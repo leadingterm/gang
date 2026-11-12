@@ -1,0 +1,48 @@
+[package]
+name = "gang-nativelink"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+axum = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+gang-clock = { workspace = true }
+gang-spi = { workspace = true }
+gang-types = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+nativelink-config = { workspace = true }
+nativelink-error = { workspace = true }
+nativelink-metric = { workspace = true }
+nativelink-proto = { workspace = true }
+nativelink-scheduler = { workspace = true }
+nativelink-service = { workspace = true }
+nativelink-store = { workspace = true }
+nativelink-util = { workspace = true }
+nativelink-worker = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+gang-os = { workspace = true }
+gang-testkit = { workspace = true }
+parking_lot = { workspace = true }
+prost = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }

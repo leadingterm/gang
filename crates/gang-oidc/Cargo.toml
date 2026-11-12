@@ -1,0 +1,30 @@
+[package]
+name = "gang-oidc"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+gang-clock = { workspace = true }
+gang-spi = { workspace = true }
+gang-tls = { workspace = true }
+gang-types = { workspace = true }
+getrandom = { workspace = true }
+http = { workspace = true }
+jsonwebtoken = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+gang-testkit = { workspace = true }

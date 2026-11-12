@@ -1,0 +1,6 @@
+load("//bazel/opentofu:defs.bzl", "opentofu_contract_test")
+
+opentofu_contract_test(
+    name = "worker_fleet_contract",
+    deps = ["//infra/terraform/modules/instance-role:sources"],
+)

@@ -1,0 +1,95 @@
+: at 1768471770000
+event: snapshot
+id: 48211
+data: {"name":"state","seq":48211,"updateTime":"2026-01-15T10:09:30.000Z","provisioner":"aws","pass":{"state":"OK","interval":"2s","applied":2,"failed":0},"queue":{"total":24,"unplaceable":0,"oldestQueueTime":"2026-01-15T10:08:42.000Z"},"fleets":[{"name":"fleets/amd64-spot","isa":"x86-64","sandbox":"bwrap","properties":{"ISA":"x86-64","sandbox":"bwrap","capacity":"spot"},"instanceSize":{"vcpus":16,"memory":68719476736},"policy":{"min":0,"max":24,"targetActions":16,"idleTimeout":"600s","maxDrainWait":"1800s","bootGrace":"300s"},"desired":3,"instances":{"pending":3,"inService":0,"terminating":0,"warm":0},"workers":{"busy":0,"idle":0,"draining":0,"unconnected":0},"demand":{"running":0,"queued":24,"candidates":24,"needed":3,"vcpus":48,"memory":206158430208}},{"name":"fleets/amd64-on-demand","isa":"x86-64","sandbox":"bwrap","properties":{"ISA":"x86-64","sandbox":"bwrap","capacity":"on-demand"},"instanceSize":{"vcpus":16,"memory":68719476736},"policy":{"min":0,"max":8,"targetActions":16,"idleTimeout":"900s","maxDrainWait":"1800s","bootGrace":"300s"},"desired":0,"instances":{"pending":0,"inService":0,"terminating":0,"warm":0},"workers":{"busy":0,"idle":0,"draining":0,"unconnected":0},"demand":{"running":0,"queued":0,"candidates":24,"needed":0,"vcpus":0,"memory":0}},{"name":"fleets/arm64-spot","isa":"aarch64","sandbox":"bwrap","properties":{"ISA":"aarch64","sandbox":"bwrap","capacity":"spot"},"instanceSize":{"vcpus":16,"memory":34359738368},"policy":{"min":0,"max":16,"targetActions":16,"idleTimeout":"600s","maxDrainWait":"1800s","bootGrace":"300s"},"desired":0,"instances":{"pending":0,"inService":0,"terminating":0,"warm":0},"workers":{"busy":0,"idle":0,"draining":0,"unconnected":0},"demand":{"running":0,"queued":0,"candidates":0,"needed":0,"vcpus":0,"memory":0}},{"name":"fleets/gpu","isa":"x86-64","sandbox":"bwrap","properties":{"ISA":"x86-64","sandbox":"bwrap","capacity":"on-demand","machine_class":"gpu"},"instanceSize":{"vcpus":8,"memory":65498251264},"policy":{"min":0,"max":2,"targetActions":4,"idleTimeout":"300s","maxDrainWait":"900s","bootGrace":"600s"},"desired":0,"instances":{"pending":0,"inService":0,"terminating":0,"warm":0},"workers":{"busy":0,"idle":0,"draining":0,"unconnected":0},"demand":{"running":0,"queued":0,"candidates":0,"needed":0,"vcpus":0,"memory":0}}],"workers":[],"instances":[{"name":"instances/i-0c0000000000000a","fleet":"fleets/amd64-spot","lifecycle":"PENDING","launchTime":"2026-01-15T10:08:46.000Z","pastBootGrace":false},{"name":"instances/i-0c0000000000000b","fleet":"fleets/amd64-spot","lifecycle":"PENDING","launchTime":"2026-01-15T10:08:46.000Z","pastBootGrace":false},{"name":"instances/i-0c0000000000000c","fleet":"fleets/amd64-spot","lifecycle":"PENDING","launchTime":"2026-01-15T10:08:46.000Z","pastBootGrace":false}],"actions":{"sampleTime":"2026-01-15T10:09:25.000Z","staleAfter":"30s","running":[],"queued":[{"name":"actions/47c0d5d7-9dea-7943-ad11-24b90b04f66c","digest":"90c79dc1a9a0e78cf22acc401b0ca8ed2455ed8d16861fdf46adbf4782a0389d/2996","target":"//crates/wal:wal_test","mnemonic":"TestRunner","queueTime":"2026-01-15T10:07:18.498Z","priority":10,"candidates":["fleets/amd64-spot","fleets/amd64-on-demand"]},{"name":"actions/cc270125-3bd3-72e3-9856-458bdf74bb26","digest":"d8c097a3c2b0aee2d7ed46df3bc93370f372362590dcf8c9f98a6a606a698bb9/3913","target":"//net/http2:frame_codec_test","mnemonic":"TestRunner","queueTime":"2026-01-15T10:08:32.666Z","priority":10,"candidates":["fleets/amd64-spot","fleets/amd64-on-demand"]},{"name":"actions/6b5c0c11-9ef2-7419-a219-35df96310176","digest":"58106a3b532e9c694307496140403d67300756ffd3a1bcee793a29b8d78cc22b/1391","target":"//pkg/router:router","mnemonic":"GoCompilePkg","queueTime":"2026-01-15T10:09:21.607Z","priority":10,"candidates":["fleets/amd64-spot","fleets/amd64-on-demand"]},{"name":"actions/78d06da9-079b-7066-975c-ccad8ab43f4b","digest":"483b77056194114a86bd5bdad895ba4253b204686eb4747d59dad5f764bf9695/406","target":"//crates/wal:wal","mnemonic":"Rustc","queueTime":"2026-01-15T10:06:11.202Z","priority":0,"candidates":["fleets/amd64-spot","fleets/amd64-on-demand"]},{"name":"actions/15cfdad8-d89a-74b0-bcc9-17892bb77a67","digest":"43ae94a84dfc19a34ef7b5723b5a0fed224bf630ee2984e4f37eb4895532b7c1/262","target":"//crates/parser:parser","mnemonic":"Rustc","queueTime":"2026-01-15T10:06:18.380Z","priority":0,"candidates":["fleets/amd64-spot","fleets/amd64-on-demand"]},{"name":"actions/fa9cb4f1-966a-7d63-b9cb-fb76a4055bea","digest":"3d60404c0f0d9d3b401d53217edbf619a675c1e41da0f59a9e3bbcbb7c762561/3002","target":"//compression/zstd:frame","mnemonic":"CppCompile","queueTime":"2026-01-15T10:06:33.627Z","priority":0,"candidates":["fleets/amd64-spot","fleets/amd64-on-demand"]},{"name":"actions/7811c1b1-fd04-7d80-8755-b732df7e34fc","digest":"9d585e09e439c43d718d8bed0030e9504599f1c2bdb514047904bb448bca623f/3333","target":"//pkg/cache/lru:lru","mnemonic":"GoCompilePkg","queueTime":"2026-01-15T10:06:34.034Z","priority":0,"candidates":["fleets/amd64-spot","fleets/amd64-on-demand"]},{"name":"actions/ac408c30-1c7c-7704-b32c-122934954eab","digest":"e313b756a14d25657d5bb95b6a6b7b1a8ab2f8ae4c8815b476b0ba931e76ffa9/3511","target":"//crates/wal:wal_test","mnemonic":"TestRunner","queueTime":"2026-01-15T10:06:37.603Z","priority":0,"candidates":["fleets/amd64-spot","fleets/amd64-on-demand"]},{"name":"actions/0744366f-501d-7ba9-bf51-0660e123aeaa","digest":"77b842a5885e1e729f9729eb0e9e59e3a7293c090daffe79705f1d6395759c1a/3986","target":"//tools/bench:bench","mnemonic":"CppLink","queueTime":"2026-01-15T10:06:58.033Z","priority":0,"candidates":["fleets/amd64-spot","fleets/amd64-on-demand"]},{"name":"actions/1923d71f-c56c-7ea0-a4c8-86b0f712befb","digest":"0c1093eab6ed3d1c7b3cc55e302b6cd0805c85cc9aa75982b72bdec8594e4a25/2541","target":"//docs:site","mnemonic":"Genrule","queueTime":"2026-01-15T10:07:02.257Z","priority":0,"candidates":["fleets/amd64-spot","fleets/amd64-on-demand"]},{"name":"actions/68da0065-c934-7e16-a209-6ae58f3e21fe","digest":"9f98221fc6005b8f53603571ed193a30ad30fd7bd25c01760f8356bd678cb747/2612","target":"//pkg/router:router","mnemonic":"GoCompilePkg","queueTime":"2026-01-15T10:07:04.186Z","priority":0,"candidates":["fleets/amd64-spot","fleets/amd64-on-demand"]},{"name":"actions/2866aa2e-bf0f-7a4c-975f-e6d9ec79b3c0","digest":"38629e403fb56b4d2d868b372eba084b12eb426c92e306ea1e41d54c7bb3c9af/668","target":"//web/assets:bundle","mnemonic":"Genrule","queueTime":"2026-01-15T10:07:16.021Z","priority":0,"candidates":["fleets/amd64-spot","fleets/amd64-on-demand"]},{"name":"actions/6a8f543d-d5a9-7909-ac41-04ddff7d9735","digest":"5dcf2978a593a3df9958ae7e8aac712f540904c8dbdeab82069ce66d3a5575a8/939","target":"//java/com/example/query:planner_test","mnemonic":"TestRunner","queueTime":"2026-01-15T10:07:21.590Z","priority":0,"candidates":["fleets/amd64-spot","fleets/amd64-on-demand"]},{"name":"actions/4d7c8557-fcd9-7ae9-913f-4fe86cca787c","digest":"790850a1b53be37c9978d975380f73d112e8a0d64eee35f74d1e9673fc3ddb60/1945","target":"//api/v2:events_proto","mnemonic":"ProtoCompile","queueTime":"2026-01-15T10:07:39.691Z","priority":0,"candidates":["fleets/amd64-spot","fleets/amd64-on-demand"]},{"name":"actions/390b2dd4-bdbb-7a70-b9f6-41cef1956acf","digest":"6f2e89f299379bb505e9f029eaa49032314f86f81126aaf9dd07f5bdee653ad8/2961","target":"//java/com/example/query:planner","mnemonic":"Javac","queueTime":"2026-01-15T10:07:44.751Z","priority":0,"candidates":["fleets/amd64-spot","fleets/amd64-on-demand"]},{"name":"actions/886a92fa-62ca-7fea-af8b-f50e0c48d94e","digest":"3c49396216997073798d59cbd53caaaf764f932d2e2177c4ca27781f3eeb7d91/948","target":"//pkg/router:router","mnemonic":"GoCompilePkg","queueTime":"2026-01-15T10:07:53.516Z","priority":0,"candidates":["fleets/amd64-spot","fleets/amd64-on-demand"]},{"name":"actions/06ef110e-89ab-7a17-a58c-082d4536e69b","digest":"2a63ebc0da2120275e8f03680638ece3b8300cf30a9e02b6fd3c6a915b33b14d/3410","target":"//cmd/fleetctl:fleetctl_lib","mnemonic":"GoCompilePkg","queueTime":"2026-01-15T10:07:57.033Z","priority":0,"candidates":["fleets/amd64-spot","fleets/amd64-on-demand"]},{"name":"actions/48db4941-ae0a-7b8d-89a5-37ab7cd2b5a5","digest":"802ccd5fca12a8d8480742f1c4a66d8ebcf06d4c40168e5d16e1d73519d22619/1174","target":"//api/v2:events_proto","mnemonic":"ProtoCompile","queueTime":"2026-01-15T10:08:00.242Z","priority":0,"candidates":["fleets/amd64-spot","fleets/amd64-on-demand"]},{"name":"actions/36289ddc-f0b0-71b3-bb18-579441ebd1fd","digest":"b02cf2809b7fbde46ccacde567828de59ce0478b816733c358dfa93572071ed0/1740","target":"//net/http2:frame_codec","mnemonic":"CppCompile","queueTime":"2026-01-15T10:08:08.809Z","priority":0,"candidates":["fleets/amd64-spot","fleets/amd64-on-demand"]},{"name":"actions/23eca52c-ae8e-74c5-b64d-176d1aff65c7","digest":"9de48de5480b77acab48bf02833ee005a6ea555f79ca8806e4e0d6c8b6107f86/434","target":"//crates/parser:parser","mnemonic":"Rustc","queueTime":"2026-01-15T10:08:12.133Z","priority":0,"candidates":["fleets/amd64-spot","fleets/amd64-on-demand"]},{"name":"actions/8e9ad21e-2e56-7462-b1b8-67a0a3b4a26c","digest":"7396781a707f9ff7e0384f6aaac7a6f2e10174539c72ae12cd5585e9f2317dc9/1267","target":"//base/strings:split","mnemonic":"CppCompile","queueTime":"2026-01-15T10:08:17.961Z","priority":0,"candidates":["fleets/amd64-spot","fleets/amd64-on-demand"]},{"name":"actions/35ea4474-dacb-7851-9e2b-91611fd0ac66","digest":"ac3a9b45c3d5fa2da1ce47a04cdb40b4286699b2bf1872c6b16ad45ad7a00453/2257","target":"//net/http2:frame_codec_test","mnemonic":"TestRunner","queueTime":"2026-01-15T10:08:39.858Z","priority":0,"candidates":["fleets/amd64-spot","fleets/amd64-on-demand"]},{"name":"actions/59a03833-636a-7069-9c61-000046e13af8","digest":"dc686e6a9481f381c7e359d4a62e36870f35c60204fd2329ba827f708147de5c/1900","target":"//crates/wal:wal","mnemonic":"Rustc","queueTime":"2026-01-15T10:09:04.220Z","priority":0,"candidates":["fleets/amd64-spot","fleets/amd64-on-demand"]},{"name":"actions/695e8283-5c88-7526-9829-0499f1c1e99c","digest":"f729692824d07538b884b278095b5525f31c66b11077d24ac991bd734614bad2/3622","target":"//tools/bench:bench","mnemonic":"CppLink","queueTime":"2026-01-15T10:09:12.870Z","priority":0,"candidates":["fleets/amd64-spot","fleets/amd64-on-demand"]}],"truncated":{"running":0,"queued":0}},"events":[{"name":"events/1","createTime":"2026-01-15T10:08:46.000Z","fleet":"fleets/amd64-spot","cause":"DEMAND","scaledOut":{"from":0,"to":3}}],"eventsLimit":200,"completed":184220,"principalsEpoch":7}
+
+: at 1768471780000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:09:40.000Z"}
+
+: at 1768471790000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:09:50.000Z"}
+
+: at 1768471800000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:10:00.000Z"}
+
+: at 1768471810000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:10:10.000Z"}
+
+: at 1768471820000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:10:20.000Z"}
+
+: at 1768471830000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:10:30.000Z"}
+
+: at 1768471840000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:10:40.000Z"}
+
+: at 1768471850000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:10:50.000Z"}
+
+: at 1768471860000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:11:00.000Z"}
+
+: at 1768471870000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:11:10.000Z"}
+
+: at 1768471880000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:11:20.000Z"}
+
+: at 1768471890000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:11:30.000Z"}
+
+: at 1768471900000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:11:40.000Z"}
+
+: at 1768471910000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:11:50.000Z"}
+
+: at 1768471920000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:12:00.000Z"}
+
+: at 1768471930000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:12:10.000Z"}
+
+: at 1768471940000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:12:20.000Z"}
+
+: at 1768471950000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:12:30.000Z"}
+

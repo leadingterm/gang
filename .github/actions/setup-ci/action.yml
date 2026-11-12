@@ -1,0 +1,12 @@
+name: Set up Linux CI
+description: Enable unprivileged user namespaces and install Nix for CI jobs.
+runs:
+  using: composite
+  steps:
+    - name: Allow unprivileged user namespaces
+      shell: bash
+      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+    - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+      with:
+        nix_conf: |
+          experimental-features = nix-command flakes

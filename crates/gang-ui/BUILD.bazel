@@ -1,0 +1,19 @@
+load("//bazel/rust:defs.bzl", "workspace_rust_library")
+
+# The `assets` module: gang-embed hashes the dist bundle and renders the `Asset` table, whose
+# `include_bytes!` paths are relative to this file, so it lives beside the sources in the output tree.
+genrule(
+    name = "assets",
+    srcs = ["//ui:dist"],
+    outs = ["src/assets.rs"],
+    cmd = "$(execpath //crates/gang-embed:gang-embed) $(execpath //ui:dist) $@",
+    tools = ["//crates/gang-embed"],
+)
+
+workspace_rust_library(
+    name = "gang_ui",
+    srcs = glob(["src/**/*.rs"]) + [":assets"],
+    compile_data = ["//ui:dist"],
+    test_env = {"UI_DIST": "$(rootpath //ui:dist)"},
+    test_runtime_data = ["//ui:dist"],
+)

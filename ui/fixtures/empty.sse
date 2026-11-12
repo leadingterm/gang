@@ -1,0 +1,95 @@
+: at 1768471770000
+event: snapshot
+id: 48211
+data: {"name":"state","seq":48211,"updateTime":"2026-01-15T10:09:30.000Z","provisioner":"aws","pass":{"state":"OK","interval":"2s","applied":2,"failed":0},"queue":{"total":0,"unplaceable":0},"fleets":[{"name":"fleets/amd64-spot","isa":"x86-64","sandbox":"bwrap","properties":{"ISA":"x86-64","sandbox":"bwrap","capacity":"spot"},"instanceSize":{"vcpus":16,"memory":68719476736},"policy":{"min":0,"max":24,"targetActions":16,"idleTimeout":"600s","maxDrainWait":"1800s","bootGrace":"300s"},"desired":0,"instances":{"pending":0,"inService":0,"terminating":0,"warm":4},"workers":{"busy":0,"idle":0,"draining":0,"unconnected":0},"demand":{"running":0,"queued":0,"candidates":0,"needed":0,"vcpus":0,"memory":0}},{"name":"fleets/amd64-on-demand","isa":"x86-64","sandbox":"bwrap","properties":{"ISA":"x86-64","sandbox":"bwrap","capacity":"on-demand"},"instanceSize":{"vcpus":16,"memory":68719476736},"policy":{"min":0,"max":8,"targetActions":16,"idleTimeout":"900s","maxDrainWait":"1800s","bootGrace":"300s"},"desired":0,"instances":{"pending":0,"inService":0,"terminating":0,"warm":0},"workers":{"busy":0,"idle":0,"draining":0,"unconnected":0},"demand":{"running":0,"queued":0,"candidates":0,"needed":0,"vcpus":0,"memory":0}},{"name":"fleets/arm64-spot","isa":"aarch64","sandbox":"bwrap","properties":{"ISA":"aarch64","sandbox":"bwrap","capacity":"spot"},"instanceSize":{"vcpus":16,"memory":34359738368},"policy":{"min":0,"max":16,"targetActions":16,"idleTimeout":"600s","maxDrainWait":"1800s","bootGrace":"300s"},"desired":0,"instances":{"pending":0,"inService":0,"terminating":0,"warm":0},"workers":{"busy":0,"idle":0,"draining":0,"unconnected":0},"demand":{"running":0,"queued":0,"candidates":0,"needed":0,"vcpus":0,"memory":0}},{"name":"fleets/gpu","isa":"x86-64","sandbox":"bwrap","properties":{"ISA":"x86-64","sandbox":"bwrap","capacity":"on-demand","machine_class":"gpu"},"instanceSize":{"vcpus":8,"memory":65498251264},"policy":{"min":0,"max":2,"targetActions":4,"idleTimeout":"300s","maxDrainWait":"900s","bootGrace":"600s"},"desired":0,"instances":{"pending":0,"inService":0,"terminating":0,"warm":0},"workers":{"busy":0,"idle":0,"draining":0,"unconnected":0},"demand":{"running":0,"queued":0,"candidates":0,"needed":0,"vcpus":0,"memory":0}}],"workers":[],"instances":[],"actions":{"sampleTime":"2026-01-15T10:09:26.000Z","staleAfter":"30s","running":[],"queued":[],"truncated":{"running":0,"queued":0}},"events":[{"name":"events/1000","createTime":"2026-01-15T01:12:50.000Z","fleet":"fleets/amd64-on-demand","cause":"DEMAND","scaledOut":{"from":1,"to":2}},{"name":"events/1001","createTime":"2026-01-15T01:23:40.000Z","fleet":"fleets/amd64-spot","cause":"DEMAND","scaledOut":{"from":0,"to":4}},{"name":"events/1002","createTime":"2026-01-15T01:37:50.000Z","fleet":"fleets/amd64-spot","cause":"DEMAND","scaledOut":{"from":4,"to":9}},{"name":"events/1003","createTime":"2026-01-15T02:06:10.000Z","fleet":"fleets/arm64-spot","cause":"DEMAND","scaledOut":{"from":0,"to":3}},{"name":"events/1004","createTime":"2026-01-15T02:41:30.000Z","fleet":"fleets/amd64-spot","cause":"DEMAND","scaledOut":{"from":8,"to":9}},{"name":"events/1005","createTime":"2026-01-15T03:27:50.000Z","fleet":"fleets/arm64-spot","cause":"IDLE_TIMEOUT","drainStarted":{"worker":"workers/i-0aab6f62b737371ef-59eb361f-a6cd-7ded-a3d3-48dd8a8f7a21"}},{"name":"events/1006","createTime":"2026-01-15T03:32:40.000Z","fleet":"fleets/arm64-spot","cause":"DEMAND","drainCancelled":{"worker":"workers/i-019f34c2227f6eff5-009238da-c321-780b-9ec5-3fe4c2d7e22d"}},{"name":"events/1007","createTime":"2026-01-15T03:52:50.000Z","fleet":"fleets/amd64-spot","cause":"IDLE_TIMEOUT","drainStarted":{"worker":"workers/i-0192cbee9a7b2df05-6e1a6c5e-c588-7934-82c9-4aab90fb8a12"}},{"name":"events/1008","createTime":"2026-01-15T04:02:50.000Z","fleet":"fleets/amd64-spot","cause":"DRAIN_FINISHED","terminated":{"instance":"instances/i-0b0fd178a81cb8e54"}},{"name":"events/1009","createTime":"2026-01-15T04:32:50.000Z","fleet":"fleets/amd64-on-demand","cause":"DEMAND","scaledOut":{"from":2,"to":3}},{"name":"events/1010","createTime":"2026-01-15T05:09:20.000Z","fleet":"fleets/arm64-spot","cause":"ORPHAN","terminated":{"instance":"instances/i-0e3c2fb23abce5cba"}},{"name":"events/1011","createTime":"2026-01-15T05:09:40.000Z","fleet":"fleets/arm64-spot","cause":"DEMAND","scaledOut":{"from":3,"to":4}},{"name":"events/1012","createTime":"2026-01-15T05:44:10.000Z","fleet":"fleets/amd64-spot","cause":"DEMAND","scaledOut":{"from":9,"to":12}},{"name":"events/1013","createTime":"2026-01-15T06:15:10.000Z","fleet":"fleets/arm64-spot","cause":"DEMAND","scaledOut":{"from":4,"to":6}},{"name":"events/1014","createTime":"2026-01-15T06:29:50.000Z","fleet":"fleets/gpu","cause":"IDLE_TIMEOUT","drainStarted":{"worker":"workers/i-0a4646805f072ec68-e09af1c9-7c39-72df-9914-f1409554e379"}},{"name":"events/1015","createTime":"2026-01-15T06:31:20.000Z","fleet":"fleets/gpu","cause":"DRAIN_FINISHED","terminated":{"instance":"instances/i-0eb8c874d0b680b7a"}},{"name":"events/1016","createTime":"2026-01-15T06:37:10.000Z","fleet":"fleets/amd64-spot","cause":"DEMAND","scaledOut":{"from":12,"to":14}}],"eventsLimit":200,"completed":184220,"principalsEpoch":7}
+
+: at 1768471780000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:09:40.000Z"}
+
+: at 1768471790000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:09:50.000Z"}
+
+: at 1768471800000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:10:00.000Z"}
+
+: at 1768471810000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:10:10.000Z"}
+
+: at 1768471820000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:10:20.000Z"}
+
+: at 1768471830000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:10:30.000Z"}
+
+: at 1768471840000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:10:40.000Z"}
+
+: at 1768471850000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:10:50.000Z"}
+
+: at 1768471860000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:11:00.000Z"}
+
+: at 1768471870000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:11:10.000Z"}
+
+: at 1768471880000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:11:20.000Z"}
+
+: at 1768471890000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:11:30.000Z"}
+
+: at 1768471900000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:11:40.000Z"}
+
+: at 1768471910000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:11:50.000Z"}
+
+: at 1768471920000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:12:00.000Z"}
+
+: at 1768471930000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:12:10.000Z"}
+
+: at 1768471940000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:12:20.000Z"}
+
+: at 1768471950000
+event: tick
+id: 48211
+data: {"seq":48211,"time":"2026-01-15T10:12:30.000Z"}
+

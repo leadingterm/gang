@@ -1,0 +1,14 @@
+load("//bazel/rust:defs.bzl", "workspace_rust_library")
+
+workspace_rust_library(
+    name = "gang_nativelink",
+    dev_deps = [
+        "//crates/gang-os:gang_os",
+        "//crates/gang-testkit:gang_testkit",
+    ],
+    deps = [
+        "//crates/gang-clock:gang_clock",
+        "//crates/gang-spi:gang_spi",
+        "//crates/gang-types:gang_types",
+    ],
+)

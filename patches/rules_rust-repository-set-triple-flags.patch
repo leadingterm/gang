@@ -1,0 +1,32 @@
+# Expose rust_repository_set's existing per-triple rustc flags in the module
+# extension, so musl linker flags are not passed to the macOS host toolchain.
+--- a/rust/extensions.bzl
++++ b/rust/extensions.bzl
+@@ -62,6 +62,8 @@ def _rust_impl(module_ctx):
+     grouped_repository_sets = {}
+     for repository_set in root.tags.repository_set:
+         if repository_set.name not in grouped_repository_sets:
++            if repository_set.extra_rustc_flags and repository_set.extra_rustc_flags_triples:
++                fail("Cannot define both extra_rustc_flags and extra_rustc_flags_triples")
+             grouped_repository_sets[repository_set.name] = {
+                 "allocator_library": str(repository_set.allocator_library) if repository_set.allocator_library else None,
+                 "auth": repository_set.auth if repository_set.auth else None,
+@@ -71,7 +73,7 @@ def _rust_impl(module_ctx):
+                 "exec_compatible_with": [str(v) for v in repository_set.exec_compatible_with] if repository_set.exec_compatible_with else None,
+                 "exec_triple": repository_set.exec_triple,
+                 "extra_exec_rustc_flags": repository_set.extra_exec_rustc_flags if repository_set.extra_exec_rustc_flags else None,
+-                "extra_rustc_flags": repository_set.extra_rustc_flags if repository_set.extra_rustc_flags else None,
++                "extra_rustc_flags": repository_set.extra_rustc_flags if repository_set.extra_rustc_flags else repository_set.extra_rustc_flags_triples,
+                 "extra_target_triples": {repository_set.target_triple: [str(v) for v in repository_set.target_compatible_with]},
+                 "global_allocator_library": str(repository_set.global_allocator_library) if repository_set.global_allocator_library else None,
+                 "name": repository_set.name,
+@@ -212,6 +214,9 @@ _RUST_REPOSITORY_SET_TAG_ATTRS = {
+     "extra_rustc_flags": attr.string_list(
+         doc = "Extra flags to pass to rustc in non-exec configuration.",
+     ),
++    "extra_rustc_flags_triples": attr.string_list_dict(
++        doc = "Extra flags to pass to rustc in non-exec configuration, keyed by target triple.",
++    ),
+     "name": attr.string(
+         doc = "Name of the repository_set - if you're looking to replace default toolchains you must use the exact name you're replacing.",
+     ),

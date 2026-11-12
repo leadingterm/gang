@@ -1,0 +1,26 @@
+common --enable_bzlmod
+common --enable_platform_specific_config
+common --lockfile_mode=error
+common --repo_env=ASPECT_TOOLS_TELEMETRY=-all
+# Repository rules see the client environment; --action_env (the devShell's pinned PATH) is for actions only.
+common --incompatible_repo_env_ignores_action_env
+
+build --incompatible_strict_action_env
+build:linux --platforms=//bazel/platforms:linux_musl
+build:macos --repo_env=CC=/usr/bin/clang
+build:macos --repo_env=CXX=/usr/bin/clang++
+
+build --@rules_rust//rust/settings:clippy_flags=-Dwarnings
+build --@rules_rust//rust/settings:clippy.toml=//:clippy.toml
+
+test --test_output=errors
+test --local_test_jobs=HOST_CPUS*.25
+
+# `bazel coverage`: instrument the workspace crates, test targets included, into one lcov report.
+# Test helper binaries are named `fake_*` and stay uninstrumented because the
+# profiler runtime changes the environment and files they report on.
+coverage --instrument_test_targets
+coverage --instrumentation_filter=^//crates[/:],-^//crates/[^:]+:fake_
+coverage --combined_report=lcov
+
+try-import %workspace%/.bazelrc.local

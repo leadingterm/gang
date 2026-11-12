@@ -1,0 +1,304 @@
+[workspace]
+members = [
+    "bazel/architecture",
+    "bazel/opentofu/runner",
+    "crates/gang-authn",
+    "crates/gang-aws",
+    "crates/gang-bindings",
+    "crates/gang-bwrap",
+    "crates/gang-cgroup",
+    "crates/gang-client",
+    "crates/gang-clock",
+    "crates/gang-config",
+    "crates/gang-deploy",
+    "crates/gang-e2e",
+    "crates/gang-embed",
+    "crates/gang-exec",
+    "crates/gang-local",
+    "crates/gang-macros",
+    "crates/gang-main",
+    "crates/gang-mtls",
+    "crates/gang-nativelink",
+    "crates/gang-noop",
+    "crates/gang-oidc",
+    "crates/gang-os",
+    "crates/gang-reconciler",
+    "crates/gang-server",
+    "crates/gang-spi",
+    "crates/gang-sqlite",
+    "crates/gang-state",
+    "crates/gang-testkit",
+    "crates/gang-tls",
+    "crates/gang-types",
+    "crates/gang-ui",
+    "crates/gang-wire",
+    "crates/gang-worker",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+version = "0.1.0"
+
+[workspace.lints.rust]
+missing_docs = "deny"
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+expect_used = "deny"
+panic = "deny"
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+
+[workspace.dependencies]
+allocation-counter = "0.8.1"
+anstream = "1.0"
+anstyle = "1.0"
+async-trait = "0.1"
+aws-config = { default-features = false, features = [
+    "behavior-version-latest",
+    "rt-tokio",
+], version = "1.13" }
+aws-credential-types = { default-features = false, version = "1.3" }
+aws-runtime = { default-features = false, version = "1.10" }
+aws-sdk-autoscaling = { default-features = false, features = [
+    "behavior-version-latest",
+    "rt-tokio",
+], version = "1.140" }
+aws-sdk-ec2 = { default-features = false, features = [
+    "behavior-version-latest",
+    "rt-tokio",
+], version = "1.275" }
+aws-sdk-kms = { default-features = false, features = [
+    "behavior-version-latest",
+    "rt-tokio",
+], version = "1.129" }
+aws-sdk-sts = { default-features = false, features = [
+    "behavior-version-latest",
+    "rt-tokio",
+], version = "1.124" }
+aws-smithy-http-client = { default-features = false, features = [
+    "rt-tokio",
+    "rustls-ring",
+], version = "1.5" }
+aws-smithy-runtime-api = { default-features = false, version = "1.19" }
+aws-smithy-types = { default-features = false, features = [
+    "rt-tokio",
+], version = "1.9" }
+axum = { default-features = false, features = [
+    "form",
+    "http1",
+    "json",
+    "tokio",
+], version = "0.8" }
+base64 = "0.23"
+bytes = "1.11.1"
+clap = { default-features = false, features = [
+    "color",
+    "derive",
+    "error-context",
+    "help",
+    "std",
+    "suggestions",
+    "usage",
+], version = "4" }
+const-oid = { features = [
+    "db",
+], version = "0.10" }
+der = { features = [
+    "alloc",
+    "derive",
+    "pem",
+], version = "0.8" }
+ecdsa = { features = [
+    "algorithm",
+    "der",
+], version = "0.17" }
+form_urlencoded = "1.2.2"
+futures = { default-features = false, features = [
+    "std",
+], version = "0.3.31" }
+futures-core = "0.3"
+gang-authn = { path = "crates/gang-authn" }
+gang-aws = { path = "crates/gang-aws" }
+gang-bwrap = { path = "crates/gang-bwrap" }
+gang-cgroup = { path = "crates/gang-cgroup" }
+gang-client = { path = "crates/gang-client" }
+gang-clock = { path = "crates/gang-clock" }
+gang-config = { path = "crates/gang-config" }
+gang-deploy = { path = "crates/gang-deploy" }
+gang-e2e = { path = "crates/gang-e2e" }
+gang-embed = { path = "crates/gang-embed" }
+gang-exec = { path = "crates/gang-exec" }
+gang-local = { path = "crates/gang-local" }
+gang-macros = { path = "crates/gang-macros" }
+gang-main = { path = "crates/gang-main" }
+gang-mtls = { path = "crates/gang-mtls" }
+gang-nativelink = { path = "crates/gang-nativelink" }
+gang-noop = { path = "crates/gang-noop" }
+gang-oidc = { path = "crates/gang-oidc" }
+gang-os = { path = "crates/gang-os" }
+gang-reconciler = { path = "crates/gang-reconciler" }
+gang-server = { path = "crates/gang-server" }
+gang-spi = { path = "crates/gang-spi" }
+gang-sqlite = { path = "crates/gang-sqlite" }
+gang-state = { path = "crates/gang-state" }
+gang-testkit = { path = "crates/gang-testkit" }
+gang-tls = { path = "crates/gang-tls" }
+gang-types = { path = "crates/gang-types" }
+gang-ui = { path = "crates/gang-ui" }
+gang-wire = { path = "crates/gang-wire" }
+gang-worker = { path = "crates/gang-worker" }
+getrandom = "0.4"
+h2 = "0.4"
+hex = "0.4"
+http = "1.5"
+http-body = "1.1"
+http-body-util = { features = ["channel"], version = "0.1.5" }
+httpdate = "1.0.3"
+hyper = { features = [
+    "client",
+    "http1",
+    "http2",
+    "server",
+], version = "1.12.0" }
+hyper-util = { features = [
+    "client-legacy",
+    "http1",
+    "server-auto",
+    "server-graceful",
+    "service",
+    "tokio",
+], version = "0.1.21" }
+ipnet = { features = [
+    "serde",
+], version = "2.12" }
+itertools = { version = "0.14" }
+itoa = { version = "1" }
+jsonwebtoken = { features = [
+    "rust_crypto",
+], version = "11" }
+libc = "0.2.191"
+lru = "0.18.5"
+mimalloc = { version = "0.1" }
+nativelink-config = { git = "https://github.com/TraceMachina/nativelink", tag = "v1.8.3" }
+nativelink-error = { git = "https://github.com/TraceMachina/nativelink", tag = "v1.8.3" }
+nativelink-metric = { git = "https://github.com/TraceMachina/nativelink", tag = "v1.8.3" }
+nativelink-proto = { git = "https://github.com/TraceMachina/nativelink", tag = "v1.8.3" }
+nativelink-scheduler = { git = "https://github.com/TraceMachina/nativelink", tag = "v1.8.3" }
+nativelink-service = { git = "https://github.com/TraceMachina/nativelink", tag = "v1.8.3" }
+nativelink-store = { git = "https://github.com/TraceMachina/nativelink", tag = "v1.8.3" }
+nativelink-util = { git = "https://github.com/TraceMachina/nativelink", tag = "v1.8.3" }
+nativelink-worker = { git = "https://github.com/TraceMachina/nativelink", tag = "v1.8.3" }
+object = { default-features = false, features = [
+    "elf",
+    "read_core",
+    "std",
+], version = "0.39" }
+p256 = { features = [
+    "ecdsa",
+    "getrandom",
+    "pem",
+    "pkcs8",
+], version = "0.14" }
+parking_lot = "0.12"
+percent-encoding = "2.3.2"
+pin-project-lite = "0.2"
+proc-macro2 = "1.0.106"
+prost = { default-features = false, features = [
+    "std",
+], version = "0.14" }
+quote = "1.0.45"
+rcgen = { default-features = false, features = [
+    "pem",
+    "ring",
+], version = "0.14" }
+rusqlite = { features = [
+    "bundled",
+], version = "0.40" }
+rustix = { features = [
+    "event",
+    "fs",
+    "process",
+], version = "1.1.6" }
+rustls = { default-features = false, features = [
+    "ring",
+    "std",
+], version = "0.23" }
+rustls-native-certs = "0.8"
+rustls-pki-types = "1.15"
+rustls-webpki = { default-features = false, features = [
+    "ring",
+    "std",
+], version = "0.103" }
+serde = { features = [
+    "derive",
+], version = "1.0.228" }
+serde_json = "1.0.145"
+sha2 = "0.11"
+spki = { features = [
+    "alloc",
+    "pem",
+], version = "0.8" }
+syn = { features = [
+    "full",
+], version = "2.0.117" }
+sysinfo = { default-features = false, features = ["system"], version = "0.39.6" }
+tempfile = "3.23.0"
+terminal_size = "0.4"
+thiserror = "2.0.18"
+time = { default-features = false, features = [
+    "formatting",
+    "macros",
+    "parsing",
+], version = "0.3.55" }
+tokio = { features = [
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+], version = "1.48.0" }
+tokio-rusqlite = "0.8"
+tokio-rustls = { default-features = false, features = [
+    "ring",
+], version = "0.26.2" }
+tokio-stream = "0.1"
+tokio-util = { features = [
+    "rt",
+], version = "0.7" }
+toml = "1.2.0"
+tonic = { default-features = false, features = [
+    "tls-ring",
+    "transport",
+], version = "0.14.0" }
+tower = { default-features = false, version = "0.5.2" }
+tracing = { default-features = false, features = [
+    "std",
+], version = "0.1.41" }
+tracing-subscriber = { default-features = false, features = [
+    "ansi",
+    "env-filter",
+    "fmt",
+    "std",
+], version = "0.3" }
+ts-rs = { default-features = false, features = [
+    "no-serde-warnings",
+    "serde-compat",
+    "serde-json-impl",
+], version = "12.0.1" }
+unicode-width = "0.2"
+url = { features = [
+    "serde",
+], version = "2.5.8" }
+webpki-roots = "1"
+x509-cert = { features = [
+    "pem",
+], version = "0.3" }
+zeroize = "1"

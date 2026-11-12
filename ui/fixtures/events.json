@@ -1,0 +1,67 @@
+{
+  "events": [
+    {
+      "name": "events/1023",
+      "createTime": "2026-01-15T10:09:54.000Z",
+      "fleet": "fleets/amd64-spot",
+      "workerDeregistered": {
+        "worker": "workers/i-0e1000000000000a-0194d5a2-7b3c-7f10-8a4e-1c2d3e4f5a6b"
+      }
+    },
+    {
+      "name": "events/1022",
+      "createTime": "2026-01-15T10:09:54.000Z",
+      "fleet": "fleets/amd64-on-demand",
+      "workerRegistered": {
+        "worker": "workers/i-04828e21626b14dd2-0ee112f6-7a36-7faf-be44-719a1246ef6b"
+      }
+    },
+    {
+      "name": "events/999",
+      "createTime": "2026-01-14T10:07:50.000Z",
+      "fleet": "fleets/arm64-spot",
+      "cause": "ORPHAN",
+      "terminated": {
+        "instance": "instances/i-0e1000000000000b"
+      }
+    },
+    {
+      "name": "events/998",
+      "createTime": "2026-01-14T09:09:30.000Z",
+      "fleet": "fleets/arm64-spot",
+      "cause": "DEMAND",
+      "scaledOut": {
+        "from": 0,
+        "to": 2
+      }
+    },
+    {
+      "name": "events/997",
+      "createTime": "2026-01-14T08:29:30.000Z",
+      "fleet": "fleets/amd64-spot",
+      "cause": "DRAIN_FINISHED",
+      "terminated": {
+        "instance": "instances/i-0e1000000000000a"
+      }
+    },
+    {
+      "name": "events/996",
+      "createTime": "2026-01-14T08:19:30.000Z",
+      "fleet": "fleets/amd64-spot",
+      "cause": "IDLE_TIMEOUT",
+      "drainStarted": {
+        "worker": "workers/i-0e1000000000000a-0194d5a2-7b3c-7f10-8a4e-1c2d3e4f5a6b"
+      }
+    },
+    {
+      "name": "events/995",
+      "createTime": "2026-01-14T07:09:30.000Z",
+      "fleet": "fleets/amd64-spot",
+      "cause": "DEMAND",
+      "scaledOut": {
+        "from": 0,
+        "to": 6
+      }
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+# actionlint's job-context type does not yet define workflow_repository and workflow_sha,
+# which GitHub provides. Remove this entry once actionlint knows these properties.
+paths:
+  .github/workflows/deploy.yml:
+    ignore:
+      - 'property "workflow_(repository|sha)" is not defined in object type .*'

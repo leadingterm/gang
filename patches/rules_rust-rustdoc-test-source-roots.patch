@@ -1,0 +1,13 @@
+--- a/rust/private/rustdoc_test.bzl	2026-11-06 04:31:59.376945900 +0400
++++ b/rust/private/rustdoc_test.bzl	2026-11-06 04:31:59.486130212 +0400
+@@ -89,7 +89,9 @@
+         if dep_cc_info:
+             _collect_library_roots(roots, dep_cc_info.linking_context.linker_inputs)
+ 
+-    writer_args.add_all(roots, format_each = "--strip_substring=%s/", uniquify = True)
++    # musl's self-contained linking context carries @zig_sdk source files as additional_inputs; their root is
++    # empty, and stripping "/" would mangle every path in the test runner (rules_rust#4271).
++    writer_args.add_all([root for root in roots if root], format_each = "--strip_substring=%s/", uniquify = True)
+ 
+     # Indicate that the rustdoc_test args are over.
+     writer_args.add("--")

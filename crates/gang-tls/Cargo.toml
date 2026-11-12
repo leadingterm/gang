@@ -1,0 +1,44 @@
+[package]
+name = "gang-tls"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+futures-core = { workspace = true }
+gang-clock = { workspace = true }
+gang-types = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+parking_lot = { workspace = true }
+rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
+rustls-pki-types = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
+tokio-util = { workspace = true }
+tower = { workspace = true }
+webpki-roots = { workspace = true }
+x509-cert = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }
+gang-testkit = { workspace = true }
+hex = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+rustls = { workspace = true, features = ["tls12"] }
+tokio = { workspace = true, features = [
+    "test-util",
+] }

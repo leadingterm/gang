@@ -1,0 +1,5 @@
+# The harness passes every remote flag itself, so this workspace has no Gang rc file. A consumer
+# repository commits the output of `gang bazelrc --server <endpoint>` and sets `gang get` as its credential helper.
+common --enable_bzlmod
+common --noenable_workspace
+common --lockfile_mode=off

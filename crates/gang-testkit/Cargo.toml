@@ -1,0 +1,34 @@
+[package]
+name = "gang-testkit"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+gang-clock = { workspace = true }
+gang-config = { workspace = true }
+gang-spi = { workspace = true }
+gang-types = { workspace = true }
+getrandom = { workspace = true }
+hex = { workspace = true }
+http = { workspace = true }
+p256 = { workspace = true }
+parking_lot = { workspace = true }
+rcgen = { workspace = true }
+rustls-pki-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+x509-cert = { workspace = true }

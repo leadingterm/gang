@@ -1,0 +1,31 @@
+[package]
+name = "gang-mtls"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+const-oid = { workspace = true }
+der = { workspace = true }
+ecdsa = { workspace = true }
+gang-clock = { workspace = true }
+gang-spi = { workspace = true }
+gang-types = { workspace = true }
+getrandom = { workspace = true }
+p256 = { workspace = true }
+percent-encoding = { workspace = true }
+sha2 = { workspace = true }
+spki = { workspace = true }
+thiserror = { workspace = true }
+x509-cert = { workspace = true, features = ["builder"] }
+
+[dev-dependencies]
+gang-testkit = { workspace = true }
+hex = { workspace = true }
+rustls-pki-types = { workspace = true }
+rustls-webpki = { workspace = true }
+tokio = { workspace = true }

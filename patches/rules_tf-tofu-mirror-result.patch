@@ -1,0 +1,32 @@
+--- a/tf/toolchains/tofu/toolchain.bzl	2026-11-11 14:08:05.049869538 +0400
++++ b/tf/toolchains/tofu/toolchain.bzl	2026-11-11 14:08:23.260354922 +0400
+@@ -72,11 +72,14 @@
+ 
+     ctx.file("versions.tf.json", content = json.encode(versions_tf))
+ 
+-    ctx.execute([
+-        "bash",
+-        "-c",
+-        "mkdir -p mirror; tofu/tofu providers mirror ./mirror > /dev/null",
+-        ])
++    # Upstream ignores this result, so a failed or timed-out mirror left a partial provider mirror behind
++    # (not yet reported to yanndegat/rules_tf).
++    res = ctx.execute(
++        ["bash", "-c", "mkdir -p mirror; tofu/tofu providers mirror ./mirror > /dev/null"],
++        timeout = ctx.attr.mirror_timeout,
++    )
++    if res.return_code != 0:
++        fail("tofu providers mirror failed with exit code {}: {}".format(res.return_code, res.stderr))
+ 
+     return
+ 
+@@ -87,6 +90,9 @@
+         "os": attr.string(mandatory = True),
+         "arch": attr.string(mandatory = True),
+         "mirror": attr.string_dict(mandatory = True),
++        # A cold mirror downloads every provider (~155 MB for hashicorp/aws per platform): one hour covers
++        # links down to ~45 KB/s, where Bazel's 600 s execute default needs ~260 KB/s.
++        "mirror_timeout": attr.int(default = 3600, doc = "Seconds allowed for `tofu providers mirror`."),
+     },
+ )
+ 

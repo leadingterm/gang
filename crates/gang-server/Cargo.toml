@@ -1,0 +1,43 @@
+[package]
+name = "gang-server"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+form_urlencoded = { workspace = true }
+futures = { workspace = true }
+gang-clock = { workspace = true }
+gang-config = { workspace = true }
+gang-mtls = { workspace = true }
+gang-reconciler = { workspace = true }
+gang-spi = { workspace = true }
+gang-state = { workspace = true }
+gang-tls = { workspace = true }
+gang-types = { workspace = true }
+gang-ui = { workspace = true }
+gang-wire = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+ipnet = { workspace = true }
+lru = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+allocation-counter = { workspace = true }
+gang-authn = { workspace = true }
+gang-testkit = { workspace = true }
+p256 = { workspace = true }
+tokio-rustls = { workspace = true }
+x509-cert = { workspace = true, features = ["builder"] }

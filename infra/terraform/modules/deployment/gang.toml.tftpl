@@ -1,0 +1,86 @@
+poll_interval = ${jsonencode(gang_settings.poll_interval)}
+client_action_timeout = ${jsonencode(gang_settings.client_action_timeout)}
+default_isa = ${jsonencode(default_isa)}
+listen = ${jsonencode("0.0.0.0:${public_port}")}
+worker_listen = ${jsonencode("0.0.0.0:${worker_port}")}
+endpoint = ${jsonencode(endpoint)}
+%{ for f in fleets }
+
+[[fleets]]
+name = ${jsonencode(f.name)}
+isa = ${jsonencode(f.isa)}
+sandbox = ${jsonencode(f.sandbox)}
+min_instances = ${f.min_instances}
+max_instances = ${f.max_instances}
+vcpus_per_instance = ${f.vcpus_per_instance}
+memory_per_instance = ${jsonencode(f.memory_per_instance)}
+disk_per_instance = ${jsonencode(f.disk_per_instance)}
+target_actions_per_instance = ${f.target_actions_per_instance}
+idle_timeout = ${jsonencode(f.idle_timeout)}
+max_drain_wait = ${jsonencode(f.max_drain_wait)}
+boot_grace = ${jsonencode(f.boot_grace)}
+
+[fleets.options]
+capacity = ${jsonencode(f.capacity)}
+%{ if f.machine_class != null ~}
+machine_class = ${jsonencode(f.machine_class)}
+%{ endif ~}
+%{ if f.fallback != null ~}
+[fleets.options.fallback]
+retry_spot_after = ${jsonencode(f.fallback.retry_spot_after)}
+drain_on_demand_first = ${f.fallback.drain_on_demand_first}
+%{ endif ~}
+%{ endfor }
+
+[execution]
+input_links = ${jsonencode(gang_settings.input_links)}
+
+[provisioner.aws]
+region = ${jsonencode(region)}
+scratch_mount_point = ${jsonencode(scratch_mount_point)}
+fleet_tag_key = ${jsonencode(fleet_tag_key)}
+
+[provisioner.aws.workload_token]
+audience = ${jsonencode(workload_token_audience)}
+
+[cache.s3]
+region = ${jsonencode(region)}
+bucket = ${jsonencode(cache_bucket_name)}
+
+[signer.kms]
+region = ${jsonencode(region)}
+key_id = ${jsonencode(ca_key_alias)}
+
+[scheduler.nativelink]
+worker_endpoint = ${jsonencode(worker_endpoint)}
+# NativeLink's controller and worker use this scheduler name.
+scheduler_name = "MAIN_SCHEDULER"
+
+[database.sqlite]
+# The controller image mounts its state volume at this path.
+path = "/var/lib/gang/gang.db"
+
+[sandbox.bwrap]
+# The NixOS worker image provides these paths for sandboxed actions.
+readonly_bind_paths = ["/nix/store", "/run/current-system/sw"]
+permit_network_property = ${gang_settings.permit_network_property}
+
+[limits.cgroup]
+
+[server]
+trust_domain = ${jsonencode(trust_domain)}
+# Workers trust this deployment's signer as their CA.
+ca_pin = "signer"
+
+[authentication.clients.token]
+providers = ${jsonencode(client_token_providers)}
+
+[authentication.workers.mtls]
+provider = "aws-workers"
+
+[identity.providers.aws-workers.oidc]
+issuer_url = ${jsonencode(issuer_url)}
+audience = ${jsonencode(workload_token_audience)}
+# The AWS worker identity is the STS subject.
+principal_claim = "sub"
+required_claims = { sub = ${jsonencode(worker_role_arn)} }${extra_config_toml != "" ? "\n\n${chomp(extra_config_toml)}" : ""}

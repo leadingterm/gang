@@ -1,0 +1,20 @@
+Gang
+Copyright 2026 The Gang Authors
+
+Gang is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Third-party software
+
+The `gang` binary embeds NativeLink (https://github.com/TraceMachina/nativelink),
+Copyright 2025 Trace Machina, Inc., licensed under the Functional Source License,
+Version 1.1, Apache 2.0 Future License (FSL-1.1-ALv2). Gang links the NativeLink
+crates nativelink-config, nativelink-scheduler, nativelink-store, nativelink-service,
+nativelink-worker, nativelink-util, nativelink-error, and nativelink-proto at
+tag v1.8.3. The license text is at
+https://github.com/TraceMachina/nativelink/blob/v1.8.3/LICENSE.
+
+The dashboard bundle (`ui/`) includes Preact and @preact/signals
+(https://github.com/preactjs), Copyright The Preact Authors, licensed under the MIT
+License, and the fonts Atkinson Hyperlegible Next and Atkinson Hyperlegible Mono,
+Copyright 2020-2024 their Project Authors, licensed under the SIL Open Font License,
+Version 1.1 (ui/fonts/OFL-sans.txt, ui/fonts/OFL-mono.txt).

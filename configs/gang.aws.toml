@@ -1,0 +1,125 @@
+poll_interval = "1s"
+client_action_timeout = "2m"
+default_isa = "x86-64"
+listen = "0.0.0.0:443"
+worker_listen = "0.0.0.0:9090"
+endpoint = "https://gang.example.com"
+
+
+[[fleets]]
+name = "gang-worker-x86-64"
+isa = "x86-64"
+sandbox = "bwrap"
+min_instances = 0
+max_instances = 4
+vcpus_per_instance = 15
+memory_per_instance = "29GiB"
+disk_per_instance = "200GiB"
+target_actions_per_instance = 16
+idle_timeout = "10m"
+max_drain_wait = "25m"
+boot_grace = "10m"
+
+[fleets.options]
+capacity = "spot"
+
+
+[[fleets]]
+name = "gang-worker-aarch64"
+isa = "aarch64"
+sandbox = "bwrap"
+min_instances = 0
+max_instances = 4
+vcpus_per_instance = 15
+memory_per_instance = "29GiB"
+disk_per_instance = "200GiB"
+target_actions_per_instance = 16
+idle_timeout = "10m"
+max_drain_wait = "25m"
+boot_grace = "10m"
+
+[fleets.options]
+capacity = "spot"
+
+
+[execution]
+input_links = "break"
+
+[provisioner.aws]
+region = "eu-north-1"
+scratch_mount_point = "/mnt/nvme"
+fleet_tag_key = "gang-fleet"
+
+[provisioner.aws.workload_token]
+audience = "gang"
+
+[cache.s3]
+region = "eu-north-1"
+bucket = "example-gang-cache"
+
+[signer.kms]
+region = "eu-north-1"
+key_id = "alias/gang-ca"
+
+[scheduler.nativelink]
+worker_endpoint = "grpcs://ip-10-20-0-10.eu-north-1.compute.internal:9090"
+# NativeLink's controller and worker use this scheduler name.
+scheduler_name = "MAIN_SCHEDULER"
+
+[database.sqlite]
+# The controller image mounts its state volume at this path.
+path = "/var/lib/gang/gang.db"
+
+[sandbox.bwrap]
+# The NixOS worker image provides these paths for sandboxed actions.
+readonly_bind_paths = ["/nix/store", "/run/current-system/sw"]
+permit_network_property = false
+
+[limits.cgroup]
+
+[server]
+trust_domain = "example.com"
+# Workers trust this deployment's signer as their CA.
+ca_pin = "signer"
+
+[authentication.clients.token]
+providers = ["google","github-actions"]
+
+[authentication.workers.mtls]
+provider = "aws-workers"
+
+[identity.providers.aws-workers.oidc]
+issuer_url = "https://issuer.example.com/123456789012"
+audience = "gang"
+# The AWS worker identity is the STS subject.
+principal_claim = "sub"
+required_claims = { sub = "arn:aws:iam::000000000000:role/gang-worker" }
+
+[[server.roles]]
+name        = "administrator"
+permissions = ["*"]
+principals  = [{ provider = "google", principal = "operator@example.com" }]
+
+[identity.providers.google.oidc]
+issuer_url = "https://accounts.google.com"
+audience = "000000000000-example.apps.googleusercontent.com"
+principal_claim = "email"
+required_claims = { hd = "example.com", email_verified = true }
+
+[identity.providers.google.oidc.login]
+# The native-app client secret is not confidential (RFC 8252): every CLI receives it, so it may stay in the public configuration.
+client_secret = "GOCSPX-example"
+scopes = ["openid", "email"]
+authorization_params = { access_type = "offline", prompt = "consent" }
+
+# The dashboard's confidential web client: its secret lives in a SecureString parameter, never in this public configuration.
+[dashboard.login]
+provider = "google"
+client_id = "000000000000-dashboard.apps.googleusercontent.com"
+client_secret_file = "/etc/gang/secrets/dashboard-client-secret"
+
+[identity.providers.github-actions.oidc]
+issuer_url = "https://token.actions.githubusercontent.com"
+audience = "gang"
+principal_claim = "sub"
+required_claims = { repository_owner_id = "0000000" }

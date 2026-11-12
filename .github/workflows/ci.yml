@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Every job is required: a gate that may fail is not a gate. Branch protection lists validate, macos, linux-arm64, e2e-gate-1 and e2e-gate-2.
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-ci
+      - name: Check BUILD files are in sync
+        run: nix develop -c bazelisk run //:gazelle.check
+      - name: Test
+        run: nix develop -c bazelisk test //...
+      # The UI build runs esbuild on the exec platform, not the cross-build target.
+      - name: Cross-build gang
+        run: nix develop -c bazelisk build --platforms=@zig_sdk//libc_aware/platform:linux_arm64_musl //:gang
+      - name: Check Nix formatting
+        run: nix develop -c alejandra --check .
+      - name: Evaluate NixOS configurations, checks, and images
+        run: |
+          for config in controller-x86_64 controller-aarch64 worker-x86_64 worker-aarch64; do
+            nix eval --raw ".#nixosConfigurations.${config}.config.system.build.toplevel.drvPath"
+            echo
+          done
+          for check in gang-scratch gang-config; do
+            nix eval --raw ".#checks.x86_64-linux.${check}.drvPath"
+            echo
+          done
+          for system in x86_64-linux aarch64-linux; do
+            for image in controller-image worker-image; do
+              nix eval --raw ".#packages.${system}.${image}.drvPath"
+              echo
+            done
+          done
+      - name: Lint scripts
+        run: nix develop -c shellcheck infra/scripts/*.sh
+      - name: Lint workflows
+        run: nix develop -c actionlint
+
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+        with:
+          nix_conf: |
+            experimental-features = nix-command flakes
+      - name: Build
+        run: nix develop -c bazelisk build //...
+      - name: Test the macOS-specific crates
+        run: nix develop -c bazelisk test //crates/gang-exec/... //crates/gang-noop/...
+
+  linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-ci
+      - name: Test
+        run: nix develop -c bazelisk test //...
+
+  e2e-gate-1:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-ci
+      - name: Delegate cgroup controllers to the user session
+        run: |
+          sudo mkdir -p /etc/systemd/system/user@.service.d
+          printf '[Service]\nDelegate=yes\n' | sudo tee /etc/systemd/system/user@.service.d/delegate.conf
+          sudo systemctl daemon-reload
+          sudo loginctl enable-linger "$(id -u)"
+          sudo systemctl restart "user@$(id -u).service"
+          sudo systemctl start "user@$(id -u).service"
+      # Workers use systemd-run --user --scope and need the runner's delegated user manager.
+      - name: Run Gate 1
+        run: XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-run --user --pipe --wait --same-dir -p Delegate=yes --setenv=PATH="$PATH" -- nix develop -c bazelisk run //crates/gang-e2e:local -- --gate 1
+
+  e2e-gate-2:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-ci
+      - name: Delegate cgroup controllers to the user session
+        run: |
+          sudo mkdir -p /etc/systemd/system/user@.service.d
+          printf '[Service]\nDelegate=yes\n' | sudo tee /etc/systemd/system/user@.service.d/delegate.conf
+          sudo systemctl daemon-reload
+          sudo loginctl enable-linger "$(id -u)"
+          sudo systemctl restart "user@$(id -u).service"
+          sudo systemctl start "user@$(id -u).service"
+      # Workers use systemd-run --user --scope and need the runner's delegated user manager.
+      - name: Run Gate 2 additions
+        run: XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-run --user --pipe --wait --same-dir -p Delegate=yes --setenv=PATH="$PATH" -- nix develop -c bazelisk run //crates/gang-e2e:local -- --gate 2 --additions

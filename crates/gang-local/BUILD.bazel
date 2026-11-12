@@ -1,0 +1,22 @@
+load("//bazel/rust:defs.bzl", "workspace_rust_binary", "workspace_rust_library")
+
+workspace_rust_library(
+    name = "gang_local",
+    dev_deps = ["//crates/gang-testkit:gang_testkit"],
+    test_env = {
+        "FAKE_LAUNCHER": "$(rootpath :fake_launcher)",
+    },
+    test_runtime_data = [":fake_launcher"],
+    deps = [
+        "//crates/gang-clock:gang_clock",
+        "//crates/gang-os:gang_os",
+        "//crates/gang-spi:gang_spi",
+        "//crates/gang-tls:gang_tls",
+        "//crates/gang-types:gang_types",
+    ],
+)
+
+workspace_rust_binary(
+    name = "fake_launcher",
+    src = "fake_launcher/main.rs",
+)

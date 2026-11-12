@@ -1,0 +1,59 @@
+[package]
+name = "gang-main"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anstream = { workspace = true }
+anstyle = { workspace = true }
+clap = { workspace = true }
+gang-authn = { workspace = true }
+gang-aws = { workspace = true }
+gang-bwrap = { workspace = true }
+gang-cgroup = { workspace = true }
+gang-client = { workspace = true }
+gang-clock = { workspace = true }
+gang-config = { workspace = true }
+gang-deploy = { workspace = true }
+gang-exec = { workspace = true }
+gang-local = { workspace = true }
+gang-macros = { workspace = true }
+gang-mtls = { workspace = true }
+gang-nativelink = { workspace = true }
+gang-noop = { workspace = true }
+gang-oidc = { workspace = true }
+gang-os = { workspace = true }
+gang-server = { workspace = true }
+gang-spi = { workspace = true }
+gang-sqlite = { workspace = true }
+gang-tls = { workspace = true }
+gang-types = { workspace = true }
+gang-wire = { workspace = true }
+gang-worker = { workspace = true }
+mimalloc = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+terminal_size = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-std"] }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+unicode-width = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+gang-testkit = { workspace = true }
+object = { workspace = true }
+rustix = { workspace = true }
+tempfile = { workspace = true }
+
+[[bin]]
+name = "gang"
+path = "src/main.rs"

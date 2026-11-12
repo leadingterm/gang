@@ -1,0 +1,5 @@
+load("//bazel/rust:defs.bzl", "workspace_rust_proc_macro")
+
+workspace_rust_proc_macro(
+    name = "gang_macros",
+)

@@ -1,0 +1,26 @@
+[package]
+name = "gang-state"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+gang-clock = { workspace = true }
+gang-reconciler = { workspace = true }
+gang-spi = { workspace = true }
+gang-types = { workspace = true }
+gang-wire = { workspace = true }
+itertools = { workspace = true }
+itoa = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+allocation-counter = { workspace = true }
+gang-config = { workspace = true }
+gang-testkit = { workspace = true }

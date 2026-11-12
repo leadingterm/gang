@@ -1,0 +1,19 @@
+load("//bazel/rust:defs.bzl", "workspace_rust_binary", "workspace_rust_library")
+
+workspace_rust_library(
+    name = "opentofu_runner",
+    test_env = {
+        "OPENTOFU_TOFU": "$(rootpath //bazel/opentofu:tofu)",
+        "OPENTOFU_PROVIDER_MIRROR": "$(rootpath //bazel/opentofu:provider_mirror)",
+    },
+    test_runtime_data = [
+        "//bazel/opentofu:tofu",
+        "//bazel/opentofu:provider_mirror",
+    ],
+)
+
+workspace_rust_binary(
+    name = "opentofu-runner",
+    src = "src/main.rs",
+    deps = [":opentofu_runner"],
+)

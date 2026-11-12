@@ -1,0 +1,204 @@
+load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_run_binary", "js_test")
+load("@aspect_rules_ts//ts:defs.bzl", "ts_config", "ts_project")
+load("@bazel_lib//lib:diff_test.bzl", "diff_test")
+load("@npm//:defs.bzl", "npm_link_all_packages")
+
+npm_link_all_packages(name = "node_modules")
+
+exports_files([
+    "headers.json",
+    "package.json",
+    "pnpm-lock.yaml",
+])
+
+SOURCES = glob([
+    "src/**/*.ts",
+    "src/**/*.tsx",
+])
+
+TESTS = glob([
+    "test/**/*.ts",
+    "test/**/*.tsx",
+])
+
+RUNTIME = [
+    ":node_modules/@preact/signals",
+    ":node_modules/preact",
+]
+
+# The app is checked against DOM types only; the tests add Node's.
+ts_config(
+    name = "tsconfig",
+    src = "tsconfig.json",
+)
+
+ts_config(
+    name = "tsconfig_test",
+    src = "tsconfig.test.json",
+    deps = [":tsconfig"],
+)
+
+# `tsc --strict` over the app and its tests; esbuild bundles, so nothing is emitted.
+ts_project(
+    name = "typecheck_src",
+    srcs = SOURCES,
+    no_emit = True,
+    tsconfig = ":tsconfig",
+    deps = RUNTIME,
+)
+
+ts_project(
+    name = "typecheck_test",
+    srcs = SOURCES + TESTS,
+    no_emit = True,
+    tsconfig = ":tsconfig_test",
+    deps = RUNTIME + [
+        ":node_modules/@types/node",
+        ":node_modules/preact-render-to-string",
+    ],
+)
+
+filegroup(
+    name = "typecheck",
+    srcs = [
+        ":typecheck_src",
+        ":typecheck_test",
+    ],
+)
+
+js_binary(
+    name = "build",
+    data = [":node_modules/esbuild"],
+    entry_point = "tools/build.mjs",
+)
+
+# The hashed, precompressed bundle the server embeds: index.html and assets/*, text files with .gz and .br.
+js_run_binary(
+    name = "dist",
+    srcs = SOURCES + RUNTIME + glob([
+        "src/**/*.css",
+        "fonts/*.woff2",
+    ]) + [
+        "index.html",
+        "package.json",
+        "tsconfig.json",
+    ],
+    args = ["dist"],
+    chdir = package_name(),
+    out_dirs = ["dist"],
+    tool = ":build",
+    # Execroot entry points hoist the tool's runfiles in the target configuration.
+    use_execroot_entry_point = False,
+    visibility = ["//visibility:public"],
+)
+
+[
+    js_test(
+        name = test.removeprefix("test/").removesuffix(".test.ts") + "_test",
+        size = "small",
+        data = SOURCES + RUNTIME + glob(["fixtures/*"]) + [
+            "package.json",
+            "test/sse.ts",
+        ],
+        entry_point = test,
+    )
+    for test in glob(["test/*.test.ts"])
+]
+
+js_binary(
+    name = "bundle_test",
+    data = [":node_modules/esbuild"],
+    entry_point = "tools/bundle-test.mjs",
+)
+
+# Node strips types but cannot run JSX, so TSX tests run from esbuild bundles.
+[
+    js_run_binary(
+        name = test.removeprefix("test/").removesuffix(".test.tsx") + "_test_bundle",
+        testonly = True,
+        srcs = SOURCES + RUNTIME + [
+            "package.json",
+            "test/scenario.ts",
+            "test/sse.ts",
+            test,
+            "tsconfig.json",
+            ":node_modules/preact-render-to-string",
+        ],
+        outs = ["test-bundle/" + test.removeprefix("test/").removesuffix(".tsx") + ".mjs"],
+        args = [
+            test,
+            "test-bundle/" + test.removeprefix("test/").removesuffix(".tsx") + ".mjs",
+        ],
+        chdir = package_name(),
+        tool = ":bundle_test",
+        # Keep esbuild's platform-dependent runfiles in the tool's exec configuration.
+        use_execroot_entry_point = False,
+    )
+    for test in glob(["test/*.test.tsx"])
+]
+
+[
+    js_test(
+        name = test.removeprefix("test/").removesuffix(".test.tsx") + "_test",
+        size = "small",
+        data = glob(["fixtures/*"]) + ["test/views.snapshot"],
+        entry_point = ":" + test.removeprefix("test/").removesuffix(".test.tsx") + "_test_bundle",
+    )
+    for test in glob(["test/*.test.tsx"])
+]
+
+js_test(
+    name = "budget_test",
+    size = "small",
+    chdir = package_name(),
+    data = [":dist"],
+    entry_point = "tools/budget.test.mjs",
+    fixed_args = ["dist"],
+)
+
+# Serves the bundle against the recorded fixture streams, with the production headers (`headers.json`).
+js_binary(
+    name = "preview",
+    chdir = package_name(),
+    data = [":dist"] + glob(["fixtures/*"]) + [
+        "headers.json",
+        "test/sse.ts",
+    ],
+    entry_point = "tools/preview.mjs",
+    fixed_args = ["dist"],
+)
+
+# The recorded wire fixtures, shared with the Rust schema tests that check the types against them.
+filegroup(
+    name = "fixtures",
+    srcs = glob(["fixtures/*"]),
+    visibility = ["//visibility:public"],
+)
+
+# `headers.json` is what the `/ui` routes send, as `gang-ui` defines it; the preview serves the same.
+genrule(
+    name = "headers_json",
+    outs = ["headers.generated.json"],
+    cmd = "$(execpath //crates/gang-bindings:gang-bindings) headers > $@",
+    tools = ["//crates/gang-bindings"],
+)
+
+diff_test(
+    name = "headers_json_test",
+    file1 = "headers.json",
+    file2 = ":headers_json",
+)
+
+# `src/wire.ts` is the output of `gang-bindings wire-ts`, derived by ts-rs from the `gang-wire` types.
+genrule(
+    name = "wire_generated",
+    outs = ["wire.generated.ts"],
+    cmd = "$(execpath //crates/gang-bindings:gang-bindings) wire-ts > $@",
+    tools = ["//crates/gang-bindings"],
+)
+
+diff_test(
+    name = "wire_ts_test",
+    file1 = "src/wire.ts",
+    file2 = ":wire_generated",
+)

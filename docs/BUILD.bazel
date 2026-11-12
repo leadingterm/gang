@@ -1,0 +1,9 @@
+exports_files(
+    ["API.md"],
+    visibility = ["//crates/gang-server:__pkg__"],
+)
+
+exports_files(
+    ["PLAN.md"],
+    visibility = ["//bazel/architecture:__pkg__"],
+)

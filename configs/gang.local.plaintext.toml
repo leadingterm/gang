@@ -1,0 +1,63 @@
+# Only the values this deployment chooses; every other key takes the default its field or section's Default impl documents in the owning crate (docs/SPECIFICATION.md §1.3 lists them).
+
+poll_interval = "500ms"
+client_action_timeout = "1m"
+default_isa = "x86-64"  # the ISA clients put in their platform properties
+listen = "127.0.0.1:50051"
+endpoint = "http://127.0.0.1:50051"
+worker_listen = "127.0.0.1:9090"
+
+[[fleets]]
+name = "local-worker-x86-64"
+isa = "x86-64"
+sandbox = "bwrap"  # on macOS: "noop", because bubblewrap is Linux-only
+min_instances = 0
+max_instances = 4
+vcpus_per_instance = 4
+memory_per_instance = "8GiB"
+disk_per_instance = "20GiB"
+target_actions_per_instance = 4
+idle_timeout = "15s"
+max_drain_wait = "1m"
+boot_grace = "30s"
+
+[provisioner.local]
+state_dir = "/tmp/gang-local"            # worker processes, scratch, and the workload JWT key
+mock_imds_listen = "127.0.0.1:16925"     # must be a loopback address
+# worker_launcher: optional argv prefix (default: none), e.g. ["systemd-run", "--user", "--scope", "-p", "Delegate=yes", "--"]; gives each worker its own delegated cgroup subtree so [limits.cgroup] works locally; needs [limits.cgroup] delegation = "trusted"
+
+[cache.filesystem]
+path = "/tmp/gang-local/cache"           # filesystem CAS and AC
+
+[signer.file]
+key_file = "/tmp/gang-local/ca.key"  # the local CA key, generated on first start; its directory is checked for owner and mode 0700
+
+[scheduler.nativelink]
+worker_endpoint = "grpc://127.0.0.1:9090"  # dialed by workers; gang-server listens on worker_listen
+scheduler_name = "MAIN_SCHEDULER"
+
+[database.sqlite]
+path = "/tmp/gang-local/gang.db"
+busy_timeout = "5s"
+
+[sandbox.noop]
+
+[sandbox.bwrap]
+# On hosts without Nix, list directories containing actions' shells, tools, and libraries instead (e.g. "/usr", "/bin", "/lib", "/lib64").
+readonly_bind_paths = ["/nix/store"]
+permit_network_property = false
+
+# Optional [limits.cgroup] (Linux only): needs a delegated cgroup v2 subtree; locally set delegation = "trusted", because the user manager sets no delegate marker on the worker_launcher's scope (systemd_marker needs a system unit with Delegate=yes). Its keys and defaults are documented in crates/gang-cgroup/src/config.rs.
+
+[server]
+transport = "plaintext"
+
+[identity.providers.local-workers.oidc]
+issuer_url = "http://127.0.0.1:16925"
+audience = "gang"
+principal_claim = "sub"
+required_claims = {}
+
+[authentication.clients.none]
+
+[authentication.workers.none]

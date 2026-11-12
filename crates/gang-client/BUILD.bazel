@@ -1,0 +1,36 @@
+load("//bazel/rust:defs.bzl", "workspace_rust_binary", "workspace_rust_library")
+
+workspace_rust_library(
+    name = "gang_client",
+    dev_deps = [
+        "//crates/gang-mtls:gang_mtls",
+        "//crates/gang-testkit:gang_testkit",
+    ],
+    test_env = {
+        "FAKE_CREDENTIAL_HELPER": "$(rootpath :fake_credential_helper)",
+        "FAKE_BAZEL": "$(rootpath :fake_bazel)",
+    },
+    test_runtime_data = [
+        ":fake_credential_helper",
+        ":fake_bazel",
+    ],
+    deps = [
+        "//crates/gang-clock:gang_clock",
+        "//crates/gang-os:gang_os",
+        "//crates/gang-spi:gang_spi",
+        "//crates/gang-tls:gang_tls",
+        "//crates/gang-types:gang_types",
+        "//crates/gang-wire:gang_wire",
+    ],
+)
+
+workspace_rust_binary(
+    name = "fake_credential_helper",
+    src = "fake_credential_helper/main.rs",
+)
+
+workspace_rust_binary(
+    name = "fake_bazel",
+    src = "fake_bazel/main.rs",
+    deps = ["//crates/gang-os:gang_os"],
+)

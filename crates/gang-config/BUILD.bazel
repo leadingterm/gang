@@ -1,0 +1,7 @@
+load("//bazel/rust:defs.bzl", "workspace_rust_library")
+
+workspace_rust_library(
+    name = "gang_config",
+    proc_macro_deps = ["//crates/gang-macros:gang_macros"],
+    deps = ["//crates/gang-types:gang_types"],
+)
