@@ -1,0 +1,30 @@
+{
+  "roles": [
+    {
+      "name": "roles/administrator",
+      "permissions": [
+        "state.read",
+        "principals.read",
+        "events.read",
+        "principals.revoke"
+      ],
+      "principals": [
+        "principals/google%3Aops%40example.org",
+        "principals/google%3Amira.okafor%40example.org"
+      ]
+    },
+    {
+      "name": "roles/viewer",
+      "permissions": [
+        "state.read",
+        "principals.read",
+        "events.read"
+      ],
+      "principals": [
+        "principals/google%3Aj.lindqvist%40example.org",
+        "principals/google%3Abuild-oncall%40example.org",
+        "principals/google%3At.ruiz%40example.org"
+      ]
+    }
+  ]
+}

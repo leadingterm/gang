@@ -1,0 +1,29 @@
+load("//bazel/rust:defs.bzl", "workspace_rust_library")
+
+workspace_rust_library(
+    name = "gang_server",
+    dev_deps = [
+        "//crates/gang-authn:gang_authn",
+        "//crates/gang-testkit:gang_testkit",
+    ],
+    test_data = glob(
+        [
+            "Cargo.toml",
+            "src/**/*.rs",
+            "tests/fixtures/**",
+        ],
+        allow_empty = True,
+    ) + ["//docs:API.md"],
+    deps = [
+        "//crates/gang-clock:gang_clock",
+        "//crates/gang-config:gang_config",
+        "//crates/gang-mtls:gang_mtls",
+        "//crates/gang-reconciler:gang_reconciler",
+        "//crates/gang-spi:gang_spi",
+        "//crates/gang-state:gang_state",
+        "//crates/gang-tls:gang_tls",
+        "//crates/gang-types:gang_types",
+        "//crates/gang-ui:gang_ui",
+        "//crates/gang-wire:gang_wire",
+    ],
+)

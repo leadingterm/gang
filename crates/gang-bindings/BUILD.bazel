@@ -1,0 +1,11 @@
+load("//bazel/rust:defs.bzl", "workspace_rust_binary")
+
+workspace_rust_binary(
+    name = "gang-bindings",
+    src = "src/main.rs",
+    deps = [
+        "//crates/gang-types:gang_types",
+        "//crates/gang-ui:gang_ui",
+        "//crates/gang-wire:gang_wire",
+    ],
+)

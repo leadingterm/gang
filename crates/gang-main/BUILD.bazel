@@ -1,0 +1,63 @@
+load("//bazel/rust:defs.bzl", "workspace_rust_binary", "workspace_rust_library")
+
+workspace_rust_library(
+    name = "gang_main",
+    dev_deps = ["//crates/gang-testkit:gang_testkit"],
+    proc_macro_deps = ["//crates/gang-macros:gang_macros"],
+    test_env = select({
+        "@platforms//os:linux": {
+            "GANG_BIN": "$(rootpath :gang)",
+            "GANG_CHECKED_IN_CONFIGS": "$(rootpaths //configs:checked_in_configs)",
+            "LOADED_PROBE": "$(rootpath //crates/gang-main/tests/preload:loaded_probe)",
+            "PRELOAD_LIB": "$(rootpath //crates/gang-main/tests/preload:preload_lib)",
+            "FAKE_LAUNCHER": "$(rootpath //crates/gang-local:fake_launcher)",
+        },
+        "//conditions:default": {
+            "GANG_CHECKED_IN_CONFIGS": "$(rootpaths //configs:checked_in_configs)",
+            "FAKE_LAUNCHER": "$(rootpath //crates/gang-local:fake_launcher)",
+        },
+    }),
+    test_runtime_data = select({
+        "@platforms//os:linux": [
+            ":gang",
+            "//configs:checked_in_configs",
+            "//crates/gang-main/tests/preload:loaded_probe",
+            "//crates/gang-main/tests/preload:preload_lib",
+            "//crates/gang-local:fake_launcher",
+        ],
+        "//conditions:default": [
+            "//configs:checked_in_configs",
+            "//crates/gang-local:fake_launcher",
+        ],
+    }),
+    deps = [
+        "//crates/gang-authn:gang_authn",
+        "//crates/gang-aws:gang_aws",
+        "//crates/gang-bwrap:gang_bwrap",
+        "//crates/gang-cgroup:gang_cgroup",
+        "//crates/gang-client:gang_client",
+        "//crates/gang-clock:gang_clock",
+        "//crates/gang-config:gang_config",
+        "//crates/gang-deploy:gang_deploy",
+        "//crates/gang-exec:gang_exec",
+        "//crates/gang-local:gang_local",
+        "//crates/gang-mtls:gang_mtls",
+        "//crates/gang-nativelink:gang_nativelink",
+        "//crates/gang-noop:gang_noop",
+        "//crates/gang-oidc:gang_oidc",
+        "//crates/gang-os:gang_os",
+        "//crates/gang-server:gang_server",
+        "//crates/gang-spi:gang_spi",
+        "//crates/gang-sqlite:gang_sqlite",
+        "//crates/gang-tls:gang_tls",
+        "//crates/gang-types:gang_types",
+        "//crates/gang-wire:gang_wire",
+        "//crates/gang-worker:gang_worker",
+    ],
+)
+
+workspace_rust_binary(
+    name = "gang",
+    src = "src/main.rs",
+    deps = [":gang_main"],
+)

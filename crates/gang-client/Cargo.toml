@@ -1,0 +1,37 @@
+[package]
+name = "gang-client"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+bytes = { workspace = true }
+gang-clock = { workspace = true }
+gang-os = { workspace = true }
+gang-spi = { workspace = true }
+gang-tls = { workspace = true }
+gang-types = { workspace = true }
+gang-wire = { workspace = true }
+http = { workspace = true }
+httpdate = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+gang-mtls = { workspace = true }
+gang-testkit = { workspace = true }
+hyper-util = { workspace = true, features = ["http2", "server-auto", "tokio"] }
+parking_lot = { workspace = true }
+rustls = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

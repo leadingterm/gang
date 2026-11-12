@@ -1,0 +1,8 @@
+# The Linux target platform of every Gang build: the host's OS and CPU with the musl libc, so that
+# every Linux binary is static and never runs the dynamic loader.
+platform(
+    name = "linux_musl",
+    constraint_values = ["@zig_sdk//libc:musl"],
+    parents = ["@platforms//host"],
+    visibility = ["//visibility:public"],
+)

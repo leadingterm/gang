@@ -1,0 +1,243 @@
+"""Gang's hermetic build graph: Rust and the dashboard UI."""
+
+module(
+    name = "gang",
+    version = "0.1.0",
+)
+
+RUST_VERSION = "1.97.1"
+
+# zig's musl supplies the C runtime, so rustc must not add its own self-contained copy (duplicate _start).
+MUSL_RUSTC_FLAGS = ["-Clink-self-contained=no"]
+MUSL_RUSTC_FLAGS_BY_TRIPLE = {
+    "x86_64-unknown-linux-musl": MUSL_RUSTC_FLAGS,
+    "aarch64-unknown-linux-musl": MUSL_RUSTC_FLAGS,
+}
+
+LINUX_X86_64_MUSL_COMPATIBLE = [
+    "@platforms//cpu:x86_64",
+    "@platforms//os:linux",
+    "@zig_sdk//libc:musl",
+]
+LINUX_AARCH64_MUSL_COMPATIBLE = [
+    "@platforms//cpu:aarch64",
+    "@platforms//os:linux",
+    "@zig_sdk//libc:musl",
+]
+
+bazel_dep(name = "rules_rust", version = "0.72.0")
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "hermetic_cc_toolchain", version = "4.3.0")
+bazel_dep(name = "rules_tf", version = "0.0.10")
+bazel_dep(name = "aspect_rules_js", version = "3.2.3")
+bazel_dep(name = "aspect_rules_ts", version = "3.10.0")
+bazel_dep(name = "rules_nodejs", version = "6.7.5")
+bazel_dep(name = "bazel_lib", version = "3.2.2")
+
+bazel_dep(name = "aspect_gazelle_prebuilt", version = "0.0.24", dev_dependency = True)
+
+single_version_override(
+    module_name = "rules_rust",
+    patch_strip = 1,
+    patches = [
+        "//:patches/rules_rust-rustdoc-test-source-roots.patch",
+        "//:patches/rules_rust-repository-set-triple-flags.patch",
+    ],
+    version = "0.72.0",
+)
+
+http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
+# The Bazel the e2e harness drives in its sample workspace (crates/gang-e2e); each download below is pinned by checksum.
+BAZEL_VERSION = "8.7.0"
+
+http_file(
+    name = "bazel_linux_x86_64",
+    dev_dependency = True,
+    downloaded_file_path = "bazel",
+    executable = True,
+    sha256 = "d7606e679b78067c811096fb3d6cf135225b528835ca396e3a4dddf957859544",
+    urls = ["https://github.com/bazelbuild/bazel/releases/download/" + BAZEL_VERSION + "/bazel-" + BAZEL_VERSION + "-linux-x86_64"],
+)
+
+http_file(
+    name = "bazel_linux_arm64",
+    dev_dependency = True,
+    downloaded_file_path = "bazel",
+    executable = True,
+    sha256 = "bfe9558bd8a2ecfe4841ec46c0dbccb4b469fe22d81f2f859de0de222b3e7ce3",
+    urls = ["https://github.com/bazelbuild/bazel/releases/download/" + BAZEL_VERSION + "/bazel-" + BAZEL_VERSION + "-linux-arm64"],
+)
+
+http_file(
+    name = "bazel_darwin_arm64",
+    dev_dependency = True,
+    downloaded_file_path = "bazel",
+    executable = True,
+    sha256 = "575f20fb23955e02f73519befd180df635b4ed0960c60f0e70fcc8d74014a713",
+    urls = ["https://github.com/bazelbuild/bazel/releases/download/" + BAZEL_VERSION + "/bazel-" + BAZEL_VERSION + "-darwin-arm64"],
+)
+
+# Third-party static bash builds (robxu9/bash-static), sha256-pinned, dev-only: used only to run the sample's own shell snippet (gang-e2e hold_signal test).
+http_file(
+    name = "test_bash_linux_x86_64",
+    dev_dependency = True,
+    downloaded_file_path = "bash",
+    executable = True,
+    sha256 = "64469a9512a00199c85622ec56f870f97d50457a4e06e0cfa39bae7adf0cc8f2",
+    urls = ["https://github.com/robxu9/bash-static/releases/download/5.2.015-1.2.3-2/bash-linux-x86_64"],
+)
+
+http_file(
+    name = "test_bash_linux_arm64",
+    dev_dependency = True,
+    downloaded_file_path = "bash",
+    executable = True,
+    sha256 = "8877ad33344af461ed801066322fd9a7808cd73e4e81087da228e32e8fad54ca",
+    urls = ["https://github.com/robxu9/bash-static/releases/download/5.2.015-1.2.3-2/bash-linux-aarch64"],
+)
+
+http_file(
+    name = "test_bash_macos_arm64",
+    dev_dependency = True,
+    downloaded_file_path = "bash",
+    executable = True,
+    sha256 = "5d783a12a553a45bcd9ecb4f390907f4e3827844d090dd7abfbb768c9392657a",
+    urls = ["https://github.com/robxu9/bash-static/releases/download/5.2.015-1.2.3-2/bash-macos-aarch64"],
+)
+
+single_version_override(
+    module_name = "rules_tf",
+    patch_strip = 1,
+    patches = ["//:patches/rules_tf-tofu-mirror-result.patch"],
+    version = "0.0.10",
+)
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2024",
+    versions = [RUST_VERSION],
+)
+rust.repository_set(
+    name = "rust_linux_x86_64",
+    edition = "2024",
+    exec_triple = "x86_64-unknown-linux-gnu",
+    extra_rustc_flags = MUSL_RUSTC_FLAGS,
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+        "@zig_sdk//libc:unconstrained",
+    ],
+    target_triple = "x86_64-unknown-linux-gnu",
+    versions = [RUST_VERSION],
+)
+rust.repository_set(
+    name = "rust_linux_x86_64",
+    target_compatible_with = LINUX_X86_64_MUSL_COMPATIBLE,
+    target_triple = "x86_64-unknown-linux-musl",
+)
+rust.repository_set(
+    name = "rust_linux_x86_64",
+    target_compatible_with = LINUX_AARCH64_MUSL_COMPATIBLE,
+    target_triple = "aarch64-unknown-linux-musl",
+)
+rust.repository_set(
+    name = "rust_linux_aarch64",
+    edition = "2024",
+    exec_triple = "aarch64-unknown-linux-gnu",
+    extra_rustc_flags = MUSL_RUSTC_FLAGS,
+    target_compatible_with = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+        "@zig_sdk//libc:unconstrained",
+    ],
+    target_triple = "aarch64-unknown-linux-gnu",
+    versions = [RUST_VERSION],
+)
+rust.repository_set(
+    name = "rust_linux_aarch64",
+    target_compatible_with = LINUX_X86_64_MUSL_COMPATIBLE,
+    target_triple = "x86_64-unknown-linux-musl",
+)
+rust.repository_set(
+    name = "rust_linux_aarch64",
+    target_compatible_with = LINUX_AARCH64_MUSL_COMPATIBLE,
+    target_triple = "aarch64-unknown-linux-musl",
+)
+rust.repository_set(
+    name = "rust_macos_aarch64",
+    edition = "2024",
+    exec_triple = "aarch64-apple-darwin",
+    extra_rustc_flags_triples = MUSL_RUSTC_FLAGS_BY_TRIPLE,
+    target_compatible_with = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:macos",
+    ],
+    target_triple = "aarch64-apple-darwin",
+    versions = [RUST_VERSION],
+)
+rust.repository_set(
+    name = "rust_macos_aarch64",
+    target_compatible_with = LINUX_X86_64_MUSL_COMPATIBLE,
+    target_triple = "x86_64-unknown-linux-musl",
+)
+rust.repository_set(
+    name = "rust_macos_aarch64",
+    target_compatible_with = LINUX_AARCH64_MUSL_COMPATIBLE,
+    target_triple = "aarch64-unknown-linux-musl",
+)
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")
+
+cc = use_extension("@hermetic_cc_toolchain//toolchain:ext.bzl", "toolchains")
+use_repo(cc, "zig_sdk")
+
+register_toolchains(
+    "@zig_sdk//libc_aware/toolchain:linux_amd64_musl",
+    "@zig_sdk//libc_aware/toolchain:linux_arm64_musl",
+    "@zig_sdk//toolchain:linux_amd64_gnu.2.31",
+    "@zig_sdk//toolchain:linux_arm64_gnu.2.31",
+)
+
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "rust_crates",
+    cargo_lockfile = "//:Cargo.lock",
+    lockfile = "//:Cargo.Bazel.lock",
+    manifests = ["//:Cargo.toml"],
+)
+use_repo(crate, "rust_crates")
+
+tf = use_extension("@rules_tf//tf:extensions.bzl", "tf_repositories")
+tf.download(
+    mirror = {
+        "aws": "hashicorp/aws:6.72.0",
+    },
+    use_tofu = True,
+    version = "1.11.6",
+)
+use_repo(tf, "tf_toolchains")
+
+register_toolchains("@tf_toolchains//:all")
+
+node = use_extension("@rules_nodejs//nodejs:extensions.bzl", "node")
+node.toolchain(node_version = "24.13.0")
+
+pnpm = use_extension("@aspect_rules_js//npm:extensions.bzl", "pnpm", dev_dependency = True)
+pnpm.pnpm(
+    name = "pnpm",
+    pnpm_version_from = "//ui:package.json",
+)
+use_repo(pnpm, "pnpm")
+
+npm = use_extension("@aspect_rules_js//npm:extensions.bzl", "npm")
+npm.npm_translate_lock(
+    name = "npm",
+    pnpm_lock = "//ui:pnpm-lock.yaml",
+)
+use_repo(npm, "npm")
+
+typescript = use_extension("@aspect_rules_ts//ts:extensions.bzl", "typescript")
+typescript.deps(version_from = "//ui:package.json")
+use_repo(typescript, "npm_typescript")

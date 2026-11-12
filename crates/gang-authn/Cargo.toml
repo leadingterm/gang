@@ -1,0 +1,28 @@
+[package]
+name = "gang-authn"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+gang-clock = { workspace = true }
+gang-spi = { workspace = true }
+gang-types = { workspace = true }
+http = { workspace = true }
+p256 = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+gang-testkit = { workspace = true }
+hex = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

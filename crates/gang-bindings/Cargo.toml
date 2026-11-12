@@ -1,0 +1,22 @@
+[package]
+name = "gang-bindings"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+gang-types = { workspace = true }
+gang-ui = { workspace = true }
+gang-wire = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+ts-rs = { workspace = true }
+
+[[bin]]
+name = "gang-bindings"
+path = "src/main.rs"

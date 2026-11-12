@@ -1,0 +1,58 @@
+[package]
+name = "gang-e2e"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+axum = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+gang-authn = { workspace = true }
+gang-bwrap = { workspace = true }
+gang-cgroup = { workspace = true }
+gang-clock = { workspace = true }
+gang-config = { workspace = true }
+gang-local = { workspace = true }
+gang-main = { workspace = true }
+gang-nativelink = { workspace = true }
+gang-oidc = { workspace = true }
+gang-os = { workspace = true }
+gang-state = { workspace = true }
+gang-tls = { workspace = true }
+gang-testkit = { workspace = true }
+gang-types = { workspace = true }
+gang-ui = { workspace = true }
+gang-wire = { workspace = true }
+getrandom = { workspace = true }
+h2 = { workspace = true }
+hex = { workspace = true }
+http = { workspace = true }
+p256 = { workspace = true }
+parking_lot = { workspace = true }
+rustix = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sysinfo = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+toml = { workspace = true }
+x509-cert = { workspace = true }
+
+[dev-dependencies]
+http-body-util = { workspace = true }
+gang-spi = { workspace = true }
+
+[[bin]]
+name = "local"
+path = "src/main.rs"

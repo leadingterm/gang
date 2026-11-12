@@ -1,0 +1,106 @@
+/* Hallmark · custom theme: Dark Forest · vibe: canopy control room, dark cockpit
+ * paper oklch(14.5% 0.016 160) · accent oklch(76% 0.135 150) fern · display + body Atkinson Hyperlegible Next · data Atkinson Hyperlegible Mono
+ * Dark only. Colour means state: normal is quiet, deviations light up (dark-cockpit principle). */
+
+@font-face {
+  font-family: "Atkinson Hyperlegible Next";
+  src: url("../fonts/sans.woff2") format("woff2");
+  font-weight: 200 800;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Atkinson Hyperlegible Mono";
+  src: url("../fonts/mono.woff2") format("woff2");
+  font-weight: 200 800;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  color-scheme: dark;
+
+  /* Surfaces: forest floor to canopy. Every neutral carries green chroma. */
+  --color-paper: oklch(14.5% 0.016 160);
+  --color-paper-2: oklch(17.5% 0.019 158);
+  --color-paper-3: oklch(21% 0.022 155);
+  --color-rule: oklch(27% 0.022 152);
+  --color-rule-2: oklch(36% 0.026 148);
+  --color-edge: oklch(50% 0.03 145); /* control boundaries: 3:1 against paper */
+
+  /* Text: lichen whites. */
+  --color-ink: oklch(93% 0.018 125);
+  --color-ink-2: oklch(81% 0.022 135);
+  --color-muted: oklch(68% 0.024 140);
+
+  /* Accent: fern for lines, text and focus; forest and moss for fills. */
+  --color-accent: oklch(76% 0.135 150);
+  --color-accent-deep: oklch(46% 0.1 152);
+  --color-accent-moss: oklch(31% 0.055 148);
+  --color-accent-ink: oklch(14.5% 0.016 160);
+  --color-focus: oklch(86% 0.15 145);
+
+  /* Bark: winding down (draining, terminating, paused). */
+  --color-bark: oklch(72% 0.075 62);
+  --color-bark-deep: oklch(36% 0.045 58);
+
+  /* Caution: stale, aged, unplaceable. Warning: skipped, lost, revoked, failed. */
+  --color-amber: oklch(83% 0.14 82);
+  --color-amber-deep: oklch(27% 0.055 80);
+  --color-red: oklch(72% 0.16 27);
+  --color-red-deep: oklch(26% 0.07 27);
+
+  /* Hatches for transitional state. */
+  --hatch-pending: repeating-linear-gradient(135deg, var(--color-ink-2) 0 1px, transparent 1px 4px);
+  --hatch-unknown: repeating-linear-gradient(90deg, var(--color-rule) 0 1px, transparent 1px 4px);
+  --hatch-stale: repeating-linear-gradient(135deg, var(--color-amber-deep) 0 6px, transparent 6px 12px);
+
+  /* Type */
+  --font-sans: "Atkinson Hyperlegible Next", ui-sans-serif, sans-serif;
+  --font-mono: "Atkinson Hyperlegible Mono", ui-monospace, monospace;
+  --text-2xs: 0.6875rem;
+  --text-xs: 0.75rem;
+  --text-sm: 0.8125rem;
+  --text-md: 0.875rem;
+  --text-lg: 1rem;
+  --text-xl: 1.25rem;
+  --text-2xl: 1.75rem;
+  --text-3xl: 2.5rem;
+  --leading-tight: 1.15;
+  --leading-body: 1.45;
+  --tracking-code: 0.08em;
+  --measure: 62ch;
+
+  /* Space: 4px scale. */
+  --space-3xs: 2px;
+  --space-2xs: 4px;
+  --space-xs: 8px;
+  --space-sm: 12px;
+  --space-md: 16px;
+  --space-lg: 24px;
+  --space-xl: 32px;
+  --space-2xl: 48px;
+  --space-3xl: 64px;
+
+  /* Shape */
+  --radius-sm: 2px;
+  --radius-md: 4px;
+  --rule-hair: 1px;
+  --control-h: 36px;
+  --target-min: 44px;
+  --strip-h: 52px;
+  --cell: 18px;
+  --cell-gap: 3px;
+  --shell-max: 1440px;
+
+  /* Motion: values tween, rows settle, nothing flashes. */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in: cubic-bezier(0.7, 0, 0.84, 0);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --dur-micro: 120ms;
+  --dur-short: 220ms;
+  --dur-long: 420ms;
+  --dur-settle: 640ms;
+  --dur-ambient: 2400ms;
+}

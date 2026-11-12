@@ -1,0 +1,12 @@
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-unwrap-in-tests = true
+
+disallowed-types = [
+    { path = "std::rc::Rc", reason = "use owned values or borrows; shared ownership hides state" },
+    { path = "std::rc::Weak", reason = "use owned values or borrows; shared ownership hides state" },
+    { path = "std::cell::RefCell", reason = "use lexical `&mut self` state machines" },
+    { path = "std::sync::Mutex", reason = "use parking_lot::Mutex: it does not poison" },
+    { path = "std::sync::RwLock", reason = "use parking_lot::RwLock: it does not poison" },
+    { path = "std::sync::Condvar", reason = "use parking_lot::Condvar with parking_lot::Mutex" },
+]

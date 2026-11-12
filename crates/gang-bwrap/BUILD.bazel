@@ -1,0 +1,20 @@
+load("//bazel/rust:defs.bzl", "workspace_rust_binary", "workspace_rust_library")
+
+workspace_rust_library(
+    name = "gang_bwrap",
+    test_env = {
+        "FAKE_BWRAP": "$(rootpath :fake_bwrap)",
+    },
+    test_runtime_data = [":fake_bwrap"],
+    deps = [
+        "//crates/gang-os:gang_os",
+        "//crates/gang-spi:gang_spi",
+        "//crates/gang-types:gang_types",
+    ],
+)
+
+workspace_rust_binary(
+    name = "fake_bwrap",
+    src = "fake_bwrap/main.rs",
+    deps = ["//crates/gang-os:gang_os"],
+)

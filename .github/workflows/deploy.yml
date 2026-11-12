@@ -1,0 +1,268 @@
+# Reusable deploy pipeline for one OpenTofu root: plans reviewed pull requests and applies merged plans on main.
+#
+# Call it from a job in the caller repository, pinned to a Gang tag:
+#
+#   jobs:
+#     deploy:
+#       uses: <owner>/gang/.github/workflows/deploy.yml@<tag>
+#       with:
+#         root: infra
+#         plan_role_arn: arn:aws:iam::000000000000:role/example-plan
+#         apply_role_arn: arn:aws:iam::000000000000:role/example-apply
+#         state_bucket: example-state
+#         state_key: infra/terraform.tfstate
+#         state_region: us-east-1
+#         kms_key_arn: arn:aws:kms:us-east-1:000000000000:key/example
+#         plan_bucket: example-plans
+#         plan_prefix: plans
+#       permissions:
+#         contents: read
+#         id-token: write
+#         pull-requests: write
+#         actions: read
+#
+# Optional inputs: apply_environment (default production), plan_max_age_seconds (default 86400), runner (default ubuntu-24.04).
+#
+# One call per repository; the manifest, comment marker and plan key do not name a root.
+#
+# The job `gang` builds the gang binary from the Gang checkout once per run; the plan and apply jobs
+# download it and run the deploy decisions with it (`gang deploy`, through $GANG).
+
+name: Deploy
+
+on:
+  workflow_call:
+    inputs:
+      root:
+        required: true
+        type: string
+      plan_role_arn:
+        required: true
+        type: string
+      apply_role_arn:
+        required: true
+        type: string
+      state_bucket:
+        required: true
+        type: string
+      state_key:
+        required: true
+        type: string
+      state_region:
+        required: true
+        type: string
+      kms_key_arn:
+        required: true
+        type: string
+      plan_bucket:
+        required: true
+        type: string
+      plan_prefix:
+        required: true
+        type: string
+      apply_environment:
+        type: string
+        default: production
+      plan_max_age_seconds:
+        type: string
+        default: "86400"
+      runner:
+        type: string
+        default: ubuntu-24.04
+
+permissions:
+  contents: read
+
+# Every run step executes inside the deploy dev shell. That shell exists only after the checkout
+# and nix-install steps of each job, which therefore stay as plain steps: a composite action
+# cannot carry them, because a local action resolves only after the Gang checkout it would perform.
+defaults:
+  run:
+    shell: nix develop ./.gang#deploy -c bash -euo pipefail {0}
+
+# Pull request runs of one PR replace each other; main runs are serialised by the apply job alone.
+concurrency:
+  group: deploy-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  TF_IN_AUTOMATION: "1"
+  ROOT: ${{ inputs.root }}
+  INFRA_STATE_BUCKET: ${{ inputs.state_bucket }}
+  INFRA_STATE_KEY: ${{ inputs.state_key }}
+  INFRA_STATE_REGION: ${{ inputs.state_region }}
+  INFRA_STATE_KMS_KEY_ARN: ${{ inputs.kms_key_arn }}
+  INFRA_PLAN_BUCKET: ${{ inputs.plan_bucket }}
+  INFRA_PLAN_PREFIX: ${{ inputs.plan_prefix }}
+  INFRA_PLAN_MAX_AGE_SECONDS: ${{ inputs.plan_max_age_seconds }}
+
+jobs:
+  validate:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .gang
+          persist-credentials: false
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+        with:
+          nix_conf: |
+            experimental-features = nix-command flakes
+      - name: Validate the OpenTofu root
+        run: .gang/infra/scripts/reviewed-plan.sh validate
+
+  gang:
+    # Only the plan and apply jobs run gang.
+    if: >-
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .gang
+          persist-credentials: false
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+        with:
+          nix_conf: |
+            experimental-features = nix-command flakes
+      # Bazel runs inside its workspace, the Gang checkout, with the Gang dev shell.
+      - name: Build gang
+        shell: bash
+        working-directory: .gang
+        run: |
+          nix develop -c bazelisk build -c opt //:gang
+          built="$(nix develop -c bazelisk cquery -c opt --output=files //:gang)"
+          install -m 0755 "$built" "$RUNNER_TEMP/gang"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gang
+          path: ${{ runner.temp }}/gang
+          if-no-files-found: error
+          overwrite: true
+
+  plan:
+    needs: [validate, gang]
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .gang
+          persist-credentials: false
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+        with:
+          nix_conf: |
+            experimental-features = nix-command flakes
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gang
+          path: ${{ runner.temp }}/gang-bin
+      - name: Install gang
+        shell: bash
+        run: |
+          chmod +x "$RUNNER_TEMP/gang-bin/gang"
+          echo "GANG=$RUNNER_TEMP/gang-bin/gang" >> "$GITHUB_ENV"
+      - name: Assume plan role
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
+        with:
+          role-to-assume: ${{ inputs.plan_role_arn }}
+          aws-region: ${{ inputs.state_region }}
+          role-session-name: deploy-plan-${{ github.run_id }}
+      - name: Initialise backend
+        run: .gang/infra/scripts/reviewed-plan.sh init
+      - name: Plan
+        id: plan
+        run: .gang/infra/scripts/reviewed-plan.sh plan
+      - name: Store reviewed plan
+        if: always() && steps.plan.outputs.blocked == 'false'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: .gang/infra/scripts/reviewed-plan.sh store
+      - name: Publish plan comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: .gang/infra/scripts/reviewed-plan.sh publish
+
+  apply:
+    needs: [validate, gang]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ${{ inputs.runner }}
+    environment: ${{ inputs.apply_environment }}
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+      pull-requests: read
+    concurrency:
+      group: deploy-apply-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .gang
+          persist-credentials: false
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+        with:
+          nix_conf: |
+            experimental-features = nix-command flakes
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gang
+          path: ${{ runner.temp }}/gang-bin
+      - name: Install gang
+        shell: bash
+        run: |
+          chmod +x "$RUNNER_TEMP/gang-bin/gang"
+          echo "GANG=$RUNNER_TEMP/gang-bin/gang" >> "$GITHUB_ENV"
+      - name: Resolve reviewed plan
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .gang/infra/scripts/reviewed-plan.sh resolve
+      - name: Assume apply role
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
+        with:
+          role-to-assume: ${{ inputs.apply_role_arn }}
+          aws-region: ${{ inputs.state_region }}
+          role-session-name: deploy-apply-${{ github.run_id }}
+      - name: Initialise backend
+        run: .gang/infra/scripts/reviewed-plan.sh init
+      - name: Fetch reviewed plan
+        run: .gang/infra/scripts/reviewed-plan.sh fetch
+      - name: Verify reviewed plan
+        id: verify
+        run: .gang/infra/scripts/reviewed-plan.sh verify
+      - name: Apply reviewed plan
+        env:
+          HAS_CHANGES: ${{ steps.verify.outputs.has_changes }}
+        run: .gang/infra/scripts/reviewed-plan.sh apply
+      - name: Confirm convergence
+        run: .gang/infra/scripts/reviewed-plan.sh converge
+      - name: Restart controller on configuration change
+        run: .gang/infra/scripts/reviewed-plan.sh restart

@@ -1,0 +1,14 @@
+load("//bazel/rust:defs.bzl", "workspace_rust_library")
+
+workspace_rust_library(
+    name = "gang_wire",
+    proc_macro_deps = ["//crates/gang-macros:gang_macros"],
+    test_env = {
+        "GANG_UI_FIXTURES": "$(rootpaths //ui:fixtures)",
+    },
+    test_runtime_data = ["//ui:fixtures"],
+    deps = [
+        "//crates/gang-clock:gang_clock",
+        "//crates/gang-types:gang_types",
+    ],
+)

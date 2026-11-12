@@ -1,0 +1,20 @@
+[package]
+name = "gang-reconciler"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+gang-clock = { workspace = true }
+gang-config = { workspace = true }
+gang-spi = { workspace = true }
+gang-types = { workspace = true }
+
+[dev-dependencies]
+allocation-counter = { workspace = true }
+gang-testkit = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,92 @@
+load("//bazel/rust:defs.bzl", "workspace_rust_binary", "workspace_rust_library")
+
+config_setting(
+    name = "linux_x86_64",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+)
+
+config_setting(
+    name = "linux_arm64",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:aarch64",
+    ],
+)
+
+config_setting(
+    name = "macos_arm64",
+    constraint_values = [
+        "@platforms//os:macos",
+        "@platforms//cpu:aarch64",
+    ],
+)
+
+# The Bazel the harness drives: pinned in MODULE.bazel, one binary per host platform.
+alias(
+    name = "bazel",
+    actual = select({
+        ":linux_x86_64": "@bazel_linux_x86_64//file:bazel",
+        ":linux_arm64": "@bazel_linux_arm64//file:bazel",
+        ":macos_arm64": "@bazel_darwin_arm64//file:bazel",
+    }),
+)
+
+# A checksum-pinned Bash for exercising the hold probe's shell command.
+alias(
+    name = "test_bash",
+    actual = select({
+        ":linux_x86_64": "@test_bash_linux_x86_64//file:bash",
+        ":linux_arm64": "@test_bash_linux_arm64//file:bash",
+        ":macos_arm64": "@test_bash_macos_arm64//file:bash",
+    }),
+)
+
+workspace_rust_library(
+    name = "gang_e2e",
+    dev_deps = ["//crates/gang-spi:gang_spi"],
+    test_env = {
+        "GANG_E2E_BASE_CONFIG": "$(rootpath //configs:gang.local.toml)",
+        "GANG_E2E_TEST_BASH": "$(rootpath :test_bash)",
+    },
+    test_runtime_data = [
+        ":test_bash",
+        "//configs:gang.local.toml",
+    ],
+    deps = [
+        "//crates/gang-authn:gang_authn",
+        "//crates/gang-bwrap:gang_bwrap",
+        "//crates/gang-cgroup:gang_cgroup",
+        "//crates/gang-clock:gang_clock",
+        "//crates/gang-config:gang_config",
+        "//crates/gang-local:gang_local",
+        "//crates/gang-main:gang_main",
+        "//crates/gang-nativelink:gang_nativelink",
+        "//crates/gang-oidc:gang_oidc",
+        "//crates/gang-os:gang_os",
+        "//crates/gang-state:gang_state",
+        "//crates/gang-testkit:gang_testkit",
+        "//crates/gang-tls:gang_tls",
+        "//crates/gang-types:gang_types",
+        "//crates/gang-ui:gang_ui",
+        "//crates/gang-wire:gang_wire",
+    ],
+)
+
+workspace_rust_binary(
+    name = "local",
+    src = "src/main.rs",
+    data = [
+        ":bazel",
+        "//crates/gang-main:gang",
+    ],
+    env = {
+        "GANG_E2E_BAZEL": "$(rootpath :bazel)",
+        "GANG_E2E_GANG": "$(rootpath //crates/gang-main:gang)",
+    },
+    deps = [
+        ":gang_e2e",
+    ],
+)

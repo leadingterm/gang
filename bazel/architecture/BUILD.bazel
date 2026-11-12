@@ -1,0 +1,14 @@
+load("//bazel/rust:defs.bzl", "workspace_rust_library")
+
+workspace_rust_library(
+    name = "workspace_architecture",
+    test_env = {
+        "GANG_PLAN": "$(rootpath //docs:PLAN.md)",
+        "GANG_WORKSPACE_MANIFEST": "$(rootpath //:Cargo.toml)",
+    },
+    test_runtime_data = [
+        "//:Cargo.toml",
+        "//:rust_workspace_sources",
+        "//docs:PLAN.md",
+    ],
+)

@@ -1,0 +1,84 @@
+{
+  "principals": [
+    {
+      "name": "principals/google%3Aops%40example.org",
+      "provider": "google",
+      "principal": "ops@example.org",
+      "createTime": "2025-10-23T10:09:30.000Z",
+      "lastSeenTime": "2026-01-15T10:08:42.000Z"
+    },
+    {
+      "name": "principals/google%3Amira.okafor%40example.org",
+      "provider": "google",
+      "principal": "mira.okafor@example.org",
+      "createTime": "2025-10-23T10:09:30.000Z",
+      "lastSeenTime": "2026-01-15T07:09:30.000Z"
+    },
+    {
+      "name": "principals/google%3Aj.lindqvist%40example.org",
+      "provider": "google",
+      "principal": "j.lindqvist@example.org",
+      "createTime": "2025-11-15T10:09:30.000Z",
+      "lastSeenTime": "2026-01-15T09:50:30.000Z"
+    },
+    {
+      "name": "principals/google%3Abuild-oncall%40example.org",
+      "provider": "google",
+      "principal": "build-oncall@example.org",
+      "createTime": "2025-12-06T10:09:30.000Z",
+      "lastSeenTime": "2026-01-13T10:09:30.000Z"
+    },
+    {
+      "name": "principals/github-actions%3Arepo%3Aexample%2Fmonorepo%3Aref%3Arefs%2Fheads%2Fmain",
+      "provider": "github-actions",
+      "principal": "repo:example/monorepo:ref:refs/heads/main",
+      "createTime": "2025-10-24T10:09:30.000Z",
+      "lastSeenTime": "2026-01-15T10:09:23.000Z"
+    },
+    {
+      "name": "principals/github-actions%3Arepo%3Aexample%2Fmonorepo%3Apull_request",
+      "provider": "github-actions",
+      "principal": "repo:example/monorepo:pull_request",
+      "createTime": "2025-10-24T10:09:30.000Z",
+      "lastSeenTime": "2026-01-15T10:09:08.000Z"
+    },
+    {
+      "name": "principals/github-actions%3Arepo%3Aexample%2Fmonorepo%3Aref%3Arefs%2Fheads%2Frelease-4.2",
+      "provider": "github-actions",
+      "principal": "repo:example/monorepo:ref:refs/heads/release-4.2",
+      "createTime": "2026-01-03T10:09:30.000Z",
+      "lastSeenTime": "2026-01-15T05:09:30.000Z"
+    },
+    {
+      "name": "principals/github-actions%3Arepo%3Aexample%2Fwebsite%3Aref%3Arefs%2Fheads%2Fmain",
+      "provider": "github-actions",
+      "principal": "repo:example/website:ref:refs/heads/main",
+      "createTime": "2025-11-21T10:09:30.000Z",
+      "lastSeenTime": "2026-01-15T01:09:30.000Z"
+    },
+    {
+      "name": "principals/google%3At.ruiz%40example.org",
+      "provider": "google",
+      "principal": "t.ruiz@example.org",
+      "createTime": "2025-11-06T10:09:30.000Z",
+      "lastSeenTime": "2026-01-06T10:09:30.000Z",
+      "revokeTime": "2026-01-06T10:39:30.000Z"
+    },
+    {
+      "name": "principals/github-actions%3Arepo%3Aexample%2Ffork-experiment%3Aref%3Arefs%2Fheads%2Fmain",
+      "provider": "github-actions",
+      "principal": "repo:example/fork-experiment:ref:refs/heads/main",
+      "createTime": "2025-12-16T10:09:30.000Z",
+      "lastSeenTime": "2025-12-19T10:09:30.000Z",
+      "revokeTime": "2025-12-19T10:19:30.000Z"
+    },
+    {
+      "name": "principals/google%3Acontractor-ci%40example.org",
+      "provider": "google",
+      "principal": "contractor-ci@example.org",
+      "createTime": "2025-12-01T10:09:30.000Z",
+      "lastSeenTime": "2025-12-30T10:09:30.000Z",
+      "revokeTime": "2025-12-31T10:09:30.000Z"
+    }
+  ]
+}

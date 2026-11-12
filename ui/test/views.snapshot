@@ -1,0 +1,1388 @@
+exports[`access live 1`] = `
+Skip to content
+gang
+gang.example.orgOverview1
+Actions2
+Workers3
+Activity4
+Access5
+google · ops@example.orgSign out
+STREAM
+PASS
+QUEUE3 unplaceable3
+ACTIONS
+SESSION6m 52s6m 52s
+10:09:30 UTC
+Access
+Principals
+11
+All
+Revoked 3
+Filter principals
+ProviderPrincipalFirst seenLast seenRevoked
+googleops@example.org23 Oct 202548s
+googlemira.okafor@example.org23 Oct 20253h 00m
+googlej.lindqvist@example.org15 Nov 202519m 00s
+googlebuild-oncall@example.org6 Dec 202513 Jan 2026
+github-actionsrepo:example/monorepo:ref:refs/heads/main24 Oct 20257s
+github-actionsrepo:example/monorepo:pull_request24 Oct 202522s
+github-actionsrepo:example/monorepo:ref:refs/heads/release-4.23 Jan 20265h 00m
+github-actionsrepo:example/website:ref:refs/heads/main21 Nov 20259h 00m
+googlet.ruiz@example.org6 Nov 20256 Jan 2026revoked 6 Jan 2026
+github-actionsrepo:example/fork-experiment:ref:refs/heads/main16 Dec 202519 Dec 2025revoked 19 Dec 2025
+googlecontractor-ci@example.org1 Dec 202530 Dec 2025revoked 31 Dec 2025
+You
+6m 52s
+ops@example.org google
+state.readprincipals.readevents.readprincipals.revoke
+Roles
+administrator
+state.readprincipals.readevents.readprincipals.revoke
+google:ops@example.org
+google:mira.okafor@example.org
+viewer
+state.readprincipals.readevents.read
+google:j.lindqvist@example.org
+google:build-oncall@example.org
+google:t.ruiz@example.org revoked
+Overview
+Actions
+Workers
+Activity
+Access
+`;
+
+exports[`actions empty 1`] = `
+Skip to content
+gang
+gang.example.orgOverview1
+Actions2
+Workers3
+Activity4
+Access5
+google · ops@example.orgSign out
+STREAM
+PASS
+QUEUE
+ACTIONS
+SESSION6m 52s6m 52s
+10:09:30 UTC
+Actions
+Nothing running or queued
+Overview
+Actions
+Workers
+Activity
+Access
+`;
+
+exports[`actions lagging 1`] = `
+Skip to content
+gang
+gang.example.orgOverview1
+Actions2
+Workers3
+Activity4
+Access5
+google · ops@example.orgSign out
+STREAM
+PASS
+QUEUE3 unplaceable3
+ACTIONSas of 10:08:15stale
+SESSION6m 52s6m 52s
+10:09:30 UTC
+Actions
+Filter by target or mnemonic
+FleetAll fleetsamd64-spotamd64-on-demandarm64-spotgpu
+AS OF 10:08:15
+Running
+215
+TargetMnemonicFleetWorkerTime
+//cmd/fleetctl:fleetctl_libGoCompilePkgamd64-spoti-041bd675c1c3f5d6526s
+//net/http2:frame_codec_testTestRunneramd64-spoti-01e113de72bf31a9c2m 17s
+//rpc/server:serverCppLinkamd64-on-demandi-0f8cb31b67f73d1b41m 09s
+//api/v2:events_proto priority ↑10ProtoCompileamd64-spoti-0e111e497e90efab67m 07s
+//api/v2:events_proto priority ↑10ProtoCompileamd64-spoti-05f7f19854965c5492m 34s
+//crates/wal:wal_testTestRunneramd64-on-demandi-0bba44a44c21db25d2m 30s
+//java/com/example/auth:tokensJavacamd64-spoti-01e113de72bf31a9c1m 07s
+//crates/simd:kernels_testTestRunnerarm64-spoti-0e72925d8de62c49511s
+//rpc/server:serverCppLinkamd64-spoti-05e70efbfab1f64042m 31s
+//storage/blob:blob_store priority ↑10CppCompilearm64-spoti-0c8719395c9cf1f485m 34s
+//crates/codec:codecRustcamd64-spoti-0297b8f491056517e8m 29s
+//pkg/router:routerGoCompilePkgamd64-spoti-0e111e497e90efab655s
+//compression/zstd:frame priority ↑10CppCompileamd64-spoti-01e113de72bf31a9c1m 28s
+//tools/bench:benchCppLinkamd64-spoti-01e113de72bf31a9c1m 19s
+//base/time:clockCppCompilearm64-spoti-0a8915f6a02aa1c795m 55s
+//mobile/sync:engineCppCompilearm64-spoti-0e72925d8de62c4955m 28s
+//crates/wal:walRustcamd64-spoti-05f7f19854965c5498m 36s
+//java/com/example/index:indexerJavacamd64-spoti-0e111e497e90efab64m 55s
+//compression/zstd:frameCppCompileamd64-spoti-068551e29abed9b4b6m 38s
+//api/v2:catalog_protoProtoCompileamd64-spoti-054adcae811dcbedf1m 12s
+//crates/codec:codec priority ↑10Rustcamd64-spoti-0297b8f491056517e7m 28s
+//java/com/example/auth:tokensJavacamd64-spoti-05f7f19854965c5492m 29s
+//crates/simd:kernelsRustcarm64-spoti-01b895f867feb85834m 11s
+//api/v2:catalog_protoProtoCompileamd64-spoti-0297b8f491056517e3m 39s
+//crates/wal:wal_testTestRunneramd64-spoti-054adcae811dcbedf45s
+//java/com/example/query:plannerJavacamd64-spoti-054adcae811dcbedf1m 12s
+//pkg/cache/lru:lruGoCompilePkgamd64-spoti-0302d350b4a82a1571m 04s
+//crates/wal:wal_testTestRunneramd64-spoti-0297b8f491056517e6m 28s
+//rpc/server:serverCppLinkamd64-spoti-041bd675c1c3f5d6535s
+//mobile/sync:engineCppCompilearm64-spoti-0e72925d8de62c4951m 41s
+//net/http2:frame_codecCppCompileamd64-on-demandi-0bba44a44c21db25d1m 26s
+//storage/blob:blob_store_testTestRunneramd64-spoti-054adcae811dcbedf1m 10s
+//compression/zstd:frameCppCompileamd64-spoti-05e70efbfab1f64047m 43s
+//cmd/fleetctl:fleetctl_libGoCompilePkgamd64-on-demandi-0f8cb31b67f73d1b48m 13s
+//net/http2:frame_codec_testTestRunneramd64-spoti-068551e29abed9b4b8m 15s
+//tools/bench:benchCppLinkamd64-spoti-041bd675c1c3f5d6527s
+//net/http2:frame_codecCppCompileamd64-spoti-068551e29abed9b4b19s
+//crates/parser:parserRustcarm64-spoti-01b895f867feb85832m 22s
+//api/v2:events_protoProtoCompileamd64-spoti-054adcae811dcbedf26s
+//storage/blob:blob_storeCppCompilearm64-spoti-0a8915f6a02aa1c796m 34s
+//api/v2:catalog_protoProtoCompileamd64-spoti-05f7f19854965c5498m 56s
+//mobile/sync:engine_testTestRunnerarm64-spoti-01b895f867feb85838m 33s
+//java/com/example/index:indexerJavacamd64-spoti-0297b8f491056517e2m 21s
+//mobile/sync:sync_daemonCppLinkarm64-spoti-01b895f867feb85836m 08s
+//pkg/router:routerGoCompilePkgamd64-on-demandi-0f8cb31b67f73d1b43m 58s
+//pkg/cache/lru:lruGoCompilePkgamd64-spoti-0e111e497e90efab68m 35s
+//base/time:clockCppCompilearm64-spoti-0a8915f6a02aa1c792m 58s
+//web/assets:bundleGenruleamd64-on-demandi-0f8cb31b67f73d1b47m 17s
+//compression/zstd:frame priority ↑10CppCompileamd64-spoti-05f7f19854965c5494m 00s
+//api/v2:catalog_protoProtoCompileamd64-spoti-0302d350b4a82a1572m 51s
+//tools/bench:benchCppLinkamd64-spoti-01e113de72bf31a9c3m 30s
+//docs:siteGenruleamd64-spoti-05f7f19854965c5494m 19s
+//crates/parser:parserRustcarm64-spoti-0c8719395c9cf1f483m 48s
+//crates/simd:kernels_test priority ↑10TestRunnerarm64-spoti-0a8915f6a02aa1c793m 04s
+//mobile/sync:engine_testTestRunnerarm64-spoti-01b895f867feb85832m 29s
+//crates/wal:wal_testTestRunneramd64-spoti-01e113de72bf31a9c3m 38s
+//crates/simd:kernelsRustcarm64-spoti-01b895f867feb85834m 13s
+//cmd/fleetctl:fleetctl_libGoCompilePkgamd64-spoti-09add97bdc05be8432m 01s
+//java/com/example/query:plannerJavacamd64-spoti-05e70efbfab1f64045m 00s
+//crates/wal:walRustcamd64-spoti-05e70efbfab1f64045m 52s
+//mobile/sync:engine_test priority ↑10TestRunnerarm64-spoti-0a8915f6a02aa1c794m 54s
+//api/v2:catalog_protoProtoCompileamd64-spoti-054adcae811dcbedf15s
+//pkg/router:routerGoCompilePkgamd64-spoti-0e111e497e90efab64m 21s
+//crates/wal:walRustcamd64-spoti-0e111e497e90efab61m 17s
+//pkg/router:routerGoCompilePkgamd64-spoti-054adcae811dcbedf24s
+//java/com/example/query:plannerJavacamd64-spoti-041bd675c1c3f5d6521s
+//storage/blob:blob_storeCppCompilearm64-spoti-0c8719395c9cf1f4811s
+//java/com/example/auth:tokensJavacamd64-spoti-09add97bdc05be84311s
+//rpc/server:dispatcherCppCompileamd64-on-demandi-0f8cb31b67f73d1b44m 37s
+//crates/simd:kernelsRustcarm64-spoti-0a8915f6a02aa1c794m 06s
+//rpc/server:serverCppLinkamd64-on-demandi-0f8cb31b67f73d1b43m 35s
+//pkg/router:router priority ↑10GoCompilePkgamd64-spoti-09add97bdc05be8432m 13s
+//mobile/sync:engine_testTestRunnerarm64-spoti-0e72925d8de62c4955s
+//java/com/example/query:planner_testTestRunneramd64-spoti-0e111e497e90efab630s
+//java/com/example/auth:tokensJavacamd64-spoti-05e70efbfab1f64047m 12s
+//api/v2:catalog_protoProtoCompileamd64-spoti-01e113de72bf31a9c31s
+//crates/wal:wal_testTestRunneramd64-spoti-0e111e497e90efab61m 49s
+//api/v2:events_protoProtoCompileamd64-spoti-0e111e497e90efab67m 10s
+//mobile/sync:sync_daemonCppLinkarm64-spoti-0a8915f6a02aa1c795m 22s
+//crates/parser:parserRustcamd64-spoti-05f7f19854965c5497m 19s
+//api/v2:catalog_protoProtoCompileamd64-spoti-068551e29abed9b4b1m 05s
+//mobile/sync:sync_daemonCppLinkarm64-spoti-01b895f867feb85838m 37s
+//rpc/server:serverCppLinkamd64-spoti-01e113de72bf31a9c1m 15s
+//mobile/sync:sync_daemonCppLinkarm64-spoti-0c8719395c9cf1f486m 59s
+//java/com/example/query:planner priority ↑10Javacamd64-spoti-068551e29abed9b4b4m 02s
+//docs:siteGenruleamd64-spoti-0297b8f491056517e2m 00s
+//tools/bench:benchCppLinkamd64-spoti-09add97bdc05be8431m 00s
+//tools/bench:benchCppLinkamd64-spoti-01e113de72bf31a9c1m 51s
+//java/com/example/query:plannerJavacamd64-spoti-054adcae811dcbedf35s
+//rpc/server:dispatcherCppCompileamd64-spoti-068551e29abed9b4b7m 44s
+//api/v2:catalog_protoProtoCompileamd64-spoti-09add97bdc05be84358s
+//mobile/sync:engineCppCompilearm64-spoti-0a8915f6a02aa1c797m 02s
+//crates/wal:wal_testTestRunneramd64-spoti-054adcae811dcbedf6s
+//crates/wal:walRustcamd64-spoti-0e111e497e90efab61m 34s
+//mobile/sync:sync_daemonCppLinkarm64-spoti-01b895f867feb85832m 47s
+//mobile/sync:engine_testTestRunnerarm64-spoti-0e72925d8de62c4951m 21s
+//crates/codec:codecRustcamd64-spoti-068551e29abed9b4b3m 19s
+//storage/blob:blob_store_test priority ↑10TestRunneramd64-spoti-0302d350b4a82a15754s
+//crates/parser:parserRustcamd64-on-demandi-0f8cb31b67f73d1b425s
+//docs:siteGenruleamd64-on-demandi-0bba44a44c21db25d7m 46s
+//docs:siteGenruleamd64-spoti-05e70efbfab1f640426s
+//tools/bench:benchCppLinkamd64-spoti-05e70efbfab1f64042m 18s
+//api/v2:catalog_protoProtoCompileamd64-on-demandi-0bba44a44c21db25d3m 28s
+//java/com/example/index:indexerJavacamd64-spoti-054adcae811dcbedf16s
+//api/v2:events_protoProtoCompileamd64-spoti-0e111e497e90efab68m 55s
+//mobile/sync:sync_daemonCppLinkarm64-spoti-01b895f867feb85831m 11s
+//pkg/cache/lru:lruGoCompilePkgamd64-spoti-0297b8f491056517e7m 23s
+//cmd/fleetctl:fleetctl_libGoCompilePkgamd64-spoti-0e111e497e90efab66m 09s
+//net/http2:frame_codecCppCompileamd64-spoti-068551e29abed9b4b7m 35s
+//api/v2:events_protoProtoCompileamd64-spoti-041bd675c1c3f5d6528s
+//pkg/router:routerGoCompilePkgamd64-spoti-05f7f19854965c5495m 01s
+//crates/simd:kernelsRustcarm64-spoti-0e72925d8de62c4956m 43s
+//java/com/example/query:plannerJavacamd64-spoti-0297b8f491056517e7m 02s
+//cmd/fleetctl:fleetctl_libGoCompilePkgamd64-spoti-01e113de72bf31a9c25s
+//docs:siteGenruleamd64-spoti-05f7f19854965c5491m 50s
+//web/assets:bundleGenruleamd64-spoti-054adcae811dcbedf1m 33s
+//net/http2:frame_codecCppCompileamd64-on-demandi-0bba44a44c21db25d1m 23s
+//crates/wal:wal_testTestRunneramd64-spoti-041bd675c1c3f5d6532s
+//docs:siteGenruleamd64-spoti-01e113de72bf31a9c5m 07s
+//crates/parser:parser priority ↑10Rustcamd64-spoti-09add97bdc05be8432m 24s
+//web/assets:bundleGenruleamd64-spoti-068551e29abed9b4b8m 09s
+//mobile/sync:sync_daemon priority ↑10CppLinkarm64-spoti-0c8719395c9cf1f486m 46s
+//java/com/example/auth:tokensJavacamd64-spoti-01e113de72bf31a9c18s
+//rpc/server:dispatcherCppCompileamd64-spoti-0297b8f491056517e1m 58s
+//rpc/server:serverCppLinkamd64-spoti-068551e29abed9b4b4m 26s
+//mobile/sync:sync_daemonCppLinkarm64-spoti-0e72925d8de62c4952m 22s
+//java/com/example/index:indexerJavacamd64-spoti-068551e29abed9b4b2m 39s
+//cmd/fleetctl:fleetctl_libGoCompilePkgamd64-spoti-054adcae811dcbedf8s
+//crates/simd:kernels_testTestRunnerarm64-spoti-0a8915f6a02aa1c794m 43s
+//crates/wal:walRustcamd64-spoti-01e113de72bf31a9c3m 57s
+//pkg/router:routerGoCompilePkgamd64-spoti-09add97bdc05be84311s
+//api/v2:catalog_protoProtoCompileamd64-spoti-05e70efbfab1f64044m 49s
+//base/strings:splitCppCompileamd64-spoti-05e70efbfab1f64046m 14s
+//mobile/sync:engineCppCompilearm64-spoti-01b895f867feb85835m 03s
+//crates/wal:walRustcamd64-spoti-041bd675c1c3f5d6512s
+//crates/codec:codecRustcamd64-spoti-01e113de72bf31a9c33s
+//mobile/sync:engine_testTestRunnerarm64-spoti-0c8719395c9cf1f485m 13s
+//mobile/sync:engineCppCompilearm64-spoti-0a8915f6a02aa1c796m 06s
+//crates/wal:walRustcamd64-spoti-05e70efbfab1f640454s
+//crates/parser:parserRustcamd64-on-demandi-0bba44a44c21db25d5m 28s
+//docs:siteGenruleamd64-spoti-05e70efbfab1f64042m 52s
+//rpc/server:serverCppLinkamd64-spoti-054adcae811dcbedf47s
+//base/strings:splitCppCompileamd64-spoti-0297b8f491056517e7m 52s
+//web/assets:bundleGenruleamd64-spoti-068551e29abed9b4b4m 34s
+//api/v2:events_proto priority ↑10ProtoCompileamd64-on-demandi-0bba44a44c21db25d6m 19s
+//mobile/sync:sync_daemonCppLinkarm64-spoti-0a8915f6a02aa1c792m 32s
+//net/http2:frame_codec_testTestRunneramd64-spoti-05f7f19854965c5495m 49s
+//web/assets:bundle priority ↑10Genruleamd64-on-demandi-0f8cb31b67f73d1b42m 35s
+//java/com/example/query:plannerJavacamd64-spoti-054adcae811dcbedf1m 24s
+//pkg/cache/lru:lruGoCompilePkgamd64-spoti-09add97bdc05be8432m 07s
+//mobile/sync:engine_testTestRunnerarm64-spoti-0a8915f6a02aa1c793m 08s
+//crates/parser:parserRustcamd64-spoti-0e111e497e90efab62m 39s
+//crates/wal:wal_test priority ↑10TestRunneramd64-on-demandi-0f8cb31b67f73d1b46m 30s
+//api/v2:events_protoProtoCompileamd64-spoti-05e70efbfab1f64048m 03s
+//cmd/fleetctl:fleetctl_libGoCompilePkgamd64-spoti-05f7f19854965c5496m 53s
+//rpc/server:serverCppLinkamd64-spoti-05e70efbfab1f64041m 25s
+//tools/bench:benchCppLinkamd64-spoti-05e70efbfab1f640418s
+//api/v2:events_protoProtoCompileamd64-spoti-05e70efbfab1f64044m 12s
+//rpc/server:dispatcher priority ↑10CppCompileamd64-spoti-041bd675c1c3f5d6530s
+//tools/bench:benchCppLinkamd64-on-demandi-0bba44a44c21db25d57s
+//java/com/example/query:plannerJavacamd64-spoti-068551e29abed9b4b3m 00s
+//mobile/sync:engine_testTestRunnerarm64-spoti-0c8719395c9cf1f488m 33s
+//crates/codec:codec priority ↑10Rustcamd64-on-demandi-0bba44a44c21db25d5m 18s
+//api/v2:catalog_protoProtoCompileamd64-spoti-041bd675c1c3f5d652s
+//api/v2:events_protoProtoCompileamd64-spoti-0297b8f491056517e5m 26s
+//crates/parser:parserRustcarm64-spoti-0a8915f6a02aa1c792m 45s
+//mobile/sync:sync_daemonCppLinkarm64-spoti-0a8915f6a02aa1c7928s
+//base/time:clockCppCompilearm64-spoti-0e72925d8de62c4951m 12s
+//mobile/sync:engine_testTestRunnerarm64-spoti-0a8915f6a02aa1c791m 46s
+//crates/simd:kernelsRustcarm64-spoti-0e72925d8de62c49535s
+//rpc/server:serverCppLinkamd64-spoti-05e70efbfab1f64047m 45s
+//base/strings:splitCppCompileamd64-spoti-0e111e497e90efab64m 53s
+//api/v2:events_proto priority ↑10ProtoCompileamd64-spoti-068551e29abed9b4b3m 56s
+//crates/wal:wal_testTestRunneramd64-spoti-0e111e497e90efab66m 14s
+//mobile/sync:sync_daemon priority ↑10CppLinkarm64-spoti-0e72925d8de62c4956m 23s
+//mobile/sync:sync_daemonCppLinkarm64-spoti-0e72925d8de62c4955m 25s
+//pkg/cache/lru:lruGoCompilePkgamd64-spoti-054adcae811dcbedf18s
+//base/time:clockCppCompilearm64-spoti-01b895f867feb85833m 33s
+//java/com/example/auth:tokensJavacamd64-spoti-05f7f19854965c5493m 04s
+//rpc/server:serverCppLinkamd64-on-demandi-0f8cb31b67f73d1b43m 02s
+//mobile/sync:engine_testTestRunnerarm64-spoti-0c8719395c9cf1f482m 01s
+//java/com/example/index:indexerJavacamd64-spoti-054adcae811dcbedf35s
+//crates/simd:kernelsRustcarm64-spoti-01b895f867feb85836m 18s
+//crates/simd:kernels_testTestRunnerarm64-spoti-01b895f867feb85836m 26s
+//crates/parser:parserRustcarm64-spoti-0c8719395c9cf1f482m 18s
+//mobile/sync:engineCppCompilearm64-spoti-01b895f867feb85832m 44s
+//api/v2:events_proto priority ↑10ProtoCompileamd64-spoti-09add97bdc05be8439s
+//pkg/router:routerGoCompilePkgamd64-spoti-0297b8f491056517e8m 38s
+//crates/wal:wal_testTestRunneramd64-on-demandi-0bba44a44c21db25d3m 46s
+//pkg/router:routerGoCompilePkgamd64-spoti-05f7f19854965c5496m 00s
+//web/assets:bundleGenruleamd64-spoti-05f7f19854965c5494m 41s
+//crates/simd:kernels priority ↑10Rustcarm64-spoti-0c8719395c9cf1f481m 02s
+//pkg/cache/lru:lruGoCompilePkgamd64-on-demandi-0f8cb31b67f73d1b42m 16s
+//crates/parser:parserRustcarm64-spoti-0e72925d8de62c4952m 08s
+//rpc/server:serverCppLinkamd64-spoti-01e113de72bf31a9c49s
+//api/v2:events_protoProtoCompileamd64-spoti-01e113de72bf31a9c2m 28s
+//net/http2:frame_codec_testTestRunneramd64-spoti-09add97bdc05be8431m 39s
+//rpc/server:dispatcherCppCompileamd64-on-demandi-0bba44a44c21db25d1m 16s
+//api/v2:events_protoProtoCompileamd64-spoti-05f7f19854965c5491m 44s
+//docs:siteGenruleamd64-spoti-09add97bdc05be8432m 21s
+//api/v2:catalog_protoProtoCompileamd64-spoti-068551e29abed9b4b1m 24s
+//api/v2:events_protoProtoCompileamd64-spoti-0297b8f491056517e3s
+//mobile/sync:engine priority ↑10CppCompilearm64-spoti-0a8915f6a02aa1c793m 07s
+//pkg/cache/lru:lruGoCompilePkgamd64-on-demandi-0f8cb31b67f73d1b47m 28s
+//pkg/cache/lru:lruGoCompilePkgamd64-on-demandi-0f8cb31b67f73d1b44m 52s
+//mobile/sync:engineCppCompilearm64-spoti-01b895f867feb85834m 27s
+//crates/parser:parser priority ↑10Rustcamd64-spoti-09add97bdc05be8432m 27s
+//net/http2:frame_codec priority ↑10CppCompileamd64-spoti-068551e29abed9b4b6m 15s
+//api/v2:catalog_protoProtoCompileamd64-on-demandi-0f8cb31b67f73d1b41m 48s
+//crates/codec:codecRustcamd64-spoti-0297b8f491056517e7m 40s
+//web/assets:bundleGenruleamd64-on-demandi-0f8cb31b67f73d1b42m 56s
+//pkg/cache/lru:lruGoCompilePkgamd64-on-demandi-0f8cb31b67f73d1b45m 13s
+//mobile/sync:engineCppCompilearm64-spoti-01b895f867feb85836m 36s
+//pkg/router:routerGoCompilePkgamd64-spoti-0e111e497e90efab68m 34s
+//pkg/router:routerGoCompilePkgamd64-spoti-041bd675c1c3f5d6525s
+Queued
+73
+WaitTargetMnemonicFleets
+2m 56s//mobile/sync:sync_daemon priority ↑10CppLinkarm64-spot
+2m 05s//web/assets:bundle priority ↑10Genruleamd64-spotamd64-on-demand
+1m 33s//mobile/sync:engine priority ↑10CppCompilearm64-spot
+1m 05s//rpc/server:server priority ↑10CppLinkamd64-spotamd64-on-demand
+14s//mobile/sync:sync_daemon priority ↑10CppLinkarm64-spot
+4m 12s//firmware/riscv:boot_testTestRunnerno fleet
+4m 05s//firmware/riscv:boot_testTestRunnerno fleet
+3m 58s//firmware/riscv:mmu_testTestRunnerno fleet
+3m 18s//rpc/server:serverCppLinkamd64-spotamd64-on-demand
+3m 17s//pkg/cache/lru:lruGoCompilePkgamd64-spotamd64-on-demand
+3m 13s//docs:siteGenruleamd64-spotamd64-on-demand
+3m 11s//crates/wal:wal_testTestRunneramd64-spotamd64-on-demand
+3m 09s//crates/simd:kernels_testTestRunnerarm64-spot
+3m 07s//api/v2:events_protoProtoCompileamd64-spotamd64-on-demand
+3m 06s//rpc/server:serverCppLinkamd64-spotamd64-on-demand
+3m 03s//java/com/example/auth:tokensJavacamd64-spotamd64-on-demand
+3m 01s//base/time:clockCppCompilearm64-spot
+3m 01s//api/v2:catalog_protoProtoCompileamd64-spotamd64-on-demand
+2m 53s//pkg/cache/lru:lruGoCompilePkgamd64-spotamd64-on-demand
+2m 52s//base/time:clockCppCompilearm64-spot
+2m 48s//tools/bench:benchCppLinkamd64-spotamd64-on-demand
+2m 41s//crates/wal:wal_testTestRunneramd64-spotamd64-on-demand
+2m 40s//java/com/example/index:indexerJavacamd64-spotamd64-on-demand
+2m 32s//pkg/router:routerGoCompilePkgamd64-spotamd64-on-demand
+2m 28s//mobile/sync:sync_daemonCppLinkarm64-spot
+2m 28s//crates/simd:kernels_testTestRunnerarm64-spot
+2m 26s//pkg/cache/lru:lruGoCompilePkgamd64-spotamd64-on-demand
+2m 25s//mobile/sync:sync_daemonCppLinkarm64-spot
+2m 12s//java/com/example/query:planner_testTestRunneramd64-spotamd64-on-demand
+2m 06s//api/v2:events_protoProtoCompileamd64-spotamd64-on-demand
+2m 05s//java/com/example/index:indexerJavacamd64-spotamd64-on-demand
+2m 04s//storage/blob:blob_storeCppCompilearm64-spot
+2m 04s//mobile/sync:engineCppCompilearm64-spot
+2m 04s//pkg/cache/lru:lruGoCompilePkgamd64-spotamd64-on-demand
+2m 02s//java/com/example/index:indexerJavacamd64-spotamd64-on-demand
+2m 01s//crates/simd:kernelsRustcarm64-spot
+1m 55s//mobile/sync:engine_testTestRunnerarm64-spot
+1m 53s//cmd/fleetctl:fleetctl_libGoCompilePkgamd64-spotamd64-on-demand
+1m 44s//crates/simd:kernelsRustcarm64-spot
+1m 42s//storage/blob:blob_store_testTestRunneramd64-spotamd64-on-demand
+1m 41s//storage/blob:blob_storeCppCompileamd64-spotamd64-on-demand
+1m 36s//crates/wal:wal_testTestRunneramd64-spotamd64-on-demand
+1m 33s//api/v2:events_protoProtoCompileamd64-spotamd64-on-demand
+1m 33s//rpc/server:serverCppLinkamd64-spotamd64-on-demand
+1m 32s//mobile/sync:engine_testTestRunnerarm64-spot
+1m 22s//mobile/sync:sync_daemonCppLinkarm64-spot
+1m 18s//crates/simd:kernels_testTestRunnerarm64-spot
+1m 18s//java/com/example/query:plannerJavacamd64-spotamd64-on-demand
+1m 17s//net/http2:frame_codecCppCompileamd64-spotamd64-on-demand
+1m 15s//cmd/fleetctl:fleetctl_libGoCompilePkgamd64-spotamd64-on-demand
+1m 13s//crates/parser:parserRustcamd64-spotamd64-on-demand
+1m 11s//web/assets:bundleGenruleamd64-spotamd64-on-demand
+1m 07s//crates/parser:parserRustcamd64-spotamd64-on-demand
+1m 04s//api/v2:events_protoProtoCompileamd64-spotamd64-on-demand
+1m 04s//api/v2:catalog_protoProtoCompileamd64-spotamd64-on-demand
+1m 03s//crates/simd:kernels_testTestRunnerarm64-spot
+56s//rpc/server:dispatcherCppCompileamd64-spotamd64-on-demand
+52s//tools/bench:benchCppLinkamd64-spotamd64-on-demand
+39s//api/v2:events_protoProtoCompileamd64-spotamd64-on-demand
+36s//compression/zstd:frameCppCompileamd64-spotamd64-on-demand
+32s//crates/parser:parserRustcamd64-spotamd64-on-demand
+27s//mobile/sync:sync_daemonCppLinkarm64-spot
+23s//docs:siteGenruleamd64-spotamd64-on-demand
+15s//crates/parser:parserRustcarm64-spot
+10s//java/com/example/auth:tokensJavacamd64-spotamd64-on-demand
+10s//pkg/cache/lru:lruGoCompilePkgamd64-spotamd64-on-demand
+10s//mobile/sync:engine_testTestRunnerarm64-spot
+8s//crates/wal:walRustcamd64-spotamd64-on-demand
+8s//rpc/server:serverCppLinkamd64-spotamd64-on-demand
+7s//mobile/sync:sync_daemonCppLinkarm64-spot
+6s//compression/zstd:frameCppCompileamd64-spotamd64-on-demand
+6s//storage/blob:blob_store_testTestRunneramd64-spotamd64-on-demand
+0s//crates/simd:kernels_testTestRunnerarm64-spot
+Overview
+Actions
+Workers
+Activity
+Access
+`;
+
+exports[`actions live 1`] = `
+Skip to content
+gang
+gang.example.orgOverview1
+Actions2
+Workers3
+Activity4
+Access5
+google · ops@example.orgSign out
+STREAM
+PASS
+QUEUE3 unplaceable3
+ACTIONS
+SESSION6m 52s6m 52s
+10:09:30 UTC
+Actions
+Filter by target or mnemonic
+FleetAll fleetsamd64-spotamd64-on-demandarm64-spotgpu
+AS OF 10:09:24
+Running
+215
+TargetMnemonicFleetWorkerTime
+//cmd/fleetctl:fleetctl_libGoCompilePkgamd64-spoti-041bd675c1c3f5d6526s
+//net/http2:frame_codec_testTestRunneramd64-spoti-01e113de72bf31a9c2m 17s
+//rpc/server:serverCppLinkamd64-on-demandi-0f8cb31b67f73d1b41m 09s
+//api/v2:events_proto priority ↑10ProtoCompileamd64-spoti-0e111e497e90efab67m 07s
+//api/v2:events_proto priority ↑10ProtoCompileamd64-spoti-05f7f19854965c5492m 34s
+//crates/wal:wal_testTestRunneramd64-on-demandi-0bba44a44c21db25d2m 30s
+//java/com/example/auth:tokensJavacamd64-spoti-01e113de72bf31a9c1m 07s
+//crates/simd:kernels_testTestRunnerarm64-spoti-0e72925d8de62c49511s
+//rpc/server:serverCppLinkamd64-spoti-05e70efbfab1f64042m 31s
+//storage/blob:blob_store priority ↑10CppCompilearm64-spoti-0c8719395c9cf1f485m 34s
+//crates/codec:codecRustcamd64-spoti-0297b8f491056517e8m 29s
+//pkg/router:routerGoCompilePkgamd64-spoti-0e111e497e90efab655s
+//compression/zstd:frame priority ↑10CppCompileamd64-spoti-01e113de72bf31a9c1m 28s
+//tools/bench:benchCppLinkamd64-spoti-01e113de72bf31a9c1m 19s
+//base/time:clockCppCompilearm64-spoti-0a8915f6a02aa1c795m 55s
+//mobile/sync:engineCppCompilearm64-spoti-0e72925d8de62c4955m 28s
+//crates/wal:walRustcamd64-spoti-05f7f19854965c5498m 36s
+//java/com/example/index:indexerJavacamd64-spoti-0e111e497e90efab64m 55s
+//compression/zstd:frameCppCompileamd64-spoti-068551e29abed9b4b6m 38s
+//api/v2:catalog_protoProtoCompileamd64-spoti-054adcae811dcbedf1m 12s
+//crates/codec:codec priority ↑10Rustcamd64-spoti-0297b8f491056517e7m 28s
+//java/com/example/auth:tokensJavacamd64-spoti-05f7f19854965c5492m 29s
+//crates/simd:kernelsRustcarm64-spoti-01b895f867feb85834m 11s
+//api/v2:catalog_protoProtoCompileamd64-spoti-0297b8f491056517e3m 39s
+//crates/wal:wal_testTestRunneramd64-spoti-054adcae811dcbedf45s
+//java/com/example/query:plannerJavacamd64-spoti-054adcae811dcbedf1m 12s
+//pkg/cache/lru:lruGoCompilePkgamd64-spoti-0302d350b4a82a1571m 04s
+//crates/wal:wal_testTestRunneramd64-spoti-0297b8f491056517e6m 28s
+//rpc/server:serverCppLinkamd64-spoti-041bd675c1c3f5d6535s
+//mobile/sync:engineCppCompilearm64-spoti-0e72925d8de62c4951m 41s
+//net/http2:frame_codecCppCompileamd64-on-demandi-0bba44a44c21db25d1m 26s
+//storage/blob:blob_store_testTestRunneramd64-spoti-054adcae811dcbedf1m 10s
+//compression/zstd:frameCppCompileamd64-spoti-05e70efbfab1f64047m 43s
+//cmd/fleetctl:fleetctl_libGoCompilePkgamd64-on-demandi-0f8cb31b67f73d1b48m 13s
+//net/http2:frame_codec_testTestRunneramd64-spoti-068551e29abed9b4b8m 15s
+//tools/bench:benchCppLinkamd64-spoti-041bd675c1c3f5d6527s
+//net/http2:frame_codecCppCompileamd64-spoti-068551e29abed9b4b19s
+//crates/parser:parserRustcarm64-spoti-01b895f867feb85832m 22s
+//api/v2:events_protoProtoCompileamd64-spoti-054adcae811dcbedf26s
+//storage/blob:blob_storeCppCompilearm64-spoti-0a8915f6a02aa1c796m 34s
+//api/v2:catalog_protoProtoCompileamd64-spoti-05f7f19854965c5498m 56s
+//mobile/sync:engine_testTestRunnerarm64-spoti-01b895f867feb85838m 33s
+//java/com/example/index:indexerJavacamd64-spoti-0297b8f491056517e2m 21s
+//mobile/sync:sync_daemonCppLinkarm64-spoti-01b895f867feb85836m 08s
+//pkg/router:routerGoCompilePkgamd64-on-demandi-0f8cb31b67f73d1b43m 58s
+//pkg/cache/lru:lruGoCompilePkgamd64-spoti-0e111e497e90efab68m 35s
+//base/time:clockCppCompilearm64-spoti-0a8915f6a02aa1c792m 58s
+//web/assets:bundleGenruleamd64-on-demandi-0f8cb31b67f73d1b47m 17s
+//compression/zstd:frame priority ↑10CppCompileamd64-spoti-05f7f19854965c5494m 00s
+//api/v2:catalog_protoProtoCompileamd64-spoti-0302d350b4a82a1572m 51s
+//tools/bench:benchCppLinkamd64-spoti-01e113de72bf31a9c3m 30s
+//docs:siteGenruleamd64-spoti-05f7f19854965c5494m 19s
+//crates/parser:parserRustcarm64-spoti-0c8719395c9cf1f483m 48s
+//crates/simd:kernels_test priority ↑10TestRunnerarm64-spoti-0a8915f6a02aa1c793m 04s
+//mobile/sync:engine_testTestRunnerarm64-spoti-01b895f867feb85832m 29s
+//crates/wal:wal_testTestRunneramd64-spoti-01e113de72bf31a9c3m 38s
+//crates/simd:kernelsRustcarm64-spoti-01b895f867feb85834m 13s
+//cmd/fleetctl:fleetctl_libGoCompilePkgamd64-spoti-09add97bdc05be8432m 01s
+//java/com/example/query:plannerJavacamd64-spoti-05e70efbfab1f64045m 00s
+//crates/wal:walRustcamd64-spoti-05e70efbfab1f64045m 52s
+//mobile/sync:engine_test priority ↑10TestRunnerarm64-spoti-0a8915f6a02aa1c794m 54s
+//api/v2:catalog_protoProtoCompileamd64-spoti-054adcae811dcbedf15s
+//pkg/router:routerGoCompilePkgamd64-spoti-0e111e497e90efab64m 21s
+//crates/wal:walRustcamd64-spoti-0e111e497e90efab61m 17s
+//pkg/router:routerGoCompilePkgamd64-spoti-054adcae811dcbedf24s
+//java/com/example/query:plannerJavacamd64-spoti-041bd675c1c3f5d6521s
+//storage/blob:blob_storeCppCompilearm64-spoti-0c8719395c9cf1f4811s
+//java/com/example/auth:tokensJavacamd64-spoti-09add97bdc05be84311s
+//rpc/server:dispatcherCppCompileamd64-on-demandi-0f8cb31b67f73d1b44m 37s
+//crates/simd:kernelsRustcarm64-spoti-0a8915f6a02aa1c794m 06s
+//rpc/server:serverCppLinkamd64-on-demandi-0f8cb31b67f73d1b43m 35s
+//pkg/router:router priority ↑10GoCompilePkgamd64-spoti-09add97bdc05be8432m 13s
+//mobile/sync:engine_testTestRunnerarm64-spoti-0e72925d8de62c4955s
+//java/com/example/query:planner_testTestRunneramd64-spoti-0e111e497e90efab630s
+//java/com/example/auth:tokensJavacamd64-spoti-05e70efbfab1f64047m 12s
+//api/v2:catalog_protoProtoCompileamd64-spoti-01e113de72bf31a9c31s
+//crates/wal:wal_testTestRunneramd64-spoti-0e111e497e90efab61m 49s
+//api/v2:events_protoProtoCompileamd64-spoti-0e111e497e90efab67m 10s
+//mobile/sync:sync_daemonCppLinkarm64-spoti-0a8915f6a02aa1c795m 22s
+//crates/parser:parserRustcamd64-spoti-05f7f19854965c5497m 19s
+//api/v2:catalog_protoProtoCompileamd64-spoti-068551e29abed9b4b1m 05s
+//mobile/sync:sync_daemonCppLinkarm64-spoti-01b895f867feb85838m 37s
+//rpc/server:serverCppLinkamd64-spoti-01e113de72bf31a9c1m 15s
+//mobile/sync:sync_daemonCppLinkarm64-spoti-0c8719395c9cf1f486m 59s
+//java/com/example/query:planner priority ↑10Javacamd64-spoti-068551e29abed9b4b4m 02s
+//docs:siteGenruleamd64-spoti-0297b8f491056517e2m 00s
+//tools/bench:benchCppLinkamd64-spoti-09add97bdc05be8431m 00s
+//tools/bench:benchCppLinkamd64-spoti-01e113de72bf31a9c1m 51s
+//java/com/example/query:plannerJavacamd64-spoti-054adcae811dcbedf35s
+//rpc/server:dispatcherCppCompileamd64-spoti-068551e29abed9b4b7m 44s
+//api/v2:catalog_protoProtoCompileamd64-spoti-09add97bdc05be84358s
+//mobile/sync:engineCppCompilearm64-spoti-0a8915f6a02aa1c797m 02s
+//crates/wal:wal_testTestRunneramd64-spoti-054adcae811dcbedf6s
+//crates/wal:walRustcamd64-spoti-0e111e497e90efab61m 34s
+//mobile/sync:sync_daemonCppLinkarm64-spoti-01b895f867feb85832m 47s
+//mobile/sync:engine_testTestRunnerarm64-spoti-0e72925d8de62c4951m 21s
+//crates/codec:codecRustcamd64-spoti-068551e29abed9b4b3m 19s
+//storage/blob:blob_store_test priority ↑10TestRunneramd64-spoti-0302d350b4a82a15754s
+//crates/parser:parserRustcamd64-on-demandi-0f8cb31b67f73d1b425s
+//docs:siteGenruleamd64-on-demandi-0bba44a44c21db25d7m 46s
+//docs:siteGenruleamd64-spoti-05e70efbfab1f640426s
+//tools/bench:benchCppLinkamd64-spoti-05e70efbfab1f64042m 18s
+//api/v2:catalog_protoProtoCompileamd64-on-demandi-0bba44a44c21db25d3m 28s
+//java/com/example/index:indexerJavacamd64-spoti-054adcae811dcbedf16s
+//api/v2:events_protoProtoCompileamd64-spoti-0e111e497e90efab68m 55s
+//mobile/sync:sync_daemonCppLinkarm64-spoti-01b895f867feb85831m 11s
+//pkg/cache/lru:lruGoCompilePkgamd64-spoti-0297b8f491056517e7m 23s
+//cmd/fleetctl:fleetctl_libGoCompilePkgamd64-spoti-0e111e497e90efab66m 09s
+//net/http2:frame_codecCppCompileamd64-spoti-068551e29abed9b4b7m 35s
+//api/v2:events_protoProtoCompileamd64-spoti-041bd675c1c3f5d6528s
+//pkg/router:routerGoCompilePkgamd64-spoti-05f7f19854965c5495m 01s
+//crates/simd:kernelsRustcarm64-spoti-0e72925d8de62c4956m 43s
+//java/com/example/query:plannerJavacamd64-spoti-0297b8f491056517e7m 02s
+//cmd/fleetctl:fleetctl_libGoCompilePkgamd64-spoti-01e113de72bf31a9c25s
+//docs:siteGenruleamd64-spoti-05f7f19854965c5491m 50s
+//web/assets:bundleGenruleamd64-spoti-054adcae811dcbedf1m 33s
+//net/http2:frame_codecCppCompileamd64-on-demandi-0bba44a44c21db25d1m 23s
+//crates/wal:wal_testTestRunneramd64-spoti-041bd675c1c3f5d6532s
+//docs:siteGenruleamd64-spoti-01e113de72bf31a9c5m 07s
+//crates/parser:parser priority ↑10Rustcamd64-spoti-09add97bdc05be8432m 24s
+//web/assets:bundleGenruleamd64-spoti-068551e29abed9b4b8m 09s
+//mobile/sync:sync_daemon priority ↑10CppLinkarm64-spoti-0c8719395c9cf1f486m 46s
+//java/com/example/auth:tokensJavacamd64-spoti-01e113de72bf31a9c18s
+//rpc/server:dispatcherCppCompileamd64-spoti-0297b8f491056517e1m 58s
+//rpc/server:serverCppLinkamd64-spoti-068551e29abed9b4b4m 26s
+//mobile/sync:sync_daemonCppLinkarm64-spoti-0e72925d8de62c4952m 22s
+//java/com/example/index:indexerJavacamd64-spoti-068551e29abed9b4b2m 39s
+//cmd/fleetctl:fleetctl_libGoCompilePkgamd64-spoti-054adcae811dcbedf8s
+//crates/simd:kernels_testTestRunnerarm64-spoti-0a8915f6a02aa1c794m 43s
+//crates/wal:walRustcamd64-spoti-01e113de72bf31a9c3m 57s
+//pkg/router:routerGoCompilePkgamd64-spoti-09add97bdc05be84311s
+//api/v2:catalog_protoProtoCompileamd64-spoti-05e70efbfab1f64044m 49s
+//base/strings:splitCppCompileamd64-spoti-05e70efbfab1f64046m 14s
+//mobile/sync:engineCppCompilearm64-spoti-01b895f867feb85835m 03s
+//crates/wal:walRustcamd64-spoti-041bd675c1c3f5d6512s
+//crates/codec:codecRustcamd64-spoti-01e113de72bf31a9c33s
+//mobile/sync:engine_testTestRunnerarm64-spoti-0c8719395c9cf1f485m 13s
+//mobile/sync:engineCppCompilearm64-spoti-0a8915f6a02aa1c796m 06s
+//crates/wal:walRustcamd64-spoti-05e70efbfab1f640454s
+//crates/parser:parserRustcamd64-on-demandi-0bba44a44c21db25d5m 28s
+//docs:siteGenruleamd64-spoti-05e70efbfab1f64042m 52s
+//rpc/server:serverCppLinkamd64-spoti-054adcae811dcbedf47s
+//base/strings:splitCppCompileamd64-spoti-0297b8f491056517e7m 52s
+//web/assets:bundleGenruleamd64-spoti-068551e29abed9b4b4m 34s
+//api/v2:events_proto priority ↑10ProtoCompileamd64-on-demandi-0bba44a44c21db25d6m 19s
+//mobile/sync:sync_daemonCppLinkarm64-spoti-0a8915f6a02aa1c792m 32s
+//net/http2:frame_codec_testTestRunneramd64-spoti-05f7f19854965c5495m 49s
+//web/assets:bundle priority ↑10Genruleamd64-on-demandi-0f8cb31b67f73d1b42m 35s
+//java/com/example/query:plannerJavacamd64-spoti-054adcae811dcbedf1m 24s
+//pkg/cache/lru:lruGoCompilePkgamd64-spoti-09add97bdc05be8432m 07s
+//mobile/sync:engine_testTestRunnerarm64-spoti-0a8915f6a02aa1c793m 08s
+//crates/parser:parserRustcamd64-spoti-0e111e497e90efab62m 39s
+//crates/wal:wal_test priority ↑10TestRunneramd64-on-demandi-0f8cb31b67f73d1b46m 30s
+//api/v2:events_protoProtoCompileamd64-spoti-05e70efbfab1f64048m 03s
+//cmd/fleetctl:fleetctl_libGoCompilePkgamd64-spoti-05f7f19854965c5496m 53s
+//rpc/server:serverCppLinkamd64-spoti-05e70efbfab1f64041m 25s
+//tools/bench:benchCppLinkamd64-spoti-05e70efbfab1f640418s
+//api/v2:events_protoProtoCompileamd64-spoti-05e70efbfab1f64044m 12s
+//rpc/server:dispatcher priority ↑10CppCompileamd64-spoti-041bd675c1c3f5d6530s
+//tools/bench:benchCppLinkamd64-on-demandi-0bba44a44c21db25d57s
+//java/com/example/query:plannerJavacamd64-spoti-068551e29abed9b4b3m 00s
+//mobile/sync:engine_testTestRunnerarm64-spoti-0c8719395c9cf1f488m 33s
+//crates/codec:codec priority ↑10Rustcamd64-on-demandi-0bba44a44c21db25d5m 18s
+//api/v2:catalog_protoProtoCompileamd64-spoti-041bd675c1c3f5d652s
+//api/v2:events_protoProtoCompileamd64-spoti-0297b8f491056517e5m 26s
+//crates/parser:parserRustcarm64-spoti-0a8915f6a02aa1c792m 45s
+//mobile/sync:sync_daemonCppLinkarm64-spoti-0a8915f6a02aa1c7928s
+//base/time:clockCppCompilearm64-spoti-0e72925d8de62c4951m 12s
+//mobile/sync:engine_testTestRunnerarm64-spoti-0a8915f6a02aa1c791m 46s
+//crates/simd:kernelsRustcarm64-spoti-0e72925d8de62c49535s
+//rpc/server:serverCppLinkamd64-spoti-05e70efbfab1f64047m 45s
+//base/strings:splitCppCompileamd64-spoti-0e111e497e90efab64m 53s
+//api/v2:events_proto priority ↑10ProtoCompileamd64-spoti-068551e29abed9b4b3m 56s
+//crates/wal:wal_testTestRunneramd64-spoti-0e111e497e90efab66m 14s
+//mobile/sync:sync_daemon priority ↑10CppLinkarm64-spoti-0e72925d8de62c4956m 23s
+//mobile/sync:sync_daemonCppLinkarm64-spoti-0e72925d8de62c4955m 25s
+//pkg/cache/lru:lruGoCompilePkgamd64-spoti-054adcae811dcbedf18s
+//base/time:clockCppCompilearm64-spoti-01b895f867feb85833m 33s
+//java/com/example/auth:tokensJavacamd64-spoti-05f7f19854965c5493m 04s
+//rpc/server:serverCppLinkamd64-on-demandi-0f8cb31b67f73d1b43m 02s
+//mobile/sync:engine_testTestRunnerarm64-spoti-0c8719395c9cf1f482m 01s
+//java/com/example/index:indexerJavacamd64-spoti-054adcae811dcbedf35s
+//crates/simd:kernelsRustcarm64-spoti-01b895f867feb85836m 18s
+//crates/simd:kernels_testTestRunnerarm64-spoti-01b895f867feb85836m 26s
+//crates/parser:parserRustcarm64-spoti-0c8719395c9cf1f482m 18s
+//mobile/sync:engineCppCompilearm64-spoti-01b895f867feb85832m 44s
+//api/v2:events_proto priority ↑10ProtoCompileamd64-spoti-09add97bdc05be8439s
+//pkg/router:routerGoCompilePkgamd64-spoti-0297b8f491056517e8m 38s
+//crates/wal:wal_testTestRunneramd64-on-demandi-0bba44a44c21db25d3m 46s
+//pkg/router:routerGoCompilePkgamd64-spoti-05f7f19854965c5496m 00s
+//web/assets:bundleGenruleamd64-spoti-05f7f19854965c5494m 41s
+//crates/simd:kernels priority ↑10Rustcarm64-spoti-0c8719395c9cf1f481m 02s
+//pkg/cache/lru:lruGoCompilePkgamd64-on-demandi-0f8cb31b67f73d1b42m 16s
+//crates/parser:parserRustcarm64-spoti-0e72925d8de62c4952m 08s
+//rpc/server:serverCppLinkamd64-spoti-01e113de72bf31a9c49s
+//api/v2:events_protoProtoCompileamd64-spoti-01e113de72bf31a9c2m 28s
+//net/http2:frame_codec_testTestRunneramd64-spoti-09add97bdc05be8431m 39s
+//rpc/server:dispatcherCppCompileamd64-on-demandi-0bba44a44c21db25d1m 16s
+//api/v2:events_protoProtoCompileamd64-spoti-05f7f19854965c5491m 44s
+//docs:siteGenruleamd64-spoti-09add97bdc05be8432m 21s
+//api/v2:catalog_protoProtoCompileamd64-spoti-068551e29abed9b4b1m 24s
+//api/v2:events_protoProtoCompileamd64-spoti-0297b8f491056517e3s
+//mobile/sync:engine priority ↑10CppCompilearm64-spoti-0a8915f6a02aa1c793m 07s
+//pkg/cache/lru:lruGoCompilePkgamd64-on-demandi-0f8cb31b67f73d1b47m 28s
+//pkg/cache/lru:lruGoCompilePkgamd64-on-demandi-0f8cb31b67f73d1b44m 52s
+//mobile/sync:engineCppCompilearm64-spoti-01b895f867feb85834m 27s
+//crates/parser:parser priority ↑10Rustcamd64-spoti-09add97bdc05be8432m 27s
+//net/http2:frame_codec priority ↑10CppCompileamd64-spoti-068551e29abed9b4b6m 15s
+//api/v2:catalog_protoProtoCompileamd64-on-demandi-0f8cb31b67f73d1b41m 48s
+//crates/codec:codecRustcamd64-spoti-0297b8f491056517e7m 40s
+//web/assets:bundleGenruleamd64-on-demandi-0f8cb31b67f73d1b42m 56s
+//pkg/cache/lru:lruGoCompilePkgamd64-on-demandi-0f8cb31b67f73d1b45m 13s
+//mobile/sync:engineCppCompilearm64-spoti-01b895f867feb85836m 36s
+//pkg/router:routerGoCompilePkgamd64-spoti-0e111e497e90efab68m 34s
+//pkg/router:routerGoCompilePkgamd64-spoti-041bd675c1c3f5d6525s
+Queued
+73
+WaitTargetMnemonicFleets
+2m 56s//mobile/sync:sync_daemon priority ↑10CppLinkarm64-spot
+2m 05s//web/assets:bundle priority ↑10Genruleamd64-spotamd64-on-demand
+1m 33s//mobile/sync:engine priority ↑10CppCompilearm64-spot
+1m 05s//rpc/server:server priority ↑10CppLinkamd64-spotamd64-on-demand
+14s//mobile/sync:sync_daemon priority ↑10CppLinkarm64-spot
+4m 12s//firmware/riscv:boot_testTestRunnerno fleet
+4m 05s//firmware/riscv:boot_testTestRunnerno fleet
+3m 58s//firmware/riscv:mmu_testTestRunnerno fleet
+3m 18s//rpc/server:serverCppLinkamd64-spotamd64-on-demand
+3m 17s//pkg/cache/lru:lruGoCompilePkgamd64-spotamd64-on-demand
+3m 13s//docs:siteGenruleamd64-spotamd64-on-demand
+3m 11s//crates/wal:wal_testTestRunneramd64-spotamd64-on-demand
+3m 09s//crates/simd:kernels_testTestRunnerarm64-spot
+3m 07s//api/v2:events_protoProtoCompileamd64-spotamd64-on-demand
+3m 06s//rpc/server:serverCppLinkamd64-spotamd64-on-demand
+3m 03s//java/com/example/auth:tokensJavacamd64-spotamd64-on-demand
+3m 01s//base/time:clockCppCompilearm64-spot
+3m 01s//api/v2:catalog_protoProtoCompileamd64-spotamd64-on-demand
+2m 53s//pkg/cache/lru:lruGoCompilePkgamd64-spotamd64-on-demand
+2m 52s//base/time:clockCppCompilearm64-spot
+2m 48s//tools/bench:benchCppLinkamd64-spotamd64-on-demand
+2m 41s//crates/wal:wal_testTestRunneramd64-spotamd64-on-demand
+2m 40s//java/com/example/index:indexerJavacamd64-spotamd64-on-demand
+2m 32s//pkg/router:routerGoCompilePkgamd64-spotamd64-on-demand
+2m 28s//mobile/sync:sync_daemonCppLinkarm64-spot
+2m 28s//crates/simd:kernels_testTestRunnerarm64-spot
+2m 26s//pkg/cache/lru:lruGoCompilePkgamd64-spotamd64-on-demand
+2m 25s//mobile/sync:sync_daemonCppLinkarm64-spot
+2m 12s//java/com/example/query:planner_testTestRunneramd64-spotamd64-on-demand
+2m 06s//api/v2:events_protoProtoCompileamd64-spotamd64-on-demand
+2m 05s//java/com/example/index:indexerJavacamd64-spotamd64-on-demand
+2m 04s//storage/blob:blob_storeCppCompilearm64-spot
+2m 04s//mobile/sync:engineCppCompilearm64-spot
+2m 04s//pkg/cache/lru:lruGoCompilePkgamd64-spotamd64-on-demand
+2m 02s//java/com/example/index:indexerJavacamd64-spotamd64-on-demand
+2m 01s//crates/simd:kernelsRustcarm64-spot
+1m 55s//mobile/sync:engine_testTestRunnerarm64-spot
+1m 53s//cmd/fleetctl:fleetctl_libGoCompilePkgamd64-spotamd64-on-demand
+1m 44s//crates/simd:kernelsRustcarm64-spot
+1m 42s//storage/blob:blob_store_testTestRunneramd64-spotamd64-on-demand
+1m 41s//storage/blob:blob_storeCppCompileamd64-spotamd64-on-demand
+1m 36s//crates/wal:wal_testTestRunneramd64-spotamd64-on-demand
+1m 33s//api/v2:events_protoProtoCompileamd64-spotamd64-on-demand
+1m 33s//rpc/server:serverCppLinkamd64-spotamd64-on-demand
+1m 32s//mobile/sync:engine_testTestRunnerarm64-spot
+1m 22s//mobile/sync:sync_daemonCppLinkarm64-spot
+1m 18s//crates/simd:kernels_testTestRunnerarm64-spot
+1m 18s//java/com/example/query:plannerJavacamd64-spotamd64-on-demand
+1m 17s//net/http2:frame_codecCppCompileamd64-spotamd64-on-demand
+1m 15s//cmd/fleetctl:fleetctl_libGoCompilePkgamd64-spotamd64-on-demand
+1m 13s//crates/parser:parserRustcamd64-spotamd64-on-demand
+1m 11s//web/assets:bundleGenruleamd64-spotamd64-on-demand
+1m 07s//crates/parser:parserRustcamd64-spotamd64-on-demand
+1m 04s//api/v2:events_protoProtoCompileamd64-spotamd64-on-demand
+1m 04s//api/v2:catalog_protoProtoCompileamd64-spotamd64-on-demand
+1m 03s//crates/simd:kernels_testTestRunnerarm64-spot
+56s//rpc/server:dispatcherCppCompileamd64-spotamd64-on-demand
+52s//tools/bench:benchCppLinkamd64-spotamd64-on-demand
+39s//api/v2:events_protoProtoCompileamd64-spotamd64-on-demand
+36s//compression/zstd:frameCppCompileamd64-spotamd64-on-demand
+32s//crates/parser:parserRustcamd64-spotamd64-on-demand
+27s//mobile/sync:sync_daemonCppLinkarm64-spot
+23s//docs:siteGenruleamd64-spotamd64-on-demand
+15s//crates/parser:parserRustcarm64-spot
+10s//java/com/example/auth:tokensJavacamd64-spotamd64-on-demand
+10s//pkg/cache/lru:lruGoCompilePkgamd64-spotamd64-on-demand
+10s//mobile/sync:engine_testTestRunnerarm64-spot
+8s//crates/wal:walRustcamd64-spotamd64-on-demand
+8s//rpc/server:serverCppLinkamd64-spotamd64-on-demand
+7s//mobile/sync:sync_daemonCppLinkarm64-spot
+6s//compression/zstd:frameCppCompileamd64-spotamd64-on-demand
+6s//storage/blob:blob_store_testTestRunneramd64-spotamd64-on-demand
+0s//crates/simd:kernels_testTestRunnerarm64-spot
+Overview
+Actions
+Workers
+Activity
+Access
+`;
+
+exports[`actions without a sample 1`] = `
+Skip to content
+gang
+gang.example.orgOverview1
+Actions2
+Workers3
+Activity4
+Access5
+google · ops@example.orgSign out
+STREAM
+PASS
+QUEUE3 unplaceable3
+ACTIONS
+SESSION6m 52s6m 52s
+10:09:30 UTC
+Actions
+No action sample yet
+Overview
+Actions
+Workers
+Activity
+Access
+`;
+
+exports[`activity live 1`] = `
+Skip to content
+gang
+gang.example.orgOverview1
+Actions2
+Workers3
+Activity4
+Access5
+google · ops@example.orgSign out
+STREAM
+PASS
+QUEUE3 unplaceable3
+ACTIONS
+SESSION6m 52s6m 52s
+10:09:30 UTC
+Activity
+Scale-out 10
+Drain 5
+Cancel drain 2
+Terminate 4
+Early exit 0
+Join 0
+Leave 0
+FleetAll fleetsamd64-spotamd64-on-demandarm64-spotgpu
+amd64-spot: show only this fleet's events
+amd64-on-demand: show only this fleet's events
+arm64-spot: show only this fleet's events
+gpu: show only this fleet's events
+−6h−5h−4h−3h−2h−1hnow
+Log
+21
+10:00
+10:07:54Terminateamd64-spoti-0a43a824b2b26734dmax drain wait reached
+10:05:49Cancel drainamd64-spoti-09add97bdc05be843demand
+10:05:37Drainamd64-spoti-0302d350b4a82a157idle timeout
+10:02:38Drainamd64-spoti-09add97bdc05be843idle timeout
+09:00
+09:37:10Scale-outamd64-spot12 → 14demand
+09:31:20Terminategpui-0eb8c874d0b680b7adrain finished
+09:29:50Draingpui-0a4646805f072ec68idle timeout
+09:15:10Scale-outarm64-spot4 → 6demand
+08:00
+08:44:10Scale-outamd64-spot9 → 12demand
+08:09:40Scale-outarm64-spot3 → 4demand
+08:09:20Terminatearm64-spoti-0e3c2fb23abce5cbano worker within boot grace
+07:00
+07:32:50Scale-outamd64-on-demand2 → 3demand
+07:02:50Terminateamd64-spoti-0b0fd178a81cb8e54drain finished
+06:00
+06:52:50Drainamd64-spoti-0192cbee9a7b2df05idle timeout
+06:32:40Cancel drainarm64-spoti-019f34c2227f6eff5demand
+06:27:50Drainarm64-spoti-0aab6f62b737371efidle timeout
+05:00
+05:41:30Scale-outamd64-spot8 → 9demand
+05:06:10Scale-outarm64-spot0 → 3demand
+04:00
+04:37:50Scale-outamd64-spot4 → 9demand
+04:23:40Scale-outamd64-spot0 → 4demand
+04:12:50Scale-outamd64-on-demand1 → 2demand
+Load earlier
+Overview
+Actions
+Workers
+Activity
+Access
+`;
+
+exports[`activity without events.read 1`] = `
+Skip to content
+gang
+gang.example.orgOverview1
+Actions2
+Workers3
+Activity4
+Access5
+google · ops@example.orgSign out
+STREAM
+PASS
+QUEUE3 unplaceable3
+ACTIONS
+SESSION6m 52s6m 52s
+10:09:30 UTC
+Activity
+Scale-out 10
+Drain 5
+Cancel drain 2
+Terminate 4
+Early exit 0
+Join 0
+Leave 0
+FleetAll fleetsamd64-spotamd64-on-demandarm64-spotgpu
+amd64-spot: show only this fleet's events
+amd64-on-demand: show only this fleet's events
+arm64-spot: show only this fleet's events
+gpu: show only this fleet's events
+−6h−5h−4h−3h−2h−1hnow
+Log
+21
+10:00
+10:07:54Terminateamd64-spoti-0a43a824b2b26734dmax drain wait reached
+10:05:49Cancel drainamd64-spoti-09add97bdc05be843demand
+10:05:37Drainamd64-spoti-0302d350b4a82a157idle timeout
+10:02:38Drainamd64-spoti-09add97bdc05be843idle timeout
+09:00
+09:37:10Scale-outamd64-spot12 → 14demand
+09:31:20Terminategpui-0eb8c874d0b680b7adrain finished
+09:29:50Draingpui-0a4646805f072ec68idle timeout
+09:15:10Scale-outarm64-spot4 → 6demand
+08:00
+08:44:10Scale-outamd64-spot9 → 12demand
+08:09:40Scale-outarm64-spot3 → 4demand
+08:09:20Terminatearm64-spoti-0e3c2fb23abce5cbano worker within boot grace
+07:00
+07:32:50Scale-outamd64-on-demand2 → 3demand
+07:02:50Terminateamd64-spoti-0b0fd178a81cb8e54drain finished
+06:00
+06:52:50Drainamd64-spoti-0192cbee9a7b2df05idle timeout
+06:32:40Cancel drainarm64-spoti-019f34c2227f6eff5demand
+06:27:50Drainarm64-spoti-0aab6f62b737371efidle timeout
+05:00
+05:41:30Scale-outamd64-spot8 → 9demand
+05:06:10Scale-outarm64-spot0 → 3demand
+04:00
+04:37:50Scale-outamd64-spot4 → 9demand
+04:23:40Scale-outamd64-spot0 → 4demand
+04:12:50Scale-outamd64-on-demand1 → 2demand
+Overview
+Actions
+Workers
+Activity
+Access
+`;
+
+exports[`forbidden 1`] = `
+Skip to content
+gang
+gang.example.orgOverview1
+Actions2
+Workers3
+Activity4
+Access5
+google · ops@example.orgSign out
+STREAM403 state.read403
+PASS
+QUEUE
+ACTIONS
+SESSION20468d 10h20468d 10h
+00:00:00 UTC
+Overview
+No access
+state.read missing for google:ops@example.org
+Overview
+Actions
+Workers
+Activity
+Access
+`;
+
+exports[`overview cold 1`] = `
+Skip to content
+gang
+gang.example.orgOverview1
+Actions2
+Workers3
+Activity4
+Access5
+google · ops@example.orgSign out
+STREAM
+PASS
+QUEUE
+ACTIONS
+SESSION6m 52s6m 52s
+10:09:30 UTC
+Overview
+Queue
+24
+oldest 48s
+Executing
+0/0
+Instances
+0/50
+0 spot
+Done / min
+–
+Fleets
+busyidledrainingno workerpendingterminatingwarmdesired
+preference 1amd64-spot
+spotstarting 44s
+amd64-spot: 0 busy, 0 idle, 0 draining, 0 no worker, 3 pending, 0 terminating, of 24 maximum. Desired 3, minimum 0.24
+running0
+queued24
+preference 2amd64-on-demand
+on-demand
+amd64-on-demand: 0 busy, 0 idle, 0 draining, 0 no worker, 0 pending, 0 terminating, of 8 maximum. Desired 0, minimum 0.8
+running0
+queued0
+preference 3arm64-spot
+spot
+arm64-spot: 0 busy, 0 idle, 0 draining, 0 no worker, 0 pending, 0 terminating, of 16 maximum. Desired 0, minimum 0.16
+running0
+queued0
+preference 4gpu
+on-demand
+gpu: 0 busy, 0 idle, 0 draining, 0 no worker, 0 pending, 0 terminating, of 2 maximum. Desired 0, minimum 0.2
+running0
+queued0
+Control pass
+−3m 00snow
+Scaling
+All
+10:08:46Scale-outamd64-spot0 → 3
+Overview
+Actions
+Workers
+Activity
+Access
+`;
+
+exports[`overview disconnected 1`] = `
+Skip to content
+gang
+gang.example.orgOverview1
+Actions2
+Workers3
+Activity4
+Access5
+google · ops@example.orgSign out
+STREAMreconnecting 4s4s
+PASS
+QUEUE3 unplaceable3
+ACTIONS
+SESSION6m 52s6m 52s
+10:09:30 UTC
+Stream lostfrozen at 10:09:30 · retry 4s
+Overview
+Queue
+73
+oldest 4m 12s3 unplaceable
+Executing
+215/288
+Instances
+20/50
+17 spot
+Done / min
+–
+Fleets
+busyidledrainingno workerpendingterminatingwarmdesired
+preference 1amd64-spot
+spot
+amd64-spot: 9 busy, 1 idle, 1 draining, 1 no worker, 2 pending, 1 terminating, of 24 maximum. Desired 14, minimum 0.24
+running134
+queued41
+preference 2amd64-on-demand
+on-demand
+amd64-on-demand: 2 busy, 1 idle, 0 draining, 0 no worker, 0 pending, 0 terminating, of 8 maximum. Desired 3, minimum 1.8
+running27
+queued6
+preference 3arm64-spot
+spot
+arm64-spot: 4 busy, 0 idle, 0 draining, 1 no worker, 1 pending, 0 terminating, of 16 maximum. Desired 6, minimum 0.16
+running54
+queued23
+preference 4gpu
+on-demand
+gpu: 0 busy, 0 idle, 0 draining, 0 no worker, 0 pending, 0 terminating, of 2 maximum. Desired 0, minimum 0.2
+running0
+queued0
+Control pass
+−3m 00snow
+Scaling
+All
+10:07:54Terminateamd64-spoti-0a43a824b2b26734d
+10:05:49Cancel drainamd64-spoti-09add97bdc05be843
+10:05:37Drainamd64-spoti-0302d350b4a82a157
+10:02:38Drainamd64-spoti-09add97bdc05be843
+09:37:10Scale-outamd64-spot12 → 14
+09:31:20Terminategpui-0eb8c874d0b680b7a
+Overview
+Actions
+Workers
+Activity
+Access
+`;
+
+exports[`overview empty 1`] = `
+Skip to content
+gang
+gang.example.orgOverview1
+Actions2
+Workers3
+Activity4
+Access5
+google · ops@example.orgSign out
+STREAM
+PASS
+QUEUE
+ACTIONS
+SESSION6m 52s6m 52s
+10:09:30 UTC
+Overview
+Queue
+0
+Executing
+0/0
+Instances
+0/50
+0 spot
+Done / min
+–
+Idle · no workers, nothing queued
+Fleets
+busyidledrainingno workerpendingterminatingwarmdesired
+preference 1amd64-spot
+spot
+amd64-spot: 0 busy, 0 idle, 0 draining, 0 no worker, 0 pending, 0 terminating, of 24 maximum. Desired 0, minimum 0.24
+running0
+queued0
+preference 2amd64-on-demand
+on-demand
+amd64-on-demand: 0 busy, 0 idle, 0 draining, 0 no worker, 0 pending, 0 terminating, of 8 maximum. Desired 0, minimum 0.8
+running0
+queued0
+preference 3arm64-spot
+spot
+arm64-spot: 0 busy, 0 idle, 0 draining, 0 no worker, 0 pending, 0 terminating, of 16 maximum. Desired 0, minimum 0.16
+running0
+queued0
+preference 4gpu
+on-demand
+gpu: 0 busy, 0 idle, 0 draining, 0 no worker, 0 pending, 0 terminating, of 2 maximum. Desired 0, minimum 0.2
+running0
+queued0
+Control pass
+−3m 00snow
+Scaling
+All
+06:37:10Scale-outamd64-spot12 → 14
+06:31:20Terminategpui-0eb8c874d0b680b7a
+06:29:50Draingpui-0a4646805f072ec68
+06:15:10Scale-outarm64-spot4 → 6
+05:44:10Scale-outamd64-spot9 → 12
+05:09:40Scale-outarm64-spot3 → 4
+Overview
+Actions
+Workers
+Activity
+Access
+`;
+
+exports[`overview live 1`] = `
+Skip to content
+gang
+gang.example.orgOverview1
+Actions2
+Workers3
+Activity4
+Access5
+google · ops@example.orgSign out
+STREAM
+PASS
+QUEUE3 unplaceable3
+ACTIONS
+SESSION6m 52s6m 52s
+10:09:30 UTC
+Overview
+Queue
+73
+oldest 4m 12s3 unplaceable
+Executing
+215/288
+Instances
+20/50
+17 spot
+Done / min
+–
+Fleets
+busyidledrainingno workerpendingterminatingwarmdesired
+preference 1amd64-spot
+spot
+amd64-spot: 9 busy, 1 idle, 1 draining, 1 no worker, 2 pending, 1 terminating, of 24 maximum. Desired 14, minimum 0.24
+running134
+queued41
+preference 2amd64-on-demand
+on-demand
+amd64-on-demand: 2 busy, 1 idle, 0 draining, 0 no worker, 0 pending, 0 terminating, of 8 maximum. Desired 3, minimum 1.8
+running27
+queued6
+preference 3arm64-spot
+spot
+arm64-spot: 4 busy, 0 idle, 0 draining, 1 no worker, 1 pending, 0 terminating, of 16 maximum. Desired 6, minimum 0.16
+running54
+queued23
+preference 4gpu
+on-demand
+gpu: 0 busy, 0 idle, 0 draining, 0 no worker, 0 pending, 0 terminating, of 2 maximum. Desired 0, minimum 0.2
+running0
+queued0
+Control pass
+−3m 00snow
+Scaling
+All
+10:07:54Terminateamd64-spoti-0a43a824b2b26734d
+10:05:49Cancel drainamd64-spoti-09add97bdc05be843
+10:05:37Drainamd64-spoti-0302d350b4a82a157
+10:02:38Drainamd64-spoti-09add97bdc05be843
+09:37:10Scale-outamd64-spot12 → 14
+09:31:20Terminategpui-0eb8c874d0b680b7a
+Overview
+Actions
+Workers
+Activity
+Access
+`;
+
+exports[`overview revoked 1`] = `
+Skip to content
+gang
+gang.example.orgOverview1
+Actions2
+Workers3
+Activity4
+Access5
+google · ops@example.orgSign out
+STREAMrevokedrevoked
+PASS
+QUEUE3 unplaceable3
+ACTIONS
+SESSION6m 52s6m 52s
+10:09:30 UTC
+Access revoked
+Overview
+Queue
+73
+oldest 4m 12s3 unplaceable
+Executing
+215/288
+Instances
+20/50
+17 spot
+Done / min
+–
+Fleets
+busyidledrainingno workerpendingterminatingwarmdesired
+preference 1amd64-spot
+spot
+amd64-spot: 9 busy, 1 idle, 1 draining, 1 no worker, 2 pending, 1 terminating, of 24 maximum. Desired 14, minimum 0.24
+running134
+queued41
+preference 2amd64-on-demand
+on-demand
+amd64-on-demand: 2 busy, 1 idle, 0 draining, 0 no worker, 0 pending, 0 terminating, of 8 maximum. Desired 3, minimum 1.8
+running27
+queued6
+preference 3arm64-spot
+spot
+arm64-spot: 4 busy, 0 idle, 0 draining, 1 no worker, 1 pending, 0 terminating, of 16 maximum. Desired 6, minimum 0.16
+running54
+queued23
+preference 4gpu
+on-demand
+gpu: 0 busy, 0 idle, 0 draining, 0 no worker, 0 pending, 0 terminating, of 2 maximum. Desired 0, minimum 0.2
+running0
+queued0
+Control pass
+−3m 00snow
+Scaling
+All
+10:07:54Terminateamd64-spoti-0a43a824b2b26734d
+10:05:49Cancel drainamd64-spoti-09add97bdc05be843
+10:05:37Drainamd64-spoti-0302d350b4a82a157
+10:02:38Drainamd64-spoti-09add97bdc05be843
+09:37:10Scale-outamd64-spot12 → 14
+09:31:20Terminategpui-0eb8c874d0b680b7a
+Overview
+Actions
+Workers
+Activity
+Access
+`;
+
+exports[`overview stale 1`] = `
+Skip to content
+gang
+gang.example.orgOverview1
+Actions2
+Workers3
+Activity4
+Access5
+google · ops@example.orgSign out
+STREAM
+PASSskipped 2m 14sskipped
+QUEUE3 unplaceable3
+ACTIONS
+SESSION6m 52s6m 52s
+10:09:30 UTC
+Pass skipped · provisioner unavailablefrozen at 10:07:16 · 2m 14s
+Overview
+Queue
+73
+oldest 4m 12s3 unplaceable
+Executing
+215/288
+Instances
+20/50
+17 spot
+Done / min
+–
+Fleets
+busyidledrainingno workerpendingterminatingwarmdesired
+preference 1amd64-spot
+spot
+amd64-spot: 9 busy, 1 idle, 1 draining, 1 no worker, 2 pending, 1 terminating, of 24 maximum. Desired 14, minimum 0.24
+running134
+queued41
+preference 2amd64-on-demand
+on-demand
+amd64-on-demand: 2 busy, 1 idle, 0 draining, 0 no worker, 0 pending, 0 terminating, of 8 maximum. Desired 3, minimum 1.8
+running27
+queued6
+preference 3arm64-spot
+spot
+arm64-spot: 4 busy, 0 idle, 0 draining, 1 no worker, 1 pending, 0 terminating, of 16 maximum. Desired 6, minimum 0.16
+running54
+queued23
+preference 4gpu
+on-demand
+gpu: 0 busy, 0 idle, 0 draining, 0 no worker, 0 pending, 0 terminating, of 2 maximum. Desired 0, minimum 0.2
+running0
+queued0
+Control pass
+−3m 00snow
+Scaling
+All
+10:07:54Terminateamd64-spoti-0a43a824b2b26734d
+10:05:49Cancel drainamd64-spoti-09add97bdc05be843
+10:05:37Drainamd64-spoti-0302d350b4a82a157
+10:02:38Drainamd64-spoti-09add97bdc05be843
+09:37:10Scale-outamd64-spot12 → 14
+09:31:20Terminategpui-0eb8c874d0b680b7a
+Overview
+Actions
+Workers
+Activity
+Access
+`;
+
+exports[`sign in 1`] = `
+gang
+Sign in
+Continue with Google
+gang.example.org
+`;
+
+exports[`sign in unavailable 1`] = `
+gang
+401Not signed in
+This server offers no browser sign-in.
+gang.example.org
+`;
+
+exports[`sign-in error denied 1`] = `
+gang
+DECLINEDSign-in declined
+The identity provider refused this sign-in.
+Use another account
+gang.example.org
+`;
+
+exports[`workers cold 1`] = `
+Skip to content
+gang
+gang.example.orgOverview1
+Actions2
+Workers3
+Activity4
+Access5
+google · ops@example.orgSign out
+STREAM
+PASS
+QUEUE
+ACTIONS
+SESSION6m 52s6m 52s
+10:09:30 UTC
+Workers
+No workers yet · 3 booting
+Overview
+Actions
+Workers
+Activity
+Access
+`;
+
+exports[`workers live 1`] = `
+Skip to content
+gang
+gang.example.orgOverview1
+Actions2
+Workers3
+Activity4
+Access5
+google · ops@example.orgSign out
+STREAM
+PASS
+QUEUE3 unplaceable3
+ACTIONS
+SESSION6m 52s6m 52s
+10:09:30 UTC
+Workers
+FleetAll fleetsamd64-spot (11)amd64-on-demand (3)arm64-spot (4)gpu (0)
+15 busy2 idle1 draining2 no worker3 pending
+−30m−20m−10mnow
+amd64-spot
+11
+i-01e113de72bf31a9c7973busy5m 12s16 of 16 slots
+i-0297b8f491056517e481cbusy10m 10s14 of 16 slots
+i-0302d350b4a82a1570ae0draining3m 53s3 of 16 slots
+i-0384d636da4f244ab82b1idle6m 52s0 of 16 slots
+i-041bd675c1c3f5d65e0e2busy41s10 of 16 slots
+i-054adcae811dcbedfa3b3busy1m 36s16 of 16 slots
+i-05e70efbfab1f6404070fbusy51m 50s16 of 16 slots
+i-05f7f19854965c54960f2busy20m 20s15 of 16 slots
+i-068551e29abed9b4b2b86busy15m 05s16 of 16 slots
+i-09add97bdc05be843b36abusy3m 08s12 of 16 slots
+i-0e111e497e90efab6567ebusy42m 30s16 of 16 slots
+1 no worker
+2 pending
+1 terminating
+amd64-on-demand
+3
+i-04828e21626b14dd20ee1idle2m 35s0 of 16 slots
+i-0bba44a44c21db25d6bf5busy24m 20s11 of 16 slots
+i-0f8cb31b67f73d1b4edefbusy1h 30m16 of 16 slots
+arm64-spot
+4
+i-01b895f867feb8583138abusy40m 40s16 of 16 slots
+i-0a8915f6a02aa1c79156fbusy45m 00s16 of 16 slots
+i-0c8719395c9cf1f48aa3fbusy10m 40spaused10 of 16 slots
+i-0e72925d8de62c4958be4busy25m 00s12 of 16 slots
+1 no worker · 1 overdue
+1 pending
+Overview
+Actions
+Workers
+Activity
+Access
+`;

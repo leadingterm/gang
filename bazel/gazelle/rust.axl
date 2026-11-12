@@ -1,0 +1,150 @@
+"""Cargo package generation for first-party Rust targets."""
+
+LIBRARY = "workspace_rust_library"
+BINARY = "workspace_rust_binary"
+PROC_MACRO = "workspace_rust_proc_macro"
+SOURCE_SET = "workspace_rust_source_set"
+
+LIBRARY_PROVIDER = "rust_workspace_library"
+PROC_MACRO_PROVIDER = "rust_workspace_proc_macro"
+
+aspect.gazelle_rule_kind(SOURCE_SET, {
+    "From": "//bazel/rust:defs.bzl",
+    "NonEmptyAttrs": ["packages"],
+})
+
+aspect.gazelle_rule_kind(LIBRARY, {
+    "From": "//bazel/rust:defs.bzl",
+    "NonEmptyAttrs": ["srcs"],
+    "ResolveAttrs": ["deps", "dev_deps", "proc_macro_deps"],
+})
+
+aspect.gazelle_rule_kind(BINARY, {
+    "From": "//bazel/rust:defs.bzl",
+    "NonEmptyAttrs": ["src"],
+    "ResolveAttrs": ["deps", "proc_macro_deps"],
+})
+
+aspect.gazelle_rule_kind(PROC_MACRO, {
+    "From": "//bazel/rust:defs.bzl",
+    "NonEmptyAttrs": ["srcs"],
+    "ResolveAttrs": ["deps"],
+})
+
+def prepare(_):
+    return aspect.PrepareResult(
+        sources = aspect.SourceFiles("Cargo.toml"),
+        queries = {
+            "package_name": aspect.TomlQuery(
+                filter = "Cargo.toml",
+                query = ".package.name",
+            ),
+            "lib_name": aspect.TomlQuery(
+                filter = "Cargo.toml",
+                query = ".lib.name?",
+            ),
+            "proc_macro": aspect.TomlQuery(
+                filter = "Cargo.toml",
+                query = ".lib.\"proc-macro\"?",
+            ),
+            "dependencies": aspect.TomlQuery(
+                filter = "Cargo.toml",
+                query = ".dependencies // {} | keys | .[]",
+            ),
+            "dev_dependencies": aspect.TomlQuery(
+                filter = "Cargo.toml",
+                query = ".\"dev-dependencies\" // {} | keys | .[]",
+            ),
+            "bins": aspect.TomlQuery(
+                filter = "Cargo.toml",
+                query = ".bin[]?",
+            ),
+            "workspace_members": aspect.TomlQuery(
+                filter = "Cargo.toml",
+                query = ".workspace.members[]?",
+            ),
+        },
+    )
+
+def imports(names, provider):
+    return [
+        aspect.Import(
+            id = name,
+            provider = provider,
+            optional = True,
+            src = "Cargo.toml",
+        )
+        for name in names
+    ]
+
+def result(query_results, name, default = None):
+    values = query_results[name]
+    return values[0] if values else default
+
+def declare(ctx):
+    manifest = None
+    for source in ctx.sources:
+        if source.path == "Cargo.toml":
+            manifest = source
+            break
+    if not manifest:
+        return
+
+    query_results = manifest.query_results
+    package_name = result(query_results, "package_name")
+    if not package_name:
+        workspace_members = query_results["workspace_members"]
+        if workspace_members:
+            ctx.targets.add(
+                name = "rust_workspace_sources",
+                kind = SOURCE_SET,
+                attrs = {"packages": workspace_members},
+            )
+        return
+
+    dependency_names = query_results["dependencies"]
+    dev_dependency_names = query_results["dev_dependencies"]
+    configured_lib_name = result(query_results, "lib_name")
+    lib_name = configured_lib_name or package_name.replace("-", "_")
+    has_library = ctx.has_file("src/lib.rs") or configured_lib_name != None
+    is_proc_macro = result(query_results, "proc_macro", False)
+
+    if has_library:
+        kind = PROC_MACRO if is_proc_macro else LIBRARY
+        attrs = {
+            "deps": imports(dependency_names, LIBRARY_PROVIDER),
+        }
+        if is_proc_macro:
+            symbols = [aspect.Symbol(id = package_name, provider = PROC_MACRO_PROVIDER)]
+        else:
+            attrs["dev_deps"] = imports(dev_dependency_names, LIBRARY_PROVIDER)
+            attrs["proc_macro_deps"] = imports(dependency_names, PROC_MACRO_PROVIDER)
+            symbols = [aspect.Symbol(id = package_name, provider = LIBRARY_PROVIDER)]
+        ctx.targets.add(
+            name = lib_name,
+            kind = kind,
+            attrs = attrs,
+            symbols = symbols,
+        )
+
+    for binary in query_results["bins"]:
+        binary_name = binary["name"]
+        target_name = binary_name + "_bin" if binary_name == lib_name else binary_name
+        # With a library the binary reaches workspace crates through it.
+        binary_deps = [":" + lib_name] if has_library else imports(dependency_names, LIBRARY_PROVIDER)
+        binary_proc_macro_deps = [] if has_library else imports(dependency_names, PROC_MACRO_PROVIDER)
+        ctx.targets.add(
+            name = target_name,
+            kind = BINARY,
+            attrs = {
+                "deps": binary_deps,
+                "proc_macro_deps": binary_proc_macro_deps,
+                "src": binary["path"],
+            },
+        )
+
+aspect.orion_extension(
+    id = "rust_package",
+    prepare = prepare,
+    declare = declare,
+)

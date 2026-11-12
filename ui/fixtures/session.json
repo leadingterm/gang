@@ -1,0 +1,14 @@
+{
+  "name": "session",
+  "principal": "principals/google%3Aops%40example.org",
+  "permissions": [
+    "state.read",
+    "principals.read",
+    "events.read",
+    "principals.revoke"
+  ],
+  "expireTime": "2026-01-15T10:16:22.000Z",
+  "login": {
+    "provider": "google"
+  }
+}

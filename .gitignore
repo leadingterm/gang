@@ -1,0 +1,15 @@
+/target
+/result
+/bazel-*
+/.bazelrc.local
+.direnv/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+*_override.tf
+crash.log
+*.tfplan
+/ui/node_modules
+/ui/test-bundle

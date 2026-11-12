@@ -1,0 +1,36 @@
+# Host-configuration (exec) helpers for the static-binary test: the library and the control process must be
+# gnu/dynamic so that the host's dynamic loader runs them, whatever platform `gang` itself is built for. The
+# cc_binary targets are manual because built directly they would target the musl platform; the genrules build
+# them as exec tools.
+cc_binary(
+    name = "marker_lib.so",
+    srcs = ["marker.c"],
+    linkshared = True,
+    tags = ["manual"],
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+cc_binary(
+    name = "probe",
+    srcs = ["probe.c"],
+    tags = ["manual"],
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+genrule(
+    name = "preload_lib",
+    outs = ["preload_lib.so"],
+    cmd = "cp $(execpath :marker_lib.so) $@",
+    target_compatible_with = ["@platforms//os:linux"],
+    tools = [":marker_lib.so"],
+    visibility = ["//crates/gang-main:__pkg__"],
+)
+
+genrule(
+    name = "loaded_probe",
+    outs = ["loaded_probe_copy"],
+    cmd = "cp $(execpath :probe) $@",
+    target_compatible_with = ["@platforms//os:linux"],
+    tools = [":probe"],
+    visibility = ["//crates/gang-main:__pkg__"],
+)

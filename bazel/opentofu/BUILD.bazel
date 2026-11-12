@@ -1,0 +1,15 @@
+load("//bazel/opentofu:defs.bzl", "opentofu_toolchain_file")
+
+exports_files(["defs.bzl"])
+
+opentofu_toolchain_file(
+    name = "tofu",
+    file = "tf",
+    visibility = ["//bazel/opentofu/runner:__pkg__"],
+)
+
+opentofu_toolchain_file(
+    name = "provider_mirror",
+    file = "mirror",
+    visibility = ["//bazel/opentofu/runner:__pkg__"],
+)

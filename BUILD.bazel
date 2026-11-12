@@ -1,0 +1,62 @@
+load("@aspect_gazelle_prebuilt//:def.bzl", "aspect_gazelle")
+load("//bazel/rust:defs.bzl", "workspace_rust_source_set")
+
+aspect_gazelle(
+    name = "gazelle",
+    extensions = ["//bazel/gazelle:rust.axl"],
+    languages = [],
+    with_check = True,
+)
+
+alias(
+    name = "gang",
+    actual = "//crates/gang-main:gang",
+    visibility = ["//visibility:public"],
+)
+
+exports_files([
+    "Cargo.Bazel.lock",
+    "Cargo.lock",
+    "Cargo.toml",
+    "MODULE.bazel",
+    "clippy.toml",
+])
+
+workspace_rust_source_set(
+    name = "rust_workspace_sources",
+    packages = [
+        "bazel/architecture",
+        "bazel/opentofu/runner",
+        "crates/gang-authn",
+        "crates/gang-aws",
+        "crates/gang-bindings",
+        "crates/gang-bwrap",
+        "crates/gang-cgroup",
+        "crates/gang-client",
+        "crates/gang-clock",
+        "crates/gang-config",
+        "crates/gang-deploy",
+        "crates/gang-e2e",
+        "crates/gang-embed",
+        "crates/gang-exec",
+        "crates/gang-local",
+        "crates/gang-macros",
+        "crates/gang-main",
+        "crates/gang-mtls",
+        "crates/gang-nativelink",
+        "crates/gang-noop",
+        "crates/gang-oidc",
+        "crates/gang-os",
+        "crates/gang-reconciler",
+        "crates/gang-server",
+        "crates/gang-spi",
+        "crates/gang-sqlite",
+        "crates/gang-state",
+        "crates/gang-testkit",
+        "crates/gang-tls",
+        "crates/gang-types",
+        "crates/gang-ui",
+        "crates/gang-wire",
+        "crates/gang-worker",
+    ],
+)

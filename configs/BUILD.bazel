@@ -1,0 +1,7 @@
+exports_files(["gang.local.toml"])
+
+filegroup(
+    name = "checked_in_configs",
+    srcs = glob(["*.toml"]),
+    visibility = ["//visibility:public"],
+)

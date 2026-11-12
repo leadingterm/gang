@@ -1,0 +1,66 @@
+name: Gang login
+description: Log the job in to a Gang server with a GitHub Actions identity token, as a workload.
+
+inputs:
+  server:
+    description: URL of the Gang server.
+    required: true
+  audience:
+    description: Audience of the job's identity token.
+    required: true
+  provider:
+    description: Identity provider entry on the server that accepts the job token.
+    required: false
+    default: github-actions
+  gang:
+    description: The gang executable. The workflow installs it; this action does not.
+    required: false
+    default: gang
+  ca-pin:
+    description: The `sha256:<hex>` pin of the Gang CA public key. Empty when the server has no CA (plaintext, or a public certificate).
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Log in to Gang
+      shell: bash
+      env:
+        SERVER: ${{ inputs.server }}
+        AUDIENCE: ${{ inputs.audience }}
+        PROVIDER: ${{ inputs.provider }}
+        GANG: ${{ inputs.gang }}
+        CA_PIN: ${{ inputs.ca-pin }}
+      run: |
+        set -euo pipefail
+
+        if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" || -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]]; then
+          echo '::error::the job has no identity token: grant `id-token: write` to the job' >&2
+          exit 1
+        fi
+
+        script_dir="${RUNNER_TEMP}/gang"
+        mkdir -p "${script_dir}"
+        script="${script_dir}/job-token.sh"
+        cat >"${script}" <<'SCRIPT'
+        #!/usr/bin/env bash
+        set -euo pipefail
+        response="$(curl --fail --silent --show-error --get \
+          --data-urlencode "audience=${AUDIENCE}" \
+          --header "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}")"
+        token="$(jq -r '.value' <<<"${response}")"
+        if [[ -z "${token}" || "${token}" == "null" ]]; then
+          echo 'the job identity token response has no token' >&2
+          exit 1
+        fi
+        printf '%s' "${token}"
+        SCRIPT
+        chmod 0700 "${script}"
+
+        login=("${GANG}" login --server "${SERVER}" --workload --provider "${PROVIDER}" --token-command "${script}")
+        if [[ -n "${CA_PIN}" ]]; then
+          login+=(--ca-pin "${CA_PIN}")
+        fi
+        "${login[@]}"

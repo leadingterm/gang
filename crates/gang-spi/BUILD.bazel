@@ -1,0 +1,14 @@
+load("//bazel/rust:defs.bzl", "workspace_rust_library")
+
+workspace_rust_library(
+    name = "gang_spi",
+    dev_deps = [
+        "//crates/gang-config:gang_config",
+        "//crates/gang-testkit:gang_testkit",
+    ],
+    proc_macro_deps = ["//crates/gang-macros:gang_macros"],
+    deps = [
+        "//crates/gang-clock:gang_clock",
+        "//crates/gang-types:gang_types",
+    ],
+)
