@@ -22,6 +22,8 @@
   # amazon-image.nix sets these at default priority; override them.
   services.openssh.enable = lib.mkForce false;
   networking.timeServers = lib.mkForce [];
+  # The EC2 module prints the SSH host keys on the console; without sshd there are none, so the unit could only fail.
+  systemd.services.print-host-key.enable = false;
 
   services.amazon-ssm-agent.enable = true;
 
