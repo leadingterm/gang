@@ -2,8 +2,11 @@
 
 module(
     name = "gang",
-    version = "0.1.1",
 )
+
+# Cargo.toml's [workspace.package] version is Gang's version; Bazel reads it from there (bazel/version).
+gang_version = use_extension("//bazel/version:extensions.bzl", "workspace_version")
+use_repo(gang_version, "gang_version")
 
 RUST_VERSION = "1.97.1"
 

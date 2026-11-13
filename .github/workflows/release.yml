@@ -1,5 +1,5 @@
-# Publishes the gang binaries of every pushed v* tag as a GitHub release (docs/SPECIFICATION.md 7.2):
-# the binaries CI built and tested for the tagged commit on main. Nothing is compiled here.
+# Publishes every pushed v* tag as a GitHub release (docs/SPECIFICATION.md 7.2): the binaries CI built and tested for the tagged commit on main,
+# and, when the repository variable IMAGE_DESTINATION is set, the controller and worker disk images made from them. Nothing is compiled here.
 
 name: Release
 
@@ -16,12 +16,13 @@ defaults:
 
 jobs:
   # gh and sha256sum are the runner's own: this job checks out nothing and installs no Nix.
-  publish:
+  locate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 5
     permissions:
-      contents: write
       actions: read
+    outputs:
+      run-id: ${{ steps.ci.outputs.run-id }}
     steps:
       - name: Find the CI run of the tagged commit
         id: ci
@@ -37,25 +38,139 @@ jobs:
             exit 1
           fi
           echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
+
+  # Disk images of the binaries CI tested, built natively per architecture and stored once under <destination>/<tag>/.
+  images:
+    needs: locate
+    if: vars.IMAGE_DESTINATION != ''
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      SYSTEM: ${{ matrix.arch }}-linux
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-nix
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gang-${{ matrix.arch }}-unknown-linux-musl
+          path: staged
+          run-id: ${{ needs.locate.outputs.run-id }}
+          github-token: ${{ github.token }}
+      # make-disk-image installs the bootloader in a VM: KVM where the runner has it (x86_64), qemu's TCG fallback otherwise (aarch64).
+      - name: Build the images
+        env:
+          NIX_CONFIG: extra-system-features = kvm
+        run: |
+          install -D -m 0755 "staged/gang-${{ matrix.arch }}-unknown-linux-musl" "gang-binaries/$SYSTEM/gang"
+          mkdir dist
+          for role in controller worker; do
+            nix build -L --override-input gang-binaries "path:$PWD/gang-binaries" ".#packages.$SYSTEM.$role-image" --out-link "image-$role"
+          done
+      - name: Compress the images
+        shell: nix develop .#release -c bash --noprofile --norc -euo pipefail {0}
+        run: |
+          for role in controller worker; do
+            zstd -19 --long=27 -T0 -q "image-$role"/*.img -o "dist/gang-$role-${{ matrix.arch }}.raw.zst"
+            cp "image-$role/nix-support/image-info.json" "dist/gang-$role-${{ matrix.arch }}.json"
+          done
+          (cd dist && sha256sum gang-*) >"images-${{ matrix.arch }}.sha256"
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
+        with:
+          role-to-assume: ${{ vars.IMAGE_PUBLISH_ROLE }}
+          aws-region: ${{ vars.IMAGE_REGION }}
+      # Write-once: an existing key is accepted only if S3 holds the same SHA-256, so re-running a failed job is safe.
+      - name: Store the images
+        shell: nix develop .#release -c bash --noprofile --norc -euo pipefail {0}
+        working-directory: dist
+        env:
+          DESTINATION: ${{ vars.IMAGE_DESTINATION }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          location="${DESTINATION#s3://}"
+          bucket="${location%%/*}"
+          prefix="${location#"$bucket"}"
+          prefix="${prefix#/}"
+          prefix="${prefix%/}"
+          for file in gang-*; do
+            key="${prefix:+$prefix/}$TAG/$file"
+            checksum="$(sha256sum "$file" | cut -d' ' -f1 | tr a-f A-F | basenc --base16 -d | base64)"
+            if aws s3api put-object --bucket "$bucket" --key "$key" --body "$file" \
+              --checksum-sha256 "$checksum" --if-none-match '*' >/dev/null 2>put.err; then
+              echo "stored s3://$bucket/$key"
+            elif grep -q PreconditionFailed put.err; then
+              stored="$(aws s3api head-object --bucket "$bucket" --key "$key" --checksum-mode ENABLED --query ChecksumSHA256 --output text)"
+              if [[ "$stored" != "$checksum" ]]; then
+                echo "::error::s3://$bucket/$key already holds other bytes" >&2
+                exit 1
+              fi
+              echo "already stored s3://$bucket/$key"
+            else
+              cat put.err >&2
+              exit 1
+            fi
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: images-${{ matrix.arch }}
+          path: images-${{ matrix.arch }}.sha256
+
+  publish:
+    needs: [locate, images]
+    if: ${{ !cancelled() && needs.locate.result == 'success' && contains(fromJSON('["success", "skipped"]'), needs.images.result) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: gang-*
           path: dist
           merge-multiple: true
-          run-id: ${{ steps.ci.outputs.run-id }}
+          run-id: ${{ needs.locate.outputs.run-id }}
           github-token: ${{ github.token }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.images.result == 'success'
+        with:
+          pattern: images-*
+          path: images
+          merge-multiple: true
+      - name: Write SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum gang-* >SHA256SUMS
+          if [[ -d ../images ]]; then cat ../images/*.sha256 >>SHA256SUMS; fi
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
       - name: Publish the release
         working-directory: dist
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ steps.ci.outputs.run-id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ needs.locate.outputs.run-id }}
+          DESTINATION: ${{ needs.images.result == 'success' && vars.IMAGE_DESTINATION || '' }}
         run: |
-          sha256sum gang-* >SHA256SUMS
+          notes="Binaries built and tested by CI run $RUN_URL."
+          if [[ -n "$DESTINATION" ]]; then notes+=$'\n\n'"Disk images: $DESTINATION/$TAG/ (requester pays). Checksums in SHA256SUMS."; fi
           prerelease=()
           if [[ "$TAG" == *-* ]]; then
             prerelease=(--prerelease)
           fi
-          gh release create "$TAG" --verify-tag --title "$TAG" --notes "Binaries built and tested by CI run $RUN_URL." \
+          gh release create "$TAG" --verify-tag --title "$TAG" --notes "$notes" \
             --generate-notes "${prerelease[@]}" gang-* SHA256SUMS

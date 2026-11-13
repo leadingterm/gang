@@ -78,6 +78,7 @@ fn tools() -> ActionTools {
         shell: PathBuf::from("/nix/store/aaa-bash/bin/bash"),
         bwrap: Some(PathBuf::from("/nix/store/ccc-bubblewrap/bin/bwrap")),
         path: "/nix/store/aaa-bash/bin:/nix/store/bbb-coreutils/bin".to_owned(),
+        action_bin: PathBuf::from("/nix/store/ddd-action-tools/bin"),
         glibc_tool: None,
         glibc_loader: Vec::new(),
     }
@@ -341,6 +342,28 @@ fn bwrap_binds_only_action_tool_roots_and_signal_dir() -> gang_e2e::Result<()> {
     Ok(())
 }
 
+#[test]
+fn bwrap_binds_action_tools_at_standard_paths() -> gang_e2e::Result<()> {
+    let (_, template) = placed(Transport::Plain)?;
+    let tools = tools();
+    let template = template.vary(&Variant::baseline(Sandbox::Bwrap), &launcher(), &tools)?;
+    let doc = typed_rendered(&template)?;
+    let bwrap = doc.sandbox.bwrap.as_ref().expect("bwrap sandbox");
+    let mounts: Vec<_> = bwrap
+        .readonly_bind_mounts
+        .iter()
+        .map(|(destination, source)| (destination.as_path(), source.as_path()))
+        .collect();
+    assert_eq!(
+        mounts,
+        vec![
+            (std::path::Path::new("/bin"), tools.action_bin.as_path()),
+            (std::path::Path::new("/usr/bin"), tools.action_bin.as_path()),
+        ]
+    );
+    Ok(())
+}
+
 /// Loader paths follow the action tool roots and precede the signal directory.
 #[test]
 fn bwrap_binds_the_host_glibc_loader_after_the_tool_roots() -> gang_e2e::Result<()> {
@@ -418,6 +441,7 @@ fn bwrap_rejects_host_action_tools_but_noop_does_not() -> gang_e2e::Result<()> {
                 shell: PathBuf::from("/usr/bin/bash"),
                 bwrap: Some(PathBuf::from("/nix/store/ccc-bubblewrap/bin/bwrap")),
                 path: "/usr/bin:/bin".to_owned(),
+                action_bin: PathBuf::from("/nix/store/ddd-action-tools/bin"),
                 glibc_tool: None,
                 glibc_loader: Vec::new(),
             },
@@ -428,6 +452,7 @@ fn bwrap_rejects_host_action_tools_but_noop_does_not() -> gang_e2e::Result<()> {
                 shell: PathBuf::from("/nix/store/aaa-bash/bin/bash"),
                 bwrap: Some(PathBuf::from("/nix/store/ccc-bubblewrap/bin/bwrap")),
                 path: "/usr/bin:/bin".to_owned(),
+                action_bin: PathBuf::from("/nix/store/ddd-action-tools/bin"),
                 glibc_tool: None,
                 glibc_loader: Vec::new(),
             },

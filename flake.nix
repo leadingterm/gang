@@ -57,13 +57,18 @@
       gang-scratch = import ./infra/nixos/tests/gang-scratch.nix {inherit pkgs;};
       gang-config = import ./infra/nixos/tests/gang-config.nix {inherit pkgs;};
       glibc-loader = import ./infra/nixos/tests/glibc-loader.nix {inherit pkgs;};
+      action-tools = import ./infra/nixos/tests/action-tools.nix {inherit pkgs;};
     });
 
     packages = forLinuxSystems (system: let
       pkgs = pkgsFor system;
       binary = "${gang-binaries}/${system}/gang";
+      # Raw, so the disk compresses well and EBS direct APIs or VM Import take it unconverted.
       image = role:
-        (mkNixos [amazonImageModule] role system).config.system.build.amazonImage;
+        import ./infra/nixos/verified-image.nix {
+          inherit pkgs;
+          nixos = mkNixos [amazonImageModule {amazonImage.format = "raw";}] role system;
+        };
     in {
       # Bazel is the only builder of gang (statically linked, dashboard embedded): the images carry exactly the binary it built, taken unchanged from the gang-binaries input.
       gang = pkgs.stdenvNoCC.mkDerivation {
@@ -132,6 +137,12 @@
           # The e2e harness uses pinned action tools without the host toolchain.
           GANG_E2E_ACTION_SHELL = "${pkgs.bash}/bin/bash";
           GANG_E2E_ACTION_PATH = lib.makeBinPath actionTools;
+          # The same tools in one directory, which the harness's bwrap sandbox binds at /bin and /usr/bin as the worker image binds its action tools.
+          GANG_E2E_ACTION_BIN = "${pkgs.buildEnv {
+            name = "gang-e2e-action-tools";
+            paths = actionTools;
+            pathsToLink = ["/bin"];
+          }}/bin";
           packages =
             [
               bazel
@@ -146,6 +157,8 @@
           GANG_E2E_BWRAP = "${pkgs.bubblewrap}/bin/bwrap";
         });
       deploy = pkgs.mkShell {packages = deployTools;};
+      # The release workflow's image publication: S3 uploads and zstd.
+      release = pkgs.mkShell {packages = [pkgs.awscli2 pkgs.coreutils pkgs.zstd];};
     });
   };
 }

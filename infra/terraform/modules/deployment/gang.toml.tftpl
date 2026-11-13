@@ -67,6 +67,12 @@ path = "/var/lib/gang/gang.db"
 readonly_bind_paths = ["/nix/store", "/run/current-system/sw", "/lib", "/lib64"]
 permit_network_property = ${gang_settings.permit_network_property}
 
+# The worker image's action tools (infra/nixos/action-tools.nix) where a Linux build host has them:
+# /bin/sh, /bin/bash, /usr/bin/env and the tools of Bazel's strict action PATH.
+[sandbox.bwrap.readonly_bind_mounts]
+"/bin" = "/etc/gang-action-tools/bin"
+"/usr/bin" = "/etc/gang-action-tools/bin"
+
 [limits.cgroup]
 
 [server]

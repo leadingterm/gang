@@ -11,6 +11,7 @@ workspace_rust_library(
             "LOADED_PROBE": "$(rootpath //crates/gang-main/tests/preload:loaded_probe)",
             "PRELOAD_LIB": "$(rootpath //crates/gang-main/tests/preload:preload_lib)",
             "FAKE_LAUNCHER": "$(rootpath //crates/gang-local:fake_launcher)",
+            "WORKSPACE_MANIFEST": "$(rootpath //:Cargo.toml)",
         },
         "//conditions:default": {
             "GANG_CHECKED_IN_CONFIGS": "$(rootpaths //configs:checked_in_configs)",
@@ -20,6 +21,7 @@ workspace_rust_library(
     test_runtime_data = select({
         "@platforms//os:linux": [
             ":gang",
+            "//:Cargo.toml",
             "//configs:checked_in_configs",
             "//crates/gang-main/tests/preload:loaded_probe",
             "//crates/gang-main/tests/preload:preload_lib",

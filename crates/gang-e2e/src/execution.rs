@@ -318,7 +318,8 @@ pub trait Execution: Sync {
     /// When the worker's environment cannot be read.
     fn worker_only_environment(&self, worker: u32) -> Result<Vec<String>>;
 
-    /// `[sandbox.bwrap] readonly_bind_paths` of the deployment's configuration.
+    /// Paths inside the sandbox of `[sandbox.bwrap] readonly_bind_paths` and
+    /// `readonly_bind_mounts` in the deployment's configuration.
     ///
     /// # Errors
     ///

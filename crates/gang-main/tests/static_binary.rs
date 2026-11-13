@@ -183,6 +183,28 @@ fn gang_exec_ignores_loader_environment() -> TestResult {
     Ok(())
 }
 
+/// The release binary reports Cargo.toml's workspace version: Bazel takes it
+/// from there, so the two cannot drift.
+#[test]
+fn short_version_is_the_cargo_workspace_version() -> TestResult {
+    let manifest: toml::Table =
+        std::fs::read_to_string(required_path("WORKSPACE_MANIFEST")?)?.parse()?;
+    let version = manifest
+        .get("workspace")
+        .and_then(|workspace| workspace.get("package"))
+        .and_then(|package| package.get("version"))
+        .and_then(toml::Value::as_str)
+        .ok_or("cargo.toml has no [workspace.package] version")?;
+    let home = tempfile::tempdir()?;
+    let output = output_within(gang_command(home.path())?.arg("-V"), CHILD_LIMIT)?;
+    assert!(output.status.success(), "gang -V failed: {output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout)?.trim(),
+        format!("gang {version}")
+    );
+    Ok(())
+}
+
 #[test]
 fn usage_errors_exit_with_code_two() -> TestResult {
     let dir = tempfile::tempdir()?;

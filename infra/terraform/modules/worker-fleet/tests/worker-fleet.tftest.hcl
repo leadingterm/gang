@@ -17,6 +17,14 @@ mock_provider "aws" {
     defaults = { issuer_identifier = "https://example.invalid" }
   }
 
+  # Every instance type the tests use is offered in both zones unless a run overrides it.
+  mock_data "aws_ec2_instance_type_offerings" {
+    defaults = {
+      instance_types = ["c6id.4xlarge", "c6id.4xlarge", "c7gd.4xlarge", "c7gd.4xlarge", "m6id.4xlarge", "m6id.4xlarge", "m7g.2xlarge", "m7g.2xlarge"]
+      locations      = ["eu-north-1a", "eu-north-1b", "eu-north-1a", "eu-north-1b", "eu-north-1a", "eu-north-1b", "eu-north-1a", "eu-north-1b"]
+    }
+  }
+
   mock_resource "aws_iam_instance_profile" {
     defaults = { arn = "arn:aws:iam::000000000000:instance-profile/gang-worker" }
   }
@@ -36,10 +44,13 @@ override_data {
 }
 
 variables {
-  cache_bucket_arn      = "arn:aws:s3:::gang-cache-example"
-  ca_key_arn            = "arn:aws:kms:eu-north-1:000000000000:key/11111111-2222-3333-4444-555555555555"
-  security_group_id     = "sg-0000000000000000"
-  subnet_ids            = ["subnet-0000000000000001", "subnet-0000000000000002"]
+  cache_bucket_arn  = "arn:aws:s3:::gang-cache-example"
+  ca_key_arn        = "arn:aws:kms:eu-north-1:000000000000:key/11111111-2222-3333-4444-555555555555"
+  security_group_id = "sg-0000000000000000"
+  subnet_ids = {
+    "eu-north-1a" = "subnet-0000000000000001"
+    "eu-north-1b" = "subnet-0000000000000002"
+  }
   config_parameter_name = "/gang/gang.toml"
   config_parameter_arn  = "arn:aws:ssm:eu-north-1:000000000000:parameter/gang/gang.toml"
   fleet_tag_key         = "gang-fleet"
@@ -816,4 +827,136 @@ run "rejects_newline_in_config_parameter_name" {
   }
 
   expect_failures = [var.config_parameter_name]
+}
+
+run "groups_span_every_subnet_when_every_zone_offers_their_types" {
+  command = plan
+
+  assert {
+    condition     = alltrue([for group in aws_autoscaling_group.this : group.vpc_zone_identifier == toset(values(var.subnet_ids))])
+    error_message = "With every instance type offered in every zone, each group must span every subnet."
+  }
+
+  assert {
+    condition     = data.aws_ec2_instance_type_offerings.this.location_type == "availability-zone"
+    error_message = "Instance type offerings must be read per availability zone."
+  }
+
+  assert {
+    condition = (
+      toset(one([for f in data.aws_ec2_instance_type_offerings.this.filter : f.values if f.name == "location"])) == toset(["eu-north-1a", "eu-north-1b"])
+      && toset(one([for f in data.aws_ec2_instance_type_offerings.this.filter : f.values if f.name == "instance-type"])) == toset(["c6id.4xlarge", "c7gd.4xlarge", "m7g.2xlarge"])
+    )
+    error_message = "Instance type offerings must be filtered to the subnet zones and the fleets' instance types."
+  }
+}
+
+run "zone_offering_none_of_a_fleets_types_drops_its_subnet" {
+  command = plan
+
+  override_data {
+    target = data.aws_ec2_instance_type_offerings.this
+    values = {
+      instance_types = ["c6id.4xlarge", "c6id.4xlarge", "c7gd.4xlarge", "c7gd.4xlarge", "m7g.2xlarge"]
+      locations      = ["eu-north-1a", "eu-north-1b", "eu-north-1a", "eu-north-1b", "eu-north-1a"]
+    }
+  }
+
+  assert {
+    condition     = aws_autoscaling_group.this["gang-worker-aarch64"].vpc_zone_identifier == toset(["subnet-0000000000000001"])
+    error_message = "A zone that offers none of a fleet's instance types must drop its subnet from the fleet's group."
+  }
+
+  assert {
+    condition     = aws_autoscaling_group.this["gang-worker-x86-64"].vpc_zone_identifier == toset(["subnet-0000000000000001", "subnet-0000000000000002"])
+    error_message = "A type missing from one fleet must not drop subnets from a fleet whose types every zone offers."
+  }
+}
+
+run "zone_offering_one_of_a_fleets_types_keeps_its_subnet" {
+  command = plan
+
+  override_data {
+    target = data.aws_ec2_instance_type_offerings.this
+    values = {
+      instance_types = ["c6id.4xlarge", "c7gd.4xlarge", "m7g.2xlarge", "m7g.2xlarge"]
+      locations      = ["eu-north-1a", "eu-north-1b", "eu-north-1a", "eu-north-1b"]
+    }
+  }
+
+  assert {
+    condition     = aws_autoscaling_group.this["gang-worker-x86-64"].vpc_zone_identifier == toset(["subnet-0000000000000001", "subnet-0000000000000002"])
+    error_message = "A zone that offers at least one of a fleet's instance types must keep its subnet in the fleet's group."
+  }
+
+  assert {
+    condition = [
+      for o in aws_autoscaling_group.this["gang-worker-x86-64"].mixed_instances_policy[0].launch_template[0].override : o.instance_type
+    ] == ["c6id.4xlarge", "c7gd.4xlarge"]
+    error_message = "Zone filtering must keep every instance type as a group-wide override, in priority order."
+  }
+}
+
+run "fallback_twin_spans_the_same_zones_as_its_spot_group" {
+  command = plan
+
+  variables {
+    fleets = [
+      {
+        name           = "gang-worker-x86-64"
+        capacity       = "spot"
+        ami_id         = "ami-0000000000000001"
+        instance_types = ["m6id.4xlarge"]
+        max_instances  = 4
+        fallback       = {}
+      },
+    ]
+  }
+
+  override_data {
+    target = data.aws_ec2_instance_type_offerings.this
+    values = {
+      instance_types = ["m6id.4xlarge"]
+      locations      = ["eu-north-1b"]
+    }
+  }
+
+  assert {
+    condition     = aws_autoscaling_group.this["gang-worker-x86-64"].vpc_zone_identifier == toset(["subnet-0000000000000002"]) && aws_autoscaling_group.this["gang-worker-x86-64-on-demand"].vpc_zone_identifier == toset(["subnet-0000000000000002"])
+    error_message = "A fallback fleet's spot group and on-demand twin must both span only the zones that offer its instance types."
+  }
+}
+
+run "rejects_fleet_whose_instance_types_no_zone_offers" {
+  command = plan
+
+  override_data {
+    target = data.aws_ec2_instance_type_offerings.this
+    values = {
+      instance_types = ["c6id.4xlarge", "c6id.4xlarge", "c7gd.4xlarge", "c7gd.4xlarge"]
+      locations      = ["eu-north-1a", "eu-north-1b", "eu-north-1a", "eu-north-1b"]
+    }
+  }
+
+  expect_failures = [aws_autoscaling_group.this]
+}
+
+run "rejects_empty_subnet_ids" {
+  command = plan
+
+  variables {
+    subnet_ids = {}
+  }
+
+  expect_failures = [var.subnet_ids]
+}
+
+run "rejects_empty_fleets" {
+  command = plan
+
+  variables {
+    fleets = []
+  }
+
+  expect_failures = [var.fleets]
 }

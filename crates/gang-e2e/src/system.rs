@@ -226,6 +226,8 @@ gang_types::string_enum! {
         SandboxContract = "sandbox_contract",
         /// Runs the staged dynamically linked glibc program and records whether it started.
         GlibcTool = "glibc_tool",
+        /// Runs a `#!/usr/bin/env bash` script with Bazel's strict action `PATH` and records whether it ran.
+        FhsTools = "fhs_tools",
         /// Leaves a process in its own process group behind and waits for the go flag.
         Stray = "stray",
         /// Reports to the journal and waits for the go flag.

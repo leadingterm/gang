@@ -24,8 +24,8 @@ output "public_subnet_cidr_blocks" {
 }
 
 output "private_subnet_ids" {
-  description = "Private subnet IDs in availability zone order. Worker fleets launch here."
-  value       = aws_subnet.private[*].id
+  description = "Private subnet ID per availability zone name. Worker fleets launch here."
+  value       = { for subnet in aws_subnet.private : subnet.availability_zone => subnet.id }
 }
 
 output "controller_security_group_id" {

@@ -69,6 +69,11 @@ pub struct Settings {
     /// The PATH of the sample's actions. Defaults to `GANG_E2E_ACTION_PATH`, which the flake's devShell sets.
     #[serde(default)]
     pub action_path: Option<String>,
+    /// The directory of the sample's action tools, bound at `/bin` and `/usr/bin` in bwrap
+    /// sandboxes as the worker image binds its action tools. Defaults to `GANG_E2E_ACTION_BIN`,
+    /// which the flake's devShell sets.
+    #[serde(default)]
+    pub action_bin: Option<PathBuf>,
     /// How long connection setup, TLS, and the first HTTP/2 frame may take.
     #[serde(with = "gang_types::duration")]
     pub handshake_timeout: Duration,
@@ -118,6 +123,7 @@ impl Default for Settings {
             shell: None,
             bwrap: None,
             action_path: None,
+            action_bin: None,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             command_timeout: DEFAULT_COMMAND_TIMEOUT,
@@ -153,6 +159,8 @@ pub struct ActionTools {
     pub shell: PathBuf,
     /// The PATH provided to each action.
     pub path: String,
+    /// The directory of the action tools, bound at `/bin` and `/usr/bin` in bwrap sandboxes.
+    pub action_bin: PathBuf,
     /// The bubblewrap binary a bwrap-sandboxed worker runs (`[sandbox.bwrap] program`);
     /// `None` where the platform has no bwrap.
     pub bwrap: Option<PathBuf>,

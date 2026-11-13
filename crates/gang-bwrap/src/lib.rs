@@ -12,6 +12,7 @@
 //!
 //! let config = BwrapConfig {
 //!     readonly_bind_paths: vec![AbsolutePathBuf::try_new("/usr")?],
+//!     readonly_bind_mounts: std::collections::BTreeMap::new(),
 //!     permit_network_property: false,
 //!     program: PathBuf::from("/usr/bin/bwrap"),
 //!     tmp_path: AbsolutePathBuf::try_new("/tmp")?,

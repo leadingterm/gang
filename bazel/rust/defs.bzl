@@ -1,5 +1,6 @@
 """Shared defaults for first-party Rust packages."""
 
+load("@gang_version//:version.bzl", "VERSION")
 load("@rules_rust//cargo:defs.bzl", "extract_cargo_lints")
 load(
     "@rules_rust//rust:defs.bzl",
@@ -13,10 +14,6 @@ load(
     _rust_library = "rust_library",
 )
 load("@rust_crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
-
-def _workspace_version():
-    """Returns the root module version."""
-    return native.module_version()
 
 def _unique(values):
     result = []
@@ -46,7 +43,7 @@ def _common(rustc_env):
         "edition": crate_edition(),
         "lint_config": _cargo_lints(),
         "rustc_env": rustc_env,
-        "version": _workspace_version(),
+        "version": VERSION,
     }
 
 def _cargo_lints():

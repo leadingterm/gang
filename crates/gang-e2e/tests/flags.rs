@@ -22,6 +22,7 @@ fn action_tools() -> ActionTools {
     ActionTools {
         shell: PathBuf::from("/nix/store/example-bash/bin/bash"),
         path: "/nix/store/example-coreutils/bin".to_owned(),
+        action_bin: PathBuf::from("/nix/store/ddd-action-tools/bin"),
         bwrap: None,
         glibc_tool: None,
         glibc_loader: Vec::new(),

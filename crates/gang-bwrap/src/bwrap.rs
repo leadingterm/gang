@@ -50,6 +50,7 @@ impl Plugin for Bwrap {
     fn build(config: Self::Config, _context: &PluginContext<'_>) -> Result<Self, PortError> {
         let BwrapConfig {
             readonly_bind_paths,
+            readonly_bind_mounts,
             permit_network_property,
             program,
             tmp_path,
@@ -59,8 +60,12 @@ impl Plugin for Bwrap {
             return Err(BwrapError::RelativeProgram(program).into());
         }
 
-        let mut prefix =
-            Vec::with_capacity(FIXED_ARGUMENTS.len() + 3 + 3 * readonly_bind_paths.len());
+        let mut prefix = Vec::with_capacity(
+            FIXED_ARGUMENTS.len()
+                + 3
+                + 3 * readonly_bind_paths.len()
+                + 3 * readonly_bind_mounts.len(),
+        );
         prefix.extend(FIXED_ARGUMENTS.iter().copied().map(OsString::from));
         prefix.push(OsString::from("--tmpfs"));
         prefix.push(tmp_path.into_path_buf().into_os_string());
@@ -70,6 +75,11 @@ impl Plugin for Bwrap {
             prefix.push(OsString::from("--ro-bind"));
             prefix.push(source.clone());
             prefix.push(source);
+        }
+        for (destination, source) in readonly_bind_mounts {
+            prefix.push(OsString::from("--ro-bind"));
+            prefix.push(source.into_path_buf().into_os_string());
+            prefix.push(destination.into_path_buf().into_os_string());
         }
 
         Ok(Self {
@@ -190,6 +200,7 @@ async fn sandbox_pid(reader: std::io::PipeReader) -> Result<Option<Pid>, BwrapEr
 
 #[cfg(test)]
 pub(super) mod tests {
+    use std::collections::BTreeMap;
     use std::ffi::OsString;
     #[cfg(target_os = "linux")]
     use std::fs::File;
@@ -229,6 +240,7 @@ pub(super) mod tests {
     fn config() -> BwrapConfig {
         BwrapConfig {
             readonly_bind_paths: Vec::new(),
+            readonly_bind_mounts: BTreeMap::new(),
             permit_network_property: false,
             program: PathBuf::from("/usr/bin/bwrap"),
             tmp_path: AbsolutePathBuf::try_new("/tmp").expect("`/tmp` is absolute"),

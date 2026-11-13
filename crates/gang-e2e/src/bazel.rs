@@ -143,6 +143,7 @@ mod tests {
             ActionTools {
                 shell: PathBuf::from("/tools/sh"),
                 path: "/pinned/bin:/pinned/other".to_owned(),
+                action_bin: PathBuf::from("/nix/store/ddd-action-tools/bin"),
                 bwrap: None,
                 glibc_tool: None,
                 glibc_loader: Vec::new(),

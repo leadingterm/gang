@@ -19,9 +19,14 @@ variable "iam_permissions_boundary_arn" {
 }
 
 variable "subnet_ids" {
-  description = "Private subnet IDs the worker Auto Scaling groups launch into."
-  type        = list(string)
+  description = "Private subnet ID per availability zone name. Each worker Auto Scaling group launches into the subnets whose zone offers at least one of its fleet's instance types."
+  type        = map(string)
   nullable    = false
+
+  validation {
+    condition     = length(var.subnet_ids) > 0
+    error_message = "subnet_ids needs at least one subnet."
+  }
 }
 
 variable "security_group_id" {
@@ -36,7 +41,7 @@ variable "fleets" {
     - `name`: the ASG name, which is also the fleet name the controller uses. 1 to 40 lowercase letters, digits and hyphens; starts and ends with a letter or digit.
     - `capacity`: `spot` or `on-demand`. Spot fleets buy interruptible capacity with price-capacity-optimized allocation; on-demand fleets buy only on-demand capacity.
     - `ami_id`: the worker AMI for this fleet.
-    - `instance_types`: instance types, one mixed-instances override each. The list order is the priority for on-demand fleets: the first type is tried first. Spot fleets ignore the order. Types must be distinct. Unless `scratch_volume_gib` is set, every type must have instance-store NVMe (a `d` family such as `c6id.4xlarge` or `c7gd.4xlarge`).
+    - `instance_types`: instance types, one mixed-instances override each. The list order is the priority for on-demand fleets: the first type is tried first. Spot fleets ignore the order. Types must be distinct. Unless `scratch_volume_gib` is set, every type must have instance-store NVMe (a `d` family such as `c6id.4xlarge` or `c7gd.4xlarge`). Each of the fleet's groups spans only the subnets whose availability zone offers at least one of these types; the plan fails when no zone offers any.
     - `max_instances`: the ASG maximum size.
     - `scratch_volume_gib`: size of an encrypted gp3 EBS data volume at `/dev/sdf`, for EBS-only instance types. `null` attaches no scratch volume.
     - `root_volume_gib`: size of the encrypted gp3 root volume. Defaults to 30 GiB.
@@ -55,6 +60,11 @@ variable "fleets" {
     fallback           = optional(object({}), null)
   }))
   nullable = false
+
+  validation {
+    condition     = length(var.fleets) > 0
+    error_message = "At least one fleet is required."
+  }
 
   validation {
     condition     = alltrue([for fleet in var.fleets : can(regex("^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$", fleet.name))])

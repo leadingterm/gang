@@ -45,6 +45,10 @@ use crate::system::{
     LIMIT_MAX_PIDS, NOOP_FLEET, PermitNetwork, SMALL_FLEET, Sandbox, SoftMemory, Variant,
 };
 
+/// The paths inside the sandbox at which the worker image binds its action tools
+/// (`configs/gang.aws.toml`); the harness binds the sample's action tools there.
+const ACTION_TOOL_PATHS: [&str; 2] = ["/bin", "/usr/bin"];
+
 /// The `max_instances` of [`SMALL_FLEET`] and [`NOOP_FLEET`].
 const SMALL_MAX_INSTANCES: NonZeroU32 = NonZeroU32::MIN;
 
@@ -285,6 +289,16 @@ impl ConfigTemplate {
                 bwrap.readonly_bind_paths = bind_roots(tools)?
                     .into_iter()
                     .map(|root| absolute(root, "the action tool bind root"))
+                    .collect::<Result<_>>()?;
+                let tools_directory =
+                    absolute(tools.action_bin.clone(), "the action tools directory")?;
+                bwrap.readonly_bind_mounts = ACTION_TOOL_PATHS
+                    .iter()
+                    .copied()
+                    .map(|path| {
+                        absolute(PathBuf::from(path), "an action tool path")
+                            .map(|path| (path, tools_directory.clone()))
+                    })
                     .collect::<Result<_>>()?;
                 bwrap.permit_network_property = variant.permit_network == PermitNetwork::Permitted;
             }

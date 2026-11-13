@@ -47,6 +47,10 @@ busy_timeout = "5s"
 # On NixOS with nix-ld, add "/run/current-system/sw" and "/lib64" (x86-64) or "/lib" (aarch64) so the dynamically linked glibc toolchains Bazel downloads can start.
 readonly_bind_paths = ["/nix/store"]
 permit_network_property = false
+# Optional readonly_bind_mounts show a directory of tools where actions name them, as the worker image does, e.g. on NixOS:
+# [sandbox.bwrap.readonly_bind_mounts]
+# "/bin" = "/run/current-system/sw/bin"
+# "/usr/bin" = "/run/current-system/sw/bin"
 
 # Optional [limits.cgroup] (Linux only): needs a delegated cgroup v2 subtree; locally set delegation = "trusted", because the user manager sets no delegate marker on the worker_launcher's scope (systemd_marker needs a system unit with Delegate=yes). Its keys and defaults are documented in crates/gang-cgroup/src/config.rs.
 
