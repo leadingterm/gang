@@ -954,8 +954,7 @@ mod tests {
         processes.exit(pid);
 
         let warnings = Warnings::default();
-        let supply =
-            tracing::subscriber::with_default(warnings.clone(), || supply_of(&manager, fleet));
+        let supply = gang_testkit::with_subscriber(warnings.clone(), || supply_of(&manager, fleet));
         assert_eq!(supply.instances.len(), 1);
         assert_eq!(supply.instances[0].id, id("local-2"));
         assert_eq!(processes.launched(), 2);
@@ -982,8 +981,7 @@ mod tests {
         processes.exit(pid);
 
         let warnings = Warnings::default();
-        let supply =
-            tracing::subscriber::with_default(warnings.clone(), || supply_of(&manager, fleet));
+        let supply = gang_testkit::with_subscriber(warnings.clone(), || supply_of(&manager, fleet));
 
         assert_eq!(supply.instances.len(), 1);
         assert_eq!(supply.instances[0].id, id("local-2"));
@@ -1554,7 +1552,7 @@ mod tests {
             .with_writer(buffer.clone())
             .with_ansi(false)
             .finish();
-        let supply = tracing::subscriber::with_default(subscriber, || supply_of(&manager, fleet));
+        let supply = gang_testkit::with_subscriber(subscriber, || supply_of(&manager, fleet));
         assert_eq!(
             supply.exits,
             vec![InstanceExit {

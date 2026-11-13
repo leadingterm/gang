@@ -86,7 +86,7 @@ cmd_plan() {
 
 cmd_store() {
   require GITHUB_SHA GITHUB_REPOSITORY GITHUB_REPOSITORY_ID GITHUB_RUN_ID GITHUB_RUN_ATTEMPT PR_NUMBER PR_HEAD_SHA \
-    RUNNER_TEMP INFRA_PLAN_BUCKET INFRA_PLAN_PREFIX INFRA_STATE_KMS_KEY_ARN INFRA_PLAN_MAX_AGE_SECONDS
+    RUNNER_TEMP INFRA_PLAN_BUCKET INFRA_PLAN_PREFIX INFRA_STATE_KMS_KEY_ARN INFRA_PLAN_MAX_AGE
 
   local plan_file="$RUNNER_TEMP/infra.tfplan"
   local json_file="$RUNNER_TEMP/infra-plan.json"
@@ -106,7 +106,7 @@ cmd_store() {
     --pr-number "$PR_NUMBER" --pr-head-sha "$PR_HEAD_SHA" \
     --sha "$GITHUB_SHA" --head "$head" "${parents[@]}" --tree-sha "$tree" \
     --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
-    --prefix "$INFRA_PLAN_PREFIX" --max-age-seconds "$INFRA_PLAN_MAX_AGE_SECONDS" \
+    --prefix "$INFRA_PLAN_PREFIX" --max-age "$INFRA_PLAN_MAX_AGE" \
     --now "$now" --plan-file "$plan_file" <"$json_file" >"$request"
   key="$(jq -r .plan_key "$request")"
   metadata="$(jq -r .metadata "$request")"
@@ -189,8 +189,7 @@ cmd_resolve() {
 }
 
 cmd_fetch() {
-  require INFRA_PLAN_BUCKET INFRA_PLAN_MAX_AGE_SECONDS RUNNER_TEMP
-  require_number INFRA_PLAN_MAX_AGE_SECONDS
+  require INFRA_PLAN_BUCKET INFRA_PLAN_MAX_AGE RUNNER_TEMP
 
   local manifest="$RUNNER_TEMP/manifest.json"
   local dest="$RUNNER_TEMP/infra.tfplan"
@@ -206,7 +205,7 @@ cmd_fetch() {
     || die "could not read plan object $key"
   now="$(date -u +%s)"
   "$GANG" deploy check-object --manifest "$manifest" --now "$now" \
-    --max-age-seconds "$INFRA_PLAN_MAX_AGE_SECONDS" <<<"$object"
+    --max-age "$INFRA_PLAN_MAX_AGE" <<<"$object"
 
   aws s3api get-object --bucket "$INFRA_PLAN_BUCKET" --key "$key" --version-id "$version" "$dest" >/dev/null \
     || { rm -f "$dest"; die "could not fetch plan object $key"; }
@@ -224,38 +223,18 @@ cmd_verify() {
 }
 
 cmd_apply() {
-  require RUNNER_TEMP HAS_CHANGES
+  require RUNNER_TEMP HAS_CHANGES INFRA_LOCK_TIMEOUT
   if [[ "$HAS_CHANGES" != true ]]; then
     log "reviewed plan has no changes; nothing to apply"
     return 0
   fi
-
-  local max_attempts="${TOFU_LOCK_MAX_ATTEMPTS:-6}"
-  local delay="${TOFU_LOCK_INITIAL_DELAY_SECONDS:-2}"
-  local lock_timeout="${TOFU_LOCK_TIMEOUT:-30s}"
-  local err="$RUNNER_TEMP/tofu-apply.stderr"
-  local attempt=1 rc
-
-  while :; do
-    rc=0
-    tofu -chdir="$ROOT" apply -input=false -lock-timeout="$lock_timeout" "$RUNNER_TEMP/infra.tfplan" 2>"$err" || rc=$?
-    cat "$err" >&2
-    if (( rc == 0 )); then
-      return 0
-    fi
-    if ! grep -q 'Error acquiring the state lock' "$err" || (( attempt >= max_attempts )); then
-      die "tofu apply failed with exit status $rc"
-    fi
-    log "state lock is held; retrying in ${delay}s (attempt $attempt of $max_attempts)"
-    sleep "$delay"
-    delay=$((delay * 2))
-    attempt=$((attempt + 1))
-  done
+  tofu -chdir="$ROOT" apply -input=false -lock-timeout="$INFRA_LOCK_TIMEOUT" "$RUNNER_TEMP/infra.tfplan"
 }
 
 cmd_converge() {
+  require INFRA_LOCK_TIMEOUT
   local rc=0
-  tofu -chdir="$ROOT" plan -detailed-exitcode -input=false -lock-timeout="${TOFU_LOCK_TIMEOUT:-30s}" || rc=$?
+  tofu -chdir="$ROOT" plan -detailed-exitcode -input=false -lock-timeout="$INFRA_LOCK_TIMEOUT" || rc=$?
   case "$rc" in
     0) log "root converged" ;;
     2) die "root is not converged after apply: a follow-up plan has changes" ;;

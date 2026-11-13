@@ -101,3 +101,25 @@ workspace_rust_binary(
         ":gang_e2e",
     ],
 )
+
+# The harness with the pinned Bazel and the glibc probe it runs, as plain files beside each other,
+# for a job that runs the harness without Bazel (CI's e2e gates pass them by flag).
+genrule(
+    name = "bundle",
+    srcs = [
+        ":bazel",
+        ":local",
+        "//crates/gang-main/tests/preload:loaded_probe",
+    ],
+    outs = [
+        "bundle/bazel",
+        "bundle/local",
+        "bundle/loaded_probe",
+    ],
+    cmd = " && ".join([
+        "cp $(execpath :bazel) $(execpath bundle/bazel)",
+        "cp $(execpath :local) $(execpath bundle/local)",
+        "cp $(execpath //crates/gang-main/tests/preload:loaded_probe) $(execpath bundle/loaded_probe)",
+    ]),
+    target_compatible_with = ["@platforms//os:linux"],
+)

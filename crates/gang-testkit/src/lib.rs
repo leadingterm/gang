@@ -7,6 +7,7 @@
 //! The kit provides:
 //!
 //! - [`fork_gate`]: the process-wide gate between lifetime-lock users and child spawns.
+//! - [`with_subscriber`]: runs a closure under a scoped tracing subscriber that other test threads cannot blind.
 //! - [`ChildTest`]: a test of the running binary that another test re-executes in a child process and requires to complete.
 //! - [`TestResult`]: the result type test functions return.
 //! - [`assert_sources_not_repeated`]: the error-message check for `every_variant()` tests.
@@ -53,6 +54,7 @@ mod scheduler;
 mod signer;
 /// The contract suite that every `CertificateSignerPort` implementation must pass.
 pub mod signer_contract;
+mod subscriber;
 mod test_result;
 mod tls_authority;
 mod worker;
@@ -78,6 +80,7 @@ pub use scheduler::{
 pub use signer::{
     AUTHORITY_SEED, FailingSigner, GarbageSigner, TestSigner, WrongKeySigner, signing_key,
 };
+pub use subscriber::with_subscriber;
 pub use test_result::TestResult;
 pub use tls_authority::{
     ExtendedKeyUsagePurpose, TestAuthority, TestLeaf, TlsFixtureError, Window,

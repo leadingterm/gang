@@ -14,75 +14,96 @@ concurrency:
 
 defaults:
   run:
-    shell: bash
+    shell: nix develop -c bash --noprofile --norc -euo pipefail {0}
 
 jobs:
-  # Every job is required: a gate that may fail is not a gate. Branch protection lists validate, macos, linux-arm64, e2e-gate-1 and e2e-gate-2.
-  # Every job restores the Bazel disk cache (setup-ci). validate, linux-arm64 and macos save it
-  # (save-bazel-cache) at the end of every run of this repository, whether it passed, failed, timed out
-  # or was cancelled, so a cold run's progress is kept for the next run of the same ref; a fork's pull
-  # request saves nothing, and the e2e jobs reuse validate's Linux x86-64 entry and save none.
-  # Timeouts are about twice the slowest measured cold (no cache) duration (docs/SPECIFICATION.md 7.1);
-  # the step timeouts on the long Bazel steps leave the save room inside the job timeout.
-  validate:
+  # Every job is a required check (docs/SPECIFICATION.md 7.1). Timeouts are about twice the slowest
+  # measured cold run; the step timeouts of the long Bazel steps leave the cache save room inside the job's.
+  lint:
     runs-on: ubuntu-24.04
-    timeout-minutes: 75
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-ci
+      - uses: ./.github/actions/setup-nix
+      - name: Check Nix formatting
+        run: alejandra --check .
+      - name: Lint scripts
+        run: shellcheck infra/scripts/*.sh
+      - name: Lint workflows
+        run: actionlint
+      - name: Evaluate every flake output of every system
+        run: nix flake check --no-build --all-systems
+
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-nix
+      - uses: ./.github/actions/setup-bazel
       - name: Check BUILD files are in sync
-        run: nix develop -c bazelisk run --config=ci --disk_cache="$BAZEL_DISK_CACHE" //:gazelle.check
+        run: bazel run //:gazelle.check
       - name: Test
-        timeout-minutes: 40
-        run: nix develop -c bazelisk test --config=ci --disk_cache="$BAZEL_DISK_CACHE" //...
-      # The UI build runs esbuild on the exec platform, not the cross-build target.
-      - name: Cross-build gang
-        timeout-minutes: 16
-        run: nix develop -c bazelisk build --config=ci --disk_cache="$BAZEL_DISK_CACHE" --platforms=@zig_sdk//libc_aware/platform:linux_arm64_musl //:gang
+        timeout-minutes: 55
+        run: bazel test //...
+      - uses: ./.github/actions/upload-gang
+        with:
+          target: x86_64-unknown-linux-musl
+      - name: Collect the e2e harness
+        run: |
+          mkdir -p "$RUNNER_TEMP/e2e"
+          cp $(bazel cquery --output=files //crates/gang-e2e:bundle) "$RUNNER_TEMP/e2e/"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-harness
+          path: ${{ runner.temp }}/e2e
+          if-no-files-found: error
       - name: Save the Bazel disk cache
         if: always()
         uses: ./.github/actions/save-bazel-cache
         with:
           prune: ${{ job.status == 'success' }}
-      - name: Check Nix formatting
-        run: nix develop -c alejandra --check .
-      - name: Evaluate NixOS configurations, checks, and images
-        run: |
-          for config in controller-x86_64 controller-aarch64 worker-x86_64 worker-aarch64; do
-            nix eval --raw ".#nixosConfigurations.${config}.config.system.build.toplevel.drvPath"
-            echo
-          done
-          for check in gang-scratch gang-config; do
-            nix eval --raw ".#checks.x86_64-linux.${check}.drvPath"
-            echo
-          done
-          for system in x86_64-linux aarch64-linux; do
-            for image in controller-image worker-image; do
-              nix eval --raw ".#packages.${system}.${image}.drvPath"
-              echo
-            done
-          done
-      - name: Lint scripts
-        run: nix develop -c shellcheck infra/scripts/*.sh
-      - name: Lint workflows
-        run: nix develop -c actionlint
 
-  macos:
-    runs-on: macos-15
-    timeout-minutes: 70
+  cross:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-ci
+      - uses: ./.github/actions/setup-nix
+      - uses: ./.github/actions/setup-bazel
+      - name: Cross-build gang
+        timeout-minutes: 45
+        run: bazel build --platforms=@zig_sdk//libc_aware/platform:linux_arm64_musl //:gang
+      - name: Save the Bazel disk cache
+        if: always()
+        uses: ./.github/actions/save-bazel-cache
+        with:
+          prune: ${{ job.status == 'success' }}
+
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 145
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-nix
+      - uses: ./.github/actions/setup-bazel
       - name: Build
-        timeout-minutes: 50
-        run: nix develop -c bazelisk build --config=ci --disk_cache="$BAZEL_DISK_CACHE" //...
+        timeout-minutes: 130
+        run: bazel build //...
+      - uses: ./.github/actions/upload-gang
+        with:
+          target: aarch64-apple-darwin
       - name: Test the macOS-specific crates
         timeout-minutes: 10
-        run: nix develop -c bazelisk test --config=ci --disk_cache="$BAZEL_DISK_CACHE" //crates/gang-exec/... //crates/gang-noop/...
+        run: bazel test //crates/gang-exec/... //crates/gang-noop/...
       - name: Save the Bazel disk cache
         if: always()
         uses: ./.github/actions/save-bazel-cache
@@ -91,29 +112,51 @@ jobs:
 
   linux-arm64:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 45
+    timeout-minutes: 65
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-ci
+      - uses: ./.github/actions/setup-nix
+      - uses: ./.github/actions/setup-bazel
       - name: Test
-        timeout-minutes: 35
-        run: nix develop -c bazelisk test --config=ci --disk_cache="$BAZEL_DISK_CACHE" //...
+        timeout-minutes: 60
+        run: bazel test //...
+      - uses: ./.github/actions/upload-gang
+        with:
+          target: aarch64-unknown-linux-musl
       - name: Save the Bazel disk cache
         if: always()
         uses: ./.github/actions/save-bazel-cache
         with:
           prune: ${{ job.status == 'success' }}
 
-  e2e-gate-1:
+  e2e:
+    name: e2e-gate-${{ matrix.gate }}
+    needs: linux-x86_64
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - gate: 1
+            args: --gate 1
+          - gate: 2
+            args: --gate 2 --additions
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-ci
+      - uses: ./.github/actions/setup-nix
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: e2e-harness
+          path: ${{ runner.temp }}/e2e
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gang-x86_64-unknown-linux-musl
+          path: ${{ runner.temp }}/e2e
       - name: Delegate cgroup controllers to the user session
         run: |
           sudo mkdir -p /etc/systemd/system/user@.service.d
@@ -122,26 +165,13 @@ jobs:
           sudo loginctl enable-linger "$(id -u)"
           sudo systemctl restart "user@$(id -u).service"
           sudo systemctl start "user@$(id -u).service"
-      # Workers use systemd-run --user --scope and need the runner's delegated user manager.
-      - name: Run Gate 1
-        run: XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-run --user --pipe --wait --same-dir -p Delegate=yes --setenv=PATH="$PATH" -- nix develop -c bazelisk run --config=ci --disk_cache="$BAZEL_DISK_CACHE" //crates/gang-e2e:local -- --gate 1
-
-  e2e-gate-2:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/setup-ci
-      - name: Delegate cgroup controllers to the user session
+      # Workers use systemd-run --user --scope and need the runner's delegated user manager. The unit
+      # starts from the user manager's environment, so it enters the devShell itself. Artifacts drop
+      # file modes; ARGS splits into the harness's arguments.
+      - name: Run the gate
+        env:
+          ARGS: ${{ matrix.args }}
+          E2E: ${{ runner.temp }}/e2e
         run: |
-          sudo mkdir -p /etc/systemd/system/user@.service.d
-          printf '[Service]\nDelegate=yes\n' | sudo tee /etc/systemd/system/user@.service.d/delegate.conf
-          sudo systemctl daemon-reload
-          sudo loginctl enable-linger "$(id -u)"
-          sudo systemctl restart "user@$(id -u).service"
-          sudo systemctl start "user@$(id -u).service"
-      # Workers use systemd-run --user --scope and need the runner's delegated user manager.
-      - name: Run Gate 2 additions
-        run: XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-run --user --pipe --wait --same-dir -p Delegate=yes --setenv=PATH="$PATH" -- nix develop -c bazelisk run --config=ci --disk_cache="$BAZEL_DISK_CACHE" //crates/gang-e2e:local -- --gate 2 --additions
+          chmod +x "$E2E"/*
+          XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-run --user --pipe --wait --same-dir -p Delegate=yes --setenv=PATH="$PATH" --setenv=GANG_E2E_GLIBC_TOOL="$E2E/loaded_probe" -- nix develop -c "$E2E/local" --gang "$E2E/gang-x86_64-unknown-linux-musl" --bazel "$E2E/bazel" --config configs/gang.local.toml --sample e2e/sample --configs configs $ARGS

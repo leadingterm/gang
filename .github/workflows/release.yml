@@ -1,7 +1,5 @@
-# Publishes the gang binaries of a release: every pushed `v*` tag gets a GitHub release holding
-# gang-<target> for each target below and SHA256SUMS over them. A tag with a pre-release suffix
-# (`v1.2.3-rc.1`) is published as a pre-release. A release is created once: re-running `publish`
-# for a tag that already has a release fails instead of replacing its assets.
+# Publishes the gang binaries of every pushed v* tag as a GitHub release (docs/SPECIFICATION.md 7.2):
+# the binaries CI built and tested for the tagged commit on main. Nothing is compiled here.
 
 name: Release
 
@@ -17,71 +15,47 @@ defaults:
     shell: bash
 
 jobs:
-  # Restores the disk cache that CI's pushes to main save (setup-ci) and never saves one: a cache
-  # saved from a tag is visible to that tag only.
-  build:
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            runner: ubuntu-24.04
-            platforms: ""
-          # Cross-built; the UI build runs esbuild on the exec platform, not the cross-build target.
-          - target: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04
-            platforms: "@zig_sdk//libc_aware/platform:linux_arm64_musl"
-          - target: aarch64-apple-darwin
-            runner: macos-15
-            platforms: ""
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/setup-ci
-      - name: Build gang
-        env:
-          ASSET: gang-${{ matrix.target }}
-          PLATFORMS: ${{ matrix.platforms }}
-        run: |
-          flags=(--config=ci --disk_cache="$BAZEL_DISK_CACHE" -c opt)
-          if [[ -n "$PLATFORMS" ]]; then
-            flags+=("--platforms=$PLATFORMS")
-          fi
-          nix develop -c bazelisk build "${flags[@]}" //:gang
-          built="$(nix develop -c bazelisk cquery "${flags[@]}" --output=files //:gang)"
-          mkdir -p "$RUNNER_TEMP/dist"
-          install -m 0755 "$built" "$RUNNER_TEMP/dist/$ASSET"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: gang-${{ matrix.target }}
-          path: ${{ runner.temp }}/dist/gang-${{ matrix.target }}
-          if-no-files-found: error
-
+  # gh and sha256sum are the runner's own: this job checks out nothing and installs no Nix.
   publish:
-    needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: write
+      actions: read
     steps:
+      - name: Find the CI run of the tagged commit
+        id: ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          run_id="$(gh api "repos/$GH_REPO/actions/workflows/ci.yml/runs?head_sha=$SHA" \
+            --jq '[.workflow_runs[] | select(.event == "push" and .head_branch == "main" and .conclusion == "success")][0].id // empty')"
+          if [[ -z "$run_id" ]]; then
+            echo "::error::no successful CI run of $SHA pushed to main: tag a commit of main once its CI run has passed" >&2
+            exit 1
+          fi
+          echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: gang-*
           path: dist
           merge-multiple: true
-      # gh and sha256sum are the runner's own: this job checks out nothing and installs no Nix.
+          run-id: ${{ steps.ci.outputs.run-id }}
+          github-token: ${{ github.token }}
       - name: Publish the release
         working-directory: dist
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ steps.ci.outputs.run-id }}
         run: |
           sha256sum gang-* >SHA256SUMS
           prerelease=()
           if [[ "$TAG" == *-* ]]; then
             prerelease=(--prerelease)
           fi
-          gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes "${prerelease[@]}" gang-* SHA256SUMS
+          gh release create "$TAG" --verify-tag --title "$TAG" --notes "Binaries built and tested by CI run $RUN_URL." \
+            --generate-notes "${prerelease[@]}" gang-* SHA256SUMS

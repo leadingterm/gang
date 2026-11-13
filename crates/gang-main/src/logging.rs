@@ -97,7 +97,7 @@ mod tests {
     fn plain_output_has_no_escape_codes() {
         let buffer = SharedBuffer::default();
         let sub = subscriber(false, filter(None), buffer.clone());
-        tracing::subscriber::with_default(sub, || {
+        gang_testkit::with_subscriber(sub, || {
             tracing::info!("plain message marker");
         });
         let output = buffer.contents();
@@ -109,7 +109,7 @@ mod tests {
     fn ansi_output_has_escape_codes() {
         let buffer = SharedBuffer::default();
         let sub = subscriber(true, filter(None), buffer.clone());
-        tracing::subscriber::with_default(sub, || {
+        gang_testkit::with_subscriber(sub, || {
             tracing::info!("ansi message marker");
         });
         let output = buffer.contents();
@@ -121,7 +121,7 @@ mod tests {
     fn warn_directive_drops_info_and_keeps_warn() {
         let buffer = SharedBuffer::default();
         let sub = subscriber(false, filter(Some(OsStr::new("warn"))), buffer.clone());
-        tracing::subscriber::with_default(sub, || {
+        gang_testkit::with_subscriber(sub, || {
             tracing::info!("dropped info marker");
             tracing::warn!("kept warn marker");
         });
@@ -138,7 +138,7 @@ mod tests {
             filter(Some(OsStr::new("not a [valid directive"))),
             buffer.clone(),
         );
-        tracing::subscriber::with_default(sub, || {
+        gang_testkit::with_subscriber(sub, || {
             tracing::info!("fallback info marker");
         });
         let output = buffer.contents();
@@ -153,7 +153,7 @@ mod tests {
             filter(Some(OsStr::from_bytes(b"\xff"))),
             buffer.clone(),
         );
-        tracing::subscriber::with_default(sub, || {
+        gang_testkit::with_subscriber(sub, || {
             tracing::info!("non-utf8 fallback marker");
         });
         let output = buffer.contents();

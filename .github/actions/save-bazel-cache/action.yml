@@ -1,9 +1,9 @@
 name: Save the Bazel disk cache
 description: >-
-  Save the Bazel disk cache that .github/actions/setup-ci restored and the job's Bazel commands filled.
+  Save the Bazel disk cache that .github/actions/setup-bazel restored and the job's Bazel commands filled.
   After a successful job the entries it did not use are dropped first, so the saved cache is the job's
   working set; a failed or timed-out job saves without dropping, so a cold run's progress carries over.
-  Saves nothing when setup-ci decided the job does not save: a fork's pull request, or a run that
+  Saves nothing when setup-bazel decided the job does not save: a fork's pull request, or a run that
   restored its own key exactly.
 inputs:
   prune:

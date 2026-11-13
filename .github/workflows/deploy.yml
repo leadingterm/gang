@@ -22,13 +22,8 @@
 #         pull-requests: write
 #         actions: read
 #
-# Optional inputs: apply_environment (default production), plan_max_age_seconds (default 86400), runner (default ubuntu-24.04).
-#
 # One call per repository; the manifest, comment marker and plan key do not name a root.
-#
-# Nothing is compiled: the plan and apply jobs download the gang binary from the Gang release of the
-# pinned tag, check it against gang_sha256 (the asset for the runner's architecture), and run the
-# deploy decisions with it (`gang deploy`, through $GANG).
+# The specification (docs/SPECIFICATION.md 8.5) describes the plan and apply jobs.
 
 name: Deploy
 
@@ -36,42 +31,59 @@ on:
   workflow_call:
     inputs:
       root:
+        description: "Directory of the OpenTofu root in the caller's repository."
         required: true
         type: string
       plan_role_arn:
+        description: "IAM role the plan job assumes through the job's identity token."
         required: true
         type: string
       apply_role_arn:
+        description: "IAM role the apply job assumes through the job's identity token."
         required: true
         type: string
       state_bucket:
+        description: "S3 bucket of the OpenTofu state."
         required: true
         type: string
       state_key:
+        description: "Key of the OpenTofu state object in state_bucket."
         required: true
         type: string
       state_region:
+        description: "AWS region of the state bucket and of the jobs' AWS credentials."
         required: true
         type: string
       kms_key_arn:
+        description: "KMS key that encrypts the state and the stored plans."
         required: true
         type: string
       plan_bucket:
+        description: "S3 bucket of the reviewed-plan store."
         required: true
         type: string
       plan_prefix:
+        description: "Key prefix of the stored plans in plan_bucket; a trailing / is trimmed."
         required: true
         type: string
       gang_sha256:
+        description: "SHA-256 of the release asset gang-<arch>-unknown-linux-musl for the runner's architecture, from the release's SHA256SUMS."
         required: true
         type: string
       apply_environment:
+        description: "GitHub environment of the apply job."
         type: string
         default: production
-      plan_max_age_seconds:
+      plan_max_age:
+        description: "How long a stored plan stays usable, as a duration such as 24h or 90m (units ms, s, m, h, d)."
         type: string
-        default: "86400"
+        default: 24h
+      lock_timeout:
+        description: "How long apply and the convergence plan wait for another run to release the state lock, as an OpenTofu duration (-lock-timeout)."
+        type: string
+        default: 4m
       runner:
+        description: "Runner label of every job."
         type: string
         default: ubuntu-24.04
 
@@ -99,7 +111,8 @@ env:
   INFRA_STATE_KMS_KEY_ARN: ${{ inputs.kms_key_arn }}
   INFRA_PLAN_BUCKET: ${{ inputs.plan_bucket }}
   INFRA_PLAN_PREFIX: ${{ inputs.plan_prefix }}
-  INFRA_PLAN_MAX_AGE_SECONDS: ${{ inputs.plan_max_age_seconds }}
+  INFRA_PLAN_MAX_AGE: ${{ inputs.plan_max_age }}
+  INFRA_LOCK_TIMEOUT: ${{ inputs.lock_timeout }}
   GANG_SHA256: ${{ inputs.gang_sha256 }}
 
 jobs:
@@ -116,9 +129,6 @@ jobs:
           path: .gang
           persist-credentials: false
       - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
-        with:
-          nix_conf: |
-            experimental-features = nix-command flakes
       - name: Validate the OpenTofu root
         run: .gang/infra/scripts/reviewed-plan.sh validate
 
@@ -141,9 +151,6 @@ jobs:
           path: .gang
           persist-credentials: false
       - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
-        with:
-          nix_conf: |
-            experimental-features = nix-command flakes
       - name: Install gang
         env:
           GH_TOKEN: ${{ github.token }}
@@ -199,9 +206,6 @@ jobs:
           path: .gang
           persist-credentials: false
       - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
-        with:
-          nix_conf: |
-            experimental-features = nix-command flakes
       - name: Install gang
         env:
           GH_TOKEN: ${{ github.token }}

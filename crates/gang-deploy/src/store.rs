@@ -172,13 +172,15 @@ impl FromStr for StoreRequest {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use serde_json::Value;
 
     use super::{StoreInputs, StoreRequest};
     use crate::manifest::Manifest;
     use crate::plan::tests::{fixture, plan};
     use crate::sha::{PlanSha256, Sha};
-    use crate::timestamp::{Timestamp, UnixTime};
+    use crate::timestamp::{MaxAge, Timestamp, UnixTime};
 
     const BASE: &str = "2222222222222222222222222222222222222222";
     const HEAD: &str = "1111111111111111111111111111111111111111";
@@ -203,7 +205,7 @@ mod tests {
             run_id: "99".parse().expect("positive run id"),
             run_attempt: "1".parse().expect("positive run attempt"),
             prefix: "plans".parse().unwrap(),
-            max_age: "86400".parse().expect("positive max age"),
+            max_age: MaxAge::try_from(Duration::from_secs(86_400)).expect("positive max age"),
             now: UnixTime::from_seconds(1_767_312_000),
         }
     }

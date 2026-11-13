@@ -163,16 +163,17 @@ impl Manifest {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use serde_json::{Value, json};
 
     use super::{ObjectHead, ObjectVersions};
     use crate::manifest::tests::{BASE, DIGEST, HEAD, manifest};
     use crate::sha::PlanSha256;
-    use crate::timestamp::UnixTime;
+    use crate::timestamp::{MaxAge, UnixTime};
 
     /// 2026-01-01T12:00:00Z.
     const NOW: UnixTime = UnixTime::from_seconds(1_767_268_800);
-    const DAY: &str = "86400";
 
     fn key() -> String {
         manifest().plan_key.to_string()
@@ -213,7 +214,11 @@ mod tests {
 
     fn object_rejection(head: &ObjectHead, now: UnixTime) -> Option<String> {
         manifest()
-            .check_object(head, now, DAY.parse().expect("positive max age"))
+            .check_object(
+                head,
+                now,
+                MaxAge::try_from(Duration::from_secs(86_400)).expect("positive max age"),
+            )
             .err()
             .as_ref()
             .map(ToString::to_string)
@@ -359,7 +364,11 @@ mod tests {
     fn check_object_rejects_an_object_without_a_usable_last_modified() {
         let head: ObjectHead = json!({"Metadata": {}}).to_string().parse().unwrap();
         let error = manifest()
-            .check_object(&head, NOW, DAY.parse().expect("positive max age"))
+            .check_object(
+                &head,
+                NOW,
+                MaxAge::try_from(Duration::from_secs(86_400)).expect("positive max age"),
+            )
             .unwrap_err();
         assert!(error.to_string().starts_with("plan object metadata"));
         let mut metadata = serde_json::Map::new();

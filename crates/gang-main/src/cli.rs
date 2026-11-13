@@ -14,6 +14,11 @@ use gang_types::{CaPin, CertSerial, Identity, NonZeroDuration, ProviderName, Url
 
 use crate::errors::{MainError, Result};
 
+/// Parses a duration such as `24h` into the plan store's maximum age.
+fn max_age(text: &str) -> std::result::Result<MaxAge, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(MaxAge::try_from(gang_types::duration::parse(text)?)?)
+}
+
 /// Default time a `gang local up` waits for the server to print its CA pin.
 pub(crate) const DEFAULT_STARTUP_TIMEOUT: &str = "30s";
 /// Default time a `gang local down` waits for the server to exit.
@@ -134,7 +139,7 @@ const DEPLOY_EXAMPLES: &str = examples! {
     ];
     "a deploy job: check the stored plan object against the manifest" => [
         "aws s3api head-object ... | gang deploy check-object --manifest manifest.json \\",
-        "  --now \"$(date -u +%s)\" --max-age-seconds 86400",
+        "  --now \"$(date -u +%s)\" --max-age 24h",
     ];
 };
 /// The `after_help` of `gang deploy policy`.
@@ -155,7 +160,7 @@ const DEPLOY_STORE_REQUEST_EXAMPLES: &str = examples! {
         "gang deploy store-request --repository example-org/infra --repository-id 42 \\",
         "  --pr-number 7 --pr-head-sha <sha> --sha <sha> --head <sha> --parent <base> \\",
         "  --parent <head> --tree-sha <sha> --run-id 99 --run-attempt 1 --prefix plans \\",
-        "  --max-age-seconds 86400 --now \"$(date -u +%s)\" --plan-file infra.tfplan \\",
+        "  --max-age 24h --now \"$(date -u +%s)\" --plan-file infra.tfplan \\",
         "  < infra-plan.json > store-request.json",
     ];
 };
@@ -217,7 +222,7 @@ const DEPLOY_CHECK_VERSIONS_EXAMPLES: &str = examples! {
 const DEPLOY_CHECK_OBJECT_EXAMPLES: &str = examples! {
     "an apply job: the plan object matches the manifest and is fresh" => [
         "aws s3api head-object ... | gang deploy check-object --manifest manifest.json \\",
-        "  --now \"$(date -u +%s)\" --max-age-seconds 86400",
+        "  --now \"$(date -u +%s)\" --max-age 24h",
     ];
 };
 /// The `after_help` of `gang deploy check-plan`.
@@ -723,9 +728,9 @@ pub struct StoreRequestArgs {
     /// The key prefix of the plan store.
     #[arg(long, value_name = "PREFIX")]
     pub prefix: PlanPrefix,
-    /// How long the stored plan stays usable, in seconds.
-    #[arg(long, value_name = "SECONDS")]
-    pub max_age_seconds: MaxAge,
+    /// How long the stored plan stays usable, as a duration such as `24h`.
+    #[arg(long, value_name = "DURATION", value_parser = max_age)]
+    pub max_age: MaxAge,
     /// The time of storing, in seconds since the Unix epoch.
     #[arg(long, value_name = "SECONDS")]
     pub now: UnixTime,
@@ -874,9 +879,9 @@ pub struct CheckObjectArgs {
     /// The time of the check, in seconds since the Unix epoch.
     #[arg(long, value_name = "SECONDS")]
     pub now: UnixTime,
-    /// How old the stored plan may be, in seconds.
-    #[arg(long, value_name = "SECONDS")]
-    pub max_age_seconds: MaxAge,
+    /// How old the stored plan may be, as a duration such as `24h`.
+    #[arg(long, value_name = "DURATION", value_parser = max_age)]
+    pub max_age: MaxAge,
 }
 
 /// Arguments of `gang deploy check-plan`.
@@ -1613,21 +1618,14 @@ mod tests {
 
     #[test]
     fn deploy_store_request_takes_every_parent_in_order() {
-        let cli = store_request(&[
-            "--pr-head-sha",
-            SHA,
-            "--pr-number",
-            "7",
-            "--max-age-seconds",
-            "86400",
-        ])
-        .expect("the command line parses");
+        let cli = store_request(&["--pr-head-sha", SHA, "--pr-number", "7", "--max-age", "24h"])
+            .expect("the command line parses");
         let Command::Deploy(DeployCommand::StoreRequest(args)) = cli.command else {
             panic!("expected gang deploy store-request");
         };
         assert_eq!(args.parents.len(), 2);
         assert_eq!(args.pr_number.get(), 7);
-        assert_eq!(args.max_age_seconds.as_secs(), 86_400);
+        assert_eq!(args.max_age.as_secs(), 86_400);
     }
 
     #[test]
@@ -1637,8 +1635,8 @@ mod tests {
             SHA,
             "--pr-number",
             "abc",
-            "--max-age-seconds",
-            "86400",
+            "--max-age",
+            "24h",
         ])
         .expect_err("the command line is rejected");
         assert_eq!(error.kind(), ErrorKind::ValueValidation);
@@ -1647,16 +1645,19 @@ mod tests {
 
     #[test]
     fn deploy_store_request_rejects_a_non_numeric_max_age() {
-        let error = store_request(&[
-            "--pr-head-sha",
-            SHA,
-            "--pr-number",
-            "7",
-            "--max-age-seconds",
-            "abc",
-        ])
-        .expect_err("the command line is rejected");
+        let error = store_request(&["--pr-head-sha", SHA, "--pr-number", "7", "--max-age", "abc"])
+            .expect_err("the command line is rejected");
         assert_eq!(error.kind(), ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn deploy_store_request_rejects_a_max_age_without_unit_or_zero() {
+        for value in ["86400", "0s"] {
+            let error =
+                store_request(&["--pr-head-sha", SHA, "--pr-number", "7", "--max-age", value])
+                    .expect_err("the command line is rejected");
+            assert_eq!(error.kind(), ErrorKind::ValueValidation);
+        }
     }
 
     #[test]
@@ -1665,8 +1666,8 @@ mod tests {
         let error = store_request(&[
             "--pr-number",
             "7",
-            "--max-age-seconds",
-            "86400",
+            "--max-age",
+            "24h",
             "--pr-head-sha",
             &upper,
         ])

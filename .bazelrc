@@ -12,6 +12,8 @@ build:macos --repo_env=CXX=/usr/bin/clang++
 
 build --@rules_rust//rust/settings:clippy_flags=-Dwarnings
 build --@rules_rust//rust/settings:clippy.toml=//:clippy.toml
+# rustc turns overflow checks off under -c opt; Gang keeps them in every compilation mode.
+build --@rules_rust//rust/settings:extra_rustc_flag=-Coverflow-checks=on
 
 test --test_output=errors
 test --local_test_jobs=HOST_CPUS*.25
@@ -23,16 +25,13 @@ coverage --instrument_test_targets
 coverage --instrumentation_filter=^//crates[/:],-^//crates/[^:]+:fake_
 coverage --combined_report=lcov
 
-# GitHub-hosted runners pass --config=ci. Peak RSS of a clean -c opt //:gang build on 4 CPUs: the
-# aws-sdk-ec2 crate alone 10.1 GiB, every other action 2.6 GiB or less, the Bazel server 1.5 GiB.
-# Two local actions at a time keep the build under 14 GiB, inside the 16 GB runners.
+# .github/actions/setup-ci turns on --config=ci for GitHub-hosted runners. Peak RSS of a clean
+# -c opt //:gang build on 4 CPUs: the aws-sdk-ec2 crate alone 10.1 GiB, every other action 2.6 GiB
+# or less, the Bazel server 1.5 GiB. Two local actions at a time keep the build under 14 GiB, inside
+# the 16 GB runners.
 build:ci --local_resources=cpu=2
 
-# hermetic_cc_toolchain's zig keeps the C runtimes it compiles (musl, compiler-rt, libunwind) in its
-# cache directory. Actions run without HOME, so that directory defaults to /tmp/zig-cache, which the
-# sandbox's hermetic /tmp empties for every action: each C compile and link rebuilt the runtimes.
-# CI gives zig one persistent cache directory, writable inside the sandbox; setup-ci creates it.
-build:ci --repo_env=HERMETIC_CC_TOOLCHAIN_CACHE_PREFIX=/var/tmp/zig-cache
-build:ci --sandbox_writable_path=/var/tmp/zig-cache
+# CI builds and tests in the configuration it ships: the release publishes CI's binaries.
+build:ci --compilation_mode=opt
 
 try-import %workspace%/.bazelrc.local
