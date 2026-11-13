@@ -8,6 +8,7 @@ opentofu_contract_test(
         "//infra/terraform/modules/controller:sources",
         "//infra/terraform/modules/deployment:sources",
         "//infra/terraform/modules/instance-role:sources",
+        "//infra/terraform/modules/load-balancer:sources",
         "//infra/terraform/modules/network:sources",
         "//infra/terraform/modules/storage:sources",
         "//infra/terraform/modules/worker-fleet:sources",

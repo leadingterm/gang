@@ -45,6 +45,12 @@ pub mod network {
         "a permitted network request shares the host network";
 }
 
+/// Names of the checks of dynamically linked glibc programs in the sandbox.
+pub mod glibc_toolchain {
+    /// A dynamically linked glibc program, as a downloaded toolchain is, starts inside the sandbox.
+    pub const TOOL_RUNS: &str = "a dynamically linked glibc program runs inside the sandbox";
+}
+
 /// Names of the checks of a build's outcome.
 pub mod build {
     /// Every action of the build ran remotely.
@@ -97,6 +103,21 @@ pub mod integrity {
     /// With input links kept, a later action does see the modification.
     pub const KEEP_CONTROL: &str =
         "control: with input_links = keep a modified input reaches the later action";
+}
+
+/// Names of the checks of the input root scenario.
+pub mod input_root {
+    /// The build of the input root probe succeeded.
+    pub const BUILD_SUCCEEDS: &str = "the input root probe builds";
+    /// Bazel gave the action an input outside its working directory.
+    pub const OUTSIDE_WORKING_DIRECTORY: &str =
+        "the action's input lies outside its working directory";
+    /// The action read that input.
+    pub const SIBLING_READ: &str = "the action reads an input beside its working directory";
+    /// The action read the same input through a relative symlink.
+    pub const SYMLINK_FOLLOWED: &str = "the action follows a relative symlink to that input";
+    /// With input links broken, that input has a private inode.
+    pub const LINKS_BROKEN: &str = "that input's hard link is broken";
 }
 
 /// Names of the checks of the restart scenario.

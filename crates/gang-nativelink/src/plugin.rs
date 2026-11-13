@@ -183,6 +183,8 @@ impl SchedulerPort for NativeLink {
     /// # Errors
     ///
     /// [`PortError::Config`] when the inputs cannot form a valid worker;
+    /// [`PortError::Backend`] when the controller refuses the worker's certificate as revoked;
+    /// the worker then never reconnects.
     /// [`PortError`] when the worker cannot be started or fails.
     async fn run_worker(
         &self,

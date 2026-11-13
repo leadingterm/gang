@@ -1,12 +1,70 @@
-name: Set up Linux CI
-description: Enable unprivileged user namespaces and install Nix for CI jobs.
+name: Set up CI
+description: >-
+  Enable unprivileged user namespaces on Linux, install Nix, create zig's cache directory, and restore
+  the Bazel disk cache that .github/actions/save-bazel-cache saved, from the run's own ref first, else
+  from main.
 runs:
   using: composite
   steps:
     - name: Allow unprivileged user namespaces
+      if: runner.os == 'Linux'
       shell: bash
       run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+    # The ci config of .bazelrc points zig's cache here and makes it writable inside the sandbox.
+    - name: Create zig's cache directory
+      shell: bash
+      run: mkdir -p /var/tmp/zig-cache
     - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
       with:
         nix_conf: |
           experimental-features = nix-command flakes
+    # One key line per platform and per toolchain and dependency set: Bazel, the Rust and other
+    # toolchains, the crates, and the Nix pins that fix the action PATH. A push's key is unique per run
+    # attempt, so main keeps adding entries and a re-run saves too; a pull request has one key per line,
+    # so it holds at most one entry per platform. A restore takes the exact key, else the newest entry of
+    # its line, else the newest of its platform. GitHub scopes an entry to the ref that saved it and
+    # searches the run's own ref (a pull request's merge ref, or the pushed branch) first, then the base
+    # branch and main, so a pull request's entries are never visible to main or to other pull requests.
+    - name: Name the Bazel disk cache
+      id: name
+      shell: bash
+      env:
+        PLATFORM: bazel-disk-${{ runner.os }}-${{ runner.arch }}
+        INPUTS: ${{ hashFiles('.bazelversion', 'MODULE.bazel', 'MODULE.bazel.lock', 'Cargo.lock', 'flake.lock') }}
+        RUN: ${{ github.event_name == 'pull_request' && format('pr{0}', github.event.pull_request.number) || format('{0}-{1}', github.run_id, github.run_attempt) }}
+      run: |
+        {
+          echo "BAZEL_DISK_CACHE=$HOME/.cache/bazel-disk"
+          echo "BAZEL_DISK_CACHE_KEY=$PLATFORM-$INPUTS-$RUN"
+          echo "BAZEL_DISK_CACHE_EPOCH=$RUNNER_TEMP/bazel-disk-cache-epoch"
+        } >> "$GITHUB_ENV"
+        {
+          echo "platform=$PLATFORM-"
+          echo "inputs=$PLATFORM-$INPUTS-"
+        } >> "$GITHUB_OUTPUT"
+    - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      id: restore
+      with:
+        path: ${{ env.BAZEL_DISK_CACHE }}
+        key: ${{ env.BAZEL_DISK_CACHE_KEY }}
+        restore-keys: |
+          ${{ steps.name.outputs.inputs }}
+          ${{ steps.name.outputs.platform }}
+    # A fork's pull request saves nothing, so forks cannot fill the repository's cache quota and evict
+    # main's entries. Entries are immutable, so a run that restored its own key exactly saves nothing.
+    - name: Decide whether the job saves the Bazel disk cache
+      shell: bash
+      env:
+        FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        HIT: ${{ steps.restore.outputs.cache-hit }}
+      run: |
+        if [[ "$FORK" == true || "$HIT" == true ]]; then
+          echo "BAZEL_DISK_CACHE_SAVE=false" >> "$GITHUB_ENV"
+        else
+          echo "BAZEL_DISK_CACHE_SAVE=true" >> "$GITHUB_ENV"
+        fi
+    # Bazel sets an entry's mtime when it stores or reads it, so the entries this job uses end up newer
+    # than this marker; save-bazel-cache drops the others.
+    - name: Mark the start of the build
+      shell: bash
+      run: touch "$BAZEL_DISK_CACHE_EPOCH"

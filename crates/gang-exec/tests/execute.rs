@@ -8,6 +8,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use gang_config::InputLinks;
 use gang_exec::{Action, ExecError, execute, exit_status};
 use gang_spi::{
     ActionCommand, ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, ActionLimits,
@@ -67,12 +68,14 @@ fn limits() -> ActionLimits {
 
 fn action<'a>(
     argv: &'a [OsString],
+    action_directory: &'a Path,
     working_directory: &'a Path,
 ) -> Result<Action<'a>, Box<dyn Error>> {
     Ok(Action {
         spec: ActionExecutionSpec {
             command: ActionCommand::from_argv(argv).ok_or("empty argv")?,
             environment: &[],
+            action_directory,
             working_directory,
             network: NetworkRequest::NotRequested,
             launcher: &[],
@@ -148,8 +151,8 @@ fn link_count(path: &Path) -> Result<u64, Box<dyn Error>> {
 }
 
 /// Creates `root/partner` and `root/action/inputs/shared`, hard-linked to each other, and the
-/// working directory `root/action/work`. Returns the link root `root/action` and the working
-/// directory.
+/// working directory `root/action/work`. Returns the action directory `root/action` and the
+/// working directory.
 fn linked_inputs(root: &Path) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
     let partner = root.join("partner");
     std::fs::write(&partner, b"shared")?;
@@ -177,12 +180,12 @@ async fn enters_starts_waits_and_leaves_in_order() -> Result<(), Box<dyn Error>>
     let limits_port = RecordingLimits::new(&log);
     let argv = [OsString::from("cmd")];
     let directory = tempfile::tempdir()?;
-    let action = action(&argv, directory.path())?;
+    let action = action(&argv, directory.path(), directory.path())?;
 
     let outcome = execute(
         &sandbox,
         Some(&limits_port),
-        None,
+        InputLinks::Keep,
         &action,
         &mut no_terminations(),
         || {
@@ -212,12 +215,12 @@ async fn without_limits_neither_enters_nor_leaves() -> Result<(), Box<dyn Error>
     let sandbox = ScriptedSandbox::exiting(&log, ActionExecutionOutcome::Signaled(9));
     let argv = [OsString::from("cmd")];
     let directory = tempfile::tempdir()?;
-    let action = action(&argv, directory.path())?;
+    let action = action(&argv, directory.path(), directory.path())?;
 
     let outcome = execute::<ScriptedSandbox, RecordingLimits>(
         &sandbox,
         None,
-        None,
+        InputLinks::Keep,
         &action,
         &mut no_terminations(),
         || {
@@ -249,11 +252,11 @@ async fn leave_action_group_failure_drops_action_and_leaves_scope() -> Result<()
             };
             let argv = [OsString::from("cmd")];
             let directory = tempfile::tempdir()?;
-            let action = action(&argv, directory.path())?;
+            let action = action(&argv, directory.path(), directory.path())?;
             let result = execute(
                 &sandbox,
                 with_limits.then_some(&limits_port),
-                None,
+                InputLinks::Keep,
                 &action,
                 &mut no_terminations(),
                 || {
@@ -295,14 +298,14 @@ async fn pending_termination_prevents_start_with_and_without_limits() -> Result<
             let limits_port = RecordingLimits::new(&log);
             let argv = [OsString::from("cmd")];
             let directory = tempfile::tempdir()?;
-            let action = action(&argv, directory.path())?;
+            let action = action(&argv, directory.path(), directory.path())?;
             let (sender, mut receiver) = mpsc::unbounded_channel();
             sender.send(termination)?;
 
             let outcome = execute(
                 &sandbox,
                 with_limits.then_some(&limits_port),
-                None,
+                InputLinks::Keep,
                 &action,
                 &mut receiver,
                 || {
@@ -340,12 +343,12 @@ async fn an_action_in_its_own_group_keeps_gang_exec_in_the_action_group()
         let limits_port = RecordingLimits::new(&log);
         let argv = [OsString::from("cmd")];
         let directory = tempfile::tempdir()?;
-        let action = action(&argv, directory.path())?;
+        let action = action(&argv, directory.path(), directory.path())?;
 
         let outcome = execute(
             &sandbox,
             with_limits.then_some(&limits_port),
-            None,
+            InputLinks::Keep,
             &action,
             &mut terminations,
             || {
@@ -373,12 +376,12 @@ async fn leaves_the_scope_when_the_sandbox_fails_to_start() -> Result<(), Box<dy
     let limits_port = RecordingLimits::new(&log);
     let argv = [OsString::from("cmd")];
     let directory = tempfile::tempdir()?;
-    let action = action(&argv, directory.path())?;
+    let action = action(&argv, directory.path(), directory.path())?;
 
     let result = execute(
         &sandbox,
         Some(&limits_port),
-        None,
+        InputLinks::Keep,
         &action,
         &mut no_terminations(),
         || Ok(()),
@@ -402,12 +405,12 @@ async fn a_failing_wait_while_limits_are_active_is_a_sandbox_error_and_the_scope
     let limits_port = RecordingLimits::new(&log);
     let argv = [OsString::from("cmd")];
     let directory = tempfile::tempdir()?;
-    let action = action(&argv, directory.path())?;
+    let action = action(&argv, directory.path(), directory.path())?;
 
     let result = execute(
         &sandbox,
         Some(&limits_port),
-        None,
+        InputLinks::Keep,
         &action,
         &mut no_terminations(),
         || Ok(()),
@@ -434,12 +437,12 @@ async fn leave_failure_after_success_is_a_limits_error() -> Result<(), Box<dyn E
     let limits_port = RecordingLimits::new(&log).failing(LimitsStep::Leave);
     let argv = [OsString::from("cmd")];
     let directory = tempfile::tempdir()?;
-    let action = action(&argv, directory.path())?;
+    let action = action(&argv, directory.path(), directory.path())?;
 
     let result = execute(
         &sandbox,
         Some(&limits_port),
-        None,
+        InputLinks::Keep,
         &action,
         &mut no_terminations(),
         || Ok(()),
@@ -466,12 +469,12 @@ async fn sandbox_error_wins_over_leave_error() -> Result<(), Box<dyn Error>> {
     let limits_port = RecordingLimits::new(&log).failing(LimitsStep::Leave);
     let argv = [OsString::from("cmd")];
     let directory = tempfile::tempdir()?;
-    let action = action(&argv, directory.path())?;
+    let action = action(&argv, directory.path(), directory.path())?;
 
     let result = execute(
         &sandbox,
         Some(&limits_port),
-        None,
+        InputLinks::Keep,
         &action,
         &mut no_terminations(),
         || Ok(()),
@@ -489,12 +492,12 @@ async fn enter_failure_never_starts_the_sandbox() -> Result<(), Box<dyn Error>> 
     let limits_port = RecordingLimits::new(&log).failing(LimitsStep::Enter);
     let argv = [OsString::from("cmd")];
     let directory = tempfile::tempdir()?;
-    let action = action(&argv, directory.path())?;
+    let action = action(&argv, directory.path(), directory.path())?;
 
     let result = execute(
         &sandbox,
         Some(&limits_port),
-        None,
+        InputLinks::Keep,
         &action,
         &mut no_terminations(),
         || Ok(()),
@@ -518,12 +521,12 @@ async fn break_leaves_one_link_per_file_before_the_sandbox_starts() -> Result<()
     let first = directory.path().join("first");
     std::fs::write(&first, b"shared")?;
     std::fs::hard_link(&first, directory.path().join("second"))?;
-    let action = action(&argv, directory.path())?;
+    let action = action(&argv, directory.path(), directory.path())?;
 
     let outcome = execute::<LinkCounting, RecordingLimits>(
         &sandbox,
         None,
-        Some(directory.path()),
+        InputLinks::Break,
         &action,
         &mut no_terminations(),
         || Ok(()),
@@ -536,19 +539,19 @@ async fn break_leaves_one_link_per_file_before_the_sandbox_starts() -> Result<()
 }
 
 #[tokio::test]
-async fn breaks_links_under_the_link_root_outside_the_working_directory()
+async fn breaks_links_under_the_action_directory_outside_the_working_directory()
 -> Result<(), Box<dyn Error>> {
     let log = CallLog::default();
     let sandbox = ScriptedSandbox::exiting(&log, ActionExecutionOutcome::Exited(0));
     let argv = [OsString::from("cmd")];
     let root = tempfile::tempdir()?;
-    let (link_root, working_directory) = linked_inputs(root.path())?;
-    let action = action(&argv, &working_directory)?;
+    let (action_directory, working_directory) = linked_inputs(root.path())?;
+    let action = action(&argv, &action_directory, &working_directory)?;
 
     let outcome = execute::<ScriptedSandbox, RecordingLimits>(
         &sandbox,
         None,
-        Some(&link_root),
+        InputLinks::Break,
         &action,
         &mut no_terminations(),
         || Ok(()),
@@ -556,7 +559,7 @@ async fn breaks_links_under_the_link_root_outside_the_working_directory()
     .await?;
 
     assert_eq!(outcome, ActionExecutionOutcome::Exited(0));
-    assert_eq!(link_count(&link_root.join("inputs/shared"))?, 1);
+    assert_eq!(link_count(&action_directory.join("inputs/shared"))?, 1);
     assert_eq!(link_count(&root.path().join("partner"))?, 1);
     Ok(())
 }
@@ -570,16 +573,16 @@ async fn keep_leaves_hard_links_in_place() -> Result<(), Box<dyn Error>> {
     ));
     let argv = [OsString::from("cmd")];
     let root = tempfile::tempdir()?;
-    let (link_root, working_directory) = linked_inputs(root.path())?;
+    let (action_directory, working_directory) = linked_inputs(root.path())?;
     let first = working_directory.join("first");
     std::fs::write(&first, b"shared")?;
     std::fs::hard_link(&first, working_directory.join("second"))?;
-    let action = action(&argv, &working_directory)?;
+    let action = action(&argv, &action_directory, &working_directory)?;
 
     let outcome = execute::<LinkCounting, RecordingLimits>(
         &sandbox,
         None,
-        None,
+        InputLinks::Keep,
         &action,
         &mut no_terminations(),
         || Ok(()),
@@ -588,7 +591,7 @@ async fn keep_leaves_hard_links_in_place() -> Result<(), Box<dyn Error>> {
     assert_eq!(outcome, ActionExecutionOutcome::Exited(0));
 
     assert_eq!(*sandbox.counts.lock(), vec![2, 2]);
-    assert_eq!(link_count(&link_root.join("inputs/shared"))?, 2);
+    assert_eq!(link_count(&action_directory.join("inputs/shared"))?, 2);
     assert_eq!(link_count(&root.path().join("partner"))?, 2);
     Ok(())
 }
@@ -600,12 +603,12 @@ async fn break_failure_never_starts_the_sandbox() -> Result<(), Box<dyn Error>> 
     let argv = [OsString::from("cmd")];
     let directory = tempfile::tempdir()?;
     let missing = directory.path().join("missing");
-    let action = action(&argv, &missing)?;
+    let action = action(&argv, &missing, &missing)?;
 
     let result = execute::<ScriptedSandbox, RecordingLimits>(
         &sandbox,
         None,
-        Some(&missing),
+        InputLinks::Break,
         &action,
         &mut no_terminations(),
         || Ok(()),
@@ -630,12 +633,12 @@ async fn a_termination_while_waiting_is_relayed_and_the_action_outcome_is_report
     };
     let argv = [OsString::from("cmd")];
     let directory = tempfile::tempdir()?;
-    let action = action(&argv, directory.path())?;
+    let action = action(&argv, directory.path(), directory.path())?;
 
     let outcome = execute::<Relaying, RecordingLimits>(
         &sandbox,
         None,
-        None,
+        InputLinks::Keep,
         &action,
         &mut terminations,
         || Ok(()),
@@ -660,12 +663,12 @@ async fn a_relayed_termination_still_leaves_the_limits_scope() -> Result<(), Box
     let limits_port = RecordingLimits::new(&log);
     let argv = [OsString::from("cmd")];
     let directory = tempfile::tempdir()?;
-    let action = action(&argv, directory.path())?;
+    let action = action(&argv, directory.path(), directory.path())?;
 
     let outcome = execute(
         &sandbox,
         Some(&limits_port),
-        None,
+        InputLinks::Keep,
         &action,
         &mut terminations,
         || Ok(()),
@@ -685,14 +688,14 @@ async fn the_action_starts_through_the_scope_launcher() -> Result<(), Box<dyn Er
     let limits_port = RecordingLimits::new(&log);
     let argv = [OsString::from("cmd")];
     let directory = tempfile::tempdir()?;
-    let action = action(&argv, directory.path())?;
+    let action = action(&argv, directory.path(), directory.path())?;
     // `enter` hands out the scope's launcher; every scope of the double has the same one.
     let scope = limits_port.enter(&action.limits).await?;
 
     let outcome = execute(
         &sandbox,
         Some(&limits_port),
-        None,
+        InputLinks::Keep,
         &action,
         &mut no_terminations(),
         || Ok(()),
@@ -710,12 +713,12 @@ async fn without_limits_the_action_starts_without_a_launcher() -> Result<(), Box
     let sandbox = ScriptedSandbox::exiting(&log, ActionExecutionOutcome::Exited(0));
     let argv = [OsString::from("cmd")];
     let directory = tempfile::tempdir()?;
-    let action = action(&argv, directory.path())?;
+    let action = action(&argv, directory.path(), directory.path())?;
 
     let outcome = execute::<ScriptedSandbox, RecordingLimits>(
         &sandbox,
         None,
-        None,
+        InputLinks::Keep,
         &action,
         &mut no_terminations(),
         || Ok(()),

@@ -10,10 +10,12 @@ resource "terraform_data" "input_checks" {
 module "network" {
   source = "../network"
 
-  name                    = var.name
-  cidr_block              = var.cidr_block
-  nat_mode                = var.nat_mode
-  client_ingress_cidrs    = var.client_ingress_cidrs
+  name       = var.name
+  cidr_block = var.cidr_block
+  nat_mode   = var.nat_mode
+
+  # With a load balancer, clients reach it instead of the controller.
+  client_ingress_cidrs    = var.load_balancer == null ? var.client_ingress_cidrs : []
   availability_zone_count = var.network.availability_zone_count
   tags                    = var.tags
 }
@@ -47,6 +49,7 @@ locals {
     public_port             = local.public_port
     worker_port             = local.worker_port
     endpoint                = local.endpoint
+    endpoint_trust          = var.load_balancer == null ? null : "system"
     worker_endpoint         = local.worker_endpoint
     scratch_mount_point     = var.scratch_mount_point
     workload_token_audience = var.workload_token_audience
@@ -92,6 +95,24 @@ module "controller" {
   tags                          = var.tags
   iam_name_prefix               = var.iam_name_prefix
   iam_permissions_boundary_arn  = var.iam_permissions_boundary_arn
+}
+
+module "load_balancer" {
+  count  = var.load_balancer == null ? 0 : 1
+  source = "../load-balancer"
+
+  name                           = var.name
+  vpc_id                         = module.network.vpc_id
+  subnet_id                      = module.network.public_subnet_ids[0]
+  hostname                       = var.hostname
+  port                           = local.public_port
+  client_ingress_cidrs           = var.client_ingress_cidrs
+  controller_security_group_id   = module.network.controller_security_group_id
+  controller_instance_id         = module.controller.instance_id
+  controller_private_ip          = module.network.controller_private_ip
+  ssl_policy                     = var.load_balancer.ssl_policy
+  certificate_validation_timeout = var.load_balancer.certificate_validation_timeout
+  tags                           = var.tags
 }
 
 module "worker_fleet" {

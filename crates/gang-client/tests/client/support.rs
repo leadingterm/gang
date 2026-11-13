@@ -555,6 +555,7 @@ fn issue_certificate(
         expire_time: now + CERTIFICATE_LIFETIME,
         revoke_time: None,
         pem_certificate: Some(fixture().server_certificate.clone()),
+        ca_certificate: Some(fixture().ca.clone()),
     })
     .into_response()
 }
@@ -606,6 +607,7 @@ fn certificate(serial: &CertSerial, holder: &Identity, now: Timestamp) -> Certif
         expire_time: now + CERTIFICATE_LIFETIME,
         revoke_time: Some(now),
         pem_certificate: None,
+        ca_certificate: None,
     }
 }
 

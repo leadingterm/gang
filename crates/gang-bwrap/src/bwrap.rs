@@ -319,6 +319,7 @@ pub(super) mod tests {
             command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
             launcher: &[],
             environment: &[],
+            action_directory: directory.path(),
             working_directory: directory.path(),
             network: NetworkRequest::NotRequested,
         };
@@ -367,6 +368,7 @@ pub(super) mod tests {
             command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
             launcher: &[],
             environment: &[],
+            action_directory: directory.path(),
             working_directory: directory.path(),
             network: NetworkRequest::NotRequested,
         };
@@ -393,6 +395,7 @@ pub(super) mod tests {
             command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
             launcher: &[],
             environment: &[],
+            action_directory: directory.path(),
             working_directory: directory.path(),
             network: NetworkRequest::NotRequested,
         };
@@ -437,6 +440,7 @@ pub(super) mod tests {
             command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
             launcher: &[],
             environment: &[],
+            action_directory: directory.path(),
             working_directory: directory.path(),
             network: NetworkRequest::NotRequested,
         };
@@ -468,6 +472,7 @@ pub(super) mod tests {
             command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
             launcher: &[],
             environment: &[],
+            action_directory: directory.path(),
             working_directory: directory.path(),
             network: NetworkRequest::NotRequested,
         };
@@ -515,6 +520,7 @@ pub(super) mod tests {
             command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
             launcher: &[],
             environment: &[],
+            action_directory: directory.path(),
             working_directory: directory.path(),
             network: NetworkRequest::NotRequested,
         };
@@ -552,6 +558,7 @@ pub(super) mod tests {
             command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
             launcher: &[],
             environment: &[],
+            action_directory: directory.path(),
             working_directory: directory.path(),
             network: NetworkRequest::NotRequested,
         };

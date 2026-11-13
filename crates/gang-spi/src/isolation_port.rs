@@ -168,7 +168,11 @@ pub struct ActionExecutionSpec<'a> {
     pub command: ActionCommand<'a>,
     /// The complete environment of the command.
     pub environment: &'a [(OsString, OsString)],
-    /// The directory the command runs in; the only writable location besides temporary space.
+    /// The directory that holds everything of this one action: its inputs, its outputs and the
+    /// working directory. The only writable location besides temporary space; a sandbox that
+    /// isolates exposes all of it, so inputs outside the working directory resolve.
+    pub action_directory: &'a Path,
+    /// The directory the command runs in, inside `action_directory`.
     pub working_directory: &'a Path,
     /// Whether the action asked for network access.
     pub network: NetworkRequest,

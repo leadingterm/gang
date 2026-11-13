@@ -11,7 +11,7 @@ use crate::access::IdentityKnobs;
 use crate::build_output::BuildOutcome;
 use crate::control::ControlKnobs;
 use crate::errors::Result;
-use crate::execution::ExecutionKnobs;
+use crate::execution::{ExecutionKnobs, Run};
 use crate::host::Host;
 use crate::report::ProbeReport;
 use crate::server::ServerKnobs;
@@ -176,6 +176,9 @@ gang_types::string_enum! {
         Poison = "poison",
         /// Runs after [`Probe::Poison`] and records whether the shared input was modified.
         Victim = "victim",
+        /// Reads an input of an external repository from beside its working directory, directly
+        /// and through a relative symlink, and records the input's link count.
+        InputRoot = "input_root",
         /// Runs in its own cgroup scope and waits until released, leaving an orphan process behind.
         Hold = "hold",
         /// Allocates far beyond its hard memory ceiling.
@@ -221,6 +224,8 @@ gang_types::string_enum! {
         /// Records its environment's variable names, its /tmp, whether each mount point is
         /// writable, and whether its working directory is writable.
         SandboxContract = "sandbox_contract",
+        /// Runs the staged dynamically linked glibc program and records whether it started.
+        GlibcTool = "glibc_tool",
         /// Leaves a process in its own process group behind and waits for the go flag.
         Stray = "stray",
         /// Reports to the journal and waits for the go flag.
@@ -231,6 +236,17 @@ gang_types::string_enum! {
     }
 }
 impl Probe {
+    /// The Bazel flags building the target needs beyond the suite's own.
+    #[must_use]
+    pub const fn build_flags(self) -> &'static [&'static str] {
+        match self {
+            // Only under this layout does Bazel give the action a working directory below its
+            // input root (the execroot's name), with external repositories beside it.
+            Self::InputRoot => &["--experimental_sibling_repository_layout"],
+            _ => &[],
+        }
+    }
+
     /// The Bazel label of the target.
     #[must_use]
     pub fn label(self) -> String {
@@ -318,6 +334,15 @@ pub trait System: Sync {
     ///
     /// When Bazel cannot be run.
     fn build(&self, probes: &[Probe]) -> Result<BuildOutcome>;
+
+    /// Builds `probes` as `run`: their actions are distinct from those of every other build, so
+    /// no earlier result or attempt stands in for them, and the journal lines their probes write
+    /// start with `run` and a space. A build that fails is `Ok` with a failed [`BuildOutcome`].
+    ///
+    /// # Errors
+    ///
+    /// When Bazel cannot be run.
+    fn build_run(&self, probes: &[Probe], run: &Run) -> Result<BuildOutcome>;
 
     /// Removes the workspace's build outputs (`bazel clean`), keeping the remote cache.
     ///

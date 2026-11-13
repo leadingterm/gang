@@ -8,6 +8,9 @@
 //! `rustls-native-certs`). Every configuration names its crypto provider explicitly, so no
 //! process-wide provider is required.
 //!
+//! A client learns that a server revoked it through [`RevokedAlert`], raised by the streams
+//! [`Dialer`] opens.
+//!
 //! ```
 //! use gang_tls::RevocationSet;
 //! use gang_types::CertSerial;
@@ -23,10 +26,12 @@
 mod acceptor;
 mod client_config;
 mod connector;
+mod dialer;
 mod errors;
 mod http_client;
 mod incoming;
 mod revocation;
+mod revoked_alert;
 mod stream;
 mod time;
 mod tls_material;
@@ -35,6 +40,7 @@ mod verifier;
 pub use acceptor::{AcceptorSettings, Alpn, ClientAuth, TlsAcceptor};
 pub use client_config::{ClientIdentity, ServerTrust, ca_pin_of_certificate, client_config};
 pub use connector::{ConnectorSettings, TlsConnector};
+pub use dialer::{DialedStream, Dialer};
 pub use errors::{TransportError, is_certificate_refused, is_tls_failure};
 pub use http_client::{
     HttpClient, HttpError, HttpProtocol, HttpReply, HttpRequest, HttpScheme, HttpSettings,
@@ -42,5 +48,6 @@ pub use http_client::{
 };
 pub use incoming::{Failure, Incoming, IncomingSettings, Listener, accept_retrying};
 pub use revocation::{RevocationSet, RevocationWatch};
+pub use revoked_alert::{AlertWatched, CertificateRevoked, RevokedAlert};
 pub use rustls_pki_types::ServerName;
 pub use stream::RevocableStream;

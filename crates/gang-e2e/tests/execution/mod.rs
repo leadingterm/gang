@@ -156,6 +156,28 @@ fn stale_is_compliant_when_local_mode_retires_a_killed_worker_at_once() {
 }
 
 #[test]
+fn stale_is_compliant_when_a_killed_exec_is_retried() {
+    assert_compliant(
+        &stale(Behaviour {
+            exec_retry: ExecRetry::Retried,
+            ..Behaviour::COMPLIANT
+        })
+        .expect("the scenario runs"),
+    );
+}
+
+#[test]
+fn stale_is_compliant_when_a_stray_line_arrives_late() {
+    assert_compliant(
+        &stale(Behaviour {
+            late_line: LateLine::Late,
+            ..Behaviour::COMPLIANT
+        })
+        .expect("the scenario runs"),
+    );
+}
+
+#[test]
 fn escalation_is_compliant() {
     assert_compliant(&escalation(Behaviour::COMPLIANT).expect("the scenario runs"));
 }

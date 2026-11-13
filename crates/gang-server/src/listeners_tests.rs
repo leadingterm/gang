@@ -60,6 +60,7 @@ fn handshake_settings() -> HandshakeSettings {
     HandshakeSettings {
         handshake_timeout: NonZeroDuration::from_secs(10),
         max_pending_handshakes: NonZeroUsize::new(256).expect("256 is non-zero"),
+        refusal_linger: NonZeroDuration::from_secs(2),
     }
 }
 

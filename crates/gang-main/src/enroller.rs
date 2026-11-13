@@ -20,8 +20,9 @@ enum EnrollmentFailure {
     /// The client key or its certificate signing request could not be produced.
     #[error("cannot generate the client key")]
     Key(#[source] MtlsError),
-    /// The server published no certificate authority, so the worker has no trust anchor.
-    #[error("the server does not publish its certificate authority")]
+    /// The server issued a certificate without the certificate of its authority, so the worker
+    /// has no trust anchor.
+    #[error("the server returned no certificate authority with the certificate")]
     NoCaCertificate,
     /// The server created the certificate but did not return its PEM.
     #[error("the server returned no certificate")]
@@ -45,16 +46,12 @@ impl WorkloadEnroller {
 }
 
 impl<S: ServerCalls> WorkloadEnroller<S> {
-    /// Generates a fresh key and fetches the server's CA certificate. Fails before requesting
-    /// a certificate when the server publishes no CA, then requests a certificate for the key,
-    /// presenting `proof`.
+    /// Generates a fresh key and requests a certificate for it, presenting `proof`; the answer
+    /// carries the certificate and the certificate of its authority, which the worker trusts for
+    /// the worker listener.
     async fn exchange(&self, proof: Proof) -> Result<Credentials, EnrollmentFailure> {
         let key = KeyPair::generate().map_err(EnrollmentFailure::Key)?;
         let pem_csr = key.certificate_request().map_err(EnrollmentFailure::Key)?;
-        let server = self.api.server().await.map_err(EnrollmentFailure::Server)?;
-        let Some(ca_certificate) = server.ca_certificate else {
-            return Err(EnrollmentFailure::NoCaCertificate);
-        };
         let certificate = self
             .api
             .create_certificate(&CreateCertificateRequest {
@@ -66,6 +63,9 @@ impl<S: ServerCalls> WorkloadEnroller<S> {
             .map_err(EnrollmentFailure::Server)?;
         let Some(pem_certificate) = certificate.pem_certificate else {
             return Err(EnrollmentFailure::NoCertificate);
+        };
+        let Some(ca_certificate) = certificate.ca_certificate else {
+            return Err(EnrollmentFailure::NoCaCertificate);
         };
         Ok(Credentials {
             certificate: pem_certificate,
@@ -174,17 +174,12 @@ mod tests {
         expire_time: Timestamp,
         server_error: Option<(u16, &'static str)>,
         created: AtomicUsize,
+        server_calls: AtomicUsize,
     }
 
     impl ServerCalls for FakeServer {
         async fn server(&self) -> Result<Server<serde_json::Value>, ServerCallError> {
-            if let Some((status, message)) = self.server_error {
-                return Err(ClientError::Server {
-                    status,
-                    message: message.to_owned(),
-                }
-                .into());
-            }
+            self.server_calls.fetch_add(1, Ordering::SeqCst);
             let mut server = serde_json::json!({
                 "name": "server",
                 "remoteExecutor": "grpcs://example.com",
@@ -203,6 +198,13 @@ mod tests {
             _request: &CreateCertificateRequest,
         ) -> Result<Certificate, ServerCallError> {
             self.created.fetch_add(1, Ordering::SeqCst);
+            if let Some((status, message)) = self.server_error {
+                return Err(ClientError::Server {
+                    status,
+                    message: message.to_owned(),
+                }
+                .into());
+            }
             let mut certificate = serde_json::json!({
                 "name": "certificates/1",
                 "principal": "principals/workload",
@@ -212,18 +214,22 @@ mod tests {
             if let Some(pem_certificate) = &self.pem_certificate {
                 certificate["pemCertificate"] = pem_certificate.as_str().into();
             }
+            if let Some(ca_certificate) = &self.ca_certificate {
+                certificate["caCertificate"] = ca_certificate.as_str().into();
+            }
             serde_json::from_value(certificate).map_err(|error| ClientError::Body(error).into())
         }
     }
 
     #[tokio::test]
-    async fn a_server_without_a_ca_is_not_asked_for_a_certificate() -> Result<(), Box<dyn Error>> {
+    async fn a_certificate_without_its_ca_is_a_failure() -> Result<(), Box<dyn Error>> {
         let enroller = WorkloadEnroller {
             api: FakeServer {
                 ca_certificate: None,
                 pem_certificate: Some(CertificatePem::try_new(CERTIFICATE)?),
                 expire_time: Timestamp::from_rfc3339(EXPIRE_TIME)?,
                 created: AtomicUsize::new(0),
+                server_calls: AtomicUsize::new(0),
                 server_error: None,
             },
             provider: ProviderName::try_new("workloads")?,
@@ -232,7 +238,7 @@ mod tests {
         let result = enroller.exchange(Proof::new("proof")).await;
 
         assert!(matches!(result, Err(EnrollmentFailure::NoCaCertificate)));
-        assert_eq!(enroller.api.created.load(Ordering::SeqCst), 0);
+        assert_eq!(enroller.api.created.load(Ordering::SeqCst), 1);
         Ok(())
     }
 
@@ -244,6 +250,7 @@ mod tests {
                 pem_certificate: None,
                 expire_time: Timestamp::from_rfc3339(EXPIRE_TIME)?,
                 created: AtomicUsize::new(0),
+                server_calls: AtomicUsize::new(0),
                 server_error: None,
             },
             provider: ProviderName::try_new("workloads")?,
@@ -257,7 +264,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn credentials_carry_the_servers_ca_certificate_and_the_issued_certificate()
+    async fn credentials_carry_the_certificate_and_its_ca_from_one_answer()
     -> Result<(), Box<dyn Error>> {
         let enroller = WorkloadEnroller {
             api: FakeServer {
@@ -265,6 +272,7 @@ mod tests {
                 pem_certificate: Some(CertificatePem::try_new(ISSUED_CERTIFICATE)?),
                 expire_time: Timestamp::from_rfc3339(EXPIRE_TIME)?,
                 created: AtomicUsize::new(0),
+                server_calls: AtomicUsize::new(0),
                 server_error: None,
             },
             provider: ProviderName::try_new("workloads")?,
@@ -276,6 +284,7 @@ mod tests {
             .map_err(|failure| format!("{failure:?}"))?;
 
         assert_eq!(enroller.api.created.load(Ordering::SeqCst), 1);
+        assert_eq!(enroller.api.server_calls.load(Ordering::SeqCst), 0);
         assert_eq!(credentials.ca_certificate.as_str(), CERTIFICATE);
         assert_eq!(credentials.certificate.as_str(), ISSUED_CERTIFICATE);
         assert_eq!(credentials.not_after, Timestamp::from_rfc3339(EXPIRE_TIME)?);
@@ -291,6 +300,7 @@ mod tests {
                 pem_certificate: None,
                 expire_time: Timestamp::from_rfc3339(EXPIRE_TIME)?,
                 created: AtomicUsize::new(0),
+                server_calls: AtomicUsize::new(0),
                 server_error: Some((500, "internal error")),
             },
             provider: ProviderName::try_new("workloads")?,

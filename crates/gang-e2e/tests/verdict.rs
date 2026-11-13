@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use gang_clock::Timestamp;
 use gang_e2e::verdict;
 use gang_e2e::{
-    BuildOutcome, Check, HOLD_CPU_COUNT, HOLD_MEMORY_KB, Host, InputLinks, IsolationReport,
-    LIMIT_CPU_PERIOD_MICROS, LIMIT_HEADROOM_PERCENT, LIMIT_MAX_PIDS, Namespaces, Outcome,
-    PermitNetwork, PoisonReport, Sandbox, ScopeFacts, VictimReport, names,
+    BuildOutcome, Check, HOLD_CPU_COUNT, HOLD_MEMORY_KB, Host, InputLinks, InputRootReport,
+    IsolationReport, LIMIT_CPU_PERIOD_MICROS, LIMIT_HEADROOM_PERCENT, LIMIT_MAX_PIDS, Namespaces,
+    Outcome, PermitNetwork, PoisonReport, Sandbox, ScopeFacts, VictimReport, names,
 };
 use gang_types::{FleetName, InstanceId, WorkerId};
 use gang_wire::{Event, EventChange, name};
@@ -165,23 +165,51 @@ fn bwrap_namespaces_empty_mnt_fails() {
 }
 
 #[test]
-fn siblings_hidden_passes_when_each_directory_lists_only_its_child_under_bwrap() {
-    let check = verdict::siblings_hidden(Sandbox::Bwrap, &layout("work,", "sandbox,", "work,"));
+fn siblings_hidden_passes_when_each_directory_lists_only_expected_entries_under_bwrap() {
+    let check = verdict::siblings_hidden(Sandbox::Bwrap, &layout("tmp,work,", "sandbox,", "work,"));
     assert_eq!(check.name, names::isolation::SIBLINGS_HIDDEN);
     assert!(check.is_passed());
 }
 
 #[test]
 fn siblings_hidden_fails_when_the_parent_lists_a_sibling_under_bwrap() {
-    let check = verdict::siblings_hidden(Sandbox::Bwrap, &layout("cas,work,", "sandbox,", "work,"));
+    let check = verdict::siblings_hidden(
+        Sandbox::Bwrap,
+        &layout("cas,tmp,work,", "sandbox,", "work,"),
+    );
     assert!(check.is_failure());
     assert!(failure(&check).contains("parent directory"));
     assert!(failure(&check).contains("cas"));
 }
 
 #[test]
+fn siblings_hidden_fails_when_another_name_stands_beside_the_working_directory_under_bwrap() {
+    let check =
+        verdict::siblings_hidden(Sandbox::Bwrap, &layout("other,work,", "sandbox,", "work,"));
+    assert!(check.is_failure());
+    assert!(failure(&check).contains("parent directory"));
+    assert!(failure(&check).contains("other"));
+}
+
+#[test]
+fn siblings_hidden_fails_when_the_parent_lacks_the_action_tmp_under_bwrap() {
+    let check = verdict::siblings_hidden(Sandbox::Bwrap, &layout("work,", "sandbox,", "work,"));
+    assert!(check.is_failure());
+    assert!(failure(&check).contains("parent directory"));
+}
+
+#[test]
+fn siblings_hidden_accepts_the_parent_in_any_order_under_bwrap() {
+    let check = verdict::siblings_hidden(Sandbox::Bwrap, &layout("work,tmp,", "sandbox,", "work,"));
+    assert!(check.is_passed());
+}
+
+#[test]
 fn siblings_hidden_fails_when_the_grandparent_lists_a_sibling_under_bwrap() {
-    let check = verdict::siblings_hidden(Sandbox::Bwrap, &layout("work,", "cas,sandbox,", "work,"));
+    let check = verdict::siblings_hidden(
+        Sandbox::Bwrap,
+        &layout("tmp,work,", "cas,sandbox,", "work,"),
+    );
     assert!(check.is_failure());
     assert!(failure(&check).contains("grandparent directory"));
     assert!(failure(&check).contains("cas"));
@@ -191,7 +219,7 @@ fn siblings_hidden_fails_when_the_grandparent_lists_a_sibling_under_bwrap() {
 fn siblings_hidden_fails_when_the_great_grandparent_lists_a_sibling_under_bwrap() {
     let check = verdict::siblings_hidden(
         Sandbox::Bwrap,
-        &layout("work,", "sandbox,", "work,fast-cas,"),
+        &layout("tmp,work,", "sandbox,", "work,fast-cas,"),
     );
     assert!(check.is_failure());
     assert!(failure(&check).contains("great-grandparent directory"));
@@ -507,6 +535,92 @@ fn input_integrity_keep_passes_when_the_control_is_poisoned() {
 fn input_integrity_keep_fails_when_the_control_is_not_poisoned() {
     let check = verdict::input_integrity(InputLinks::Keep, &VictimReport { poisoned: false });
     assert!(check.is_failure());
+}
+
+fn input_root_report() -> InputRootReport {
+    InputRootReport {
+        shared_path: "../+_repo_rules+shared_input/input".to_owned(),
+        sibling: "shared input".to_owned(),
+        symlink: "shared input".to_owned(),
+        sibling_links: Some(1),
+    }
+}
+
+fn only_input_root_failure(report: &InputRootReport, name: &str) {
+    let checks = verdict::input_root(InputLinks::Break, report);
+    assert_eq!(checks.len(), 4);
+    assert!(named(&checks, name).is_failure());
+    assert_eq!(checks.iter().filter(|check| check.is_failure()).count(), 1);
+}
+
+#[test]
+fn input_root_passes_when_the_sibling_and_symlink_are_read_with_private_inode() {
+    let checks = verdict::input_root(InputLinks::Break, &input_root_report());
+    assert_eq!(checks.len(), 4);
+    assert!(checks.iter().all(Check::is_passed));
+}
+
+#[test]
+fn input_root_fails_both_reads_when_the_sibling_is_empty() {
+    let report = InputRootReport {
+        sibling: String::new(),
+        ..input_root_report()
+    };
+    let checks = verdict::input_root(InputLinks::Break, &report);
+    assert!(named(&checks, names::input_root::SIBLING_READ).is_failure());
+    assert!(named(&checks, names::input_root::SYMLINK_FOLLOWED).is_failure());
+    assert_eq!(checks.iter().filter(|check| check.is_failure()).count(), 2);
+}
+
+#[test]
+fn input_root_fails_when_symlink_reads_a_different_input() {
+    let report = InputRootReport {
+        symlink: "different input".to_owned(),
+        ..input_root_report()
+    };
+    only_input_root_failure(&report, names::input_root::SYMLINK_FOLLOWED);
+}
+
+#[test]
+fn input_root_fails_when_the_input_is_inside_the_working_directory() {
+    let report = InputRootReport {
+        shared_path: "external/x/input".to_owned(),
+        ..input_root_report()
+    };
+    only_input_root_failure(&report, names::input_root::OUTSIDE_WORKING_DIRECTORY);
+}
+
+#[test]
+fn input_root_fails_when_the_input_still_has_a_hard_link() {
+    let report = InputRootReport {
+        sibling_links: Some(2),
+        ..input_root_report()
+    };
+    only_input_root_failure(&report, names::input_root::LINKS_BROKEN);
+}
+
+#[test]
+fn input_root_fails_when_the_input_link_count_is_unreadable() {
+    let report = InputRootReport {
+        sibling_links: None,
+        ..input_root_report()
+    };
+    let checks = verdict::input_root(InputLinks::Break, &report);
+    assert_eq!(
+        failure(named(&checks, names::input_root::LINKS_BROKEN)),
+        "the input's link count could not be read"
+    );
+    only_input_root_failure(&report, names::input_root::LINKS_BROKEN);
+}
+
+#[test]
+fn input_root_skips_link_check_when_links_are_kept() {
+    let checks = verdict::input_root(InputLinks::Keep, &input_root_report());
+    assert!(matches!(
+        &named(&checks, names::input_root::LINKS_BROKEN).outcome,
+        Outcome::Skipped(_)
+    ));
+    assert_eq!(checks.iter().filter(|check| check.is_passed()).count(), 3);
 }
 
 fn fleet_events() -> Result<Vec<Event>, Box<dyn std::error::Error>> {

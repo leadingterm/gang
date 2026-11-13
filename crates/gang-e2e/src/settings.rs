@@ -139,6 +139,13 @@ impl Default for Settings {
     }
 }
 
+/// Host paths a dynamically linked glibc program needs: the ELF interpreter directories (`/lib64`
+/// on x86-64, `/lib` on aarch64, holding the loader on an FHS host and the nix-ld stub on NixOS),
+/// `/usr` (an FHS host's libraries) and `/run/current-system/sw` (nix-ld's libraries on NixOS). The
+/// harness binds those the host has, read-only, as the worker image binds `/lib`, `/lib64` and
+/// `/run/current-system/sw`.
+pub const GLIBC_LOADER_PATHS: [&str; 4] = ["/lib", "/lib64", "/usr", "/run/current-system/sw"];
+
 /// The resolved shell and PATH used by the sample's actions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionTools {
@@ -149,9 +156,25 @@ pub struct ActionTools {
     /// The bubblewrap binary a bwrap-sandboxed worker runs (`[sandbox.bwrap] program`);
     /// `None` where the platform has no bwrap.
     pub bwrap: Option<PathBuf>,
+    /// A dynamically linked glibc program, as the toolchains Bazel downloads are, that the sample's
+    /// `glibc_tool` probe runs; `None` where the platform has no bwrap.
+    pub glibc_tool: Option<PathBuf>,
+    /// The host's [`GLIBC_LOADER_PATHS`] that exist, bound read-only in bwrap sandboxes so that
+    /// dynamically linked glibc programs start.
+    pub glibc_loader: Vec<PathBuf>,
 }
 
 impl ActionTools {
+    /// The host's [`GLIBC_LOADER_PATHS`] that exist.
+    #[must_use]
+    pub fn host_glibc_loader() -> Vec<PathBuf> {
+        GLIBC_LOADER_PATHS
+            .iter()
+            .map(PathBuf::from)
+            .filter(|path| path.exists())
+            .collect()
+    }
+
     /// The bubblewrap binary bwrap-sandboxed workers run.
     ///
     /// # Errors
@@ -161,6 +184,19 @@ impl ActionTools {
         self.bwrap.as_deref().ok_or_else(|| {
             E2eError::system(
                 "the bwrap binary is unset: run the harness inside `nix develop`, or set `bwrap` in the settings",
+            )
+        })
+    }
+
+    /// The dynamically linked glibc program of the glibc-toolchain scenario.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`E2eError::System`] when the program is unset.
+    pub fn glibc_tool_program(&self) -> Result<&Path> {
+        self.glibc_tool.as_deref().ok_or_else(|| {
+            E2eError::system(
+                "the glibc tool is unset: run the harness with `bazel run //crates/gang-e2e:local`, which sets GANG_E2E_GLIBC_TOOL",
             )
         })
     }

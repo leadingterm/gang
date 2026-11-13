@@ -78,14 +78,25 @@ workspace_rust_library(
 workspace_rust_binary(
     name = "local",
     src = "src/main.rs",
+    # The glibc-toolchain scenario's dynamically linked glibc program, Linux only.
     data = [
         ":bazel",
         "//crates/gang-main:gang",
-    ],
-    env = {
-        "GANG_E2E_BAZEL": "$(rootpath :bazel)",
-        "GANG_E2E_GANG": "$(rootpath //crates/gang-main:gang)",
-    },
+    ] + select({
+        "@platforms//os:linux": ["//crates/gang-main/tests/preload:loaded_probe"],
+        "//conditions:default": [],
+    }),
+    env = select({
+        "@platforms//os:linux": {
+            "GANG_E2E_BAZEL": "$(rootpath :bazel)",
+            "GANG_E2E_GANG": "$(rootpath //crates/gang-main:gang)",
+            "GANG_E2E_GLIBC_TOOL": "$(rootpath //crates/gang-main/tests/preload:loaded_probe)",
+        },
+        "//conditions:default": {
+            "GANG_E2E_BAZEL": "$(rootpath :bazel)",
+            "GANG_E2E_GANG": "$(rootpath //crates/gang-main:gang)",
+        },
+    }),
     deps = [
         ":gang_e2e",
     ],

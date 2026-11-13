@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use gang_clock::Timestamp;
 use gang_e2e::{
-    BuildOutcome, Check, Control, E2eError, Host, Probe, ProbeReport, Result, Sandbox, System,
+    BuildOutcome, Check, Control, E2eError, Host, Probe, ProbeReport, Result, Run, Sandbox, System,
     Variant, drain_cancel, names, orphan, skipped_pass,
 };
 use gang_wire::{
@@ -660,6 +660,11 @@ impl System for ControlSim {
         self.observe()?;
         let target = self.enqueue();
         self.serve(target)
+    }
+
+    // Models neither the action cache nor the journal, so a run changes nothing.
+    fn build_run(&self, probes: &[Probe], _run: &Run) -> Result<BuildOutcome> {
+        self.build(probes)
     }
 
     fn clean(&self) -> Result<()> {

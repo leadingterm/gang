@@ -1,6 +1,6 @@
 # ADR-03: Gang terminates TLS in one fixed adapter; transport is independent of authentication
 
-Status: Accepted
+Status: Accepted. A re-encrypting public terminator is ADR-36.
 
 ## Context
 - NativeLink reads a CRL only at listener start and never closes established connections (ADR-02), so TLS and admission cannot live in it.

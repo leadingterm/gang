@@ -6,8 +6,8 @@
 //! 1. Read the sandbox file beside the `gang-exec` entrypoint link. The worker writes it there,
 //!    and an action cannot write to that directory.
 //! 2. Read the network, CPU and memory requests from the environment.
-//! 3. If the file breaks input links, derive the action directory from the work directory the
-//!    file records and the current directory.
+//! 3. Resolve the action directory and working directory from the recorded work directory and
+//!    current directory.
 //! 4. If the file has limits, build the limits plugin and start a scope guardian.
 //! 5. If the file breaks input links, replace every hard-linked regular file under the action
 //!    directory with a private copy.
@@ -30,7 +30,7 @@ mod properties;
 mod run;
 mod terminations;
 
-pub use action_directory::action_directory;
+pub use action_directory::ActionDirectory;
 pub use errors::{ExecError, LinkBreakError, PropertyError};
 pub use execute::{Action, execute, exit_status};
 pub use guard::guard;

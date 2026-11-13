@@ -229,6 +229,7 @@ fn execute(sandbox: &Sandbox) -> Result<ActionExecutionOutcome, Box<dyn Error>> 
         command: gang_spi::ActionCommand::from_argv(&argv).ok_or("empty argv")?,
         launcher: &[],
         environment: &[],
+        action_directory: Path::new("/work"),
         working_directory: Path::new("/work"),
         network: NetworkRequest::NotRequested,
     };

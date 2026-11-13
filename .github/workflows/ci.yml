@@ -18,21 +18,34 @@ defaults:
 
 jobs:
   # Every job is required: a gate that may fail is not a gate. Branch protection lists validate, macos, linux-arm64, e2e-gate-1 and e2e-gate-2.
+  # Every job restores the Bazel disk cache (setup-ci). validate, linux-arm64 and macos save it
+  # (save-bazel-cache) at the end of every run of this repository, whether it passed, failed, timed out
+  # or was cancelled, so a cold run's progress is kept for the next run of the same ref; a fork's pull
+  # request saves nothing, and the e2e jobs reuse validate's Linux x86-64 entry and save none.
+  # Timeouts are about twice the slowest measured cold (no cache) duration (docs/SPECIFICATION.md 7.1);
+  # the step timeouts on the long Bazel steps leave the save room inside the job timeout.
   validate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-ci
       - name: Check BUILD files are in sync
-        run: nix develop -c bazelisk run //:gazelle.check
+        run: nix develop -c bazelisk run --config=ci --disk_cache="$BAZEL_DISK_CACHE" //:gazelle.check
       - name: Test
-        run: nix develop -c bazelisk test //...
+        timeout-minutes: 40
+        run: nix develop -c bazelisk test --config=ci --disk_cache="$BAZEL_DISK_CACHE" //...
       # The UI build runs esbuild on the exec platform, not the cross-build target.
       - name: Cross-build gang
-        run: nix develop -c bazelisk build --platforms=@zig_sdk//libc_aware/platform:linux_arm64_musl //:gang
+        timeout-minutes: 16
+        run: nix develop -c bazelisk build --config=ci --disk_cache="$BAZEL_DISK_CACHE" --platforms=@zig_sdk//libc_aware/platform:linux_arm64_musl //:gang
+      - name: Save the Bazel disk cache
+        if: always()
+        uses: ./.github/actions/save-bazel-cache
+        with:
+          prune: ${{ job.status == 'success' }}
       - name: Check Nix formatting
         run: nix develop -c alejandra --check .
       - name: Evaluate NixOS configurations, checks, and images
@@ -58,34 +71,44 @@ jobs:
 
   macos:
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
-        with:
-          nix_conf: |
-            experimental-features = nix-command flakes
+      - uses: ./.github/actions/setup-ci
       - name: Build
-        run: nix develop -c bazelisk build //...
+        timeout-minutes: 50
+        run: nix develop -c bazelisk build --config=ci --disk_cache="$BAZEL_DISK_CACHE" //...
       - name: Test the macOS-specific crates
-        run: nix develop -c bazelisk test //crates/gang-exec/... //crates/gang-noop/...
+        timeout-minutes: 10
+        run: nix develop -c bazelisk test --config=ci --disk_cache="$BAZEL_DISK_CACHE" //crates/gang-exec/... //crates/gang-noop/...
+      - name: Save the Bazel disk cache
+        if: always()
+        uses: ./.github/actions/save-bazel-cache
+        with:
+          prune: ${{ job.status == 'success' }}
 
   linux-arm64:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 90
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-ci
       - name: Test
-        run: nix develop -c bazelisk test //...
+        timeout-minutes: 35
+        run: nix develop -c bazelisk test --config=ci --disk_cache="$BAZEL_DISK_CACHE" //...
+      - name: Save the Bazel disk cache
+        if: always()
+        uses: ./.github/actions/save-bazel-cache
+        with:
+          prune: ${{ job.status == 'success' }}
 
   e2e-gate-1:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -101,11 +124,11 @@ jobs:
           sudo systemctl start "user@$(id -u).service"
       # Workers use systemd-run --user --scope and need the runner's delegated user manager.
       - name: Run Gate 1
-        run: XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-run --user --pipe --wait --same-dir -p Delegate=yes --setenv=PATH="$PATH" -- nix develop -c bazelisk run //crates/gang-e2e:local -- --gate 1
+        run: XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-run --user --pipe --wait --same-dir -p Delegate=yes --setenv=PATH="$PATH" -- nix develop -c bazelisk run --config=ci --disk_cache="$BAZEL_DISK_CACHE" //crates/gang-e2e:local -- --gate 1
 
   e2e-gate-2:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -121,4 +144,4 @@ jobs:
           sudo systemctl start "user@$(id -u).service"
       # Workers use systemd-run --user --scope and need the runner's delegated user manager.
       - name: Run Gate 2 additions
-        run: XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-run --user --pipe --wait --same-dir -p Delegate=yes --setenv=PATH="$PATH" -- nix develop -c bazelisk run //crates/gang-e2e:local -- --gate 2 --additions
+        run: XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-run --user --pipe --wait --same-dir -p Delegate=yes --setenv=PATH="$PATH" -- nix develop -c bazelisk run --config=ci --disk_cache="$BAZEL_DISK_CACHE" //crates/gang-e2e:local -- --gate 2 --additions

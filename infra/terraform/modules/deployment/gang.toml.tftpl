@@ -61,8 +61,10 @@ scheduler_name = "MAIN_SCHEDULER"
 path = "/var/lib/gang/gang.db"
 
 [sandbox.bwrap]
-# The NixOS worker image provides these paths for sandboxed actions.
-readonly_bind_paths = ["/nix/store", "/run/current-system/sw"]
+# The NixOS worker image provides these paths for sandboxed actions: the Nix store, the system
+# profile, and the ELF interpreter directories through which nix-ld runs dynamically linked glibc
+# programs such as the toolchains Bazel downloads (infra/nixos/glibc-loader.nix).
+readonly_bind_paths = ["/nix/store", "/run/current-system/sw", "/lib", "/lib64"]
 permit_network_property = ${gang_settings.permit_network_property}
 
 [limits.cgroup]
@@ -71,7 +73,10 @@ permit_network_property = ${gang_settings.permit_network_property}
 trust_domain = ${jsonencode(trust_domain)}
 # Workers trust this deployment's signer as their CA.
 ca_pin = "signer"
-
+%{ if endpoint_trust != null ~}
+# A load balancer presents a publicly trusted certificate for endpoint, so clients use their system roots.
+endpoint_trust = ${jsonencode(endpoint_trust)}
+%{ endif }
 [authentication.clients.token]
 providers = ${jsonencode(client_token_providers)}
 

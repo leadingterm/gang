@@ -99,6 +99,7 @@ impl<D: Deployment> Server<D> {
             login,
             provisioner,
         } = settings;
+        let endpoint_trust = transport.endpoint_trust();
         let (worker_endpoint, security, signer) = prepare_transport::<D>(
             transport,
             scheduler.endpoints().worker,
@@ -110,6 +111,7 @@ impl<D: Deployment> Server<D> {
         let info = wire_server(
             &endpoint,
             default_isa,
+            endpoint_trust,
             security.certificate(),
             clients.scheme(),
             &providers,

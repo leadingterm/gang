@@ -38,11 +38,13 @@ mod fake_bazel;
 mod fifo;
 mod fleets;
 mod gang_cli;
+mod glibc_toolchain;
 mod h2_frames;
 mod hold;
 mod host;
 mod http;
 mod identity;
+mod input_root;
 mod integrity;
 mod issuer;
 mod journal;
@@ -117,19 +119,21 @@ pub use event_log::EventFollower;
 pub use execution::{
     ACTIONS_DIR, ActionTimeout, COLD_START_MISFIT_MESSAGE, ColdStart, ESCALATION_MAX_STEPS,
     Execution, ExecutionKnobs, FleetDisk, Generations, JOURNAL_END, MemoryEscalation,
-    NO_FLEET_ACCEPTS, Proc, REFUSAL_RELAUNCH_BACKOFF, Role, ServerExit, WORKER_LEAF,
+    NO_FLEET_ACCEPTS, Proc, REFUSAL_RELAUNCH_BACKOFF, Role, Run, ServerExit, WORKER_LEAF,
     WorkerCertificates, held_build, renewal_deadline, scope_of,
 };
 pub use fake_bazel::{FAKE_BAZEL_ENV, command_line_event, fake_bazel, fake_bazel_requested};
 pub use fleets::fleets;
 pub use gang_cli::GangCli;
 pub use gang_config::InputLinks;
+pub use glibc_toolchain::glibc_toolchain;
 pub use h2_frames::H2Channel;
 pub use hold::{SIGNAL_COMMAND, Signal, Signalled};
 pub use host::Host;
 pub use identity::{
     Admission, Channel, ChannelEvent, Credentials, Identity, Issuance, Presenting, Reply,
 };
+pub use input_root::input_root;
 pub use integrity::input_integrity;
 pub use issuer::{
     AUDIENCE, DASHBOARD_CLIENT_ID, DASHBOARD_CLIENT_SECRET, ORGANIZATION, ORGANIZATION_CLAIM,
@@ -148,7 +152,8 @@ pub use plaintext::plaintext;
 pub use preemption::{preemption, worker_renewal};
 pub use process::Ran;
 pub use report::{
-    DiskNeighbourReport, IsolationReport, Namespaces, PoisonReport, ProbeReport, VictimReport,
+    DiskNeighbourReport, InputRootReport, IsolationReport, Namespaces, PoisonReport, ProbeReport,
+    VictimReport,
 };
 pub use restart::restart;
 pub use revocation::revocation;
@@ -163,7 +168,7 @@ pub use server::{
 pub use server_scenarios::{api, certificate_rotation, event_paging, request_limits, viewer_cap};
 pub use server_stack::ServerStream;
 pub use session::{SessionCookie, TokenUsage, cookie_name, session_cookie, signed_token};
-pub use settings::{ActionTools, Settings};
+pub use settings::{ActionTools, GLIBC_LOADER_PATHS, Settings};
 pub use skipped_pass::skipped_pass;
 pub use sse::EventStream;
 pub use stack::Stack;

@@ -18,7 +18,7 @@ use crate::fleets::{Fleets, RawFleet};
 use crate::identity_config::IdentityConfig;
 use crate::plugin_set::PluginSet;
 use crate::role_config::RoleConfig;
-use crate::server_config::{ServerConfig, Transport};
+use crate::server_config::{EndpointTrust, ServerConfig, Transport};
 use crate::worker_config::WorkerConfig;
 
 /// `gang.toml`. The plugin sections are typed by the composition's [`PluginSet`]; `F` is the
@@ -303,9 +303,9 @@ impl<P: PluginSet, F> GangConfig<P, F> {
         self
     }
 
-    /// Checks the transport: `mtls` needs TLS, a TLS server needs an https endpoint, and a
-    /// plaintext server needs an http or https one. An omitted endpoint
-    /// is derived from the bound address by the server and needs no check here.
+    /// Checks transport and endpoint schemes, and rejects pinned non-enrolling workers when the
+    /// system-trusted endpoint advertises no CA. An omitted endpoint is derived from the bound
+    /// address by the server and needs no scheme check here.
     fn check_transport(
         server: &ServerConfig,
         endpoint: Option<&Url>,
@@ -317,6 +317,12 @@ impl<P: PluginSet, F> GangConfig<P, F> {
                     && endpoint.scheme() != server.transport.kind().public_scheme()
                 {
                     return Err(ConfigError::EndpointNotHttps(endpoint.clone()));
+                }
+                if server.endpoint_trust == EndpointTrust::System
+                    && server.ca_pin.is_some()
+                    && authentication.workers.enrollment_provider().is_none()
+                {
+                    return Err(ConfigError::PinnedWorkersNeedAdvertisedCa);
                 }
             }
             Transport::Plaintext => {

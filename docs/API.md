@@ -85,7 +85,7 @@ A deployment on a trusted network with no authentication:
 ### Notes
 
 - `remoteExecutor` and `remoteCache` are the endpoints for Bazel's `--remote_executor` and `--remote_cache`; the scheme is `grpcs` when the listener serves TLS and `grpc` otherwise.
-- `caCertificate` is the certificate authority the client should trust for those endpoints; it is omitted when the server has none.
+- `caCertificate` is the certificate authority the client should trust for those endpoints; it is omitted when the server has none, and when `[server] endpoint_trust = "system"`, where a publicly trusted terminator presents the endpoint and clients use their system roots.
 - `defaultIsa` is the instruction set a build gets when it does not name one. `gang bazelrc` writes it as `--remote_default_exec_properties=ISA=<defaultIsa>`.
 - `authentication` is a oneof. `token` means the client obtains a bearer token with `POST /v1/session:authenticate`; `none` means no credential is needed. A client that meets a member it does not know must stop and say so.
 - The route is open: it is the first call a client makes, before it has any credential.
@@ -598,7 +598,8 @@ curl -X POST https://gang.example.com/v1/certificates -d @request.json
   "principal": "principals/aws-workers%3Ai-0e10",
   "createTime": "2026-01-14T09:00:00.000Z",
   "expireTime": "2026-01-21T09:00:00.000Z",
-  "pemCertificate": "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgICM/kwCgYIKoZIzj0EAwIwEjEQMA4GA1UE\n-----END CERTIFICATE-----\n"
+  "pemCertificate": "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgICM/kwCgYIKoZIzj0EAwIwEjEQMA4GA1UE\n-----END CERTIFICATE-----\n",
+  "caCertificate": "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUdGhpcyBpcyBhbiBleGFtcGxl\n-----END CERTIFICATE-----\n"
 }
 ```
 
@@ -638,6 +639,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 - `POST /v1/certificates` is mounted only if the worker authentication plugin offers certificates; otherwise it is `404 ROUTE_NOT_FOUND`. A certificate is `200` on create, like every success.
 - The issuance is recorded in the ledger before the response is sent. A client that retries after a lost response gets a second certificate: it is harmless, it expires, and revoking the principal covers it.
 - `pemCertificate` is returned only by create. Revoke returns the certificate without it, and `revokeTime` is present only once the certificate is revoked.
+- `caCertificate` is the certificate of the authority that issued it, which a worker trusts for the worker listener. Like `pemCertificate`, only create returns it.
 - `principal` is the principal the certificate was issued to. `createTime` and `expireTime` bound the certificate's validity.
 - **Revoking is idempotent.** Repeating a revoke answers `200` and keeps the original `revokeTime`. Revoking a certificate does not revoke its principal; revoke the principal to revoke all its certificates.
 - Certificates are revoked through `principals.revoke`: one revoke permission covers principals and certificates.

@@ -44,6 +44,7 @@ busy_timeout = "5s"
 
 [sandbox.bwrap]
 # On hosts without Nix, list directories containing actions' shells, tools, and libraries instead (e.g. "/usr", "/bin", "/lib", "/lib64").
+# On NixOS with nix-ld, add "/run/current-system/sw" and "/lib64" (x86-64) or "/lib" (aarch64) so the dynamically linked glibc toolchains Bazel downloads can start.
 readonly_bind_paths = ["/nix/store"]
 permit_network_property = false
 

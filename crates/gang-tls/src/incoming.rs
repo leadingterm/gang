@@ -9,16 +9,19 @@ use std::task::{Context, Poll};
 use futures_core::Stream;
 use gang_clock::Clock;
 use gang_types::NonZeroDuration;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::task::AbortOnDropHandle;
 
-use crate::acceptor::TlsAcceptor;
+use crate::acceptor::{Refusal, TlsAcceptor};
 use crate::errors::TransportError;
 use crate::stream::RevocableStream;
+
+/// Bytes read per drain step from a refused connection; what is read is discarded.
+const DRAIN_CHUNK: usize = 4096;
 
 /// A source of raw connections, such as a bound TCP listener.
 pub trait Listener: Send + 'static {
@@ -58,6 +61,8 @@ pub struct IncomingSettings {
     pub max_pending_handshakes: NonZeroUsize,
     /// Pause after a failed `accept` before the next attempt.
     pub accept_error_backoff: NonZeroDuration,
+    /// How long a refused connection stays open for its client to read the TLS alert.
+    pub refusal_linger: NonZeroDuration,
 }
 
 /// Why a connection did not reach the consumer of an [`Incoming`] stream.
@@ -99,6 +104,9 @@ impl TlsAcceptor {
     /// buffered for the consumer at once; a permit is held until the connection is buffered, so
     /// further connections wait in the listener's backlog. `on_failure` observes every failed
     /// accept and handshake.
+    /// A connection whose handshake the TLS engine refuses stays open for
+    /// `settings.refusal_linger` after it is reported, so its client can read the alert; it holds
+    /// its handshake slot meanwhile.
     ///
     /// # Panics
     ///
@@ -187,10 +195,37 @@ async fn accept_loop<L, F>(
                     // closes the connection.
                     deliveries.send(stream.with_address(address)).await.ok();
                 }
-                Err(error) => on_failure(&Failure::Handshake { peer, error }),
+                Err(Refusal { error, io }) => {
+                    on_failure(&Failure::Handshake { peer, error });
+                    if let Some(io) = io {
+                        deliver_alert(io, settings.refusal_linger, &acceptor.clock).await;
+                    }
+                }
             }
         });
     }
+}
+
+/// Lets a refused client read the alert the TLS engine wrote: shuts the write side, then reads
+/// and discards what the client still sends until it closes the connection or `linger` elapses.
+/// The drain uses a fixed buffer and discards its contents, so a client that keeps sending costs
+/// no additional memory; the connection is dropped when `linger` elapses even if it keeps sending.
+///
+/// Dropping the connection at once would close it with the client's bytes unread, and the
+/// kernel answers that with a reset. A client still writing, as an HTTP/2 client does with its
+/// preface right after its TLS 1.3 handshake, then fails on the reset before it reads the alert.
+async fn deliver_alert<IO: AsyncRead + AsyncWrite + Unpin>(
+    mut io: IO,
+    linger: NonZeroDuration,
+    clock: &impl Clock,
+) {
+    // A failed shutdown means the client is gone: nobody is left to read the alert.
+    if io.shutdown().await.is_err() {
+        return;
+    }
+    let mut discard = [0_u8; DRAIN_CHUNK];
+    let drain = async { while matches!(io.read(&mut discard).await, Ok(read) if read > 0) {} };
+    Clock::timeout(clock, linger.get(), drain).await.ok();
 }
 
 #[cfg(test)]

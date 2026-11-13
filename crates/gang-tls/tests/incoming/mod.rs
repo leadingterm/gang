@@ -10,7 +10,7 @@ use std::task::{Context, Poll, Waker};
 use futures_core::Stream;
 use gang_tls::{Failure, IncomingSettings, Listener, TransportError};
 use gang_types::NonZeroDuration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, DuplexStream, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
@@ -18,6 +18,12 @@ use crate::support::{FakeListener, TransportFixture, echo_once};
 
 /// Pause after a failed accept in the tests that do not exercise backoff.
 const BACKOFF: NonZeroDuration = NonZeroDuration::from_millis(100);
+
+/// How long refused connections stay open in these tests.
+const LINGER: NonZeroDuration = NonZeroDuration::from_secs(2);
+
+/// The first bytes an HTTP/2 client writes after its TLS handshake.
+const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 /// What the failure callback saw, without the non-`Clone` error payload.
 #[derive(Debug, PartialEq)]
@@ -34,6 +40,7 @@ fn settings(max_pending: usize, accept_error_backoff: NonZeroDuration) -> Incomi
         max_pending_handshakes: NonZeroUsize::new(max_pending)
             .expect("test handshake bound is non-zero"),
         accept_error_backoff,
+        refusal_linger: LINGER,
     }
 }
 
@@ -267,6 +274,179 @@ async fn failed_handshakes_are_reported_and_skipped() {
         Outcome::Accept | Outcome::Timeout => 0,
     });
     assert_eq!(reported, [Outcome::Handshake(1), Outcome::Handshake(2)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_client_that_writes_before_it_reads_still_receives_the_revoked_alert() {
+    let (fixture, revoked) = TransportFixture::with_revoked_client(40, "alpha");
+    let (listener, feed) = FakeListener::new();
+    let (mut failures, callback) = recorder();
+    let _incoming = fixture
+        .acceptor()
+        .incoming(listener, settings(256, BACKOFF), callback);
+    let (client_io, server_io) = TransportFixture::pipe();
+    feed.push(Ok((server_io, 1)));
+    let mut client = revoked
+        .connector
+        .connect(TransportFixture::server_name(), client_io)
+        .await
+        .expect(
+            "a TLS 1.3 client completes its handshake before the server verifies its certificate",
+        );
+    assert_eq!(next_failure(&mut failures).await, Outcome::Handshake(1));
+    client
+        .write_all(H2_PREFACE)
+        .await
+        .expect("the refused connection still takes the client's bytes");
+    client
+        .flush()
+        .await
+        .expect("the refused connection still takes the client's bytes");
+    let error = client
+        .read(&mut [0_u8; 1])
+        .await
+        .expect_err("the client reads the server's alert");
+    assert!(matches!(
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<rustls::Error>()),
+        Some(rustls::Error::AlertReceived(
+            rustls::AlertDescription::CertificateRevoked
+        ))
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_connection_frees_its_handshake_slot_when_the_client_closes() {
+    let (fixture, revoked) = TransportFixture::with_revoked_client(41, "alpha");
+    let good = fixture.client(42, "beta");
+    let (listener, feed) = FakeListener::new();
+    let (mut failures, callback) = recorder();
+    let mut incoming = fixture
+        .acceptor()
+        .incoming(listener, settings(1, BACKOFF), callback);
+    let (client_io, server_io) = TransportFixture::pipe();
+    feed.push(Ok((server_io, 1)));
+    let mut client = revoked
+        .connector
+        .connect(TransportFixture::server_name(), client_io)
+        .await
+        .expect(
+            "a TLS 1.3 client completes its handshake before the server verifies its certificate",
+        );
+    assert_eq!(next_failure(&mut failures).await, Outcome::Handshake(1));
+    client
+        .read(&mut [0_u8; 1])
+        .await
+        .expect_err("the client reads the server's alert");
+    drop(client);
+
+    let (client_io, server_io) = TransportFixture::pipe();
+    feed.push(Ok((server_io, 2)));
+    let (client_result, server) = tokio::join!(
+        good.connector
+            .connect(TransportFixture::server_name(), client_io),
+        next(&mut incoming)
+    );
+    client_result.expect("good client handshake completes");
+    assert!(server.is_some(), "the stream yields the good client");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_connection_holds_its_slot_until_the_linger_ends_even_while_its_client_keeps_sending()
+ {
+    let (fixture, revoked) = TransportFixture::with_revoked_client(43, "alpha");
+    let good = fixture.client(44, "beta");
+    let (listener, feed) = FakeListener::new();
+    let (mut failures, callback) = recorder();
+    let mut incoming = fixture
+        .acceptor()
+        .incoming(listener, settings(1, BACKOFF), callback);
+    let (client_io, server_io) = TransportFixture::pipe();
+    feed.push(Ok((server_io, 1)));
+    let mut client = revoked
+        .connector
+        .connect(TransportFixture::server_name(), client_io)
+        .await
+        .expect(
+            "a TLS 1.3 client completes its handshake before the server verifies its certificate",
+        );
+    assert_eq!(next_failure(&mut failures).await, Outcome::Handshake(1));
+    let (started, writing) = oneshot::channel();
+    let writer = tokio::spawn(async move {
+        client
+            .write_all(&[0_u8; 1024])
+            .await
+            .expect("the refused connection accepts client bytes");
+        let _ = started.send(());
+        loop {
+            if client.write_all(&[0_u8; 1024]).await.is_err() {
+                break;
+            }
+        }
+    });
+    writing.await.expect("the writer starts sending");
+
+    let (client_io, server_io) = TransportFixture::pipe();
+    feed.push(Ok((server_io, 2)));
+    let mut second = pin!(
+        good.connector
+            .connect(TransportFixture::server_name(), client_io)
+    );
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(
+        second.as_mut().poll(&mut cx).is_pending(),
+        "the refused connection holds the only handshake slot during the linger"
+    );
+    fixture.clock().advance(LINGER.get());
+    let (client_result, server) = tokio::join!(second, next(&mut incoming));
+    client_result.expect("good client handshake completes");
+    assert!(server.is_some(), "the stream yields the good client");
+    writer.await.expect("the writer task completes");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_connection_discards_more_than_any_buffer_holds() {
+    let (fixture, revoked) = TransportFixture::with_revoked_client(45, "alpha");
+    let (listener, feed) = FakeListener::new();
+    let (mut failures, callback) = recorder();
+    let _incoming = fixture
+        .acceptor()
+        .incoming(listener, settings(256, BACKOFF), callback);
+    let (client_io, server_io) = TransportFixture::pipe();
+    feed.push(Ok((server_io, 1)));
+    let mut client = revoked
+        .connector
+        .connect(TransportFixture::server_name(), client_io)
+        .await
+        .expect(
+            "a TLS 1.3 client completes its handshake before the server verifies its certificate",
+        );
+    assert_eq!(next_failure(&mut failures).await, Outcome::Handshake(1));
+
+    // One MiB exceeds the test pipe's 64 KiB capacity.
+    for _ in 0..1024 {
+        client
+            .write_all(&[0_u8; 1024])
+            .await
+            .expect("the refused connection continues to drain client bytes");
+    }
+    client
+        .flush()
+        .await
+        .expect("the refused connection continues to drain client bytes");
+    let error = client
+        .read(&mut [0_u8; 1])
+        .await
+        .expect_err("the client reads the server's alert");
+    assert!(matches!(
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<rustls::Error>()),
+        Some(rustls::Error::AlertReceived(
+            rustls::AlertDescription::CertificateRevoked
+        ))
+    ));
 }
 
 #[tokio::test]

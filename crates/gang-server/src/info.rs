@@ -1,5 +1,6 @@
 //! The server resource a client stores at `gang login --server`.
 
+use gang_config::EndpointTrust;
 use gang_spi::{LoginPort, Scheme};
 use gang_types::{CertificatePem, Isa};
 use gang_wire::name::SERVER;
@@ -10,10 +11,12 @@ use crate::errors::ServerError;
 use crate::identity::Providers;
 
 /// Builds the server resource from the endpoint, the certificate authority, the clients
-/// authentication scheme, and the identity providers.
+/// authentication scheme, and the identity providers. The CA is advertised only when clients see
+/// Gang's own certificate.
 pub(crate) fn wire_server<V: LoginPort>(
     endpoint: &PublicEndpoint,
     default_isa: Isa,
+    endpoint_trust: EndpointTrust,
     ca: Option<CertificatePem>,
     scheme: Scheme,
     providers: &Providers<V>,
@@ -36,7 +39,10 @@ pub(crate) fn wire_server<V: LoginPort>(
         name: SERVER.to_owned(),
         remote_executor: endpoint.remote().clone(),
         remote_cache: endpoint.remote().clone(),
-        ca_certificate: ca,
+        ca_certificate: match endpoint_trust {
+            EndpointTrust::Ca => ca,
+            EndpointTrust::System => None,
+        },
         default_isa: default_isa.into(),
         authentication,
     })
@@ -46,6 +52,7 @@ pub(crate) fn wire_server<V: LoginPort>(
 mod tests {
     use std::collections::BTreeMap;
 
+    use gang_config::EndpointTrust;
     use gang_spi::{LoginSupport, Scheme};
     use gang_types::{CertificatePem, Isa, ProviderName, Url};
     use gang_wire::{Authentication, NoAuthentication, TokenAuthentication};
@@ -96,6 +103,7 @@ mod tests {
         let info = wire_server(
             &endpoint("https://gang.example.test:443/"),
             Isa::X86_64,
+            EndpointTrust::Ca,
             None,
             Scheme::Token,
             &providers(),
@@ -117,6 +125,7 @@ mod tests {
         let info = wire_server(
             &endpoint("https://gang.example.test/"),
             Isa::Aarch64,
+            EndpointTrust::Ca,
             None,
             Scheme::None,
             &providers(),
@@ -134,6 +143,7 @@ mod tests {
         let result = wire_server(
             &endpoint("https://gang.example.test/"),
             Isa::X86_64,
+            EndpointTrust::Ca,
             None,
             Scheme::Mtls,
             &providers(),
@@ -147,6 +157,7 @@ mod tests {
         let secure = wire_server(
             &endpoint("https://gang.example.test:8443/base"),
             Isa::X86_64,
+            EndpointTrust::Ca,
             None,
             Scheme::None,
             &providers(),
@@ -164,6 +175,7 @@ mod tests {
         let with_ca = wire_server(
             &endpoint("https://gang.example.test/"),
             Isa::X86_64,
+            EndpointTrust::Ca,
             Some(ca()),
             Scheme::None,
             &providers(),
@@ -174,11 +186,26 @@ mod tests {
         let without_ca = wire_server(
             &endpoint("https://gang.example.test/"),
             Isa::X86_64,
+            EndpointTrust::Ca,
             None,
             Scheme::None,
             &providers(),
         )
         .expect("server info builds");
         assert_eq!(without_ca.ca_certificate, None);
+    }
+
+    #[test]
+    fn a_publicly_trusted_endpoint_advertises_no_ca() {
+        let info = wire_server(
+            &endpoint("https://gang.example.test/"),
+            Isa::X86_64,
+            EndpointTrust::System,
+            Some(ca()),
+            Scheme::None,
+            &providers(),
+        )
+        .expect("server info builds");
+        assert_eq!(info.ca_certificate, None);
     }
 }

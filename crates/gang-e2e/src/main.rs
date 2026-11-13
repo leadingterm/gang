@@ -132,6 +132,8 @@ impl Cli {
                 .bwrap
                 .clone()
                 .or_else(|| env::var_os("GANG_E2E_BWRAP").map(PathBuf::from)),
+            glibc_tool: env::var_os("GANG_E2E_GLIBC_TOOL").map(|path| current.join(path)),
+            glibc_loader: ActionTools::host_glibc_loader(),
         };
         let invocation = Invocation {
             gang,

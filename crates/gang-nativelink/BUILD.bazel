@@ -9,6 +9,7 @@ workspace_rust_library(
     deps = [
         "//crates/gang-clock:gang_clock",
         "//crates/gang-spi:gang_spi",
+        "//crates/gang-tls:gang_tls",
         "//crates/gang-types:gang_types",
     ],
 )

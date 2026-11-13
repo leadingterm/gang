@@ -72,6 +72,9 @@ fn a_terminated_noop_action_keeps_its_grace_and_its_host_cleans_up() -> TestResu
     std::os::unix::fs::symlink(required_path("GANG_BIN")?, &exec)?;
     let work = dir.path().join("work");
     std::fs::create_dir(&work)?;
+    // `NativeLink` runs every action in `<work>/<id>/work`; `gang exec` rejects any other directory.
+    let working_directory = work.join("a1/work");
+    std::fs::create_dir_all(&working_directory)?;
     std::fs::write(dir.path().join(SANDBOX_FILE_NAME), sandbox_file(&work))?;
 
     // The action is this test binary: no host program runs.
@@ -82,7 +85,7 @@ fn a_terminated_noop_action_keeps_its_grace_and_its_host_cleans_up() -> TestResu
         .args(GRACE_ACTION.arguments())
         .env_clear()
         .env(ACTION_VARIABLE, "1")
-        .current_dir(dir.path())
+        .current_dir(&working_directory)
         .process_group(0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

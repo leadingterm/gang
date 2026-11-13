@@ -56,6 +56,7 @@ fn parameters() -> SampleParameters {
         large_fleet: "local-large".to_owned(),
         large_memory_kb: 16_777_216,
         requested_sandbox: Sandbox::Noop,
+        glibc_tool: None,
     }
 }
 
@@ -94,6 +95,42 @@ fn staged_tree_equals_the_source_with_permissions() {
     let mut staged = snapshot(&destination).expect("staged tree is readable");
     staged.remove(Path::new("config.bzl"));
     assert_eq!(staged, snapshot(&source).expect("source tree is readable"));
+}
+
+#[cfg(unix)]
+#[test]
+fn staged_glibc_tool_keeps_content_and_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = tempfile::tempdir().expect("work directory is created");
+    let source = work.path().join("source");
+    fs::create_dir(&source).expect("source is created");
+    fs::write(
+        source.join("BUILD.bazel"),
+        build_file(Probe::ALL).expect("build file formats"),
+    )
+    .expect("build file is written");
+    let tool = work.path().join("tool");
+    fs::write(&tool, b"tool").expect("tool is written");
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).expect("mode is set");
+    let destination = work.path().join("staged");
+    let parameters = SampleParameters {
+        glibc_tool: Some(tool),
+        ..parameters()
+    };
+
+    stage(&source, &destination, &parameters).expect("sample stages");
+
+    let staged = destination.join("glibc-tool");
+    assert_eq!(fs::read(&staged).expect("tool is readable"), b"tool");
+    assert_eq!(
+        fs::metadata(&staged)
+            .expect("tool exists")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
 }
 
 #[test]

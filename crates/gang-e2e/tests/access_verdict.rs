@@ -38,6 +38,8 @@ fn tools() -> ActionTools {
         bwrap: Some(std::path::PathBuf::from(
             "/nix/store/ccc-bubblewrap/bin/bwrap",
         )),
+        glibc_tool: None,
+        glibc_loader: Vec::new(),
     }
 }
 

@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gang_config::{
-    CaPinSetting, ClientSecretSource, ConfigError, Document, FleetConfig, FleetMember,
-    FleetOptionsError, FleetOptionsTable, FleetPolicy, Fleets, GangConfig, InputLinks,
+    CaPinSetting, ClientSecretSource, ConfigError, Document, EndpointTrust, FleetConfig,
+    FleetMember, FleetOptionsError, FleetOptionsTable, FleetPolicy, Fleets, GangConfig, InputLinks,
     InstanceBounds, PluginSet, SandboxFile, SandboxFileError, SandboxSelection, SecretFileError,
     ServerTransport, Transport, WorkerConfig,
 };
@@ -320,6 +320,13 @@ impl AuthenticationSettings for WorkerAuthenticationConfig {
             Self::None(_) => &[],
         }
     }
+
+    fn enrollment_provider(&self) -> Option<&ProviderName> {
+        match self {
+            Self::Mtls(mtls) => Some(&mtls.provider),
+            Self::None(_) => None,
+        }
+    }
 }
 
 const TOP: &str = r#"
@@ -441,6 +448,7 @@ const TRANSPORT_SERVER: &str = r#"
 trust_domain = "gang.internal"
 handshake_timeout = "3s"
 max_pending_handshakes = 8
+refusal_linger = "3s"
 accept_error_backoff = "250ms"
 "#;
 
@@ -460,6 +468,12 @@ const ZERO_BACKOFF_SERVER: &str = r#"
 [server]
 trust_domain = "gang.internal"
 accept_error_backoff = "0s"
+"#;
+
+const ZERO_REFUSAL_LINGER_SERVER: &str = r#"
+[server]
+trust_domain = "gang.internal"
+refusal_linger = "0s"
 "#;
 
 const AUTHENTICATION: &str = r#"
@@ -791,6 +805,48 @@ fn parses_a_signer_ca_pin() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn system_endpoint_trust_rejects_pinned_workers_without_enrollment() -> Result<(), Box<dyn Error>> {
+    let error = Sections {
+        server: "[server]\ntrust_domain = \"gang.internal\"\nendpoint_trust = \"system\"\nca_pin = \"signer\"\n",
+        authentication: PLAINTEXT_AUTHENTICATION,
+        ..Sections::VALID
+    }
+    .parse()
+    .err()
+    .ok_or("accepted")?;
+
+    assert!(matches!(error, ConfigError::PinnedWorkersNeedAdvertisedCa));
+    Ok(())
+}
+
+#[test]
+fn system_endpoint_trust_accepts_enrolling_workers() -> Result<(), Box<dyn Error>> {
+    let config = Sections {
+        server: "[server]\ntrust_domain = \"gang.internal\"\nendpoint_trust = \"system\"\nca_pin = \"signer\"\n",
+        authentication: AUTHENTICATION,
+        ..Sections::VALID
+    }
+    .parse()?;
+
+    assert_eq!(config.server.endpoint_trust, EndpointTrust::System);
+    Ok(())
+}
+
+#[test]
+fn system_endpoint_trust_accepts_unpinned_workers() -> Result<(), Box<dyn Error>> {
+    let config = Sections {
+        server: "[server]\ntrust_domain = \"gang.internal\"\nendpoint_trust = \"system\"\n",
+        authentication: PLAINTEXT_AUTHENTICATION,
+        ..Sections::VALID
+    }
+    .parse()?;
+
+    assert_eq!(config.server.endpoint_trust, EndpointTrust::System);
+    assert!(config.server.ca_pin.is_none());
+    Ok(())
+}
+
+#[test]
 fn rejects_a_ca_pin_that_is_not_64_hex_characters() -> Result<(), Box<dyn Error>> {
     let pinned = SERVER.replace(
         "trust_domain = \"gang.internal\"\n",
@@ -830,6 +886,7 @@ fn parses_custom_server_transport_settings() -> Result<(), Box<dyn Error>> {
         NonZeroDuration::from_secs(3)
     );
     assert_eq!(config.server.max_pending_handshakes.get(), 8);
+    assert_eq!(config.server.refusal_linger, NonZeroDuration::from_secs(3));
     assert_eq!(
         config.server.accept_error_backoff,
         NonZeroDuration::from_millis(250)
@@ -855,6 +912,20 @@ fn rejects_a_zero_handshake_timeout() -> Result<(), Box<dyn Error>> {
 fn rejects_a_zero_accept_error_backoff() -> Result<(), Box<dyn Error>> {
     let error = Sections {
         server: ZERO_BACKOFF_SERVER,
+        ..Sections::VALID
+    }
+    .parse()
+    .err()
+    .ok_or("accepted")?;
+
+    assert!(matches!(error, ConfigError::Gang(_)));
+    Ok(())
+}
+
+#[test]
+fn rejects_a_zero_refusal_linger() -> Result<(), Box<dyn Error>> {
+    let error = Sections {
+        server: ZERO_REFUSAL_LINGER_SERVER,
         ..Sections::VALID
     }
     .parse()
@@ -1795,6 +1866,7 @@ fn server_and_worker_defaults_apply_when_sections_are_absent() -> Result<(), Box
         NonZeroDuration::from_secs(10)
     );
     assert_eq!(config.server.max_pending_handshakes.get(), 256);
+    assert_eq!(config.server.refusal_linger, NonZeroDuration::from_secs(2));
     assert_eq!(
         config.server.accept_error_backoff,
         NonZeroDuration::from_millis(100)

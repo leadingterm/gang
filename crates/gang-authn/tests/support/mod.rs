@@ -166,6 +166,7 @@ impl AuthenticationHost for TestHost {
         let certificate = CertificatePem::try_new(CERTIFICATE_PEM)
             .map_err(|error| PortError::backend(error.to_string()))?;
         Ok(IssuedCertificate {
+            ca_certificate: certificate.clone(),
             certificate,
             record: IssuedCertRecord {
                 serial,

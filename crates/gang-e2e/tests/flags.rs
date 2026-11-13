@@ -2,11 +2,11 @@
 
 use std::path::{Path, PathBuf};
 
-use gang_e2e::flags::{Remote, build_args, helper_path, startup_args};
-use gang_e2e::{ActionTools, Settings};
+use gang_e2e::flags::{RUN_DEFINE, Remote, build_args, helper_path, startup_args};
+use gang_e2e::{ActionTools, Probe, Run, Settings};
 
 const OUTPUT_ROOT: &str = "/state/bazel";
-const TARGET: &str = "//sample:probe_one";
+const TARGET: &str = "//:isolated";
 
 fn settings() -> Settings {
     Settings {
@@ -23,6 +23,8 @@ fn action_tools() -> ActionTools {
         shell: PathBuf::from("/nix/store/example-bash/bin/bash"),
         path: "/nix/store/example-coreutils/bin".to_owned(),
         bwrap: None,
+        glibc_tool: None,
+        glibc_loader: Vec::new(),
     }
 }
 
@@ -48,13 +50,13 @@ fn position(args: &[String], wanted: &str) -> usize {
     found.unwrap_or_default()
 }
 
-fn targets() -> Vec<String> {
-    vec![TARGET.to_owned(), "//sample:probe_two".to_owned()]
+fn probes() -> &'static [Probe] {
+    &[Probe::Isolated]
 }
 
 #[test]
 fn gang_build_passes_the_harness_flags() {
-    let args = build_args(&settings(), &action_tools(), &gang(), &targets());
+    let args = build_args(&settings(), &action_tools(), &gang(), probes(), None);
 
     assert!(args.contains(&"--shell_executable=/nix/store/example-bash/bin/bash".to_owned()));
     assert!(args.contains(&"--incompatible_strict_action_env".to_owned()));
@@ -65,7 +67,7 @@ fn gang_build_passes_the_harness_flags() {
 #[test]
 fn builds_do_not_pass_action_environment_flags() {
     for remote in [gang(), plain()] {
-        let args = build_args(&settings(), &action_tools(), &remote, &targets());
+        let args = build_args(&settings(), &action_tools(), &remote, probes(), None);
         assert!(
             args.iter()
                 .all(|argument| !argument.starts_with("--action_env"))
@@ -76,7 +78,7 @@ fn builds_do_not_pass_action_environment_flags() {
 #[test]
 fn every_build_asks_for_verbose_failures() {
     for remote in [gang(), plain()] {
-        let args = build_args(&settings(), &action_tools(), &remote, &targets());
+        let args = build_args(&settings(), &action_tools(), &remote, probes(), None);
 
         let verbose = position(&args, "--verbose_failures");
         assert!(
@@ -89,7 +91,7 @@ fn every_build_asks_for_verbose_failures() {
 #[test]
 fn every_build_keeps_going_after_a_failed_action() {
     for remote in [gang(), plain()] {
-        let args = build_args(&settings(), &action_tools(), &remote, &targets());
+        let args = build_args(&settings(), &action_tools(), &remote, probes(), None);
 
         assert!(
             args.contains(&"--keep_going".to_owned()),
@@ -100,7 +102,7 @@ fn every_build_keeps_going_after_a_failed_action() {
 
 #[test]
 fn extra_build_flags_sit_between_harness_flags_and_targets() {
-    let args = build_args(&settings(), &action_tools(), &gang(), &targets());
+    let args = build_args(&settings(), &action_tools(), &gang(), probes(), None);
 
     let extra = position(&args, "--extra_build_option");
     let harness = position(&args, "--incompatible_strict_action_env");
@@ -109,15 +111,44 @@ fn extra_build_flags_sit_between_harness_flags_and_targets() {
     assert!(harness < extra, "extra flags come after the harness flags");
     assert!(extra < first_target, "extra flags come before the targets");
     assert_eq!(
-        args[args.len() - targets().len()..],
-        targets()[..],
+        args[args.len() - probes().len()..],
+        [TARGET],
         "the targets are the last arguments"
     );
 }
 
 #[test]
+fn a_probe_build_flag_precedes_the_labels() {
+    let settings = settings();
+    let flag = "--experimental_sibling_repository_layout";
+    let args = build_args(
+        &settings,
+        &action_tools(),
+        &gang(),
+        &[Probe::Victim, Probe::InputRoot],
+        None,
+    );
+
+    assert_eq!(
+        args.iter()
+            .filter(|argument| argument.as_str() == flag)
+            .count(),
+        1
+    );
+    let flag_position = position(&args, flag);
+    for extra in &settings.bazel_flags {
+        assert!(position(&args, extra) < flag_position);
+    }
+    assert!(flag_position < position(&args, "//:victim"));
+    assert!(flag_position < position(&args, "//:input_root"));
+
+    let victim_args = build_args(&settings, &action_tools(), &gang(), &[Probe::Victim], None);
+    assert!(!victim_args.iter().any(|argument| argument == flag));
+}
+
+#[test]
 fn gang_build_names_no_executor_and_asks_the_credential_helper() {
-    let args = build_args(&settings(), &action_tools(), &gang(), &targets());
+    let args = build_args(&settings(), &action_tools(), &gang(), probes(), None);
 
     assert!(
         args.iter()
@@ -129,7 +160,7 @@ fn gang_build_names_no_executor_and_asks_the_credential_helper() {
 
 #[test]
 fn plain_build_names_no_executor_and_no_credential_helper() {
-    let args = build_args(&settings(), &action_tools(), &plain(), &targets());
+    let args = build_args(&settings(), &action_tools(), &plain(), probes(), None);
 
     assert!(args.iter().all(|argument| {
         !argument.starts_with("--remote_executor")
@@ -193,4 +224,18 @@ fn every_remote_ignores_host_and_workspace_rc_files() {
             );
         }
     }
+}
+
+#[test]
+fn only_a_held_build_defines_its_run() -> gang_e2e::Result<()> {
+    let run = Run::fresh()?;
+    let held = build_args(&settings(), &action_tools(), &gang(), probes(), Some(&run));
+    assert!(held.contains(&format!("--define={RUN_DEFINE}={run}")));
+    let plain = build_args(&settings(), &action_tools(), &gang(), probes(), None);
+    assert!(
+        !plain
+            .iter()
+            .any(|arg| arg.starts_with(&format!("--define={RUN_DEFINE}=")))
+    );
+    Ok(())
 }

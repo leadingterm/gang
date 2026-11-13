@@ -2,6 +2,8 @@
 //! revocation of unrelated serials.
 
 use std::io;
+use std::pin::Pin;
+use std::task::Poll;
 
 use gang_testkit::park_then_signal;
 use gang_types::CertSerial;
@@ -218,4 +220,72 @@ async fn serial_loaded_from_set_is_refused() {
     );
     let mut client_io = client_io.expect("TLS 1.3 client handshake completes before the rejection");
     assert!(client_io.read(&mut [0_u8; 1]).await.is_err());
+}
+
+async fn poll_once<F: Future>(mut future: Pin<&mut F>) -> Poll<F::Output> {
+    std::future::poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await
+}
+
+#[tokio::test(start_paused = true)]
+async fn reading_the_revoked_alert_raises_the_signal() {
+    let (fixture, client) = TransportFixture::with_revoked_client(40, "revoked");
+    let (client_io, server_io) = TransportFixture::pipe();
+    let (server_result, client_result) = tokio::join!(
+        fixture.acceptor().accept(server_io),
+        client
+            .connector
+            .connect(TransportFixture::server_name(), client_io),
+    );
+    assert!(server_result.is_err());
+
+    let alert = gang_tls::RevokedAlert::default();
+    let mut stream = alert.watch(client_result.expect(
+        "a TLS 1.3 client completes its handshake before the server verifies its certificate",
+    ));
+    let raised = alert.raised();
+    tokio::pin!(raised);
+    assert!(poll_once(raised.as_mut()).await.is_pending());
+
+    stream
+        .read(&mut [0_u8; 1])
+        .await
+        .expect_err("the revoked certificate alert fails the read");
+    let Poll::Ready(revoked) = poll_once(raised.as_mut()).await else {
+        panic!("the revoked certificate alert raises the signal");
+    };
+    assert!(matches!(
+        std::error::Error::source(&revoked)
+            .and_then(|source| source.downcast_ref::<rustls::Error>()),
+        Some(rustls::Error::AlertReceived(
+            rustls::AlertDescription::CertificateRevoked
+        ))
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn another_refusal_does_not_raise_the_signal() {
+    let fixture = TransportFixture::new();
+    let client = fixture.foreign_client(41, "foreign");
+    let (client_io, server_io) = TransportFixture::pipe();
+    let (server_result, client_result) = tokio::join!(
+        fixture.acceptor().accept(server_io),
+        client
+            .connector
+            .connect(TransportFixture::server_name(), client_io),
+    );
+    assert!(server_result.is_err());
+
+    let alert = gang_tls::RevokedAlert::default();
+    let mut stream = alert.watch(client_result.expect(
+        "a TLS 1.3 client completes its handshake before the server verifies its certificate",
+    ));
+    let raised = alert.raised();
+    tokio::pin!(raised);
+    assert!(poll_once(raised.as_mut()).await.is_pending());
+
+    stream
+        .read(&mut [0_u8; 1])
+        .await
+        .expect_err("the untrusted certificate alert fails the read");
+    assert!(poll_once(raised.as_mut()).await.is_pending());
 }

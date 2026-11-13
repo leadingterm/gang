@@ -1,0 +1,23 @@
+name: Save the Bazel disk cache
+description: >-
+  Save the Bazel disk cache that .github/actions/setup-ci restored and the job's Bazel commands filled.
+  After a successful job the entries it did not use are dropped first, so the saved cache is the job's
+  working set; a failed or timed-out job saves without dropping, so a cold run's progress carries over.
+  Saves nothing when setup-ci decided the job does not save: a fork's pull request, or a run that
+  restored its own key exactly.
+inputs:
+  prune:
+    description: Drop the entries this job did not use. Pass true only when every Bazel step of the job succeeded.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Drop the entries this job did not use
+      if: env.BAZEL_DISK_CACHE_SAVE == 'true' && inputs.prune == 'true'
+      shell: bash
+      run: find "$BAZEL_DISK_CACHE" -type f ! -newer "$BAZEL_DISK_CACHE_EPOCH" -delete
+    - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      if: env.BAZEL_DISK_CACHE_SAVE == 'true'
+      with:
+        path: ${{ env.BAZEL_DISK_CACHE }}
+        key: ${{ env.BAZEL_DISK_CACHE_KEY }}

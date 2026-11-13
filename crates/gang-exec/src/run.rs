@@ -7,13 +7,13 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 
-use gang_config::{InputLinks, PluginSet, SandboxFile};
+use gang_config::{PluginSet, SandboxFile};
 use gang_spi::{
     ActionCommand, ActionExecutionSpec, ActionIsolationPort, ActionLimitsPort, GUARD_LINK_NAME,
     PluginContext, PortError,
 };
 
-use crate::action_directory::action_directory;
+use crate::action_directory::ActionDirectory;
 use crate::errors::ExecError;
 use crate::execute::{Action, execute, exit_status};
 use crate::properties::ActionProperties;
@@ -92,12 +92,13 @@ where
 /// Runs the action in `invocation` as `gang exec` does and returns its exit status.
 ///
 /// Steps, in order: reject an empty command; reject a relative entrypoint; read the sandbox file
-/// beside the entrypoint; read the action properties from the environment; when the file breaks
-/// input links, resolve the action directory under the work directory the file records; build
-/// the sandbox and, when the file has limits, the limits plugin; then run the action on a
-/// dedicated current-thread runtime. Hard-link breaking happens inside that runtime, before the
-/// sandbox starts. The single runtime thread is deliberate: nothing else runs before the sandbox,
-/// so per-action startup stays minimal.
+/// beside the entrypoint; read the action properties from the environment; resolve the action
+/// directory and the working directory inside it under the work directory the file records,
+/// rejecting a working directory outside it; the sandbox gets both, so it can expose the whole
+/// action directory; build the sandbox and, when the file has limits, the limits plugin; then run
+/// the action on a dedicated current-thread runtime. Hard-link breaking happens inside that
+/// runtime, before the sandbox starts. The single runtime thread is deliberate: nothing else runs
+/// before the sandbox, so per-action startup stays minimal.
 ///
 /// Termination signals are handled for the whole run on that runtime. `leave_action_group` is
 /// chosen by the caller and runs once an action that shares the process group of `gang exec`
@@ -154,13 +155,7 @@ where
     let path = SandboxFile::<P>::beside(invocation.entrypoint);
     let file = read_sandbox_file::<P>(&path)?;
     let properties = ActionProperties::from_environment(invocation.environment)?;
-    let link_root = match file.execution.input_links {
-        InputLinks::Break => Some(action_directory(
-            &file.work_directory,
-            invocation.working_directory,
-        )?),
-        InputLinks::Keep => None,
-    };
+    let directory = ActionDirectory::try_new(&file.work_directory, invocation.working_directory)?;
     let context = PluginContext { config_path: &path };
 
     let sandbox =
@@ -178,7 +173,8 @@ where
         spec: ActionExecutionSpec {
             command,
             environment: invocation.environment,
-            working_directory: invocation.working_directory,
+            action_directory: &directory.path,
+            working_directory: &directory.working_directory,
             network: properties.network,
             launcher: &[],
         },
@@ -193,7 +189,7 @@ where
         execute(
             &sandbox,
             limits.as_ref(),
-            link_root.as_deref(),
+            file.execution.input_links,
             &action,
             &mut terminations,
             leave_action_group,

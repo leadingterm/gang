@@ -107,6 +107,7 @@ impl<K: Stack> AuthenticationHost for Host<K> {
             .map_err(certificate_failure)?;
         Ok(IssuedCertificate {
             certificate: issued.certificate,
+            ca_certificate: authority.certificate().clone(),
             record: IssuedCertRecord {
                 serial: issued.serial,
                 identity: request.identity.clone(),

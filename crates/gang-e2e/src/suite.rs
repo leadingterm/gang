@@ -24,6 +24,8 @@ use crate::drain_cancel::drain_cancel;
 use crate::errors::Result;
 use crate::execution::ExecutionKnobs;
 use crate::fleets::fleets;
+use crate::glibc_toolchain::glibc_toolchain;
+use crate::input_root::input_root;
 use crate::integrity::input_integrity;
 use crate::issuer::TestIssuer;
 use crate::lifecycle::lifecycle;
@@ -158,6 +160,12 @@ gang_types::string_enum! {
         /// A bwrap action sees no worker environment, a fresh /tmp and read-only binds, runs in
         /// its own scope, and an out-of-memory kill is cleaned up.
         SandboxContract = "sandbox-contract",
+        /// An action whose command runs below its input root reads an input beside its working
+        /// directory, directly and through a relative symlink.
+        InputRoot = "input-root",
+        /// A dynamically linked glibc program, as the toolchains Bazel downloads are, runs inside the
+        /// bwrap sandbox.
+        GlibcToolchain = "glibc-toolchain",
         /// The scope and stray process of a SIGKILLed `gang exec` are swept by the next action,
         /// and a dead worker's are gone before its replacement serves.
         StaleScope = "stale-scope",
@@ -233,6 +241,8 @@ impl Scenario {
             | Self::ActionTimeout
             | Self::ActionTimeoutNoop
             | Self::SandboxContract
+            | Self::InputRoot
+            | Self::GlibcToolchain
             | Self::StaleScope
             | Self::MemoryEscalation
             | Self::UnplaceableDisk
@@ -333,6 +343,7 @@ impl Scenario {
             }),
             Self::Network => network_checks(ctx),
             Self::InputIntegrity => input_integrity_checks(ctx),
+            Self::InputRoot => input_root_checks(ctx),
             Self::Restart => restart_checks(ctx),
             Self::Limits => limits_checks(ctx),
             Self::Memory => memory_checks(ctx),
@@ -351,6 +362,7 @@ impl Scenario {
             Self::ActionTimeout => execution_checks(ctx, ExecutionScenario::ActionTimeout),
             Self::ActionTimeoutNoop => execution_checks(ctx, ExecutionScenario::ActionTimeoutNoop),
             Self::SandboxContract => execution_checks(ctx, ExecutionScenario::SandboxContract),
+            Self::GlibcToolchain => glibc_toolchain_checks(ctx),
             Self::StaleScope => execution_checks(ctx, ExecutionScenario::StaleScope),
             Self::MemoryEscalation => execution_checks(ctx, ExecutionScenario::MemoryEscalation),
             Self::UnplaceableDisk => execution_checks(ctx, ExecutionScenario::UnplaceableDisk),
@@ -443,6 +455,21 @@ fn network_checks(ctx: &RunContext<'_>) -> Vec<Check> {
     }
 }
 
+/// The verdicts of the glibc toolchain scenario, or one skipped check where the sandbox is the host.
+fn glibc_toolchain_checks(ctx: &RunContext<'_>) -> Vec<Check> {
+    match ctx.sandbox {
+        Sandbox::Bwrap => attempt(Scenario::GlibcToolchain, || {
+            ctx.invocation.action_tools.glibc_tool_program()?;
+            let stack = Stack::create(ctx.invocation, &ctx.baseline, Transport::Tls, ctx.issuer)?;
+            glibc_toolchain(&stack)
+        }),
+        Sandbox::Noop => vec![Check::skipped(
+            names::glibc_toolchain::TOOL_RUNS,
+            "the noop sandbox runs actions on the host, whose own loader starts the program",
+        )],
+    }
+}
+
 /// The verdicts of the input integrity scenario, on one deployment that breaks input links and
 /// one that keeps them.
 fn input_integrity_checks(ctx: &RunContext<'_>) -> Vec<Check> {
@@ -461,6 +488,14 @@ fn input_integrity_checks(ctx: &RunContext<'_>) -> Vec<Check> {
         ));
     }
     checks
+}
+
+/// The verdicts of the input root scenario, on the baseline deployment.
+fn input_root_checks(ctx: &RunContext<'_>) -> Vec<Check> {
+    attempt(Scenario::InputRoot, || {
+        let stack = Stack::create(ctx.invocation, &ctx.baseline, Transport::Tls, ctx.issuer)?;
+        input_root(&stack, &ctx.baseline)
+    })
 }
 
 /// The verdicts of the limits scenario, or one skipped check where the platform has no cgroups.
@@ -803,6 +838,7 @@ mod tests {
     #[test]
     fn scenario_names_are_kebab_case() {
         assert_eq!(Scenario::InputIntegrity.to_string(), "input-integrity");
+        assert_eq!(Scenario::InputRoot.to_string(), "input-root");
         assert_eq!(Scenario::Lifecycle.to_string(), "lifecycle");
         assert_eq!(Scenario::Revocation.to_string(), "revocation");
     }

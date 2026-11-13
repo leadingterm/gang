@@ -34,27 +34,19 @@
 //! ```
 
 use std::error::Error;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use gang_clock::Clock;
 use gang_types::{AccessToken, NonZeroBytes, NonZeroDuration, Url};
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
-use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::{Connected, Connection, HttpConnector};
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use rustls_pki_types::ServerName;
-use tokio::net::TcpStream;
-use tokio_rustls::client::TlsStream;
-use tower::Service;
+use hyper_util::rt::TokioExecutor;
 
-use crate::acceptor::ALPN_H2;
-use crate::{Alpn, ConnectorSettings, ServerTrust, TlsConnector, TransportError};
+use crate::{Alpn, ConnectorSettings, Dialer, ServerTrust, TlsConnector, TransportError};
 
 /// How a client reaches servers.
 pub enum HttpTransport<'a> {
@@ -217,119 +209,9 @@ pub enum HttpError {
     TimedOut,
 }
 
-type BoxError = Box<dyn Error + Send + Sync>;
-
-/// A connection to a server, over TCP or over TLS.
-enum Stream {
-    Plain(TcpStream),
-    Tls(Box<TlsStream<TcpStream>>),
-}
-
-impl tokio::io::AsyncRead for Stream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
-            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
-        }
-    }
-}
-
-impl tokio::io::AsyncWrite for Stream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        match self.get_mut() {
-            Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
-            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
-            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
-            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
-        }
-    }
-}
-
-impl Connection for Stream {
-    fn connected(&self) -> Connected {
-        match self {
-            Self::Plain(_) => Connected::new(),
-            Self::Tls(stream) => {
-                let connected = Connected::new();
-                if stream.get_ref().1.alpn_protocol() == Some(ALPN_H2) {
-                    connected.negotiated_h2()
-                } else {
-                    connected
-                }
-            }
-        }
-    }
-}
-
-/// Opens connections: TCP, then TLS when a connector is configured for `https` URIs.
-#[derive(Clone)]
-struct Connector {
-    http: HttpConnector,
-    tls: Option<TlsConnector>,
-}
-
-type ConnectFuture = Pin<Box<dyn Future<Output = Result<TokioIo<Stream>, BoxError>> + Send>>;
-
-impl Service<Uri> for Connector {
-    type Response = TokioIo<Stream>;
-    type Error = BoxError;
-    type Future = ConnectFuture;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.http.poll_ready(cx).map_err(Into::into)
-    }
-
-    fn call(&mut self, uri: Uri) -> Self::Future {
-        Box::pin(connect(self.http.clone(), self.tls.clone(), uri))
-    }
-}
-
-/// Connects TCP to `uri`, then runs TLS when `tls` is set.
-/// [`HttpClient::prepare`] has checked that the URL scheme is the one the transport serves.
-async fn connect(
-    mut http: HttpConnector,
-    tls: Option<TlsConnector>,
-    uri: Uri,
-) -> Result<TokioIo<Stream>, BoxError> {
-    let tcp = Service::call(&mut http, uri.clone()).await?.into_inner();
-    let stream = match tls {
-        Some(tls) => {
-            let host = uri.host().ok_or("uri has no host")?;
-            let host = host
-                .strip_prefix('[')
-                .and_then(|inner| inner.strip_suffix(']'))
-                .unwrap_or(host);
-            let name = ServerName::try_from(host.to_owned())?;
-            Stream::Tls(Box::new(tls.connect(name, tcp).await?))
-        }
-        None => Stream::Plain(tcp),
-    };
-    Ok(TokioIo::new(stream))
-}
-
 /// A client that sends requests over plain HTTP or HTTPS.
 pub struct HttpClient {
-    client: Client<Connector, Full<Bytes>>,
+    client: Client<Dialer, Full<Bytes>>,
     /// The scheme the transport serves; requests to any other scheme are refused.
     scheme: HttpScheme,
     timeout: NonZeroDuration,
@@ -362,12 +244,9 @@ impl HttpClient {
                 Some(connector)
             }
         };
-        let mut http = HttpConnector::new();
-        http.enforce_http(false);
-        http.set_nodelay(true);
         let client = Client::builder(TokioExecutor::new())
             .http2_only(settings.protocol == HttpProtocol::Http2)
-            .build::<_, Full<Bytes>>(Connector { http, tls });
+            .build::<_, Full<Bytes>>(Dialer::new(tls));
         Ok(Self {
             client,
             scheme: settings.transport.scheme(),

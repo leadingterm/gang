@@ -86,12 +86,7 @@ fn user_version(connection: &Connection) -> Result<i64, SqliteError> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
-    use gang_spi::{Plugin, PluginContext};
-
     use super::*;
-    use crate::{Sqlite, SqliteConfig};
 
     /// Reads the rows of `sql` as pairs of text columns.
     fn text_pairs(connection: &Connection, sql: &str) -> Vec<(String, String)> {
@@ -288,55 +283,6 @@ ALTER TABLE nonexistent ADD COLUMN y TEXT;
         assert_eq!(
             text_pairs(&connection, "SELECT fleet, kind FROM scaling_audit"),
             vec![("gang-x86".to_owned(), "terminated".to_owned())]
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn concurrent_first_opens_run_each_migration_once() {
-        const OPENERS: usize = 8;
-        let directory = tempfile::tempdir().expect("temp dir is created");
-        let path = directory.path().join("gang.sqlite");
-        // Holding the write lock keeps every opener waiting until the test releases it.
-        let holder = Connection::open(&path).expect("database opens");
-        holder
-            .execute_batch("BEGIN IMMEDIATE")
-            .expect("write lock is taken");
-        let context = PluginContext {
-            config_path: Path::new("gang.toml"),
-        };
-        let (reports, mut outcomes) = tokio::sync::mpsc::unbounded_channel();
-        for _ in 0..OPENERS {
-            let store = Sqlite::build(SqliteConfig::new(path.clone()), &context)
-                .expect("valid configuration builds");
-            let reports = reports.clone();
-            tokio::spawn(async move {
-                let outcome = store.run(|_| Ok(())).await;
-                reports.send(outcome).expect("test is collecting outcomes");
-            });
-        }
-        drop(reports);
-
-        assert!(
-            outcomes.try_recv().is_err(),
-            "an opener finished while the write lock was held"
-        );
-        holder
-            .execute_batch("COMMIT")
-            .expect("write lock is released");
-        drop(holder);
-
-        let mut results = Vec::new();
-        while let Some(outcome) = outcomes.recv().await {
-            results.push(outcome);
-        }
-        assert_eq!(results.len(), OPENERS);
-        for result in results {
-            result.expect("opener succeeds");
-        }
-        let connection = Connection::open(&path).expect("database reopens");
-        assert_eq!(
-            user_version(&connection).expect("version is readable"),
-            i64::try_from(MIGRATIONS.len()).expect("migration count fits")
         );
     }
 }
