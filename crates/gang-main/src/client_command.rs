@@ -4,7 +4,7 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
-use gang_client::{Client, ClientHome, InteractiveLogin, LoggedIn, WorkloadLogin};
+use gang_client::{Client, ClientHome, InteractiveLogin, LocalBrowser, LoggedIn, WorkloadLogin};
 use gang_clock::{Clock, SystemClock, Timestamp};
 use gang_types::CertSerial;
 use gang_wire::{Certificate, RevokePrincipalResponse, name};
@@ -50,6 +50,7 @@ pub(crate) fn login(args: LoginArgs, out: &Output) -> Result<ExitCode> {
                 server: &server,
                 provider: provider.as_ref(),
                 ca_pin: ca_pin.as_ref(),
+                browser: LocalBrowser::detect(|name| std::env::var_os(name)),
             }))?
         }
         LoginMode::Workload {

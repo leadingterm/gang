@@ -40,7 +40,7 @@ resolver = "2"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
-version = "0.1.2"
+version = "0.1.3"
 
 [workspace.lints.rust]
 missing_docs = "deny"
@@ -215,6 +215,7 @@ rcgen = { default-features = false, features = [
     "pem",
     "ring",
 ], version = "0.14" }
+ring = { default-features = false, features = ["alloc"], version = "0.17" }
 rusqlite = { features = [
     "bundled",
 ], version = "0.40" }

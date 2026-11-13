@@ -13,6 +13,7 @@ use parking_lot::Mutex;
 
 use crate::access::{IdentityKnobs, identity};
 use crate::admission::{cold_start_misfit, memory_escalation, oversized_fleet, unplaceable_disk};
+use crate::browser::sessions;
 use crate::check::{Check, Report};
 use crate::checked_in::{ShippedConfigs, checked_in_configs};
 use crate::cli::cli;
@@ -226,6 +227,9 @@ gang_types::string_enum! {
         /// how the dashboard signs a browser in, how a revoked worker certificate is cut off, and
         /// that a revocation survives a restart. Gate two only.
         Identity = "identity",
+        /// A signed-in browser renews silently until the absolute lifetime, then signs in without
+        /// consent; revocation, logout and a suspended account end renewal. Gate two only.
+        Sessions = "sessions",
     }
 }
 
@@ -267,7 +271,8 @@ impl Scenario {
             | Self::RequestLimits
             | Self::ViewerCap
             | Self::CertificateRotation
-            | Self::Identity => Gate::Two,
+            | Self::Identity
+            | Self::Sessions => Gate::Two,
         }
     }
 }
@@ -437,8 +442,21 @@ impl Scenario {
                 let secured = Secured::create(ctx.invocation, &variant, ctx.issuer)?;
                 identity(&secured)
             }),
+            Self::Sessions => sessions_checks(ctx),
         }
     }
+}
+
+/// The verdicts of the browser sessions scenario on a short-lived deployment.
+fn sessions_checks(ctx: &RunContext<'_>) -> Vec<Check> {
+    attempt(Scenario::Sessions, || {
+        let variant = Variant {
+            identity: IdentityKnobs::SESSIONS,
+            ..ctx.baseline
+        };
+        let secured = Secured::create(ctx.invocation, &variant, ctx.issuer)?;
+        sessions(&secured, ctx.invocation.settings.history_timeout)
+    })
 }
 
 /// The verdicts of the network scenario, or one skipped check where the sandbox does not isolate.
@@ -861,6 +879,7 @@ mod tests {
         assert_eq!(Scenario::InputRoot.to_string(), "input-root");
         assert_eq!(Scenario::Lifecycle.to_string(), "lifecycle");
         assert_eq!(Scenario::Revocation.to_string(), "revocation");
+        assert_eq!(Scenario::Sessions.to_string(), "sessions");
     }
 
     #[test]
@@ -906,6 +925,7 @@ mod tests {
             Scenario::ViewerCap,
             Scenario::CertificateRotation,
             Scenario::Identity,
+            Scenario::Sessions,
         ];
         for scenario in gate_two_only {
             assert!(!runs.contains(&scenario), "{scenario}");

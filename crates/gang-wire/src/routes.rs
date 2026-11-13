@@ -17,6 +17,15 @@ pub const CALLBACK_PATH: &str = "/ui/callback";
 /// Path that ends a browser session.
 pub const LOGOUT_PATH: &str = "/ui/logout";
 
+/// Path that renews a browser session from its renewal cookie.
+pub const RENEW_PATH: &str = "/ui/renew";
+
+/// Approves a device login (POST); GET is the dashboard page.
+pub const DEVICE_PATH: &str = "/ui/device";
+
+/// Dashboard page a device approval lands on, not a server route.
+pub const DEVICE_APPROVED_PATH: &str = "/ui/device/approved";
+
 /// A `/ui` path the server answers itself, whether or not its feature is mounted. The
 /// dashboard serves every other `/ui` path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,11 +36,21 @@ pub enum UiRoute {
     Callback,
     /// Ends a browser session.
     Logout,
+    /// Renews a browser session.
+    Renew,
+    /// Approves a device login (POST); GET is the dashboard page.
+    Device,
 }
 
 impl UiRoute {
     /// Every server-owned dashboard path.
-    pub const ALL: [Self; 3] = [Self::Login, Self::Callback, Self::Logout];
+    pub const ALL: [Self; 5] = [
+        Self::Login,
+        Self::Callback,
+        Self::Logout,
+        Self::Renew,
+        Self::Device,
+    ];
 
     /// The path owned by this route.
     #[must_use]
@@ -40,6 +59,8 @@ impl UiRoute {
             Self::Login => LOGIN_PATH,
             Self::Callback => CALLBACK_PATH,
             Self::Logout => LOGOUT_PATH,
+            Self::Renew => RENEW_PATH,
+            Self::Device => DEVICE_PATH,
         }
     }
 
@@ -251,6 +272,41 @@ routes! {
         rate_limited: true,
     };
 
+    /// Starts a device login. Open, mounted only with device login.
+    CREATE_DEVICE_AUTHORIZATION = CreateDeviceAuthorization {
+        method: Method::Post,
+        template: "/v1/deviceAuthorizations",
+        permission: None,
+        request: None,
+        response: "DeviceAuthorization",
+        cookie: false,
+        rate_limited: true,
+    };
+
+    /// Retrieves a device authorization.
+    GET_DEVICE_AUTHORIZATION = GetDeviceAuthorization {
+        method: Method::Get,
+        template: "/v1/deviceAuthorizations/{deviceAuthorization}",
+        collection: name::DeviceAuthorizations,
+        permission: None,
+        request: None,
+        response: "DeviceAuthorization",
+        cookie: false,
+        rate_limited: true,
+    };
+
+    /// Redeems an approved device authorization.
+    REDEEM_DEVICE_AUTHORIZATION = RedeemDeviceAuthorization {
+        method: Method::Post,
+        template: "/v1/deviceAuthorizations/{deviceAuthorization}:redeem",
+        collection: name::DeviceAuthorizations,
+        permission: None,
+        request: Some("RedeemDeviceAuthorizationRequest"),
+        response: "AuthenticateResponse",
+        cookie: false,
+        rate_limited: true,
+    };
+
     /// `POST /v1/certificates`: issues a worker certificate for a signing request. Open,
     /// mounted only if the worker plugin offers certificates.
     CREATE_CERTIFICATE = CreateCertificate {
@@ -400,11 +456,45 @@ mod tests {
 
     #[test]
     fn ui_routes_match_only_server_owned_paths() {
+        assert_eq!(UiRoute::of(RENEW_PATH), Some(UiRoute::Renew));
+        assert_eq!(UiRoute::of(DEVICE_PATH), Some(UiRoute::Device));
+        assert_eq!(UiRoute::of(DEVICE_APPROVED_PATH), None);
         for route in UiRoute::ALL {
             assert_eq!(UiRoute::of(route.path()), Some(route));
         }
         for path in [ERROR_PATH, "/ui", "/ui/login/x"] {
             assert_eq!(UiRoute::of(path), None);
+        }
+    }
+
+    #[test]
+    fn device_routes_match_and_are_open_and_rate_limited() {
+        for (method, path, id, raw) in [
+            (
+                Method::Post,
+                "/v1/deviceAuthorizations",
+                RouteId::CreateDeviceAuthorization,
+                None,
+            ),
+            (
+                Method::Get,
+                "/v1/deviceAuthorizations/BCDF-GHJK",
+                RouteId::GetDeviceAuthorization,
+                Some("BCDF-GHJK"),
+            ),
+            (
+                Method::Post,
+                "/v1/deviceAuthorizations/BCDF-GHJK:redeem",
+                RouteId::RedeemDeviceAuthorization,
+                Some("BCDF-GHJK"),
+            ),
+        ] {
+            let (route, matched) = lookup(method, path).expect("device route matches");
+            assert_eq!(route.id, id);
+            assert_eq!(matched, raw);
+            assert_eq!(route.permission, None);
+            assert!(!route.cookie);
+            assert!(route.rate_limited);
         }
     }
 
@@ -576,6 +666,12 @@ mod tests {
             [
                 ("/v1/server", None),
                 ("/v1/session:authenticate", None),
+                ("/v1/deviceAuthorizations", None),
+                ("/v1/deviceAuthorizations/{deviceAuthorization}", None),
+                (
+                    "/v1/deviceAuthorizations/{deviceAuthorization}:redeem",
+                    None
+                ),
                 ("/v1/certificates", None),
                 (
                     "/v1/certificates/{certificate}:revoke",
@@ -601,18 +697,27 @@ mod tests {
 
     #[test]
     fn browser_flow_paths_live_under_ui() {
-        for path in [LOGIN_PATH, CALLBACK_PATH, LOGOUT_PATH, ERROR_PATH] {
+        for path in [
+            LOGIN_PATH,
+            CALLBACK_PATH,
+            LOGOUT_PATH,
+            RENEW_PATH,
+            ERROR_PATH,
+        ] {
             assert!(path.starts_with("/ui/"), "{path}");
             assert!(lookup(Method::Get, path).is_none(), "{path}");
         }
     }
 
     #[test]
-    fn placeholders_only_appear_on_principal_and_certificate_routes() {
+    fn placeholders_only_appear_on_item_routes() {
         for route in ROUTES.iter().filter(|route| route.template.contains('{')) {
             assert!(
                 route.template.starts_with("/v1/principals/")
-                    || route.template.starts_with("/v1/certificates/"),
+                    || route.template.starts_with("/v1/certificates/")
+                    || route
+                        .template
+                        .starts_with("/v1/deviceAuthorizations/{deviceAuthorization}"),
                 "{}",
                 route.template
             );

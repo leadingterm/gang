@@ -9,6 +9,11 @@ use gang_wire::CookieNames;
 use http::HeaderMap;
 use http::header::{COOKIE, HeaderValue};
 
+/// The longest cookie lifetime browsers keep (RFC 6265bis caps Max-Age at 400 days): the renewal
+/// cookie outlives `session_max_age` so the sign-in after it asks no consent; the sealed
+/// `expire_time` alone bounds renewal (ADR-39).
+const RENEWAL_COOKIE_MAX_AGE: Duration = Duration::from_hours(400 * 24);
+
 /// A cookie value or formatted header is invalid.
 #[derive(Debug, thiserror::Error)]
 #[error("invalid cookie value or header")]
@@ -39,6 +44,8 @@ pub(crate) struct SessionCookies {
     pub(crate) session: &'static str,
     /// Name of the cookie that carries the browser sign-in.
     pub(crate) login: &'static str,
+    /// Name of the cookie that carries the sealed renewal.
+    pub(crate) renewal: &'static str,
     /// Whether the cookies are set with the `Secure` attribute.
     pub(crate) secure: bool,
 }
@@ -53,6 +60,7 @@ impl SessionCookies {
         Self {
             session: names.session,
             login: names.login,
+            renewal: names.renewal,
             secure,
         }
     }
@@ -91,6 +99,21 @@ impl SessionCookies {
         max_age: Duration,
     ) -> Result<HeaderValue, InvalidCookieValue> {
         self.attributes(self.login, state, SameSite::Lax, max_age)
+    }
+
+    /// The sealed renewal cookie, retained beyond the sealed renewal's expiry.
+    pub(crate) fn renewal_header(&self, sealed: &str) -> Result<HeaderValue, InvalidCookieValue> {
+        self.attributes(
+            self.renewal,
+            sealed,
+            SameSite::Strict,
+            RENEWAL_COOKIE_MAX_AGE,
+        )
+    }
+
+    /// The header that clears the renewal cookie.
+    pub(crate) fn clear_renewal_header(&self) -> Result<HeaderValue, InvalidCookieValue> {
+        self.attributes(self.renewal, "", SameSite::Strict, Duration::ZERO)
     }
 
     /// The `Set-Cookie` header that clears the session cookie.

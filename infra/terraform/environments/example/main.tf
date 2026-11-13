@@ -103,6 +103,9 @@ module "gang" {
     # The native-app client secret is not confidential (RFC 8252): every CLI receives it, so it may stay in the public configuration.
     client_secret = "GOCSPX-example"
     scopes = ["openid", "email"]
+
+    # Sent only on logins that must yield a refresh token (ADR-38). Clients must be upgraded before this table is set: older clients reject unknown login keys.
+    [identity.providers.google.oidc.login.offline]
     authorization_params = { access_type = "offline", prompt = "consent" }
 
     # The dashboard's confidential web client: its secret lives in a SecureString parameter, never in this public configuration.

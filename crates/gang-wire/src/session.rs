@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use gang_clock::Timestamp;
-use gang_types::{AccessToken, Proof, ProviderName};
+use gang_types::{AccessToken, Proof, ProviderName, RefreshToken};
 use serde::{Deserialize, Serialize};
 
 use crate::Permission;
@@ -12,10 +12,14 @@ use crate::Permission;
 const SECURE_SESSION: &str = "__Host-gang_session";
 /// Name of the sign-in cookie on HTTPS.
 const SECURE_LOGIN: &str = "__Host-gang_login";
+/// Name of the renewal cookie on HTTPS.
+const SECURE_RENEWAL: &str = "__Host-gang_renewal";
 /// Name of the session cookie on HTTP.
 const PLAIN_SESSION: &str = "gang_session";
 /// Name of the sign-in cookie on HTTP.
 const PLAIN_LOGIN: &str = "gang_login";
+/// Name of the renewal cookie on HTTP.
+const PLAIN_RENEWAL: &str = "gang_renewal";
 
 /// The names of the browser cookies of a session on one endpoint. On `https` they carry the
 /// `__Host-` prefix, which binds them to the host and the path `/`.
@@ -25,6 +29,8 @@ pub struct CookieNames {
     pub session: &'static str,
     /// The sign-in cookie, alive between the login redirect and the callback.
     pub login: &'static str,
+    /// The renewal cookie: the sealed refresh token of a browser sign-in (ADR-39).
+    pub renewal: &'static str,
 }
 
 impl CookieNames {
@@ -35,27 +41,85 @@ impl CookieNames {
             Self {
                 session: SECURE_SESSION,
                 login: SECURE_LOGIN,
+                renewal: SECURE_RENEWAL,
             }
         } else {
             Self {
                 session: PLAIN_SESSION,
                 login: PLAIN_LOGIN,
+                renewal: PLAIN_RENEWAL,
             }
         }
     }
 }
 
+/// What `POST /v1/session:authenticate` exchanges: exactly one of `proof` and `refreshToken`.
+#[derive(gang_macros::Known, Debug, Clone)]
+pub enum Credential {
+    /// A proof of identity issued by the provider.
+    Proof(Proof),
+    /// A refresh token of the device-login provider's web client (ADR-37); the server renews it.
+    RefreshToken(RefreshToken),
+}
+
 /// Body of `POST /v1/session:authenticate`.
-///
-/// The caller sends a proof of identity from the named identity provider and receives a bearer
-/// token to present on the client surface.
 #[derive(gang_macros::Known, Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(try_from = "RawAuthenticateRequest", into = "RawAuthenticateRequest")]
 pub struct AuthenticateRequest {
     /// Identity provider that vouches for the caller.
     pub provider: ProviderName,
-    /// Proof of identity issued by `provider`.
-    pub proof: Proof,
+    /// The credential exchanged for a bearer token.
+    pub credential: Credential,
+}
+
+/// The wire representation before enforcing the credential oneof.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawAuthenticateRequest {
+    /// Identity provider that vouches for the caller.
+    provider: ProviderName,
+    /// Provider-issued proof, when using proof authentication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proof: Option<Proof>,
+    /// Provider refresh token, when renewing a device login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refresh_token: Option<RefreshToken>,
+}
+
+impl TryFrom<RawAuthenticateRequest> for AuthenticateRequest {
+    type Error = &'static str;
+
+    fn try_from(raw: RawAuthenticateRequest) -> Result<Self, Self::Error> {
+        let credential = match (raw.proof, raw.refresh_token) {
+            (Some(proof), None) => Credential::Proof(proof),
+            (None, Some(token)) => Credential::RefreshToken(token),
+            _ => return Err("exactly one of proof and refreshToken"),
+        };
+        Ok(Self {
+            provider: raw.provider,
+            credential,
+        })
+    }
+}
+
+impl From<AuthenticateRequest> for RawAuthenticateRequest {
+    fn from(request: AuthenticateRequest) -> Self {
+        let (proof, refresh_token) = match request.credential {
+            Credential::Proof(proof) => (Some(proof), None),
+            Credential::RefreshToken(token) => (None, Some(token)),
+        };
+        Self {
+            provider: request.provider,
+            proof,
+            refresh_token,
+        }
+    }
+}
+
+impl crate::Known for RefreshToken {
+    fn is_known(&self) -> bool {
+        true
+    }
 }
 
 /// Body of a successful `POST /v1/session:authenticate`.
@@ -67,6 +131,10 @@ pub struct AuthenticateResponse {
     /// Lifetime of the token from issue. It is relative, so client clock skew does not matter.
     #[serde(with = "crate::duration")]
     pub lifetime: Duration,
+    /// The provider's rotated refresh token, after a `refreshToken` exchange that rotated it;
+    /// the caller stores it before the token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<RefreshToken>,
 }
 
 /// The caller's session, the body of `GET /v1/session`.
@@ -117,26 +185,47 @@ mod tests {
         let secure = CookieNames::for_https(true);
         assert_eq!(secure.session, "__Host-gang_session");
         assert_eq!(secure.login, "__Host-gang_login");
+        assert_eq!(secure.renewal, "__Host-gang_renewal");
         let plain = CookieNames::for_https(false);
         assert_eq!(plain.session, "gang_session");
         assert_eq!(plain.login, "gang_login");
+        assert_eq!(plain.renewal, "gang_renewal");
     }
 
     #[test]
-    fn authenticate_request_parses_and_round_trips_exactly() {
-        let value = json!({"provider": "okta", "proof": "tok-123"});
-        let request: AuthenticateRequest =
-            serde_json::from_value(value.clone()).expect("request parses");
-        assert_eq!(
-            serde_json::to_value(&request).expect("request serializes"),
-            value
-        );
+    fn authenticate_request_takes_exactly_one_credential() {
+        for (field, value) in [
+            ("proof", "proof-secret"),
+            ("refreshToken", "refresh-secret"),
+        ] {
+            let json = json!({"provider": "okta", (field): value});
+            let request: AuthenticateRequest =
+                serde_json::from_value(json.clone()).expect("request parses");
+            match (&request.credential, field) {
+                (Credential::Proof(secret), "proof") => assert_eq!(secret.expose(), value),
+                (Credential::RefreshToken(secret), "refreshToken") => {
+                    assert_eq!(secret.expose(), value);
+                }
+                _ => panic!("wrong credential variant"),
+            }
+            assert_eq!(serde_json::to_value(request).expect("serializes"), json);
+        }
+        for json in [
+            json!({"provider": "okta"}),
+            json!({"provider": "okta", "proof": "p", "refreshToken": "r"}),
+            json!({"provider": "okta", "proof": "p", "unknown": true}),
+        ] {
+            assert!(serde_json::from_value::<AuthenticateRequest>(json).is_err());
+        }
     }
 
     #[test]
-    fn authenticate_request_rejects_unknown_fields() {
-        let value = json!({"provider": "okta", "proof": "tok-123", "unexpected": true});
-        assert!(serde_json::from_value::<AuthenticateRequest>(value).is_err());
+    fn authenticate_response_omits_an_absent_refresh_token() {
+        let value = json!({"token": "token", "lifetime": "60s"});
+        let response: AuthenticateResponse =
+            serde_json::from_value(value.clone()).expect("response parses");
+        assert!(response.refresh_token.is_none());
+        assert_eq!(serde_json::to_value(response).expect("serializes"), value);
     }
 
     #[test]

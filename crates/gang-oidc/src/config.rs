@@ -138,6 +138,9 @@ pub enum ConfigError {
     /// The login flow owns the named authorization parameter.
     #[error("authorization parameter `{0}` is set by the login flow")]
     ReservedAuthorizationParam(String),
+    /// `login.offline` repeats a scope or authorization parameter the login already sets.
+    #[error("`{0}` is already set by the login and cannot repeat in `login.offline`")]
+    RepeatedInOffline(String),
 }
 
 const RESERVED_AUTHORIZATION_PARAMS: &[&str] = &[
@@ -188,6 +191,29 @@ pub struct LoginConfig {
     pub scopes: Vec<String>,
     /// Extra query parameters for the authorization request.
     pub authorization_params: BTreeMap<String, String>,
+    /// Added to the authorization request only when the login must yield a refresh token (ADR-38).
+    pub offline: OfflineLogin,
+}
+
+/// What a login that must yield a refresh token adds to its authorization request (ADR-38).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OfflineLogin {
+    /// Scopes added to the login's own, for example `offline_access`.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Query parameters added to the login's own, for example Google's
+    /// `access_type = "offline"` and `prompt = "consent"`.
+    #[serde(default)]
+    pub authorization_params: BTreeMap<String, String>,
+}
+
+impl OfflineLogin {
+    /// Whether the table adds nothing; an empty table is omitted when serialized.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.scopes.is_empty() && self.authorization_params.is_empty()
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -255,6 +281,8 @@ struct RawLoginConfig {
     scopes: Vec<String>,
     #[serde(default)]
     authorization_params: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "OfflineLogin::is_empty")]
+    offline: OfflineLogin,
 }
 
 impl TryFrom<RawLoginConfig> for LoginConfig {
@@ -271,10 +299,35 @@ impl TryFrom<RawLoginConfig> for LoginConfig {
         {
             return Err(ConfigError::ReservedAuthorizationParam(name.clone()));
         }
+        if let Some(name) = raw
+            .offline
+            .authorization_params
+            .keys()
+            .find(|name| RESERVED_AUTHORIZATION_PARAMS.contains(&name.as_str()))
+        {
+            return Err(ConfigError::ReservedAuthorizationParam(name.clone()));
+        }
+        if let Some(name) = raw
+            .offline
+            .authorization_params
+            .keys()
+            .find(|name| raw.authorization_params.contains_key(*name))
+        {
+            return Err(ConfigError::RepeatedInOffline(name.clone()));
+        }
+        if let Some(scope) = raw
+            .offline
+            .scopes
+            .iter()
+            .find(|scope| raw.scopes.contains(scope))
+        {
+            return Err(ConfigError::RepeatedInOffline(scope.clone()));
+        }
         Ok(Self {
             client_secret: raw.client_secret,
             scopes: raw.scopes,
             authorization_params: raw.authorization_params,
+            offline: raw.offline,
         })
     }
 }
@@ -285,6 +338,7 @@ impl From<LoginConfig> for RawLoginConfig {
             client_secret: config.client_secret,
             scopes: config.scopes,
             authorization_params: config.authorization_params,
+            offline: config.offline,
         }
     }
 }

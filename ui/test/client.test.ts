@@ -8,6 +8,7 @@ import { PATHS, type Frame, type ScalingEvent, type Session } from "../src/wire.
 import { iso, load, snapshotOf } from "./sse.ts";
 
 const session = JSON.parse(readFileSync(new URL("../fixtures/session.json", import.meta.url), "utf8")) as Session;
+const defaultSession = { ...session, expireTime: undefined };
 const anonymous: Session = { name: session.name, permissions: [] };
 const snapshot = snapshotOf(load("live"));
 const t0 = ms(snapshot.updateTime);
@@ -40,8 +41,10 @@ class FakeEnvironment implements Environment {
   readonly sources: FakeSource[] = [];
   readonly scheduled: { run: () => void; delay: number }[] = [];
   readonly navigations: string[] = [];
-  readonly responses = new Map<string, unknown>([[PATHS.getSession, session]]);
+  readonly responses = new Map<string, unknown>([[PATHS.getSession, defaultSession]]);
   readonly fetched: string[] = [];
+  readonly posts: string[] = [];
+  readonly postResults: (number | Error)[] = [];
   clock = 1000;
   openStream(): StreamSource {
     const source = new FakeSource();
@@ -53,6 +56,12 @@ class FakeEnvironment implements Environment {
     const body = this.responses.get(path);
     if (body instanceof Error || body === undefined) throw body ?? new Error(`no fixture for ${path}`);
     return body;
+  }
+  async post(path: string): Promise<number> {
+    this.posts.push(path);
+    const result = this.postResults.shift() ?? 204;
+    if (result instanceof Error) throw result;
+    return result;
   }
   now(): number {
     return this.clock;
@@ -142,11 +151,78 @@ test("REVOKED ends the stream for good", async () => {
   assert.equal(env.scheduled.length, 0);
 });
 
-test("EXPIRED sends the browser to sign in again", async () => {
+test("renews before expireTime", async () => {
+  const env = new FakeEnvironment();
+  env.responses.set(PATHS.getSession, { ...session, expireTime: iso(env.clock + 10 * 60_000) });
+  const client = new StateClient(env);
+  await client.start();
+  const renewal = env.scheduled.find((entry) => entry.delay === 8 * 60_000);
+  assert.ok(renewal);
+  renewal.run();
+  assert.deepEqual(env.posts, [PATHS.renew]);
+  await flush();
+  assert.deepEqual(env.fetched, [PATHS.getSession, PATHS.getSession]);
+  assert.equal(env.sources.length, 2);
+  assert.ok(env.sources[0]?.closed);
+});
+
+test("a one-minute session renews after thirty seconds, not at once", async () => {
+  const env = new FakeEnvironment();
+  env.responses.set(PATHS.getSession, { ...session, expireTime: iso(env.clock + 60_000) });
+  const client = new StateClient(env);
+  await client.start();
+  assert.deepEqual(env.scheduled.map((entry) => entry.delay), [30_000]);
+  assert.deepEqual(env.posts, []);
+});
+
+test("EXPIRED renews and reconnects without navigating", async () => {
   const { env } = await live();
+  env.postResults.push(204);
   env.source.emit("closed", { reason: "EXPIRED" });
-  assert.deepEqual(env.navigations, [loginUrl("/ui/workers")]);
+  await flush();
+  assert.deepEqual(env.posts, [PATHS.renew]);
+  assert.deepEqual(env.navigations, []);
+  assert.equal(env.sources.length, 2);
+});
+
+test("a 401 or 403 from renewal sends the browser to sign in", async () => {
+  for (const status of [401, 403]) {
+    const { env } = await live();
+    env.postResults.push(status);
+    env.source.emit("closed", { reason: "EXPIRED" });
+    await flush();
+    assert.deepEqual(env.navigations, [loginUrl(env.here())]);
+    assert.equal(env.sources.length, 1);
+  }
   assert.equal(loginUrl("/ui/workers"), "/ui/login?next=%2Fui%2Fworkers");
+});
+
+test("a failed renewal retries later", async () => {
+  const { env, client } = await live();
+  env.postResults.push(503);
+  env.source.emit("closed", { reason: "EXPIRED" });
+  await flush();
+  assert.deepEqual(env.navigations, []);
+  assert.equal(client.link.value.kind, "lost");
+  assert.deepEqual(env.scheduled.map((entry) => entry.delay), [1000]);
+});
+
+test("a failed renewal retries the renewal, not the session probe", async () => {
+  const { env, client } = await live();
+  env.postResults.push(503);
+  env.source.emit("closed", { reason: "EXPIRED" });
+  await flush();
+  // By the retry the session cookie has expired; only the renewal cookie is left.
+  env.responses.set(PATHS.getSession, { ...anonymous, login: session.login });
+  const retry = env.scheduled.at(-1);
+  assert.ok(retry);
+  retry.run();
+  // A renewal sent by the retry succeeds: the server now answers with the renewed session.
+  env.responses.set(PATHS.getSession, defaultSession);
+  await flush();
+  assert.deepEqual(env.posts, [PATHS.renew, PATHS.renew]);
+  assert.notEqual(client.link.value.kind, "signed_out");
+  assert.equal(env.sources.length, 2);
 });
 
 test("a reason this client does not know backs off like a shutdown", async () => {
@@ -160,11 +236,13 @@ test("a reason this client does not know backs off like a shutdown", async () =>
   );
 });
 
-test("a failed stream without a principal sends the browser to sign in", async () => {
+test("a failed stream without a principal renews before signing in", async () => {
   const { env } = await live();
   env.responses.set(PATHS.getSession, { ...anonymous, login: session.login });
+  env.postResults.push(401);
   env.source.fail();
   await flush();
+  assert.deepEqual(env.posts, [PATHS.renew]);
   assert.deepEqual(env.navigations, [loginUrl("/ui/workers")]);
 });
 
@@ -212,7 +290,7 @@ test("a snapshot resets the reconnect backoff", async () => {
   await client.start();
   env.scheduled.at(-1)?.run();
   await flush();
-  env.responses.set(PATHS.getSession, session);
+  env.responses.set(PATHS.getSession, defaultSession);
   env.scheduled.at(-1)?.run();
   await flush();
   env.source.emit("snapshot", snapshot);

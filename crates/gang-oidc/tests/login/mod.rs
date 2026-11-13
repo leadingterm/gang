@@ -1,12 +1,12 @@
 //! Login flows against the in-process test issuer.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
 use super::support::{RefreshMode, TestIssuer, WEB_CLIENT_ID, web_client};
 use gang_clock::{TestClock, Timestamp};
-use gang_oidc::{OidcConfig, Provider};
+use gang_oidc::{OfflineLogin, OidcConfig, Provider};
 use gang_spi::{
     LoginChallenge, LoginClient, LoginGrant, LoginPort, LoginRequest, LoginSupport, PortError,
     ProofVerifierPort, Rejection,
@@ -83,6 +83,7 @@ async fn begin_as(provider: &TestProvider, client: Option<&LoginClient>) -> Logi
         .begin_login(&LoginRequest {
             redirect_uri: &redirect,
             client,
+            offline: false,
         })
         .await
         .expect("login starts")
@@ -106,6 +107,53 @@ async fn verified(provider: &TestProvider, grant: &LoginGrant) -> String {
         .to_owned()
 }
 
+fn config_with_offline(issuer: &TestIssuer<'_>) -> OidcConfig {
+    let mut config = issuer.login_config().clone();
+    let login = config.login.as_mut().expect("login is configured");
+    login.scopes = vec!["openid".to_owned(), "email".to_owned()];
+    login.authorization_params =
+        BTreeMap::from([("prompt".to_owned(), "select_account".to_owned())]);
+    login.offline = OfflineLogin {
+        scopes: vec!["offline_access".to_owned()],
+        authorization_params: BTreeMap::from([("access_type".to_owned(), "offline".to_owned())]),
+    };
+    config
+}
+
+#[tokio::test]
+async fn offline_login_adds_the_offline_scopes_and_parameters() {
+    let clock = new_clock();
+    let issuer = TestIssuer::start(&clock).await;
+    let provider = provider(&clock, config_with_offline(&issuer));
+    let redirect = redirect_uri();
+    let challenge = provider
+        .begin_login(&LoginRequest {
+            redirect_uri: &redirect,
+            client: None,
+            offline: true,
+        })
+        .await
+        .expect("login starts");
+    let params = query(&challenge.authorization_url);
+
+    assert_eq!(params["scope"], "openid email offline_access");
+    assert_eq!(params["access_type"], "offline");
+    assert_eq!(params["prompt"], "select_account");
+}
+
+#[tokio::test]
+async fn online_login_sends_nothing_from_the_offline_table() {
+    let clock = new_clock();
+    let issuer = TestIssuer::start(&clock).await;
+    let provider = provider(&clock, config_with_offline(&issuer));
+    let challenge = begin(&provider).await;
+    let params = query(&challenge.authorization_url);
+
+    assert_eq!(params["scope"], "openid email");
+    assert!(!params.contains_key("access_type"));
+    assert_eq!(params["prompt"], "select_account");
+}
+
 #[tokio::test]
 async fn javascript_authorization_endpoint_is_rejected_before_login() {
     let clock = new_clock();
@@ -119,6 +167,7 @@ async fn javascript_authorization_endpoint_is_rejected_before_login() {
             .begin_login(&LoginRequest {
                 redirect_uri: &redirect,
                 client: None,
+                offline: false,
             })
             .await,
         Err(PortError::Backend(_))
@@ -348,6 +397,7 @@ async fn provider_without_a_login_table_is_unsupported() {
             .begin_login(&LoginRequest {
                 redirect_uri: &redirect,
                 client: None,
+                offline: false,
             })
             .await,
         Err(PortError::Unsupported { operation: "login" })

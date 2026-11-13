@@ -41,6 +41,7 @@ async fn login(
             server: &server,
             provider: requested,
             ca_pin: Some(&pin),
+            browser: gang_client::LocalBrowser::Available,
         })
         .await
 }
@@ -68,6 +69,19 @@ async fn single_interactive_provider_is_chosen_when_none_is_requested() {
         .expect("the loopback login succeeds");
 
     assert_eq!(logged.provider, provider("google"));
+}
+
+#[tokio::test]
+async fn loopback_login_requests_offline_access() {
+    let harness = Harness::start_tls(ConsoleMode::Browser, google()).await;
+    harness.server.accept_proof("google", &proof(1, START));
+
+    let logged = login(&harness, ClientOptions::default(), None)
+        .await
+        .expect("the loopback login succeeds");
+
+    assert_eq!(logged.provider, provider("google"));
+    assert_eq!(harness.providers.begun_offline(), vec![true]);
 }
 
 #[tokio::test]
@@ -189,6 +203,7 @@ async fn server_without_authentication_has_no_login() {
             server: &server,
             provider: None,
             ca_pin: None,
+            browser: gang_client::LocalBrowser::Available,
         })
         .await
         .expect_err("a server without authentication has no login");

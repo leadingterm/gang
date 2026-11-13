@@ -42,6 +42,8 @@ fn collect(cfg: &Config) -> BTreeMap<String, String> {
     let mut seen = HashSet::new();
     walk::<gang_wire::Isa>(cfg, &mut out, &mut seen);
     walk::<gang_wire::Session>(cfg, &mut out, &mut seen);
+    walk::<gang_wire::DeviceAuthorization>(cfg, &mut out, &mut seen);
+    walk::<gang_wire::DeviceAuthorizationState>(cfg, &mut out, &mut seen);
     walk::<gang_wire::ListPrincipalsResponse>(cfg, &mut out, &mut seen);
     walk::<gang_wire::ListRolesResponse>(cfg, &mut out, &mut seen);
     walk::<gang_wire::ListEventsResponse>(cfg, &mut out, &mut seen);
@@ -95,14 +97,18 @@ fn export_decl(decl: &str) -> String {
 }
 
 /// Renders the `PATHS` constant: the template of every route in the shared route table, keyed by
-/// its `RouteId` variant name in lowerCamelCase, then the browser sign-in, sign-out and error pages.
+/// its `RouteId` variant name in lowerCamelCase, then every server-owned `/ui` route and the error page.
 fn paths_decl() -> Result<String, serde_json::Error> {
     let entries: String = gang_wire::routes::ROUTES
         .iter()
         .map(|route| path_entry(&lower_camel(&format!("{:?}", route.id)), route.template))
+        .chain(
+            gang_wire::UiRoute::ALL
+                .iter()
+                .map(|route| path_entry(&lower_camel(&format!("{route:?}")), route.path())),
+        )
         .chain([
-            path_entry("login", gang_wire::LOGIN_PATH),
-            path_entry("logout", gang_wire::LOGOUT_PATH),
+            path_entry("deviceApproved", gang_wire::DEVICE_APPROVED_PATH),
             path_entry("error", gang_wire::ERROR_PATH),
         ])
         .collect::<Result<_, _>>()?;
@@ -150,6 +156,14 @@ mod tests {
         let rendered = render().unwrap();
         assert!(rendered.contains("export type Session = "), "{rendered}");
         assert!(
+            rendered.contains("export type DeviceAuthorization = "),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("export type DeviceAuthorizationState = "),
+            "{rendered}"
+        );
+        assert!(
             rendered.contains("export type ScalingEvent = "),
             "{rendered}"
         );
@@ -168,8 +182,13 @@ mod tests {
         for line in [
             "  watchState: \"/v1/state:watch\",",
             "  getSession: \"/v1/session\",",
+            "  createDeviceAuthorization: \"/v1/deviceAuthorizations\",",
             "  login: \"/ui/login\",",
+            "  callback: \"/ui/callback\",",
             "  logout: \"/ui/logout\",",
+            "  renew: \"/ui/renew\",",
+            "  device: \"/ui/device\",",
+            "  deviceApproved: \"/ui/device/approved\",",
             "  error: \"/ui/error\",",
         ] {
             assert!(
@@ -182,7 +201,7 @@ mod tests {
                 .lines()
                 .filter(|line| line.starts_with("  "))
                 .count(),
-            gang_wire::routes::ROUTES.len() + 3
+            gang_wire::routes::ROUTES.len() + gang_wire::UiRoute::ALL.len() + 2
         );
     }
 }

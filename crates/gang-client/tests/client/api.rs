@@ -232,7 +232,7 @@ async fn authenticated_token_is_presented_as_the_bearer_on_later_requests() {
     let minted = minting
         .authenticate(&AuthenticateRequest {
             provider: ProviderName::try_new("google").expect("provider name is valid"),
-            proof: Proof::new("proof-1"),
+            credential: gang_wire::Credential::Proof(Proof::new("proof-1")),
         })
         .await
         .expect("the proof is accepted");

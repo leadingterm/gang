@@ -104,6 +104,11 @@ define_secret! {
 }
 
 define_secret! {
+    /// Secret required to redeem a device authorization.
+    DeviceSecret
+}
+
+define_secret! {
     /// Secret a confidential client presents to the identity provider to prove its own identity.
     ClientSecret
 }
@@ -147,6 +152,7 @@ mod tests {
         check_matches!(ClientSecret);
         check_matches!(AccessToken);
         check_matches!(LoginSession);
+        check_matches!(DeviceSecret);
     }
 
     #[test]

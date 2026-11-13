@@ -14,7 +14,7 @@ use gang_wire::routes::{
     LIST_PRINCIPALS, LIST_ROLES, RESTORE_PRINCIPAL, REVOKE_CERTIFICATE, REVOKE_PRINCIPAL, ROUTES,
     Route, WATCH_STATE,
 };
-use gang_wire::{AuthenticateRequest, CreateCertificateRequest, ErrorReason};
+use gang_wire::{AuthenticateRequest, CreateCertificateRequest, Credential, ErrorReason};
 use http::StatusCode;
 use http::header::CONTENT_TYPE;
 use http_body_util::BodyExt;
@@ -28,6 +28,7 @@ use crate::test_support::{
     ApiReply as Answer, FakeVerifier, admits, api_request, at, decode_sse, identity, mint_token,
     raw_api_request, serve, signing_request, tls_parts, tls_settings,
 };
+use crate::test_support_api::device_login_settings;
 
 const SERIAL: &str = "b1";
 const HUNG_PROOF: &str = "hung-proof";
@@ -80,7 +81,7 @@ fn probes() -> Vec<Probe> {
     let worker_provider = ProviderName::try_new(WORKER_PROVIDER).expect("provider name is valid");
     let authenticate = AuthenticateRequest {
         provider,
-        proof: Proof::new(ALICE_PROOF),
+        credential: Credential::Proof(Proof::new(ALICE_PROOF)),
     };
     let create = CreateCertificateRequest {
         provider: worker_provider,
@@ -195,7 +196,13 @@ async fn every_route_is_served_and_every_json_key_is_lower_camel_case() -> TestR
 
             let probes = probes();
             let covered: Vec<Route> = probes.iter().map(|probe| probe.route).collect();
-            assert_eq!(covered, ROUTES, "the sweep covers exactly the route table");
+            // Device routes need a mounted login and are covered by the device API tests.
+            let non_device: Vec<Route> = ROUTES
+                .iter()
+                .copied()
+                .filter(|route| !route.template.starts_with("/v1/deviceAuthorizations"))
+                .collect();
+            assert_eq!(covered, non_device, "the sweep covers the other routes");
 
             for probe in probes {
                 let path = probe.path;
@@ -252,6 +259,39 @@ async fn post_past_deadline(
     );
     clock.advance(timeout.get() + Duration::from_secs(1));
     answer.await
+}
+
+/// Provokes the pending and unknown-device errors without depending on a generated code.
+async fn device_refusals(controller: &Controller) -> [(Answer, ErrorReason); 2] {
+    let authorization: Value = post_json(controller, "/v1/deviceAuthorizations", json!({}))
+        .await
+        .ok();
+    let name = authorization["name"]
+        .as_str()
+        .expect("device authorization name");
+    let secret = authorization["secret"]
+        .as_str()
+        .expect("device authorization secret");
+    let unknown = if name == "deviceAuthorizations/BCDF-GHJK" {
+        "/v1/deviceAuthorizations/BCDF-GHJL"
+    } else {
+        "/v1/deviceAuthorizations/BCDF-GHJK"
+    };
+    [
+        (
+            post_json(
+                controller,
+                &format!("/v1/{name}:redeem"),
+                json!({ "secret": secret }),
+            )
+            .await,
+            ErrorReason::AuthorizationPending,
+        ),
+        (
+            get(controller, unknown, None).await,
+            ErrorReason::DeviceAuthorizationNotFound,
+        ),
+    ]
 }
 
 /// A refusal for every reason the fakes can provoke, each with the reason it must carry. Revokes
@@ -319,6 +359,7 @@ async fn refusals(
             ErrorReason::PrincipalNotFound,
         ),
     ];
+    refusals.extend(device_refusals(controller).await);
 
     repository.fail_scaling_reads(true);
     refusals.push((
@@ -349,7 +390,11 @@ async fn every_refusal_is_the_error_envelope_with_one_error_info() {
     let clock = handles.clock.clone();
     serve(
         parts,
-        tls_settings(),
+        {
+            let mut settings = tls_settings();
+            settings.login = Some(device_login_settings());
+            settings
+        },
         handles.scheduler,
         move |controller| async move {
             let refusals = refusals(&controller, &repository, &verifier, &clock).await;

@@ -46,8 +46,8 @@
           ++ extraModules;
       };
 
-    # The AMI disk image is the same system with the EC2 image builder added.
-    amazonImageModule = "${nixpkgs}/nixos/maintainers/scripts/ec2/amazon-image.nix";
+    # The EC2 disk image is the same system with the image builder added.
+    ec2ImageModule = ./infra/nixos/ec2-image.nix;
   in {
     formatter = forAllSystems (system: (pkgsFor system).alejandra);
 
@@ -67,7 +67,7 @@
       image = role:
         import ./infra/nixos/verified-image.nix {
           inherit pkgs;
-          nixos = mkNixos [amazonImageModule {amazonImage.format = "raw";}] role system;
+          nixos = mkNixos [ec2ImageModule {image.repart.name = "gang-${role}";}] role system;
         };
     in {
       # Bazel is the only builder of gang (statically linked, dashboard embedded): the images carry exactly the binary it built, taken unchanged from the gang-binaries input.

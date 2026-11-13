@@ -3,10 +3,12 @@
 
 use gang_config::GangConfig;
 use gang_e2e::{
-    ActionTools, Answer, ConfigTemplate, CookieValue, DASHBOARD_CLIENT_ID, E2eError,
-    ExpectedCookie, IdentityKnobs, MaxAge, Placement, Ran, RowStatus, SIGN_IN_SUBJECT, Sandbox,
-    SetCookie, StatusRow, Transport, Variant, authorization_request, cookie_set, failure_reported,
-    login_cookie_name, query_value, redirected_to, status_rows,
+    ActionTools, Answer, BROWSER_SUBJECT, ConfigTemplate, CookieValue, DASHBOARD_CLIENT_ID,
+    E2eError, ExpectedCookie, IdentityKnobs, MaxAge, Placement, Ran, RefreshOutcome, RefreshRecord,
+    RowStatus, SESSION_MAX_AGE, SIGN_IN_SUBJECT, Sandbox, SetCookie, StatusRow, Transport, Variant,
+    authorization_request, consent_free, cookie_set, cross_site_renewal_refused, failure_reported,
+    login_cookie_name, offline_requested, query_value, rechecked, redirected_to, renewal_cleared,
+    renewal_cookie, renewal_kept, sealed_refused, shared_grant, status_rows,
 };
 use gang_testkit::OpaquePlugins;
 use gang_types::Url;
@@ -387,6 +389,13 @@ fn rendered_identity_variant_sends_the_sign_in_login_hint() -> gang_e2e::Result<
         Some(SIGN_IN_SUBJECT)
     );
     assert_eq!(
+        oidc["login"]["offline"]["authorization_params"],
+        Value::Table(Table::from_iter([
+            ("access_type".to_owned(), Value::from("offline")),
+            ("prompt".to_owned(), Value::from("consent")),
+        ]))
+    );
+    assert_eq!(
         oidc["login"]["scopes"],
         Value::Array(vec![Value::from("openid")])
     );
@@ -415,4 +424,314 @@ fn rendered_identity_variant_sends_the_sign_in_login_hint() -> gang_e2e::Result<
         "the baseline variant renders no dashboard.login"
     );
     Ok(())
+}
+
+/// Cross-site renewal cannot succeed or set cookies.
+#[test]
+fn cross_site_renewal_must_be_refused() {
+    assert!(cross_site_renewal_refused(&answer(403, &[])).is_ok());
+    let defect = answer(
+        204,
+        &[(
+            "set-cookie",
+            "__Host-gang_session=s; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=60",
+        )],
+    );
+    assert!(
+        cross_site_renewal_refused(&defect)
+            .expect_err("must refuse")
+            .contains("204")
+    );
+}
+
+/// Renewal cookies require both `HttpOnly` and `SameSite=Strict`.
+#[test]
+fn renewal_cookie_needs_http_only_and_strict() {
+    let name = "__Host-gang_renewal";
+    let good = "__Host-gang_renewal=v; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=34560000";
+    let no_http_only = "__Host-gang_renewal=v; Secure; SameSite=Strict; Path=/; Max-Age=34560000";
+    let lax = "__Host-gang_renewal=v; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=34560000";
+    assert!(renewal_cookie(&with_cookies(&[good]), name).is_ok());
+    assert!(
+        renewal_cookie(&with_cookies(&[no_http_only]), name)
+            .expect_err("HttpOnly required")
+            .contains("HttpOnly")
+    );
+    assert!(
+        renewal_cookie(&with_cookies(&[lax]), name)
+            .expect_err("Strict required")
+            .contains("SameSite")
+    );
+}
+
+/// A later sign-in does not request offline access or consent.
+#[test]
+fn sign_in_after_the_lifetime_must_not_ask_consent() {
+    let url = "https://issuer.example/authorize?login_hint=browser";
+    assert!(consent_free(url).is_ok());
+    assert!(
+        consent_free(&format!("{url}&prompt=consent"))
+            .expect_err("consent requested")
+            .contains("consent")
+    );
+    assert!(
+        consent_free(&format!("{url}&access_type=offline"))
+            .expect_err("offline requested")
+            .contains("offline")
+    );
+    assert!(offline_requested(&format!("{url}&access_type=offline&prompt=consent")).is_ok());
+    assert!(offline_requested(&format!("{url}&access_type=offline")).is_err());
+}
+
+/// A sealed renewal cookie is not a credential on other surfaces.
+#[test]
+fn sealed_cookie_is_no_credential() {
+    let denied = answer(401, &[]);
+    let accepted = answer(200, &[]);
+    assert!(sealed_refused(&denied, &denied, &denied).is_ok());
+    assert!(
+        sealed_refused(&accepted, &denied, &denied)
+            .expect_err("bearer accepted")
+            .contains("bearer")
+    );
+    assert!(
+        sealed_refused(&denied, &accepted, &denied)
+            .expect_err("session accepted")
+            .contains("session cookie")
+    );
+    assert!(
+        sealed_refused(&denied, &denied, &accepted)
+            .expect_err("proof accepted")
+            .contains("session:authenticate")
+    );
+}
+
+/// Expired renewal retains its cookie rather than clearing it.
+#[test]
+fn max_age_renewal_keeps_the_cookie() {
+    let name = "__Host-gang_renewal";
+    let denied = answer(401, &[]);
+    let cleared = answer(
+        401,
+        &[(
+            "set-cookie",
+            "__Host-gang_renewal=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0",
+        )],
+    );
+    assert!(renewal_kept(&denied, 401, name).is_ok());
+    assert!(renewal_kept(&cleared, 401, name).is_err());
+    assert!(renewal_cleared(&cleared, 401, name).is_ok());
+    assert!(renewal_cleared(&denied, 401, name).is_err());
+}
+
+/// Concurrent renewals share a grant and re-check the held token.
+#[test]
+fn one_shared_grant_and_held_token_recheck() {
+    let session = "__Host-gang_session";
+    let renewal = "__Host-gang_renewal";
+    let cookies = [
+        (
+            "set-cookie",
+            "__Host-gang_session=s; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=60",
+        ),
+        (
+            "set-cookie",
+            "__Host-gang_renewal=v; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=34560000",
+        ),
+    ];
+    let first = answer(204, &cookies);
+    let second = answer(204, &cookies);
+    let record = RefreshRecord {
+        client_id: DASHBOARD_CLIENT_ID.to_owned(),
+        refresh_token: "t1".to_owned(),
+        outcome: RefreshOutcome::Rotated {
+            issued: "t2".to_owned(),
+        },
+    };
+    assert!(
+        shared_grant(
+            &first,
+            &second,
+            std::slice::from_ref(&record),
+            session,
+            renewal
+        )
+        .is_ok()
+    );
+    assert!(
+        shared_grant(
+            &first,
+            &second,
+            &[record.clone(), record.clone()],
+            session,
+            renewal
+        )
+        .expect_err("two grants")
+        .contains("2 refresh grants")
+    );
+    let recheck = RefreshRecord {
+        client_id: DASHBOARD_CLIENT_ID.to_owned(),
+        refresh_token: "t2".to_owned(),
+        outcome: RefreshOutcome::Granted,
+    };
+    assert!(rechecked(Some(&record), std::slice::from_ref(&recheck)).is_ok());
+    let wrong = RefreshRecord {
+        refresh_token: "t1".to_owned(),
+        ..recheck
+    };
+    assert!(rechecked(Some(&record), &[wrong]).is_err());
+}
+
+/// The sessions variant renders short lifetimes and browser access.
+#[test]
+fn rendered_sessions_variant() -> gang_e2e::Result<()> {
+    let placement = Placement::create(None)?;
+    let issuer = Url::parse("http://127.0.0.1:9").map_err(E2eError::parse("issuer URL"))?;
+    let variant = Variant {
+        identity: IdentityKnobs::SESSIONS,
+        ..Variant::baseline(Sandbox::Bwrap)
+    };
+    let text = ConfigTemplate::parse(&base_config()?)?
+        .place(&placement, Transport::Tls)?
+        .vary(&variant, &launcher(), &tools())?
+        .with_identity(&issuer, variant.identity)?
+        .render()?;
+    let config = parsed(&text)?;
+    assert_eq!(config.dashboard.session_max_age.get(), SESSION_MAX_AGE);
+    let doc: Table = toml::from_str(&text).expect("the rendered config is TOML");
+    let token = &doc["authentication"]["clients"]["token"];
+    assert_eq!(token["token_ttl"].as_str(), Some("1m"));
+    assert_eq!(token["clock_skew"].as_str(), Some("0s"));
+    let login = &doc["identity"]["providers"][PROVIDER]["oidc"]["login"];
+    assert_eq!(
+        login["authorization_params"]["login_hint"].as_str(),
+        Some(BROWSER_SUBJECT)
+    );
+    assert_eq!(
+        login["offline"]["authorization_params"],
+        Value::Table(Table::from_iter([
+            ("access_type".to_owned(), Value::from("offline")),
+            ("prompt".to_owned(), Value::from("consent")),
+        ]))
+    );
+    let roles = doc["server"]["roles"].as_array().expect("server roles");
+    assert!(roles.iter().any(|role| {
+        role["principals"].as_array().is_some_and(|principals| {
+            principals.iter().any(|principal| {
+                principal["provider"].as_str() == Some(PROVIDER)
+                    && principal["principal"].as_str() == Some(BROWSER_SUBJECT)
+            })
+        }) && role["permissions"] == Value::Array(vec![Value::from("state.read")])
+    }));
+    Ok(())
+}
+
+#[test]
+fn device_prompt_reads_the_uri_and_the_code() {
+    let lines = "To sign in from any device, open https://gang.example/ui/device\n\
+        and enter the code BCDF-GHJK (valid until 14:32)";
+    assert_eq!(
+        gang_e2e::device_prompt(lines),
+        Some(gang_e2e::DevicePrompt {
+            verification_uri: "https://gang.example/ui/device".to_owned(),
+            user_code: "BCDF-GHJK".to_owned(),
+        })
+    );
+    assert!(gang_e2e::device_prompt(&lines.replace("BCDF-GHJK", "BCDA-GHJK")).is_none());
+    assert!(gang_e2e::device_prompt("enter the code BCDF-GHJK").is_none());
+}
+
+#[test]
+fn cross_site_device_approval_must_be_refused() {
+    assert!(gang_e2e::cross_site_approval_refused(&answer(403, &[])).is_ok());
+    let defect = answer(303, &[("location", "http://127.0.0.1:9/authorize?..")]);
+    assert!(gang_e2e::cross_site_approval_refused(&defect).is_err_and(|e| e.contains("303")));
+}
+
+#[test]
+fn second_redeem_must_not_be_served() -> Result<(), serde_json::Error> {
+    let mut refused = answer(404, &[]);
+    refused.body = serde_json::to_vec(&gang_wire::ErrorResponse {
+        error: gang_wire::Status::new(
+            gang_wire::ErrorReason::DeviceAuthorizationNotFound,
+            "..",
+            [],
+        ),
+    })?;
+    assert!(gang_e2e::refused_with(&refused, 404, "DEVICE_AUTHORIZATION_NOT_FOUND").is_ok());
+    let mut served = answer(200, &[]);
+    served.body = br#"{"token":"t","lifetime":"600s","refreshToken":"r"}"#.to_vec();
+    assert!(
+        gang_e2e::refused_with(&served, 404, "DEVICE_AUTHORIZATION_NOT_FOUND")
+            .is_err_and(|e| e.contains("200"))
+    );
+    Ok(())
+}
+
+#[test]
+fn device_get_must_not_carry_the_secret() {
+    let mut resource = answer(200, &[]);
+    resource.body = br#"{"name":"deviceAuthorizations/BCDF-GHJK","clientAddress":"127.0.0.1","state":"PENDING"}"#.to_vec();
+    assert!(gang_e2e::device_resource(&resource, "BCDF-GHJK", "127.0.0.1").is_ok());
+    resource.body = br#"{"name":"deviceAuthorizations/BCDF-GHJK","clientAddress":"127.0.0.1","state":"PENDING","secret":"s"}"#.to_vec();
+    assert!(
+        gang_e2e::device_resource(&resource, "BCDF-GHJK", "127.0.0.1")
+            .is_err_and(|e| e.contains("secret"))
+    );
+}
+
+#[test]
+fn rotated_refresh_token_is_written_first() {
+    let t = std::time::UNIX_EPOCH;
+    let later = t + std::time::Duration::from_nanos(1);
+    let mut files = gang_e2e::StoredSession {
+        refresh_token: Some("t2".to_owned()),
+        refresh_written: Some(t),
+        token_written: Some(later),
+        ..gang_e2e::StoredSession::default()
+    };
+    assert!(gang_e2e::rotation_stored(&files, "t2").is_ok());
+    files.refresh_written = Some(later);
+    files.token_written = Some(t);
+    assert!(gang_e2e::rotation_stored(&files, "t2").is_err_and(|e| e.contains("written before")));
+    files.refresh_token = Some("t1".to_owned());
+    assert!(gang_e2e::rotation_stored(&files, "t2").is_err_and(|e| e.contains("not the rotated")));
+}
+
+#[test]
+fn device_only_refuses_a_browser_url() {
+    assert!(gang_e2e::device_only("open https://gang.example/ui/device").is_ok());
+    assert!(
+        gang_e2e::device_only("open https://issuer.example/authorize?state=s")
+            .is_err_and(|e| e.contains("/authorize"))
+    );
+}
+
+#[test]
+fn logged_in_with_needs_exit_zero_and_the_provider() {
+    assert!(
+        gang_e2e::logged_in_with(
+            &outcome(Some(0), "ok  logged in with e2e · token valid for 599s"),
+            "e2e"
+        )
+        .is_ok()
+    );
+    assert!(
+        gang_e2e::logged_in_with(
+            &outcome(Some(1), "ok  logged in with e2e · token valid for 599s"),
+            "e2e"
+        )
+        .is_err()
+    );
+    assert!(gang_e2e::logged_in_with(&outcome(Some(0), "logged in with other"), "e2e").is_err());
+}
+
+#[test]
+fn stored_nothing_needs_an_empty_home() {
+    assert!(gang_e2e::stored_nothing(&gang_e2e::StoredSession::default()).is_ok());
+    let files = gang_e2e::StoredSession {
+        kind: Some("device".to_owned()),
+        ..gang_e2e::StoredSession::default()
+    };
+    assert!(gang_e2e::stored_nothing(&files).is_err());
 }

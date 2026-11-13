@@ -1,6 +1,6 @@
 # ADR-29: Dashboard sign-in uses a dedicated web client
 
-Status: Accepted
+Status: Accepted. Amended by ADR-37 (device approval uses the web client).
 
 ## Context
 - The provider's `oidc.login` client is a native-app client whose `client_secret` is copied into the `GET /v1/server` answer for every CLI and treated as "not a secret in the strict sense" (RFC 8252 §8.5). A browser sign-in needs a confidential web client and a server-side code exchange.

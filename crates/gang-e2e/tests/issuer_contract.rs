@@ -4,9 +4,11 @@ use std::error::Error;
 use std::sync::Arc;
 
 use gang_clock::{SystemClock, TestClock, Timestamp};
-use gang_e2e::{AUDIENCE, ORGANIZATION, ORGANIZATION_CLAIM, Settings, TestIssuer, TokenSpec};
+use gang_e2e::{
+    AUDIENCE, ORGANIZATION, ORGANIZATION_CLAIM, Settings, SubjectPolicy, TestIssuer, TokenSpec,
+};
 use gang_oidc::{OidcConfig, Provider};
-use gang_spi::{LoginPort, LoginRequest, PortError, ProofVerifierPort, Rejection};
+use gang_spi::{LoginGrant, LoginPort, LoginRequest, PortError, ProofVerifierPort, Rejection};
 use gang_tls::{HttpClient, HttpProtocol, HttpRequest, HttpSettings, HttpTransport};
 use gang_types::{NonZeroBytes, NonZeroDuration, Proof, Url};
 use http::{Method, StatusCode, header};
@@ -16,6 +18,45 @@ use serde_json::json;
 const HTTP_TIMEOUT: NonZeroDuration = NonZeroDuration::from_secs(10);
 /// Maximum buffered issuer response.
 const MAX_BODY: NonZeroBytes = NonZeroBytes::kib(64);
+
+/// Completes an interactive login against the test issuer.
+async fn login(provider: &Provider, offline: bool) -> Result<LoginGrant, Box<dyn Error>> {
+    let redirect = Url::parse("http://127.0.0.1:43111/callback")?;
+    let challenge = provider
+        .begin_login(&LoginRequest {
+            redirect_uri: &redirect,
+            client: None,
+            offline,
+        })
+        .await?;
+    let client = HttpClient::try_new(&HttpSettings {
+        transport: HttpTransport::Plain,
+        protocol: HttpProtocol::Negotiated,
+        timeout: HTTP_TIMEOUT,
+        max_body: MAX_BODY,
+        clock: Arc::new(SystemClock::new()),
+    })?;
+    let response = client
+        .send(HttpRequest {
+            method: Method::GET,
+            url: &challenge.authorization_url,
+            bearer: None,
+            headers: &[],
+            body: None,
+        })
+        .await?;
+    assert_eq!(response.status, StatusCode::FOUND);
+    let callback = Url::parse(
+        response
+            .headers
+            .get(header::LOCATION)
+            .ok_or("missing location")?
+            .to_str()?,
+    )?;
+    Ok(provider
+        .complete_login(challenge.session, &callback)
+        .await?)
+}
 
 #[test]
 fn issuer_contract_with_real_provider() -> Result<(), Box<dyn Error>> {
@@ -31,7 +72,8 @@ fn issuer_contract_with_real_provider() -> Result<(), Box<dyn Error>> {
         "required_claims": { ORGANIZATION_CLAIM: ORGANIZATION },
         "login": {
             "scopes": ["openid"],
-            "authorization_params": { "login_hint": "login-subject" }
+            "authorization_params": { "login_hint": "login-subject" },
+            "offline": { "authorization_params": { "access_type": "offline", "prompt": "consent" } }
         }
     }))?;
     // At this earlier instant the expired token is halfway through its original lifetime.
@@ -78,45 +120,25 @@ fn issuer_contract_with_real_provider() -> Result<(), Box<dyn Error>> {
                 ..
             })
         ));
-        let redirect = Url::parse("http://127.0.0.1:43111/callback")?;
-        let challenge = provider
-            .begin_login(&LoginRequest {
-                redirect_uri: &redirect,
-                client: None,
-            })
-            .await?;
-        let client = HttpClient::try_new(&HttpSettings {
-            transport: HttpTransport::Plain,
-            protocol: HttpProtocol::Negotiated,
-            timeout: HTTP_TIMEOUT,
-            max_body: MAX_BODY,
-            clock: Arc::new(SystemClock::new()),
-        })?;
-        let response = client
-            .send(HttpRequest {
-                method: Method::GET,
-                url: &challenge.authorization_url,
-                bearer: None,
-                headers: &[],
-                body: None,
-            })
-            .await?;
-        assert_eq!(response.status, StatusCode::FOUND);
-        let callback = Url::parse(
-            response
-                .headers
-                .get(header::LOCATION)
-                .ok_or("missing location")?
-                .to_str()?,
-        )?;
-        let grant = provider
-            .complete_login(challenge.session, &callback)
-            .await?;
+        let offline_grant = login(&provider, true).await?;
         assert_eq!(
-            provider.verify(&grant.proof).await?.as_str(),
+            provider.verify(&offline_grant.proof).await?.as_str(),
             "login-subject"
         );
-        assert!(grant.refresh_token.is_some());
+        let refresh = offline_grant.refresh_token.ok_or("missing refresh token")?;
+        let online_grant = login(&provider, false).await?;
+        assert!(online_grant.refresh_token.is_none());
+
+        issuer.set_policy("login-subject", SubjectPolicy::Rotating);
+        let renewed = provider.renew(&refresh, None).await?;
+        let rotated = renewed
+            .refresh_token
+            .ok_or("missing rotated refresh token")?;
+        assert_ne!(rotated.expose(), refresh.expose());
+        assert!(matches!(
+            provider.renew(&refresh, None).await,
+            Err(PortError::Rejected { .. })
+        ));
         Ok::<(), Box<dyn Error>>(())
     })?;
     Ok(())

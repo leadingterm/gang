@@ -18,20 +18,21 @@ use x509_cert::der::DecodePem;
 
 use crate::Ran;
 use crate::access::{
-    Access, Administration, Aging, Login, MisdirectedLogin, Misdirection, TokenAnswer, Validity,
-    WorkerIdentity,
+    Access, Administration, Aging, DeviceLogin, Login, MisdirectedLogin, Misdirection,
+    StoredSession, TokenAnswer, Validity, WorkerIdentity,
 };
+use crate::device_verdict::{DevicePrompt, device_prompt};
 use crate::errors::{E2eError, Result};
 use crate::flags::helper_path;
 use crate::h2_frames::H2Channel;
 use crate::identity::{Admission, Credentials, Identity, Issuance};
-use crate::issuer::TokenSpec;
+use crate::issuer::{AuthorizationRecord, RefreshRecord, SubjectPolicy, TokenSpec};
 use crate::process::{self, scrub_environment};
 use crate::secured::{self, CA_CERTIFICATE_FILE, Secured};
 use crate::server::{Answer, Request, ServerApi};
 use crate::session::{self, TokenUsage};
 use crate::system::System;
-use crate::template::PROVIDER;
+use crate::template::{DEVICE_TTL, PROVIDER};
 use crate::tls_client::ALPN_H2;
 
 /// Client credential directory beneath the client home.
@@ -42,6 +43,8 @@ const TOKEN_FILE: &str = "token";
 const ID_TOKEN_FILE: &str = "id-token";
 /// Stored refresh token filename.
 const REFRESH_TOKEN_FILE: &str = "refresh-token";
+/// Stored session metadata filename.
+const SESSION_FILE: &str = "session.json";
 /// Worker client certificate filename.
 const WORKER_CERTIFICATE: &str = "certificate.pem";
 /// Worker private key filename.
@@ -348,6 +351,104 @@ impl Access for Secured<'_> {
         })
     }
 
+    fn device_login(
+        &self,
+        approve: &mut dyn FnMut(&DevicePrompt) -> Result<()>,
+    ) -> Result<DeviceLogin> {
+        let home = self.new_home()?;
+        let (child, receiver, stderr_thread, stdout_thread) =
+            self.spawn_login(&home, None, false)?;
+        let waited = self.stack().settings().history_timeout;
+        let deadline = Instant::now() + waited;
+        let mut lines = Vec::new();
+        let prompt = loop {
+            match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(line) => {
+                    lines.push(line);
+                    if let Some(prompt) = device_prompt(&lines.join("\n")) {
+                        break prompt;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let outcome = finish_login(child, stderr_thread, stdout_thread, &lines)?;
+                    return Ok(DeviceLogin {
+                        home,
+                        prompt: None,
+                        outcome,
+                    });
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    stop_login(child, stderr_thread, stdout_thread);
+                    return Err(E2eError::timeout(
+                        "gang login to print its device prompt",
+                        waited,
+                    ));
+                }
+            }
+        };
+        if let Err(error) = approve(&prompt) {
+            stop_login(child, stderr_thread, stdout_thread);
+            return Err(error);
+        }
+        let finish_wait = waited + DEVICE_TTL;
+        if !drain_login_output(&receiver, Instant::now() + finish_wait, &mut lines) {
+            stop_login(child, stderr_thread, stdout_thread);
+            return Err(E2eError::timeout(
+                "gang login to finish its device login",
+                finish_wait,
+            ));
+        }
+        let outcome = finish_login(child, stderr_thread, stdout_thread, &lines)?;
+        Ok(DeviceLogin {
+            home,
+            prompt: Some(prompt),
+            outcome,
+        })
+    }
+
+    fn session_files(&self, home: &Path) -> Result<StoredSession> {
+        let session = client_file(home, SESSION_FILE);
+        let kind = match fs::read_to_string(&session) {
+            Ok(text) => {
+                let value: serde_json::Value =
+                    serde_json::from_str(&text).map_err(E2eError::parse("the stored session"))?;
+                value
+                    .pointer("/kind/kind")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => return Err(E2eError::parse("the stored session")(error)),
+        };
+        let refresh = client_file(home, REFRESH_TOKEN_FILE);
+        let token = client_file(home, TOKEN_FILE);
+        Ok(StoredSession {
+            kind,
+            id_token: client_file(home, ID_TOKEN_FILE).exists(),
+            refresh_token: read_optional(&refresh)?.map(|text| text.trim().to_owned()),
+            refresh_written: modified_optional(&refresh)?,
+            token_written: modified_optional(&token)?,
+        })
+    }
+
+    fn authorizations(&self, subject: &str) -> Vec<AuthorizationRecord> {
+        self.issuer().authorizations(subject)
+    }
+
+    fn refreshes(&self, subject: &str) -> Vec<RefreshRecord> {
+        self.issuer().refreshes(subject)
+    }
+
+    fn set_policy(&self, subject: &str, policy: SubjectPolicy) {
+        self.issuer().set_policy(subject, policy);
+    }
+
+    fn server_log(&self) -> Result<String> {
+        let path = self.stack().placement().server_log();
+        let bytes = fs::read(&path).map_err(E2eError::io(format!("reading {}", path.display())))?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
     fn get(&self, home: &Path) -> Result<TokenAnswer> {
         let endpoint = self.stack().endpoint()?;
         let input = serde_json::json!({"uri": endpoint.as_str()}).to_string();
@@ -583,6 +684,16 @@ impl Access for Secured<'_> {
 impl Secured<'_> {
     /// Starts an interactive login and captures its output streams.
     fn start_login(&self, home: &Path) -> Result<LoginProcess> {
+        self.spawn_login(home, Some(PROVIDER), true)
+    }
+
+    /// Starts a login with the requested provider and browser availability.
+    fn spawn_login(
+        &self,
+        home: &Path,
+        provider: Option<&str>,
+        browser: bool,
+    ) -> Result<LoginProcess> {
         let endpoint = self.stack().endpoint()?;
         let pin = self.stack().ca_pin()?;
         let mut command = gang(self, home);
@@ -591,9 +702,22 @@ impl Secured<'_> {
             .arg("--server")
             .arg(endpoint.as_str())
             .arg("--ca-pin")
-            .arg(pin.to_string())
-            .arg("--provider")
-            .arg(PROVIDER)
+            .arg(pin.to_string());
+        if let Some(provider) = provider {
+            command.arg("--provider").arg(provider);
+        }
+        if browser {
+            command
+                .env("DISPLAY", ":0")
+                .env_remove("WAYLAND_DISPLAY")
+                .env_remove("SSH_CONNECTION");
+        } else {
+            command
+                .env_remove("DISPLAY")
+                .env_remove("WAYLAND_DISPLAY")
+                .env("SSH_CONNECTION", "127.0.0.1 50000 127.0.0.1 22");
+        }
+        command
             .env("PATH", "")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -631,6 +755,61 @@ impl Secured<'_> {
             text
         });
         Ok((child, receiver, stderr_thread, stdout_thread))
+    }
+}
+
+/// Waits for a login and collects both output streams.
+fn finish_login(
+    mut child: std::process::Child,
+    stderr_thread: thread::JoinHandle<()>,
+    stdout_thread: thread::JoinHandle<String>,
+    lines: &[String],
+) -> Result<Ran> {
+    let status = child
+        .wait()
+        .map_err(E2eError::io("waiting for gang login"))?;
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let _ = stderr_thread.join();
+    Ok(Ran {
+        code: status.code(),
+        stdout,
+        stderr: lines.join("\n"),
+    })
+}
+
+/// Terminates a login and joins its output readers.
+fn stop_login(
+    mut child: std::process::Child,
+    stderr_thread: thread::JoinHandle<()>,
+    stdout_thread: thread::JoinHandle<String>,
+) {
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = stderr_thread.join();
+    let _ = stdout_thread.join();
+}
+
+/// Reads an optional UTF-8 client file.
+fn read_optional(path: &Path) -> Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(E2eError::io(format!("reading {}", path.display()))(error)),
+    }
+}
+
+/// Reads the modification time of an optional client file.
+fn modified_optional(path: &Path) -> Result<Option<std::time::SystemTime>> {
+    match fs::metadata(path) {
+        Ok(metadata) => metadata.modified().map(Some).map_err(E2eError::io(format!(
+            "reading modification time of {}",
+            path.display()
+        ))),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(E2eError::io(format!(
+            "reading metadata of {}",
+            path.display()
+        ))(error)),
     }
 }
 

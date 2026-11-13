@@ -2,9 +2,9 @@
 
 use gang_config::EndpointTrust;
 use gang_spi::{LoginPort, Scheme};
-use gang_types::{CertificatePem, Isa};
+use gang_types::{CertificatePem, Isa, ProviderName};
 use gang_wire::name::SERVER;
-use gang_wire::{Authentication, NoAuthentication, Server, TokenAuthentication};
+use gang_wire::{Authentication, DeviceLogin, NoAuthentication, Server, TokenAuthentication};
 
 use crate::endpoint::PublicEndpoint;
 use crate::errors::ServerError;
@@ -31,6 +31,7 @@ pub(crate) fn wire_server<V: LoginPort>(
                         .map(|section| (name.clone(), section.clone()))
                 })
                 .collect(),
+            device_login: None,
         }),
         Scheme::None => Authentication::None(NoAuthentication {}),
         Scheme::Mtls => return Err(ServerError::ClientScheme),
@@ -46,6 +47,18 @@ pub(crate) fn wire_server<V: LoginPort>(
         default_isa: default_isa.into(),
         authentication,
     })
+}
+
+/// Advertises device login on token authentication when its routes are mounted.
+pub(crate) fn advertise_device_login(
+    server: &mut Server<serde_json::Value>,
+    provider: &ProviderName,
+) {
+    if let Authentication::Token(token) = &mut server.authentication {
+        token.device_login = Some(DeviceLogin {
+            provider: provider.clone(),
+        });
+    }
 }
 
 #[cfg(test)]
@@ -110,7 +123,7 @@ mod tests {
         )
         .expect("server info builds");
 
-        let Authentication::Token(TokenAuthentication { login }) = info.authentication else {
+        let Authentication::Token(TokenAuthentication { login, .. }) = info.authentication else {
             panic!("token scheme must advertise token authentication");
         };
         assert_eq!(login.len(), 1);

@@ -4,12 +4,16 @@
 use std::future::Future;
 
 use gang_types::Url;
+use gang_wire::DeviceAuthorization;
 
 /// What an interactive login needs from the user.
 pub trait Console: Send + Sync {
     /// Shows the authorization URL to the user and offers whatever else is needed to finish a
     /// login without a local browser; may open a browser. Best effort, infallible.
     fn announce(&self, url: &Url);
+
+    /// Shows the verification address and user code for a device login.
+    fn announce_device(&self, authorization: &DeviceAuthorization);
 
     /// Resolves with a redirect URL the user pasted; stays pending for as long as no URL can
     /// arrive (input closed).

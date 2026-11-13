@@ -233,6 +233,7 @@ async fn idempotent_principal_operations_leave_the_live_epoch_unchanged() {
             core.host.clock.clone(),
         )),
         login_provider: None,
+        device: None,
     });
     let caller = Caller::Authenticated(Authenticated {
         identity: Arc::new(identity(ADMIN)),

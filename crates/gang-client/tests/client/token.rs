@@ -53,6 +53,7 @@ async fn login_interactive(harness: &Harness) -> Result<LoggedIn, ClientError> {
             server: &server,
             provider: None,
             ca_pin: None,
+            browser: gang_client::LocalBrowser::Available,
         })
         .await
 }

@@ -15,17 +15,18 @@ use bytes::{Bytes, BytesMut};
 use gang_clock::Clock;
 use gang_spi::{
     ApiRequestBody, ApiResponseBody, ApiService, Authenticated, AuthenticationPort,
-    CertificateIssue, CredentialLifecyclePort, ScalingEventSeq, StateRepositoryPort, TokenIssue,
-    full_body,
+    CertificateIssue, CredentialLifecyclePort, LoginPort, PortError, ScalingEventSeq,
+    StateRepositoryPort, TokenIssue, full_body,
 };
-use gang_types::{Identity, NonZeroDuration, ProviderName};
+use gang_types::{Identity, NonZeroDuration, Proof, ProviderName, RefreshToken};
 use gang_wire::name::{self, SESSION};
 use gang_wire::page::{PageToken, page_size};
 use gang_wire::routes::{self, Method as RouteMethod, RouteId};
 use gang_wire::{
-    AuthenticateRequest, AuthenticateResponse, Certificate, CreateCertificateRequest, ErrorReason,
-    ErrorResponse, INTERNAL_ERROR_BODY, ListEventsResponse, ListPrincipalsResponse,
-    ListRolesResponse, Principal, RevokePrincipalResponse, Role, Session, SessionLogin, Status,
+    AuthenticateRequest, AuthenticateResponse, Certificate, CreateCertificateRequest, Credential,
+    DeviceAuthorization, ErrorReason, ErrorResponse, INTERNAL_ERROR_BODY, ListEventsResponse,
+    ListPrincipalsResponse, ListRolesResponse, Principal, RedeemDeviceAuthorizationRequest,
+    RevokePrincipalResponse, Role, Session, SessionLogin, Status,
 };
 use http::header::{CONTENT_TYPE, HeaderValue, RETRY_AFTER, WWW_AUTHENTICATE};
 use http::{Method, Request, Response, StatusCode};
@@ -37,12 +38,13 @@ use serde::{
 use serde_json::Value;
 
 use crate::api_error::{
-    PortResultExt, gate_status, malformed_request, missing_permission, route_not_found,
+    PortResultExt, gate_status, malformed_request, missing_permission, route_not_found, status_of,
 };
 use crate::authorizer::Authorizer;
 use crate::client_address::ClientAddress;
 use crate::core::Core;
 use crate::deployment::Stack;
+use crate::device_logins::{MountedDevice, Redeem};
 use crate::events::wire_event;
 use crate::gate::{Caller, is_open_path};
 use crate::hub::StateHub;
@@ -85,6 +87,8 @@ pub(crate) struct ApiParts<K: Stack> {
     /// The identity provider the browser signs in with, which `GET /v1/session` reports; `None`
     /// when the browser sign-in is not mounted.
     pub(crate) login_provider: Option<ProviderName>,
+    /// The shared device-login routes, present only when mounted by the dashboard.
+    pub(crate) device: Option<Arc<MountedDevice<K::Clock, K::Identity>>>,
 }
 
 /// The Gang API. Cloning it shares the same state.
@@ -114,7 +118,7 @@ impl<K: Stack> Api<K> {
         path: &'a str,
         caller: &'a Caller,
         client: Option<IpAddr>,
-    ) -> Result<Operation<'a>, Status> {
+    ) -> Result<Operation<'a, K>, Status> {
         if let Caller::Refused(refusal) = caller {
             return Err(gate_status(refusal));
         }
@@ -167,7 +171,7 @@ impl<K: Stack> Api<K> {
         id: RouteId,
         raw: Option<&'a str>,
         authenticated: Option<&'a Authenticated>,
-    ) -> Option<Operation<'a>> {
+    ) -> Option<Operation<'a, K>> {
         let shared = &*self.0;
         Some(match id {
             RouteId::GetServer => Operation::GetServer,
@@ -177,6 +181,17 @@ impl<K: Stack> Api<K> {
                 }
                 Operation::Authenticate
             }
+            RouteId::CreateDeviceAuthorization => {
+                Operation::CreateDeviceAuthorization(shared.device.as_deref()?)
+            }
+            RouteId::GetDeviceAuthorization => Operation::GetDeviceAuthorization {
+                device: shared.device.as_deref()?,
+                raw: raw?,
+            },
+            RouteId::RedeemDeviceAuthorization => Operation::RedeemDeviceAuthorization {
+                device: shared.device.as_deref()?,
+                raw: raw?,
+            },
             RouteId::CreateCertificate => {
                 if !shared.core.workers.capabilities().certificates {
                     return None;
@@ -200,14 +215,25 @@ impl<K: Stack> Api<K> {
 
     async fn serve(
         &self,
-        operation: Operation<'_>,
+        operation: Operation<'_, K>,
         query: Option<&str>,
         body: ApiRequestBody,
         caller: &Caller,
+        client: Option<IpAddr>,
     ) -> Response<ApiResponseBody> {
         match operation {
             Operation::GetServer => json(StatusCode::OK, &self.0.info),
             Operation::Authenticate => outcome(self.authenticate(body).await),
+            Operation::CreateDeviceAuthorization(device) => {
+                outcome(self.create_device_authorization(device, body, client).await)
+            }
+            Operation::GetDeviceAuthorization { device, raw } => {
+                outcome(get_device_authorization(device, raw))
+            }
+            Operation::RedeemDeviceAuthorization { device, raw } => outcome(
+                self.redeem_device_authorization(device, raw, body, client)
+                    .await,
+            ),
             Operation::CreateCertificate => outcome(self.create_certificate(body).await),
             Operation::RevokeCertificate(raw) => outcome(self.revoke_certificate(raw, body).await),
             Operation::ListPrincipals => outcome(self.list_principals(query).await),
@@ -221,24 +247,98 @@ impl<K: Stack> Api<K> {
         }
     }
 
+    /// Exchanges a provider proof or a device-login refresh token for a bearer token.
     async fn authenticate(&self, body: ApiRequestBody) -> Result<AuthenticateResponse, Status> {
         let request: AuthenticateRequest = self.read_json(body).await?;
+        let (proof, refresh_token) = match request.credential {
+            Credential::Proof(proof) => (proof, None),
+            Credential::RefreshToken(token) => {
+                let device = self
+                    .0
+                    .device
+                    .as_ref()
+                    .filter(|device| device.provider == request.provider)
+                    .ok_or_else(|| Status::from(ErrorReason::ProofRejected))?;
+                let grant = device
+                    .verifier
+                    .renew(&token, Some(&device.client))
+                    .await
+                    .map_err(|error| match error {
+                        PortError::Rejected { .. } => Status::from(ErrorReason::ProofRejected),
+                        other => crate::api_error::port_status(&other),
+                    })?;
+                (grant.proof, grant.refresh_token)
+            }
+        };
+        self.issue_token(&request.provider, &proof, refresh_token)
+            .await
+    }
+
+    /// Issues a token after the client plugin has checked revocation and policy.
+    async fn issue_token(
+        &self,
+        provider: &ProviderName,
+        proof: &Proof,
+        refresh_token: Option<RefreshToken>,
+    ) -> Result<AuthenticateResponse, Status> {
         let core = &self.0.core;
         let issued = core
             .clients
-            .issue_token(
-                &core.host,
-                &TokenIssue {
-                    provider: &request.provider,
-                    proof: &request.proof,
-                },
-            )
+            .issue_token(&core.host, &TokenIssue { provider, proof })
             .await
             .or_status()?;
         Ok(AuthenticateResponse {
             token: issued.token,
             lifetime: issued.expires_in,
+            refresh_token,
         })
+    }
+
+    /// Starts a device login, returning its secret only in this response.
+    async fn create_device_authorization(
+        &self,
+        device: &MountedDevice<K::Clock, K::Identity>,
+        body: ApiRequestBody,
+        client: Option<IpAddr>,
+    ) -> Result<DeviceAuthorization, Status> {
+        self.read_empty(body).await?;
+        device
+            .logins
+            .create(client, &device.verification_uri, &device.provider)
+            .map_err(|error| {
+                tracing::error!(?error, "cannot create device authorization");
+                Status::from(ErrorReason::InternalError)
+            })
+    }
+
+    /// Consumes an approved device login before issuing its bearer token.
+    async fn redeem_device_authorization(
+        &self,
+        device: &MountedDevice<K::Clock, K::Identity>,
+        raw: &str,
+        body: ApiRequestBody,
+        client: Option<IpAddr>,
+    ) -> Result<AuthenticateResponse, Status> {
+        let code = name::decode(raw).map_err(|_| device_not_found(raw))?;
+        let request: RedeemDeviceAuthorizationRequest = self.read_json(body).await?;
+        let approval =
+            device
+                .logins
+                .redeem(&code, &request.secret)
+                .map_err(|error| match error {
+                    Redeem::NotFound => device_not_found(raw),
+                    Redeem::Pending => ErrorReason::AuthorizationPending.into(),
+                    Redeem::TooSoon(delay) => crate::api_error::rate_limited(delay),
+                })?;
+        let response = self
+            .issue_token(
+                &device.provider,
+                &approval.grant.proof,
+                approval.grant.refresh_token,
+            )
+            .await?;
+        tracing::info!(code = %approval.code, principal = %approval.principal, ?client, "device login redeemed");
+        Ok(response)
     }
 
     async fn create_certificate(&self, body: ApiRequestBody) -> Result<Certificate, Status> {
@@ -440,34 +540,8 @@ impl<K: Stack> Api<K> {
     }
 
     /// Reads the request body, which may not exceed the size limit.
-    async fn read_bytes(&self, mut body: ApiRequestBody) -> Result<Bytes, Status> {
-        let limit = self.0.limits.max_request_size;
-        let mut length = 0;
-        let mut first: Option<Bytes> = None;
-        let mut combined: Option<BytesMut> = None;
-        while let Some(frame) = body.frame().await {
-            let frame = frame.map_err(|_| malformed_body())?;
-            if let Ok(chunk) = frame.into_data() {
-                if chunk.len() > limit.saturating_sub(length) {
-                    return Err(ErrorReason::RequestTooLarge.into());
-                }
-                length += chunk.len();
-                if let Some(buffer) = &mut combined {
-                    buffer.extend_from_slice(&chunk);
-                } else if let Some(previous) = first.take() {
-                    let mut buffer = BytesMut::with_capacity(length);
-                    buffer.extend_from_slice(&previous);
-                    buffer.extend_from_slice(&chunk);
-                    combined = Some(buffer);
-                } else {
-                    first = Some(chunk);
-                }
-            }
-        }
-        Ok(match combined {
-            Some(buffer) => buffer.freeze(),
-            None => first.unwrap_or_default(),
-        })
+    async fn read_bytes(&self, body: ApiRequestBody) -> Result<Bytes, Status> {
+        read_body(body, self.0.limits.max_request_size).await
     }
 
     /// Reads the request body as the JSON request `T`, which rejects unknown fields.
@@ -493,6 +567,36 @@ impl<K: Stack> Api<K> {
             None => Ok(()),
         }
     }
+}
+
+/// Reads a request body without exceeding its configured size limit.
+pub(crate) async fn read_body(mut body: ApiRequestBody, limit: usize) -> Result<Bytes, Status> {
+    let mut length = 0;
+    let mut first: Option<Bytes> = None;
+    let mut combined: Option<BytesMut> = None;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| malformed_body())?;
+        if let Ok(chunk) = frame.into_data() {
+            if chunk.len() > limit.saturating_sub(length) {
+                return Err(ErrorReason::RequestTooLarge.into());
+            }
+            length += chunk.len();
+            if let Some(buffer) = &mut combined {
+                buffer.extend_from_slice(&chunk);
+            } else if let Some(previous) = first.take() {
+                let mut buffer = BytesMut::with_capacity(length);
+                buffer.extend_from_slice(&previous);
+                buffer.extend_from_slice(&chunk);
+                combined = Some(buffer);
+            } else {
+                first = Some(chunk);
+            }
+        }
+    }
+    Ok(match combined {
+        Some(buffer) => buffer.freeze(),
+        None => first.unwrap_or_default(),
+    })
 }
 
 impl<K: Stack> ApiService for Api<K> {
@@ -521,7 +625,7 @@ impl<K: Stack> ApiService for Api<K> {
                 Ok(served) => served,
                 Err(status) => return failure(status),
             };
-            let answer = this.serve(operation, parts.uri.query(), body, caller);
+            let answer = this.serve(operation, parts.uri.query(), body, caller, client);
             let deadline = this
                 .0
                 .core
@@ -538,13 +642,25 @@ impl<K: Stack> ApiService for Api<K> {
 }
 
 /// What a decided request asks the API to do, with what the decision proved: one variant per
-/// route of the table. The variants that need the dashboard or the caller carry them, so serving
-/// them needs no further lookup.
-enum Operation<'a> {
+/// route of the table. The variants that need the dashboard, device, or caller carry them, so
+/// serving them needs no further lookup.
+enum Operation<'a, K: Stack> {
     /// `GET /v1/server`: the server resource.
     GetServer,
     /// `POST /v1/session:authenticate`: exchanges a proof for a bearer credential.
     Authenticate,
+    /// `POST /v1/deviceAuthorizations`: starts a device login.
+    CreateDeviceAuthorization(&'a MountedDevice<K::Clock, K::Identity>),
+    /// `GET /v1/deviceAuthorizations/{deviceAuthorization}`: reads its public state.
+    GetDeviceAuthorization {
+        device: &'a MountedDevice<K::Clock, K::Identity>,
+        raw: &'a str,
+    },
+    /// `POST /v1/deviceAuthorizations/{deviceAuthorization}:redeem`: consumes an approval.
+    RedeemDeviceAuthorization {
+        device: &'a MountedDevice<K::Clock, K::Identity>,
+        raw: &'a str,
+    },
     /// `POST /v1/certificates`: issues a worker certificate.
     CreateCertificate,
     /// `POST /v1/certificates/{certificate}:revoke`: revokes one certificate.
@@ -570,6 +686,26 @@ enum Operation<'a> {
     },
     /// `GET /v1/session`: the caller's session.
     GetSession,
+}
+
+/// Reads a device authorization without exposing its secret.
+fn get_device_authorization<C: Clock, V>(
+    device: &MountedDevice<C, V>,
+    raw: &str,
+) -> Result<DeviceAuthorization, Status> {
+    let code = name::decode(raw).map_err(|_| device_not_found(raw))?;
+    device
+        .logins
+        .get(&code)
+        .ok_or_else(|| device_not_found(raw))
+}
+
+/// The same refusal for every way a device authorization cannot be redeemed.
+fn device_not_found(raw: &str) -> Status {
+    status_of(
+        ErrorReason::DeviceAuthorizationNotFound,
+        [("deviceAuthorization", raw.to_owned())],
+    )
 }
 
 /// The parameters every list request takes, as the caller sent them. An empty value is an unset

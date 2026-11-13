@@ -96,6 +96,15 @@ impl<const UNIT_NANOS: u64, const MIN_UNITS: u64, const MAX_UNITS: u64>
 /// A workload token lifetime in whole seconds from one minute to one hour inclusive.
 pub type TokenTtl = BoundedDuration<NANOS_PER_SECOND, 60, 3600>;
 
+/// The absolute lifetime of a browser session: whole seconds from 1 minute to 30 days.
+pub type SessionMaxAge = BoundedDuration<NANOS_PER_SECOND, 60, 2_592_000>;
+
+/// The lifetime of a device authorization (ADR-37): whole seconds from one to thirty minutes.
+pub type DeviceCodeTtl = BoundedDuration<NANOS_PER_SECOND, 60, 1800>;
+
+/// The device authorization polling interval (ADR-37): whole seconds from one second to one hour.
+pub type DevicePollInterval = BoundedDuration<NANOS_PER_SECOND, 1, 3600>;
+
 /// Errors from parsing or validating a bounded duration.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BoundedDurationError {

@@ -4,7 +4,7 @@ use std::num::NonZeroUsize;
 
 use gang_config::DashboardConfig;
 use gang_spi::LoginClient;
-use gang_types::{ClientSecret, NonZeroDuration, ProviderName};
+use gang_types::{ClientSecret, NonZeroDuration, ProviderName, SessionMaxAge};
 use http::StatusCode;
 use http::header::{CONTENT_TYPE, HeaderValue, IF_NONE_MATCH};
 
@@ -28,6 +28,9 @@ fn settings(enabled: bool) -> ServerSettings {
             },
             ttl: NonZeroDuration::from_mins(10),
             max_pending: NonZeroUsize::new(8).expect("8 is nonzero"),
+            session_max_age: SessionMaxAge::from_units(43_200),
+            renewal_reuse: NonZeroDuration::from_mins(1),
+            device: None,
         }),
         ..tls_settings()
     }

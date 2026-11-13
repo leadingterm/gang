@@ -4,7 +4,7 @@
   gang,
   ...
 }: {
-  # AMI disk image: `system.build.amazonImage` is defined in nixos/maintainers/scripts/ec2/amazon-image.nix, which the image build (not this module) must import.
+  # The EC2 disk image, `system.build.ec2Image`, is defined in ./ec2-image.nix, which the image build (not this module) imports.
   imports = [
     (modulesPath + "/virtualisation/amazon-image.nix")
     ./gang-config.nix

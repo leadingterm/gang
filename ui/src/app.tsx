@@ -8,6 +8,7 @@ import { ClientContext, useClient } from "./ui.tsx";
 import { Access } from "./views/access.tsx";
 import { Actions } from "./views/actions.tsx";
 import { Activity } from "./views/activity.tsx";
+import { Device, DeviceApproved } from "./views/device.tsx";
 import { Forbidden, SignIn, SignInError } from "./views/gate.tsx";
 import { Overview } from "./views/overview.tsx";
 import { Workers } from "./views/workers.tsx";
@@ -65,6 +66,8 @@ const Screens = () => {
   const r = route.value;
   const link = client.link.value;
   if (r.kind === "error") return <SignInError reason={r.reason} />;
+  if (r.kind === "device") return <Device error={r.error} />;
+  if (r.kind === "deviceApproved") return <DeviceApproved />;
   if (link.kind === "signed_out") return <SignIn />;
   if (!client.session.value) return null;
   const View = SCREEN_VIEWS[r.screen];

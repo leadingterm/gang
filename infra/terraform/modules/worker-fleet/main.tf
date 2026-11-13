@@ -68,6 +68,13 @@ data "aws_ec2_instance_type_offerings" "this" {
   }
 }
 
+# Gang's images boot UEFI only, so every fleet instance type must support it. Read at plan time.
+data "aws_ec2_instance_type" "this" {
+  for_each = toset(flatten(var.fleets[*].instance_types))
+
+  instance_type = each.key
+}
+
 resource "aws_launch_template" "this" {
   for_each = local.fleets
 
@@ -123,6 +130,13 @@ resource "aws_launch_template" "this" {
   tag_specifications {
     resource_type = "volume"
     tags          = merge(var.tags, { Name = each.value.name })
+  }
+
+  lifecycle {
+    precondition {
+      condition     = alltrue([for type in each.value.instance_types : contains(data.aws_ec2_instance_type.this[type].boot_modes, "uefi")])
+      error_message = "Fleet ${each.key}: Gang's images boot UEFI, and these instance types do not support it: ${join(", ", [for type in each.value.instance_types : type if !contains(data.aws_ec2_instance_type.this[type].boot_modes, "uefi")])}."
+    }
   }
 }
 

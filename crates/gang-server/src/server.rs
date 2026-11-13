@@ -29,7 +29,7 @@ use crate::endpoint::{EndpointRole, PublicEndpoint, WorkerEndpoint};
 use crate::errors::ServerError;
 use crate::gate::Gate;
 use crate::host::Host;
-use crate::info::wire_server;
+use crate::info::{advertise_device_login, wire_server};
 use crate::listeners::{Accepting, TlsPolicy};
 use crate::login::SessionRoutes;
 use crate::principals::{PrincipalSightings, RevokedPrincipals};
@@ -147,10 +147,10 @@ impl<D: Deployment> Server<D> {
                 dashboard: dashboard.as_ref().map(Dashboard::api),
                 limiter: Arc::new(RateLimiter::new(&rate_limit, Arc::clone(&core.host.clock))),
                 login_provider: None,
+                device: None,
             },
             login,
         );
-        let proxies = Arc::new(TrustedProxies::new(rate_limit.trusted_proxies.clone()));
         Ok(Self {
             provisioner: fleet,
             fleets,
@@ -158,7 +158,7 @@ impl<D: Deployment> Server<D> {
             scheduler,
             listeners,
             public,
-            public_gate: Gate::public(Arc::clone(&core), proxies),
+            public_gate: public_gate(&core, &rate_limit),
             worker_gate: Gate::worker(Arc::clone(&core)),
             core,
             revoked_certificates,
@@ -288,6 +288,15 @@ impl<D: Deployment> Server<D> {
     }
 }
 
+/// Builds the public gate with the configured trusted proxies.
+fn public_gate<K: Stack>(
+    core: &Arc<Core<K>>,
+    rate_limit: &gang_config::RateLimitConfig,
+) -> Gate<K, K::Clients> {
+    let proxies = Arc::new(TrustedProxies::new(rate_limit.trusted_proxies.clone()));
+    Gate::public(Arc::clone(core), proxies)
+}
+
 /// Validates the worker endpoint and establishes the listener security policy.
 async fn prepare_transport<K: Stack>(
     transport: TransportSettings,
@@ -315,11 +324,19 @@ fn public_service<K: Stack>(
     mut parts: ApiParts<K>,
     login: Option<LoginSettings>,
 ) -> PublicService<K> {
-    let ui = parts
-        .dashboard
-        .as_ref()
-        .map(|_| SessionRoutes::new(Arc::clone(&parts.core), login, Arc::clone(&parts.limiter)));
+    let ui = parts.dashboard.as_ref().map(|_| {
+        SessionRoutes::new(
+            Arc::clone(&parts.core),
+            login,
+            Arc::clone(&parts.limiter),
+            parts.limits.max_request_size,
+        )
+    });
     parts.login_provider = ui.as_ref().and_then(SessionRoutes::login_provider).cloned();
+    parts.device = ui.as_ref().and_then(SessionRoutes::device);
+    if let Some(device) = &parts.device {
+        advertise_device_login(&mut parts.info, &device.provider);
+    }
     PublicService {
         api: Api::new(parts),
         ui,

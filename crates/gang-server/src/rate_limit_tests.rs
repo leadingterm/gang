@@ -10,7 +10,9 @@ use crate::client_address::ClientAddress;
 use gang_config::DashboardConfig;
 use gang_spi::{ApiRequestBody, LoginClient, Peer};
 use gang_testkit::Controller;
-use gang_types::{AccessToken, ClientSecret, NonZeroDuration, PermissionSet, ProviderName};
+use gang_types::{
+    AccessToken, ClientSecret, NonZeroDuration, PermissionSet, ProviderName, SessionMaxAge,
+};
 use gang_wire::routes::{AUTHENTICATE_SESSION, GET_SERVER, GET_STATE, LOGIN_PATH};
 use gang_wire::{Code, ErrorReason, ErrorResponse};
 use http::header::{CACHE_CONTROL, RETRY_AFTER};
@@ -90,6 +92,9 @@ fn login_settings(enabled: bool) -> ServerSettings {
             },
             ttl: NonZeroDuration::from_mins(10),
             max_pending: NonZeroUsize::new(8).expect("8 is nonzero"),
+            session_max_age: SessionMaxAge::from_units(43_200),
+            renewal_reuse: NonZeroDuration::from_mins(1),
+            device: None,
         }),
         ..with_rate_limit(
             tls_settings(),

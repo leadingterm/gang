@@ -1,6 +1,6 @@
 # ADR-06: Clients authenticate with short-lived bearer tokens
 
-Status: Accepted. Replaces the earlier model in which every caller, clients included, held a client certificate.
+Status: Accepted. Replaces the earlier model in which every caller, clients included, held a client certificate. Amended by ADR-37 (device login renewal through Gang).
 
 ## Context
 - Developers and CI jobs gain nothing from client certificates: Bazel needs only server TLS plus a bearer credential. The certificate flow cost a wrapper script, a generated rc file and a renewal command.

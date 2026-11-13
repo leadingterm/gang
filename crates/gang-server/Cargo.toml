@@ -9,6 +9,7 @@ version.workspace = true
 workspace = true
 
 [dependencies]
+base64 = { workspace = true }
 bytes = { workspace = true }
 form_urlencoded = { workspace = true }
 futures = { workspace = true }
@@ -28,6 +29,7 @@ http-body-util = { workspace = true }
 ipnet = { workspace = true }
 lru = { workspace = true }
 parking_lot = { workspace = true }
+ring = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

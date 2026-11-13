@@ -7,7 +7,7 @@ This file is the one reference for routes and bodies. The route table, the wire 
 Conventions that hold for every route:
 
 - **Versioning.** The major version is the URL prefix. `/v1` evolves additively only: fields, enum values, oneof members, error reasons, metadata keys and routes may be added, and nothing is renamed, repurposed or removed. A break would be served as `/v2` alongside.
-- **Authentication.** A caller presents `Authorization: Bearer <token>`, a token obtained from `POST /v1/session:authenticate`. The `GET` routes marked "cookie" below also accept the browser session cookie; the cookie is never read for `POST`, so no state-changing route authenticates by cookie. A deployment whose authentication is `none` needs no credential and identifies every caller as the principal `none:anonymous`, whose permissions come from its roles like any other.
+- **Authentication.** A caller presents `Authorization: Bearer <token>`, a token obtained from `POST /v1/session:authenticate`. The `GET` routes marked "cookie" below also accept the browser session cookie; the session cookie is never read for `POST`, so no state-changing route authenticates by it. A deployment whose authentication is `none` needs no credential and identifies every caller as the principal `none:anonymous`, whose permissions come from its roles like any other.
 - **Authorization.** Each route has a permission, or is `open`. A caller holds a permission through a `[[server.roles]]` role of `gang.toml`. The caller is authenticated and authorized before the existence of any named resource is checked, so a caller without the permission learns nothing about what exists.
 - **Names.** A resource is named `collection/{id}`; singletons are `server`, `session` and `state`. An ID is exactly one path segment: every byte outside `A-Z a-z 0-9 - . _ ~` is percent-encoded with uppercase hex, in URLs and in every `name` or reference field, so an encoded ID never contains `:` or `/`. The verb of a custom method is the text after the last `:` of the final segment. The principal `google:ops@example.org` is therefore `principals/google%3Aops%40example.org`, and `POST /v1/principals/google%3Aops%40example.org:revoke` revokes it. The decoded ID of a principal is its identity string `provider:principal`, the same string as the token `sub`. A reference to another resource is always its full name (`fleets/x86-64-spot`), never a bare ID.
 - **JSON.** Keys are lowerCamelCase (map keys, such as fleet `properties` and the provider names under `authentication.token.login`, are data and are not renamed). Timestamps are RFC 3339 in UTC with milliseconds, `2026-01-14T09:20:02.000Z`, and field names end in `Time`; a parser accepts any RFC 3339 offset. Durations are seconds with an optional fraction and an `s` suffix, `600s` or `0.250s`. Enums are `UPPER_SNAKE` strings. A union is a oneof: exactly one member key is present and there is no tag field. Absent optional values are omitted, never `null`; scalars (counts, booleans, `0`) are always present. 64-bit integers are JSON numbers.
@@ -55,6 +55,9 @@ curl https://gang.example.com/v1/server
             "scopes": ["openid", "email"]
           }
         }
+      },
+      "deviceLogin": {
+        "provider": "google"
       }
     }
   }
@@ -88,6 +91,7 @@ A deployment on a trusted network with no authentication:
 - `caCertificate` is the certificate authority the client should trust for those endpoints; it is omitted when the server has none, and when `[server] endpoint_trust = "system"`, where a publicly trusted terminator presents the endpoint and clients use their system roots.
 - `defaultIsa` is the instruction set a build gets when it does not name one. `gang bazelrc` writes it as `--remote_default_exec_properties=ISA=<defaultIsa>`.
 - `authentication` is a oneof. `token` means the client obtains a bearer token with `POST /v1/session:authenticate`; `none` means no credential is needed. A client that meets a member it does not know must stop and say so.
+- `authentication.token.deviceLogin` names the dashboard sign-in provider when device login is mounted; it is omitted otherwise.
 - The route is open: it is the first call a client makes, before it has any credential.
 
 ## session
@@ -126,6 +130,23 @@ curl -X POST https://gang.example.com/v1/session:authenticate \
 }
 ```
 
+Renew a device login through Gang's confidential web client:
+
+```json request AuthenticateRequest
+{
+  "provider": "google",
+  "refreshToken": "provider-refresh-token"
+}
+```
+
+```json response AuthenticateResponse
+{
+  "token": "eyJhbGciOiJFUzI1NiJ9.e30.c2ln",
+  "lifetime": "600s",
+  "refreshToken": "rotated-provider-refresh-token"
+}
+```
+
 Read the session of the token's bearer:
 
 ```sh
@@ -157,10 +178,10 @@ The same route without a credential answers `200` with an anonymous session:
 
 | Reason | When |
 |---|---|
-| `MALFORMED_REQUEST` | the body is not JSON, has an unknown field, or a field of the wrong type |
+| `MALFORMED_REQUEST` | the body is not JSON, has an unknown field or wrong type, or has both or neither of `proof` and `refreshToken` |
 | `REQUEST_TOO_LARGE` | the body exceeds `max_request_size` |
 | `UNKNOWN_PROVIDER` | `provider` names an identity provider the server does not configure; the metadata key is `provider` |
-| `PROOF_REJECTED` | the identity provider rejected the proof (`401`) |
+| `PROOF_REJECTED` | the provider rejected the proof or refresh token, or refresh was requested for a provider other than the mounted device-login provider (`401`) |
 | `POLICY_DENIED` | the issuance policy refuses the principal |
 | `PRINCIPAL_REVOKED` | the proof verified, but its principal is revoked |
 | `RATE_LIMITED` | the caller sent more requests than `[server.rate_limit]` allows (`429`) |
@@ -191,7 +212,100 @@ The same route without a credential answers `200` with an anonymous session:
 - `GET /v1/session` is always `200`, also for a caller with no credential, an expired cookie, or no valid proof: the caller's session always exists, and an anonymous session simply has no `principal`. This is deliberate and is not an error case. A caller with a revoked principal or a malformed `Authorization` header is still refused with the envelope (`PRINCIPAL_REVOKED`, `CREDENTIALS_INVALID`). A bearer token works on this route, so a CLI gets `whoami` from it, and the browser classifies a failed `state:watch` connect by calling it.
 - `GET /v1/session` accepts the session cookie. `permissions` is the set the caller holds, with `*` expanded to the permission names, in canonical order. `expireTime` is when the caller's credential stops being valid and is omitted when it does not expire. `login` is present exactly when the browser login routes are mounted; its `provider` is the provider the dashboard signs in with.
 - `POST /v1/session:authenticate` is mounted only if the client authentication plugin issues tokens (`authentication` is `token` in `GET /v1/server`); otherwise it is `404 ROUTE_NOT_FOUND`. It verifies the proof with the named provider, applies the provider's required claims, and signs an access token for `provider:principal`. A token is accepted until its `lifetime` has elapsed; there is no per-token revocation, but revoking the principal makes the gate refuse its tokens at the next request.
+- The request contains exactly one of `proof` and `refreshToken`. A refresh token is accepted only for the mounted device-login provider; the server renews it with the dashboard web client, then verifies and issues as for a proof. `refreshToken` in the response is optional and carries a rotated provider refresh token when returned; store it before the bearer token.
 - The token is opaque to clients. Present it as `Authorization: Bearer <token>`.
+
+## deviceAuthorizations
+
+### Name
+
+`deviceAuthorizations/{userCode}`: a pending headless login. The user code is displayed as `XXXX-XXXX`.
+
+### Methods
+
+| Method | Path | Permission |
+|---|---|---|
+| `POST` | `/v1/deviceAuthorizations` | `open` |
+| `GET` | `/v1/deviceAuthorizations/{deviceAuthorization}` | `open` |
+| `POST` | `/v1/deviceAuthorizations/{deviceAuthorization}:redeem` | `open` |
+
+### Examples
+
+Create an authorization with an empty body or `{}`:
+
+```sh
+curl -X POST https://gang.example.com/v1/deviceAuthorizations -d '{}'
+```
+
+```json response DeviceAuthorization
+{
+  "name": "deviceAuthorizations/BCDF-GHJK",
+  "provider": "google",
+  "verificationUri": "https://gang.example.com/ui/device",
+  "clientAddress": "203.0.113.9",
+  "state": "PENDING",
+  "createTime": "2026-01-14T09:20:00.000Z",
+  "expireTime": "2026-01-14T09:30:00.000Z",
+  "pollInterval": "5s",
+  "secret": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+}
+```
+
+Get the authorization, without its secret:
+
+```sh
+curl https://gang.example.com/v1/deviceAuthorizations/BCDF-GHJK
+```
+
+```json response DeviceAuthorization
+{
+  "name": "deviceAuthorizations/BCDF-GHJK",
+  "provider": "google",
+  "verificationUri": "https://gang.example.com/ui/device",
+  "clientAddress": "203.0.113.9",
+  "state": "APPROVED",
+  "createTime": "2026-01-14T09:20:00.000Z",
+  "expireTime": "2026-01-14T09:30:00.000Z",
+  "pollInterval": "5s"
+}
+```
+
+Redeem after the user approves:
+
+```sh
+curl -X POST https://gang.example.com/v1/deviceAuthorizations/BCDF-GHJK:redeem \
+  -d '{"secret":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}'
+```
+
+```json request RedeemDeviceAuthorizationRequest
+{
+  "secret": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+}
+```
+
+```json response AuthenticateResponse
+{
+  "token": "eyJhbGciOiJFUzI1NiJ9.e30.c2ln",
+  "lifetime": "600s",
+  "refreshToken": "provider-refresh-token"
+}
+```
+
+### Errors
+
+| Reason | When |
+|---|---|
+| `AUTHORIZATION_PENDING` | redemption is not yet approved (`400`) |
+| `DEVICE_AUTHORIZATION_NOT_FOUND` | the code is unknown, expired or already redeemed, or the secret is wrong; all give the identical `404` with `deviceAuthorization` metadata |
+| `RATE_LIMITED` | the caller exceeds the rate limit or polls before `pollInterval`; retry after `Retry-After` (`429`) |
+| `PRINCIPAL_REVOKED` | the approved principal is revoked at redemption (`403`); the authorization is consumed |
+
+### Notes
+
+- These routes are open and rate limited, and mounted only when device login is enabled and dashboard sign-in is mounted. `authentication.token.deviceLogin` announces the provider.
+- The user types the code at `verificationUri` and signs in to approve. `clientAddress`, when present, is the server-observed address of the creator. Codes ignore case, spaces and hyphens on input.
+- `secret` is returned only on create and is required for redemption. The authorization is in memory, bounded and expiring; the first approval wins, and successful redemption consumes it.
+- Approval requests offline access. Redemption applies the normal issuance policy and revocation check and returns the provider refresh token; never expose the secret or refresh token to another user.
 
 ## state
 
@@ -788,6 +902,7 @@ Every non-2xx answer on `/v1/**` is the same envelope, `google.rpc.Status` as in
 | `REQUEST_TOO_LARGE` | 400 | `INVALID_ARGUMENT` | — |
 | `INVALID_PAGE_TOKEN` | 400 | `INVALID_ARGUMENT` | — |
 | `UNKNOWN_PROVIDER` | 400 | `INVALID_ARGUMENT` | `provider` |
+| `AUTHORIZATION_PENDING` | 400 | `FAILED_PRECONDITION` | — |
 | `PROOF_REJECTED` | 401 | `UNAUTHENTICATED` | — |
 | `CREDENTIALS_MISSING` | 401 | `UNAUTHENTICATED` | — |
 | `CREDENTIALS_INVALID` | 401 | `UNAUTHENTICATED` | — |
@@ -797,6 +912,7 @@ Every non-2xx answer on `/v1/**` is the same envelope, `google.rpc.Status` as in
 | `ROUTE_NOT_FOUND` | 404 | `NOT_FOUND` | `method`, `path` |
 | `CERTIFICATE_NOT_FOUND` | 404 | `NOT_FOUND` | `certificate` |
 | `PRINCIPAL_NOT_FOUND` | 404 | `NOT_FOUND` | `principal` |
+| `DEVICE_AUTHORIZATION_NOT_FOUND` | 404 | `NOT_FOUND` | `deviceAuthorization` |
 | `RATE_LIMITED` | 429 | `RESOURCE_EXHAUSTED` | — |
 | `DEPENDENCY_UNAVAILABLE` | 503 | `UNAVAILABLE` | — |
 | `REQUEST_TIMED_OUT` | 504 | `DEADLINE_EXCEEDED` | — |
@@ -808,6 +924,7 @@ What each reason means:
 - `REQUEST_TOO_LARGE`: the body exceeds the server's `max_request_size`.
 - `INVALID_PAGE_TOKEN`: the page token is not one this server issued, or was issued for a different `filter`.
 - `UNKNOWN_PROVIDER`: the body names an identity provider the server does not configure. It is a bad reference in the request, not a missing resource, so it is `400`.
+- `AUTHORIZATION_PENDING`: the device authorization has not been approved yet.
 - `PROOF_REJECTED`: the identity provider rejected the proof of identity.
 - `CREDENTIALS_MISSING`: the route needs an identity and the request presents none; this includes an unknown path for an anonymous caller.
 - `CREDENTIALS_INVALID`: a credential was presented and refused: expired, malformed, for another audience, or an unusable `Authorization` header.
@@ -816,6 +933,7 @@ What each reason means:
 - `MISSING_PERMISSION`: the caller is authenticated and lacks the permission the route requires; the metadata names it.
 - `ROUTE_NOT_FOUND`: no route matches the method and path, or the route is not mounted on this deployment.
 - `CERTIFICATE_NOT_FOUND`, `PRINCIPAL_NOT_FOUND`: the named resource does not exist.
+- `DEVICE_AUTHORIZATION_NOT_FOUND`: the device authorization is unknown, expired or already redeemed, or its secret is wrong; these cases are indistinguishable.
 - `RATE_LIMITED`: a client address, or the server as a whole, sent more requests to an open route than `[server.rate_limit]` allows. The answer carries `Retry-After` and a `RetryInfo` detail; retry after that wait.
 - `DEPENDENCY_UNAVAILABLE`: the ledger, an identity provider or the signer cannot be reached, including when the gate cannot check the caller (`503` on every `/v1/**` route); retrying later may succeed.
 - `REQUEST_TIMED_OUT`: the request did not finish within `request_timeout`.
@@ -962,13 +1080,17 @@ A path or method no route matches, for an authenticated caller:
 | Method | Path | Behaviour |
 |---|---|---|
 | `GET` | `/ui/login?next=` | Starts the sign-in: `302` to the identity provider's authorization URL and sets the sign-in cookie. `next` must be `/ui` or below; anything else is replaced by `/ui`. Mounted only when `[dashboard.login]` is configured. |
-| `GET` | `/ui/callback` | The OAuth redirect URI that is registered with the identity provider. It completes the sign-in, sets the session cookie, clears the sign-in cookie and answers `302` to `next`, or to `/ui/error?reason=denied\|failed\|unavailable` on a failure. Mounted like `/ui/login`. |
-| `POST` | `/ui/logout` | Clears the session cookie: `204` when `Sec-Fetch-Site` is `same-origin` or `Origin` equals the endpoint's origin, otherwise `403`. |
+| `GET` | `/ui/callback` | The registered OAuth redirect URI. A dashboard sign-in sets the session cookie and redirects to `next`; a device approval sets no session or renewal cookie and redirects to `/ui/device/approved`. Both clear the sign-in cookie; failures redirect to `/ui/error?reason=denied\|failed\|unavailable`. Mounted like `/ui/login`. |
+| `POST` | `/ui/renew` | Renews from the sealed renewal cookie; requires `Sec-Fetch-Site: same-origin` or `Origin` equal to the endpoint's origin and is rate limited. Empty answers: `204` sets a new session cookie and reseals the renewal cookie only if the token rotated, keeping its deadline; `401` keeps the cookie past `session_max_age`, but clears it for a missing, invalid or refused token or another principal; `403` clears it for a revoked or denied principal but not for a cross-site request; `429` is rate limited; `503` keeps the cookie when the provider is unavailable. Mounted like `/ui/login`. |
+| `POST` | `/ui/logout` | Clears the session and renewal cookies: `204` when `Sec-Fetch-Site` is `same-origin` or `Origin` equals the endpoint's origin, otherwise `403`. |
+| `POST` | `/ui/device` | Approves a device login via form field `userCode`. Requires the same-origin rule and is rate limited; cross-site requests get `403`. Unknown, expired or already approved codes get `303` to `/ui/device?error=unknown`. Otherwise sets the sign-in cookie and redirects with `303` to the provider for an offline sign-in. Mounted only with device login. |
+| `GET` | `/ui/device` | The code-entry and approval page; it shows the request's server-observed address and age before approval. |
+| `GET` | `/ui/device/approved` | The page shown after a successful device approval. |
 | `GET` | `/ui/error?reason=` | The page that explains a failed sign-in. `reason` is `denied`, `failed` or `unavailable`; these are lowercase route parameters, not API enum values. |
 | `GET` | `/ui/**` | The embedded dashboard bundle: hashed assets with long-lived caching, and `index.html` for every path without a file extension. |
 
-- `GET /ui/login` and `GET /ui/callback` are rate limited like the open API routes. When a client address, or the server as a whole, exceeds `[server.rate_limit]`, the answer is an empty `429` with `Retry-After` in whole seconds. It is not the error envelope.
-- The session cookie is `__Host-gang_session` under an `https` endpoint and `gang_session` otherwise. It is `HttpOnly; SameSite=Strict; Path=/` and is `Secure` under `https`. The sign-in cookie is `__Host-gang_login` or `gang_login`, `SameSite=Lax` because the callback is a cross-site navigation. Cookies are read only for `GET` of the cookie routes of the API; when a bearer token and a cookie are both present, the token wins.
+- `GET /ui/login`, `GET /ui/callback`, `POST /ui/renew` and `POST /ui/device` are rate limited like the open API routes. When a client address, or the server as a whole, exceeds `[server.rate_limit]`, the answer is an empty `429` with `Retry-After` in whole seconds. It is not the error envelope.
+- The session cookie is `__Host-gang_session` under an `https` endpoint and `gang_session` otherwise. It is `HttpOnly; SameSite=Strict; Path=/` and is `Secure` under `https`. The sign-in cookie is `__Host-gang_login` or `gang_login`, `SameSite=Lax` because the callback is a cross-site navigation. The renewal cookie is `__Host-gang_renewal` or `gang_renewal`, `HttpOnly; SameSite=Strict; Path=/` and `Secure` under `https`; its `Max-Age` is 400 days (the RFC 6265bis browser cap), while the sealed `expireTime` bounds renewal. Keeping it beyond that deadline lets the next sign-in re-check the token without consent. Its sealed value is not set over 4000 bytes. Only `GET /ui/login` and `POST /ui/renew` read the renewal cookie; the callback uses the renewal carried by its sign-in attempt. The session cookie is read only for `GET` and `HEAD` of the cookie routes of the API; when a bearer token and a cookie are both present, the token wins.
 - The dashboard reads the API with the session cookie: `GET /v1/session`, `GET /v1/state`, `GET /v1/state:watch`, `GET /v1/principals`, `GET /v1/roles` and `GET /v1/events`. Its sign-in state comes from `GET /v1/session`.
 - The shell and the static assets carry no data, so a refusal recorded for the caller does not stop them: a revoked or signed-out visitor still loads the page, and the API calls it makes answer with the envelope.
 - With the dashboard disabled, `/ui/**` is handled like any unknown path.

@@ -549,6 +549,7 @@ fn identity_ports_reach_their_plugin() -> Result<(), Box<dyn Error>> {
     let challenge = ready(identity.begin_login(&LoginRequest {
         redirect_uri: &redirect_uri,
         client: None,
+        offline: false,
     }))?;
     assert_eq!(
         challenge.authorization_url,

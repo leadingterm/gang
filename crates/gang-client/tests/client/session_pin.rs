@@ -37,6 +37,7 @@ async fn logged_in_over_tls() -> Harness {
             server: &server,
             provider: None,
             ca_pin: Some(&pin),
+            browser: gang_client::LocalBrowser::Available,
         })
         .await
         .expect("the TLS login succeeds");

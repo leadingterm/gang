@@ -2,7 +2,9 @@
 
 use gang_types::{AccessToken, Proof, ProviderName};
 use gang_wire::routes::{AUTHENTICATE_SESSION, CREATE_CERTIFICATE, GET_SERVER, LIST_EVENTS};
-use gang_wire::{AuthenticateRequest, AuthenticateResponse, Authentication, ErrorReason, Server};
+use gang_wire::{
+    AuthenticateRequest, AuthenticateResponse, Authentication, Credential, ErrorReason, Server,
+};
 use serde_json::{Value, json};
 
 use crate::api_test_support::{
@@ -241,7 +243,7 @@ async fn authenticate_answers_the_bearer_token_and_its_lifetime() {
         |controller| async move {
             let request = AuthenticateRequest {
                 provider: ProviderName::try_new(PROVIDER).expect("provider name is valid"),
-                proof: Proof::new(ALICE_PROOF),
+                credential: Credential::Proof(Proof::new(ALICE_PROOF)),
             };
             let answer = send(
                 &controller,

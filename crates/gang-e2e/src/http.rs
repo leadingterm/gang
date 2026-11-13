@@ -21,7 +21,9 @@ use crate::errors::{E2eError, Result};
 /// The largest buffered response body accepted by the harness.
 const MAX_BODY: gang_types::NonZeroBytes = gang_types::NonZeroBytes::mib(16);
 
-/// A blocking client and the runtime that drives its requests.
+/// A blocking client and the runtime that drives its requests; the runtime has its own worker
+/// thread, so pooled connections keep answering the server's keep-alive pings between requests,
+/// as a browser's do.
 pub(crate) struct Http {
     runtime: Arc<Runtime>,
     client: HttpClient,
@@ -38,7 +40,9 @@ impl Http {
         let timeout_setting = NonZeroDuration::try_new(timeout)
             .map_err(E2eError::system_from("invalid http timeout"))?;
         let runtime = Arc::new(
-            Builder::new_current_thread()
+            Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name("gang-e2e-http")
                 .enable_all()
                 .build()
                 .map_err(E2eError::io("starting the http runtime"))?,

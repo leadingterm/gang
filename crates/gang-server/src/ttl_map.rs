@@ -48,6 +48,19 @@ impl<K: Hash + Eq, V> TtlMap<K, V> {
         (now < *expires_at).then_some(value)
     }
 
+    /// Returns a mutable live value without changing write order.
+    pub(crate) fn get_live_mut<Q: Hash + Eq + ?Sized>(
+        &mut self,
+        key: &Q,
+        now: Tick,
+    ) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+    {
+        let (value, expires_at) = self.entries.peek_mut(key)?;
+        (now < *expires_at).then_some(value)
+    }
+
     /// Removes a value and returns it only if it is still live.
     pub(crate) fn take_live<Q: Hash + Eq + ?Sized>(&mut self, key: &Q, now: Tick) -> Option<V>
     where
@@ -93,6 +106,21 @@ mod tests {
         assert_eq!(entries.get_live(&"a", at(9)), Some(&1));
         assert_eq!(entries.get_live(&"a", at(10)), None);
         assert_eq!(entries.take_live(&"a", at(10)), None);
+    }
+
+    #[test]
+    fn get_live_mut_changes_a_live_entry_only() {
+        let mut entries = map();
+        entries.insert("a", 1, at(0));
+        entries.insert("b", 2, at(1));
+        *entries.get_live_mut(&"a", at(2)).expect("a is live") = 3;
+        assert_eq!(entries.get_live(&"a", at(2)), Some(&3));
+        assert!(entries.get_live_mut(&"missing", at(2)).is_none());
+        entries.insert("c", 4, at(3));
+        assert!(entries.get_live(&"a", at(3)).is_none());
+        assert_eq!(entries.get_live(&"b", at(3)), Some(&2));
+        assert!(entries.get_live_mut(&"b", at(11)).is_none());
+        assert_eq!(entries.take_live(&"b", at(10)), Some(2));
     }
 
     #[test]

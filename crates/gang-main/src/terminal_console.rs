@@ -83,6 +83,23 @@ impl Console for TerminalConsole {
         self.announce_with(url, spawn_browser);
     }
 
+    fn announce_device(&self, authorization: &gang_wire::DeviceAuthorization) {
+        let code = authorization
+            .name
+            .strip_prefix("deviceAuthorizations/")
+            .unwrap_or(&authorization.name);
+        let minutes = authorization.expire_time.as_unix_millis() / 60_000;
+        self.out.notice(Line::new().plain(format!(
+            "To sign in from any device, open {}",
+            authorization.verification_uri
+        )));
+        self.out.notice(Line::new().plain(format!(
+            "and enter the code {code} (valid until {:02}:{:02}Z)",
+            (minutes / 60) % 24,
+            minutes % 60
+        )));
+    }
+
     fn pasted_redirect(&self) -> impl Future<Output = Url> + Send {
         let receiver = self.paste.get_or_init(|| {
             let (sender, receiver) = mpsc::unbounded_channel();

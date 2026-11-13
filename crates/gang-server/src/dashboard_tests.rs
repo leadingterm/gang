@@ -13,7 +13,9 @@ use gang_spi::{
     StateRepositoryPort,
 };
 use gang_testkit::{Controller, FakeRepository};
-use gang_types::{AccessToken, ClientSecret, FleetName, NonZeroDuration, ProviderName};
+use gang_types::{
+    AccessToken, ClientSecret, FleetName, NonZeroDuration, ProviderName, SessionMaxAge,
+};
 use gang_wire::routes::{
     GET_SERVER, GET_SESSION, GET_STATE, RESTORE_PRINCIPAL, REVOKE_PRINCIPAL, WATCH_STATE,
 };
@@ -268,6 +270,9 @@ async fn server_info_never_contains_the_dashboard_client_secret() {
             },
             ttl: NonZeroDuration::from_mins(10),
             max_pending: NonZeroUsize::new(8).expect("8 is non-zero"),
+            session_max_age: SessionMaxAge::from_units(43_200),
+            renewal_reuse: NonZeroDuration::from_mins(1),
+            device: None,
         }),
         ..tls_settings()
     };

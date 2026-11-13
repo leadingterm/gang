@@ -3007,6 +3007,132 @@ fn dashboard_defaults_apply_when_the_section_is_omitted() -> Result<(), Box<dyn 
 }
 
 #[test]
+fn dashboard_device_defaults() -> Result<(), Box<dyn Error>> {
+    let config = Sections::VALID.parse()?;
+    let device = &config.dashboard.device;
+    assert!(device.enabled);
+    assert_eq!(device.ttl.get(), Duration::from_mins(10));
+    assert_eq!(device.poll_interval.get(), Duration::from_secs(5));
+    assert_eq!(device.max_pending.get(), 1024);
+
+    let config = with_dashboard(
+        "[dashboard.device]\nenabled = false\nttl = \"2m\"\npoll_interval = \"10s\"\nmax_pending = 2\n",
+    )?;
+    let device = &config.dashboard.device;
+    assert!(!device.enabled);
+    assert_eq!(device.ttl.get(), Duration::from_mins(2));
+    assert_eq!(device.poll_interval.get(), Duration::from_secs(10));
+    assert_eq!(device.max_pending.get(), 2);
+    assert!(with_dashboard("[dashboard.device]\nmax_pending = 0\n").is_err());
+    Ok(())
+}
+
+#[test]
+fn dashboard_device_ttl_and_poll_interval_are_bounded() -> Result<(), Box<dyn Error>> {
+    for (text, seconds) in [
+        ("[dashboard.device]\nttl = \"1m\"\n", 60),
+        ("[dashboard.device]\nttl = \"30m\"\n", 1800),
+    ] {
+        assert_eq!(
+            with_dashboard(text)?.dashboard.device.ttl.get(),
+            Duration::from_secs(seconds)
+        );
+    }
+    for text in [
+        "[dashboard.device]\nttl = \"59s\"\n",
+        "[dashboard.device]\nttl = \"31m\"\n",
+        "[dashboard.device]\npoll_interval = \"0s\"\n",
+        "[dashboard.device]\npoll_interval = \"500ms\"\n",
+        "[dashboard.device]\npoll_interval = \"3601s\"\n",
+    ] {
+        assert!(with_dashboard(text).is_err(), "{text}");
+    }
+    for (text, seconds) in [
+        ("[dashboard.device]\npoll_interval = \"1s\"\n", 1),
+        (
+            "[dashboard.device]\nttl = \"30m\"\npoll_interval = \"1799s\"\n",
+            1799,
+        ),
+    ] {
+        assert_eq!(
+            with_dashboard(text)?.dashboard.device.poll_interval.get(),
+            Duration::from_secs(seconds)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn dashboard_device_poll_interval_must_be_shorter_than_ttl() -> Result<(), Box<dyn Error>> {
+    let message = rejection(&Sections {
+        dashboard: "[dashboard.device]\nttl = \"1m\"\npoll_interval = \"1m\"\n",
+        ..Sections::VALID
+    })?;
+    assert!(
+        message.contains("dashboard.device poll_interval must be shorter than ttl"),
+        "{message}"
+    );
+    let message = rejection(&Sections {
+        dashboard: "[dashboard.device]\nttl = \"1m\"\npoll_interval = \"1h\"\n",
+        ..Sections::VALID
+    })?;
+    assert!(
+        message.contains("dashboard.device poll_interval must be shorter than ttl"),
+        "{message}"
+    );
+    let config = with_dashboard("[dashboard.device]\nttl = \"1m\"\npoll_interval = \"59s\"\n")?;
+    assert_eq!(
+        config.dashboard.device.poll_interval.get(),
+        Duration::from_secs(59)
+    );
+    Ok(())
+}
+
+#[test]
+fn dashboard_device_rejects_unknown_keys() -> Result<(), Box<dyn Error>> {
+    let message = rejection(&Sections {
+        dashboard: "[dashboard.device]\nbogus = 1\n",
+        ..Sections::VALID
+    })?;
+    assert!(message.contains("bogus"), "{message}");
+    Ok(())
+}
+
+#[test]
+fn session_max_age_defaults_to_twelve_hours_and_is_bounded() -> Result<(), Box<dyn Error>> {
+    assert_eq!(
+        Sections::VALID.parse()?.dashboard.session_max_age.get(),
+        Duration::from_hours(12)
+    );
+    for (text, seconds) in [
+        ("[dashboard]\nsession_max_age = \"1m\"\n", 60),
+        ("[dashboard]\nsession_max_age = \"30d\"\n", 2_592_000),
+    ] {
+        assert_eq!(
+            with_dashboard(text)?.dashboard.session_max_age.get(),
+            Duration::from_secs(seconds)
+        );
+    }
+    for text in [
+        "[dashboard]\nsession_max_age = \"59s\"\n",
+        "[dashboard]\nsession_max_age = \"31d\"\n",
+    ] {
+        assert!(with_dashboard(text).is_err(), "{text}");
+    }
+    Ok(())
+}
+
+#[test]
+fn renewal_reuse_defaults_to_one_minute() -> Result<(), Box<dyn Error>> {
+    assert_eq!(
+        Sections::VALID.parse()?.dashboard.renewal_reuse,
+        NonZeroDuration::from_mins(1)
+    );
+    assert!(with_dashboard("[dashboard]\nrenewal_reuse = \"0s\"\n").is_err());
+    Ok(())
+}
+
+#[test]
 fn every_dashboard_key_can_be_overridden() -> Result<(), Box<dyn Error>> {
     let config = with_dashboard(
         r#"
@@ -3023,6 +3149,8 @@ detail_interval = "3s"
 actions_stale_after = "45s"
 login_ttl = "5m"
 max_pending_logins = 16
+session_max_age = "24h"
+renewal_reuse = "2m"
 "#,
     )?;
     let dashboard = &config.dashboard;
@@ -3043,6 +3171,8 @@ max_pending_logins = 16
     assert_eq!(dashboard.actions_stale_after(), Duration::from_secs(45));
     assert_eq!(dashboard.login_ttl, NonZeroDuration::from_mins(5));
     assert_eq!(dashboard.max_pending_logins.get(), 16);
+    assert_eq!(dashboard.session_max_age.get(), Duration::from_hours(24));
+    assert_eq!(dashboard.renewal_reuse, NonZeroDuration::from_mins(2));
     Ok(())
 }
 

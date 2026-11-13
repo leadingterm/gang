@@ -30,6 +30,7 @@ mod cookies;
 mod core;
 mod dashboard;
 mod deployment;
+mod device_logins;
 mod endpoint;
 mod errors;
 mod events;
@@ -44,6 +45,8 @@ mod principals;
 mod publish;
 mod query;
 mod rate_limit;
+mod renewal_flights;
+mod renewal_seal;
 mod resources;
 mod responses;
 mod revocation;
@@ -83,6 +86,8 @@ mod composite_tests;
 mod control_tests;
 #[cfg(test)]
 mod dashboard_tests;
+#[cfg(test)]
+mod device_api_tests;
 #[cfg(test)]
 mod gate_tests;
 #[cfg(test)]
@@ -134,5 +139,6 @@ pub use errors::ServerError;
 pub use identity::{Provider, Providers};
 pub use server::Server;
 pub use settings::{
-    HandshakeSettings, LoginSettings, RequestLimits, ServerSettings, TlsSettings, TransportSettings,
+    DeviceSettings, HandshakeSettings, LoginSettings, RequestLimits, ServerSettings, TlsSettings,
+    TransportSettings,
 };

@@ -29,8 +29,10 @@ jobs:
       actions: read
     outputs:
       run-id: ${{ steps.ci.outputs.run-id }}
+      dry-run-id: ${{ steps.dry-run.outputs.run-id }}
     steps:
       - name: Require a passed dry run of the tagged commit
+        id: dry-run
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -51,6 +53,7 @@ jobs:
             exit 1
           fi
           echo "dry run $dry_run of $SHA passed"
+          echo "run-id=$dry_run" >> "$GITHUB_OUTPUT"
       - name: Find the CI run to release
         id: ci
         env:
@@ -94,7 +97,7 @@ jobs:
           path: staged
           run-id: ${{ needs.locate.outputs.run-id }}
           github-token: ${{ github.token }}
-      # make-disk-image installs the bootloader in a VM: KVM where the runner has it (x86_64), qemu's TCG fallback otherwise (aarch64).
+      # Each image build boots the image under UEFI firmware: KVM where the runner has it (x86_64), qemu's TCG fallback otherwise (aarch64).
       - name: Build the images
         env:
           NIX_CONFIG: extra-system-features = kvm
@@ -103,17 +106,36 @@ jobs:
           mkdir dist
           for role in controller worker; do
             nix build -L --override-input gang-binaries "path:$PWD/gang-binaries" ".#packages.$SYSTEM.$role-image" --out-link "image-$role"
+            # Nix builds the disk a second time and fails if the bytes differ.
+            nix build -L --rebuild --override-input gang-binaries "path:$PWD/gang-binaries" ".#packages.$SYSTEM.$role-image.disk" --no-link
           done
       - name: Compress the images
         shell: nix develop .#release -c bash --noprofile --norc -euo pipefail {0}
         run: |
           for role in controller worker; do
             # The image output links its disk; zstd skips a symbolic link, so it gets the store file itself.
-            zstd -19 --long=27 -T0 -q "$(realpath "image-$role"/*.img)" -o "dist/gang-$role-${{ matrix.arch }}.raw.zst"
+            zstd -19 --long=27 -T0 -q "$(realpath "image-$role"/*.raw)" -o "dist/gang-$role-${{ matrix.arch }}.raw.zst"
             cp "image-$role/nix-support/image-info.json" "dist/gang-$role-${{ matrix.arch }}.json"
           done
           (cd dist && sha256sum gang-*) >"images-${{ matrix.arch }}.sha256"
           (cd dist && wc -c gang-* && cat ../"images-${{ matrix.arch }}.sha256") >>"$GITHUB_STEP_SUMMARY"
+      # A release stores only images that its dry run, built on another runner, reproduced byte for byte.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: env.PUBLISH == 'true'
+        with:
+          name: images-${{ matrix.arch }}
+          path: dry-run
+          run-id: ${{ needs.locate.outputs.dry-run-id }}
+          github-token: ${{ github.token }}
+      - name: Match the dry run's images
+        if: env.PUBLISH == 'true'
+        env:
+          DRY_RUN: ${{ needs.locate.outputs.dry-run-id }}
+        run: |
+          if ! diff "dry-run/images-${{ matrix.arch }}.sha256" "images-${{ matrix.arch }}.sha256"; then
+            echo "::error::the images differ from those of dry run $DRY_RUN: the image build is not reproducible" >&2
+            exit 1
+          fi
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
         if: env.PUBLISH == 'true'
         with:

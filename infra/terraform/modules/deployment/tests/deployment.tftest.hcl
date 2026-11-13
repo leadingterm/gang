@@ -25,6 +25,13 @@ mock_provider "aws" {
     }
   }
 
+  # The controller and worker-fleet modules require UEFI-capable instance types.
+  mock_data "aws_ec2_instance_type" {
+    defaults = {
+      boot_modes = ["legacy-bios", "uefi"]
+    }
+  }
+
   mock_data "aws_iam_policy_document" {
     defaults = {
       json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}"

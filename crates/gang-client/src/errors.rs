@@ -153,6 +153,18 @@ pub enum ClientError {
     /// The browser redirect did not arrive in time.
     #[error("login timed out waiting for the browser redirect")]
     LoginTimedOut,
+    /// The server no longer knows the device authorization.
+    #[error("the device authorization has expired")]
+    DeviceLoginExpired,
+    /// The server rejected the stored device login.
+    #[error("the stored login was rejected")]
+    LoginRejected,
+    /// The device authorization is still awaiting approval.
+    #[error("the device authorization is not approved yet")]
+    AuthorizationPending,
+    /// The device authorization response lacks its redemption secret.
+    #[error("the device authorization has no secret")]
+    DeviceLoginInvalid,
     /// The loopback server for the browser redirect could not run.
     #[error("cannot run the loopback login server")]
     Loopback(#[source] io::Error),
@@ -238,7 +250,10 @@ impl Fix for ClientError {
                     .collect::<Vec<_>>()
                     .join(", or ")
             ))),
-            Self::RenewalRejected(_) | Self::NoRefreshToken => Some(Cow::Borrowed(LOGIN_AGAIN_FIX)),
+            Self::RenewalRejected(_)
+            | Self::NoRefreshToken
+            | Self::LoginRejected
+            | Self::DeviceLoginExpired => Some(Cow::Borrowed(LOGIN_AGAIN_FIX)),
             Self::LoginTimedOut => Some(Cow::Borrowed(
                 "run gang login again and finish the sign-in in the browser",
             )),
@@ -272,6 +287,8 @@ impl Fix for ClientError {
             | Self::Provider(_)
             | Self::Loopback(_)
             | Self::EmptyToken
+            | Self::AuthorizationPending
+            | Self::DeviceLoginInvalid
             | Self::CredentialRequest(_) => None,
         }
     }

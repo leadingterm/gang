@@ -18,6 +18,7 @@ export const offline: Environment = {
     throw new Error("views render without a stream");
   },
   fetchJson: () => Promise.reject(new Error("views render without fetches")),
+  post: () => Promise.reject(new Error("views render without posts")),
   now: () => 0,
   schedule: () => () => {},
   navigate: () => {},

@@ -12,11 +12,17 @@ export const SCREENS = [
   { id: "access", label: "Access", path: "/ui/access" },
 ] as const satisfies readonly { id: Screen; label: string; path: string }[];
 
-export type Route = { readonly kind: "screen"; readonly screen: Screen } | { readonly kind: "error"; readonly reason: string | null };
+export type Route =
+  | { readonly kind: "screen"; readonly screen: Screen }
+  | { readonly kind: "error"; readonly reason: string | null }
+  | { readonly kind: "device"; readonly error: string | null }
+  | { readonly kind: "deviceApproved" };
 
 export const routeOf = (pathname: string, search: string): Route => {
   const path = pathname.replace(/\/+$/, "");
   if (path === PATHS.error) return { kind: "error", reason: new URLSearchParams(search).get("reason") };
+  if (path === PATHS.device) return { kind: "device", error: new URLSearchParams(search).get("error") };
+  if (path === PATHS.deviceApproved) return { kind: "deviceApproved" };
   const screen = SCREENS.find((s) => s.path.replace(/\/+$/, "") === path);
   return { kind: "screen", screen: screen?.id ?? "overview" };
 };

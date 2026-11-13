@@ -18,7 +18,9 @@ use axum::{Json, Router};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use gang_clock::{Clock, TestClock, Timestamp};
-use gang_oidc::{IssuerUrl, LoginConfig, OidcCache, OidcConfig, OidcHttp, OidcTokens};
+use gang_oidc::{
+    IssuerUrl, LoginConfig, OfflineLogin, OidcCache, OidcConfig, OidcHttp, OidcTokens,
+};
 use gang_spi::LoginClient;
 use gang_testkit::generate_es256_key;
 use gang_types::{Audience, ClientSecret, Es256Key, NonZeroDuration, Url};
@@ -236,6 +238,7 @@ impl<'clock> TestIssuer<'clock> {
                 client_secret: Some(ClientSecret::new(CLIENT_SECRET)),
                 scopes: vec!["openid".to_owned(), "email".to_owned()],
                 authorization_params: BTreeMap::from([("prompt".to_owned(), "consent".to_owned())]),
+                offline: OfflineLogin::default(),
             }),
             ..self.config()
         }

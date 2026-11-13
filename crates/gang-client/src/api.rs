@@ -12,11 +12,12 @@ use gang_tls::{
     HttpClient, HttpError, HttpProtocol, HttpReply, HttpRequest, HttpScheme, HttpSettings,
     HttpTransport, RequestBody, ServerTrust,
 };
-use gang_types::{AccessToken, CertSerial, Identity, Url};
+use gang_types::{AccessToken, CertSerial, DeviceSecret, Identity, Url};
 use gang_wire::routes::{self, Method, Route};
 use gang_wire::{
     AuthenticateRequest, AuthenticateResponse, Certificate, CreateCertificateRequest,
-    ErrorResponse, Principal, RevokePrincipalResponse, Server,
+    DeviceAuthorization, ErrorReason, ErrorResponse, Principal, RedeemDeviceAuthorizationRequest,
+    RevokePrincipalResponse, Server,
 };
 use http::header::{DATE, RETRY_AFTER};
 use http::{HeaderMap, StatusCode};
@@ -135,13 +136,67 @@ impl ServerApi {
         &self,
         request: &AuthenticateRequest,
     ) -> Result<AuthenticateResponse, ClientError> {
+        let result = self
+            .execute(
+                None,
+                &routes::AUTHENTICATE_SESSION,
+                routes::AUTHENTICATE_SESSION.template,
+                Some(encode(request)?),
+            )
+            .await;
+        match result {
+            Err(ClientError::LoginRejected)
+                if matches!(&request.credential, gang_wire::Credential::Proof(_)) =>
+            {
+                Err(ClientError::Server {
+                    status: 401,
+                    message: "proof rejected".to_owned(),
+                })
+            }
+            other => other,
+        }
+    }
+
+    /// Starts a device authorization.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport, server, or response decoding error.
+    pub async fn create_device_authorization(&self) -> Result<DeviceAuthorization, ClientError> {
         self.execute(
             None,
-            &routes::AUTHENTICATE_SESSION,
-            routes::AUTHENTICATE_SESSION.template,
-            Some(encode(request)?),
+            &routes::CREATE_DEVICE_AUTHORIZATION,
+            routes::CREATE_DEVICE_AUTHORIZATION.template,
+            None,
         )
         .await
+    }
+
+    /// Redeems a device authorization with its secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns a pending, expired, rate-limit, transport, server, or decoding error.
+    pub async fn redeem_device_authorization(
+        &self,
+        code: &str,
+        secret: &DeviceSecret,
+    ) -> Result<AuthenticateResponse, ClientError> {
+        let path = routes::REDEEM_DEVICE_AUTHORIZATION.path(&code.to_owned());
+        match self
+            .execute(
+                None,
+                &routes::REDEEM_DEVICE_AUTHORIZATION,
+                &path,
+                Some(encode(&RedeemDeviceAuthorizationRequest {
+                    secret: secret.clone(),
+                })?),
+            )
+            .await
+        {
+            Err(ClientError::Server { status: 404, .. }) => Err(ClientError::DeviceLoginExpired),
+            result => result,
+        }
     }
 
     /// Submits a certificate signing request and returns the issued certificate.
@@ -259,6 +314,22 @@ impl ServerApi {
             });
         }
         if !reply.status.is_success() {
+            if let Ok(envelope) = serde_json::from_slice::<ErrorResponse>(&reply.body) {
+                match (reply.status, envelope.error.reason()) {
+                    (StatusCode::BAD_REQUEST, Some(ErrorReason::AuthorizationPending)) => {
+                        return Err(ClientError::AuthorizationPending);
+                    }
+                    (StatusCode::NOT_FOUND, Some(ErrorReason::DeviceAuthorizationNotFound)) => {
+                        return Err(ClientError::DeviceLoginExpired);
+                    }
+                    (StatusCode::UNAUTHORIZED, Some(ErrorReason::ProofRejected))
+                        if route.template == routes::AUTHENTICATE_SESSION.template =>
+                    {
+                        return Err(ClientError::LoginRejected);
+                    }
+                    _ => {}
+                }
+            }
             return Err(ClientError::Server {
                 status: reply.status.as_u16(),
                 message: server_message(reply.status, &reply.body, self.max_error_chars),

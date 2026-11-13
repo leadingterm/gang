@@ -59,19 +59,23 @@ impl Provider {
         }
     }
 
-    async fn begin(
-        &self,
-        redirect_uri: &Url,
-        client: Option<&LoginClient>,
-    ) -> Result<LoginChallenge, OidcError> {
+    async fn begin(&self, request: &LoginRequest<'_>) -> Result<LoginChallenge, OidcError> {
         let login = self.login_config()?;
-        let (client_id, client_secret) = self.client_credentials(client);
+        let (client_id, client_secret) = self.client_credentials(request.client);
         let discovery = self.discovery().await?;
         let endpoint = discovery.authorization_endpoint()?;
         let state = random_token()?;
         let nonce = random_token()?;
         let verifier = random_token()?;
         let code_challenge = challenge(&verifier);
+        let offline = request.offline.then_some(&login.offline);
+        let scope = login
+            .scopes
+            .iter()
+            .chain(offline.into_iter().flat_map(|offline| &offline.scopes))
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
 
         let mut authorization_url = endpoint.clone();
         {
@@ -79,13 +83,17 @@ impl Provider {
             query
                 .append_pair("response_type", "code")
                 .append_pair("client_id", &client_id)
-                .append_pair("redirect_uri", redirect_uri.as_str())
-                .append_pair("scope", &login.scopes.join(" "))
+                .append_pair("redirect_uri", request.redirect_uri.as_str())
+                .append_pair("scope", &scope)
                 .append_pair("state", &state)
                 .append_pair("nonce", &nonce)
                 .append_pair("code_challenge", &code_challenge)
                 .append_pair("code_challenge_method", "S256");
-            for (name, value) in &login.authorization_params {
+            for (name, value) in login.authorization_params.iter().chain(
+                offline
+                    .into_iter()
+                    .flat_map(|offline| &offline.authorization_params),
+            ) {
                 query.append_pair(name, value);
             }
         }
@@ -94,7 +102,7 @@ impl Provider {
             state: state.clone(),
             nonce,
             verifier,
-            redirect_uri: redirect_uri.clone(),
+            redirect_uri: request.redirect_uri.clone(),
             client_id,
             client_secret,
         };
@@ -193,9 +201,7 @@ impl LoginPort for Provider {
     }
 
     async fn begin_login(&self, request: &LoginRequest<'_>) -> Result<LoginChallenge, PortError> {
-        self.begin(request.redirect_uri, request.client)
-            .await
-            .map_err(PortError::from)
+        self.begin(request).await.map_err(PortError::from)
     }
 
     async fn complete_login(

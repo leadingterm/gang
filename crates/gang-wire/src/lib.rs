@@ -25,6 +25,7 @@ extern crate self as gang_wire;
 #[macro_use]
 mod enumeration;
 mod certificate;
+mod device;
 pub mod duration;
 mod error;
 mod errors;
@@ -43,6 +44,7 @@ mod state;
 pub mod time;
 
 pub use certificate::{Certificate, CreateCertificateRequest};
+pub use device::{DeviceAuthorization, DeviceAuthorizationState, RedeemDeviceAuthorizationRequest};
 pub use error::{
     BadRequest, Code, Detail, ERROR_DOMAIN, ErrorInfo, ErrorReason, ErrorResponse, FieldViolation,
     INTERNAL_ERROR_BODY, RetryInfo, Status, UnknownErrorReason,
@@ -57,9 +59,14 @@ pub use known::Known;
 pub use permission::Permission;
 pub use principal::{ListPrincipalsResponse, Principal, RevokePrincipalResponse};
 pub use role::{ListRolesResponse, Role};
-pub use routes::{CALLBACK_PATH, ERROR_PATH, LOGIN_PATH, LOGOUT_PATH, RouteId, UiRoute};
-pub use server::{Authentication, Isa, NoAuthentication, Server, TokenAuthentication};
-pub use session::{AuthenticateRequest, AuthenticateResponse, CookieNames, Session, SessionLogin};
+pub use routes::{
+    CALLBACK_PATH, DEVICE_APPROVED_PATH, DEVICE_PATH, ERROR_PATH, LOGIN_PATH, LOGOUT_PATH,
+    RENEW_PATH, RouteId, UiRoute,
+};
+pub use server::{Authentication, DeviceLogin, Isa, NoAuthentication, Server, TokenAuthentication};
+pub use session::{
+    AuthenticateRequest, AuthenticateResponse, CookieNames, Credential, Session, SessionLogin,
+};
 pub use state::{
     Actions, Demand, Fleet, Instance, InstanceCounts, InstanceSize, Lifecycle, Named, Pass,
     PassState, Phase, Policy, Queue, QueuedAction, RunningAction, SkipReason, State, Truncated,

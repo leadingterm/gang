@@ -26,7 +26,7 @@ mod refresh_cache;
 mod verify;
 
 pub use config::{
-    ConfigError, IssuerUrl, IssuerUrlError, LoginConfig, OidcCache, OidcConfig, OidcHttp,
-    OidcTokens,
+    ConfigError, IssuerUrl, IssuerUrlError, LoginConfig, OfflineLogin, OidcCache, OidcConfig,
+    OidcHttp, OidcTokens,
 };
 pub use provider::Provider;

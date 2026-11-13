@@ -6,6 +6,11 @@ data "aws_subnet" "this" {
   id = var.subnet_id
 }
 
+# Gang's images boot UEFI only, so the controller's instance type must support it. Read at plan time.
+data "aws_ec2_instance_type" "this" {
+  instance_type = var.instance_type
+}
+
 resource "aws_instance" "this" {
   ami                         = var.ami_id
   instance_type               = var.instance_type
@@ -28,6 +33,13 @@ resource "aws_instance" "this" {
     volume_type = "gp3"
     volume_size = var.root_volume_gib
     encrypted   = true
+  }
+
+  lifecycle {
+    precondition {
+      condition     = contains(data.aws_ec2_instance_type.this.boot_modes, "uefi")
+      error_message = "Instance type ${var.instance_type} does not support UEFI boot, which Gang's images require."
+    }
   }
 
   tags = merge(var.tags, { Name = var.name })
