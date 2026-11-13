@@ -6,9 +6,15 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Dry run: builds, verifies, compresses and checksums the images on both architectures, and stores and publishes nothing. A tag releases only a commit whose dry run passed.
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+env:
+  # Only a pushed v* tag stores images and publishes a release; a dispatched run is a dry run.
+  PUBLISH: ${{ github.event_name == 'push' }}
 
 defaults:
   run:
@@ -24,7 +30,28 @@ jobs:
     outputs:
       run-id: ${{ steps.ci.outputs.run-id }}
     steps:
-      - name: Find the CI run of the tagged commit
+      - name: Require a passed dry run of the tagged commit
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          IMAGES: ${{ vars.IMAGE_DESTINATION != '' }}
+        run: |
+          dry_run="$(gh api "repos/$GH_REPO/actions/workflows/release.yml/runs?head_sha=$SHA&event=workflow_dispatch" \
+            --jq '[.workflow_runs[] | select(.conclusion == "success")][0].id // empty')"
+          if [[ -z "$dry_run" ]]; then
+            echo "::error::no passed dry run of $SHA: dispatch this workflow on the commit (gh workflow run release.yml --ref main) and tag once it has passed" >&2
+            exit 1
+          fi
+          imaged="$(gh api "repos/$GH_REPO/actions/runs/$dry_run/jobs" \
+            --jq '[.jobs[] | select((.name | startswith("images (")) and .conclusion == "success")] | length')"
+          if [[ "$IMAGES" == true && "$imaged" != 2 ]]; then
+            echo "::error::dry run $dry_run of $SHA did not build the images of both architectures" >&2
+            exit 1
+          fi
+          echo "dry run $dry_run of $SHA passed"
+      - name: Find the CI run to release
         id: ci
         env:
           GH_TOKEN: ${{ github.token }}
@@ -34,7 +61,7 @@ jobs:
           run_id="$(gh api "repos/$GH_REPO/actions/workflows/ci.yml/runs?head_sha=$SHA" \
             --jq '[.workflow_runs[] | select(.event == "push" and .head_branch == "main" and .conclusion == "success")][0].id // empty')"
           if [[ -z "$run_id" ]]; then
-            echo "::error::no successful CI run of $SHA pushed to main: tag a commit of main once its CI run has passed" >&2
+            echo "::error::no successful CI run of $SHA pushed to main: release a commit of main once its CI run has passed" >&2
             exit 1
           fi
           echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
@@ -81,16 +108,20 @@ jobs:
         shell: nix develop .#release -c bash --noprofile --norc -euo pipefail {0}
         run: |
           for role in controller worker; do
-            zstd -19 --long=27 -T0 -q "image-$role"/*.img -o "dist/gang-$role-${{ matrix.arch }}.raw.zst"
+            # The image output links its disk; zstd skips a symbolic link, so it gets the store file itself.
+            zstd -19 --long=27 -T0 -q "$(realpath "image-$role"/*.img)" -o "dist/gang-$role-${{ matrix.arch }}.raw.zst"
             cp "image-$role/nix-support/image-info.json" "dist/gang-$role-${{ matrix.arch }}.json"
           done
           (cd dist && sha256sum gang-*) >"images-${{ matrix.arch }}.sha256"
+          (cd dist && wc -c gang-* && cat ../"images-${{ matrix.arch }}.sha256") >>"$GITHUB_STEP_SUMMARY"
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
+        if: env.PUBLISH == 'true'
         with:
           role-to-assume: ${{ vars.IMAGE_PUBLISH_ROLE }}
           aws-region: ${{ vars.IMAGE_REGION }}
       # Write-once: an existing key is accepted only if S3 holds the same SHA-256, so re-running a failed job is safe.
       - name: Store the images
+        if: env.PUBLISH == 'true'
         shell: nix develop .#release -c bash --noprofile --norc -euo pipefail {0}
         working-directory: dist
         env:
@@ -127,7 +158,7 @@ jobs:
 
   publish:
     needs: [locate, images]
-    if: ${{ !cancelled() && needs.locate.result == 'success' && contains(fromJSON('["success", "skipped"]'), needs.images.result) }}
+    if: ${{ github.event_name == 'push' && !cancelled() && needs.locate.result == 'success' && contains(fromJSON('["success", "skipped"]'), needs.images.result) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
