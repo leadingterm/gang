@@ -23,6 +23,7 @@ use crate::disk::disk;
 use crate::drain_cancel::drain_cancel;
 use crate::errors::Result;
 use crate::execution::ExecutionKnobs;
+use crate::fhs_tools::fhs_tools;
 use crate::fleets::fleets;
 use crate::glibc_toolchain::glibc_toolchain;
 use crate::input_root::input_root;
@@ -166,6 +167,9 @@ gang_types::string_enum! {
         /// A dynamically linked glibc program, as the toolchains Bazel downloads are, runs inside the
         /// bwrap sandbox.
         GlibcToolchain = "glibc-toolchain",
+        /// A `#!/usr/bin/env bash` script runs inside the bwrap sandbox with Bazel's strict action
+        /// `PATH`.
+        FhsTools = "fhs-tools",
         /// The scope and stray process of a SIGKILLed `gang exec` are swept by the next action,
         /// and a dead worker's are gone before its replacement serves.
         StaleScope = "stale-scope",
@@ -243,6 +247,7 @@ impl Scenario {
             | Self::SandboxContract
             | Self::InputRoot
             | Self::GlibcToolchain
+            | Self::FhsTools
             | Self::StaleScope
             | Self::MemoryEscalation
             | Self::UnplaceableDisk
@@ -363,6 +368,7 @@ impl Scenario {
             Self::ActionTimeoutNoop => execution_checks(ctx, ExecutionScenario::ActionTimeoutNoop),
             Self::SandboxContract => execution_checks(ctx, ExecutionScenario::SandboxContract),
             Self::GlibcToolchain => glibc_toolchain_checks(ctx),
+            Self::FhsTools => fhs_tools_checks(ctx),
             Self::StaleScope => execution_checks(ctx, ExecutionScenario::StaleScope),
             Self::MemoryEscalation => execution_checks(ctx, ExecutionScenario::MemoryEscalation),
             Self::UnplaceableDisk => execution_checks(ctx, ExecutionScenario::UnplaceableDisk),
@@ -466,6 +472,20 @@ fn glibc_toolchain_checks(ctx: &RunContext<'_>) -> Vec<Check> {
         Sandbox::Noop => vec![Check::skipped(
             names::glibc_toolchain::TOOL_RUNS,
             "the noop sandbox runs actions on the host, whose own loader starts the program",
+        )],
+    }
+}
+
+/// The verdicts of the FHS tools scenario, or one skipped check where the sandbox is the host.
+fn fhs_tools_checks(ctx: &RunContext<'_>) -> Vec<Check> {
+    match ctx.sandbox {
+        Sandbox::Bwrap => attempt(Scenario::FhsTools, || {
+            let stack = Stack::create(ctx.invocation, &ctx.baseline, Transport::Tls, ctx.issuer)?;
+            fhs_tools(&stack)
+        }),
+        Sandbox::Noop => vec![Check::skipped(
+            names::fhs_tools::SCRIPT_RUNS,
+            "the noop sandbox runs actions on the host, whose own /bin and /usr/bin they see",
         )],
     }
 }

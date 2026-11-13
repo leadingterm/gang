@@ -18,6 +18,13 @@ mock_provider "aws" {
     }
   }
 
+  mock_data "aws_ec2_instance_type_offerings" {
+    defaults = {
+      instance_types = ["c6id.4xlarge", "c6id.4xlarge", "c6id.4xlarge", "c7gd.4xlarge", "c7gd.4xlarge", "c7gd.4xlarge"]
+      locations      = ["az-a", "az-b", "az-c", "az-a", "az-b", "az-c"]
+    }
+  }
+
   mock_data "aws_iam_policy_document" {
     defaults = {
       json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}"

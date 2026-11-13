@@ -128,6 +128,11 @@ impl Cli {
                 .clone()
                 .or_else(|| env::var("GANG_E2E_ACTION_PATH").ok())
                 .ok_or_else(|| "the sample's action PATH is unset: run the harness inside `nix develop`, or set `action_path` in the settings".to_owned())?,
+            action_bin: settings
+                .action_bin
+                .clone()
+                .or_else(|| env::var_os("GANG_E2E_ACTION_BIN").map(PathBuf::from))
+                .ok_or_else(|| "the sample's action tools directory is unset: run the harness inside `nix develop`, or set `action_bin` in the settings".to_owned())?,
             bwrap: settings
                 .bwrap
                 .clone()

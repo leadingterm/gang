@@ -4,7 +4,7 @@
   gang,
   ...
 }: {
-  imports = [./gang-scratch.nix ./glibc-loader.nix];
+  imports = [./gang-scratch.nix ./glibc-loader.nix ./action-tools.nix];
 
   # bwrap bind paths reference /run/current-system/sw.
   environment.systemPackages = [pkgs.bubblewrap];

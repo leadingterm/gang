@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use gang_types::Url;
-use h2::client::{self, SendRequest};
-use h2::{Ping, PingPong};
+use h2::client::{self, ResponseFuture, SendRequest};
+use h2::{Ping, PingPong, SendStream};
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use http::{HeaderMap, Method, Request, Version};
 use rustls_pki_types::ServerName;
@@ -210,6 +210,78 @@ impl Channel for H2Channel {
     }
 }
 
+/// One Capabilities request on the connection: its headers are sent, its body is not yet.
+struct Exchange {
+    /// The server's answer, once it arrives.
+    response: ResponseFuture,
+    /// The request's body, still open.
+    body: SendStream<Bytes>,
+}
+
+impl Exchange {
+    /// Sends the request's headers on the connection behind `sender`, presenting `token` when
+    /// given. `None` when the connection is gone.
+    ///
+    /// # Errors
+    ///
+    /// When the request cannot be built.
+    async fn open(
+        sender: SendRequest<Bytes>,
+        uri: &str,
+        token: Option<&str>,
+    ) -> Result<Option<Self>> {
+        let Ok(mut sender) = sender.ready().await else {
+            return Ok(None);
+        };
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .version(Version::HTTP_2)
+            .header(CONTENT_TYPE, "application/grpc")
+            .header("te", "trailers");
+        if let Some(token) = token {
+            builder = builder.header(AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let request = builder
+            .body(())
+            .map_err(E2eError::system_from("building the request"))?;
+        let Ok((response, body)) = sender.send_request(request, false) else {
+            return Ok(None);
+        };
+        Ok(Some(Self { response, body }))
+    }
+
+    /// Sends the request's empty message and classifies the server's answer by `grpc-status`.
+    /// The answer decides the reply, even when the server sent it before reading the body. A
+    /// connection that is gone has no answer, so it is [`Reply::Closed`].
+    async fn reply(mut self) -> Reply {
+        // A server may answer at the headers and then reset the unread stream with NO_ERROR
+        // (RFC 9113 §8.1), which fails this send: the answer, not the body, decides the reply.
+        let _ = self
+            .body
+            .send_data(Bytes::from_static(&EMPTY_MESSAGE), true);
+        let Ok(response) = self.response.await else {
+            return Reply::Closed;
+        };
+        let (parts, mut body) = response.into_parts();
+        if let Some(status) = grpc_status(&parts.headers) {
+            return classify(Some(status));
+        }
+        while let Some(chunk) = body.data().await {
+            let Ok(chunk) = chunk else {
+                return Reply::Closed;
+            };
+            if body.flow_control().release_capacity(chunk.len()).is_err() {
+                return Reply::Closed;
+            }
+        }
+        match body.trailers().await {
+            Ok(trailers) => classify(trailers.as_ref().and_then(grpc_status)),
+            Err(_) => Reply::Closed,
+        }
+    }
+}
+
 /// Sends one Capabilities request and classifies its answer by `grpc-status`. A connection that
 /// is gone is [`Reply::Closed`], not an error.
 async fn get_capabilities(
@@ -217,49 +289,10 @@ async fn get_capabilities(
     uri: &str,
     token: Option<&str>,
 ) -> Result<Reply> {
-    let Ok(mut sender) = sender.ready().await else {
-        return Ok(Reply::Closed);
-    };
-    let mut builder = Request::builder()
-        .method(Method::POST)
-        .uri(uri)
-        .version(Version::HTTP_2)
-        .header(CONTENT_TYPE, "application/grpc")
-        .header("te", "trailers");
-    if let Some(token) = token {
-        builder = builder.header(AUTHORIZATION, format!("Bearer {token}"));
-    }
-    let request = builder
-        .body(())
-        .map_err(E2eError::system_from("building the request"))?;
-    let Ok((response, mut stream)) = sender.send_request(request, false) else {
-        return Ok(Reply::Closed);
-    };
-    if stream
-        .send_data(Bytes::from_static(&EMPTY_MESSAGE), true)
-        .is_err()
-    {
-        return Ok(Reply::Closed);
-    }
-    let Ok(response) = response.await else {
-        return Ok(Reply::Closed);
-    };
-    let (parts, mut body) = response.into_parts();
-    if let Some(status) = grpc_status(&parts.headers) {
-        return Ok(classify(Some(status)));
-    }
-    while let Some(chunk) = body.data().await {
-        let Ok(chunk) = chunk else {
-            return Ok(Reply::Closed);
-        };
-        if body.flow_control().release_capacity(chunk.len()).is_err() {
-            return Ok(Reply::Closed);
-        }
-    }
-    match body.trailers().await {
-        Ok(trailers) => Ok(classify(trailers.as_ref().and_then(grpc_status))),
-        Err(_) => Ok(Reply::Closed),
-    }
+    Ok(match Exchange::open(sender, uri, token).await? {
+        Some(exchange) => exchange.reply().await,
+        None => Reply::Closed,
+    })
 }
 
 /// The `grpc-status` carried by `headers`, when it has a valid one.
@@ -291,7 +324,7 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio::task::JoinHandle;
 
-    use super::{H2Channel, classify, grpc_status};
+    use super::{Exchange, H2Channel, classify, grpc_status};
     use crate::identity::{Channel, ChannelEvent, Reply};
     use crate::{errors::E2eError, tls_client};
 
@@ -318,8 +351,10 @@ mod tests {
         Ok(())
     }
 
-    /// A server on one end of an in-memory connection. It answers what the client sends, and it
-    /// drops the connection when `close` fires or the client ends the connection.
+    /// A server on one end of an in-memory connection. It answers every request at its headers
+    /// with a trailers-only `grpc-status: 7`, as the server's gate refuses a revoked principal,
+    /// and leaves the request's body unread, which resets the stream with NO_ERROR. It drops the
+    /// connection when `close` fires or the client ends the connection.
     async fn serve(io: DuplexStream, close: oneshot::Receiver<()>) {
         let Ok(mut connection) = h2::server::handshake(io).await else {
             return;
@@ -327,7 +362,18 @@ mod tests {
         tokio::select! {
             biased;
             _ = close => {}
-            () = async { while connection.accept().await.is_some() {} } => {}
+            () = async {
+                while let Some(Ok((request, mut respond))) = connection.accept().await {
+                    let response = http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/grpc")
+                        .header("grpc-status", super::GRPC_PERMISSION_DENIED.to_string())
+                        .body(())
+                        .expect("the response is valid");
+                    let _ = respond.send_response(response, true);
+                    drop(request);
+                }
+            } => {}
         }
     }
 
@@ -417,5 +463,27 @@ mod tests {
             pair.channel.request().expect("the request ends"),
             Reply::Closed
         );
+    }
+
+    /// An answer received before the request body is sent is still the reply.
+    #[test]
+    fn an_answer_sent_before_the_request_body_is_the_reply() {
+        let mut pair = Pair::open();
+        let sender = pair.channel.sender.clone();
+        let reply = pair.channel.runtime.block_on(async move {
+            let mut exchange = Exchange::open(sender, CAPABILITIES, None)
+                .await
+                .expect("the request is built")
+                .expect("the connection is open");
+            // The server answers at the headers and resets the unread stream: the body is sent
+            // only once the client has seen that reset.
+            let reset = std::future::poll_fn(|cx| exchange.body.poll_reset(cx))
+                .await
+                .expect("the stream is reset");
+            assert_eq!(reset, h2::Reason::NO_ERROR);
+            exchange.reply().await
+        });
+        assert_eq!(reply, Reply::Denied);
+        pair.close_server();
     }
 }

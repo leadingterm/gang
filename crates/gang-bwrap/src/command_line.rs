@@ -15,8 +15,9 @@ impl Bwrap {
     /// Builds the `bwrap` invocation that runs `spec`.
     ///
     /// The sandbox root starts empty, so the only host paths visible inside it are the prefix's
-    /// read-only binds and the action directory; the content store and other actions' directories
-    /// are never mapped. The action directory is bound read-write, so every input resolves,
+    /// read-only binds (each at its own path, then each mount at its path inside the sandbox) and
+    /// the action directory; the content store and other actions' directories are never mapped.
+    /// The action directory is bound read-write, so every input resolves,
     /// including those outside the working directory (`../input`, relative symlinks); the working
     /// directory inside it becomes the current directory. `--share-net` must follow
     /// `--unshare-all`, which the prefix contains, so it re-enables the network only when both the
@@ -72,6 +73,7 @@ impl Bwrap {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::ffi::{OsStr, OsString};
     use std::os::fd::RawFd;
     use std::path::{Path, PathBuf};
@@ -95,6 +97,7 @@ mod tests {
         Bwrap::build(
             BwrapConfig {
                 readonly_bind_paths: READONLY.iter().copied().map(abs).collect(),
+                readonly_bind_mounts: BTreeMap::new(),
                 permit_network_property,
                 program: PathBuf::from("/usr/bin/bwrap"),
                 tmp_path: abs("/tmp"),
@@ -211,6 +214,50 @@ mod tests {
     }
 
     #[test]
+    fn readonly_bind_mounts_follow_the_same_path_binds() -> Result<(), Box<dyn std::error::Error>> {
+        let bwrap = Bwrap::build(
+            BwrapConfig {
+                readonly_bind_paths: READONLY.iter().copied().map(abs).collect(),
+                readonly_bind_mounts: BTreeMap::from([
+                    (abs("/bin"), abs("/opt/tools/bin")),
+                    (abs("/usr/bin"), abs("/opt/tools/bin")),
+                ]),
+                permit_network_property: false,
+                program: PathBuf::from("/usr/bin/bwrap"),
+                tmp_path: abs("/tmp"),
+            },
+            &PluginContext {
+                config_path: Path::new("sandbox.toml"),
+            },
+        )
+        .expect("bwrap plugin builds from its config");
+        let command = command(
+            &bwrap,
+            Path::new("/work/a"),
+            Path::new("/work/a"),
+            NetworkRequest::NotRequested,
+        )?;
+        let args = args(&command);
+        let usr = position(&args, "/usr");
+        assert_eq!(
+            &args[usr - 1..usr + 9],
+            [
+                "--ro-bind",
+                "/usr",
+                "/usr",
+                "--ro-bind",
+                "/opt/tools/bin",
+                "/bin",
+                "--ro-bind",
+                "/opt/tools/bin",
+                "/usr/bin",
+                "--info-fd",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn share_net_only_when_permitted_and_requested() -> Result<(), Box<dyn std::error::Error>> {
         let cases = [
             (false, NetworkRequest::NotRequested, false),
@@ -265,6 +312,7 @@ mod tests {
         let bwrap = Bwrap::build(
             BwrapConfig {
                 readonly_bind_paths: Vec::new(),
+                readonly_bind_mounts: BTreeMap::new(),
                 permit_network_property: false,
                 program: PathBuf::from("/custom/bwrap"),
                 tmp_path: abs("/scratch"),
@@ -335,6 +383,7 @@ mod tests {
         let bwrap = Bwrap::build(
             BwrapConfig {
                 readonly_bind_paths: Vec::new(),
+                readonly_bind_mounts: BTreeMap::new(),
                 permit_network_property: false,
                 program: std::env::current_dir()?.join(fake),
                 tmp_path: abs("/tmp"),

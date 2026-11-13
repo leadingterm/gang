@@ -441,6 +441,7 @@ impl Execution for Observer {
         Ok(bwrap
             .readonly_bind_paths
             .iter()
+            .chain(bwrap.readonly_bind_mounts.keys())
             .map(|path| path.as_path().to_string_lossy().into_owned())
             .collect())
     }

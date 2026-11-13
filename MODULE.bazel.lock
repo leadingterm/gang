@@ -3151,12 +3151,12 @@
     "@@rules_tf+//tf:extensions.bzl%tf_repositories": {
       "os:linux,arch:aarch64": {
         "bzlTransitiveDigest": "nOoRARYYQvZENzWYXz8YfM9gu9dZAhoJylKAUK+4qkM=",
-        "usagesDigest": "IsZGlNmIkrIqft98rIqmzaHH+6x4g+9eAtKGY31n/Dg=",
+        "usagesDigest": "nyZ23FVC2Sw1K0L1WpiYU2JJqEOKXR+t/eWzPwlEKcs=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
         "envVariables": {},
         "generatedRepoSpecs": {
-          "gang_0.1.1_download_tfdoc_0_linux_arm64": {
+          "gang__download_tfdoc_0_linux_arm64": {
             "repoRuleId": "@@rules_tf+//tf/toolchains/tfdoc:toolchain.bzl%tfdoc_download",
             "attributes": {
               "version": "0.18.0",
@@ -3164,7 +3164,7 @@
               "arch": "arm64"
             }
           },
-          "gang_0.1.1_download_tflint_0_linux_arm64": {
+          "gang__download_tflint_0_linux_arm64": {
             "repoRuleId": "@@rules_tf+//tf/toolchains/tflint:toolchain.bzl%tflint_download",
             "attributes": {
               "version": "0.51.1",
@@ -3172,7 +3172,7 @@
               "arch": "arm64"
             }
           },
-          "gang_0.1.1_download_tf_0_linux_arm64": {
+          "gang__download_tf_0_linux_arm64": {
             "repoRuleId": "@@rules_tf+//tf/toolchains/tofu:toolchain.bzl%tofu_download",
             "attributes": {
               "version": "1.11.6",
@@ -3187,14 +3187,14 @@
             "repoRuleId": "@@rules_tf+//tf:toolchains.bzl%tf_toolchains",
             "attributes": {
               "tflint_repos": [
-                "gang_0.1.1_download_tflint_0_linux_arm64"
+                "gang__download_tflint_0_linux_arm64"
               ],
               "tfdoc_repos": [
-                "gang_0.1.1_download_tfdoc_0_linux_arm64"
+                "gang__download_tfdoc_0_linux_arm64"
               ],
               "terraform_repos": [],
               "tofu_repos": [
-                "gang_0.1.1_download_tf_0_linux_arm64"
+                "gang__download_tf_0_linux_arm64"
               ],
               "os": "linux",
               "arch": "arm64"
@@ -3211,12 +3211,12 @@
       },
       "os:linux,arch:amd64": {
         "bzlTransitiveDigest": "nOoRARYYQvZENzWYXz8YfM9gu9dZAhoJylKAUK+4qkM=",
-        "usagesDigest": "IsZGlNmIkrIqft98rIqmzaHH+6x4g+9eAtKGY31n/Dg=",
+        "usagesDigest": "nyZ23FVC2Sw1K0L1WpiYU2JJqEOKXR+t/eWzPwlEKcs=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
         "envVariables": {},
         "generatedRepoSpecs": {
-          "gang_0.1.1_download_tfdoc_0_linux_amd64": {
+          "gang__download_tfdoc_0_linux_amd64": {
             "repoRuleId": "@@rules_tf+//tf/toolchains/tfdoc:toolchain.bzl%tfdoc_download",
             "attributes": {
               "version": "0.18.0",
@@ -3224,7 +3224,7 @@
               "arch": "amd64"
             }
           },
-          "gang_0.1.1_download_tflint_0_linux_amd64": {
+          "gang__download_tflint_0_linux_amd64": {
             "repoRuleId": "@@rules_tf+//tf/toolchains/tflint:toolchain.bzl%tflint_download",
             "attributes": {
               "version": "0.51.1",
@@ -3232,7 +3232,7 @@
               "arch": "amd64"
             }
           },
-          "gang_0.1.1_download_tf_0_linux_amd64": {
+          "gang__download_tf_0_linux_amd64": {
             "repoRuleId": "@@rules_tf+//tf/toolchains/tofu:toolchain.bzl%tofu_download",
             "attributes": {
               "version": "1.11.6",
@@ -3247,14 +3247,14 @@
             "repoRuleId": "@@rules_tf+//tf:toolchains.bzl%tf_toolchains",
             "attributes": {
               "tflint_repos": [
-                "gang_0.1.1_download_tflint_0_linux_amd64"
+                "gang__download_tflint_0_linux_amd64"
               ],
               "tfdoc_repos": [
-                "gang_0.1.1_download_tfdoc_0_linux_amd64"
+                "gang__download_tfdoc_0_linux_amd64"
               ],
               "terraform_repos": [],
               "tofu_repos": [
-                "gang_0.1.1_download_tf_0_linux_amd64"
+                "gang__download_tf_0_linux_amd64"
               ],
               "os": "linux",
               "arch": "amd64"
@@ -3271,12 +3271,12 @@
       },
       "os:osx,arch:aarch64": {
         "bzlTransitiveDigest": "nOoRARYYQvZENzWYXz8YfM9gu9dZAhoJylKAUK+4qkM=",
-        "usagesDigest": "IsZGlNmIkrIqft98rIqmzaHH+6x4g+9eAtKGY31n/Dg=",
+        "usagesDigest": "nyZ23FVC2Sw1K0L1WpiYU2JJqEOKXR+t/eWzPwlEKcs=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
         "envVariables": {},
         "generatedRepoSpecs": {
-          "gang_0.1.1_download_tfdoc_0_darwin_arm64": {
+          "gang__download_tfdoc_0_darwin_arm64": {
             "repoRuleId": "@@rules_tf+//tf/toolchains/tfdoc:toolchain.bzl%tfdoc_download",
             "attributes": {
               "version": "0.18.0",
@@ -3284,7 +3284,7 @@
               "arch": "arm64"
             }
           },
-          "gang_0.1.1_download_tflint_0_darwin_arm64": {
+          "gang__download_tflint_0_darwin_arm64": {
             "repoRuleId": "@@rules_tf+//tf/toolchains/tflint:toolchain.bzl%tflint_download",
             "attributes": {
               "version": "0.51.1",
@@ -3292,7 +3292,7 @@
               "arch": "arm64"
             }
           },
-          "gang_0.1.1_download_tf_0_darwin_arm64": {
+          "gang__download_tf_0_darwin_arm64": {
             "repoRuleId": "@@rules_tf+//tf/toolchains/tofu:toolchain.bzl%tofu_download",
             "attributes": {
               "version": "1.11.6",
@@ -3307,14 +3307,14 @@
             "repoRuleId": "@@rules_tf+//tf:toolchains.bzl%tf_toolchains",
             "attributes": {
               "tflint_repos": [
-                "gang_0.1.1_download_tflint_0_darwin_arm64"
+                "gang__download_tflint_0_darwin_arm64"
               ],
               "tfdoc_repos": [
-                "gang_0.1.1_download_tfdoc_0_darwin_arm64"
+                "gang__download_tfdoc_0_darwin_arm64"
               ],
               "terraform_repos": [],
               "tofu_repos": [
-                "gang_0.1.1_download_tf_0_darwin_arm64"
+                "gang__download_tf_0_darwin_arm64"
               ],
               "os": "darwin",
               "arch": "arm64"

@@ -325,6 +325,19 @@ fi
 """,
 )
 
+# Runs fhs-tools.sh with Bazel's strict action PATH (--incompatible_strict_action_env): it starts only where
+# the sandbox provides /usr/bin/env, and finishes only where /bin and /usr/bin hold bash, sh and the tools.
+probe(
+    name = "fhs_tools",
+    srcs = ["fhs-tools.sh"],
+    path = "/bin:/usr/bin:/usr/local/bin",
+    script = """
+if out=$(./fhs-tools.sh 2>&1); then echo "fhs_tools=$out"
+else echo "fhs_tools=failed: ${out//$'\\n'/ }"
+fi
+""",
+)
+
 # Leaves behind a process in its own process group, marked and named in the journal, then waits for the go
 # flag. Once the flag exists it succeeds at once, so a requeued attempt leaves nothing behind.
 probe(

@@ -1,5 +1,6 @@
 //! The `[sandbox.bwrap]` section of `gang.toml`.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use gang_spi::SandboxPrograms;
@@ -7,13 +8,20 @@ use gang_types::AbsolutePathBuf;
 use serde::{Deserialize, Serialize};
 
 /// Configuration of the bubblewrap sandbox. `readonly_bind_paths` and `permit_network_property`
-/// are required; `program` and `tmp_path` default as documented on their fields.
+/// are required; `readonly_bind_mounts`, `program` and `tmp_path` default as documented on their
+/// fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BwrapConfig {
     /// Host paths made visible read-only inside the sandbox at the same location. Each must be
     /// absolute; a relative path is rejected when the configuration is parsed.
     pub readonly_bind_paths: Vec<AbsolutePathBuf>,
+    /// Host paths made visible read-only inside the sandbox at another path, keyed by the path
+    /// inside the sandbox, as in `"/bin" = "/etc/gang-action-tools/bin"`. Both must be absolute; a
+    /// relative one is rejected when the configuration is parsed. They are bound after
+    /// `readonly_bind_paths`, so an entry may cover a directory inside one of those. Default: none.
+    #[serde(default)]
+    pub readonly_bind_mounts: BTreeMap<AbsolutePathBuf, AbsolutePathBuf>,
     /// Whether an action that requests network access is given the host network. When `false`,
     /// the network request is ignored and the action runs without network.
     pub permit_network_property: bool,
@@ -48,6 +56,7 @@ impl SandboxPrograms for BwrapConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::convert::Infallible;
     use std::path::PathBuf;
 
@@ -59,6 +68,8 @@ mod tests {
     const COMPLETE: &str = r#"
 readonly_bind_paths = ["/usr", "/etc/ssl"]
 permit_network_property = true
+[readonly_bind_mounts]
+"/bin" = "/opt/tools/bin"
 "#;
 
     fn abs(path: &str) -> AbsolutePathBuf {
@@ -73,6 +84,7 @@ permit_network_property = true
             config,
             BwrapConfig {
                 readonly_bind_paths: vec![abs("/usr"), abs("/etc/ssl")],
+                readonly_bind_mounts: BTreeMap::from([(abs("/bin"), abs("/opt/tools/bin"))]),
                 permit_network_property: true,
                 program: PathBuf::from("bwrap"),
                 tmp_path: abs("/tmp"),
@@ -83,7 +95,7 @@ permit_network_property = true
     #[test]
     fn parses_program_and_tmp_path() {
         let config: BwrapConfig = toml::from_str(&format!(
-            "{COMPLETE}program = \"/opt/bwrap/bin/bwrap\"\ntmp_path = \"/scratch/tmp\"\n"
+            "program = \"/opt/bwrap/bin/bwrap\"\ntmp_path = \"/scratch/tmp\"\n{COMPLETE}"
         ))
         .expect("section with program and tmp_path parses");
 
@@ -95,6 +107,7 @@ permit_network_property = true
     fn round_trips_through_toml() {
         let config = BwrapConfig {
             readonly_bind_paths: vec![abs("/usr")],
+            readonly_bind_mounts: BTreeMap::new(),
             permit_network_property: false,
             program: PathBuf::from("/opt/bwrap/bin/bwrap"),
             tmp_path: abs("/scratch/tmp"),
@@ -108,7 +121,7 @@ permit_network_property = true
 
     #[test]
     fn rejects_unknown_key() {
-        let rejected = toml::from_str::<BwrapConfig>(&format!("{COMPLETE}unexpected = 1\n"));
+        let rejected = toml::from_str::<BwrapConfig>(&format!("unexpected = 1\n{COMPLETE}"));
 
         let error = rejected.expect_err("unknown key is rejected");
         assert!(
@@ -143,6 +156,39 @@ permit_network_property = true
     }
 
     #[test]
+    fn missing_readonly_bind_mounts_defaults_to_empty() {
+        let config: BwrapConfig =
+            toml::from_str("readonly_bind_paths = []\npermit_network_property = false\n")
+                .expect("section without mounts parses");
+        assert!(config.readonly_bind_mounts.is_empty());
+    }
+
+    #[test]
+    fn rejects_a_relative_mount_destination() {
+        let rejected = toml::from_str::<BwrapConfig>(
+            "readonly_bind_paths = []\npermit_network_property = false\n[readonly_bind_mounts]\n\"bin\" = \"/opt/tools/bin\"\n",
+        );
+        let error = rejected.expect_err("relative mount destination is rejected");
+        assert!(
+            error.to_string().contains("bin") || error.to_string().contains("readonly_bind_mounts"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_relative_mount_source() {
+        let rejected = toml::from_str::<BwrapConfig>(
+            "readonly_bind_paths = []\npermit_network_property = false\n[readonly_bind_mounts]\n\"/bin\" = \"tools/bin\"\n",
+        );
+        let error = rejected.expect_err("relative mount source is rejected");
+        assert!(
+            error.to_string().contains("tools/bin")
+                || error.to_string().contains("readonly_bind_mounts"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn rejects_a_relative_bind_path() {
         let rejected = toml::from_str::<BwrapConfig>(
             "readonly_bind_paths = [\"relative\"]\npermit_network_property = false\n",
@@ -154,7 +200,7 @@ permit_network_property = true
     #[test]
     fn rejects_a_relative_tmp_path() {
         let rejected =
-            toml::from_str::<BwrapConfig>(&format!("{COMPLETE}tmp_path = \"relative\"\n"));
+            toml::from_str::<BwrapConfig>(&format!("tmp_path = \"relative\"\n{COMPLETE}"));
 
         rejected.expect_err("relative tmp path is rejected");
     }
@@ -163,6 +209,7 @@ permit_network_property = true
     fn visits_exactly_its_program_and_observes_a_rewrite() {
         let mut config = BwrapConfig {
             readonly_bind_paths: vec![abs("/usr")],
+            readonly_bind_mounts: BTreeMap::new(),
             permit_network_property: false,
             program: PathBuf::from("bwrap"),
             tmp_path: abs("/tmp"),

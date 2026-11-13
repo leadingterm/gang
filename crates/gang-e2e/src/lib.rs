@@ -35,6 +35,7 @@ mod errors;
 mod event_log;
 mod execution;
 mod fake_bazel;
+mod fhs_tools;
 mod fifo;
 mod fleets;
 mod gang_cli;
@@ -123,6 +124,7 @@ pub use execution::{
     WorkerCertificates, held_build, renewal_deadline, scope_of,
 };
 pub use fake_bazel::{FAKE_BAZEL_ENV, command_line_event, fake_bazel, fake_bazel_requested};
+pub use fhs_tools::fhs_tools;
 pub use fleets::fleets;
 pub use gang_cli::GangCli;
 pub use gang_config::InputLinks;

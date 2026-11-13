@@ -27,6 +27,20 @@ locals {
     for fleet in var.fleets :
     fleet.fallback == null ? [fleet.name] : [fleet.name, "${fleet.name}${local.on_demand_suffix}"]
   ])
+
+  # Per fleet, the worker subnets whose zone offers at least one of its instance types; the
+  # on-demand twin uses its fleet's list. Capacity pools are per instance type and zone, and a
+  # mixed-instances group chooses among the pools of the zone it launches in, so one offered type
+  # makes a zone usable. Requiring every type would drop usable zones and shrink the fleet.
+  fleet_subnet_ids = {
+    for fleet in var.fleets : fleet.name => [
+      for zone, subnet_id in var.subnet_ids : subnet_id
+      if anytrue([
+        for index, offered_zone in data.aws_ec2_instance_type_offerings.this.locations :
+        offered_zone == zone && contains(fleet.instance_types, data.aws_ec2_instance_type_offerings.this.instance_types[index])
+      ])
+    ]
+  }
 }
 
 # Root volume device name comes from the AMI, so the launch template maps the right device.
@@ -36,6 +50,21 @@ data "aws_ami" "this" {
   filter {
     name   = "image-id"
     values = [each.value.ami_id]
+  }
+}
+
+# Which worker subnet zones offer which instance types. Read at plan time, so each group spans only zones that can launch its fleet.
+data "aws_ec2_instance_type_offerings" "this" {
+  location_type = "availability-zone"
+
+  filter {
+    name   = "location"
+    values = keys(var.subnet_ids)
+  }
+
+  filter {
+    name   = "instance-type"
+    values = distinct(flatten(var.fleets[*].instance_types))
   }
 }
 
@@ -104,7 +133,7 @@ resource "aws_autoscaling_group" "this" {
   min_size               = 0
   max_size               = local.fleets[each.value.fleet].max_instances
   desired_capacity       = 0
-  vpc_zone_identifier    = var.subnet_ids
+  vpc_zone_identifier    = local.fleet_subnet_ids[each.value.fleet]
   capacity_rebalance     = each.value.capacity == "spot"
   protect_from_scale_in  = each.value.protected
   force_delete_warm_pool = each.value.warm_pool_size > 0
@@ -162,6 +191,11 @@ resource "aws_autoscaling_group" "this" {
   # The controller owns desired capacity; Terraform sets it only at creation.
   lifecycle {
     ignore_changes = [desired_capacity]
+
+    precondition {
+      condition     = length(local.fleet_subnet_ids[each.value.fleet]) > 0
+      error_message = "Fleet ${each.value.fleet}: no worker subnet zone (${join(", ", keys(var.subnet_ids))}) offers any of its instance types (${join(", ", local.fleets[each.value.fleet].instance_types)})."
+    }
   }
 }
 

@@ -100,6 +100,13 @@ behaviour! {
             /// The loader is missing from the sandbox.
             Missing,
         },
+        /// Whether the sandbox shows the action tools at `/bin` and `/usr/bin`.
+        fhs: Fhs {
+            /// The action tools are bound into the sandbox.
+            Bound,
+            /// The action tools are missing from the sandbox.
+            Missing,
+        },
         /// Whether cached inputs stay intact.
         /// This describes whether a modified cached input reaches a later action as `input_links`
         /// says.
@@ -700,6 +707,15 @@ impl Simulation {
                     Loader::Bound => "glibc_tool=ran\n",
                     Loader::Missing => {
                         "glibc_tool=failed: bwrap: execvp ./glibc-tool: No such file or directory\n"
+                    }
+                }
+                .to_owned(),
+            ),
+            Probe::FhsTools => Some(
+                match self.behaviour.fhs {
+                    Fhs::Bound => "fhs_tools=ran\n",
+                    Fhs::Missing => {
+                        "fhs_tools=failed: ./fhs-tools.sh: /usr/bin/env: bad interpreter: No such file or directory\n"
                     }
                 }
                 .to_owned(),

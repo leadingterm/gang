@@ -51,6 +51,13 @@ pub mod glibc_toolchain {
     pub const TOOL_RUNS: &str = "a dynamically linked glibc program runs inside the sandbox";
 }
 
+/// Names of the checks of the tools a sandboxed action finds at standard paths.
+pub mod fhs_tools {
+    /// A script with `#!/usr/bin/env bash` runs with Bazel's strict action `PATH`.
+    pub const SCRIPT_RUNS: &str =
+        "a #!/usr/bin/env bash script runs with Bazel's strict action PATH";
+}
+
 /// Names of the checks of a build's outcome.
 pub mod build {
     /// Every action of the build ran remotely.
@@ -486,9 +493,8 @@ pub mod sandbox_contract {
         "no variable of the gang worker's own environment reaches a bwrap action";
     /// /tmp in a bwrap action is a fresh, empty tmpfs.
     pub const TMP_FRESH: &str = "/tmp in a bwrap action is a fresh, empty tmpfs";
-    /// Every `readonly_bind_paths` entry is read-only inside a bwrap action.
-    pub const READONLY_BINDS: &str =
-        "every readonly_bind_paths entry is read-only inside a bwrap action";
+    /// Every `readonly_bind_paths` and `readonly_bind_mounts` path is read-only inside a bwrap action.
+    pub const READONLY_BINDS: &str = "every readonly_bind_paths and readonly_bind_mounts path is read-only inside a bwrap action";
     /// The working directory of a bwrap action is writable.
     pub const WORKDIR_WRITABLE: &str = "the working directory of a bwrap action is writable";
     /// The held bwrap action runs in its own scope.

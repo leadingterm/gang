@@ -60,15 +60,16 @@ use gang_e2e::{
     Probe, SMALL_FLEET, Sandbox, Settings, Signalled, SoftMemory, Variant, names,
 };
 use gang_e2e::{
-    disk, fleets, glibc_toolchain, input_integrity, lifecycle, limits, memory, network, plaintext,
-    restart, revocation,
+    disk, fhs_tools, fleets, glibc_toolchain, input_integrity, lifecycle, limits, memory, network,
+    plaintext, restart, revocation,
 };
 use gang_wire::routes::{GET_STATE, WATCH_STATE};
 use support::{
     AdminRoutes, Anonymous, Behaviour, BuildFailure, Cache, Completed, Convergence, Dashboard,
-    Disk, Drain, Grower, Handshake, HoldBuild, HoldSignal, Integrity, Isolation, Limits, Loader,
-    Neighbour, OrphanProcess, PidReuse, Requests, Restart, Revocation, Routing, ScopeReport,
-    Serving, SimulatedIdentity, Simulation, StateView, StreamCauses, Termination, TokenIssue, Warm,
+    Disk, Drain, Fhs, Grower, Handshake, HoldBuild, HoldSignal, Integrity, Isolation, Limits,
+    Loader, Neighbour, OrphanProcess, PidReuse, Requests, Restart, Revocation, Routing,
+    ScopeReport, Serving, SimulatedIdentity, Simulation, StateView, StreamCauses, Termination,
+    TokenIssue, Warm,
 };
 
 /// The name of the check that a request for the state without a session cookie is refused.
@@ -215,6 +216,11 @@ fn lifecycle_checks(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
 /// The verdicts of the glibc toolchain scenario against a simulated sandbox.
 fn glibc_toolchain_checks(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
     glibc_toolchain(&Simulation::new(baseline(Sandbox::Bwrap), behaviour))
+}
+
+/// The verdicts of the FHS tools scenario against a simulated sandbox.
+fn fhs_tools_checks(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
+    fhs_tools(&Simulation::new(baseline(Sandbox::Bwrap), behaviour))
 }
 
 /// The verdicts of the input integrity scenario against a simulation that behaves as `behaviour`
@@ -365,6 +371,17 @@ flaw! {
     missing_loader_fails_only_the_glibc_tool_check:
         glibc_toolchain_checks(loader = Loader::Missing)
         => only [names::glibc_toolchain::TOOL_RUNS]
+}
+
+#[test]
+fn fhs_tools_is_compliant_when_the_tools_are_bound() {
+    assert_compliant(&fhs_tools_checks(Behaviour::COMPLIANT).expect("the FHS tools scenario runs"));
+}
+
+flaw! {
+    missing_fhs_tools_fail_only_the_script_check:
+        fhs_tools_checks(fhs = Fhs::Missing)
+        => only [names::fhs_tools::SCRIPT_RUNS]
 }
 
 flaw! {

@@ -53,6 +53,7 @@ gang-testkit = { workspace = true }
 object = { workspace = true }
 rustix = { workspace = true }
 tempfile = { workspace = true }
+toml = { workspace = true }
 
 [[bin]]
 name = "gang"

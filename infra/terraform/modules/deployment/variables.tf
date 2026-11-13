@@ -144,7 +144,7 @@ variable "fleets" {
     capacity: spot or on-demand. Selects the Auto Scaling group purchase option and is written to [fleets.options].capacity.
     machine_class: optional qualitative machine class (for example gpu), written to [fleets.options].machine_class when set.
     ami_id: worker AMI for this fleet.
-    instance_types: EC2 instance types. For on-demand fleets the order is the launch priority (the first type is tried first); spot fleets ignore the order. Every type needs instance-store NVMe unless scratch_volume_gib is set.
+    instance_types: EC2 instance types. For on-demand fleets the order is the launch priority (the first type is tried first); spot fleets ignore the order. Every type needs instance-store NVMe unless scratch_volume_gib is set. The fleet's groups span only the private subnets whose availability zone offers at least one of these types; the plan fails when no zone offers any.
     max_instances: upper bound of the Auto Scaling group.
     min_instances, vcpus_per_instance, target_actions_per_instance, idle_timeout,
     max_drain_wait, boot_grace: scheduling policy written to gang.toml.

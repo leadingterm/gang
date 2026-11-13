@@ -35,6 +35,7 @@ fn tools() -> ActionTools {
     ActionTools {
         shell: std::path::PathBuf::from("/nix/store/aaa-bash/bin/bash"),
         path: "/nix/store/aaa-bash/bin:/nix/store/bbb-coreutils/bin".to_owned(),
+        action_bin: std::path::PathBuf::from("/nix/store/ddd-action-tools/bin"),
         bwrap: Some(std::path::PathBuf::from(
             "/nix/store/ccc-bubblewrap/bin/bwrap",
         )),

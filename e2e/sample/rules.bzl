@@ -29,7 +29,7 @@ def _report(ctx, script, inputs, env):
     return [DefaultInfo(files = depset([report]))]
 
 def _probe_impl(ctx):
-    return _report(ctx, ctx.attr.script, ctx.files.srcs, {})
+    return _report(ctx, ctx.attr.script, ctx.files.srcs, {"PATH": ctx.attr.path or ACTION_PATH})
 
 def _input_root_probe_impl(ctx):
     shared = ctx.file.shared
@@ -59,6 +59,7 @@ probe = rule(
     implementation = _probe_impl,
     attrs = {
         "script": attr.string(mandatory = True, doc = "Shell script; its standard output is the report."),
+        "path": attr.string(doc = "The action's PATH; empty: the harness's ACTION_PATH."),
         "srcs": attr.label_list(allow_files = True, doc = "Inputs of the action."),
     },
 )

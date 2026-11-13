@@ -54,8 +54,22 @@ run "subnets_per_az" {
   }
 
   assert {
+    condition     = toset(keys(output.private_subnet_ids)) == toset(["eu-north-1a", "eu-north-1b", "eu-north-1c"])
+    error_message = "private_subnet_ids must be keyed by the availability zone of each private subnet."
+  }
+
+  assert {
     condition     = alltrue([for subnet in aws_subnet.public : subnet.map_public_ip_on_launch]) && alltrue([for subnet in aws_subnet.private : !subnet.map_public_ip_on_launch])
     error_message = "Only public subnets may assign public IPs on launch."
+  }
+}
+
+run "private_subnet_ids_map_each_zone_to_its_private_subnet" {
+  command = apply
+
+  assert {
+    condition     = output.private_subnet_ids["eu-north-1a"] == aws_subnet.private[0].id && output.private_subnet_ids["eu-north-1b"] == aws_subnet.private[1].id && output.private_subnet_ids["eu-north-1c"] == aws_subnet.private[2].id
+    error_message = "private_subnet_ids must map each availability zone to the private subnet in that zone."
   }
 }
 
