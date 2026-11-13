@@ -1,5 +1,5 @@
 {
-  "checksum": "0d890a1b8c4e8dae1c445218b84bbb69d85bb6da92f362e8456508f7fd58652d",
+  "checksum": "be3524405b6e5ba3eb96acb74a1b669e2e1abc7fb53ffc315cd6512be29e4d0d",
   "crates": {
     "adler2 2.0.1": {
       "name": "adler2",
@@ -14146,6 +14146,10 @@
             {
               "id": "toml 1.2.0+spec-1.1.0",
               "target": "toml"
+            },
+            {
+              "id": "tracing 0.1.44",
+              "target": "tracing"
             },
             {
               "id": "url 2.5.8",

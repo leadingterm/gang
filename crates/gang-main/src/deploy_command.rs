@@ -103,7 +103,7 @@ fn store_request(args: StoreRequestArgs, input: impl Read, out: &Output) -> Resu
         run_id: args.run_id,
         run_attempt: args.run_attempt,
         prefix: args.prefix,
-        max_age: args.max_age_seconds,
+        max_age: args.max_age,
         now: args.now,
     };
     let request = StoreRequest::try_new(inputs, &plan, PlanSha256::digest(&bytes))?;
@@ -199,7 +199,7 @@ fn check_versions(args: &ManifestFileArgs, input: impl Read) -> Result<ExitCode>
 /// Checks the object head on stdin against the manifest, the time and the maximum age.
 fn check_object(args: &CheckObjectArgs, input: impl Read) -> Result<ExitCode> {
     let head: ObjectHead = stdin_document(input)?;
-    read_manifest(&args.manifest)?.check_object(&head, args.now, args.max_age_seconds)?;
+    read_manifest(&args.manifest)?.check_object(&head, args.now, args.max_age)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -214,8 +214,9 @@ fn check_plan(args: &CheckPlanArgs) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::time::Duration;
 
-    use gang_deploy::UnixTime;
+    use gang_deploy::{MaxAge, UnixTime};
     use serde_json::json;
 
     use super::*;
@@ -286,7 +287,7 @@ mod tests {
                 run_id: "99".parse().expect("run id"),
                 run_attempt: "2".parse().expect("run attempt"),
                 prefix: "plans".parse().expect("prefix"),
-                max_age: "86400".parse().expect("max age"),
+                max_age: MaxAge::try_from(Duration::from_secs(86_400)).expect("positive max age"),
                 now: UnixTime::from_seconds(1_767_312_000),
             },
             &plan,
@@ -401,8 +402,8 @@ mod tests {
                     "2",
                     "--prefix",
                     "plans",
-                    "--max-age-seconds",
-                    "86400",
+                    "--max-age",
+                    "24h",
                     "--now",
                     "1767312000",
                     "--plan-file",
@@ -525,8 +526,8 @@ mod tests {
                     manifest_file,
                     "--now",
                     "1767312001",
-                    "--max-age-seconds",
-                    "86400",
+                    "--max-age",
+                    "24h",
                 ],
                 stdin: &object,
                 code: ExitCode::SUCCESS,

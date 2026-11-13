@@ -4,12 +4,13 @@
 use std::fmt;
 use std::num::NonZeroU32;
 use std::str::FromStr;
+use std::time::Duration;
 
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, PrimitiveDateTime};
 
 use crate::errors::{DeployError, Expected, Result};
-use crate::newtype::{decimal, positive};
+use crate::newtype::decimal;
 
 /// The manifest's whole-second UTC timestamp format.
 const FORMAT: &[time::format_description::BorrowedFormatItem<'_>] =
@@ -59,11 +60,8 @@ impl fmt::Display for UnixTime {
     }
 }
 
-/// The longest time a stored plan stays usable, in positive whole seconds.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
-#[serde(transparent)]
+/// The longest time a stored plan stays usable: a positive whole number of seconds, at most `u32::MAX`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MaxAge(NonZeroU32);
 
 impl MaxAge {
@@ -80,19 +78,18 @@ impl MaxAge {
     }
 }
 
-impl FromStr for MaxAge {
-    type Err = DeployError;
+impl TryFrom<Duration> for MaxAge {
+    type Error = DeployError;
 
-    fn from_str(text: &str) -> Result<Self> {
-        let seconds = positive(text)?;
-        u32::try_from(seconds.get())
+    fn try_from(duration: Duration) -> Result<Self> {
+        if duration.subsec_nanos() != 0 {
+            return Err(DeployError::MaxAge(duration));
+        }
+        u32::try_from(duration.as_secs())
             .ok()
             .and_then(NonZeroU32::new)
             .map(Self)
-            .ok_or_else(|| DeployError::Invalid {
-                text: text.to_owned(),
-                expected: Expected::PositiveNumber,
-            })
+            .ok_or(DeployError::MaxAge(duration))
     }
 }
 
@@ -188,6 +185,10 @@ pub fn object_age(last_modified: &str, now: UnixTime) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use crate::errors::DeployError;
+
     use super::{MaxAge, Timestamp, UnixTime, object_age};
 
     /// 2026-01-02T00:00:00Z.
@@ -265,46 +266,29 @@ mod tests {
     }
 
     #[test]
-    fn max_age_rejects_zero() {
-        assert!(matches!(
-            "0".parse::<MaxAge>(),
-            Err(crate::errors::DeployError::Invalid {
-                expected: crate::errors::Expected::PositiveNumber,
-                ..
-            })
-        ));
-        assert!(serde_json::from_str::<MaxAge>("0").is_err());
-    }
-
-    #[test]
-    fn max_age_accepts_positive_seconds_and_rejects_overflow()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let seconds = std::num::NonZeroU32::new(86_400).ok_or("zero max age")?;
-        let max_age = MaxAge::from_seconds(seconds);
+    fn max_age_accepts_positive_whole_seconds_within_u32() {
+        let max_age = MaxAge::try_from(Duration::from_secs(86_400)).expect("positive max age");
         assert_eq!(max_age.as_secs(), 86_400);
-        assert_eq!(serde_json::to_string(&max_age)?, "86400");
-        assert_eq!(serde_json::from_str::<MaxAge>("86400")?, max_age);
-        assert!(matches!(
-            "4294967296".parse::<MaxAge>(),
-            Err(crate::errors::DeployError::Invalid {
-                expected: crate::errors::Expected::PositiveNumber,
-                ..
-            })
-        ));
-        Ok(())
+        assert!(MaxAge::try_from(Duration::from_secs(u64::from(u32::MAX))).is_ok());
     }
 
     #[test]
-    fn unix_time_and_max_age_parse_digits_only() {
+    fn max_age_rejects_zero_fractional_seconds_and_overflow() {
+        for duration in [
+            Duration::ZERO,
+            Duration::from_millis(1_500),
+            Duration::from_secs(u64::from(u32::MAX) + 1),
+        ] {
+            assert!(matches!(
+                MaxAge::try_from(duration),
+                Err(DeployError::MaxAge(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn unix_time_parses_digits_only() {
         assert_eq!("1767312000".parse::<UnixTime>().unwrap(), JAN_2);
-        assert_eq!(
-            "86400"
-                .parse::<MaxAge>()
-                .expect("positive max age")
-                .as_secs(),
-            86_400
-        );
-        assert!("abc".parse::<MaxAge>().is_err());
         assert!("-1".parse::<UnixTime>().is_err());
     }
 }

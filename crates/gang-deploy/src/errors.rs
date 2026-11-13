@@ -219,6 +219,9 @@ pub enum DeployError {
         /// The maximum age.
         max_age: MaxAge,
     },
+    /// A maximum age that is not a positive whole number of seconds up to `u32::MAX`.
+    #[error("maximum age {0:?} is not a positive whole number of seconds up to 4294967295")]
+    MaxAge(std::time::Duration),
     /// The plan expired.
     #[error("plan expired at {expires_at}")]
     Expired {

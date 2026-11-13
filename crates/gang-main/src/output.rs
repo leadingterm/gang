@@ -409,7 +409,7 @@ impl Output {
             pairs
                 .iter()
                 .flat_map(|(key, value)| {
-                    debug_assert!(
+                    assert!(
                         columns(key) <= MARGIN,
                         "field key {key} does not fit the margin"
                     );

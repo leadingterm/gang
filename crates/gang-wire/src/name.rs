@@ -191,12 +191,15 @@ pub fn write_of<C: Collection>(into: &mut String, id: &C::Id) {
 ///
 /// [`write_of`] uses it after the collection prefix, and route builders use it to append an ID
 /// to a path.
+///
+/// # Panics
+///
+/// Panics if `id`'s `Display` implementation returns an error.
 pub fn push_segment(into: &mut String, id: &(impl Display + ?Sized)) {
     let mut sink = SegmentSink { out: into };
     let written = fmt::write(&mut sink, format_args!("{id}"));
-    // `SegmentSink::write_str` never fails, so only a `Display` impl that returns an error can
-    // reach this point, and then the name is left truncated.
-    debug_assert!(written.is_ok(), "Display for an ID returned an error");
+    // `SegmentSink::write_str` never fails, so only a faulty `Display` impl of the ID can fail here.
+    assert!(written.is_ok(), "Display for an ID returned an error");
 }
 
 /// Adapter that percent-encodes every chunk written to it, appending the result to `out`.

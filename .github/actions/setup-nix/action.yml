@@ -1,0 +1,12 @@
+name: Set up Nix
+description: >-
+  Enable unprivileged user namespaces on Linux, so bwrap works, and install Nix for the repository's
+  devShell.
+runs:
+  using: composite
+  steps:
+    - name: Allow unprivileged user namespaces
+      if: runner.os == 'Linux'
+      shell: bash
+      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+    - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
