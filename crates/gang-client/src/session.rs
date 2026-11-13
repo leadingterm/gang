@@ -18,6 +18,8 @@ pub(crate) enum SessionKind {
         /// The provider's login configuration, as published by the server.
         login: serde_json::Value,
     },
+    /// Obtained through the server's device authorization flow.
+    Device,
     /// Obtained from a workload proof; every token is minted from a fresh read of `source`.
     Workload {
         /// Where the workload proof is read from.

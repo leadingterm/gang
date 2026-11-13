@@ -15,6 +15,7 @@
 mod api;
 mod bazel_options;
 mod bazelrc;
+mod browser;
 mod client;
 mod console;
 mod credential_helper;
@@ -37,6 +38,7 @@ mod test_support;
 pub use api::ServerApi;
 pub use bazel_options::{BazelCommand, BazelProbe, EffectiveOptions, OptionSource, Setting};
 pub use bazelrc::CA_FILE_NAME;
+pub use browser::LocalBrowser;
 pub use client::{
     Bazelrc, BazelrcRequest, BearerToken, Client, InteractiveLogin, LoggedIn, WorkloadLogin,
 };

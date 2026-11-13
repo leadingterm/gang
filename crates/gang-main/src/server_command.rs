@@ -12,8 +12,8 @@ use gang_config::{
     Transport,
 };
 use gang_server::{
-    HandshakeSettings, Listeners, LoginSettings, Parts, Provider, Providers, PublicEndpoint,
-    RequestLimits, Server, ServerSettings, TlsSettings, TransportSettings,
+    DeviceSettings, HandshakeSettings, Listeners, LoginSettings, Parts, Provider, Providers,
+    PublicEndpoint, RequestLimits, Server, ServerSettings, TlsSettings, TransportSettings,
 };
 use gang_spi::{
     ControllerReady, LoginClient, PluginContext, ProvisionerPort, ServerEndpoints, Sidecar,
@@ -267,6 +267,13 @@ async fn dashboard_login(dashboard: &DashboardConfig) -> Result<Option<LoginSett
         },
         ttl: dashboard.login_ttl,
         max_pending: dashboard.max_pending_logins,
+        session_max_age: dashboard.session_max_age,
+        renewal_reuse: dashboard.renewal_reuse,
+        device: dashboard.device.enabled.then_some(DeviceSettings {
+            ttl: dashboard.device.ttl,
+            poll_interval: dashboard.device.poll_interval,
+            max_pending: dashboard.device.max_pending,
+        }),
     }))
 }
 

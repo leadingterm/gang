@@ -969,7 +969,7 @@ fn fleet_name(id: &str) -> Result<String> {
 
 /// A live state numbered `seq` that shows `fleets` and `workers`, carries `events` and counts
 /// `completed` actions.
-fn state_frame(
+pub(crate) fn state_frame(
     seq: u64,
     fleets: Vec<Fleet>,
     workers: Vec<Worker>,

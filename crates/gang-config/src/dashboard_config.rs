@@ -3,7 +3,10 @@
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use gang_types::{AbsolutePathBuf, ClientSecret, NonZeroDuration, ProviderName};
+use gang_types::{
+    AbsolutePathBuf, ClientSecret, DeviceCodeTtl, DevicePollInterval, NonZeroDuration,
+    ProviderName, SessionMaxAge,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::client_secret::ClientSecretSource;
@@ -40,6 +43,21 @@ const DEFAULT_LOGIN_TTL: NonZeroDuration = NonZeroDuration::from_mins(10);
 
 /// The default number of logins in progress at once: 1024.
 const DEFAULT_MAX_PENDING_LOGINS: NonZeroUsize = NonZeroUsize::new(1024).expect("1024 is non-zero");
+
+/// The default lifetime of a device authorization: ten minutes.
+const DEFAULT_DEVICE_TTL: DeviceCodeTtl = DeviceCodeTtl::from_units(600);
+
+/// The default interval between device polls: five seconds.
+const DEFAULT_DEVICE_POLL_INTERVAL: DevicePollInterval = DevicePollInterval::from_units(5);
+
+/// The default number of device authorizations pending at once: 1024.
+const DEFAULT_DEVICE_MAX_PENDING: NonZeroUsize = NonZeroUsize::new(1024).expect("1024 is non-zero");
+
+/// The default absolute browser session lifetime: twelve hours.
+const DEFAULT_SESSION_MAX_AGE: SessionMaxAge = SessionMaxAge::from_units(43_200);
+
+/// The default sharing window for a renewal grant: one minute.
+const DEFAULT_RENEWAL_REUSE: NonZeroDuration = NonZeroDuration::from_mins(1);
 
 /// How many `detail_interval`s an action may go unrefreshed before it is stale, when
 /// `actions_stale_after` is unset.
@@ -125,6 +143,69 @@ impl From<DashboardLogin> for RawDashboardLogin {
     }
 }
 
+/// Settings of device login (ADR-37) under `[dashboard.device]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "RawDeviceConfig")]
+pub struct DeviceConfig {
+    /// Mounts device login (ADR-37) when the dashboard sign-in is mounted. Defaults to true.
+    pub enabled: bool,
+    /// How long a device authorization lasts (ADR-37), from 1m to 30m. Defaults to 10m.
+    pub ttl: DeviceCodeTtl,
+    /// How often a device may poll (ADR-37), from 1s to 1h and shorter than `ttl`. Defaults to 5s.
+    pub poll_interval: DevicePollInterval,
+    /// The most device authorizations pending at once (ADR-37). Defaults to 1024.
+    pub max_pending: NonZeroUsize,
+}
+
+impl Default for DeviceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ttl: DEFAULT_DEVICE_TTL,
+            poll_interval: DEFAULT_DEVICE_POLL_INTERVAL,
+            max_pending: DEFAULT_DEVICE_MAX_PENDING,
+        }
+    }
+}
+
+/// The `[dashboard.device]` table before its timing is checked.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawDeviceConfig {
+    enabled: bool,
+    ttl: DeviceCodeTtl,
+    poll_interval: DevicePollInterval,
+    max_pending: NonZeroUsize,
+}
+
+impl Default for RawDeviceConfig {
+    fn default() -> Self {
+        let device = DeviceConfig::default();
+        Self {
+            enabled: device.enabled,
+            ttl: device.ttl,
+            poll_interval: device.poll_interval,
+            max_pending: device.max_pending,
+        }
+    }
+}
+
+impl TryFrom<RawDeviceConfig> for DeviceConfig {
+    type Error = &'static str;
+
+    fn try_from(raw: RawDeviceConfig) -> Result<Self, Self::Error> {
+        if raw.poll_interval.get() >= raw.ttl.get() {
+            return Err("dashboard.device poll_interval must be shorter than ttl");
+        }
+        Ok(Self {
+            enabled: raw.enabled,
+            ttl: raw.ttl,
+            poll_interval: raw.poll_interval,
+            max_pending: raw.max_pending,
+        })
+    }
+}
+
 /// Settings of the operator dashboard. Every field has a default, so the section may be
 /// omitted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,10 +240,20 @@ pub struct DashboardConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actions_stale_after: Option<NonZeroDuration>,
     /// How long a started browser sign-in stays open before its callback arrives. Must be
-    /// non-zero. Defaults to ten minutes. The session lifetime is the token plugin's `token_ttl`.
+    /// non-zero. Defaults to ten minutes. The short-lived token lifetime is the token plugin's
+    /// `token_ttl`.
     pub login_ttl: NonZeroDuration,
     /// The most logins in progress at once. Defaults to 1024.
     pub max_pending_logins: NonZeroUsize,
+    /// The absolute lifetime of a browser session (ADR-39): renewal stops this long after the
+    /// sign-in that set the renewal cookie, and the next sign-in asks no consent. From 1m to 30d.
+    /// Defaults to 12 hours.
+    pub session_max_age: SessionMaxAge,
+    /// How long one refresh grant's result is shared by renewals of the same refresh token
+    /// (ADR-39), so two tabs never present one token twice. Must be non-zero. Defaults to 1 minute.
+    pub renewal_reuse: NonZeroDuration,
+    /// Settings of device login (ADR-37).
+    pub device: DeviceConfig,
     /// The login the dashboard requires. Defaults to absent, which means the dashboard has no
     /// login.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -184,6 +275,9 @@ impl Default for DashboardConfig {
             actions_stale_after: None,
             login_ttl: DEFAULT_LOGIN_TTL,
             max_pending_logins: DEFAULT_MAX_PENDING_LOGINS,
+            session_max_age: DEFAULT_SESSION_MAX_AGE,
+            renewal_reuse: DEFAULT_RENEWAL_REUSE,
+            device: DeviceConfig::default(),
             login: None,
         }
     }

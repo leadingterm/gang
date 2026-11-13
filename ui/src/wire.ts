@@ -145,6 +145,42 @@ vcpus: number,
  */
 memory: Bytes, };
 
+export type DeviceAuthorization = { 
+/**
+ * Resource name containing the user code.
+ */
+name: string, 
+/**
+ * Identity provider used for approval.
+ */
+provider: string, 
+/**
+ * Dashboard page where the user enters the code.
+ */
+verificationUri: string, 
+/**
+ * Server-observed address of the creator, when available.
+ */
+clientAddress?: string, 
+/**
+ * Current approval state.
+ */
+state: DeviceAuthorizationState, 
+/**
+ * Time the authorization was created.
+ */
+createTime: Timestamp, 
+/**
+ * Time the authorization expires.
+ */
+expireTime: Timestamp, 
+/**
+ * Minimum interval between redemption polls.
+ */
+pollInterval: string, };
+
+export type DeviceAuthorizationState = "PENDING" | "APPROVED";
+
 export type EventChange = { "scaledOut": { 
 /**
  * Size before the change.
@@ -731,6 +767,9 @@ unconnected: number, };
 export const PATHS = {
   getServer: "/v1/server",
   authenticateSession: "/v1/session:authenticate",
+  createDeviceAuthorization: "/v1/deviceAuthorizations",
+  getDeviceAuthorization: "/v1/deviceAuthorizations/{deviceAuthorization}",
+  redeemDeviceAuthorization: "/v1/deviceAuthorizations/{deviceAuthorization}:redeem",
   createCertificate: "/v1/certificates",
   revokeCertificate: "/v1/certificates/{certificate}:revoke",
   listPrincipals: "/v1/principals",
@@ -742,6 +781,10 @@ export const PATHS = {
   watchState: "/v1/state:watch",
   getSession: "/v1/session",
   login: "/ui/login",
+  callback: "/ui/callback",
   logout: "/ui/logout",
+  renew: "/ui/renew",
+  device: "/ui/device",
+  deviceApproved: "/ui/device/approved",
   error: "/ui/error",
 } as const;

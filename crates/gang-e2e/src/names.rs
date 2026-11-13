@@ -224,6 +224,59 @@ pub mod dashboard {
         "revoking the principal ends the open stream with a closed event: revoked";
 }
 
+/// Names of the checks of the sessions scenario (ADR-39).
+pub mod sessions {
+    /// The first sign-in asks for offline access.
+    pub const OFFLINE_SIGN_IN: &str =
+        "the first sign-in asks the provider for offline access with consent";
+    /// The renewal cookie is set with its security attributes.
+    pub const RENEWAL_COOKIE_SET: &str =
+        "the offline sign-in sets an HttpOnly, SameSite=Strict renewal cookie for 400 days";
+    /// A cross-site renewal is refused.
+    pub const CROSS_SITE_RENEWAL_REFUSED: &str =
+        "a cross-site renewal answers 403 and touches no cookie";
+    /// A renewal without its cookie is refused.
+    pub const RENEWAL_NEEDS_COOKIE: &str = "a renewal without a renewal cookie answers 401";
+    /// The sealed cookie is no credential.
+    pub const SEALED_COOKIE_NOT_A_CREDENTIAL: &str = "the sealed renewal cookie is refused as a bearer token, as a session cookie and as a session:authenticate proof";
+    /// Concurrent renewals share one refresh grant.
+    pub const CONCURRENT_RENEWALS_SHARE_ONE_GRANT: &str =
+        "two concurrent renewals of a rotating refresh token both renew through one refresh grant";
+    /// Renewal across expiries.
+    pub const RENEWS_ACROSS_EXPIRY: &str =
+        "for two token lifetimes, each expired stream is renewed and reopened";
+    /// Renewal is silent at the provider.
+    pub const RENEWAL_SILENT: &str = "renewals reach the provider only as web-client refresh grants, never as an authorization request";
+    /// The absolute lifetime ends renewal.
+    pub const MAX_AGE_ENDS_RENEWAL: &str =
+        "past the absolute lifetime a renewal answers 401 and keeps the renewal cookie";
+    /// The next sign-in asks no consent.
+    pub const SIGN_IN_WITHOUT_CONSENT: &str = "the sign-in after the absolute lifetime asks no offline access and re-checks the held refresh token with one grant";
+    /// Revocation ends renewal.
+    pub const REVOCATION_ENDS_RENEWAL: &str = "revoking the principal closes the stream and a renewal answers 403 clearing the renewal cookie";
+    /// Logout clears both cookies.
+    pub const LOGOUT_CLEARS_BOTH: &str =
+        "logout clears the session and renewal cookies, and a renewal afterwards answers 401";
+    /// A suspended account cannot renew or sign in.
+    pub const SUSPENSION_ENDS_RENEWAL: &str = "a suspended account's renewal answers 401 clearing the cookie, and its sign-in fails at the provider";
+    /// Every check, in the order the scenario emits them.
+    pub const ALL: [&str; 13] = [
+        OFFLINE_SIGN_IN,
+        RENEWAL_COOKIE_SET,
+        CROSS_SITE_RENEWAL_REFUSED,
+        RENEWAL_NEEDS_COOKIE,
+        SEALED_COOKIE_NOT_A_CREDENTIAL,
+        CONCURRENT_RENEWALS_SHARE_ONE_GRANT,
+        RENEWS_ACROSS_EXPIRY,
+        RENEWAL_SILENT,
+        MAX_AGE_ENDS_RENEWAL,
+        SIGN_IN_WITHOUT_CONSENT,
+        REVOCATION_ENDS_RENEWAL,
+        LOGOUT_CLEARS_BOTH,
+        SUSPENSION_ENDS_RENEWAL,
+    ];
+}
+
 /// Names of the checks of the per-action limits scenario.
 pub mod limits {
     /// The platform enforces limits with cgroups.
@@ -448,6 +501,50 @@ pub mod identity {
         "a principal revoked before the restart is refused after it as PRINCIPAL_REVOKED";
     /// B13: the restarted server serves.
     pub const RESTARTED_SERVER_SERVES: &str = "the restarted server serves an unrevoked principal";
+
+    /// ADR-37: a headless login prompts for a device approval only.
+    pub const DEVICE_LOGIN_PROMPTED: &str = "a headless gang login prints the verification URI and a code, and starts no browser sign-in";
+    /// ADR-37: the approval page's resource shows the requester, never the secret.
+    pub const DEVICE_SHOWS_CLIENT_ADDRESS: &str =
+        "the device authorization shows the CLI's address and never its secret";
+    /// ADR-37: the approval goes through the provider to the approved page.
+    pub const DEVICE_APPROVAL_REDIRECTS: &str = "a same-origin approval goes through the provider and the callback to /ui/device/approved without a session cookie";
+    /// ADR-38/39: device approvals still ask for offline access.
+    pub const DEVICE_APPROVAL_OFFLINE: &str =
+        "the device approval asks the provider for offline access with consent";
+    /// ADR-37: the login completes by itself.
+    pub const DEVICE_LOGIN_COMPLETES: &str = "the device login ends by itself, logged in with the provider, storing a device session without an ID token";
+    /// ADR-37: renewal through the web client.
+    pub const DEVICE_LOGIN_RENEWS: &str = "an expired device session renews through one web-client refresh grant, storing the rotated refresh token before the token";
+    /// ADR-37: revocation applies to device sessions.
+    pub const DEVICE_LOGIN_REVOKED: &str = "a revoked approver's device session is refused with principal revoked, and works again once restored";
+    /// ADR-37 simulated flaw: a provider that returns no refresh token.
+    pub const DEVICE_WITHOUT_REFRESH_TOKEN_FAILS: &str = "an approval without a refresh token fails, the code stays pending, and the login exits 1 storing nothing, with a server warning";
+    /// ADR-37 attacker: cross-site approval.
+    pub const CROSS_SITE_DEVICE_APPROVAL_REFUSED: &str = "a cross-site device approval answers 403";
+    /// ADR-37 attacker: wrong secret.
+    pub const WRONG_SECRET_REDEEM_REFUSED: &str =
+        "a redeem with a wrong secret answers 404 DEVICE_AUTHORIZATION_NOT_FOUND";
+    /// ADR-37 attacker: revoked between approval and redeem.
+    pub const REVOKED_BEFORE_REDEEM_REFUSED: &str = "revoking the approver between approval and redeem makes the redeem answer 403 PRINCIPAL_REVOKED";
+    /// ADR-37 attacker: a second redeem.
+    pub const SECOND_REDEEM_REFUSED: &str =
+        "a second redeem answers 404 DEVICE_AUTHORIZATION_NOT_FOUND";
+    /// The device-login checks, in the order the identity scenario emits them.
+    pub const DEVICE: [&str; 12] = [
+        DEVICE_LOGIN_PROMPTED,
+        DEVICE_SHOWS_CLIENT_ADDRESS,
+        DEVICE_APPROVAL_REDIRECTS,
+        DEVICE_APPROVAL_OFFLINE,
+        DEVICE_LOGIN_COMPLETES,
+        DEVICE_LOGIN_RENEWS,
+        DEVICE_LOGIN_REVOKED,
+        DEVICE_WITHOUT_REFRESH_TOKEN_FAILS,
+        CROSS_SITE_DEVICE_APPROVAL_REFUSED,
+        WRONG_SECRET_REDEEM_REFUSED,
+        REVOKED_BEFORE_REDEEM_REFUSED,
+        SECOND_REDEEM_REFUSED,
+    ];
 }
 
 /// Names of the checks of the action timeout scenarios, under bwrap and under noop.

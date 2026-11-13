@@ -24,6 +24,8 @@ wire_enum! {
     pub enum Code {
         /// The request is malformed; HTTP 400.
         InvalidArgument = "INVALID_ARGUMENT",
+        /// The operation cannot proceed in the resource's current state; HTTP 400.
+        FailedPrecondition = "FAILED_PRECONDITION",
         /// The request carries no valid credentials; HTTP 401.
         Unauthenticated = "UNAUTHENTICATED",
         /// The credentials may not perform the request; HTTP 403.
@@ -47,7 +49,7 @@ impl Code {
     #[must_use]
     pub const fn http(&self) -> u16 {
         match self {
-            Self::InvalidArgument => 400,
+            Self::InvalidArgument | Self::FailedPrecondition => 400,
             Self::Unauthenticated => 401,
             Self::PermissionDenied => 403,
             Self::NotFound => 404,
@@ -148,6 +150,8 @@ reasons! {
         InvalidPageToken = "INVALID_PAGE_TOKEN", "invalid page token", InvalidArgument, [];
         /// The request names an identity provider the server does not configure.
         UnknownProvider = "UNKNOWN_PROVIDER", "unknown identity provider", InvalidArgument, ["provider"];
+        /// A device authorization is still waiting for browser approval.
+        AuthorizationPending = "AUTHORIZATION_PENDING", "the device authorization is not approved yet", FailedPrecondition, [];
         /// The identity provider rejected the submitted proof of identity.
         ProofRejected = "PROOF_REJECTED", "proof rejected", Unauthenticated, [];
         /// The request presents no credentials.
@@ -162,6 +166,8 @@ reasons! {
         MissingPermission = "MISSING_PERMISSION", "missing permission", PermissionDenied, ["permission"];
         /// No route matches the method and path.
         RouteNotFound = "ROUTE_NOT_FOUND", "no such route", NotFound, ["method", "path"];
+        /// No device authorization with the requested code exists.
+        DeviceAuthorizationNotFound = "DEVICE_AUTHORIZATION_NOT_FOUND", "no such device authorization", NotFound, ["deviceAuthorization"];
         /// No certificate with the requested serial exists.
         CertificateNotFound = "CERTIFICATE_NOT_FOUND", "certificate not found", NotFound, ["certificate"];
         /// No principal with the requested name exists.
@@ -468,7 +474,7 @@ mod tests {
             .iter()
             .map(|reason| reason.as_str())
             .collect();
-        assert_eq!(names.len(), 17);
+        assert_eq!(names.len(), 19);
         for reason in ErrorReason::ALL {
             let name = reason.as_str();
             assert!(
@@ -497,6 +503,11 @@ mod tests {
             (ErrorReason::RequestTooLarge, 400, Code::InvalidArgument),
             (ErrorReason::InvalidPageToken, 400, Code::InvalidArgument),
             (ErrorReason::UnknownProvider, 400, Code::InvalidArgument),
+            (
+                ErrorReason::AuthorizationPending,
+                400,
+                Code::FailedPrecondition,
+            ),
             (ErrorReason::ProofRejected, 401, Code::Unauthenticated),
             (ErrorReason::CredentialsMissing, 401, Code::Unauthenticated),
             (ErrorReason::CredentialsInvalid, 401, Code::Unauthenticated),
@@ -504,6 +515,11 @@ mod tests {
             (ErrorReason::PrincipalRevoked, 403, Code::PermissionDenied),
             (ErrorReason::MissingPermission, 403, Code::PermissionDenied),
             (ErrorReason::RouteNotFound, 404, Code::NotFound),
+            (
+                ErrorReason::DeviceAuthorizationNotFound,
+                404,
+                Code::NotFound,
+            ),
             (ErrorReason::CertificateNotFound, 404, Code::NotFound),
             (ErrorReason::PrincipalNotFound, 404, Code::NotFound),
             (ErrorReason::RateLimited, 429, Code::ResourceExhausted),
@@ -520,11 +536,12 @@ mod tests {
 
     #[test]
     fn metadata_keys_follow_the_catalog() {
-        let table: [(ErrorReason, &[&str]); 17] = [
+        let table: [(ErrorReason, &[&str]); 19] = [
             (ErrorReason::MalformedRequest, &[]),
             (ErrorReason::RequestTooLarge, &[]),
             (ErrorReason::InvalidPageToken, &[]),
             (ErrorReason::UnknownProvider, &["provider"]),
+            (ErrorReason::AuthorizationPending, &[]),
             (ErrorReason::ProofRejected, &[]),
             (ErrorReason::CredentialsMissing, &[]),
             (ErrorReason::CredentialsInvalid, &[]),
@@ -532,6 +549,10 @@ mod tests {
             (ErrorReason::PrincipalRevoked, &[]),
             (ErrorReason::MissingPermission, &["permission"]),
             (ErrorReason::RouteNotFound, &["method", "path"]),
+            (
+                ErrorReason::DeviceAuthorizationNotFound,
+                &["deviceAuthorization"],
+            ),
             (ErrorReason::CertificateNotFound, &["certificate"]),
             (ErrorReason::PrincipalNotFound, &["principal"]),
             (ErrorReason::RateLimited, &[]),
@@ -749,6 +770,7 @@ mod tests {
     fn code_http_maps_each_code_and_answers_unknown_as_500() {
         let table = [
             (Code::InvalidArgument, 400),
+            (Code::FailedPrecondition, 400),
             (Code::Unauthenticated, 401),
             (Code::PermissionDenied, 403),
             (Code::NotFound, 404),

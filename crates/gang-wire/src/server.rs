@@ -82,6 +82,17 @@ pub struct TokenAuthentication<Login> {
     /// Providers that support interactive login, keyed by provider name. The keys are data, and
     /// the values are owned by the provider's plugin.
     pub login: BTreeMap<ProviderName, Login>,
+    /// The device login (ADR-37), present exactly when the server mounts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_login: Option<DeviceLogin>,
+}
+
+/// The provider device logins sign in with: the dashboard sign-in's.
+#[derive(gang_macros::Known, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceLogin {
+    /// The provider used for device login.
+    pub provider: ProviderName,
 }
 
 /// The empty member of [`Authentication::None`]; serializes to `{}`.
@@ -93,6 +104,22 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn token_authentication_round_trips_device_login() {
+        for value in [
+            json!({"login": {}}),
+            json!({"login": {}, "deviceLogin": {"provider": "okta"}}),
+        ] {
+            let token: TokenAuthentication<Value> =
+                serde_json::from_value(value.clone()).expect("token authentication parses");
+            assert_eq!(
+                token.device_login.is_some(),
+                value.get("deviceLogin").is_some()
+            );
+            assert_eq!(serde_json::to_value(token).expect("serializes"), value);
+        }
+    }
 
     fn server_value(authentication: &Value) -> Value {
         json!({

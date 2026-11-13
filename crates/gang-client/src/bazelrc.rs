@@ -98,6 +98,7 @@ mod tests {
     fn token() -> Authentication<Value> {
         Authentication::Token(TokenAuthentication {
             login: BTreeMap::new(),
+            device_login: None,
         })
     }
 

@@ -7,6 +7,7 @@ mod client {
 
     mod api;
     mod bazelrc;
+    mod device;
     mod get;
     mod interactive;
     mod revoke;

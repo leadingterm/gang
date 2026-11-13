@@ -110,7 +110,7 @@ mod worker_config;
 pub use authentication_config::AuthenticationConfig;
 pub use ca_pin_setting::CaPinSetting;
 pub use client_secret::{ClientSecretSource, SecretFileError};
-pub use dashboard_config::{DashboardConfig, DashboardLogin};
+pub use dashboard_config::{DashboardConfig, DashboardLogin, DeviceConfig};
 pub use endpoint::ListenerUrlError;
 pub use errors::{CaPinSettingError, ConfigError};
 pub use execution_config::{ExecutionConfig, InputLinks};

@@ -19,8 +19,9 @@ use gang_testkit::Controller;
 use gang_types::{AccessToken, Permission, PermissionSet};
 use gang_wire::routes::{ROUTES, Route};
 use gang_wire::{
-    AuthenticateRequest, AuthenticateResponse, Certificate, CreateCertificateRequest, ErrorReason,
-    ErrorResponse, Known, ListEventsResponse, ListPrincipalsResponse, ListRolesResponse, Principal,
+    AuthenticateRequest, AuthenticateResponse, Certificate, CreateCertificateRequest,
+    DeviceAuthorization, ErrorReason, ErrorResponse, Known, ListEventsResponse,
+    ListPrincipalsResponse, ListRolesResponse, Principal, RedeemDeviceAuthorizationRequest,
     RevokePrincipalResponse, Server, Session, State,
 };
 use http::{Request, StatusCode};
@@ -31,6 +32,7 @@ use serde_json::{Value, json};
 use crate::test_support::{
     api_request, mint_token, read, role_for, serve, tls_parts, tls_settings,
 };
+use crate::test_support_api::device_login_settings;
 
 /// The document under test.
 const DOCUMENT: &str = include_str!("../../../docs/API.md");
@@ -236,6 +238,8 @@ fn round_trip(name: &str, value: &Value) -> Result<Value, String> {
         "Server" => through::<Server<Value>>(value),
         "AuthenticateRequest" => through::<AuthenticateRequest>(value),
         "AuthenticateResponse" => through::<AuthenticateResponse>(value),
+        "DeviceAuthorization" => through::<DeviceAuthorization>(value),
+        "RedeemDeviceAuthorizationRequest" => through::<RedeemDeviceAuthorizationRequest>(value),
         "CreateCertificateRequest" => through::<CreateCertificateRequest>(value),
         "Certificate" => through::<Certificate>(value),
         "ListPrincipalsResponse" => through::<ListPrincipalsResponse>(value),
@@ -830,6 +834,7 @@ async fn check_route(controller: &Controller, admin: &AccessToken, route: &Route
 async fn the_server_answers_the_documented_routes_and_only_those() {
     let (parts, _dials, handles) = tls_parts();
     let mut settings = tls_settings();
+    settings.login = Some(device_login_settings());
     for missing in required_permissions() {
         let (name, proof) = lacking(missing);
         let permissions = Permission::ALL

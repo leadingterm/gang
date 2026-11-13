@@ -92,6 +92,9 @@ pub struct LoginRequest<'a> {
     pub redirect_uri: &'a Url,
     /// The client to log in with; `None` uses the provider's own configured client.
     pub client: Option<&'a LoginClient>,
+    /// The login must yield a refresh token: the provider adds its offline scopes and
+    /// authorization parameters to the request (ADR-38).
+    pub offline: bool,
 }
 
 /// A started login.

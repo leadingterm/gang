@@ -17,11 +17,13 @@ use gang_main::plugins::{
     WorkerAuthenticationConfig,
 };
 use gang_types::{
-    AbsolutePathBuf, Bytes, CaPin, ClientSecret, HeadroomPercent, Isa, NonZeroBytes,
-    NonZeroDuration, Percent, PermissionSet, ProviderName, SchedulerSettings, Url,
+    AbsolutePathBuf, Bytes, CaPin, ClientSecret, DeviceCodeTtl, HeadroomPercent, Isa, NonZeroBytes,
+    NonZeroDuration, Percent, Permission, PermissionSet, ProviderName, SchedulerSettings,
+    SessionMaxAge, TokenTtl, Url,
 };
 
-use crate::access::{IdentityKnobs, SIGN_IN_SUBJECT, SignIn, StandingWorker};
+use crate::access::{IdentityKnobs, SIGN_IN_SUBJECT, Sessions, SignIn, StandingWorker};
+use crate::browser::{BROWSER_SUBJECT, SESSION_MAX_AGE, SESSION_TOKEN_TTL};
 use crate::control::ControlKnobs;
 use crate::errors::{E2eError, Result};
 use crate::execution::{
@@ -31,7 +33,8 @@ use crate::execution::{
     WORKER_CERTIFICATE_TTL_SECS, WorkerCertificates,
 };
 use crate::issuer::{
-    AUDIENCE, DASHBOARD_CLIENT_ID, DASHBOARD_CLIENT_SECRET, ORGANIZATION, ORGANIZATION_CLAIM,
+    AUDIENCE, CONSENT_PROMPT, DASHBOARD_CLIENT_ID, DASHBOARD_CLIENT_SECRET, OFFLINE_ACCESS,
+    ORGANIZATION, ORGANIZATION_CLAIM,
 };
 use crate::placement::Placement;
 use crate::server::{
@@ -103,6 +106,9 @@ const FLEET_DISK: &str = "8GiB";
 /// The identity provider of the in-process issuer: the key of its `[identity.providers.<key>]`
 /// section, and the provider that administers the server.
 pub(crate) const PROVIDER: &str = "e2e";
+
+/// How long the identity scenario's device authorization remains valid.
+pub(crate) const DEVICE_TTL: Duration = Duration::from_mins(1);
 
 /// The principal of the administrator's token, under [`PROVIDER`].
 const ADMINISTRATOR_PRINCIPAL: &str = "administrator";
@@ -579,18 +585,28 @@ fn render_execution(document: &mut Document<Plugins>, knobs: ExecutionKnobs) -> 
 }
 
 /// Adds interactive login settings to the test provider.
-fn configure_login(oidc: &mut gang_oidc::OidcConfig) -> Result<()> {
+fn configure_login(oidc: &mut gang_oidc::OidcConfig, subject: &str) -> Result<()> {
     oidc.additional_audiences = vec![DASHBOARD_CLIENT_ID.parse().map_err(template_error)?];
     oidc.login = Some(gang_oidc::LoginConfig {
         client_secret: None,
         scopes: vec!["openid".to_owned()],
-        authorization_params: [("login_hint".to_owned(), SIGN_IN_SUBJECT.to_owned())].into(),
+        authorization_params: [("login_hint".to_owned(), subject.to_owned())].into(),
+        offline: gang_oidc::OfflineLogin {
+            scopes: Vec::new(),
+            authorization_params: [OFFLINE_ACCESS, CONSENT_PROMPT]
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .into(),
+        },
     });
     Ok(())
 }
 
 /// Applies identity scenario tuning after the test issuer has been configured.
 fn render_identity(document: &mut Document<Plugins>, knobs: IdentityKnobs) -> Result<()> {
+    if knobs == IdentityKnobs::IDENTITY {
+        document.dashboard.device.ttl =
+            DeviceCodeTtl::try_new(DEVICE_TTL).map_err(template_error)?;
+    }
     if knobs.sign_in == SignIn::Offered {
         let provider: ProviderName = PROVIDER.parse().map_err(template_error)?;
         let Some(IdentityProviderConfig::Oidc(oidc)) =
@@ -598,11 +614,33 @@ fn render_identity(document: &mut Document<Plugins>, knobs: IdentityKnobs) -> Re
         else {
             return Err(template_error("missing test identity provider"));
         };
-        configure_login(oidc)?;
+        let subject = if knobs.sessions == Sessions::Short {
+            BROWSER_SUBJECT
+        } else {
+            SIGN_IN_SUBJECT
+        };
+        configure_login(oidc, subject)?;
         document.dashboard.login = Some(DashboardLogin {
             provider,
             client_id: DASHBOARD_CLIENT_ID.to_owned(),
             client_secret: ClientSecretSource::Inline(ClientSecret::new(DASHBOARD_CLIENT_SECRET)),
+        });
+    }
+    if knobs.sessions == Sessions::Short {
+        let ClientAuthenticationConfig::Token(token) = &mut document.authentication.clients else {
+            return Err(template_error("missing [authentication.clients.token]"));
+        };
+        token.token_ttl = TokenTtl::try_new(SESSION_TOKEN_TTL).map_err(template_error)?;
+        token.clock_skew = Duration::ZERO;
+        document.dashboard.session_max_age =
+            SessionMaxAge::try_new(SESSION_MAX_AGE).map_err(template_error)?;
+        document.server.roles.push(RoleConfig {
+            name: "viewer".parse().map_err(template_error)?,
+            permissions: [Permission::StateRead].into_iter().collect(),
+            principals: vec![RolePrincipal {
+                provider: PROVIDER.parse().map_err(template_error)?,
+                principal: BROWSER_SUBJECT.parse().map_err(template_error)?,
+            }],
         });
     }
     if knobs.standing_worker == StandingWorker::One {

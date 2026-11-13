@@ -3,8 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, UNIX_EPOCH};
 
-use super::{assert_compliant, failures};
+use super::{assert_compliant, assert_fails, failures};
 use gang_e2e::names::identity as names;
 use gang_e2e::{
     Access, Administration, Aging, Login, MisdirectedLogin, Misdirection, Ran, TokenAnswer,
@@ -12,6 +13,8 @@ use gang_e2e::{
 };
 use gang_e2e::{Admission, Channel, ChannelEvent, Credentials, Reply, SessionCookie};
 use gang_e2e::{Answer, Presented, Request};
+use gang_e2e::{AuthorizationRecord, DeviceLogin, DevicePrompt, RefreshOutcome, RefreshRecord};
+use gang_e2e::{StoredSession, SubjectPolicy};
 use gang_types::CertSerial;
 use gang_wire::{ErrorReason, ErrorResponse, Status};
 use http::Method;
@@ -94,6 +97,37 @@ behaviour! {
             CrossSiteLogout,
             /// Leave the session cookie intact on logout.
             LogoutKeepsCookie,
+        },
+        /// Device authorization behavior.
+        device: DeviceFlow {
+            /// Complete device login correctly.
+            Compliant,
+            /// Also print the browser URL.
+            LoopbackToo,
+            /// Expose the secret in the resource.
+            SecretInGet,
+            /// Permit cross-site approval.
+            CrossSiteApproved,
+            /// Request an online-only authorization.
+            OnlineApproval,
+            /// Set a session cookie on approval.
+            SessionOnApproval,
+            /// Fail to complete the login.
+            NeverCompletes,
+            /// Write the token before the refresh token.
+            TokenBeforeRefresh,
+            /// Refresh using the CLI client.
+            CliClientRenewal,
+            /// Serve revoked device sessions.
+            RevokedRenews,
+            /// Approve without a refresh token.
+            ApprovedWithoutRefresh,
+            /// Report a wrong secret as pending.
+            WrongSecretPending,
+            /// Serve a revoked redemption.
+            RevokedRedeemServed,
+            /// Serve a second redemption.
+            SecondRedeemServed,
         },
         /// Proof command behavior. Proof execution behavior.
         proof: ProofCommand {
@@ -184,7 +218,21 @@ struct Home {
     rejected: bool,
     /// Number of refresh grants.
     grants: usize,
+    /// Files held by a device session.
+    files: StoredSession,
 }
+/// A simulated device authorization.
+struct DeviceEntry {
+    /// The secret presented at redemption.
+    secret: String,
+    /// Whether a browser approved this entry.
+    approved: bool,
+    /// Whether the entry has been consumed.
+    consumed: bool,
+    /// Refresh token issued on approval.
+    refresh: Option<String>,
+}
+
 /// Mutable state shared by requests and worker channels.
 struct State {
     /// Revoked principals.
@@ -203,6 +251,18 @@ struct State {
     restarted: bool,
     /// Counter for simulated identifiers.
     counter: usize,
+    /// Device authorizations indexed by code.
+    devices: BTreeMap<String, DeviceEntry>,
+    /// Device callback state mapped to the code.
+    device_attempts: BTreeMap<String, String>,
+    /// Subject policies.
+    policies: BTreeMap<String, SubjectPolicy>,
+    /// Issuer authorization records.
+    authorizations: BTreeMap<String, Vec<AuthorizationRecord>>,
+    /// Issuer refresh records.
+    refreshes: BTreeMap<String, Vec<RefreshRecord>>,
+    /// Simulated server log.
+    log: String,
 }
 /// An in-memory identity deployment.
 struct SimulatedAccess {
@@ -225,6 +285,12 @@ impl SimulatedAccess {
                 pid: 100,
                 restarted: false,
                 counter: 0,
+                devices: BTreeMap::new(),
+                device_attempts: BTreeMap::new(),
+                policies: BTreeMap::new(),
+                authorizations: BTreeMap::new(),
+                refreshes: BTreeMap::new(),
+                log: String::new(),
             })),
         }
     }
@@ -250,10 +316,202 @@ impl SimulatedAccess {
                 runs,
                 rejected: false,
                 grants: 0,
+                files: StoredSession::default(),
             },
         );
         path
     }
+    /// Creates a pending device authorization.
+    fn create_device(&self) -> (String, String) {
+        let mut state = self.state.lock();
+        state.counter += 1;
+        let suffix = char::from(b"KLMNPQRSTV"[state.counter % 10]);
+        let code = format!("BCDF-GHJ{suffix}");
+        let secret = format!("secret-{}", state.counter);
+        state.devices.insert(
+            code.clone(),
+            DeviceEntry {
+                secret: secret.clone(),
+                approved: false,
+                consumed: false,
+                refresh: None,
+            },
+        );
+        (code, secret)
+    }
+
+    /// Handles a device authorization resource or redemption.
+    fn device_resource(&self, r: &Request, path: &str) -> Answer {
+        if r.method == Method::POST && path == "/v1/deviceAuthorizations" {
+            let (code, secret) = self.create_device();
+            return Self::response(
+                200,
+                vec![],
+                serde_json::json!({
+                    "name": format!("deviceAuthorizations/{code}"), "secret": secret
+                })
+                .to_string()
+                .into_bytes(),
+            );
+        }
+        let Some(code) = path.strip_prefix("/v1/deviceAuthorizations/") else {
+            return Self::response(404, vec![], vec![]);
+        };
+        let redeem = code.ends_with(":redeem");
+        let code = code.strip_suffix(":redeem").unwrap_or(code);
+        let mut state = self.state.lock();
+        let revoked = state.revoked.contains("e2e:operator");
+        let Some(entry) = state.devices.get_mut(code) else {
+            return Self::device_error(404, ErrorReason::DeviceAuthorizationNotFound);
+        };
+        if !redeem && r.method == Method::GET {
+            let mut body = serde_json::json!({
+                "name": format!("deviceAuthorizations/{code}"),
+                "clientAddress": "127.0.0.1",
+                "state": if entry.approved { "APPROVED" } else { "PENDING" }
+            });
+            if matches!(self.behaviour.device, DeviceFlow::SecretInGet) {
+                body["secret"] = entry.secret.clone().into();
+            }
+            return Self::response(200, vec![], body.to_string().into_bytes());
+        }
+        let secret = r
+            .body
+            .as_ref()
+            .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body.bytes).ok())
+            .and_then(|body| body["secret"].as_str().map(str::to_owned));
+        if secret.as_deref() != Some(entry.secret.as_str()) {
+            return if matches!(self.behaviour.device, DeviceFlow::WrongSecretPending) {
+                Self::device_error(400, ErrorReason::AuthorizationPending)
+            } else {
+                Self::device_error(404, ErrorReason::DeviceAuthorizationNotFound)
+            };
+        }
+        if entry.consumed && !matches!(self.behaviour.device, DeviceFlow::SecondRedeemServed) {
+            return Self::device_error(404, ErrorReason::DeviceAuthorizationNotFound);
+        }
+        if !entry.approved {
+            return Self::device_error(400, ErrorReason::AuthorizationPending);
+        }
+        entry.consumed = true;
+        if revoked && !matches!(self.behaviour.device, DeviceFlow::RevokedRedeemServed) {
+            return Self::device_error(403, ErrorReason::PrincipalRevoked);
+        }
+        Self::response(
+            200,
+            vec![],
+            serde_json::json!({
+                "token": "device-token", "lifetime": "600s", "refreshToken": entry.refresh
+            })
+            .to_string()
+            .into_bytes(),
+        )
+    }
+
+    /// Constructs a device protocol error.
+    fn device_error(status: u16, reason: ErrorReason) -> Answer {
+        Self::response(status, vec![], Self::error(reason, &[]))
+    }
+
+    /// Starts approval of a device code.
+    fn device_page(&self, r: &Request) -> Answer {
+        let cross = r.headers.iter().any(|(name, value)| {
+            (*name == "sec-fetch-site" && value == "cross-site")
+                || (*name == "origin" && value != "https://127.0.0.1:8443")
+        });
+        if cross && !matches!(self.behaviour.device, DeviceFlow::CrossSiteApproved) {
+            return Self::response(403, vec![], vec![]);
+        }
+        let code = r
+            .body
+            .as_ref()
+            .and_then(|body| std::str::from_utf8(&body.bytes).ok())
+            .and_then(|body| body.strip_prefix("userCode="))
+            .unwrap_or("");
+        let mut state = self.state.lock();
+        if !state.devices.contains_key(code) {
+            return Self::response(
+                302,
+                vec![("location".into(), "/ui/device?error=unknown".into())],
+                vec![],
+            );
+        }
+        state.counter += 1;
+        let attempt = format!("state-{}", state.counter);
+        state.device_attempts.insert(attempt.clone(), code.into());
+        let offline = if matches!(self.behaviour.device, DeviceFlow::OnlineApproval) {
+            ""
+        } else {
+            "&access_type=offline&prompt=consent"
+        };
+        Self::response(
+            303,
+            vec![
+                (
+                    "location".into(),
+                    format!(
+                        "https://issuer.example/authorize?login_hint=operator&client_id=gang-e2e-dashboard{offline}&state={attempt}&redirect_uri=https%3A%2F%2F127.0.0.1%3A8443%2Fui%2Fcallback"
+                    ),
+                ),
+                (
+                    "set-cookie".into(),
+                    format!(
+                        "{}={attempt}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=600",
+                        COOKIE_NAMES.login
+                    ),
+                ),
+            ],
+            vec![],
+        )
+    }
+
+    /// Completes a device-specific callback.
+    fn device_callback(&self, state: &mut State, attempt: &str) -> Option<Answer> {
+        let code = state.device_attempts.remove(attempt)?;
+        let no_refresh =
+            state.policies.get("operator") == Some(&SubjectPolicy::WithoutRefreshTokens);
+        let success =
+            !no_refresh || matches!(self.behaviour.device, DeviceFlow::ApprovedWithoutRefresh);
+        if success {
+            if let Some(entry) = state.devices.get_mut(&code) {
+                entry.approved = true;
+                entry.refresh = Some(format!("refresh-{attempt}"));
+            }
+        } else {
+            state.log.push_str(
+                "WARN [identity.providers.e2e.oidc.login.offline] missing refresh token\n",
+            );
+        }
+        let mut headers = vec![
+            (
+                "location".into(),
+                if success {
+                    "/ui/device/approved"
+                } else {
+                    "/ui/error?reason=failed"
+                }
+                .into(),
+            ),
+            (
+                "set-cookie".into(),
+                format!(
+                    "{}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0",
+                    COOKIE_NAMES.login
+                ),
+            ),
+        ];
+        if matches!(self.behaviour.device, DeviceFlow::SessionOnApproval) {
+            headers.push((
+                "set-cookie".into(),
+                format!(
+                    "{}=signed-device; HttpOnly; Secure; SameSite=Strict; Path=/",
+                    COOKIE_NAMES.session
+                ),
+            ));
+        }
+        Some(Self::response(302, headers, vec![]))
+    }
+
     /// Constructs an HTTP answer.
     fn response(status: u16, headers: Vec<(String, String)>, body: Vec<u8>) -> Answer {
         Answer {
@@ -304,6 +562,9 @@ impl SimulatedAccess {
                 ],
                 vec![],
             );
+        }
+        if let Some(answer) = self.device_callback(&mut state, state_value) {
+            return answer;
         }
         let Some(next) = state.attempts.remove(state_value) else {
             return Self::response(
@@ -555,6 +816,80 @@ impl SimulatedAccess {
         }
         None
     }
+    /// Gets or renews a device session.
+    fn get_device_session(&self, state: &mut State, path: &Path, revoked: bool) -> TokenAnswer {
+        if revoked && !matches!(self.behaviour.device, DeviceFlow::RevokedRenews) {
+            return TokenAnswer {
+                outcome: Ran { code: Some(1), stdout: String::new(),
+                    stderr: "  fail  gang get: the server answered 403: principal revoked\n   fix  ask an operator for a role that grants the permission the action needs\n".into() },
+                bearer: None,
+            };
+        }
+        let rotating = state.policies.get("operator") == Some(&SubjectPolicy::Rotating);
+        state.counter += 1;
+        let n = state.counter;
+        let Some(home) = state.homes.get_mut(path) else {
+            return TokenAnswer {
+                outcome: Ran {
+                    code: Some(1),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+                bearer: None,
+            };
+        };
+        let mut record = None;
+        if home.aged.take().is_some() {
+            let old = home.files.refresh_token.clone().unwrap_or_default();
+            let issued = format!("rotated-{n}");
+            let outcome = if rotating {
+                home.files.refresh_token = Some(issued.clone());
+                RefreshOutcome::Rotated { issued }
+            } else {
+                RefreshOutcome::Granted
+            };
+            let (refresh_time, token_time) =
+                if matches!(self.behaviour.device, DeviceFlow::TokenBeforeRefresh) {
+                    (2, 1)
+                } else {
+                    (1, 2)
+                };
+            if rotating {
+                home.files.refresh_written = Some(UNIX_EPOCH + Duration::from_secs(refresh_time));
+            }
+            home.files.token_written = Some(UNIX_EPOCH + Duration::from_secs(token_time));
+            home.token = Some(format!("device-token-{n}"));
+            record = Some(RefreshRecord {
+                client_id: if matches!(self.behaviour.device, DeviceFlow::CliClientRenewal) {
+                    "gang-e2e"
+                } else {
+                    gang_e2e::DASHBOARD_CLIENT_ID
+                }
+                .into(),
+                refresh_token: old,
+                outcome,
+            });
+        }
+        let bearer = home.token.clone();
+        if let Some(token) = &bearer {
+            state.tokens.insert(token.clone(), "e2e:operator".into());
+        }
+        if let Some(record) = record {
+            state
+                .refreshes
+                .entry("operator".into())
+                .or_default()
+                .push(record);
+        }
+        TokenAnswer {
+            outcome: Ran {
+                code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            bearer,
+        }
+    }
 }
 /// An established worker connection.
 struct SimWorkerChannel {
@@ -756,6 +1091,12 @@ impl Access for SimulatedAccess {
     }
     fn request(&self, r: &Request) -> gang_e2e::Result<Answer> {
         let path = r.target.split('?').next().unwrap_or("");
+        if path == "/ui/device" && r.method == Method::POST {
+            return Ok(self.device_page(r));
+        }
+        if path.starts_with("/v1/deviceAuthorizations") {
+            return Ok(self.device_resource(r, path));
+        }
         let invalid_bearer = matches!(&r.presented, Presented::Bearer(_));
         if matches!(&r.presented, Presented::Bearer(token) if token.starts_with("minted-"))
             && matches!(self.behaviour.bearer, BearerCheck::MintedRefused)
@@ -842,6 +1183,25 @@ impl Access for SimulatedAccess {
                 .find(|(k, _)| k == "state")
                 .map(|(_, v)| v.into_owned())
                 .unwrap_or_default();
+            let pairs: Vec<_> = url.query_pairs().collect();
+            let offline = pairs
+                .iter()
+                .any(|(k, v)| k == "access_type" && v == "offline");
+            let consent = pairs.iter().any(|(k, v)| k == "prompt" && v == "consent");
+            let client_id = pairs
+                .iter()
+                .find(|(k, _)| k == "client_id")
+                .map_or_else(String::new, |(_, v)| v.to_string());
+            self.state
+                .lock()
+                .authorizations
+                .entry("operator".into())
+                .or_default()
+                .push(AuthorizationRecord {
+                    client_id,
+                    offline,
+                    consent,
+                });
             Ok(Self::response(
                 302,
                 vec![(
@@ -911,12 +1271,104 @@ impl Access for SimulatedAccess {
             },
         })
     }
+    fn device_login(
+        &self,
+        approve: &mut dyn FnMut(&DevicePrompt) -> gang_e2e::Result<()>,
+    ) -> gang_e2e::Result<DeviceLogin> {
+        let (code, _) = self.create_device();
+        let prompt = DevicePrompt {
+            verification_uri: "https://127.0.0.1:8443/ui/device".into(),
+            user_code: code.clone(),
+        };
+        let mut stderr = format!(
+            "To sign in from any device, open {}\nand enter the code {code} (valid until 14:32)\n",
+            prompt.verification_uri
+        );
+        if matches!(self.behaviour.device, DeviceFlow::LoopbackToo) {
+            stderr.push_str("https://issuer.example/authorize?state=1\n");
+        }
+        approve(&prompt)?;
+        let refresh = self
+            .state
+            .lock()
+            .devices
+            .get(&code)
+            .filter(|entry| entry.approved)
+            .and_then(|entry| entry.refresh.clone());
+        let success =
+            refresh.is_some() && !matches!(self.behaviour.device, DeviceFlow::NeverCompletes);
+        let token = success.then(|| self.token("e2e:operator"));
+        let home = self.home("e2e:operator", token, 0);
+        if success {
+            if let Some(entry) = self.state.lock().devices.get_mut(&code) {
+                entry.consumed = true;
+            }
+            if let Some(h) = self.state.lock().homes.get_mut(&home) {
+                h.files = StoredSession {
+                    kind: Some("device".into()),
+                    id_token: false,
+                    refresh_token: refresh,
+                    refresh_written: Some(UNIX_EPOCH + Duration::from_secs(1)),
+                    token_written: Some(UNIX_EPOCH + Duration::from_secs(2)),
+                };
+            }
+        }
+        Ok(DeviceLogin {
+            home,
+            prompt: Some(prompt),
+            outcome: Ran {
+                code: Some(i32::from(!success)),
+                stdout: if success {
+                    "    ok  logged in with e2e · token valid for 599s".into()
+                } else {
+                    String::new()
+                },
+                stderr,
+            },
+        })
+    }
+    fn session_files(&self, home: &Path) -> gang_e2e::Result<StoredSession> {
+        Ok(self
+            .state
+            .lock()
+            .homes
+            .get(home)
+            .map_or_else(StoredSession::default, |h| h.files.clone()))
+    }
+    fn authorizations(&self, subject: &str) -> Vec<AuthorizationRecord> {
+        self.state
+            .lock()
+            .authorizations
+            .get(subject)
+            .cloned()
+            .unwrap_or_default()
+    }
+    fn refreshes(&self, subject: &str) -> Vec<RefreshRecord> {
+        self.state
+            .lock()
+            .refreshes
+            .get(subject)
+            .cloned()
+            .unwrap_or_default()
+    }
+    fn set_policy(&self, subject: &str, policy: SubjectPolicy) {
+        self.state.lock().policies.insert(subject.into(), policy);
+    }
+    fn server_log(&self) -> gang_e2e::Result<String> {
+        Ok(self.state.lock().log.clone())
+    }
     fn get(&self, p: &Path) -> gang_e2e::Result<TokenAnswer> {
         let mut s = self.state.lock();
         let revoked = s
             .homes
             .get(p)
             .is_some_and(|home| s.revoked.contains(&home.principal));
+        if s.homes
+            .get(p)
+            .is_some_and(|h| h.files.kind.as_deref() == Some("device"))
+        {
+            return Ok(self.get_device_session(&mut s, p, revoked));
+        }
         let Some(h) = s.homes.get_mut(p) else {
             return Ok(TokenAnswer {
                 outcome: Ran {
@@ -1104,8 +1556,9 @@ fn identity_checks(behaviour: Behaviour) -> gang_e2e::Result<Vec<gang_e2e::Check
 
 /// Confirms the unmodified simulation satisfies the identity scenario.
 #[test]
-fn identity_is_compliant() {
-    assert_compliant(&identity_checks(Behaviour::COMPLIANT).expect("the identity scenario runs"));
+fn identity_is_compliant() -> gang_e2e::Result<()> {
+    assert_compliant(&identity_checks(Behaviour::COMPLIANT)?);
+    Ok(())
 }
 
 flaw!(wrong_pin_stores_nothing_fails: identity_checks(pin = PinCheck::Leaks)
@@ -1188,6 +1641,8 @@ flaw!(revoked_served_fails: identity_checks(renewal = Renewal::RevokedServed)
     => only [names::REVOKED_LOGIN_REFUSED]);
 flaw!(administrator_revoke_fails: identity_checks(administration = AdminRevocation::Fails)
 => only [
+    names::DEVICE_LOGIN_REVOKED,
+    names::REVOKED_BEFORE_REDEEM_REFUSED,
     names::OPERATOR_REVOKED,
     names::REVOKED_LOGIN_REFUSED,
     names::MEMBER_REVOKED,
@@ -1223,3 +1678,29 @@ flaw!(revocation_forgotten_fails: identity_checks(restart = RestartCheck::Revoca
     => only [names::REVOCATION_SURVIVES_RESTART]);
 flaw!(server_down_after_restart_fails: identity_checks(restart = RestartCheck::DownAfterRestart)
     => only [names::REVOCATION_SURVIVES_RESTART, names::RESTARTED_SERVER_SERVES]);
+flaw!(device_loopback_too_fails: identity_checks(device = DeviceFlow::LoopbackToo)
+    => only [names::DEVICE_LOGIN_PROMPTED]);
+flaw!(device_secret_in_get_fails: identity_checks(device = DeviceFlow::SecretInGet)
+    => only [names::DEVICE_SHOWS_CLIENT_ADDRESS]);
+flaw!(device_cross_site_fails: identity_checks(device = DeviceFlow::CrossSiteApproved)
+    => only [names::CROSS_SITE_DEVICE_APPROVAL_REFUSED]);
+flaw!(device_online_approval_fails: identity_checks(device = DeviceFlow::OnlineApproval)
+    => only [names::DEVICE_APPROVAL_OFFLINE]);
+flaw!(device_session_cookie_fails: identity_checks(device = DeviceFlow::SessionOnApproval)
+    => only [names::DEVICE_APPROVAL_REDIRECTS]);
+flaw!(device_never_completes_fails: identity_checks(device = DeviceFlow::NeverCompletes)
+    => fails [names::DEVICE_LOGIN_COMPLETES]);
+flaw!(device_token_first_fails: identity_checks(device = DeviceFlow::TokenBeforeRefresh)
+    => only [names::DEVICE_LOGIN_RENEWS]);
+flaw!(device_cli_client_fails: identity_checks(device = DeviceFlow::CliClientRenewal)
+    => only [names::DEVICE_LOGIN_RENEWS]);
+flaw!(device_revoked_renews_fails: identity_checks(device = DeviceFlow::RevokedRenews)
+    => only [names::DEVICE_LOGIN_REVOKED]);
+flaw!(device_without_refresh_fails: identity_checks(device = DeviceFlow::ApprovedWithoutRefresh)
+    => only [names::DEVICE_WITHOUT_REFRESH_TOKEN_FAILS]);
+flaw!(device_wrong_secret_fails: identity_checks(device = DeviceFlow::WrongSecretPending)
+    => only [names::WRONG_SECRET_REDEEM_REFUSED]);
+flaw!(device_revoked_redeem_fails: identity_checks(device = DeviceFlow::RevokedRedeemServed)
+    => only [names::REVOKED_BEFORE_REDEEM_REFUSED]);
+flaw!(device_second_redeem_fails: identity_checks(device = DeviceFlow::SecondRedeemServed)
+    => only [names::SECOND_REDEEM_REFUSED]);

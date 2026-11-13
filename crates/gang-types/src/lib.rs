@@ -64,7 +64,8 @@ pub use absolute_path::{AbsolutePathBuf, AbsolutePathError};
 pub use authentication::AuthenticationSettings;
 pub use bearer::parse_bearer;
 pub use bounded_duration::{
-    BoundedDuration, BoundedDurationError, NANOS_PER_MILLI, NANOS_PER_SECOND, TokenTtl,
+    BoundedDuration, BoundedDurationError, DeviceCodeTtl, DevicePollInterval, NANOS_PER_MILLI,
+    NANOS_PER_SECOND, SessionMaxAge, TokenTtl,
 };
 pub use bytes::Bytes;
 pub use ca_pin::CaPin;
@@ -98,7 +99,7 @@ pub use resources::Resources;
 pub use saturating::SaturatingInto;
 pub use scaling_cause::ScalingCause;
 pub use scheduler_settings::SchedulerSettings;
-pub use secret::{AccessToken, ClientSecret, LoginSession, Proof, RefreshToken};
+pub use secret::{AccessToken, ClientSecret, DeviceSecret, LoginSession, Proof, RefreshToken};
 pub use string_enum::UnknownVariantError;
 pub use url::Url;
 pub use workload_token_settings::WorkloadTokenSettings;

@@ -5,7 +5,10 @@ use std::time::Duration;
 
 use gang_config::{DashboardConfig, EndpointTrust, RoleConfig};
 use gang_spi::LoginClient;
-use gang_types::{Isa, NonZeroDuration, Percent, ProviderName, TrustDomain};
+use gang_types::{
+    DeviceCodeTtl, DevicePollInterval, Isa, NonZeroDuration, Percent, ProviderName, SessionMaxAge,
+    TrustDomain,
+};
 
 use crate::endpoint::PublicEndpoint;
 
@@ -79,6 +82,23 @@ pub struct LoginSettings {
     /// How long a sign-in stays open between starting it and completing it.
     pub ttl: NonZeroDuration,
     /// How many sign-ins may be open at once.
+    pub max_pending: NonZeroUsize,
+    /// The absolute lifetime of a browser session (ADR-39).
+    pub session_max_age: SessionMaxAge,
+    /// How long one renewal grant is shared by renewals of the same refresh token.
+    pub renewal_reuse: NonZeroDuration,
+    /// Device login settings (ADR-37), or none when disabled.
+    pub device: Option<DeviceSettings>,
+}
+
+/// Limits for device login (ADR-37).
+#[derive(Debug, Clone)]
+pub struct DeviceSettings {
+    /// How long a device authorization remains live.
+    pub ttl: DeviceCodeTtl,
+    /// The minimum interval between polls.
+    pub poll_interval: DevicePollInterval,
+    /// The maximum number of pending device authorizations.
     pub max_pending: NonZeroUsize,
 }
 

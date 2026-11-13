@@ -6,6 +6,7 @@
 //! real [`crate::Secured`] deployment with it.
 
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use gang_types::{CertSerial, Url};
 use gang_wire::{CALLBACK_PATH, ERROR_PATH, ErrorReason, LOGIN_PATH, LOGOUT_PATH, Permission};
@@ -17,10 +18,16 @@ use crate::access_verdict::{
     failure_reported, has_line, login_cookie_name, query_value, redirected_to, set_cookies,
     status_is,
 };
+use crate::browser_verdict::{authorized, offline_requested};
 use crate::check::Check;
+use crate::device_verdict::{
+    DevicePrompt, cross_site_approval_refused, device_approved, device_only, device_resource,
+    device_session, logged_in_with, refused_with, renewed_by_web_client, rotation_stored,
+    stored_nothing,
+};
 use crate::errors::{E2eError, Result};
 use crate::identity::{Admission, Channel, ChannelEvent, Credentials};
-use crate::issuer::DASHBOARD_CLIENT_ID;
+use crate::issuer::{AuthorizationRecord, DASHBOARD_CLIENT_ID, RefreshRecord, SubjectPolicy};
 use crate::names::identity;
 use crate::server::{Answer, Presented, Request};
 use crate::session::{SessionCookie, cookie_name};
@@ -56,6 +63,17 @@ pub enum StandingWorker {
     One,
 }
 
+/// How long the deployment's browser sessions and tokens live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sessions {
+    /// The configured defaults.
+    Default,
+    /// Short lifetimes for the sessions scenario: `token_ttl = "1m"`, `clock_skew = "0s"` and
+    /// `[dashboard] session_max_age = "3m"`; browsers sign in as [`crate::BROWSER_SUBJECT`], which
+    /// holds a role granting `state.read`.
+    Short,
+}
+
 /// The configuration knobs of the identity family: the `identity` field of [`crate::Variant`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IdentityKnobs {
@@ -63,6 +81,8 @@ pub struct IdentityKnobs {
     pub sign_in: SignIn,
     /// Whether a worker runs without a build.
     pub standing_worker: StandingWorker,
+    /// The lifetimes of sessions and tokens.
+    pub sessions: Sessions,
 }
 
 impl IdentityKnobs {
@@ -70,22 +90,32 @@ impl IdentityKnobs {
     pub const NONE: Self = Self {
         sign_in: SignIn::Absent,
         standing_worker: StandingWorker::Absent,
+        sessions: Sessions::Default,
     };
 
     /// The dashboard offers interactive sign-in, mounting the `/ui/login` route.
     pub const SIGN_IN: Self = Self {
         sign_in: SignIn::Offered,
         standing_worker: StandingWorker::Absent,
+        sessions: Sessions::Default,
     };
 
     /// The configuration of the identity scenario.
     pub const IDENTITY: Self = Self {
         sign_in: SignIn::Offered,
         standing_worker: StandingWorker::One,
+        sessions: Sessions::Default,
+    };
+
+    /// The configuration of the sessions scenario: sign-in offered, short lifetimes.
+    pub const SESSIONS: Self = Self {
+        sign_in: SignIn::Offered,
+        standing_worker: StandingWorker::Absent,
+        sessions: Sessions::Short,
     };
 
     /// Every identity preset used by a scenario; configuration tests render each.
-    pub const PRESETS: &[Self] = &[Self::SIGN_IN, Self::IDENTITY];
+    pub const PRESETS: &[Self] = &[Self::SIGN_IN, Self::IDENTITY, Self::SESSIONS];
 }
 
 /// A `gang login` that points the client somewhere it must not log in.
@@ -134,6 +164,32 @@ pub struct Login {
     /// The client home.
     pub home: PathBuf,
     /// How `gang login` ended.
+    pub outcome: Ran,
+}
+
+/// The session files a client home holds (absent ones are `None`/`false`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoredSession {
+    /// `kind` of `session.json`.
+    pub kind: Option<String>,
+    /// Whether `id-token` exists.
+    pub id_token: bool,
+    /// The trimmed `refresh-token`.
+    pub refresh_token: Option<String>,
+    /// When `refresh-token` was last written.
+    pub refresh_written: Option<SystemTime>,
+    /// When `token` was last written.
+    pub token_written: Option<SystemTime>,
+}
+
+/// How a headless `gang login` ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceLogin {
+    /// The client home.
+    pub home: PathBuf,
+    /// What it printed for the device login; `None` when it ended without a prompt.
+    pub prompt: Option<DevicePrompt>,
+    /// How it ended; `stderr` holds every line it printed.
     pub outcome: Ran,
 }
 
@@ -279,6 +335,40 @@ pub trait Access: Sync {
     /// When the command cannot be run or no authorization URL appears within the deadline.
     fn interactive_login(&self) -> Result<Login>;
 
+    /// Runs a headless `gang login` without `--provider` in a new client home.
+    /// Calls `approve` once a prompt appears, then waits for the command to end.
+    ///
+    /// # Errors
+    ///
+    /// When the command, approval, or observation cannot be completed.
+    fn device_login(
+        &self,
+        approve: &mut dyn FnMut(&DevicePrompt) -> Result<()>,
+    ) -> Result<DeviceLogin>;
+
+    /// The session files in `home`.
+    ///
+    /// # Errors
+    ///
+    /// When the files cannot be read or parsed.
+    fn session_files(&self, home: &Path) -> Result<StoredSession>;
+
+    /// The provider's authorization requests for `subject`, oldest first.
+    fn authorizations(&self, subject: &str) -> Vec<AuthorizationRecord>;
+
+    /// The provider's refresh grants for `subject`, oldest first.
+    fn refreshes(&self, subject: &str) -> Vec<RefreshRecord>;
+
+    /// Sets how the provider treats `subject` from now on.
+    fn set_policy(&self, subject: &str, policy: SubjectPolicy);
+
+    /// The server's log so far, as text.
+    ///
+    /// # Errors
+    ///
+    /// When the server log cannot be read.
+    fn server_log(&self) -> Result<String>;
+
     /// Runs `gang get` in `home` for the deployment's endpoint.
     ///
     /// # Errors
@@ -374,6 +464,12 @@ const NEXT_PATH: &str = "/ui/workers";
 const UNSAFE_NEXT: &str = "https://evil.example/ui";
 /// UI fallback destination.
 const UI_HOME: &str = "/ui";
+const DEVICE_AUTHORIZATIONS: &str = "/v1/deviceAuthorizations";
+const DEVICE_PAGE: &str = "/ui/device";
+const DEVICE_APPROVED: &str = "/ui/device/approved";
+const LOOPBACK_CLIENT: &str = "127.0.0.1";
+const FOREIGN_ORIGIN: &str = "https://evil.example";
+const WRONG_SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 /// Login cookie lifetime in seconds.
 const LOGIN_COOKIE_MAX_AGE: u64 = 600;
 /// The TLS alert a worker logs when the server refuses its revoked certificate.
@@ -554,11 +650,362 @@ pub fn identity<A: Access>(access: &A) -> Result<Vec<Check>> {
     checks.extend(bearers(access, &administrator)?);
     checks.extend(sign_in(access, &endpoint)?);
     checks.extend(proof_command(access)?);
+    checks.extend(device_checks(access, &endpoint, &administrator)?);
     checks.extend(renewal(access, &administrator)?);
     checks.extend(doctor(access, &endpoint, &member, &administrator)?);
     checks.extend(worker_certificate(access, &administrator)?);
     checks.extend(restart(access, &member, &administrator)?);
     Ok(checks)
+}
+
+/// An approval's server and provider responses.
+struct Approval {
+    started: Answer,
+    provider_location: String,
+    done: Answer,
+}
+
+/// Approves a device code through the provider and its callback.
+fn approve<A: Access>(
+    access: &A,
+    endpoint: &Url,
+    code: &str,
+) -> Result<std::result::Result<Approval, String>> {
+    let started = access.request(
+        &Request::new(Method::POST, DEVICE_PAGE)
+            .header("origin", endpoint.origin().ascii_serialization())
+            .header("sec-fetch-site", "same-origin")
+            .body(
+                "application/x-www-form-urlencoded",
+                format!("userCode={code}").into_bytes(),
+            ),
+    )?;
+    let Some(provider_url) = started.header("location").and_then(|s| Url::parse(s).ok()) else {
+        return Ok(Err(format!(
+            "the approval answered {} without a provider redirect",
+            started.status
+        )));
+    };
+    let provider = access.visit(&provider_url)?;
+    let Some(provider_location) = provider.header("location") else {
+        return Ok(Err(format!(
+            "the provider answered {} without a callback redirect",
+            provider.status
+        )));
+    };
+    let Ok(redirect) = Url::parse(provider_location) else {
+        return Ok(Err(format!(
+            "the provider redirect is invalid: {provider_location}"
+        )));
+    };
+    let name = login_cookie_name(endpoint);
+    let value = set_cookies(&started)
+        .into_iter()
+        .find(|cookie| cookie.name == name)
+        .map_or_else(String::new, |cookie| cookie.value);
+    let done = access.request(
+        &Request::get(format!(
+            "{}?{}",
+            redirect.path(),
+            redirect.query().unwrap_or_default()
+        ))
+        .presenting(Presented::Cookie(SessionCookie {
+            name: name.to_owned(),
+            value,
+        })),
+    )?;
+    Ok(Ok(Approval {
+        started,
+        provider_location: provider_location.to_owned(),
+        done,
+    }))
+}
+
+/// Redeems a device authorization with its secret.
+fn redeem<A: Access>(access: &A, code: &str, secret: &str) -> Result<Answer> {
+    access.request(
+        &Request::new(
+            Method::POST,
+            format!("{DEVICE_AUTHORIZATIONS}/{code}:redeem"),
+        )
+        .body(
+            "application/json",
+            serde_json::json!({ "secret": secret })
+                .to_string()
+                .into_bytes(),
+        ),
+    )
+}
+
+/// Reads a device authorization.
+fn get_device<A: Access>(access: &A, code: &str) -> Result<Answer> {
+    access.request(&Request::get(format!("{DEVICE_AUTHORIZATIONS}/{code}")))
+}
+
+/// Checks the headless device login and its subsequent renewal.
+fn device_checks<A: Access>(access: &A, endpoint: &Url, admin: &Credentials) -> Result<Vec<Check>> {
+    access.set_policy(SIGN_IN_SUBJECT, SubjectPolicy::Rotating);
+    let mark = access.authorizations(SIGN_IN_SUBJECT).len();
+    let mut resource = None;
+    let mut approval = None;
+    let login = access.device_login(&mut |prompt| {
+        resource = Some(get_device(access, &prompt.user_code)?);
+        approval = Some(approve(access, endpoint, &prompt.user_code)?);
+        Ok(())
+    })?;
+    let expected = endpoint
+        .join(DEVICE_PAGE)
+        .map_err(E2eError::parse("the device page URL"))?
+        .to_string();
+    let prompted = match &login.prompt {
+        None => Err(format!("no prompt; stderr: {}", login.outcome.stderr)),
+        Some(prompt) if prompt.verification_uri != expected => Err(format!(
+            "verification URI {}; expected {expected}",
+            prompt.verification_uri
+        )),
+        Some(_) => device_only(&login.outcome.stderr),
+    };
+    let mut checks = vec![judged(identity::DEVICE_LOGIN_PROMPTED, prompted)];
+    if let (Some(prompt), Some(Ok(approved)), Some(resource)) =
+        (&login.prompt, &approval, &resource)
+    {
+        checks.push(judged(
+            identity::DEVICE_SHOWS_CLIENT_ADDRESS,
+            device_resource(resource, &prompt.user_code, LOOPBACK_CLIENT),
+        ));
+        checks.push(judged(
+            identity::DEVICE_APPROVAL_REDIRECTS,
+            device_approved(
+                &approved.started,
+                &approved.provider_location,
+                &approved.done,
+                cookie_name(endpoint),
+            ),
+        ));
+        let location = approved.started.header("location").unwrap_or_default();
+        let records = access.authorizations(SIGN_IN_SUBJECT);
+        let offline = offline_requested(location).and_then(|()| authorized(&records[mark..], true));
+        checks.push(judged(identity::DEVICE_APPROVAL_OFFLINE, offline));
+        let files = access.session_files(&login.home)?;
+        checks.push(judged(
+            identity::DEVICE_LOGIN_COMPLETES,
+            logged_in_with(&login.outcome, crate::template::PROVIDER)
+                .and_then(|()| device_session(&files)),
+        ));
+        device_renewal_checks(access, admin, &login.home, &mut checks)?;
+    } else {
+        let reason = match &approval {
+            Some(Err(reason)) => reason.as_str(),
+            _ => "no prompt or approval response",
+        };
+        for &name in &identity::DEVICE[1..7] {
+            checks.push(Check::failed(
+                name,
+                format!("the device login was not approved: {reason}"),
+            ));
+        }
+    }
+    access.set_policy(SIGN_IN_SUBJECT, SubjectPolicy::Standard);
+    device_missing_refresh_check(access, endpoint, &mut checks)?;
+    device_attacker_checks(access, endpoint, admin, &mut checks)?;
+    Ok(checks)
+}
+
+/// Checks renewal and revocation of a completed device session.
+fn device_renewal_checks<A: Access>(
+    access: &A,
+    admin: &Credentials,
+    home: &Path,
+    checks: &mut Vec<Check>,
+) -> Result<()> {
+    let first = access.get(home)?;
+    access.age(home, Aging::Token)?;
+    let before = access.refreshes(SIGN_IN_SUBJECT).len();
+    let renewed = access.get(home)?;
+    let grants = access.refreshes(SIGN_IN_SUBJECT);
+    let files = access.session_files(home)?;
+    let verdict = if first.outcome.code == Some(0)
+        && first.bearer.is_some()
+        && renewed.outcome.code == Some(0)
+        && renewed.bearer.is_some()
+    {
+        renewed_by_web_client(&grants[before..]).and_then(|issued| rotation_stored(&files, &issued))
+    } else {
+        Err(format!(
+            "first code {:?}, stderr {}; renewed code {:?}, stderr {}",
+            first.outcome.code, first.outcome.stderr, renewed.outcome.code, renewed.outcome.stderr
+        ))
+    };
+    checks.push(judged(identity::DEVICE_LOGIN_RENEWS, verdict));
+    access.set_policy(SIGN_IN_SUBJECT, SubjectPolicy::Standard);
+    let operator = format!("{}:{SIGN_IN_SUBJECT}", crate::template::PROVIDER);
+    let revoke = access.administer(admin, &Administration::RevokePrincipal(operator.clone()))?;
+    access.age(home, Aging::Token)?;
+    let refused = access.get(home)?;
+    let restore = access.administer(admin, &Administration::RestorePrincipal(operator))?;
+    access.age(home, Aging::Token)?;
+    let restored = access.get(home)?;
+    let verdict = if revoke.code != Some(0)
+        || restore.code != Some(0)
+        || restored.outcome.code != Some(0)
+        || restored.bearer.is_none()
+    {
+        Err(format!(
+            "revoke {:?}: {}; restore {:?}: {}; get {:?}: {}",
+            revoke.code,
+            revoke.stderr,
+            restore.code,
+            restore.stderr,
+            restored.outcome.code,
+            restored.outcome.stderr
+        ))
+    } else {
+        failure_reported(
+            &refused.outcome,
+            "gang get",
+            "the server answered 403: principal revoked",
+            FORBIDDEN_FIX,
+        )
+    };
+    checks.push(judged(identity::DEVICE_LOGIN_REVOKED, verdict));
+    Ok(())
+}
+
+/// Checks that a provider without refresh tokens cannot approve a device.
+fn device_missing_refresh_check<A: Access>(
+    access: &A,
+    endpoint: &Url,
+    checks: &mut Vec<Check>,
+) -> Result<()> {
+    access.set_policy(SIGN_IN_SUBJECT, SubjectPolicy::WithoutRefreshTokens);
+    let mut seen = None;
+    let failed = access.device_login(&mut |prompt| {
+        let approval = approve(access, endpoint, &prompt.user_code)?;
+        let resource = get_device(access, &prompt.user_code)?;
+        seen = Some((approval, resource));
+        Ok(())
+    })?;
+    access.set_policy(SIGN_IN_SUBJECT, SubjectPolicy::Standard);
+    let files = access.session_files(&failed.home)?;
+    let log = access.server_log()?;
+    let verdict = match seen {
+        Some((Ok(approval), resource)) => {
+            let state = serde_json::from_slice::<serde_json::Value>(&resource.body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("state")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                });
+            redirected_to(&approval.done, &format!("{ERROR_PATH}?reason=failed"))
+                .and_then(|()| {
+                    if state.as_deref() == Some("PENDING") {
+                        Ok(())
+                    } else {
+                        Err(format!("device state {state:?}"))
+                    }
+                })
+                .and_then(|()| {
+                    if failed.outcome.code == Some(1) {
+                        Ok(())
+                    } else {
+                        Err(format!("login code {:?}", failed.outcome.code))
+                    }
+                })
+                .and_then(|()| stored_nothing(&files))
+                .and_then(|()| {
+                    if log.contains("login.offline") {
+                        Ok(())
+                    } else {
+                        Err("the server log has no warning naming login.offline".to_owned())
+                    }
+                })
+        }
+        Some((Err(reason), _)) => Err(reason),
+        None => Err("no device approval was observed".to_owned()),
+    };
+    checks.push(judged(
+        identity::DEVICE_WITHOUT_REFRESH_TOKEN_FAILS,
+        verdict,
+    ));
+    Ok(())
+}
+
+/// Checks cross-site, secret, revocation, and replay attacks.
+fn device_attacker_checks<A: Access>(
+    access: &A,
+    endpoint: &Url,
+    admin: &Credentials,
+    checks: &mut Vec<Check>,
+) -> Result<()> {
+    let created = access.request(
+        &Request::new(Method::POST, DEVICE_AUTHORIZATIONS).body("application/json", b"{}".to_vec()),
+    )?;
+    let parsed = serde_json::from_slice::<serde_json::Value>(&created.body).ok();
+    let fields = parsed.as_ref().and_then(|value| {
+        Some((
+            value
+                .get("name")?
+                .as_str()?
+                .strip_prefix("deviceAuthorizations/")?,
+            value.get("secret")?.as_str()?,
+        ))
+    });
+    let Some((code, secret)) = fields.filter(|_| created.status == 200) else {
+        let reason = format!(
+            "the device authorization could not be created: status {} {}",
+            created.status,
+            String::from_utf8_lossy(&created.body)
+        );
+        for &name in &identity::DEVICE[8..] {
+            checks.push(Check::failed(name, reason.clone()));
+        }
+        return Ok(());
+    };
+    let cross = access.request(
+        &Request::new(Method::POST, DEVICE_PAGE)
+            .header("sec-fetch-site", "cross-site")
+            .header("origin", FOREIGN_ORIGIN)
+            .body(
+                "application/x-www-form-urlencoded",
+                format!("userCode={code}").into_bytes(),
+            ),
+    )?;
+    checks.push(judged(
+        identity::CROSS_SITE_DEVICE_APPROVAL_REFUSED,
+        cross_site_approval_refused(&cross),
+    ));
+    let wrong = redeem(access, code, WRONG_SECRET)?;
+    checks.push(judged(
+        identity::WRONG_SECRET_REDEEM_REFUSED,
+        refused_with(&wrong, 404, "DEVICE_AUTHORIZATION_NOT_FOUND"),
+    ));
+    let approved = approve(access, endpoint, code)?;
+    let operator = format!("{}:{SIGN_IN_SUBJECT}", crate::template::PROVIDER);
+    let revoke = access.administer(admin, &Administration::RevokePrincipal(operator.clone()))?;
+    let first = redeem(access, code, secret)?;
+    let restore = access.administer(admin, &Administration::RestorePrincipal(operator))?;
+    let second = redeem(access, code, secret)?;
+    let verdict = approved
+        .and_then(|approval| redirected_to(&approval.done, DEVICE_APPROVED))
+        .and_then(|()| {
+            if revoke.code == Some(0) && restore.code == Some(0) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "revoke {:?}: {}; restore {:?}: {}",
+                    revoke.code, revoke.stderr, restore.code, restore.stderr
+                ))
+            }
+        })
+        .and_then(|()| refused_with(&first, 403, "PRINCIPAL_REVOKED"));
+    checks.push(judged(identity::REVOKED_BEFORE_REDEEM_REFUSED, verdict));
+    checks.push(judged(
+        identity::SECOND_REDEEM_REFUSED,
+        refused_with(&second, 404, "DEVICE_AUTHORIZATION_NOT_FOUND"),
+    ));
+    Ok(())
 }
 
 /// One started authorization transaction and its callback information.

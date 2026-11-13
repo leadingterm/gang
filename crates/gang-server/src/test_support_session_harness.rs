@@ -12,11 +12,13 @@ use crate::login::SessionRoutes;
 use crate::principals::{PrincipalSightings, RevokedPrincipals};
 use crate::rate_limit::RateLimiter;
 use crate::security::Security;
-use crate::{LoginSettings, Stack};
+use crate::{DeviceSettings, LoginSettings, Stack};
 use gang_clock::TestClock;
 use gang_spi::{ApiRequestBody, ApiResponseBody, LoginClient, Peer, PortError, RequestGate};
 use gang_testkit::{FakeRepository, TestSigner};
-use gang_types::{ClientSecret, NonZeroDuration, ProviderName};
+use gang_types::{
+    ClientSecret, DeviceCodeTtl, DevicePollInterval, NonZeroDuration, ProviderName, SessionMaxAge,
+};
 use gang_wire::UiRoute;
 use http::header::{COOKIE, HeaderName, HeaderValue};
 use http::{Request, Response, StatusCode};
@@ -35,10 +37,16 @@ pub struct HarnessOptions {
     pub endpoint: &'static str,
     /// Whether the server offers the browser sign-in.
     pub login: bool,
+    /// Whether the server offers device login (ADR-37).
+    pub device: bool,
     /// How long a sign-in cookie and a pending sign-in last.
     pub ttl: NonZeroDuration,
     /// How many sign-ins may be pending at once.
     pub max_pending: usize,
+    /// The absolute lifetime of a browser session.
+    pub session_max_age: SessionMaxAge,
+    /// How long a renewal grant is shared.
+    pub renewal_reuse: NonZeroDuration,
 }
 
 impl Default for HarnessOptions {
@@ -46,8 +54,11 @@ impl Default for HarnessOptions {
         Self {
             endpoint: "https://gang.example.test",
             login: true,
+            device: false,
             ttl: NonZeroDuration::from_mins(10),
             max_pending: 8,
+            session_max_age: SessionMaxAge::from_units(43_200),
+            renewal_reuse: NonZeroDuration::from_mins(1),
         }
     }
 }
@@ -122,13 +133,20 @@ where
             ttl: options.ttl,
             max_pending: NonZeroUsize::new(options.max_pending)
                 .expect("test max_pending is non-zero"),
+            session_max_age: options.session_max_age,
+            renewal_reuse: options.renewal_reuse,
+            device: options.device.then(|| DeviceSettings {
+                ttl: DeviceCodeTtl::from_units(600),
+                poll_interval: DevicePollInterval::from_units(5),
+                max_pending: NonZeroUsize::new(1024).expect("1024 is non-zero"),
+            }),
         });
         let limiter = Arc::new(RateLimiter::new(
             &gang_config::RateLimitConfig::default(),
             Arc::clone(&clock),
         ));
         Self {
-            routes: SessionRoutes::new(Arc::clone(&core), login, limiter),
+            routes: SessionRoutes::new(Arc::clone(&core), login, limiter, 64 * 1024),
             gate: Gate::public(
                 Arc::clone(&core),
                 Arc::new(crate::client_address::TrustedProxies::default()),

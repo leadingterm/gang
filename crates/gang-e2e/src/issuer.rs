@@ -1,6 +1,6 @@
 //! In-process `OpenID` Connect issuer for the identity scenarios.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +33,66 @@ pub const ORGANIZATION_CLAIM: &str = "org";
 pub const DASHBOARD_CLIENT_ID: &str = "gang-e2e-dashboard";
 /// The shared secret required by the confidential dashboard client.
 pub const DASHBOARD_CLIENT_SECRET: &str = "gang-e2e-dashboard-secret";
+/// The authorization parameter that asks Google-style providers for a refresh token. The e2e
+/// deployments send it in `[identity.providers.e2e.oidc.login.offline]`.
+pub const OFFLINE_ACCESS: (&str, &str) = ("access_type", "offline");
+/// The parameter that asks for consent again, sent beside [`OFFLINE_ACCESS`] as Google needs it.
+pub const CONSENT_PROMPT: (&str, &str) = ("prompt", "consent");
+
+/// How the issuer treats the logins and refresh tokens of one subject (the `login_hint`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SubjectPolicy {
+    /// A code grant returns a refresh token only when its authorization request carried
+    /// [`OFFLINE_ACCESS`]; a refresh grant returns no new refresh token.
+    #[default]
+    Standard,
+    /// As `Standard`, but every refresh grant rotates: it returns a new refresh token of the same
+    /// family and retires the one presented; presenting a retired token revokes the whole family.
+    Rotating,
+    /// A suspended account: authorization requests are answered with `error=access_denied` and no
+    /// code, and every refresh grant is refused.
+    Suspended,
+    /// A misconfigured provider: code grants never return a refresh token.
+    WithoutRefreshTokens,
+}
+
+/// One authorization request the issuer answered for a subject.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizationRecord {
+    /// The `client_id` of the request.
+    pub client_id: String,
+    /// Whether the request carried [`OFFLINE_ACCESS`].
+    pub offline: bool,
+    /// Whether the request carried [`CONSENT_PROMPT`].
+    pub consent: bool,
+}
+
+/// How the issuer answered one refresh grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    /// Granted without a new refresh token.
+    Granted,
+    /// Granted with the new refresh token `issued`; the presented one is retired.
+    Rotated {
+        /// The refresh token returned in place of the presented one.
+        issued: String,
+    },
+    /// Refused: rejected token, wrong client, suspended subject, or revoked family.
+    Refused,
+    /// Refused because the token was already retired; its whole family is now revoked.
+    ReuseDetected,
+}
+
+/// One refresh grant the issuer answered for a subject.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshRecord {
+    /// The authenticated `client_id` of the grant.
+    pub client_id: String,
+    /// The refresh token presented.
+    pub refresh_token: String,
+    /// The answer.
+    pub outcome: RefreshOutcome,
+}
 const KEY_ID: &str = "gang-e2e-key";
 
 /// The claims of a token to mint.
@@ -82,6 +142,11 @@ struct Documents {
 struct Grants {
     codes: HashMap<String, CodeGrant>,
     refresh: HashMap<String, RefreshGrant>,
+    policies: HashMap<String, SubjectPolicy>,
+    authorizations: HashMap<String, Vec<AuthorizationRecord>>,
+    refreshes: HashMap<String, Vec<RefreshRecord>>,
+    revoked_families: HashSet<u64>,
+    next_family: u64,
 }
 struct CodeGrant {
     client_id: String,
@@ -89,12 +154,15 @@ struct CodeGrant {
     code_challenge: String,
     nonce: String,
     subject: String,
+    offline: bool,
 }
 struct RefreshGrant {
     client_id: String,
     subject: String,
     grants: usize,
     rejected: bool,
+    family: u64,
+    retired: bool,
 }
 #[derive(Clone)]
 struct AppState {
@@ -239,6 +307,33 @@ impl TestIssuer {
             grant.rejected = true;
         }
     }
+    /// Sets how the issuer treats `subject` from now on (default [`SubjectPolicy::Standard`]).
+    pub fn set_policy(&self, subject: &str, policy: SubjectPolicy) {
+        self.grants
+            .lock()
+            .policies
+            .insert(subject.to_owned(), policy);
+    }
+    /// The authorization requests answered for `subject`, oldest first.
+    #[must_use]
+    pub fn authorizations(&self, subject: &str) -> Vec<AuthorizationRecord> {
+        self.grants
+            .lock()
+            .authorizations
+            .get(subject)
+            .cloned()
+            .unwrap_or_default()
+    }
+    /// The refresh grants answered for `subject`, oldest first.
+    #[must_use]
+    pub fn refreshes(&self, subject: &str) -> Vec<RefreshRecord> {
+        self.grants
+            .lock()
+            .refreshes
+            .get(subject)
+            .cloned()
+            .unwrap_or_default()
+    }
     fn sign_claims(
         &self,
         subject: &str,
@@ -318,6 +413,8 @@ struct Authorize {
     code_challenge: Option<String>,
     code_challenge_method: Option<String>,
     login_hint: Option<String>,
+    access_type: Option<String>,
+    prompt: Option<String>,
 }
 async fn authorize(
     State(state): State<AppState>,
@@ -364,22 +461,41 @@ async fn authorize(
             "invalid_request",
         ));
     };
-    let code = random_value()?;
-    state.grants.lock().codes.insert(
-        code.clone(),
-        CodeGrant {
-            client_id: client,
-            redirect_uri: redirect.clone(),
-            code_challenge: challenge,
-            nonce,
-            subject,
-        },
-    );
-
-    target
-        .query_pairs_mut()
-        .append_pair("code", &code)
-        .append_pair("state", &csrf);
+    let offline = query.access_type.as_deref() == Some(OFFLINE_ACCESS.1);
+    let consent = query.prompt.as_deref() == Some(CONSENT_PROMPT.1);
+    let mut grants = state.grants.lock();
+    grants
+        .authorizations
+        .entry(subject.clone())
+        .or_default()
+        .push(AuthorizationRecord {
+            client_id: client.clone(),
+            offline,
+            consent,
+        });
+    if grants.policies.get(&subject) == Some(&SubjectPolicy::Suspended) {
+        target
+            .query_pairs_mut()
+            .append_pair("error", "access_denied")
+            .append_pair("state", &csrf);
+    } else {
+        let code = random_value()?;
+        grants.codes.insert(
+            code.clone(),
+            CodeGrant {
+                client_id: client,
+                redirect_uri: redirect,
+                code_challenge: challenge,
+                nonce,
+                subject,
+                offline,
+            },
+        );
+        target
+            .query_pairs_mut()
+            .append_pair("code", &code)
+            .append_pair("state", &csrf);
+    }
     Ok((
         StatusCode::FOUND,
         [(axum::http::header::LOCATION, target.to_string())],
@@ -461,24 +577,33 @@ async fn token(
             }
             let now = state.clock.wall().as_unix_millis() / 1000;
             let id_token = signed(&state, &grant.subject, client, now, Some(&grant.nonce))?;
-            let refresh = random_value()?;
             let access = random_value()?;
-            state.grants.lock().refresh.insert(
-                refresh.clone(),
-                RefreshGrant {
-                    client_id: client.to_owned(),
-                    subject: grant.subject,
-                    grants: 0,
-                    rejected: false,
-                },
-            );
-            Ok(Json(json!({
+            let mut response = json!({
                 "token_type": "Bearer",
                 "access_token": access,
                 "id_token": id_token,
-                "refresh_token": refresh,
-            }))
-            .into_response())
+            });
+            let mut grants = state.grants.lock();
+            if grant.offline
+                && grants.policies.get(&grant.subject) != Some(&SubjectPolicy::WithoutRefreshTokens)
+            {
+                let refresh = random_value()?;
+                let family = grants.next_family;
+                grants.next_family += 1;
+                grants.refresh.insert(
+                    refresh.clone(),
+                    RefreshGrant {
+                        client_id: client.to_owned(),
+                        subject: grant.subject,
+                        grants: 0,
+                        rejected: false,
+                        family,
+                        retired: false,
+                    },
+                );
+                response["refresh_token"] = json!(refresh);
+            }
+            Ok(Json(response).into_response())
         }
         Some("refresh_token") => {
             let Some(refresh) = form.refresh_token else {
@@ -487,33 +612,98 @@ async fn token(
                     "invalid_grant",
                 ));
             };
-            let mut grants = state.grants.lock();
-            let Some(grant) = grants.refresh.get_mut(&refresh) else {
-                return Err(IssuerHttpError::new(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_grant",
-                ));
-            };
-            if grant.rejected || grant.client_id != client {
-                return Err(IssuerHttpError::new(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_grant",
-                ));
-            }
-            let now = state.clock.wall().as_unix_millis() / 1000;
-            let id_token = signed(&state, &grant.subject, client, now, None)?;
-            let access = random_value()?;
-            grant.grants += 1;
-            Ok(
-                Json(json!({"token_type":"Bearer", "access_token":access, "id_token":id_token}))
-                    .into_response(),
-            )
+            refresh_token(&state, client, refresh)
         }
         _ => Err(IssuerHttpError::new(
             StatusCode::BAD_REQUEST,
             "unsupported_grant_type",
         )),
     }
+}
+
+/// Answers a refresh grant and records its outcome atomically with token-family changes.
+fn refresh_token(
+    state: &AppState,
+    client: &str,
+    refresh: String,
+) -> std::result::Result<Response, IssuerHttpError> {
+    let mut grants = state.grants.lock();
+    let Some(grant) = grants.refresh.get(&refresh) else {
+        return Err(IssuerHttpError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+        ));
+    };
+    let subject = grant.subject.clone();
+    let family = grant.family;
+    let policy = grants.policies.get(&subject).copied().unwrap_or_default();
+    let outcome = if grant.rejected
+        || grant.client_id != client
+        || policy == SubjectPolicy::Suspended
+        || grants.revoked_families.contains(&family)
+    {
+        RefreshOutcome::Refused
+    } else if policy == SubjectPolicy::Rotating && grant.retired {
+        grants.revoked_families.insert(family);
+        RefreshOutcome::ReuseDetected
+    } else {
+        let now = state.clock.wall().as_unix_millis() / 1000;
+        let id_token = signed(state, &subject, client, now, None)?;
+        let access = random_value()?;
+        let issued = if policy == SubjectPolicy::Rotating {
+            Some(random_value()?)
+        } else {
+            None
+        };
+        if let Some(grant) = grants.refresh.get_mut(&refresh) {
+            grant.grants += 1;
+            if issued.is_some() {
+                grant.retired = true;
+            }
+        }
+        let mut response =
+            json!({"token_type":"Bearer", "access_token":access, "id_token":id_token});
+        let outcome = if let Some(token) = issued {
+            grants.refresh.insert(
+                token.clone(),
+                RefreshGrant {
+                    client_id: client.to_owned(),
+                    subject: subject.clone(),
+                    grants: 0,
+                    rejected: false,
+                    family,
+                    retired: false,
+                },
+            );
+            response["refresh_token"] = json!(token);
+            RefreshOutcome::Rotated { issued: token }
+        } else {
+            RefreshOutcome::Granted
+        };
+        grants
+            .refreshes
+            .entry(subject)
+            .or_default()
+            .push(RefreshRecord {
+                client_id: client.to_owned(),
+                refresh_token: refresh,
+                outcome,
+            });
+        return Ok(Json(response).into_response());
+    };
+    grants
+        .refreshes
+        .entry(subject)
+        .or_default()
+        .push(RefreshRecord {
+            client_id: client.to_owned(),
+            refresh_token: refresh,
+            outcome,
+        });
+    Err(IssuerHttpError::new(
+        StatusCode::BAD_REQUEST,
+        "invalid_grant",
+    ))
 }
 fn signed(
     state: &AppState,
@@ -594,6 +784,8 @@ mod tests {
             code_challenge: Some("challenge".into()),
             code_challenge_method: Some("S256".into()),
             login_hint: Some("subject".into()),
+            access_type: None,
+            prompt: None,
         };
         let runtime = Builder::new_current_thread()
             .build()

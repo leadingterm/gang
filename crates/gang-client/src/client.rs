@@ -9,18 +9,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gang_clock::{Clock, Timestamp};
-use gang_spi::{LoginPort, LoginRequest, LoginSupport, PortError};
+use gang_spi::{LoginGrant, LoginPort, LoginRequest, LoginSupport, PortError};
 use gang_tls::ServerTrust;
 use gang_types::{
     AccessToken, CaPin, CertSerial, Identity, Proof, ProviderName, RefreshToken, Url,
 };
 use gang_wire::{
-    AuthenticateRequest, Authentication, Certificate, Principal, RevokePrincipalResponse, Server,
+    AuthenticateRequest, AuthenticateResponse, Authentication, Certificate, Credential, Principal,
+    RevokePrincipalResponse, Server,
 };
 use serde_json::Value;
 
 use crate::api::ServerApi;
 use crate::bazelrc;
+use crate::browser::LocalBrowser;
 use crate::console::Console;
 use crate::credential_helper::{CredentialRequest, credential_reply};
 use crate::errors::ClientError;
@@ -42,6 +44,14 @@ pub struct Client<P, C, K> {
     clock: Arc<K>,
 }
 
+/// The successful authorization from either login path.
+enum LoginOutcome {
+    /// A browser returned an identity-provider grant.
+    Interactive(LoginGrant),
+    /// The server redeemed a device authorization.
+    Device(AuthenticateResponse),
+}
+
 /// An interactive login through a browser, in the server's identity-provider list.
 pub struct InteractiveLogin<'a> {
     /// The Gang server URL.
@@ -50,6 +60,8 @@ pub struct InteractiveLogin<'a> {
     pub provider: Option<&'a ProviderName>,
     /// The pin of the Gang CA public key; `None` trusts the system roots.
     pub ca_pin: Option<&'a CaPin>,
+    /// Whether a local browser can be opened.
+    pub browser: LocalBrowser,
 }
 
 /// A login from a proof source the caller provides, such as a CI job token.
@@ -144,26 +156,62 @@ impl<P: LoginProviders, C: Console, K: Clock + 'static> Client<P, C, K> {
             &self.options,
             self.clock.clone(),
         )?;
-        let logins = token_logins(api.server(None).await?)?;
-        let name = choose_provider(&logins, request.provider)?;
-        let provider = self.interactive_provider(&name, &logins)?;
-
-        let listener = LoopbackListener::bind().await?;
-        let challenge = provider
-            .begin_login(&LoginRequest {
-                redirect_uri: listener.redirect_uri(),
-                client: None,
-            })
-            .await
-            .map_err(ClientError::Provider)?;
-        self.console.announce(&challenge.authorization_url);
-        let callback = self.await_redirect(listener).await?;
-        let grant = provider
-            .complete_login(challenge.session, &callback)
-            .await
-            .map_err(ClientError::Provider)?;
-
+        let info = api.server(None).await?;
+        let (logins, device) = match info.authentication {
+            Authentication::Token(token) => (token.login, token.device_login),
+            Authentication::None(_) => return Err(ClientError::NoAuthentication),
+            Authentication::Unrecognized(_) => return Err(ClientError::UnsupportedAuthentication),
+        };
+        let device =
+            device.filter(|device| request.provider.is_none_or(|name| *name == device.provider));
+        let name = match &device {
+            Some(device) => device.provider.clone(),
+            None => choose_provider(&logins, request.provider)?,
+        };
+        let outcome = if device.is_some() {
+            let mut poll = Box::pin(self.device_login(&api));
+            if request.browser == LocalBrowser::Available {
+                let mut browser = Box::pin(self.loopback_login(&name, &logins, false));
+                tokio::select! {
+                    result = &mut browser => match result {
+                        Ok(grant) => LoginOutcome::Interactive(grant),
+                        Err(_) => LoginOutcome::Device(poll.await?),
+                    },
+                    result = &mut poll => match result {
+                        Ok(response) => LoginOutcome::Device(response),
+                        Err(_) => LoginOutcome::Interactive(browser.await?),
+                    },
+                }
+            } else {
+                LoginOutcome::Device(poll.await?)
+            }
+        } else {
+            LoginOutcome::Interactive(Box::pin(self.loopback_login(&name, &logins, true)).await?)
+        };
         let _lock = self.home.lock().await?;
+        let grant = match outcome {
+            LoginOutcome::Interactive(grant) => grant,
+            LoginOutcome::Device(response) => {
+                let refresh = response
+                    .refresh_token
+                    .as_ref()
+                    .ok_or(ClientError::NoRefreshToken)?;
+                self.forget_interactive_login()?;
+                self.write_refresh_token(refresh)?;
+                let token = self.store_response(response)?;
+                Session {
+                    server: request.server.clone(),
+                    ca_pin: request.ca_pin.copied(),
+                    provider: name.clone(),
+                    kind: SessionKind::Device,
+                }
+                .store(&self.home)?;
+                return Ok(LoggedIn {
+                    provider: name,
+                    expires_at: token.expires_at,
+                });
+            }
+        };
         match &grant.refresh_token {
             Some(token) => self.write_refresh_token(token)?,
             None => self.remove_refresh_token()?,
@@ -183,6 +231,93 @@ impl<P: LoginProviders, C: Console, K: Clock + 'static> Client<P, C, K> {
             provider: name,
             expires_at: token.expires_at,
         })
+    }
+
+    /// Runs a browser login, optionally accepting a pasted callback.
+    async fn loopback_login(
+        &self,
+        name: &ProviderName,
+        logins: &BTreeMap<ProviderName, Value>,
+        paste: bool,
+    ) -> Result<LoginGrant, ClientError> {
+        let provider = self.interactive_provider(name, logins)?;
+        let listener = LoopbackListener::bind().await?;
+        let challenge = provider
+            .begin_login(&LoginRequest {
+                redirect_uri: listener.redirect_uri(),
+                client: None,
+                offline: true,
+            })
+            .await
+            .map_err(ClientError::Provider)?;
+        self.console.announce(&challenge.authorization_url);
+        let callback = if paste {
+            self.await_redirect(listener).await?
+        } else {
+            Clock::timeout(
+                &self.clock,
+                self.options.login_timeout.get(),
+                listener.callback(
+                    &self.clock,
+                    self.options.callback_read_timeout.get(),
+                    self.options.callback_max_head_size.get().as_usize(),
+                ),
+            )
+            .await
+            .map_err(|_| ClientError::LoginTimedOut)??
+        };
+        provider
+            .complete_login(challenge.session, &callback)
+            .await
+            .map_err(ClientError::Provider)
+    }
+
+    /// Creates and polls a device authorization until approval or expiry.
+    async fn device_login(&self, api: &ServerApi) -> Result<AuthenticateResponse, ClientError> {
+        let started = self.clock.monotonic();
+        let operation = async {
+            let authorization = api.create_device_authorization().await?;
+            let created = self.clock.monotonic();
+            self.console.announce_device(&authorization);
+            let secret = authorization
+                .secret
+                .as_ref()
+                .ok_or(ClientError::DeviceLoginInvalid)?;
+            let code = authorization
+                .name
+                .strip_prefix("deviceAuthorizations/")
+                .ok_or(ClientError::DeviceLoginInvalid)?;
+            let remaining = authorization
+                .expire_time
+                .saturating_duration_since(authorization.create_time)
+                .saturating_sub(self.clock.monotonic().saturating_duration_since(created));
+            let poll = async {
+                let mut delay = authorization.poll_interval;
+                loop {
+                    self.clock.sleep(delay).await;
+                    match api.redeem_device_authorization(code, secret).await {
+                        Err(ClientError::AuthorizationPending) => {
+                            delay = authorization.poll_interval;
+                        }
+                        Err(ClientError::RateLimited { retry_after }) => {
+                            delay = retry_after.unwrap_or(authorization.poll_interval);
+                        }
+                        result => return result,
+                    }
+                }
+            };
+            Clock::timeout(&self.clock, remaining, poll)
+                .await
+                .map_err(|_| ClientError::LoginTimedOut)?
+        };
+        let remaining = self
+            .options
+            .login_timeout
+            .get()
+            .saturating_sub(self.clock.monotonic().saturating_duration_since(started));
+        Clock::timeout(&self.clock, remaining, operation)
+            .await
+            .map_err(|_| ClientError::LoginTimedOut)?
     }
 
     /// Logs in with a proof source and stores the session. A workload session has no refresh
@@ -380,9 +515,28 @@ impl<P: LoginProviders, C: Console, K: Clock + 'static> Client<P, C, K> {
     /// session presents its stored identity-provider proof while it is fresh; the server's
     /// refusal of a stored proof renews it once. The caller holds the client lock.
     async fn mint(&self, api: &ServerApi, session: &Session) -> Result<BearerToken, ClientError> {
+        if matches!(&session.kind, SessionKind::Device) {
+            let request = AuthenticateRequest {
+                provider: session.provider.clone(),
+                credential: Credential::RefreshToken(self.stored_refresh_token()?),
+            };
+            let response = match api.authenticate(&request).await {
+                Err(ClientError::LoginRejected) => {
+                    ClientHome::remove(&self.home.session_file())?;
+                    ClientHome::remove(&self.home.token_file())?;
+                    self.forget_interactive_login()?;
+                    return Err(ClientError::LoginRejected);
+                }
+                result => result?,
+            };
+            if let Some(refresh) = &response.refresh_token {
+                self.write_refresh_token(refresh)?;
+            }
+            return self.store_response(response);
+        }
         let stored = match &session.kind {
             SessionKind::Interactive { .. } => self.stored_id_token()?,
-            SessionKind::Workload { .. } => None,
+            SessionKind::Workload { .. } | SessionKind::Device => None,
         };
         let mut from_store = stored.is_some();
         let mut proof = match stored {
@@ -392,18 +546,26 @@ impl<P: LoginProviders, C: Console, K: Clock + 'static> Client<P, C, K> {
         let response = loop {
             let request = AuthenticateRequest {
                 provider: session.provider.clone(),
-                proof: proof.clone(),
+                credential: Credential::Proof(proof.clone()),
             };
             match api.authenticate(&request).await {
-                Err(ClientError::Server {
-                    status: 401 | 403, ..
-                }) if from_store => {
+                Err(
+                    ClientError::LoginRejected
+                    | ClientError::Server {
+                        status: 401 | 403, ..
+                    },
+                ) if from_store => {
                     from_store = false;
                     proof = self.renew_proof(session).await?;
                 }
                 result => break result?,
             }
         };
+        self.store_response(response)
+    }
+
+    /// Stores a server-issued bearer token.
+    fn store_response(&self, response: AuthenticateResponse) -> Result<BearerToken, ClientError> {
         let issued_at = self.clock.wall();
         let stored = StoredToken {
             token: response.token,
@@ -427,6 +589,7 @@ impl<P: LoginProviders, C: Console, K: Clock + 'static> Client<P, C, K> {
         match &session.kind {
             SessionKind::Interactive { login } => self.renew(&session.provider, login).await,
             SessionKind::Workload { source } => source.read(&self.clock, &self.options).await,
+            SessionKind::Device => Err(ClientError::DeviceLoginInvalid),
         }
     }
 

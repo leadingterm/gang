@@ -2,15 +2,17 @@
 
 use std::time::Duration;
 
+use crate::device_logins::Redeem;
 use crate::gate::Caller;
+use crate::renewal_seal::RenewalSeal;
 use gang_spi::{Peer, Rejection, RequestGate};
-use gang_types::{Identity, Principal, ProviderName};
+use gang_types::{ClientSecret, Identity, Principal, ProviderName};
 use gang_wire::{ERROR_PATH, routes::GET_SESSION};
 use http::StatusCode;
 use http::header::CACHE_CONTROL;
 
 use crate::test_support::{
-    ApiReply, BeginFailure, Harness, HarnessOptions, TlsDeployment, read, request,
+    ApiReply, BeginFailure, Harness, HarnessOptions, TlsDeployment, raw_api_request, read, request,
     request_with_header,
 };
 
@@ -19,6 +21,9 @@ const SESSION_COOKIE: &str = "__Host-gang_session";
 
 /// The sign-in cookie name on an `https` endpoint.
 const LOGIN_COOKIE: &str = "__Host-gang_login";
+
+/// The sealed renewal cookie name on an HTTPS endpoint.
+const RENEWAL_COOKIE: &str = "__Host-gang_renewal";
 
 /// The lifetime of a pending sign-in and of the session it issues: 10 minutes.
 const TTL: Duration = Duration::from_mins(10);
@@ -189,6 +194,17 @@ async fn sign_in_redirects_to_the_provider_and_issues_a_session() {
         .expect("the token authenticates the caller");
     assert_eq!(authenticated.identity.provider.as_str(), "example-idp");
     assert_eq!(authenticated.identity.principal.as_str(), "admin");
+}
+
+#[tokio::test]
+async fn dashboard_sign_in_without_a_renewal_cookie_requests_offline_access() {
+    let harness = Harness::<TlsDeployment>::token(HarnessOptions::default());
+
+    start(&harness, "/ui/login?next=/ui").await;
+
+    let seen = harness.verifier.begun();
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].offline);
 }
 
 #[tokio::test]
@@ -494,4 +510,482 @@ async fn client_secret_and_session_token_stay_out_of_responses_and_urls() {
     for url in &urls {
         assert!(!url.contains(SECRET), "a URL carries the client secret");
     }
+}
+
+/// Signs in with a refresh token and returns the sealed renewal cookie.
+async fn renewal_cookie(harness: &Harness<TlsDeployment>) -> String {
+    harness
+        .verifier
+        .issue_refresh_token("admin-proof", "refresh");
+    let state = begin(harness).await;
+    finish(harness, &state)
+        .await
+        .set_cookie_value(RENEWAL_COOKIE)
+        .expect("sign-in sets a renewal cookie")
+}
+
+/// Opens a test renewal cookie using the same key and origin as the server.
+fn open_renewal(value: &str) -> crate::renewal_seal::Renewal {
+    RenewalSeal::new(&ClientSecret::new(SECRET), "https://gang.example.test")
+        .open(value)
+        .expect("renewal opens")
+}
+
+/// Posts a same-origin renewal request carrying the supplied cookie.
+async fn renew(harness: &Harness<TlsDeployment>, cookie: Option<&str>) -> ApiReply {
+    let cookies: Vec<_> = cookie
+        .map(|value| (RENEWAL_COOKIE, value))
+        .into_iter()
+        .collect();
+    exchange(
+        harness,
+        request_with_header(
+            "POST",
+            "/ui/renew",
+            &cookies,
+            "sec-fetch-site",
+            "same-origin",
+        ),
+    )
+    .await
+}
+
+/// Asserts that the renewal cookie is cleared.
+fn assert_renewal_cleared(reply: &ApiReply) {
+    assert!(reply.set_cookies().contains(&format!(
+        "{RENEWAL_COOKIE}=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0"
+    )));
+}
+
+#[tokio::test]
+async fn a_first_sign_in_is_offline_and_sets_the_renewal_cookie() {
+    let harness = Harness::<TlsDeployment>::token(HarnessOptions::default());
+    harness
+        .verifier
+        .issue_refresh_token("admin-proof", "refresh");
+    let state = begin(&harness).await;
+    assert!(harness.verifier.begun()[0].offline);
+    let reply = finish(&harness, &state).await;
+    assert!(reply.set_cookie_value(SESSION_COOKIE).is_some());
+    let cookie = reply
+        .set_cookie_value(RENEWAL_COOKIE)
+        .expect("renewal cookie");
+    assert_eq!(open_renewal(&cookie).principal, "admin");
+    assert!(reply.set_cookies().contains(&format!(
+        "{RENEWAL_COOKIE}={cookie}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=34560000"
+    )));
+}
+
+#[tokio::test]
+async fn a_sign_in_without_a_refresh_token_sets_no_renewal_cookie() {
+    let harness = Harness::<TlsDeployment>::token(HarnessOptions::default());
+    let state = begin(&harness).await;
+    let reply = finish(&harness, &state).await;
+    assert_renewal_cleared(&reply);
+    assert!(reply.set_cookie_value(SESSION_COOKIE).is_some());
+}
+
+#[tokio::test]
+async fn a_sign_in_with_a_renewal_cookie_is_not_offline_and_rechecks_the_sealed_token() {
+    let harness = Harness::<TlsDeployment>::token(HarnessOptions::default());
+    let cookie = renewal_cookie(&harness).await;
+    let original = open_renewal(&cookie);
+    harness.clock.advance(Duration::from_secs(10));
+    harness.verifier.renew_to("refresh", "admin-proof", None);
+    let started = exchange(
+        &harness,
+        request("GET", "/ui/login", &[(RENEWAL_COOKIE, &cookie)]),
+    )
+    .await;
+    let state = state_of(&started);
+    assert!(!harness.verifier.begun()[1].offline);
+    let reply = finish(&harness, &state).await;
+    assert_signed_in(&reply, "/ui");
+    assert_eq!(
+        harness.verifier.renewals(),
+        vec![("refresh".into(), Some("web-client".into()))]
+    );
+    let new = open_renewal(
+        &reply
+            .set_cookie_value(RENEWAL_COOKIE)
+            .expect("renewal resealed"),
+    );
+    assert_eq!(
+        new.expire_time,
+        original.expire_time + Duration::from_secs(10)
+    );
+}
+
+#[tokio::test]
+async fn a_failed_recheck_restarts_the_sign_in_as_offline() {
+    let harness = Harness::<TlsDeployment>::token(HarnessOptions::default());
+    let cookie = renewal_cookie(&harness).await;
+    let started = exchange(
+        &harness,
+        request(
+            "GET",
+            "/ui/login?next=/ui/workers",
+            &[(RENEWAL_COOKIE, &cookie)],
+        ),
+    )
+    .await;
+    let reply = finish(&harness, &state_of(&started)).await;
+    assert_eq!(reply.status, StatusCode::FOUND);
+    assert!(
+        reply
+            .location()
+            .expect("provider redirect")
+            .starts_with("https://idp.example.test/authorize?")
+    );
+    assert!(harness.verifier.begun()[2].offline);
+    assert!(reply.set_cookie_value(LOGIN_COOKIE).is_some());
+    assert!(reply.set_cookie_value(SESSION_COOKIE).is_none());
+    assert_renewal_cleared(&reply);
+}
+
+#[tokio::test]
+async fn renew_issues_a_session_and_reseals_only_a_rotated_token() {
+    for rotated in [None, Some("rotated")] {
+        let harness = Harness::<TlsDeployment>::token(HarnessOptions::default());
+        let cookie = renewal_cookie(&harness).await;
+        let original = open_renewal(&cookie);
+        harness.verifier.renew_to("refresh", "admin-proof", rotated);
+        let reply = renew(&harness, Some(&cookie)).await;
+        assert_eq!(reply.status, StatusCode::NO_CONTENT);
+        assert_no_store(&reply);
+        assert!(reply.set_cookie_value(SESSION_COOKIE).is_some());
+        if let Some(rotated) = rotated {
+            let new = open_renewal(
+                &reply
+                    .set_cookie_value(RENEWAL_COOKIE)
+                    .expect("rotated cookie"),
+            );
+            assert_eq!(new.expire_time, original.expire_time);
+            assert_eq!(new.refresh_token.expose(), rotated);
+        } else {
+            assert!(reply.set_cookie_value(RENEWAL_COOKIE).is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn renew_past_the_absolute_lifetime_is_401_even_with_a_valid_refresh_token() {
+    let harness = Harness::<TlsDeployment>::token(HarnessOptions::default());
+    let cookie = renewal_cookie(&harness).await;
+    harness.verifier.renew_to("refresh", "admin-proof", None);
+    harness.clock.advance(Duration::from_secs(43_201));
+    let reply = renew(&harness, Some(&cookie)).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    assert!(harness.verifier.renewals().is_empty());
+    assert!(reply.set_cookies().is_empty());
+}
+
+#[tokio::test]
+async fn renew_for_another_principal_is_401() {
+    let harness = Harness::<TlsDeployment>::token(HarnessOptions::default());
+    let cookie = renewal_cookie(&harness).await;
+    harness.verifier.accept("other-proof", "other");
+    harness.verifier.renew_to("refresh", "other-proof", None);
+    let reply = renew(&harness, Some(&cookie)).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    assert_renewal_cleared(&reply);
+}
+
+#[tokio::test]
+async fn renew_of_a_revoked_principal_is_403_and_clears_the_cookie() {
+    let harness = Harness::<TlsDeployment>::token(HarnessOptions::default());
+    let cookie = renewal_cookie(&harness).await;
+    harness.verifier.renew_to("refresh", "admin-proof", None);
+    let provider = ProviderName::try_new("example-idp").expect("provider valid");
+    let principal = Principal::try_new("admin").expect("principal valid");
+    harness
+        .core
+        .host
+        .revoked_principals
+        .revoke(Identity::new(provider, principal));
+    let reply = renew(&harness, Some(&cookie)).await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    assert_renewal_cleared(&reply);
+}
+
+#[tokio::test]
+async fn renew_when_the_provider_is_unavailable_is_503_and_keeps_the_cookie() {
+    let harness = Harness::<TlsDeployment>::token(HarnessOptions::default());
+    let cookie = renewal_cookie(&harness).await;
+    harness.verifier.renew_unavailable("refresh");
+    let reply = renew(&harness, Some(&cookie)).await;
+    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(reply.set_cookies().is_empty());
+}
+
+#[tokio::test]
+async fn renew_without_a_cookie_is_401() {
+    let harness = Harness::<TlsDeployment>::token(HarnessOptions::default());
+    let reply = renew(&harness, None).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    assert_renewal_cleared(&reply);
+}
+
+#[tokio::test]
+async fn renew_with_a_tampered_cookie_is_401() {
+    let harness = Harness::<TlsDeployment>::token(HarnessOptions::default());
+    let cookie = format!("{}!", renewal_cookie(&harness).await);
+    let reply = renew(&harness, Some(&cookie)).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    assert_renewal_cleared(&reply);
+}
+
+#[tokio::test]
+async fn cross_site_renew_is_403() {
+    let harness = Harness::<TlsDeployment>::token(HarnessOptions::default());
+    let cookie = renewal_cookie(&harness).await;
+    let reply = exchange(
+        &harness,
+        request_with_header(
+            "POST",
+            "/ui/renew",
+            &[(RENEWAL_COOKIE, &cookie)],
+            "sec-fetch-site",
+            "cross-site",
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    assert!(reply.set_cookies().is_empty());
+    assert!(harness.verifier.renewals().is_empty());
+}
+
+#[tokio::test]
+async fn two_renewals_of_one_token_make_one_grant() {
+    let harness = Harness::<TlsDeployment>::token(HarnessOptions::default());
+    let cookie = renewal_cookie(&harness).await;
+    harness
+        .verifier
+        .renew_to("refresh", "admin-proof", Some("rotated"));
+    assert_eq!(
+        renew(&harness, Some(&cookie)).await.status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        renew(&harness, Some(&cookie)).await.status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(harness.verifier.renewals().len(), 1);
+}
+
+#[tokio::test]
+async fn renew_is_post_only() {
+    let harness = Harness::<TlsDeployment>::token(HarnessOptions::default());
+    let reply = exchange(&harness, request("GET", "/ui/renew", &[])).await;
+    assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(
+        reply.headers.get(http::header::ALLOW).expect("allow"),
+        "POST"
+    );
+}
+
+#[tokio::test]
+async fn logout_clears_the_session_and_renewal_cookies() {
+    let harness = Harness::<TlsDeployment>::token(HarnessOptions::default());
+    let reply = exchange(
+        &harness,
+        request_with_header("POST", "/ui/logout", &[], "sec-fetch-site", "same-origin"),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    assert_renewal_cleared(&reply);
+    assert!(reply.set_cookies().contains(&format!(
+        "{SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0"
+    )));
+}
+
+/// A harness with device login enabled.
+fn device_harness() -> Harness<TlsDeployment> {
+    Harness::<TlsDeployment>::token(HarnessOptions {
+        device: true,
+        ..HarnessOptions::default()
+    })
+}
+
+/// Creates a device authorization using the service shared by the routes.
+fn create_device(harness: &Harness<TlsDeployment>) -> gang_wire::DeviceAuthorization {
+    let device = harness.routes.device().expect("device login is mounted");
+    device
+        .logins
+        .create(None, &device.verification_uri, &device.provider)
+        .expect("device authorization is created")
+}
+
+/// Extracts the user code from a device authorization name.
+fn device_code(authorization: &gang_wire::DeviceAuthorization) -> &str {
+    authorization
+        .name
+        .strip_prefix("deviceAuthorizations/")
+        .expect("device name")
+}
+
+/// Submits the device code from a browser with the given fetch-site.
+async fn approve_device(harness: &Harness<TlsDeployment>, code: &str, site: &str) -> ApiReply {
+    let mut request = raw_api_request(
+        "POST",
+        "/ui/device",
+        None,
+        format!("userCode={code}").into_bytes(),
+    );
+    request.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/x-www-form-urlencoded"),
+    );
+    request.headers_mut().insert(
+        "sec-fetch-site",
+        http::HeaderValue::from_str(site).expect("fetch site header"),
+    );
+    exchange(harness, request).await
+}
+
+#[tokio::test]
+async fn device_page_get_is_the_dashboard_page() {
+    let harness = device_harness();
+    let page = exchange(&harness, request("GET", "/ui/device", &[])).await;
+    let dashboard = read(
+        gang_ui::respond(&http::Method::GET, "/ui", &http::HeaderMap::new())
+            .map(gang_spi::full_body),
+    )
+    .await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert_eq!(page.body, dashboard.body);
+    assert_eq!(
+        page.headers
+            .get(http::header::CONTENT_TYPE)
+            .expect("content type"),
+        "text/html; charset=utf-8"
+    );
+}
+
+#[tokio::test]
+async fn device_page_head_and_other_methods_follow_the_ui_contract() {
+    let harness = Harness::<TlsDeployment>::token(HarnessOptions::default());
+    let head = exchange(&harness, request("HEAD", "/ui/device", &[])).await;
+    assert_eq!(head.status, StatusCode::OK);
+    assert!(head.body.is_empty());
+    let other = exchange(&harness, request("PUT", "/ui/device", &[])).await;
+    assert_eq!(other.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(
+        other.headers.get(http::header::ALLOW).expect("allow"),
+        "GET, HEAD, POST"
+    );
+}
+
+#[tokio::test]
+async fn cross_site_device_approval_is_403_and_starts_nothing() {
+    let harness = device_harness();
+    let authorization = create_device(&harness);
+    let reply = approve_device(&harness, device_code(&authorization), "cross-site").await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    assert!(harness.verifier.begun().is_empty());
+}
+
+#[tokio::test]
+async fn an_unknown_code_redirects_to_the_device_page_with_an_error() {
+    let harness = device_harness();
+    let reply = approve_device(&harness, "invalid", "same-origin").await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        reply.location().as_deref(),
+        Some("/ui/device?error=unknown")
+    );
+    assert!(harness.verifier.begun().is_empty());
+}
+
+#[tokio::test]
+async fn a_device_approval_signs_in_offline_with_the_web_client() {
+    let harness = device_harness();
+    let authorization = create_device(&harness);
+    let reply = approve_device(&harness, device_code(&authorization), "same-origin").await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    let state = state_of(&reply);
+    assert_eq!(reply.set_cookies(), vec![login_set_cookie(&state)]);
+    assert!(reply.set_cookie_value(SESSION_COOKIE).is_none());
+    let begun = harness.verifier.begun();
+    assert_eq!(begun.len(), 1);
+    assert!(begun[0].offline);
+    assert_eq!(
+        begun[0].client,
+        Some(("web-client".to_owned(), SECRET.to_owned()))
+    );
+}
+
+#[tokio::test]
+async fn the_device_callback_approves_and_lands_on_the_approved_page() {
+    let harness = device_harness();
+    let authorization = create_device(&harness);
+    harness
+        .verifier
+        .issue_refresh_token("admin-proof", "device-refresh");
+    let begun = approve_device(&harness, device_code(&authorization), "same-origin").await;
+    let done = finish(&harness, &state_of(&begun)).await;
+    assert_eq!(done.status, StatusCode::FOUND);
+    assert_eq!(done.location().as_deref(), Some("/ui/device/approved"));
+    assert_eq!(done.set_cookies(), vec![cleared_login_cookie()]);
+    let device = harness.routes.device().expect("device login");
+    let approval = device
+        .logins
+        .redeem(
+            device_code(&authorization),
+            authorization
+                .secret
+                .as_ref()
+                .expect("create returns a secret"),
+        )
+        .expect("approval can be redeemed");
+    assert_eq!(approval.principal, "admin");
+    assert_eq!(approval.grant.proof.expose(), "admin-proof");
+    assert_eq!(
+        approval
+            .grant
+            .refresh_token
+            .expect("refresh token")
+            .expose(),
+        "device-refresh"
+    );
+}
+
+#[tokio::test]
+async fn a_device_callback_without_a_refresh_token_leaves_the_entry_pending() {
+    let harness = device_harness();
+    let authorization = create_device(&harness);
+    let begun = approve_device(&harness, device_code(&authorization), "same-origin").await;
+    let done = finish(&harness, &state_of(&begun)).await;
+    assert_failed(&done, "failed");
+    assert!(done.set_cookie_value(RENEWAL_COOKIE).is_none());
+    let device = harness.routes.device().expect("device login");
+    assert!(matches!(
+        device.logins.redeem(
+            device_code(&authorization),
+            authorization.secret.as_ref().expect("secret")
+        ),
+        Err(Redeem::Pending)
+    ));
+}
+
+#[tokio::test]
+async fn a_second_approval_is_refused() {
+    let harness = device_harness();
+    let authorization = create_device(&harness);
+    harness
+        .verifier
+        .issue_refresh_token("admin-proof", "device-refresh");
+    let first = approve_device(&harness, device_code(&authorization), "same-origin").await;
+    let second = approve_device(&harness, device_code(&authorization), "same-origin").await;
+    let approved = finish(&harness, &state_of(&first)).await;
+    assert_eq!(approved.location().as_deref(), Some("/ui/device/approved"));
+    assert_failed(&finish(&harness, &state_of(&second)).await, "failed");
+}
+
+#[tokio::test]
+async fn device_approval_is_404_when_device_login_is_off() {
+    let harness = Harness::<TlsDeployment>::token(HarnessOptions::default());
+    let reply = approve_device(&harness, "BCDF-GHJK", "same-origin").await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    assert!(harness.verifier.begun().is_empty());
 }

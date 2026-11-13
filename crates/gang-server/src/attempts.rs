@@ -7,14 +7,32 @@ use std::time::Duration;
 use gang_clock::Tick;
 use gang_types::LoginSession;
 
+use crate::device_logins::UserCode;
+use crate::renewal_seal::Renewal;
 use crate::ttl_map::TtlMap;
 
 /// A browser sign-in that has started and awaits its callback.
 pub(crate) struct Attempt {
     /// The plugin's state for the sign-in.
     pub(crate) session: LoginSession,
-    /// The path the browser is sent to after a successful sign-in.
-    pub(crate) next: http::HeaderValue,
+    /// The operation completed by the callback.
+    pub(crate) purpose: Purpose,
+}
+
+/// The operation a browser sign-in completes.
+pub(crate) enum Purpose {
+    /// A dashboard session, optionally rechecking an existing renewal.
+    Session {
+        /// The path the browser is sent to after a successful sign-in.
+        next: http::HeaderValue,
+        /// The sealed login to recheck, or `None` for an offline sign-in.
+        renewal: Option<Renewal>,
+    },
+    /// Approval of a pending device login.
+    Device {
+        /// The user code of the pending login.
+        code: UserCode,
+    },
 }
 
 /// A bounded table of pending sign-ins that expire after a fixed time to live. The cache's order
@@ -58,7 +76,7 @@ mod tests {
     use gang_clock::Tick;
     use gang_types::LoginSession;
 
-    use super::{Attempt, LoginAttempts};
+    use super::{Attempt, LoginAttempts, Purpose};
 
     const TTL: Duration = Duration::from_secs(10);
 
@@ -77,7 +95,18 @@ mod tests {
     fn attempt(next: &str) -> Attempt {
         Attempt {
             session: LoginSession::new(format!("session-{next}")),
-            next: http::HeaderValue::from_str(next).expect("test path is a valid header value"),
+            purpose: Purpose::Session {
+                next: http::HeaderValue::from_str(next).expect("test path is a valid header value"),
+                renewal: None,
+            },
+        }
+    }
+
+    /// Returns the destination from a session attempt.
+    fn next(attempt: Attempt) -> Option<http::HeaderValue> {
+        match attempt.purpose {
+            Purpose::Session { next, .. } => Some(next),
+            Purpose::Device { .. } => None,
         }
     }
 
@@ -100,11 +129,11 @@ mod tests {
 
         assert_eq!(attempts.len(), 2);
         assert_eq!(
-            attempts.take("b", at(11)).map(|a| a.next),
+            attempts.take("b", at(11)).and_then(next),
             Some(http::HeaderValue::from_static("b"))
         );
         assert_eq!(
-            attempts.take("c", at(11)).map(|a| a.next),
+            attempts.take("c", at(11)).and_then(next),
             Some(http::HeaderValue::from_static("c"))
         );
     }
@@ -118,11 +147,11 @@ mod tests {
 
         assert!(attempts.take("a", at(2)).is_none());
         assert_eq!(
-            attempts.take("b", at(2)).map(|a| a.next),
+            attempts.take("b", at(2)).and_then(next),
             Some(http::HeaderValue::from_static("b"))
         );
         assert_eq!(
-            attempts.take("c", at(2)).map(|a| a.next),
+            attempts.take("c", at(2)).and_then(next),
             Some(http::HeaderValue::from_static("c"))
         );
     }
@@ -154,7 +183,7 @@ mod tests {
 
         assert_eq!(attempts.len(), 2);
         assert_eq!(
-            attempts.take("a", at(2)).map(|a| a.next),
+            attempts.take("a", at(2)).and_then(next),
             Some(http::HeaderValue::from_static("a2"))
         );
     }
@@ -168,7 +197,7 @@ mod tests {
 
         // The replacement expires at 19s, so it survives past the original 10s expiry.
         assert_eq!(
-            attempts.take("a", at(15)).map(|a| a.next),
+            attempts.take("a", at(15)).and_then(next),
             Some(http::HeaderValue::from_static("a2"))
         );
     }
@@ -183,11 +212,11 @@ mod tests {
 
         assert!(attempts.take("b", at(3)).is_none());
         assert_eq!(
-            attempts.take("a", at(3)).map(|a| a.next),
+            attempts.take("a", at(3)).and_then(next),
             Some(http::HeaderValue::from_static("a2"))
         );
         assert_eq!(
-            attempts.take("c", at(3)).map(|a| a.next),
+            attempts.take("c", at(3)).and_then(next),
             Some(http::HeaderValue::from_static("c"))
         );
     }

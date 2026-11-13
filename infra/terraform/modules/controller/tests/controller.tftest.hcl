@@ -28,6 +28,12 @@ mock_provider "aws" {
       availability_zone = "eu-north-1a"
     }
   }
+
+  mock_data "aws_ec2_instance_type" {
+    defaults = {
+      boot_modes = ["legacy-bios", "uefi"]
+    }
+  }
 }
 
 variables {
@@ -505,4 +511,17 @@ run "no_iam_or_wildcard_actions" {
     ])
     error_message = "The controller policy must not grant iam:* or wildcard actions."
   }
+}
+
+run "rejects_instance_type_without_uefi" {
+  command = plan
+
+  override_data {
+    target = data.aws_ec2_instance_type.this
+    values = {
+      boot_modes = ["legacy-bios"]
+    }
+  }
+
+  expect_failures = [aws_instance.this]
 }

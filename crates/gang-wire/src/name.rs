@@ -49,6 +49,15 @@ impl Collection for Certificates {
     type Id = gang_types::CertSerial;
 }
 
+/// Collection of device authorizations, named by user code.
+#[derive(Debug, Clone, Copy)]
+pub enum DeviceAuthorizations {}
+
+impl Collection for DeviceAuthorizations {
+    const NAME: &'static str = "deviceAuthorizations";
+    type Id = String;
+}
+
 /// Collection of role resources, named by validated role name.
 #[derive(Debug, Clone, Copy)]
 pub enum Roles {}
@@ -258,6 +267,17 @@ mod tests {
     use gang_types::{CertSerial, Identity};
 
     use super::*;
+
+    #[test]
+    fn device_authorization_name_round_trips_user_code() {
+        let code = String::from("BCDF-GHJK");
+        let name = of::<DeviceAuthorizations>(&code);
+        assert_eq!(name, "deviceAuthorizations/BCDF-GHJK");
+        assert_eq!(
+            parse::<DeviceAuthorizations>(&name).expect("name parses"),
+            code
+        );
+    }
 
     #[test]
     fn invalid_role_name_is_refused() {

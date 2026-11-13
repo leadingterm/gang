@@ -21,6 +21,9 @@ mod access_verdict;
 mod administrator;
 mod admission;
 mod bazel;
+mod browser;
+mod browser_secured;
+mod browser_verdict;
 mod build_output;
 mod check;
 mod checked_in;
@@ -28,6 +31,7 @@ mod cli;
 mod cli_terminal;
 mod control;
 mod dashboard;
+mod device_verdict;
 mod disk;
 mod drain;
 mod drain_cancel;
@@ -92,9 +96,9 @@ pub mod server_verdict;
 pub mod verdict;
 
 pub use access::{
-    Access, Administration, Aging, IdentityKnobs, Login, MEMBER_SUBJECT, MisdirectedLogin,
-    Misdirection, PROVER_SUBJECT, REVOKED_TEXT, SIGN_IN_SUBJECT, SignIn, StandingWorker,
-    TokenAnswer, Validity, WorkerIdentity, identity,
+    Access, Administration, Aging, DeviceLogin, IdentityKnobs, Login, MEMBER_SUBJECT,
+    MisdirectedLogin, Misdirection, PROVER_SUBJECT, REVOKED_TEXT, SIGN_IN_SUBJECT, Sessions,
+    SignIn, StandingWorker, StoredSession, TokenAnswer, Validity, WorkerIdentity, identity,
 };
 pub use access_secured::proof_command;
 pub use access_verdict::{
@@ -105,6 +109,12 @@ pub use access_verdict::{
 pub use administrator::{ADMINISTRATOR, Administrator};
 pub use admission::{cold_start_misfit, memory_escalation, oversized_fleet, unplaceable_disk};
 pub use bazel::Bazel;
+pub use browser::{BROWSER_SUBJECT, Browser, SESSION_MAX_AGE, SESSION_TOKEN_TTL, sessions};
+pub use browser_verdict::{
+    RENEWAL_COOKIE_MAX_AGE, authorized, consent_free, cross_site_renewal_refused,
+    offline_requested, rechecked, refused_by_provider, renewal_cleared, renewal_cookie,
+    renewal_kept, renewed, sealed_refused, shared_grant, silent_renewals,
+};
 pub use build_output::{BuildOutcome, ProcessSummary};
 pub use check::{Check, Outcome, Report};
 pub use checked_in::{Shipped, ShippedConfig, Start, checked_in_configs};
@@ -113,6 +123,11 @@ pub use cli::{
 };
 pub use control::{Control, ControlKnobs};
 pub use dashboard::dashboard;
+pub use device_verdict::{
+    DevicePrompt, cross_site_approval_refused, device_approved, device_only, device_prompt,
+    device_resource, device_session, logged_in_with, refused_with, renewed_by_web_client,
+    rotation_stored, stored_nothing,
+};
 pub use disk::disk;
 pub use drain_cancel::drain_cancel;
 pub use errors::{E2eError, Result};
@@ -138,7 +153,8 @@ pub use identity::{
 pub use input_root::input_root;
 pub use integrity::input_integrity;
 pub use issuer::{
-    AUDIENCE, DASHBOARD_CLIENT_ID, DASHBOARD_CLIENT_SECRET, ORGANIZATION, ORGANIZATION_CLAIM,
+    AUDIENCE, AuthorizationRecord, CONSENT_PROMPT, DASHBOARD_CLIENT_ID, DASHBOARD_CLIENT_SECRET,
+    OFFLINE_ACCESS, ORGANIZATION, ORGANIZATION_CLAIM, RefreshOutcome, RefreshRecord, SubjectPolicy,
     TestIssuer, TokenSpec,
 };
 pub use lifecycle::lifecycle;

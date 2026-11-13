@@ -287,6 +287,7 @@ macro_rules! flaw {
     };
 }
 mod identity;
+mod sessions;
 
 mod server;
 

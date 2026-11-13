@@ -3,17 +3,21 @@
 
 use std::collections::BTreeSet;
 use std::convert::Infallible;
+use std::num::NonZeroUsize;
 
 use crate::gate::Caller;
 use crate::{Deployment, Parts, Server, ServerSettings};
 use bytes::Bytes;
-use gang_spi::{ApiRequestBody, ApiResponseBody, BoxedError, ControllerReady, Peer};
+use gang_spi::{ApiRequestBody, ApiResponseBody, BoxedError, ControllerReady, LoginClient, Peer};
 use gang_testkit::{Controller, FakeScheduler};
-use gang_types::{AccessToken, Identity, Principal, Proof, ProviderName};
+use gang_types::{
+    AccessToken, ClientSecret, DeviceCodeTtl, DevicePollInterval, Identity, NonZeroDuration,
+    Principal, Proof, ProviderName, SessionMaxAge,
+};
 use gang_wire::routes::{AUTHENTICATE_SESSION, GET_SERVER};
 use gang_wire::{
-    AuthenticateRequest, AuthenticateResponse, Detail, ERROR_DOMAIN, ErrorReason, ErrorResponse,
-    Status,
+    AuthenticateRequest, AuthenticateResponse, Credential, Detail, ERROR_DOMAIN, ErrorReason,
+    ErrorResponse, Status,
 };
 use http::header::{
     AUTHORIZATION, CONTENT_TYPE, HeaderValue, LOCATION, SET_COOKIE, WWW_AUTHENTICATE,
@@ -160,6 +164,26 @@ pub fn identity(principal: &str) -> Identity {
     )
 }
 
+/// Login settings that mount device authorization for the interactive test provider.
+pub fn device_login_settings() -> crate::LoginSettings {
+    crate::LoginSettings {
+        provider: ProviderName::try_new("example-idp").expect("test provider name is valid"),
+        client: LoginClient {
+            id: "web-client".to_owned(),
+            secret: ClientSecret::new("dashboard-secret-value"),
+        },
+        ttl: NonZeroDuration::from_mins(10),
+        max_pending: NonZeroUsize::new(8).expect("eight is non-zero"),
+        session_max_age: SessionMaxAge::from_units(43_200),
+        renewal_reuse: NonZeroDuration::from_mins(1),
+        device: Some(crate::settings::DeviceSettings {
+            ttl: DeviceCodeTtl::from_units(600),
+            poll_interval: DevicePollInterval::from_units(5),
+            max_pending: NonZeroUsize::new(1024).expect("1024 is non-zero"),
+        }),
+    }
+}
+
 /// Prepares the plaintext test server.
 pub async fn prepare_plain(
     parts: Parts<crate::test_support::PlainDeployment>,
@@ -296,7 +320,7 @@ pub async fn admits(controller: &Controller, token: &AccessToken) -> bool {
 pub async fn mint_token(controller: &Controller, provider: &str, proof: &str) -> AccessToken {
     let body = AuthenticateRequest {
         provider: ProviderName::try_new(provider).expect("test provider name is valid"),
-        proof: Proof::new(proof),
+        credential: Credential::Proof(Proof::new(proof)),
     };
     let request = api_request(
         "POST",

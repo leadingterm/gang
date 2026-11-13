@@ -25,6 +25,13 @@ mock_provider "aws" {
     }
   }
 
+  # Every instance type the tests use supports UEFI boot unless a run overrides it.
+  mock_data "aws_ec2_instance_type" {
+    defaults = {
+      boot_modes = ["legacy-bios", "uefi"]
+    }
+  }
+
   mock_resource "aws_iam_instance_profile" {
     defaults = { arn = "arn:aws:iam::000000000000:instance-profile/gang-worker" }
   }
@@ -939,6 +946,20 @@ run "rejects_fleet_whose_instance_types_no_zone_offers" {
   }
 
   expect_failures = [aws_autoscaling_group.this]
+}
+
+run "rejects_fleet_instance_type_without_uefi" {
+  command = plan
+
+  # override_data overrides every instance of the data source: OpenTofu does not accept a keyed target.
+  override_data {
+    target = data.aws_ec2_instance_type.this
+    values = {
+      boot_modes = ["legacy-bios"]
+    }
+  }
+
+  expect_failures = [aws_launch_template.this]
 }
 
 run "rejects_empty_subnet_ids" {

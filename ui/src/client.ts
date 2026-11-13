@@ -32,6 +32,8 @@ export interface StreamSource {
 export interface Environment {
   openStream(path: string): StreamSource;
   fetchJson(path: string): Promise<unknown>;
+  /** POSTs to `path` with no body and same-origin credentials; resolves to the HTTP status, rejects on a network failure. */
+  post(path: string): Promise<number>;
   /** The local clock, in unix milliseconds. */
   now(): UnixMs;
   schedule(run: () => void, delayMs: number): () => void;
@@ -74,6 +76,9 @@ export const earlierMore = (earlier: Earlier): boolean => earlier.kind === "unlo
 
 const BACKOFF_FIRST_MS = 1000;
 const BACKOFF_MAX_MS = 30000;
+/** The session renews when time left drops below max(1 minute, 20%), but never earlier than half its remaining life. */
+const RENEW_LEAD_MIN_MS = 60_000;
+const RENEW_LEAD_FRACTION = 0.2;
 const PRINCIPALS_PAGE = 500;
 const REVOKED_FILTER = "revokeTime:*";
 const EARLIER_PAGE = 200;
@@ -124,6 +129,7 @@ export class StateClient {
   #lastFrame: UnixMs | null = null;
   #failures = 0;
   #cancelRetry: (() => void) | null = null;
+  #cancelRenewal: (() => void) | null = null;
   #accessEpoch: number | null = null;
   #earlierGeneration = 0;
   /** A `loadMorePrincipals` request is in flight; a second call would repeat its page token. */
@@ -154,6 +160,7 @@ export class StateClient {
   stop(): void {
     this.#closeSource();
     this.#cancelRetry?.();
+    this.#cancelRenewal?.();
   }
 
   /**
@@ -258,6 +265,14 @@ export class StateClient {
 
   #admit(session: Session): void {
     this.session.value = session;
+    this.#cancelRenewal?.();
+    this.#cancelRenewal = null;
+    if (session.principal !== undefined && session.login && session.expireTime !== undefined) {
+      const left = ms(session.expireTime) - this.serverNow();
+      const lead = Math.min(left / 2, Math.max(RENEW_LEAD_MIN_MS, RENEW_LEAD_FRACTION * left));
+      const delay = Math.max(0, left - lead);
+      this.#cancelRenewal = this.#env.schedule(() => void this.#renew(), delay);
+    }
     if (session.principal === undefined) {
       this.link.value = { kind: "signed_out" };
       return;
@@ -365,7 +380,7 @@ export class StateClient {
         return;
       case "EXPIRED":
         this.#freeze(this.serverNow());
-        this.#env.navigate(loginUrl(this.#env.here()));
+        void this.#renew();
         return;
       case "VIEWER_CAP":
       case "SHUTDOWN":
@@ -383,10 +398,27 @@ export class StateClient {
     }
     if (session.principal === undefined && session.login && this.state.value) {
       this.#freeze(this.serverNow());
-      this.#env.navigate(loginUrl(this.#env.here()));
+      void this.#renew();
       return;
     }
     this.#admit(session);
+  }
+
+  async #renew(): Promise<void> {
+    let status: number | null;
+    try {
+      status = await this.#env.post(PATHS.renew);
+    } catch {
+      status = null;
+    }
+    if (status === 204) {
+      await this.start();
+    } else if (status === 401 || status === 403) {
+      this.#freeze(this.serverNow());
+      this.#env.navigate(loginUrl(this.#env.here()));
+    } else {
+      this.#retry(null, () => this.#renew());
+    }
   }
 
   async #probe(): Promise<Session | null> {
@@ -397,14 +429,15 @@ export class StateClient {
     }
   }
 
-  #retry(retryMs: number | null): void {
+  /** Runs `attempt` again after `retryMs`, or after the next backoff step when it is null. */
+  #retry(retryMs: number | null, attempt: () => Promise<void> = () => this.start()): void {
     const delay = retryMs ?? Math.min(BACKOFF_MAX_MS, BACKOFF_FIRST_MS * 2 ** this.#failures);
     this.#failures += 1;
     this.#freeze(this.serverNow() + delay);
     this.#cancelRetry?.();
     this.#cancelRetry = this.#env.schedule(() => {
       this.#cancelRetry = null;
-      void this.start();
+      void attempt();
     }, delay);
   }
 
@@ -435,6 +468,7 @@ export const browserEnvironment = (): Environment => ({
     if (!response.ok) throw new Error(`${path}: ${response.status}`);
     return response.json();
   },
+  post: async (path) => (await fetch(path, { method: "POST", credentials: "same-origin" })).status,
   now: () => Date.now(),
   schedule: (run, delayMs) => {
     const id = setTimeout(run, delayMs);

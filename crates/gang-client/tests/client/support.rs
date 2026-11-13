@@ -2,9 +2,10 @@
 //! TLS with the fixture CA) answering the server, authenticate, revoke and restore endpoints,
 //! identity providers that mint JWT-shaped proofs, a scripted console and a shared test clock.
 
+use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, UNIX_EPOCH};
@@ -151,6 +152,7 @@ pub fn token_info(
                     )
                 })
                 .collect(),
+            device_login: None,
         }),
     }
 }
@@ -200,6 +202,13 @@ struct ServerState {
     revoked_principals: Vec<Identity>,
     restored_principals: Vec<Identity>,
     forced: Option<ForcedResponse>,
+    device_answers: VecDeque<(u16, Option<u64>)>,
+    device_calls: Vec<(String, Timestamp)>,
+    device_notify: Arc<Notify>,
+    device_ttl: Duration,
+    device_create_time: Option<Timestamp>,
+    device_refresh: Option<String>,
+    block_token_write: Option<PathBuf>,
 }
 
 type SharedServerState = Arc<Mutex<ServerState>>;
@@ -310,6 +319,48 @@ impl FakeServer {
         self.state.lock().token_requests.clone()
     }
 
+    /// Scripts redeem statuses and optional retry-after seconds.
+    pub fn device_answers(&self, answers: &[(u16, Option<u64>)]) {
+        self.state.lock().device_answers = answers.iter().copied().collect();
+    }
+
+    /// Returns the recorded device requests and their clock times.
+    pub fn device_calls(&self) -> Vec<(String, Timestamp)> {
+        self.state.lock().device_calls.clone()
+    }
+
+    /// Waits for at least `count` device requests.
+    pub async fn wait_device_calls(&self, count: usize) {
+        loop {
+            let notify = self.state.lock().device_notify.clone();
+            let notified = notify.notified();
+            if self.state.lock().device_calls.len() >= count {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Sets the device code lifetime.
+    pub fn device_ttl(&self, ttl: Duration) {
+        self.state.lock().device_ttl = ttl;
+    }
+
+    /// Overrides the device authorization's creation time.
+    pub fn device_create_time(&self, time: Timestamp) {
+        self.state.lock().device_create_time = Some(time);
+    }
+
+    /// Sets the refresh token returned by a successful exchange.
+    pub fn device_refresh(&self, token: Option<&str>) {
+        self.state.lock().device_refresh = token.map(str::to_owned);
+    }
+
+    /// Blocks the token write after a refresh request has read the old token.
+    pub fn block_token_write(&self, path: PathBuf) {
+        self.state.lock().block_token_write = Some(path);
+    }
+
     /// Sets the `lifetime` of tokens issued from now on; the default is ten minutes.
     pub fn set_token_ttl(&self, ttl: Duration) {
         self.state.lock().token_ttl = ttl;
@@ -406,6 +457,13 @@ fn new_state(info: Server<serde_json::Value>, clock: Arc<TestClock>) -> SharedSe
         revoked_principals: Vec::new(),
         restored_principals: Vec::new(),
         forced: None,
+        device_answers: VecDeque::new(),
+        device_calls: Vec::new(),
+        device_notify: Arc::new(Notify::new()),
+        device_ttl: Duration::from_mins(10),
+        device_create_time: None,
+        device_refresh: Some("device-refresh".to_owned()),
+        block_token_write: None,
     }))
 }
 
@@ -482,6 +540,11 @@ async fn dispatch(
             .into_response()
     } else if *route == routes::AUTHENTICATE_SESSION {
         authenticate(&mut state, &body)
+    } else if *route == routes::CREATE_DEVICE_AUTHORIZATION
+        || route.id == routes::GET_DEVICE_AUTHORIZATION.id
+        || route.id == routes::REDEEM_DEVICE_AUTHORIZATION.id
+    {
+        device_route(&mut state, route, uri.path())
     } else if *route == routes::CREATE_CERTIFICATE {
         issue_certificate(&mut state, method_name, uri.path(), bearer, &body)
     } else if route.id == routes::REVOKE_CERTIFICATE.id {
@@ -495,6 +558,60 @@ async fn dispatch(
     }
 }
 
+/// Answers scripted device authorization requests.
+fn device_route(state: &mut ServerState, route: &routes::Route, path: &str) -> Response {
+    let now = state.clock.wall();
+    state.device_calls.push((path.to_owned(), now));
+    state.device_notify.notify_one();
+    if *route == routes::CREATE_DEVICE_AUTHORIZATION
+        || route.id == routes::GET_DEVICE_AUTHORIZATION.id
+    {
+        let create_time = state.device_create_time.unwrap_or(now);
+        let authorization = gang_wire::DeviceAuthorization {
+            name: "deviceAuthorizations/BCDF-GHJK".to_owned(),
+            provider: provider("google"),
+            verification_uri: Url::parse("https://gang.test/ui/device").expect("valid url"),
+            client_address: None,
+            state: gang_wire::DeviceAuthorizationState::Pending,
+            create_time,
+            expire_time: create_time + state.device_ttl,
+            poll_interval: Duration::from_secs(5),
+            secret: (*route == routes::CREATE_DEVICE_AUTHORIZATION)
+                .then(|| gang_types::DeviceSecret::new("device-secret")),
+        };
+        return Json(authorization).into_response();
+    }
+    let (status, retry) = state.device_answers.pop_front().unwrap_or((400, None));
+    match status {
+        200 => {
+            state.tokens_issued += 1;
+            let token = format!("gang-token-{}", state.tokens_issued);
+            state.tokens.push((token.clone(), now + state.token_ttl));
+            Json(AuthenticateResponse {
+                token: AccessToken::new(token),
+                lifetime: state.token_ttl,
+                refresh_token: state.device_refresh.as_ref().map(RefreshToken::new),
+            })
+            .into_response()
+        }
+        400 => api_error(
+            ErrorReason::AuthorizationPending,
+            "the device authorization is not approved yet",
+        ),
+        404 => api_error(
+            ErrorReason::DeviceAuthorizationNotFound,
+            "no such device authorization",
+        ),
+        429 => (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, retry.unwrap_or(5).to_string())],
+            "",
+        )
+            .into_response(),
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
 fn authenticate(state: &mut ServerState, body: &str) -> Response {
     let request: AuthenticateRequest = match serde_json::from_str(body) {
         Ok(request) => request,
@@ -505,15 +622,24 @@ fn authenticate(state: &mut ServerState, body: &str) -> Response {
             );
         }
     };
+    let proof = match &request.credential {
+        gang_wire::Credential::Proof(proof) => proof.expose(),
+        gang_wire::Credential::RefreshToken(token) => token.expose(),
+    };
     state
         .token_requests
-        .push((request.provider.clone(), request.proof.expose().to_owned()));
+        .push((request.provider.clone(), proof.to_owned()));
+    let refresh_exchange = matches!(&request.credential, gang_wire::Credential::RefreshToken(_));
     let accepted = state
         .accepted
         .iter()
-        .any(|(provider, proof)| *provider == request.provider && proof == request.proof.expose());
+        .any(|(provider, accepted)| *provider == request.provider && accepted == proof);
     if !accepted {
         return api_error(ErrorReason::ProofRejected, "proof rejected");
+    }
+    if refresh_exchange && let Some(path) = state.block_token_write.take() {
+        std::fs::remove_file(&path).expect("removing old bearer token");
+        std::fs::create_dir(&path).expect("blocking bearer token write");
     }
     state.tokens_issued += 1;
     let token = format!("gang-token-{}", state.tokens_issued);
@@ -523,6 +649,11 @@ fn authenticate(state: &mut ServerState, body: &str) -> Response {
     Json(AuthenticateResponse {
         token: AccessToken::new(token),
         lifetime,
+        refresh_token: if refresh_exchange {
+            state.device_refresh.as_ref().map(RefreshToken::new)
+        } else {
+            None
+        },
     })
     .into_response()
 }
@@ -712,6 +843,7 @@ fn jwt_proof(sequence: usize, expires_at: Timestamp) -> Proof {
 struct ProviderState {
     clock: Option<Arc<TestClock>>,
     begins: AtomicUsize,
+    begun_offline: Mutex<Vec<bool>>,
     completes: AtomicUsize,
     grants: AtomicUsize,
     renews: AtomicUsize,
@@ -743,6 +875,12 @@ impl FakeProviders {
     #[must_use]
     pub fn begin_login_calls(&self) -> usize {
         self.state.begins.load(Ordering::SeqCst)
+    }
+
+    /// The `offline` flag of each `begin_login`, in order.
+    #[must_use]
+    pub fn begun_offline(&self) -> Vec<bool> {
+        self.state.begun_offline.lock().clone()
     }
 
     /// Returns how many `complete_login` calls have been made so far.
@@ -824,6 +962,11 @@ impl LoginPort for FakeProvider {
     }
 
     async fn begin_login(&self, request: &LoginRequest<'_>) -> Result<LoginChallenge, PortError> {
+        self.providers
+            .state
+            .begun_offline
+            .lock()
+            .push(request.offline);
         let n = self.providers.state.begins.fetch_add(1, Ordering::SeqCst) + 1;
         let state = format!("state-{n}");
         let authorization_url = Url::parse_with_params(
@@ -889,6 +1032,8 @@ impl LoginPort for FakeProvider {
 #[derive(Default)]
 struct ConsoleState {
     announced: Mutex<Vec<Url>>,
+    device_announced: Mutex<Vec<gang_wire::DeviceAuthorization>>,
+    paste_reads: AtomicUsize,
     arrived: Notify,
     oversized: Mutex<Option<String>>,
 }
@@ -919,6 +1064,16 @@ impl FakeConsole {
         self.state.announced.lock().clone()
     }
 
+    /// Returns device announcements.
+    pub fn devices(&self) -> Vec<gang_wire::DeviceAuthorization> {
+        self.state.device_announced.lock().clone()
+    }
+
+    /// Returns the number of attempts to read a pasted URL.
+    pub fn paste_reads(&self) -> usize {
+        self.state.paste_reads.load(Ordering::SeqCst)
+    }
+
     /// Returns the status line the loopback listener answered the oversized callback head with,
     /// or `None` when it closed without an answer or no oversized head was sent yet.
     #[must_use]
@@ -947,7 +1102,16 @@ impl Console for FakeConsole {
         }
     }
 
+    fn announce_device(&self, authorization: &gang_wire::DeviceAuthorization) {
+        self.state
+            .device_announced
+            .lock()
+            .push(authorization.clone());
+        self.state.arrived.notify_one();
+    }
+
     fn pasted_redirect(&self) -> impl Future<Output = Url> + Send {
+        self.state.paste_reads.fetch_add(1, Ordering::SeqCst);
         let mode = self.mode;
         let state = Arc::clone(&self.state);
         async move {

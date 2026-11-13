@@ -150,6 +150,67 @@ fn login_table_without_client_secret_round_trips() {
 }
 
 #[test]
+fn offline_table_parses_and_is_omitted_when_empty() {
+    let input = with_login(
+        base_config(),
+        json!({
+            "scopes": ["openid"],
+            "offline": {
+                "scopes": ["offline_access"],
+                "authorization_params": {"access_type": "offline"},
+            },
+        }),
+    );
+    let config = parse(input);
+    let offline = &config.login.as_ref().expect("login is configured").offline;
+    assert_eq!(offline.scopes, vec!["offline_access"]);
+    assert_eq!(
+        offline.authorization_params,
+        BTreeMap::from([("access_type".to_owned(), "offline".to_owned())])
+    );
+    let serialized = serde_json::to_value(&config).expect("config serializes");
+    assert_eq!(
+        serialized["login"]["offline"],
+        json!({
+            "scopes": ["offline_access"],
+            "authorization_params": {"access_type": "offline"},
+        })
+    );
+
+    let config = parse(with_login(base_config(), json!({"scopes": ["openid"]})));
+    let serialized = serde_json::to_value(&config).expect("config serializes");
+    assert!(serialized["login"].get("offline").is_none());
+}
+
+#[test]
+fn offline_table_rejects_reserved_and_repeated_names() {
+    for (login, expected) in [
+        (
+            json!({"scopes": ["openid"], "offline": {"authorization_params": {"state": "x"}}}),
+            "authorization parameter `state` is set by the login flow",
+        ),
+        (
+            json!({
+                "scopes": ["openid"],
+                "authorization_params": {"prompt": "x"},
+                "offline": {"authorization_params": {"prompt": "y"}},
+            }),
+            "`prompt` is already set by the login and cannot repeat in `login.offline`",
+        ),
+        (
+            json!({"scopes": ["openid"], "offline": {"scopes": ["openid"]}}),
+            "`openid` is already set by the login and cannot repeat in `login.offline`",
+        ),
+        (
+            json!({"scopes": ["openid"], "offline": {"unexpected": true}}),
+            "unknown field `unexpected`",
+        ),
+    ] {
+        rejected_as_config(with_login(base_config(), login), expected);
+    }
+}
+
+#[test]
 fn unknown_top_level_field_is_rejected() {
     let mut input = base_config();
     input["extra"] = json!(true);
