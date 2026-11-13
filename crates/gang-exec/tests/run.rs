@@ -85,6 +85,7 @@ fn sandbox_file(
 struct Fixture {
     _temp: TempDir,
     base: PathBuf,
+    root: PathBuf,
     entrypoint: PathBuf,
     working_directory: PathBuf,
     outside: PathBuf,
@@ -99,7 +100,7 @@ impl Fixture {
         let base = temp.path().to_path_buf();
         let bin = base.join("bin");
         let root = base.join("root");
-        let working_directory = root.join("a1/work");
+        let working_directory = root.join("a1/work/sub");
         let shared = root.join("a1/inputs/shared");
         let partner = base.join("cache/shared");
         let outside = base.join("outside");
@@ -129,6 +130,7 @@ impl Fixture {
         Ok(Self {
             _temp: temp,
             base,
+            root,
             entrypoint,
             working_directory,
             outside,
@@ -265,15 +267,14 @@ fn breaks_every_link_under_the_action_directory_whatever_the_environment_says()
 }
 
 #[test]
-fn keep_leaves_links_alone_and_tolerates_a_working_directory_outside_the_work_directory()
--> Result<(), Box<dyn Error>> {
+fn keep_leaves_links_alone() -> Result<(), Box<dyn Error>> {
     let fixture = Fixture::new(InputLinks::Keep)?;
     let started = Events::default();
 
     run_action(
         &argv(),
         &fixture.entrypoint,
-        &fixture.outside,
+        &fixture.working_directory,
         &[],
         &started,
     )?;
@@ -285,20 +286,56 @@ fn keep_leaves_links_alone_and_tolerates_a_working_directory_outside_the_work_di
 }
 
 #[test]
-fn break_rejects_a_working_directory_outside_the_work_directory() -> Result<(), Box<dyn Error>> {
-    let fixture = Fixture::new(InputLinks::Break)?;
+fn a_working_directory_outside_the_work_directory_is_rejected_whatever_input_links_says()
+-> Result<(), Box<dyn Error>> {
+    for input_links in [InputLinks::Keep, InputLinks::Break] {
+        let fixture = Fixture::new(input_links)?;
+        let started = Events::default();
+
+        let error = error_of(run_action(
+            &argv(),
+            &fixture.entrypoint,
+            &fixture.outside,
+            &[],
+            &started,
+        ))?;
+
+        assert!(matches!(error, ExecError::OutsideWorkDirectory { .. }));
+        assert!(started_markers(&started).is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn the_sandbox_gets_the_action_directory_and_the_working_directory_inside_it()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new(InputLinks::Keep)?;
     let started = Events::default();
 
-    let error = error_of(run_action(
+    run_action(
         &argv(),
         &fixture.entrypoint,
-        &fixture.outside,
+        &fixture.working_directory,
         &[],
         &started,
-    ))?;
+    )?;
 
-    assert!(matches!(error, ExecError::OutsideWorkDirectory { .. }));
-    assert!(started_markers(&started).is_empty());
+    let events = started.lock();
+    let sandboxes: Vec<_> = events
+        .iter()
+        .filter(|(_, sandbox)| !sandbox.started().is_empty())
+        .collect();
+    assert_eq!(sandboxes.len(), 1);
+    let actions = sandboxes[0].1.started();
+    assert_eq!(actions.len(), 1);
+    assert_eq!(
+        actions[0].action_directory,
+        fixture.root.canonicalize()?.join("a1")
+    );
+    assert_eq!(
+        actions[0].working_directory,
+        fixture.root.canonicalize()?.join("a1/work/sub")
+    );
     Ok(())
 }
 
@@ -362,7 +399,7 @@ fn limits_section_builds_the_limits_plugin_and_enter_receives_the_requested_limi
 -> Result<(), Box<dyn Error>> {
     let fixture = Fixture::new(InputLinks::Keep)?;
     let text = sandbox_file(
-        &fixture.base.join("root"),
+        &fixture.root,
         "trusted",
         InputLinks::Keep,
         Some(TestLimits { max_pids: 1 }),

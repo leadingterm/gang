@@ -25,6 +25,7 @@ use crate::bazel::Bazel;
 use crate::build_output::BuildOutcome;
 use crate::errors::{E2eError, Result};
 use crate::event_log::{EventFollower, describe_early_exit, early_exit};
+use crate::execution::Run;
 use crate::flags::Remote;
 use crate::gang_cli::GangCli;
 use crate::host::Host;
@@ -148,6 +149,7 @@ impl<'a> Stack<'a> {
             large_fleet: LARGE_FLEET.to_owned(),
             large_memory_kb,
             requested_sandbox: Sandbox::Noop,
+            glibc_tool: invocation.action_tools.glibc_tool.clone(),
         };
         sample::stage(&invocation.sample, &placement.workspace(), &parameters)?;
 
@@ -386,15 +388,19 @@ impl<'a> Stack<'a> {
         }
     }
 
-    /// Builds `probes` through `remote`, returning how the build ended.
+    /// Builds `probes` through `remote`, as `run` when there is one, returning how the build ended.
     /// A follower accelerates failure on a newly recorded early exit; its own errors do not
     /// change the build result.
     ///
     /// # Errors
     ///
     /// When the event follower cannot be opened or Bazel cannot be run.
-    pub(crate) fn run_build(&self, remote: &Remote, probes: &[Probe]) -> Result<BuildOutcome> {
-        let labels: Vec<String> = probes.iter().map(|probe| probe.label()).collect();
+    pub(crate) fn run_build(
+        &self,
+        remote: &Remote,
+        probes: &[Probe],
+        run: Option<&Run>,
+    ) -> Result<BuildOutcome> {
         let mut follower = match self.transport {
             Transport::Tls => self
                 .administrator()?
@@ -417,7 +423,7 @@ impl<'a> Stack<'a> {
                     let _ = sender.send(describe_early_exit(event));
                 }
             });
-            let result = self.bazel.build_until(remote, &labels, receiver);
+            let result = self.bazel.build_until(remote, probes, run, receiver);
             stop.notify_one();
             // The follower is an accelerator, not a verdict, even if its thread fails.
             let _ = watcher.join();
@@ -699,7 +705,11 @@ impl System for Stack<'_> {
     }
 
     fn build(&self, probes: &[Probe]) -> Result<BuildOutcome> {
-        self.run_build(&self.remote()?, probes)
+        self.run_build(&self.remote()?, probes, None)
+    }
+
+    fn build_run(&self, probes: &[Probe], run: &Run) -> Result<BuildOutcome> {
+        self.run_build(&self.remote()?, probes, Some(run))
     }
 
     fn clean(&self) -> Result<()> {

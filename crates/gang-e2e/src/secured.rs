@@ -243,7 +243,7 @@ impl Identity for Secured<'_> {
             Presenting::Nothing => (self.anonymous_remote()?, PINNED_PROBE),
         };
         self.stack.run_clean(&remote)?;
-        self.stack.run_build(&remote, probes)
+        self.stack.run_build(&remote, probes, None)
     }
 
     fn revoke(&self, target: &Credentials) -> Result<()> {

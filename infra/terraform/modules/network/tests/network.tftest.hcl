@@ -200,6 +200,24 @@ run "public_port_only_from_client_ingress_cidrs" {
   }
 }
 
+run "no_client_ingress_without_client_cidrs" {
+  command = plan
+
+  variables {
+    client_ingress_cidrs = []
+  }
+
+  assert {
+    condition     = length(aws_vpc_security_group_ingress_rule.controller_public) == 0
+    error_message = "No client CIDRs must create no direct client ingress rules."
+  }
+
+  assert {
+    condition     = aws_vpc_security_group_ingress_rule.controller_worker_public.from_port == 443
+    error_message = "Workers must retain access to the public listener on port 443 without client CIDRs."
+  }
+}
+
 run "derived_hostnames_fixed_eip_eu_north_1" {
   command = plan
 

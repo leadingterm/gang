@@ -2,7 +2,7 @@
 
 module(
     name = "gang",
-    version = "0.1.0",
+    version = "0.1.1",
 )
 
 RUST_VERSION = "1.97.1"
@@ -33,6 +33,7 @@ bazel_dep(name = "aspect_rules_js", version = "3.2.3")
 bazel_dep(name = "aspect_rules_ts", version = "3.10.0")
 bazel_dep(name = "rules_nodejs", version = "6.7.5")
 bazel_dep(name = "bazel_lib", version = "3.2.2")
+bazel_dep(name = "rules_shell", version = "0.6.1")
 
 bazel_dep(name = "aspect_gazelle_prebuilt", version = "0.0.24", dev_dependency = True)
 

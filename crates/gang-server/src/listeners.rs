@@ -324,6 +324,7 @@ where
         },
         IncomingSettings {
             max_pending_handshakes: policy.handshake.max_pending_handshakes,
+            refusal_linger: policy.handshake.refusal_linger,
             accept_error_backoff: policy.accept_error_backoff,
         },
         |failure| tracing::debug!(?failure, "a connection did not complete its handshake"),
@@ -410,6 +411,7 @@ mod tests {
             handshake: HandshakeSettings {
                 handshake_timeout: NonZeroDuration::from_secs(10),
                 max_pending_handshakes: NonZeroUsize::new(256).expect("256 is non-zero"),
+                refusal_linger: NonZeroDuration::from_secs(2),
             },
             accept_error_backoff: NonZeroDuration::from_millis(100),
         };

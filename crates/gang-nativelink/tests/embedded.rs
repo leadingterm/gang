@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt::Write as _;
 use std::net::Ipv4Addr;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,15 +15,19 @@ use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use gang_nativelink::{NativeLink, NativeLinkConfig};
 use gang_spi::{
-    Accepted, ApiRequestBody, ApiResponseBody, ApiService, ControllerConnections, ControllerReady,
-    ControllerSpec, Listening, Peer, Plugin, PluginContext, PortError, Rejection,
+    Accepted, ApiRequestBody, ApiResponseBody, ApiService, ClientTls, ControllerConnections,
+    ControllerReady, ControllerSpec, Listening, Peer, Plugin, PluginContext, PortError, Rejection,
     RenderedStoreSpec, RequestGate, SchedulerPort, SchedulerSnapshot, Slots, StoreAccess, Subject,
     WorkerSpec, WorkerState, WorkerTls, full_body,
 };
-use gang_testkit::{ChildTest, TestResult};
+use gang_testkit::{ChildTest, ExtendedKeyUsagePurpose, TestAuthority, TestResult};
+use gang_tls::{
+    AcceptorSettings, Alpn, CertificateRevoked, ClientAuth, Failure, IncomingSettings,
+    RevocationSet, TlsAcceptor,
+};
 use gang_types::{
     Bytes, CertSerial, FleetCatalog, FleetName, FleetProperties, FleetSet, InstanceId, Isa,
-    Resources, WorkerId,
+    NonZeroDuration, Resources, WorkerId,
 };
 use hyper::client::conn::{http1, http2};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -49,7 +53,7 @@ use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tonic::Code;
 use tonic::codec::Streaming;
@@ -564,6 +568,100 @@ async fn controller_serves_capabilities_over_grpc() -> TestResult {
     let harness = Harness::start().await?;
     let capabilities = plain_capabilities(harness.public_port).await?;
     assert!(advertises_execution(&capabilities));
+    Ok(())
+}
+
+/// A worker whose certificate the controller refuses as revoked ends with that cause before it reconnects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_whose_certificate_is_revoked_ends_instead_of_reconnecting() -> TestResult {
+    let ca = TestAuthority::new("test ca")?;
+    let server = ca.issue(
+        vec!["127.0.0.1".to_owned()],
+        vec![ExtendedKeyUsagePurpose::ServerAuth],
+        [1; 16],
+        "server",
+    )?;
+    let worker = ca.issue(
+        Vec::new(),
+        vec![ExtendedKeyUsagePurpose::ClientAuth],
+        [2; 16],
+        "worker",
+    )?;
+    let scratch = tempfile::tempdir()?;
+    let certificate = scratch.path().join("worker.pem");
+    let private_key = scratch.path().join("worker-key.pem");
+    let server_ca = scratch.path().join("ca.pem");
+    std::fs::write(&certificate, worker.pem.as_str())?;
+    std::fs::write(&private_key, worker.key_pem.expose())?;
+    std::fs::write(&server_ca, ca.pem.as_str())?;
+
+    let revocations = RevocationSet::default();
+    revocations.revoke(worker.serial.clone());
+    let acceptor = TlsAcceptor::try_new(&AcceptorSettings {
+        certificate: &server.pem,
+        private_key: &server.key_pem,
+        client_ca: &ca.pem,
+        revocations: &revocations,
+        handshake_timeout: NonZeroDuration::from_secs(10),
+        client_auth: ClientAuth::Required,
+        alpn: Alpn::H2,
+        clock: Arc::new(gang_clock::SystemClock::default()),
+    })?;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let port = listener.local_addr()?.port();
+    let (refused_tx, mut refused) = mpsc::unbounded_channel();
+    let _incoming = acceptor.incoming(
+        listener,
+        IncomingSettings {
+            max_pending_handshakes: NonZeroUsize::new(8).expect("eight is not zero"),
+            accept_error_backoff: NonZeroDuration::from_millis(100),
+            refusal_linger: NonZeroDuration::from_secs(2),
+        },
+        move |failure| {
+            if matches!(failure, Failure::Handshake { .. }) {
+                let _ = refused_tx.send(());
+            }
+        },
+    );
+
+    let plugin = build_plugin(config_with(
+        port,
+        json!({"worker_endpoint": format!("grpcs://127.0.0.1:{port}")}),
+    )?)?;
+    let paths = WorkerPaths::new(scratch.path(), "revoked");
+    let spec = WorkerSpec {
+        instance: InstanceId::try_new(WORKER_INSTANCE)?,
+        properties: default_fleet()?,
+        slots: Slots::LongLived(MAX_INFLIGHT),
+        work_directory: paths.work,
+        fast_cas_directory: paths.fast,
+        fast_cas_budget: Bytes::new(FAST_CAS_BUDGET),
+        content_store: RenderedStoreSpec(json!({"memory": {}})),
+        action_store: RenderedStoreSpec(json!({"memory": {}})),
+        store_access: StoreAccess::Direct,
+        entrypoint: std::env::current_exe()?,
+    };
+    let stop = async {
+        let _ = refused.recv().await;
+        let _ = refused.recv().await;
+    };
+    let result = plugin
+        .run_worker(
+            &spec,
+            WorkerTls::Mutual(ClientTls {
+                certificate: &certificate,
+                private_key: &private_key,
+                server_ca: &server_ca,
+            }),
+            stop,
+        )
+        .await;
+    let error = result.expect_err("a revoked worker ends with an error instead of reconnecting");
+    assert!(
+        std::iter::successors(Some(&error as &(dyn Error + 'static)), |&e| e.source())
+            .any(<dyn Error>::is::<CertificateRevoked>),
+        "the worker's error names the revoked certificate"
+    );
     Ok(())
 }
 

@@ -126,5 +126,5 @@ pub use rate_limit_config::{
 };
 pub use role_config::{RoleConfig, RolePrincipal};
 pub use sandbox_file::{SANDBOX_FILE_NAME, SandboxFile, SandboxFileError};
-pub use server_config::{ServerConfig, ServerTransport, Transport};
+pub use server_config::{EndpointTrust, ServerConfig, ServerTransport, Transport};
 pub use worker_config::WorkerConfig;

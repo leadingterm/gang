@@ -21,6 +21,20 @@ pub enum ServerTransport {
     Plaintext,
 }
 
+/// What clients see at `endpoint`, and so which roots they verify it with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EndpointTrust {
+    /// Gang's own listener certificate: clients verify `endpoint` against the Gang CA, which
+    /// `GET /v1/server` advertises.
+    #[default]
+    Ca,
+    /// A publicly trusted TLS terminator, such as a load balancer that re-encrypts to Gang,
+    /// presents `endpoint`: clients verify it against their system roots, and `GET /v1/server`
+    /// advertises no CA.
+    System,
+}
+
 /// How `gang server` carries its connections, with the trust domain its TLS mode requires.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Transport {
@@ -60,6 +74,9 @@ const DEFAULT_HANDSHAKE_TIMEOUT: NonZeroDuration = NonZeroDuration::from_secs(10
 /// The default number of TLS handshakes that may be in flight at once: 256.
 const DEFAULT_MAX_PENDING_HANDSHAKES: NonZeroUsize =
     NonZeroUsize::new(256).expect("256 is non-zero");
+
+/// The default time a refused TLS connection stays open: two seconds.
+const DEFAULT_REFUSAL_LINGER: NonZeroDuration = NonZeroDuration::from_secs(2);
 
 /// The default pause after a failed `accept` before accepting again: one hundred milliseconds.
 const DEFAULT_ACCEPT_ERROR_BACKOFF: NonZeroDuration = NonZeroDuration::from_millis(100);
@@ -101,11 +118,16 @@ pub struct ServerConfig {
     /// the system roots. The server derives its own pin and ignores this field. Defaults to none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ca_pin: Option<CaPinSetting>,
+    /// What clients see at `endpoint`: `ca` or `system`. Applies under `tls`; a plaintext server
+    /// advertises no CA either way. Defaults to `ca`.
+    pub endpoint_trust: EndpointTrust,
     /// The longest a TLS handshake with a client or server may take. Defaults to ten seconds.
     pub handshake_timeout: NonZeroDuration,
     /// How many TLS handshakes may be in flight at once; further connections wait in the OS
     /// backlog. Defaults to 256.
     pub max_pending_handshakes: NonZeroUsize,
+    /// How long a refused TLS connection stays open for its client to read the alert.
+    pub refusal_linger: NonZeroDuration,
     /// Pause after a failed `accept` before accepting again. Defaults to one hundred
     /// milliseconds.
     pub accept_error_backoff: NonZeroDuration,
@@ -138,8 +160,10 @@ struct RawServer {
     certificate_backdate: Duration,
     #[serde(skip_serializing_if = "Option::is_none")]
     ca_pin: Option<CaPinSetting>,
+    endpoint_trust: EndpointTrust,
     handshake_timeout: NonZeroDuration,
     max_pending_handshakes: NonZeroUsize,
+    refusal_linger: NonZeroDuration,
     accept_error_backoff: NonZeroDuration,
     principal_seen_interval: NonZeroDuration,
     max_tracked_principals: NonZeroUsize,
@@ -158,8 +182,10 @@ impl Default for RawServer {
             reissue_at_percent: DEFAULT_REISSUE_AT_PERCENT,
             certificate_backdate: DEFAULT_CERTIFICATE_BACKDATE,
             ca_pin: None,
+            endpoint_trust: EndpointTrust::default(),
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             max_pending_handshakes: DEFAULT_MAX_PENDING_HANDSHAKES,
+            refusal_linger: DEFAULT_REFUSAL_LINGER,
             accept_error_backoff: DEFAULT_ACCEPT_ERROR_BACKOFF,
             principal_seen_interval: DEFAULT_PRINCIPAL_SEEN_INTERVAL,
             max_tracked_principals: DEFAULT_MAX_TRACKED_PRINCIPALS,
@@ -192,8 +218,10 @@ impl TryFrom<RawServer> for ServerConfig {
             reissue_at_percent: raw.reissue_at_percent,
             certificate_backdate: raw.certificate_backdate,
             ca_pin: raw.ca_pin,
+            endpoint_trust: raw.endpoint_trust,
             handshake_timeout: raw.handshake_timeout,
             max_pending_handshakes: raw.max_pending_handshakes,
+            refusal_linger: raw.refusal_linger,
             accept_error_backoff: raw.accept_error_backoff,
             principal_seen_interval: raw.principal_seen_interval,
             max_tracked_principals: raw.max_tracked_principals,
@@ -218,8 +246,10 @@ impl From<ServerConfig> for RawServer {
             reissue_at_percent: config.reissue_at_percent,
             certificate_backdate: config.certificate_backdate,
             ca_pin: config.ca_pin,
+            endpoint_trust: config.endpoint_trust,
             handshake_timeout: config.handshake_timeout,
             max_pending_handshakes: config.max_pending_handshakes,
+            refusal_linger: config.refusal_linger,
             accept_error_backoff: config.accept_error_backoff,
             principal_seen_interval: config.principal_seen_interval,
             max_tracked_principals: config.max_tracked_principals,
@@ -228,5 +258,36 @@ impl From<ServerConfig> for RawServer {
             request_timeout: config.request_timeout,
             rate_limit: config.rate_limit,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EndpointTrust, ServerConfig};
+
+    #[test]
+    fn endpoint_trust_defaults_to_ca() -> Result<(), Box<dyn std::error::Error>> {
+        let config: ServerConfig = toml::from_str("transport = \"plaintext\"")?;
+        assert_eq!(config.endpoint_trust, EndpointTrust::Ca);
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_trust_system_parses_and_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+        let config: ServerConfig =
+            toml::from_str("transport = \"plaintext\"\nendpoint_trust = \"system\"")?;
+        assert_eq!(config.endpoint_trust, EndpointTrust::System);
+        assert!(toml::to_string(&config)?.contains("endpoint_trust = \"system\""));
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_trust_rejects_an_unknown_value() {
+        assert!(
+            toml::from_str::<ServerConfig>(
+                "transport = \"plaintext\"\nendpoint_trust = \"public\""
+            )
+            .is_err()
+        );
     }
 }

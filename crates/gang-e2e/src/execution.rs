@@ -394,15 +394,47 @@ pub trait Execution: Sync {
     fn worker_logs(&self) -> Result<String>;
 }
 
+/// One held build's identity. Its actions are distinct from those of every other build, so no
+/// earlier result or attempt stands in for them, and every journal line its probes write starts
+/// with it and a space.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Run(String);
+
+impl Run {
+    /// A run no other build has: 16 hex digits from the operating system's randomness.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`E2eError::System`] when the operating system cannot provide randomness.
+    pub fn fresh() -> Result<Self> {
+        crate::sample::salt().map(Self)
+    }
+}
+
+impl AsRef<str> for Run {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Run {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// The journal of one held build, read by the scenario while the build runs.
 pub struct Lines<'e, E: Execution> {
     exec: &'e E,
+    run: &'e Run,
     ended: bool,
 }
 
 impl<E: Execution> Lines<'_, E> {
-    /// Blocks for the next journal line that starts with `prefix`, skipping the others. Returns
-    /// `None` once the build ended without such a line.
+    /// Blocks for the next journal line of this run whose text starts with `prefix`, skipping the
+    /// others, and returns its text without the run. Lines of other runs are skipped too: an
+    /// earlier build's attempt can write after that build ended. Returns `None` once the build
+    /// ended without such a line.
     ///
     /// # Errors
     ///
@@ -410,12 +442,22 @@ impl<E: Execution> Lines<'_, E> {
     pub fn await_prefix(&mut self, prefix: &str) -> Result<Option<String>> {
         while !self.ended {
             match self.exec.next_line()? {
-                Some(line) if line.starts_with(prefix) => return Ok(Some(line)),
-                Some(_) => {}
+                Some(line) => {
+                    if let Some(text) = self.text_of(&line)
+                        && text.starts_with(prefix)
+                    {
+                        return Ok(Some(text.to_owned()));
+                    }
+                }
                 None => self.ended = true,
             }
         }
         Ok(None)
+    }
+
+    /// The text of `line` when this run wrote it: the line without its run and the space after.
+    fn text_of<'l>(&self, line: &'l str) -> Option<&'l str> {
+        line.strip_prefix(self.run.as_ref())?.strip_prefix(' ')
     }
 
     /// Reads the journal up to the end of the build, so the next build starts on an empty one.
@@ -429,8 +471,9 @@ impl<E: Execution> Lines<'_, E> {
     }
 }
 
-/// Builds `probes` on a thread while `during` observes the build through its journal, releases the
-/// go flag after `during` returns on success or error, then drains and joins the build.
+/// Builds `probes` as a fresh [`Run`] on a thread while `during` observes the build through that
+/// run's journal lines, releases the go flag after `during` returns on success or error, then
+/// drains and joins the build.
 ///
 /// The build thread ends the journal when its build returns, so a wait of `during` for a line
 /// that never comes ends with the build, and so does the final read. The journal is read to its
@@ -441,20 +484,25 @@ impl<E: Execution> Lines<'_, E> {
 /// # Errors
 ///
 /// The errors of `during` and of the build, and [`E2eError::System`] when the build thread
-/// panicked.
+/// panicked or no run can be drawn.
 pub fn held_build<S: System, E: Execution, T>(
     system: &S,
     exec: &E,
     probes: &[Probe],
     during: impl FnOnce(&mut Lines<'_, E>) -> Result<T>,
 ) -> Result<(BuildOutcome, T)> {
+    let run = Run::fresh()?;
     std::thread::scope(|scope| {
         let build = scope.spawn(|| {
-            let outcome = system.build(probes);
+            let outcome = system.build_run(probes, &run);
             exec.end_lines()?;
             outcome
         });
-        let mut lines = Lines { exec, ended: false };
+        let mut lines = Lines {
+            exec,
+            run: &run,
+            ended: false,
+        };
         let observed = during(&mut lines);
         let released = exec.set_go(true);
         if observed.is_err() || released.is_err() {

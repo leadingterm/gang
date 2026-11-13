@@ -10,8 +10,8 @@ use crate::api_test_support::{
     revoke_principal, send, violated_fields,
 };
 use crate::test_support::{
-    api_request, mint_token, plain_parts, plain_settings, raw_api_request, serve, tls_parts,
-    tls_settings,
+    api_request, mint_token, plain_parts, plain_settings, publicly_trusted_settings,
+    raw_api_request, serve, tls_parts, tls_settings,
 };
 
 #[tokio::test]
@@ -31,6 +31,26 @@ async fn server_is_open_and_answers_the_token_authentication_and_the_ca() {
             let server: Server<Value> = answer.ok();
             assert!(matches!(server.authentication, Authentication::Token(_)));
             assert!(server.ca_certificate.is_some());
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn server_behind_a_publicly_trusted_endpoint_answers_no_ca() {
+    let (parts, _dials, handles) = tls_parts();
+    serve(
+        parts,
+        publicly_trusted_settings(),
+        handles.scheduler,
+        |controller| async move {
+            let answer = get(&controller, GET_SERVER.template, None).await;
+
+            let body = answer.value();
+            assert!(body.get("caCertificate").is_none());
+            let server: Server<Value> = answer.ok();
+            assert!(server.ca_certificate.is_none());
+            assert!(matches!(server.authentication, Authentication::Token(_)));
         },
     )
     .await;

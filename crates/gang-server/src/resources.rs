@@ -23,11 +23,18 @@ pub(crate) fn wire_principal(record: PrincipalRecord) -> Principal {
     }
 }
 
-/// The wire form of one issued certificate. `pem_certificate` is the certificate itself, which
-/// only the answer that issues it carries.
+/// The certificate and the certificate of its authority, which only the answer that issues it carries.
+pub(crate) struct IssuedPems {
+    /// The issued certificate.
+    pub(crate) certificate: CertificatePem,
+    /// The certificate of the issuing authority.
+    pub(crate) ca_certificate: CertificatePem,
+}
+
+/// The wire form of one issued certificate, with PEMs only in the answer that issues it.
 pub(crate) fn wire_certificate(
     record: IssuedCertRecord,
-    pem_certificate: Option<CertificatePem>,
+    issued: Option<IssuedPems>,
 ) -> Certificate {
     let IssuedCertRecord {
         serial,
@@ -36,6 +43,10 @@ pub(crate) fn wire_certificate(
         expires_at,
         status,
     } = record;
+    let (pem_certificate, ca_certificate) = match issued {
+        Some(issued) => (Some(issued.certificate), Some(issued.ca_certificate)),
+        None => (None, None),
+    };
     Certificate {
         name: name::of::<Certificates>(&serial),
         principal: name::of::<Principals>(&identity),
@@ -46,6 +57,7 @@ pub(crate) fn wire_certificate(
             CertStatus::Revoked { at } => Some(at),
         },
         pem_certificate,
+        ca_certificate,
     }
 }
 
@@ -94,6 +106,23 @@ mod tests {
         assert_eq!(active.principal, "principals/google%3Aops%40example.org");
         assert_eq!(active.revoke_time, None);
         assert_eq!(active.pem_certificate, None);
+        assert_eq!(active.ca_certificate, None);
+
+        let certificate =
+            CertificatePem::try_new("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----")
+                .expect("certificate PEM is valid");
+        let ca_certificate =
+            CertificatePem::try_new("-----BEGIN CERTIFICATE-----\nBBBB\n-----END CERTIFICATE-----")
+                .expect("CA certificate PEM is valid");
+        let created = wire_certificate(
+            record(CertStatus::Active),
+            Some(IssuedPems {
+                certificate: certificate.clone(),
+                ca_certificate: ca_certificate.clone(),
+            }),
+        );
+        assert_eq!(created.pem_certificate, Some(certificate));
+        assert_eq!(created.ca_certificate, Some(ca_certificate));
 
         let revoked = wire_certificate(
             record(CertStatus::Revoked {
@@ -105,5 +134,7 @@ mod tests {
             revoked.revoke_time,
             Some(Timestamp::from_unix_millis(4_000))
         );
+        assert_eq!(revoked.pem_certificate, None);
+        assert_eq!(revoked.ca_certificate, None);
     }
 }

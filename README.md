@@ -72,12 +72,14 @@ Gang is deployed from a separate repository that calls its modules and reusable 
 
 ```hcl
 module "gang" {
-  source = "git::https://github.com/example-org/gang//infra/terraform/modules/deployment?ref=v0.1.0"
+  source = "git::https://github.com/example-org/gang//infra/terraform/modules/deployment?ref=v0.1.1"
   # variables as in the example root
 }
 ```
 
-Call `.github/workflows/deploy.yml` as its header comment shows, pinned to the same tag.
+Call `.github/workflows/deploy.yml` as its header comment shows, pinned to the same tag, with `gang_sha256` set to the release's checksum of the binary for the deploy runner (the `gang-x86_64-unknown-linux-musl` line of the release's `SHA256SUMS` for the default runner). The workflow downloads that binary and refuses any other; it never compiles Gang.
+
+Every `v*` tag has a GitHub release with `gang-x86_64-unknown-linux-musl`, `gang-aarch64-unknown-linux-musl`, `gang-aarch64-apple-darwin` and `SHA256SUMS` (specification section 7.2). Check a downloaded binary with `sha256sum --check --ignore-missing SHA256SUMS`, and pin its checksum where you deploy it.
 
 See section 8 of [`docs/SPECIFICATION.md`](docs/SPECIFICATION.md) for the deployment contract, and the example root [`infra/terraform/environments/example`](infra/terraform/environments/example).
 

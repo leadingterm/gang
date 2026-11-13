@@ -16,7 +16,7 @@ use crate::check::Check;
 use crate::host::Host;
 use crate::mirror::follow;
 use crate::names;
-use crate::report::{IsolationReport, Namespaces, PoisonReport, VictimReport};
+use crate::report::{InputRootReport, IsolationReport, Namespaces, PoisonReport, VictimReport};
 use crate::system::{
     HOLD_CPU_COUNT, HOLD_MEMORY_KB, LIMIT_CPU_PERIOD_MICROS, LIMIT_HEADROOM_PERCENT,
     LIMIT_MAX_PIDS, PermitNetwork, Sandbox, ScopeFacts,
@@ -57,12 +57,17 @@ pub fn namespaces(sandbox: Sandbox, host: &Host, isolated: &Namespaces) -> Vec<C
     }
 }
 
+/// The directory `NativeLink` creates in each action directory, beside the input root, for the
+/// action's `TMPDIR` (`set_tmpdir`, on by default).
+const ACTION_TMP_NAME: &str = "tmp";
+
 /// Whether the action's parent directories show no more than the sandbox allows.
 ///
-/// Under bwrap the worker's CAS sits beside the action's grandparent directory, so the parent must
-/// list only the working directory, the grandparent only the parent and the great-grandparent only
-/// the grandparent. The noop control must list all three levels, the great-grandparent holding a
-/// sibling of the grandparent, which proves the probe would see the CAS if it were there.
+/// Under bwrap the action sees its whole action directory, so the parent lists exactly the working
+/// directory and `NativeLink`'s per-action `tmp`; the worker's CAS sits beside the action's
+/// grandparent directory, so the grandparent must list only the parent and the great-grandparent
+/// only the grandparent. The noop control must list all three levels, the great-grandparent holding
+/// a sibling of the grandparent, which proves the probe would see the CAS if it were there.
 pub fn siblings_hidden(sandbox: Sandbox, isolated: &IsolationReport) -> Check {
     let cwd_name = &isolated.cwd_name;
     let parent_name = &isolated.parent_name;
@@ -72,9 +77,13 @@ pub fn siblings_hidden(sandbox: Sandbox, isolated: &IsolationReport) -> Check {
     let great_grandparent = &isolated.great_grandparent_entries;
     match sandbox {
         Sandbox::Bwrap => {
-            let leak = if parent.as_slice() != std::slice::from_ref(cwd_name) {
+            let mut listed: Vec<&str> = parent.iter().map(String::as_str).collect();
+            listed.sort_unstable();
+            let mut expected = [cwd_name.as_str(), ACTION_TMP_NAME];
+            expected.sort_unstable();
+            let leak = if listed != expected {
                 Some(format!(
-                    "the action's parent directory lists {parent:?}, expected only `{cwd_name}`"
+                    "the action's parent directory lists {parent:?}, expected exactly `{cwd_name}` and `{ACTION_TMP_NAME}`"
                 ))
             } else if grandparent.as_slice() != std::slice::from_ref(parent_name) {
                 Some(format!(
@@ -278,6 +287,56 @@ pub fn input_integrity(links: InputLinks, victim: &VictimReport) -> Check {
             "the later action reported `poisoned = no`".to_owned()
         }),
     }
+}
+
+/// Whether an action whose command runs below its input root reads every input: its input lies
+/// outside the working directory, it reads it directly and through a relative symlink, and with
+/// [`InputLinks::Break`] that input has a private inode. With [`InputLinks::Keep`] the link check
+/// is skipped.
+#[must_use]
+pub fn input_root(links: InputLinks, report: &InputRootReport) -> Vec<Check> {
+    let mut checks = vec![
+        Check::expect(
+            names::input_root::OUTSIDE_WORKING_DIRECTORY,
+            report.shared_path.starts_with("../"),
+            || {
+                format!(
+                    "the input `{}` is inside the working directory: the working directory is the input root",
+                    report.shared_path
+                )
+            },
+        ),
+        Check::expect(
+            names::input_root::SIBLING_READ,
+            !report.sibling.is_empty(),
+            || format!("the action could not read `{}`", report.shared_path),
+        ),
+        Check::expect(
+            names::input_root::SYMLINK_FOLLOWED,
+            !report.symlink.is_empty() && report.symlink == report.sibling,
+            || {
+                format!(
+                    "through the symlink the action read `{}`, directly `{}`",
+                    report.symlink, report.sibling
+                )
+            },
+        ),
+    ];
+    checks.push(match links {
+        InputLinks::Break => Check::expect(
+            names::input_root::LINKS_BROKEN,
+            report.sibling_links == Some(1),
+            || match report.sibling_links {
+                Some(n) => format!("the input has {n} links"),
+                None => "the input's link count could not be read".to_owned(),
+            },
+        ),
+        InputLinks::Keep => Check::skipped(
+            names::input_root::LINKS_BROKEN,
+            "input_links = keep leaves the links",
+        ),
+    });
+    checks
 }
 
 /// Whether the poisoning action got as far as modifying its input.

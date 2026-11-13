@@ -343,7 +343,9 @@ fn transport_settings(server: &ServerConfig) -> TransportSettings {
             handshake: HandshakeSettings {
                 handshake_timeout: server.handshake_timeout,
                 max_pending_handshakes: server.max_pending_handshakes,
+                refusal_linger: server.refusal_linger,
             },
+            endpoint_trust: server.endpoint_trust,
         }),
     }
 }

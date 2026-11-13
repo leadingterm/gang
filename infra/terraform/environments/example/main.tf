@@ -28,6 +28,9 @@ module "gang" {
   controller_secret_parameters = { dashboard-client-secret = "/example/gang/dashboard-client-secret" }
   tags                         = local.tags
 
+  # Publicly trusted TLS: an ACM certificate for hostname on a load balancer, so browsers and Bazel need no CA. Publish the certificate_validation_records, then point hostname at load_balancer_dns_name.
+  load_balancer = {}
+
   fleets = [
     {
       name                        = "gang-worker-x86-64"

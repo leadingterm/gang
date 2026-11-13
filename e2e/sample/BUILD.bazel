@@ -1,5 +1,5 @@
 load(":config.bzl", "CPU_COUNT", "ISA", "LARGE_FLEET", "LARGE_MEMORY_KB", "MEMORY_KB", "REQUESTED_SANDBOX", "SIGNAL_COMMAND")
-load(":rules.bzl", "probe")
+load(":rules.bzl", "input_root_probe", "probe")
 
 # Namespaces of the action, as `readlink` prints them (`net:[4026531992]`); `unavailable` without /proc.
 NAMESPACES = """
@@ -124,6 +124,20 @@ echo "poisoned=$poisoned"
 """,
 )
 
+# Under `--experimental_sibling_repository_layout` (the harness passes it for this probe only),
+# Bazel runs the action in a working directory below its input root, with the external input
+# beside it: the action must read it directly and through a relative symlink.
+input_root_probe(
+    name = "input_root",
+    shared = "@shared_input//:input",
+    script = """
+echo "shared_path=$E2E_SHARED"
+echo "sibling=$(cat "$E2E_SHARED" 2>/dev/null)"
+echo "symlink=$(cat "$E2E_LINK" 2>/dev/null)"
+echo "sibling_links=$(stat -L -c %h "$E2E_SHARED" 2>/dev/null || echo unreadable)"
+""",
+)
+
 LIMITS = {
     "ISA": ISA,
     "cpu_count": str(CPU_COUNT),
@@ -166,11 +180,12 @@ echo hogged=yes
 """,
 )
 
-# Plateaus at 48 MiB, above the 38.4 MiB soft limit of its 32 MiB reservation and below the 64 MiB
-# cgroup ceiling, so only NativeLink can end the first attempt, which holds the plateau until it is
-# killed. The requeued attempt, with the reservation doubled to 64 MiB, completes at once. `tail -n
-# 1` on newline-free input keeps all of it in memory. Each attempt appends a line to
-# $E2E_ATTEMPTS, a host path, before it grows.
+# Holds 48 MiB, above the 38.4 MiB soft limit of its 32 MiB reservation and below the 64 MiB cgroup
+# ceiling, so only NativeLink can end the first attempt, which holds it until it is killed. The
+# requeued attempt, with the reservation doubled to 64 MiB, completes at once. `dd` reads the whole
+# size into one buffer and blocks writing it to `sleep`, which never reads, so the footprint is that
+# buffer however the processes are scheduled. Each attempt appends a line to $E2E_ATTEMPTS, a host
+# path, before it grows.
 probe(
     name = "memory_grower",
     exec_properties = MEMORY_HOG,
@@ -178,7 +193,7 @@ probe(
 echo attempt >> "$E2E_ATTEMPTS"
 attempts=$(wc -l < "$E2E_ATTEMPTS")
 if [ "$attempts" -eq 1 ]; then hold=300; else hold=0; fi
-( head -c 50331648 /dev/zero | tr '\\0' a; sleep "$hold" ) | tail -n 1 > /dev/null
+dd if=/dev/zero bs=50331648 count=1 2>/dev/null | sleep "$hold"
 echo "grown=yes"
 """,
 )
@@ -220,7 +235,8 @@ echo "neighbour=$neighbour"
 )
 # The execution probes talk to the harness through two paths beside the hold signal: the journal, a named pipe
 # they write lines to, and the go flag, a file whose existence releases them. Both are reachable under bwrap,
-# whose only host mounts are the working directory and the read-only binds.
+# whose only host mounts are the working directory and the read-only binds. Every journal line starts with
+# $E2E_RUN and a space, so the harness reads only the lines of the held build it observes.
 JOURNAL = 'J="$(dirname "$E2E_SIGNAL")/journal"; G="$(dirname "$E2E_SIGNAL")/go"\n'
 
 # Starts a background child that ignores SIGTERM and carries a marker, then waits forever: only the action
@@ -228,7 +244,7 @@ JOURNAL = 'J="$(dirname "$E2E_SIGNAL")/journal"; G="$(dirname "$E2E_SIGNAL")/go"
 probe(
     name = "timeout_child",
     script = JOURNAL + """
-sh -c 'trap "" TERM; echo "child started" > "$2"; while :; do sleep 1; done' sh e2e-timeout-child "$J" &
+sh -c 'trap "" TERM; echo "$E2E_RUN child started" > "$2"; while :; do sleep 1; done' sh e2e-timeout-child "$J" &
 while :; do sleep 1; done
 """,
 )
@@ -238,8 +254,8 @@ while :; do sleep 1; done
 probe(
     name = "term_trap",
     script = JOURNAL + """
-trap 'echo "trap term" > "$J"; sleep 1; echo "trap clean" > "$J"; exit 0' TERM
-echo "trap started ${TMPDIR:-none}" > "$J"
+trap 'echo "$E2E_RUN trap term" > "$J"; sleep 1; echo "$E2E_RUN trap clean" > "$J"; exit 0' TERM
+echo "$E2E_RUN trap started ${TMPDIR:-none}" > "$J"
 while :; do sleep 1 & wait $!; done
 """,
 )
@@ -250,14 +266,14 @@ probe(
     name = "term_ignorer",
     script = JOURNAL + """
 termed=0
-trap 'termed=1; echo "ignore term" > "$J"' TERM
-echo "ignore started" > "$J"
+trap 'termed=1; echo "$E2E_RUN ignore term" > "$J"' TERM
+echo "$E2E_RUN ignore started" > "$J"
 seconds=0
 while :; do
   sleep 1 & wait $!
   if [ "$termed" -eq 1 ]; then
     seconds=$((seconds + 1))
-    if [ "$seconds" -eq 2 ]; then echo "ignore survived" > "$J"; fi
+    if [ "$seconds" -eq 2 ]; then echo "$E2E_RUN ignore survived" > "$J"; fi
   fi
 done
 """,
@@ -297,6 +313,18 @@ if touch ./writable-probe 2>/dev/null; then echo cwd_writable=yes; else echo cwd
 """,
 )
 
+# Runs a dynamically linked glibc program, as the toolchains Bazel downloads are (rules_rust's rustc and
+# cargo, prebuilt tools): it starts only where the sandbox provides an ELF interpreter at the standard path.
+probe(
+    name = "glibc_tool",
+    srcs = ["glibc-tool"],
+    script = """
+if out=$(./glibc-tool 2>&1); then echo "glibc_tool=ran"
+else echo "glibc_tool=failed: $(printf '%s' "$out" | tr '\\n' ' ')"
+fi
+""",
+)
+
 # Leaves behind a process in its own process group, marked and named in the journal, then waits for the go
 # flag. Once the flag exists it succeeds at once, so a requeued attempt leaves nothing behind.
 probe(
@@ -304,7 +332,7 @@ probe(
     script = JOURNAL + """
 if [ -e "$G" ]; then echo stray=skipped; exit 0; fi
 set -m
-sh -c 'echo "stray $$" > "$2"; while :; do sleep 1; done' sh e2e-stray "$J" &
+sh -c 'echo "$E2E_RUN stray $$" > "$2"; while :; do sleep 1; done' sh e2e-stray "$J" &
 set +m
 while [ ! -e "$G" ]; do sleep 1; done
 echo stray=released
@@ -315,7 +343,7 @@ echo stray=released
 probe(
     name = "held_release",
     script = JOURNAL + """
-echo "held started" > "$J"
+echo "$E2E_RUN held started" > "$J"
 while [ ! -e "$G" ]; do sleep 1; done
 echo held=released
 """,
@@ -326,17 +354,17 @@ probe(
     name = "held_hog",
     exec_properties = MEMORY_HOG,
     script = JOURNAL + """
-echo "hog started" > "$J"
+echo "$E2E_RUN hog started" > "$J"
 while [ ! -e "$G" ]; do sleep 1; done
 dd if=/dev/zero of=/dev/null bs=1G count=1 2>/dev/null
 echo hogged=yes
 """,
 )
 
-# Outgrows the soft limit of every reservation it gets and holds the plateau, so each attempt ends only by a
-# kill: attempt n plateaus at 48 MiB times 2^(n-1), above the soft limit of the reservation escalated n-1
-# times by 200 percent and below that reservation's cgroup ceiling. Appends a line per attempt to
-# $E2E_ATTEMPTS first.
+# Outgrows the soft limit of every reservation it gets and holds it, so each attempt ends only by a
+# kill: attempt n holds one `dd` buffer of 48 MiB times 2^(n-1), as memory_grower does, above the
+# soft limit of the reservation escalated n-1 times by 200 percent and below that reservation's
+# cgroup ceiling. Appends a line per attempt to $E2E_ATTEMPTS first.
 probe(
     name = "memory_escalation",
     exec_properties = MEMORY_HOG,
@@ -346,7 +374,7 @@ attempts=$(wc -l < "$E2E_ATTEMPTS")
 size=50331648
 i=1
 while [ "$i" -lt "$attempts" ]; do size=$((size * 2)); i=$((i + 1)); done
-( head -c "$size" /dev/zero | tr '\\0' a; sleep 300 ) | tail -n 1 > /dev/null
+dd if=/dev/zero bs="$size" count=1 2>/dev/null | sleep 300
 echo "grown=yes"
 """,
 )

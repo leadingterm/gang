@@ -143,6 +143,8 @@ pub struct AuthorityRequest<'a> {
 pub struct IssuedCertificate {
     /// The certificate.
     pub certificate: CertificatePem,
+    /// The certificate of the authority that signed it.
+    pub ca_certificate: CertificatePem,
     /// The certificate's record, persisted by the issuing plugin.
     pub record: IssuedCertRecord,
 }

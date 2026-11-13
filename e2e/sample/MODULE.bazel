@@ -1,3 +1,7 @@
 """Sample workspace of the end-to-end suite: probe actions that report what they observe."""
 
 module(name = "gang_e2e_sample")
+
+shared_input = use_repo_rule("//:repositories.bzl", "shared_input")
+
+shared_input(name = "shared_input")

@@ -37,6 +37,25 @@ mock_provider "aws" {
     }
   }
 
+  mock_resource "aws_lb" {
+    defaults = {
+      arn      = "arn:aws:elasticloadbalancing:eu-north-1:000000000000:loadbalancer/net/gang/0000000000000000"
+      dns_name = "gang-0000000000.elb.eu-north-1.amazonaws.com"
+    }
+  }
+
+  mock_resource "aws_lb_target_group" {
+    defaults = {
+      arn = "arn:aws:elasticloadbalancing:eu-north-1:000000000000:targetgroup/gang/0000000000000000"
+    }
+  }
+
+  mock_resource "aws_acm_certificate" {
+    defaults = {
+      arn = "arn:aws:acm:eu-north-1:000000000000:certificate/00000000-0000-0000-0000-000000000000"
+    }
+  }
+
   mock_resource "aws_iam_outbound_web_identity_federation" {
     defaults = {
       issuer_identifier = "https://issuer.example.com/123456789012"
@@ -113,6 +132,62 @@ variables {
       disk_per_instance           = "200GiB"
       target_actions_per_instance = 16
     },
+  ]
+}
+
+run "direct_endpoint_without_load_balancer" {
+  command = plan
+
+  assert {
+    condition     = length(module.load_balancer) == 0
+    error_message = "The direct endpoint must not create a load balancer."
+  }
+
+  assert {
+    condition     = !strcontains(output.gang_toml, "endpoint_trust")
+    error_message = "The direct endpoint must use the default endpoint trust."
+  }
+
+  assert {
+    condition     = output.load_balancer_dns_name == null && length(output.certificate_validation_records) == 0
+    error_message = "The direct endpoint must not expose load balancer DNS or certificate validation records."
+  }
+}
+
+run "load_balancer_fronts_the_public_listener" {
+  command = apply
+
+  variables {
+    hostname             = "gang.example.com"
+    load_balancer        = {}
+    client_ingress_cidrs = ["198.51.100.0/24"]
+  }
+
+  assert {
+    condition     = can(regex("(?s)\\[server\\][^\\[]*ca_pin = \"signer\"\n# A load balancer presents a publicly trusted certificate for endpoint, so clients use their system roots.\nendpoint_trust = \"system\"\n\n\\[authentication", output.gang_toml))
+    error_message = "The load balancer endpoint must use system roots in gang.toml."
+  }
+
+  assert {
+    condition     = output.endpoint == "https://gang.example.com" && output.load_balancer_dns_name != null
+    error_message = "The load balancer must expose its DNS name and the configured public endpoint."
+  }
+
+  assert {
+    condition     = length(module.load_balancer) == 1 && module.load_balancer[0].security_group_id != null
+    error_message = "The load balancer and its security group must be created."
+  }
+}
+
+run "load_balancer_requires_hostname" {
+  command = plan
+
+  variables {
+    load_balancer = {}
+  }
+
+  expect_failures = [
+    var.load_balancer,
   ]
 }
 

@@ -190,6 +190,7 @@ mod tests {
             expire_time: Timestamp::from_unix_millis(9_000),
             revoke_time: Some(Timestamp::from_unix_millis(4_000)),
             pem_certificate: None,
+            ca_certificate: None,
         }
     }
 

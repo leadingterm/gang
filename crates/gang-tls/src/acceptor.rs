@@ -172,6 +172,8 @@ impl TlsAcceptor {
 
     /// Runs the server handshake on `io` and returns the stream, which closes as soon as the
     /// client's certificate is revoked.
+    /// A refused connection is closed at once; [`Self::incoming`] keeps it open for its client to
+    /// read the alert.
     ///
     /// # Errors
     ///
@@ -188,25 +190,30 @@ impl TlsAcceptor {
     where
         IO: AsyncRead + AsyncWrite + Unpin,
     {
-        self.handshake(io).await
+        self.handshake(io).await.map_err(|refusal| refusal.error)
     }
 
-    /// Shared handshake for [`Self::accept`] and the incoming connection stream.
+    /// Shared handshake for [`Self::accept`] and the incoming connection stream. A handshake the
+    /// TLS engine fails hands the connection back, so the listener can deliver the alert the
+    /// engine wrote to it.
     pub(crate) async fn handshake<IO>(
         &self,
         io: IO,
-    ) -> Result<RevocableStream<tokio_rustls::server::TlsStream<IO>>, TransportError>
+    ) -> Result<RevocableStream<tokio_rustls::server::TlsStream<IO>>, Refusal<IO>>
     where
         IO: AsyncRead + AsyncWrite + Unpin,
     {
         let stream = Clock::timeout(
             &self.clock,
             self.handshake_timeout.get(),
-            self.acceptor.accept(io),
+            self.acceptor.accept(io).into_fallible(),
         )
         .await
         .map_err(|_| TransportError::HandshakeTimeout)?
-        .map_err(TransportError::Handshake)?;
+        .map_err(|(error, io)| Refusal {
+            error: TransportError::Handshake(error),
+            io: Some(io),
+        })?;
         let watch = match stream
             .get_ref()
             .1
@@ -215,11 +222,26 @@ impl TlsAcceptor {
         {
             Some(leaf) => Some(self.revocations.watch(&leaf_serial(leaf)?)),
             None => match self.client_auth {
-                ClientAuth::Required => return Err(TransportError::NoPeerCertificate),
+                ClientAuth::Required => return Err(TransportError::NoPeerCertificate.into()),
                 ClientAuth::Optional | ClientAuth::None => None,
             },
         };
         Ok(RevocableStream::new(stream, watch))
+    }
+}
+
+/// A failed handshake, with the connection when the TLS engine handed it back.
+pub(crate) struct Refusal<IO> {
+    /// Why the handshake failed.
+    pub(crate) error: TransportError,
+    /// The connection after the TLS engine's attempt to write its alert to it; `None` when the
+    /// handshake timed out or failed after the engine completed it.
+    pub(crate) io: Option<IO>,
+}
+
+impl<IO> From<TransportError> for Refusal<IO> {
+    fn from(error: TransportError) -> Self {
+        Self { error, io: None }
     }
 }
 

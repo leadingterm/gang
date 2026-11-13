@@ -16,6 +16,9 @@ use crate::system::{Probe, Sandbox};
 /// The file name the generated parameters are written to, inside the staged workspace.
 const CONFIG_FILE: &str = "config.bzl";
 
+/// The file name the glibc tool is staged under, the input of the sample's `glibc_tool` probe.
+const GLIBC_TOOL_FILE: &str = "glibc-tool";
+
 /// The number of random bytes a salt is made of. Each byte becomes two hex digits.
 const SALT_BYTES: usize = 8;
 
@@ -43,6 +46,8 @@ pub struct SampleParameters {
     pub large_memory_kb: u64,
     /// The sandbox that the sample's `sandbox_requested` probe declares as its `sandbox`.
     pub requested_sandbox: Sandbox,
+    /// The dynamically linked glibc program staged as [`GLIBC_TOOL_FILE`]; `None` where the platform has no bwrap.
+    pub glibc_tool: Option<PathBuf>,
 }
 
 /// Copies the sample workspace at `source` to `destination` and writes its parameters.
@@ -52,6 +57,7 @@ pub struct SampleParameters {
 /// because it could make the staged copy differ from the source in ways the run cannot see.
 /// After the copy, `BUILD.bazel` is checked for every probe target, and `config.bzl` in
 /// `destination` is overwritten with the parameters.
+/// The glibc tool, when set, is copied in as `glibc-tool` with its permissions.
 ///
 /// # Errors
 ///
@@ -64,6 +70,14 @@ pub fn stage(source: &Path, destination: &Path, parameters: &SampleParameters) -
         destination.display()
     )))?;
     copy_tree(source, destination)?;
+    if let Some(tool) = &parameters.glibc_tool {
+        let staged = destination.join(GLIBC_TOOL_FILE);
+        fs::copy(tool, &staged).map_err(E2eError::io(format!(
+            "copying {} to {}",
+            tool.display(),
+            staged.display()
+        )))?;
+    }
     let build_path = destination.join("BUILD.bazel");
     let build_file = fs::read_to_string(&build_path)
         .map_err(E2eError::io(format!("reading {}", build_path.display())))?;

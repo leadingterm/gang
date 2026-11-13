@@ -19,7 +19,7 @@ pub(crate) enum Security<K: Stack> {
     /// Connections are served as received.
     Plaintext,
     /// Connections complete a TLS handshake under the server's certificate authority.
-    Tls(TlsIdentity<K>),
+    Tls(Box<TlsIdentity<K>>),
 }
 
 /// What TLS needs: its settings, the names the listeners present, the authority that issues
@@ -74,12 +74,12 @@ impl<K: Stack> Security<K> {
         .await
         .map_err(ServerError::Authority)?;
         let pin = gang_tls::ca_pin_of_certificate(authority.certificate())?;
-        Ok(Self::Tls(TlsIdentity {
+        Ok(Self::Tls(Box::new(TlsIdentity {
             settings,
             names,
             authority: Arc::new(authority),
             pin,
-        }))
+        })))
     }
 
     /// The certificate authority; `None` under plaintext.

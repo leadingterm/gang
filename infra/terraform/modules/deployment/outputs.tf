@@ -24,8 +24,18 @@ output "worker_endpoint" {
 }
 
 output "controller_public_ip" {
-  description = "Public IP of the controller Elastic IP. Point the endpoint DNS record here."
+  description = "Public IP of the controller Elastic IP: point the endpoint DNS record here, or, with load_balancer, the controller's egress address."
   value       = module.network.controller_public_ip
+}
+
+output "load_balancer_dns_name" {
+  description = "DNS name of the load balancer; point the hostname's CNAME here. Null without load_balancer."
+  value       = one(module.load_balancer[*].dns_name)
+}
+
+output "certificate_validation_records" {
+  description = "DNS records that validate the endpoint certificate; publish them where the hostname's zone is served. Empty without load_balancer."
+  value       = var.load_balancer == null ? [] : module.load_balancer[0].certificate_validation_records
 }
 
 output "controller_public_dns" {

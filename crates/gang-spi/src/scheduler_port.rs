@@ -91,6 +91,8 @@ pub trait SchedulerPort: Send + Sync {
     ///
     /// [`PortError::Config`] when the inputs cannot form a valid worker, including a `tls` whose
     /// scheme is not the endpoint's; [`PortError`] when the worker cannot be started or fails.
+    /// [`PortError::Backend`] when the controller refuses the worker's certificate as revoked;
+    /// the worker then never reconnects.
     async fn run_worker(
         &self,
         spec: &WorkerSpec,

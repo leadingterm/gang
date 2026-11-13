@@ -6,10 +6,12 @@ use tokio::sync::oneshot;
 
 use crate::build_output::BuildOutcome;
 use crate::errors::{E2eError, Result};
+use crate::execution::Run;
 use crate::flags::{self, Remote};
 use crate::gang_cli::client_home;
 use crate::process::{self, Ran, scrub_environment};
 use crate::settings::{ActionTools, Settings};
+use crate::system::Probe;
 
 /// One Bazel workspace and the output root its server runs under.
 #[derive(Debug, Clone)]
@@ -46,8 +48,8 @@ impl Bazel {
         &self.program
     }
 
-    /// Builds `targets` through `remote` and reports the exit code, the output, and the process
-    /// summary. A failing build is an outcome, not an error.
+    /// Builds `probes` through `remote`, as `run` when there is one, and reports the exit code,
+    /// the output, and the process summary. A failing build is an outcome, not an error.
     ///
     /// # Errors
     ///
@@ -57,12 +59,13 @@ impl Bazel {
     pub fn build_until(
         &self,
         remote: &Remote,
-        targets: &[String],
+        probes: &[Probe],
+        run: Option<&Run>,
         abort: oneshot::Receiver<String>,
     ) -> Result<BuildOutcome> {
         let command = self.invocation(
             remote,
-            flags::build_args(&self.settings, &self.action_tools, remote, targets),
+            flags::build_args(&self.settings, &self.action_tools, remote, probes, run),
         );
         let output = process::run_until(command, None, self.settings.build_timeout, abort)?;
         Ok(BuildOutcome::new(output.code, output.combined()))
@@ -141,6 +144,8 @@ mod tests {
                 shell: PathBuf::from("/tools/sh"),
                 path: "/pinned/bin:/pinned/other".to_owned(),
                 bwrap: None,
+                glibc_tool: None,
+                glibc_loader: Vec::new(),
             },
             PathBuf::from("/workspace"),
             PathBuf::from("/output"),

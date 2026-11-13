@@ -273,6 +273,59 @@ impl fmt::Display for VictimReport {
     }
 }
 
+/// What the input root probe read directly and through a relative symlink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputRootReport {
+    /// The input's path relative to the working directory.
+    pub shared_path: String,
+    /// What the action read from the input, empty when it could not.
+    pub sibling: String,
+    /// What the action read through the relative symlink, empty when it could not.
+    pub symlink: String,
+    /// The input's link count, or `None` when it could not be read.
+    pub sibling_links: Option<u64>,
+}
+
+impl TryFrom<&ProbeReport> for InputRootReport {
+    type Error = E2eError;
+
+    /// Reads the typed report from the keys of `report`.
+    ///
+    /// # Errors
+    ///
+    /// [`E2eError::Parse`] when a key is missing or the link count is invalid.
+    fn try_from(report: &ProbeReport) -> Result<Self> {
+        let links = report.get("sibling_links")?;
+        let sibling_links = if links == "unreadable" {
+            None
+        } else {
+            Some(links.parse().map_err(|_| {
+                parse_error(format!(
+                    "key `sibling_links` is `{links}`, expected a number or `unreadable`"
+                ))
+            })?)
+        };
+        Ok(Self {
+            shared_path: report.get("shared_path")?.to_owned(),
+            sibling: report.get("sibling")?.to_owned(),
+            symlink: report.get("symlink")?.to_owned(),
+            sibling_links,
+        })
+    }
+}
+
+impl fmt::Display for InputRootReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "shared_path={}", self.shared_path)?;
+        writeln!(f, "sibling={}", self.sibling)?;
+        writeln!(f, "symlink={}", self.symlink)?;
+        match self.sibling_links {
+            Some(links) => writeln!(f, "sibling_links={links}"),
+            None => writeln!(f, "sibling_links=unreadable"),
+        }
+    }
+}
+
 /// What the disk neighbour saw of its own file once its writes ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiskNeighbourReport {

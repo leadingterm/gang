@@ -14,7 +14,7 @@ use crate::{
 };
 use gang_authn::{Anonymous, Mtls, MtlsConfig, NoneConfig, Token, TokenConfig};
 use gang_clock::TestClock;
-use gang_config::{DashboardConfig, RoleConfig, RolePrincipal};
+use gang_config::{DashboardConfig, EndpointTrust, RoleConfig, RolePrincipal};
 use gang_spi::{LoginSupport, Plugin, PluginContext};
 use gang_testkit::{
     FakeCache, FakeProvisioner, FakeRepository, FakeScheduler, TestPlugins, TestSigner,
@@ -209,7 +209,9 @@ pub fn tls_settings() -> ServerSettings {
             handshake: HandshakeSettings {
                 handshake_timeout: NonZeroDuration::from_secs(10),
                 max_pending_handshakes: NonZeroUsize::new(256).expect("256 is non-zero"),
+                refusal_linger: NonZeroDuration::from_secs(2),
             },
+            endpoint_trust: EndpointTrust::Ca,
         }),
         roles: vec![role_for("administrator", PermissionSet::all(), "admin")],
         limits: request_limits(),
@@ -221,6 +223,17 @@ pub fn tls_settings() -> ServerSettings {
         login: None,
         provisioner: "test".into(),
     }
+}
+
+/// Settings for a TLS server behind a publicly trusted terminator: [`tls_settings`] with `endpoint_trust = System`.
+#[must_use]
+pub fn publicly_trusted_settings() -> ServerSettings {
+    let mut settings = tls_settings();
+    let TransportSettings::Tls(tls) = &mut settings.transport else {
+        panic!("tls_settings is TLS");
+    };
+    tls.endpoint_trust = EndpointTrust::System;
+    settings
 }
 
 /// Settings for a plaintext server: the same as [`tls_settings`] without a transport certificate.

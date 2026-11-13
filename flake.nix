@@ -56,6 +56,7 @@
     in {
       gang-scratch = import ./infra/nixos/tests/gang-scratch.nix {inherit pkgs;};
       gang-config = import ./infra/nixos/tests/gang-config.nix {inherit pkgs;};
+      glibc-loader = import ./infra/nixos/tests/glibc-loader.nix {inherit pkgs;};
     });
 
     packages = forLinuxSystems (system: let

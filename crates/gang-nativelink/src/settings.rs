@@ -263,7 +263,7 @@ pub(crate) fn worker(
         named_store(WORKER_CONTENT_STORE, &fast_slow)?,
         named_store(WORKER_ACTION_STORE, &action)?,
     ];
-    let worker = deserialize(local_worker(config, spec, tls, &endpoint)?)?;
+    let worker = deserialize(local_worker(config, spec, &endpoint)?)?;
     Ok(WorkerSettings { stores, worker })
 }
 
@@ -299,20 +299,16 @@ fn controller_grpc_store(
 fn local_worker(
     config: &NativeLinkConfig,
     spec: &WorkerSpec,
-    tls: WorkerTls<'_>,
     endpoint: &str,
 ) -> Result<Value, NativeLinkConfigError> {
     let tuning = &config.worker;
     let keepalive = tuning.keepalive_interval.as_units();
-    let mut api_endpoint = json!({
+    let api_endpoint = json!({
         "uri": endpoint,
         "timeout": tuning.connect_timeout.get().as_secs_f32(),
         "tcp_keepalive_s": keepalive,
         "http2_keepalive_interval_s": keepalive,
     });
-    if let Some(tls) = tls_config(tls)? {
-        api_endpoint["tls_config"] = tls;
-    }
     let platform_properties: Map<String, Value> = spec
         .properties
         .worker_properties()
@@ -782,7 +778,7 @@ mod tests {
     }
 
     #[test]
-    fn tls_files_render_into_the_worker_endpoint_and_the_controller_stores() {
+    fn tls_files_render_into_the_controller_stores() {
         let instance = InstanceId::try_new("local-1").expect("instance");
         let content = memory_store();
         let action = memory_store();
@@ -806,7 +802,7 @@ mod tests {
             WorkerTls::Mutual(tls),
         )
         .expect("worker");
-        assert_tls_files(settings.worker.worker_api_endpoint.tls_config.as_ref());
+        assert!(settings.worker.worker_api_endpoint.tls_config.is_none());
         let StoreSpec::FastSlow(fast_slow) = &settings.stores[0].spec else {
             panic!("worker content store must be fast-slow");
         };
@@ -820,7 +816,7 @@ mod tests {
         assert_tls_files(action_grpc.endpoints[0].tls_config.as_ref());
     }
 
-    /// Server-authenticated TLS reaches the worker API and both controller-backed stores.
+    /// Server-authenticated TLS reaches both controller-backed stores.
     fn assert_server_only_settings(
         tls: WorkerTls<'_>,
         ca: Option<&str>,
@@ -849,8 +845,8 @@ mod tests {
         let StoreSpec::Grpc(action_grpc) = &settings.stores[1].spec else {
             panic!("worker action store must be grpc");
         };
+        assert!(settings.worker.worker_api_endpoint.tls_config.is_none());
         for config in [
-            settings.worker.worker_api_endpoint.tls_config.as_ref(),
             content_grpc.endpoints[0].tls_config.as_ref(),
             action_grpc.endpoints[0].tls_config.as_ref(),
         ] {

@@ -6,7 +6,9 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use crate::execution::Run;
 use crate::settings::{ActionTools, Settings};
+use crate::system::Probe;
 
 /// How a build reaches the remote executor.
 ///
@@ -64,7 +66,10 @@ pub fn startup_args(settings: &Settings, output_user_root: &Path, remote: &Remot
     args
 }
 
-/// The arguments of one `build` of `targets` through the remote executor.
+/// The `--define` name a held build's run is passed under; the sample's probe rule reads it.
+pub const RUN_DEFINE: &str = "e2e_run";
+
+/// The arguments of one `build` of `probes` through the remote executor.
 ///
 /// Every build carries `--verbose_failures`, so Bazel prints the full cause chain of a failed
 /// remote call (the TLS alert, for instance) rather than only its top-level message.
@@ -72,13 +77,19 @@ pub fn startup_args(settings: &Settings, output_user_root: &Path, remote: &Remot
 /// Every build carries `--keep_going`, so one failed action does not cancel the other actions of
 /// the same invocation, such as a neighbour that shares the worker.
 ///
+/// Probe-specific flags follow the settings' extra build flags, before all probe labels.
+///
 /// The probe rule declares its action environment in the staged sample configuration.
+///
+/// A held build passes its run as `--define=e2e_run=<run>`, which the probe rule exports as
+/// `E2E_RUN`.
 #[must_use]
 pub fn build_args(
     settings: &Settings,
     action_tools: &ActionTools,
     remote: &Remote,
-    targets: &[String],
+    probes: &[Probe],
+    run: Option<&Run>,
 ) -> Vec<String> {
     let mut args: Vec<String> = [
         "build",
@@ -101,13 +112,21 @@ pub fn build_args(
         action_tools.shell.display()
     ));
     args.push("--incompatible_strict_action_env".to_owned());
+    if let Some(run) = run {
+        args.push(format!("--define={RUN_DEFINE}={run}"));
+    }
 
     if let Remote::Gang { host, helper, .. } = remote {
         args.push(format!("--credential_helper={host}={}", helper.display()));
     }
 
     args.extend(settings.bazel_flags.iter().cloned());
-    args.extend(targets.iter().cloned());
+    args.extend(
+        probes
+            .iter()
+            .flat_map(|probe| probe.build_flags().iter().map(|flag| (*flag).to_owned())),
+    );
+    args.extend(probes.iter().map(|probe| probe.label()));
     args
 }
 

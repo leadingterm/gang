@@ -72,6 +72,33 @@ pub(crate) enum NativeLinkEmbedError {
     #[error(transparent)]
     #[failure(config)]
     Config(#[from] NativeLinkConfigError),
+    /// A TLS file of the worker cannot be read.
+    #[error("cannot read the worker tls file {}", path.display())]
+    #[failure(config)]
+    WorkerTlsFile {
+        /// The file.
+        path: PathBuf,
+        /// The read error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A TLS file of the worker is not a PEM document of its kind.
+    #[error("the worker tls file {} is malformed", path.display())]
+    #[failure(config)]
+    WorkerTlsPem {
+        /// The file.
+        path: PathBuf,
+        /// The parsing error.
+        #[source]
+        source: gang_types::PemError,
+    },
+    /// The worker's TLS client cannot be built from its files.
+    #[error("the worker tls client cannot be built")]
+    #[failure(config)]
+    WorkerTls(#[source] gang_tls::TransportError),
+    /// The controller refused the worker's certificate as revoked.
+    #[error("the controller refused the worker certificate")]
+    CertificateRevoked(#[source] gang_tls::CertificateRevoked),
     /// `NativeLink` rejected a component it was asked to build or run.
     #[error("nativelink {context}")]
     NativeLink {

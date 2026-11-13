@@ -11,6 +11,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::QuantityError;
+use crate::bounded_duration::BoundedDuration;
 use crate::duration;
 
 /// A duration that is strictly greater than zero, a whole number of milliseconds, and at most
@@ -119,6 +120,28 @@ impl From<NonZeroDuration> for Duration {
     }
 }
 
+/// A bounded duration of at least one whole-millisecond unit is always a valid [`NonZeroDuration`];
+/// a bound that could hold zero, a fraction of a millisecond, or more than `u64::MAX` milliseconds
+/// fails to compile at the conversion.
+impl<const UNIT_NANOS: u64, const MIN_UNITS: u64, const MAX_UNITS: u64>
+    From<BoundedDuration<UNIT_NANOS, MIN_UNITS, MAX_UNITS>> for NonZeroDuration
+{
+    fn from(value: BoundedDuration<UNIT_NANOS, MIN_UNITS, MAX_UNITS>) -> Self {
+        const {
+            assert!(MIN_UNITS >= 1, "the bound admits zero");
+            assert!(
+                UNIT_NANOS.is_multiple_of(1_000_000),
+                "the unit is not whole milliseconds"
+            );
+            assert!(
+                (UNIT_NANOS / 1_000_000).checked_mul(MAX_UNITS).is_some(),
+                "the bound exceeds u64::MAX milliseconds"
+            );
+        }
+        Self(value.get())
+    }
+}
+
 /// Errors from parsing a [`NonZeroDuration`].
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum NonZeroDurationError {
@@ -159,6 +182,15 @@ impl_parsed_serde!(
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
+
+    #[test]
+    fn bounded_whole_seconds_convert_to_nonzero_duration() {
+        let duration = BoundedDuration::<1_000_000_000, 1, 10>::from_units(3);
+        assert_eq!(
+            NonZeroDuration::from(duration),
+            NonZeroDuration::from_secs(3)
+        );
+    }
 
     #[test]
     fn json_deserializes_borrowed_and_owned_strings() {

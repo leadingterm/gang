@@ -1,8 +1,8 @@
 //! Runs one action in its sandbox, inside its limits scope, and maps the outcome to an exit status.
 
 use std::io;
-use std::path::Path;
 
+use gang_config::InputLinks;
 use gang_spi::{
     ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, ActionLimits,
     ActionLimitsPort, ActionScope, ActionUsage, SandboxedAction, Termination,
@@ -22,9 +22,9 @@ pub struct Action<'a> {
 
 /// Runs `action` in `sandbox`.
 ///
-/// The steps, in order, are: break the hard links under `link_root` when it is given; enter a
-/// limits scope when `limits` is given, which creates and limits the scope while `gang exec`
-/// stays outside it; start the action through the scope's launcher, so it runs inside the scope
+/// The steps, in order, are: break the hard links under the action directory when `input_links` is
+/// `break`; enter a limits scope when `limits` is given, which creates and limits the scope while
+/// `gang exec` stays outside it; start the action through the scope's launcher, so it runs inside the scope
 /// from its first instruction; call `leave_action_group` once an action that shares the process
 /// group of `gang exec` exists (the caller moves `gang exec` out of that group; an action in its
 /// own group, which the sandbox relays to, leaves `gang exec` where it is); wait for the action,
@@ -45,13 +45,13 @@ pub struct Action<'a> {
 pub async fn execute<S: ActionIsolationPort, L: ActionLimitsPort>(
     sandbox: &S,
     limits: Option<&L>,
-    link_root: Option<&Path>,
+    input_links: InputLinks,
     action: &Action<'_>,
     terminations: &mut UnboundedReceiver<Termination>,
     leave_action_group: impl FnOnce() -> io::Result<()>,
 ) -> Result<ActionExecutionOutcome, ExecError> {
-    if let Some(root) = link_root {
-        break_hard_links(root)?;
+    if matches!(input_links, InputLinks::Break) {
+        break_hard_links(action.spec.action_directory)?;
     }
     let Some(port) = limits else {
         if let Ok(termination) = terminations.try_recv() {

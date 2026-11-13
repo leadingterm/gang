@@ -57,14 +57,28 @@ variable "storage" {
 
 variable "hostname" {
   type        = string
-  description = "Public hostname of the Gang endpoint (port 443). Null uses the EC2 public DNS name of the controller Elastic IP. DNS is managed outside this module."
+  description = "Public hostname of the Gang endpoint (port 443). Null uses the EC2 public DNS name of the controller Elastic IP. DNS is managed outside this module. Required by load_balancer."
   default     = null
 }
 
 variable "client_ingress_cidrs" {
   type        = list(string)
-  description = "CIDRs allowed to reach the public endpoint (443). Access is authenticated by gang."
+  description = "CIDRs allowed to reach the public endpoint (443): the controller's listener, or the load balancer when load_balancer is set. Access is authenticated by gang."
   default     = ["0.0.0.0/0"]
+}
+
+variable "load_balancer" {
+  type = object({
+    ssl_policy                     = optional(string, "ELBSecurityPolicy-TLS13-1-2-2021-06")
+    certificate_validation_timeout = optional(string, "2h")
+  })
+  description = "Publicly trusted TLS in front of the controller: an ACM certificate for hostname on a Network Load Balancer that terminates TLS (ALPN h2 then http/1.1) and re-encrypts to the controller's public listener, so browsers, Bazel and gang use their system roots; gang.toml then sets [server] endpoint_trust = \"system\". Requires hostname. The controller's public port then accepts only the load balancer and the workers, and its Elastic IP remains its egress address. Inside the VPC hostname resolves to the controller (a private hosted zone), so workers keep reaching its own listener. ssl_policy must be an ELBSecurityPolicy-TLS13-* policy (validated by the load-balancer module). The first apply waits up to certificate_validation_timeout until the record in certificate_validation_records is published. Null (the default) serves the public listener directly on the controller's Elastic IP with the gang CA certificate."
+  default     = null
+
+  validation {
+    condition     = var.load_balancer == null || var.hostname != null
+    error_message = "load_balancer requires hostname: it is the certificate's domain."
+  }
 }
 
 variable "nat_mode" {

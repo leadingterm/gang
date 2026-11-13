@@ -15,8 +15,10 @@ impl Bwrap {
     /// Builds the `bwrap` invocation that runs `spec`.
     ///
     /// The sandbox root starts empty, so the only host paths visible inside it are the prefix's
-    /// read-only binds and the working directory; the content store is never mapped. The working
-    /// directory is bound read-write and becomes the current directory. `--share-net` must follow
+    /// read-only binds and the action directory; the content store and other actions' directories
+    /// are never mapped. The action directory is bound read-write, so every input resolves,
+    /// including those outside the working directory (`../input`, relative symlinks); the working
+    /// directory inside it becomes the current directory. `--share-net` must follow
     /// `--unshare-all`, which the prefix contains, so it re-enables the network only when both the
     /// plugin permits it and the action requests it. The `bwrap` process itself starts with an
     /// empty environment, so a host variable such as `LD_PRELOAD` never reaches it; inside the
@@ -31,7 +33,7 @@ impl Bwrap {
     /// starts inside the limits scope.
     #[must_use]
     pub(crate) fn command(&self, spec: &ActionExecutionSpec<'_>, info_fd: RawFd) -> Command {
-        let working_directory = spec.working_directory.as_os_str();
+        let action_directory = spec.action_directory.as_os_str();
         let mut command = match spec.launcher.split_first() {
             Some((launcher, launcher_arguments)) => {
                 let mut command = Command::new(launcher);
@@ -45,10 +47,10 @@ impl Bwrap {
         command.arg("--info-fd").arg(info_fd.to_string());
         command.args([
             OsStr::new("--bind"),
-            working_directory,
-            working_directory,
+            action_directory,
+            action_directory,
             OsStr::new("--chdir"),
-            working_directory,
+            spec.working_directory.as_os_str(),
         ]);
         if self.permit_network && spec.network == NetworkRequest::Requested {
             command.arg("--share-net");
@@ -106,6 +108,7 @@ mod tests {
 
     fn command(
         bwrap: &Bwrap,
+        action_directory: &Path,
         working_directory: &Path,
         network: NetworkRequest,
     ) -> Result<Command, Box<dyn std::error::Error>> {
@@ -122,6 +125,7 @@ mod tests {
             command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
             launcher: &[],
             environment: &environment,
+            action_directory,
             working_directory,
             network,
         };
@@ -153,7 +157,12 @@ mod tests {
     fn full_command_line_for_unshared_network() -> Result<(), Box<dyn std::error::Error>> {
         let bwrap = bwrap(false);
 
-        let command = command(&bwrap, Path::new("/work/a"), NetworkRequest::NotRequested)?;
+        let command = command(
+            &bwrap,
+            Path::new("/work/a"),
+            Path::new("/work/a/sub"),
+            NetworkRequest::NotRequested,
+        )?;
 
         assert_eq!(command.get_program(), "/usr/bin/bwrap");
         assert_eq!(
@@ -181,7 +190,7 @@ mod tests {
                 "/work/a",
                 "/work/a",
                 "--chdir",
-                "/work/a",
+                "/work/a/sub",
                 "--setenv",
                 "A",
                 "1",
@@ -212,7 +221,12 @@ mod tests {
 
         for (permit, request, expected) in cases {
             let bwrap = bwrap(permit);
-            let args = args(&command(&bwrap, Path::new("/work/a"), request)?);
+            let args = args(&command(
+                &bwrap,
+                Path::new("/work/a"),
+                Path::new("/work/a"),
+                request,
+            )?);
 
             let occurrences = args.iter().filter(|arg| *arg == "--share-net").count();
             assert_eq!(
@@ -230,11 +244,12 @@ mod tests {
     }
 
     #[test]
-    fn tmpfs_tmp_precedes_working_directory_bind() -> Result<(), Box<dyn std::error::Error>> {
+    fn tmpfs_tmp_precedes_action_directory_bind() -> Result<(), Box<dyn std::error::Error>> {
         let bwrap = bwrap(false);
 
         let args = args(&command(
             &bwrap,
+            Path::new("/tmp/work"),
             Path::new("/tmp/work"),
             NetworkRequest::NotRequested,
         )?);
@@ -260,7 +275,12 @@ mod tests {
         )
         .expect("bwrap plugin builds from its config");
 
-        let command = command(&bwrap, Path::new("/work/a"), NetworkRequest::NotRequested)?;
+        let command = command(
+            &bwrap,
+            Path::new("/work/a"),
+            Path::new("/work/a"),
+            NetworkRequest::NotRequested,
+        )?;
 
         assert_eq!(command.get_program(), "/custom/bwrap");
         let args = args(&command);
@@ -282,6 +302,7 @@ mod tests {
             command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
             launcher: &launcher,
             environment: &[],
+            action_directory: Path::new("/work/a"),
             working_directory: Path::new("/work/a"),
             network: NetworkRequest::NotRequested,
         };
@@ -331,6 +352,7 @@ mod tests {
             command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
             launcher: &[],
             environment: &[],
+            action_directory: directory.path(),
             working_directory: directory.path(),
             network: NetworkRequest::NotRequested,
         };

@@ -6,13 +6,13 @@
 //! applies the next step's effect, so what the scenario observes between two reads is the state
 //! after the line it last read.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use gang_e2e::{
     BuildOutcome, COLD_START_MISFIT_MESSAGE, E2eError, Execution, ExecutionKnobs, FleetDisk,
-    Generations, Host, Limits, Probe, ProbeReport, Proc, Result, Role, Sandbox, ScopeFacts,
+    Generations, Host, Limits, Probe, ProbeReport, Proc, Result, Role, Run, Sandbox, ScopeFacts,
     ServerExit, Signalled, System, Variant,
 };
 use gang_wire::{
@@ -204,6 +204,23 @@ behaviour! {
             /// `TakesScope`.
             TakesScope,
         },
+        /// See [`ExecRetry`]. What becomes of the action of a killed `gang exec` under a
+        /// serving worker.
+        exec_retry: ExecRetry {
+            /// It fails.
+            Fails,
+            /// It is retried; the retry finds the go flag and succeeds.
+            Retried,
+        },
+        /// See [`LateLine`]. Whether an attempt of a held stray build writes to the journal after
+        /// that build ended.
+        late_line: LateLine {
+            /// Every line arrives while its build runs.
+            OnTime,
+            /// A second attempt's stray line arrives after its build ended, naming a process
+            /// that is gone.
+            Late,
+        },
         /// See [`Freeze`]. Whether the cgroup freezer freezes the worker's subtree.
         freeze: Freeze {
             /// `Freezes`.
@@ -339,6 +356,8 @@ const BWRAP: u32 = 300;
 const CHILD: u32 = 400;
 /// The process id of the stray.
 const STRAY_PID: u32 = 500;
+/// The process id a late stray line names; no process has it.
+const LATE_STRAY_PID: u32 = 600;
 /// The worker's leaf cgroup.
 const WORKER_LEAF_DIR: &str = "/sim/worker";
 /// The directory of the action scopes beside it.
@@ -411,6 +430,13 @@ enum WorkerPhase {
 
 /// The mutable state of an [`ExecSim`].
 struct State {
+    /// The run of the held build in progress, empty for a build without one.
+    run: String,
+    /// Every held probe and run whose build succeeded: Bazel finds such a build up to date.
+    built: HashSet<(Probe, String)>,
+    /// A line an earlier build's attempt writes after that build ended, read before the next
+    /// held build's own lines.
+    late: Option<String>,
     /// The running held probe and its next step.
     machine: Option<(Probe, u8)>,
     /// The outcome of the held probe, once it ended.
@@ -472,6 +498,9 @@ impl ExecSim {
             execution: variant.execution,
             behaviour,
             state: Mutex::new(State {
+                run: String::new(),
+                built: HashSet::new(),
+                late: None,
                 machine: None,
                 outcome: None,
                 journal: JournalFlags::default(),
@@ -647,6 +676,12 @@ impl ExecSim {
                     }
                     return Step::Done(ok());
                 }
+                if behaviour.exec_retry == ExecRetry::Retried
+                    && !state.live.exec
+                    && state.journal.go
+                {
+                    return Step::Done(ok());
+                }
                 Step::Done(failed(probe, "(Killed)"))
             }
             (Probe::HeldRelease, 0) => {
@@ -693,8 +728,13 @@ impl ExecSim {
     /// Runs the held probe `probe` until its step machine ends, driven by the journal reads. A
     /// worker that had stopped serving before the build fails it; one the build itself stops
     /// fails only the builds after it.
-    fn held(&self, probe: Probe) -> BuildOutcome {
+    fn held(&self, probe: Probe, run: &str) -> BuildOutcome {
         let mut state = self.state.lock();
+        // Bazel finds the same action's earlier success up to date and runs nothing.
+        if state.built.contains(&(probe, run.to_owned())) {
+            return ok();
+        }
+        run.clone_into(&mut state.run);
         let failing = state.failing;
         state.machine = Some((probe, 0));
         state.outcome = None;
@@ -840,7 +880,7 @@ impl System for ExecSim {
             | Probe::TermIgnorer
             | Probe::Stray
             | Probe::HeldRelease
-            | Probe::HeldHog => Ok(self.held(probe)),
+            | Probe::HeldHog => Ok(self.held(probe, "")),
             Probe::SelfKill => Ok(failed(
                 probe,
                 match behaviour.signal_status {
@@ -908,6 +948,23 @@ impl System for ExecSim {
                 let outcome = self.inner.build(probes)?;
                 Ok(Self::serving(&self.state.lock(), probe, outcome))
             }
+        }
+    }
+
+    fn build_run(&self, probes: &[Probe], run: &Run) -> Result<BuildOutcome> {
+        match probes.first() {
+            Some(
+                &probe @ (Probe::TimeoutChild
+                | Probe::TermTrap
+                | Probe::TermIgnorer
+                | Probe::Stray
+                | Probe::HeldRelease
+                | Probe::HeldHog),
+            ) => {
+                self.sweep_by_action(&mut self.state.lock());
+                Ok(self.held(probe, run.as_ref()))
+            }
+            _ => self.build(probes),
         }
     }
 
@@ -1015,14 +1072,26 @@ impl Execution for ExecSim {
     fn next_line(&self) -> Result<Option<String>> {
         let mut state = self.state.lock();
         loop {
+            if state.machine.is_some()
+                && let Some(line) = state.late.take()
+            {
+                return Ok(Some(line));
+            }
             if let Some((probe, step)) = state.machine {
                 match self.step(&mut state, probe, step) {
                     Step::Line(line) => {
                         state.machine = Some((probe, step + 1));
-                        return Ok(Some(line));
+                        return Ok(Some(format!("{} {line}", state.run)));
                     }
                     Step::Done(outcome) => {
                         state.machine = None;
+                        if outcome.succeeded() {
+                            let built = (probe, state.run.clone());
+                            state.built.insert(built);
+                        }
+                        if probe == Probe::Stray && self.behaviour.late_line == LateLine::Late {
+                            state.late = Some(format!("{} stray {LATE_STRAY_PID}", state.run));
+                        }
                         state.outcome = Some(outcome);
                         self.changed.notify_all();
                     }

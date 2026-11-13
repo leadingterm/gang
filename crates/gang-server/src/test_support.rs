@@ -15,8 +15,8 @@ pub use crate::test_support_crypto::{
     authority, client_certificate, signing_request, tls_client, tls_client_over,
 };
 pub use crate::test_support_deployment::{
-    PlainDeployment, TlsDeployment, endpoint, plain_parts, plain_settings, providers, role_for,
-    tls_parts, tls_settings,
+    PlainDeployment, TlsDeployment, endpoint, plain_parts, plain_settings, providers,
+    publicly_trusted_settings, role_for, tls_parts, tls_settings,
 };
 pub use crate::test_support_fleet::{fleets, fleets_of, queued_demand};
 pub use crate::test_support_memory::{MemoryDialer, MemoryListener, memory_listener};

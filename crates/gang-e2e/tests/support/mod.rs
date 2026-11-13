@@ -15,8 +15,8 @@ use gang_e2e::{
     E2eError, EventStream, FleetLayout, HOLD_CPU_COUNT, HOLD_MEMORY_KB, Host, Identity, InputLinks,
     IsolationReport, Issuance, LARGE_FLEET, LIMIT_CPU_PERIOD_MICROS, LIMIT_HEADROOM_PERCENT,
     LIMIT_MAX_PIDS, NOOP_FLEET, Namespaces, ORGANIZATION, PermitNetwork, PoisonReport, Presenting,
-    Probe, ProbeReport, Reply, Result, SMALL_FLEET, Sandbox, ScopeFacts, SessionCookie, Settings,
-    Signalled, System, TokenSpec, Variant, VictimReport,
+    Probe, ProbeReport, Reply, Result, Run, SMALL_FLEET, Sandbox, ScopeFacts, SessionCookie,
+    Settings, Signalled, System, TokenSpec, Variant, VictimReport,
 };
 use gang_types::{FleetName, InstanceId, WorkerId};
 use gang_wire::routes::{GET_STATE, WATCH_STATE};
@@ -55,6 +55,8 @@ const SIM_CWD_NAME: &str = "sim-work";
 const SIM_PARENT_NAME: &str = "tmp";
 const SIM_GRANDPARENT_NAME: &str = "root";
 const SIBLING: &str = "cas";
+/// The per-action `TMPDIR` directory `NativeLink` creates beside the working directory.
+const SIM_ACTION_TMP_NAME: &str = "tmp";
 /// The principal of the one session the identity simulation issues.
 const SIM_PRINCIPAL: &str = "local-workers:developer";
 /// The bearer token of that session.
@@ -90,6 +92,13 @@ behaviour! {
             LeakyGreatGrandparent,
             /// The namespace ids cannot be read, so the probes report `unavailable`.
             Unreadable,
+        },
+        /// Whether the sandbox provides the glibc loader.
+        loader: Loader {
+            /// The loader is bound into the sandbox.
+            Bound,
+            /// The loader is missing from the sandbox.
+            Missing,
         },
         /// Whether cached inputs stay intact.
         /// This describes whether a modified cached input reaches a later action as `input_links`
@@ -622,9 +631,13 @@ impl Simulation {
     /// The entries of the action's parent directory, as `ls -A ..` lists them.
     fn parent_entries(&self) -> Vec<String> {
         if self.parent_leaks() {
-            vec![SIBLING.to_owned(), SIM_CWD_NAME.to_owned()]
+            vec![
+                SIBLING.to_owned(),
+                SIM_ACTION_TMP_NAME.to_owned(),
+                SIM_CWD_NAME.to_owned(),
+            ]
         } else {
-            vec![SIM_CWD_NAME.to_owned()]
+            vec![SIM_ACTION_TMP_NAME.to_owned(), SIM_CWD_NAME.to_owned()]
         }
     }
 
@@ -682,6 +695,15 @@ impl Simulation {
             Probe::Pinned => {
                 (self.behaviour.serving == Serving::Keeps).then(|| "ran=yes\n".to_owned())
             }
+            Probe::GlibcTool => Some(
+                match self.behaviour.loader {
+                    Loader::Bound => "glibc_tool=ran\n",
+                    Loader::Missing => {
+                        "glibc_tool=failed: bwrap: execvp ./glibc-tool: No such file or directory\n"
+                    }
+                }
+                .to_owned(),
+            ),
             Probe::Unconstrained
             | Probe::FleetRequested
             | Probe::MemoryRequested
@@ -696,6 +718,7 @@ impl Simulation {
             | Probe::SelfKill
             | Probe::SelfTerm
             | Probe::SandboxContract
+            | Probe::InputRoot
             | Probe::Stray
             | Probe::HeldRelease
             | Probe::HeldHog
@@ -1343,6 +1366,11 @@ impl System for Simulation {
         }
         self.changed.notify_all();
         outcome
+    }
+
+    // Models neither the action cache nor the journal, so a run changes nothing.
+    fn build_run(&self, probes: &[Probe], _run: &Run) -> Result<BuildOutcome> {
+        self.build(probes)
     }
 
     fn clean(&self) -> Result<()> {

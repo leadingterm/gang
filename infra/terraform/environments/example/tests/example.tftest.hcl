@@ -37,6 +37,25 @@ mock_provider "aws" {
     }
   }
 
+  mock_resource "aws_lb" {
+    defaults = {
+      arn      = "arn:aws:elasticloadbalancing:eu-north-1:000000000000:loadbalancer/net/gang/0000000000000000"
+      dns_name = "gang-0000000000.elb.eu-north-1.amazonaws.com"
+    }
+  }
+
+  mock_resource "aws_lb_target_group" {
+    defaults = {
+      arn = "arn:aws:elasticloadbalancing:eu-north-1:000000000000:targetgroup/gang/0000000000000000"
+    }
+  }
+
+  mock_resource "aws_acm_certificate" {
+    defaults = {
+      arn = "arn:aws:acm:eu-north-1:000000000000:certificate/00000000-0000-0000-0000-000000000000"
+    }
+  }
+
   mock_resource "aws_iam_outbound_web_identity_federation" {
     defaults = {
       issuer_identifier = "https://issuer.example.com/123456789012"
@@ -85,6 +104,11 @@ run "plans_the_example_deployment" {
   assert {
     condition     = output.gang.endpoint == "https://gang.example.com"
     error_message = "The example endpoint must be the example hostname over https."
+  }
+
+  assert {
+    condition     = output.gang.load_balancer_dns_name != null
+    error_message = "The example must expose a load balancer DNS name."
   }
 
   assert {

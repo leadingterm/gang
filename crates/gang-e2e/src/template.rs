@@ -57,7 +57,8 @@ const LARGE_FACTOR: u32 = 2;
 /// The shared root containing the self-contained closures of the action tools.
 const NIX_STORE: &str = "/nix/store";
 
-/// Returns the bind roots needed by the action shell and PATH, in first-seen order.
+/// Returns the bind roots: the Nix store roots of the action shell and PATH, in first-seen order,
+/// then the host's glibc loader paths.
 ///
 /// # Errors
 ///
@@ -77,6 +78,7 @@ fn bind_roots(tools: &ActionTools) -> Result<Vec<PathBuf>> {
             roots.push(root);
         }
     }
+    roots.extend(tools.glibc_loader.iter().cloned());
     Ok(roots)
 }
 

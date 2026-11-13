@@ -60,15 +60,15 @@ use gang_e2e::{
     Probe, SMALL_FLEET, Sandbox, Settings, Signalled, SoftMemory, Variant, names,
 };
 use gang_e2e::{
-    disk, fleets, input_integrity, lifecycle, limits, memory, network, plaintext, restart,
-    revocation,
+    disk, fleets, glibc_toolchain, input_integrity, lifecycle, limits, memory, network, plaintext,
+    restart, revocation,
 };
 use gang_wire::routes::{GET_STATE, WATCH_STATE};
 use support::{
     AdminRoutes, Anonymous, Behaviour, BuildFailure, Cache, Completed, Convergence, Dashboard,
-    Disk, Drain, Grower, Handshake, HoldBuild, HoldSignal, Integrity, Isolation, Limits, Neighbour,
-    OrphanProcess, PidReuse, Requests, Restart, Revocation, Routing, ScopeReport, Serving,
-    SimulatedIdentity, Simulation, StateView, StreamCauses, Termination, TokenIssue, Warm,
+    Disk, Drain, Grower, Handshake, HoldBuild, HoldSignal, Integrity, Isolation, Limits, Loader,
+    Neighbour, OrphanProcess, PidReuse, Requests, Restart, Revocation, Routing, ScopeReport,
+    Serving, SimulatedIdentity, Simulation, StateView, StreamCauses, Termination, TokenIssue, Warm,
 };
 
 /// The name of the check that a request for the state without a session cookie is refused.
@@ -212,6 +212,11 @@ fn lifecycle_checks(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
     lifecycle(&Simulation::new(variant, behaviour), &variant)
 }
 
+/// The verdicts of the glibc toolchain scenario against a simulated sandbox.
+fn glibc_toolchain_checks(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
+    glibc_toolchain(&Simulation::new(baseline(Sandbox::Bwrap), behaviour))
+}
+
 /// The verdicts of the input integrity scenario against a simulation that behaves as `behaviour`
 /// says.
 fn integrity_checks(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
@@ -347,6 +352,19 @@ fn network_is_compliant_when_isolated() {
     let variant = baseline(Sandbox::Bwrap);
     let system = Simulation::new(variant, Behaviour::COMPLIANT);
     assert_compliant(&network(&system, &variant).expect("the network scenario runs"));
+}
+
+#[test]
+fn glibc_toolchain_is_compliant_when_the_loader_is_bound() {
+    assert_compliant(
+        &glibc_toolchain_checks(Behaviour::COMPLIANT).expect("the glibc toolchain scenario runs"),
+    );
+}
+
+flaw! {
+    missing_loader_fails_only_the_glibc_tool_check:
+        glibc_toolchain_checks(loader = Loader::Missing)
+        => only [names::glibc_toolchain::TOOL_RUNS]
 }
 
 flaw! {

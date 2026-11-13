@@ -43,6 +43,10 @@ pub struct Certificate {
     /// The issued certificate. Present only in the answer to `POST /v1/certificates`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pem_certificate: Option<CertificatePem>,
+    /// The certificate of the authority that issued it. Present only in the answer to
+    /// `POST /v1/certificates`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_certificate: Option<CertificatePem>,
 }
 
 #[cfg(test)]
@@ -92,10 +96,12 @@ mod tests {
             "createTime": "2026-01-14T09:00:00.000Z",
             "expireTime": "2026-01-21T09:00:00.000Z",
             "pemCertificate": "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----",
+            "caCertificate": "-----BEGIN CERTIFICATE-----\nBBBB\n-----END CERTIFICATE-----",
         });
         let certificate: Certificate =
             serde_json::from_value(value.clone()).expect("certificate parses");
         assert_eq!(certificate.revoke_time, None);
+        assert!(certificate.ca_certificate.is_some());
         assert_eq!(
             serde_json::to_value(&certificate).expect("certificate serializes"),
             value
@@ -114,6 +120,7 @@ mod tests {
         let certificate: Certificate =
             serde_json::from_value(value.clone()).expect("certificate parses");
         assert_eq!(certificate.pem_certificate, None);
+        assert_eq!(certificate.ca_certificate, None);
         assert!(certificate.revoke_time.is_some());
         assert_eq!(
             serde_json::to_value(&certificate).expect("certificate serializes"),

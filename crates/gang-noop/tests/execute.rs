@@ -113,6 +113,7 @@ fn host() -> Result<(), Box<dyn Error>> {
         command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
         launcher: &[],
         environment: &environment,
+        action_directory: &working_directory,
         working_directory: &working_directory,
         network: NetworkRequest::NotRequested,
     };
@@ -170,6 +171,7 @@ async fn spec_run(
         command: ActionCommand::from_argv(argv).ok_or("empty argv")?,
         launcher: &[],
         environment,
+        action_directory: working_directory,
         working_directory,
         network: NetworkRequest::NotRequested,
     };
@@ -345,6 +347,7 @@ async fn dropping_the_running_action_kills_it() -> Result<(), Box<dyn Error>> {
         command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
         launcher: &[],
         environment: &environment,
+        action_directory: dir.path(),
         working_directory: dir.path(),
         network: NetworkRequest::NotRequested,
     };

@@ -48,7 +48,7 @@ use crate::gate::{Caller, is_open_path};
 use crate::hub::StateHub;
 use crate::query::query_param;
 use crate::rate_limit::RateLimiter;
-use crate::resources::{wire_certificate, wire_principal};
+use crate::resources::{IssuedPems, wire_certificate, wire_principal};
 use crate::revocation::Revocations;
 use crate::settings::RequestLimits;
 use crate::stream::{StreamParams, open_stream};
@@ -256,7 +256,18 @@ impl<K: Stack> Api<K> {
             )
             .await
             .or_status()?;
-        Ok(wire_certificate(issued.record, Some(issued.certificate)))
+        let gang_spi::IssuedCertificate {
+            certificate,
+            ca_certificate,
+            record,
+        } = issued;
+        Ok(wire_certificate(
+            record,
+            Some(IssuedPems {
+                certificate,
+                ca_certificate,
+            }),
+        ))
     }
 
     async fn revoke_certificate(

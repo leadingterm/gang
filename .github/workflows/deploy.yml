@@ -15,6 +15,7 @@
 #         kms_key_arn: arn:aws:kms:us-east-1:000000000000:key/example
 #         plan_bucket: example-plans
 #         plan_prefix: plans
+#         gang_sha256: <SHA-256 of gang-x86_64-unknown-linux-musl, from the release's SHA256SUMS>
 #       permissions:
 #         contents: read
 #         id-token: write
@@ -25,8 +26,9 @@
 #
 # One call per repository; the manifest, comment marker and plan key do not name a root.
 #
-# The job `gang` builds the gang binary from the Gang checkout once per run; the plan and apply jobs
-# download it and run the deploy decisions with it (`gang deploy`, through $GANG).
+# Nothing is compiled: the plan and apply jobs download the gang binary from the Gang release of the
+# pinned tag, check it against gang_sha256 (the asset for the runner's architecture), and run the
+# deploy decisions with it (`gang deploy`, through $GANG).
 
 name: Deploy
 
@@ -58,6 +60,9 @@ on:
         required: true
         type: string
       plan_prefix:
+        required: true
+        type: string
+      gang_sha256:
         required: true
         type: string
       apply_environment:
@@ -95,6 +100,7 @@ env:
   INFRA_PLAN_BUCKET: ${{ inputs.plan_bucket }}
   INFRA_PLAN_PREFIX: ${{ inputs.plan_prefix }}
   INFRA_PLAN_MAX_AGE_SECONDS: ${{ inputs.plan_max_age_seconds }}
+  GANG_SHA256: ${{ inputs.gang_sha256 }}
 
 jobs:
   validate:
@@ -116,40 +122,8 @@ jobs:
       - name: Validate the OpenTofu root
         run: .gang/infra/scripts/reviewed-plan.sh validate
 
-  gang:
-    # Only the plan and apply jobs run gang.
-    if: >-
-      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
-      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-    runs-on: ${{ inputs.runner }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          path: .gang
-          persist-credentials: false
-      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
-        with:
-          nix_conf: |
-            experimental-features = nix-command flakes
-      # Bazel runs inside its workspace, the Gang checkout, with the Gang dev shell.
-      - name: Build gang
-        shell: bash
-        working-directory: .gang
-        run: |
-          nix develop -c bazelisk build -c opt //:gang
-          built="$(nix develop -c bazelisk cquery -c opt --output=files //:gang)"
-          install -m 0755 "$built" "$RUNNER_TEMP/gang"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: gang
-          path: ${{ runner.temp }}/gang
-          if-no-files-found: error
-          overwrite: true
-
   plan:
-    needs: [validate, gang]
+    needs: validate
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ inputs.runner }}
     permissions:
@@ -170,15 +144,12 @@ jobs:
         with:
           nix_conf: |
             experimental-features = nix-command flakes
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: gang
-          path: ${{ runner.temp }}/gang-bin
       - name: Install gang
-        shell: bash
-        run: |
-          chmod +x "$RUNNER_TEMP/gang-bin/gang"
-          echo "GANG=$RUNNER_TEMP/gang-bin/gang" >> "$GITHUB_ENV"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GANG_REPOSITORY: ${{ job.workflow_repository }}
+          GANG_WORKFLOW_REF: ${{ job.workflow_ref }}
+        run: .gang/infra/scripts/install-gang.sh
       - name: Assume plan role
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
         with:
@@ -204,7 +175,7 @@ jobs:
         run: .gang/infra/scripts/reviewed-plan.sh publish
 
   apply:
-    needs: [validate, gang]
+    needs: validate
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ${{ inputs.runner }}
     environment: ${{ inputs.apply_environment }}
@@ -231,15 +202,12 @@ jobs:
         with:
           nix_conf: |
             experimental-features = nix-command flakes
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: gang
-          path: ${{ runner.temp }}/gang-bin
       - name: Install gang
-        shell: bash
-        run: |
-          chmod +x "$RUNNER_TEMP/gang-bin/gang"
-          echo "GANG=$RUNNER_TEMP/gang-bin/gang" >> "$GITHUB_ENV"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GANG_REPOSITORY: ${{ job.workflow_repository }}
+          GANG_WORKFLOW_REF: ${{ job.workflow_ref }}
+        run: .gang/infra/scripts/install-gang.sh
       - name: Resolve reviewed plan
         id: resolve
         env:

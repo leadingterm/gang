@@ -306,6 +306,47 @@ mod tests {
         assert_eq!(configured, expected);
     }
 
+    /// Two first opens of one database, interleaved through the pause: the first holds the write
+    /// lock while its migration is under way, the second finds it busy, and on the second's pause
+    /// the first finishes migrating. The second must then come up without running any migration
+    /// itself (a second run would fail on the existing tables).
+    #[test]
+    fn an_opener_that_waits_for_a_first_migration_runs_none_of_its_own() {
+        let settings = bring_up_settings(Duration::from_secs(1));
+        let dir = TempDir::new().expect("temp dir is created");
+        let path = dir.path().join("gang.db");
+        let first = rusqlite::Connection::open(&path).expect("database opens");
+        first
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("write lock is taken");
+        let mut first = Some(first);
+        let mut second = rusqlite::Connection::open(&path).expect("database opens");
+
+        let mut pauses = 0;
+        bring_up_with_retry(&mut second, &settings, &mut |_: Duration| {
+            pauses += 1;
+            if let Some(mut first) = first.take() {
+                first
+                    .execute_batch("COMMIT")
+                    .expect("write lock is released");
+                migrate(&mut first).expect("the first opener migrates");
+            }
+        })
+        .expect("the second opener comes up after the first one's migration");
+
+        assert_eq!(pauses, 1, "the second opener waits exactly once");
+        let version: i64 = second
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user version reads");
+        let mut migrated =
+            rusqlite::Connection::open_in_memory().expect("in-memory database opens");
+        migrate(&mut migrated).expect("a fresh database migrates");
+        let newest: i64 = migrated
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user version reads");
+        assert_eq!(version, newest);
+    }
+
     #[tokio::test]
     async fn a_failed_open_is_not_cached() {
         let dir = TempDir::new().expect("temp dir is created");

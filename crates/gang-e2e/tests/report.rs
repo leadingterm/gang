@@ -1,8 +1,8 @@
 //! Behaviour of the probe report parser: keys, values, blank lines, and malformed text.
 
 use gang_e2e::{
-    DiskNeighbourReport, E2eError, IsolationReport, Namespaces, PoisonReport, ProbeReport,
-    VictimReport,
+    DiskNeighbourReport, E2eError, InputRootReport, IsolationReport, Namespaces, PoisonReport,
+    ProbeReport, VictimReport,
 };
 
 fn parse_error_detail(error: &E2eError) -> Option<String> {
@@ -245,6 +245,34 @@ fn the_victim_report_names_the_missing_key() {
 
     let detail = parse_error_detail(&error).expect("a parse error on the probe report");
     assert_eq!(detail, "missing key `poisoned`");
+}
+
+#[test]
+fn input_root_report_round_trips_link_counts() -> gang_e2e::Result<()> {
+    for sibling_links in [Some(1), None] {
+        let report = InputRootReport {
+            shared_path: "../shared/input".to_owned(),
+            sibling: "shared input".to_owned(),
+            symlink: "shared input".to_owned(),
+            sibling_links,
+        };
+        let text = report.to_string();
+        if sibling_links.is_none() {
+            assert!(text.contains("sibling_links=unreadable\n"));
+        }
+        assert_eq!(InputRootReport::try_from(&parsed(&text)?)?, report);
+    }
+    Ok(())
+}
+
+#[test]
+fn input_root_report_rejects_an_invalid_link_count() -> gang_e2e::Result<()> {
+    let report = parsed("shared_path=../input\nsibling=x\nsymlink=x\nsibling_links=invalid\n")?;
+    let error = InputRootReport::try_from(&report).expect_err("invalid link count");
+    let detail = parse_error_detail(&error).expect("a parse error on the probe report");
+    assert!(detail.contains("`sibling_links`"), "{detail}");
+    assert!(detail.contains("`invalid`"), "{detail}");
+    Ok(())
 }
 
 #[test]

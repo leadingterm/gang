@@ -4,7 +4,7 @@ Flake input `gang-binaries` (`flake = false`), consumed by `packages.<system>.ga
 
 This directory is a placeholder. It holds no binary.
 
-Layout: `<system>/gang`, where `<system>` is `x86_64-linux` or `aarch64-linux`. Each `gang` is the static musl binary built by Bazel on a host of that architecture:
+Layout: `<system>/gang`, where `<system>` is `x86_64-linux` or `aarch64-linux`. Each `gang` is the static musl binary built by Bazel: the release asset `gang-x86_64-unknown-linux-musl` or `gang-aarch64-unknown-linux-musl` of a Gang release (checked against its `SHA256SUMS`), or a local build:
 
     bazel build -c opt //:gang
     # binary: bazel-bin/crates/gang-main/gang

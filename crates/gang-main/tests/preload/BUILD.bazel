@@ -2,6 +2,7 @@
 # gnu/dynamic so that the host's dynamic loader runs them, whatever platform `gang` itself is built for. The
 # cc_binary targets are manual because built directly they would target the musl platform; the genrules build
 # them as exec tools.
+# The e2e glibc-toolchain scenario runs loaded_probe as its dynamically linked glibc program.
 cc_binary(
     name = "marker_lib.so",
     srcs = ["marker.c"],
@@ -32,5 +33,8 @@ genrule(
     cmd = "cp $(execpath :probe) $@",
     target_compatible_with = ["@platforms//os:linux"],
     tools = [":probe"],
-    visibility = ["//crates/gang-main:__pkg__"],
+    visibility = [
+        "//crates/gang-e2e:__pkg__",
+        "//crates/gang-main:__pkg__",
+    ],
 )

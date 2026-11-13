@@ -1,0 +1,8 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+sh_test(
+    name = "install-gang_test",
+    srcs = ["install-gang_test.sh"],
+    data = ["install-gang.sh"],
+    env = {"INSTALL_GANG": "$(rootpath install-gang.sh)"},
+)

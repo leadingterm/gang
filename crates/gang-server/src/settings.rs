@@ -3,7 +3,7 @@
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use gang_config::{DashboardConfig, RoleConfig};
+use gang_config::{DashboardConfig, EndpointTrust, RoleConfig};
 use gang_spi::LoginClient;
 use gang_types::{Isa, NonZeroDuration, Percent, ProviderName, TrustDomain};
 
@@ -16,6 +16,18 @@ pub enum TransportSettings {
     Plaintext,
     /// Connections complete a TLS handshake under the server's certificate authority.
     Tls(TlsSettings),
+}
+
+impl TransportSettings {
+    /// Returns what clients trust at the endpoint. A plaintext server sits behind a terminator
+    /// that clients verify with their system roots.
+    #[must_use]
+    pub(crate) fn endpoint_trust(&self) -> EndpointTrust {
+        match self {
+            Self::Tls(tls) => tls.endpoint_trust,
+            Self::Plaintext => EndpointTrust::System,
+        }
+    }
 }
 
 /// How TLS connections are issued certificates and handshake.
@@ -33,6 +45,8 @@ pub struct TlsSettings {
     pub reissue_at_percent: Percent,
     /// How TLS handshakes are bounded.
     pub handshake: HandshakeSettings,
+    /// What clients see at the endpoint: under `System` the server information advertises no CA.
+    pub endpoint_trust: EndpointTrust,
 }
 
 /// Limits on the TLS handshakes of one listener.
@@ -42,6 +56,8 @@ pub struct HandshakeSettings {
     pub handshake_timeout: NonZeroDuration,
     /// How many TLS handshakes may be in progress at once on one listener.
     pub max_pending_handshakes: NonZeroUsize,
+    /// How long a refused TLS connection stays open for its client to read the alert.
+    pub refusal_linger: NonZeroDuration,
 }
 
 /// Limits on each Gang API request.

@@ -80,6 +80,15 @@ pub enum ConfigError {
     #[error("an authentication plugin requires server.transport = \"tls\"")]
     #[fix("set server.transport = \"tls\"")]
     AuthenticationRequiresTls,
+    /// `endpoint_trust = "system"` under `tls` with a `ca_pin` and a worker plugin that does not
+    /// enroll: the worker reads the CA from `GET /v1/server`, which then advertises none.
+    #[error(
+        "server.endpoint_trust = \"system\" advertises no CA, which a pinned worker without enrollment needs"
+    )]
+    #[fix(
+        "set server.endpoint_trust = \"ca\", or enroll workers through an authentication plugin that issues certificates"
+    )]
+    PinnedWorkersNeedAdvertisedCa,
     /// A scheduler worker endpoint has no host.
     #[error("worker endpoint `{0}` has no host")]
     #[fix(
@@ -229,6 +238,7 @@ mod tests {
             ConfigError::AuthenticationProviderNotConfigured(provider()),
             ConfigError::ReservedProviderName(provider()),
             ConfigError::AuthenticationRequiresTls,
+            ConfigError::PinnedWorkersNeedAdvertisedCa,
             ConfigError::WorkerEndpointWithoutHost(endpoint()),
             ConfigError::WorkerEndpointNotGrpcs(endpoint()),
             ConfigError::WorkerEndpointNotGrpc(endpoint()),

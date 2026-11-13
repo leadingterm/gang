@@ -15,6 +15,7 @@ bytes = { workspace = true }
 futures = { workspace = true }
 gang-clock = { workspace = true }
 gang-spi = { workspace = true }
+gang-tls = { workspace = true }
 gang-types = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }

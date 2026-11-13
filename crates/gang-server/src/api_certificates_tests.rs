@@ -5,16 +5,17 @@ use std::sync::atomic::Ordering;
 use gang_clock::Clock;
 use gang_spi::CertStatus;
 use gang_types::{CertSerial, CertificateRequestPem, Proof, ProviderName};
-use gang_wire::routes::{CREATE_CERTIFICATE, REVOKE_CERTIFICATE};
-use gang_wire::{Certificate, CreateCertificateRequest, ErrorReason, name};
+use gang_wire::routes::{CREATE_CERTIFICATE, GET_SERVER, REVOKE_CERTIFICATE};
+use gang_wire::{Certificate, CreateCertificateRequest, ErrorReason, Server, name};
 use serde_json::json;
 
 use crate::api_test_support::{
-    ADMIN_PROOF, ALICE_PROOF, FAR_FUTURE_MILLIS, PROVIDER, WORKER_PROOF, WORKER_PROVIDER, metadata,
-    post, send, worker_certificate, worker_identity,
+    ADMIN_PROOF, ALICE_PROOF, FAR_FUTURE_MILLIS, PROVIDER, WORKER_PROOF, WORKER_PROVIDER, get,
+    metadata, post, send, worker_certificate, worker_identity,
 };
 use crate::test_support::{
-    api_request, at, mint_token, serve, signing_request, tls_parts, tls_settings,
+    api_request, at, mint_token, publicly_trusted_settings, serve, signing_request, tls_parts,
+    tls_settings,
 };
 
 const TARGET_SERIAL: &str = "b1";
@@ -55,6 +56,10 @@ async fn a_signing_request_is_answered_with_the_certificate_and_recorded_in_the_
             .await;
 
             let certificate: Certificate = answer.ok();
+            let server: Server<serde_json::Value> =
+                get(&controller, GET_SERVER.template, None).await.ok();
+            assert!(certificate.ca_certificate.is_some());
+            assert_eq!(certificate.ca_certificate, server.ca_certificate);
             let issued = repository.issued();
             let [record] = issued.as_slice() else {
                 panic!("exactly one certificate is recorded");
@@ -71,6 +76,34 @@ async fn a_signing_request_is_answered_with_the_certificate_and_recorded_in_the_
                 .pem_certificate
                 .expect("creating a certificate answers its PEM");
             assert!(pem.as_str().starts_with("-----BEGIN CERTIFICATE-----"));
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_publicly_trusted_server_still_answers_the_ca_with_the_certificate() {
+    let (parts, _dials, handles) = tls_parts();
+    serve(
+        parts,
+        publicly_trusted_settings(),
+        handles.scheduler,
+        |controller| async move {
+            let certificate: Certificate = send(
+                &controller,
+                api_request(
+                    "POST",
+                    CREATE_CERTIFICATE.template,
+                    None,
+                    Some(create_body(signing_request())),
+                ),
+            )
+            .await
+            .ok();
+            let ca = certificate
+                .ca_certificate
+                .expect("creating a certificate answers the issuing CA");
+            assert!(ca.as_str().starts_with("-----BEGIN CERTIFICATE-----"));
         },
     )
     .await;
@@ -223,6 +256,7 @@ async fn admin_revokes_a_certificate_by_serial() {
             assert_eq!(certificate.expire_time, at(FAR_FUTURE_MILLIS));
             assert_eq!(certificate.revoke_time, Some(now));
             assert!(certificate.pem_certificate.is_none());
+            assert!(certificate.ca_certificate.is_none());
             let target = CertSerial::try_new(TARGET_SERIAL).expect("fixture serial is valid");
             let issued = repository.issued();
             let record = issued.iter().find(|record| record.serial == target);

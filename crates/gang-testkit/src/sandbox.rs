@@ -20,6 +20,8 @@ pub struct StartedAction {
     pub argv: Vec<OsString>,
     /// The complete environment of the command.
     pub environment: Vec<(OsString, OsString)>,
+    /// The directory that holds everything of the action; the working directory is inside it.
+    pub action_directory: PathBuf,
     /// The directory the command runs in.
     pub working_directory: PathBuf,
     /// Whether the action asked for network access.
@@ -92,6 +94,7 @@ impl ActionIsolationPort for ScriptedSandbox {
                 .chain(spec.command.args().iter().cloned())
                 .collect(),
             environment: spec.environment.to_vec(),
+            action_directory: spec.action_directory.to_path_buf(),
             working_directory: spec.working_directory.to_path_buf(),
             network: spec.network,
             launcher: spec.launcher.to_vec(),
@@ -144,6 +147,7 @@ mod tests {
         Ok(ready(sandbox.start(&ActionExecutionSpec {
             command: ActionCommand::from_argv(&sample_argv()).ok_or("empty argv")?,
             environment: &sample_environment(),
+            action_directory: Path::new("/work"),
             working_directory: Path::new("/work"),
             network: NetworkRequest::Requested,
             launcher: &[],
@@ -202,6 +206,7 @@ mod tests {
             [StartedAction {
                 argv: sample_argv(),
                 environment: sample_environment(),
+                action_directory: PathBuf::from("/work"),
                 working_directory: PathBuf::from("/work"),
                 network: NetworkRequest::Requested,
                 launcher: Vec::new(),
