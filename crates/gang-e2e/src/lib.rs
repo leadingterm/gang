@@ -27,6 +27,7 @@ mod browser_verdict;
 mod build_output;
 mod check;
 mod checked_in;
+mod chromium;
 mod cli;
 mod cli_terminal;
 mod control;
@@ -118,15 +119,16 @@ pub use browser_verdict::{
 pub use build_output::{BuildOutcome, ProcessSummary};
 pub use check::{Check, Outcome, Report};
 pub use checked_in::{Shipped, ShippedConfig, Start, checked_in_configs};
+pub use chromium::{Chromium, Navigation};
 pub use cli::{
     Call, Colour, Local, Refused, RowStatus, StatusRow, Terminal, cli, plain, status_rows,
 };
 pub use control::{Control, ControlKnobs};
 pub use dashboard::dashboard;
 pub use device_verdict::{
-    DevicePrompt, cross_site_approval_refused, device_approved, device_only, device_prompt,
-    device_resource, device_session, logged_in_with, refused_with, renewed_by_web_client,
-    rotation_stored, stored_nothing,
+    DevicePrompt, browser_approved, cross_site_approval_refused, device_approved, device_only,
+    device_prompt, device_resource, device_session, logged_in_with, refused_with,
+    renewed_by_web_client, rotation_stored, stored_nothing,
 };
 pub use disk::disk;
 pub use drain_cancel::drain_cancel;

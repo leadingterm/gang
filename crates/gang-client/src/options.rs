@@ -37,7 +37,8 @@ pub struct ClientOptions {
     /// The longest text of a server error body quoted in an error message, in characters;
     /// longer text is cut and marked with `...`. Must not be zero.
     pub max_error_message_chars: NonZeroUsize,
-    /// The time a login waits for the browser redirect or a pasted URL. Must not be zero.
+    /// The time a login waits for the browser redirect, a pasted URL, or device approval.
+    /// Must not be zero.
     pub login_timeout: NonZeroDuration,
     /// The time allowed for one loopback connection to deliver its request. Must not be zero.
     pub callback_read_timeout: NonZeroDuration,

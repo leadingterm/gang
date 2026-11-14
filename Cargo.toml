@@ -40,7 +40,7 @@ resolver = "2"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
-version = "0.1.4"
+version = "0.1.5"
 
 [workspace.lints.rust]
 missing_docs = "deny"
@@ -294,6 +294,7 @@ ts-rs = { default-features = false, features = [
     "serde-compat",
     "serde-json-impl",
 ], version = "12.0.1" }
+tungstenite = { default-features = false, features = ["handshake"], version = "0.30" }
 unicode-width = "0.2"
 url = { features = [
     "serde",

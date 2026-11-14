@@ -1,11 +1,14 @@
 //! The pure verdicts of the identity scenario's device login (ADR-37).
 
 use gang_types::Url;
-use gang_wire::{DEVICE_APPROVED_PATH, DEVICE_PATH, ErrorResponse};
+use gang_wire::{
+    ApproveDeviceAuthorizationResponse, DEVICE_APPROVED_PATH, DEVICE_PATH, ErrorResponse,
+};
 use serde_json::Value;
 
 use crate::access::StoredSession;
 use crate::access_verdict::{Verdict, query_value, redirected_to, set_cookies};
+use crate::chromium::Navigation;
 use crate::issuer::{DASHBOARD_CLIENT_ID, RefreshOutcome, RefreshRecord};
 use crate::process::Ran;
 use crate::server::Answer;
@@ -89,20 +92,63 @@ pub fn device_resource(answer: &Answer, code: &str, client_address: &str) -> Ver
     Ok(())
 }
 
-/// Checks the provider redirect and device approval callback.
+/// Checks the browser's destination and the resulting device authorization state.
 ///
 /// # Errors
 ///
-/// Returns a description when the redirects or session cookie do not match.
+/// Returns the refusal, unexpected destination, or observed resource state.
+pub fn browser_approved(navigation: &Navigation, endpoint: &Url, resource: &Answer) -> Verdict {
+    match navigation {
+        Navigation::Refused(message) => {
+            return Err(format!("the browser refused the approval: {message}"));
+        }
+        Navigation::Stalled => {
+            return Err(
+                "the browser neither navigated nor reported a refusal after the approve click"
+                    .to_owned(),
+            );
+        }
+        Navigation::Committed(url)
+            if url.origin() != endpoint.origin() || url.path() != DEVICE_APPROVED_PATH =>
+        {
+            return Err(format!("the browser stopped at {url}"));
+        }
+        Navigation::Committed(_) => {}
+    }
+    let state = serde_json::from_slice::<Value>(&resource.body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("state")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    if resource.status == 200 && state.as_deref() == Some("APPROVED") {
+        Ok(())
+    } else {
+        Err(format!(
+            "device status {}, state {state:?}",
+            resource.status
+        ))
+    }
+}
+
+/// Checks the provider URL and device approval callback.
+///
+/// # Errors
+///
+/// Returns a description when the answer, provider redirect or session cookie does not match.
 pub fn device_approved(
     started: &Answer,
     provider_location: &str,
     done: &Answer,
     session_cookie: &str,
 ) -> Verdict {
-    if started.status != 303 {
+    if started.status != 200 {
         return Err(format!("the approval answered {}", started.status));
     }
+    serde_json::from_slice::<ApproveDeviceAuthorizationResponse>(&started.body)
+        .map_err(|error| format!("the approval answered an invalid provider URL: {error}"))?;
     if query_value(provider_location, "code").is_none() {
         return Err(format!(
             "provider redirect has no code: {provider_location}"
@@ -244,5 +290,127 @@ pub fn renewed_by_web_client(grants: &[RefreshRecord]) -> std::result::Result<St
         Err(format!(
             "expected one rotating dashboard refresh grant: {grants:?}"
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_requires_provider_url_and_valid_callback() {
+        let started = Answer {
+            status: 200,
+            headers: vec![],
+            body: br#"{"authorizationUrl":"https://example.com/authorize"}"#.to_vec(),
+        };
+        let done = Answer {
+            status: 302,
+            headers: vec![("location".into(), DEVICE_APPROVED_PATH.into())],
+            body: vec![],
+        };
+        let provider = "https://example.com/ui/callback?code=ok";
+        assert!(device_approved(&started, provider, &done, "session").is_ok());
+        assert!(
+            device_approved(
+                &Answer {
+                    status: 303,
+                    ..started.clone()
+                },
+                provider,
+                &done,
+                "session"
+            )
+            .is_err()
+        );
+        assert!(
+            device_approved(
+                &Answer {
+                    body: b"{}".to_vec(),
+                    ..started.clone()
+                },
+                provider,
+                &done,
+                "session"
+            )
+            .is_err()
+        );
+        assert!(
+            device_approved(
+                &started,
+                "https://example.com/ui/callback",
+                &done,
+                "session"
+            )
+            .is_err()
+        );
+        assert!(
+            device_approved(
+                &started,
+                provider,
+                &Answer {
+                    status: 200,
+                    ..done.clone()
+                },
+                "session"
+            )
+            .is_err()
+        );
+        let with_cookie = Answer {
+            headers: vec![
+                ("location".into(), DEVICE_APPROVED_PATH.into()),
+                ("set-cookie".into(), "session=value; Path=/".into()),
+            ],
+            ..done
+        };
+        assert!(device_approved(&started, provider, &with_cookie, "session").is_err());
+    }
+
+    #[test]
+    fn browser_approval_checks_navigation_and_state() {
+        let endpoint = Url::parse("https://example.com/").expect("valid endpoint");
+        let good = Navigation::Committed(endpoint.join(DEVICE_APPROVED_PATH).expect("valid path"));
+        let answer = |status, body: &str| Answer {
+            status,
+            headers: vec![],
+            body: body.as_bytes().to_vec(),
+        };
+        assert!(
+            browser_approved(&good, &endpoint, &answer(200, r#"{"state":"APPROVED"}"#)).is_ok()
+        );
+        assert_eq!(
+            browser_approved(
+                &Navigation::Refused("blocked".into()),
+                &endpoint,
+                &answer(200, "{}")
+            ),
+            Err("the browser refused the approval: blocked".into())
+        );
+        assert_eq!(
+            browser_approved(&Navigation::Stalled, &endpoint, &answer(200, "{}")),
+            Err(
+                "the browser neither navigated nor reported a refusal after the approve click"
+                    .into()
+            )
+        );
+        for url in [
+            "https://example.com/other",
+            "https://other.example/ui/device/approved",
+        ] {
+            let navigation = Navigation::Committed(Url::parse(url).expect("valid URL"));
+            assert_eq!(
+                browser_approved(&navigation, &endpoint, &answer(200, "{}")),
+                Err(format!("the browser stopped at {url}"))
+            );
+        }
+        assert!(
+            browser_approved(&good, &endpoint, &answer(200, r#"{"state":"PENDING"}"#))
+                .expect_err("pending fails")
+                .contains("PENDING")
+        );
+        assert!(
+            browser_approved(&good, &endpoint, &answer(500, r#"{"state":"APPROVED"}"#)).is_err()
+        );
+        assert!(browser_approved(&good, &endpoint, &answer(200, "invalid")).is_err());
     }
 }

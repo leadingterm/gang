@@ -142,6 +142,7 @@ fn json_bodies_round_trip() -> Result<(), Box<dyn Error>> {
     check_json::<ListPrincipalsResponse>(&files, "principals.json")?;
     check_json::<ListRolesResponse>(&files, "roles.json")?;
     check_json::<ListEventsResponse>(&files, "events.json")?;
+    check_json::<gang_wire::DeviceAuthorization>(&files, "device-authorization.json")?;
     Ok(())
 }
 

@@ -146,7 +146,8 @@ impl<P: LoginProviders, C: Console, K: Clock + 'static> Client<P, C, K> {
     /// errors of [`ClientError::Transport`], [`ClientError::Server`], and [`ClientError::Body`];
     /// [`ClientError::ProviderNotOffered`], [`ClientError::AmbiguousProvider`], or
     /// [`ClientError::NoInteractiveProvider`] when the provider cannot be chosen;
-    /// [`ClientError::LoginTimedOut`] when no redirect arrives in time;
+    /// [`ClientError::LoginTimedOut`] when no browser redirect arrives in time;
+    /// [`ClientError::DeviceApprovalTimedOut`] when device approval does not arrive in time;
     /// [`ClientError::Provider`] when the identity provider rejects the login; and the storage
     /// errors of [`ClientError::Io`] and [`ClientError::Session`].
     pub async fn login(&self, request: &InteractiveLogin<'_>) -> Result<LoggedIn, ClientError> {
@@ -308,7 +309,7 @@ impl<P: LoginProviders, C: Console, K: Clock + 'static> Client<P, C, K> {
             };
             Clock::timeout(&self.clock, remaining, poll)
                 .await
-                .map_err(|_| ClientError::LoginTimedOut)?
+                .map_err(|_| ClientError::DeviceApprovalTimedOut)?
         };
         let remaining = self
             .options
@@ -317,7 +318,7 @@ impl<P: LoginProviders, C: Console, K: Clock + 'static> Client<P, C, K> {
             .saturating_sub(self.clock.monotonic().saturating_duration_since(started));
         Clock::timeout(&self.clock, remaining, operation)
             .await
-            .map_err(|_| ClientError::LoginTimedOut)?
+            .map_err(|_| ClientError::DeviceApprovalTimedOut)?
     }
 
     /// Logs in with a proof source and stores the session. A workload session has no refresh

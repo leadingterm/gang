@@ -507,8 +507,8 @@ pub mod identity {
     /// ADR-37: the approval page's resource shows the requester, never the secret.
     pub const DEVICE_SHOWS_CLIENT_ADDRESS: &str =
         "the device authorization shows the CLI's address and never its secret";
-    /// ADR-37: the approval goes through the provider to the approved page.
-    pub const DEVICE_APPROVAL_REDIRECTS: &str = "a same-origin approval goes through the provider and the callback to /ui/device/approved without a session cookie";
+    /// ADR-37: approval answers the provider URL and goes through the callback to the approved page.
+    pub const DEVICE_APPROVAL_REDIRECTS: &str = "a same-origin approval answers the provider URL and goes through the provider and the callback to /ui/device/approved without a session cookie";
     /// ADR-38/39: device approvals still ask for offline access.
     pub const DEVICE_APPROVAL_OFFLINE: &str =
         "the device approval asks the provider for offline access with consent";
@@ -530,8 +530,10 @@ pub mod identity {
     /// ADR-37 attacker: a second redeem.
     pub const SECOND_REDEEM_REFUSED: &str =
         "a second redeem answers 404 DEVICE_AUTHORIZATION_NOT_FOUND";
+    /// ADR-37: a real browser approves under the dashboard's own headers.
+    pub const DEVICE_APPROVED_IN_BROWSER: &str = "a headless browser types the code at /ui/device, approves, and reaches the provider and /ui/device/approved under the dashboard's Content-Security-Policy";
     /// The device-login checks, in the order the identity scenario emits them.
-    pub const DEVICE: [&str; 12] = [
+    pub const DEVICE: [&str; 13] = [
         DEVICE_LOGIN_PROMPTED,
         DEVICE_SHOWS_CLIENT_ADDRESS,
         DEVICE_APPROVAL_REDIRECTS,
@@ -544,6 +546,7 @@ pub mod identity {
         WRONG_SECRET_REDEEM_REFUSED,
         REVOKED_BEFORE_REDEEM_REFUSED,
         SECOND_REDEEM_REFUSED,
+        DEVICE_APPROVED_IN_BROWSER,
     ];
 }
 

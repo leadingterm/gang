@@ -110,6 +110,11 @@ pub(crate) const PROVIDER: &str = "e2e";
 /// How long the identity scenario's device authorization remains valid.
 pub(crate) const DEVICE_TTL: Duration = Duration::from_mins(1);
 
+/// `[server.rate_limit.client] burst` of the identity deployment. Every check comes from the same
+/// loopback address, so the default bucket would let the scenario's own volume, not the
+/// behaviour under test, decide its later checks.
+const IDENTITY_CLIENT_BURST: NonZeroU32 = NonZeroU32::new(120).expect("120 is non-zero");
+
 /// The principal of the administrator's token, under [`PROVIDER`].
 const ADMINISTRATOR_PRINCIPAL: &str = "administrator";
 
@@ -606,6 +611,7 @@ fn render_identity(document: &mut Document<Plugins>, knobs: IdentityKnobs) -> Re
     if knobs == IdentityKnobs::IDENTITY {
         document.dashboard.device.ttl =
             DeviceCodeTtl::try_new(DEVICE_TTL).map_err(template_error)?;
+        document.server.rate_limit.client.burst = IDENTITY_CLIENT_BURST;
     }
     if knobs.sign_in == SignIn::Offered {
         let provider: ProviderName = PROVIDER.parse().map_err(template_error)?;

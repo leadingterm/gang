@@ -140,6 +140,9 @@ impl Cli {
             glibc_tool: env::var_os("GANG_E2E_GLIBC_TOOL").map(|path| current.join(path)),
             glibc_loader: ActionTools::host_glibc_loader(),
         };
+        if settings.chromium.is_none() {
+            settings.chromium = env::var_os("GANG_E2E_CHROMIUM").map(PathBuf::from);
+        }
         let invocation = Invocation {
             gang,
             bazel,

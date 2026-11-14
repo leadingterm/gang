@@ -1,5 +1,7 @@
 //! Behavioural tests of the browser sign-in: `/ui/login`, `/ui/callback` and the session it issues.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::device_logins::Redeem;
@@ -10,11 +12,81 @@ use gang_types::{ClientSecret, Identity, Principal, ProviderName};
 use gang_wire::{ERROR_PATH, routes::GET_SESSION};
 use http::StatusCode;
 use http::header::CACHE_CONTROL;
+use parking_lot::Mutex;
+use tracing::field::{Field, Visit};
+use tracing::{Event, Subscriber};
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::{Layer, Registry};
 
 use crate::test_support::{
     ApiReply, BeginFailure, Harness, HarnessOptions, TlsDeployment, raw_api_request, read, request,
     request_with_header,
 };
+
+/// A field recorder for the events emitted by a single request.
+#[derive(Default)]
+struct EventFields(BTreeMap<String, String>);
+
+impl Visit for EventFields {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(field.name().to_owned(), format!("{value:?}"));
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.0.insert(field.name().to_owned(), value.to_owned());
+    }
+}
+
+/// Collects INFO events without changing the request's tracing context.
+#[derive(Clone, Default)]
+struct Events(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+
+impl<S: Subscriber> Layer<S> for Events {
+    fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+        if *event.metadata().level() == tracing::Level::INFO {
+            let mut fields = EventFields::default();
+            event.record(&mut fields);
+            self.0.lock().push(fields.0);
+        }
+    }
+}
+
+impl Events {
+    fn matching(&self, message: &str) -> Vec<BTreeMap<String, String>> {
+        self.0
+            .lock()
+            .iter()
+            .filter(|fields| fields.get("message").is_some_and(|value| value == message))
+            .cloned()
+            .collect()
+    }
+}
+
+/// Runs requests on the subscriber's thread so scoped events are captured.
+fn recorded(f: impl FnOnce(&tokio::runtime::Runtime, &Events)) {
+    let events = Events::default();
+    let subscriber = Registry::default().with(events.clone());
+    gang_testkit::with_subscriber(subscriber, || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        f(&runtime, &events);
+    });
+}
+
+fn assert_event(events: &Events, message: &str, outcome: &str, principal: Option<&str>) {
+    let matching = events.matching(message);
+    assert_eq!(matching.len(), 1, "{message}: {matching:?}");
+    let fields = &matching[0];
+    assert!(
+        fields
+            .get("outcome")
+            .is_some_and(|value| value.starts_with(outcome)),
+        "{fields:?}"
+    );
+    assert_eq!(fields.get("principal").map(String::as_str), principal);
+}
 
 /// The session cookie name on an `https` endpoint.
 const SESSION_COOKIE: &str = "__Host-gang_session";
@@ -95,9 +167,16 @@ async fn finish(harness: &Harness<TlsDeployment>, state: &str) -> ApiReply {
 
 /// The state of a sign-in, read from the `state` parameter of its authorization URL.
 fn state_of(reply: &ApiReply) -> String {
-    let location = reply
-        .location()
-        .expect("sign-in redirects to the identity provider");
+    let location = if reply.status == StatusCode::OK {
+        reply
+            .json::<gang_wire::ApproveDeviceAuthorizationResponse>()
+            .authorization_url
+            .to_string()
+    } else {
+        reply
+            .location()
+            .expect("sign-in redirects to the identity provider")
+    };
     let url = gang_types::Url::parse(&location).expect("the authorization URL is absolute");
     url.query_pairs()
         .find(|(name, _)| name == "state")
@@ -124,6 +203,17 @@ fn assert_failed(reply: &ApiReply, reason: &str) {
     assert_eq!(
         reply.location(),
         Some(format!("{ERROR_PATH}?reason={reason}"))
+    );
+    assert!(reply.set_cookie_value(SESSION_COOKIE).is_none());
+    assert!(reply.set_cookies().contains(&cleared_login_cookie()));
+}
+
+fn assert_device_failed(reply: &ApiReply, reason: &str) {
+    assert_eq!(reply.status, StatusCode::FOUND);
+    assert_no_store(reply);
+    assert_eq!(
+        reply.location(),
+        Some(format!("/ui/device?reason={reason}"))
     );
     assert!(reply.set_cookie_value(SESSION_COOKIE).is_none());
     assert!(reply.set_cookies().contains(&cleared_login_cookie()));
@@ -830,11 +920,11 @@ async fn approve_device(harness: &Harness<TlsDeployment>, code: &str, site: &str
         "POST",
         "/ui/device",
         None,
-        format!("userCode={code}").into_bytes(),
+        serde_json::to_vec(&serde_json::json!({ "userCode": code })).expect("request encodes"),
     );
     request.headers_mut().insert(
         http::header::CONTENT_TYPE,
-        http::HeaderValue::from_static("application/x-www-form-urlencoded"),
+        http::HeaderValue::from_static("application/json"),
     );
     request.headers_mut().insert(
         "sec-fetch-site",
@@ -882,18 +972,49 @@ async fn cross_site_device_approval_is_403_and_starts_nothing() {
     let authorization = create_device(&harness);
     let reply = approve_device(&harness, device_code(&authorization), "cross-site").await;
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    assert!(reply.body.is_empty());
     assert!(harness.verifier.begun().is_empty());
 }
 
 #[tokio::test]
-async fn an_unknown_code_redirects_to_the_device_page_with_an_error() {
+async fn an_unknown_code_is_not_found() {
     let harness = device_harness();
     let reply = approve_device(&harness, "invalid", "same-origin").await;
-    assert_eq!(reply.status, StatusCode::SEE_OTHER);
-    assert_eq!(
-        reply.location().as_deref(),
-        Some("/ui/device?error=unknown")
-    );
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    assert!(reply.body.is_empty());
+    assert!(harness.verifier.begun().is_empty());
+}
+
+#[tokio::test]
+async fn malformed_device_approval_bodies_are_rejected() {
+    let harness = device_harness();
+    for (body, content_type, status) in [
+        (
+            r"userCode=X",
+            "application/x-www-form-urlencoded",
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ),
+        (r"userCode=X", "application/json", StatusCode::BAD_REQUEST),
+        (
+            r#"{"userCode":"X","extra":true}"#,
+            "Application/JSON; charset=utf-8",
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let mut request = raw_api_request("POST", "/ui/device", None, body.as_bytes().to_vec());
+        request.headers_mut().insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static(content_type),
+        );
+        request.headers_mut().insert(
+            "sec-fetch-site",
+            http::HeaderValue::from_static("same-origin"),
+        );
+        let reply = exchange(&harness, request).await;
+        assert_eq!(reply.status, status);
+        assert!(reply.body.is_empty());
+        assert!(reply.set_cookies().is_empty());
+    }
     assert!(harness.verifier.begun().is_empty());
 }
 
@@ -902,7 +1023,19 @@ async fn a_device_approval_signs_in_offline_with_the_web_client() {
     let harness = device_harness();
     let authorization = create_device(&harness);
     let reply = approve_device(&harness, device_code(&authorization), "same-origin").await;
-    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(reply.status, StatusCode::OK);
+    let answer: gang_wire::ApproveDeviceAuthorizationResponse = reply.json();
+    let expected = gang_types::Url::parse_with_params(
+        "https://idp.example.test/authorize",
+        &[
+            ("client_id", "web-client"),
+            ("redirect_uri", "https://gang.example.test/ui/callback"),
+            ("state", "state-1"),
+        ],
+    )
+    .expect("provider URL parses");
+    assert_eq!(answer.authorization_url, expected);
+    assert_no_store(&reply);
     let state = state_of(&reply);
     assert_eq!(reply.set_cookies(), vec![login_set_cookie(&state)]);
     assert!(reply.set_cookie_value(SESSION_COOKIE).is_none());
@@ -913,6 +1046,29 @@ async fn a_device_approval_signs_in_offline_with_the_web_client() {
         begun[0].client,
         Some(("web-client".to_owned(), SECRET.to_owned()))
     );
+}
+
+#[tokio::test]
+async fn device_approval_reports_sign_in_start_failures() {
+    for (failure, status) in [
+        (BeginFailure::Unavailable, StatusCode::SERVICE_UNAVAILABLE),
+        (
+            BeginFailure::Rejected(Rejection::PolicyDenied),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            BeginFailure::Rejected(Rejection::InvalidProof),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    ] {
+        let harness = device_harness();
+        let authorization = create_device(&harness);
+        harness.verifier.fail_begin(failure);
+        let reply = approve_device(&harness, device_code(&authorization), "same-origin").await;
+        assert_eq!(reply.status, status);
+        assert!(reply.body.is_empty());
+        assert!(reply.set_cookies().is_empty());
+    }
 }
 
 #[tokio::test]
@@ -956,7 +1112,7 @@ async fn a_device_callback_without_a_refresh_token_leaves_the_entry_pending() {
     let authorization = create_device(&harness);
     let begun = approve_device(&harness, device_code(&authorization), "same-origin").await;
     let done = finish(&harness, &state_of(&begun)).await;
-    assert_failed(&done, "failed");
+    assert_device_failed(&done, "failed");
     assert!(done.set_cookie_value(RENEWAL_COOKIE).is_none());
     let device = harness.routes.device().expect("device login");
     assert!(matches!(
@@ -979,7 +1135,7 @@ async fn a_second_approval_is_refused() {
     let second = approve_device(&harness, device_code(&authorization), "same-origin").await;
     let approved = finish(&harness, &state_of(&first)).await;
     assert_eq!(approved.location().as_deref(), Some("/ui/device/approved"));
-    assert_failed(&finish(&harness, &state_of(&second)).await, "failed");
+    assert_device_failed(&finish(&harness, &state_of(&second)).await, "failed");
 }
 
 #[tokio::test]
@@ -988,4 +1144,57 @@ async fn device_approval_is_404_when_device_login_is_off() {
     let reply = approve_device(&harness, "BCDF-GHJK", "same-origin").await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND);
     assert!(harness.verifier.begun().is_empty());
+}
+
+#[test]
+fn refused_device_approvals_log_the_outcome_once() {
+    for (code, site, status) in [
+        ("invalid", "cross-site", StatusCode::FORBIDDEN),
+        ("invalid", "same-origin", StatusCode::NOT_FOUND),
+    ] {
+        recorded(|runtime, events| {
+            let harness = device_harness();
+            let reply = runtime.block_on(approve_device(&harness, code, site));
+            assert_eq!(reply.status, status);
+            assert_event(events, "device approval refused", status.as_str(), None);
+            assert!(events.matching("device approval refused")[0].contains_key("client"));
+        });
+    }
+}
+
+#[test]
+fn failed_device_callback_logs_principal_and_returns_to_device_page() {
+    recorded(|runtime, events| {
+        let harness = device_harness();
+        let authorization = create_device(&harness);
+        let code = device_code(&authorization);
+        let begun = runtime.block_on(approve_device(&harness, code, "same-origin"));
+        let reply = runtime.block_on(finish(&harness, &state_of(&begun)));
+        assert_device_failed(&reply, "failed");
+        assert_event(events, "device approval failed", "failed", Some("admin"));
+        assert_eq!(
+            events.matching("device approval failed")[0]
+                .get("code")
+                .map(String::as_str),
+            Some(code)
+        );
+    });
+}
+
+#[test]
+fn browser_renewal_logs_principal_and_outcome_once() {
+    recorded(|runtime, events| {
+        let harness = Harness::<TlsDeployment>::token(HarnessOptions::default());
+        let cookie = runtime.block_on(renewal_cookie(&harness));
+        harness.verifier.renew_to("refresh", "admin-proof", None);
+        let reply = runtime.block_on(renew(&harness, Some(&cookie)));
+        assert_eq!(reply.status, StatusCode::NO_CONTENT);
+        assert_event(events, "browser renewal", "204", Some("admin"));
+    });
+    recorded(|runtime, events| {
+        let harness = Harness::<TlsDeployment>::token(HarnessOptions::default());
+        let reply = runtime.block_on(renew(&harness, None));
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+        assert_event(events, "browser renewal", "401", None);
+    });
 }

@@ -33,6 +33,8 @@ pub(crate) fn render() -> Result<String, crate::Error> {
     }
     out.push('\n');
     out.push_str(&paths_decl()?);
+    out.push('\n');
+    out.push_str(&user_code_decl()?);
     Ok(out)
 }
 
@@ -42,6 +44,8 @@ fn collect(cfg: &Config) -> BTreeMap<String, String> {
     let mut seen = HashSet::new();
     walk::<gang_wire::Isa>(cfg, &mut out, &mut seen);
     walk::<gang_wire::Session>(cfg, &mut out, &mut seen);
+    walk::<gang_wire::ApproveDeviceAuthorizationRequest>(cfg, &mut out, &mut seen);
+    walk::<gang_wire::ApproveDeviceAuthorizationResponse>(cfg, &mut out, &mut seen);
     walk::<gang_wire::DeviceAuthorization>(cfg, &mut out, &mut seen);
     walk::<gang_wire::DeviceAuthorizationState>(cfg, &mut out, &mut seen);
     walk::<gang_wire::ListPrincipalsResponse>(cfg, &mut out, &mut seen);
@@ -115,6 +119,16 @@ fn paths_decl() -> Result<String, serde_json::Error> {
     Ok(format!("export const PATHS = {{\n{entries}}} as const;\n"))
 }
 
+/// Renders the shared user-code alphabet and length for the dashboard.
+fn user_code_decl() -> Result<String, serde_json::Error> {
+    Ok(format!(
+        "/** User codes: `length` characters of `alphabet`, displayed as two halves joined by `-`. */\n\
+         export const USER_CODE = {{ alphabet: {}, length: {} }} as const;\n",
+        json_string(gang_wire::USER_CODE_ALPHABET)?,
+        gang_wire::USER_CODE_LENGTH,
+    ))
+}
+
 /// Builds one `key: "path",` entry of the `PATHS` constant.
 fn path_entry(key: &str, path: &str) -> Result<String, serde_json::Error> {
     Ok(format!("  {key}: {},\n", json_string(path)?))
@@ -156,6 +170,14 @@ mod tests {
         let rendered = render().unwrap();
         assert!(rendered.contains("export type Session = "), "{rendered}");
         assert!(
+            rendered.contains("export type ApproveDeviceAuthorizationRequest = "),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("export type ApproveDeviceAuthorizationResponse = "),
+            "{rendered}"
+        );
+        assert!(
             rendered.contains("export type DeviceAuthorization = "),
             "{rendered}"
         );
@@ -174,6 +196,16 @@ mod tests {
         assert!(rendered.contains("export type State = "), "{rendered}");
         assert!(rendered.contains("export type Frame = "), "{rendered}");
         assert!(rendered.contains("export type Delta = "), "{rendered}");
+    }
+
+    #[test]
+    fn output_exports_the_user_code_configuration_after_paths() {
+        let rendered = render().unwrap();
+        let paths = rendered.find("export const PATHS = ").unwrap();
+        let user_code = rendered
+            .find("export const USER_CODE = { alphabet: \"BCDFGHJKLMNPQRSTVWXZ\", length: 8 } as const;")
+            .unwrap();
+        assert!(paths < user_code);
     }
 
     #[test]

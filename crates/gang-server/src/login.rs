@@ -10,10 +10,13 @@ use gang_spi::{
     ApiRequestBody, ApiResponseBody, AuthenticationPort, CredentialLifecyclePort, LoginGrant,
     LoginPort, LoginRequest, PortError, ProofVerifierPort, Rejection, TokenIssue, full_body,
 };
-use gang_types::{Principal, ProviderName, RefreshToken};
-use gang_wire::{DEVICE_APPROVED_PATH, ERROR_PATH, UiRoute};
+use gang_types::{LoginSession, Principal, ProviderName, RefreshToken, Url};
+use gang_wire::{
+    ApproveDeviceAuthorizationRequest, ApproveDeviceAuthorizationResponse, DEVICE_APPROVED_PATH,
+    DEVICE_PATH, ERROR_PATH, UiRoute,
+};
 use http::HeaderMap;
-use http::header::{ALLOW, HeaderValue, LOCATION, ORIGIN, RETRY_AFTER, SET_COOKIE};
+use http::header::{ALLOW, CONTENT_TYPE, HeaderValue, LOCATION, ORIGIN, RETRY_AFTER, SET_COOKIE};
 use http::{Method, Request, Response, StatusCode};
 use parking_lot::Mutex;
 use tracing::{info, warn};
@@ -58,6 +61,24 @@ struct MountedLogin<C: Clock, V> {
     flights: RenewalFlights,
     /// The device authorization service shared with the API, when enabled.
     device: Option<Arc<MountedDevice<C, V>>>,
+}
+
+/// A started sign-in: the provider's authorization URL and the sign-in cookie bound to it.
+struct Started {
+    authorization_url: Url,
+    cookie: HeaderValue,
+}
+
+impl Started {
+    fn redirect(
+        self,
+        mut cookies: Vec<HeaderValue>,
+    ) -> Result<Response<ApiResponseBody>, LoginFailure> {
+        let location = HeaderValue::try_from(self.authorization_url.as_str())
+            .map_err(|_| LoginFailure::failed("authorization url is not a header value"))?;
+        cookies.insert(0, self.cookie);
+        Ok(redirect(location, cookies))
+    }
 }
 
 impl<K: Stack> Clone for SessionRoutes<K> {
@@ -242,14 +263,31 @@ impl<K: Stack> SessionRoutes<K> {
         match self
             .begin(mounted, Purpose::Session { next, renewal })
             .await
+            .and_then(|started| started.redirect(Vec::new()))
         {
             Ok(response) => response,
-            Err(failure) => error_redirect(failure, Vec::new()),
+            Err(failure) => error_redirect(failure, ERROR_PATH, Vec::new()),
         }
     }
 
-    /// Starts an offline sign-in to approve a pending device authorization.
+    /// Starts an offline sign-in to approve a pending device authorization and answers the
+    /// provider's authorization URL for the page to navigate to: the dashboard's
+    /// `form-action 'self'` also covers a form's redirects, so a redirect answer would be blocked.
     async fn start_device(
+        &self,
+        mounted: &MountedLogin<K::Clock, K::Identity>,
+        headers: &HeaderMap,
+        body: ApiRequestBody,
+        client: Option<IpAddr>,
+    ) -> Response<ApiResponseBody> {
+        let response = self.device_start(mounted, headers, body, client).await;
+        if !response.status().is_success() {
+            info!(client = ?client, outcome = %response.status(), "device approval refused");
+        }
+        response
+    }
+
+    async fn device_start(
         &self,
         mounted: &MountedLogin<K::Clock, K::Identity>,
         headers: &HeaderMap,
@@ -262,26 +300,33 @@ impl<K: Stack> SessionRoutes<K> {
         if let Err(delay) = mounted.limiter.check(client) {
             return rate_limited(delay);
         }
+        if !is_json(headers) {
+            return empty(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        }
         let Ok(bytes) = crate::api::read_body(body, self.0.max_request_size).await else {
             return empty(StatusCode::BAD_REQUEST);
         };
-        let code = form_urlencoded::parse(&bytes)
-            .find(|(name, _)| name == "userCode")
-            .and_then(|(_, value)| mounted.device.as_ref()?.logins.begin_approval(&value));
+        let Ok(request) = serde_json::from_slice::<ApproveDeviceAuthorizationRequest>(&bytes)
+        else {
+            return empty(StatusCode::BAD_REQUEST);
+        };
+        let code = mounted
+            .device
+            .as_ref()
+            .and_then(|device| device.logins.begin_approval(&request.user_code));
         let Some(code) = code else {
-            let mut response = redirect(
-                HeaderValue::from_static("/ui/device?error=unknown"),
-                Vec::new(),
-            );
-            *response.status_mut() = StatusCode::SEE_OTHER;
-            return response;
+            return empty(StatusCode::NOT_FOUND);
         };
         match self.begin(mounted, Purpose::Device { code }).await {
-            Ok(mut response) => {
-                *response.status_mut() = StatusCode::SEE_OTHER;
+            Ok(started) => {
+                let answer = ApproveDeviceAuthorizationResponse {
+                    authorization_url: started.authorization_url,
+                };
+                let mut response = crate::responses::json(StatusCode::OK, &answer);
+                response.headers_mut().append(SET_COOKIE, started.cookie);
                 response
             }
-            Err(failure) => error_redirect(failure, Vec::new()),
+            Err(failure) => empty(failure.status()),
         }
     }
 
@@ -289,7 +334,7 @@ impl<K: Stack> SessionRoutes<K> {
         &self,
         mounted: &MountedLogin<K::Clock, K::Identity>,
         purpose: Purpose,
-    ) -> Result<Response<ApiResponseBody>, LoginFailure> {
+    ) -> Result<Started, LoginFailure> {
         let login = &mounted.settings;
         let core = &self.0.core;
         let offline = !matches!(
@@ -309,8 +354,6 @@ impl<K: Stack> SessionRoutes<K> {
             .await
             .map_err(|error| LoginFailure::of(&error))?;
         let state = challenge.state;
-        let location = HeaderValue::try_from(challenge.authorization_url.as_str())
-            .map_err(|_| LoginFailure::failed("authorization url is not a header value"))?;
         let cookie = core
             .cookies
             .login_header(&state, login.ttl.get())
@@ -323,7 +366,10 @@ impl<K: Stack> SessionRoutes<K> {
             },
             core.host.clock.monotonic(),
         );
-        Ok(redirect(location, vec![cookie]))
+        Ok(Started {
+            authorization_url: challenge.authorization_url,
+            cookie,
+        })
     }
 
     async fn callback(
@@ -338,7 +384,11 @@ impl<K: Stack> SessionRoutes<K> {
         }
         match self.finish(mounted, query, headers, client).await {
             Ok(response) => response,
-            Err(failure) => error_redirect(failure, self.login_clearing().into_iter().collect()),
+            Err(failure) => error_redirect(
+                failure,
+                ERROR_PATH,
+                self.login_clearing().into_iter().collect(),
+            ),
         }
     }
 
@@ -370,19 +420,19 @@ impl<K: Stack> SessionRoutes<K> {
             .take(state, core.host.clock.monotonic())
             .ok_or_else(|| LoginFailure::failed("sign-in attempt is unknown or expired"))?;
         let Attempt { session, purpose } = attempt;
+        let (next, renewal) = match purpose {
+            Purpose::Session { next, renewal } => (next, renewal),
+            Purpose::Device { code } => {
+                return Ok(self
+                    .finish_device(mounted, code, session, &callback_url, clear, client)
+                    .await);
+            }
+        };
         let grant = mounted
             .verifier
             .complete_login(session, &callback_url)
             .await
             .map_err(|error| LoginFailure::of(&error))?;
-        let (next, renewal) = match purpose {
-            Purpose::Session { next, renewal } => (next, renewal),
-            Purpose::Device { code } => {
-                return self
-                    .finish_device(mounted, code, grant, clear, client)
-                    .await;
-            }
-        };
         let principal = mounted
             .verifier
             .verify(&grant.proof)
@@ -442,10 +492,33 @@ impl<K: Stack> SessionRoutes<K> {
         &self,
         mounted: &MountedLogin<K::Clock, K::Identity>,
         code: UserCode,
-        grant: LoginGrant,
+        session: LoginSession,
+        callback_url: &Url,
         clear: HeaderValue,
         client: Option<IpAddr>,
-    ) -> Result<Response<ApiResponseBody>, LoginFailure> {
+    ) -> Response<ApiResponseBody> {
+        let grant = match mounted.verifier.complete_login(session, callback_url).await {
+            Ok(grant) => grant,
+            Err(error) => return device_failed(&code, None, LoginFailure::of(&error), clear),
+        };
+        let principal = match mounted.verifier.verify(&grant.proof).await {
+            Ok(principal) => principal.as_str().to_owned(),
+            Err(error) => return device_failed(&code, None, LoginFailure::of(&error), clear),
+        };
+        if let Err(failure) = Self::approve_verified(mounted, &code, grant, &principal) {
+            return device_failed(&code, Some(&principal), failure, clear);
+        }
+        info!(%code, %principal, approver = ?client, "device login approved");
+        redirect(HeaderValue::from_static(DEVICE_APPROVED_PATH), vec![clear])
+    }
+
+    /// Stores a verified device grant if its authorization is still pending.
+    fn approve_verified(
+        mounted: &MountedLogin<K::Clock, K::Identity>,
+        code: &UserCode,
+        grant: LoginGrant,
+        principal: &str,
+    ) -> Result<(), LoginFailure> {
         if grant.refresh_token.is_none() {
             warn!(
                 provider = %mounted.settings.provider,
@@ -454,31 +527,21 @@ impl<K: Stack> SessionRoutes<K> {
             );
             return Err(LoginFailure::failed("device login has no refresh token"));
         }
-        let principal = mounted
-            .verifier
-            .verify(&grant.proof)
-            .await
-            .map_err(|error| LoginFailure::of(&error))?;
         let device = mounted
             .device
             .as_ref()
             .ok_or_else(|| LoginFailure::failed("device login is not mounted"))?;
-        let principal = principal.as_str().to_owned();
         if !device.logins.approve(
-            &code,
+            code,
             Approval {
                 code: code.clone(),
                 grant,
-                principal: principal.clone(),
+                principal: principal.to_owned(),
             },
         ) {
             return Err(LoginFailure::failed("device login is no longer pending"));
         }
-        info!(%code, %principal, approver = ?client, "device login approved");
-        Ok(redirect(
-            HeaderValue::from_static(DEVICE_APPROVED_PATH),
-            vec![clear],
-        ))
+        Ok(())
     }
 
     /// Rechecks a held renewal against the signed-in principal, restarting offline if invalid.
@@ -513,7 +576,7 @@ impl<K: Stack> SessionRoutes<K> {
                 .cookies
                 .clear_renewal_header()
                 .map_err(|_| LoginFailure::failed("renewal cookie cannot be cleared"))?;
-            let mut response = self
+            let response = self
                 .begin(
                     mounted,
                     Purpose::Session {
@@ -521,8 +584,8 @@ impl<K: Stack> SessionRoutes<K> {
                         renewal: None,
                     },
                 )
-                .await?;
-            response.headers_mut().append(SET_COOKIE, renewal_clear);
+                .await?
+                .redirect(vec![renewal_clear])?;
             return Ok(ControlFlow::Break(response));
         }
         Ok(ControlFlow::Continue(
@@ -563,19 +626,31 @@ impl<K: Stack> SessionRoutes<K> {
         client: Option<IpAddr>,
     ) -> Response<ApiResponseBody> {
         let core = &self.0.core;
-        let login = &mounted.settings;
         if !is_same_origin_request(headers, core.host.endpoint.origin()) {
-            return empty(StatusCode::FORBIDDEN);
+            return renewal_logged(None, empty(StatusCode::FORBIDDEN));
         }
         if let Err(delay) = mounted.limiter.check(client) {
-            return rate_limited(delay);
+            return renewal_logged(None, rate_limited(delay));
         }
         let renewal = cookie_value(headers, core.cookies.renewal)
             .and_then(|value| mounted.seal.open(value).ok())
-            .filter(|renewal| renewal.provider == login.provider);
-        let Some(mut renewal) = renewal else {
-            return self.renewal_refusal(StatusCode::UNAUTHORIZED, true);
+            .filter(|renewal| renewal.provider == mounted.settings.provider);
+        let Some(renewal) = renewal else {
+            return renewal_logged(None, self.renewal_refusal(StatusCode::UNAUTHORIZED, true));
         };
+        let principal = renewal.principal.clone();
+        let response = self.renew_held(mounted, renewal).await;
+        renewal_logged(Some(&principal), response)
+    }
+
+    /// Renews a session from an opened, provider-matched cookie.
+    async fn renew_held(
+        &self,
+        mounted: &MountedLogin<K::Clock, K::Identity>,
+        mut renewal: Renewal,
+    ) -> Response<ApiResponseBody> {
+        let core = &self.0.core;
+        let login = &mounted.settings;
         if renewal.expire_time <= core.host.clock.wall() {
             return self.renewal_refusal(StatusCode::UNAUTHORIZED, false);
         }
@@ -723,6 +798,15 @@ impl LoginFailure {
         Self::Failed
     }
 
+    /// The empty HTTP refusal for a sign-in that cannot start.
+    const fn status(self) -> StatusCode {
+        match self {
+            Self::Denied => StatusCode::FORBIDDEN,
+            Self::Failed => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+
     /// The reason the error page names.
     const fn reason(self) -> &'static str {
         match self {
@@ -773,6 +857,22 @@ fn is_dot_dot(segment: &str) -> bool {
         || segment.eq_ignore_ascii_case("%2e%2e")
 }
 
+/// Whether the request declares exactly one `Content-Type`, `application/json` with any
+/// parameters. A cross-site form cannot send it without a CORS preflight.
+fn is_json(headers: &HeaderMap) -> bool {
+    let all_content_types = headers.get_all(CONTENT_TYPE);
+    let mut content_types = all_content_types.iter();
+    let json = content_types
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(';').next().is_some_and(|media_type| {
+                media_type.trim().eq_ignore_ascii_case("application/json")
+            })
+        });
+    json && content_types.next().is_none()
+}
+
 /// A `405` naming the methods the path accepts.
 fn method_not_allowed(allow: &'static str) -> Response<ApiResponseBody> {
     let mut response = empty(StatusCode::METHOD_NOT_ALLOWED);
@@ -795,16 +895,57 @@ fn redirect(location: HeaderValue, set_cookies: Vec<HeaderValue>) -> Response<Ap
 /// A `302` to the error page, naming only the reason.
 fn error_redirect(
     failure: LoginFailure,
+    page: &'static str,
     set_cookies: Vec<HeaderValue>,
 ) -> Response<ApiResponseBody> {
-    let location = HeaderValue::from_str(&format!("{ERROR_PATH}?reason={}", failure.reason()))
-        .unwrap_or_else(|_| HeaderValue::from_static(ERROR_PATH));
+    let location = HeaderValue::from_str(&format!("{page}?reason={}", failure.reason()))
+        .unwrap_or_else(|_| HeaderValue::from_static(page));
     redirect(location, set_cookies)
+}
+
+/// Logs a failed device approval and returns to the device page with its reason.
+fn device_failed(
+    code: &UserCode,
+    principal: Option<&str>,
+    failure: LoginFailure,
+    clear: HeaderValue,
+) -> Response<ApiResponseBody> {
+    info!(%code, principal, outcome = failure.reason(), "device approval failed");
+    error_redirect(failure, DEVICE_PATH, vec![clear])
+}
+
+/// Logs a browser renewal's outcome and returns its answer.
+fn renewal_logged(
+    principal: Option<&str>,
+    response: Response<ApiResponseBody>,
+) -> Response<ApiResponseBody> {
+    info!(principal, outcome = %response.status(), "browser renewal");
+    response
 }
 
 #[cfg(test)]
 mod tests {
-    use super::safe_next;
+    use super::{is_json, safe_next};
+    use http::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+
+    #[test]
+    fn json_content_type_requires_exactly_one_matching_media_type() {
+        for (value, expected) in [
+            ("application/json", true),
+            ("Application/JSON; charset=utf-8", true),
+            ("application/x-www-form-urlencoded", false),
+            ("text/plain", false),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static(value));
+            assert_eq!(is_json(&headers), expected, "{value}");
+        }
+        let mut headers = HeaderMap::new();
+        assert!(!is_json(&headers));
+        headers.append(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.append(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        assert!(!is_json(&headers));
+    }
 
     #[test]
     fn safe_next_keeps_ui_paths_and_rejects_others() {

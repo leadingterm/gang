@@ -21,6 +21,7 @@ use crate::access::{
     Access, Administration, Aging, DeviceLogin, Login, MisdirectedLogin, Misdirection,
     StoredSession, TokenAnswer, Validity, WorkerIdentity,
 };
+use crate::chromium::{Chromium, Navigation};
 use crate::device_verdict::{DevicePrompt, device_prompt};
 use crate::errors::{E2eError, Result};
 use crate::flags::helper_path;
@@ -61,6 +62,25 @@ const EXPIRED_AGE: Duration = Duration::from_hours(2);
 const EXPIRED_LIFETIME: Duration = Duration::from_hours(1);
 /// Lifetime of a current token.
 const CURRENT_LIFETIME: Duration = Duration::from_mins(10);
+
+/// Focuses the device code input.
+const FOCUS_CODE: &str = "document.querySelector(\"main input\").focus()";
+/// Clicks the enabled approval button once it appears.
+const CLICK_APPROVE: &str = r#"new Promise(resolve => {
+    const click = () => {
+        const button = [...document.querySelectorAll("button")].find(
+            button => !button.disabled && /approve/i.test(button.textContent)
+        );
+        if (!button) return false;
+        observer.disconnect();
+        button.click();
+        resolve();
+        return true;
+    };
+    const observer = new MutationObserver(click);
+    observer.observe(document.body, {childList: true, subtree: true, attributes: true});
+    click();
+})"#;
 
 /// Process and output readers for an interactive login.
 type LoginProcess = (
@@ -159,6 +179,22 @@ impl Access for Secured<'_> {
 
     fn request(&self, request: &Request) -> Result<Answer> {
         ServerApi::send(self.stack(), request)
+    }
+
+    fn approve_in_browser(&self, code: &str) -> Result<Navigation> {
+        let settings = self.stack().settings();
+        let program = settings.chromium_program()?;
+        let mut browser = Chromium::launch(program, Instant::now() + settings.command_timeout)?;
+        let endpoint = self.stack().endpoint()?;
+        let page = endpoint
+            .join(gang_wire::DEVICE_PATH)
+            .map_err(E2eError::system_from("constructing the device page URL"))?;
+        browser.open(&page)?;
+        browser.evaluate(FOCUS_CODE)?;
+        browser.insert_text(code)?;
+        browser.press_enter()?;
+        browser.evaluate(CLICK_APPROVE)?;
+        browser.next_navigation()
     }
 
     fn visit(&self, url: &Url) -> Result<Answer> {

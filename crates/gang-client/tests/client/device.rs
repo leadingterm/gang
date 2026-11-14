@@ -132,7 +132,12 @@ async fn device_login_ends_at_the_code_expiry() {
         }
         h.clock.advance(Duration::from_secs(5));
     });
-    assert!(matches!(result, Err(ClientError::LoginTimedOut)));
+    let error = result.expect_err("device login times out");
+    assert!(matches!(error, ClientError::DeviceApprovalTimedOut));
+    assert_eq!(
+        error.to_string(),
+        "login timed out waiting for the device approval"
+    );
     assert!(!h.home.session_file().exists());
     assert!(!h.home.token_file().exists());
 }

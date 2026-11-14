@@ -42,4 +42,5 @@ gang-authn = { workspace = true }
 gang-testkit = { workspace = true }
 p256 = { workspace = true }
 tokio-rustls = { workspace = true }
+tracing-subscriber = { workspace = true }
 x509-cert = { workspace = true, features = ["builder"] }

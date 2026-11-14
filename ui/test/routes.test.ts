@@ -31,9 +31,9 @@ test("the error page with a trailing slash is still the error page", () => {
   assert.deepEqual(routeOf("/ui/error/", ""), { kind: "error", reason: null });
 });
 
-test("device approval carries only its error, never a code from the URL", () => {
-  assert.deepEqual(routeOf("/ui/device", "?error=unknown&code=X"), { kind: "device", error: "unknown" });
-  assert.deepEqual(routeOf("/ui/device/", "?code=X"), { kind: "device", error: null });
+test("device approval carries only its reason, never a code from the URL", () => {
+  assert.deepEqual(routeOf("/ui/device", "?reason=failed&code=X"), { kind: "device", reason: "failed" });
+  assert.deepEqual(routeOf("/ui/device/", "?code=X"), { kind: "device", reason: null });
 });
 
 test("device approval confirmation has its own route", () => {

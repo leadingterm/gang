@@ -6,10 +6,34 @@ use gang_clock::Timestamp;
 use gang_types::{DeviceSecret, ProviderName, Url};
 use serde::{Deserialize, Serialize};
 
+/// The characters of a user code: consonants without Y, so no code spells a word and none is
+/// mistaken for a digit or another letter.
+pub const USER_CODE_ALPHABET: &str = "BCDFGHJKLMNPQRSTVWXZ";
+/// Characters in a user code, displayed as two halves joined by `-`.
+pub const USER_CODE_LENGTH: usize = 8;
+
 impl crate::Known for DeviceSecret {
     fn is_known(&self) -> bool {
         true
     }
+}
+
+/// Body of `POST /ui/device`: the code the user typed.
+#[derive(gang_macros::Known, Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApproveDeviceAuthorizationRequest {
+    /// The user code, `XXXX-XXXX`; case, spaces and the hyphen are ignored.
+    pub user_code: String,
+}
+
+/// Answer of `POST /ui/device`: where the browser signs in to approve. The page navigates there
+/// itself because `form-action 'self'` also covers a form submission's redirects.
+#[derive(gang_macros::Known, Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ApproveDeviceAuthorizationResponse {
+    /// The identity provider's authorization URL for this approval.
+    #[ts(type = "string")]
+    pub authorization_url: Url,
 }
 
 /// `deviceAuthorizations/{userCode}`: a pending headless login (ADR-37).

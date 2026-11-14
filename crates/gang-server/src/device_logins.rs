@@ -11,7 +11,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use gang_clock::{Clock, Tick, Timestamp};
 use gang_spi::{LoginClient, LoginGrant};
 use gang_types::{DeviceSecret, ProviderName, Url};
-use gang_wire::{DeviceAuthorization, DeviceAuthorizationState};
+use gang_wire::{
+    DeviceAuthorization, DeviceAuthorizationState, USER_CODE_ALPHABET, USER_CODE_LENGTH,
+};
 use parking_lot::Mutex;
 use ring::digest::{SHA256, digest};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -19,26 +21,28 @@ use ring::rand::{SecureRandom, SystemRandom};
 use crate::settings::DeviceSettings;
 use crate::ttl_map::TtlMap;
 
-/// The alphabet used for device user codes.
-const ALPHABET: &[u8; 20] = b"BCDFGHJKLMNPQRSTVWXZ";
+/// Largest multiple of the alphabet length within the number of possible byte values.
+const UNBIASED_BYTE_BOUND: usize =
+    (1usize << u8::BITS) / USER_CODE_ALPHABET.len() * USER_CODE_ALPHABET.len();
 
-/// A normalized eight-character device user code.
+/// A normalized device user code.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct UserCode([u8; 8]);
+pub(crate) struct UserCode([u8; USER_CODE_LENGTH]);
 
 impl UserCode {
     /// Draws each character uniformly, rejecting the incomplete final byte range.
     fn generate(random: &SystemRandom) -> Result<Self, DeviceError> {
-        let mut code = [0; 8];
+        let mut code = [0; USER_CODE_LENGTH];
         let mut filled = 0;
         while filled < code.len() {
-            let mut bytes = [0; 8];
+            let mut bytes = [0; USER_CODE_LENGTH];
             random
                 .fill(&mut bytes)
                 .map_err(|_| DeviceError::Randomness)?;
             for byte in bytes {
-                if byte < 240 {
-                    code[filled] = ALPHABET[usize::from(byte % 20)];
+                if usize::from(byte) < UNBIASED_BYTE_BOUND {
+                    code[filled] =
+                        USER_CODE_ALPHABET.as_bytes()[usize::from(byte) % USER_CODE_ALPHABET.len()];
                     filled += 1;
                     if filled == code.len() {
                         break;
@@ -59,11 +63,11 @@ impl FromStr for UserCode {
     type Err = InvalidUserCode;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
-        let mut code = [0; 8];
+        let mut code = [0; USER_CODE_LENGTH];
         let mut count = 0;
         for byte in input.bytes().filter(|byte| !matches!(byte, b'-' | b' ')) {
             let byte = byte.to_ascii_uppercase();
-            if count == code.len() || !ALPHABET.contains(&byte) {
+            if count == code.len() || !USER_CODE_ALPHABET.as_bytes().contains(&byte) {
                 return Err(InvalidUserCode);
             }
             code[count] = byte;
@@ -79,7 +83,7 @@ impl FromStr for UserCode {
 impl fmt::Display for UserCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (index, byte) in self.0.iter().enumerate() {
-            if index == 4 {
+            if index == USER_CODE_LENGTH / 2 {
                 f.write_str("-")?;
             }
             write!(f, "{}", char::from(*byte))?;
@@ -391,12 +395,12 @@ mod tests {
         for _ in 0..256 {
             let code = UserCode::generate(&random).expect("randomness available");
             let text = code.to_string();
-            assert_eq!(text.len(), 9);
-            assert_eq!(text.as_bytes()[4], b'-');
+            assert_eq!(text.len(), USER_CODE_LENGTH + 1);
+            assert_eq!(text.as_bytes()[USER_CODE_LENGTH / 2], b'-');
             assert!(
                 text.bytes()
                     .filter(|byte| *byte != b'-')
-                    .all(|byte| ALPHABET.contains(&byte))
+                    .all(|byte| USER_CODE_ALPHABET.as_bytes().contains(&byte))
             );
         }
     }

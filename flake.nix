@@ -132,6 +132,11 @@
         name = "bazel-bazelisk";
         paths = [(bazelWrapper "bazel") (bazelWrapper "bazelisk")];
       };
+      # The identity scenario's browser. Chromium aborts when fontconfig finds no fonts, so it gets a pinned configuration.
+      e2eChromium = pkgs.runCommand "gang-e2e-chromium" {nativeBuildInputs = [pkgs.makeWrapper];} ''
+        makeWrapper ${pkgs.chromium}/bin/chromium $out/bin/chromium \
+          --set FONTCONFIG_FILE ${pkgs.makeFontsConf {fontDirectories = [pkgs.dejavu_fonts];}}
+      '';
       deployTools = [pkgs.awscli2 pkgs.coreutils pkgs.gh pkgs.git pkgs.jq pkgs.opentofu];
     in {
       default = pkgs.mkShell ({
@@ -156,6 +161,9 @@
         }
         // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           GANG_E2E_BWRAP = "${pkgs.bubblewrap}/bin/bwrap";
+          # The browser of the identity scenario's device approval, which observes what only a browser enforces: the dashboard's Content-Security-Policy.
+          # Pinned by flake.lock's nixpkgs, like bubblewrap; never taken from the host PATH.
+          GANG_E2E_CHROMIUM = "${e2eChromium}/bin/chromium";
         });
       deploy = pkgs.mkShell {packages = deployTools;};
       # The release workflow's image publication: S3 uploads and zstd.

@@ -16,7 +16,7 @@ use gang_clock::Clock;
 use gang_spi::{
     ApiRequestBody, ApiResponseBody, ApiService, Authenticated, AuthenticationPort,
     CertificateIssue, CredentialLifecyclePort, LoginPort, PortError, ScalingEventSeq,
-    StateRepositoryPort, TokenIssue, full_body,
+    StateRepositoryPort, TokenIssue,
 };
 use gang_types::{Identity, NonZeroDuration, Proof, ProviderName, RefreshToken};
 use gang_wire::name::{self, SESSION};
@@ -24,11 +24,11 @@ use gang_wire::page::{PageToken, page_size};
 use gang_wire::routes::{self, Method as RouteMethod, RouteId};
 use gang_wire::{
     AuthenticateRequest, AuthenticateResponse, Certificate, CreateCertificateRequest, Credential,
-    DeviceAuthorization, ErrorReason, ErrorResponse, INTERNAL_ERROR_BODY, ListEventsResponse,
-    ListPrincipalsResponse, ListRolesResponse, Principal, RedeemDeviceAuthorizationRequest,
-    RevokePrincipalResponse, Role, Session, SessionLogin, Status,
+    DeviceAuthorization, ErrorReason, ErrorResponse, ListEventsResponse, ListPrincipalsResponse,
+    ListRolesResponse, Principal, RedeemDeviceAuthorizationRequest, RevokePrincipalResponse, Role,
+    Session, SessionLogin, Status,
 };
-use http::header::{CONTENT_TYPE, HeaderValue, RETRY_AFTER, WWW_AUTHENTICATE};
+use http::header::{HeaderValue, RETRY_AFTER, WWW_AUTHENTICATE};
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::BodyExt;
 use serde::{
@@ -51,6 +51,7 @@ use crate::hub::StateHub;
 use crate::query::query_param;
 use crate::rate_limit::RateLimiter;
 use crate::resources::{IssuedPems, wire_certificate, wire_principal};
+use crate::responses::{json, json_response};
 use crate::revocation::Revocations;
 use crate::settings::RequestLimits;
 use crate::stream::{StreamParams, open_stream};
@@ -952,32 +953,6 @@ pub(crate) fn failure(error: Status) -> Response<ApiResponseBody> {
             .headers_mut()
             .insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
     }
-    response
-}
-
-/// Renders `body` as JSON with `status`. A body that cannot be serialized becomes a constant
-/// internal error.
-fn json<T: Serialize>(status: StatusCode, body: &T) -> Response<ApiResponseBody> {
-    match serde_json::to_vec(body) {
-        Ok(bytes) => json_response(status, bytes),
-        Err(error) => {
-            tracing::error!(%error, "cannot serialize api response");
-            json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Bytes::from_static(INTERNAL_ERROR_BODY.as_bytes()),
-            )
-        }
-    }
-}
-
-/// Renders `body` as a JSON response with `status` that the caller must not store.
-fn json_response(status: StatusCode, body: impl Into<Bytes>) -> Response<ApiResponseBody> {
-    let mut response = Response::new(full_body(body));
-    *response.status_mut() = status;
-    response
-        .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    crate::responses::no_store(response.headers_mut());
     response
 }
 
