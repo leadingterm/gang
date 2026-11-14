@@ -43,11 +43,13 @@
     export PATH=/run/current-system/sw/bin LC_ALL=C
     problems=()
 
-    # Every unit of the boot ran: none failed, no job is left but this one, and the only runtime masks are the check's (the image's own masks are the image's).
+    # The boot finished: systemd's job queue drained, so no job of the boot is left (one that never finishes keeps the check waiting until its hard deadline).
+    # Jobs that systemd or udev queue after the boot, such as a console setup restart for a new virtual terminal, are not part of it.
+    state=$(systemctl is-system-running --wait)
+    [ "$state" = running ] || problems+=("the system is $state, not running")
+    # No unit failed, and the only runtime masks are the check's (the image's own masks are the image's).
     failed=$(systemctl list-units --all --state=failed --plain --no-legend --no-pager | awk '{print $1}' | xargs)
     [ -z "$failed" ] || problems+=("failed units: $failed")
-    jobs=$(systemctl list-jobs --no-legend --no-pager | awk '$2 != "image-check.service" {print $2 "/" $3}' | xargs)
-    [ -z "$jobs" ] || problems+=("unfinished jobs: $jobs")
     masked=$(systemctl list-unit-files --no-legend --no-pager | awk '$2 == "masked-runtime" {print $1}' | sort | xargs)
     [ "$masked" = ${lib.escapeShellArg maskedUnits} ] || problems+=("masked units: ''${masked:-none}; the check masks only ${maskedUnits}")
 
@@ -113,7 +115,8 @@
       After=multi-user.target
 
       [Service]
-      Type=oneshot
+      # Its start job finishes once the check runs, so the boot's job queue can drain while the check waits for it.
+      Type=exec
       ImportCredential=image-check
       ExecStart=/run/current-system/sw/bin/bash %d/image-check
       StandardOutput=journal+console
