@@ -16,8 +16,10 @@ in {
   imports = [(modulesPath + "/image/repart.nix")];
 
   # Only the firmware reads the EFI system partition, to boot the unified kernel image; nothing in the running system does.
-  # So the system never mounts or checks it, and nothing in its boot depends on it: `ec2.efi` stays off, because in the EC2 module it only declares
-  # a `/boot` mount of the partition (and GRUB's EFI options), and that mount's file system check raced growpart's rewrite of the disk's partition table and could hang the boot.
+  # So the system never mounts or checks it, and nothing in its boot depends on it: `ec2.efi` is off on both architectures (nixpkgs turns it on by default on aarch64),
+  # because in the EC2 module it only declares a `/boot` mount of the partition (and GRUB's EFI options), and that mount's file system check raced growpart's
+  # rewrite of the disk's partition table and could hang the boot.
+  ec2.efi = false;
   boot.loader.grub.enable = false;
   # Nor does systemd's GPT auto generator, which is on by default: because the unified kernel image's stub reports the partition it booted from,
   # it would declare a `/boot` mount of the EFI system partition with its file system check. The root, the image's only other partition, is mounted by label.
