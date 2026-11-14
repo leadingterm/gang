@@ -106,6 +106,10 @@ jobs:
           mkdir dist
           for role in controller worker; do
             nix build -L --override-input gang-binaries "path:$PWD/gang-binaries" ".#packages.$SYSTEM.$role-image" --out-link "image-$role"
+          done
+          # The second build runs against a store whose identical files are hard-linked, as on a host with auto-optimise-store, so a disk that carried the builder's store layout differs.
+          nix store optimise
+          for role in controller worker; do
             # Nix builds the disk a second time and fails if the bytes differ.
             nix build -L --rebuild --override-input gang-binaries "path:$PWD/gang-binaries" ".#packages.$SYSTEM.$role-image.disk" --no-link
           done

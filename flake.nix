@@ -64,9 +64,9 @@
       pkgs = pkgsFor system;
       binary = "${gang-binaries}/${system}/gang";
       # Raw, so the disk compresses well and EBS direct APIs or VM Import take it unconverted.
-      image = role:
+      image = role: volumes:
         import ./infra/nixos/verified-image.nix {
-          inherit pkgs;
+          inherit pkgs volumes;
           nixos = mkNixos [ec2ImageModule {image.repart.name = "gang-${role}";}] role system;
         };
     in {
@@ -97,8 +97,9 @@
         '';
         meta.mainProgram = "gang";
       };
-      controller-image = image "controller";
-      worker-image = image "worker";
+      # The controller module attaches the state volume as sdf; a worker's scratch volume is gang-scratch's, which needs instance metadata.
+      controller-image = image "controller" ["sdf"];
+      worker-image = image "worker" [];
     });
 
     nixosConfigurations = lib.listToAttrs (lib.concatMap (
