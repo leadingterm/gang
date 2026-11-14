@@ -1,7 +1,8 @@
 // Preview server: serves the built bundle with the production `/ui` headers (`headers.json`) and
-// answers the HTTP API endpoints from the recorded fixtures. `node tools/preview.mjs <dist>`, run from `ui/`.
+// answers the HTTP API endpoints from the recorded fixtures, including device-code lookup and a
+// simulated approval. `node tools/preview.mjs <dist>`, run from `ui/`.
 // Open `/ui/?scenario=<name>` to pick a scenario: live (default), stale, lagging, empty, cold,
-// disconnected, forbidden, signedout. PORT selects the port (default 8412).
+// disconnected, forbidden, signedout. Enter BCDF-GHJK at `/ui/device`. PORT selects the port (default 8412).
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { createServer } from "node:http";
 import { extname, join, normalize } from "node:path";
@@ -29,6 +30,10 @@ const STREAMS = { stale: "stale", lagging: "lagging", empty: "empty", cold: "col
 const fixture = (name) => readFileSync(join("fixtures", name), "utf8");
 
 const session = JSON.parse(fixture("session.json"));
+const device = JSON.parse(fixture("device-authorization.json"));
+const DEVICE_PATH = "/v1/deviceAuthorizations/";
+const DEVICE_AGE_MS = 90_000;
+const normalizeCode = (code) => code.toUpperCase().replace(/[- ]/g, "");
 const sessionFor = (scenario) => {
   if (scenario === "signedout") return { name: session.name, permissions: [], login: session.login };
   if (scenario === "forbidden") return { ...session, principal: "principals/google%3Anew.hire%40example.org", permissions: [] };
@@ -120,6 +125,21 @@ createServer((req, res) => {
   const url = new URL(req.url ?? "/", "http://preview");
   const scenario = SCENARIOS.find((s) => s === cookies(req).preview_scenario) ?? "live";
   if (req.method === "POST" && url.pathname === "/ui/logout") return send(res, 303, { location: "/ui/" });
+  if (req.method === "POST" && url.pathname === "/ui/device") return json(res, { authorizationUrl: "/ui/device/approved" });
+  if (req.method === "GET" && url.pathname.startsWith(DEVICE_PATH)) {
+    let code;
+    try {
+      code = decodeURIComponent(url.pathname.slice(DEVICE_PATH.length));
+    } catch {
+      return send(res, 404, { "content-type": "application/json" }, "{}");
+    }
+    if (normalizeCode(code) !== normalizeCode(device.name.slice("deviceAuthorizations/".length))) {
+      return send(res, 404, { "content-type": "application/json" }, "{}");
+    }
+    const created = Date.now() - DEVICE_AGE_MS;
+    const lifetime = Date.parse(device.expireTime) - Date.parse(device.createTime);
+    return json(res, { ...device, createTime: new Date(created).toISOString(), expireTime: new Date(created + lifetime).toISOString() });
+  }
   if (url.pathname === "/v1/session") return json(res, sessionFor(scenario));
   if (url.pathname === "/v1/state:watch") return stream(req, res, scenario);
   const body = BODIES[url.pathname];

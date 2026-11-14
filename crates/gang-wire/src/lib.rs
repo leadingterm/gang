@@ -44,7 +44,11 @@ mod state;
 pub mod time;
 
 pub use certificate::{Certificate, CreateCertificateRequest};
-pub use device::{DeviceAuthorization, DeviceAuthorizationState, RedeemDeviceAuthorizationRequest};
+pub use device::{
+    ApproveDeviceAuthorizationRequest, ApproveDeviceAuthorizationResponse, DeviceAuthorization,
+    DeviceAuthorizationState, RedeemDeviceAuthorizationRequest, USER_CODE_ALPHABET,
+    USER_CODE_LENGTH,
+};
 pub use error::{
     BadRequest, Code, Detail, ERROR_DOMAIN, ErrorInfo, ErrorReason, ErrorResponse, FieldViolation,
     INTERNAL_ERROR_BODY, RetryInfo, Status, UnknownErrorReason,

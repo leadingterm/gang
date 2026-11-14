@@ -374,6 +374,7 @@ fn rendered_identity_variant_sends_the_sign_in_login_hint() -> gang_e2e::Result<
         .render()?;
 
     let config = parsed(&text)?;
+    assert_eq!(config.server.rate_limit.client.burst.get(), 120);
     let login = config
         .dashboard
         .login

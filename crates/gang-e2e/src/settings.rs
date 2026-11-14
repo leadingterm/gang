@@ -66,6 +66,9 @@ pub struct Settings {
     /// The bubblewrap binary. Defaults to `GANG_E2E_BWRAP`, which the Linux devShell sets.
     #[serde(default)]
     pub bwrap: Option<PathBuf>,
+    /// The headless Chromium binary. Defaults to `GANG_E2E_CHROMIUM`, which the Linux devShell sets.
+    #[serde(default)]
+    pub chromium: Option<PathBuf>,
     /// The PATH of the sample's actions. Defaults to `GANG_E2E_ACTION_PATH`, which the flake's devShell sets.
     #[serde(default)]
     pub action_path: Option<String>,
@@ -122,6 +125,7 @@ impl Default for Settings {
             bazel_flags: Vec::new(),
             shell: None,
             bwrap: None,
+            chromium: None,
             action_path: None,
             action_bin: None,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
@@ -142,6 +146,19 @@ impl Default for Settings {
             log_tail_bytes: DEFAULT_LOG_TAIL_BYTES,
             parallel_scenarios: DEFAULT_PARALLEL_SCENARIOS,
         }
+    }
+}
+
+impl Settings {
+    /// The headless Chromium binary of the browser checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`E2eError::System`] when it is unset.
+    pub fn chromium_program(&self) -> Result<&Path> {
+        self.chromium.as_deref().ok_or_else(|| E2eError::system(
+            "the Chromium binary is unset: run the harness inside `nix develop`, or set `chromium` in the settings",
+        ))
     }
 }
 
@@ -213,6 +230,15 @@ impl ActionTools {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chromium_defaults_to_unset_and_accepts_override() {
+        let defaults: Settings = toml::from_str("").expect("default settings parse");
+        assert_eq!(defaults.chromium, None);
+        let settings: Settings =
+            toml::from_str("chromium = '/bin/chromium'").expect("chromium override parses");
+        assert_eq!(settings.chromium, Some(PathBuf::from("/bin/chromium")));
+    }
 
     #[test]
     fn cgroup_root_defaults_to_cgroup_config_and_accepts_override() {

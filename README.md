@@ -72,7 +72,7 @@ Gang is deployed from a separate repository that calls its modules and reusable 
 
 ```hcl
 module "gang" {
-  source = "git::https://github.com/example-org/gang//infra/terraform/modules/deployment?ref=v0.1.4"
+  source = "git::https://github.com/example-org/gang//infra/terraform/modules/deployment?ref=v0.1.5"
   # variables as in the example root
 }
 ```

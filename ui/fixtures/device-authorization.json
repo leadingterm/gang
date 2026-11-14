@@ -1,0 +1,10 @@
+{
+  "name": "deviceAuthorizations/BCDF-GHJK",
+  "provider": "google",
+  "verificationUri": "https://gang.example.com/ui/device",
+  "clientAddress": "192.0.2.4",
+  "state": "PENDING",
+  "createTime": "2026-01-15T10:00:00.000Z",
+  "expireTime": "2026-01-15T10:10:00.000Z",
+  "pollInterval": "5s"
+}

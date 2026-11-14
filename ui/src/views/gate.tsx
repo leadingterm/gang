@@ -17,7 +17,8 @@ const canopy = (density: number): readonly string[] => {
   });
 };
 
-const Gate = ({ title, density, children }: { title: string; density: number; children: ComponentChildren }) => {
+/** A screen outside the app frame: the brand, a body and the canopy backdrop at `density`. */
+export const Gate = ({ title, density, children }: { title: string; density: number; children: ComponentChildren }) => {
   useTitle(title);
   return (
     <div class="gate">
@@ -63,17 +64,17 @@ export const SignIn = () => {
   );
 };
 
-const ERRORS = {
+export const SIGN_IN_ERRORS = {
   denied: { code: "DECLINED", caution: false, title: "Sign-in declined", text: "The identity provider refused this sign-in.", cta: "Use another account" },
   failed: { code: "FAILED", caution: false, title: "Sign-in failed", text: "The identity provider returned an error, or the attempt expired.", cta: "Try again" },
   unavailable: { code: "UNAVAILABLE", caution: true, title: "Sign-in unavailable", text: "The identity provider is unreachable or busy.", cta: "Try again" },
 } as const;
 
-const isReason = (reason: string | null): reason is keyof typeof ERRORS => reason !== null && Object.hasOwn(ERRORS, reason);
+export const isSignInError = (reason: string | null): reason is keyof typeof SIGN_IN_ERRORS => reason !== null && Object.hasOwn(SIGN_IN_ERRORS, reason);
 
 /** `/ui/error?reason=denied|failed|unavailable`, where a failed callback lands. */
 export const SignInError = ({ reason }: { reason: string | null }) => {
-  const e = ERRORS[isReason(reason) ? reason : "failed"];
+  const e = SIGN_IN_ERRORS[isSignInError(reason) ? reason : "failed"];
   return (
     <Gate title={e.title} density={0.08}>
       <span class={e.caution ? "gate__code caution" : "gate__code"}>{e.code}</span>

@@ -153,6 +153,9 @@ pub enum ClientError {
     /// The browser redirect did not arrive in time.
     #[error("login timed out waiting for the browser redirect")]
     LoginTimedOut,
+    /// The device authorization was not approved in time.
+    #[error("login timed out waiting for the device approval")]
+    DeviceApprovalTimedOut,
     /// The server no longer knows the device authorization.
     #[error("the device authorization has expired")]
     DeviceLoginExpired,
@@ -256,6 +259,9 @@ impl Fix for ClientError {
             | Self::DeviceLoginExpired => Some(Cow::Borrowed(LOGIN_AGAIN_FIX)),
             Self::LoginTimedOut => Some(Cow::Borrowed(
                 "run gang login again and finish the sign-in in the browser",
+            )),
+            Self::DeviceApprovalTimedOut => Some(Cow::Borrowed(
+                "run gang login again and approve its code in a browser before it expires",
             )),
             Self::TokenCommand { .. } => Some(Cow::Borrowed(
                 "check that the proof command exists and is executable",
@@ -425,6 +431,7 @@ mod tests {
             ClientError::RenewalRejected(port_error()),
             ClientError::NoRefreshToken,
             ClientError::LoginTimedOut,
+            ClientError::DeviceApprovalTimedOut,
             ClientError::Loopback(io_error()),
             ClientError::EmptyToken,
             ClientError::TokenCommand {
@@ -582,6 +589,10 @@ mod tests {
         assert_eq!(
             fix_of(&ClientError::LoginTimedOut).as_deref(),
             Some("run gang login again and finish the sign-in in the browser")
+        );
+        assert_eq!(
+            fix_of(&ClientError::DeviceApprovalTimedOut).as_deref(),
+            Some("run gang login again and approve its code in a browser before it expires")
         );
     }
 

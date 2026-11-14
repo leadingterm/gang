@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use super::{assert_compliant, assert_fails, failures};
+use gang_e2e::Navigation;
 use gang_e2e::names::identity as names;
 use gang_e2e::{
     Access, Administration, Aging, Login, MisdirectedLogin, Misdirection, Ran, TokenAnswer,
@@ -128,6 +129,8 @@ behaviour! {
             RevokedRedeemServed,
             /// Serve a second redemption.
             SecondRedeemServed,
+            /// The browser blocks the form redirect under the dashboard's CSP.
+            BrowserCspRefusal,
         },
         /// Proof command behavior. Proof execution behavior.
         proof: ProofCommand {
@@ -422,37 +425,41 @@ impl SimulatedAccess {
         if cross && !matches!(self.behaviour.device, DeviceFlow::CrossSiteApproved) {
             return Self::response(403, vec![], vec![]);
         }
-        let code = r
-            .body
-            .as_ref()
-            .and_then(|body| std::str::from_utf8(&body.bytes).ok())
-            .and_then(|body| body.strip_prefix("userCode="))
-            .unwrap_or("");
+        let Some(body) = r.body.as_ref().filter(|body| {
+            body.content_type
+                .split(';')
+                .next()
+                .is_some_and(|media_type| {
+                    media_type.trim().eq_ignore_ascii_case("application/json")
+                })
+        }) else {
+            return Self::response(415, vec![], vec![]);
+        };
+        let Ok(request) =
+            serde_json::from_slice::<gang_wire::ApproveDeviceAuthorizationRequest>(&body.bytes)
+        else {
+            return Self::response(400, vec![], vec![]);
+        };
+        let code = &request.user_code;
         let mut state = self.state.lock();
-        if !state.devices.contains_key(code) {
-            return Self::response(
-                302,
-                vec![("location".into(), "/ui/device?error=unknown".into())],
-                vec![],
-            );
+        if state.devices.get(code).is_none_or(|device| device.approved) {
+            return Self::response(404, vec![], vec![]);
         }
         state.counter += 1;
         let attempt = format!("state-{}", state.counter);
-        state.device_attempts.insert(attempt.clone(), code.into());
+        state.device_attempts.insert(attempt.clone(), code.clone());
         let offline = if matches!(self.behaviour.device, DeviceFlow::OnlineApproval) {
             ""
         } else {
             "&access_type=offline&prompt=consent"
         };
+        let authorization_url = format!(
+            "https://issuer.example/authorize?login_hint=operator&client_id=gang-e2e-dashboard{offline}&state={attempt}&redirect_uri=https%3A%2F%2F127.0.0.1%3A8443%2Fui%2Fcallback"
+        );
         Self::response(
-            303,
+            200,
             vec![
-                (
-                    "location".into(),
-                    format!(
-                        "https://issuer.example/authorize?login_hint=operator&client_id=gang-e2e-dashboard{offline}&state={attempt}&redirect_uri=https%3A%2F%2F127.0.0.1%3A8443%2Fui%2Fcallback"
-                    ),
-                ),
+                ("content-type".into(), "application/json".into()),
                 (
                     "set-cookie".into(),
                     format!(
@@ -461,7 +468,9 @@ impl SimulatedAccess {
                     ),
                 ),
             ],
-            vec![],
+            serde_json::json!({"authorizationUrl": authorization_url})
+                .to_string()
+                .into_bytes(),
         )
     }
 
@@ -488,7 +497,7 @@ impl SimulatedAccess {
                 if success {
                     "/ui/device/approved"
                 } else {
-                    "/ui/error?reason=failed"
+                    "/ui/device?reason=failed"
                 }
                 .into(),
             ),
@@ -1214,6 +1223,57 @@ impl Access for SimulatedAccess {
             Ok(Self::response(200, vec![], vec![]))
         }
     }
+    fn approve_in_browser(&self, code: &str) -> gang_e2e::Result<Navigation> {
+        if matches!(self.behaviour.device, DeviceFlow::BrowserCspRefusal) {
+            return Ok(Navigation::Refused("Refused to send form data to 'http://127.0.0.1:1/authorize' because it violates the following Content Security Policy directive: \"form-action 'self'\".".into()));
+        }
+        let body = serde_json::to_vec(&gang_wire::ApproveDeviceAuthorizationRequest {
+            user_code: code.to_owned(),
+        })
+        .map_err(gang_e2e::E2eError::system_from(
+            "serializing device approval",
+        ))?;
+        let started = self.request(
+            &Request::new(Method::POST, "/ui/device")
+                .header("origin", self.endpoint()?.origin().ascii_serialization())
+                .header("sec-fetch-site", "same-origin")
+                .body("application/json", body),
+        )?;
+        let provider =
+            serde_json::from_slice::<gang_wire::ApproveDeviceAuthorizationResponse>(&started.body)
+                .map_err(gang_e2e::E2eError::system_from("parsing provider URL"))?
+                .authorization_url;
+        let response = self.visit(&provider)?;
+        let callback = response
+            .header("location")
+            .ok_or_else(|| gang_e2e::E2eError::system("missing callback redirect"))?;
+        let callback = gang_types::Url::parse(callback)
+            .map_err(gang_e2e::E2eError::system_from("parsing callback redirect"))?;
+        let value = gang_e2e::set_cookies(&started)
+            .into_iter()
+            .find(|cookie| cookie.name == COOKIE_NAMES.login)
+            .ok_or_else(|| gang_e2e::E2eError::system("missing login cookie"))?
+            .value;
+        let done = self.request(
+            &Request::get(format!(
+                "{}?{}",
+                callback.path(),
+                callback.query().unwrap_or_default()
+            ))
+            .presenting(Presented::Cookie(SessionCookie {
+                name: COOKIE_NAMES.login.into(),
+                value,
+            })),
+        )?;
+        let destination = done
+            .header("location")
+            .ok_or_else(|| gang_e2e::E2eError::system("missing approval redirect"))?;
+        let url = self
+            .endpoint()?
+            .join(destination)
+            .map_err(gang_e2e::E2eError::system_from("parsing approval redirect"))?;
+        Ok(Navigation::Committed(url))
+    }
     fn mint_bearer(&self, p: &str, v: Validity) -> gang_e2e::Result<String> {
         let t = if v == Validity::Expired {
             format!("expired-{p}")
@@ -1557,7 +1617,56 @@ fn identity_checks(behaviour: Behaviour) -> gang_e2e::Result<Vec<gang_e2e::Check
 /// Confirms the unmodified simulation satisfies the identity scenario.
 #[test]
 fn identity_is_compliant() -> gang_e2e::Result<()> {
-    assert_compliant(&identity_checks(Behaviour::COMPLIANT)?);
+    let checks = identity_checks(Behaviour::COMPLIANT)?;
+    assert_compliant(&checks);
+    for name in names::DEVICE {
+        assert!(
+            checks
+                .iter()
+                .any(|check| check.name == name && check.is_passed()),
+            "missing passed device check: {name}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn simulated_device_approval_accepts_json_and_refuses_invalid_requests() -> gang_e2e::Result<()> {
+    let access = SimulatedAccess::new(Behaviour::COMPLIANT);
+    let (code, _) = access.create_device();
+    let body =
+        serde_json::to_vec(&gang_wire::ApproveDeviceAuthorizationRequest { user_code: code })
+            .map_err(gang_e2e::E2eError::system_from(
+                "serializing device approval",
+            ))?;
+    let request =
+        |media_type, bytes| Request::new(Method::POST, "/ui/device").body(media_type, bytes);
+    let answer = access.request(&request("application/json", body.clone()))?;
+    assert_eq!(answer.status, 200);
+    assert!(
+        serde_json::from_slice::<gang_wire::ApproveDeviceAuthorizationResponse>(&answer.body)
+            .is_ok()
+    );
+    assert!(answer.header("set-cookie").is_some());
+    for (request, status) in [
+        (
+            request("application/x-www-form-urlencoded", body.clone()),
+            415,
+        ),
+        (request("application/json", b"{}".to_vec()), 400),
+        (
+            request("application/json", br#"{"userCode":"UNKNOWN"}"#.to_vec()),
+            404,
+        ),
+        (
+            request("application/json", body).header("sec-fetch-site", "cross-site"),
+            403,
+        ),
+    ] {
+        let answer = access.request(&request)?;
+        assert_eq!(answer.status, status);
+        assert!(answer.body.is_empty());
+    }
     Ok(())
 }
 
@@ -1704,3 +1813,5 @@ flaw!(device_revoked_redeem_fails: identity_checks(device = DeviceFlow::RevokedR
     => only [names::REVOKED_BEFORE_REDEEM_REFUSED]);
 flaw!(device_second_redeem_fails: identity_checks(device = DeviceFlow::SecondRedeemServed)
     => only [names::SECOND_REDEEM_REFUSED]);
+flaw!(device_browser_csp_fails: identity_checks(device = DeviceFlow::BrowserCspRefusal)
+    => only [names::DEVICE_APPROVED_IN_BROWSER]);

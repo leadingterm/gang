@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use gang_types::{CertSerial, Url};
-use gang_wire::{CALLBACK_PATH, ERROR_PATH, ErrorReason, LOGIN_PATH, LOGOUT_PATH, Permission};
+use gang_wire::{
+    CALLBACK_PATH, DEVICE_PATH, ERROR_PATH, ErrorReason, LOGIN_PATH, LOGOUT_PATH, Permission,
+};
 use http::Method;
 
 use crate::Ran;
@@ -20,6 +22,7 @@ use crate::access_verdict::{
 };
 use crate::browser_verdict::{authorized, offline_requested};
 use crate::check::Check;
+use crate::chromium::Navigation;
 use crate::device_verdict::{
     DevicePrompt, cross_site_approval_refused, device_approved, device_only, device_resource,
     device_session, logged_in_with, refused_with, renewed_by_web_client, rotation_stored,
@@ -285,6 +288,15 @@ pub trait Access: Sync {
     ///
     /// When the request cannot be sent.
     fn visit(&self, url: &Url) -> Result<Answer>;
+
+    /// Approves the device login `code` in a real headless browser: opens the approval page, types
+    /// the code into its first input, presses Enter, clicks the button whose text contains "approve",
+    /// and reports where the page went.
+    ///
+    /// # Errors
+    ///
+    /// When the browser cannot be started or driven.
+    fn approve_in_browser(&self, code: &str) -> Result<Navigation>;
 
     /// Mints a bearer token for `principal` (`provider:principal`) with the deployment's own
     /// signing key, valid as `validity` says.
@@ -661,6 +673,7 @@ pub fn identity<A: Access>(access: &A) -> Result<Vec<Check>> {
 /// An approval's server and provider responses.
 struct Approval {
     started: Answer,
+    authorization_url: Url,
     provider_location: String,
     done: Answer,
 }
@@ -671,20 +684,26 @@ fn approve<A: Access>(
     endpoint: &Url,
     code: &str,
 ) -> Result<std::result::Result<Approval, String>> {
+    let body = serde_json::to_vec(&gang_wire::ApproveDeviceAuthorizationRequest {
+        user_code: code.to_owned(),
+    })
+    .map_err(E2eError::system_from("serializing device approval"))?;
     let started = access.request(
         &Request::new(Method::POST, DEVICE_PAGE)
             .header("origin", endpoint.origin().ascii_serialization())
             .header("sec-fetch-site", "same-origin")
-            .body(
-                "application/x-www-form-urlencoded",
-                format!("userCode={code}").into_bytes(),
-            ),
+            .body("application/json", body),
     )?;
-    let Some(provider_url) = started.header("location").and_then(|s| Url::parse(s).ok()) else {
-        return Ok(Err(format!(
-            "the approval answered {} without a provider redirect",
-            started.status
-        )));
+    let provider_url = match serde_json::from_slice::<gang_wire::ApproveDeviceAuthorizationResponse>(
+        &started.body,
+    ) {
+        Ok(answer) if started.status == 200 => answer.authorization_url,
+        _ => {
+            return Ok(Err(format!(
+                "the approval answered {} without a valid provider URL",
+                started.status
+            )));
+        }
     };
     let provider = access.visit(&provider_url)?;
     let Some(provider_location) = provider.header("location") else {
@@ -716,6 +735,7 @@ fn approve<A: Access>(
     )?;
     Ok(Ok(Approval {
         started,
+        authorization_url: provider_url,
         provider_location: provider_location.to_owned(),
         done,
     }))
@@ -782,9 +802,9 @@ fn device_checks<A: Access>(access: &A, endpoint: &Url, admin: &Credentials) -> 
                 cookie_name(endpoint),
             ),
         ));
-        let location = approved.started.header("location").unwrap_or_default();
         let records = access.authorizations(SIGN_IN_SUBJECT);
-        let offline = offline_requested(location).and_then(|()| authorized(&records[mark..], true));
+        let offline = offline_requested(approved.authorization_url.as_str())
+            .and_then(|()| authorized(&records[mark..], true));
         checks.push(judged(identity::DEVICE_APPROVAL_OFFLINE, offline));
         let files = access.session_files(&login.home)?;
         checks.push(judged(
@@ -808,6 +828,7 @@ fn device_checks<A: Access>(access: &A, endpoint: &Url, admin: &Credentials) -> 
     access.set_policy(SIGN_IN_SUBJECT, SubjectPolicy::Standard);
     device_missing_refresh_check(access, endpoint, &mut checks)?;
     device_attacker_checks(access, endpoint, admin, &mut checks)?;
+    device_browser_check(access, endpoint, &mut checks)?;
     Ok(checks)
 }
 
@@ -898,7 +919,7 @@ fn device_missing_refresh_check<A: Access>(
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_owned)
                 });
-            redirected_to(&approval.done, &format!("{ERROR_PATH}?reason=failed"))
+            redirected_to(&approval.done, &format!("{DEVICE_PATH}?reason=failed"))
                 .and_then(|()| {
                     if state.as_deref() == Some("PENDING") {
                         Ok(())
@@ -932,13 +953,8 @@ fn device_missing_refresh_check<A: Access>(
     Ok(())
 }
 
-/// Checks cross-site, secret, revocation, and replay attacks.
-fn device_attacker_checks<A: Access>(
-    access: &A,
-    endpoint: &Url,
-    admin: &Credentials,
-    checks: &mut Vec<Check>,
-) -> Result<()> {
+/// Creates a device authorization and extracts its code and secret.
+fn create_device<A: Access>(access: &A) -> Result<std::result::Result<(String, String), String>> {
     let created = access.request(
         &Request::new(Method::POST, DEVICE_AUTHORIZATIONS).body("application/json", b"{}".to_vec()),
     )?;
@@ -948,45 +964,83 @@ fn device_attacker_checks<A: Access>(
             value
                 .get("name")?
                 .as_str()?
-                .strip_prefix("deviceAuthorizations/")?,
-            value.get("secret")?.as_str()?,
+                .strip_prefix("deviceAuthorizations/")?
+                .to_owned(),
+            value.get("secret")?.as_str()?.to_owned(),
         ))
     });
-    let Some((code, secret)) = fields.filter(|_| created.status == 200) else {
-        let reason = format!(
+    Ok(fields.filter(|_| created.status == 200).ok_or_else(|| {
+        format!(
             "the device authorization could not be created: status {} {}",
             created.status,
             String::from_utf8_lossy(&created.body)
-        );
-        for &name in &identity::DEVICE[8..] {
-            checks.push(Check::failed(name, reason.clone()));
+        )
+    }))
+}
+
+/// Checks approval under the dashboard's browser-enforced policy.
+fn device_browser_check<A: Access>(
+    access: &A,
+    endpoint: &Url,
+    checks: &mut Vec<Check>,
+) -> Result<()> {
+    let (code, _) = match create_device(access)? {
+        Ok(device) => device,
+        Err(reason) => {
+            checks.push(Check::failed(identity::DEVICE_APPROVED_IN_BROWSER, reason));
+            return Ok(());
         }
-        return Ok(());
     };
+    let navigation = access.approve_in_browser(&code)?;
+    let resource = get_device(access, &code)?;
+    checks.push(judged(
+        identity::DEVICE_APPROVED_IN_BROWSER,
+        crate::device_verdict::browser_approved(&navigation, endpoint, &resource),
+    ));
+    Ok(())
+}
+
+/// Checks cross-site, secret, revocation, and replay attacks.
+fn device_attacker_checks<A: Access>(
+    access: &A,
+    endpoint: &Url,
+    admin: &Credentials,
+    checks: &mut Vec<Check>,
+) -> Result<()> {
+    let (code, secret) = match create_device(access)? {
+        Ok(device) => device,
+        Err(reason) => {
+            for &name in &identity::DEVICE[8..12] {
+                checks.push(Check::failed(name, reason.clone()));
+            }
+            return Ok(());
+        }
+    };
+    let body = serde_json::to_vec(&gang_wire::ApproveDeviceAuthorizationRequest {
+        user_code: code.clone(),
+    })
+    .map_err(E2eError::system_from("serializing device approval"))?;
     let cross = access.request(
         &Request::new(Method::POST, DEVICE_PAGE)
             .header("sec-fetch-site", "cross-site")
             .header("origin", FOREIGN_ORIGIN)
-            .body(
-                "application/x-www-form-urlencoded",
-                format!("userCode={code}").into_bytes(),
-            ),
+            .body("application/json", body),
     )?;
     checks.push(judged(
         identity::CROSS_SITE_DEVICE_APPROVAL_REFUSED,
         cross_site_approval_refused(&cross),
     ));
-    let wrong = redeem(access, code, WRONG_SECRET)?;
+    let wrong = redeem(access, &code, WRONG_SECRET)?;
     checks.push(judged(
         identity::WRONG_SECRET_REDEEM_REFUSED,
         refused_with(&wrong, 404, "DEVICE_AUTHORIZATION_NOT_FOUND"),
     ));
-    let approved = approve(access, endpoint, code)?;
+    let approved = approve(access, endpoint, &code)?;
     let operator = format!("{}:{SIGN_IN_SUBJECT}", crate::template::PROVIDER);
     let revoke = access.administer(admin, &Administration::RevokePrincipal(operator.clone()))?;
-    let first = redeem(access, code, secret)?;
+    let first = redeem(access, &code, &secret)?;
     let restore = access.administer(admin, &Administration::RestorePrincipal(operator))?;
-    let second = redeem(access, code, secret)?;
+    let second = redeem(access, &code, &secret)?;
     let verdict = approved
         .and_then(|approval| redirected_to(&approval.done, DEVICE_APPROVED))
         .and_then(|()| {

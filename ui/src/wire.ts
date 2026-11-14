@@ -55,6 +55,18 @@ queued?: Array<QueuedAction>,
  */
 truncated?: Truncated, };
 
+export type ApproveDeviceAuthorizationRequest = { 
+/**
+ * The user code, `XXXX-XXXX`; case, spaces and the hyphen are ignored.
+ */
+userCode: string, };
+
+export type ApproveDeviceAuthorizationResponse = { 
+/**
+ * The identity provider's authorization URL for this approval.
+ */
+authorizationUrl: string, };
+
 export type Cause = "DEMAND" | "IDLE_TIMEOUT" | "ORPHAN" | "DRAIN_FINISHED" | "MAX_DRAIN_WAIT";
 
 export type Closed = { 
@@ -788,3 +800,6 @@ export const PATHS = {
   deviceApproved: "/ui/device/approved",
   error: "/ui/error",
 } as const;
+
+/** User codes: `length` characters of `alphabet`, displayed as two halves joined by `-`. */
+export const USER_CODE = { alphabet: "BCDFGHJKLMNPQRSTVWXZ", length: 8 } as const;

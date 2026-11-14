@@ -66,7 +66,7 @@ const Screens = () => {
   const r = route.value;
   const link = client.link.value;
   if (r.kind === "error") return <SignInError reason={r.reason} />;
-  if (r.kind === "device") return <Device error={r.error} />;
+  if (r.kind === "device") return <Device reason={r.reason} />;
   if (r.kind === "deviceApproved") return <DeviceApproved />;
   if (link.kind === "signed_out") return <SignIn />;
   if (!client.session.value) return null;
