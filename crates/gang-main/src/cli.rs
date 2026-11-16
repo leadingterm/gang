@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use clap::{Arg, ArgGroup, ArgMatches, Args, FromArgMatches, Parser, Subcommand};
 use gang_client::ProofSource;
 use gang_deploy::{
-    MaxAge, PlanPrefix, PlanVersion, PrNumber, Repository, RepositoryId, RunAttempt, RunId, Sha,
-    UnixTime,
+    Architecture, ImageSha256, MaxAge, PlanPrefix, PlanVersion, PrNumber, Region, ReleaseTag,
+    Repository, RepositoryId, RunAttempt, RunId, Sha, UnixTime,
 };
 use gang_types::{CaPin, CertSerial, Identity, NonZeroDuration, ProviderName, Url};
 
@@ -128,6 +128,25 @@ const EXEC_EXAMPLES: &str = examples! {
     ];
     "a CI job: the worker runs every action through the gang-exec link" => [
         "gang-exec sh -c 'echo hello'",
+    ];
+};
+/// The `after_help` of `gang release`.
+const RELEASE_EXAMPLES: &str = examples! {
+    "a release job: decide how to backfill image regions" => [
+        "gang release ami-steps --home-region us-east-1 --now \"$(date -u +%s)\" < regions.json",
+    ];
+};
+/// The `after_help` of `gang release ami-steps`.
+const RELEASE_AMI_STEPS_EXAMPLES: &str = examples! {
+    "a release job: decide the next publication steps" => [
+        "gang release ami-steps --home-region us-east-1 --now \"$(date -u +%s)\" < regions.json",
+    ];
+};
+/// The `after_help` of `gang release ami-manifest`.
+const RELEASE_AMI_MANIFEST_EXAMPLES: &str = examples! {
+    "a release job: write the converged AMI manifest" => [
+        "gang release ami-manifest --home-region us-east-1 --now \"$(date -u +%s)\" \\",
+        "  --release v1 --image x86_64=<sha256> --image aarch64=<sha256> < regions.json",
     ];
 };
 /// The `after_help` of `gang deploy`.
@@ -347,6 +366,9 @@ pub enum Command {
     /// Decide one step of the deploy workflow.
     #[command(subcommand, hide = true, after_help = DEPLOY_EXAMPLES)]
     Deploy(DeployCommand),
+    /// Decide public AMI publication steps for the release workflow.
+    #[command(subcommand, hide = true, after_help = RELEASE_EXAMPLES)]
+    Release(ReleaseCommand),
 }
 
 impl Command {
@@ -368,6 +390,7 @@ impl Command {
             Self::Doctor(_) => "gang doctor",
             Self::CaPin(_) => "gang ca-pin",
             Self::Deploy(command) => command.subject(),
+            Self::Release(command) => command.subject(),
         }
     }
 }
@@ -663,6 +686,80 @@ pub struct LocalDownArgs {
     /// How often to check whether the server has exited.
     #[arg(long, value_name = "DURATION", default_value = DEFAULT_POLL_INTERVAL)]
     pub poll_interval: NonZeroDuration,
+}
+
+/// The hidden `gang release` commands: the decisions of public AMI publication.
+#[derive(Debug, Subcommand)]
+pub enum ReleaseCommand {
+    /// Print the next public AMI publication steps from regions on standard input.
+    #[command(after_help = RELEASE_AMI_STEPS_EXAMPLES)]
+    AmiSteps(AmiStepsArgs),
+    /// Print the converged release AMI manifest from regions on standard input.
+    #[command(after_help = RELEASE_AMI_MANIFEST_EXAMPLES)]
+    AmiManifest(AmiManifestArgs),
+}
+
+impl ReleaseCommand {
+    /// The name an error of this command is reported under.
+    pub(crate) fn subject(&self) -> &'static str {
+        match self {
+            Self::AmiSteps(_) => "gang release ami-steps",
+            Self::AmiManifest(_) => "gang release ami-manifest",
+        }
+    }
+}
+
+/// Arguments shared by the public AMI commands.
+#[derive(Debug, Args)]
+pub struct AmiPublicationArgs {
+    /// The region where release images are first uploaded.
+    #[arg(long, value_name = "REGION")]
+    pub home_region: Region,
+    /// The current Unix time in seconds.
+    #[arg(long, value_name = "SECONDS")]
+    pub now: UnixTime,
+}
+
+/// Arguments of `gang release ami-steps`.
+#[derive(Debug, Args)]
+pub struct AmiStepsArgs {
+    /// Publication region and time.
+    #[command(flatten)]
+    pub publication: AmiPublicationArgs,
+    /// The release being published, omitted for a backfill.
+    #[arg(long, requires = "image", value_name = "TAG")]
+    pub release: Option<ReleaseTag>,
+    /// An architecture and image digest, once per architecture.
+    #[arg(long, requires = "release", value_name = "ARCH=SHA256", value_parser = image)]
+    pub image: Vec<(Architecture, ImageSha256)>,
+}
+
+/// Arguments of `gang release ami-manifest`.
+#[derive(Debug, Args)]
+pub struct AmiManifestArgs {
+    /// Publication region and time.
+    #[command(flatten)]
+    pub publication: AmiPublicationArgs,
+    /// The release being published.
+    #[arg(long, value_name = "TAG")]
+    pub release: ReleaseTag,
+    /// An architecture and image digest, once per architecture.
+    #[arg(long, required = true, value_name = "ARCH=SHA256", value_parser = image)]
+    pub image: Vec<(Architecture, ImageSha256)>,
+}
+
+/// Parses an architecture and its image digest.
+fn image(text: &str) -> std::result::Result<(Architecture, ImageSha256), String> {
+    let (architecture, sha) = text
+        .split_once('=')
+        .ok_or_else(|| "expected an image as <arch>=<sha256>".to_owned())?;
+    Ok((
+        architecture
+            .parse::<Architecture>()
+            .map_err(|error| error.to_string())?,
+        sha.parse::<ImageSha256>()
+            .map_err(|error| error.to_string())?,
+    ))
 }
 
 /// The hidden `gang deploy` commands: the decisions of the deploy workflow.
@@ -1653,6 +1750,41 @@ mod tests {
         ];
         args.extend_from_slice(extra);
         try_parse(&args)
+    }
+
+    #[test]
+    fn release_commands_require_paired_release_and_images() {
+        let base = [
+            "gang",
+            "release",
+            "ami-steps",
+            "--home-region",
+            "us-east-1",
+            "--now",
+            "0",
+        ];
+        assert!(try_parse(&base).is_ok());
+        let mut with_release = base.to_vec();
+        with_release.extend(["--release", "v1"]);
+        assert!(try_parse(&with_release).is_err());
+        let mut with_image = base.to_vec();
+        with_image.extend([
+            "--image",
+            "x86_64=0000000000000000000000000000000000000000000000000000000000000000",
+        ]);
+        assert!(try_parse(&with_image).is_err());
+        assert!(
+            try_parse(&[
+                "gang",
+                "release",
+                "ami-manifest",
+                "--home-region",
+                "us-east-1",
+                "--now",
+                "0",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

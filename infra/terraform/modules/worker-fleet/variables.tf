@@ -165,7 +165,7 @@ variable "workload_token_max_seconds" {
 }
 
 variable "config_parameter_name" {
-  description = "Name of the SSM parameter holding the rendered gang.toml. Becomes the EC2 user data; workers read the parameter at boot."
+  description = "Name of the SSM parameter holding the rendered gang.toml. Named on the first EC2 user-data line after the role (worker <name>); workers read the parameter at boot."
   type        = string
   nullable    = false
 

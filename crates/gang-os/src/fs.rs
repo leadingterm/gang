@@ -1339,7 +1339,7 @@ mod tests {
                 assert_eq!(e.kind(), ErrorKind::PermissionDenied);
                 assert_eq!(e.path, trusted.join("shared"));
             }
-            other => panic!("expected io error, got {other}"),
+            other @ PrivateDirError::NotPrivate { .. } => panic!("expected io error, got {other}"),
         }
         Ok(())
     }
@@ -1379,7 +1379,7 @@ mod tests {
                 assert_eq!(e.path, trusted);
                 assert_eq!(e.kind(), ErrorKind::PermissionDenied);
             }
-            other => panic!("expected io error, got {other}"),
+            other @ PrivateDirError::NotPrivate { .. } => panic!("expected io error, got {other}"),
         }
         Ok(())
     }
@@ -1400,7 +1400,7 @@ mod tests {
                 assert_eq!(error.kind(), ErrorKind::PermissionDenied);
                 assert_eq!(error.path, open);
             }
-            other => panic!("expected io error, got {other}"),
+            other @ PrivateDirError::NotPrivate { .. } => panic!("expected io error, got {other}"),
         }
         Ok(())
     }
@@ -1423,7 +1423,9 @@ mod tests {
             ensure_private_dir(&link),
             require_private_dir(&link).map_err(|error| match error {
                 PrivateDirError::Io(error) => error,
-                other => PathIo::new("use directory", &link, io::Error::other(other.to_string())),
+                other @ PrivateDirError::NotPrivate { .. } => {
+                    PathIo::new("use directory", &link, io::Error::other(other.to_string()))
+                }
             }),
         ] {
             let error = result.expect_err(
@@ -1962,13 +1964,12 @@ mod tests {
     }
 
     #[test]
-    fn private_fifo_rejects_nul_in_path() -> TestResult {
+    fn private_fifo_rejects_nul_in_path() {
         use std::ffi::OsStr;
 
         let path = Path::new(OsStr::from_bytes(b"fifo\0name"));
         let error = create_private_fifo(path).expect_err("NUL cannot occur in a filesystem path");
         assert_eq!(error.path, path);
         assert_eq!(error.source.kind(), io::ErrorKind::InvalidInput);
-        Ok(())
     }
 }

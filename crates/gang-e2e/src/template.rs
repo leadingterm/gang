@@ -154,14 +154,8 @@ pub(crate) fn place(
     document.endpoint = None;
     document.scheduler.set_worker_endpoint(None);
     let SchedulerConfig::Nativelink(scheduler) = &mut document.scheduler;
-    let cold_memory = COLD_START_MEMORY
-        .parse::<NonZeroBytes>()
-        .map_err(template_error)?;
-    scheduler.cold_start.memory = cold_memory.try_into().map_err(template_error)?;
-    let cold_disk = COLD_START_DISK
-        .parse::<NonZeroBytes>()
-        .map_err(template_error)?;
-    scheduler.cold_start.disk = cold_disk.try_into().map_err(template_error)?;
+    scheduler.cold_start.memory = COLD_START_MEMORY.parse().map_err(template_error)?;
+    scheduler.cold_start.disk = COLD_START_DISK.parse().map_err(template_error)?;
     if let ProvisionerConfig::Local(local) = &mut document.provisioner {
         let disk = FLEET_DISK.parse::<NonZeroBytes>().map_err(template_error)?;
         for fleet in &mut document.fleets {
@@ -520,6 +514,7 @@ fn placement_fleet(
         boot_grace: base.boot_grace,
         sandbox: base.sandbox,
         options: base.options.clone(),
+        scheduled_minimum: Vec::new(),
     })
 }
 
@@ -561,11 +556,7 @@ fn render_execution(document: &mut Document<Plugins>, knobs: ExecutionKnobs) -> 
             ESCALATION_PERCENT.try_into().map_err(template_error)?;
     }
     if knobs.cold_start == ColdStart::Misfit {
-        scheduler.cold_start.memory = MISFIT_COLD_START_MEMORY
-            .parse::<NonZeroBytes>()
-            .map_err(template_error)?
-            .try_into()
-            .map_err(template_error)?;
+        scheduler.cold_start.memory = MISFIT_COLD_START_MEMORY.parse().map_err(template_error)?;
     }
     if knobs.fleet_disk == FleetDisk::Oversized {
         document
@@ -689,6 +680,22 @@ fn render_control(document: &mut Document<Plugins>, knobs: &ControlKnobs) -> Res
         if let Some(max) = knobs.max_instances {
             fleet.max_instances = NonZeroU32::new(max)
                 .ok_or_else(|| template_error("max instances must be nonzero"))?;
+        }
+        if let Some(instances) = knobs.scheduled_minimum {
+            let instances = NonZeroU32::new(instances)
+                .ok_or_else(|| template_error("scheduled minimum instances must be nonzero"))?;
+            let days = gang_config::Weekdays::try_from(gang_config::Weekday::ALL.to_vec())
+                .map_err(template_error)?;
+            fleet.scheduled_minimum = vec![
+                gang_config::ScheduledMinimum::try_new(
+                    instances,
+                    days,
+                    "00:00".parse().map_err(template_error)?,
+                    "24:00".parse().map_err(template_error)?,
+                    "Asia/Kathmandu".parse().map_err(template_error)?,
+                )
+                .map_err(template_error)?,
+            ];
         }
     }
     if let Some(grace) = knobs.terminate_grace {

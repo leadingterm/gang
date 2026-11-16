@@ -17,7 +17,8 @@ use gang_types::{
 use gang_wire::{Cause, Event, EventChange, name};
 
 use crate::support::{
-    blank, config, fleet_instance, instance_id, policy, properties, queued, ts, worker_state,
+    blank, build_key, config, fleet_instance, instance_id, policy, properties, queued, ts,
+    worker_state,
 };
 
 /// Passes run before measurement so the builder's buffers reach their steady-state size.
@@ -49,6 +50,7 @@ struct World {
     hosted: HostedSnapshot,
     actions: Option<ActionsSample>,
     events: Vec<Event>,
+    builds: gang_insight::Builds,
 }
 
 fn ok(applied: u32, hosted: &HostedSnapshot) -> PassStatus<'_> {
@@ -78,6 +80,7 @@ fn outlook() -> FleetOutlook {
         disk: Bytes::new(0),
     });
     FleetOutlook {
+        minimum: 0,
         needed: 2,
         demand,
         queued: 4,
@@ -95,6 +98,7 @@ fn inputs(world: &World) -> Inputs<'_> {
         catalog: &world.catalog,
         actions: world.actions.as_ref(),
         events: &world.events,
+        builds: &world.builds,
         principals_epoch: 7,
     }
 }
@@ -172,6 +176,8 @@ fn scheduler_snapshot() -> Result<SchedulerSnapshot, Box<dyn Error>> {
     }
     Ok(SchedulerSnapshot {
         completed: 100,
+        lookups: 0,
+        hits: 0,
         workers,
         queued: queued_actions,
     })
@@ -188,6 +194,7 @@ fn actions_sample() -> Result<ActionsSample, Box<dyn Error>> {
                 target: "//pkg:target".to_owned(),
                 mnemonic: "Javac".to_owned(),
                 priority: 0,
+                build: None,
             },
             worker: worker_on(&instance_id(index)?)?,
             started: ts(5_000 + index),
@@ -202,6 +209,7 @@ fn actions_sample() -> Result<ActionsSample, Box<dyn Error>> {
                 target: "//pkg:queued".to_owned(),
                 mnemonic: "Genrule".to_owned(),
                 priority: 0,
+                build: None,
             },
             queued_since: ts(4_000 + index),
             candidates: FleetSet::default(),
@@ -267,12 +275,23 @@ fn world() -> Result<World, Box<dyn Error>> {
     let mut snapshot = scheduler_snapshot()?;
     let mut hosted = HostedSnapshot::default();
     hosted.replace(&mut snapshot);
+    let key = build_key("allocation")?;
+    let mut builds = gang_insight::Builds::new(&gang_config::BuildsConfig::default());
+    builds.lose(ts(WALL_MILLIS), &key, 1);
+    let mut actions = actions_sample()?;
+    for action in &mut actions.view.running {
+        action.info.build = Some(key.id());
+    }
+    for action in &mut actions.view.queued {
+        action.info.build = Some(key.id());
+    }
     Ok(World {
         passes,
         catalog: FleetCatalog::try_new(properties)?,
         hosted,
-        actions: Some(actions_sample()?),
+        actions: Some(actions),
         events: events()?,
+        builds,
     })
 }
 

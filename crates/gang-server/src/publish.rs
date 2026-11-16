@@ -11,6 +11,7 @@ use gang_state::{Builder, BuilderConfig, Inputs, PassStatus};
 use gang_types::FleetCatalog;
 
 use crate::actions::ActionsCache;
+use crate::builds::BuildsCell;
 use crate::events::wire_event;
 use crate::hub::StateHub;
 
@@ -19,16 +20,23 @@ pub(crate) struct StatePublisher {
     hub: StateHub,
     builder: Builder,
     cache: ActionsCache,
+    builds: BuildsCell,
 }
 
 impl StatePublisher {
     /// A publisher that builds the state with `config` and reads actions from `cache`.
     #[must_use]
-    pub(crate) fn new(hub: StateHub, config: BuilderConfig, cache: ActionsCache) -> Self {
+    pub(crate) fn new(
+        hub: StateHub,
+        config: BuilderConfig,
+        cache: ActionsCache,
+        builds: BuildsCell,
+    ) -> Self {
         Self {
             hub,
             builder: Builder::new(config),
             cache,
+            builds,
         }
     }
 
@@ -49,22 +57,26 @@ impl StatePublisher {
     ) {
         let builder = &mut self.builder;
         let cache = &self.cache;
+        let builds = &self.builds;
         self.hub.publish(|cur, prev, seq, events| {
             let () = cache.read(|actions| {
-                builder.fill(
-                    cur,
-                    prev,
-                    seq,
-                    &Inputs {
-                        wall,
-                        pass,
-                        fleets,
-                        catalog,
-                        actions,
-                        events,
-                        principals_epoch: prev.principals_epoch,
-                    },
-                );
+                builds.read(|builds| {
+                    builder.fill(
+                        cur,
+                        prev,
+                        seq,
+                        &Inputs {
+                            wall,
+                            pass,
+                            fleets,
+                            catalog,
+                            actions,
+                            builds,
+                            events,
+                            principals_epoch: prev.principals_epoch,
+                        },
+                    );
+                });
             });
         });
     }

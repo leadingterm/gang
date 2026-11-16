@@ -70,6 +70,40 @@ pub(crate) async fn get(
     send(controller, api_request("GET", path, token, None)).await
 }
 
+/// A build used by the route and API-documentation sweeps.
+pub(crate) fn fixture_build() -> gang_spi::Observation {
+    gang_spi::Observation::Call(gang_spi::Call {
+        origin: gang_spi::Origin {
+            build: gang_types::BuildKey {
+                principal: std::sync::Arc::new(identity(ALICE)),
+                invocation: gang_types::InvocationId::try_new("route-fixture")
+                    .expect("fixture invocation is valid"),
+            },
+            correlated: None,
+            tool: None,
+            target: None,
+            mnemonic: None,
+        },
+        rpc: gang_spi::Rpc::GetActionResult,
+        outcome: gang_spi::CallOutcome::Ok,
+    })
+}
+
+/// Sends a fixture through the recorder and waits for its full view to be served.
+pub(crate) async fn seed_build(controller: &Controller, token: &AccessToken) {
+    const MAX_POLLS: usize = 1_000;
+    let observation = fixture_build();
+    let path = format!("/v1/builds/{}", observation.origin().build.id());
+    controller.observe(observation);
+    for _ in 0..MAX_POLLS {
+        if get(controller, &path, Some(token)).await.status == http::StatusCode::OK {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("the recorder did not publish the fixture build");
+}
+
 /// A `POST` of `path` with an empty body as the holder of `token`.
 pub(crate) async fn post(controller: &Controller, path: &str, token: &AccessToken) -> Answer {
     send(controller, api_request("POST", path, Some(token), None)).await

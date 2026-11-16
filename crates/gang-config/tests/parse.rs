@@ -354,6 +354,15 @@ max_drain_wait = "1m"
 boot_grace = "30s"
 "#;
 
+const SCHEDULED_MINIMUM: &str = r#"
+[[fleets.scheduled_minimum]]
+instances = 1
+days = ["mon", "tue", "wed", "thu", "fri"]
+start = "08:00"
+end = "19:00"
+time_zone = "Europe/Paris"
+"#;
+
 const TWO_FLEETS: &str = r#"
 [[fleets]]
 name = "amd64-spot"
@@ -529,6 +538,7 @@ struct Sections {
     server: &'static str,
     worker: &'static str,
     dashboard: &'static str,
+    builds: &'static str,
 }
 
 impl Sections {
@@ -548,6 +558,7 @@ impl Sections {
         server: SERVER,
         worker: "",
         dashboard: "",
+        builds: "",
     };
 
     fn text(&self) -> String {
@@ -567,6 +578,7 @@ impl Sections {
             self.server,
             self.worker,
             self.dashboard,
+            self.builds,
         ]
         .concat()
     }
@@ -1392,6 +1404,212 @@ fn rejects_a_fleet_whose_minimum_exceeds_its_maximum() -> Result<(), Box<dyn Err
 }
 
 #[test]
+fn parses_a_scheduled_minimum_in_local_time() -> Result<(), Box<dyn Error>> {
+    let config = Sections {
+        fleet: format!("{FLEET}{SCHEDULED_MINIMUM}").leak(),
+        ..Sections::VALID
+    }
+    .parse()?;
+    let fleet = config.fleets.get(0).ok_or("local fleet")?;
+    let start = gang_clock::Timestamp::from_rfc3339("2026-11-16T07:00:00Z")?;
+    let end = gang_clock::Timestamp::from_rfc3339("2026-11-16T18:00:00Z")?;
+
+    assert_eq!(fleet.policy.instances.min_at(start), 1);
+    assert_eq!(fleet.policy.instances.min_at(end), 0);
+    Ok(())
+}
+
+#[test]
+fn an_unscheduled_fleet_keeps_its_base_minimum() -> Result<(), Box<dyn Error>> {
+    let config = Sections {
+        fleet: FLEET
+            .replace("min_instances = 0", "min_instances = 2")
+            .leak(),
+        ..Sections::VALID
+    }
+    .parse()?;
+    let fleet = config.fleets.get(0).ok_or("local fleet")?;
+    for instant in ["2026-11-16T07:00:00Z", "2026-11-16T18:00:00Z"] {
+        assert_eq!(
+            fleet
+                .policy
+                .instances
+                .min_at(gang_clock::Timestamp::from_rfc3339(instant)?),
+            2
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn scheduled_minimum_round_trips_through_a_document() -> Result<(), Box<dyn Error>> {
+    let text = Sections {
+        fleet: format!("{FLEET}{SCHEDULED_MINIMUM}").leak(),
+        ..Sections::VALID
+    }
+    .text();
+    let rendered = Document::<Plugins>::parse(&text)?.to_toml()?;
+    let original = text.parse::<GangConfig<Plugins>>()?;
+    let reparsed = rendered.parse::<GangConfig<Plugins>>()?;
+
+    assert!(rendered.contains("scheduled_minimum"), "{rendered}");
+    let original_fleet = original.fleets.get(0).ok_or("original fleet")?;
+    let reparsed_fleet = reparsed.fleets.get(0).ok_or("reparsed fleet")?;
+    assert_eq!(
+        reparsed_fleet.policy.instances,
+        original_fleet.policy.instances
+    );
+    assert_eq!(Document::<Plugins>::parse(&rendered)?.to_toml()?, rendered);
+
+    let without_schedule = Document::<Plugins>::parse(&Sections::VALID.text())?.to_toml()?;
+    assert!(
+        !without_schedule.contains("scheduled_minimum"),
+        "{without_schedule}"
+    );
+    Ok(())
+}
+
+#[test]
+fn scheduled_minimum_canonicalizes_time_zone_case() -> Result<(), Box<dyn Error>> {
+    let window = SCHEDULED_MINIMUM.replace("Europe/Paris", "europe/paris");
+    let text = Sections {
+        fleet: format!("{FLEET}{window}").leak(),
+        ..Sections::VALID
+    }
+    .text();
+    let _config = text.parse::<GangConfig<Plugins>>()?;
+    let rendered = Document::<Plugins>::parse(&text)?.to_toml()?;
+    assert!(
+        rendered.contains("time_zone = \"Europe/Paris\""),
+        "{rendered}"
+    );
+    Ok(())
+}
+
+#[test]
+fn scheduled_minimum_and_fleet_options_round_trip_together() -> Result<(), Box<dyn Error>> {
+    let text = Sections {
+        provisioner: AWS_PROVISIONER,
+        fleet: format!("{FLEET}[fleets.options]\ncapacity = \"spot\"\n{SCHEDULED_MINIMUM}").leak(),
+        ..Sections::VALID
+    }
+    .text();
+    let original = text.parse::<GangConfig<Plugins>>()?;
+    let rendered = Document::<Plugins>::parse(&text)?.to_toml()?;
+    let reparsed = rendered.parse::<GangConfig<Plugins>>()?;
+    let original_fleet = original.fleets.get(0).ok_or("original fleet")?;
+    let reparsed_fleet = reparsed.fleets.get(0).ok_or("reparsed fleet")?;
+    assert_eq!(
+        reparsed_fleet.policy.instances,
+        original_fleet.policy.instances
+    );
+    match (original_fleet.options, reparsed_fleet.options) {
+        (FleetOptions::Aws(original), FleetOptions::Aws(reparsed)) => {
+            assert_eq!(original.capacity, "spot");
+            assert_eq!(reparsed.capacity, original.capacity);
+        }
+        _ => return Err("expected aws fleet options".into()),
+    }
+    Ok(())
+}
+
+#[test]
+fn rejects_invalid_scheduled_minimum_tables_as_toml_errors() -> Result<(), Box<dyn Error>> {
+    let cases = [
+        (
+            SCHEDULED_MINIMUM.replace("time_zone = \"Europe/Paris\"\n", ""),
+            "missing field `time_zone`",
+        ),
+        (
+            SCHEDULED_MINIMUM.replace("instances = 1", "instances = 0"),
+            "invalid value",
+        ),
+        (
+            SCHEDULED_MINIMUM.replace("Europe/Paris", "Europe/Pariss"),
+            "unknown time zone `Europe/Pariss`",
+        ),
+        (SCHEDULED_MINIMUM.replace("08:00", "8:00"), "expected HH:MM"),
+        (
+            SCHEDULED_MINIMUM.replace("19:00", "25:00"),
+            "expected HH:MM",
+        ),
+        (
+            SCHEDULED_MINIMUM.replace(
+                "start = \"08:00\"\nend = \"19:00\"",
+                "start = \"19:00\"\nend = \"08:00\"",
+            ),
+            "start 19:00 is not before end 08:00",
+        ),
+        (
+            SCHEDULED_MINIMUM.replace("end = \"19:00\"", "end = \"08:00\""),
+            "start 08:00 is not before end 08:00",
+        ),
+        (
+            SCHEDULED_MINIMUM.replace("[\"mon\", \"tue\", \"wed\", \"thu\", \"fri\"]", "[]"),
+            "days must name at least one day",
+        ),
+        (
+            SCHEDULED_MINIMUM.replace(
+                "[\"mon\", \"tue\", \"wed\", \"thu\", \"fri\"]",
+                "[\"mon\", \"mon\"]",
+            ),
+            "day `mon` is listed twice",
+        ),
+        (
+            SCHEDULED_MINIMUM.replace(
+                "[\"mon\", \"tue\", \"wed\", \"thu\", \"fri\"]",
+                "[\"monday\"]",
+            ),
+            "monday",
+        ),
+        (
+            format!("{SCHEDULED_MINIMUM}zone = \"Europe/Paris\"\n"),
+            "unknown field `zone`",
+        ),
+    ];
+    for (window, expected) in cases {
+        let message = toml_rejection(&Sections {
+            fleet: format!("{FLEET}{window}").leak(),
+            ..Sections::VALID
+        })?;
+        assert!(
+            message.contains(expected),
+            "expected {expected:?}: {message}"
+        );
+        assert!(message.contains("line"), "missing TOML location: {message}");
+    }
+    Ok(())
+}
+
+#[test]
+fn rejects_scheduled_minimums_outside_fleet_bounds() -> Result<(), Box<dyn Error>> {
+    for (minimum, instances) in [(1, 1), (0, 5)] {
+        let fleet = FLEET.replace("min_instances = 0", &format!("min_instances = {minimum}"));
+        let window =
+            SCHEDULED_MINIMUM.replace("instances = 1", &format!("instances = {instances}"));
+        let error = Sections {
+            fleet: format!("{fleet}{window}").leak(),
+            ..Sections::VALID
+        }
+        .parse()
+        .err()
+        .ok_or("accepted an out-of-bounds scheduled minimum")?;
+
+        assert!(
+            matches!(
+                &error,
+                ConfigError::ScheduledMinimumBounds {
+                    fleet, instances: actual, min_instances, max_instances: 4
+                } if fleet.as_str() == "local-worker-x86-64"
+                    && *actual == instances && *min_instances == minimum
+            ),
+            "{error}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn rejects_a_fleet_name_with_an_uppercase_letter() -> Result<(), Box<dyn Error>> {
     let uppercase = FLEET.replace("local-worker-x86-64", "Local-worker-x86-64");
 
@@ -1536,6 +1754,19 @@ fn parses_fleets_in_preference_order() -> Result<(), Box<dyn Error>> {
     assert_eq!(catalog.fleets()[1].get("fleet"), Some("arm64-on-demand"));
     assert_eq!(catalog.fleets()[1].get("sandbox"), Some("noop"));
     assert_eq!(catalog.fleets()[1].get("capacity"), Some("on-demand"));
+    Ok(())
+}
+
+#[test]
+fn max_instances_sums_every_fleet() -> Result<(), Box<dyn Error>> {
+    let config = Sections {
+        provisioner: AWS_PROVISIONER,
+        fleet: TWO_FLEETS,
+        ..Sections::VALID
+    }
+    .parse()?;
+
+    assert_eq!(config.fleets.max_instances(), 6);
     Ok(())
 }
 
@@ -2973,6 +3204,68 @@ fn sandbox_programs_stop_at_the_first_error() -> Result<(), Box<dyn Error>> {
     assert_eq!(stopped, Err("stop"));
     assert_eq!(calls, 1);
     Ok(())
+}
+
+#[test]
+fn builds_defaults_apply_when_the_section_is_omitted() -> Result<(), Box<dyn Error>> {
+    let config = Sections::VALID.parse()?;
+    let builds = &config.builds;
+    assert_eq!(builds.max_live.get(), 256);
+    assert_eq!(builds.idle_after, NonZeroDuration::from_mins(5));
+    assert_eq!(builds.queue.get(), 65_536);
+    assert_eq!(builds.mnemonics.get(), 32);
+    assert_eq!(builds.targets.get(), 20);
+    assert_eq!(builds.slowest_actions.get(), 20);
+    assert_eq!(builds.timeline_buckets.get(), 120);
+    Ok(())
+}
+
+#[test]
+fn every_builds_key_can_be_overridden() -> Result<(), Box<dyn Error>> {
+    let config = Sections {
+        builds: "[builds]\nmax_live = 10\nidle_after = \"2m\"\nqueue = 100\nmnemonics = 4\ntargets = 5\nslowest_actions = 6\ntimeline_buckets = 7\n",
+        ..Sections::VALID
+    }
+    .parse()?;
+    let builds = &config.builds;
+    assert_eq!(builds.max_live.get(), 10);
+    assert_eq!(builds.idle_after, NonZeroDuration::from_mins(2));
+    assert_eq!(builds.queue.get(), 100);
+    assert_eq!(builds.mnemonics.get(), 4);
+    assert_eq!(builds.targets.get(), 5);
+    assert_eq!(builds.slowest_actions.get(), 6);
+    assert_eq!(builds.timeline_buckets.get(), 7);
+    Ok(())
+}
+
+#[test]
+fn unknown_builds_key_is_rejected_and_named() -> Result<(), Box<dyn Error>> {
+    let message = rejection(&Sections {
+        builds: "[builds]\nbogus = 1\n",
+        ..Sections::VALID
+    })?;
+    assert!(message.contains("bogus"), "{message}");
+    Ok(())
+}
+
+#[test]
+fn zero_builds_limits_are_rejected() {
+    for key in [
+        "max_live",
+        "queue",
+        "mnemonics",
+        "targets",
+        "slowest_actions",
+        "timeline_buckets",
+    ] {
+        let text = format!("{}\n[builds]\n{key} = 0\n", Sections::VALID.text());
+        assert!(text.parse::<GangConfig<Plugins>>().is_err(), "{key}");
+    }
+    let text = format!(
+        "{}\n[builds]\nidle_after = \"0s\"\n",
+        Sections::VALID.text()
+    );
+    assert!(text.parse::<GangConfig<Plugins>>().is_err(), "idle_after");
 }
 
 /// The configuration with the given `[dashboard]` text and every other section valid.

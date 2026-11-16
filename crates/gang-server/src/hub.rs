@@ -217,6 +217,7 @@ impl StateHub {
             events: Vec::new(),
             completed: None,
             recent: None,
+            builds: None,
             principals_epoch: Some(epoch),
         };
         match sse::encode(FrameRef::Delta(&delta)) {

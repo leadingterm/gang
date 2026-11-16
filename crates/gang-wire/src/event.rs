@@ -35,6 +35,8 @@ wire_enum! {
     pub enum Cause from ScalingCause {
         /// Queued work needed another worker.
         Demand = "DEMAND",
+        /// The fleet's minimum in force, not its work, needed the capacity.
+        Minimum = "MINIMUM",
         /// A worker stayed idle past its timeout.
         IdleTimeout = "IDLE_TIMEOUT",
         /// A worker lost its host and no longer has a reason to run.
@@ -159,6 +161,19 @@ mod tests {
                 worker: "workers/i-0e1000000000000a-0194d5a2".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn minimum_cause_round_trips_and_maps_from_scaling_cause() {
+        let event = round_trip(&json!({
+            "name": "events/997",
+            "createTime": "2026-01-14T09:19:30.000Z",
+            "fleet": "fleets/workers-x86-64",
+            "cause": "MINIMUM",
+            "scaledOut": {"from": 0, "to": 1},
+        }));
+        assert_eq!(event.cause, Some(Cause::Minimum));
+        assert_eq!(Cause::from(ScalingCause::Minimum), Cause::Minimum);
     }
 
     #[test]

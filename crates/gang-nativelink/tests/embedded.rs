@@ -15,10 +15,10 @@ use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use gang_nativelink::{NativeLink, NativeLinkConfig};
 use gang_spi::{
-    Accepted, ApiRequestBody, ApiResponseBody, ApiService, ClientTls, ControllerConnections,
-    ControllerReady, ControllerSpec, Listening, Peer, Plugin, PluginContext, PortError, Rejection,
-    RenderedStoreSpec, RequestGate, SchedulerPort, SchedulerSnapshot, Slots, StoreAccess, Subject,
-    WorkerSpec, WorkerState, WorkerTls, full_body,
+    Accepted, Admitted, ApiRequestBody, ApiResponseBody, ApiService, Authenticated, ClientTls,
+    ControllerConnections, ControllerReady, ControllerSpec, Listening, Peer, Plugin, PluginContext,
+    PortError, Rejection, RenderedStoreSpec, RequestGate, SchedulerPort, SchedulerSnapshot, Slots,
+    StoreAccess, Subject, WorkerSpec, WorkerState, WorkerTls, full_body,
 };
 use gang_testkit::{ChildTest, ExtendedKeyUsagePurpose, TestAuthority, TestResult};
 use gang_tls::{
@@ -26,8 +26,8 @@ use gang_tls::{
     RevocationSet, TlsAcceptor,
 };
 use gang_types::{
-    Bytes, CertSerial, FleetCatalog, FleetName, FleetProperties, FleetSet, InstanceId, Isa,
-    NonZeroDuration, Resources, WorkerId,
+    Bytes, CertSerial, FleetCatalog, FleetName, FleetProperties, FleetSet, Identity, InstanceId,
+    Isa, NonZeroDuration, Principal, ProviderName, Resources, WorkerId,
 };
 use hyper::client::conn::{http1, http2};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -213,6 +213,16 @@ fn no_connections() -> ControllerConnections<TestGate, TestGate, TestApi> {
     }
 }
 
+fn caller() -> Result<Authenticated, PortError> {
+    Ok(Authenticated {
+        identity: Arc::new(Identity::new(
+            ProviderName::try_new("test").map_err(PortError::unavailable)?,
+            Principal::try_new("tester").map_err(PortError::unavailable)?,
+        )),
+        valid_until: None,
+    })
+}
+
 /// A gate that refuses every request with `denial`, or admits every request when there is none.
 /// It records the peer of each request it sees.
 #[derive(Clone)]
@@ -249,10 +259,12 @@ impl RequestGate for TestGate {
         &self,
         peer: &Peer,
         _parts: &mut axum::http::request::Parts,
-    ) -> Result<(), PortError> {
+    ) -> Result<Admitted, PortError> {
         self.peers.lock().push(peer.clone());
-        self.denial
-            .map_or(Ok(()), |rejection| Err(PortError::refused(rejection)))
+        self.denial.map_or_else(
+            || caller().map(Admitted::Authenticated),
+            |rejection| Err(PortError::refused(rejection)),
+        )
     }
 }
 
@@ -320,11 +332,17 @@ fn spawn_controller(
     let (ready, readiness) = ControllerReady::channel();
     let controller = tokio::spawn(async move {
         let content = RenderedStoreSpec(json!({"memory": {}}));
+        let (observations, _receiver) = gang_spi::ObservationSink::channel(
+            std::num::NonZeroUsize::MIN,
+            std::num::NonZeroUsize::MIN,
+        );
         let action = RenderedStoreSpec(json!({"memory": {}}));
         let spec = ControllerSpec {
             content_store: &content,
             action_store: &action,
             fleets: &fleets,
+            max_workers: 8,
+            observations: &observations,
             client_action_timeout: CLIENT_ACTION_TIMEOUT,
         };
         let connections = ControllerConnections {
@@ -736,10 +754,16 @@ async fn a_second_controller_is_refused() -> TestResult {
     let content = RenderedStoreSpec(json!({"memory": {}}));
     let action = RenderedStoreSpec(json!({"memory": {}}));
     let fleets = FleetCatalog::try_new(vec![default_fleet()?])?;
+    let (observations, _receiver) = gang_spi::ObservationSink::channel(
+        std::num::NonZeroUsize::MIN,
+        std::num::NonZeroUsize::MIN,
+    );
     let spec = ControllerSpec {
         content_store: &content,
         action_store: &action,
         fleets: &fleets,
+        max_workers: 8,
+        observations: &observations,
         client_action_timeout: CLIENT_ACTION_TIMEOUT,
     };
     let (ready, readiness) = ControllerReady::channel();
@@ -752,31 +776,58 @@ async fn a_second_controller_is_refused() -> TestResult {
     Ok(())
 }
 
-/// A cold start that fits no fleet is rejected before the controller is ready.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_cold_start_no_fleet_accepts_is_refused_before_ready() -> TestResult {
-    let config = serde_json::from_value(json!({
-        "worker_endpoint": "grpc://127.0.0.1:0",
-        "scheduler_name": "MAIN_SCHEDULER",
-        "cold_start": { "memory": "64GiB" },
-    }))?;
-    let plugin = build_plugin(config)?;
+/// Runs a controller over the default fleet whose configuration adds `extra` to the defaults, and
+/// returns the configuration error it stops with, after checking that it never signalled ready.
+async fn refused_before_ready(extra: serde_json::Value) -> Result<String, Box<dyn Error>> {
+    let plugin = build_plugin(config_with(0, extra)?)?;
     let content = RenderedStoreSpec(json!({"memory": {}}));
     let action = RenderedStoreSpec(json!({"memory": {}}));
     let fleets = FleetCatalog::try_new(vec![default_fleet()?])?;
+    let (observations, _receiver) = gang_spi::ObservationSink::channel(
+        std::num::NonZeroUsize::MIN,
+        std::num::NonZeroUsize::MIN,
+    );
     let spec = ControllerSpec {
         content_store: &content,
         action_store: &action,
         fleets: &fleets,
+        max_workers: 8,
+        observations: &observations,
         client_action_timeout: CLIENT_ACTION_TIMEOUT,
     };
     let (ready, readiness) = ControllerReady::channel();
     let result = plugin.run_controller(&spec, no_connections(), ready).await;
-    assert!(matches!(
-        result,
-        Err(PortError::Config(error)) if error.to_string().contains("which no fleet accepts")
-    ));
     assert!(readiness.await.is_err());
+    match result {
+        Err(PortError::Config(error)) => Ok(error.to_string()),
+        other => Err(format!("expected a configuration error, got {other:?}").into()),
+    }
+}
+
+/// A cold start that fits no fleet is rejected before the controller is ready.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cold_start_no_fleet_accepts_is_refused_before_ready() -> TestResult {
+    let error = refused_before_ready(json!({
+        "cold_start": { "memory": "64GiB" },
+    }))
+    .await?;
+    assert!(error.contains("which no fleet accepts"), "{error}");
+    Ok(())
+}
+
+/// A minimum reservation above a fleet's memory is rejected before the controller is ready.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_minimum_reservation_above_a_fleet_is_refused_before_ready() -> TestResult {
+    let error = refused_before_ready(json!({
+        "memory": { "min_reservation": "16GiB" },
+    }))
+    .await?;
+    assert!(
+        error.contains(
+            "lower [scheduler.nativelink.memory] min_reservation or raise the fleet's memory_per_instance"
+        ),
+        "{error}"
+    );
     Ok(())
 }
 
@@ -1347,6 +1398,43 @@ async fn an_action_is_queued_for_the_fleets_that_fit_it() -> TestResult {
     await_response(operations).await?;
     let snapshot = read_snapshot(&harness).await?;
     assert_eq!(sole_worker(&snapshot)?.fleet, large_name);
+    Ok(())
+}
+
+/// The controller applies its configured minimum to a smaller requested reservation, end to end
+/// from the configuration to the queued action.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reservation_below_the_minimum_is_queued_at_the_minimum() -> TestResult {
+    let harness = Harness::start_configured(
+        vec![default_fleet()?],
+        TestGate::allow(),
+        Vec::new(),
+        json!({"memory": {"min_reservation": "64MiB"}}),
+    )
+    .await?;
+    let channel = public_channel(harness.public_port).await?;
+    let action = build_action(&[("memory_kb", "252")])?;
+    upload_blobs(&channel, action.blobs).await?;
+    let mut operations = ExecutionClient::new(channel)
+        .execute(ExecuteRequest {
+            instance_name: String::new(),
+            skip_cache_lookup: true,
+            action_digest: Some(action.digest),
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    let first = operations
+        .message()
+        .await?
+        .ok_or("the operation stream ended before the action was queued")?;
+    assert!(!first.done);
+    let snapshot = read_snapshot(&harness).await?;
+    let queued = snapshot
+        .queued
+        .first()
+        .ok_or("the snapshot lists no queued action")?;
+    assert_eq!(queued.resources.memory, Bytes::mib(64));
     Ok(())
 }
 

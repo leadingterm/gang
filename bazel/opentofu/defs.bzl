@@ -61,7 +61,7 @@ _opentofu_contract_test = rule(
         ),
         "srcs": attr.label_list(
             allow_files = True,
-            doc = "Files of the infra/ tree that the test needs at runtime.",
+            doc = "Runtime files from infra/, configs/, or //:Cargo.toml that the test needs.",
         ),
         "_runner": attr.label(
             default = "//bazel/opentofu/runner:opentofu-runner",
@@ -81,7 +81,7 @@ def opentofu_contract_test(name, test_file = None, deps = []):
     Args:
         name: Test target name.
         test_file: Test file relative to the package; defaults to tests/<package name>.tftest.hcl.
-        deps: Further files of the infra/ tree the root needs, such as the `sources` of the modules it calls.
+        deps: Further files the root needs, such as module `sources`, files in configs/, or //:Cargo.toml.
     """
     if not native.existing_rule("sources"):
         native.filegroup(

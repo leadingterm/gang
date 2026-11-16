@@ -3,6 +3,10 @@
 use thiserror::Error;
 
 use crate::MAX_FLEETS;
+/// A build id is not canonical lowercase Crockford base32.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("build id must be 16 base32 characters")]
+pub struct BuildIdError;
 
 /// Why a `<digits><unit>` quantity (a byte size or a configuration duration) did not parse.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

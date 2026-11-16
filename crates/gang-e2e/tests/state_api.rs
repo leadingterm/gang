@@ -39,6 +39,7 @@ fn state(seq: u64) -> Result<State, serde_json::Error> {
         "events": [],
         "eventsLimit": 200,
         "completed": 0,
+        "builds": [],
         "principalsEpoch": 0,
     }))
 }

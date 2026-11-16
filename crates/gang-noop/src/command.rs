@@ -61,13 +61,13 @@ mod tests {
         let command = command(&spec, Path::new("/tmp/action"));
 
         assert_eq!(command.get_program(), launcher[0].as_os_str());
-        let args: Vec<&OsStr> = command.get_args().collect();
+        let actual_arguments: Vec<&OsStr> = command.get_args().collect();
         let expected: Vec<&OsStr> = launcher[1..]
             .iter()
             .chain(&argv)
             .map(OsString::as_os_str)
             .collect();
-        assert_eq!(args, expected);
+        assert_eq!(actual_arguments, expected);
         Ok(())
     }
 }

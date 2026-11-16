@@ -3,6 +3,7 @@ load("//bazel/opentofu:defs.bzl", "opentofu_contract_test")
 opentofu_contract_test(
     name = "deployment_contract",
     deps = [
+        "//:Cargo.toml",
         "//infra/terraform/modules/controller:sources",
         "//infra/terraform/modules/instance-role:sources",
         "//infra/terraform/modules/load-balancer:sources",

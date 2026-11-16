@@ -39,6 +39,7 @@ pub struct FleetProperties {
 }
 
 impl FleetProperties {
+    const FLEET_POSITION: usize = 0;
     const SANDBOX_POSITION: usize = 2;
     const FIXED_ENTRY_COUNT: usize = 7;
 
@@ -91,6 +92,25 @@ impl FleetProperties {
     #[must_use]
     pub fn sandbox(&self) -> &str {
         self.entries[Self::SANDBOX_POSITION].value.as_str()
+    }
+
+    /// The fleet's name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        self.entries[Self::FLEET_POSITION].value.as_str()
+    }
+
+    /// The limit of the minimum entry named `key`, if the fleet has one: memory and disk in
+    /// KiB, CPU in cores or millicores.
+    #[must_use]
+    pub fn limit(&self, key: &str) -> Option<u64> {
+        self.entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .and_then(|entry| match entry.rule {
+                Rule::Minimum(limit) => Some(limit),
+                Rule::Exact => None,
+            })
     }
 
     /// The provisioner options, in registration order: every entry after the fleet, ISA,
@@ -169,6 +189,19 @@ mod tests {
     #[test]
     fn sandbox_returns_the_sandbox_given_to_new() {
         assert_eq!(gang_x86().sandbox(), "bwrap");
+    }
+
+    #[test]
+    fn name_is_the_fleet_name() {
+        assert_eq!(gang_x86().name(), "gang-x86");
+    }
+
+    #[test]
+    fn limit_reads_minimum_entries_only() {
+        let fleet = gang_x86();
+        assert_eq!(fleet.limit(property::MEMORY_KB), Some(29 * 1024 * 1024));
+        assert_eq!(fleet.limit(property::SANDBOX), None);
+        assert_eq!(fleet.limit("absent"), None);
     }
 
     #[test]
@@ -251,8 +284,8 @@ mod tests {
                 ("sandbox", "bwrap", Rule::Exact),
                 ("cpu_count", "15", Rule::Minimum(15)),
                 ("cpu_millicores", "15000", Rule::Minimum(15000)),
-                ("memory_kb", "30408704", Rule::Minimum(30408704)),
-                ("disk_kb", "104857600", Rule::Minimum(104857600)),
+                ("memory_kb", "30408704", Rule::Minimum(30_408_704)),
+                ("disk_kb", "104857600", Rule::Minimum(104_857_600)),
                 ("capacity", "spot", Rule::Exact),
             ]
         );

@@ -15,7 +15,6 @@ module "gang" {
   cidr_block                   = "10.20.0.0/16"
   hostname                     = "gang.example.com"
   cache_bucket_name            = "example-gang-cache"
-  controller_ami_id            = "ami-00000000000000000"
   controller_instance_type     = "c7i.large"
   default_isa                  = "x86-64"
   trust_domain                 = "example.com"
@@ -36,7 +35,6 @@ module "gang" {
       name                        = "gang-worker-x86-64"
       isa                         = "x86-64"
       capacity                    = "spot"
-      ami_id                      = "ami-00000000000000001"
       instance_types              = ["c6id.4xlarge"]
       max_instances               = 4
       vcpus_per_instance          = 15
@@ -48,7 +46,6 @@ module "gang" {
       name                        = "gang-worker-aarch64"
       isa                         = "aarch64"
       capacity                    = "spot"
-      ami_id                      = "ami-00000000000000002"
       instance_types              = ["c7gd.4xlarge"]
       max_instances               = 4
       vcpus_per_instance          = 15
@@ -62,7 +59,6 @@ module "gang" {
     #   name                        = "gang-worker-x86-64-fallback"
     #   isa                         = "x86-64"
     #   capacity                    = "spot"
-    #   ami_id                      = "ami-00000000000000003"
     #   instance_types              = ["c6id.4xlarge"]
     #   max_instances               = 4
     #   vcpus_per_instance          = 15
@@ -76,7 +72,6 @@ module "gang" {
     #   name                        = "gang-worker-aarch64-warm"
     #   isa                         = "aarch64"
     #   capacity                    = "on-demand"
-    #   ami_id                      = "ami-00000000000000004"
     #   instance_types              = ["c7gd.4xlarge"]
     #   max_instances               = 4
     #   vcpus_per_instance          = 15

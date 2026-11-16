@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use gang_clock::Clock;
+use gang_insight::BuildFilter;
 use gang_spi::{
     ApiRequestBody, ApiResponseBody, ApiService, Authenticated, AuthenticationPort,
     CertificateIssue, CredentialLifecyclePort, LoginPort, PortError, ScalingEventSeq,
@@ -41,6 +42,7 @@ use crate::api_error::{
     PortResultExt, gate_status, malformed_request, missing_permission, route_not_found, status_of,
 };
 use crate::authorizer::Authorizer;
+use crate::builds::BuildsCell;
 use crate::client_address::ClientAddress;
 use crate::core::Core;
 use crate::deployment::Stack;
@@ -85,6 +87,8 @@ pub(crate) struct ApiParts<K: Stack> {
     /// The dashboard served at `GET /v1/state` and `GET /v1/state:watch`; `None` when the server
     /// does not mount it.
     pub(crate) dashboard: Option<ApiDashboard>,
+    /// The live builds served independently of the dashboard.
+    pub(crate) builds: BuildsCell,
     /// The identity provider the browser signs in with, which `GET /v1/session` reports; `None`
     /// when the browser sign-in is not mounted.
     pub(crate) login_provider: Option<ProviderName>,
@@ -205,6 +209,8 @@ impl<K: Stack> Api<K> {
             RouteId::RestorePrincipal => Operation::RestorePrincipal(raw?),
             RouteId::ListRoles => Operation::ListRoles,
             RouteId::ListEvents => Operation::ListEvents,
+            RouteId::ListBuilds => Operation::ListBuilds,
+            RouteId::GetBuild => Operation::GetBuild(raw?),
             RouteId::GetState => Operation::GetState(shared.dashboard.as_ref()?),
             RouteId::WatchState => Operation::WatchState {
                 dashboard: shared.dashboard.as_ref()?,
@@ -242,6 +248,8 @@ impl<K: Stack> Api<K> {
             Operation::RestorePrincipal(raw) => outcome(self.restore_principal(raw, body).await),
             Operation::ListRoles => outcome(self.list_roles(query)),
             Operation::ListEvents => outcome(self.list_events(query).await),
+            Operation::ListBuilds => outcome(self.list_builds(query)),
+            Operation::GetBuild(raw) => outcome(self.get_build(raw)),
             Operation::GetState(dashboard) => state(dashboard),
             Operation::WatchState { dashboard, caller } => self.watch_state(dashboard, caller),
             Operation::GetSession => json(StatusCode::OK, &self.session(caller)),
@@ -498,6 +506,69 @@ impl<K: Stack> Api<K> {
         })
     }
 
+    /// Answers a page of live builds in latest-activity order.
+    fn list_builds(&self, query: Option<&str>) -> Result<gang_wire::ListBuildsResponse, Status> {
+        let query = ListQuery::parse(query)?;
+        let text = query.filter.as_deref().unwrap_or("");
+        let filter: BuildFilter = text
+            .parse()
+            .map_err(|_| malformed_request([("filter", "invalid build filter")]))?;
+        let paging = query.paging(text)?;
+        let cursor = paging
+            .cursor
+            .as_deref()
+            .map(|cursor| {
+                let (millis, id) = cursor
+                    .split_once('/')
+                    .ok_or(ErrorReason::InvalidPageToken)?;
+                let millis = millis
+                    .parse::<u64>()
+                    .map_err(|_| ErrorReason::InvalidPageToken)?;
+                let id = id
+                    .parse::<gang_types::BuildId>()
+                    .map_err(|_| ErrorReason::InvalidPageToken)?;
+                Ok::<_, ErrorReason>((millis, format!("builds/{id}")))
+            })
+            .transpose()?;
+        let now = self.0.core.host.clock.wall();
+        let mut builds = self.0.builds.read(|builds| builds.list(&filter, now));
+        if let Some((millis, name)) = cursor {
+            builds.retain(|build| {
+                let time = build.last_active_time.as_unix_millis();
+                time < millis || (time == millis && build.name > name)
+            });
+        }
+        let more = builds.len() > paging.limit.get();
+        builds.truncate(paging.limit.get());
+        let last = builds.last().map(|build| {
+            format!(
+                "{}/{}",
+                build.last_active_time.as_unix_millis(),
+                build.name.trim_start_matches("builds/")
+            )
+        });
+        let next_page_token = PageToken::after(text, more, last.as_deref());
+        Ok(gang_wire::ListBuildsResponse {
+            builds,
+            next_page_token,
+        })
+    }
+
+    /// Answers the full view of a live build.
+    fn get_build(&self, raw: &str) -> Result<gang_wire::Build, Status> {
+        let id = id_of::<name::Builds>(raw, "build")?;
+        let not_found = || {
+            status_of(
+                ErrorReason::BuildNotFound,
+                [("build", name::of::<name::Builds>(&id))],
+            )
+        };
+        self.0
+            .builds
+            .read(|builds| builds.get(id, self.0.core.host.clock.wall()))
+            .ok_or_else(not_found)
+    }
+
     /// The caller's session. An anonymous caller has a session too: one without a principal.
     fn session(&self, caller: &Caller) -> Session {
         let authenticated = caller.as_authenticated();
@@ -676,6 +747,10 @@ enum Operation<'a, K: Stack> {
     ListRoles,
     /// `GET /v1/events`: one page of scaling events.
     ListEvents,
+    /// `GET /v1/builds`: one page of live builds.
+    ListBuilds,
+    /// `GET /v1/builds/{build}`: one full live build.
+    GetBuild(&'a str),
     /// `GET /v1/state`: the latest state, from the mounted dashboard.
     GetState(&'a ApiDashboard),
     /// `GET /v1/state:watch`: the live state stream, for an authenticated caller.

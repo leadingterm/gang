@@ -22,7 +22,7 @@
 //! - [`FakeProvisioner`]: a configurable fleet and worker-side provisioner.
 //! - [`FakeScheduler`] and its [`Controller`], [`Behaviour`] and [`CallCount`] helpers.
 //! - [`TestPlugins`], [`OpaquePlugins`] and [`STANDARD_GANG_TOML`]: plugin sets and a standard configuration.
-//! - [`fleet_policy`], [`fleet_of`] and [`fleet`]: sample fleet builders.
+//! - [`fleet_policy`], [`fleet_of`], [`fleet`] and [`scheduled_minimum`]: sample fleet builders.
 //! - [`worker_on`] and [`worker_id`]: deterministic worker identifiers for an instance.
 //! - [`generate_es256_key`]: generate the signing key and JWK that test issuers publish.
 //! - [`signer_contract`]: checks the shared certificate signer boundary.
@@ -64,7 +64,7 @@ mod test_result;
 mod tls_authority;
 mod worker;
 
-pub use builders::{fleet, fleet_of, fleet_policy};
+pub use builders::{fleet, fleet_of, fleet_policy, scheduled_minimum};
 pub use cache::FakeCache;
 pub use call_log::CallLog;
 pub use child_test::ChildTest;

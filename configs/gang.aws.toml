@@ -67,7 +67,7 @@ worker_endpoint = "grpcs://ip-10-20-0-10.eu-north-1.compute.internal:9090"
 scheduler_name = "MAIN_SCHEDULER"
 
 [database.sqlite]
-# The controller image mounts its state volume at this path.
+# The controller keeps its state under this path.
 path = "/var/lib/gang/gang.db"
 
 [sandbox.bwrap]

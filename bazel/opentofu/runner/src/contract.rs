@@ -15,7 +15,7 @@ pub struct Contract {
     pub tofu: PathBuf,
     /// Directory of pre-downloaded providers, passed to `tofu init` as `-plugin-dir`.
     pub provider_mirror: PathBuf,
-    /// Directory holding `infra/` and optionally `configs/`.
+    /// Directory holding `infra/` and optionally `configs/` and `Cargo.toml`.
     pub sources: PathBuf,
     /// Root directory, relative to `sources`.
     pub root: PathBuf,
@@ -110,14 +110,27 @@ impl Contract {
     }
 }
 
-/// Copies `sources/infra` into `work/infra`, and `sources/configs` beside it when present.
+/// Copies `infra/`, optional `configs/`, and optional `Cargo.toml` into `work`.
 ///
 /// Symlinks are followed, so the copy holds regular files only.
 fn stage(sources: &Path, work: &Path) -> Result<(), RunError> {
-    copy_dir(&sources.join("infra"), &work.join("infra"))?;
-    let configs = sources.join("configs");
-    if configs.is_dir() {
-        copy_dir(&configs, &work.join("configs"))?;
+    // Each entry is (relative path, required, directory).
+    const ENTRIES: &[(&str, bool, bool)] = &[
+        ("infra", true, true),
+        ("configs", false, true),
+        ("Cargo.toml", false, false),
+    ];
+
+    for &(name, required, directory) in ENTRIES {
+        let from = sources.join(name);
+        let to = work.join(name);
+        if directory {
+            if required || from.is_dir() {
+                copy_dir(&from, &to)?;
+            }
+        } else if required || from.is_file() {
+            fs::copy(&from, &to).map_err(|source| RunError::Stage { source, path: from })?;
+        }
     }
     Ok(())
 }
@@ -214,6 +227,27 @@ mod tests {
     fn run(root: &str) -> Result<(), RunError> {
         let work = tempfile::tempdir().expect("work directory");
         contract(root).run(work.path())
+    }
+
+    #[test]
+    fn stages_workspace_manifest() {
+        let sources = tempfile::tempdir().expect("sources directory");
+        let work = tempfile::tempdir().expect("work directory");
+        fs::create_dir(sources.path().join("infra")).expect("infra directory");
+        fs::write(
+            sources.path().join("Cargo.toml"),
+            "[workspace.package]\nversion = \"1.2.3\"\n",
+        )
+        .expect("workspace manifest");
+
+        stage(sources.path(), work.path()).expect("stage sources");
+
+        assert_eq!(
+            fs::read_to_string(work.path().join("Cargo.toml")).expect("staged manifest"),
+            "[workspace.package]\nversion = \"1.2.3\"\n"
+        );
+        assert!(work.path().join("infra").is_dir());
+        assert!(!work.path().join("configs").exists());
     }
 
     #[test]

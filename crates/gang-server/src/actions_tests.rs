@@ -24,6 +24,7 @@ fn queued(op: &str) -> QueuedActionView {
             target: "//pkg:target".to_owned(),
             mnemonic: "Javac".to_owned(),
             priority: 0,
+            build: None,
         },
         queued_since: Timestamp::UNIX_EPOCH,
         candidates: FleetSet::EMPTY,

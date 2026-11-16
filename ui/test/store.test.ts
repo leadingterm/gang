@@ -90,7 +90,7 @@ const after = (state: State, parts: Omit<Delta, "seq" | "base" | "updateTime"> =
 
 test("a delta applies its recent increment", () => {
   const sample = (step: number, completed: number) => ({
-    start: iso(step * 10000), completed, running: 1, queued: 2, passes: 1, skipped: 0,
+    start: iso(step * 10000), completed, running: 1, queued: 2, passes: 1, skipped: 0, lookups: 0, hits: 0,
   });
   const recent = { window: "30s", step: "10s", samples: [sample(0, 1), sample(1, 2), sample(2, 3)] };
   const state = { ...snapshot, recent };
@@ -134,6 +134,27 @@ test("keyed deltas remove rows by their names", () => {
   const next = apply(snapshot, after(snapshot, { workers: { remove: [worker.name] } }));
   assert.equal(next.workers.length, snapshot.workers.length - 1);
   assert.ok(!next.workers.some((w) => w.name === worker.name));
+});
+
+test("build deltas upsert and remove by name", () => {
+  const first = snapshot.builds?.[0];
+  assert.ok(first);
+  const added = { ...first, name: "builds/zzzz" };
+  const next = apply(snapshot, after(snapshot, { builds: { remove: [first.name], upsert: [added] } }));
+  assert.ok(!next.builds?.some((b) => b.name === first.name));
+  assert.deepEqual(next.builds?.find((b) => b.name === added.name), added);
+});
+
+test("a build state-only delta changes its row identity but keeps untouched rows", () => {
+  const first = snapshot.builds?.[0];
+  const second = snapshot.builds?.[1];
+  assert.ok(first);
+  assert.ok(second);
+  const changed = { ...first, state: "IDLE" as const };
+  const next = apply(snapshot, after(snapshot, { builds: { upsert: [changed] } }));
+  assert.notEqual(next.builds?.[0], first);
+  assert.equal(next.builds?.[0], changed);
+  assert.equal(next.builds?.[1], second);
 });
 
 test("the first action sample can arrive in a delta, and needs its threshold", () => {

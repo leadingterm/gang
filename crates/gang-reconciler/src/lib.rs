@@ -10,7 +10,7 @@
 //!
 //! use gang_clock::{TestClock, Timestamp};
 //! use gang_config::{FleetPolicy, InstanceBounds};
-//! use gang_reconciler::{Action, FleetPass, HostedSnapshot, PassTime, Plan, PlanStep, Reconciler};
+//! use gang_reconciler::{Action, FleetPass, HostedSnapshot, NeedCause, PassTime, Plan, PlanStep, Reconciler};
 //! use gang_spi::{QueuedDemand, SchedulerSnapshot};
 //! use gang_types::{ActionResources, FleetName, FleetSet, Isa, NonZeroBytes, nonzero_u32};
 //!
@@ -48,7 +48,7 @@
 //!     plan.steps,
 //!     [PlanStep {
 //!         fleet: 0,
-//!         action: Action::ScaleOut { from: 0, to: 1 },
+//!         action: Action::ScaleOut { from: 0, to: 1, need: NeedCause::Demand },
 //!     }]
 //! );
 //! # Ok::<(), Box<dyn std::error::Error>>(())
@@ -68,5 +68,5 @@ pub use demand::Demand;
 pub use fleet::{FleetOutlook, FleetPass, WorkerCounts};
 pub use hosted_snapshot::HostedSnapshot;
 pub use pass_time::PassTime;
-pub use plan::{Action, Plan, PlanStep, TerminationCause};
+pub use plan::{Action, NeedCause, Plan, PlanStep, TerminationCause};
 pub use reconciler::Reconciler;

@@ -50,3 +50,7 @@ export const humanize = (e: string): string => e.toLowerCase().replaceAll("_", "
 
 /** The total of `value` over `rows`. */
 export const sum = <T,>(rows: readonly T[], value: (row: T) => number): number => rows.reduce((n, row) => n + value(row), 0);
+
+/** A ratio as a whole percentage, or a dash when it has no denominator. */
+export const percent = (numerator: number, denominator: number): string =>
+  denominator > 0 ? `${Math.round(numerator / denominator * 100)}%` : "—";

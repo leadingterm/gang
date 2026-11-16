@@ -1,20 +1,22 @@
-# Publishes every pushed v* tag as a GitHub release (docs/SPECIFICATION.md 7.2): the binaries CI built and tested for the tagged commit on main,
-# and, when the repository variable IMAGE_DESTINATION is set, the controller and worker disk images made from them. Nothing is compiled here.
+# Publishes every pushed v* tag as a GitHub release: CI's binaries, each architecture's disk image,
+# and its public AMI in every image region (gang-amis.json). Nothing is compiled here.
+# Dispatch on a branch or main is a dry run without AWS; dispatch on a v* tag backfills retained AMIs.
 
 name: Release
 
 on:
   push:
     tags: ["v*"]
-  # Dry run: builds, verifies, compresses and checksums the images on both architectures, and stores and publishes nothing. A tag releases only a commit whose dry run passed.
+  # A pushed tag releases only a commit whose dry run passed.
   workflow_dispatch:
 
 permissions:
   contents: read
 
 env:
-  # Only a pushed v* tag stores images and publishes a release; a dispatched run is a dry run.
+  # Only a pushed v* tag publishes a release.
   PUBLISH: ${{ github.event_name == 'push' }}
+  BACKFILL: ${{ github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v') }}
 
 defaults:
   run:
@@ -23,6 +25,7 @@ defaults:
 jobs:
   # gh and sha256sum are the runner's own: this job checks out nothing and installs no Nix.
   locate:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -38,18 +41,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
-          IMAGES: ${{ vars.IMAGE_DESTINATION != '' }}
         run: |
-          dry_run="$(gh api "repos/$GH_REPO/actions/workflows/release.yml/runs?head_sha=$SHA&event=workflow_dispatch" \
-            --jq '[.workflow_runs[] | select(.conclusion == "success")][0].id // empty')"
+          runs="$(gh api "repos/$GH_REPO/actions/workflows/release.yml/runs?head_sha=$SHA&event=workflow_dispatch" \
+            --jq '.workflow_runs[] | select(.conclusion == "success") | .id')"
+          dry_run=""
+          for candidate in $runs; do
+            imaged="$(gh api "repos/$GH_REPO/actions/runs/$candidate/jobs" \
+              --jq '[.jobs[] | select((.name | startswith("images (")) and .conclusion == "success")] | length')"
+            if [[ "$imaged" == 2 ]]; then
+              dry_run="$candidate"
+              break
+            fi
+          done
           if [[ -z "$dry_run" ]]; then
-            echo "::error::no passed dry run of $SHA: dispatch this workflow on the commit (gh workflow run release.yml --ref main) and tag once it has passed" >&2
-            exit 1
-          fi
-          imaged="$(gh api "repos/$GH_REPO/actions/runs/$dry_run/jobs" \
-            --jq '[.jobs[] | select((.name | startswith("images (")) and .conclusion == "success")] | length')"
-          if [[ "$IMAGES" == true && "$imaged" != 2 ]]; then
-            echo "::error::dry run $dry_run of $SHA did not build the images of both architectures" >&2
+            echo "::error::no passed dry run of $SHA built both images: dispatch this workflow on the commit (gh workflow run release.yml --ref main) and tag once it has passed" >&2
             exit 1
           fi
           echo "dry run $dry_run of $SHA passed"
@@ -60,19 +65,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
         run: |
           run_id="$(gh api "repos/$GH_REPO/actions/workflows/ci.yml/runs?head_sha=$SHA" \
-            --jq '[.workflow_runs[] | select(.event == "push" and .head_branch == "main" and .conclusion == "success")][0].id // empty')"
+            --jq "[.workflow_runs[] | select(.conclusion == \"success\" and ((.event == \"push\" and .head_branch == \"main\") or (\"$EVENT\" == \"workflow_dispatch\" and .event == \"pull_request\")))][0].id // empty")"
           if [[ -z "$run_id" ]]; then
-            echo "::error::no successful CI run of $SHA pushed to main: release a commit of main once its CI run has passed" >&2
+            echo "::error::no eligible successful CI run of $SHA" >&2
             exit 1
           fi
           echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
 
-  # Disk images of the binaries CI tested, built natively per architecture and stored once under <destination>/<tag>/.
+  # Build each architecture's disk image from the binaries CI tested.
   images:
     needs: locate
-    if: vars.IMAGE_DESTINATION != ''
+    if: ${{ !(github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')) }}
     strategy:
       matrix:
         include:
@@ -104,23 +110,17 @@ jobs:
         run: |
           install -D -m 0755 "staged/gang-${{ matrix.arch }}-unknown-linux-musl" "gang-binaries/$SYSTEM/gang"
           mkdir dist
-          for role in controller worker; do
-            nix build -L --override-input gang-binaries "path:$PWD/gang-binaries" ".#packages.$SYSTEM.$role-image" --out-link "image-$role"
-          done
+          nix build -L --override-input gang-binaries "path:$PWD/gang-binaries" ".#packages.$SYSTEM.image" --out-link image
           # The second build runs against a store whose identical files are hard-linked, as on a host with auto-optimise-store, so a disk that carried the builder's store layout differs.
           nix store optimise
-          for role in controller worker; do
-            # Nix builds the disk a second time and fails if the bytes differ.
-            nix build -L --rebuild --override-input gang-binaries "path:$PWD/gang-binaries" ".#packages.$SYSTEM.$role-image.disk" --no-link
-          done
+          # Nix builds the disk a second time and fails if the bytes differ.
+          nix build -L --rebuild --override-input gang-binaries "path:$PWD/gang-binaries" ".#packages.$SYSTEM.image.disk" --no-link
       - name: Compress the images
         shell: nix develop .#release -c bash --noprofile --norc -euo pipefail {0}
         run: |
-          for role in controller worker; do
-            # The image output links its disk; zstd skips a symbolic link, so it gets the store file itself.
-            zstd -19 --long=27 -T0 -q "$(realpath "image-$role"/*.raw)" -o "dist/gang-$role-${{ matrix.arch }}.raw.zst"
-            cp "image-$role/nix-support/image-info.json" "dist/gang-$role-${{ matrix.arch }}.json"
-          done
+          # The image output links its disk; zstd skips a symbolic link, so it gets the store file itself.
+          zstd -19 --long=27 -T0 -q "$(realpath image/*.raw)" -o "dist/gang-image-${{ matrix.arch }}.raw.zst"
+          cp image/nix-support/image-info.json "dist/gang-image-${{ matrix.arch }}.json"
           (cd dist && sha256sum gang-*) >"images-${{ matrix.arch }}.sha256"
           (cd dist && wc -c gang-* && cat ../"images-${{ matrix.arch }}.sha256") >>"$GITHUB_STEP_SUMMARY"
       # A release stores only images that its dry run, built on another runner, reproduced byte for byte.
@@ -140,51 +140,89 @@ jobs:
             echo "::error::the images differ from those of dry run $DRY_RUN: the image build is not reproducible" >&2
             exit 1
           fi
-      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: env.PUBLISH == 'true'
         with:
-          role-to-assume: ${{ vars.IMAGE_PUBLISH_ROLE }}
-          aws-region: ${{ vars.IMAGE_REGION }}
-      # Write-once: an existing key is accepted only if S3 holds the same SHA-256, so re-running a failed job is safe.
-      - name: Store the images
-        if: env.PUBLISH == 'true'
-        shell: nix develop .#release -c bash --noprofile --norc -euo pipefail {0}
-        working-directory: dist
-        env:
-          DESTINATION: ${{ vars.IMAGE_DESTINATION }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          location="${DESTINATION#s3://}"
-          bucket="${location%%/*}"
-          prefix="${location#"$bucket"}"
-          prefix="${prefix#/}"
-          prefix="${prefix%/}"
-          for file in gang-*; do
-            key="${prefix:+$prefix/}$TAG/$file"
-            checksum="$(sha256sum "$file" | cut -d' ' -f1 | tr a-f A-F | basenc --base16 -d | base64)"
-            if aws s3api put-object --bucket "$bucket" --key "$key" --body "$file" \
-              --checksum-sha256 "$checksum" --if-none-match '*' >/dev/null 2>put.err; then
-              echo "stored s3://$bucket/$key"
-            elif grep -q PreconditionFailed put.err; then
-              stored="$(aws s3api head-object --bucket "$bucket" --key "$key" --checksum-mode ENABLED --query ChecksumSHA256 --output text)"
-              if [[ "$stored" != "$checksum" ]]; then
-                echo "::error::s3://$bucket/$key already holds other bytes" >&2
-                exit 1
-              fi
-              echo "already stored s3://$bucket/$key"
-            else
-              cat put.err >&2
-              exit 1
-            fi
-          done
+          name: image-${{ matrix.arch }}
+          path: |
+            dist/gang-image-${{ matrix.arch }}.raw.zst
+            dist/gang-image-${{ matrix.arch }}.json
+          retention-days: 1
+          compression-level: 0
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: images-${{ matrix.arch }}
           path: images-${{ matrix.arch }}.sha256
 
-  publish:
+  amis:
     needs: [locate, images]
-    if: ${{ github.event_name == 'push' && !cancelled() && needs.locate.result == 'success' && contains(fromJSON('["success", "skipped"]'), needs.images.result) }}
+    if: ${{ !cancelled() && ((github.event_name == 'push' && needs.locate.result == 'success' && needs.images.result == 'success') || (github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v'))) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      actions: read
+      attestations: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-nix
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: env.BACKFILL != 'true'
+        with:
+          name: gang-x86_64-unknown-linux-musl
+          path: staged
+          run-id: ${{ needs.locate.outputs.run-id }}
+          github-token: ${{ github.token }}
+      - name: Download and verify the backfill binary
+        if: env.BACKFILL == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir -p staged
+          cd staged
+          gh release download "$TAG" --pattern gang-x86_64-unknown-linux-musl --pattern SHA256SUMS
+          sha256sum --check --ignore-missing --strict SHA256SUMS
+          gh attestation verify gang-x86_64-unknown-linux-musl --repo "$GH_REPO" \
+            --cert-identity "https://github.com/$GH_REPO/.github/workflows/release.yml@refs/tags/$TAG" \
+            --cert-oidc-issuer https://token.actions.githubusercontent.com --source-ref "refs/tags/$TAG"
+      - run: chmod +x staged/gang-x86_64-unknown-linux-musl
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: env.PUBLISH == 'true'
+        with:
+          pattern: image-*
+          path: images
+          merge-multiple: true
+      - name: Calculate image identities
+        if: env.PUBLISH == 'true'
+        run: |
+          echo "IMAGE_SHA256_x86_64=$(sha256sum images/gang-image-x86_64.raw.zst | cut -d' ' -f1)" >> "$GITHUB_ENV"
+          echo "IMAGE_SHA256_aarch64=$(sha256sum images/gang-image-aarch64.raw.zst | cut -d' ' -f1)" >> "$GITHUB_ENV"
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
+        with:
+          role-to-assume: ${{ vars.IMAGE_PUBLISH_ROLE }}
+          aws-region: ${{ vars.IMAGE_HOME_REGION }}
+      - name: Converge public AMIs
+        shell: nix develop .#release -c bash --noprofile --norc -euo pipefail {0}
+        env:
+          GANG: ${{ github.workspace }}/staged/gang-x86_64-unknown-linux-musl
+          IMAGE_HOME_REGION: ${{ vars.IMAGE_HOME_REGION }}
+          IMAGE_REGIONS: ${{ vars.IMAGE_REGIONS }}
+          RELEASE: ${{ github.event_name == 'push' && github.ref_name || '' }}
+          IMAGES_DIR: ${{ github.event_name == 'push' && 'images' || '' }}
+        run: infra/scripts/publish-amis.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: env.PUBLISH == 'true'
+        with:
+          name: gang-amis
+          path: gang-amis.json
+          retention-days: 1
+
+  publish:
+    needs: [locate, images, amis]
+    if: ${{ github.event_name == 'push' && !cancelled() && needs.locate.result == 'success' && needs.images.result == 'success' && needs.amis.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -201,16 +239,18 @@ jobs:
           run-id: ${{ needs.locate.outputs.run-id }}
           github-token: ${{ github.token }}
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        if: needs.images.result == 'success'
         with:
-          pattern: images-*
-          path: images
+          pattern: image-*
+          path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gang-amis
+          path: dist
       - name: Write SHA256SUMS
         working-directory: dist
         run: |
           sha256sum gang-* >SHA256SUMS
-          if [[ -d ../images ]]; then cat ../images/*.sha256 >>SHA256SUMS; fi
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-checksums: dist/SHA256SUMS
@@ -221,10 +261,8 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ needs.locate.outputs.run-id }}
-          DESTINATION: ${{ needs.images.result == 'success' && vars.IMAGE_DESTINATION || '' }}
         run: |
-          notes="Binaries built and tested by CI run $RUN_URL."
-          if [[ -n "$DESTINATION" ]]; then notes+=$'\n\n'"Disk images: $DESTINATION/$TAG/ (requester pays). Checksums in SHA256SUMS."; fi
+          notes="Binaries built and tested by CI run $RUN_URL. Public AMIs of each architecture in every image region: gang-amis.json."
           prerelease=()
           if [[ "$TAG" == *-* ]]; then
             prerelease=(--prerelease)

@@ -10,6 +10,24 @@ export type Duration = string;
 /** A count of bytes. */
 export type Bytes = number;
 
+export type ActionTime = { 
+/**
+ * Time spent queued.
+ */
+queued: Duration, 
+/**
+ * Time spent fetching inputs.
+ */
+inputFetch: Duration, 
+/**
+ * Time spent executing.
+ */
+executing: Duration, 
+/**
+ * Time spent uploading outputs.
+ */
+outputUpload: Duration, };
+
 export type Actions = { 
 /**
  * The sample time.
@@ -67,7 +85,89 @@ export type ApproveDeviceAuthorizationResponse = {
  */
 authorizationUrl: string, };
 
-export type Cause = "DEMAND" | "IDLE_TIMEOUT" | "ORPHAN" | "DRAIN_FINISHED" | "MAX_DRAIN_WAIT";
+export type Build = { 
+/**
+ * Resource name, `builds/{id}`.
+ */
+name: string, 
+/**
+ * Authenticated principal, `principals/{identity}`.
+ */
+principal: string, 
+/**
+ * Bazel invocation identifier.
+ */
+invocationId: string, 
+/**
+ * Bazel correlated invocations identifier, when supplied.
+ */
+correlatedInvocationsId?: string, 
+/**
+ * Tool name and version, when supplied.
+ */
+tool?: string, 
+/**
+ * Whether the build has recently been active.
+ */
+state: BuildState, 
+/**
+ * Time of the first observation.
+ */
+startTime: Timestamp, 
+/**
+ * Time of the latest observation.
+ */
+lastActiveTime: Timestamp, 
+/**
+ * Usage for the whole build.
+ */
+usage: Usage, 
+/**
+ * Observations lost to a full channel.
+ */
+unrecorded: number, 
+/**
+ * Usage by mnemonic, present in the full view.
+ */
+mnemonics?: Array<MnemonicUsage>, 
+/**
+ * Usage without a retained mnemonic, present in the full view.
+ */
+otherMnemonics?: Usage, 
+/**
+ * Most-missed targets, most misses first, in the full view.
+ */
+missedTargets?: Array<MissedTarget>, 
+/**
+ * Slowest actions, longest span first, in the full view.
+ */
+slowest?: Array<SlowAction>, 
+/**
+ * Observed activity over time, present in the full view.
+ */
+timeline?: Timeline, };
+
+export type BuildState = "ACTIVE" | "IDLE";
+
+export type CacheCounts = { 
+/**
+ * Successful lookups.
+ */
+hits: number, 
+/**
+ * Lookups answered not found.
+ */
+misses: number, 
+/**
+ * Lookups answered with another error.
+ */
+errors: number, 
+/**
+ * Successful uploads of locally executed results.
+ */
+uploadedResults: number, };
+
+export type Cause = "DEMAND" | "MINIMUM" | "IDLE_TIMEOUT" | "ORPHAN" | "DRAIN_FINISHED" | "MAX_DRAIN_WAIT";
 
 export type Closed = { 
 /**
@@ -131,6 +231,10 @@ completed?: number,
  * replace the client's samples from the first one's start on (see [`Recent::apply`]).
  */
 recent?: Recent, 
+/**
+ * Changes to the builds.
+ */
+builds?: Keyed<Build>, 
 /**
  * A new principal epoch.
  */
@@ -256,6 +360,24 @@ worker: string, } } | { "workerDeregistered": {
  */
 worker: string, } };
 
+export type Executions = { 
+/**
+ * Execute calls answered successfully.
+ */
+executeCalls: number, 
+/**
+ * Execute calls answered with an error.
+ */
+rejected: number, 
+/**
+ * Own executions that succeeded.
+ */
+completed: number, 
+/**
+ * Own executions that failed.
+ */
+failed: number, };
+
 export type Fleet = { 
 /**
  * Resource name, `fleets/{fleet}`.
@@ -378,6 +500,16 @@ reason: string, };
 
 export type Lifecycle = "PENDING" | "IN_SERVICE" | "TERMINATING";
 
+export type ListBuildsResponse = { 
+/**
+ * Builds in the page.
+ */
+builds: Array<Build>, 
+/**
+ * Token for the next page, absent on the last page.
+ */
+nextPageToken?: PageToken, };
+
 export type ListEventsResponse = { 
 /**
  * The events on this page.
@@ -407,6 +539,30 @@ roles: Array<Role>,
  * Token that resumes the list; absent on the last page.
  */
 nextPageToken?: PageToken, };
+
+export type MissedTarget = { 
+/**
+ * Target label.
+ */
+target: string, 
+/**
+ * Estimated misses, an upper bound.
+ */
+misses: number, 
+/**
+ * Error bound; true misses are at least `misses - overestimate`.
+ */
+overestimate: number, };
+
+export type MnemonicUsage = { 
+/**
+ * Action mnemonic.
+ */
+mnemonic: string, 
+/**
+ * Usage attributed to the mnemonic.
+ */
+usage: Usage, };
 
 export type PageToken = string;
 
@@ -442,7 +598,7 @@ skipped?: number, };
 
 export type PassState = "OK" | "SKIPPED";
 
-export type Permission = "state.read" | "principals.read" | "events.read" | "principals.revoke";
+export type Permission = "state.read" | "principals.read" | "events.read" | "builds.read" | "principals.revoke";
 
 export type Phase = "BUSY" | "IDLE" | "DRAINING";
 
@@ -458,7 +614,7 @@ start: Timestamp, };
 
 export type Policy = { 
 /**
- * The fewest instances the fleet keeps.
+ * The fewest instances the fleet keeps at this pass: `min_instances`, raised by a scheduled minimum in force.
  */
 min: number, 
 /**
@@ -528,6 +684,10 @@ export type QueuedAction = {
  */
 name: string, 
 /**
+ * The build of the action's first submitter, `builds/{id}`; absent when unattributable.
+ */
+build?: string, 
+/**
  * The action's digest.
  */
 digest: string, 
@@ -592,6 +752,10 @@ export type RunningAction = {
  */
 name: string, 
 /**
+ * The build of the action's first submitter, `builds/{id}`; absent when unattributable.
+ */
+build?: string, 
+/**
  * Reference `fleets/{fleet}` of the fleet the action runs on.
  */
 fleet: string, 
@@ -644,7 +808,15 @@ passes: number,
 /**
  * Control passes skipped during the step.
  */
-skipped: number, };
+skipped: number, 
+/**
+ * `GetActionResult` calls answered during the step.
+ */
+lookups: number, 
+/**
+ * Of `lookups`, remote cache hits.
+ */
+hits: number, };
 
 export type ScalingEvent = { 
 /**
@@ -752,6 +924,52 @@ provider: string, };
 
 export type SkipReason = "SCHEDULER_UNAVAILABLE" | "PROVISIONER_UNAVAILABLE";
 
+export type SlowAction = { 
+/**
+ * Target label, when supplied.
+ */
+target?: string, 
+/**
+ * Action mnemonic, when supplied.
+ */
+mnemonic?: string, 
+/**
+ * Action digest.
+ */
+digest: string, 
+/**
+ * Worker resource name, when known.
+ */
+worker?: string, 
+/**
+ * When the action was queued.
+ */
+queueTime: Timestamp, 
+/**
+ * Time from queuing to worker completion.
+ */
+span: Duration, 
+/**
+ * Time spent queued.
+ */
+queued: Duration, 
+/**
+ * Time spent fetching inputs.
+ */
+inputFetch: Duration, 
+/**
+ * Time spent executing.
+ */
+executing: Duration, 
+/**
+ * Time spent uploading outputs.
+ */
+outputUpload: Duration, 
+/**
+ * Process exit code.
+ */
+exitCode: number, };
+
 export type State = { 
 /**
  * Resource name, `state` in served frames.
@@ -811,6 +1029,10 @@ completed: number,
  */
 recent: Recent, 
 /**
+ * Builds with an observation within the recent window, basic view, ordered by name; at most `max_live`.
+ */
+builds: Array<Build>, 
+/**
  * Epoch of the principal set, which advances when principals change.
  */
 principalsEpoch: number, };
@@ -825,6 +1047,38 @@ seq: number,
  */
 time: Timestamp, };
 
+export type Timeline = { 
+/**
+ * Beginning of the first bucket.
+ */
+startTime: Timestamp, 
+/**
+ * Width of each bucket.
+ */
+step: Duration, 
+/**
+ * Consecutive buckets from `start_time`.
+ */
+buckets?: Array<TimelineBucket>, };
+
+export type TimelineBucket = { 
+/**
+ * Cache hits in this step.
+ */
+hits: number, 
+/**
+ * Cache misses in this step.
+ */
+misses: number, 
+/**
+ * Executing action-time within this step.
+ */
+executing: Duration, 
+/**
+ * Queued action-time within this step.
+ */
+queued: Duration, };
+
 export type Truncated = { 
 /**
  * Running actions left out.
@@ -834,6 +1088,20 @@ running: number,
  * Queued actions left out.
  */
 queued: number, };
+
+export type Usage = { 
+/**
+ * Action cache calls.
+ */
+cache: CacheCounts, 
+/**
+ * Execution calls and outcomes.
+ */
+executions: Executions, 
+/**
+ * Sums of action phase times.
+ */
+actionTime: ActionTime, };
 
 export type Worker = { 
 /**
@@ -909,6 +1177,8 @@ export const PATHS = {
   restorePrincipal: "/v1/principals/{principal}:restore",
   listRoles: "/v1/roles",
   listEvents: "/v1/events",
+  listBuilds: "/v1/builds",
+  getBuild: "/v1/builds/{build}",
   getState: "/v1/state",
   watchState: "/v1/state:watch",
   getSession: "/v1/session",

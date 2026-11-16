@@ -4,6 +4,7 @@ opentofu_contract_test(
     name = "example_contract",
     deps = [
         ".terraform.lock.hcl",
+        "//:Cargo.toml",
         "//configs:checked_in_configs",
         "//infra/terraform/modules/controller:sources",
         "//infra/terraform/modules/deployment:sources",

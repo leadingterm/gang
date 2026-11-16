@@ -1,7 +1,7 @@
 // Overview: four readouts, the fleets in preference order, the control pass and recent scaling.
 import { eventKind, idOf, ms } from "../wire-parse.ts";
 import type { Cause, Fleet, Recent, ScalingEvent, State } from "../wire.ts";
-import { donePerMinute, doneSeries, passBars, queuedSeries, runningSeries, unrecordedSlots, windowMs } from "../recent.ts";
+import { cacheRate, cacheSeries, donePerMinute, doneSeries, passBars, queuedSeries, runningSeries, unrecordedSlots, windowMs } from "../recent.ts";
 import { clock, duration, humanize, sum } from "../format.ts";
 import { Empty, EVENT_VIEW, EventWhat, Glyph, Ident, Num, Section, Since, useClient, useEnter } from "../ui.tsx";
 import { Legend, Tape } from "./fleet.tsx";
@@ -111,6 +111,12 @@ const Readouts = ({ state }: { state: State }) => {
         <p class="readout__big">{done === null ? <span class="num live">–</span> : <Num value={done.perMinute} />}</p>
         {done === null ? <p class="readout__sub">not recorded yet</p> : done.spanMs < 60 * 1000 && <p class="readout__sub">over {Math.round(done.spanMs / 1000)}s</p>}
         <Spark values={doneSeries(state.recent)} label="Done per minute" recent={state.recent} />
+      </div>
+      <div class="readout">
+        <h2 class="label">Remote cache</h2>
+        <p class="readout__big">{cacheRate(state.recent) === null ? "—" : `${Math.round((cacheRate(state.recent) ?? 0) * 100)}%`}</p>
+        <p class="readout__sub">recent window</p>
+        <Spark values={cacheSeries(state.recent)} label="Remote cache hit rate" recent={state.recent} />
       </div>
     </section>
   );

@@ -63,6 +63,7 @@ impl Fixture {
                 Arc::clone(&harness.clock),
             )),
             dashboard: None,
+            builds: crate::builds::BuildsCell::new(&gang_config::BuildsConfig::default()),
             login_provider: harness.routes.login_provider().cloned(),
             device: mounted,
         });

@@ -1,18 +1,27 @@
 //! The request gate: the middleware that runs a listener's [`RequestGate`] over every request
 //! before any service sees it, and the denial responses it produces.
 
+use std::sync::Arc;
+
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use gang_spi::{Peer, PortError, Rejection, RequestGate};
+use gang_spi::{Admitted, Peer, PortError, Rejection, RequestGate};
 use http::{StatusCode, header};
 use http_body_util::Empty;
 use tonic::{Code, Status};
 
+use crate::standing::{Standing, hold};
+
 /// Runs `gate` on a request and passes the request on when the gate admits it. The request's
-/// [`Peer`] comes from the request extensions; a request without one has the default peer.
+/// [`Peer`] comes from the request extensions; a request without one has the default peer. When the
+/// request carries its unproven connection's [`Standing`], it counts as in flight until its
+/// response body is done. An authenticated admission is the one source of both what follows from
+/// it: it proves the connection, after which its requests are no longer tracked, and it gives the
+/// services behind the gate the caller's [`Authenticated`](gang_spi::Authenticated) identity in
+/// the request extensions.
 pub(crate) async fn admit<G: RequestGate>(
     State(gate): State<G>,
     request: Request,
@@ -24,10 +33,28 @@ pub(crate) async fn admit<G: RequestGate>(
         .cloned()
         .unwrap_or_default();
     let grpc = is_grpc(&request);
+    let standing = request
+        .extensions()
+        .get::<Arc<Standing>>()
+        .filter(|standing| !standing.is_proven())
+        .cloned();
+    let busy = standing.as_ref().map(Standing::begin);
     let (mut parts, body) = request.into_parts();
-    match gate.admit(&peer, &mut parts).await {
-        Ok(()) => next.run(Request::from_parts(parts, body)).await,
+    let response = match gate.admit(&peer, &mut parts).await {
+        Ok(admitted) => {
+            if let Admitted::Authenticated(authenticated) = admitted {
+                if let Some(standing) = &standing {
+                    standing.prove();
+                }
+                parts.extensions.insert(authenticated);
+            }
+            next.run(Request::from_parts(parts, body)).await
+        }
         Err(error) => denial(&error, grpc),
+    };
+    match busy {
+        Some(busy) => hold(response, busy),
+        None => response,
     }
 }
 
@@ -87,12 +114,22 @@ mod tests {
     use axum::body::Body;
     use axum::middleware::from_fn_with_state;
     use axum::routing::post;
-    use gang_spi::Peer;
-    use gang_types::CertSerial;
+    use gang_spi::{Authenticated, Peer};
+    use gang_types::{CertSerial, Identity, Principal, ProviderName};
     use http::Request;
     use tower::ServiceExt;
 
     use super::*;
+
+    fn caller() -> Authenticated {
+        Authenticated {
+            identity: Arc::new(Identity::new(
+                ProviderName::try_new("test").expect("valid provider"),
+                Principal::try_new("tester").expect("valid principal"),
+            )),
+            valid_until: None,
+        }
+    }
 
     /// Denies every request with the error `make` builds.
     #[derive(Clone)]
@@ -103,7 +140,7 @@ mod tests {
             &self,
             _peer: &Peer,
             _parts: &mut http::request::Parts,
-        ) -> impl Future<Output = Result<(), PortError>> + Send {
+        ) -> impl Future<Output = Result<Admitted, PortError>> + Send {
             std::future::ready(Err((self.0)()))
         }
     }
@@ -117,8 +154,8 @@ mod tests {
             &self,
             _peer: &Peer,
             _parts: &mut http::request::Parts,
-        ) -> impl Future<Output = Result<(), PortError>> + Send {
-            std::future::ready(Ok(()))
+        ) -> impl Future<Output = Result<Admitted, PortError>> + Send {
+            std::future::ready(Ok(Admitted::Authenticated(caller())))
         }
     }
 
@@ -207,6 +244,63 @@ mod tests {
         assert_eq!(&body[..], b"ok");
     }
 
+    #[derive(Clone)]
+    struct Admit(Admitted);
+
+    impl RequestGate for Admit {
+        fn admit(
+            &self,
+            _peer: &Peer,
+            _parts: &mut http::request::Parts,
+        ) -> impl Future<Output = Result<Admitted, PortError>> + Send {
+            std::future::ready(Ok(self.0.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_authenticated_admission_gives_the_service_its_caller() {
+        let caller = caller();
+        let expected = caller.clone();
+        let router = Router::new()
+            .route(
+                "/grpc.Service/Method",
+                post(move |request: Request<Body>| async move {
+                    assert_eq!(request.extensions().get::<Authenticated>(), Some(&expected));
+                    StatusCode::OK
+                }),
+            )
+            .layer(from_fn_with_state(
+                Admit(Admitted::Authenticated(caller)),
+                admit::<Admit>,
+            ));
+        let request = Request::post("/grpc.Service/Method")
+            .body(Body::empty())
+            .expect("valid request");
+        let response = router.oneshot(request).await.expect("infallible router");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn an_anonymous_admission_gives_the_service_no_caller() {
+        let router = Router::new()
+            .route(
+                "/grpc.Service/Method",
+                post(|request: Request<Body>| async move {
+                    assert!(request.extensions().get::<Authenticated>().is_none());
+                    StatusCode::OK
+                }),
+            )
+            .layer(from_fn_with_state(
+                Admit(Admitted::Anonymous),
+                admit::<Admit>,
+            ));
+        let request = Request::post("/grpc.Service/Method")
+            .body(Body::empty())
+            .expect("valid request");
+        let response = router.oneshot(request).await.expect("infallible router");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     /// Admits only requests from a peer that presented a client certificate.
     #[derive(Clone)]
     struct RequireCertificate;
@@ -216,9 +310,9 @@ mod tests {
             &self,
             peer: &Peer,
             _parts: &mut http::request::Parts,
-        ) -> impl Future<Output = Result<(), PortError>> + Send {
+        ) -> impl Future<Output = Result<Admitted, PortError>> + Send {
             std::future::ready(match peer.certificate {
-                Some(_) => Ok(()),
+                Some(_) => Ok(Admitted::Authenticated(caller())),
                 None => Err(invalid_proof()),
             })
         }

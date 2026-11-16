@@ -36,10 +36,22 @@ pub(crate) fn scheduler(
     config: &NativeLinkConfig,
     spec: &ControllerSpec<'_>,
 ) -> Result<SchedulerConfig, NativeLinkConfigError> {
+    let min_kb = config.memory.min_reservation.as_units();
+    for fleet in spec.fleets.fleets() {
+        if let Some(memory_kb) = fleet.limit(property::MEMORY_KB)
+            && min_kb > memory_kb
+        {
+            return Err(NativeLinkConfigError::MinReservationAboveFleet {
+                fleet: fleet.name().to_owned(),
+                min_kb,
+                memory_kb,
+            });
+        }
+    }
     if config.cold_start.enabled {
         let cold = &config.cold_start;
-        let memory_kb = cold.memory.as_kib();
-        let disk_kb = cold.disk.as_kib();
+        let memory_kb = cold.memory.as_units();
+        let disk_kb = cold.disk.as_units();
         let millicores_text =
             (u64::from(cold.cpu_count.get()) * property::MILLICORES_PER_CORE).to_string();
         let (cpu_text, memory_text, disk_text) = (
@@ -114,8 +126,8 @@ fn cold_start(tuning: &ColdStartTuning) -> Option<Value> {
     tuning.enabled.then(|| {
         json!({
             "cpu_count": u64::from(tuning.cpu_count.get()) * property::MILLICORES_PER_CORE,
-            "memory_kb": tuning.memory.as_kib(),
-            "disk_kb": tuning.disk.as_kib(),
+            "memory_kb": tuning.memory.as_units(),
+            "disk_kb": tuning.disk.as_units(),
         })
     })
 }
@@ -280,6 +292,10 @@ fn worker_endpoint(endpoint: &Url, tls: WorkerTls<'_>) -> Result<String, NativeL
     }
     Ok(endpoint.as_str().trim_end_matches('/').to_owned())
 }
+
+/// The most connections one worker opens to the controller's worker listener: one for its worker
+/// API and, under [`StoreAccess::ViaController`], one for each of its content and action stores.
+pub(crate) const WORKER_CONNECTIONS: u64 = 3;
 
 /// A gRPC store that reaches the controller's worker listener for `store_type` (`cas` or `ac`).
 fn controller_grpc_store(
@@ -454,8 +470,7 @@ mod tests {
 
     use super::*;
     use crate::config::NativeLinkConfig;
-    use crate::enforcement::{DiskTuning, EscalationPercent};
-    use crate::whole_kib::WholeKib;
+    use crate::enforcement::{DiskTuning, EscalationPercent, MinReservation, WholeKib};
 
     fn config() -> NativeLinkConfig {
         serde_json::from_value(json!({
@@ -491,6 +506,18 @@ mod tests {
         FleetCatalog::try_new(vec![fleet("fleet-a", Isa::X86_64, "2")]).expect("valid catalog")
     }
 
+    fn observations() -> &'static gang_spi::ObservationSink {
+        static SINK: std::sync::LazyLock<gang_spi::ObservationSink> =
+            std::sync::LazyLock::new(|| {
+                gang_spi::ObservationSink::channel(
+                    std::num::NonZeroUsize::MIN,
+                    std::num::NonZeroUsize::MIN,
+                )
+                .0
+            });
+        &SINK
+    }
+
     fn controller_spec<'a>(
         content: &'a RenderedStoreSpec,
         action: &'a RenderedStoreSpec,
@@ -500,6 +527,8 @@ mod tests {
             content_store: content,
             action_store: action,
             fleets,
+            max_workers: 8,
+            observations: observations(),
             client_action_timeout: Duration::from_mins(10),
         }
     }
@@ -775,6 +804,39 @@ mod tests {
             panic!("slow store must be grpc");
         };
         assert_eq!(grpc.endpoints[0].address, "grpc://127.0.0.1:9100");
+    }
+
+    /// How many connections a worker with `settings` opens to the controller: its worker API, and
+    /// every connection of each store that reaches the controller over gRPC.
+    fn controller_dials(settings: &WorkerSettings) -> usize {
+        let grpc_connections: usize = settings
+            .stores
+            .iter()
+            .filter_map(|store| match &store.spec {
+                StoreSpec::Grpc(grpc) => Some(grpc),
+                StoreSpec::FastSlow(fast_slow) => match &fast_slow.slow {
+                    StoreSpec::Grpc(grpc) => Some(grpc),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .map(|grpc| grpc.endpoints.len() * grpc.connections_per_endpoint.max(1))
+            .sum();
+        1 + grpc_connections
+    }
+
+    #[test]
+    fn a_worker_dials_the_controller_at_most_worker_connections_times() {
+        let instance = InstanceId::try_new("local-1").expect("instance");
+        let content = memory_store();
+        let action = memory_store();
+        let properties = fleet("fleet-a", Isa::X86_64, "2");
+        let most = usize::try_from(WORKER_CONNECTIONS).expect("three fits a usize");
+        for (access, dials) in [(StoreAccess::ViaController, most), (StoreAccess::Direct, 1)] {
+            let spec = worker_spec(&instance, &properties, &content, &action, access);
+            let settings = worker(&config(), &endpoint(), &spec, WorkerTls::Plain).expect("worker");
+            assert_eq!(controller_dials(&settings), dials, "{access:?}");
+        }
     }
 
     #[test]
@@ -1138,6 +1200,7 @@ mod tests {
             headroom_percent: HeadroomPercent::from_percent(35),
             escalation_percent: EscalationPercent::try_new(300).expect("valid percent"),
             escalation_max_steps: 2,
+            min_reservation: MemoryTuning::default().min_reservation,
         });
         let enforcement = resource_enforcement_of(&config).expect("resource_enforcement");
         assert_eq!(enforcement.memory, NativeMemoryEnforcement::Soft);
@@ -1233,8 +1296,8 @@ mod tests {
         config.cold_start = ColdStartTuning {
             enabled: true,
             cpu_count: NonZeroU32::new(4).expect("non-zero cpu count"),
-            memory: WholeKib::from_kib(2 * 1024 * 1024),
-            disk: WholeKib::from_kib(8 * 1024 * 1024),
+            memory: WholeKib::from_units(2 * 1024 * 1024),
+            disk: WholeKib::from_units(8 * 1024 * 1024),
         };
         let scheduler = rendered_scheduler(&config);
         let cold = historical_of(&scheduler)
@@ -1279,8 +1342,8 @@ mod tests {
         config.cold_start = ColdStartTuning {
             enabled: true,
             cpu_count: NonZeroU32::new(1).expect("non-zero cpu count"),
-            memory: WholeKib::from_kib(memory_kib),
-            disk: WholeKib::from_kib(disk_kib),
+            memory: WholeKib::from_units(memory_kib),
+            disk: WholeKib::from_units(disk_kib),
         };
         config
     }
@@ -1295,6 +1358,79 @@ mod tests {
         let fleets = one_cpu_catalog(FOUR_GIB_KIB * 1024, FOUR_GIB_KIB * 1024);
         let config = config_with_cold_start_kib(FOUR_GIB_KIB, FOUR_GIB_KIB);
         assert!(scheduler(&config, &controller_spec(&content, &action, &fleets)).is_ok());
+    }
+
+    #[test]
+    fn minimum_reservation_above_the_only_fleet_is_rejected() {
+        let content = memory_store();
+        let action = memory_store();
+        let fleets = catalog();
+        let mut config = config();
+        config.memory.min_reservation = MinReservation::from_units(9 * 1024 * 1024);
+        assert!(matches!(
+            scheduler(&config, &controller_spec(&content, &action, &fleets)),
+            Err(NativeLinkConfigError::MinReservationAboveFleet {
+                fleet, min_kb: 9_437_184, memory_kb: 8_388_608
+            }) if fleet == "fleet-a"
+        ));
+    }
+
+    #[test]
+    fn minimum_reservation_equal_to_the_only_fleet_fits() {
+        let content = memory_store();
+        let action = memory_store();
+        let fleets = catalog();
+        let mut config = config();
+        config.memory.min_reservation = MinReservation::from_units(8_388_608);
+        assert!(scheduler(&config, &controller_spec(&content, &action, &fleets)).is_ok());
+    }
+
+    #[test]
+    fn minimum_reservation_one_kib_over_the_only_fleet_is_rejected() {
+        let content = memory_store();
+        let action = memory_store();
+        let fleets = catalog();
+        let mut config = config();
+        config.memory.min_reservation = MinReservation::from_units(8_388_609);
+        assert!(matches!(
+            scheduler(&config, &controller_spec(&content, &action, &fleets)),
+            Err(NativeLinkConfigError::MinReservationAboveFleet {
+                fleet, min_kb: 8_388_609, memory_kb: 8_388_608
+            }) if fleet == "fleet-a"
+        ));
+    }
+
+    #[test]
+    fn minimum_reservation_above_any_fleet_is_rejected_naming_it() {
+        let content = memory_store();
+        let action = memory_store();
+        let fleets = FleetCatalog::try_new(
+            [("fleet-big", 32_u64), ("fleet-small", 8)]
+                .into_iter()
+                .map(|(name, gib)| {
+                    FleetProperties::new(
+                        &FleetName::try_new(name).expect("valid fleet name"),
+                        Isa::X86_64,
+                        &"docker",
+                        Resources {
+                            vcpus: 4,
+                            memory: Bytes::gib(gib),
+                            disk: Bytes::gib(100),
+                        },
+                        [("capacity", "2".to_owned())],
+                    )
+                })
+                .collect(),
+        )
+        .expect("valid catalog");
+        let mut config = config();
+        config.memory.min_reservation = MinReservation::from_units(16_777_216);
+        assert!(matches!(
+            scheduler(&config, &controller_spec(&content, &action, &fleets)),
+            Err(NativeLinkConfigError::MinReservationAboveFleet {
+                fleet, min_kb: 16_777_216, memory_kb: 8_388_608
+            }) if fleet == "fleet-small"
+        ));
     }
 
     #[test]

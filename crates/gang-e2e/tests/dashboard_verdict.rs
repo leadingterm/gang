@@ -121,6 +121,7 @@ fn state(seq: u64, in_service: u32, workers: Vec<Worker>, completed: u64) -> Sta
         events_limit: 100,
         completed,
         recent: Recent::default(),
+        builds: Vec::new(),
         principals_epoch: 0,
     }
 }
@@ -176,6 +177,7 @@ fn delta(base: u64, seq: u64, events: Vec<Event>) -> Delta {
         events,
         completed: None,
         recent: None,
+        builds: None,
         principals_epoch: None,
     }
 }

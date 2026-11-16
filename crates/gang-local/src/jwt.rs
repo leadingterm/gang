@@ -153,7 +153,10 @@ mod tests {
         assert_eq!(jwks["keys"][0]["crv"], "P-256");
         assert_eq!(jwks["keys"][0]["alg"], "ES256");
         assert_eq!(jwks["keys"][0]["use"], "sig");
-        assert_eq!(jwks["keys"][0].as_object().map(|key| key.len()), Some(7));
+        assert_eq!(
+            jwks["keys"][0].as_object().map(serde_json::Map::len),
+            Some(7)
+        );
         let verifying = verifying_key_from_jwks(&jwks)?;
         let signature = Signature::from_slice(&URL_SAFE_NO_PAD.decode(parts[2])?)
             .expect("signature is 64 bytes");

@@ -62,3 +62,8 @@ output "cache_bucket_name" {
   description = "Name of the S3 build cache bucket."
   value       = module.storage.cache_bucket_name
 }
+
+output "images" {
+  description = "AMI id of each node: controller and each fleet by name."
+  value       = local.node_ami_ids
+}

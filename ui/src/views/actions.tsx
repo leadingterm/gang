@@ -26,6 +26,7 @@ const RunningRow = ({ a }: { a: RunningAction }) => {
       <td class="a-main">
         <Target label={a.target} />
         <Priority p={a.priority} />
+        {a.build && <div><a class="more" href={`/ui/builds/${encodeURIComponent(idOf(a.build))}`}>Build {idOf(a.build)}</a></div>}
       </td>
       <td class="a-kind">{a.mnemonic}</td>
       <td class="a-m1 mono dim"><Ident text={idOf(a.fleet)} /></td>
@@ -49,6 +50,7 @@ const QueuedRow = ({ q }: { q: QueuedAction }) => {
       <td class="a-main">
         <Target label={q.target} />
         <Priority p={q.priority} />
+        {q.build && <div><a class="more" href={`/ui/builds/${encodeURIComponent(idOf(q.build))}`}>Build {idOf(q.build)}</a></div>}
         {q.refusal && <div class="action__refusal caution">{q.refusal}</div>}
       </td>
       <td class="a-kind">{q.mnemonic}</td>
@@ -68,6 +70,7 @@ export const Actions = () => {
   const state = client.state.value;
   const [query, setQuery] = useState("");
   const [fleet, setFleet] = useState("");
+  const [build, setBuild] = useState("");
   if (!state) return null;
   const actions = state.actions;
   // Whether work exists is the live state's call; the sample may lag it or not exist yet.
@@ -88,11 +91,12 @@ export const Actions = () => {
     );
   }
   const q = query.trim().toLowerCase();
+  const builds = [...new Set([...actions.running, ...actions.queued].flatMap((a) => a.build ? [a.build] : []).concat(build ? [build] : []))].sort();
   const running = actions.running.filter(
-    (a) => matches(`${a.target} ${a.mnemonic}`, q) && (fleet === "" || a.fleet === fleet),
+    (a) => matches(`${a.target} ${a.mnemonic}`, q) && (fleet === "" || a.fleet === fleet) && (build === "" || a.build === build),
   );
   const queued = actions.queued.filter(
-    (a) => matches(`${a.target} ${a.mnemonic}`, q) && (fleet === "" || a.candidates.includes(fleet)),
+    (a) => matches(`${a.target} ${a.mnemonic}`, q) && (fleet === "" || a.candidates.includes(fleet)) && (build === "" || a.build === build),
   );
   return (
     <>
@@ -113,6 +117,13 @@ export const Actions = () => {
           />
         </div>
         <FleetFilter id="fleet" fleets={state.fleets} value={fleet} onChange={setFleet} />
+        <label class="field">
+          <span class="visually-hidden">Filter by build</span>
+          <select class="select" value={build} onChange={(e) => setBuild(e.currentTarget.value)}>
+            <option value="">All builds</option>
+            {builds.map((name) => <option key={name} value={name}>{idOf(name)}</option>)}
+          </select>
+        </label>
         <AsOf actions={actions} />
       </div>
       {actions.running.length > 0 && (

@@ -269,7 +269,7 @@ mod tests {
     fn a_held_write_lock_bounds_the_bring_up_by_busy_timeout() {
         // An hour-long timeout: a busy handler left on during the bring-up would block a single
         // attempt for that hour, so the test cannot pass with a second wait mechanism.
-        let busy_timeout = Duration::from_secs(3600);
+        let busy_timeout = Duration::from_hours(1);
         let settings = bring_up_settings(busy_timeout);
         let dir = TempDir::new().expect("temp dir is created");
         let path = dir.path().join("gang.db");

@@ -4,6 +4,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use crate::QuantityError;
+use crate::SaturatingInto;
 use crate::quantity::Units;
 
 /// A size in bytes.
@@ -75,7 +76,7 @@ impl Bytes {
     /// Returns the size as a `usize`, saturating on targets where `usize` is narrower than `u64`.
     #[must_use]
     pub fn as_usize(self) -> usize {
-        usize::try_from(self.0).unwrap_or(usize::MAX)
+        self.0.saturating_into()
     }
 }
 

@@ -11,7 +11,8 @@ use gang_config::{DashboardConfig, Fleets};
 use gang_mtls::SubjectName;
 use gang_spi::{
     AuthenticationPort, CacheStorePort, ClientCertificates, ControllerConnections, ControllerReady,
-    ControllerSpec, CredentialLifecyclePort, Listening, SchedulerPort, Scheme, StateRepositoryPort,
+    ControllerSpec, CredentialLifecyclePort, Listening, ObservationSink, Observations,
+    SchedulerPort, Scheme, StateRepositoryPort,
 };
 use gang_tls::{Alpn, ClientAuth, RevocationSet};
 use gang_types::{CaPin, NonZeroDuration, Url};
@@ -19,6 +20,7 @@ use tokio::sync::oneshot;
 
 use crate::api::{Api, ApiParts};
 use crate::authorizer::Authorizer;
+use crate::builds::BuildsCell;
 use crate::client_address::TrustedProxies;
 use crate::composite::PublicService;
 use crate::control::ControlLoop;
@@ -56,6 +58,9 @@ pub struct Server<D: Deployment> {
     client_action_timeout: NonZeroDuration,
     accept_error_backoff: NonZeroDuration,
     dashboard: Option<Dashboard>,
+    builds: BuildsCell,
+    observation_sink: ObservationSink,
+    observations: Observations,
 }
 
 impl<D: Deployment> Server<D> {
@@ -96,6 +101,7 @@ impl<D: Deployment> Server<D> {
             max_tracked_principals,
             accept_error_backoff,
             dashboard,
+            builds: builds_config,
             login,
             provisioner,
         } = settings;
@@ -108,14 +114,6 @@ impl<D: Deployment> Server<D> {
             &clock,
         )
         .await?;
-        let info = wire_server(
-            &endpoint,
-            default_isa,
-            endpoint_trust,
-            security.certificate(),
-            clients.scheme(),
-            &providers,
-        )?;
         let revoked_principals = load_revoked_principals::<D>(&repository).await?;
         let core = Core::new(
             Host {
@@ -134,7 +132,9 @@ impl<D: Deployment> Server<D> {
             clients,
             workers,
         );
+        let info = server_info(&core, default_isa, endpoint_trust)?;
         let revoked_certificates = revoked_certificates(&core).await?;
+        let (builds, observation_sink, observations) = BuildsCell::channel(&builds_config);
         let dashboard =
             start_dashboard(dashboard, provisioner, poll_interval.get(), &core.host).await?;
         let public = public_service(
@@ -145,6 +145,7 @@ impl<D: Deployment> Server<D> {
                 authorizer: Authorizer::new(roles),
                 limits,
                 dashboard: dashboard.as_ref().map(Dashboard::api),
+                builds: builds.clone(),
                 limiter: Arc::new(RateLimiter::new(&rate_limit, Arc::clone(&core.host.clock))),
                 login_provider: None,
                 device: None,
@@ -167,6 +168,9 @@ impl<D: Deployment> Server<D> {
             client_action_timeout,
             accept_error_backoff,
             dashboard,
+            builds,
+            observation_sink,
+            observations,
         })
     }
 
@@ -211,7 +215,9 @@ impl<D: Deployment> Server<D> {
             content_store: &content_store,
             action_store: &action_store,
             fleets: self.fleets.catalog(),
+            max_workers: self.fleets.max_instances(),
             client_action_timeout: self.client_action_timeout.get(),
+            observations: &self.observation_sink,
         };
         let (public, worker) = open_endpoints::<D>(
             self.listeners,
@@ -240,6 +246,7 @@ impl<D: Deployment> Server<D> {
             },
             api: self.public,
         };
+        let publisher_builds = self.builds.clone();
         let dashboard = self.dashboard.as_ref();
         let control = async {
             let control = ControlLoop::new(
@@ -251,7 +258,7 @@ impl<D: Deployment> Server<D> {
                 &core.host.clock,
             );
             let control = match dashboard {
-                Some(dashboard) => control.with_publisher(dashboard.publisher()),
+                Some(dashboard) => control.with_publisher(dashboard.publisher(publisher_builds)),
                 None => control,
             };
             control.run().await
@@ -266,6 +273,7 @@ impl<D: Deployment> Server<D> {
             tokio::select! {
                 never = control => match never {},
                 never = dashboard_tasks(dashboard, scheduler, clock, revoked_principals) => never,
+                never = self.builds.record(self.observations, clock) => never,
             }
         });
         tokio::select! {
@@ -286,6 +294,22 @@ impl<D: Deployment> Server<D> {
             never = &mut background => match never {},
         }
     }
+}
+
+/// Builds the public server description from the prepared host and client authentication.
+fn server_info<K: Stack>(
+    core: &Core<K>,
+    default_isa: gang_types::Isa,
+    endpoint_trust: gang_config::EndpointTrust,
+) -> Result<gang_wire::Server<serde_json::Value>, ServerError> {
+    wire_server(
+        &core.host.endpoint,
+        default_isa,
+        endpoint_trust,
+        core.host.security.certificate(),
+        core.clients.scheme(),
+        &core.host.providers,
+    )
 }
 
 /// Builds the public gate with the configured trusted proxies.

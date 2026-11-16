@@ -9,6 +9,8 @@ wire_enum! {
         PrincipalsRead = "principals.read",
         /// Reads the scaling event history.
         EventsRead = "events.read",
+        /// Reads builds.
+        BuildsRead = "builds.read",
         /// Revokes principals and restores revoked principals.
         PrincipalsRevoke = "principals.revoke",
     }

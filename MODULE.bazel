@@ -217,6 +217,7 @@ tf = use_extension("@rules_tf//tf:extensions.bzl", "tf_repositories")
 tf.download(
     mirror = {
         "aws": "hashicorp/aws:6.72.0",
+        "http": "hashicorp/http:3.6.3",
     },
     use_tofu = True,
     version = "1.11.6",

@@ -4,19 +4,23 @@
 import { snapshot, test } from "node:test";
 import type { ComponentChildren } from "preact";
 import { render } from "preact-render-to-string";
+import type { EarlierBuilds } from "../src/client.ts";
+import { clock } from "../src/format.ts";
 import type { Screen } from "../src/routes.ts";
 import { Shell } from "../src/shell.tsx";
 import { ClientContext } from "../src/ui.tsx";
 import { Access } from "../src/views/access.tsx";
 import { Actions } from "../src/views/actions.tsx";
 import { Activity } from "../src/views/activity.tsx";
+import { Build, BuildView } from "../src/views/build.tsx";
+import { autoLoadBuilds, Builds, filterBuilds } from "../src/views/builds.tsx";
 import { fleetCounts, fleetTotals, Tape } from "../src/views/fleet.tsx";
 import { Forbidden, SignIn, SignInError } from "../src/views/gate.tsx";
 import { EventRow, Overview } from "../src/views/overview.tsx";
 import { WorkerDetail, Workers } from "../src/views/workers.tsx";
 import { ms } from "../src/wire-parse.ts";
 import type { ScalingEvent } from "../src/wire.ts";
-import { clientFor, session, signedOut, type Scenario } from "./scenario.ts";
+import { build, clientFor, session, signedOut, type Scenario } from "./scenario.ts";
 import { iso, load, snapshotOf } from "./sse.ts";
 
 snapshot.setResolveSnapshotPath(() => new URL("../test/views.snapshot", import.meta.url).pathname);
@@ -110,6 +114,159 @@ for (const [name, rendered] of SCREENS) {
   });
 }
 
+test("build list shows the live build, hit rate and link", (t) => {
+  const markup = html({}, <Builds />);
+  t.assert.match(markup, /ops@example.org/);
+  t.assert.match(markup, /80%/);
+  t.assert.match(markup, /href=\"\/ui\/builds\/0123456789abcdef\"/);
+});
+
+test("build filters use principal, invocation and mine and sort newest first", (t) => {
+  const rows = live.builds ?? [];
+  t.assert.equal(rows.length, 4);
+  const all = filterBuilds(rows.toReversed(), false, session.principal, "", "");
+  t.assert.deepEqual(all.map((b) => b.name), ["builds/0123456789abcdef", "builds/1111111111111111", "builds/2222222222222222", "builds/3333333333333333"]);
+  t.assert.equal(filterBuilds(rows, true, session.principal, "", "").length, 2);
+  t.assert.equal(filterBuilds(rows, false, session.principal, "GITHUB-ACTIONS", "").length, 2);
+  t.assert.equal(filterBuilds(rows, false, session.principal, "", "COLD").length, 1);
+  t.assert.equal(filterBuilds(rows, true, session.principal, "github-actions", "").length, 0);
+  const first = rows[0];
+  const second = rows[1];
+  if (!first || !second) throw new Error("fixture has two builds");
+  const tied = filterBuilds([{ ...second, lastActiveTime: first.lastActiveTime }, first], false, session.principal, "", "");
+  t.assert.deepEqual(tied.map((b) => b.name), [first.name, second.name]);
+});
+
+test("only build-only forbidden sessions auto-load held builds", (t) => {
+  t.assert.equal(autoLoadBuilds(true, { kind: "forbidden" }, false), true);
+  t.assert.equal(autoLoadBuilds(true, { kind: "connecting" }, false), false);
+  t.assert.equal(autoLoadBuilds(true, { kind: "live", beats: 0 }, false), false);
+  t.assert.equal(autoLoadBuilds(false, { kind: "forbidden" }, false), false);
+  t.assert.equal(autoLoadBuilds(true, { kind: "forbidden" }, true), false);
+});
+
+test("a one-bucket timeline spans the chart", (t) => {
+  const bucket = build.timeline?.buckets?.[0];
+  if (!bucket || !build.timeline) throw new Error("fixture has a timeline");
+  const markup = html({}, <BuildView build={{ ...build, timeline: { ...build.timeline, buckets: [bucket] } }} />);
+  t.assert.match(markup, /class="build-chart__executing" points="0,[^ ]+ 300,[^ ]+ 600,/);
+});
+
+test("build-only sessions see held builds without state.read", async (t) => {
+  const { App, route } = await import("../src/app.tsx");
+  const previous = route.value;
+  const client = clientFor({ state: null, session: { ...session, permissions: ["builds.read"] }, link: { kind: "forbidden" } });
+  client.earlierBuilds.value = { kind: "loaded", builds: [build], next: undefined, loading: false, asOf: ms(live.updateTime), failing: false };
+  route.value = { kind: "screen", screen: "builds" };
+  try {
+    const markup = render(<App client={client} />);
+    t.assert.match(markup, /ops@example.org/);
+    t.assert.doesNotMatch(markup, /No access/);
+  } finally {
+    route.value = previous;
+  }
+});
+
+test("a build-only session never claims no builds before its first page", (t) => {
+  const client = clientFor({ state: null, session: { ...session, permissions: ["builds.read"] }, link: { kind: "forbidden" } });
+  const text = (earlier: EarlierBuilds): string => {
+    client.earlierBuilds.value = earlier;
+    return visibleText(render(<ClientContext.Provider value={client}><Builds /></ClientContext.Provider>));
+  };
+  const loading = text({ kind: "unloaded", loading: true });
+  t.assert.match(loading, /Loading builds/);
+  t.assert.doesNotMatch(loading, /No builds/);
+  const error = text({ kind: "error", loading: false });
+  t.assert.match(error, /Could not load builds/);
+  t.assert.doesNotMatch(error, /No builds/);
+  const loaded = text({ kind: "loaded", builds: [], next: undefined, loading: false, asOf: ms(live.updateTime), failing: false });
+  t.assert.match(loaded, /No builds/);
+  t.assert.doesNotMatch(loaded, /Loading builds/);
+});
+
+test("each build-only page says when its own builds are as of while its refresh fails", (t) => {
+  const client = clientFor({ state: null, session: { ...session, permissions: ["builds.read"] }, link: { kind: "forbidden" } });
+  const id = "0123456789abcdef";
+  const detailAsOf = ms(live.updateTime);
+  const listAsOf = detailAsOf + 60_000;
+  client.build.value = { kind: "loaded", id, build, asOf: detailAsOf, failing: true };
+  client.earlierBuilds.value = { kind: "loaded", builds: [build], next: undefined, loading: false, asOf: listAsOf, failing: true };
+  const page = (view: ComponentChildren): string => render(<ClientContext.Provider value={client}>{view}</ClientContext.Provider>);
+  const detail = page(<Build id={id} />);
+  const list = page(<Builds />);
+  t.assert.match(detail, /<p class="caution" role="status">Could not refresh this build; showing it as of /);
+  t.assert.match(list, /<p class="caution" role="status">Could not refresh builds; showing them as of /);
+  t.assert.equal(visibleText(detail).includes(`showing it as of ${clock(detailAsOf)}`), true);
+  t.assert.equal(visibleText(list).includes(`showing them as of ${clock(listAsOf)}`), true);
+  t.assert.equal(visibleText(list).includes(`showing them as of ${clock(detailAsOf)}`), false);
+  client.build.value = { kind: "loaded", id, build, asOf: detailAsOf, failing: false };
+  client.earlierBuilds.value = { kind: "loaded", builds: [build], next: undefined, loading: false, asOf: listAsOf, failing: false };
+  t.assert.doesNotMatch(page(<Build id={id} />), /Could not refresh/);
+  t.assert.doesNotMatch(page(<Builds />), /Could not refresh/);
+});
+
+test("builds require builds.read", (t) => {
+  const markup = html({ session: { ...session, permissions: ["state.read"] } }, <Builds />);
+  t.assert.match(markup, /builds.read/);
+  t.assert.doesNotMatch(markup, /invocation-example/);
+});
+
+test("actions link to their build and offer it as a filter", (t) => {
+  const markup = html({}, <Actions />);
+  t.assert.match(markup, /href="\/ui\/builds\/0123456789abcdef"/);
+  t.assert.match(markup, /<option value="builds\/0123456789abcdef">/);
+});
+
+test("empty build details explain the missing observations", (t) => {
+  const { mnemonics: _mnemonics, otherMnemonics: _other, missedTargets: _targets, slowest: _slowest, ...emptyBuild } = build;
+  const markup = html({}, <BuildView build={emptyBuild} />);
+  const text = visibleText(markup);
+  t.assert.match(text, /No mnemonic misses recorded/);
+  t.assert.match(text, /No missed targets recorded/);
+  t.assert.match(text, /No completed actions recorded/);
+  t.assert.doesNotMatch(markup, /<table\b/);
+});
+
+test("mnemonic rows with no misses do not appear", (t) => {
+  const usage = { ...build.usage, cache: { ...build.usage.cache, misses: 0 } };
+  const markup = html({}, <BuildView build={{ ...build, mnemonics: [{ mnemonic: "NoMisses", usage }], otherMnemonics: usage }} />);
+  t.assert.doesNotMatch(markup, /NoMisses/);
+  t.assert.match(markup, /No mnemonic misses recorded/);
+});
+
+test("build detail shows its observed work", (t) => {
+  const markup = html({}, <BuildView build={build} />);
+  for (const expected of [/invocation-example/, /bazel 8.4.2/, /Remote work Gang saw; local actions, disk-cache hits and analysis are not included\./, /Remote cache/, /80%/, /Slowest actions/, /parser/, /Joined\s+3/]) t.assert.match(visibleText(markup), expected);
+});
+
+test("a missing build says it is not held", (t) => {
+  const client = clientFor({});
+  client.build.value = { kind: "missing", id: "missing" };
+  const markup = render(<ClientContext.Provider value={client}><Build id="missing" /></ClientContext.Provider>);
+  t.assert.match(markup, /build not held: only the latest builds are kept in memory/);
+});
+
+test("overview includes remote cache hit rate", (t) => {
+  const markup = html({}, <Overview />);
+  t.assert.match(markup, /Remote cache/);
+  t.assert.match(markup, /80%/);
+});
+
+test("the app renders a loaded build at its direct route", async (t) => {
+  // The app reads location during module initialization; install the test location first.
+  const { App, route } = await import("../src/app.tsx");
+  const previous = route.value;
+  const client = clientFor({});
+  client.build.value = { kind: "loaded", id: "0123456789abcdef", build, asOf: ms(live.updateTime), failing: false };
+  route.value = { kind: "build", id: "0123456789abcdef" };
+  try {
+    const markup = render(<App client={client} />);
+    t.assert.match(visibleText(markup), /invocation-example/);
+  } finally {
+    route.value = previous;
+  }
+});
+
 const WORKER = "i-04828e21626b14dd2-0ee112f6-7a36-7faf-be44-719a1246ef6b";
 const common = { name: "events/1022", createTime: live.updateTime, fleet: "fleets/amd64-on-demand" };
 
@@ -117,6 +274,12 @@ test("worker events name the worker and its verb", (t) => {
   const row = (e: ScalingEvent) => render(<EventRow withCause e={e} />);
   t.assert.match(row({ ...common, workerRegistered: { worker: `workers/${WORKER}` } }), /i-04828e21626b14dd2 joined/);
   t.assert.match(row({ ...common, workerDeregistered: { worker: `workers/${WORKER}` } }), /i-04828e21626b14dd2 left/);
+});
+
+test("a minimum cause is shown without caution styling", (t) => {
+  const row = render(<EventRow withCause e={{ ...common, cause: "MINIMUM", scaledOut: { from: 0, to: 1 } }} />);
+  t.assert.match(row, /<span class="event__cause">minimum<\/span>/);
+  t.assert.doesNotMatch(row, /caution/);
 });
 
 test("an early exit names the instance and shows its failure", (t) => {
@@ -207,7 +370,7 @@ const recentState = (count: number) => {
       step: "10s",
       samples: Array.from({ length: count }, (_, i) => ({
         start: iso(last - (count - 1 - i) * 10000),
-        completed: 10, running: 100, queued: 5, passes: 5, skipped: 0,
+        completed: 10, running: 100, queued: 5, passes: 5, skipped: 0, lookups: 0, hits: 0,
       })),
     },
   };

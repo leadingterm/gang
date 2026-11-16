@@ -1,0 +1,81 @@
+{
+  "name": "builds/0123456789abcdef",
+  "principal": "principals/google%3Aops%40example.org",
+  "invocationId": "invocation-example",
+  "tool": "bazel 8.4.2",
+  "state": "ACTIVE",
+  "startTime": "2026-01-15T10:00:00.000Z",
+  "lastActiveTime": "2026-01-15T10:09:30.000Z",
+  "usage": {
+    "cache": { "hits": 80, "misses": 18, "errors": 2, "uploadedResults": 3 },
+    "executions": { "executeCalls": 15, "rejected": 1, "completed": 10, "failed": 2 },
+    "actionTime": { "queued": "30s", "inputFetch": "20s", "executing": "140s", "outputUpload": "10s" }
+  },
+  "unrecorded": 0,
+  "mnemonics": [
+    { "mnemonic": "Rustc", "usage": { "cache": { "hits": 30, "misses": 6, "errors": 0, "uploadedResults": 0 }, "executions": { "executeCalls": 5, "rejected": 0, "completed": 3, "failed": 1 }, "actionTime": { "queued": "10s", "inputFetch": "6s", "executing": "50s", "outputUpload": "3s" } } },
+    { "mnemonic": "CppCompile", "usage": { "cache": { "hits": 20, "misses": 5, "errors": 1, "uploadedResults": 1 }, "executions": { "executeCalls": 4, "rejected": 0, "completed": 3, "failed": 0 }, "actionTime": { "queued": "7s", "inputFetch": "5s", "executing": "40s", "outputUpload": "2s" } } },
+    { "mnemonic": "Javac", "usage": { "cache": { "hits": 15, "misses": 3, "errors": 0, "uploadedResults": 1 }, "executions": { "executeCalls": 3, "rejected": 0, "completed": 2, "failed": 0 }, "actionTime": { "queued": "5s", "inputFetch": "4s", "executing": "25s", "outputUpload": "2s" } } },
+    { "mnemonic": "TestRunner", "usage": { "cache": { "hits": 10, "misses": 2, "errors": 1, "uploadedResults": 1 }, "executions": { "executeCalls": 2, "rejected": 1, "completed": 1, "failed": 1 }, "actionTime": { "queued": "5s", "inputFetch": "3s", "executing": "20s", "outputUpload": "2s" } } }
+  ],
+  "otherMnemonics": { "cache": { "hits": 5, "misses": 2, "errors": 0, "uploadedResults": 0 }, "executions": { "executeCalls": 1, "rejected": 0, "completed": 1, "failed": 0 }, "actionTime": { "queued": "3s", "inputFetch": "2s", "executing": "5s", "outputUpload": "1s" } },
+  "missedTargets": [
+    { "target": "//crates/parser:parser", "misses": 6, "overestimate": 2 },
+    { "target": "//rpc/server:server", "misses": 4, "overestimate": 0 },
+    { "target": "//java/com/example/query:planner", "misses": 3, "overestimate": 0 },
+    { "target": "//crates/wal:wal_test", "misses": 2, "overestimate": 0 },
+    { "target": "//tools/bench:bench", "misses": 1, "overestimate": 0 }
+  ],
+  "slowest": [
+    { "target": "//crates/parser:parser", "mnemonic": "Rustc", "digest": "abcdef/123", "worker": "workers/example-1", "queueTime": "2026-01-15T10:01:00.000Z", "span": "60s", "queued": "5s", "inputFetch": "5s", "executing": "45s", "outputUpload": "5s", "exitCode": 0 },
+    { "target": "//rpc/server:server", "mnemonic": "CppCompile", "digest": "bcdefa/124", "worker": "workers/example-2", "queueTime": "2026-01-15T10:02:00.000Z", "span": "48s", "queued": "4s", "inputFetch": "4s", "executing": "36s", "outputUpload": "4s", "exitCode": 0 },
+    { "target": "//java/com/example/query:planner", "mnemonic": "Javac", "digest": "cdefab/125", "worker": "workers/example-3", "queueTime": "2026-01-15T10:03:00.000Z", "span": "35s", "queued": "3s", "inputFetch": "3s", "executing": "27s", "outputUpload": "2s", "exitCode": 0 },
+    { "target": "//crates/wal:wal_test", "mnemonic": "TestRunner", "digest": "defabc/126", "worker": "workers/example-4", "queueTime": "2026-01-15T10:04:00.000Z", "span": "26s", "queued": "2s", "inputFetch": "2s", "executing": "20s", "outputUpload": "2s", "exitCode": 1 },
+    { "target": "//tools/bench:bench", "mnemonic": "CppCompile", "digest": "efabcd/127", "worker": "workers/example-5", "queueTime": "2026-01-15T10:05:00.000Z", "span": "18s", "queued": "2s", "inputFetch": "2s", "executing": "13s", "outputUpload": "1s", "exitCode": 0 }
+  ],
+  "timeline": {
+    "startTime": "2026-01-15T10:00:00.000Z", "step": "15s",
+    "buckets": [
+      { "hits": 2, "misses": 1, "executing": "1s", "queued": "3s" },
+      { "hits": 2, "misses": 1, "executing": "2s", "queued": "5s" },
+      { "hits": 2, "misses": 1, "executing": "3s", "queued": "6s" },
+      { "hits": 2, "misses": 1, "executing": "4s", "queued": "5s" },
+      { "hits": 2, "misses": 1, "executing": "4s", "queued": "4s" },
+      { "hits": 2, "misses": 1, "executing": "4s", "queued": "3s" },
+      { "hits": 2, "misses": 1, "executing": "4s", "queued": "2s" },
+      { "hits": 2, "misses": 1, "executing": "4s", "queued": "1s" },
+      { "hits": 2, "misses": 1, "executing": "4s", "queued": "1s" },
+      { "hits": 2, "misses": 1, "executing": "4s", "queued": "0s" },
+      { "hits": 2, "misses": 1, "executing": "4s", "queued": "0s" },
+      { "hits": 2, "misses": 1, "executing": "4s", "queued": "0s" },
+      { "hits": 2, "misses": 1, "executing": "4s", "queued": "0s" },
+      { "hits": 2, "misses": 1, "executing": "4s", "queued": "0s" },
+      { "hits": 2, "misses": 1, "executing": "4s", "queued": "0s" },
+      { "hits": 2, "misses": 1, "executing": "4s", "queued": "0s" },
+      { "hits": 2, "misses": 1, "executing": "4s", "queued": "0s" },
+      { "hits": 2, "misses": 1, "executing": "4s", "queued": "0s" },
+      { "hits": 2, "misses": 0, "executing": "4s", "queued": "0s" },
+      { "hits": 2, "misses": 0, "executing": "4s", "queued": "0s" },
+      { "hits": 2, "misses": 0, "executing": "4s", "queued": "0s" },
+      { "hits": 2, "misses": 0, "executing": "4s", "queued": "0s" },
+      { "hits": 2, "misses": 0, "executing": "4s", "queued": "0s" },
+      { "hits": 2, "misses": 0, "executing": "4s", "queued": "0s" },
+      { "hits": 2, "misses": 0, "executing": "4s", "queued": "0s" },
+      { "hits": 2, "misses": 0, "executing": "4s", "queued": "0s" },
+      { "hits": 2, "misses": 0, "executing": "4s", "queued": "0s" },
+      { "hits": 2, "misses": 0, "executing": "4s", "queued": "0s" },
+      { "hits": 2, "misses": 0, "executing": "4s", "queued": "0s" },
+      { "hits": 2, "misses": 0, "executing": "4s", "queued": "0s" },
+      { "hits": 2, "misses": 0, "executing": "4s", "queued": "0s" },
+      { "hits": 2, "misses": 0, "executing": "4s", "queued": "0s" },
+      { "hits": 2, "misses": 0, "executing": "4s", "queued": "0s" },
+      { "hits": 2, "misses": 0, "executing": "4s", "queued": "0s" },
+      { "hits": 2, "misses": 0, "executing": "3s", "queued": "0s" },
+      { "hits": 2, "misses": 0, "executing": "3s", "queued": "0s" },
+      { "hits": 2, "misses": 0, "executing": "2s", "queued": "0s" },
+      { "hits": 2, "misses": 0, "executing": "1s", "queued": "0s" },
+      { "hits": 2, "misses": 0, "executing": "1s", "queued": "0s" },
+      { "hits": 2, "misses": 0, "executing": "0s", "queued": "0s" }
+    ]
+  }
+}

@@ -10,9 +10,9 @@ use gang_spi::{ScalingAuditEvent, ScalingEventKind, StateRepositoryPort};
 use gang_testkit::{Controller, FakeRepository, TestResult, worker_id};
 use gang_types::{AccessToken, FleetName, Proof, ProviderName, ScalingCause};
 use gang_wire::routes::{
-    AUTHENTICATE_SESSION, CREATE_CERTIFICATE, GET_SERVER, GET_SESSION, GET_STATE, LIST_EVENTS,
-    LIST_PRINCIPALS, LIST_ROLES, RESTORE_PRINCIPAL, REVOKE_CERTIFICATE, REVOKE_PRINCIPAL, ROUTES,
-    Route, WATCH_STATE,
+    AUTHENTICATE_SESSION, CREATE_CERTIFICATE, GET_BUILD, GET_SERVER, GET_SESSION, GET_STATE,
+    LIST_BUILDS, LIST_EVENTS, LIST_PRINCIPALS, LIST_ROLES, RESTORE_PRINCIPAL, REVOKE_CERTIFICATE,
+    REVOKE_PRINCIPAL, ROUTES, Route, WATCH_STATE,
 };
 use gang_wire::{AuthenticateRequest, CreateCertificateRequest, Credential, ErrorReason};
 use http::StatusCode;
@@ -21,8 +21,9 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 
 use crate::api_test_support::{
-    ADMIN_PROOF, ALICE, ALICE_PROOF, BODY_LIMIT, PROVIDER, WORKER_PROOF, WORKER_PROVIDER, get,
-    post, principal_path, revoke_principal, send, worker_certificate,
+    ADMIN_PROOF, ALICE, ALICE_PROOF, BODY_LIMIT, PROVIDER, WORKER_PROOF, WORKER_PROVIDER,
+    fixture_build, get, post, principal_path, revoke_principal, seed_build, send,
+    worker_certificate,
 };
 use crate::test_support::{
     ApiReply as Answer, FakeVerifier, admits, api_request, at, decode_sse, identity, mint_token,
@@ -121,6 +122,12 @@ fn probes() -> Vec<Probe> {
         ),
         probe(LIST_ROLES, None, None),
         probe(LIST_EVENTS, None, None),
+        probe(LIST_BUILDS, None, None),
+        probe(
+            *GET_BUILD,
+            Some(GET_BUILD.path(&fixture_build().origin().build.id())),
+            None,
+        ),
         probe(GET_STATE, None, None),
         probe(WATCH_STATE, None, None),
         probe(GET_SESSION, None, None),
@@ -189,6 +196,7 @@ async fn every_route_is_served_and_every_json_key_is_lower_camel_case() -> TestR
         |controller| async move {
             let admin = mint_token(&controller, PROVIDER, ADMIN_PROOF).await;
             let alice = mint_token(&controller, PROVIDER, ALICE_PROOF).await;
+            seed_build(&controller, &admin).await;
             assert!(
                 admits(&controller, &alice).await,
                 "alice is in the registry"
@@ -357,6 +365,10 @@ async fn refusals(
         (
             post(controller, &missing_principal, &admin).await,
             ErrorReason::PrincipalNotFound,
+        ),
+        (
+            get(controller, "/v1/builds/0000000000000000", Some(&admin)).await,
+            ErrorReason::BuildNotFound,
         ),
     ];
     refusals.extend(device_refusals(controller).await);

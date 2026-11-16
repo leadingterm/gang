@@ -3,9 +3,10 @@ Skip to content
 gang
 gang.example.orgOverview1
 Actions2
-Workers3
-Activity4
-Access5
+Builds3
+Workers4
+Activity5
+Access6
 google · ops@example.orgSign out
 STREAM
 PASS
@@ -34,7 +35,7 @@ googlecontractor-ci@example.org1 Dec 202530 Dec 2025revoked 31 Dec 2025
 You
 6m 52s
 ops@example.org google
-state.readprincipals.readevents.readprincipals.revoke
+state.readprincipals.readevents.readbuilds.readprincipals.revoke
 Roles
 administrator
 state.readprincipals.readevents.readprincipals.revoke
@@ -47,6 +48,7 @@ google:build-oncall@example.org
 google:t.ruiz@example.org revoked
 Overview
 Actions
+Builds
 Workers
 Activity
 Access
@@ -57,9 +59,10 @@ Skip to content
 gang
 gang.example.orgOverview1
 Actions2
-Workers3
-Activity4
-Access5
+Builds3
+Workers4
+Activity5
+Access6
 google · ops@example.orgSign out
 STREAM
 PASS
@@ -71,6 +74,7 @@ Actions
 Nothing running or queued
 Overview
 Actions
+Builds
 Workers
 Activity
 Access
@@ -81,9 +85,10 @@ Skip to content
 gang
 gang.example.orgOverview1
 Actions2
-Workers3
-Activity4
-Access5
+Builds3
+Workers4
+Activity5
+Access6
 google · ops@example.orgSign out
 STREAM
 PASS
@@ -94,7 +99,7 @@ SESSION6m 52s6m 52s
 Actions
 Filter by target or mnemonic
 FleetAll fleetsamd64-spotamd64-on-demandbuild-worker-aarch64-spotgpu
-AS OF 10:08:15
+Filter by buildAll buildsAS OF 10:08:15
 Running
 215
 TargetMnemonicFleetWorkerTime
@@ -391,6 +396,7 @@ WaitTargetMnemonicFleets
 0s//crates/simd:kernels_testTestRunnerbuild-worker-aarch64-spot
 Overview
 Actions
+Builds
 Workers
 Activity
 Access
@@ -401,9 +407,10 @@ Skip to content
 gang
 gang.example.orgOverview1
 Actions2
-Workers3
-Activity4
-Access5
+Builds3
+Workers4
+Activity5
+Access6
 google · ops@example.orgSign out
 STREAM
 PASS
@@ -414,11 +421,12 @@ SESSION6m 52s6m 52s
 Actions
 Filter by target or mnemonic
 FleetAll fleetsamd64-spotamd64-on-demandbuild-worker-aarch64-spotgpu
-AS OF 10:09:24
+Filter by buildAll builds0123456789abcdefAS OF 10:09:24
 Running
 215
 TargetMnemonicFleetWorkerTime
-//cmd/fleetctl:fleetctl_libGoCompilePkgamd64-spoti-041bd675c1c3f5d6526s
+//cmd/fleetctl:fleetctl_libBuild 0123456789abcdef
+GoCompilePkgamd64-spoti-041bd675c1c3f5d6526s
 //net/http2:frame_codec_testTestRunneramd64-spoti-01e113de72bf31a9c2m 17s
 //rpc/server:serverCppLinkamd64-on-demandi-0f8cb31b67f73d1b41m 09s
 //api/v2:events_proto priority ↑10ProtoCompileamd64-spoti-0e111e497e90efab67m 07s
@@ -636,7 +644,8 @@ TargetMnemonicFleetWorkerTime
 Queued
 73
 WaitTargetMnemonicFleets
-2m 56s//mobile/sync:sync_daemon priority ↑10CppLinkbuild-worker-aarch64-spot
+2m 56s//mobile/sync:sync_daemon priority ↑10Build 0123456789abcdef
+CppLinkbuild-worker-aarch64-spot
 2m 05s//web/assets:bundle priority ↑10Genruleamd64-spotamd64-on-demand
 1m 33s//mobile/sync:engine priority ↑10CppCompilebuild-worker-aarch64-spot
 1m 05s//rpc/server:server priority ↑10CppLinkamd64-spotamd64-on-demand
@@ -712,6 +721,7 @@ TestRunnerno fleet
 0s//crates/simd:kernels_testTestRunnerbuild-worker-aarch64-spot
 Overview
 Actions
+Builds
 Workers
 Activity
 Access
@@ -722,9 +732,10 @@ Skip to content
 gang
 gang.example.orgOverview1
 Actions2
-Workers3
-Activity4
-Access5
+Builds3
+Workers4
+Activity5
+Access6
 google · ops@example.orgSign out
 STREAM
 PASS
@@ -736,6 +747,7 @@ Actions
 No action sample yet
 Overview
 Actions
+Builds
 Workers
 Activity
 Access
@@ -746,9 +758,10 @@ Skip to content
 gang
 gang.example.orgOverview1
 Actions2
-Workers3
-Activity4
-Access5
+Builds3
+Workers4
+Activity5
+Access6
 google · ops@example.orgSign out
 STREAM
 PASS
@@ -805,6 +818,7 @@ Log
 Load earlier
 Overview
 Actions
+Builds
 Workers
 Activity
 Access
@@ -815,9 +829,10 @@ Skip to content
 gang
 gang.example.orgOverview1
 Actions2
-Workers3
-Activity4
-Access5
+Builds3
+Workers4
+Activity5
+Access6
 google · ops@example.orgSign out
 STREAM
 PASS
@@ -873,6 +888,7 @@ Log
 04:12:50launch failedbuild-worker-aarch64-spot2 of 4 launchedCould not launch Spot Instances. MaxSpotInstanceCountExceeded - Max spot instance count exceeded. Launching EC2 instance failed.
 Overview
 Actions
+Builds
 Workers
 Activity
 Access
@@ -883,9 +899,10 @@ Skip to content
 gang
 gang.example.orgOverview1
 Actions2
-Workers3
-Activity4
-Access5
+Builds3
+Workers4
+Activity5
+Access6
 google · ops@example.orgSign out
 STREAM403 state.read403
 PASS
@@ -898,6 +915,7 @@ No access
 state.read missing for google:ops@example.org
 Overview
 Actions
+Builds
 Workers
 Activity
 Access
@@ -908,9 +926,10 @@ Skip to content
 gang
 gang.example.orgOverview1
 Actions2
-Workers3
-Activity4
-Access5
+Builds3
+Workers4
+Activity5
+Access6
 google · ops@example.orgSign out
 STREAM
 PASS
@@ -930,6 +949,9 @@ Instances
 Done / min
 69
 over 20s
+Remote cache
+—
+recent window
 Fleets
 busyidledrainingno workerpendingterminatingwarmdesired
 preference 1amd64-spot
@@ -959,6 +981,7 @@ All
 10:08:46Scale-outamd64-spot0 → 3
 Overview
 Actions
+Builds
 Workers
 Activity
 Access
@@ -969,9 +992,10 @@ Skip to content
 gang
 gang.example.orgOverview1
 Actions2
-Workers3
-Activity4
-Access5
+Builds3
+Workers4
+Activity5
+Access6
 google · ops@example.orgSign out
 STREAMreconnecting 4s4s
 PASS
@@ -991,6 +1015,9 @@ Instances
 13 spot
 Done / min
 75
+Remote cache
+80%
+recent window
 Fleets
 busyidledrainingno workerpendingterminatingwarmdesired
 preference 1amd64-spot
@@ -1025,6 +1052,7 @@ All
 09:31:20Terminategpui-0eb8c874d0b680b7a
 Overview
 Actions
+Builds
 Workers
 Activity
 Access
@@ -1035,9 +1063,10 @@ Skip to content
 gang
 gang.example.orgOverview1
 Actions2
-Workers3
-Activity4
-Access5
+Builds3
+Workers4
+Activity5
+Access6
 google · ops@example.orgSign out
 STREAM
 PASS
@@ -1055,6 +1084,9 @@ Instances
 0 spot
 Done / min
 0
+Remote cache
+—
+recent window
 Idle · no workers, nothing queued
 Fleets
 busyidledrainingno workerpendingterminatingwarmdesired
@@ -1090,6 +1122,7 @@ All
 05:09:40Scale-outbuild-worker-aarch64-spot3 → 4
 Overview
 Actions
+Builds
 Workers
 Activity
 Access
@@ -1100,9 +1133,10 @@ Skip to content
 gang
 gang.example.orgOverview1
 Actions2
-Workers3
-Activity4
-Access5
+Builds3
+Workers4
+Activity5
+Access6
 google · ops@example.orgSign out
 STREAM
 PASS
@@ -1121,6 +1155,9 @@ Instances
 13 spot
 Done / min
 75
+Remote cache
+80%
+recent window
 Fleets
 busyidledrainingno workerpendingterminatingwarmdesired
 preference 1amd64-spot
@@ -1155,6 +1192,7 @@ All
 09:31:20Terminategpui-0eb8c874d0b680b7a
 Overview
 Actions
+Builds
 Workers
 Activity
 Access
@@ -1165,9 +1203,10 @@ Skip to content
 gang
 gang.example.orgOverview1
 Actions2
-Workers3
-Activity4
-Access5
+Builds3
+Workers4
+Activity5
+Access6
 google · ops@example.orgSign out
 STREAMrevokedrevoked
 PASS
@@ -1187,6 +1226,9 @@ Instances
 13 spot
 Done / min
 75
+Remote cache
+80%
+recent window
 Fleets
 busyidledrainingno workerpendingterminatingwarmdesired
 preference 1amd64-spot
@@ -1221,6 +1263,7 @@ All
 09:31:20Terminategpui-0eb8c874d0b680b7a
 Overview
 Actions
+Builds
 Workers
 Activity
 Access
@@ -1231,9 +1274,10 @@ Skip to content
 gang
 gang.example.orgOverview1
 Actions2
-Workers3
-Activity4
-Access5
+Builds3
+Workers4
+Activity5
+Access6
 google · ops@example.orgSign out
 STREAM
 PASSskipped 2m 14sskipped
@@ -1253,6 +1297,9 @@ Instances
 17 spot
 Done / min
 75
+Remote cache
+—
+recent window
 Fleets
 busyidledrainingno workerpendingterminatingwarmdesired
 preference 1amd64-spot
@@ -1287,6 +1334,7 @@ All
 09:31:20Terminategpui-0eb8c874d0b680b7a
 Overview
 Actions
+Builds
 Workers
 Activity
 Access
@@ -1319,9 +1367,10 @@ Skip to content
 gang
 gang.example.orgOverview1
 Actions2
-Workers3
-Activity4
-Access5
+Builds3
+Workers4
+Activity5
+Access6
 google · ops@example.orgSign out
 STREAM
 PASS
@@ -1333,6 +1382,7 @@ Workers
 No workers yet · 3 booting
 Overview
 Actions
+Builds
 Workers
 Activity
 Access
@@ -1343,9 +1393,10 @@ Skip to content
 gang
 gang.example.orgOverview1
 Actions2
-Workers3
-Activity4
-Access5
+Builds3
+Workers4
+Activity5
+Access6
 google · ops@example.orgSign out
 STREAM
 PASS
@@ -1387,6 +1438,7 @@ i-0e72925d8de62c495busy25m 00s12 of 16 slots
 1 no worker · 1 overdue
 Overview
 Actions
+Builds
 Workers
 Activity
 Access

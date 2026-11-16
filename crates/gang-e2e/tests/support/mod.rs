@@ -985,6 +985,7 @@ fn queued_action(index: usize) -> QueuedAction {
         digest: format!("{index:064x}/1"),
         target: "//:sim".to_owned(),
         mnemonic: "E2eProbe".to_owned(),
+        build: String::new(),
         queue_time: at(0),
         priority: 0,
         candidates: Vec::new(),
@@ -1034,6 +1035,7 @@ pub(crate) fn state_frame(
         events_limit: EVENTS_LIMIT,
         completed,
         recent: Recent::default(),
+        builds: Vec::new(),
         principals_epoch: 0,
     }
 }
@@ -1242,6 +1244,7 @@ impl Simulation {
                 events,
                 completed: None,
                 recent: None,
+                builds: None,
                 principals_epoch: None,
             };
         Ok(vec![

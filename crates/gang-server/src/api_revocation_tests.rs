@@ -228,6 +228,7 @@ async fn idempotent_principal_operations_leave_the_live_epoch_unchanged() {
         authorizer: Authorizer::new(vec![role_for("administrator", PermissionSet::all(), ADMIN)]),
         limits: tls_settings().limits,
         dashboard: None,
+        builds: crate::builds::BuildsCell::new(&gang_config::BuildsConfig::default()),
         limiter: Arc::new(RateLimiter::new(
             &tls_settings().rate_limit,
             core.host.clock.clone(),

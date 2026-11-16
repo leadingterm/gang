@@ -84,6 +84,7 @@ export const applyDelta = (state: State, delta: Delta): Applied => {
       events: delta.events?.length ? [...state.events, ...delta.events].slice(-state.eventsLimit) : state.events,
       completed: delta.completed ?? state.completed,
       recent: applyRecent(state.recent, delta.recent),
+      builds: mergeKeyed(state.builds, delta.builds, byName, "sorted"),
       principalsEpoch: delta.principalsEpoch ?? state.principalsEpoch,
     },
   };

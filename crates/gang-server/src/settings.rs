@@ -131,6 +131,8 @@ pub struct ServerSettings {
     pub accept_error_backoff: NonZeroDuration,
     /// The operator dashboard: viewer limits, refresh intervals and the actions cache.
     pub dashboard: DashboardConfig,
+    /// Bounds and activity settings for live builds.
+    pub builds: gang_config::BuildsConfig,
     /// The browser sign-in the dashboard offers; `None` when it offers none.
     pub login: Option<LoginSettings>,
     /// The key of the configured provisioner plugin, such as `aws` or `local`, that the state

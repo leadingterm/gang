@@ -10,7 +10,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use gang_spi::{
-    ActionsView, ApiRequestBody, ApiResponseBody, ApiService, BoxedConnection,
+    ActionsView, Admitted, ApiRequestBody, ApiResponseBody, ApiService, BoxedConnection,
     ControllerConnections, ControllerEndpoints, ControllerReady, ControllerSpec, Listening,
     ListingLimits, Peer, PortError, Rejection, RequestGate, SchedulerPort, SchedulerSnapshot,
     Slots, Subject, WorkerSpec, WorkerTls, full_body,
@@ -47,14 +47,14 @@ trait Services: Send + Sync {
         &'a self,
         peer: &'a Peer,
         parts: &'a mut http::request::Parts,
-    ) -> BoxFuture<'a, Result<(), PortError>>;
+    ) -> BoxFuture<'a, Result<Admitted, PortError>>;
 
     /// Applies the worker listener's gate to a request.
     fn admit_worker<'a>(
         &'a self,
         peer: &'a Peer,
         parts: &'a mut http::request::Parts,
-    ) -> BoxFuture<'a, Result<(), PortError>>;
+    ) -> BoxFuture<'a, Result<Admitted, PortError>>;
 
     /// Answers a request with the Gang API.
     fn call_api(
@@ -78,7 +78,7 @@ impl<P: RequestGate, W: RequestGate, A: ApiService> Services for Gates<P, W, A> 
         &'a self,
         peer: &'a Peer,
         parts: &'a mut http::request::Parts,
-    ) -> BoxFuture<'a, Result<(), PortError>> {
+    ) -> BoxFuture<'a, Result<Admitted, PortError>> {
         Box::pin(self.public.admit(peer, parts))
     }
 
@@ -86,7 +86,7 @@ impl<P: RequestGate, W: RequestGate, A: ApiService> Services for Gates<P, W, A> 
         &'a self,
         peer: &'a Peer,
         parts: &'a mut http::request::Parts,
-    ) -> BoxFuture<'a, Result<(), PortError>> {
+    ) -> BoxFuture<'a, Result<Admitted, PortError>> {
         Box::pin(self.worker.admit(peer, parts))
     }
 
@@ -99,7 +99,12 @@ impl<P: RequestGate, W: RequestGate, A: ApiService> Services for Gates<P, W, A> 
         Box::pin(async move {
             let (mut parts, body) = request.into_parts();
             match gate.admit(&Peer::default(), &mut parts).await {
-                Ok(()) => api.call(http::Request::from_parts(parts, body)).await,
+                Ok(admitted) => {
+                    if let Admitted::Authenticated(authenticated) = admitted {
+                        parts.extensions.insert(authenticated);
+                    }
+                    api.call(http::Request::from_parts(parts, body)).await
+                }
                 Err(error) => refusal(&error),
             }
         })
@@ -130,9 +135,15 @@ fn refusal(error: &PortError) -> http::Response<ApiResponseBody> {
 pub struct Controller {
     /// The gates and the Gang API.
     services: Arc<dyn Services>,
+    observations: gang_spi::ObservationSink,
 }
 
 impl Controller {
+    /// Sends an observation through the controller's bounded channel.
+    pub fn observe(&self, observation: gang_spi::Observation) {
+        self.observations.record(observation);
+    }
+
     /// Applies the public listener's gate to a request, as the controller does before any
     /// public service sees it.
     ///
@@ -143,7 +154,7 @@ impl Controller {
         &self,
         peer: &Peer,
         parts: &mut http::request::Parts,
-    ) -> Result<(), PortError> {
+    ) -> Result<Admitted, PortError> {
         self.services.admit_public(peer, parts).await
     }
 
@@ -157,12 +168,12 @@ impl Controller {
         &self,
         peer: &Peer,
         parts: &mut http::request::Parts,
-    ) -> Result<(), PortError> {
+    ) -> Result<Admitted, PortError> {
         self.services.admit_worker(peer, parts).await
     }
 
-    /// Answers a request with the Gang API after the public listener's gate admitted it; a
-    /// request the gate refuses is answered with the refusal's status and no body.
+    /// Answers a request admitted by the public gate, passing its authenticated caller to the
+    /// Gang API in the request extensions. Refusals are answered with their status and no body.
     pub async fn call_api(
         &self,
         request: http::Request<ApiRequestBody>,
@@ -539,7 +550,7 @@ impl SchedulerPort for FakeScheduler {
 
     async fn run_controller<P: RequestGate, W: RequestGate, A: ApiService>(
         &self,
-        _spec: &ControllerSpec<'_>,
+        spec: &ControllerSpec<'_>,
         connections: ControllerConnections<P, W, A>,
         ready: ControllerReady,
     ) -> Result<(), PortError> {
@@ -578,6 +589,7 @@ impl SchedulerPort for FakeScheduler {
                 worker: worker_gate,
                 api,
             }),
+            observations: spec.observations.clone(),
         };
         self.published.send_replace(Some(controller));
         ready.signal();
@@ -661,7 +673,8 @@ mod tests {
     use std::path::Path;
 
     use futures::FutureExt;
-    use gang_types::{FleetName, Isa, Resources};
+    use gang_spi::Authenticated;
+    use gang_types::{FleetName, Identity, Isa, Principal, ProviderName, Resources};
 
     use super::*;
     use crate::TestResult;
@@ -983,8 +996,14 @@ mod tests {
             &self,
             _peer: &Peer,
             _parts: &mut http::request::Parts,
-        ) -> Result<(), PortError> {
-            Ok(())
+        ) -> Result<Admitted, PortError> {
+            Ok(Admitted::Authenticated(Authenticated {
+                identity: Arc::new(Identity::new(
+                    ProviderName::try_new("test").expect("valid provider"),
+                    Principal::try_new("tester").expect("valid principal"),
+                )),
+                valid_until: None,
+            }))
         }
     }
 
@@ -1001,16 +1020,55 @@ mod tests {
         }
     }
 
+    /// A Gang API that returns the admitted identity.
+    #[derive(Clone)]
+    struct CallerApi;
+
+    impl ApiService for CallerApi {
+        async fn call(
+            &self,
+            request: http::Request<ApiRequestBody>,
+        ) -> http::Response<ApiResponseBody> {
+            let identity = request.extensions().get::<Authenticated>().map_or_else(
+                || "anonymous".to_owned(),
+                |caller| caller.identity.to_string(),
+            );
+            let mut response = http::Response::new(full_body(""));
+            response.headers_mut().insert(
+                "x-caller",
+                http::HeaderValue::from_str(&identity).expect("an identity is a header value"),
+            );
+            response
+        }
+    }
+
+    #[tokio::test]
+    async fn the_api_receives_the_caller_its_gate_admitted() {
+        let gates = Gates {
+            public: AdmitAll,
+            worker: AdmitAll,
+            api: CallerApi,
+        };
+        let response = gates.call_api(http::Request::new(full_body(""))).await;
+        assert_eq!(response.headers()["x-caller"], "test:tester");
+    }
+
     #[test]
     fn finish_controller_makes_run_controller_return_at_once() -> TestResult {
         let fixture = WorkerFixture::new()?;
         let stores = gang_spi::RenderedStoreSpec(serde_json::Value::Null);
         let catalog = gang_types::FleetCatalog::try_new(vec![fixture.properties.clone()])?;
+        let (observations, _receiver) = gang_spi::ObservationSink::channel(
+            std::num::NonZeroUsize::MIN,
+            std::num::NonZeroUsize::MIN,
+        );
         let spec = ControllerSpec {
             content_store: &stores,
             action_store: &stores,
             fleets: &catalog,
+            max_workers: 8,
             client_action_timeout: std::time::Duration::from_mins(1),
+            observations: &observations,
         };
         let scheduler = FakeScheduler::new()?;
         let mut received = scheduler.connections();
@@ -1043,11 +1101,17 @@ mod tests {
         let fixture = WorkerFixture::new()?;
         let stores = gang_spi::RenderedStoreSpec(serde_json::Value::Null);
         let catalog = gang_types::FleetCatalog::try_new(vec![fixture.properties.clone()])?;
+        let (observations, _receiver) = gang_spi::ObservationSink::channel(
+            std::num::NonZeroUsize::MIN,
+            std::num::NonZeroUsize::MIN,
+        );
         let spec = ControllerSpec {
             content_store: &stores,
             action_store: &stores,
             fleets: &catalog,
+            max_workers: 8,
             client_action_timeout: std::time::Duration::from_mins(1),
+            observations: &observations,
         };
         let scheduler = FakeScheduler::new()?;
         scheduler.fail_controller(true);

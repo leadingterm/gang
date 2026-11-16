@@ -28,7 +28,8 @@ mock_provider "aws" {
   # The controller and worker-fleet modules require UEFI-capable instance types.
   mock_data "aws_ec2_instance_type" {
     defaults = {
-      boot_modes = ["legacy-bios", "uefi"]
+      boot_modes              = ["legacy-bios", "uefi"]
+      supported_architectures = ["x86_64"]
     }
   }
 
@@ -77,6 +78,25 @@ mock_provider "aws" {
   }
 }
 
+mock_provider "http" {
+  mock_data "http" {
+    defaults = {
+      status_code   = 200
+      response_body = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  gang-image-aarch64.raw.zst\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  gang-image-x86_64.raw.zst\n"
+    }
+  }
+}
+
+override_data {
+  target = data.aws_ami.image
+  values = {
+    name             = "gang-x86_64-aaaaaaaaaaaaaaaa"
+    boot_mode        = "uefi"
+    tags             = { "ec2:SharedTag/ImageSha256" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+    deprecation_time = ""
+  }
+}
+
 override_resource {
   target = module.worker_fleet.module.instance_role.aws_iam_instance_profile.this
   values = {
@@ -117,7 +137,6 @@ variables {
   region                   = "eu-north-1"
   cidr_block               = "10.20.0.0/16"
   cache_bucket_name        = "example-gang-cache"
-  controller_ami_id        = "ami-00000000000000000"
   controller_instance_type = "c7i.large"
   default_isa              = "x86-64"
   trust_domain             = "example.com"
@@ -126,7 +145,6 @@ variables {
       name                        = "gang-worker-x86-64"
       isa                         = "x86-64"
       capacity                    = "spot"
-      ami_id                      = "ami-00000000000000001"
       instance_types              = ["c6id.4xlarge"]
       max_instances               = 4
       vcpus_per_instance          = 15
@@ -138,7 +156,6 @@ variables {
       name                        = "gang-worker-aarch64"
       isa                         = "aarch64"
       capacity                    = "on-demand"
-      ami_id                      = "ami-00000000000000002"
       instance_types              = ["c7gd.4xlarge"]
       max_instances               = 4
       vcpus_per_instance          = 15
@@ -254,6 +271,156 @@ run "renders_gang_toml_for_every_fleet" {
   }
 }
 
+run "renders_scheduled_minimum" {
+  command = apply
+
+  variables {
+    fleets = [
+      {
+        name                        = "gang-worker-x86-64"
+        isa                         = "x86-64"
+        capacity                    = "spot"
+        instance_types              = ["c6id.4xlarge"]
+        max_instances               = 4
+        min_instances               = 0
+        vcpus_per_instance          = 15
+        memory_per_instance         = "29GiB"
+        disk_per_instance           = "200GiB"
+        target_actions_per_instance = 16
+        scheduled_minimum = [{
+          instances = 1
+          days      = ["mon", "tue", "wed", "thu", "fri"]
+          start     = "07:55"
+          end       = "19:00"
+          time_zone = "Europe/Paris"
+        }]
+      },
+      {
+        name                        = "gang-worker-aarch64"
+        isa                         = "aarch64"
+        capacity                    = "on-demand"
+        instance_types              = ["c7gd.4xlarge"]
+        max_instances               = 4
+        vcpus_per_instance          = 15
+        memory_per_instance         = "29GiB"
+        disk_per_instance           = "200GiB"
+        target_actions_per_instance = 16
+      },
+    ]
+  }
+
+  assert {
+    condition     = can(regex("(?s)name = \"gang-worker-x86-64\".*\\[\\[fleets\\.scheduled_minimum\\]\\]\ninstances = 1\ndays = \\[\"mon\",\"tue\",\"wed\",\"thu\",\"fri\"\\]\nstart = \"07:55\"\nend = \"19:00\"\ntime_zone = \"Europe/Paris\"\n.*name = \"gang-worker-aarch64\"", output.gang_toml))
+    error_message = "The exact scheduled minimum must appear between the first and second fleet names."
+  }
+
+  assert {
+    condition     = length(split("[[fleets.scheduled_minimum]]", output.gang_toml)) == 2
+    error_message = "A fleet without windows must not render a scheduled minimum."
+  }
+}
+
+run "rejects_scheduled_minimum_at_min_instances" {
+  command = plan
+  variables {
+    fleets = [{
+      name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
+      instance_types      = ["c6id.4xlarge"]
+      max_instances       = 4, min_instances = 1, vcpus_per_instance = 15
+      memory_per_instance = "29GiB", disk_per_instance = "200GiB", target_actions_per_instance = 16
+      scheduled_minimum   = [{ instances = 1, days = ["mon"], start = "07:55", end = "19:00", time_zone = "Europe/Paris" }]
+    }]
+  }
+  expect_failures = [var.fleets]
+}
+
+run "rejects_scheduled_minimum_bad_day" {
+  command = plan
+  variables {
+    fleets = [{
+      name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
+      instance_types      = ["c6id.4xlarge"]
+      max_instances       = 4, min_instances = 0, vcpus_per_instance = 15
+      memory_per_instance = "29GiB", disk_per_instance = "200GiB", target_actions_per_instance = 16
+      scheduled_minimum   = [{ instances = 1, days = ["monday"], start = "07:55", end = "19:00", time_zone = "Europe/Paris" }]
+    }]
+  }
+  expect_failures = [var.fleets]
+}
+
+run "rejects_scheduled_minimum_end_before_start" {
+  command = plan
+  variables {
+    fleets = [{
+      name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
+      instance_types      = ["c6id.4xlarge"]
+      max_instances       = 4, min_instances = 0, vcpus_per_instance = 15
+      memory_per_instance = "29GiB", disk_per_instance = "200GiB", target_actions_per_instance = 16
+      scheduled_minimum   = [{ instances = 1, days = ["mon"], start = "19:00", end = "08:00", time_zone = "Europe/Paris" }]
+    }]
+  }
+  expect_failures = [var.fleets]
+}
+
+run "accepts_scheduled_minimum_until_midnight" {
+  command = apply
+  variables {
+    fleets = [{
+      name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
+      instance_types      = ["c6id.4xlarge"]
+      max_instances       = 4, min_instances = 0, vcpus_per_instance = 15
+      memory_per_instance = "29GiB", disk_per_instance = "200GiB", target_actions_per_instance = 16
+      scheduled_minimum   = [{ instances = 4, days = ["sat", "sun"], start = "22:00", end = "24:00", time_zone = "UTC" }]
+    }]
+  }
+  assert {
+    condition     = strcontains(output.gang_toml, "end = \"24:00\"")
+    error_message = "A scheduled minimum may end at midnight."
+  }
+}
+
+run "rejects_scheduled_minimum_above_max_instances" {
+  command = plan
+  variables {
+    fleets = [{
+      name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
+      instance_types      = ["c6id.4xlarge"]
+      max_instances       = 4, min_instances = 0, vcpus_per_instance = 15
+      memory_per_instance = "29GiB", disk_per_instance = "200GiB", target_actions_per_instance = 16
+      scheduled_minimum   = [{ instances = 5, days = ["mon"], start = "07:55", end = "19:00", time_zone = "UTC" }]
+    }]
+  }
+  expect_failures = [var.fleets]
+}
+
+run "rejects_scheduled_minimum_without_days" {
+  command = plan
+  variables {
+    fleets = [{
+      name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
+      instance_types      = ["c6id.4xlarge"]
+      max_instances       = 4, min_instances = 0, vcpus_per_instance = 15
+      memory_per_instance = "29GiB", disk_per_instance = "200GiB", target_actions_per_instance = 16
+      scheduled_minimum   = [{ instances = 1, days = [], start = "07:55", end = "19:00", time_zone = "UTC" }]
+    }]
+  }
+  expect_failures = [var.fleets]
+}
+
+run "rejects_scheduled_minimum_with_a_repeated_day" {
+  command = plan
+  variables {
+    fleets = [{
+      name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
+      instance_types      = ["c6id.4xlarge"]
+      max_instances       = 4, min_instances = 0, vcpus_per_instance = 15
+      memory_per_instance = "29GiB", disk_per_instance = "200GiB", target_actions_per_instance = 16
+      scheduled_minimum   = [{ instances = 1, days = ["mon", "mon"], start = "07:55", end = "19:00", time_zone = "UTC" }]
+    }]
+  }
+  expect_failures = [var.fleets]
+}
+
 run "renders_gang_settings_override" {
   command = plan
 
@@ -360,7 +527,6 @@ run "rejects_fleet_isa_outside_pattern" {
         name                        = "gang-worker-x86"
         isa                         = "X86"
         capacity                    = "spot"
-        ami_id                      = "ami-00000000000000003"
         instance_types              = ["c6id.4xlarge"]
         max_instances               = 4
         vcpus_per_instance          = 15
@@ -385,7 +551,6 @@ run "rejects_disk_per_instance_without_unit" {
         name                        = "gang-worker-x86-64"
         isa                         = "x86-64"
         capacity                    = "spot"
-        ami_id                      = "ami-00000000000000001"
         instance_types              = ["c6id.4xlarge"]
         max_instances               = 4
         vcpus_per_instance          = 15
@@ -496,7 +661,6 @@ run "fallback_fleet_gets_an_on_demand_twin" {
         name                        = "gang-worker-x86-64"
         isa                         = "x86-64"
         capacity                    = "spot"
-        ami_id                      = "ami-00000000000000001"
         instance_types              = ["c6id.4xlarge"]
         max_instances               = 4
         vcpus_per_instance          = 15
@@ -509,7 +673,6 @@ run "fallback_fleet_gets_an_on_demand_twin" {
         name                        = "gang-worker-aarch64"
         isa                         = "aarch64"
         capacity                    = "on-demand"
-        ami_id                      = "ami-00000000000000002"
         instance_types              = ["c7gd.4xlarge"]
         max_instances               = 4
         vcpus_per_instance          = 15
@@ -546,7 +709,6 @@ run "rejects_fallback_on_on_demand_fleet" {
         name                        = "gang-worker-x86-64"
         isa                         = "x86-64"
         capacity                    = "on-demand"
-        ami_id                      = "ami-00000000000000001"
         instance_types              = ["c6id.4xlarge"]
         max_instances               = 4
         vcpus_per_instance          = 15
@@ -572,7 +734,6 @@ run "rejects_warm_pool_without_on_demand_group" {
         name                        = "gang-worker-x86-64"
         isa                         = "x86-64"
         capacity                    = "spot"
-        ami_id                      = "ami-00000000000000001"
         instance_types              = ["c6id.4xlarge"]
         max_instances               = 4
         vcpus_per_instance          = 15
@@ -684,7 +845,6 @@ run "rejects_unknown_fleet_isa" {
       name                        = "worker"
       isa                         = "riscv"
       capacity                    = "spot"
-      ami_id                      = "ami-00000000000000001"
       instance_types              = ["c6id.4xlarge"]
       max_instances               = 4
       vcpus_per_instance          = 15
@@ -705,7 +865,6 @@ run "rejects_zero_fleet_disk" {
       name                        = "worker"
       isa                         = "x86-64"
       capacity                    = "spot"
-      ami_id                      = "ami-00000000000000001"
       instance_types              = ["c6id.4xlarge"]
       max_instances               = 4
       vcpus_per_instance          = 15
@@ -726,7 +885,6 @@ run "rejects_zero_fleet_memory" {
       name                        = "worker"
       isa                         = "x86-64"
       capacity                    = "spot"
-      ami_id                      = "ami-00000000000000001"
       instance_types              = ["c6id.4xlarge"]
       max_instances               = 4
       vcpus_per_instance          = 15
@@ -739,7 +897,7 @@ run "rejects_zero_fleet_memory" {
   expect_failures = [var.fleets]
 }
 
-run "rejects_overflowing_fleet_size" {
+run "rejects_fleet_memory_below_min_reservation" {
   command = plan
 
   variables {
@@ -748,6 +906,45 @@ run "rejects_overflowing_fleet_size" {
       isa                         = "x86-64"
       capacity                    = "spot"
       ami_id                      = "ami-00000000000000001"
+      instance_types              = ["c6id.4xlarge"]
+      max_instances               = 4
+      vcpus_per_instance          = 15
+      memory_per_instance         = "8MiB"
+      disk_per_instance           = "200GiB"
+      target_actions_per_instance = 16
+    }]
+  }
+
+  expect_failures = [var.fleets]
+}
+
+run "accepts_fleet_memory_equal_to_min_reservation" {
+  command = plan
+
+  variables {
+    fleets = [{
+      name                        = "worker"
+      isa                         = "x86-64"
+      capacity                    = "spot"
+      ami_id                      = "ami-00000000000000001"
+      instance_types              = ["c6id.4xlarge"]
+      max_instances               = 4
+      vcpus_per_instance          = 15
+      memory_per_instance         = "16MiB"
+      disk_per_instance           = "200GiB"
+      target_actions_per_instance = 16
+    }]
+  }
+}
+
+run "rejects_overflowing_fleet_size" {
+  command = plan
+
+  variables {
+    fleets = [{
+      name                        = "worker"
+      isa                         = "x86-64"
+      capacity                    = "spot"
       instance_types              = ["c6id.4xlarge"]
       max_instances               = 4
       vcpus_per_instance          = 15
@@ -768,7 +965,6 @@ run "accepts_nonzero_sizes_with_leading_zeroes" {
       name                        = "worker"
       isa                         = "x86-64"
       capacity                    = "spot"
-      ami_id                      = "ami-00000000000000001"
       instance_types              = ["c6id.4xlarge"]
       max_instances               = 4
       vcpus_per_instance          = 15
@@ -788,7 +984,6 @@ run "rejects_min_instances_above_max_instances" {
         name                        = "gang-worker-x86-64"
         isa                         = "x86-64"
         capacity                    = "spot"
-        ami_id                      = "ami-00000000000000001"
         instance_types              = ["c6id.4xlarge"]
         max_instances               = 4
         min_instances               = 5
@@ -814,7 +1009,6 @@ run "rejects_zero_vcpus_per_instance" {
         name                        = "gang-worker-x86-64"
         isa                         = "x86-64"
         capacity                    = "spot"
-        ami_id                      = "ami-00000000000000001"
         instance_types              = ["c6id.4xlarge"]
         max_instances               = 4
         vcpus_per_instance          = 0
@@ -839,7 +1033,6 @@ run "rejects_zero_target_actions_per_instance" {
         name                        = "gang-worker-x86-64"
         isa                         = "x86-64"
         capacity                    = "spot"
-        ami_id                      = "ami-00000000000000001"
         instance_types              = ["c6id.4xlarge"]
         max_instances               = 4
         vcpus_per_instance          = 15
@@ -864,7 +1057,6 @@ run "rejects_zero_max_instances" {
         name                        = "gang-worker-x86-64"
         isa                         = "x86-64"
         capacity                    = "spot"
-        ami_id                      = "ami-00000000000000001"
         instance_types              = ["c6id.4xlarge"]
         max_instances               = 0
         vcpus_per_instance          = 15
@@ -936,4 +1128,309 @@ run "accepts_whole_second_client_action_timeout_in_ms" {
     condition     = strcontains(output.gang_toml, "client_action_timeout = \"2000ms\"")
     error_message = "A whole-second client_action_timeout written in ms must be accepted and rendered verbatim."
   }
+}
+
+# Correctness: Defaults resolve each used architecture from this module's release.
+run "default_images_from_release" {
+  command = plan
+
+  assert {
+    condition = toset(keys(local.image_lookups)) == toset([
+      "072320588884/x86_64/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "072320588884/aarch64/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ])
+    error_message = "The default images must use the release publisher and both fleet architectures."
+  }
+
+  assert {
+    condition     = data.http.sha256sums[0].url == "https://github.com/leadingterm/gang/releases/download/v${local.version}/SHA256SUMS" && can(regex("^[0-9]+\\.[0-9]+\\.[0-9]+", local.version))
+    error_message = "The release URL must use the module's Cargo version and default repository."
+  }
+}
+
+# Correctness: Select the x86 digest even when the ARM digest appears first.
+run "single_architecture_uses_matching_digest" {
+  command = plan
+
+  variables {
+    fleets = [{
+      name                        = "worker"
+      isa                         = "x86-64"
+      capacity                    = "spot"
+      instance_types              = ["c6id.4xlarge"]
+      max_instances               = 4
+      vcpus_per_instance          = 15
+      memory_per_instance         = "29GiB"
+      disk_per_instance           = "200GiB"
+      target_actions_per_instance = 16
+    }]
+  }
+
+  override_data {
+    target = data.http.sha256sums
+    values = {
+      status_code   = 200
+      response_body = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  gang-image-aarch64.raw.zst\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  gang-image-x86_64.raw.zst\n"
+    }
+  }
+
+  assert {
+    condition     = toset(keys(local.image_lookups)) == toset(["072320588884/x86_64/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"])
+    error_message = "The x86-only deployment must use the x86 digest, not the first manifest line."
+  }
+
+  assert {
+    condition     = alltrue([for image in data.aws_ami.image : anytrue([for filter in image.filter : filter.name == "architecture" && toset(filter.values) == toset(["x86_64"])])])
+    error_message = "The x86 AMI lookup must filter for the x86_64 architecture."
+  }
+}
+
+# Correctness: An unavailable release cannot provide trusted image hashes.
+run "release_missing_fails" {
+  command = plan
+
+  override_data {
+    target = data.http.sha256sums
+    values = {
+      status_code   = 404
+      response_body = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  gang-image-aarch64.raw.zst\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  gang-image-x86_64.raw.zst\n"
+    }
+  }
+
+  expect_failures = [data.http.sha256sums]
+}
+
+# Correctness: A successful manifest response must list every required architecture.
+run "release_missing_architecture_fails" {
+  command = plan
+
+  override_data {
+    target = data.http.sha256sums
+    values = {
+      status_code   = 200
+      response_body = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  gang-image-x86_64.raw.zst\n"
+    }
+  }
+
+  expect_failures = [data.http.sha256sums]
+}
+
+# Correctness: Each required image must appear exactly once in the manifest.
+run "release_duplicate_architecture_fails" {
+  command = plan
+
+  override_data {
+    target = data.http.sha256sums
+    values = {
+      status_code   = 200
+      response_body = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  gang-image-aarch64.raw.zst\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  gang-image-x86_64.raw.zst\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  gang-image-x86_64.raw.zst\n"
+    }
+  }
+
+  expect_failures = [data.http.sha256sums]
+}
+
+# Security: An AMI whose shared digest differs from the release is rejected.
+run "tag_mismatch_fails" {
+  command = plan
+
+  override_data {
+    target = data.aws_ami.image
+    values = {
+      name             = "gang-x86_64-aaaaaaaaaaaaaaaa"
+      boot_mode        = "uefi"
+      tags             = { "ec2:SharedTag/ImageSha256" = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
+      deprecation_time = ""
+    }
+  }
+
+  expect_failures = [data.aws_ami.image]
+}
+
+# Security: Gang images must boot using UEFI.
+run "legacy_boot_mode_fails" {
+  command = plan
+
+  override_data {
+    target = data.aws_ami.image
+    values = {
+      name             = "gang-x86_64-aaaaaaaaaaaaaaaa"
+      boot_mode        = "legacy-bios"
+      tags             = { "ec2:SharedTag/ImageSha256" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+      deprecation_time = ""
+    }
+  }
+
+  expect_failures = [data.aws_ami.image]
+}
+
+# Correctness: Explicit architecture images do not request the release manifest.
+run "explicit_images_skip_release" {
+  command = plan
+
+  variables {
+    images = {
+      x86_64  = { owner = "self", sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+      aarch64 = { owner = "self", sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+    }
+  }
+
+  assert {
+    condition     = length(data.http.sha256sums) == 0 && alltrue([for image in values(local.image_lookups) : image.owner == "self"]) && length(local.image_lookups) == 2
+    error_message = "Explicit images must use self and skip the release manifest."
+  }
+}
+
+# Correctness: A fleet override selects its own image instead of its architecture default.
+run "fleet_image_override" {
+  command = plan
+
+  variables {
+    images = {
+      x86_64 = { owner = "self", sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
+    }
+    fleets = [{
+      name                        = "worker"
+      isa                         = "x86-64"
+      capacity                    = "spot"
+      image                       = { owner = "000000000000", sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
+      instance_types              = ["c6id.4xlarge"]
+      max_instances               = 4
+      vcpus_per_instance          = 15
+      memory_per_instance         = "29GiB"
+      disk_per_instance           = "200GiB"
+      target_actions_per_instance = 16
+    }]
+  }
+
+  override_data {
+    target = data.aws_ami.image
+    values = {
+      id               = "ami-00000000000000001"
+      name             = "gang-x86_64-bbbbbbbbbbbbbbbb"
+      boot_mode        = "uefi"
+      tags             = { "ec2:SharedTag/ImageSha256" = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
+      deprecation_time = ""
+    }
+  }
+
+  assert {
+    condition     = output.images["worker"] == data.aws_ami.image["000000000000/x86_64/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"].id
+    error_message = "The worker image must be the AMI resolved for its fleet override."
+  }
+}
+
+# Correctness: An ARM controller selects the aarch64 image.
+run "arm_controller_uses_aarch64_image" {
+  command = plan
+
+  override_data {
+    target = data.aws_ec2_instance_type.controller
+    values = {
+      boot_modes              = ["uefi"]
+      supported_architectures = ["arm64"]
+    }
+  }
+
+  assert {
+    condition     = local.node_images["controller"].architecture == "aarch64"
+    error_message = "An ARM controller must use the aarch64 image."
+  }
+
+  assert {
+    condition     = anytrue([for filter in data.aws_ami.image["072320588884/aarch64/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"].filter : filter.name == "architecture" && toset(filter.values) == toset(["arm64"])])
+    error_message = "The aarch64 AMI lookup must filter for the AWS arm64 architecture."
+  }
+}
+
+# Correctness: Images already deprecated trigger the retention warning.
+run "deprecation_warns" {
+  command = plan
+
+  override_data {
+    target = data.aws_ami.image
+    values = {
+      name             = "gang-x86_64-aaaaaaaaaaaaaaaa"
+      boot_mode        = "uefi"
+      tags             = { "ec2:SharedTag/ImageSha256" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+      deprecation_time = "2000-01-01T00:00:00Z"
+    }
+  }
+
+  expect_failures = [check.images_current]
+}
+
+# Correctness: A deprecation beyond the warning window does not warn.
+run "deprecation_beyond_window_passes" {
+  command = plan
+
+  override_data {
+    target = data.aws_ami.image
+    values = {
+      name             = "gang-x86_64-aaaaaaaaaaaaaaaa"
+      boot_mode        = "uefi"
+      tags             = { "ec2:SharedTag/ImageSha256" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+      deprecation_time = "2099-01-01T00:00:00Z"
+    }
+  }
+}
+
+# Correctness: A fleet cannot collide with the controller's image key.
+run "fleet_named_controller_rejected" {
+  command = plan
+
+  variables {
+    fleets = [{
+      name                        = "controller"
+      isa                         = "x86-64"
+      capacity                    = "spot"
+      instance_types              = ["c6id.4xlarge"]
+      max_instances               = 4
+      vcpus_per_instance          = 15
+      memory_per_instance         = "29GiB"
+      disk_per_instance           = "200GiB"
+      target_actions_per_instance = 16
+    }]
+  }
+
+  expect_failures = [var.fleets]
+}
+
+# Correctness: Only supported architectures may appear as image keys.
+run "images_invalid_architecture_rejected" {
+  command = plan
+
+  variables {
+    images = {
+      riscv = { owner = "self", sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+    }
+  }
+
+  expect_failures = [var.images]
+}
+
+# Security: Image digests must be lowercase, complete SHA-256 values.
+run "images_invalid_sha256_rejected" {
+  command = plan
+
+  variables {
+    images = {
+      x86_64 = { owner = "self", sha256 = "not-a-sha256" }
+    }
+  }
+
+  expect_failures = [var.images]
+}
+
+# Security: Image owners must be self or an AWS account ID.
+run "images_invalid_owner_rejected" {
+  command = plan
+
+  variables {
+    images = {
+      x86_64 = { owner = "not-an-account", sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+    }
+  }
+
+  expect_failures = [var.images]
 }

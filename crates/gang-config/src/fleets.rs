@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::errors::ConfigError;
 use crate::fleet_policy::{FleetPolicy, InstanceBounds};
 use crate::plugin_set::{FleetOptionsTable, PluginSet, SandboxSelection};
+use crate::scheduled_minimum::ScheduledMinimum;
 
 /// One `[[fleets]]` entry as written: the policy fields, the `sandbox` key and the
 /// `[fleets.options]` table. Serde rejects unknown and missing keys while the file is parsed.
@@ -49,6 +50,9 @@ pub struct RawFleet<K> {
     /// Provisioner-specific options.
     #[serde(default)]
     pub options: FleetOptionsTable,
+    /// Weekly windows that raise the fleet's minimum; none by default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scheduled_minimum: Vec<ScheduledMinimum>,
 }
 
 impl<K> RawFleet<K> {
@@ -68,14 +72,21 @@ impl<K> RawFleet<K> {
             boot_grace,
             sandbox,
             options,
+            scheduled_minimum,
         } = self;
-        let instances = InstanceBounds::try_new(min_instances, max_instances).map_err(|_| {
-            ConfigError::FleetBounds {
+        let instances = InstanceBounds::try_new(min_instances, max_instances)
+            .map_err(|_| ConfigError::FleetBounds {
                 fleet: name.clone(),
                 min_instances,
                 max_instances: max_instances.get(),
-            }
-        })?;
+            })?
+            .with_schedule(scheduled_minimum)
+            .map_err(|error| ConfigError::ScheduledMinimumBounds {
+                fleet: name.clone(),
+                instances: error.instances.get(),
+                min_instances,
+                max_instances: max_instances.get(),
+            })?;
         let policy = FleetPolicy {
             name,
             isa,
@@ -120,8 +131,8 @@ impl<P: PluginSet> Fleets<P> {
     ///
     /// [`ConfigError::TooManyFleets`] when there are more than the supported number of fleets,
     /// [`ConfigError::DuplicateFleet`], [`ConfigError::FleetBounds`],
-    /// [`ConfigError::FleetSandboxNotConfigured`], and [`ConfigError::FleetOptions`] for an
-    /// entry that is not valid.
+    /// [`ConfigError::ScheduledMinimumBounds`], [`ConfigError::FleetSandboxNotConfigured`], and
+    /// [`ConfigError::FleetOptions`] for an entry that is not valid.
     pub(crate) fn resolve(
         raw: Vec<RawFleet<P::SandboxKey>>,
         provisioner: &P::Provisioner,
@@ -195,6 +206,15 @@ impl<P: PluginSet> Fleets<P> {
             options,
             catalog,
         })
+    }
+
+    /// The most instances the fleets run at once: the sum of their `max_instances`.
+    #[must_use]
+    pub fn max_instances(&self) -> u64 {
+        self.policies
+            .iter()
+            .map(|policy| u64::from(policy.instances.max().get()))
+            .sum()
     }
 
     /// The number of fleets.

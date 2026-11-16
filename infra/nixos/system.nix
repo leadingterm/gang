@@ -4,10 +4,13 @@
   gang,
   ...
 }: {
+  # The one Gang NixOS system: both roles, of which the EC2 user data's first line starts one at boot (gang-config.nix).
   # The EC2 disk image, `system.build.ec2Image`, is defined in ./ec2-image.nix, which the image build (not this module) imports.
   imports = [
     (modulesPath + "/virtualisation/amazon-image.nix")
     ./gang-config.nix
+    ./controller.nix
+    ./worker.nix
   ];
 
   virtualisation.amazon-init.enable = false;

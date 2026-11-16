@@ -64,6 +64,16 @@ pub enum Expected {
     Timestamp,
     /// A non-empty plan object key.
     PlanKey,
+    /// A supported image architecture.
+    Architecture,
+    /// A release tag beginning with v and containing no whitespace.
+    ReleaseTag,
+    /// An EC2 AMI identifier.
+    ImageId,
+    /// A lowercase EC2 region name.
+    Region,
+    /// A non-negative whole-number quota fitting in u32.
+    Quota,
 }
 
 impl fmt::Display for Expected {
@@ -76,6 +86,11 @@ impl fmt::Display for Expected {
             Self::Repository => "an owner/name repository",
             Self::Timestamp => "a YYYY-MM-DDTHH:MM:SSZ timestamp",
             Self::PlanKey => "a non-empty plan key",
+            Self::Architecture => "a supported image architecture",
+            Self::ReleaseTag => "a release tag beginning with v without whitespace",
+            Self::ImageId => "an ami- identifier with lowercase hex digits",
+            Self::Region => "a lowercase region name",
+            Self::Quota => "a non-negative whole-number quota fitting in u32",
         })
     }
 }
@@ -302,6 +317,69 @@ pub enum DeployError {
     NewerPlanRun {
         /// The pull request head.
         head: Sha,
+    },
+    /// The home region is not in the observed regions.
+    #[error("home region {region} is missing")]
+    HomeRegionMissing {
+        /// The missing home region.
+        region: String,
+    },
+    /// A Gang-named image lacks valid identity tags or a matching name.
+    #[error("region {region}: foreign image {name}")]
+    ForeignImage {
+        /// The image's region.
+        region: String,
+        /// The image's name.
+        name: String,
+    },
+    /// A Gang image is in a failed EC2 state.
+    #[error("region {region}: image {name} is in state {state}")]
+    FailedImage {
+        /// The image's region.
+        region: String,
+        /// The image's name.
+        name: String,
+        /// The failed EC2 state.
+        state: String,
+    },
+    /// An image has an unexpected release or digest.
+    #[error("region {region}: image {name} has {found}, expected {expected}")]
+    ImageConflict {
+        /// The image's region.
+        region: String,
+        /// The image's name.
+        name: String,
+        /// The expected identity.
+        expected: String,
+        /// The observed identity.
+        found: String,
+    },
+    /// The new images would exceed the public AMI quota.
+    #[error(
+        "region {region}: {public} public AMIs plus {new} new exceed the Public AMIs quota of {quota}; raise it in the publishing account"
+    )]
+    QuotaExceeded {
+        /// The region over quota.
+        region: String,
+        /// Existing public images.
+        public: usize,
+        /// Images to add.
+        new: usize,
+        /// The regional quota.
+        quota: u32,
+    },
+    /// A manifest cannot be made without a release.
+    #[error("no release was provided")]
+    NoRelease,
+    /// A release image has not reached the desired state.
+    #[error("region {region}: image {name} is not converged: {reason}")]
+    NotConverged {
+        /// The image's region.
+        region: String,
+        /// The image's expected name.
+        name: String,
+        /// The unmet condition.
+        reason: String,
     },
 }
 

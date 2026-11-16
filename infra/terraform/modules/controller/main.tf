@@ -11,15 +11,21 @@ data "aws_ec2_instance_type" "this" {
   instance_type = var.instance_type
 }
 
+locals {
+  # The image's gang.stateDevice; the role line names it.
+  state_device = "/dev/sdg"
+}
+
 resource "aws_instance" "this" {
-  ami                         = var.ami_id
-  instance_type               = var.instance_type
-  subnet_id                   = var.subnet_id
-  private_ip                  = var.private_ip
-  vpc_security_group_ids      = [var.security_group_id]
-  iam_instance_profile        = module.instance_role.instance_profile_name
-  monitoring                  = true
-  user_data                   = join("\n", concat([var.config_parameter_name], [for file, parameter in var.secret_parameters : "${file}=${parameter}"]))
+  ami                    = var.ami_id
+  instance_type          = var.instance_type
+  subnet_id              = var.subnet_id
+  private_ip             = var.private_ip
+  vpc_security_group_ids = [var.security_group_id]
+  iam_instance_profile   = module.instance_role.instance_profile_name
+  monitoring             = true
+  # Line 1 names the role, config parameter and state device; then one "<file>=<parameter>" line per secret.
+  user_data                   = join("\n", concat(["controller ${var.config_parameter_name} state=${local.state_device}"], [for file, parameter in var.secret_parameters : "${file}=${parameter}"]))
   user_data_replace_on_change = true
 
   # IMDSv2 only; a hop limit of 1 keeps the metadata service unreachable from containers.
@@ -66,7 +72,7 @@ resource "aws_ebs_volume" "state" {
 }
 
 resource "aws_volume_attachment" "state" {
-  device_name                    = "/dev/sdf"
+  device_name                    = local.state_device
   volume_id                      = aws_ebs_volume.state.id
   instance_id                    = aws_instance.this.id
   stop_instance_before_detaching = true

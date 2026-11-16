@@ -14,6 +14,7 @@ use parking_lot::Mutex;
 use crate::access::{IdentityKnobs, identity};
 use crate::admission::{cold_start_misfit, memory_escalation, oversized_fleet, unplaceable_disk};
 use crate::browser::sessions;
+use crate::builds::builds;
 use crate::check::{Check, Report};
 use crate::checked_in::{ShippedConfigs, checked_in_configs};
 use crate::cli::cli;
@@ -43,6 +44,7 @@ use crate::preemption::{preemption, worker_renewal};
 use crate::restart::restart;
 use crate::revocation::revocation;
 use crate::sandbox_contract::sandbox_contract;
+use crate::scheduled_minimum::scheduled_minimum;
 use crate::secured::Secured;
 use crate::server::ServerKnobs;
 use crate::server_scenarios::{
@@ -236,6 +238,12 @@ gang_types::string_enum! {
         /// A signed-in browser renews silently until the absolute lifetime, then signs in without
         /// consent; revocation, logout and a suspended account end renewal. Gate two only.
         Sessions = "sessions",
+        /// Two authenticated builds, cold then warm, are attributed separately with their cache
+        /// and execution usage and timestamps visible to the administrator. Gate two only.
+        Builds = "builds",
+        /// A fleet with `min_instances = 0` keeps one worker with no build while a scheduled
+        /// minimum is in force, and the scale-out carries cause `MINIMUM`. Gate two only.
+        ScheduledMinimum = "scheduled-minimum",
     }
 }
 
@@ -280,7 +288,9 @@ impl Scenario {
             | Self::ViewerCap
             | Self::CertificateRotation
             | Self::Identity
-            | Self::Sessions => Gate::Two,
+            | Self::Builds
+            | Self::Sessions
+            | Self::ScheduledMinimum => Gate::Two,
         }
     }
 }
@@ -366,17 +376,7 @@ impl Scenario {
             Self::Limits => limits_checks(ctx),
             Self::Memory => memory_checks(ctx),
             Self::Disk => disk_checks(ctx),
-            Self::Fleets => {
-                let variant = Variant {
-                    fleets: FleetLayout::Placement,
-                    ..ctx.baseline
-                };
-                attempt(self, || {
-                    let stack =
-                        Stack::create(ctx.invocation, &variant, Transport::Tls, ctx.issuer)?;
-                    fleets(&stack, &variant)
-                })
-            }
+            Self::Fleets => fleets_checks(ctx),
             Self::ActionTimeout => execution_checks(ctx, ExecutionScenario::ActionTimeout),
             Self::ActionTimeoutNoop => execution_checks(ctx, ExecutionScenario::ActionTimeoutNoop),
             Self::SandboxContract => execution_checks(ctx, ExecutionScenario::SandboxContract),
@@ -390,6 +390,7 @@ impl Scenario {
             Self::Preemption => execution_checks(ctx, ExecutionScenario::Preemption),
             Self::WorkerRenewal => execution_checks(ctx, ExecutionScenario::WorkerRenewal),
             Self::Orphan => control_checks(self, ctx, ControlKnobs::ORPHAN, orphan),
+            Self::ScheduledMinimum => scheduled_minimum_checks(ctx),
             Self::DrainCancel => {
                 control_checks(self, ctx, ControlKnobs::DRAIN_CANCEL, drain_cancel)
             }
@@ -451,8 +452,31 @@ impl Scenario {
                 identity(&secured)
             }),
             Self::Sessions => sessions_checks(ctx),
+            Self::Builds => attempt(self, || builds(ctx.invocation, &ctx.baseline, ctx.issuer)),
         }
     }
+}
+
+/// The verdicts of the fleets scenario on a fresh placement deployment.
+fn fleets_checks(ctx: &RunContext<'_>) -> Vec<Check> {
+    let variant = Variant {
+        fleets: FleetLayout::Placement,
+        ..ctx.baseline
+    };
+    attempt(Scenario::Fleets, || {
+        let stack = Stack::create(ctx.invocation, &variant, Transport::Tls, ctx.issuer)?;
+        fleets(&stack, &variant)
+    })
+}
+
+/// The verdicts of the scheduled-minimum scenario on a fresh deployment.
+fn scheduled_minimum_checks(ctx: &RunContext<'_>) -> Vec<Check> {
+    control_checks(
+        Scenario::ScheduledMinimum,
+        ctx,
+        ControlKnobs::SCHEDULED_MINIMUM,
+        scheduled_minimum,
+    )
 }
 
 /// The verdicts of the dashboard scenario on fresh deployments.
@@ -922,6 +946,7 @@ mod tests {
         assert_eq!(Scenario::Lifecycle.to_string(), "lifecycle");
         assert_eq!(Scenario::Revocation.to_string(), "revocation");
         assert_eq!(Scenario::Sessions.to_string(), "sessions");
+        assert_eq!(Scenario::Builds.to_string(), "builds");
     }
 
     #[test]
@@ -987,6 +1012,8 @@ mod tests {
             Scenario::CertificateRotation,
             Scenario::Identity,
             Scenario::Sessions,
+            Scenario::Builds,
+            Scenario::ScheduledMinimum,
         ];
         for scenario in gate_two_only {
             assert!(!runs.contains(&scenario), "{scenario}");
@@ -997,6 +1024,23 @@ mod tests {
                 .copied()
                 .filter(|scenario| { !gate_two_only.contains(scenario) })
                 .all(|scenario| runs.contains(&scenario))
+        );
+    }
+
+    #[test]
+    fn scheduled_minimum_is_last_and_gate_two_only() {
+        assert_eq!(
+            "scheduled-minimum".parse::<Scenario>().ok(),
+            Some(Scenario::ScheduledMinimum)
+        );
+        assert!(
+            !Gate::One
+                .scenarios()
+                .any(|scenario| scenario == Scenario::ScheduledMinimum)
+        );
+        assert_eq!(
+            Gate::Two.additions().last(),
+            Some(Scenario::ScheduledMinimum)
         );
     }
 

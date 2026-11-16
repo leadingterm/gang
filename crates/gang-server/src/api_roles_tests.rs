@@ -44,6 +44,7 @@ async fn roles_list_each_role_with_expanded_permissions_and_principal_references
                                 "state.read",
                                 "principals.read",
                                 "events.read",
+                                "builds.read",
                                 "principals.revoke",
                             ],
                             "principals": [principal_name(ADMIN)],

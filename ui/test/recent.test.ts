@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { applyRecent, donePerMinute, doneSeries, passBars, slots, unrecordedSlots } from "../src/recent.ts";
+import { applyRecent, cacheRate, cacheSeries, donePerMinute, doneSeries, passBars, slots, unrecordedSlots } from "../src/recent.ts";
 import type { Recent, Sample } from "../src/wire.ts";
 import { iso } from "./sse.ts";
 
 const sample = (step: number, completed = 0): Sample => ({
-  start: iso(step * 10000), completed, running: 0, queued: 0, passes: 0, skipped: 0,
+  start: iso(step * 10000), completed, running: 0, queued: 0, passes: 0, skipped: 0, lookups: 0, hits: 0,
 });
 const recent = (samples: Sample[], window = "60s"): Recent => ({ window, step: "10s", samples });
 
@@ -46,4 +46,11 @@ test("pass bars distinguish skipped, ok, idle and unrecorded", () => {
     sample(2),
   ], "40s");
   assert.deepEqual(passBars(r), ["unrecorded", "skipped", "ok", "idle"]);
+});
+
+test("cache rates weight lookups and leave empty slots unrecorded", () => {
+  const r = recent([{ ...sample(0), lookups: 10, hits: 5 }, { ...sample(1), lookups: 30, hits: 30 }, sample(2)], "40s");
+  assert.equal(cacheRate(r), 35 / 40);
+  assert.deepEqual(cacheSeries(r), [null, 0.5, 1, null]);
+  assert.equal(cacheRate(recent([sample(0)])), null);
 });

@@ -69,7 +69,7 @@ fn names() -> Vec<SubjectName> {
 }
 
 /// The endpoint policy shared by the tests: a one-hour certificate for the test host, with the
-/// client authentication, ALPN, revoked_certificates, and reissue point each test needs.
+/// client authentication, ALPN, `revoked_certificates`, and reissue point each test needs.
 fn policy(
     client_auth: ClientAuth,
     alpn: Alpn,

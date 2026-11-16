@@ -165,7 +165,7 @@ mod tests {
         let key_file = temporary.path().join("key.der");
         std::fs::write(&key_file, der.as_bytes())?;
         let issued = Timestamp::from_unix_millis(1_700_000_000_000);
-        let lifetime = Duration::from_secs(300);
+        let lifetime = Duration::from_mins(5);
         let token = signed_token(
             &key_file,
             &Url::parse("https://example.test")?,

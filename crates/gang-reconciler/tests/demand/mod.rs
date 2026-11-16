@@ -131,7 +131,7 @@ fn actions_without_resource_requests_add_no_vcpus() -> Result<(), Box<dyn std::e
 }
 
 #[test]
-fn min_instances_floor_beats_small_demand() -> Result<(), Box<dyn std::error::Error>> {
+fn instances_ignore_the_minimum() -> Result<(), Box<dyn std::error::Error>> {
     let policy = FleetPolicy {
         instances: InstanceBounds::try_new(3, NonZeroU32::MIN.saturating_add(99))?,
         ..policy()?
@@ -139,7 +139,7 @@ fn min_instances_floor_beats_small_demand() -> Result<(), Box<dyn std::error::Er
     let mut demand = Demand::default();
     demand.add_queued(ActionResources::default());
 
-    assert_eq!(demand.instances(&policy), 3);
+    assert_eq!(demand.instances(&policy), 1);
     Ok(())
 }
 

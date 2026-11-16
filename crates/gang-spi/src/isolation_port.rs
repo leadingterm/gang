@@ -345,7 +345,8 @@ mod tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod unix_tests {
     use std::os::unix::process::ExitStatusExt;
     use std::process::ExitStatus;

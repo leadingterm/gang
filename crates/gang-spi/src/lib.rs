@@ -36,6 +36,7 @@ mod identity_port;
 mod isolation_port;
 mod lifecycle_port;
 mod limits_port;
+mod observation_port;
 mod plugin;
 mod private;
 mod provisioner_port;
@@ -67,6 +68,10 @@ pub use limits_port::{
     ActionLimits, ActionLimitsPort, ActionScope, ActionUsage, CPU_COUNT_ENV, GUARD_LINK_NAME,
     JOIN_LINK_NAME, MEMORY_KB_ENV,
 };
+pub use observation_port::{
+    Call, CallOutcome, Delivery, Executed, ExecutionTimes, Observation, ObservationSink,
+    Observations, Origin, Phase, Rpc,
+};
 pub use plugin::{Plugin, PluginContext, SandboxPrograms};
 pub use private::__private;
 pub use provisioner_port::{
@@ -78,7 +83,7 @@ pub use repository_port::{
     ScalingEventKind, ScalingEventSeq, StateRepositoryPort,
 };
 pub use scheduler_port::{
-    Accepted, ActionInfo, ActionsView, ApiRequestBody, ApiResponseBody, ApiService,
+    Accepted, ActionInfo, ActionsView, Admitted, ApiRequestBody, ApiResponseBody, ApiService,
     BoxedConnection, ClientTls, Connection, ControllerConnections, ControllerEndpoints,
     ControllerReady, ControllerSpec, Listening, ListingLimits, QueuedActionView, QueuedDemand,
     RequestGate, RunningActionView, SchedulerPort, SchedulerSnapshot, Slots, StoreAccess,

@@ -1,7 +1,8 @@
 //! The `local` binary: runs the end-to-end harness against a `gang` binary and prints the verdicts.
 //!
 //! Exit status: 0 when every check passes or is skipped, 1 when a check fails, 2 when the
-//! invocation cannot run (bad arguments, unreadable files).
+//! invocation cannot run (bad arguments, unreadable files). A harness killed by a signal, or a
+//! reaper stopped by SIGTERM, SIGINT, SIGHUP or SIGQUIT, exits with 128 plus the signal number.
 
 use std::env;
 use std::ffi::OsString;
@@ -174,6 +175,11 @@ fn main() -> ExitCode {
     if gang_e2e::fake_bazel_requested() {
         return gang_e2e::fake_bazel(env::args_os().skip(1));
     }
+    gang_e2e::reaped(harness)
+}
+
+/// Parses the command line, runs the selected scenarios and prints the verdicts.
+fn harness() -> ExitCode {
     let cli = Cli::parse();
     let rejected = unknown_scenarios(cli.gate, &cli.scenarios);
     if !rejected.is_empty() {

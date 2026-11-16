@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn max_age_accepts_positive_whole_seconds_within_u32() {
-        let max_age = MaxAge::try_from(Duration::from_secs(86_400)).expect("positive max age");
+        let max_age = MaxAge::try_from(Duration::from_hours(24)).expect("positive max age");
         assert_eq!(max_age.as_secs(), 86_400);
         assert!(MaxAge::try_from(Duration::from_secs(u64::from(u32::MAX))).is_ok());
     }

@@ -54,6 +54,23 @@ pub enum ConfigError {
         /// The configured ceiling.
         max_instances: u32,
     },
+    /// A scheduled minimum that does not raise the fleet's floor or exceeds its ceiling.
+    #[error(
+        "fleet `{fleet}` has a scheduled minimum of {instances}, which must be above min_instances {min_instances} and at most max_instances {max_instances}"
+    )]
+    #[fix(
+        "set each [[fleets.scheduled_minimum]] instances above min_instances and at most max_instances"
+    )]
+    ScheduledMinimumBounds {
+        /// The fleet's name.
+        fleet: FleetName,
+        /// The invalid scheduled count.
+        instances: u32,
+        /// The configured floor.
+        min_instances: u32,
+        /// The configured ceiling.
+        max_instances: u32,
+    },
     /// A fleet names a sandbox that has no `[sandbox.<plugin>]` section.
     #[error("fleet `{fleet}` uses sandbox `{key}` that has no [sandbox.{key}] section")]
     #[fix("add the [sandbox.<plugin>] section, or name a configured sandbox in the fleet")]
@@ -236,6 +253,12 @@ mod tests {
             ConfigError::FleetBounds {
                 fleet: fleet(),
                 min_instances: 6,
+                max_instances: 4,
+            },
+            ConfigError::ScheduledMinimumBounds {
+                fleet: fleet(),
+                instances: 5,
+                min_instances: 0,
                 max_instances: 4,
             },
             ConfigError::FleetSandboxNotConfigured {

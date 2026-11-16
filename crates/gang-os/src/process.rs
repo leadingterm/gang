@@ -400,7 +400,7 @@ mod tests {
         };
         let stdout = child.stdout.take().ok_or("missing child stdout")?;
         let mut lines = tokio::io::BufReader::new(stdout).lines();
-        tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::time::timeout(Duration::from_mins(1), async {
             while let Some(line) = lines.next_line().await? {
                 if line == "watching" {
                     return Ok::<(), io::Error>(());
@@ -413,7 +413,7 @@ mod tests {
         })
         .await??;
         child.start_kill()?;
-        let line = tokio::time::timeout(Duration::from_secs(60), async {
+        let line = tokio::time::timeout(Duration::from_mins(1), async {
             while let Some(line) = lines.next_line().await? {
                 if line.starts_with("parent-exited ") {
                     return Ok::<String, io::Error>(line);
@@ -426,7 +426,7 @@ mod tests {
         })
         .await??;
         assert_eq!(line, "parent-exited Z");
-        tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::time::timeout(Duration::from_mins(1), async {
             while let Some(line) = lines.next_line().await? {
                 if WATCHING_CHILD.completed_in(&line) {
                     return Ok::<(), io::Error>(());

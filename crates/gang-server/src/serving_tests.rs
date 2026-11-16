@@ -953,7 +953,7 @@ async fn worker_gate_admits_a_ledgered_certificate_and_refuses_an_unknown_one() 
     .await;
 }
 
-/// A principal revoked before startup is refused as PRINCIPAL_REVOKED on authenticate and on gated requests.
+/// A principal revoked before startup is refused as `PRINCIPAL_REVOKED` on authenticate and on gated requests.
 #[tokio::test]
 async fn a_principal_revoked_before_the_start_is_refused_as_revoked_everywhere() {
     // The first server mints alice's token before any revocation is recorded. Its key is the

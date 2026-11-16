@@ -183,6 +183,8 @@ mod tests {
 
     #[test]
     fn exclusive_blocking_waits_until_the_child_releases() -> TestResult {
+        type WaiterResult = Result<FileLock, Box<dyn std::error::Error + Send + Sync>>;
+
         let _spawn = fork_gate::spawner();
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("lock");
@@ -209,7 +211,6 @@ mod tests {
         assert!(FileLock::try_exclusive(&path)?.is_none());
         let (entering, entered) = std::sync::mpsc::channel();
         let waiter_path = path.clone();
-        type WaiterResult = Result<FileLock, Box<dyn std::error::Error + Send + Sync>>;
         let waiter = std::thread::spawn(move || -> WaiterResult {
             // While the child holds the lock, a non-blocking attempt from this thread is busy.
             let busy = FileLock::try_exclusive(&waiter_path)?.is_none();

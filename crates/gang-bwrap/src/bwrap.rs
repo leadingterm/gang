@@ -249,7 +249,7 @@ pub(super) mod tests {
 
     /// The bound on every blocking read and wait in these tests.
     #[cfg(target_os = "linux")]
-    const LIMIT: Duration = Duration::from_secs(60);
+    const LIMIT: Duration = Duration::from_mins(1);
 
     /// Returns the `fake_bwrap` test program that Bazel builds and exposes through `FAKE_BWRAP`.
     #[cfg(target_os = "linux")]

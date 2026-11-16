@@ -39,7 +39,7 @@ mod tests {
     fn role_round_trips_exactly() {
         let value = json!({
             "name": "roles/administrator",
-            "permissions": ["state.read", "principals.read", "events.read", "principals.revoke"],
+            "permissions": ["state.read", "principals.read", "events.read", "builds.read", "principals.revoke"],
             "principals": ["principals/google%3Aops%40example.org"],
         });
         let role: Role = serde_json::from_value(value.clone()).expect("role parses");

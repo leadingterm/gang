@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 bytes = { workspace = true }
 gang-clock = { workspace = true }
+gang-insight = { workspace = true }
 gang-reconciler = { workspace = true }
 gang-spi = { workspace = true }
 gang-types = { workspace = true }

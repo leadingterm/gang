@@ -12,7 +12,7 @@
 //! let policy = FleetPolicy {
 //!     name: FleetName::try_new("workers")?,
 //!     isa: Isa::Aarch64,
-//!     instances: InstanceBounds::up_to(nonzero_u32(100)),
+//!     instances: InstanceBounds::try_new(3, nonzero_u32(100))?,
 //!     vcpus_per_instance: nonzero_u32(15),
 //!     memory_per_instance: NonZeroBytes::gib(29),
 //!     disk_per_instance: NonZeroBytes::gib(100),
@@ -78,13 +78,12 @@ impl Demand {
 
     /// Returns the instances needed to serve this demand under `policy`.
     ///
-    /// The result is saturated to `u32`, raised to the fleet's minimum, then capped at its
-    /// maximum.
+    /// The result is saturated to `u32` and capped at the fleet's maximum. The fleet's minimum
+    /// plays no part: the pass raises the need to the minimum in force.
     #[must_use]
     pub fn instances(&self, policy: &FleetPolicy) -> u32 {
         let need: u32 = self.uncapped_need(policy).saturating_into();
-        need.max(policy.instances.min())
-            .min(policy.instances.max().get())
+        need.min(policy.instances.max().get())
     }
 
     /// Returns whether this demand fits within the fleet's maximum instance count.

@@ -75,12 +75,12 @@ run "instance_requires_imdsv2_with_hop_limit_one" {
   }
 }
 
-run "user_data_is_config_parameter_name" {
+run "user_data_is_role_and_config_parameter_name" {
   command = plan
 
   assert {
-    condition     = aws_instance.this.user_data == var.config_parameter_name
-    error_message = "EC2 user-data must be the SSM parameter name, not the configuration itself."
+    condition     = aws_instance.this.user_data == "controller ${var.config_parameter_name} state=/dev/sdg"
+    error_message = "EC2 user-data must be the role line `controller <config parameter name> state=/dev/sdg`."
   }
 }
 
@@ -96,11 +96,11 @@ run "user_data_lists_each_secret_after_config_name" {
 
   assert {
     condition = aws_instance.this.user_data == join("\n", [
-      var.config_parameter_name,
+      "controller ${var.config_parameter_name} state=/dev/sdg",
       "ca-password=/gang-controller/secrets/ca-password",
       "dashboard-client-secret=/gang-controller/secrets/dashboard-client-secret",
     ])
-    error_message = "EC2 user-data must be the configuration parameter name followed by one file=parameter line per secret, in file-name order."
+    error_message = "EC2 user-data must start with the role line `controller <config parameter name> state=/dev/sdg` followed by one file=parameter line per secret, in file-name order."
   }
 }
 
@@ -123,12 +123,12 @@ run "state_volume_is_encrypted_and_in_subnet_az" {
   }
 }
 
-run "state_volume_attached_at_sdf_and_stopped_safely" {
+run "state_volume_attached_at_sdg_and_stopped_safely" {
   command = plan
 
   assert {
-    condition     = aws_volume_attachment.state.device_name == "/dev/sdf"
-    error_message = "The state volume must be attached as /dev/sdf."
+    condition     = aws_volume_attachment.state.device_name == "/dev/sdg"
+    error_message = "The state volume must be attached as /dev/sdg."
   }
 
   assert {

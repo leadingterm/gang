@@ -12,8 +12,8 @@ use crate::errors::Result;
 use crate::output::{Output, Record};
 use crate::{
     bazel_command, ca_pin_command, client_command, deploy_command, doctor_command, exec_command,
-    guard_command, help, join_command, local_down, local_up, options_command, reset_command,
-    server_command, setup_command, worker_command,
+    guard_command, help, join_command, local_down, local_up, options_command, release_command,
+    reset_command, server_command, setup_command, worker_command,
 };
 
 /// What a process runs, decided from its argv0 and arguments.
@@ -158,6 +158,7 @@ fn execute(command: Command, entrypoint: &Path, out: &Output) -> Result<ExitCode
         Command::Doctor(args) => doctor_command::run(args, out),
         Command::CaPin(args) => ca_pin_command::run(&args.config, out),
         Command::Deploy(command) => deploy_command::run(command, std::io::stdin().lock(), out),
+        Command::Release(command) => release_command::run(command, std::io::stdin().lock(), out),
     }
 }
 
@@ -175,12 +176,8 @@ mod tests {
         items.iter().map(|item| OsString::from(*item)).collect()
     }
 
-    fn try_parse(items: Vec<OsString>) -> std::result::Result<Parsed, clap::Error> {
-        parse(&items)
-    }
-
     fn parse_str(items: &[&str]) -> Parsed {
-        try_parse(args(items)).expect("parses")
+        parse(&args(items)).expect("parses")
     }
 
     fn expect_exec(parsed: Parsed) -> (PathBuf, Vec<OsString>) {
@@ -358,12 +355,12 @@ mod tests {
 
     #[test]
     fn exec_subcommand_without_a_command_is_a_usage_error() {
-        assert!(try_parse(args(&["/usr/bin/gang", "exec"])).is_err());
+        assert!(parse(&args(&["/usr/bin/gang", "exec"])).is_err());
     }
 
     #[test]
     fn unknown_subcommand_is_a_usage_error() {
-        match try_parse(args(&["/usr/bin/gang", "frobnicate"])) {
+        match parse(&args(&["/usr/bin/gang", "frobnicate"])) {
             Err(error) => assert_eq!(error.kind(), ErrorKind::InvalidSubcommand),
             Ok(_) => panic!("an unknown subcommand must not parse"),
         }
@@ -396,7 +393,7 @@ mod tests {
     #[test]
     fn non_utf8_gang_path_parses_its_subcommand() {
         let gang = OsString::from_vec(b"/work/bin/\xff/gang".to_vec());
-        let parsed = try_parse(vec![
+        let parsed = parse(&[
             gang,
             OsString::from("server"),
             OsString::from("--config"),

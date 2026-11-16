@@ -172,6 +172,8 @@ reasons! {
         CertificateNotFound = "CERTIFICATE_NOT_FOUND", "certificate not found", NotFound, ["certificate"];
         /// No principal with the requested name exists.
         PrincipalNotFound = "PRINCIPAL_NOT_FOUND", "principal not found", NotFound, ["principal"];
+        /// No live build with the requested name exists.
+        BuildNotFound = "BUILD_NOT_FOUND", "build not found", NotFound, ["build"];
         /// The caller sent too many requests to a route that is open to anyone.
         RateLimited = "RATE_LIMITED", "too many requests", ResourceExhausted, [];
         /// A backing dependency (ledger, identity provider or signer) is unavailable.
@@ -474,7 +476,7 @@ mod tests {
             .iter()
             .map(|reason| reason.as_str())
             .collect();
-        assert_eq!(names.len(), 19);
+        assert_eq!(names.len(), 20);
         for reason in ErrorReason::ALL {
             let name = reason.as_str();
             assert!(
@@ -522,6 +524,7 @@ mod tests {
             ),
             (ErrorReason::CertificateNotFound, 404, Code::NotFound),
             (ErrorReason::PrincipalNotFound, 404, Code::NotFound),
+            (ErrorReason::BuildNotFound, 404, Code::NotFound),
             (ErrorReason::RateLimited, 429, Code::ResourceExhausted),
             (ErrorReason::DependencyUnavailable, 503, Code::Unavailable),
             (ErrorReason::RequestTimedOut, 504, Code::DeadlineExceeded),
@@ -536,7 +539,7 @@ mod tests {
 
     #[test]
     fn metadata_keys_follow_the_catalog() {
-        let table: [(ErrorReason, &[&str]); 19] = [
+        let table: [(ErrorReason, &[&str]); 20] = [
             (ErrorReason::MalformedRequest, &[]),
             (ErrorReason::RequestTooLarge, &[]),
             (ErrorReason::InvalidPageToken, &[]),
@@ -555,6 +558,7 @@ mod tests {
             ),
             (ErrorReason::CertificateNotFound, &["certificate"]),
             (ErrorReason::PrincipalNotFound, &["principal"]),
+            (ErrorReason::BuildNotFound, &["build"]),
             (ErrorReason::RateLimited, &[]),
             (ErrorReason::DependencyUnavailable, &[]),
             (ErrorReason::RequestTimedOut, &[]),

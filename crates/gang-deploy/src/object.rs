@@ -217,7 +217,7 @@ mod tests {
             .check_object(
                 head,
                 now,
-                MaxAge::try_from(Duration::from_secs(86_400)).expect("positive max age"),
+                MaxAge::try_from(Duration::from_hours(24)).expect("positive max age"),
             )
             .err()
             .as_ref()
@@ -367,7 +367,7 @@ mod tests {
             .check_object(
                 &head,
                 NOW,
-                MaxAge::try_from(Duration::from_secs(86_400)).expect("positive max age"),
+                MaxAge::try_from(Duration::from_hours(24)).expect("positive max age"),
             )
             .unwrap_err();
         assert!(error.to_string().starts_with("plan object metadata"));

@@ -89,7 +89,7 @@ in {
 
     systemd.services.gang-scratch = {
       description = "Assemble and mount Gang worker scratch storage";
-      wantedBy = ["multi-user.target"];
+      wantedBy = ["gang-worker.target"];
       requires = ["gang-config.service"];
       after = ["gang-config.service"];
       before = ["gang-worker.service"];

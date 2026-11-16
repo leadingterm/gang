@@ -51,6 +51,17 @@ export const runningSeries = (r: Recent): readonly (number | null)[] =>
 export const queuedSeries = (r: Recent): readonly (number | null)[] =>
   slots(r).map((s) => s && s.passes > 0 ? s.queued : null);
 
+/** Remote-cache hit rate per recorded step, or null without lookups. */
+export const cacheSeries = (r: Recent): readonly (number | null)[] =>
+  slots(r).map((s) => s && s.lookups > 0 ? s.hits / s.lookups : null);
+
+/** Hit rate weighted by lookup count across the recent window. */
+export const cacheRate = (r: Recent): number | null => {
+  const samples = slots(r).filter((s): s is Sample => s !== null);
+  const lookups = sum(samples, (s) => s.lookups ?? 0);
+  return lookups > 0 ? sum(samples, (s) => s.hits ?? 0) / lookups : null;
+};
+
 export type Bar = "ok" | "skipped" | "idle" | "unrecorded";
 
 /** Pass outcome per slot, with skipped passes taking precedence. */

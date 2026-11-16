@@ -91,6 +91,7 @@ async fn serve(loaded: LoadedConfig, out: &Output) -> Result<ExitCode> {
         scheduler,
         database,
         dashboard,
+        builds,
         ..
     } = config;
     let context = PluginContext { config_path: &path };
@@ -134,6 +135,7 @@ async fn serve(loaded: LoadedConfig, out: &Output) -> Result<ExitCode> {
             endpoint: endpoint.clone(),
             transport,
             dashboard,
+            builds,
             login,
             provisioner: provisioner_name,
         },
@@ -219,6 +221,8 @@ struct SettingsSource {
     transport: TransportSettings,
     /// The operator dashboard's configuration.
     dashboard: DashboardConfig,
+    /// The live builds configuration.
+    builds: gang_config::BuildsConfig,
     /// The browser sign-in of the dashboard, with its client secret already loaded.
     login: Option<LoginSettings>,
     /// The key of the configured provisioner section.
@@ -243,6 +247,7 @@ fn server_settings(source: SettingsSource, server: ServerConfig) -> Result<Serve
         max_tracked_principals: server.max_tracked_principals,
         accept_error_backoff: server.accept_error_backoff,
         dashboard: source.dashboard,
+        builds: source.builds,
         login: source.login,
         provisioner: source.provisioner.into(),
     })
@@ -497,7 +502,7 @@ mod tests {
         SchedulerConfig::Nativelink(config)
     }
 
-    fn worker_endpoint_of(scheduler: SchedulerConfig) -> Option<Url> {
+    fn worker_endpoint_of(scheduler: &SchedulerConfig) -> Option<Url> {
         scheduler.worker_endpoint().cloned()
     }
 
@@ -509,7 +514,7 @@ mod tests {
         let (scheduler, url) = resolve_worker_endpoint(scheduler(None), expected.clone());
         assert_eq!(url, expected);
         assert_eq!(url.as_str(), "grpc://127.0.0.1:41000/");
-        assert_eq!(worker_endpoint_of(scheduler), Some(expected));
+        assert_eq!(worker_endpoint_of(&scheduler), Some(expected));
     }
 
     #[test]
@@ -520,7 +525,7 @@ mod tests {
         let (scheduler, url) =
             resolve_worker_endpoint(scheduler(Some("grpcs://workers.example.com:8443")), derived);
         assert_eq!(url, workers_endpoint());
-        assert_eq!(worker_endpoint_of(scheduler), Some(workers_endpoint()));
+        assert_eq!(worker_endpoint_of(&scheduler), Some(workers_endpoint()));
     }
 
     #[tokio::test]

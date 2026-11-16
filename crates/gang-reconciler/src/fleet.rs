@@ -23,8 +23,11 @@ pub struct WorkerCounts {
 /// What one fleet's queue and demand came to in the latest pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FleetOutlook {
-    /// The instances the demand needs under the fleet's policy.
+    /// The instances the work needs, raised to the minimum in force.
     pub needed: u32,
+    /// The fewest instances the fleet keeps at this pass: `min_instances` raised by any scheduled
+    /// minimum in force.
+    pub minimum: u32,
     /// The demand charged to the fleet: its attributed queued actions and the running actions of
     /// its non-draining workers.
     pub demand: Demand,

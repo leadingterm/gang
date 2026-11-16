@@ -2039,7 +2039,7 @@ dependencies = [
 
 [[package]]
 name = "gang-authn"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
  "gang-clock",
@@ -2059,7 +2059,7 @@ dependencies = [
 
 [[package]]
 name = "gang-aws"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "aws-config",
  "aws-credential-types",
@@ -2093,7 +2093,7 @@ dependencies = [
 
 [[package]]
 name = "gang-bindings"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "gang-types",
  "gang-ui",
@@ -2106,7 +2106,7 @@ dependencies = [
 
 [[package]]
 name = "gang-bwrap"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "gang-os",
  "gang-spi",
@@ -2122,7 +2122,7 @@ dependencies = [
 
 [[package]]
 name = "gang-cgroup"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "gang-clock",
  "gang-spi",
@@ -2139,7 +2139,7 @@ dependencies = [
 
 [[package]]
 name = "gang-client"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2169,7 +2169,7 @@ dependencies = [
 
 [[package]]
 name = "gang-clock"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "gang-types",
  "parking_lot",
@@ -2183,11 +2183,13 @@ dependencies = [
 
 [[package]]
 name = "gang-config"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
+ "gang-clock",
  "gang-macros",
  "gang-types",
  "ipnet",
+ "jiff",
  "serde",
  "tempfile",
  "thiserror",
@@ -2196,7 +2198,7 @@ dependencies = [
 
 [[package]]
 name = "gang-deploy"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
  "hex",
@@ -2209,7 +2211,7 @@ dependencies = [
 
 [[package]]
 name = "gang-e2e"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2257,7 +2259,7 @@ dependencies = [
 
 [[package]]
 name = "gang-embed"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "hex",
  "sha2 0.11.1",
@@ -2267,7 +2269,7 @@ dependencies = [
 
 [[package]]
 name = "gang-exec"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "gang-config",
  "gang-os",
@@ -2284,8 +2286,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "gang-insight"
+version = "0.2.0"
+dependencies = [
+ "gang-clock",
+ "gang-config",
+ "gang-spi",
+ "gang-types",
+ "gang-wire",
+ "thiserror",
+]
+
+[[package]]
 name = "gang-local"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2312,7 +2326,7 @@ dependencies = [
 
 [[package]]
 name = "gang-macros"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2321,7 +2335,7 @@ dependencies = [
 
 [[package]]
 name = "gang-main"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "anstream",
  "anstyle",
@@ -2371,7 +2385,7 @@ dependencies = [
 
 [[package]]
 name = "gang-mtls"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "const-oid 0.10.2",
  "der 0.8.3",
@@ -2395,7 +2409,7 @@ dependencies = [
 
 [[package]]
 name = "gang-nativelink"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2437,7 +2451,7 @@ dependencies = [
 
 [[package]]
 name = "gang-noop"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "gang-os",
  "gang-spi",
@@ -2453,7 +2467,7 @@ dependencies = [
 
 [[package]]
 name = "gang-oidc"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2476,7 +2490,7 @@ dependencies = [
 
 [[package]]
 name = "gang-os"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "gang-testkit",
  "gang-types",
@@ -2489,7 +2503,7 @@ dependencies = [
 
 [[package]]
 name = "gang-reconciler"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "allocation-counter",
  "gang-clock",
@@ -2502,7 +2516,7 @@ dependencies = [
 
 [[package]]
 name = "gang-server"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "allocation-counter",
  "base64 0.23.1",
@@ -2512,6 +2526,7 @@ dependencies = [
  "gang-authn",
  "gang-clock",
  "gang-config",
+ "gang-insight",
  "gang-mtls",
  "gang-reconciler",
  "gang-spi",
@@ -2541,7 +2556,7 @@ dependencies = [
 
 [[package]]
 name = "gang-spi"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "futures",
@@ -2562,7 +2577,7 @@ dependencies = [
 
 [[package]]
 name = "gang-sqlite"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "gang-clock",
  "gang-spi",
@@ -2578,12 +2593,13 @@ dependencies = [
 
 [[package]]
 name = "gang-state"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "allocation-counter",
  "bytes",
  "gang-clock",
  "gang-config",
+ "gang-insight",
  "gang-reconciler",
  "gang-spi",
  "gang-testkit",
@@ -2597,7 +2613,7 @@ dependencies = [
 
 [[package]]
 name = "gang-testkit"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -2626,7 +2642,7 @@ dependencies = [
 
 [[package]]
 name = "gang-tls"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "futures-core",
@@ -2654,7 +2670,7 @@ dependencies = [
 
 [[package]]
 name = "gang-types"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "allocation-counter",
  "base64 0.23.1",
@@ -2672,7 +2688,7 @@ dependencies = [
 
 [[package]]
 name = "gang-ui"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "http",
@@ -2680,7 +2696,7 @@ dependencies = [
 
 [[package]]
 name = "gang-wire"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
  "gang-clock",
@@ -2695,7 +2711,7 @@ dependencies = [
 
 [[package]]
 name = "gang-worker"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "gang-clock",
  "gang-config",
@@ -3331,6 +3347,48 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "jiff"
+version = "0.2.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "175dc66334db3b9ab9985bf8b61cfed50dc16d20964bb47f9e479adcae984a7f"
+dependencies = [
+ "jiff-core",
+ "jiff-static",
+ "jiff-tzdb",
+ "log",
+ "portable-atomic",
+ "portable-atomic-util",
+ "serde_core",
+]
+
+[[package]]
+name = "jiff-core"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e599b80292e597019b8b3e392de3f4bea2959ddfb8c7dff60e035e9e311a2c1b"
+dependencies = [
+ "log",
+]
+
+[[package]]
+name = "jiff-static"
+version = "0.2.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7b1af7547d47354bc438d797e3854601bde8f8d185780c5ba4ab27afa54f1ba"
+dependencies = [
+ "jiff-core",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "jiff-tzdb"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0980fca2cc272465bd60e82397607ba9f33add9e48defd77923301bbd03808f2"
 
 [[package]]
 name = "jni"
@@ -4336,7 +4394,7 @@ dependencies = [
 
 [[package]]
 name = "opentofu-runner"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "tempfile",
  "thiserror",
@@ -4603,6 +4661,15 @@ name = "portable-atomic"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
+
+[[package]]
+name = "portable-atomic-util"
+version = "0.2.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10ab3eb7f3becc3a1cbc4f2c6f20267996cfc1a6467a873763411b136a122715"
+dependencies = [
+ "portable-atomic",
+]
 
 [[package]]
 name = "potential_utf"
@@ -7002,7 +7069,7 @@ dependencies = [
 
 [[package]]
 name = "workspace-architecture"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "serde",
  "syn 2.0.119",

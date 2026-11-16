@@ -76,6 +76,15 @@ impl Collection for Events {
     type Id = u64;
 }
 
+/// Collection of builds, named by build identifier.
+#[derive(Debug, Clone, Copy)]
+pub enum Builds {}
+
+impl Collection for Builds {
+    const NAME: &'static str = "builds";
+    type Id = gang_types::BuildId;
+}
+
 /// Collection of fleet resources, named by fleet name.
 #[derive(Debug, Clone, Copy)]
 pub enum Fleets {}

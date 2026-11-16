@@ -2,12 +2,13 @@
 import { render } from "preact";
 import { App, route } from "./app.tsx";
 import { browserEnvironment, StateClient } from "./client.ts";
+import { startsClient } from "./routes.ts";
 import "./app.css";
 
 const client = new StateClient(browserEnvironment());
 let started = false;
 route.subscribe((current) => {
-  if (current.kind !== "screen" || started) return;
+  if (!startsClient(current) || started) return;
   started = true;
   setInterval(() => client.tick(), 1000);
   void client.start();

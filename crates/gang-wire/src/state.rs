@@ -10,7 +10,7 @@ use std::time::Duration;
 use gang_clock::{Timestamp, millis_of};
 use serde::{Deserialize, Serialize};
 
-use crate::{Event, Isa};
+use crate::{Build, Event, Isa};
 
 wire_enum! {
     /// Why a scheduling pass was skipped.
@@ -100,6 +100,8 @@ pub struct State {
     /// What this server observed over its recent window.
     #[serde(default)]
     pub recent: Recent,
+    /// Builds with an observation within the recent window, basic view, ordered by name; at most `max_live`.
+    pub builds: Vec<Build>,
     /// Epoch of the principal set, which advances when principals change.
     #[ts(type = "number")]
     pub principals_epoch: u64,
@@ -159,6 +161,10 @@ pub struct Sample {
     pub passes: u32,
     /// Control passes skipped during the step.
     pub skipped: u32,
+    /// `GetActionResult` calls answered during the step.
+    pub lookups: u32,
+    /// Of `lookups`, remote cache hits.
+    pub hits: u32,
 }
 
 /// A phase a worker was in, from `start` until the next span's start (the last one lasts).
@@ -449,7 +455,7 @@ pub struct LaunchFailure {
 )]
 #[serde(rename_all = "camelCase")]
 pub struct Policy {
-    /// The fewest instances the fleet keeps.
+    /// The fewest instances the fleet keeps at this pass: `min_instances`, raised by a scheduled minimum in force.
     pub min: u32,
     /// The most instances the fleet runs.
     pub max: u32,
@@ -660,6 +666,10 @@ pub struct Truncated {
 pub struct RunningAction {
     /// Resource name, `actions/{op}`.
     pub name: String,
+    /// The build of the action's first submitter, `builds/{id}`; absent when unattributable.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[ts(as = "Option<String>", optional)]
+    pub build: String,
     /// Reference `fleets/{fleet}` of the fleet the action runs on.
     pub fleet: String,
     /// Reference `workers/{worker}` of the worker that runs the action.
@@ -687,6 +697,10 @@ pub struct RunningAction {
 pub struct QueuedAction {
     /// Resource name, `actions/{op}`.
     pub name: String,
+    /// The build of the action's first submitter, `builds/{id}`; absent when unattributable.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[ts(as = "Option<String>", optional)]
+    pub build: String,
     /// The action's digest.
     pub digest: String,
     /// The action's target.
@@ -810,7 +824,7 @@ mod tests {
     #[test]
     fn recent_and_worker_phases_have_wire_json() {
         let start = Timestamp::from_unix_millis(0);
-        let mut recent = Recent::new(Duration::from_secs(900), Duration::from_secs(10));
+        let mut recent = Recent::new(Duration::from_mins(15), Duration::from_secs(10));
         recent.sample_at(start, |sample| {
             *sample = Sample {
                 start,
@@ -819,6 +833,8 @@ mod tests {
                 queued: 3,
                 passes: 4,
                 skipped: 5,
+                lookups: 6,
+                hits: 7,
             };
         });
         let state = State {
@@ -826,12 +842,13 @@ mod tests {
             ..State::default()
         };
         let value = serde_json::to_value(&state).expect("state serializes");
+        assert_eq!(value["builds"], json!([]));
         assert_eq!(
             value["recent"],
             json!({
                 "window": "900s", "step": "10s",
                 "samples": [{"start": "1970-01-01T00:00:00.000Z", "completed": 1,
-                    "running": 2, "queued": 3, "passes": 4, "skipped": 5}]
+                    "running": 2, "queued": 3, "passes": 4, "skipped": 5, "lookups": 6, "hits": 7}]
             })
         );
         let mut worker = Worker::default();
@@ -1068,6 +1085,7 @@ mod tests {
             "eventsLimit": 200,
             "completed": 17,
             "recent": {"window": "0s", "step": "0s"},
+            "builds": [],
             "principalsEpoch": 3,
         });
         let state: State = round_trip(&value);
@@ -1090,6 +1108,7 @@ mod tests {
             "events": [],
             "eventsLimit": 200,
             "completed": 0,
+            "builds": [],
             "principalsEpoch": 0,
             "schema": 1,
         });

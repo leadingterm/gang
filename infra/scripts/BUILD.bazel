@@ -6,3 +6,10 @@ sh_test(
     data = ["install-gang.sh"],
     env = {"INSTALL_GANG": "$(rootpath install-gang.sh)"},
 )
+
+sh_test(
+    name = "publish-amis_test",
+    srcs = ["publish-amis_test.sh"],
+    data = ["publish-amis.sh"],
+    env = {"PUBLISH_AMIS": "$(rootpath publish-amis.sh)"},
+)

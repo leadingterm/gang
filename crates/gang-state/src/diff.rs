@@ -26,6 +26,7 @@ pub fn diff(prev: &State, cur: &State) -> Option<Delta> {
             .to_vec(),
         completed: changed(&prev.completed, &cur.completed).copied(),
         recent: cur.recent.increment(&prev.recent),
+        builds: keyed(&prev.builds, &cur.builds),
         principals_epoch: changed(&prev.principals_epoch, &cur.principals_epoch).copied(),
     };
     (!delta.is_empty()).then_some(delta)

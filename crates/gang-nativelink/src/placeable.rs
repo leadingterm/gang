@@ -155,6 +155,7 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::*;
+    use crate::enforcement::MemoryTuning;
     use crate::fitted::FittedActions;
 
     #[derive(Default)]
@@ -254,7 +255,7 @@ mod tests {
         Arc::new(ActionInfo {
             command_digest: digest,
             input_root_digest: digest,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_mins(1),
             platform_properties: [(key.to_owned(), value.to_owned())].into_iter().collect(),
             priority: 0,
             load_timestamp: UNIX_EPOCH,
@@ -290,12 +291,11 @@ mod tests {
     async fn refuses_client_request_above_every_fleet() {
         let fake = Arc::new(Fake::default());
         let wrapper = PlaceableActions::new(fake.clone(), catalog(), AdmittedFleets::default());
-        let error = match wrapper
+        let Err(error) = wrapper
             .add_action(operation(), info(property::CPU_COUNT, "99"))
             .await
-        {
-            Err(error) => error,
-            Ok(_) => panic!("unplaceable request accepted"),
+        else {
+            panic!("unplaceable request accepted");
         };
         assert_eq!(error.code, Code::InvalidArgument);
         let message = error.to_string();
@@ -308,7 +308,12 @@ mod tests {
         let fake = Arc::new(Fake::default());
         let fleets = catalog();
         let admitted = AdmittedFleets::default();
-        let fitted = FittedActions::new(fake.clone(), fleets.clone(), admitted.clone());
+        let fitted = FittedActions::new(
+            fake.clone(),
+            fleets.clone(),
+            admitted.clone(),
+            MemoryTuning::default().min_reservation,
+        );
         for (value, expected) in [("871000", "15000"), ("12000", "12000")] {
             let _admission = admitted.insert(operation(), fleets.accepting(|_| None));
             fitted
@@ -362,7 +367,12 @@ mod tests {
         )
         .expect("valid catalog");
         let admitted = AdmittedFleets::default();
-        let fitted = FittedActions::new(fake.clone(), fleets.clone(), admitted.clone());
+        let fitted = FittedActions::new(
+            fake.clone(),
+            fleets.clone(),
+            admitted.clone(),
+            MemoryTuning::default().min_reservation,
+        );
         let _admission = admitted.insert(operation(), fleets.accepting(|_| None));
         fitted
             .add_action(operation(), info(property::MEMORY_KB, "35232154"))
@@ -375,6 +385,98 @@ mod tests {
                 .expect("recorded")
                 .platform_properties[property::MEMORY_KB],
             "33554432"
+        );
+    }
+
+    fn large_memory_catalog() -> FleetCatalog {
+        FleetCatalog::try_new(vec![FleetProperties::new(
+            &FleetName::try_new("fleet-a").expect("valid fleet"),
+            Isa::X86_64,
+            &"docker",
+            Resources {
+                vcpus: 15,
+                memory: Bytes::gib(64),
+                disk: Bytes::gib(1),
+            },
+            Vec::<(&'static str, String)>::new(),
+        )])
+        .expect("valid catalog")
+    }
+
+    #[tokio::test]
+    async fn fitted_raises_a_tiny_learned_reservation_to_the_minimum() {
+        let fake = Arc::new(Fake::default());
+        let fitted = FittedActions::new(
+            fake.clone(),
+            large_memory_catalog(),
+            AdmittedFleets::default(),
+            MemoryTuning::default().min_reservation,
+        );
+        fitted
+            .add_action(operation(), info(property::MEMORY_KB, "252"))
+            .await
+            .expect("fitted");
+        assert_eq!(
+            fake.calls.lock()[0].platform_properties[property::MEMORY_KB],
+            "16384"
+        );
+    }
+
+    #[tokio::test]
+    async fn fitted_keeps_a_reservation_above_the_minimum() {
+        let fake = Arc::new(Fake::default());
+        let fitted = FittedActions::new(
+            fake.clone(),
+            large_memory_catalog(),
+            AdmittedFleets::default(),
+            MemoryTuning::default().min_reservation,
+        );
+        fitted
+            .add_action(operation(), info(property::MEMORY_KB, "35232154"))
+            .await
+            .expect("fitted");
+        assert_eq!(
+            fake.calls.lock()[0].platform_properties[property::MEMORY_KB],
+            "35232154"
+        );
+    }
+
+    #[tokio::test]
+    async fn fitted_leaves_an_action_without_memory_kb_alone() {
+        let fake = Arc::new(Fake::default());
+        let fitted = FittedActions::new(
+            fake.clone(),
+            large_memory_catalog(),
+            AdmittedFleets::default(),
+            MemoryTuning::default().min_reservation,
+        );
+        fitted
+            .add_action(operation(), info(property::CPU_COUNT, "1"))
+            .await
+            .expect("fitted");
+        assert!(
+            !fake.calls.lock()[0]
+                .platform_properties
+                .contains_key(property::MEMORY_KB)
+        );
+    }
+
+    #[tokio::test]
+    async fn fitted_leaves_a_zero_memory_kb_alone() {
+        let fake = Arc::new(Fake::default());
+        let fitted = FittedActions::new(
+            fake.clone(),
+            large_memory_catalog(),
+            AdmittedFleets::default(),
+            MemoryTuning::default().min_reservation,
+        );
+        fitted
+            .add_action(operation(), info(property::MEMORY_KB, "0"))
+            .await
+            .expect("fitted");
+        assert_eq!(
+            fake.calls.lock()[0].platform_properties[property::MEMORY_KB],
+            "0"
         );
     }
 

@@ -77,7 +77,7 @@ module "controller" {
   source = "../controller"
 
   name                          = "${var.name}-controller"
-  ami_id                        = var.controller_ami_id
+  ami_id                        = local.node_ami_ids["controller"]
   instance_type                 = var.controller_instance_type
   root_volume_gib               = var.controller_root_volume_gib
   state_volume_gib              = var.controller_state_volume_gib
@@ -136,7 +136,7 @@ module "worker_fleet" {
     for fleet in var.fleets : {
       name               = fleet.name
       capacity           = fleet.capacity
-      ami_id             = fleet.ami_id
+      ami_id             = local.node_ami_ids[fleet.name]
       instance_types     = fleet.instance_types
       max_instances      = fleet.max_instances
       root_volume_gib    = fleet.root_volume_gib

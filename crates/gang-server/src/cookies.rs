@@ -377,14 +377,10 @@ mod tests {
         for value in ["token; Domain=evil.example", "token value"] {
             assert!(
                 cookies
-                    .session_header(&AccessToken::new(value), Duration::from_secs(60))
+                    .session_header(&AccessToken::new(value), Duration::from_mins(1))
                     .is_err()
             );
-            assert!(
-                cookies
-                    .login_header(value, Duration::from_secs(60))
-                    .is_err()
-            );
+            assert!(cookies.login_header(value, Duration::from_mins(1)).is_err());
         }
     }
 
@@ -392,15 +388,11 @@ mod tests {
     fn cookie_values_reject_non_cookie_octets() {
         let cookies = SessionCookies::for_endpoint(&url("https://gang.example/"));
         for value in ["\"", ",", ";", "\\", "\u{7f}", "é"] {
-            assert!(
-                cookies
-                    .login_header(value, Duration::from_secs(60))
-                    .is_err()
-            );
+            assert!(cookies.login_header(value, Duration::from_mins(1)).is_err());
         }
         assert!(
             cookies
-                .login_header("!#$%&'()*+-./:<>?@[]^_`{|}~", Duration::from_secs(60))
+                .login_header("!#$%&'()*+-./:<>?@[]^_`{|}~", Duration::from_mins(1))
                 .is_ok()
         );
     }

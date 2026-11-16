@@ -394,6 +394,29 @@ routes! {
         rate_limited: false,
     };
 
+    /// `GET /v1/builds`: lists builds. Requires `builds.read`; may use the session cookie.
+    LIST_BUILDS = ListBuilds {
+        method: Method::Get,
+        template: "/v1/builds",
+        permission: Some(Permission::BuildsRead),
+        request: None,
+        response: "ListBuildsResponse",
+        cookie: true,
+        rate_limited: false,
+    };
+
+    /// `GET /v1/builds/{build}`: retrieves a build. Requires `builds.read`; may use the session cookie.
+    GET_BUILD = GetBuild {
+        method: Method::Get,
+        template: "/v1/builds/{build}",
+        collection: name::Builds,
+        permission: Some(Permission::BuildsRead),
+        request: None,
+        response: "Build",
+        cookie: true,
+        rate_limited: false,
+    };
+
     /// `GET /v1/state`: the current state. Requires `state.read`; may be identified by the session
     /// cookie.
     GET_STATE = GetState {
@@ -442,12 +465,12 @@ pub fn lookup(method: Method, path: &str) -> Option<(&'static Route, Option<&str
         .find_map(|route| route.matches(method, path).map(|raw| (route, raw)))
 }
 
-/// Templates of the `GET` routes that accept the session cookie, in [`ROUTES`] order.
-pub fn cookie_paths() -> impl Iterator<Item = &'static str> {
-    ROUTES
-        .iter()
-        .filter(|route| route.cookie && route.method == Method::Get)
-        .map(|route| route.template)
+/// Whether a request matches a `GET` route that accepts the session cookie.
+#[must_use]
+pub fn accepts_cookie(method: &Method, path: &str) -> bool {
+    ROUTES.iter().any(|route| {
+        route.cookie && route.method == Method::Get && route.matches(*method, path).is_some()
+    })
 }
 
 #[cfg(test)]
@@ -628,8 +651,12 @@ mod tests {
     }
 
     #[test]
-    fn cookie_paths_are_the_cookie_gets() {
-        let mut paths: Vec<&str> = cookie_paths().collect();
+    fn cookie_routes_are_the_cookie_gets() {
+        let mut paths: Vec<&str> = ROUTES
+            .iter()
+            .filter(|route| route.cookie && route.method == Method::Get)
+            .map(|route| route.template)
+            .collect();
         paths.sort_unstable();
         let mut expected = [
             "/v1/session",
@@ -638,9 +665,20 @@ mod tests {
             "/v1/principals",
             "/v1/roles",
             "/v1/events",
+            "/v1/builds",
+            "/v1/builds/{build}",
         ];
         expected.sort_unstable();
         assert_eq!(paths, expected);
+    }
+
+    #[test]
+    fn cookie_eligibility_matches_request_paths() {
+        assert!(accepts_cookie(&Method::Get, "/v1/builds/0123456789abcdef"));
+        assert!(accepts_cookie(&Method::Get, "/v1/state"));
+        assert!(!accepts_cookie(&Method::Post, "/v1/principals/x:revoke"));
+        assert!(!accepts_cookie(&Method::Get, "/v1/unknown"));
+        assert!(!accepts_cookie(&Method::Get, "/v1/builds/a/b"));
     }
 
     #[test]
@@ -688,6 +726,8 @@ mod tests {
                 ),
                 ("/v1/roles", Some("principals.read")),
                 ("/v1/events", Some("events.read")),
+                ("/v1/builds", Some("builds.read")),
+                ("/v1/builds/{build}", Some("builds.read")),
                 ("/v1/state", Some("state.read")),
                 ("/v1/state:watch", Some("state.read")),
                 ("/v1/session", None),
@@ -715,6 +755,7 @@ mod tests {
             assert!(
                 route.template.starts_with("/v1/principals/")
                     || route.template.starts_with("/v1/certificates/")
+                    || route.template.starts_with("/v1/builds/")
                     || route
                         .template
                         .starts_with("/v1/deviceAuthorizations/{deviceAuthorization}"),

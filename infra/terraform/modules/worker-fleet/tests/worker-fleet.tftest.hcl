@@ -175,9 +175,9 @@ run "one_spot_asg_per_fleet" {
   assert {
     condition = alltrue([
       for fleet in var.fleets :
-      base64decode(aws_launch_template.this[fleet.name].user_data) == var.config_parameter_name
+      base64decode(aws_launch_template.this[fleet.name].user_data) == "worker ${var.config_parameter_name}"
     ])
-    error_message = "Worker user data must be the config parameter name, so workers read the current gang.toml at boot."
+    error_message = "Worker user data must be `worker <config parameter name>`, so workers read the current gang.toml at boot."
   }
 
   assert {

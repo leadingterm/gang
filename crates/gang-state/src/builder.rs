@@ -30,6 +30,7 @@ pub struct Builder {
     config: BuilderConfig,
     last_ok: Option<Timestamp>,
     skipped: u32,
+    last_cache_counts: Option<(u64, u64)>,
     scratch: Scratch,
 }
 
@@ -51,6 +52,7 @@ impl Builder {
             config,
             last_ok: None,
             skipped: 0,
+            last_cache_counts: None,
             scratch: Scratch::default(),
         }
     }
@@ -79,7 +81,7 @@ impl Builder {
     /// Fills `cur` with the frame for `inputs`, numbered `seq`.
     ///
     /// A completed pass rewrites every row of `cur` from `inputs`. A skipped pass copies the rows
-    /// of `prev` unchanged and reports the skip. The actions part is refreshed in both cases.
+    /// of `prev` unchanged and reports the skip. Actions and recent builds are refreshed in both cases.
     pub fn fill(&mut self, cur: &mut State, prev: &State, seq: u64, inputs: &Inputs<'_>) {
         name::STATE.clone_into(&mut cur.name);
         cur.seq = seq;
@@ -92,6 +94,15 @@ impl Builder {
         cur.recent.window = self.config.history_window;
         cur.recent.step = self.config.history_step;
         fill_events(cur, inputs.events, self.config.events_limit);
+        let since = Timestamp::from_unix_millis(
+            inputs
+                .wall
+                .as_unix_millis()
+                .saturating_sub(gang_clock::millis_of(self.config.history_window)),
+        );
+        inputs
+            .builds
+            .fill_recent(since, inputs.wall, &mut cur.builds);
         let interval = self.config.interval;
         match &inputs.pass {
             PassStatus::Ok {
@@ -119,6 +130,16 @@ impl Builder {
                     .completed
                     .checked_sub(prev.completed)
                     .unwrap_or(snapshot.completed);
+                let (last_lookups, last_hits) = self.last_cache_counts.unwrap_or_default();
+                let lookups = snapshot
+                    .lookups
+                    .checked_sub(last_lookups)
+                    .unwrap_or(snapshot.lookups);
+                let hits = snapshot
+                    .hits
+                    .checked_sub(last_hits)
+                    .unwrap_or(snapshot.hits);
+                self.last_cache_counts = Some((snapshot.lookups, snapshot.hits));
                 let running = cur
                     .fleets
                     .iter()
@@ -126,6 +147,8 @@ impl Builder {
                 let queued = cur.queue.total;
                 cur.recent.sample_at(inputs.wall, |sample| {
                     sample.completed = sample.completed.saturating_add(completed.saturating_into());
+                    sample.lookups = sample.lookups.saturating_add(lookups.saturating_into());
+                    sample.hits = sample.hits.saturating_add(hits.saturating_into());
                     sample.running = running;
                     sample.queued = queued;
                     sample.passes = sample.passes.saturating_add(1);
@@ -367,7 +390,7 @@ fn fill_fleet(row: &mut Fleet, pass: &FleetPass, properties: &FleetProperties) {
         memory: policy.memory_per_instance.as_u64(),
     });
     row.policy = Policy {
-        min: policy.instances.min(),
+        min: pass.outlook.minimum,
         max: policy.instances.max().get(),
         target_actions: policy.target_actions_per_instance.get(),
         idle_timeout: policy.idle_timeout,
@@ -513,6 +536,11 @@ fn fill_running(
             row.digest.clone_from(&action.info.digest);
             row.target.clone_from(&action.info.target);
             row.mnemonic.clone_from(&action.info.mnemonic);
+            if let Some(build) = action.info.build {
+                name::write_of::<name::Builds>(&mut row.build, &build);
+            } else {
+                row.build.clear();
+            }
             row.start_time = action.started;
             row.priority = action.info.priority;
             true
@@ -542,6 +570,11 @@ fn fill_queued_row(row: &mut QueuedAction, queued: &QueuedActionView, inputs: &I
     row.digest.clone_from(&queued.info.digest);
     row.target.clone_from(&queued.info.target);
     row.mnemonic.clone_from(&queued.info.mnemonic);
+    if let Some(build) = queued.info.build {
+        name::write_of::<name::Builds>(&mut row.build, &build);
+    } else {
+        row.build.clear();
+    }
     row.queue_time = queued.queued_since;
     row.priority = queued.info.priority;
     if let Some(refusal) = &queued.refusal {

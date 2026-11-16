@@ -921,6 +921,57 @@ fn launch_failure_preset_sets_missing_launcher_and_short_timeout() -> gang_e2e::
 }
 
 #[test]
+fn scheduled_minimum_preset_applies_to_every_fleet() -> gang_e2e::Result<()> {
+    let variant = Variant {
+        control: ControlKnobs::SCHEDULED_MINIMUM,
+        fleets: FleetLayout::Placement,
+        ..Variant::baseline(Sandbox::Noop)
+    };
+    let template = ConfigTemplate::parse(&base_config()?)?.vary(&variant, &launcher(), &tools())?;
+    let text = template.render()?;
+    let document: toml::Table = text
+        .parse()
+        .map_err(|error: toml::de::Error| E2eError::Template(error.to_string()))?;
+    let fleets = document["fleets"].as_array().expect("fleets");
+    assert_eq!(fleets.len(), 3);
+    for fleet in fleets {
+        assert_eq!(fleet["min_instances"].as_integer(), Some(0));
+        assert_eq!(fleet["max_instances"].as_integer(), Some(1));
+        let windows = fleet["scheduled_minimum"].as_array().expect("windows");
+        assert_eq!(windows.len(), 1);
+        let window = &windows[0];
+        assert_eq!(window["instances"].as_integer(), Some(1));
+        assert_eq!(
+            window["days"]
+                .as_array()
+                .expect("days")
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .collect::<Vec<_>>(),
+            ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+        );
+        assert_eq!(window["start"].as_str(), Some("00:00"));
+        assert_eq!(window["end"].as_str(), Some("24:00"));
+        assert_eq!(window["time_zone"].as_str(), Some("Asia/Kathmandu"));
+    }
+    Ok(())
+}
+
+#[test]
+fn scheduled_minimum_zero_is_a_template_error() -> gang_e2e::Result<()> {
+    let variant = Variant {
+        control: ControlKnobs {
+            scheduled_minimum: Some(0),
+            ..ControlKnobs::NONE
+        },
+        ..Variant::baseline(Sandbox::Noop)
+    };
+    let result = ConfigTemplate::parse(&base_config()?)?.vary(&variant, &launcher(), &tools());
+    assert!(matches!(result, Err(E2eError::Template(_))));
+    Ok(())
+}
+
+#[test]
 fn vary_absent_removes_the_worker_launcher_of_the_base() -> gang_e2e::Result<()> {
     let text = base_config()?.replace(
         "[provisioner.local]",
