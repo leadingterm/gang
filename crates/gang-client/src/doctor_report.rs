@@ -17,6 +17,8 @@ string_enum! {
         RemoteExecutor = "remote_executor",
         /// Bazel's `--remote_cache` points at the server's cache.
         RemoteCache = "remote_cache",
+        /// Effective remote headers do not come from another service's rc file.
+        RemoteHeaders = "remote_headers",
         /// Bazel trusts the CA certificate the server needs, when it needs one.
         TlsCertificate = "tls_certificate",
         /// Bazel's `--credential_helper` covers the server's cache host.

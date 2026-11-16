@@ -315,6 +315,8 @@ mod tests {
         ) -> Result<(), PortError> {
             self.record(format!("supply({})", fleet.name.as_str()));
             into.exits.clear();
+            into.launch_failure = None;
+            into.abandoned = 0;
             into.instances = self
                 .instances_of(fleet.name.as_str())
                 .iter()
@@ -736,7 +738,8 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(LocalCommandError::StateDirNotPrivate { mode: 0o755, .. })
+            Err(LocalCommandError::StateDirNotPrivate { mode, .. })
+                if mode == gang_os::fs::Mode::from_bits_retain(0o755)
         ));
         let mode = fs::metadata(state.path())
             .expect("metadata")

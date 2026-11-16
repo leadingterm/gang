@@ -11,7 +11,7 @@ use gang_spi::{
     SchedulerPort, SchedulerSnapshot, StateRepositoryPort, Subject, WorkerState,
 };
 use gang_state::PassStatus;
-use gang_types::{FleetName, NonZeroDuration, WorkerId};
+use gang_types::{FleetName, InstanceLifecycle, NonZeroDuration, WorkerId};
 use gang_wire::SkipReason;
 
 use crate::publish::StatePublisher;
@@ -47,6 +47,8 @@ pub(crate) struct ControlLoop<'a, P: PluginSet, F, S, R, C> {
     roster: WorkerRoster,
     /// The worker registration and deregistration events of the current pass, before recording.
     worker_changes: Vec<ScalingAuditEvent>,
+    /// Last recorded launch failure reason for each fleet.
+    launch_failures: Vec<Option<String>>,
     plan: Plan,
     reconciler: Reconciler,
     poll_interval: NonZeroDuration,
@@ -83,6 +85,7 @@ where
             .iter()
             .map(|config| FleetPass::new(config.policy.clone()))
             .collect();
+        let launch_failures = vec![None; configs.len()];
         let reconciler = Reconciler::new(fleets.policies());
         Self {
             fleets,
@@ -92,6 +95,7 @@ where
             incoming: SchedulerSnapshot::default(),
             roster: WorkerRoster::default(),
             worker_changes: Vec::new(),
+            launch_failures,
             plan: Plan::new(),
             reconciler,
             poll_interval,
@@ -141,6 +145,7 @@ where
         self.hosted.replace(&mut self.incoming);
         self.record_worker_changes(time.wall).await;
         self.record_exits(time.wall).await;
+        self.record_launch_failures(time.wall).await;
         self.reconciler
             .reconcile(&mut self.passes, &self.hosted, time, &mut self.plan);
         Ok(time)
@@ -239,6 +244,48 @@ where
         }
     }
 
+    /// Records new launch failure causes until the fleet's request is met.
+    async fn record_launch_failures(&mut self, at: Timestamp) {
+        for ((config, pass), last_reason) in self
+            .configs
+            .iter()
+            .zip(&self.passes)
+            .zip(&mut self.launch_failures)
+        {
+            let supply = &pass.supply;
+            let live = supply
+                .instances
+                .iter()
+                .filter(|instance| instance.lifecycle != InstanceLifecycle::Terminating)
+                .fold(0_u32, |count, _| count.saturating_add(1));
+            if supply.desired <= live {
+                *last_reason = None;
+            } else if let Some(failure) = &supply.launch_failure
+                && last_reason.as_deref() != Some(failure.reason.as_str())
+            {
+                let event = ScalingAuditEvent {
+                    at,
+                    fleet: config.policy.name.clone(),
+                    kind: ScalingEventKind::LaunchFailed {
+                        from: live,
+                        to: supply.desired,
+                        reason: failure.reason.clone(),
+                    },
+                    cause: None,
+                };
+                match self.repository.record_scaling_event(&event).await {
+                    Ok(seq) => {
+                        *last_reason = Some(failure.reason.clone());
+                        if let Some(publisher) = self.publisher.as_ref() {
+                            publisher.record_event(RecordedScalingEvent { seq, event });
+                        }
+                    }
+                    Err(error) => tracing::error!(%error, "failed to record scaling event"),
+                }
+            }
+        }
+    }
+
     /// Refreshes every fleet's supply. Returns whether the pass may continue.
     async fn refresh_supplies(&mut self) -> bool {
         for (config, pass) in self.configs.iter().zip(self.passes.iter_mut()) {
@@ -293,7 +340,7 @@ where
         step: &PlanStep,
     ) -> Result<(), PortError> {
         match &step.action {
-            Action::ScaleOut { to, .. } => {
+            Action::ScaleOut { to, .. } | Action::Withdraw { to, .. } => {
                 provisioner
                     .set_desired_capacity(configs[step.fleet].fleet(), *to)
                     .await

@@ -17,6 +17,10 @@ pub struct BuilderConfig {
     pub stale_after: Duration,
     /// The control poll interval reported to clients.
     pub interval: Duration,
+    /// How far back `State::recent` and the workers' phases reach.
+    pub history_window: Duration,
+    /// The span of one sample of `State::recent`.
+    pub history_step: Duration,
     /// The name of the provisioner reported in the state.
     pub provisioner: String,
 }

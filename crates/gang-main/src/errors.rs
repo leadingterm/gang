@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use gang_os::fs::Mode;
 use gang_types::announcement::ListenerRole;
 use gang_types::{CaPin, ProviderName};
 
@@ -139,6 +140,10 @@ pub(crate) enum MainError {
     #[error("cannot locate the gang executable")]
     CurrentExecutable(#[source] io::Error),
 
+    /// The running executable's path cannot be written into a Bazel rc file.
+    #[error("the path of the gang executable is not UTF-8: {}", .0.display())]
+    ExecutablePath(PathBuf),
+
     /// A workload login lacked its provider or token.
     #[error("a workload login needs a provider and a token")]
     #[fix("add --provider <NAME> and --token <FILE> or --token-command <ARGV>")]
@@ -160,6 +165,61 @@ pub(crate) enum MainError {
     /// Standard output could not be written.
     #[error("cannot write to stdout")]
     Stdout(#[source] io::Error),
+
+    /// Standard error could not be written.
+    #[error("cannot write to stderr")]
+    Stderr(#[source] io::Error),
+
+    /// A prompt ended before an answer was available.
+    #[error("standard input ended while waiting for an answer")]
+    #[fix(
+        "run again on a terminal, or pass --yes to apply Gang's files or --dry-run to only preview"
+    )]
+    PromptEof,
+
+    /// The current working directory could not be determined.
+    #[error("cannot determine the working directory")]
+    #[fix("run setup from inside a Bazel workspace")]
+    NoWorkingDirectory,
+
+    /// The certificate path cannot be represented in a Bazel rc file.
+    #[error("the certificate path is not UTF-8: {}", .0.display())]
+    #[fix("use a workspace with a UTF-8 path")]
+    CertificatePath(PathBuf),
+
+    /// A conflicting rc file could not be read.
+    #[error("cannot read `{}`", path.display())]
+    #[fix("check that the file is readable")]
+    ReadConflict {
+        /// The file containing the conflict.
+        path: PathBuf,
+        /// The underlying read failure.
+        #[source]
+        source: io::Error,
+    },
+
+    /// The preview could not be applied without interactive consent.
+    #[error("changes were only previewed")]
+    #[fix(
+        "run again on a terminal, or pass --yes to apply Gang's files or --dry-run to only preview"
+    )]
+    PreviewOnly,
+
+    /// The workspace still has changes requiring consent.
+    #[error("the workspace changes were not applied")]
+    #[fix("gang setup")]
+    ChangesNotApplied,
+
+    /// A server entered at the prompt was not a URL.
+    #[error("invalid server url `{value}`")]
+    #[fix("enter a complete http or https url")]
+    SetupServerUrl {
+        /// The entered server address.
+        value: String,
+        /// Why the address could not be parsed.
+        #[source]
+        source: url::ParseError,
+    },
 
     /// Standard input could not be read.
     #[error("cannot read standard input")]
@@ -270,7 +330,7 @@ pub(crate) enum LocalCommandError {
         /// The state directory.
         path: PathBuf,
         /// Its permission bits.
-        mode: u32,
+        mode: Mode,
     },
 
     /// The server process could not be started.
@@ -652,7 +712,7 @@ mod tests {
             (
                 LocalCommandError::StateDirNotPrivate {
                     path: PathBuf::from("/tmp/gang-local"),
-                    mode: 0o755,
+                    mode: Mode::from_bits_retain(0o755),
                 },
                 "`0755`",
                 "chmod 700 /tmp/gang-local",

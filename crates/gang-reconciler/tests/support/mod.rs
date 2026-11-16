@@ -17,7 +17,7 @@ use gang_spi::{
 };
 use gang_testkit::{TestResult, worker_id};
 use gang_types::{
-    Bytes, FleetName, FleetSet, InstanceId, InstanceLifecycle, Isa, NameError, Resources,
+    ActionResources, Bytes, FleetName, FleetSet, InstanceId, InstanceLifecycle, Isa, NameError,
 };
 
 /// Index of the x86-64 test fleet in the harness's fleets.
@@ -59,11 +59,11 @@ pub fn policy() -> Result<FleetPolicy, HarnessError> {
     policy_named("gang-x86", Isa::X86_64)
 }
 
-/// Resources of an action that needs `vcpus` virtual CPUs, 1 GiB of memory and 1 GiB of disk.
+/// Resources of an action requesting CPU in millicores, 1 GiB of memory and 1 GiB of disk.
 #[must_use]
-pub fn x86_resources(vcpus: u32) -> Resources {
-    Resources {
-        vcpus,
+pub fn x86_resources(cpu_millicores: u64) -> ActionResources {
+    ActionResources {
+        cpu_millicores,
         memory: Bytes::new(1 << 30),
         disk: Bytes::new(1 << 30),
     }
@@ -120,21 +120,31 @@ impl Harness {
 
     /// Queues `count` actions with no resource requests on the fleet at index `fleet`.
     pub fn queue(&mut self, fleet: usize, count: usize) -> TestResult {
-        self.queue_sized(fleet, count, Resources::default())
+        self.queue_sized(fleet, count, ActionResources::default())
     }
 
     /// Queues `count` actions with the given resources on the fleet at index `fleet`.
-    pub fn queue_sized(&mut self, fleet: usize, count: usize, resources: Resources) -> TestResult {
+    pub fn queue_sized(
+        &mut self,
+        fleet: usize,
+        count: usize,
+        resources: ActionResources,
+    ) -> TestResult {
         self.queue_candidates_sized(FleetSet::try_from_indices([fleet])?, count, resources);
         Ok(())
     }
 
     /// Queues `count` actions with no resource requests on any fleet in `candidates`.
     pub fn queue_candidates(&mut self, candidates: FleetSet, count: usize) {
-        self.queue_candidates_sized(candidates, count, Resources::default());
+        self.queue_candidates_sized(candidates, count, ActionResources::default());
     }
 
-    fn queue_candidates_sized(&mut self, candidates: FleetSet, count: usize, resources: Resources) {
+    fn queue_candidates_sized(
+        &mut self,
+        candidates: FleetSet,
+        count: usize,
+        resources: ActionResources,
+    ) {
         let queued_since = self.clock.wall();
         for _ in 0..count {
             self.snapshot.queued.push(QueuedDemand {
@@ -213,11 +223,21 @@ impl Harness {
         Ok(())
     }
 
-    /// Sets the provisioner's desired capacity for the fleet at index `fleet`. Does nothing
-    /// when there is no such fleet.
+    /// Sets the provisioner's desired capacity for the fleet at index `fleet`. Lowering the
+    /// request never removes live instances. Does nothing when there is no such fleet.
     pub fn set_desired_capacity(&mut self, fleet: usize, desired: u32) {
         if let Some(pass) = self.passes.get_mut(fleet) {
-            pass.supply.desired = desired;
+            let live = pass
+                .supply
+                .instances
+                .iter()
+                .filter(|instance| instance.lifecycle != InstanceLifecycle::Terminating)
+                .count();
+            pass.supply.desired = if desired < pass.supply.desired {
+                desired.max(u32::try_from(live).unwrap_or(u32::MAX))
+            } else {
+                desired
+            };
         }
     }
 
@@ -300,8 +320,8 @@ impl Harness {
 
     /// Performs the steps of the most recent plan the way the provisioner and scheduler would.
     ///
-    /// * `ScaleOut` sets the desired capacity of the step's fleet to `to`. Instances are
-    ///   launched by tests explicitly.
+    /// * `ScaleOut` and `Withdraw` set the desired capacity of the step's fleet to `to`.
+    ///   Instances are launched by tests explicitly.
     /// * `StartDrain` marks the worker as draining.
     /// * `CancelDrain` clears the worker's draining flag.
     /// * `Terminate` removes the instance and its worker, removes the instance from the fleet's
@@ -310,10 +330,8 @@ impl Harness {
         let steps = self.plan.steps.clone();
         for step in steps {
             match step.action {
-                Action::ScaleOut { to, .. } => {
-                    if let Some(pass) = self.passes.get_mut(step.fleet) {
-                        pass.supply.desired = to;
-                    }
+                Action::ScaleOut { to, .. } | Action::Withdraw { to, .. } => {
+                    self.set_desired_capacity(step.fleet, to);
                 }
                 Action::StartDrain(worker) => {
                     for state in &mut self.snapshot.workers {

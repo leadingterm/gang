@@ -30,6 +30,26 @@ pub enum ClientError {
     /// A file under the client directory or the workspace could not be read, written, or removed.
     #[error(transparent)]
     Io(#[from] PathIo),
+    /// No Bazel workspace was found above the starting directory.
+    #[error("no Bazel workspace at or above {}", start.display())]
+    NoWorkspace {
+        /// Directory at which the search began.
+        start: PathBuf,
+    },
+    /// An rc entry changed after its conflict was identified.
+    #[error("{}:{line} no longer holds the conflicting flags", path.display())]
+    RcEntryChanged {
+        /// The rc file that changed.
+        path: PathBuf,
+        /// First physical line of the entry.
+        line: usize,
+    },
+    /// A file changed after its setup preview was created.
+    #[error("{} changed since it was previewed; run gang setup again", path.display())]
+    FileChanged {
+        /// The file that changed.
+        path: PathBuf,
+    },
     /// Neither `RUNNER_TEMP` nor `HOME` is set to a usable value.
     #[error("cannot locate the client directory")]
     HomeUnknown,
@@ -226,6 +246,10 @@ impl ClientError {
 impl Fix for ClientError {
     fn fix(&self) -> Option<Cow<'static, str>> {
         match self {
+            Self::NoWorkspace { .. } => Some(Cow::Borrowed("run inside a Bazel workspace")),
+            Self::RcEntryChanged { .. } | Self::FileChanged { .. } => {
+                Some(Cow::Borrowed("run gang setup again to refresh the preview"))
+            }
             Self::HomeUnknown => Some(Cow::Borrowed("set HOME or RUNNER_TEMP")),
             Self::Options { .. } => Some(Cow::Borrowed("fix or delete the client options file")),
             Self::NotLoggedIn => Some(Cow::Borrowed("gang login --server <URL>")),
@@ -331,6 +355,14 @@ pub enum BazelError {
         status: String,
         /// The first `ERROR:` line of its standard error, else its last non-empty line.
         detail: String,
+    },
+    /// Bazel cannot find a `--credential_helper` named by a bare command on its `PATH`.
+    #[error("`{program}` cannot find the credential helper `{helper}` on its PATH")]
+    HelperNotOnPath {
+        /// The program that ran.
+        program: String,
+        /// The helper as the rc file names it.
+        helper: String,
     },
     /// Bazel's build events are not valid JSON lines.
     #[error("the build events of `{program}` are not valid")]
@@ -659,6 +691,10 @@ mod tests {
                 program: "bazel".to_owned(),
                 status: "exit status: 1".to_owned(),
                 detail: "no command line".to_owned(),
+            },
+            BazelError::HelperNotOnPath {
+                program: "bazel".to_owned(),
+                helper: "gang".to_owned(),
             },
             BazelError::Events {
                 program: "bazel".to_owned(),

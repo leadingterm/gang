@@ -11,7 +11,9 @@ use gang_spi::{
 };
 use gang_state::{ActionsSample, Builder, Inputs, PassStatus};
 use gang_testkit::{TestResult, worker_on};
-use gang_types::{Bytes, FleetCatalog, FleetProperties, FleetSet, InstanceLifecycle, Resources};
+use gang_types::{
+    ActionResources, Bytes, FleetCatalog, FleetProperties, FleetSet, InstanceLifecycle,
+};
 use gang_wire::{Cause, Event, EventChange, name};
 
 use crate::support::{
@@ -70,8 +72,8 @@ fn two_fleets() -> Result<FleetSet, Box<dyn Error>> {
 /// The reconciler's outlook of one fleet: two needed instances and one queued demand.
 fn outlook() -> FleetOutlook {
     let mut demand = FleetOutlook::default().demand;
-    demand.add_queued(Resources {
-        vcpus: 2,
+    demand.add_queued(ActionResources {
+        cpu_millicores: 2000,
         memory: Bytes::new(1_024),
         disk: Bytes::new(0),
     });
@@ -134,10 +136,14 @@ fn supplies() -> Result<Vec<FleetSupply>, Box<dyn Error>> {
     let mut supplies = Vec::new();
     for instances in fleets {
         supplies.push(FleetSupply {
+            abandoned: 0,
             desired: u32::try_from(instances.len())?,
             instances,
             warm: 0,
             exits: Vec::new(),
+            launch_failure: Some(gang_spi::LaunchFailure {
+                reason: "capacity unavailable".to_owned(),
+            }),
         });
     }
     Ok(supplies)
@@ -198,7 +204,8 @@ fn actions_sample() -> Result<ActionsSample, Box<dyn Error>> {
                 priority: 0,
             },
             queued_since: ts(4_000 + index),
-            candidates: two_fleets()?,
+            candidates: FleetSet::default(),
+            refusal: Some(gang_types::Refusal::Combination),
         });
     }
     Ok(ActionsSample {

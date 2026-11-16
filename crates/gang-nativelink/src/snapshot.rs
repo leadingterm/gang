@@ -5,7 +5,7 @@ use std::num::NonZeroU32;
 
 use gang_clock::Timestamp;
 use gang_spi::{QueuedDemand, SchedulerSnapshot, WorkerState};
-use gang_types::{Bytes, FleetCatalog, FleetName, Resources, WorkerId, property};
+use gang_types::{ActionResources, Bytes, FleetCatalog, FleetName, WorkerId, property};
 use nativelink_scheduler::admin::QueuedDemand as NativeQueuedDemand;
 use nativelink_scheduler::worker_scheduler::WorkerSummary;
 
@@ -52,7 +52,7 @@ fn worker_state(summary: &WorkerSummary) -> Option<WorkerState> {
 ///
 /// The action's candidates are the fleets that accept its platform properties. An action no
 /// fleet accepts is kept with empty candidates and counts for nothing in the attribution.
-/// Each resource dimension is zero when the corresponding property is missing or malformed.
+/// Each missing or malformed property contributes zero to its resource dimension.
 fn queued_demand(demand: &NativeQueuedDemand, fleets: &FleetCatalog) -> QueuedDemand {
     QueuedDemand {
         candidates: fleets.accepting(|key| demand.platform_properties.get(key).map(String::as_str)),
@@ -62,22 +62,25 @@ fn queued_demand(demand: &NativeQueuedDemand, fleets: &FleetCatalog) -> QueuedDe
     }
 }
 
+fn parse<T: std::str::FromStr + Default>(properties: &HashMap<String, String>, key: &str) -> T {
+    properties
+        .get(key)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_default()
+}
+
 /// Reads the resources an action requests from its platform properties.
 ///
-/// Missing or malformed properties request zero. Memory and disk KiB values are converted to
-/// bytes with saturation.
-fn resources(properties: &HashMap<String, String>) -> Resources {
-    fn parse<T: std::str::FromStr + Default>(properties: &HashMap<String, String>, key: &str) -> T {
-        properties
-            .get(key)
-            .and_then(|value| value.parse().ok())
-            .unwrap_or_default()
-    }
-
+/// Missing or malformed properties request zero. Whole cores are converted to millicores, and
+/// memory and disk KiB values are converted to bytes with saturation.
+fn resources(properties: &HashMap<String, String>) -> ActionResources {
     let memory_kb: u64 = parse(properties, property::MEMORY_KB);
     let disk_kb: u64 = parse(properties, property::DISK_KB);
-    Resources {
-        vcpus: parse(properties, property::CPU_COUNT),
+    let millicores: u64 = parse(properties, property::CPU_MILLICORES);
+    let cores: u32 = parse(properties, property::CPU_COUNT);
+    ActionResources {
+        cpu_millicores: millicores
+            .max(u64::from(cores).saturating_mul(property::MILLICORES_PER_CORE)),
         memory: Bytes::new(memory_kb.saturating_mul(Bytes::kib(1).get())),
         disk: Bytes::new(disk_kb.saturating_mul(Bytes::kib(1).get())),
     }
@@ -103,7 +106,7 @@ pub(crate) fn fill(
 
 #[cfg(test)]
 mod tests {
-    use gang_types::{FleetProperties, FleetSet, Isa};
+    use gang_types::{FleetProperties, FleetSet, Isa, Resources};
 
     use super::*;
 
@@ -307,8 +310,8 @@ mod tests {
             action,
             QueuedDemand {
                 candidates: FleetSet::prefix(1).expect("fleet count in range"),
-                resources: Resources {
-                    vcpus: 4,
+                resources: ActionResources {
+                    cpu_millicores: 4000,
                     memory: Bytes::kib(1024),
                     disk: Bytes::new(0),
                 },
@@ -319,13 +322,41 @@ mod tests {
     }
 
     #[test]
+    fn demand_cpu_uses_the_larger_reservation() {
+        let millicores = demand(0, &[(property::CPU_MILLICORES, "1500")]);
+        assert_eq!(
+            queued_demand(&millicores, &catalog())
+                .resources
+                .cpu_millicores,
+            1500
+        );
+        let both = demand(
+            0,
+            &[
+                (property::CPU_COUNT, "4"),
+                (property::CPU_MILLICORES, "250"),
+            ],
+        );
+        assert_eq!(
+            queued_demand(&both, &catalog()).resources.cpu_millicores,
+            4000,
+            "whole-core request must not be hidden by a smaller millicore request"
+        );
+        let huge = demand(0, &[(property::CPU_MILLICORES, "18446744073709551615")]);
+        assert_eq!(
+            queued_demand(&huge, &catalog()).resources.cpu_millicores,
+            u64::MAX
+        );
+    }
+
+    #[test]
     fn individual_resource_properties_are_independent() {
         let cases = [
             (
                 property::MEMORY_KB,
                 "1024",
-                Resources {
-                    vcpus: 0,
+                ActionResources {
+                    cpu_millicores: 0,
                     memory: Bytes::kib(1024),
                     disk: Bytes::new(0),
                 },
@@ -333,8 +364,8 @@ mod tests {
             (
                 property::CPU_COUNT,
                 "4",
-                Resources {
-                    vcpus: 4,
+                ActionResources {
+                    cpu_millicores: 4000,
                     memory: Bytes::new(0),
                     disk: Bytes::new(0),
                 },
@@ -342,8 +373,8 @@ mod tests {
             (
                 property::DISK_KB,
                 "42",
-                Resources {
-                    vcpus: 0,
+                ActionResources {
+                    cpu_millicores: 0,
                     memory: Bytes::new(0),
                     disk: Bytes::kib(42),
                 },
@@ -367,8 +398,8 @@ mod tests {
         );
         assert_eq!(
             queued_demand(&entry, &catalog()).resources,
-            Resources {
-                vcpus: 0,
+            ActionResources {
+                cpu_millicores: 0,
                 memory: Bytes::kib(1024),
                 disk: Bytes::kib(42),
             }
@@ -381,8 +412,8 @@ mod tests {
         let entry = demand(0, &[(property::MEMORY_KB, &max_memory)]);
         assert_eq!(
             queued_demand(&entry, &catalog()).resources,
-            Resources {
-                vcpus: 0,
+            ActionResources {
+                cpu_millicores: 0,
                 memory: Bytes::new(u64::MAX),
                 disk: Bytes::new(0),
             }
@@ -404,8 +435,8 @@ mod tests {
 
         assert_eq!(
             action.resources,
-            Resources {
-                vcpus: 4,
+            ActionResources {
+                cpu_millicores: 4000,
                 memory: Bytes::kib(1024),
                 disk: Bytes::new(50 << 30),
             }
@@ -422,8 +453,8 @@ mod tests {
             let action = queued_demand(&entry, &catalog());
             assert_eq!(
                 action.resources,
-                Resources {
-                    vcpus: 4,
+                ActionResources {
+                    cpu_millicores: 4000,
                     memory: Bytes::kib(1024),
                     disk: Bytes::new(0),
                 }

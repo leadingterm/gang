@@ -360,6 +360,13 @@ impl Output {
             }
         }
     }
+    /// Writes a prompt to stderr without a newline, flushing before input is read.
+    pub(crate) fn prompt(&self, line: &Line) -> Result<()> {
+        self.shared
+            .err
+            .write(&line.paint(self.shared.err.palette))
+            .map_err(MainError::Stderr)
+    }
 
     /// Writes the outcome record to the primary stream. `--quiet` drops `ok` and `skip` records.
     pub(crate) fn result(&self, record: &Record) -> Result<()> {

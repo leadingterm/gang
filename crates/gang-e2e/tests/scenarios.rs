@@ -65,9 +65,9 @@ use gang_e2e::{
 };
 use gang_wire::routes::{GET_STATE, WATCH_STATE};
 use support::{
-    AdminRoutes, Anonymous, Behaviour, BuildFailure, Cache, Completed, Convergence, Dashboard,
-    Disk, Drain, Fhs, Grower, Handshake, HoldBuild, HoldSignal, Integrity, Isolation, Limits,
-    Loader, Neighbour, OrphanProcess, PidReuse, Requests, Restart, Revocation, Routing,
+    AdminRoutes, Anonymous, Arrival, Behaviour, BuildFailure, Cache, Completed, Convergence,
+    Dashboard, Disk, Drain, Fhs, Grower, Handshake, HoldBuild, HoldSignal, Integrity, Isolation,
+    Limits, Loader, Neighbour, OrphanProcess, PidReuse, Requests, Restart, Revocation, Routing,
     ScopeReport, Serving, SimulatedIdentity, Simulation, StateView, StreamCauses, Termination,
     TokenIssue, Warm,
 };
@@ -946,6 +946,18 @@ fn fleets_is_compliant_under_bwrap() -> gang_e2e::Result<()> {
 #[test]
 fn fleets_is_compliant_under_noop() -> gang_e2e::Result<()> {
     assert_compliant(&fleets_checks(Sandbox::Noop, Behaviour::COMPLIANT)?);
+    Ok(())
+}
+
+// Bazel may send the second action of the pair only once the first ran, when a small worker
+// already serves and packs it: the scenario must still see the pair placed together.
+#[test]
+fn fleets_is_compliant_when_bazel_sends_the_pair_one_by_one() -> gang_e2e::Result<()> {
+    let behaviour = Behaviour {
+        arrival: Arrival::OneByOne,
+        ..Behaviour::COMPLIANT
+    };
+    assert_compliant(&fleets_checks(Sandbox::Bwrap, behaviour)?);
     Ok(())
 }
 

@@ -21,8 +21,11 @@ pub(crate) struct CaSigner {
 
 impl CaSigner {
     /// Loads the CA key at `path`, generating it on first use, and caches its public key.
-    pub(crate) fn load_or_create(path: &Path) -> Result<Self, LocalError> {
-        let key = key_file::load_or_create(path)?;
+    pub(crate) fn load_or_create(
+        path: &Path,
+        dir: &gang_os::fs::PrivateDir,
+    ) -> Result<Self, LocalError> {
+        let key = key_file::load_or_create_in(path, dir)?;
         let public_key_der = key
             .verifying_key()
             .to_public_key_der()
@@ -124,8 +127,8 @@ impl KeyPaths {
     /// Creates the directory when missing and loads the key. An existing directory must already
     /// be private. Key creation is atomic, and the signer serializes first-use initialization.
     fn load(&self) -> Result<CaSigner, LocalError> {
-        gang_os::fs::require_private_dir(&self.directory)?;
-        CaSigner::load_or_create(&self.file)
+        let dir = gang_os::fs::require_private_dir(&self.directory)?;
+        CaSigner::load_or_create(&self.file, &dir)
     }
 }
 
@@ -234,7 +237,8 @@ mod tests {
             .ok_or("loaded a key from a 0755 directory")?;
         assert!(matches!(
             error,
-            LocalError::PrivateDir(gang_os::fs::PrivateDirError::NotPrivate { mode: 0o755, .. })
+            LocalError::PrivateDir(gang_os::fs::PrivateDirError::NotPrivate { mode, .. })
+                if mode == gang_os::fs::Mode::from_bits_retain(0o755)
         ));
         assert!(matches!(
             signer.public_key().await,

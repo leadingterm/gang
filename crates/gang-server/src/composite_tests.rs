@@ -6,7 +6,7 @@ use gang_config::DashboardConfig;
 use gang_spi::LoginClient;
 use gang_types::{ClientSecret, NonZeroDuration, ProviderName, SessionMaxAge};
 use http::StatusCode;
-use http::header::{CONTENT_TYPE, HeaderValue, IF_NONE_MATCH};
+use http::header::{CONTENT_TYPE, HeaderValue, IF_NONE_MATCH, LOCATION};
 
 use crate::composite::is_ui_path;
 use crate::{LoginSettings, ServerSettings};
@@ -34,6 +34,45 @@ fn settings(enabled: bool) -> ServerSettings {
         }),
         ..tls_settings()
     }
+}
+
+#[tokio::test]
+async fn enabled_dashboard_sends_the_root_to_the_dashboard() {
+    let (parts, _dials, handles) = tls_parts();
+    serve(
+        parts,
+        settings(true),
+        handles.scheduler,
+        |controller| async move {
+            for (method, path) in [("GET", "/"), ("HEAD", "/"), ("GET", "/?x=1")] {
+                let response = controller
+                    .call_api(api_request(method, path, None, None))
+                    .await;
+                assert_eq!(response.headers()[LOCATION], "/ui/", "{method} {path}");
+                let reply = read(response).await;
+                assert_eq!(reply.status, StatusCode::FOUND, "{method} {path}");
+                assert!(reply.body.is_empty(), "{method} {path}");
+            }
+
+            let reply = read(
+                controller
+                    .call_api(api_request("POST", "/", None, None))
+                    .await,
+            )
+            .await;
+            assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+
+            let token = mint_token(&controller, "example-idp", "admin-proof").await;
+            let reply = read(
+                controller
+                    .call_api(api_request("GET", "/", Some(&token), None))
+                    .await,
+            )
+            .await;
+            assert_eq!(reply.status, StatusCode::FOUND);
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -121,7 +160,7 @@ async fn disabled_dashboard_routes_ui_paths_to_api() {
         settings(false),
         handles.scheduler,
         |controller| async move {
-            for path in ["/ui", "/ui/x", "/ui/login"] {
+            for path in ["/", "/ui", "/ui/x", "/ui/login"] {
                 let response = controller
                     .call_api(api_request("GET", path, None, None))
                     .await;

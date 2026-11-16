@@ -1,7 +1,7 @@
 use std::io::ErrorKind;
 use std::path::Path;
 
-use gang_os::fs::{PRIVATE_FILE, ensure_private_dir, read_optional, write_new_atomic};
+use gang_os::fs::{PRIVATE_FILE, PrivateDir, ensure_private_dir};
 use p256::ecdsa::SigningKey;
 use p256::elliptic_curve::Generate;
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey};
@@ -13,9 +13,22 @@ use crate::errors::LocalError;
 /// The new key is published atomically and never replaces an existing file, so two racing first
 /// starts agree on one key: the loser re-reads the winner's file. The file is created owner-only.
 pub(crate) fn load_or_create(path: &Path) -> Result<SigningKey, LocalError> {
-    match read_optional(path)? {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let dir = ensure_private_dir(parent)?;
+    load_or_create_in(path, &dir)
+}
+
+/// Loads or creates a key using the already verified containing directory.
+pub(crate) fn load_or_create_in(path: &Path, dir: &PrivateDir) -> Result<SigningKey, LocalError> {
+    let name = path.file_name().ok_or_else(|| {
+        gang_os::PathIo::new("read key file", path, ErrorKind::InvalidInput.into())
+    })?;
+    match dir.read_optional(name)? {
         Some(der) => decode(path, &der),
-        None => create(path),
+        None => create(path, dir),
     }
 }
 
@@ -25,23 +38,20 @@ fn decode(path: &Path, der: &[u8]) -> Result<SigningKey, LocalError> {
     })
 }
 
-fn create(path: &Path) -> Result<SigningKey, LocalError> {
+fn create(path: &Path, dir: &PrivateDir) -> Result<SigningKey, LocalError> {
     let key = SigningKey::generate();
     let der = key.to_pkcs8_der().map_err(|_| LocalError::Key {
         path: path.to_path_buf(),
     })?;
 
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        ensure_private_dir(parent)?;
-    }
-    if write_new_atomic(path, der.as_bytes(), PRIVATE_FILE)? {
+    let name = path.file_name().ok_or_else(|| {
+        gang_os::PathIo::new("write key file", path, ErrorKind::InvalidInput.into())
+    })?;
+    if dir.write_new_atomic(name, der.as_bytes(), PRIVATE_FILE)? {
         return Ok(key);
     }
 
-    let existing = read_optional(path)?.ok_or_else(|| {
+    let existing = dir.read_optional(name)?.ok_or_else(|| {
         LocalError::Io(gang_os::PathIo::new(
             "read key file",
             path,

@@ -9,6 +9,7 @@
 //! - [`fork_gate`]: the process-wide gate between lifetime-lock users and child spawns.
 //! - [`with_subscriber`]: runs a closure under a scoped tracing subscriber that other test threads cannot blind.
 //! - [`ChildTest`]: a test of the running binary that another test re-executes in a child process and requires to complete.
+//! - `run_answering`: drives interactive commands on a pseudo-terminal on Unix.
 //! - [`TestResult`]: the result type test functions return.
 //! - [`assert_sources_not_repeated`]: the error-message check for `every_variant()` tests.
 //! - [`park_then_signal`]: a wrapper that signals once its future first parks, so tests can order wake-ups.
@@ -46,6 +47,10 @@ mod limits;
 mod park;
 mod plugins;
 mod provisioner;
+/// Shared contract checks for `ProvisionerPort` implementations.
+pub mod provisioner_contract;
+#[cfg(unix)]
+mod pty;
 mod repository;
 /// The contract suite that every `StateRepositoryPort` implementation must pass.
 pub mod repository_contract;
@@ -72,6 +77,8 @@ pub use plugins::{
     TestPluginSet, TestPlugins,
 };
 pub use provisioner::FakeProvisioner;
+#[cfg(unix)]
+pub use pty::{PtyOutput, run_answering};
 pub use repository::FakeRepository;
 pub use sandbox::{ScriptedSandbox, StartedAction};
 pub use scheduler::{

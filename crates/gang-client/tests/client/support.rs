@@ -142,6 +142,7 @@ pub fn token_info(
         remote_cache: Url::parse("grpcs://cache.example:443").expect("cache url parses"),
         ca_certificate: with_ca.then(|| fixture().ca.clone()),
         default_isa: Isa::X86_64,
+        version: None,
         authentication: Authentication::Token(TokenAuthentication {
             login: providers
                 .iter()
@@ -166,6 +167,7 @@ pub fn no_auth_info() -> Server<serde_json::Value> {
         remote_cache: Url::parse("grpcs://cache.example:443").expect("cache url parses"),
         ca_certificate: None,
         default_isa: Isa::X86_64,
+        version: None,
         authentication: Authentication::None(NoAuthentication {}),
     }
 }
@@ -522,6 +524,9 @@ async fn dispatch(
     let mut state = shared.lock();
     let bearer = bearer_token(&headers);
     let bearer_route = route.permission.is_some();
+    if *route == routes::GET_SESSION {
+        state.calls.push((uri.path().to_owned(), bearer.clone()));
+    }
     if bearer_route {
         state.calls.push((uri.path().to_owned(), bearer.clone()));
     }
@@ -538,6 +543,15 @@ async fn dispatch(
             Json(state.info.clone()),
         )
             .into_response()
+    } else if *route == routes::GET_SESSION {
+        let principal = authorized(&state, bearer.as_deref())
+            .then_some("principals/google%3Auser%40example.org");
+        Json(serde_json::json!({
+            "name": "session",
+            "principal": principal,
+            "permissions": []
+        }))
+        .into_response()
     } else if *route == routes::AUTHENTICATE_SESSION {
         authenticate(&mut state, &body)
     } else if *route == routes::CREATE_DEVICE_AUTHORIZATION

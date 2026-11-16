@@ -6,7 +6,7 @@ import { earlierMore } from "../client.ts";
 import { EVENT_KINDS, eventKind, idOf, ms, type EventKind, type UnixMs } from "../wire-parse.ts";
 import type { ScalingEvent } from "../wire.ts";
 import { clock, day } from "../format.ts";
-import { Empty, EVENT_VIEW, FleetFilter, Glyph, Section, useClient, useNowStep } from "../ui.tsx";
+import { Empty, EVENT_VIEW, FleetFilter, Glyph, Ident, Section, useClient, useNowStep } from "../ui.tsx";
 import { EventRow } from "./overview.tsx";
 
 /** The lanes' span. */
@@ -55,8 +55,9 @@ export const Activity = () => {
   const earlier = client.earlier.value;
   const [hidden, setHidden] = useState<ReadonlySet<EventKind>>(new Set());
   const [fleet, setFleet] = useState("");
-  const now = useNowStep(STEP_MS);
+  const stepped = useNowStep(STEP_MS);
   if (!state) return null;
+  const now = Math.max(stepped, ms(state.updateTime));
   const start = now - LANES_MS;
   const all = [...(earlier.kind === "loaded" ? earlier.events : []), ...state.events];
   if (all.length === 0) {
@@ -104,7 +105,7 @@ export const Activity = () => {
               onClick={() => setFleet(fleet === f.name ? "" : f.name)}
             >
               <span class="lanes__name">
-                {idOf(f.name)}
+                <Ident text={idOf(f.name)} />
                 <span class="visually-hidden">: show only this fleet's events</span>
               </span>
               <span class="lanes__track" aria-hidden="true">

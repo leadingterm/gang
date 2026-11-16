@@ -10,8 +10,8 @@ use gang_e2e::{Check, Outcome, follow, names};
 use gang_wire::name::Collection;
 use gang_wire::{
     Cause, Closed, ClosedReason, Delta, Demand, Event, EventChange, Fleet, Frame, Instance,
-    InstanceCounts, InstanceSize, Keyed, Lifecycle, Pass, PassState, Phase, Policy, Queue, State,
-    Tick, Worker, WorkerCounts, name,
+    InstanceCounts, InstanceSize, Keyed, Lifecycle, Pass, PassState, Phase, Policy, Queue, Recent,
+    State, Tick, Worker, WorkerCounts, name,
 };
 
 const FLEET: &str = "local-worker-x86-64";
@@ -53,6 +53,7 @@ fn fleet(in_service: u32) -> Fleet {
             boot_grace: Duration::from_secs(30),
         },
         desired: in_service,
+        launch_failure: None,
         instances: InstanceCounts {
             pending: 0,
             in_service,
@@ -87,6 +88,7 @@ fn worker(phase: Phase) -> Worker {
         slots: Some(4),
         paused: false,
         launch_time: at(0),
+        phases: Vec::new(),
     }
 }
 
@@ -118,6 +120,7 @@ fn state(seq: u64, in_service: u32, workers: Vec<Worker>, completed: u64) -> Sta
         events: Vec::new(),
         events_limit: 100,
         completed,
+        recent: Recent::default(),
         principals_epoch: 0,
     }
 }
@@ -172,6 +175,7 @@ fn delta(base: u64, seq: u64, events: Vec<Event>) -> Delta {
         actions: None,
         events,
         completed: None,
+        recent: None,
         principals_epoch: None,
     }
 }

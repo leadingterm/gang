@@ -1,14 +1,15 @@
 //! The local fleet. Instances are worker processes; the record files and the
-//! desired-capacity files are the only state, so a restarted server sees the
-//! same fleet.
+//! desired-capacity files persist across server restarts. Spawn failures are kept
+//! in memory until a launch succeeds or the request is met.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use gang_clock::Clock;
-use gang_spi::{FleetInstance, FleetSupply, InstanceExit};
+use gang_spi::{FleetInstance, FleetSupply, InstanceExit, LaunchFailure};
 use gang_types::{Fleet, FleetName, InstanceId, InstanceLifecycle, NonZeroDuration};
 use parking_lot::Mutex;
 
@@ -45,6 +46,8 @@ pub(crate) struct LocalFleet<P: Processes, C: Clock> {
     terminate_grace: NonZeroDuration,
     /// Early exits not yet reported, with their fleet; `supply` hands a fleet's exits out.
     pending_exits: Mutex<Vec<(FleetName, InstanceExit)>>,
+    /// The most recent failed spawn for each fleet.
+    launch_failures: Mutex<HashMap<FleetName, String>>,
 }
 
 impl<P: Processes, C: Clock> LocalFleet<P, C> {
@@ -68,6 +71,7 @@ impl<P: Processes, C: Clock> LocalFleet<P, C> {
             relaunch_backoff,
             terminate_grace,
             pending_exits: Mutex::new(Vec::new()),
+            launch_failures: Mutex::new(HashMap::new()),
         }
     }
 
@@ -88,9 +92,9 @@ impl<P: Processes, C: Clock> LocalFleet<P, C> {
 
     /// Overwrites `into` with the desired capacity and the live instances of `fleet`.
     ///
-    /// Dead records of `fleet` are reaped and replaced first, so the reported fleet
-    /// already holds the persisted desired capacity. The `instances` buffer is
-    /// cleared and refilled, never replaced; the order of instances and exits is unspecified.
+    /// Dead records of `fleet` are reaped and replacements are attempted first.
+    /// The `instances` buffer is cleared and refilled, never replaced; the
+    /// order of instances and exits is unspecified.
     pub(crate) fn supply(
         &self,
         fleet: Fleet<'_, LocalFleetOptions>,
@@ -98,9 +102,10 @@ impl<P: Processes, C: Clock> LocalFleet<P, C> {
     ) -> Result<(), LocalError> {
         self.processes.reap();
         into.warm = 0;
+        into.abandoned = 0;
         into.instances.clear();
         into.exits.clear();
-        self.converge(fleet, &mut |record: &InstanceRecord| {
+        self.converge(fleet, None, &mut |record: &InstanceRecord| {
             into.instances.push(FleetInstance {
                 lifecycle: if record.is_terminating() {
                     InstanceLifecycle::Terminating
@@ -113,6 +118,13 @@ impl<P: Processes, C: Clock> LocalFleet<P, C> {
             });
         })?;
         into.desired = self.records.desired(fleet.name)?;
+        into.launch_failure =
+            self.launch_failures
+                .lock()
+                .get(fleet.name)
+                .map(|reason| LaunchFailure {
+                    reason: reason.clone(),
+                });
         let mut pending = self.pending_exits.lock();
         let mut index = 0;
         while index < pending.len() {
@@ -125,20 +137,16 @@ impl<P: Processes, C: Clock> LocalFleet<P, C> {
         Ok(())
     }
 
-    /// Persists the larger of `desired` and the persisted desired capacity, then
-    /// launches workers until the live, non-terminating count reaches it. Lowering
-    /// `desired` never lowers it and never stops a worker; scale-in is done by
-    /// [`LocalFleet::terminate`].
+    /// Persists the requested capacity, clamped to the serving count, and
+    /// launches missing workers. Lowering it never stops a worker; scale-in is
+    /// done by [`LocalFleet::terminate`].
     pub(crate) fn set_desired_capacity(
         &self,
         fleet: Fleet<'_, LocalFleetOptions>,
         desired: u32,
     ) -> Result<(), LocalError> {
         self.processes.reap();
-        if desired > self.records.desired(fleet.name)? {
-            self.records.set_desired(fleet.name, desired)?;
-        }
-        self.converge(fleet, &mut |_: &InstanceRecord| {})
+        self.converge(fleet, Some(desired), &mut |_: &InstanceRecord| {})
     }
 
     /// Drains one instance: marks it terminating and signals its process, or removes it outright
@@ -259,6 +267,7 @@ impl<P: Processes, C: Clock> LocalFleet<P, C> {
     fn converge(
         &self,
         fleet: Fleet<'_, LocalFleetOptions>,
+        requested: Option<u32>,
         on_instance: &mut impl FnMut(&InstanceRecord),
     ) -> Result<(), LocalError> {
         let now = self.clock.wall();
@@ -295,11 +304,18 @@ impl<P: Processes, C: Clock> LocalFleet<P, C> {
             }
             on_instance(&record);
         }
-        if pending_retirement {
+        let desired = if let Some(requested) = requested {
+            let desired = requested.max(serving);
+            self.records.set_desired(fleet.name, desired)?;
+            desired
+        } else {
+            self.records.desired(fleet.name)?
+        };
+        if serving >= desired {
+            self.launch_failures.lock().remove(fleet.name);
             return Ok(());
         }
-        let desired = self.records.desired(fleet.name)?;
-        if serving >= desired {
+        if pending_retirement {
             return Ok(());
         }
         let backing_off = self
@@ -310,7 +326,10 @@ impl<P: Processes, C: Clock> LocalFleet<P, C> {
             return Ok(());
         }
         for _ in serving..desired {
-            let record = self.spawn_one(fleet)?;
+            let Some(record) = self.spawn_one(fleet)? else {
+                break;
+            };
+            self.launch_failures.lock().remove(fleet.name);
             on_instance(&record);
         }
         Ok(())
@@ -319,7 +338,10 @@ impl<P: Processes, C: Clock> LocalFleet<P, C> {
     /// Writes the worker's record before starting it, so mock IMDS can authorize its first request,
     /// then records its pid. The process spawn takes the worker's lifetime lock. A failed spawn
     /// removes the record; a failed pid update signals the new process.
-    fn spawn_one(&self, fleet: Fleet<'_, LocalFleetOptions>) -> Result<InstanceRecord, LocalError> {
+    fn spawn_one(
+        &self,
+        fleet: Fleet<'_, LocalFleetOptions>,
+    ) -> Result<Option<InstanceRecord>, LocalError> {
         let id = self.records.next_instance()?;
         let dir = self.layout.instance_dir(&id);
         gang_os::fs::ensure_private_dir(&dir)?;
@@ -351,7 +373,10 @@ impl<P: Processes, C: Clock> LocalFleet<P, C> {
             Ok(pid) => pid,
             Err(error) => {
                 let _ = self.records.remove(&record.id);
-                return Err(error);
+                self.launch_failures
+                    .lock()
+                    .insert(fleet.name.clone(), error.to_string());
+                return Ok(None);
             }
         };
         record.pid = Some(pid);
@@ -359,7 +384,7 @@ impl<P: Processes, C: Clock> LocalFleet<P, C> {
             let _ = self.processes.terminate(pid);
             return Err(error);
         }
-        Ok(record)
+        Ok(Some(record))
     }
 }
 
@@ -653,9 +678,11 @@ mod tests {
         assert_eq!(
             supply,
             FleetSupply {
+                abandoned: 0,
                 warm: 0,
                 exits: Vec::new(),
                 desired: 2,
+                launch_failure: None,
                 instances: vec![
                     in_service("local-1", launched_at),
                     in_service("local-2", launched_at),
@@ -786,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn set_desired_capacity_never_lowers_the_desired_capacity() {
+    fn set_desired_capacity_withdraws_unborn_without_stopping_workers() {
         let _gate = gang_testkit::fork_gate::lock_user();
         let dir = TempDir::new().unwrap();
         let layout = layout_in(dir.path());
@@ -796,20 +823,19 @@ mod tests {
         let name = fleet_name("local");
         let fleet = fleet_view(&name, Isa::X86_64);
 
-        manager.set_desired_capacity(fleet, 3).unwrap();
         manager.set_desired_capacity(fleet, 1).unwrap();
-
+        *processes.fail_next_spawn.lock() = true;
+        manager.set_desired_capacity(fleet, 4).unwrap();
+        manager.set_desired_capacity(fleet, 0).unwrap();
+        assert_eq!(manager.records().desired(&name).unwrap(), 1);
         assert!(processes.terminated.lock().is_empty());
-        assert_eq!(processes.launched(), 3);
-        let supply = supply_of(&manager, fleet);
-        assert_eq!(supply.desired, 3);
-        assert_eq!(supply.instances.len(), 3);
-        assert!(
-            supply
-                .instances
-                .iter()
-                .all(|i| i.lifecycle == InstanceLifecycle::InService)
-        );
+        assert_eq!(processes.launched(), 1);
+        assert_eq!(supply_of(&manager, fleet).instances.len(), 1);
+
+        manager.set_desired_capacity(fleet, 2).unwrap();
+        assert_eq!(processes.launched(), 2);
+        assert_eq!(supply_of(&manager, fleet).desired, 2);
+        assert!(processes.terminated.lock().is_empty());
     }
 
     #[test]
@@ -1151,9 +1177,11 @@ mod tests {
         assert_eq!(
             supply_of(&manager, fleet),
             FleetSupply {
+                abandoned: 0,
                 warm: 0,
                 exits: Vec::new(),
                 desired: 1,
+                launch_failure: None,
                 instances: vec![
                     FleetInstance {
                         id: target.clone(),
@@ -1171,9 +1199,11 @@ mod tests {
         assert_eq!(
             supply_of(&manager, fleet),
             FleetSupply {
+                abandoned: 0,
                 warm: 0,
                 exits: Vec::new(),
                 desired: 1,
+                launch_failure: None,
                 instances: vec![in_service("local-2", launched_at)],
             }
         );
@@ -1235,18 +1265,22 @@ mod tests {
         assert_eq!(
             supply_of(&manager, small),
             FleetSupply {
+                abandoned: 0,
                 warm: 0,
                 exits: Vec::new(),
                 desired: 1,
+                launch_failure: None,
                 instances: vec![in_service("local-1", launched_at)],
             }
         );
         assert_eq!(
             supply_of(&manager, big),
             FleetSupply {
+                abandoned: 0,
                 warm: 0,
                 exits: Vec::new(),
                 desired: 2,
+                launch_failure: None,
                 instances: vec![
                     in_service("local-2", launched_at),
                     in_service("local-3", launched_at),
@@ -1275,9 +1309,11 @@ mod tests {
         assert_eq!(
             supply_of(&manager, small),
             FleetSupply {
+                abandoned: 0,
                 warm: 0,
                 exits: Vec::new(),
                 desired: 0,
+                launch_failure: None,
                 instances: vec![FleetInstance {
                     id: id("local-1"),
                     lifecycle: InstanceLifecycle::Terminating,
@@ -1289,9 +1325,11 @@ mod tests {
         assert_eq!(
             supply_of(&manager, big),
             FleetSupply {
+                abandoned: 0,
                 warm: 0,
                 exits: Vec::new(),
                 desired: 2,
+                launch_failure: None,
                 instances: vec![
                     in_service("local-2", launched_at),
                     in_service("local-3", launched_at),
@@ -1320,18 +1358,22 @@ mod tests {
         assert_eq!(
             supply_of(&manager, x86),
             FleetSupply {
+                abandoned: 0,
                 warm: 0,
                 exits: Vec::new(),
                 desired: 1,
+                launch_failure: None,
                 instances: vec![in_service("local-1", launched_at)],
             }
         );
         assert_eq!(
             supply_of(&manager, arm),
             FleetSupply {
+                abandoned: 0,
                 warm: 0,
                 exits: Vec::new(),
                 desired: 2,
+                launch_failure: None,
                 instances: vec![
                     in_service("local-2", launched_at),
                     in_service("local-3", launched_at),
@@ -1497,9 +1539,11 @@ mod tests {
         assert_eq!(
             supply_of(&manager, fleet),
             FleetSupply {
+                abandoned: 0,
                 warm: 0,
                 exits: Vec::new(),
                 desired: 1,
+                launch_failure: None,
                 instances: vec![
                     FleetInstance {
                         id: target.clone(),
@@ -1518,9 +1562,11 @@ mod tests {
         assert_eq!(
             supply_of(&manager, fleet),
             FleetSupply {
+                abandoned: 0,
                 warm: 0,
                 exits: Vec::new(),
                 desired: 1,
+                launch_failure: None,
                 instances: vec![in_service("local-2", launched_at)],
             }
         );
@@ -1856,7 +1902,8 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_spawn_leaves_no_instance_directory() -> Result<(), Box<dyn std::error::Error>> {
+    fn failed_spawn_is_reported_until_a_successful_spawn() -> Result<(), Box<dyn std::error::Error>>
+    {
         let _gate = gang_testkit::fork_gate::lock_user();
         let dir = TempDir::new()?;
         let layout = layout_in(dir.path());
@@ -1864,18 +1911,58 @@ mod tests {
         let clock = clock();
         let manager = new_manager(&layout, processes.clone(), &clock);
         let name = fleet_name("local");
+        let fleet = fleet_view(&name, Isa::X86_64);
         let instance = id("local-1");
         *processes.fail_next_spawn.lock() = true;
-
-        assert!(
-            manager
-                .set_desired_capacity(fleet_view(&name, Isa::X86_64), 1)
-                .is_err()
-        );
-
+        manager.set_desired_capacity(fleet, 1)?;
         assert!(!layout.instance_dir(&instance).exists());
         assert!(manager.records().read(&instance)?.is_none());
+
+        *processes.fail_next_spawn.lock() = true;
+        let supply = supply_of(&manager, fleet);
+        let expected = LocalError::Io(gang_os::PathIo::new(
+            "spawn worker",
+            &launch_spec().program,
+            std::io::Error::other("spawn refused"),
+        ))
+        .to_string();
+        assert_eq!(
+            supply.launch_failure.as_ref().map(|f| f.reason.as_str()),
+            Some(expected.as_str())
+        );
+        assert!(supply.instances.is_empty());
+        let other_name = fleet_name("other");
+        assert!(
+            supply_of(&manager, fleet_view(&other_name, Isa::X86_64))
+                .launch_failure
+                .is_none()
+        );
+
+        let recovered = supply_of(&manager, fleet);
+        assert!(recovered.launch_failure.is_none());
+        assert_eq!(recovered.instances.len(), 1);
         Ok(())
+    }
+
+    #[test]
+    fn withdrawing_failed_request_to_zero_clears_failure() {
+        let _gate = gang_testkit::fork_gate::lock_user();
+        let dir = TempDir::new().unwrap();
+        let layout = layout_in(dir.path());
+        let processes = FakeProcesses::new();
+        let clock = clock();
+        let manager = new_manager(&layout, processes.clone(), &clock);
+        let name = fleet_name("local");
+        let fleet = fleet_view(&name, Isa::X86_64);
+        *processes.fail_next_spawn.lock() = true;
+        manager.set_desired_capacity(fleet, 1).unwrap();
+        manager.set_desired_capacity(fleet, 0).unwrap();
+        assert_eq!(manager.records().desired(&name).unwrap(), 0);
+        let supply = supply_of(&manager, fleet);
+        assert!(supply.instances.is_empty());
+        assert!(supply.launch_failure.is_none());
+        assert_eq!(processes.launched(), 0);
+        assert!(processes.terminated.lock().is_empty());
     }
 
     #[test]

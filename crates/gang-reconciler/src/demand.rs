@@ -7,7 +7,7 @@
 //!
 //! use gang_config::{FleetPolicy, InstanceBounds};
 //! use gang_reconciler::Demand;
-//! use gang_types::{FleetName, Isa, NonZeroBytes, Resources, nonzero_u32};
+//! use gang_types::{ActionResources, FleetName, Isa, NonZeroBytes, nonzero_u32};
 //!
 //! let policy = FleetPolicy {
 //!     name: FleetName::try_new("workers")?,
@@ -24,7 +24,7 @@
 //!
 //! let mut demand = Demand::default();
 //! for _ in 0..17 {
-//!     demand.add_queued(Resources::default());
+//!     demand.add_queued(ActionResources::default());
 //! }
 //! assert_eq!(demand.instances(&policy), 2);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
@@ -33,22 +33,22 @@
 use std::num::NonZeroU64;
 
 use gang_config::FleetPolicy;
-use gang_types::{FleetSet, Resources, SaturatingInto};
+use gang_types::{ActionResources, FleetSet, SaturatingInto};
 
 /// Work waiting for or occupying one fleet.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Demand {
     actions: u64,
-    vcpus: u64,
+    millicores: u64,
     memory: u64,
     disk: u64,
 }
 
 impl Demand {
     /// Adds a queued action: one action slot and the resources it requests.
-    pub fn add_queued(&mut self, resources: Resources) {
+    pub fn add_queued(&mut self, resources: ActionResources) {
         self.actions = self.actions.saturating_add(1);
-        self.vcpus = self.vcpus.saturating_add(u64::from(resources.vcpus));
+        self.millicores = self.millicores.saturating_add(resources.cpu_millicores);
         self.memory = self.memory.saturating_add(resources.memory.get());
         self.disk = self.disk.saturating_add(resources.disk.get());
     }
@@ -64,10 +64,10 @@ impl Demand {
         self.actions
     }
 
-    /// Returns the vCPUs of the queued actions whose resources were measured.
+    /// Returns the total queued CPU rounded up to whole vCPUs.
     #[must_use]
-    pub const fn vcpus(&self) -> u64 {
-        self.vcpus
+    pub fn vcpus(&self) -> u64 {
+        self.millicores.div_ceil(1000)
     }
 
     /// Returns the memory in bytes of the queued actions whose resources were measured.
@@ -104,7 +104,9 @@ impl Demand {
             self.actions,
             NonZeroU64::from(policy.target_actions_per_instance),
         );
-        let by_vcpus = div_ceil(self.vcpus, NonZeroU64::from(policy.vcpus_per_instance));
+        let capacity = NonZeroU64::from(policy.vcpus_per_instance)
+            .saturating_mul(NonZeroU64::MIN.saturating_add(999));
+        let by_vcpus = div_ceil(self.millicores, capacity);
         let by_memory = div_ceil(self.memory, policy.memory_per_instance.as_nonzero_u64());
         let by_disk = div_ceil(self.disk, policy.disk_per_instance.as_nonzero_u64());
         by_actions.max(by_vcpus).max(by_memory).max(by_disk)
@@ -126,7 +128,7 @@ fn div_ceil(total: u64, per: NonZeroU64) -> u64 {
 /// caller adds the action to the demand of the chosen fleet.
 pub(crate) fn place<'a>(
     candidates: FleetSet,
-    resources: Resources,
+    resources: ActionResources,
     fleets: impl Fn(usize) -> Option<(&'a FleetPolicy, Demand)>,
 ) -> Option<usize> {
     let mut last = None;
@@ -151,7 +153,7 @@ mod tests {
 
     use gang_config::InstanceBounds;
     use gang_testkit::fleet_policy;
-    use gang_types::{Bytes, NameError, NonZeroBytes, Resources, nonzero_u32};
+    use gang_types::{Bytes, NameError, NonZeroBytes, nonzero_u32};
 
     use super::*;
 
@@ -178,9 +180,9 @@ mod tests {
         })
     }
 
-    fn resources(vcpus: u32, memory: Bytes) -> Resources {
-        Resources {
-            vcpus,
+    fn resources(cpu_millicores: u64, memory: Bytes) -> ActionResources {
+        ActionResources {
+            cpu_millicores,
             memory,
             disk: Bytes::gib(1),
         }
@@ -201,7 +203,7 @@ mod tests {
         demands: &mut [Demand],
         policies: &[FleetPolicy],
         candidates: FleetSet,
-        resources: Resources,
+        resources: ActionResources,
     ) -> Option<usize> {
         let index = place(candidates, resources, |index| {
             policies.get(index).zip(demands.get(index).copied())
@@ -211,13 +213,69 @@ mod tests {
     }
 
     #[test]
+    fn fractional_cpu_is_summed_before_rounding() -> Result<(), Box<dyn std::error::Error>> {
+        let policy = FleetPolicy {
+            vcpus_per_instance: nonzero_u32(8),
+            target_actions_per_instance: nonzero_u32(32),
+            ..policy()?
+        };
+        let mut demand = Demand::default();
+        for _ in 0..16 {
+            demand.add_queued(ActionResources {
+                cpu_millicores: 250,
+                ..ActionResources::default()
+            });
+        }
+        assert_eq!(
+            demand.instances(&policy),
+            1,
+            "fractional CPU must be summed before rounding"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn queued_cpu_has_one_owner() -> Result<(), Box<dyn std::error::Error>> {
+        let policy = FleetPolicy {
+            vcpus_per_instance: nonzero_u32(2),
+            ..policy()?
+        };
+        let mut four_cores = Demand::default();
+        four_cores.add_queued(ActionResources {
+            cpu_millicores: 4000,
+            ..ActionResources::default()
+        });
+        assert_eq!(
+            four_cores.instances(&policy),
+            2,
+            "4000m requires two 2-vCPU instances"
+        );
+        let mut fractional = Demand::default();
+        fractional.add_queued(ActionResources {
+            cpu_millicores: 250,
+            ..ActionResources::default()
+        });
+        assert_eq!(
+            fractional.instances(&policy),
+            1,
+            "250m requires one instance"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn single_candidate_is_charged() -> Result<(), Box<dyn std::error::Error>> {
         let policies = [one_action_per_instance(2)?, one_action_per_instance(10)?];
         let mut demands = vec![Demand::default(); 2];
         let candidates = FleetSet::try_from_indices([1])?;
 
         assert_eq!(
-            attribute(&mut demands, &policies, candidates, Resources::default()),
+            attribute(
+                &mut demands,
+                &policies,
+                candidates,
+                ActionResources::default()
+            ),
             Some(1)
         );
         assert_eq!(demands[0], Demand::default());
@@ -233,7 +291,14 @@ mod tests {
         let candidates = FleetSet::prefix(2)?;
 
         let charged: Vec<_> = (0..3)
-            .map(|_| attribute(&mut demands, &policies, candidates, Resources::default()))
+            .map(|_| {
+                attribute(
+                    &mut demands,
+                    &policies,
+                    candidates,
+                    ActionResources::default(),
+                )
+            })
             .collect();
 
         assert_eq!(charged, [Some(0), Some(0), Some(1)]);
@@ -248,11 +313,21 @@ mod tests {
         let mut demands = vec![Demand::default(); 2];
         let candidates = FleetSet::prefix(2)?;
         for _ in 0..12 {
-            attribute(&mut demands, &policies, candidates, Resources::default());
+            attribute(
+                &mut demands,
+                &policies,
+                candidates,
+                ActionResources::default(),
+            );
         }
 
         assert_eq!(
-            attribute(&mut demands, &policies, candidates, Resources::default()),
+            attribute(
+                &mut demands,
+                &policies,
+                candidates,
+                ActionResources::default()
+            ),
             Some(1)
         );
         assert!(!demands[1].fits(&policies[1]));
@@ -272,7 +347,7 @@ mod tests {
                 &mut demands,
                 &policies,
                 FleetSet::EMPTY,
-                Resources::default()
+                ActionResources::default()
             ),
             None
         );
@@ -281,7 +356,7 @@ mod tests {
                 &mut demands,
                 &policies,
                 FleetSet::EMPTY,
-                resources(4, Bytes::gib(1))
+                resources(4000, Bytes::gib(1))
             ),
             None
         );
@@ -297,7 +372,12 @@ mod tests {
         let candidates = FleetSet::try_from_indices([1, 0])?;
 
         assert_eq!(
-            attribute(&mut demands, &policies, candidates, Resources::default()),
+            attribute(
+                &mut demands,
+                &policies,
+                candidates,
+                ActionResources::default()
+            ),
             Some(0)
         );
         assert_eq!(demands[1], Demand::default());
@@ -320,7 +400,7 @@ mod tests {
                 &mut demands,
                 &policies,
                 candidates,
-                resources(20, Bytes::new(0))
+                resources(20000, Bytes::new(0))
             ),
             Some(0)
         );
@@ -329,7 +409,7 @@ mod tests {
                 &mut demands,
                 &policies,
                 candidates,
-                resources(16, Bytes::new(0))
+                resources(16000, Bytes::new(0))
             ),
             Some(1)
         );
@@ -346,7 +426,12 @@ mod tests {
         let candidates = FleetSet::try_from_indices([7])?;
 
         assert_eq!(
-            attribute(&mut demands, &policies, candidates, Resources::default()),
+            attribute(
+                &mut demands,
+                &policies,
+                candidates,
+                ActionResources::default()
+            ),
             None
         );
         assert_eq!(demands, before);
@@ -364,11 +449,16 @@ mod tests {
 
         for _ in 0..3 {
             assert_eq!(
-                attribute(&mut demands, &policies, mixed, Resources::default()),
+                attribute(&mut demands, &policies, mixed, ActionResources::default()),
                 Some(0)
             );
             assert_eq!(
-                attribute(&mut reference, &policies, only_first, Resources::default()),
+                attribute(
+                    &mut reference,
+                    &policies,
+                    only_first,
+                    ActionResources::default()
+                ),
                 Some(0)
             );
         }

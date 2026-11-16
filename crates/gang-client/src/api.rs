@@ -17,7 +17,7 @@ use gang_wire::routes::{self, Method, Route};
 use gang_wire::{
     AuthenticateRequest, AuthenticateResponse, Certificate, CreateCertificateRequest,
     DeviceAuthorization, ErrorReason, ErrorResponse, Principal, RedeemDeviceAuthorizationRequest,
-    RevokePrincipalResponse, Server,
+    RevokePrincipalResponse, Server, Session,
 };
 use http::header::{DATE, RETRY_AFTER};
 use http::{HeaderMap, StatusCode};
@@ -99,6 +99,21 @@ impl ServerApi {
             bearer,
             &routes::GET_SERVER,
             routes::GET_SERVER.template,
+            None,
+        )
+        .await
+    }
+
+    /// Fetches the caller's session, optionally presenting its bearer token.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport, server, or response decoding error.
+    pub async fn session(&self, bearer: Option<&AccessToken>) -> Result<Session, ClientError> {
+        self.execute(
+            bearer,
+            &routes::GET_SESSION,
+            routes::GET_SESSION.template,
             None,
         )
         .await

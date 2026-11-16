@@ -156,6 +156,14 @@ pub enum ConfigError {
     #[error("dashboard.actions_stale_after must exceed dashboard.detail_interval")]
     #[fix("raise dashboard.actions_stale_after above dashboard.detail_interval")]
     StaleThresholdNotAboveRefresh,
+    /// The dashboard history window is not between one and 1440 whole steps.
+    #[error(
+        "dashboard.history_window must be 1 to 1440 whole dashboard.history_steps of whole seconds"
+    )]
+    #[fix(
+        "set dashboard.history_step to whole seconds and dashboard.history_window to a multiple of it, at most 1440 steps"
+    )]
+    HistoryWindowNotWholeSteps,
     /// `dashboard.login.provider` names no `[identity.providers]` section, or is the reserved
     /// `none`.
     #[error(
@@ -259,6 +267,7 @@ mod tests {
                 provider: provider(),
             },
             ConfigError::StaleThresholdNotAboveRefresh,
+            ConfigError::HistoryWindowNotWholeSteps,
             ConfigError::DashboardLoginProviderNotConfigured(provider()),
         ]
     }
@@ -281,6 +290,11 @@ mod tests {
         let fix =
             fix_of(&ConfigError::StaleThresholdNotAboveRefresh).expect("the variant has a fix");
         assert!(fix.contains("dashboard.actions_stale_after"), "{fix}");
+        let fix = fix_of(&ConfigError::HistoryWindowNotWholeSteps).expect("the variant has a fix");
+        assert_eq!(
+            fix,
+            "set dashboard.history_step to whole seconds and dashboard.history_window to a multiple of it, at most 1440 steps"
+        );
     }
 
     #[test]

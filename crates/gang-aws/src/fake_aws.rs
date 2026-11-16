@@ -351,7 +351,7 @@ pub(crate) struct FakeActivity {
     pub(crate) status_code: String,
     /// RFC 3339 UTC start time; `StartTimeLowerBound` compares it as an instant.
     pub(crate) start_time: String,
-    pub(crate) message: String,
+    pub(crate) message: Option<String>,
 }
 
 /// A KMS key, addressable by its ARN or alias.
@@ -736,10 +736,13 @@ fn describe_activities(state: &FakeState, params: &Parameters) -> Result<String,
     let items: String = matching
         .into_iter()
         .map(|(_, index, activity)| {
+            let status_message = activity.message.as_ref()
+                .map(|message| format!("<StatusMessage>{message}</StatusMessage>"))
+                .unwrap_or_default();
+            let message = activity.message.as_deref().unwrap_or_default();
             format!(
-                "<member><ActivityId>{ACTIVITY_ID_PREFIX}{index:012}</ActivityId><AutoScalingGroupName>{group}</AutoScalingGroupName><Cause>{message}</Cause><Description>{message}</Description><StartTime>{start}</StartTime><StatusCode>{status}</StatusCode><StatusMessage>{message}</StatusMessage><Progress>0</Progress></member>",
+                "<member><ActivityId>{ACTIVITY_ID_PREFIX}{index:012}</ActivityId><AutoScalingGroupName>{group}</AutoScalingGroupName><Cause>{message}</Cause><Description>{message}</Description><StartTime>{start}</StartTime><StatusCode>{status}</StatusCode>{status_message}<Progress>0</Progress></member>",
                 group = activity.group,
-                message = activity.message,
                 start = activity.start_time,
                 status = activity.status_code,
             )

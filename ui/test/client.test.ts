@@ -519,11 +519,6 @@ test("a snapshot keeps the loaded page only when it continues the held events", 
   assert.deepEqual(client.earlier.value, { kind: "unloaded", loading: false });
 });
 
-test("a revoked stream stops the observed span at the last frame", async () => {
-  const { env, client } = await live();
-  env.source.emit("closed", { reason: "REVOKED" });
-  assert.deepEqual(client.history.value?.gaps, [{ from: t0, to: null }]);
-});
 
 test("events identical but for their name stay distinct on the loaded page", async () => {
   const { env, client } = await live();

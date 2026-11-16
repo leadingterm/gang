@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { clock, day, duration, gib, humanize, policyDuration, splitTarget, sum, workerInstance, workerShort } from "../src/format.ts";
+import { clock, day, duration, gib, humanize, policyDuration, splitTarget, sum, workerInstance } from "../src/format.ts";
 
 const AT = Date.UTC(2026, 0, 15, 10, 9, 30);
 const WORKER = "i-0abc123-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b";
@@ -32,11 +32,15 @@ test("a target splits at its last colon", () => {
   assert.deepEqual(splitTarget("plain"), ["", "plain"]);
 });
 
-test("a worker id names its instance and a short uuid", () => {
+test("worker labels distinguish instances and preserve ids without an instance", () => {
+  const a = "i-04be3ef9b3f358c25-1f1e0567-7b3c-6f10-8a4e-1c2d3e4f5a6b";
+  const b = "i-092aaa89b3f358c25-1f1e0563-7b3c-6f10-8a4e-1c2d3e4f5a6b";
+  assert.equal(workerInstance(a), "i-04be3ef9b3f358c25");
+  assert.equal(workerInstance(b), "i-092aaa89b3f358c25");
+  assert.notEqual(workerInstance(a), workerInstance(b));
   assert.equal(workerInstance(WORKER), "i-0abc123");
   assert.equal(workerInstance("0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b"), "0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b");
-  assert.equal(workerShort(WORKER, "i-0abc123"), "0194");
-  assert.equal(workerShort("other-id", "i-0abc123"), "othe");
+  assert.equal(workerInstance("a-long-worker-id-that-does-not-name-an-instance"), "a-long-worker-id-that-does-not-name-an-instance");
 });
 
 test("times are UTC and sizes whole GiB", () => {

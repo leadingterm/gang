@@ -11,7 +11,7 @@ use gang_e2e::{
 };
 use gang_wire::{
     Actions, Cause, Event, EventChange, Frame, Instance, Lifecycle, Pass, PassState, Phase, Queue,
-    QueuedAction, SkipReason, State, Worker,
+    QueuedAction, Recent, SkipReason, State, Worker,
 };
 use parking_lot::Mutex;
 
@@ -493,6 +493,7 @@ impl World {
             events: self.ledger.clone(),
             events_limit: 1_000,
             completed: 0,
+            recent: Recent::default(),
             principals_epoch: 0,
         }
     }

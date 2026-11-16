@@ -261,6 +261,49 @@ pub async fn scaling_events_get_increasing_sequence_numbers<R: StateRepositoryPo
     Ok(())
 }
 
+/// Launch failures and withdrawals retain capacities and the provider's exact reason.
+///
+/// # Errors
+///
+/// Fails when the repository cannot write or read the events.
+///
+/// # Panics
+///
+/// Panics when the stored events differ from the originals.
+pub async fn launch_failure_and_withdrawal_round_trip<R: StateRepositoryPort>(
+    repository: &R,
+) -> TestResult {
+    let mut failed = event("w1")?;
+    failed.kind = ScalingEventKind::LaunchFailed {
+        from: 2,
+        to: 7,
+        reason: "  quota exceeded: café\nretry later  ".to_owned(),
+    };
+    let mut withdrawn = event("w2")?;
+    withdrawn.kind = ScalingEventKind::Withdrawn { from: 7, to: 2 };
+    let failed_seq = repository.record_scaling_event(&failed).await?;
+    let withdrawn_seq = repository.record_scaling_event(&withdrawn).await?;
+    let mut into = Vec::new();
+    let more = repository
+        .scaling_events(ScalingEventSeq::default(), None, limit(10)?, &mut into)
+        .await?;
+    assert!(!more);
+    assert_eq!(
+        into,
+        vec![
+            RecordedScalingEvent {
+                seq: failed_seq,
+                event: failed,
+            },
+            RecordedScalingEvent {
+                seq: withdrawn_seq,
+                event: withdrawn,
+            },
+        ]
+    );
+    Ok(())
+}
+
 /// `scaling_events` returns the newest events inside the window, oldest first, and reports
 /// `more` when events were left out. An empty window leaves the buffer empty.
 ///
@@ -508,6 +551,7 @@ macro_rules! repository_contract {
             certificates_of_lists_active_records_by_issue_time_then_serial
         );
         $crate::repository_contract!(@case $fresh, scaling_events_get_increasing_sequence_numbers);
+        $crate::repository_contract!(@case $fresh, launch_failure_and_withdrawal_round_trip);
         $crate::repository_contract!(
             @case $fresh,
             scaling_window_returns_the_newest_events_and_reports_skipped

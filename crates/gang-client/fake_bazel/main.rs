@@ -4,6 +4,9 @@
 //! - `--fake_events_from=<fixture>` copies the fixture to the path supplied through
 //!   `--build_event_json_file=<events>`; together with `--fake_record_events_path=<seen>`, it also
 //!   writes the events path text to `<seen>` and exits 0.
+//! - `--fake_events_then=<fixture>` substitutes this fixture on invocations where `<seen>`
+//!   already exists, allowing a later probe to observe changed options.
+//! - `--fake_invocations_path=<log>` appends one line for each invocation carrying the flag.
 //! - `--fake_grandchild_lock=<path>` starts this executable with `--fake_block=<path>`, waits for
 //!   it, and exits 0.
 //! - `--fake_block=<path>` takes an exclusive lock on `<path>.tmp`, renames it to `<path>` so the
@@ -12,6 +15,7 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -32,6 +36,15 @@ fn flag(arguments: &[OsString], name: &str) -> Option<PathBuf> {
 /// Starts the fake Bazel binary.
 fn main() {
     let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
+    if let Some(path) = flag(&arguments, "fake_invocations_path") {
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap_or_else(|error| fail(format!("opening invocation log: {error}")));
+        writeln!(log, "invocation")
+            .unwrap_or_else(|error| fail(format!("writing invocation log: {error}")));
+    }
 
     if let Some(path) = flag(&arguments, "fake_block") {
         let temporary = PathBuf::from(format!("{}.tmp", path.display()));
@@ -69,6 +82,11 @@ fn main() {
             .unwrap_or_else(|| fail("missing --build_event_json_file argument"));
         let seen = flag(&arguments, "fake_record_events_path")
             .unwrap_or_else(|| fail("missing --fake_record_events_path argument"));
+        let fixture = if seen.exists() {
+            flag(&arguments, "fake_events_then").unwrap_or(fixture)
+        } else {
+            fixture
+        };
         fs::copy(&fixture, &events)
             .unwrap_or_else(|error| fail(format!("copying events fixture: {error}")));
         let events_text = events

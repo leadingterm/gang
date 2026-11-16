@@ -127,6 +127,11 @@ events?: Array<ScalingEvent>,
  */
 completed?: number, 
 /**
+ * New and changed samples of `recent`, oldest first, with its `window` and `step`. They
+ * replace the client's samples from the first one's start on (see [`Recent::apply`]).
+ */
+recent?: Recent, 
+/**
  * A new principal epoch.
  */
 principalsEpoch?: number, };
@@ -201,6 +206,26 @@ from: number,
 /**
  * Size after the change.
  */
+to: number, } } | { "launchFailed": { 
+/**
+ * Instances that exist, excluding terminating instances.
+ */
+from: number, 
+/**
+ * Instances requested by the fleet.
+ */
+to: number, 
+/**
+ * The provider's failure message, verbatim.
+ */
+reason: string, } } | { "withdrawn": { 
+/**
+ * Requested instances before the withdrawal.
+ */
+from: number, 
+/**
+ * Requested instances after the withdrawal.
+ */
 to: number, } } | { "drainStarted": { 
 /**
  * Reference `workers/{worker}` of the worker that started to drain.
@@ -261,6 +286,11 @@ policy: Policy,
  * The number of instances the fleet wants.
  */
 desired: number, 
+/**
+ * Why the newest launch attempt failed while the request is unmet and no launch is in
+ * flight; absent when the request is met, a launch is in flight, or the provider cannot tell.
+ */
+launchFailure?: LaunchFailure, 
 /**
  * Instances by lifecycle.
  */
@@ -340,6 +370,12 @@ upsert?: Array<T>,
  */
 remove?: Array<string>, };
 
+export type LaunchFailure = { 
+/**
+ * The provider's failure message, verbatim.
+ */
+reason: string, };
+
 export type Lifecycle = "PENDING" | "IN_SERVICE" | "TERMINATING";
 
 export type ListEventsResponse = { 
@@ -409,6 +445,16 @@ export type PassState = "OK" | "SKIPPED";
 export type Permission = "state.read" | "principals.read" | "events.read" | "principals.revoke";
 
 export type Phase = "BUSY" | "IDLE" | "DRAINING";
+
+export type PhaseSpan = { 
+/**
+ * The phase.
+ */
+phase: Phase, 
+/**
+ * When the worker entered it.
+ */
+start: Timestamp, };
 
 export type Policy = { 
 /**
@@ -505,7 +551,26 @@ priority: number,
  * References `fleets/{fleet}` of the fleets that accept the action; empty when
  * unplaceable.
  */
-candidates: Array<string>, };
+candidates: Array<string>, 
+/**
+ * Why no fleet accepts this action; absent when a fleet accepts it.
+ */
+refusal?: string, };
+
+export type Recent = { 
+/**
+ * How far back samples reach; constant for the process.
+ */
+window: Duration, 
+/**
+ * The span of one sample; constant for the process. `window` is a whole number of steps.
+ */
+step: Duration, 
+/**
+ * One sample per step, oldest first, without holes; the last is the step in progress. At
+ * most `window / step` samples.
+ */
+samples?: Array<Sample>, };
 
 export type Role = { 
 /**
@@ -555,6 +620,32 @@ startTime: Timestamp,
  */
 priority: number, };
 
+export type Sample = { 
+/**
+ * Start of the step: a whole multiple of the step since the Unix epoch.
+ */
+start: Timestamp, 
+/**
+ * Actions that reached a terminal result during the step.
+ */
+completed: number, 
+/**
+ * Actions executing at the step's latest completed pass; 0 when `passes` is 0.
+ */
+running: number, 
+/**
+ * Actions queued at the step's latest completed pass; 0 when `passes` is 0.
+ */
+queued: number, 
+/**
+ * Control passes that completed during the step.
+ */
+passes: number, 
+/**
+ * Control passes skipped during the step.
+ */
+skipped: number, };
+
 export type ScalingEvent = { 
 /**
  * Resource name, `events/{seq}`; the sequence number is strictly increasing.
@@ -579,6 +670,26 @@ cause?: Cause, } & ({ "scaledOut": {
 from: number, 
 /**
  * Size after the change.
+ */
+to: number, } } | { "launchFailed": { 
+/**
+ * Instances that exist, excluding terminating instances.
+ */
+from: number, 
+/**
+ * Instances requested by the fleet.
+ */
+to: number, 
+/**
+ * The provider's failure message, verbatim.
+ */
+reason: string, } } | { "withdrawn": { 
+/**
+ * Requested instances before the withdrawal.
+ */
+from: number, 
+/**
+ * Requested instances after the withdrawal.
  */
 to: number, } } | { "drainStarted": { 
 /**
@@ -696,6 +807,10 @@ eventsLimit: number,
  */
 completed: number, 
 /**
+ * What this server observed over its recent window.
+ */
+recent: Recent, 
+/**
  * Epoch of the principal set, which advances when principals change.
  */
 principalsEpoch: number, };
@@ -756,7 +871,12 @@ paused: boolean,
 /**
  * When the instance launched.
  */
-launchTime: Timestamp, };
+launchTime: Timestamp, 
+/**
+ * The phases this server saw the worker in within the recent window, oldest first; the last
+ * is the current phase, starting at `phase_time`. Before the first, the phase is not recorded.
+ */
+phases?: Array<PhaseSpan>, };
 
 export type WorkerCounts = { 
 /**

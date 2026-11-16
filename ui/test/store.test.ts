@@ -72,7 +72,7 @@ test("a worker event in a delta is appended once, after the held events", () => 
   const joined: ScalingEvent = {
     name: `events/${seq}`,
     createTime: snapshot.updateTime,
-    fleet: "fleets/arm64-spot",
+    fleet: "fleets/build-worker-aarch64-spot",
     workerRegistered: { worker: "workers/i-0f00000000000001-0194d5a2-7b3c-7f10-8a4e-1c2d3e4f5a6b" },
   };
   const next = apply(snapshot, after(snapshot, { events: [joined] }));
@@ -86,6 +86,18 @@ const after = (state: State, parts: Omit<Delta, "seq" | "base" | "updateTime"> =
   base: state.seq,
   updateTime: iso(ms(state.updateTime) + 2000),
   ...parts,
+});
+
+test("a delta applies its recent increment", () => {
+  const sample = (step: number, completed: number) => ({
+    start: iso(step * 10000), completed, running: 1, queued: 2, passes: 1, skipped: 0,
+  });
+  const recent = { window: "30s", step: "10s", samples: [sample(0, 1), sample(1, 2), sample(2, 3)] };
+  const state = { ...snapshot, recent };
+  const increment = { ...recent, samples: [sample(2, 30), sample(3, 4)] };
+  assert.deepEqual(apply(state, after(state, { recent: increment })).recent, {
+    ...recent, samples: [sample(1, 2), sample(2, 30), sample(3, 4)],
+  });
 });
 
 test("a delta on another base asks for a resync", () => {

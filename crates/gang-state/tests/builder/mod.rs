@@ -19,8 +19,8 @@ use gang_spi::{
 use gang_state::{ActionsSample, Builder, Inputs, PassStatus, diff};
 use gang_testkit::{TestResult, worker_on};
 use gang_types::{
-    Bytes, FleetCatalog, FleetName, FleetProperties, FleetSet, InstanceId, InstanceLifecycle,
-    Resources, WorkerId, property,
+    ActionResources, Bytes, FleetCatalog, FleetName, FleetProperties, FleetSet, InstanceId,
+    InstanceLifecycle, WorkerId, property,
 };
 use gang_wire::name;
 use gang_wire::{Pass, PassState, SkipReason, State};
@@ -99,6 +99,7 @@ fn queued_action(
         info,
         queued_since,
         candidates,
+        refusal: None,
     }
 }
 
@@ -213,21 +214,25 @@ fn fleets_follow_declaration_order_and_units() -> TestResult {
         .collect();
     world.supplies = vec![
         FleetSupply {
+            abandoned: 0,
             desired: 2,
             instances: Vec::new(),
             warm: 0,
             exits: Vec::new(),
+            launch_failure: None,
         },
         FleetSupply {
+            abandoned: 0,
             desired: 1,
             instances: Vec::new(),
             warm: 0,
             exits: Vec::new(),
+            launch_failure: None,
         },
     ];
     let mut demand = FleetOutlook::default().demand;
-    demand.add_queued(Resources {
-        vcpus: 2,
+    demand.add_queued(ActionResources {
+        cpu_millicores: 2000,
         memory: Bytes::new(1_024),
         disk: Bytes::new(0),
     });
@@ -270,10 +275,12 @@ fn provisioner_properties_exclude_reserved_keys() -> TestResult {
     world.properties = vec![properties(&alpha, vec![("custom.option", "v".to_owned())])];
     world.policies = vec![alpha];
     world.supplies = vec![FleetSupply {
+        abandoned: 0,
         desired: 0,
         instances: Vec::new(),
         warm: 0,
         exits: Vec::new(),
+        launch_failure: None,
     }];
     world.outlook = vec![FleetOutlook::default()];
     let mut builder = Builder::new(config());
@@ -305,9 +312,11 @@ fn counts_workers_by_phase_and_instances_by_lifecycle() -> TestResult {
     let other = instance_id(9)?;
     world.supplies = vec![
         FleetSupply {
+            abandoned: 0,
             desired: 4,
             warm: 3,
             exits: Vec::new(),
+            launch_failure: None,
             instances: vec![
                 fleet_instance(&busy, InstanceLifecycle::InService, 0),
                 fleet_instance(&idle, InstanceLifecycle::InService, 0),
@@ -317,9 +326,11 @@ fn counts_workers_by_phase_and_instances_by_lifecycle() -> TestResult {
             ],
         },
         FleetSupply {
+            abandoned: 0,
             desired: 0,
             warm: 0,
             exits: Vec::new(),
+            launch_failure: None,
             instances: Vec::new(),
         },
     ];
@@ -399,10 +410,12 @@ fn worker_phase_and_phase_time_copy_or_reset_across_frames() -> TestResult {
     let instance = instance_id(1)?;
     let worker = worker_on(&instance)?;
     world.supplies = vec![FleetSupply {
+        abandoned: 0,
         desired: 1,
         instances: vec![fleet_instance(&instance, InstanceLifecycle::InService, 0)],
         warm: 0,
         exits: Vec::new(),
+        launch_failure: None,
     }];
     world.outlook = vec![FleetOutlook::default()];
     world.snapshot.workers = vec![worker_state(
@@ -457,10 +470,12 @@ fn launch_time_of_a_worker_without_instance_is_carried_over() -> TestResult {
     world.properties = vec![properties(&alpha, Vec::new())];
     world.policies = vec![alpha];
     world.supplies = vec![FleetSupply {
+        abandoned: 0,
         desired: 0,
         instances: Vec::new(),
         warm: 0,
         exits: Vec::new(),
+        launch_failure: None,
     }];
     world.outlook = vec![FleetOutlook::default()];
     let worker = worker_on(&instance_id(7)?)?;
@@ -509,6 +524,7 @@ fn merge_pairs_workers_and_instances_with_interleaving_ids() -> TestResult {
     };
     world.supplies = vec![
         FleetSupply {
+            abandoned: 0,
             desired: 3,
             instances: vec![
                 in_service("local-1", 10)?,
@@ -517,12 +533,15 @@ fn merge_pairs_workers_and_instances_with_interleaving_ids() -> TestResult {
             ],
             warm: 0,
             exits: Vec::new(),
+            launch_failure: None,
         },
         FleetSupply {
+            abandoned: 0,
             desired: 2,
             instances: vec![in_service("local-20", 40)?, in_service("local-3", 50)?],
             warm: 0,
             exits: Vec::new(),
+            launch_failure: None,
         },
     ];
     world.outlook = vec![FleetOutlook::default(); 2];
@@ -595,10 +614,12 @@ fn every_worker_on_an_instance_gets_its_launch_time() -> TestResult {
     world.policies = vec![alpha];
     let instance = instance_id(1)?;
     world.supplies = vec![FleetSupply {
+        abandoned: 0,
         desired: 1,
         instances: vec![fleet_instance(&instance, InstanceLifecycle::InService, 10)],
         warm: 0,
         exits: Vec::new(),
+        launch_failure: None,
     }];
     world.outlook = vec![FleetOutlook::default()];
     let old = worker_on(&instance)?;
@@ -631,10 +652,12 @@ fn slots_are_none_for_unbounded_workers() -> TestResult {
     world.properties = vec![properties(&alpha, Vec::new())];
     world.policies = vec![alpha];
     world.supplies = vec![FleetSupply {
+        abandoned: 0,
         desired: 0,
         instances: Vec::new(),
         warm: 0,
         exits: Vec::new(),
+        launch_failure: None,
     }];
     world.outlook = vec![FleetOutlook::default()];
     let unbounded = worker_on(&instance_id(1)?)?;
@@ -666,6 +689,7 @@ fn instances_without_worker_are_listed_with_boot_grace() -> TestResult {
     let pending = instance_id(4)?;
     let young = instance_id(5)?;
     world.supplies = vec![FleetSupply {
+        abandoned: 0,
         desired: 2,
         instances: vec![
             fleet_instance(&pending, InstanceLifecycle::Pending, 0),
@@ -673,6 +697,7 @@ fn instances_without_worker_are_listed_with_boot_grace() -> TestResult {
         ],
         warm: 0,
         exits: Vec::new(),
+        launch_failure: None,
     }];
     world.outlook = vec![FleetOutlook {
         workers: WorkerCounts {
@@ -705,10 +730,12 @@ fn old_unserved_instance_uses_the_pass_boot_grace_verdict() -> TestResult {
     world.policies = vec![alpha];
     let instance = instance_id(5)?;
     world.supplies = vec![FleetSupply {
+        abandoned: 0,
         desired: 1,
         instances: vec![fleet_instance(&instance, InstanceLifecycle::InService, 0)],
         warm: 0,
         exits: Vec::new(),
+        launch_failure: None,
     }];
     world.past_boot_grace = vec![vec![false]];
     let mut builder = Builder::new(config());
@@ -731,16 +758,20 @@ fn unplaceable_plus_charged_equals_queue_total() -> TestResult {
         .collect();
     world.supplies = vec![
         FleetSupply {
+            abandoned: 0,
             desired: 0,
             instances: Vec::new(),
             warm: 0,
             exits: Vec::new(),
+            launch_failure: None,
         },
         FleetSupply {
+            abandoned: 0,
             desired: 0,
             instances: Vec::new(),
             warm: 0,
             exits: Vec::new(),
+            launch_failure: None,
         },
     ];
     let mut builder = Builder::new(config());
@@ -783,10 +814,12 @@ fn oldest_queue_time_is_the_earliest_queued_since_whatever_the_order() -> TestRe
     world.properties = vec![properties(&alpha, Vec::new())];
     world.policies = vec![alpha];
     world.supplies = vec![FleetSupply {
+        abandoned: 0,
         desired: 0,
         instances: Vec::new(),
         warm: 0,
         exits: Vec::new(),
+        launch_failure: None,
     }];
     world.outlook = vec![FleetOutlook::default()];
     world.snapshot.queued = [300, 200, 100]
@@ -888,6 +921,7 @@ fn skipped_pass_keeps_rows_and_counts_skips() -> TestResult {
     let instance = instance_id(1)?;
     let worker = worker_on(&instance)?;
     world.supplies = vec![FleetSupply {
+        abandoned: 0,
         desired: 2,
         instances: vec![
             fleet_instance(&instance, InstanceLifecycle::InService, 0),
@@ -895,6 +929,7 @@ fn skipped_pass_keeps_rows_and_counts_skips() -> TestResult {
         ],
         warm: 0,
         exits: Vec::new(),
+        launch_failure: None,
     }];
     world.outlook = vec![FleetOutlook::default()];
     world.snapshot.workers = vec![worker_state(
@@ -966,10 +1001,12 @@ fn skipped_pass_refreshes_the_actions_part() -> TestResult {
     world.properties = vec![properties(&alpha, Vec::new())];
     world.policies = vec![alpha];
     world.supplies = vec![FleetSupply {
+        abandoned: 0,
         desired: 0,
         instances: Vec::new(),
         warm: 0,
         exits: Vec::new(),
+        launch_failure: None,
     }];
     world.outlook = vec![FleetOutlook::default()];
     let worker = worker_on(&instance_id(1)?)?;
@@ -1027,10 +1064,12 @@ fn a_pass_without_a_sample_keeps_the_previous_actions() -> TestResult {
     world.properties = vec![properties(&alpha, Vec::new())];
     world.policies = vec![alpha];
     world.supplies = vec![FleetSupply {
+        abandoned: 0,
         desired: 0,
         instances: Vec::new(),
         warm: 0,
         exits: Vec::new(),
+        launch_failure: None,
     }];
     world.outlook = vec![FleetOutlook::default()];
     let worker = worker_on(&instance_id(1)?)?;
@@ -1084,10 +1123,12 @@ fn scale_sweep_matches_a_naive_reference() -> TestResult {
         ));
     }
     world.supplies = vec![FleetSupply {
+        abandoned: 0,
         desired: 2_000,
         instances,
         warm: 0,
         exits: Vec::new(),
+        launch_failure: None,
     }];
     world.outlook = vec![FleetOutlook::default()];
     let mut workers = Vec::new();
@@ -1187,9 +1228,11 @@ fn a_worker_of_another_fleet_does_not_host_the_instance() -> TestResult {
     let instance = instance_id(1)?;
     world.supplies = vec![
         FleetSupply {
+            abandoned: 0,
             desired: 1,
             warm: 0,
             exits: Vec::new(),
+            launch_failure: None,
             instances: vec![fleet_instance(&instance, InstanceLifecycle::InService, 0)],
         },
         FleetSupply::default(),
@@ -1264,6 +1307,7 @@ fn larger_world() -> Result<World, Box<dyn Error>> {
     world.policies = vec![alpha, beta];
     world.supplies = vec![
         FleetSupply {
+            abandoned: 0,
             desired: 2,
             instances: vec![
                 fleet_instance(&instance_id(1)?, InstanceLifecycle::InService, 10),
@@ -1271,8 +1315,10 @@ fn larger_world() -> Result<World, Box<dyn Error>> {
             ],
             warm: 0,
             exits: Vec::new(),
+            launch_failure: None,
         },
         FleetSupply {
+            abandoned: 0,
             desired: 1,
             instances: vec![
                 fleet_instance(&instance_id(3)?, InstanceLifecycle::InService, 30),
@@ -1280,6 +1326,7 @@ fn larger_world() -> Result<World, Box<dyn Error>> {
             ],
             warm: 0,
             exits: Vec::new(),
+            launch_failure: None,
         },
     ];
     world.outlook = vec![
@@ -1339,6 +1386,7 @@ fn smaller_world() -> Result<World, Box<dyn Error>> {
     world.properties = vec![properties(&alpha, Vec::new())];
     world.policies = vec![alpha];
     world.supplies = vec![FleetSupply {
+        abandoned: 0,
         desired: 1,
         instances: vec![fleet_instance(
             &instance_id(1)?,
@@ -1347,6 +1395,7 @@ fn smaller_world() -> Result<World, Box<dyn Error>> {
         )],
         warm: 0,
         exits: Vec::new(),
+        launch_failure: None,
     }];
     world.outlook = vec![FleetOutlook::default()];
     let w1 = worker_on(&instance_id(1)?)?;
@@ -1512,5 +1561,171 @@ fn events_keep_only_the_newest_configured_window() -> TestResult {
     let mut rebuilt = prev;
     gang_state::apply(&mut rebuilt, &delta)?;
     assert_eq!(rebuilt, cur);
+    Ok(())
+}
+
+#[test]
+fn recent_samples_follow_completed_passes_and_restarts() -> TestResult {
+    let mut world = World::default();
+    world.policies = vec![policy("alpha", 100, 4)?, policy("beta", 100, 4)?];
+    world.properties = world
+        .policies
+        .iter()
+        .map(|policy| properties(policy, Vec::new()))
+        .collect();
+    let mut builder = Builder::new(config());
+    let mut prev = builder.initial(ts(0), 7);
+    assert!(prev.recent.samples.is_empty());
+    for (index, completed) in [0, 5, 12, 12, 20].into_iter().enumerate() {
+        world.snapshot.completed = completed;
+        world.snapshot.queued = (0..index)
+            .map(|n| queued(n as u64, FleetSet::default()))
+            .collect();
+        world.outlook = vec![
+            FleetOutlook {
+                workers: WorkerCounts {
+                    running: u32::try_from(index).expect("test fleets are few"),
+                    ..WorkerCounts::default()
+                },
+                ..FleetOutlook::default()
+            },
+            FleetOutlook {
+                workers: WorkerCounts {
+                    running: 2,
+                    ..WorkerCounts::default()
+                },
+                ..FleetOutlook::default()
+            },
+        ];
+        let cur = fill(
+            &mut builder,
+            &prev,
+            index as u64 + 1,
+            &world,
+            index as u64 * 4_000,
+            ok(0),
+        )?;
+        let delta = diff(&prev, &cur).ok_or("missing delta")?;
+        let mut applied = prev;
+        gang_state::apply(&mut applied, &delta)?;
+        assert_eq!(applied, cur);
+        prev = cur;
+    }
+    assert_eq!(
+        prev.recent.samples,
+        vec![
+            gang_wire::Sample {
+                start: ts(0),
+                completed: 12,
+                running: 4,
+                queued: 2,
+                passes: 3,
+                skipped: 0,
+            },
+            gang_wire::Sample {
+                start: ts(10_000),
+                completed: 8,
+                running: 6,
+                queued: 4,
+                passes: 2,
+                skipped: 0,
+            },
+        ]
+    );
+
+    let skipped = fill(
+        &mut builder,
+        &prev,
+        6,
+        &world,
+        18_000,
+        Outcome::Skipped(SkipReason::SchedulerUnavailable),
+    )?;
+    let sample = skipped
+        .recent
+        .samples
+        .last()
+        .ok_or("missing skipped sample")?;
+    assert_eq!(
+        (sample.passes, sample.skipped, sample.running, sample.queued),
+        (2, 1, 6, 4)
+    );
+    world.snapshot.completed = 3;
+    let restarted = fill(&mut builder, &skipped, 7, &world, 24_000, ok(0))?;
+    let sample = restarted
+        .recent
+        .samples
+        .last()
+        .ok_or("missing restarted sample")?;
+    assert_eq!((sample.completed, sample.passes, sample.skipped), (3, 1, 0));
+    for (before, after) in [(&prev, &skipped), (&skipped, &restarted)] {
+        let delta = diff(before, after).ok_or("missing delta")?;
+        let mut applied = before.clone();
+        gang_state::apply(&mut applied, &delta)?;
+        assert_eq!(&applied, after);
+    }
+    Ok(())
+}
+
+#[test]
+fn worker_phase_history_keeps_the_span_overlapping_the_window() -> TestResult {
+    let mut world = World::default();
+    let alpha = policy("alpha", 100, 4)?;
+    world.properties = vec![properties(&alpha, Vec::new())];
+    world.policies = vec![alpha];
+    let instance = instance_id(1)?;
+    let worker = worker_on(&instance)?;
+    world.snapshot.workers = vec![worker_state(&worker, "alpha", 0, false, None)?];
+    let mut settings = config();
+    settings.history_window = Duration::from_secs(10);
+    let mut builder = Builder::new(settings);
+    let mut prev = builder.initial(ts(0), 7);
+    for (seq, wall, running) in [(1, 1_000, 0), (2, 4_000, 1), (3, 7_000, 0)] {
+        world.snapshot.workers[0].running_actions = running;
+        let cur = fill(&mut builder, &prev, seq, &world, wall, ok(0))?;
+        let delta = diff(&prev, &cur).ok_or("missing delta")?;
+        let mut applied = prev;
+        gang_state::apply(&mut applied, &delta)?;
+        assert_eq!(applied, cur);
+        prev = cur;
+    }
+    let spans = &find_worker(&prev, &worker).ok_or("worker missing")?.phases;
+    assert_eq!(
+        spans,
+        &[
+            gang_wire::PhaseSpan {
+                phase: gang_wire::Phase::Idle,
+                start: ts(1_000),
+            },
+            gang_wire::PhaseSpan {
+                phase: gang_wire::Phase::Busy,
+                start: ts(4_000),
+            },
+            gang_wire::PhaseSpan {
+                phase: gang_wire::Phase::Idle,
+                start: ts(7_000),
+            },
+        ]
+    );
+    let trimmed = fill(&mut builder, &prev, 4, &world, 14_000, ok(0))?;
+    let spans = &find_worker(&trimmed, &worker)
+        .ok_or("worker missing")?
+        .phases;
+    assert_eq!(
+        spans,
+        &[
+            gang_wire::PhaseSpan {
+                phase: gang_wire::Phase::Busy,
+                start: ts(4_000),
+            },
+            gang_wire::PhaseSpan {
+                phase: gang_wire::Phase::Idle,
+                start: ts(7_000),
+            },
+        ]
+    );
+    let delta = diff(&prev, &trimmed).ok_or("missing delta")?;
+    gang_state::apply(&mut prev, &delta)?;
+    assert_eq!(prev, trimmed);
     Ok(())
 }

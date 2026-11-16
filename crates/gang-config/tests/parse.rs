@@ -3143,6 +3143,8 @@ retry_after = "0s"
 heartbeat = "2s"
 lag_frames = 4
 recent_events = 50
+history_window = "5m"
+history_step = "15s"
 max_listed_running = 100
 max_listed_queued = 10
 detail_interval = "3s"
@@ -3161,6 +3163,8 @@ renewal_reuse = "2m"
     assert_eq!(dashboard.heartbeat, NonZeroDuration::from_secs(2));
     assert_eq!(dashboard.lag_frames.get(), 4);
     assert_eq!(dashboard.recent_events.get(), 50);
+    assert_eq!(dashboard.history_window, NonZeroDuration::from_mins(5));
+    assert_eq!(dashboard.history_step, NonZeroDuration::from_secs(15));
     assert_eq!(dashboard.max_listed_running, 100);
     assert_eq!(dashboard.max_listed_queued, 10);
     assert_eq!(dashboard.detail_interval, NonZeroDuration::from_secs(3));
@@ -3173,6 +3177,27 @@ renewal_reuse = "2m"
     assert_eq!(dashboard.max_pending_logins.get(), 16);
     assert_eq!(dashboard.session_max_age.get(), Duration::from_hours(24));
     assert_eq!(dashboard.renewal_reuse, NonZeroDuration::from_mins(2));
+    Ok(())
+}
+
+#[test]
+fn dashboard_history_defaults_and_validation() -> Result<(), Box<dyn Error>> {
+    let dashboard = Sections::VALID.parse()?.dashboard;
+    assert_eq!(dashboard.history_window, NonZeroDuration::from_mins(15));
+    assert_eq!(dashboard.history_step, NonZeroDuration::from_secs(10));
+
+    for text in [
+        "[dashboard]\nhistory_step = \"1500ms\"\n",
+        "[dashboard]\nhistory_window = \"5s\"\nhistory_step = \"10s\"\n",
+        "[dashboard]\nhistory_window = \"95s\"\nhistory_step = \"10s\"\n",
+        "[dashboard]\nhistory_window = \"5h\"\nhistory_step = \"10s\"\n",
+    ] {
+        let error = with_dashboard(text).err().ok_or("accepted")?;
+        assert!(
+            matches!(error, ConfigError::HistoryWindowNotWholeSteps),
+            "{error}"
+        );
+    }
     Ok(())
 }
 

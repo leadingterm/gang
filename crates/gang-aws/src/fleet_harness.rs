@@ -85,7 +85,7 @@ impl Harness {
             group: group.to_owned(),
             status_code: status.to_owned(),
             start_time: start_time.to_owned(),
-            message: String::new(),
+            message: Some(String::new()),
         });
     }
 

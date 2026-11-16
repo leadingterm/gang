@@ -3,7 +3,7 @@ import { useEffect, useState } from "preact/hooks";
 import { identityOf, idOf, ms, splitIdentity } from "../wire-parse.ts";
 import type { Principal, Session } from "../wire.ts";
 import { day } from "../format.ts";
-import { Section, Since, Tags, Until, useClient } from "../ui.tsx";
+import { Ident, Section, Since, Tags, Until, useClient } from "../ui.tsx";
 
 const DAY_MS = 24 * 3600 * 1000;
 
@@ -11,9 +11,9 @@ const PrincipalRow = ({ p, now }: { p: Principal; now: number }) => {
   const lastSeen = ms(p.lastSeenTime);
   return (
     <tr class={p.revokeTime !== undefined ? "is-revoked" : undefined}>
-      <td class="a-kind mono dim">{p.provider}</td>
+      <td class="a-kind mono dim"><Ident text={p.provider} /></td>
       <td class="a-main">
-        <span class="target">{p.principal}</span>
+        <Ident text={p.principal} />
       </td>
       <td class="a-m1 dim">{day(ms(p.createTime))}</td>
       <td class="a-m2">{now - lastSeen < DAY_MS ? <Since t={lastSeen} /> : day(lastSeen)}</td>
@@ -31,8 +31,7 @@ const You = ({ session }: { session: Session }) => {
       id="se-h"
       title="You"
       variant="panel"
-      aside={session.expireTime === undefined ? undefined : <Until t={ms(session.expireTime)} />}
-      asideCls="mono quiet"
+      aside={session.expireTime === undefined ? undefined : <span class="mono quiet"><Until t={ms(session.expireTime)} /></span>}
     >
       {who && (
         <p class="you">
@@ -143,7 +142,7 @@ export const Access = () => {
                 <ul class="role__list">
                   {r.principals.map((p) => (
                     <li key={p}>
-                      {identityOf(p)}
+                      <Ident text={identityOf(p)} />
                       {revokedNames.has(p) && <span class="status-revoked"> revoked</span>}
                     </li>
                   ))}

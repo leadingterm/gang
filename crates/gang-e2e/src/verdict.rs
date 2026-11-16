@@ -833,6 +833,8 @@ fn caused(
 fn describe(event: &Event) -> String {
     let kind = match &event.change {
         EventChange::ScaledOut { .. } => "scaled_out",
+        EventChange::LaunchFailed { .. } => "launch_failed",
+        EventChange::Withdrawn { .. } => "withdrawn",
         EventChange::DrainStarted { .. } => "drain_started",
         EventChange::DrainCancelled { .. } => "drain_cancelled",
         EventChange::Terminated { .. } => "terminated",

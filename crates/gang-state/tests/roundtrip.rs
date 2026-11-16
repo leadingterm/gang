@@ -10,7 +10,8 @@ use gang_types::{FleetName, InstanceId, WorkerId};
 use gang_wire::name;
 use gang_wire::{
     Actions, Demand, Fleet, Instance, InstanceCounts, InstanceSize, Isa, Lifecycle, Pass, Phase,
-    Policy, Queue, QueuedAction, RunningAction, SkipReason, State, Truncated, Worker, WorkerCounts,
+    Policy, Queue, QueuedAction, Recent, RunningAction, SkipReason, State, Truncated, Worker,
+    WorkerCounts,
 };
 use gang_wire::{Cause, Event, EventChange};
 use serde_json::json;
@@ -128,6 +129,7 @@ fn worker(slot: usize, phase: Phase, running: u32) -> Result<Worker, Box<dyn Err
         slots: Some(4),
         paused: false,
         launch_time: timestamped(1),
+        phases: Vec::new(),
     })
 }
 
@@ -163,6 +165,7 @@ fn queued(op: &str) -> Result<QueuedAction, Box<dyn Error>> {
         queue_time: timestamped(1),
         priority: 0,
         candidates: vec![fleet_name("alpha")?],
+        refusal: None,
     })
 }
 
@@ -246,6 +249,9 @@ fn random_fleet(rng: &mut Rng, fleet: &str) -> Result<Fleet, Box<dyn Error>> {
             boot_grace: Duration::from_mins(2),
         },
         desired: rng.small() % 9,
+        launch_failure: rng.chance(50).then(|| gang_wire::LaunchFailure {
+            reason: "capacity unavailable".to_owned(),
+        }),
         instances: InstanceCounts {
             pending: rng.small() % 2,
             in_service: rng.small() % 5,
@@ -512,6 +518,7 @@ fn snapshot(world: &World) -> State {
         events,
         events_limit: world.events_limit,
         completed: world.completed,
+        recent: Recent::default(),
         principals_epoch: world.principals_epoch,
     }
 }

@@ -66,6 +66,14 @@ pub fn startup_args(settings: &Settings, output_user_root: &Path, remote: &Remot
     args
 }
 
+/// Startup arguments that leave the system, workspace and home rc files enabled.
+#[must_use]
+pub(crate) fn user_rc_startup_args(settings: &Settings, output_user_root: &Path) -> Vec<String> {
+    let mut args = vec![format!("--output_user_root={}", output_user_root.display())];
+    args.extend(settings.bazel_startup_flags.iter().cloned());
+    args
+}
+
 /// The `--define` name a held build's run is passed under; the sample's probe rule reads it.
 pub const RUN_DEFINE: &str = "e2e_run";
 
@@ -152,4 +160,28 @@ pub fn helper_path(helper: &Path, pinned: &str) -> OsString {
         entries.extend(std::env::split_paths(pinned));
     }
     std::env::join_paths(entries).unwrap_or_else(|_| OsString::from(pinned))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_rc_startup_preserves_output_root_and_extra_flags() {
+        let settings = Settings {
+            bazel_startup_flags: vec!["--extra_startup_option".to_owned()],
+            ..Settings::default()
+        };
+        let args = user_rc_startup_args(&settings, Path::new("/output"));
+        assert_eq!(
+            args,
+            ["--output_user_root=/output", "--extra_startup_option"]
+        );
+        assert!(!args.iter().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "--nohome_rc" | "--nosystem_rc" | "--noworkspace_rc"
+            ) || arg.starts_with("--bazelrc=")
+        }));
+    }
 }

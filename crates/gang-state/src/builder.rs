@@ -7,6 +7,7 @@
 //! previous frame's rows, which are sorted by name too.
 
 use std::collections::BTreeMap;
+use std::fmt::Write;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
@@ -16,8 +17,8 @@ use gang_spi::{FleetInstance, FleetSupply, QueuedActionView, SchedulerSnapshot};
 use gang_types::{FleetCatalog, FleetProperties, InstanceLifecycle, SaturatingInto};
 use gang_wire::{
     Actions, Demand, Event, Fleet, Instance, InstanceCounts, InstanceSize, Isa, Lifecycle, Pass,
-    Phase, Policy, Queue, QueuedAction, RunningAction, SkipReason, State, Truncated, Worker,
-    WorkerCounts, name,
+    Phase, PhaseSpan, Policy, Queue, QueuedAction, Recent, RunningAction, SkipReason, State,
+    Truncated, Worker, WorkerCounts, name,
 };
 
 use crate::events::newer;
@@ -69,6 +70,7 @@ impl Builder {
                 0,
             ),
             events_limit: self.config.events_limit.saturating_into(),
+            recent: Recent::new(self.config.history_window, self.config.history_step),
             principals_epoch,
             ..State::default()
         }
@@ -85,6 +87,10 @@ impl Builder {
         cur.provisioner.clone_from(&self.config.provisioner);
         cur.events_limit = self.config.events_limit.saturating_into();
         cur.principals_epoch = inputs.principals_epoch;
+        // Field-wise: the derived `Recent::clone_from` would replace the buffer, not reuse it.
+        cur.recent.samples.clone_from(&prev.recent.samples);
+        cur.recent.window = self.config.history_window;
+        cur.recent.step = self.config.history_step;
         fill_events(cur, inputs.events, self.config.events_limit);
         let interval = self.config.interval;
         match &inputs.pass {
@@ -99,9 +105,31 @@ impl Builder {
                 cur.pass = Pass::ok(interval, *applied, *failed);
                 cur.completed = snapshot.completed;
                 fill_instances(cur, inputs.fleets, hosted, &mut self.scratch);
-                fill_workers(cur, prev, inputs.wall, snapshot, &self.scratch);
+                fill_workers(
+                    cur,
+                    prev,
+                    inputs.wall,
+                    snapshot,
+                    &self.scratch,
+                    self.config.history_window,
+                );
                 fill_fleets(cur, inputs.fleets, inputs.catalog);
                 fill_queue(cur, inputs.fleets, snapshot);
+                let completed = snapshot
+                    .completed
+                    .checked_sub(prev.completed)
+                    .unwrap_or(snapshot.completed);
+                let running = cur
+                    .fleets
+                    .iter()
+                    .fold(0_u32, |sum, fleet| sum.saturating_add(fleet.demand.running));
+                let queued = cur.queue.total;
+                cur.recent.sample_at(inputs.wall, |sample| {
+                    sample.completed = sample.completed.saturating_add(completed.saturating_into());
+                    sample.running = running;
+                    sample.queued = queued;
+                    sample.passes = sample.passes.saturating_add(1);
+                });
             }
             PassStatus::Skipped(reason) => {
                 self.skipped = self.skipped.saturating_add(1);
@@ -111,6 +139,9 @@ impl Builder {
                 cur.instances.clone_from(&prev.instances);
                 cur.queue.clone_from(&prev.queue);
                 cur.completed = prev.completed;
+                cur.recent.sample_at(inputs.wall, |sample| {
+                    sample.skipped = sample.skipped.saturating_add(1);
+                });
             }
         }
         fill_actions(
@@ -160,7 +191,12 @@ fn fill_workers(
     wall: Timestamp,
     snapshot: &SchedulerSnapshot,
     scratch: &Scratch,
+    history_window: Duration,
 ) {
+    let horizon = Timestamp::from_unix_millis(
+        wall.as_unix_millis()
+            .saturating_sub(gang_clock::millis_of(history_window)),
+    );
     // Worker ids contain only unreserved characters, so worker name order is id order.
     let mut previous = prev.workers.iter().peekable();
     refill(
@@ -188,6 +224,23 @@ fn fill_workers(
             name::write_of::<name::Fleets>(&mut row.fleet, &worker.fleet);
             write_text_of::<name::Instances>(&mut row.instance, key);
             row.phase = phase;
+            if let Some(earlier) = earlier {
+                row.phases.clone_from(&earlier.phases);
+            } else {
+                row.phases.clear();
+            }
+            if row.phases.last().is_none_or(|span| span.phase != row.phase) {
+                row.phases.push(PhaseSpan {
+                    phase: row.phase.clone(),
+                    start: row.phase_time,
+                });
+            }
+            let ended = row
+                .phases
+                .windows(2)
+                .take_while(|spans| spans[1].start <= horizon)
+                .count();
+            row.phases.drain(..ended);
             row.running = worker.running_actions;
             row.slots = worker.max_inflight_actions.map(NonZeroU32::get);
             row.paused = worker.paused;
@@ -322,6 +375,16 @@ fn fill_fleet(row: &mut Fleet, pass: &FleetPass, properties: &FleetProperties) {
         boot_grace: policy.boot_grace,
     };
     row.desired = pass.supply.desired;
+    if let Some(failure) = &pass.supply.launch_failure {
+        row.launch_failure
+            .get_or_insert_with(|| gang_wire::LaunchFailure {
+                reason: String::new(),
+            })
+            .reason
+            .clone_from(&failure.reason);
+    } else {
+        row.launch_failure = None;
+    }
     row.instances = instance_counts(&pass.supply);
     row.workers = WorkerCounts {
         busy: pass.outlook.workers.busy,
@@ -481,6 +544,13 @@ fn fill_queued_row(row: &mut QueuedAction, queued: &QueuedActionView, inputs: &I
     row.mnemonic.clone_from(&queued.info.mnemonic);
     row.queue_time = queued.queued_since;
     row.priority = queued.info.priority;
+    if let Some(refusal) = &queued.refusal {
+        let text = row.refusal.get_or_insert_with(String::new);
+        text.clear();
+        let _ = write!(text, "{refusal}");
+    } else {
+        row.refusal = None;
+    }
     refill(
         &mut row.candidates,
         queued

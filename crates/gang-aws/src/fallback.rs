@@ -1,7 +1,7 @@
 //! Pure capacity split between a Spot group and its on-demand twin.
 //!
 //! Works on numbers only: no AWS types, no I/O. The fleet layer reads the
-//! groups, calls [`reported`] for the supply view and [`raise`] for the
+//! groups, calls [`reported`] for the supply view and [`writes`] for the
 //! desired-capacity writes it must issue, in order.
 
 /// Desired and live member counts of one Auto Scaling group.
@@ -43,12 +43,12 @@ pub(crate) struct Write {
     pub desired: u32,
 }
 
-/// The capacity writes one raise needs: at most two, in the order they are applied.
+/// The capacity writes one request needs, in the order they are applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct Writes([Option<Write>; 2]);
 
 impl Writes {
-    /// Appends a write; `raise` pushes at most two writes.
+    /// Appends a write; `writes` pushes at most two writes.
     fn push(&mut self, write: Write) {
         if let Some(slot) = self.0.iter_mut().find(|slot| slot.is_none()) {
             *slot = Some(write);
@@ -74,47 +74,52 @@ pub(crate) fn reported(spot: Counts, on_demand: Counts, down: bool) -> u32 {
     spot_part.saturating_add(on_demand.reported())
 }
 
-/// Up to two writes that raise the fleet's reported capacity to `to`, in issue order.
-///
-/// Rule:
-/// - `d = reported(spot, on_demand, down)`; if `d >= to`, no writes.
-/// - `add = to - d`.
-/// - Not `down`: one write, `Spot <- spot.reported() + add`.
-/// - `down`: if the Spot group still wants capacity (`spot.desired > spot.live`),
-///   first withdraw it with `Spot <- spot.live`; then `OnDemand <- on_demand.reported() + add`.
+/// Writes for a target reported capacity: raise the appropriate tier, lower unmet requests
+/// from the twin before healthy Spot, or withdraw a down Spot gap at the current capacity.
 #[must_use]
-pub(crate) fn raise(spot: Counts, on_demand: Counts, down: bool, to: u32) -> Writes {
+pub(crate) fn writes(spot: Counts, on_demand: Counts, down: bool, to: u32) -> Writes {
     let d = reported(spot, on_demand, down);
-    if d >= to {
-        return Writes::default();
-    }
-    let add = to.saturating_sub(d);
     let mut writes = Writes::default();
-    if !down {
+    if to > d {
+        let add = to.saturating_sub(d);
+        let (tier, count) = if down {
+            (Tier::OnDemand, on_demand)
+        } else {
+            (Tier::Spot, spot)
+        };
         writes.push(Write {
-            tier: Tier::Spot,
-            desired: spot.reported().saturating_add(add),
+            tier,
+            desired: count.reported().saturating_add(add),
         });
-        return writes;
-    }
-    if spot.gap() > 0 {
+    } else if to < d {
+        let mut surplus = d.saturating_sub(to);
+        for (tier, count) in [(Tier::OnDemand, on_demand), (Tier::Spot, spot)] {
+            if down && tier == Tier::Spot {
+                continue;
+            }
+            let withdrawn = count.gap().min(surplus);
+            if withdrawn > 0 {
+                writes.push(Write {
+                    tier,
+                    desired: count.desired.saturating_sub(withdrawn),
+                });
+                surplus = surplus.saturating_sub(withdrawn);
+            }
+        }
+    } else if down && spot.gap() > 0 {
         writes.push(Write {
             tier: Tier::Spot,
             desired: spot.live,
         });
     }
-    writes.push(Write {
-        tier: Tier::OnDemand,
-        desired: on_demand.reported().saturating_add(add),
-    });
     writes
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Counts, Tier, Write, raise, reported};
+    use super::{Counts, Tier, Write, reported, writes};
 
-    /// One `raise` table row: the group states, the target, and the expected writes.
+    /// One capacity-write table row.
     struct Case {
         name: &'static str,
         spot: Counts,
@@ -143,7 +148,7 @@ mod tests {
         Write { tier, desired }
     }
 
-    /// Builds one `raise` row.
+    /// Builds one capacity-write row.
     fn case(
         name: &'static str,
         spot: Counts,
@@ -162,11 +167,11 @@ mod tests {
         }
     }
 
-    /// Asserts that every row's `raise` output matches its expected writes.
+    /// Asserts that every row's output matches its expected writes.
     fn check(cases: &[Case]) {
         for case in cases {
             assert_eq!(
-                raise(case.spot, case.on_demand, case.down, case.to)
+                writes(case.spot, case.on_demand, case.down, case.to)
                     .into_iter()
                     .collect::<Vec<_>>(),
                 case.expected,
@@ -277,7 +282,7 @@ mod tests {
         ]);
     }
 
-    /// Targets already met write nothing, whether met by the group itself or by a surplus.
+    /// A down Spot gap is withdrawn only when the reported target is unchanged.
     #[test]
     fn raise_idempotent_when_target_met() {
         check(&[
@@ -295,15 +300,23 @@ mod tests {
                 c(4, 4),
                 true,
                 10,
-                Vec::new(),
+                vec![w(Tier::Spot, 6)],
             ),
             case(
-                "idempotent when reported exceeds target",
+                "lower target with no twin gap writes nothing",
                 c(10, 6),
                 c(4, 4),
                 true,
                 8,
                 Vec::new(),
+            ),
+            case(
+                "down lowering writes twin only",
+                c(4, 1),
+                c(3, 2),
+                true,
+                3,
+                vec![w(Tier::OnDemand, 2)],
             ),
             case(
                 "twin desired already meets target",
@@ -316,17 +329,17 @@ mod tests {
         ]);
     }
 
-    /// A down fleet withdraws Spot surplus, then raises the on-demand twin.
+    /// A down fleet raises only the on-demand twin.
     #[test]
-    fn raise_down_withdraws_spot_then_raises_twin() {
+    fn raise_down_raises_twin_only() {
         check(&[
             case(
-                "first detection withdraws spot and raises twin",
+                "down raise leaves spot gap untouched",
                 c(10, 6),
                 c(0, 0),
                 true,
                 10,
-                vec![w(Tier::Spot, 6), w(Tier::OnDemand, 4)],
+                vec![w(Tier::OnDemand, 4)],
             ),
             case(
                 "restart after withdraw raises twin only",
@@ -337,12 +350,12 @@ mod tests {
                 vec![w(Tier::OnDemand, 4)],
             ),
             case(
-                "twin already holds capacity, spot withdrawn",
+                "twin already holds capacity, spot gap remains",
                 c(10, 6),
                 c(3, 3),
                 true,
                 10,
-                vec![w(Tier::Spot, 6), w(Tier::OnDemand, 4)],
+                vec![w(Tier::OnDemand, 4)],
             ),
             case(
                 "twin already holds capacity, no spot gap",

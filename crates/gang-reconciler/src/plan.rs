@@ -86,6 +86,14 @@ pub enum Action {
         /// The capacity requested.
         to: u32,
     },
+    /// Lower a fleet's request for instances that have not launched. The caller calls
+    /// `ProvisionerPort::set_desired_capacity` with `to`.
+    Withdraw {
+        /// The desired capacity before withdrawal.
+        from: u32,
+        /// The desired capacity after withdrawal.
+        to: u32,
+    },
     /// Stop a worker taking new actions. The caller calls
     /// `SchedulerPort::set_draining(worker, true)`.
     StartDrain(WorkerId),
@@ -111,6 +119,10 @@ impl Action {
                 from: *from,
                 to: *to,
             },
+            Self::Withdraw { from, to } => ScalingEventKind::Withdrawn {
+                from: *from,
+                to: *to,
+            },
             Self::StartDrain(worker) => ScalingEventKind::DrainStarted {
                 worker: worker.clone(),
             },
@@ -128,7 +140,9 @@ impl Action {
     #[must_use]
     pub fn cause(&self) -> ScalingCause {
         match self {
-            Self::ScaleOut { .. } | Self::CancelDrain(_) => ScalingCause::Demand,
+            Self::ScaleOut { .. } | Self::Withdraw { .. } | Self::CancelDrain(_) => {
+                ScalingCause::Demand
+            }
             Self::StartDrain(_) => ScalingCause::IdleTimeout,
             Self::Terminate { cause, .. } => (*cause).into(),
         }
@@ -163,6 +177,25 @@ mod tests {
                 at,
                 fleet: fleet("x86-64-fleet")?,
                 kind: ScalingEventKind::ScaledOut { from: 2, to: 5 },
+                cause: Some(ScalingCause::Demand),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn withdraw_audits_as_withdrawn_for_demand() -> TestResult {
+        let step = PlanStep {
+            fleet: 0,
+            action: Action::Withdraw { from: 4, to: 2 },
+        };
+        let at = Timestamp::from_unix_millis(42);
+        assert_eq!(
+            step.audit_event(at, &fleet("x86-64-fleet")?),
+            ScalingAuditEvent {
+                at,
+                fleet: fleet("x86-64-fleet")?,
+                kind: ScalingEventKind::Withdrawn { from: 4, to: 2 },
                 cause: Some(ScalingCause::Demand),
             }
         );

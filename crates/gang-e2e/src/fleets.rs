@@ -1,14 +1,32 @@
 //! The fleets scenario: a deployment with three fleets places each action on the fleet its exec
 //! properties select, and overflows to the next fleet when the first is at its instance limit.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+
+use gang_wire::State;
+
+use crate::build_output::BuildOutcome;
 use crate::check::Check;
+use crate::control::{Control, latest_holds};
 use crate::drain::{DrainChecks, settle};
-use crate::errors::Result;
+use crate::errors::{E2eError, Result};
 use crate::event_log::sequence;
 use crate::names;
 use crate::report::Namespaces;
 use crate::system::{LARGE_FLEET, NOOP_FLEET, Probe, SMALL_FLEET, Sandbox, System, Variant};
 use crate::verdict;
+
+/// How the actions of a step reach the passes that place them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arrival {
+    /// As the build sends them.
+    AsSent,
+    /// All at once: every pass is skipped until the live state shows each action of the step
+    /// queued, so the first pass that places them sees them together, before any worker could
+    /// run one of them.
+    Together,
+}
 
 /// What a step reads from the report of its probes once they ran.
 #[derive(Debug, Clone, Copy)]
@@ -34,6 +52,8 @@ struct Step {
     native_noop: Option<&'static [&'static str]>,
     /// What the probes' reports must show.
     observed: Observed,
+    /// How the build's actions reach the passes.
+    arrival: Arrival,
 }
 
 impl Step {
@@ -54,6 +74,7 @@ const STEPS: [Step; 5] = [
         fleets: &[SMALL_FLEET],
         native_noop: None,
         observed: Observed::Native(Probe::Unconstrained),
+        arrival: Arrival::AsSent,
     },
     Step {
         request: names::fleets::PINNED,
@@ -61,6 +82,7 @@ const STEPS: [Step; 5] = [
         fleets: &[LARGE_FLEET],
         native_noop: None,
         observed: Observed::Native(Probe::FleetRequested),
+        arrival: Arrival::AsSent,
     },
     Step {
         request: names::fleets::MEMORY,
@@ -68,6 +90,7 @@ const STEPS: [Step; 5] = [
         fleets: &[LARGE_FLEET],
         native_noop: None,
         observed: Observed::Native(Probe::MemoryRequested),
+        arrival: Arrival::AsSent,
     },
     Step {
         request: names::fleets::NOOP_SANDBOX,
@@ -75,13 +98,18 @@ const STEPS: [Step; 5] = [
         fleets: &[NOOP_FLEET],
         native_noop: Some(&[SMALL_FLEET]),
         observed: Observed::Noop(Probe::SandboxRequested),
+        arrival: Arrival::AsSent,
     },
+    // Placed by one pass that sees both actions queued: the first fills the small fleet's one
+    // instance, so the second overflows. Sent as they come, the second can reach a small worker
+    // that already serves, which packs both, before any pass sees it queued.
     Step {
         request: names::fleets::OVERFLOW,
         probes: &[Probe::OverflowFirst, Probe::OverflowSecond],
         fleets: &[SMALL_FLEET, LARGE_FLEET],
         native_noop: None,
         observed: Observed::Ran,
+        arrival: Arrival::Together,
     },
 ];
 
@@ -93,12 +121,14 @@ const STEPS: [Step; 5] = [
 /// deployment, and the scale-outs it caused are the ones recorded between the history read before
 /// the build and the history read after it. The scale-outs must be exactly those of the fleets
 /// the step's exec properties select. Where the variant's own sandbox is noop, the first two
-/// fleets run under it too, so a request for the noop sandbox fits the first fleet.
+/// fleets run under it too, so a request for the noop sandbox fits the first fleet. A step whose
+/// actions must be placed together holds the provisioner's supply while it builds, so no pass
+/// runs until the live state shows all of them queued.
 ///
 /// # Errors
 ///
 /// When the system cannot be driven or observed; a system that misbehaves is a failed [`Check`].
-pub fn fleets<S: System>(system: &S, variant: &Variant) -> Result<Vec<Check>> {
+pub fn fleets<S: Control>(system: &S, variant: &Variant) -> Result<Vec<Check>> {
     let mut checks = Vec::new();
 
     system.start_server()?;
@@ -112,7 +142,10 @@ pub fn fleets<S: System>(system: &S, variant: &Variant) -> Result<Vec<Check>> {
     for step in &STEPS {
         let before = system.scaling_events()?;
         let since = before.last().map_or(Ok(0), sequence)?;
-        let outcome = system.build(step.probes)?;
+        let outcome = match step.arrival {
+            Arrival::AsSent => system.build(step.probes)?,
+            Arrival::Together => build_together(system, step.probes)?,
+        };
         let actions = u32::try_from(step.probes.len()).unwrap_or(u32::MAX);
         checks.push(labelled(
             step.request,
@@ -140,6 +173,48 @@ pub fn fleets<S: System>(system: &S, variant: &Variant) -> Result<Vec<Check>> {
         )?;
     }
     Ok(checks)
+}
+
+/// Builds `probes` while every pass is skipped, and lets the passes run again once the live state
+/// shows all of their actions queued, or once the build ended without queueing them all. The
+/// deployment is drained, so no worker can run an action before the first pass that places them.
+///
+/// # Errors
+///
+/// When the supply cannot be held or released, Bazel cannot be run, the build thread panics, or
+/// the live state cannot be observed.
+fn build_together<S: Control>(system: &S, probes: &[Probe]) -> Result<BuildOutcome> {
+    let ended = AtomicBool::new(false);
+    system.hold_supply()?;
+    thread::scope(|scope| {
+        let build = scope.spawn(|| {
+            let outcome = system.build(probes);
+            ended.store(true, Ordering::Release);
+            outcome
+        });
+        let all_queued = system.await_stream(&mut |frames| {
+            ended.load(Ordering::Acquire)
+                || latest_holds(frames, |state| queued(state) >= probes.len())
+        });
+        let released = system.release_supply();
+        let outcome = build
+            .join()
+            .map_err(|_| E2eError::system("the build thread panicked"))??;
+        released?;
+        // A failed build is judged by its own checks, whatever the state showed of it.
+        if outcome.succeeded() {
+            all_queued?;
+        }
+        Ok(outcome)
+    })
+}
+
+/// The number of queued actions `state` lists.
+fn queued(state: &State) -> usize {
+    state
+        .actions
+        .as_ref()
+        .map_or(0, |actions| actions.queued.len())
 }
 
 /// Judges what the probes of `step` reported.

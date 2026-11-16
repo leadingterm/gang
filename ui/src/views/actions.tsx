@@ -5,7 +5,7 @@ import { idOf, ms } from "../wire-parse.ts";
 import type { Actions as ActionsSample, QueuedAction, RunningAction } from "../wire.ts";
 import { clock, workerInstance } from "../format.ts";
 import { actionsStale } from "../store.ts";
-import { Empty, FleetFilter, Num, Priority, Section, Since, Tags, Target, useClient, useEnter } from "../ui.tsx";
+import { Empty, FleetFilter, Ident, Num, Priority, Section, Since, Target, useClient, useEnter } from "../ui.tsx";
 
 /** Queued longer than this, the wait reads as caution. */
 const AGED_MS = 3 * 60 * 1000;
@@ -28,8 +28,8 @@ const RunningRow = ({ a }: { a: RunningAction }) => {
         <Priority p={a.priority} />
       </td>
       <td class="a-kind">{a.mnemonic}</td>
-      <td class="a-m1 mono dim">{idOf(a.fleet)}</td>
-      <td class="a-m2 mono dim">{workerInstance(idOf(a.worker))}</td>
+      <td class="a-m1 mono dim"><Ident text={idOf(a.fleet)} /></td>
+      <td class="a-m2 mono dim"><Ident text={workerInstance(idOf(a.worker))} /></td>
       <td class="a-age r">
         <Since t={ms(a.startTime)} />
       </td>
@@ -49,9 +49,16 @@ const QueuedRow = ({ q }: { q: QueuedAction }) => {
       <td class="a-main">
         <Target label={q.target} />
         <Priority p={q.priority} />
+        {q.refusal && <div class="action__refusal caution">{q.refusal}</div>}
       </td>
       <td class="a-kind">{q.mnemonic}</td>
-      <td class="a-m1 a-span">{q.candidates.length ? <Tags items={q.candidates.map(idOf)} /> : <span class="warning">no fleet</span>}</td>
+      <td class="a-m1 a-span">
+        {q.candidates.length ? (
+          <span class="chips">
+            {q.candidates.map((candidate) => <span key={candidate} class="tag"><Ident text={idOf(candidate)} /></span>)}
+          </span>
+        ) : <span class="warning">no fleet</span>}
+      </td>
     </tr>
   );
 };
@@ -113,8 +120,7 @@ export const Actions = () => {
           id="run-h"
           title="Running"
           count={<Num value={actions.running.length} />}
-          aside={actions.truncated.running > 0 ? `+${actions.truncated.running}` : undefined}
-          asideCls="trunc"
+          aside={actions.truncated.running > 0 ? <span class="trunc">+{actions.truncated.running}</span> : undefined}
         >
           <table class="table">
             <thead>
@@ -139,8 +145,7 @@ export const Actions = () => {
           id="q-h"
           title="Queued"
           count={<Num value={state.queue.total} />}
-          aside={actions.truncated.queued > 0 ? `+${actions.truncated.queued}` : undefined}
-          asideCls="trunc"
+          aside={actions.truncated.queued > 0 ? <span class="trunc">+{actions.truncated.queued}</span> : undefined}
         >
           <table class="table">
             <thead>

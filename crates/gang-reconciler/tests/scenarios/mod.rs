@@ -134,6 +134,296 @@ fn scale_out_is_clamped_at_max_instances() -> TestResult {
     Ok(())
 }
 
+fn failed_launch_fleet() -> TestResult<Harness> {
+    let mut h = Harness::new()?;
+    for name in ["local-1", "local-2"] {
+        serve(&mut h, name, secs(3600))?;
+        h.set_running(name, 4)?;
+    }
+    h.set_desired_capacity(X86, 4);
+    h.supply_mut(X86)?.launch_failure = Some(gang_spi::LaunchFailure {
+        reason: "launch failed".to_owned(),
+    });
+    Ok(h)
+}
+
+#[test]
+fn abandoned_requests_are_withdrawn_by_the_plan() -> TestResult {
+    let mut h = failed_launch_fleet()?;
+    h.supply_mut(X86)?.launch_failure = None;
+    h.supply_mut(X86)?.abandoned = 3;
+    assert_eq!(
+        h.reconcile(),
+        vec![PlanStep {
+            fleet: X86,
+            action: Action::Withdraw { from: 7, to: 4 },
+        }],
+        "abandoned requests must be withdrawn even without surplus demand"
+    );
+    Ok(())
+}
+
+#[test]
+fn abandoned_requests_are_withdrawn_in_their_own_step() -> TestResult {
+    let mut h = failed_launch_fleet()?;
+    h.supply_mut(X86)?.abandoned = 3;
+    assert_eq!(
+        h.reconcile(),
+        vec![
+            PlanStep {
+                fleet: X86,
+                action: Action::Withdraw { from: 7, to: 4 },
+            },
+            PlanStep {
+                fleet: X86,
+                action: Action::Withdraw { from: 4, to: 2 },
+            },
+        ],
+        "abandoned and failed requests have separate withdrawals"
+    );
+    Ok(())
+}
+
+#[test]
+fn abandoned_requests_are_withdrawn_before_a_scale_out() -> TestResult {
+    let mut h = Harness::new()?;
+    h.supply_mut(X86)?.abandoned = 3;
+    h.queue(X86, 1)?;
+    assert_eq!(
+        h.reconcile(),
+        vec![
+            PlanStep {
+                fleet: X86,
+                action: Action::Withdraw { from: 3, to: 0 },
+            },
+            PlanStep {
+                fleet: X86,
+                action: Action::ScaleOut { from: 0, to: 1 },
+            },
+        ],
+        "abandoned requests are withdrawn before scale-out"
+    );
+    Ok(())
+}
+
+#[test]
+fn failed_launch_withdraws_surplus_unborn_capacity() -> TestResult {
+    let mut h = failed_launch_fleet()?;
+    assert_eq!(
+        h.reconcile(),
+        vec![PlanStep {
+            fleet: X86,
+            action: Action::Withdraw { from: 4, to: 2 },
+        }]
+    );
+    Ok(())
+}
+
+#[test]
+fn failed_launch_withdraws_only_the_surplus() -> TestResult {
+    let mut h = failed_launch_fleet()?;
+    h.queue(X86, 4)?;
+    assert_eq!(
+        h.reconcile(),
+        vec![PlanStep {
+            fleet: X86,
+            action: Action::Withdraw { from: 4, to: 3 },
+        }]
+    );
+    Ok(())
+}
+
+#[test]
+fn in_flight_launches_are_not_withdrawn() -> TestResult {
+    let mut h = failed_launch_fleet()?;
+    h.supply_mut(X86)?.launch_failure = None;
+    assert_eq!(h.reconcile(), Vec::new());
+    Ok(())
+}
+
+#[test]
+fn failed_launch_with_full_demand_keeps_request_without_repeating_scale_out() -> TestResult {
+    let mut h = failed_launch_fleet()?;
+    h.queue(X86, 8)?;
+    assert_eq!(h.reconcile(), Vec::new());
+    Ok(())
+}
+
+#[test]
+fn withdraw_counts_from_the_capacity_left_after_finished_drains() -> TestResult {
+    let mut h = Harness::new()?;
+    for name in ["local-1", "local-2"] {
+        serve(&mut h, name, secs(3600))?;
+        h.set_draining(name, true)?;
+    }
+    h.set_desired_capacity(X86, 3);
+    h.supply_mut(X86)?.launch_failure = Some(gang_spi::LaunchFailure {
+        reason: "launch failed".to_owned(),
+    });
+    assert_eq!(
+        h.reconcile(),
+        vec![
+            terminate("local-1", TerminationCause::DrainFinished)?,
+            terminate("local-2", TerminationCause::DrainFinished)?,
+            PlanStep {
+                fleet: X86,
+                action: Action::Withdraw { from: 1, to: 0 },
+            },
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn withdraw_counts_from_the_capacity_left_after_orphans() -> TestResult {
+    let mut h = Harness::new()?;
+    h.set_desired_capacity(X86, 2);
+    h.launch(X86, "local-1", InstanceLifecycle::InService, secs(3600))?;
+    h.reconcile();
+    h.advance(secs(30));
+    h.supply_mut(X86)?.launch_failure = Some(gang_spi::LaunchFailure {
+        reason: "launch failed".to_owned(),
+    });
+    assert_eq!(
+        h.reconcile(),
+        vec![
+            terminate("local-1", TerminationCause::Orphan)?,
+            PlanStep {
+                fleet: X86,
+                action: Action::Withdraw { from: 1, to: 0 },
+            },
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn failed_launch_resumes_a_finished_drain_before_terminating_it() -> TestResult {
+    let mut h = Harness::new()?;
+    serve(&mut h, "local-1", secs(3600))?;
+    h.set_draining("local-1", true)?;
+    h.set_desired_capacity(X86, 2);
+    h.supply_mut(X86)?.launch_failure = Some(gang_spi::LaunchFailure {
+        reason: "launch failed".to_owned(),
+    });
+    h.queue(X86, 1)?;
+    assert_eq!(
+        h.reconcile(),
+        vec![
+            cancel_drain("local-1")?,
+            PlanStep {
+                fleet: X86,
+                action: Action::Withdraw { from: 2, to: 1 },
+            },
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn failed_launch_is_withdrawn_before_surplus_workers_are_drained() -> TestResult {
+    let mut h = failed_launch_fleet()?;
+    h.set_running("local-1", 0)?;
+    h.set_running("local-2", 0)?;
+    // Observe the idle workers before their timeout starts.
+    assert_eq!(
+        h.reconcile(),
+        vec![PlanStep {
+            fleet: X86,
+            action: Action::Withdraw { from: 4, to: 2 },
+        }]
+    );
+    let idle_timeout = h.passes[X86].policy.idle_timeout;
+    h.advance(idle_timeout);
+    assert_eq!(
+        h.reconcile(),
+        vec![
+            PlanStep {
+                fleet: X86,
+                action: Action::Withdraw { from: 4, to: 2 },
+            },
+            PlanStep {
+                fleet: X86,
+                action: Action::StartDrain(worker_id("local-1")?),
+            },
+            PlanStep {
+                fleet: X86,
+                action: Action::StartDrain(worker_id("local-2")?),
+            },
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn lowering_desired_keeps_live_instances_but_not_terminating_instances() -> TestResult {
+    let mut h = Harness::new()?;
+    h.set_desired_capacity(X86, 5);
+    h.launch(X86, "local-1", InstanceLifecycle::InService, secs(1))?;
+    h.launch(X86, "local-2", InstanceLifecycle::Pending, secs(1))?;
+    h.launch(X86, "local-3", InstanceLifecycle::Terminating, secs(1))?;
+    h.set_desired_capacity(X86, 0);
+    assert_eq!(h.supply(X86)?.desired, 2);
+    Ok(())
+}
+
+#[test]
+fn failed_scale_out_then_disappearing_demand_reaches_zero() -> TestResult {
+    let mut h = Harness::new()?;
+    for name in ["local-1", "local-2"] {
+        serve(&mut h, name, secs(3600))?;
+        h.set_running(name, 4)?;
+    }
+    h.queue(X86, 8)?;
+    assert_eq!(
+        h.run(),
+        vec![PlanStep {
+            fleet: X86,
+            action: Action::ScaleOut { from: 2, to: 4 },
+        }]
+    );
+    h.supply_mut(X86)?.launch_failure = Some(gang_spi::LaunchFailure {
+        reason: "launch failed".to_owned(),
+    });
+    assert_eq!(h.run(), Vec::new());
+    h.snapshot.queued.clear();
+    h.set_running("local-1", 0)?;
+    h.set_running("local-2", 0)?;
+    assert_eq!(
+        h.run(),
+        vec![PlanStep {
+            fleet: X86,
+            action: Action::Withdraw { from: 4, to: 2 },
+        }]
+    );
+    let idle_timeout = h.passes[X86].policy.idle_timeout;
+    h.advance(idle_timeout);
+    assert_eq!(
+        h.run(),
+        vec![
+            PlanStep {
+                fleet: X86,
+                action: Action::StartDrain(worker_id("local-1")?),
+            },
+            PlanStep {
+                fleet: X86,
+                action: Action::StartDrain(worker_id("local-2")?),
+            },
+        ]
+    );
+    assert_eq!(
+        h.run(),
+        vec![
+            terminate("local-1", TerminationCause::DrainFinished)?,
+            terminate("local-2", TerminationCause::DrainFinished)?,
+        ]
+    );
+    assert_eq!(h.supply(X86)?.desired, 0);
+    assert!(h.supply(X86)?.instances.is_empty());
+    assert_eq!(h.run(), Vec::new());
+    Ok(())
+}
+
 #[test]
 fn booting_instance_does_not_repeat_scale_out() -> TestResult {
     let mut h = Harness::new()?;
@@ -174,7 +464,7 @@ fn scale_out_counts_running_actions() -> TestResult {
 #[test]
 fn measured_resources_drive_scale_out() -> TestResult {
     let mut h = Harness::new()?;
-    h.queue_sized(X86, 2, x86_resources(4))?;
+    h.queue_sized(X86, 2, x86_resources(4000))?;
     assert_eq!(
         h.run(),
         vec![PlanStep {

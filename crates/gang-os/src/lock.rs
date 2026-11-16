@@ -6,11 +6,10 @@
 
 use crate::PathIo;
 use crate::fs::PRIVATE_FILE;
-use rustix::fs::{FlockOperation, flock};
+use rustix::fs::{FlockOperation, OFlags, flock};
 use rustix::io::Errno;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::Stdio;
 
@@ -72,7 +71,11 @@ impl FileLock {
     /// Returns an error when the file cannot be opened (action "open lock file") or the lock
     /// call fails (action "lock").
     pub fn exclusive_blocking(path: &Path) -> Result<Self, PathIo> {
-        let file = open_lock_file(path)?;
+        Self::exclusive_blocking_on(open_lock_file(path)?, path)
+    }
+
+    /// Takes an exclusive lock on an already opened file, retrying interruptions.
+    pub(crate) fn exclusive_blocking_on(file: File, path: &Path) -> Result<Self, PathIo> {
         loop {
             match flock(&file, FlockOperation::LockExclusive) {
                 Ok(()) => return Ok(Self { file }),
@@ -101,19 +104,18 @@ impl From<FileLock> for Stdio {
 }
 
 fn open_lock_file(path: &Path) -> Result<File, PathIo> {
-    OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .mode(PRIVATE_FILE)
-        .open(path)
-        .map_err(|source| PathIo::new("open lock file", path, source))
+    rustix::fs::open(
+        path,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::CLOEXEC,
+        PRIVATE_FILE,
+    )
+    .map(File::from)
+    .map_err(|errno| PathIo::new("open lock file", path, errno.into()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::FileLock;
-    use crate::fs::PRIVATE_FILE;
     use gang_testkit::{ChildTest, TestResult, fork_gate};
     use std::io::{self, BufRead, BufReader, Read, Write};
     use std::os::unix::fs::PermissionsExt;
@@ -136,7 +138,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("lock");
         let lock = FileLock::try_exclusive(&path)?.ok_or("first try_exclusive was busy")?;
-        assert_eq!(mode_of(&path)?, PRIVATE_FILE);
+        assert_eq!(mode_of(&path)?, 0o600);
         assert!(FileLock::try_exclusive(&path)?.is_none());
         drop(lock);
         assert!(FileLock::try_exclusive(&path)?.is_some());

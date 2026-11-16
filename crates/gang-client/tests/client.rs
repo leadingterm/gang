@@ -13,5 +13,6 @@ mod client {
     mod revoke;
     mod session_pin;
     mod token;
+    mod whoami;
     mod workload;
 }

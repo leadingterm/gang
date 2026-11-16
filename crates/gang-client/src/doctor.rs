@@ -1,6 +1,8 @@
 //! The `gang doctor` run: asks the server, Bazel, and the credential helper what they see, and
 //! turns the answers into a [`Report`] through the pure checks of [`crate::doctor_checks`].
 
+use std::path::PathBuf;
+
 use gang_clock::Clock;
 use gang_tls::ServerTrust;
 use gang_types::Url;
@@ -9,10 +11,12 @@ use serde_json::Value;
 
 use crate::ClientOptions;
 use crate::bazel_options::{BazelProbe, EffectiveOptions};
+use crate::conflicts::find_conflicts;
 use crate::doctor_checks::{
     Endpoint, Gang, bazel_failed, bazel_reported, clock, credential_helper, credentials,
     credentials_not_needed, credentials_unsupported, helper_for, needs_bazel, needs_helper,
-    needs_server, remote_endpoint, server_failed, server_reached, tls_certificate, tls_trusted,
+    needs_server, remote_endpoint, remote_headers, server_failed, server_reached, tls_certificate,
+    tls_trusted,
 };
 use crate::doctor_report::{Check, Finding, Report, Status};
 use crate::server_probe::ServerProbe;
@@ -28,9 +32,10 @@ pub enum Event<'e> {
 }
 
 /// The rows whose inputs are Bazel's effective options, in report order.
-const BAZEL_ROWS: [Check; 4] = [
+const BAZEL_ROWS: [Check; 5] = [
     Check::RemoteExecutor,
     Check::RemoteCache,
+    Check::RemoteHeaders,
     Check::TlsCertificate,
     Check::CredentialHelper,
 ];
@@ -44,11 +49,12 @@ pub struct Doctor<'a, B, S, K> {
     server: &'a Url,
     trust: ServerTrust<'a>,
     options: &'a ClientOptions,
+    owned_rc: PathBuf,
 }
 
 impl<'a, B: BazelProbe, S: ServerProbe, K: Clock> Doctor<'a, B, S, K> {
     /// Creates a doctor for `server` that asks `bazel` and `probe`, reads time from `clock`, and
-    /// reports the trust that verified the server.
+    /// reports the server's trust and uses `owned_rc` for the probed workspace.
     pub fn new(
         bazel: &'a B,
         probe: &'a S,
@@ -56,6 +62,7 @@ impl<'a, B: BazelProbe, S: ServerProbe, K: Clock> Doctor<'a, B, S, K> {
         server: &'a Url,
         trust: ServerTrust<'a>,
         options: &'a ClientOptions,
+        owned_rc: PathBuf,
     ) -> Self {
         Self {
             bazel,
@@ -64,6 +71,7 @@ impl<'a, B: BazelProbe, S: ServerProbe, K: Clock> Doctor<'a, B, S, K> {
             server,
             trust,
             options,
+            owned_rc,
         }
     }
 
@@ -139,7 +147,7 @@ impl<'a, B: BazelProbe, S: ServerProbe, K: Clock> Doctor<'a, B, S, K> {
         let options = match self.bazel.effective_options().await {
             Ok(options) => options,
             Err(error) => {
-                push(findings, observe, bazel_failed(&error));
+                push(findings, observe, bazel_failed(&error, self.server));
                 for check in BAZEL_ROWS {
                     let skipped = match info {
                         Some(_) => needs_bazel(check),
@@ -157,12 +165,21 @@ impl<'a, B: BazelProbe, S: ServerProbe, K: Clock> Doctor<'a, B, S, K> {
                     server: self.server,
                     info,
                 };
-                let executor = remote_endpoint(&gang, &options, Endpoint::Executor, false);
+                let conflicts = find_conflicts(info, &options, &self.owned_rc);
+                let executor =
+                    remote_endpoint(&gang, &options, Endpoint::Executor, false, &conflicts);
                 let executor_is_gang = executor.status == Status::Ok;
-                let cache = remote_endpoint(&gang, &options, Endpoint::Cache, executor_is_gang);
+                let cache = remote_endpoint(
+                    &gang,
+                    &options,
+                    Endpoint::Cache,
+                    executor_is_gang,
+                    &conflicts,
+                );
                 for finding in [
                     executor,
                     cache,
+                    remote_headers(&options, &self.owned_rc, &conflicts),
                     tls_certificate(&gang, &options),
                     credential_helper(&gang, &options),
                 ] {
@@ -362,7 +379,7 @@ mod tests {
         options: &ClientOptions,
     ) -> Report {
         let server = server();
-        Doctor::new(bazel, probe, clock, &server, trust, options)
+        Doctor::new(bazel, probe, clock, &server, trust, options, PathBuf::new())
             .diagnose()
             .await
     }
@@ -373,6 +390,46 @@ mod tests {
             .iter()
             .find(|finding| finding.check == check)
             .expect("every check has a row")
+    }
+
+    /// The header check uses the workspace chosen by the caller, not the process cwd.
+    #[tokio::test]
+    async fn doctor_respects_passed_owned_rc() {
+        let dir = tempfile::tempdir().expect("temporary workspace");
+        let owned = dir.path().join(".gang").join("bazelrc");
+        std::fs::create_dir_all(owned.parent().expect("parent")).expect("create directory");
+        std::fs::write(&owned, "build --remote_header=x=y\n").expect("write rc");
+        let bazel = FakeBazel {
+            options: Some(EffectiveOptions::new(vec![(
+                "remote_header".to_owned(),
+                setting(
+                    "x=y",
+                    OptionSource::RcFile {
+                        path: owned.clone(),
+                        section: "build".into(),
+                    },
+                ),
+            )])),
+        };
+        let probe = healthy_server(Some(now()));
+        let clock = TestClock::new(now());
+        let server = server();
+        let options = ClientOptions::default();
+        let report = Doctor::new(
+            &bazel,
+            &probe,
+            &clock,
+            &server,
+            ServerTrust::System,
+            &options,
+            owned,
+        )
+        .diagnose()
+        .await;
+        assert!(
+            finding(&report, Check::RemoteHeaders).status == Status::Ok,
+            "header from passed owned rc must be accepted"
+        );
     }
 
     fn statuses(report: &Report) -> Vec<(Check, Status)> {
@@ -401,6 +458,7 @@ mod tests {
                 (Check::Bazel, Status::Ok),
                 (Check::RemoteExecutor, Status::Ok),
                 (Check::RemoteCache, Status::Ok),
+                (Check::RemoteHeaders, Status::Ok),
                 (Check::TlsCertificate, Status::Ok),
                 (Check::CredentialHelper, Status::Ok),
                 (Check::Credentials, Status::Ok),
@@ -545,6 +603,7 @@ mod tests {
                 (Check::Bazel, Status::Ok),
                 (Check::RemoteExecutor, Status::Skip),
                 (Check::RemoteCache, Status::Skip),
+                (Check::RemoteHeaders, Status::Skip),
                 (Check::TlsCertificate, Status::Skip),
                 (Check::CredentialHelper, Status::Skip),
                 (Check::Credentials, Status::Skip),
@@ -571,6 +630,7 @@ mod tests {
                 (Check::Bazel, Status::Fail),
                 (Check::RemoteExecutor, Status::Skip),
                 (Check::RemoteCache, Status::Skip),
+                (Check::RemoteHeaders, Status::Skip),
                 (Check::TlsCertificate, Status::Skip),
                 (Check::CredentialHelper, Status::Skip),
                 (Check::Credentials, Status::Skip),
@@ -615,14 +675,22 @@ mod tests {
         let server = server();
         let options = ClientOptions::default();
         let mut events = Vec::new();
-        let report = Doctor::new(bazel, probe, clock, &server, ServerTrust::System, &options)
-            .diagnose_with(&mut |event: Event<'_>| {
-                events.push(match event {
-                    Event::Started(check) => Seen::Started(check),
-                    Event::Finished(finding) => Seen::Finished(finding.check, finding.status),
-                });
-            })
-            .await;
+        let report = Doctor::new(
+            bazel,
+            probe,
+            clock,
+            &server,
+            ServerTrust::System,
+            &options,
+            PathBuf::new(),
+        )
+        .diagnose_with(&mut |event: Event<'_>| {
+            events.push(match event {
+                Event::Started(check) => Seen::Started(check),
+                Event::Finished(finding) => Seen::Finished(finding.check, finding.status),
+            });
+        })
+        .await;
         (report, events)
     }
 
@@ -657,6 +725,7 @@ mod tests {
                 Seen::Finished(Check::Bazel, Status::Ok),
                 Seen::Finished(Check::RemoteExecutor, Status::Ok),
                 Seen::Finished(Check::RemoteCache, Status::Ok),
+                Seen::Finished(Check::RemoteHeaders, Status::Ok),
                 Seen::Finished(Check::TlsCertificate, Status::Ok),
                 Seen::Finished(Check::CredentialHelper, Status::Ok),
                 Seen::Started(Check::Credentials),
@@ -691,6 +760,7 @@ mod tests {
                 Seen::Finished(Check::Bazel, Status::Ok),
                 Seen::Finished(Check::RemoteExecutor, Status::Skip),
                 Seen::Finished(Check::RemoteCache, Status::Skip),
+                Seen::Finished(Check::RemoteHeaders, Status::Skip),
                 Seen::Finished(Check::TlsCertificate, Status::Skip),
                 Seen::Finished(Check::CredentialHelper, Status::Skip),
                 Seen::Finished(Check::Credentials, Status::Skip),
@@ -718,6 +788,7 @@ mod tests {
                 Seen::Finished(Check::Bazel, Status::Fail),
                 Seen::Finished(Check::RemoteExecutor, Status::Skip),
                 Seen::Finished(Check::RemoteCache, Status::Skip),
+                Seen::Finished(Check::RemoteHeaders, Status::Skip),
                 Seen::Finished(Check::TlsCertificate, Status::Skip),
                 Seen::Finished(Check::CredentialHelper, Status::Skip),
                 Seen::Finished(Check::Credentials, Status::Skip),
@@ -914,12 +985,14 @@ mod tests {
 
         let report = run(&bazel, &probe, &clock, &ClientOptions::default()).await;
 
-        assert_eq!(report.findings().len(), 9);
-        assert!(
+        assert_eq!(report.findings().len(), Check::ALL.len());
+        assert_eq!(
             report
                 .findings()
-                .windows(2)
-                .all(|pair| pair[0].check <= pair[1].check),
+                .iter()
+                .map(|finding| finding.check)
+                .collect::<Vec<_>>(),
+            Check::ALL,
             "{:?}",
             statuses(&report)
         );

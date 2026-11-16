@@ -8,7 +8,7 @@ use crate::check::Check;
 use crate::errors::{E2eError, Result};
 use crate::event_log::{describe_early_exit, early_exit, scale_out_recorded};
 use crate::execution::{
-    COLD_START_MISFIT_MESSAGE, ESCALATION_MAX_STEPS, Execution, NO_FLEET_ACCEPTS,
+    COLD_START_MISFIT_MESSAGE, ESCALATION_MAX_STEPS, Execution, NO_FLEET_ACCEPTS, REFUSED_DISK_KEY,
 };
 use crate::names::{cold_start, disk_guard, escalation, oversized_fleet};
 use crate::system::{Limits, Probe, System};
@@ -88,7 +88,7 @@ pub fn unplaceable_disk<S: Limits, E: Execution>(
         }),
         Check::expect(
             disk_guard::NAMES_NO_FLEET,
-            outcome.stderr.contains(NO_FLEET_ACCEPTS),
+            outcome.stderr.contains(NO_FLEET_ACCEPTS) && outcome.stderr.contains(REFUSED_DISK_KEY),
             || {
                 format!(
                     "the build did not name the refusal; it said:\n{}",

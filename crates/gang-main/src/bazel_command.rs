@@ -1,9 +1,9 @@
 //! The Bazel commands: `gang get`, the credential helper Bazel runs for a server, and `gang bazelrc`,
 //! which prints the Bazel settings that point a build at a server.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, IsTerminal, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
 use gang_client::{BazelrcRequest, CA_FILE_NAME};
@@ -73,10 +73,11 @@ fn present_terminal_hint(out: &Output) {
 /// server has one.
 pub(crate) fn bazelrc(args: &BazelrcArgs, out: &Output) -> Result<ExitCode> {
     let client = client(out)?;
+    let helper = credential_helper(args.helper.as_deref())?;
     let request = BazelrcRequest {
         server: &args.server,
         ca_pin: args.ca_pin.as_ref(),
-        helper: &args.helper,
+        helper: &helper,
     };
     let settings = runtime::block_on(client.bazelrc(&request))?;
     let ca_path = match &settings.ca_certificate {
@@ -91,6 +92,63 @@ pub(crate) fn bazelrc(args: &BazelrcArgs, out: &Output) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// The credential helper `gang bazelrc` names: `explicit` when given, otherwise the running `gang`
+/// by absolute path. Bazel looks a bare name up on its own `PATH`, which need not hold the
+/// directory the user's shell found `gang` in.
+pub(crate) fn credential_helper(explicit: Option<&str>) -> Result<String> {
+    if let Some(helper) = explicit {
+        return Ok(helper.to_owned());
+    }
+    let running = std::env::current_exe().map_err(MainError::CurrentExecutable)?;
+    let argv0 = std::env::args_os().next().unwrap_or_default();
+    let cwd = std::env::current_dir().ok();
+    let search = std::env::var_os("PATH");
+    let path = invoked_executable(
+        Path::new(&argv0),
+        cwd.as_deref(),
+        search.as_deref(),
+        &running,
+    )
+    .map_err(MainError::CurrentExecutable)?;
+    path.into_os_string()
+        .into_string()
+        .map_err(|path| MainError::ExecutablePath(PathBuf::from(path)))
+}
+
+/// The absolute path the running executable `running` was invoked by: `argv0` against `cwd` when
+/// it names a path, otherwise the first absolute `search` entry holding `argv0` that is `running`,
+/// as a shell finds a command. Symlinks stay unresolved, so an upgrade that replaces the file or
+/// retargets a link keeps the path valid. Without such a path, or when it holds `..` (which
+/// Bazel refuses in a credential helper), the answer is `running` with every link resolved.
+fn invoked_executable(
+    argv0: &Path,
+    cwd: Option<&Path>,
+    search: Option<&OsStr>,
+    running: &Path,
+) -> io::Result<PathBuf> {
+    let running = std::fs::canonicalize(running)?;
+    let is_running = |file: &Path| std::fs::canonicalize(file).is_ok_and(|real| real == running);
+    let invoked = if argv0.as_os_str().as_encoded_bytes().contains(&b'/') {
+        cwd.map(|cwd| cwd.join(argv0))
+    } else {
+        search
+            .into_iter()
+            .flat_map(std::env::split_paths)
+            .filter(|dir| dir.is_absolute())
+            .map(|dir| dir.join(argv0))
+            .find(|file| is_running(file))
+    };
+    Ok(invoked
+        // Collecting the components drops every `.` after the root.
+        .map(|file| file.components().collect::<PathBuf>())
+        .filter(|file| {
+            file.is_absolute()
+                && !file.components().any(|part| part == Component::ParentDir)
+                && is_running(file)
+        })
+        .unwrap_or(running))
+}
+
 /// Resolves the CA file relative to the directory where the command was invoked.
 fn ca_certificate_path(env: impl Fn(&str) -> Option<OsString>) -> PathBuf {
     crate::workspace::absolute(PathBuf::from(CA_FILE_NAME), env)
@@ -98,7 +156,8 @@ fn ca_certificate_path(env: impl Fn(&str) -> Option<OsString>) -> PathBuf {
 
 /// Writes the CA certificate that the rc file refers to, replacing any earlier copy.
 fn write_ca_certificate(path: &Path, pem: &str) -> Result<()> {
-    gang_os::fs::write_atomic(path, pem.as_bytes(), 0o644).map_err(MainError::CaCertificate)
+    gang_os::fs::write_atomic(path, pem.as_bytes(), gang_os::fs::PUBLIC_FILE)
+        .map_err(MainError::CaCertificate)
 }
 
 /// Prints the rc text as data, one line per line of text, then says which file was written for
@@ -123,13 +182,137 @@ fn present_bazelrc(out: &Output, rc_text: &str, ca_path: Option<&Path>) -> Resul
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
     use crate::palette::Palette;
 
     use super::*;
 
     const RC_TEXT: &str = "# Written by `gang bazelrc`. Do not edit.\n\
                            build --remote_executor=grpcs://gang.example.com:443\n\
-                           build --credential_helper=gang.example.com=gang\n";
+                           build --credential_helper=gang.example.com=/usr/local/bin/gang\n";
+
+    /// An installed link to the running test binary and its resolved path.
+    struct Installed {
+        /// Directory holding the executable link.
+        bin: tempfile::TempDir,
+        /// Path of the running test binary.
+        running: PathBuf,
+        /// Canonical path of the running test binary.
+        real: PathBuf,
+    }
+
+    /// Installs a link to the running binary in a temporary directory.
+    fn installed() -> Installed {
+        let bin = tempfile::tempdir().expect("temporary bin");
+        let running = std::env::current_exe().expect("test binary path");
+        let real = std::fs::canonicalize(&running).expect("canonical test binary");
+        symlink(&running, bin.path().join("gang")).expect("gang symlink");
+        Installed { bin, running, real }
+    }
+
+    /// Creates another executable named gang that is not the running binary.
+    fn other_gang() -> tempfile::TempDir {
+        let other = tempfile::tempdir().expect("other directory");
+        let path = other.path().join("gang");
+        std::fs::write(&path, b"#!/bin/sh\n").expect("other gang");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("executable permissions");
+        other
+    }
+
+    #[test]
+    fn a_bare_name_is_the_path_entry_holding_it_with_links_unresolved() {
+        let Installed { bin, running, real } = installed();
+        let search =
+            std::env::join_paths([Path::new("relative/dir"), bin.path()]).expect("search path");
+        let found = invoked_executable(Path::new("gang"), None, Some(&search), &running)
+            .expect("invoked executable");
+        assert_eq!(found, bin.path().join("gang"));
+        assert_eq!(
+            std::fs::canonicalize(found).expect("resolved symlink"),
+            real
+        );
+    }
+
+    #[test]
+    fn a_bare_name_skips_path_entries_holding_another_file() {
+        let Installed { bin, running, real } = installed();
+        let other = other_gang();
+        let search = std::env::join_paths([other.path(), bin.path()]).expect("search path");
+        let found = invoked_executable(Path::new("gang"), None, Some(&search), &running)
+            .expect("invoked executable");
+        assert_eq!(found, bin.path().join("gang"));
+        assert_eq!(
+            std::fs::canonicalize(found).expect("resolved symlink"),
+            real
+        );
+    }
+
+    #[test]
+    fn a_bare_name_on_no_path_entry_is_the_running_file_resolved() {
+        let Installed {
+            bin: _bin,
+            running,
+            real,
+        } = installed();
+        let other = tempfile::tempdir().expect("other directory");
+        let search = std::env::join_paths([other.path()]).expect("search path");
+        assert_eq!(
+            invoked_executable(Path::new("gang"), None, Some(&search), &running)
+                .expect("invoked executable"),
+            real
+        );
+        assert_eq!(
+            invoked_executable(Path::new("gang"), None, None, &running)
+                .expect("invoked executable"),
+            real
+        );
+    }
+
+    #[test]
+    fn a_relative_path_is_absolute_against_the_working_directory() {
+        let Installed { bin, running, real } = installed();
+        let found = invoked_executable(Path::new("./gang"), Some(bin.path()), None, &running)
+            .expect("invoked executable");
+        assert_eq!(found, bin.path().join("gang"));
+        assert_eq!(
+            std::fs::canonicalize(found).expect("resolved symlink"),
+            real
+        );
+    }
+
+    #[test]
+    fn a_path_with_parent_components_is_the_running_file_resolved() {
+        let Installed { bin, running, real } = installed();
+        let sub = bin.path().join("sub");
+        std::fs::create_dir(&sub).expect("subdirectory");
+        assert_eq!(
+            invoked_executable(Path::new("../gang"), Some(&sub), None, &running)
+                .expect("invoked executable"),
+            real
+        );
+    }
+
+    #[test]
+    fn a_path_naming_another_file_is_the_running_file_resolved() {
+        let Installed { bin, running, real } = installed();
+        let other = other_gang();
+        let other_gang = other.path().join("gang");
+        assert_eq!(
+            invoked_executable(&other_gang, Some(bin.path()), None, &running)
+                .expect("invoked executable"),
+            real
+        );
+    }
+
+    #[test]
+    fn an_explicit_helper_is_used_verbatim() {
+        assert_eq!(
+            credential_helper(Some("gang")).expect("explicit helper"),
+            "gang"
+        );
+    }
 
     #[test]
     fn ca_certificate_path_uses_bazels_working_directory() {

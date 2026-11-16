@@ -16,9 +16,9 @@ pub trait ProvisionerPort: Send + Sync {
     /// the composed provisioners to implement [`FleetOptions`](crate::FleetOptions).
     type FleetOptions: std::fmt::Debug + Send + Sync + 'static;
 
-    /// Overwrites `into` with the fleet's current size, instances, and observed early exits.
-    /// Its buffers are reused so callers can pass the same value on every pass. On `Err`, `into`
-    /// is unspecified; callers skip the pass.
+    /// Overwrites `into` with the fleet's current size, instances, and observed early exits. It
+    /// only reads: it never changes the fleet. Its buffers are reused so callers can pass the same
+    /// value on every pass. On `Err`, `into` is unspecified; callers skip the pass.
     ///
     /// # Errors
     ///
@@ -29,10 +29,12 @@ pub trait ProvisionerPort: Send + Sync {
         into: &mut FleetSupply,
     ) -> Result<(), PortError>;
 
-    /// Raises the instances the provisioner keeps or converges to up to `desired`; each
-    /// instance is [`Fleet::instance`] in size. Never removes instances: scale-in is not done
-    /// through this call, the autoscaler drains a worker and then calls
-    /// [`terminate`](Self::terminate).
+    /// Sets the instances the fleet asks for, each [`Fleet::instance`] in size. A higher
+    /// `desired` raises the request; a lower one withdraws requested instances that do not exist
+    /// yet, never below the instances that exist (pending or in service, not terminating). It
+    /// never removes an instance: scale-in drains a worker and then calls
+    /// [`terminate`](Self::terminate). A call that keeps `desired` unchanged withdraws abandoned
+    /// requests; any other call changes only the requested count.
     ///
     /// # Errors
     ///
@@ -84,6 +86,11 @@ pub struct FleetSupply {
     /// when an instance exits and is not replaced (a finished pod or job); an autoscaling
     /// group keeps its stored value.
     pub desired: u32,
+    /// Instances still requested from the backend but excluded from `desired` because the
+    /// provisioner gave up launching them (for example, a down Spot group's unmet request).
+    /// A `set_desired_capacity` call at the current `desired` withdraws them; zero if requests
+    /// are never abandoned.
+    pub abandoned: u32,
     /// The instances that exist, in any state.
     pub instances: Vec<FleetInstance>,
     /// The instances parked in a warm pool; `0` without one.
@@ -91,6 +98,18 @@ pub struct FleetSupply {
     /// The instances whose worker failed soon after its launch since the previous call; empty
     /// for a provisioner that cannot tell.
     pub exits: Vec<InstanceExit>,
+    /// Why the provisioner cannot launch the instances `desired` asks for beyond those that
+    /// exist: the newest launch attempt for the fleet failed and no launch is in flight.
+    /// `None` while the request is met, while a launch is in flight, or when the provisioner
+    /// cannot tell.
+    pub launch_failure: Option<LaunchFailure>,
+}
+
+/// A failed launch attempt for a fleet whose request remains unmet and has no launch in flight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchFailure {
+    /// The provider's own message, verbatim.
+    pub reason: String,
 }
 
 /// An instance whose worker failed soon after its launch, as a provisioner observed it.

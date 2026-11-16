@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use gang_os::FileLock;
 use gang_os::fs::{
     PRIVATE_FILE, PrivateDirError, ensure_private_dir, read_optional, remove_optional,
-    require_private_dir, write_atomic,
+    require_private_dir,
 };
 use serde::{Deserialize, Serialize};
 
@@ -108,13 +108,17 @@ impl ServerDirectory {
             path: path.clone(),
             source,
         })?;
-        write_atomic(&path, &bytes, PRIVATE_FILE)?;
+        ensure_private_dir(&self.server_dir)?.write_atomic(RECORD_FILE, &bytes, PRIVATE_FILE)?;
         Ok(())
     }
 
     /// Atomically replaces the configuration copy the server is started with.
     pub(crate) fn write_config(&self, text: &str) -> Result<(), LocalCommandError> {
-        write_atomic(&self.config_path(), text.as_bytes(), PRIVATE_FILE)?;
+        ensure_private_dir(&self.server_dir)?.write_atomic(
+            CONFIG_FILE,
+            text.as_bytes(),
+            PRIVATE_FILE,
+        )?;
         Ok(())
     }
 
@@ -213,7 +217,7 @@ mod tests {
         match directory.create() {
             Err(LocalCommandError::StateDirNotPrivate { path, mode }) => {
                 assert_eq!(path, state);
-                assert_eq!(mode, 0o755);
+                assert_eq!(mode, gang_os::fs::Mode::from_bits_retain(0o755));
             }
             other => panic!("expected a state directory refusal, got {other:?}"),
         }
@@ -272,7 +276,7 @@ mod tests {
         let directory = ServerDirectory::new(&state);
         directory.create().expect("create");
         directory.write(&sample_record(&state, 7)).expect("write");
-        assert_eq!(mode(&directory.record_path()), PRIVATE_FILE);
+        assert_eq!(mode(&directory.record_path()), 0o600);
     }
 
     #[test]
@@ -304,7 +308,7 @@ mod tests {
         let directory = ServerDirectory::new(&temp.path().join("state"));
         directory.create().expect("create");
         directory.write_config("[server]\n").expect("write config");
-        assert_eq!(mode(&directory.config_path()), PRIVATE_FILE);
+        assert_eq!(mode(&directory.config_path()), 0o600);
     }
 
     #[test]

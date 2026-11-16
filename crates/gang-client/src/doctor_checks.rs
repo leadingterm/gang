@@ -11,13 +11,16 @@ use serde_json::Value;
 use url::Url;
 
 use crate::bazel_options::{
-    CREDENTIAL_HELPER, EffectiveOptions, OptionSource, REMOTE_CACHE, REMOTE_EXECUTOR,
-    TLS_CERTIFICATE,
+    CREDENTIAL_HELPER, EffectiveOptions, OptionSource, REMOTE_CACHE, REMOTE_CACHE_HEADER,
+    REMOTE_EXEC_HEADER, REMOTE_EXECUTOR, REMOTE_HEADER, TLS_CERTIFICATE,
 };
 use crate::bazelrc::display_url;
-use crate::doctor_report::{Check, Finding, Status};
+use crate::conflicts::{CAS_MISMATCH, Conflict, ConflictReason, same_rc};
+#[cfg(test)]
+use crate::doctor_report::Status;
+use crate::doctor_report::{Check, Finding};
 use crate::errors::{BazelError, REACH_FIX, TRUST_FIX};
-use crate::server_probe::{CredentialFault, ServerFault};
+use crate::server_probe::{CredentialFault, ServerFault, same_server};
 
 /// The server as the doctor found it: the URL the user gave and the information it answered with.
 pub(crate) struct Gang<'a> {
@@ -62,17 +65,9 @@ impl Endpoint {
     }
 }
 
-/// Appended to the fix of a failing cache row when the executor is Gang's own.
-const CAS_HINT: &str = "; actions upload elsewhere and fail with \"missing from CAS\"";
-
 /// Fix shown when the server rejects the URL the user gave.
 const WRONG_URL_FIX: &str =
     "use the public URL of the Gang server, the one `gang bazelrc --server` takes";
-
-/// Whether a flag value names `expected`, ignoring one trailing `/`.
-fn same_url(value: &str, expected: &str) -> bool {
-    value.strip_suffix('/').unwrap_or(value) == expected.strip_suffix('/').unwrap_or(expected)
-}
 
 /// Where a Bazel setting came from, as the ` from ...` tail of a summary; empty when unknown.
 fn origin_suffix(source: &OptionSource) -> String {
@@ -307,25 +302,30 @@ pub(crate) fn bazel_reported() -> Finding {
     Finding::ok(Check::Bazel, "Bazel reported its effective flags")
 }
 
-/// The `bazel` finding when Bazel's effective options could not be read.
-pub(crate) fn bazel_failed(error: &BazelError) -> Finding {
+/// The `bazel` finding when Bazel's effective options could not be read; a fix that names
+/// `gang bazelrc` names `server`.
+pub(crate) fn bazel_failed(error: &BazelError, server: &Url) -> Finding {
     Finding::fail(
         Check::Bazel,
         "cannot read Bazel's effective flags",
-        bazel_fix(error),
+        bazel_fix(error, server),
     )
     .with_cause(error_chain(error).to_string())
 }
 
 /// The fix for a failure to read Bazel's effective options.
-fn bazel_fix(error: &BazelError) -> &'static str {
+fn bazel_fix(error: &BazelError, server: &Url) -> String {
     match error {
-        BazelError::Spawn { .. } => "install Bazel, or pass --bazel <program>",
+        BazelError::Spawn { .. } => "install Bazel, or pass --bazel <program>".to_owned(),
         BazelError::TimedOut { .. } => {
-            "run `bazel build --nobuild` in this directory to see what stalls it"
+            "run `bazel build --nobuild` in this directory to see what stalls it".to_owned()
         }
+        BazelError::HelperNotOnPath { helper, .. } => format!(
+            "Bazel looks the credential helper `{helper}` up on its own PATH: run `gang setup --server {}`; it names gang by absolute path",
+            display_url(server)
+        ),
         BazelError::NoCommandLine { .. } | BazelError::Events { .. } => {
-            "run `bazel build --nobuild` in this workspace directory and fix what it reports; `gang doctor` must run inside the workspace"
+            "run `bazel build --nobuild` in this workspace directory and fix what it reports; `gang doctor` must run inside the workspace".to_owned()
         }
     }
 }
@@ -339,18 +339,14 @@ pub(crate) fn remote_endpoint(
     options: &EffectiveOptions,
     endpoint: Endpoint,
     executor_is_gang: bool,
+    conflicts: &[Conflict],
 ) -> Finding {
     if endpoint == Endpoint::Cache
         && let Some(finding) = executor_serves_cache(gang, options)
     {
         return finding;
     }
-    let finding = endpoint_finding(gang, options, endpoint);
-    if finding.status == Status::Fail && endpoint == Endpoint::Cache && executor_is_gang {
-        let fix = finding.fix.map(|fix| format!("{fix}{CAS_HINT}"));
-        return Finding { fix, ..finding };
-    }
-    finding
+    endpoint_finding(gang, options, endpoint, executor_is_gang, conflicts)
 }
 
 /// The cache row when Bazel serves the cache through `--remote_executor`: `--remote_cache` is
@@ -366,35 +362,46 @@ fn executor_serves_cache(gang: &Gang, options: &EffectiveOptions) -> Option<Find
         .value(REMOTE_EXECUTOR)
         .filter(|setting| !setting.value.is_empty())?;
     let expected = display_url(&gang.info.remote_cache);
-    if same_url(&executor.value, expected) {
+    if same_server(&executor.value, &gang.info.remote_cache) {
         return Some(Finding::ok(Check::RemoteCache, expected));
     }
     Some(Finding::fail(
         Check::RemoteCache,
         format!("{} from --remote_executor", executor.value),
         format!(
-            "run `gang bazelrc --server {}` and put its output in the workspace .bazelrc; Bazel caches through --remote_executor instead of Gang's cache {expected}",
+            "run `gang setup --server {}`; Bazel caches through --remote_executor instead of Gang's cache {expected}",
             display_url(gang.server)
         ),
     ))
 }
 
-/// The endpoint finding before the cache hint is considered.
-fn endpoint_finding(gang: &Gang, options: &EffectiveOptions, endpoint: Endpoint) -> Finding {
+/// The endpoint finding, using the conflict's fix when one was found.
+fn endpoint_finding(
+    gang: &Gang,
+    options: &EffectiveOptions,
+    endpoint: Endpoint,
+    executor_is_gang: bool,
+    conflicts: &[Conflict],
+) -> Finding {
     let check = endpoint.check();
     let flag = endpoint.flag();
     let expected = display_url(endpoint.expected(gang.info));
+    let hint = if endpoint == Endpoint::Cache && executor_is_gang {
+        format!("; {CAS_MISMATCH}")
+    } else {
+        String::new()
+    };
     let Some(setting) = options.value(flag) else {
         return Finding::fail(
             check,
             format!("Bazel sets no --{flag}"),
             format!(
-                "run `gang bazelrc --server {}` and put its output in the workspace .bazelrc",
+                "run `gang setup --server {}`{hint}",
                 display_url(gang.server)
             ),
         );
     };
-    if same_url(&setting.value, expected) {
+    if same_server(&setting.value, endpoint.expected(gang.info)) {
         return Finding::ok(check, expected);
     }
     let origin = origin_suffix(&setting.source);
@@ -403,14 +410,25 @@ fn endpoint_finding(gang: &Gang, options: &EffectiveOptions, endpoint: Endpoint)
     } else {
         format!("{}{origin}", setting.value)
     };
-    Finding::fail(
-        check,
-        summary,
-        format!(
-            "{}; Gang's is {expected}",
-            endpoint_fix(flag, &setting.source)
-        ),
-    )
+    let conflict = conflicts.iter().find(|conflict| {
+        conflict.reasons.iter().any(|reason| {
+            matches!(
+                (endpoint, reason),
+                (Endpoint::Executor, ConflictReason::Executor)
+                    | (Endpoint::Cache, ConflictReason::Cache { .. })
+            )
+        })
+    });
+    let fix = conflict.map_or_else(
+        || {
+            format!(
+                "{}; Gang's is {expected}{hint}",
+                endpoint_fix(flag, &setting.source)
+            )
+        },
+        Conflict::fix,
+    );
+    Finding::fail(check, summary, fix)
 }
 
 /// The `tls_certificate` finding: Bazel must trust the CA certificate when the server has one.
@@ -431,7 +449,7 @@ pub(crate) fn tls_certificate(gang: &Gang, options: &EffectiveOptions) -> Findin
             Check::TlsCertificate,
             "Bazel has no --tls_certificate",
             format!(
-                "run `gang bazelrc --server {}` and keep the gang-ca.pem it writes next to the rc file; the server uses Gang's own CA",
+                "run `gang setup --server {}`; the server uses Gang's own CA",
                 display_url(gang.server)
             ),
         ),
@@ -449,12 +467,60 @@ pub(crate) fn credential_helper(gang: &Gang, options: &EffectiveOptions) -> Find
         None => Finding::fail(
             Check::CredentialHelper,
             format!("no --credential_helper covers {host}"),
-            format!(
-                "run `gang bazelrc --server {}` and put its output in the workspace .bazelrc",
-                display_url(gang.server)
-            ),
+            format!("run `gang setup --server {}`", display_url(gang.server)),
         ),
     }
+}
+
+/// Report effective headers not proven to originate from Gang's owned rc.
+pub(crate) fn remote_headers(
+    options: &EffectiveOptions,
+    owned: &Path,
+    conflicts: &[Conflict],
+) -> Finding {
+    let headers: Vec<_> = conflicts
+        .iter()
+        .filter(|c| {
+            c.reasons
+                .iter()
+                .any(|r| matches!(r, ConflictReason::Header { .. }))
+        })
+        .collect();
+    let mut summary: Vec<String> = headers
+        .iter()
+        .flat_map(|c| {
+            c.reasons.iter().filter_map(move |reason| match reason {
+                ConflictReason::Header { flag, .. } => {
+                    Some(format!("--{flag} from {}:{}", c.path.display(), c.line))
+                }
+                _ => None,
+            })
+        })
+        .collect();
+    let mut fixes: Vec<String> = headers.iter().map(|c| c.fix()).collect();
+    for flag in [REMOTE_HEADER, REMOTE_CACHE_HEADER, REMOTE_EXEC_HEADER] {
+        for setting in options.values(flag) {
+            match &setting.source {
+                OptionSource::RcFile { path, section } if !same_rc(path, owned) => {
+                    if !headers.iter().any(|c| c.path == *path && c.section == *section && c.reasons.iter().any(|r| matches!(r, ConflictReason::Header { flag: found } if found == flag))) {
+                        summary.push(format!("--{flag} from {}", path.display()));
+                        fixes.push(format!("inspect --{flag} in {}; another service's credential header would be sent to Gang's endpoints", path.display()));
+                    }
+                }
+                OptionSource::Client | OptionSource::Unknown => {
+                    summary.push(format!("--{flag} from the command line or an unattributed source"));
+                    fixes.push(format!("remove --{flag} or move it to a --config"));
+                }
+                OptionSource::RcFile { .. } => {}
+            }
+        }
+    }
+    if summary.is_empty() {
+        return Finding::ok(Check::RemoteHeaders, "none from rc files Gang does not own");
+    }
+    let summary = summary.join("; ");
+    let fix = fixes.join("; ");
+    Finding::fail(Check::RemoteHeaders, summary, fix)
 }
 
 /// The `credentials` finding: the outcome of running the credential helper that Bazel will run.
@@ -473,7 +539,9 @@ pub(crate) fn credentials(
         Err(CredentialFault::NotRunnable(text)) => Finding::fail(
             Check::Credentials,
             format!("cannot run {helper}"),
-            "install it, or correct the path in --credential_helper",
+            format!(
+                "install it, or run `gang setup --server {server}` with the installed gang"
+            ),
         )
         .with_cause(text.as_str()),
         Err(CredentialFault::Failed(status)) => Finding::fail(
@@ -589,10 +657,26 @@ mod tests {
     use crate::bazel_options::Setting;
 
     const CERTIFICATE: &str = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----";
-    const CAS_TEXT: &str = "; actions upload elsewhere and fail with \"missing from CAS\"";
-    const WRONG_URL: &str =
-        "use the public URL of the Gang server, the one `gang bazelrc --server` takes";
-    const BAZELRC_FIX: &str = "run `gang bazelrc --server https://gang.example.com` and put its output in the workspace .bazelrc";
+    const WRONG_URL: &str = "gang bazelrc";
+    const BAZELRC_FIX: &str = "gang setup --server https://gang.example.com";
+
+    /// Runs an endpoint check with the same conflict snapshot as a diagnosis.
+    fn remote_endpoint(
+        gang: &Gang,
+        options: &EffectiveOptions,
+        endpoint: Endpoint,
+        executor_is_gang: bool,
+    ) -> Finding {
+        let conflicts = crate::conflicts::find_conflicts(gang.info, options, Path::new(""));
+        super::remote_endpoint(gang, options, endpoint, executor_is_gang, &conflicts)
+    }
+
+    /// Runs the header check with an unowned test rc.
+    fn remote_headers(gang: &Gang, options: &EffectiveOptions) -> Finding {
+        let owned = Path::new("");
+        let conflicts = crate::conflicts::find_conflicts(gang.info, options, owned);
+        super::remote_headers(options, owned, &conflicts)
+    }
 
     fn url(text: &str) -> Url {
         Url::parse(text).expect("test url parses")
@@ -662,11 +746,142 @@ mod tests {
         assert_eq!(finding.check, check);
         assert_eq!(finding.status, status);
         assert_eq!(finding.summary, summary);
-        assert_eq!(finding.fix.as_deref(), fix);
+        match fix {
+            Some(expected) => assert!(
+                finding
+                    .fix
+                    .as_deref()
+                    .is_some_and(|actual| actual.contains(expected)),
+                "{:?}",
+                finding.fix
+            ),
+            None => assert!(finding.fix.is_none(), "{:?}", finding.fix),
+        }
     }
 
     fn assert_cause(finding: &Finding, cause: &str) {
         assert_eq!(finding.cause.as_deref(), Some(cause));
+    }
+
+    /// Owned rc attribution follows workspace symlinks for both conflict and header checks.
+    #[test]
+    fn symlinked_workspace_rc_is_owned() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(".gang")).expect("workspace");
+        let owned = workspace.join(".gang/bazelrc");
+        std::fs::write(&owned, b"build --remote_header=A=1\n").expect("rc");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&workspace, &link).expect("symlink");
+        let effective = options(&[(
+            REMOTE_HEADER,
+            "A=1",
+            OptionSource::RcFile {
+                path: link.join(".gang/bazelrc"),
+                section: "build".into(),
+            },
+        )]);
+        let conflicts = crate::conflicts::find_conflicts(&token_info(), &effective, &owned);
+        assert!(
+            conflicts.is_empty(),
+            "owned symlink must not produce conflicts"
+        );
+        assert_eq!(
+            super::remote_headers(&effective, &owned, &[]).status,
+            Status::Ok,
+            "owned symlink must not fail remote headers"
+        );
+    }
+
+    /// The header check recognizes an owned rc even without a conflict snapshot.
+    #[test]
+    fn symlinked_workspace_header_is_owned() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(".gang")).expect("workspace");
+        let owned = workspace.join(".gang/bazelrc");
+        std::fs::write(&owned, b"build --remote_header=A=1\n").expect("rc");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&workspace, &link).expect("symlink");
+        let effective = options(&[(
+            REMOTE_HEADER,
+            "A=1",
+            OptionSource::RcFile {
+                path: link.join(".gang/bazelrc"),
+                section: "build".into(),
+            },
+        )]);
+        assert_eq!(
+            super::remote_headers(&effective, &owned, &[]).status,
+            Status::Ok,
+            "owned symlink must not fail remote headers"
+        );
+    }
+
+    #[test]
+    fn remote_headers_report_effective_rc_headers() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("home.bazelrc");
+        std::fs::write(
+            &path,
+            b"build --remote_header=Authorization=secret\nbuild:ci --remote_header=Other=secret\n",
+        )
+        .expect("write");
+        let source = OptionSource::RcFile {
+            path: path.clone(),
+            section: "build".into(),
+        };
+        let effective = options(&[("remote_header", "Authorization=secret", source)]);
+        let server = server();
+        let info = token_info();
+        let gang = Gang {
+            server: &server,
+            info: &info,
+        };
+        let finding = remote_headers(&gang, &effective);
+        assert_eq!(finding.status, Status::Fail);
+        assert!(finding.summary.contains("remote_header"));
+        assert!(finding.summary.contains(":1"));
+        assert!(
+            finding
+                .fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("credential header"))
+        );
+        assert_eq!(
+            remote_headers(&gang, &EffectiveOptions::default()).status,
+            Status::Ok
+        );
+    }
+
+    /// Unattributed and client headers must never silently pass.
+    #[test]
+    fn unattributed_remote_headers_fail_closed() {
+        let server = server();
+        let info = token_info();
+        let gang = Gang {
+            server: &server,
+            info: &info,
+        };
+        for source in [OptionSource::Unknown, OptionSource::Client] {
+            for flag in [REMOTE_HEADER, REMOTE_CACHE_HEADER, REMOTE_EXEC_HEADER] {
+                let finding =
+                    remote_headers(&gang, &options(&[(flag, "secret=value", source.clone())]));
+                assert!(
+                    finding.status == Status::Fail,
+                    "unattributed remote header must fail"
+                );
+                assert!(finding.summary.contains(&format!(
+                    "--{flag} from the command line or an unattributed source"
+                )));
+                assert!(
+                    finding
+                        .fix
+                        .as_deref()
+                        .is_some_and(|fix| fix.contains("--config") && fix.contains(flag))
+                );
+            }
+        }
     }
 
     #[test]
@@ -887,7 +1102,7 @@ mod tests {
             program: "bazel".into(),
             source: io::Error::new(io::ErrorKind::NotFound, "missing"),
         };
-        let finding = bazel_failed(&error);
+        let finding = bazel_failed(&error, &server());
         assert_finding(
             &finding,
             Check::Bazel,
@@ -904,7 +1119,7 @@ mod tests {
             program: "bazel".into(),
             seconds: 600,
         };
-        let finding = bazel_failed(&error);
+        let finding = bazel_failed(&error, &server());
         assert_finding(
             &finding,
             Check::Bazel,
@@ -922,7 +1137,7 @@ mod tests {
             status: "exit status: 1".into(),
             detail: "boom".into(),
         };
-        let finding = bazel_failed(&error);
+        let finding = bazel_failed(&error, &server());
         assert_finding(
             &finding,
             Check::Bazel,
@@ -939,6 +1154,28 @@ mod tests {
     }
 
     #[test]
+    fn a_helper_missing_from_bazels_path_points_at_gang_bazelrc() {
+        let error = BazelError::HelperNotOnPath {
+            program: "bazel".into(),
+            helper: "gang".into(),
+        };
+        let finding = bazel_failed(&error, &server());
+        assert_finding(
+            &finding,
+            Check::Bazel,
+            Status::Fail,
+            "cannot read Bazel's effective flags",
+            Some(
+                "Bazel looks the credential helper `gang` up on its own PATH: run `gang setup --server https://gang.example.com`; it names gang by absolute path",
+            ),
+        );
+        assert_cause(
+            &finding,
+            "`bazel` cannot find the credential helper `gang` on its PATH",
+        );
+    }
+
+    #[test]
     fn invalid_events_ask_to_fix_the_workspace() {
         let source = serde_json::from_str::<Value>("{").expect_err("truncated json fails");
         let text = format!("the build events of `bazel` are not valid: {source}");
@@ -946,7 +1183,7 @@ mod tests {
             program: "bazel".into(),
             source,
         };
-        let finding = bazel_failed(&error);
+        let finding = bazel_failed(&error, &server());
         assert_finding(
             &finding,
             Check::Bazel,
@@ -1043,14 +1280,72 @@ mod tests {
             finding.summary,
             "grpcs://other.example.com:443 from /home/u/.bazelrc"
         );
+        let fix = finding.fix.as_deref().expect("cache fix");
+        assert!(fix.contains("--remote_cache"));
+        assert!(fix.contains("/home/u/.bazelrc"));
+        assert!(fix.contains("missing from CAS"));
+    }
+
+    /// A path containing the CAS phrase is not itself a CAS explanation.
+    #[test]
+    fn cache_hint_does_not_depend_on_fix_wording() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("missing from CAS");
+        let server = server();
+        let info = token_info();
+        let gang = Gang {
+            server: &server,
+            info: &info,
+        };
+        let options = options(&[(
+            REMOTE_CACHE,
+            "grpcs://other",
+            OptionSource::RcFile {
+                path,
+                section: "build".into(),
+            },
+        )]);
+        let finding = remote_endpoint(&gang, &options, Endpoint::Cache, true);
+        let fix = finding.fix.as_deref().expect("cache fix");
+        assert!(
+            fix.contains(CAS_MISMATCH),
+            "CAS hint must be added even when the path contains its wording"
+        );
+    }
+
+    /// A conflict that already explains CAS does not get a second hint.
+    #[test]
+    fn cache_conflict_explains_cas_once() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("foreign.bazelrc");
+        std::fs::write(&path, "build --remote_cache=grpcs://other\n").expect("write rc");
+        let server = server();
+        let info = token_info();
+        let gang = Gang {
+            server: &server,
+            info: &info,
+        };
+        let options = options(&[
+            (
+                REMOTE_EXECUTOR,
+                "grpcs://exec.example.com:443",
+                OptionSource::Unknown,
+            ),
+            (
+                REMOTE_CACHE,
+                "grpcs://other",
+                OptionSource::RcFile {
+                    path,
+                    section: "build".into(),
+                },
+            ),
+        ]);
+        let finding = remote_endpoint(&gang, &options, Endpoint::Cache, true);
+        let fix = finding.fix.as_deref().expect("cache fix");
         assert_eq!(
-            finding.fix.as_deref(),
-            Some(
-                format!(
-                    "remove or change --remote_cache in section `build:ci` of /home/u/.bazelrc; Gang's is grpcs://cache.example.com:443{CAS_TEXT}"
-                )
-                .as_str()
-            )
+            fix.matches("missing from CAS").count(),
+            1,
+            "cache conflict must explain CAS exactly once"
         );
     }
 
@@ -1156,12 +1451,10 @@ mod tests {
             "Bazel sets no --remote_cache",
             Some(BAZELRC_FIX),
         );
-        assert_eq!(
-            remote_endpoint(&gang, &options, Endpoint::Cache, true)
-                .fix
-                .as_deref(),
-            Some(format!("{BAZELRC_FIX}{CAS_TEXT}").as_str())
-        );
+        let finding = remote_endpoint(&gang, &options, Endpoint::Cache, true);
+        let fix = finding.fix.as_deref().expect("cache fix");
+        assert!(fix.contains(BAZELRC_FIX));
+        assert!(fix.contains("missing from CAS"));
     }
 
     fn shared_info() -> Server<Value> {
@@ -1242,15 +1535,10 @@ mod tests {
             finding.summary,
             "grpcs://other-exec.example.com:443 from --remote_executor"
         );
-        assert_eq!(
-            finding.fix.as_deref(),
-            Some(
-                format!(
-                    "{BAZELRC_FIX}; Bazel caches through --remote_executor instead of Gang's cache grpcs://cache.example.com:443"
-                )
-                .as_str()
-            )
-        );
+        let fix = finding.fix.as_deref().expect("cache fix");
+        assert!(fix.contains(BAZELRC_FIX));
+        assert!(fix.contains("--remote_executor"));
+        assert!(!fix.contains("missing from CAS"));
         assert!(!finding.summary.contains("missing from CAS"));
     }
 
@@ -1284,16 +1572,11 @@ mod tests {
             "grpcs://other.example.com:443",
             OptionSource::Client,
         )]);
-        assert_finding(
-            &remote_endpoint(&gang, &options, Endpoint::Cache, true),
-            Check::RemoteCache,
-            Status::Fail,
-            "grpcs://other.example.com:443 from the Bazel client",
-            Some(
-                format!("stop passing --remote_cache to Bazel; Gang's is grpcs://gang.example.com:443{CAS_TEXT}")
-                    .as_str(),
-            ),
-        );
+        let finding = remote_endpoint(&gang, &options, Endpoint::Cache, true);
+        assert_eq!(finding.status, Status::Fail);
+        let fix = finding.fix.as_deref().expect("cache fix");
+        assert!(fix.contains("--remote_cache"));
+        assert!(fix.contains("missing from CAS"));
     }
 
     #[test]
@@ -1343,7 +1626,8 @@ mod tests {
             server: &server,
             info: &info,
         };
-        let fix = "run `gang bazelrc --server https://gang.example.com` and keep the gang-ca.pem it writes next to the rc file; the server uses Gang's own CA";
+        let fix =
+            "run `gang setup --server https://gang.example.com`; the server uses Gang's own CA";
         assert_finding(
             &tls_certificate(&gang, &EffectiveOptions::default()),
             Check::TlsCertificate,
@@ -1730,7 +2014,9 @@ mod tests {
             Check::Credentials,
             Status::Fail,
             "cannot run /x",
-            Some("install it, or correct the path in --credential_helper"),
+            Some(
+                "install it, or run `gang setup --server https://gang.example.com` with the installed gang",
+            ),
         );
         assert_cause(&finding, "no such file");
     }

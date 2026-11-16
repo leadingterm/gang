@@ -21,9 +21,9 @@ use gang_spi::{
     StoreAccess, Subject, TokenIssue, WorkerSpec, WorkerTls, WorkloadCredentialPort,
 };
 use gang_types::{
-    AuthenticationSettings, Bytes, CertSerial, Fleet, FleetName, FleetSet, Identity, InstanceId,
-    InstanceLifecycle, Isa, LoginSession, Principal, Proof, ProviderName, RefreshToken, Resources,
-    SchedulerSettings, Url, WorkerId, WorkerLifetime,
+    ActionResources, AuthenticationSettings, Bytes, CertSerial, Fleet, FleetName, FleetSet,
+    Identity, InstanceId, InstanceLifecycle, Isa, LoginSession, Principal, Proof, ProviderName,
+    RefreshToken, SchedulerSettings, Url, WorkerId, WorkerLifetime,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -131,6 +131,7 @@ macro_rules! provisioner_plugin {
         /// A provisioner plugin whose ports record the fleet options they receive.
         pub struct $plugin {
             number: u32,
+            desired: Mutex<u32>,
             /// The fleet options each port call received, in call order.
             pub seen: Mutex<Vec<String>>,
         }
@@ -144,6 +145,7 @@ macro_rules! provisioner_plugin {
             ) -> Result<Self, PortError> {
                 Ok(Self {
                     number: config.number,
+                    desired: Mutex::new(config.number),
                     seen: Mutex::new(Vec::new()),
                 })
             }
@@ -164,10 +166,12 @@ macro_rules! provisioner_plugin {
                 into: &mut FleetSupply,
             ) -> Result<(), PortError> {
                 self.record(fleet.options);
-                into.desired = self.number;
+                into.desired = *self.desired.lock();
                 into.instances.clear();
                 into.exits.clear();
                 into.warm = 0;
+                into.abandoned = 0;
+                into.launch_failure = None;
                 into.instances.push(FleetInstance {
                     id: instance(self.number)?,
                     lifecycle: InstanceLifecycle::InService,
@@ -183,11 +187,13 @@ macro_rules! provisioner_plugin {
                 desired: u32,
             ) -> Result<(), PortError> {
                 self.record(fleet.options);
-                if desired == self.number {
-                    Ok(())
+                let mut current = self.desired.lock();
+                *current = if desired < *current {
+                    desired.max(1)
                 } else {
-                    Err(PortError::refused(Rejection::PolicyDenied))
-                }
+                    desired
+                };
+                Ok(())
             }
 
             async fn terminate(
@@ -324,7 +330,7 @@ impl SchedulerPort for Stub {
         let candidates = FleetSet::prefix(1).map_err(PortError::backend)?;
         into.queued.push(QueuedDemand {
             candidates,
-            resources: Resources::default(),
+            resources: ActionResources::default(),
             queued_since: Timestamp::UNIX_EPOCH,
             priority: i32::try_from(self.number).map_err(PortError::backend)?,
         });

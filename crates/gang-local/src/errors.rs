@@ -167,7 +167,7 @@ mod tests {
     fn private_dir_refusal_maps_to_config() {
         let error = LocalError::PrivateDir(gang_os::fs::PrivateDirError::NotPrivate {
             path: PathBuf::from("state"),
-            mode: 0o755,
+            mode: gang_os::fs::Mode::from_bits_retain(0o755),
         });
         match PortError::from(error) {
             PortError::Config(cause) => {

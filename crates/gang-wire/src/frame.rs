@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::state::{
-    Fleet, Instance, Pass, Queue, QueuedAction, RunningAction, State, Truncated, Worker,
+    Fleet, Instance, Pass, Queue, QueuedAction, Recent, RunningAction, State, Truncated, Worker,
 };
 use crate::{Event, FrameError};
 
@@ -129,6 +129,10 @@ pub struct Delta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "number")]
     pub completed: Option<u64>,
+    /// New and changed samples of `recent`, oldest first, with its `window` and `step`. They
+    /// replace the client's samples from the first one's start on (see [`Recent::apply`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent: Option<Recent>,
     /// A new principal epoch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "number")]
@@ -150,6 +154,7 @@ impl Delta {
             && self.actions.as_ref().is_none_or(ActionsDelta::is_empty)
             && self.events.is_empty()
             && self.completed.is_none()
+            && self.recent.is_none()
             && self.principals_epoch.is_none()
     }
 }
@@ -350,6 +355,7 @@ mod tests {
             "events": [],
             "eventsLimit": 200,
             "completed": 0,
+            "recent": {"window": "0s", "step": "0s"},
             "principalsEpoch": 0,
         })
     }
@@ -608,6 +614,7 @@ mod tests {
                 }]),
             ),
             ("completed", json!(0)),
+            ("recent", json!({"window": "900s", "step": "10s"})),
             ("principalsEpoch", json!(0)),
         ];
         for (part, value) in parts {

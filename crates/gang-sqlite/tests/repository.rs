@@ -705,6 +705,53 @@ async fn early_exit_round_trips_with_failure_detail() {
 }
 
 #[tokio::test]
+async fn launch_failure_and_withdrawal_round_trip() {
+    let dir = TempDir::new().expect("temp dir");
+    let store = store(&dir);
+    let reason = "  quota exceeded: café\nretry later  ";
+    let failed = scaling(
+        1_000,
+        ScalingEventKind::LaunchFailed {
+            from: 2,
+            to: 7,
+            reason: reason.to_owned(),
+        },
+    );
+    let withdrawn = scaling(2_000, ScalingEventKind::Withdrawn { from: 7, to: 2 });
+    for event in [&failed, &withdrawn] {
+        store
+            .record_scaling_event(event)
+            .await
+            .expect("event is appended");
+    }
+
+    let connection = raw_connection(&dir);
+    let rows = text_rows(
+        &connection,
+        "SELECT CAST(at AS TEXT), fleet, kind, \
+                COALESCE(CAST(from_capacity AS TEXT), '-'), \
+                COALESCE(CAST(to_capacity AS TEXT), '-'), \
+                COALESCE(subject, '-'), COALESCE(detail, '-') \
+         FROM scaling_audit ORDER BY id",
+        7,
+    );
+    assert_eq!(
+        rows,
+        vec![
+            expected_row(["1000", "gang-x86", "launch_failed", "2", "7", "-", reason]),
+            expected_row(["2000", "gang-x86", "withdrawn", "7", "2", "-", "-"]),
+        ]
+    );
+
+    let mut events = Vec::new();
+    store
+        .scaling_events(ScalingEventSeq::default(), None, limit(10), &mut events)
+        .await
+        .expect("events are read");
+    assert_eq!(events, vec![recorded(1, &failed), recorded(2, &withdrawn)]);
+}
+
+#[tokio::test]
 async fn scaling_events_come_back_in_sequence_order_after_the_cursor() {
     let dir = TempDir::new().expect("temp dir");
     let store = store(&dir);

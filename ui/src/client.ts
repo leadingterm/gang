@@ -3,7 +3,6 @@
 // are parsed once here; rows keep their timestamp strings for the views to parse.
 import { batch, signal } from "@preact/signals";
 import { applyDelta, tickContinues } from "./store.ts";
-import { emptyHistory, observe, streamLost, type History } from "./history.ts";
 import { idOf, ms, seconds, type UnixMs } from "./wire-parse.ts";
 import {
   PATHS,
@@ -115,7 +114,6 @@ export const loginUrl = (next: string): string => `${PATHS.login}?next=${encodeU
 
 export class StateClient {
   readonly state = signal<State | null>(null);
-  readonly history = signal<History | null>(null);
   readonly link = signal<Link>({ kind: "connecting" });
   readonly session = signal<Session | null>(null);
   readonly access = signal<Access | null>(null);
@@ -334,12 +332,10 @@ export class StateClient {
     const at = ms(state.updateTime);
     this.#clockFrom(at);
     this.#failures = 0;
-    const prev = this.history.value;
     const held = this.state.value?.events ?? [];
     batch(() => {
       this.#continueEarlier(held, state.events);
       this.state.value = state;
-      this.history.value = observe(prev ?? emptyHistory(at), state, at);
       this.link.value = { kind: "live", beats: 0 };
       this.now.value = at;
     });
@@ -355,7 +351,6 @@ export class StateClient {
     batch(() => {
       if (state) this.#continueEarlier(state.events, next.events);
       this.state.value = next;
-      this.history.value = observe(this.history.value ?? emptyHistory(at), next, at);
       this.now.value = at;
     });
   }
@@ -445,13 +440,9 @@ export class StateClient {
     this.#streamDown({ kind: "lost", frozenAt: this.#lastFrame, retryAt });
   }
 
-  /** The stream ended: nothing is observed after the last frame until a new one arrives. */
+  /** The stream ended; the last state remains frozen until a new frame arrives. */
   #streamDown(link: Link): void {
-    const history = this.history.value;
-    batch(() => {
-      if (history && this.#lastFrame !== null) this.history.value = streamLost(history, this.#lastFrame);
-      this.link.value = link;
-    });
+    this.link.value = link;
   }
 
   #closeSource(): void {

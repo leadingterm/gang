@@ -25,8 +25,6 @@ pub(crate) const DEFAULT_STARTUP_TIMEOUT: &str = "30s";
 pub(crate) const DEFAULT_STOP_TIMEOUT: &str = "30s";
 /// Default interval between two checks of a local server's progress.
 pub(crate) const DEFAULT_POLL_INTERVAL: &str = "100ms";
-/// Default command Bazel runs as the credential helper: the `gang` binary found on `PATH`.
-pub(crate) const DEFAULT_CREDENTIAL_HELPER: &str = "gang";
 /// Default Bazel program `gang doctor` asks for its effective options: the `bazel` on `PATH`.
 pub(crate) const DEFAULT_BAZEL_PROGRAM: &str = "bazel";
 
@@ -42,7 +40,7 @@ macro_rules! examples {
 const ROOT_EXAMPLES: &str = examples! {
     "a laptop: log in, then point Bazel at the farm" => [
         "gang login --server https://gang.example.com",
-        "gang bazelrc --server https://gang.example.com > .bazelrc",
+        "gang setup --server https://gang.example.com",
     ];
     "a CI job: log in with the job's own token" => [
         "gang login --server https://gang.example.com --workload \\",
@@ -64,17 +62,17 @@ const GET_EXAMPLES: &str = examples! {
     "a laptop: ask by hand what Bazel would ask" => [
         "echo '{\"uri\":\"https://gang.example.com/\"}' | gang get",
     ];
-    "a CI job: Bazel runs it, as set up by gang bazelrc" => [
+    "a CI job: Bazel runs it, as set up by gang setup or gang bazelrc" => [
         "build --credential_helper=gang.example.com=gang",
     ];
 };
 /// The `after_help` of `gang bazelrc`.
 const BAZELRC_EXAMPLES: &str = examples! {
-    "a laptop: write the settings next to your Bazel workspace" => [
-        "gang bazelrc --server https://gang.example.com > .bazelrc",
+    "a script: an rc file to pass with --bazelrc" => [
+        "gang bazelrc --server https://gang.example.com > gang.bazelrc",
     ];
     "a CI job: pin the server's certificate authority" => [
-        "gang bazelrc --server https://gang.example.com --ca-pin sha256:<hex> > .bazelrc",
+        "gang bazelrc --server https://gang.example.com --ca-pin sha256:<hex> > gang.bazelrc",
     ];
 };
 /// The `after_help` of `gang revoke`.
@@ -249,6 +247,15 @@ const DOCTOR_EXAMPLES: &str = examples! {
         "gang doctor -q --server https://gang.example.com",
     ];
 };
+/// The `after_help` of `gang setup`.
+const SETUP_EXAMPLES: &str = examples! {
+    "set up a workspace" => [
+        "gang setup --server https://gang.example.com",
+    ];
+    "preview without writing" => [
+        "gang setup --server https://gang.example.com --dry-run",
+    ];
+};
 /// The `after_help` of `gang local`.
 const LOCAL_EXAMPLES: &str = examples! {
     "a laptop: start and stop the local farm" => [
@@ -298,6 +305,9 @@ pub struct Cli {
 /// The subcommands of the gang binary.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Set up this workspace to use a Gang server.
+    #[command(after_help = SETUP_EXAMPLES)]
+    Setup(SetupArgs),
     /// Log in to a Gang server and store the client identity.
     #[command(override_usage = "gang login --server <URL> [OPTIONS]", after_help = LOGIN_EXAMPLES)]
     Login(LoginArgs),
@@ -343,6 +353,7 @@ impl Command {
     /// The name an error of this command is reported under.
     pub(crate) fn subject(&self) -> &'static str {
         match self {
+            Self::Setup(_) => "gang setup",
             Self::Login(_) => "gang login",
             Self::Get => "gang get",
             Self::Bazelrc(_) => "gang bazelrc",
@@ -366,6 +377,32 @@ impl Command {
 pub struct OptionsArgs {
     /// Only this provisioner's options; all provisioners when omitted.
     pub provisioner: Option<String>,
+}
+
+/// Arguments of `gang setup`.
+#[derive(Debug, Args)]
+pub struct SetupArgs {
+    /// Base URL of the server; defaults to the stored login's server.
+    #[arg(long, value_name = "URL")]
+    pub server: Option<Url>,
+    /// SHA-256 pin of the server's certificate authority.
+    #[arg(long, value_name = "SHA256")]
+    pub ca_pin: Option<CaPin>,
+    /// Identity provider to use for sign-in.
+    #[arg(long, value_name = "NAME")]
+    pub provider: Option<ProviderName>,
+    /// Apply Gang-owned changes without prompting.
+    #[arg(long, conflicts_with = "dry_run")]
+    pub yes: bool,
+    /// Preview changes without writing or signing in.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Bazel program asked for its effective options.
+    #[arg(long, value_name = "PROGRAM", default_value = DEFAULT_BAZEL_PROGRAM)]
+    pub bazel: OsString,
+    /// Arguments of the Bazel invocation, given after `--`.
+    #[arg(last = true, value_name = "BAZEL_ARG", allow_hyphen_values = true)]
+    pub bazel_args: Vec<OsString>,
 }
 
 /// Arguments of `gang doctor`.
@@ -512,9 +549,10 @@ pub struct BazelrcArgs {
     /// SHA-256 pin of the server's certificate authority; the system roots are trusted when omitted.
     #[arg(long, value_name = "SHA256")]
     pub ca_pin: Option<CaPin>,
-    /// Command Bazel runs as the credential helper for the server's host.
-    #[arg(long, value_name = "NAME", default_value = DEFAULT_CREDENTIAL_HELPER)]
-    pub helper: String,
+    /// Command Bazel runs as the credential helper for the server's host; by default the running
+    /// gang, by the absolute path it was invoked by.
+    #[arg(long, value_name = "COMMAND")]
+    pub helper: Option<String>,
 }
 
 /// Arguments of `gang revoke`.
@@ -910,6 +948,38 @@ mod tests {
     const SERVER: &str = "https://example.com";
     const PIN: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+    /// The root example configures a workspace through setup.
+    #[test]
+    fn root_example_uses_setup_for_workspace() {
+        assert!(
+            ROOT_EXAMPLES.contains("gang setup --server https://gang.example.com"),
+            "root workspace example must use gang setup"
+        );
+    }
+
+    /// Bazelrc examples write isolated files rather than replacing a workspace rc.
+    #[test]
+    fn bazelrc_examples_write_isolated_files() {
+        assert!(
+            !BAZELRC_EXAMPLES.contains("> .bazelrc"),
+            "bazelrc examples must not overwrite the workspace .bazelrc"
+        );
+        assert_eq!(
+            BAZELRC_EXAMPLES.matches("> gang.bazelrc").count(),
+            2,
+            "both bazelrc examples must write an isolated rc file"
+        );
+    }
+
+    /// The helper example acknowledges both ways to configure it.
+    #[test]
+    fn get_example_names_both_writers() {
+        assert!(
+            GET_EXAMPLES.contains("as set up by gang setup or gang bazelrc"),
+            "get example must name both setup and bazelrc"
+        );
+    }
+
     fn try_parse(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
         Cli::try_parse_from(args)
     }
@@ -1198,7 +1268,7 @@ mod tests {
         let args = bazelrc(&[]);
         assert_eq!(args.server.host_str(), Some("example.com"));
         assert!(args.ca_pin.is_none());
-        assert_eq!(args.helper, "gang");
+        assert!(args.helper.is_none());
     }
 
     #[test]
@@ -1208,7 +1278,7 @@ mod tests {
             args.ca_pin.as_ref().map(ToString::to_string).as_deref(),
             Some(PIN)
         );
-        assert_eq!(args.helper, "gang-helper");
+        assert_eq!(args.helper.as_deref(), Some("gang-helper"));
     }
 
     #[test]

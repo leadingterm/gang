@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+use gang_client::display_url;
 use gang_config::{Document, Fleets, GangConfig, ServerTransport};
 use gang_os::FileLock;
 use gang_spi::PluginContext;
@@ -237,23 +238,15 @@ struct Started {
     log: PathBuf,
 }
 
-/// An endpoint as shown to the user: without its trailing slash.
-fn displayed(endpoint: &Url) -> &str {
-    endpoint
-        .as_str()
-        .strip_suffix('/')
-        .unwrap_or(endpoint.as_str())
-}
-
 impl Started {
-    /// The `gang bazelrc` command that points Bazel at the server.
-    fn bazelrc_command(&self) -> String {
-        let server = displayed(&self.public);
+    /// The `gang setup` command that points Bazel at the server.
+    fn setup_command(&self) -> String {
+        let server = display_url(&self.public);
         match &self.security {
             Security::Pinned(ca_pin) => {
-                format!("gang bazelrc --server {server} --ca-pin {ca_pin} > .bazelrc")
+                format!("gang setup --server {server} --ca-pin {ca_pin}")
             }
-            Security::Insecure => format!("gang bazelrc --server {server} > .bazelrc"),
+            Security::Insecure => format!("gang setup --server {server}"),
         }
     }
 }
@@ -272,8 +265,8 @@ fn present(out: &Output, started: &Started) -> errors::Result<()> {
     ))?;
     out.gap()?;
     let log = started.log.display();
-    let public = displayed(&started.public);
-    let worker = displayed(&started.worker);
+    let public = display_url(&started.public);
+    let worker = display_url(&started.worker);
     let mut fields: Vec<(&str, &dyn Display)> = vec![
         ("public", &public as &dyn Display),
         ("worker", &worker as &dyn Display),
@@ -288,7 +281,7 @@ fn present(out: &Output, started: &Started) -> errors::Result<()> {
     }
     fields.push(("log", &log as &dyn Display));
     out.fields(&fields)?;
-    out.next(&started.bazelrc_command());
+    out.next(&started.setup_command());
     Ok(())
 }
 
@@ -1173,15 +1166,17 @@ mod tests {
     #[test]
     fn the_next_command_carries_the_pin_only_for_tls() {
         assert_eq!(
-            tls_server().bazelrc_command(),
+            tls_server().setup_command(),
             format!(
-                "gang bazelrc --server https://127.0.0.1:50051 --ca-pin {} > .bazelrc",
+                "gang setup --server https://127.0.0.1:50051 --ca-pin {}",
                 pin()
-            )
+            ),
+            "TLS next hint must use gang setup"
         );
         assert_eq!(
-            insecure_server(None).bazelrc_command(),
-            "gang bazelrc --server http://127.0.0.1:50051 > .bazelrc"
+            insecure_server(None).setup_command(),
+            "gang setup --server http://127.0.0.1:50051",
+            "insecure next hint must use gang setup"
         );
     }
 
@@ -1196,8 +1191,8 @@ mod tests {
         assert!(stdout.contains("public  http://127.0.0.1:50051\n"));
         assert!(stdout.contains("worker  grpc://127.0.0.1:9090\n"));
         assert_eq!(
-            started.bazelrc_command(),
-            "gang bazelrc --server http://127.0.0.1:50051 > .bazelrc"
+            started.setup_command(),
+            "gang setup --server http://127.0.0.1:50051"
         );
     }
 

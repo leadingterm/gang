@@ -95,6 +95,7 @@ fn request_groups() -> Vec<(&'static str, Vec<&'static str>)> {
         ("capacity", vec!["spot", "on-demand", "gpu"]),
         // Each fleet's exact size appears, plus one value just above the largest fleet.
         (property::CPU_COUNT, vec!["1", "2", "4", "8", "9", "64"]),
+        (property::CPU_MILLICORES, vec!["1", "1500", "4000", "8001"]),
         (
             property::MEMORY_KB,
             vec![

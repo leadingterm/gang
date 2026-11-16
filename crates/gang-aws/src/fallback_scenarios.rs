@@ -9,7 +9,9 @@ use gang_clock::Timestamp;
 use gang_spi::FleetSupply;
 use gang_types::InstanceId;
 
-use crate::config::{AwsFleetOptions, Capacity, RetrySpotAfter, RetrySpotAfterError, SpotFallback};
+use crate::config::{
+    AwsFleetOptions, Capacity, CooldownPolicy, RetrySpotAfter, RetrySpotAfterError, SpotFallback,
+};
 use crate::errors::AwsError;
 use crate::fake_aws::{FakeFailure, FakeGroup, FakeInstance};
 use crate::fleet_harness::{FLEET, Harness, fleet_with, rfc3339_ago};
@@ -114,9 +116,50 @@ fn throttled() -> FakeFailure {
     }
 }
 
-/// Plain spot fleets never ask for scaling activities and never touch the on-demand twin.
 #[tokio::test]
-async fn plain_spot_fleet_never_reads_activities_or_twin() -> TestResult {
+async fn lowering_withdraws_twin_before_spot_and_keeps_live_members() -> TestResult {
+    let harness = harness_with(vec![
+        protected(FLEET, 5, &[("i-spot", "InService")]),
+        protected(TWIN, 4, &[("i-twin", "Pending")]),
+    ])
+    .await?;
+    let fleet = fleet_with(FLEET, fallback_options(true)?)?;
+    harness.fleets.set_desired_capacity(fleet.view(), 3).await?;
+    assert_eq!(writes(&harness), vec![write(TWIN, "1"), write(FLEET, "2")]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn supply_reports_first_unmet_failing_group_spot_before_twin() -> TestResult {
+    let harness = harness_with(vec![protected(FLEET, 1, &[]), protected(TWIN, 1, &[])]).await?;
+    for (group, message) in [(FLEET, "spot failed"), (TWIN, "twin failed")] {
+        harness
+            .fake
+            .state()
+            .activities
+            .push(crate::fake_aws::FakeActivity {
+                group: group.to_owned(),
+                status_code: "Failed".to_owned(),
+                start_time: rfc3339_ago(600),
+                message: Some(message.to_owned()),
+            });
+    }
+    let fleet = fleet_with(FLEET, fallback_options(true)?)?;
+    let mut supply = FleetSupply::default();
+    harness.fleets.supply(fleet.view(), &mut supply).await?;
+    assert_eq!(
+        supply
+            .launch_failure
+            .as_ref()
+            .map(|failure| failure.reason.as_str()),
+        Some("spot failed")
+    );
+    Ok(())
+}
+
+/// A met plain spot fleet reads no activities and never touches the on-demand twin.
+#[tokio::test]
+async fn met_plain_spot_fleet_reads_neither_activities_nor_twin() -> TestResult {
     let harness = harness_with(vec![FakeGroup::new(
         FLEET,
         6,
@@ -146,8 +189,7 @@ async fn plain_spot_fleet_never_reads_activities_or_twin() -> TestResult {
     Ok(())
 }
 
-/// With Spot healthy, a raise goes to the spot group only, and the next supply reports the raised
-/// capacity after one scaling activities call that finds nothing.
+/// With Spot healthy, supply probes both fallback health and the newest unmet spot activity.
 #[tokio::test]
 async fn healthy_spot_raise_goes_to_spot_only() -> TestResult {
     let harness = harness_with(vec![
@@ -181,7 +223,115 @@ async fn healthy_spot_raise_goes_to_spot_only() -> TestResult {
     assert_eq!(into.desired, 10);
     assert_eq!(
         harness.requests("DescribeScalingActivities") - activities_before,
-        1
+        2
+    );
+    Ok(())
+}
+
+/// Supply never writes, even when the abandoned Spot request is in cooldown.
+#[tokio::test]
+async fn supply_reports_a_down_spot_request_as_abandoned_and_writes_nothing() -> TestResult {
+    let harness = Harness::start_with(CooldownPolicy::Honor).await?;
+    let mut spot = protected(FLEET, 4, &[]);
+    spot.in_cooldown = true;
+    harness.add_group_with(spot);
+    harness.add_group_with(protected(TWIN, 0, &[]));
+    harness.add_activity(FLEET, "Failed", &rfc3339_ago(30));
+    let fleet = fleet_with(FLEET, fallback_options(true)?)?;
+    let mut into = FleetSupply::default();
+    harness.fleets.supply(fleet.view(), &mut into).await?;
+    assert_eq!(into.desired, 0);
+    assert_eq!(into.abandoned, 4, "the unmet Spot request is abandoned");
+    assert!(
+        writes(&harness).is_empty(),
+        "supply must not write capacity"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_desired_capacity_withdraws_a_down_spot_request_at_the_reported_capacity() -> TestResult
+{
+    let harness = harness_with(vec![protected(FLEET, 4, &[]), protected(TWIN, 0, &[])]).await?;
+    harness.add_activity(FLEET, "Failed", &rfc3339_ago(30));
+    let fleet = fleet_with(FLEET, fallback_options(true)?)?;
+    harness.fleets.set_desired_capacity(fleet.view(), 0).await?;
+    assert_eq!(
+        writes(&harness),
+        vec![write(FLEET, "0")],
+        "withdraw the abandoned request"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_spot_withdrawal_fails_only_its_own_call() -> TestResult {
+    let harness = Harness::start_with(CooldownPolicy::Honor).await?;
+    let mut spot = protected(FLEET, 4, &[]);
+    spot.in_cooldown = true;
+    harness.add_group_with(spot);
+    harness.add_group_with(protected(TWIN, 0, &[]));
+    harness.add_activity(FLEET, "Failed", &rfc3339_ago(30));
+    let fleet = fleet_with(FLEET, fallback_options(true)?)?;
+    let mut into = FleetSupply::default();
+    harness.fleets.supply(fleet.view(), &mut into).await?;
+    assert!(
+        harness
+            .fleets
+            .set_desired_capacity(fleet.view(), 0)
+            .await
+            .is_err(),
+        "cooldown must reject the planned withdrawal"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_fallback_raise_writes_only_the_twin_and_succeeds_while_spot_is_in_cooldown() -> TestResult
+{
+    let harness = Harness::start_with(CooldownPolicy::Honor).await?;
+    let mut spot = protected(FLEET, 4, &[]);
+    spot.in_cooldown = true;
+    harness.add_group_with(spot);
+    harness.add_group_with(protected(TWIN, 0, &[]));
+    harness.add_activity(FLEET, "Failed", &rfc3339_ago(30));
+    let fleet = fleet_with(FLEET, fallback_options(true)?)?;
+
+    assert!(
+        harness
+            .fleets
+            .set_desired_capacity(fleet.view(), 2)
+            .await
+            .is_ok(),
+        "the raise took effect, so the call succeeds"
+    );
+    assert_eq!(
+        writes(&harness),
+        vec![write(TWIN, "2")],
+        "a raise writes only the on-demand twin"
+    );
+    assert_eq!(harness.desired(TWIN), Some(2));
+    Ok(())
+}
+
+#[tokio::test]
+async fn lowering_while_down_lowers_only_the_twin() -> TestResult {
+    let harness = harness_with(vec![
+        protected(FLEET, 4, &[("i-spot", "InService")]),
+        protected(
+            TWIN,
+            3,
+            &[("i-twin", "InService"), ("i-pending", "Pending")],
+        ),
+    ])
+    .await?;
+    harness.add_activity(FLEET, "Failed", &rfc3339_ago(30));
+    let fleet = fleet_with(FLEET, fallback_options(true)?)?;
+    harness.fleets.set_desired_capacity(fleet.view(), 3).await?;
+    assert_eq!(
+        writes(&harness),
+        vec![write(TWIN, "2")],
+        "lowering writes only the on-demand twin"
     );
     Ok(())
 }
@@ -212,7 +362,9 @@ async fn first_failure_withdraws_spot_then_raises_on_demand() -> TestResult {
 
     harness.fleets.supply(fleet.view(), &mut into).await?;
     assert_eq!(into.desired, 6);
+    assert!(writes(&harness).is_empty());
 
+    harness.fleets.set_desired_capacity(fleet.view(), 6).await?;
     harness
         .fleets
         .set_desired_capacity(fleet.view(), 10)
@@ -224,7 +376,7 @@ async fn first_failure_withdraws_spot_then_raises_on_demand() -> TestResult {
     assert_eq!(into.desired, 10);
     assert_eq!(
         harness.requests("DescribeScalingActivities") - activities_before,
-        0
+        1
     );
     Ok(())
 }
@@ -257,6 +409,7 @@ async fn restart_before_any_failure_reports_booting_capacity() -> TestResult {
     assert_eq!(into.desired, 10);
     assert!(writes(&harness).is_empty());
     harness.add_activity(FLEET, "Failed", &rfc3339_ago(30));
+    harness.fleets.set_desired_capacity(fleet.view(), 6).await?;
     harness
         .fleets
         .set_desired_capacity(fleet.view(), 10)
@@ -476,7 +629,7 @@ async fn recovered_spot_keeps_growing_on_spot() -> TestResult {
     Ok(())
 }
 
-/// A Spot member that leaves, with its replacement failing, falls back on the next raise.
+/// A Spot member that leaves, with its replacement failing, is withdrawn before the next raise.
 #[tokio::test]
 async fn interrupted_spot_with_failed_replacement_falls_back() -> TestResult {
     let harness = harness_with(vec![
@@ -500,7 +653,9 @@ async fn interrupted_spot_with_failed_replacement_falls_back() -> TestResult {
 
     harness.fleets.supply(fleet.view(), &mut into).await?;
     assert_eq!(into.desired, 5);
+    assert!(writes(&harness).is_empty());
 
+    harness.fleets.set_desired_capacity(fleet.view(), 5).await?;
     harness.fleets.set_desired_capacity(fleet.view(), 6).await?;
     assert_eq!(writes(&harness), vec![write(FLEET, "5"), write(TWIN, "1")]);
     Ok(())

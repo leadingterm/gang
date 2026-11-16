@@ -37,10 +37,12 @@ fn push_fleet(
     world.properties.push(properties(&spec, options));
     world.policies.push(spec);
     world.supplies.push(FleetSupply {
+        abandoned: 0,
         desired,
         instances,
         warm: 0,
         exits: Vec::new(),
+        launch_failure: None,
     });
     world.outlook.push(FleetOutlook::default());
     Ok(())
@@ -105,6 +107,7 @@ fn waiting(op: &str, queued_since: u64, priority: i32, fleets: &[usize]) -> Queu
         },
         queued_since: ts(queued_since),
         candidates: fleet_set(fleets),
+        refusal: None,
     }
 }
 
@@ -396,6 +399,62 @@ fn fill_window(
         principals_epoch: 7,
     };
     builder.fill(cur, prev, seq, &inputs);
+    Ok(())
+}
+
+#[test]
+fn launch_failure_is_reported_and_cleared_on_reuse() -> TestResult {
+    let mut world = World::default();
+    push_fleet(&mut world, "alpha", vec![], 1, vec![])?;
+    world.supplies[0].launch_failure = Some(gang_spi::LaunchFailure {
+        reason: "capacity unavailable".to_owned(),
+    });
+    let mut builder = Builder::new(config());
+    let mut frame = blank();
+    let prev = blank();
+    fill_into(&mut builder, &mut frame, &prev, 1, &world, 1_000, ok(0))?;
+    assert_eq!(
+        frame.fleets[0]
+            .launch_failure
+            .as_ref()
+            .map(|failure| failure.reason.as_str()),
+        Some("capacity unavailable")
+    );
+    world.supplies[0].launch_failure = None;
+    fill_into(&mut builder, &mut frame, &prev, 2, &world, 2_000, ok(0))?;
+    assert_eq!(frame.fleets[0].launch_failure, None);
+    Ok(())
+}
+
+#[test]
+fn queued_refusal_is_reported_and_cleared_on_reuse() -> TestResult {
+    let mut world = World::default();
+    push_fleet(&mut world, "alpha", vec![], 1, vec![])?;
+    let mut queued = waiting("op-q", 500, 0, &[]);
+    queued.refusal = Some(gang_types::Refusal::Combination);
+    world.actions = Some(sample(1_000, vec![], vec![queued]));
+    let mut builder = Builder::new(config());
+    let mut frame = blank();
+    let prev = blank();
+    fill_into(&mut builder, &mut frame, &prev, 1, &world, 1_000, ok(0))?;
+    assert_eq!(
+        frame
+            .actions
+            .as_ref()
+            .and_then(|actions| actions.queued[0].refusal.as_deref()),
+        Some("no single fleet accepts every requested property")
+    );
+    if let Some(actions) = &mut world.actions {
+        actions.view.queued[0].refusal = None;
+    }
+    fill_into(&mut builder, &mut frame, &prev, 2, &world, 2_000, ok(0))?;
+    assert_eq!(
+        frame
+            .actions
+            .as_ref()
+            .and_then(|actions| actions.queued[0].refusal.as_deref()),
+        None
+    );
     Ok(())
 }
 

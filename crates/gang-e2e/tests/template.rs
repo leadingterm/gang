@@ -891,6 +891,36 @@ fn vary_cgroup_writes_the_worker_launcher_in_order() -> gang_e2e::Result<()> {
 }
 
 #[test]
+fn launch_failure_preset_sets_missing_launcher_and_short_timeout() -> gang_e2e::Result<()> {
+    let variant = Variant {
+        control: ControlKnobs::LAUNCH_FAILURE,
+        ..Variant::baseline(Sandbox::Noop)
+    };
+    let doc = typed_rendered(&ConfigTemplate::parse(&base_config()?)?.vary(
+        &variant,
+        &launcher(),
+        &tools(),
+    )?)?;
+    assert_eq!(
+        doc.client_action_timeout.get(),
+        std::time::Duration::from_secs(15)
+    );
+    assert_eq!(doc.poll_interval.get(), std::time::Duration::from_secs(1));
+    assert_eq!(
+        doc.fleets[0].idle_timeout,
+        std::time::Duration::from_secs(5)
+    );
+    let ProvisionerConfig::Local(local) = doc.provisioner else {
+        panic!("local provisioner expected");
+    };
+    assert_eq!(
+        local.worker_launcher.argv(),
+        ["gang-e2e-nonexistent-worker-launcher"]
+    );
+    Ok(())
+}
+
+#[test]
 fn vary_absent_removes_the_worker_launcher_of_the_base() -> gang_e2e::Result<()> {
     let text = base_config()?.replace(
         "[provisioner.local]",

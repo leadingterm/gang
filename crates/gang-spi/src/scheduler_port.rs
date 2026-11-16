@@ -12,7 +12,8 @@ use tokio::sync::oneshot;
 
 use gang_clock::Timestamp;
 use gang_types::{
-    Bytes, FleetCatalog, FleetName, FleetProperties, FleetSet, InstanceId, Resources, Url, WorkerId,
+    ActionResources, Bytes, FleetCatalog, FleetName, FleetProperties, FleetSet, InstanceId,
+    Refusal, Url, WorkerId,
 };
 
 use crate::{BoxedError, Peer, PortError, RenderedStoreSpec, port};
@@ -139,7 +140,7 @@ pub struct QueuedDemand {
     /// preference order; empty when none accepts it.
     pub candidates: FleetSet,
     /// The resources the action requests, each dimension zero when the action does not request it.
-    pub resources: Resources,
+    pub resources: ActionResources,
     /// When it was queued.
     pub queued_since: Timestamp,
     /// Scheduling priority; higher runs first.
@@ -203,6 +204,8 @@ pub struct QueuedActionView {
     pub queued_since: Timestamp,
     /// The fleets that accept the action; empty when none accepts it.
     pub candidates: FleetSet,
+    /// Why no fleet accepts the action; set exactly when `candidates` is empty.
+    pub refusal: Option<Refusal>,
 }
 
 /// A byte stream the controller serves one HTTP/2 connection on: an accepted socket, a TLS

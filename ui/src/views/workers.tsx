@@ -1,11 +1,11 @@
-// Workers: one row per worker grouped by fleet, with its phase, slots and the phase lane the
-// browser has observed; instances without a worker sit under their fleet as counts.
+// Workers: one row per worker grouped by fleet, with server-recorded phase lanes;
+// instances without a worker sit under their fleet as counts.
 import { useState } from "preact/hooks";
 import { idOf, ms, type UnixMs } from "../wire-parse.ts";
 import type { Fleet, Instance, Phase, State, Worker } from "../wire.ts";
-import { WINDOW_MS, type WorkerHistory } from "../history.ts";
-import { clock, duration, sum, workerShort } from "../format.ts";
-import { Disclosure, Empty, FleetFilter, Since, Target, useClient, useNowStep } from "../ui.tsx";
+import { windowMs } from "../recent.ts";
+import { clock, duration, sum, workerInstance } from "../format.ts";
+import { Disclosure, Empty, FleetFilter, Ident, SectionHead, Since, Target, useClient, useNowStep } from "../ui.tsx";
 import { AsOf } from "./actions.tsx";
 import { fleetCounts, fleetTotals, STATE_NAME, StaticCell, Tally, type Counted } from "./fleet.tsx";
 
@@ -18,28 +18,42 @@ const TALLIED: Record<Counted, boolean> = { busy: true, idle: true, draining: tr
 /** Lanes move at this resolution, so rows do not re-render every second. */
 const LANE_STEP_MS = 10 * 1000;
 
-type LaneSegment = { readonly phase: Phase | "off"; readonly from: UnixMs; readonly to: UnixMs };
+type LaneSegment = { readonly phase: Phase | "off" | "unrecorded"; readonly from: UnixMs; readonly to: UnixMs };
 
-export const laneSegments = (w: Worker, h: WorkerHistory | undefined, now: UnixMs): readonly LaneSegment[] => {
-  const start = now - WINDOW_MS;
+export const laneSegments = (w: Worker, now: UnixMs, window: number): readonly LaneSegment[] => {
+  const start = now - window;
   const launched = ms(w.launchTime);
-  const off = launched > start ? [{ phase: "off" as const, from: start, to: launched }] : [];
-  const seen = (h?.segments ?? []).map((s) => ({ phase: s.phase, from: s.from, to: s.to ?? now }));
-  return [...off, ...seen].filter((s) => s.to > start);
+  const phases = w.phases?.length ? w.phases : [{ phase: w.phase, start: w.phaseTime }];
+  const first = phases[0];
+  const segments: LaneSegment[] = [
+    { phase: "off", from: start, to: launched },
+    { phase: "unrecorded", from: Math.max(start, launched), to: first ? ms(first.start) : now },
+    ...phases.map((span, i) => {
+      const next = phases[i + 1];
+      return {
+        phase: span.phase,
+        from: Math.max(launched, ms(span.start)),
+        to: next ? ms(next.start) : now,
+      };
+    }),
+  ];
+  return segments
+    .map((s) => ({ ...s, from: Math.max(start, s.from), to: Math.min(now, s.to) }))
+    .filter((s) => s.to > s.from);
 };
 
-const Lane = ({ w, h, now }: { w: Worker; h: WorkerHistory | undefined; now: UnixMs }) => {
-  if (!h) return <div class="lane" aria-hidden="true" />;
-  const start = now - WINDOW_MS;
+const Lane = ({ w, now, window }: { w: Worker; now: UnixMs; window: number }) => {
+  const start = now - window;
+  const segments = laneSegments(w, now, window);
   return (
-    <div class="lane" role="img" aria-label={`Phase history: ${h.segments.map((s) => s.phase.toLowerCase()).join(", ")}`}>
-      {laneSegments(w, h, now).map((s) => (
+    <div class="lane" role="img" aria-label={`Phase history: ${segments.map((s) => s.phase.toLowerCase()).join(", ")}`}>
+      {segments.map((s) => (
         <i
           key={`${s.phase}-${s.from}`}
           class={`lane__seg lane__seg--${s.phase.toLowerCase()}`}
           style={{
-            "--x": String(Math.max(0, (s.from - start) / WINDOW_MS).toFixed(4)),
-            "--w": String(Math.max(0, (Math.min(now, s.to) - Math.max(start, s.from)) / WINDOW_MS).toFixed(4)),
+            "--x": String(((s.from - start) / window).toFixed(4)),
+            "--w": String(((s.to - s.from) / window).toFixed(4)),
           }}
         />
       ))}
@@ -60,16 +74,24 @@ const Pips = ({ w }: { w: Worker }) => (
   </span>
 );
 
-const WorkerDetail = ({ w, h, state }: { w: Worker; h: WorkerHistory | undefined; state: State }) => {
+export const WorkerDetail = ({ w, state }: { w: Worker; state: State }) => {
   const client = useClient();
   const acts = state.actions?.running.filter((a) => a.worker === w.name) ?? [];
-  const segments = (h?.segments ?? []).toReversed();
+  const phases = w.phases?.length ? w.phases : [{ phase: w.phase, start: w.phaseTime }];
+  const segments = phases.map((s, i) => {
+    const next = phases[i + 1];
+    return {
+      phase: s.phase,
+      from: ms(s.start),
+      to: next ? ms(next.start) : null,
+    };
+  }).toReversed();
   const launched = ms(w.launchTime);
   return (
     <>
       <dl class="kv kv--tight">
         <dt>worker</dt>
-        <dd class="mono">{idOf(w.name)}</dd>
+        <dd><Ident text={idOf(w.name)} /></dd>
         <dt>up</dt>
         <dd class="mono">
           <Since t={launched} /> · since {clock(launched)}
@@ -97,13 +119,20 @@ const WorkerDetail = ({ w, h, state }: { w: Worker; h: WorkerHistory | undefined
       {acts.length > 0 && state.actions && (
         <>
           <table class="table" aria-label="Running on this worker">
+            <thead>
+              <tr>
+                <th scope="col">Target</th>
+                <th scope="col">Mnemonic</th>
+                <th scope="col" class="r">Running</th>
+              </tr>
+            </thead>
             <tbody>
               {acts.map((a) => (
                 <tr key={a.name}>
                   <td class="a-main">
-                    <Target label={a.target} />
+                    {a.target ? <Target label={a.target} /> : <span class="mono quiet">{a.digest.slice(0, 12)}</span>}
                   </td>
-                  <td class="a-kind">{a.mnemonic}</td>
+                  <td class="a-kind">{a.mnemonic || "—"}</td>
                   <td class="a-age r">
                     <Since t={ms(a.startTime)} />
                   </td>
@@ -118,9 +147,9 @@ const WorkerDetail = ({ w, h, state }: { w: Worker; h: WorkerHistory | undefined
   );
 };
 
-const WorkerRow = ({ w, h, state, now }: { w: Worker; h: WorkerHistory | undefined; state: State; now: UnixMs }) => {
+const WorkerRow = ({ w, state, now }: { w: Worker; state: State; now: UnixMs }) => {
   const id = idOf(w.name);
-  const instance = idOf(w.instance);
+  const instance = workerInstance(id);
   const phase = w.phase.toLowerCase();
   return (
     <div class="wrow">
@@ -134,8 +163,7 @@ const WorkerRow = ({ w, h, state, now }: { w: Worker; h: WorkerHistory | undefin
               <svg class="wrow__chev" viewBox="0 0 10 10" aria-hidden="true">
                 <path d="M3 1.5 6.5 5 3 8.5" />
               </svg>
-              <span class="wrow__inst">{instance}</span>
-              <span class="wrow__uuid">{workerShort(id, instance)}</span>
+              <span class="wrow__inst"><Ident text={instance} /></span>
             </span>
             <span class={`phase phase--${phase}`}>
               <span class="phase__name">{phase}</span>
@@ -145,11 +173,11 @@ const WorkerRow = ({ w, h, state, now }: { w: Worker; h: WorkerHistory | undefin
               {w.paused && <span class="paused">paused</span>}
             </span>
             <Pips w={w} />
-            <Lane w={w} h={h} now={now} />
+            <Lane w={w} now={now} window={windowMs(state.recent)} />
           </>
         }
       >
-        <WorkerDetail w={w} h={h} state={state} />
+        <WorkerDetail w={w} state={state} />
       </Disclosure>
     </div>
   );
@@ -178,10 +206,11 @@ const ghosts = (f: Fleet, instances: readonly Instance[]) => {
 export const Workers = () => {
   const client = useClient();
   const state = client.state.value;
-  const history = client.history.value;
   const [fleet, setFleet] = useState("");
-  const now = useNowStep(LANE_STEP_MS);
+  const stepped = useNowStep(LANE_STEP_MS);
   if (!state) return null;
+  const now = Math.max(stepped, ms(state.updateTime));
+  const window = windowMs(state.recent);
   const ws = state.workers;
   const pending = sum(state.fleets, (f) => f.instances.pending);
   if (ws.length === 0) {
@@ -203,9 +232,9 @@ export const Workers = () => {
           <span />
           <span />
           <span class="axis">
-            <span>−30m</span>
-            <span>−20m</span>
-            <span>−10m</span>
+            <span>−{duration(window)}</span>
+            <span>−{duration(2 * window / 3)}</span>
+            <span>−{duration(window / 3)}</span>
             <span>now</span>
           </span>
         </div>
@@ -214,13 +243,10 @@ export const Workers = () => {
           const gs = ghosts(f, state.instances);
           if (rows.length === 0 && gs.length === 0) return null;
           return (
-            <section key={f.name} class="wgroup" aria-label={idOf(f.name)} hidden={fleet !== "" && fleet !== f.name}>
-              <div class="wgroup__head">
-                <h2>{idOf(f.name)}</h2>
-                <span class="section__count">{rows.length}</span>
-              </div>
+            <section key={f.name} class="wgroup" aria-labelledby={`wg-${idOf(f.name)}`} hidden={fleet !== "" && fleet !== f.name}>
+              <SectionHead id={`wg-${idOf(f.name)}`} title={idOf(f.name)} count={rows.length} mono />
               {rows.map((w) => (
-                <WorkerRow key={w.name} w={w} h={history?.workers.get(w.name)} state={state} now={now} />
+                <WorkerRow key={w.name} w={w} state={state} now={now} />
               ))}
               {gs.map((g) => (
                 <Ghost key={g.state} {...g} />

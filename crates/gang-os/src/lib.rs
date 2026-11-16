@@ -3,14 +3,14 @@
 //! spawning and shutdown signals.
 //!
 //! ```
-//! use gang_os::fs::{PRIVATE_FILE, ensure_private_dir, read_optional, write_atomic};
+//! use gang_os::fs::{PRIVATE_FILE, ensure_private_dir, read_optional};
 //!
 //! let dir = tempfile::tempdir()?;
 //! let state = dir.path().join("state");
-//! ensure_private_dir(&state)?;
+//! let private = ensure_private_dir(&state)?;
 //! let file = state.join("token");
 //! assert_eq!(read_optional(&file)?, None);
-//! write_atomic(&file, b"secret", PRIVATE_FILE)?;
+//! private.write_atomic("token", b"secret", PRIVATE_FILE)?;
 //! assert_eq!(read_optional(&file)?.as_deref(), Some(&b"secret"[..]));
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```

@@ -204,11 +204,14 @@ impl ScratchVolumePort for Aws {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
-    use crate::fake_aws::{FakeAws, FakeFailure};
-    use crate::fleet_harness::{Harness, fleet};
+    use crate::config::{AwsFleetOptions, Capacity, RetrySpotAfter, SpotFallback};
+    use crate::fake_aws::{FakeAws, FakeFailure, FakeGroup};
+    use crate::fleet_harness::{Harness, NOW_MILLIS, fleet, fleet_with, rfc3339_ago};
     use crate::test_support::context;
-    use gang_clock::TestClock;
+    use gang_clock::{TestClock, Timestamp};
     use gang_types::InstanceLifecycle;
     use serde_json::json;
 
@@ -236,7 +239,7 @@ mod tests {
             &fake.sdk_config().await,
             fake.imds_client()?,
             &config,
-            Arc::new(TestClock::default()),
+            Arc::new(TestClock::new(Timestamp::from_unix_millis(NOW_MILLIS))),
         );
         Ok(Aws::with_runtime(config, runtime))
     }
@@ -264,6 +267,34 @@ mod tests {
         assert_eq!(instance.id, InstanceId::try_new(INSTANCE)?);
         assert_eq!(instance.lifecycle, InstanceLifecycle::InService);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn abandoned_requests_follow_the_provisioner_contract() -> TestResult {
+        let harness = Harness::start().await?;
+        harness.add_group_with(FakeGroup {
+            new_instances_protected: true,
+            ..FakeGroup::new(GROUP, 4, &[])
+        });
+        harness.add_group_with(FakeGroup {
+            new_instances_protected: true,
+            ..FakeGroup::new("gang-worker-x86-64-on-demand", 0, &[])
+        });
+        harness.add_activity(GROUP, "Failed", &rfc3339_ago(30));
+        let aws = with_fake(&harness.fake).await?;
+        let fleet = fleet_with(
+            GROUP,
+            AwsFleetOptions {
+                capacity: Capacity::Spot,
+                machine_class: None,
+                fallback: Some(SpotFallback {
+                    retry_spot_after: RetrySpotAfter::try_new(Duration::from_mins(5))?,
+                    drain_on_demand_first: true,
+                }),
+            },
+        )?;
+
+        gang_testkit::provisioner_contract::abandoned_requests_contract(&aws, fleet.view()).await
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@ use std::io;
 use gang_os::{FileLock, PathIo};
 
 use crate::ClientError;
-use crate::home::ClientHome;
+use crate::home::{ClientHome, LOCK_FILE};
 
 /// Holds the client lock. The lock is released when this value is dropped.
 #[derive(Debug)]
@@ -23,13 +23,12 @@ impl ClientHome {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Io`] when the directory or the lock file cannot be created or
-    /// locked.
+    /// Returns [`ClientError::Io`] when the directory fails its private-directory checks, the
+    /// lock file cannot be opened without following links or locked, or the blocking task fails.
     pub(crate) async fn lock(&self) -> Result<ClientLock, ClientError> {
-        self.create_dir()?;
+        let dir = self.ensure_dir()?;
         let path = self.lock_file();
-        let blocking = path.clone();
-        let lock = tokio::task::spawn_blocking(move || FileLock::exclusive_blocking(&blocking))
+        let lock = tokio::task::spawn_blocking(move || dir.lock(LOCK_FILE))
             .await
             .map_err(|join| PathIo::new("lock", &path, io::Error::other(join)))??;
         Ok(ClientLock { _lock: lock })
@@ -39,6 +38,7 @@ impl ClientHome {
 #[cfg(test)]
 mod tests {
     use std::future::{Future, poll_fn};
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::pin::pin;
     use std::task::Poll;
 
@@ -54,6 +54,23 @@ mod tests {
         assert_eq!(mode(home.dir()), 0o700);
         assert_eq!(mode(&home.lock_file()), 0o600);
         drop(lock);
+    }
+
+    /// A lock file link is refused without creating its target.
+    #[tokio::test]
+    async fn lock_refuses_a_symbolic_link() {
+        let tmp = TempDir::new().expect("temp dir");
+        let home = home_in(&tmp);
+        std::fs::create_dir_all(home.dir()).expect("home directory is created");
+        std::fs::set_permissions(home.dir(), std::fs::Permissions::from_mode(0o700))
+            .expect("home directory permissions are set");
+        let elsewhere = tmp.path().join("elsewhere");
+        symlink(&elsewhere, home.lock_file()).expect("lock link is created");
+
+        home.lock()
+            .await
+            .expect_err("a lock file that is a link must be refused");
+        assert!(!elsewhere.exists(), "the link target must not be created");
     }
 
     #[tokio::test]

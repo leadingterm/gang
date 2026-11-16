@@ -50,7 +50,7 @@ impl Session {
     /// [`ClientError::Io`] when it cannot be read.
     pub(crate) fn load(home: &ClientHome) -> Result<Option<Self>, ClientError> {
         let path = home.session_file();
-        let Some(contents) = ClientHome::read(&path)? else {
+        let Some(contents) = home.read(&path)? else {
             return Ok(None);
         };
         serde_json::from_slice(&contents)
@@ -76,6 +76,7 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     use gang_types::{CaPin, ProviderName, Url};
@@ -83,6 +84,7 @@ mod tests {
 
     use super::{Session, SessionKind};
     use crate::ClientError;
+    use crate::home::ClientHome;
     use crate::proof_source::ProofSource;
     use crate::test_support::{ca_pin, home_in};
 
@@ -141,6 +143,29 @@ mod tests {
         let loaded = Session::load(&home).expect("absence is not an error");
 
         assert_eq!(loaded, None);
+    }
+
+    /// Sessions beneath an untrusted writable parent are not accepted.
+    #[test]
+    fn session_under_a_writable_parent_is_refused() {
+        if rustix::process::geteuid().as_raw() == 0 {
+            return;
+        }
+        let tmp = TempDir::new().expect("temp dir");
+        let shared = tmp.path().join("shared");
+        std::fs::create_dir(&shared).expect("shared directory is created");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777))
+            .expect("shared directory permissions are set");
+        let home = ClientHome::try_new(shared.join("gang")).expect("home path is valid");
+        std::fs::create_dir(home.dir()).expect("home directory is created");
+        std::fs::set_permissions(home.dir(), std::fs::Permissions::from_mode(0o700))
+            .expect("home directory permissions are set");
+        let contents =
+            serde_json::to_vec(&session(SessionKind::Device, None)).expect("session is serialized");
+        std::fs::write(home.session_file(), contents).expect("session is written");
+
+        Session::load(&home)
+            .expect_err("a session planted under a writable parent must be refused");
     }
 
     #[test]
