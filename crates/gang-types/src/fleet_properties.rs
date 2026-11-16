@@ -40,13 +40,13 @@ pub struct FleetProperties {
 
 impl FleetProperties {
     const SANDBOX_POSITION: usize = 2;
-    const FIXED_ENTRY_COUNT: usize = 6;
+    const FIXED_ENTRY_COUNT: usize = 7;
 
     /// Creates a fleet's properties.
     ///
-    /// The entries are the fleet, ISA, sandbox, `cpu_count`, `memory_kb` and `disk_kb` (all
-    /// minimums, with memory and disk in KiB), followed by the provisioner options as exact
-    /// entries.
+    /// The entries are the fleet, ISA, sandbox, `cpu_count`, `cpu_millicores`, `memory_kb`
+    /// and `disk_kb`; the resource entries are minimums, with memory and disk in KiB.
+    /// Provisioner options follow as exact entries.
     pub fn new(
         name: &FleetName,
         isa: Isa,
@@ -71,6 +71,10 @@ impl FleetProperties {
                 rule: Rule::Exact,
             },
             minimum(property::CPU_COUNT, u64::from(instance.vcpus)),
+            minimum(
+                property::CPU_MILLICORES,
+                u64::from(instance.vcpus) * property::MILLICORES_PER_CORE,
+            ),
             minimum(property::MEMORY_KB, instance.memory.get() / 1024),
             minimum(property::DISK_KB, instance.disk.get() / 1024),
         ];
@@ -202,6 +206,7 @@ mod tests {
                 ("ISA", "x86-64"),
                 ("sandbox", "bwrap"),
                 ("cpu_count", "15"),
+                ("cpu_millicores", "15000"),
                 ("memory_kb", "30408704"),
                 ("disk_kb", "104857600"),
                 ("capacity", "spot"),
@@ -227,6 +232,7 @@ mod tests {
                 ("ISA", MatchKind::Exact),
                 ("sandbox", MatchKind::Exact),
                 ("cpu_count", MatchKind::Minimum),
+                ("cpu_millicores", MatchKind::Minimum),
                 ("memory_kb", MatchKind::Minimum),
                 ("disk_kb", MatchKind::Minimum),
                 ("capacity", MatchKind::Exact),
@@ -244,6 +250,7 @@ mod tests {
                 ("ISA", "x86-64", Rule::Exact),
                 ("sandbox", "bwrap", Rule::Exact),
                 ("cpu_count", "15", Rule::Minimum(15)),
+                ("cpu_millicores", "15000", Rule::Minimum(15000)),
                 ("memory_kb", "30408704", Rule::Minimum(30408704)),
                 ("disk_kb", "104857600", Rule::Minimum(104857600)),
                 ("capacity", "spot", Rule::Exact),

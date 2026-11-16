@@ -22,7 +22,7 @@ use crate::wrap::{columns, wrap_text};
 /// clap has no subcommand groups, so the root help template is built from this table; every
 /// visible command appears exactly once and each row's text is the command's own doc comment.
 pub(crate) const GROUPS: &[(&str, &[&str])] = &[
-    ("Build", &["login", "bazelrc", "doctor"]),
+    ("Build", &["setup", "login", "bazelrc", "doctor"]),
     ("Local farm", &["local up", "local down"]),
     (
         "Operate",

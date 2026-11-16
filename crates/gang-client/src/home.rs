@@ -1,14 +1,15 @@
 //! The client's private directory: the session, the identity provider's proofs and the bearer token.
 //!
-//! Every write goes through a temporary file in the destination's directory and is renamed
-//! into place, so readers never observe a partial file.
+//! Reads, writes and the lock go through the verified private directory. Writes use a
+//! temporary file in that directory and are renamed into place, so readers never observe
+//! a partial file.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use gang_os::PathIo;
-use gang_os::fs::{self, PRIVATE_FILE};
+use gang_os::fs::{self, Mode, PRIVATE_FILE, PUBLIC_FILE, PrivateDir};
 
 use crate::{ClientError, ClientOptions};
 
@@ -40,10 +41,7 @@ const TOKEN_FILE: &str = "token";
 const REFRESH_TOKEN_FILE: &str = "refresh-token";
 
 /// File that serializes the client operations which rewrite the identity files.
-const LOCK_FILE: &str = "lock";
-
-/// Permission bits of public files: owner read and write, everyone read.
-const PUBLIC_FILE_MODE: u32 = 0o644;
+pub(crate) const LOCK_FILE: &str = "lock";
 
 /// The client's private directory and the files it keeps there.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,13 +100,11 @@ impl ClientHome {
     /// [`ClientError::Options`] if its contents are invalid.
     pub fn options(&self) -> Result<ClientOptions, ClientError> {
         let path = self.options_file();
-        let contents = match std::fs::read_to_string(&path) {
-            Ok(contents) => contents,
-            Err(source) if source.kind() == ErrorKind::NotFound => {
-                return Ok(ClientOptions::default());
-            }
-            Err(source) => return Err(PathIo::new("read", &path, source).into()),
+        let Some(contents) = self.read(&path)? else {
+            return Ok(ClientOptions::default());
         };
+        let contents = String::from_utf8(contents)
+            .map_err(|_| PathIo::new("read", &path, ErrorKind::InvalidData.into()))?;
         toml::from_str(&contents).map_err(|source| ClientError::Options { path, source })
     }
 
@@ -149,37 +145,66 @@ impl ClientHome {
 
     /// Writes `contents` to `path` with mode 0600, creating the directory first.
     pub(crate) fn write_private(&self, path: &Path, contents: &[u8]) -> Result<(), ClientError> {
-        self.create_dir()?;
-        fs::write_atomic(path, contents, PRIVATE_FILE)?;
-        Ok(())
+        self.write_file(path, contents, PRIVATE_FILE)
     }
 
     /// Writes `contents` to `path` with mode 0644, creating the directory first.
     pub(crate) fn write_public(&self, path: &Path, contents: &[u8]) -> Result<(), ClientError> {
-        self.create_dir()?;
-        fs::write_atomic(path, contents, PUBLIC_FILE_MODE)?;
+        self.write_file(path, contents, PUBLIC_FILE)
+    }
+
+    /// Publishes a client file through its verified directory.
+    fn write_file(&self, path: &Path, contents: &[u8], mode: Mode) -> Result<(), ClientError> {
+        let dir = self.ensure_dir()?;
+        let name = self.file_name(path, "write")?;
+        dir.write_atomic(name, contents, mode)?;
         Ok(())
     }
 
     /// Reads `path`, or `None` when it does not exist.
-    pub(crate) fn read(path: &Path) -> Result<Option<Vec<u8>>, ClientError> {
-        fs::read_optional(path).map_err(ClientError::from)
+    pub(crate) fn read(&self, path: &Path) -> Result<Option<Vec<u8>>, ClientError> {
+        let name = self.file_name(path, "read")?;
+        let Some(dir) = self.open_dir()? else {
+            return Ok(None);
+        };
+        dir.read_optional(name).map_err(ClientError::from)
     }
 
     /// Removes `path`; succeeds when it is already absent.
-    pub(crate) fn remove(path: &Path) -> Result<(), ClientError> {
-        fs::remove_optional(path).map_err(ClientError::from)
+    pub(crate) fn remove(&self, path: &Path) -> Result<(), ClientError> {
+        let name = self.file_name(path, "remove")?;
+        let Some(dir) = self.open_dir()? else {
+            return Ok(());
+        };
+        dir.remove_optional(name).map_err(ClientError::from)
     }
 
-    /// Creates the client directory (and missing parents) with mode 0700 when absent.
-    pub(crate) fn create_dir(&self) -> Result<(), ClientError> {
+    /// Opens the client directory after the private-directory checks, or `None` when absent.
+    fn open_dir(&self) -> Result<Option<PrivateDir>, ClientError> {
+        fs::open_private_dir(&self.dir).map_err(ClientError::from)
+    }
+
+    /// Opens the client directory after the checks, creating it with mode 0700 when absent.
+    pub(crate) fn ensure_dir(&self) -> Result<PrivateDir, ClientError> {
         fs::ensure_private_dir(&self.dir).map_err(ClientError::from)
+    }
+
+    /// Returns the name of a client file relative to the client directory.
+    fn file_name<'a>(
+        &self,
+        path: &'a Path,
+        action: &'static str,
+    ) -> Result<&'a OsStr, ClientError> {
+        path.strip_prefix(&self.dir)
+            .map(Path::as_os_str)
+            .map_err(|_| PathIo::new(action, path, ErrorKind::InvalidInput.into()).into())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
     use tempfile::TempDir;
@@ -245,7 +270,7 @@ mod tests {
     fn options_file_overrides_a_default() {
         let tmp = TempDir::new().expect("temp dir");
         let home = home_in(&tmp);
-        home.create_dir().expect("directory is created");
+        home.ensure_dir().expect("directory is created");
         std::fs::write(
             home.dir().join("client.toml"),
             "browser_command = 'browser'\n",
@@ -261,7 +286,7 @@ mod tests {
     fn unknown_option_reports_the_options_file() {
         let tmp = TempDir::new().expect("temp dir");
         let home = home_in(&tmp);
-        home.create_dir().expect("directory is created");
+        home.ensure_dir().expect("directory is created");
         let path = home.dir().join("client.toml");
         std::fs::write(&path, "unknown_option = true\n").expect("options are written");
 
@@ -275,10 +300,35 @@ mod tests {
     fn options_file_read_failure_is_an_io_error() {
         let tmp = TempDir::new().expect("temp dir");
         let home = home_in(&tmp);
-        home.create_dir().expect("directory is created");
+        home.ensure_dir().expect("directory is created");
         std::fs::create_dir(home.dir().join("client.toml")).expect("directory is created");
 
         assert!(matches!(home.options(), Err(ClientError::Io(_))));
+    }
+
+    /// Options beneath an untrusted writable parent are not accepted.
+    #[test]
+    fn options_under_a_writable_parent_are_refused() {
+        if rustix::process::geteuid().as_raw() == 0 {
+            return;
+        }
+        let tmp = TempDir::new().expect("temp dir");
+        let shared = tmp.path().join("shared");
+        std::fs::create_dir(&shared).expect("shared directory is created");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777))
+            .expect("shared directory permissions are set");
+        let home = ClientHome::try_new(shared.join("gang")).expect("home path is valid");
+        std::fs::create_dir(home.dir()).expect("home directory is created");
+        std::fs::set_permissions(home.dir(), std::fs::Permissions::from_mode(0o700))
+            .expect("home directory permissions are set");
+        std::fs::write(
+            home.dir().join("client.toml"),
+            "browser_command = '/bin/false'\n",
+        )
+        .expect("options are written");
+
+        home.options()
+            .expect_err("options planted under a writable parent must be refused");
     }
 
     #[test]
@@ -314,7 +364,9 @@ mod tests {
         home.write_private(&home.refresh_token_file(), b"second")
             .expect("second write succeeds");
 
-        let contents = ClientHome::read(&home.refresh_token_file()).expect("read succeeds");
+        let contents = home
+            .read(&home.refresh_token_file())
+            .expect("read succeeds");
         assert_eq!(contents.as_deref(), Some(&b"second"[..]));
     }
 
@@ -323,7 +375,7 @@ mod tests {
         let tmp = TempDir::new().expect("temp dir");
         let home = home_in(&tmp);
 
-        let contents = ClientHome::read(&home.token_file()).expect("read succeeds");
+        let contents = home.read(&home.token_file()).expect("read succeeds");
 
         assert_eq!(contents, None);
     }
@@ -332,9 +384,9 @@ mod tests {
     fn read_that_fails_for_another_reason_is_an_error() {
         let tmp = TempDir::new().expect("temp dir");
         let home = home_in(&tmp);
-        home.create_dir().expect("directory is created");
+        home.ensure_dir().expect("directory is created");
 
-        let result = ClientHome::read(home.dir());
+        let result = home.read(home.dir());
 
         assert!(matches!(result, Err(ClientError::Io(_))));
     }
@@ -344,6 +396,7 @@ mod tests {
         let tmp = TempDir::new().expect("temp dir");
         let home = home_in(&tmp);
 
-        ClientHome::remove(&home.refresh_token_file()).expect("removing an absent file succeeds");
+        home.remove(&home.refresh_token_file())
+            .expect("removing an absent file succeeds");
     }
 }

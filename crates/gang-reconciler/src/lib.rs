@@ -12,7 +12,7 @@
 //! use gang_config::{FleetPolicy, InstanceBounds};
 //! use gang_reconciler::{Action, FleetPass, HostedSnapshot, PassTime, Plan, PlanStep, Reconciler};
 //! use gang_spi::{QueuedDemand, SchedulerSnapshot};
-//! use gang_types::{FleetName, FleetSet, Isa, NonZeroBytes, Resources, nonzero_u32};
+//! use gang_types::{ActionResources, FleetName, FleetSet, Isa, NonZeroBytes, nonzero_u32};
 //!
 //! let policy = FleetPolicy {
 //!     name: FleetName::try_new("x86-64-fleet")?,
@@ -31,7 +31,7 @@
 //! let mut snapshot = SchedulerSnapshot {
 //!     queued: vec![QueuedDemand {
 //!         candidates: FleetSet::prefix(1)?,
-//!         resources: Resources::default(),
+//!         resources: ActionResources::default(),
 //!         queued_since: Timestamp::from_unix_millis(0),
 //!         priority: 0,
 //!     }],

@@ -28,6 +28,7 @@ async fn server_is_open_and_answers_the_token_authentication_and_the_ca() {
 
             let body = answer.value();
             assert_eq!(body["name"], "server");
+            assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
             assert!(body["authentication"]["token"]["login"].is_object());
             assert!(body["caCertificate"].is_string());
             let server: Server<Value> = answer.ok();

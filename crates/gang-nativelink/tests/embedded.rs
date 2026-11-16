@@ -1299,11 +1299,8 @@ async fn an_action_no_fleet_accepts_is_refused_when_submitted() -> TestResult {
         .await
         .expect_err("an unplaceable action must be refused");
     assert_eq!(status.code(), Code::InvalidArgument);
-    assert!(
-        status
-            .message()
-            .contains("no fleet accepts the platform properties of this action")
-    );
+    assert!(status.message().contains("no fleet accepts this action"));
+    assert!(status.message().contains("disk_kb"));
     Ok(())
 }
 

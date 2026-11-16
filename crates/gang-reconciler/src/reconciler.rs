@@ -237,10 +237,10 @@ impl Reconciler {
     ///   orders, and draining workers not resumed are not capacity even while still listed.
     /// * When demand needs more capacity than remains, draining workers are resumed first,
     ///   busiest first, then the workers whose instance is not `release_first`, and the fleet is
-    ///   scaled out only for what resuming cannot cover. When capacity is in surplus, the surplus
-    ///   is released from the `release_first` tier first: its longest-idle eligible workers past
-    ///   `idle_timeout` are drained, and the other eligible workers are drained only for the
-    ///   surplus that tier cannot absorb (see [`Reconciler::reconcile_fleet`]).
+    ///   scaled out only for what resuming cannot cover. When capacity is in surplus, failed
+    ///   unlaunched requests are withdrawn first; requests with a launch in flight are retained.
+    ///   The remaining surplus is released from the `release_first` tier first: its longest-idle
+    ///   eligible workers past `idle_timeout` drain before other eligible workers.
     ///
     /// Every step is safe to apply again. A pass that runs before the provisioner or scheduler
     /// has reflected the previous pass plans the same steps again, so the caller converges
@@ -336,7 +336,8 @@ impl Reconciler {
     ///
     /// The steps are pushed in this order: orphan terminations in supply order, then
     /// [`Action::CancelDrain`] for the resumed workers, then terminations of finished drains,
-    /// then either one [`Action::ScaleOut`] or the [`Action::StartDrain`]s.
+    /// then a withdrawal of abandoned requests, then either one [`Action::ScaleOut`] or a
+    /// possible surplus [`Action::Withdraw`] followed by the [`Action::StartDrain`]s.
     ///
     /// Capacity is counted forward: instances classified as capacity (serving, idle, booting, or
     /// not yet an orphan), plus instances requested but not yet listed by the provisioner
@@ -349,8 +350,12 @@ impl Reconciler {
     /// not `release_first`, then by worker id. Capacity that is already running serves again
     /// before a new instance boots. If the fleet is still short, it is scaled out to the needed
     /// count, which `Demand::instances` caps at `max_instances`.
+    /// Failed launches' unborn requests do not count when deciding how many workers to resume.
     ///
-    /// Otherwise the surplus is released in two tiers. Let `R` be the release-first instances
+    /// Abandoned requests are withdrawn at the desired capacity after terminations. On a launch
+    /// failure, at most the surplus of the instances requested but not yet listed is withdrawn
+    /// separately. In-flight requests are never withdrawn.
+    /// The remaining surplus is released in two tiers. Let `R` be the release-first instances
     /// that count as capacity, busy and booting ones included, `Ce` the eligible release-first
     /// candidates, and `Cs` the other eligible candidates, each sorted longest idle first, then
     /// by worker id. The first `min(surplus, |Ce|)` of `Ce` drain, then the first
@@ -367,6 +372,7 @@ impl Reconciler {
         workers: &mut WorkerCounts,
         plan: &mut Plan,
     ) {
+        let planned = plan.steps.len();
         self.candidates.clear();
         self.draining.clear();
         let Census {
@@ -388,8 +394,28 @@ impl Reconciler {
         let unborn = view.supply.desired.saturating_sub(live);
         // The capacity before any draining worker is resumed.
         let standing = serving.saturating_add(unborn);
-        let resume = view.needed.saturating_sub(standing).min(draining);
+        let reliable = if view.supply.launch_failure.is_some() {
+            serving
+        } else {
+            standing
+        };
+        let resume = view.needed.saturating_sub(reliable).min(draining);
         self.resume_and_terminate(pass, view, resume, plan);
+        let terminated: u32 = plan.steps[planned..]
+            .iter()
+            .filter(|step| matches!(step.action, Action::Terminate { .. }))
+            .count()
+            .saturating_into();
+        let from = view.supply.desired.saturating_sub(terminated);
+        if view.supply.abandoned > 0 {
+            plan.steps.push(PlanStep {
+                fleet: view.index,
+                action: Action::Withdraw {
+                    from: from.saturating_add(view.supply.abandoned),
+                    to: from,
+                },
+            });
+        }
         let capacity = standing.saturating_add(resume);
         if view.needed > capacity {
             plan.steps.push(PlanStep {
@@ -400,7 +426,23 @@ impl Reconciler {
                 },
             });
         } else {
-            self.start_drains(pass, view, capacity - view.needed, release_first, plan);
+            let mut surplus = capacity - view.needed;
+            let withdrawn = if view.supply.launch_failure.is_some() {
+                unborn.min(surplus)
+            } else {
+                0
+            };
+            if withdrawn > 0 {
+                plan.steps.push(PlanStep {
+                    fleet: view.index,
+                    action: Action::Withdraw {
+                        from,
+                        to: from.saturating_sub(withdrawn),
+                    },
+                });
+                surplus = surplus.saturating_sub(withdrawn);
+            }
+            self.start_drains(pass, view, surplus, release_first, plan);
         }
     }
 

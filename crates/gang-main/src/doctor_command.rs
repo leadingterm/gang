@@ -1,12 +1,14 @@
 //! The `gang doctor` command: diagnoses this machine's Bazel and login setup against a Gang server
 //! and reports one record per finding.
 
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use gang_client::{
-    BazelCommand, Check, ClientHome, ClientProbe, Doctor, Event, Finding, Report, Status,
-    StoredLogin, stored_login,
+    BazelCommand, BazelProbe, Check, ClientHome, ClientOptions, ClientProbe, Doctor, Event,
+    Finding, Report, Status, StoredLogin, pin_for, stored_login,
 };
 use gang_clock::SystemClock;
 use gang_tls::ServerTrust;
@@ -25,21 +27,47 @@ pub(crate) fn run(args: DoctorArgs, out: &Output) -> Result<ExitCode> {
     let home = ClientHome::resolve(|key| std::env::var_os(key))?;
     let stored = stored_login(&home)?;
     let (server, ca_pin) = resolve_target(args.server, args.ca_pin, stored)?;
-    let host = host_name(&server);
     let options = home.options()?;
     let clock = Arc::new(SystemClock::new());
-    let probe = ClientProbe::try_new(&server, ca_pin.as_ref(), &options, clock.clone())?;
-    let bazel = BazelCommand::new(args.bazel, args.bazel_args, &options, clock.clone());
+    let (directory, owned_rc) = doctor_directory(|key| std::env::var_os(key));
+    let mut bazel = BazelCommand::new(args.bazel, args.bazel_args, &options, clock.clone());
+    if let Some(directory) = directory {
+        bazel = bazel.in_directory(directory);
+    }
+    let report = diagnose(
+        out,
+        &server,
+        ca_pin.as_ref(),
+        &options,
+        &clock,
+        &bazel,
+        owned_rc,
+    )?;
+    Ok(exit_code(report.as_ref()))
+}
+
+/// Runs the shared doctor with `bazel` and prints its findings and summary.
+pub(crate) fn diagnose(
+    out: &Output,
+    server: &Url,
+    ca_pin: Option<&CaPin>,
+    options: &ClientOptions,
+    clock: &Arc<SystemClock>,
+    bazel: &impl BazelProbe,
+    owned_rc: PathBuf,
+) -> Result<Option<Report>> {
+    let probe = ClientProbe::try_new(server, ca_pin, options, clock.clone())?;
     let mut stream = Stream::new(out);
     let report = runtime::block_on(async {
         let shutdown = gang_os::shutdown_signal().map_err(MainError::Signals)?;
         let doctor = Doctor::new(
-            &bazel,
+            bazel,
             &probe,
-            &*clock,
-            &server,
-            ServerTrust::from(ca_pin.as_ref()),
-            &options,
+            &**clock,
+            server,
+            ServerTrust::from(ca_pin),
+            options,
+            owned_rc,
         );
         let mut observe = |event: Event<'_>| stream.observe(event);
         let diagnosis = doctor.diagnose_with(&mut observe);
@@ -47,14 +75,26 @@ pub(crate) fn run(args: DoctorArgs, out: &Output) -> Result<ExitCode> {
     })?;
     stream.finish()?;
     if let Some(report) = &report {
-        summarize(out, report, &host);
+        summarize(out, report, &host_name(server));
     }
-    Ok(exit_code(report.as_ref()))
+    Ok(report)
+}
+
+/// Resolves Bazel's working directory and the rc owned by its workspace.
+fn doctor_directory(env: impl Fn(&str) -> Option<OsString>) -> (Option<PathBuf>, PathBuf) {
+    let directory = crate::workspace::working_directory(env);
+    let owned_rc = directory
+        .as_deref()
+        .and_then(|dir| gang_client::workspace_root(dir).ok())
+        .map_or_else(PathBuf::new, |root| {
+            root.join(gang_client::GANG_DIR).join(gang_client::GANG_RC)
+        });
+    (directory, owned_rc)
 }
 
 /// The exit code of a run: success only when a report exists and no check failed. An
 /// interrupted run has no report and fails.
-fn exit_code(report: Option<&Report>) -> ExitCode {
+pub(crate) fn exit_code(report: Option<&Report>) -> ExitCode {
     match report {
         Some(report) if report.is_healthy() => ExitCode::SUCCESS,
         _ => ExitCode::FAILURE,
@@ -73,20 +113,20 @@ async fn diagnose_until<R>(
     }
 }
 
-/// Chooses the server and CA pin to diagnose. An explicit server is used with only an explicit
-/// pin; otherwise the stored login supplies the server, and an explicit pin still wins over its pin.
+/// Chooses the server and its explicit or matching stored CA pin.
 fn resolve_target(
     server: Option<Url>,
     ca_pin: Option<CaPin>,
     stored: Option<StoredLogin>,
 ) -> Result<(Url, Option<CaPin>)> {
-    if let Some(server) = server {
-        return Ok((server, ca_pin));
+    match (server, stored) {
+        (Some(server), stored) => {
+            let ca_pin = pin_for(&server, ca_pin, stored.as_ref());
+            Ok((server, ca_pin))
+        }
+        (None, Some(stored)) => Ok((stored.server, ca_pin.or(stored.ca_pin))),
+        (None, None) => Err(MainError::NoServer),
     }
-    let Some(stored) = stored else {
-        return Err(MainError::NoServer);
-    };
-    Ok((stored.server, ca_pin.or(stored.ca_pin)))
 }
 
 /// The host of `server`, as the summary names it; the whole URL when it has none.
@@ -119,7 +159,8 @@ const fn activity(check: Check) -> Option<&'static str> {
         | Check::RemoteCache
         | Check::TlsCertificate
         | Check::CredentialHelper
-        | Check::Clock => None,
+        | Check::Clock
+        | Check::RemoteHeaders => None,
     }
 }
 
@@ -246,6 +287,22 @@ mod tests {
 
     use super::*;
 
+    /// Bazel's invoking directory, not the process cwd, owns the default rc.
+    #[test]
+    fn doctor_directory_uses_bazel_working_directory() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("MODULE.bazel"), "").expect("workspace marker");
+        let (_, owned) = doctor_directory(|key| {
+            (key == crate::workspace::WORKING_DIRECTORY_ENV)
+                .then(|| workspace.path().as_os_str().to_owned())
+        });
+        assert_eq!(
+            owned,
+            workspace.path().join(".gang").join("bazelrc"),
+            "doctor must use BUILD_WORKING_DIRECTORY for the owned rc"
+        );
+    }
+
     /// The text of a valid pin whose digest repeats one byte.
     fn pin_text(byte_hex: &str) -> String {
         format!("sha256:{}", byte_hex.repeat(32))
@@ -286,6 +343,21 @@ mod tests {
         .expect("an explicit server resolves");
         assert_eq!(server, url("https://gang.example.com"));
         assert_eq!(text(ca_pin.as_ref()), None);
+    }
+
+    #[test]
+    fn explicit_matching_server_retains_stored_pin() {
+        let (_, ca_pin) = resolve_target(
+            Some(url("https://gang.example/path")),
+            None,
+            Some(stored("https://gang.example/path/", Some(pin("aa")))),
+        )
+        .expect("an explicit server resolves");
+        assert_eq!(
+            text(ca_pin.as_ref()),
+            Some(pin_text("aa")),
+            "explicit matching server must retain the stored CA pin"
+        );
     }
 
     #[test]

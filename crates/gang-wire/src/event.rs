@@ -61,6 +61,22 @@ pub enum EventChange {
         /// Size after the change.
         to: u32,
     },
+    /// The provider's newest launch attempt failed while the fleet's request is unmet.
+    LaunchFailed {
+        /// Instances that exist, excluding terminating instances.
+        from: u32,
+        /// Instances requested by the fleet.
+        to: u32,
+        /// The provider's failure message, verbatim.
+        reason: String,
+    },
+    /// Unfulfilled requested instances were withdrawn.
+    Withdrawn {
+        /// Requested instances before the withdrawal.
+        from: u32,
+        /// Requested instances after the withdrawal.
+        to: u32,
+    },
     /// A worker began draining.
     DrainStarted {
         /// Reference `workers/{worker}` of the worker that started to drain.

@@ -4,15 +4,14 @@ use std::path::{Path, PathBuf};
 use gang_config::SANDBOX_FILE_NAME;
 use gang_os::PathIo;
 use gang_os::fs::{
-    PRIVATE_FILE, ensure_private_dir, remove_dir_optional, replace_symlink, write_atomic,
+    PRIVATE_FILE, PUBLIC_FILE, ensure_private_dir, remove_dir_optional, replace_symlink,
+    write_atomic,
 };
 use gang_spi::{EXEC_LINK_NAME, JOIN_LINK_NAME};
 use gang_types::CertificatePem;
 
 use crate::credentials::Credentials;
 use crate::errors::WorkerError;
-
-const PUBLIC_FILE_MODE: u32 = 0o644;
 
 /// On-disk layout of a worker under its mounted scratch volume.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,11 +97,7 @@ impl Layout {
         create_directory(&self.bin_directory())?;
         remove_dir_optional(&self.identity_directory())?;
         ensure_private_dir(&self.identity_directory())?;
-        write_atomic(
-            &self.sandbox_file(),
-            sandbox_file.as_bytes(),
-            PUBLIC_FILE_MODE,
-        )?;
+        write_atomic(&self.sandbox_file(), sandbox_file.as_bytes(), PUBLIC_FILE)?;
         replace_symlink(executable, &self.entrypoint())?;
         replace_symlink(executable, &self.join_link())?;
         Ok(())
@@ -115,7 +110,11 @@ impl Layout {
     /// Returns an error if the CA file cannot be written.
     pub fn write_server_ca(&self, ca: &CertificatePem) -> Result<PathBuf, PathIo> {
         let path = self.identity_directory().join("server-ca.pem");
-        write_atomic(&path, ca.as_str().as_bytes(), PUBLIC_FILE_MODE)?;
+        ensure_private_dir(&self.identity_directory())?.write_atomic(
+            "server-ca.pem",
+            ca.as_str().as_bytes(),
+            PUBLIC_FILE,
+        )?;
         Ok(path)
     }
 
@@ -136,32 +135,33 @@ impl Layout {
     ) -> Result<IdentityFiles, WorkerError> {
         let directory = self.generation_directory(generation);
         remove_dir_optional(&directory)?;
-        ensure_private_dir(&directory)?;
+        let private_dir = ensure_private_dir(&directory)?;
         let files = IdentityFiles {
             directory: directory.clone(),
             certificate: directory.join("certificate.pem"),
             private_key: directory.join("private-key.pem"),
             server_ca: directory.join("ca.pem"),
         };
-        let written = write_atomic(
-            &files.certificate,
-            credentials.certificate.as_str().as_bytes(),
-            PUBLIC_FILE_MODE,
-        )
-        .and_then(|()| {
-            write_atomic(
-                &files.private_key,
-                credentials.private_key.expose().as_bytes(),
-                PRIVATE_FILE,
+        let written = private_dir
+            .write_atomic(
+                "certificate.pem",
+                credentials.certificate.as_str().as_bytes(),
+                PUBLIC_FILE,
             )
-        })
-        .and_then(|()| {
-            write_atomic(
-                &files.server_ca,
-                credentials.ca_certificate.as_str().as_bytes(),
-                PUBLIC_FILE_MODE,
-            )
-        });
+            .and_then(|()| {
+                private_dir.write_atomic(
+                    "private-key.pem",
+                    credentials.private_key.expose().as_bytes(),
+                    PRIVATE_FILE,
+                )
+            })
+            .and_then(|()| {
+                private_dir.write_atomic(
+                    "ca.pem",
+                    credentials.ca_certificate.as_str().as_bytes(),
+                    PUBLIC_FILE,
+                )
+            });
         match written {
             Ok(()) => Ok(files),
             Err(error) => {

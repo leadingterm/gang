@@ -848,6 +848,7 @@ impl System for ExecSim {
                 slots: None,
                 paused: false,
                 launch_time: at,
+                phases: Vec::new(),
             }];
         }
         let frames = vec![Frame::Snapshot(first), Frame::Snapshot(second)];
@@ -921,7 +922,7 @@ impl System for ExecSim {
                         0,
                         failed(
                             probe,
-                            "no fleet accepts the platform properties of this action (disk_kb=549755813888)",
+                            "no fleet accepts this action: disk_kb 549755813888 is above the largest fleet's 8388608; change its exec_properties or declare a fleet that accepts them",
                         ),
                     ),
                     Unplaceable::Admitted => (1, ok()),

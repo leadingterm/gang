@@ -8,14 +8,40 @@ use serde_json::Value;
 /// Name of the CA certificate file that `gang bazelrc` writes next to the rc file.
 pub const CA_FILE_NAME: &str = "gang-ca.pem";
 
-/// The comment that opens every generated file.
-const HEADER: &str = "# Written by `gang bazelrc`. Do not edit.";
+/// The command responsible for writing a Bazel rc file.
+#[derive(Debug, Clone, Copy)]
+pub enum BazelrcWriter {
+    /// The `gang bazelrc` command.
+    Bazelrc,
+    /// The `gang setup` command.
+    Setup,
+}
 
-/// Renders the Bazel rc text for `info`. `host` is the host the credential helper serves
-/// and `helper` is the command Bazel runs for it; a server without token authentication gets no
-/// helper line, and a server without a CA certificate gets no certificate line.
-pub(crate) fn render(info: &Server<Value>, host: &str, helper: &str) -> String {
-    let mut lines = vec![HEADER.to_owned()];
+impl BazelrcWriter {
+    /// The command to name in the generated file.
+    const fn command(self) -> &'static str {
+        match self {
+            Self::Bazelrc => "gang bazelrc",
+            Self::Setup => "gang setup",
+        }
+    }
+}
+
+/// Renders the Bazel rc text for `info`, identifying `writer` as the command that generated it.
+/// `host` is the host the credential helper serves and `helper` is the command Bazel runs for it.
+/// The helper comment advises running `writer` again if gang moves. A server without token
+/// authentication gets no helper line, and a server without a CA certificate gets no certificate
+/// line. `certificate` is the certificate path used by Bazel.
+#[must_use]
+pub fn render(
+    info: &Server<Value>,
+    host: &str,
+    helper: &str,
+    certificate: &str,
+    writer: BazelrcWriter,
+) -> String {
+    let writer = writer.command();
+    let mut lines = vec![format!("# Written by `{writer}`. Do not edit.")];
     lines.push(format!(
         "build --remote_executor={}",
         quote(display_url(&info.remote_executor))
@@ -26,6 +52,9 @@ pub(crate) fn render(info: &Server<Value>, host: &str, helper: &str) -> String {
     ));
     if matches!(info.authentication, Authentication::Token(_)) {
         lines.push(format!(
+            "# The gang that Bazel runs for credentials; run `{writer}` again if it moves."
+        ));
+        lines.push(format!(
             "build --credential_helper={}",
             quote(&format!("{host}={helper}"))
         ));
@@ -35,13 +64,14 @@ pub(crate) fn render(info: &Server<Value>, host: &str, helper: &str) -> String {
         quote(&format!("{}={}", property::ISA, info.default_isa))
     ));
     if info.ca_certificate.is_some() {
-        lines.push(format!("build --tls_certificate={CA_FILE_NAME}"));
+        lines.push(format!("build --tls_certificate={}", quote(certificate)));
     }
     lines.join("\n") + "\n"
 }
 
 /// The URL as text, without the trailing `/` of a bare root path; other paths are kept verbatim.
-pub(crate) fn display_url(url: &Url) -> &str {
+#[must_use]
+pub fn display_url(url: &Url) -> &str {
     let text = url.as_str();
     if url.path() == "/" && url.query().is_none() && url.fragment().is_none() {
         text.strip_suffix('/').unwrap_or(text)
@@ -91,6 +121,7 @@ mod tests {
             ca_certificate: ca_certificate
                 .map(|text| CertificatePem::try_new(text).expect("valid certificate")),
             default_isa: Isa::X86_64,
+            version: None,
             authentication,
         }
     }
@@ -123,15 +154,54 @@ mod tests {
             &info(token(), Some(CERTIFICATE)),
             "gang.example.test",
             "/usr/local/bin/gang",
+            CA_FILE_NAME,
+            BazelrcWriter::Bazelrc,
         );
-        assert_eq!(
-            rendered,
-            "# Written by `gang bazelrc`. Do not edit.\n\
-             build --remote_executor=grpcs://exec.example.test:443\n\
-             build --remote_cache=grpcs://cache.example.test:443\n\
-             build --credential_helper=gang.example.test=/usr/local/bin/gang\n\
-             build --remote_default_exec_properties=ISA=x86-64\n\
-             build --tls_certificate=gang-ca.pem\n"
+        assert!(
+            rendered
+                .lines()
+                .next()
+                .is_some_and(|line| line.contains("gang bazelrc"))
+        );
+        assert!(rendered.lines().any(|line| line.starts_with('#')
+            && line.contains("gang bazelrc")
+            && line.contains("credentials")));
+        for line in [
+            "build --remote_executor=grpcs://exec.example.test:443",
+            "build --remote_cache=grpcs://cache.example.test:443",
+            "build --credential_helper=gang.example.test=/usr/local/bin/gang",
+            "build --remote_default_exec_properties=ISA=x86-64",
+            "build --tls_certificate=gang-ca.pem",
+        ] {
+            assert!(
+                rendered.lines().any(|actual| actual == line),
+                "missing {line}"
+            );
+        }
+    }
+
+    /// Setup output identifies setup in both generated comments.
+    #[test]
+    fn setup_names_its_writer_in_header_and_helper_comment() {
+        let rendered = render(
+            &info(token(), None),
+            "host",
+            "gang",
+            CA_FILE_NAME,
+            BazelrcWriter::Setup,
+        );
+        assert!(
+            rendered
+                .lines()
+                .next()
+                .is_some_and(|line| line.contains("gang setup")),
+            "setup header must name gang setup"
+        );
+        assert!(
+            rendered.lines().any(|line| line.starts_with('#')
+                && line.contains("credentials")
+                && line.contains("gang setup")),
+            "setup helper comment must name gang setup"
         );
     }
 
@@ -141,14 +211,37 @@ mod tests {
             &info(Authentication::None(NoAuthentication {}), None),
             "gang.example.test",
             "/usr/local/bin/gang",
+            CA_FILE_NAME,
+            BazelrcWriter::Bazelrc,
         );
-        assert_eq!(
-            rendered,
-            "# Written by `gang bazelrc`. Do not edit.\n\
-             build --remote_executor=grpcs://exec.example.test:443\n\
-             build --remote_cache=grpcs://cache.example.test:443\n\
-             build --remote_default_exec_properties=ISA=x86-64\n"
+        assert!(
+            rendered
+                .lines()
+                .next()
+                .is_some_and(|line| line.contains("gang bazelrc"))
         );
+        assert!(rendered.contains("build --remote_executor=grpcs://exec.example.test:443\n"));
+        assert!(rendered.contains("build --remote_cache=grpcs://cache.example.test:443\n"));
+        assert!(rendered.contains("build --remote_default_exec_properties=ISA=x86-64\n"));
+        assert!(!rendered.contains("--credential_helper"));
+        assert!(!rendered.contains("--tls_certificate"));
+    }
+
+    #[test]
+    fn a_server_without_login_gets_no_helper_comment() {
+        let rendered = render(
+            &info(Authentication::None(NoAuthentication {}), None),
+            "gang.example.test",
+            "/usr/local/bin/gang",
+            CA_FILE_NAME,
+            BazelrcWriter::Bazelrc,
+        );
+        assert!(
+            !rendered
+                .lines()
+                .any(|line| line.starts_with('#') && line.contains("credentials"))
+        );
+        assert!(!rendered.contains("--credential_helper"));
     }
 
     #[test]
@@ -157,11 +250,26 @@ mod tests {
             &info(token(), None),
             "gang.example.test",
             "/opt/My Tools/gang",
+            CA_FILE_NAME,
+            BazelrcWriter::Bazelrc,
         );
         assert!(
             rendered
-                .contains("build --credential_helper=\"gang.example.test=/opt/My Tools/gang\"\n"),
-            "{rendered}"
+                .contains("build --credential_helper=\"gang.example.test=/opt/My Tools/gang\"\n")
+        );
+    }
+
+    #[test]
+    fn quotes_absolute_certificate_path() {
+        let rendered = render(
+            &info(token(), Some(CERTIFICATE)),
+            "host",
+            "gang",
+            "/workspace with spaces/.gang/ca.pem",
+            BazelrcWriter::Bazelrc,
+        );
+        assert!(
+            rendered.contains("build --tls_certificate=\"/workspace with spaces/.gang/ca.pem\"\n")
         );
     }
 }

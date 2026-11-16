@@ -72,7 +72,7 @@ pub use session::{
     AuthenticateRequest, AuthenticateResponse, CookieNames, Credential, Session, SessionLogin,
 };
 pub use state::{
-    Actions, Demand, Fleet, Instance, InstanceCounts, InstanceSize, Lifecycle, Named, Pass,
-    PassState, Phase, Policy, Queue, QueuedAction, RunningAction, SkipReason, State, Truncated,
-    Worker, WorkerCounts,
+    Actions, Demand, Fleet, Instance, InstanceCounts, InstanceSize, LaunchFailure, Lifecycle,
+    Named, Pass, PassState, Phase, PhaseSpan, Policy, Queue, QueuedAction, Recent, RunningAction,
+    Sample, SkipReason, State, Truncated, Worker, WorkerCounts,
 };

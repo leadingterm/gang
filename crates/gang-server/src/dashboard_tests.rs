@@ -10,7 +10,7 @@ use gang_clock::Timestamp;
 use gang_config::DashboardConfig;
 use gang_spi::{
     ApiResponseBody, ControllerReady, LoginClient, ScalingAuditEvent, ScalingEventKind,
-    StateRepositoryPort,
+    SchedulerSnapshot, StateRepositoryPort,
 };
 use gang_testkit::{Controller, FakeRepository};
 use gang_types::{
@@ -293,6 +293,104 @@ async fn server_info_never_contains_the_dashboard_client_secret() {
                 !text.contains(SECRET),
                 "the server info leaks the secret: {text}"
             );
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn snapshot_carries_the_recent_window_after_completions() {
+    let (parts, _dials, handles) = tls_parts();
+    let scheduler = handles.scheduler.clone();
+    let clock = handles.clock.clone();
+    let settings = ServerSettings {
+        poll_interval: NonZeroDuration::from_secs(10),
+        dashboard: DashboardConfig {
+            history_window: NonZeroDuration::from_mins(5),
+            ..DashboardConfig::default()
+        },
+        ..tls_settings()
+    };
+    serve(
+        parts,
+        settings,
+        handles.scheduler,
+        |controller| async move {
+            let token = mint_token(&controller, PROVIDER, ADMIN_PROOF).await;
+            let response = controller
+                .call_api(api_request("GET", WATCH_STATE.template, Some(&token), None))
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut stream = response.into_body();
+            let first = next_text(&mut stream).await.expect("initial snapshot");
+            let gang_wire::Frame::Snapshot(initial) = decode_sse(first.as_bytes()) else {
+                panic!("first frame is a snapshot");
+            };
+            if initial.recent.samples.is_empty() {
+                loop {
+                    let text = next_text(&mut stream).await.expect("initial pass");
+                    if let gang_wire::Frame::Delta(delta) = decode_sse(text.as_bytes())
+                        && delta.recent.is_some()
+                    {
+                        break;
+                    }
+                }
+            }
+
+            for completed in [4, 9, 15] {
+                scheduler.set_snapshot(SchedulerSnapshot {
+                    completed,
+                    ..SchedulerSnapshot::default()
+                });
+                clock.advance(Duration::from_secs(10));
+                loop {
+                    let text = next_text(&mut stream).await.expect("completed pass");
+                    if let gang_wire::Frame::Delta(delta) = decode_sse(text.as_bytes())
+                        && delta.completed == Some(completed)
+                    {
+                        break;
+                    }
+                }
+            }
+
+            let response = controller
+                .call_api(api_request("GET", GET_STATE.template, Some(&token), None))
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response
+                .into_body()
+                .collect()
+                .await
+                .expect("state body")
+                .to_bytes();
+            let state: State = serde_json::from_slice(&bytes).expect("state JSON");
+            assert_eq!(state.recent.window, Duration::from_secs(300));
+            assert_eq!(state.recent.step, Duration::from_secs(10));
+            assert_eq!(state.recent.samples.len(), 4);
+            assert_eq!(
+                state
+                    .recent
+                    .samples
+                    .iter()
+                    .map(|sample| sample.completed)
+                    .collect::<Vec<_>>(),
+                vec![0, 4, 5, 6]
+            );
+            assert!(state.recent.samples.iter().all(|s| s.passes == 1));
+            assert!(state.recent.samples.windows(2).all(|pair| {
+                pair[1].start.as_unix_millis() - pair[0].start.as_unix_millis() == 10_000
+            }));
+
+            let response = controller
+                .call_api(api_request("GET", WATCH_STATE.template, Some(&token), None))
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut stream = response.into_body();
+            let first = next_text(&mut stream).await.expect("new viewer snapshot");
+            let gang_wire::Frame::Snapshot(snapshot) = decode_sse(first.as_bytes()) else {
+                panic!("first frame is a snapshot");
+            };
+            assert_eq!(snapshot.recent, state.recent);
         },
     )
     .await;

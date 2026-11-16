@@ -251,6 +251,26 @@ pub struct StoredLogin {
     pub ca_pin: Option<CaPin>,
 }
 
+/// Whether `value` names `server`, ignoring trailing slashes on both.
+#[must_use]
+pub fn same_server(value: &str, server: &Url) -> bool {
+    value.trim_end_matches('/') == server.as_str().trim_end_matches('/')
+}
+
+/// Selects the explicit pin, or the stored pin when the login is for this server.
+#[must_use]
+pub fn pin_for(
+    server: &Url,
+    explicit: Option<CaPin>,
+    stored: Option<&StoredLogin>,
+) -> Option<CaPin> {
+    explicit.or_else(|| {
+        stored
+            .filter(|login| same_server(login.server.as_str(), server))
+            .and_then(|login| login.ca_pin)
+    })
+}
+
 /// Reads the stored login, or `None` when the client has never logged in.
 ///
 /// # Errors
@@ -279,12 +299,28 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{
-        ClientProbe, CredentialFault, ServerFault, ServerProbe, reply_token, stored_login,
+        ClientProbe, CredentialFault, ServerFault, ServerProbe, StoredLogin, pin_for, reply_token,
+        stored_login,
     };
     use crate::errors::ClientError;
     use crate::options::ClientOptions;
     use crate::session::{Session, SessionKind};
     use crate::test_support::{ca_pin, home_in};
+
+    #[test]
+    fn matching_server_pin_selection_preserves_stored_pin() {
+        let stored_pin = ca_pin();
+        let stored = StoredLogin {
+            server: Url::parse("https://gang.example/path/").expect("valid URL"),
+            ca_pin: Some(stored_pin),
+        };
+        let server = Url::parse("https://gang.example/path").expect("valid URL");
+        assert_eq!(
+            pin_for(&server, None, Some(&stored)),
+            Some(stored_pin),
+            "setup must retain the stored CA pin for the matching server"
+        );
+    }
 
     fn rustls_text() -> String {
         rustls::Error::NoCertificatesPresented.to_string()

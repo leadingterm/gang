@@ -8,10 +8,12 @@ use std::time::Duration;
 
 use gang_clock::TestClock;
 use gang_spi::{
-    FleetSupply, InstanceIdentity, MountedScratchVolume, NodeLifecyclePort, PortError,
-    PreemptionNotice, ProvisionerPort, ScratchVolumePort, WorkloadCredentialPort,
+    FleetSupply, InstanceIdentity, LaunchFailure, MountedScratchVolume, NodeLifecyclePort,
+    PortError, PreemptionNotice, ProvisionerPort, ScratchVolumePort, WorkloadCredentialPort,
 };
-use gang_types::{Bytes, Fleet, FleetName, InstanceId, Isa, Proof, WorkerLifetime};
+use gang_types::{
+    Bytes, Fleet, FleetName, InstanceId, InstanceLifecycle, Isa, Proof, WorkerLifetime,
+};
 use parking_lot::Mutex;
 
 use crate::{CallCount, Opaque};
@@ -44,6 +46,7 @@ struct Failures {
 
 struct State {
     supplies: BTreeMap<FleetName, FleetSupply>,
+    launch_failures: BTreeMap<FleetName, String>,
     supply_calls: Vec<(FleetName, Isa)>,
     desired: Vec<(FleetName, u32)>,
     terminations: Vec<InstanceId>,
@@ -60,6 +63,11 @@ struct State {
 }
 
 /// A shared, configurable provisioner with recorded fleet calls and worker-side answers.
+///
+/// Termination honours [`ProvisionerPort::terminate`], removing live members and lowering the
+/// fleet's desired capacity.
+/// Setting the desired capacity to its current value withdraws abandoned requests; changing it
+/// leaves them untouched.
 ///
 /// The default has no node identity; configure one with [`Self::set_identity`] or [`Self::new`].
 #[derive(Clone)]
@@ -101,6 +109,7 @@ impl FakeProvisioner {
         Self {
             state: Arc::new(Mutex::new(State {
                 supplies: BTreeMap::new(),
+                launch_failures: BTreeMap::new(),
                 supply_calls: Vec::new(),
                 desired: Vec::new(),
                 terminations: Vec::new(),
@@ -123,6 +132,17 @@ impl FakeProvisioner {
     /// Configures the supply returned for a fleet, including its instance list.
     pub fn set_supply(&self, name: &FleetName, supply: FleetSupply) {
         self.state.lock().supplies.insert(name.clone(), supply);
+    }
+    /// Makes launches for a fleet fail with the given provider message until cleared.
+    pub fn fail_launches(&self, name: &FleetName, reason: impl Into<String>) {
+        self.state
+            .lock()
+            .launch_failures
+            .insert(name.clone(), reason.into());
+    }
+    /// Clears the injected launch failure for a fleet.
+    pub fn clear_launch_failure(&self, name: &FleetName) {
+        self.state.lock().launch_failures.remove(name);
     }
     /// Advances `clock` by `by` whenever a supply is read, including failed reads.
     pub fn advance_on_supply(&self, clock: Arc<TestClock>, by: Duration) {
@@ -214,14 +234,30 @@ impl ProvisionerPort for FakeProvisioner {
         if let Some(supply) = state.supplies.get_mut(fleet.name) {
             into.desired = supply.desired;
             into.warm = supply.warm;
+            into.abandoned = supply.abandoned;
             into.instances.clone_from(&supply.instances);
             into.exits.clear();
             into.exits.append(&mut supply.exits);
+            into.launch_failure.clone_from(&supply.launch_failure);
         } else {
             into.desired = 0;
             into.warm = 0;
+            into.abandoned = 0;
             into.instances.clear();
             into.exits.clear();
+            into.launch_failure = None;
+        }
+        let live = into
+            .instances
+            .iter()
+            .filter(|instance| instance.lifecycle != InstanceLifecycle::Terminating)
+            .count();
+        if u64::from(into.desired) <= live as u64 {
+            into.launch_failure = None;
+        } else if let Some(reason) = state.launch_failures.get(fleet.name) {
+            into.launch_failure = Some(LaunchFailure {
+                reason: reason.clone(),
+            });
         }
         Ok(())
     }
@@ -235,11 +271,22 @@ impl ProvisionerPort for FakeProvisioner {
             return Err(PortError::unavailable("fleet capacity is unavailable"));
         }
         state.desired.push((fleet.name.clone(), desired));
+        let supply = state.supplies.entry(fleet.name.clone()).or_default();
+        if desired == supply.desired {
+            supply.abandoned = 0;
+        }
+        let live = supply
+            .instances
+            .iter()
+            .filter(|instance| instance.lifecycle != InstanceLifecycle::Terminating)
+            .count();
+        let live = u32::try_from(live).unwrap_or(u32::MAX);
+        supply.desired = desired.max(live);
         Ok(())
     }
     async fn terminate(
         &self,
-        _fleet: Fleet<'_, Opaque>,
+        fleet: Fleet<'_, Opaque>,
         instance: &InstanceId,
     ) -> Result<(), PortError> {
         let mut state = self.state.lock();
@@ -249,6 +296,14 @@ impl ProvisionerPort for FakeProvisioner {
             ));
         }
         state.terminations.push(instance.clone());
+        if let Some(supply) = state.supplies.get_mut(fleet.name)
+            && let Some(index) = supply.instances.iter().position(|member| {
+                member.id == *instance && member.lifecycle != InstanceLifecycle::Terminating
+            })
+        {
+            supply.instances.remove(index);
+            supply.desired = supply.desired.saturating_sub(1);
+        }
         Ok(())
     }
     fn worker_lifetime(&self) -> WorkerLifetime {
@@ -309,6 +364,198 @@ mod tests {
     use gang_types::{InstanceLifecycle, Resources};
 
     #[tokio::test]
+    async fn lowering_capacity_keeps_live_instances_and_excludes_terminating() -> crate::TestResult
+    {
+        let fake = FakeProvisioner::default();
+        let name = FleetName::try_new("workers")?;
+        let options = Opaque::default();
+        let fleet = Fleet {
+            name: &name,
+            isa: Isa::X86_64,
+            instance: Resources {
+                vcpus: 1,
+                memory: Bytes::new(1),
+                disk: Bytes::new(1),
+            },
+            options: &options,
+        };
+        let instances = vec![
+            FleetInstance {
+                id: InstanceId::try_new("pending")?,
+                lifecycle: InstanceLifecycle::Pending,
+                launched_at: Timestamp::from_unix_millis(0),
+                release_first: false,
+            },
+            FleetInstance {
+                id: InstanceId::try_new("serving")?,
+                lifecycle: InstanceLifecycle::InService,
+                launched_at: Timestamp::from_unix_millis(0),
+                release_first: false,
+            },
+            FleetInstance {
+                id: InstanceId::try_new("terminating")?,
+                lifecycle: InstanceLifecycle::Terminating,
+                launched_at: Timestamp::from_unix_millis(0),
+                release_first: false,
+            },
+        ];
+        fake.set_supply(
+            &name,
+            FleetSupply {
+                abandoned: 0,
+                desired: 5,
+                instances,
+                ..FleetSupply::default()
+            },
+        );
+        fake.set_desired_capacity(fleet, 0).await?;
+        let mut supply = FleetSupply::default();
+        fake.supply(fleet, &mut supply).await?;
+        assert_eq!(supply.desired, 2);
+        assert_eq!(supply.instances.len(), 3);
+        fake.set_desired_capacity(fleet, 4).await?;
+        fake.supply(fleet, &mut supply).await?;
+        assert_eq!(supply.desired, 4);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn abandoned_requests_follow_the_provisioner_contract() -> crate::TestResult {
+        let fake = FakeProvisioner::default();
+        let name = FleetName::try_new("workers")?;
+        let options = Opaque::default();
+        let fleet = Fleet {
+            name: &name,
+            isa: Isa::X86_64,
+            instance: Resources::default(),
+            options: &options,
+        };
+        fake.set_supply(
+            &name,
+            FleetSupply {
+                desired: 2,
+                abandoned: 3,
+                ..FleetSupply::default()
+            },
+        );
+        crate::provisioner_contract::abandoned_requests_contract(&fake, fleet).await
+    }
+
+    #[tokio::test]
+    async fn terminate_removes_the_instance_and_lowers_desired() -> crate::TestResult {
+        let fake = FakeProvisioner::default();
+        let name = FleetName::try_new("workers")?;
+        let options = Opaque::default();
+        let fleet = Fleet {
+            name: &name,
+            isa: Isa::X86_64,
+            instance: Resources::default(),
+            options: &options,
+        };
+        let first = InstanceId::try_new("first")?;
+        let second = InstanceId::try_new("second")?;
+        fake.set_supply(
+            &name,
+            FleetSupply {
+                abandoned: 0,
+                desired: 2,
+                instances: vec![
+                    FleetInstance {
+                        id: first.clone(),
+                        lifecycle: InstanceLifecycle::InService,
+                        launched_at: Timestamp::UNIX_EPOCH,
+                        release_first: false,
+                    },
+                    FleetInstance {
+                        id: second.clone(),
+                        lifecycle: InstanceLifecycle::InService,
+                        launched_at: Timestamp::UNIX_EPOCH,
+                        release_first: false,
+                    },
+                ],
+                ..FleetSupply::default()
+            },
+        );
+
+        fake.terminate(fleet, &first).await?;
+        let mut supply = FleetSupply::default();
+        fake.supply(fleet, &mut supply).await?;
+        assert_eq!(supply.desired, 1);
+        assert_eq!(supply.instances.len(), 1);
+        assert_eq!(supply.instances[0].id, second);
+
+        fake.terminate(fleet, &InstanceId::try_new("unknown")?)
+            .await?;
+        fake.terminate(fleet, &first).await?;
+        let mut after = FleetSupply::default();
+        fake.supply(fleet, &mut after).await?;
+        assert_eq!(after, supply);
+
+        supply.instances[0].lifecycle = InstanceLifecycle::Terminating;
+        fake.set_supply(&name, supply.clone());
+        fake.terminate(fleet, &second).await?;
+        fake.supply(fleet, &mut after).await?;
+        assert_eq!(after, supply);
+
+        supply.desired = 0;
+        supply.instances[0].lifecycle = InstanceLifecycle::Pending;
+        fake.set_supply(&name, supply);
+        fake.terminate(fleet, &second).await?;
+        fake.supply(fleet, &mut after).await?;
+        assert_eq!(after.desired, 0);
+        assert!(after.instances.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn launch_failure_is_reported_only_for_unmet_requests() -> crate::TestResult {
+        let fake = FakeProvisioner::default();
+        let name = FleetName::try_new("workers")?;
+        let options = Opaque::default();
+        let fleet = Fleet {
+            name: &name,
+            isa: Isa::X86_64,
+            instance: Resources {
+                vcpus: 1,
+                memory: Bytes::new(1),
+                disk: Bytes::new(1),
+            },
+            options: &options,
+        };
+        fake.fail_launches(&name, "quota exceeded");
+        let mut supply = FleetSupply::default();
+        fake.supply(fleet, &mut supply).await?;
+        assert!(supply.launch_failure.is_none());
+        fake.set_desired_capacity(fleet, 2).await?;
+        fake.supply(fleet, &mut supply).await?;
+        assert_eq!(supply.desired, 2);
+        assert!(supply.instances.is_empty());
+        assert_eq!(
+            supply
+                .launch_failure
+                .as_ref()
+                .map(|failure| failure.reason.as_str()),
+            Some("quota exceeded")
+        );
+        let other_name = FleetName::try_new("other")?;
+        let other = Fleet {
+            name: &other_name,
+            ..fleet
+        };
+        fake.set_desired_capacity(other, 1).await?;
+        fake.supply(other, &mut supply).await?;
+        assert!(supply.launch_failure.is_none());
+        fake.set_desired_capacity(fleet, 0).await?;
+        fake.supply(fleet, &mut supply).await?;
+        assert!(supply.launch_failure.is_none());
+        fake.set_desired_capacity(fleet, 1).await?;
+        fake.clear_launch_failure(&name);
+        fake.supply(fleet, &mut supply).await?;
+        assert!(supply.launch_failure.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn fleet_calls_record_successes_failures_and_instance_listing() -> crate::TestResult {
         let fake = FakeProvisioner::default();
         let name = FleetName::try_new("workers")?;
@@ -325,6 +572,7 @@ mod tests {
         };
         let instance = InstanceId::try_new("i-one")?;
         let supply = FleetSupply {
+            abandoned: 0,
             desired: 1,
             warm: 0,
             instances: vec![FleetInstance {
@@ -334,6 +582,7 @@ mod tests {
                 release_first: false,
             }],
             exits: Vec::new(),
+            launch_failure: None,
         };
         fake.set_supply(&name, supply.clone());
         let mut actual = FleetSupply::default();

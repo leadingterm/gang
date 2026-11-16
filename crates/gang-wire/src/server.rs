@@ -42,6 +42,9 @@ pub struct Server<Login> {
     ///
     /// The client writes it into the Bazel default execution properties as `ISA=<default_isa>`.
     pub default_isa: Isa,
+    /// Version of the Gang server, for display; omitted by servers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     /// How the client surface authenticates its callers.
     pub authentication: Authentication<Login>,
 }
@@ -176,6 +179,25 @@ mod tests {
         assert_eq!(server.ca_certificate, None);
         assert_eq!(
             serde_json::to_value(&server).expect("server serializes"),
+            value
+        );
+    }
+
+    #[test]
+    fn version_is_optional_and_round_trips_when_present() {
+        let mut value = server_value(&json!({"none": {}}));
+        let server: Server<Value> = serde_json::from_value(value.clone()).expect("server parses");
+        assert_eq!(server.version, None);
+        assert_eq!(
+            serde_json::to_value(server).expect("server serializes"),
+            value
+        );
+
+        value["version"] = json!("0.1.5");
+        let server: Server<Value> = serde_json::from_value(value.clone()).expect("server parses");
+        assert_eq!(server.version.as_deref(), Some("0.1.5"));
+        assert_eq!(
+            serde_json::to_value(server).expect("server serializes"),
             value
         );
     }

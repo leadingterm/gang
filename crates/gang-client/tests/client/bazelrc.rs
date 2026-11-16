@@ -30,6 +30,7 @@ async fn renders_the_executor_cache_and_helper_with_the_server_ca() {
             "# Written by `gang bazelrc`. Do not edit.\n\
              build --remote_executor=grpcs://exec.example:443\n\
              build --remote_cache=grpcs://cache.example:443\n\
+             # The gang that Bazel runs for credentials; run `gang bazelrc` again if it moves.\n\
              build --credential_helper={host}={HELPER}\n\
              build --remote_default_exec_properties=ISA=x86-64\n\
              build --tls_certificate=gang-ca.pem\n"

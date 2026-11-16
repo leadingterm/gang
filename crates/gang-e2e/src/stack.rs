@@ -51,6 +51,10 @@ use crate::template::{ConfigTemplate, Transport};
 pub struct Stack<'a> {
     placement: Placement,
     settings: Settings,
+    /// Parameters used to stage another copy of this deployment's sample.
+    sample_parameters: SampleParameters,
+    /// The sample workspace this deployment was staged from.
+    sample_source: PathBuf,
     bazel: Bazel,
     cli: GangCli,
     binary: PathBuf,
@@ -191,6 +195,8 @@ impl<'a> Stack<'a> {
             developer: Mutex::new(false),
             host: Host::observe(),
             settings: settings.clone(),
+            sample_parameters: parameters,
+            sample_source: invocation.sample.clone(),
             server: Mutex::new(None),
             administrator: Mutex::new(None),
             server_http: Mutex::new(None),
@@ -202,6 +208,16 @@ impl<'a> Stack<'a> {
     #[must_use]
     pub(crate) const fn placement(&self) -> &Placement {
         &self.placement
+    }
+
+    /// Stages another copy of the sample this deployment was staged from, with the same parameters.
+    pub(crate) fn stage_sample(&self, destination: &Path) -> Result<()> {
+        sample::stage(&self.sample_source, destination, &self.sample_parameters)
+    }
+
+    /// The Bazel driver associated with this deployment.
+    pub(crate) const fn bazel(&self) -> &Bazel {
+        &self.bazel
     }
     /// The pinned Bazel executable used by this stack.
     #[must_use]
@@ -386,6 +402,53 @@ impl<'a> Stack<'a> {
                 StateApi::with_bearer(&endpoint, &credentials, self.settings.handshake_timeout)
             }
         }
+    }
+
+    /// Runs a build until it finishes or the caller sends an abort reason.
+    pub(crate) fn build_until_stopped(
+        &self,
+        probes: &[Probe],
+        stop: oneshot::Receiver<String>,
+    ) -> Result<BuildOutcome> {
+        self.bazel.build_until(&self.remote()?, probes, None, stop)
+    }
+
+    /// Kills the Bazel server after its launcher was aborted, abandoning the build it still runs.
+    pub(crate) fn kill_bazel(&self) -> Result<()> {
+        self.bazel.kill_servers()
+    }
+
+    /// Waits on the state stream, checking the authoritative GET state on each frame.
+    pub(crate) fn wait_live_state(
+        &self,
+        timeout: Duration,
+        mut done: impl FnMut(&State) -> bool,
+    ) -> Result<State> {
+        let api = self.state_api()?;
+        let mut stream = self.state_api()?.open_stream()?;
+        if stream.status() != STREAM_OK {
+            return Err(E2eError::system(format!(
+                "the state stream answered {}",
+                stream.status()
+            )));
+        }
+        let mut observed = None;
+        let mut failed = None;
+        sse::await_frames(&mut stream, timeout, &mut |_| match api.state() {
+            Ok(state) if done(&state) => {
+                observed = Some(state);
+                true
+            }
+            Ok(_) => false,
+            Err(error) => {
+                failed = Some(error);
+                true
+            }
+        })?;
+        if let Some(error) = failed {
+            return Err(error);
+        }
+        observed.ok_or_else(|| E2eError::system("the state stream ended without a matching state"))
     }
 
     /// Builds `probes` through `remote`, as `run` when there is one, returning how the build ended.

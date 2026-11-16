@@ -27,6 +27,7 @@ fn queued(op: &str) -> QueuedActionView {
         },
         queued_since: Timestamp::UNIX_EPOCH,
         candidates: FleetSet::EMPTY,
+        refusal: None,
     }
 }
 

@@ -29,7 +29,7 @@ use gang_types::{FleetName, Url, error_chain};
 use gang_wire::page::PageToken;
 use gang_wire::{
     Cause, Closed, ClosedReason, Delta, Event, EventChange, Frame, ListEventsResponse, Pass,
-    PassState, Queue, State, Tick, name,
+    PassState, Queue, Recent, State, Tick, name,
 };
 use serde::Deserialize;
 use tokio::runtime::{Builder, Runtime};
@@ -88,6 +88,7 @@ fn snapshot(seq: u64, held: &[u64], limit: u32) -> Result<Frame, Box<dyn Error>>
         events: events(held)?,
         events_limit: limit,
         completed: 0,
+        recent: Recent::default(),
         principals_epoch: 0,
     }))
 }
@@ -106,6 +107,7 @@ fn delta(base: u64, seq: u64, carried: &[u64]) -> Result<Frame, Box<dyn Error>> 
         actions: None,
         events: events(carried)?,
         completed: None,
+        recent: None,
         principals_epoch: None,
     }))
 }

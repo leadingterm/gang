@@ -1,7 +1,6 @@
 // Recorded fixture scenarios shared by server-rendered UI tests.
 import { readFileSync } from "node:fs";
 import { StateClient, type Environment, type Link } from "../src/client.ts";
-import { emptyHistory, observe } from "../src/history.ts";
 import { ms } from "../src/wire-parse.ts";
 import type { ListPrincipalsResponse, ListRolesResponse, Session, State } from "../src/wire.ts";
 import { load, snapshotOf } from "./sse.ts";
@@ -45,7 +44,6 @@ export const clientFor = ({ state = snapshotOf(load("live")), session: who = ses
   if (state) {
     const at = ms(state.updateTime);
     client.state.value = state;
-    client.history.value = observe(emptyHistory(at), state, at);
     client.now.value = at;
   }
   return client;

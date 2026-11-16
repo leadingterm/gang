@@ -13,7 +13,7 @@ use crate::output::{Output, Record};
 use crate::{
     bazel_command, ca_pin_command, client_command, deploy_command, doctor_command, exec_command,
     guard_command, help, join_command, local_down, local_up, options_command, reset_command,
-    server_command, worker_command,
+    server_command, setup_command, worker_command,
 };
 
 /// What a process runs, decided from its argv0 and arguments.
@@ -143,6 +143,7 @@ pub fn run(args: &[OsString]) -> ExitCode {
 /// Calls the handler for a command.
 fn execute(command: Command, entrypoint: &Path, out: &Output) -> Result<ExitCode> {
     match command {
+        Command::Setup(args) => setup_command::run(args, out),
         Command::Exec(args) => exec_command::run(entrypoint, &args.command),
         Command::Login(args) => client_command::login(args, out),
         Command::Get => bazel_command::get(out),

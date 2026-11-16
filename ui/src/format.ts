@@ -39,14 +39,10 @@ export const splitTarget = (target: string): readonly [pkg: string, name: string
   return i < 0 ? ["", target] : [target.slice(0, i), target.slice(i)];
 };
 
-/** A worker id is `<instance>-<uuid>`; the short form is the uuid's first four characters. */
-export const workerShort = (id: string, instance: string): string =>
-  (id.startsWith(`${instance}-`) ? id.slice(instance.length + 1) : id).slice(0, 4);
-
-/** The instance a worker id names. */
+/** The instance a worker id names, or the full id when it has no instance. */
 export const workerInstance = (id: string): string => {
-  const uuid = 36;
-  return id.length > uuid + 1 ? id.slice(0, id.length - uuid - 1) : id;
+  const match = /^(.*)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.exec(id);
+  return match?.[1] || id;
 };
 
 /** An enum name as words: `IDLE_TIMEOUT` reads `idle timeout`. */

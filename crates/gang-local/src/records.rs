@@ -7,9 +7,7 @@ use std::str::FromStr;
 
 use gang_clock::Timestamp;
 use gang_os::PathIo;
-use gang_os::fs::{
-    PRIVATE_FILE, ensure_private_dir, read_optional, read_to_string_optional, write_atomic,
-};
+use gang_os::fs::{PRIVATE_FILE, ensure_private_dir, read_optional, read_to_string_optional};
 use gang_types::{FleetName, InstanceId, Isa};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -68,9 +66,12 @@ impl RecordStore {
     /// Atomically replaces the instance's record, creating its directory when needed.
     pub(crate) fn write(&self, record: &InstanceRecord) -> Result<(), LocalError> {
         let dir = self.layout.instance_dir(&record.id);
-        ensure_private_dir(&dir)?;
+        let directory = ensure_private_dir(&dir)?;
         let path = self.layout.record_path(&record.id);
-        write_atomic(&path, &to_json(&path, record)?, PRIVATE_FILE)?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| PathIo::new("write", &path, io::ErrorKind::InvalidInput.into()))?;
+        directory.write_atomic(name, &to_json(&path, record)?, PRIVATE_FILE)?;
         Ok(())
     }
 
@@ -87,7 +88,7 @@ impl RecordStore {
         cgroup: &Path,
     ) -> Result<(), LocalError> {
         let path = self.layout.worker_cgroup_path(id);
-        write_atomic(&path, cgroup.as_os_str().as_bytes(), PRIVATE_FILE)?;
+        write_private(&path, cgroup.as_os_str().as_bytes())?;
         Ok(())
     }
 
@@ -134,7 +135,7 @@ impl RecordStore {
     /// Persists the desired capacity for `fleet`.
     pub(crate) fn set_desired(&self, fleet: &FleetName, desired: u32) -> Result<(), LocalError> {
         let path = self.layout.desired_path(fleet);
-        write_atomic(&path, desired.to_string().as_bytes(), PRIVATE_FILE)?;
+        write_private(&path, desired.to_string().as_bytes())?;
         Ok(())
     }
 
@@ -146,11 +147,7 @@ impl RecordStore {
         at: Timestamp,
     ) -> Result<(), LocalError> {
         let path = self.layout.early_exit_path(fleet);
-        write_atomic(
-            &path,
-            at.as_unix_millis().to_string().as_bytes(),
-            PRIVATE_FILE,
-        )?;
+        write_private(&path, at.as_unix_millis().to_string().as_bytes())?;
         Ok(())
     }
 
@@ -180,7 +177,7 @@ impl RecordStore {
                 io::Error::new(io::ErrorKind::InvalidData, "instance counter is exhausted"),
             ))
         })?;
-        write_atomic(&path, next.to_string().as_bytes(), PRIVATE_FILE)?;
+        write_private(&path, next.to_string().as_bytes())?;
         let id = InstanceId::try_new(format!("local-{current}"))?;
         Ok(id)
     }
@@ -197,7 +194,7 @@ impl RecordStore {
             return Err(LocalError::UnknownInstance(id.clone()));
         }
         let path = self.layout.preemption_path(id);
-        write_atomic(&path, &to_json(&path, &terminate_at)?, PRIVATE_FILE)?;
+        write_private(&path, &to_json(&path, &terminate_at)?)?;
         Ok(())
     }
 
@@ -205,6 +202,18 @@ impl RecordStore {
     pub(crate) fn read_preemption(&self, id: &InstanceId) -> Result<Option<Timestamp>, LocalError> {
         read_json(&self.layout.preemption_path(id))
     }
+}
+
+/// Writes a record through its verified containing directory.
+fn write_private(path: &Path, bytes: &[u8]) -> Result<(), LocalError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| PathIo::new("write", path, io::ErrorKind::InvalidInput.into()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| PathIo::new("write", path, io::ErrorKind::InvalidInput.into()))?;
+    ensure_private_dir(parent)?.write_atomic(name, bytes, PRIVATE_FILE)?;
+    Ok(())
 }
 
 /// Reads the record behind one `instances_dir` entry. `None` skips the entry: it is not a directory,

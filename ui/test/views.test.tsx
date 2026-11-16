@@ -13,11 +13,11 @@ import { Activity } from "../src/views/activity.tsx";
 import { fleetCounts, fleetTotals, Tape } from "../src/views/fleet.tsx";
 import { Forbidden, SignIn, SignInError } from "../src/views/gate.tsx";
 import { EventRow, Overview } from "../src/views/overview.tsx";
-import { Workers } from "../src/views/workers.tsx";
+import { WorkerDetail, Workers } from "../src/views/workers.tsx";
 import { ms } from "../src/wire-parse.ts";
 import type { ScalingEvent } from "../src/wire.ts";
 import { clientFor, session, signedOut, type Scenario } from "./scenario.ts";
-import { load, snapshotOf } from "./sse.ts";
+import { iso, load, snapshotOf } from "./sse.ts";
 
 snapshot.setResolveSnapshotPath(() => new URL("../test/views.snapshot", import.meta.url).pathname);
 snapshot.setDefaultSnapshotSerializers([(html: unknown) => html]);
@@ -115,8 +115,8 @@ const common = { name: "events/1022", createTime: live.updateTime, fleet: "fleet
 
 test("worker events name the worker and its verb", (t) => {
   const row = (e: ScalingEvent) => render(<EventRow withCause e={e} />);
-  t.assert.match(row({ ...common, workerRegistered: { worker: `workers/${WORKER}` } }), /0ee1 joined/);
-  t.assert.match(row({ ...common, workerDeregistered: { worker: `workers/${WORKER}` } }), /0ee1 left/);
+  t.assert.match(row({ ...common, workerRegistered: { worker: `workers/${WORKER}` } }), /i-04828e21626b14dd2 joined/);
+  t.assert.match(row({ ...common, workerDeregistered: { worker: `workers/${WORKER}` } }), /i-04828e21626b14dd2 left/);
 });
 
 test("an early exit names the instance and shows its failure", (t) => {
@@ -167,4 +167,170 @@ test("a fleet's counts are totalled across fleets and name every state with the 
     ["draining", 1],
   ]);
   t.assert.match(html({}, <Tape f={spot} />), /9 busy, 1 idle, 1 draining, 1 no worker, 2 pending, 1 terminating, of 24 maximum/);
+});
+
+test("open worker detail names running actions and falls back to the digest", (t) => {
+  const worker = live.workers[0];
+  const action = live.actions?.running[0];
+  if (!worker || !action || !live.actions) throw new Error("the live recording has a worker and a running action");
+  const detailed = { ...worker, phases: [{ phase: worker.phase, start: worker.phaseTime }] };
+  const state = {
+    ...live,
+    workers: [detailed, ...live.workers.slice(1)],
+    actions: { ...live.actions, running: [
+      { ...action, worker: worker.name, target: "//pkg:target", mnemonic: "Compile" },
+      { ...action, name: "actions/fallback", worker: worker.name, target: "", mnemonic: "", digest: "abcdef1234567890/123" },
+    ] },
+  };
+  const markup = html({ state }, <WorkerDetail w={detailed} state={state} />);
+  t.assert.match(markup, /<thead>[\s\S]*Target[\s\S]*Mnemonic[\s\S]*Running[\s\S]*<\/thead>/);
+  t.assert.match(visibleText(markup), /\/\/pkg:target/);
+  t.assert.match(markup, /class="[^"]*(?:quiet|dim)[^"]*"[^>]*>abcdef123456</);
+  t.assert.match(visibleText(markup), /—/);
+});
+
+test("fleet launch failure shows the unmet request and provider reason", (t) => {
+  const fleet = live.fleets[0];
+  if (!fleet) throw new Error("the live recording has a fleet");
+  const state = { ...live, fleets: [{ ...fleet, desired: 4, instances: { ...fleet.instances, inService: 2 }, launchFailure: { reason: "spot quota exceeded" } }] };
+  const text = visibleText(html({ state }, <Overview />));
+  t.assert.match(text, /can't launch/);
+  t.assert.match(text, /2 of 4 · spot quota exceeded/);
+});
+
+const recentState = (count: number) => {
+  const last = Math.floor(ms(live.updateTime) / 10000) * 10000;
+  return {
+    ...live,
+    recent: {
+      window: "900s",
+      step: "10s",
+      samples: Array.from({ length: count }, (_, i) => ({
+        start: iso(last - (count - 1 - i) * 10000),
+        completed: 10, running: 100, queued: 5, passes: 5, skipped: 0,
+      })),
+    },
+  };
+};
+
+const chart = (markup: string, label: string): string =>
+  new RegExp(`<svg\\b[^>]*aria-label="${label}"[^>]*>[\\s\\S]*?<\\/svg>`).exec(markup)?.[0] ?? "";
+
+const passStrip = (markup: string): string =>
+  /<div class="passbar"[^>]*>[\s\S]*?<\/div>/.exec(markup)?.[0] ?? "";
+
+test("a page opened once renders Done/min and the full charts from the first frame", (t) => {
+  const markup = html({ state: recentState(90) }, <Overview />);
+  t.assert.match(markup, /Done \/ min<\/h2><p class="readout__big"><span[^>]*>60<\/span><\/p>/);
+  t.assert.doesNotMatch(markup, /over \d+s/);
+  for (const label of ["Done per minute", "Executing", "Queued"]) {
+    const svg = chart(markup, label);
+    const path = /<path class="spark__run" d="([^"]*)"/.exec(svg)?.[1] ?? "";
+    const points = (path.match(/[ML]/g) ?? []).length;
+    t.assert.equal(points === 89 || points === 90, true, `${label}: ${points} points`);
+  }
+  const strip = passStrip(markup);
+  t.assert.equal((strip.match(/<i\b/g) ?? []).length, 90);
+  t.assert.doesNotMatch(strip, /is-unrecorded/);
+});
+
+test("a restarted server shows the time before its first sample as not recorded, never zero", (t) => {
+  const markup = html({ state: recentState(3) }, <Overview />);
+  t.assert.match(markup, /over 20s/);
+  t.assert.equal((passStrip(markup).match(/is-unrecorded/g) ?? []).length, 87);
+  for (const label of ["Done per minute", "Executing", "Queued"]) {
+    t.assert.match(chart(markup, label), /spark__unrecorded/, label);
+  }
+});
+
+test("every section header renders through the one header component", (t) => {
+  for (const [name, rendered] of SCREENS) {
+    const markup = rendered();
+    t.assert.doesNotMatch(markup, /(?:section__head|wgroup__head)/, name);
+    for (const match of markup.matchAll(/<section\b[^>]*aria-labelledby="([^"]+)"[^>]*>/g)) {
+      const id = match[1]!;
+      t.assert.equal(markup.includes(`<div class="shead"><h2 id="${id}"`), true, `${name}: ${id}`);
+    }
+    if (name === "forbidden" || name.startsWith("sign")) continue;
+    const withoutEmpty = markup.replace(/<div class="empty">[\s\S]*?<\/div>/g, "");
+    for (const [heading] of withoutEmpty.matchAll(/<h2\b[^>]*>/g)) {
+      if (/class="label"/.test(heading)) continue;
+      t.assert.match(heading, /class="shead__title(?: shead__title--mono)?"/, name);
+    }
+  }
+});
+
+test("fleet badges sit on the name's row whatever the name length", (t) => {
+  const fleet = live.fleets[0];
+  if (!fleet) throw new Error("the live recording has a fleet");
+  const names = ["a", "build-worker-aarch64-with-a-very-long-name"];
+  const state = { ...live, fleets: names.map((name) => ({
+    ...fleet, name: `fleets/${name}`, properties: { ...fleet.properties, capacity: "spot" },
+  })) };
+  const markup = html({ state }, <Overview />);
+  for (const name of names) {
+    t.assert.match(markup, new RegExp(`<div class="fleet__id"><span class="fleet__ord">[\\s\\S]*?<\\/span><h3 class="fleet__name" title="${name}">${name}<\\/h3><span class="fleet__tags"><span class="tag tag--spot">spot<\\/span>`));
+  }
+});
+
+test("identifiers never wrap", (t) => {
+  const row = render(<EventRow withCause e={{ ...common, fleet: "fleets/build-worker-x86-64", scaledOut: { from: 0, to: 1 } }} />);
+  t.assert.match(row, /<span class="ident" title="build-worker-x86-64">build-worker-x86-64<\/span>/);
+});
+
+test("queued actions show their refusal", (t) => {
+  const queued = cold.actions?.queued[0];
+  if (!queued || !live.actions) throw new Error("the recordings have a queued action and an action sample");
+  const state = { ...live, actions: { ...live.actions, queued: [{ ...queued, candidates: [], refusal: "cpu exceeds every fleet" }] } };
+  t.assert.match(html({ state }, <Actions />), /class="[^"]*caution[^"]*"[^>]*>cpu exceeds every fleet/);
+});
+
+test("worker rows distinguish instances with the same uuid prefix", (t) => {
+  const worker = live.workers[0];
+  if (!worker) throw new Error("the live recording has a worker");
+  const suffix = "0ee112f6-7a36-7faf-be44-719a1246ef6b";
+  const workers = ["i-first", "i-second"].map((instance) => ({
+    ...worker, name: `workers/${instance}-${suffix}`, instance: `instances/${instance}`,
+  }));
+  const text = visibleText(html({ state: { ...live, workers } }, <Workers />));
+  t.assert.match(text, /i-first/);
+  t.assert.match(text, /i-second/);
+  t.assert.doesNotMatch(text, /0ee1/);
+});
+
+test("a phase entered after the last lane step shows in the lane", (t) => {
+  const worker = live.workers[0];
+  if (!worker) throw new Error("the live recording has a worker");
+  const at = Math.floor(ms(live.updateTime) / 60000) * 60000 + 5000;
+  const start = iso(at - 3000);
+  const state = {
+    ...live,
+    updateTime: iso(at),
+    workers: [{ ...worker, launchTime: start, phase: "BUSY" as const, phaseTime: start, phases: [{ phase: "BUSY" as const, start }] }],
+  };
+  const rendered = html({ state }, <Workers />);
+  t.assert.equal(rendered.includes("lane__seg--busy"), true);
+});
+
+test("an event after the last step stays inside the activity lane", (t) => {
+  const fleet = live.fleets[0];
+  if (!fleet) throw new Error("the live recording has a fleet");
+  const at = Math.floor(ms(live.updateTime) / 60000) * 60000 + 5000;
+  const state = {
+    ...live,
+    updateTime: iso(at),
+    events: [{ ...common, fleet: fleet.name, createTime: iso(at - 2000), scaledOut: { from: 1, to: 2 } }],
+  };
+  const rendered = html({ state }, <Activity />);
+  const positions = [...rendered.matchAll(/--x:\s*([0-9.]+)/g)].map((match) => Number(match[1]));
+  t.assert.equal(positions.length, 1);
+  t.assert.equal(positions.every((x) => x <= 1), true);
+});
+
+test("launch failure and withdrawal events show their details", (t) => {
+  const failure = render(<EventRow withCause e={{ ...common, launchFailed: { from: 2, to: 4, reason: "spot quota exceeded" } }} />);
+  t.assert.match(visibleText(failure), /2 of 4 launched/);
+  t.assert.match(failure, /event__cause caution[^>]*>spot quota exceeded/);
+  const withdrawn = render(<EventRow withCause e={{ ...common, withdrawn: { from: 4, to: 2 } }} />);
+  t.assert.match(visibleText(withdrawn), /4 → 2/);
 });

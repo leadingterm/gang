@@ -27,6 +27,8 @@ export type EventKind = KeyOf<EventChange>;
 
 const KNOWN_KINDS: { readonly [K in EventKind]: true } = {
   scaledOut: true,
+  launchFailed: true,
+  withdrawn: true,
   drainStarted: true,
   drainCancelled: true,
   terminated: true,

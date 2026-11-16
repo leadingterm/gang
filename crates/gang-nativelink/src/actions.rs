@@ -135,6 +135,13 @@ async fn queued(
         }
         let (state, origin) = result.as_state().await?;
         let row = read(state, origin, &*result).await?;
+        let properties = &row.info.platform_properties;
+        let candidates = fleets.accepting(|key| properties.get(key).map(String::as_str));
+        let refusal = if candidates.is_empty() {
+            fleets.refusal(|key| properties.get(key).map(String::as_str))
+        } else {
+            None
+        };
         into.queued.push(QueuedActionView {
             info: ActionInfo {
                 op: row.op,
@@ -144,8 +151,8 @@ async fn queued(
                 priority: row.info.priority,
             },
             queued_since: Timestamp::from(row.info.insert_timestamp),
-            candidates: fleets
-                .accepting(|key| row.info.platform_properties.get(key).map(String::as_str)),
+            candidates,
+            refusal,
         });
     }
     Ok(())
@@ -520,6 +527,7 @@ mod tests {
                     },
                     queued_since: Timestamp::from_unix_millis(4_000),
                     candidates: fleets.accepting(|key| (key == "cpu").then_some("2")),
+                    refusal: None,
                 },
                 QueuedActionView {
                     info: ActionInfo {
@@ -531,9 +539,47 @@ mod tests {
                     },
                     queued_since: Timestamp::from_unix_millis(5_000),
                     candidates: fleets.accepting(|_| None),
+                    refusal: None,
                 },
             ]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queued_refusal_identifies_unaccepted_property()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fleets = catalog()?;
+        let fake = Fake {
+            queued: vec![
+                row(
+                    "rejected",
+                    ActionStage::Queued,
+                    0,
+                    info(0, 0, &[(property::CPU_COUNT, "999")]),
+                    None,
+                ),
+                row(
+                    "accepted",
+                    ActionStage::Queued,
+                    0,
+                    info(0, 0, &[(property::CPU_COUNT, "1")]),
+                    None,
+                ),
+            ],
+            ..Fake::default()
+        };
+        let view = run(&fake, &[], &fleets, ALL).await?;
+        assert!(view.queued[0].candidates.is_empty());
+        assert!(matches!(
+            &view.queued[0].refusal,
+            Some(gang_types::Refusal::Minimum {
+                key: property::CPU_COUNT,
+                ..
+            })
+        ));
+        assert!(!view.queued[1].candidates.is_empty());
+        assert_eq!(view.queued[1].refusal, None);
         Ok(())
     }
 

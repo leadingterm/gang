@@ -144,6 +144,8 @@ gang_types::string_enum! {
     /// This is the only place the names are spelled out.
     enum KindTag("scaling event kind") {
         ScaledOut = "scaled_out",
+        LaunchFailed = "launch_failed",
+        Withdrawn = "withdrawn",
         DrainStarted = "drain_started",
         DrainCancelled = "drain_cancelled",
         Terminated = "terminated",
@@ -157,6 +159,8 @@ impl KindTag {
     fn of(kind: &ScalingEventKind) -> Self {
         match kind {
             ScalingEventKind::ScaledOut { .. } => Self::ScaledOut,
+            ScalingEventKind::LaunchFailed { .. } => Self::LaunchFailed,
+            ScalingEventKind::Withdrawn { .. } => Self::Withdrawn,
             ScalingEventKind::DrainStarted { .. } => Self::DrainStarted,
             ScalingEventKind::DrainCancelled { .. } => Self::DrainCancelled,
             ScalingEventKind::Terminated { .. } => Self::Terminated,
@@ -177,7 +181,7 @@ pub(crate) struct ScalingRow {
     pub(crate) to_capacity: Option<i64>,
     pub(crate) subject: Option<String>,
     pub(crate) cause: Option<&'static str>,
-    /// The failure record for an early worker exit, when present.
+    /// The failure record for an early worker exit or a launch failure, when present.
     pub(crate) detail: Option<String>,
 }
 
@@ -186,9 +190,15 @@ impl TryFrom<&ScalingAuditEvent> for ScalingRow {
 
     fn try_from(event: &ScalingAuditEvent) -> Result<Self, Self::Error> {
         let (from_capacity, to_capacity, subject, detail) = match &event.kind {
-            ScalingEventKind::ScaledOut { from, to } => {
+            ScalingEventKind::ScaledOut { from, to } | ScalingEventKind::Withdrawn { from, to } => {
                 (Some(i64::from(*from)), Some(i64::from(*to)), None, None)
             }
+            ScalingEventKind::LaunchFailed { from, to, reason } => (
+                Some(i64::from(*from)),
+                Some(i64::from(*to)),
+                None,
+                Some(reason.clone()),
+            ),
             ScalingEventKind::DrainStarted { worker }
             | ScalingEventKind::DrainCancelled { worker }
             | ScalingEventKind::WorkerRegistered { worker }
@@ -260,6 +270,16 @@ fn scaling_kind(row: &Row<'_>) -> Result<ScalingEventKind, SqliteError> {
         .map_err(|error| corrupt("kind", error))?;
     Ok(match tag {
         KindTag::ScaledOut => ScalingEventKind::ScaledOut {
+            from: capacity(row, "from_capacity")?,
+            to: capacity(row, "to_capacity")?,
+        },
+        KindTag::LaunchFailed => ScalingEventKind::LaunchFailed {
+            from: capacity(row, "from_capacity")?,
+            to: capacity(row, "to_capacity")?,
+            reason: cell::<Option<String>>(row, "detail")?
+                .ok_or_else(|| corrupt("detail", "expected text"))?,
+        },
+        KindTag::Withdrawn => ScalingEventKind::Withdrawn {
             from: capacity(row, "from_capacity")?,
             to: capacity(row, "to_capacity")?,
         },

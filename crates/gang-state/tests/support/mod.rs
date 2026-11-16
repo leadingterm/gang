@@ -14,7 +14,8 @@ use gang_spi::{FleetInstance, QueuedDemand, WorkerState};
 use gang_state::BuilderConfig;
 use gang_testkit::fleet_policy;
 use gang_types::{
-    FleetName, FleetProperties, FleetSet, InstanceId, InstanceLifecycle, Isa, Resources, WorkerId,
+    ActionResources, FleetName, FleetProperties, FleetSet, InstanceId, InstanceLifecycle, Isa,
+    WorkerId,
 };
 use gang_wire::{State, name};
 
@@ -30,6 +31,8 @@ pub fn config() -> BuilderConfig {
         events_limit: 10,
         stale_after: Duration::from_secs(5),
         interval: Duration::from_secs(1),
+        history_window: Duration::from_mins(15),
+        history_step: Duration::from_secs(10),
         provisioner: "test-provisioner".to_owned(),
     }
 }
@@ -104,7 +107,7 @@ pub fn worker_state(
 pub fn queued(since: u64, candidates: FleetSet) -> QueuedDemand {
     QueuedDemand {
         candidates,
-        resources: Resources::default(),
+        resources: ActionResources::default(),
         queued_since: ts(since),
         priority: 0,
     }

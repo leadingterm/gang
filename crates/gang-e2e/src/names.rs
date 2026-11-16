@@ -208,6 +208,51 @@ pub mod plaintext {
     pub const ADMIN_ADMITTED: &str = "an anonymous administrator is admitted to the admin routes";
 }
 
+/// Names of the checks of the setup scenario.
+pub mod setup {
+    /// The noninteractive run fails while the conflict remains.
+    pub const YES_EXITS_WITH_CONFLICT: &str = "gang setup --yes exits 1 with the home conflict";
+    /// The noninteractive run emits a failure record.
+    pub const YES_REPORTS_FAILURE: &str = "gang setup --yes prints a fail record";
+    /// Interactive setup succeeds after accepting the edit.
+    pub const INTERACTIVE_SUCCEEDS: &str = "interactive gang setup exits 0";
+    /// Interactive setup applies the expected home rc edit.
+    pub const INTERACTIVE_EDITS_HOME_RC: &str =
+        "interactive gang setup applies the home rc edit byte for byte";
+    /// Interactive setup saves exactly one backup of the original home rc.
+    pub const INTERACTIVE_BACKS_UP_HOME_RC: &str =
+        "interactive gang setup saves one exact backup of the home rc";
+    /// A subsequent noninteractive run succeeds.
+    pub const YES_SUCCEEDS_AFTER_EDIT: &str = "gang setup --yes exits 0 after the edit";
+    /// Setup reuses the previously stored workload login.
+    pub const REUSES_SIGN_IN: &str = "gang setup reuses the workload sign-in";
+    /// Setup writes the server's exact CA certificate.
+    pub const WRITES_SERVER_CA: &str = "gang setup writes the server CA to .gang/ca.pem";
+    /// The generated rc names the workspace CA certificate.
+    pub const CONFIGURES_TLS_CERTIFICATE: &str = "gang setup configures the TLS certificate";
+    /// The generated rc names the absolute gang credential helper.
+    pub const CONFIGURES_CREDENTIAL_HELPER: &str =
+        "gang setup configures the absolute credential helper";
+    /// Setup identifies the conflicting home rc line.
+    pub const REPORTS_THE_CONFLICTING_LINE: &str =
+        "gang setup names the home rc line that overrides Gang's cache";
+    /// Setup prints the minimal edit.
+    pub const REPORTS_THE_MINIMAL_EDIT: &str =
+        "gang setup prints the edit that moves the line into build:not-gang";
+    /// Setup reports the credential header leak.
+    pub const REPORTS_THE_HEADER_LEAK: &str =
+        "gang setup reports the home rc header that would be sent to Gang";
+    /// Setup writes the workspace files.
+    pub const WRITES_THE_WORKSPACE_FILES: &str =
+        "gang setup writes .gang/bazelrc and the try-import line";
+    /// Setup does not modify the home rc.
+    pub const LEAVES_THE_HOME_RC_UNCHANGED: &str =
+        "gang setup --yes leaves the home rc byte for byte";
+    /// The build runs remotely after the edit.
+    pub const BUILDS_REMOTELY_AFTER_THE_EDIT: &str =
+        "after the edit, a build through the workspace rc runs remotely";
+}
+
 /// Names of the checks of the dashboard scenario.
 pub mod dashboard {
     /// The route refuses a request that carries no session cookie.
@@ -651,9 +696,9 @@ pub mod escalation {
 pub mod disk_guard {
     /// An unplaceable action fails the build.
     pub const REFUSED: &str = "an action whose disk no fleet accepts fails the build";
-    /// The refusal names the rejected platform properties.
+    /// The refusal names the rejected platform property.
     pub const NAMES_NO_FLEET: &str =
-        "the build says no fleet accepts the action's platform properties";
+        "the build says no fleet accepts the action and names its disk_kb";
     /// The unplaceable action never runs.
     pub const NEVER_RAN: &str = "the action no fleet accepts never runs";
     /// The worker keeps serving.

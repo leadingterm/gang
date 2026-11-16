@@ -8,6 +8,10 @@ pub const ISA: &str = "ISA";
 pub const SANDBOX: &str = "sandbox";
 /// The number of virtual CPUs. Matches when the fleet has at least the requested count.
 pub const CPU_COUNT: &str = "cpu_count";
+/// CPU in millicores. Matches when the fleet has at least the requested amount.
+pub const CPU_MILLICORES: &str = "cpu_millicores";
+/// Number of millicores in one CPU core.
+pub const MILLICORES_PER_CORE: u64 = 1000;
 /// The memory in KiB. Matches when the fleet has at least the requested amount.
 pub const MEMORY_KB: &str = "memory_kb";
 /// Disk in KiB. Matches when the fleet has at least the requested amount.
@@ -16,7 +20,16 @@ pub const DISK_KB: &str = "disk_kb";
 pub const NETWORK: &str = "network";
 
 /// Every reserved property key.
-pub const RESERVED: [&str; 7] = [FLEET, ISA, SANDBOX, CPU_COUNT, MEMORY_KB, DISK_KB, NETWORK];
+pub const RESERVED: [&str; 8] = [
+    FLEET,
+    ISA,
+    SANDBOX,
+    CPU_COUNT,
+    CPU_MILLICORES,
+    MEMORY_KB,
+    DISK_KB,
+    NETWORK,
+];
 
 /// Keys that impose nothing on matching.
 pub const IGNORED: [&str; 1] = [NETWORK];
@@ -56,6 +69,7 @@ mod tests {
             "ISA",
             "sandbox",
             "cpu_count",
+            "cpu_millicores",
             "memory_kb",
             "disk_kb",
             "network",

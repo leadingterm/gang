@@ -22,6 +22,12 @@ use crate::options::ClientOptions;
 pub(crate) const REMOTE_EXECUTOR: &str = "remote_executor";
 /// The Bazel flag that names the remote cache.
 pub(crate) const REMOTE_CACHE: &str = "remote_cache";
+/// A header sent to both remote endpoints.
+pub(crate) const REMOTE_HEADER: &str = "remote_header";
+/// A header sent to the remote cache.
+pub(crate) const REMOTE_CACHE_HEADER: &str = "remote_cache_header";
+/// A header sent to the remote executor.
+pub(crate) const REMOTE_EXEC_HEADER: &str = "remote_exec_header";
 /// The Bazel flag that names the CA certificate Bazel trusts for remote endpoints.
 pub(crate) const TLS_CERTIFICATE: &str = "tls_certificate";
 /// The Bazel flag that names a credential helper, possibly scoped to a host.
@@ -138,20 +144,39 @@ impl EffectiveOptions {
     }
 }
 
-/// The values of the canonical `config` options: the configs Bazel was asked to apply.
+/// The explicitly requested configs and the host config when Bazel enables platform configs.
 fn requested_configs(canonical: &CommandLine) -> Vec<String> {
-    canonical
-        .sections
-        .iter()
-        .filter(|section| section.section_label == COMMAND_OPTIONS)
-        .flat_map(|section| &section.option_list.option)
+    let options = || {
+        canonical
+            .sections
+            .iter()
+            .filter(|section| section.section_label == COMMAND_OPTIONS)
+            .flat_map(|section| &section.option_list.option)
+    };
+    let mut configs: Vec<String> = options()
         .filter(|option| option.option_name == "config")
         .map(|option| option.option_value.clone().unwrap_or_default())
-        .collect()
+        .collect();
+    let enabled = options()
+        .rfind(|option| option.option_name == "enable_platform_specific_config")
+        .is_some_and(|option| {
+            matches!(
+                option.option_value.as_deref().unwrap_or_default(),
+                "" | "1" | "true" | "yes"
+            )
+        });
+    if enabled
+        && matches!(
+            std::env::consts::OS,
+            "linux" | "macos" | "windows" | "freebsd" | "openbsd"
+        )
+    {
+        configs.push(std::env::consts::OS.to_owned());
+    }
+    configs
 }
 
-/// Keeps the overrides of sections that apply to this build: `common`, `always`, `build`, and
-/// `build:<config>` for each applicable config.
+/// Keeps the overrides of applicable common, always and build sections.
 fn applicable_overrides(overrides: Vec<Override>, requested: &[String]) -> Vec<Override> {
     let configs = applicable_configs(&overrides, requested);
     overrides
@@ -178,15 +203,15 @@ fn applicable_configs(overrides: &[Override], requested: &[String]) -> Vec<Strin
     }
 }
 
-/// Whether a section's overrides apply: `common`, `always`, `build`, or `build:<config>` for an
-/// applicable config.
+/// Whether a section's overrides apply to this build and its configs.
 fn applies(section: &str, configs: &[String]) -> bool {
-    match section {
-        "common" | "always" | "build" => true,
-        _ => section
-            .strip_prefix("build:")
-            .is_some_and(|config| configs.iter().any(|known| known == config)),
+    if matches!(section, "common" | "always" | "build") {
+        return true;
     }
+    section.split_once(':').is_some_and(|(command, config)| {
+        matches!(command, "common" | "always" | "build")
+            && configs.iter().any(|known| known == config)
+    })
 }
 
 /// The part of the `original` command line that says where options were set.
@@ -391,6 +416,8 @@ pub struct BazelCommand {
     program: OsString,
     /// Arguments placed after `build --nobuild`, such as `--config=ci`.
     args: Vec<OsString>,
+    /// Optional working directory; absent means the process working directory.
+    directory: Option<PathBuf>,
     /// How long the program may take before it is abandoned.
     timeout: NonZeroDuration,
     /// The most characters of the program's error output quoted in an error.
@@ -413,11 +440,19 @@ impl BazelCommand {
         Self {
             program: program.into(),
             args,
+            directory: None,
             timeout: options.bazel_timeout,
             max_detail_chars: options.max_error_message_chars,
             max_output: options.max_response_size,
             clock,
         }
+    }
+
+    /// Run Bazel in `dir`, for example the workspace that setup just configured.
+    #[must_use]
+    pub fn in_directory(mut self, dir: PathBuf) -> Self {
+        self.directory = Some(dir);
+        self
     }
 }
 
@@ -455,6 +490,9 @@ impl BazelCommand {
             .arg("--nobuild")
             .arg(format!("--build_event_json_file={}", events.display()))
             .args(&self.args);
+        if let Some(directory) = &self.directory {
+            command.current_dir(directory);
+        }
         self.clock
             .timeout(
                 self.timeout.get(),
@@ -490,17 +528,36 @@ fn take_events(path: &Path) -> String {
     text
 }
 
-/// The error for a run that reported no command line, quoting what its stderr says.
+/// What Bazel prints when a `--credential_helper` names a bare command missing from its `PATH`
+/// (`CommandLinePathFactory`): `Could not find file with name '<helper>' on PATH '<PATH>'`.
+const HELPER_NOT_ON_PATH: &str = "Could not find file with name '";
+
+/// The credential helper Bazel's `stderr` reports missing from its `PATH`, if it reports one.
+fn helper_not_on_path(stderr: &str) -> Option<&str> {
+    let (_, rest) = stderr.split_once(HELPER_NOT_ON_PATH)?;
+    let (helper, rest) = rest.split_once('\'')?;
+    rest.starts_with(" on PATH").then_some(helper)
+}
+
+/// The error for a run that reported no command line, identifying a missing helper when possible.
 fn no_command_line(
     program: String,
     status: ExitStatus,
     stderr: &[u8],
     max_chars: NonZeroUsize,
 ) -> BazelError {
-    BazelError::NoCommandLine {
-        program,
-        status: status.to_string(),
-        detail: failure_detail(&String::from_utf8_lossy(stderr), max_chars),
+    let stderr_text = String::from_utf8_lossy(stderr);
+    if let Some(helper) = helper_not_on_path(&stderr_text) {
+        BazelError::HelperNotOnPath {
+            program,
+            helper: helper.to_owned(),
+        }
+    } else {
+        BazelError::NoCommandLine {
+            program,
+            status: status.to_string(),
+            detail: failure_detail(&stderr_text, max_chars),
+        }
     }
 }
 
@@ -522,6 +579,7 @@ mod tests {
     use std::ffi::OsString;
     use std::io;
     use std::num::NonZeroUsize;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
     use std::process::ExitStatus;
@@ -533,7 +591,7 @@ mod tests {
 
     use super::{
         BazelCommand, BazelProbe, EffectiveOptions, OptionSource, Setting, failure_detail,
-        no_command_line, take_events,
+        helper_not_on_path, no_command_line, take_events,
     };
     use crate::errors::BazelError;
     use crate::options::ClientOptions;
@@ -693,6 +751,89 @@ mod tests {
     #[test]
     fn parses_effective_options_with_their_sources() {
         assert_eq!(parsed(), expected());
+    }
+
+    /// Configured common and always sections contribute provenance.
+    #[test]
+    fn configured_common_and_always_headers_are_attributed() {
+        for section in ["common:ci", "always:ci"] {
+            let canonical = event(
+                "canonical",
+                &[(
+                    "command options",
+                    vec![
+                        option("config", Some("ci")),
+                        option("remote_header", Some("x=y")),
+                    ],
+                )],
+            );
+            let original = event(
+                "original",
+                &[(
+                    "command options",
+                    vec![
+                        option("rc_source", Some(WORKSPACE)),
+                        option(
+                            "default_override",
+                            Some(&format!("0:{section}=--remote_header=x=y")),
+                        ),
+                    ],
+                )],
+            );
+            let options = EffectiveOptions::parse(&format!("{canonical}\n{original}"))
+                .expect("valid events")
+                .expect("canonical options");
+            assert!(
+                options
+                    .value("remote_header")
+                    .is_some_and(|setting| setting.source == rc(WORKSPACE, section)),
+                "configured common/always header must be attributed to its rc section"
+            );
+        }
+    }
+
+    /// Platform configs are applied when enabled in the canonical command line.
+    #[test]
+    fn platform_config_header_is_attributed() {
+        let host = std::env::consts::OS;
+        if !matches!(host, "linux" | "macos" | "windows" | "freebsd" | "openbsd") {
+            return;
+        }
+        for value in [Some("1"), Some("true"), Some("yes"), None] {
+            let section = format!("build:{host}");
+            let canonical = event(
+                "canonical",
+                &[(
+                    "command options",
+                    vec![
+                        option("enable_platform_specific_config", value),
+                        option("remote_header", Some("x=y")),
+                    ],
+                )],
+            );
+            let original = event(
+                "original",
+                &[(
+                    "command options",
+                    vec![
+                        option("rc_source", Some(WORKSPACE)),
+                        option(
+                            "default_override",
+                            Some(&format!("0:{section}=--remote_header=x=y")),
+                        ),
+                    ],
+                )],
+            );
+            let options = EffectiveOptions::parse(&format!("{canonical}\n{original}"))
+                .expect("valid events")
+                .expect("canonical options");
+            assert!(
+                options
+                    .value("remote_header")
+                    .is_some_and(|setting| setting.source == rc(WORKSPACE, &section)),
+                "platform config header must be attributed to its rc section"
+            );
+        }
     }
 
     #[test]
@@ -974,6 +1115,27 @@ mod tests {
     }
 
     #[test]
+    fn command_runs_in_selected_directory() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let script = dir.path().join("pwd");
+        std::fs::write(&script, "#!/bin/sh\npwd\n").expect("write script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let command = BazelCommand::new(
+            &script,
+            Vec::new(),
+            &ClientOptions::default(),
+            Arc::new(TestClock::default()),
+        )
+        .in_directory(dir.path().to_path_buf());
+        let output = run_real(command.run("/bin/pwd", &dir.path().join("events"))).expect("run");
+        let actual = String::from_utf8(output.stdout).expect("utf8");
+        assert_eq!(
+            std::fs::canonicalize(actual.trim()).expect("working directory"),
+            std::fs::canonicalize(dir.path()).expect("directory")
+        );
+    }
+
+    #[test]
     fn take_events_reads_the_file_and_removes_it() {
         let dir = tempfile::tempdir().expect("creating a temporary directory");
         let path = dir.path().join("events.json");
@@ -1133,6 +1295,40 @@ mod tests {
         // the timeout has killed it; a surviving grandchild keeps it blocked.
         let freed = FileLock::exclusive_blocking(&lock).expect("the grandchild lock can be taken");
         drop(freed);
+    }
+
+    #[test]
+    fn a_helper_missing_from_path_is_named() {
+        let stderr = "INFO: Invocation ID: x\nERROR: Could not find file with name 'gang' on PATH '/usr/bin:/bin'\n";
+        assert_eq!(helper_not_on_path(stderr), Some("gang"));
+    }
+
+    #[test]
+    fn other_failures_name_no_helper() {
+        assert_eq!(
+            helper_not_on_path("ERROR: Skipping '//x': no such package\n"),
+            None
+        );
+        assert_eq!(
+            helper_not_on_path("Could not find file with name 'gang'"),
+            None
+        );
+    }
+
+    #[test]
+    fn no_command_line_identifies_a_helper_missing_from_path() {
+        let stderr = b"INFO: Invocation ID: x\nERROR: Could not find file with name 'gang' on PATH '/usr/bin:/bin'\n";
+        let error = no_command_line(
+            "bazel".to_owned(),
+            ExitStatus::from_raw(1 << 8),
+            stderr,
+            limit(200),
+        );
+        assert!(
+            matches!(&error, BazelError::HelperNotOnPath { program, helper }
+                if program == "bazel" && helper == "gang"),
+            "{error:?}"
+        );
     }
 
     #[test]

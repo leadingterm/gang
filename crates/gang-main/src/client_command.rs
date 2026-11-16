@@ -22,6 +22,14 @@ pub(crate) fn client(
     out: &Output,
 ) -> Result<Client<BuiltInProviders, TerminalConsole, SystemClock>> {
     let home = ClientHome::resolve(|key| std::env::var_os(key))?;
+    client_with_home(out, home)
+}
+
+/// Builds a client for an already resolved home.
+pub(crate) fn client_with_home(
+    out: &Output,
+    home: ClientHome,
+) -> Result<Client<BuiltInProviders, TerminalConsole, SystemClock>> {
     let options = home.options()?;
     let providers = BuiltInProviders::new(home.session_file());
     let console = TerminalConsole::new(&options, out.clone());

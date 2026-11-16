@@ -44,6 +44,7 @@ curl https://gang.example.com/v1/server
   "remoteCache": "grpcs://gang.example.com:443",
   "caCertificate": "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUdGhpcyBpcyBhbiBleGFtcGxl\n-----END CERTIFICATE-----\n",
   "defaultIsa": "x86-64",
+  "version": "0.1.5",
   "authentication": {
     "token": {
       "login": {
@@ -72,6 +73,7 @@ A deployment on a trusted network with no authentication:
   "remoteExecutor": "grpc://gang.example.com:8980",
   "remoteCache": "grpc://gang.example.com:8980",
   "defaultIsa": "aarch64",
+  "version": "0.1.5",
   "authentication": {
     "none": {}
   }
@@ -90,6 +92,7 @@ A deployment on a trusted network with no authentication:
 - `remoteExecutor` and `remoteCache` are the endpoints for Bazel's `--remote_executor` and `--remote_cache`; the scheme is `grpcs` when the listener serves TLS and `grpc` otherwise.
 - `caCertificate` is the certificate authority the client should trust for those endpoints; it is omitted when the server has none, and when `[server] endpoint_trust = "system"`, where a publicly trusted terminator presents the endpoint and clients use their system roots.
 - `defaultIsa` is the instruction set a build gets when it does not name one. `gang bazelrc` writes it as `--remote_default_exec_properties=ISA=<defaultIsa>`.
+- `version` is the server's Gang version, for display; a server that predates it omits it.
 - `authentication` is a oneof. `token` means the client obtains a bearer token with `POST /v1/session:authenticate`; `none` means no credential is needed. A client that meets a member it does not know must stop and say so.
 - `authentication.token.deviceLogin` names the dashboard sign-in provider when device login is mounted; it is omitted otherwise.
 - The route is open: it is the first call a client makes, before it has any credential.
@@ -342,7 +345,7 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
   },
   "queue": {
     "total": 1,
-    "unplaceable": 0,
+    "unplaceable": 1,
     "oldestQueueTime": "2026-01-14T09:19:51.250Z"
   },
   "fleets": [
@@ -365,7 +368,10 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
         "maxDrainWait": "1800s",
         "bootGrace": "300s"
       },
-      "desired": 2,
+      "desired": 3,
+      "launchFailure": {
+        "reason": "capacity unavailable"
+      },
       "instances": {
         "pending": 1,
         "inService": 1,
@@ -380,8 +386,8 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
       },
       "demand": {
         "running": 1,
-        "queued": 1,
-        "candidates": 1,
+        "queued": 0,
+        "candidates": 0,
         "needed": 2,
         "vcpus": 2,
         "memory": 4294967296
@@ -398,7 +404,11 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
       "running": 1,
       "slots": 4,
       "paused": false,
-      "launchTime": "2026-01-14T09:18:30.000Z"
+      "launchTime": "2026-01-14T09:18:30.000Z",
+      "phases": [
+        {"phase": "IDLE", "start": "2026-01-14T09:19:12.000Z"},
+        {"phase": "BUSY", "start": "2026-01-14T09:19:58.000Z"}
+      ]
     }
   ],
   "instances": [
@@ -433,7 +443,8 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
         "mnemonic": "CppCompile",
         "queueTime": "2026-01-14T09:19:51.250Z",
         "priority": 0,
-        "candidates": ["fleets/x86-64-spot"]
+        "candidates": [],
+        "refusal": "cpu_millicores 871000 is above the largest fleet's 15000"
       }
     ],
     "truncated": {
@@ -459,10 +470,29 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
       "workerRegistered": {
         "worker": "workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b"
       }
+    },
+    {
+      "name": "events/997",
+      "createTime": "2026-01-14T09:20:00.000Z",
+      "fleet": "fleets/x86-64-spot",
+      "launchFailed": {
+        "from": 2,
+        "to": 3,
+        "reason": "capacity unavailable"
+      }
     }
   ],
   "eventsLimit": 200,
   "completed": 980,
+  "recent": {
+    "window": "900s",
+    "step": "10s",
+    "samples": [
+      {"start": "2026-01-14T09:19:40.000Z", "completed": 12, "running": 3, "queued": 0, "passes": 5, "skipped": 0},
+      {"start": "2026-01-14T09:19:50.000Z", "completed": 9, "running": 2, "queued": 1, "passes": 5, "skipped": 0},
+      {"start": "2026-01-14T09:20:00.000Z", "completed": 1, "running": 1, "queued": 1, "passes": 1, "skipped": 0}
+    ]
+  },
   "principalsEpoch": 3
 }
 ```
@@ -476,11 +506,11 @@ curl -N -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state:watc
 ```sse
 event: snapshot
 id: 4812
-data: {"name":"state","seq":4812,"updateTime":"2026-01-14T09:20:02.000Z","provisioner":"aws","pass":{"state":"OK","interval":"2s","applied":0,"failed":0},"queue":{"total":0,"unplaceable":0},"fleets":[],"workers":[],"instances":[],"events":[{"name":"events/996","createTime":"2026-01-14T09:19:58.000Z","fleet":"fleets/x86-64-spot","workerRegistered":{"worker":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b"}}],"eventsLimit":200,"completed":980,"principalsEpoch":3}
+data: {"name":"state","seq":4812,"updateTime":"2026-01-14T09:20:02.000Z","provisioner":"aws","pass":{"state":"OK","interval":"2s","applied":0,"failed":0},"queue":{"total":0,"unplaceable":0},"fleets":[],"workers":[],"instances":[],"events":[{"name":"events/996","createTime":"2026-01-14T09:19:58.000Z","fleet":"fleets/x86-64-spot","workerRegistered":{"worker":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b"}}],"eventsLimit":200,"completed":980,"recent":{"window":"900s","step":"10s","samples":[{"start":"2026-01-14T09:20:00.000Z","completed":0,"running":0,"queued":0,"passes":1,"skipped":0}]},"principalsEpoch":3}
 
 event: delta
 id: 4813
-data: {"seq":4813,"base":4812,"updateTime":"2026-01-14T09:20:04.000Z","queue":{"total":0,"unplaceable":0},"workers":{"upsert":[{"name":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b","fleet":"fleets/x86-64-spot","instance":"instances/i-0e1000000000000a","phase":"IDLE","phaseTime":"2026-01-14T09:20:04.000Z","running":0,"slots":4,"paused":false,"launchTime":"2026-01-14T09:18:30.000Z"}]},"actions":{"sampleTime":"2026-01-14T09:20:04.000Z","running":{"remove":["actions/ac9b1c52-3d0e-4f61-9a27-51c6d7e8f901"]},"queued":[]},"events":[{"name":"events/997","createTime":"2026-01-14T09:20:04.000Z","fleet":"fleets/x86-64-spot","cause":"IDLE_TIMEOUT","drainStarted":{"worker":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b"}}],"completed":981}
+data: {"seq":4813,"base":4812,"updateTime":"2026-01-14T09:20:04.000Z","queue":{"total":0,"unplaceable":0},"workers":{"upsert":[{"name":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b","fleet":"fleets/x86-64-spot","instance":"instances/i-0e1000000000000a","phase":"IDLE","phaseTime":"2026-01-14T09:20:04.000Z","running":0,"slots":4,"paused":false,"launchTime":"2026-01-14T09:18:30.000Z","phases":[{"phase":"BUSY","start":"2026-01-14T09:19:58.000Z"},{"phase":"IDLE","start":"2026-01-14T09:20:04.000Z"}]}]},"actions":{"sampleTime":"2026-01-14T09:20:04.000Z","running":{"remove":["actions/ac9b1c52-3d0e-4f61-9a27-51c6d7e8f901"]},"queued":[]},"events":[{"name":"events/997","createTime":"2026-01-14T09:20:04.000Z","fleet":"fleets/x86-64-spot","cause":"IDLE_TIMEOUT","drainStarted":{"worker":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b"}}],"completed":981,"recent":{"window":"900s","step":"10s","samples":[{"start":"2026-01-14T09:20:00.000Z","completed":0,"running":0,"queued":0,"passes":2,"skipped":0}]}}
 
 event: tick
 id: 4813
@@ -508,13 +538,14 @@ data: {"reason":"VIEWER_CAP","retryDelay":"5s"}
   | Event | Data | Sent |
   |---|---|---|
   | `snapshot` | `State` | first on every connect, and again when a viewer fell behind the broadcast |
-  | `delta` | `{seq, base, updateTime, pass?, queue?, fleets?, workers?, instances?, actions?, events?, completed?, principalsEpoch?}` | when a pass changed something and a viewer is connected |
+  | `delta` | `{seq, base, updateTime, pass?, queue?, fleets?, workers?, instances?, actions?, events?, completed?, recent?, principalsEpoch?}` | when a pass changed something and a viewer is connected |
   | `tick` | `{seq, time}` | every heartbeat interval, with the current `seq` |
   | `closed` | `{reason, retryDelay?}` | last, when the server ends the stream deliberately |
 
   The SSE event names `snapshot`, `delta`, `tick` and `closed` are protocol identifiers and stay lowercase. `id:` is the frame's `seq`. The server may also write comment lines starting with `:` between frames; a reader ignores them.
-- **Applying a delta.** A delta moves the state from `base` to `seq`. A part that is present replaces the whole part (`pass`, `queue`, `completed`, `principalsEpoch`); `fleets`, `workers` and `instances` are `{upsert[], remove[]}` keyed by `name`, and a name is in at most one of the two lists (empty lists are omitted); `events` are appended, newest last. The `actions` patch is `{sampleTime?, staleAfter?, running?, queued?, truncated?}`: `running` is keyed by `name`, `queued` replaces the whole list. When `actions` first appears, the patch carries every field and all rows in `running.upsert`.
+- **Applying a delta.** A delta moves the state from `base` to `seq`. A part that is present replaces the whole part (`pass`, `queue`, `completed`, `principalsEpoch`); `fleets`, `workers` and `instances` are `{upsert[], remove[]}` keyed by `name`, and a name is in at most one of the two lists (empty lists are omitted); `events` are appended, newest last; `recent` carries `window`, `step` and the samples from the first one that changed: drop your samples from that sample's `start` on, append these, then drop samples that start a whole `window` or more before the last. The `actions` patch is `{sampleTime?, staleAfter?, running?, queued?, truncated?}`: `running` is keyed by `name`, `queued` replaces the whole list. When `actions` first appears, the patch carries every field and all rows in `running.upsert`.
 - **Resynchronizing.** `seq` advances only when a delta is sent, and only while a viewer is connected. A client reconnects when a delta's `base` differs from its own `seq`, or when a tick's `seq` is behind its own state. A tick whose `seq` equals or runs ahead of the client's is normal (a delta may still be queued for that viewer). There is no replay and no `Last-Event-ID` handling: every connect begins with a snapshot, and a second `snapshot` on an open stream replaces the client's state.
+- **Recent window.** `recent` is what the server observed over its last `window` (`[dashboard] history_window`), one sample per `step` (`history_step`), oldest first and without holes; the last sample is the step in progress. A sample counts `completed` actions in its step, the `running` and `queued` actions at its latest completed pass, and its completed and `skipped` passes. A worker's `phases` are its phase spans within the window, the last being its current phase. The window lives in the server's memory: after a restart the steps before the first sample were not recorded and must not be read as zero.
 - **Events in the state.** `State.events` holds the newest `eventsLimit` scaling events, newest last (ascending). The same events are on `GET /v1/events`, which pages the whole history newest first.
 - **Closing.** `closed.reason` is one of the values below. `retryDelay` is a `Duration` and the SSE `retry:` line repeats it in milliseconds. A client treats a reason it does not know as terminal and reconnects only after the delay, if there is one.
 
@@ -527,6 +558,8 @@ data: {"reason":"VIEWER_CAP","retryDelay":"5s"}
 
 - **Failures before the stream.** An authentication or authorization failure at connect is the normal error envelope with its HTTP status, not a `closed` frame. `EventSource` hides the status, so a browser classifies a failed connect by calling `GET /v1/session`.
 - **Sampling.** `actions` is omitted until the first sample after the controller starts. It is stale when the frame's `updateTime` minus `sampleTime` exceeds `staleAfter`. A worker's `phaseTime` is carried over while its phase is unchanged, so rows do not change on every pass. `completed` counts actions that reached a result since the controller started; a decrease means a restart.
+- A fleet's optional `launchFailure` is `{reason}` when its newest launch attempt failed, its request is unmet and no launch is in flight. The reason is the provider's message, verbatim. It is absent when the request is met, a launch is in flight, or the provider cannot tell.
+- A queued action's optional `refusal` explains why no fleet accepts it; it is present when `candidates` is empty and absent otherwise.
 - Both routes accept the session cookie.
 
 ## principals
@@ -866,11 +899,13 @@ curl -H "Authorization: Bearer $TOKEN" 'https://gang.example.com/v1/events?pageS
 
 - **Order.** Events are listed by sequence number, descending, so a chain of pages walks backward in time. `nextPageToken` resumes after the last event of the page.
 - **Live and history.** The history is this list. Live events come only from `GET /v1/state:watch`: its snapshot `events` and every delta's `events` are full `Event` resources with the same shape. There is no long poll, no `since` and no `before`. A client that holds the newest events of a stream and wants older ones lists from the newest, and stops at the first event it already holds, deduplicating by `name`.
-- **Event.** `createTime` is when the event was recorded and `fleet` is the fleet it concerns. `cause` is present for an autoscaler decision and omitted for worker joins and leaves, early exits, and events recorded before causes existed. Its values are `DEMAND`, `IDLE_TIMEOUT`, `ORPHAN`, `DRAIN_FINISHED` and `MAX_DRAIN_WAIT`; a client tolerates a value it does not know. Beside the common fields exactly one member describes the change:
+- **Event.** `createTime` is when the event was recorded and `fleet` is the fleet it concerns. `cause` is present for an autoscaler decision and omitted for worker joins and leaves, early exits, launch failures, and events recorded before causes existed. Its values are `DEMAND`, `IDLE_TIMEOUT`, `ORPHAN`, `DRAIN_FINISHED` and `MAX_DRAIN_WAIT`; a client tolerates a value it does not know. Beside the common fields exactly one member describes the change:
 
   | Member | Fields |
   |---|---|
   | `scaledOut` | `from`, `to`: the fleet's desired capacity before and after |
+  | `launchFailed` | `from`: existing instances excluding terminating instances; `to`: requested instances; `reason`: the provider's failure message, verbatim |
+  | `withdrawn` | `from`, `to`: the fleet's requested capacity before and after withdrawal |
   | `drainStarted` | `worker`: the worker that began draining |
   | `drainCancelled` | `worker`: the worker whose drain was cancelled |
   | `terminated` | `instance`: the instance that was terminated |
@@ -1079,6 +1114,7 @@ A path or method no route matches, for an authenticated caller:
 
 | Method | Path | Behaviour |
 |---|---|---|
+| `GET` | `/` | `302` to `/ui/`, so a browser opening the server lands on the dashboard; `HEAD` alike. No API route is served at `/`. |
 | `GET` | `/ui/login?next=` | Starts the sign-in: `302` to the identity provider's authorization URL and sets the sign-in cookie. `next` must be `/ui` or below; anything else is replaced by `/ui`. Mounted only when `[dashboard.login]` is configured. |
 | `GET` | `/ui/callback` | The registered OAuth redirect URI. A dashboard sign-in sets the session cookie and redirects to `next`; a device approval sets no session or renewal cookie and redirects to `/ui/device/approved`. Both clear the sign-in cookie; sign-in failures redirect to `/ui/error?reason=denied\|failed\|unavailable`, and device approval failures redirect to `/ui/device?reason=denied\|failed\|unavailable` once the device attempt is identified. Mounted like `/ui/login`. |
 | `POST` | `/ui/renew` | Renews from the sealed renewal cookie; requires `Sec-Fetch-Site: same-origin` or `Origin` equal to the endpoint's origin and is rate limited. Empty answers: `204` sets a new session cookie and reseals the renewal cookie only if the token rotated, keeping its deadline; `401` keeps the cookie past `session_max_age`, but clears it for a missing, invalid or refused token or another principal; `403` clears it for a revoked or denied principal but not for a cross-site request; `429` is rate limited; `503` keeps the cookie when the provider is unavailable. Mounted like `/ui/login`. |
@@ -1093,4 +1129,4 @@ A path or method no route matches, for an authenticated caller:
 - The session cookie is `__Host-gang_session` under an `https` endpoint and `gang_session` otherwise. It is `HttpOnly; SameSite=Strict; Path=/` and is `Secure` under `https`. The sign-in cookie is `__Host-gang_login` or `gang_login`, `SameSite=Lax` because the callback is a cross-site navigation. The renewal cookie is `__Host-gang_renewal` or `gang_renewal`, `HttpOnly; SameSite=Strict; Path=/` and `Secure` under `https`; its `Max-Age` is 400 days (the RFC 6265bis browser cap), while the sealed `expireTime` bounds renewal. Keeping it beyond that deadline lets the next sign-in re-check the token without consent. Its sealed value is not set over 4000 bytes. Only `GET /ui/login` and `POST /ui/renew` read the renewal cookie; the callback uses the renewal carried by its sign-in attempt. The session cookie is read only for `GET` and `HEAD` of the cookie routes of the API; when a bearer token and a cookie are both present, the token wins.
 - The dashboard reads the API with the session cookie: `GET /v1/session`, `GET /v1/state`, `GET /v1/state:watch`, `GET /v1/principals`, `GET /v1/roles` and `GET /v1/events`. Its sign-in state comes from `GET /v1/session`.
 - The shell and the static assets carry no data, so a refusal recorded for the caller does not stop them: a revoked or signed-out visitor still loads the page, and the API calls it makes answer with the envelope.
-- With the dashboard disabled, `/ui/**` is handled like any unknown path.
+- With the dashboard disabled, `/` and `/ui/**` are handled like any unknown path.

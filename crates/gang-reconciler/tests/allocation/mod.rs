@@ -118,7 +118,7 @@ fn steady_state_with(release_first_idle: bool) -> TestResult<Harness> {
     h.set_running("local-4", 1)?;
     h.set_draining("local-4", true)?;
     h.queue_candidates(FleetSet::try_from_indices([X86, SPARE])?, 6);
-    h.queue_sized(X86, 2, x86_resources(8))?;
+    h.queue_sized(X86, 2, x86_resources(8000))?;
     h.set_desired_capacity(X86, 5);
     Ok(h)
 }

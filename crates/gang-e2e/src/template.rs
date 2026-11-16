@@ -664,6 +664,18 @@ fn render_control(document: &mut Document<Plugins>, knobs: &ControlKnobs) -> Res
     if let Some(interval) = knobs.poll_interval {
         document.poll_interval = NonZeroDuration::try_new(interval).map_err(template_error)?;
     }
+    if let Some(timeout) = knobs.client_action_timeout {
+        document.client_action_timeout =
+            NonZeroDuration::try_new(timeout).map_err(template_error)?;
+    }
+    if knobs.broken_launcher {
+        let ProvisionerConfig::Local(local) = &mut document.provisioner else {
+            return Err(template_error("missing [provisioner.local]"));
+        };
+        local.worker_launcher = vec!["gang-e2e-nonexistent-worker-launcher".to_owned()]
+            .try_into()
+            .map_err(template_error)?;
+    }
     for fleet in &mut document.fleets {
         if let Some(grace) = knobs.boot_grace {
             fleet.boot_grace = grace;

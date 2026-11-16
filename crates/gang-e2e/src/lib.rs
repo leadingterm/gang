@@ -77,6 +77,7 @@ mod server_scenarios;
 mod server_stack;
 mod session;
 mod settings;
+mod setup;
 mod signer_key;
 mod skipped_pass;
 mod sse;
@@ -90,6 +91,7 @@ mod timeout;
 mod tls_client;
 
 pub mod flags;
+pub mod launch_failure;
 pub mod names;
 pub mod process;
 pub mod sample;

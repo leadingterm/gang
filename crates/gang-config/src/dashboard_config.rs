@@ -29,6 +29,12 @@ const DEFAULT_LAG_FRAMES: NonZeroUsize = NonZeroUsize::new(32).expect("32 is non
 /// The default number of recent events kept for a viewer that reconnects: 200.
 const DEFAULT_RECENT_EVENTS: NonZeroUsize = NonZeroUsize::new(200).expect("200 is non-zero");
 
+/// The default history window: fifteen minutes.
+const DEFAULT_HISTORY_WINDOW: NonZeroDuration = NonZeroDuration::from_mins(15);
+
+/// The default history sample span: ten seconds.
+const DEFAULT_HISTORY_STEP: NonZeroDuration = NonZeroDuration::from_secs(10);
+
 /// The default most running entries listed in a snapshot: 2000.
 const DEFAULT_MAX_LISTED_RUNNING: usize = 2000;
 
@@ -228,6 +234,10 @@ pub struct DashboardConfig {
     pub lag_frames: NonZeroUsize,
     /// How many recent events are kept for a viewer that reconnects. Defaults to 200.
     pub recent_events: NonZeroUsize,
+    /// How far back recent samples and worker phases reach. Defaults to fifteen minutes.
+    pub history_window: NonZeroDuration,
+    /// The span of one recent sample, in whole seconds. Defaults to ten seconds.
+    pub history_step: NonZeroDuration,
     /// The most running entries listed in a snapshot. Defaults to 2000.
     pub max_listed_running: usize,
     /// The most queued entries listed in a snapshot. Defaults to 200.
@@ -269,6 +279,8 @@ impl Default for DashboardConfig {
             heartbeat: DEFAULT_HEARTBEAT,
             lag_frames: DEFAULT_LAG_FRAMES,
             recent_events: DEFAULT_RECENT_EVENTS,
+            history_window: DEFAULT_HISTORY_WINDOW,
+            history_step: DEFAULT_HISTORY_STEP,
             max_listed_running: DEFAULT_MAX_LISTED_RUNNING,
             max_listed_queued: DEFAULT_MAX_LISTED_QUEUED,
             detail_interval: DEFAULT_DETAIL_INTERVAL,

@@ -30,6 +30,7 @@ nativelink-service = { workspace = true }
 nativelink-store = { workspace = true }
 nativelink-util = { workspace = true }
 nativelink-worker = { workspace = true }
+parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -39,9 +40,10 @@ tower = { workspace = true, features = ["util"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+base64 = { workspace = true }
 gang-os = { workspace = true }
 gang-testkit = { workspace = true }
-parking_lot = { workspace = true }
+opentelemetry = { workspace = true }
 prost = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }

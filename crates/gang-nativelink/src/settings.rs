@@ -40,6 +40,8 @@ pub(crate) fn scheduler(
         let cold = &config.cold_start;
         let memory_kb = cold.memory.as_kib();
         let disk_kb = cold.disk.as_kib();
+        let millicores_text =
+            (u64::from(cold.cpu_count.get()) * property::MILLICORES_PER_CORE).to_string();
         let (cpu_text, memory_text, disk_text) = (
             cold.cpu_count.to_string(),
             memory_kb.to_string(),
@@ -47,6 +49,7 @@ pub(crate) fn scheduler(
         );
         let accepting = spec.fleets.accepting(|key| match key {
             property::CPU_COUNT => Some(cpu_text.as_str()),
+            property::CPU_MILLICORES => Some(millicores_text.as_str()),
             property::MEMORY_KB => Some(memory_text.as_str()),
             property::DISK_KB => Some(disk_text.as_str()),
             _ => None,
@@ -79,6 +82,7 @@ pub(crate) fn scheduler(
     }
     let mut historical = json!({
         "learn_from_workers": true,
+        "cpu_property_name": property::CPU_MILLICORES,
         "headroom_percent": tuning.headroom_percent,
         "window_days": tuning.window_days,
         "scheduler": { "simple": simple },
@@ -99,6 +103,7 @@ fn memory_escalation(memory: &MemoryTuning) -> Option<Value> {
         json!({
             "percent": memory.escalation_percent.get(),
             "max_steps": memory.escalation_max_steps,
+            "cpu_property": property::CPU_MILLICORES,
         })
     })
 }
@@ -108,7 +113,7 @@ fn memory_escalation(memory: &MemoryTuning) -> Option<Value> {
 fn cold_start(tuning: &ColdStartTuning) -> Option<Value> {
     tuning.enabled.then(|| {
         json!({
-            "cpu_count": tuning.cpu_count.get(),
+            "cpu_count": u64::from(tuning.cpu_count.get()) * property::MILLICORES_PER_CORE,
             "memory_kb": tuning.memory.as_kib(),
             "disk_kb": tuning.disk.as_kib(),
         })
@@ -545,6 +550,7 @@ mod tests {
         assert!(historical.learn_from_workers);
         assert_eq!(historical.headroom_percent, 20);
         assert_eq!(historical.window_days, 7);
+        assert_eq!(historical.cpu_property_name, property::CPU_MILLICORES);
         let SchedulerSpec::Simple(simple) = historical.scheduler.as_ref() else {
             panic!(
                 "expected nested simple scheduler, got {:?}",
@@ -623,11 +629,42 @@ mod tests {
         ] {
             assert_eq!(declared.get(key), Some(&json!("exact")), "{key}");
         }
-        for key in [property::CPU_COUNT, property::MEMORY_KB, property::DISK_KB] {
+        for key in [
+            property::CPU_COUNT,
+            property::CPU_MILLICORES,
+            property::MEMORY_KB,
+            property::DISK_KB,
+        ] {
             assert_eq!(declared.get(key), Some(&json!("minimum")), "{key}");
         }
         assert_eq!(declared.get(property::NETWORK), Some(&json!("ignore")));
-        assert_eq!(declared.len(), 8);
+        assert_eq!(declared.len(), 9);
+    }
+
+    #[test]
+    fn fifteen_vcpu_fleet_advertises_millicores_as_minimum() {
+        let fleet = FleetProperties::new(
+            &FleetName::try_new("fleet-a").expect("valid fleet name"),
+            Isa::X86_64,
+            &"docker",
+            Resources {
+                vcpus: 15,
+                memory: Bytes::gib(8),
+                disk: Bytes::gib(100),
+            },
+            [],
+        );
+        assert_eq!(
+            fleet
+                .worker_properties()
+                .find(|(key, _)| *key == property::CPU_MILLICORES),
+            Some((property::CPU_MILLICORES, "15000"))
+        );
+        let fleets = FleetCatalog::try_new(vec![fleet]).expect("valid catalog");
+        assert_eq!(
+            supported_platform_properties(&fleets).get(property::CPU_MILLICORES),
+            Some(&json!("minimum"))
+        );
     }
 
     #[test]
@@ -1070,6 +1107,7 @@ mod tests {
             .expect("memory_escalation");
         assert_eq!(escalation.percent, 200);
         assert_eq!(escalation.max_steps, 8);
+        assert_eq!(escalation.cpu_property, property::CPU_MILLICORES);
     }
 
     #[test]
@@ -1184,7 +1222,7 @@ mod tests {
             .cold_start
             .as_ref()
             .expect("cold_start");
-        assert_eq!(cold.cpu_count, 1);
+        assert_eq!(cold.cpu_count, 1_000);
         assert_eq!(cold.memory_kb, 4_194_304);
         assert_eq!(cold.disk_kb, 4_194_304);
     }
@@ -1203,7 +1241,7 @@ mod tests {
             .cold_start
             .as_ref()
             .expect("cold_start");
-        assert_eq!(cold.cpu_count, 4);
+        assert_eq!(cold.cpu_count, 4_000);
         assert_eq!(cold.memory_kb, 2_097_152);
         assert_eq!(cold.disk_kb, 8_388_608);
     }

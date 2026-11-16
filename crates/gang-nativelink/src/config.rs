@@ -84,6 +84,7 @@ pub struct NativeLinkConfig {
     #[serde(default)]
     pub disk: DiskTuning,
     /// The reservation of an action whose kind nothing has measured yet, and whether it applies.
+    /// `cpu_count` is in cores; learned and cold-start scheduler CPU reservations use millicores.
     #[serde(default)]
     pub cold_start: ColdStartTuning,
     /// HTTP/2 settings of every connection the controller is handed: message sizes, stream

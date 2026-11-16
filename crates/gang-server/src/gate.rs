@@ -15,7 +15,7 @@ use http::request::Parts;
 use http::{Extensions, Method};
 
 use crate::client_address::{ClientAddress, TrustedProxies};
-use crate::composite::{is_ui_path, under};
+use crate::composite::{ROOT_PATH, is_ui_path, under};
 use crate::cookies::cookie_value;
 use crate::core::Core;
 use crate::deployment::Stack;
@@ -205,10 +205,10 @@ fn refuse(parts: &mut Parts, open: bool, error: PortError) -> Result<(), PortErr
     }
 }
 
-/// Whether `path` is under the paths the services behind the gate decide for: `/v1` and `/ui`
+/// Whether `path` is one the services behind the gate decide for: the root `/`, and `/v1` and `/ui`
 /// themselves and anything below them.
 pub(crate) fn is_open_path(path: &str) -> bool {
-    under(path, "/v1") || is_ui_path(path)
+    path == ROOT_PATH || under(path, "/v1") || is_ui_path(path)
 }
 
 #[cfg(test)]
@@ -216,7 +216,7 @@ mod tests {
     use super::is_open_path;
 
     #[test]
-    fn open_paths_are_v1_and_ui_and_below() {
+    fn open_paths_are_the_root_and_v1_and_ui_and_below() {
         assert!(is_open_path("/v1"));
         assert!(is_open_path("/v1/x"));
         assert!(is_open_path("/ui"));
@@ -225,7 +225,8 @@ mod tests {
         assert!(!is_open_path("/v10"));
         assert!(!is_open_path("/v1x"));
         assert!(!is_open_path("/uix"));
-        assert!(!is_open_path("/"));
+        assert!(is_open_path("/"));
+        assert!(!is_open_path("//"));
         assert!(!is_open_path(
             "/google.devtools.remoteexecution.v2.Execution/Execute"
         ));

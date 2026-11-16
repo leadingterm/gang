@@ -38,6 +38,10 @@ pub struct ControlKnobs {
     /// `[dashboard] detail_interval`: how often the state's sample of the scheduler's actions is
     /// refreshed.
     pub detail_interval: Option<Duration>,
+    /// The client action abandonment timeout.
+    pub client_action_timeout: Option<Duration>,
+    /// Use a nonexistent local worker launcher.
+    pub broken_launcher: bool,
 }
 
 impl ControlKnobs {
@@ -50,6 +54,8 @@ impl ControlKnobs {
         max_instances: None,
         terminate_grace: None,
         detail_interval: None,
+        client_action_timeout: None,
+        broken_launcher: false,
     };
 
     /// The orphan scenario: one standing instance and no more, a pass every second, a ten-second
@@ -83,9 +89,25 @@ impl ControlKnobs {
         ..Self::NONE
     };
 
+    /// A failed local launch and a short client abandonment timeout.
+    pub const LAUNCH_FAILURE: Self = Self {
+        poll_interval: Some(Duration::from_secs(1)),
+        idle_timeout: Some(Duration::from_secs(5)),
+        min_instances: Some(0),
+        max_instances: Some(1),
+        client_action_timeout: Some(Duration::from_secs(15)),
+        broken_launcher: true,
+        ..Self::NONE
+    };
+
     /// Every preset a control scenario runs under, in suite order: the one list the suite's
     /// presets and the configuration parse tests draw from.
-    pub const PRESETS: [Self; 3] = [Self::ORPHAN, Self::DRAIN_CANCEL, Self::SKIPPED_PASS];
+    pub const PRESETS: [Self; 4] = [
+        Self::ORPHAN,
+        Self::DRAIN_CANCEL,
+        Self::SKIPPED_PASS,
+        Self::LAUNCH_FAILURE,
+    ];
 }
 
 /// Faults a control scenario injects into a [`System`].

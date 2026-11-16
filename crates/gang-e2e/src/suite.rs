@@ -19,7 +19,7 @@ use crate::checked_in::{ShippedConfigs, checked_in_configs};
 use crate::cli::cli;
 use crate::cli_terminal::LocalTerminal;
 use crate::control::ControlKnobs;
-use crate::dashboard::dashboard;
+use crate::dashboard::{dashboard, running_metadata};
 use crate::disk::disk;
 use crate::drain_cancel::drain_cancel;
 use crate::errors::Result;
@@ -30,6 +30,7 @@ use crate::glibc_toolchain::glibc_toolchain;
 use crate::input_root::input_root;
 use crate::integrity::input_integrity;
 use crate::issuer::TestIssuer;
+use crate::launch_failure::launch_failure;
 use crate::lifecycle::lifecycle;
 use crate::limits::limits;
 use crate::memory::memory;
@@ -48,6 +49,7 @@ use crate::server_scenarios::{
     api, certificate_rotation, event_paging, request_limits, viewer_cap,
 };
 use crate::settings::{ActionTools, Settings};
+use crate::setup::setup;
 use crate::skipped_pass::skipped_pass;
 use crate::stack::Stack;
 use crate::stale_scope::stale_scope;
@@ -205,11 +207,15 @@ gang_types::string_enum! {
         CheckedInConfigs = "checked-in-configs",
         /// A deployment without TLS serves builds over the plaintext transport.
         Plaintext = "plaintext",
+        /// TLS and authenticated `gang setup` resolves a home rc conflict and builds remotely.
+        Setup = "setup",
         /// A revoked certificate's connection is closed and new ones are refused. Gate two only.
         Revocation = "revocation",
         /// A session cookie opens the live state stream, requests without one are refused, and
         /// revoking the principal closes the open stream. Gate two only.
         Dashboard = "dashboard",
+        /// A failed worker launch is reported, then withdrawn when its demand is abandoned.
+        LaunchFailure = "launch_failure",
         /// The API contracts of one deployment: authentication challenges, unknown routes,
         /// paging, the error envelope, dashboard assets, cookie-only writes, cross-origin logout,
         /// and a graceful shutdown. Gate two only.
@@ -264,9 +270,11 @@ impl Scenario {
             | Self::SkippedPass
             | Self::Cli
             | Self::CheckedInConfigs
-            | Self::Plaintext => Gate::One,
+            | Self::Plaintext
+            | Self::Setup => Gate::One,
             Self::Revocation
             | Self::Dashboard
+            | Self::LaunchFailure
             | Self::Api
             | Self::RequestLimits
             | Self::ViewerCap
@@ -395,19 +403,19 @@ impl Scenario {
             Self::CheckedInConfigs => attempt(self, || {
                 checked_in_configs(&ShippedConfigs::new(ctx.invocation))
             }),
-            Self::Plaintext => attempt(self, || {
-                let stack =
-                    Stack::create(ctx.invocation, &ctx.baseline, Transport::Plain, ctx.issuer)?;
-                plaintext(&stack)
+            Self::Plaintext => plaintext_checks(self, ctx, |stack| plaintext(stack)),
+            Self::Setup => attempt(self, || {
+                let secured = Secured::create(ctx.invocation, &ctx.baseline, ctx.issuer)?;
+                setup(&secured)
             }),
             Self::Revocation => attempt(self, || {
                 let secured = Secured::create(ctx.invocation, &ctx.baseline, ctx.issuer)?;
                 revocation(&secured)
             }),
-            Self::Dashboard => attempt(self, || {
-                let secured = Secured::create(ctx.invocation, &ctx.baseline, ctx.issuer)?;
-                dashboard(&secured, ctx.invocation.settings.history_timeout)
-            }),
+            Self::Dashboard => dashboard_checks(ctx),
+            Self::LaunchFailure => {
+                control_checks(self, ctx, ControlKnobs::LAUNCH_FAILURE, launch_failure)
+            }
             Self::Api => attempt(self, || {
                 api(
                     &server_deployment(ctx, ServerKnobs::NONE, IdentityKnobs::NONE)?,
@@ -445,6 +453,40 @@ impl Scenario {
             Self::Sessions => sessions_checks(ctx),
         }
     }
+}
+
+/// The verdicts of the dashboard scenario on fresh deployments.
+fn dashboard_checks(ctx: &RunContext<'_>) -> Vec<Check> {
+    attempt(Scenario::Dashboard, || {
+        let variant = Variant {
+            control: ControlKnobs {
+                detail_interval: Some(std::time::Duration::from_secs(1)),
+                ..ControlKnobs::NONE
+            },
+            ..ctx.baseline
+        };
+        let stack = Stack::create(ctx.invocation, &variant, Transport::Tls, ctx.issuer)?;
+        let metadata = running_metadata(&stack, ctx.invocation.settings.history_timeout)?;
+        let secured = Secured::create(ctx.invocation, &ctx.baseline, ctx.issuer)?;
+        let mut checks = vec![metadata];
+        checks.extend(dashboard(
+            &secured,
+            ctx.invocation.settings.history_timeout,
+        )?);
+        Ok(checks)
+    })
+}
+
+/// The verdicts of `scenario` run by `checks` on a fresh plaintext deployment.
+fn plaintext_checks(
+    scenario: Scenario,
+    ctx: &RunContext<'_>,
+    checks: impl FnOnce(&Stack<'_>) -> Result<Vec<Check>>,
+) -> Vec<Check> {
+    attempt(scenario, || {
+        let stack = Stack::create(ctx.invocation, &ctx.baseline, Transport::Plain, ctx.issuer)?;
+        checks(&stack)
+    })
 }
 
 /// The verdicts of the browser sessions scenario on a short-lived deployment.
@@ -883,6 +925,24 @@ mod tests {
     }
 
     #[test]
+    fn launch_failure_is_selectable_only_from_gate_two() {
+        assert_eq!(
+            "launch_failure".parse::<Scenario>().ok(),
+            Some(Scenario::LaunchFailure)
+        );
+        assert!(
+            !Gate::One
+                .scenarios()
+                .any(|scenario| scenario == Scenario::LaunchFailure)
+        );
+        assert!(
+            Gate::Two
+                .scenarios()
+                .any(|scenario| scenario == Scenario::LaunchFailure)
+        );
+    }
+
+    #[test]
     fn unknown_scenario_names_are_rejected() {
         assert!("input_integrity".parse::<Scenario>().is_err());
         assert!("Lifecycle".parse::<Scenario>().is_err());
@@ -920,6 +980,7 @@ mod tests {
         let gate_two_only = [
             Scenario::Revocation,
             Scenario::Dashboard,
+            Scenario::LaunchFailure,
             Scenario::Api,
             Scenario::RequestLimits,
             Scenario::ViewerCap,
@@ -1092,6 +1153,13 @@ mod tests {
     #[test]
     fn disk_scenario_is_selectable_in_gate_one() {
         assert!(unknown_scenarios(Gate::One, &[Scenario::Disk]).is_empty());
+    }
+
+    #[test]
+    fn setup_scenario_is_in_gate_one() {
+        assert_eq!(Scenario::Setup.gate(), Gate::One);
+        assert!(unknown_scenarios(Gate::One, &[Scenario::Setup]).is_empty());
+        assert_eq!("setup".parse::<Scenario>().ok(), Some(Scenario::Setup));
     }
 
     #[test]

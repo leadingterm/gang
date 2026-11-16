@@ -310,7 +310,11 @@ impl Drop for Supervised {
 
 /// Waits without reaping in a helper thread, keeping the child owned here until it is safe to
 /// either reap it or kill it. `waitid` with `NOWAIT` is available on both Linux and macOS.
-fn wait_within(child: &mut Child, timeout: Duration, condition: &str) -> Result<ExitStatus> {
+pub(crate) fn wait_within(
+    child: &mut Child,
+    timeout: Duration,
+    condition: &str,
+) -> Result<ExitStatus> {
     let id = child.id();
     let Some(pid) = i32::try_from(id).ok().and_then(Pid::from_raw) else {
         let _ = child.kill();
@@ -393,6 +397,21 @@ pub struct ProcessEntry {
     pub pid: u32,
     /// The command line, program first.
     pub args: Vec<String>,
+}
+
+/// Returns the exact command-line arguments of `pid`, or `None` if it no longer exists.
+#[must_use]
+pub fn arguments(pid: u32) -> Option<Vec<OsString>> {
+    let mut system = System::new();
+    let pid = sysinfo::Pid::from_u32(pid);
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing()
+            .without_tasks()
+            .with_cmd(UpdateKind::Always),
+    );
+    system.process(pid).map(|process| process.cmd().to_vec())
 }
 
 /// The current process table, including the available command-line arguments.

@@ -140,6 +140,8 @@ fn builder_config(
 ) -> BuilderConfig {
     BuilderConfig {
         events_limit: config.recent_events.get(),
+        history_window: config.history_window.get(),
+        history_step: config.history_step.get(),
         stale_after: config.actions_stale_after(),
         interval: poll_interval,
         provisioner: provisioner.to_owned(),

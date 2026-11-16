@@ -263,14 +263,18 @@ fn every_provisioner_port_reaches_the_selected_plugin() -> Result<(), Box<dyn Er
         "supply must overwrite its buffer"
     );
 
+    ready(provisioner.set_desired_capacity(fleet.view(), 4))?;
+    ready(provisioner.supply(fleet.view(), &mut supply))?;
+    assert_eq!(supply.desired, 4);
     ready(provisioner.set_desired_capacity(fleet.view(), 2))?;
-    assert!(matches!(
-        ready(provisioner.set_desired_capacity(fleet.view(), 9)),
-        Err(PortError::Rejected {
-            reason: Rejection::PolicyDenied,
-            ..
-        })
-    ));
+    ready(provisioner.supply(fleet.view(), &mut supply))?;
+    assert_eq!(supply.desired, 2);
+    ready(provisioner.set_desired_capacity(fleet.view(), 0))?;
+    ready(provisioner.supply(fleet.view(), &mut supply))?;
+    assert_eq!(
+        supply.desired, 1,
+        "the existing instance must not be removed"
+    );
     let gone = instance(1)?;
     assert!(matches!(
         ready(provisioner.terminate(fleet.view(), &gone)),

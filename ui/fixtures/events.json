@@ -19,7 +19,7 @@
     {
       "name": "events/999",
       "createTime": "2026-01-14T10:07:50.000Z",
-      "fleet": "fleets/arm64-spot",
+      "fleet": "fleets/build-worker-aarch64-spot",
       "cause": "ORPHAN",
       "terminated": {
         "instance": "instances/i-0e1000000000000b"
@@ -28,7 +28,7 @@
     {
       "name": "events/998",
       "createTime": "2026-01-14T09:09:30.000Z",
-      "fleet": "fleets/arm64-spot",
+      "fleet": "fleets/build-worker-aarch64-spot",
       "cause": "DEMAND",
       "scaledOut": {
         "from": 0,

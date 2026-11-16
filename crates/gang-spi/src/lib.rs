@@ -70,7 +70,8 @@ pub use limits_port::{
 pub use plugin::{Plugin, PluginContext, SandboxPrograms};
 pub use private::__private;
 pub use provisioner_port::{
-    FleetInstance, FleetSupply, InstanceExit, ProvisionerPort, ServerEndpoints, Sidecar,
+    FleetInstance, FleetSupply, InstanceExit, LaunchFailure, ProvisionerPort, ServerEndpoints,
+    Sidecar,
 };
 pub use repository_port::{
     CertStatus, IssuedCertRecord, PrincipalRecord, RecordedScalingEvent, ScalingAuditEvent,

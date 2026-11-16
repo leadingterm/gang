@@ -1,7 +1,7 @@
 //! The fleets a controller matches requests against, in preference order.
 
 use crate::fleet_properties::Rule;
-use crate::{FleetCountError, FleetProperties, FleetSet, MatchKind, property};
+use crate::{FleetCountError, FleetProperties, FleetSet, MatchKind, Refusal, property};
 
 /// Every fleet's properties, in preference order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10,6 +10,15 @@ pub struct FleetCatalog {
     declared: Vec<(&'static str, MatchKind)>,
     columns: Vec<Column>,
     all: FleetSet,
+}
+
+/// The fleet a request is fitted to and the minimum keys lowered to that fleet's limits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fit {
+    /// Index of the fitted fleet in preference order.
+    pub fleet: usize,
+    /// Minimum properties lowered to the fleet's limits, in declaration order.
+    pub lowered: Vec<(&'static str, u64)>,
 }
 
 /// One declared key with its values compiled into fleet masks.
@@ -26,6 +35,36 @@ enum ColumnRule {
     Exact(Box<[(Box<str>, FleetSet)]>),
     /// Each distinct fleet limit, ascending, with the fleets whose limit is at least it.
     Minimum(Box<[(u64, FleetSet)]>),
+}
+
+impl ColumnRule {
+    /// Returns the fleets accepting one requested value.
+    fn mask(&self, value: &str) -> FleetSet {
+        match self {
+            Self::Exact(values) => values
+                .binary_search_by(|(known, _)| (**known).cmp(value))
+                .ok()
+                .and_then(|index| values.get(index))
+                .map_or(FleetSet::EMPTY, |(_, mask)| *mask),
+            Self::Minimum(limits) => value
+                .parse::<u64>()
+                .ok()
+                .and_then(|requested| {
+                    limits.get(limits.partition_point(|(limit, _)| *limit < requested))
+                })
+                .map_or(FleetSet::EMPTY, |(_, mask)| *mask),
+        }
+    }
+}
+
+/// Returns a fleet's limit when it lowers the requested minimum.
+fn lowered_limit(limits: &[(u64, FleetSet)], fleet: usize, requested: Option<u64>) -> Option<u64> {
+    let limit = limits
+        .iter()
+        .rev()
+        .find(|(_, mask)| mask.contains(fleet))?
+        .0;
+    requested.is_none_or(|value| value > limit).then_some(limit)
 }
 
 /// Adds a fleet index to the mask for a value.
@@ -161,23 +200,109 @@ impl FleetCatalog {
             let Some(value) = request(column.key) else {
                 continue;
             };
-            let mask = match &column.rule {
-                ColumnRule::Exact(values) => values
-                    .binary_search_by(|(known, _)| (**known).cmp(value))
-                    .ok()
-                    .and_then(|index| values.get(index))
-                    .map_or(FleetSet::EMPTY, |(_, mask)| *mask),
-                ColumnRule::Minimum(limits) => value
-                    .parse::<u64>()
-                    .ok()
-                    .and_then(|requested| {
-                        limits.get(limits.partition_point(|(limit, _)| *limit < requested))
-                    })
-                    .map_or(FleetSet::EMPTY, |(_, mask)| *mask),
-            };
-            accepting &= mask;
+            accepting &= column.rule.mask(value);
         }
         accepting
+    }
+
+    /// Explains why no fleet accepts the request, or returns `None` when one does.
+    ///
+    /// The first individually unsatisfied property in declaration order is reported;
+    /// if every property is individually satisfied, the refusal is a combination.
+    pub fn refusal<'r>(&self, request: impl Fn(&str) -> Option<&'r str>) -> Option<Refusal> {
+        let mut accepting = self.all;
+        let mut refusal = None;
+        for column in &self.columns {
+            let Some(value) = request(column.key) else {
+                continue;
+            };
+            let mask = column.rule.mask(value);
+            accepting &= mask;
+            if mask.is_empty() && refusal.is_none() {
+                refusal = Some(match &column.rule {
+                    ColumnRule::Minimum(limits) => {
+                        if value.parse::<u64>().is_ok() {
+                            Refusal::Minimum {
+                                key: column.key,
+                                requested: value.to_owned(),
+                                largest: limits.last().map_or(0, |(limit, _)| *limit),
+                            }
+                        } else {
+                            Refusal::InvalidMinimum {
+                                key: column.key,
+                                requested: value.to_owned(),
+                            }
+                        }
+                    }
+                    ColumnRule::Exact(values) => Refusal::Exact {
+                        key: column.key,
+                        requested: value.to_owned(),
+                        offered: values.iter().map(|(value, _)| value.to_string()).collect(),
+                    },
+                });
+            }
+        }
+        if accepting.is_empty() {
+            Some(refusal.unwrap_or(Refusal::Combination))
+        } else {
+            None
+        }
+    }
+
+    /// Fits minimum requests to an admitted fleet, preserving all exact matches.
+    ///
+    /// An accepting fleet wins in preference order. Otherwise the fleet lowering the fewest
+    /// minimum keys wins, then the one with the smallest sum of relative shortfalls, then
+    /// preference order. Each term is rounded down to units of 2^-64, distinguishing different
+    /// limits on one key; equal rounded sums go to preference order. A non-numeric lowered value
+    /// contributes one.
+    pub fn fit<'r>(
+        &self,
+        admitted: FleetSet,
+        request: impl Fn(&str) -> Option<&'r str>,
+    ) -> Option<Fit> {
+        let mut considered = admitted & self.all;
+        for column in &self.columns {
+            if matches!(&column.rule, ColumnRule::Exact(_))
+                && let Some(value) = request(column.key)
+            {
+                considered &= column.rule.mask(value);
+            }
+        }
+        let mut scores = [(0_u32, 0_u128); crate::MAX_FLEETS];
+        for column in &self.columns {
+            let ColumnRule::Minimum(limits) = &column.rule else {
+                continue;
+            };
+            let Some(value) = request(column.key) else {
+                continue;
+            };
+            let requested = value.parse::<u64>().ok();
+            for fleet in considered {
+                if let Some(limit) = lowered_limit(limits, fleet, requested) {
+                    let term = requested.map_or(1_u128 << 64, |value| {
+                        (u128::from(value - limit) << 64) / u128::from(value)
+                    });
+                    let score = &mut scores[fleet];
+                    score.0 = score.0.saturating_add(1);
+                    score.1 = score.1.saturating_add(term);
+                }
+            }
+        }
+        // `min_by_key` keeps the first equal minimum, preserving fleet preference.
+        let fleet = considered.iter().min_by_key(|&fleet| scores[fleet])?;
+        let lowered = self
+            .columns
+            .iter()
+            .filter_map(|column| {
+                let ColumnRule::Minimum(limits) = &column.rule else {
+                    return None;
+                };
+                let requested = request(column.key)?.parse::<u64>().ok();
+                lowered_limit(limits, fleet, requested).map(|limit| (column.key, limit))
+            })
+            .collect();
+        Some(Fit { fleet, lowered })
     }
 }
 
@@ -393,6 +518,7 @@ mod tests {
                 ("ISA", MatchKind::Exact),
                 ("sandbox", MatchKind::Exact),
                 ("cpu_count", MatchKind::Minimum),
+                ("cpu_millicores", MatchKind::Minimum),
                 ("memory_kb", MatchKind::Minimum),
                 ("disk_kb", MatchKind::Minimum),
                 ("capacity", MatchKind::Exact),
@@ -423,6 +549,7 @@ mod tests {
                 "ISA",
                 "sandbox",
                 "cpu_count",
+                "cpu_millicores",
                 "memory_kb",
                 "disk_kb",
                 "capacity",
@@ -545,6 +672,284 @@ mod tests {
             set(&[])
         );
         assert_eq!(catalog.accepting(request(&[("cpu_count", "5")])), set(&[]));
+    }
+
+    #[test]
+    fn refusal_explains_minimum_values() {
+        let catalog = catalog();
+        assert_eq!(catalog.refusal(request(&[("cpu_count", "8")])), None);
+        let refusal = catalog.refusal(request(&[("cpu_count", "9")])).unwrap();
+        assert_eq!(
+            refusal,
+            Refusal::Minimum {
+                key: "cpu_count",
+                requested: "9".into(),
+                largest: 8,
+            }
+        );
+        assert_eq!(
+            refusal.to_string(),
+            "cpu_count 9 is above the largest fleet's 8"
+        );
+    }
+
+    #[test]
+    fn refusal_names_a_minimum_that_is_not_a_number() {
+        let refusal = catalog()
+            .refusal(request(&[("memory_kb", "4GiB")]))
+            .unwrap();
+        assert_eq!(
+            refusal,
+            Refusal::InvalidMinimum {
+                key: "memory_kb",
+                requested: "4GiB".into(),
+            }
+        );
+        assert_eq!(
+            refusal.to_string(),
+            "memory_kb 4GiB is not a non-negative integer"
+        );
+    }
+
+    #[test]
+    fn refusal_uses_first_individually_unsatisfied_column() {
+        assert_eq!(
+            catalog().refusal(request(&[("capacity", "reserved"), ("cpu_count", "20")])),
+            Some(Refusal::Minimum {
+                key: "cpu_count",
+                requested: "20".into(),
+                largest: 8,
+            })
+        );
+    }
+
+    #[test]
+    fn refusal_explains_exact_values_and_combinations() {
+        let catalog = catalog();
+        let refusal = catalog
+            .refusal(request(&[("capacity", "reserved")]))
+            .unwrap();
+        assert_eq!(
+            refusal,
+            Refusal::Exact {
+                key: "capacity",
+                requested: "reserved".into(),
+                offered: vec!["on-demand".into(), "spot".into()],
+            }
+        );
+        assert_eq!(
+            refusal.to_string(),
+            "capacity reserved matches no fleet (fleets offer on-demand, spot)"
+        );
+        let combination = catalog
+            .refusal(request(&[("ISA", "aarch64"), ("capacity", "spot")]))
+            .unwrap();
+        assert_eq!(combination, Refusal::Combination);
+        assert_eq!(
+            combination.to_string(),
+            "no single fleet accepts every requested property"
+        );
+    }
+
+    #[test]
+    fn refusal_explains_empty_exact_column() {
+        let mut catalog = catalog();
+        catalog.columns.push(Column {
+            key: "empty",
+            rule: ColumnRule::Exact(Box::new([])),
+        });
+        let refusal = catalog.refusal(request(&[("empty", "value")])).unwrap();
+        assert_eq!(
+            refusal,
+            Refusal::Exact {
+                key: "empty",
+                requested: "value".into(),
+                offered: vec![]
+            }
+        );
+        assert_eq!(
+            refusal.to_string(),
+            "empty value matches no fleet (no fleet declares empty)"
+        );
+    }
+
+    #[test]
+    fn fit_selects_first_accepting_admitted_fleet() {
+        assert_eq!(
+            catalog().fit(set(&[1, 2]), request(&[("cpu_count", "4")])),
+            Some(Fit {
+                fleet: 1,
+                lowered: vec![]
+            })
+        );
+        assert_eq!(
+            catalog().fit(set(&[0, 1]), request(&[("capacity", "reserved")])),
+            None
+        );
+    }
+
+    #[test]
+    fn fit_lowers_to_admitted_limit_and_breaks_ties_by_preference() {
+        let catalog = catalog();
+        assert_eq!(
+            catalog.fit(set(&[0, 1, 2]), request(&[("cpu_count", "20")])),
+            Some(Fit {
+                fleet: 0,
+                lowered: vec![("cpu_count", 8)]
+            })
+        );
+        assert_eq!(
+            catalog.fit(set(&[2]), request(&[("cpu_count", "20")])),
+            Some(Fit {
+                fleet: 2,
+                lowered: vec![("cpu_count", 4)]
+            })
+        );
+        assert_eq!(
+            catalog.fit(set(&[2]), request(&[("cpu_count", "many")])),
+            Some(Fit {
+                fleet: 2,
+                lowered: vec![("cpu_count", 4)]
+            })
+        );
+    }
+
+    #[test]
+    fn fit_prefers_fewest_lowered_keys() {
+        let catalog = FleetCatalog::try_new(vec![
+            fleet("small", Isa::X86_64, 4, 8, 100, &[]),
+            fleet("large", Isa::X86_64, 8, 16, 100, &[]),
+        ])
+        .unwrap();
+        assert_eq!(
+            catalog.fit(
+                set(&[0, 1]),
+                request(&[("cpu_count", "20"), ("memory_kb", "10000000")])
+            ),
+            Some(Fit {
+                fleet: 1,
+                lowered: vec![("cpu_count", 8)]
+            })
+        );
+    }
+
+    #[test]
+    fn fit_clamps_an_oversized_memory_reservation_to_the_largest_fleet() {
+        let catalog = FleetCatalog::try_new(vec![
+            fleet("small", Isa::X86_64, 4, 8, 100, &[]),
+            fleet("large", Isa::X86_64, 16, 32, 100, &[]),
+        ])
+        .unwrap();
+        assert_eq!(
+            catalog.fit(set(&[0, 1]), request(&[("memory_kb", "35232154")])),
+            Some(Fit {
+                fleet: 1,
+                lowered: vec![("memory_kb", 33554432)],
+            })
+        );
+    }
+
+    #[test]
+    fn fit_clamps_oversized_cpu_millicores_to_the_largest_fleet() {
+        let catalog = FleetCatalog::try_new(vec![
+            fleet("small", Isa::X86_64, 4, 8, 100, &[]),
+            fleet("large", Isa::X86_64, 16, 32, 100, &[]),
+        ])
+        .unwrap();
+        assert_eq!(
+            catalog.fit(set(&[0, 1]), request(&[("cpu_millicores", "19200")])),
+            Some(Fit {
+                fleet: 1,
+                lowered: vec![("cpu_millicores", 16000)],
+            })
+        );
+    }
+
+    #[test]
+    fn fit_prefers_the_larger_fleet_for_an_outlier_request() {
+        let catalog = FleetCatalog::try_new(vec![
+            fleet("small", Isa::X86_64, 4, 8, 100, &[]),
+            fleet("large", Isa::X86_64, 8, 8, 100, &[]),
+        ])
+        .unwrap();
+        assert_eq!(
+            catalog.fit(set(&[0, 1]), request(&[("cpu_millicores", "8710000")])),
+            Some(Fit {
+                fleet: 1,
+                lowered: vec![("cpu_millicores", 8000)],
+            }),
+            "the larger fleet has the smaller relative shortfall"
+        );
+    }
+
+    #[test]
+    fn fit_prefers_the_smaller_shortfall_sum_across_keys() {
+        let catalog = FleetCatalog::try_new(vec![
+            fleet("cpu", Isa::X86_64, 8, 8, 100, &[]),
+            fleet("memory", Isa::X86_64, 4, 16, 100, &[]),
+        ])
+        .unwrap();
+        // Both per-mille sums are 999 + 999. The memory fleet gains
+        // 8_388_608 / 100_000_000_000, exceeding the CPU fleet's advantage
+        // of 4 / 8_710_000, so its shortfall sum is smaller at Q64.64 precision.
+        assert_eq!(
+            catalog.fit(
+                set(&[0, 1]),
+                request(&[("cpu_count", "8710000"), ("memory_kb", "100000000000")]),
+            ),
+            Some(Fit {
+                fleet: 1,
+                lowered: vec![("cpu_count", 4), ("memory_kb", 16777216)],
+            }),
+            "the sum of relative shortfalls favors the memory fleet"
+        );
+    }
+
+    #[test]
+    fn fit_treats_shortfall_sums_within_2_pow_minus_64_as_a_tie() {
+        let mut catalog = FleetCatalog::try_new(vec![
+            fleet("first", Isa::X86_64, 4, 8, 100, &[]),
+            fleet("second", Isa::X86_64, 4, 8, 100, &[]),
+        ])
+        .unwrap();
+        catalog.columns.extend([
+            Column {
+                key: "first_minimum",
+                rule: ColumnRule::Minimum(vec![(1, set(&[0, 1])), (2, set(&[0]))].into()),
+            },
+            Column {
+                key: "second_minimum",
+                rule: ColumnRule::Minimum(vec![(1, set(&[0, 1])), (2, set(&[1]))].into()),
+            },
+        ]);
+        assert_eq!(
+            catalog.fit(
+                set(&[0, 1]),
+                request(&[
+                    ("first_minimum", "18446744073709551615"),
+                    ("second_minimum", "18446744073709551614"),
+                ]),
+            ),
+            Some(Fit {
+                fleet: 0,
+                lowered: vec![("first_minimum", 2), ("second_minimum", 1)],
+            }),
+            "equal Q64.64 sums select the first fleet even when its exact sum is larger"
+        );
+    }
+
+    #[test]
+    fn fit_lists_all_lowered_keys_in_declaration_order() {
+        assert_eq!(
+            catalog().fit(
+                set(&[2]),
+                request(&[("memory_kb", "99999999"), ("cpu_count", "20")]),
+            ),
+            Some(Fit {
+                fleet: 2,
+                lowered: vec![("cpu_count", 4), ("memory_kb", 8388608)],
+            })
+        );
     }
 
     #[test]

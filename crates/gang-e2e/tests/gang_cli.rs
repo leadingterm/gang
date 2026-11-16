@@ -135,7 +135,7 @@ fn bazelrc_argv_is_what_gang_parses() -> TestResult {
         GangCommand::Bazelrc(args) => {
             assert_eq!(args.server, server);
             assert_eq!(args.ca_pin, Some(ca_pin));
-            assert_eq!(args.helper, "gang");
+            assert_eq!(args.helper.as_deref(), Some("gang"));
         }
         other => panic!("expected `gang bazelrc`, got {other:?}"),
     }

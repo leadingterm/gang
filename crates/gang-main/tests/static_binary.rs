@@ -3,14 +3,16 @@
 //! when run as a black box.
 #![cfg(target_os = "linux")]
 
+mod black_box;
 mod support;
 
 use std::error::Error;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Output, Stdio};
+use std::process::{Command, ExitStatus};
 use std::time::Duration;
 
+use black_box::{gang_command_for, output_within, serve_server_info};
 use object::read::elf::{Dyn, ElfFile64, ProgramHeader};
 use object::{Endianness, elf};
 use support::{required_path, wait_within};
@@ -20,14 +22,8 @@ type TestResult = Result<(), Box<dyn Error>>;
 /// Deadline for every child process this file spawns.
 const CHILD_LIMIT: Duration = Duration::from_mins(1);
 
-/// Runs `command` to completion within `limit`, capturing stdout and stderr.
-fn output_within(command: &mut Command, limit: Duration) -> Result<Output, Box<dyn Error>> {
-    let child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    wait_within(child, limit, true)
-}
+/// Server information returned to the Bazel rc command.
+const SERVER_INFO: &str = r#"{"name":"server","remoteExecutor":"grpc://127.0.0.1:8980","remoteCache":"grpc://127.0.0.1:8980","defaultIsa":"x86-64","authentication":{"token":{"login":{"google":{"issuer_url":"https://accounts.example.com","audience":"gang","principal_claim":"email","login":{"scopes":["openid","email"]}}}}}}"#;
 
 /// Runs `command` to completion within `limit` and returns its exit status.
 fn status_within(command: &mut Command, limit: Duration) -> Result<ExitStatus, Box<dyn Error>> {
@@ -38,13 +34,10 @@ fn status_within(command: &mut Command, limit: Duration) -> Result<ExitStatus, B
 /// A `gang` command with an empty environment and `HOME` and
 /// `XDG_CONFIG_HOME` both set to `home`.
 fn gang_command(home: &Path) -> Result<Command, Box<dyn Error>> {
-    let mut command = Command::new(required_path("GANG_BIN")?);
-    command
-        .env_clear()
-        .env("HOME", home)
-        .env("XDG_CONFIG_HOME", home)
-        .stdin(Stdio::null());
-    Ok(command)
+    Ok(gang_command_for(
+        required_path("GANG_BIN")?.as_os_str(),
+        home,
+    ))
 }
 
 /// Reads the checked-in config whose file name is `name`.
@@ -202,6 +195,49 @@ fn short_version_is_the_cargo_workspace_version() -> TestResult {
         String::from_utf8(output.stdout)?.trim(),
         format!("gang {version}")
     );
+    Ok(())
+}
+
+/// Bazel looks a bare helper name up on its own PATH, so the helper must name the gang that ran
+/// by its absolute path as invoked, with links unresolved.
+#[test]
+fn bazelrc_names_the_invoked_gang_by_absolute_path() -> TestResult {
+    let gang = required_path("GANG_BIN")?;
+    let parent = gang
+        .parent()
+        .ok_or_else(|| std::io::Error::other("gang binary has no parent directory"))?;
+    for bare in [false, true] {
+        let home = tempfile::tempdir()?;
+        let server = serve_server_info(SERVER_INFO)?;
+        let mut command = if bare {
+            let mut command = gang_command_for(OsStr::new("gang"), home.path());
+            command.env("PATH", parent);
+            command
+        } else {
+            gang_command(home.path())?
+        };
+        let out = output_within(
+            command
+                .current_dir(home.path())
+                .args(["bazelrc", "--server", &server.url()]),
+            CHILD_LIMIT,
+        )?;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "stderr: {stderr}");
+        let expected = if bare {
+            parent.join("gang")
+        } else {
+            gang.clone()
+        };
+        let stdout = String::from_utf8(out.stdout)?;
+        let expected_line = format!("build --credential_helper=127.0.0.1={}", expected.display());
+        assert!(
+            stdout.contains(&format!(
+                "# The gang that Bazel runs for credentials; run `gang bazelrc` again if it moves.\n{expected_line}\n"
+            )),
+            "stdout: {stdout}"
+        );
+    }
     Ok(())
 }
 

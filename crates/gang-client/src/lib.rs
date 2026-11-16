@@ -17,6 +17,7 @@ mod bazel_options;
 mod bazelrc;
 mod browser;
 mod client;
+mod conflicts;
 mod console;
 mod credential_helper;
 mod doctor;
@@ -29,18 +30,25 @@ mod loopback;
 mod options;
 mod proof_source;
 mod providers;
+mod rc_file;
 mod server_probe;
 mod session;
+mod setup;
 mod stored;
 #[cfg(test)]
 mod test_support;
 
 pub use api::ServerApi;
 pub use bazel_options::{BazelCommand, BazelProbe, EffectiveOptions, OptionSource, Setting};
-pub use bazelrc::CA_FILE_NAME;
+pub use bazelrc::render as render_bazelrc;
+pub use bazelrc::{BazelrcWriter, CA_FILE_NAME, display_url};
 pub use browser::LocalBrowser;
 pub use client::{
-    Bazelrc, BazelrcRequest, BearerToken, Client, InteractiveLogin, LoggedIn, WorkloadLogin,
+    Bazelrc, BazelrcRequest, BearerToken, Client, InteractiveLogin, LoggedIn, SessionState,
+    WorkloadLogin,
+};
+pub use conflicts::{
+    Conflict, ConflictReason, NOT_GANG_CONFIG, RcEdit, Writable, find_conflicts, rc_edits, writable,
 };
 pub use console::Console;
 pub use credential_helper::CredentialRequest;
@@ -52,6 +60,9 @@ pub use options::{ClientOptions, DEFAULT_BROWSER_COMMAND};
 pub use proof_source::ProofSource;
 pub use providers::LoginProviders;
 pub use server_probe::{
-    ClientProbe, CredentialFault, ServerFault, ServerProbe, ServerReading, StoredLogin,
-    stored_login,
+    ClientProbe, CredentialFault, ServerFault, ServerProbe, ServerReading, StoredLogin, pin_for,
+    same_server, stored_login,
+};
+pub use setup::{
+    Change, GANG_CA, GANG_DIR, GANG_RC, backup_path, gang_files, import_change, workspace_root,
 };

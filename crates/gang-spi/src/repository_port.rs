@@ -239,6 +239,22 @@ pub enum ScalingEventKind {
         /// Capacity requested.
         to: u32,
     },
+    /// The newest launch attempt failed with no launch in flight.
+    LaunchFailed {
+        /// Instances that exist and are not terminating.
+        from: u32,
+        /// Instances asked for.
+        to: u32,
+        /// The provider's message.
+        reason: String,
+    },
+    /// The request was lowered without removing instances.
+    Withdrawn {
+        /// The request before withdrawal.
+        from: u32,
+        /// The request after withdrawal.
+        to: u32,
+    },
     /// A worker was told to stop taking actions.
     DrainStarted {
         /// The drained worker.

@@ -1,5 +1,6 @@
 // The keyed state store: a snapshot replaced by deltas. Pure functions over immutable frames, so a
 // delta changes only the rows it names and every untouched row keeps its identity.
+import { applyRecent } from "./recent.ts";
 import { ms, seconds, type UnixMs } from "./wire-parse.ts";
 import type { Actions, ActionsDelta, Delta, Keyed, State, Tick } from "./wire.ts";
 
@@ -82,6 +83,7 @@ export const applyDelta = (state: State, delta: Delta): Applied => {
       instances: mergeKeyed(state.instances, delta.instances, byName, "sorted"),
       events: delta.events?.length ? [...state.events, ...delta.events].slice(-state.eventsLimit) : state.events,
       completed: delta.completed ?? state.completed,
+      recent: applyRecent(state.recent, delta.recent),
       principalsEpoch: delta.principalsEpoch ?? state.principalsEpoch,
     },
   };

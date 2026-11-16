@@ -1,13 +1,13 @@
 //! Process-group signalling, bounded child runs, and logged spawning.
 
-use std::fs::OpenOptions;
+use std::fs::File;
 use std::io;
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
+use rustix::fs::OFlags;
 use rustix::io::Errno;
 use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -307,12 +307,13 @@ pub async fn run_bounded(
 /// Returns [`SpawnError::Log`] if the log cannot be opened or duplicated, and
 /// [`SpawnError::Spawn`] if the program cannot be started.
 pub fn spawn_logged(command: &mut Command, stdin: Stdio, log: &Path) -> Result<Child, SpawnError> {
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(PRIVATE_FILE)
-        .open(log)
-        .map_err(PathIo::at("open log file", log))?;
+    let file = rustix::fs::open(
+        log,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::APPEND | OFlags::CLOEXEC,
+        PRIVATE_FILE,
+    )
+    .map(File::from)
+    .map_err(|errno| PathIo::new("open log file", log, errno.into()))?;
     let stderr = file.try_clone().map_err(PathIo::at("open log file", log))?;
     // The log is a file: a forced colour request of the caller must not put escape codes in it.
     // Applied after any env the caller configured, so it also wins over them.

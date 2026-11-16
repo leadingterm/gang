@@ -11,19 +11,19 @@ use std::time::Duration;
 
 use gang_clock::Timestamp;
 use gang_e2e::{
-    AUDIENCE, Admission, BuildOutcome, Channel, ChannelEvent, Credentials, DiskNeighbourReport,
-    E2eError, EventStream, FleetLayout, HOLD_CPU_COUNT, HOLD_MEMORY_KB, Host, Identity, InputLinks,
-    IsolationReport, Issuance, LARGE_FLEET, LIMIT_CPU_PERIOD_MICROS, LIMIT_HEADROOM_PERCENT,
-    LIMIT_MAX_PIDS, NOOP_FLEET, Namespaces, ORGANIZATION, PermitNetwork, PoisonReport, Presenting,
-    Probe, ProbeReport, Reply, Result, Run, SMALL_FLEET, Sandbox, ScopeFacts, SessionCookie,
-    Settings, Signalled, System, TokenSpec, Variant, VictimReport,
+    AUDIENCE, Admission, BuildOutcome, Channel, ChannelEvent, Control, Credentials,
+    DiskNeighbourReport, E2eError, EventStream, FleetLayout, HOLD_CPU_COUNT, HOLD_MEMORY_KB, Host,
+    Identity, InputLinks, IsolationReport, Issuance, LARGE_FLEET, LIMIT_CPU_PERIOD_MICROS,
+    LIMIT_HEADROOM_PERCENT, LIMIT_MAX_PIDS, NOOP_FLEET, Namespaces, ORGANIZATION, PermitNetwork,
+    PoisonReport, Presenting, Probe, ProbeReport, Reply, Result, Run, SMALL_FLEET, Sandbox,
+    ScopeFacts, SessionCookie, Settings, Signalled, System, TokenSpec, Variant, VictimReport,
 };
 use gang_types::{FleetName, InstanceId, WorkerId};
 use gang_wire::routes::{GET_STATE, WATCH_STATE};
 use gang_wire::{
-    Cause, Closed, ClosedReason, Delta, Demand, Event, EventChange, Fleet, Frame, InstanceCounts,
-    InstanceSize, Keyed, Pass, PassState, Phase, Policy, Queue, State, Tick, Worker, WorkerCounts,
-    name,
+    Actions, Cause, Closed, ClosedReason, Delta, Demand, Event, EventChange, Fleet, Frame,
+    InstanceCounts, InstanceSize, Keyed, Pass, PassState, Phase, Policy, Queue, QueuedAction,
+    Recent, State, Tick, Truncated, Worker, WorkerCounts, name,
 };
 use parking_lot::{Condvar, Mutex};
 
@@ -161,6 +161,14 @@ behaviour! {
             NoOverflow,
             /// The fleets are preferred from the last to the first, and scale out in that order.
             ReversedPreference,
+        },
+        /// How a build sends its actions to the scheduler.
+        arrival: Arrival {
+            /// A build's actions are all queued before a pass places them.
+            Together,
+            /// Each action is sent only once the one before it ran, so no pass sees two of them
+            /// queued, unless a held supply keeps them all queued until it is released.
+            OneByOne,
         },
         /// Whether admin routes admit an anonymous caller.
         /// The plaintext deployment binds `none:anonymous` to the administrator role.
@@ -522,6 +530,12 @@ struct SimState {
     attempts: usize,
     /// The actions that ran remotely, which the live state counts as completed.
     completed: u64,
+    /// Whether the provisioner's supply is held, so that no pass places a queued action.
+    supply_held: bool,
+    /// The builds begun before the supply was last held.
+    held_after: u32,
+    /// The actions queued while the supply is held.
+    queued: usize,
 }
 
 impl Simulation {
@@ -552,6 +566,9 @@ impl Simulation {
                 builds_started: 0,
                 attempts: 0,
                 completed: 0,
+                supply_held: false,
+                held_after: 0,
+                queued: 0,
             }),
             changed: Condvar::new(),
             host: Host {
@@ -961,6 +978,20 @@ fn at(millis: u64) -> Timestamp {
     Timestamp::from_unix_millis(millis)
 }
 
+/// The `index`th action queued while the supply is held.
+fn queued_action(index: usize) -> QueuedAction {
+    QueuedAction {
+        name: format!("actions/queued-{index}"),
+        digest: format!("{index:064x}/1"),
+        target: "//:sim".to_owned(),
+        mnemonic: "E2eProbe".to_owned(),
+        queue_time: at(0),
+        priority: 0,
+        candidates: Vec::new(),
+        refusal: None,
+    }
+}
+
 /// The resource name of a simulated fleet.
 fn fleet_name(id: &str) -> Result<String> {
     let id = FleetName::try_new(id).map_err(E2eError::system_from(format!("fleet name {id}")))?;
@@ -1002,6 +1033,7 @@ pub(crate) fn state_frame(
         events,
         events_limit: EVENTS_LIMIT,
         completed,
+        recent: Recent::default(),
         principals_epoch: 0,
     }
 }
@@ -1094,6 +1126,7 @@ impl Simulation {
                 boot_grace: Duration::from_secs(30),
             },
             desired: count,
+            launch_failure: None,
             instances: InstanceCounts {
                 pending: 0,
                 in_service: count,
@@ -1129,6 +1162,7 @@ impl Simulation {
             slots: Some(fleet.actions_per_instance),
             paused: false,
             launch_time: at(0),
+            phases: Vec::new(),
         })
     }
 
@@ -1150,13 +1184,24 @@ impl Simulation {
     /// The live state of the deployment as `state` has it, numbered by the events recorded so far.
     fn snapshot(&self, state: &SimState) -> Result<State> {
         let (fleets, workers) = self.rows(&state.instances, &Phase::Idle)?;
-        Ok(state_frame(
-            sequence(state.events.len()),
+        let seq = sequence(state.events.len());
+        let mut frame = state_frame(
+            seq,
             fleets,
             workers,
             self.streamed(&state.events),
             state.completed,
-        ))
+        );
+        if state.queued > 0 {
+            frame.actions = Some(Actions {
+                sample_time: at(seq),
+                stale_after: Duration::from_secs(5),
+                running: Vec::new(),
+                queued: (0..state.queued).map(queued_action).collect(),
+                truncated: Truncated::default(),
+            });
+        }
+        Ok(frame)
     }
 
     /// What a viewer sees while the idle fleet drains: a delta that starts the drains, then a
@@ -1196,6 +1241,7 @@ impl Simulation {
                 actions: None,
                 events,
                 completed: None,
+                recent: None,
                 principals_epoch: None,
             };
         Ok(vec![
@@ -1352,6 +1398,13 @@ impl System for Simulation {
 
     fn await_stream(&self, done: &mut dyn FnMut(&[Frame]) -> bool) -> Result<Vec<Frame>> {
         let mut state = self.state.lock();
+        // While the supply is held, a build in flight, or one yet to begin, queues its actions.
+        while state.supply_held
+            && state.queued == 0
+            && (state.building > 0 || state.builds_started == state.held_after)
+        {
+            self.changed.wait(&mut state);
+        }
         let mut frames = vec![Frame::Snapshot(self.snapshot(&state)?)];
         if done(&frames) {
             return Ok(frames);
@@ -1415,6 +1468,33 @@ impl System for Simulation {
     }
 }
 
+impl Control for Simulation {
+    fn hold_supply(&self) -> Result<()> {
+        let mut state = self.state.lock();
+        state.supply_held = true;
+        state.held_after = state.builds_started;
+        Ok(())
+    }
+
+    fn release_supply(&self) -> Result<()> {
+        self.state.lock().supply_held = false;
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    fn stop_workers(&self) -> Result<usize> {
+        Err(E2eError::system(
+            "the fleets simulation runs no worker process to stop",
+        ))
+    }
+
+    fn continue_workers(&self) -> Result<()> {
+        Err(E2eError::system(
+            "the fleets simulation runs no worker process to continue",
+        ))
+    }
+}
+
 impl Simulation {
     /// The body of [`build`](Self::build), run while the build counts as in flight.
     fn run_build(&self, probes: &[Probe]) -> Result<BuildOutcome> {
@@ -1454,16 +1534,34 @@ impl Simulation {
             .filter(|(_, hit)| !hit)
             .map(|(probe, _)| *probe)
             .collect();
-        let Some(placed) = self.place(&actions) else {
-            let stderr = "ERROR: no fleet accepts the platform properties of an action\n";
-            return Ok(BuildOutcome::new(Some(1), stderr.to_owned()));
-        };
-        if self.scale_out(&mut state, &placed)? {
+        let together = state.supply_held || self.behaviour.arrival == Arrival::Together;
+        if state.supply_held && !actions.is_empty() {
+            state.queued = actions.len();
             self.changed.notify_all();
-            let scaled_under = state.starts;
-            while state.pid.is_none() || (self.slow_boot && state.starts == scaled_under) {
+            while state.supply_held {
                 self.changed.wait(&mut state);
             }
+            state.queued = 0;
+        }
+        let sent: Vec<&[Probe]> = if together {
+            vec![actions.as_slice()]
+        } else {
+            actions.chunks(1).collect()
+        };
+        let mut placed = Vec::with_capacity(actions.len());
+        for batch in sent {
+            let Some(batch_placed) = self.place(batch) else {
+                let stderr = "ERROR: no fleet accepts this action: disk_kb 549755813888 is above the largest fleet's 8388608; change its exec_properties or declare a fleet that accepts them\n";
+                return Ok(BuildOutcome::new(Some(1), stderr.to_owned()));
+            };
+            if self.scale_out(&mut state, &batch_placed)? {
+                self.changed.notify_all();
+                let scaled_under = state.starts;
+                while state.pid.is_none() || (self.slow_boot && state.starts == scaled_under) {
+                    self.changed.wait(&mut state);
+                }
+            }
+            placed.extend(batch_placed);
         }
         if remote > 0 {
             state.idle = 0;

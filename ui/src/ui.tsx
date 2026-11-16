@@ -3,7 +3,7 @@ import { createContext, type ComponentChildren } from "preact";
 import { useContext, useEffect, useRef, useState } from "preact/hooks";
 import { useComputed } from "@preact/signals";
 import type { StateClient } from "./client.ts";
-import { duration, splitTarget, workerInstance, workerShort } from "./format.ts";
+import { duration, splitTarget, workerInstance } from "./format.ts";
 import { eventKind, idOf, type EventKind, type UnixMs } from "./wire-parse.ts";
 import type { EventChange, Fleet, ScalingEvent } from "./wire.ts";
 
@@ -98,11 +98,8 @@ export const Priority = ({ p }: { p: number }) =>
 /** The payload of the oneof member `K`. */
 type ChangeOf<K extends EventKind> = EventChange extends infer C ? (C extends Record<K, infer P> ? P : never) : never;
 
-/** The short worker id that an event names, from a `workers/{worker}` reference. */
-const workerLabel = (worker: string): string => {
-  const id = idOf(worker);
-  return workerShort(id, workerInstance(id));
-};
+/** The instance named by a `workers/{worker}` reference, or its full id. */
+const workerLabel = (worker: string): string => workerInstance(idOf(worker));
 
 const workerGlyph = <circle class="g-worker" cx="7" cy="7" r="3" />;
 
@@ -117,15 +114,25 @@ export const EVENT_VIEW = {
       </span>
     ),
   },
+  launchFailed: {
+    glyph: <path class="caution" fill="currentColor" d="M7 1 13 12H1L7 1zm-.7 4v3.5h1.4V5H6.3zm0 4.5V11h1.4V9.5H6.3z" fill-rule="evenodd" />,
+    label: "launch failed",
+    what: (c) => <span class="mono">{c.from} of {c.to} launched</span>,
+  },
+  withdrawn: {
+    glyph: <path class="g-drain" d="M7 2v9M3 7.5 7 11.5l4-4" />,
+    label: "withdrawn",
+    what: (c) => <span class="mono">{c.from} → {c.to}</span>,
+  },
   drainStarted: {
     glyph: <path class="g-drain" d="M7 2v9M3 7.5 7 11.5l4-4" />,
     label: "Drain",
-    what: (c) => <span class="mono">{workerInstance(idOf(c.worker))}</span>,
+    what: (c) => <span class="mono">{workerLabel(c.worker)}</span>,
   },
   drainCancelled: {
     glyph: <path class="g-cancel" d="M11.5 11.5v-5H3M6 3.5l-3 3 3 3" />,
     label: "Cancel drain",
-    what: (c) => <span class="mono">{workerInstance(idOf(c.worker))}</span>,
+    what: (c) => <span class="mono">{workerLabel(c.worker)}</span>,
   },
   terminated: {
     glyph: <path class="g-term" d="M3 3l8 8M11 3l-8 8" />,
@@ -219,6 +226,24 @@ export const useTitle = (label: string): void => {
 
 const FRAME = { section: "section", panel: "panel", plain: undefined } as const;
 
+/** The shared, single-line header for a section or group. */
+export const SectionHead = ({ id, title, count, aside, mono = false }: {
+  id: string;
+  title: string;
+  count?: ComponentChildren;
+  aside?: ComponentChildren;
+  mono?: boolean;
+}) => (
+  <div class="shead">
+    <h2 id={id} class={mono ? "shead__title shead__title--mono" : "shead__title"} title={title}>{title}</h2>
+    {count !== undefined && <span class="shead__count">{count}</span>}
+    {aside !== undefined && <span class="shead__aside">{aside}</span>}
+  </div>
+);
+
+/** A single-line identifier, truncated when its container is narrow. */
+export const Ident = ({ text }: { text: string }) => <span class="ident" title={text}>{text}</span>;
+
 /** A titled block: `aside` sits at the end of the head, after the optional `count`. */
 export const Section = ({
   id,
@@ -226,7 +251,6 @@ export const Section = ({
   variant = "section",
   count,
   aside,
-  asideCls,
   children,
 }: {
   id: string;
@@ -234,15 +258,10 @@ export const Section = ({
   variant?: keyof typeof FRAME;
   count?: ComponentChildren;
   aside?: ComponentChildren;
-  asideCls?: string;
   children?: ComponentChildren;
 }) => (
   <section class={FRAME[variant]} aria-labelledby={id}>
-    <div class="section__head">
-      <h2 id={id}>{title}</h2>
-      {count !== undefined && <span class="section__count">{count}</span>}
-      {aside !== undefined && <span class={asideCls === undefined ? "section__aside" : `section__aside ${asideCls}`}>{aside}</span>}
-    </div>
+    <SectionHead id={id} title={title} count={count} aside={aside} />
     {children}
   </section>
 );

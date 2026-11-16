@@ -4,7 +4,7 @@ Gang runs Bazel remote execution on workers that exist only while there is work.
 
 ## Commands
 
-`gang` is the only artifact; laptops, CI, the controller and workers run the same build. Clients use `login`, `get`, `bazelrc`, `doctor`, `revoke` and `restore`. The controller and workers use `server`, `worker` and the hidden `exec`. Local Mode uses `local up` and `local down`. `options` lists each provisioner's fleet options. `gang --help` lists the commands people run; `get`, `worker` and `exec` are hidden from it. [`docs/SPECIFICATION.md`](docs/SPECIFICATION.md) §6 specifies them all.
+`gang` is the only artifact; laptops, CI, the controller and workers run the same build. Clients use `setup`, `login`, `get`, `bazelrc`, `doctor`, `revoke` and `restore`. The controller and workers use `server`, `worker` and the hidden `exec`. Local Mode uses `local up` and `local down`. `options` lists each provisioner's fleet options. `gang --help` lists the commands people run; `get`, `worker` and `exec` are hidden from it. [`docs/SPECIFICATION.md`](docs/SPECIFICATION.md) §6 specifies them all.
 
 ## Authentication
 
@@ -40,25 +40,24 @@ nix develop -c bazel test //...
 
 ## Quick start: Local Mode
 
-Local Mode runs the controller and on-demand workers on one machine from `configs/gang.local.toml` (specification section 1.4). Actions run under `bwrap` on Linux. On macOS, set the fleet's `sandbox = "noop"` in that file first, because bubblewrap is Linux-only. Install the binary first: Bazel runs `gang` as its credential helper, and `gang bazelrc` and `gang doctor` act on the current directory.
+Local Mode runs the controller and on-demand workers on one machine from `configs/gang.local.toml` (specification section 1.4). Actions run under `bwrap` on Linux. On macOS, set the fleet's `sandbox = "noop"` in that file first, because bubblewrap is Linux-only. Install the binary first.
 
 ```sh
 nix develop -c bazel build -c opt //:gang && install bazel-bin/crates/gang-main/gang ~/.local/bin/gang
 gang local up --insecure          # from this checkout; loopback only, plaintext, no authentication; prints the endpoints and the next step
 cd <your Bazel workspace>
-gang bazelrc --server http://127.0.0.1:50051 > .bazelrc
-gang doctor --server http://127.0.0.1:50051
+gang setup --server http://127.0.0.1:50051
 nix develop <path-to-gang-checkout> -c bazel build //...  # workers start while actions are queued and stop when idle
 gang local down                   # from this checkout
 ```
 
-Against a deployment, sign in first. `gang doctor` then takes the server from the stored login.
+Against a deployment, run setup from the Bazel workspace:
 
 ```sh
-gang login --server https://gang.example.com
-gang bazelrc --server https://gang.example.com > .bazelrc
-gang doctor
+gang setup --server https://gang.example.com
 ```
+
+Setup writes Gang-owned files under `.gang/` and one `try-import` line in `.bazelrc`, safe to commit; it shows every change first (`--dry-run` only previews, `--yes` applies for scripts). `gang bazelrc` remains the printing primitive for scripts and isolated rc files.
 
 TLS Local Mode (`gang local up` without `--insecure`) accepts client tokens only from the providers in `[authentication.clients.token] providers`. Add an interactive provider (specification section 1.3) before you `gang login` to it. Run the end-to-end harness from this checkout with `nix develop -c bazel run //crates/gang-e2e:local -- --gate 1` (specification section 6.5). The `gang` binary and pinned Bazel come from the harness's runfiles; `--gang` and `--bazel` override them.
 
@@ -72,7 +71,7 @@ Gang is deployed from a separate repository that calls its modules and reusable 
 
 ```hcl
 module "gang" {
-  source = "git::https://github.com/example-org/gang//infra/terraform/modules/deployment?ref=v0.1.5"
+  source = "git::https://github.com/example-org/gang//infra/terraform/modules/deployment?ref=v0.1.6"
   # variables as in the example root
 }
 ```

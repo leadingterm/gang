@@ -166,6 +166,7 @@ fn delta(seq: u64) -> Delta {
         actions: None,
         events: Vec::new(),
         completed: None,
+        recent: None,
         principals_epoch: None,
     }
 }

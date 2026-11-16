@@ -3,10 +3,11 @@
 //! Gang scales from zero, so `NativeLink`'s worker-based unsatisfiable check cannot see fleets
 //! whose workers have not connected yet.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use gang_types::FleetCatalog;
+use gang_types::{FleetCatalog, FleetSet, Refusal};
 use nativelink_error::{Error, make_input_err};
 use nativelink_metric::{
     MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent, RootMetricsComponent,
@@ -16,17 +17,70 @@ use nativelink_util::action_messages::{ActionInfo, OperationId};
 use nativelink_util::operation_state_manager::{
     ActionStateResult, ActionStateResultStream, ClientStateManager, OperationFilter,
 };
+use parking_lot::Mutex;
+
+/// The client-accepted fleets for calls passing through the historical scheduler.
+#[derive(Clone, Default)]
+pub(crate) struct AdmittedFleets(Arc<Mutex<HashMap<OperationId, FleetSet>>>);
+
+/// Removes an admission if the scheduler has not already taken it.
+#[must_use]
+pub(crate) struct Admission<'a> {
+    fleets: &'a AdmittedFleets,
+    operation: OperationId,
+}
+
+impl Drop for Admission<'_> {
+    fn drop(&mut self) {
+        let _ = self.fleets.take(&self.operation);
+    }
+}
+
+impl AdmittedFleets {
+    /// Inserts an admission that is removed when its guard is dropped.
+    pub(crate) fn insert(&self, operation: OperationId, fleets: FleetSet) -> Admission<'_> {
+        self.0.lock().insert(operation.clone(), fleets);
+        Admission {
+            fleets: self,
+            operation,
+        }
+    }
+
+    pub(crate) fn take(&self, operation: &OperationId) -> Option<FleetSet> {
+        self.0.lock().remove(operation)
+    }
+}
+
+/// The error a client gets when no declared fleet accepts its action, naming what was refused.
+pub(crate) fn refused<'r>(
+    fleets: &FleetCatalog,
+    request: impl Fn(&str) -> Option<&'r str>,
+) -> Error {
+    let refusal = fleets.refusal(request).unwrap_or(Refusal::Combination);
+    make_input_err!(
+        "no fleet accepts this action: {refusal}; change its exec_properties or declare a fleet that accepts them"
+    )
+}
 
 /// Forwards scheduler calls while refusing actions that cannot run on any declared fleet.
 pub(crate) struct PlaceableActions {
     inner: Arc<dyn KnownPlatformPropertyProvider>,
     fleets: FleetCatalog,
+    admitted: AdmittedFleets,
 }
 
 impl PlaceableActions {
     /// Wraps the action scheduler with the fleet catalog used for placement.
-    pub(crate) fn new(inner: Arc<dyn KnownPlatformPropertyProvider>, fleets: FleetCatalog) -> Self {
-        Self { inner, fleets }
+    pub(crate) fn new(
+        inner: Arc<dyn KnownPlatformPropertyProvider>,
+        fleets: FleetCatalog,
+        admitted: AdmittedFleets,
+    ) -> Self {
+        Self {
+            inner,
+            fleets,
+            admitted,
+        }
     }
 }
 
@@ -60,22 +114,12 @@ impl ClientStateManager for PlaceableActions {
         client_operation_id: OperationId,
         action_info: Arc<ActionInfo>,
     ) -> Result<Box<dyn ActionStateResult>, Error> {
-        if self
-            .fleets
-            .accepting(|key| action_info.platform_properties.get(key).map(String::as_str))
-            .is_empty()
-        {
-            let mut properties: Vec<_> = action_info.platform_properties.iter().collect();
-            properties.sort_unstable_by_key(|(key, _)| *key);
-            let properties = properties
-                .into_iter()
-                .map(|(key, value)| format!("{key}={value}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(make_input_err!(
-                "no fleet accepts the platform properties of this action ({properties}): change its exec_properties or declare a fleet that accepts them"
-            ));
+        let properties = |key: &str| action_info.platform_properties.get(key).map(String::as_str);
+        let admitted = self.fleets.accepting(properties);
+        if admitted.is_empty() {
+            return Err(refused(&self.fleets, properties));
         }
+        let _admission = self.admitted.insert(client_operation_id.clone(), admitted);
         self.inner
             .add_action(client_operation_id, action_info)
             .await
@@ -94,5 +138,263 @@ impl ClientStateManager for PlaceableActions {
 impl KnownPlatformPropertyProvider for PlaceableActions {
     async fn get_known_properties(&self, instance_name: &str) -> Result<Vec<String>, Error> {
         self.inner.get_known_properties(instance_name).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use gang_types::{Bytes, FleetName, FleetProperties, Isa, Resources, property};
+    use nativelink_error::Code;
+    use nativelink_util::action_messages::{ActionState, ActionUniqueKey, ActionUniqueQualifier};
+    use nativelink_util::common::DigestInfo;
+    use nativelink_util::digest_hasher::DigestHasherFunc;
+    use nativelink_util::origin_event::OriginMetadata;
+    use parking_lot::Mutex;
+
+    use super::*;
+    use crate::fitted::FittedActions;
+
+    #[derive(Default)]
+    struct Fake {
+        calls: Mutex<Vec<Arc<ActionInfo>>>,
+        fail: AtomicBool,
+        observed_admitted: Mutex<Option<AdmittedFleets>>,
+        saw_admitted: AtomicBool,
+    }
+
+    struct ResultRow;
+
+    #[async_trait]
+    impl ActionStateResult for ResultRow {
+        async fn as_state(&self) -> Result<(Arc<ActionState>, Option<OriginMetadata>), Error> {
+            Err(make_input_err!("not used"))
+        }
+        async fn changed(&mut self) -> Result<(Arc<ActionState>, Option<OriginMetadata>), Error> {
+            Err(make_input_err!("not used"))
+        }
+        async fn as_action_info(&self) -> Result<(Arc<ActionInfo>, Option<OriginMetadata>), Error> {
+            Err(make_input_err!("not used"))
+        }
+    }
+
+    impl MetricsComponent for Fake {
+        fn publish(
+            &self,
+            _: MetricKind,
+            _: MetricFieldData<'_>,
+        ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+            Ok(MetricPublishKnownKindData::Component)
+        }
+    }
+
+    impl RootMetricsComponent for Fake {
+        fn publish(
+            &self,
+            _: MetricKind,
+            _: MetricFieldData<'_>,
+        ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+            Ok(MetricPublishKnownKindData::Component)
+        }
+    }
+
+    #[async_trait]
+    impl ClientStateManager for Fake {
+        async fn add_action(
+            &self,
+            operation: OperationId,
+            info: Arc<ActionInfo>,
+        ) -> Result<Box<dyn ActionStateResult>, Error> {
+            if let Some(admitted) = self.observed_admitted.lock().as_ref() {
+                let map = admitted.0.lock();
+                self.saw_admitted
+                    .store(map.contains_key(&operation), Ordering::Relaxed);
+            }
+            self.calls.lock().push(info);
+            if self.fail.load(Ordering::Relaxed) {
+                Err(make_input_err!("fake failure"))
+            } else {
+                Ok(Box::new(ResultRow))
+            }
+        }
+        async fn filter_operations(
+            &self,
+            _: OperationFilter,
+        ) -> Result<ActionStateResultStream<'_>, Error> {
+            Err(make_input_err!("not used"))
+        }
+    }
+
+    #[async_trait]
+    impl KnownPlatformPropertyProvider for Fake {
+        async fn get_known_properties(&self, _: &str) -> Result<Vec<String>, Error> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn catalog() -> FleetCatalog {
+        FleetCatalog::try_new(vec![FleetProperties::new(
+            &FleetName::try_new("fleet-a").expect("valid fleet"),
+            Isa::X86_64,
+            &"docker",
+            Resources {
+                vcpus: 15,
+                memory: Bytes::new(1024),
+                disk: Bytes::new(1024),
+            },
+            Vec::<(&'static str, String)>::new(),
+        )])
+        .expect("valid catalog")
+    }
+
+    fn info(key: &str, value: &str) -> Arc<ActionInfo> {
+        let digest = DigestInfo::new([1; 32], 1);
+        Arc::new(ActionInfo {
+            command_digest: digest,
+            input_root_digest: digest,
+            timeout: Duration::from_secs(60),
+            platform_properties: [(key.to_owned(), value.to_owned())].into_iter().collect(),
+            priority: 0,
+            load_timestamp: UNIX_EPOCH,
+            insert_timestamp: UNIX_EPOCH,
+            unique_qualifier: ActionUniqueQualifier::Cacheable(ActionUniqueKey {
+                execution_scope: None,
+                instance_name: String::new(),
+                digest_function: DigestHasherFunc::Sha256,
+                digest,
+            }),
+        })
+    }
+
+    fn operation() -> OperationId {
+        OperationId::String("op".to_owned())
+    }
+
+    #[test]
+    fn an_abandoned_admission_is_removed() {
+        let admitted = AdmittedFleets::default();
+        let fleets = catalog();
+        {
+            let _admission = admitted.insert(operation(), fleets.accepting(|_| None));
+            assert!(admitted.take(&operation()).is_some());
+        }
+        {
+            let _admission = admitted.insert(operation(), fleets.accepting(|_| None));
+        }
+        assert!(admitted.take(&operation()).is_none());
+    }
+
+    #[tokio::test]
+    async fn refuses_client_request_above_every_fleet() {
+        let fake = Arc::new(Fake::default());
+        let wrapper = PlaceableActions::new(fake.clone(), catalog(), AdmittedFleets::default());
+        let error = match wrapper
+            .add_action(operation(), info(property::CPU_COUNT, "99"))
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("unplaceable request accepted"),
+        };
+        assert_eq!(error.code, Code::InvalidArgument);
+        let message = error.to_string();
+        assert!(message.contains("cpu_count") && message.contains("99") && message.contains("15"));
+        assert!(fake.calls.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fits_learned_reservations_but_preserves_values_within_fleet() {
+        let fake = Arc::new(Fake::default());
+        let fleets = catalog();
+        let admitted = AdmittedFleets::default();
+        let fitted = FittedActions::new(fake.clone(), fleets.clone(), admitted.clone());
+        for (value, expected) in [("871000", "15000"), ("12000", "12000")] {
+            let _admission = admitted.insert(operation(), fleets.accepting(|_| None));
+            fitted
+                .add_action(operation(), info(property::CPU_MILLICORES, value))
+                .await
+                .expect("fitted");
+            assert_eq!(
+                fake.calls
+                    .lock()
+                    .last()
+                    .expect("recorded")
+                    .platform_properties[property::CPU_MILLICORES],
+                expected
+            );
+        }
+        let outer = PlaceableActions::new(Arc::new(fitted), fleets, admitted);
+        outer
+            .add_action(operation(), info(property::CPU_MILLICORES, "14000"))
+            .await
+            .expect("accepted");
+        assert_eq!(
+            fake.calls
+                .lock()
+                .last()
+                .expect("recorded")
+                .platform_properties[property::CPU_MILLICORES],
+            "14000"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_reservation_fits_the_largest_of_two_fleets() {
+        let fake = Arc::new(Fake::default());
+        let fleets = FleetCatalog::try_new(
+            [("small", 4, 8_u64), ("large", 16, 32)]
+                .into_iter()
+                .map(|(name, vcpus, gib)| {
+                    FleetProperties::new(
+                        &FleetName::try_new(name).expect("valid fleet"),
+                        Isa::X86_64,
+                        &"docker",
+                        Resources {
+                            vcpus,
+                            memory: Bytes::new(gib << 30),
+                            disk: Bytes::new(100_u64 << 30),
+                        },
+                        Vec::<(&'static str, String)>::new(),
+                    )
+                })
+                .collect(),
+        )
+        .expect("valid catalog");
+        let admitted = AdmittedFleets::default();
+        let fitted = FittedActions::new(fake.clone(), fleets.clone(), admitted.clone());
+        let _admission = admitted.insert(operation(), fleets.accepting(|_| None));
+        fitted
+            .add_action(operation(), info(property::MEMORY_KB, "35232154"))
+            .await
+            .expect("fitted");
+        assert_eq!(
+            fake.calls
+                .lock()
+                .last()
+                .expect("recorded")
+                .platform_properties[property::MEMORY_KB],
+            "33554432"
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_entry_removed_after_success_and_failure() {
+        let fake = Arc::new(Fake::default());
+        let admitted = AdmittedFleets::default();
+        *fake.observed_admitted.lock() = Some(admitted.clone());
+        let outer = PlaceableActions::new(fake.clone(), catalog(), admitted.clone());
+        for fail in [false, true] {
+            fake.fail.store(fail, Ordering::Relaxed);
+            assert_eq!(
+                outer
+                    .add_action(operation(), info(property::CPU_COUNT, "1"))
+                    .await
+                    .is_err(),
+                fail
+            );
+            assert!(fake.saw_admitted.swap(false, Ordering::Relaxed));
+            assert!(admitted.take(&operation()).is_none());
+        }
     }
 }

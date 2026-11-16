@@ -3,12 +3,10 @@
 
 use std::io;
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
 
 use gang_client::{ClientOptions, Console, DEFAULT_BROWSER_COMMAND};
 use gang_types::Url;
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
 
 use crate::output::{Line, Output, Progress, Record};
 
@@ -21,7 +19,6 @@ use crate::output::{Line, Output, Progress, Record};
 pub(crate) struct TerminalConsole {
     browser_command: String,
     out: Output,
-    paste: OnceLock<tokio::sync::Mutex<mpsc::UnboundedReceiver<Url>>>,
     waiting: Mutex<Option<Progress>>,
 }
 
@@ -35,7 +32,6 @@ impl TerminalConsole {
         Self {
             browser_command,
             out,
-            paste: OnceLock::new(),
             waiting: Mutex::new(None),
         }
     }
@@ -100,18 +96,15 @@ impl Console for TerminalConsole {
         )));
     }
 
-    fn pasted_redirect(&self) -> impl Future<Output = Url> + Send {
-        let receiver = self.paste.get_or_init(|| {
-            let (sender, receiver) = mpsc::unbounded_channel();
-            let out = self.out.clone();
-            std::thread::spawn(move || read_pastes(&sender, &out));
-            tokio::sync::Mutex::new(receiver)
-        });
-        async move {
-            let mut receiver = receiver.lock().await;
-            match receiver.recv().await {
-                Some(url) => url,
-                None => std::future::pending().await,
+    async fn pasted_redirect(&self) -> Url {
+        loop {
+            match crate::prompt::input_line().await {
+                Some(Ok(line)) => {
+                    if let Some(url) = parse_paste(&line, &self.out) {
+                        return url;
+                    }
+                }
+                Some(Err(_)) | None => std::future::pending().await,
             }
         }
     }
@@ -130,21 +123,6 @@ fn spawn_browser(command: &str, url: &str) -> io::Result<()> {
         .name("browser-opener".into())
         .spawn(move || child.wait())?;
     Ok(())
-}
-
-/// Reads stdin lines until end of input, forwarding every line that parses as a URL.
-fn read_pastes(sender: &mpsc::UnboundedSender<Url>, out: &Output) {
-    for line in io::stdin().lines() {
-        let Ok(line) = line else {
-            return;
-        };
-        let Some(url) = parse_paste(&line, out) else {
-            continue;
-        };
-        if sender.send(url).is_err() {
-            return;
-        }
-    }
 }
 
 /// Parses one pasted line; blank lines are ignored and a line that is not a URL is reported.

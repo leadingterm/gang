@@ -100,7 +100,7 @@ fn queued_is_exclusive_while_candidates_overlap() -> TestResult {
 #[test]
 fn demand_carries_measured_resources_of_attributed_actions() -> TestResult {
     let mut h = harness()?;
-    h.queue_sized(X86, 2, x86_resources(2))?;
+    h.queue_sized(X86, 2, x86_resources(2000))?;
     h.queue(X86, 1)?;
     h.reconcile();
 

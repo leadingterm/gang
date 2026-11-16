@@ -213,6 +213,71 @@ async fn every_kind_of_event_is_mapped_to_its_oneof_member() -> TestResult {
 }
 
 #[tokio::test]
+async fn launch_failure_and_withdrawal_round_trip_on_the_wire() {
+    let (parts, _dials, handles) = tls_parts();
+    record_scaling(
+        &handles.repository,
+        &[
+            ledger_event(
+                1_000,
+                ScalingEventKind::LaunchFailed {
+                    from: 2,
+                    to: 4,
+                    reason: "capacity unavailable".to_owned(),
+                },
+                None,
+            ),
+            ledger_event(
+                2_000,
+                ScalingEventKind::Withdrawn { from: 4, to: 2 },
+                Some(ScalingCause::Demand),
+            ),
+        ],
+    )
+    .await;
+    serve(
+        parts,
+        tls_settings(),
+        handles.scheduler,
+        |controller| async move {
+            let admin = mint_token(&controller, PROVIDER, ADMIN_PROOF).await;
+            let answer = get(&controller, LIST_EVENTS.template, Some(&admin)).await;
+            let response: ListEventsResponse = answer.ok();
+            assert_eq!(
+                response.events,
+                vec![
+                    wire_event(
+                        2,
+                        2_000,
+                        EventChange::Withdrawn { from: 4, to: 2 },
+                        Some(Cause::from(ScalingCause::Demand))
+                    ),
+                    wire_event(
+                        1,
+                        1_000,
+                        EventChange::LaunchFailed {
+                            from: 2,
+                            to: 4,
+                            reason: "capacity unavailable".to_owned(),
+                        },
+                        None
+                    ),
+                ]
+            );
+            let body = answer.value();
+            assert_eq!(body["events"][0]["withdrawn"], json!({"from": 4, "to": 2}));
+            assert_eq!(
+                body["events"][1]["launchFailed"],
+                json!({
+                    "from": 2, "to": 4, "reason": "capacity unavailable"
+                })
+            );
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn events_carry_their_cause_in_upper_snake_case_and_omit_it_when_absent() -> TestResult {
     let (parts, _dials, handles) = tls_parts();
     record_scaling(

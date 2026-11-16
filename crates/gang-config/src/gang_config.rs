@@ -21,6 +21,9 @@ use crate::role_config::RoleConfig;
 use crate::server_config::{EndpointTrust, ServerConfig, Transport};
 use crate::worker_config::WorkerConfig;
 
+/// The most samples retained in the dashboard history window.
+const MAX_HISTORY_STEPS: u128 = 1440;
+
 /// `gang.toml`. The plugin sections are typed by the composition's [`PluginSet`]; `F` is the
 /// fleet column: the typed `[[fleets]]` entries until parsing resolves them into [`Fleets`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,12 +257,22 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
         Ok(())
     }
 
-    /// Checks the `[dashboard]` section: an explicit stale threshold must exceed the refresh
-    /// interval, and a login's provider must be configured.
+    /// Checks dashboard history, stale threshold, and login provider settings.
     fn check_dashboard(
         dashboard: &DashboardConfig,
         providers: &BTreeMap<ProviderName, P::IdentityProvider>,
     ) -> Result<(), ConfigError> {
+        let step = dashboard.history_step.get();
+        let window = dashboard.history_window.get();
+        let step_nanos = step.as_nanos();
+        let window_nanos = window.as_nanos();
+        if step.subsec_nanos() != 0
+            || window_nanos < step_nanos
+            || !window_nanos.is_multiple_of(step_nanos)
+            || window_nanos / step_nanos > MAX_HISTORY_STEPS
+        {
+            return Err(ConfigError::HistoryWindowNotWholeSteps);
+        }
         if dashboard
             .actions_stale_after
             .is_some_and(|stale_after| stale_after <= dashboard.detail_interval)

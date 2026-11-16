@@ -45,6 +45,7 @@ pub(crate) fn wire_server<V: LoginPort>(
             EndpointTrust::System => None,
         },
         default_isa: default_isa.into(),
+        version: Some(env!("CARGO_PKG_VERSION").to_owned()),
         authentication,
     })
 }
@@ -145,6 +146,7 @@ mod tests {
         )
         .expect("server info builds");
 
+        assert_eq!(info.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
         assert_eq!(
             info.authentication,
             Authentication::None(NoAuthentication {})

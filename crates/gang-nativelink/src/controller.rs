@@ -5,14 +5,21 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::time::{Duration, SystemTime};
 
 use axum::Router;
 use axum::body::Body;
 use http::{Request, Response};
 use http_body_util::BodyExt;
+use nativelink_config::cas_server::SchedulerConfig;
+use nativelink_config::schedulers::{ExperimentalSimpleSchedulerBackend, SchedulerSpec};
 use nativelink_error::{Code, make_err};
-use nativelink_scheduler::default_scheduler_factory::scheduler_factory;
+use nativelink_scheduler::default_scheduler_factory::memory_awaited_action_db_factory;
+use nativelink_scheduler::historical_resource_scheduler::{
+    HistoricalResourceScheduler, replica_id, snapshot_key,
+};
 use nativelink_scheduler::known_platform_property_provider::KnownPlatformPropertyProvider;
+use nativelink_scheduler::simple_scheduler::SimpleScheduler;
 use nativelink_scheduler::worker_scheduler::WorkerScheduler;
 use nativelink_service::ac_server::AcServer;
 use nativelink_service::bytestream_server::ByteStreamServer;
@@ -35,8 +42,9 @@ use gang_types::FleetCatalog;
 use crate::config::NativeLinkConfig;
 use crate::counting::CountingWorkerScheduler;
 use crate::errors::NativeLinkEmbedError;
+use crate::fitted::FittedActions;
 use crate::globals;
-use crate::placeable::PlaceableActions;
+use crate::placeable::{AdmittedFleets, PlaceableActions};
 use crate::serve::{Protocols, serve};
 use crate::settings;
 use crate::stores::build_stores;
@@ -86,18 +94,7 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
     let worker_services = settings::worker_services(config);
     let store_manager = build_stores(settings::controller_stores(spec)?).await?;
 
-    let (action_scheduler, worker_scheduler, _) =
-        scheduler_factory(&scheduler.spec, &store_manager, None)
-            .await
-            .map_err(NativeLinkEmbedError::native("scheduler creation failed"))?;
-    let (Some(action_scheduler), Some(worker_scheduler)) = (action_scheduler, worker_scheduler)
-    else {
-        return Err(NativeLinkEmbedError::native("scheduler creation failed")(
-            make_err!(Code::Internal, "the scheduler has no action or worker side"),
-        ));
-    };
-    let action_scheduler: Arc<dyn KnownPlatformPropertyProvider> =
-        Arc::new(PlaceableActions::new(action_scheduler, spec.fleets.clone()));
+    let (action_scheduler, worker_scheduler) = scheduler_stack(&scheduler, spec.fleets)?;
     let completed = Arc::new(AtomicU64::new(0));
     let worker_scheduler: Arc<dyn WorkerScheduler> = Arc::new(CountingWorkerScheduler::new(
         worker_scheduler,
@@ -139,13 +136,84 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         worker,
         api,
     } = connections;
-    let public_router = client_router.fallback_service(api_service(api));
+    let public_router = with_request_metadata(client_router).fallback_service(api_service(api));
     futures::future::try_join(
         serve(public, public_router, &config.http2, Protocols::Auto),
         serve(worker, worker_router, &config.http2, Protocols::H2),
     )
     .await?;
     Ok(())
+}
+
+/// The action side and the worker side of the scheduler.
+type SchedulerHandles = (
+    Arc<dyn KnownPlatformPropertyProvider>,
+    Arc<dyn WorkerScheduler>,
+);
+
+/// Builds the action stack from the client inward: `PlaceableActions`,
+/// `HistoricalResourceScheduler`, `FittedActions`, then `SimpleScheduler`. Client refusal
+/// stays outside, while learned-reservation fitting happens inside the historical layer.
+fn scheduler_stack(
+    scheduler: &SchedulerConfig,
+    fleets: &FleetCatalog,
+) -> Result<SchedulerHandles, NativeLinkEmbedError> {
+    let SchedulerSpec::HistoricalResource(historical_spec) = &scheduler.spec else {
+        return Err(NativeLinkEmbedError::native("scheduler creation failed")(
+            make_err!(Code::Internal, "expected a historical resource scheduler"),
+        ));
+    };
+    let SchedulerSpec::Simple(simple) = historical_spec.scheduler.as_ref() else {
+        return Err(NativeLinkEmbedError::native("scheduler creation failed")(
+            make_err!(Code::Internal, "expected a nested simple scheduler"),
+        ));
+    };
+    if !matches!(
+        simple.experimental_backend,
+        None | Some(ExperimentalSimpleSchedulerBackend::Memory)
+    ) {
+        return Err(NativeLinkEmbedError::native("scheduler creation failed")(
+            make_err!(Code::Internal, "expected the memory scheduler backend"),
+        ));
+    }
+    HistoricalResourceScheduler::validate(historical_spec)
+        .map_err(NativeLinkEmbedError::native("scheduler creation failed"))?;
+    let sketch = Arc::new(HistoricalResourceScheduler::sketch_from_spec(
+        historical_spec,
+    ));
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let db =
+        memory_awaited_action_db_factory(simple.retain_completed_for_s, &notify, SystemTime::now);
+    let (simple_actions, worker_scheduler) =
+        SimpleScheduler::new_with_resource_sketch(simple, db, notify, None, Some(sketch.clone()));
+    let admitted = AdmittedFleets::default();
+    let fitted = Arc::new(FittedActions::new(
+        simple_actions,
+        fleets.clone(),
+        admitted.clone(),
+    ));
+    let historical = Arc::new(HistoricalResourceScheduler::new(
+        historical_spec,
+        fitted,
+        sketch.clone(),
+    ));
+    if historical_spec.learn_from_workers {
+        HistoricalResourceScheduler::spawn_snapshot_writer(
+            sketch,
+            None,
+            Duration::from_secs(historical_spec.snapshot_interval_s),
+            snapshot_key(&replica_id(&historical_spec.replica_id)),
+        );
+    }
+    let action_scheduler: Arc<dyn KnownPlatformPropertyProvider> =
+        Arc::new(PlaceableActions::new(historical, fleets.clone(), admitted));
+    Ok((action_scheduler, worker_scheduler))
+}
+
+/// Decodes Bazel's `RequestMetadata` header into the request context so actions carry their target
+/// and mnemonic and the scheduler learns per target.
+fn with_request_metadata(router: Router) -> Router {
+    router.layer(nativelink_util::telemetry::OtlpLayer::new(false))
 }
 
 /// The Gang API as the controller's fallback service: an infallible axum service that maps the
@@ -256,13 +324,31 @@ fn worker_routes(
 #[cfg(test)]
 mod tests {
     use std::error::Error;
+    use std::time::UNIX_EPOCH;
 
     use axum::middleware::from_fn_with_state;
     use axum::routing::get;
-    use gang_spi::{ApiResponseBody, Peer, PortError, full_body};
+    use base64::Engine;
+    use base64::prelude::BASE64_STANDARD_NO_PAD;
+    use futures::StreamExt;
+    use gang_spi::{ApiResponseBody, Peer, PortError, RenderedStoreSpec, full_body};
     use gang_testkit::TestResult;
-    use gang_types::{Identity, Principal, ProviderName};
+    use gang_types::{
+        Bytes, FleetName, FleetProperties, Identity, Isa, Principal, ProviderName, Resources,
+        property,
+    };
     use http::StatusCode;
+    use nativelink_proto::build::bazel::remote::execution::v2::RequestMetadata;
+    use nativelink_util::action_messages::{
+        ActionInfo, ActionUniqueKey, ActionUniqueQualifier, OperationId,
+    };
+    use nativelink_util::common::DigestInfo;
+    use nativelink_util::digest_hasher::DigestHasherFunc;
+    use nativelink_util::operation_state_manager::OperationFilter;
+    use nativelink_util::origin_event::{BAZEL_METADATA_KEY, request_metadata_from_baggage};
+    use opentelemetry::baggage::BaggageExt;
+    use prost::Message;
+    use serde_json::json;
     use tower::ServiceExt;
 
     use super::*;
@@ -322,6 +408,129 @@ mod tests {
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), 1024).await?;
         Ok((status, String::from_utf8(body.to_vec())?))
+    }
+
+    /// Fitting outside the historical layer would leave memory at 30 GiB. Losing the operation
+    /// ID handoff would fit against all fleets: B's CPU reduction (8000/12000) is smaller than
+    /// A's memory reduction (22/30), so CPU would become 4000 instead of remaining 12000.
+    #[tokio::test]
+    async fn scheduler_stack_fits_reservations_to_the_admitted_fleet() {
+        let fleets = FleetCatalog::try_new(
+            [("fleet-a", 16, 8_u64), ("fleet-b", 4, 32)]
+                .into_iter()
+                .map(|(name, vcpus, memory_gib)| {
+                    FleetProperties::new(
+                        &FleetName::try_new(name).expect("valid fleet name"),
+                        Isa::X86_64,
+                        &"docker",
+                        Resources {
+                            vcpus,
+                            memory: Bytes::new(memory_gib << 30),
+                            disk: Bytes::new(100_u64 << 30),
+                        },
+                        Vec::<(&'static str, String)>::new(),
+                    )
+                })
+                .collect(),
+        )
+        .expect("valid fleet catalog");
+        let config: NativeLinkConfig = serde_json::from_value(json!({
+            "scheduler_name": "MAIN_SCHEDULER",
+            "cold_start": { "memory": "30GiB" },
+        }))
+        .expect("valid controller config");
+        let store = RenderedStoreSpec(json!({ "memory": {} }));
+        let spec = ControllerSpec {
+            content_store: &store,
+            action_store: &store,
+            fleets: &fleets,
+            client_action_timeout: Duration::from_secs(600),
+        };
+        let mut scheduler = settings::scheduler(&config, &spec).expect("valid scheduler config");
+        let SchedulerSpec::HistoricalResource(historical) = &mut scheduler.spec else {
+            panic!("expected historical scheduler");
+        };
+        historical.learn_from_workers = false;
+        let (actions, _workers) = scheduler_stack(&scheduler, &fleets).expect("scheduler stack");
+        let operation = OperationId::String("stack-wiring".to_owned());
+        let digest = DigestInfo::new([1; 32], 1);
+        let info = Arc::new(ActionInfo {
+            command_digest: digest,
+            input_root_digest: digest,
+            timeout: Duration::from_secs(60),
+            platform_properties: [(property::CPU_MILLICORES.to_owned(), "12000".to_owned())]
+                .into_iter()
+                .collect(),
+            priority: 0,
+            load_timestamp: UNIX_EPOCH,
+            insert_timestamp: UNIX_EPOCH,
+            unique_qualifier: ActionUniqueQualifier::Cacheable(ActionUniqueKey {
+                execution_scope: None,
+                instance_name: String::new(),
+                digest_function: DigestHasherFunc::Sha256,
+                digest,
+            }),
+        });
+        actions
+            .add_action(operation.clone(), info)
+            .await
+            .expect("client request admits fleet A");
+        let mut results = actions
+            .filter_operations(OperationFilter {
+                client_operation_id: Some(operation),
+                ..Default::default()
+            })
+            .await
+            .expect("filter submitted operation");
+        let result = results.next().await.expect("submitted operation is queued");
+        let (info, _) = result.as_action_info().await.expect("queued action info");
+        assert_eq!(
+            info.platform_properties[property::CPU_MILLICORES],
+            "12000",
+            "scheduler stack must hand the admitted fleet to fitting by operation ID"
+        );
+        assert_eq!(
+            info.platform_properties[property::MEMORY_KB],
+            "8388608",
+            "scheduler stack must fit after historical cold-start memory is applied"
+        );
+    }
+
+    /// Confirms the client router puts Bazel request metadata in the scheduler's context.
+    #[tokio::test]
+    async fn request_metadata_reaches_the_scheduler_context() -> TestResult {
+        /// Returns the action identity from the current request's baggage.
+        async fn handler() -> String {
+            opentelemetry::Context::current()
+                .baggage()
+                .get(BAZEL_METADATA_KEY)
+                .and_then(|value| request_metadata_from_baggage(value.as_str()).ok())
+                .map_or_else(
+                    || "none".to_owned(),
+                    |metadata| format!("{} {}", metadata.target_id, metadata.action_mnemonic),
+                )
+        }
+
+        let metadata = RequestMetadata {
+            target_id: "//pkg:lib".to_owned(),
+            action_mnemonic: "Rustc".to_owned(),
+            ..Default::default()
+        };
+        let router =
+            with_request_metadata(Router::new().route("/probe", axum::routing::post(handler)));
+        let response = router
+            .oneshot(
+                Request::post("/probe")
+                    .header(
+                        "build.bazel.remote.execution.v2.requestmetadata-bin",
+                        BASE64_STANDARD_NO_PAD.encode(metadata.encode_to_vec()),
+                    )
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let body = axum::body::to_bytes(response.into_body(), 1024).await?;
+        assert_eq!(body.as_ref(), b"//pkg:lib Rustc");
+        Ok(())
     }
 
     #[tokio::test]

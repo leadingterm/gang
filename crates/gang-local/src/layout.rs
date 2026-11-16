@@ -252,7 +252,8 @@ mod tests {
 
         assert!(matches!(
             error,
-            LocalError::PrivateDir(gang_os::fs::PrivateDirError::NotPrivate { mode: 0o755, .. })
+            LocalError::PrivateDir(gang_os::fs::PrivateDirError::NotPrivate { mode, .. })
+                if mode == gang_os::fs::Mode::from_bits_retain(0o755)
         ));
         let mode = fs::metadata(dir.path())?.permissions().mode() & 0o777;
         assert_eq!(mode, 0o755);

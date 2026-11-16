@@ -32,7 +32,10 @@ pub const OVERSIZED_FLEET_DISK: &str = "1024TiB";
 pub const REFUSAL_RELAUNCH_BACKOFF: &str = "1s";
 
 /// The refusal reported by `gang-nativelink/src/placeable.rs` when no fleet accepts an action.
-pub const NO_FLEET_ACCEPTS: &str = "no fleet accepts the platform properties of this action";
+pub const NO_FLEET_ACCEPTS: &str = "no fleet accepts this action";
+
+/// The platform property the disk-guarded probe asks too much of; the refusal names it.
+pub const REFUSED_DISK_KEY: &str = "disk_kb";
 
 /// `[scheduler.nativelink.cold_start] memory` under [`ColdStart::Misfit`]: above the base fleet's
 /// `memory_per_instance`, so no fleet accepts the cold start.

@@ -78,7 +78,8 @@ probe(
     },
 )
 
-# Built together, so that the first fleet is at its instance limit while the second still waits.
+# Built together while the harness holds every pass until both are queued (crates/gang-e2e/src/fleets.rs), so
+# that one pass places them: the first fleet is then at its instance limit and the second overflows.
 probe(
     name = "overflow_first",
     script = "echo ran=first",

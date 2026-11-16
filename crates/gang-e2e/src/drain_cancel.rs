@@ -165,6 +165,8 @@ fn concerns(event: &Event, worker: &str, instance: &str) -> bool {
         | EventChange::WorkerDeregistered { worker: named } => named == worker,
         EventChange::Terminated { instance: named } => named == instance,
         EventChange::ScaledOut { .. }
+        | EventChange::LaunchFailed { .. }
+        | EventChange::Withdrawn { .. }
         | EventChange::ExitedEarly { .. }
         | EventChange::Unrecognized(_) => false,
     }

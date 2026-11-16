@@ -1,6 +1,6 @@
 # ADR-27: State is streamed as snapshot plus deltas over SSE
 
-Status: Accepted
+Status: Accepted. Amended by ADR-40: every watched pass changes the step in progress of the recent window, so it sends a delta.
 
 ## Context
 - The dashboard is one-way. A full frame is hundreds of KB at 1 Hz for large fleets. The stream must pass the per-request gate with the session cookie (ADR-28), work over HTTP/1.1 and h2 (ADR-09), and survive a lagging viewer.

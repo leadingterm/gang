@@ -49,10 +49,13 @@ unicode-width = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+axum = { workspace = true }
 gang-testkit = { workspace = true }
+hyper-util = { workspace = true, features = ["http2", "server-auto", "tokio"] }
 object = { workspace = true }
 rustix = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true }
 toml = { workspace = true }
 
 [[bin]]

@@ -172,3 +172,72 @@ fn action_priorities_reject_values_outside_int32() -> Result<(), Box<dyn Error>>
     }
     Ok(())
 }
+
+#[test]
+fn fleet_launch_failure_json_round_trips_and_is_omitted_when_absent() -> Result<(), Box<dyn Error>>
+{
+    let mut fleet = gang_wire::Fleet::default();
+    let absent = serde_json::to_value(&fleet)?;
+    assert!(absent.get("launchFailure").is_none());
+    assert_eq!(
+        serde_json::from_value::<gang_wire::Fleet>(absent.clone())?,
+        fleet
+    );
+
+    fleet.launch_failure = Some(gang_wire::LaunchFailure {
+        reason: "capacity unavailable".to_owned(),
+    });
+    let mut expected = absent;
+    expected["launchFailure"] = serde_json::json!({"reason": "capacity unavailable"});
+    assert_eq!(serde_json::to_value(&fleet)?, expected);
+    assert_eq!(serde_json::from_value::<gang_wire::Fleet>(expected)?, fleet);
+    Ok(())
+}
+
+#[test]
+fn queued_refusal_json_round_trips_and_is_omitted_when_absent() -> Result<(), Box<dyn Error>> {
+    let mut action = gang_wire::QueuedAction::default();
+    let absent = serde_json::to_value(&action)?;
+    assert!(absent.get("refusal").is_none());
+    assert_eq!(
+        serde_json::from_value::<gang_wire::QueuedAction>(absent.clone())?,
+        action
+    );
+
+    action.refusal = Some("no single fleet accepts every requested property".to_owned());
+    let mut expected = absent;
+    expected["refusal"] = serde_json::json!("no single fleet accepts every requested property");
+    assert_eq!(serde_json::to_value(&action)?, expected);
+    assert_eq!(
+        serde_json::from_value::<gang_wire::QueuedAction>(expected)?,
+        action
+    );
+    Ok(())
+}
+
+#[test]
+fn launch_failed_and_withdrawn_changes_round_trip_exact_json() -> Result<(), Box<dyn Error>> {
+    for (change, expected) in [
+        (
+            gang_wire::EventChange::LaunchFailed {
+                from: 2,
+                to: 4,
+                reason: "capacity unavailable".to_owned(),
+            },
+            serde_json::json!({
+                "launchFailed": {"from": 2, "to": 4, "reason": "capacity unavailable"}
+            }),
+        ),
+        (
+            gang_wire::EventChange::Withdrawn { from: 4, to: 2 },
+            serde_json::json!({"withdrawn": {"from": 4, "to": 2}}),
+        ),
+    ] {
+        assert_eq!(serde_json::to_value(&change)?, expected);
+        assert_eq!(
+            serde_json::from_value::<gang_wire::EventChange>(expected)?,
+            change
+        );
+    }
+    Ok(())
+}

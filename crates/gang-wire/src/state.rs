@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use gang_clock::Timestamp;
+use gang_clock::{Timestamp, millis_of};
 use serde::{Deserialize, Serialize};
 
 use crate::{Event, Isa};
@@ -97,9 +97,184 @@ pub struct State {
     /// restart.
     #[ts(type = "number")]
     pub completed: u64,
+    /// What this server observed over its recent window.
+    #[serde(default)]
+    pub recent: Recent,
     /// Epoch of the principal set, which advances when principals change.
     #[ts(type = "number")]
     pub principals_epoch: u64,
+}
+
+/// What this server observed over its recent window, oldest first. Every dashboard chart and rate
+/// is drawn from it, so a page shows the whole window from its first frame. It lives in the
+/// server's memory: a server that starts has none, and the steps before its first sample are not
+/// recorded (shown as such, never as zero).
+#[derive(
+    gang_macros::Known, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS,
+)]
+#[serde(rename_all = "camelCase")]
+#[ts(optional_fields)]
+pub struct Recent {
+    /// How far back samples reach; constant for the process.
+    #[serde(with = "crate::duration")]
+    #[ts(type = "Duration")]
+    pub window: Duration,
+    /// The span of one sample; constant for the process. `window` is a whole number of steps.
+    #[serde(with = "crate::duration")]
+    #[ts(type = "Duration")]
+    pub step: Duration,
+    /// One sample per step, oldest first, without holes; the last is the step in progress. At
+    /// most `window / step` samples.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<Sample>>", optional)]
+    pub samples: Vec<Sample>,
+}
+
+/// One step of [`Recent`].
+#[derive(
+    gang_macros::Known,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    Default,
+    ts_rs::TS,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct Sample {
+    /// Start of the step: a whole multiple of the step since the Unix epoch.
+    #[serde(with = "crate::time")]
+    #[ts(type = "Timestamp")]
+    pub start: Timestamp,
+    /// Actions that reached a terminal result during the step.
+    pub completed: u32,
+    /// Actions executing at the step's latest completed pass; 0 when `passes` is 0.
+    pub running: u32,
+    /// Actions queued at the step's latest completed pass; 0 when `passes` is 0.
+    pub queued: u32,
+    /// Control passes that completed during the step.
+    pub passes: u32,
+    /// Control passes skipped during the step.
+    pub skipped: u32,
+}
+
+/// A phase a worker was in, from `start` until the next span's start (the last one lasts).
+#[derive(
+    gang_macros::Known, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct PhaseSpan {
+    /// The phase.
+    pub phase: Phase,
+    /// When the worker entered it.
+    #[serde(with = "crate::time")]
+    #[ts(type = "Timestamp")]
+    pub start: Timestamp,
+}
+
+impl Recent {
+    /// An empty window of `window`, sampled every `step`.
+    #[must_use]
+    pub const fn new(window: Duration, step: Duration) -> Self {
+        Self {
+            window,
+            step,
+            samples: Vec::new(),
+        }
+    }
+
+    /// How many samples the window holds: `window / step`, at least 1.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        usize::try_from(millis_of(self.window) / millis_of(self.step).max(1))
+            .unwrap_or(usize::MAX)
+            .max(1)
+    }
+
+    /// Makes the sample of the step holding `at` the last one and lets `count` update it.
+    /// A time before the last sample's step counts into the last sample (the clock stepped back).
+    /// Steps skipped since the last sample get empty samples; a jump of a whole window or more
+    /// drops every sample first. At most `capacity` samples are kept, oldest dropped.
+    pub fn sample_at(&mut self, at: Timestamp, count: impl FnOnce(&mut Sample)) {
+        let step = millis_of(self.step).max(1);
+        let start = at.as_unix_millis() / step * step;
+        let capacity = self.capacity();
+        match self.samples.last() {
+            None => self.samples.push(Sample {
+                start: Timestamp::from_unix_millis(start),
+                ..Sample::default()
+            }),
+            Some(last) => {
+                let last = last.start.as_unix_millis();
+                if start > last {
+                    let steps = (start - last) / step;
+                    if steps >= u64::try_from(capacity).unwrap_or(u64::MAX) {
+                        self.samples.clear();
+                        self.samples.push(Sample {
+                            start: Timestamp::from_unix_millis(start),
+                            ..Sample::default()
+                        });
+                    } else {
+                        for offset in 1..=steps {
+                            self.samples.push(Sample {
+                                start: Timestamp::from_unix_millis(last + offset * step),
+                                ..Sample::default()
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        self.samples
+            .drain(..self.samples.len().saturating_sub(capacity));
+        if let Some(sample) = self.samples.last_mut() {
+            count(sample);
+        }
+    }
+
+    /// The increment that moves `prev` to `self`: `window`, `step`, and the samples of `self` from
+    /// the first one that `prev` lacks or holds differently. `None` when there is no such sample.
+    #[must_use]
+    pub fn increment(&self, prev: &Self) -> Option<Self> {
+        let first = self.samples.iter().position(|sample| {
+            prev.samples
+                .binary_search_by_key(&sample.start, |prior| prior.start)
+                .ok()
+                .is_none_or(|index| prev.samples[index] != *sample)
+        })?;
+        Some(Self {
+            window: self.window,
+            step: self.step,
+            samples: self.samples[first..].to_vec(),
+        })
+    }
+
+    /// Applies an increment: takes its `window` and `step`, drops the samples whose start is at
+    /// or after the increment's first, appends the increment's samples, then drops the samples
+    /// that start a whole window or more before the last one.
+    pub fn apply(&mut self, increment: &Self) {
+        self.window = increment.window;
+        self.step = increment.step;
+        if let Some(first) = increment.samples.first() {
+            let keep = self
+                .samples
+                .partition_point(|sample| sample.start < first.start);
+            self.samples.truncate(keep);
+            self.samples.extend_from_slice(&increment.samples);
+            if let Some(last) = self.samples.last() {
+                let last = last.start.as_unix_millis();
+                let window = millis_of(self.window);
+                let drop = self.samples.partition_point(|sample| {
+                    let start = sample.start.as_unix_millis();
+                    start < last && last - start >= window
+                });
+                self.samples.drain(..drop);
+            }
+        }
+    }
 }
 
 /// The outcome of the last scheduling pass.
@@ -239,12 +414,24 @@ pub struct Fleet {
     pub policy: Policy,
     /// The number of instances the fleet wants.
     pub desired: u32,
+    /// Why the newest launch attempt failed while the request is unmet and no launch is in
+    /// flight; absent when the request is met, a launch is in flight, or the provider cannot tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_failure: Option<LaunchFailure>,
     /// Instances by lifecycle.
     pub instances: InstanceCounts,
     /// Workers by phase.
     pub workers: WorkerCounts,
     /// The fleet's share of demand.
     pub demand: Demand,
+}
+
+/// The provisioner's reason for an unmet fleet request with no launch in flight.
+#[derive(gang_macros::Known, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchFailure {
+    /// The provider's failure message, verbatim.
+    pub reason: String,
 }
 
 /// The scaling bounds and timeouts of a fleet.
@@ -392,6 +579,11 @@ pub struct Worker {
     #[serde(with = "crate::time")]
     #[ts(type = "Timestamp")]
     pub launch_time: Timestamp,
+    /// The phases this server saw the worker in within the recent window, oldest first; the last
+    /// is the current phase, starting at `phase_time`. Before the first, the phase is not recorded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<PhaseSpan>>", optional)]
+    pub phases: Vec<PhaseSpan>,
 }
 
 /// An instance without a connected worker, named `instances/{instance}`.
@@ -491,6 +683,7 @@ pub struct RunningAction {
     gang_macros::Known, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS,
 )]
 #[serde(rename_all = "camelCase")]
+#[ts(optional_fields)]
 pub struct QueuedAction {
     /// Resource name, `actions/{op}`.
     pub name: String,
@@ -509,6 +702,9 @@ pub struct QueuedAction {
     /// References `fleets/{fleet}` of the fleets that accept the action; empty when
     /// unplaceable.
     pub candidates: Vec<String>,
+    /// Why no fleet accepts this action; absent when a fleet accepts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
 }
 
 /// A resource that carries its resource name.
@@ -546,6 +742,114 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+
+    #[test]
+    fn recent_samples_follow_steps_and_bound_the_window() {
+        let mut recent = Recent::new(Duration::from_secs(30), Duration::from_secs(10));
+        recent.sample_at(Timestamp::from_unix_millis(10_999), |sample| {
+            sample.completed = 3;
+        });
+        recent.sample_at(Timestamp::from_unix_millis(19_999), |sample| {
+            sample.passes = 1;
+        });
+        recent.sample_at(Timestamp::from_unix_millis(1_000), |sample| {
+            sample.skipped = 2;
+        });
+        assert_eq!(recent.samples.len(), 1);
+        assert_eq!(recent.samples[0].completed, 3);
+        assert_eq!(recent.samples[0].passes, 1);
+        assert_eq!(recent.samples[0].skipped, 2);
+        recent.sample_at(Timestamp::from_unix_millis(30_000), |sample| {
+            sample.running = 4;
+        });
+        assert_eq!(
+            recent
+                .samples
+                .iter()
+                .map(|s| s.start.as_unix_millis())
+                .collect::<Vec<_>>(),
+            vec![10_000, 20_000, 30_000]
+        );
+        assert_eq!(
+            recent.samples[1],
+            Sample {
+                start: Timestamp::from_unix_millis(20_000),
+                ..Sample::default()
+            }
+        );
+        recent.sample_at(Timestamp::from_unix_millis(40_000), |_| {});
+        assert_eq!(recent.samples.len(), recent.capacity());
+        assert_eq!(recent.samples[0].start.as_unix_millis(), 20_000);
+        recent.sample_at(Timestamp::from_unix_millis(70_000), |_| {});
+        assert_eq!(recent.samples.len(), 1);
+        assert_eq!(recent.samples[0].start.as_unix_millis(), 70_000);
+    }
+
+    #[test]
+    fn recent_increments_reconstruct_each_successive_window() {
+        for sequence in [
+            &[0, 1_000, 10_000, 30_000, 40_000, 80_000][..],
+            &[50_000, 20_000, 60_000, 70_000, 90_000][..],
+            &[10_000, 30_000, 50_000, 60_000, 70_000][..],
+        ] {
+            let mut current = Recent::new(Duration::from_secs(30), Duration::from_secs(10));
+            let mut previous = current.clone();
+            assert_eq!(current.increment(&previous), None);
+            for &at in sequence {
+                current.sample_at(Timestamp::from_unix_millis(at), |sample| {
+                    sample.completed = sample.completed.saturating_add(1);
+                });
+                let increment = current.increment(&previous).expect("sample changed");
+                previous.apply(&increment);
+                assert_eq!(previous, current);
+                assert_eq!(current.increment(&previous), None);
+            }
+        }
+    }
+
+    #[test]
+    fn recent_and_worker_phases_have_wire_json() {
+        let start = Timestamp::from_unix_millis(0);
+        let mut recent = Recent::new(Duration::from_secs(900), Duration::from_secs(10));
+        recent.sample_at(start, |sample| {
+            *sample = Sample {
+                start,
+                completed: 1,
+                running: 2,
+                queued: 3,
+                passes: 4,
+                skipped: 5,
+            };
+        });
+        let state = State {
+            recent,
+            ..State::default()
+        };
+        let value = serde_json::to_value(&state).expect("state serializes");
+        assert_eq!(
+            value["recent"],
+            json!({
+                "window": "900s", "step": "10s",
+                "samples": [{"start": "1970-01-01T00:00:00.000Z", "completed": 1,
+                    "running": 2, "queued": 3, "passes": 4, "skipped": 5}]
+            })
+        );
+        let mut worker = Worker::default();
+        assert!(
+            serde_json::to_value(&worker)
+                .expect("worker serializes")
+                .get("phases")
+                .is_none()
+        );
+        worker.phases.push(PhaseSpan {
+            phase: Phase::Busy,
+            start,
+        });
+        assert_eq!(
+            serde_json::to_value(&worker).expect("worker serializes")["phases"],
+            json!([{"phase": "BUSY", "start": "1970-01-01T00:00:00.000Z"}])
+        );
+    }
 
     fn round_trip<T>(value: &Value) -> T
     where
@@ -763,6 +1067,7 @@ mod tests {
             }],
             "eventsLimit": 200,
             "completed": 17,
+            "recent": {"window": "0s", "step": "0s"},
             "principalsEpoch": 3,
         });
         let state: State = round_trip(&value);

@@ -86,6 +86,18 @@ pub struct LoggedIn {
     pub expires_at: Timestamp,
 }
 
+/// Whether a stored session can be reused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionState {
+    /// The session is usable, with an optional identified principal.
+    Active {
+        /// The decoded identity, or `None` for an anonymous session.
+        principal: Option<String>,
+    },
+    /// A new login is needed.
+    NeedsLogin,
+}
+
 /// A bearer token for the server, with its expiry.
 #[derive(Debug, Clone)]
 pub struct BearerToken {
@@ -101,7 +113,8 @@ pub struct BazelrcRequest<'a> {
     pub server: &'a Url,
     /// The pin of the Gang CA public key; `None` trusts the system roots.
     pub ca_pin: Option<&'a CaPin>,
-    /// The credential helper command Bazel runs for the server's host.
+    /// The credential helper Bazel runs for the server's host; `gang bazelrc` passes the running
+    /// `gang` by absolute path, because Bazel looks a bare name up on its own `PATH`.
     pub helper: &'a str,
 }
 
@@ -384,6 +397,69 @@ impl<P: LoginProviders, C: Console, K: Clock + 'static> Client<P, C, K> {
         self.session_token(|_| Ok(())).await.map(|(_, token)| token)
     }
 
+    /// Returns the stored session's provider, if a login exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or session decoding error.
+    pub fn stored_provider(&self) -> Result<Option<ProviderName>, ClientError> {
+        Ok(Session::load(&self.home)?.map(|session| session.provider))
+    }
+
+    /// Returns the decoded identity of the stored bearer token's session, if identified.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Client::token`] or the session request, including an invalid
+    /// principal resource name.
+    pub async fn whoami(&self) -> Result<Option<String>, ClientError> {
+        let (api, bearer) = self.authorized().await?;
+        Self::session_identity(&api, &bearer).await
+    }
+
+    /// Checks whether the stored session can be reused and identifies its principal.
+    ///
+    /// # Errors
+    ///
+    /// Propagates token and session-request errors other than missing or rejected credentials.
+    pub async fn session_state(&self) -> Result<SessionState, ClientError> {
+        let result = async {
+            let (api, bearer) = self.authorized().await?;
+            Self::session_identity(&api, &bearer).await
+        }
+        .await;
+        match result {
+            Ok(principal) => Ok(SessionState::Active { principal }),
+            Err(
+                ClientError::NotLoggedIn
+                | ClientError::NoRefreshToken
+                | ClientError::RenewalRejected(_)
+                | ClientError::LoginRejected
+                | ClientError::DeviceLoginInvalid
+                | ClientError::Server {
+                    status: 401 | 403, ..
+                },
+            ) => Ok(SessionState::NeedsLogin),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Reads and decodes the identity of an authorized session.
+    async fn session_identity(
+        api: &ServerApi,
+        bearer: &BearerToken,
+    ) -> Result<Option<String>, ClientError> {
+        api.session(Some(&bearer.value))
+            .await?
+            .principal
+            .map(|principal| {
+                gang_wire::name::parse::<gang_wire::name::Principals>(&principal)
+                    .map(|identity| identity.to_string())
+                    .map_err(|error| ClientError::Body(serde::de::Error::custom(error)))
+            })
+            .transpose()
+    }
+
     /// Loads and checks the session and returns its bearer under one hold of the client lock.
     async fn session_token(
         &self,
@@ -454,7 +530,13 @@ impl<P: LoginProviders, C: Console, K: Clock + 'static> Client<P, C, K> {
                 url: request.server.clone(),
             })?;
         let info = api.server(None).await?;
-        let text = bazelrc::render(&info, host, request.helper);
+        let text = bazelrc::render(
+            &info,
+            host,
+            request.helper,
+            bazelrc::CA_FILE_NAME,
+            bazelrc::BazelrcWriter::Bazelrc,
+        );
         Ok(Bazelrc {
             text,
             ca_certificate: info.ca_certificate,
@@ -523,8 +605,8 @@ impl<P: LoginProviders, C: Console, K: Clock + 'static> Client<P, C, K> {
             };
             let response = match api.authenticate(&request).await {
                 Err(ClientError::LoginRejected) => {
-                    ClientHome::remove(&self.home.session_file())?;
-                    ClientHome::remove(&self.home.token_file())?;
+                    self.home.remove(&self.home.session_file())?;
+                    self.home.remove(&self.home.token_file())?;
                     self.forget_interactive_login()?;
                     return Err(ClientError::LoginRejected);
                 }
@@ -609,7 +691,7 @@ impl<P: LoginProviders, C: Console, K: Clock + 'static> Client<P, C, K> {
 
     /// The stored identity-provider proof, when it stays valid beyond the configured margin.
     fn stored_id_token(&self) -> Result<Option<Proof>, ClientError> {
-        let Some(bytes) = ClientHome::read(&self.home.id_token_file())? else {
+        let Some(bytes) = self.home.read(&self.home.id_token_file())? else {
             return Ok(None);
         };
         let text = String::from_utf8_lossy(&bytes).trim().to_owned();
@@ -621,7 +703,8 @@ impl<P: LoginProviders, C: Console, K: Clock + 'static> Client<P, C, K> {
     /// The stored bearer token, when one has been minted.
     fn stored_token(&self) -> Result<Option<StoredToken>, ClientError> {
         let path = self.home.token_file();
-        ClientHome::read(&path)?
+        self.home
+            .read(&path)?
             .map(|bytes| {
                 serde_json::from_slice::<StoredToken>(&bytes).map_err(|source| {
                     ClientError::Session {
@@ -647,18 +730,20 @@ impl<P: LoginProviders, C: Console, K: Clock + 'static> Client<P, C, K> {
 
     /// Removes the stored refresh token, for a login that brings none.
     fn remove_refresh_token(&self) -> Result<(), ClientError> {
-        ClientHome::remove(&self.home.refresh_token_file())
+        self.home.remove(&self.home.refresh_token_file())
     }
 
     /// Removes the interactive login's refresh token and identity-provider proof.
     fn forget_interactive_login(&self) -> Result<(), ClientError> {
         self.remove_refresh_token()?;
-        ClientHome::remove(&self.home.id_token_file())
+        self.home.remove(&self.home.id_token_file())
     }
 
     /// Reads the stored refresh token.
     fn stored_refresh_token(&self) -> Result<RefreshToken, ClientError> {
-        let bytes = ClientHome::read(&self.home.refresh_token_file())?
+        let bytes = self
+            .home
+            .read(&self.home.refresh_token_file())?
             .ok_or(ClientError::NoRefreshToken)?;
         Ok(RefreshToken::new(String::from_utf8_lossy(&bytes).trim()))
     }
@@ -917,6 +1002,7 @@ mod tests {
             remote_cache: Url::parse("grpcs://cache.example.test:443").expect("valid url"),
             ca_certificate: None,
             default_isa: gang_wire::Isa::X86_64,
+            version: None,
             authentication: Authentication::Unrecognized(serde_json::Map::new()),
         };
         assert!(matches!(

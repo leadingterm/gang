@@ -2039,7 +2039,7 @@ dependencies = [
 
 [[package]]
 name = "gang-authn"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "base64 0.23.1",
  "gang-clock",
@@ -2059,7 +2059,7 @@ dependencies = [
 
 [[package]]
 name = "gang-aws"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "aws-config",
  "aws-credential-types",
@@ -2093,7 +2093,7 @@ dependencies = [
 
 [[package]]
 name = "gang-bindings"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "gang-types",
  "gang-ui",
@@ -2106,7 +2106,7 @@ dependencies = [
 
 [[package]]
 name = "gang-bwrap"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "gang-os",
  "gang-spi",
@@ -2122,7 +2122,7 @@ dependencies = [
 
 [[package]]
 name = "gang-cgroup"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "gang-clock",
  "gang-spi",
@@ -2139,7 +2139,7 @@ dependencies = [
 
 [[package]]
 name = "gang-client"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2156,6 +2156,7 @@ dependencies = [
  "httpdate",
  "hyper-util",
  "parking_lot",
+ "rustix",
  "rustls",
  "serde",
  "serde_json",
@@ -2168,7 +2169,7 @@ dependencies = [
 
 [[package]]
 name = "gang-clock"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "gang-types",
  "parking_lot",
@@ -2182,7 +2183,7 @@ dependencies = [
 
 [[package]]
 name = "gang-config"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "gang-macros",
  "gang-types",
@@ -2195,7 +2196,7 @@ dependencies = [
 
 [[package]]
 name = "gang-deploy"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "base64 0.23.1",
  "hex",
@@ -2208,7 +2209,7 @@ dependencies = [
 
 [[package]]
 name = "gang-e2e"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2256,7 +2257,7 @@ dependencies = [
 
 [[package]]
 name = "gang-embed"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "hex",
  "sha2 0.11.1",
@@ -2266,7 +2267,7 @@ dependencies = [
 
 [[package]]
 name = "gang-exec"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "gang-config",
  "gang-os",
@@ -2284,7 +2285,7 @@ dependencies = [
 
 [[package]]
 name = "gang-local"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2311,7 +2312,7 @@ dependencies = [
 
 [[package]]
 name = "gang-macros"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2320,10 +2321,11 @@ dependencies = [
 
 [[package]]
 name = "gang-main"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anstream",
  "anstyle",
+ "axum",
  "clap",
  "gang-authn",
  "gang-aws",
@@ -2349,6 +2351,7 @@ dependencies = [
  "gang-types",
  "gang-wire",
  "gang-worker",
+ "hyper-util",
  "mimalloc",
  "object",
  "parking_lot",
@@ -2368,7 +2371,7 @@ dependencies = [
 
 [[package]]
 name = "gang-mtls"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "const-oid 0.10.2",
  "der 0.8.3",
@@ -2392,10 +2395,11 @@ dependencies = [
 
 [[package]]
 name = "gang-nativelink"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "axum",
+ "base64 0.23.1",
  "bytes",
  "futures",
  "gang-clock",
@@ -2417,6 +2421,7 @@ dependencies = [
  "nativelink-store",
  "nativelink-util",
  "nativelink-worker",
+ "opentelemetry",
  "parking_lot",
  "prost",
  "serde",
@@ -2432,7 +2437,7 @@ dependencies = [
 
 [[package]]
 name = "gang-noop"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "gang-os",
  "gang-spi",
@@ -2448,7 +2453,7 @@ dependencies = [
 
 [[package]]
 name = "gang-oidc"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2471,7 +2476,7 @@ dependencies = [
 
 [[package]]
 name = "gang-os"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "gang-testkit",
  "gang-types",
@@ -2484,7 +2489,7 @@ dependencies = [
 
 [[package]]
 name = "gang-reconciler"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "allocation-counter",
  "gang-clock",
@@ -2497,7 +2502,7 @@ dependencies = [
 
 [[package]]
 name = "gang-server"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "allocation-counter",
  "base64 0.23.1",
@@ -2536,7 +2541,7 @@ dependencies = [
 
 [[package]]
 name = "gang-spi"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bytes",
  "futures",
@@ -2557,7 +2562,7 @@ dependencies = [
 
 [[package]]
 name = "gang-sqlite"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "gang-clock",
  "gang-spi",
@@ -2573,7 +2578,7 @@ dependencies = [
 
 [[package]]
 name = "gang-state"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "allocation-counter",
  "bytes",
@@ -2592,7 +2597,7 @@ dependencies = [
 
 [[package]]
 name = "gang-testkit"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -2607,6 +2612,7 @@ dependencies = [
  "p256 0.14.0",
  "parking_lot",
  "rcgen",
+ "rustix",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -2620,7 +2626,7 @@ dependencies = [
 
 [[package]]
 name = "gang-tls"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bytes",
  "futures-core",
@@ -2648,7 +2654,7 @@ dependencies = [
 
 [[package]]
 name = "gang-types"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "allocation-counter",
  "base64 0.23.1",
@@ -2666,7 +2672,7 @@ dependencies = [
 
 [[package]]
 name = "gang-ui"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bytes",
  "http",
@@ -2674,7 +2680,7 @@ dependencies = [
 
 [[package]]
 name = "gang-wire"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "base64 0.23.1",
  "gang-clock",
@@ -2689,7 +2695,7 @@ dependencies = [
 
 [[package]]
 name = "gang-worker"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "gang-clock",
  "gang-config",
@@ -4249,6 +4255,7 @@ dependencies = [
  "js-sys",
  "pin-project-lite",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -4329,7 +4336,7 @@ dependencies = [
 
 [[package]]
 name = "opentofu-runner"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "tempfile",
  "thiserror",
@@ -6995,7 +7002,7 @@ dependencies = [
 
 [[package]]
 name = "workspace-architecture"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "serde",
  "syn 2.0.119",

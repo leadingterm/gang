@@ -28,6 +28,7 @@ mod enforcement;
 #[cfg(test)]
 mod equivalence;
 mod errors;
+mod fitted;
 mod gate;
 mod globals;
 mod open_file_limit;

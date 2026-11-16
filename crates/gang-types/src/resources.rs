@@ -16,6 +16,18 @@ pub struct Resources {
     pub disk: Bytes,
 }
 
+/// Resources one queued action requests. CPU is in millicores only; whole cores are converted
+/// where they are read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ActionResources {
+    /// CPU in millicores.
+    pub cpu_millicores: u64,
+    /// Memory size.
+    pub memory: Bytes,
+    /// Disk size.
+    pub disk: Bytes,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

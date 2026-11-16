@@ -1,6 +1,6 @@
 # ADR-25: Live state is derived every pass and never authoritative
 
-Status: Accepted. Builds on ADR-11.
+Status: Accepted. Builds on ADR-11. Partly superseded by ADR-40: the server now keeps the dashboard's recent history (samples and worker phases over a bounded window); the "no server-side phase history" decision and its rejected alternative no longer hold.
 
 ## Context
 - Operators need a live view of jobs, fleets, workers, scaling and principals. It must not become a second owner of facts, must not weaken the gate (ADR-05), and must work in `--insecure` Local Mode and behind a TLS-terminating proxy.

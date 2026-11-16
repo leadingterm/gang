@@ -36,9 +36,9 @@ pub(crate) fn signal_set(signals: &[libc::c_int]) -> libc::sigset_t {
     set
 }
 
-pub(crate) fn mkfifo(path: &CStr, mode: libc::mode_t) -> io::Result<()> {
+pub(crate) fn mkfifo(path: &CStr, mode: rustix::fs::Mode) -> io::Result<()> {
     // SAFETY: path is a valid NUL-terminated C string and mode is passed by value.
-    if unsafe { libc::mkfifo(path.as_ptr(), mode) } == -1 {
+    if unsafe { libc::mkfifo(path.as_ptr(), mode.bits()) } == -1 {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
