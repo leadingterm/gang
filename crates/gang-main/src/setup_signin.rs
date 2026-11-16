@@ -123,7 +123,7 @@ mod tests {
     use crate::output::Output;
 
     /// Creates a server document for the chosen authentication member.
-    fn info(authentication: Value) -> Server<Value> {
+    fn info(authentication: &Value) -> Server<Value> {
         serde_json::from_value(json!({
             "name": "server",
             "remoteExecutor": "grpcs://example.test:443",
@@ -162,7 +162,7 @@ mod tests {
             serde_json::to_vec(&json!({
                 "token": "cached-token",
                 "issued_at": 0,
-                "expires_at": 4102444800000_u64
+                "expires_at": 4_102_444_800_000_u64
             }))
             .expect("serialize token"),
         )
@@ -184,7 +184,7 @@ mod tests {
         let result = sign_in_with_home(
             &out,
             &target,
-            &info(json!({"token": {"login": {}}})),
+            &info(&json!({"token": {"login": {}}})),
             false,
             home,
         );
@@ -208,7 +208,7 @@ mod tests {
         let result = sign_in_with_home(
             &out,
             &target,
-            &info(json!({"token": {"login": {}}})),
+            &info(&json!({"token": {"login": {}}})),
             false,
             home,
         );
@@ -224,7 +224,7 @@ mod tests {
         let home = ClientHome::try_new(dir.path()).expect("client home");
         let (out, _, _) = Output::captured();
         assert_eq!(
-            sign_in_with_home(&out, &target(), &info(json!({"none": {}})), false, home)
+            sign_in_with_home(&out, &target(), &info(&json!({"none": {}})), false, home)
                 .expect("sign-in decision"),
             SignIn::NotNeeded
         );
@@ -239,7 +239,7 @@ mod tests {
             sign_in_with_home(
                 &out,
                 &target(),
-                &info(json!({"token": {"login": {}}})),
+                &info(&json!({"token": {"login": {}}})),
                 false,
                 home,
             )

@@ -66,6 +66,7 @@ pub mod plugins;
 mod progress;
 mod prompt;
 mod record;
+mod release_command;
 mod reset_command;
 mod runtime;
 mod server_command;

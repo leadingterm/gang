@@ -68,6 +68,31 @@ macro_rules! define_name {
         );
     };
 }
+/// Longest allowed invocation id, in characters.
+const INVOCATION_ID_MAX_LENGTH: usize = 64;
+/// Longest allowed action mnemonic, in characters.
+const MNEMONIC_MAX_LENGTH: usize = 128;
+/// Longest allowed target label, in characters.
+const TARGET_LABEL_MAX_LENGTH: usize = 1024;
+/// Longest allowed tool details, in characters.
+const TOOL_DETAILS_MAX_LENGTH: usize = 128;
+
+define_name! {
+    /// A client-asserted invocation id, at most 64 non-control characters.
+    InvocationId, "invocation id", is_free_text_char, Some(INVOCATION_ID_MAX_LENGTH)
+}
+define_name! {
+    /// An action mnemonic, at most 128 non-control characters.
+    Mnemonic, "action mnemonic", is_free_text_char, Some(MNEMONIC_MAX_LENGTH)
+}
+define_name! {
+    /// A target label, at most 1024 non-control characters.
+    TargetLabel, "target label", is_free_text_char, Some(TARGET_LABEL_MAX_LENGTH)
+}
+define_name! {
+    /// Tool name and version, at most 128 non-control characters.
+    ToolDetails, "tool details", is_free_text_char, Some(TOOL_DETAILS_MAX_LENGTH)
+}
 
 define_name! {
     /// Operator's name for an identity provider, such as `aws-workers`.
@@ -346,6 +371,20 @@ impl WorkerId {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    #[test]
+    fn build_metadata_names_enforce_nonempty_and_length_caps() {
+        macro_rules! check {
+            ($name:ty, $max:expr) => {
+                assert!(<$name>::try_new("").is_err());
+                assert!(<$name>::try_new("a".repeat($max)).is_ok());
+                assert!(<$name>::try_new("a".repeat($max + 1)).is_err());
+            };
+        }
+        check!(InvocationId, INVOCATION_ID_MAX_LENGTH);
+        check!(Mnemonic, MNEMONIC_MAX_LENGTH);
+        check!(TargetLabel, TARGET_LABEL_MAX_LENGTH);
+        check!(ToolDetails, TOOL_DETAILS_MAX_LENGTH);
+    }
 
     #[test]
     fn provider_name_accepts_slugs_and_rejects_bad_input() {

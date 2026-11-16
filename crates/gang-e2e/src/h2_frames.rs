@@ -353,7 +353,7 @@ mod tests {
 
     /// A server on one end of an in-memory connection. It answers every request at its headers
     /// with a trailers-only `grpc-status: 7`, as the server's gate refuses a revoked principal,
-    /// and leaves the request's body unread, which resets the stream with NO_ERROR. It drops the
+    /// and leaves the request's body unread, which resets the stream with `NO_ERROR`. It drops the
     /// connection when `close` fires or the client ends the connection.
     async fn serve(io: DuplexStream, close: oneshot::Receiver<()>) {
         let Ok(mut connection) = h2::server::handshake(io).await else {

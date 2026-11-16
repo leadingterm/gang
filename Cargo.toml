@@ -14,6 +14,7 @@ members = [
     "crates/gang-e2e",
     "crates/gang-embed",
     "crates/gang-exec",
+    "crates/gang-insight",
     "crates/gang-local",
     "crates/gang-macros",
     "crates/gang-main",
@@ -40,7 +41,7 @@ resolver = "2"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
-version = "0.1.6"
+version = "0.2.0"
 
 [workspace.lints.rust]
 missing_docs = "deny"
@@ -132,6 +133,7 @@ gang-deploy = { path = "crates/gang-deploy" }
 gang-e2e = { path = "crates/gang-e2e" }
 gang-embed = { path = "crates/gang-embed" }
 gang-exec = { path = "crates/gang-exec" }
+gang-insight = { path = "crates/gang-insight" }
 gang-local = { path = "crates/gang-local" }
 gang-macros = { path = "crates/gang-macros" }
 gang-main = { path = "crates/gang-main" }
@@ -177,6 +179,7 @@ ipnet = { features = [
 ], version = "2.12" }
 itertools = { version = "0.14" }
 itoa = { version = "1" }
+jiff = { default-features = false, features = ["std", "tzdb-bundle-always"], version = "0.2.46" }
 jsonwebtoken = { features = [
     "rust_crypto",
 ], version = "11" }

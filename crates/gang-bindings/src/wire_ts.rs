@@ -51,6 +51,18 @@ fn collect(cfg: &Config) -> BTreeMap<String, String> {
     walk::<gang_wire::ListPrincipalsResponse>(cfg, &mut out, &mut seen);
     walk::<gang_wire::ListRolesResponse>(cfg, &mut out, &mut seen);
     walk::<gang_wire::ListEventsResponse>(cfg, &mut out, &mut seen);
+    walk::<gang_wire::ListBuildsResponse>(cfg, &mut out, &mut seen);
+    walk::<gang_wire::BuildState>(cfg, &mut out, &mut seen);
+    walk::<gang_wire::Build>(cfg, &mut out, &mut seen);
+    walk::<gang_wire::Usage>(cfg, &mut out, &mut seen);
+    walk::<gang_wire::CacheCounts>(cfg, &mut out, &mut seen);
+    walk::<gang_wire::Executions>(cfg, &mut out, &mut seen);
+    walk::<gang_wire::ActionTime>(cfg, &mut out, &mut seen);
+    walk::<gang_wire::MnemonicUsage>(cfg, &mut out, &mut seen);
+    walk::<gang_wire::MissedTarget>(cfg, &mut out, &mut seen);
+    walk::<gang_wire::SlowAction>(cfg, &mut out, &mut seen);
+    walk::<gang_wire::Timeline>(cfg, &mut out, &mut seen);
+    walk::<gang_wire::TimelineBucket>(cfg, &mut out, &mut seen);
     walk::<gang_wire::State>(cfg, &mut out, &mut seen);
     walk::<gang_wire::Frame>(cfg, &mut out, &mut seen);
     walk::<gang_wire::EventChange>(cfg, &mut out, &mut seen);
@@ -190,12 +202,31 @@ mod tests {
             "{rendered}"
         );
         assert!(
-            rendered.contains("export type Cause = \"DEMAND\" | \"IDLE_TIMEOUT\""),
+            rendered.contains("export type Cause = \"DEMAND\" | \"MINIMUM\" | \"IDLE_TIMEOUT\""),
             "{rendered}"
         );
         assert!(rendered.contains("export type State = "), "{rendered}");
         assert!(rendered.contains("export type Frame = "), "{rendered}");
         assert!(rendered.contains("export type Delta = "), "{rendered}");
+        for name in [
+            "BuildState",
+            "Build",
+            "Usage",
+            "CacheCounts",
+            "Executions",
+            "ActionTime",
+            "MnemonicUsage",
+            "MissedTarget",
+            "SlowAction",
+            "Timeline",
+            "TimelineBucket",
+            "ListBuildsResponse",
+        ] {
+            assert!(
+                rendered.contains(&format!("export type {name} = ")),
+                "{rendered}"
+            );
+        }
     }
 
     #[test]
@@ -212,6 +243,8 @@ mod tests {
     fn paths_list_every_route_and_the_browser_pages() {
         let rendered = paths_decl().unwrap();
         for line in [
+            "  listBuilds: \"/v1/builds\",",
+            "  getBuild: \"/v1/builds/{build}\",",
             "  watchState: \"/v1/state:watch\",",
             "  getSession: \"/v1/session\",",
             "  createDeviceAuthorization: \"/v1/deviceAuthorizations\",",

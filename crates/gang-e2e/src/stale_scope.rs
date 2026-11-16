@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::build_output::BuildOutcome;
 use crate::check::Check;
 use crate::errors::{E2eError, Result};
 use crate::execution::{Execution, Lines, Proc, Role, held_build};
@@ -21,8 +22,10 @@ const STRAY_MARKER: &str = "e2e-stray";
 /// What the journal and process table reveal about a stray.
 #[derive(Debug)]
 enum StrayObservation {
-    /// No matching process was observed.
-    NotStarted,
+    /// The build ended without the stray reporting its pid.
+    NeverReported,
+    /// The stray reported its pid but was not in the deployment's process table.
+    Gone { pid: u32 },
     /// The process was found without a cgroup scope.
     MissingScope { pid: u32 },
     /// The process and its scope were found.
@@ -31,9 +34,24 @@ enum StrayObservation {
 
 impl StrayObservation {
     /// Returns the stray or describes why it cannot be used for a scope check.
-    fn into_started(self, stray: &str) -> std::result::Result<Stray, String> {
+    fn into_started(
+        self,
+        stray: &str,
+        build: &BuildOutcome,
+        tail_lines: usize,
+    ) -> std::result::Result<Stray, String> {
         match self {
-            Self::NotStarted => Err(format!("{stray} never reported its pid and scope")),
+            Self::NeverReported => Err(format!(
+                "{stray} never reported its pid; the build exited with {:?}: {}",
+                build.exit_code,
+                build.stderr_tail(tail_lines)
+            )),
+            Self::Gone { pid } => Err(format!(
+                "{stray} {pid} reported its pid but is not in the deployment's process table; \
+                 the build exited with {:?}: {}",
+                build.exit_code,
+                build.stderr_tail(tail_lines)
+            )),
             Self::MissingScope { pid } => Err(format!("{stray} {pid} has no cgroup scope")),
             Self::Started(stray) => Ok(stray),
         }
@@ -63,8 +81,8 @@ pub fn stale_scope<S: System, E: Execution>(
     system.start_server()?;
     let mut checks = oom(system, exec, Probe::Pinned, stderr_tail_lines)?;
 
-    let (observation, reaped) = guard_reaps(system, exec, hold_timeout)?;
-    if let Err(failure) = observation.into_started("the stray") {
+    let (held, observation, reaped) = guard_reaps(system, exec, hold_timeout)?;
+    if let Err(failure) = observation.into_started("the stray", &held, stderr_tail_lines) {
         checks.push(Check::failed(STRAY_STARTED, failure.clone()));
         checks.extend(Check::skipped_all(
             [
@@ -81,7 +99,12 @@ pub fn stale_scope<S: System, E: Execution>(
     checks.push(Check::expect(GUARD_REAPS_SCOPE, reaped, || {
         "the guard did not finish reaping the scope and stray".to_owned()
     }));
-    checks.extend(stale_construction(system, exec, hold_timeout)?);
+    checks.extend(stale_construction(
+        system,
+        exec,
+        stderr_tail_lines,
+        hold_timeout,
+    )?);
     Ok(checks)
 }
 
@@ -90,9 +113,9 @@ fn guard_reaps<S: System, E: Execution>(
     system: &S,
     exec: &E,
     hold_timeout: Duration,
-) -> Result<(StrayObservation, bool)> {
+) -> Result<(BuildOutcome, StrayObservation, bool)> {
     exec.set_go(false)?;
-    let (_held, observed) = held_build(system, exec, &[Probe::Stray], |lines| {
+    let (held, observed) = held_build(system, exec, &[Probe::Stray], |lines| {
         let stray = match await_stray(exec, lines)? {
             StrayObservation::Started(stray) => stray,
             observation => return Ok((observation, false)),
@@ -121,19 +144,20 @@ fn guard_reaps<S: System, E: Execution>(
         cleanup(exec, &stray)?;
         Ok((StrayObservation::Started(stray), reaped))
     })?;
-    Ok(observed)
+    Ok((held, observed.0, observed.1))
 }
 
 /// Constructs a stale scope without a guard, then observes both worker sweeps.
 fn stale_construction<S: System, E: Execution>(
     system: &S,
     exec: &E,
+    stderr_tail_lines: usize,
     hold_timeout: Duration,
 ) -> Result<Vec<Check>> {
     let mut checks = Vec::new();
 
     exec.set_go(false)?;
-    let (_held, stray) = held_build(system, exec, &[Probe::Stray], |lines| {
+    let (held, stray) = held_build(system, exec, &[Probe::Stray], |lines| {
         let stray = match await_stray(exec, lines)? {
             StrayObservation::Started(stray) => stray,
             observation => return Ok((observation, false)),
@@ -142,7 +166,7 @@ fn stale_construction<S: System, E: Execution>(
         Ok((StrayObservation::Started(stray), killed))
     })?;
     let (observation, guards_killed) = stray;
-    let stray = match observation.into_started("the second stray") {
+    let stray = match observation.into_started("the second stray", &held, stderr_tail_lines) {
         Ok(stray) => stray,
         Err(failure) => {
             checks.push(Check::failed(SCOPE_OUTLIVES_EXEC, failure.clone()));
@@ -210,7 +234,7 @@ fn stale_construction<S: System, E: Execution>(
     }
     cleanup(exec, &stray)?;
 
-    replaced_worker(system, exec, &mut checks, hold_timeout)?;
+    replaced_worker(system, exec, &mut checks, stderr_tail_lines, hold_timeout)?;
     Ok(checks)
 }
 
@@ -218,10 +242,11 @@ fn replaced_worker<S: System, E: Execution>(
     system: &S,
     exec: &E,
     checks: &mut Vec<Check>,
+    stderr_tail_lines: usize,
     hold_timeout: Duration,
 ) -> Result<()> {
     exec.set_go(false)?;
-    let (_held, stray) = held_build(system, exec, &[Probe::Stray], |lines| {
+    let (held, stray) = held_build(system, exec, &[Probe::Stray], |lines| {
         let stray = match await_stray(exec, lines)? {
             StrayObservation::Started(stray) => stray,
             observation => return Ok((observation, Vec::new())),
@@ -267,7 +292,7 @@ fn replaced_worker<S: System, E: Execution>(
         Ok((StrayObservation::Started(stray), unmet))
     })?;
     let (observation, unmet) = stray;
-    let stray = match observation.into_started("the second stray") {
+    let stray = match observation.into_started("the third stray", &held, stderr_tail_lines) {
         Ok(stray) => stray,
         Err(failure) => {
             checks.push(Check::failed(GONE_BEFORE_REPLACEMENT_SERVES, failure));
@@ -316,7 +341,7 @@ fn replaced_worker<S: System, E: Execution>(
 /// Returns journal, process-table, and parse errors.
 fn await_stray<E: Execution>(exec: &E, lines: &mut Lines<'_, E>) -> Result<StrayObservation> {
     let Some(line) = lines.await_prefix("stray ")? else {
-        return Ok(StrayObservation::NotStarted);
+        return Ok(StrayObservation::NeverReported);
     };
     let pid: u32 = line
         .trim_start_matches("stray ")
@@ -332,7 +357,7 @@ fn observe_stray(pid: u32, processes: Vec<Proc>) -> StrayObservation {
         process.pid == pid
             && matches!(&process.role, Role::Marked(marker) if marker == STRAY_MARKER)
     }) else {
-        return StrayObservation::NotStarted;
+        return StrayObservation::Gone { pid };
     };
     match process.cgroup {
         Some(scope) => StrayObservation::Started(Stray { pid, scope }),
@@ -410,6 +435,7 @@ fn cleanup<E: Execution>(exec: &E, stray: &Stray) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{STRAY_MARKER, StrayObservation, observe_stray};
+    use crate::build_output::BuildOutcome;
     use crate::execution::{Proc, Role};
 
     #[test]
@@ -428,8 +454,46 @@ mod tests {
             StrayObservation::MissingScope { pid: 42 }
         ));
         assert_eq!(
-            observation.into_started("the stray").err().as_deref(),
+            observation
+                .into_started("the stray", &BuildOutcome::new(Some(0), String::new()), 2)
+                .err()
+                .as_deref(),
             Some("the stray 42 has no cgroup scope")
+        );
+    }
+
+    #[test]
+    fn an_unlisted_stray_is_gone_not_unreported() {
+        let observation = observe_stray(42, vec![]);
+        assert!(matches!(&observation, StrayObservation::Gone { pid: 42 }));
+        assert_eq!(
+            observation
+                .into_started(
+                    "the stray",
+                    &BuildOutcome::new(Some(1), "a\nb\nc".to_owned()),
+                    2,
+                )
+                .err()
+                .as_deref(),
+            Some(
+                "the stray 42 reported its pid but is not in the deployment's process table; \
+                 the build exited with Some(1): b\nc"
+            )
+        );
+    }
+
+    #[test]
+    fn an_unreported_stray_quotes_the_build() {
+        assert_eq!(
+            StrayObservation::NeverReported
+                .into_started(
+                    "the stray",
+                    &BuildOutcome::new(Some(1), "a\nb\nc".to_owned()),
+                    2,
+                )
+                .err()
+                .as_deref(),
+            Some("the stray never reported its pid; the build exited with Some(1): b\nc")
         );
     }
 }

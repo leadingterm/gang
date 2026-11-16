@@ -12,6 +12,7 @@ workspace_rust_library(
     test_runtime_data = ["//ui:fixtures"],
     deps = [
         "//crates/gang-clock:gang_clock",
+        "//crates/gang-insight:gang_insight",
         "//crates/gang-reconciler:gang_reconciler",
         "//crates/gang-spi:gang_spi",
         "//crates/gang-types:gang_types",

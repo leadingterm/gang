@@ -24,6 +24,7 @@ extern crate self as gang_wire;
 
 #[macro_use]
 mod enumeration;
+mod build;
 mod certificate;
 mod device;
 pub mod duration;
@@ -43,6 +44,10 @@ mod session;
 mod state;
 pub mod time;
 
+pub use build::{
+    ActionTime, Build, BuildState, CacheCounts, Executions, ListBuildsResponse, MissedTarget,
+    MnemonicUsage, SlowAction, Timeline, TimelineBucket, Usage,
+};
 pub use certificate::{Certificate, CreateCertificateRequest};
 pub use device::{
     ApproveDeviceAuthorizationRequest, ApproveDeviceAuthorizationResponse, DeviceAuthorization,

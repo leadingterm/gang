@@ -2,15 +2,16 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { setImmediate as flush } from "node:timers/promises";
-import { loginUrl, StateClient, type Environment, type FrameData, type StreamSource } from "../src/client.ts";
+import { BUILDS_REFRESH_MS, HttpError, loginUrl, PAGE_MAX, StateClient, type Environment, type FrameData, type StreamSource } from "../src/client.ts";
 import { idOf, ms } from "../src/wire-parse.ts";
-import { PATHS, type Frame, type ScalingEvent, type Session } from "../src/wire.ts";
+import { PATHS, type Build, type Frame, type ScalingEvent, type Session } from "../src/wire.ts";
 import { iso, load, snapshotOf } from "./sse.ts";
 
 const session = JSON.parse(readFileSync(new URL("../fixtures/session.json", import.meta.url), "utf8")) as Session;
 const defaultSession = { ...session, expireTime: undefined };
 const anonymous: Session = { name: session.name, permissions: [] };
 const snapshot = snapshotOf(load("live"));
+const build = JSON.parse(readFileSync(new URL("../fixtures/build.json", import.meta.url), "utf8")) as Build;
 const t0 = ms(snapshot.updateTime);
 
 const PRINCIPALS = `${PATHS.listPrincipals}?pageSize=500`;
@@ -37,9 +38,15 @@ class FakeSource implements StreamSource {
   }
 }
 
+interface Scheduled {
+  readonly delay: number;
+  fired: boolean;
+  run(): void;
+}
+
 class FakeEnvironment implements Environment {
   readonly sources: FakeSource[] = [];
-  readonly scheduled: { run: () => void; delay: number }[] = [];
+  readonly scheduled: Scheduled[] = [];
   readonly navigations: string[] = [];
   readonly responses = new Map<string, unknown>([[PATHS.getSession, defaultSession]]);
   readonly fetched: string[] = [];
@@ -67,8 +74,13 @@ class FakeEnvironment implements Environment {
     return this.clock;
   }
   schedule(run: () => void, delay: number): () => void {
-    this.scheduled.push({ run, delay });
-    return () => {};
+    const entry: Scheduled = { delay, fired: false, run: () => { entry.fired = true; run(); } };
+    this.scheduled.push(entry);
+    // As `clearTimeout`: cancelling removes a pending entry; a fired or already cancelled one is left alone.
+    return () => {
+      const i = this.scheduled.indexOf(entry);
+      if (!entry.fired && i !== -1) this.scheduled.splice(i, 1);
+    };
   }
   navigate(url: string): void {
     this.navigations.push(url);
@@ -83,6 +95,20 @@ class FakeEnvironment implements Environment {
   }
 }
 
+test("the fake environment cancels a pending entry, and nothing once it fired", () => {
+  const env = new FakeEnvironment();
+  const ran: string[] = [];
+  const cancelA = env.schedule(() => ran.push("a"), 1);
+  const cancelB = env.schedule(() => ran.push("b"), 2);
+  cancelA();
+  cancelA();
+  assert.deepEqual(env.scheduled.map((s) => s.delay), [2]);
+  env.scheduled[0]?.run();
+  cancelB();
+  assert.deepEqual(env.scheduled.map((s) => s.delay), [2]);
+  assert.deepEqual(ran, ["b"]);
+});
+
 const live = async (): Promise<{ env: FakeEnvironment; client: StateClient }> => {
   const env = new FakeEnvironment();
   const client = new StateClient(env);
@@ -94,6 +120,46 @@ const live = async (): Promise<{ env: FakeEnvironment; client: StateClient }> =>
   return { env, client };
 };
 
+const LIST = `${PATHS.listBuilds}?pageSize=200`;
+/** A ten-minute session, admitted at the fake's start clock, renews after eight minutes. */
+const EXPIRING = { expireTime: iso(1000 + 10 * 60_000) };
+const RENEWAL_MS = 8 * 60_000;
+const pathOf = (id: string): string => PATHS.getBuild.replace("{build}", encodeURIComponent(id));
+const named = (id: string): Build => ({ ...build, name: `builds/${id}` });
+
+const buildOnly = async (over: Partial<Session> = {}): Promise<{ env: FakeEnvironment; client: StateClient }> => {
+  const env = new FakeEnvironment();
+  env.responses.set(PATHS.getSession, { ...defaultSession, permissions: ["builds.read"], ...over });
+  const client = new StateClient(env);
+  await client.start();
+  return { env, client };
+};
+
+const pendingRefreshes = (env: FakeEnvironment): Scheduled[] =>
+  env.scheduled.filter((entry) => entry.delay === BUILDS_REFRESH_MS && !entry.fired);
+
+/** Fires the one scheduled builds refresh without waiting for it. */
+const startRefresh = (env: FakeEnvironment): void => {
+  const pending = pendingRefreshes(env);
+  assert.equal(pending.length, 1, "exactly one builds refresh is scheduled");
+  const [entry] = pending;
+  assert.ok(entry);
+  entry.run();
+};
+
+const refreshBuilds = async (env: FakeEnvironment): Promise<void> => {
+  startRefresh(env);
+  await flush();
+};
+
+/** Fires the latest pending renewal (the clock must not have moved since that admission). */
+const renew = async (env: FakeEnvironment): Promise<void> => {
+  const entry = env.scheduled.filter((s) => s.delay === RENEWAL_MS && !s.fired).at(-1);
+  assert.ok(entry, "a renewal is scheduled");
+  entry.run();
+  await flush();
+};
+
 /** An event of the ledger as `base` with another position and time. */
 const eventAt = (base: ScalingEvent, seq: number, createTime: number): ScalingEvent => ({
   ...base,
@@ -102,6 +168,75 @@ const eventAt = (base: ScalingEvent, seq: number, createTime: number): ScalingEv
 });
 
 const seqs = (events: readonly ScalingEvent[] | undefined): number[] => (events ?? []).map((e) => Number(idOf(e.name)));
+
+test("build loading encodes ids, keeps the same detail during refresh, and handles 404", async () => {
+  const env = new FakeEnvironment();
+  const client = new StateClient(env);
+  const id = "build/with space";
+  const path = "/v1/builds/build%2Fwith%20space";
+  env.responses.set(path, build);
+  await client.loadBuild(id);
+  assert.equal(env.fetched.at(-1), path);
+  assert.deepEqual(client.build.value, { kind: "loaded", id, build, asOf: 1000, failing: false });
+  const refresh = client.loadBuild(id);
+  assert.deepEqual(client.build.value, { kind: "loaded", id, build, asOf: 1000, failing: false });
+  await refresh;
+  env.responses.set("/v1/builds/missing", new HttpError(404));
+  await client.loadBuild("missing");
+  assert.deepEqual(client.build.value, { kind: "missing", id: "missing" });
+});
+
+test("held builds load successive pages without duplicate names", async () => {
+  const env = new FakeEnvironment();
+  const client = new StateClient(env);
+  env.responses.set("/v1/builds?pageSize=200", { builds: [build], nextPageToken: "next" });
+  env.responses.set("/v1/builds?pageSize=200&pageToken=next", { builds: [build, { ...build, name: "builds/other" }] });
+  await client.loadEarlierBuilds();
+  await client.loadEarlierBuilds();
+  const earlier = client.earlierBuilds.value;
+  assert.equal(earlier.kind, "loaded");
+  if (earlier.kind === "loaded") {
+    assert.deepEqual(earlier.builds.map((b) => b.name), [build.name, "builds/other"]);
+    assert.equal(earlier.next, undefined);
+  }
+});
+
+test("a failed first page of held builds is an error, a failed later page keeps the list", async () => {
+  const env = new FakeEnvironment();
+  const client = new StateClient(env);
+  env.responses.set("/v1/builds?pageSize=200", new HttpError(500));
+  await client.loadEarlierBuilds();
+  assert.deepEqual(client.earlierBuilds.value, { kind: "error", loading: false });
+  env.responses.set("/v1/builds?pageSize=200", { builds: [build], nextPageToken: "next" });
+  env.responses.set("/v1/builds?pageSize=200&pageToken=next", new HttpError(500));
+  await client.loadEarlierBuilds();
+  await client.loadEarlierBuilds();
+  assert.deepEqual(client.earlierBuilds.value, { kind: "loaded", builds: [build], next: "next", loading: false, asOf: 1000, failing: false });
+});
+
+test("build deltas refresh held rows and removals invalidate pages", async () => {
+  const { env, client } = await live();
+  client.earlierBuilds.value = { kind: "loaded", builds: [build], next: undefined, loading: false, asOf: t0, failing: false };
+  const updated = { ...build, state: "IDLE" as const };
+  env.source.emit("delta", { seq: snapshot.seq + 1, base: snapshot.seq, updateTime: snapshot.updateTime, builds: { upsert: [updated] } });
+  const held = client.earlierBuilds.value;
+  assert.equal(held.kind, "loaded");
+  if (held.kind === "loaded") assert.deepEqual(held.builds[0], updated);
+  env.source.emit("delta", { seq: snapshot.seq + 2, base: snapshot.seq + 1, updateTime: snapshot.updateTime, builds: { remove: [build.name] } });
+  assert.deepEqual(client.earlierBuilds.value, { kind: "unloaded", loading: false });
+});
+
+test("a snapshot invalidates held pages and discards their in-flight response", async () => {
+  const { env, client } = await live();
+  const { promise, resolve } = Promise.withResolvers<unknown>();
+  env.responses.set("/v1/builds?pageSize=200", promise);
+  const pending = client.loadEarlierBuilds();
+  env.source.emit("snapshot", snapshot);
+  assert.deepEqual(client.earlierBuilds.value, { kind: "unloaded", loading: false });
+  resolve({ builds: [build] });
+  await pending;
+  assert.deepEqual(client.earlierBuilds.value, { kind: "unloaded", loading: false });
+});
 
 test("a delta on another base reconnects", async () => {
   const { env } = await live();
@@ -565,4 +700,529 @@ test("a pending earlier page is discarded after a snapshot gap", async () => {
   resolve({ events: [base], nextPageToken: "stale" });
   await pending;
   assert.deepEqual(client.earlier.value, { kind: "unloaded", loading: false });
+});
+
+test("a build-only session reloads the open build until it is idle", async () => {
+  const { env, client } = await buildOnly();
+  const id = idOf(build.name);
+  env.responses.set(pathOf(id), build);
+  await client.loadBuild(id);
+  const updated: Build = { ...build, state: "IDLE", usage: { ...build.usage, executions: { ...build.usage.executions, completed: build.usage.executions.completed + 1 } } };
+  env.responses.set(pathOf(id), updated);
+  env.clock = 6_000;
+  await refreshBuilds(env);
+  assert.deepEqual(client.build.value, { kind: "loaded", id, build: updated, asOf: 6_000, failing: false });
+  assert.equal(pendingRefreshes(env).length, 1);
+});
+
+test("stop ends the builds refresh, also one in flight", async () => {
+  const first = await buildOnly();
+  assert.equal(pendingRefreshes(first.env).length, 1);
+  first.client.stop();
+  assert.equal(pendingRefreshes(first.env).length, 0);
+  const { env, client } = await buildOnly();
+  env.responses.set(LIST, { builds: [build] });
+  await client.loadEarlierBuilds();
+  const answer = Promise.withResolvers<unknown>();
+  env.responses.set(LIST, answer.promise);
+  startRefresh(env);
+  client.stop();
+  answer.resolve({ builds: [build] });
+  await flush();
+  assert.equal(pendingRefreshes(env).length, 0);
+});
+
+test("every admission leaves exactly one builds refresh", async () => {
+  const { env, client } = await buildOnly(EXPIRING);
+  await renew(env);
+  await renew(env);
+  assert.equal(pendingRefreshes(env).length, 1);
+  env.responses.set(LIST, { builds: [build] });
+  await client.loadEarlierBuilds();
+  const answer = Promise.withResolvers<unknown>();
+  env.responses.set(LIST, answer.promise);
+  startRefresh(env);
+  await renew(env);
+  answer.resolve({ builds: [build] });
+  await flush();
+  assert.equal(pendingRefreshes(env).length, 1);
+});
+
+test("load earlier during a refresh continues the page its token belongs to, whichever answers first", async () => {
+  for (const refreshFirst of [true, false]) {
+    const { env, client } = await buildOnly();
+    const [b1, b2, b3, n1] = ["b1", "b2", "b3", "n1"].map(named) as [Build, Build, Build, Build];
+    env.responses.set(LIST, { builds: [b1, b2], nextPageToken: "tok" });
+    await client.loadEarlierBuilds();
+    const refresh = Promise.withResolvers<unknown>();
+    const page = Promise.withResolvers<unknown>();
+    env.responses.set(LIST, refresh.promise);
+    env.responses.set(`${LIST}&pageToken=tok`, page.promise);
+    startRefresh(env);
+    const loading = client.loadEarlierBuilds();
+    if (refreshFirst) {
+      refresh.resolve({ builds: [n1, b1], nextPageToken: "tok-new" });
+      await flush();
+      page.resolve({ builds: [b3] });
+    } else {
+      page.resolve({ builds: [b3] });
+      await flush();
+      refresh.resolve({ builds: [n1, b1], nextPageToken: "tok-new" });
+    }
+    await loading;
+    await flush();
+    assert.deepEqual(client.earlierBuilds.value, { kind: "loaded", builds: [b1, b2, b3], next: undefined, loading: false, asOf: 1000, failing: false }, `refreshFirst=${refreshFirst}`);
+    assert.equal(pendingRefreshes(env).length, 1);
+  }
+});
+
+test("a refresh leaves a loading page alone and the later page preserves failed freshness", async () => {
+  const { env, client } = await buildOnly();
+  const b1 = named("b1");
+  const b3 = named("b3");
+  env.responses.set(LIST, { builds: [b1], nextPageToken: "tok" });
+  await client.loadEarlierBuilds();
+  env.clock = 4_000;
+  env.responses.set(LIST, new HttpError(500));
+  await refreshBuilds(env);
+  assert.deepEqual(client.earlierBuilds.value, { kind: "loaded", builds: [b1], next: "tok", loading: false, asOf: 1000, failing: true });
+  const page = Promise.withResolvers<unknown>();
+  env.responses.set(`${LIST}&pageToken=tok`, page.promise);
+  const loading = client.loadEarlierBuilds();
+  const asked = env.fetched.length;
+  await refreshBuilds(env);
+  assert.equal(env.fetched.length, asked);
+  assert.equal(client.earlierBuilds.value.loading, true);
+  env.clock = 8_000;
+  page.resolve({ builds: [b3] });
+  await loading;
+  assert.deepEqual(client.earlierBuilds.value, { kind: "loaded", builds: [b1, b3], next: undefined, loading: false, asOf: 1000, failing: true });
+  assert.equal(pendingRefreshes(env).length, 1);
+});
+
+test("each build-only resource says its own as of", async () => {
+  const { env, client } = await buildOnly();
+  const id = idOf(build.name);
+  env.responses.set(LIST, { builds: [build] });
+  env.responses.set(pathOf(id), build);
+  env.clock = 10_000;
+  await client.loadEarlierBuilds();
+  env.clock = 20_000;
+  await client.loadBuild(id);
+  env.clock = 30_000;
+  env.responses.set(LIST, new HttpError(500));
+  await refreshBuilds(env);
+  assert.deepEqual(client.earlierBuilds.value, { kind: "loaded", builds: [build], next: undefined, loading: false, asOf: 10_000, failing: true });
+  assert.deepEqual(client.build.value, { kind: "loaded", id, build, asOf: 30_000, failing: false });
+  env.clock = 40_000;
+  env.responses.set(LIST, { builds: [build] });
+  env.responses.set(pathOf(id), new HttpError(500));
+  await refreshBuilds(env);
+  assert.deepEqual(client.earlierBuilds.value, { kind: "loaded", builds: [build], next: undefined, loading: false, asOf: 40_000, failing: false });
+  assert.deepEqual(client.build.value, { kind: "loaded", id, build, asOf: 30_000, failing: true });
+  env.clock = 50_000;
+  await refreshBuilds(env);
+  assert.deepEqual(client.build.value, { kind: "loaded", id, build, asOf: 30_000, failing: true });
+});
+
+test("a refresh with nothing loaded asks for nothing and changes nothing", async () => {
+  const { env, client } = await buildOnly();
+  const asked = env.fetched.length;
+  await refreshBuilds(env);
+  assert.equal(env.fetched.length, asked);
+  assert.deepEqual(client.earlierBuilds.value, { kind: "unloaded", loading: false });
+  assert.equal(client.build.value, null);
+  assert.equal(pendingRefreshes(env).length, 1);
+});
+
+test("a refresh superseded by opening another build marks nothing failing", async () => {
+  const { env, client } = await buildOnly();
+  const id = idOf(build.name);
+  const other = named("other");
+  env.responses.set(pathOf(id), build);
+  env.responses.set(pathOf("other"), other);
+  await client.loadBuild(id);
+  env.responses.set(pathOf(id), new Error("offline"));
+  await refreshBuilds(env);
+  assert.equal(client.build.value?.kind, "loaded");
+  assert.equal(client.build.value?.kind === "loaded" && client.build.value.failing, true);
+  const answer = Promise.withResolvers<unknown>();
+  env.responses.set(pathOf(id), answer.promise);
+  startRefresh(env);
+  env.clock = 7_000;
+  await client.loadBuild("other");
+  answer.reject(new Error("offline"));
+  await flush();
+  assert.deepEqual(client.build.value, { kind: "loaded", id: "other", build: other, asOf: 7_000, failing: false });
+});
+
+test("a refreshed build that is no longer held is missing, and is not asked for again", async () => {
+  const { env, client } = await buildOnly();
+  const id = idOf(build.name);
+  env.responses.set(pathOf(id), build);
+  await client.loadBuild(id);
+  env.responses.set(pathOf(id), new HttpError(404));
+  await refreshBuilds(env);
+  assert.deepEqual(client.build.value, { kind: "missing", id });
+  const asked = env.fetched.length;
+  await refreshBuilds(env);
+  assert.equal(env.fetched.length, asked);
+  assert.equal(pendingRefreshes(env).length, 1);
+});
+
+test("a build-only refresh replaces the held builds with the server's", async () => {
+  const { env, client } = await buildOnly();
+  const kept = named("kept");
+  const evicted = named("evicted");
+  const added = named("added");
+  env.responses.set(LIST, { builds: [kept, evicted] });
+  await client.loadEarlierBuilds();
+  const idle = { ...kept, state: "IDLE" as const };
+  env.responses.set(LIST, { builds: [added, idle] });
+  env.clock = 9_000;
+  await refreshBuilds(env);
+  assert.deepEqual(client.earlierBuilds.value, { kind: "loaded", builds: [added, idle], next: undefined, loading: false, asOf: 9_000, failing: false });
+  assert.equal(pendingRefreshes(env).length, 1);
+});
+
+test("only a signed-in session with builds.read and without state.read refreshes builds", async () => {
+  for (const answer of [
+    { ...defaultSession, permissions: ["state.read", "builds.read"] },
+    { ...defaultSession, permissions: [] },
+    anonymous,
+  ]) {
+    const env = new FakeEnvironment();
+    env.responses.set(PATHS.getSession, answer);
+    await new StateClient(env).start();
+    assert.equal(pendingRefreshes(env).length, 0);
+  }
+});
+
+test("a refresh asks for the held builds and the open build together", async () => {
+  const { env, client } = await buildOnly();
+  const id = idOf(build.name);
+  env.responses.set(LIST, { builds: [build] });
+  env.responses.set(pathOf(id), build);
+  await client.loadEarlierBuilds();
+  await client.loadBuild(id);
+  const list = Promise.withResolvers<unknown>();
+  env.responses.set(LIST, list.promise);
+  const asked = env.fetched.length;
+  startRefresh(env);
+  await flush();
+  assert.deepEqual(env.fetched.slice(asked), [LIST, pathOf(id)]);
+  assert.equal(pendingRefreshes(env).length, 0);
+  list.resolve({ builds: [build] });
+  await flush();
+  assert.equal(pendingRefreshes(env).length, 1);
+});
+
+test("a closed build is neither refreshed nor overwritten by its pending load", async () => {
+  const { env, client } = await buildOnly();
+  const id = idOf(build.name);
+  env.responses.set(pathOf(id), build);
+  await client.loadBuild(id);
+  client.closeBuild();
+  assert.equal(client.build.value, null);
+  const asked = env.fetched.length;
+  await refreshBuilds(env);
+  assert.equal(env.fetched.length, asked);
+  const answer = Promise.withResolvers<unknown>();
+  env.responses.set(pathOf(id), answer.promise);
+  const pending = client.loadBuild(id);
+  client.closeBuild();
+  answer.resolve(build);
+  await pending;
+  assert.equal(client.build.value, null);
+});
+
+test("a builds refresh never asks for more than the largest page", async () => {
+  const { env, client } = await buildOnly();
+  const rows = Array.from({ length: PAGE_MAX + 1 }, (_, i) => named(String(i)));
+  client.earlierBuilds.value = { kind: "loaded", builds: rows, next: "rest", loading: false, asOf: 1000, failing: false };
+  env.responses.set(`${PATHS.listBuilds}?pageSize=${PAGE_MAX}`, { builds: rows.slice(0, PAGE_MAX), nextPageToken: "rest" });
+  await refreshBuilds(env);
+  assert.equal(env.fetched.at(-1), `${PATHS.listBuilds}?pageSize=${PAGE_MAX}`);
+  assert.deepEqual(client.earlierBuilds.value, { kind: "loaded", builds: rows.slice(0, PAGE_MAX), next: "rest", loading: false, asOf: 1000, failing: false });
+  env.responses.set(`${LIST}&pageToken=rest`, { builds: [rows[PAGE_MAX]] });
+  await client.loadEarlierBuilds();
+  assert.deepEqual(client.earlierBuilds.value, { kind: "loaded", builds: rows, next: undefined, loading: false, asOf: 1000, failing: false });
+});
+
+test("losing state.read resets partial held builds and drops the streamed state", async () => {
+  const env = new FakeEnvironment();
+  env.responses.set(PATHS.getSession, { ...session, permissions: ["state.read", "builds.read"], ...EXPIRING });
+  const client = new StateClient(env);
+  await client.start();
+  env.source.emit("snapshot", snapshot);
+  const stream = env.source;
+  env.responses.set(LIST, { builds: [] });
+  await client.loadEarlierBuilds();
+  stream.emit("delta", { seq: snapshot.seq + 1, base: snapshot.seq, updateTime: snapshot.updateTime, builds: { upsert: [build] } });
+  assert.deepEqual(client.earlierBuilds.value, { kind: "loaded", builds: [], next: undefined, loading: false, asOf: t0, failing: false });
+  assert.ok(client.state.value?.builds.some((row) => row.name === build.name));
+  env.responses.set(PATHS.getSession, { ...session, permissions: ["builds.read"], ...EXPIRING });
+  await renew(env);
+  assert.equal(stream.closed, true);
+  assert.equal(env.sources.length, 1);
+  assert.equal(client.state.value, null);
+  assert.deepEqual(client.earlier.value, { kind: "unloaded", loading: false });
+  assert.deepEqual(client.earlierBuilds.value, { kind: "unloaded", loading: false });
+  assert.equal(client.link.value.kind, "forbidden");
+  assert.equal(pendingRefreshes(env).length, 1);
+  stream.emit("snapshot", snapshot);
+  assert.equal(client.state.value, null);
+});
+
+test("gaining state.read clears held pages, connects and freezes if the stream closes before a snapshot", async () => {
+  const { env, client } = await buildOnly(EXPIRING);
+  const id = idOf(build.name);
+  env.responses.set(pathOf(id), build);
+  env.responses.set(LIST, { builds: [build] });
+  await client.loadEarlierBuilds();
+  await client.loadBuild(id);
+  env.responses.set(pathOf(id), new HttpError(500));
+  await refreshBuilds(env);
+  env.responses.set(pathOf(id), build);
+  env.responses.set(PATHS.getSession, { ...defaultSession, permissions: ["state.read", "builds.read"], ...EXPIRING });
+  await renew(env);
+  assert.equal(pendingRefreshes(env).length, 0);
+  assert.equal(env.sources.length, 1);
+  assert.deepEqual(client.build.value, { kind: "loaded", id, build, asOf: 1000, failing: false });
+  assert.equal(client.link.value.kind, "connecting");
+  assert.deepEqual(client.earlierBuilds.value, { kind: "unloaded", loading: false });
+  env.source.emit("closed", { reason: "VIEWER_CAP", retryDelay: "5s" });
+  assert.equal(client.link.value.kind, "lost");
+});
+
+test("a session that loses builds.read drops the builds it was shown", async () => {
+  const { env, client } = await buildOnly(EXPIRING);
+  const id = idOf(build.name);
+  env.responses.set(LIST, { builds: [build] });
+  env.responses.set(pathOf(id), build);
+  await client.loadEarlierBuilds();
+  await client.loadBuild(id);
+  env.responses.set(PATHS.getSession, { ...defaultSession, permissions: [], ...EXPIRING });
+  await renew(env);
+  assert.equal(client.build.value, null);
+  assert.deepEqual(client.earlierBuilds.value, { kind: "unloaded", loading: false });
+  assert.equal(client.link.value.kind, "forbidden");
+  assert.equal(pendingRefreshes(env).length, 0);
+});
+
+test("a failed renewal leaves a build-only session's pages and refresh running", async () => {
+  const { env, client } = await buildOnly(EXPIRING);
+  env.responses.set(LIST, { builds: [build] });
+  await client.loadEarlierBuilds();
+  env.postResults.push(503);
+  await renew(env);
+  assert.equal(client.link.value.kind, "forbidden");
+  assert.deepEqual(env.scheduled.filter((s) => !s.fired).map((s) => s.delay).sort((a, b) => a - b), [1000, BUILDS_REFRESH_MS]);
+  env.clock = 6_000;
+  await refreshBuilds(env);
+  assert.deepEqual(client.earlierBuilds.value, { kind: "loaded", builds: [build], next: undefined, loading: false, asOf: 6_000, failing: false });
+});
+
+test("a refresh refused for an expired session renews it and refreshes again", async () => {
+  const { env, client } = await buildOnly();
+  const id = idOf(build.name);
+  env.responses.set(pathOf(id), build);
+  await client.loadBuild(id);
+  env.responses.set(pathOf(id), new HttpError(401));
+  env.responses.set(PATHS.getSession, { ...anonymous, login: session.login });
+  env.postResults.push(503);
+  await refreshBuilds(env);
+  assert.deepEqual(env.posts, [PATHS.renew]);
+  assert.equal(client.link.value.kind, "forbidden");
+  assert.deepEqual(client.build.value, { kind: "loaded", id, build, asOf: 1000, failing: true });
+  assert.equal(pendingRefreshes(env).length, 0);
+  env.responses.set(PATHS.getSession, { ...defaultSession, permissions: ["builds.read"] });
+  env.responses.set(pathOf(id), build);
+  env.clock = 3_000;
+  const retry = env.scheduled.find((s) => s.delay === 1000 && !s.fired);
+  assert.ok(retry);
+  retry.run();
+  await flush();
+  assert.deepEqual(env.posts, [PATHS.renew, PATHS.renew]);
+  assert.deepEqual(client.build.value, { kind: "loaded", id, build, asOf: 3_000, failing: false });
+  assert.equal(pendingRefreshes(env).length, 1);
+});
+
+test("a refused refresh is classified by the session, as a failed stream is", async () => {
+  const rows = [
+    { name: "still permitted", answer: { ...defaultSession, permissions: ["builds.read"] }, link: "forbidden", kept: true, refreshes: 1 },
+    { name: "no session answer", answer: new Error("offline"), link: "forbidden", kept: true, refreshes: 1 },
+    { name: "builds.read removed", answer: { ...defaultSession, permissions: [] }, link: "forbidden", kept: false, refreshes: 0 },
+    { name: "signed out", answer: anonymous, link: "signed_out", kept: false, refreshes: 0 },
+    { name: "revoked", answer: new HttpError(403), link: "revoked", kept: true, refreshes: 0 },
+  ];
+  for (const row of rows) {
+    const { env, client } = await buildOnly();
+    const id = idOf(build.name);
+    env.responses.set(LIST, { builds: [build] });
+    env.responses.set(pathOf(id), build);
+    await client.loadEarlierBuilds();
+    await client.loadBuild(id);
+    env.responses.set(pathOf(id), new HttpError(403));
+    env.responses.set(PATHS.getSession, row.answer);
+    await refreshBuilds(env);
+    assert.equal(client.link.value.kind, row.link, row.name);
+    assert.equal(pendingRefreshes(env).length, row.refreshes, row.name);
+    assert.equal(client.build.value?.kind === "loaded" && client.build.value.failing, row.kept, row.name);
+    assert.equal(client.earlierBuilds.value.kind, row.kept ? "loaded" : "unloaded", row.name);
+    assert.deepEqual(env.posts, [], row.name);
+  }
+});
+
+test("a failed reload keeps the build shown, marked failing; a failed first load is an error", async () => {
+  const env = new FakeEnvironment();
+  const client = new StateClient(env);
+  const id = idOf(build.name);
+  env.responses.set(pathOf(id), build);
+  await client.loadBuild(id);
+  env.responses.set(pathOf(id), new Error("offline"));
+  await client.loadBuild(id);
+  assert.deepEqual(client.build.value, { kind: "loaded", id, build, asOf: 1000, failing: true });
+  env.responses.set(pathOf("other"), new Error("offline"));
+  await client.loadBuild("other");
+  assert.deepEqual(client.build.value, { kind: "error", id: "other" });
+});
+
+test("a builds refresh retains every loaded row between one page and the server limit", async () => {
+  const { env, client } = await buildOnly();
+  const rows = Array.from({ length: 400 }, (_, i) => named(String(i)));
+  client.earlierBuilds.value = { kind: "loaded", builds: rows, next: undefined, loading: false, asOf: 1000, failing: false };
+  const path = `${PATHS.listBuilds}?pageSize=400`;
+  env.responses.set(path, { builds: rows });
+  await refreshBuilds(env);
+  assert.equal(env.fetched.at(-1), path);
+  assert.deepEqual(client.earlierBuilds.value, { kind: "loaded", builds: rows, next: undefined, loading: false, asOf: 1000, failing: false });
+});
+
+test("a refused held-builds refresh classifies a list-only session", async () => {
+  for (const status of [401, 403]) {
+    const { env, client } = await buildOnly();
+    env.responses.set(LIST, { builds: [build] });
+    await client.loadEarlierBuilds();
+    env.responses.set(LIST, new HttpError(status));
+    env.responses.set(PATHS.getSession, new HttpError(403));
+    await refreshBuilds(env);
+    assert.equal(client.build.value, null);
+    assert.equal(client.link.value.kind, "revoked", `list ${status}`);
+    assert.equal(pendingRefreshes(env).length, 0);
+    assert.deepEqual(client.earlierBuilds.value, { kind: "loaded", builds: [build], next: undefined, loading: false, asOf: 1000, failing: true });
+  }
+});
+
+test("first-load build and list refusals classify revocation and stop refreshing", async () => {
+  for (const resource of ["build", "list"] as const) {
+    for (const status of [401, 403]) {
+      const { env, client } = await buildOnly();
+      const id = idOf(build.name);
+      env.responses.set(resource === "build" ? pathOf(id) : LIST, new HttpError(status));
+      env.responses.set(PATHS.getSession, new HttpError(403));
+      if (resource === "build") await client.loadBuild(id);
+      else await client.loadEarlierBuilds();
+      await flush();
+      assert.equal(client.link.value.kind, "revoked", `${resource} ${status}`);
+      assert.equal(pendingRefreshes(env).length, 0);
+    }
+  }
+});
+
+test("first-load build and list refusals renew an expired build-only session", async () => {
+  for (const resource of ["build", "list"] as const) {
+    const { env, client } = await buildOnly();
+    const id = idOf(build.name);
+    env.responses.set(resource === "build" ? pathOf(id) : LIST, new HttpError(401));
+    env.responses.set(PATHS.getSession, { ...anonymous, login: session.login });
+    env.postResults.push(503);
+    if (resource === "build") await client.loadBuild(id);
+    else await client.loadEarlierBuilds();
+    await flush();
+    assert.deepEqual(env.posts, [PATHS.renew], resource);
+    assert.equal(client.link.value.kind, "forbidden", resource);
+    assert.equal(pendingRefreshes(env).length, 0, resource);
+    assert.ok(env.scheduled.some((entry) => entry.delay === 1000 && !entry.fired), resource);
+  }
+});
+
+test("re-admission retries an errored open build and resets an errored first list page", async () => {
+  for (const resource of ["build", "list"] as const) {
+    const { env, client } = await buildOnly();
+    const id = idOf(build.name);
+    const path = resource === "build" ? pathOf(id) : LIST;
+    const probe = Promise.withResolvers<unknown>();
+    env.responses.set(path, new HttpError(403));
+    env.responses.set(PATHS.getSession, probe.promise);
+    if (resource === "build") await client.loadBuild(id);
+    else await client.loadEarlierBuilds();
+    assert.equal(pendingRefreshes(env).length, 0, resource);
+    env.responses.set(path, resource === "build" ? build : { builds: [build] });
+    probe.resolve({ ...defaultSession, permissions: ["builds.read"] });
+    await flush();
+    assert.equal(client.link.value.kind, "forbidden", resource);
+    assert.equal(pendingRefreshes(env).length, 1, resource);
+    if (resource === "build") {
+      assert.deepEqual(client.build.value, { kind: "loaded", id, build, asOf: 1000, failing: false });
+    } else {
+      assert.deepEqual(client.earlierBuilds.value, { kind: "unloaded", loading: false });
+      await client.loadEarlierBuilds();
+      assert.deepEqual(client.earlierBuilds.value, { kind: "loaded", builds: [build], next: undefined, loading: false, asOf: 1000, failing: false });
+    }
+  }
+});
+
+test("a newer first-load refusal supersedes an in-flight refusal probe", async () => {
+  const { env, client } = await buildOnly();
+  const id = idOf(build.name);
+  const first = Promise.withResolvers<unknown>();
+  const second = Promise.withResolvers<unknown>();
+  env.responses.set(pathOf(id), new HttpError(401));
+  env.responses.set(LIST, new HttpError(403));
+  env.responses.set(PATHS.getSession, first.promise);
+  await client.loadBuild(id);
+  env.responses.set(PATHS.getSession, second.promise);
+  await client.loadEarlierBuilds();
+  assert.equal(pendingRefreshes(env).length, 0);
+  second.reject(new Error("offline"));
+  first.resolve(anonymous);
+  await flush();
+  assert.equal(client.link.value.kind, "forbidden");
+  assert.equal(pendingRefreshes(env).length, 1);
+  assert.deepEqual(env.posts, []);
+});
+
+test("a build-only renewal preserves its loaded held builds", async () => {
+  const { env, client } = await buildOnly(EXPIRING);
+  env.responses.set(LIST, { builds: [build] });
+  await client.loadEarlierBuilds();
+  await renew(env);
+  assert.deepEqual(client.earlierBuilds.value, { kind: "loaded", builds: [build], next: undefined, loading: false, asOf: 1000, failing: false });
+  assert.equal(pendingRefreshes(env).length, 1);
+});
+
+test("a failed renewal after revocation never replaces the revoked link", async () => {
+  for (const source of ["builds", "stream"] as const) {
+    let env: FakeEnvironment;
+    let client: StateClient;
+    if (source === "builds") {
+      ({ env, client } = await buildOnly(EXPIRING));
+      env.responses.set(LIST, { builds: [build] });
+      await client.loadEarlierBuilds();
+      env.responses.set(LIST, new HttpError(403));
+      env.responses.set(PATHS.getSession, new HttpError(403));
+      await refreshBuilds(env);
+    } else {
+      env = new FakeEnvironment();
+      env.responses.set(PATHS.getSession, { ...session, permissions: ["state.read", "builds.read"], ...EXPIRING });
+      client = new StateClient(env);
+      await client.start();
+      env.source.emit("closed", { reason: "REVOKED" });
+    }
+    assert.equal(client.link.value.kind, "revoked", source);
+    env.postResults.push(503);
+    await renew(env);
+    assert.equal(client.link.value.kind, "revoked", source);
+  }
 });

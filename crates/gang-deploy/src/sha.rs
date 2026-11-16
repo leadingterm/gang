@@ -30,6 +30,11 @@ text_newtype! {
     PlanSha256, check_sha256
 }
 
+text_newtype! {
+    /// The SHA-256 of a release image: 64 lowercase hex characters.
+    ImageSha256, check_sha256
+}
+
 impl PlanSha256 {
     /// The digest of the plan file `bytes`.
     #[must_use]

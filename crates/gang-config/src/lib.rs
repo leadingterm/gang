@@ -90,6 +90,7 @@
 //! ```
 
 mod authentication_config;
+mod builds_config;
 mod ca_pin_setting;
 mod client_secret;
 mod dashboard_config;
@@ -104,17 +105,19 @@ mod plugin_set;
 mod rate_limit_config;
 mod role_config;
 mod sandbox_file;
+mod scheduled_minimum;
 mod server_config;
 mod worker_config;
 
 pub use authentication_config::AuthenticationConfig;
+pub use builds_config::BuildsConfig;
 pub use ca_pin_setting::CaPinSetting;
 pub use client_secret::{ClientSecretSource, SecretFileError};
 pub use dashboard_config::{DashboardConfig, DashboardLogin, DeviceConfig};
 pub use endpoint::ListenerUrlError;
 pub use errors::{CaPinSettingError, ConfigError};
 pub use execution_config::{ExecutionConfig, InputLinks};
-pub use fleet_policy::{FleetPolicy, InstanceBounds, InstanceBoundsError};
+pub use fleet_policy::{FleetPolicy, InstanceBounds, InstanceBoundsError, ScheduledMinimumError};
 pub use fleets::{FleetConfig, FleetMember, Fleets, RawFleet};
 pub use gang_config::{Document, GangConfig};
 pub use identity_config::IdentityConfig;
@@ -126,5 +129,9 @@ pub use rate_limit_config::{
 };
 pub use role_config::{RoleConfig, RolePrincipal};
 pub use sandbox_file::{SANDBOX_FILE_NAME, SandboxFile, SandboxFileError};
+pub use scheduled_minimum::{
+    ClockTime, ClockTimeError, IanaTimeZone, ScheduledMinimum, UnknownTimeZone, Weekday, Weekdays,
+    WeekdaysError, WindowError,
+};
 pub use server_config::{EndpointTrust, ServerConfig, ServerTransport, Transport};
 pub use worker_config::WorkerConfig;

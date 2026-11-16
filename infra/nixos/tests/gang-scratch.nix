@@ -5,6 +5,9 @@
 
     environment.systemPackages = [pkgs.xfsprogs pkgs.mdadm];
 
+    # Stands in for gang-config, which starts the worker target on a worker.
+    systemd.targets.gang-worker.wantedBy = ["multi-user.target"];
+
     users.groups.gang = {};
     users.users.gang = {
       isSystemUser = true;

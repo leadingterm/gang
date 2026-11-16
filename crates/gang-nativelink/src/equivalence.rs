@@ -133,6 +133,14 @@ fn requests(
     requests
 }
 
+fn observations() -> &'static gang_spi::ObservationSink {
+    static SINK: std::sync::LazyLock<gang_spi::ObservationSink> = std::sync::LazyLock::new(|| {
+        gang_spi::ObservationSink::channel(std::num::NonZeroUsize::MIN, std::num::NonZeroUsize::MIN)
+            .0
+    });
+    &SINK
+}
+
 /// The controller spec over the test fleets, with in-memory stores.
 fn controller_spec<'a>(
     content: &'a RenderedStoreSpec,
@@ -143,6 +151,8 @@ fn controller_spec<'a>(
         content_store: content,
         action_store: action,
         fleets,
+        max_workers: 8,
+        observations: observations(),
         client_action_timeout: Duration::from_mins(10),
     }
 }

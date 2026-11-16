@@ -89,6 +89,8 @@ impl SchedulerPort for NativeLink {
             .map_err(PortError::backend)?;
         let completed = handles.completed.load(Ordering::Relaxed);
         snapshot::fill(&workers, &demand, &handles.fleets, completed, into);
+        into.lookups = handles.cache.lookups.load(Ordering::Relaxed);
+        into.hits = handles.cache.hits.load(Ordering::Relaxed);
         Ok(())
     }
 

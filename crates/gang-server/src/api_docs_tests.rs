@@ -29,6 +29,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+use crate::api_test_support::{fixture_build, seed_build};
 use crate::test_support::{
     api_request, mint_token, read, role_for, serve, tls_parts, tls_settings,
 };
@@ -247,6 +248,8 @@ fn round_trip(name: &str, value: &Value) -> Result<Value, String> {
         "Principal" => through::<Principal>(value),
         "ListRolesResponse" => through::<ListRolesResponse>(value),
         "ListEventsResponse" => through::<ListEventsResponse>(value),
+        "ListBuildsResponse" => through::<gang_wire::ListBuildsResponse>(value),
+        "Build" => through::<gang_wire::Build>(value),
         "State" => through::<State>(value),
         "Session" => through::<Session>(value),
         "ErrorResponse" => through::<ErrorResponse>(value),
@@ -771,6 +774,9 @@ fn request_for(method: &str, route: &Route, token: &AccessToken) -> Request<ApiR
             .path(&"test:principal".parse().expect("fixture identity is valid")),
         gang_wire::routes::RouteId::RestorePrincipal => gang_wire::routes::RESTORE_PRINCIPAL
             .path(&"test:principal".parse().expect("fixture identity is valid")),
+        gang_wire::routes::RouteId::GetBuild => {
+            gang_wire::routes::GET_BUILD.path(&fixture_build().origin().build.id())
+        }
         _ => route.template.to_owned(),
     };
     api_request(method, &path, Some(token), body)
@@ -796,6 +802,13 @@ async fn check_route(controller: &Controller, admin: &AccessToken, route: &Route
         failures.push(format!(
             "{name} is answered 404 ROUTE_NOT_FOUND to the administrator"
         ));
+    }
+    if matches!(
+        route.id,
+        gang_wire::routes::RouteId::ListBuilds | gang_wire::routes::RouteId::GetBuild
+    ) && served.status != StatusCode::OK
+    {
+        failures.push(format!("{name} did not return 200 for the recorded build"));
     }
     for method in METHODS {
         let documented = ROUTES
@@ -850,6 +863,7 @@ async fn the_server_answers_the_documented_routes_and_only_those() {
         handles.scheduler,
         |controller| async move {
             let admin = mint_token(&controller, PROVIDER, ADMIN_PROOF).await;
+            seed_build(&controller, &admin).await;
             let mut failures = Vec::new();
             for route in &ROUTES {
                 failures.extend(check_route(&controller, &admin, route).await);

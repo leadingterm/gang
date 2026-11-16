@@ -346,7 +346,7 @@ where
                     .await
             }
             Action::StartDrain(worker) => scheduler.set_draining(worker, true).await,
-            Action::CancelDrain(worker) => scheduler.set_draining(worker, false).await,
+            Action::CancelDrain(worker, _) => scheduler.set_draining(worker, false).await,
             Action::Terminate { instance, .. } => {
                 provisioner
                     .terminate(configs[step.fleet].fleet(), instance)

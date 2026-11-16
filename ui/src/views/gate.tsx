@@ -89,15 +89,15 @@ export const SignInError = ({ reason }: { reason: string | null }) => {
   );
 };
 
-/** Signed in, but no role grants `state.read`. */
-export const Forbidden = () => {
+/** Signed in, but no role grants the required permission. */
+export const Forbidden = ({ permission = "state.read" }: { permission?: string }) => {
   const principal = useClient().session.value?.principal;
   return (
     <Empty>
       <div>
         <h2>No access</h2>
         <p class="mono">
-          <span class="warning">state.read</span> missing{principal && ` for ${identityOf(principal)}`}
+          <span class="warning">{permission}</span> missing{principal && ` for ${identityOf(principal)}`}
         </p>
       </div>
     </Empty>

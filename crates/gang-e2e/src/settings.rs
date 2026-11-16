@@ -43,10 +43,13 @@ pub const DEFAULT_PARALLEL_SCENARIOS: NonZeroUsize = NonZeroUsize::MIN.saturatin
 
 /// Default for [`Settings::worker_launcher`]: starts a worker in a scope delegated to the user,
 /// through the host's `systemd-run` resolved from PATH, the client of the host's systemd user manager.
+/// `--slice-inherit` (systemd 254+) keeps workers in the harness's slice, so its host-imposed
+/// bounds apply to them instead of placing them in the user manager's `app.slice`.
 pub const DEFAULT_WORKER_LAUNCHER: &[&str] = &[
     "systemd-run",
     "--user",
     "--scope",
+    "--slice-inherit",
     "--collect",
     "--property=Delegate=yes",
     "--",

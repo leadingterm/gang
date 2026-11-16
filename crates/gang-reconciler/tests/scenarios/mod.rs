@@ -1,11 +1,11 @@
 use std::num::NonZeroU32;
 use std::time::Duration;
 
-use gang_clock::Clock;
-use gang_config::{FleetPolicy, InstanceBounds};
-use gang_reconciler::{Action, PlanStep, TerminationCause};
+use gang_clock::{Clock, Timestamp};
+use gang_config::{FleetPolicy, InstanceBounds, Weekday};
+use gang_reconciler::{Action, NeedCause, PlanStep, TerminationCause};
 use gang_spi::{ScalingAuditEvent, ScalingEventKind};
-use gang_testkit::{TestResult, worker_id};
+use gang_testkit::{TestResult, scheduled_minimum, worker_id};
 use gang_types::{FleetName, FleetSet, InstanceId, InstanceLifecycle, Isa, ScalingCause, WorkerId};
 
 use crate::support::*;
@@ -49,7 +49,7 @@ fn terminate(name: &str, cause: TerminationCause) -> TestResult<PlanStep> {
 fn cancel_drain(name: &str) -> TestResult<PlanStep> {
     Ok(PlanStep {
         fleet: X86,
-        action: Action::CancelDrain(worker_id(name)?),
+        action: Action::CancelDrain(worker_id(name)?, NeedCause::Demand),
     })
 }
 
@@ -106,6 +106,196 @@ fn surplus_draining_fleet() -> TestResult<Harness> {
     Ok(h)
 }
 
+fn scheduled_policy() -> TestResult<FleetPolicy> {
+    let mut policy = policy()?;
+    let window = scheduled_minimum(1, &Weekday::ALL[..5], "08:00", "19:00", "Europe/Paris")?;
+    policy.instances =
+        InstanceBounds::try_new(0, policy.instances.max())?.with_schedule(vec![window])?;
+    Ok(policy)
+}
+
+fn scheduled_harness(wall: &str) -> TestResult<Harness> {
+    Ok(Harness::with_policy_at(
+        scheduled_policy()?,
+        Timestamp::from_rfc3339(wall)?,
+    ))
+}
+
+fn minimum_scale_out() -> PlanStep {
+    PlanStep {
+        fleet: X86,
+        action: Action::ScaleOut {
+            from: 0,
+            to: 1,
+            need: NeedCause::Minimum,
+        },
+    }
+}
+
+#[test]
+fn work_equal_to_the_window_scales_out_for_demand() -> TestResult {
+    let mut h = scheduled_harness("2026-11-16T16:00:00Z")?;
+    h.queue(X86, 1)?;
+    assert_eq!(
+        h.reconcile(),
+        vec![PlanStep {
+            fleet: X86,
+            action: Action::ScaleOut {
+                from: 0,
+                to: 1,
+                need: NeedCause::Demand,
+            },
+        }]
+    );
+    Ok(())
+}
+
+#[test]
+fn min_instances_scales_out_for_the_minimum() -> TestResult {
+    let mut policy = policy()?;
+    policy.instances = InstanceBounds::try_new(1, policy.instances.max())?;
+    let mut h = Harness::with_policy(policy);
+    assert_eq!(h.reconcile(), vec![minimum_scale_out()]);
+    assert_eq!(
+        h.audit_events()?,
+        vec![ScalingAuditEvent {
+            at: h.clock.wall(),
+            fleet: x86_name()?,
+            kind: ScalingEventKind::ScaledOut { from: 0, to: 1 },
+            cause: Some(ScalingCause::Minimum),
+        }]
+    );
+    Ok(())
+}
+
+#[test]
+fn min_instances_resumes_a_draining_worker_for_the_minimum() -> TestResult {
+    let mut policy = policy()?;
+    policy.instances = InstanceBounds::try_new(1, policy.instances.max())?;
+    let mut h = Harness::with_policy(policy);
+    serve(&mut h, "local-1", secs(60))?;
+    h.set_draining("local-1", true)?;
+    assert_eq!(
+        h.reconcile(),
+        vec![PlanStep {
+            fleet: X86,
+            action: Action::CancelDrain(worker_id("local-1")?, NeedCause::Minimum),
+        }]
+    );
+    Ok(())
+}
+
+#[test]
+fn scheduled_minimum_scales_out_when_its_window_opens() -> TestResult {
+    let mut h = scheduled_harness("2026-11-16T06:59:00Z")?;
+    assert_eq!(h.reconcile(), Vec::new());
+    h.advance(secs(60));
+    assert_eq!(h.reconcile(), vec![minimum_scale_out()]);
+    Ok(())
+}
+
+#[test]
+fn a_window_keeps_an_idle_worker_until_it_closes() -> TestResult {
+    let mut h = scheduled_harness("2026-11-16T16:00:00Z")?;
+    serve(&mut h, "local-1", secs(60))?;
+    assert_eq!(h.reconcile(), Vec::new());
+    h.advance(Duration::from_millis(7_199_999));
+    assert_eq!(h.reconcile(), Vec::new());
+    h.advance(Duration::from_millis(1));
+    assert_eq!(
+        h.reconcile(),
+        vec![PlanStep {
+            fleet: X86,
+            action: Action::StartDrain(worker_id("local-1")?),
+        }]
+    );
+    Ok(())
+}
+
+#[test]
+fn a_window_drains_only_the_workers_above_it() -> TestResult {
+    let mut h = scheduled_harness("2026-11-16T16:00:00Z")?;
+    serve(&mut h, "local-1", secs(60))?;
+    assert_eq!(h.reconcile(), Vec::new());
+    h.advance(secs(5));
+    serve(&mut h, "local-2", secs(60))?;
+    assert_eq!(h.reconcile(), Vec::new());
+    h.advance(secs(30));
+    assert_eq!(
+        h.reconcile(),
+        vec![PlanStep {
+            fleet: X86,
+            action: Action::StartDrain(worker_id("local-1")?),
+        }]
+    );
+    Ok(())
+}
+
+#[test]
+fn work_above_the_window_scales_out_for_demand() -> TestResult {
+    let policy = scheduled_policy()?;
+    let queued = usize::try_from(policy.target_actions_per_instance.get())? + 1;
+    let mut h = Harness::with_policy_at(policy, Timestamp::from_rfc3339("2026-11-16T16:00:00Z")?);
+    h.queue(X86, queued)?;
+    assert_eq!(
+        h.reconcile(),
+        vec![PlanStep {
+            fleet: X86,
+            action: Action::ScaleOut {
+                from: 0,
+                to: 2,
+                need: NeedCause::Demand,
+            },
+        }]
+    );
+    Ok(())
+}
+
+#[test]
+fn a_window_resumes_a_draining_worker() -> TestResult {
+    let mut h = scheduled_harness("2026-11-16T06:59:00Z")?;
+    serve(&mut h, "local-1", secs(60))?;
+    h.set_draining("local-1", true)?;
+    h.advance(secs(60));
+    assert_eq!(
+        h.reconcile(),
+        vec![PlanStep {
+            fleet: X86,
+            action: Action::CancelDrain(worker_id("local-1")?, NeedCause::Minimum),
+        }]
+    );
+    Ok(())
+}
+
+#[test]
+fn the_window_opens_at_local_time_across_daylight_saving() -> TestResult {
+    for wall in ["2026-03-27T06:59:00Z", "2026-03-30T05:59:00Z"] {
+        let mut h = scheduled_harness(wall)?;
+        assert_eq!(h.reconcile(), Vec::new());
+        h.advance(secs(60));
+        assert_eq!(h.reconcile(), vec![minimum_scale_out()]);
+    }
+    Ok(())
+}
+
+#[test]
+fn the_scale_out_audit_names_the_minimum() -> TestResult {
+    let mut h = scheduled_harness("2026-11-16T06:59:00Z")?;
+    assert_eq!(h.reconcile(), Vec::new());
+    h.advance(secs(60));
+    assert_eq!(h.reconcile(), vec![minimum_scale_out()]);
+    assert_eq!(
+        h.audit_events()?,
+        vec![ScalingAuditEvent {
+            at: h.clock.wall(),
+            fleet: x86_name()?,
+            kind: ScalingEventKind::ScaledOut { from: 0, to: 1 },
+            cause: Some(ScalingCause::Minimum),
+        }]
+    );
+    Ok(())
+}
+
 #[test]
 fn cold_scale_out_from_zero() -> TestResult {
     let mut h = Harness::new()?;
@@ -114,7 +304,11 @@ fn cold_scale_out_from_zero() -> TestResult {
         h.run(),
         vec![PlanStep {
             fleet: X86,
-            action: Action::ScaleOut { from: 0, to: 1 },
+            action: Action::ScaleOut {
+                from: 0,
+                to: 1,
+                need: NeedCause::Demand,
+            },
         }]
     );
     Ok(())
@@ -128,7 +322,11 @@ fn scale_out_is_clamped_at_max_instances() -> TestResult {
         h.run(),
         vec![PlanStep {
             fleet: X86,
-            action: Action::ScaleOut { from: 0, to: 4 },
+            action: Action::ScaleOut {
+                from: 0,
+                to: 4,
+                need: NeedCause::Demand,
+            },
         }]
     );
     Ok(())
@@ -198,7 +396,11 @@ fn abandoned_requests_are_withdrawn_before_a_scale_out() -> TestResult {
             },
             PlanStep {
                 fleet: X86,
-                action: Action::ScaleOut { from: 0, to: 1 },
+                action: Action::ScaleOut {
+                    from: 0,
+                    to: 1,
+                    need: NeedCause::Demand,
+                },
             },
         ],
         "abandoned requests are withdrawn before scale-out"
@@ -246,6 +448,39 @@ fn failed_launch_with_full_demand_keeps_request_without_repeating_scale_out() ->
     let mut h = failed_launch_fleet()?;
     h.queue(X86, 8)?;
     assert_eq!(h.reconcile(), Vec::new());
+    Ok(())
+}
+
+/// While an action stays queued for a fleet that cannot launch, the plan keeps the fleet's request
+/// however long the action waits: nothing withdraws it, so the fleet keeps showing `can't launch`
+/// and the reason, and no timer gives up on the action. Only its client owns that deadline.
+#[test]
+fn a_queued_action_keeps_the_request_of_a_fleet_that_cannot_launch_however_long_it_waits()
+-> TestResult {
+    let mut h = Harness::new()?;
+    h.queue(X86, 1)?;
+    assert_eq!(
+        h.reconcile(),
+        vec![PlanStep {
+            fleet: X86,
+            action: Action::ScaleOut {
+                from: 0,
+                to: 1,
+                need: NeedCause::Demand,
+            },
+        }]
+    );
+    h.set_desired_capacity(X86, 1);
+    h.supply_mut(X86)?.launch_failure = Some(gang_spi::LaunchFailure {
+        reason: "launch failed".to_owned(),
+    });
+    for day in 1..=30 {
+        h.advance(secs(86_400));
+        assert_eq!(h.reconcile(), Vec::new(), "day {day}");
+        let outlook = h.outlook(X86)?;
+        assert_eq!(outlook.queued, 1, "day {day}");
+        assert_eq!(outlook.needed, 1, "day {day}");
+    }
     Ok(())
 }
 
@@ -379,7 +614,11 @@ fn failed_scale_out_then_disappearing_demand_reaches_zero() -> TestResult {
         h.run(),
         vec![PlanStep {
             fleet: X86,
-            action: Action::ScaleOut { from: 2, to: 4 },
+            action: Action::ScaleOut {
+                from: 2,
+                to: 4,
+                need: NeedCause::Demand,
+            },
         }]
     );
     h.supply_mut(X86)?.launch_failure = Some(gang_spi::LaunchFailure {
@@ -455,7 +694,11 @@ fn scale_out_counts_running_actions() -> TestResult {
         h.run(),
         vec![PlanStep {
             fleet: X86,
-            action: Action::ScaleOut { from: 1, to: 2 },
+            action: Action::ScaleOut {
+                from: 1,
+                to: 2,
+                need: NeedCause::Demand,
+            },
         }]
     );
     Ok(())
@@ -469,7 +712,11 @@ fn measured_resources_drive_scale_out() -> TestResult {
         h.run(),
         vec![PlanStep {
             fleet: X86,
-            action: Action::ScaleOut { from: 0, to: 2 },
+            action: Action::ScaleOut {
+                from: 0,
+                to: 2,
+                need: NeedCause::Demand,
+            },
         }]
     );
     Ok(())
@@ -488,7 +735,11 @@ fn draining_worker_is_not_capacity() -> TestResult {
             cancel_drain("local-1")?,
             PlanStep {
                 fleet: X86,
-                action: Action::ScaleOut { from: 1, to: 3 },
+                action: Action::ScaleOut {
+                    from: 1,
+                    to: 3,
+                    need: NeedCause::Demand,
+                },
             },
         ]
     );
@@ -535,7 +786,11 @@ fn resumes_the_busiest_draining_workers_first_then_scales_out() -> TestResult {
             cancel_drain("local-1")?,
             PlanStep {
                 fleet: X86,
-                action: Action::ScaleOut { from: 2, to: 3 },
+                action: Action::ScaleOut {
+                    from: 2,
+                    to: 3,
+                    need: NeedCause::Demand,
+                },
             },
         ]
     );
@@ -892,7 +1147,11 @@ fn orphan_is_terminated_before_the_same_pass_scales_out() -> TestResult {
             terminate("local-1", TerminationCause::Orphan)?,
             PlanStep {
                 fleet: X86,
-                action: Action::ScaleOut { from: 1, to: 2 },
+                action: Action::ScaleOut {
+                    from: 1,
+                    to: 2,
+                    need: NeedCause::Demand,
+                },
             },
         ]
     );
@@ -1067,7 +1326,11 @@ fn an_ordered_termination_does_not_hide_a_needed_scale_out() -> TestResult {
         h.reconcile(),
         vec![PlanStep {
             fleet: X86,
-            action: Action::ScaleOut { from: 1, to: 2 },
+            action: Action::ScaleOut {
+                from: 1,
+                to: 2,
+                need: NeedCause::Demand,
+            },
         }]
     );
     Ok(())
@@ -1209,7 +1472,11 @@ fn fleets_are_independent_per_isa() -> TestResult {
         h.run(),
         vec![PlanStep {
             fleet: ARM,
-            action: Action::ScaleOut { from: 0, to: 1 },
+            action: Action::ScaleOut {
+                from: 0,
+                to: 1,
+                need: NeedCause::Demand,
+            },
         }]
     );
     assert_eq!(h.supply(X86)?.desired, 0);
@@ -1336,11 +1603,19 @@ fn preference_fills_the_first_fleet_then_overflows_to_the_next() -> TestResult {
         vec![
             PlanStep {
                 fleet: SPOT,
-                action: Action::ScaleOut { from: 0, to: 2 },
+                action: Action::ScaleOut {
+                    from: 0,
+                    to: 2,
+                    need: NeedCause::Demand,
+                },
             },
             PlanStep {
                 fleet: ONDEMAND,
-                action: Action::ScaleOut { from: 0, to: 1 },
+                action: Action::ScaleOut {
+                    from: 0,
+                    to: 1,
+                    need: NeedCause::Demand,
+                },
             },
         ]
     );
@@ -1355,7 +1630,11 @@ fn pinned_action_scales_only_its_candidate_fleet() -> TestResult {
         h.run(),
         vec![PlanStep {
             fleet: ARM,
-            action: Action::ScaleOut { from: 0, to: 1 },
+            action: Action::ScaleOut {
+                from: 0,
+                to: 1,
+                need: NeedCause::Demand,
+            },
         }]
     );
     assert_eq!(h.supply(X86)?.desired, 0);
@@ -1385,7 +1664,11 @@ fn running_actions_count_on_their_own_fleet_only() -> TestResult {
         h.run(),
         vec![PlanStep {
             fleet: X86,
-            action: Action::ScaleOut { from: 0, to: 1 },
+            action: Action::ScaleOut {
+                from: 0,
+                to: 1,
+                need: NeedCause::Demand,
+            },
         }]
     );
     assert_eq!(h.supply(ARM)?.desired, 1);

@@ -844,7 +844,7 @@ mod tests {
             catalog.fit(set(&[0, 1]), request(&[("memory_kb", "35232154")])),
             Some(Fit {
                 fleet: 1,
-                lowered: vec![("memory_kb", 33554432)],
+                lowered: vec![("memory_kb", 33_554_432)],
             })
         );
     }
@@ -899,7 +899,7 @@ mod tests {
             ),
             Some(Fit {
                 fleet: 1,
-                lowered: vec![("cpu_count", 4), ("memory_kb", 16777216)],
+                lowered: vec![("cpu_count", 4), ("memory_kb", 16_777_216)],
             }),
             "the sum of relative shortfalls favors the memory fleet"
         );
@@ -947,7 +947,7 @@ mod tests {
             ),
             Some(Fit {
                 fleet: 2,
-                lowered: vec![("cpu_count", 4), ("memory_kb", 8388608)],
+                lowered: vec![("cpu_count", 4), ("memory_kb", 8_388_608)],
             })
         );
     }

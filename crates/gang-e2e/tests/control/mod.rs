@@ -7,7 +7,7 @@ use std::time::Duration;
 use gang_clock::Timestamp;
 use gang_e2e::{
     BuildOutcome, Check, Control, E2eError, Host, Probe, ProbeReport, Result, Run, Sandbox, System,
-    Variant, drain_cancel, names, orphan, skipped_pass,
+    Variant, drain_cancel, names, orphan, scheduled_minimum, skipped_pass,
 };
 use gang_wire::{
     Actions, Cause, Event, EventChange, Frame, Instance, Lifecycle, Pass, PassState, Phase, Queue,
@@ -185,10 +185,23 @@ enum Served {
     Local,
 }
 
+/// How the simulated deployment misreports its scheduled minimum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MinimumFault {
+    /// Reports the minimum faithfully.
+    None,
+    /// Records the minimum's scale-out with cause `DEMAND`.
+    DemandCause,
+    /// Reports `policy.min` as the configured `min_instances`.
+    ConfiguredMinimum,
+}
+
 /// The simulated deployment; its control loop runs one pass at a time.
 struct World {
     behaviour: Behaviour,
     min_instances: u32,
+    scheduled_minimum: u32,
+    minimum_fault: MinimumFault,
     up: bool,
     held: bool,
     pass: u64,
@@ -209,6 +222,8 @@ impl World {
         Self {
             behaviour,
             min_instances,
+            scheduled_minimum: 0,
+            minimum_fault: MinimumFault::None,
             up: false,
             held: false,
             pass: 0,
@@ -349,7 +364,9 @@ impl World {
                     self.queued -= 1;
                     self.served += 1;
                     Link::Busy
-                } else if passes + 1 >= IDLE_PASSES && self.live() > self.min_instances {
+                } else if passes + 1 >= IDLE_PASSES
+                    && self.live() > self.min_instances.max(self.scheduled_minimum)
+                {
                     self.record(
                         Some(Cause::IdleTimeout),
                         EventChange::DrainStarted { worker },
@@ -413,12 +430,18 @@ impl World {
     fn scale_out(&mut self) {
         let live = self.live();
         let demand = u32::from(self.queued > 0);
-        let needed = self.min_instances.max(demand);
+        let needed = self.min_instances.max(self.scheduled_minimum).max(demand);
         if live >= needed {
             return;
         }
         self.record(
-            Some(Cause::Demand),
+            Some(
+                if demand < needed && self.minimum_fault != MinimumFault::DemandCause {
+                    Cause::Minimum
+                } else {
+                    Cause::Demand
+                },
+            ),
             EventChange::ScaledOut {
                 from: live,
                 to: needed,
@@ -449,7 +472,17 @@ impl World {
                 unplaceable: 0,
                 oldest_queue_time: None,
             },
-            fleets: Vec::new(),
+            fleets: vec![gang_wire::Fleet {
+                policy: gang_wire::Policy {
+                    min: if self.minimum_fault == MinimumFault::ConfiguredMinimum {
+                        self.min_instances
+                    } else {
+                        self.min_instances.max(self.scheduled_minimum)
+                    },
+                    ..gang_wire::Policy::default()
+                },
+                ..gang_wire::Fleet::default()
+            }],
             workers: self
                 .machines
                 .iter()
@@ -494,6 +527,7 @@ impl World {
             events_limit: 1_000,
             completed: 0,
             recent: Recent::default(),
+            builds: Vec::new(),
             principals_epoch: 0,
         }
     }
@@ -761,6 +795,87 @@ fn drain_cancel_checks(behaviour: Behaviour) -> Result<Vec<Check>> {
 /// behaves as `behaviour` says.
 fn skipped_pass_checks(behaviour: Behaviour) -> Result<Vec<Check>> {
     skipped_pass(&ControlSim::new(behaviour, 0))
+}
+
+#[test]
+fn scheduled_minimum_is_compliant() {
+    let system = ControlSim::new(Behaviour::COMPLIANT, 0);
+    system.world.lock().scheduled_minimum = 1;
+    let checks = scheduled_minimum(&system).expect("the scheduled-minimum scenario runs");
+    assert_eq!(
+        checks
+            .iter()
+            .map(|check| check.name.as_ref())
+            .collect::<Vec<_>>(),
+        [
+            names::scheduled_minimum::WORKER_STANDS,
+            names::scheduled_minimum::SCALED_OUT_FOR_MINIMUM,
+            names::scheduled_minimum::POLICY_MIN,
+        ]
+    );
+    assert_compliant(&checks);
+}
+
+#[test]
+fn scheduled_minimum_without_a_floor_fails_the_worker_check() {
+    let system = ControlSim::new(Behaviour::COMPLIANT, 0);
+    let checks = scheduled_minimum(&system).expect("timeout produces a verdict");
+    assert_eq!(
+        failures(&checks),
+        vec![names::scheduled_minimum::WORKER_STANDS]
+    );
+}
+
+#[test]
+fn scheduled_minimum_accepts_scale_out_in_opening_snapshot() {
+    let system = ControlSim::new(Behaviour::COMPLIANT, 0);
+    {
+        let mut world = system.world.lock();
+        world.scheduled_minimum = 1;
+        world.scale_out();
+    }
+    assert_compliant(&scheduled_minimum(&system).expect("scenario runs"));
+}
+
+#[test]
+fn scheduled_minimum_rejects_wrong_scale_out_cause() {
+    let system = ControlSim::new(Behaviour::COMPLIANT, 0);
+    {
+        let mut world = system.world.lock();
+        world.scheduled_minimum = 1;
+        world.minimum_fault = MinimumFault::DemandCause;
+    }
+    let checks = scheduled_minimum(&system).expect("scenario runs");
+    assert_eq!(
+        failures(&checks),
+        vec![names::scheduled_minimum::SCALED_OUT_FOR_MINIMUM]
+    );
+}
+
+#[test]
+fn scheduled_minimum_rejects_wrong_policy_minimum() {
+    let system = ControlSim::new(Behaviour::COMPLIANT, 0);
+    {
+        let mut world = system.world.lock();
+        world.scheduled_minimum = 1;
+        world.minimum_fault = MinimumFault::ConfiguredMinimum;
+    }
+    let checks = scheduled_minimum(&system).expect("scenario runs");
+    assert_eq!(
+        failures(&checks),
+        vec![names::scheduled_minimum::POLICY_MIN]
+    );
+}
+
+#[test]
+fn scale_out_cause_distinguishes_floor_from_demand() {
+    let mut floor = World::new(Behaviour::COMPLIANT, 1);
+    floor.scale_out();
+    assert_eq!(floor.ledger[0].cause, Some(Cause::Minimum));
+    let mut demand = World::new(Behaviour::COMPLIANT, 1);
+    demand.queued = 1;
+    demand.scale_out();
+    assert_eq!(demand.ledger[0].cause, Some(Cause::Demand));
 }
 
 #[test]

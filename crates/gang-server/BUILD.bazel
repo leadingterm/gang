@@ -17,6 +17,7 @@ workspace_rust_library(
     deps = [
         "//crates/gang-clock:gang_clock",
         "//crates/gang-config:gang_config",
+        "//crates/gang-insight:gang_insight",
         "//crates/gang-mtls:gang_mtls",
         "//crates/gang-reconciler:gang_reconciler",
         "//crates/gang-spi:gang_spi",

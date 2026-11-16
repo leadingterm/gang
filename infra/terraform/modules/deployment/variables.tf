@@ -91,9 +91,37 @@ variable "nat_mode" {
   }
 }
 
-variable "controller_ami_id" {
+variable "image_publisher" {
   type        = string
-  description = "AMI id of the controller instance (the Gang controller NixOS image). Changing it replaces the controller."
+  description = "AWS account that publishes Gang's public AMIs, a fact of Gang's distribution. A fork that publishes its own images sets its account."
+  default     = "072320588884"
+
+  validation {
+    condition     = can(regex("^[0-9]{12}$", var.image_publisher))
+    error_message = "image_publisher must be a 12-digit AWS account ID."
+  }
+}
+
+variable "release_repository" {
+  type        = string
+  description = "GitHub repository whose release of this module's version lists each image's SHA-256 in SHA256SUMS. A fork sets its own."
+  default     = "leadingterm/gang"
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$", var.release_repository))
+    error_message = "release_repository must be a GitHub owner/repository."
+  }
+}
+
+variable "images" {
+  type        = map(object({ owner = string, sha256 = string }))
+  description = "Image per architecture: the AMI named gang-<architecture>-<first 16 hex digits of sha256> that owner (an account id, or self for an imported image) registered. An architecture not set here uses the public image of this module's release from image_publisher."
+  default     = {}
+
+  validation {
+    condition     = alltrue([for architecture, image in var.images : contains(["x86_64", "aarch64"], architecture) && can(regex("^(self|[0-9]{12})$", image.owner)) && can(regex("^[0-9a-f]{64}$", image.sha256))])
+    error_message = "Each images key must be x86_64 or aarch64, with owner self or a 12-digit account ID and sha256 of 64 lowercase hex digits."
+  }
 }
 
 variable "controller_instance_type" {
@@ -120,7 +148,7 @@ variable "fleets" {
     sandbox                     = optional(string, "bwrap")
     capacity                    = string
     machine_class               = optional(string, null)
-    ami_id                      = string
+    image                       = optional(object({ owner = string, sha256 = string }), null)
     instance_types              = list(string)
     max_instances               = number
     min_instances               = optional(number, 0)
@@ -135,6 +163,7 @@ variable "fleets" {
     root_volume_gib             = optional(number)
     warm_pool_size              = optional(number, 0)
     fallback                    = optional(object({ retry_spot_after = optional(string, "5m"), drain_on_demand_first = optional(bool, true) }), null)
+    scheduled_minimum           = optional(list(object({ instances = number, days = list(string), start = string, end = string, time_zone = string })), [])
   }))
   description = <<-EOT
     Worker fleets in preference order: the scheduler tries them in list order. Each fleet is one Auto Scaling group; a fleet with `fallback` also has an on-demand twin group `<name>-on-demand`.
@@ -143,22 +172,33 @@ variable "fleets" {
     sandbox: sandbox the workers run actions in. Only bwrap is supported. Written to gang.toml as [[fleets]].sandbox.
     capacity: spot or on-demand. Selects the Auto Scaling group purchase option and is written to [fleets.options].capacity.
     machine_class: optional qualitative machine class (for example gpu), written to [fleets.options].machine_class when set.
-    ami_id: worker AMI for this fleet.
+    image: optional image of this fleet (for example a GPU image), {owner, sha256} as in images; null uses images[<the isa's architecture>].
     instance_types: EC2 instance types. For on-demand fleets the order is the launch priority (the first type is tried first); spot fleets ignore the order. Every type needs instance-store NVMe unless scratch_volume_gib is set. The fleet's groups span only the private subnets whose availability zone offers at least one of these types; the plan fails when no zone offers any.
     max_instances: upper bound of the Auto Scaling group.
     min_instances, vcpus_per_instance, target_actions_per_instance, idle_timeout,
     max_drain_wait, boot_grace: scheduling policy written to gang.toml.
-    memory_per_instance: non-zero memory size in B, KiB, MiB, GiB or TiB, written to gang.toml.
+    memory_per_instance: memory size at least 16MiB in B, KiB, MiB, GiB or TiB, written to gang.toml.
     disk_per_instance: non-zero disk size in B, KiB, MiB, GiB or TiB; lower bound of the disk the fleet's actions may fill in total, valid for every instance type of the fleet (scratch capacity minus the fast CAS budget minus an overshoot reserve); written to gang.toml.
     scratch_volume_gib: EBS scratch volume on /dev/sdf for EBS-only instance types. Null uses instance-store NVMe.
     root_volume_gib: size of the encrypted gp3 root volume in GiB. Unset uses the worker-fleet module's default.
     warm_pool_size: stopped standby instances kept warm on the fleet's on-demand group: the fleet's own group for on-demand fleets, the <name>-on-demand twin for fallback fleets. 0 keeps no pool. Above 0 the fleet needs an on-demand group (capacity on-demand, or fallback). Not written to gang.toml.
     fallback: opts a spot fleet in to on-demand fallback. The fleet keeps its spot group and gains the on-demand twin <name>-on-demand, which takes capacity while Spot is unavailable. Presence opts in; null keeps Spot only. Requires capacity spot. Written to gang.toml as [fleets.options.fallback]: retry_spot_after (default 5m) is how long capacity stays on the twin after a failed Spot launch before Spot is tried again; drain_on_demand_first (default true) releases on-demand instances before Spot ones when the fleet has surplus.
+    scheduled_minimum: weekly windows during which the fleet keeps at least instances instances (days of mon..sun, start and end as HH:MM local time from 00:00 to 24:00 with start before end, an IANA time_zone). Written to gang.toml as [[fleets.scheduled_minimum]]; the controller rejects an unknown time zone when it starts.
   EOT
 
   validation {
     condition     = alltrue([for fleet in var.fleets : can(regex("^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$", fleet.name))])
     error_message = "Each fleet name must be 1 to 40 lowercase letters, digits or hyphens, and start and end with a letter or digit."
+  }
+
+  validation {
+    condition     = alltrue([for fleet in var.fleets : fleet.name != "controller"])
+    error_message = "No fleet may be named controller."
+  }
+
+  validation {
+    condition     = alltrue([for fleet in var.fleets : fleet.image == null ? true : can(regex("^(self|[0-9]{12})$", fleet.image.owner)) && can(regex("^[0-9a-f]{64}$", fleet.image.sha256))])
+    error_message = "Each fleet image owner must be self or a 12-digit account ID and sha256 must be 64 lowercase hex digits."
   }
 
   validation {
@@ -209,6 +249,17 @@ variable "fleets" {
   }
 
   validation {
+    condition = alltrue([
+      for fleet in var.fleets : try(
+        tonumber(regex("^(0*[1-9][0-9]*)(B|KiB|MiB|GiB|TiB)$", fleet.memory_per_instance)[0]) *
+        { B = 1, KiB = 1024, MiB = 1048576, GiB = 1073741824, TiB = 1099511627776 }[regex("^(0*[1-9][0-9]*)(B|KiB|MiB|GiB|TiB)$", fleet.memory_per_instance)[1]] >= 16777216,
+        false
+      )
+    ])
+    error_message = "Each fleet memory_per_instance must be at least 16MiB, the default [scheduler.nativelink.memory] min_reservation, which the controller refuses to exceed."
+  }
+
+  validation {
     condition     = alltrue([for fleet in var.fleets : fleet.max_instances >= 1 && fleet.max_instances <= 4294967295 && floor(fleet.max_instances) == fleet.max_instances])
     error_message = "Each fleet max_instances must be a whole number from 1 to 4294967295."
   }
@@ -216,6 +267,33 @@ variable "fleets" {
   validation {
     condition     = alltrue([for fleet in var.fleets : fleet.min_instances >= 0 && fleet.min_instances <= fleet.max_instances && floor(fleet.min_instances) == fleet.min_instances])
     error_message = "Each fleet min_instances must be a whole number from 0 to its max_instances."
+  }
+
+  validation {
+    condition = alltrue(flatten([
+      for fleet in var.fleets : [
+        for window in fleet.scheduled_minimum : floor(window.instances) == window.instances && window.instances > fleet.min_instances && window.instances <= fleet.max_instances
+      ]
+    ]))
+    error_message = "Each scheduled minimum instances must be a whole number above min_instances and at most max_instances."
+  }
+
+  validation {
+    condition = alltrue(flatten([
+      for fleet in var.fleets : [
+        for window in fleet.scheduled_minimum : length(window.days) > 0 && length(distinct(window.days)) == length(window.days) && alltrue([for day in window.days : contains(["mon", "tue", "wed", "thu", "fri", "sat", "sun"], day)])
+      ]
+    ]))
+    error_message = "Each scheduled minimum days list must be non-empty, distinct, and contain only mon through sun."
+  }
+
+  validation {
+    condition = alltrue(flatten([
+      for fleet in var.fleets : [
+        for window in fleet.scheduled_minimum : can(regex("^([01][0-9]|2[0-3]):[0-5][0-9]$", window.start)) && can(regex("^(([01][0-9]|2[0-3]):[0-5][0-9]|24:00)$", window.end)) && try(tonumber(replace(window.start, ":", "")) < tonumber(replace(window.end, ":", "")), false)
+      ]
+    ]))
+    error_message = "Each scheduled minimum start and end must be HH:MM from 00:00 to 24:00, with start before end."
   }
 
   validation {

@@ -12,11 +12,11 @@ use tokio::sync::oneshot;
 
 use gang_clock::Timestamp;
 use gang_types::{
-    ActionResources, Bytes, FleetCatalog, FleetName, FleetProperties, FleetSet, InstanceId,
-    Refusal, Url, WorkerId,
+    ActionResources, BuildId, Bytes, FleetCatalog, FleetName, FleetProperties, FleetSet,
+    InstanceId, Refusal, Url, WorkerId,
 };
 
-use crate::{BoxedError, Peer, PortError, RenderedStoreSpec, port};
+use crate::{Authenticated, BoxedError, ObservationSink, Peer, PortError, RenderedStoreSpec, port};
 
 /// The remote execution scheduler Gang scales workers for. The scheduler runs inside the `gang`
 /// process: `gang server` runs the controller and `gang worker` runs a worker, each through the
@@ -107,6 +107,10 @@ pub trait SchedulerPort: Send + Sync {
 pub struct SchedulerSnapshot {
     /// Actions that reached a terminal result on a worker since the controller started. Monotonic.
     pub completed: u64,
+    /// `GetActionResult` calls the controller answered since it started. Monotonic.
+    pub lookups: u64,
+    /// Of `lookups`, those answered with a result: remote cache hits. Monotonic.
+    pub hits: u64,
     /// The connected workers, with unique ids sorted by `WorkerId` ascending.
     pub workers: Vec<WorkerState>,
     /// The queued actions, highest priority first, then oldest.
@@ -182,6 +186,8 @@ pub struct ActionInfo {
     pub mnemonic: String,
     /// Scheduling priority; higher runs first.
     pub priority: i32,
+    /// The build the action's first submitter belongs to; `None` when unattributable.
+    pub build: Option<BuildId>,
 }
 
 /// A running action reported by the scheduler.
@@ -225,11 +231,25 @@ pub struct Accepted {
     pub peer: Peer,
 }
 
+/// What a gate learned about the caller of a request it admits: the one answer to whether, and
+/// as whom, the caller authenticated. A connection whose request was admitted
+/// [`Admitted::Authenticated`] has earned its place among the listener's connections, and the
+/// services behind the gate act for that caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admitted {
+    /// The caller proved who it is.
+    Authenticated(Authenticated),
+    /// The caller is anonymous, as an open path of the public listener admits it.
+    Anonymous,
+}
+
 /// The authentication gate of a listener. The controller applies it to every request before any
 /// service sees it, so the scheduler stays free of TLS, tokens and revocation.
 pub trait RequestGate: Clone + Send + Sync + 'static {
-    /// Decides whether a request may proceed. The gate may add values to `parts.extensions`,
-    /// such as the caller's identity, for the services behind it.
+    /// Decides whether a request may proceed, and as whom. The gate may add values to
+    /// `parts.extensions` for the services behind it.
+    /// An admitted request is [`Admitted::Authenticated`] when its caller proved who it is, and
+    /// [`Admitted::Anonymous`] otherwise.
     ///
     /// # Errors
     ///
@@ -243,7 +263,7 @@ pub trait RequestGate: Clone + Send + Sync + 'static {
         &self,
         peer: &Peer,
         parts: &mut http::request::Parts,
-    ) -> impl Future<Output = Result<(), PortError>> + Send;
+    ) -> impl Future<Output = Result<Admitted, PortError>> + Send;
 }
 
 /// The request body of an [`ApiService`].
@@ -362,8 +382,13 @@ pub struct ControllerSpec<'a> {
     /// Every fleet's properties in preference order: what the scheduler declares and how
     /// queued actions are matched.
     pub fleets: &'a FleetCatalog,
+    /// The most workers the fleets run at once, one per instance: the sum of their
+    /// `max_instances`.
+    pub max_workers: u64,
     /// The timeout the controller applies to client actions.
     pub client_action_timeout: Duration,
+    /// Where the controller's observers send what builds do.
+    pub observations: &'a ObservationSink,
 }
 
 /// The dialable URL of the controller's worker listener, with its host name, as the plugin's

@@ -1,15 +1,35 @@
 {
+  config,
   lib,
   pkgs,
   ...
 }: let
+  roles = ["controller" "worker"];
   imds = "http://169.254.169.254/latest";
+  gangStateDisk = pkgs.writeShellApplication {
+    name = "gang-state-disk";
+    # systemd-makefs locates mkfs.ext4 on PATH.
+    runtimeInputs = [pkgs.util-linux pkgs.e2fsprogs config.systemd.package];
+    text = ''
+      mountpoint -q /var/lib/gang && exit 0
+      systemctl start "$(systemd-escape --path --suffix=device ${lib.escapeShellArg config.gang.stateDevice})"
+      ${config.systemd.package}/lib/systemd/systemd-makefs ext4 ${lib.escapeShellArg config.gang.stateDevice}
+      # A dependent can keep a previous transient mount loaded after unmount.
+      if [ "$(systemctl show -P LoadState var-lib-gang.mount)" = loaded ]; then
+        systemctl start var-lib-gang.mount
+      else
+        systemd-mount --collect --no-ask-password --type=ext4 --options=noatime \
+          ${lib.escapeShellArg config.gang.stateDevice} /var/lib/gang
+      fi
+    '';
+  };
   gangConfig = pkgs.writeShellApplication {
     name = "gang-config";
     runtimeInputs = [
       pkgs.awscli2
       pkgs.curl
       pkgs.coreutils
+      config.systemd.package
     ];
     text = ''
       token=$(curl --fail --silent --show-error --retry 10 --retry-all-errors \
@@ -23,9 +43,26 @@
       }
 
       user_data=$(imds_get user-data)
-      name=$(printf '%s\n' "$user_data" | head -n 1)
-      if [ -z "$name" ]; then
-        echo "gang-config: EC2 user-data (parameter name) is empty" >&2
+      # The first line names the role, parameter, and optionally the controller state device.
+      first_line=$(printf '%s\n' "$user_data" | head -n 1)
+      read -r role name state rest <<<"$first_line"
+      case "$role" in
+        ${lib.concatStringsSep " | " roles}) ;;
+        *)
+          echo "gang-config: EC2 user-data role '$role' is not one of: ${toString roles}" >&2
+          exit 1
+          ;;
+      esac
+      expected="$role $name"
+      if [ -n "$state" ]; then
+        expected+=" $state"
+      fi
+      if [ -z "$name" ] || [ -n "$rest" ] || [ "$first_line" != "$expected" ]; then
+        echo "gang-config: the first line of EC2 user-data must be '<role> <parameter>' or 'controller <parameter> state=<stateDevice>'" >&2
+        exit 1
+      fi
+      if [ -n "$state" ] && { [ "$role" != controller ] || [ "$state" != ${lib.escapeShellArg "state=${config.gang.stateDevice}"} ]; }; then
+        echo ${lib.escapeShellArg "gang-config: only a controller's first EC2 user-data line may end with state=${config.gang.stateDevice}"} >&2
         exit 1
       fi
 
@@ -112,33 +149,70 @@
       chown root:root "$tmp"
       chmod 0644 "$tmp"
       mv -f -- "$tmp" /etc/gang/gang.toml
+
+      # Only a named state disk is mounted, before the controller starts; failure fails this service.
+      if [ -n "$state" ]; then
+        systemctl start gang-state-disk.service
+      fi
+
+      # The role's units hang off its target; starting an active target again is a no-op, so a restart is safe.
+      systemctl start --no-block "gang-$role.target"
     '';
   };
 in {
-  users.groups.gang = {};
-  users.users.gang = {
-    isSystemUser = true;
-    group = "gang";
-    createHome = false;
+  options.gang.roles = lib.mkOption {
+    type = lib.types.listOf lib.types.str;
+    default = roles;
+    readOnly = true;
+    description = "The roles of the image, one systemd target `gang-<role>.target` each; the first line of the EC2 user data names the one gang-config starts.";
   };
 
-  systemd.tmpfiles.rules = ["d /etc/gang 0755 root root -"];
+  options.gang.stateDevice = lib.mkOption {
+    type = lib.types.str;
+    default = "/dev/sdg";
+    description = "The controller's state disk, mounted at /var/lib/gang only when the first EC2 user-data line names it (`state=<device>`); the module that attaches the disk renders the token. Distinct from a worker's EBS scratch volume (/dev/sdf).";
+  };
 
-  systemd.services.gang-config = {
-    description = "Write gang.toml from the SSM parameter named in EC2 user-data";
-    wantedBy = ["multi-user.target"];
-    wants = ["network-online.target"];
-    after = ["network-online.target"];
-    environment = {
-      AWS_MAX_ATTEMPTS = "10";
-      AWS_RETRY_MODE = "standard";
+  config = {
+    users.groups.gang = {};
+    users.users.gang = {
+      isSystemUser = true;
+      group = "gang";
+      createHome = false;
     };
-    serviceConfig = {
-      Type = "oneshot";
-      RemainAfterExit = true;
-      ExecStart = lib.getExe gangConfig;
-      Restart = "on-failure";
-      RestartSec = 5;
+
+    systemd.tmpfiles.rules = ["d /etc/gang 0755 root root -"];
+
+    systemd.targets = lib.listToAttrs (map (role:
+      lib.nameValuePair "gang-${role}" {
+        description = "Gang ${role}, started by gang-config.service when the EC2 user data names this role";
+      })
+    roles);
+
+    systemd.services.gang-state-disk = {
+      description = "Format when blank and mount the controller state disk named by the EC2 user data";
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = lib.getExe gangStateDisk;
+      };
+    };
+
+    systemd.services.gang-config = {
+      description = "Write gang.toml from the SSM parameter named in EC2 user-data and start the role it names";
+      wantedBy = ["multi-user.target"];
+      wants = ["network-online.target"];
+      after = ["network-online.target"];
+      environment = {
+        AWS_MAX_ATTEMPTS = "10";
+        AWS_RETRY_MODE = "standard";
+      };
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = lib.getExe gangConfig;
+        Restart = "on-failure";
+        RestartSec = 5;
+      };
     };
   };
 }

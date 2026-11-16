@@ -137,6 +137,7 @@ impl Plan {
 struct Crate {
     path: PathBuf,
     proc_macro: bool,
+    inherits_lints: bool,
     dependencies: BTreeSet<String>,
     files: BTreeMap<PathBuf, String>,
 }
@@ -243,6 +244,11 @@ impl Workspace {
                 .and_then(|lib| lib.get("proc-macro"))
                 .and_then(toml::Value::as_bool)
                 .unwrap_or(false);
+            let inherits_lints = parsed
+                .get("lints")
+                .and_then(|lints| lints.get("workspace"))
+                .and_then(toml::Value::as_bool)
+                == Some(true);
             let mut files = BTreeMap::new();
             collect_sources(root, &root.join(&path).join("src"), &mut files)?;
             let tests = root.join(&path).join("tests");
@@ -262,6 +268,7 @@ impl Workspace {
                     Crate {
                         path,
                         proc_macro,
+                        inherits_lints,
                         dependencies,
                         files,
                     },
@@ -285,6 +292,11 @@ pub enum Violation {
     },
     /// A plan entry has no corresponding workspace package.
     ExtraPlanCrate {
+        /// Package name.
+        name: String,
+    },
+    /// A workspace package does not inherit workspace lints, so its targets are linted with nothing.
+    LintsNotInherited {
         /// Package name.
         name: String,
     },
@@ -344,6 +356,10 @@ impl std::fmt::Display for Violation {
             Self::ExtraPlanCrate { name } => {
                 write!(f, "plan crate {name} is not a workspace package")
             }
+            Self::LintsNotInherited { name } => write!(
+                f,
+                "{name}: Cargo.toml must inherit the workspace lints ([lints] workspace = true)"
+            ),
             Self::TierEdge {
                 from,
                 to,
@@ -476,7 +492,7 @@ fn facade_item(item: &syn::Item, proc_macro: bool) -> Option<String> {
     }
 }
 
-/// Checks membership, tiers, source layout, facades and unsafe-code confinement.
+/// Checks membership, lint inheritance, tiers, source layout, facades and unsafe-code confinement.
 ///
 /// # Errors
 /// Returns an error when any Rust source cannot be parsed.
@@ -493,6 +509,9 @@ pub fn check(plan: &Plan, workspace: &Workspace) -> Result<Vec<Violation>, Error
         }
     }
     for (name, krate) in &workspace.crates {
+        if !krate.inherits_lints {
+            violations.push(Violation::LintsNotInherited { name: name.clone() });
+        }
         if let Some(Some(from_tier)) = plan.tiers.get(name) {
             for dependency in &krate.dependencies {
                 if let Some(to_tier) = plan.tiers.get(dependency)

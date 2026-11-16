@@ -30,6 +30,15 @@ machine_class = ${jsonencode(f.machine_class)}
 retry_spot_after = ${jsonencode(f.fallback.retry_spot_after)}
 drain_on_demand_first = ${f.fallback.drain_on_demand_first}
 %{ endif ~}
+%{ for w in f.scheduled_minimum ~}
+
+[[fleets.scheduled_minimum]]
+instances = ${w.instances}
+days = ${jsonencode(w.days)}
+start = ${jsonencode(w.start)}
+end = ${jsonencode(w.end)}
+time_zone = ${jsonencode(w.time_zone)}
+%{ endfor ~}
 %{ endfor }
 
 [execution]
@@ -57,7 +66,7 @@ worker_endpoint = ${jsonencode(worker_endpoint)}
 scheduler_name = "MAIN_SCHEDULER"
 
 [database.sqlite]
-# The controller image mounts its state volume at this path.
+# The controller keeps its state under this path.
 path = "/var/lib/gang/gang.db"
 
 [sandbox.bwrap]

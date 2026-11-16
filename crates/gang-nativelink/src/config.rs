@@ -1,11 +1,11 @@
 //! Plugin configuration: dialable endpoints, scheduler name, and tuning.
 
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::time::Duration;
 
 use gang_types::{
-    BoundedDuration, HeadroomPercent, NANOS_PER_SECOND, NonZeroBytes, NonZeroDuration,
-    SchedulerName, SchedulerSettings, Url,
+    BoundedBytes, BoundedDuration, HeadroomPercent, NANOS_PER_SECOND, NonZeroBytes,
+    NonZeroDuration, SchedulerName, SchedulerSettings, Url,
 };
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +16,10 @@ use crate::open_file_limit::OpenFileLimit;
 /// A non-zero whole number of seconds, capped at the representable maximum of about 584 years.
 pub(crate) type WholeSeconds =
     BoundedDuration<NANOS_PER_SECOND, 1, { u64::MAX / NANOS_PER_SECOND }>;
+
+/// How many bytes a client may send on one HTTP/2 connection, and on any one of its streams,
+/// before the controller acknowledges them.
+pub type ReceiveWindow = BoundedBytes<1, MIN_RECEIVE_WINDOW, MAX_RECEIVE_WINDOW>;
 
 /// A worker silent for longer than this is dropped from the scheduler.
 const DEFAULT_WORKER_TIMEOUT: WholeSeconds = WholeSeconds::from_units(10);
@@ -45,6 +49,24 @@ const DEFAULT_CLEANUP_WAIT: WholeSeconds = WholeSeconds::from_units(30);
 const DEFAULT_WORKER_KEEPALIVE_INTERVAL: WholeSeconds = WholeSeconds::from_units(30);
 /// Largest gRPC message a connection accepts: 4 MiB.
 const DEFAULT_MAX_MESSAGE_SIZE: NonZeroBytes = NonZeroBytes::mib(4);
+/// How many connections the public listener serves at once: 128 × the default 16 MiB
+/// `receive_window` is 2 GiB, within the 4 GiB reference controller.
+const DEFAULT_MAX_CONNECTIONS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(127);
+/// How many requests one HTTP/2 connection runs at once: 100, as many as Bazel sends on one
+/// connection by default (`--remote_max_concurrency_per_connection`).
+const DEFAULT_MAX_CONCURRENT_STREAMS: NonZeroU32 = NonZeroU32::MIN.saturating_add(99);
+/// Shortest time between two log lines of a listener's refused connections.
+const DEFAULT_REFUSAL_LOG_INTERVAL: NonZeroDuration = NonZeroDuration::from_secs(60);
+/// How long a connection on the public listener that has not earned its place may stay without a
+/// request in flight.
+const DEFAULT_UNPROVEN_IDLE_TIMEOUT: NonZeroDuration = NonZeroDuration::from_secs(30);
+/// The smallest receive window a server can honour: every HTTP/2 connection starts with a
+/// 65535-byte window, which can only grow (RFC 9113, section 6.9.2).
+const MIN_RECEIVE_WINDOW: u64 = 65_535;
+/// The largest flow-control window HTTP/2 allows (RFC 9113, section 6.9.1).
+const MAX_RECEIVE_WINDOW: u64 = (1 << 31) - 1;
+/// 16 MiB: HTTP/2 flow control lets one connection 140 ms away upload up to about 114 MiB/s.
+const DEFAULT_RECEIVE_WINDOW: ReceiveWindow = ReceiveWindow::from_units(16 * 1024 * 1024);
 /// How long a `ByteStream` write survives a client disconnect.
 const DEFAULT_STREAM_IDLE_TIMEOUT: WholeSeconds = WholeSeconds::from_units(10);
 /// Interval of HTTP/2 keepalive pings sent to clients.
@@ -87,8 +109,8 @@ pub struct NativeLinkConfig {
     /// `cpu_count` is in cores; learned and cold-start scheduler CPU reservations use millicores.
     #[serde(default)]
     pub cold_start: ColdStartTuning,
-    /// HTTP/2 settings of every connection the controller is handed: message sizes, stream
-    /// timeouts, and keepalives.
+    /// HTTP/2 settings of every connection the controller is handed: connection, stream, and
+    /// message limits, the receive window, timeouts, keepalives, and the shutdown grace.
     #[serde(default)]
     pub http2: Http2Tuning,
 }
@@ -210,11 +232,37 @@ impl Default for WorkerTuning {
 
 /// HTTP/2 settings of every connection the controller is handed. Every field has a default, so an
 /// empty section is valid.
+///
+/// They bound the request data each listener holds before a handler reads it. An HTTP/2
+/// connection holds at most `receive_window` bytes that no handler has read, and an HTTP/1.1
+/// connection at most hyper's 408 KiB read buffer, so a listener holds at most its connection
+/// limit × `receive_window` unread (2 GiB on the public listener at the defaults). What a handler
+/// reads is its own: a gRPC request decodes one message of at most `max_message_size` (plus one
+/// 16 KiB HTTP/2 frame) at a time, on at most `max_concurrent_streams` requests per connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Http2Tuning {
     /// Largest gRPC message a connection accepts. Default: `4MiB`.
     pub max_message_size: NonZeroBytes,
+    /// How many connections the public listener serves at once. A connection earns its place once
+    /// the gate admits an authenticated request on it; at the limit, a new connection replaces the
+    /// oldest one that has not, an idle one first, and is closed only when every connection has.
+    /// The worker listener serves two generations of every connection of every worker the fleets
+    /// can run (the sum of their `max_instances`). Default: `128`.
+    pub max_connections: NonZeroUsize,
+    /// Shortest time between two log lines of a listener's refused connections; each line counts
+    /// the refusals since the previous one and in all. Default: `60s`.
+    pub refusal_log_interval: NonZeroDuration,
+    /// How long a connection on the public listener that has not earned its place may stay without
+    /// a request in flight, before its first request included, before it is closed. Default: `30s`.
+    pub unproven_idle_timeout: NonZeroDuration,
+    /// How many requests one HTTP/2 connection runs at once; its client queues the rest.
+    /// Default: `100`.
+    pub max_concurrent_streams: NonZeroU32,
+    /// How many bytes a client may send on one connection, and on any one of its streams, before
+    /// the controller reads them; between 65535 and 2147483647 bytes. A connection uploads at most
+    /// one window per round trip. Default: `16MiB`.
+    pub receive_window: ReceiveWindow,
     /// How long a `ByteStream` write survives a client disconnect. Default: `10s`.
     pub stream_idle_timeout: WholeSeconds,
     /// Interval of HTTP/2 keepalive pings sent to clients. Default: `30s`.
@@ -232,6 +280,11 @@ impl Default for Http2Tuning {
     fn default() -> Self {
         Self {
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            refusal_log_interval: DEFAULT_REFUSAL_LOG_INTERVAL,
+            unproven_idle_timeout: DEFAULT_UNPROVEN_IDLE_TIMEOUT,
+            max_concurrent_streams: DEFAULT_MAX_CONCURRENT_STREAMS,
+            receive_window: DEFAULT_RECEIVE_WINDOW,
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
             keepalive_interval: DEFAULT_HTTP2_KEEPALIVE_INTERVAL,
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
@@ -299,8 +352,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::enforcement::{DiskEnforcement, EscalationPercent, MemoryEnforcement};
-    use crate::whole_kib::WholeKib;
+    use crate::enforcement::{DiskEnforcement, EscalationPercent, MemoryEnforcement, WholeKib};
 
     fn base() -> Value {
         json!({
@@ -317,6 +369,17 @@ mod tests {
     fn empty_sections_take_the_defaults_and_round_trip() {
         let config = parse(base()).expect("valid config");
         assert_eq!(config.max_open_files.get(), 24_576);
+        assert_eq!(config.http2.max_connections.get(), 128);
+        assert_eq!(config.http2.max_concurrent_streams.get(), 100);
+        assert_eq!(config.http2.receive_window.as_units(), 16 * 1024 * 1024);
+        assert_eq!(
+            config.http2.refusal_log_interval,
+            NonZeroDuration::from_secs(60)
+        );
+        assert_eq!(
+            config.http2.unproven_idle_timeout,
+            NonZeroDuration::from_secs(30)
+        );
         assert_eq!(config.scheduler, SchedulerTuning::default());
         assert_eq!(config.worker, WorkerTuning::default());
         assert_eq!(config.http2, Http2Tuning::default());
@@ -369,13 +432,31 @@ mod tests {
     fn durations_and_bytes_parse_from_strings() {
         let mut value = base();
         value["scheduler"] = json!({ "worker_timeout": "30s" });
-        value["http2"] = json!({ "max_message_size": "8MiB" });
+        value["http2"] = json!({
+            "max_message_size": "8MiB",
+            "receive_window": "8MiB",
+            "max_connections": 2,
+            "max_concurrent_streams": 3,
+            "refusal_log_interval": "5s",
+            "unproven_idle_timeout": "7s"
+        });
         let config = parse(value).expect("valid config");
         assert_eq!(
             config.scheduler.worker_timeout,
             WholeSeconds::from_units(30)
         );
         assert_eq!(config.http2.max_message_size, NonZeroBytes::mib(8));
+        assert_eq!(config.http2.receive_window.as_units(), 8 * 1024 * 1024);
+        assert_eq!(config.http2.max_connections.get(), 2);
+        assert_eq!(
+            config.http2.refusal_log_interval,
+            NonZeroDuration::from_secs(5)
+        );
+        assert_eq!(
+            config.http2.unproven_idle_timeout,
+            NonZeroDuration::from_secs(7)
+        );
+        assert_eq!(config.http2.max_concurrent_streams.get(), 3);
     }
 
     #[test]
@@ -417,6 +498,23 @@ mod tests {
         let mut value = base();
         value["http2"] = json!({ "max_message_size": "0B" });
         assert!(parse(value).is_err());
+
+        for limit in ["max_connections", "max_concurrent_streams"] {
+            let mut value = base();
+            value["http2"] = json!({ limit: 0 });
+            assert!(parse(value).is_err(), "{limit}");
+        }
+
+        for window in ["65534B", "2GiB"] {
+            let mut value = base();
+            value["http2"] = json!({ "receive_window": window });
+            assert!(parse(value).is_err(), "window {window}");
+        }
+        for window in ["65535B", "2147483647B"] {
+            let mut value = base();
+            value["http2"] = json!({ "receive_window": window });
+            assert!(parse(value).is_ok(), "window {window}");
+        }
     }
 
     #[test]
@@ -592,7 +690,12 @@ mod tests {
 
     #[test]
     fn http2_non_zero_intervals_reject_zero() {
-        for key in ["keepalive_interval", "header_read_timeout"] {
+        for key in [
+            "keepalive_interval",
+            "header_read_timeout",
+            "refusal_log_interval",
+            "unproven_idle_timeout",
+        ] {
             let mut value = base();
             value["http2"] = json!({ (key): "0s" });
             assert!(parse(value).is_err(), "http2.{key} = 0s must be rejected");
@@ -633,6 +736,24 @@ mod tests {
         value["memory"] = json!({ "enforcement": "soft" });
         let config = parse(value).expect("valid config");
         assert_eq!(config.memory.enforcement, MemoryEnforcement::Soft);
+    }
+
+    #[test]
+    fn memory_tuning_parses_all_fields() {
+        let mut value = base();
+        value["memory"] = json!({
+            "enforcement": "soft",
+            "min_reservation": "64MiB",
+            "headroom_percent": 30,
+            "escalation_percent": 150,
+            "escalation_max_steps": 4,
+        });
+        let config = parse(value).expect("valid config");
+        assert_eq!(config.memory.enforcement, MemoryEnforcement::Soft);
+        assert_eq!(config.memory.min_reservation.as_units(), 65_536);
+        assert_eq!(config.memory.headroom_percent.get(), 30);
+        assert_eq!(config.memory.escalation_percent.get(), 150);
+        assert_eq!(config.memory.escalation_max_steps, 4);
     }
 
     #[test]
@@ -689,9 +810,9 @@ mod tests {
         assert_eq!(config.cold_start.cpu_count.get(), 2);
         assert_eq!(
             config.cold_start.memory,
-            WholeKib::from_kib(2 * 1024 * 1024)
+            WholeKib::from_units(2 * 1024 * 1024)
         );
-        assert_eq!(config.cold_start.disk, WholeKib::from_kib(1024 * 1024));
+        assert_eq!(config.cold_start.disk, WholeKib::from_units(1024 * 1024));
     }
 
     #[test]
@@ -702,7 +823,7 @@ mod tests {
     }
 
     #[test]
-    fn cold_start_sizes_parse_only_as_whole_kib() {
+    fn cold_start_sizes_parse_only_as_integral_kibibytes() {
         let cold = |value: Value| {
             let mut config = base();
             config["cold_start"] = value;

@@ -71,6 +71,31 @@ pub mod build {
         format!("an action exiting with {code} fails the build with that exit code")
     }
 }
+/// Names of the checks of per-build accounting.
+pub mod builds {
+    /// The cold invocation has exactly one listed build.
+    pub const COLD_LIST: &str = "cold invocation lists exactly one build";
+    /// The cold build has at least one cache miss.
+    pub const COLD_MISSES: &str = "cold build records cache misses";
+    /// The cold build has at least one completed execution.
+    pub const COLD_COMPLETED: &str = "cold build records completed executions";
+    /// The cold build's timestamps are ordered.
+    pub const COLD_TIMES: &str = "cold build timestamps are ordered";
+    /// The cold build belongs to its client principal.
+    pub const COLD_PRINCIPAL: &str = "cold build names its client principal";
+    /// The warm invocation has exactly one listed build.
+    pub const WARM_LIST: &str = "warm invocation lists exactly one build";
+    /// The warm build has at least one cache hit.
+    pub const WARM_HITS: &str = "warm build records cache hits";
+    /// The warm build has no cache misses.
+    pub const WARM_MISSES: &str = "warm build records no cache misses";
+    /// The warm build's timestamps are ordered.
+    pub const WARM_TIMES: &str = "warm build timestamps are ordered";
+    /// The warm build belongs to its client principal.
+    pub const WARM_PRINCIPAL: &str = "warm build names its client principal";
+    /// The two invocations have different build names.
+    pub const DISTINCT: &str = "cold and warm builds have different names";
+}
 
 /// Names of the checks of the scale-outs a build causes.
 pub mod scaling {
@@ -764,6 +789,16 @@ pub mod orphan {
 
     /// An orphan is terminated exactly once.
     pub const TERMINATED_ONCE: &str = "an orphan is terminated exactly once";
+}
+
+/// Names of the checks of the scheduled-minimum scenario.
+pub mod scheduled_minimum {
+    /// A worker connects without a build.
+    pub const WORKER_STANDS: &str = "a worker stands without a build";
+    /// The fleet scales out for its minimum.
+    pub const SCALED_OUT_FOR_MINIMUM: &str = "the fleet scales out for its scheduled minimum";
+    /// The streamed policy reports the scheduled floor.
+    pub const POLICY_MIN: &str = "the policy minimum reflects the scheduled minimum";
 }
 
 /// Names of the checks of the drain-cancel scenario.

@@ -80,8 +80,9 @@ resource "aws_launch_template" "this" {
 
   name_prefix = "${var.name_prefix}-${each.key}-"
   image_id    = each.value.ami_id
-  user_data   = base64encode(var.config_parameter_name)
-  tags        = merge(var.tags, { Name = each.value.name })
+  # Line 1 is "<role> <parameter>" (infra/nixos/gang-config.nix): the role this instance runs and the SSM parameter of gang.toml.
+  user_data = base64encode("worker ${var.config_parameter_name}")
+  tags      = merge(var.tags, { Name = each.value.name })
 
   iam_instance_profile {
     arn = module.instance_role.instance_profile_arn

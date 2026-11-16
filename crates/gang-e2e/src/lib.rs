@@ -25,6 +25,7 @@ mod browser;
 mod browser_secured;
 mod browser_verdict;
 mod build_output;
+mod builds;
 mod check;
 mod checked_in;
 mod chromium;
@@ -67,10 +68,12 @@ mod placement;
 mod plaintext;
 mod ports;
 mod preemption;
+mod reaper;
 mod report;
 mod restart;
 mod revocation;
 mod sandbox_contract;
+mod scheduled_minimum;
 mod secured;
 mod server;
 mod server_scenarios;
@@ -173,6 +176,7 @@ pub use placement::Placement;
 pub use plaintext::plaintext;
 pub use preemption::{preemption, worker_renewal};
 pub use process::Ran;
+pub use reaper::reaped;
 pub use report::{
     DiskNeighbourReport, InputRootReport, IsolationReport, Namespaces, PoisonReport, ProbeReport,
     VictimReport,
@@ -180,6 +184,7 @@ pub use report::{
 pub use restart::restart;
 pub use revocation::revocation;
 pub use sandbox_contract::sandbox_contract;
+pub use scheduled_minimum::scheduled_minimum;
 pub use secured::{Secured, bearer_of};
 pub use server::{
     Answer, Body, CERTIFICATE_BACKDATE, CERTIFICATE_TTL, CertificateLifetime, Exit, Handshake,

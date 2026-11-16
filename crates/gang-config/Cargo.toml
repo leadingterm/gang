@@ -9,9 +9,11 @@ version.workspace = true
 workspace = true
 
 [dependencies]
+gang-clock = { workspace = true }
 gang-macros = { workspace = true }
 gang-types = { workspace = true }
 ipnet = { workspace = true }
+jiff = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }

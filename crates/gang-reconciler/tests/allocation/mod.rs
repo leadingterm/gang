@@ -3,9 +3,10 @@
 use std::time::Duration;
 
 use gang_clock::{Clock, TestClock};
+use gang_config::{InstanceBounds, Weekday};
 use gang_reconciler::{FleetPass, HostedSnapshot, PassTime, Plan, Reconciler};
 use gang_spi::{SchedulerSnapshot, WorkerState};
-use gang_testkit::TestResult;
+use gang_testkit::{TestResult, scheduled_minimum};
 use gang_types::{FleetSet, InstanceId, InstanceLifecycle, Isa};
 
 use crate::support::{Harness, X86, policy, policy_named, x86_resources};
@@ -97,7 +98,11 @@ fn steady_state() -> TestResult<Harness> {
 /// Builds the same steady state as [`steady_state`]; when `release_first_idle` is set, the idle
 /// `local-2` is a release-first instance.
 fn steady_state_with(release_first_idle: bool) -> TestResult<Harness> {
-    let mut h = Harness::with_fleets(vec![policy()?, policy_named("gang-spare", Isa::X86_64)?]);
+    let window = scheduled_minimum(1, &Weekday::ALL[..5], "08:00", "19:00", "Europe/Paris")?;
+    let mut primary = policy()?;
+    primary.instances =
+        InstanceBounds::try_new(0, primary.instances.max())?.with_schedule(vec![window])?;
+    let mut h = Harness::with_fleets(vec![primary, policy_named("gang-spare", Isa::X86_64)?]);
     let long_ago = Duration::from_hours(1);
     for instance in ["local-1", "local-2", "local-3", "local-4"] {
         if release_first_idle && instance == "local-2" {

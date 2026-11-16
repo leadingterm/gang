@@ -11,6 +11,7 @@ use gang_state::{Builder, BuilderConfig};
 
 use crate::actions::{ActionsCache, ActionsRefresher};
 use crate::api::ApiDashboard;
+use crate::builds::BuildsCell;
 use crate::errors::ServerError;
 use crate::events::wire_event;
 use crate::hub::{HubConfig, StateHub};
@@ -84,11 +85,12 @@ impl Dashboard {
 
     /// The publisher that turns each control pass into the next state frame of the hub.
     #[must_use]
-    pub(crate) fn publisher(&self) -> StatePublisher {
+    pub(crate) fn publisher(&self, builds: BuildsCell) -> StatePublisher {
         StatePublisher::new(
             self.hub.clone(),
             builder_config(&self.config, &self.provisioner, self.poll_interval),
             self.cache.clone(),
+            builds,
         )
     }
 

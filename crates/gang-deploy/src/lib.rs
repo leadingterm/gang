@@ -2,6 +2,7 @@
 //! product crates: the plan policy over `tofu show -json`, the plan manifest and its comment
 //! line, the plan object key and age, the verification of the plan run and the stored plan
 //! object, and the plan comment.
+//! It also holds the decisions of the release's public images (`gang release`).
 //!
 //! The library performs no I/O and reads no clock: the workflow's glue
 //! (`infra/scripts/reviewed-plan.sh`) runs `tofu`, `aws`, `gh`, `git` and `date`, and pipes
@@ -19,6 +20,7 @@
 //! # Ok::<(), DeployError>(())
 //! ```
 
+mod amis;
 mod comment;
 mod errors;
 mod github;
@@ -34,6 +36,10 @@ mod sha;
 mod store;
 mod timestamp;
 
+pub use amis::{
+    Ami, AmiManifest, AmiName, AmiState, Architecture, DEPRECATE_AFTER, DEREGISTER_AFTER, ImageId,
+    ImageSha256, Protection, Publication, Region, RegionImages, Regions, Release, ReleaseTag, Step,
+};
 pub use comment::{CommentSource, PlanComment};
 pub use errors::{DeployError, Document, Expected};
 pub use github::{

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { routeOf } from "../src/routes.ts";
+import { routeOf, startsClient } from "../src/routes.ts";
 
 test("the root and the bare /ui path both route to the overview", () => {
   assert.deepEqual(routeOf("/ui/", ""), { kind: "screen", screen: "overview" });
@@ -12,6 +12,18 @@ test("a screen path routes to its screen, with or without a trailing slash", () 
   assert.deepEqual(routeOf("/ui/workers/", ""), { kind: "screen", screen: "workers" });
   assert.deepEqual(routeOf("/ui/workers", ""), { kind: "screen", screen: "workers" });
   assert.deepEqual(routeOf("/ui/access", ""), { kind: "screen", screen: "access" });
+});
+
+test("build routes carry one decoded id", () => {
+  assert.deepEqual(routeOf("/ui/builds", ""), { kind: "screen", screen: "builds" });
+  assert.deepEqual(routeOf("/ui/builds/abc", ""), { kind: "build", id: "abc" });
+  assert.deepEqual(routeOf("/ui/builds/a%20b", ""), { kind: "build", id: "a b" });
+  assert.deepEqual(routeOf("/ui/builds/a/b", ""), { kind: "screen", screen: "overview" });
+});
+
+test("a direct build route starts the state client", () => {
+  assert.equal(startsClient(routeOf("/ui/builds/0123456789abcdef", "")), true);
+  assert.equal(startsClient(routeOf("/ui/error", "")), false);
 });
 
 test("an unknown path falls back to the overview", () => {

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::state::{
     Fleet, Instance, Pass, Queue, QueuedAction, Recent, RunningAction, State, Truncated, Worker,
 };
-use crate::{Event, FrameError};
+use crate::{Build, Event, FrameError};
 
 /// Event name of a [`Frame::Snapshot`].
 pub const SNAPSHOT_EVENT: &str = "snapshot";
@@ -133,6 +133,9 @@ pub struct Delta {
     /// replace the client's samples from the first one's start on (see [`Recent::apply`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recent: Option<Recent>,
+    /// Changes to the builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builds: Option<Keyed<Build>>,
     /// A new principal epoch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "number")]
@@ -155,6 +158,7 @@ impl Delta {
             && self.events.is_empty()
             && self.completed.is_none()
             && self.recent.is_none()
+            && keyed_is_empty(self.builds.as_ref())
             && self.principals_epoch.is_none()
     }
 }
@@ -356,6 +360,7 @@ mod tests {
             "eventsLimit": 200,
             "completed": 0,
             "recent": {"window": "0s", "step": "0s"},
+            "builds": [],
             "principalsEpoch": 0,
         })
     }
@@ -615,6 +620,7 @@ mod tests {
             ),
             ("completed", json!(0)),
             ("recent", json!({"window": "900s", "step": "10s"})),
+            ("builds", json!({"remove": ["builds/0123456789abcdef"]})),
             ("principalsEpoch", json!(0)),
         ];
         for (part, value) in parts {
@@ -633,6 +639,7 @@ mod tests {
         value["instances"] = json!({});
         value["events"] = json!([]);
         value["actions"] = json!({});
+        value["builds"] = json!({});
         let delta: Delta = serde_json::from_value(value).expect("delta decodes");
         assert!(delta.is_empty());
     }

@@ -2,9 +2,10 @@
 
 use std::time::Duration;
 
+use gang_config::{InstanceBounds, Weekday};
 use gang_reconciler::WorkerCounts;
-use gang_testkit::TestResult;
-use gang_types::{FleetName, FleetSet, InstanceLifecycle, Isa};
+use gang_testkit::{TestResult, scheduled_minimum};
+use gang_types::{FleetName, FleetSet, InstanceLifecycle, Isa, nonzero_u32};
 
 use crate::support::{ARM, Harness, X86, policy, policy_named, x86_resources};
 
@@ -29,6 +30,24 @@ fn needed_follows_each_fleets_demand() -> TestResult {
     assert_eq!(x86.demand.actions(), 11);
     assert_eq!(x86.needed, 3);
     assert_eq!(h.outlook(ARM)?.needed, 0);
+    Ok(())
+}
+
+#[test]
+fn needed_is_the_work_raised_to_the_minimum_in_force() -> TestResult {
+    let window = scheduled_minimum(2, &Weekday::ALL, "00:00", "24:00", "UTC")?;
+    let mut fleet = policy()?;
+    fleet.instances = InstanceBounds::try_new(0, nonzero_u32(10))?.with_schedule(vec![window])?;
+    let mut h = Harness::with_fleets(vec![fleet]);
+    h.queue(X86, 1)?;
+    h.reconcile();
+    assert_eq!(h.outlook(X86)?.minimum, 2);
+    assert_eq!(h.outlook(X86)?.needed, 2);
+
+    h.queue(X86, 8)?;
+    h.reconcile();
+    assert_eq!(h.outlook(X86)?.minimum, 2);
+    assert_eq!(h.outlook(X86)?.needed, 3);
     Ok(())
 }
 

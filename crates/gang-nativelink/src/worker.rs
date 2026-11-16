@@ -363,10 +363,7 @@ mod tests {
                 .expect("endpoint");
         assert_eq!(endpoint.uri().scheme_str(), Some("http"));
         assert_eq!(
-            endpoint
-                .uri()
-                .authority()
-                .map(|authority| authority.as_str()),
+            endpoint.uri().authority().map(http::uri::Authority::as_str),
             Some("[::1]:9100")
         );
     }

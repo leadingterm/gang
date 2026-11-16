@@ -23,6 +23,7 @@ mod api;
 mod api_error;
 mod attempts;
 mod authorizer;
+mod builds;
 mod client_address;
 mod composite;
 mod control;
@@ -58,6 +59,8 @@ mod ttl_map;
 
 #[cfg(test)]
 mod actions_tests;
+#[cfg(test)]
+mod api_builds_tests;
 #[cfg(test)]
 mod api_certificates_tests;
 #[cfg(test)]

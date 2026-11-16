@@ -364,7 +364,7 @@ async fn snapshot_carries_the_recent_window_after_completions() {
                 .expect("state body")
                 .to_bytes();
             let state: State = serde_json::from_slice(&bytes).expect("state JSON");
-            assert_eq!(state.recent.window, Duration::from_secs(300));
+            assert_eq!(state.recent.window, Duration::from_mins(5));
             assert_eq!(state.recent.step, Duration::from_secs(10));
             assert_eq!(state.recent.samples.len(), 4);
             assert_eq!(

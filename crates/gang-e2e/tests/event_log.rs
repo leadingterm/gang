@@ -89,6 +89,7 @@ fn snapshot(seq: u64, held: &[u64], limit: u32) -> Result<Frame, Box<dyn Error>>
         events_limit: limit,
         completed: 0,
         recent: Recent::default(),
+        builds: Vec::new(),
         principals_epoch: 0,
     }))
 }
@@ -108,6 +109,7 @@ fn delta(base: u64, seq: u64, carried: &[u64]) -> Result<Frame, Box<dyn Error>> 
         events: events(carried)?,
         completed: None,
         recent: None,
+        builds: None,
         principals_epoch: None,
     }))
 }

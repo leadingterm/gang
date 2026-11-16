@@ -53,6 +53,24 @@ impl PlanStep {
     }
 }
 
+/// What sets a fleet's need for the capacity a step adds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NeedCause {
+    /// The fleet's queued and running work.
+    Demand,
+    /// The fleet's minimum in force, which exceeds what its work needs.
+    Minimum,
+}
+
+impl From<NeedCause> for ScalingCause {
+    fn from(cause: NeedCause) -> Self {
+        match cause {
+            NeedCause::Demand => Self::Demand,
+            NeedCause::Minimum => Self::Minimum,
+        }
+    }
+}
+
 /// Why an instance is terminated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminationCause {
@@ -85,6 +103,8 @@ pub enum Action {
         from: u32,
         /// The capacity requested.
         to: u32,
+        /// What sets the fleet's need for this capacity.
+        need: NeedCause,
     },
     /// Lower a fleet's request for instances that have not launched. The caller calls
     /// `ProvisionerPort::set_desired_capacity` with `to`.
@@ -98,8 +118,9 @@ pub enum Action {
     /// `SchedulerPort::set_draining(worker, true)`.
     StartDrain(WorkerId),
     /// Resume a draining worker so it takes new actions again. The caller calls
-    /// `SchedulerPort::set_draining(worker, false)`. Used instead of scaling out.
-    CancelDrain(WorkerId),
+    /// `SchedulerPort::set_draining(worker, false)`. Used instead of scaling out; the second
+    /// field records what sets the fleet's need for this capacity.
+    CancelDrain(WorkerId, NeedCause),
     /// Terminate an instance. The caller calls `ProvisionerPort::terminate`; the provisioner
     /// lowers the desired capacity itself.
     Terminate {
@@ -115,7 +136,7 @@ impl Action {
     #[must_use]
     pub fn kind(&self) -> ScalingEventKind {
         match self {
-            Self::ScaleOut { from, to } => ScalingEventKind::ScaledOut {
+            Self::ScaleOut { from, to, .. } => ScalingEventKind::ScaledOut {
                 from: *from,
                 to: *to,
             },
@@ -126,7 +147,7 @@ impl Action {
             Self::StartDrain(worker) => ScalingEventKind::DrainStarted {
                 worker: worker.clone(),
             },
-            Self::CancelDrain(worker) => ScalingEventKind::DrainCancelled {
+            Self::CancelDrain(worker, _) => ScalingEventKind::DrainCancelled {
                 worker: worker.clone(),
             },
             Self::Terminate { instance, .. } => ScalingEventKind::Terminated {
@@ -135,14 +156,13 @@ impl Action {
         }
     }
 
-    /// The autoscaler decision this action carries out. Fixed per variant, except for
-    /// [`Action::Terminate`], which carries its own cause.
+    /// The autoscaler decision this action carries out. Scale-out and drain cancellation carry
+    /// their need, and termination carries its cause.
     #[must_use]
     pub fn cause(&self) -> ScalingCause {
         match self {
-            Self::ScaleOut { .. } | Self::Withdraw { .. } | Self::CancelDrain(_) => {
-                ScalingCause::Demand
-            }
+            Self::ScaleOut { need, .. } | Self::CancelDrain(_, need) => (*need).into(),
+            Self::Withdraw { .. } => ScalingCause::Demand,
             Self::StartDrain(_) => ScalingCause::IdleTimeout,
             Self::Terminate { cause, .. } => (*cause).into(),
         }
@@ -167,7 +187,11 @@ mod tests {
     fn scale_out_audits_as_scaled_out() -> TestResult {
         let step = PlanStep {
             fleet: 0,
-            action: Action::ScaleOut { from: 2, to: 5 },
+            action: Action::ScaleOut {
+                from: 2,
+                to: 5,
+                need: NeedCause::Demand,
+            },
         };
         let at = Timestamp::from_unix_millis(42);
 
@@ -228,7 +252,7 @@ mod tests {
     fn cancel_drain_audits_as_drain_cancelled() -> TestResult {
         let step = PlanStep {
             fleet: 1,
-            action: Action::CancelDrain(worker_id("i-0abc123")?),
+            action: Action::CancelDrain(worker_id("i-0abc123")?, NeedCause::Demand),
         };
         let at = Timestamp::from_unix_millis(3);
 
@@ -242,6 +266,33 @@ mod tests {
                 },
                 cause: Some(ScalingCause::Demand),
             }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn capacity_added_for_minimum_audits_as_minimum() -> TestResult {
+        let at = Timestamp::from_unix_millis(3);
+        let fleet = fleet("x86-64-fleet")?;
+        let scale = PlanStep {
+            fleet: 0,
+            action: Action::ScaleOut {
+                from: 0,
+                to: 1,
+                need: NeedCause::Minimum,
+            },
+        };
+        let cancel = PlanStep {
+            fleet: 0,
+            action: Action::CancelDrain(worker_id("i-0abc123")?, NeedCause::Minimum),
+        };
+        assert_eq!(
+            scale.audit_event(at, &fleet).cause,
+            Some(ScalingCause::Minimum)
+        );
+        assert_eq!(
+            cancel.audit_event(at, &fleet).cause,
+            Some(ScalingCause::Minimum)
         );
         Ok(())
     }

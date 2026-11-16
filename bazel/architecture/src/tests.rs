@@ -13,7 +13,9 @@ fn package(root: &Path, name: &str, extra: &str, lib: &str) -> Result<(), Box<dy
     fs::create_dir_all(dir.join("src"))?;
     fs::write(
         dir.join("Cargo.toml"),
-        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n{extra}"),
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n{extra}\n[lints]\nworkspace = true\n"
+        ),
     )?;
     fs::write(dir.join("src/lib.rs"), lib)?;
     Ok(())
@@ -43,6 +45,32 @@ fn membership_reports_missing_and_extra() -> Result<(), Box<dyn Error>> {
     )?;
     assert!(violations.contains(&Violation::MissingMember { name: "b".into() }));
     assert!(violations.contains(&Violation::ExtraPlanCrate { name: "c".into() }));
+    Ok(())
+}
+
+#[test]
+fn members_must_inherit_the_workspace_lints() -> Result<(), Box<dyn Error>> {
+    for manifest in [
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+        concat!(
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+            "[lints]\nworkspace = false\n",
+        ),
+        concat!(
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+            "[lints.clippy]\npedantic = \"allow\"\n",
+        ),
+    ] {
+        let temp = tempfile::tempdir()?;
+        setup(temp.path())?;
+        fs::write(temp.path().join("a/Cargo.toml"), manifest)?;
+        let workspace = Workspace::load(temp.path())?;
+        assert_eq!(
+            check(&plan(CLEAN)?, &workspace)?,
+            vec![Violation::LintsNotInherited { name: "a".into() }],
+            "{manifest}"
+        );
+    }
     Ok(())
 }
 
@@ -245,7 +273,7 @@ fn unsafe_lint_overrides_require_designated_file_and_reason() -> Result<(), Box<
     )?;
     fs::write(
         package_dir.join("Cargo.toml"),
-        "[package]\nname = \"gang-os\"\nversion = \"0.1.0\"\n",
+        "[package]\nname = \"gang-os\"\nversion = \"0.1.0\"\n[lints]\nworkspace = true\n",
     )?;
     fs::write(package_dir.join("src/lib.rs"), "mod sys;\n")?;
     let plan = plan("| `gang-os` | `0_kernel` | 2 | os |\n")?;

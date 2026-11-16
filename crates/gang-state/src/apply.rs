@@ -47,6 +47,9 @@ pub fn apply(state: &mut State, delta: &Delta) -> Result<(), ApplyError> {
     if let Some(recent) = &delta.recent {
         state.recent.apply(recent);
     }
+    if let Some(builds) = &delta.builds {
+        apply_sorted(&mut state.builds, builds);
+    }
     if let Some(epoch) = delta.principals_epoch {
         state.principals_epoch = epoch;
     }

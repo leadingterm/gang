@@ -849,19 +849,20 @@ mod tests {
         );
     }
 
+    const SCALED_OUT: &[(&str, &str)] = &[
+        ("id", "7"),
+        ("at", "1700"),
+        ("fleet", "'gang-x86'"),
+        ("kind", "'scaled_out'"),
+        ("from_capacity", "2"),
+        ("to_capacity", "5"),
+        ("subject", "NULL"),
+        ("cause", "NULL"),
+        ("detail", "NULL"),
+    ];
+
     #[test]
     fn corrupt_scaling_rows_name_the_bad_column() {
-        const SCALED_OUT: &[(&str, &str)] = &[
-            ("id", "7"),
-            ("at", "1700"),
-            ("fleet", "'gang-x86'"),
-            ("kind", "'scaled_out'"),
-            ("from_capacity", "2"),
-            ("to_capacity", "5"),
-            ("subject", "NULL"),
-            ("cause", "NULL"),
-            ("detail", "NULL"),
-        ];
         let cases = [
             Case {
                 name: "unknown kind",
@@ -903,6 +904,16 @@ mod tests {
                 overrides: &[("from_capacity", "NULL")],
                 column: "from_capacity",
             },
+        ];
+        for case in &cases {
+            let select = select_row(SCALED_OUT, case.overrides);
+            assert_corrupt_column(case.name, read_row(&select, scaling_from_row), case.column);
+        }
+    }
+
+    #[test]
+    fn corrupt_scaling_event_details_name_the_bad_column() {
+        let cases = [
             Case {
                 name: "unknown cause",
                 overrides: &[("cause", "'bored'")],

@@ -273,6 +273,14 @@ pub(crate) enum MainError {
     #[error(transparent)]
     Deploy(#[from] gang_deploy::DeployError),
 
+    /// The release AMI input or output is not valid JSON.
+    #[error("release ami json: {0}")]
+    ReleaseJson(#[source] serde_json::Error),
+
+    /// A release must provide exactly one digest for each architecture.
+    #[error("release requires exactly one image for each architecture")]
+    ReleaseImages,
+
     /// A file a deploy decision reads could not be read.
     #[error(transparent)]
     DeployFile(#[from] gang_os::PathIo),

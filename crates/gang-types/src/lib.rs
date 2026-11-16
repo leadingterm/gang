@@ -19,7 +19,9 @@ mod validated;
 mod absolute_path;
 mod authentication;
 mod bearer;
+mod bounded_bytes;
 mod bounded_duration;
+mod build;
 mod bytes;
 mod ca_pin;
 mod error_chain;
@@ -64,15 +66,18 @@ pub mod __private;
 pub use absolute_path::{AbsolutePathBuf, AbsolutePathError};
 pub use authentication::AuthenticationSettings;
 pub use bearer::parse_bearer;
+pub use bounded_bytes::{BoundedBytes, BoundedBytesError};
 pub use bounded_duration::{
     BoundedDuration, BoundedDurationError, DeviceCodeTtl, DevicePollInterval, NANOS_PER_MILLI,
     NANOS_PER_SECOND, SessionMaxAge, TokenTtl,
 };
+pub use build::{BuildId, BuildKey};
 pub use bytes::Bytes;
 pub use ca_pin::CaPin;
 pub use error_chain::{ErrorChain, error_chain};
 pub use errors::{
-    CaPinError, FleetCountError, FleetIndexError, IdentityError, NameError, PemError, QuantityError,
+    BuildIdError, CaPinError, FleetCountError, FleetIndexError, IdentityError, NameError, PemError,
+    QuantityError,
 };
 pub use fix::Fix;
 pub use fleet::{Fleet, WorkerLifetime};
@@ -87,8 +92,9 @@ pub use isa::Isa;
 pub use jws::{Es256Key, Jwk};
 pub use loopback::is_loopback_url;
 pub use names::{
-    Audience, CertSerial, CertSerialError, FleetName, InstanceId, MachineClass, Principal,
-    ProviderName, RoleName, SchedulerName, TrustDomain, WorkerId,
+    Audience, CertSerial, CertSerialError, FleetName, InstanceId, InvocationId, MachineClass,
+    Mnemonic, Principal, ProviderName, RoleName, SchedulerName, TargetLabel, ToolDetails,
+    TrustDomain, WorkerId,
 };
 pub use nonzero::nonzero_u32;
 pub use nonzero_bytes::{NonZeroBytes, NonZeroBytesError};

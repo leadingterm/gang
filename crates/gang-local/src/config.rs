@@ -209,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_ephemeral_loopback_ports() -> Result<(), Box<dyn std::error::Error>> {
+    fn rejects_ephemeral_loopback_ports() {
         for addr in ["127.0.0.1:0", "[::1]:0"] {
             let error =
                 with("mock_imds_listen", json!(addr)).expect_err("ephemeral port must be rejected");
@@ -218,7 +218,6 @@ mod tests {
                 LocalConfigError::EphemeralImdsPort.to_string()
             );
         }
-        Ok(())
     }
 
     #[test]

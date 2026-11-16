@@ -95,7 +95,15 @@ impl Harness {
     /// A harness with one fleet built from `policy`.
     #[must_use]
     pub fn with_policy(policy: FleetPolicy) -> Self {
-        Self::with_fleets(vec![policy])
+        Self::with_policy_at(policy, Timestamp::from_unix_millis(1_000_000))
+    }
+
+    /// A harness with one fleet and the given initial wall time.
+    #[must_use]
+    pub fn with_policy_at(policy: FleetPolicy, wall: Timestamp) -> Self {
+        let mut harness = Self::with_fleets(vec![policy]);
+        harness.clock = TestClock::new(wall);
+        harness
     }
 
     /// A harness with the given fleets, each starting with an empty provisioner supply.
@@ -340,7 +348,7 @@ impl Harness {
                         }
                     }
                 }
-                Action::CancelDrain(worker) => {
+                Action::CancelDrain(worker, _) => {
                     for state in &mut self.snapshot.workers {
                         if state.id == worker {
                             state.draining = false;

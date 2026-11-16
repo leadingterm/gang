@@ -17,6 +17,8 @@ crate::string_enum! {
         PrincipalsRead = "principals.read",
         /// Reads the scaling event history.
         EventsRead = "events.read",
+        /// Reads builds.
+        BuildsRead = "builds.read",
         /// Revokes principals and restores revoked principals.
         PrincipalsRevoke = "principals.revoke",
     }
@@ -132,10 +134,11 @@ impl<'de> Deserialize<'de> for PermissionSet {
 mod tests {
     use super::*;
 
-    const ALL_NAMES: [&str; 4] = [
+    const ALL_NAMES: [&str; 5] = [
         "state.read",
         "principals.read",
         "events.read",
+        "builds.read",
         "principals.revoke",
     ];
 
@@ -219,11 +222,15 @@ mod tests {
 
     #[test]
     fn serde_round_trips_as_array_of_names() {
-        let set: PermissionSet = [Permission::StateRead, Permission::EventsRead]
-            .into_iter()
-            .collect();
+        let set: PermissionSet = [
+            Permission::StateRead,
+            Permission::EventsRead,
+            Permission::BuildsRead,
+        ]
+        .into_iter()
+        .collect();
         let text = serde_json::to_string(&set).expect("set serializes");
-        assert_eq!(text, r#"["state.read","events.read"]"#);
+        assert_eq!(text, r#"["state.read","events.read","builds.read"]"#);
         assert_eq!(
             serde_json::from_str::<PermissionSet>(&text).expect("set parses"),
             set

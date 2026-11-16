@@ -499,7 +499,7 @@ mod tests {
             table.redeem(code(&resource), secret),
             Err(Redeem::Pending)
         ));
-        clock.advance(Duration::from_secs(60));
+        clock.advance(Duration::from_mins(1));
         assert!(matches!(
             table.redeem(code(&resource), secret),
             Err(Redeem::NotFound)
@@ -529,7 +529,7 @@ mod tests {
         let (table, clock) = table(2);
         let resource = create(&table);
         let user_code = table.begin_approval(code(&resource)).expect("pending");
-        clock.advance(Duration::from_secs(60));
+        clock.advance(Duration::from_mins(1));
         assert!(table.begin_approval(code(&resource)).is_none());
         assert!(!table.approve(&user_code, approval(&user_code, "alice")));
     }

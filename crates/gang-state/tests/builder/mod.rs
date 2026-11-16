@@ -26,7 +26,8 @@ use gang_wire::name;
 use gang_wire::{Pass, PassState, SkipReason, State};
 
 use crate::support::{
-    blank, config, fleet_instance, instance_id, policy, properties, queued, ts, worker_state,
+    blank, build_key, config, fleet_instance, instance_id, policy, properties, queued, ts,
+    worker_state,
 };
 
 /// Everything one control pass hands to the builder, owned so that the inputs can borrow it.
@@ -40,6 +41,7 @@ struct World {
     past_boot_grace: Vec<Vec<bool>>,
     snapshot: SchedulerSnapshot,
     actions: Option<ActionsSample>,
+    builds: Option<gang_insight::Builds>,
 }
 
 impl World {
@@ -79,6 +81,7 @@ fn action_info(op: &str, digest: &str, target: &str, mnemonic: &str, priority: i
         target: target.to_owned(),
         mnemonic: mnemonic.to_owned(),
         priority,
+        build: None,
     }
 }
 
@@ -148,6 +151,7 @@ fn fill_into(
         },
         Outcome::Skipped(reason) => PassStatus::Skipped(reason),
     };
+    let empty_builds = gang_insight::Builds::new(&gang_config::BuildsConfig::default());
     let inputs = Inputs {
         wall: ts(wall),
         pass,
@@ -155,6 +159,7 @@ fn fill_into(
         catalog: &catalog,
         actions: world.actions.as_ref(),
         events: &[],
+        builds: world.builds.as_ref().unwrap_or(&empty_builds),
         principals_epoch: 7,
     };
     builder.fill(cur, prev, seq, &inputs);
@@ -183,6 +188,7 @@ fn running_on(worker: &WorkerId, op: &str, started: u64) -> RunningActionView {
             target: format!("//t:{op}"),
             mnemonic: "Compile".to_owned(),
             priority: 0,
+            build: None,
         },
         worker: worker.clone(),
         started: ts(started),
@@ -201,6 +207,30 @@ fn sample_at(at: u64, running: Vec<RunningActionView>) -> ActionsSample {
             truncated_queued: 0,
         },
     }
+}
+
+#[test]
+fn policy_min_is_the_minimum_in_force() -> TestResult {
+    let mut world = World::default();
+    world.policies = vec![policy("alpha", 30_000, 4)?];
+    world.properties = world
+        .policies
+        .iter()
+        .map(|policy| properties(policy, Vec::new()))
+        .collect();
+    world.outlook = vec![FleetOutlook {
+        minimum: 2,
+        ..FleetOutlook::default()
+    }];
+    let mut builder = Builder::new(config());
+
+    let raised = fill(&mut builder, &blank(), 1, &world, 1_000, ok(0))?;
+    assert_eq!(raised.fleets[0].policy.min, 2);
+
+    world.outlook[0].minimum = 0;
+    let baseline = fill(&mut builder, &raised, 2, &world, 2_000, ok(0))?;
+    assert_eq!(baseline.fleets[0].policy.min, 0);
+    Ok(())
 }
 
 #[test]
@@ -238,6 +268,7 @@ fn fleets_follow_declaration_order_and_units() -> TestResult {
     });
     world.outlook = vec![
         FleetOutlook {
+            minimum: 0,
             needed: 2,
             demand,
             queued: 1,
@@ -1534,6 +1565,7 @@ fn events_keep_only_the_newest_configured_window() -> TestResult {
     settings.events_limit = 2;
     let mut builder = Builder::new(settings);
     let catalog = FleetCatalog::try_new(Vec::new())?;
+    let builds = gang_insight::Builds::new(&gang_config::BuildsConfig::default());
     let mut prev = blank();
     let initial = Inputs {
         wall: ts(0),
@@ -1542,6 +1574,7 @@ fn events_keep_only_the_newest_configured_window() -> TestResult {
         catalog: &catalog,
         actions: None,
         events: &[],
+        builds: &builds,
         principals_epoch: 0,
     };
     builder.fill(&mut prev, &blank(), 0, &initial);
@@ -1553,6 +1586,7 @@ fn events_keep_only_the_newest_configured_window() -> TestResult {
         catalog: &catalog,
         actions: None,
         events: &events,
+        builds: &builds,
         principals_epoch: 0,
     };
     builder.fill(&mut cur, &prev, 1, &inputs);
@@ -1562,6 +1596,17 @@ fn events_keep_only_the_newest_configured_window() -> TestResult {
     gang_state::apply(&mut rebuilt, &delta)?;
     assert_eq!(rebuilt, cur);
     Ok(())
+}
+
+/// A fleet outlook with the given number of running workers.
+fn running_outlook(running: u32) -> FleetOutlook {
+    FleetOutlook {
+        workers: WorkerCounts {
+            running,
+            ..WorkerCounts::default()
+        },
+        ..FleetOutlook::default()
+    }
 }
 
 #[test]
@@ -1582,20 +1627,8 @@ fn recent_samples_follow_completed_passes_and_restarts() -> TestResult {
             .map(|n| queued(n as u64, FleetSet::default()))
             .collect();
         world.outlook = vec![
-            FleetOutlook {
-                workers: WorkerCounts {
-                    running: u32::try_from(index).expect("test fleets are few"),
-                    ..WorkerCounts::default()
-                },
-                ..FleetOutlook::default()
-            },
-            FleetOutlook {
-                workers: WorkerCounts {
-                    running: 2,
-                    ..WorkerCounts::default()
-                },
-                ..FleetOutlook::default()
-            },
+            running_outlook(u32::try_from(index).expect("test fleets are few")),
+            running_outlook(2),
         ];
         let cur = fill(
             &mut builder,
@@ -1621,6 +1654,8 @@ fn recent_samples_follow_completed_passes_and_restarts() -> TestResult {
                 queued: 2,
                 passes: 3,
                 skipped: 0,
+                lookups: 0,
+                hits: 0,
             },
             gang_wire::Sample {
                 start: ts(10_000),
@@ -1629,6 +1664,8 @@ fn recent_samples_follow_completed_passes_and_restarts() -> TestResult {
                 queued: 4,
                 passes: 2,
                 skipped: 0,
+                lookups: 0,
+                hits: 0,
             },
         ]
     );
@@ -1727,5 +1764,146 @@ fn worker_phase_history_keeps_the_span_overlapping_the_window() -> TestResult {
     let delta = diff(&prev, &trimmed).ok_or("missing delta")?;
     gang_state::apply(&mut prev, &delta)?;
     assert_eq!(prev, trimmed);
+    Ok(())
+}
+
+#[test]
+fn cache_samples_follow_counter_deltas_skips_and_restarts() -> TestResult {
+    let mut world = World::default();
+    let mut builder = Builder::new(config());
+    let initial = builder.initial(ts(0), 0);
+    world.snapshot.lookups = 10;
+    world.snapshot.hits = 7;
+    let first = fill(&mut builder, &initial, 1, &world, 1_000, ok(0))?;
+    let sample = first.recent.samples.last().ok_or("missing sample")?;
+    assert_eq!((sample.lookups, sample.hits), (10, 7));
+    world.snapshot.lookups = 30;
+    world.snapshot.hits = 20;
+    let skipped = fill(
+        &mut builder,
+        &first,
+        2,
+        &world,
+        11_000,
+        Outcome::Skipped(SkipReason::SchedulerUnavailable),
+    )?;
+    let sample = skipped.recent.samples.last().ok_or("missing sample")?;
+    assert_eq!((sample.lookups, sample.hits), (0, 0));
+    world.snapshot.lookups = 20;
+    world.snapshot.hits = 14;
+    let resumed = fill(&mut builder, &skipped, 3, &world, 21_000, ok(0))?;
+    let sample = resumed.recent.samples.last().ok_or("missing sample")?;
+    assert_eq!((sample.lookups, sample.hits), (10, 7));
+    world.snapshot.lookups = 3;
+    world.snapshot.hits = 2;
+    let restarted = fill(&mut builder, &resumed, 4, &world, 31_000, ok(0))?;
+    let sample = restarted.recent.samples.last().ok_or("missing sample")?;
+    assert_eq!((sample.lookups, sample.hits), (3, 2));
+    Ok(())
+}
+
+#[test]
+fn recent_builds_expire_on_skipped_pass_and_round_trip() -> TestResult {
+    let mut settings = config();
+    settings.history_window = Duration::from_secs(10);
+    let mut builder = Builder::new(settings);
+    let mut world = World::default();
+    let mut builds = gang_insight::Builds::new(&gang_config::BuildsConfig::default());
+    let old = build_key("old")?;
+    let new = build_key("new")?;
+    builds.lose(ts(10_000), &old, 1);
+    builds.lose(ts(20_000), &new, 1);
+    world.builds = Some(builds);
+    let mut applied_initial = builder.initial(ts(0), 7);
+    let first = fill(&mut builder, &applied_initial, 1, &world, 20_000, ok(0))?;
+    let mut expected = vec![
+        format!("builds/{}", old.id()),
+        format!("builds/{}", new.id()),
+    ];
+    expected.sort();
+    assert_eq!(
+        first
+            .builds
+            .iter()
+            .map(|build| build.name.clone())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    let added = diff(&applied_initial, &first).ok_or("missing initial delta")?;
+    assert_eq!(
+        added
+            .builds
+            .as_ref()
+            .ok_or("missing builds delta")?
+            .upsert
+            .len(),
+        2
+    );
+    gang_state::apply(&mut applied_initial, &added)?;
+    assert_eq!(applied_initial, first);
+    let next = fill(
+        &mut builder,
+        &first,
+        2,
+        &world,
+        20_001,
+        Outcome::Skipped(SkipReason::SchedulerUnavailable),
+    )?;
+    assert_eq!(next.builds.len(), 1);
+    assert_eq!(next.builds[0].name, format!("builds/{}", new.id()));
+    let delta = diff(&first, &next).ok_or("missing delta")?;
+    assert_eq!(
+        delta.builds.as_ref().ok_or("missing builds delta")?.remove,
+        vec![format!("builds/{}", old.id())]
+    );
+    let mut applied = first;
+    gang_state::apply(&mut applied, &delta)?;
+    assert_eq!(applied, next);
+    Ok(())
+}
+
+#[test]
+fn action_build_names_are_written_and_cleared_on_reuse() -> TestResult {
+    let mut world = World::default();
+    let alpha = policy("alpha", 100, 4)?;
+    world.properties = vec![properties(&alpha, Vec::new())];
+    world.policies = vec![alpha];
+    let worker = worker_on(&instance_id(1)?)?;
+    world.snapshot.workers = vec![worker_state(
+        &worker,
+        "alpha",
+        1,
+        false,
+        NonZeroU32::new(8),
+    )?];
+    let key = build_key("action")?;
+    let mut info = action_info("running", "d/1", "", "", 0);
+    info.build = Some(key.id());
+    let mut queued_info = action_info("queued", "d/2", "", "", 0);
+    queued_info.build = Some(key.id());
+    world.actions = Some(ActionsSample {
+        at: ts(1_000),
+        view: ActionsView {
+            running: vec![running_action(info, &worker, ts(900))],
+            queued: vec![queued_action(queued_info, ts(900), FleetSet::default())],
+            truncated_running: 0,
+            truncated_queued: 0,
+        },
+    });
+    let mut builder = Builder::new(config());
+    let mut frame = blank();
+    fill_into(&mut builder, &mut frame, &blank(), 1, &world, 1_000, ok(0))?;
+    let actions = frame.actions.as_ref().ok_or("missing actions")?;
+    let name = format!("builds/{}", key.id());
+    assert_eq!(actions.running[0].build, name);
+    assert_eq!(actions.queued[0].build, name);
+    let sample = world.actions.as_mut().ok_or("missing sample")?;
+    sample.view.running[0].info.build = None;
+    sample.view.queued[0].info.build = None;
+    let prev = frame.clone();
+    fill_into(&mut builder, &mut frame, &prev, 2, &world, 2_000, ok(0))?;
+    let actions = frame.actions.as_ref().ok_or("missing actions")?;
+    assert!(actions.running[0].build.is_empty());
+    assert!(actions.queued[0].build.is_empty());
     Ok(())
 }

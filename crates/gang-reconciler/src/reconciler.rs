@@ -19,7 +19,7 @@ use crate::fleet::{FleetOutlook, FleetPass, WorkerCounts};
 use crate::hosted_snapshot::HostedSnapshot;
 use crate::observations::{Observations, Seen};
 use crate::pass_time::PassTime;
-use crate::plan::{Action, Plan, PlanStep, TerminationCause};
+use crate::plan::{Action, NeedCause, Plan, PlanStep, TerminationCause};
 
 /// A serving worker that may be drained, with the tick since which it has been idle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,7 +151,7 @@ struct Census {
 }
 
 /// One fleet's inputs for the pass: its index in the `fleets` slice, its policy, its provisioner
-/// supply, and the instances its demand needs.
+/// supply, the instances needed after applying the minimum in force, and what sets that need.
 #[derive(Debug, Clone, Copy)]
 struct FleetView<'a> {
     /// The position of the fleet in the slice passed to [`Reconciler::reconcile`].
@@ -159,6 +159,7 @@ struct FleetView<'a> {
     policy: &'a FleetPolicy,
     supply: &'a FleetSupply,
     needed: u32,
+    need: NeedCause,
 }
 
 /// The inputs shared by every fleet in one pass.
@@ -213,7 +214,8 @@ impl Reconciler {
     /// else the last candidate that names a fleet.
     ///
     /// The outlook of each fleet is written to its `fleets[i].outlook`: its needed instances,
-    /// demand, queued actions, candidate actions, and worker counts.
+    /// the work's need raised to the minimum in force, plus that minimum, demand, queued actions,
+    /// candidate actions, and worker counts. Steps that add capacity carry a [`NeedCause`].
     ///
     /// The pass classifies every instance that is not terminating, then plans each fleet:
     ///
@@ -235,7 +237,7 @@ impl Reconciler {
     ///   (`supply.desired` less listed instances that are not terminating), plus draining workers
     ///   resumed this pass. Orphans ordered to terminate, instances with outstanding termination
     ///   orders, and draining workers not resumed are not capacity even while still listed.
-    /// * When demand needs more capacity than remains, draining workers are resumed first,
+    /// * When the fleet needs more capacity than remains, draining workers are resumed first,
     ///   busiest first, then the workers whose instance is not `release_first`, and the fleet is
     ///   scaled out only for what resuming cannot cover. When capacity is in surplus, failed
     ///   unlaunched requests are withdrawn first; requests with a launch in flight are retained.
@@ -306,12 +308,20 @@ impl Reconciler {
 
         let pass = Pass { hosted, wall, now };
         for (index, fleet) in fleets.iter_mut().enumerate() {
-            fleet.outlook.needed = fleet.outlook.demand.instances(&fleet.policy);
+            let work = fleet.outlook.demand.instances(&fleet.policy);
+            fleet.outlook.minimum = fleet.policy.instances.min_at(wall);
+            fleet.outlook.needed = work.max(fleet.outlook.minimum);
+            let need = if work < fleet.outlook.needed {
+                NeedCause::Minimum
+            } else {
+                NeedCause::Demand
+            };
             let view = FleetView {
                 index,
                 policy: &fleet.policy,
                 supply: &fleet.supply,
                 needed: fleet.outlook.needed,
+                need,
             };
             self.reconcile_fleet(
                 &pass,
@@ -345,11 +355,11 @@ impl Reconciler {
     /// resumed this pass. Orphans ordered to terminate, instances with outstanding termination
     /// orders, and draining workers not resumed are not capacity even while still listed.
     ///
-    /// Resuming comes before scaling out. When demand needs more capacity than remains, only the
-    /// shortfall is resumed: the busiest draining worker first, then a worker whose instance is
+    /// Resuming comes before scaling out. When the fleet needs more capacity than remains, only
+    /// the shortfall is resumed: the busiest draining worker first, then a worker whose instance is
     /// not `release_first`, then by worker id. Capacity that is already running serves again
-    /// before a new instance boots. If the fleet is still short, it is scaled out to the needed
-    /// count, which `Demand::instances` caps at `max_instances`.
+    /// before a new instance boots. If the fleet is still short, it is scaled out to the work's
+    /// need raised to the minimum in force. Both steps carry the [`NeedCause`] for that need.
     /// Failed launches' unborn requests do not count when deciding how many workers to resume.
     ///
     /// Abandoned requests are withdrawn at the desired capacity after terminations. On a launch
@@ -423,6 +433,7 @@ impl Reconciler {
                 action: Action::ScaleOut {
                     from: capacity,
                     to: view.needed,
+                    need: view.need,
                 },
             });
         } else {
@@ -598,7 +609,7 @@ impl Reconciler {
         for draining in &self.draining[..resumed] {
             plan.steps.push(PlanStep {
                 fleet: view.index,
-                action: Action::CancelDrain(workers[draining.worker].id.clone()),
+                action: Action::CancelDrain(workers[draining.worker].id.clone(), view.need),
             });
         }
 

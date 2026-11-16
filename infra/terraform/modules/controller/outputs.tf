@@ -24,6 +24,6 @@ output "secret_parameter_arns" {
 }
 
 output "state_volume_id" {
-  description = "ID of the encrypted EBS state volume attached to the controller as /dev/sdf."
+  description = "ID of the encrypted EBS state volume attached to the controller as /dev/sdg."
   value       = aws_ebs_volume.state.id
 }

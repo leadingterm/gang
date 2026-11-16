@@ -67,7 +67,7 @@ variable "root_volume_gib" {
 }
 
 variable "state_volume_gib" {
-  description = "Size in GiB of the encrypted gp3 state volume attached as /dev/sdf and mounted at /var/lib/gang."
+  description = "Size in GiB of the encrypted gp3 state volume attached as /dev/sdg and mounted at /var/lib/gang."
   type        = number
   default     = 20
   nullable    = false

@@ -63,6 +63,19 @@ pub(crate) enum NativeLinkConfigError {
         /// The disk the cold start reserves, in KiB.
         disk_kb: u64,
     },
+    /// The minimum reservation cannot fit on this fleet.
+    #[error(
+        "[scheduler.nativelink.memory] min_reservation {min_kb} KiB is above fleet `{fleet}`'s memory of {memory_kb} KiB: lower [scheduler.nativelink.memory] min_reservation or raise the fleet's memory_per_instance"
+    )]
+    #[failure(config)]
+    MinReservationAboveFleet {
+        /// The fleet that cannot fit the minimum.
+        fleet: String,
+        /// The minimum reservation, in KiB.
+        min_kb: u64,
+        /// The fleet's memory, in KiB.
+        memory_kb: u64,
+    },
 }
 
 /// Failures of the embedded `NativeLink` controller or worker.
@@ -221,6 +234,20 @@ mod tests {
             memory_kb: 67_108_864,
             disk_kb: 4_194_304,
         };
+        assert!(matches!(PortError::from(config), PortError::Config(_)));
+    }
+
+    #[test]
+    fn minimum_above_fleet_is_a_config_error() {
+        let config = NativeLinkConfigError::MinReservationAboveFleet {
+            fleet: "fleet-a".to_owned(),
+            min_kb: 16_384,
+            memory_kb: 8_192,
+        };
+        assert_eq!(
+            config.to_string(),
+            "[scheduler.nativelink.memory] min_reservation 16384 KiB is above fleet `fleet-a`'s memory of 8192 KiB: lower [scheduler.nativelink.memory] min_reservation or raise the fleet's memory_per_instance"
+        );
         assert!(matches!(PortError::from(config), PortError::Config(_)));
     }
 }

@@ -790,11 +790,14 @@ mod tests {
         .expect("plan");
         let written = std::fs::read_to_string(&change.path).expect("written file");
         let shown = stdout.text();
-        let added: String = shown
+        let added = shown
             .lines()
             .filter_map(|line| line.strip_prefix("+ "))
-            .map(|line| format!("{line}\n"))
-            .collect();
+            .fold(String::new(), |mut result, line| {
+                result.push_str(line);
+                result.push('\n');
+                result
+            });
         assert_eq!(added, written);
         assert_eq!(written.as_bytes(), change.after);
     }

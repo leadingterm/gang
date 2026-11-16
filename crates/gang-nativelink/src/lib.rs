@@ -23,7 +23,6 @@
 mod actions;
 mod config;
 mod controller;
-mod counting;
 mod enforcement;
 #[cfg(test)]
 mod equivalence;
@@ -31,22 +30,24 @@ mod errors;
 mod fitted;
 mod gate;
 mod globals;
+mod observer;
+mod observing;
 mod open_file_limit;
 mod placeable;
 mod plugin;
 mod properties;
+mod refusals;
 mod serve;
 mod settings;
 mod snapshot;
+mod standing;
 mod stores;
-mod whole_kib;
 mod worker;
 
-pub use config::{Http2Tuning, NativeLinkConfig, SchedulerTuning, WorkerTuning};
+pub use config::{Http2Tuning, NativeLinkConfig, ReceiveWindow, SchedulerTuning, WorkerTuning};
 pub use enforcement::{
     ColdStartTuning, DiskEnforcement, DiskTuning, EscalationError, EscalationPercent,
-    MemoryEnforcement, MemoryTuning,
+    MemoryEnforcement, MemoryTuning, MinReservation, WholeKib,
 };
 pub use open_file_limit::{OpenFileLimit, OpenFileLimitError};
 pub use plugin::NativeLink;
-pub use whole_kib::{WholeError, WholeKib};

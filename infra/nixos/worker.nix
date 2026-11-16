@@ -11,15 +11,9 @@
 
   users.users.gang.home = "/var/lib/gang-home";
 
-  # The worker accepts no inbound connections.
-  networking.firewall = {
-    allowedTCPPorts = [];
-    allowedUDPPorts = [];
-  };
-
   systemd.services.gang-worker = {
     description = "Gang worker";
-    wantedBy = ["multi-user.target"];
+    wantedBy = ["gang-worker.target"];
     requires = ["gang-scratch.service" "gang-config.service"];
     after = [
       "gang-scratch.service"

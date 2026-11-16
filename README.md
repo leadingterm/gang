@@ -59,7 +59,7 @@ gang setup --server https://gang.example.com
 
 Setup writes Gang-owned files under `.gang/` and one `try-import` line in `.bazelrc`, safe to commit; it shows every change first (`--dry-run` only previews, `--yes` applies for scripts). `gang bazelrc` remains the printing primitive for scripts and isolated rc files.
 
-TLS Local Mode (`gang local up` without `--insecure`) accepts client tokens only from the providers in `[authentication.clients.token] providers`. Add an interactive provider (specification section 1.3) before you `gang login` to it. Run the end-to-end harness from this checkout with `nix develop -c bazel run //crates/gang-e2e:local -- --gate 1` (specification section 6.5). The `gang` binary and pinned Bazel come from the harness's runfiles; `--gang` and `--bazel` override them.
+TLS Local Mode (`gang local up` without `--insecure`) accepts client tokens only from the providers in `[authentication.clients.token] providers`. Add an interactive provider (specification section 1.3) before you `gang login` to it. Run the end-to-end harness from this checkout with `nix develop -c bazel run //crates/gang-e2e:local -- --gate 1` (specification section 6.5). The `gang` binary and pinned Bazel come from the harness's runfiles; `--gang` and `--bazel` override them. Before a change merges, `nix develop -c tools/gate.sh` runs CI's lint job (`tools/lint.sh`, Clippy of every Cargo target for macOS included), the full workspace and the end-to-end gates on one Linux host, as CI runs them (specification section 7). Every Rust target, tests included, is linted with the one lint policy in `[workspace.lints]` of `Cargo.toml`.
 
 The harness settings `startup_timeout` and `command_timeout` default to `2m`; `build_timeout`
 defaults to `30m` for each Bazel invocation, including shutdown. `handshake_timeout` defaults to
@@ -71,16 +71,33 @@ Gang is deployed from a separate repository that calls its modules and reusable 
 
 ```hcl
 module "gang" {
-  source = "git::https://github.com/example-org/gang//infra/terraform/modules/deployment?ref=v0.1.6"
+  source = "git::https://github.com/example-org/gang//infra/terraform/modules/deployment?ref=v0.2.0"
   # variables as in the example root
 }
 ```
 
 Call `.github/workflows/deploy.yml` as its header comment shows, pinned to the same tag, with `gang_sha256` set to the release's checksum of the binary for the deploy runner (the `gang-x86_64-unknown-linux-musl` line of the release's `SHA256SUMS` for the default runner). The workflow downloads that binary and refuses any other; it never compiles Gang.
 
-Every `v*` tag has a GitHub release with `gang-x86_64-unknown-linux-musl`, `gang-aarch64-unknown-linux-musl`, `gang-aarch64-apple-darwin` and `SHA256SUMS` (specification section 7.2). When the repository variable `IMAGE_DESTINATION` is set, the release also stores the controller and worker disk images for x86_64 and aarch64 there, listed in the same `SHA256SUMS` (specification section 7.2). Check a downloaded binary with `sha256sum --check --ignore-missing SHA256SUMS`, and pin its checksum where you deploy it.
+Every `v*` tag has a GitHub release with `gang-x86_64-unknown-linux-musl`, `gang-aarch64-unknown-linux-musl`, `gang-aarch64-apple-darwin`, disk images for x86_64 and aarch64, and `SHA256SUMS`. Public AMIs of each architecture in every image region are listed in `gang-amis.json` (specification section 7.2). Check downloaded assets with `sha256sum --check --ignore-missing SHA256SUMS`, and pin the binary checksum where you deploy it.
 
 See section 8 of [`docs/SPECIFICATION.md`](docs/SPECIFICATION.md) for the deployment contract, and the example root [`infra/terraform/environments/example`](infra/terraform/environments/example).
+
+To avoid a cold start on the first build of the day, a fleet can keep instances during given hours. Set `start` a few minutes before people arrive; a worker needs about a minute to come into service. Outside the windows the fleet scales to `min_instances`.
+
+The deployment module's `fleets[].scheduled_minimum` input renders these windows into `gang.toml`.
+
+```toml
+[[fleets]]
+name = "workers-x86-64"
+# … the fleet's other keys
+
+[[fleets.scheduled_minimum]]
+instances = 1
+days = ["mon", "tue", "wed", "thu", "fri"]
+start = "07:55"
+end = "19:00"
+time_zone = "Europe/Paris"
+```
 
 ## Troubleshooting
 

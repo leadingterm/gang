@@ -37,12 +37,16 @@ def _external(normal, dev):
         proc_macro_deps = all_crate_deps(proc_macro = normal, proc_macro_dev = dev),
     )
 
-def _common(rustc_env):
-    """Returns the attributes every crate-defining rule takes from the workspace."""
+def _common():
+    """Returns the attributes every Rust rule the macros declare takes from the workspace, unit tests included.
+
+    A `rust_test` of a `crate` inherits the crate's edition and rustc_env but not its lint config or version: rustc and
+    Clippy read only the target's own `lint_config`.
+    """
     return {
         "edition": crate_edition(),
         "lint_config": _cargo_lints(),
-        "rustc_env": rustc_env,
+        "rustc_env": {"CARGO_MANIFEST_DIR": native.package_name()},
         "version": VERSION,
     }
 
@@ -55,9 +59,6 @@ def _cargo_lints():
             workspace = "//:Cargo.toml",
         )
     return ":cargo_lints"
-
-def _manifest_env():
-    return {"CARGO_MANIFEST_DIR": native.package_name()}
 
 def _rust_library_sources(srcs):
     return srcs or native.glob(
@@ -106,7 +107,7 @@ def workspace_rust_source_set(name, packages):
         visibility = ["//visibility:public"],
     )
 
-def _workspace_rust_unit_test(name, compile_data, data, deps, env, rustc_env):
+def _workspace_rust_unit_test(name, compile_data, data, deps, env):
     external = _external(normal = False, dev = True)
     rust_test(
         name = name + "_unit_test",
@@ -118,8 +119,8 @@ def _workspace_rust_unit_test(name, compile_data, data, deps, env, rustc_env):
         deps = deps + external.deps,
         env = env,
         proc_macro_deps = external.proc_macro_deps,
-        rustc_env = rustc_env,
         tags = ["rust"],
+        **_common()
     )
 
 def _workspace_rust_doc_test(name, deps):
@@ -140,8 +141,7 @@ def _workspace_rust_integration_tests(
         data,
         deps,
         proc_macro_deps,
-        env,
-        rustc_env):
+        env):
     integration_srcs = native.glob(["tests/*.rs"], allow_empty = True)
     if not integration_srcs:
         return []
@@ -164,7 +164,7 @@ def _workspace_rust_integration_tests(
         env = env,
         proc_macro_deps = proc_macro_deps + external.proc_macro_deps,
         tags = ["rust"],
-        **_common(rustc_env)
+        **_common()
     )
     return [
         ":{}_{}_test".format(suite_name, src[:-3])
@@ -199,7 +199,6 @@ def workspace_rust_library(
     _package_sources()
     deps = _unique(deps or [])
     dev_deps = _unique(dev_deps or [])
-    rustc_env = _manifest_env()
     test_data = _rust_test_data(test_data)
     runtime_data = test_data + (test_runtime_data or [])
     test_env = test_env or {}
@@ -214,7 +213,7 @@ def workspace_rust_library(
         proc_macro_deps = _unique(proc_macro_deps or []) + external.proc_macro_deps,
         visibility = ["//visibility:public"],
         deps = deps + external.deps,
-        **_common(rustc_env)
+        **_common()
     )
 
     _workspace_rust_unit_test(
@@ -223,7 +222,6 @@ def workspace_rust_library(
         data = runtime_data,
         deps = dev_deps,
         env = test_env,
-        rustc_env = rustc_env,
     )
     _workspace_rust_doc_test(name = name, deps = dev_deps)
     integration_targets = _workspace_rust_integration_tests(
@@ -233,7 +231,6 @@ def workspace_rust_library(
         deps = _unique([":" + name] + deps + dev_deps),
         proc_macro_deps = _unique(proc_macro_deps or []),
         env = test_env,
-        rustc_env = rustc_env,
     )
     _workspace_rust_lint_tests(
         name,
@@ -249,7 +246,6 @@ def workspace_rust_binary(
         src = "src/main.rs"):
     """Declares a workspace binary using Cargo-derived external metadata."""
     _package_sources()
-    rustc_env = _manifest_env()
     test_data = _rust_test_data(None)
     external = _external(normal = True, dev = False)
     _rust_binary(
@@ -263,7 +259,7 @@ def workspace_rust_binary(
         proc_macro_deps = _unique(proc_macro_deps or []) + external.proc_macro_deps,
         visibility = ["//visibility:public"],
         deps = _unique(deps or []) + external.deps,
-        **_common(rustc_env)
+        **_common()
     )
 
     _workspace_rust_unit_test(
@@ -272,7 +268,6 @@ def workspace_rust_binary(
         data = test_data + (data or []),
         deps = [],
         env = env or {},
-        rustc_env = rustc_env,
     )
     _workspace_rust_lint_tests(name, [":" + name, ":" + name + "_unit_test"])
 
@@ -288,7 +283,7 @@ def workspace_rust_proc_macro(name, deps = None):
         proc_macro_deps = external.proc_macro_deps,
         visibility = ["//visibility:public"],
         deps = _unique(deps or []) + external.deps,
-        **_common(_manifest_env())
+        **_common()
     )
 
     test_data = _rust_test_data(None)
@@ -298,7 +293,6 @@ def workspace_rust_proc_macro(name, deps = None):
         data = test_data,
         deps = [],
         env = {},
-        rustc_env = _manifest_env(),
     )
 
     _workspace_rust_lint_tests(name, [":" + name, ":" + name + "_unit_test"])

@@ -5,6 +5,7 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -12,20 +13,20 @@ use gang_clock::Timestamp;
 use gang_config::{ConfigError, GangConfig, SandboxSelection};
 use gang_spi::{
     ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, ActionLimits,
-    ActionLimitsPort, ActionScope, ActionUsage, ApiRequestBody, ApiResponseBody, ApiService,
-    AuthenticationPort, BuildError, CacheStorePort, CertificateSignerPort, ControllerConnections,
-    ControllerEndpoints, ControllerReady, ControllerSpec, FleetInstance, FleetSupply, Listening,
-    LoginPort, LoginRequest, LoginSupport, NetworkRequest, NodeLifecyclePort, Peer, Plugin,
-    PluginContext, PortError, PreemptionNotice, ProofVerifierPort, ProvisionerPort, Rejection,
-    RenderedStoreSpec, RequestGate, SchedulerPort, SchedulerSnapshot, Scheme, ScratchVolumePort,
-    SignatureAlgorithm, Slots, StateRepositoryPort, StoreAccess, Subject, WorkerSpec, WorkerTls,
-    WorkloadCredentialPort, full_body,
+    ActionLimitsPort, ActionScope, ActionUsage, Admitted, ApiRequestBody, ApiResponseBody,
+    ApiService, Authenticated, AuthenticationPort, BuildError, CacheStorePort,
+    CertificateSignerPort, ControllerConnections, ControllerEndpoints, ControllerReady,
+    ControllerSpec, FleetInstance, FleetSupply, Listening, LoginPort, LoginRequest, LoginSupport,
+    NetworkRequest, NodeLifecyclePort, Peer, Plugin, PluginContext, PortError, PreemptionNotice,
+    ProofVerifierPort, ProvisionerPort, Rejection, RenderedStoreSpec, RequestGate, SchedulerPort,
+    SchedulerSnapshot, Scheme, ScratchVolumePort, SignatureAlgorithm, Slots, StateRepositoryPort,
+    StoreAccess, Subject, WorkerSpec, WorkerTls, WorkloadCredentialPort, full_body,
 };
 use gang_testkit::must_ready as ready;
 use gang_types::{
     AuthenticationSettings, Bytes, CertSerial, Fleet, FleetCatalog, FleetName, FleetProperties,
-    InstanceLifecycle, Isa, NonZeroBytes, Principal, Proof, ProviderName, RefreshToken, Resources,
-    Url, WorkerId, WorkerLifetime,
+    Identity, InstanceLifecycle, Isa, NonZeroBytes, Principal, Proof, ProviderName, RefreshToken,
+    Resources, Url, WorkerId, WorkerLifetime,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -427,8 +428,14 @@ impl RequestGate for TestGate {
         &self,
         _peer: &Peer,
         _parts: &mut http::request::Parts,
-    ) -> Result<(), PortError> {
-        Ok(())
+    ) -> Result<Admitted, PortError> {
+        Ok(Admitted::Authenticated(Authenticated {
+            identity: Arc::new(Identity::new(
+                ProviderName::try_new("test").map_err(PortError::unavailable)?,
+                Principal::try_new("tester").map_err(PortError::unavailable)?,
+            )),
+            valid_until: None,
+        }))
     }
 }
 
@@ -465,11 +472,17 @@ fn scheduler_runs_the_selected_controller_and_worker() -> Result<(), Box<dyn Err
         [],
     );
     let catalog = FleetCatalog::try_new(vec![properties.clone()])?;
+    let (observations, _receiver) = gang_spi::ObservationSink::channel(
+        std::num::NonZeroUsize::MIN,
+        std::num::NonZeroUsize::MIN,
+    );
     let controller = ControllerSpec {
         content_store: &stores,
         action_store: &stores,
         fleets: &catalog,
+        max_workers: 8,
         client_action_timeout: Duration::from_mins(1),
+        observations: &observations,
     };
     let connections = ControllerConnections {
         public: Listening {

@@ -39,6 +39,7 @@ workspace_rust_source_set(
         "crates/gang-e2e",
         "crates/gang-embed",
         "crates/gang-exec",
+        "crates/gang-insight",
         "crates/gang-local",
         "crates/gang-macros",
         "crates/gang-main",

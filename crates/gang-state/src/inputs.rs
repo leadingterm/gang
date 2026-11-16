@@ -66,6 +66,8 @@ pub struct Inputs<'a> {
     pub actions: Option<&'a ActionsSample>,
     /// The newest scaling events, oldest first.
     pub events: &'a [gang_wire::Event],
+    /// The builds the recorder holds.
+    pub builds: &'a gang_insight::Builds,
     /// The epoch of the principal set, bumped whenever principals change.
     pub principals_epoch: u64,
 }

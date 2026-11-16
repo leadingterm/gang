@@ -28,7 +28,8 @@ mock_provider "aws" {
   # The controller and worker-fleet modules require UEFI-capable instance types.
   mock_data "aws_ec2_instance_type" {
     defaults = {
-      boot_modes = ["legacy-bios", "uefi"]
+      boot_modes              = ["legacy-bios", "uefi"]
+      supported_architectures = ["x86_64"]
     }
   }
 
@@ -74,6 +75,25 @@ mock_provider "aws" {
     defaults = {
       issuer_identifier = "https://issuer.example.com/123456789012"
     }
+  }
+}
+
+mock_provider "http" {
+  mock_data "http" {
+    defaults = {
+      status_code   = 200
+      response_body = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  gang-image-aarch64.raw.zst\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  gang-image-x86_64.raw.zst\n"
+    }
+  }
+}
+
+override_data {
+  target = module.gang.data.aws_ami.image
+  values = {
+    name             = "gang-x86_64-aaaaaaaaaaaaaaaa"
+    boot_mode        = "uefi"
+    tags             = { "ec2:SharedTag/ImageSha256" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+    deprecation_time = ""
   }
 }
 

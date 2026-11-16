@@ -18,6 +18,7 @@ const ONE: NonZeroUsize = NonZeroUsize::MIN;
 const TWO: NonZeroUsize = NonZeroUsize::new(2).expect("two is non-zero");
 const FOUR: NonZeroUsize = NonZeroUsize::new(4).expect("four is non-zero");
 const EIGHT: NonZeroUsize = NonZeroUsize::new(8).expect("eight is non-zero");
+const TICK: Duration = Duration::from_millis(1);
 
 /// The heartbeat interval that keeps ticks out of tests that do not look for them.
 const QUIET: NonZeroDuration = NonZeroDuration::from_hours(1);
@@ -143,12 +144,17 @@ async fn heartbeat_reports_the_current_seq_and_does_not_advance_it() {
     frame_text(&mut body).await.expect("snapshot is sent");
 
     let mut next = Box::pin(frame_text(&mut body));
-    clock.advance(heartbeat.get() - Duration::from_millis(1));
+    clock.advance(
+        heartbeat
+            .get()
+            .checked_sub(TICK)
+            .expect("the heartbeat interval is longer than one tick"),
+    );
     assert!(
         next.as_mut().now_or_never().is_none(),
         "no heartbeat before the interval"
     );
-    clock.advance(Duration::from_millis(1));
+    clock.advance(TICK);
     let tick = next
         .await
         .expect("a heartbeat arrives one interval after the stream opened");

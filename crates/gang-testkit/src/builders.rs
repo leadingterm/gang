@@ -5,12 +5,36 @@
 //! `noop` sandbox and no options, so tests that build properties by hand agree with the
 //! configuration.
 
+use std::num::NonZeroU32;
 use std::time::Duration;
 
-use gang_config::{FleetPolicy, InstanceBounds};
+use gang_config::{FleetPolicy, InstanceBounds, ScheduledMinimum, Weekday, Weekdays};
 use gang_types::{FleetName, FleetProperties, Isa, NameError, NonZeroBytes, nonzero_u32};
 
+use crate::TestResult;
 use crate::plugins::SandboxKey;
+
+/// A scheduled minimum of `instances` on `days` from `start` to `end` (`HH:MM`) in `time_zone`,
+/// as a `[[fleets.scheduled_minimum]]` table writes it.
+///
+/// # Errors
+///
+/// When a field is not valid, as parsing `gang.toml` would reject it.
+pub fn scheduled_minimum(
+    instances: u32,
+    days: &[Weekday],
+    start: &str,
+    end: &str,
+    time_zone: &str,
+) -> TestResult<ScheduledMinimum> {
+    Ok(ScheduledMinimum::try_new(
+        NonZeroU32::new(instances).ok_or("zero instances")?,
+        Weekdays::try_from(days.to_vec())?,
+        start.parse()?,
+        end.parse()?,
+        time_zone.parse()?,
+    )?)
+}
 
 /// A valid sample fleet policy named `name`: up to four x86-64 instances of four vCPUs, 8 GiB of
 /// memory and 100 GiB of disk, each running four concurrent actions.
@@ -59,6 +83,24 @@ mod tests {
     use super::*;
     use crate::TestResult;
     use crate::plugins::{Opaque, STANDARD_GANG_TOML, TestPlugins};
+
+    #[test]
+    fn scheduled_minimum_builds_window_and_rejects_zero() -> TestResult {
+        let days = [Weekday::Mon, Weekday::Tue];
+        let expected = ScheduledMinimum::try_new(
+            NonZeroU32::new(2).ok_or("zero instances")?,
+            Weekdays::try_from(days.to_vec())?,
+            "08:00".parse()?,
+            "19:00".parse()?,
+            "Europe/Paris".parse()?,
+        )?;
+        assert_eq!(
+            scheduled_minimum(2, &days, "08:00", "19:00", "Europe/Paris")?,
+            expected
+        );
+        assert!(scheduled_minimum(0, &days, "08:00", "19:00", "Europe/Paris").is_err());
+        Ok(())
+    }
 
     #[test]
     fn fleet_policy_is_the_sample_policy() -> TestResult {

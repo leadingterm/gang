@@ -2,13 +2,14 @@
 import { readFileSync } from "node:fs";
 import { StateClient, type Environment, type Link } from "../src/client.ts";
 import { ms } from "../src/wire-parse.ts";
-import type { ListPrincipalsResponse, ListRolesResponse, Session, State } from "../src/wire.ts";
+import type { Build, ListPrincipalsResponse, ListRolesResponse, Session, State } from "../src/wire.ts";
 import { load, snapshotOf } from "./sse.ts";
 
 export const json = <T>(name: string): T => JSON.parse(readFileSync(new URL(`../fixtures/${name}.json`, import.meta.url), "utf8")) as T;
 export const session = json<Session>("session");
 export const principals = json<ListPrincipalsResponse>("principals");
 export const roles = json<ListRolesResponse>("roles");
+export const build = json<Build>("build");
 const { principal: _principal, expireTime: _expireTime, ...signedOut } = session;
 export { signedOut };
 

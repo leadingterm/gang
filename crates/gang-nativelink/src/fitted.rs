@@ -1,9 +1,11 @@
 //! Fits learned reservations to a fleet that accepted the original client request.
+//! It also raises a non-zero memory reservation below the configured minimum to it; a `memory_kb`
+//! of 0 means not requested and stays 0.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use gang_types::FleetCatalog;
+use gang_types::{FleetCatalog, property};
 use nativelink_error::Error;
 use nativelink_metric::{
     MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent, RootMetricsComponent,
@@ -14,6 +16,7 @@ use nativelink_util::operation_state_manager::{
     ActionStateResult, ActionStateResultStream, ClientStateManager, OperationFilter,
 };
 
+use crate::enforcement::MinReservation;
 use crate::placeable::{AdmittedFleets, refused};
 
 /// Fits reservations after historical learning and before the simple scheduler.
@@ -21,6 +24,7 @@ pub(crate) struct FittedActions {
     inner: Arc<dyn KnownPlatformPropertyProvider>,
     fleets: FleetCatalog,
     admitted: AdmittedFleets,
+    min_reservation: MinReservation,
 }
 
 impl FittedActions {
@@ -28,11 +32,13 @@ impl FittedActions {
         inner: Arc<dyn KnownPlatformPropertyProvider>,
         fleets: FleetCatalog,
         admitted: AdmittedFleets,
+        min_reservation: MinReservation,
     ) -> Self {
         Self {
             inner,
             fleets,
             admitted,
+            min_reservation,
         }
     }
 }
@@ -71,6 +77,18 @@ impl ClientStateManager for FittedActions {
             .admitted
             .take(&operation)
             .unwrap_or_else(|| self.fleets.accepting(|_| None));
+        let min_kb = self.min_reservation.as_units();
+        if let Some(reserved_kb) = action_info
+            .platform_properties
+            .get(property::MEMORY_KB)
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|&value| value > 0 && value < min_kb)
+        {
+            tracing::debug!(operation_id = %operation, reserved_kb, min_kb, "raising a memory reservation to the minimum");
+            Arc::make_mut(&mut action_info)
+                .platform_properties
+                .insert(property::MEMORY_KB.to_owned(), min_kb.to_string());
+        }
         let properties = |key: &str| action_info.platform_properties.get(key).map(String::as_str);
         let Some(fit) = self.fleets.fit(admitted, properties) else {
             return Err(refused(&self.fleets, properties));

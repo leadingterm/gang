@@ -13,7 +13,7 @@ Conventions that hold for every route:
 - **JSON.** Keys are lowerCamelCase (map keys, such as fleet `properties` and the provider names under `authentication.token.login`, are data and are not renamed). Timestamps are RFC 3339 in UTC with milliseconds, `2026-01-14T09:20:02.000Z`, and field names end in `Time`; a parser accepts any RFC 3339 offset. Durations are seconds with an optional fraction and an `s` suffix, `600s` or `0.250s`. Enums are `UPPER_SNAKE` strings. A union is a oneof: exactly one member key is present and there is no tag field. Absent optional values are omitted, never `null`; scalars (counts, booleans, `0`) are always present. 64-bit integers are JSON numbers.
 - **Leniency.** A request rejects unknown fields. A response may gain fields, so clients ignore unknown response fields, unknown enum values, unknown oneof members and unknown error-detail types.
 - **Success.** Every success is `200`, including create. Every JSON response, errors included, carries `Content-Type: application/json` and `Cache-Control: no-store`.
-- **Lists.** The three list routes take `pageSize` and `pageToken` and answer the plural collection key followed by `nextPageToken`, which is omitted on the last page. `pageSize` defaults to 100 and is clamped to 1000; a negative value is `400 MALFORMED_REQUEST`. A page token is opaque and URL-safe; one that is malformed, or was issued for a different `filter`, is `400 INVALID_PAGE_TOKEN`. Order is fixed and has no `orderBy`. Walk a collection by passing each `nextPageToken` back unchanged until it is absent.
+- **Lists.** List routes take `pageSize` and `pageToken` and answer the plural collection key followed by `nextPageToken`, which is omitted on the last page. `pageSize` defaults to 100 and is clamped to 1000; a negative value is `400 MALFORMED_REQUEST`. A page token is opaque and URL-safe; one that is malformed, or was issued for a different `filter`, is `400 INVALID_PAGE_TOKEN`. Order is fixed and has no `orderBy`. Walk a collection by passing each `nextPageToken` back unchanged until it is absent.
 - **Wrong method, unknown path.** A route is the pair of method and path. A wrong method is `404 ROUTE_NOT_FOUND`, there is no `405`, and a route that is not mounted is `404 ROUTE_NOT_FOUND` too. For an anonymous caller an unknown path is `401 CREDENTIALS_MISSING`, so routes cannot be probed anonymously.
 - **Query parameters.** An empty `pageSize=`, `pageToken=` or `filter=` counts as unset. Query values are decoded as `application/x-www-form-urlencoded`: `%XX` escapes decode, `+` is a space, and bytes that are not UTF-8 are replaced. A `pageSize` that is not an integer, or a path ID with bad percent-encoding, is `400 MALFORMED_REQUEST` whose `BadRequest` names the field (`pageSize`, or the path parameter); an unsupported `filter` names `filter`. A request body that is not valid JSON names the field `body`; unknown fields are each named.
 
@@ -327,6 +327,8 @@ The singleton `state`: the fleet as the control loop last saw it, with the worke
 
 The current state. Embedded resources (fleets, workers, instances, actions, events) have names so they can become collections later without changing their representation; they have no routes of their own.
 
+A fleet's `policy.min` is the fewest instances the fleet keeps at this pass: `min_instances`, raised by a scheduled minimum in force.
+
 ```sh
 curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
 ```
@@ -431,6 +433,7 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
         "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855/142",
         "target": "//app:server_test",
         "mnemonic": "TestRunner",
+        "build": "builds/k3q9w2m7x1c4v8bz",
         "startTime": "2026-01-14T09:19:58.000Z",
         "priority": 0
       }
@@ -441,6 +444,7 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
         "digest": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08/311",
         "target": "//app:lib",
         "mnemonic": "CppCompile",
+        "build": "builds/k3q9w2m7x1c4v8bz",
         "queueTime": "2026-01-14T09:19:51.250Z",
         "priority": 0,
         "candidates": [],
@@ -488,11 +492,12 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
     "window": "900s",
     "step": "10s",
     "samples": [
-      {"start": "2026-01-14T09:19:40.000Z", "completed": 12, "running": 3, "queued": 0, "passes": 5, "skipped": 0},
-      {"start": "2026-01-14T09:19:50.000Z", "completed": 9, "running": 2, "queued": 1, "passes": 5, "skipped": 0},
-      {"start": "2026-01-14T09:20:00.000Z", "completed": 1, "running": 1, "queued": 1, "passes": 1, "skipped": 0}
+      {"start": "2026-01-14T09:19:40.000Z", "completed": 12, "running": 3, "queued": 0, "passes": 5, "skipped": 0, "lookups": 20, "hits": 18},
+      {"start": "2026-01-14T09:19:50.000Z", "completed": 9, "running": 2, "queued": 1, "passes": 5, "skipped": 0, "lookups": 10, "hits": 9},
+      {"start": "2026-01-14T09:20:00.000Z", "completed": 1, "running": 1, "queued": 1, "passes": 1, "skipped": 0, "lookups": 2, "hits": 1}
     ]
   },
+  "builds": [],
   "principalsEpoch": 3
 }
 ```
@@ -506,11 +511,11 @@ curl -N -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state:watc
 ```sse
 event: snapshot
 id: 4812
-data: {"name":"state","seq":4812,"updateTime":"2026-01-14T09:20:02.000Z","provisioner":"aws","pass":{"state":"OK","interval":"2s","applied":0,"failed":0},"queue":{"total":0,"unplaceable":0},"fleets":[],"workers":[],"instances":[],"events":[{"name":"events/996","createTime":"2026-01-14T09:19:58.000Z","fleet":"fleets/x86-64-spot","workerRegistered":{"worker":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b"}}],"eventsLimit":200,"completed":980,"recent":{"window":"900s","step":"10s","samples":[{"start":"2026-01-14T09:20:00.000Z","completed":0,"running":0,"queued":0,"passes":1,"skipped":0}]},"principalsEpoch":3}
+data: {"name":"state","seq":4812,"updateTime":"2026-01-14T09:20:02.000Z","provisioner":"aws","pass":{"state":"OK","interval":"2s","applied":0,"failed":0},"queue":{"total":0,"unplaceable":0},"fleets":[],"workers":[],"instances":[],"events":[{"name":"events/996","createTime":"2026-01-14T09:19:58.000Z","fleet":"fleets/x86-64-spot","workerRegistered":{"worker":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b"}}],"eventsLimit":200,"completed":980,"recent":{"window":"900s","step":"10s","samples":[{"start":"2026-01-14T09:20:00.000Z","completed":0,"running":0,"queued":0,"passes":1,"skipped":0,"lookups":0,"hits":0}]},"builds":[],"principalsEpoch":3}
 
 event: delta
 id: 4813
-data: {"seq":4813,"base":4812,"updateTime":"2026-01-14T09:20:04.000Z","queue":{"total":0,"unplaceable":0},"workers":{"upsert":[{"name":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b","fleet":"fleets/x86-64-spot","instance":"instances/i-0e1000000000000a","phase":"IDLE","phaseTime":"2026-01-14T09:20:04.000Z","running":0,"slots":4,"paused":false,"launchTime":"2026-01-14T09:18:30.000Z","phases":[{"phase":"BUSY","start":"2026-01-14T09:19:58.000Z"},{"phase":"IDLE","start":"2026-01-14T09:20:04.000Z"}]}]},"actions":{"sampleTime":"2026-01-14T09:20:04.000Z","running":{"remove":["actions/ac9b1c52-3d0e-4f61-9a27-51c6d7e8f901"]},"queued":[]},"events":[{"name":"events/997","createTime":"2026-01-14T09:20:04.000Z","fleet":"fleets/x86-64-spot","cause":"IDLE_TIMEOUT","drainStarted":{"worker":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b"}}],"completed":981,"recent":{"window":"900s","step":"10s","samples":[{"start":"2026-01-14T09:20:00.000Z","completed":0,"running":0,"queued":0,"passes":2,"skipped":0}]}}
+data: {"seq":4813,"base":4812,"updateTime":"2026-01-14T09:20:04.000Z","queue":{"total":0,"unplaceable":0},"workers":{"upsert":[{"name":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b","fleet":"fleets/x86-64-spot","instance":"instances/i-0e1000000000000a","phase":"IDLE","phaseTime":"2026-01-14T09:20:04.000Z","running":0,"slots":4,"paused":false,"launchTime":"2026-01-14T09:18:30.000Z","phases":[{"phase":"BUSY","start":"2026-01-14T09:19:58.000Z"},{"phase":"IDLE","start":"2026-01-14T09:20:04.000Z"}]}]},"actions":{"sampleTime":"2026-01-14T09:20:04.000Z","running":{"remove":["actions/ac9b1c52-3d0e-4f61-9a27-51c6d7e8f901"]},"queued":[]},"events":[{"name":"events/997","createTime":"2026-01-14T09:20:04.000Z","fleet":"fleets/x86-64-spot","cause":"IDLE_TIMEOUT","drainStarted":{"worker":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b"}}],"completed":981,"recent":{"window":"900s","step":"10s","samples":[{"start":"2026-01-14T09:20:00.000Z","completed":0,"running":0,"queued":0,"passes":2,"skipped":0,"lookups":0,"hits":0}]}}
 
 event: tick
 id: 4813
@@ -538,7 +543,7 @@ data: {"reason":"VIEWER_CAP","retryDelay":"5s"}
   | Event | Data | Sent |
   |---|---|---|
   | `snapshot` | `State` | first on every connect, and again when a viewer fell behind the broadcast |
-  | `delta` | `{seq, base, updateTime, pass?, queue?, fleets?, workers?, instances?, actions?, events?, completed?, recent?, principalsEpoch?}` | when a pass changed something and a viewer is connected |
+  | `delta` | `{seq, base, updateTime, pass?, queue?, fleets?, workers?, instances?, actions?, events?, completed?, recent?, builds?, principalsEpoch?}` | when a pass changed something and a viewer is connected |
   | `tick` | `{seq, time}` | every heartbeat interval, with the current `seq` |
   | `closed` | `{reason, retryDelay?}` | last, when the server ends the stream deliberately |
 
@@ -546,6 +551,7 @@ data: {"reason":"VIEWER_CAP","retryDelay":"5s"}
 - **Applying a delta.** A delta moves the state from `base` to `seq`. A part that is present replaces the whole part (`pass`, `queue`, `completed`, `principalsEpoch`); `fleets`, `workers` and `instances` are `{upsert[], remove[]}` keyed by `name`, and a name is in at most one of the two lists (empty lists are omitted); `events` are appended, newest last; `recent` carries `window`, `step` and the samples from the first one that changed: drop your samples from that sample's `start` on, append these, then drop samples that start a whole `window` or more before the last. The `actions` patch is `{sampleTime?, staleAfter?, running?, queued?, truncated?}`: `running` is keyed by `name`, `queued` replaces the whole list. When `actions` first appears, the patch carries every field and all rows in `running.upsert`.
 - **Resynchronizing.** `seq` advances only when a delta is sent, and only while a viewer is connected. A client reconnects when a delta's `base` differs from its own `seq`, or when a tick's `seq` is behind its own state. A tick whose `seq` equals or runs ahead of the client's is normal (a delta may still be queued for that viewer). There is no replay and no `Last-Event-ID` handling: every connect begins with a snapshot, and a second `snapshot` on an open stream replaces the client's state.
 - **Recent window.** `recent` is what the server observed over its last `window` (`[dashboard] history_window`), one sample per `step` (`history_step`), oldest first and without holes; the last sample is the step in progress. A sample counts `completed` actions in its step, the `running` and `queued` actions at its latest completed pass, and its completed and `skipped` passes. A worker's `phases` are its phase spans within the window, the last being its current phase. The window lives in the server's memory: after a restart the steps before the first sample were not recorded and must not be read as zero.
+- **Builds in the state.** `State.builds` contains the basic build view for records observed within the recent window, ordered by name and bounded by `max_live`; `Delta.builds` applies `{upsert[], remove[]}` keyed by name. RunningAction and QueuedAction `build` references the first submitter's build, and is absent when unattributable. Each Sample's `lookups` and `hits` count farm-wide remote cache lookups and hits in the step, including unattributable calls. See [builds](#builds) for the build view.
 - **Events in the state.** `State.events` holds the newest `eventsLimit` scaling events, newest last (ascending). The same events are on `GET /v1/events`, which pages the whole history newest first.
 - **Closing.** `closed.reason` is one of the values below. `retryDelay` is a `Duration` and the SSE `retry:` line repeats it in milliseconds. A client treats a reason it does not know as terminal and reconnects only after the delay, if there is one.
 
@@ -560,6 +566,123 @@ data: {"reason":"VIEWER_CAP","retryDelay":"5s"}
 - **Sampling.** `actions` is omitted until the first sample after the controller starts. It is stale when the frame's `updateTime` minus `sampleTime` exceeds `staleAfter`. A worker's `phaseTime` is carried over while its phase is unchanged, so rows do not change on every pass. `completed` counts actions that reached a result since the controller started; a decrease means a restart.
 - A fleet's optional `launchFailure` is `{reason}` when its newest launch attempt failed, its request is unmet and no launch is in flight. The reason is the provider's message, verbatim. It is absent when the request is met, a launch is in flight, or the provider cannot tell.
 - A queued action's optional `refusal` explains why no fleet accepts it; it is present when `candidates` is empty and absent otherwise.
+- Both routes accept the session cookie.
+
+## builds
+
+### Name
+
+`builds/{build}`: one Bazel command identified by the authenticated principal and client-asserted invocation id (ADR-42). The id is 16 lowercase Crockford base32 characters, derived from the first 80 bits of SHA-256 of principal text, a zero byte and invocation text.
+
+### Methods
+
+| Method | Path | Permission |
+|---|---|---|
+| `GET` | `/v1/builds` | `builds.read` |
+| `GET` | `/v1/builds/{build}` | `builds.read` |
+
+### Examples
+
+Get the full view:
+
+```sh
+curl -H "Authorization: Bearer $TOKEN" https://gang.example.org/v1/builds/k3q9w2m7x1c4v8bz
+```
+
+```json response Build
+{
+  "name": "builds/k3q9w2m7x1c4v8bz",
+  "principal": "principals/google%3Adev%40example.org",
+  "invocationId": "invocation-1",
+  "correlatedInvocationsId": "job-1",
+  "tool": "bazel 8.4.2",
+  "state": "ACTIVE",
+  "startTime": "2026-01-14T09:20:00.000Z",
+  "lastActiveTime": "2026-01-14T09:20:10.000Z",
+  "usage": {
+    "cache": {"hits": 3, "misses": 1, "errors": 0, "uploadedResults": 1},
+    "executions": {"executeCalls": 1, "rejected": 0, "completed": 1, "failed": 0},
+    "actionTime": {"queued": "1s", "inputFetch": "0.250s", "executing": "2s", "outputUpload": "0.500s"}
+  },
+  "unrecorded": 0,
+  "mnemonics": [{
+    "mnemonic": "CppCompile",
+    "usage": {
+      "cache": {"hits": 3, "misses": 1, "errors": 0, "uploadedResults": 1},
+      "executions": {"executeCalls": 1, "rejected": 0, "completed": 1, "failed": 0},
+      "actionTime": {"queued": "1s", "inputFetch": "0.250s", "executing": "2s", "outputUpload": "0.500s"}
+    }
+  }],
+  "otherMnemonics": {
+    "cache": {"hits": 0, "misses": 0, "errors": 0, "uploadedResults": 0},
+    "executions": {"executeCalls": 0, "rejected": 0, "completed": 0, "failed": 0},
+    "actionTime": {"queued": "0s", "inputFetch": "0s", "executing": "0s", "outputUpload": "0s"}
+  },
+  "missedTargets": [{"target": "//app:lib", "misses": 1, "overestimate": 0}],
+  "slowest": [{
+    "target": "//app:lib", "mnemonic": "CppCompile", "digest": "abc123/142",
+    "worker": "workers/worker-1", "queueTime": "2026-01-14T09:20:01.000Z",
+    "span": "4s", "queued": "1s", "inputFetch": "0.250s", "executing": "2s",
+    "outputUpload": "0.500s", "exitCode": 0
+  }],
+  "timeline": {
+    "startTime": "2026-01-14T09:20:00.000Z", "step": "1s",
+    "buckets": [{"hits": 3, "misses": 1, "executing": "1s", "queued": "1s"}]
+  }
+}
+```
+
+List basic views with a filter and page size:
+
+```sh
+curl -G -H "Authorization: Bearer $TOKEN" https://gang.example.org/v1/builds \
+  --data-urlencode 'filter=principal = "principals/google%3Adev%40example.org" AND correlatedInvocationsId = "job-1"' \
+  --data-urlencode 'pageSize=1'
+```
+
+```json response ListBuildsResponse
+{
+  "builds": [{
+    "name": "builds/k3q9w2m7x1c4v8bz",
+    "principal": "principals/google%3Adev%40example.org",
+    "invocationId": "invocation-1",
+    "correlatedInvocationsId": "job-1",
+    "tool": "bazel 8.4.2",
+    "state": "ACTIVE",
+    "startTime": "2026-01-14T09:20:00.000Z",
+    "lastActiveTime": "2026-01-14T09:20:10.000Z",
+    "usage": {
+      "cache": {"hits": 3, "misses": 1, "errors": 0, "uploadedResults": 1},
+      "executions": {"executeCalls": 1, "rejected": 0, "completed": 1, "failed": 0},
+      "actionTime": {"queued": "1s", "inputFetch": "0.250s", "executing": "2s", "outputUpload": "0.500s"}
+    },
+    "unrecorded": 0
+  }],
+  "nextPageToken": "opaque-token"
+}
+```
+
+Pass the returned `nextPageToken` as `pageToken` with the same filter to request the next page.
+
+### Errors
+
+| Reason | When |
+|---|---|
+| `MISSING_PERMISSION` | the caller lacks `builds.read` |
+| `MALFORMED_REQUEST` | the list filter or paging parameter is invalid, or the build id is malformed (field `build`) |
+| `INVALID_PAGE_TOKEN` | the page token is invalid or belongs to another filter |
+| `BUILD_NOT_FOUND` | the well-formed build id is not held; the metadata key is `build` |
+
+### Notes
+
+- **Scope and visibility.** A `builds.read` holder sees all held builds. Records are bounded in memory; at capacity the least recently active is dropped, and a restart clears them. Calls with no principal, no invocation id or an over-cap metadata field are not attributed to a build. Invocation ids, target labels and mnemonics are client-asserted; target labels can reveal repository structure.
+- **Filter and order.** `filter` is a conjunction of `field = "value"` terms joined by ` AND `, each field at most once: `principal`, `invocationId` and `correlatedInvocationsId`. Empty matches all. The list orders newest `lastActiveTime` first, ties by name; the opaque cursor resumes strictly after the last row.
+- **Views.** List and `State.builds` use the basic view; Get returns the full view, adding `mnemonics`, `otherMnemonics`, `missedTargets`, `slowest` and `timeline` when present. Optional empty fields are omitted.
+- **State and loss.** `ACTIVE` means an observation arrived within `[builds] idle_after`; `IDLE` means none did. Neither says the command finished or succeeded. `unrecorded` counts observations lost to the bounded channel; further losses that cannot be attributed to a held loss counter are logged, not assigned to a build.
+- **Cache and execution.** `usage.cache` counts remote lookup hits, misses and errors and successful result uploads; a successful upload is a locally executed result uploaded by the client. `usage.executions` counts successful execute calls, rejected calls and own completed and failed worker executions. NativeLink deduplicates in-flight work: a later submitter joins the first submitter's execution. Clients derive joined as `max(0, executeCalls - completed - failed)`; joined wait is not timed. `usage.actionTime` sums worker-reported phase durations, not elapsed build time; phases the worker did not report are left out of the sums and slowest actions.
+- **Breakdowns.** Each `mnemonics` row holds the same usage shape; missing or excess mnemonics go into `otherMnemonics`. `missedTargets` uses Space-Saving: the true misses lie between `misses - overestimate` and `misses`. `slowest` is ordered by largest `span`, from `queueTime` to worker completion; its phase durations are action times.
+- **Timeline.** Buckets hold hit and miss counts and queued and executing action-time durations. Divide a duration by `step` for mean concurrency. As the timeline grows, adjacent buckets merge and `step` doubles, preserving totals.
+- **What the server cannot see.** Local and disk-cache hits, local-only actions except uploaded results, analysis time, Bazel job throttling, critical path and build success are not visible. A remote lookup hit whose outputs were evicted can be followed by an execution, so both may be counted; actions for which Bazel skips a remote lookup can execute without a lookup.
 - Both routes accept the session cookie.
 
 ## principals
@@ -814,12 +937,12 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/roles
   "roles": [
     {
       "name": "roles/administrator",
-      "permissions": ["state.read", "principals.read", "events.read", "principals.revoke"],
+      "permissions": ["state.read", "principals.read", "events.read", "builds.read", "principals.revoke"],
       "principals": ["principals/google%3Aops%40example.org"]
     },
     {
       "name": "roles/viewer",
-      "permissions": ["state.read"],
+      "permissions": ["state.read", "builds.read"],
       "principals": ["principals/google%3Adev%40example.org", "principals/github-actions%3Aexample-org%2Fexample-repo"]
     }
   ]
@@ -837,7 +960,7 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/roles
 ### Notes
 
 - **Order.** Roles are listed in configuration order, paged in memory over the configured list.
-- A role's `permissions` are the permission names with `*` expanded, in canonical order (`state.read`, `principals.read`, `events.read`, `principals.revoke`). `principals` are references to the principals the role names.
+- A role's `permissions` are the permission names with `*` expanded, in canonical order (`state.read`, `principals.read`, `events.read`, `builds.read`, `principals.revoke`). `principals` are references to the principals the role names.
 - Roles are read through `principals.read`: they are principal data, so no separate permission exists.
 - The route accepts the session cookie.
 
@@ -899,7 +1022,7 @@ curl -H "Authorization: Bearer $TOKEN" 'https://gang.example.com/v1/events?pageS
 
 - **Order.** Events are listed by sequence number, descending, so a chain of pages walks backward in time. `nextPageToken` resumes after the last event of the page.
 - **Live and history.** The history is this list. Live events come only from `GET /v1/state:watch`: its snapshot `events` and every delta's `events` are full `Event` resources with the same shape. There is no long poll, no `since` and no `before`. A client that holds the newest events of a stream and wants older ones lists from the newest, and stops at the first event it already holds, deduplicating by `name`.
-- **Event.** `createTime` is when the event was recorded and `fleet` is the fleet it concerns. `cause` is present for an autoscaler decision and omitted for worker joins and leaves, early exits, launch failures, and events recorded before causes existed. Its values are `DEMAND`, `IDLE_TIMEOUT`, `ORPHAN`, `DRAIN_FINISHED` and `MAX_DRAIN_WAIT`; a client tolerates a value it does not know. Beside the common fields exactly one member describes the change:
+- **Event.** `createTime` is when the event was recorded and `fleet` is the fleet it concerns. `cause` is present for an autoscaler decision and omitted for worker joins and leaves, early exits, launch failures, and events recorded before causes existed. Its values are `DEMAND`, `MINIMUM`, `IDLE_TIMEOUT`, `ORPHAN`, `DRAIN_FINISHED` and `MAX_DRAIN_WAIT`; a client tolerates a value it does not know. Beside the common fields exactly one member describes the change:
 
   | Member | Fields |
   |---|---|
@@ -947,6 +1070,7 @@ Every non-2xx answer on `/v1/**` is the same envelope, `google.rpc.Status` as in
 | `ROUTE_NOT_FOUND` | 404 | `NOT_FOUND` | `method`, `path` |
 | `CERTIFICATE_NOT_FOUND` | 404 | `NOT_FOUND` | `certificate` |
 | `PRINCIPAL_NOT_FOUND` | 404 | `NOT_FOUND` | `principal` |
+| `BUILD_NOT_FOUND` | 404 | `NOT_FOUND` | `build` |
 | `DEVICE_AUTHORIZATION_NOT_FOUND` | 404 | `NOT_FOUND` | `deviceAuthorization` |
 | `RATE_LIMITED` | 429 | `RESOURCE_EXHAUSTED` | — |
 | `DEPENDENCY_UNAVAILABLE` | 503 | `UNAVAILABLE` | — |
@@ -967,7 +1091,7 @@ What each reason means:
 - `PRINCIPAL_REVOKED`: the caller's principal is revoked.
 - `MISSING_PERMISSION`: the caller is authenticated and lacks the permission the route requires; the metadata names it.
 - `ROUTE_NOT_FOUND`: no route matches the method and path, or the route is not mounted on this deployment.
-- `CERTIFICATE_NOT_FOUND`, `PRINCIPAL_NOT_FOUND`: the named resource does not exist.
+- `CERTIFICATE_NOT_FOUND`, `PRINCIPAL_NOT_FOUND`, `BUILD_NOT_FOUND`: the named resource does not exist.
 - `DEVICE_AUTHORIZATION_NOT_FOUND`: the device authorization is unknown, expired or already redeemed, or its secret is wrong; these cases are indistinguishable.
 - `RATE_LIMITED`: a client address, or the server as a whole, sent more requests to an open route than `[server.rate_limit]` allows. The answer carries `Retry-After` and a `RetryInfo` detail; retry after that wait.
 - `DEPENDENCY_UNAVAILABLE`: the ledger, an identity provider or the signer cannot be reached, including when the gate cannot check the caller (`503` on every `/v1/**` route); retrying later may succeed.

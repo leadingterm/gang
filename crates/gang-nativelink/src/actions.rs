@@ -5,18 +5,26 @@ use std::sync::Arc;
 use futures::StreamExt;
 use gang_clock::Timestamp;
 use gang_spi::{ActionInfo, ActionsView, ListingLimits, QueuedActionView, RunningActionView};
+use gang_types::{BuildId, Identity};
 use gang_types::{FleetCatalog, WorkerId};
 use nativelink_error::Error;
 use nativelink_scheduler::worker_scheduler::WorkerSummary;
 use nativelink_util::action_messages::{
     ActionInfo as NativeActionInfo, ActionState, WorkerId as NativeWorkerId,
 };
+use nativelink_util::common::DigestInfo;
 use nativelink_util::operation_state_manager::{
     ActionStateResult, ClientStateManager, OperationFilter, OperationStageFlags, OrderDirection,
 };
 use nativelink_util::origin_event::OriginMetadata;
 
+use crate::observer::origin as build_origin;
 use crate::snapshot::managed_worker;
+
+/// Formats an action digest for the scheduler views and execution observations.
+pub(crate) fn digest_text(digest: DigestInfo) -> String {
+    format!("{}/{}", digest.packed_hash(), digest.size_bytes())
+}
 
 /// Reads the running and queued actions into `into`.
 ///
@@ -106,6 +114,7 @@ async fn running(
                 target: row.target,
                 mnemonic: row.mnemonic,
                 priority: row.info.priority,
+                build: row.build,
             },
             worker,
             started: row.started,
@@ -148,6 +157,7 @@ async fn queued(
                 digest: row.digest,
                 target: row.target,
                 mnemonic: row.mnemonic,
+                build: row.build,
                 priority: row.info.priority,
             },
             queued_since: Timestamp::from(row.info.insert_timestamp),
@@ -165,6 +175,7 @@ struct Listed {
     target: String,
     mnemonic: String,
     started: Timestamp,
+    build: Option<BuildId>,
     info: Arc<NativeActionInfo>,
 }
 
@@ -175,20 +186,25 @@ async fn read(
     result: &dyn ActionStateResult,
 ) -> Result<Listed, Error> {
     let (info, _) = result.as_action_info().await?;
+    let build = origin.as_ref().and_then(|origin| {
+        let principal = Arc::new(origin.identity.parse::<Identity>().ok()?);
+        Some(
+            build_origin(principal, origin.bazel_metadata.as_ref()?)?
+                .build
+                .id(),
+        )
+    });
     let (target, mnemonic) = origin.and_then(|origin| origin.bazel_metadata).map_or_else(
         || (String::new(), String::new()),
         |metadata| (metadata.target_id, metadata.action_mnemonic),
     );
     Ok(Listed {
         op: state.client_operation_id.to_string(),
-        digest: format!(
-            "{}/{}",
-            state.action_digest.packed_hash(),
-            state.action_digest.size_bytes()
-        ),
+        digest: digest_text(state.action_digest),
         target,
         mnemonic,
         started: Timestamp::from(state.last_transition_timestamp),
+        build,
         info,
     })
 }
@@ -240,6 +256,7 @@ mod tests {
         state: Arc<ActionState>,
         info: Arc<NativeActionInfo>,
         origin: Option<RequestMetadata>,
+        identity: String,
         state_reads: Arc<AtomicUsize>,
         info_reads: Arc<AtomicUsize>,
     }
@@ -247,7 +264,7 @@ mod tests {
     impl Row {
         fn origin(&self) -> OriginMetadata {
             OriginMetadata {
-                identity: String::new(),
+                identity: self.identity.clone(),
                 bazel_metadata: self.origin.clone(),
             }
         }
@@ -379,6 +396,7 @@ mod tests {
             }),
             info,
             origin,
+            identity: String::new(),
             state_reads: Arc::new(AtomicUsize::new(0)),
             info_reads: Arc::new(AtomicUsize::new(0)),
         }
@@ -436,6 +454,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_action_reports_the_first_submitters_build()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut action = row(
+            "q",
+            ActionStage::Queued,
+            0,
+            info(0, 0, &[]),
+            Some(RequestMetadata {
+                tool_invocation_id: "invocation".to_owned(),
+                ..Default::default()
+            }),
+        );
+        action.identity = "local:alice".to_owned();
+        let fake = Fake {
+            queued: vec![action],
+            ..Default::default()
+        };
+        let view = run(&fake, &[], &catalog()?, ALL).await?;
+        let key = gang_types::BuildKey {
+            principal: Arc::new("local:alice".parse()?),
+            invocation: gang_types::InvocationId::try_new("invocation")?,
+        };
+        assert_eq!(view.queued[0].info.build, Some(key.id()));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn operations_are_associated_with_the_worker_running_them()
     -> Result<(), Box<dyn std::error::Error>> {
         let fleets = catalog()?;
@@ -474,6 +519,7 @@ mod tests {
                         target: "//app:bin".to_owned(),
                         mnemonic: "CppCompile".to_owned(),
                         priority: 5,
+                        build: None,
                     },
                     worker: WorkerId::try_new(WORKER_A)?,
                     started: Timestamp::from_unix_millis(1_000),
@@ -485,6 +531,7 @@ mod tests {
                         target: "//b:lib".to_owned(),
                         mnemonic: "Javac".to_owned(),
                         priority: 3,
+                        build: None,
                     },
                     worker: WorkerId::try_new(WORKER_B)?,
                     started: Timestamp::from_unix_millis(2_000),
@@ -524,6 +571,7 @@ mod tests {
                         target: "//q:one".to_owned(),
                         mnemonic: "Genrule".to_owned(),
                         priority: 7,
+                        build: None,
                     },
                     queued_since: Timestamp::from_unix_millis(4_000),
                     candidates: fleets.accepting(|key| (key == "cpu").then_some("2")),
@@ -536,6 +584,7 @@ mod tests {
                         target: String::new(),
                         mnemonic: String::new(),
                         priority: 2,
+                        build: None,
                     },
                     queued_since: Timestamp::from_unix_millis(5_000),
                     candidates: fleets.accepting(|_| None),

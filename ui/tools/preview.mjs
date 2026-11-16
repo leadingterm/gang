@@ -142,6 +142,16 @@ createServer((req, res) => {
   }
   if (url.pathname === "/v1/session") return json(res, sessionFor(scenario));
   if (url.pathname === "/v1/state:watch") return stream(req, res, scenario);
+  if (req.method === "GET" && url.pathname === "/v1/builds") {
+    if (!sessionFor(scenario).permissions.includes("builds.read")) return send(res, 403, {});
+    return json(res, { builds: load("live")[0].event.data.builds ?? [] });
+  }
+  if (req.method === "GET" && url.pathname.startsWith("/v1/builds/")) {
+    if (!sessionFor(scenario).permissions.includes("builds.read")) return send(res, 403, {});
+    const build = JSON.parse(fixture("build.json"));
+    if (url.pathname !== `/v1/${build.name}`) return send(res, 404, { "content-type": "application/json" }, "{}");
+    return json(res, build);
+  }
   const body = BODIES[url.pathname];
   if (body) {
     if (!sessionFor(scenario).permissions.includes(body.permission)) return send(res, 403, {});

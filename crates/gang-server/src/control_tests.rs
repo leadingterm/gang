@@ -23,6 +23,8 @@ use crate::test_support::{clock_at, fleets, fleets_of, queued_demand};
 use gang_testkit::{FakeProvisioner, FakeRepository, FakeScheduler, Opaque, TestResult, worker_on};
 
 const POLL_INTERVAL: NonZeroDuration = NonZeroDuration::from_secs(1);
+const TICK: Duration = Duration::from_millis(1);
+const BEFORE_POLL: Duration = POLL_INTERVAL.get().checked_sub(TICK).unwrap();
 
 fn fleet_name() -> FleetName {
     FleetName::try_new("example-fleet").expect("example-fleet is a valid fleet name")
@@ -904,7 +906,7 @@ async fn overflow_from_a_full_fleet_scales_the_next_candidate() -> TestResult {
         queued: vec![queued_demand(
             FleetSet::prefix(2).map_err(PortError::backend)?,
         )],
-        completed: 0,
+        ..SchedulerSnapshot::default()
     });
     let mut control = ControlLoop::new(
         &fleets,
@@ -1227,13 +1229,18 @@ fn hub() -> StateHub {
 fn publisher(hub: &StateHub) -> StatePublisher {
     let config = BuilderConfig {
         events_limit: 100,
-        history_window: Duration::from_secs(900),
+        history_window: Duration::from_mins(15),
         history_step: Duration::from_secs(10),
         stale_after: Duration::from_mins(1),
         interval: POLL_INTERVAL.get(),
         provisioner: "local".to_owned(),
     };
-    StatePublisher::new(hub.clone(), config, ActionsCache::default())
+    StatePublisher::new(
+        hub.clone(),
+        config,
+        ActionsCache::default(),
+        crate::builds::BuildsCell::new(&gang_config::BuildsConfig::default()),
+    )
 }
 
 /// The state the hub serves now.
@@ -1436,11 +1443,11 @@ async fn run_passes_at_once_then_once_per_poll_interval() -> Result<(), PortErro
     }
     assert_eq!(snapshots.get(), 1, "the first pass runs at once");
 
-    clock.advance(POLL_INTERVAL.get() - Duration::from_millis(1));
+    clock.advance(BEFORE_POLL);
     assert!(poll!(run.as_mut()).is_pending());
     assert_eq!(snapshots.get(), 1, "no pass before the poll interval");
 
-    clock.advance(Duration::from_millis(1));
+    clock.advance(TICK);
     assert!(poll!(run.as_mut()).is_pending());
     assert_eq!(
         snapshots.get(),

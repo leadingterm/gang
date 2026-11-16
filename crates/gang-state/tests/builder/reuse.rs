@@ -89,6 +89,7 @@ fn running(
             target: format!("//t:{op}"),
             mnemonic: "Compile".to_owned(),
             priority,
+            build: None,
         },
         worker: worker_on(&instance_id(index)?)?,
         started: ts(started),
@@ -104,6 +105,7 @@ fn waiting(op: &str, queued_since: u64, priority: i32, fleets: &[usize]) -> Queu
             target: format!("//t:{op}"),
             mnemonic: "Link".to_owned(),
             priority,
+            build: None,
         },
         queued_since: ts(queued_since),
         candidates: fleet_set(fleets),
@@ -385,6 +387,7 @@ fn fill_window(
     let catalog = FleetCatalog::try_new(world.properties.clone())?;
     let mut hosted = HostedSnapshot::default();
     hosted.replace(&mut world.snapshot.clone());
+    let empty_builds = gang_insight::Builds::new(&gang_config::BuildsConfig::default());
     let inputs = Inputs {
         wall: ts(wall),
         pass: PassStatus::Ok {
@@ -396,6 +399,7 @@ fn fill_window(
         catalog: &catalog,
         actions: world.actions.as_ref(),
         events,
+        builds: world.builds.as_ref().unwrap_or(&empty_builds),
         principals_epoch: 7,
     };
     builder.fill(cur, prev, seq, &inputs);

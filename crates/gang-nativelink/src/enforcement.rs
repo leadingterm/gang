@@ -5,10 +5,20 @@
 use std::fmt;
 use std::num::NonZeroU32;
 
-use gang_types::HeadroomPercent;
+use gang_types::{BoundedBytes, HeadroomPercent};
 use serde::{Deserialize, Serialize};
 
-use crate::whole_kib::WholeKib;
+/// A size that is a whole, non-zero number of KiB, as `NativeLink` takes memory and disk sizes.
+pub type WholeKib = BoundedBytes<1024, 1, { u64::MAX / 1024 }>;
+
+/// The least memory reservation an action is scheduled with: a whole number of KiB, at least 4 MiB.
+/// The kernel was observed to OOM-kill a shell before its first write at a `memory.max` of 0.5 to
+/// 1 MiB, twice a reservation of 252 to 518 KiB; below 4 MiB the minimum would not keep a scope out
+/// of that range.
+pub type MinReservation = BoundedBytes<1024, { 4 * 1024 }, { u64::MAX / 1024 }>;
+
+/// The default minimum reservation: 16 MiB.
+const DEFAULT_MIN_RESERVATION: MinReservation = MinReservation::from_units(16 * 1024);
 
 /// Percent above the reservation an action may reach before it is killed.
 const DEFAULT_MEMORY_HEADROOM_PERCENT: HeadroomPercent = HeadroomPercent::from_percent(20);
@@ -19,9 +29,9 @@ const DEFAULT_DISK_HEADROOM_PERCENT: HeadroomPercent = HeadroomPercent::from_per
 /// Cores an unmeasured action reserves.
 const DEFAULT_COLD_START_CPU_COUNT: NonZeroU32 = NonZeroU32::MIN;
 /// Memory an unmeasured action reserves: 4 GiB.
-const DEFAULT_COLD_START_MEMORY: WholeKib = WholeKib::from_kib(4 * 1024 * 1024);
+const DEFAULT_COLD_START_MEMORY: WholeKib = WholeKib::from_units(4 * 1024 * 1024);
 /// Disk an unmeasured action reserves: 4 GiB.
-const DEFAULT_COLD_START_DISK: WholeKib = WholeKib::from_kib(4 * 1024 * 1024);
+const DEFAULT_COLD_START_DISK: WholeKib = WholeKib::from_units(4 * 1024 * 1024);
 
 gang_types::string_enum! {
     /// How a worker holds an action to the memory it reserved.
@@ -50,6 +60,11 @@ impl Default for MemoryEnforcement {
 pub struct MemoryTuning {
     /// What a worker does with an action that exceeds its memory reservation. Default: `soft`.
     pub enforcement: MemoryEnforcement,
+    /// The least memory reservation an action is scheduled with: a learned reservation can be a
+    /// few hundred KiB (a quick action's first PSS sample), under which the soft limit and the
+    /// escalation steps are judged from almost nothing. A whole number of KiB, it must not exceed
+    /// any fleet's `memory_per_instance`. Default: 16MiB.
+    pub min_reservation: MinReservation,
     /// Percent above its reservation an action may reach before `NativeLink` kills it. Default: 20.
     pub headroom_percent: HeadroomPercent,
     /// A killed action is requeued with its reservation scaled to this percent, so 200 doubles
@@ -64,6 +79,7 @@ impl Default for MemoryTuning {
     fn default() -> Self {
         Self {
             enforcement: MemoryEnforcement::default(),
+            min_reservation: DEFAULT_MIN_RESERVATION,
             headroom_percent: DEFAULT_MEMORY_HEADROOM_PERCENT,
             escalation_percent: EscalationPercent::DEFAULT,
             escalation_max_steps: DEFAULT_ESCALATION_MAX_STEPS,
@@ -250,12 +266,40 @@ mod tests {
         assert_eq!(memory.escalation_percent.get(), 200);
         assert_eq!(memory.headroom_percent.get(), 20);
         assert_eq!(memory.escalation_max_steps, 8);
+        assert_eq!(memory.min_reservation.as_units(), 16_384);
 
         let cold = ColdStartTuning::default();
         assert!(cold.enabled);
         assert_eq!(cold.cpu_count.get(), 1);
-        assert_eq!(cold.memory.as_kib(), 4 * 1024 * 1024);
-        assert_eq!(cold.disk.as_kib(), 4 * 1024 * 1024);
+        assert_eq!(cold.memory.as_units(), 4 * 1024 * 1024);
+        assert_eq!(cold.disk.as_units(), 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn minimum_reservation_is_at_least_four_mib() {
+        let error = serde_json::from_str::<MemoryTuning>(r#"{"min_reservation":"3MiB"}"#)
+            .expect_err("minimum below 4 MiB must fail");
+        assert!(error.to_string().contains("must be at least 4MiB"));
+        let memory: MemoryTuning =
+            serde_json::from_str(r#"{"min_reservation":"4MiB"}"#).expect("4 MiB is accepted");
+        assert_eq!(memory.min_reservation.as_units(), 4096);
+    }
+
+    #[test]
+    fn minimum_reservation_one_kib_below_four_mib_is_rejected() {
+        assert!(serde_json::from_str::<MemoryTuning>(r#"{"min_reservation":"4095KiB"}"#).is_err());
+    }
+
+    #[test]
+    fn minimum_reservation_must_be_whole_kib() {
+        assert!(serde_json::from_str::<MemoryTuning>(r#"{"min_reservation":"4194305B"}"#).is_err());
+    }
+
+    #[test]
+    fn minimum_reservation_is_exact_kib() {
+        let memory: MemoryTuning =
+            serde_json::from_str(r#"{"min_reservation":"16385KiB"}"#).expect("valid minimum");
+        assert_eq!(memory.min_reservation.as_units(), 16_385);
     }
 
     #[test]
@@ -273,8 +317,8 @@ mod tests {
         assert!(serde_json::from_str::<ColdStartTuning>(r#"{"disk": "512B"}"#).is_err());
         let cold: ColdStartTuning =
             serde_json::from_str(r#"{"memory": "4GiB", "disk": "4GiB"}"#).unwrap();
-        assert_eq!(cold.memory.as_kib(), 4 * 1024 * 1024);
-        assert_eq!(cold.disk.as_kib(), 4 * 1024 * 1024);
+        assert_eq!(cold.memory.as_units(), 4 * 1024 * 1024);
+        assert_eq!(cold.disk.as_units(), 4 * 1024 * 1024);
     }
 
     #[test]

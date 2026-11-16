@@ -21,20 +21,15 @@ jobs:
   # measured cold run; the step timeouts of the long Bazel steps leave the cache save room inside the job's.
   lint:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-nix
-      - name: Check Nix formatting
-        run: alejandra --check .
-      - name: Lint scripts
-        run: shellcheck infra/scripts/*.sh
-      - name: Lint workflows
-        run: actionlint
-      - name: Evaluate every flake output of every system
-        run: nix flake check --no-build --all-systems
+      # One owner for the lint steps, which tools/gate.sh runs too; it includes macOS Clippy of every Cargo target (docs/SPECIFICATION.md §7).
+      - name: Lint
+        run: tools/lint.sh
 
   linux-x86_64:
     runs-on: ubuntu-24.04
@@ -143,7 +138,9 @@ jobs:
           - gate: 2
             args: --gate 2 --additions
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    # This timeout is only an outer backstop; tools/e2e-gate.sh bounds the gate itself so a slow gate fails
+    # with the script's message instead of a cancelled job.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -165,13 +162,12 @@ jobs:
           sudo loginctl enable-linger "$(id -u)"
           sudo systemctl restart "user@$(id -u).service"
           sudo systemctl start "user@$(id -u).service"
-      # Workers use systemd-run --user --scope and need the runner's delegated user manager. The unit
-      # starts from the user manager's environment, so it enters the devShell itself. Artifacts drop
-      # file modes; ARGS splits into the harness's arguments.
+      # tools/e2e-gate.sh runs the harness as a delegated transient service of the runner's user manager, as
+      # tools/gate.sh does on any Linux host. Artifacts drop file modes; ARGS splits into the harness's arguments.
       - name: Run the gate
         env:
           ARGS: ${{ matrix.args }}
           E2E: ${{ runner.temp }}/e2e
         run: |
           chmod +x "$E2E"/*
-          XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-run --user --pipe --wait --same-dir -p Delegate=yes --setenv=PATH="$PATH" --setenv=GANG_E2E_GLIBC_TOOL="$E2E/loaded_probe" -- nix develop -c "$E2E/local" --gang "$E2E/gang-x86_64-unknown-linux-musl" --bazel "$E2E/bazel" --config configs/gang.local.toml --sample e2e/sample --configs configs $ARGS
+          tools/e2e-gate.sh "$E2E" "$E2E/gang-x86_64-unknown-linux-musl" $ARGS

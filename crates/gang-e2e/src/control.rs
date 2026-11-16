@@ -32,6 +32,10 @@ pub struct ControlKnobs {
     pub min_instances: Option<u32>,
     /// `max_instances` of every `[[fleets]]` entry.
     pub max_instances: Option<u32>,
+    /// A `[[fleets.scheduled_minimum]]` window in force at every instant (all seven `days`,
+    /// `00:00` to `24:00`, `time_zone = "Asia/Kathmandu"`) with this many `instances`, on every
+    /// `[[fleets]]` entry.
+    pub scheduled_minimum: Option<u32>,
     /// `[provisioner.local] terminate_grace`: how long a worker sent `SIGTERM` may run before it
     /// is killed.
     pub terminate_grace: Option<Duration>,
@@ -52,6 +56,7 @@ impl ControlKnobs {
         idle_timeout: None,
         min_instances: None,
         max_instances: None,
+        scheduled_minimum: None,
         terminate_grace: None,
         detail_interval: None,
         client_action_timeout: None,
@@ -100,13 +105,24 @@ impl ControlKnobs {
         ..Self::NONE
     };
 
+    /// One worker kept by a scheduled minimum alone: `min_instances` 0, at most one instance,
+    /// a pass every second.
+    pub const SCHEDULED_MINIMUM: Self = Self {
+        poll_interval: Some(Duration::from_secs(1)),
+        min_instances: Some(0),
+        max_instances: Some(1),
+        scheduled_minimum: Some(1),
+        ..Self::NONE
+    };
+
     /// Every preset a control scenario runs under, in suite order: the one list the suite's
     /// presets and the configuration parse tests draw from.
-    pub const PRESETS: [Self; 4] = [
+    pub const PRESETS: [Self; 5] = [
         Self::ORPHAN,
         Self::DRAIN_CANCEL,
         Self::SKIPPED_PASS,
         Self::LAUNCH_FAILURE,
+        Self::SCHEDULED_MINIMUM,
     ];
 }
 

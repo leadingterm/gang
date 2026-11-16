@@ -134,17 +134,17 @@ mod tests {
 
     #[test]
     fn endpoint_transport_and_fragment_are_checked() {
-        let https_issuer = Url::parse("https://idp.example.test").expect("valid issuer");
-        let http_issuer = Url::parse("http://127.0.0.1:8080").expect("valid issuer");
+        let secure = Url::parse("https://idp.example.test").expect("valid issuer");
+        let loopback = Url::parse("http://127.0.0.1:8080").expect("valid issuer");
         for (issuer, endpoint, allowed) in [
-            (&https_issuer, "https://idp.example.test/jwks", true),
-            (&http_issuer, "http://localhost:8080/jwks", true),
-            (&http_issuer, "http://idp.example.test/jwks", false),
-            (&https_issuer, "http://127.0.0.1/jwks", false),
-            (&http_issuer, "javascript:alert(1)", false),
-            (&http_issuer, "file:///tmp/jwks", false),
-            (&https_issuer, "https://idp.example.test/jwks#key", false),
-            (&https_issuer, "https://idp.example.test/jwks?key=1", true),
+            (&secure, "https://idp.example.test/jwks", true),
+            (&loopback, "http://localhost:8080/jwks", true),
+            (&loopback, "http://idp.example.test/jwks", false),
+            (&secure, "http://127.0.0.1/jwks", false),
+            (&loopback, "javascript:alert(1)", false),
+            (&loopback, "file:///tmp/jwks", false),
+            (&secure, "https://idp.example.test/jwks#key", false),
+            (&secure, "https://idp.example.test/jwks?key=1", true),
         ] {
             let endpoint = Url::parse(endpoint).expect("valid endpoint url");
             let result = check_endpoint(issuer, "jwks_uri", &endpoint);

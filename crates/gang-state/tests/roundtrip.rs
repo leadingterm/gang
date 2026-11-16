@@ -153,6 +153,7 @@ fn running(slot: usize, priority: i32) -> Result<RunningAction, Box<dyn Error>> 
         mnemonic: "GoCompile".to_owned(),
         start_time: timestamped(1),
         priority,
+        build: String::new(),
     })
 }
 
@@ -166,6 +167,7 @@ fn queued(op: &str) -> Result<QueuedAction, Box<dyn Error>> {
         priority: 0,
         candidates: vec![fleet_name("alpha")?],
         refusal: None,
+        build: String::new(),
     })
 }
 
@@ -519,6 +521,7 @@ fn snapshot(world: &World) -> State {
         events_limit: world.events_limit,
         completed: world.completed,
         recent: Recent::default(),
+        builds: Vec::new(),
         principals_epoch: world.principals_epoch,
     }
 }

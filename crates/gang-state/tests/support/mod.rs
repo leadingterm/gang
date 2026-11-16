@@ -24,6 +24,17 @@ pub fn ts(millis: u64) -> Timestamp {
     Timestamp::from_unix_millis(millis)
 }
 
+/// A build key for a test invocation.
+pub fn build_key(invocation: &str) -> Result<gang_types::BuildKey, Box<dyn std::error::Error>> {
+    Ok(gang_types::BuildKey {
+        principal: std::sync::Arc::new(gang_types::Identity::new(
+            gang_types::ProviderName::try_new("local")?,
+            gang_types::Principal::try_new("alice")?,
+        )),
+        invocation: gang_types::InvocationId::try_new(invocation)?,
+    })
+}
+
 /// The builder configuration of the tests: ten events, a five-second staleness bound, a
 /// one-second interval and the `test-provisioner` provisioner.
 pub fn config() -> BuilderConfig {

@@ -5,6 +5,8 @@ crate::string_enum! {
     pub enum ScalingCause("scaling cause") {
         /// Queued work needed another worker.
         Demand = "demand",
+        /// The fleet's minimum in force, not its work, needed the capacity.
+        Minimum = "minimum",
         /// A worker stayed idle past its timeout.
         IdleTimeout = "idle_timeout",
         /// An in-service instance had no connected worker for its fleet's boot grace.

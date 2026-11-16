@@ -223,12 +223,12 @@ mod tests {
     use crate::cli::Command;
 
     fn gang_deploy(args: &[&str], stdin: &str) -> (ExitCode, String, String) {
-        let argv: Vec<OsString> = ["gang", "deploy"]
+        let command_line: Vec<OsString> = ["gang", "deploy"]
             .into_iter()
             .chain(args.iter().copied())
             .map(OsString::from)
             .collect();
-        let parsed = crate::dispatch::parse(&argv).expect("valid deploy arguments");
+        let parsed = crate::dispatch::parse(&command_line).expect("valid deploy arguments");
         let Command::Deploy(command) = parsed.command else {
             panic!("expected a deploy command");
         };
@@ -239,335 +239,425 @@ mod tests {
         (code, stdout.text(), stderr.text())
     }
 
-    #[test]
-    fn every_deploy_command_maps_its_input_to_its_output_and_exit_code() {
-        const HEAD: &str = "1111111111111111111111111111111111111111";
-        const BASE: &str = "2222222222222222222222222222222222222222";
-        const MERGE: &str = "3333333333333333333333333333333333333333";
-        const TREE: &str = "4444444444444444444444444444444444444444";
-        const MAIN: &str = "6666666666666666666666666666666666666666";
-        const REPOSITORY: &str = "example-org/gang";
-        const WORKFLOW: &str = "example-org/gang/.github/workflows/infra.yml@refs/heads/main";
-        const EMPTY_PLAN: &str = "{}";
-        const BLOCKED_PLAN: &str = r#"{"resource_changes":[{"address":"aws_kms_key.state","type":"aws_kms_key","change":{"actions":["delete"]}}]}"#;
-        const RESTART_PLAN: &str = r#"{"resource_changes":[{"address":"module.gang.aws_ssm_parameter.config","type":"aws_ssm_parameter","change":{"actions":["update"],"before":{"value":"a"},"after":{"value":"b"},"after_unknown":{}}}]}"#;
+    const HEAD: &str = "1111111111111111111111111111111111111111";
+    const BASE: &str = "2222222222222222222222222222222222222222";
+    const MERGE: &str = "3333333333333333333333333333333333333333";
+    const TREE: &str = "4444444444444444444444444444444444444444";
+    const MAIN: &str = "6666666666666666666666666666666666666666";
+    const REPOSITORY: &str = "example-org/gang";
+    const WORKFLOW: &str = "example-org/gang/.github/workflows/infra.yml@refs/heads/main";
+    const EMPTY_PLAN: &str = "{}";
+    const BLOCKED_PLAN: &str = r#"{"resource_changes":[{"address":"aws_kms_key.state","type":"aws_kms_key","change":{"actions":["delete"]}}]}"#;
+    const RESTART_PLAN: &str = r#"{"resource_changes":[{"address":"module.gang.aws_ssm_parameter.config","type":"aws_ssm_parameter","change":{"actions":["update"],"before":{"value":"a"},"after":{"value":"b"},"after_unknown":{}}}]}"#;
 
-        struct Case<'a> {
-            args: Vec<&'a str>,
-            stdin: &'a str,
-            code: ExitCode,
-            stdout: &'a str,
-            stderr: Option<&'a str>,
+    struct Case<'a> {
+        args: Vec<&'a str>,
+        stdin: &'a str,
+        code: ExitCode,
+        stdout: &'a str,
+        stderr: Option<&'a str>,
+    }
+
+    struct Fixtures {
+        _dir: tempfile::TempDir,
+        plan_file: String,
+        wrong_plan_file: String,
+        manifest_file: String,
+        request_text: String,
+        expected_request: String,
+        expected_manifest: String,
+        tree_comment: String,
+        manifest_comment: String,
+        comments: String,
+        pulls: String,
+        expected_pull: String,
+        evidence: String,
+        versions: String,
+        object: String,
+    }
+
+    impl Fixtures {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("create deploy test directory");
+            let plan_path = dir.path().join("plan");
+            let wrong_plan_path = dir.path().join("wrong-plan");
+            let manifest_path = dir.path().join("manifest.json");
+            fs::write(&plan_path, b"plan bytes\n").expect("write plan");
+            fs::write(&wrong_plan_path, b"other bytes\n").expect("write different plan");
+            let plan_file = plan_path.to_str().expect("UTF-8 plan path").to_owned();
+            let wrong_plan_file = wrong_plan_path
+                .to_str()
+                .expect("UTF-8 wrong plan path")
+                .to_owned();
+            let manifest_file = manifest_path
+                .to_str()
+                .expect("UTF-8 manifest path")
+                .to_owned();
+
+            let plan: Plan = EMPTY_PLAN.parse().expect("parse empty plan");
+            let request = StoreRequest::try_new(
+                StoreInputs {
+                    repository: REPOSITORY.parse().expect("repository"),
+                    repository_id: "42".parse().expect("repository id"),
+                    pr_number: "7".parse().expect("pull request number"),
+                    pr_head_sha: HEAD.parse().expect("head sha"),
+                    sha: MERGE.parse().expect("merge sha"),
+                    head: MERGE.parse().expect("checked out sha"),
+                    parents: vec![
+                        BASE.parse().expect("base sha"),
+                        HEAD.parse().expect("head sha"),
+                    ],
+                    tree_sha: TREE.parse().expect("tree sha"),
+                    run_id: "99".parse().expect("run id"),
+                    run_attempt: "2".parse().expect("run attempt"),
+                    prefix: "plans".parse().expect("prefix"),
+                    max_age: MaxAge::try_from(Duration::from_hours(24)).expect("positive max age"),
+                    now: UnixTime::from_seconds(1_767_312_000),
+                },
+                &plan,
+                PlanSha256::digest(b"plan bytes\n"),
+            )
+            .expect("construct store request");
+            let request_text = request.to_string();
+            let manifest = request.into_manifest("ver-1".parse().expect("plan version"));
+            let manifest_text = manifest.to_string();
+            fs::write(&manifest_path, &manifest_text).expect("write manifest");
+            let comments_value = Self::comments_value(&manifest);
+            let pulls_value = Self::pulls_value();
+            Self {
+                _dir: dir,
+                plan_file,
+                wrong_plan_file,
+                manifest_file,
+                expected_request: format!("{request_text}\n"),
+                request_text,
+                expected_manifest: format!("{manifest_text}\n"),
+                tree_comment: Self::tree_comment(),
+                manifest_comment: Self::manifest_comment(&manifest),
+                comments: comments_value.to_string(),
+                pulls: pulls_value.to_string(),
+                expected_pull: format!("7 {HEAD}\n"),
+                evidence: Self::evidence(&pulls_value, &comments_value),
+                versions: Self::versions(&manifest),
+                object: Self::object(&manifest),
+            }
         }
 
-        let dir = tempfile::tempdir().expect("create deploy test directory");
-        let plan_path = dir.path().join("plan");
-        let wrong_plan_path = dir.path().join("wrong-plan");
-        let manifest_path = dir.path().join("manifest.json");
-        fs::write(&plan_path, b"plan bytes\n").expect("write plan");
-        fs::write(&wrong_plan_path, b"other bytes\n").expect("write different plan");
-        let plan_file = plan_path.to_str().expect("UTF-8 plan path");
-        let wrong_plan_file = wrong_plan_path.to_str().expect("UTF-8 wrong plan path");
-        let manifest_file = manifest_path.to_str().expect("UTF-8 manifest path");
+        /// Builds the expected comment for a failed plan.
+        fn tree_comment() -> String {
+            let body = format!(
+                "<!-- gang-deploy-plan -->\n## Infrastructure plan\n\nTree: `{TREE}`\n\n\
+                 **Plan did not complete.** See the workflow run logs.\n"
+            );
+            format!("{}\n", json!({"body": body}))
+        }
 
-        let plan: Plan = EMPTY_PLAN.parse().expect("parse empty plan");
-        let request = StoreRequest::try_new(
-            StoreInputs {
-                repository: REPOSITORY.parse().expect("repository"),
-                repository_id: "42".parse().expect("repository id"),
-                pr_number: "7".parse().expect("pull request number"),
-                pr_head_sha: HEAD.parse().expect("head sha"),
-                sha: MERGE.parse().expect("merge sha"),
-                head: MERGE.parse().expect("checked out sha"),
-                parents: vec![
-                    BASE.parse().expect("base sha"),
-                    HEAD.parse().expect("head sha"),
-                ],
-                tree_sha: TREE.parse().expect("tree sha"),
-                run_id: "99".parse().expect("run id"),
-                run_attempt: "2".parse().expect("run attempt"),
-                prefix: "plans".parse().expect("prefix"),
-                max_age: MaxAge::try_from(Duration::from_secs(86_400)).expect("positive max age"),
-                now: UnixTime::from_seconds(1_767_312_000),
-            },
-            &plan,
-            PlanSha256::digest(b"plan bytes\n"),
-        )
-        .expect("construct store request");
-        let request_text = request.to_string();
-        let manifest = request.into_manifest("ver-1".parse().expect("plan version"));
-        let manifest_text = manifest.to_string();
-        fs::write(&manifest_path, &manifest_text).expect("write manifest");
-        let expected_request = format!("{request_text}\n");
-        let expected_manifest = format!("{manifest_text}\n");
+        /// Builds the expected comment for a completed plan.
+        fn manifest_comment(manifest: &Manifest) -> String {
+            let body = format!(
+                "<!-- gang-deploy-plan -->\n## Infrastructure plan\n\nTree: `{TREE}`\n\n\
+                 No changes.\n\n| Action | Count |\n| --- | ---: |\n| create | 0 |\n\
+                 | update | 0 |\n| delete | 0 |\n| replace | 0 |\n\nChanged resources:\n\n\n{}\n",
+                manifest.comment_line()
+            );
+            format!("{}\n", json!({"body": body}))
+        }
 
-        let tree_body = format!(
-            "<!-- gang-deploy-plan -->\n## Infrastructure plan\n\nTree: `{TREE}`\n\n\
-             **Plan did not complete.** See the workflow run logs.\n"
-        );
-        let tree_comment = format!("{}\n", json!({"body": tree_body}));
-        let manifest_body = format!(
-            "<!-- gang-deploy-plan -->\n## Infrastructure plan\n\nTree: `{TREE}`\n\n\
-             No changes.\n\n| Action | Count |\n| --- | ---: |\n| create | 0 |\n\
-             | update | 0 |\n| delete | 0 |\n| replace | 0 |\n\nChanged resources:\n\n\n{}\n",
-            manifest.comment_line()
-        );
-        let manifest_comment = format!("{}\n", json!({"body": manifest_body}));
-        let comments_value = json!([{
-            "id": 12,
-            "user": {"login": "github-actions[bot]", "type": "Bot"},
-            "body": format!("<!-- gang-deploy-plan -->\n{}\n", manifest.comment_line())
-        }]);
-        let comments = comments_value.to_string();
-        let pulls_value = json!([{
-            "number": 7,
-            "merged_at": "2026-01-02T00:00:00Z",
-            "merge_commit_sha": MAIN,
-            "head": {"sha": HEAD, "repo": {"full_name": REPOSITORY}}
-        }]);
-        let pulls = pulls_value.to_string();
-        let workflow_run = json!({
-            "id": 99, "run_attempt": 2, "run_started_at": "2026-01-02T00:00:00Z",
-            "head_sha": HEAD, "event": "pull_request", "status": "completed",
-            "conclusion": "success", "path": ".github/workflows/infra.yml",
-            "head_repository": {"full_name": REPOSITORY}, "repository": {"id": 42}
-        });
-        let evidence = json!({
-            "pulls": pulls_value, "comments": comments_value,
-            "run": workflow_run, "runs": {"workflow_runs": [workflow_run]}
-        })
-        .to_string();
-        let versions = json!({
-            "Versions": [{"Key": manifest.plan_key.as_str(), "VersionId": "ver-1"}]
-        })
-        .to_string();
-        let metadata: serde_json::Map<String, serde_json::Value> = manifest
-            .facts
-            .object_metadata()
-            .pairs()
-            .iter()
-            .map(|(name, value)| ((*name).to_owned(), json!(value)))
-            .collect();
-        let object = json!({
-            "LastModified": "2026-01-02T00:00:00Z", "Metadata": metadata
-        })
-        .to_string();
-        let expected_pull = format!("7 {HEAD}\n");
-        let cases = [
-            Case {
-                args: vec!["policy"],
-                stdin: EMPTY_PLAN,
-                code: ExitCode::SUCCESS,
-                stdout: "has_changes=false\nblocked=false\n",
-                stderr: None,
-            },
-            Case {
-                args: vec!["policy"],
-                stdin: BLOCKED_PLAN,
-                code: ExitCode::from(3),
-                stdout: "has_changes=true\nblocked=true\n",
-                stderr: Some("aws_kms_key.state"),
-            },
-            Case {
-                args: vec!["restart-needed"],
-                stdin: RESTART_PLAN,
-                code: ExitCode::SUCCESS,
-                stdout: "true\n",
-                stderr: None,
-            },
-            Case {
-                args: vec![
-                    "store-request",
-                    "--repository",
-                    REPOSITORY,
-                    "--repository-id",
-                    "42",
-                    "--pr-number",
-                    "7",
-                    "--pr-head-sha",
-                    HEAD,
-                    "--sha",
-                    MERGE,
-                    "--head",
-                    MERGE,
-                    "--parent",
-                    BASE,
-                    "--parent",
-                    HEAD,
-                    "--tree-sha",
-                    TREE,
-                    "--run-id",
-                    "99",
-                    "--run-attempt",
-                    "2",
-                    "--prefix",
-                    "plans",
-                    "--max-age",
-                    "24h",
-                    "--now",
-                    "1767312000",
-                    "--plan-file",
-                    plan_file,
-                ],
-                stdin: EMPTY_PLAN,
-                code: ExitCode::SUCCESS,
-                stdout: &expected_request,
-                stderr: None,
-            },
-            Case {
-                args: vec!["manifest", "--plan-version", "ver-1"],
-                stdin: &request_text,
-                code: ExitCode::SUCCESS,
-                stdout: &expected_manifest,
-                stderr: None,
-            },
-            Case {
-                args: vec!["comment", "--tree", TREE],
-                stdin: "",
-                code: ExitCode::SUCCESS,
-                stdout: &tree_comment,
-                stderr: None,
-            },
-            Case {
-                args: vec!["comment", "--manifest", manifest_file],
-                stdin: EMPTY_PLAN,
-                code: ExitCode::SUCCESS,
-                stdout: &manifest_comment,
-                stderr: None,
-            },
-            Case {
-                args: vec!["comment-id"],
-                stdin: &comments,
-                code: ExitCode::SUCCESS,
-                stdout: "12\n",
-                stderr: None,
-            },
-            Case {
-                args: vec!["comment-id"],
-                stdin: "[]",
-                code: ExitCode::SUCCESS,
-                stdout: "",
-                stderr: None,
-            },
-            Case {
-                args: vec!["merged-pr", "--sha", MAIN, "--repository", REPOSITORY],
-                stdin: &pulls,
-                code: ExitCode::SUCCESS,
-                stdout: &expected_pull,
-                stderr: None,
-            },
-            Case {
-                args: vec!["plan-comment"],
-                stdin: &comments,
-                code: ExitCode::SUCCESS,
-                stdout: &expected_manifest,
-                stderr: None,
-            },
-            Case {
-                args: vec![
-                    "workflow-file",
-                    "--ref",
-                    "example-org/gang/.github/workflows/ci.yml@refs/heads/main",
-                ],
-                stdin: "",
-                code: ExitCode::SUCCESS,
-                stdout: "ci.yml\n",
-                stderr: None,
-            },
-            Case {
-                args: vec![
-                    "workflow-file",
-                    "--ref",
-                    "example-org/gang/ci.yml@refs/heads/main",
-                ],
-                stdin: "",
-                code: ExitCode::FAILURE,
-                stdout: "",
-                stderr: Some("workflow ref has no .github/workflows/"),
-            },
-            Case {
-                args: vec![
-                    "resolve",
-                    "--ref",
-                    "refs/heads/main",
-                    "--head",
-                    MAIN,
-                    "--sha",
-                    MAIN,
-                    "--parent",
-                    BASE,
-                    "--tree-sha",
-                    TREE,
-                    "--repository",
-                    REPOSITORY,
-                    "--repository-id",
-                    "42",
-                    "--prefix",
-                    "plans",
-                    "--workflow-ref",
-                    WORKFLOW,
-                ],
-                stdin: &evidence,
-                code: ExitCode::SUCCESS,
-                stdout: &expected_manifest,
-                stderr: None,
-            },
-            Case {
-                args: vec!["check-versions", "--manifest", manifest_file],
-                stdin: &versions,
-                code: ExitCode::SUCCESS,
-                stdout: "",
-                stderr: None,
-            },
-            Case {
-                args: vec![
-                    "check-object",
-                    "--manifest",
-                    manifest_file,
-                    "--now",
-                    "1767312001",
-                    "--max-age",
-                    "24h",
-                ],
-                stdin: &object,
-                code: ExitCode::SUCCESS,
-                stdout: "",
-                stderr: None,
-            },
-            Case {
-                args: vec![
-                    "check-plan",
-                    "--manifest",
-                    manifest_file,
-                    "--plan-file",
-                    plan_file,
-                ],
-                stdin: "",
-                code: ExitCode::SUCCESS,
-                stdout: "",
-                stderr: None,
-            },
-            Case {
-                args: vec![
-                    "check-plan",
-                    "--manifest",
-                    manifest_file,
-                    "--plan-file",
-                    wrong_plan_file,
-                ],
-                stdin: "",
-                code: ExitCode::FAILURE,
-                stdout: "",
-                stderr: Some("plan sha256 mismatch"),
-            },
-            Case {
-                args: vec!["policy"],
-                stdin: "not JSON",
-                code: ExitCode::FAILURE,
-                stdout: "",
-                stderr: Some("cannot read plan JSON"),
-            },
-        ];
+        /// Builds the comments used by comment and evidence commands.
+        fn comments_value(manifest: &Manifest) -> serde_json::Value {
+            json!([{
+                "id": 12,
+                "user": {"login": "github-actions[bot]", "type": "Bot"},
+                "body": format!("<!-- gang-deploy-plan -->\n{}\n", manifest.comment_line())
+            }])
+        }
+
+        /// Builds the pull requests used by pull and evidence commands.
+        fn pulls_value() -> serde_json::Value {
+            json!([{
+                "number": 7,
+                "merged_at": "2026-01-02T00:00:00Z",
+                "merge_commit_sha": MAIN,
+                "head": {"sha": HEAD, "repo": {"full_name": REPOSITORY}}
+            }])
+        }
+
+        /// Builds the workflow evidence document.
+        fn evidence(pulls: &serde_json::Value, comments: &serde_json::Value) -> String {
+            let workflow_run = json!({
+                "id": 99, "run_attempt": 2, "run_started_at": "2026-01-02T00:00:00Z",
+                "head_sha": HEAD, "event": "pull_request", "status": "completed",
+                "conclusion": "success", "path": ".github/workflows/infra.yml",
+                "head_repository": {"full_name": REPOSITORY}, "repository": {"id": 42}
+            });
+            json!({
+                "pulls": pulls, "comments": comments,
+                "run": workflow_run, "runs": {"workflow_runs": [workflow_run]}
+            })
+            .to_string()
+        }
+
+        /// Builds the plan object version listing.
+        fn versions(manifest: &Manifest) -> String {
+            json!({
+                "Versions": [{"Key": manifest.plan_key.as_str(), "VersionId": "ver-1"}]
+            })
+            .to_string()
+        }
+
+        /// Builds the plan object head.
+        fn object(manifest: &Manifest) -> String {
+            let metadata: serde_json::Map<String, serde_json::Value> = manifest
+                .facts
+                .object_metadata()
+                .pairs()
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), json!(value)))
+                .collect();
+            json!({
+                "LastModified": "2026-01-02T00:00:00Z", "Metadata": metadata
+            })
+            .to_string()
+        }
+
+        fn plan_cases(&self) -> Vec<Case<'_>> {
+            vec![
+                Case {
+                    args: vec!["policy"],
+                    stdin: EMPTY_PLAN,
+                    code: ExitCode::SUCCESS,
+                    stdout: "has_changes=false\nblocked=false\n",
+                    stderr: None,
+                },
+                Case {
+                    args: vec!["policy"],
+                    stdin: BLOCKED_PLAN,
+                    code: ExitCode::from(3),
+                    stdout: "has_changes=true\nblocked=true\n",
+                    stderr: Some("aws_kms_key.state"),
+                },
+                Case {
+                    args: vec!["restart-needed"],
+                    stdin: RESTART_PLAN,
+                    code: ExitCode::SUCCESS,
+                    stdout: "true\n",
+                    stderr: None,
+                },
+                Case {
+                    args: vec![
+                        "store-request",
+                        "--repository",
+                        REPOSITORY,
+                        "--repository-id",
+                        "42",
+                        "--pr-number",
+                        "7",
+                        "--pr-head-sha",
+                        HEAD,
+                        "--sha",
+                        MERGE,
+                        "--head",
+                        MERGE,
+                        "--parent",
+                        BASE,
+                        "--parent",
+                        HEAD,
+                        "--tree-sha",
+                        TREE,
+                        "--run-id",
+                        "99",
+                        "--run-attempt",
+                        "2",
+                        "--prefix",
+                        "plans",
+                        "--max-age",
+                        "24h",
+                        "--now",
+                        "1767312000",
+                        "--plan-file",
+                        &self.plan_file,
+                    ],
+                    stdin: EMPTY_PLAN,
+                    code: ExitCode::SUCCESS,
+                    stdout: &self.expected_request,
+                    stderr: None,
+                },
+                Case {
+                    args: vec!["manifest", "--plan-version", "ver-1"],
+                    stdin: &self.request_text,
+                    code: ExitCode::SUCCESS,
+                    stdout: &self.expected_manifest,
+                    stderr: None,
+                },
+                Case {
+                    args: vec!["policy"],
+                    stdin: "not JSON",
+                    code: ExitCode::FAILURE,
+                    stdout: "",
+                    stderr: Some("cannot read plan JSON"),
+                },
+            ]
+        }
+
+        fn comment_cases(&self) -> Vec<Case<'_>> {
+            vec![
+                Case {
+                    args: vec!["comment", "--tree", TREE],
+                    stdin: "",
+                    code: ExitCode::SUCCESS,
+                    stdout: &self.tree_comment,
+                    stderr: None,
+                },
+                Case {
+                    args: vec!["comment", "--manifest", &self.manifest_file],
+                    stdin: EMPTY_PLAN,
+                    code: ExitCode::SUCCESS,
+                    stdout: &self.manifest_comment,
+                    stderr: None,
+                },
+                Case {
+                    args: vec!["comment-id"],
+                    stdin: &self.comments,
+                    code: ExitCode::SUCCESS,
+                    stdout: "12\n",
+                    stderr: None,
+                },
+                Case {
+                    args: vec!["comment-id"],
+                    stdin: "[]",
+                    code: ExitCode::SUCCESS,
+                    stdout: "",
+                    stderr: None,
+                },
+                Case {
+                    args: vec!["merged-pr", "--sha", MAIN, "--repository", REPOSITORY],
+                    stdin: &self.pulls,
+                    code: ExitCode::SUCCESS,
+                    stdout: &self.expected_pull,
+                    stderr: None,
+                },
+                Case {
+                    args: vec!["plan-comment"],
+                    stdin: &self.comments,
+                    code: ExitCode::SUCCESS,
+                    stdout: &self.expected_manifest,
+                    stderr: None,
+                },
+                Case {
+                    args: vec![
+                        "workflow-file",
+                        "--ref",
+                        "example-org/gang/.github/workflows/ci.yml@refs/heads/main",
+                    ],
+                    stdin: "",
+                    code: ExitCode::SUCCESS,
+                    stdout: "ci.yml\n",
+                    stderr: None,
+                },
+                Case {
+                    args: vec![
+                        "workflow-file",
+                        "--ref",
+                        "example-org/gang/ci.yml@refs/heads/main",
+                    ],
+                    stdin: "",
+                    code: ExitCode::FAILURE,
+                    stdout: "",
+                    stderr: Some("workflow ref has no .github/workflows/"),
+                },
+            ]
+        }
+
+        fn check_cases(&self) -> Vec<Case<'_>> {
+            vec![
+                Case {
+                    args: vec![
+                        "resolve",
+                        "--ref",
+                        "refs/heads/main",
+                        "--head",
+                        MAIN,
+                        "--sha",
+                        MAIN,
+                        "--parent",
+                        BASE,
+                        "--tree-sha",
+                        TREE,
+                        "--repository",
+                        REPOSITORY,
+                        "--repository-id",
+                        "42",
+                        "--prefix",
+                        "plans",
+                        "--workflow-ref",
+                        WORKFLOW,
+                    ],
+                    stdin: &self.evidence,
+                    code: ExitCode::SUCCESS,
+                    stdout: &self.expected_manifest,
+                    stderr: None,
+                },
+                Case {
+                    args: vec!["check-versions", "--manifest", &self.manifest_file],
+                    stdin: &self.versions,
+                    code: ExitCode::SUCCESS,
+                    stdout: "",
+                    stderr: None,
+                },
+                Case {
+                    args: vec![
+                        "check-object",
+                        "--manifest",
+                        &self.manifest_file,
+                        "--now",
+                        "1767312001",
+                        "--max-age",
+                        "24h",
+                    ],
+                    stdin: &self.object,
+                    code: ExitCode::SUCCESS,
+                    stdout: "",
+                    stderr: None,
+                },
+                Case {
+                    args: vec![
+                        "check-plan",
+                        "--manifest",
+                        &self.manifest_file,
+                        "--plan-file",
+                        &self.plan_file,
+                    ],
+                    stdin: "",
+                    code: ExitCode::SUCCESS,
+                    stdout: "",
+                    stderr: None,
+                },
+                Case {
+                    args: vec![
+                        "check-plan",
+                        "--manifest",
+                        &self.manifest_file,
+                        "--plan-file",
+                        &self.wrong_plan_file,
+                    ],
+                    stdin: "",
+                    code: ExitCode::FAILURE,
+                    stdout: "",
+                    stderr: Some("plan sha256 mismatch"),
+                },
+            ]
+        }
+    }
+
+    #[test]
+    fn every_deploy_command_maps_its_input_to_its_output_and_exit_code() {
+        let fixtures = Fixtures::new();
+        run_cases(fixtures.plan_cases());
+        run_cases(fixtures.comment_cases());
+        run_cases(fixtures.check_cases());
+    }
+
+    fn run_cases(cases: Vec<Case<'_>>) {
         for case in cases {
             let (code, stdout, stderr) = gang_deploy(&case.args, case.stdin);
             assert_eq!(code, case.code, "{:?}: {stderr}", case.args);
@@ -578,7 +668,10 @@ mod tests {
                 assert_eq!(stderr, "", "{:?}", case.args);
             }
         }
+    }
 
+    #[test]
+    fn comment_requires_a_source() {
         let argv: Vec<OsString> = ["gang", "deploy", "comment"]
             .into_iter()
             .map(OsString::from)

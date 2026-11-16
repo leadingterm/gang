@@ -6,9 +6,11 @@ import { applyDelta, tickContinues } from "./store.ts";
 import { idOf, ms, seconds, type UnixMs } from "./wire-parse.ts";
 import {
   PATHS,
+  type Build,
   type Closed,
   type Delta,
   type Frame,
+  type ListBuildsResponse,
   type ListEventsResponse,
   type ListPrincipalsResponse,
   type ListRolesResponse,
@@ -73,6 +75,41 @@ export type Earlier =
 /** Whether older events than those loaded may exist. */
 export const earlierMore = (earlier: Earlier): boolean => earlier.kind === "unloaded" || earlier.next !== undefined;
 
+/** The result of loading a build's full view. */
+export type BuildDetail =
+  | { readonly kind: "loading"; readonly id: string }
+  /** `asOf` is the server time of the last successful load; `failing` says the latest reload failed, so `build` is as of `asOf`. */
+  | { readonly kind: "loaded"; readonly id: string; readonly build: Build; readonly asOf: UnixMs; readonly failing: boolean }
+  | { readonly kind: "missing"; readonly id: string }
+  | { readonly kind: "error"; readonly id: string };
+
+/** Pages of held builds loaded independently of the state stream. */
+export type EarlierBuilds =
+  | { readonly kind: "unloaded"; readonly loading: boolean }
+  /** The first page failed: nothing is known yet, and the next load retries. */
+  | { readonly kind: "error"; readonly loading: boolean }
+  /** `asOf` is the server time of the first page's last successful load; `failing` says the latest refresh failed, so `builds` are as of `asOf`. */
+  | {
+      readonly kind: "loaded";
+      readonly builds: readonly Build[];
+      readonly next: string | undefined;
+      readonly loading: boolean;
+      readonly asOf: UnixMs;
+      readonly failing: boolean;
+    };
+
+/** An HTTP response that did not succeed. */
+export class HttpError extends Error {
+  readonly status: number;
+  constructor(status: number) {
+    super(`HTTP ${status}`);
+    this.status = status;
+  }
+}
+
+/** How often a session with `builds.read` but no state stream reloads the builds it shows. */
+export const BUILDS_REFRESH_MS = 5_000;
+
 const BACKOFF_FIRST_MS = 1000;
 const BACKOFF_MAX_MS = 30000;
 /** The session renews when time left drops below max(1 minute, 20%), but never earlier than half its remaining life. */
@@ -82,7 +119,7 @@ const PRINCIPALS_PAGE = 500;
 const REVOKED_FILTER = "revokeTime:*";
 const EARLIER_PAGE = 200;
 /** The largest page size the server grants. */
-const PAGE_MAX = 1000;
+export const PAGE_MAX = 1000;
 const NO_EARLIER: Earlier = { kind: "unloaded", loading: false };
 
 const seqOf = (e: ScalingEvent): number => Number(idOf(e.name));
@@ -91,6 +128,9 @@ const withQuery = (path: string, params: Readonly<Record<string, string>>): stri
   const query = new URLSearchParams(params).toString();
   return query === "" ? path : `${path}?${query}`;
 };
+
+/** A refused request the session must classify: no valid credential (401) or no longer permitted (403). */
+const refused = (error: unknown): boolean => error instanceof HttpError && (error.status === 401 || error.status === 403);
 
 /**
  * Keeps a loaded page contiguous with the streamed events: events the stream stopped holding move
@@ -118,6 +158,8 @@ export class StateClient {
   readonly session = signal<Session | null>(null);
   readonly access = signal<Access | null>(null);
   readonly earlier = signal<Earlier>(NO_EARLIER);
+  readonly build = signal<BuildDetail | null>(null);
+  readonly earlierBuilds = signal<EarlierBuilds>({ kind: "unloaded", loading: false });
   /** The server clock, advanced once a second between frames. */
   readonly now = signal<UnixMs>(0);
 
@@ -128,8 +170,13 @@ export class StateClient {
   #failures = 0;
   #cancelRetry: (() => void) | null = null;
   #cancelRenewal: (() => void) | null = null;
+  #cancelBuildsRefresh: (() => void) | null = null;
+  /** Bumped whenever the builds refresh stops; a refresh or refusal probe of an older generation does nothing more. */
+  #buildsRefreshGeneration = 0;
   #accessEpoch: number | null = null;
   #earlierGeneration = 0;
+  #buildGeneration = 0;
+  #earlierBuildsGeneration = 0;
   /** A `loadMorePrincipals` request is in flight; a second call would repeat its page token. */
   #morePending = false;
   readonly #env: Environment;
@@ -159,6 +206,68 @@ export class StateClient {
     this.#closeSource();
     this.#cancelRetry?.();
     this.#cancelRenewal?.();
+    this.#stopBuildsRefresh();
+  }
+
+  /** Loads a build's full view, discarding superseded responses; a failed reload keeps the build shown, marked failing. */
+  async loadBuild(id: string): Promise<void> {
+    const error = await this.#loadBuild(id);
+    if (this.link.value.kind === "forbidden" && refused(error)) void this.#onRefused();
+  }
+
+  /** Forgets the open build; the Build page calls it when it unmounts, so only a shown build is reloaded. */
+  closeBuild(): void {
+    this.#buildGeneration += 1;
+    this.build.value = null;
+  }
+
+  /** As `loadBuild`; resolves to the request's error, if any, for the builds refresh to classify. */
+  async #loadBuild(id: string): Promise<unknown> {
+    const generation = ++this.#buildGeneration;
+    const shown = this.build.value;
+    if (shown?.kind !== "loaded" || shown.id !== id) this.build.value = { kind: "loading", id };
+    try {
+      const build = await this.#get<Build>(PATHS.getBuild.replace("{build}", encodeURIComponent(id)), {});
+      if (generation === this.#buildGeneration) this.build.value = { kind: "loaded", id, build, asOf: this.serverNow(), failing: false };
+      return undefined;
+    } catch (error) {
+      if (generation === this.#buildGeneration) {
+        const latest = this.build.value;
+        this.build.value = error instanceof HttpError && error.status === 404
+          ? { kind: "missing", id }
+          : latest?.kind === "loaded" ? { ...latest, failing: true } : { kind: "error", id };
+      }
+      return error;
+    }
+  }
+
+  /** Loads the next page of held builds; it supersedes a refresh in flight, and a refresh never supersedes it. */
+  async loadEarlierBuilds(): Promise<void> {
+    const current = this.earlierBuilds.value;
+    if (current.loading || (current.kind === "loaded" && current.next === undefined)) return;
+    const generation = ++this.#earlierBuildsGeneration;
+    this.earlierBuilds.value = { ...current, loading: true };
+    const params = current.kind === "loaded" && current.next !== undefined
+      ? { pageSize: String(EARLIER_PAGE), pageToken: current.next }
+      : { pageSize: String(EARLIER_PAGE) };
+    try {
+      const page = await this.#get<ListBuildsResponse>(PATHS.listBuilds, params);
+      if (generation !== this.#earlierBuildsGeneration) return;
+      const latest = this.earlierBuilds.value;
+      const builds = latest.kind === "loaded" ? latest.builds : [];
+      const names = new Set(builds.map((build) => build.name));
+      const live = new Map((this.state.value?.builds ?? []).map((build) => [build.name, build]));
+      const added = page.builds.filter((build) => !names.has(build.name)).map((build) => live.get(build.name) ?? build);
+      this.earlierBuilds.value = latest.kind === "loaded"
+        ? { ...latest, builds: [...builds, ...added], next: page.nextPageToken, loading: false }
+        : { kind: "loaded", builds: added, next: page.nextPageToken, loading: false, asOf: this.serverNow(), failing: false };
+    } catch (error) {
+      if (generation === this.#earlierBuildsGeneration) {
+        const latest = this.earlierBuilds.value;
+        this.earlierBuilds.value = latest.kind === "loaded" ? { ...latest, loading: false } : { kind: "error", loading: false };
+      }
+      if (this.link.value.kind === "forbidden" && refused(error)) void this.#onRefused();
+    }
   }
 
   /**
@@ -241,6 +350,81 @@ export class StateClient {
     }
   }
 
+  #scheduleBuildsRefresh(): void {
+    this.#cancelBuildsRefresh?.();
+    this.#cancelBuildsRefresh = this.#env.schedule(() => {
+      this.#cancelBuildsRefresh = null;
+      void this.#refreshBuilds();
+    }, BUILDS_REFRESH_MS);
+  }
+
+  #stopBuildsRefresh(): void {
+    this.#cancelBuildsRefresh?.();
+    this.#cancelBuildsRefresh = null;
+    this.#buildsRefreshGeneration += 1;
+  }
+
+  /** Reloads the loaded held builds and the open build together, then refreshes again or hands a refusal to the session. */
+  async #refreshBuilds(): Promise<void> {
+    const generation = this.#buildsRefreshGeneration;
+    const open = this.build.value;
+    const errors = await Promise.all([
+      this.#refreshEarlierBuilds(),
+      open?.kind === "loaded" ? this.#loadBuild(open.id) : undefined,
+    ]);
+    if (generation !== this.#buildsRefreshGeneration) return;
+    if (errors.some(refused)) void this.#onRefused();
+    else this.#scheduleBuildsRefresh();
+  }
+
+  /** Replaces the loaded held builds with as many of the newest, at most `PAGE_MAX`; skipped while a page is loading. */
+  async #refreshEarlierBuilds(): Promise<unknown> {
+    const current = this.earlierBuilds.value;
+    if (current.kind !== "loaded" || current.loading) return undefined;
+    const generation = ++this.#earlierBuildsGeneration;
+    try {
+      const page = await this.#get<ListBuildsResponse>(PATHS.listBuilds, {
+        pageSize: String(Math.min(PAGE_MAX, Math.max(EARLIER_PAGE, current.builds.length))),
+      });
+      if (generation === this.#earlierBuildsGeneration) {
+        this.earlierBuilds.value = { kind: "loaded", builds: page.builds, next: page.nextPageToken, loading: false, asOf: this.serverNow(), failing: false };
+      }
+      return undefined;
+    } catch (error) {
+      if (generation === this.#earlierBuildsGeneration) {
+        const latest = this.earlierBuilds.value;
+        if (latest.kind === "loaded") this.earlierBuilds.value = { ...latest, failing: true };
+      }
+      return error;
+    }
+  }
+
+  /** A build request was refused (401 or 403): the session decides, as `#onFailure` does for the stream. */
+  async #onRefused(): Promise<void> {
+    this.#stopBuildsRefresh();
+    const generation = this.#buildsRefreshGeneration;
+    let session: Session;
+    try {
+      session = (await this.#env.fetchJson(PATHS.getSession)) as Session;
+    } catch (error) {
+      if (generation !== this.#buildsRefreshGeneration) return;
+      // `GET /v1/session` refuses only a revoked principal (403) or a malformed credential (docs/API.md).
+      if (error instanceof HttpError && error.status === 403) {
+        this.#stopBuildsRefresh();
+        this.#streamDown({ kind: "revoked" });
+        return;
+      }
+      if (this.link.value.kind === "forbidden" && (this.session.value?.permissions.includes("builds.read") ?? false)) this.#scheduleBuildsRefresh();
+      return;
+    }
+    if (generation !== this.#buildsRefreshGeneration) return;
+    if (session.principal === undefined && session.login) {
+      void this.#renew();
+      return;
+    }
+    this.#admit(session);
+  }
+
   #get<T>(path: string, params: Readonly<Record<string, string>>): Promise<T> {
     return this.#env.fetchJson(withQuery(path, params)) as Promise<T>;
   }
@@ -261,8 +445,15 @@ export class StateClient {
     return rows;
   }
 
+  /**
+   * The one owner of what a session may see. Every admission passes here (`start`, hence renewal and
+   * retries; `#onFailure`; `#onRefused`): it stops the previous admission's work, drops what the session
+   * may not read, reloads the open build, and starts the stream or the builds refresh.
+   */
   #admit(session: Session): void {
-    this.session.value = session;
+    this.#stopBuildsRefresh();
+    this.#cancelRetry?.();
+    this.#cancelRetry = null;
     this.#cancelRenewal?.();
     this.#cancelRenewal = null;
     if (session.principal !== undefined && session.login && session.expireTime !== undefined) {
@@ -271,15 +462,35 @@ export class StateClient {
       const delay = Math.max(0, left - lead);
       this.#cancelRenewal = this.#env.schedule(() => void this.#renew(), delay);
     }
-    if (session.principal === undefined) {
-      this.link.value = { kind: "signed_out" };
-      return;
-    }
-    if (!session.permissions.includes("state.read")) {
-      this.link.value = { kind: "forbidden" };
-      return;
-    }
-    this.#connect();
+    const signedIn = session.principal !== undefined;
+    const streamed = signedIn && session.permissions.includes("state.read");
+    const builds = signedIn && session.permissions.includes("builds.read");
+    batch(() => {
+      this.session.value = session;
+      if (!streamed) {
+        this.#closeSource();
+        if (this.state.value !== null) this.#resetEarlierBuilds();
+        this.state.value = null;
+        this.#earlierGeneration += 1;
+        this.earlier.value = NO_EARLIER;
+      }
+      if (!builds) {
+        this.closeBuild();
+        this.#resetEarlierBuilds();
+      } else if (this.earlierBuilds.value.kind === "error") {
+        this.#resetEarlierBuilds();
+      }
+      if (!signedIn) this.link.value = { kind: "signed_out" };
+      else if (!streamed) this.link.value = { kind: "forbidden" };
+      else if (this.link.value.kind !== "live" && this.link.value.kind !== "lost") {
+        this.#resetEarlierBuilds();
+        this.link.value = { kind: "connecting" };
+      }
+    });
+    const open = this.build.value;
+    if (open?.kind === "loaded" || open?.kind === "error") void this.#loadBuild(open.id);
+    if (streamed) this.#connect();
+    else if (builds) this.#scheduleBuildsRefresh();
   }
 
   #connect(): void {
@@ -317,6 +528,11 @@ export class StateClient {
     this.#lastFrame = at;
   }
 
+  #resetEarlierBuilds(): void {
+    this.#earlierBuildsGeneration += 1;
+    this.earlierBuilds.value = { kind: "unloaded", loading: false };
+  }
+
   /** Keeps earlier pages contiguous with the stream, invalidating in-flight pages across gaps. */
   #continueEarlier(prev: readonly ScalingEvent[], next: readonly ScalingEvent[]): void {
     const earlier = continueEarlier(this.earlier.value, prev, next);
@@ -334,6 +550,7 @@ export class StateClient {
     this.#failures = 0;
     const held = this.state.value?.events ?? [];
     batch(() => {
+      this.#resetEarlierBuilds();
       this.#continueEarlier(held, state.events);
       this.state.value = state;
       this.link.value = { kind: "live", beats: 0 };
@@ -349,6 +566,15 @@ export class StateClient {
     this.#clockFrom(at);
     const next = applied.state;
     batch(() => {
+      if (delta.builds?.remove?.length) {
+        this.#resetEarlierBuilds();
+      } else if (delta.builds?.upsert?.length) {
+        const earlier = this.earlierBuilds.value;
+        if (earlier.kind === "loaded") {
+          const changes = new Map(delta.builds.upsert.map((build) => [build.name, build]));
+          this.earlierBuilds.value = { ...earlier, builds: earlier.builds.map((build) => changes.get(build.name) ?? build) };
+        }
+      }
       if (state) this.#continueEarlier(state.events, next.events);
       this.state.value = next;
       this.now.value = at;
@@ -436,7 +662,9 @@ export class StateClient {
     }, delay);
   }
 
+  /** Freezes streamed rows without replacing a build-only or revoked link. */
   #freeze(retryAt: UnixMs): void {
+    if (this.link.value.kind === "forbidden" || this.link.value.kind === "revoked") return;
     this.#streamDown({ kind: "lost", frozenAt: this.#lastFrame, retryAt });
   }
 
@@ -456,7 +684,7 @@ export const browserEnvironment = (): Environment => ({
   openStream: (path) => new EventSource(path),
   fetchJson: async (path) => {
     const response = await fetch(path, { credentials: "same-origin", headers: { accept: "application/json" } });
-    if (!response.ok) throw new Error(`${path}: ${response.status}`);
+    if (!response.ok) throw new HttpError(response.status);
     return response.json();
   },
   post: async (path) => (await fetch(path, { method: "POST", credentials: "same-origin" })).status,

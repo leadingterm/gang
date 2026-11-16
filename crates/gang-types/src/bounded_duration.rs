@@ -128,7 +128,7 @@ pub enum BoundedDurationError {
     },
     /// The duration text could not be parsed.
     #[error(transparent)]
-    Text(#[from] QuantityError),
+    Invalid(#[from] QuantityError),
 }
 
 impl<const U: u64, const MIN: u64, const MAX: u64> FromStr for BoundedDuration<U, MIN, MAX> {
@@ -171,25 +171,23 @@ mod tests {
 
     #[test]
     fn bounds_and_whole_units_are_enforced() {
+        type MillisBound = BoundedDuration<NANOS_PER_MILLI, 1, 1000>;
+
         assert!(matches!(
             TokenTtl::try_new(Duration::from_secs(59)),
             Err(BoundedDurationError::TooShort { .. })
         ));
         assert_eq!(TokenTtl::from_units(60), TokenTtl::MIN);
-        assert_eq!(
-            TokenTtl::try_new(Duration::from_secs(60)),
-            Ok(TokenTtl::MIN)
-        );
+        assert_eq!(TokenTtl::try_new(Duration::from_mins(1)), Ok(TokenTtl::MIN));
         assert_eq!(TokenTtl::from_units(3600), TokenTtl::MAX);
         assert_eq!(
-            TokenTtl::try_new(Duration::from_secs(3600)),
+            TokenTtl::try_new(Duration::from_hours(1)),
             Ok(TokenTtl::MAX)
         );
         assert!(matches!(
             TokenTtl::try_new(Duration::from_secs(3601)),
             Err(BoundedDurationError::TooLong { .. })
         ));
-        type MillisBound = BoundedDuration<NANOS_PER_MILLI, 1, 1000>;
         assert!(matches!(
             MillisBound::try_new(Duration::from_secs(u64::MAX)),
             Err(BoundedDurationError::TooLong { .. })
@@ -233,7 +231,7 @@ mod tests {
             Duration::from_millis(500)
         );
         assert_eq!(
-            MillisBound::try_new(Duration::from_millis(1000)),
+            MillisBound::try_new(Duration::from_secs(1)),
             Ok(MillisBound::MAX)
         );
         assert!(matches!(

@@ -10,6 +10,7 @@ use gang_types::{
 use serde::{Deserialize, Serialize};
 
 use crate::authentication_config::AuthenticationConfig;
+use crate::builds_config::BuildsConfig;
 use crate::ca_pin_setting::CaPinSetting;
 use crate::dashboard_config::DashboardConfig;
 use crate::errors::ConfigError;
@@ -74,6 +75,9 @@ pub struct GangConfig<P: PluginSet, F = Fleets<P>> {
     /// intervals and the optional login. The section may be omitted.
     #[serde(default)]
     pub dashboard: DashboardConfig,
+    /// Limits for in-memory build insight. The section may be omitted.
+    #[serde(default)]
+    pub builds: BuildsConfig,
 
     /// The provisioner plugin: the worker fleets' instances.
     pub provisioner: P::Provisioner,
@@ -128,6 +132,7 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
             server,
             worker,
             dashboard,
+            builds,
             provisioner,
             cache,
             signer,
@@ -170,6 +175,7 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
             server,
             worker,
             dashboard,
+            builds,
             provisioner,
             cache,
             signer,

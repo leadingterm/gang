@@ -8,6 +8,8 @@ import { ClientContext, useClient } from "./ui.tsx";
 import { Access } from "./views/access.tsx";
 import { Actions } from "./views/actions.tsx";
 import { Activity } from "./views/activity.tsx";
+import { Build } from "./views/build.tsx";
+import { Builds } from "./views/builds.tsx";
 import { Device, DeviceApproved } from "./views/device.tsx";
 import { Forbidden, SignIn, SignInError } from "./views/gate.tsx";
 import { Overview } from "./views/overview.tsx";
@@ -16,6 +18,7 @@ import { Workers } from "./views/workers.tsx";
 const SCREEN_VIEWS: Record<Screen, () => preact.JSX.Element | null> = {
   overview: Overview,
   actions: Actions,
+  builds: Builds,
   workers: Workers,
   activity: Activity,
   access: Access,
@@ -37,7 +40,7 @@ const useNavigation = (): void => {
       if (ev.defaultPrevented || ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
       const a = (ev.target as Element | null)?.closest("a");
       const href = a?.getAttribute("href");
-      if (!a || !href || a.target || !SCREENS.some((s) => s.path === href)) return;
+      if (!a || !href || a.target || (!SCREENS.some((s) => s.path === href) && routeOf(href, "").kind !== "build")) return;
       ev.preventDefault();
       go(href);
     };
@@ -70,9 +73,10 @@ const Screens = () => {
   if (r.kind === "deviceApproved") return <DeviceApproved />;
   if (link.kind === "signed_out") return <SignIn />;
   if (!client.session.value) return null;
-  const View = SCREEN_VIEWS[r.screen];
-  const blocked = link.kind === "forbidden" && r.screen !== "access";
-  return <Shell screen={r.screen}>{blocked ? <Forbidden /> : <View />}</Shell>;
+  const screen = r.kind === "build" ? "builds" : r.screen;
+  const View = SCREEN_VIEWS[screen];
+  const blocked = link.kind === "forbidden" && screen !== "access" && screen !== "builds";
+  return <Shell screen={screen}>{blocked ? <Forbidden /> : r.kind === "build" ? <Build id={r.id} /> : <View />}</Shell>;
 };
 
 export const App = ({ client }: { client: StateClient }) => (

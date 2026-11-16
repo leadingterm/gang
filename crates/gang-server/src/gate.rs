@@ -1,15 +1,15 @@
 //! The authentication gate of one listener. It asks the listener's plugin who the caller is,
 //! refuses revoked principals, records what it sees, and tells the services behind it who the
-//! caller is. On the public listener's open paths it also records the client address that the
-//! trusted proxies determine. Outside the open paths the gate stores no caller, because it admits
-//! authenticated requests only.
+//! caller is: its admission names the authenticated caller. On the public listener's open paths it
+//! also records the client address that the trusted proxies determine. Outside the open paths the
+//! gate stores no caller, because it admits authenticated requests only.
 
 use std::sync::Arc;
 
 use gang_spi::{
-    Authenticated, AuthenticationPort, Evidence, Peer, PortError, Rejection, RequestGate,
+    Admitted, Authenticated, AuthenticationPort, Evidence, Peer, PortError, Rejection, RequestGate,
 };
-use gang_wire::routes::cookie_paths;
+use gang_wire::routes::{Method as RouteMethod, accepts_cookie};
 use http::header::AUTHORIZATION;
 use http::request::Parts;
 use http::{Extensions, Method};
@@ -115,7 +115,7 @@ impl<K: Stack, P: AuthenticationPort> Gate<K, P> {
     fn session_cookie<'h>(&self, parts: &'h Parts) -> Option<&'h str> {
         self.public.as_ref()?;
         let readable = parts.method == Method::GET || parts.method == Method::HEAD;
-        if !readable || !cookie_paths().any(|path| path == parts.uri.path()) {
+        if !readable || !accepts_cookie(&RouteMethod::Get, parts.uri.path()) {
             return None;
         }
         cookie_value(&parts.headers, self.core.cookies.session)
@@ -149,8 +149,8 @@ impl<K: Stack, P: AuthenticationPort + 'static> RequestGate for Gate<K, P> {
     /// Admits the request, or refuses it with the plugin's error. On the public listener's open
     /// paths nothing is refused here: a refusal or an authenticated caller is recorded in the
     /// request's [`Caller`] for the services behind the gate to decide, and an anonymous request
-    /// stores nothing.
-    async fn admit(&self, peer: &Peer, parts: &mut Parts) -> Result<(), PortError> {
+    /// stores nothing. The result names the caller when it authenticated.
+    async fn admit(&self, peer: &Peer, parts: &mut Parts) -> Result<Admitted, PortError> {
         let open_public = self
             .public
             .as_ref()
@@ -172,7 +172,7 @@ impl<K: Stack, P: AuthenticationPort + 'static> RequestGate for Gate<K, P> {
         };
         let Some(authenticated) = authenticated else {
             return if open {
-                Ok(())
+                Ok(Admitted::Anonymous)
             } else {
                 Err(PortError::refused(Rejection::InvalidProof))
             };
@@ -189,17 +189,17 @@ impl<K: Stack, P: AuthenticationPort + 'static> RequestGate for Gate<K, P> {
         if open {
             parts
                 .extensions
-                .insert(Caller::Authenticated(authenticated));
+                .insert(Caller::Authenticated(authenticated.clone()));
         }
-        Ok(())
+        Ok(Admitted::Authenticated(authenticated))
     }
 }
 
 /// Records `error` as the refusal of an open path's request, or returns it as the gate's error.
-fn refuse(parts: &mut Parts, open: bool, error: PortError) -> Result<(), PortError> {
+fn refuse(parts: &mut Parts, open: bool, error: PortError) -> Result<Admitted, PortError> {
     if open {
         parts.extensions.insert(Caller::Refused(Arc::new(error)));
-        Ok(())
+        Ok(Admitted::Anonymous)
     } else {
         Err(error)
     }

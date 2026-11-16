@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, SystemTime};
@@ -12,13 +13,16 @@ use axum::body::Body;
 use http::{Request, Response};
 use http_body_util::BodyExt;
 use nativelink_config::cas_server::SchedulerConfig;
-use nativelink_config::schedulers::{ExperimentalSimpleSchedulerBackend, SchedulerSpec};
+use nativelink_config::schedulers::{
+    ExperimentalSimpleSchedulerBackend, SchedulerSpec, SimpleSpec,
+};
 use nativelink_error::{Code, make_err};
 use nativelink_scheduler::default_scheduler_factory::memory_awaited_action_db_factory;
 use nativelink_scheduler::historical_resource_scheduler::{
     HistoricalResourceScheduler, replica_id, snapshot_key,
 };
 use nativelink_scheduler::known_platform_property_provider::KnownPlatformPropertyProvider;
+use nativelink_scheduler::resource_sketch::ResourceSketch;
 use nativelink_scheduler::simple_scheduler::SimpleScheduler;
 use nativelink_scheduler::worker_scheduler::WorkerScheduler;
 use nativelink_service::ac_server::AcServer;
@@ -29,24 +33,28 @@ use nativelink_service::execution_server::ExecutionServer;
 use nativelink_service::wire_compression::RemoteCacheCompressionInstances;
 use nativelink_service::worker_api_server::WorkerApiServer;
 use nativelink_store::store_manager::StoreManager;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tonic::service::Routes;
 use tower::{Service, service_fn};
 
+use gang_clock::SystemClock;
 use gang_spi::{
     ApiRequestBody, ApiService, BoxedError, ControllerConnections, ControllerReady, ControllerSpec,
     RequestGate,
 };
-use gang_types::FleetCatalog;
+use gang_types::{FleetCatalog, SaturatingInto};
 
-use crate::config::NativeLinkConfig;
-use crate::counting::CountingWorkerScheduler;
+use crate::config::{Http2Tuning, NativeLinkConfig};
+use crate::enforcement::MinReservation;
 use crate::errors::NativeLinkEmbedError;
 use crate::fitted::FittedActions;
 use crate::globals;
+use crate::observer::{BuildObserverLayer, CacheCounters};
+use crate::observing::ObservingWorkerScheduler;
 use crate::placeable::{AdmittedFleets, PlaceableActions};
-use crate::serve::{Protocols, serve};
+use crate::serve::{Listener, serve};
 use crate::settings;
+use crate::settings::WORKER_CONNECTIONS;
 use crate::stores::build_stores;
 
 /// What the running controller hands to the plugin: the scheduler handles it queries.
@@ -59,6 +67,8 @@ pub(crate) struct Handles {
     pub fleets: FleetCatalog,
     /// Actions that reached a terminal result on a worker since the controller started.
     pub completed: Arc<AtomicU64>,
+    /// Farm-wide cache lookup counts.
+    pub cache: Arc<CacheCounters>,
 }
 
 /// Resets the published handles to `None` when the controller stops, however it stops.
@@ -94,11 +104,16 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
     let worker_services = settings::worker_services(config);
     let store_manager = build_stores(settings::controller_stores(spec)?).await?;
 
-    let (action_scheduler, worker_scheduler) = scheduler_stack(&scheduler, spec.fleets)?;
+    let (action_scheduler, worker_scheduler) =
+        scheduler_stack(&scheduler, spec.fleets, config.memory.min_reservation)?;
     let completed = Arc::new(AtomicU64::new(0));
-    let worker_scheduler: Arc<dyn WorkerScheduler> = Arc::new(CountingWorkerScheduler::new(
+    let cache = Arc::new(CacheCounters::default());
+    let worker_scheduler: Arc<dyn WorkerScheduler> = Arc::new(ObservingWorkerScheduler::new(
         worker_scheduler,
+        Arc::clone(&action_scheduler)
+            as Arc<dyn nativelink_util::operation_state_manager::ClientStateManager>,
         Arc::clone(&completed),
+        spec.observations.clone(),
     ));
     let actions = HashMap::from([(scheduler.name.clone(), Arc::clone(&action_scheduler))]);
     let workers = HashMap::from([(scheduler.name.clone(), Arc::clone(&worker_scheduler))]);
@@ -117,6 +132,7 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         action_scheduler,
         fleets: spec.fleets.clone(),
         completed,
+        cache: Arc::clone(&cache),
     });
     let claimed = handles.send_if_modified(|slot| {
         if slot.is_some() {
@@ -136,13 +152,56 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         worker,
         api,
     } = connections;
-    let public_router = with_request_metadata(client_router).fallback_service(api_service(api));
+    let public_router = with_request_metadata(client_router, spec.observations.clone(), cache)
+        .fallback_service(api_service(api));
+    let limits = connection_limits(&config.http2, spec.max_workers);
+    let clock = SystemClock::new();
     futures::future::try_join(
-        serve(public, public_router, &config.http2, Protocols::Auto),
-        serve(worker, worker_router, &config.http2, Protocols::H2),
+        serve(
+            public,
+            public_router,
+            &config.http2,
+            Listener::Public,
+            limits.public,
+            clock,
+        ),
+        serve(
+            worker,
+            worker_router,
+            &config.http2,
+            Listener::Worker,
+            limits.worker,
+            clock,
+        ),
     )
     .await?;
     Ok(())
+}
+
+/// Worker generations that overlap on one instance: the one stopping (certificate renewal,
+/// termination, or a dead socket not yet noticed) and the one replacing it.
+const WORKER_GENERATIONS: u64 = 2;
+
+/// How many connections each listener serves at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConnectionLimits {
+    /// The public listener's limit, as configured.
+    public: NonZeroUsize,
+    /// The worker listener's limit: every connection of two generations of every worker the
+    /// fleets can run, and at least one.
+    worker: NonZeroUsize,
+}
+
+/// The connection limits of the listeners under `tuning`, for fleets of at most `max_workers`.
+fn connection_limits(tuning: &Http2Tuning, max_workers: u64) -> ConnectionLimits {
+    let worker: usize = max_workers
+        .saturating_mul(WORKER_GENERATIONS)
+        .saturating_mul(WORKER_CONNECTIONS)
+        .saturating_into();
+    ConnectionLimits {
+        public: tuning.max_connections,
+        worker: NonZeroUsize::new(worker).unwrap_or(NonZeroUsize::MIN),
+    }
 }
 
 /// The action side and the worker side of the scheduler.
@@ -151,12 +210,41 @@ type SchedulerHandles = (
     Arc<dyn WorkerScheduler>,
 );
 
-/// Builds the action stack from the client inward: `PlaceableActions`,
-/// `HistoricalResourceScheduler`, `FittedActions`, then `SimpleScheduler`. Client refusal
-/// stays outside, while learned-reservation fitting happens inside the historical layer.
+/// The action stack over `NativeLink`'s simple scheduler on the system clock.
 fn scheduler_stack(
     scheduler: &SchedulerConfig,
     fleets: &FleetCatalog,
+    min_reservation: MinReservation,
+) -> Result<SchedulerHandles, NativeLinkEmbedError> {
+    action_stack(
+        scheduler,
+        fleets,
+        min_reservation,
+        |simple, notify, sketch| {
+            let db = memory_awaited_action_db_factory(
+                simple.retain_completed_for_s,
+                &notify,
+                SystemTime::now,
+            );
+            SimpleScheduler::new_with_resource_sketch(simple, db, notify, None, Some(sketch))
+        },
+    )
+}
+
+/// Builds the action stack from the client inward: `PlaceableActions`,
+/// `HistoricalResourceScheduler`, `FittedActions`, then `SimpleScheduler`. Client refusal
+/// stays outside, while learned-reservation fitting happens inside the historical layer,
+/// over the simple scheduler `simple_scheduler` builds from the nested spec, the scheduler's
+/// change notification and the sketch the historical layer learns from.
+fn action_stack(
+    scheduler: &SchedulerConfig,
+    fleets: &FleetCatalog,
+    min_reservation: MinReservation,
+    simple_scheduler: impl FnOnce(
+        &SimpleSpec,
+        Arc<Notify>,
+        Arc<ResourceSketch>,
+    ) -> (Arc<SimpleScheduler>, Arc<dyn WorkerScheduler>),
 ) -> Result<SchedulerHandles, NativeLinkEmbedError> {
     let SchedulerSpec::HistoricalResource(historical_spec) = &scheduler.spec else {
         return Err(NativeLinkEmbedError::native("scheduler creation failed")(
@@ -181,16 +269,14 @@ fn scheduler_stack(
     let sketch = Arc::new(HistoricalResourceScheduler::sketch_from_spec(
         historical_spec,
     ));
-    let notify = Arc::new(tokio::sync::Notify::new());
-    let db =
-        memory_awaited_action_db_factory(simple.retain_completed_for_s, &notify, SystemTime::now);
-    let (simple_actions, worker_scheduler) =
-        SimpleScheduler::new_with_resource_sketch(simple, db, notify, None, Some(sketch.clone()));
+    let notify = Arc::new(Notify::new());
+    let (simple_actions, worker_scheduler) = simple_scheduler(simple, notify, sketch.clone());
     let admitted = AdmittedFleets::default();
     let fitted = Arc::new(FittedActions::new(
         simple_actions,
         fleets.clone(),
         admitted.clone(),
+        min_reservation,
     ));
     let historical = Arc::new(HistoricalResourceScheduler::new(
         historical_spec,
@@ -212,8 +298,14 @@ fn scheduler_stack(
 
 /// Decodes Bazel's `RequestMetadata` header into the request context so actions carry their target
 /// and mnemonic and the scheduler learns per target.
-fn with_request_metadata(router: Router) -> Router {
-    router.layer(nativelink_util::telemetry::OtlpLayer::new(false))
+fn with_request_metadata(
+    router: Router,
+    sink: gang_spi::ObservationSink,
+    cache: Arc<CacheCounters>,
+) -> Router {
+    router
+        .layer(BuildObserverLayer::new(sink, cache))
+        .layer(nativelink_util::telemetry::OtlpLayer::new(false))
 }
 
 /// The Gang API as the controller's fallback service: an infallible axum service that maps the
@@ -323,15 +415,18 @@ fn worker_routes(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::error::Error;
-    use std::time::UNIX_EPOCH;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use axum::middleware::from_fn_with_state;
     use axum::routing::get;
     use base64::Engine;
     use base64::prelude::BASE64_STANDARD_NO_PAD;
     use futures::StreamExt;
-    use gang_spi::{ApiResponseBody, Peer, PortError, RenderedStoreSpec, full_body};
+    use gang_spi::{
+        Admitted, ApiResponseBody, Authenticated, Peer, PortError, RenderedStoreSpec, full_body,
+    };
     use gang_testkit::TestResult;
     use gang_types::{
         Bytes, FleetName, FleetProperties, Identity, Isa, Principal, ProviderName, Resources,
@@ -339,22 +434,522 @@ mod tests {
     };
     use http::StatusCode;
     use nativelink_proto::build::bazel::remote::execution::v2::RequestMetadata;
+    use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
+        ActionResourceUsage, Reservation, ResourceOutcome, StartExecute, UpdateForWorker,
+        update_for_worker,
+    };
+    use nativelink_scheduler::resource_sketch::{Observation, ResourceSketch, SketchKey};
+    use nativelink_scheduler::worker::Worker;
     use nativelink_util::action_messages::{
-        ActionInfo, ActionUniqueKey, ActionUniqueQualifier, OperationId,
+        ActionInfo, ActionResult, ActionStage, ActionUniqueKey, ActionUniqueQualifier, OperationId,
+        WorkerId,
     };
     use nativelink_util::common::DigestInfo;
     use nativelink_util::digest_hasher::DigestHasherFunc;
-    use nativelink_util::operation_state_manager::OperationFilter;
+    use nativelink_util::instant_wrapper::InstantWrapper;
+    use nativelink_util::operation_state_manager::{OperationFilter, UpdateOperationType};
     use nativelink_util::origin_event::{BAZEL_METADATA_KEY, request_metadata_from_baggage};
+    use nativelink_util::platform_properties::{PlatformProperties, PlatformPropertyValue};
     use opentelemetry::baggage::BaggageExt;
     use prost::Message;
     use serde_json::json;
+    use tokio::sync::mpsc;
     use tower::ServiceExt;
 
     use super::*;
     use crate::gate::admit;
 
-    /// Puts a fixed identity in the request extensions, as the gate does for a verified caller.
+    #[test]
+    fn the_public_limit_is_configured_and_the_worker_limit_follows_the_fleets() {
+        let tuning = Http2Tuning {
+            max_connections: NonZeroUsize::MIN.saturating_add(6),
+            ..Http2Tuning::default()
+        };
+        let limits = connection_limits(&tuning, 2);
+        assert_eq!((limits.public.get(), limits.worker.get()), (7, 12));
+        assert_eq!(connection_limits(&tuning, 0).worker, NonZeroUsize::MIN);
+        assert_eq!(
+            connection_limits(&tuning, u64::MAX).worker.get(),
+            usize::MAX
+        );
+    }
+
+    /// The deployment module's default `client_action_timeout` in
+    /// `infra/terraform/modules/deployment/variables.tf`.
+    const CLIENT_ACTION_TIMEOUT: Duration = Duration::from_mins(2);
+    /// How long the connected client waits on the test clock.
+    const WAIT: Duration = Duration::from_hours(48);
+    /// Clock increments shorter than the client-action timeout.
+    const STEP: Duration = Duration::from_mins(1);
+    /// Scheduler turns that let the client's keepalive reach the action database on the
+    /// current-thread runtime; these are not a wait on time.
+    const KEEPALIVE_YIELDS: usize = 16;
+
+    thread_local! {
+        /// The stack's clock, moved only by the test on its current-thread runtime.
+        static NOW: Cell<Duration> = const { Cell::new(Duration::from_secs(1_000_000)) };
+    }
+
+    /// Moves the stack's clock forward.
+    fn advance(by: Duration) {
+        NOW.set(NOW.get() + by);
+    }
+
+    /// An instant on the stack's test-controlled clock.
+    #[derive(Debug, Clone, Copy)]
+    struct TestInstant(Duration);
+
+    impl InstantWrapper for TestInstant {
+        fn from_secs(secs: u64) -> Self {
+            Self(Duration::from_secs(secs))
+        }
+
+        fn unix_timestamp(&self) -> u64 {
+            self.0.as_secs()
+        }
+
+        fn now(&self) -> SystemTime {
+            UNIX_EPOCH + self.0
+        }
+
+        fn elapsed(&self) -> Duration {
+            NOW.get().saturating_sub(self.0)
+        }
+
+        async fn sleep(self, duration: Duration) {
+            while self.elapsed() < duration {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    /// Returns the current test-controlled instant.
+    fn test_now() -> TestInstant {
+        TestInstant(NOW.get())
+    }
+
+    /// A fleet with the resources used by the queued-action test.
+    fn fleet(name: &str, isa: Isa) -> FleetProperties {
+        FleetProperties::new(
+            &FleetName::try_new(name).expect("valid fleet name"),
+            isa,
+            &"docker",
+            Resources {
+                vcpus: 4,
+                memory: Bytes::new(8 << 30),
+                disk: Bytes::new(100 << 30),
+            },
+            Vec::<(&'static str, String)>::new(),
+        )
+    }
+
+    /// Two fleets with incompatible instruction sets.
+    fn x86_and_arm_fleets() -> FleetCatalog {
+        FleetCatalog::try_new(vec![fleet("x86", Isa::X86_64), fleet("arm", Isa::Aarch64)])
+            .expect("valid fleet catalog")
+    }
+
+    /// Scheduler handles used by the test-controlled stack.
+    struct TestStack {
+        /// The outer action scheduler.
+        actions: Arc<dyn KnownPlatformPropertyProvider>,
+        /// The worker scheduler.
+        workers: Arc<dyn WorkerScheduler>,
+        /// The simple scheduler, used to drive matching.
+        simple: Arc<SimpleScheduler>,
+        /// The sketch the historical layer learns from.
+        sketch: Arc<ResourceSketch>,
+    }
+
+    /// The default scheduler configuration used by the test-controlled stack.
+    fn default_config() -> TestResult<NativeLinkConfig> {
+        Ok(serde_json::from_value(
+            json!({ "scheduler_name": "MAIN_SCHEDULER" }),
+        )?)
+    }
+
+    /// Builds the rendered stack on the test clock with the deployment's default client timeout.
+    fn stack_on_test_clock(
+        fleets: &FleetCatalog,
+        config: &NativeLinkConfig,
+    ) -> TestResult<TestStack> {
+        let memory = RenderedStoreSpec(json!({ "memory": {} }));
+        let (observations, _receiver) = gang_spi::ObservationSink::channel(
+            std::num::NonZeroUsize::MIN,
+            std::num::NonZeroUsize::MIN,
+        );
+        let rendered = settings::scheduler(
+            config,
+            &ControllerSpec {
+                content_store: &memory,
+                action_store: &memory,
+                fleets,
+                max_workers: 8,
+                observations: &observations,
+                client_action_timeout: CLIENT_ACTION_TIMEOUT,
+            },
+        )?;
+        let mut simple_slot = None;
+        let mut sketch_slot = None;
+        let (actions, workers) = action_stack(
+            &rendered,
+            fleets,
+            config.memory.min_reservation,
+            |simple, notify, sketch| {
+                let db = memory_awaited_action_db_factory(
+                    simple.retain_completed_for_s,
+                    &notify,
+                    test_now,
+                );
+                let (scheduler, workers) = SimpleScheduler::new_with_callback(
+                    simple,
+                    db,
+                    || async {},
+                    notify,
+                    test_now,
+                    None,
+                );
+                simple_slot = Some(Arc::clone(&scheduler));
+                sketch_slot = Some(Arc::clone(&sketch));
+                (scheduler, workers)
+            },
+        )?;
+        Ok(TestStack {
+            actions,
+            workers,
+            simple: simple_slot.expect("simple scheduler was constructed"),
+            sketch: sketch_slot.expect("resource sketch was provided"),
+        })
+    }
+
+    /// Connects an Arm worker and keeps its update receiver alive for the caller.
+    async fn connect_arm_worker(
+        workers: &dyn WorkerScheduler,
+        id: &WorkerId,
+    ) -> TestResult<mpsc::Receiver<UpdateForWorker>> {
+        let (tx, rx) = mpsc::channel(64);
+        let properties = PlatformProperties::new(HashMap::from([
+            (
+                property::FLEET.to_owned(),
+                PlatformPropertyValue::Exact("arm".to_owned()),
+            ),
+            (
+                property::ISA.to_owned(),
+                PlatformPropertyValue::Exact(Isa::Aarch64.to_string()),
+            ),
+            (
+                property::SANDBOX.to_owned(),
+                PlatformPropertyValue::Exact("docker".to_owned()),
+            ),
+            (
+                property::CPU_COUNT.to_owned(),
+                PlatformPropertyValue::Minimum(4),
+            ),
+            (
+                property::CPU_MILLICORES.to_owned(),
+                PlatformPropertyValue::Minimum(4_000),
+            ),
+            (
+                property::MEMORY_KB.to_owned(),
+                PlatformPropertyValue::Minimum(8 * 1024 * 1024),
+            ),
+            (
+                property::DISK_KB.to_owned(),
+                PlatformPropertyValue::Minimum(100 * 1024 * 1024),
+            ),
+        ]));
+        workers
+            .add_worker(Worker::new(
+                id.clone(),
+                properties,
+                tx,
+                NOW.get().as_secs(),
+                1,
+            ))
+            .await?;
+        Ok(rx)
+    }
+
+    /// An action requiring the given instruction set and optional memory reservation.
+    fn action(isa: Isa, memory_kb: Option<&str>) -> Arc<ActionInfo> {
+        let digest = DigestInfo::new([1; 32], 1);
+        let mut platform_properties = HashMap::from([(property::ISA.to_owned(), isa.to_string())]);
+        if let Some(memory_kb) = memory_kb {
+            platform_properties.insert(property::MEMORY_KB.to_owned(), memory_kb.to_owned());
+        }
+        Arc::new(ActionInfo {
+            command_digest: digest,
+            input_root_digest: digest,
+            timeout: Duration::from_mins(1),
+            platform_properties,
+            priority: 0,
+            load_timestamp: test_now().now(),
+            insert_timestamp: test_now().now(),
+            unique_qualifier: ActionUniqueQualifier::Cacheable(ActionUniqueKey {
+                execution_scope: None,
+                instance_name: String::new(),
+                digest_function: DigestHasherFunc::Sha256,
+                digest,
+            }),
+        })
+    }
+
+    /// An action accepted by the x86 fleet, but not by an Arm worker.
+    fn x86_action() -> Arc<ActionInfo> {
+        action(Isa::X86_64, None)
+    }
+
+    /// Reads the next worker dispatch without waiting on wall-clock time.
+    async fn next_dispatch(rx: &mut mpsc::Receiver<UpdateForWorker>) -> (StartExecute, u64) {
+        let mut last_message = None;
+        for _ in 0..KEEPALIVE_YIELDS {
+            match rx.try_recv() {
+                Ok(message) => match message.update {
+                    Some(update_for_worker::Update::StartAction(start)) => {
+                        let memory_kb = start
+                            .platform
+                            .as_ref()
+                            .and_then(|platform| {
+                                platform
+                                    .properties
+                                    .iter()
+                                    .find(|property| property.name == "memory_kb")
+                                    .and_then(|property| property.value.parse().ok())
+                            })
+                            .expect("the dispatch carries memory_kb");
+                        return (start, memory_kb);
+                    }
+                    update => last_message = Some(update),
+                },
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("worker update channel closed before dispatch");
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("expected a StartAction, last update: {last_message:?}");
+    }
+
+    /// Reads the current stage without driving the client's subscription.
+    async fn stage_of(
+        actions: &dyn KnownPlatformPropertyProvider,
+        client: &OperationId,
+    ) -> TestResult<Option<ActionStage>> {
+        let mut results = actions
+            .filter_operations(OperationFilter {
+                client_operation_id: Some(client.clone()),
+                ..Default::default()
+            })
+            .await?;
+        match results.next().await {
+            Some(result) => Ok(Some(result.as_state().await?.0.stage.clone())),
+            None => Ok(None),
+        }
+    }
+
+    /// A live subscription refreshes the client keepalive at the deployment's default timeout,
+    /// so a placeable action stays queued even with no worker or only an incompatible worker.
+    /// A Gang deadline derived from that timeout would fail this test. Once the subscription
+    /// stops, `NativeLink` drops the action after the client-action timeout.
+    #[tokio::test]
+    async fn a_placeable_action_that_cannot_launch_stays_queued_while_its_client_waits()
+    -> TestResult {
+        for (case, arm_worker) in [("no worker", false), ("arm worker", true)] {
+            NOW.set(Duration::from_secs(1_000_000));
+            let fleets = x86_and_arm_fleets();
+            let stack = stack_on_test_clock(&fleets, &default_config()?)?;
+            let worker_id = WorkerId("arm-worker".to_owned());
+            let _rx = if arm_worker {
+                Some(connect_arm_worker(stack.workers.as_ref(), &worker_id).await?)
+            } else {
+                None
+            };
+            let client = OperationId::from("client");
+            let mut result = stack
+                .actions
+                .add_action(client.clone(), x86_action())
+                .await?;
+            let handle = tokio::spawn(async move {
+                while let Ok((state, _)) = result.changed().await {
+                    if state.stage != ActionStage::Queued {
+                        break;
+                    }
+                }
+            });
+            for minute in 1..=WAIT.as_secs() / STEP.as_secs() {
+                advance(STEP);
+                for _ in 0..KEEPALIVE_YIELDS {
+                    tokio::task::yield_now().await;
+                }
+                if arm_worker {
+                    stack
+                        .workers
+                        .worker_keep_alive_received(&worker_id, NOW.get().as_secs(), None)
+                        .await?;
+                }
+                stack.simple.do_try_match_for_test().await?;
+                assert_eq!(
+                    stage_of(stack.actions.as_ref(), &client).await?,
+                    Some(ActionStage::Queued),
+                    "{case}, elapsed {minute} minutes"
+                );
+            }
+            handle.abort();
+            for _ in 0..(CLIENT_ACTION_TIMEOUT + STEP).as_secs() / STEP.as_secs() {
+                advance(STEP);
+                for _ in 0..KEEPALIVE_YIELDS {
+                    tokio::task::yield_now().await;
+                }
+                if arm_worker {
+                    stack
+                        .workers
+                        .worker_keep_alive_received(&worker_id, NOW.get().as_secs(), None)
+                        .await?;
+                }
+                stack.simple.do_try_match_for_test().await?;
+            }
+            assert_ne!(
+                stage_of(stack.actions.as_ref(), &client).await?,
+                Some(ActionStage::Queued),
+                "{case}, client gone"
+            );
+        }
+        Ok(())
+    }
+
+    /// A request below the minimum reaches the worker at the minimum, and a memory kill
+    /// doubles that raised reservation rather than treating the minimum as a cap.
+    #[tokio::test]
+    async fn a_reservation_raised_to_the_minimum_escalates_from_it_after_a_memory_kill()
+    -> TestResult {
+        NOW.set(Duration::from_secs(1_000_000));
+        let config: NativeLinkConfig = serde_json::from_value(json!({
+            "scheduler_name": "MAIN_SCHEDULER",
+            "memory": { "min_reservation": "64MiB" },
+        }))?;
+        let fleets = x86_and_arm_fleets();
+        let stack = stack_on_test_clock(&fleets, &config)?;
+        let worker_id = WorkerId("arm-worker".to_owned());
+        let mut rx = connect_arm_worker(stack.workers.as_ref(), &worker_id).await?;
+        let connected = rx
+            .try_recv()
+            .expect("the worker receives a connection result");
+        assert!(matches!(
+            connected.update,
+            Some(update_for_worker::Update::ConnectionResult(_))
+        ));
+
+        let _subscription = stack
+            .actions
+            .add_action(
+                OperationId::from("client"),
+                action(Isa::Aarch64, Some("252")),
+            )
+            .await?;
+        stack.simple.do_try_match_for_test().await?;
+        let (start, memory_kb) = next_dispatch(&mut rx).await;
+        assert_eq!(memory_kb, 65_536, "the minimum reaches the worker");
+        let operation_id = OperationId::from(start.operation_id.as_str());
+        stack
+            .workers
+            .record_action_resource_usage(
+                &worker_id,
+                &operation_id,
+                ActionResourceUsage {
+                    peak_memory_kb: memory_kb + memory_kb / 5,
+                    sampled: true,
+                    outcome: ResourceOutcome::KilledMemory.into(),
+                    enforced: true,
+                    reserved: Some(Reservation {
+                        memory_kb,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        stack
+            .workers
+            .update_action(
+                &worker_id,
+                &operation_id,
+                UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(ActionResult {
+                    exit_code: 9,
+                    error: Some(make_err!(
+                        Code::FailedPrecondition,
+                        "action exceeded its memory reservation"
+                    )),
+                    ..Default::default()
+                })),
+            )
+            .await?;
+        for _ in 0..KEEPALIVE_YIELDS {
+            tokio::task::yield_now().await;
+        }
+        stack.simple.do_try_match_for_test().await?;
+        let (retry, memory_kb) = next_dispatch(&mut rx).await;
+        assert_eq!(retry.operation_id, start.operation_id);
+        assert_eq!(
+            memory_kb, 131_072,
+            "the escalation doubles the raised reservation"
+        );
+        Ok(())
+    }
+
+    /// A small sample learned by the historical layer is raised to the minimum before it
+    /// reaches a worker, so the learned reservation never becomes the scope's limit.
+    #[tokio::test]
+    async fn a_learned_reservation_below_the_minimum_reaches_the_worker_at_the_minimum()
+    -> TestResult {
+        NOW.set(Duration::from_secs(1_000_000));
+        let config: NativeLinkConfig = serde_json::from_value(json!({
+            "scheduler_name": "MAIN_SCHEDULER",
+            "memory": { "min_reservation": "64MiB" },
+        }))?;
+        let fleets = x86_and_arm_fleets();
+        let stack = stack_on_test_clock(&fleets, &config)?;
+        let worker_id = WorkerId("arm-worker".to_owned());
+        let mut rx = connect_arm_worker(stack.workers.as_ref(), &worker_id).await?;
+        let connected = rx
+            .try_recv()
+            .expect("the worker receives a connection result");
+        assert!(matches!(
+            connected.update,
+            Some(update_for_worker::Update::ConnectionResult(_))
+        ));
+
+        let action = action(Isa::Aarch64, None);
+        let key = SketchKey::for_attempt(None, None, &action.command_digest.to_string());
+        let now_s = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let observation = Observation {
+            peak_memory_kb: 210,
+            now_s,
+            ..Default::default()
+        };
+        // A successful command's first sighting is probation; the second records one sample.
+        assert!(!stack.sketch.observe(key.clone(), &observation));
+        assert!(stack.sketch.observe(key.clone(), &observation));
+        let entry = stack
+            .sketch
+            .lookup(&key, now_s)
+            .expect("sample was learned");
+        assert_eq!(stack.sketch.shape(&entry).memory_kb, 252);
+
+        let _subscription = stack
+            .actions
+            .add_action(OperationId::from("client"), action)
+            .await?;
+        stack.simple.do_try_match_for_test().await?;
+        let (_, memory_kb) = next_dispatch(&mut rx).await;
+        assert_eq!(
+            memory_kb, 65_536,
+            "the learned reservation is raised to the minimum"
+        );
+        Ok(())
+    }
+
+    /// Admits a fixed identity as the verified caller.
     #[derive(Clone)]
     struct Identify;
 
@@ -362,10 +957,12 @@ mod tests {
         fn admit(
             &self,
             _peer: &Peer,
-            parts: &mut http::request::Parts,
-        ) -> impl Future<Output = Result<(), PortError>> + Send {
-            parts.extensions.insert(alice());
-            std::future::ready(Ok(()))
+            _parts: &mut http::request::Parts,
+        ) -> impl Future<Output = Result<Admitted, PortError>> + Send {
+            std::future::ready(Ok(Admitted::Authenticated(Authenticated {
+                identity: Arc::new(alice()),
+                valid_until: None,
+            })))
         }
     }
 
@@ -376,8 +973,7 @@ mod tests {
         )
     }
 
-    /// Answers every request the router does not route with its path and the identity the gate
-    /// put in the request extensions.
+    /// Answers every request the router does not route with its path and admitted identity.
     #[derive(Clone)]
     struct Echo;
 
@@ -386,10 +982,10 @@ mod tests {
             &self,
             request: Request<ApiRequestBody>,
         ) -> impl Future<Output = Response<ApiResponseBody>> + Send {
-            let identity = request
-                .extensions()
-                .get::<Identity>()
-                .map_or_else(|| "anonymous".to_owned(), ToString::to_string);
+            let identity = request.extensions().get::<Authenticated>().map_or_else(
+                || "anonymous".to_owned(),
+                |caller| caller.identity.to_string(),
+            );
             let answer = format!("{} {identity}", request.uri().path());
             std::future::ready(Response::new(full_body(answer)))
         }
@@ -440,24 +1036,32 @@ mod tests {
         }))
         .expect("valid controller config");
         let store = RenderedStoreSpec(json!({ "memory": {} }));
+        let (observations, _receiver) = gang_spi::ObservationSink::channel(
+            std::num::NonZeroUsize::MIN,
+            std::num::NonZeroUsize::MIN,
+        );
         let spec = ControllerSpec {
             content_store: &store,
             action_store: &store,
             fleets: &fleets,
-            client_action_timeout: Duration::from_secs(600),
+            max_workers: 8,
+            observations: &observations,
+            client_action_timeout: Duration::from_mins(10),
         };
         let mut scheduler = settings::scheduler(&config, &spec).expect("valid scheduler config");
         let SchedulerSpec::HistoricalResource(historical) = &mut scheduler.spec else {
             panic!("expected historical scheduler");
         };
         historical.learn_from_workers = false;
-        let (actions, _workers) = scheduler_stack(&scheduler, &fleets).expect("scheduler stack");
+        let (actions, _workers) =
+            scheduler_stack(&scheduler, &fleets, config.memory.min_reservation)
+                .expect("scheduler stack");
         let operation = OperationId::String("stack-wiring".to_owned());
         let digest = DigestInfo::new([1; 32], 1);
         let info = Arc::new(ActionInfo {
             command_digest: digest,
             input_root_digest: digest,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_mins(1),
             platform_properties: [(property::CPU_MILLICORES.to_owned(), "12000".to_owned())]
                 .into_iter()
                 .collect(),
@@ -496,6 +1100,121 @@ mod tests {
         );
     }
 
+    /// An action used to check the operation's origin.
+    fn origin_test_action() -> Arc<ActionInfo> {
+        let digest = DigestInfo::new([2; 32], 2);
+        Arc::new(ActionInfo {
+            command_digest: digest,
+            input_root_digest: digest,
+            timeout: Duration::from_mins(1),
+            platform_properties: HashMap::new(),
+            priority: 0,
+            load_timestamp: UNIX_EPOCH,
+            insert_timestamp: UNIX_EPOCH,
+            unique_qualifier: ActionUniqueQualifier::Cacheable(ActionUniqueKey {
+                execution_scope: None,
+                instance_name: String::new(),
+                digest_function: DigestHasherFunc::Sha256,
+                digest,
+            }),
+        })
+    }
+
+    #[tokio::test]
+    async fn operation_origin_identity_is_the_gates_principal() {
+        let fleets =
+            FleetCatalog::try_new(vec![fleet("fleet-a", Isa::X86_64)]).expect("valid catalog");
+        let config: NativeLinkConfig =
+            serde_json::from_value(json!({ "scheduler_name": "MAIN_SCHEDULER" })).expect("config");
+        let store = RenderedStoreSpec(json!({ "memory": {} }));
+        let (sink, _receiver) = gang_spi::ObservationSink::channel(
+            std::num::NonZeroUsize::MIN,
+            std::num::NonZeroUsize::MIN,
+        );
+        let spec = ControllerSpec {
+            content_store: &store,
+            action_store: &store,
+            fleets: &fleets,
+            max_workers: 8,
+            observations: &sink,
+            client_action_timeout: Duration::from_mins(10),
+        };
+        let mut scheduler = settings::scheduler(&config, &spec).expect("scheduler");
+        let SchedulerSpec::HistoricalResource(historical) = &mut scheduler.spec else {
+            panic!("historical scheduler")
+        };
+        historical.learn_from_workers = false;
+        let (actions, _) =
+            scheduler_stack(&scheduler, &fleets, config.memory.min_reservation).expect("stack");
+        let info = origin_test_action();
+        let metadata = RequestMetadata {
+            tool_invocation_id: "invocation".to_owned(),
+            ..Default::default()
+        };
+        let handler_actions = Arc::clone(&actions);
+        let router = with_request_metadata(
+            Router::new().route(
+                "/build.bazel.remote.execution.v2.Execution/Execute",
+                axum::routing::post(move || {
+                    let actions = Arc::clone(&handler_actions);
+                    let info = Arc::clone(&info);
+                    async move {
+                        actions
+                            .add_action(OperationId::String("client".to_owned()), info)
+                            .await
+                            .expect("add");
+                    }
+                }),
+            ),
+            sink,
+            Arc::new(CacheCounters::default()),
+        )
+        .layer(axum::Extension(gang_spi::Authenticated {
+            identity: Arc::new(alice()),
+            valid_until: None,
+        }));
+        router
+            .oneshot(
+                Request::post("/build.bazel.remote.execution.v2.Execution/Execute")
+                    .header(
+                        "build.bazel.remote.execution.v2.requestmetadata-bin",
+                        BASE64_STANDARD_NO_PAD.encode(metadata.encode_to_vec()),
+                    )
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        let mut all = actions
+            .filter_operations(OperationFilter::default())
+            .await
+            .expect("list");
+        let (state, _) = all
+            .next()
+            .await
+            .expect("queued")
+            .as_state()
+            .await
+            .expect("state");
+        let mut found = actions
+            .filter_operations(OperationFilter {
+                operation_id: Some(state.client_operation_id.clone()),
+                ..Default::default()
+            })
+            .await
+            .expect("filter");
+        let (_, origin) = found
+            .next()
+            .await
+            .expect("operation")
+            .as_action_info()
+            .await
+            .expect("info");
+        let origin = origin.expect("origin");
+        assert_eq!(origin.identity, alice().to_string());
+        assert_eq!(origin.bazel_metadata, Some(metadata));
+    }
+
     /// Confirms the client router puts Bazel request metadata in the scheduler's context.
     #[tokio::test]
     async fn request_metadata_reaches_the_scheduler_context() -> TestResult {
@@ -516,8 +1235,15 @@ mod tests {
             action_mnemonic: "Rustc".to_owned(),
             ..Default::default()
         };
-        let router =
-            with_request_metadata(Router::new().route("/probe", axum::routing::post(handler)));
+        let router = with_request_metadata(
+            Router::new().route("/probe", axum::routing::post(handler)),
+            gang_spi::ObservationSink::channel(
+                std::num::NonZeroUsize::MIN,
+                std::num::NonZeroUsize::MIN,
+            )
+            .0,
+            Arc::new(CacheCounters::default()),
+        );
         let response = router
             .oneshot(
                 Request::post("/probe")
@@ -530,6 +1256,295 @@ mod tests {
             .await?;
         let body = axum::body::to_bytes(response.into_body(), 1024).await?;
         assert_eq!(body.as_ref(), b"//pkg:lib Rustc");
+        Ok(())
+    }
+
+    fn observer_router(sink: gang_spi::ObservationSink, cache: Arc<CacheCounters>) -> Router {
+        let auth = gang_spi::Authenticated {
+            identity: Arc::new(alice()),
+            valid_until: None,
+        };
+        with_request_metadata(
+            Router::new().route(
+                "/build.bazel.remote.execution.v2.ActionCache/GetActionResult",
+                axum::routing::post(|| async { ([("grpc-status", "5")], "") }),
+            ),
+            sink,
+            cache,
+        )
+        .layer(axum::Extension(auth))
+    }
+
+    #[tokio::test]
+    async fn not_found_is_a_miss_and_ok_a_hit_for_the_callers_build() -> TestResult {
+        let (sink, mut observations) = gang_spi::ObservationSink::channel(
+            std::num::NonZeroUsize::new(4).expect("nonzero"),
+            std::num::NonZeroUsize::MIN,
+        );
+        let cache = Arc::new(CacheCounters::default());
+        let metadata = RequestMetadata {
+            tool_invocation_id: "invocation".to_owned(),
+            target_id: "//pkg:lib".to_owned(),
+            action_mnemonic: "Rustc".to_owned(),
+            ..Default::default()
+        };
+        let header = BASE64_STANDARD_NO_PAD.encode(metadata.encode_to_vec());
+        let miss = observer_router(sink.clone(), Arc::clone(&cache));
+        let auth = gang_spi::Authenticated {
+            identity: Arc::new(alice()),
+            valid_until: None,
+        };
+        let hit = with_request_metadata(
+            Router::new().route(
+                "/build.bazel.remote.execution.v2.ActionCache/GetActionResult",
+                axum::routing::post(|| async { "" }),
+            ),
+            sink,
+            Arc::clone(&cache),
+        )
+        .layer(axum::Extension(auth));
+        for router in [miss, hit] {
+            router
+                .oneshot(
+                    Request::post("/build.bazel.remote.execution.v2.ActionCache/GetActionResult")
+                        .header(
+                            "build.bazel.remote.execution.v2.requestmetadata-bin",
+                            &header,
+                        )
+                        .body(Body::empty())?,
+                )
+                .await?;
+        }
+        for outcome in [gang_spi::CallOutcome::NotFound, gang_spi::CallOutcome::Ok] {
+            let Some(gang_spi::Delivery::Observation(observation)) = observations.next().await
+            else {
+                panic!("expected observation")
+            };
+            let gang_spi::Observation::Call(call) = *observation else {
+                panic!("expected call")
+            };
+            assert_eq!(call.outcome, outcome);
+            assert_eq!(call.rpc, gang_spi::Rpc::GetActionResult);
+            assert_eq!(*call.origin.build.principal, alice());
+            assert_eq!(call.origin.build.invocation.as_str(), "invocation");
+            assert_eq!(
+                call.origin
+                    .target
+                    .as_ref()
+                    .map(gang_types::TargetLabel::as_str),
+                Some("//pkg:lib")
+            );
+            assert_eq!(
+                call.origin
+                    .mnemonic
+                    .as_ref()
+                    .map(gang_types::Mnemonic::as_str),
+                Some("Rustc")
+            );
+        }
+        assert_eq!(cache.lookups.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(cache.hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_gates_principal_replaces_a_client_enduser_id() -> TestResult {
+        async fn handler() -> String {
+            let context = opentelemetry::Context::current();
+            let baggage = context.baggage();
+            let identity = baggage
+                .get(crate::observer::ENDUSER_ID)
+                .map_or_else(String::new, |v| v.as_str().to_owned());
+            let metadata = baggage
+                .get(BAZEL_METADATA_KEY)
+                .and_then(|value| request_metadata_from_baggage(value.as_str()).ok())
+                .expect("request metadata reaches the handler");
+            format!(
+                "{identity} {} {} {}",
+                metadata.tool_invocation_id, metadata.target_id, metadata.action_mnemonic
+            )
+        }
+        nativelink_util::telemetry::init_propagator();
+        let (sink, _receiver) = gang_spi::ObservationSink::channel(
+            std::num::NonZeroUsize::MIN,
+            std::num::NonZeroUsize::MIN,
+        );
+        let auth = gang_spi::Authenticated {
+            identity: Arc::new(alice()),
+            valid_until: None,
+        };
+        let metadata = RequestMetadata {
+            tool_invocation_id: "invocation".to_owned(),
+            target_id: "//pkg:lib".to_owned(),
+            action_mnemonic: "Rustc".to_owned(),
+            ..Default::default()
+        };
+        let router = with_request_metadata(
+            Router::new().route(
+                "/build.bazel.remote.execution.v2.Execution/Execute",
+                axum::routing::post(handler),
+            ),
+            sink,
+            Arc::new(CacheCounters::default()),
+        )
+        .layer(axum::Extension(auth));
+        let response = router
+            .oneshot(
+                Request::post("/build.bazel.remote.execution.v2.Execution/Execute")
+                    .header("baggage", "enduser.id=mallory")
+                    .header(
+                        "build.bazel.remote.execution.v2.requestmetadata-bin",
+                        BASE64_STANDARD_NO_PAD.encode(metadata.encode_to_vec()),
+                    )
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let body = axum::body::to_bytes(response.into_body(), 1024).await?;
+        assert_eq!(
+            body.as_ref(),
+            format!("{} invocation //pkg:lib Rustc", alice()).as_bytes()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn only_successful_post_grpc_responses_are_hits() -> TestResult {
+        let (sink, mut observations) = gang_spi::ObservationSink::channel(
+            std::num::NonZeroUsize::new(4).expect("nonzero"),
+            std::num::NonZeroUsize::MIN,
+        );
+        let cache = Arc::new(CacheCounters::default());
+        let path = "/build.bazel.remote.execution.v2.ActionCache/GetActionResult";
+        let auth = gang_spi::Authenticated {
+            identity: Arc::new(alice()),
+            valid_until: None,
+        };
+        let metadata = RequestMetadata {
+            tool_invocation_id: "invocation".to_owned(),
+            ..Default::default()
+        };
+        let header = BASE64_STANDARD_NO_PAD.encode(metadata.encode_to_vec());
+        let router = with_request_metadata(
+            Router::new().route(
+                path,
+                axum::routing::get(|| async { "" })
+                    .post(|| async { StatusCode::METHOD_NOT_ALLOWED }),
+            ),
+            sink.clone(),
+            Arc::clone(&cache),
+        )
+        .layer(axum::Extension(auth.clone()));
+        for request in [Request::get(path), Request::post(path)] {
+            router
+                .clone()
+                .oneshot(
+                    request
+                        .header(
+                            "build.bazel.remote.execution.v2.requestmetadata-bin",
+                            &header,
+                        )
+                        .body(Body::empty())?,
+                )
+                .await?;
+        }
+        let ok = with_request_metadata(
+            Router::new().route(
+                path,
+                axum::routing::post(|| async { ([("grpc-status", "0")], "") }),
+            ),
+            sink,
+            Arc::clone(&cache),
+        )
+        .layer(axum::Extension(auth));
+        ok.oneshot(
+            Request::post(path)
+                .header(
+                    "build.bazel.remote.execution.v2.requestmetadata-bin",
+                    &header,
+                )
+                .body(Body::empty())?,
+        )
+        .await?;
+        drop(router);
+        for expected in [gang_spi::CallOutcome::Error, gang_spi::CallOutcome::Ok] {
+            let Some(gang_spi::Delivery::Observation(observation)) = observations.next().await
+            else {
+                panic!("expected observation")
+            };
+            let gang_spi::Observation::Call(call) = *observation else {
+                panic!("expected call")
+            };
+            assert_eq!(call.outcome, expected);
+        }
+        assert!(observations.next().await.is_none());
+        assert_eq!(cache.lookups.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(cache.hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn anonymous_observed_calls_strip_client_identity() -> TestResult {
+        async fn handler() -> String {
+            let context = opentelemetry::Context::current();
+            let baggage = context.baggage();
+            format!(
+                "{} {}",
+                baggage
+                    .get(crate::observer::ENDUSER_ID)
+                    .map_or("none", |v| v.as_str()),
+                baggage.get("other").map_or("none", |v| v.as_str())
+            )
+        }
+        nativelink_util::telemetry::init_propagator();
+        let (sink, _receiver) = gang_spi::ObservationSink::channel(
+            std::num::NonZeroUsize::MIN,
+            std::num::NonZeroUsize::MIN,
+        );
+        let path = "/build.bazel.remote.execution.v2.Execution/Execute";
+        let router = with_request_metadata(
+            Router::new().route(path, axum::routing::post(handler)),
+            sink,
+            Arc::new(CacheCounters::default()),
+        );
+        let response = router
+            .oneshot(
+                Request::post(path)
+                    .header("baggage", "enduser.id=mallory,other=kept")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await?
+                .as_ref(),
+            b"none kept"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn calls_without_invocation_still_count_lookups() -> TestResult {
+        let (sink, mut observations) = gang_spi::ObservationSink::channel(
+            std::num::NonZeroUsize::MIN,
+            std::num::NonZeroUsize::MIN,
+        );
+        let cache = Arc::new(CacheCounters::default());
+        let router = observer_router(sink, Arc::clone(&cache));
+        let empty = BASE64_STANDARD_NO_PAD.encode(RequestMetadata::default().encode_to_vec());
+        for header in [None, Some(empty)] {
+            let mut request =
+                Request::post("/build.bazel.remote.execution.v2.ActionCache/GetActionResult");
+            if let Some(header) = header {
+                request = request.header(
+                    "build.bazel.remote.execution.v2.requestmetadata-bin",
+                    header,
+                );
+            }
+            router.clone().oneshot(request.body(Body::empty())?).await?;
+        }
+        drop(router);
+        assert_eq!(cache.lookups.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert!(observations.next().await.is_none());
         Ok(())
     }
 

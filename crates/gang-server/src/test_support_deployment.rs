@@ -220,6 +220,7 @@ pub fn tls_settings() -> ServerSettings {
         max_tracked_principals: NonZeroUsize::new(10_000).expect("10,000 is non-zero"),
         accept_error_backoff: NonZeroDuration::from_millis(100),
         dashboard: DashboardConfig::default(),
+        builds: gang_config::BuildsConfig::default(),
         login: None,
         provisioner: "test".into(),
     }
