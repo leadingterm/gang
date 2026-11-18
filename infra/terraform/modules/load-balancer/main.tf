@@ -86,7 +86,9 @@ resource "aws_lb" "this" {
 }
 
 resource "aws_lb_target_group" "this" {
-  name        = var.name
+  # A distinct name replaces an HTTP-health target group on a schema-compatible rollback.
+  # The AWS provider otherwise retains its computed HTTP matcher when planning TCP.
+  name        = "${var.name}-tcp"
   port        = var.port
   protocol    = "TLS"
   target_type = "instance"
