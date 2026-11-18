@@ -1,5 +1,5 @@
 {
-  "checksum": "3680de9f20639d2b1be9ce6ea34737547243566cff774ada4b1daecbcb4fb679",
+  "checksum": "412367eeb064f053fd7a7060bb4b3cba907b484ce5a82c100538f24147646d5d",
   "crates": {
     "adler2 2.0.1": {
       "name": "adler2",
@@ -2000,6 +2000,129 @@
         },
         "edition": "2021",
         "version": "1.140.0"
+      },
+      "license": "Apache-2.0",
+      "license_ids": [
+        "Apache-2.0"
+      ],
+      "license_file": "LICENSE"
+    },
+    "aws-sdk-dynamodb 1.137.0": {
+      "name": "aws-sdk-dynamodb",
+      "version": "1.137.0",
+      "package_url": "https://github.com/awslabs/aws-sdk-rust",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/aws-sdk-dynamodb/1.137.0/download",
+          "sha256": "41515f51bd2b5608268336bda372065e8fd5d1ca2f684b63e5c25ae4abb62c53"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "aws_sdk_dynamodb",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "aws_sdk_dynamodb",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "behavior-version-latest",
+            "rt-tokio"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "arc-swap 1.9.3",
+              "target": "arc_swap"
+            },
+            {
+              "id": "aws-credential-types 1.3.1",
+              "target": "aws_credential_types"
+            },
+            {
+              "id": "aws-runtime 1.10.2",
+              "target": "aws_runtime"
+            },
+            {
+              "id": "aws-smithy-async 1.3.1",
+              "target": "aws_smithy_async"
+            },
+            {
+              "id": "aws-smithy-http 0.64.3",
+              "target": "aws_smithy_http"
+            },
+            {
+              "id": "aws-smithy-json 0.65.1",
+              "target": "aws_smithy_json"
+            },
+            {
+              "id": "aws-smithy-observability 0.3.0",
+              "target": "aws_smithy_observability"
+            },
+            {
+              "id": "aws-smithy-runtime 1.16.2",
+              "target": "aws_smithy_runtime"
+            },
+            {
+              "id": "aws-smithy-runtime-api 1.19.2",
+              "target": "aws_smithy_runtime_api"
+            },
+            {
+              "id": "aws-smithy-schema 1.1.2",
+              "target": "aws_smithy_schema"
+            },
+            {
+              "id": "aws-smithy-types 1.9.1",
+              "target": "aws_smithy_types"
+            },
+            {
+              "id": "aws-types 1.7.0",
+              "target": "aws_types"
+            },
+            {
+              "id": "bytes 1.12.1",
+              "target": "bytes"
+            },
+            {
+              "id": "fastrand 2.5.0",
+              "target": "fastrand"
+            },
+            {
+              "id": "http 1.5.0",
+              "target": "http",
+              "alias": "http_1x"
+            },
+            {
+              "id": "regex-lite 0.1.9",
+              "target": "regex_lite"
+            },
+            {
+              "id": "tracing 0.1.44",
+              "target": "tracing"
+            },
+            {
+              "id": "url 2.5.8",
+              "target": "url"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "1.137.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -5730,6 +5853,13 @@
         "compile_data_glob": [
           "**"
         ],
+        "crate_features": {
+          "common": [
+            "default",
+            "std"
+          ],
+          "selects": {}
+        },
         "edition": "2021",
         "version": "1.5.0"
       },
@@ -6555,6 +6685,13 @@
         "compile_data_glob": [
           "**"
         ],
+        "crate_features": {
+          "common": [
+            "db",
+            "std"
+          ],
+          "selects": {}
+        },
         "edition": "2021",
         "version": "0.9.6"
       },
@@ -8804,6 +8941,208 @@
       ],
       "license_file": "LICENSE"
     },
+    "deadpool 0.13.1": {
+      "name": "deadpool",
+      "version": "0.13.1",
+      "package_url": "https://github.com/deadpool-rs/deadpool",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/deadpool/0.13.1/download",
+          "sha256": "3e98a7e119cd347f4201e1159b19831029e203e2d8b790547708e8157b4acf1e"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "deadpool",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "deadpool",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "managed",
+            "rt_tokio_1"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "deadpool-runtime 0.3.1",
+              "target": "deadpool_runtime"
+            },
+            {
+              "id": "tokio 1.54.1",
+              "target": "tokio"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.13.1"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "deadpool-postgres 0.14.2": {
+      "name": "deadpool-postgres",
+      "version": "0.14.2",
+      "package_url": "https://github.com/deadpool-rs/deadpool",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/deadpool-postgres/0.14.2/download",
+          "sha256": "65a536565624b97fc19f758cd01b15d12908d3344425066efc8162236fbd3749"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "deadpool_postgres",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "deadpool_postgres",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "rt_tokio_1"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "deadpool 0.13.1",
+              "target": "deadpool"
+            },
+            {
+              "id": "tokio 1.54.1",
+              "target": "tokio"
+            },
+            {
+              "id": "tracing 0.1.44",
+              "target": "tracing"
+            }
+          ],
+          "selects": {
+            "cfg(not(target_arch = \"wasm32\"))": [
+              {
+                "id": "tokio-postgres 0.7.18",
+                "target": "tokio_postgres"
+              }
+            ],
+            "cfg(target_arch = \"wasm32\")": [
+              {
+                "id": "getrandom 0.4.3",
+                "target": "getrandom"
+              },
+              {
+                "id": "tokio-postgres 0.7.18",
+                "target": "tokio_postgres"
+              }
+            ]
+          }
+        },
+        "edition": "2024",
+        "proc_macro_deps": {
+          "common": [
+            {
+              "id": "async-trait 0.1.92",
+              "target": "async_trait"
+            }
+          ],
+          "selects": {}
+        },
+        "version": "0.14.2"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "deadpool-runtime 0.3.1": {
+      "name": "deadpool-runtime",
+      "version": "0.3.1",
+      "package_url": "https://github.com/deadpool-rs/deadpool",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/deadpool-runtime/0.3.1/download",
+          "sha256": "2657f61fb1dd8bf37a8d51093cc7cee4e77125b22f7753f49b289f831bec2bae"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "deadpool_runtime",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "deadpool_runtime",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "tokio_1"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "tokio 1.54.1",
+              "target": "tokio",
+              "alias": "tokio_1"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.3.1"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
     "der 0.7.10": {
       "name": "der",
       "version": "0.7.10",
@@ -8836,6 +9175,8 @@
         "crate_features": {
           "common": [
             "alloc",
+            "derive",
+            "flagset",
             "oid",
             "pem",
             "std",
@@ -8850,6 +9191,10 @@
               "target": "const_oid"
             },
             {
+              "id": "flagset 0.4.7",
+              "target": "flagset"
+            },
+            {
               "id": "pem-rfc7468 0.7.0",
               "target": "pem_rfc7468"
             },
@@ -8861,6 +9206,15 @@
           "selects": {}
         },
         "edition": "2021",
+        "proc_macro_deps": {
+          "common": [
+            {
+              "id": "der_derive 0.7.3",
+              "target": "der_derive"
+            }
+          ],
+          "selects": {}
+        },
         "version": "0.7.10"
       },
       "license": "Apache-2.0 OR MIT",
@@ -9014,6 +9368,62 @@
         "version": "10.0.0"
       },
       "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "der_derive 0.7.3": {
+      "name": "der_derive",
+      "version": "0.7.3",
+      "package_url": "https://github.com/RustCrypto/formats/tree/master/der/derive",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/der_derive/0.7.3/download",
+          "sha256": "8034092389675178f570469e6c3b0465d3d30b4505c294a6550db47f3c17ad18"
+        }
+      },
+      "targets": [
+        {
+          "ProcMacro": {
+            "crate_name": "der_derive",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "der_derive",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "proc-macro2 1.0.107",
+              "target": "proc_macro2"
+            },
+            {
+              "id": "quote 1.0.47",
+              "target": "quote"
+            },
+            {
+              "id": "syn 2.0.119",
+              "target": "syn"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.7.3"
+      },
+      "license": "Apache-2.0 OR MIT",
       "license_ids": [
         "Apache-2.0",
         "MIT"
@@ -10410,22 +10820,10 @@
         ],
         "crate_features": {
           "common": [
+            "default",
             "std"
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              "default"
-            ],
-            "aarch64-unknown-linux-gnu": [
-              "default"
-            ],
-            "x86_64-unknown-linux-gnu": [
-              "default"
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              "default"
-            ]
-          }
+          "selects": {}
         },
         "deps": {
           "common": [],
@@ -10604,6 +11002,52 @@
         "version": "0.5.4"
       },
       "license": "Apache-2.0 OR MIT",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "fallible-iterator 0.2.0": {
+      "name": "fallible-iterator",
+      "version": "0.2.0",
+      "package_url": "https://github.com/sfackler/rust-fallible-iterator",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/fallible-iterator/0.2.0/download",
+          "sha256": "4443176a9f2c162692bd3d352d745ef9413eec5782a80d8fd6f8a1ac692a07f7"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "fallible_iterator",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "fallible_iterator",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default",
+            "std"
+          ],
+          "selects": {}
+        },
+        "edition": "2018",
+        "version": "0.2.0"
+      },
+      "license": "MIT/Apache-2.0",
       "license_ids": [
         "Apache-2.0",
         "MIT"
@@ -11964,9 +12408,9 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
-    "gang-authn 0.2.0": {
+    "gang-authn 0.3.0": {
       "name": "gang-authn",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -12039,7 +12483,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -12047,9 +12491,9 @@
       ],
       "license_file": null
     },
-    "gang-aws 0.2.0": {
+    "gang-aws 0.3.0": {
       "name": "gang-aws",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -12078,10 +12522,6 @@
               "target": "aws_config"
             },
             {
-              "id": "aws-runtime 1.10.2",
-              "target": "aws_runtime"
-            },
-            {
               "id": "aws-sdk-autoscaling 1.140.0",
               "target": "aws_sdk_autoscaling"
             },
@@ -12096,10 +12536,6 @@
             {
               "id": "aws-sdk-sts 1.124.0",
               "target": "aws_sdk_sts"
-            },
-            {
-              "id": "aws-smithy-http-client 1.5.2",
-              "target": "aws_smithy_http_client"
             },
             {
               "id": "aws-smithy-runtime-api 1.19.2",
@@ -12174,7 +12610,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -12182,9 +12618,84 @@
       ],
       "license_file": null
     },
-    "gang-bindings 0.2.0": {
+    "gang-aws-sdk 0.3.0": {
+      "name": "gang-aws-sdk",
+      "version": "0.3.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "gang_aws_sdk",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "gang_aws_sdk",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "aws-config 1.13.0",
+              "target": "aws_config"
+            },
+            {
+              "id": "aws-runtime 1.10.2",
+              "target": "aws_runtime"
+            },
+            {
+              "id": "aws-smithy-http-client 1.5.2",
+              "target": "aws_smithy_http_client"
+            },
+            {
+              "id": "aws-smithy-runtime-api 1.19.2",
+              "target": "aws_smithy_runtime_api"
+            },
+            {
+              "id": "aws-smithy-types 1.9.1",
+              "target": "aws_smithy_types"
+            },
+            {
+              "id": "serde 1.0.229",
+              "target": "serde"
+            },
+            {
+              "id": "thiserror 2.0.21",
+              "target": "thiserror"
+            }
+          ],
+          "selects": {}
+        },
+        "deps_dev": {
+          "common": [
+            {
+              "id": "serde_json 1.0.154",
+              "target": "serde_json"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.3.0"
+      },
+      "license": "Apache-2.0",
+      "license_ids": [
+        "Apache-2.0"
+      ],
+      "license_file": null
+    },
+    "gang-bindings 0.3.0": {
       "name": "gang-bindings",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [],
@@ -12215,7 +12726,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -12223,9 +12734,9 @@
       ],
       "license_file": null
     },
-    "gang-bwrap 0.2.0": {
+    "gang-bwrap 0.3.0": {
       "name": "gang-bwrap",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -12286,7 +12797,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -12294,9 +12805,9 @@
       ],
       "license_file": null
     },
-    "gang-cgroup 0.2.0": {
+    "gang-cgroup 0.3.0": {
       "name": "gang-cgroup",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -12361,7 +12872,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -12369,9 +12880,9 @@
       ],
       "license_file": null
     },
-    "gang-client 0.2.0": {
+    "gang-client 0.3.0": {
       "name": "gang-client",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -12468,7 +12979,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -12476,9 +12987,9 @@
       ],
       "license_file": null
     },
-    "gang-clock 0.2.0": {
+    "gang-clock 0.3.0": {
       "name": "gang-clock",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -12539,7 +13050,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -12547,9 +13058,9 @@
       ],
       "license_file": null
     },
-    "gang-config 0.2.0": {
+    "gang-config 0.3.0": {
       "name": "gang-config",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -12606,7 +13117,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -12614,9 +13125,9 @@
       ],
       "license_file": null
     },
-    "gang-deploy 0.2.0": {
+    "gang-deploy 0.3.0": {
       "name": "gang-deploy",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -12672,7 +13183,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -12680,9 +13191,80 @@
       ],
       "license_file": null
     },
-    "gang-e2e 0.2.0": {
+    "gang-dynamodb 0.3.0": {
+      "name": "gang-dynamodb",
+      "version": "0.3.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "gang_dynamodb",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "gang_dynamodb",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "aws-sdk-dynamodb 1.137.0",
+              "target": "aws_sdk_dynamodb"
+            },
+            {
+              "id": "getrandom 0.4.3",
+              "target": "getrandom"
+            },
+            {
+              "id": "hex 0.4.3",
+              "target": "hex"
+            },
+            {
+              "id": "serde 1.0.229",
+              "target": "serde"
+            },
+            {
+              "id": "thiserror 2.0.21",
+              "target": "thiserror"
+            },
+            {
+              "id": "tokio 1.54.1",
+              "target": "tokio"
+            }
+          ],
+          "selects": {}
+        },
+        "deps_dev": {
+          "common": [
+            {
+              "id": "aws-credential-types 1.3.1",
+              "target": "aws_credential_types"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.3.0"
+      },
+      "license": "Apache-2.0",
+      "license_ids": [
+        "Apache-2.0"
+      ],
+      "license_file": null
+    },
+    "gang-e2e 0.3.0": {
       "name": "gang-e2e",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -12739,12 +13321,28 @@
               "target": "http"
             },
             {
+              "id": "hyper 1.12.0",
+              "target": "hyper"
+            },
+            {
+              "id": "hyper-util 0.1.21",
+              "target": "hyper_util"
+            },
+            {
+              "id": "nativelink-proto 1.8.3",
+              "target": "nativelink_proto"
+            },
+            {
               "id": "p256 0.14.0",
               "target": "p256"
             },
             {
               "id": "parking_lot 0.12.5",
               "target": "parking_lot"
+            },
+            {
+              "id": "prost 0.14.4",
+              "target": "prost"
             },
             {
               "id": "rustix 1.1.6",
@@ -12815,7 +13413,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -12823,9 +13421,9 @@
       ],
       "license_file": null
     },
-    "gang-embed 0.2.0": {
+    "gang-embed 0.3.0": {
       "name": "gang-embed",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -12874,7 +13472,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -12882,9 +13480,9 @@
       ],
       "license_file": null
     },
-    "gang-exec 0.2.0": {
+    "gang-exec 0.3.0": {
       "name": "gang-exec",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -12909,8 +13507,16 @@
         "deps": {
           "common": [
             {
+              "id": "futures 0.3.34",
+              "target": "futures"
+            },
+            {
               "id": "rustix 1.1.6",
               "target": "rustix"
+            },
+            {
+              "id": "signal-hook 0.4.6",
+              "target": "signal_hook"
             },
             {
               "id": "thiserror 2.0.21",
@@ -12940,12 +13546,16 @@
             {
               "id": "tempfile 3.27.0",
               "target": "tempfile"
+            },
+            {
+              "id": "tokio-stream 0.1.19",
+              "target": "tokio_stream"
             }
           ],
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -12953,9 +13563,9 @@
       ],
       "license_file": null
     },
-    "gang-insight 0.2.0": {
+    "gang-insight 0.3.0": {
       "name": "gang-insight",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -12980,6 +13590,14 @@
         "deps": {
           "common": [
             {
+              "id": "serde 1.0.229",
+              "target": "serde"
+            },
+            {
+              "id": "serde_json 1.0.154",
+              "target": "serde_json"
+            },
+            {
               "id": "thiserror 2.0.21",
               "target": "thiserror"
             }
@@ -12987,7 +13605,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -12995,9 +13613,9 @@
       ],
       "license_file": null
     },
-    "gang-local 0.2.0": {
+    "gang-local 0.3.0": {
       "name": "gang-local",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13090,7 +13708,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13098,9 +13716,9 @@
       ],
       "license_file": null
     },
-    "gang-macros 0.2.0": {
+    "gang-macros 0.3.0": {
       "name": "gang-macros",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13140,7 +13758,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13148,9 +13766,9 @@
       ],
       "license_file": null
     },
-    "gang-main 0.2.0": {
+    "gang-main 0.3.0": {
       "name": "gang-main",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13185,6 +13803,10 @@
             {
               "id": "clap 4.6.7",
               "target": "clap"
+            },
+            {
+              "id": "getrandom 0.4.3",
+              "target": "getrandom"
             },
             {
               "id": "mimalloc 0.1.52",
@@ -13263,7 +13885,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13271,9 +13893,9 @@
       ],
       "license_file": null
     },
-    "gang-mtls 0.2.0": {
+    "gang-mtls 0.3.0": {
       "name": "gang-mtls",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13362,7 +13984,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13370,9 +13992,9 @@
       ],
       "license_file": null
     },
-    "gang-nativelink 0.2.0": {
+    "gang-nativelink 0.3.0": {
       "name": "gang-nativelink",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13506,6 +14128,10 @@
               "target": "base64"
             },
             {
+              "id": "h2 0.4.20",
+              "target": "h2"
+            },
+            {
               "id": "prost 0.14.4",
               "target": "prost"
             },
@@ -13530,7 +14156,7 @@
           ],
           "selects": {}
         },
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13538,9 +14164,9 @@
       ],
       "license_file": null
     },
-    "gang-noop 0.2.0": {
+    "gang-noop 0.3.0": {
       "name": "gang-noop",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13597,7 +14223,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13605,9 +14231,9 @@
       ],
       "license_file": null
     },
-    "gang-oidc 0.2.0": {
+    "gang-oidc 0.3.0": {
       "name": "gang-oidc",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13688,7 +14314,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13696,9 +14322,9 @@
       ],
       "license_file": null
     },
-    "gang-os 0.2.0": {
+    "gang-os 0.3.0": {
       "name": "gang-os",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13746,7 +14372,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13754,9 +14380,92 @@
       ],
       "license_file": null
     },
-    "gang-reconciler 0.2.0": {
+    "gang-postgres 0.3.0": {
+      "name": "gang-postgres",
+      "version": "0.3.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "gang_postgres",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "gang_postgres",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "deadpool-postgres 0.14.2",
+              "target": "deadpool_postgres"
+            },
+            {
+              "id": "rustls-pki-types 1.15.1",
+              "target": "rustls_pki_types"
+            },
+            {
+              "id": "serde 1.0.229",
+              "target": "serde"
+            },
+            {
+              "id": "thiserror 2.0.21",
+              "target": "thiserror"
+            },
+            {
+              "id": "time 0.3.55",
+              "target": "time"
+            },
+            {
+              "id": "tokio 1.54.1",
+              "target": "tokio"
+            },
+            {
+              "id": "tokio-postgres 0.7.18",
+              "target": "tokio_postgres"
+            },
+            {
+              "id": "tokio-postgres-rustls 0.14.0",
+              "target": "tokio_postgres_rustls"
+            }
+          ],
+          "selects": {}
+        },
+        "deps_dev": {
+          "common": [
+            {
+              "id": "tempfile 3.27.0",
+              "target": "tempfile"
+            },
+            {
+              "id": "toml 1.2.0+spec-1.1.0",
+              "target": "toml"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.3.0"
+      },
+      "license": "Apache-2.0",
+      "license_ids": [
+        "Apache-2.0"
+      ],
+      "license_file": null
+    },
+    "gang-reconciler 0.3.0": {
       "name": "gang-reconciler",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13792,7 +14501,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13800,9 +14509,9 @@
       ],
       "license_file": null
     },
-    "gang-server 0.2.0": {
+    "gang-server 0.3.0": {
       "name": "gang-server",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13853,6 +14562,14 @@
             {
               "id": "http-body-util 0.1.5",
               "target": "http_body_util"
+            },
+            {
+              "id": "hyper 1.12.0",
+              "target": "hyper"
+            },
+            {
+              "id": "hyper-util 0.1.21",
+              "target": "hyper_util"
             },
             {
               "id": "ipnet 2.12.2",
@@ -13919,7 +14636,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13927,9 +14644,9 @@
       ],
       "license_file": null
     },
-    "gang-spi 0.2.0": {
+    "gang-spi 0.3.0": {
       "name": "gang-spi",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13962,6 +14679,10 @@
               "target": "futures"
             },
             {
+              "id": "getrandom 0.4.3",
+              "target": "getrandom"
+            },
+            {
               "id": "http 1.5.0",
               "target": "http"
             },
@@ -13988,12 +14709,20 @@
             {
               "id": "tokio 1.54.1",
               "target": "tokio"
+            },
+            {
+              "id": "tracing 0.1.44",
+              "target": "tracing"
             }
           ],
           "selects": {}
         },
         "deps_dev": {
           "common": [
+            {
+              "id": "tempfile 3.27.0",
+              "target": "tempfile"
+            },
             {
               "id": "toml 1.2.0+spec-1.1.0",
               "target": "toml"
@@ -14002,7 +14731,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14010,9 +14739,9 @@
       ],
       "license_file": null
     },
-    "gang-sqlite 0.2.0": {
+    "gang-sqlite 0.3.0": {
       "name": "gang-sqlite",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14069,7 +14798,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14077,9 +14806,9 @@
       ],
       "license_file": null
     },
-    "gang-state 0.2.0": {
+    "gang-state 0.3.0": {
       "name": "gang-state",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14136,7 +14865,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14144,9 +14873,9 @@
       ],
       "license_file": null
     },
-    "gang-testkit 0.2.0": {
+    "gang-testkit 0.3.0": {
       "name": "gang-testkit",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14171,12 +14900,20 @@
         "deps": {
           "common": [
             {
+              "id": "axum 0.8.9",
+              "target": "axum"
+            },
+            {
               "id": "base64 0.23.1",
               "target": "base64"
             },
             {
               "id": "bytes 1.12.1",
               "target": "bytes"
+            },
+            {
+              "id": "flate2 1.1.10",
+              "target": "flate2"
             },
             {
               "id": "futures 0.3.34",
@@ -14223,12 +14960,24 @@
               "target": "serde_json"
             },
             {
+              "id": "tar 0.4.46",
+              "target": "tar"
+            },
+            {
+              "id": "tempfile 3.27.0",
+              "target": "tempfile"
+            },
+            {
               "id": "thiserror 2.0.21",
               "target": "thiserror"
             },
             {
               "id": "tokio 1.54.1",
               "target": "tokio"
+            },
+            {
+              "id": "tokio-postgres 0.7.18",
+              "target": "tokio_postgres"
             },
             {
               "id": "toml 1.2.0+spec-1.1.0",
@@ -14255,7 +15004,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14263,9 +15012,9 @@
       ],
       "license_file": null
     },
-    "gang-tls 0.2.0": {
+    "gang-tls 0.3.0": {
       "name": "gang-tls",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14374,7 +15123,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14382,9 +15131,9 @@
       ],
       "license_file": null
     },
-    "gang-types 0.2.0": {
+    "gang-types 0.3.0": {
       "name": "gang-types",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14461,7 +15210,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14469,9 +15218,9 @@
       ],
       "license_file": null
     },
-    "gang-ui 0.2.0": {
+    "gang-ui 0.3.0": {
       "name": "gang-ui",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14507,7 +15256,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14515,9 +15264,9 @@
       ],
       "license_file": null
     },
-    "gang-wire 0.2.0": {
+    "gang-wire 0.3.0": {
       "name": "gang-wire",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14569,7 +15318,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14577,9 +15326,9 @@
       ],
       "license_file": null
     },
-    "gang-worker 0.2.0": {
+    "gang-worker 0.3.0": {
       "name": "gang-worker",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14640,7 +15389,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -19559,6 +20308,44 @@
       ],
       "license_file": "LICENSE.txt"
     },
+    "libredox 0.1.25": {
+      "name": "libredox",
+      "version": "0.1.25",
+      "package_url": "https://gitlab.redox-os.org/redox-os/libredox.git",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/libredox/0.1.25/download",
+          "sha256": "61ff90caf6077a803a240f62fdbe88645a890bbca49ef8174c3cb0404362171d"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "libredox",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "libredox",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "edition": "2021",
+        "version": "0.1.25"
+      },
+      "license": "MIT",
+      "license_ids": [
+        "MIT"
+      ],
+      "license_file": "LICENSE"
+    },
     "libsqlite3-sys 0.38.2": {
       "name": "libsqlite3-sys",
       "version": "0.38.2",
@@ -23688,6 +24475,7 @@
             "CFBase",
             "CFData",
             "CFDictionary",
+            "CFError",
             "CFPlugInCOM",
             "CFRunLoop",
             "CFString",
@@ -23762,6 +24550,62 @@
               "id": "libc 0.2.191",
               "target": "libc"
             },
+            {
+              "id": "objc2-core-foundation 0.3.2",
+              "target": "objc2_core_foundation"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.3.2"
+      },
+      "license": "Zlib OR Apache-2.0 OR MIT",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT",
+        "Zlib"
+      ],
+      "license_file": null
+    },
+    "objc2-system-configuration 0.3.2": {
+      "name": "objc2-system-configuration",
+      "version": "0.3.2",
+      "package_url": "https://github.com/madsmtm/objc2",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/objc2-system-configuration/0.3.2/download",
+          "sha256": "7216bd11cbda54ccabcab84d523dc93b858ec75ecfb3a7d89513fa22464da396"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "objc2_system_configuration",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "objc2_system_configuration",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "SCDynamicStore",
+            "SCDynamicStoreCopySpecific"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
             {
               "id": "objc2-core-foundation 0.3.2",
               "target": "objc2_core_foundation"
@@ -24642,9 +25486,9 @@
       ],
       "license_file": null
     },
-    "opentofu-runner 0.2.0": {
+    "opentofu-runner 0.3.0": {
       "name": "opentofu-runner",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -24680,7 +25524,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -25940,6 +26784,113 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
+    "phf 0.13.1": {
+      "name": "phf",
+      "version": "0.13.1",
+      "package_url": "https://github.com/rust-phf/rust-phf",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/phf/0.13.1/download",
+          "sha256": "c1562dc717473dbaa4c1f85a36410e03c047b2e7df7f45ee938fbef64ae7fadf"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "phf",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "phf",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default",
+            "std"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "phf_shared 0.13.1",
+              "target": "phf_shared"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.13.1"
+      },
+      "license": "MIT",
+      "license_ids": [
+        "MIT"
+      ],
+      "license_file": "LICENSE"
+    },
+    "phf_shared 0.13.1": {
+      "name": "phf_shared",
+      "version": "0.13.1",
+      "package_url": "https://github.com/rust-phf/rust-phf",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/phf_shared/0.13.1/download",
+          "sha256": "e57fef6bc5981e38c2ce2d63bfa546861309f875b8a75f092d1d54ae2d64f266"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "phf_shared",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "phf_shared",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "std"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "siphasher 1.0.4",
+              "target": "siphasher"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.13.1"
+      },
+      "license": "MIT",
+      "license_ids": [
+        "MIT"
+      ],
+      "license_file": "LICENSE"
+    },
     "pin-project 1.1.13": {
       "name": "pin-project",
       "version": "1.1.13",
@@ -26454,6 +27405,164 @@
         ]
       },
       "license": "Apache-2.0 OR MIT",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "postgres-protocol 0.6.12": {
+      "name": "postgres-protocol",
+      "version": "0.6.12",
+      "package_url": "https://github.com/rust-postgres/rust-postgres",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/postgres-protocol/0.6.12/download",
+          "sha256": "08808e3c483c46e999108051c78334f473d5adb59d78bb80a1268c7e6aa6c514"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "postgres_protocol",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "postgres_protocol",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "base64 0.22.1",
+              "target": "base64"
+            },
+            {
+              "id": "byteorder 1.5.0",
+              "target": "byteorder"
+            },
+            {
+              "id": "bytes 1.12.1",
+              "target": "bytes"
+            },
+            {
+              "id": "fallible-iterator 0.2.0",
+              "target": "fallible_iterator"
+            },
+            {
+              "id": "hmac 0.13.0",
+              "target": "hmac"
+            },
+            {
+              "id": "md-5 0.11.0",
+              "target": "md5"
+            },
+            {
+              "id": "memchr 2.8.3",
+              "target": "memchr"
+            },
+            {
+              "id": "rand 0.10.3",
+              "target": "rand"
+            },
+            {
+              "id": "sha2 0.11.1",
+              "target": "sha2"
+            },
+            {
+              "id": "stringprep 0.1.5",
+              "target": "stringprep"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.6.12"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "postgres-types 0.2.14": {
+      "name": "postgres-types",
+      "version": "0.2.14",
+      "package_url": "https://github.com/rust-postgres/rust-postgres",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/postgres-types/0.2.14/download",
+          "sha256": "851ca9db4932932d69f3ea811b1abe63087a0f740a47692619dd40d4899b68be"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "postgres_types",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "postgres_types",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "time-03",
+            "with-time-0_3"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "bytes 1.12.1",
+              "target": "bytes"
+            },
+            {
+              "id": "fallible-iterator 0.2.0",
+              "target": "fallible_iterator"
+            },
+            {
+              "id": "postgres-protocol 0.6.12",
+              "target": "postgres_protocol"
+            },
+            {
+              "id": "time 0.3.55",
+              "target": "time",
+              "alias": "time_03"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.2.14"
+      },
+      "license": "MIT OR Apache-2.0",
       "license_ids": [
         "Apache-2.0",
         "MIT"
@@ -29730,6 +30839,7 @@
             "cache",
             "default",
             "ffi-sqlite-wasm-rs",
+            "functions",
             "hashlink",
             "modern_sqlite"
           ],
@@ -30137,6 +31247,7 @@
             "process",
             "pty",
             "std",
+            "stdio",
             "termios"
           ],
           "selects": {}
@@ -32598,6 +33709,95 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
+    "signal-hook 0.4.6": {
+      "name": "signal-hook",
+      "version": "0.4.6",
+      "package_url": "https://github.com/vorner/signal-hook",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/signal-hook/0.4.6/download",
+          "sha256": "49f7447afd772ca79ad17ae0a3972a6b0df0cb4b80990fd82707593e9e012a74"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "signal_hook",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        },
+        {
+          "BuildScript": {
+            "crate_name": "build_script_build",
+            "crate_root": "build.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "signal_hook",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "channel",
+            "default",
+            "iterator"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "libc 0.2.191",
+              "target": "libc"
+            },
+            {
+              "id": "signal-hook-registry 1.4.8",
+              "target": "signal_hook_registry"
+            }
+          ],
+          "selects": {}
+        },
+        "extra_deps": {
+          "common": [
+            ":build_script_build"
+          ],
+          "selects": {}
+        },
+        "edition": "2018",
+        "version": "0.4.6"
+      },
+      "build_script_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "compile_data_glob_excludes": [
+          "**/*.rs"
+        ],
+        "data_glob": [
+          "**"
+        ]
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
     "signal-hook-registry 1.4.8": {
       "name": "signal-hook-registry",
       "version": "1.4.8",
@@ -32969,6 +34169,52 @@
         "ISC"
       ],
       "license_file": "LICENSE"
+    },
+    "siphasher 1.0.4": {
+      "name": "siphasher",
+      "version": "1.0.4",
+      "package_url": "https://github.com/jedisct1/rust-siphash",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/siphasher/1.0.4/download",
+          "sha256": "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "siphasher",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "siphasher",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default",
+            "std"
+          ],
+          "selects": {}
+        },
+        "edition": "2018",
+        "version": "1.0.4"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
     },
     "slab 0.4.12": {
       "name": "slab",
@@ -34416,6 +35662,61 @@
       ],
       "license_file": "LICENSE.txt"
     },
+    "tar 0.4.46": {
+      "name": "tar",
+      "version": "0.4.46",
+      "package_url": "https://github.com/composefs/tar-rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/tar/0.4.46/download",
+          "sha256": "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "tar",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "tar",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "filetime 0.2.29",
+              "target": "filetime"
+            }
+          ],
+          "selects": {
+            "cfg(unix)": [
+              {
+                "id": "libc 0.2.191",
+                "target": "libc"
+              }
+            ]
+          }
+        },
+        "edition": "2021",
+        "version": "0.4.46"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
     "tempfile 3.27.0": {
       "name": "tempfile",
       "version": "3.27.0",
@@ -35580,6 +36881,226 @@
         },
         "edition": "2021",
         "version": "2.7.2"
+      },
+      "license": "MIT",
+      "license_ids": [
+        "MIT"
+      ],
+      "license_file": "LICENSE"
+    },
+    "tokio-postgres 0.7.18": {
+      "name": "tokio-postgres",
+      "version": "0.7.18",
+      "package_url": "https://github.com/rust-postgres/rust-postgres",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/tokio-postgres/0.7.18/download",
+          "sha256": "a528f7d280f6d5b9cd149635c8705b0dd049754bc67d81d31fa25169a93809d3"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "tokio_postgres",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "tokio_postgres",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "runtime",
+            "with-time-0_3"
+          ],
+          "selects": {
+            "aarch64-apple-darwin": [
+              "default"
+            ],
+            "aarch64-unknown-linux-gnu": [
+              "default"
+            ],
+            "x86_64-pc-windows-msvc": [
+              "default"
+            ],
+            "x86_64-unknown-linux-gnu": [
+              "default"
+            ],
+            "x86_64-unknown-nixos-gnu": [
+              "default"
+            ]
+          }
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "byteorder 1.5.0",
+              "target": "byteorder"
+            },
+            {
+              "id": "bytes 1.12.1",
+              "target": "bytes"
+            },
+            {
+              "id": "fallible-iterator 0.2.0",
+              "target": "fallible_iterator"
+            },
+            {
+              "id": "futures-channel 0.3.34",
+              "target": "futures_channel"
+            },
+            {
+              "id": "futures-util 0.3.34",
+              "target": "futures_util"
+            },
+            {
+              "id": "log 0.4.35",
+              "target": "log"
+            },
+            {
+              "id": "parking_lot 0.12.5",
+              "target": "parking_lot"
+            },
+            {
+              "id": "percent-encoding 2.3.2",
+              "target": "percent_encoding"
+            },
+            {
+              "id": "phf 0.13.1",
+              "target": "phf"
+            },
+            {
+              "id": "pin-project-lite 0.2.17",
+              "target": "pin_project_lite"
+            },
+            {
+              "id": "postgres-protocol 0.6.12",
+              "target": "postgres_protocol"
+            },
+            {
+              "id": "postgres-types 0.2.14",
+              "target": "postgres_types"
+            },
+            {
+              "id": "rand 0.10.3",
+              "target": "rand"
+            },
+            {
+              "id": "tokio 1.54.1",
+              "target": "tokio"
+            },
+            {
+              "id": "tokio-util 0.7.20",
+              "target": "tokio_util"
+            },
+            {
+              "id": "whoami 2.1.3",
+              "target": "whoami"
+            }
+          ],
+          "selects": {
+            "cfg(not(target_arch = \"wasm32\"))": [
+              {
+                "id": "socket2 0.6.5",
+                "target": "socket2"
+              }
+            ]
+          }
+        },
+        "edition": "2024",
+        "proc_macro_deps": {
+          "common": [
+            {
+              "id": "async-trait 0.1.92",
+              "target": "async_trait"
+            }
+          ],
+          "selects": {}
+        },
+        "version": "0.7.18"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "tokio-postgres-rustls 0.14.0": {
+      "name": "tokio-postgres-rustls",
+      "version": "0.14.0",
+      "package_url": "https://github.com/jbg/tokio-postgres-rustls",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/tokio-postgres-rustls/0.14.0/download",
+          "sha256": "4c2ad44aa0ae96db89c4742212ed41645b2f597311ff6e1945542a4d9fadc2fb"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "tokio_postgres_rustls",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "tokio_postgres_rustls",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "ring"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "rustls 0.23.46",
+              "target": "rustls"
+            },
+            {
+              "id": "sha2 0.11.1",
+              "target": "sha2"
+            },
+            {
+              "id": "tokio 1.54.1",
+              "target": "tokio"
+            },
+            {
+              "id": "tokio-postgres 0.7.18",
+              "target": "tokio_postgres"
+            },
+            {
+              "id": "tokio-rustls 0.26.6",
+              "target": "tokio_rustls"
+            },
+            {
+              "id": "x509-cert 0.2.5",
+              "target": "x509_cert"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.14.0"
       },
       "license": "MIT",
       "license_ids": [
@@ -39191,6 +40712,54 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
+    "wasi 0.14.7+wasi-0.2.4": {
+      "name": "wasi",
+      "version": "0.14.7+wasi-0.2.4",
+      "package_url": "https://github.com/bytecodealliance/wasi-rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/wasi/0.14.7+wasi-0.2.4/download",
+          "sha256": "883478de20367e224c0090af9cf5f9fa85bed63a95c1abf3afc5c083ebc06e8c"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "wasi",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "wasi",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "wasip2 1.0.4+wasi-0.2.12",
+              "target": "wasip2"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.14.7+wasi-0.2.4"
+      },
+      "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
     "wasip2 1.0.4+wasi-0.2.12": {
       "name": "wasip2",
       "version": "1.0.4+wasi-0.2.12",
@@ -39238,6 +40807,55 @@
         "MIT"
       ],
       "license_file": "LICENSE-APACHE"
+    },
+    "wasite 1.0.2": {
+      "name": "wasite",
+      "version": "1.0.2",
+      "package_url": "https://github.com/ardaku/wasite",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/wasite/1.0.2/download",
+          "sha256": "66fe902b4a6b8028a753d5424909b764ccf79b7a209eac9bf97e59cda9f71a42"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "wasite",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "wasite",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "wasi 0.14.7+wasi-0.2.4",
+              "target": "wasi"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "1.0.2"
+      },
+      "license": "Apache-2.0 OR BSL-1.0 OR MIT",
+      "license_ids": [
+        "Apache-2.0",
+        "BSL-1.0",
+        "MIT"
+      ],
+      "license_file": null
     },
     "wasm-bindgen 0.2.130": {
       "name": "wasm-bindgen",
@@ -39717,10 +41335,14 @@
             "AbortSignal",
             "Blob",
             "BlobPropertyBag",
+            "Document",
             "EventTarget",
             "File",
             "FormData",
             "Headers",
+            "Location",
+            "Navigator",
+            "Node",
             "QueuingStrategy",
             "ReadableByteStreamController",
             "ReadableStream",
@@ -39929,6 +41551,100 @@
         "CDLA-Permissive-2.0"
       ],
       "license_file": "LICENSE"
+    },
+    "whoami 2.1.3": {
+      "name": "whoami",
+      "version": "2.1.3",
+      "package_url": "https://github.com/ardaku/whoami",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/whoami/2.1.3/download",
+          "sha256": "626c4bac6755d76ffc12cb01b2eac751db1996b9e0041de9aa02c8c211ddc82c"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "whoami",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "whoami",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default",
+            "std",
+            "wasi-wasite",
+            "wasm-web"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [],
+          "selects": {
+            "aarch64-apple-darwin": [
+              {
+                "id": "libc 0.2.191",
+                "target": "libc"
+              },
+              {
+                "id": "objc2-system-configuration 0.3.2",
+                "target": "objc2_system_configuration"
+              }
+            ],
+            "aarch64-unknown-linux-gnu": [
+              {
+                "id": "libc 0.2.191",
+                "target": "libc"
+              }
+            ],
+            "wasm32-unknown-unknown": [
+              {
+                "id": "web-sys 0.3.107",
+                "target": "web_sys"
+              }
+            ],
+            "wasm32-wasip1": [
+              {
+                "id": "wasite 1.0.2",
+                "target": "wasite"
+              }
+            ],
+            "x86_64-unknown-linux-gnu": [
+              {
+                "id": "libc 0.2.191",
+                "target": "libc"
+              }
+            ],
+            "x86_64-unknown-nixos-gnu": [
+              {
+                "id": "libc 0.2.191",
+                "target": "libc"
+              }
+            ]
+          }
+        },
+        "edition": "2021",
+        "version": "2.1.3"
+      },
+      "license": "Apache-2.0 OR BSL-1.0 OR MIT",
+      "license_ids": [
+        "Apache-2.0",
+        "BSL-1.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE_APACHE"
     },
     "widestring 1.2.1": {
       "name": "widestring",
@@ -42080,9 +43796,9 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
-    "workspace-architecture 0.2.0": {
+    "workspace-architecture 0.3.0": {
       "name": "workspace-architecture",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -42135,7 +43851,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.0"
+        "version": "0.3.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -42227,6 +43943,68 @@
         "MIT"
       ],
       "license_file": "LICENSE.txt"
+    },
+    "x509-cert 0.2.5": {
+      "name": "x509-cert",
+      "version": "0.2.5",
+      "package_url": "https://github.com/RustCrypto/formats/tree/master/x509-cert",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/x509-cert/0.2.5/download",
+          "sha256": "1301e935010a701ae5f8655edc0ad17c44bad3ac5ce8c39185f75453b720ae94"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "x509_cert",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "x509_cert",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "std"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "const-oid 0.9.6",
+              "target": "const_oid"
+            },
+            {
+              "id": "der 0.7.10",
+              "target": "der"
+            },
+            {
+              "id": "spki 0.7.3",
+              "target": "spki"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.2.5"
+      },
+      "license": "Apache-2.0 OR MIT",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
     },
     "x509-cert 0.3.0": {
       "name": "x509-cert",
@@ -43634,40 +45412,43 @@
   },
   "binary_crates": [],
   "workspace_members": {
-    "gang-authn 0.2.0": "crates/gang-authn",
-    "gang-aws 0.2.0": "crates/gang-aws",
-    "gang-bindings 0.2.0": "crates/gang-bindings",
-    "gang-bwrap 0.2.0": "crates/gang-bwrap",
-    "gang-cgroup 0.2.0": "crates/gang-cgroup",
-    "gang-client 0.2.0": "crates/gang-client",
-    "gang-clock 0.2.0": "crates/gang-clock",
-    "gang-config 0.2.0": "crates/gang-config",
-    "gang-deploy 0.2.0": "crates/gang-deploy",
-    "gang-e2e 0.2.0": "crates/gang-e2e",
-    "gang-embed 0.2.0": "crates/gang-embed",
-    "gang-exec 0.2.0": "crates/gang-exec",
-    "gang-insight 0.2.0": "crates/gang-insight",
-    "gang-local 0.2.0": "crates/gang-local",
-    "gang-macros 0.2.0": "crates/gang-macros",
-    "gang-main 0.2.0": "crates/gang-main",
-    "gang-mtls 0.2.0": "crates/gang-mtls",
-    "gang-nativelink 0.2.0": "crates/gang-nativelink",
-    "gang-noop 0.2.0": "crates/gang-noop",
-    "gang-oidc 0.2.0": "crates/gang-oidc",
-    "gang-os 0.2.0": "crates/gang-os",
-    "gang-reconciler 0.2.0": "crates/gang-reconciler",
-    "gang-server 0.2.0": "crates/gang-server",
-    "gang-spi 0.2.0": "crates/gang-spi",
-    "gang-sqlite 0.2.0": "crates/gang-sqlite",
-    "gang-state 0.2.0": "crates/gang-state",
-    "gang-testkit 0.2.0": "crates/gang-testkit",
-    "gang-tls 0.2.0": "crates/gang-tls",
-    "gang-types 0.2.0": "crates/gang-types",
-    "gang-ui 0.2.0": "crates/gang-ui",
-    "gang-wire 0.2.0": "crates/gang-wire",
-    "gang-worker 0.2.0": "crates/gang-worker",
-    "opentofu-runner 0.2.0": "bazel/opentofu/runner",
-    "workspace-architecture 0.2.0": "bazel/architecture"
+    "gang-authn 0.3.0": "crates/gang-authn",
+    "gang-aws 0.3.0": "crates/gang-aws",
+    "gang-aws-sdk 0.3.0": "crates/gang-aws-sdk",
+    "gang-bindings 0.3.0": "crates/gang-bindings",
+    "gang-bwrap 0.3.0": "crates/gang-bwrap",
+    "gang-cgroup 0.3.0": "crates/gang-cgroup",
+    "gang-client 0.3.0": "crates/gang-client",
+    "gang-clock 0.3.0": "crates/gang-clock",
+    "gang-config 0.3.0": "crates/gang-config",
+    "gang-deploy 0.3.0": "crates/gang-deploy",
+    "gang-dynamodb 0.3.0": "crates/gang-dynamodb",
+    "gang-e2e 0.3.0": "crates/gang-e2e",
+    "gang-embed 0.3.0": "crates/gang-embed",
+    "gang-exec 0.3.0": "crates/gang-exec",
+    "gang-insight 0.3.0": "crates/gang-insight",
+    "gang-local 0.3.0": "crates/gang-local",
+    "gang-macros 0.3.0": "crates/gang-macros",
+    "gang-main 0.3.0": "crates/gang-main",
+    "gang-mtls 0.3.0": "crates/gang-mtls",
+    "gang-nativelink 0.3.0": "crates/gang-nativelink",
+    "gang-noop 0.3.0": "crates/gang-noop",
+    "gang-oidc 0.3.0": "crates/gang-oidc",
+    "gang-os 0.3.0": "crates/gang-os",
+    "gang-postgres 0.3.0": "crates/gang-postgres",
+    "gang-reconciler 0.3.0": "crates/gang-reconciler",
+    "gang-server 0.3.0": "crates/gang-server",
+    "gang-spi 0.3.0": "crates/gang-spi",
+    "gang-sqlite 0.3.0": "crates/gang-sqlite",
+    "gang-state 0.3.0": "crates/gang-state",
+    "gang-testkit 0.3.0": "crates/gang-testkit",
+    "gang-tls 0.3.0": "crates/gang-tls",
+    "gang-types 0.3.0": "crates/gang-types",
+    "gang-ui 0.3.0": "crates/gang-ui",
+    "gang-wire 0.3.0": "crates/gang-wire",
+    "gang-worker 0.3.0": "crates/gang-worker",
+    "opentofu-runner 0.3.0": "bazel/opentofu/runner",
+    "workspace-architecture 0.3.0": "bazel/architecture"
   },
   "conditions": {
     "aarch64-apple-darwin": [
@@ -43940,6 +45721,7 @@
     "aws-config 1.13.0",
     "aws-runtime 1.10.2",
     "aws-sdk-autoscaling 1.140.0",
+    "aws-sdk-dynamodb 1.137.0",
     "aws-sdk-ec2 1.275.0",
     "aws-sdk-kms 1.129.0",
     "aws-sdk-sts 1.124.0",
@@ -43951,8 +45733,10 @@
     "bytes 1.12.1",
     "clap 4.6.7",
     "const-oid 0.10.2",
+    "deadpool-postgres 0.14.2",
     "der 0.8.3",
     "ecdsa 0.17.0",
+    "flate2 1.1.10",
     "form_urlencoded 1.2.2",
     "futures 0.3.34",
     "futures-core 0.3.34",
@@ -43988,6 +45772,7 @@
     "percent-encoding 2.3.2",
     "pin-project-lite 0.2.17",
     "proc-macro2 1.0.107",
+    "prost 0.14.4",
     "quote 1.0.47",
     "rcgen 0.14.10",
     "ring 0.17.14",
@@ -43999,14 +45784,18 @@
     "serde 1.0.229",
     "serde_json 1.0.154",
     "sha2 0.11.1",
+    "signal-hook 0.4.6",
     "spki 0.8.1",
     "syn 2.0.119",
     "sysinfo 0.39.6",
+    "tar 0.4.46",
     "tempfile 3.27.0",
     "terminal_size 0.4.4",
     "thiserror 2.0.21",
     "time 0.3.55",
     "tokio 1.54.1",
+    "tokio-postgres 0.7.18",
+    "tokio-postgres-rustls 0.14.0",
     "tokio-rusqlite 0.8.0",
     "tokio-rustls 0.26.6",
     "tokio-stream 0.1.19",
@@ -44028,7 +45817,6 @@
     "allocation-counter 0.8.1",
     "aws-credential-types 1.3.1",
     "object 0.39.1",
-    "prost 0.14.4",
     "rustls-webpki 0.103.16"
   ],
   "unused_patches": []

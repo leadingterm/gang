@@ -41,6 +41,9 @@ pub enum ClientSettingsError {
     /// The backoff ceiling is below the backoff base.
     #[error("retry_max_backoff must be at least retry_initial_backoff")]
     BackoffOrder,
+    /// The connection cannot be established within an operation attempt.
+    #[error("connect_timeout must not exceed the operation attempt timeout")]
+    ConnectTimeout,
 }
 
 /// The wire form of [`ClientSettings`], checked by its conversion. Keys are as in the config.
@@ -83,6 +86,14 @@ impl TryFrom<ClientSettingsDoc> for ClientSettings {
     fn try_from(doc: ClientSettingsDoc) -> Result<Self, Self::Error> {
         if doc.retry_max_backoff < doc.retry_initial_backoff {
             return Err(ClientSettingsError::BackoffOrder);
+        }
+        let attempt_timeout = if doc.max_attempts.get() > 1 {
+            doc.request_timeout.get() / 2
+        } else {
+            doc.request_timeout.get()
+        };
+        if doc.connect_timeout.get() > attempt_timeout {
+            return Err(ClientSettingsError::ConnectTimeout);
         }
         Ok(Self {
             request_timeout: doc.request_timeout,
@@ -130,6 +141,21 @@ mod tests {
     fn zero_attempts_is_rejected() {
         let result = serde_json::from_str::<ClientSettings>(r#"{"max_attempts": 0}"#);
         assert!(result.is_err());
+    }
+    #[test]
+    fn connect_timeout_cannot_exceed_attempt_timeout() {
+        assert!(
+            serde_json::from_str::<ClientSettings>(
+                r#"{"request_timeout":"4s","connect_timeout":"3100ms"}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<ClientSettings>(
+                r#"{"request_timeout":"4s","connect_timeout":"3100ms","max_attempts":1}"#
+            )
+            .is_ok()
+        );
     }
 
     #[test]

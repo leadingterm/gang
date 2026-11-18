@@ -85,6 +85,9 @@ pub const RUN_DEFINE: &str = "e2e_run";
 /// Every build carries `--keep_going`, so one failed action does not cancel the other actions of
 /// the same invocation, such as a neighbour that shares the worker.
 ///
+/// Builds with probes set `--jobs` to their count so in-flight actions do not depend on the
+/// host's CPU count. Settings' extra build flags may override this default.
+///
 /// Probe-specific flags follow the settings' extra build flags, before all probe labels.
 ///
 /// The probe rule declares its action environment in the staged sample configuration.
@@ -106,6 +109,7 @@ pub fn build_args(
         "--noshow_progress",
         "--verbose_failures",
         "--keep_going",
+        "--lockfile_mode=off",
         "--disk_cache=",
         "--spawn_strategy=remote",
         "--noremote_local_fallback",
@@ -114,7 +118,6 @@ pub fn build_args(
     .into_iter()
     .map(str::to_owned)
     .collect();
-    args.push(format!("--remote_retries={}", settings.remote_retries));
     args.push(format!(
         "--shell_executable={}",
         action_tools.shell.display()
@@ -128,6 +131,9 @@ pub fn build_args(
         args.push(format!("--credential_helper={host}={}", helper.display()));
     }
 
+    if !probes.is_empty() {
+        args.push(format!("--jobs={}", probes.len()));
+    }
     args.extend(settings.bazel_flags.iter().cloned());
     args.extend(
         probes

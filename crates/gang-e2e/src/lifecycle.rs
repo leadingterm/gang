@@ -21,22 +21,22 @@ use crate::verdict;
 ///
 /// When the system cannot be driven or observed; a system that misbehaves is a failed [`Check`].
 pub fn lifecycle<S: System>(system: &S, variant: &Variant) -> Result<Vec<Check>> {
-    let mut checks = Vec::new();
-
     system.start_server()?;
     let workers = system.worker_count()?;
-    checks.push(Check::expect(
+    let mut checks = vec![Check::expect(
         names::lifecycle::STARTS_AT_ZERO,
         workers == 0,
         || format!("{workers} workers were running before the first build"),
-    ));
+    )];
 
     let cold = system.build(&[Probe::Isolated, Probe::NetworkRequested, Probe::Pinned])?;
-    checks.push(verdict::remote_execution(
+    if !crate::check::record_build(
+        &mut checks,
         &cold,
-        3,
-        system.stderr_tail_lines(),
-    ));
+        verdict::remote_execution(&cold, 3, system.stderr_tail_lines()),
+    ) {
+        return Ok(checks);
+    }
 
     // Worker registrations are recorded by the next control pass.
     let events = match system

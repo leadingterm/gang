@@ -166,10 +166,10 @@ echo released=yes
 MEMORY_HOG = {
     "ISA": ISA,
     "cpu_count": str(CPU_COUNT),
-    "memory_kb": "32768",
+    "memory_kb": "65536",
 }
 
-# Allocates one 1 GiB buffer at once against a hard ceiling of twice its 32 MiB reservation. The
+# Allocates one 1 GiB buffer at once against a hard ceiling of twice its 64 MiB reservation. The
 # allocation outruns NativeLink's 250 ms sampling window, so this check proves the cgroup backstop:
 # the kernel kills it at `memory.max` before NativeLink's two-sample soft rule can act.
 probe(
@@ -181,9 +181,9 @@ echo hogged=yes
 """,
 )
 
-# Holds 48 MiB, above the 38.4 MiB soft limit of its 32 MiB reservation and below the 64 MiB cgroup
+# Holds 96 MiB, above the 76.8 MiB soft limit of its 64 MiB reservation and below the 128 MiB cgroup
 # ceiling, so only NativeLink can end the first attempt, which holds it until it is killed. The
-# requeued attempt, with the reservation doubled to 64 MiB, completes at once. `dd` reads the whole
+# requeued attempt, with the reservation doubled to 128 MiB, completes at once. `dd` reads the whole
 # size into one buffer and blocks writing it to `sleep`, which never reads, so the footprint is that
 # buffer however the processes are scheduled. Each attempt appends a line to $E2E_ATTEMPTS, a host
 # path, before it grows.
@@ -194,7 +194,7 @@ probe(
 echo attempt >> "$E2E_ATTEMPTS"
 attempts=$(wc -l < "$E2E_ATTEMPTS")
 if [ "$attempts" -eq 1 ]; then hold=300; else hold=0; fi
-dd if=/dev/zero bs=50331648 count=1 2>/dev/null | sleep "$hold"
+dd if=/dev/zero bs=100663296 count=1 2>/dev/null | sleep "$hold"
 echo "grown=yes"
 """,
 )
@@ -362,6 +362,49 @@ while [ ! -e "$G" ]; do sleep 1; done
 echo held=released
 """,
 )
+# Independent held actions for controller failover. The worker is identified by walking the
+# process ancestry on the Local Mode host, and each attempt records both ends of its interval.
+CONTROLLER_LOSS = JOURNAL + """
+# The harness precreates this file in the read-only signal directory. Locking is
+# nonblocking and observational: a contended attempt still runs rather than serializing.
+exec 9< "$(dirname "$E2E_SIGNAL")/$E2E_RUN-$E2E_ACTION.lock" || exit 1
+if flock --exclusive --nonblock --conflict-exit-code 42 9; then
+  witness=exclusive
+else
+  status=$?
+  [ "$status" -eq 42 ] || exit "$status"
+  witness=contended
+fi
+worker=$PPID
+while [ "$worker" -gt 1 ]; do
+  exec 3< "/proc/$worker/cmdline"
+  IFS= read -r -d '' program <&3 || exit 1
+  IFS= read -r -d '' subcommand <&3 || subcommand=
+  exec 3<&-
+  [ "$subcommand" = worker ] && break
+  parent=
+  while read -r key value rest; do
+    if [ "$key" = "PPid:" ]; then parent=$value; break; fi
+  done < "/proc/$worker/status"
+  [ -n "$parent" ] || exit 1
+  worker=$parent
+done
+[ "$worker" -gt 1 ] || exit 1
+attempt=$$
+echo "$E2E_RUN loss start $E2E_ACTION $worker $attempt $(date +%s%N) $witness" > "$J"
+while [ ! -e "$G" ]; do sleep 1; done
+echo "$E2E_RUN loss end $E2E_ACTION $worker $attempt $(date +%s%N)" > "$J"
+echo held=released
+"""
+probe(name = "controller_loss_0", script = CONTROLLER_LOSS, exec_properties = LIMITS)
+probe(name = "controller_loss_1", script = CONTROLLER_LOSS, exec_properties = LIMITS)
+probe(name = "controller_loss_2", script = CONTROLLER_LOSS, exec_properties = LIMITS)
+probe(name = "controller_loss_3", script = CONTROLLER_LOSS, exec_properties = LIMITS)
+probe(name = "controller_loss_4", script = CONTROLLER_LOSS, exec_properties = LIMITS)
+probe(name = "controller_loss_5", script = CONTROLLER_LOSS, exec_properties = LIMITS)
+probe(name = "controller_loss_6", script = CONTROLLER_LOSS, exec_properties = LIMITS)
+probe(name = "controller_loss_7", script = CONTROLLER_LOSS, exec_properties = LIMITS)
+
 
 # The memory hog, held until the go flag exists, so that its scope can be observed while it runs.
 probe(
@@ -376,7 +419,7 @@ echo hogged=yes
 )
 
 # Outgrows the soft limit of every reservation it gets and holds it, so each attempt ends only by a
-# kill: attempt n holds one `dd` buffer of 48 MiB times 2^(n-1), as memory_grower does, above the
+# kill: attempt n holds one `dd` buffer of 96 MiB times 2^(n-1), as memory_grower does, above the
 # soft limit of the reservation escalated n-1 times by 200 percent and below that reservation's
 # cgroup ceiling. Appends a line per attempt to $E2E_ATTEMPTS first.
 probe(
@@ -385,7 +428,7 @@ probe(
     script = """
 echo attempt >> "$E2E_ATTEMPTS"
 attempts=$(wc -l < "$E2E_ATTEMPTS")
-size=50331648
+size=100663296
 i=1
 while [ "$i" -lt "$attempts" ]; do size=$((size * 2)); i=$((i + 1)); done
 dd if=/dev/zero bs="$size" count=1 2>/dev/null | sleep 300

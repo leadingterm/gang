@@ -84,6 +84,8 @@ resource "aws_launch_template" "this" {
   user_data = base64encode("worker ${var.config_parameter_name}")
   tags      = merge(var.tags, { Name = each.value.name })
 
+  update_default_version = true
+
   iam_instance_profile {
     arn = module.instance_role.instance_profile_arn
   }

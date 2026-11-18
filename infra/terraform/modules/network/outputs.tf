@@ -40,17 +40,17 @@ output "worker_security_group_id" {
 
 output "controller_eip_allocation_id" {
   description = "Allocation ID of the controller Elastic IP, for the controller's EIP association."
-  value       = aws_eip.controller.allocation_id
+  value       = one(aws_eip.controller[*].allocation_id)
 }
 
 output "controller_public_ip" {
   description = "Public IPv4 address of the controller Elastic IP."
-  value       = aws_eip.controller.public_ip
+  value       = one(aws_eip.controller[*].public_ip)
 }
 
 output "controller_public_dns" {
   description = "EC2 public DNS name of the controller Elastic IP."
-  value = (
+  value = !var.controller_eip ? null : (
     local.region == "us-east-1"
     ? "ec2-${local.controller_public_ip_dashed}.compute-1.amazonaws.com"
     : "ec2-${local.controller_public_ip_dashed}.${local.region}.compute.amazonaws.com"
@@ -81,7 +81,17 @@ output "public_port" {
   value       = local.public_port
 }
 
+output "execution_port" {
+  description = "TCP port of the controller's execution listener in the multi-controller shape; reached only through the load balancers."
+  value       = local.execution_port
+}
+
 output "worker_port" {
   description = "TCP port of the controller's worker listener. Opened to the worker security group only."
   value       = local.worker_port
+}
+
+output "health_port" {
+  description = "TCP port of the controller's health listener used by load balancer target groups."
+  value       = local.health_port
 }

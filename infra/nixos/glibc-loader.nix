@@ -14,6 +14,14 @@
   # read-only.
   programs.nix-ld.enable = true;
 
+  # Upstream draft (not filed): "Default LD_LIBRARY_PATH trampoline restores a read-only
+  # environment string (gawk aborts)". Remove when pinned upstream supplies a writable
+  # replacement environment string:
+  # https://github.com/nix-community/nix-ld/blob/af1a6c38d6a9889f7acfd14cece8ea1834ee8035/src/main.rs#L43
+  programs.nix-ld.package = pkgs.nix-ld.overrideAttrs (old: {
+    patches = (old.patches or []) ++ [../../patches/nix-ld-writable-environ.patch];
+  });
+
   # One gang.toml serves the workers of every architecture, so both interpreter directories exist
   # on every worker. NixOS creates this architecture's (environment.ldso); the other one stays
   # empty.

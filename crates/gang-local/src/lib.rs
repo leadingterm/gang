@@ -43,4 +43,4 @@ pub use errors::LocalError;
 pub use file_signer::{FileSigner, FileSignerConfig};
 pub use filesystem_cache::{FilesystemCache, FilesystemCacheConfig};
 pub use plugin::Local;
-pub use processes::{INSTANCE_ENV, INSTANCE_SECRET_ENV};
+pub use processes::{INSTANCE_ENV, INSTANCE_SECRET_ENV, bootstrap_worker};

@@ -76,17 +76,23 @@ impl<S: ServerCalls> WorkloadEnroller<S> {
     }
 }
 
-/// Classifies an enrollment failure for the worker: a rate-limited exchange keeps its retry
-/// delay, every other failure is a plain enrollment error.
+/// Classifies an enrollment failure for the worker: a server that is rate limiting the worker
+/// or is temporarily unavailable refuses for now and keeps the wait it asked for; every other
+/// failure is a plain enrollment error.
 fn enroll_error(failure: EnrollmentFailure) -> EnrollError {
-    let rate_limit = match &failure {
-        EnrollmentFailure::Server(ServerCallError::Client(ClientError::RateLimited {
-            retry_after,
-        })) => Some(*retry_after),
+    let retry = match &failure {
+        EnrollmentFailure::Server(ServerCallError::Client(
+            ClientError::RateLimited { retry_after }
+            | ClientError::Server {
+                status: 503,
+                retry_after,
+                ..
+            },
+        )) => Some(*retry_after),
         _ => None,
     };
-    match rate_limit {
-        Some(retry_after) => EnrollError::rate_limited(failure, retry_after),
+    match retry {
+        Some(after) => EnrollError::retry_later(failure, after),
         None => EnrollError::new(failure),
     }
 }
@@ -100,15 +106,24 @@ impl<S: ServerCalls> Enroller for WorkloadEnroller<S> {
 #[cfg(test)]
 mod tests {
     use std::error::Error;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use gang_clock::Timestamp;
-    use gang_types::CertificatePem;
+    use axum::http::header::RETRY_AFTER;
+    use axum::http::{HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use gang_client::ClientOptions;
+    use gang_clock::{TestClock, Timestamp};
+    use gang_types::{CertificatePem, Url};
     use gang_wire::{Certificate, Server};
-    use gang_worker::RateLimit;
+    use gang_worker::Retry;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto;
+    use hyper_util::service::TowerToHyperService;
 
     use super::*;
+    use crate::worker_server::ServerPin;
 
     #[test]
     fn rate_limited_failure_carries_the_retry_after_delay() {
@@ -120,9 +135,9 @@ mod tests {
         let error = enroll_error(failure);
 
         assert_eq!(
-            error.rate_limit(),
-            Some(RateLimit {
-                retry_after: Some(Duration::from_secs(5)),
+            error.retry(),
+            Some(Retry {
+                after: Some(Duration::from_secs(5)),
             })
         );
     }
@@ -136,26 +151,112 @@ mod tests {
 
         let error = enroll_error(failure);
 
-        assert_eq!(error.rate_limit(), Some(RateLimit { retry_after: None }));
+        assert_eq!(error.retry(), Some(Retry { after: None }));
     }
 
     #[test]
-    fn server_error_is_not_a_rate_limit() {
+    fn server_error_is_not_retried() {
         let failure = EnrollmentFailure::Server(ServerCallError::Client(ClientError::Server {
             status: 500,
             message: "internal error".to_owned(),
+            retry_after: None,
         }));
 
         let error = enroll_error(failure);
 
-        assert_eq!(error.rate_limit(), None);
+        assert_eq!(error.retry(), None);
     }
 
     #[test]
-    fn missing_certificate_authority_is_not_a_rate_limit() {
+    fn missing_certificate_authority_is_not_retried() {
         let error = enroll_error(EnrollmentFailure::NoCaCertificate);
 
-        assert_eq!(error.rate_limit(), None);
+        assert_eq!(error.retry(), None);
+    }
+
+    /// Serves every request over HTTP/1.1 or HTTP/2 with a 503, carrying `retry_after` as its
+    /// `Retry-After` header when set, and returns the server's base URL.
+    async fn unavailable_server(retry_after: Option<&'static str>) -> Result<Url, Box<dyn Error>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let app = axum::Router::new().fallback(move || async move {
+            let mut response =
+                (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response();
+            if let Some(value) = retry_after {
+                response
+                    .headers_mut()
+                    .insert(RETRY_AFTER, HeaderValue::from_static(value));
+            }
+            response
+        });
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let app = app.clone();
+                tokio::spawn(async move {
+                    let _ = auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), TowerToHyperService::new(app))
+                        .await;
+                });
+            }
+        });
+        Ok(Url::parse(&format!("http://{address}"))?)
+    }
+
+    /// Enrolls through the real server client against `server` and returns the refusal.
+    async fn refusal_from(server: Url) -> Result<EnrollError, Box<dyn Error>> {
+        let enroller = WorkloadEnroller {
+            api: WorkerServer::new(
+                server,
+                ServerPin::SystemRoots,
+                ClientOptions::default(),
+                Arc::new(TestClock::new(Timestamp::UNIX_EPOCH)),
+            ),
+            provider: ProviderName::try_new("workloads")?,
+        };
+        match Enroller::enroll(&enroller, Proof::new("proof")).await {
+            Ok(_) => Err("enrollment succeeded against an unavailable server".into()),
+            Err(error) => Ok(error),
+        }
+    }
+
+    /// A server that is temporarily unavailable, such as a controller cut off from its database,
+    /// refuses for now: the worker retries after the server's `Retry-After`, as for a rate limit.
+    #[tokio::test]
+    async fn an_unavailable_server_is_retried_after_its_retry_after() -> Result<(), Box<dyn Error>>
+    {
+        let error = refusal_from(unavailable_server(Some("7")).await?).await?;
+
+        assert_eq!(
+            error.retry(),
+            Some(Retry {
+                after: Some(Duration::from_secs(7)),
+            })
+        );
+        Ok(())
+    }
+
+    /// Without a `Retry-After`, the worker retries an unavailable server after its own interval.
+    #[tokio::test]
+    async fn an_unavailable_server_without_retry_after_is_retried() -> Result<(), Box<dyn Error>> {
+        let error = refusal_from(unavailable_server(None).await?).await?;
+
+        assert_eq!(error.retry(), Some(Retry { after: None }));
+        Ok(())
+    }
+
+    #[test]
+    fn authentication_and_permission_refusals_stay_permanent() {
+        for status in [401, 403] {
+            let failure = EnrollmentFailure::Server(ServerCallError::Client(ClientError::Server {
+                status,
+                message: "refused".to_owned(),
+                retry_after: None,
+            }));
+
+            let error = enroll_error(failure);
+
+            assert_eq!(error.retry(), None, "status {status}");
+        }
     }
 
     /// A PEM certificate that `gang_types` accepts; the enrollment never parses its contents.
@@ -202,6 +303,7 @@ mod tests {
                 return Err(ClientError::Server {
                     status,
                     message: message.to_owned(),
+                    retry_after: None,
                 }
                 .into());
             }
@@ -310,7 +412,7 @@ mod tests {
             return Err("enrollment succeeded against a failing server".into());
         };
 
-        assert_eq!(error.rate_limit(), None);
+        assert_eq!(error.retry(), None);
         Ok(())
     }
 }

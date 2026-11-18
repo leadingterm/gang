@@ -1,7 +1,7 @@
 name: Set up Nix
 description: >-
-  Enable unprivileged user namespaces on Linux, so bwrap works, and install Nix for the repository's
-  devShell.
+  Enable unprivileged user namespaces on Linux and VM KVM access on Linux x86-64, and install
+  Nix for the repository's devShell.
 runs:
   using: composite
   steps:
@@ -9,4 +9,26 @@ runs:
       if: runner.os == 'Linux'
       shell: bash
       run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+    - name: Enable KVM access
+      if: runner.os == 'Linux' && runner.arch == 'X64'
+      shell: bash
+      run: |
+        if [[ ! -e /dev/kvm ]]; then
+          echo "::error::Linux runner is missing /dev/kvm, required for VM builds"
+          exit 1
+        fi
+        sudo -n chmod 0666 /dev/kvm
     - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+    - name: Verify KVM access and Nix system feature
+      if: runner.os == 'Linux' && runner.arch == 'X64'
+      shell: bash
+      run: |
+        if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+          echo "::error::Linux runner cannot read and write /dev/kvm"
+          exit 1
+        fi
+        features="$(nix config show system-features)"
+        if [[ ! " $features " =~ [[:space:]]kvm[[:space:]] ]]; then
+          echo "::error::Nix system-features does not include kvm: $features"
+          exit 1
+        fi

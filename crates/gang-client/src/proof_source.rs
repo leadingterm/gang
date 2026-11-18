@@ -28,6 +28,35 @@ pub enum ProofSource {
 }
 
 impl ProofSource {
+    /// Binds relative locations to the login directory without resolving symlinks, so rotation
+    /// through a symlink remains visible to later reads.
+    pub(crate) fn bind(mut self) -> Result<Self, ClientError> {
+        match &mut self {
+            Self::File { path } if path.is_relative() => {
+                *path = std::path::absolute(&*path)
+                    .map_err(PathIo::at("resolve proof file", &*path))?;
+            }
+            Self::Command { argv } => {
+                if let Some(program) = argv.first_mut() {
+                    let path = std::path::Path::new(program.as_str());
+                    if path.is_relative() && program.contains('/') {
+                        let absolute = std::path::absolute(path)
+                            .map_err(PathIo::at("resolve proof command", path))?;
+                        *program = absolute.into_os_string().into_string().map_err(|path| {
+                            PathIo::new(
+                                "resolve proof command",
+                                &PathBuf::from(path),
+                                io::ErrorKind::InvalidData.into(),
+                            )
+                        })?;
+                    }
+                }
+            }
+            Self::File { .. } => {}
+        }
+        Ok(self)
+    }
+
     /// Reads the proof. Surrounding whitespace is removed.
     ///
     /// # Errors

@@ -16,6 +16,7 @@ use gang_spi::{
     FleetInstance, FleetSupply, QueuedDemand, ScalingAuditEvent, SchedulerSnapshot, WorkerState,
 };
 use gang_testkit::{TestResult, worker_id};
+use gang_types::health::CLIENT_REROUTE_BOUND;
 use gang_types::{
     ActionResources, Bytes, FleetName, FleetSet, InstanceId, InstanceLifecycle, Isa, NameError,
 };
@@ -302,6 +303,22 @@ impl Harness {
     pub fn restart(&mut self) {
         let policies: Vec<_> = self.passes.iter().map(|pass| pass.policy.clone()).collect();
         self.reconciler = Reconciler::new(&policies);
+    }
+
+    /// Runs the first pass of the reconciler's leadership term, then moves the clock past
+    /// [`CLIENT_REROUTE_BOUND`], after which the term may start drains. The pass's steps are not
+    /// applied, so it must order no termination: the reconciler remembers an ordered termination
+    /// and does not plan it again within `boot_grace`. Such a pass is an error.
+    pub fn settle_term(&mut self) -> TestResult {
+        let steps = self.reconcile();
+        if steps
+            .iter()
+            .any(|step| matches!(step.action, Action::Terminate { .. }))
+        {
+            return Err(format!("the settling pass ordered a termination: {steps:?}").into());
+        }
+        self.advance(CLIENT_REROUTE_BOUND);
+        Ok(())
     }
 
     /// Runs one pass and returns the steps it planned.

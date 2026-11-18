@@ -157,10 +157,10 @@ impl Builder {
             PassStatus::Skipped(reason) => {
                 self.skipped = self.skipped.saturating_add(1);
                 cur.pass = Pass::skipped(interval, reason.clone(), self.last_ok, self.skipped);
-                cur.fleets.clone_from(&prev.fleets);
-                cur.workers.clone_from(&prev.workers);
-                cur.instances.clone_from(&prev.instances);
-                cur.queue.clone_from(&prev.queue);
+                copy_if_changed(&mut cur.fleets, &prev.fleets);
+                copy_if_changed(&mut cur.workers, &prev.workers);
+                copy_if_changed(&mut cur.instances, &prev.instances);
+                copy_if_changed(&mut cur.queue, &prev.queue);
                 cur.completed = prev.completed;
                 cur.recent.sample_at(inputs.wall, |sample| {
                     sample.skipped = sample.skipped.saturating_add(1);
@@ -174,6 +174,13 @@ impl Builder {
             &self.config,
             &mut self.scratch.running_order,
         );
+    }
+}
+
+// Derived row `clone_from` reallocates unchanged nested data.
+fn copy_if_changed<T: Clone + PartialEq>(into: &mut T, from: &T) {
+    if into != from {
+        into.clone_from(from);
     }
 }
 
@@ -482,7 +489,7 @@ fn fill_actions(
     running_order: &mut Vec<usize>,
 ) {
     let Some(sample) = inputs.actions else {
-        cur.actions.clone_from(&prev.actions);
+        copy_if_changed(&mut cur.actions, &prev.actions);
         return;
     };
     let State {

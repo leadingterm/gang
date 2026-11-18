@@ -14,7 +14,7 @@ use gang_testkit::{TestResult, worker_on};
 use gang_types::{
     ActionResources, Bytes, FleetCatalog, FleetProperties, FleetSet, InstanceLifecycle,
 };
-use gang_wire::{Cause, Event, EventChange, name};
+use gang_wire::{Cause, Event, EventChange, SkipReason, name};
 
 use crate::support::{
     blank, build_key, config, fleet_instance, instance_id, policy, properties, queued, ts,
@@ -325,6 +325,50 @@ fn steady_completed_pass_allocates_nothing() -> TestResult {
     assert_eq!(
         info.bytes_total, 0,
         "steady-state pass allocated {} bytes",
+        info.bytes_total
+    );
+    Ok(())
+}
+
+/// Alternating frames retain their capacity when unchanged passes are skipped.
+#[test]
+fn steady_skipped_pass_allocates_nothing() -> TestResult {
+    let world = world()?;
+    let view = inputs(&world);
+    let skipped = Inputs {
+        pass: PassStatus::Skipped(SkipReason::SchedulerUnavailable),
+        actions: None,
+        ..inputs(&world)
+    };
+    let mut builder = Builder::new(config());
+    let mut cur = blank();
+    let mut prev = blank();
+
+    let mut seq = 0;
+    for _ in 0..WARM_UP_PASSES {
+        seq += 1;
+        builder.fill(&mut cur, &prev, seq, &view);
+        std::mem::swap(&mut cur, &mut prev);
+    }
+    for _ in 0..WARM_UP_PASSES {
+        seq += 1;
+        builder.fill(&mut cur, &prev, seq, &skipped);
+        std::mem::swap(&mut cur, &mut prev);
+    }
+
+    seq += 1;
+    let info = allocation_counter::measure(|| {
+        builder.fill(&mut cur, &prev, seq, &skipped);
+    });
+
+    assert_eq!(
+        info.count_total, 0,
+        "steady-state skipped pass made {} allocations",
+        info.count_total
+    );
+    assert_eq!(
+        info.bytes_total, 0,
+        "steady-state skipped pass allocated {} bytes",
         info.bytes_total
     );
     Ok(())

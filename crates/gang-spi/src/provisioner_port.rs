@@ -7,9 +7,13 @@ use futures::future::BoxFuture;
 use gang_clock::Timestamp;
 use gang_types::{Fleet, InstanceId, InstanceLifecycle, Url, WorkerLifetime};
 
-use crate::{PortError, port};
+use crate::{Held, PortError, port};
 
 /// The worker fleets, on the compute backend that runs the instances.
+///
+/// A method that changes anything takes a [`Held`], the fence's permission: reads take none, so
+/// no read can change a fleet, and no change starts once the leader lease could have passed to
+/// another controller.
 #[port]
 pub trait ProvisionerPort: Send + Sync {
     /// The typed `[fleets.options]` table of the provisioner. `compose!` requires the types of
@@ -17,8 +21,12 @@ pub trait ProvisionerPort: Send + Sync {
     type FleetOptions: std::fmt::Debug + Send + Sync + 'static;
 
     /// Overwrites `into` with the fleet's current size, instances, and observed early exits. It
-    /// only reads: it never changes the fleet. Its buffers are reused so callers can pass the same
-    /// value on every pass. On `Err`, `into` is unspecified; callers skip the pass.
+    /// only reads: it never changes the fleet or the backend. Its buffers are reused so callers
+    /// can pass the same value on every pass. On `Err`, `into` is unspecified; callers skip the
+    /// pass.
+    ///
+    /// Unacknowledged exits are repeated across calls and restarts until acknowledged. A
+    /// provisioner must persist an exit before retiring the corresponding instance.
     ///
     /// # Errors
     ///
@@ -28,6 +36,45 @@ pub trait ProvisionerPort: Send + Sync {
         fleet: Fleet<'_, Self::FleetOptions>,
         into: &mut FleetSupply,
     ) -> Result<(), PortError>;
+
+    /// Acknowledges an exit after its audit event has been durably recorded. Unknown instance
+    /// IDs are harmless, so repeated acknowledgements succeed. Delivery is at least once: a
+    /// crash or an ambiguous audit append or acknowledgement failure may repeat an audit event.
+    ///
+    /// The default is only for provisioners that produce no exits.
+    ///
+    /// # Errors
+    ///
+    /// [`PortError`] when the provisioner cannot acknowledge the exit.
+    async fn acknowledge_exit(
+        &self,
+        held: &Held,
+        fleet: Fleet<'_, Self::FleetOptions>,
+        instance: &InstanceId,
+    ) -> Result<(), PortError> {
+        let _ = (fleet, instance);
+        held.check()?;
+        Ok(())
+    }
+
+    /// Does what the backend would do by itself to keep the fleet at its desired capacity:
+    /// retires instances that died, replaces them, and ends terminations past their grace. The
+    /// leader calls it before every [`supply`](Self::supply). The default changes nothing, for a
+    /// backend that converges by itself, such as an auto scaling group, and refuses an expired
+    /// permission like every other change.
+    ///
+    /// # Errors
+    ///
+    /// [`PortError`] when the provisioner cannot converge the fleet or `held` has expired.
+    async fn converge(
+        &self,
+        held: &Held,
+        fleet: Fleet<'_, Self::FleetOptions>,
+    ) -> Result<(), PortError> {
+        let _ = fleet;
+        held.check()?;
+        Ok(())
+    }
 
     /// Sets the instances the fleet asks for, each [`Fleet::instance`] in size. A higher
     /// `desired` raises the request; a lower one withdraws requested instances that do not exist
@@ -41,6 +88,7 @@ pub trait ProvisionerPort: Send + Sync {
     /// [`PortError`] when the provisioner rejects the request.
     async fn set_desired_capacity(
         &self,
+        held: &Held,
         fleet: Fleet<'_, Self::FleetOptions>,
         desired: u32,
     ) -> Result<(), PortError>;
@@ -57,6 +105,7 @@ pub trait ProvisionerPort: Send + Sync {
     /// [`PortError`] when the provisioner cannot terminate the instance.
     async fn terminate(
         &self,
+        held: &Held,
         fleet: Fleet<'_, Self::FleetOptions>,
         instance: &InstanceId,
     ) -> Result<(), PortError>;
@@ -68,7 +117,9 @@ pub trait ProvisionerPort: Send + Sync {
 
     /// Attaches the provisioner to the server that is about to serve: it learns where clients
     /// and workers reach the server, and may return a sidecar task the server runs while it
-    /// serves. The default has nothing to attach.
+    /// serves. The default has nothing to attach. It takes no [`Held`]: attaching changes no
+    /// fleet, and a leader whose lease lapsed keeps serving its workers (fail static), so it
+    /// may attach again after its sidecar stopped.
     ///
     /// # Errors
     ///
@@ -95,8 +146,8 @@ pub struct FleetSupply {
     pub instances: Vec<FleetInstance>,
     /// The instances parked in a warm pool; `0` without one.
     pub warm: u32,
-    /// The instances whose worker failed soon after its launch since the previous call; empty
-    /// for a provisioner that cannot tell.
+    /// The instances whose worker failed soon after launch and whose exits have not yet been
+    /// acknowledged; empty for a provisioner that cannot tell.
     pub exits: Vec<InstanceExit>,
     /// Why the provisioner cannot launch the instances `desired` asks for beyond those that
     /// exist: the newest launch attempt for the fleet failed and no launch is in flight.

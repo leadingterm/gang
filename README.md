@@ -38,6 +38,15 @@ nix develop -c bazel build //...
 nix develop -c bazel test //...
 ```
 
+CI runs portable lint and the Darwin check on ARM, x86 NixOS VM lint on x86, and full Linux tests on both architectures; the Linux end-to-end gates run on ARM. The required `lint` and `e2e-gate-2` checks aggregate their respective work jobs under stable names, preserving existing protection without governance changes. CI also emits an ARM `required` aggregator covering every other `ci.yml` job, intended as a future single repository-governance check; current protection remains the existing seven checks. The structural `tools/check-required-jobs.sh` guard runs in portable lint and in `required`, so an omitted job fails CI under either policy. Portable lint also runs its standalone behavioral test, which exercises added and dropped jobs and status gating; run it locally with `nix develop -c tools/check-required-jobs_test.sh`. `tools/lint.sh --portable` and `tools/lint.sh --nix-vm` select the two lint partitions; on x86, `tools/lint.sh` runs both. Remote ARM execution and cross-target toolchains are described in [specification §8.4](docs/SPECIFICATION.md#84-nixos-images).
+
+OpenTofu provider ZIPs are checksum-pinned in `MODULE.bazel` and fetched through
+Bazel's repository cache, so separate output bases can reuse the downloads. When
+updating a provider, regenerate the Terraform lockfiles and update its platform
+checksums from the OpenTofu registry; the archive checksums must match the
+lockfiles' `zh:` entries. A missing checksum or mismatched archive fails the
+fetch.
+
 ## Quick start: Local Mode
 
 Local Mode runs the controller and on-demand workers on one machine from `configs/gang.local.toml` (specification section 1.4). Actions run under `bwrap` on Linux. On macOS, set the fleet's `sandbox = "noop"` in that file first, because bubblewrap is Linux-only. Install the binary first.
@@ -59,7 +68,7 @@ gang setup --server https://gang.example.com
 
 Setup writes Gang-owned files under `.gang/` and one `try-import` line in `.bazelrc`, safe to commit; it shows every change first (`--dry-run` only previews, `--yes` applies for scripts). `gang bazelrc` remains the printing primitive for scripts and isolated rc files.
 
-TLS Local Mode (`gang local up` without `--insecure`) accepts client tokens only from the providers in `[authentication.clients.token] providers`. Add an interactive provider (specification section 1.3) before you `gang login` to it. Run the end-to-end harness from this checkout with `nix develop -c bazel run //crates/gang-e2e:local -- --gate 1` (specification section 6.5). The `gang` binary and pinned Bazel come from the harness's runfiles; `--gang` and `--bazel` override them. Before a change merges, `nix develop -c tools/gate.sh` runs CI's lint job (`tools/lint.sh`, Clippy of every Cargo target for macOS included), the full workspace and the end-to-end gates on one Linux host, as CI runs them (specification section 7). Every Rust target, tests included, is linted with the one lint policy in `[workspace.lints]` of `Cargo.toml`.
+TLS Local Mode (`gang local up` without `--insecure`) accepts client tokens only from the providers in `[authentication.clients.token] providers`. Add an interactive provider (specification section 1.3) before you `gang login` to it. Run the end-to-end harness from this checkout with `nix develop -c bazel run //crates/gang-e2e:local -- --gate 1` (specification section 6.5). The `gang` binary and pinned Bazel come from the harness's runfiles; `--gang` and `--bazel` override them. Before a change merges, `nix develop -c tools/gate.sh` runs both CI lint partitions (`tools/lint.sh`, Clippy of every Cargo target for macOS included), the full workspace and the end-to-end gates on one x86 Linux host (specification section 7). Every Rust target, tests included, is linted with the one lint policy in `[workspace.lints]` of `Cargo.toml`.
 
 The harness settings `startup_timeout` and `command_timeout` default to `2m`; `build_timeout`
 defaults to `30m` for each Bazel invocation, including shutdown. `handshake_timeout` defaults to
@@ -69,14 +78,16 @@ defaults to `30m` for each Bazel invocation, including shutdown. `handshake_time
 
 Gang is deployed from a separate repository that calls its modules and reusable workflow at one release tag. This repository holds no deployment.
 
+The deployment module defaults to `database.engine = "sqlite"` for one controller. Choose `postgres` or `dynamodb` for one or several controllers behind load balancers; shared engines require a shared S3 cache. See the [configuration reference](docs/SPECIFICATION.md) for the settings.
+
 ```hcl
 module "gang" {
-  source = "git::https://github.com/example-org/gang//infra/terraform/modules/deployment?ref=v0.2.0"
+  source = "git::https://github.com/example-org/gang//infra/terraform/modules/deployment?ref=v0.3.0"
   # variables as in the example root
 }
 ```
 
-Call `.github/workflows/deploy.yml` as its header comment shows, pinned to the same tag, with `gang_sha256` set to the release's checksum of the binary for the deploy runner (the `gang-x86_64-unknown-linux-musl` line of the release's `SHA256SUMS` for the default runner). The workflow downloads that binary and refuses any other; it never compiles Gang.
+Call `.github/workflows/deploy.yml` as its header comment shows, pinned to the same tag, with `gang_sha256` set to the release's checksum of the binary for the deploy runner (the `gang-x86_64-unknown-linux-musl` line of the release's `SHA256SUMS` for the default x86 runner). To use ARM, set `runner: ubuntu-24.04-arm` and pin the checksum of `gang-aarch64-unknown-linux-musl`. The workflow downloads that binary and refuses any other; it never compiles Gang.
 
 Every `v*` tag has a GitHub release with `gang-x86_64-unknown-linux-musl`, `gang-aarch64-unknown-linux-musl`, `gang-aarch64-apple-darwin`, disk images for x86_64 and aarch64, and `SHA256SUMS`. Public AMIs of each architecture in every image region are listed in `gang-amis.json` (specification section 7.2). Check downloaded assets with `sha256sum --check --ignore-missing SHA256SUMS`, and pin the binary checksum where you deploy it.
 

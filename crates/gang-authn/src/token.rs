@@ -19,6 +19,10 @@ use crate::key::TokenKey;
 /// The audience every Gang token names.
 pub const AUDIENCE: &str = "gang";
 
+/// The shortest session a token is minted for: its cookie's `Max-Age` counts whole seconds, and
+/// `Max-Age=0` would delete the cookie instead of setting it.
+pub(crate) const MIN_SESSION: Duration = Duration::from_secs(1);
+
 /// What a token may be presented for. Carried in the `use` claim; a verifier accepts a token only
 /// for the use it expects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,11 +69,14 @@ fn issued_by(endpoint: &Url, iss: &str) -> bool {
 /// `key` is the public key `signer` holds; its key id goes in the token header.
 ///
 /// `usage` is the use the token is valid for; it is written to the `use` claim.
+/// Session expiry is rounded down to whole seconds and is an exclusive hard deadline; a session
+/// is minted only when at least one whole second remains before it.
 ///
 /// # Errors
 ///
-/// [`PortError::Config`] when `signer` is not an ECDSA P-256 key, or the signer's error when it
-/// cannot sign.
+/// [`PortError::Config`] when `signer` is not an ECDSA P-256 key, [`TokenError::Expired`]
+/// when a session would have less than one second left, or the signer's error when it cannot
+/// sign.
 pub async fn mint<S: CertificateSignerPort>(
     signer: &S,
     key: &TokenKey,
@@ -85,7 +92,22 @@ pub async fn mint<S: CertificateSignerPort>(
         ));
     }
     let issued_at = now.as_unix_millis() / 1000;
-    let expires_at = (now + ttl).as_unix_millis().div_ceil(1000);
+    let expiry_millis = (now + ttl).as_unix_millis();
+    let expires_at = match usage {
+        TokenUse::Client => expiry_millis.div_ceil(1000),
+        TokenUse::Session => expiry_millis / 1000,
+    };
+    let expires_in = match usage {
+        TokenUse::Client => ttl,
+        TokenUse::Session => {
+            let expiry = Timestamp::from_unix_millis(expires_at.saturating_mul(1000));
+            let remaining = expiry.saturating_duration_since(now);
+            if remaining < MIN_SESSION {
+                return Err(TokenError::Expired.into());
+            }
+            remaining
+        }
+    };
     let subject = identity.to_string();
     let header = jose::encode_segment(&HeaderOut {
         alg: ALGORITHM,
@@ -108,7 +130,7 @@ pub async fn mint<S: CertificateSignerPort>(
     let signature = jose::encode_signature(&der)?;
     Ok(IssuedToken {
         token: AccessToken::new(format!("{signing_input}.{signature}")),
-        expires_in: ttl,
+        expires_in,
     })
 }
 
@@ -117,14 +139,14 @@ pub async fn mint<S: CertificateSignerPort>(
 pub struct Verified {
     /// The identity the token was issued to.
     pub identity: Identity,
-    /// The last instant the token is accepted, `exp` plus the clock skew allowance.
+    /// The exclusive validity deadline: `exp` plus clock skew for clients, `exp` for sessions.
     pub valid_until: Timestamp,
 }
 
 /// Verifies a bearer token against `key` and the issuer origin of `endpoint`, at time `now`.
 ///
-/// `skew` widens the validity window on both ends to tolerate clock drift between the signer
-/// and the verifier.
+/// `skew` tolerates clock drift at the start of both validity windows and at client expiry.
+/// Session expiry is an exclusive hard deadline and is not extended by skew.
 ///
 /// `usage` is the use the caller expects; a token issued for another use is refused.
 ///
@@ -170,7 +192,11 @@ pub fn verify(
     if claims.usage != usage {
         return Err(TokenError::Usage);
     }
-    let valid_until = Timestamp::from_unix_millis(claims.exp.saturating_mul(1000)) + skew;
+    let expiry = Timestamp::from_unix_millis(claims.exp.saturating_mul(1000));
+    let valid_until = match usage {
+        TokenUse::Client => expiry + skew,
+        TokenUse::Session => expiry,
+    };
     if valid_until <= now {
         return Err(TokenError::Expired);
     }

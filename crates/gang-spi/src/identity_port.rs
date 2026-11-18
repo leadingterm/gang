@@ -36,7 +36,8 @@ pub trait LoginPort: Send + Sync {
     #[optional]
     async fn begin_login(&self, request: &LoginRequest<'_>) -> Result<LoginChallenge, PortError>;
 
-    /// Finishes a login from the URL the provider redirected the browser to.
+    /// Finishes a login from the URL the provider redirected the browser to, returning a proof
+    /// and the principal verified for it by the provider.
     ///
     /// # Errors
     ///
@@ -52,7 +53,8 @@ pub trait LoginPort: Send + Sync {
 
     /// Obtains a fresh proof from a stored refresh token. `client` selects the OAuth client the
     /// refresh runs under: `None` uses the provider's own configured client, `Some` uses that
-    /// client's id and secret, as a login does.
+    /// client's id and secret, as a login does. The provider verifies the returned proof and
+    /// principal.
     ///
     /// # Errors
     ///
@@ -113,6 +115,8 @@ pub struct LoginChallenge {
 pub struct LoginGrant {
     /// The proof to present at the certificate endpoint.
     pub proof: Proof,
+    /// The principal verified by the provider for this proof.
+    pub principal: Principal,
     /// The token for the next renewal, when the provider issued or rotated one.
     pub refresh_token: Option<RefreshToken>,
 }

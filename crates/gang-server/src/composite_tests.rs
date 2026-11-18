@@ -1,7 +1,5 @@
 //! Routing between the public API, browser session routes, and embedded dashboard assets.
 
-use std::num::NonZeroUsize;
-
 use gang_config::DashboardConfig;
 use gang_spi::LoginClient;
 use gang_types::{ClientSecret, NonZeroDuration, ProviderName, SessionMaxAge};
@@ -27,7 +25,6 @@ fn settings(enabled: bool) -> ServerSettings {
                 secret: ClientSecret::new("secret"),
             },
             ttl: NonZeroDuration::from_mins(10),
-            max_pending: NonZeroUsize::new(8).expect("8 is nonzero"),
             session_max_age: SessionMaxAge::from_units(43_200),
             renewal_reuse: NonZeroDuration::from_mins(1),
             device: None,

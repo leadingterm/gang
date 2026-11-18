@@ -11,7 +11,7 @@ gang_spi::compose! {
     cache: Cache { s3: gang_aws::S3Cache, filesystem: gang_local::FilesystemCache },
     signer: Signer { kms: gang_aws::KmsSigner, file: gang_local::FileSigner },
     scheduler: Scheduler { nativelink: gang_nativelink::NativeLink },
-    database: Database { sqlite: gang_sqlite::Sqlite },
+    database: Database { sqlite: gang_sqlite::Sqlite, postgres: gang_postgres::Postgres, dynamodb: gang_dynamodb::DynamoDb },
     sandbox: Sandbox { noop: gang_noop::Noop, bwrap: gang_bwrap::Bwrap },
     identity_provider: IdentityProvider { oidc: gang_oidc::Provider },
     client_authentication: ClientAuthentication { token: gang_authn::Token, none: gang_authn::Anonymous },

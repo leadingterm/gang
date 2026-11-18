@@ -3,11 +3,11 @@
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use gang_config::{DashboardConfig, EndpointTrust, RoleConfig};
+use gang_config::{DashboardConfig, EndpointTrust, LeadershipConfig, RoleConfig};
 use gang_spi::LoginClient;
 use gang_types::{
     DeviceCodeTtl, DevicePollInterval, Isa, NonZeroDuration, Percent, ProviderName, SessionMaxAge,
-    TrustDomain,
+    TrustDomain, Url,
 };
 
 use crate::endpoint::PublicEndpoint;
@@ -50,6 +50,8 @@ pub struct TlsSettings {
     pub handshake: HandshakeSettings,
     /// What clients see at the endpoint: under `System` the server information advertises no CA.
     pub endpoint_trust: EndpointTrust,
+    /// Whether workers pin this deployment's Gang CA.
+    pub ca_pinned: bool,
 }
 
 /// Limits on the TLS handshakes of one listener.
@@ -81,8 +83,6 @@ pub struct LoginSettings {
     pub client: LoginClient,
     /// How long a sign-in stays open between starting it and completing it.
     pub ttl: NonZeroDuration,
-    /// How many sign-ins may be open at once.
-    pub max_pending: NonZeroUsize,
     /// The absolute lifetime of a browser session (ADR-39).
     pub session_max_age: SessionMaxAge,
     /// How long one renewal grant is shared by renewals of the same refresh token.
@@ -98,13 +98,17 @@ pub struct DeviceSettings {
     pub ttl: DeviceCodeTtl,
     /// The minimum interval between polls.
     pub poll_interval: DevicePollInterval,
-    /// The maximum number of pending device authorizations.
-    pub max_pending: NonZeroUsize,
 }
 
 /// Everything the server needs to run, apart from the ports it is given.
 #[derive(Debug, Clone)]
 pub struct ServerSettings {
+    /// Lease timing for this controller.
+    pub leadership: LeadershipConfig,
+    /// How often to refresh revocations written by other controllers.
+    pub revocation_refresh_interval: NonZeroDuration,
+    /// The dedicated execution endpoint, when execution has its own listener.
+    pub execution_endpoint: Option<Url>,
     /// How often the control loop runs a reconcile pass.
     pub poll_interval: NonZeroDuration,
     /// How long a client action may take before the scheduler gives up on it.
@@ -129,6 +133,11 @@ pub struct ServerSettings {
     pub max_tracked_principals: NonZeroUsize,
     /// How long a listener waits after a failed accept before accepting again.
     pub accept_error_backoff: NonZeroDuration,
+    /// How many health listener connections may be open at once; further connections wait in the
+    /// OS backlog.
+    pub health_max_connections: NonZeroUsize,
+    /// The largest request head a health listener connection may send, in bytes; at least 8 KiB.
+    pub health_max_header_size: usize,
     /// The operator dashboard: viewer limits, refresh intervals and the actions cache.
     pub dashboard: DashboardConfig,
     /// Bounds and activity settings for live builds.

@@ -46,6 +46,18 @@ mock_provider "aws" {
     }
   }
 
+  mock_resource "aws_dynamodb_table" {
+    defaults = {
+      arn = "arn:aws:dynamodb:eu-north-1:000000000000:table/gang-state"
+    }
+  }
+
+  mock_resource "aws_launch_template" {
+    defaults = {
+      id = "lt-0123456789abcdef0"
+    }
+  }
+
   mock_resource "aws_eip" {
     defaults = {
       public_ip = "203.0.113.10"
@@ -183,6 +195,11 @@ run "direct_endpoint_without_load_balancer" {
     condition     = output.load_balancer_dns_name == null && length(output.certificate_validation_records) == 0
     error_message = "The direct endpoint must not expose load balancer DNS or certificate validation records."
   }
+
+  assert {
+    condition     = !strcontains(output.gang_toml, "health_listen")
+    error_message = "The direct endpoint must not enable the load balancer health listener."
+  }
 }
 
 run "load_balancer_fronts_the_public_listener" {
@@ -207,6 +224,11 @@ run "load_balancer_fronts_the_public_listener" {
   assert {
     condition     = length(module.load_balancer) == 1 && module.load_balancer[0].security_group_id != null
     error_message = "The load balancer and its security group must be created."
+  }
+
+  assert {
+    condition     = strcontains(output.gang_toml, "health_listen = \"0.0.0.0:${module.network.health_port}\"") && module.load_balancer[0].health_port == module.network.health_port
+    error_message = "The network health port must reach the server listener and load balancer."
   }
 }
 
@@ -905,11 +927,10 @@ run "rejects_fleet_memory_below_min_reservation" {
       name                        = "worker"
       isa                         = "x86-64"
       capacity                    = "spot"
-      ami_id                      = "ami-00000000000000001"
       instance_types              = ["c6id.4xlarge"]
       max_instances               = 4
       vcpus_per_instance          = 15
-      memory_per_instance         = "8MiB"
+      memory_per_instance         = "67108863B"
       disk_per_instance           = "200GiB"
       target_actions_per_instance = 16
     }]
@@ -926,11 +947,10 @@ run "accepts_fleet_memory_equal_to_min_reservation" {
       name                        = "worker"
       isa                         = "x86-64"
       capacity                    = "spot"
-      ami_id                      = "ami-00000000000000001"
       instance_types              = ["c6id.4xlarge"]
       max_instances               = 4
       vcpus_per_instance          = 15
-      memory_per_instance         = "16MiB"
+      memory_per_instance         = "64MiB"
       disk_per_instance           = "200GiB"
       target_actions_per_instance = 16
     }]
@@ -1128,6 +1148,34 @@ run "accepts_whole_second_client_action_timeout_in_ms" {
     condition     = strcontains(output.gang_toml, "client_action_timeout = \"2000ms\"")
     error_message = "A whole-second client_action_timeout written in ms must be accepted and rendered verbatim."
   }
+}
+
+run "sqlite_instance_shape" {
+  command = plan
+
+  assert {
+    condition     = output.controller_shape == "instance" && strcontains(output.gang_toml, "[database.sqlite]") && !strcontains(output.gang_toml, "execution_listen")
+    error_message = "The default deployment must retain the single SQLite controller configuration."
+  }
+  assert {
+    condition     = output.controller_config_digest == null
+    error_message = "SQLite must not pass a group configuration digest to its controller."
+  }
+}
+
+run "rejects_unknown_database_engine" {
+  command = plan
+  variables { database = { engine = "mysql" } }
+  expect_failures = [var.database]
+}
+
+run "rejects_multiple_sqlite_controllers" {
+  command = plan
+  variables {
+    controller_count = 2
+    nat_mode         = "per_az"
+  }
+  expect_failures = [var.database]
 }
 
 # Correctness: Defaults resolve each used architecture from this module's release.

@@ -7,6 +7,7 @@ def _report(ctx, script, inputs, env):
     # The action sees exactly this environment; the harness stages the values per deployment.
     env_all = {
         "E2E_OUT": report.path,
+        "E2E_ACTION": ctx.label.name,
         # The salt makes every run's actions distinct, so a run never hits an earlier run's cache.
         "E2E_SALT": SALT,
         # A held build sets its run with `--define=e2e_run=<run>`: its actions differ from every other

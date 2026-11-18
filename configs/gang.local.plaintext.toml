@@ -19,7 +19,7 @@ disk_per_instance = "20GiB"
 target_actions_per_instance = 4
 idle_timeout = "15s"
 max_drain_wait = "1m"
-boot_grace = "30s"
+boot_grace = "1m"
 
 [provisioner.local]
 state_dir = "/tmp/gang-local"            # worker processes, scratch, and the workload JWT key

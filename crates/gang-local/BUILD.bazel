@@ -19,4 +19,5 @@ workspace_rust_library(
 workspace_rust_binary(
     name = "fake_launcher",
     src = "fake_launcher/main.rs",
+    deps = [":gang_local"],
 )

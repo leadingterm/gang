@@ -1,7 +1,7 @@
 //! Two authenticated Bazel invocations, cold then warm, appear as distinct builds with their
 //! principal, cache and execution usage, and ordered timestamps visible to the administrator.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use gang_clock::Timestamp;
 use gang_wire::name;
@@ -15,19 +15,18 @@ use crate::issuer::TestIssuer;
 use crate::names;
 use crate::secured::Secured;
 use crate::server::{Answer, Presented, Request, ServerApi};
-use crate::suite::Invocation;
+use crate::settings::DeploymentInputs;
 use crate::system::{Probe, System, Variant};
 use crate::verdict;
 
 const COLD_ID: &str = "11111111-1111-4111-8111-111111111111";
 const WARM_ID: &str = "22222222-2222-4222-8222-222222222222";
 const PROBES: &[Probe] = &[Probe::Pinned];
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const HTTP_OK: u16 = 200;
 
 /// Runs the cold and warm builds and checks their administrator-visible accounting.
 pub(crate) fn builds(
-    invocation: &Invocation,
+    invocation: &DeploymentInputs,
     variant: &Variant,
     issuer: &TestIssuer,
 ) -> Result<Vec<Check>> {
@@ -69,6 +68,7 @@ pub(crate) fn builds(
     ];
     let cold = observe(
         stack,
+        &|request: &Request| ServerApi::send(stack, request),
         &credentials.token,
         COLD_ID,
         true,
@@ -76,6 +76,7 @@ pub(crate) fn builds(
     )?;
     let warm = observe(
         stack,
+        &|request: &Request| ServerApi::send(stack, request),
         &credentials.token,
         WARM_ID,
         false,
@@ -100,37 +101,46 @@ pub(crate) fn builds(
 }
 
 /// The last list and detail responses, including failures for diagnostic checks.
-struct Observed {
-    list: Answer,
-    detail: Option<Answer>,
+pub(crate) struct Observed {
+    pub(crate) list: Answer,
+    pub(crate) detail: Option<Answer>,
 }
 
-/// Polls until expected usage is unchanged across consecutive reads, or the deadline expires.
-fn observe(
-    server: &impl ServerApi,
+/// Observes build accounting on state-stream events until usage stabilizes or the deadline expires.
+pub(crate) fn observe(
+    stack: &crate::stack::Stack<'_>,
+    read: &dyn Fn(&Request) -> Result<Answer>,
     token: &str,
     id: &str,
     cold: bool,
     timeout: Duration,
 ) -> Result<Observed> {
-    let deadline = Instant::now() + timeout;
     let mut previous_usage = None;
-    loop {
-        let list = server.send(
-            &Request::get(format!("/v1/builds?filter=invocationId%3D%22{id}%22"))
-                .presenting(Presented::Bearer(token.to_owned())),
-        )?;
-        let name = listed_name(&list);
-        let detail = match name.as_deref() {
-            Some(name) => Some(
-                server.send(
+    let mut latest = None;
+    let mut failure = None;
+    let waited = stack.wait_live_state(timeout, |_| {
+        let result = (|| -> Result<Observed> {
+            let list = read(
+                &Request::get(format!("/v1/builds?filter=invocationId%3D%22{id}%22"))
+                    .presenting(Presented::Bearer(token.to_owned())),
+            )?;
+            let name = listed_name(&list);
+            let detail = match name.as_deref() {
+                Some(name) => Some(read(
                     &Request::get(format!("/v1/{name}"))
                         .presenting(Presented::Bearer(token.to_owned())),
-                )?,
-            ),
-            None => None,
+                )?),
+                None => None,
+            };
+            Ok(Observed { list, detail })
+        })();
+        let observed = match result {
+            Ok(observed) => observed,
+            Err(error) => {
+                failure = Some(error);
+                return true;
+            }
         };
-        let observed = Observed { list, detail };
         let checks = build_checks(&observed, cold, "");
         let ready = if cold {
             checks.get(1).is_some_and(Check::is_passed)
@@ -139,10 +149,18 @@ fn observe(
             checks.get(1).is_some_and(Check::is_passed)
         };
         let stable = stable_usage(&mut previous_usage, &observed);
-        if (ready && stable) || Instant::now() >= deadline {
-            return Ok(observed);
+        latest = Some(observed);
+        ready && stable
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    match waited {
+        Ok(_) | Err(E2eError::Timeout { .. }) if latest.is_some() => {
+            latest.ok_or_else(|| E2eError::system("no build observation"))
         }
-        std::thread::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
+        Err(error) => Err(error),
+        Ok(_) => Err(E2eError::system("no build observation")),
     }
 }
 
@@ -165,7 +183,7 @@ fn stable_usage(previous: &mut Option<Value>, observed: &Observed) -> bool {
 }
 
 /// Extracts the unique listed build's name only from a successful response.
-fn listed_name(answer: &Answer) -> Option<String> {
+pub(crate) fn listed_name(answer: &Answer) -> Option<String> {
     if answer.status != HTTP_OK {
         return None;
     }
@@ -188,7 +206,7 @@ fn listed_name(answer: &Answer) -> Option<String> {
 }
 
 /// Checks one list response and its detail without treating malformed JSON as success.
-fn build_checks(observed: &Observed, cold: bool, principal: &str) -> Vec<Check> {
+pub(crate) fn build_checks(observed: &Observed, cold: bool, principal: &str) -> Vec<Check> {
     let (list_name, count_name, second_name, times_name, principal_name) = if cold {
         (
             names::builds::COLD_LIST,

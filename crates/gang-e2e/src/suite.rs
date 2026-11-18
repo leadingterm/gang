@@ -2,7 +2,6 @@
 
 use std::fmt;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -11,15 +10,17 @@ use std::time::Instant;
 use gang_config::InputLinks;
 use parking_lot::Mutex;
 
-use crate::access::{IdentityKnobs, identity};
+use crate::access::{IdentityKnobs, SignIn, identity};
 use crate::admission::{cold_start_misfit, memory_escalation, oversized_fleet, unplaceable_disk};
 use crate::browser::sessions;
 use crate::builds::builds;
-use crate::check::{Check, Report};
+use crate::check::{Check, Report, prefix_checks};
 use crate::checked_in::{ShippedConfigs, checked_in_configs};
 use crate::cli::cli;
 use crate::cli_terminal::LocalTerminal;
+use crate::cluster::Engine;
 use crate::control::ControlKnobs;
+use crate::cross_revocation::{CROSS_REVOCATION_SUBJECT, cross_revocation};
 use crate::dashboard::{dashboard, running_metadata};
 use crate::disk::disk;
 use crate::drain_cancel::drain_cancel;
@@ -50,7 +51,7 @@ use crate::server::ServerKnobs;
 use crate::server_scenarios::{
     api, certificate_rotation, event_paging, request_limits, viewer_cap,
 };
-use crate::settings::{ActionTools, Settings};
+use crate::settings::DeploymentInputs;
 use crate::setup::setup;
 use crate::skipped_pass::skipped_pass;
 use crate::stack::Stack;
@@ -64,20 +65,8 @@ use crate::timeout::{action_timeout, exit_signals};
 /// The configuration of one harness run.
 #[derive(Debug, Clone)]
 pub struct Invocation {
-    /// The `gang` binary under test.
-    pub gang: PathBuf,
-    /// The Bazel binary the harness drives.
-    pub bazel: PathBuf,
-    /// The base `gang.toml` the variants are applied to.
-    pub base_config: String,
-    /// The sample workspace the builds run in.
-    pub sample: PathBuf,
-    /// The directory of the checked-in gang.toml files.
-    pub configs: PathBuf,
-    /// The tunables of the harness.
-    pub settings: Settings,
-    /// The resolved tools used by the sample's actions.
-    pub action_tools: ActionTools,
+    /// The resolved inputs for every deployment in this run.
+    pub inputs: DeploymentInputs,
     /// The scenarios to run; empty selects the gate's default scenarios
     /// ([`Gate::scenarios`]). A selected scenario that the gate cannot select is ignored;
     /// [`unknown_scenarios`] finds those for a caller to reject.
@@ -238,9 +227,24 @@ gang_types::string_enum! {
         /// A signed-in browser renews silently until the absolute lifetime, then signs in without
         /// consent; revocation, logout and a suspended account end renewal. Gate two only.
         Sessions = "sessions",
+        /// A build survives loss of either the leader or a follower.
+        ControllerLoss = "controller-loss",
+        /// Controllers are replaced while a build is in progress.
+        RollingDeploy = "rolling-deploy",
+        /// Revocations propagate between controllers.
+        CrossRevocation = "cross-revocation",
+        /// Queued demand survives loss or suspension of the leader.
+        LeaderFailover = "leader-failover",
+        /// Device and browser logins continue across controllers.
+        LoginAcross = "login-across",
+        /// Builds and scaling recover from a database outage.
+        DatabaseOutage = "database-outage",
         /// Two authenticated builds, cold then warm, are attributed separately with their cache
         /// and execution usage and timestamps visible to the administrator. Gate two only.
         Builds = "builds",
+        /// Followers alone serve the public frontend of three controllers; their cache lookups
+        /// reach the leader's build view cold, warm and after a leader change. Gate two only.
+        FollowerBuilds = "follower-builds",
         /// A fleet with `min_instances = 0` keeps one worker with no build while a scheduled
         /// minimum is in force, and the scale-out carries cause `MINIMUM`. Gate two only.
         ScheduledMinimum = "scheduled-minimum",
@@ -248,6 +252,50 @@ gang_types::string_enum! {
 }
 
 impl Scenario {
+    /// Estimated seconds for balancing shards, rounded up from CI scenario timings; where CI
+    /// failed, and for gate one, timings are from a four-CPU run. Follower builds uses a
+    /// provisional estimate combining builds and rolling deploy.
+    #[must_use]
+    pub const fn weight(self) -> u64 {
+        match self {
+            Self::Lifecycle => 44,
+            Self::Network => 19,
+            Self::InputIntegrity => 36,
+            Self::Restart => 51,
+            Self::Limits | Self::SandboxContract => 18,
+            Self::Memory | Self::UnplaceableDisk => 16,
+            Self::Disk => 46,
+            Self::Fleets => 109,
+            Self::ActionTimeout => 37,
+            Self::ActionTimeoutNoop | Self::WorkerRenewal => 38,
+            Self::InputRoot | Self::GlibcToolchain | Self::FhsTools => 15,
+            Self::StaleScope => 50,
+            Self::MemoryEscalation | Self::OversizedFleet => 17,
+            Self::ColdStartMisfit | Self::CheckedInConfigs | Self::Api => 1,
+            Self::Preemption => 52,
+            Self::Orphan => 27,
+            Self::DrainCancel => 47,
+            Self::SkippedPass => 6,
+            Self::Cli => 2,
+            Self::Plaintext => 32,
+            Self::Setup => 92,
+            Self::Revocation => 20,
+            Self::Dashboard | Self::CrossRevocation => 14,
+            Self::LaunchFailure => 30,
+            Self::RequestLimits | Self::Builds => 9,
+            Self::ViewerCap => 3,
+            Self::CertificateRotation => 12,
+            Self::Identity => 78,
+            Self::Sessions => 184,
+            Self::ControllerLoss => 62,
+            Self::RollingDeploy => 25,
+            Self::FollowerBuilds => 34,
+            Self::LeaderFailover => 120,
+            Self::LoginAcross | Self::ScheduledMinimum => 4,
+            Self::DatabaseOutage => 161,
+        }
+    }
+
     /// The first gate whose default list contains this scenario.
     #[must_use]
     pub const fn gate(self) -> Gate {
@@ -289,8 +337,15 @@ impl Scenario {
             | Self::CertificateRotation
             | Self::Identity
             | Self::Builds
+            | Self::FollowerBuilds
             | Self::Sessions
-            | Self::ScheduledMinimum => Gate::Two,
+            | Self::ScheduledMinimum
+            | Self::ControllerLoss
+            | Self::RollingDeploy
+            | Self::CrossRevocation
+            | Self::LeaderFailover
+            | Self::LoginAcross
+            | Self::DatabaseOutage => Gate::Two,
         }
     }
 }
@@ -302,7 +357,7 @@ impl Scenario {
 /// the run never stops early.
 pub fn run(invocation: &Invocation, gate: Gate) -> Report {
     let mut report = Report::default();
-    let issuer = match TestIssuer::start(&invocation.settings) {
+    let issuer = match TestIssuer::start(&invocation.inputs.settings) {
         Ok(issuer) => issuer,
         Err(error) => {
             report.extend([Check::failed(
@@ -314,7 +369,7 @@ pub fn run(invocation: &Invocation, gate: Gate) -> Report {
     };
     let sandbox = Sandbox::native();
     let ctx = RunContext {
-        invocation,
+        inputs: &invocation.inputs,
         issuer: &issuer,
         sandbox,
         baseline: Variant::baseline(sandbox),
@@ -326,10 +381,10 @@ pub fn run(invocation: &Invocation, gate: Gate) -> Report {
         .collect();
     let verdicts = run_bounded(
         &selected,
-        invocation.settings.parallel_scenarios,
+        invocation.inputs.settings.parallel_scenarios,
         |scenario| {
             let started = Instant::now();
-            let checks = scenario.run(&ctx);
+            let checks = crate::stack::with_failure_evidence(|| scenario.run(&ctx));
             let failed = checks.iter().filter(|check| check.is_failure()).count();
             eprintln!(
                 "scenario {scenario}: {} checks, {failed} failed, {:.1}s",
@@ -350,10 +405,10 @@ pub fn run(invocation: &Invocation, gate: Gate) -> Report {
     report
 }
 
-/// What a scenario run starts from: the invocation, the in-process issuer, the sandbox, and the
+/// What a scenario run starts from: the inputs, the in-process issuer, the sandbox, and the
 /// baseline variant that the scenarios derive their variants from.
 struct RunContext<'a> {
-    invocation: &'a Invocation,
+    inputs: &'a DeploymentInputs,
     issuer: &'a TestIssuer,
     sandbox: Sandbox,
     baseline: Variant,
@@ -365,14 +420,20 @@ impl Scenario {
     fn run(self, ctx: &RunContext<'_>) -> Vec<Check> {
         match self {
             Self::Lifecycle => attempt(self, || {
-                let stack =
-                    Stack::create(ctx.invocation, &ctx.baseline, Transport::Tls, ctx.issuer)?;
+                let stack = Stack::create(ctx.inputs, &ctx.baseline, Transport::Tls, ctx.issuer)?;
                 lifecycle(&stack, &ctx.baseline).map(|checks| with_event_paging(checks, &stack))
             }),
             Self::Network => network_checks(ctx),
             Self::InputIntegrity => input_integrity_checks(ctx),
             Self::InputRoot => input_root_checks(ctx),
             Self::Restart => restart_checks(ctx),
+            Self::ControllerLoss
+            | Self::RollingDeploy
+            | Self::CrossRevocation
+            | Self::LeaderFailover
+            | Self::LoginAcross
+            | Self::FollowerBuilds
+            | Self::DatabaseOutage => cluster_scenario_checks(self, ctx),
             Self::Limits => limits_checks(ctx),
             Self::Memory => memory_checks(ctx),
             Self::Disk => disk_checks(ctx),
@@ -398,19 +459,19 @@ impl Scenario {
                 control_checks(self, ctx, ControlKnobs::SKIPPED_PASS, skipped_pass)
             }
             Self::Cli => attempt(self, || {
-                let terminal = LocalTerminal::create(ctx.invocation)?;
+                let terminal = LocalTerminal::create(ctx.inputs)?;
                 cli(&terminal)
             }),
             Self::CheckedInConfigs => attempt(self, || {
-                checked_in_configs(&ShippedConfigs::new(ctx.invocation))
+                checked_in_configs(&ShippedConfigs::new(ctx.inputs))
             }),
             Self::Plaintext => plaintext_checks(self, ctx, |stack| plaintext(stack)),
             Self::Setup => attempt(self, || {
-                let secured = Secured::create(ctx.invocation, &ctx.baseline, ctx.issuer)?;
+                let secured = Secured::create(ctx.inputs, &ctx.baseline, ctx.issuer)?;
                 setup(&secured)
             }),
             Self::Revocation => attempt(self, || {
-                let secured = Secured::create(ctx.invocation, &ctx.baseline, ctx.issuer)?;
+                let secured = Secured::create(ctx.inputs, &ctx.baseline, ctx.issuer)?;
                 revocation(&secured)
             }),
             Self::Dashboard => dashboard_checks(ctx),
@@ -420,7 +481,7 @@ impl Scenario {
             Self::Api => attempt(self, || {
                 api(
                     &server_deployment(ctx, ServerKnobs::NONE, IdentityKnobs::NONE)?,
-                    ctx.invocation.settings.history_timeout,
+                    ctx.inputs.settings.history_timeout,
                 )
             }),
             Self::RequestLimits => attempt(self, || {
@@ -433,7 +494,7 @@ impl Scenario {
             Self::ViewerCap => attempt(self, || {
                 viewer_cap(
                     &server_deployment(ctx, ServerKnobs::ONE_VIEWER, IdentityKnobs::NONE)?,
-                    ctx.invocation.settings.history_timeout,
+                    ctx.inputs.settings.history_timeout,
                 )
             }),
             Self::CertificateRotation => attempt(self, || {
@@ -448,11 +509,11 @@ impl Scenario {
                     identity: IdentityKnobs::IDENTITY,
                     ..ctx.baseline
                 };
-                let secured = Secured::create(ctx.invocation, &variant, ctx.issuer)?;
+                let secured = Secured::create(ctx.inputs, &variant, ctx.issuer)?;
                 identity(&secured)
             }),
             Self::Sessions => sessions_checks(ctx),
-            Self::Builds => attempt(self, || builds(ctx.invocation, &ctx.baseline, ctx.issuer)),
+            Self::Builds => attempt(self, || builds(ctx.inputs, &ctx.baseline, ctx.issuer)),
         }
     }
 }
@@ -464,7 +525,7 @@ fn fleets_checks(ctx: &RunContext<'_>) -> Vec<Check> {
         ..ctx.baseline
     };
     attempt(Scenario::Fleets, || {
-        let stack = Stack::create(ctx.invocation, &variant, Transport::Tls, ctx.issuer)?;
+        let stack = Stack::create(ctx.inputs, &variant, Transport::Tls, ctx.issuer)?;
         fleets(&stack, &variant)
     })
 }
@@ -489,14 +550,11 @@ fn dashboard_checks(ctx: &RunContext<'_>) -> Vec<Check> {
             },
             ..ctx.baseline
         };
-        let stack = Stack::create(ctx.invocation, &variant, Transport::Tls, ctx.issuer)?;
-        let metadata = running_metadata(&stack, ctx.invocation.settings.history_timeout)?;
-        let secured = Secured::create(ctx.invocation, &ctx.baseline, ctx.issuer)?;
+        let stack = Stack::create(ctx.inputs, &variant, Transport::Tls, ctx.issuer)?;
+        let metadata = running_metadata(&stack, ctx.inputs.settings.history_timeout)?;
+        let secured = Secured::create(ctx.inputs, &ctx.baseline, ctx.issuer)?;
         let mut checks = vec![metadata];
-        checks.extend(dashboard(
-            &secured,
-            ctx.invocation.settings.history_timeout,
-        )?);
+        checks.extend(dashboard(&secured, ctx.inputs.settings.history_timeout)?);
         Ok(checks)
     })
 }
@@ -508,7 +566,7 @@ fn plaintext_checks(
     checks: impl FnOnce(&Stack<'_>) -> Result<Vec<Check>>,
 ) -> Vec<Check> {
     attempt(scenario, || {
-        let stack = Stack::create(ctx.invocation, &ctx.baseline, Transport::Plain, ctx.issuer)?;
+        let stack = Stack::create(ctx.inputs, &ctx.baseline, Transport::Plain, ctx.issuer)?;
         checks(&stack)
     })
 }
@@ -520,8 +578,8 @@ fn sessions_checks(ctx: &RunContext<'_>) -> Vec<Check> {
             identity: IdentityKnobs::SESSIONS,
             ..ctx.baseline
         };
-        let secured = Secured::create(ctx.invocation, &variant, ctx.issuer)?;
-        sessions(&secured, ctx.invocation.settings.history_timeout)
+        let secured = Secured::create(ctx.inputs, &variant, ctx.issuer)?;
+        sessions(&secured, ctx.inputs.settings.history_timeout)
     })
 }
 
@@ -534,7 +592,7 @@ fn network_checks(ctx: &RunContext<'_>) -> Vec<Check> {
                 ..ctx.baseline
             };
             attempt(Scenario::Network, || {
-                let stack = Stack::create(ctx.invocation, &permitted, Transport::Tls, ctx.issuer)?;
+                let stack = Stack::create(ctx.inputs, &permitted, Transport::Tls, ctx.issuer)?;
                 network(&stack, &permitted)
             })
         }
@@ -549,8 +607,8 @@ fn network_checks(ctx: &RunContext<'_>) -> Vec<Check> {
 fn glibc_toolchain_checks(ctx: &RunContext<'_>) -> Vec<Check> {
     match ctx.sandbox {
         Sandbox::Bwrap => attempt(Scenario::GlibcToolchain, || {
-            ctx.invocation.action_tools.glibc_tool_program()?;
-            let stack = Stack::create(ctx.invocation, &ctx.baseline, Transport::Tls, ctx.issuer)?;
+            ctx.inputs.action_tools.glibc_tool_program()?;
+            let stack = Stack::create(ctx.inputs, &ctx.baseline, Transport::Tls, ctx.issuer)?;
             glibc_toolchain(&stack)
         }),
         Sandbox::Noop => vec![Check::skipped(
@@ -564,7 +622,7 @@ fn glibc_toolchain_checks(ctx: &RunContext<'_>) -> Vec<Check> {
 fn fhs_tools_checks(ctx: &RunContext<'_>) -> Vec<Check> {
     match ctx.sandbox {
         Sandbox::Bwrap => attempt(Scenario::FhsTools, || {
-            let stack = Stack::create(ctx.invocation, &ctx.baseline, Transport::Tls, ctx.issuer)?;
+            let stack = Stack::create(ctx.inputs, &ctx.baseline, Transport::Tls, ctx.issuer)?;
             fhs_tools(&stack)
         }),
         Sandbox::Noop => vec![Check::skipped(
@@ -586,7 +644,7 @@ fn input_integrity_checks(ctx: &RunContext<'_>) -> Vec<Check> {
         checks.extend(attempt(
             format_args!("{} {label}", Scenario::InputIntegrity),
             || {
-                let stack = Stack::create(ctx.invocation, &variant, Transport::Tls, ctx.issuer)?;
+                let stack = Stack::create(ctx.inputs, &variant, Transport::Tls, ctx.issuer)?;
                 input_integrity(&stack, &variant)
             },
         ));
@@ -597,7 +655,7 @@ fn input_integrity_checks(ctx: &RunContext<'_>) -> Vec<Check> {
 /// The verdicts of the input root scenario, on the baseline deployment.
 fn input_root_checks(ctx: &RunContext<'_>) -> Vec<Check> {
     attempt(Scenario::InputRoot, || {
-        let stack = Stack::create(ctx.invocation, &ctx.baseline, Transport::Tls, ctx.issuer)?;
+        let stack = Stack::create(ctx.inputs, &ctx.baseline, Transport::Tls, ctx.issuer)?;
         input_root(&stack, &ctx.baseline)
     })
 }
@@ -621,7 +679,7 @@ fn limits_checks(ctx: &RunContext<'_>) -> Vec<Check> {
             soft_memory: SoftMemory::Off,
             ..Variant::baseline(Sandbox::Noop)
         };
-        let stack = Stack::create(ctx.invocation, &variant, Transport::Tls, ctx.issuer)?;
+        let stack = Stack::create(ctx.inputs, &variant, Transport::Tls, ctx.issuer)?;
         limits(&stack, stack.stderr_tail_lines())
     })
 }
@@ -643,8 +701,238 @@ fn restart_checks(ctx: &RunContext<'_>) -> Vec<Check> {
             soft_memory: SoftMemory::Off,
             ..Variant::baseline(Sandbox::Noop)
         };
-        let stack = Stack::create(ctx.invocation, &variant, Transport::Tls, ctx.issuer)?;
+        let stack = Stack::create(ctx.inputs, &variant, Transport::Tls, ctx.issuer)?;
         restart(&stack)
+    })
+}
+const LOGIN_ACROSS_SUBJECT: &str = "login-across";
+const DATABASE_OUTAGE_SUBJECT: &str = "database-outage";
+
+/// Every cluster deployment selects its identity here so concurrent scenarios cannot share
+/// a subject whose issuer policy is changed by another scenario.
+fn cluster_variant(scenario: Scenario, baseline: Variant) -> Option<Variant> {
+    let mut variant = match scenario {
+        Scenario::ControllerLoss
+        | Scenario::RollingDeploy
+        | Scenario::LeaderFailover
+        | Scenario::FollowerBuilds => Variant::baseline(Sandbox::Noop),
+        Scenario::CrossRevocation => Variant {
+            identity: IdentityKnobs {
+                standing_worker: crate::access::StandingWorker::One,
+                ..IdentityKnobs::SESSIONS
+            },
+            ..baseline
+        },
+        Scenario::LoginAcross => Variant {
+            identity: IdentityKnobs::IDENTITY,
+            ..baseline
+        },
+        Scenario::DatabaseOutage => Variant {
+            identity: IdentityKnobs::SIGN_IN,
+            control: ControlKnobs {
+                detail_interval: Some(std::time::Duration::from_secs(1)),
+                ..ControlKnobs::NONE
+            },
+            ..Variant::baseline(Sandbox::Noop)
+        },
+        _ => return None,
+    };
+    let subject = match scenario {
+        Scenario::CrossRevocation => CROSS_REVOCATION_SUBJECT,
+        Scenario::LoginAcross => LOGIN_ACROSS_SUBJECT,
+        Scenario::DatabaseOutage => DATABASE_OUTAGE_SUBJECT,
+        _ => return Some(variant),
+    };
+    variant.identity.sign_in = SignIn::Subject(subject);
+    Some(variant)
+}
+
+fn required_cluster_variant(scenario: Scenario, baseline: Variant) -> Result<Variant> {
+    cluster_variant(scenario, baseline)
+        .ok_or_else(|| crate::errors::E2eError::system("not a cluster scenario"))
+}
+
+/// Runs the leader and follower variants in independent deployments.
+fn controller_loss_checks(ctx: &RunContext<'_>, engine: Engine) -> Vec<Check> {
+    if !cfg!(target_os = "linux") {
+        return vec![Check::skipped(
+            names::controller_loss::HELD,
+            "the controller-loss probes identify workers through Linux process ancestry",
+        )];
+    }
+    attempt(Scenario::ControllerLoss, || {
+        let mut invocation = ctx.inputs.clone();
+        let mut document: toml::Value =
+            toml::from_str(&invocation.base_config).map_err(crate::template::template_error)?;
+        let fleet = document
+            .get_mut("fleets")
+            .and_then(toml::Value::as_array_mut)
+            .and_then(|fleets| fleets.first_mut())
+            .and_then(toml::Value::as_table_mut)
+            .ok_or_else(|| crate::errors::E2eError::system("missing first fleet"))?;
+        fleet.insert("max_instances".into(), toml::Value::Integer(2));
+        fleet.insert("vcpus_per_instance".into(), toml::Value::Integer(2));
+        let server = document
+            .get_mut("server")
+            .and_then(toml::Value::as_table_mut)
+            .ok_or_else(|| crate::errors::E2eError::system("missing server configuration"))?;
+        let leadership =
+            toml::from_str("ttl = \"10s\"\nrenew_interval = \"3s\"\nclock_skew = \"2s\"\n")
+                .map_err(crate::template::template_error)?;
+        server.insert("leadership".into(), leadership);
+        invocation.base_config =
+            toml::to_string(&document).map_err(crate::template::template_error)?;
+        let variant = required_cluster_variant(Scenario::ControllerLoss, ctx.baseline)?;
+        let mut checks = Vec::new();
+        for follower in [false, true] {
+            let cluster =
+                crate::cluster::Cluster::start(&invocation, &variant, ctx.issuer, 2, engine)?;
+            let variant_checks =
+                cluster.diagnose(crate::controller_loss::controller_loss(&cluster, follower))?;
+            checks.extend(prefix_checks(
+                variant_checks,
+                if follower { "follower" } else { "leader" },
+            ));
+        }
+        Ok(checks)
+    })
+}
+
+/// Applies the worker capacity needed by the held-build cluster scenarios.
+fn cluster_inputs(ctx: &RunContext<'_>, min: i64, max: i64) -> Result<DeploymentInputs> {
+    let mut invocation = ctx.inputs.clone();
+    let mut document: toml::Value =
+        toml::from_str(&invocation.base_config).map_err(crate::template::template_error)?;
+    let fleet = document
+        .get_mut("fleets")
+        .and_then(toml::Value::as_array_mut)
+        .and_then(|fleets| fleets.first_mut())
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| crate::errors::E2eError::system("missing first fleet"))?;
+    fleet.insert("min_instances".into(), toml::Value::Integer(min));
+    fleet.insert("max_instances".into(), toml::Value::Integer(max));
+    fleet.insert("vcpus_per_instance".into(), toml::Value::Integer(2));
+    invocation.base_config = toml::to_string(&document).map_err(crate::template::template_error)?;
+    Ok(invocation)
+}
+
+/// Runs the leader-loss and zombie variants on separate deployments.
+fn leader_failover_checks(ctx: &RunContext<'_>, engine: Engine) -> Result<Vec<Check>> {
+    let invocation = cluster_inputs(ctx, 1, 2)?;
+    let variant = required_cluster_variant(Scenario::LeaderFailover, ctx.baseline)?;
+    let mut checks = Vec::new();
+    for zombie in [false, true] {
+        let cluster = crate::cluster::Cluster::start(&invocation, &variant, ctx.issuer, 2, engine)?;
+        let result = cluster.diagnose(crate::leader_failover::leader_failover(&cluster, zombie))?;
+        checks.extend(prefix_checks(
+            result,
+            if zombie { "zombie" } else { "killed" },
+        ));
+    }
+    Ok(checks)
+}
+
+/// Runs the outage scenario with one and two controllers on separate deployments.
+fn database_outage_checks(ctx: &RunContext<'_>, engine: Engine) -> Result<Vec<Check>> {
+    let mut invocation = cluster_inputs(ctx, 1, 3)?;
+    let mut document: toml::Value =
+        toml::from_str(&invocation.base_config).map_err(crate::template::template_error)?;
+    let fleet = document
+        .get_mut("fleets")
+        .and_then(toml::Value::as_array_mut)
+        .and_then(|fleets| fleets.first_mut())
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| crate::errors::E2eError::system("missing first fleet"))?;
+    fleet.insert(
+        "target_actions_per_instance".into(),
+        toml::Value::Integer(2),
+    );
+    invocation.base_config = toml::to_string(&document).map_err(crate::template::template_error)?;
+    let variant = required_cluster_variant(Scenario::DatabaseOutage, ctx.baseline)?;
+    let mut checks = Vec::new();
+    for count in [1, 2] {
+        let cluster =
+            crate::cluster::Cluster::start(&invocation, &variant, ctx.issuer, count, engine)?;
+        let result = cluster.diagnose(crate::database_outage::database_outage(&cluster, count))?;
+        checks.extend(prefix_checks(result, &format!("{count} controllers")));
+    }
+    Ok(checks)
+}
+
+/// Runs each cluster scenario on its own appropriately configured deployment.
+fn cluster_scenario_checks(scenario: Scenario, ctx: &RunContext<'_>) -> Vec<Check> {
+    cluster_engine_checks(|engine| {
+        crate::stack::with_failure_evidence(|| {
+            cluster_scenario_engine_checks(scenario, ctx, engine)
+        })
+    })
+}
+
+fn cluster_engine_checks(run: impl Fn(Engine) -> Vec<Check> + Sync) -> Vec<Check> {
+    thread::scope(|scope| {
+        let handles = [Engine::DynamoDb, Engine::Postgres].map(|engine| {
+            let run = &run;
+            scope.spawn(move || prefix_checks(run(engine), engine.as_str()))
+        });
+        handles
+            .into_iter()
+            .flat_map(|handle| match handle.join() {
+                Ok(checks) => checks,
+                Err(panic) => std::panic::resume_unwind(panic),
+            })
+            .collect()
+    })
+}
+
+fn cluster_scenario_engine_checks(
+    scenario: Scenario,
+    ctx: &RunContext<'_>,
+    engine: Engine,
+) -> Vec<Check> {
+    if scenario == Scenario::ControllerLoss {
+        return controller_loss_checks(ctx, engine);
+    }
+    if !cfg!(target_os = "linux")
+        && matches!(
+            scenario,
+            Scenario::RollingDeploy | Scenario::LeaderFailover | Scenario::DatabaseOutage
+        )
+    {
+        return vec![Check::skipped(
+            scenario.as_str(),
+            "held probes require Linux process ancestry",
+        )];
+    }
+    attempt(scenario, || match scenario {
+        Scenario::RollingDeploy => {
+            let invocation = cluster_inputs(ctx, 0, 1)?;
+            let variant = required_cluster_variant(scenario, ctx.baseline)?;
+            let cluster =
+                crate::cluster::Cluster::start(&invocation, &variant, ctx.issuer, 2, engine)?;
+            cluster.diagnose(crate::rolling_deploy::rolling_deploy(&cluster))
+        }
+        Scenario::FollowerBuilds => {
+            let invocation = cluster_inputs(ctx, 0, 1)?;
+            let variant = required_cluster_variant(scenario, ctx.baseline)?;
+            let cluster =
+                crate::cluster::Cluster::start(&invocation, &variant, ctx.issuer, 3, engine)?;
+            cluster.diagnose(crate::follower_builds::follower_builds(&cluster))
+        }
+        Scenario::CrossRevocation => {
+            let variant = required_cluster_variant(scenario, ctx.baseline)?;
+            let cluster =
+                crate::cluster::Cluster::start(ctx.inputs, &variant, ctx.issuer, 2, engine)?;
+            cluster.diagnose(cross_revocation(&cluster, ctx.issuer))
+        }
+        Scenario::LeaderFailover => leader_failover_checks(ctx, engine),
+        Scenario::LoginAcross => {
+            let variant = required_cluster_variant(scenario, ctx.baseline)?;
+            let cluster =
+                crate::cluster::Cluster::start(ctx.inputs, &variant, ctx.issuer, 2, engine)?;
+            cluster.diagnose(crate::login_across::login_across(&cluster))
+        }
+        Scenario::DatabaseOutage => database_outage_checks(ctx, engine),
+        _ => Err(crate::errors::E2eError::system("not a cluster scenario")),
     })
 }
 
@@ -664,7 +952,7 @@ fn memory_checks(ctx: &RunContext<'_>) -> Vec<Check> {
             limits: ActionLimits::Cgroup,
             ..Variant::baseline(Sandbox::Noop)
         };
-        let stack = Stack::create(ctx.invocation, &variant, Transport::Tls, ctx.issuer)?;
+        let stack = Stack::create(ctx.inputs, &variant, Transport::Tls, ctx.issuer)?;
         memory(&stack, stack.stderr_tail_lines())
     })
 }
@@ -674,7 +962,7 @@ fn memory_checks(ctx: &RunContext<'_>) -> Vec<Check> {
 fn disk_checks(ctx: &RunContext<'_>) -> Vec<Check> {
     attempt(Scenario::Disk, || {
         let variant = Variant::baseline(Sandbox::native());
-        let stack = Stack::create(ctx.invocation, &variant, Transport::Tls, ctx.issuer)?;
+        let stack = Stack::create(ctx.inputs, &variant, Transport::Tls, ctx.issuer)?;
         disk(&stack, stack.stderr_tail_lines(), cfg!(target_os = "linux"))
     })
 }
@@ -780,8 +1068,8 @@ fn execution_checks(ctx: &RunContext<'_>, scenario: ExecutionScenario) -> Vec<Ch
         )];
     }
     attempt(scenario.scenario(), || {
-        let stack = Stack::create(ctx.invocation, &variant, Transport::Tls, ctx.issuer)?;
-        let exec = Observer::new(&stack, &ctx.invocation.settings)?;
+        let stack = Stack::create(ctx.inputs, &variant, Transport::Tls, ctx.issuer)?;
+        let exec = Observer::new(&stack, &ctx.inputs.settings)?;
         let tail = stack.stderr_tail_lines();
         match scenario {
             ExecutionScenario::ActionTimeout => action_timeout(&stack, &exec, Sandbox::Bwrap),
@@ -792,7 +1080,7 @@ fn execution_checks(ctx: &RunContext<'_>, scenario: ExecutionScenario) -> Vec<Ch
             }
             ExecutionScenario::SandboxContract => sandbox_contract(&stack, &exec, tail),
             ExecutionScenario::StaleScope => {
-                stale_scope(&stack, &exec, tail, ctx.invocation.settings.hold_timeout)
+                stale_scope(&stack, &exec, tail, ctx.inputs.settings.hold_timeout)
             }
             ExecutionScenario::MemoryEscalation => memory_escalation(&stack, tail),
             ExecutionScenario::UnplaceableDisk => unplaceable_disk(&stack, &exec, tail),
@@ -817,7 +1105,7 @@ fn control_checks<'a>(
             control: knobs,
             ..ctx.baseline
         };
-        let stack = Stack::create(ctx.invocation, &variant, Transport::Tls, ctx.issuer)?;
+        let stack = Stack::create(ctx.inputs, &variant, Transport::Tls, ctx.issuer)?;
         run(&stack)
     })
 }
@@ -838,7 +1126,7 @@ fn server_deployment<'a>(
         server,
         ..ctx.baseline
     };
-    let stack = Stack::create(ctx.invocation, &variant, Transport::Tls, ctx.issuer)?;
+    let stack = Stack::create(ctx.inputs, &variant, Transport::Tls, ctx.issuer)?;
     stack.start_server()?;
     Ok(stack)
 }
@@ -930,6 +1218,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cluster_engines_run_on_separate_threads_in_verdict_order() {
+        let parent = thread::current().id();
+        let threads = Mutex::new(Vec::new());
+        let checks = cluster_engine_checks(|_| {
+            threads.lock().push(thread::current().id());
+            vec![Check::passed("check")]
+        });
+        let threads = threads.into_inner();
+        assert_eq!(threads.len(), 2);
+        assert_ne!(threads[0], parent);
+        assert_ne!(threads[1], parent);
+        assert_ne!(threads[0], threads[1]);
+        assert_eq!(checks[0].name, "dynamodb: check");
+        assert_eq!(checks[1].name, "postgres: check");
+    }
+
+    #[test]
+    fn cluster_sign_in_subjects_are_isolated_from_mutated_issuer_policies() {
+        let mutated = [
+            crate::access::SIGN_IN_SUBJECT,
+            crate::browser::BROWSER_SUBJECT,
+        ];
+        for scenario in [
+            Scenario::ControllerLoss,
+            Scenario::RollingDeploy,
+            Scenario::FollowerBuilds,
+            Scenario::CrossRevocation,
+            Scenario::LeaderFailover,
+            Scenario::DatabaseOutage,
+            Scenario::LoginAcross,
+        ] {
+            let variant = cluster_variant(scenario, Variant::baseline(Sandbox::Noop))
+                .expect("listed scenarios are cluster scenarios");
+            if let Some(subject) = variant.identity.sign_in.subject(variant.identity.sessions) {
+                assert!(!mutated.contains(&subject), "{scenario}: {subject}");
+            }
+        }
+    }
+
+    #[test]
     fn every_scenario_name_round_trips() {
         for scenario in Scenario::ALL.iter().copied() {
             assert_eq!(
@@ -1012,7 +1340,14 @@ mod tests {
             Scenario::CertificateRotation,
             Scenario::Identity,
             Scenario::Sessions,
+            Scenario::ControllerLoss,
+            Scenario::RollingDeploy,
+            Scenario::CrossRevocation,
+            Scenario::LeaderFailover,
+            Scenario::LoginAcross,
+            Scenario::DatabaseOutage,
             Scenario::Builds,
+            Scenario::FollowerBuilds,
             Scenario::ScheduledMinimum,
         ];
         for scenario in gate_two_only {

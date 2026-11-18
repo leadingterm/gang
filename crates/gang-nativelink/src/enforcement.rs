@@ -17,8 +17,8 @@ pub type WholeKib = BoundedBytes<1024, 1, { u64::MAX / 1024 }>;
 /// of that range.
 pub type MinReservation = BoundedBytes<1024, { 4 * 1024 }, { u64::MAX / 1024 }>;
 
-/// The default minimum reservation: 16 MiB.
-const DEFAULT_MIN_RESERVATION: MinReservation = MinReservation::from_units(16 * 1024);
+/// The default minimum reservation: 64 MiB.
+const DEFAULT_MIN_RESERVATION: MinReservation = MinReservation::from_units(64 * 1024);
 
 /// Percent above the reservation an action may reach before it is killed.
 const DEFAULT_MEMORY_HEADROOM_PERCENT: HeadroomPercent = HeadroomPercent::from_percent(20);
@@ -63,7 +63,7 @@ pub struct MemoryTuning {
     /// The least memory reservation an action is scheduled with: a learned reservation can be a
     /// few hundred KiB (a quick action's first PSS sample), under which the soft limit and the
     /// escalation steps are judged from almost nothing. A whole number of KiB, it must not exceed
-    /// any fleet's `memory_per_instance`. Default: 16MiB.
+    /// any fleet's `memory_per_instance`. Default: 64MiB.
     pub min_reservation: MinReservation,
     /// Percent above its reservation an action may reach before `NativeLink` kills it. Default: 20.
     pub headroom_percent: HeadroomPercent,
@@ -266,7 +266,7 @@ mod tests {
         assert_eq!(memory.escalation_percent.get(), 200);
         assert_eq!(memory.headroom_percent.get(), 20);
         assert_eq!(memory.escalation_max_steps, 8);
-        assert_eq!(memory.min_reservation.as_units(), 16_384);
+        assert_eq!(memory.min_reservation.as_units(), 65_536);
 
         let cold = ColdStartTuning::default();
         assert!(cold.enabled);

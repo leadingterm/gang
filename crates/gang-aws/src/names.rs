@@ -19,9 +19,6 @@ const RESERVED_TAG_PREFIX: &[u8] = b"aws:";
 /// A config value that names something AWS cannot accept.
 #[derive(Debug, PartialEq, Eq, Error)]
 pub enum AwsNameError {
-    /// The region is empty or has characters outside `a-z`, `0-9` and `-`.
-    #[error("region must be non-empty and contain only a-z, 0-9 and '-'")]
-    Region,
     /// The bucket name has the wrong length or characters.
     #[error("bucket must be 3 to 63 characters of a-z, 0-9, '.' and '-'")]
     Bucket,
@@ -41,18 +38,6 @@ pub enum AwsNameError {
     /// The scratch mount point is relative or is the filesystem root.
     #[error("scratch_mount_point must be an absolute path other than the filesystem root")]
     MountPoint,
-}
-
-fn check_region(value: &str) -> Result<(), AwsNameError> {
-    let well_formed = !value.is_empty()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
-    if well_formed {
-        Ok(())
-    } else {
-        Err(AwsNameError::Region)
-    }
 }
 
 fn check_bucket(value: &str) -> Result<(), AwsNameError> {
@@ -100,13 +85,6 @@ fn check_key_id(value: &str) -> Result<(), AwsNameError> {
         Ok(())
     }
 }
-
-validated_string!(
-    /// An AWS region such as `eu-north-1`.
-    pub Region,
-    check_region,
-    AwsNameError
-);
 
 validated_string!(
     /// An S3 bucket name.
@@ -184,15 +162,6 @@ mod tests {
     use std::error::Error;
 
     use super::*;
-
-    #[test]
-    fn region_accepts_well_formed_and_rejects_the_rest() -> Result<(), Box<dyn Error>> {
-        assert_eq!(Region::try_new("us-east-1")?.as_str(), "us-east-1");
-        assert_eq!(Region::try_new(""), Err(AwsNameError::Region));
-        assert_eq!(Region::try_new("US"), Err(AwsNameError::Region));
-        assert_eq!(Region::try_new("eu_west"), Err(AwsNameError::Region));
-        Ok(())
-    }
 
     #[test]
     fn bucket_enforces_length_and_characters() -> Result<(), Box<dyn Error>> {
@@ -280,7 +249,6 @@ mod tests {
 
     #[test]
     fn deserialize_rejects_invalid_values() {
-        assert!(serde_json::from_str::<Region>("\"US\"").is_err());
         assert!(serde_json::from_str::<FleetTagKey>("\"aws:x\"").is_err());
         assert!(serde_json::from_str::<BucketName>("\"ab\"").is_err());
         assert!(serde_json::from_str::<KeyPrefix>("\"/x\"").is_err());
@@ -290,8 +258,6 @@ mod tests {
 
     #[test]
     fn round_trips_through_serde() -> Result<(), Box<dyn Error>> {
-        let region: Region = serde_json::from_str("\"eu-north-1\"")?;
-        assert_eq!(serde_json::to_string(&region)?, "\"eu-north-1\"");
         let mount: MountPoint = serde_json::from_str("\"/mnt/scratch\"")?;
         assert_eq!(serde_json::to_string(&mount)?, "\"/mnt/scratch\"");
         Ok(())

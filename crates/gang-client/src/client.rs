@@ -202,48 +202,48 @@ impl<P: LoginProviders, C: Console, K: Clock + 'static> Client<P, C, K> {
         } else {
             LoginOutcome::Interactive(Box::pin(self.loopback_login(&name, &logins, true)).await?)
         };
-        let _lock = self.home.lock().await?;
-        let grant = match outcome {
-            LoginOutcome::Interactive(grant) => grant,
-            LoginOutcome::Device(response) => {
+        let (session, stored, proof, refresh) = match outcome {
+            LoginOutcome::Interactive(grant) => {
+                let session = Session {
+                    server: request.server.clone(),
+                    ca_pin: request.ca_pin.copied(),
+                    provider: name.clone(),
+                    kind: SessionKind::Interactive {
+                        login: section_of(&logins, &name)?.clone(),
+                    },
+                };
+                let response = api
+                    .authenticate(&AuthenticateRequest {
+                        provider: name.clone(),
+                        credential: Credential::Proof(grant.proof.clone()),
+                    })
+                    .await?;
+                (
+                    session,
+                    self.response_token(response),
+                    Some(grant.proof),
+                    grant.refresh_token,
+                )
+            }
+            LoginOutcome::Device(mut response) => {
                 let refresh = response
                     .refresh_token
-                    .as_ref()
+                    .take()
                     .ok_or(ClientError::NoRefreshToken)?;
-                self.forget_interactive_login()?;
-                self.write_refresh_token(refresh)?;
-                let token = self.store_response(response)?;
-                Session {
+                let session = Session {
                     server: request.server.clone(),
                     ca_pin: request.ca_pin.copied(),
                     provider: name.clone(),
                     kind: SessionKind::Device,
-                }
-                .store(&self.home)?;
-                return Ok(LoggedIn {
-                    provider: name,
-                    expires_at: token.expires_at,
-                });
+                };
+                (session, self.response_token(response), None, Some(refresh))
             }
         };
-        match &grant.refresh_token {
-            Some(token) => self.write_refresh_token(token)?,
-            None => self.remove_refresh_token()?,
-        }
-        self.write_id_token(&grant.proof)?;
-        let session = Session {
-            server: request.server.clone(),
-            ca_pin: request.ca_pin.copied(),
-            provider: name.clone(),
-            kind: SessionKind::Interactive {
-                login: section_of(&logins, &name)?.clone(),
-            },
-        };
-        let token = self.mint(&api, &session).await?;
-        session.store(&self.home)?;
+        let _lock = self.home.lock().await?;
+        session.replace(&self.home, &stored, proof.as_ref(), refresh.as_ref())?;
         Ok(LoggedIn {
             provider: name,
-            expires_at: token.expires_at,
+            expires_at: stored.expires_at,
         })
     }
 
@@ -357,6 +357,7 @@ impl<P: LoginProviders, C: Console, K: Clock + 'static> Client<P, C, K> {
             source,
             ca_pin,
         } = request;
+        let source = source.bind()?;
         let api = ServerApi::try_new(
             server,
             ServerTrust::from(ca_pin),
@@ -364,6 +365,14 @@ impl<P: LoginProviders, C: Console, K: Clock + 'static> Client<P, C, K> {
             self.clock.clone(),
         )?;
         token_logins(api.server(None).await?)?;
+        let proof = source.read(&self.clock, &self.options).await?;
+        let response = api
+            .authenticate(&AuthenticateRequest {
+                provider: provider.clone(),
+                credential: Credential::Proof(proof),
+            })
+            .await?;
+        let stored = self.response_token(response);
         let session = Session {
             server: server.clone(),
             ca_pin: ca_pin.copied(),
@@ -372,12 +381,10 @@ impl<P: LoginProviders, C: Console, K: Clock + 'static> Client<P, C, K> {
         };
 
         let _lock = self.home.lock().await?;
-        self.forget_interactive_login()?;
-        let token = self.mint(&api, &session).await?;
-        session.store(&self.home)?;
+        session.replace(&self.home, &stored, None, None)?;
         Ok(LoggedIn {
             provider: provider.clone(),
-            expires_at: token.expires_at,
+            expires_at: stored.expires_at,
         })
     }
 
@@ -402,7 +409,11 @@ impl<P: LoginProviders, C: Console, K: Clock + 'static> Client<P, C, K> {
     /// # Errors
     ///
     /// Returns a storage or session decoding error.
-    pub fn stored_provider(&self) -> Result<Option<ProviderName>, ClientError> {
+    pub async fn stored_provider(&self) -> Result<Option<ProviderName>, ClientError> {
+        if !self.home.has_file(&self.home.session_file())? {
+            return Ok(None);
+        }
+        let _lock = self.home.lock().await?;
         Ok(Session::load(&self.home)?.map(|session| session.provider))
     }
 
@@ -647,14 +658,19 @@ impl<P: LoginProviders, C: Console, K: Clock + 'static> Client<P, C, K> {
         self.store_response(response)
     }
 
-    /// Stores a server-issued bearer token.
-    fn store_response(&self, response: AuthenticateResponse) -> Result<BearerToken, ClientError> {
+    /// Prepares the stored bearer token from a server response.
+    fn response_token(&self, response: AuthenticateResponse) -> StoredToken {
         let issued_at = self.clock.wall();
-        let stored = StoredToken {
+        StoredToken {
             token: response.token,
             issued_at,
             expires_at: issued_at + response.lifetime,
-        };
+        }
+    }
+
+    /// Stores a server-issued bearer token.
+    fn store_response(&self, response: AuthenticateResponse) -> Result<BearerToken, ClientError> {
+        let stored = self.response_token(response);
         let bytes = serde_json::to_vec(&stored).map_err(|source| ClientError::Session {
             path: self.home.token_file(),
             source,

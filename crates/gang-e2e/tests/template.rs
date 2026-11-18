@@ -96,6 +96,31 @@ fn placed_base_omits_announced_endpoints_and_parses_as_toml() -> gang_e2e::Resul
 }
 
 #[test]
+fn placement_preserves_dynamodb_configuration() -> gang_e2e::Result<()> {
+    let mut table: Table = toml::from_str(&base_config()?).expect("base is TOML");
+    let dynamodb: Table =
+        toml::from_str("[database.dynamodb]\ntable = \"gang-test\"\nregion = \"us-east-1\"\n")
+            .expect("database fixture is TOML");
+    table.insert(
+        "database".to_owned(),
+        dynamodb.get("database").expect("database fixture").clone(),
+    );
+    let text = toml::to_string(&table).expect("base renders");
+    let original =
+        Document::<Plugins>::parse(&text).map_err(|error| E2eError::Template(error.to_string()))?;
+    let placement = Placement::create(None)?;
+    let placed = ConfigTemplate::parse(&text)?.place(&placement, Transport::Tls)?;
+    let rendered = typed_rendered(&placed)?;
+    let (DatabaseConfig::Dynamodb(rendered), DatabaseConfig::Dynamodb(expected)) =
+        (&rendered.database, &original.database)
+    else {
+        panic!("placement must keep the dynamodb database section");
+    };
+    assert_eq!(rendered, expected);
+    Ok(())
+}
+
+#[test]
 fn place_gives_every_local_fleet_the_harness_fleet_disk() -> gang_e2e::Result<()> {
     let placement = Placement::create(None)?;
     let template = ConfigTemplate::parse(&base_config()?)?
@@ -132,7 +157,9 @@ fn place_points_listeners_paths_and_endpoints_at_the_placement() -> gang_e2e::Re
         panic!("file signer expected");
     };
     assert_eq!(signer.key_file.as_path(), placement.ca_key());
-    let DatabaseConfig::Sqlite(database) = &doc.database;
+    let DatabaseConfig::Sqlite(database) = &doc.database else {
+        return Err(E2eError::Template("sqlite database expected".to_owned()));
+    };
     assert_eq!(database.path, placement.database());
     let noop = doc.sandbox.noop.as_ref().expect("noop sandbox expected");
     assert_eq!(
@@ -285,6 +312,39 @@ fn varied_nativelink(variant: Variant) -> gang_e2e::Result<NativeLinkConfig> {
     )?)?;
     let SchedulerConfig::Nativelink(nativelink) = doc.scheduler;
     Ok(nativelink)
+}
+
+#[test]
+fn short_boot_grace_bounds_shutdown_and_preserves_shorter_setting() -> gang_e2e::Result<()> {
+    let variant = Variant {
+        control: ControlKnobs::ORPHAN,
+        ..Variant::baseline(Sandbox::Noop)
+    };
+    for (suffix, expected) in [
+        ("", std::time::Duration::from_secs(5)),
+        (
+            "\n[scheduler.nativelink.http2]\nshutdown_grace = \"3s\"\n",
+            std::time::Duration::from_secs(3),
+        ),
+    ] {
+        let base = format!("{}{suffix}", base_config()?);
+        let text = ConfigTemplate::parse(&base)?
+            .vary(&variant, &launcher(), &tools())?
+            .render()?;
+        let config = text
+            .parse::<GangConfig<Plugins>>()
+            .map_err(|error| E2eError::Template(error.to_string()))?;
+        let SchedulerConfig::Nativelink(scheduler) = config.scheduler;
+        assert_eq!(scheduler.http2.shutdown_grace, expected);
+        assert!(
+            config
+                .fleets
+                .policies()
+                .iter()
+                .all(|fleet| scheduler.http2.shutdown_grace < fleet.boot_grace)
+        );
+    }
+    Ok(())
 }
 
 #[test]

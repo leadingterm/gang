@@ -51,15 +51,30 @@ export const runningSeries = (r: Recent): readonly (number | null)[] =>
 export const queuedSeries = (r: Recent): readonly (number | null)[] =>
   slots(r).map((s) => s && s.passes > 0 ? s.queued : null);
 
-/** Remote-cache hit rate per recorded step, or null without lookups. */
-export const cacheSeries = (r: Recent): readonly (number | null)[] =>
-  slots(r).map((s) => s && s.lookups > 0 ? s.hits / s.lookups : null);
+export interface CacheWindow {
+  readonly lookups: number;
+  readonly hits: number;
+  readonly rate: number | null;
+  readonly lookupsPerStep: readonly (number | null)[];
+  readonly hitsPerStep: readonly (number | null)[];
+}
 
-/** Hit rate weighted by lookup count across the recent window. */
-export const cacheRate = (r: Recent): number | null => {
-  const samples = slots(r).filter((s): s is Sample => s !== null);
-  const lookups = sum(samples, (s) => s.lookups ?? 0);
-  return lookups > 0 ? sum(samples, (s) => s.hits ?? 0) / lookups : null;
+/** Cache lookup and hit counts and their weighted rate across the recent window. */
+export const cacheWindow = (r: Recent): CacheWindow => {
+  const all = slots(r);
+  const lookupsPerStep: (number | null)[] = [];
+  const hitsPerStep: (number | null)[] = [];
+  let lookups = 0;
+  let hits = 0;
+  for (const s of all) {
+    lookupsPerStep.push(s === null ? null : s.lookups);
+    hitsPerStep.push(s === null ? null : s.hits);
+    if (s !== null) {
+      lookups += s.lookups;
+      hits += s.hits;
+    }
+  }
+  return { lookups, hits, rate: lookups > 0 ? hits / lookups : null, lookupsPerStep, hitsPerStep };
 };
 
 export type Bar = "ok" | "skipped" | "idle" | "unrecorded";

@@ -1,24 +1,28 @@
 //! Plugins shared by the `compose!` integration tests. Each test crate declares this module and
 //! composes the same plugins, so every item here is used by both crates.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use gang_clock::Timestamp;
 use gang_spi::{
-    ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, ActionsView, ApiService,
-    Authenticated, AuthenticationHost, AuthenticationPort, CacheStorePort, Capabilities,
-    CertStatus, CertificateIssue, CertificateSignerPort, CertificateTarget, ClientCertificates,
-    ControllerConnections, ControllerEndpoints, ControllerReady, ControllerSpec,
-    CredentialLifecyclePort, Evidence, FleetInstance, FleetOptions, FleetSupply, InstanceIdentity,
-    IssuedCertRecord, IssuedCertificate, IssuedToken, ListingLimits, LoginChallenge, LoginClient,
-    LoginGrant, LoginPort, LoginRequest, LoginSupport, MountedScratchVolume, NodeLifecyclePort,
-    Plugin, PluginContext, PortError, PreemptionNotice, PrincipalRecord, ProofVerifierPort,
-    ProvisionerPort, QueuedDemand, RecordedScalingEvent, Rejection, RenderedStoreSpec, RequestGate,
-    SandboxPrograms, SandboxedAction, ScalingAuditEvent, ScalingEventSeq, SchedulerPort,
-    SchedulerSnapshot, Scheme, ScratchVolumePort, SignatureAlgorithm, StateRepositoryPort,
-    StoreAccess, Subject, TokenIssue, WorkerSpec, WorkerTls, WorkloadCredentialPort,
+    Acquisition, ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, ActionsView,
+    ApiService, Authenticated, AuthenticationHost, AuthenticationPort, CacheStorePort,
+    Capabilities, CertStatus, CertificateIssue, CertificateSignerPort, CertificateTarget,
+    ClientCertificates, ControllerConnections, ControllerEndpoints, ControllerHostPort,
+    ControllerId, ControllerReady, ControllerSpec, CredentialLifecyclePort, Evidence,
+    ExpiringRecordPort, FleetInstance, FleetOptions, FleetSupply, Held, HostMilestone, Insert,
+    InstanceIdentity, IssuedCertRecord, IssuedCertificate, IssuedToken, LeaderLeasePort, Lease,
+    LeaseEpoch, ListingLimits, LoginChallenge, LoginClient, LoginGrant, LoginPort, LoginRequest,
+    LoginSupport, MountedScratchVolume, NodeLifecyclePort, Plugin, PluginContext, PortError,
+    PreemptionNotice, PrincipalRecord, ProofVerifierPort, ProvisionerPort, QueuedDemand, Record,
+    RecordKey, RecordVersion, RecordedScalingEvent, Rejection, Remove, RenderedStoreSpec, Renewal,
+    Replace, RequestGate, RevocationEpoch, SandboxPrograms, SandboxedAction, ScalingAuditEvent,
+    ScalingEventSeq, SchedulerPort, SchedulerSnapshot, Scheme, ScratchVolumePort,
+    SignatureAlgorithm, StateRepositoryPort, StoreAccess, Subject, TokenIssue, WorkerSpec,
+    WorkerTls, WorkloadCredentialPort,
 };
 use gang_types::{
     ActionResources, AuthenticationSettings, Bytes, CertSerial, Fleet, FleetName, FleetSet,
@@ -134,6 +138,8 @@ macro_rules! provisioner_plugin {
             desired: Mutex<u32>,
             /// The fleet options each port call received, in call order.
             pub seen: Mutex<Vec<String>>,
+            /// Number of convergence calls received.
+            pub converges: Mutex<usize>,
         }
 
         impl Plugin for $plugin {
@@ -147,6 +153,7 @@ macro_rules! provisioner_plugin {
                     number: config.number,
                     desired: Mutex::new(config.number),
                     seen: Mutex::new(Vec::new()),
+                    converges: Mutex::new(0),
                 })
             }
         }
@@ -181,13 +188,26 @@ macro_rules! provisioner_plugin {
                 Ok(())
             }
 
+            async fn converge(
+                &self,
+                held: &Held,
+                _fleet: Fleet<'_, Self::FleetOptions>,
+            ) -> Result<(), PortError> {
+                held.check()?;
+                *self.converges.lock() += 1;
+                Ok(())
+            }
+
             async fn set_desired_capacity(
                 &self,
+                held: &Held,
                 fleet: Fleet<'_, Self::FleetOptions>,
                 desired: u32,
             ) -> Result<(), PortError> {
+                held.check()?;
                 self.record(fleet.options);
                 let mut current = self.desired.lock();
+                held.check()?;
                 *current = if desired < *current {
                     desired.max(1)
                 } else {
@@ -198,15 +218,27 @@ macro_rules! provisioner_plugin {
 
             async fn terminate(
                 &self,
+                held: &Held,
                 fleet: Fleet<'_, Self::FleetOptions>,
                 instance: &InstanceId,
             ) -> Result<(), PortError> {
+                held.check()?;
                 self.record(fleet.options);
                 Err(PortError::NotFound(Subject::Instance(instance.clone())))
             }
 
             fn worker_lifetime(&self) -> WorkerLifetime {
                 $lifetime
+            }
+        }
+
+        impl ControllerHostPort for $plugin {
+            async fn retiring(&self) -> Result<(), PortError> {
+                std::future::pending().await
+            }
+
+            async fn reached(&self, _milestone: HostMilestone) -> Result<(), PortError> {
+                Ok(())
             }
         }
 
@@ -377,32 +409,33 @@ impl SchedulerPort for Stub {
     }
 }
 
-numbered_plugin!(Memory);
+/// The in-test database plugin.
+pub struct Memory {
+    state: Mutex<MemoryState>,
+}
 
-impl StateRepositoryPort for Memory {
-    async fn record_issued(&self, _record: &IssuedCertRecord) -> Result<(), PortError> {
-        Ok(())
-    }
+#[derive(Default)]
+struct MemoryState {
+    certificates: BTreeMap<CertSerial, IssuedCertRecord>,
+    principals: BTreeMap<Identity, PrincipalRecord>,
+    revocation_epoch: u64,
+    lease: Option<MemoryLease>,
+    records: BTreeMap<RecordKey, Record>,
+}
 
-    async fn certificate(
-        &self,
-        _serial: &CertSerial,
-    ) -> Result<Option<IssuedCertRecord>, PortError> {
-        Ok(None)
-    }
+struct MemoryLease {
+    holder: Option<ControllerId>,
+    epoch: LeaseEpoch,
+    expires_at: Timestamp,
+}
 
-    async fn revoke(
-        &self,
-        serial: &CertSerial,
-        _at: Timestamp,
-    ) -> Result<IssuedCertRecord, PortError> {
-        Err(PortError::NotFound(Subject::Certificate(serial.clone())))
-    }
+impl Plugin for Memory {
+    type Config = NumberConfig;
 
-    async fn revoked(&self) -> Result<Vec<IssuedCertRecord>, PortError> {
+    fn build(config: NumberConfig, _context: &PluginContext<'_>) -> Result<Self, PortError> {
         let principal =
-            Principal::try_new(format!("db-{}", self.number)).map_err(PortError::backend)?;
-        Ok(vec![IssuedCertRecord {
+            Principal::try_new(format!("db-{}", config.number)).map_err(PortError::backend)?;
+        let record = IssuedCertRecord {
             serial: CertSerial::try_new("01").map_err(PortError::backend)?,
             identity: Identity::new(
                 ProviderName::try_new("corp").map_err(PortError::backend)?,
@@ -413,14 +446,107 @@ impl StateRepositoryPort for Memory {
             status: CertStatus::Revoked {
                 at: Timestamp::UNIX_EPOCH,
             },
-        }])
+        };
+        let mut state = MemoryState::default();
+        state.certificates.insert(record.serial.clone(), record);
+        Ok(Self {
+            state: Mutex::new(state),
+        })
+    }
+}
+
+impl StateRepositoryPort for Memory {
+    async fn record_issued(&self, record: &IssuedCertRecord) -> Result<(), PortError> {
+        let mut state = self.state.lock();
+        if state.certificates.contains_key(&record.serial) {
+            return Err(PortError::backend(std::io::Error::other(
+                "duplicate certificate",
+            )));
+        }
+        state
+            .certificates
+            .insert(record.serial.clone(), record.clone());
+        Ok(())
+    }
+
+    async fn certificate(
+        &self,
+        serial: &CertSerial,
+    ) -> Result<Option<IssuedCertRecord>, PortError> {
+        Ok(self.state.lock().certificates.get(serial).cloned())
+    }
+
+    async fn revoke(
+        &self,
+        serial: &CertSerial,
+        at: Timestamp,
+    ) -> Result<IssuedCertRecord, PortError> {
+        let mut state = self.state.lock();
+        let next = state.revocation_epoch.checked_add(1).ok_or_else(|| {
+            PortError::backend(std::io::Error::other("revocation epoch overflow"))
+        })?;
+        let record = state
+            .certificates
+            .get_mut(serial)
+            .ok_or_else(|| PortError::NotFound(Subject::Certificate(serial.clone())))?;
+        if record.status == CertStatus::Active {
+            record.status = CertStatus::Revoked { at };
+        }
+        let record = record.clone();
+        state.revocation_epoch = next;
+        Ok(record)
+    }
+
+    async fn revoked(&self) -> Result<Vec<IssuedCertRecord>, PortError> {
+        let mut records: Vec<_> = self
+            .state
+            .lock()
+            .certificates
+            .values()
+            .filter(|record| matches!(record.status, CertStatus::Revoked { .. }))
+            .cloned()
+            .collect();
+        records.sort_by_key(|record| match record.status {
+            CertStatus::Revoked { at } => (at, record.serial.clone()),
+            CertStatus::Active => (Timestamp::UNIX_EPOCH, record.serial.clone()),
+        });
+        Ok(records)
     }
 
     async fn certificates_of(
         &self,
-        _identity: &Identity,
+        identity: &Identity,
     ) -> Result<Vec<IssuedCertRecord>, PortError> {
-        Ok(Vec::new())
+        let mut records: Vec<_> = self
+            .state
+            .lock()
+            .certificates
+            .values()
+            .filter(|record| record.identity == *identity && record.status == CertStatus::Active)
+            .cloned()
+            .collect();
+        records.sort_by(|a, b| (a.issued_at, &a.serial).cmp(&(b.issued_at, &b.serial)));
+        Ok(records)
+    }
+
+    async fn certificates(
+        &self,
+        after: Option<&CertSerial>,
+        limit: NonZeroUsize,
+        into: &mut Vec<IssuedCertRecord>,
+    ) -> Result<bool, PortError> {
+        let state = self.state.lock();
+        let mut records = state
+            .certificates
+            .values()
+            .filter(|record| after.is_none_or(|after| record.serial > *after));
+        into.clear();
+        into.extend(records.by_ref().take(limit.get()).cloned());
+        Ok(records.next().is_some())
+    }
+
+    async fn revocation_epoch(&self) -> Result<RevocationEpoch, PortError> {
+        Ok(RevocationEpoch::new(self.state.lock().revocation_epoch))
     }
 
     async fn record_scaling_event(
@@ -441,16 +567,23 @@ impl StateRepositoryPort for Memory {
         Ok(false)
     }
 
-    async fn observe_principal(
-        &self,
-        _identity: &Identity,
-        _at: Timestamp,
-    ) -> Result<(), PortError> {
+    async fn observe_principal(&self, identity: &Identity, at: Timestamp) -> Result<(), PortError> {
+        let mut state = self.state.lock();
+        let record = state
+            .principals
+            .entry(identity.clone())
+            .or_insert_with(|| PrincipalRecord {
+                identity: identity.clone(),
+                first_seen: at,
+                last_seen: at,
+                revoked_at: None,
+            });
+        record.last_seen = record.last_seen.max(at);
         Ok(())
     }
 
-    async fn principal(&self, _identity: &Identity) -> Result<Option<PrincipalRecord>, PortError> {
-        Ok(None)
+    async fn principal(&self, identity: &Identity) -> Result<Option<PrincipalRecord>, PortError> {
+        Ok(self.state.lock().principals.get(identity).cloned())
     }
 
     async fn revoke_principal(
@@ -458,31 +591,227 @@ impl StateRepositoryPort for Memory {
         identity: &Identity,
         at: Timestamp,
     ) -> Result<PrincipalRecord, PortError> {
-        Ok(PrincipalRecord {
-            identity: identity.clone(),
-            first_seen: at,
-            last_seen: at,
-            revoked_at: Some(at),
-        })
+        let mut state = self.state.lock();
+        let next = state.revocation_epoch.checked_add(1).ok_or_else(|| {
+            PortError::backend(std::io::Error::other("revocation epoch overflow"))
+        })?;
+        let record = state
+            .principals
+            .entry(identity.clone())
+            .or_insert_with(|| PrincipalRecord {
+                identity: identity.clone(),
+                first_seen: at,
+                last_seen: at,
+                revoked_at: None,
+            });
+        record.revoked_at.get_or_insert(at);
+        let record = record.clone();
+        state.revocation_epoch = next;
+        Ok(record)
     }
 
     async fn restore_principal(&self, identity: &Identity) -> Result<PrincipalRecord, PortError> {
-        Err(PortError::NotFound(Subject::Principal(identity.clone())))
+        let mut state = self.state.lock();
+        let next = state.revocation_epoch.checked_add(1).ok_or_else(|| {
+            PortError::backend(std::io::Error::other("revocation epoch overflow"))
+        })?;
+        let record = state
+            .principals
+            .get_mut(identity)
+            .ok_or_else(|| PortError::NotFound(Subject::Principal(identity.clone())))?;
+        record.revoked_at = None;
+        let record = record.clone();
+        state.revocation_epoch = next;
+        Ok(record)
     }
 
     async fn revoked_principals(&self) -> Result<Vec<PrincipalRecord>, PortError> {
-        Ok(Vec::new())
+        let mut records: Vec<_> = self
+            .state
+            .lock()
+            .principals
+            .values()
+            .filter(|record| record.revoked_at.is_some())
+            .cloned()
+            .collect();
+        records.sort_by(|a, b| (a.revoked_at, &a.identity).cmp(&(b.revoked_at, &b.identity)));
+        Ok(records)
     }
 
     async fn principals(
         &self,
-        _after: Option<&gang_types::Identity>,
-        _limit: NonZeroUsize,
-        _only_revoked: bool,
+        after: Option<&gang_types::Identity>,
+        limit: NonZeroUsize,
+        only_revoked: bool,
         into: &mut Vec<PrincipalRecord>,
     ) -> Result<bool, PortError> {
+        let state = self.state.lock();
+        let mut records = state.principals.values().filter(|record| {
+            after.is_none_or(|after| record.identity > *after)
+                && (!only_revoked || record.revoked_at.is_some())
+        });
         into.clear();
-        Ok(false)
+        into.extend(records.by_ref().take(limit.get()).cloned());
+        Ok(records.next().is_some())
+    }
+}
+
+impl LeaderLeasePort for Memory {
+    async fn acquire(
+        &self,
+        holder: &ControllerId,
+        stale_before: Timestamp,
+        expires_at: Timestamp,
+    ) -> Result<Acquisition, PortError> {
+        let mut state = self.state.lock();
+        if let Some(current) = &state.lease
+            && let Some(current_holder) = &current.holder
+            && current.expires_at >= stale_before
+        {
+            return Ok(Acquisition::Held(Lease {
+                holder: current_holder.clone(),
+                epoch: current.epoch,
+                expires_at: current.expires_at,
+            }));
+        }
+        let previous = state.lease.as_ref().map_or(0, |lease| lease.epoch.get());
+        let epoch = previous
+            .checked_add(1)
+            .ok_or_else(|| PortError::backend(std::io::Error::other("lease epoch overflow")))?;
+        let lease = Lease {
+            holder: holder.clone(),
+            epoch: LeaseEpoch::new(epoch),
+            expires_at,
+        };
+        state.lease = Some(MemoryLease {
+            holder: Some(holder.clone()),
+            epoch: lease.epoch,
+            expires_at,
+        });
+        Ok(Acquisition::Acquired(lease))
+    }
+
+    async fn renew(&self, lease: &Lease, expires_at: Timestamp) -> Result<Renewal, PortError> {
+        let mut state = self.state.lock();
+        if let Some(current) = state.lease.as_mut()
+            && current.holder.as_ref() == Some(&lease.holder)
+            && current.epoch == lease.epoch
+        {
+            current.expires_at = expires_at;
+            return Ok(Renewal::Renewed(Lease {
+                holder: lease.holder.clone(),
+                epoch: lease.epoch,
+                expires_at,
+            }));
+        }
+        Ok(Renewal::Lost)
+    }
+
+    async fn release(&self, lease: &Lease) -> Result<(), PortError> {
+        let mut state = self.state.lock();
+        if let Some(current) = state.lease.as_mut()
+            && current.holder.as_ref() == Some(&lease.holder)
+            && current.epoch == lease.epoch
+        {
+            current.holder = None;
+        }
+        Ok(())
+    }
+}
+
+impl ExpiringRecordPort for Memory {
+    async fn insert(
+        &self,
+        records: &[(RecordKey, &[u8])],
+        version: RecordVersion,
+        now: Timestamp,
+        expires_at: Timestamp,
+    ) -> Result<Insert, PortError> {
+        let mut state = self.state.lock();
+        if records.iter().any(|(key, _)| {
+            state
+                .records
+                .get(key)
+                .is_some_and(|record| now < record.expires_at)
+        }) {
+            return Ok(Insert::Exists);
+        }
+        for (key, body) in records {
+            state.records.insert(
+                *key,
+                Record {
+                    body: body.to_vec(),
+                    version,
+                    expires_at,
+                },
+            );
+        }
+        Ok(Insert::Inserted)
+    }
+
+    async fn get(&self, key: &RecordKey, now: Timestamp) -> Result<Option<Record>, PortError> {
+        Ok(self
+            .state
+            .lock()
+            .records
+            .get(key)
+            .filter(|record| now < record.expires_at)
+            .cloned())
+    }
+
+    async fn replace(
+        &self,
+        key: &RecordKey,
+        version: RecordVersion,
+        body: &[u8],
+        now: Timestamp,
+        expires_at: Timestamp,
+    ) -> Result<Replace, PortError> {
+        let mut state = self.state.lock();
+        let Some(record) = state
+            .records
+            .get_mut(key)
+            .filter(|record| now < record.expires_at && record.version == version)
+        else {
+            return Ok(Replace::Stale);
+        };
+        let next = version
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| PortError::backend(std::io::Error::other("record version overflow")))?;
+        let version = RecordVersion::new(next);
+        *record = Record {
+            body: body.to_vec(),
+            version,
+            expires_at,
+        };
+        Ok(Replace::Replaced(version))
+    }
+
+    async fn remove(
+        &self,
+        key: &RecordKey,
+        version: RecordVersion,
+        now: Timestamp,
+    ) -> Result<Remove, PortError> {
+        let mut state = self.state.lock();
+        if state
+            .records
+            .get(key)
+            .is_some_and(|record| now < record.expires_at && record.version == version)
+        {
+            state.records.remove(key);
+            return Ok(Remove::Removed);
+        }
+        Ok(Remove::Stale)
+    }
+
+    async fn purge(&self, now: Timestamp) -> Result<(), PortError> {
+        self.state
+            .lock()
+            .records
+            .retain(|_, record| now < record.expires_at);
+        Ok(())
     }
 }
 
@@ -578,8 +907,11 @@ impl LoginPort for Token {
         session: LoginSession,
         _callback_url: &Url,
     ) -> Result<LoginGrant, PortError> {
+        let proof = Proof::new(session.expose());
+        let principal = self.verify(&proof).await?;
         Ok(LoginGrant {
-            proof: Proof::new(session.expose()),
+            proof,
+            principal,
             refresh_token: None,
         })
     }
@@ -625,6 +957,7 @@ macro_rules! no_credentials {
                 &self,
                 _host: &H,
                 _request: &TokenIssue<'_>,
+                _expires_at: gang_clock::Timestamp,
             ) -> Result<IssuedToken, PortError> {
                 Err(PortError::Unsupported {
                     operation: "issue_session",

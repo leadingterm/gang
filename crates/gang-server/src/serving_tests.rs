@@ -47,9 +47,6 @@ const WORKER_HOST: &str = "scheduler.example.test";
 /// The session cookie name of the https deployment.
 const SESSION_COOKIE: &str = "__Host-gang_session";
 
-/// How far past its expiry a token is still accepted: the test token configuration's clock skew.
-const CLOCK_SKEW: Duration = Duration::from_secs(30);
-
 /// Prepares a TLS server with the test settings, failing the test when preparation fails.
 async fn prepare_tls(parts: Parts<TlsDeployment>) -> Server<TlsDeployment> {
     match Server::prepare(parts, tls_settings()).await {
@@ -847,7 +844,7 @@ async fn session_cookie_of_an_administrator_reports_every_permission() {
         );
         assert_eq!(
             session.expire_time,
-            Some(handles.clock.wall() + SESSION_TTL + CLOCK_SKEW)
+            Some(handles.clock.wall() + SESSION_TTL)
         );
     }))
     .await;

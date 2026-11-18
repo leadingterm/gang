@@ -10,14 +10,13 @@ workspace = true
 
 [dependencies]
 aws-config = { workspace = true }
-aws-runtime = { workspace = true }
 aws-sdk-autoscaling = { workspace = true }
 aws-sdk-ec2 = { workspace = true }
 aws-sdk-kms = { workspace = true }
 aws-sdk-sts = { workspace = true }
-aws-smithy-http-client = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
+gang-aws-sdk = { workspace = true }
 gang-clock = { workspace = true }
 gang-os = { workspace = true }
 gang-spi = { workspace = true }
@@ -38,4 +37,5 @@ gang-testkit = { workspace = true }
 nativelink-config = { workspace = true }
 p256 = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 url = { workspace = true }

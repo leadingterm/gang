@@ -3,7 +3,7 @@ import { createContext, type ComponentChildren } from "preact";
 import { useContext, useEffect, useRef, useState } from "preact/hooks";
 import { useComputed } from "@preact/signals";
 import type { StateClient } from "./client.ts";
-import { duration, splitTarget, workerInstance } from "./format.ts";
+import { clock, day, duration, splitTail, workerInstance } from "./format.ts";
 import { eventKind, idOf, type EventKind, type UnixMs } from "./wire-parse.ts";
 import type { EventChange, Fleet, ScalingEvent } from "./wire.ts";
 
@@ -18,18 +18,40 @@ export const useClient = (): StateClient => {
 const reducedMotion = (): boolean =>
   typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
 
+/** A column: `share` takes the free width for a main identifier and never drops below 10rem, so capped columns cannot starve it; `fit` shows an identifier whole up to its rem cap; neither fits a one-line value. */
+export type Column = { readonly head?: ComponentChildren; readonly share?: number; readonly fit?: number; readonly end?: boolean };
+
+/** Rows share column tracks so their cells cannot widen the table; explicit roles keep the table semantics that grid layout drops. */
+export const Table = ({ cols, label, cls, children }: { cols: readonly Column[]; label?: string; cls?: string; children: ComponentChildren }) => (
+  <table role="table" class={cls ? `table ${cls}` : "table"} aria-label={label} style={{ "--cols": cols.map((c) => c.share !== undefined ? `minmax(min(10rem, 100%), ${c.share}fr)` : c.fit !== undefined ? `fit-content(${c.fit}rem)` : "max-content").join(" ") }}>
+    {cols.some((c) => c.head !== undefined) && <thead role="rowgroup"><tr role="row">{cols.map((c, i) => <th key={i} role="columnheader" scope="col" class={c.end ? "r" : undefined}>{c.head}</th>)}</tr></thead>}
+    <tbody role="rowgroup">{children}</tbody>
+  </table>
+);
+
+const iso = (t: UnixMs): string => new Date(t).toISOString();
+
+/** A moment as a UTC day. */
+export const Day = ({ t }: { t: UnixMs }) => <time dateTime={iso(t)}>{day(t)}</time>;
+
+/** A moment as a UTC clock time. */
+export const Clock = ({ t }: { t: UnixMs }) => <time dateTime={iso(t)}>{clock(t)}</time>;
+
+/** A length of time. */
+export const Duration = ({ ms }: { ms: number }) => <time>{duration(ms)}</time>;
+
 /** Time since `t` on the server clock; only the text node updates each second. */
 export const Since = ({ t, cls = "" }: { t: UnixMs; cls?: string }) => {
   const client = useClient();
   const text = useComputed(() => duration(client.now.value - t));
-  return <span class={`mono ${cls}`.trim()}>{text}</span>;
+  return <time class={`mono ${cls}`.trim()}>{text}</time>;
 };
 
 /** Time left until `t` on the server clock. */
 export const Until = ({ t }: { t: UnixMs }) => {
   const client = useClient();
   const text = useComputed(() => duration(t - client.now.value));
-  return <span>{text}</span>;
+  return <time>{text}</time>;
 };
 
 const TWEEN_MS = 640;
@@ -77,15 +99,24 @@ export const useEnter = <T extends HTMLElement>() => {
   return ref;
 };
 
-export const Target = ({ label }: { label: string }) => {
-  const [pkg, name] = splitTarget(label);
-  return (
-    <span class="target">
-      <span class="target__pkg">{pkg}</span>
-      {name}
-    </span>
-  );
+/** A table row; `enter` settles a newly added row into place. Rows keep their role because the table is laid out as a grid. */
+export const Row = ({ cls, enter = false, children }: { cls?: string | undefined; enter?: boolean; children: ComponentChildren }) => {
+  const ref = useEnter<HTMLTableRowElement>();
+  return <tr role="row" class={cls} ref={enter ? ref : null}>{children}</tr>;
 };
+/** A table cell. */
+export const Cell = ({ cls, children }: { cls?: string | undefined; children?: ComponentChildren }) => <td role="cell" class={cls}>{children}</td>;
+
+/** A single-line identifier with its full value on hover; when narrow it gives way in its head and keeps its tail (`splitTail`). */
+export const Ident = ({ text, title = text, cls }: { text: string; title?: string; cls?: string }) => {
+  const [head, tail] = splitTail(text);
+  const classes = ["ident", head && "ident--split", cls].filter(Boolean).join(" ");
+  return head ? (
+    <span class={classes} title={title}><span class="ident__head">{head}</span><span class="ident__tail">{tail}</span></span>
+  ) : <span class={classes} title={title}>{text}</span>;
+};
+/** A Bazel label: an identifier whose package gives way first. */
+export const Target = ({ label }: { label: string }) => <Ident text={label} cls="target" />;
 
 export const Priority = ({ p }: { p: number }) =>
   p > 0 ? (
@@ -127,32 +158,32 @@ export const EVENT_VIEW = {
   drainStarted: {
     glyph: <path class="g-drain" d="M7 2v9M3 7.5 7 11.5l4-4" />,
     label: "Drain",
-    what: (c) => <span class="mono">{workerLabel(c.worker)}</span>,
+    what: (c) => <span class="line mono"><Ident text={workerLabel(c.worker)} /></span>,
   },
   drainCancelled: {
     glyph: <path class="g-cancel" d="M11.5 11.5v-5H3M6 3.5l-3 3 3 3" />,
     label: "Cancel drain",
-    what: (c) => <span class="mono">{workerLabel(c.worker)}</span>,
+    what: (c) => <span class="line mono"><Ident text={workerLabel(c.worker)} /></span>,
   },
   terminated: {
     glyph: <path class="g-term" d="M3 3l8 8M11 3l-8 8" />,
     label: "Terminate",
-    what: (c) => <span class="mono">{idOf(c.instance)}</span>,
+    what: (c) => <span class="line mono"><Ident text={idOf(c.instance)} /></span>,
   },
   exitedEarly: {
     glyph: <path class="g-term" d="M3 3l8 8M11 3l-8 8" />,
     label: "Early exit",
-    what: (c) => <span class="mono">{idOf(c.instance)}: {c.failure}</span>,
+    what: (c) => <span class="line mono"><Ident text={idOf(c.instance)} />{" "}<span class="line__prose">{c.failure}</span></span>,
   },
   workerRegistered: {
     glyph: workerGlyph,
     label: "Join",
-    what: (c) => <span class="mono">{workerLabel(c.worker)} joined</span>,
+    what: (c) => <span class="line mono"><Ident text={workerLabel(c.worker)} />{" "}<span>joined</span></span>,
   },
   workerDeregistered: {
     glyph: workerGlyph,
     label: "Leave",
-    what: (c) => <span class="mono">{workerLabel(c.worker)} left</span>,
+    what: (c) => <span class="line mono"><Ident text={workerLabel(c.worker)} />{" "}<span>left</span></span>,
   },
 } satisfies { [K in EventKind]: { glyph: preact.JSX.Element; label: string; what: (change: ChangeOf<K>) => preact.JSX.Element } };
 
@@ -204,7 +235,7 @@ export const Empty = ({ children }: { children: ComponentChildren }) => (
 export const Tags = ({ items }: { items: readonly string[] }) => (
   <span class="chips">
     {items.map((t) => (
-      <span key={t} class="tag">
+      <span key={t} class="tag" title={t}>
         {t}
       </span>
     ))}
@@ -235,33 +266,35 @@ export const SectionHead = ({ id, title, count, aside, mono = false }: {
   mono?: boolean;
 }) => (
   <div class="shead">
-    <h2 id={id} class={mono ? "shead__title shead__title--mono" : "shead__title"} title={title}>{title}</h2>
+    <h2 id={id} class={mono ? "shead__title shead__title--mono" : "shead__title"} title={mono ? undefined : title}>{mono ? <Ident text={title} /> : title}</h2>
     {count !== undefined && <span class="shead__count">{count}</span>}
     {aside !== undefined && <span class="shead__aside">{aside}</span>}
   </div>
 );
 
-/** A single-line identifier, truncated when its container is narrow. */
-export const Ident = ({ text }: { text: string }) => <span class="ident" title={text}>{text}</span>;
 
 /** A titled block: `aside` sits at the end of the head, after the optional `count`. */
 export const Section = ({
   id,
   title,
   variant = "section",
+  cls,
   count,
   aside,
+  mono = false,
   children,
 }: {
   id: string;
   title: string;
   variant?: keyof typeof FRAME;
+  cls?: string;
   count?: ComponentChildren;
   aside?: ComponentChildren;
+  mono?: boolean;
   children?: ComponentChildren;
 }) => (
-  <section class={FRAME[variant]} aria-labelledby={id}>
-    <SectionHead id={id} title={title} count={count} aside={aside} />
+  <section class={[FRAME[variant], cls].filter(Boolean).join(" ") || undefined} aria-labelledby={id}>
+    <SectionHead id={id} title={title} count={count} aside={aside} mono={mono} />
     {children}
   </section>
 );

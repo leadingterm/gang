@@ -108,7 +108,7 @@ fn held_action<S: Limits>(system: &S, checks: &mut Vec<Check>) -> Result<bool> {
                 return Ok(false);
             }
             Err(error) => {
-                end_held_build(system);
+                end_held_build(system, hold);
                 return Err(error);
             }
         };
@@ -140,10 +140,16 @@ pub(crate) fn hold_check(signal: Result<Signalled>) -> Result<Check> {
     }
 }
 
-/// Ends a held build before its thread is joined, preserving the original error.
-pub(crate) fn end_held_build<S: Limits>(system: &S) {
+/// Ends a held build and joins its thread at best effort, so that the caller returns its own
+/// error: the build is cancelled, the server killed, and a pending `await_hold` woken.
+pub(crate) fn end_held_build<S: Limits>(
+    system: &S,
+    hold: ScopedJoinHandle<'_, Result<BuildOutcome>>,
+) {
+    let _ = system.cancel_hold();
     let _ = system.kill_server();
     let _ = system.abandon_hold();
+    let _ = join_build(hold);
 }
 
 /// Waits for the thread that runs an action and returns what the action reported.
@@ -151,7 +157,9 @@ pub(crate) fn end_held_build<S: Limits>(system: &S) {
 /// # Errors
 ///
 /// Returns [`E2eError::System`] when the thread panicked, and the error of the build otherwise.
-fn join_build(handle: ScopedJoinHandle<'_, Result<BuildOutcome>>) -> Result<BuildOutcome> {
+pub(crate) fn join_build(
+    handle: ScopedJoinHandle<'_, Result<BuildOutcome>>,
+) -> Result<BuildOutcome> {
     handle
         .join()
         .map_err(|_| E2eError::system("the build thread panicked"))?

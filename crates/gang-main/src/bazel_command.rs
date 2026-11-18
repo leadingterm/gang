@@ -190,6 +190,11 @@ mod tests {
 
     const RC_TEXT: &str = "# Written by `gang bazelrc`. Do not edit.\n\
                            build --remote_executor=grpcs://gang.example.com:443\n\
+                           build --remote_cache=grpcs://gang.example.com:443\n\
+                           build --remote_retries=12\n\
+                           build --remote_retry_max_delay=5s\n\
+                           build --grpc_keepalive_time=10s\n\
+                           build --grpc_keepalive_timeout=30s\n\
                            build --credential_helper=gang.example.com=/usr/local/bin/gang\n";
 
     /// An installed link to the running test binary and its resolved path.

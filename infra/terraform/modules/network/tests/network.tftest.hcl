@@ -346,3 +346,38 @@ run "rejects_ipv6_client_ingress_cidr" {
     var.client_ingress_cidrs,
   ]
 }
+
+run "dynamodb_endpoint_on_private_routes" {
+  command = plan
+  variables {
+    dynamodb_gateway_endpoint = true
+    nat_mode                  = "per_az"
+  }
+  override_resource {
+    target = aws_route_table.private
+    values = { id = "rtb-private" }
+  }
+  assert {
+    condition     = aws_vpc_endpoint.dynamodb[0].service_name == "com.amazonaws.eu-north-1.dynamodb" && aws_vpc_endpoint.dynamodb[0].vpc_endpoint_type == "Gateway" && aws_vpc_endpoint.dynamodb[0].route_table_ids == toset(["rtb-private"])
+    error_message = "The DynamoDB gateway endpoint must use all private route tables."
+  }
+}
+
+run "group_omits_controller_eip" {
+  command = plan
+  variables {
+    controller_eip = false
+  }
+  assert {
+    condition     = length(aws_eip.controller) == 0 && output.controller_eip_allocation_id == null && output.controller_public_ip == null && output.controller_public_dns == null
+    error_message = "The group shape must not allocate a controller EIP."
+  }
+}
+
+run "default_omits_dynamodb_endpoint" {
+  command = plan
+  assert {
+    condition     = length(aws_vpc_endpoint.dynamodb) == 0 && length(aws_eip.controller) == 1
+    error_message = "The default shape retains its EIP and does not create a DynamoDB endpoint."
+  }
+}

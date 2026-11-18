@@ -26,7 +26,14 @@ pub(crate) const GROUPS: &[(&str, &[&str])] = &[
     ("Local farm", &["local up", "local down"]),
     (
         "Operate",
-        &["server", "ca-pin", "options", "revoke", "restore"],
+        &[
+            "server",
+            "ca-pin",
+            "options",
+            "database copy",
+            "revoke",
+            "restore",
+        ],
     ),
 ];
 
@@ -590,12 +597,29 @@ mod tests {
         let (output, _, _) = Output::captured();
         let mut root = command_at(&output, 80);
         let help = root.render_help().to_string();
-        for name in ["get", "worker", "exec", "deploy"] {
+        for sub in root.get_subcommands().filter(|sub| sub.is_hide_set()) {
+            let name = sub.get_name();
             let listed = help
                 .lines()
                 .any(|line| line.split_whitespace().next() == Some(name));
             assert!(!listed, "{name} must not be listed in the root help");
         }
+    }
+
+    #[test]
+    fn every_command_has_an_examples_section_with_a_comment() {
+        fn check(command: &Command, path: &str) {
+            let after = command
+                .get_after_help()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            assert!(after.starts_with("Examples:\n"), "{path} has no examples");
+            assert!(after.contains("  # "), "{path} has no commented example");
+            for sub in command.get_subcommands().filter(|sub| !sub.is_hide_set()) {
+                check(sub, &format!("{path} {}", sub.get_name()));
+            }
+        }
+        check(&Cli::command(), "gang");
     }
 
     #[test]
@@ -611,22 +635,6 @@ mod tests {
         for line in options {
             assert!(columns(line) <= 60, "{line:?} is wider than 60");
         }
-    }
-
-    #[test]
-    fn every_command_has_an_examples_section_with_a_comment() {
-        fn check(command: &Command, path: &str) {
-            let after = command
-                .get_after_help()
-                .map(ToString::to_string)
-                .unwrap_or_default();
-            assert!(after.starts_with("Examples:\n"), "{path} has no examples");
-            assert!(after.contains("  # "), "{path} has no commented example");
-            for sub in command.get_subcommands() {
-                check(sub, &format!("{path} {}", sub.get_name()));
-            }
-        }
-        check(&Cli::command(), "gang");
     }
 
     #[test]

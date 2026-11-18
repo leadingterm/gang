@@ -9,6 +9,9 @@
 //! - [`NodeLifecyclePort`] answers who this node is from the instance identity document, reports
 //!   a Spot interruption from the instance-action document and reports whether the node is parked
 //!   in its warm pool from the target lifecycle state.
+//! - [`ControllerHostPort`](gang_spi::ControllerHostPort) detects controller retirement and
+//!   completes the matching Auto Scaling lifecycle hook at each host milestone. Instance
+//!   metadata tags must be enabled to read the Auto Scaling group tag.
 //! - [`ScratchVolumePort`] adopts the local scratch volume. The volume belongs to the node, not
 //!   to an instance, so every call returns the same volume.
 //! - [`WorkloadCredentialPort`] issues a web identity token through STS.
@@ -21,6 +24,8 @@
 //!
 //! - `autoscaling:DescribeAutoScalingGroups`
 //! - `autoscaling:DescribeScalingActivities`
+//! - `autoscaling:DescribeLifecycleHooks`
+//! - `autoscaling:CompleteLifecycleAction`
 //! - `autoscaling:SetDesiredCapacity`
 //! - `autoscaling:SetInstanceProtection`
 //! - `autoscaling:TerminateInstanceInAutoScalingGroup`
@@ -32,8 +37,9 @@ use std::sync::Arc;
 use aws_config::SdkConfig;
 use gang_clock::{Clock, SystemClock};
 use gang_spi::{
-    FleetSupply, InstanceIdentity, MountedScratchVolume, NodeLifecyclePort, Plugin, PluginContext,
-    PortError, PreemptionNotice, ProvisionerPort, ScratchVolumePort, WorkloadCredentialPort,
+    FleetSupply, Held, InstanceIdentity, MountedScratchVolume, NodeLifecyclePort, Plugin,
+    PluginContext, PortError, PreemptionNotice, ProvisionerPort, ScratchVolumePort,
+    WorkloadCredentialPort,
 };
 use gang_types::{Fleet, InstanceId, Proof, WorkerLifetime};
 use tokio::sync::OnceCell;
@@ -44,13 +50,13 @@ use crate::errors::AwsError;
 use crate::fleet::Fleets;
 use crate::lifecycle::{Metadata, imds_client};
 use crate::scratch::{Scratch, SystemMachine};
-use crate::sdk;
+use gang_aws_sdk as sdk;
 
 /// The provisioner plugin. Building it only records the configuration; AWS clients are opened on
 /// the first port call.
 pub struct Aws {
-    config: AwsConfig,
-    clock: Arc<dyn Clock>,
+    pub(crate) config: AwsConfig,
+    pub(crate) clock: Arc<dyn Clock>,
     scratch: Arc<Scratch<SystemMachine>>,
     runtime: OnceCell<Runtime>,
 }
@@ -58,7 +64,8 @@ pub struct Aws {
 /// The AWS clients and helpers the ports use, opened together on first use.
 pub(crate) struct Runtime {
     fleets: Fleets,
-    metadata: Metadata,
+    pub(crate) autoscaling: aws_sdk_autoscaling::Client,
+    pub(crate) metadata: Metadata,
     web_identity: WebIdentity,
 }
 
@@ -72,6 +79,7 @@ impl Runtime {
     ) -> Self {
         Self {
             fleets: Fleets::new(sdk, clock, config.set_capacity_cooldown),
+            autoscaling: aws_sdk_autoscaling::Client::new(sdk),
             metadata: Metadata::new(imds, config.fleet_tag_key.as_str()),
             web_identity: WebIdentity::new(sdk, config),
         }
@@ -80,7 +88,7 @@ impl Runtime {
 
 impl Aws {
     /// Returns the runtime, opening the AWS clients on the first call.
-    async fn runtime(&self) -> Result<&Runtime, AwsError> {
+    pub(crate) async fn runtime(&self) -> Result<&Runtime, AwsError> {
         self.runtime.get_or_try_init(|| self.open()).await
     }
 
@@ -145,21 +153,26 @@ impl ProvisionerPort for Aws {
 
     async fn set_desired_capacity(
         &self,
+        held: &Held,
         fleet: Fleet<'_, AwsFleetOptions>,
         desired: u32,
     ) -> Result<(), PortError> {
         let runtime = self.runtime().await?;
-        runtime.fleets.set_desired_capacity(fleet, desired).await?;
+        runtime
+            .fleets
+            .set_desired_capacity(held, fleet, desired)
+            .await?;
         Ok(())
     }
 
     async fn terminate(
         &self,
+        held: &Held,
         fleet: Fleet<'_, AwsFleetOptions>,
         instance: &InstanceId,
     ) -> Result<(), PortError> {
         let runtime = self.runtime().await?;
-        runtime.fleets.terminate(fleet, instance).await?;
+        runtime.fleets.terminate(held, fleet, instance).await?;
         Ok(())
     }
 
@@ -338,13 +351,19 @@ mod tests {
         harness.add_launch(OTHER_INSTANCE, LAUNCH_TIME);
         let aws = with_fake(&harness.fake).await?;
 
-        let result = aws
-            .terminate(fleet(GROUP)?.view(), &InstanceId::try_new(OTHER_INSTANCE)?)
-            .await;
+        let result = gang_testkit::fence::with_held(async |held| {
+            aws.terminate(
+                held,
+                fleet(GROUP).expect("test value is valid").view(),
+                &InstanceId::try_new(OTHER_INSTANCE).expect("test value is valid"),
+            )
+            .await
+        })
+        .await;
 
         assert!(matches!(
             &result,
-            Err(PortError::Config(cause)) if cause.to_string().contains(GROUP)
+            Err(gang_spi::RunError::Failed(PortError::Config(cause))) if cause.to_string().contains(GROUP)
         ));
         Ok(())
     }

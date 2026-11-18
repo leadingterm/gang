@@ -14,12 +14,13 @@ use aws_sdk_autoscaling::types::Filter as ScalingFilter;
 use aws_sdk_autoscaling::types::ScalingActivityStatusCode;
 use aws_sdk_ec2::types::Filter;
 use aws_sdk_ec2::types::builders::FilterBuilder;
+use gang_aws_sdk::call_error;
 use gang_clock::{Clock, Timestamp};
-use gang_spi::{FleetInstance, FleetSupply, LaunchFailure};
+use gang_spi::{FleetInstance, FleetSupply, Held, LaunchFailure};
 use gang_types::{Fleet, InstanceId, InstanceLifecycle};
 
 use crate::config::{AwsFleetOptions, CooldownPolicy, ON_DEMAND_SUFFIX, SpotFallback};
-use crate::errors::{AwsError, sdk_error};
+use crate::errors::AwsError;
 use crate::fallback::{self, Counts, Tier};
 use crate::group::{DESCRIBE_GROUPS, Group, Member};
 
@@ -92,7 +93,9 @@ impl Fleets {
                 continue;
             }
             if let Some(failure) = self.latest_launch_failure(&group.name).await? {
-                launch_failure = Some(failure);
+                launch_failure.get_or_insert(failure);
+            } else {
+                launch_failure = None;
                 break;
             }
         }
@@ -137,6 +140,7 @@ impl Fleets {
     /// An opted-in fleet lowers the on-demand twin before healthy Spot.
     pub(crate) async fn set_desired_capacity(
         &self,
+        held: &Held,
         fleet: Fleet<'_, AwsFleetOptions>,
         desired: u32,
     ) -> Result<(), AwsError> {
@@ -145,11 +149,11 @@ impl Fleets {
         match FleetGroups::read(&output, &names)? {
             FleetGroups::Plain(group) => {
                 if group.reported() < desired {
-                    self.set_capacity(&group.name, desired).await?;
+                    self.set_capacity(held, &group.name, desired).await?;
                 } else {
                     let target = desired.max(group.live());
                     if target < group.desired {
-                        self.set_capacity(&group.name, target).await?;
+                        self.set_capacity(held, &group.name, target).await?;
                     }
                 }
                 Ok(())
@@ -173,7 +177,7 @@ impl Fleets {
                             "spot fallback: writing desired capacity"
                         );
                     }
-                    self.set_capacity(name, write.desired).await?;
+                    self.set_capacity(held, name, write.desired).await?;
                 }
                 Ok(())
             }
@@ -185,6 +189,7 @@ impl Fleets {
     /// capacity lowered with it.
     pub(crate) async fn terminate(
         &self,
+        held: &Held,
         fleet: Fleet<'_, AwsFleetOptions>,
         instance: &InstanceId,
     ) -> Result<(), AwsError> {
@@ -201,8 +206,9 @@ impl Fleets {
             return Ok(());
         }
         if member.lifecycle == InstanceLifecycle::InService && group.reuse_on_scale_in {
-            return self.release(group, member, instance).await;
+            return self.release(held, group, member, instance).await;
         }
+        held.check()?;
         self.autoscaling
             .terminate_instance_in_auto_scaling_group()
             .instance_id(instance.as_str())
@@ -210,7 +216,7 @@ impl Fleets {
             .send()
             .await
             .map(|_| ())
-            .map_err(|e| sdk_error(TERMINATE_INSTANCE, e))
+            .map_err(|e| call_error(TERMINATE_INSTANCE, e).into())
     }
 
     /// Releases an in-service instance of a warm-pool group. The release target is computed
@@ -218,23 +224,26 @@ impl Fleets {
     /// is lifted and the group's desired capacity lowered to the target.
     async fn release(
         &self,
+        held: &Held,
         group: &Group,
         member: &Member,
         instance: &InstanceId,
     ) -> Result<(), AwsError> {
         let target = group.release_target(instance)?;
         if member.protected {
-            self.set_protection(&group.name, instance, false).await?;
+            self.set_protection(held, &group.name, instance, false)
+                .await?;
         }
         if target < group.desired {
-            self.set_capacity(&group.name, target).await?;
+            self.set_capacity(held, &group.name, target).await?;
         }
         Ok(())
     }
 
     /// Writes one group's desired capacity, honoring the cooldown policy. Every desired-capacity
     /// write goes through here.
-    async fn set_capacity(&self, group: &str, desired: u32) -> Result<(), AwsError> {
+    async fn set_capacity(&self, held: &Held, group: &str, desired: u32) -> Result<(), AwsError> {
+        held.check()?;
         let wanted = i32::try_from(desired).map_err(|_| AwsError::Config {
             field: "desired",
             reason: "exceeds the largest capacity an auto scaling group accepts".to_owned(),
@@ -247,16 +256,18 @@ impl Fleets {
             .send()
             .await
             .map(|_| ())
-            .map_err(|e| sdk_error(SET_DESIRED_CAPACITY, e))
+            .map_err(|e| call_error(SET_DESIRED_CAPACITY, e).into())
     }
 
     /// Sets one instance's scale-in protection within its group.
     async fn set_protection(
         &self,
+        held: &Held,
         group: &str,
         instance: &InstanceId,
         protected: bool,
     ) -> Result<(), AwsError> {
+        held.check()?;
         self.autoscaling
             .set_instance_protection()
             .auto_scaling_group_name(group)
@@ -265,7 +276,7 @@ impl Fleets {
             .send()
             .await
             .map(|_| ())
-            .map_err(|e| sdk_error(SET_INSTANCE_PROTECTION, e))
+            .map_err(|e| call_error(SET_INSTANCE_PROTECTION, e).into())
     }
 
     /// The failed scaling activity that marks the spot group down, if any: a failed activity
@@ -305,7 +316,7 @@ impl Fleets {
             .max_records(ACTIVITY_PROBE_LIMIT)
             .send()
             .await
-            .map_err(|e| sdk_error(DESCRIBE_SCALING_ACTIVITIES, e))?;
+            .map_err(|e| call_error(DESCRIBE_SCALING_ACTIVITIES, e))?;
         Ok(output.activities().first().map(|activity| FailedActivity {
             status_message: activity.status_message().map(str::to_owned),
         }))
@@ -320,7 +331,7 @@ impl Fleets {
             .max_records(ACTIVITY_PROBE_LIMIT)
             .send()
             .await
-            .map_err(|e| sdk_error(DESCRIBE_SCALING_ACTIVITIES, e))?;
+            .map_err(|e| call_error(DESCRIBE_SCALING_ACTIVITIES, e))?;
         let Some(activity) = output.activities().first() else {
             return Ok(None);
         };
@@ -351,7 +362,7 @@ impl Fleets {
         request
             .send()
             .await
-            .map_err(|e| sdk_error(DESCRIBE_GROUPS, e))
+            .map_err(|e| call_error(DESCRIBE_GROUPS, e).into())
     }
 
     /// Maps each EC2 instance of the named groups to its launch time.
@@ -373,7 +384,7 @@ impl Fleets {
             .send();
         let mut launches = HashMap::new();
         while let Some(page) = pages.next().await {
-            let page = page.map_err(|e| sdk_error(DESCRIBE_INSTANCES, e))?;
+            let page = page.map_err(|e| call_error(DESCRIBE_INSTANCES, e))?;
             for instance in page
                 .reservations()
                 .iter()
@@ -623,14 +634,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_expired_permission_writes_no_capacity() -> TestResult {
+        let harness = Harness::start().await?;
+        harness.add_group(FLEET, 1, &[("i-1", "InService")]);
+        let test_fleet = fleet(FLEET)?;
+        let result = gang_testkit::fence::with_expired_held(async |held| {
+            harness
+                .fleets
+                .set_desired_capacity(held, test_fleet.view(), 5)
+                .await
+        })
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(gang_spi::RunError::Failed(AwsError::LeaseLapsed(_))
+                | gang_spi::RunError::Overran(_))
+        ));
+        assert_eq!(harness.requests("SetDesiredCapacity"), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn set_desired_capacity_withdraws_only_unmet_requests() -> TestResult {
         for (current, requested, expected, writes) in [(4, 2, 2, 1), (4, 0, 2, 1), (2, 0, 2, 0)] {
             let harness = Harness::start().await?;
             harness.add_group(FLEET, current, &[("i-1", "InService"), ("i-2", "Pending")]);
-            harness
-                .fleets
-                .set_desired_capacity(fleet(FLEET)?.view(), requested)
-                .await?;
+            gang_testkit::fence::with_held(async |held| {
+                harness
+                    .fleets
+                    .set_desired_capacity(
+                        held,
+                        fleet(FLEET).expect("test value is valid").view(),
+                        requested,
+                    )
+                    .await
+            })
+            .await?;
             assert_eq!(harness.desired(FLEET), Some(expected));
             assert_eq!(harness.requests("SetDesiredCapacity"), writes);
         }
@@ -818,7 +858,10 @@ mod tests {
         let mut into = FleetSupply::default();
         let result = harness.fleets.supply(fleet(FLEET)?.view(), &mut into).await;
 
-        assert!(matches!(result, Err(AwsError::Transient { .. })));
+        assert!(matches!(
+            result,
+            Err(AwsError::Call(gang_aws_sdk::CallError::Transient { .. }))
+        ));
         Ok(())
     }
 
@@ -837,10 +880,13 @@ mod tests {
         let harness = Harness::start_with(CooldownPolicy::Honor).await?;
         harness.add_group(FLEET, 2, &[]);
 
-        harness
-            .fleets
-            .set_desired_capacity(fleet(FLEET)?.view(), 5)
-            .await?;
+        gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .set_desired_capacity(held, fleet(FLEET).expect("test value is valid").view(), 5)
+                .await
+        })
+        .await?;
 
         assert_eq!(honor_cooldown_sent(&harness).as_deref(), Some("true"));
         Ok(())
@@ -851,10 +897,13 @@ mod tests {
         let harness = Harness::start_with(CooldownPolicy::Ignore).await?;
         harness.add_group(FLEET, 2, &[]);
 
-        harness
-            .fleets
-            .set_desired_capacity(fleet(FLEET)?.view(), 5)
-            .await?;
+        gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .set_desired_capacity(held, fleet(FLEET).expect("test value is valid").view(), 5)
+                .await
+        })
+        .await?;
 
         assert_eq!(honor_cooldown_sent(&harness).as_deref(), Some("false"));
         Ok(())
@@ -865,10 +914,13 @@ mod tests {
         let harness = Harness::start().await?;
         harness.add_group(FLEET, 2, &[]);
 
-        harness
-            .fleets
-            .set_desired_capacity(fleet(FLEET)?.view(), 5)
-            .await?;
+        gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .set_desired_capacity(held, fleet(FLEET).expect("test value is valid").view(), 5)
+                .await
+        })
+        .await?;
 
         assert_eq!(harness.desired(FLEET), Some(5));
         assert_eq!(harness.requests("SetDesiredCapacity"), 1);
@@ -887,10 +939,13 @@ mod tests {
         ];
         harness.add_group(FLEET, 5, &members);
 
-        harness
-            .fleets
-            .set_desired_capacity(fleet(FLEET)?.view(), 2)
-            .await?;
+        gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .set_desired_capacity(held, fleet(FLEET).expect("test value is valid").view(), 2)
+                .await
+        })
+        .await?;
 
         assert_eq!(harness.requests("SetDesiredCapacity"), 0);
         assert_eq!(harness.desired(FLEET), Some(5));
@@ -936,7 +991,13 @@ mod tests {
         };
         let fleet = fleet_with(FLEET, options)?;
 
-        harness.fleets.set_desired_capacity(fleet.view(), 2).await?;
+        gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .set_desired_capacity(held, fleet.view(), 2)
+                .await
+        })
+        .await?;
 
         assert_eq!(harness.requests("SetDesiredCapacity"), 0);
         assert_eq!(harness.desired(FLEET), Some(5));
@@ -951,17 +1012,24 @@ mod tests {
         let harness = Harness::start().await?;
         harness.add_group(FLEET, 1, &[]);
 
-        let result = harness
-            .fleets
-            .set_desired_capacity(fleet(FLEET)?.view(), u32::MAX)
-            .await;
+        let result = gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .set_desired_capacity(
+                    held,
+                    fleet(FLEET).expect("test value is valid").view(),
+                    u32::MAX,
+                )
+                .await
+        })
+        .await;
 
         assert!(matches!(
             result,
-            Err(AwsError::Config {
+            Err(gang_spi::RunError::Failed(AwsError::Config {
                 field: "desired",
                 ..
-            })
+            }))
         ));
         assert_eq!(harness.requests("SetDesiredCapacity"), 0);
         Ok(())
@@ -971,12 +1039,18 @@ mod tests {
     async fn set_desired_capacity_of_a_missing_group_is_missing_group() -> TestResult {
         let harness = Harness::start().await?;
 
-        let result = harness
-            .fleets
-            .set_desired_capacity(fleet(FLEET)?.view(), 1)
-            .await;
+        let result = gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .set_desired_capacity(held, fleet(FLEET).expect("test value is valid").view(), 1)
+                .await
+        })
+        .await;
 
-        assert!(matches!(result, Err(AwsError::MissingGroup(_))));
+        assert!(matches!(
+            result,
+            Err(gang_spi::RunError::Failed(AwsError::MissingGroup(_)))
+        ));
         Ok(())
     }
 
@@ -993,12 +1067,43 @@ mod tests {
             },
         );
 
-        let result = harness
-            .fleets
-            .set_desired_capacity(fleet(FLEET)?.view(), 3)
-            .await;
+        let result = gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .set_desired_capacity(held, fleet(FLEET).expect("test value is valid").view(), 3)
+                .await
+        })
+        .await;
 
-        assert!(matches!(result, Err(AwsError::Refused { .. })));
+        assert!(matches!(
+            result,
+            Err(gang_spi::RunError::Failed(AwsError::Call(
+                gang_aws_sdk::CallError::Refused { .. }
+            )))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_expired_permission_terminates_nothing() -> TestResult {
+        let harness = Harness::start().await?;
+        harness.add_group(FLEET, 1, &[("i-1", "InService")]);
+        let test_fleet = fleet(FLEET)?;
+        let instance = InstanceId::try_new("i-1")?;
+        let result = gang_testkit::fence::with_expired_held(async |held| {
+            harness
+                .fleets
+                .terminate(held, test_fleet.view(), &instance)
+                .await
+        })
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(gang_spi::RunError::Failed(AwsError::LeaseLapsed(_))
+                | gang_spi::RunError::Overran(_))
+        ));
+        assert_eq!(harness.requests("TerminateInstanceInAutoScalingGroup"), 0);
         Ok(())
     }
 
@@ -1007,10 +1112,17 @@ mod tests {
         let harness = Harness::start().await?;
         harness.add_group(FLEET, 2, &[("i-a", "InService"), ("i-b", "InService")]);
 
-        harness
-            .fleets
-            .terminate(fleet(FLEET)?.view(), &InstanceId::try_new("i-a")?)
-            .await?;
+        gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .terminate(
+                    held,
+                    fleet(FLEET).expect("test value is valid").view(),
+                    &InstanceId::try_new("i-a").expect("test value is valid"),
+                )
+                .await
+        })
+        .await?;
 
         assert_eq!(harness.instance_ids(FLEET), vec!["i-b".to_owned()]);
         assert_eq!(harness.desired(FLEET), Some(1));
@@ -1039,8 +1151,20 @@ mod tests {
         let fleet = fleet(FLEET)?;
         let instance = InstanceId::try_new("i-a")?;
 
-        harness.fleets.terminate(fleet.view(), &instance).await?;
-        harness.fleets.terminate(fleet.view(), &instance).await?;
+        gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .terminate(held, fleet.view(), &instance)
+                .await
+        })
+        .await?;
+        gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .terminate(held, fleet.view(), &instance)
+                .await
+        })
+        .await?;
 
         assert_eq!(harness.requests("TerminateInstanceInAutoScalingGroup"), 1);
         Ok(())
@@ -1051,10 +1175,17 @@ mod tests {
         let harness = Harness::start().await?;
         harness.add_group(FLEET, 1, &[("i-t", "Terminating")]);
 
-        harness
-            .fleets
-            .terminate(fleet(FLEET)?.view(), &InstanceId::try_new("i-t")?)
-            .await?;
+        gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .terminate(
+                    held,
+                    fleet(FLEET).expect("test value is valid").view(),
+                    &InstanceId::try_new("i-t").expect("test value is valid"),
+                )
+                .await
+        })
+        .await?;
 
         assert_eq!(harness.requests("TerminateInstanceInAutoScalingGroup"), 0);
         Ok(())
@@ -1065,10 +1196,17 @@ mod tests {
         let harness = Harness::start().await?;
         harness.add_group(FLEET, 1, &[]);
 
-        harness
-            .fleets
-            .terminate(fleet(FLEET)?.view(), &InstanceId::try_new("i-gone")?)
-            .await?;
+        gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .terminate(
+                    held,
+                    fleet(FLEET).expect("test value is valid").view(),
+                    &InstanceId::try_new("i-gone").expect("test value is valid"),
+                )
+                .await
+        })
+        .await?;
 
         assert_eq!(harness.requests("TerminateInstanceInAutoScalingGroup"), 0);
         Ok(())
@@ -1080,10 +1218,17 @@ mod tests {
         harness.add_group("other-fleet", 1, &[("i-x", "InService")]);
         harness.add_group(FLEET, 1, &[]);
 
-        harness
-            .fleets
-            .terminate(fleet(FLEET)?.view(), &InstanceId::try_new("i-x")?)
-            .await?;
+        gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .terminate(
+                    held,
+                    fleet(FLEET).expect("test value is valid").view(),
+                    &InstanceId::try_new("i-x").expect("test value is valid"),
+                )
+                .await
+        })
+        .await?;
 
         assert!(
             harness
@@ -1101,12 +1246,22 @@ mod tests {
         let harness = Harness::start().await?;
         harness.add_group("other-fleet", 1, &[("i-x", "InService")]);
 
-        let result = harness
-            .fleets
-            .terminate(fleet(FLEET)?.view(), &InstanceId::try_new("i-x")?)
-            .await;
+        let result = gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .terminate(
+                    held,
+                    fleet(FLEET).expect("test value is valid").view(),
+                    &InstanceId::try_new("i-x").expect("test value is valid"),
+                )
+                .await
+        })
+        .await;
 
-        assert!(matches!(result, Err(AwsError::MissingGroup(_))));
+        assert!(matches!(
+            result,
+            Err(gang_spi::RunError::Failed(AwsError::MissingGroup(_)))
+        ));
         assert_eq!(harness.requests("TerminateInstanceInAutoScalingGroup"), 0);
         Ok(())
     }
@@ -1116,10 +1271,17 @@ mod tests {
         let harness = Harness::start().await?;
         harness.add_group(FLEET, 1, &[("i-p", "Pending")]);
 
-        harness
-            .fleets
-            .terminate(fleet(FLEET)?.view(), &InstanceId::try_new("i-p")?)
-            .await?;
+        gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .terminate(
+                    held,
+                    fleet(FLEET).expect("test value is valid").view(),
+                    &InstanceId::try_new("i-p").expect("test value is valid"),
+                )
+                .await
+        })
+        .await?;
 
         assert!(harness.instance_ids(FLEET).is_empty());
         assert_eq!(harness.desired(FLEET), Some(0));
@@ -1141,17 +1303,31 @@ mod tests {
         let ids: Vec<&str> = into.instances.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(ids, ["i-b"]);
 
-        harness
-            .fleets
-            .set_desired_capacity(fleet("fleet-a")?.view(), 3)
-            .await?;
+        gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .set_desired_capacity(
+                    held,
+                    fleet("fleet-a").expect("test value is valid").view(),
+                    3,
+                )
+                .await
+        })
+        .await?;
         assert_eq!(harness.desired("fleet-a"), Some(3));
         assert_eq!(harness.desired("fleet-b"), Some(2));
 
-        harness
-            .fleets
-            .terminate(fleet("fleet-a")?.view(), &InstanceId::try_new("i-b")?)
-            .await?;
+        gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .terminate(
+                    held,
+                    fleet("fleet-a").expect("test value is valid").view(),
+                    &InstanceId::try_new("i-b").expect("test value is valid"),
+                )
+                .await
+        })
+        .await?;
         assert_eq!(harness.instance_ids("fleet-b"), vec!["i-b".to_owned()]);
         assert_eq!(harness.requests("TerminateInstanceInAutoScalingGroup"), 0);
         Ok(())
@@ -1251,12 +1427,20 @@ mod tests {
         let harness = Harness::start_with(CooldownPolicy::Honor).await?;
         harness.add_group_with(cooling_group(FLEET, 2));
 
-        let result = harness
-            .fleets
-            .set_desired_capacity(fleet(FLEET)?.view(), 5)
-            .await;
+        let result = gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .set_desired_capacity(held, fleet(FLEET).expect("test value is valid").view(), 5)
+                .await
+        })
+        .await;
 
-        assert!(matches!(result, Err(AwsError::Transient { .. })));
+        assert!(matches!(
+            result,
+            Err(gang_spi::RunError::Failed(AwsError::Call(
+                gang_aws_sdk::CallError::Transient { .. }
+            )))
+        ));
         assert_eq!(harness.desired(FLEET), Some(2));
         Ok(())
     }
@@ -1266,10 +1450,13 @@ mod tests {
         let harness = Harness::start().await?;
         harness.add_group_with(cooling_group(FLEET, 2));
 
-        harness
-            .fleets
-            .set_desired_capacity(fleet(FLEET)?.view(), 5)
-            .await?;
+        gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .set_desired_capacity(held, fleet(FLEET).expect("test value is valid").view(), 5)
+                .await
+        })
+        .await?;
 
         assert_eq!(harness.desired(FLEET), Some(5));
         Ok(())
@@ -1282,12 +1469,20 @@ mod tests {
         group.max_size = 4;
         harness.add_group_with(group);
 
-        let result = harness
-            .fleets
-            .set_desired_capacity(fleet(FLEET)?.view(), 5)
-            .await;
+        let result = gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .set_desired_capacity(held, fleet(FLEET).expect("test value is valid").view(), 5)
+                .await
+        })
+        .await;
 
-        assert!(matches!(result, Err(AwsError::Refused { .. })));
+        assert!(matches!(
+            result,
+            Err(gang_spi::RunError::Failed(AwsError::Call(
+                gang_aws_sdk::CallError::Refused { .. }
+            )))
+        ));
         assert_eq!(harness.desired(FLEET), Some(2));
         Ok(())
     }
@@ -1299,10 +1494,13 @@ mod tests {
         group.max_size = 4;
         harness.add_group_with(group);
 
-        harness
-            .fleets
-            .set_desired_capacity(fleet(FLEET)?.view(), 4)
-            .await?;
+        gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .set_desired_capacity(held, fleet(FLEET).expect("test value is valid").view(), 4)
+                .await
+        })
+        .await?;
 
         assert_eq!(harness.desired(FLEET), Some(4));
         Ok(())
@@ -1333,10 +1531,17 @@ mod tests {
         harness.add_launch("i-a", "2026-01-01T00:02:00Z");
         harness.add_launch("i-k", "2026-01-01T00:03:00Z");
 
-        harness
-            .fleets
-            .terminate(fleet(FLEET)?.view(), &InstanceId::try_new("i-r")?)
-            .await?;
+        gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .terminate(
+                    held,
+                    fleet(FLEET).expect("test value is valid").view(),
+                    &InstanceId::try_new("i-r").expect("test value is valid"),
+                )
+                .await
+        })
+        .await?;
 
         assert_eq!(harness.instance_ids(FLEET), vec!["i-k".to_owned()]);
         assert_eq!(harness.desired(FLEET), Some(1));

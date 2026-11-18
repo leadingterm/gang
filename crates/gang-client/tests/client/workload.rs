@@ -2,12 +2,24 @@
 //! token.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
-use gang_client::{ClientError, LoggedIn, ProofSource, WorkloadLogin};
-use gang_types::ProviderName;
+use gang_client::{
+    Client, ClientError, ClientHome, ClientOptions, LoggedIn, ProofSource, WorkloadLogin,
+};
+use gang_clock::TestClock;
+use gang_testkit::ChildTest;
+use gang_types::{ProviderName, Url};
 use tempfile::TempDir;
 
 use super::support::*;
+
+const PROOF_DIRECTORY_CHILD: ChildTest = ChildTest::new("client::workload::proof_directory_child");
+const PROOF_DIRECTORY_ROLE: &str = "GANG_TEST_PROOF_DIRECTORY_ROLE";
+const PROOF_DIRECTORY_HOME: &str = "GANG_TEST_PROOF_DIRECTORY_HOME";
+const PROOF_DIRECTORY_SERVER: &str = "GANG_TEST_PROOF_DIRECTORY_SERVER";
+const PROOF_DIRECTORY_MODE: &str = "GANG_TEST_PROOF_DIRECTORY_MODE";
 
 /// Writes `text` to a proof file in a fresh directory and returns the file's path.
 fn proof_file(dir: &TempDir, text: &str) -> PathBuf {
@@ -134,6 +146,147 @@ async fn proof_file_text_is_trimmed_before_the_token_request() {
         harness.server.token_requests(),
         vec![(provider("google"), "workload-proof".to_owned())]
     );
+}
+
+#[tokio::test]
+async fn relative_proof_file_stays_bound_to_login_directory() {
+    proof_directory_scenario("file").await;
+}
+
+#[tokio::test]
+async fn relative_proof_command_stays_bound_to_login_directory() {
+    proof_directory_scenario("relative-command").await;
+}
+
+#[tokio::test]
+async fn bare_proof_command_keeps_path_lookup() {
+    proof_directory_scenario("bare-command").await;
+}
+
+/// Exercises login and renewal from different directories for each proof source.
+async fn proof_directory_scenario(mode: &str) {
+    let harness = Harness::start_plain(ConsoleMode::Silent, google()).await;
+    harness.server.accept_proof("google", "proof-from-a");
+    harness.server.accept_proof("google", "proof-from-b");
+    let a = TempDir::new().expect("creating login directory");
+    let b = TempDir::new().expect("creating renewal directory");
+    let bin = match mode {
+        "file" => {
+            proof_file(&a, "proof-from-a");
+            proof_file(&b, "proof-from-b");
+            None
+        }
+        "relative-command" | "bare-command" => {
+            let helper = std::env::current_dir()
+                .expect("finding the test working directory")
+                .join(std::env::var_os("FAKE_CREDENTIAL_HELPER").expect("helper is declared"))
+                .canonicalize()
+                .expect("resolving the declared helper");
+            let bin = (mode == "bare-command")
+                .then(|| TempDir::new().expect("creating command search directory"));
+            let directory = bin.as_ref().map_or(a.path(), |dir| dir.path());
+            std::os::unix::fs::symlink(helper, directory.join("get-proof"))
+                .expect("linking the declared helper");
+            bin
+        }
+        _ => panic!("unknown proof source mode: {mode}"),
+    };
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for (role, dir) in [("login", &a), ("renew", &b)] {
+            if role == "renew" {
+                harness.clock.advance(Duration::from_hours(1));
+            }
+            // Re-execute the declared test binary to isolate each working directory.
+            let mut command = tokio::process::Command::from(
+                PROOF_DIRECTORY_CHILD
+                    .command()
+                    .expect("locating the test binary"),
+            );
+            command
+                .current_dir(dir.path())
+                .env(PROOF_DIRECTORY_ROLE, role)
+                .env(PROOF_DIRECTORY_MODE, mode)
+                .env(PROOF_DIRECTORY_HOME, harness.home.dir())
+                .env(PROOF_DIRECTORY_SERVER, harness.server.url().as_str())
+                .kill_on_drop(true);
+            if let Some(bin) = &bin {
+                command.env("PATH", bin.path());
+            }
+            let output = command.output().await.expect("running the child test");
+            PROOF_DIRECTORY_CHILD.assert_completed(&output);
+        }
+    })
+    .await
+    .expect("both child tests finish before the deadline");
+
+    assert_eq!(
+        harness.server.token_requests(),
+        vec![
+            (provider("google"), "proof-from-a".to_owned()),
+            (provider("google"), "proof-from-a".to_owned()),
+        ]
+    );
+}
+
+#[tokio::test]
+#[ignore = "child test: run by proof directory scenarios"]
+async fn proof_directory_child() {
+    let role = std::env::var(PROOF_DIRECTORY_ROLE).expect("child role is set");
+    let mode = std::env::var(PROOF_DIRECTORY_MODE).expect("proof source mode is set");
+    let home =
+        ClientHome::try_new(std::env::var_os(PROOF_DIRECTORY_HOME).expect("client home is set"))
+            .expect("client home is valid");
+    let server = Url::parse(&std::env::var(PROOF_DIRECTORY_SERVER).expect("server URL is set"))
+        .expect("server URL is valid");
+    let now = match role.as_str() {
+        "login" => START,
+        "renew" => START + Duration::from_hours(1),
+        _ => panic!("unknown child role: {role}"),
+    };
+    let clock = Arc::new(TestClock::new(now));
+    let client = Client::new(
+        home,
+        ClientOptions::default(),
+        FakeProviders::new(clock.clone()),
+        FakeConsole::new(ConsoleMode::Silent),
+        clock,
+    );
+    match role.as_str() {
+        "login" => {
+            let _logged_in = client
+                .login_workload(WorkloadLogin {
+                    server: &server,
+                    provider: &provider("google"),
+                    source: match mode.as_str() {
+                        "file" => ProofSource::File {
+                            path: "./proof".into(),
+                        },
+                        "relative-command" | "bare-command" => ProofSource::Command {
+                            argv: vec![
+                                if mode == "relative-command" {
+                                    "./get-proof"
+                                } else {
+                                    "get-proof"
+                                }
+                                .to_owned(),
+                                "proof".to_owned(),
+                                "proof-from-a".to_owned(),
+                            ],
+                        },
+                        _ => panic!("unknown proof source mode: {mode}"),
+                    },
+                    ca_pin: None,
+                })
+                .await
+                .expect("workload login succeeds");
+        }
+        "renew" => {
+            client.token().await.expect("workload token is renewed");
+        }
+        _ => unreachable!("role was checked above"),
+    }
+    PROOF_DIRECTORY_CHILD.complete();
 }
 
 #[tokio::test]

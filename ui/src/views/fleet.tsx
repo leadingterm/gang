@@ -1,10 +1,10 @@
 // The fleet tape: one cell per instance up to the fleet's max, in a fixed state order.
-import { Fragment } from "preact";
+import { Fragment, type ComponentChildren } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
-import { idOf } from "../wire-parse.ts";
+import { idOf, seconds } from "../wire-parse.ts";
 import type { Fleet } from "../wire.ts";
-import { gib, policyDuration } from "../format.ts";
-import { Disclosure } from "../ui.tsx";
+import { gib } from "../format.ts";
+import { Disclosure, Duration, Ident } from "../ui.tsx";
 
 export type CellState = "busy" | "idle" | "draining" | "unconnected" | "pending" | "terminating" | "warm" | "empty";
 
@@ -105,13 +105,13 @@ export const Tally = ({ items }: { items: Counts }) => (
 const TapeKey = ({ f }: { f: Fleet }) => {
   const size = f.instanceSize ? [`${f.instanceSize.vcpus} vCPU`, gib(f.instanceSize.memory)] : [];
   const machine = [f.isa, f.sandbox, f.properties["machine_class"], ...size];
-  const rows: [string, string][] = [
-    ["machine", machine.filter(Boolean).join(" · ")],
-    ["size", `desired ${f.desired} · min ${f.policy.min} · max ${f.policy.max}`],
-    ["demand", `${f.demand.candidates} eligible · ${f.demand.needed} needed`],
+  const rows: [string, ComponentChildren][] = [
+    ["machine", <Ident text={machine.filter(Boolean).join(" · ")} />],
+    ["size", <><span class="clause">desired {f.desired}</span>{" · "}<span class="clause">min {f.policy.min}</span>{" · "}<span class="clause">max {f.policy.max}</span></>],
+    ["demand", <><span class="clause">{f.demand.candidates} eligible</span>{" · "}<span class="clause">{f.demand.needed} needed</span></>],
     [
       "policy",
-      `${f.policy.targetActions}/instance · idle ${policyDuration(f.policy.idleTimeout)} · grace ${policyDuration(f.policy.bootGrace)}`,
+      <><span class="clause">{f.policy.targetActions}/instance</span>{" · "}<span class="clause">idle <Duration ms={seconds(f.policy.idleTimeout) * 1000} /></span>{" · "}<span class="clause">grace <Duration ms={seconds(f.policy.bootGrace) * 1000} /></span></>,
     ],
   ];
   return (

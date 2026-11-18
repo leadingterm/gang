@@ -51,6 +51,12 @@ single_version_override(
 )
 
 http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+devshell_chromium = use_repo_rule("//bazel/chromium:chromium.bzl", "devshell_chromium")
+devshell_import_tools = use_repo_rule("//infra/scripts:tools.bzl", "devshell_import_tools")
+
+# The devShell's pinned headless Chromium (flake.nix e2eChromium), for //ui:layout_test.
+devshell_chromium(name = "chromium", dev_dependency = True)
+devshell_import_tools(name = "import_test_tools", dev_dependency = True)
 
 # The Bazel the e2e harness drives in its sample workspace (crates/gang-e2e); each download below is pinned by checksum.
 BAZEL_VERSION = "8.7.0"
@@ -108,6 +114,33 @@ http_file(
     executable = True,
     sha256 = "5d783a12a553a45bcd9ecb4f390907f4e3827844d090dd7abfbb768c9392657a",
     urls = ["https://github.com/robxu9/bash-static/releases/download/5.2.015-1.2.3-2/bash-macos-aarch64"],
+)
+
+# PostgreSQL for the tests of gang-postgres and the e2e cluster: the server binaries per host platform, pinned by checksum and unpacked by gang-testkit.
+POSTGRESQL_VERSION = "17.12.0"
+
+http_file(
+    name = "postgresql_linux_x86_64",
+    dev_dependency = True,
+    downloaded_file_path = "postgresql.tar.gz",
+    sha256 = "af316b6e42266ec0a153bdc9194e0b1b5f12c9ce4f0b13d9a96dfca77d9aaecc",
+    urls = ["https://github.com/theseus-rs/postgresql-binaries/releases/download/" + POSTGRESQL_VERSION + "/postgresql-" + POSTGRESQL_VERSION + "-x86_64-unknown-linux-gnu.tar.gz"],
+)
+
+http_file(
+    name = "postgresql_linux_arm64",
+    dev_dependency = True,
+    downloaded_file_path = "postgresql.tar.gz",
+    sha256 = "9b3ca376cbdecb297711f9b09bfe834ae0f7c231042de58b7cb4bb2c0a526301",
+    urls = ["https://github.com/theseus-rs/postgresql-binaries/releases/download/" + POSTGRESQL_VERSION + "/postgresql-" + POSTGRESQL_VERSION + "-aarch64-unknown-linux-gnu.tar.gz"],
+)
+
+http_file(
+    name = "postgresql_darwin_arm64",
+    dev_dependency = True,
+    downloaded_file_path = "postgresql.tar.gz",
+    sha256 = "2f752033b208f9a6a12ef64a9ee23bf19149cff160841980db1e221bf7d24809",
+    urls = ["https://github.com/theseus-rs/postgresql-binaries/releases/download/" + POSTGRESQL_VERSION + "/postgresql-" + POSTGRESQL_VERSION + "-aarch64-apple-darwin.tar.gz"],
 )
 
 single_version_override(
@@ -195,6 +228,10 @@ use_repo(rust, "rust_toolchains")
 register_toolchains("@rust_toolchains//:all")
 
 cc = use_extension("@hermetic_cc_toolchain//toolchain:ext.bzl", "toolchains")
+cc.exec_platform(
+    arch = "arm64",
+    os = "linux",
+)
 use_repo(cc, "zig_sdk")
 
 register_toolchains(
@@ -219,8 +256,20 @@ tf.download(
         "aws": "hashicorp/aws:6.72.0",
         "http": "hashicorp/http:3.6.3",
     },
+    # OpenTofu-built ZIP checksums from registry.opentofu.org download metadata must
+    # match .terraform.lock.hcl zh entries to enable Bazel repository-cache reuse.
+    mirror_sha256 = {
+        "hashicorp/aws:6.72.0/darwin_amd64": "15ac65be772bc93d911fb2d7ca366063b6df3af41d915503ad42ce3cac525f21",
+        "hashicorp/aws:6.72.0/darwin_arm64": "0d37e9dae7fd5252d869dd444687acc468684b128d11a9034510a8612ea51925",
+        "hashicorp/aws:6.72.0/linux_amd64": "afd61efd15d485cf0f621d5bdaf730143db6e763e862ed59f8e94b51d23e8a71",
+        "hashicorp/aws:6.72.0/linux_arm64": "8c3e82c6aa69b20f720ef2c4a842af11a85691e50fc0a93e29674bd24ad819c7",
+        "hashicorp/http:3.6.3/darwin_amd64": "80b341609f5f962f709bae424860334e69e1fe6d12b9027f9c0355a1da63eb02",
+        "hashicorp/http:3.6.3/darwin_arm64": "94cd85fd04a0b36a8e622efc63e08c34a6ba135713dd9c7a60059af55aea6876",
+        "hashicorp/http:3.6.3/linux_amd64": "c3534ef0998dba2a3b79d4c993197ed86f1482dd451479ae8244d92cf7b3b3a9",
+        "hashicorp/http:3.6.3/linux_arm64": "476a140b360acb9ca589b7de6a5a8a379aabab4e034fd2dbf4be033c21749907",
+    },
     use_tofu = True,
-    version = "1.11.6",
+    version = "1.11.9",
 )
 use_repo(tf, "tf_toolchains")
 

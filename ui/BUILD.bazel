@@ -141,7 +141,7 @@ js_binary(
     js_test(
         name = test.removeprefix("test/").removesuffix(".test.tsx") + "_test",
         size = "small",
-        data = glob(["fixtures/*"]) + ["test/views.snapshot"],
+        data = glob(["fixtures/*"]),
         entry_point = ":" + test.removeprefix("test/").removesuffix(".test.tsx") + "_test_bundle",
     )
     for test in glob(["test/*.test.tsx"])
@@ -163,9 +163,95 @@ js_binary(
     data = [":dist"] + glob(["fixtures/*"]) + [
         "headers.json",
         "test/sse.ts",
+        "tools/preview-server.mjs",
     ],
     entry_point = "tools/preview.mjs",
     fixed_args = ["dist"],
+)
+
+genrule(
+    name = "layout_fonts",
+    srcs = [
+        "@chromium//:mono_font",
+        "@chromium//:sans_font",
+    ],
+    outs = [
+        "test/fonts/DejaVuSans.ttf",
+        "test/fonts/DejaVuSansMono.ttf",
+    ],
+    cmd = """
+        cp $(location @chromium//:sans_font) $(location test/fonts/DejaVuSans.ttf)
+        cp $(location @chromium//:mono_font) $(location test/fonts/DejaVuSansMono.ttf)
+    """,
+)
+
+BROWSER_LAYOUT_DATA = [
+    ":dist",
+    ":layout_fonts",
+    "@chromium",
+] + glob(["fixtures/*"]) + [
+    "headers.json",
+    "test/fonts.conf",
+    "test/layout-widths.mjs",
+    "test/sse.ts",
+    "tools/chromium.mjs",
+    "tools/preview-server.mjs",
+]
+
+# Checks every screen in the devShell's pinned Chromium; screenshots are opt-in.
+js_test(
+    name = "layout_test",
+    size = "medium",
+    chdir = package_name(),
+    data = BROWSER_LAYOUT_DATA,
+    entry_point = "test/layout.test.mjs",
+    env = {
+        "CHROMIUM": "$(rlocationpath @chromium)",
+        "FONTCONFIG_FILE": "$(rlocationpath test/fonts.conf)",
+    },
+    # The external browser stays where the repository rule links it.
+    no_copy_to_bin = ["@chromium"],
+)
+
+js_test(
+    name = "overview_layout_test",
+    size = "medium",
+    chdir = package_name(),
+    data = BROWSER_LAYOUT_DATA,
+    entry_point = "test/overview-layout.test.mjs",
+    env = {
+        "CHROMIUM": "$(rlocationpath @chromium)",
+        "FONTCONFIG_FILE": "$(rlocationpath test/fonts.conf)",
+    },
+    no_copy_to_bin = ["@chromium"],
+)
+
+js_binary(
+    name = "chromium_fixture",
+    testonly = True,
+    data = ["test/chromium-helper.mjs"],
+    entry_point = "test/chromium-fixture.mjs",
+    env = {"JS_BINARY__CHDIR": ""},
+)
+
+js_test(
+    name = "chromium_test",
+    size = "small",
+    chdir = package_name(),
+    data = [
+        "test/fonts.conf",
+        "tools/chromium.mjs",
+        ":chromium_fixture",
+        ":layout_fonts",
+        "@chromium",
+    ],
+    entry_point = "test/chromium.test.mjs",
+    env = {
+        "CHROMIUM": "$(rlocationpath @chromium)",
+        "CHROMIUM_FIXTURE": "$(rlocationpath :chromium_fixture)",
+        "FONTCONFIG_FILE": "$(rlocationpath test/fonts.conf)",
+    },
+    no_copy_to_bin = ["@chromium"],
 )
 
 # The recorded wire fixtures, shared with the Rust schema tests that check the types against them.

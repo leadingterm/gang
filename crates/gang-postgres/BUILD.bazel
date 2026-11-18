@@ -1,0 +1,21 @@
+load("//bazel/rust:defs.bzl", "workspace_rust_library")
+
+workspace_rust_library(
+    name = "gang_postgres",
+    dev_deps = ["//crates/gang-testkit:gang_testkit"],
+    # Tests use a real server pinned by the build graph.
+    test_env = {
+        "GANG_TEST_POSTGRES": "$(rootpath //crates/gang-testkit:postgresql_archive)",
+        "GANG_TEST_RDS_CA_BUNDLE": "$(rootpath //infra/nixos:rds-ca-bundle.pem)",
+    },
+    test_runtime_data = [
+        "//crates/gang-testkit:postgresql_archive",
+        "//infra/nixos:rds-ca-bundle.pem",
+    ],
+    deps = [
+        "//crates/gang-clock:gang_clock",
+        "//crates/gang-spi:gang_spi",
+        "//crates/gang-tls:gang_tls",
+        "//crates/gang-types:gang_types",
+    ],
+)

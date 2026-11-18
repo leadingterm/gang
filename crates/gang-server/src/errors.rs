@@ -2,8 +2,8 @@
 
 use std::fmt;
 
-use gang_mtls::MtlsError;
-use gang_spi::PortError;
+use gang_mtls::{MtlsError, ProofError};
+use gang_spi::{BoxedError, PortError};
 use gang_tls::TransportError;
 use gang_types::Url;
 
@@ -27,10 +27,39 @@ impl fmt::Display for ExpectedSchemes<'_> {
         Ok(())
     }
 }
-
 /// Why the server could not be prepared or stopped while running.
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
+    /// Another controller acquired the lease while this controller was leading.
+    #[error("another controller took the leader lease; this controller handed off")]
+    LeadershipLost,
+
+    /// A leader-only listener could not be bound.
+    #[error("cannot bind the {endpoint} listener")]
+    Bind {
+        /// The listener's role.
+        endpoint: &'static str,
+        /// The binding failure.
+        #[source]
+        source: BoxedError,
+    },
+
+    /// Listener configuration and the execution endpoint disagree.
+    #[error("the execution endpoint must be set exactly when the execution listener is dedicated")]
+    ExecutionEndpoint,
+
+    /// The client for forwarding leader routes could not be built.
+    #[error("cannot build the leader route client")]
+    LeaderClient(#[source] gang_tls::HttpError),
+
+    /// The request size limit cannot hold a forwarded observation.
+    #[error("build observations cannot be forwarded within the request size limit")]
+    Forwarding(#[source] gang_insight::OutboxError),
+
+    /// The controller proof verification key could not be prepared.
+    #[error("cannot prepare the controller proof key")]
+    ControllerProofKey(#[source] ProofError),
+
     /// The certificate authority could not be established from the signer.
     #[error("cannot establish the certificate authority")]
     Authority(#[source] MtlsError),

@@ -20,6 +20,7 @@ gang-clock = { workspace = true }
 gang-config = { workspace = true }
 gang-local = { workspace = true }
 gang-main = { workspace = true }
+gang-mtls = { workspace = true }
 gang-nativelink = { workspace = true }
 gang-oidc = { workspace = true }
 gang-os = { workspace = true }
@@ -33,8 +34,12 @@ getrandom = { workspace = true }
 h2 = { workspace = true }
 hex = { workspace = true }
 http = { workspace = true }
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+nativelink-proto = { workspace = true }
 p256 = { workspace = true }
 parking_lot = { workspace = true }
+prost = { workspace = true }
 rustix = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }

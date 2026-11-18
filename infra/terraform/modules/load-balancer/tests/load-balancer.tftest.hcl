@@ -1,4 +1,10 @@
 mock_provider "aws" {
+  mock_data "aws_route53_zone" {
+    defaults = {
+      name = "example.com."
+    }
+  }
+
   mock_resource "aws_lb" {
     defaults = {
       arn = "arn:aws:elasticloadbalancing:eu-north-1:000000000000:loadbalancer/net/gang/0000000000000000"
@@ -24,6 +30,9 @@ variables {
   subnet_id                      = "subnet-00000000000000000"
   hostname                       = "gang.example.com"
   port                           = 443
+  execute_port                   = 8443
+  workers_port                   = 9090
+  health_port                    = 8181
   client_ingress_cidrs           = ["198.51.100.0/24", "203.0.113.0/24"]
   controller_security_group_id   = "sg-00000000000000001"
   controller_instance_id         = "i-00000000000000000"
@@ -60,8 +69,8 @@ run "forwards_tls_to_the_controller_with_the_client_address" {
   }
 
   assert {
-    condition     = aws_lb_target_group.this.health_check[0].protocol == "TCP" && aws_lb_target_group_attachment.this.target_id == var.controller_instance_id
-    error_message = "The controller instance must be attached to a target group with TCP health checks."
+    condition     = aws_lb_target_group_attachment.this[0].target_id == var.controller_instance_id && aws_lb_target_group.this.health_check[0].protocol == "HTTP" && aws_lb_target_group.this.health_check[0].port == tostring(var.health_port) && aws_lb_target_group.this.health_check[0].path == jsondecode(file("${path.module}/health-check.json")).serve_path && aws_lb_target_group.this.health_check[0].matcher == "200" && aws_lb_target_group.this.health_check[0].interval == jsondecode(file("${path.module}/health-check.json")).interval_seconds && aws_lb_target_group.this.health_check[0].timeout == jsondecode(file("${path.module}/health-check.json")).timeout_seconds && aws_lb_target_group.this.health_check[0].healthy_threshold == jsondecode(file("${path.module}/health-check.json")).threshold && aws_lb_target_group.this.health_check[0].unhealthy_threshold == jsondecode(file("${path.module}/health-check.json")).threshold
+    error_message = "The attached controller must receive the configured HTTP serve health check."
   }
 }
 
@@ -82,13 +91,18 @@ run "only_the_load_balancer_reaches_the_controller_listener" {
     condition     = aws_vpc_security_group_egress_rule.controller.referenced_security_group_id == var.controller_security_group_id
     error_message = "The load balancer egress rule must reference the controller security group."
   }
+
+  assert {
+    condition     = aws_vpc_security_group_egress_rule.health.security_group_id == aws_security_group.this.id && aws_vpc_security_group_egress_rule.health.referenced_security_group_id == var.controller_security_group_id && aws_vpc_security_group_egress_rule.health.from_port == var.health_port && aws_vpc_security_group_egress_rule.health.to_port == var.health_port && aws_vpc_security_group_egress_rule.health.ip_protocol == "tcp" && aws_vpc_security_group_ingress_rule.controller_health.security_group_id == var.controller_security_group_id && aws_vpc_security_group_ingress_rule.controller_health.referenced_security_group_id == aws_security_group.this.id && aws_vpc_security_group_ingress_rule.controller_health.from_port == var.health_port && aws_vpc_security_group_ingress_rule.controller_health.to_port == var.health_port && aws_vpc_security_group_ingress_rule.controller_health.ip_protocol == "tcp"
+    error_message = "The public load balancer must reach the controller health port in both directions."
+  }
 }
 
 run "workers_resolve_the_hostname_to_the_controller" {
   command = apply
 
   assert {
-    condition     = aws_route53_zone.this.name == "gang.example.com" && one(aws_route53_zone.this.vpc).vpc_id == var.vpc_id
+    condition     = aws_route53_zone.this[0].name == "gang.example.com" && one(aws_route53_zone.this[0].vpc).vpc_id == var.vpc_id
     error_message = "The endpoint hostname must have a private hosted zone associated with the controller VPC."
   }
 
@@ -155,4 +169,151 @@ run "rejects_an_ipv6_client_cidr" {
   expect_failures = [
     var.client_ingress_cidrs,
   ]
+}
+
+run "execution_load_balancers" {
+  command = plan
+
+  variables {
+    execution                = true
+    public_subnet_ids        = ["subnet-public"]
+    private_subnet_ids       = ["subnet-private"]
+    worker_security_group_id = "sg-workers"
+    private_zone_id          = "ZPRIVATE"
+    port                     = 444
+    execute_port             = 8444
+    workers_port             = 9091
+    shutdown_grace           = 100
+    deregistration_delay     = 120
+  }
+
+  assert {
+    condition     = aws_lb_listener.this.protocol == "TLS" && aws_lb_listener.this.port == 444 && aws_lb_listener.execute[0].protocol == "TLS" && aws_lb_listener.execute[0].port == 8444 && aws_lb_listener.execute[0].certificate_arn == aws_acm_certificate_validation.this.certificate_arn && aws_lb_listener.execute[0].alpn_policy == "HTTP2Preferred" && aws_lb_target_group.this.port == 444 && aws_lb_target_group.execute[0].port == 8444
+    error_message = "The public NLB must use TLS serve and execute listeners on the controller's ports."
+  }
+  assert {
+    condition     = aws_lb.internal[0].internal && length(aws_lb_listener.internal) == 3 && aws_lb_listener.internal["serve"].port == 444 && aws_lb_listener.internal["execute"].port == 8444 && aws_lb_listener.internal["workers"].port == 9091 && aws_lb_target_group.internal["workers"].port == 9091 && alltrue([for listener in values(aws_lb_listener.internal) : listener.protocol == "TCP" && listener.certificate_arn == null])
+    error_message = "The internal NLB must use TCP passthrough without certificates on every configured listener."
+  }
+  assert {
+    condition     = aws_lb_target_group.this.protocol == "TLS" && aws_lb_target_group.execute[0].protocol == "TLS" && alltrue([for tg in values(aws_lb_target_group.internal) : tg.protocol == "TCP"]) && alltrue([for tg in concat([aws_lb_target_group.this, aws_lb_target_group.execute[0]], values(aws_lb_target_group.internal)) : tonumber(tg.deregistration_delay) == 120 && !tg.connection_termination && tg.health_check[0].protocol == "HTTP" && tg.health_check[0].port == tostring(var.health_port) && tg.health_check[0].matcher == "200" && tg.health_check[0].interval == jsondecode(file("${path.module}/health-check.json")).interval_seconds && tg.health_check[0].timeout == jsondecode(file("${path.module}/health-check.json")).timeout_seconds && tg.health_check[0].healthy_threshold == jsondecode(file("${path.module}/health-check.json")).threshold && tg.health_check[0].unhealthy_threshold == jsondecode(file("${path.module}/health-check.json")).threshold])
+    error_message = "Every target group must drain gracefully and use the configured HTTP health check."
+  }
+  assert {
+    condition     = aws_lb_target_group.this.health_check[0].path == jsondecode(file("${path.module}/health-check.json")).serve_path && aws_lb_target_group.execute[0].health_check[0].path == jsondecode(file("${path.module}/health-check.json")).leader_path && aws_lb_target_group.internal["serve"].health_check[0].path == jsondecode(file("${path.module}/health-check.json")).serve_path && aws_lb_target_group.internal["execute"].health_check[0].path == jsondecode(file("${path.module}/health-check.json")).leader_path && aws_lb_target_group.internal["workers"].health_check[0].path == jsondecode(file("${path.module}/health-check.json")).leader_path
+    error_message = "Serve frontends must check the serve path; execute and worker frontends must check the leader path."
+  }
+  assert {
+    condition     = aws_vpc_security_group_egress_rule.health.security_group_id == aws_security_group.this.id && aws_vpc_security_group_egress_rule.health.referenced_security_group_id == var.controller_security_group_id && aws_vpc_security_group_egress_rule.health.from_port == var.health_port && aws_vpc_security_group_egress_rule.health.to_port == var.health_port && aws_vpc_security_group_egress_rule.health.ip_protocol == "tcp" && aws_vpc_security_group_ingress_rule.controller_health.security_group_id == var.controller_security_group_id && aws_vpc_security_group_ingress_rule.controller_health.referenced_security_group_id == aws_security_group.this.id && aws_vpc_security_group_ingress_rule.controller_health.from_port == var.health_port && aws_vpc_security_group_ingress_rule.controller_health.to_port == var.health_port && aws_vpc_security_group_ingress_rule.controller_health.ip_protocol == "tcp"
+    error_message = "The public load balancer must reach the controller health port."
+  }
+  assert {
+    condition     = aws_vpc_security_group_egress_rule.internal_health[0].security_group_id == aws_security_group.internal[0].id && aws_vpc_security_group_egress_rule.internal_health[0].referenced_security_group_id == var.controller_security_group_id && aws_vpc_security_group_egress_rule.internal_health[0].from_port == var.health_port && aws_vpc_security_group_egress_rule.internal_health[0].to_port == var.health_port && aws_vpc_security_group_egress_rule.internal_health[0].ip_protocol == "tcp" && aws_vpc_security_group_ingress_rule.controller_internal_health[0].security_group_id == var.controller_security_group_id && aws_vpc_security_group_ingress_rule.controller_internal_health[0].referenced_security_group_id == aws_security_group.internal[0].id && aws_vpc_security_group_ingress_rule.controller_internal_health[0].from_port == var.health_port && aws_vpc_security_group_ingress_rule.controller_internal_health[0].to_port == var.health_port && aws_vpc_security_group_ingress_rule.controller_internal_health[0].ip_protocol == "tcp"
+    error_message = "The internal load balancer must reach the controller health port."
+  }
+  assert {
+    condition     = aws_lb_target_group.internal["execute"].preserve_client_ip == "false" && aws_lb_target_group.internal["serve"].preserve_client_ip == "true" && aws_lb_target_group.internal["workers"].preserve_client_ip == "true"
+    error_message = "Internal execution must allow controller hairpin connections without changing other listeners."
+  }
+  assert {
+    condition     = aws_route53_record.controller.zone_id == "ZPRIVATE" && aws_route53_record.controller.name == "gang.example.com" && length(aws_route53_record.controller.alias) == 1 && length(aws_lb_target_group_attachment.this) == 0
+    error_message = "The private hostname must alias the internal NLB and the ASG owns target registration."
+  }
+  assert {
+    condition     = length(aws_vpc_security_group_ingress_rule.internal) == 6 && length(aws_vpc_security_group_ingress_rule.controller_internal) == 3 && length(aws_vpc_security_group_ingress_rule.client_execute) == 2
+    error_message = "The public execution listener and internal listeners must have matching security group rules."
+  }
+}
+
+run "rejects_private_zone_outside_hostname" {
+  command = plan
+
+  variables {
+    private_zone_id = "ZPRIVATE"
+  }
+
+  override_data {
+    target = data.aws_route53_zone.existing
+    values = {
+      name = "otherexample.com."
+    }
+  }
+
+  expect_failures = [aws_route53_record.controller]
+}
+
+
+run "rejects_missing_public_subnets" {
+  command = plan
+  variables {
+    execution                = true
+    private_subnet_ids       = ["subnet-private"]
+    worker_security_group_id = "sg-workers"
+  }
+  expect_failures = [var.public_subnet_ids]
+}
+
+run "rejects_missing_private_subnets" {
+  command = plan
+  variables {
+    execution                = true
+    public_subnet_ids        = ["subnet-public"]
+    worker_security_group_id = "sg-workers"
+  }
+  expect_failures = [var.private_subnet_ids]
+}
+
+run "rejects_missing_worker_security_group" {
+  command = plan
+  variables {
+    execution          = true
+    public_subnet_ids  = ["subnet-public"]
+    private_subnet_ids = ["subnet-private"]
+  }
+  expect_failures = [var.worker_security_group_id]
+}
+
+run "rejects_short_deregistration_delay" {
+  command = plan
+  variables {
+    shutdown_grace       = 301
+    deregistration_delay = 300
+  }
+  expect_failures = [var.deregistration_delay]
+}
+
+run "rejects_negative_shutdown_grace" {
+  command = plan
+  variables { shutdown_grace = -1 }
+  expect_failures = [var.shutdown_grace]
+}
+
+run "rejects_invalid_execute_port" {
+  command = plan
+  variables { execute_port = 65536 }
+  expect_failures = [var.execute_port]
+}
+
+run "rejects_invalid_workers_port" {
+  command = plan
+  variables { workers_port = 1.5 }
+  expect_failures = [var.workers_port]
+}
+
+run "rejects_invalid_health_port" {
+  command = plan
+  variables { health_port = 1.5 }
+  expect_failures = [var.health_port]
+}
+
+run "rejects_missing_instance" {
+  command = plan
+  variables { controller_instance_id = null }
+  expect_failures = [var.controller_instance_id]
+}
+
+run "rejects_missing_private_ip" {
+  command = plan
+  variables { controller_private_ip = null }
+  expect_failures = [var.controller_private_ip]
 }

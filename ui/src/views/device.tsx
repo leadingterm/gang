@@ -1,6 +1,6 @@
 // Device approval is available without a dashboard session.
 import { useRef, useState } from "preact/hooks";
-import { duration } from "../format.ts";
+import { Duration, Ident } from "../ui.tsx";
 import { codeOf, emptyCells, enter, erase, type Cells, type Entry } from "../user-code.ts";
 import { ms } from "../wire-parse.ts";
 import { PATHS, USER_CODE, type ApproveDeviceAuthorizationRequest, type ApproveDeviceAuthorizationResponse, type DeviceAuthorization } from "../wire.ts";
@@ -60,14 +60,14 @@ export const DeviceRequest = ({ authorization, code, now = Date.now() }: { autho
     <section class="device-request" aria-labelledby="device-request-title">
       <h2 id="device-request-title">Pending login <span class="mono">{code}</span></h2>
       <dl class="device-request__facts">
-        <div><dt>From</dt><dd>{authorization.clientAddress ?? "Unknown address"}</dd></div>
-        <div><dt>Requested</dt><dd>{duration(now - ms(authorization.createTime))} ago</dd></div>
-        <div><dt>Expires in</dt><dd>{duration(ms(authorization.expireTime) - now)}</dd></div>
-        <div><dt>Sign in with</dt><dd>{provider}</dd></div>
+        <div><dt>From</dt><dd><Ident text={authorization.clientAddress ?? "Unknown address"} /></dd></div>
+        <div><dt>Requested</dt><dd><Duration ms={now - ms(authorization.createTime)} /> ago</dd></div>
+        <div><dt>Expires in</dt><dd><Duration ms={ms(authorization.expireTime) - now} /></dd></div>
+        <div><dt>Sign in with</dt><dd><Ident text={provider} /></dd></div>
       </dl>
       <p class="device-request__warning">Approve only if you just ran <code>gang login</code> yourself and the address is yours. Approving lets that terminal act as you.</p>
       <div class="gate__actions">
-        <button class="btn btn--primary btn--lg" type="button" onClick={approve} disabled={loading} aria-busy={loading ? "true" : undefined}>{loading ? `Opening ${provider}…` : `Sign in with ${provider} to approve`}</button>
+        <button class="btn btn--primary btn--lg" type="button" onClick={approve} disabled={loading} aria-busy={loading ? "true" : undefined}>{loading ? "Opening sign-in…" : "Sign in to approve"}</button>
       </div>
       {error && <p class="device-alert" role="alert">{error}</p>}
     </section>

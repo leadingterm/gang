@@ -199,6 +199,12 @@ pub trait AuthenticationPort: Send + Sync {
     /// What the surface's listener must ask of clients at the TLS layer.
     fn client_certificates(&self) -> ClientCertificates;
 
+    /// Discards any cached authentication for a certificate newly observed as revoked.
+    /// Plugins without certificate caches have nothing to discard.
+    fn forget_revoked_certificate(&self, serial: &CertSerial) {
+        let _ = serial;
+    }
+
     /// Identifies the caller of one request. `Ok(None)` means the request carries no credential
     /// of this plugin's kind. Otherwise the caller comes with the instant its credential stops
     /// being accepted.
@@ -247,18 +253,21 @@ pub trait CredentialLifecyclePort: Send + Sync {
     ) -> Result<IssuedToken, PortError>;
 
     /// Mints a session token for a browser against a proof. The token is presented only in the
-    /// session cookie, never in an `Authorization` header.
+    /// session cookie, never in an `Authorization` header. `expires_at` is a hard upper bound on
+    /// token acceptance, including any clock skew.
     ///
     /// # Errors
     ///
     /// [`PortError::Unsupported`] (the default) without the `sessions` capability;
     /// [`PortError::NotFound`] for an unknown provider; [`PortError::Rejected`] when the proof is
-    /// refused; other [`PortError`] variants when a dependency fails.
+    /// refused or no validity remains before `expires_at`; other [`PortError`] variants when a
+    /// dependency fails.
     #[optional]
     async fn issue_session<H: AuthenticationHost>(
         &self,
         host: &H,
         request: &TokenIssue<'_>,
+        expires_at: Timestamp,
     ) -> Result<IssuedToken, PortError>;
 
     /// Revokes certificates in the ledger and returns their revoked records, never empty.

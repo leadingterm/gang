@@ -86,7 +86,7 @@ def opentofu_contract_test(name, test_file = None, deps = []):
     if not native.existing_rule("sources"):
         native.filegroup(
             name = "sources",
-            srcs = native.glob(["*.tf"]) + native.glob(["*.tftpl"], allow_empty = True),
+            srcs = native.glob(["*.tf"]) + native.glob(["*.tftpl", "*.json"], allow_empty = True),
             visibility = ["//visibility:public"],
         )
     _opentofu_contract_test(

@@ -10,11 +10,13 @@ use std::fs;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::str::FromStr;
 
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 use gang_e2e::{
-    ActionTools, Gate, Invocation, Scenario, Settings, anchored, run, unknown_scenarios,
+    ActionTools, DeploymentInputs, Gate, Invocation, Scenario, Settings, anchored, run,
+    unknown_scenarios,
 };
 
 /// Relative to the workspace: the base `gang.toml` the variants are applied to.
@@ -39,6 +41,10 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     bazel: Option<PathBuf>,
 
+    /// The pinned `PostgreSQL` archive. Defaults to the one Bazel provides.
+    #[arg(long, value_name = "PATH")]
+    postgres: Option<PathBuf>,
+
     /// The gate to run: `1` or `one`, or `2` or `two`, which includes the earlier gate.
     #[arg(long, value_name = "GATE", default_value = "1")]
     gate: Gate,
@@ -50,6 +56,10 @@ struct Cli {
     /// Run only the scenarios this gate adds to the earlier gates.
     #[arg(long, conflicts_with = "scenarios")]
     additions: bool,
+
+    /// Run one deterministically balanced shard of the selected scenarios, numbered from 1.
+    #[arg(long, value_name = "K/N")]
+    shard: Option<Shard>,
 
     /// The base `gang.toml` the variants are applied to. Defaults to a fixture of the workspace.
     #[arg(long, value_name = "PATH")]
@@ -80,6 +90,7 @@ impl Cli {
     /// A required binary or workspace default is missing, or a directory or file cannot be read
     /// or parsed.
     fn into_invocation(self) -> Result<(Gate, Invocation), String> {
+        let scenarios = self.selected_scenarios()?;
         let directory = invocation_directory()?;
         let current = env::current_dir()
             .map_err(|error| format!("cannot read the current directory: {error}"))?;
@@ -90,6 +101,13 @@ impl Cli {
             &current,
             "GANG_E2E_BAZEL",
             "--bazel",
+        )?;
+        let postgres = resolve_binary(
+            self.postgres,
+            &directory,
+            &current,
+            "GANG_E2E_POSTGRES",
+            "--postgres",
         )?;
         let workspace = non_empty_path(env::var_os("BUILD_WORKSPACE_DIRECTORY"));
         let workspace = workspace.as_deref();
@@ -145,21 +163,88 @@ impl Cli {
             settings.chromium = env::var_os("GANG_E2E_CHROMIUM").map(PathBuf::from);
         }
         let invocation = Invocation {
-            gang,
-            bazel,
-            base_config: read_file(&config)?,
-            sample,
-            configs,
-            settings,
-            action_tools,
-            scenarios: if self.additions {
-                self.gate.additions().collect()
-            } else {
-                self.scenarios
+            inputs: DeploymentInputs {
+                gang,
+                bazel,
+                postgres,
+                base_config: read_file(&config)?,
+                sample,
+                configs,
+                settings,
+                action_tools,
             },
+            scenarios,
         };
         Ok((self.gate, invocation))
     }
+
+    fn selected_scenarios(&self) -> Result<Vec<Scenario>, String> {
+        let selected: Vec<_> = if self.additions {
+            self.gate.additions().collect()
+        } else if self.scenarios.is_empty() {
+            self.gate.scenarios().collect()
+        } else {
+            self.gate
+                .scenarios()
+                .filter(|scenario| self.scenarios.contains(scenario))
+                .collect()
+        };
+        match self.shard {
+            Some(shard) => {
+                let selected = partition(&selected, shard);
+                if selected.is_empty() {
+                    return Err("the selected shard has no scenarios".to_owned());
+                }
+                Ok(selected)
+            }
+            None => Ok(selected),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Shard {
+    index: usize,
+    count: usize,
+}
+
+impl FromStr for Shard {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let invalid = || format!("invalid shard `{text}`; expected K/N with 1 <= K <= N");
+        let (index, count) = text.split_once('/').ok_or_else(invalid)?;
+        let index: usize = index.parse().map_err(|_| invalid())?;
+        let count: usize = count.parse().map_err(|_| invalid())?;
+        if index == 0 || index > count {
+            return Err(invalid());
+        }
+        Ok(Self {
+            index: index - 1,
+            count,
+        })
+    }
+}
+
+/// Assign the heaviest scenarios first to the lightest shard, breaking ties by scenario order
+/// and shard number. Return the chosen shard in execution order.
+fn partition(scenarios: &[Scenario], shard: Shard) -> Vec<Scenario> {
+    let mut ordered: Vec<_> = scenarios.iter().copied().enumerate().collect();
+    ordered.sort_by_key(|(_, scenario)| std::cmp::Reverse(scenario.weight()));
+    let mut loads = vec![0_u64; shard.count.min(scenarios.len())];
+    let mut assigned = Vec::new();
+    for (position, scenario) in ordered {
+        let Some((index, load)) = loads.iter_mut().enumerate().min_by_key(|(_, load)| **load)
+        else {
+            break;
+        };
+        *load += scenario.weight();
+        if index == shard.index {
+            assigned.push((position, scenario));
+        }
+    }
+    assigned.sort_by_key(|(position, _)| *position);
+    assigned.into_iter().map(|(_, scenario)| scenario).collect()
 }
 
 fn main() -> ExitCode {
@@ -207,7 +292,7 @@ fn harness() -> ExitCode {
     }
 }
 
-/// The explicit binary flag, or a Bazel runfile relative to the process's starting directory.
+/// The explicit path flag, or a Bazel runfile relative to the process's starting directory.
 fn resolve_binary(
     flag: Option<PathBuf>,
     directory: &Path,
@@ -285,7 +370,68 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
 
-    use super::non_empty_path;
+    use super::{Gate, Shard, non_empty_path, partition};
+
+    #[test]
+    fn shards_are_valid_deterministic_and_cover_the_selection() {
+        for invalid in ["", "0/1", "2/1", "1/0", "1", "1/2/3", "-1/2"] {
+            assert!(invalid.parse::<Shard>().is_err(), "{invalid}");
+        }
+        for selected in [
+            Gate::One.scenarios().collect::<Vec<_>>(),
+            Gate::Two.scenarios().collect(),
+            Gate::Two.additions().collect(),
+        ] {
+            for count in [1, 2] {
+                let shards: Vec<_> = (1..=count)
+                    .map(|index| partition(&selected, format!("{index}/{count}").parse().unwrap()))
+                    .collect();
+                for scenario in &selected {
+                    assert_eq!(
+                        shards
+                            .iter()
+                            .filter(|shard| shard.contains(scenario))
+                            .count(),
+                        1
+                    );
+                }
+                for (index, shard) in shards.iter().enumerate() {
+                    assert_eq!(
+                        *shard,
+                        partition(&selected, format!("{}/{count}", index + 1).parse().unwrap())
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gate_two_shards_fit_the_measured_budget() {
+        let path = std::env::var_os("GANG_E2E_GATE_SCRIPT")
+            .map_or_else(|| PathBuf::from("../../tools/e2e-gate.sh"), PathBuf::from);
+        let script = std::fs::read_to_string(path).expect("gate script is available");
+        let budget: u64 = script
+            .lines()
+            .find_map(|line| line.strip_prefix("budget="))
+            .expect("gate script declares budget")
+            .parse()
+            .expect("numeric budget");
+        let selected: Vec<_> = Gate::Two.additions().collect();
+        for index in 1..=2 {
+            let shard = partition(&selected, format!("{index}/2").parse().unwrap());
+            // run_bounded starts scenarios in selected order on the next available slot.
+            let mut slots = vec![0_u64; gang_e2e::Settings::default().parallel_scenarios.get()];
+            for scenario in shard {
+                let slot = slots.iter_mut().min().expect("parallelism is nonzero");
+                *slot += scenario.weight();
+            }
+            let makespan = slots.into_iter().max().expect("parallelism is nonzero");
+            assert!(
+                2 * makespan <= budget,
+                "shard {index}: estimated {makespan}s exceeds half the {budget}s budget"
+            );
+        }
+    }
 
     #[test]
     fn empty_environment_paths_are_unset() {

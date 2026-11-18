@@ -108,6 +108,10 @@ impl AuthenticationPort for Mtls {
         ClientCertificates::Required
     }
 
+    fn forget_revoked_certificate(&self, serial: &CertSerial) {
+        self.memo.remove(serial);
+    }
+
     async fn authenticate<H: AuthenticationHost>(
         &self,
         host: &H,
@@ -163,8 +167,18 @@ impl CredentialLifecyclePort for Mtls {
                 request.provider.clone(),
             )));
         }
+        let epoch = host.repository().revocation_epoch().await?;
         let principal = host.verify(request.provider, request.proof).await?;
         let identity = Identity::new(request.provider.clone(), principal);
+        // The host's revoked cache may lag another controller; the ledger is authoritative.
+        if host
+            .repository()
+            .principal(&identity)
+            .await?
+            .is_some_and(|record| record.revoked_at.is_some())
+        {
+            return Err(PortError::refused(Rejection::PrincipalRevoked));
+        }
         let issued = host
             .issue_certificate(&AuthorityRequest {
                 csr: request.csr,
@@ -173,6 +187,13 @@ impl CredentialLifecyclePort for Mtls {
             })
             .await?;
         host.repository().record_issued(&issued.record).await?;
+        // A sweep can miss in-flight publication; the epoch also catches revoke followed by restore.
+        if host.repository().revocation_epoch().await? != epoch {
+            host.repository()
+                .revoke(&issued.record.serial, host.now())
+                .await?;
+            return Err(PortError::refused(Rejection::PolicyDenied));
+        }
         Ok(issued)
     }
 
@@ -224,7 +245,7 @@ mod tests {
         Authenticated, AuthenticationHost, AuthenticationPort, AuthorityRequest, CertStatus,
         CertificateTarget, CredentialLifecyclePort, Evidence, IssuedCertRecord, IssuedCertificate,
         Peer, Plugin, PluginContext, PortError, PrincipalRecord, RecordedScalingEvent, Rejection,
-        ScalingAuditEvent, ScalingEventSeq, StateRepositoryPort,
+        RevocationEpoch, ScalingAuditEvent, ScalingEventSeq, StateRepositoryPort,
     };
     use gang_testkit::{FakeRepository, TestSigner, park_then_signal};
     use gang_types::{
@@ -420,6 +441,19 @@ mod tests {
             identity: &Identity,
         ) -> Result<Vec<IssuedCertRecord>, PortError> {
             self.inner.certificates_of(identity).await
+        }
+
+        async fn certificates(
+            &self,
+            after: Option<&CertSerial>,
+            limit: NonZeroUsize,
+            into: &mut Vec<IssuedCertRecord>,
+        ) -> Result<bool, PortError> {
+            self.inner.certificates(after, limit, into).await
+        }
+
+        async fn revocation_epoch(&self) -> Result<RevocationEpoch, PortError> {
+            self.inner.revocation_epoch().await
         }
 
         async fn record_scaling_event(

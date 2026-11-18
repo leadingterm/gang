@@ -46,6 +46,16 @@ pub trait Clock: Send + Sync {
     {
         Timeout::new(future.into_future(), self.sleep(duration))
     }
+
+    /// Runs `future` until it completes or the monotonic reading reaches `deadline`, whichever
+    /// is first. If both are ready, the future wins. Dropping the returned timeout drops the
+    /// future, cancelling it.
+    fn timeout_at<F: IntoFuture>(&self, deadline: Tick, future: F) -> Timeout<F::IntoFuture>
+    where
+        Self: Sized,
+    {
+        Timeout::new(future.into_future(), self.sleep_until(deadline))
+    }
 }
 
 impl<C: Clock + ?Sized> Clock for &C {
@@ -164,5 +174,33 @@ mod tests {
         assert!(sleep.as_mut().poll(&mut cx).is_pending());
         clock.advance(Duration::from_secs(1));
         assert!(sleep.as_mut().poll(&mut cx).is_ready());
+    }
+
+    #[test]
+    fn timeout_at_ends_at_the_deadline() {
+        let clock = TestClock::default();
+        let deadline = clock.monotonic() + Duration::from_secs(1);
+        let mut timeout = pin!(clock.timeout_at(deadline, std::future::pending::<()>()));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(timeout.as_mut().poll(&mut cx).is_pending());
+        clock.advance(Duration::from_secs(1) - Duration::from_nanos(1));
+        assert!(timeout.as_mut().poll(&mut cx).is_pending());
+        clock.advance(Duration::from_nanos(1));
+        assert!(matches!(
+            timeout.as_mut().poll(&mut cx),
+            std::task::Poll::Ready(Err(_))
+        ));
+    }
+
+    #[test]
+    fn timeout_at_prefers_a_ready_future() {
+        let clock = TestClock::default();
+        let deadline = clock.monotonic();
+        let mut timeout = pin!(clock.timeout_at(deadline, std::future::ready(42)));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            timeout.as_mut().poll(&mut cx),
+            std::task::Poll::Ready(Ok(42))
+        ));
     }
 }

@@ -335,6 +335,18 @@ behaviour! {
             /// The worker renews only once its certificate has expired.
             AfterExpiry,
         },
+        /// See [`Fault`]. Which harness-side operation on a held build fails with [`INJECTED_FAULT`]
+        /// without taking effect.
+        fault: Fault {
+            /// Every operation takes effect.
+            Never,
+            /// Releasing the hold probe fails, leaving it held.
+            Release,
+            /// Listing the members of the hold probe's scope fails.
+            CgroupMembers,
+            /// Setting the go flag fails, leaving it unset.
+            SetGo,
+        },
     }
     shares {
         /// Whether a dead worker's stale scope and stray are gone before its replacement serves.
@@ -342,6 +354,17 @@ behaviour! {
         /// Whether the action held across a renewal completes.
         renewal_hold: Held = Completes,
     }
+}
+
+/// The context of the error an operation selected by [`Fault`] fails with.
+pub const INJECTED_FAULT: &str = "the injected fault";
+
+/// Fails with [`INJECTED_FAULT`] when `fault` is the behaviour's.
+fn inject(behaviour: &Behaviour, fault: Fault) -> Result<()> {
+    if behaviour.fault == fault {
+        return Err(E2eError::system(INJECTED_FAULT));
+    }
+    Ok(())
 }
 
 /// The process id of the first worker; each restart takes the next.
@@ -1045,6 +1068,7 @@ impl Limits for ExecSim {
     }
 
     fn release(&self, scope: &ScopeFacts) -> Result<()> {
+        inject(&self.behaviour, Fault::Release)?;
         self.inner.release(scope)
     }
 
@@ -1062,6 +1086,10 @@ impl Limits for ExecSim {
 
     fn abandon_hold(&self) -> Result<()> {
         self.inner.abandon_hold()
+    }
+
+    fn cancel_hold(&self) -> Result<()> {
+        self.inner.cancel_hold()
     }
 
     fn attempts(&self) -> Result<usize> {
@@ -1113,6 +1141,7 @@ impl Execution for ExecSim {
     }
 
     fn set_go(&self, go: bool) -> Result<()> {
+        inject(&self.behaviour, Fault::SetGo)?;
         self.state.lock().journal.go = go;
         Ok(())
     }
@@ -1184,6 +1213,7 @@ impl Execution for ExecSim {
     }
 
     fn cgroup_members(&self, cgroup: &Path) -> Result<Vec<u32>> {
+        inject(&self.behaviour, Fault::CgroupMembers)?;
         if let Some(facts) = self.inner.running_scope()?
             && facts.directory == cgroup
         {

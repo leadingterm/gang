@@ -2,6 +2,7 @@
 //! plugin configurations the server is composed from.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
@@ -9,13 +10,13 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crate::{
-    Deployment, HandshakeSettings, Listeners, Parts, Provider, Providers, PublicEndpoint,
-    RequestLimits, ServerSettings, Stack, TlsSettings, TransportSettings,
+    Binder, Deployment, HandshakeSettings, LeaderListeners, Listeners, Parts, Provider, Providers,
+    PublicEndpoint, RequestLimits, ServerSettings, Stack, TlsSettings, TransportSettings,
 };
 use gang_authn::{Anonymous, Mtls, MtlsConfig, NoneConfig, Token, TokenConfig};
 use gang_clock::TestClock;
 use gang_config::{DashboardConfig, EndpointTrust, RoleConfig, RolePrincipal};
-use gang_spi::{LoginSupport, Plugin, PluginContext};
+use gang_spi::{BoxedError, ControllerId, LoginSupport, Plugin, PluginContext};
 use gang_testkit::{
     FakeCache, FakeProvisioner, FakeRepository, FakeScheduler, TestPlugins, TestSigner,
 };
@@ -23,12 +24,36 @@ use gang_types::{
     Isa, NonZeroDuration, Percent, PermissionSet, Principal, ProviderName, RoleName, TrustDomain,
     Url,
 };
+use parking_lot::Mutex;
 use serde_json::json;
 
 use crate::test_support::start_clock;
 use crate::test_support_fleet::fleets;
 use crate::test_support_memory::{MemoryDialer, MemoryListener, memory_listener};
 use crate::test_support_verifier::FakeVerifier;
+
+/// In-memory binding registry for dedicated listener tests.
+#[derive(Clone, Default)]
+pub struct MemoryBinder {
+    dials: Arc<Mutex<BTreeMap<SocketAddr, MemoryDialer>>>,
+}
+
+impl MemoryBinder {
+    /// Returns a dialer for an address that has been bound.
+    pub fn dialer(&self, address: SocketAddr) -> Option<MemoryDialer> {
+        self.dials.lock().get(&address).cloned()
+    }
+}
+
+impl Binder for MemoryBinder {
+    type Listener = MemoryListener;
+
+    async fn bind(&self, address: SocketAddr) -> Result<MemoryListener, BoxedError> {
+        let (listener, dialer) = memory_listener();
+        self.dials.lock().insert(address, dialer);
+        Ok(listener)
+    }
+}
 
 /// The deployment of a TLS server: client tokens and worker certificates, both under the
 /// certificate authority.
@@ -48,6 +73,7 @@ impl Deployment for TlsDeployment {
     type Cache = FakeCache;
     type Scheduler = FakeScheduler;
     type Listener = MemoryListener;
+    type Binder = MemoryBinder;
     type Plugins = TestPlugins;
 }
 
@@ -68,6 +94,7 @@ impl Deployment for PlainDeployment {
     type Cache = FakeCache;
     type Scheduler = FakeScheduler;
     type Listener = MemoryListener;
+    type Binder = MemoryBinder;
     type Plugins = TestPlugins;
 }
 
@@ -101,7 +128,7 @@ struct Wiring {
     repository: FakeRepository,
     clock: Arc<TestClock>,
     providers: Providers<FakeVerifier>,
-    listeners: Listeners<MemoryListener>,
+    listeners: Listeners<MemoryBinder>,
 }
 
 /// Builds the shared state over fresh fakes and memory listeners.
@@ -118,7 +145,10 @@ fn wire(scheduler: FakeScheduler) -> (Wiring, Dials, Handles) {
         repository: repository.clone(),
         clock: clock.clone(),
         providers,
-        listeners: Listeners { public, worker },
+        listeners: Listeners {
+            public,
+            leader: LeaderListeners::OnPublic { worker },
+        },
     };
     let dials = Dials {
         public: public_dial,
@@ -197,6 +227,9 @@ pub(super) fn anonymous() -> Anonymous {
 #[must_use]
 pub fn tls_settings() -> ServerSettings {
     ServerSettings {
+        leadership: gang_config::LeadershipConfig::default(),
+        revocation_refresh_interval: NonZeroDuration::from_secs(1),
+        execution_endpoint: None,
         poll_interval: NonZeroDuration::from_secs(1),
         client_action_timeout: NonZeroDuration::from_mins(1),
         default_isa: Isa::X86_64,
@@ -212,6 +245,7 @@ pub fn tls_settings() -> ServerSettings {
                 refusal_linger: NonZeroDuration::from_secs(2),
             },
             endpoint_trust: EndpointTrust::Ca,
+            ca_pinned: false,
         }),
         roles: vec![role_for("administrator", PermissionSet::all(), "admin")],
         limits: request_limits(),
@@ -219,6 +253,8 @@ pub fn tls_settings() -> ServerSettings {
         principal_seen_interval: NonZeroDuration::from_mins(1),
         max_tracked_principals: NonZeroUsize::new(10_000).expect("10,000 is non-zero"),
         accept_error_backoff: NonZeroDuration::from_millis(100),
+        health_max_connections: NonZeroUsize::new(64).expect("64 is non-zero"),
+        health_max_header_size: 8 * 1024,
         dashboard: DashboardConfig::default(),
         builds: gang_config::BuildsConfig::default(),
         login: None,
@@ -264,6 +300,7 @@ pub fn tls_parts() -> (Parts<TlsDeployment>, Dials, Handles) {
         providers: wiring.providers,
         clock: wiring.clock,
         listeners: wiring.listeners,
+        controller: ControllerId::new("test-controller"),
         clients: token(),
         workers: mtls(),
     };
@@ -287,6 +324,7 @@ pub fn plain_parts() -> (Parts<PlainDeployment>, Dials, Handles) {
         providers: wiring.providers,
         clock: wiring.clock,
         listeners: wiring.listeners,
+        controller: ControllerId::new("test-controller"),
         clients: anonymous(),
         workers: anonymous(),
     };

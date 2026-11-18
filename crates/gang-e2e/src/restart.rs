@@ -80,7 +80,7 @@ pub fn restart<S: System + Limits>(system: &S) -> Result<Vec<Check>> {
         } = match restart_holding(system, &handle) {
             Ok(restarted) => restarted,
             Err(error) => {
-                crate::limits::end_held_build(system);
+                crate::limits::end_held_build(system, handle);
                 return Err(error);
             }
         };
@@ -93,14 +93,21 @@ pub fn restart<S: System + Limits>(system: &S) -> Result<Vec<Check>> {
             }
             // The server must go first: the build then fails at once instead of at its timeout.
             if let Err(error) = system.kill_server() {
-                crate::limits::end_held_build(system);
+                crate::limits::end_held_build(system, handle);
                 return Err(error);
             }
-            let _ = handle.join();
+            if let Ok(Ok(outcome)) = handle.join()
+                && !outcome.succeeded()
+            {
+                checks.push(Check::failed(
+                    names::restart::BUILD_SURVIVES,
+                    outcome.exit_summary(),
+                ));
+            }
             return Ok(checks);
         };
         if let Err(error) = system.release(&facts) {
-            crate::limits::end_held_build(system);
+            crate::limits::end_held_build(system, handle);
             return Err(error);
         }
         let outcome = handle

@@ -11,6 +11,7 @@
 use gang_clock::{Tick, Timestamp};
 use gang_config::FleetPolicy;
 use gang_spi::{FleetInstance, FleetSupply, WorkerState};
+use gang_types::health::CLIENT_REROUTE_BOUND;
 use gang_types::{InstanceId, InstanceLifecycle, SaturatingInto};
 
 use crate::activity::Activity;
@@ -168,6 +169,9 @@ struct Pass<'a> {
     hosted: &'a HostedSnapshot,
     wall: Timestamp,
     now: Tick,
+    /// Whether [`CLIENT_REROUTE_BOUND`] has passed since this reconciler's first pass, so the
+    /// demand a lost leader's clients held has had time to reach this one.
+    demand_settled: bool,
 }
 
 /// Reusable scratch state for [`Reconciler::reconcile`].
@@ -176,7 +180,8 @@ struct Pass<'a> {
 /// steady-state passes do not allocate. It also remembers what it has observed between passes
 /// (see the observations module). Nothing persists across a restart, so a restarted reconciler
 /// starts every timer from zero and only acts on a worker or instance it has seen for a full
-/// timeout in the current process.
+/// timeout in the current process. One reconciler serves one leadership term: its first pass
+/// starts the term's demand settle.
 #[derive(Debug)]
 pub struct Reconciler {
     /// Since when each worker has shown its current activity, since when each instance has been
@@ -186,6 +191,8 @@ pub struct Reconciler {
     candidates: Vec<Candidate>,
     /// The draining workers of the fleet being reconciled.
     draining: Vec<Draining>,
+    /// The tick of this reconciler's first pass; `None` until it has run one.
+    first_pass: Option<Tick>,
 }
 
 impl Reconciler {
@@ -202,6 +209,7 @@ impl Reconciler {
             observations: Observations::new(fleets.len()),
             candidates: Vec::with_capacity(capacity),
             draining: Vec::with_capacity(capacity),
+            first_pass: None,
         }
     }
 
@@ -243,6 +251,10 @@ impl Reconciler {
     ///   unlaunched requests are withdrawn first; requests with a launch in flight are retained.
     ///   The remaining surplus is released from the `release_first` tier first: its longest-idle
     ///   eligible workers past `idle_timeout` drain before other eligible workers.
+    /// * No drain starts until [`CLIENT_REROUTE_BOUND`] has passed since the reconciler's first
+    ///   pass. Demand queued on a lost leader reaches the new one only once its clients have
+    ///   detected the loss and resubmitted, so an idle worker is not surplus before then. Drains
+    ///   already started still resume and end, and scale-out and withdrawals are unaffected.
     ///
     /// Every step is safe to apply again. A pass that runs before the provisioner or scheduler
     /// has reflected the previous pass plans the same steps again, so the caller converges
@@ -258,6 +270,8 @@ impl Reconciler {
         plan: &mut Plan,
     ) {
         let PassTime { wall, now } = time;
+        let first_pass = *self.first_pass.get_or_insert(now);
+        let demand_settled = now.saturating_duration_since(first_pass) >= CLIENT_REROUTE_BOUND;
         let snapshot = hosted.snapshot();
         plan.steps.clear();
         plan.at = wall;
@@ -306,7 +320,12 @@ impl Reconciler {
             }
         }
 
-        let pass = Pass { hosted, wall, now };
+        let pass = Pass {
+            hosted,
+            wall,
+            now,
+            demand_settled,
+        };
         for (index, fleet) in fleets.iter_mut().enumerate() {
             let work = fleet.outlook.demand.instances(&fleet.policy);
             fleet.outlook.minimum = fleet.policy.instances.min_at(wall);
@@ -373,7 +392,7 @@ impl Reconciler {
     /// the surplus that the release-first tier cannot absorb. With no release-first instance `R`
     /// is zero and the surplus drains the longest-idle candidates, ties broken by worker id. Only
     /// idle workers past `idle_timeout` are candidates, so a busy worker is never drained for
-    /// scale-in.
+    /// scale-in. No drain starts before the pass's demand has settled.
     fn reconcile_fleet(
         &mut self,
         pass: &Pass<'_>,
@@ -453,7 +472,9 @@ impl Reconciler {
                 });
                 surplus = surplus.saturating_sub(withdrawn);
             }
-            self.start_drains(pass, view, surplus, release_first, plan);
+            if pass.demand_settled {
+                self.start_drains(pass, view, surplus, release_first, plan);
+            }
         }
     }
 

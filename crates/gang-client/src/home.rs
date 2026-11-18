@@ -170,6 +170,15 @@ impl ClientHome {
         dir.read_optional(name).map_err(ClientError::from)
     }
 
+    /// Checks whether `path` exists in the verified client directory.
+    pub(crate) fn has_file(&self, path: &Path) -> Result<bool, ClientError> {
+        let name = self.file_name(path, "read")?;
+        let Some(dir) = self.open_dir()? else {
+            return Ok(false);
+        };
+        dir.has_file(name).map_err(ClientError::from)
+    }
+
     /// Removes `path`; succeeds when it is already absent.
     pub(crate) fn remove(&self, path: &Path) -> Result<(), ClientError> {
         let name = self.file_name(path, "remove")?;

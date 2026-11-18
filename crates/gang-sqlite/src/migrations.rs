@@ -1,6 +1,13 @@
-use rusqlite::{Connection, TransactionBehavior};
+use gang_spi::{SchemaPlan, SchemaVersion};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use crate::errors::SqliteError;
+
+/// Current schema version; all three migrations are additive since schema 1.
+pub const SCHEMA_VERSION: SchemaVersion = SchemaVersion {
+    current: 3,
+    oldest_compatible: 1,
+};
 
 /// Ordered schema migrations. The entry at position `i` brings the schema to `user_version`
 /// `i + 1`, so the versions are the positions and cannot skip a number.
@@ -39,6 +46,10 @@ CREATE TABLE scaling_audit (
 ) STRICT;
 ",
     "ALTER TABLE scaling_audit ADD COLUMN detail TEXT;",
+    "
+CREATE TABLE counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL) STRICT;
+CREATE TABLE expiring_records (kind TEXT NOT NULL, id BLOB NOT NULL, body BLOB NOT NULL, version INTEGER NOT NULL, expires_at INTEGER NOT NULL, PRIMARY KEY (kind, id)) STRICT;
+",
 ];
 
 /// Brings the schema up to the newest migration.
@@ -49,31 +60,79 @@ CREATE TABLE scaling_audit (
 ///
 /// # Errors
 ///
-/// Returns [`SqliteError::SchemaTooNew`] when the database was written by a newer version of
-/// this crate, or the underlying statement error when a migration fails. A failed migration
-/// rolls back the whole run.
+/// Returns [`SqliteError::Schema`] when the database requires a newer binary, or the underlying
+/// statement error when a migration fails. A failed migration rolls back the whole run.
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), SqliteError> {
-    migrate_with(connection, MIGRATIONS)
+    migrate_with(connection, MIGRATIONS, SCHEMA_VERSION.oldest_compatible)
 }
 
 /// Applies the migrations newer than the stored version, in order, in one immediate transaction.
 /// Any error drops the transaction, which rolls back every migration in the run.
-fn migrate_with(connection: &mut Connection, migrations: &[&str]) -> Result<(), SqliteError> {
+fn migrate_with(
+    connection: &mut Connection,
+    migrations: &[&str],
+    oldest_compatible: u32,
+) -> Result<(), SqliteError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let stored = user_version(&transaction)?;
-    let supported = i64::try_from(migrations.len()).unwrap_or(i64::MAX);
-    if stored > supported {
-        return Err(SqliteError::SchemaTooNew {
-            found: stored,
-            supported,
-        });
-    }
-    for (version, sql) in (1_i64..).zip(migrations) {
-        if version <= stored {
-            continue;
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_compatibility (oldest_compatible INTEGER NOT NULL) STRICT",
+    )?;
+    let current = user_version(&transaction)?;
+    let current = u32::try_from(current).map_err(|error| SqliteError::Corrupt {
+        column: "user_version",
+        detail: error.to_string(),
+    })?;
+    let stored = if current == 0 {
+        None
+    } else {
+        let oldest_compatible: i64 = transaction
+            .query_row(
+                "SELECT oldest_compatible FROM schema_compatibility LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(i64::from(current));
+        let oldest_compatible =
+            u32::try_from(oldest_compatible).map_err(|error| SqliteError::Corrupt {
+                column: "schema_compatibility",
+                detail: error.to_string(),
+            })?;
+        let stored = SchemaVersion {
+            current,
+            oldest_compatible,
+        };
+        if !stored.is_valid() {
+            return Err(SqliteError::Corrupt {
+                column: "schema_compatibility",
+                detail: format!(
+                    "invalid oldest compatible version {oldest_compatible} for version {current}"
+                ),
+            });
         }
-        transaction.execute_batch(sql)?;
-        transaction.execute_batch(&format!("PRAGMA user_version = {version}"))?;
+        Some(stored)
+    };
+    let binary = SchemaVersion {
+        current: u32::try_from(migrations.len())
+            .map_err(|_| SqliteError::MigrationCountOverflow)?,
+        oldest_compatible,
+    };
+    match binary.plan(stored)? {
+        SchemaPlan::Migrate { from } => {
+            for (version, sql) in (1_u32..).zip(migrations) {
+                if version <= from {
+                    continue;
+                }
+                transaction.execute_batch(sql)?;
+                transaction.execute_batch(&format!("PRAGMA user_version = {version}"))?;
+            }
+            transaction.execute("DELETE FROM schema_compatibility", [])?;
+            transaction.execute(
+                "INSERT INTO schema_compatibility (oldest_compatible) VALUES (?1)",
+                [oldest_compatible],
+            )?;
+        }
+        SchemaPlan::Use => {}
     }
     transaction.commit()?;
     Ok(())
@@ -100,6 +159,29 @@ mod tests {
             .expect("rows read")
     }
 
+    #[test]
+    fn schema_version_matches_migrations() {
+        assert_eq!(
+            usize::try_from(SCHEMA_VERSION.current),
+            Ok(MIGRATIONS.len())
+        );
+    }
+
+    #[test]
+    fn fresh_database_records_schema_compatibility() {
+        let mut connection = Connection::open_in_memory().expect("in-memory database opens");
+        migrate(&mut connection).expect("migration succeeds");
+        assert_eq!(user_version(&connection).expect("version is readable"), 3);
+        let oldest: u32 = connection
+            .query_row(
+                "SELECT oldest_compatible FROM schema_compatibility",
+                [],
+                |row| row.get(0),
+            )
+            .expect("compatibility is recorded");
+        assert_eq!(oldest, 1);
+    }
+
     /// Checks every stored schema definition on a freshly migrated database.
     #[test]
     fn fresh_database_schema_matches_expected_ddl() {
@@ -117,6 +199,14 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("schema rows read");
         let expected = [
+            (
+                "counters",
+                "CREATE TABLE counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL) STRICT",
+            ),
+            (
+                "expiring_records",
+                "CREATE TABLE expiring_records (kind TEXT NOT NULL, id BLOB NOT NULL, body BLOB NOT NULL, version INTEGER NOT NULL, expires_at INTEGER NOT NULL, PRIMARY KEY (kind, id)) STRICT",
+            ),
             (
                 "issued_certificates",
                 "CREATE TABLE issued_certificates (
@@ -164,6 +254,10 @@ mod tests {
     cause     TEXT
 , detail TEXT) STRICT",
             ),
+            (
+                "schema_compatibility",
+                "CREATE TABLE schema_compatibility (oldest_compatible INTEGER NOT NULL) STRICT",
+            ),
             ("sqlite_sequence", "CREATE TABLE sqlite_sequence(name,seq)"),
         ];
         assert_eq!(
@@ -175,7 +269,7 @@ mod tests {
     #[test]
     fn existing_scaling_events_gain_nullable_detail() {
         let mut connection = Connection::open_in_memory().expect("in-memory database opens");
-        migrate_with(&mut connection, &MIGRATIONS[..1]).expect("initial migration succeeds");
+        migrate_with(&mut connection, &MIGRATIONS[..1], 1).expect("initial migration succeeds");
         connection
             .execute(
                 "INSERT INTO scaling_audit (at, fleet, kind, subject) VALUES (1000, 'gang-x86', 'terminated', 'local-1')",
@@ -189,7 +283,7 @@ mod tests {
             .query_row("SELECT detail FROM scaling_audit", [], |row| row.get(0))
             .expect("existing row is readable");
         assert_eq!(detail, None);
-        assert_eq!(user_version(&connection).expect("version is readable"), 2);
+        assert_eq!(user_version(&connection).expect("version is readable"), 3);
     }
 
     #[test]
@@ -208,7 +302,7 @@ mod tests {
     #[test]
     fn schema_newer_than_this_crate_is_rejected() {
         let mut connection = Connection::open_in_memory().expect("in-memory database opens");
-        let newer = i64::try_from(MIGRATIONS.len() + 1).expect("migration count fits");
+        let newer = SCHEMA_VERSION.current + 1;
         connection
             .execute_batch(&format!("PRAGMA user_version = {newer}"))
             .expect("version is recorded");
@@ -217,8 +311,53 @@ mod tests {
 
         assert!(matches!(
             error,
-            SqliteError::SchemaTooNew { found, .. } if found == newer
+            SqliteError::Schema(gang_spi::SchemaTooNew {
+                stored: SchemaVersion { current, oldest_compatible },
+                supported: 3,
+            }) if current == newer && oldest_compatible == newer
         ));
+    }
+
+    #[test]
+    fn invalid_schema_compatibility_is_rejected() {
+        for oldest in [0, 4, -1] {
+            let mut connection = Connection::open_in_memory().expect("in-memory database opens");
+            migrate(&mut connection).expect("migration succeeds");
+            connection
+                .execute(
+                    "UPDATE schema_compatibility SET oldest_compatible = ?1",
+                    [oldest],
+                )
+                .expect("invalid compatibility is recorded");
+            assert!(matches!(
+                migrate(&mut connection),
+                Err(SqliteError::Corrupt {
+                    column: "schema_compatibility",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn compatible_newer_schema_is_left_untouched() {
+        let mut connection = Connection::open_in_memory().expect("in-memory database opens");
+        migrate(&mut connection).expect("migration succeeds");
+        connection
+            .execute_batch("PRAGMA user_version = 4")
+            .expect("version is recorded");
+
+        migrate(&mut connection).expect("compatible schema is accepted");
+
+        assert_eq!(user_version(&connection).expect("version is readable"), 4);
+        let oldest: u32 = connection
+            .query_row(
+                "SELECT oldest_compatible FROM schema_compatibility",
+                [],
+                |row| row.get(0),
+            )
+            .expect("compatibility is readable");
+        assert_eq!(oldest, 1);
     }
 
     #[test]
@@ -259,10 +398,10 @@ CREATE TABLE scratch (x INTEGER) STRICT;
 INSERT INTO scaling_audit (fleet, kind) VALUES ('gang-x86', 'scaled_out');
 ALTER TABLE nonexistent ADD COLUMN y TEXT;
 ";
-        migrate_with(&mut connection, &[first, second]).expect("initial migrations succeed");
+        migrate_with(&mut connection, &[first, second], 1).expect("initial migrations succeed");
         let migrations = [first, second, failing];
 
-        migrate_with(&mut connection, &migrations).expect_err("failing migration is rejected");
+        migrate_with(&mut connection, &migrations, 1).expect_err("failing migration is rejected");
 
         assert_eq!(user_version(&connection).expect("version is readable"), 2);
         let scratch: i64 = connection

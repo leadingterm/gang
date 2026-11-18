@@ -3,10 +3,11 @@
 use std::time::Duration;
 
 use gang_clock::{Clock, TestClock};
-use gang_config::{InstanceBounds, Weekday};
+use gang_config::{FleetPolicy, InstanceBounds, Weekday};
 use gang_reconciler::{FleetPass, HostedSnapshot, PassTime, Plan, Reconciler};
 use gang_spi::{SchedulerSnapshot, WorkerState};
 use gang_testkit::{TestResult, scheduled_minimum};
+use gang_types::health::CLIENT_REROUTE_BOUND;
 use gang_types::{FleetSet, InstanceId, InstanceLifecycle, Isa};
 
 use crate::support::{Harness, X86, policy, policy_named, x86_resources};
@@ -102,6 +103,10 @@ fn steady_state_with(release_first_idle: bool) -> TestResult<Harness> {
     let mut primary = policy()?;
     primary.instances =
         InstanceBounds::try_new(0, primary.instances.max())?.with_schedule(vec![window])?;
+    // local-4's drain outlasts the simulation: the warm-up's settle, then one second for each
+    // warm-up and measured pass, and one more.
+    let passes = u64::try_from(WARM_UP_PASSES + MEASURED_PASSES + 1)?;
+    primary.max_drain_wait = settle_advance(&primary) + Duration::from_secs(passes);
     let mut h = Harness::with_fleets(vec![primary, policy_named("gang-spare", Isa::X86_64)?]);
     let long_ago = Duration::from_hours(1);
     for instance in ["local-1", "local-2", "local-3", "local-4"] {
@@ -128,16 +133,22 @@ fn steady_state_with(release_first_idle: bool) -> TestResult<Harness> {
     Ok(h)
 }
 
+/// How far the warm-up advances after the term's first pass: past `idle_timeout`, so `local-2` is
+/// a drain candidate, and past [`CLIENT_REROUTE_BOUND`], so drains are no longer held back.
+fn settle_advance(policy: &FleetPolicy) -> Duration {
+    (policy.idle_timeout + Duration::from_secs(1)).max(CLIENT_REROUTE_BOUND)
+}
+
 /// Runs the unmeasured warm-up passes.
 ///
-/// Advances the clock past `idle_timeout` first so `local-2` is a drain candidate during every
-/// measured pass; without it the measured passes never reach the drain-candidate path.
+/// The first pass starts the reconciler's term; the clock then advances by [`settle_advance`],
+/// so every measured pass reaches the drain path. Without it the measured passes never do.
 fn warm_up(world: &mut World) {
-    world
-        .clock
-        .advance(world.passes[X86].policy.idle_timeout + Duration::from_secs(1));
     world.counted_reconcile();
     assert!(world.plan.steps.is_empty(), "warm-up pass planned steps");
+    world
+        .clock
+        .advance(settle_advance(&world.passes[X86].policy));
     for _ in 0..WARM_UP_PASSES {
         world.quiet_pass();
     }

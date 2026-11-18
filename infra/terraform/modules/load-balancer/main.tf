@@ -36,8 +36,8 @@ resource "aws_vpc_security_group_ingress_rule" "client" {
 
   security_group_id = aws_security_group.this.id
   cidr_ipv4         = each.value
-  from_port         = 443
-  to_port           = 443
+  from_port         = var.port
+  to_port           = var.port
   ip_protocol       = "tcp"
   description       = "gang public endpoint"
 
@@ -73,12 +73,33 @@ resource "aws_vpc_security_group_ingress_rule" "controller" {
   })
 }
 
+resource "aws_vpc_security_group_egress_rule" "health" {
+  security_group_id            = aws_security_group.this.id
+  referenced_security_group_id = var.controller_security_group_id
+  from_port                    = var.health_port
+  to_port                      = var.health_port
+  ip_protocol                  = "tcp"
+  description                  = "gang controller health listener"
+  tags                         = merge(var.tags, { Name = "${var.name}-health-egress" })
+}
+
+resource "aws_vpc_security_group_ingress_rule" "controller_health" {
+  security_group_id            = var.controller_security_group_id
+  referenced_security_group_id = aws_security_group.this.id
+  from_port                    = var.health_port
+  to_port                      = var.health_port
+  ip_protocol                  = "tcp"
+  description                  = "gang health listener, public load balancer only"
+  tags                         = merge(var.tags, { Name = "${var.name}-health-ingress" })
+}
+
 resource "aws_lb" "this" {
-  name               = var.name
-  internal           = false
-  load_balancer_type = "network"
-  subnets            = [var.subnet_id]
-  security_groups    = [aws_security_group.this.id]
+  name                             = var.name
+  internal                         = false
+  load_balancer_type               = "network"
+  subnets                          = var.execution ? var.public_subnet_ids : [var.subnet_id]
+  enable_cross_zone_load_balancing = var.execution ? true : null
+  security_groups                  = [aws_security_group.this.id]
 
   tags = merge(var.tags, {
     Name = var.name
@@ -93,12 +114,28 @@ resource "aws_lb_target_group" "this" {
   vpc_id      = var.vpc_id
 
   # Gang's per-address rate limits see the client's address.
-  preserve_client_ip = "true"
+  preserve_client_ip     = "true"
+  deregistration_delay   = var.execution ? var.deregistration_delay : null
+  connection_termination = var.execution ? false : null
 
-  # A TCP check avoids spending rate-limit buckets on the only open HTTPS route.
+  dynamic "target_health_state" {
+    for_each = var.execution ? [1] : []
+    content {
+      enable_unhealthy_connection_termination = false
+    }
+  }
+
+  # Plaintext HTTP answers only from a live controller; /leader only from the leader.
+  # HTTPS health checks fail against Gang's TLS-1.3-only targets.
   health_check {
-    protocol = "TCP"
-    port     = "traffic-port"
+    protocol            = "HTTP"
+    port                = var.health_port
+    path                = local.health.serve_path
+    matcher             = "200"
+    interval            = local.health.interval_seconds
+    timeout             = local.health.timeout_seconds
+    healthy_threshold   = local.health.threshold
+    unhealthy_threshold = local.health.threshold
   }
 
   tags = merge(var.tags, {
@@ -107,6 +144,8 @@ resource "aws_lb_target_group" "this" {
 }
 
 resource "aws_lb_target_group_attachment" "this" {
+  count = var.execution ? 0 : 1
+
   target_group_arn = aws_lb_target_group.this.arn
   target_id        = var.controller_instance_id
   port             = var.port
@@ -116,7 +155,7 @@ resource "aws_lb_target_group_attachment" "this" {
 # matches the public listener's ALPN; Bazel's gRPC needs h2.
 resource "aws_lb_listener" "this" {
   load_balancer_arn = aws_lb.this.arn
-  port              = 443
+  port              = var.port
   protocol          = "TLS"
   certificate_arn   = aws_acm_certificate_validation.this.certificate_arn
   ssl_policy        = var.ssl_policy
@@ -133,6 +172,8 @@ resource "aws_lb_listener" "this" {
 }
 
 resource "aws_route53_zone" "this" {
+  count = var.private_zone_id == null ? 1 : 0
+
   name    = var.hostname
   comment = "Resolves the gang endpoint to the controller inside the VPC, so workers reach its own listener and verify the gang CA"
 
@@ -145,10 +186,266 @@ resource "aws_route53_zone" "this" {
   })
 }
 
+data "aws_route53_zone" "existing" {
+  count   = var.private_zone_id == null ? 0 : 1
+  zone_id = var.private_zone_id
+}
+
 resource "aws_route53_record" "controller" {
-  zone_id = aws_route53_zone.this.zone_id
+  zone_id = var.private_zone_id != null ? var.private_zone_id : aws_route53_zone.this[0].zone_id
   name    = var.hostname
   type    = "A"
-  ttl     = 60
-  records = [var.controller_private_ip]
+  ttl     = var.execution ? null : 60
+  records = var.execution ? null : [var.controller_private_ip]
+
+  lifecycle {
+    precondition {
+      # The provider always returns a boolean; OpenTofu's mock leaves this non-computed field null.
+      condition = var.private_zone_id == null ? true : (
+        data.aws_route53_zone.existing[0].private_zone != false && (
+          lower(trimsuffix(var.hostname, ".")) == lower(trimsuffix(data.aws_route53_zone.existing[0].name, ".")) ||
+          endswith(lower(trimsuffix(var.hostname, ".")), ".${lower(trimsuffix(data.aws_route53_zone.existing[0].name, "."))}")
+        )
+      )
+      error_message = "The private hosted zone must be private and authoritative for hostname or a parent domain."
+    }
+  }
+
+  dynamic "alias" {
+    for_each = var.execution ? [1] : []
+    content {
+      name                   = aws_lb.internal[0].dns_name
+      zone_id                = aws_lb.internal[0].zone_id
+      evaluate_target_health = true
+    }
+  }
+}
+
+moved {
+  from = aws_lb_target_group_attachment.this
+  to   = aws_lb_target_group_attachment.this[0]
+}
+
+moved {
+  from = aws_route53_zone.this
+  to   = aws_route53_zone.this[0]
+}
+
+locals {
+  health = jsondecode(file("${path.module}/health-check.json"))
+
+  internal_listeners = var.execution ? {
+    serve   = var.port
+    execute = var.execute_port
+    workers = var.workers_port
+  } : {}
+
+  internal_sources = var.execution ? {
+    for pair in setproduct(keys(local.internal_listeners), ["worker", "controller"]) :
+    "${pair[0]}-${pair[1]}" => {
+      port              = local.internal_listeners[pair[0]]
+      security_group_id = pair[1] == "worker" ? var.worker_security_group_id : var.controller_security_group_id
+    }
+  } : {}
+}
+
+resource "aws_vpc_security_group_ingress_rule" "client_execute" {
+  for_each = var.execution ? toset(var.client_ingress_cidrs) : toset([])
+
+  security_group_id = aws_security_group.this.id
+  cidr_ipv4         = each.value
+  from_port         = var.execute_port
+  to_port           = var.execute_port
+  ip_protocol       = "tcp"
+  description       = "gang public execution endpoint"
+  tags              = merge(var.tags, { Name = "${var.name}-execute-${each.value}" })
+}
+
+resource "aws_vpc_security_group_egress_rule" "execute" {
+  count = var.execution ? 1 : 0
+
+  security_group_id            = aws_security_group.this.id
+  referenced_security_group_id = var.controller_security_group_id
+  from_port                    = var.execute_port
+  to_port                      = var.execute_port
+  ip_protocol                  = "tcp"
+  tags                         = merge(var.tags, { Name = "${var.name}-execute-egress" })
+}
+
+resource "aws_vpc_security_group_ingress_rule" "controller_execute" {
+  count = var.execution ? 1 : 0
+
+  security_group_id            = var.controller_security_group_id
+  referenced_security_group_id = aws_security_group.this.id
+  from_port                    = var.execute_port
+  to_port                      = var.execute_port
+  ip_protocol                  = "tcp"
+  tags                         = merge(var.tags, { Name = "${var.name}-execute-ingress" })
+}
+
+resource "aws_lb_target_group" "execute" {
+  count = var.execution ? 1 : 0
+
+  name                   = "${substr(var.name, 0, 24)}-execute"
+  port                   = var.execute_port
+  protocol               = "TLS"
+  target_type            = "instance"
+  vpc_id                 = var.vpc_id
+  preserve_client_ip     = "true"
+  deregistration_delay   = var.deregistration_delay
+  connection_termination = false
+
+  target_health_state {
+    enable_unhealthy_connection_termination = false
+  }
+
+  health_check {
+    protocol            = "HTTP"
+    port                = var.health_port
+    path                = local.health.leader_path
+    matcher             = "200"
+    interval            = local.health.interval_seconds
+    timeout             = local.health.timeout_seconds
+    healthy_threshold   = local.health.threshold
+    unhealthy_threshold = local.health.threshold
+  }
+
+  tags = merge(var.tags, { Name = "${var.name}-execute" })
+}
+
+resource "aws_lb_listener" "execute" {
+  count = var.execution ? 1 : 0
+
+  load_balancer_arn = aws_lb.this.arn
+  port              = var.execute_port
+  protocol          = "TLS"
+  certificate_arn   = aws_acm_certificate_validation.this.certificate_arn
+  ssl_policy        = var.ssl_policy
+  alpn_policy       = "HTTP2Preferred"
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.execute[0].arn
+  }
+  tags = merge(var.tags, { Name = "${var.name}-execute" })
+}
+
+resource "aws_security_group" "internal" {
+  count = var.execution ? 1 : 0
+
+  name        = "${var.name}-internal"
+  description = "gang internal load balancer"
+  vpc_id      = var.vpc_id
+  tags        = merge(var.tags, { Name = "${var.name}-internal" })
+}
+
+resource "aws_vpc_security_group_ingress_rule" "internal" {
+  for_each = local.internal_sources
+
+  security_group_id            = aws_security_group.internal[0].id
+  referenced_security_group_id = each.value.security_group_id
+  from_port                    = each.value.port
+  to_port                      = each.value.port
+  ip_protocol                  = "tcp"
+  tags                         = merge(var.tags, { Name = "${var.name}-internal-${each.key}" })
+}
+
+resource "aws_vpc_security_group_egress_rule" "internal" {
+  for_each = local.internal_listeners
+
+  security_group_id            = aws_security_group.internal[0].id
+  referenced_security_group_id = var.controller_security_group_id
+  from_port                    = each.value
+  to_port                      = each.value
+  ip_protocol                  = "tcp"
+  tags                         = merge(var.tags, { Name = "${var.name}-internal-${each.key}-egress" })
+}
+
+resource "aws_vpc_security_group_ingress_rule" "controller_internal" {
+  for_each = local.internal_listeners
+
+  security_group_id            = var.controller_security_group_id
+  referenced_security_group_id = aws_security_group.internal[0].id
+  from_port                    = each.value
+  to_port                      = each.value
+  ip_protocol                  = "tcp"
+  tags                         = merge(var.tags, { Name = "${var.name}-controller-internal-${each.key}" })
+}
+
+resource "aws_vpc_security_group_egress_rule" "internal_health" {
+  count = var.execution ? 1 : 0
+
+  security_group_id            = aws_security_group.internal[0].id
+  referenced_security_group_id = var.controller_security_group_id
+  from_port                    = var.health_port
+  to_port                      = var.health_port
+  ip_protocol                  = "tcp"
+  description                  = "gang controller health listener"
+  tags                         = merge(var.tags, { Name = "${var.name}-internal-health-egress" })
+}
+
+resource "aws_vpc_security_group_ingress_rule" "controller_internal_health" {
+  count = var.execution ? 1 : 0
+
+  security_group_id            = var.controller_security_group_id
+  referenced_security_group_id = aws_security_group.internal[0].id
+  from_port                    = var.health_port
+  to_port                      = var.health_port
+  ip_protocol                  = "tcp"
+  description                  = "gang health listener, internal load balancer only"
+  tags                         = merge(var.tags, { Name = "${var.name}-internal-health-ingress" })
+}
+
+resource "aws_lb" "internal" {
+  count = var.execution ? 1 : 0
+
+  name                             = "${substr(var.name, 0, 23)}-internal"
+  internal                         = true
+  load_balancer_type               = "network"
+  subnets                          = var.private_subnet_ids
+  security_groups                  = [aws_security_group.internal[0].id]
+  enable_cross_zone_load_balancing = true
+  tags                             = merge(var.tags, { Name = "${var.name}-internal" })
+}
+
+resource "aws_lb_target_group" "internal" {
+  for_each = local.internal_listeners
+
+  name                   = "${substr(var.name, 0, 22)}-i-${each.key}"
+  port                   = each.value
+  protocol               = "TCP"
+  target_type            = "instance"
+  vpc_id                 = var.vpc_id
+  preserve_client_ip     = each.key == "execute" ? "false" : "true"
+  deregistration_delay   = var.deregistration_delay
+  connection_termination = false
+
+  target_health_state {
+    enable_unhealthy_connection_termination = false
+  }
+
+  health_check {
+    protocol            = "HTTP"
+    port                = var.health_port
+    path                = each.key == "serve" ? local.health.serve_path : local.health.leader_path
+    matcher             = "200"
+    interval            = local.health.interval_seconds
+    timeout             = local.health.timeout_seconds
+    healthy_threshold   = local.health.threshold
+    unhealthy_threshold = local.health.threshold
+  }
+
+  tags = merge(var.tags, { Name = "${var.name}-internal-${each.key}" })
+}
+
+resource "aws_lb_listener" "internal" {
+  for_each = local.internal_listeners
+
+  load_balancer_arn = aws_lb.internal[0].arn
+  port              = each.value
+  protocol          = "TCP"
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.internal[each.key].arn
+  }
+  tags = merge(var.tags, { Name = "${var.name}-internal-${each.key}" })
 }

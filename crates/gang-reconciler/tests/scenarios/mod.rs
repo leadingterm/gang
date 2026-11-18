@@ -6,6 +6,7 @@ use gang_config::{FleetPolicy, InstanceBounds, Weekday};
 use gang_reconciler::{Action, NeedCause, PlanStep, TerminationCause};
 use gang_spi::{ScalingAuditEvent, ScalingEventKind};
 use gang_testkit::{TestResult, scheduled_minimum, worker_id};
+use gang_types::health::CLIENT_REROUTE_BOUND;
 use gang_types::{FleetName, FleetSet, InstanceId, InstanceLifecycle, Isa, ScalingCause, WorkerId};
 
 use crate::support::*;
@@ -215,6 +216,7 @@ fn a_window_keeps_an_idle_worker_until_it_closes() -> TestResult {
 #[test]
 fn a_window_drains_only_the_workers_above_it() -> TestResult {
     let mut h = scheduled_harness("2026-11-16T16:00:00Z")?;
+    h.settle_term()?;
     serve(&mut h, "local-1", secs(60))?;
     assert_eq!(h.reconcile(), Vec::new());
     h.advance(secs(5));
@@ -558,6 +560,7 @@ fn failed_launch_resumes_a_finished_drain_before_terminating_it() -> TestResult 
 #[test]
 fn failed_launch_is_withdrawn_before_surplus_workers_are_drained() -> TestResult {
     let mut h = failed_launch_fleet()?;
+    h.settle_term()?;
     h.set_running("local-1", 0)?;
     h.set_running("local-2", 0)?;
     // Observe the idle workers before their timeout starts.
@@ -605,6 +608,7 @@ fn lowering_desired_keeps_live_instances_but_not_terminating_instances() -> Test
 #[test]
 fn failed_scale_out_then_disappearing_demand_reaches_zero() -> TestResult {
     let mut h = Harness::new()?;
+    h.settle_term()?;
     for name in ["local-1", "local-2"] {
         serve(&mut h, name, secs(3600))?;
         h.set_running(name, 4)?;
@@ -877,6 +881,7 @@ fn an_instance_drains_only_when_all_its_workers_drain() -> TestResult {
 #[test]
 fn an_idle_instance_with_two_connections_drains_its_newest_worker() -> TestResult {
     let mut h = Harness::new()?;
+    h.settle_term()?;
     serve(&mut h, "local-1", secs(3600))?;
     assert_eq!(h.reconcile(), Vec::new());
     h.advance(secs(1));
@@ -900,6 +905,7 @@ fn an_idle_instance_with_two_connections_drains_its_newest_worker() -> TestResul
 #[test]
 fn idle_worker_drains_after_idle_timeout_then_terminates_once_drained() -> TestResult {
     let mut h = Harness::new()?;
+    h.settle_term()?;
     serve(&mut h, "local-1", secs(60))?;
     assert_eq!(h.run(), Vec::new());
     h.advance(secs(14));
@@ -928,9 +934,57 @@ fn idle_worker_drains_after_idle_timeout_then_terminates_once_drained() -> TestR
     Ok(())
 }
 
+/// A new leader cannot see the demand queued on the leader it replaced until that leader's
+/// clients detect the loss through their keepalive and resubmit. Until then it drains no idle
+/// worker as surplus, even one idle for longer than `idle_timeout`, so the capacity its
+/// predecessor raised for that demand still serves it once it arrives.
+#[test]
+fn a_new_leader_drains_no_idle_worker_before_lost_demand_can_reroute() -> TestResult {
+    let mut policy = policy()?;
+    policy.instances = InstanceBounds::try_new(1, NonZeroU32::MIN.saturating_add(1))?;
+    let demand = 2 * usize::try_from(policy.target_actions_per_instance.get())?;
+    assert!(policy.idle_timeout < CLIENT_REROUTE_BOUND);
+    let mut h = Harness::with_policy(policy);
+    // The previous leader scaled out to two for queued demand; the second instance is not listed.
+    serve(&mut h, "local-1", secs(3600))?;
+    h.set_desired_capacity(X86, 2);
+
+    assert_eq!(h.run(), Vec::new());
+    h.advance(CLIENT_REROUTE_BOUND.saturating_sub(Duration::from_millis(1)));
+    assert_eq!(h.run(), Vec::new());
+    h.queue(X86, demand)?;
+    assert_eq!(h.run(), Vec::new());
+    assert_eq!(h.supply(X86)?.desired, 2);
+    Ok(())
+}
+
+/// A restarted reconciler leads a new term: it again starts no drain until the demand of the
+/// leader it replaced can have rerouted, then drains an idle surplus worker as usual.
+#[test]
+fn a_new_term_drains_an_idle_worker_only_once_lost_demand_can_have_rerouted() -> TestResult {
+    let mut h = Harness::new()?;
+    h.settle_term()?;
+    serve(&mut h, "local-1", secs(60))?;
+    assert_eq!(h.reconcile(), Vec::new());
+    h.restart();
+    assert_eq!(h.reconcile(), Vec::new());
+    h.advance(CLIENT_REROUTE_BOUND.saturating_sub(Duration::from_millis(1)));
+    assert_eq!(h.reconcile(), Vec::new());
+    h.advance(Duration::from_millis(1));
+    assert_eq!(
+        h.reconcile(),
+        vec![PlanStep {
+            fleet: X86,
+            action: Action::StartDrain(worker_id("local-1")?),
+        }]
+    );
+    Ok(())
+}
+
 #[test]
 fn busy_worker_resets_its_idle_timer() -> TestResult {
     let mut h = Harness::new()?;
+    h.settle_term()?;
     serve(&mut h, "local-1", secs(60))?;
     assert_eq!(h.reconcile(), Vec::new());
     h.advance(secs(10));
@@ -1058,16 +1112,16 @@ fn restart_mid_drain_restarts_the_drain_wait() -> TestResult {
 
 #[test]
 fn restart_restarts_idle_timers() -> TestResult {
-    let mut h = Harness::new()?;
+    let mut h = Harness::with_policy(ten_minute_policy()?);
     serve(&mut h, "local-1", Duration::ZERO)?;
     assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(14));
+    h.advance(secs(9 * 60));
     assert_eq!(h.reconcile(), Vec::new());
     h.restart();
     assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(14));
+    h.advance(secs(9 * 60));
     assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(1));
+    h.advance(secs(60));
     assert_eq!(
         h.reconcile(),
         vec![PlanStep {
@@ -1081,6 +1135,7 @@ fn restart_restarts_idle_timers() -> TestResult {
 #[test]
 fn worker_that_disconnects_restarts_its_idle_timer() -> TestResult {
     let mut h = Harness::new()?;
+    h.settle_term()?;
     serve(&mut h, "local-1", Duration::ZERO)?;
     assert_eq!(h.reconcile(), Vec::new());
     h.advance(secs(14));
@@ -1421,6 +1476,7 @@ fn drains_longest_idle_first_up_to_the_excess() -> TestResult {
     let mut policy: FleetPolicy = policy()?;
     policy.instances = InstanceBounds::try_new(1, policy.instances.max())?;
     let mut h = Harness::with_policy(policy);
+    h.settle_term()?;
     serve(&mut h, "local-1", Duration::ZERO)?;
     assert_eq!(h.reconcile(), Vec::new());
     h.advance(secs(5));
@@ -1449,6 +1505,7 @@ fn drains_longest_idle_first_up_to_the_excess() -> TestResult {
 #[test]
 fn surplus_drain_ties_break_by_worker_id() -> TestResult {
     let mut h = Harness::new()?;
+    h.settle_term()?;
     serve(&mut h, "local-3", Duration::ZERO)?;
     serve(&mut h, "local-1", Duration::ZERO)?;
     h.queue(X86, 1)?;
@@ -1512,6 +1569,7 @@ fn audit_events_record_scale_out() -> TestResult {
 #[test]
 fn audit_events_record_drain_start() -> TestResult {
     let mut h = Harness::new()?;
+    h.settle_term()?;
     serve(&mut h, "local-1", secs(60))?;
     assert_eq!(h.reconcile(), Vec::new());
     h.advance(secs(15));
@@ -1678,6 +1736,7 @@ fn running_actions_count_on_their_own_fleet_only() -> TestResult {
 #[test]
 fn fleets_with_the_same_isa_are_reconciled_independently() -> TestResult {
     let mut h = Harness::with_fleets(vec![policy()?, policy_named("gang-x86-b", Isa::X86_64)?]);
+    h.settle_term()?;
     serve(&mut h, "local-1", secs(60))?;
     serve_in(&mut h, ONDEMAND, "local-2", secs(60))?;
     h.set_running("local-2", 1)?;

@@ -1,9 +1,7 @@
 //! The contract suite for [`StateRepositoryPort`].
 //!
-//! Every case takes a fresh repository and checks one behaviour the port promises. The
-//! `repository_contract!` macro turns each case into a `#[tokio::test]`, so one suite runs
-//! against every backend. The expected values follow the SQLite backend, which is the reference
-//! behaviour where backends differ.
+//! Every case takes a fresh repository and checks one behaviour the port promises.
+//! The `database_contract!` macro runs these cases against every database backend.
 
 use std::num::NonZeroUsize;
 
@@ -12,7 +10,7 @@ use gang_spi::{
     CertStatus, IssuedCertRecord, PortError, PrincipalRecord, RecordedScalingEvent,
     ScalingAuditEvent, ScalingEventKind, ScalingEventSeq, StateRepositoryPort, Subject,
 };
-use gang_types::{CertSerial, FleetName, Identity, Principal, ProviderName, WorkerId};
+use gang_types::{CertSerial, FleetName, Identity, InstanceId, Principal, ProviderName, WorkerId};
 
 use crate::TestResult;
 
@@ -277,12 +275,18 @@ pub async fn launch_failure_and_withdrawal_round_trip<R: StateRepositoryPort>(
     failed.kind = ScalingEventKind::LaunchFailed {
         from: 2,
         to: 7,
-        reason: "  quota exceeded: café\nretry later  ".to_owned(),
+        reason: "  quota\0exceeded: café\nretry later  ".to_owned(),
     };
     let mut withdrawn = event("w2")?;
     withdrawn.kind = ScalingEventKind::Withdrawn { from: 7, to: 2 };
+    let mut exited = event("w3")?;
+    exited.kind = ScalingEventKind::ExitedEarly {
+        instance: InstanceId::try_new("i-failed")?,
+        failure: "exit\0failure: café\n".to_owned(),
+    };
     let failed_seq = repository.record_scaling_event(&failed).await?;
     let withdrawn_seq = repository.record_scaling_event(&withdrawn).await?;
+    let exited_seq = repository.record_scaling_event(&exited).await?;
     let mut into = Vec::new();
     let more = repository
         .scaling_events(ScalingEventSeq::default(), None, limit(10)?, &mut into)
@@ -298,6 +302,10 @@ pub async fn launch_failure_and_withdrawal_round_trip<R: StateRepositoryPort>(
             RecordedScalingEvent {
                 seq: withdrawn_seq,
                 event: withdrawn,
+            },
+            RecordedScalingEvent {
+                seq: exited_seq,
+                event: exited,
             },
         ]
     );
@@ -351,6 +359,21 @@ pub async fn scaling_window_returns_the_newest_events_and_reports_skipped<
         into,
         vec![recorded(1, "w2")?, recorded(2, "w3")?, recorded(3, "w4")?]
     );
+
+    let more = repository
+        .scaling_events(seqs[1], Some(seqs[2]), limit(2)?, &mut into)
+        .await?;
+    assert!(!more);
+    assert!(
+        into.is_empty(),
+        "adjacent exclusive bounds yield an empty window"
+    );
+
+    let more = repository
+        .scaling_events(seqs[3], Some(seqs[1]), limit(2)?, &mut into)
+        .await?;
+    assert!(!more);
+    assert!(into.is_empty(), "inverted bounds yield an empty window");
 
     let more = repository
         .scaling_events(seqs[4], None, limit(3)?, &mut into)
@@ -520,54 +543,136 @@ pub async fn revoked_principals_are_ordered_by_revocation_time<R: StateRepositor
     Ok(())
 }
 
-/// Runs every contract case against the repository that `$fresh` builds, one `#[tokio::test]`
-/// per case. `$fresh` is an expression evaluating to a closure that returns a future of
-/// `Result<R, E>`, where `R: StateRepositoryPort` and `E: Into<Box<dyn std::error::Error>>`.
-/// Each test calls the closure once, for its own fresh repository.
-#[macro_export]
-macro_rules! repository_contract {
-    (@case $fresh:expr, $case:ident) => {
-        #[tokio::test]
-        async fn $case() -> $crate::TestResult {
-            let repository = ($fresh)()
-                .await
-                .map_err(Into::<Box<dyn std::error::Error>>::into)?;
-            $crate::repository_contract::$case(&repository).await
-        }
-    };
-    ($fresh:expr) => {
-        $crate::repository_contract!(@case $fresh, recorded_certificate_is_found_by_serial);
-        $crate::repository_contract!(
-            @case $fresh,
-            duplicate_record_issued_is_a_backend_error_and_keeps_one_record
-        );
-        $crate::repository_contract!(@case $fresh, revoke_keeps_the_first_revocation_time);
-        $crate::repository_contract!(
-            @case $fresh,
-            revoked_is_ordered_by_revocation_time_then_serial
-        );
-        $crate::repository_contract!(
-            @case $fresh,
-            certificates_of_lists_active_records_by_issue_time_then_serial
-        );
-        $crate::repository_contract!(@case $fresh, scaling_events_get_increasing_sequence_numbers);
-        $crate::repository_contract!(@case $fresh, launch_failure_and_withdrawal_round_trip);
-        $crate::repository_contract!(
-            @case $fresh,
-            scaling_window_returns_the_newest_events_and_reports_skipped
-        );
-        $crate::repository_contract!(
-            @case $fresh,
-            observe_principal_keeps_first_seen_and_raises_last_seen
-        );
-        $crate::repository_contract!(
-            @case $fresh,
-            revoke_principal_twice_keeps_the_first_revocation_time_and_restore_clears_it
-        );
-        $crate::repository_contract!(
-            @case $fresh,
-            principals_page_with_after_and_the_more_flag_and_only_revoked
-        );
-        $crate::repository_contract!(@case $fresh, revoked_principals_are_ordered_by_revocation_time);
-    };
+/// Certificate pages include revoked records in serial order and resume strictly after a cursor.
+///
+/// # Errors
+/// Returns a repository or fixture error.
+///
+/// # Panics
+/// Panics if the listing, cursor or `more` flag differs from the contract.
+pub async fn certificates_page_by_serial<R: StateRepositoryPort>(repository: &R) -> TestResult {
+    let a = record(1, "github", "alice", 1)?;
+    let b = record(2, "github", "bob", 2)?;
+    let c = record(3, "github", "carol", 3)?;
+    let mut page = vec![a.clone()];
+    assert!(!repository.certificates(None, limit(2)?, &mut page).await?);
+    assert!(page.is_empty());
+    for issued in [&c, &a, &b] {
+        repository.record_issued(issued).await?;
+    }
+    repository.revoke(&b.serial, ts(4)).await?;
+    assert!(repository.certificates(None, limit(2)?, &mut page).await?);
+    assert_eq!(page, vec![a.clone(), revoked_at(&b, 4)]);
+    assert!(
+        !repository
+            .certificates(Some(&b.serial), limit(1)?, &mut page)
+            .await?
+    );
+    assert_eq!(page, vec![c.clone()]);
+    assert!(
+        !repository
+            .certificates(Some(&c.serial), limit(1)?, &mut page)
+            .await?
+    );
+    assert!(page.is_empty());
+    Ok(())
+}
+
+/// Revocation mutations advance the epoch once, including repeated mutations.
+///
+/// # Errors
+/// Returns a repository or fixture error.
+///
+/// # Panics
+/// Panics if the epoch changes by an incorrect amount.
+pub async fn revocation_epoch_advances_on_mutations<R: StateRepositoryPort>(
+    repository: &R,
+) -> TestResult {
+    let cert = record(1, "github", "alice", 1)?;
+    let who = identity("github", "alice")?;
+    assert_eq!(repository.revocation_epoch().await?.get(), 0);
+    repository.record_issued(&cert).await?;
+    assert_eq!(repository.revocation_epoch().await?.get(), 0);
+    repository.revoke(&cert.serial, ts(2)).await?;
+    assert_eq!(repository.revocation_epoch().await?.get(), 1);
+    repository.revoke(&cert.serial, ts(3)).await?;
+    assert_eq!(repository.revocation_epoch().await?.get(), 2);
+    repository.revoke_principal(&who, ts(4)).await?;
+    assert_eq!(repository.revocation_epoch().await?.get(), 3);
+    repository.revoke_principal(&who, ts(5)).await?;
+    assert_eq!(repository.revocation_epoch().await?.get(), 4);
+    repository.restore_principal(&who).await?;
+    assert_eq!(repository.revocation_epoch().await?.get(), 5);
+    repository.restore_principal(&who).await?;
+    assert_eq!(repository.revocation_epoch().await?.get(), 6);
+    repository.observe_principal(&who, ts(6)).await?;
+    assert_eq!(repository.revocation_epoch().await?.get(), 6);
+    repository.record_scaling_event(&event("worker")?).await?;
+    assert_eq!(repository.revocation_epoch().await?.get(), 6);
+    Ok(())
+}
+
+/// A completed certificate revocation exposes both the epoch and the revoked record.
+///
+/// # Errors
+/// Returns a repository or fixture error.
+///
+/// # Panics
+/// Panics if either change is missing after the revocation.
+pub async fn revocation_epoch_and_record_are_visible<R: StateRepositoryPort>(
+    repository: &R,
+) -> TestResult {
+    let cert = record(1, "github", "alice", 1)?;
+    repository.record_issued(&cert).await?;
+    assert_eq!(repository.revocation_epoch().await?.get(), 0);
+    assert!(repository.revoked().await?.is_empty());
+    repository.revoke(&cert.serial, ts(2)).await?;
+    assert_eq!(repository.revocation_epoch().await?.get(), 1);
+    assert_eq!(repository.revoked().await?, vec![revoked_at(&cert, 2)]);
+    Ok(())
+}
+
+/// Concurrent audit inserts have distinct sequences and are all listed in sequence order.
+///
+/// # Errors
+/// Returns a repository or fixture error.
+///
+/// # Panics
+/// Panics if any event is missing, duplicated or listed out of order.
+pub async fn concurrent_scaling_events_are_ordered<R: StateRepositoryPort>(
+    repository: &R,
+) -> TestResult {
+    let a = event("w1")?;
+    let b = event("w2")?;
+    let c = event("w3")?;
+    let (a_seq, b_seq, c_seq) = tokio::join!(
+        repository.record_scaling_event(&a),
+        repository.record_scaling_event(&b),
+        repository.record_scaling_event(&c)
+    );
+    let mut expected = vec![
+        RecordedScalingEvent {
+            seq: a_seq?,
+            event: a,
+        },
+        RecordedScalingEvent {
+            seq: b_seq?,
+            event: b,
+        },
+        RecordedScalingEvent {
+            seq: c_seq?,
+            event: c,
+        },
+    ];
+    expected.sort_by_key(|item| item.seq);
+    assert!(expected[0].seq < expected[1].seq);
+    assert!(expected[1].seq < expected[2].seq);
+    let mut actual = Vec::new();
+    assert!(
+        !repository
+            .scaling_events(ScalingEventSeq::default(), None, limit(4)?, &mut actual)
+            .await?
+    );
+    assert_eq!(actual, expected);
+    Ok(())
 }

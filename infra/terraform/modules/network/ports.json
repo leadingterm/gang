@@ -1,0 +1,6 @@
+{
+  "public": 443,
+  "execution": 8443,
+  "worker": 9090,
+  "health": 8080
+}

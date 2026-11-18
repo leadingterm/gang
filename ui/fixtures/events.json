@@ -17,18 +17,27 @@
       }
     },
     {
-      "name": "events/999",
+      "name": "events/1000",
       "createTime": "2026-01-14T10:07:50.000Z",
-      "fleet": "fleets/build-worker-aarch64-spot",
+      "fleet": "fleets/build-worker-aarch64-graviton4-spot-xl",
       "cause": "ORPHAN",
       "terminated": {
         "instance": "instances/i-0e1000000000000b"
       }
     },
     {
+      "name": "events/999",
+      "createTime": "2026-01-14T09:39:55.000Z",
+      "fleet": "fleets/amd64-spot",
+      "exitedEarly": {
+        "instance": "instances/linux-x86-64-builder-node-production-worker-instance-0000000001",
+        "failure": "The worker exited before it could register with the remote execution service."
+      }
+    },
+    {
       "name": "events/998",
       "createTime": "2026-01-14T09:09:30.000Z",
-      "fleet": "fleets/build-worker-aarch64-spot",
+      "fleet": "fleets/build-worker-aarch64-graviton4-spot-xl",
       "cause": "DEMAND",
       "scaledOut": {
         "from": 0,
@@ -63,5 +72,6 @@
         "to": 6
       }
     }
-  ]
+  ],
+  "nextPageToken": "earlier"
 }

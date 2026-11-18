@@ -4,9 +4,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use gang_aws::{
-    AwsConfig, AwsFleetOptions, ClientSettings, CooldownPolicy, ExpiryAge, KmsSignerConfig,
-    RetrySpotAfter, S3CacheConfig, SpotFallback, WorkloadTokenAlgorithm,
+    AwsConfig, AwsFleetOptions, CooldownPolicy, ExpiryAge, KmsSignerConfig, RetrySpotAfter,
+    S3CacheConfig, SpotFallback, WorkloadTokenAlgorithm,
 };
+use gang_aws_sdk::ClientSettings;
 use gang_types::Bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -339,6 +340,8 @@ fn s3_defaults_apply_when_optional_keys_are_absent() -> TestResult {
     let config = s3(json!({}))?;
     assert_eq!(config.region.as_str(), REGION);
     assert_eq!(config.bucket.as_str(), BUCKET);
+    assert!(config.endpoint.is_none());
+    assert!(!config.force_path_style);
     assert_eq!(config.key_prefix.as_str(), "");
     assert_eq!(config.tuning.max_retries, 6);
     assert_eq!(config.tuning.retry_delay.get(), Duration::from_millis(300));
@@ -346,6 +349,23 @@ fn s3_defaults_apply_when_optional_keys_are_absent() -> TestResult {
     assert_eq!(config.tuning.multipart_max_concurrent_uploads.get(), 10);
     assert_eq!(config.tuning.retry_buffer_per_request.get(), Bytes::mib(5));
     assert!(config.tuning.consider_expired_after.is_none());
+    Ok(())
+}
+
+#[test]
+fn s3_endpoint_and_path_style_parse() -> TestResult {
+    let config = s3(json!({
+        "endpoint": "http://127.0.0.1:9000/",
+        "force_path_style": true,
+    }))?;
+    assert_eq!(
+        config.endpoint.as_ref().map(gang_types::Url::as_str),
+        Some("http://127.0.0.1:9000/")
+    );
+    assert!(config.force_path_style);
+    assert!(s3(json!({"endpoint": "https://example.com"})).is_ok());
+    assert!(s3(json!({"endpoint": "not a url"})).is_err());
+    assert!(s3(json!({"endpoint": "ftp://example.com"})).is_err());
     Ok(())
 }
 

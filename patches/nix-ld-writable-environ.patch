@@ -1,0 +1,25 @@
+The default LD_LIBRARY_PATH trampoline restores a read-only environment string,
+which causes programs that modify their environment, such as gawk, to abort.
+
+Upstream issue/PR draft (not filed): Default LD_LIBRARY_PATH trampoline restores
+a read-only environment string (gawk aborts). Remove this patch when pinned
+upstream supplies a writable replacement environment string.
+
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -42,3 +42,4 @@
+ const DEFAULT_NIX_LD_LIBRARY_PATH: &[u8] = b"/run/current-system/sw/share/nix-ld/lib";
+-const EMPTY_LD_LIBRARY_PATH_ENV: &CStr = c"LD_LIBRARY_PATH=";
++// execve environment strings must be writable by the program.
++static mut EMPTY_LD_LIBRARY_PATH_ENV: [u8; 17] = *b"LD_LIBRARY_PATH=\0";
+ 
+@@ -173,7 +174,7 @@
+         EnvEdit {
+             entry: ptr::null(),
+-            old_string: EMPTY_LD_LIBRARY_PATH_ENV.as_ptr().cast(),
++            old_string: (&raw mut EMPTY_LD_LIBRARY_PATH_ENV).cast_const().cast(),
+         }
+     };
+ 
+     let pagesz = args

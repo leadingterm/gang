@@ -169,7 +169,7 @@ fn server_step<R: BufRead>(
 ) -> Result<ServerStep> {
     heading(out, 1, "server");
     let home = ClientHome::resolve(|key| std::env::var_os(key))?;
-    let stored = stored_login(&home)?;
+    let stored = runtime::block_on(stored_login(&home))?;
     let server = if let Some(server) = args.server.take() {
         server
     } else if mode.prompts() {

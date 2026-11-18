@@ -350,6 +350,8 @@ fn check_security(insecure: bool, config: &GangConfig<Plugins>) -> Result<(), Lo
             config.worker_listen,
             config.endpoint.as_ref(),
             &config.scheduler,
+            config.execution_listen,
+            config.execution_endpoint.as_ref(),
         );
     }
     match config.server.transport.kind() {
@@ -1407,6 +1409,28 @@ mod tests {
     fn plaintext_configuration_with_insecure_passes_the_loopback_check() {
         let config = plaintext_configuration();
         check_security(true, &config).expect("a loopback plaintext configuration passes");
+    }
+
+    #[test]
+    fn insecure_refuses_a_public_execution_listener() -> gang_testkit::TestResult {
+        let mut config = plaintext_configuration();
+        config.execution_listen = Some("0.0.0.0:8443".parse()?);
+        assert!(matches!(
+            check_security(true, &config),
+            Err(LocalCommandError::InsecureNeedsLoopback { what, .. }) if what == "execution_listen"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn insecure_refuses_a_public_execution_endpoint() -> gang_testkit::TestResult {
+        let mut config = plaintext_configuration();
+        config.execution_endpoint = Some("https://example.com:8443".parse()?);
+        assert!(matches!(
+            check_security(true, &config),
+            Err(LocalCommandError::InsecureNeedsLoopback { what, .. }) if what == "execution_endpoint"
+        ));
+        Ok(())
     }
 
     #[test]

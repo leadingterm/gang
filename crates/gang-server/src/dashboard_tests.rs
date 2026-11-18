@@ -113,6 +113,54 @@ async fn the_state_starts_skipped_with_the_newest_events_oldest_first() {
 }
 
 #[tokio::test]
+async fn forwarding_publishes_the_current_revocation_epoch() -> gang_testkit::TestResult {
+    let repository = FakeRepository::default();
+    let clock = start_clock();
+    let dashboard = Dashboard::start(
+        DashboardConfig::default(),
+        "test".to_owned(),
+        Duration::from_secs(1),
+        0,
+        &clock,
+        &repository,
+    )
+    .await?;
+    let revoked = crate::principals::RevokedPrincipals::new();
+    revoked.revoke(gang_types::Identity::new(
+        ProviderName::try_new("example-idp")?,
+        gang_types::Principal::try_new("alice")?,
+    ));
+    let forward = dashboard.forward_principals(&revoked);
+    tokio::pin!(forward);
+    assert!(futures::poll!(forward.as_mut()).is_pending());
+    let state: State = serde_json::from_slice(&dashboard.api().hub.state_json()?)?;
+    assert_eq!(state.principals_epoch, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn promotion_reloads_events_written_while_following() -> gang_testkit::TestResult {
+    let repository = FakeRepository::default();
+    let clock = start_clock();
+    let dashboard = Dashboard::start(
+        DashboardConfig::default(),
+        "test".to_owned(),
+        Duration::from_secs(1),
+        0,
+        &clock,
+        &repository,
+    )
+    .await?;
+    repository.record_scaling_event(&scaled_out(1_000)).await?;
+    dashboard.reload_from(&repository).await?;
+    dashboard.reload_from(&repository).await?;
+    let state: State = serde_json::from_slice(&dashboard.api().hub.state_json()?)?;
+    assert_eq!(state.events.len(), 1);
+    assert_eq!(state.events[0].name, "events/1");
+    Ok(())
+}
+
+#[tokio::test]
 async fn prepare_refuses_when_the_scaling_events_cannot_be_read() {
     let (parts, _dials, handles) = tls_parts();
     handles.repository.fail_scaling_reads(true);
@@ -269,7 +317,6 @@ async fn server_info_never_contains_the_dashboard_client_secret() {
                 secret: ClientSecret::new(SECRET),
             },
             ttl: NonZeroDuration::from_mins(10),
-            max_pending: NonZeroUsize::new(8).expect("8 is non-zero"),
             session_max_age: SessionMaxAge::from_units(43_200),
             renewal_reuse: NonZeroDuration::from_mins(1),
             device: None,

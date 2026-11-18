@@ -57,13 +57,24 @@ pub trait SchedulerPort: Send + Sync {
     fn endpoints(&self) -> ControllerEndpoints;
 
     /// Builds the controller's stores, scheduler, and services, and serves the connections it is
-    /// handed on `connections`: the client services and `api` on every public connection, which
-    /// may speak HTTP/1.1 or HTTP/2 (auto-detected), and the worker services on every worker
-    /// connection, which speak HTTP/2 only. Each request first passes its listener's gate. It
-    /// runs until both streams have ended or the returned future is dropped; dropping it closes
-    /// every connection it serves. Listening, TLS, and authentication belong to the caller.
+    /// handed on `connections`: the cache services (CAS, action cache, `ByteStream`, Capabilities)
+    /// and `api` on every public connection, which may speak HTTP/1.1 or HTTP/2 (auto-detected);
+    /// the execution services, Capabilities and `api` on every execution connection; and the
+    /// worker services on every worker connection, which speak HTTP/2 only. Without an execution
+    /// listener, the public connections carry the execution services too. Each request first
+    /// passes its listener's gate. Listening, TLS, and authentication belong to the caller; a
+    /// caller that does not lead yet feeds the execution and worker streams later.
     /// It sends `ready` once the controller is built and before it serves the first connection;
     /// a run that fails before that drops `ready` unsent.
+    ///
+    /// Once every connection stream has ended, the controller hands off: it assigns no new
+    /// action to any worker, ends with `UNAVAILABLE` every client operation stream whose action
+    /// is not executing (so the client submits it again elsewhere), asks every client
+    /// connection to go away once its streams finish, and releases each worker the moment it
+    /// runs nothing (the worker reconnects). Worker connections are never asked to go away, so a
+    /// worker reports the actions it runs on the connection that dispatched them. The run
+    /// returns once no connection remains or the plugin's shutdown grace has elapsed; dropping
+    /// the returned future closes every connection at once.
     ///
     /// # Errors
     ///
@@ -299,13 +310,17 @@ pub struct Listening<G> {
     pub gate: G,
 }
 
-/// What the controller serves: the public listener, which carries the client services and the
-/// Gang API, and the private worker listener. Each listener has its own gate type, so the two
-/// gates may differ.
+/// What the controller serves: the public listener, which carries the cache services and the
+/// Gang API, the execution listener of the leading controller, and the private worker listener.
+/// The public and execution listeners admit clients through gates of one type; the worker
+/// listener's gate may differ.
 pub struct ControllerConnections<P, W, A> {
     /// The public listener: Bazel and `gang` clients. Requests no client service handles go to
     /// `api`.
     pub public: Listening<P>,
+    /// The execution listener: Bazel's `--remote_executor` and the leader routes of the Gang API.
+    /// `None` serves the execution services on `public` instead.
+    pub execution: Option<Listening<P>>,
     /// The worker listener: workers.
     pub worker: Listening<W>,
     /// The Gang API.

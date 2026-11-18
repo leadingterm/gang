@@ -1,4 +1,10 @@
 mock_provider "aws" {
+  mock_resource "aws_launch_template" {
+    defaults = {
+      id = "lt-0123456789abcdef0"
+    }
+  }
+
   mock_data "aws_partition" {
     defaults = {
       partition = "aws"
@@ -60,17 +66,17 @@ run "instance_requires_imdsv2_with_hop_limit_one" {
   command = plan
 
   assert {
-    condition     = aws_instance.this.metadata_options[0].http_tokens == "required"
+    condition     = aws_instance.this[0].metadata_options[0].http_tokens == "required"
     error_message = "The controller must require IMDSv2 session tokens."
   }
 
   assert {
-    condition     = aws_instance.this.metadata_options[0].http_put_response_hop_limit == 1
+    condition     = aws_instance.this[0].metadata_options[0].http_put_response_hop_limit == 1
     error_message = "The IMDS PUT response hop limit must be 1."
   }
 
   assert {
-    condition     = aws_instance.this.root_block_device[0].encrypted == true
+    condition     = aws_instance.this[0].root_block_device[0].encrypted == true
     error_message = "The root volume must be encrypted."
   }
 }
@@ -79,8 +85,8 @@ run "user_data_is_role_and_config_parameter_name" {
   command = plan
 
   assert {
-    condition     = aws_instance.this.user_data == "controller ${var.config_parameter_name} state=/dev/sdg"
-    error_message = "EC2 user-data must be the role line `controller <config parameter name> state=/dev/sdg`."
+    condition     = aws_instance.this[0].user_data == "controller ${var.config_parameter_name} state=/dev/sdg"
+    error_message = "EC2 user-data must identify the controller, configuration parameter and state device."
   }
 }
 
@@ -95,7 +101,7 @@ run "user_data_lists_each_secret_after_config_name" {
   }
 
   assert {
-    condition = aws_instance.this.user_data == join("\n", [
+    condition = aws_instance.this[0].user_data == join("\n", [
       "controller ${var.config_parameter_name} state=/dev/sdg",
       "ca-password=/gang-controller/secrets/ca-password",
       "dashboard-client-secret=/gang-controller/secrets/dashboard-client-secret",
@@ -108,17 +114,17 @@ run "state_volume_is_encrypted_and_in_subnet_az" {
   command = plan
 
   assert {
-    condition     = aws_ebs_volume.state.encrypted == true
+    condition     = aws_ebs_volume.state[0].encrypted == true
     error_message = "The state volume must be encrypted."
   }
 
   assert {
-    condition     = aws_ebs_volume.state.type == "gp3"
+    condition     = aws_ebs_volume.state[0].type == "gp3"
     error_message = "The state volume must be gp3."
   }
 
   assert {
-    condition     = aws_ebs_volume.state.availability_zone == data.aws_subnet.this.availability_zone
+    condition     = aws_ebs_volume.state[0].availability_zone == data.aws_subnet.this[0].availability_zone
     error_message = "The state volume must be created in the availability zone of the controller subnet."
   }
 }
@@ -127,12 +133,12 @@ run "state_volume_attached_at_sdg_and_stopped_safely" {
   command = plan
 
   assert {
-    condition     = aws_volume_attachment.state.device_name == "/dev/sdg"
+    condition     = aws_volume_attachment.state[0].device_name == "/dev/sdg"
     error_message = "The state volume must be attached as /dev/sdg."
   }
 
   assert {
-    condition     = aws_volume_attachment.state.stop_instance_before_detaching == true
+    condition     = aws_volume_attachment.state[0].stop_instance_before_detaching == true
     error_message = "The instance must be stopped before the state volume is detached."
   }
 }
@@ -145,7 +151,7 @@ run "state_volume_accepts_minimum_size" {
   }
 
   assert {
-    condition     = aws_ebs_volume.state.size == 8
+    condition     = aws_ebs_volume.state[0].size == 8
     error_message = "An 8 GiB state volume must be accepted."
   }
 }
@@ -254,13 +260,13 @@ run "recover_alarm_uses_ec2_recover_automate_action" {
   command = plan
 
   assert {
-    condition     = aws_cloudwatch_metric_alarm.recover.metric_name == "StatusCheckFailed_System"
+    condition     = aws_cloudwatch_metric_alarm.recover[0].metric_name == "StatusCheckFailed_System"
     error_message = "The recover alarm must watch the EC2 system status check."
   }
 
   assert {
-    condition = length(aws_cloudwatch_metric_alarm.recover.alarm_actions) == 1 && contains(
-      aws_cloudwatch_metric_alarm.recover.alarm_actions,
+    condition = length(aws_cloudwatch_metric_alarm.recover[0].alarm_actions) == 1 && contains(
+      aws_cloudwatch_metric_alarm.recover[0].alarm_actions,
       "arn:${data.aws_partition.this.partition}:automate:${data.aws_region.this.region}:ec2:recover",
     )
     error_message = "The recover alarm must use the ec2:recover automate action and nothing else."
@@ -523,5 +529,56 @@ run "rejects_instance_type_without_uefi" {
     }
   }
 
-  expect_failures = [aws_instance.this]
+  expect_failures = [aws_instance.this[0]]
+}
+
+run "instance_shape_has_no_group_permissions" {
+  command = plan
+
+  assert {
+    condition     = length(aws_launch_template.controller) == 0 && length(aws_autoscaling_group.controller) == 0 && output.autoscaling_group_name == null && !anytrue([for s in data.aws_iam_policy_document.this.statement : contains(["ControllerLifecycle", "Database"], s.sid)])
+    error_message = "The instance shape must not create a group or grant group and database permissions."
+  }
+}
+
+run "invalid_shape" {
+  command = plan
+  variables { shape = "unknown" }
+  expect_failures = [var.shape]
+}
+
+run "invalid_controller_count" {
+  command = plan
+  variables { controller_count = 1.5 }
+  expect_failures = [var.controller_count]
+}
+
+run "invalid_shutdown_grace" {
+  command = plan
+  variables { shutdown_grace_seconds = 3481 }
+  expect_failures = [var.shutdown_grace_seconds]
+}
+
+run "invalid_table_arn" {
+  command = plan
+  variables { dynamodb_table_arn = "not-an-arn" }
+  expect_failures = [var.dynamodb_table_arn]
+}
+
+run "instance_requires_subnet" {
+  command = plan
+  variables { subnet_id = null }
+  expect_failures = [var.subnet_id]
+}
+
+run "instance_requires_private_ip" {
+  command = plan
+  variables { private_ip = null }
+  expect_failures = [var.private_ip]
+}
+
+run "instance_requires_eip" {
+  command = plan
+  variables { eip_allocation_id = null }
+  expect_failures = [var.eip_allocation_id]
 }

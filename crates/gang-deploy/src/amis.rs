@@ -84,6 +84,13 @@ fn check_id(text: &str) -> Result<()> {
         _ => Err(invalid(text, Expected::ImageId)),
     }
 }
+fn check_snapshot_id(text: &str) -> Result<()> {
+    match text.strip_prefix("snap-") {
+        Some(hex) if !hex.is_empty() => lower_hex(hex, hex.len(), Expected::SnapshotId)
+            .map_err(|_| invalid(text, Expected::SnapshotId)),
+        _ => Err(invalid(text, Expected::SnapshotId)),
+    }
+}
 fn check_region(text: &str) -> Result<()> {
     if !text.is_empty()
         && text
@@ -102,6 +109,10 @@ text_newtype! {
 text_newtype! {
     /// An EC2 AMI identifier.
     ImageId, check_id
+}
+text_newtype! {
+    /// An EC2 snapshot identifier.
+    SnapshotId, check_snapshot_id
 }
 text_newtype! {
     /// An EC2 region name.
@@ -210,6 +221,16 @@ struct Tag {
     #[serde(rename = "Value")]
     value: String,
 }
+#[derive(Debug, Clone, Deserialize)]
+struct BlockDeviceMapping {
+    #[serde(rename = "Ebs")]
+    ebs: Option<Ebs>,
+}
+#[derive(Debug, Clone, Deserialize)]
+struct Ebs {
+    #[serde(rename = "SnapshotId")]
+    snapshot_id: Option<SnapshotId>,
+}
 /// One image returned by `describe-images`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Ami {
@@ -233,6 +254,8 @@ pub struct Ami {
     protection: Protection,
     #[serde(rename = "Tags", default)]
     tags: Vec<Tag>,
+    #[serde(default, rename = "BlockDeviceMappings")]
+    mappings: Vec<BlockDeviceMapping>,
 }
 impl Ami {
     fn tag(&self, key: &str) -> Option<&str> {
@@ -254,20 +277,31 @@ impl Ami {
     }
 }
 #[derive(Debug, Clone)]
-struct Images {
+struct ImageInventory {
     images: Vec<Ami>,
     public_other: usize,
+    other_ids: BTreeSet<String>,
+    other_snapshots: BTreeSet<String>,
 }
-impl<'de> Deserialize<'de> for Images {
+impl<'de> Deserialize<'de> for ImageInventory {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         #[derive(Deserialize)]
         struct Response {
             #[serde(rename = "Images")]
             images: Vec<serde_json::Value>,
         }
+        #[derive(Deserialize)]
+        struct OtherImage {
+            #[serde(rename = "ImageId")]
+            id: Option<ImageId>,
+            #[serde(default, rename = "BlockDeviceMappings")]
+            mappings: Vec<BlockDeviceMapping>,
+        }
         let response = Response::deserialize(deserializer)?;
         let mut images = Vec::new();
         let mut public_other = 0;
+        let mut other_ids = BTreeSet::new();
+        let mut other_snapshots = BTreeSet::new();
         for value in response.images {
             let name = value
                 .get("Name")
@@ -275,13 +309,26 @@ impl<'de> Deserialize<'de> for Images {
                 .unwrap_or_default();
             if name.starts_with("gang-") {
                 images.push(serde_json::from_value(value).map_err(serde::de::Error::custom)?);
-            } else if value.get("Public").and_then(serde_json::Value::as_bool) == Some(true) {
-                public_other += 1;
+            } else {
+                if value.get("Public").and_then(serde_json::Value::as_bool) == Some(true) {
+                    public_other += 1;
+                }
+                let other: OtherImage =
+                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                other_ids.extend(other.id.map(|id| id.0));
+                other_snapshots.extend(
+                    other
+                        .mappings
+                        .into_iter()
+                        .filter_map(|mapping| mapping.ebs?.snapshot_id.map(|id| id.0)),
+                );
             }
         }
         Ok(Self {
             images,
             public_other,
+            other_ids,
+            other_snapshots,
         })
     }
 }
@@ -297,12 +344,25 @@ fn quota<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Result<u32,
         Expected::Quota,
     )))
 }
+#[derive(Debug, Clone, Deserialize)]
+struct Snapshot {
+    #[serde(rename = "SnapshotId")]
+    id: SnapshotId,
+    #[serde(default, rename = "Tags")]
+    tags: Vec<Tag>,
+}
+#[derive(Debug, Clone, Deserialize)]
+struct Snapshots {
+    #[serde(rename = "Snapshots")]
+    snapshots: Vec<Snapshot>,
+}
 /// The observed quota and images in one region.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RegionImages {
     #[serde(deserialize_with = "quota")]
     quota: u32,
-    images: Images,
+    images: ImageInventory,
+    snapshots: Snapshots,
 }
 /// Observations keyed by region, in deterministic order.
 #[derive(Debug, Clone, Deserialize)]
@@ -388,12 +448,28 @@ pub enum Step {
         /// Image ID.
         id: ImageId,
     },
-    /// Deregister an image and its snapshots.
+    /// Record the retiring image on one of its snapshots.
+    RetireSnapshot {
+        /// Snapshot region.
+        region: Region,
+        /// Snapshot ID.
+        id: SnapshotId,
+        /// Retiring image ID.
+        image: ImageId,
+    },
+    /// Deregister an image.
     Deregister {
         /// Image region.
         region: Region,
         /// Image ID.
         id: ImageId,
+    },
+    /// Delete an unreferenced snapshot of a retired image.
+    DeleteSnapshot {
+        /// Snapshot region.
+        region: Region,
+        /// Snapshot ID.
+        id: SnapshotId,
     },
 }
 impl fmt::Display for Step {
@@ -417,7 +493,11 @@ impl fmt::Display for Step {
             Self::Publish { region, id } => write!(f, "publish\t{region}\t{id}"),
             Self::Deprecate { region, id, at } => write!(f, "deprecate\t{region}\t{id}\t{at}"),
             Self::Unprotect { region, id } => write!(f, "unprotect\t{region}\t{id}"),
+            Self::RetireSnapshot { region, id, image } => {
+                write!(f, "retire-snapshot\t{region}\t{id}\t{image}")
+            }
             Self::Deregister { region, id } => write!(f, "deregister\t{region}\t{id}"),
+            Self::DeleteSnapshot { region, id } => write!(f, "delete-snapshot\t{region}\t{id}"),
         }
     }
 }
@@ -760,9 +840,25 @@ impl Publication {
                                 .any(|other| other.name == image.name)
                     });
                 if !remote_exists {
+                    for snapshot in image
+                        .mappings
+                        .iter()
+                        .filter_map(|mapping| mapping.ebs.as_ref()?.snapshot_id.as_ref())
+                    {
+                        push(
+                            region,
+                            7,
+                            snapshot.to_string(),
+                            Step::RetireSnapshot {
+                                region: region.clone(),
+                                id: snapshot.clone(),
+                                image: image.id.clone(),
+                            },
+                        );
+                    }
                     push(
                         region,
-                        7,
+                        8,
                         key,
                         Step::Deregister {
                             region: region.clone(),
@@ -881,6 +977,45 @@ impl Publication {
                     &mut push,
                 )?;
             }
+            for snapshot in &data.snapshots.snapshots {
+                let marker = snapshot
+                    .tags
+                    .iter()
+                    .find(|tag| tag.key == "ec2:SharedTag/GangRetiredImage");
+                let Some(image) = marker
+                    .map(|tag| tag.value.as_str())
+                    .filter(|id| check_id(id).is_ok())
+                else {
+                    continue;
+                };
+                if !data.images.other_ids.contains(image)
+                    && !data
+                        .images
+                        .images
+                        .iter()
+                        .any(|ami| ami.id.as_str() == image)
+                    && !data.images.other_snapshots.contains(snapshot.id.as_str())
+                    && !data.images.images.iter().any(|ami| {
+                        ami.mappings.iter().any(|mapping| {
+                            mapping
+                                .ebs
+                                .as_ref()
+                                .and_then(|ebs| ebs.snapshot_id.as_ref())
+                                == Some(&snapshot.id)
+                        })
+                    })
+                {
+                    push(
+                        region,
+                        9,
+                        snapshot.id.to_string(),
+                        Step::DeleteSnapshot {
+                            region: region.clone(),
+                            id: snapshot.id.clone(),
+                        },
+                    );
+                }
+            }
         }
         ordered.sort_by(|a, b| (&a.0, &a.1, &a.2, &a.3).cmp(&(&b.0, &b.1, &b.2, &b.3)));
         ordered.dedup_by(|a, b| a.4 == b.4);
@@ -967,8 +1102,8 @@ mod tests {
         quota: u32,
     ) -> Publication {
         let regions: Regions = serde_json::from_value(json!({
-            "home-1": {"quota":quota,"images":{"Images":home.to_vec()}},
-            "other-1": {"quota":quota,"images":{"Images":other.to_vec()}}
+            "home-1": {"quota":quota,"images":{"Images":home.to_vec()},"snapshots":{"Snapshots":[]}},
+            "other-1": {"quota":quota,"images":{"Images":other.to_vec()},"snapshots":{"Snapshots":[]}}
         }))
         .unwrap();
         let release = release.then(|| Release {
@@ -1055,6 +1190,164 @@ mod tests {
         home[2]["DeprecationTime"] = json!("2025-07-04T00:00:00Z");
         other[2]["DeprecationTime"] = json!("2025-07-04T00:00:00Z");
         assert!(lines(&publication(&home, &other, true, 0, 10)).is_empty());
+    }
+    #[test]
+    fn snapshots_pending_retirement_survive_image_disappearance() {
+        let images = current();
+        assert!(lines(&publication(&images, &images, false, 0, 10)).is_empty());
+
+        let regions: Regions = serde_json::from_value(json!({
+            "home-1": {
+                "quota": 10,
+                "images": {"Images": images},
+                "snapshots": {"Snapshots": [{
+                    "SnapshotId": "snap-01",
+                    "State": "completed",
+                    "Tags": [{"Key": "ec2:SharedTag/GangRetiredImage", "Value": "ami-03"}]
+                }]}
+            },
+            "other-1": {
+                "quota": 10,
+                "images": {"Images": current()},
+                "snapshots": {"Snapshots": []}
+            }
+        }))
+        .unwrap();
+        let p = Publication::new(
+            "home-1".parse().unwrap(),
+            regions,
+            None,
+            UnixTime::from_seconds(0),
+        )
+        .unwrap();
+        assert_eq!(lines(&p), vec!["delete-snapshot\thome-1\tsnap-01"]);
+    }
+    fn snapshot_publication(images: &[Value], snapshots: &[Value]) -> Publication {
+        let regions: Regions = serde_json::from_value(json!({
+            "home-1": {
+                "quota": 20,
+                "images": {"Images": images},
+                "snapshots": {"Snapshots": snapshots}
+            }
+        }))
+        .unwrap();
+        Publication::new(
+            "home-1".parse().unwrap(),
+            regions,
+            None,
+            UnixTime::from_seconds(1_759_536_000),
+        )
+        .unwrap()
+    }
+
+    fn retired_snapshot() -> Value {
+        json!({"SnapshotId": "snap-01", "Tags": [
+            {"Key": "ec2:SharedTag/GangRetiredImage", "Value": "ami-03"}
+        ]})
+    }
+
+    #[test]
+    fn tagged_snapshot_waits_for_retired_image_to_disappear() {
+        let mut images = current();
+        images.push(old());
+        let p = snapshot_publication(&images, &[retired_snapshot()]);
+        assert!(
+            !lines(&p)
+                .iter()
+                .any(|line| line.starts_with("delete-snapshot\t"))
+        );
+    }
+
+    #[test]
+    fn tagged_snapshot_waits_for_foreign_image_reference() {
+        let mut images = current();
+        images.push(json!({
+            "ImageId": "ami-04",
+            "Name": "foreign",
+            "Public": false,
+            "State": "disabled",
+            "BlockDeviceMappings": [{"Ebs": {"SnapshotId": "snap-01"}}]
+        }));
+        let p = snapshot_publication(&images, &[retired_snapshot()]);
+        assert!(lines(&p).is_empty());
+    }
+
+    #[test]
+    fn tagged_snapshot_waits_for_foreign_retired_image_id() {
+        let mut images = current();
+        images.push(json!({"ImageId": "ami-03", "Name": "foreign", "Public": false}));
+        assert!(lines(&snapshot_publication(&images, &[retired_snapshot()])).is_empty());
+    }
+
+    #[test]
+    fn tagged_snapshot_waits_for_gang_image_reference() {
+        let mut images = current();
+        images[0]["BlockDeviceMappings"] = json!([{"Ebs": {"SnapshotId": "snap-01"}}]);
+        let p = snapshot_publication(&images, &[retired_snapshot()]);
+        assert!(lines(&p).is_empty());
+    }
+
+    #[test]
+    fn untagged_and_malformed_snapshot_markers_are_ignored() {
+        let snapshots = [
+            json!({"SnapshotId": "snap-01"}),
+            json!({"SnapshotId": "snap-02", "Tags": [
+                {"Key": "ec2:SharedTag/GangRetiredImage", "Value": "not-an-ami"}
+            ]}),
+            json!({"SnapshotId": "snap-03", "Tags": [
+                {"Key": "GangRetiredImage", "Value": "ami-03"}
+            ]}),
+        ];
+        assert!(lines(&snapshot_publication(&current(), &snapshots)).is_empty());
+    }
+
+    #[test]
+    fn retiring_image_marks_every_snapshot_before_deregistering() {
+        let mut retired = old();
+        retired["DeprecationTime"] = json!("2025-07-04T00:00:00Z");
+        retired["DeregistrationProtection"] = json!("disabled");
+        retired["BlockDeviceMappings"] = json!([
+            {"Ebs": {"SnapshotId": "snap-02"}},
+            {"VirtualName": "ephemeral0"},
+            {"Ebs": {}},
+            {"Ebs": {"SnapshotId": "snap-01"}}
+        ]);
+        let mut images = current();
+        images.push(retired);
+        assert_eq!(
+            lines(&snapshot_publication(&images, &[])),
+            vec![
+                "retire-snapshot\thome-1\tsnap-01\tami-03",
+                "retire-snapshot\thome-1\tsnap-02\tami-03",
+                "deregister\thome-1\tami-03",
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshot_inventory_and_typed_identifiers_are_required() {
+        assert!(
+            serde_json::from_value::<Regions>(json!({
+                "home-1": {"quota": 10, "images": {"Images": []}}
+            }))
+            .is_err()
+        );
+        for foreign in [
+            json!({"ImageId": "invalid"}),
+            json!({"BlockDeviceMappings": [{"Ebs": {"SnapshotId": "snap-XYZ"}}]}),
+        ] {
+            assert!(
+                serde_json::from_value::<Regions>(json!({
+                    "home-1": {"quota": 10, "images": {"Images": [foreign]},
+                               "snapshots": {"Snapshots": []}}
+                }))
+                .is_err()
+            );
+        }
+        for id in ["snap-", "snap-A", "snap-xyz", "ami-01"] {
+            assert!(id.parse::<super::SnapshotId>().is_err(), "{id}");
+        }
+        assert!("snap-01abcdef".parse::<super::SnapshotId>().is_ok());
     }
     #[test]
     fn retirement_boundary_and_protection() {
@@ -1237,8 +1530,8 @@ mod tests {
             matches!(err, DeployError::QuotaExceeded { region, public: 2, new: 0, quota: 1 } if region == "home-1")
         );
         let regions: Regions = serde_json::from_value(json!({
-            "home-1": {"quota": 10, "images": {"Images": current()}},
-            "other-1": {"quota": 1, "images": {"Images": []}}
+            "home-1": {"quota": 10, "images": {"Images": current()}, "snapshots":{"Snapshots":[]}},
+            "other-1": {"quota": 1, "images": {"Images": []}, "snapshots":{"Snapshots":[]}}
         }))
         .unwrap();
         let p = Publication::new(
@@ -1296,11 +1589,15 @@ mod tests {
     #[test]
     fn quota_accepts_integral_floats_and_rejects_invalid_numbers() {
         for quota in ["100", "100.0", "0.0", "4294967295.0"] {
-            let json = format!(r#"{{"home-1":{{"quota":{quota},"images":{{"Images":[]}}}}}}"#);
+            let json = format!(
+                r#"{{"home-1":{{"quota":{quota},"images":{{"Images":[]}},"snapshots":{{"Snapshots":[]}}}}}}"#
+            );
             assert!(serde_json::from_str::<Regions>(&json).is_ok(), "{quota}");
         }
         for quota in ["100.5", "-1", "4294967296.0", "1e400"] {
-            let json = format!(r#"{{"home-1":{{"quota":{quota},"images":{{"Images":[]}}}}}}"#);
+            let json = format!(
+                r#"{{"home-1":{{"quota":{quota},"images":{{"Images":[]}},"snapshots":{{"Snapshots":[]}}}}}}"#
+            );
             assert!(serde_json::from_str::<Regions>(&json).is_err(), "{quota}");
         }
     }
@@ -1348,9 +1645,9 @@ mod tests {
         let mut other = current();
         other.push(expired);
         let regions: Regions = serde_json::from_value(json!({
-            "home-1": {"quota": 10, "images": {"Images": home}},
-            "other-1": {"quota": 10, "images": {"Images": other}},
-            "new-1": {"quota": 2, "images": {"Images": []}}
+            "home-1": {"quota": 10, "images": {"Images": home}, "snapshots":{"Snapshots":[]}},
+            "other-1": {"quota": 10, "images": {"Images": other}, "snapshots":{"Snapshots":[]}},
+            "new-1": {"quota": 2, "images": {"Images": []}, "snapshots":{"Snapshots":[]}}
         }))
         .unwrap();
         let p = Publication::new(

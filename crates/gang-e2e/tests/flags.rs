@@ -10,7 +10,6 @@ const TARGET: &str = "//:isolated";
 
 fn settings() -> Settings {
     Settings {
-        remote_retries: 7,
         bazel_flags: vec!["--extra_build_option".to_owned()],
         bazel_startup_flags: vec!["--extra_startup_option".to_owned()],
         ..Settings::default()
@@ -61,8 +60,25 @@ fn gang_build_passes_the_harness_flags() {
 
     assert!(args.contains(&"--shell_executable=/nix/store/example-bash/bin/bash".to_owned()));
     assert!(args.contains(&"--incompatible_strict_action_env".to_owned()));
-    assert!(args.contains(&"--remote_retries=7".to_owned()));
     assert_eq!(args.first().map(String::as_str), Some("build"));
+}
+
+#[test]
+fn builds_use_the_bazelrc_remote_retry_policy() {
+    for remote in [gang(), plain()] {
+        let args = build_args(
+            &Settings::default(),
+            &action_tools(),
+            &remote,
+            probes(),
+            None,
+        );
+        assert!(
+            args.iter()
+                .all(|argument| !argument.starts_with("--remote_retries=")),
+            "the harness must not override the bazelrc retry policy: {args:?}"
+        );
+    }
 }
 
 #[test]
@@ -98,6 +114,35 @@ fn every_build_keeps_going_after_a_failed_action() {
             args.contains(&"--keep_going".to_owned()),
             "`--keep_going` is passed for {remote:?}"
         );
+    }
+}
+
+#[test]
+fn every_build_disables_lockfile_updates() {
+    for remote in [gang(), plain()] {
+        let args = build_args(&settings(), &action_tools(), &remote, probes(), None);
+        assert!(args.iter().any(|arg| arg == "--lockfile_mode=off"));
+    }
+}
+
+#[test]
+fn builds_allow_every_probe_in_flight_and_settings_can_override() {
+    let settings = Settings {
+        bazel_flags: vec!["--jobs=7".to_owned()],
+        ..Settings::default()
+    };
+    for remote in [gang(), plain()] {
+        let args = build_args(
+            &settings,
+            &action_tools(),
+            &remote,
+            &[Probe::Victim, Probe::InputRoot],
+            None,
+        );
+        assert!(position(&args, "--jobs=2") < position(&args, "--jobs=7"));
+
+        let empty = build_args(&Settings::default(), &action_tools(), &remote, &[], None);
+        assert!(!empty.iter().any(|arg| arg.starts_with("--jobs=")));
     }
 }
 
@@ -156,7 +201,6 @@ fn gang_build_names_no_executor_and_asks_the_credential_helper() {
             .all(|argument| !argument.starts_with("--remote_executor"))
     );
     assert!(args.contains(&"--credential_helper=gang.example=/usr/local/bin/gang".to_owned()));
-    assert!(args.contains(&"--remote_retries=7".to_owned()));
 }
 
 #[test]

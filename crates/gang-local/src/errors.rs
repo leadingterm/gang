@@ -4,6 +4,10 @@ use std::path::PathBuf;
 /// Every failure the local provisioner can report. Converted into `PortError` at the port boundary.
 #[derive(Debug, thiserror::Error, gang_spi::PortFailure)]
 pub enum LocalError {
+    /// The leader's permission to change the fleet has lapsed.
+    #[error(transparent)]
+    #[failure(transparent)]
+    LeaseLapsed(#[from] gang_spi::LeaseLapsed),
     /// A file or directory under the state dir could not be read or written.
     #[error(transparent)]
     #[failure(unavailable)]
@@ -45,6 +49,10 @@ pub enum LocalError {
     #[error(transparent)]
     #[failure(backend)]
     Spawn(#[from] gang_os::SpawnError),
+    /// The worker bootstrap could not communicate readiness.
+    #[error("cannot start local worker")]
+    #[failure(backend)]
+    Bootstrap(#[source] std::io::Error),
     /// Sending a signal to a worker process failed for a reason other than it being gone.
     #[error("cannot stop process {pid}")]
     #[failure(unavailable)]

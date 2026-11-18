@@ -75,7 +75,7 @@ pub enum ExecError {
     /// The async runtime could not be started.
     #[error("cannot start the runtime")]
     Runtime(#[source] io::Error),
-    /// The termination signal handlers cannot be installed.
+    /// The termination signal handlers cannot be installed or a signal cannot be read.
     #[error("cannot listen for termination signals")]
     Signals(#[source] io::Error),
     /// The executor could not leave the action's process group after starting it.

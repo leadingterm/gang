@@ -95,7 +95,13 @@ fn hit_and_miss_count_in_their_build() {
         time(2),
         &call(&other, Rpc::GetActionResult, CallOutcome::Ok),
     );
-    assert_eq!(builds.list(&BuildFilter::default(), time(2)).len(), 2);
+    assert_eq!(
+        builds
+            .list(&BuildFilter::default(), time(2), None, usize::MAX)
+            .0
+            .len(),
+        2
+    );
 }
 
 #[test]
@@ -111,7 +117,13 @@ fn same_invocation_other_principal_is_another_build() {
         time(1),
         &call(&bob, Rpc::GetActionResult, CallOutcome::NotFound),
     );
-    assert_eq!(builds.list(&BuildFilter::default(), time(1)).len(), 2);
+    assert_eq!(
+        builds
+            .list(&BuildFilter::default(), time(1), None, usize::MAX)
+            .0
+            .len(),
+        2
+    );
     let cache = builds.get(alice.build.id(), time(1)).unwrap().usage.cache;
     assert_eq!((cache.hits, cache.misses), (1, 0));
 }
@@ -203,7 +215,13 @@ fn the_257th_build_drops_the_least_recently_active() {
         assert!(builds.get(o.build.id(), time(300)).is_some());
     }
     builds.observe(time(301), &call(&keys[1], Rpc::Execute, CallOutcome::Ok));
-    assert_eq!(builds.list(&BuildFilter::default(), time(301)).len(), 256);
+    assert_eq!(
+        builds
+            .list(&BuildFilter::default(), time(301), None, usize::MAX)
+            .0
+            .len(),
+        256
+    );
 }
 
 #[test]
@@ -277,6 +295,16 @@ fn lost_observations_count_as_unrecorded() {
 }
 
 #[test]
+fn lost_observations_saturate_at_u64_max() {
+    let mut builds = Builds::new(&BuildsConfig::default());
+    let o = origin("alice", "lost").unwrap();
+    builds.lose(time(10), &o.build, u64::MAX);
+    builds.lose(time(20), &o.build, u64::MAX);
+    let row = builds.get(o.build.id(), time(20)).unwrap();
+    assert_eq!(row.unrecorded, u64::MAX);
+}
+
+#[test]
 fn mnemonic_cap_and_call_outcomes() {
     let config = BuildsConfig {
         mnemonics: NonZeroUsize::new(1).unwrap(),
@@ -316,7 +344,9 @@ fn recent_list_and_filter() {
     b.correlated = Some("group".parse().unwrap());
     builds.observe(time(1), &call(&a, Rpc::Execute, CallOutcome::Ok));
     builds.observe(time(2), &call(&b, Rpc::Execute, CallOutcome::Ok));
-    let rows = builds.list(&BuildFilter::default(), time(2));
+    let rows = builds
+        .list(&BuildFilter::default(), time(2), None, usize::MAX)
+        .0;
     assert_eq!(
         rows.iter()
             .map(|r| r.invocation_id.as_str())
@@ -327,10 +357,22 @@ fn recent_list_and_filter() {
         "principal = \"{}\" AND invocationId = \"b\" AND correlatedInvocationsId = \"group\"",
         rows[0].principal
     );
-    assert_eq!(builds.list(&text.parse().unwrap(), time(2)).len(), 1);
     assert_eq!(
         builds
-            .list(&"invocationId=\"b\"".parse().unwrap(), time(2))
+            .list(&text.parse().unwrap(), time(2), None, usize::MAX)
+            .0
+            .len(),
+        1
+    );
+    assert_eq!(
+        builds
+            .list(
+                &"invocationId=\"b\"".parse().unwrap(),
+                time(2),
+                None,
+                usize::MAX
+            )
+            .0
             .len(),
         1
     );
@@ -350,6 +392,89 @@ fn recent_list_and_filter() {
     builds.fill_recent(time(0), time(2), &mut recent);
     assert_eq!(recent.len(), 2);
     assert!(recent[0].name < recent[1].name);
+}
+
+#[test]
+fn list_pages_in_order_and_filters_before_limiting() {
+    let mut builds = Builds::new(&BuildsConfig::default());
+    let newest = origin("bob", "newest").unwrap();
+    let oldest = origin("alice", "oldest").unwrap();
+    let mut tied = [
+        (origin("alice", "tied-a").unwrap(), "tied-a"),
+        (origin("alice", "tied-b").unwrap(), "tied-b"),
+        (origin("alice", "tied-c").unwrap(), "tied-c"),
+    ];
+    builds.observe(time(30), &call(&newest, Rpc::Execute, CallOutcome::Ok));
+    builds.observe(time(10), &call(&oldest, Rpc::Execute, CallOutcome::Ok));
+    for (origin, _) in &tied {
+        builds.observe(time(20), &call(origin, Rpc::Execute, CallOutcome::Ok));
+    }
+    tied.sort_by_key(|(origin, _)| origin.build.id());
+
+    let filter = BuildFilter::default();
+    let (first, more) = builds.list(&filter, time(30), None, 2);
+    assert_eq!(
+        first
+            .iter()
+            .map(|row| row.invocation_id.as_str())
+            .collect::<Vec<_>>(),
+        ["newest", tied[0].1]
+    );
+    assert!(more);
+    let (second, more) = builds.list(&filter, time(30), Some((time(20), tied[0].0.build.id())), 2);
+    assert_eq!(
+        second
+            .iter()
+            .map(|row| row.invocation_id.as_str())
+            .collect::<Vec<_>>(),
+        [tied[1].1, tied[2].1]
+    );
+    assert!(more);
+    let (third, more) = builds.list(&filter, time(30), Some((time(20), tied[2].0.build.id())), 2);
+    assert_eq!(
+        third
+            .iter()
+            .map(|row| row.invocation_id.as_str())
+            .collect::<Vec<_>>(),
+        ["oldest"]
+    );
+    assert!(!more);
+    let (empty, more) = builds.list(&filter, time(30), Some((time(10), oldest.build.id())), 2);
+    assert!(empty.is_empty());
+    assert!(!more);
+
+    let alice: BuildFilter = "principal=\"principals/example-idp%3aalice\""
+        .parse()
+        .unwrap();
+    let (filtered, more) = builds.list(&alice, time(30), None, 2);
+    assert_eq!(
+        filtered
+            .iter()
+            .map(|row| row.invocation_id.as_str())
+            .collect::<Vec<_>>(),
+        [tied[0].1, tied[1].1]
+    );
+    assert!(more);
+    let (remaining, more) =
+        builds.list(&alice, time(30), Some((time(20), tied[1].0.build.id())), 2);
+    assert_eq!(
+        remaining
+            .iter()
+            .map(|row| row.invocation_id.as_str())
+            .collect::<Vec<_>>(),
+        [tied[2].1, "oldest"]
+    );
+    assert!(!more);
+    let missing: BuildFilter = "invocationId=\"missing\"".parse().unwrap();
+    let (empty, more) = builds.list(&missing, time(30), None, 2);
+    assert!(empty.is_empty());
+    assert!(!more);
+    let (empty, more) = builds.list(&filter, time(30), None, 0);
+    assert!(empty.is_empty());
+    assert!(more);
+    let (empty, more) = builds.list(&missing, time(30), None, 0);
+    assert!(empty.is_empty());
+    assert!(!more);
 }
 
 #[test]
@@ -427,7 +552,7 @@ fn filter_normalizes_principals_and_validates_invocations() {
         "  principal=\"principals/example-idp%3aalice\" AND   invocationId=\"build\""
             .parse()
             .unwrap();
-    assert_eq!(builds.list(&filter, time(0)).len(), 1);
+    assert_eq!(builds.list(&filter, time(0), None, usize::MAX).0.len(), 1);
     for field in ["invocationId", "correlatedInvocationsId"] {
         for value in [String::new(), "invalid\nid".to_owned(), "x".repeat(65)] {
             assert!(

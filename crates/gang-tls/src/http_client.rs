@@ -47,6 +47,8 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 
 use crate::{Alpn, ConnectorSettings, Dialer, ServerTrust, TlsConnector, TransportError};
+type StreamingBody =
+    http_body_util::combinators::UnsyncBoxBody<Bytes, Box<dyn Error + Send + Sync>>;
 
 /// How a client reaches servers.
 pub enum HttpTransport<'a> {
@@ -211,7 +213,7 @@ pub enum HttpError {
 
 /// A client that sends requests over plain HTTP or HTTPS.
 pub struct HttpClient {
-    client: Client<Dialer, Full<Bytes>>,
+    client: Client<Dialer, StreamingBody>,
     /// The scheme the transport serves; requests to any other scheme are refused.
     scheme: HttpScheme,
     timeout: NonZeroDuration,
@@ -246,7 +248,7 @@ impl HttpClient {
         };
         let client = Client::builder(TokioExecutor::new())
             .http2_only(settings.protocol == HttpProtocol::Http2)
-            .build::<_, Full<Bytes>>(Dialer::new(tls));
+            .build::<_, StreamingBody>(Dialer::new(tls));
         Ok(Self {
             client,
             scheme: settings.transport.scheme(),
@@ -287,9 +289,39 @@ impl HttpClient {
             Err(_) => Err(HttpError::TimedOut),
         }
     }
+    /// Opens a streamed response to an already constructed, streaming request.
+    ///
+    /// The request URI must be absolute and use the scheme served by this client. The timeout
+    /// covers the response head, not the response body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HttpError::UnsupportedScheme`] for a mismatched scheme and an [`HttpError`]
+    /// when the connection, request, or response head fails.
+    pub async fn open_request(
+        &self,
+        request: http::Request<
+            http_body_util::combinators::UnsyncBoxBody<Bytes, Box<dyn Error + Send + Sync>>,
+        >,
+    ) -> Result<HttpStream, HttpError> {
+        let scheme = request.uri().scheme_str().unwrap_or_default();
+        let expected = match self.scheme {
+            HttpScheme::Http => "http",
+            HttpScheme::Https => "https",
+        };
+        if scheme != expected {
+            return Err(HttpError::UnsupportedScheme {
+                scheme: scheme.to_owned(),
+            });
+        }
+        match Clock::timeout(&self.clock, self.timeout.get(), self.head(request)).await {
+            Ok(response) => response,
+            Err(_) => Err(HttpError::TimedOut),
+        }
+    }
 
     /// Validates the transport scheme and builds the request before any I/O.
-    fn prepare(&self, request: HttpRequest<'_>) -> Result<http::Request<Full<Bytes>>, HttpError> {
+    fn prepare(&self, request: HttpRequest<'_>) -> Result<http::Request<StreamingBody>, HttpError> {
         if HttpScheme::of(request.url) != Some(self.scheme) {
             return Err(HttpError::UnsupportedScheme {
                 scheme: request.url.scheme().to_owned(),
@@ -298,7 +330,7 @@ impl HttpClient {
         Self::build_request(request)
     }
 
-    fn build_request(request: HttpRequest<'_>) -> Result<http::Request<Full<Bytes>>, HttpError> {
+    fn build_request(request: HttpRequest<'_>) -> Result<http::Request<StreamingBody>, HttpError> {
         let mut builder = http::Request::builder()
             .method(request.method)
             .uri(request.url.as_str());
@@ -318,11 +350,17 @@ impl HttpClient {
         for (name, value) in request.headers {
             builder = builder.header(name, value);
         }
-        builder.body(Full::new(body)).map_err(HttpError::Request)
+        builder
+            .body(
+                Full::new(body)
+                    .map_err(|never| match never {})
+                    .boxed_unsync(),
+            )
+            .map_err(HttpError::Request)
     }
 
     /// Acquires a response head without consuming its body.
-    async fn head(&self, request: http::Request<Full<Bytes>>) -> Result<HttpStream, HttpError> {
+    async fn head(&self, request: http::Request<StreamingBody>) -> Result<HttpStream, HttpError> {
         let response = self
             .client
             .request(request)
@@ -336,7 +374,10 @@ impl HttpClient {
         })
     }
 
-    async fn exchange(&self, request: http::Request<Full<Bytes>>) -> Result<HttpReply, HttpError> {
+    async fn exchange(
+        &self,
+        request: http::Request<StreamingBody>,
+    ) -> Result<HttpReply, HttpError> {
         let HttpStream {
             status,
             headers,
@@ -367,6 +408,72 @@ impl HttpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn open_request_streams_request_and_response() -> gang_testkit::TestResult {
+        use gang_clock::SystemClock;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::sync::{mpsc, oneshot};
+        use tokio_stream::wrappers::ReceiverStream;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (received, wait_received) = oneshot::channel();
+        let (finish, wait_finish) = oneshot::channel();
+        let (respond, wait_respond) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            let mut byte = [0; 1];
+            while !request.ends_with(b"5\r\nhello\r\n") {
+                socket.read_exact(&mut byte).await?;
+                request.push(byte[0]);
+            }
+            let _ = received.send(());
+            let _ = wait_respond.await;
+            let mut terminator = [0; 5];
+            socket.read_exact(&mut terminator).await?;
+            assert_eq!(&terminator, b"0\r\n\r\n");
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n")
+                .await?;
+            let _ = wait_finish.await;
+            socket.write_all(b"0\r\n\r\n").await
+        });
+        let client = HttpClient::try_new(&HttpSettings {
+            transport: HttpTransport::Plain,
+            protocol: HttpProtocol::Negotiated,
+            timeout: NonZeroDuration::from_secs(5),
+            max_body: NonZeroBytes::kib(1),
+            clock: Arc::new(SystemClock::default()),
+        })?;
+        let (send, receive) = mpsc::channel(1);
+        send.send(Ok::<_, Box<dyn Error + Send + Sync>>(
+            hyper::body::Frame::data(Bytes::from_static(b"hello")),
+        ))
+        .await
+        .map_err(|_| "request receiver stopped")?;
+        let body = http_body_util::StreamBody::new(ReceiverStream::new(receive)).boxed_unsync();
+        let request = http::Request::post(format!("http://{address}/")).body(body)?;
+        let response = client.open_request(request);
+        tokio::pin!(response);
+        tokio::select! {
+            result = &mut response => return Err(format!("response arrived before request ended: {result:?}").into()),
+            result = wait_received => result?,
+        }
+        drop(send);
+        respond.send(()).map_err(|()| "server stopped")?;
+        let mut response = response.await?;
+        assert_eq!(
+            response.next_chunk().await?,
+            Some(Bytes::from_static(b"first"))
+        );
+        finish.send(()).map_err(|()| "server stopped")?;
+        assert_eq!(response.next_chunk().await?, None);
+        server.await??;
+        Ok(())
+    }
 
     #[test]
     fn no_http_error_repeats_its_source() {

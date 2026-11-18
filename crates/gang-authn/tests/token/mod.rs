@@ -636,6 +636,45 @@ async fn tokens_are_refused_for_the_other_use() {
 }
 
 #[tokio::test]
+async fn session_with_less_than_a_whole_second_left_is_not_minted() {
+    let (signer, key) = fixture(1).await;
+    let exactly_one = mint(
+        &signer,
+        &key,
+        ISSUER,
+        &alice(),
+        at(NOW_MS),
+        Duration::from_secs(1),
+        TokenUse::Session,
+    )
+    .await
+    .expect("a whole second of session mints");
+    assert_eq!(exactly_one.expires_in, Duration::from_secs(1));
+
+    // Expiry rounds down to `NOW_SECS + 1`, half a second away: `Max-Age` would be 0.
+    let result = mint(
+        &signer,
+        &key,
+        ISSUER,
+        &alice(),
+        at(NOW_MS + 500),
+        Duration::from_secs(1),
+        TokenUse::Session,
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(PortError::Rejected {
+                reason: Rejection::InvalidProof,
+                ..
+            })
+        ),
+        "a session with under a second left must not be minted, got {result:?}"
+    );
+}
+
+#[tokio::test]
 async fn token_without_use_claim_is_malformed() {
     let (_, key) = fixture(1).await;
     let claims = format!(

@@ -11,20 +11,24 @@ data "aws_availability_zones" "this" {
 data "aws_region" "this" {}
 
 locals {
-  region             = data.aws_region.this.region
-  availability_zones = slice(data.aws_availability_zones.this.names, 0, var.availability_zone_count)
+  region              = data.aws_region.this.region
+  availability_zones  = slice(data.aws_availability_zones.this.names, 0, var.availability_zone_count)
+  public_subnet_cidrs = [for index in range(var.availability_zone_count) : cidrsubnet(var.cidr_block, 4, index)]
 
   nat_count                 = var.nat_mode == "single" ? 1 : var.availability_zone_count
   private_route_table_count = var.nat_mode == "per_az" ? var.availability_zone_count : 1
 
-  public_port = 443
-  worker_port = 9090
+  ports          = jsondecode(file("${path.module}/ports.json"))
+  public_port    = local.ports.public
+  execution_port = local.ports.execution
+  worker_port    = local.ports.worker
+  health_port    = local.ports.health
 
   # The controller sits in public subnet 0 at a fixed host offset so its private
   # address, and therefore its private DNS name, is deterministic.
-  controller_private_ip = cidrhost(aws_subnet.public[0].cidr_block, 10)
+  controller_private_ip = cidrhost(local.public_subnet_cidrs[0], 10)
 
-  controller_public_ip_dashed  = replace(aws_eip.controller.public_ip, ".", "-")
+  controller_public_ip_dashed  = var.controller_eip ? replace(aws_eip.controller[0].public_ip, ".", "-") : null
   controller_private_ip_dashed = replace(local.controller_private_ip, ".", "-")
 }
 
@@ -50,7 +54,7 @@ resource "aws_subnet" "public" {
   count = var.availability_zone_count
 
   availability_zone       = local.availability_zones[count.index]
-  cidr_block              = cidrsubnet(var.cidr_block, 4, count.index)
+  cidr_block              = local.public_subnet_cidrs[count.index]
   map_public_ip_on_launch = true
   vpc_id                  = aws_vpc.this.id
 
@@ -154,7 +158,22 @@ resource "aws_vpc_endpoint" "this" {
   })
 }
 
+resource "aws_vpc_endpoint" "dynamodb" {
+  count = var.dynamodb_gateway_endpoint ? 1 : 0
+
+  route_table_ids   = aws_route_table.private[*].id
+  service_name      = "com.amazonaws.${local.region}.dynamodb"
+  vpc_endpoint_type = "Gateway"
+  vpc_id            = aws_vpc.this.id
+
+  tags = merge(var.tags, {
+    Name = "${var.name}-dynamodb"
+  })
+}
+
 resource "aws_eip" "controller" {
+  count = var.controller_eip ? 1 : 0
+
   domain = "vpc"
 
   tags = merge(var.tags, {
@@ -162,6 +181,11 @@ resource "aws_eip" "controller" {
   })
 
   depends_on = [aws_internet_gateway.this]
+}
+
+moved {
+  from = aws_eip.controller
+  to   = aws_eip.controller[0]
 }
 
 resource "aws_security_group" "controller" {

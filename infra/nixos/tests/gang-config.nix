@@ -1,5 +1,13 @@
 {pkgs}: let
   inherit (pkgs) lib;
+  controllerService =
+    (import (pkgs.path + "/nixos/lib/eval-config.nix") {
+      system = pkgs.stdenv.hostPlatform.system;
+      modules = [
+        ../controller.nix
+        {_module.args.gang = pkgs.hello;}
+      ];
+    }).config.systemd.services.gang-server.serviceConfig;
 
   # One HTTP server answers the EC2 metadata routes on :80 and the SSM JSON
   # 1.1 GetParameter route on :8080. Values come from USER_DATA and PARAMETERS.
@@ -78,7 +86,7 @@
 
   stateDisk = {
     virtualisation.emptyDiskImages = [64];
-    gang.stateDevice = "/dev/vdb";
+    gang.stateDevice = "/dev/vdc";
   };
 
   baseModule = {
@@ -148,226 +156,263 @@
     };
   };
 in
-  pkgs.testers.runNixOSTest {
-    name = "gang-config";
+  assert lib.assertMsg (controllerService.Restart == "on-failure") "gang-server must restart only on failure";
+  assert lib.assertMsg (controllerService.RestartPreventExitStatus == 4) "gang-server must not restart after a shutdown deadline";
+  assert lib.assertMsg (controllerService.TimeoutStopSec == "infinity") "gang-server shutdown must not have a systemd deadline";
+    pkgs.testers.runNixOSTest {
+      name = "gang-config";
 
-    nodes = {
-      withSecrets = {
-        imports = [
-          stateDisk
-          (baseModule {
-            userData = "controller /gang/gang.toml\ndashboard-client-secret=/gang/secrets/client";
-            parameters = {
-              "/gang/gang.toml" = tomlText;
-              "/gang/secrets/client" = "s3cr3t";
-            };
-          })
-        ];
+      nodeDefaults = {
+        # Each independent scenario runs alone within the CI runner budget.
+        virtualisation.memorySize = 1024;
+        virtualisation.cores = 1;
+        # The store image avoids asynchronous virtiofs socket startup; no host shares are needed.
+        virtualisation.useNixStoreImage = true;
+        virtualisation.mountHostNixStore = false;
+        virtualisation.sharedDirectories = lib.mkForce {};
       };
 
-      controllerstate = {
-        imports = [
-          stateDisk
-          (baseModule {
-            userData = "controller /gang/gang.toml state=/dev/vdb";
-            parameters = {"/gang/gang.toml" = tomlText;};
-          })
-        ];
-      };
+      nodes = {
+        withSecrets = {
+          imports = [
+            stateDisk
+            (baseModule {
+              userData = "controller /gang/gang.toml\ndashboard-client-secret=/gang/secrets/client\n# config-digest 0123456789abcdef";
+              parameters = {
+                "/gang/gang.toml" = tomlText;
+                "/gang/secrets/client" = "s3cr3t";
+              };
+            })
+          ];
+        };
 
-      workerstate = {
-        imports = [
-          stateDisk
-          (baseModule {
-            userData = "worker /gang/gang.toml state=/dev/vdb";
-            parameters = {"/gang/gang.toml" = tomlText;};
-          })
-        ];
-        systemd.services.gang-config.serviceConfig.Restart = lib.mkForce "no";
-      };
+        controllerstate = {
+          imports = [
+            stateDisk
+            (baseModule {
+              userData = "controller /gang/gang.toml state=/dev/vdc";
+              parameters = {"/gang/gang.toml" = tomlText;};
+            })
+          ];
+        };
 
-      wrongdevice = {
-        imports = [
-          stateDisk
-          (baseModule {
-            userData = "controller /gang/gang.toml state=/dev/sdf";
-            parameters = {"/gang/gang.toml" = tomlText;};
-          })
-        ];
-        systemd.services.gang-config.serviceConfig.Restart = lib.mkForce "no";
-      };
+        workerstate = {
+          imports = [
+            stateDisk
+            (baseModule {
+              userData = "worker /gang/gang.toml state=/dev/vdc";
+              parameters = {"/gang/gang.toml" = tomlText;};
+            })
+          ];
+          systemd.services.gang-config.serviceConfig.Restart = lib.mkForce "no";
+        };
 
-      plain = baseModule {
-        userData = "worker /gang/gang.toml";
-        parameters = {
-          "/gang/gang.toml" = tomlText;
+        wrongdevice = {
+          imports = [
+            stateDisk
+            (baseModule {
+              userData = "controller /gang/gang.toml state=/dev/sdf";
+              parameters = {"/gang/gang.toml" = tomlText;};
+            })
+          ];
+          systemd.services.gang-config.serviceConfig.Restart = lib.mkForce "no";
+        };
+
+        plain = baseModule {
+          userData = "worker /gang/gang.toml";
+          parameters = {
+            "/gang/gang.toml" = tomlText;
+          };
+        };
+
+        badname = baseModule {
+          userData = "controller /gang/gang.toml\n../escape=/gang/secrets/client";
+          parameters = {
+            "/gang/gang.toml" = tomlText;
+            "/gang/secrets/client" = "s3cr3t";
+          };
+        };
+
+        missing = {
+          imports = [
+            (baseModule {
+              userData = "worker /gang/absent";
+              parameters = {};
+            })
+          ];
+          systemd.services.gang-config.serviceConfig.Restart = lib.mkForce "no";
+        };
+
+        badrole = {
+          imports = [
+            (baseModule {
+              userData = "builder /gang/gang.toml";
+              parameters = {"/gang/gang.toml" = tomlText;};
+            })
+          ];
+          systemd.services.gang-config.serviceConfig.Restart = lib.mkForce "no";
+        };
+
+        noparameter = {
+          imports = [
+            (baseModule {
+              userData = "worker";
+              parameters = {};
+            })
+          ];
+          systemd.services.gang-config.serviceConfig.Restart = lib.mkForce "no";
+        };
+
+        extratoken = {
+          imports = [
+            (baseModule {
+              userData = "controller /gang/gang.toml state=/dev/vdc extra";
+              parameters = {"/gang/gang.toml" = tomlText;};
+            })
+          ];
+          systemd.services.gang-config.serviceConfig.Restart = lib.mkForce "no";
         };
       };
 
-      badname = baseModule {
-        userData = "controller /gang/gang.toml\n../escape=/gang/secrets/client";
-        parameters = {
-          "/gang/gang.toml" = tomlText;
-          "/gang/secrets/client" = "s3cr3t";
-        };
-      };
+      testScript = ''
+        from collections.abc import Generator
+        from contextlib import contextmanager
+        import shutil
 
-      missing = {
-        imports = [
-          (baseModule {
-            userData = "worker /gang/absent";
-            parameters = {};
-          })
-        ];
-        systemd.services.gang-config.serviceConfig.Restart = lib.mkForce "no";
-      };
 
-      badrole = {
-        imports = [
-          (baseModule {
-            userData = "builder /gang/gang.toml";
-            parameters = {"/gang/gang.toml" = tomlText;};
-          })
-        ];
-        systemd.services.gang-config.serviceConfig.Restart = lib.mkForce "no";
-      };
+        @contextmanager
+        def guest(machine: QemuMachine) -> Generator[None]:
+            assert not any(node.booted for node in machines_qemu)
+            # Keep failed scenarios for the driver to diagnose and clean up.
+            yield
+            machine.shutdown()
+            # Store images belong to one scenario, not the whole test.
+            if not machine.keep_machine_state:
+                shutil.rmtree(machine.state_dir)
 
-      noparameter = {
-        imports = [
-          (baseModule {
-            userData = "worker";
-            parameters = {};
-          })
-        ];
-        systemd.services.gang-config.serviceConfig.Restart = lib.mkForce "no";
-      };
 
-      extratoken = {
-        imports = [
-          (baseModule {
-            userData = "controller /gang/gang.toml state=/dev/vdb extra";
-            parameters = {"/gang/gang.toml" = tomlText;};
-          })
-        ];
-        systemd.services.gang-config.serviceConfig.Restart = lib.mkForce "no";
-      };
-    };
+        TOML = ${builtins.toJSON tomlText}
+        JOURNAL = "journalctl -u gang-config.service"
+        SECRET = "/etc/gang/secrets/dashboard-client-secret"
 
-    testScript = ''
-      TOML = ${builtins.toJSON tomlText}
-      JOURNAL = "journalctl -u gang-config.service"
-      SECRET = "/etc/gang/secrets/dashboard-client-secret"
+        with guest(withSecrets):
+            with subtest("withSecrets installs gang.toml and secrets before dependents start"):
+                withSecrets.wait_for_unit("probe-controller.service")
+                withSecrets.wait_for_unit("gang-controller.target")
+                assert withSecrets.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-worker.target").strip() == "0"
+                assert withSecrets.succeed("systemctl show -P ActiveEnterTimestampMonotonic probe-worker.service").strip() == "0"
+                assert withSecrets.succeed("cat /etc/gang/gang.toml") == TOML
+                assert withSecrets.succeed("stat -c '%a' /etc/gang/gang.toml").strip() == "644"
+                assert withSecrets.succeed("cat /run/probe-controller") == "644\n"
+                assert withSecrets.succeed("stat -c '%a %U:%G' /etc/gang/secrets").strip() == "700 gang:gang"
+                assert withSecrets.succeed(f"stat -c '%a %U:%G %s' {SECRET}").strip() == "600 gang:gang 6"
+                assert withSecrets.succeed(f"cat {SECRET}") == "s3cr3t"
+                withSecrets.succeed("rc=0; blkid -p /dev/vdc >/dev/null || rc=$?; test \"$rc\" -eq 2")
+                withSecrets.fail("mountpoint -q /var/lib/gang")
+                assert withSecrets.succeed("systemctl show -P LoadState var-lib-gang.mount").strip() == "not-found"
 
-      start_all()
+            with subtest("restart removes stale secret files"):
+                withSecrets.succeed("touch /etc/gang/secrets/stale")
+                withSecrets.succeed("systemctl restart gang-config.service")
+                withSecrets.wait_until_succeeds("test \"$(wc -l < /run/probe-controller)\" -eq 2")
+                withSecrets.wait_for_unit("gang-controller.target")
+                assert withSecrets.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-worker.target").strip() == "0"
+                withSecrets.fail("test -e /etc/gang/secrets/stale")
+                assert withSecrets.succeed(f"cat {SECRET}") == "s3cr3t"
 
-      with subtest("withSecrets installs gang.toml and secrets before dependents start"):
-          withSecrets.wait_for_unit("probe-controller.service")
-          withSecrets.wait_for_unit("gang-controller.target")
-          assert withSecrets.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-worker.target").strip() == "0"
-          assert withSecrets.succeed("systemctl show -P ActiveEnterTimestampMonotonic probe-worker.service").strip() == "0"
-          assert withSecrets.succeed("cat /etc/gang/gang.toml") == TOML
-          assert withSecrets.succeed("stat -c '%a' /etc/gang/gang.toml").strip() == "644"
-          assert withSecrets.succeed("cat /run/probe-controller") == "644\n"
-          assert withSecrets.succeed("stat -c '%a %U:%G' /etc/gang/secrets").strip() == "700 gang:gang"
-          assert withSecrets.succeed(f"stat -c '%a %U:%G %s' {SECRET}").strip() == "600 gang:gang 6"
-          assert withSecrets.succeed(f"cat {SECRET}") == "s3cr3t"
-          withSecrets.succeed("rc=0; blkid -p /dev/vdb >/dev/null || rc=$?; test \"$rc\" -eq 2")
-          withSecrets.fail("mountpoint -q /var/lib/gang")
-          assert withSecrets.succeed("systemctl show -P LoadState var-lib-gang.mount").strip() == "not-found"
+            with subtest("restart without configured secrets removes every secret file"):
+                withSecrets.succeed("echo 'controller /gang/gang.toml' > /run/fake-aws/user-data")
+                withSecrets.succeed("systemctl restart gang-config.service")
+                withSecrets.succeed("test -z \"$(ls -A /etc/gang/secrets)\"")
 
-      with subtest("controller state disk is mounted before the role and stays mounted on restart"):
-          controllerstate.wait_for_unit("probe-controller.service")
-          assert controllerstate.succeed("systemctl is-active var-lib-gang.mount").strip() == "active"
-          assert controllerstate.succeed("cat /run/probe-controller") == "644\n"
-          assert controllerstate.succeed("findmnt -no FSTYPE,SOURCE /var/lib/gang").strip() == "ext4 /dev/vdb"
-          controllerstate.succeed("systemctl restart gang-config.service")
-          controllerstate.wait_until_succeeds("test \"$(wc -l < /run/probe-controller)\" -eq 2")
-          assert controllerstate.succeed("findmnt -no FSTYPE,SOURCE /var/lib/gang").strip() == "ext4 /dev/vdb"
-          assert controllerstate.succeed("systemctl is-active var-lib-gang.mount").strip() == "active"
+        with guest(controllerstate):
+            with subtest("controller state disk is mounted before the role and stays mounted on restart"):
+                controllerstate.wait_for_unit("probe-controller.service")
+                assert controllerstate.succeed("systemctl is-active var-lib-gang.mount").strip() == "active"
+                assert controllerstate.succeed("cat /run/probe-controller") == "644\n"
+                assert controllerstate.succeed("findmnt -no FSTYPE,SOURCE /var/lib/gang").strip() == "ext4 /dev/vdc"
+                controllerstate.succeed("systemctl restart gang-config.service")
+                controllerstate.wait_until_succeeds("test \"$(wc -l < /run/probe-controller)\" -eq 2")
+                assert controllerstate.succeed("findmnt -no FSTYPE,SOURCE /var/lib/gang").strip() == "ext4 /dev/vdc"
+                assert controllerstate.succeed("systemctl is-active var-lib-gang.mount").strip() == "active"
 
-      with subtest("existing controller state survives an unmount and restart"):
-          controllerstate.succeed("echo marker > /var/lib/gang/marker")
-          controllerstate.succeed("umount /var/lib/gang")
-          controllerstate.fail("mountpoint -q /var/lib/gang")
-          controllerstate.succeed("systemctl restart gang-config.service")
-          assert controllerstate.succeed("findmnt -no FSTYPE,SOURCE /var/lib/gang").strip() == "ext4 /dev/vdb"
-          assert controllerstate.succeed("cat /var/lib/gang/marker") == "marker\n"
+            with subtest("existing controller state survives an unmount and restart"):
+                controllerstate.succeed("echo marker > /var/lib/gang/marker")
+                controllerstate.succeed("umount /var/lib/gang")
+                controllerstate.fail("mountpoint -q /var/lib/gang")
+                controllerstate.succeed("systemctl restart gang-config.service")
+                assert controllerstate.succeed("findmnt -no FSTYPE,SOURCE /var/lib/gang").strip() == "ext4 /dev/vdc"
+                assert controllerstate.succeed("cat /var/lib/gang/marker") == "marker\n"
 
-      with subtest("restart removes stale secret files"):
-          withSecrets.succeed("touch /etc/gang/secrets/stale")
-          withSecrets.succeed("systemctl restart gang-config.service")
-          withSecrets.wait_until_succeeds("test \"$(wc -l < /run/probe-controller)\" -eq 2")
-          withSecrets.wait_for_unit("gang-controller.target")
-          assert withSecrets.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-worker.target").strip() == "0"
-          withSecrets.fail("test -e /etc/gang/secrets/stale")
-          assert withSecrets.succeed(f"cat {SECRET}") == "s3cr3t"
+        with guest(plain):
+            with subtest("plain installs gang.toml without a secrets directory"):
+                plain.wait_for_unit("probe-worker.service")
+                plain.wait_for_unit("gang-worker.target")
+                assert plain.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-controller.target").strip() == "0"
+                assert plain.succeed("systemctl show -P ActiveEnterTimestampMonotonic probe-controller.service").strip() == "0"
+                assert plain.succeed("cat /run/probe-worker") == "644\n"
+                assert plain.succeed("cat /etc/gang/gang.toml") == TOML
+                plain.fail("test -e /etc/gang/secrets")
 
-      with subtest("restart without configured secrets removes every secret file"):
-          withSecrets.succeed("echo 'controller /gang/gang.toml' > /run/fake-aws/user-data")
-          withSecrets.succeed("systemctl restart gang-config.service")
-          withSecrets.succeed("test -z \"$(ls -A /etc/gang/secrets)\"")
+        with guest(badname):
+            with subtest("invalid secret file name is rejected before anything is written"):
+                badname.wait_until_succeeds(f"{JOURNAL} | grep -q 'invalid secret file name'")
+                badname.fail("test -e /etc/gang/gang.toml")
+                assert badname.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-controller.target").strip() == "0"
+                assert badname.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-worker.target").strip() == "0"
 
-      with subtest("plain installs gang.toml without a secrets directory"):
-          plain.wait_for_unit("probe-worker.service")
-          plain.wait_for_unit("gang-worker.target")
-          assert plain.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-controller.target").strip() == "0"
-          assert plain.succeed("systemctl show -P ActiveEnterTimestampMonotonic probe-controller.service").strip() == "0"
-          assert plain.succeed("cat /run/probe-worker") == "644\n"
-          assert plain.succeed("cat /etc/gang/gang.toml") == TOML
-          plain.fail("test -e /etc/gang/secrets")
+        with guest(missing):
+            with subtest("missing SSM parameter fails without writing gang.toml"):
+                missing.wait_until_succeeds(f"{JOURNAL} | grep -q 'SSM parameter /gang/absent is empty or unreadable'")
+                missing.wait_until_succeeds("systemctl is-failed gang-config.service")
+                missing.fail("test -e /etc/gang/gang.toml")
+                assert missing.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-controller.target").strip() == "0"
+                assert missing.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-worker.target").strip() == "0"
 
-      with subtest("invalid secret file name is rejected before anything is written"):
-          badname.wait_until_succeeds(f"{JOURNAL} | grep -q 'invalid secret file name'")
-          badname.fail("test -e /etc/gang/gang.toml")
-          assert badname.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-controller.target").strip() == "0"
-          assert badname.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-worker.target").strip() == "0"
+        with guest(badrole):
+            with subtest("unknown role fails before writing gang.toml or starting a target"):
+                badrole.wait_until_succeeds(f"{JOURNAL} | grep -q \"role 'builder' is not one of: controller worker\"")
+                badrole.wait_until_succeeds("systemctl is-failed gang-config.service")
+                badrole.fail("test -e /etc/gang/gang.toml")
+                assert badrole.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-controller.target").strip() == "0"
+                assert badrole.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-worker.target").strip() == "0"
 
-      with subtest("missing SSM parameter fails without writing gang.toml"):
-          missing.wait_until_succeeds(f"{JOURNAL} | grep -q 'SSM parameter /gang/absent is empty or unreadable'")
-          missing.wait_until_succeeds("systemctl is-failed gang-config.service")
-          missing.fail("test -e /etc/gang/gang.toml")
-          assert missing.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-controller.target").strip() == "0"
-          assert missing.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-worker.target").strip() == "0"
+        with guest(noparameter):
+            with subtest("missing parameter fails before writing gang.toml"):
+                noparameter.wait_until_succeeds(f"{JOURNAL} | grep -q \"must be '<role> <parameter>' or 'controller <parameter> state=<stateDevice>'\"")
+                noparameter.wait_until_succeeds("systemctl is-failed gang-config.service")
+                noparameter.fail("test -e /etc/gang/gang.toml")
+                assert noparameter.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-controller.target").strip() == "0"
+                assert noparameter.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-worker.target").strip() == "0"
 
-      with subtest("unknown role fails before writing gang.toml or starting a target"):
-          badrole.wait_until_succeeds(f"{JOURNAL} | grep -q \"role 'builder' is not one of: controller worker\"")
-          badrole.wait_until_succeeds("systemctl is-failed gang-config.service")
-          badrole.fail("test -e /etc/gang/gang.toml")
-          assert badrole.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-controller.target").strip() == "0"
-          assert badrole.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-worker.target").strip() == "0"
+        with guest(extratoken):
+            with subtest("extra token fails before writing gang.toml"):
+                extratoken.wait_until_succeeds(f"{JOURNAL} | grep -q \"must be '<role> <parameter>' or 'controller <parameter> state=<stateDevice>'\"")
+                extratoken.wait_until_succeeds("systemctl is-failed gang-config.service")
+                extratoken.fail("test -e /etc/gang/gang.toml")
+                assert extratoken.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-controller.target").strip() == "0"
+                assert extratoken.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-worker.target").strip() == "0"
 
-      with subtest("missing parameter fails before writing gang.toml"):
-          noparameter.wait_until_succeeds(f"{JOURNAL} | grep -q \"must be '<role> <parameter>' or 'controller <parameter> state=<stateDevice>'\"")
-          noparameter.wait_until_succeeds("systemctl is-failed gang-config.service")
-          noparameter.fail("test -e /etc/gang/gang.toml")
-          assert noparameter.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-controller.target").strip() == "0"
-          assert noparameter.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-worker.target").strip() == "0"
+        with guest(workerstate):
+            with subtest("state token on a worker is rejected"):
+                workerstate.wait_until_succeeds(f"{JOURNAL} | grep -q \"only a controller's first EC2 user-data line may end with state=/dev/vdc\"")
+                workerstate.wait_until_succeeds("systemctl is-failed gang-config.service")
+                workerstate.fail("test -e /etc/gang/gang.toml")
+                assert workerstate.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-controller.target").strip() == "0"
+                assert workerstate.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-worker.target").strip() == "0"
+                workerstate.succeed("rc=0; blkid -p /dev/vdc >/dev/null || rc=$?; test \"$rc\" -eq 2")
+                workerstate.fail("mountpoint -q /var/lib/gang")
+                assert workerstate.succeed("systemctl show -P LoadState var-lib-gang.mount").strip() == "not-found"
 
-      with subtest("extra token fails before writing gang.toml"):
-          extratoken.wait_until_succeeds(f"{JOURNAL} | grep -q \"must be '<role> <parameter>' or 'controller <parameter> state=<stateDevice>'\"")
-          extratoken.wait_until_succeeds("systemctl is-failed gang-config.service")
-          extratoken.fail("test -e /etc/gang/gang.toml")
-          assert extratoken.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-controller.target").strip() == "0"
-          assert extratoken.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-worker.target").strip() == "0"
-
-      with subtest("state token on a worker is rejected"):
-          workerstate.wait_until_succeeds(f"{JOURNAL} | grep -q \"only a controller's first EC2 user-data line may end with state=/dev/vdb\"")
-          workerstate.wait_until_succeeds("systemctl is-failed gang-config.service")
-          workerstate.fail("test -e /etc/gang/gang.toml")
-          assert workerstate.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-controller.target").strip() == "0"
-          assert workerstate.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-worker.target").strip() == "0"
-          workerstate.succeed("rc=0; blkid -p /dev/vdb >/dev/null || rc=$?; test \"$rc\" -eq 2")
-          workerstate.fail("mountpoint -q /var/lib/gang")
-          assert workerstate.succeed("systemctl show -P LoadState var-lib-gang.mount").strip() == "not-found"
-
-      with subtest("wrong state device is rejected"):
-          wrongdevice.wait_until_succeeds(f"{JOURNAL} | grep -q \"only a controller's first EC2 user-data line may end with state=/dev/vdb\"")
-          wrongdevice.wait_until_succeeds("systemctl is-failed gang-config.service")
-          wrongdevice.fail("test -e /etc/gang/gang.toml")
-          assert wrongdevice.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-controller.target").strip() == "0"
-          assert wrongdevice.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-worker.target").strip() == "0"
-          wrongdevice.succeed("rc=0; blkid -p /dev/vdb >/dev/null || rc=$?; test \"$rc\" -eq 2")
-          wrongdevice.fail("mountpoint -q /var/lib/gang")
-          assert wrongdevice.succeed("systemctl show -P LoadState var-lib-gang.mount").strip() == "not-found"
-    '';
-  }
+        with guest(wrongdevice):
+            with subtest("wrong state device is rejected"):
+                wrongdevice.wait_until_succeeds(f"{JOURNAL} | grep -q \"only a controller's first EC2 user-data line may end with state=/dev/vdc\"")
+                wrongdevice.wait_until_succeeds("systemctl is-failed gang-config.service")
+                wrongdevice.fail("test -e /etc/gang/gang.toml")
+                assert wrongdevice.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-controller.target").strip() == "0"
+                assert wrongdevice.succeed("systemctl show -P ActiveEnterTimestampMonotonic gang-worker.target").strip() == "0"
+                wrongdevice.succeed("rc=0; blkid -p /dev/vdc >/dev/null || rc=$?; test \"$rc\" -eq 2")
+                wrongdevice.fail("mountpoint -q /var/lib/gang")
+                assert wrongdevice.succeed("systemctl show -P LoadState var-lib-gang.mount").strip() == "not-found"
+      '';
+    }

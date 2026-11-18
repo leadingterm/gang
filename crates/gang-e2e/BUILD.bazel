@@ -1,36 +1,12 @@
 load("//bazel/rust:defs.bzl", "workspace_rust_binary", "workspace_rust_library")
 
-config_setting(
-    name = "linux_x86_64",
-    constraint_values = [
-        "@platforms//os:linux",
-        "@platforms//cpu:x86_64",
-    ],
-)
-
-config_setting(
-    name = "linux_arm64",
-    constraint_values = [
-        "@platforms//os:linux",
-        "@platforms//cpu:aarch64",
-    ],
-)
-
-config_setting(
-    name = "macos_arm64",
-    constraint_values = [
-        "@platforms//os:macos",
-        "@platforms//cpu:aarch64",
-    ],
-)
-
 # The Bazel the harness drives: pinned in MODULE.bazel, one binary per host platform.
 alias(
     name = "bazel",
     actual = select({
-        ":linux_x86_64": "@bazel_linux_x86_64//file:bazel",
-        ":linux_arm64": "@bazel_linux_arm64//file:bazel",
-        ":macos_arm64": "@bazel_darwin_arm64//file:bazel",
+        "//bazel/platforms:linux_x86_64": "@bazel_linux_x86_64//file:bazel",
+        "//bazel/platforms:linux_arm64": "@bazel_linux_arm64//file:bazel",
+        "//bazel/platforms:macos_arm64": "@bazel_darwin_arm64//file:bazel",
     }),
 )
 
@@ -38,9 +14,9 @@ alias(
 alias(
     name = "test_bash",
     actual = select({
-        ":linux_x86_64": "@test_bash_linux_x86_64//file:bash",
-        ":linux_arm64": "@test_bash_linux_arm64//file:bash",
-        ":macos_arm64": "@test_bash_macos_arm64//file:bash",
+        "//bazel/platforms:linux_x86_64": "@test_bash_linux_x86_64//file:bash",
+        "//bazel/platforms:linux_arm64": "@test_bash_linux_arm64//file:bash",
+        "//bazel/platforms:macos_arm64": "@test_bash_macos_arm64//file:bash",
     }),
 )
 
@@ -63,6 +39,7 @@ workspace_rust_library(
         "//crates/gang-config:gang_config",
         "//crates/gang-local:gang_local",
         "//crates/gang-main:gang_main",
+        "//crates/gang-mtls:gang_mtls",
         "//crates/gang-nativelink:gang_nativelink",
         "//crates/gang-oidc:gang_oidc",
         "//crates/gang-os:gang_os",
@@ -81,7 +58,9 @@ workspace_rust_binary(
     # The glibc-toolchain scenario's dynamically linked glibc program, Linux only.
     data = [
         ":bazel",
+        "//:tools/e2e-gate.sh",
         "//crates/gang-main:gang",
+        "//crates/gang-testkit:postgresql_archive",
     ] + select({
         "@platforms//os:linux": ["//crates/gang-main/tests/preload:loaded_probe"],
         "//conditions:default": [],
@@ -90,11 +69,15 @@ workspace_rust_binary(
         "@platforms//os:linux": {
             "GANG_E2E_BAZEL": "$(rootpath :bazel)",
             "GANG_E2E_GANG": "$(rootpath //crates/gang-main:gang)",
+            "GANG_E2E_GATE_SCRIPT": "$(rootpath //:tools/e2e-gate.sh)",
             "GANG_E2E_GLIBC_TOOL": "$(rootpath //crates/gang-main/tests/preload:loaded_probe)",
+            "GANG_E2E_POSTGRES": "$(rootpath //crates/gang-testkit:postgresql_archive)",
         },
         "//conditions:default": {
             "GANG_E2E_BAZEL": "$(rootpath :bazel)",
             "GANG_E2E_GANG": "$(rootpath //crates/gang-main:gang)",
+            "GANG_E2E_GATE_SCRIPT": "$(rootpath //:tools/e2e-gate.sh)",
+            "GANG_E2E_POSTGRES": "$(rootpath //crates/gang-testkit:postgresql_archive)",
         },
     }),
     deps = [
@@ -102,7 +85,7 @@ workspace_rust_binary(
     ],
 )
 
-# The harness with the pinned Bazel and the glibc probe it runs, as plain files beside each other,
+# The harness with pinned Bazel, PostgreSQL archive and glibc probe as plain files,
 # for a job that runs the harness without Bazel (CI's e2e gates pass them by flag).
 genrule(
     name = "bundle",
@@ -110,16 +93,19 @@ genrule(
         ":bazel",
         ":local",
         "//crates/gang-main/tests/preload:loaded_probe",
+        "//crates/gang-testkit:postgresql_archive",
     ],
     outs = [
         "bundle/bazel",
         "bundle/local",
         "bundle/loaded_probe",
+        "bundle/postgresql.tar.gz",
     ],
     cmd = " && ".join([
         "cp $(execpath :bazel) $(execpath bundle/bazel)",
         "cp $(execpath :local) $(execpath bundle/local)",
         "cp $(execpath //crates/gang-main/tests/preload:loaded_probe) $(execpath bundle/loaded_probe)",
+        "cp $(execpath //crates/gang-testkit:postgresql_archive) $(execpath bundle/postgresql.tar.gz)",
     ]),
     target_compatible_with = ["@platforms//os:linux"],
 )

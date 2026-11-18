@@ -1,6 +1,6 @@
 # ADR-37: Headless login is a Gang device authorization approved through the dashboard sign-in
 
-Status: Accepted. Amends ADR-06 (who renews an interactive login) and ADR-29 (what the web client signs in for).
+Status: Accepted. Amends ADR-06 (who renews an interactive login) and ADR-29 (what the web client signs in for). Amended by ADR-43: pending device logins live in the database as expiring records, so any controller can continue one.
 
 ## Context
 - `gang login` needs a browser on the same machine: the provider redirects to the CLI's `127.0.0.1` listener. Over SSH, from a phone or a server, the user must copy a failed loopback URL out of an address bar.

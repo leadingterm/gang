@@ -1,14 +1,12 @@
 //! The browser routes under `/ui` (`/ui/login`, `/ui/callback`, `/ui/logout`), driven through the
 //! public gate and the routes.
 
-use std::num::NonZeroUsize;
-
 use crate::LoginSettings;
 use gang_spi::LoginClient;
 use gang_types::{ClientSecret, NonZeroDuration, ProviderName, SessionMaxAge};
 use gang_wire::{CALLBACK_PATH, LOGIN_PATH, LOGOUT_PATH, UiRoute};
 use http::StatusCode;
-use http::header::{ALLOW, CACHE_CONTROL, HeaderName};
+use http::header::{ALLOW, CACHE_CONTROL, HeaderName, LOCATION};
 
 use crate::test_support::{
     ApiReply, Harness, HarnessOptions, PlainDeployment, TlsDeployment, read, request,
@@ -97,7 +95,8 @@ async fn logout_clears_the_session_cookie_with_or_without_a_session() {
     let harness = Harness::<TlsDeployment>::token(HarnessOptions::default());
 
     let bare = post_logout(&harness, &[], SAME_ORIGIN).await;
-    assert_eq!(bare.status, StatusCode::NO_CONTENT);
+    assert_eq!(bare.status, StatusCode::SEE_OTHER);
+    assert_eq!(header(&bare, LOCATION), "/ui/");
     assert_eq!(header(&bare, CACHE_CONTROL), "no-store");
     assert_eq!(
         bare.set_cookies(),
@@ -107,7 +106,8 @@ async fn logout_clears_the_session_cookie_with_or_without_a_session() {
     let cookie = harness.signed_in_cookie("admin-proof").await;
     let cookies = [(harness.core.cookies.session, cookie.as_str())];
     let signed_in = post_logout(&harness, &cookies, SAME_ORIGIN).await;
-    assert_eq!(signed_in.status, StatusCode::NO_CONTENT);
+    assert_eq!(signed_in.status, StatusCode::SEE_OTHER);
+    assert_eq!(header(&signed_in, LOCATION), "/ui/");
     assert_eq!(header(&signed_in, CACHE_CONTROL), "no-store");
     assert_eq!(
         signed_in.set_cookies(),
@@ -119,7 +119,8 @@ async fn logout_clears_the_session_cookie_with_or_without_a_session() {
 async fn logout_from_the_endpoint_origin_clears_the_session_cookie() {
     let harness = Harness::<TlsDeployment>::token(HarnessOptions::default());
     let reply = post_logout(&harness, &[], Some(("origin", "https://gang.example.test"))).await;
-    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(header(&reply, LOCATION), "/ui/");
     assert_eq!(header(&reply, CACHE_CONTROL), "no-store");
     assert_eq!(
         reply.set_cookies(),
@@ -184,7 +185,8 @@ async fn http_endpoint_logout_accepts_its_own_origin_and_same_origin_fetches() {
     });
 
     let by_origin = post_logout(&harness, &[], Some(("origin", "http://gang.example.test"))).await;
-    assert_eq!(by_origin.status, StatusCode::NO_CONTENT);
+    assert_eq!(by_origin.status, StatusCode::SEE_OTHER);
+    assert_eq!(header(&by_origin, LOCATION), "/ui/");
     assert_eq!(
         by_origin.set_cookies(),
         vec![
@@ -194,7 +196,8 @@ async fn http_endpoint_logout_accepts_its_own_origin_and_same_origin_fetches() {
     );
 
     let by_fetch = post_logout(&harness, &[], SAME_ORIGIN).await;
-    assert_eq!(by_fetch.status, StatusCode::NO_CONTENT);
+    assert_eq!(by_fetch.status, StatusCode::SEE_OTHER);
+    assert_eq!(header(&by_fetch, LOCATION), "/ui/");
     assert_eq!(
         by_fetch.set_cookies(),
         vec![
@@ -254,7 +257,6 @@ async fn the_client_secret_appears_in_no_sign_in_response_or_settings_debug() {
             secret: ClientSecret::new(SECRET),
         },
         ttl: NonZeroDuration::from_mins(10),
-        max_pending: NonZeroUsize::new(8).expect("8 is non-zero"),
         session_max_age: SessionMaxAge::from_units(43_200),
         renewal_reuse: NonZeroDuration::from_mins(1),
         device: None,

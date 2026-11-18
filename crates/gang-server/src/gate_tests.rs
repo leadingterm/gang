@@ -8,14 +8,15 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 use crate::client_address::ClientAddress;
-use crate::gate::Caller;
+use crate::gate::{Caller, ExecutionListener, Gate};
 use gang_authn::anonymous;
 use gang_clock::Clock;
-use gang_spi::{Admitted, CertStatus, IssuedCertRecord, Peer, PortError, Rejection};
+use gang_spi::{Admitted, CertStatus, IssuedCertRecord, Peer, PortError, Rejection, RequestGate};
 use gang_testkit::Controller;
 use gang_types::{AccessToken, Identity, Principal, ProviderName};
 use gang_wire::routes::{
-    AUTHENTICATE_SESSION, GET_SERVER, GET_SESSION, LIST_EVENTS, REVOKE_PRINCIPAL,
+    AUTHENTICATE_SESSION, GET_SERVER, GET_SESSION, INGEST_BUILDS, LIST_BUILDS, LIST_EVENTS,
+    REVOKE_PRINCIPAL,
 };
 use http::StatusCode;
 
@@ -23,6 +24,79 @@ use crate::test_support::{
     SESSION_TTL, api_request, authority, client_certificate, cookie_parts, identity, mint_token,
     plain_parts, plain_settings, read, serve, session_token, tls_parts, tls_settings,
 };
+use crate::test_support_session_harness::{Harness, HarnessOptions};
+
+#[tokio::test]
+async fn execution_listener_marks_only_open_public_requests() {
+    let harness = Harness::anonymous(HarnessOptions::default());
+    let gate = harness.gate.clone().executing();
+    let mut open = cookie_parts("POST", "/v1/builds:ingest", None, None);
+    gate.admit(&Peer::default(), &mut open)
+        .await
+        .expect("the public gate admits open paths");
+    assert!(open.extensions.get::<ExecutionListener>().is_some());
+
+    for path in [
+        "/build.bazel.remote.execution.v2.Execution/Execute",
+        EXECUTE_PATH,
+    ] {
+        let mut execute = cookie_parts("POST", path, None, None);
+        let _ = gate.admit(&Peer::default(), &mut execute).await;
+        assert!(execute.extensions.get::<ExecutionListener>().is_none());
+    }
+}
+
+#[tokio::test]
+async fn non_execution_public_and_worker_gates_never_mark_requests() {
+    let harness = Harness::anonymous(HarnessOptions::default());
+    let mut public = cookie_parts("POST", "/v1/builds:ingest", None, None);
+    harness
+        .gate
+        .admit(&Peer::default(), &mut public)
+        .await
+        .expect("the public gate admits open paths");
+    assert!(public.extensions.get::<ExecutionListener>().is_none());
+
+    let worker = Gate::worker(harness.core.clone()).executing();
+    let mut request = cookie_parts("POST", "/v1/builds:ingest", None, None);
+    let _ = worker.admit(&Peer::default(), &mut request).await;
+    assert!(request.extensions.get::<ExecutionListener>().is_none());
+}
+
+/// A follower's ingest on the execution listener is the controller's own traffic: the gate leaves
+/// it to the controller proof and never asks the client plugin, whose key it would otherwise load
+/// from the signer, while every other open path there still authenticates.
+#[tokio::test]
+async fn execution_gate_admits_ingest_without_the_client_plugin() {
+    let harness = Harness::token(HarnessOptions::default());
+    let gate = harness.gate.clone().executing();
+    let junk = AccessToken::new("junk".to_owned());
+    let key_reads = harness.core.host.signer.public_key_reads();
+
+    let mut ingest = cookie_parts("POST", INGEST_BUILDS.template, None, Some(&junk));
+    let admitted = gate
+        .admit(&Peer::default(), &mut ingest)
+        .await
+        .expect("the execution gate admits the ingest");
+    assert_eq!(admitted, Admitted::Anonymous);
+    assert!(ingest.extensions.get::<ExecutionListener>().is_some());
+    assert_anonymous(&ingest, "a bearer token on the execution listener's ingest");
+    assert_eq!(
+        harness.core.host.signer.public_key_reads(),
+        key_reads,
+        "the ingest never loads the client plugin's key"
+    );
+
+    let mut builds = cookie_parts("GET", LIST_BUILDS.template, None, Some(&junk));
+    gate.admit(&Peer::default(), &mut builds)
+        .await
+        .expect("the execution gate admits open paths");
+    assert_refused(
+        &builds,
+        Rejection::InvalidProof,
+        "a malformed bearer token on another open path of the execution listener",
+    );
+}
 
 const PROVIDER: &str = "example-idp";
 const ADMIN: &str = "admin";
@@ -134,10 +208,7 @@ async fn get_with_session_cookie_authenticates_the_cookie_identity() {
                 .expect("the session cookie authenticates the caller");
             assert_eq!(admitted, Admitted::Authenticated(authenticated.clone()));
             assert_eq!(authenticated.identity.as_ref(), &identity(ALICE));
-            assert_eq!(
-                authenticated.valid_until,
-                Some(clock.wall() + SESSION_TTL + CLOCK_SKEW)
-            );
+            assert_eq!(authenticated.valid_until, Some(clock.wall() + SESSION_TTL));
             assert!(!matches!(caller, Caller::Refused(_)), "nothing is refused");
         },
     )
@@ -164,10 +235,7 @@ async fn head_with_session_cookie_authenticates_the_cookie_identity() {
                 .as_authenticated()
                 .expect("the session cookie authenticates the caller");
             assert_eq!(authenticated.identity.as_ref(), &identity(ALICE));
-            assert_eq!(
-                authenticated.valid_until,
-                Some(clock.wall() + SESSION_TTL + CLOCK_SKEW)
-            );
+            assert_eq!(authenticated.valid_until, Some(clock.wall() + SESSION_TTL));
             assert!(!matches!(caller, Caller::Refused(_)), "nothing is refused");
         },
     )

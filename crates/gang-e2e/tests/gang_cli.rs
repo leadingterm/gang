@@ -66,6 +66,10 @@ fn every_command_keeps_its_credentials_under_home() -> TestResult {
             Some(PathBuf::from("home"))
         );
         assert_eq!(
+            environment(command, "XDG_CACHE_HOME"),
+            Some(PathBuf::from("home/.cache"))
+        );
+        assert_eq!(
             command
                 .get_envs()
                 .find(|(key, _)| *key == "RUNNER_TEMP")

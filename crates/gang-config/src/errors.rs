@@ -1,6 +1,7 @@
 //! Errors of `gang.toml` parsing and validation.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use gang_types::{FleetName, Isa, MAX_FLEETS, ProviderName, RoleName, Url};
 
@@ -135,6 +136,108 @@ pub enum ConfigError {
     EndpointRequired {
         /// The configured public listen address.
         listen: SocketAddr,
+    },
+    /// `execution_endpoint` requires a separate execution listener.
+    #[error("execution_endpoint requires execution_listen")]
+    #[fix("set execution_listen or remove execution_endpoint")]
+    ExecutionEndpointWithoutListen,
+    /// A non-loopback execution listener needs an explicit endpoint.
+    #[error(
+        "execution_endpoint is required when execution_listen `{listen}` is not a loopback address"
+    )]
+    #[fix("set execution_endpoint to the address clients dial")]
+    ExecutionEndpointRequired {
+        /// Configured execution listener.
+        listen: SocketAddr,
+    },
+    /// The execution endpoint has the wrong scheme for TLS.
+    #[error("execution_endpoint `{0}` must be an https url when server.transport is \"tls\"")]
+    #[fix("set execution_endpoint to an https url")]
+    ExecutionEndpointNotHttps(Url),
+    /// The execution endpoint has the wrong scheme for plaintext.
+    #[error(
+        "execution_endpoint `{0}` must be an http or https url when server.transport is \"plaintext\""
+    )]
+    #[fix("set execution_endpoint to an http or https url")]
+    ExecutionEndpointNotHttp(Url),
+    /// The execution endpoint must use the public endpoint's host.
+    #[error(
+        "execution_endpoint `{execution_endpoint}` must use the same host as endpoint `{endpoint}`"
+    )]
+    #[fix("set execution_endpoint to the same host as endpoint")]
+    ExecutionEndpointHostMismatch {
+        /// The public endpoint.
+        endpoint: String,
+        /// The execution endpoint.
+        execution_endpoint: String,
+    },
+    /// A dedicated execution endpoint must not route back through the public frontend.
+    #[error("execution_endpoint resolves to the same scheme, host and port as endpoint")]
+    #[fix("set execution_endpoint to a different scheme or port")]
+    ExecutionEndpointSelfRelay,
+    /// A leader-only listener uses an ephemeral port.
+    #[error("{key} `{listen}` must name a non-zero port")]
+    #[fix("set {key} to an address with a non-zero port")]
+    LeaderListenerPortUnset {
+        /// Listener TOML key.
+        key: &'static str,
+        /// Configured listener.
+        listen: SocketAddr,
+    },
+    /// Two listeners cannot bind overlapping non-ephemeral addresses.
+    #[error("{first} and {second} have conflicting listen addresses at `{listen}`")]
+    #[fix("configure distinct listener addresses")]
+    ListenerCollision {
+        /// First listener TOML key.
+        first: &'static str,
+        /// Second listener TOML key.
+        second: &'static str,
+        /// Conflicting address.
+        listen: SocketAddr,
+    },
+    /// Leadership renewal leaves insufficient time for a mutation and clock skew.
+    #[error(
+        "server.leadership.renew_interval {renew_interval:?} plus call_timeout {call_timeout:?} and clock_skew {clock_skew:?} must be below ttl {ttl:?}"
+    )]
+    #[fix(
+        "set server.leadership.renew_interval plus call_timeout and clock_skew below server.leadership.ttl"
+    )]
+    LeadershipRenewalTooLate {
+        /// Lease lifetime.
+        ttl: Duration,
+        /// Renewal interval.
+        renew_interval: Duration,
+        /// Minimum remaining validity for a mutation.
+        call_timeout: Duration,
+        /// Clock skew allowance.
+        clock_skew: Duration,
+    },
+    /// Bazel drops a frozen controller after the keepalive timeout; its reconnect must find the
+    /// new leader healthy.
+    #[error(
+        "server.leadership ttl plus clock_skew and renew_interval ({takeover:?}) plus the load balancer's healthy window ({healthy_window:?}) must be below the client keepalive timeout {keepalive_timeout:?}"
+    )]
+    #[fix("lower server.leadership.ttl, clock_skew or renew_interval")]
+    LeadershipOutlastsKeepalive {
+        /// Maximum leader takeover time.
+        takeover: Duration,
+        /// Time for the load balancer to mark the new leader healthy.
+        healthy_window: Duration,
+        /// Client keepalive timeout.
+        keepalive_timeout: Duration,
+    },
+    /// Scheduler hand-off is not strictly below a fleet's boot grace.
+    #[error("{key} {shutdown_grace:?} must be below fleets `{fleet}` boot_grace {boot_grace:?}")]
+    #[fix("set {key} below fleets boot_grace")]
+    ShutdownGraceNotBelowBootGrace {
+        /// Scheduler setting's full TOML key.
+        key: &'static str,
+        /// Scheduler hand-off duration.
+        shutdown_grace: Duration,
+        /// Fleet whose boot grace is too short.
+        fleet: FleetName,
+        /// Fleet boot grace.
+        boot_grace: Duration,
     },
     /// The scheduler worker endpoint is omitted but `worker_listen` is not loopback.
     #[error("{key} is required when worker_listen `{listen}` is not a loopback address")]
@@ -277,6 +380,43 @@ mod tests {
             ConfigError::EndpointNotHttp(endpoint()),
             ConfigError::EndpointRequired {
                 listen: "0.0.0.0:443".parse().expect("the address is valid"),
+            },
+            ConfigError::ExecutionEndpointWithoutListen,
+            ConfigError::ExecutionEndpointRequired {
+                listen: "0.0.0.0:443".parse().expect("the address is valid"),
+            },
+            ConfigError::ExecutionEndpointNotHttps(endpoint()),
+            ConfigError::ExecutionEndpointNotHttp(endpoint()),
+            ConfigError::ExecutionEndpointHostMismatch {
+                endpoint: endpoint().to_string(),
+                execution_endpoint: endpoint().to_string(),
+            },
+            ConfigError::ExecutionEndpointSelfRelay,
+            ConfigError::LeaderListenerPortUnset {
+                key: "execution_listen",
+                listen: "127.0.0.1:0".parse().expect("the address is valid"),
+            },
+            ConfigError::ListenerCollision {
+                first: "listen",
+                second: "worker_listen",
+                listen: "127.0.0.1:443".parse().expect("the address is valid"),
+            },
+            ConfigError::LeadershipRenewalTooLate {
+                ttl: Duration::from_secs(10),
+                renew_interval: Duration::from_secs(8),
+                call_timeout: Duration::from_secs(2),
+                clock_skew: Duration::from_secs(2),
+            },
+            ConfigError::LeadershipOutlastsKeepalive {
+                takeover: Duration::from_secs(25),
+                healthy_window: Duration::from_secs(10),
+                keepalive_timeout: Duration::from_secs(30),
+            },
+            ConfigError::ShutdownGraceNotBelowBootGrace {
+                key: "scheduler.nativelink.http2.shutdown_grace",
+                shutdown_grace: Duration::from_secs(30),
+                fleet: fleet(),
+                boot_grace: Duration::from_secs(30),
             },
             ConfigError::WorkerEndpointRequired {
                 key: "worker_endpoint",

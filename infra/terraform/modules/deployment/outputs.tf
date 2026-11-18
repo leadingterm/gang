@@ -19,12 +19,12 @@ output "endpoint" {
 }
 
 output "worker_endpoint" {
-  description = "Worker endpoint written to gang.toml. Resolves to the controller private DNS name inside the VPC."
+  description = "Worker endpoint written to gang.toml: the controller private DNS name for SQLite, or the internal load balancer hostname for PostgreSQL or DynamoDB."
   value       = local.worker_endpoint
 }
 
 output "controller_public_ip" {
-  description = "Public IP of the controller Elastic IP: point the endpoint DNS record here, or, with load_balancer, the controller's egress address."
+  description = "Public IP of the controller Elastic IP, or null for a controller group."
   value       = module.network.controller_public_ip
 }
 
@@ -39,7 +39,7 @@ output "certificate_validation_records" {
 }
 
 output "controller_public_dns" {
-  description = "EC2 public DNS name of the controller Elastic IP."
+  description = "EC2 public DNS name of the controller Elastic IP, or null for a controller group."
   value       = module.network.controller_public_dns
 }
 
@@ -54,8 +54,18 @@ output "asg_names" {
 }
 
 output "controller_instance_id" {
-  description = "Instance id of the controller."
+  description = "Instance ID of the SQLite controller, or null for a controller group."
   value       = module.controller.instance_id
+}
+
+output "controller_shape" {
+  description = "Controller resource shape: instance for SQLite or group for PostgreSQL or DynamoDB."
+  value       = local.controller_shape
+}
+
+output "controller_autoscaling_group_name" {
+  description = "Controller Auto Scaling group name, or null for the instance shape."
+  value       = module.controller.autoscaling_group_name
 }
 
 output "cache_bucket_name" {

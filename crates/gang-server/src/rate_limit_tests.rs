@@ -2,7 +2,6 @@
 //! records for them, driven through a running server on the injected clock.
 
 use std::net::{IpAddr, Ipv4Addr};
-use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use crate::ServerSettings;
@@ -91,7 +90,6 @@ fn login_settings(enabled: bool) -> ServerSettings {
                 secret: ClientSecret::new("secret"),
             },
             ttl: NonZeroDuration::from_mins(10),
-            max_pending: NonZeroUsize::new(8).expect("8 is nonzero"),
             session_max_age: SessionMaxAge::from_units(43_200),
             renewal_reuse: NonZeroDuration::from_mins(1),
             device: None,

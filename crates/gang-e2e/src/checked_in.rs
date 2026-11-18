@@ -19,8 +19,8 @@ use crate::cli_terminal::{Finished, run_until};
 use crate::errors::{E2eError, Result};
 use crate::names;
 use crate::placement::Placement;
+use crate::settings::DeploymentInputs;
 use crate::stack::is_announcement;
-use crate::suite::Invocation;
 use crate::template::{self, Transport};
 
 /// One checked-in configuration: its file name in `configs/` and whether it needs AWS to run.
@@ -137,12 +137,12 @@ pub(crate) fn retarget(
 /// The checked-in configurations of the invocation, each started with the `gang` binary under
 /// test.
 pub(crate) struct ShippedConfigs<'a> {
-    invocation: &'a Invocation,
+    invocation: &'a DeploymentInputs,
 }
 
 impl<'a> ShippedConfigs<'a> {
     /// The checked-in configurations of `invocation`.
-    pub(crate) const fn new(invocation: &'a Invocation) -> Self {
+    pub(crate) const fn new(invocation: &'a DeploymentInputs) -> Self {
         Self { invocation }
     }
 }

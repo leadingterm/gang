@@ -47,17 +47,11 @@ const DEFAULT_DETAIL_INTERVAL: NonZeroDuration = NonZeroDuration::from_secs(10);
 /// The default lifetime of a dashboard login: ten minutes.
 const DEFAULT_LOGIN_TTL: NonZeroDuration = NonZeroDuration::from_mins(10);
 
-/// The default number of logins in progress at once: 1024.
-const DEFAULT_MAX_PENDING_LOGINS: NonZeroUsize = NonZeroUsize::new(1024).expect("1024 is non-zero");
-
 /// The default lifetime of a device authorization: ten minutes.
 const DEFAULT_DEVICE_TTL: DeviceCodeTtl = DeviceCodeTtl::from_units(600);
 
 /// The default interval between device polls: five seconds.
 const DEFAULT_DEVICE_POLL_INTERVAL: DevicePollInterval = DevicePollInterval::from_units(5);
-
-/// The default number of device authorizations pending at once: 1024.
-const DEFAULT_DEVICE_MAX_PENDING: NonZeroUsize = NonZeroUsize::new(1024).expect("1024 is non-zero");
 
 /// The default absolute browser session lifetime: twelve hours.
 const DEFAULT_SESSION_MAX_AGE: SessionMaxAge = SessionMaxAge::from_units(43_200);
@@ -159,8 +153,6 @@ pub struct DeviceConfig {
     pub ttl: DeviceCodeTtl,
     /// How often a device may poll (ADR-37), from 1s to 1h and shorter than `ttl`. Defaults to 5s.
     pub poll_interval: DevicePollInterval,
-    /// The most device authorizations pending at once (ADR-37). Defaults to 1024.
-    pub max_pending: NonZeroUsize,
 }
 
 impl Default for DeviceConfig {
@@ -169,7 +161,6 @@ impl Default for DeviceConfig {
             enabled: true,
             ttl: DEFAULT_DEVICE_TTL,
             poll_interval: DEFAULT_DEVICE_POLL_INTERVAL,
-            max_pending: DEFAULT_DEVICE_MAX_PENDING,
         }
     }
 }
@@ -181,7 +172,6 @@ struct RawDeviceConfig {
     enabled: bool,
     ttl: DeviceCodeTtl,
     poll_interval: DevicePollInterval,
-    max_pending: NonZeroUsize,
 }
 
 impl Default for RawDeviceConfig {
@@ -191,7 +181,6 @@ impl Default for RawDeviceConfig {
             enabled: device.enabled,
             ttl: device.ttl,
             poll_interval: device.poll_interval,
-            max_pending: device.max_pending,
         }
     }
 }
@@ -207,7 +196,6 @@ impl TryFrom<RawDeviceConfig> for DeviceConfig {
             enabled: raw.enabled,
             ttl: raw.ttl,
             poll_interval: raw.poll_interval,
-            max_pending: raw.max_pending,
         })
     }
 }
@@ -253,8 +241,6 @@ pub struct DashboardConfig {
     /// non-zero. Defaults to ten minutes. The short-lived token lifetime is the token plugin's
     /// `token_ttl`.
     pub login_ttl: NonZeroDuration,
-    /// The most logins in progress at once. Defaults to 1024.
-    pub max_pending_logins: NonZeroUsize,
     /// The absolute lifetime of a browser session (ADR-39): renewal stops this long after the
     /// sign-in that set the renewal cookie, and the next sign-in asks no consent. From 1m to 30d.
     /// Defaults to 12 hours.
@@ -286,7 +272,6 @@ impl Default for DashboardConfig {
             detail_interval: DEFAULT_DETAIL_INTERVAL,
             actions_stale_after: None,
             login_ttl: DEFAULT_LOGIN_TTL,
-            max_pending_logins: DEFAULT_MAX_PENDING_LOGINS,
             session_max_age: DEFAULT_SESSION_MAX_AGE,
             renewal_reuse: DEFAULT_RENEWAL_REUSE,
             device: DeviceConfig::default(),

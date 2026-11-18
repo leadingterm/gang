@@ -343,9 +343,8 @@ pub trait Execution: Sync {
     /// When the filesystem cannot be queried.
     fn path_exists(&self, path: &Path) -> Result<bool>;
 
-    /// Records a spot interruption of the Local Mode instance `instance`, terminating now, the
-    /// way `gang_local::Local::request_preemption` does: the mock IMDS then reports it to the
-    /// instance's worker.
+    /// Writes a spot interruption notice for the Local Mode instance `instance`, terminating now,
+    /// which the mock metadata service then reports to the instance's worker.
     ///
     /// # Errors
     ///
@@ -475,20 +474,38 @@ impl<E: Execution> Lines<'_, E> {
     }
 }
 
+/// Releases, kills, and drains a held build whose observation unwinds, so that the scope can join
+/// its thread instead of waiting on a build no one releases or reads.
+struct UnwindGuard<'e, S: System, E: Execution> {
+    system: &'e S,
+    lines: Lines<'e, E>,
+}
+
+impl<S: System, E: Execution> Drop for UnwindGuard<'_, S, E> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let _ = self.lines.exec.set_go(true);
+            let _ = self.system.kill_server();
+            let _ = self.lines.drain();
+        }
+    }
+}
+
 /// Builds `probes` as a fresh [`Run`] on a thread while `during` observes the build through that
-/// run's journal lines, releases the go flag after `during` returns on success or error, then
-/// drains and joins the build.
+/// run's journal lines, releases the go flag after `during` returns, panics, or fails, then drains
+/// and joins the build.
 ///
 /// The build thread ends the journal when its build returns, so a wait of `during` for a line
 /// that never comes ends with the build, and so does the final read. The journal is read to its
 /// end before the build is joined, so a deployment that advances a held action only as its
-/// journal is read (a simulation) can finish it. When `during` fails, the server is killed so that
-/// a held build fails at once, and its error is returned.
+/// journal is read (a simulation) can finish it. When `during` or the release fails, the server
+/// is killed at best effort so that a held build fails at once; that kill and the build failure
+/// it induces never hide the error that caused them.
 ///
 /// # Errors
 ///
-/// The errors of `during` and of the build, and [`E2eError::System`] when the build thread
-/// panicked or no run can be drawn.
+/// The first error of `during`, the release, the final read, and the build, in that order, and
+/// [`E2eError::System`] when the build thread panicked or no run can be drawn.
 pub fn held_build<S: System, E: Execution, T>(
     system: &S,
     exec: &E,
@@ -502,22 +519,26 @@ pub fn held_build<S: System, E: Execution, T>(
             exec.end_lines()?;
             outcome
         });
-        let mut lines = Lines {
-            exec,
-            run: &run,
-            ended: false,
+        let mut guard = UnwindGuard {
+            system,
+            lines: Lines {
+                exec,
+                run: &run,
+                ended: false,
+            },
         };
-        let observed = during(&mut lines);
+        let observed = during(&mut guard.lines);
         let released = exec.set_go(true);
         if observed.is_err() || released.is_err() {
-            system.kill_server()?;
+            let _ = system.kill_server();
         }
-        lines.drain()?;
-        let outcome = build
-            .join()
-            .map_err(|_| E2eError::system("the build thread panicked"))??;
+        let drained = guard.lines.drain();
+        let joined = build.join();
+        let value = observed?;
         released?;
-        Ok((outcome, observed?))
+        drained?;
+        let outcome = joined.map_err(|_| E2eError::system("the build thread panicked"))??;
+        Ok((outcome, value))
     })
 }
 

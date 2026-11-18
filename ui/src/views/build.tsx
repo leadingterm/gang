@@ -1,9 +1,9 @@
 // One build's full, in-memory view, refreshed by its streamed row or the build-only refresh.
 import { useEffect } from "preact/hooks";
-import { clock, duration, percent } from "../format.ts";
+import { duration, percent } from "../format.ts";
 import { identityOf, ms, seconds } from "../wire-parse.ts";
 import type { Build as BuildData, ScalingEvent, State } from "../wire.ts";
-import { Empty, Num, Section, Target, useClient } from "../ui.tsx";
+import { Cell, Clock, Duration, Empty, Ident, Num, Row, Section, Table, Target, useClient } from "../ui.tsx";
 import { actionSeconds } from "./builds.tsx";
 import { Forbidden } from "./gate.tsx";
 
@@ -38,7 +38,7 @@ const TimeBar = ({ build }: { build: BuildData }) => {
           );
         })}
       </svg>
-      <p>{parts.map(([label, value]) => `${label} ${duration(value * 1000)}`).join(" · ")}</p>
+      <p>{parts.map(([label, value], i) => <span key={label}>{i > 0 && " · "}{label} <Duration ms={value * 1000} /></span>)}</p>
       <p class="dim">Remote work Gang saw; local actions, disk-cache hits and analysis are not included.</p>
     </Section>
   );
@@ -87,7 +87,7 @@ const BuildTimeline = ({ build, events }: { build: BuildData; events: ScalingEve
           );
         })}
       </svg>
-      <div class="passbar__axis"><span>{clock(start)} UTC</span><span>{clock(start + span)} UTC</span></div>
+      <div class="passbar__axis"><span><Clock t={start} /> UTC</span><span><Clock t={start + span} /> UTC</span></div>
       <div class="legend" aria-label="Timeline legend">
         <span class="legend__item"><i class="build-swatch build-swatch--executing" /> executing</span>
         <span class="legend__item"><i class="build-swatch build-swatch--queued" /> queued</span>
@@ -109,24 +109,20 @@ const CacheCard = ({ build }: { build: BuildData }) => {
       <p>Hit rate <strong>{percent(cache.hits, cache.hits + cache.misses + cache.errors)}</strong> · {cache.hits} hits · {cache.misses} misses · {cache.errors} errors</p>
       <h3 class="label">Misses by mnemonic</h3>
       {mnemonics.length === 0 && other === 0 ? <p class="dim">No mnemonic misses recorded.</p> : (
-        <table class="table build-counts">
-          <tbody>
-            {mnemonics.map((m) => (
-              <tr key={m.mnemonic}><td>{m.mnemonic}</td><td class="r">{m.usage.cache.misses}</td></tr>
-            ))}
-            {other > 0 && <tr><td>Other</td><td class="r">{other}</td></tr>}
-          </tbody>
-        </table>
+        <Table cls="build-counts" cols={[{ share: 1 }, { end: true }]}>
+          {mnemonics.map((m) => (
+            <Row key={m.mnemonic}><Cell><Ident text={m.mnemonic} /></Cell><Cell cls="r">{m.usage.cache.misses}</Cell></Row>
+          ))}
+          {other > 0 && <Row><Cell>Other</Cell><Cell cls="r">{other}</Cell></Row>}
+        </Table>
       )}
       <h3 class="label">Most-missed targets</h3>
       {targets.length === 0 ? <p class="dim">No missed targets recorded.</p> : (
-        <table class="table build-counts">
-          <tbody>
-            {targets.map((t) => (
-              <tr key={t.target}><td><Target label={t.target} /></td><td class="r">{t.overestimate > 0 && "≈"}{t.misses}</td></tr>
-            ))}
-          </tbody>
-        </table>
+        <Table cls="build-counts" cols={[{ share: 1 }, { end: true }]}>
+          {targets.map((t) => (
+            <Row key={t.target}><Cell><Target label={t.target} /></Cell><Cell cls="r">{t.overestimate > 0 && "≈"}{t.misses}</Cell></Row>
+          ))}
+        </Table>
       )}
     </Section>
   );
@@ -157,20 +153,17 @@ const ExecutionsCard = ({ build }: { build: BuildData }) => {
 const SlowestTable = ({ build }: { build: BuildData }) => (
   <Section id="build-slowest" title="Slowest actions">
     {(build.slowest ?? []).length === 0 ? <p class="dim">No completed actions recorded.</p> : (
-      <table class="table">
-        <thead><tr><th>Target</th><th>Mnemonic</th><th>Worker</th><th>Span</th><th>Exit</th></tr></thead>
-        <tbody>
-          {(build.slowest ?? []).map((a, i) => (
-            <tr key={i}>
-              <td class="a-main"><Target label={a.target || a.digest} /></td>
-              <td class="a-kind">{a.mnemonic || "—"}</td>
-              <td class="a-m1">{a.worker || "—"}</td>
-              <td class="a-age">{duration(seconds(a.span) * 1000)}</td>
-              <td class="a-m2">{a.exitCode}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      <Table cols={[{ head: "Target", share: 1 }, { head: "Mnemonic", fit: 10 }, { head: "Worker", fit: 16 }, { head: "Span" }, { head: "Exit", end: true }]}>
+        {(build.slowest ?? []).map((a, i) => (
+          <Row key={i}>
+            <Cell cls="a-main"><Target label={a.target || a.digest} /></Cell>
+            <Cell cls="a-kind">{a.mnemonic ? <Ident text={a.mnemonic} /> : "—"}</Cell>
+            <Cell cls="a-m1">{a.worker ? <Ident text={a.worker} /> : "—"}</Cell>
+            <Cell cls="a-age"><Duration ms={seconds(a.span) * 1000} /></Cell>
+            <Cell cls="a-m2 r">{a.exitCode}</Cell>
+          </Row>
+        ))}
+      </Table>
     )}
   </Section>
 );
@@ -181,9 +174,9 @@ const LiveActions = ({ build, state }: { build: BuildData; state: State | null }
   return (
     <Section id="build-actions" title="Running and queued">
       <h3 class="label">Running</h3>
-      {running.length ? <ul>{running.map((a) => <li key={a.name}><Target label={a.target || a.digest} /> · {a.mnemonic}</li>)}</ul> : <p class="dim">None sampled</p>}
+      {running.length ? <ul>{running.map((a) => <li key={a.name} class="line"><Target label={a.target || a.digest} />{" "}<span class="quiet">·</span>{" "}<Ident text={a.mnemonic} cls="quiet" /></li>)}</ul> : <p class="dim">None sampled</p>}
       <h3 class="label">Queued</h3>
-      {queued.length ? <ul>{queued.map((a) => <li key={a.name}><Target label={a.target || a.digest} /> · {a.mnemonic}</li>)}</ul> : <p class="dim">None sampled</p>}
+      {queued.length ? <ul>{queued.map((a) => <li key={a.name} class="line"><Target label={a.target || a.digest} />{" "}<span class="quiet">·</span>{" "}<Ident text={a.mnemonic} cls="quiet" /></li>)}</ul> : <p class="dim">None sampled</p>}
     </Section>
   );
 };
@@ -192,14 +185,14 @@ export const BuildView = ({ build }: { build: BuildData }) => {
   const state = useClient().state.value;
   return (
     <>
-      <Section id="build-header" title={identityOf(build.principal)}>
+      <Section id="build-header" title={identityOf(build.principal)} mono>
         <div class="readouts build-header">
           <div class="readout">
             <h3 class="label">Invocation</h3>
-            <p class="mono">{build.invocationId} <button class="btn btn--quiet" type="button" onClick={() => void navigator.clipboard.writeText(build.invocationId)}>Copy</button></p>
+            <p class="line"><Ident text={build.invocationId} />{" "}<button class="btn btn--quiet" type="button" onClick={() => void navigator.clipboard.writeText(build.invocationId)}>Copy</button></p>
           </div>
-          <div class="readout"><h3 class="label">Tool</h3><p>{build.tool || "Unknown tool"}</p></div>
-          <div class="readout"><h3 class="label">Span</h3><p class="mono">{duration(ms(build.lastActiveTime) - ms(build.startTime))}</p></div>
+          <div class="readout"><h3 class="label">Tool</h3><p><Ident text={build.tool || "Unknown tool"} /></p></div>
+          <div class="readout"><h3 class="label">Span</h3><p><Duration ms={ms(build.lastActiveTime) - ms(build.startTime)} /></p></div>
           <div class="readout"><h3 class="label">State</h3><p><span class={build.state === "IDLE" ? "tag" : "tag tag--spot"}>{build.state}</span></p></div>
         </div>
         {build.state === "IDLE" && <p class="dim">No observation for a while; Gang cannot know if it finished.</p>}
@@ -232,7 +225,7 @@ export const Build = ({ id }: { id: string }) => {
   if (detail.kind === "error") return <Empty><h2>Could not load build</h2></Empty>;
   return (
     <>
-      {detail.failing && <p class="caution" role="status">Could not refresh this build; showing it as of {clock(detail.asOf)}</p>}
+      {detail.failing && <p class="caution" role="status">Could not refresh this build; showing it as of <Clock t={detail.asOf} /></p>}
       <BuildView build={detail.build} />
     </>
   );

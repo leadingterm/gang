@@ -12,7 +12,8 @@ use gang_wire::{ClosedReason, CookieNames, Frame};
 use http::Method;
 
 use crate::access_verdict::{
-    CookieValue, ExpectedCookie, MaxAge, Verdict, cookie_set, redirected_to, set_cookies, status_is,
+    CookieValue, ExpectedCookie, MaxAge, Verdict, cookie_set, logout_redirected, redirected_to,
+    set_cookies, status_is,
 };
 use crate::browser_verdict::{
     authorized, consent_free, cross_site_renewal_refused, offline_requested, rechecked,
@@ -488,7 +489,7 @@ impl<B: Browser> Scenario<'_, B> {
         self.jar.absorb(&after);
         let verdict = fresh
             .map(drop)
-            .and_then(|()| status_is(&logout, 204))
+            .and_then(|()| logout_redirected(&logout))
             .and_then(|()| {
                 cookie_set(
                     &logout,
@@ -500,7 +501,7 @@ impl<B: Browser> Scenario<'_, B> {
                     },
                 )
             })
-            .and_then(|()| renewal_cleared(&logout, 204, self.cookies.renewal))
+            .and_then(|()| renewal_cleared(&logout, 303, self.cookies.renewal))
             .and_then(|()| status_is(&after, 401));
         self.checks.push(judged(names::LOGOUT_CLEARS_BOTH, verdict));
         let fresh = sign_in(self.browser, &mut self.jar)?;

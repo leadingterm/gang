@@ -3,6 +3,7 @@
 use gang_clock::Timestamp;
 use gang_types::{CertSerial, FleetName, Identity, InstanceId, ScalingCause, WorkerId};
 
+use crate::counter::counter;
 use crate::{PortError, port};
 
 /// Durable records. Fleet state is never stored here.
@@ -53,6 +54,39 @@ pub trait StateRepositoryPort: Send + Sync {
         &self,
         identity: &Identity,
     ) -> Result<Vec<IssuedCertRecord>, PortError>;
+
+    /// Overwrites `into` with at most `limit` certificates, revoked or not, ordered by serial,
+    /// whose serial comes strictly after `after` (`None` is the start of the ledger). The buffer
+    /// is reused.
+    ///
+    /// Returns `more`: `true` exactly when certificates beyond `limit` exist after the last one
+    /// returned, so a caller resumes from that serial. An empty listing leaves `into` empty and
+    /// returns `false`.
+    ///
+    /// # Errors
+    ///
+    /// [`PortError`] when the ledger cannot be read.
+    async fn certificates(
+        &self,
+        after: Option<&CertSerial>,
+        limit: std::num::NonZeroUsize,
+        into: &mut Vec<IssuedCertRecord>,
+    ) -> Result<bool, PortError>;
+
+    /// The revocation epoch: it advances, in the same write, with every [`revoke`],
+    /// [`revoke_principal`] and [`restore_principal`], and nothing else moves it. A controller
+    /// that sees it change re-reads [`revoked`] and [`revoked_principals`].
+    ///
+    /// [`revoke`]: StateRepositoryPort::revoke
+    /// [`revoke_principal`]: StateRepositoryPort::revoke_principal
+    /// [`restore_principal`]: StateRepositoryPort::restore_principal
+    /// [`revoked`]: StateRepositoryPort::revoked
+    /// [`revoked_principals`]: StateRepositoryPort::revoked_principals
+    ///
+    /// # Errors
+    ///
+    /// [`PortError`] when the epoch cannot be read.
+    async fn revocation_epoch(&self) -> Result<RevocationEpoch, PortError>;
 
     /// Appends one entry to the scaling audit log and returns its sequence number, which is
     /// greater than that of every event recorded before it.
@@ -187,24 +221,16 @@ pub enum CertStatus {
     },
 }
 
-/// Position of a recorded scaling event. Strictly increasing and assigned by the repository;
-/// `0` precedes every event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct ScalingEventSeq(u64);
+counter!(
+    /// The count of revocation changes a repository has recorded; `0` before the first.
+    RevocationEpoch
+);
 
-impl ScalingEventSeq {
-    /// The sequence number `value`.
-    #[must_use]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// The sequence number as an integer.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
+counter!(
+    /// Position of a recorded scaling event. Strictly increasing and assigned by the repository;
+    /// `0` precedes every event.
+    ScalingEventSeq
+);
 
 /// A scaling audit event together with its sequence number.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use gang_spi::{
     Admitted, Authenticated, AuthenticationPort, Evidence, Peer, PortError, Rejection, RequestGate,
 };
-use gang_wire::routes::{Method as RouteMethod, accepts_cookie};
+use gang_wire::routes::{self, Method as RouteMethod, RouteId, accepts_cookie};
 use http::header::AUTHORIZATION;
 use http::request::Parts;
 use http::{Extensions, Method};
@@ -57,6 +57,10 @@ impl Caller {
     }
 }
 
+/// Marks an open-path request admitted by the execution listener's public gate.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExecutionListener;
+
 /// What only the public listener's gate has: it reads the session cookie, and resolves the client
 /// address of each open-path request through the proxies whose `X-Forwarded-For` it believes.
 #[derive(Clone)]
@@ -72,6 +76,7 @@ pub(crate) struct Gate<K: Stack, P: AuthenticationPort> {
     plugin: Arc<P>,
     /// The public listener's surface; `None` on the worker listener.
     public: Option<PublicSurface>,
+    execution: bool,
 }
 
 impl<K: Stack, P: AuthenticationPort> Clone for Gate<K, P> {
@@ -80,6 +85,7 @@ impl<K: Stack, P: AuthenticationPort> Clone for Gate<K, P> {
             core: Arc::clone(&self.core),
             plugin: Arc::clone(&self.plugin),
             public: self.public.clone(),
+            execution: self.execution,
         }
     }
 }
@@ -93,6 +99,7 @@ impl<K: Stack> Gate<K, K::Clients> {
             plugin: Arc::clone(&core.clients),
             core,
             public: Some(PublicSurface { proxies }),
+            execution: false,
         }
     }
 }
@@ -105,11 +112,18 @@ impl<K: Stack> Gate<K, K::Workers> {
             plugin: Arc::clone(&core.workers),
             core,
             public: None,
+            execution: false,
         }
     }
 }
 
 impl<K: Stack, P: AuthenticationPort> Gate<K, P> {
+    /// Marks open-path requests as originating on the execution listener.
+    pub(crate) fn executing(mut self) -> Self {
+        self.execution = true;
+        self
+    }
+
     /// The session cookie a request may authenticate with. Only the public listener reads it, and
     /// only for a `GET` or `HEAD` of a path that accepts it.
     fn session_cookie<'h>(&self, parts: &'h Parts) -> Option<&'h str> {
@@ -145,11 +159,24 @@ fn is_session_only(parts: &Parts, session: Option<&str>) -> bool {
         && !parts.headers.contains_key(AUTHORIZATION)
 }
 
+/// Whether `parts` is a follower's observation ingest, which only its controller proof
+/// authenticates.
+fn is_ingest(parts: &Parts) -> bool {
+    parts
+        .method
+        .as_str()
+        .parse::<RouteMethod>()
+        .ok()
+        .and_then(|method| routes::lookup(method, parts.uri.path()))
+        .is_some_and(|(route, _)| matches!(route.id, RouteId::IngestBuilds))
+}
+
 impl<K: Stack, P: AuthenticationPort + 'static> RequestGate for Gate<K, P> {
     /// Admits the request, or refuses it with the plugin's error. On the public listener's open
     /// paths nothing is refused here: a refusal or an authenticated caller is recorded in the
     /// request's [`Caller`] for the services behind the gate to decide, and an anonymous request
-    /// stores nothing. The result names the caller when it authenticated.
+    /// stores nothing. A follower's ingest on the execution listener is admitted anonymously
+    /// without asking the plugin. The result names the caller when it authenticated.
     async fn admit(&self, peer: &Peer, parts: &mut Parts) -> Result<Admitted, PortError> {
         let open_public = self
             .public
@@ -160,6 +187,12 @@ impl<K: Stack, P: AuthenticationPort + 'static> RequestGate for Gate<K, P> {
             && let Some(client) = public.proxies.client(peer.address, &parts.headers)
         {
             parts.extensions.insert(ClientAddress(client));
+        }
+        if self.execution && open {
+            parts.extensions.insert(ExecutionListener);
+            if is_ingest(parts) {
+                return Ok(Admitted::Anonymous);
+            }
         }
         let session = self.session_cookie(parts);
         let authenticated = match self.authenticate_caller(peer, parts, session).await {

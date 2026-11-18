@@ -2,6 +2,13 @@ poll_interval = ${jsonencode(gang_settings.poll_interval)}
 client_action_timeout = ${jsonencode(gang_settings.client_action_timeout)}
 default_isa = ${jsonencode(default_isa)}
 listen = ${jsonencode("0.0.0.0:${public_port}")}
+%{ if health_port != null ~}
+health_listen = ${jsonencode("0.0.0.0:${health_port}")}
+%{ endif ~}
+%{ if database_engine != "sqlite" ~}
+execution_listen = ${jsonencode("0.0.0.0:${execution_port}")}
+execution_endpoint = ${jsonencode(execution_endpoint)}
+%{ endif ~}
 worker_listen = ${jsonencode("0.0.0.0:${worker_port}")}
 endpoint = ${jsonencode(endpoint)}
 %{ for f in fleets }
@@ -64,10 +71,33 @@ key_id = ${jsonencode(ca_key_alias)}
 worker_endpoint = ${jsonencode(worker_endpoint)}
 # NativeLink's controller and worker use this scheduler name.
 scheduler_name = "MAIN_SCHEDULER"
+%{ if database_engine != "sqlite" ~}
 
+[scheduler.nativelink.http2]
+shutdown_grace = ${jsonencode("${shutdown_grace_seconds}s")}
+%{ endif ~}
+
+%{ if database_engine == "dynamodb" ~}
+[database.dynamodb]
+table = ${jsonencode(database_table_name)}
+region = ${jsonencode(region)}
+%{ else ~}
+%{ if database_engine == "postgres" ~}
+[database.postgres]
+host = ${jsonencode(database_postgres.host)}
+port = ${jsonencode(database_postgres.port)}
+database = ${jsonencode(database_postgres.database)}
+user = ${jsonencode(database_postgres.user)}
+password_file = ${jsonencode("/etc/gang/secrets/database-password")}
+%{ if database_postgres.ca_file != null ~}
+ca_file = ${jsonencode(database_postgres.ca_file)}
+%{ endif ~}
+%{ else ~}
 [database.sqlite]
 # The controller keeps its state under this path.
 path = "/var/lib/gang/gang.db"
+%{ endif ~}
+%{ endif ~}
 
 [sandbox.bwrap]
 # The NixOS worker image provides these paths for sandboxed actions: the Nix store, the system

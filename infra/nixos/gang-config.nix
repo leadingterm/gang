@@ -96,10 +96,17 @@
       secret_lines=$(printf '%s\n' "$user_data" | tail -n +2)
       files=()
       params=()
-      while IFS='=' read -r file parameter; do
-        if [ -z "$file$parameter" ]; then
-          continue
-        fi
+      while IFS= read -r line; do
+        case "$line" in
+          "" | \#*) continue ;;
+          *=*) ;;
+          *)
+            echo "gang-config: invalid secret line '$line': expected file=parameter" >&2
+            exit 1
+            ;;
+        esac
+        file=''${line%%=*}
+        parameter=''${line#*=}
         case "$file" in
           "" | .* | */*)
             echo "gang-config: invalid secret file name '$file'" >&2

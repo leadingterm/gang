@@ -136,11 +136,17 @@ async fn error_answer_with_an_api_error_body_carries_its_message() {
         .await
         .expect_err("the server refused the request");
 
-    let ClientError::Server { status, message } = error else {
+    let ClientError::Server {
+        status,
+        message,
+        retry_after,
+    } = error
+    else {
         panic!("expected a server error, got {error}");
     };
     assert_eq!(status, 403);
     assert_eq!(message, "the proof was refused");
+    assert_eq!(retry_after, None);
 }
 
 #[tokio::test]
@@ -160,11 +166,17 @@ async fn error_answer_with_a_plain_text_body_carries_the_text() {
         .await
         .expect_err("the server is unavailable");
 
-    let ClientError::Server { status, message } = error else {
+    let ClientError::Server {
+        status,
+        message,
+        retry_after,
+    } = error
+    else {
         panic!("expected a server error, got {error}");
     };
     assert_eq!(status, 503);
     assert_eq!(message, "maintenance window");
+    assert_eq!(retry_after, None);
 }
 
 #[tokio::test]
@@ -375,6 +387,43 @@ async fn non_numeric_retry_after_without_an_envelope_has_no_wait() {
     let wait = rate_limit_wait(&[("retry-after", "later")], b"too many requests".to_vec()).await;
 
     assert_eq!(wait, None);
+}
+
+/// An unavailable server's wait comes from the same places as a rate limit's.
+#[tokio::test]
+async fn retry_info_of_the_envelope_is_the_wait_of_an_unavailable_answer() {
+    let harness = Harness::start_plain(ConsoleMode::Silent, google()).await;
+    let body = error_envelope(
+        Status::new(
+            ErrorReason::DependencyUnavailable,
+            "database unavailable",
+            [],
+        )
+        .with_retry_delay(Duration::from_secs(3)),
+    );
+    harness.server.force_response(503, body);
+    let api = api(
+        &harness.server.url(),
+        ServerTrust::System,
+        &ClientOptions::default(),
+    );
+
+    let error = api
+        .server(None)
+        .await
+        .expect_err("the server is unavailable");
+
+    assert!(
+        matches!(
+            error,
+            ClientError::Server {
+                status: 503,
+                retry_after: Some(wait),
+                ..
+            } if wait == Duration::from_secs(3)
+        ),
+        "{error}"
+    );
 }
 
 #[tokio::test]

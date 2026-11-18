@@ -5,6 +5,7 @@
 use std::error::Error;
 use std::time::Duration;
 
+use gang_aws_sdk::CallError;
 use gang_clock::Timestamp;
 use gang_spi::FleetSupply;
 use gang_types::InstanceId;
@@ -124,7 +125,13 @@ async fn lowering_withdraws_twin_before_spot_and_keeps_live_members() -> TestRes
     ])
     .await?;
     let fleet = fleet_with(FLEET, fallback_options(true)?)?;
-    harness.fleets.set_desired_capacity(fleet.view(), 3).await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 3)
+            .await
+    })
+    .await?;
     assert_eq!(writes(&harness), vec![write(TWIN, "1"), write(FLEET, "2")]);
     Ok(())
 }
@@ -157,6 +164,43 @@ async fn supply_reports_first_unmet_failing_group_spot_before_twin() -> TestResu
     Ok(())
 }
 
+#[tokio::test]
+async fn mixed_group_failure_does_not_mark_in_flight_fleet_failed() -> TestResult {
+    for activities in [
+        vec![
+            (FLEET, "Failed", 600, Some("spot failed")),
+            (TWIN, "InProgress", 60, None),
+        ],
+        vec![
+            (FLEET, "InProgress", 60, None),
+            (TWIN, "Failed", 600, Some("twin failed")),
+        ],
+        vec![(FLEET, "Failed", 600, Some("spot failed"))],
+        vec![(TWIN, "Failed", 600, Some("twin failed"))],
+    ] {
+        let harness = harness_with(vec![protected(FLEET, 1, &[]), protected(TWIN, 1, &[])]).await?;
+        for (group, status_code, age, message) in activities {
+            harness
+                .fake
+                .state()
+                .activities
+                .push(crate::fake_aws::FakeActivity {
+                    group: group.to_owned(),
+                    status_code: status_code.to_owned(),
+                    start_time: rfc3339_ago(age),
+                    message: message.map(str::to_owned),
+                });
+        }
+        let fleet = fleet_with(FLEET, fallback_options(true)?)?;
+        let mut supply = FleetSupply::default();
+        harness.fleets.supply(fleet.view(), &mut supply).await?;
+        assert_eq!(supply.desired, 2);
+        assert_eq!(supply.abandoned, 0);
+        assert!(supply.launch_failure.is_none());
+    }
+    Ok(())
+}
+
 /// A met plain spot fleet reads no activities and never touches the on-demand twin.
 #[tokio::test]
 async fn met_plain_spot_fleet_reads_neither_activities_nor_twin() -> TestResult {
@@ -177,7 +221,13 @@ async fn met_plain_spot_fleet_reads_neither_activities_nor_twin() -> TestResult 
     let mut into = FleetSupply::default();
 
     harness.fleets.supply(fleet.view(), &mut into).await?;
-    harness.fleets.set_desired_capacity(fleet.view(), 8).await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 8)
+            .await
+    })
+    .await?;
 
     assert_eq!(harness.requests("DescribeScalingActivities"), 0);
     assert!(harness.request_log().iter().all(|(_, parameters)| {
@@ -211,10 +261,13 @@ async fn healthy_spot_raise_goes_to_spot_only() -> TestResult {
     let fleet = fleet_with(FLEET, fallback_options(true)?)?;
     let mut into = FleetSupply::default();
 
-    harness
-        .fleets
-        .set_desired_capacity(fleet.view(), 10)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 10)
+            .await
+    })
+    .await?;
     assert_eq!(writes(&harness), vec![write(FLEET, "10")]);
     assert_eq!(harness.desired(TWIN), Some(0));
 
@@ -255,7 +308,13 @@ async fn set_desired_capacity_withdraws_a_down_spot_request_at_the_reported_capa
     let harness = harness_with(vec![protected(FLEET, 4, &[]), protected(TWIN, 0, &[])]).await?;
     harness.add_activity(FLEET, "Failed", &rfc3339_ago(30));
     let fleet = fleet_with(FLEET, fallback_options(true)?)?;
-    harness.fleets.set_desired_capacity(fleet.view(), 0).await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 0)
+            .await
+    })
+    .await?;
     assert_eq!(
         writes(&harness),
         vec![write(FLEET, "0")],
@@ -276,11 +335,12 @@ async fn a_failed_spot_withdrawal_fails_only_its_own_call() -> TestResult {
     let mut into = FleetSupply::default();
     harness.fleets.supply(fleet.view(), &mut into).await?;
     assert!(
-        harness
+        gang_testkit::fence::with_held(async |held| harness
             .fleets
-            .set_desired_capacity(fleet.view(), 0)
-            .await
-            .is_err(),
+            .set_desired_capacity(held, fleet.view(), 0)
+            .await)
+        .await
+        .is_err(),
         "cooldown must reject the planned withdrawal"
     );
     Ok(())
@@ -298,11 +358,12 @@ async fn a_fallback_raise_writes_only_the_twin_and_succeeds_while_spot_is_in_coo
     let fleet = fleet_with(FLEET, fallback_options(true)?)?;
 
     assert!(
-        harness
+        gang_testkit::fence::with_held(async |held| harness
             .fleets
-            .set_desired_capacity(fleet.view(), 2)
-            .await
-            .is_ok(),
+            .set_desired_capacity(held, fleet.view(), 2)
+            .await)
+        .await
+        .is_ok(),
         "the raise took effect, so the call succeeds"
     );
     assert_eq!(
@@ -327,7 +388,13 @@ async fn lowering_while_down_lowers_only_the_twin() -> TestResult {
     .await?;
     harness.add_activity(FLEET, "Failed", &rfc3339_ago(30));
     let fleet = fleet_with(FLEET, fallback_options(true)?)?;
-    harness.fleets.set_desired_capacity(fleet.view(), 3).await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 3)
+            .await
+    })
+    .await?;
     assert_eq!(
         writes(&harness),
         vec![write(TWIN, "2")],
@@ -364,11 +431,20 @@ async fn first_failure_withdraws_spot_then_raises_on_demand() -> TestResult {
     assert_eq!(into.desired, 6);
     assert!(writes(&harness).is_empty());
 
-    harness.fleets.set_desired_capacity(fleet.view(), 6).await?;
-    harness
-        .fleets
-        .set_desired_capacity(fleet.view(), 10)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 6)
+            .await
+    })
+    .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 10)
+            .await
+    })
+    .await?;
     assert_eq!(writes(&harness), vec![write(FLEET, "6"), write(TWIN, "4")]);
 
     let activities_before = harness.requests("DescribeScalingActivities");
@@ -409,11 +485,20 @@ async fn restart_before_any_failure_reports_booting_capacity() -> TestResult {
     assert_eq!(into.desired, 10);
     assert!(writes(&harness).is_empty());
     harness.add_activity(FLEET, "Failed", &rfc3339_ago(30));
-    harness.fleets.set_desired_capacity(fleet.view(), 6).await?;
-    harness
-        .fleets
-        .set_desired_capacity(fleet.view(), 10)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 6)
+            .await
+    })
+    .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 10)
+            .await
+    })
+    .await?;
     assert_eq!(writes(&harness), vec![write(FLEET, "6"), write(TWIN, "4")]);
     Ok(())
 }
@@ -446,10 +531,13 @@ async fn restart_after_withdraw_raises_on_demand_without_a_spot_write() -> TestR
     harness.fleets.supply(fleet.view(), &mut into).await?;
     assert_eq!(into.desired, 6);
 
-    harness
-        .fleets
-        .set_desired_capacity(fleet.view(), 10)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 10)
+            .await
+    })
+    .await?;
     assert_eq!(writes(&harness), vec![write(TWIN, "4")]);
     assert!(writes(&harness).iter().all(|(group, _)| group != FLEET));
     Ok(())
@@ -491,10 +579,13 @@ async fn restart_after_both_writes_repeats_nothing() -> TestResult {
     harness.fleets.supply(fleet.view(), &mut into).await?;
     assert_eq!(into.desired, 10);
 
-    harness
-        .fleets
-        .set_desired_capacity(fleet.view(), 10)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 10)
+            .await
+    })
+    .await?;
     assert!(writes(&harness).is_empty());
     Ok(())
 }
@@ -524,10 +615,13 @@ async fn growth_one_second_inside_retry_window_goes_on_demand() -> TestResult {
         .advance(RETRY_SPOT_AFTER.saturating_sub(Duration::from_secs(1)));
     let fleet = fleet_with(FLEET, fallback_options(true)?)?;
 
-    harness
-        .fleets
-        .set_desired_capacity(fleet.view(), 10)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 10)
+            .await
+    })
+    .await?;
 
     assert_eq!(writes(&harness), vec![write(TWIN, "4")]);
     Ok(())
@@ -558,10 +652,13 @@ async fn growth_one_second_past_retry_window_goes_to_spot() -> TestResult {
         .advance(RETRY_SPOT_AFTER + Duration::from_secs(1));
     let fleet = fleet_with(FLEET, fallback_options(true)?)?;
 
-    harness
-        .fleets
-        .set_desired_capacity(fleet.view(), 10)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 10)
+            .await
+    })
+    .await?;
 
     assert_eq!(writes(&harness), vec![write(FLEET, "10")]);
     assert_eq!(harness.desired(TWIN), Some(0));
@@ -593,10 +690,13 @@ async fn recovered_spot_keeps_growing_on_spot() -> TestResult {
         .clock
         .advance(RETRY_SPOT_AFTER + Duration::from_secs(1));
     let fleet = fleet_with(FLEET, fallback_options(true)?)?;
-    harness
-        .fleets
-        .set_desired_capacity(fleet.view(), 10)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 10)
+            .await
+    })
+    .await?;
 
     {
         let mut state = harness.fake.state();
@@ -617,10 +717,13 @@ async fn recovered_spot_keeps_growing_on_spot() -> TestResult {
     harness.fleets.supply(fleet.view(), &mut into).await?;
     assert_eq!(into.desired, 10);
 
-    harness
-        .fleets
-        .set_desired_capacity(fleet.view(), 12)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 12)
+            .await
+    })
+    .await?;
     assert_eq!(
         writes(&harness),
         vec![write(FLEET, "10"), write(FLEET, "12")]
@@ -655,8 +758,20 @@ async fn interrupted_spot_with_failed_replacement_falls_back() -> TestResult {
     assert_eq!(into.desired, 5);
     assert!(writes(&harness).is_empty());
 
-    harness.fleets.set_desired_capacity(fleet.view(), 5).await?;
-    harness.fleets.set_desired_capacity(fleet.view(), 6).await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 5)
+            .await
+    })
+    .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 6)
+            .await
+    })
+    .await?;
     assert_eq!(writes(&harness), vec![write(FLEET, "5"), write(TWIN, "1")]);
     Ok(())
 }
@@ -687,7 +802,13 @@ async fn failure_older_than_window_counts_gap_as_booting() -> TestResult {
     harness.fleets.supply(fleet.view(), &mut into).await?;
     assert_eq!(into.desired, 6);
 
-    harness.fleets.set_desired_capacity(fleet.view(), 7).await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 7)
+            .await
+    })
+    .await?;
     assert_eq!(writes(&harness), vec![write(FLEET, "7")]);
     Ok(())
 }
@@ -722,10 +843,17 @@ async fn terminate_on_demand_member_decrements_only_the_twin() -> TestResult {
     .await?;
     let fleet = fleet_with(FLEET, fallback_options(true)?)?;
 
-    harness
-        .fleets
-        .terminate(fleet.view(), &InstanceId::try_new("i-od-1")?)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .terminate(
+                held,
+                fleet.view(),
+                &InstanceId::try_new("i-od-1").expect("test value is valid"),
+            )
+            .await
+    })
+    .await?;
 
     assert_eq!(harness.desired(TWIN), Some(3));
     assert_eq!(harness.desired(FLEET), Some(6));
@@ -762,10 +890,17 @@ async fn terminate_spot_member_decrements_only_spot() -> TestResult {
     .await?;
     let fleet = fleet_with(FLEET, fallback_options(true)?)?;
 
-    harness
-        .fleets
-        .terminate(fleet.view(), &InstanceId::try_new("i-spot-1")?)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .terminate(
+                held,
+                fleet.view(),
+                &InstanceId::try_new("i-spot-1").expect("test value is valid"),
+            )
+            .await
+    })
+    .await?;
 
     assert_eq!(harness.desired(FLEET), Some(5));
     assert_eq!(harness.desired(TWIN), Some(4));
@@ -799,10 +934,17 @@ async fn terminate_warm_twin_member_releases_into_pool() -> TestResult {
     .await?;
     let fleet = fleet_with(FLEET, fallback_options(true)?)?;
 
-    harness
-        .fleets
-        .terminate(fleet.view(), &InstanceId::try_new("i-od-1")?)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .terminate(
+                held,
+                fleet.view(),
+                &InstanceId::try_new("i-od-1").expect("test value is valid"),
+            )
+            .await
+    })
+    .await?;
 
     let mutations: Vec<String> = harness
         .request_log()
@@ -865,10 +1007,17 @@ async fn terminate_spot_member_beside_warm_twin_skips_protection() -> TestResult
     .await?;
     let fleet = fleet_with(FLEET, fallback_options(true)?)?;
 
-    harness
-        .fleets
-        .terminate(fleet.view(), &InstanceId::try_new("i-spot-1")?)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .terminate(
+                held,
+                fleet.view(),
+                &InstanceId::try_new("i-spot-1").expect("test value is valid"),
+            )
+            .await
+    })
+    .await?;
 
     assert_eq!(harness.requests("TerminateInstanceInAutoScalingGroup"), 1);
     assert_eq!(harness.requests("SetInstanceProtection"), 0);
@@ -887,14 +1036,20 @@ async fn opt_in_without_twin_group_is_missing_group() -> TestResult {
     let harness = harness_with(vec![protected(FLEET, 6, &[("i-spot-1", "InService")])]).await?;
     let fleet = fleet_with(FLEET, fallback_options(true)?)?;
 
-    let error = harness
-        .fleets
-        .set_desired_capacity(fleet.view(), 10)
-        .await
-        .err()
-        .ok_or("the raise must be refused")?;
+    let error = gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 10)
+            .await
+    })
+    .await
+    .err()
+    .ok_or("the raise must be refused")?;
 
-    assert!(matches!(error, AwsError::MissingGroup(_)));
+    assert!(matches!(
+        error,
+        gang_spi::RunError::Failed(AwsError::MissingGroup(_))
+    ));
     assert!(writes(&harness).is_empty());
     Ok(())
 }
@@ -910,14 +1065,20 @@ async fn opt_in_with_unprotected_spot_group_is_config_error() -> TestResult {
     .await?;
     let fleet = fleet_with(FLEET, fallback_options(true)?)?;
 
-    let error = harness
-        .fleets
-        .set_desired_capacity(fleet.view(), 10)
-        .await
-        .err()
-        .ok_or("the raise must be refused")?;
+    let error = gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 10)
+            .await
+    })
+    .await
+    .err()
+    .ok_or("the raise must be refused")?;
 
-    assert!(matches!(error, AwsError::Config { .. }));
+    assert!(matches!(
+        error,
+        gang_spi::RunError::Failed(AwsError::Config { .. })
+    ));
     assert!(writes(&harness).is_empty());
     Ok(())
 }
@@ -933,14 +1094,20 @@ async fn opt_in_with_unprotected_twin_group_is_config_error() -> TestResult {
     .await?;
     let fleet = fleet_with(FLEET, fallback_options(true)?)?;
 
-    let error = harness
-        .fleets
-        .set_desired_capacity(fleet.view(), 10)
-        .await
-        .err()
-        .ok_or("the raise must be refused")?;
+    let error = gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 10)
+            .await
+    })
+    .await
+    .err()
+    .ok_or("the raise must be refused")?;
 
-    assert!(matches!(error, AwsError::Config { .. }));
+    assert!(matches!(
+        error,
+        gang_spi::RunError::Failed(AwsError::Config { .. })
+    ));
     assert!(writes(&harness).is_empty());
     Ok(())
 }
@@ -964,7 +1131,7 @@ async fn throttled_activities_make_supply_transient() -> TestResult {
         .err()
         .ok_or("the supply must fail")?;
 
-    assert!(matches!(error, AwsError::Transient { .. }));
+    assert!(matches!(error, AwsError::Call(CallError::Transient { .. })));
     Ok(())
 }
 
@@ -979,14 +1146,20 @@ async fn throttled_activities_make_raise_transient_and_write_nothing() -> TestRe
     harness.fail("DescribeScalingActivities", throttled());
     let fleet = fleet_with(FLEET, fallback_options(true)?)?;
 
-    let error = harness
-        .fleets
-        .set_desired_capacity(fleet.view(), 12)
-        .await
-        .err()
-        .ok_or("the raise must fail")?;
+    let error = gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 12)
+            .await
+    })
+    .await
+    .err()
+    .ok_or("the raise must fail")?;
 
-    assert!(matches!(error, AwsError::Transient { .. }));
+    assert!(matches!(
+        error,
+        gang_spi::RunError::Failed(AwsError::Call(CallError::Transient { .. }))
+    ));
     assert!(writes(&harness).is_empty());
     Ok(())
 }
@@ -1108,10 +1281,13 @@ async fn supply_after_fallback_raise_reports_at_least_the_target() -> TestResult
     let fleet = fleet_with(FLEET, fallback_options(true)?)?;
     let mut into = FleetSupply::default();
 
-    harness
-        .fleets
-        .set_desired_capacity(fleet.view(), 10)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 10)
+            .await
+    })
+    .await?;
     harness.fleets.supply(fleet.view(), &mut into).await?;
 
     assert!(into.desired >= 10);
@@ -1140,10 +1316,13 @@ async fn supply_after_spot_raise_reports_at_least_the_target() -> TestResult {
     let fleet = fleet_with(FLEET, fallback_options(true)?)?;
     let mut into = FleetSupply::default();
 
-    harness
-        .fleets
-        .set_desired_capacity(fleet.view(), 10)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 10)
+            .await
+    })
+    .await?;
     harness.fleets.supply(fleet.view(), &mut into).await?;
 
     assert!(into.desired >= 10);

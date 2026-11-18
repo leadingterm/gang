@@ -4,6 +4,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
+use gang_clock::Timestamp;
 use gang_spi::{
     Authenticated, AuthenticationHost, AuthenticationPort, Capabilities, CertificateSignerPort,
     ClientCertificates, CredentialLifecyclePort, Evidence, IssuedToken, Plugin, PluginContext,
@@ -16,6 +17,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::OnceCell;
 
+use crate::token::MIN_SESSION;
 use crate::{Memo, TokenError, TokenKey, TokenUse, issuer_of, mint, verify};
 
 /// The `[token]` section: settings of the bearer token plugin.
@@ -24,7 +26,7 @@ use crate::{Memo, TokenError, TokenKey, TokenUse, issuer_of, mint, verify};
 pub struct TokenConfig {
     /// How long a minted token is valid, from 1 minute to 1 hour in whole seconds. Defaults to 10 minutes.
     pub token_ttl: TokenTtl,
-    /// The clock skew tolerated when checking a token's validity window; zero is exact. Defaults to 30 seconds.
+    /// Clock skew tolerated at validity start and client expiry, but not session expiry. Defaults to 30 seconds.
     pub clock_skew: Duration,
     /// The number of verified tokens kept in memory. Defaults to 4096.
     pub max_cached_tokens: NonZeroUsize,
@@ -154,6 +156,7 @@ impl Token {
         host: &H,
         request: &TokenIssue<'_>,
         usage: TokenUse,
+        deadline: Option<Timestamp>,
     ) -> Result<IssuedToken, PortError> {
         if self
             .config
@@ -169,16 +172,23 @@ impl Token {
         let identity = Identity::new(request.provider.clone(), principal);
         let key = self.key(host).await?;
         let issuer = issuer_of(host.endpoint());
-        mint(
-            host.signer(),
-            key,
-            &issuer,
-            &identity,
-            host.now(),
-            self.config.token_ttl.get(),
-            usage,
-        )
-        .await
+        let now = host.now();
+        let ttl = deadline.map_or(self.config.token_ttl.get(), |deadline| {
+            self.config
+                .token_ttl
+                .get()
+                .min(deadline.saturating_duration_since(now))
+        });
+        let mut token = mint(host.signer(), key, &issuer, &identity, now, ttl, usage).await?;
+        if deadline.is_some() {
+            let actual_expiry = now + token.expires_in;
+            let remaining = actual_expiry.saturating_duration_since(host.now());
+            if remaining < MIN_SESSION {
+                return Err(TokenError::Expired.into());
+            }
+            token.expires_in = remaining;
+        }
+        Ok(token)
     }
 }
 
@@ -252,7 +262,7 @@ impl AuthenticationPort for Token {
             self.config.clock_skew,
             expected,
         )?;
-        // The token is accepted until its expiry plus the tolerated clock skew.
+        // Retain the token only until its verified deadline.
         let authenticated = Authenticated {
             identity: Arc::new(verified.identity),
             valid_until: Some(verified.valid_until),
@@ -276,15 +286,17 @@ impl CredentialLifecyclePort for Token {
         host: &H,
         request: &TokenIssue<'_>,
     ) -> Result<IssuedToken, PortError> {
-        self.issue(host, request, TokenUse::Client).await
+        self.issue(host, request, TokenUse::Client, None).await
     }
 
     async fn issue_session<H: AuthenticationHost>(
         &self,
         host: &H,
         request: &TokenIssue<'_>,
+        expires_at: Timestamp,
     ) -> Result<IssuedToken, PortError> {
-        self.issue(host, request, TokenUse::Session).await
+        self.issue(host, request, TokenUse::Session, Some(expires_at))
+            .await
     }
 }
 

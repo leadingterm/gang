@@ -1,10 +1,11 @@
 //! The serve loop: runs one axum router over the connections the caller hands in.
 //!
 //! The caller accepts and authenticates every connection. Each one is served in a task
-//! owned by the serve future, so dropping that future closes every connection. When the stream of
-//! connections ends, every open connection is shut down gracefully and given `shutdown_grace` to
-//! finish before it is dropped. HTTP/1.1 connections are closed if a request head stalls past
-//! `header_read_timeout`; HTTP/2 connections are kept alive by `keepalive_interval` pings.
+//! owned by the serve future, so dropping that future closes every connection. Once all listener
+//! streams have ended, client connections shut down gracefully; worker connections do so once
+//! all workers are released, or are dropped when `shutdown_grace` expires.
+//! HTTP/1.1 connections are closed if a request head stalls past `header_read_timeout`;
+//! HTTP/2 connections are kept alive by `keepalive_interval` pings.
 //! Each HTTP/2 connection, and each of its streams, may receive `receive_window` bytes before the
 //! server reads them, so a client far away uploads a whole window per round trip. A listener serves
 //! a bounded number of connections at once; connections earn their place by an authenticated
@@ -21,7 +22,6 @@ use axum::middleware::from_fn_with_state;
 use futures::StreamExt;
 use gang_clock::Clock;
 use gang_spi::{Listening, RequestGate};
-use gang_types::SaturatingInto;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::GracefulShutdown;
@@ -31,6 +31,7 @@ use tokio::task::{AbortHandle, JoinError, JoinSet};
 use crate::config::Http2Tuning;
 use crate::errors::NativeLinkEmbedError;
 use crate::gate::admit;
+use crate::handoff::HandOff;
 use crate::refusals::Refusals;
 use crate::standing::Standing;
 
@@ -40,6 +41,8 @@ pub(crate) enum Listener {
     /// The public listener: detects HTTP/1.1 or HTTP/2 on each connection, including HTTP/2 with
     /// prior knowledge.
     Public,
+    /// The execution listener has the same client transport and limits as public.
+    Execution,
     /// The worker listener: serves HTTP/2 only. A connection that does not speak HTTP/2 is
     /// closed.
     Worker,
@@ -50,9 +53,17 @@ impl Listener {
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Public => "public",
+            Self::Execution => "execution",
             Self::Worker => "worker",
         }
     }
+}
+
+/// Coordinates stream endings and the shared controller hand-off.
+#[derive(Clone)]
+pub(crate) struct ServeShutdown {
+    pub(crate) ended: tokio::sync::mpsc::UnboundedSender<()>,
+    pub(crate) handoff: HandOff,
 }
 
 /// Serves `router` on the connections of `listening` until the stream ends and the served
@@ -63,8 +74,8 @@ impl Listener {
 ///
 /// Each connection speaks the HTTP versions of `listener`.
 ///
-/// When the stream ends, every open connection is shut down gracefully: it finishes its in-flight
-/// requests and closes. Connections still open after `tuning.shutdown_grace` are dropped.
+/// After hand-off begins, client connections shut down gracefully; worker connections do so
+/// after all workers are released. Connections still open after `tuning.shutdown_grace` are dropped.
 ///
 /// HTTP/1.1 request heads must arrive within `tuning.header_read_timeout`, or the connection is
 /// closed. HTTP/2 keeps connections alive with pings every `tuning.keepalive_interval`.
@@ -76,7 +87,7 @@ impl Listener {
 /// oldest connection that has not earned its place, an idle one first, and is closed at once only
 /// when every connection has; the stream is always read, so its end is seen however many
 /// connections are open. Refusals are logged at most once per `tuning.refusal_log_interval` of
-/// `clock`. On the public listener, a connection that has not earned its place is also closed once
+/// `clock`. On the public and execution listeners, a connection that has not earned its place is also closed once
 /// it has had no request in flight for `tuning.unproven_idle_timeout`, before its first request
 /// included; the worker listener's connections are bounded by the fleets, and a worker's store
 /// connections may stay idle until it runs an action.
@@ -89,6 +100,7 @@ pub(crate) async fn serve<G: RequestGate, C: Clock + Clone + Send + Sync + 'stat
     listener: Listener,
     max_connections: NonZeroUsize,
     clock: C,
+    shutdown: ServeShutdown,
 ) -> Result<(), NativeLinkEmbedError> {
     let Listening {
         mut connections,
@@ -97,7 +109,7 @@ pub(crate) async fn serve<G: RequestGate, C: Clock + Clone + Send + Sync + 'stat
     let gated = router.layer(from_fn_with_state(gate, admit::<G>));
     let mut http = match listener {
         Listener::Worker => auto::Builder::new(TokioExecutor::new()).http2_only(),
-        Listener::Public => {
+        Listener::Public | Listener::Execution => {
             let mut http = auto::Builder::new(TokioExecutor::new());
             http.http1()
                 .timer(TokioTimer::new())
@@ -105,8 +117,7 @@ pub(crate) async fn serve<G: RequestGate, C: Clock + Clone + Send + Sync + 'stat
             http
         }
     };
-    // `ReceiveWindow` is at most 2^31 - 1 bytes, so the conversion never saturates.
-    let window: u32 = tuning.receive_window.get().get().saturating_into();
+    let window = tuning.window_for(listener);
     http.http2()
         .timer(TokioTimer::new())
         .keep_alive_interval(tuning.keepalive_interval.get())
@@ -117,11 +128,10 @@ pub(crate) async fn serve<G: RequestGate, C: Clock + Clone + Send + Sync + 'stat
     let mut served = JoinSet::new();
     let mut refusals = Refusals::new(listener, max_connections, tuning.refusal_log_interval);
     let mut open: VecDeque<Open> = VecDeque::new();
-    let idle = (listener == Listener::Public).then_some(tuning.unproven_idle_timeout.get());
+    let idle = (listener != Listener::Worker).then_some(tuning.unproven_idle_timeout.get());
     loop {
         tokio::select! {
-            next = connections.next() => match next {
-                Some(accepted) => {
+            next = connections.next() => if let Some(accepted) = next {
                     // A connection that has ended frees its place before the limit is checked.
                     while let Some(finished) = served.try_join_next_with_id() {
                         reap(finished, &mut open);
@@ -166,28 +176,69 @@ pub(crate) async fn serve<G: RequestGate, C: Clock + Clone + Send + Sync + 'stat
                         standing,
                         abort,
                     });
-                }
-                None => break,
+            } else {
+                break;
             },
             Some(finished) = served.join_next_with_id(), if !served.is_empty() => reap(finished, &mut open),
         }
     }
+    // Close the listening sockets before waiting for existing connections to drain.
+    drop(connections);
+    let _ = shutdown.ended.send(());
+    drain_connections(
+        &clock,
+        tuning,
+        listener,
+        &shutdown.handoff,
+        graceful,
+        &mut served,
+        &mut open,
+    )
+    .await;
+    Ok(())
+}
+
+/// Waits for the common hand-off, then drains connections within the grace period.
+async fn drain_connections<C: Clock>(
+    clock: &C,
+    tuning: &Http2Tuning,
+    listener: Listener,
+    handoff: &HandOff,
+    graceful: GracefulShutdown,
+    served: &mut JoinSet<()>,
+    open: &mut VecDeque<Open>,
+) {
+    loop {
+        tokio::select! {
+            () = handoff.begun() => break,
+            Some(finished) = served.join_next_with_id(), if !served.is_empty() => reap(finished, open),
+        }
+    }
     let drained = clock
         .timeout(tuning.shutdown_grace, async {
+            if listener == Listener::Worker {
+                loop {
+                    if served.is_empty() {
+                        return;
+                    }
+                    tokio::select! {
+                        () = handoff.workers_released() => break,
+                        Some(finished) = served.join_next_with_id() => reap(finished, open),
+                    }
+                }
+            }
             graceful.shutdown().await;
             while let Some(finished) = served.join_next_with_id().await {
-                reap(finished, &mut open);
+                reap(finished, open);
             }
         })
         .await;
     if drained.is_err() {
-        // Dropping `served` on return aborts the connections that are still open.
         tracing::warn!(
             open = served.len(),
             "connections did not close within the shutdown grace"
         );
     }
-    Ok(())
 }
 
 /// A served connection, in the order connections were handed in.
@@ -250,6 +301,7 @@ mod tests {
     use gang_clock::{SystemClock, TestClock, Timestamp};
     use gang_spi::{Accepted, Admitted, Authenticated, Peer, PortError};
     use gang_testkit::TestResult;
+    use gang_types::health::CLIENT_KEEPALIVE_TIME;
     use gang_types::{CertSerial, Identity, NonZeroDuration, Principal, ProviderName};
     use http_body_util::BodyExt;
     use hyper::client::conn::http1;
@@ -275,6 +327,70 @@ mod tests {
     static ZEROS: [u8; CHUNK] = [0; CHUNK];
     /// One mebibyte.
     const MIB: usize = 1024 * 1024;
+
+    #[tokio::test]
+    async fn stopped_listener_closes_before_connections_drain() -> TestResult {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let connections = stream::unfold(listener, |listener| async move {
+            let (connection, _) = listener.accept().await.ok()?;
+            Some((
+                Accepted {
+                    connection: Box::new(connection),
+                    peer: Peer::default(),
+                },
+                listener,
+            ))
+        })
+        .take_until(async {
+            let _ = stopped.await;
+        })
+        .boxed();
+        let (entered, mut entered_rx) = mpsc::unbounded_channel();
+        let router = Router::new().route(
+            "/",
+            get(move || {
+                let entered = entered.clone();
+                async move {
+                    let _ = entered.send(());
+                    std::future::pending::<&'static str>().await
+                }
+            }),
+        );
+        let handoff = HandOff::new();
+        let (ended, mut endings) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            let tuning = Http2Tuning::default();
+            serve(
+                Listening {
+                    connections,
+                    gate: Allow,
+                },
+                router,
+                &tuning,
+                Listener::Public,
+                tuning.max_connections,
+                SystemClock::new(),
+                ServeShutdown { ended, handoff },
+            )
+            .await
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await?;
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await?;
+        entered_rx.recv().await.ok_or("handler did not start")?;
+        stop.send(()).map_err(|()| "listener stopped early")?;
+        endings.recv().await.ok_or("serve stopped early")?;
+        assert!(!task.is_finished(), "connection should still be draining");
+        let error = tokio::net::TcpStream::connect(address)
+            .await
+            .expect_err("listener still bound");
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+        task.abort();
+        Ok(())
+    }
 
     fn router() -> Router {
         Router::new().route("/", get(|| async { "ok" }))
@@ -392,16 +508,29 @@ mod tests {
         })
         .boxed();
         let listening = Listening { connections, gate };
+        let handoff = HandOff::new();
+        let (ended, mut endings) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
-            serve(
+            let serving = serve(
                 listening,
                 router,
                 &tuning,
                 listener,
                 tuning.max_connections,
                 clock,
-            )
-            .await
+                ServeShutdown {
+                    ended,
+                    handoff: handoff.clone(),
+                },
+            );
+            tokio::pin!(serving);
+            tokio::select! {
+                result = &mut serving => result,
+                _ = endings.recv() => {
+                    handoff.begin();
+                    serving.await
+                }
+            }
         });
         (sender, task)
     }
@@ -600,7 +729,7 @@ mod tests {
 
     #[tokio::test]
     async fn serve_returns_when_the_stream_ends_and_idle_connections_close() -> TestResult {
-        let (feed, task) = start(router());
+        let (feed, task) = start_gated(router(), Allow, Http2Tuning::default(), Listener::Public);
         let (mut sender, connection) = open(connect(&feed)?).await?;
         let (status, _) = get_root(&mut sender).await?;
         assert_eq!(status, StatusCode::OK);
@@ -611,6 +740,86 @@ mod tests {
         // The server has closed its end, so the client's connection ends as well.
         let _outcome: Result<(), hyper::Error> = connection.await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn worker_connection_remains_usable_after_handoff() -> TestResult {
+        let (feed, receiver) = mpsc::unbounded_channel::<Accepted>();
+        let connections = stream::unfold(receiver, |mut receiver| async move {
+            receiver.recv().await.map(|accepted| (accepted, receiver))
+        })
+        .boxed();
+        let handoff = HandOff::new();
+        let (ended, mut endings) = mpsc::unbounded_channel();
+        let tuning = Http2Tuning::default();
+        let shutdown = ServeShutdown {
+            ended,
+            handoff: handoff.clone(),
+        };
+        let task = tokio::spawn(async move {
+            serve(
+                Listening {
+                    connections,
+                    gate: Allow,
+                },
+                router(),
+                &tuning,
+                Listener::Worker,
+                tuning.max_connections,
+                SystemClock::new(),
+                shutdown,
+            )
+            .await
+        });
+        let (mut sender, connection) = open(connect(&feed)?).await?;
+        assert_eq!(get_root(&mut sender).await?.0, StatusCode::OK);
+        drop(feed);
+        endings.recv().await.ok_or("worker stream did not end")?;
+        handoff.begin();
+        assert_eq!(get_root(&mut sender).await?.0, StatusCode::OK);
+        connection.abort();
+        finished(task).await
+    }
+
+    #[tokio::test]
+    async fn worker_connections_drain_when_workers_are_released() -> TestResult {
+        let (feed, receiver) = mpsc::unbounded_channel::<Accepted>();
+        let connections = stream::unfold(receiver, |mut receiver| async move {
+            receiver.recv().await.map(|accepted| (accepted, receiver))
+        })
+        .boxed();
+        let handoff = HandOff::new();
+        let (ended, mut endings) = mpsc::unbounded_channel();
+        let shutdown = ServeShutdown {
+            ended,
+            handoff: handoff.clone(),
+        };
+        let clock = Arc::new(TestClock::new(Timestamp::from_unix_millis(0)));
+        let task = tokio::spawn(async move {
+            let tuning = Http2Tuning::default();
+            serve(
+                Listening {
+                    connections,
+                    gate: Allow,
+                },
+                router(),
+                &tuning,
+                Listener::Worker,
+                tuning.max_connections,
+                clock,
+                shutdown,
+            )
+            .await
+        });
+        let (mut sender, connection) = open(connect(&feed)?).await?;
+        assert_eq!(get_root(&mut sender).await?.0, StatusCode::OK);
+        drop(feed);
+        endings.recv().await.ok_or("worker stream did not end")?;
+        handoff.begin();
+        assert_eq!(get_root(&mut sender).await?.0, StatusCode::OK);
+        handoff.release_workers();
+        let _outcome: Result<(), hyper::Error> = connection.await?;
+        finished(task).await
     }
 
     #[tokio::test]
@@ -712,6 +921,61 @@ mod tests {
         finished(task).await
     }
 
+    /// Bazel pings every `CLIENT_KEEPALIVE_TIME` while an Execute or `WaitExecution` call waits, for
+    /// as long as the action runs. No listener may answer that with a GOAWAY (gRPC's
+    /// `too_many_pings`) or by ending the call. The span outlasts every server-side timer.
+    #[tokio::test(start_paused = true)]
+    async fn all_listeners_keep_a_pending_request_under_client_keepalive_pings() -> TestResult {
+        const IDLE_SPAN: Duration = Duration::from_hours(1);
+        let pings_in_span = IDLE_SPAN.as_secs() / CLIENT_KEEPALIVE_TIME.as_secs();
+
+        for listener in [Listener::Public, Listener::Execution, Listener::Worker] {
+            let (entered, mut entered_rx) = mpsc::unbounded_channel();
+            let router = Router::new().route(
+                "/",
+                get(move || {
+                    let entered = entered.clone();
+                    async move {
+                        let _ = entered.send(());
+                        std::future::pending::<&'static str>().await
+                    }
+                }),
+            );
+            let (feed, task) = start_gated(router, Allow, Http2Tuning::default(), listener);
+            let (mut sender, mut connection) = h2::client::handshake::<_>(connect(&feed)?).await?;
+            let mut pings = connection.ping_pong().ok_or("ping handle unavailable")?;
+            let connection = tokio::spawn(connection);
+            let request = Request::get("http://localhost/").body(())?;
+            let (response, _stream) = sender.send_request(request, true)?;
+            tokio::pin!(response);
+            entered_rx.recv().await.ok_or("handler did not start")?;
+
+            for _ in 0..pings_in_span {
+                tokio::time::advance(CLIENT_KEEPALIVE_TIME).await;
+                pings.ping(h2::Ping::opaque()).await?;
+            }
+
+            assert!(
+                futures::poll!(&mut response).is_pending(),
+                "{listener:?} reset or completed the pending request"
+            );
+            assert!(!connection.is_finished(), "{listener:?} connection ended");
+
+            // Starting another stream also detects a graceful GOAWAY that leaves existing streams open.
+            sender = sender.ready().await?;
+            let request = Request::get("http://localhost/").body(())?;
+            let (_second_response, _second_stream) = sender.send_request(request, true)?;
+            entered_rx
+                .recv()
+                .await
+                .ok_or("second handler did not start")?;
+            connection.abort();
+            drop(feed);
+            finished(task).await?;
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn the_public_listener_serves_http2_connections() -> TestResult {
         let (feed, task) = start_gated(router(), Allow, Http2Tuning::default(), Listener::Public);
@@ -732,6 +996,20 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, b"ok");
         connection.abort();
+        drop(feed);
+        finished(task).await
+    }
+
+    #[tokio::test]
+    async fn the_execution_listener_serves_http1_and_http2() -> TestResult {
+        let (feed, task) =
+            start_gated(router(), Allow, Http2Tuning::default(), Listener::Execution);
+        let (mut h1, h1_connection) = open_http1(connect(&feed)?).await?;
+        let (mut h2, h2_connection) = open(connect(&feed)?).await?;
+        assert_eq!(get_root_http1(&mut h1).await?.0, StatusCode::OK);
+        assert_eq!(get_root(&mut h2).await?.0, StatusCode::OK);
+        h1_connection.abort();
+        h2_connection.abort();
         drop(feed);
         finished(task).await
     }
@@ -850,7 +1128,7 @@ mod tests {
     /// A client a long round trip away sends a whole receive window before the server's first
     /// acknowledgement: uploading exactly the window takes one round trip and one byte more takes
     /// two, whether one stream sends it or two streams share the connection's window. The default
-    /// window is 16 MiB on either listener, and a tuned window replaces it.
+    /// window is 16 MiB except on execution, where it is capped at 4 MiB by default.
     #[tokio::test(start_paused = true)]
     async fn a_client_sends_one_receive_window_per_round_trip() -> TestResult {
         let default = Http2Tuning::default;
@@ -865,6 +1143,8 @@ mod tests {
             (default(), Listener::Worker, vec![8 * MIB, 8 * MIB + 1], 2),
             (default(), Listener::Public, vec![16 * MIB], 1),
             (default(), Listener::Public, vec![16 * MIB + 1], 2),
+            (default(), Listener::Execution, vec![4 * MIB], 1),
+            (default(), Listener::Execution, vec![4 * MIB + 1], 2),
             (four_mib(), Listener::Worker, vec![4 * MIB], 1),
             (four_mib(), Listener::Worker, vec![4 * MIB + 1], 2),
         ];

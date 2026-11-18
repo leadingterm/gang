@@ -18,17 +18,19 @@ const SERVER_SUBCOMMAND: &str = "server";
 /// Flag that names the configuration file for the server subcommand.
 const CONFIG_FLAG: &str = "--config";
 
-/// A bounded wait: at most `timeout`, polled every `poll_interval`.
+/// A wait bounded by a rounded-up number of full polling intervals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Wait {
-    /// Longest time to wait.
+    /// Timeout used to derive the number of full pauses, not a strict elapsed-time limit.
     pub(crate) timeout: NonZeroDuration,
     /// Time between polls.
     pub(crate) poll_interval: NonZeroDuration,
 }
 
 impl Wait {
-    /// Runs `probe`, pausing `poll_interval` between runs, until it finds a value or `timeout` has passed. The probe runs once after each of the `Poll::attempts` pauses, so it runs one more time than it pauses. `Ok(None)` means the time ran out.
+    /// Probes initially and after each of `Poll::attempts` full `poll_interval` pauses.
+    /// Returns the first value or final probe result; `Ok(None)` means no probe found a value.
+    /// Probe and pause runtime adds to the elapsed time.
     pub(crate) fn until<T, E>(
         &self,
         processes: &impl ProcessControl,

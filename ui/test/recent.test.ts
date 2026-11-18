@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { applyRecent, cacheRate, cacheSeries, donePerMinute, doneSeries, passBars, slots, unrecordedSlots } from "../src/recent.ts";
+import { applyRecent, cacheWindow, donePerMinute, doneSeries, passBars, slots, unrecordedSlots } from "../src/recent.ts";
 import type { Recent, Sample } from "../src/wire.ts";
 import { iso } from "./sse.ts";
 
@@ -48,9 +48,37 @@ test("pass bars distinguish skipped, ok, idle and unrecorded", () => {
   assert.deepEqual(passBars(r), ["unrecorded", "skipped", "ok", "idle"]);
 });
 
-test("cache rates weight lookups and leave empty slots unrecorded", () => {
+test("cache window weights lookups and distinguishes unrecorded and zero steps", () => {
   const r = recent([{ ...sample(0), lookups: 10, hits: 5 }, { ...sample(1), lookups: 30, hits: 30 }, sample(2)], "40s");
-  assert.equal(cacheRate(r), 35 / 40);
-  assert.deepEqual(cacheSeries(r), [null, 0.5, 1, null]);
-  assert.equal(cacheRate(recent([sample(0)])), null);
+  assert.deepEqual(cacheWindow(r), {
+    lookups: 40, hits: 35, rate: 35 / 40,
+    lookupsPerStep: [null, 10, 30, 0], hitsPerStep: [null, 5, 30, 0],
+  });
+  assert.deepEqual(cacheWindow(recent([sample(0)], "10s")), {
+    lookups: 0, hits: 0, rate: null, lookupsPerStep: [0], hitsPerStep: [0],
+  });
+});
+
+test("cache series reports hit counts preserving observed zero steps", () => {
+  const r = recent([
+    { ...sample(0), lookups: 10, hits: 9 },
+    { ...sample(1), lookups: 0, hits: 0 },
+    { ...sample(2), lookups: 100, hits: 1 },
+  ], "30s");
+  const window = cacheWindow(r);
+  assert.deepEqual(window.lookupsPerStep, [10, 0, 100]);
+  assert.deepEqual(window.hitsPerStep, [9, 0, 1]);
+  assert.ok(window.hitsPerStep.every((hits, i) => hits !== null && hits <= window.lookupsPerStep[i]!));
+});
+
+test("cache window excludes samples older than the window", () => {
+  const r = recent([
+    { ...sample(0), lookups: 100, hits: 100 },
+    { ...sample(1), lookups: 10, hits: 5 },
+    { ...sample(2), lookups: 30, hits: 30 },
+  ], "20s");
+  assert.deepEqual(cacheWindow(r), {
+    lookups: 40, hits: 35, rate: 35 / 40,
+    lookupsPerStep: [10, 30], hitsPerStep: [5, 30],
+  });
 });

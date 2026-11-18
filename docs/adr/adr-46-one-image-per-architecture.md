@@ -12,7 +12,7 @@ Status: Accepted.
 
 ## Consequences
 - The controller's closure gains the worker's inactive tools (bubblewrap, nix-ld loader, mdadm, xfsprogs, yq-go, RAID0/XFS modules and action tools), about 70 MB.
-- Nothing changes on workers except two firewall ports with no listener.
+- Nothing changes on workers except the controller's four firewall ports (public, execution, worker, health) with no listener.
 - One image name and one AMI per architecture; a custom image passes the same three-run check.
 - The controller module that renders the state token ships in the same release as the image.
 

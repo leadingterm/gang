@@ -23,6 +23,11 @@ pub trait SchedulerSettings {
         None
     }
 
+    /// The full TOML key and maximum controller hand-off duration, if the scheduler has one.
+    fn shutdown_grace(&self) -> Option<(&'static str, std::time::Duration)> {
+        None
+    }
+
     /// Fills the worker endpoint with `derived` when the configuration omits it; an explicit
     /// value is kept.
     #[must_use]

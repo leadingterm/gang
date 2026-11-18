@@ -8,13 +8,15 @@ use std::time::Duration;
 
 use gang_clock::TestClock;
 use gang_spi::{
-    FleetSupply, InstanceIdentity, LaunchFailure, MountedScratchVolume, NodeLifecyclePort,
-    PortError, PreemptionNotice, ProvisionerPort, ScratchVolumePort, WorkloadCredentialPort,
+    ControllerHostPort, FleetSupply, Held, HostMilestone, InstanceIdentity, LaunchFailure,
+    MountedScratchVolume, NodeLifecyclePort, PortError, PreemptionNotice, ProvisionerPort,
+    ScratchVolumePort, ServerEndpoints, Sidecar, WorkloadCredentialPort,
 };
 use gang_types::{
     Bytes, Fleet, FleetName, InstanceId, InstanceLifecycle, Isa, Proof, WorkerLifetime,
 };
 use parking_lot::Mutex;
+use tokio::sync::watch;
 
 use crate::{CallCount, Opaque};
 
@@ -39,17 +41,34 @@ impl Script {
 
 #[derive(Default)]
 struct Failures {
-    supply: bool,
-    set_desired_capacity: bool,
-    terminate: bool,
+    supply: Script,
+    acknowledge_exit: Script,
+    set_desired_capacity: Script,
+    terminate: Script,
+}
+
+/// A callback invoked before a convergence attempt.
+type ConvergeHook = Arc<dyn Fn() -> Result<(), PortError> + Send + Sync>;
+
+/// A fleet read or convergence attempt, in the order it was made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FleetCall {
+    /// A convergence attempt for the named fleet.
+    Converge(FleetName),
+    /// A supply read for the named fleet.
+    Supply(FleetName),
 }
 
 struct State {
     supplies: BTreeMap<FleetName, FleetSupply>,
     launch_failures: BTreeMap<FleetName, String>,
     supply_calls: Vec<(FleetName, Isa)>,
+    fleet_calls: Vec<FleetCall>,
+    converges: Vec<FleetName>,
+    converge_hook: Option<ConvergeHook>,
     desired: Vec<(FleetName, u32)>,
     terminations: Vec<InstanceId>,
+    milestones: Vec<HostMilestone>,
     failures: Failures,
     advance_on_supply: Option<(Arc<TestClock>, Duration)>,
     identity: Option<InstanceIdentity>,
@@ -57,8 +76,10 @@ struct State {
     notice: Option<PreemptionNotice>,
     volume: PathBuf,
     capacity: Bytes,
+    account_for_scratch_usage: bool,
     credentials: Script,
     parked: bool,
+    attach: Script,
     parked_checks: Script,
 }
 
@@ -73,8 +94,10 @@ struct State {
 #[derive(Clone)]
 pub struct FakeProvisioner {
     state: Arc<Mutex<State>>,
+    retirement: watch::Sender<bool>,
     credential_requests: CallCount,
     parked_polls: CallCount,
+    attach_requests: CallCount,
 }
 
 impl Default for FakeProvisioner {
@@ -111,8 +134,12 @@ impl FakeProvisioner {
                 supplies: BTreeMap::new(),
                 launch_failures: BTreeMap::new(),
                 supply_calls: Vec::new(),
+                fleet_calls: Vec::new(),
+                converges: Vec::new(),
+                converge_hook: None,
                 desired: Vec::new(),
                 terminations: Vec::new(),
+                milestones: Vec::new(),
                 failures: Failures::default(),
                 advance_on_supply: None,
                 identity,
@@ -120,12 +147,16 @@ impl FakeProvisioner {
                 notice: None,
                 volume,
                 capacity,
+                account_for_scratch_usage: false,
                 credentials: Script::default(),
                 parked: false,
                 parked_checks: Script::default(),
+                attach: Script::default(),
             })),
+            retirement: watch::channel(false).0,
             credential_requests: CallCount::new(),
             parked_polls: CallCount::new(),
+            attach_requests: CallCount::new(),
         }
     }
 
@@ -148,10 +179,24 @@ impl FakeProvisioner {
     pub fn advance_on_supply(&self, clock: Arc<TestClock>, by: Duration) {
         self.state.lock().advance_on_supply = Some((clock, by));
     }
+    /// Sets a callback run at the start of each convergence; its error aborts the call.
+    pub fn on_converge(&self, hook: impl Fn() -> Result<(), PortError> + Send + Sync + 'static) {
+        self.state.lock().converge_hook = Some(Arc::new(hook));
+    }
+    /// Returns supply reads and convergence attempts in their shared order, including failures.
+    #[must_use]
+    pub fn fleet_calls(&self) -> Vec<FleetCall> {
+        self.state.lock().fleet_calls.clone()
+    }
     /// Returns all supply queries, including failed ones, in order.
     #[must_use]
     pub fn supply_calls(&self) -> Vec<(FleetName, Isa)> {
         self.state.lock().supply_calls.clone()
+    }
+    /// Returns successful convergence requests in order.
+    #[must_use]
+    pub fn converge_requests(&self) -> Vec<FleetName> {
+        self.state.lock().converges.clone()
     }
     /// Returns successful desired-capacity requests in order.
     #[must_use]
@@ -163,17 +208,30 @@ impl FakeProvisioner {
     pub fn terminations(&self) -> Vec<InstanceId> {
         self.state.lock().terminations.clone()
     }
+    /// Returns all host milestones reported, in order.
+    #[must_use]
+    pub fn milestones(&self) -> Vec<HostMilestone> {
+        self.state.lock().milestones.clone()
+    }
+    /// Retires the host, releasing all current and future retirement waiters.
+    pub fn retire(&self) {
+        self.retirement.send_replace(true);
+    }
     /// Enables or disables supply failures.
     pub fn fail_supply(&self, fail: bool) {
-        self.state.lock().failures.supply = fail;
+        self.state.lock().failures.supply.forever = fail;
+    }
+    /// Enables or disables exit-acknowledgement failures.
+    pub fn fail_acknowledge_exit(&self, fail: bool) {
+        self.state.lock().failures.acknowledge_exit.forever = fail;
     }
     /// Enables or disables desired-capacity failures.
     pub fn fail_set_desired_capacity(&self, fail: bool) {
-        self.state.lock().failures.set_desired_capacity = fail;
+        self.state.lock().failures.set_desired_capacity.forever = fail;
     }
     /// Enables or disables termination failures.
     pub fn fail_terminate(&self, fail: bool) {
-        self.state.lock().failures.terminate = fail;
+        self.state.lock().failures.terminate.forever = fail;
     }
     /// Sets the identity reported by the node lifecycle port.
     pub fn set_identity(&self, identity: InstanceIdentity) {
@@ -191,6 +249,12 @@ impl FakeProvisioner {
     pub fn set_capacity(&self, capacity: Bytes) {
         self.state.lock().capacity = capacity;
     }
+    /// Treats capacity as a total volume size and subtracts allocated scratch files on mount.
+    ///
+    /// This controlled model does not query the host's free space. Disabled by default.
+    pub fn set_capacity_accounting(&self, enabled: bool) {
+        self.state.lock().account_for_scratch_usage = enabled;
+    }
     /// Makes the next `count` workload-credential requests fail.
     pub fn fail_workload_credential_next(&self, count: usize) {
         self.state.lock().credentials.remaining = count;
@@ -203,6 +267,17 @@ impl FakeProvisioner {
     pub fn fail_parked_next(&self, count: usize) {
         self.state.lock().parked_checks.remaining = count;
     }
+    /// Makes the next `count` provisioner attachments fail.
+    pub fn fail_attach(&self, count: usize) {
+        self.state.lock().attach.remaining = count;
+    }
+
+    /// Returns a waitable count of attachment attempts, including failures.
+    #[must_use]
+    pub fn attach_calls(&self) -> CallCount {
+        self.attach_requests.clone()
+    }
+
     /// Returns a waitable counter of workload-credential requests, including failures.
     #[must_use]
     pub fn workload_credential_calls(&self) -> CallCount {
@@ -218,26 +293,38 @@ impl FakeProvisioner {
 impl ProvisionerPort for FakeProvisioner {
     type FleetOptions = Opaque;
 
+    async fn attach(&self, _endpoints: &ServerEndpoints) -> Result<Option<Sidecar>, PortError> {
+        self.attach_requests.bump();
+        if self.state.lock().attach.fails() {
+            return Err(PortError::unavailable(
+                "provisioner attachment is unavailable",
+            ));
+        }
+        Ok(None)
+    }
+
     async fn supply(
         &self,
         fleet: Fleet<'_, Opaque>,
         into: &mut FleetSupply,
     ) -> Result<(), PortError> {
         let mut state = self.state.lock();
+        state
+            .fleet_calls
+            .push(FleetCall::Supply(fleet.name.clone()));
         state.supply_calls.push((fleet.name.clone(), fleet.isa));
         if let Some((clock, by)) = &state.advance_on_supply {
             clock.advance(*by);
         }
-        if state.failures.supply {
+        if state.failures.supply.fails() {
             return Err(PortError::unavailable("fleet supply is unavailable"));
         }
-        if let Some(supply) = state.supplies.get_mut(fleet.name) {
+        if let Some(supply) = state.supplies.get(fleet.name) {
             into.desired = supply.desired;
             into.warm = supply.warm;
             into.abandoned = supply.abandoned;
             into.instances.clone_from(&supply.instances);
-            into.exits.clear();
-            into.exits.append(&mut supply.exits);
+            into.exits.clone_from(&supply.exits);
             into.launch_failure.clone_from(&supply.launch_failure);
         } else {
             into.desired = 0;
@@ -261,13 +348,48 @@ impl ProvisionerPort for FakeProvisioner {
         }
         Ok(())
     }
+    async fn acknowledge_exit(
+        &self,
+        held: &Held,
+        fleet: Fleet<'_, Opaque>,
+        instance: &InstanceId,
+    ) -> Result<(), PortError> {
+        let mut state = self.state.lock();
+        held.check()?;
+        if state.failures.acknowledge_exit.fails() {
+            return Err(PortError::unavailable(
+                "exit acknowledgement is unavailable",
+            ));
+        }
+        if let Some(supply) = state.supplies.get_mut(fleet.name) {
+            supply.exits.retain(|exit| exit.instance != *instance);
+        }
+        Ok(())
+    }
+    async fn converge(&self, held: &Held, fleet: Fleet<'_, Opaque>) -> Result<(), PortError> {
+        let hook = {
+            let mut state = self.state.lock();
+            state
+                .fleet_calls
+                .push(FleetCall::Converge(fleet.name.clone()));
+            state.converge_hook.clone()
+        };
+        if let Some(hook) = hook {
+            hook()?;
+        }
+        held.check()?;
+        self.state.lock().converges.push(fleet.name.clone());
+        Ok(())
+    }
     async fn set_desired_capacity(
         &self,
+        held: &Held,
         fleet: Fleet<'_, Opaque>,
         desired: u32,
     ) -> Result<(), PortError> {
+        held.check()?;
         let mut state = self.state.lock();
-        if state.failures.set_desired_capacity {
+        if state.failures.set_desired_capacity.fails() {
             return Err(PortError::unavailable("fleet capacity is unavailable"));
         }
         state.desired.push((fleet.name.clone(), desired));
@@ -286,11 +408,13 @@ impl ProvisionerPort for FakeProvisioner {
     }
     async fn terminate(
         &self,
+        held: &Held,
         fleet: Fleet<'_, Opaque>,
         instance: &InstanceId,
     ) -> Result<(), PortError> {
+        held.check()?;
         let mut state = self.state.lock();
-        if state.failures.terminate {
+        if state.failures.terminate.fails() {
             return Err(PortError::unavailable(
                 "instance termination is unavailable",
             ));
@@ -308,6 +432,22 @@ impl ProvisionerPort for FakeProvisioner {
     }
     fn worker_lifetime(&self) -> WorkerLifetime {
         self.state.lock().lifetime
+    }
+}
+
+impl ControllerHostPort for FakeProvisioner {
+    async fn retiring(&self) -> Result<(), PortError> {
+        let mut retirement = self.retirement.subscribe();
+        retirement
+            .wait_for(|retired| *retired)
+            .await
+            .map_err(|_| PortError::unavailable("host retirement channel closed"))?;
+        Ok(())
+    }
+
+    async fn reached(&self, milestone: HostMilestone) -> Result<(), PortError> {
+        self.state.lock().milestones.push(milestone);
+        Ok(())
     }
 }
 
@@ -337,9 +477,16 @@ impl NodeLifecyclePort for FakeProvisioner {
 impl ScratchVolumePort for FakeProvisioner {
     async fn mount(&self, _instance: &InstanceId) -> Result<MountedScratchVolume, PortError> {
         let state = self.state.lock();
+        let capacity = if state.account_for_scratch_usage {
+            state
+                .capacity
+                .saturating_sub(gang_os::fs::usage(&state.volume).map_err(PortError::backend)?)
+        } else {
+            state.capacity
+        };
         Ok(MountedScratchVolume {
             path: state.volume.clone(),
-            capacity: state.capacity,
+            capacity,
         })
     }
 }
@@ -362,6 +509,131 @@ mod tests {
     use gang_clock::Timestamp;
     use gang_spi::FleetInstance;
     use gang_types::{InstanceLifecycle, Resources};
+
+    #[tokio::test]
+    async fn converge_records_the_fleet_and_changes_nothing() -> crate::TestResult {
+        let fake = FakeProvisioner::default();
+        let name = FleetName::try_new("workers")?;
+        let options = Opaque::default();
+        let fleet = Fleet {
+            name: &name,
+            isa: Isa::X86_64,
+            instance: Resources::default(),
+            options: &options,
+        };
+        fake.set_supply(
+            &name,
+            FleetSupply {
+                desired: 2,
+                abandoned: 1,
+                ..FleetSupply::default()
+            },
+        );
+        let mut before = FleetSupply::default();
+        fake.supply(fleet, &mut before).await?;
+        crate::fence::with_held(async |held| fake.converge(held, fleet).await).await?;
+        let mut after = FleetSupply::default();
+        fake.supply(fleet, &mut after).await?;
+        assert_eq!(
+            fake.fleet_calls(),
+            vec![
+                FleetCall::Supply(name.clone()),
+                FleetCall::Converge(name.clone()),
+                FleetCall::Supply(name.clone()),
+            ]
+        );
+        assert_eq!(before, after);
+        assert_eq!(fake.converge_requests(), vec![name]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_expired_permission_changes_nothing() -> crate::TestResult {
+        let fake = FakeProvisioner::default();
+        let name = FleetName::try_new("workers")?;
+        let options = Opaque::default();
+        let fleet = Fleet {
+            name: &name,
+            isa: Isa::X86_64,
+            instance: Resources::default(),
+            options: &options,
+        };
+        let instance = InstanceId::try_new("worker")?;
+        fake.set_supply(
+            &name,
+            FleetSupply {
+                desired: 1,
+                instances: vec![FleetInstance {
+                    id: instance.clone(),
+                    lifecycle: InstanceLifecycle::InService,
+                    launched_at: Timestamp::UNIX_EPOCH,
+                    release_first: false,
+                }],
+                ..FleetSupply::default()
+            },
+        );
+        let mut before = FleetSupply::default();
+        fake.supply(fleet, &mut before).await?;
+        assert!(matches!(
+            crate::fence::with_expired_held(async |held| fake
+                .set_desired_capacity(held, fleet, 2)
+                .await)
+            .await,
+            Err(gang_spi::RunError::Failed(PortError::Unavailable(_)))
+        ));
+        assert!(matches!(
+            crate::fence::with_expired_held(async |held| fake
+                .terminate(held, fleet, &instance)
+                .await)
+            .await,
+            Err(gang_spi::RunError::Failed(PortError::Unavailable(_)))
+        ));
+        assert!(matches!(
+            crate::fence::with_expired_held(async |held| fake.converge(held, fleet).await).await,
+            Err(gang_spi::RunError::Failed(PortError::Unavailable(_)))
+        ));
+        let mut after = FleetSupply::default();
+        fake.supply(fleet, &mut after).await?;
+        assert_eq!(before, after);
+        assert!(fake.desired_requests().is_empty());
+        assert!(fake.terminations().is_empty());
+        assert!(fake.converge_requests().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn records_host_milestones_in_order() -> crate::TestResult {
+        let fake = FakeProvisioner::default();
+        let shared = fake.clone();
+        assert!(fake.milestones().is_empty());
+        fake.reached(HostMilestone::Serving).await?;
+        shared.reached(HostMilestone::HandedOff).await?;
+        fake.reached(HostMilestone::Serving).await?;
+        assert_eq!(
+            shared.milestones(),
+            vec![
+                HostMilestone::Serving,
+                HostMilestone::HandedOff,
+                HostMilestone::Serving,
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retirement_releases_all_current_and_future_waiters() -> crate::TestResult {
+        let fake = FakeProvisioner::default();
+        let shared = fake.clone();
+        let mut first = Box::pin(fake.retiring());
+        let mut second = Box::pin(shared.retiring());
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        shared.retire();
+        first.await?;
+        second.await?;
+        fake.retiring().await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn lowering_capacity_keeps_live_instances_and_excludes_terminating() -> crate::TestResult
@@ -408,12 +680,14 @@ mod tests {
                 ..FleetSupply::default()
             },
         );
-        fake.set_desired_capacity(fleet, 0).await?;
+        crate::fence::with_held(async |held| fake.set_desired_capacity(held, fleet, 0).await)
+            .await?;
         let mut supply = FleetSupply::default();
         fake.supply(fleet, &mut supply).await?;
         assert_eq!(supply.desired, 2);
         assert_eq!(supply.instances.len(), 3);
-        fake.set_desired_capacity(fleet, 4).await?;
+        crate::fence::with_held(async |held| fake.set_desired_capacity(held, fleet, 4).await)
+            .await?;
         fake.supply(fleet, &mut supply).await?;
         assert_eq!(supply.desired, 4);
         Ok(())
@@ -477,30 +751,30 @@ mod tests {
             },
         );
 
-        fake.terminate(fleet, &first).await?;
+        crate::fence::with_held(async |held| fake.terminate(held, fleet, &first).await).await?;
         let mut supply = FleetSupply::default();
         fake.supply(fleet, &mut supply).await?;
         assert_eq!(supply.desired, 1);
         assert_eq!(supply.instances.len(), 1);
         assert_eq!(supply.instances[0].id, second);
 
-        fake.terminate(fleet, &InstanceId::try_new("unknown")?)
-            .await?;
-        fake.terminate(fleet, &first).await?;
+        let unknown = InstanceId::try_new("unknown")?;
+        crate::fence::with_held(async |held| fake.terminate(held, fleet, &unknown).await).await?;
+        crate::fence::with_held(async |held| fake.terminate(held, fleet, &first).await).await?;
         let mut after = FleetSupply::default();
         fake.supply(fleet, &mut after).await?;
         assert_eq!(after, supply);
 
         supply.instances[0].lifecycle = InstanceLifecycle::Terminating;
         fake.set_supply(&name, supply.clone());
-        fake.terminate(fleet, &second).await?;
+        crate::fence::with_held(async |held| fake.terminate(held, fleet, &second).await).await?;
         fake.supply(fleet, &mut after).await?;
         assert_eq!(after, supply);
 
         supply.desired = 0;
         supply.instances[0].lifecycle = InstanceLifecycle::Pending;
         fake.set_supply(&name, supply);
-        fake.terminate(fleet, &second).await?;
+        crate::fence::with_held(async |held| fake.terminate(held, fleet, &second).await).await?;
         fake.supply(fleet, &mut after).await?;
         assert_eq!(after.desired, 0);
         assert!(after.instances.is_empty());
@@ -526,7 +800,8 @@ mod tests {
         let mut supply = FleetSupply::default();
         fake.supply(fleet, &mut supply).await?;
         assert!(supply.launch_failure.is_none());
-        fake.set_desired_capacity(fleet, 2).await?;
+        crate::fence::with_held(async |held| fake.set_desired_capacity(held, fleet, 2).await)
+            .await?;
         fake.supply(fleet, &mut supply).await?;
         assert_eq!(supply.desired, 2);
         assert!(supply.instances.is_empty());
@@ -542,13 +817,16 @@ mod tests {
             name: &other_name,
             ..fleet
         };
-        fake.set_desired_capacity(other, 1).await?;
+        crate::fence::with_held(async |held| fake.set_desired_capacity(held, other, 1).await)
+            .await?;
         fake.supply(other, &mut supply).await?;
         assert!(supply.launch_failure.is_none());
-        fake.set_desired_capacity(fleet, 0).await?;
+        crate::fence::with_held(async |held| fake.set_desired_capacity(held, fleet, 0).await)
+            .await?;
         fake.supply(fleet, &mut supply).await?;
         assert!(supply.launch_failure.is_none());
-        fake.set_desired_capacity(fleet, 1).await?;
+        crate::fence::with_held(async |held| fake.set_desired_capacity(held, fleet, 1).await)
+            .await?;
         fake.clear_launch_failure(&name);
         fake.supply(fleet, &mut supply).await?;
         assert!(supply.launch_failure.is_none());
@@ -591,13 +869,29 @@ mod tests {
         fake.fail_supply(true);
         assert!(fake.supply(fleet, &mut actual).await.is_err());
         assert_eq!(fake.supply_calls(), vec![(name.clone(), Isa::X86_64); 2]);
-        fake.set_desired_capacity(fleet, 2).await?;
+        assert_eq!(
+            fake.fleet_calls(),
+            vec![
+                FleetCall::Supply(name.clone()),
+                FleetCall::Supply(name.clone())
+            ]
+        );
+        crate::fence::with_held(async |held| fake.set_desired_capacity(held, fleet, 2).await)
+            .await?;
         fake.fail_set_desired_capacity(true);
-        assert!(fake.set_desired_capacity(fleet, 3).await.is_err());
+        assert!(
+            crate::fence::with_held(async |held| fake.set_desired_capacity(held, fleet, 3).await)
+                .await
+                .is_err()
+        );
         assert_eq!(fake.desired_requests(), vec![(name.clone(), 2)]);
-        fake.terminate(fleet, &instance).await?;
+        crate::fence::with_held(async |held| fake.terminate(held, fleet, &instance).await).await?;
         fake.fail_terminate(true);
-        assert!(fake.terminate(fleet, &instance).await.is_err());
+        assert!(
+            crate::fence::with_held(async |held| fake.terminate(held, fleet, &instance).await)
+                .await
+                .is_err()
+        );
         assert_eq!(fake.terminations(), vec![instance]);
         Ok(())
     }

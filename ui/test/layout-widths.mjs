@@ -1,0 +1,2 @@
+export const FULL_WIDTHS = [320, 375, 414, 768, 800, 1280, 1760];
+export const FOCUSED_WIDTHS = [390, 1516, 1568, 1920];

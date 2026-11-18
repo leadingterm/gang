@@ -1,11 +1,14 @@
 //! Device authorization and refresh-token exchanges through the API.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, atomic::Ordering},
+    time::Duration,
+};
 
 use gang_config::EndpointTrust;
-use gang_spi::{ApiService, LoginGrant, Scheme};
+use gang_spi::{ApiService, LoginGrant, Peer, RequestGate, Scheme};
 use gang_tls::RevocationSet;
-use gang_types::{Proof, RefreshToken};
+use gang_types::{Principal, Proof, RefreshToken};
 use gang_wire::{AuthenticateResponse, ErrorReason};
 use http::header::{DATE, RETRY_AFTER};
 use serde_json::{Value, json};
@@ -14,10 +17,12 @@ use crate::api::{Api, ApiParts};
 use crate::authorizer::Authorizer;
 use crate::client_address::ClientAddress;
 use crate::device_logins::Approval;
+use crate::gate::Caller;
 use crate::info::{advertise_device_login, wire_server};
 use crate::rate_limit::RateLimiter;
+use crate::renewal_seal::RenewalSeal;
 use crate::revocation::Revocations;
-use crate::test_support::{ApiReply, api_request, identity, read, tls_settings};
+use crate::test_support::{ApiReply, api_request, identity, read, request_parts, tls_settings};
 use crate::test_support_deployment::TlsDeployment;
 use crate::test_support_session_harness::{Harness, HarnessOptions};
 
@@ -63,6 +68,8 @@ impl Fixture {
                 Arc::clone(&harness.clock),
             )),
             dashboard: None,
+            leader_routes: None,
+            ingest: None,
             builds: crate::builds::BuildsCell::new(&gang_config::BuildsConfig::default()),
             login_provider: harness.routes.login_provider().cloned(),
             device: mounted,
@@ -83,25 +90,43 @@ impl Fixture {
     }
 
     /// Approves an existing authorization using the configured Alice proof.
-    fn approve(&self, authorization: &Value) {
+    async fn approve(&self, authorization: &Value) {
         let code = authorization["name"]
             .as_str()
             .expect("name")
             .strip_prefix("deviceAuthorizations/")
             .expect("collection");
         let device = self.harness.routes.device().expect("device is mounted");
-        let code = device.logins.begin_approval(code).expect("pending code");
-        assert!(device.logins.approve(
-            &code,
-            Approval {
-                code: code.clone(),
-                grant: LoginGrant {
-                    proof: Proof::new("alice-proof"),
-                    refresh_token: Some(RefreshToken::new("refresh"))
-                },
-                principal: "alice".to_owned(),
-            }
-        ));
+        let repository = &self.harness.core.host.repository;
+        let seal = RenewalSeal::new(
+            &device.client.secret,
+            self.harness.core.host.endpoint.origin(),
+        );
+        let code = device
+            .logins
+            .begin_approval(repository, code)
+            .await
+            .expect("storage")
+            .expect("pending code");
+        assert!(
+            device
+                .logins
+                .approve(
+                    repository,
+                    &seal,
+                    &code,
+                    Approval {
+                        code: code.code.clone(),
+                        grant: LoginGrant {
+                            proof: Proof::new("alice-proof"),
+                            refresh_token: Some(RefreshToken::new("refresh")),
+                            principal: Principal::try_new("alice").expect("valid principal"),
+                        },
+                    }
+                )
+                .await
+                .expect("storage")
+        );
     }
 
     /// Redeems the authorization with a chosen secret.
@@ -187,7 +212,7 @@ async fn a_percent_encoded_code_with_a_space_is_found() {
     let reply = fixture.send("GET", &path, None).await;
     assert_eq!(reply.value()["name"], name);
 
-    fixture.approve(&authorization);
+    fixture.approve(&authorization).await;
     let reply = fixture
         .send(
             "POST",
@@ -237,7 +262,7 @@ async fn redeem_not_found_answers_are_byte_identical() {
     let fixture = Fixture::new(true, true);
     let authorization = fixture.create().await;
     let wrong = fixture.redeem(&authorization, "wrong").await;
-    fixture.approve(&authorization);
+    fixture.approve(&authorization).await;
     let success = fixture.redeem(&authorization, secret(&authorization)).await;
     assert_eq!(success.status, http::StatusCode::OK);
     let consumed = fixture.redeem(&authorization, secret(&authorization)).await;
@@ -293,7 +318,7 @@ async fn redeem_not_found_answers_are_byte_identical() {
 async fn redeem_after_approval_issues_a_token_with_the_refresh_token() {
     let fixture = Fixture::new(true, true);
     let authorization = fixture.create().await;
-    fixture.approve(&authorization);
+    fixture.approve(&authorization).await;
     let reply: AuthenticateResponse = fixture
         .redeem(&authorization, secret(&authorization))
         .await
@@ -309,7 +334,7 @@ async fn redeem_after_approval_issues_a_token_with_the_refresh_token() {
 async fn redeem_of_a_revoked_principal_is_principal_revoked_and_consumes_the_entry() {
     let fixture = Fixture::new(true, true);
     let authorization = fixture.create().await;
-    fixture.approve(&authorization);
+    fixture.approve(&authorization).await;
     fixture
         .harness
         .core
@@ -350,6 +375,51 @@ async fn authenticate_with_a_refresh_token_renews_with_the_web_client() {
         fixture.harness.verifier.renewals(),
         vec![("old".to_owned(), Some("web-client".to_owned()))]
     );
+}
+
+#[tokio::test]
+async fn authenticate_reuses_rotated_grant_after_signer_failure() {
+    let fixture = Fixture::new(true, true);
+    fixture
+        .harness
+        .verifier
+        .renew_to("old", "alice-proof", Some("rotated"));
+    let outage = fixture.harness.core.host.signer.outage();
+    outage.store(true, Ordering::SeqCst);
+    let body = json!({"provider":"example-idp", "refreshToken":"old"});
+
+    fixture
+        .send("POST", "/v1/session:authenticate", Some(body.clone()))
+        .await
+        .refused(ErrorReason::DependencyUnavailable);
+
+    outage.store(false, Ordering::SeqCst);
+    fixture.harness.verifier.renew_unavailable("old");
+    let reply: AuthenticateResponse = fixture
+        .send("POST", "/v1/session:authenticate", Some(body))
+        .await
+        .ok();
+    assert_eq!(
+        reply.refresh_token.expect("rotated token").expose(),
+        "rotated"
+    );
+    assert_eq!(
+        fixture.harness.verifier.renewals(),
+        vec![("old".to_owned(), Some("web-client".to_owned()))]
+    );
+
+    let mut parts = request_parts("/v1/server", Some(&reply.token));
+    fixture
+        .harness
+        .gate
+        .admit(&Peer::default(), &mut parts)
+        .await
+        .expect("the gate admits the open API route");
+    let authenticated = Caller::of(&parts.extensions)
+        .as_authenticated()
+        .expect("the bearer token authenticates the caller");
+    assert_eq!(authenticated.identity.provider.as_str(), "example-idp");
+    assert_eq!(authenticated.identity.principal.as_str(), "alice");
 }
 
 #[tokio::test]
@@ -397,4 +467,121 @@ async fn device_routes_are_not_found_when_device_login_is_off() {
             .await
             .refused(ErrorReason::RouteNotFound);
     }
+}
+
+#[tokio::test]
+async fn unavailable_device_records_return_service_unavailable() {
+    let fixture = Fixture::new(true, true);
+    let authorization = fixture.create().await;
+    fixture.harness.core.host.repository.fail_records(true);
+    let name = authorization["name"].as_str().expect("name");
+    assert_eq!(
+        fixture
+            .send("POST", "/v1/deviceAuthorizations", None)
+            .await
+            .status,
+        http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        fixture
+            .send("GET", &format!("/v1/{name}"), None)
+            .await
+            .status,
+        http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        fixture
+            .redeem(&authorization, secret(&authorization))
+            .await
+            .status,
+        http::StatusCode::SERVICE_UNAVAILABLE
+    );
+}
+
+#[tokio::test]
+async fn a_second_core_continues_a_device_login() -> gang_testkit::TestResult {
+    use crate::core::Core;
+    use crate::device_logins::DeviceLogins;
+    use crate::host::Host;
+    use crate::principals::{PrincipalSightings, RevokedPrincipals};
+    use crate::security::Security;
+    use crate::settings::DeviceSettings;
+    use crate::test_support_deployment::{endpoint, mtls, providers, token};
+    use gang_types::{DeviceCodeTtl, DevicePollInterval, DeviceSecret};
+    use std::num::NonZeroUsize;
+
+    let fixture = Fixture::new(true, true);
+    let authorization = fixture.create().await;
+    let original = &fixture.harness.core;
+    let core: Arc<Core<TlsDeployment>> = Core::new(
+        Host {
+            repository: original.host.repository.clone(),
+            signer: Arc::clone(&original.host.signer),
+            security: Security::Plaintext,
+            providers: providers().0,
+            clock: Arc::clone(&fixture.harness.clock),
+            endpoint: endpoint(original.host.endpoint.url().as_str()),
+            revoked_principals: RevokedPrincipals::new(),
+            sightings: PrincipalSightings::new(
+                Duration::from_mins(1),
+                NonZeroUsize::new(10).expect("nonzero"),
+            ),
+        },
+        token(),
+        mtls(),
+    );
+    let device = fixture.harness.routes.device().expect("mounted");
+    let other = DeviceLogins::new(
+        &DeviceSettings {
+            ttl: DeviceCodeTtl::from_units(600),
+            poll_interval: DevicePollInterval::from_units(5),
+        },
+        Arc::clone(&core.host.clock),
+    );
+    let device_code = authorization["name"]
+        .as_str()
+        .expect("name")
+        .strip_prefix("deviceAuthorizations/")
+        .expect("collection");
+    let secret = DeviceSecret::new(secret(&authorization));
+    let seal = RenewalSeal::new(&device.client.secret, core.host.endpoint.origin());
+    assert!(matches!(
+        other
+            .redeem(&core.host.repository, &seal, device_code, &secret)
+            .await?,
+        Err(crate::device_logins::Redeem::Pending)
+    ));
+    let user_code = other
+        .begin_approval(&core.host.repository, device_code)
+        .await?
+        .expect("pending");
+    assert!(
+        other
+            .approve(
+                &core.host.repository,
+                &seal,
+                &user_code,
+                Approval {
+                    code: user_code.code.clone(),
+                    grant: LoginGrant {
+                        proof: Proof::new("alice-proof"),
+                        refresh_token: Some(RefreshToken::new("refresh")),
+                        principal: Principal::try_new("alice").expect("valid principal"),
+                    },
+                }
+            )
+            .await?
+    );
+    fixture.harness.clock.advance(Duration::from_secs(5));
+    assert_eq!(
+        other
+            .redeem(&core.host.repository, &seal, device_code, &secret)
+            .await?
+            .expect("approved")
+            .grant
+            .principal
+            .as_str(),
+        "alice"
+    );
+    Ok(())
 }

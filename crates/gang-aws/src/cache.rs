@@ -57,6 +57,7 @@ fn store_spec(config: &S3CacheConfig, prefix: &str) -> RenderedStoreSpec {
         "provider": PROVIDER,
         "region": config.region.as_str(),
         "bucket": config.bucket.as_str(),
+        "force_path_style": config.force_path_style,
         "key_prefix": format!("{}{prefix}", config.key_prefix.as_str()),
         "retry": {
             "max_retries": config.tuning.max_retries,
@@ -66,6 +67,13 @@ fn store_spec(config: &S3CacheConfig, prefix: &str) -> RenderedStoreSpec {
         "multipart_max_concurrent_uploads": config.tuning.multipart_max_concurrent_uploads.get(),
         "max_retry_buffer_per_request": config.tuning.retry_buffer_per_request.get(),
     });
+    if let Some(endpoint) = &config.endpoint {
+        object["endpoint"] = json!(endpoint.as_str());
+        // NativeLink otherwise configures its S3 HTTP connector for HTTPS only.
+        if endpoint.scheme() == "http" {
+            object["insecure_allow_http"] = json!(true);
+        }
+    }
     if let Some(expiry) = &config.tuning.consider_expired_after {
         object["consider_expired_after_s"] = json!(expiry.as_secs());
     }
@@ -96,6 +104,50 @@ mod tests {
 
         serde_json::from_value::<StoreSpec>(cache.content_store()?.0)?;
         serde_json::from_value::<StoreSpec>(cache.action_store()?.0)?;
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_and_path_style_render_for_both_stores() -> TestResult {
+        for (endpoint, path_style, allow_http) in [
+            (None, false, false),
+            (None, true, false),
+            (Some("http://127.0.0.1:9000/"), false, true),
+            (Some("http://127.0.0.1:9000/"), true, true),
+            (Some("https://s3.example.com/"), false, false),
+            (Some("https://s3.example.com/"), true, false),
+        ] {
+            let mut value = base_config();
+            if let Some(endpoint) = endpoint {
+                value["endpoint"] = json!(endpoint);
+            }
+            value["force_path_style"] = json!(path_style);
+            let cache = S3Cache::build(serde_json::from_value(value)?, &context())?;
+            for spec in [cache.content_store()?, cache.action_store()?] {
+                assert_eq!(
+                    object(&spec).get("endpoint").and_then(Value::as_str),
+                    endpoint
+                );
+                assert_eq!(object(&spec)["force_path_style"], json!(path_style));
+                assert_eq!(
+                    object(&spec)
+                        .get("insecure_allow_http")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    allow_http
+                );
+                let parsed = serde_json::from_value::<StoreSpec>(spec.0)?;
+                let StoreSpec::ExperimentalCloudObjectStore(
+                    nativelink_config::stores::ExperimentalCloudObjectSpec::Aws(aws),
+                ) = parsed
+                else {
+                    return Err("expected an AWS cloud object store".into());
+                };
+                assert_eq!(aws.endpoint.as_deref(), endpoint);
+                assert_eq!(aws.force_path_style, path_style);
+                assert_eq!(aws.common.insecure_allow_http, allow_http);
+            }
+        }
         Ok(())
     }
 

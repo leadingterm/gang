@@ -246,6 +246,59 @@ async fn expired_id_token_is_renewed_through_the_refresh_token() {
 }
 
 #[tokio::test]
+async fn failed_workload_login_preserves_interactive_session_for_renewal() {
+    let harness = Harness::start_plain(ConsoleMode::Browser, google()).await;
+    harness
+        .server
+        .accept_proof("google", &minted_proof(1, START + Duration::from_hours(1)));
+    let _logged_in = login_interactive(&harness)
+        .await
+        .expect("interactive login");
+
+    let paths = [
+        harness.home.session_file(),
+        harness.home.refresh_token_file(),
+        harness.home.id_token_file(),
+        harness.home.token_file(),
+    ];
+    let snapshot = paths
+        .iter()
+        .map(|path| std::fs::read(path).expect("interactive login file is readable"))
+        .collect::<Vec<_>>();
+
+    let dir = TempDir::new().expect("creating the proof directory");
+    let missing_proof = dir.path().join("missing-proof");
+    assert!(
+        login_workload(&harness, &missing_proof).await.is_err(),
+        "a missing workload proof must fail login"
+    );
+    for (path, before) in paths.iter().zip(&snapshot) {
+        let after = std::fs::read(path).expect("interactive login file remains readable");
+        assert!(after == *before, "interactive login file changed");
+    }
+
+    let renewed_at = START + Duration::from_hours(1) + Duration::from_secs(1);
+    let renewed_proof = minted_proof(2, renewed_at + Duration::from_hours(1));
+    harness.server.accept_proof("google", &renewed_proof);
+    harness
+        .clock
+        .advance(Duration::from_hours(1) + Duration::from_secs(1));
+    let minted = harness.client().token().await.expect("token is re-minted");
+
+    assert_eq!(minted.value.expose(), "gang-token-2");
+    assert_eq!(harness.providers.renew_calls(), 1);
+    assert!(
+        harness
+            .server
+            .token_requests()
+            .last()
+            .map(|request| request.1.as_str())
+            == Some(renewed_proof.as_str()),
+        "the renewed proof is used for the token request"
+    );
+}
+
+#[tokio::test]
 async fn revoked_refresh_token_is_reported_as_renewal_rejected() {
     let harness = Harness::start_plain(ConsoleMode::Browser, google()).await;
     harness

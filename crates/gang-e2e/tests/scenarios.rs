@@ -296,6 +296,38 @@ mod cli;
 mod control;
 
 mod execution;
+
+#[test]
+fn failed_builds_report_stderr_instead_of_missing_reports() -> gang_e2e::Result<()> {
+    let variant = baseline(Sandbox::Bwrap);
+    let behaviour = Behaviour {
+        build: BuildFailure::BeforeScaleOut,
+        ..Behaviour::COMPLIANT
+    };
+    for scenario in [lifecycle, network, input_integrity] {
+        let system = Simulation::new(variant, behaviour);
+        let checks = scenario(&system, &variant)?;
+        assert!(
+            checks.iter().any(|check| matches!(&check.outcome, Outcome::Failed(reason) if reason.contains("UNAVAILABLE"))),
+            "failed build stderr was not reported: {checks:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn restart_reports_a_build_that_finished_before_scale_out() -> gang_e2e::Result<()> {
+    let checks = restart_checks(Behaviour {
+        build: BuildFailure::BeforeScaleOut,
+        ..Behaviour::COMPLIANT
+    })?;
+    assert!(
+        checks.iter().any(|check| matches!(&check.outcome, Outcome::Failed(reason) if reason.contains("UNAVAILABLE"))),
+        "failed build stderr was not reported: {checks:?}"
+    );
+    Ok(())
+}
+
 #[test]
 fn lifecycle_is_compliant_under_bwrap() {
     let variant = baseline(Sandbox::Bwrap);
@@ -473,13 +505,13 @@ flaw! {
 flaw! {
     hold_without_a_scope_fails_the_scope_check_of_the_restart:
         restart_checks(scope_report = ScopeReport::Missing)
-        => only [names::limits::HOLD_HAS_SCOPE]
+        => only [names::limits::HOLD_HAS_SCOPE, names::restart::BUILD_SURVIVES]
 }
 
 flaw! {
     a_hold_that_never_signals_fails_the_signal_check_of_the_restart:
         restart_checks(hold_signal = HoldSignal::Missing)
-        => only [names::limits::HOLD_SIGNALLED]
+        => only [names::limits::HOLD_SIGNALLED, names::restart::BUILD_SURVIVES]
 }
 
 #[test]
@@ -784,6 +816,25 @@ fn abandoning_a_wait_does_not_end_the_held_build() -> gang_e2e::Result<()> {
         system.release(&facts)?;
         assert!(
             build
+                .join()
+                .expect("the build thread does not panic")?
+                .succeeded()
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn cancelling_ends_a_scoped_held_build_without_its_release() -> gang_e2e::Result<()> {
+    let system = Simulation::new(limited(), Behaviour::COMPLIANT);
+    system.start_server()?;
+    std::thread::scope(|scope| -> gang_e2e::Result<()> {
+        let build = scope.spawn(|| system.build(&[Probe::Hold]));
+        assert_eq!(system.await_hold()?, Signalled::Started);
+        assert!(system.running_scope()?.is_some());
+        system.cancel_hold()?;
+        assert!(
+            !build
                 .join()
                 .expect("the build thread does not panic")?
                 .succeeded()

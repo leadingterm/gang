@@ -294,6 +294,7 @@ mod tests {
                 return Err(ClientError::Server {
                     status: 500,
                     message: "internal error".to_owned(),
+                    retry_after: None,
                 }
                 .into());
             }
@@ -317,6 +318,7 @@ mod tests {
             Err(ClientError::Server {
                 status: 500,
                 message: "unexpected certificate request".to_owned(),
+                retry_after: None,
             }
             .into())
         }

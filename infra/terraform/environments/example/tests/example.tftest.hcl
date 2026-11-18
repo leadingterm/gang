@@ -20,7 +20,7 @@ mock_provider "aws" {
 
   mock_data "aws_ec2_instance_type_offerings" {
     defaults = {
-      instance_types = ["c6id.4xlarge", "c6id.4xlarge", "c6id.4xlarge", "c7gd.4xlarge", "c7gd.4xlarge", "c7gd.4xlarge"]
+      instance_types = ["m8id.4xlarge", "m8id.4xlarge", "m8id.4xlarge", "m7gd.4xlarge", "m7gd.4xlarge", "m7gd.4xlarge"]
       locations      = ["az-a", "az-b", "az-c", "az-a", "az-b", "az-c"]
     }
   }

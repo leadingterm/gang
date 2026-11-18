@@ -8,7 +8,7 @@ use std::sync::Arc;
 use gang_clock::Clock;
 use gang_spi::{
     ApiRequestBody, ApiResponseBody, AuthenticationPort, CredentialLifecyclePort, LoginGrant,
-    LoginPort, LoginRequest, PortError, ProofVerifierPort, Rejection, TokenIssue, full_body,
+    LoginPort, LoginRequest, PortError, Rejection, TokenIssue, full_body,
 };
 use gang_types::{LoginSession, Principal, ProviderName, RefreshToken, Url};
 use gang_wire::{
@@ -18,7 +18,6 @@ use gang_wire::{
 use http::HeaderMap;
 use http::header::{ALLOW, CONTENT_TYPE, HeaderValue, LOCATION, ORIGIN, RETRY_AFTER, SET_COOKIE};
 use http::{Method, Request, Response, StatusCode};
-use parking_lot::Mutex;
 use tracing::{info, warn};
 
 use crate::attempts::{Attempt, LoginAttempts, Purpose};
@@ -26,7 +25,7 @@ use crate::client_address::ClientAddress;
 use crate::cookies::cookie_value;
 use crate::core::Core;
 use crate::deployment::Stack;
-use crate::device_logins::{Approval, MountedDevice, UserCode};
+use crate::device_logins::{Approval, ApprovalTarget, DeviceLogins, MountedDevice, UserCode};
 use crate::rate_limit::RateLimiter;
 use crate::renewal_flights::{RenewalFailure, RenewalFlights};
 use crate::renewal_seal::{Renewal, RenewalSeal};
@@ -52,13 +51,13 @@ struct MountedLogin<C: Clock, V> {
     settings: LoginSettings,
     /// The verified interactive provider's verifier.
     verifier: Arc<V>,
-    attempts: Mutex<LoginAttempts>,
+    attempts: LoginAttempts,
     /// The shared limiter for sign-in and callback requests.
     limiter: Arc<RateLimiter<Arc<C>>>,
     /// The authenticated encryption for renewal cookies.
-    seal: RenewalSeal,
+    seal: Arc<RenewalSeal>,
     /// Shared refresh grants for concurrent and recently started renewals.
-    flights: RenewalFlights,
+    flights: Arc<RenewalFlights>,
     /// The device authorization service shared with the API, when enabled.
     device: Option<Arc<MountedDevice<C, V>>>,
 }
@@ -103,21 +102,27 @@ impl<K: Stack> SessionRoutes<K> {
             }
             let provider = core.host.providers.get(&settings.provider)?;
             provider.login()?;
+            let seal = Arc::new(RenewalSeal::new(
+                &settings.client.secret,
+                core.host.endpoint.origin(),
+            ));
+            let flights = Arc::new(RenewalFlights::new(settings.renewal_reuse.get()));
             let device = settings.device.as_ref().and_then(|device| {
                 let uri = core.host.endpoint.url().join("/ui/device").ok()?;
-                Some(Arc::new(MountedDevice::new(
-                    device,
-                    settings.provider.clone(),
-                    settings.client.clone(),
-                    Arc::clone(&provider.verifier),
-                    uri,
-                    Arc::clone(&core.host.clock),
-                )))
+                Some(Arc::new(MountedDevice {
+                    logins: DeviceLogins::new(device, Arc::clone(&core.host.clock)),
+                    provider: settings.provider.clone(),
+                    client: settings.client.clone(),
+                    verifier: Arc::clone(&provider.verifier),
+                    verification_uri: uri,
+                    seal: Arc::clone(&seal),
+                    flights: Arc::clone(&flights),
+                }))
             });
             Some(MountedLogin {
-                attempts: Mutex::new(LoginAttempts::new(settings.max_pending, settings.ttl.get())),
-                seal: RenewalSeal::new(&settings.client.secret, core.host.endpoint.origin()),
-                flights: RenewalFlights::new(settings.max_pending, settings.renewal_reuse.get()),
+                attempts: LoginAttempts::new(settings.ttl.get()),
+                seal,
+                flights,
                 verifier: Arc::clone(&provider.verifier),
                 device,
                 limiter,
@@ -215,8 +220,8 @@ impl<K: Stack> SessionRoutes<K> {
         response
     }
 
-    /// Ends the session when the request comes from the dashboard; any other request is refused
-    /// before a cookie is cleared.
+    /// Ends the session when the request comes from the dashboard and redirects with 303 to
+    /// replace the authenticated document; any other request is refused before a cookie is cleared.
     fn logout(&self, headers: &HeaderMap) -> Response<ApiResponseBody> {
         let core = &self.0.core;
         if !is_same_origin_request(headers, core.host.endpoint.origin()) {
@@ -226,7 +231,10 @@ impl<K: Stack> SessionRoutes<K> {
             core.cookies.clear_session_header(),
             core.cookies.clear_renewal_header(),
         ) {
-            let mut response = empty(StatusCode::NO_CONTENT);
+            let mut response = empty(StatusCode::SEE_OTHER);
+            response
+                .headers_mut()
+                .insert(LOCATION, HeaderValue::from_static("/ui/"));
             response.headers_mut().append(SET_COOKIE, session);
             response.headers_mut().append(SET_COOKIE, renewal);
             response
@@ -266,6 +274,7 @@ impl<K: Stack> SessionRoutes<K> {
             .and_then(|started| started.redirect(Vec::new()))
         {
             Ok(response) => response,
+            Err(LoginFailure::StorageUnavailable) => empty(StatusCode::SERVICE_UNAVAILABLE),
             Err(failure) => error_redirect(failure, ERROR_PATH, Vec::new()),
         }
     }
@@ -310,14 +319,22 @@ impl<K: Stack> SessionRoutes<K> {
         else {
             return empty(StatusCode::BAD_REQUEST);
         };
-        let code = mounted
-            .device
-            .as_ref()
-            .and_then(|device| device.logins.begin_approval(&request.user_code));
-        let Some(code) = code else {
+        let Some(device) = mounted.device.as_ref() else {
             return empty(StatusCode::NOT_FOUND);
         };
-        match self.begin(mounted, Purpose::Device { code }).await {
+        let target = match device
+            .logins
+            .begin_approval(&self.0.core.host.repository, &request.user_code)
+            .await
+        {
+            Ok(Some(target)) => target,
+            Ok(None) => return empty(StatusCode::NOT_FOUND),
+            Err(error) => {
+                warn!(%error, "device login storage unavailable");
+                return empty(StatusCode::SERVICE_UNAVAILABLE);
+            }
+        };
+        match self.begin(mounted, Purpose::Device { target }).await {
             Ok(started) => {
                 let answer = ApproveDeviceAuthorizationResponse {
                     authorization_url: started.authorization_url,
@@ -358,14 +375,23 @@ impl<K: Stack> SessionRoutes<K> {
             .cookies
             .login_header(&state, login.ttl.get())
             .map_err(|_| LoginFailure::failed("sign-in cookie is not a header value"))?;
-        mounted.attempts.lock().insert(
-            state,
-            Attempt {
-                session: challenge.session,
-                purpose,
-            },
-            core.host.clock.monotonic(),
-        );
+        mounted
+            .attempts
+            .insert(
+                &core.host.repository,
+                &mounted.seal,
+                &state,
+                Attempt {
+                    session: challenge.session,
+                    purpose,
+                },
+                core.host.clock.wall(),
+            )
+            .await
+            .map_err(|error| {
+                warn!(%error, "login attempt storage unavailable");
+                LoginFailure::StorageUnavailable
+            })?;
         Ok(Started {
             authorization_url: challenge.authorization_url,
             cookie,
@@ -384,6 +410,7 @@ impl<K: Stack> SessionRoutes<K> {
         }
         match self.finish(mounted, query, headers, client).await {
             Ok(response) => response,
+            Err(LoginFailure::StorageUnavailable) => empty(StatusCode::SERVICE_UNAVAILABLE),
             Err(failure) => error_redirect(
                 failure,
                 ERROR_PATH,
@@ -416,15 +443,24 @@ impl<K: Stack> SessionRoutes<K> {
         }
         let attempt = mounted
             .attempts
-            .lock()
-            .take(state, core.host.clock.monotonic())
+            .take(
+                &core.host.repository,
+                &mounted.seal,
+                state,
+                core.host.clock.wall(),
+            )
+            .await
+            .map_err(|error| {
+                warn!(%error, "login attempt storage unavailable");
+                LoginFailure::StorageUnavailable
+            })?
             .ok_or_else(|| LoginFailure::failed("sign-in attempt is unknown or expired"))?;
         let Attempt { session, purpose } = attempt;
         let (next, renewal) = match purpose {
             Purpose::Session { next, renewal } => (next, renewal),
-            Purpose::Device { code } => {
+            Purpose::Device { target } => {
                 return Ok(self
-                    .finish_device(mounted, code, session, &callback_url, clear, client)
+                    .finish_device(mounted, target, session, &callback_url, clear, client)
                     .await);
             }
         };
@@ -433,19 +469,16 @@ impl<K: Stack> SessionRoutes<K> {
             .complete_login(session, &callback_url)
             .await
             .map_err(|error| LoginFailure::of(&error))?;
-        let principal = mounted
-            .verifier
-            .verify(&grant.proof)
-            .await
-            .map_err(|error| LoginFailure::of(&error))?;
+        let principal = &grant.principal;
         let refresh_token = if let Some(renewal) = renewal {
-            match self.recheck(mounted, renewal, &principal, &next).await? {
+            match self.recheck(mounted, renewal, principal, &next).await? {
                 ControlFlow::Continue(refresh_token) => Some(refresh_token),
                 ControlFlow::Break(response) => return Ok(response),
             }
         } else {
             grant.refresh_token
         };
+        let expires_at = core.host.clock.wall() + login.session_max_age.get();
         let issued = core
             .clients
             .issue_session(
@@ -454,6 +487,7 @@ impl<K: Stack> SessionRoutes<K> {
                     provider: &login.provider,
                     proof: &grant.proof,
                 },
+                expires_at,
             )
             .await
             .map_err(|error| LoginFailure::of(&error))?;
@@ -467,7 +501,7 @@ impl<K: Stack> SessionRoutes<K> {
                 provider: login.provider.clone(),
                 principal: principal.as_str().to_owned(),
                 refresh_token,
-                expire_time: core.host.clock.wall() + login.session_max_age.get(),
+                expire_time: expires_at,
             };
             if let Some(cookie) = self.renewal_cookie(mounted, &renewal) {
                 cookies.push(cookie);
@@ -491,7 +525,7 @@ impl<K: Stack> SessionRoutes<K> {
     async fn finish_device(
         &self,
         mounted: &MountedLogin<K::Clock, K::Identity>,
-        code: UserCode,
+        target: ApprovalTarget,
         session: LoginSession,
         callback_url: &Url,
         clear: HeaderValue,
@@ -499,25 +533,27 @@ impl<K: Stack> SessionRoutes<K> {
     ) -> Response<ApiResponseBody> {
         let grant = match mounted.verifier.complete_login(session, callback_url).await {
             Ok(grant) => grant,
-            Err(error) => return device_failed(&code, None, LoginFailure::of(&error), clear),
+            Err(error) => {
+                return device_failed(&target.code, None, LoginFailure::of(&error), clear);
+            }
         };
-        let principal = match mounted.verifier.verify(&grant.proof).await {
-            Ok(principal) => principal.as_str().to_owned(),
-            Err(error) => return device_failed(&code, None, LoginFailure::of(&error), clear),
-        };
-        if let Err(failure) = Self::approve_verified(mounted, &code, grant, &principal) {
-            return device_failed(&code, Some(&principal), failure, clear);
+        let principal = grant.principal.as_str().to_owned();
+        if let Err(failure) = self.approve_verified(mounted, &target, grant).await {
+            if failure == LoginFailure::StorageUnavailable {
+                return empty(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            return device_failed(&target.code, Some(&principal), failure, clear);
         }
-        info!(%code, %principal, approver = ?client, "device login approved");
+        info!(code = %target.code, %principal, approver = ?client, "device login approved");
         redirect(HeaderValue::from_static(DEVICE_APPROVED_PATH), vec![clear])
     }
 
     /// Stores a verified device grant if its authorization is still pending.
-    fn approve_verified(
+    async fn approve_verified(
+        &self,
         mounted: &MountedLogin<K::Clock, K::Identity>,
-        code: &UserCode,
+        target: &ApprovalTarget,
         grant: LoginGrant,
-        principal: &str,
     ) -> Result<(), LoginFailure> {
         if grant.refresh_token.is_none() {
             warn!(
@@ -531,14 +567,23 @@ impl<K: Stack> SessionRoutes<K> {
             .device
             .as_ref()
             .ok_or_else(|| LoginFailure::failed("device login is not mounted"))?;
-        if !device.logins.approve(
-            code,
-            Approval {
-                code: code.clone(),
-                grant,
-                principal: principal.to_owned(),
-            },
-        ) {
+        if !device
+            .logins
+            .approve(
+                &self.0.core.host.repository,
+                &mounted.seal,
+                target,
+                Approval {
+                    code: target.code.clone(),
+                    grant,
+                },
+            )
+            .await
+            .map_err(|error| {
+                warn!(%error, "device login storage unavailable");
+                LoginFailure::StorageUnavailable
+            })?
+        {
             return Err(LoginFailure::failed("device login is no longer pending"));
         }
         Ok(())
@@ -555,19 +600,24 @@ impl<K: Stack> SessionRoutes<K> {
         let core = &self.0.core;
         let refreshed = mounted
             .flights
-            .renew(&renewal.refresh_token, core.host.clock.monotonic(), || {
-                mounted
-                    .verifier
-                    .renew(&renewal.refresh_token, Some(&mounted.settings.client))
-            })
+            .renew(
+                &core.host.repository,
+                core.host.clock.as_ref(),
+                &mounted.seal,
+                &renewal.refresh_token,
+                mounted.verifier.as_ref(),
+                || {
+                    mounted
+                        .verifier
+                        .renew(&renewal.refresh_token, Some(&mounted.settings.client))
+                },
+            )
             .await;
+        if matches!(refreshed, Err(RenewalFailure::StorageUnavailable)) {
+            return Err(LoginFailure::StorageUnavailable);
+        }
         let valid = if let Ok(refreshed) = &refreshed {
-            match mounted.verifier.verify(&refreshed.proof).await {
-                Ok(refreshed_principal) => {
-                    principal == &refreshed_principal && principal.as_str() == renewal.principal
-                }
-                Err(_) => false,
-            }
+            principal == &refreshed.principal && principal.as_str() == renewal.principal
         } else {
             false
         };
@@ -618,6 +668,18 @@ impl<K: Stack> SessionRoutes<K> {
         }
     }
 
+    fn with_rotated_renewal(
+        &self,
+        mounted: &MountedLogin<K::Clock, K::Identity>,
+        mut response: Response<ApiResponseBody>,
+        renewal: Option<&Renewal>,
+    ) -> Response<ApiResponseBody> {
+        if let Some(cookie) = renewal.and_then(|renewal| self.renewal_cookie(mounted, renewal)) {
+            response.headers_mut().append(SET_COOKIE, cookie);
+        }
+        response
+    }
+
     /// Renews a session after checking origin, rate limit and the sealed identity.
     async fn renew(
         &self,
@@ -647,39 +709,54 @@ impl<K: Stack> SessionRoutes<K> {
     async fn renew_held(
         &self,
         mounted: &MountedLogin<K::Clock, K::Identity>,
-        mut renewal: Renewal,
+        renewal: Renewal,
     ) -> Response<ApiResponseBody> {
         let core = &self.0.core;
         let login = &mounted.settings;
-        if renewal.expire_time <= core.host.clock.wall() {
+        // Sessions expire at whole seconds, so admission uses the same boundary.
+        let deadline = gang_clock::Timestamp::from_unix_millis(
+            renewal.expire_time.as_unix_millis() / 1_000 * 1_000,
+        );
+        if session_window_closed(deadline, core.host.clock.wall()) {
             return self.renewal_refusal(StatusCode::UNAUTHORIZED, false);
         }
         let grant = match mounted
             .flights
-            .renew(&renewal.refresh_token, core.host.clock.monotonic(), || {
-                mounted
-                    .verifier
-                    .renew(&renewal.refresh_token, Some(&login.client))
-            })
+            .renew(
+                &core.host.repository,
+                core.host.clock.as_ref(),
+                &mounted.seal,
+                &renewal.refresh_token,
+                mounted.verifier.as_ref(),
+                || {
+                    mounted
+                        .verifier
+                        .renew(&renewal.refresh_token, Some(&login.client))
+                },
+            )
             .await
         {
             Ok(grant) => grant,
             Err(RenewalFailure::Rejected) => {
                 return self.renewal_refusal(StatusCode::UNAUTHORIZED, true);
             }
-            Err(RenewalFailure::Unavailable) => {
+            Err(RenewalFailure::Unavailable | RenewalFailure::StorageUnavailable) => {
                 return self.renewal_refusal(StatusCode::SERVICE_UNAVAILABLE, false);
             }
         };
-        let principal = match mounted.verifier.verify(&grant.proof).await {
-            Ok(principal) => principal,
-            Err(error) => {
-                let (status, clear) = classify_renewal_error(&error);
-                return self.renewal_refusal(status, clear);
-            }
-        };
-        if principal.as_str() != renewal.principal {
+        if grant.principal.as_str() != renewal.principal {
             return self.renewal_refusal(StatusCode::UNAUTHORIZED, true);
+        }
+        let renewal = grant.refresh_token.map(|refresh_token| Renewal {
+            refresh_token,
+            ..renewal
+        });
+        if session_window_closed(deadline, core.host.clock.wall()) {
+            return self.with_rotated_renewal(
+                mounted,
+                self.renewal_refusal(StatusCode::UNAUTHORIZED, false),
+                renewal.as_ref(),
+            );
         }
         let issued = match core
             .clients
@@ -689,13 +766,31 @@ impl<K: Stack> SessionRoutes<K> {
                     provider: &login.provider,
                     proof: &grant.proof,
                 },
+                deadline,
             )
             .await
         {
             Ok(issued) => issued,
             Err(error) => {
-                let (status, clear) = classify_renewal_error(&error);
-                return self.renewal_refusal(status, clear);
+                let (status, clear) =
+                    if matches!(
+                        &error,
+                        PortError::Rejected {
+                            reason: Rejection::InvalidProof,
+                            ..
+                        }
+                    ) && session_window_closed(deadline, core.host.clock.wall())
+                    {
+                        (StatusCode::UNAUTHORIZED, false)
+                    } else {
+                        classify_renewal_error(&error)
+                    };
+                let response = self.renewal_refusal(status, clear);
+                return if clear {
+                    response
+                } else {
+                    self.with_rotated_renewal(mounted, response, renewal.as_ref())
+                };
             }
         };
         let session = match core
@@ -705,18 +800,16 @@ impl<K: Stack> SessionRoutes<K> {
             Ok(session) => session,
             Err(error) => {
                 tracing::error!(%error, "session cookie cannot be represented");
-                return empty(StatusCode::INTERNAL_SERVER_ERROR);
+                return self.with_rotated_renewal(
+                    mounted,
+                    empty(StatusCode::INTERNAL_SERVER_ERROR),
+                    renewal.as_ref(),
+                );
             }
         };
         let mut response = empty(StatusCode::NO_CONTENT);
         response.headers_mut().append(SET_COOKIE, session);
-        if let Some(rotated) = grant.refresh_token {
-            renewal.refresh_token = rotated;
-            if let Some(cookie) = self.renewal_cookie(mounted, &renewal) {
-                response.headers_mut().append(SET_COOKIE, cookie);
-            }
-        }
-        response
+        self.with_rotated_renewal(mounted, response, renewal.as_ref())
     }
 
     /// Builds a renewal refusal, clearing its cookie only for permanent failures.
@@ -735,6 +828,12 @@ impl<K: Stack> SessionRoutes<K> {
         }
         response
     }
+}
+
+/// Whether a session ending at the whole-second `deadline` can no longer be issued at `now`: its
+/// cookie's `Max-Age` counts whole seconds, and `Max-Age=0` deletes the cookie instead.
+fn session_window_closed(deadline: gang_clock::Timestamp, now: gang_clock::Timestamp) -> bool {
+    deadline.saturating_duration_since(now) < std::time::Duration::from_secs(1)
 }
 
 /// Classifies verification and session-issuance failures for renewal.
@@ -768,6 +867,8 @@ enum LoginFailure {
     Failed,
     /// A dependency of the sign-in is down.
     Unavailable,
+    /// The shared record store failed.
+    StorageUnavailable,
 }
 
 impl LoginFailure {
@@ -803,7 +904,7 @@ impl LoginFailure {
         match self {
             Self::Denied => StatusCode::FORBIDDEN,
             Self::Failed => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Unavailable | Self::StorageUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -812,7 +913,7 @@ impl LoginFailure {
         match self {
             Self::Denied => "denied",
             Self::Failed => "failed",
-            Self::Unavailable => "unavailable",
+            Self::Unavailable | Self::StorageUnavailable => "unavailable",
         }
     }
 }

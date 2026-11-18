@@ -1,7 +1,14 @@
-{gang, ...}: {
-  # The controller's listeners (public endpoint, worker). One system serves both roles: on a worker nothing
-  # listens on them, and the worker security group has no ingress.
-  networking.firewall.allowedTCPPorts = [443 9090];
+{gang, ...}: let
+  ports = builtins.fromJSON (builtins.readFile ../terraform/modules/network/ports.json);
+in {
+  # The controller's listeners (public endpoint, the leader's execution endpoint, worker, health). One system serves
+  # both roles: on a worker nothing listens on them, and the worker security group has no ingress.
+  networking.firewall.allowedTCPPorts = [ports.public ports.execution ports.worker ports.health];
+
+  # Amazon's RDS certificate authorities, named by gang.toml's [database.postgres]
+  # ca_file for database.postgres.rds in the deployment module. Refresh this file
+  # from https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem when AWS adds or rotates a CA.
+  environment.etc."gang/rds-ca-bundle.pem".source = ./rds-ca-bundle.pem;
 
   systemd.services.gang-server = {
     description = "Gang controller server";
@@ -15,10 +22,13 @@
       User = "gang";
       Group = "gang";
       ExecStart = "${gang}/bin/gang server --config /etc/gang/gang.toml";
-      Restart = "always";
+      Restart = "on-failure";
+      # 4: gang's shutdown deadline elapsed (crates/gang-main/src/server_command.rs); a retiring controller stays stopped.
+      RestartPreventExitStatus = 4;
       RestartSec = 5;
       LimitNOFILE = 1048576;
-      TimeoutStopSec = 60;
+      # Gang bounds the whole post-signal path; the unit cannot know runtime shutdown_grace.
+      TimeoutStopSec = "infinity";
 
       # Hardening. The controller needs no bubblewrap; it only needs the
       # state directory writable.

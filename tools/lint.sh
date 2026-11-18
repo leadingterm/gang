@@ -1,18 +1,47 @@
 #!/usr/bin/env bash
-# CI's lint job, which tools/gate.sh runs first (docs/SPECIFICATION.md §7 items 4 and 5): Nix formatting, the shell
-# scripts, the workflows, every flake output of every system, then macOS Clippy of every Cargo target, the darwin check's
-# only runner. Stops at the first failure.
-# Usage: nix develop -c tools/lint.sh
+# The two CI lint work jobs run --portable and --nix-vm, covered by the required lint aggregate; tools/gate.sh runs the full local gate.
+# Portable checks cover OpenTofu tests, formatting, shell scripts, workflows, flake evaluation, and macOS Clippy.
+# The VM checks require x86_64 Linux/KVM. Stops at the first failure.
+# Usage: nix develop -c tools/lint.sh [--portable|--nix-vm]
 set -euo pipefail
 cd "$(dirname "$0")/.."
-alejandra --check .
-shellcheck infra/scripts/*.sh tools/*.sh
-# actionlint finds its project (its configuration, every workflow and the local actions it checks) only beside a .git
-# entry: it lints a copy of .github that has one, so a source tree without Git history is linted as CI's checkout is.
-scratch=$(mktemp -d)
-trap 'rm -rf "$scratch"' EXIT
-cp -R .github .shellcheckrc "$scratch/"
-mkdir "$scratch/.git"
-(cd "$scratch" && actionlint)
-nix flake check --no-build --all-systems
-nix run .#darwin-check
+portable() {
+  tools/check-required-jobs.sh
+  tools/check-required-jobs_test.sh
+  tools/check-opentofu-tests.sh
+  alejandra --check .
+  shellcheck infra/scripts/*.sh tools/*.sh
+  # actionlint requires a .git entry beside its configuration, workflows, and local actions.
+  (
+    scratch=$(mktemp -d)
+    trap 'rm -rf "$scratch"' EXIT
+    cp -R .github .shellcheckrc "$scratch/"
+    mkdir "$scratch/.git"
+    cd "$scratch"
+    actionlint
+  )
+  nix flake check --no-build --all-systems
+  nix run .#darwin-check
+}
+
+nix_vm() {
+  if [[ $(uname -sm) != 'Linux x86_64' ]]; then
+    echo 'The Nix VM checks require Linux x86_64.' >&2
+    return 1
+  fi
+  nix flake check --all-systems --print-build-logs
+}
+
+if (( $# == 0 )); then
+  portable
+  nix_vm
+elif (( $# == 1 )); then
+  case "$1" in
+    --portable) portable ;;
+    --nix-vm) nix_vm ;;
+    *) echo "Usage: $0 [--portable|--nix-vm]" >&2; exit 2 ;;
+  esac
+else
+  echo "Usage: $0 [--portable|--nix-vm]" >&2
+  exit 2
+fi

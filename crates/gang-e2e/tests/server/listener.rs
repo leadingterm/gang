@@ -329,10 +329,12 @@ impl SimServer {
                 || header("sec-fetch-site") == Some("same-origin")
                 || self.behaviour.logout == Logout::AnyOrigin;
             if same_origin {
-                Answer::empty(204).with_header(
-                    "set-cookie",
-                    format!("{}=; Max-Age=0", super::behaviour::COOKIE_NAME),
-                )
+                Answer::empty(303)
+                    .with_header("location", "/ui/")
+                    .with_header(
+                        "set-cookie",
+                        format!("{}=; Max-Age=0", super::behaviour::COOKIE_NAME),
+                    )
             } else {
                 Answer::empty(403)
             }

@@ -9,7 +9,31 @@ sh_test(
 
 sh_test(
     name = "publish-amis_test",
+    size = "small",
+    timeout = "short",
     srcs = ["publish-amis_test.sh"],
-    data = ["publish-amis.sh"],
-    env = {"PUBLISH_AMIS": "$(rootpath publish-amis.sh)"},
+    data = [
+        "publish-amis.sh",
+        "@import_test_tools//:jq",
+    ],
+    env = {
+        "PUBLISH_AMIS": "$(rootpath publish-amis.sh)",
+        "PUBLISH_JQ": "$(rootpath @import_test_tools//:jq)",
+    },
+)
+
+sh_test(
+    name = "import-image_test",
+    size = "small",
+    timeout = "short",
+    srcs = ["import-image_test.sh"],
+    data = [
+        "import-image.sh",
+        "@import_test_tools//:jq",
+        "@import_test_tools//:zstd",
+    ],
+    env = {
+        "IMPORT_IMAGE": "$(rootpath import-image.sh)",
+        "IMPORT_JQ": "$(rootpath @import_test_tools//:jq)",
+    },
 )

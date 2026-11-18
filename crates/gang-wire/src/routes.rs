@@ -417,6 +417,18 @@ routes! {
         rate_limited: false,
     };
 
+    /// `POST /v1/builds:ingest`: a follower's batch of observations. Controller-only: authenticated
+    /// by the `x-gang-controller` proof, served by the leader's execution listener only.
+    INGEST_BUILDS = IngestBuilds {
+        method: Method::Post,
+        template: "/v1/builds:ingest",
+        permission: None,
+        request: Some("IngestBuildsRequest"),
+        response: "IngestBuildsResponse",
+        cookie: false,
+        rate_limited: false,
+    };
+
     /// `GET /v1/state`: the current state. Requires `state.read`; may be identified by the session
     /// cookie.
     GET_STATE = GetState {
@@ -519,6 +531,18 @@ mod tests {
             assert!(!route.cookie);
             assert!(route.rate_limited);
         }
+    }
+
+    #[test]
+    fn ingest_route_is_controller_only() {
+        let (route, raw) = lookup(Method::Post, "/v1/builds:ingest").expect("ingest matches");
+        assert_eq!(route.id, RouteId::IngestBuilds);
+        assert_eq!(raw, None);
+        assert_eq!(route.permission, None);
+        assert_eq!(route.request, Some("IngestBuildsRequest"));
+        assert_eq!(route.response, "IngestBuildsResponse");
+        assert!(!route.cookie);
+        assert!(!route.rate_limited);
     }
 
     #[test]
@@ -728,6 +752,7 @@ mod tests {
                 ("/v1/events", Some("events.read")),
                 ("/v1/builds", Some("builds.read")),
                 ("/v1/builds/{build}", Some("builds.read")),
+                ("/v1/builds:ingest", None),
                 ("/v1/state", Some("state.read")),
                 ("/v1/state:watch", Some("state.read")),
                 ("/v1/session", None),

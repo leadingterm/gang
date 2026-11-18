@@ -91,6 +91,7 @@ pub const DOMAINS: [Domain; 10] = [
                 }],
             },
             PortSpec::plain("NodeLifecyclePort"),
+            PortSpec::plain("ControllerHostPort"),
             PortSpec::plain("ScratchVolumePort"),
             PortSpec::plain("WorkloadCredentialPort"),
         ],
@@ -125,7 +126,11 @@ pub const DOMAINS: [Domain; 10] = [
         associated_type: "Database",
         cardinality: Cardinality::ExactlyOne,
         sandbox_selection: false,
-        ports: &[PortSpec::plain("StateRepositoryPort")],
+        ports: &[
+            PortSpec::plain("StateRepositoryPort"),
+            PortSpec::plain("LeaderLeasePort"),
+            PortSpec::plain("ExpiringRecordPort"),
+        ],
         config_traits: &[],
     },
     Domain {

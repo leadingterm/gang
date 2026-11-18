@@ -7,9 +7,11 @@ use crate::plan::{Action, Actions, Change, Plan, ResourceChange};
 
 /// Resource types whose deletion or replacement blocks a merge: they hold state that cannot be
 /// recreated (keys, data, addresses, federation).
-pub const PROTECTED_TYPES: [&str; 5] = [
+pub const PROTECTED_TYPES: [&str; 7] = [
     "aws_kms_key",
     "aws_s3_bucket",
+    "aws_dynamodb_table",
+    "aws_db_instance",
     "aws_ebs_volume",
     "aws_eip",
     "aws_iam_outbound_web_identity_federation",
@@ -18,7 +20,7 @@ pub const PROTECTED_TYPES: [&str; 5] = [
 /// Address of the configuration parameter below a deployment module, after `module.<name>.`.
 const CONFIG_PARAMETER: &str = "aws_ssm_parameter.config";
 /// Address of the controller instance below a deployment module, after `module.<name>.`.
-const CONTROLLER_INSTANCE: &str = "module.controller.aws_instance.this";
+const CONTROLLER_INSTANCE: &str = "module.controller.aws_instance.this[0]";
 
 /// A planned deletion or replacement of a protected resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +168,36 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_dynamodb_table_is_blocked() {
+        let plan = plan(&[resource(
+            "aws_dynamodb_table",
+            "aws_dynamodb_table.state",
+            &["delete"],
+        )]);
+        assert!(plan.is_blocked());
+    }
+
+    #[test]
+    fn deleting_an_rds_instance_is_blocked() {
+        let plan = plan(&[resource(
+            "aws_db_instance",
+            "aws_db_instance.postgres",
+            &["delete"],
+        )]);
+        assert!(plan.is_blocked());
+    }
+
+    #[test]
+    fn replacing_an_rds_parameter_group_is_allowed() {
+        let plan = plan(&[resource(
+            "aws_db_parameter_group",
+            "aws_db_parameter_group.postgres",
+            &["delete", "create"],
+        )]);
+        assert!(!plan.is_blocked());
+    }
+
+    #[test]
     fn deleting_an_aws_instance_is_allowed() {
         let plan = plan(&[resource("aws_instance", "aws_instance.worker", &["delete"])]);
         assert!(!plan.is_blocked());
@@ -242,18 +274,30 @@ mod tests {
 
     #[test]
     fn parameter_value_update_with_controller_create_does_not_restart() {
-        let controller = resource(
-            "aws_instance",
-            "module.gang.module.controller.aws_instance.this",
-            &["create"],
-        );
-        assert!(
-            !plan(&[
+        for actions in [
+            &["create"][..],
+            &["delete", "create"],
+            &["create", "delete"],
+        ] {
+            for parameter in [
                 value_update("module.gang.aws_ssm_parameter.config"),
-                controller
-            ])
-            .restart_needed()
-        );
+                resource(
+                    "aws_ssm_parameter",
+                    "module.gang.aws_ssm_parameter.config",
+                    &["create"],
+                ),
+            ] {
+                let controller = resource(
+                    "aws_instance",
+                    "module.gang.module.controller.aws_instance.this[0]",
+                    actions,
+                );
+                assert!(
+                    !plan(&[parameter, controller]).restart_needed(),
+                    "{actions:?}"
+                );
+            }
+        }
         assert!(!fixture("controller-replaced").restart_needed());
     }
 
@@ -262,7 +306,7 @@ mod tests {
         let plan = plan(&[
             resource(
                 "aws_instance",
-                "module.gang.module.controller.aws_instance.this",
+                "module.gang.module.controller.aws_instance.this[0]",
                 &["no-op"],
             ),
             resource("aws_kms_key", "aws_kms_key.state", &["no-op"]),

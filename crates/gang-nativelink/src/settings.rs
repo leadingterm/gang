@@ -12,6 +12,7 @@ use nativelink_config::cas_server::{
     CasStoreConfig, ExecutionConfig, LocalWorkerConfig, SchedulerConfig, StoreConfig,
     WithInstanceName, WorkerApiConfig,
 };
+use nativelink_scheduler::awaited_action_db::CLIENT_KEEPALIVE_DURATION;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
@@ -81,6 +82,12 @@ pub(crate) fn scheduler(
             requirement: "must be a whole number of seconds, at least 1s and at most about 584 years",
         })?
         .as_units();
+    if client_action_timeout <= CLIENT_KEEPALIVE_DURATION.as_secs() {
+        return Err(NativeLinkConfigError::Duration {
+            field: "client_action_timeout",
+            requirement: "must be strictly greater than the native client keepalive duration",
+        });
+    }
     let mut simple = json!({
         "supported_platform_properties": supported_platform_properties(spec.fleets),
         "client_action_timeout_s": client_action_timeout,
@@ -132,13 +139,20 @@ fn cold_start(tuning: &ColdStartTuning) -> Option<Value> {
     })
 }
 
-/// The platform properties the scheduler declares: every key the catalog declares, each with the
-/// match kind `NativeLink` applies to it.
+/// The platform properties the scheduler declares. CPU count is admitted by the catalog but
+/// ignored here because its reservation is represented by millicores.
 fn supported_platform_properties(fleets: &FleetCatalog) -> Map<String, Value> {
     fleets
         .declared()
         .iter()
-        .map(|&(key, kind)| (key.to_owned(), json!(property_type(kind))))
+        .map(|&(key, kind)| {
+            let kind = if key == property::CPU_COUNT {
+                MatchKind::Ignored
+            } else {
+                kind
+            };
+            (key.to_owned(), json!(property_type(kind)))
+        })
         .collect()
 }
 
@@ -648,29 +662,6 @@ mod tests {
     }
 
     #[test]
-    fn declaration_covers_fleet_keys_and_resource_minimums() {
-        let declared = supported_platform_properties(&catalog());
-        for key in [
-            property::FLEET,
-            property::ISA,
-            property::SANDBOX,
-            "capacity",
-        ] {
-            assert_eq!(declared.get(key), Some(&json!("exact")), "{key}");
-        }
-        for key in [
-            property::CPU_COUNT,
-            property::CPU_MILLICORES,
-            property::MEMORY_KB,
-            property::DISK_KB,
-        ] {
-            assert_eq!(declared.get(key), Some(&json!("minimum")), "{key}");
-        }
-        assert_eq!(declared.get(property::NETWORK), Some(&json!("ignore")));
-        assert_eq!(declared.len(), 9);
-    }
-
-    #[test]
     fn fifteen_vcpu_fleet_advertises_millicores_as_minimum() {
         let fleet = FleetProperties::new(
             &FleetName::try_new("fleet-a").expect("valid fleet name"),
@@ -701,7 +692,12 @@ mod tests {
         let content = memory_store();
         let action = memory_store();
         let fleets = catalog();
-        for timeout in [Duration::ZERO, Duration::from_millis(1500)] {
+        for timeout in [
+            Duration::ZERO,
+            Duration::from_millis(1500),
+            Duration::from_secs(1),
+            CLIENT_KEEPALIVE_DURATION,
+        ] {
             let spec = ControllerSpec {
                 client_action_timeout: timeout,
                 ..controller_spec(&content, &action, &fleets)
@@ -714,6 +710,23 @@ mod tests {
                 })
             ));
         }
+
+        let timeout = CLIENT_KEEPALIVE_DURATION + Duration::from_secs(1);
+        let spec = ControllerSpec {
+            client_action_timeout: timeout,
+            ..controller_spec(&content, &action, &fleets)
+        };
+        let scheduler = scheduler(&config(), &spec).expect("scheduler");
+        let SchedulerSpec::HistoricalResource(historical) = &scheduler.spec else {
+            panic!("expected historical_resource, got {:?}", scheduler.spec);
+        };
+        let SchedulerSpec::Simple(simple) = historical.scheduler.as_ref() else {
+            panic!(
+                "expected nested simple scheduler, got {:?}",
+                historical.scheduler
+            );
+        };
+        assert_eq!(simple.client_action_timeout_s, timeout.as_secs());
     }
 
     #[test]

@@ -1,5 +1,5 @@
-//! Checks that `FleetCatalog::accepting` agrees with `NativeLink`'s own platform property matcher
-//! for every request over a pool of fleets and request properties.
+//! Checks that `FleetCatalog::accepting` agrees with `NativeLink`'s platform property matcher
+//! for normalized requests over a pool of fleets and request properties.
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -183,14 +183,21 @@ fn native_manager(
 }
 
 /// Converts `pairs` into the platform properties `NativeLink` matches requests and workers with.
+/// Requests are normalized before conversion; worker properties are left unchanged.
 fn native_properties<K: AsRef<str>, V: AsRef<str>>(
     manager: &PlatformPropertyManager,
     pairs: impl IntoIterator<Item = (K, V)>,
+    normalize_request: bool,
 ) -> Result<PlatformProperties, Box<dyn Error>> {
-    let map: HashMap<String, String> = pairs
+    let mut map: HashMap<String, String> = pairs
         .into_iter()
         .map(|(key, value)| (key.as_ref().to_owned(), value.as_ref().to_owned()))
         .collect();
+    if normalize_request
+        && let Some(millicores) = crate::placeable::normalized_cpu_reservation(&map)
+    {
+        map.insert(property::CPU_MILLICORES.to_owned(), millicores.to_string());
+    }
     Ok(manager
         .make_platform_properties(map)
         .map_err(|error| error.to_string())?)
@@ -210,7 +217,7 @@ fn worker_value(key: &str, property: &WorkerProperty) -> Result<(String, String)
 }
 
 #[test]
-fn catalog_accepts_exactly_the_fleets_native_matches() -> TestResult {
+fn catalog_accepts_exactly_the_fleets_native_matches_for_normalized_requests() -> TestResult {
     let fleets = fleets()?;
     let catalog = FleetCatalog::try_new(fleets.clone())?;
     let content = RenderedStoreSpec(json!({ "memory": {} }));
@@ -242,7 +249,7 @@ fn catalog_accepts_exactly_the_fleets_native_matches() -> TestResult {
             .iter()
             .map(|(key, property)| worker_value(key, property))
             .collect::<Result<Vec<_>, _>>()?;
-        workers.push(native_properties(&manager, pairs)?);
+        workers.push(native_properties(&manager, pairs, false)?);
     }
 
     let mut any_accepted = false;
@@ -254,7 +261,7 @@ fn catalog_accepts_exactly_the_fleets_native_matches() -> TestResult {
                 .map(|(_, value)| *value)
         };
         let accepting = catalog.accepting(lookup);
-        let native = native_properties(&manager, request.iter().copied())?;
+        let native = native_properties(&manager, request.iter().copied(), true)?;
         for (index, worker) in workers.iter().enumerate() {
             let expected = native.is_satisfied_by(worker, false);
             assert_eq!(

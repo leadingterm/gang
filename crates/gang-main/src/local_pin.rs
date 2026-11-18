@@ -51,6 +51,11 @@ pub(crate) fn with_plaintext(
     let endpoint = endpoint
         .map(|url| with_scheme(url, transport.public_scheme()))
         .transpose()?;
+    document.execution_endpoint = document
+        .execution_endpoint
+        .as_ref()
+        .map(|url| with_scheme(url, transport.public_scheme()))
+        .transpose()?;
     let rendered = document
         .insecure(endpoint.clone(), authentication)
         .to_toml()
@@ -70,12 +75,20 @@ pub(crate) fn require_insecure_loopback(
     worker_listen: SocketAddr,
     endpoint: Option<&Url>,
     scheduler: &SchedulerConfig,
+    execution_listen: Option<SocketAddr>,
+    execution_endpoint: Option<&Url>,
 ) -> Result<(), LocalCommandError> {
     if !listen.ip().is_loopback() {
         return Err(not_loopback("listen", &listen));
     }
     if !worker_listen.ip().is_loopback() {
         return Err(not_loopback("worker_listen", &worker_listen));
+    }
+    if let Some(address) = execution_listen.filter(|address| !address.ip().is_loopback()) {
+        return Err(not_loopback("execution_listen", &address));
+    }
+    if let Some(url) = execution_endpoint.filter(|url| !is_loopback_url(url)) {
+        return Err(not_loopback("execution_endpoint", url));
     }
     if let Some(url) = endpoint.filter(|url| !is_loopback_url(url)) {
         return Err(not_loopback("endpoint", url));
@@ -189,6 +202,22 @@ mod tests {
             validated(&output).server.ca_pin,
             Some(CaPinSetting::Pinned(pin()))
         );
+    }
+
+    #[test]
+    fn plaintext_rewrites_the_execution_endpoint() -> gang_testkit::TestResult {
+        let mut input = document(VALID_LOCAL_CONFIG);
+        input.execution_listen = Some("127.0.0.1:8443".parse()?);
+        input.execution_endpoint = Some("https://127.0.0.1:8443".parse()?);
+        let (output, _, _) = with_plaintext(input, None, None)?;
+        assert_eq!(
+            validated(&output)
+                .execution_endpoint
+                .as_ref()
+                .map(Url::scheme),
+            Some("http")
+        );
+        Ok(())
     }
 
     #[test]
@@ -330,6 +359,8 @@ mod tests {
             worker_listen,
             Some(&endpoint),
             &scheduler(Some(&worker)),
+            Some(loopback(8443)),
+            Some(&endpoint),
         );
 
         assert!(result.is_ok());
@@ -337,7 +368,8 @@ mod tests {
 
     #[test]
     fn insecure_accepts_omitted_endpoints_for_port_zero_listeners() {
-        let result = require_insecure_loopback(loopback(0), loopback(0), None, &scheduler(None));
+        let result =
+            require_insecure_loopback(loopback(0), loopback(0), None, &scheduler(None), None, None);
 
         assert!(result.is_ok());
     }
@@ -346,7 +378,8 @@ mod tests {
     fn insecure_refuses_a_public_listen_address() {
         let listen: SocketAddr = "0.0.0.0:9443".parse().expect("address");
 
-        let result = require_insecure_loopback(listen, loopback(9090), None, &scheduler(None));
+        let result =
+            require_insecure_loopback(listen, loopback(9090), None, &scheduler(None), None, None);
 
         assert_eq!(
             refusal(result),
@@ -358,8 +391,14 @@ mod tests {
     fn insecure_refuses_a_public_worker_listen_address() {
         let worker_listen: SocketAddr = "10.0.0.5:9090".parse().expect("address");
 
-        let result =
-            require_insecure_loopback(loopback(9443), worker_listen, None, &scheduler(None));
+        let result = require_insecure_loopback(
+            loopback(9443),
+            worker_listen,
+            None,
+            &scheduler(None),
+            None,
+            None,
+        );
 
         assert_eq!(
             refusal(result),
@@ -376,6 +415,8 @@ mod tests {
             loopback(9090),
             Some(&endpoint),
             &scheduler(None),
+            None,
+            None,
         );
 
         assert_eq!(
@@ -396,6 +437,8 @@ mod tests {
             loopback(9090),
             None,
             &scheduler(Some(&worker)),
+            None,
+            None,
         );
 
         assert_eq!(
@@ -416,6 +459,8 @@ mod tests {
             loopback(9090),
             Some(&endpoint),
             &scheduler(None),
+            None,
+            None,
         );
 
         assert_eq!(refusal(result).0, "endpoint");

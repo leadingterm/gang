@@ -70,6 +70,8 @@ pub enum Expected {
     ReleaseTag,
     /// An EC2 AMI identifier.
     ImageId,
+    /// An EC2 snapshot identifier.
+    SnapshotId,
     /// A lowercase EC2 region name.
     Region,
     /// A non-negative whole-number quota fitting in u32.
@@ -89,6 +91,7 @@ impl fmt::Display for Expected {
             Self::Architecture => "a supported image architecture",
             Self::ReleaseTag => "a release tag beginning with v without whitespace",
             Self::ImageId => "an ami- identifier with lowercase hex digits",
+            Self::SnapshotId => "a snap- identifier with lowercase hex digits",
             Self::Region => "a lowercase region name",
             Self::Quota => "a non-negative whole-number quota fitting in u32",
         })

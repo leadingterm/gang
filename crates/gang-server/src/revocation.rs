@@ -73,14 +73,17 @@ impl<K: Stack> Revocations<K> {
         identity: &Identity,
     ) -> Result<RevokePrincipalResponse, PortError> {
         let Core { host, workers, .. } = &*self.core;
-        let principal = host
-            .repository
-            .revoke_principal(identity, host.now())
-            .await?;
-        host.revoked_principals.revoke(identity.clone());
+        let principal = {
+            let _guard = self.core.revocation_lock.lock().await;
+            let principal = host
+                .repository
+                .revoke_principal(identity, host.now())
+                .await?;
+            host.revoked_principals.revoke(identity.clone());
+            principal
+        };
 
-        let revoked = revoke_held(&**workers, host, identity).await?;
-        self.cut_off(&revoked);
+        let revoked = revoke_held(&**workers, host, identity, &self.revoked_certificates).await?;
         Ok(RevokePrincipalResponse {
             principal: wire_principal(principal),
             certificates: revoked
@@ -101,6 +104,7 @@ impl<K: Stack> Revocations<K> {
         identity: &Identity,
     ) -> Result<Principal, PortError> {
         let host = &self.core.host;
+        let _guard = self.core.revocation_lock.lock().await;
         let principal = host.repository.restore_principal(identity).await?;
         host.revoked_principals.restore(identity);
         Ok(wire_principal(principal))
@@ -120,6 +124,7 @@ async fn revoke_held<P, H>(
     plugin: &P,
     host: &H,
     identity: &Identity,
+    certificates: &RevocationSet,
 ) -> Result<Vec<IssuedCertRecord>, PortError>
 where
     P: AuthenticationPort + CredentialLifecyclePort,
@@ -128,12 +133,16 @@ where
     if !plugin.capabilities().certificates {
         return Ok(Vec::new());
     }
-    match plugin
-        .revoke_certificates(host, &CertificateTarget::Identity(identity))
-        .await
-    {
-        Ok(revoked) => Ok(revoked),
-        Err(PortError::NotFound(_)) => Ok(Vec::new()),
-        Err(error) => Err(error),
+    let records = host.repository().certificates_of(identity).await?;
+    let mut revoked = Vec::with_capacity(records.len());
+    for record in records {
+        let batch = plugin
+            .revoke_certificates(host, &CertificateTarget::Serial(&record.serial))
+            .await?;
+        for certificate in &batch {
+            certificates.revoke(certificate.serial.clone());
+        }
+        revoked.extend(batch);
     }
+    Ok(revoked)
 }

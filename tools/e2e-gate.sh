@@ -9,10 +9,10 @@
 # Usage: tools/e2e-gate.sh <bundle dir> <gang> <harness arguments>...
 #   <bundle dir> holds the files of //crates/gang-e2e:bundle; the user manager must delegate cgroup controllers.
 set -euo pipefail
-# The budget is twice the slowest measured cold CI service runtime: Gate 2 additions took 4 min 0 s at this release;
-# Gate 1 took 3 min 21 s and Gate 2 additions 3 min 23 s at the previous release. This keeps a loaded shared host
-# from tripping the budget while staying below the CI job's 15-minute backstop. Systemd enforces it as
-# TimeoutStartSec because a oneshot service's run is its start, and TimeoutStopSec bounds the stop to 10 seconds.
+# Gate 2 additions took 4 min 34 s unsplit on CI; on a four-CPU host, shard 1 took
+# 3 min 8.734 s and shard 2 took 5 min 13.144 s with failures. Each shard is one run under the
+# 480 s budget. Systemd enforces it as TimeoutStartSec because a oneshot service's run is its
+# start, and TimeoutStopSec bounds the stop to 10 seconds.
 budget=480
 bundle=$(realpath "$1")
 gang=$(realpath "$2")
@@ -30,7 +30,7 @@ start=$SECONDS
 systemd-run --user --unit="$unit" --collect --pipe --wait --same-dir --slice=gang.slice -p Type=oneshot -p Delegate=yes -p TimeoutStartSec="$budget" -p TimeoutStopSec=10 \
   --setenv=PATH="$PATH" --setenv=GANG_E2E_GLIBC_TOOL="$bundle/loaded_probe" -- \
   nix develop -c env -u XDG_CONFIG_HOME -u XDG_CACHE_HOME HOME="$home" \
-  "$bundle/local" --gang "$gang" --bazel "$bundle/bazel" \
+  "$bundle/local" --gang "$gang" --bazel "$bundle/bazel" --postgres "$bundle/postgresql.tar.gz" \
   --config configs/gang.local.toml --sample e2e/sample --configs configs "$@" | tee "$report" || status=$?
 if (( status != 0 )); then
   if (( SECONDS - start >= budget )); then

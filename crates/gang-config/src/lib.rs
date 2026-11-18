@@ -133,5 +133,7 @@ pub use scheduled_minimum::{
     ClockTime, ClockTimeError, IanaTimeZone, ScheduledMinimum, UnknownTimeZone, Weekday, Weekdays,
     WeekdaysError, WindowError,
 };
-pub use server_config::{EndpointTrust, ServerConfig, ServerTransport, Transport};
+pub use server_config::{
+    EndpointTrust, LeadershipConfig, ServerConfig, ServerTransport, Transport,
+};
 pub use worker_config::WorkerConfig;

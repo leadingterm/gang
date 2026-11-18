@@ -24,40 +24,41 @@ pub struct EnrollError {
     /// The failure reported by the enrollment path.
     #[source]
     source: BoxedError,
-    /// Set when the authority refused the enrollment because this client is rate limited.
-    rate_limit: Option<RateLimit>,
+    /// Set when the authority refused the enrollment for now: it is rate limiting this client
+    /// or is temporarily unavailable.
+    retry: Option<Retry>,
 }
 
 impl EnrollError {
-    /// Creates an enrollment failure that is not a rate-limit refusal.
+    /// Creates an enrollment failure that is not worth retrying.
     pub fn new(source: impl Into<BoxedError>) -> Self {
         Self {
             source: source.into(),
-            rate_limit: None,
+            retry: None,
         }
     }
 
-    /// Creates an enrollment failure caused by a rate-limit refusal, which may carry the delay the
-    /// authority asked the client to wait before retrying.
-    pub fn rate_limited(source: impl Into<BoxedError>, retry_after: Option<Duration>) -> Self {
+    /// Creates an enrollment failure the authority refused for now, which may carry the delay
+    /// the authority asked the client to wait before retrying.
+    pub fn retry_later(source: impl Into<BoxedError>, after: Option<Duration>) -> Self {
         Self {
             source: source.into(),
-            rate_limit: Some(RateLimit { retry_after }),
+            retry: Some(Retry { after }),
         }
     }
 
-    /// The rate-limit details of this failure, or `None` when the refusal was not a rate limit.
+    /// How the authority asked to be retried, or `None` when the failure is not worth retrying.
     #[must_use]
-    pub fn rate_limit(&self) -> Option<RateLimit> {
-        self.rate_limit
+    pub fn retry(&self) -> Option<Retry> {
+        self.retry
     }
 }
 
-/// A rate-limit refusal of the certificate authority.
+/// A refusal of the certificate authority that a later enrollment may overcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RateLimit {
+pub struct Retry {
     /// How long the authority asked the client to wait before retrying, when it said so.
-    pub retry_after: Option<Duration>,
+    pub after: Option<Duration>,
 }
 
 /// Exchanges a workload proof for certificate credentials.

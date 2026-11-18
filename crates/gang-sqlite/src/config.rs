@@ -55,7 +55,8 @@ impl JournalMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SqliteConfig {
-    /// The database file. Created on first use when missing.
+    /// The database file, relative to the configuration file if not absolute.
+    /// Created on first use when missing.
     pub path: PathBuf,
     /// How long a statement waits for a competing writer before failing. Defaults to
     /// five seconds when omitted.

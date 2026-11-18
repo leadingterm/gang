@@ -17,8 +17,8 @@ use http::Method;
 use crate::Ran;
 use crate::access_verdict::{
     CookieValue, ExpectedCookie, MaxAge, Verdict, authorization_request, cookie_set,
-    failure_reported, has_line, login_cookie_name, query_value, redirected_to, set_cookies,
-    status_is,
+    failure_reported, has_line, login_cookie_name, logout_redirected, query_value, redirected_to,
+    set_cookies, status_is,
 };
 use crate::browser_verdict::{authorized, offline_requested};
 use crate::check::Check;
@@ -55,6 +55,19 @@ pub enum SignIn {
     /// `gang login` and the dashboard sign browsers in through the test provider, as
     /// [`SIGN_IN_SUBJECT`].
     Offered,
+    /// Interactive sign-in for a scenario with an isolated issuer subject.
+    Subject(&'static str),
+}
+
+impl SignIn {
+    pub(crate) fn subject(self, sessions: Sessions) -> Option<&'static str> {
+        match self {
+            Self::Absent => None,
+            Self::Offered if sessions == Sessions::Short => Some(crate::BROWSER_SUBJECT),
+            Self::Offered => Some(SIGN_IN_SUBJECT),
+            Self::Subject(subject) => Some(subject),
+        }
+    }
 }
 
 /// Whether the first fleet keeps a worker running with no build: `min_instances = 1`.
@@ -1293,7 +1306,7 @@ fn logout<A: Access>(
             .presenting(Presented::Cookie(session))
             .header("origin", origin),
     )?;
-    let logout_verdict = status_is(&logout, 204).and_then(|()| {
+    let logout_verdict = logout_redirected(&logout).and_then(|()| {
         cookie_set(
             &logout,
             &ExpectedCookie {

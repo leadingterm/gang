@@ -17,7 +17,7 @@ use gang_spi::ApiRequestBody;
 use gang_state::sse;
 use gang_testkit::Controller;
 use gang_types::{AccessToken, Permission, PermissionSet};
-use gang_wire::routes::{ROUTES, Route};
+use gang_wire::routes::{ROUTES, Route, RouteId};
 use gang_wire::{
     AuthenticateRequest, AuthenticateResponse, Certificate, CreateCertificateRequest,
     DeviceAuthorization, ErrorReason, ErrorResponse, Known, ListEventsResponse,
@@ -249,6 +249,8 @@ fn round_trip(name: &str, value: &Value) -> Result<Value, String> {
         "ListRolesResponse" => through::<ListRolesResponse>(value),
         "ListEventsResponse" => through::<ListEventsResponse>(value),
         "ListBuildsResponse" => through::<gang_wire::ListBuildsResponse>(value),
+        "IngestBuildsRequest" => through::<gang_wire::IngestBuildsRequest>(value),
+        "IngestBuildsResponse" => through::<gang_wire::IngestBuildsResponse>(value),
         "Build" => through::<gang_wire::Build>(value),
         "State" => through::<State>(value),
         "Session" => through::<Session>(value),
@@ -560,7 +562,16 @@ fn check_streams(document: &Document<'_>) -> Vec<String> {
             }
         };
         let mut encoded = Vec::new();
+        let mut unknown_frame = false;
         for frame in &frames {
+            if !frame.is_known() {
+                failures.push(format!(
+                    "{}: a frame contains an unknown enum value",
+                    block.at()
+                ));
+                unknown_frame = true;
+                continue;
+            }
             match sse::encode(frame) {
                 Ok(bytes) => encoded.extend_from_slice(&bytes),
                 Err(error) => {
@@ -568,7 +579,7 @@ fn check_streams(document: &Document<'_>) -> Vec<String> {
                 }
             }
         }
-        if encoded != text.as_bytes() {
+        if !unknown_frame && encoded != text.as_bytes() {
             failures.push(format!(
                 "{}: the transcript is not what the server writes; it writes\n{}",
                 block.at(),
@@ -695,6 +706,14 @@ fn a_request_with_an_unknown_field_fails_the_round_trip() {
 }
 
 #[test]
+fn a_transcript_with_an_unknown_value_fails() {
+    let document =
+        Document::parse("```sse\nevent: closed\ndata: {\"reason\":\"MAINTENANCE\"}\n```\n")
+            .expect("document parses");
+    assert_eq!(check_streams(&document).len(), 1);
+}
+
+#[test]
 fn keys_outside_lower_camel_case_are_found_except_in_data_maps() {
     let value = json!({
         "createTime": 1,
@@ -798,6 +817,14 @@ async fn check_route(controller: &Controller, admin: &AccessToken, route: &Route
     let name = format!("{} {}", route.method.as_str(), route.template);
     let mut failures = Vec::new();
     let served = answer(controller, request_for(route.method.as_str(), route, admin)).await;
+    if route.id == RouteId::IngestBuilds {
+        if !served.is_route_not_found() {
+            failures.push(format!(
+                "{name} is not answered 404 ROUTE_NOT_FOUND to the administrator on the public API"
+            ));
+        }
+        return failures;
+    }
     if served.is_route_not_found() {
         failures.push(format!(
             "{name} is answered 404 ROUTE_NOT_FOUND to the administrator"

@@ -3,7 +3,6 @@
 
 use std::collections::BTreeSet;
 use std::convert::Infallible;
-use std::num::NonZeroUsize;
 
 use crate::gate::Caller;
 use crate::{Deployment, Parts, Server, ServerSettings};
@@ -173,13 +172,11 @@ pub fn device_login_settings() -> crate::LoginSettings {
             secret: ClientSecret::new("dashboard-secret-value"),
         },
         ttl: NonZeroDuration::from_mins(10),
-        max_pending: NonZeroUsize::new(8).expect("eight is non-zero"),
         session_max_age: SessionMaxAge::from_units(43_200),
         renewal_reuse: NonZeroDuration::from_mins(1),
         device: Some(crate::settings::DeviceSettings {
             ttl: DeviceCodeTtl::from_units(600),
             poll_interval: DevicePollInterval::from_units(5),
-            max_pending: NonZeroUsize::new(1024).expect("1024 is non-zero"),
         }),
     }
 }

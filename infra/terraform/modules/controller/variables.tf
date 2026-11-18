@@ -5,6 +5,88 @@ variable "name" {
   nullable    = false
 }
 
+variable "shape" {
+  description = "Controller resource shape: instance for SQLite or group for shared state."
+  type        = string
+  default     = "instance"
+  nullable    = false
+
+  validation {
+    condition     = contains(["instance", "group"], var.shape)
+    error_message = "shape must be instance or group."
+  }
+}
+
+variable "controller_count" {
+  description = "Desired number of controllers in the group."
+  type        = number
+  default     = 1
+  nullable    = false
+
+  validation {
+    condition     = var.controller_count >= 1 && floor(var.controller_count) == var.controller_count
+    error_message = "controller_count must be a positive integer."
+  }
+}
+
+variable "subnet_ids" {
+  description = "Private subnet IDs for the controller group; required for the group shape."
+  type        = list(string)
+  default     = []
+  nullable    = false
+
+  validation {
+    condition     = var.shape != "group" || (length(var.subnet_ids) > 0 && alltrue([for id in var.subnet_ids : length(trimspace(id)) > 0]))
+    error_message = "subnet_ids must contain nonempty subnet IDs for the group shape."
+  }
+}
+
+variable "target_group_arns" {
+  description = "Load balancer target group ARNs attached to the controller group."
+  type        = list(string)
+  default     = []
+  nullable    = false
+
+  validation {
+    condition     = var.shape != "group" || (length(var.target_group_arns) > 0 && alltrue([for arn in var.target_group_arns : length(trimspace(arn)) > 0]))
+    error_message = "target_group_arns must contain nonempty target group ARNs for the group shape."
+  }
+}
+
+variable "shutdown_grace_seconds" {
+  description = "Controller shutdown grace in seconds; lifecycle hook timeouts include a 120-second margin."
+  type        = number
+  default     = 300
+  nullable    = false
+
+  validation {
+    condition     = var.shutdown_grace_seconds >= 1 && var.shutdown_grace_seconds <= 3480 && floor(var.shutdown_grace_seconds) == var.shutdown_grace_seconds
+    error_message = "shutdown_grace_seconds must be an integer between 1 and 3480."
+  }
+}
+
+variable "config_digest" {
+  description = "SHA-256 digest of rendered gang.toml, required for group instance refresh on configuration changes."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.shape != "group" || can(regex("^[0-9a-f]{64}$", var.config_digest))
+    error_message = "config_digest must be a lowercase SHA-256 hex digest for the group shape."
+  }
+}
+
+variable "dynamodb_table_arn" {
+  description = "DynamoDB table ARN to grant item access; null omits the grant."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.dynamodb_table_arn == null || can(regex("^arn:aws[a-z-]*:dynamodb:[a-z0-9-]+:[0-9]{12}:table/[^/]+$", var.dynamodb_table_arn))
+    error_message = "dynamodb_table_arn must be null or a DynamoDB table ARN."
+  }
+}
+
 variable "iam_name_prefix" {
   description = "Prefix of the name of every IAM role and instance profile, including any separator (for example `example-`). Empty keeps the module's own names. Use it where IAM names must sit under a prefix."
   type        = string
@@ -31,15 +113,25 @@ variable "instance_type" {
 }
 
 variable "subnet_id" {
-  description = "Public subnet the controller runs in. The state volume is created in its availability zone."
+  description = "Public subnet for the instance shape; the state volume is created in its availability zone."
   type        = string
-  nullable    = false
+  default     = null
+
+  validation {
+    condition     = var.shape != "instance" || try(length(trimspace(var.subnet_id)) > 0, false)
+    error_message = "subnet_id is required for the instance shape."
+  }
 }
 
 variable "private_ip" {
-  description = "Fixed private IPv4 address of the controller inside subnet_id. Workers reach the controller worker listener at this address."
+  description = "Fixed private IPv4 address for the instance shape."
   type        = string
-  nullable    = false
+  default     = null
+
+  validation {
+    condition     = var.shape != "instance" || try(length(trimspace(var.private_ip)) > 0, false)
+    error_message = "private_ip is required for the instance shape."
+  }
 }
 
 variable "security_group_id" {
@@ -49,9 +141,14 @@ variable "security_group_id" {
 }
 
 variable "eip_allocation_id" {
-  description = "Allocation ID of the Elastic IP associated with the controller instance."
+  description = "Elastic IP allocation ID for the instance shape."
   type        = string
-  nullable    = false
+  default     = null
+
+  validation {
+    condition     = var.shape != "instance" || try(length(trimspace(var.eip_allocation_id)) > 0, false)
+    error_message = "eip_allocation_id is required for the instance shape."
+  }
 }
 
 variable "root_volume_gib" {

@@ -9,6 +9,8 @@
     /bin/sh -c 'exit 0'
     /bin/bash -c 'exit 0'
     printf 'RAN\n' | tr A-Z a-z
+    # Exercise the shipped gawk action tool in both PATH modes.
+    printf '40 2\n' | gawk '{ print $1 + $2 }'
   '';
   binds = pkgs.lib.concatMapStringsSep " " (path: "--ro-bind ${path} ${path}") shipped.readonly_bind_paths;
   mounts = mounted: pkgs.lib.concatStringsSep " " (pkgs.lib.mapAttrsToList (destination: source: "--ro-bind ${source} ${destination}") mounted);
@@ -20,16 +22,24 @@ in
   pkgs.testers.runNixOSTest {
     name = "action-tools";
 
+    nodeDefaults.virtualisation = {
+      memorySize = 1024;
+      cores = 1;
+      useNixStoreImage = true;
+      mountHostNixStore = false;
+      sharedDirectories = pkgs.lib.mkForce {};
+    };
+
     nodes.machine = {imports = [../glibc-loader.nix ../action-tools.nix];};
 
     testScript = ''
       machine.wait_for_unit("multi-user.target")
 
       with subtest("a /usr/bin/env bash script runs with Bazel's strict action PATH under the shipped binds"):
-          assert machine.succeed("${sandbox (shipped.readonly_bind_mounts or {}) strictPath}").strip() == "ran"
+          assert machine.succeed("${sandbox (shipped.readonly_bind_mounts or {}) strictPath}").strip() == "ran\n42"
 
       with subtest("it runs with no PATH at all, through the default search path"):
-          assert machine.succeed("${sandbox (shipped.readonly_bind_mounts or {}) ""}").strip() == "ran"
+          assert machine.succeed("${sandbox (shipped.readonly_bind_mounts or {}) ""}").strip() == "ran\n42"
 
       with subtest("without the mounts it cannot start"):
           machine.fail("${sandbox {} strictPath}")

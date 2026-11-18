@@ -4,3 +4,9 @@ opentofu_contract_test(
     name = "controller_contract",
     deps = ["//infra/terraform/modules/instance-role:sources"],
 )
+
+opentofu_contract_test(
+    name = "controller_group_contract",
+    test_file = "tests/controller_group.tftest.hcl",
+    deps = ["//infra/terraform/modules/instance-role:sources"],
+)

@@ -8,6 +8,12 @@ use serde_json::Value;
 /// Name of the CA certificate file that `gang bazelrc` writes next to the rc file.
 pub const CA_FILE_NAME: &str = "gang-ca.pem";
 
+/// A controller hand-off or crash take-over can interrupt connections for the lease TTL (10 s),
+/// clock skew (2 s), renew interval (3 s), and NLB health window (about 10 s): 25–30 s.
+/// Bazel's 12 retries, doubling from 100 ms up to 5 s, span about
+/// 0.1 + 0.2 + 0.4 + 0.8 + 1.6 + 3.2 + 5 × 6 = 36 s, longer than that gap.
+pub const REMOTE_RETRIES: u32 = 12;
+
 /// The command responsible for writing a Bazel rc file.
 #[derive(Debug, Clone, Copy)]
 pub enum BazelrcWriter {
@@ -49,6 +55,20 @@ pub fn render(
     lines.push(format!(
         "build --remote_cache={}",
         quote(display_url(&info.remote_cache))
+    ));
+    lines.push(format!("build --remote_retries={REMOTE_RETRIES}"));
+    lines.push(format!(
+        "build --remote_retry_max_delay={}s",
+        gang_types::health::CLIENT_RETRY_MAX_DELAY.as_secs()
+    ));
+    // Bazel's Execute stream has no deadline, so keepalive drops a frozen controller (ADR-51).
+    lines.push(format!(
+        "build --grpc_keepalive_time={}s",
+        gang_types::health::CLIENT_KEEPALIVE_TIME.as_secs()
+    ));
+    lines.push(format!(
+        "build --grpc_keepalive_timeout={}s",
+        gang_types::health::CLIENT_KEEPALIVE_TIMEOUT.as_secs()
     ));
     if matches!(info.authentication, Authentication::Token(_)) {
         lines.push(format!(
@@ -177,6 +197,40 @@ mod tests {
                 rendered.lines().any(|actual| actual == line),
                 "missing {line}"
             );
+        }
+    }
+
+    #[test]
+    fn both_writers_render_the_remote_retry_budget_after_the_cache() {
+        for writer in [BazelrcWriter::Bazelrc, BazelrcWriter::Setup] {
+            let rendered = render(&info(token(), None), "host", "gang", CA_FILE_NAME, writer);
+            assert!(rendered.contains(
+                "build --remote_cache=grpcs://cache.example.test:443\n\
+                 build --remote_retries=12\n\
+                 build --remote_retry_max_delay=5s\n"
+            ));
+        }
+    }
+
+    #[test]
+    fn both_writers_render_keepalive_from_health_constants() {
+        for writer in [BazelrcWriter::Bazelrc, BazelrcWriter::Setup] {
+            let rendered = render(&info(token(), None), "host", "gang", CA_FILE_NAME, writer);
+            for line in [
+                format!(
+                    "build --grpc_keepalive_time={}s",
+                    gang_types::health::CLIENT_KEEPALIVE_TIME.as_secs()
+                ),
+                format!(
+                    "build --grpc_keepalive_timeout={}s",
+                    gang_types::health::CLIENT_KEEPALIVE_TIMEOUT.as_secs()
+                ),
+            ] {
+                assert!(
+                    rendered.lines().any(|actual| actual == line),
+                    "missing {line}"
+                );
+            }
         }
     }
 

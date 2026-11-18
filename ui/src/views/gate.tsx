@@ -1,7 +1,7 @@
 // Screens outside the app frame: sign-in, a failed sign-in, and the in-app refusals.
 import type { ComponentChildren } from "preact";
 import { loginUrl } from "../client.ts";
-import { Brand, Empty, useClient, useTitle } from "../ui.tsx";
+import { Brand, Empty, Ident, Until, useClient, useTitle } from "../ui.tsx";
 import { identityOf } from "../wire-parse.ts";
 
 const CANOPY_CELLS = 24 * 16;
@@ -40,6 +40,36 @@ export const Gate = ({ title, density, children }: { title: string; density: num
   );
 };
 
+/** Bootstrap feedback when no session is available yet. */
+export const SessionGate = () => {
+  const link = useClient().link.value;
+  if (link.kind === "revoked") {
+    return (
+      <Gate title="Access revoked" density={0.08}>
+        <h1>Access revoked</h1>
+        <p role="alert">Your credential is no longer accepted.</p>
+        <div class="gate__actions">
+          <a class="btn btn--primary btn--lg" href={loginUrl("/ui/")}>Sign in again</a>
+        </div>
+      </Gate>
+    );
+  }
+  if (link.kind === "lost") {
+    return (
+      <Gate title="Connection unavailable" density={0.08}>
+        <h1>Connection unavailable</h1>
+        <p role="status">The server is unavailable. Retry in <Until t={link.retryAt} />.</p>
+      </Gate>
+    );
+  }
+  return (
+    <Gate title="Connecting" density={0.08}>
+      <h1>Connecting</h1>
+      <p role="status">Loading session.</p>
+    </Gate>
+  );
+};
+
 /** No identity: sign in when the server offers a login, otherwise say why nothing shows. */
 export const SignIn = () => {
   const login = useClient().session.value?.login;
@@ -55,10 +85,9 @@ export const SignIn = () => {
   return (
     <Gate title="Sign in" density={0.55}>
       <h1>Sign in</h1>
+      <p class="line"><span class="quiet">with</span>{" "}<Ident text={login.provider} /></p>
       <div class="gate__actions">
-        <a class="btn btn--primary btn--lg" href={loginUrl(`${location.pathname}${location.search}`)}>
-          <span class="btn__label">Continue with {login.provider.charAt(0).toUpperCase() + login.provider.slice(1)}</span>
-        </a>
+        <a class="btn btn--primary btn--lg" href={loginUrl(`${location.pathname}${location.search}`)}>Continue</a>
       </div>
     </Gate>
   );
@@ -96,9 +125,8 @@ export const Forbidden = ({ permission = "state.read" }: { permission?: string }
     <Empty>
       <div>
         <h2>No access</h2>
-        <p class="mono">
-          <span class="warning">{permission}</span> missing{principal && ` for ${identityOf(principal)}`}
-        </p>
+        <p><span class="warning">{permission}</span> missing</p>
+        {principal && <p class="line"><span class="quiet">for</span>{" "}<Ident text={identityOf(principal)} /></p>}
       </div>
     </Empty>
   );

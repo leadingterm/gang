@@ -52,6 +52,21 @@ impl Bazel {
             output_user_root,
         }
     }
+
+    pub(crate) fn with_output_user_root(&self, root: PathBuf) -> Self {
+        let mut driver = self.clone();
+        driver.output_user_root = root;
+        driver
+    }
+
+    /// The same driver with one more Bazel build flag.
+    #[must_use]
+    pub(crate) fn with_flag(&self, flag: impl Into<String>) -> Self {
+        let mut driver = self.clone();
+        driver.settings.bazel_flags.push(flag.into());
+        driver
+    }
+
     /// The pinned Bazel executable used by this driver.
     #[must_use]
     pub fn program(&self) -> &Path {

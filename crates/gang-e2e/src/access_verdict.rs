@@ -245,6 +245,23 @@ pub fn redirected_to(answer: &Answer, location: &str) -> Verdict {
     }
 }
 
+/// Checks that logout redirects to the UI home.
+///
+/// # Errors
+///
+/// Returns the status and location when the redirect does not match.
+pub fn logout_redirected(answer: &Answer) -> Verdict {
+    if answer.status == 303 && answer.header("location") == Some("/ui/") {
+        Ok(())
+    } else {
+        Err(format!(
+            "answered {} with location {:?}; expected 303 and \"/ui/\"",
+            answer.status,
+            answer.header("location")
+        ))
+    }
+}
+
 /// Checks the response status.
 ///
 /// # Errors

@@ -25,7 +25,7 @@ use crate::wrap::columns;
 /// Runs `gang doctor` and returns success only when the report is healthy.
 pub(crate) fn run(args: DoctorArgs, out: &Output) -> Result<ExitCode> {
     let home = ClientHome::resolve(|key| std::env::var_os(key))?;
-    let stored = stored_login(&home)?;
+    let stored = runtime::block_on(stored_login(&home))?;
     let (server, ca_pin) = resolve_target(args.server, args.ca_pin, stored)?;
     let options = home.options()?;
     let clock = Arc::new(SystemClock::new());

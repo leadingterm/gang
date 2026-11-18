@@ -3,16 +3,15 @@
 //! own scope while `gang exec` stays in the worker's leaf; and an out-of-memory kill is cleaned up.
 
 use std::collections::BTreeSet;
-use std::thread::ScopedJoinHandle;
 
-use crate::build_output::BuildOutcome;
 use crate::check::Check;
-use crate::errors::{E2eError, Result};
+use crate::errors::Result;
 use crate::execution::{Execution, Role, WORKER_LEAF};
 use crate::hold::Signalled;
+use crate::limits::{end_held_build, join_build};
 use crate::names::sandbox_contract;
 use crate::oom::oom;
-use crate::system::{Limits, Probe, System};
+use crate::system::{Limits, Probe, ScopeFacts, System};
 
 /// Proves the bwrap sandbox contract, held-action cgroup placement, OOM cleanup, and continued service.
 ///
@@ -123,6 +122,14 @@ fn environment<S: System, E: Execution>(
     Ok(checks)
 }
 
+/// How the hold of the sandbox contract ended before its build is joined.
+enum Held {
+    /// The action was released and its build completes.
+    Released,
+    /// No scope was observed; the server was killed to end the build when `restart` holds.
+    Unscoped { restart: bool },
+}
+
 fn held_in_scope<S: Limits, E: Execution>(
     system: &S,
     exec: &E,
@@ -134,96 +141,110 @@ fn held_in_scope<S: Limits, E: Execution>(
             system.abandon_hold()?;
             outcome
         });
-        let signalled = match system.await_hold() {
-            Ok(signalled) => signalled,
+        let observation = match observe_hold(system, exec, checks) {
+            Ok(observation) => observation,
             Err(error) => {
-                // The held build must end before its thread is joined.
-                let _ = system.kill_server();
-                let _ = system.abandon_hold();
-                let _ = join_build(hold);
+                end_held_build(system, hold);
                 return Err(error);
             }
         };
-        let facts = match signalled {
-            Signalled::Started => system.running_scope()?,
-            Signalled::Abandoned => None,
-        };
-        let Some(facts) = facts else {
-            checks.push(Check::failed(
-                sandbox_contract::HOLD_HAS_SCOPE,
-                match signalled {
-                    Signalled::Started => "no scope was observed for the hold action",
-                    Signalled::Abandoned => "the hold build ended before its orphan signalled",
-                },
-            ));
-            // A held build that runs without a scope ends only with the server, which is then
-            // started again so that the out-of-memory checks still run.
-            if signalled == Signalled::Started {
-                system.kill_server()?;
-                let _ = join_build(hold);
-                system.start_server()?;
-            } else {
-                let _ = join_build(hold);
+        match observation {
+            Held::Released => {
+                let outcome = join_build(hold)?;
+                checks.push(Check::expect(
+                    sandbox_contract::HOLD_COMPLETES,
+                    outcome.succeeded(),
+                    || {
+                        format!(
+                            "the held action ended with exit code {:?}",
+                            outcome.exit_code
+                        )
+                    },
+                ));
+                Ok(())
             }
-            return Ok(());
-        };
-        checks.push(Check::passed(sandbox_contract::HOLD_HAS_SCOPE));
-        let members = exec.cgroup_members(&facts.directory)?;
-        let procs = exec.processes()?;
-        let bwrap = procs
-            .iter()
-            .any(|proc| proc.role == Role::Bwrap && members.contains(&proc.pid));
-        checks.push(Check::expect(
-            sandbox_contract::BWRAP_IN_SCOPE,
-            bwrap,
-            || {
-                format!(
-                    "the scope {} holds {members:?}, no bwrap of the deployment",
-                    facts.directory.display()
-                )
-            },
-        ));
-        let execs: Vec<_> = procs
-            .iter()
-            .filter(|proc| proc.role == Role::GangExec)
-            .collect();
-        let cgroups: Vec<_> = execs.iter().map(|proc| proc.cgroup.as_ref()).collect();
-        let exec_outside = !execs.is_empty()
-            && execs.iter().all(|proc| {
-                !members.contains(&proc.pid)
-                    && proc.cgroup.as_ref().is_some_and(|c| {
-                        c.file_name().is_some_and(|name| name == WORKER_LEAF)
-                            && c != &facts.directory
-                    })
-            });
-        let exec_reason = if execs.is_empty() {
-            "no gang exec runs".to_owned()
-        } else {
-            format!("gang exec runs in {cgroups:?}, not in its worker leaf")
-        };
-        checks.push(Check::expect(
-            sandbox_contract::EXEC_OUTSIDE_SCOPE,
-            exec_outside,
-            || exec_reason,
-        ));
-        system.release(&facts)?;
-        let outcome = join_build(hold)?;
-        checks.push(Check::expect(
-            sandbox_contract::HOLD_COMPLETES,
-            outcome.succeeded(),
-            || {
-                format!(
-                    "the held action ended with exit code {:?}",
-                    outcome.exit_code
-                )
-            },
-        ));
-        Ok(())
+            Held::Unscoped { restart } => {
+                let _ = join_build(hold);
+                // The out-of-memory checks need the server the unscoped hold took down.
+                if restart {
+                    system.start_server()?;
+                }
+                Ok(())
+            }
+        }
     })
 }
 
-fn join_build(handle: ScopedJoinHandle<'_, Result<BuildOutcome>>) -> Result<BuildOutcome> {
-    handle
-        .join()
-        .map_err(|_| E2eError::system("the build thread panicked"))?
+/// Awaits the hold, checks its scope, and releases it. A held build that runs without a scope
+/// ends only with the server, which is killed.
+fn observe_hold<S: Limits, E: Execution>(
+    system: &S,
+    exec: &E,
+    checks: &mut Vec<Check>,
+) -> Result<Held> {
+    let signalled = system.await_hold()?;
+    let facts = match signalled {
+        Signalled::Started => system.running_scope()?,
+        Signalled::Abandoned => None,
+    };
+    let Some(facts) = facts else {
+        checks.push(Check::failed(
+            sandbox_contract::HOLD_HAS_SCOPE,
+            match signalled {
+                Signalled::Started => "no scope was observed for the hold action",
+                Signalled::Abandoned => "the hold build ended before its orphan signalled",
+            },
+        ));
+        let restart = signalled == Signalled::Started;
+        if restart {
+            system.kill_server()?;
+        }
+        return Ok(Held::Unscoped { restart });
+    };
+    checks.push(Check::passed(sandbox_contract::HOLD_HAS_SCOPE));
+    scope_checks(exec, &facts, checks)?;
+    system.release(&facts)?;
+    Ok(Held::Released)
+}
+
+/// Checks that bwrap runs inside the held action's scope and `gang exec` outside it.
+fn scope_checks<E: Execution>(exec: &E, facts: &ScopeFacts, checks: &mut Vec<Check>) -> Result<()> {
+    let members = exec.cgroup_members(&facts.directory)?;
+    let procs = exec.processes()?;
+    let bwrap = procs
+        .iter()
+        .any(|proc| proc.role == Role::Bwrap && members.contains(&proc.pid));
+    checks.push(Check::expect(
+        sandbox_contract::BWRAP_IN_SCOPE,
+        bwrap,
+        || {
+            format!(
+                "the scope {} holds {members:?}, no bwrap of the deployment",
+                facts.directory.display()
+            )
+        },
+    ));
+    let execs: Vec<_> = procs
+        .iter()
+        .filter(|proc| proc.role == Role::GangExec)
+        .collect();
+    let cgroups: Vec<_> = execs.iter().map(|proc| proc.cgroup.as_ref()).collect();
+    let exec_outside = !execs.is_empty()
+        && execs.iter().all(|proc| {
+            !members.contains(&proc.pid)
+                && proc.cgroup.as_ref().is_some_and(|c| {
+                    c.file_name().is_some_and(|name| name == WORKER_LEAF) && c != &facts.directory
+                })
+        });
+    let exec_reason = if execs.is_empty() {
+        "no gang exec runs".to_owned()
+    } else {
+        format!("gang exec runs in {cgroups:?}, not in its worker leaf")
+    };
+    checks.push(Check::expect(
+        sandbox_contract::EXEC_OUTSIDE_SCOPE,
+        exec_outside,
+        || exec_reason,
+    ));
+    Ok(())
 }

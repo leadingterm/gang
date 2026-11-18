@@ -5,9 +5,9 @@ import type { Link } from "./client.ts";
 import { useComputed } from "@preact/signals";
 import { identityOf, ms, splitIdentity } from "./wire-parse.ts";
 import { PATHS } from "./wire.ts";
-import { clock, humanize } from "./format.ts";
+import { humanize } from "./format.ts";
 import { actionsStale } from "./store.ts";
-import { Brand, Since, Until, useClient, useTitle } from "./ui.tsx";
+import { Brand, Clock, Ident, Since, Until, useClient, useTitle } from "./ui.tsx";
 import { SCREENS, type Screen } from "./routes.ts";
 
 type Level = "normal" | "live" | "caution" | "warning";
@@ -84,7 +84,7 @@ const Annunciators = () => {
   const state = client.state.value;
   const session = client.session.value;
   const stale = useComputed(() => actionsStale(client.state.value?.actions, client.now.value)).value;
-  const clockText = useComputed(() => clock(client.now.value));
+  const now = client.now.value;
   const pass = state?.pass;
   const unplaceable = state?.queue.unplaceable ?? 0;
   const lamps: Lamp[] = [
@@ -101,7 +101,7 @@ const Annunciators = () => {
       ? { id: "queue", level: "caution", long: `${unplaceable} unplaceable`, short: String(unplaceable) }
       : { id: "queue", level: "normal" },
     stale && state?.actions
-      ? { id: "actions", level: "caution", long: `as of ${clock(ms(state.actions.sampleTime))}`, short: "stale" }
+      ? { id: "actions", level: "caution", long: <>as of <Clock t={ms(state.actions.sampleTime)} /></>, short: "stale" }
       : { id: "actions", level: "normal" },
     session?.expireTime
       ? { id: "session", level: "normal", long: <Until t={ms(session.expireTime)} />, short: <Until t={ms(session.expireTime)} /> }
@@ -114,7 +114,7 @@ const Annunciators = () => {
           <LampView key={lamp.id} {...lamp} />
         ))}
         <div class="annun__clock">
-          <span>{clockText}</span>&nbsp;UTC
+          <Clock t={now} />&nbsp;UTC
         </div>
       </div>
     </section>
@@ -142,7 +142,7 @@ const Banner = () => {
         title="Stream lost"
         meta={
           <>
-            {link.frozenAt !== null && <>frozen at {clock(link.frozenAt)} · </>}retry <Until t={link.retryAt} />
+            {link.frozenAt !== null && <>frozen at <Clock t={link.frozenAt} /> · </>}retry <Until t={link.retryAt} />
           </>
         }
       />
@@ -158,7 +158,7 @@ const Banner = () => {
         meta={
           pass.lastOkTime === undefined ? undefined : (
             <>
-              frozen at {clock(ms(pass.lastOkTime))} · <Since t={ms(pass.lastOkTime)} />
+              frozen at <Clock t={ms(pass.lastOkTime)} /> · <Since t={ms(pass.lastOkTime)} />
             </>
           )
         }
@@ -199,14 +199,14 @@ export const Shell = ({ screen, children }: { screen: Screen; children: Componen
       <header class="top">
         <div class="shell top__inner">
           <Brand href={SCREENS[0].path} />
-          <span class="endpoint mono">{location.host}</span>
+          <Ident text={location.host} cls="endpoint" />
           <nav class="nav" aria-label="Screens">
             <NavLinks current={screen} keys />
           </nav>
           <div class="who">
             {who && (
-              <span class="who__id">
-                <span class="who__provider">{who[0]} ·</span> {who[1]}
+              <span class="who__id line">
+                <Ident text={who[0]} cls="who__provider" />{" "}<span class="who__provider" aria-hidden="true">·</span>{" "}<Ident text={who[1]} />
               </span>
             )}
             {session?.login && (

@@ -32,8 +32,11 @@ wait_all() {
 
 collect_region() {
   local region="$1" index="$2"
-  aws ec2 describe-images --region "$region" --owners self --include-deprecated \
+  aws ec2 describe-images --region "$region" --owners self --include-deprecated --include-disabled \
     --output json > "$temp_dir/images-$index.json" &&
+    aws ec2 describe-snapshots --region "$region" --owner-ids self \
+      --filters Name=tag-key,Values=ec2:SharedTag/GangRetiredImage \
+      --output json > "$temp_dir/snapshots-$index.json" &&
     aws service-quotas get-service-quota --region "$region" --service-code ec2 \
       --quota-code L-0E3CBAB9 --query Quota.Value --output json > "$temp_dir/quota-$index.json"
 }
@@ -55,8 +58,9 @@ collect_regions() {
     printf '{'
     index=0
     for region in ${regions[@]+"${regions[@]}"}; do
-      printf '%s"%s":{"quota":%s,"images":%s}' "$separator" "$region" \
-        "$(<"$temp_dir/quota-$index.json")" "$(<"$temp_dir/images-$index.json")"
+      printf '%s"%s":{"quota":%s,"images":%s,"snapshots":%s}' "$separator" "$region" \
+        "$(<"$temp_dir/quota-$index.json")" "$(<"$temp_dir/images-$index.json")" \
+        "$(<"$temp_dir/snapshots-$index.json")"
       separator=','
       index=$((index + 1))
     done
@@ -108,7 +112,9 @@ execute_steps() {
       publish) aws ec2 modify-image-attribute --region "$a" --image-id "$b" --launch-permission 'Add=[{Group=all}]' ;;
       deprecate) aws ec2 enable-image-deprecation --region "$a" --image-id "$b" --deprecate-at "$c" ;;
       unprotect) aws ec2 disable-image-deregistration-protection --region "$a" --image-id "$b" ;;
-      deregister) aws ec2 deregister-image --region "$a" --image-id "$b" --delete-associated-snapshots ;;
+      retire-snapshot) aws ec2 create-tags --region "$a" --resources "$b" --tags "Key=ec2:SharedTag/GangRetiredImage,Value=$c" ;;
+      deregister) aws ec2 deregister-image --region "$a" --image-id "$b" ;;
+      delete-snapshot) aws ec2 delete-snapshot --region "$a" --snapshot-id "$b" ;;
       *) printf 'publish-amis: unknown step: %s\n' "$kind" >&2; return 1 ;;
     esac
   done <<< "$1"

@@ -11,7 +11,7 @@ import { Activity } from "./views/activity.tsx";
 import { Build } from "./views/build.tsx";
 import { Builds } from "./views/builds.tsx";
 import { Device, DeviceApproved } from "./views/device.tsx";
-import { Forbidden, SignIn, SignInError } from "./views/gate.tsx";
+import { Forbidden, SessionGate, SignIn, SignInError } from "./views/gate.tsx";
 import { Overview } from "./views/overview.tsx";
 import { Workers } from "./views/workers.tsx";
 
@@ -72,7 +72,7 @@ const Screens = () => {
   if (r.kind === "device") return <Device reason={r.reason} />;
   if (r.kind === "deviceApproved") return <DeviceApproved />;
   if (link.kind === "signed_out") return <SignIn />;
-  if (!client.session.value) return null;
+  if (!client.session.value) return <SessionGate />;
   const screen = r.kind === "build" ? "builds" : r.screen;
   const View = SCREEN_VIEWS[screen];
   const blocked = link.kind === "forbidden" && screen !== "access" && screen !== "builds";

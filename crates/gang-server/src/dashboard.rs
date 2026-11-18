@@ -43,16 +43,6 @@ impl Dashboard {
         clock: &C,
         repository: &R,
     ) -> Result<Self, ServerError> {
-        let mut recorded = Vec::new();
-        repository
-            .scaling_events(
-                ScalingEventSeq::default(),
-                None,
-                config.recent_events,
-                &mut recorded,
-            )
-            .await
-            .map_err(ServerError::DashboardEvents)?;
         let state = Builder::new(builder_config(&config, &provisioner, poll_interval))
             .initial(clock.wall(), principals_epoch);
         let hub = StateHub::new(
@@ -64,14 +54,35 @@ impl Dashboard {
             },
             state,
         );
-        hub.preload(recorded.into_iter().map(wire_event).collect());
-        Ok(Self {
+        let dashboard = Self {
             hub,
             cache: ActionsCache::default(),
             config,
             provisioner,
             poll_interval,
-        })
+        };
+        dashboard.reload_from(repository).await?;
+        Ok(dashboard)
+    }
+
+    /// Replaces the recent event history with the current ledger contents.
+    pub(crate) async fn reload_from<R: StateRepositoryPort>(
+        &self,
+        repository: &R,
+    ) -> Result<(), ServerError> {
+        let mut recorded = Vec::new();
+        repository
+            .scaling_events(
+                ScalingEventSeq::default(),
+                None,
+                self.config.recent_events,
+                &mut recorded,
+            )
+            .await
+            .map_err(ServerError::DashboardEvents)?;
+        self.hub
+            .preload(recorded.into_iter().map(wire_event).collect());
+        Ok(())
     }
 
     /// The hub and heartbeat the Gang API serves the dashboard with.
@@ -125,6 +136,8 @@ impl Dashboard {
         revoked_principals: &RevokedPrincipals,
     ) -> Infallible {
         let mut revoked = revoked_principals.subscribe();
+        self.hub
+            .principals_changed(revoked.borrow_and_update().epoch);
         loop {
             if revoked.changed().await.is_err() {
                 return std::future::pending().await;

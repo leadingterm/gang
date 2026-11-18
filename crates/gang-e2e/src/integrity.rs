@@ -17,11 +17,18 @@ use crate::verdict;
 pub fn input_integrity<S: System>(system: &S, variant: &Variant) -> Result<Vec<Check>> {
     system.start_server()?;
     let outcome = system.build(&[Probe::Victim])?;
-    let mut checks = vec![Check::expect(
-        names::integrity::BUILD_SUCCEEDS,
-        outcome.succeeded(),
-        || outcome.exit_summary(),
-    )];
+    let mut checks = Vec::new();
+    if !crate::check::record_build(
+        &mut checks,
+        &outcome,
+        Check::expect(
+            names::integrity::BUILD_SUCCEEDS,
+            outcome.succeeded(),
+            || outcome.exit_summary(),
+        ),
+    ) {
+        return Ok(checks);
+    }
     let workers = system.worker_count()?;
     checks.push(Check::expect(
         names::integrity::ONE_WORKER,

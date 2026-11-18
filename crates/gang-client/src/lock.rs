@@ -7,6 +7,7 @@ use gang_os::{FileLock, PathIo};
 
 use crate::ClientError;
 use crate::home::{ClientHome, LOCK_FILE};
+use crate::session::Session;
 
 /// Holds the client lock. The lock is released when this value is dropped.
 #[derive(Debug)]
@@ -31,6 +32,7 @@ impl ClientHome {
         let lock = tokio::task::spawn_blocking(move || dir.lock(LOCK_FILE))
             .await
             .map_err(|join| PathIo::new("lock", &path, io::Error::other(join)))??;
+        Session::recover(self)?;
         Ok(ClientLock { _lock: lock })
     }
 }

@@ -12,3 +12,31 @@ opentofu_contract_test(
         "//infra/terraform/modules/worker-fleet:sources",
     ],
 )
+
+opentofu_contract_test(
+    name = "deployment_dynamodb_contract",
+    test_file = "tests/deployment_dynamodb.tftest.hcl",
+    deps = [
+        "//:Cargo.toml",
+        "//infra/terraform/modules/controller:sources",
+        "//infra/terraform/modules/instance-role:sources",
+        "//infra/terraform/modules/load-balancer:sources",
+        "//infra/terraform/modules/network:sources",
+        "//infra/terraform/modules/storage:sources",
+        "//infra/terraform/modules/worker-fleet:sources",
+    ],
+)
+
+opentofu_contract_test(
+    name = "deployment_postgres_contract",
+    test_file = "tests/deployment_postgres.tftest.hcl",
+    deps = [
+        "//:Cargo.toml",
+        "//infra/terraform/modules/controller:sources",
+        "//infra/terraform/modules/instance-role:sources",
+        "//infra/terraform/modules/load-balancer:sources",
+        "//infra/terraform/modules/network:sources",
+        "//infra/terraform/modules/storage:sources",
+        "//infra/terraform/modules/worker-fleet:sources",
+    ],
+)

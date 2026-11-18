@@ -141,3 +141,145 @@ resource "aws_kms_alias" "this" {
   name          = "alias/${var.name}-ca"
   target_key_id = aws_kms_key.ca.key_id
 }
+
+resource "aws_dynamodb_table" "this" {
+  count = var.dynamodb_table == null ? 0 : 1
+
+  name                        = var.dynamodb_table.name
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "pk"
+  range_key                   = "sk"
+  deletion_protection_enabled = true
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+
+  attribute {
+    name = "sk"
+    type = "S"
+  }
+
+  point_in_time_recovery {
+    enabled = true
+  }
+
+  server_side_encryption {
+    enabled = true
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  tags = merge(var.tags, { Name = var.dynamodb_table.name })
+}
+
+resource "aws_db_subnet_group" "postgres" {
+  count = var.postgres_rds == null ? 0 : 1
+
+  name       = "${var.name}-state"
+  subnet_ids = var.postgres_rds.subnet_ids
+  tags       = merge(var.tags, { Name = "${var.name}-state" })
+}
+
+resource "aws_security_group" "postgres" {
+  count = var.postgres_rds == null ? 0 : 1
+
+  name        = "${var.name}-state"
+  description = "PostgreSQL access from the controller"
+  vpc_id      = var.postgres_rds.vpc_id
+  tags        = merge(var.tags, { Name = "${var.name}-state" })
+}
+
+resource "aws_vpc_security_group_ingress_rule" "postgres" {
+  count = var.postgres_rds == null ? 0 : 1
+
+  security_group_id            = aws_security_group.postgres[0].id
+  referenced_security_group_id = var.postgres_rds.client_security_group_id
+  ip_protocol                  = "tcp"
+  from_port                    = 5432
+  to_port                      = 5432
+  tags                         = merge(var.tags, { Name = "${var.name}-state" })
+}
+
+resource "aws_db_parameter_group" "postgres" {
+  count = var.postgres_rds == null ? 0 : 1
+
+  name_prefix = "${var.name}-state-"
+  family      = "postgres${var.postgres_rds.engine_version}"
+
+  parameter {
+    name         = "rds.force_ssl"
+    value        = "1"
+    apply_method = "immediate"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  tags = merge(var.tags, { Name = "${var.name}-state" })
+}
+
+ephemeral "aws_secretsmanager_random_password" "postgres" {
+  count = var.postgres_rds == null ? 0 : 1
+
+  password_length     = 40
+  exclude_punctuation = true
+}
+
+# Write-only arguments keep the password out of state and plan; increment password_version to rotate.
+resource "aws_db_instance" "postgres" {
+  count = var.postgres_rds == null ? 0 : 1
+
+  identifier                 = "${var.name}-state"
+  engine                     = "postgres"
+  engine_version             = var.postgres_rds.engine_version
+  instance_class             = var.postgres_rds.instance_class
+  allocated_storage          = var.postgres_rds.storage_gib
+  storage_type               = "gp3"
+  storage_encrypted          = true
+  multi_az                   = var.postgres_rds.multi_az
+  db_name                    = "gang"
+  username                   = "gang"
+  password_wo                = ephemeral.aws_ssm_parameter.postgres_password[0].value
+  password_wo_version        = var.postgres_rds.password_version
+  db_subnet_group_name       = aws_db_subnet_group.postgres[0].name
+  vpc_security_group_ids     = [aws_security_group.postgres[0].id]
+  parameter_group_name       = aws_db_parameter_group.postgres[0].name
+  publicly_accessible        = false
+  backup_retention_period    = 7
+  deletion_protection        = true
+  skip_final_snapshot        = false
+  final_snapshot_identifier  = "${var.name}-state-final"
+  copy_tags_to_snapshot      = true
+  auto_minor_version_upgrade = true
+  ca_cert_identifier         = "rds-ca-rsa2048-g1"
+
+  depends_on = [aws_ssm_parameter.postgres_password]
+
+  tags = merge(var.tags, { Name = "${var.name}-state" })
+}
+
+resource "aws_ssm_parameter" "postgres_password" {
+  count = var.postgres_rds == null ? 0 : 1
+
+  name             = "/${var.name}/database-password"
+  type             = "SecureString"
+  value_wo         = ephemeral.aws_secretsmanager_random_password.postgres[0].random_password
+  value_wo_version = var.postgres_rds.password_version
+
+  tags = merge(var.tags, { Name = "/${var.name}/database-password" })
+}
+
+# A failed RDS apply retry must reuse the committed parameter, not a newly generated password. Plans read it without
+# decryption so the plan role needs no kms:Decrypt; apply re-opens it decrypted for password_wo.
+ephemeral "aws_ssm_parameter" "postgres_password" {
+  count = var.postgres_rds == null ? 0 : 1
+
+  arn             = aws_ssm_parameter.postgres_password[0].arn
+  with_decryption = terraform.applying
+}

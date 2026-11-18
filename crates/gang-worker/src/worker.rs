@@ -233,6 +233,7 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
         .to_toml()
         .map_err(|error| WorkerError::Config(error.to_string()))?;
     layout.prepare(&text, &executable)?;
+    let volume = provisioner.mount(&identity.instance).await?;
     let cached = gang_os::fs::usage(&layout.fast_cas_directory())?;
     let scratch = volume.capacity.saturating_add(cached);
     let fast_cas_budget = worker.fast_cas_percent.of_bytes(scratch);
@@ -309,11 +310,11 @@ async fn acquire<D: WorkerDeployment>(
     })
 }
 
-/// How long to wait before retrying after `error`: the `retry_after` the server sent with a
-/// rate-limit refusal, or `interval` when the failure carries none.
+/// How long to wait before retrying after `error`: the wait the server asked for with a refusal
+/// for now, or `interval` when the failure carries none.
 fn retry_wait(error: &WorkerError, interval: Duration) -> Duration {
     match error {
-        WorkerError::Enroll(error) => error.rate_limit().and_then(|limit| limit.retry_after),
+        WorkerError::Enroll(error) => error.retry().and_then(|retry| retry.after),
         _ => None,
     }
     .unwrap_or(interval)
@@ -321,8 +322,8 @@ fn retry_wait(error: &WorkerError, interval: Duration) -> Duration {
 
 /// Obtains the first generation's TLS material, before any worker runs.
 ///
-/// A rate-limited refusal is retried only if the retry can start by the enrollment deadline.
-/// Every other failure is returned at once.
+/// A refusal for now (rate limited or temporarily unavailable) is retried only if the retry can
+/// start by the enrollment deadline. Every other failure is returned at once.
 async fn first_tls<D: WorkerDeployment>(
     plan: &Plan,
     provisioner: &D::Provisioner,
@@ -334,9 +335,9 @@ async fn first_tls<D: WorkerDeployment>(
         match acquire::<D>(plan, provisioner, enroller, clock, 0).await {
             Ok(tls) => break tls,
             Err(error) => {
-                let rate_limited = matches!(
+                let retryable = matches!(
                     &error,
-                    WorkerError::Enroll(enroll) if enroll.rate_limit().is_some()
+                    WorkerError::Enroll(enroll) if enroll.retry().is_some()
                 );
                 let wait = retry_wait(&error, plan.worker.enrollment_retry_interval.get());
                 let remaining = plan
@@ -344,10 +345,10 @@ async fn first_tls<D: WorkerDeployment>(
                     .enrollment_deadline
                     .get()
                     .saturating_sub(clock.monotonic().saturating_duration_since(started));
-                if !rate_limited || wait > remaining || remaining.is_zero() {
+                if !retryable || wait > remaining || remaining.is_zero() {
                     return Err(error);
                 }
-                tracing::warn!(error = %gang_types::error_chain(&error), retry_after = ?wait, "worker enrollment rate limited; retrying");
+                tracing::warn!(error = %gang_types::error_chain(&error), retry_after = ?wait, "worker enrollment refused for now; retrying");
                 clock.sleep(wait).await;
             }
         }

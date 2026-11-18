@@ -4,8 +4,8 @@ import { useState } from "preact/hooks";
 import { idOf, ms, type UnixMs } from "../wire-parse.ts";
 import type { Fleet, Instance, Phase, State, Worker } from "../wire.ts";
 import { windowMs } from "../recent.ts";
-import { clock, duration, sum, workerInstance } from "../format.ts";
-import { Disclosure, Empty, FleetFilter, Ident, SectionHead, Since, Target, useClient, useNowStep } from "../ui.tsx";
+import { sum, workerInstance } from "../format.ts";
+import { Cell, Clock, Disclosure, Duration, Empty, FleetFilter, Ident, Row, SectionHead, Since, Table, Target, useClient, useNowStep } from "../ui.tsx";
 import { AsOf } from "./actions.tsx";
 import { fleetCounts, fleetTotals, STATE_NAME, StaticCell, Tally, type Counted } from "./fleet.tsx";
 
@@ -94,7 +94,7 @@ export const WorkerDetail = ({ w, state }: { w: Worker; state: State }) => {
         <dd><Ident text={idOf(w.name)} /></dd>
         <dt>up</dt>
         <dd class="mono">
-          <Since t={launched} /> · since {clock(launched)}
+          <span class="clause"><Since t={launched} /></span>{" · "}<span class="clause">since <Clock t={launched} /></span>
         </dd>
         <dt>slots</dt>
         <dd class="mono">
@@ -109,37 +109,28 @@ export const WorkerDetail = ({ w, state }: { w: Worker; state: State }) => {
                 <span class="phase__name">{s.phase.toLowerCase()}</span>
               </span>
               <span class="mono">
-                {clock(s.from)} → {s.to === null ? "now" : clock(s.to)}
+                <Clock t={s.from} /> → {s.to === null ? "now" : <Clock t={s.to} />}
               </span>
-              <span class="mono quiet">{duration((s.to ?? client.now.value) - s.from)}</span>
+              <span class="mono quiet"><Duration ms={(s.to ?? client.now.value) - s.from} /></span>
             </li>
           ))}
         </ol>
       )}
       {acts.length > 0 && state.actions && (
         <>
-          <table class="table" aria-label="Running on this worker">
-            <thead>
-              <tr>
-                <th scope="col">Target</th>
-                <th scope="col">Mnemonic</th>
-                <th scope="col" class="r">Running</th>
-              </tr>
-            </thead>
-            <tbody>
-              {acts.map((a) => (
-                <tr key={a.name}>
-                  <td class="a-main">
-                    {a.target ? <Target label={a.target} /> : <span class="mono quiet">{a.digest.slice(0, 12)}</span>}
-                  </td>
-                  <td class="a-kind">{a.mnemonic || "—"}</td>
-                  <td class="a-age r">
-                    <Since t={ms(a.startTime)} />
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <Table label="Running on this worker" cols={[{ head: "Target", share: 1 }, { head: "Mnemonic", fit: 10 }, { head: "Running", end: true }]}>
+            {acts.map((a) => (
+              <Row key={a.name}>
+                <Cell cls="a-main">
+                  {a.target ? <Target label={a.target} /> : <Ident text={a.digest.slice(0, 12)} title={a.digest} cls="quiet" />}
+                </Cell>
+                <Cell cls="a-kind">{a.mnemonic ? <Ident text={a.mnemonic} /> : "—"}</Cell>
+                <Cell cls="a-age r">
+                  <Since t={ms(a.startTime)} />
+                </Cell>
+              </Row>
+            ))}
+          </Table>
           <AsOf actions={state.actions} />
         </>
       )}
@@ -232,9 +223,9 @@ export const Workers = () => {
           <span />
           <span />
           <span class="axis">
-            <span>−{duration(window)}</span>
-            <span>−{duration(2 * window / 3)}</span>
-            <span>−{duration(window / 3)}</span>
+            <span>−<Duration ms={window} /></span>
+            <span>−<Duration ms={2 * window / 3} /></span>
+            <span>−<Duration ms={window / 3} /></span>
             <span>now</span>
           </span>
         </div>

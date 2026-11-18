@@ -4,12 +4,12 @@
 
 use aws_sdk_kms::types::{KeySpec, KeyUsageType, MessageType, SigningAlgorithmSpec};
 use aws_smithy_types::Blob;
+use gang_aws_sdk::{call_error, load};
 use gang_spi::{CertificateSignerPort, Plugin, PluginContext, PortError, SignatureAlgorithm};
 use tokio::sync::OnceCell;
 
 use crate::config::KmsSignerConfig;
-use crate::errors::{AwsError, sdk_error};
-use crate::sdk::load;
+use crate::errors::AwsError;
 
 const GET_PUBLIC_KEY: &str = "GetPublicKey";
 const SIGN: &str = "Sign";
@@ -76,7 +76,7 @@ impl KmsSigner {
             .key_id(key_id)
             .send()
             .await
-            .map_err(|e| sdk_error(GET_PUBLIC_KEY, e))?;
+            .map_err(|e| call_error(GET_PUBLIC_KEY, e))?;
 
         if response.key_spec() != Some(&KeySpec::EccNistP256) {
             return Err(unsuitable(key_id, KEY_NOT_P256));
@@ -133,7 +133,7 @@ impl CertificateSignerPort for KmsSigner {
             .signing_algorithm(SigningAlgorithmSpec::EcdsaSha256)
             .send()
             .await
-            .map_err(|e| sdk_error(SIGN, e))?;
+            .map_err(|e| call_error(SIGN, e))?;
 
         let signature = response
             .signature()
@@ -338,7 +338,7 @@ mod tests {
 
         assert!(matches!(
             signer.pinned().await,
-            Err(AwsError::Refused { .. })
+            Err(AwsError::Call(gang_aws_sdk::CallError::Refused { .. }))
         ));
         Ok(())
     }

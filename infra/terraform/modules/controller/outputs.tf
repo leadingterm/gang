@@ -1,6 +1,6 @@
 output "instance_id" {
-  description = "ID of the controller EC2 instance."
-  value       = aws_instance.this.id
+  description = "ID of the controller EC2 instance, or null for the group shape."
+  value       = local.instance_shape ? aws_instance.this[0].id : null
 }
 
 output "permissions_boundary_arn" {
@@ -24,6 +24,16 @@ output "secret_parameter_arns" {
 }
 
 output "state_volume_id" {
-  description = "ID of the encrypted EBS state volume attached to the controller as /dev/sdg."
-  value       = aws_ebs_volume.state.id
+  description = "ID of the encrypted EBS state volume attached as /dev/sdg, or null for the group shape."
+  value       = local.instance_shape ? aws_ebs_volume.state[0].id : null
+}
+
+output "autoscaling_group_name" {
+  description = "Name of the controller Auto Scaling group, or null for the instance shape."
+  value       = local.group_shape ? aws_autoscaling_group.controller[0].name : null
+}
+
+output "config_digest" {
+  description = "Configuration digest supplied to the controller."
+  value       = var.config_digest
 }

@@ -1,8 +1,8 @@
 {
   "name": "deviceAuthorizations/BCDF-GHJK",
-  "provider": "google",
+  "provider": "github-actions-oidc.platform-team.example.org",
   "verificationUri": "https://gang.example.com/ui/device",
-  "clientAddress": "192.0.2.4",
+  "clientAddress": "2001:db8:85a3:8d3:1319:8a2e:370:7348",
   "state": "PENDING",
   "createTime": "2026-01-15T10:00:00.000Z",
   "expireTime": "2026-01-15T10:10:00.000Z",

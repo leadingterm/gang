@@ -53,13 +53,23 @@ variable "controller_security_group_id" {
 variable "controller_instance_id" {
   description = "Instance ID of the controller."
   type        = string
-  nullable    = false
+  default     = null
+
+  validation {
+    condition     = var.execution || (var.controller_instance_id != null && var.controller_instance_id != "")
+    error_message = "controller_instance_id is required when execution is disabled."
+  }
 }
 
 variable "controller_private_ip" {
   description = "Private IPv4 address of the controller."
   type        = string
-  nullable    = false
+  default     = null
+
+  validation {
+    condition     = var.execution || (var.controller_private_ip != null && var.controller_private_ip != "")
+    error_message = "controller_private_ip is required when execution is disabled."
+  }
 }
 
 variable "ssl_policy" {
@@ -77,6 +87,111 @@ variable "certificate_validation_timeout" {
   description = "How long apply waits for the certificate's DNS validation record to be published, as an OpenTofu duration such as 2h."
   type        = string
   nullable    = false
+}
+
+variable "execution" {
+  description = "Enable the multi-controller execution and internal load balancer shape."
+  type        = bool
+  default     = false
+  nullable    = false
+}
+
+variable "public_subnet_ids" {
+  description = "Public subnets for the multi-controller public load balancer."
+  type        = list(string)
+  default     = []
+  nullable    = false
+
+  validation {
+    condition     = !var.execution || length(var.public_subnet_ids) > 0
+    error_message = "public_subnet_ids must not be empty when execution is enabled."
+  }
+}
+
+variable "private_subnet_ids" {
+  description = "Private subnets for the internal load balancer."
+  type        = list(string)
+  default     = []
+  nullable    = false
+
+  validation {
+    condition     = !var.execution || length(var.private_subnet_ids) > 0
+    error_message = "private_subnet_ids must not be empty when execution is enabled."
+  }
+}
+
+variable "worker_security_group_id" {
+  description = "Worker security group allowed to reach the internal load balancer."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = !var.execution || (var.worker_security_group_id != null && var.worker_security_group_id != "")
+    error_message = "worker_security_group_id is required when execution is enabled."
+  }
+}
+
+variable "private_zone_id" {
+  description = "Existing private hosted zone ID, authoritative for hostname or a parent domain; null creates the hostname's private zone."
+  type        = string
+  default     = null
+}
+
+variable "execute_port" {
+  description = "Controller execution port: the execute listeners' port and their target port."
+  type        = number
+  nullable    = false
+
+  validation {
+    condition     = var.execute_port >= 1 && var.execute_port <= 65535 && floor(var.execute_port) == var.execute_port
+    error_message = "execute_port must be an integer TCP port from 1 to 65535."
+  }
+}
+
+variable "health_port" {
+  description = "Controller plaintext HTTP health listener port (`health_listen`): every target group checks /serve or /leader on it."
+  type        = number
+  nullable    = false
+
+  validation {
+    condition     = var.health_port >= 1 && var.health_port <= 65535 && floor(var.health_port) == var.health_port
+    error_message = "health_port must be an integer TCP port from 1 to 65535."
+  }
+}
+
+variable "workers_port" {
+  description = "Controller worker port: the internal worker listener's port and its target port."
+  type        = number
+  nullable    = false
+
+  validation {
+    condition     = var.workers_port >= 1 && var.workers_port <= 65535 && floor(var.workers_port) == var.workers_port
+    error_message = "workers_port must be an integer TCP port from 1 to 65535."
+  }
+}
+
+variable "shutdown_grace" {
+  description = "Controller shutdown grace period in seconds."
+  type        = number
+  default     = 300
+  nullable    = false
+
+  validation {
+    condition     = var.shutdown_grace >= 0 && floor(var.shutdown_grace) == var.shutdown_grace
+    error_message = "shutdown_grace must be a nonnegative integer number of seconds."
+  }
+}
+
+variable "deregistration_delay" {
+  description = "Target deregistration delay in seconds; must cover shutdown_grace."
+  type        = number
+  default     = 300
+  nullable    = false
+
+  validation {
+    condition     = var.deregistration_delay >= var.shutdown_grace && var.deregistration_delay <= 3600 && floor(var.deregistration_delay) == var.deregistration_delay
+    error_message = "deregistration_delay must be an integer between shutdown_grace and 3600 seconds."
+  }
 }
 
 variable "tags" {

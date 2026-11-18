@@ -10,9 +10,10 @@ workspace = true
 
 [dependencies]
 gang-clock = { workspace = true }
+gang-os = { workspace = true }
 gang-spi = { workspace = true }
 gang-types = { workspace = true }
-rusqlite = { workspace = true }
+rusqlite = { workspace = true, features = ["functions"] }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

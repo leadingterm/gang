@@ -1,12 +1,62 @@
 #![expect(
     unsafe_code,
-    reason = "libc's sigprocmask and mkfifo have no safe wrapper in our dependencies (rustix exposes neither on every platform); signal masks are the only signal state that survives exec into the sandbox"
+    reason = "signal masks, mkfifo, kqueue process filters and owned readiness registration require unsafe calls"
 )]
 
 use std::ffi::CStr;
 use std::io;
 use std::mem::MaybeUninit;
+use std::os::fd::OwnedFd;
 use std::ptr;
+
+/// An asynchronously readable owned pipe. Dropping the reader closes its descriptor.
+pub struct PipeReader {
+    fd: tokio::io::unix::AsyncFd<OwnedFd>,
+}
+
+impl PipeReader {
+    /// Configures and registers an owned pipe for asynchronous reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if configuring or registering the descriptor fails.
+    pub fn new(fd: OwnedFd) -> io::Result<Self> {
+        let flags = rustix::fs::fcntl_getfl(&fd)?;
+        rustix::fs::fcntl_setfl(&fd, flags | rustix::fs::OFlags::NONBLOCK)?;
+        // SAFETY: The owned descriptor remains open and unchanged until AsyncFd deregisters
+        // on drop. It never escapes this type, and neither get_mut nor into_inner is used.
+        let fd = unsafe { tokio::io::unix::AsyncFd::register(fd) }?;
+        Ok(Self { fd })
+    }
+
+    /// Reads into `buffer` without blocking an executor thread.
+    ///
+    /// Returns the number of bytes read, or zero for an empty buffer or at EOF.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if waiting for readiness or reading the descriptor fails.
+    pub async fn read(&self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let mut ready = match self.fd.readable().await {
+                Ok(ready) => ready,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            match ready
+                .try_io(|fd| rustix::io::read(fd.get_ref(), &mut *buffer).map_err(io::Error::from))
+            {
+                Ok(Ok(count)) => return Ok(count),
+                Ok(Err(error)) if error.kind() == io::ErrorKind::Interrupted => {}
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {}
+            }
+        }
+    }
+}
 
 pub(crate) fn thread_mask(
     how: libc::c_int,
@@ -42,6 +92,81 @@ pub(crate) fn mkfifo(path: &CStr, mode: rustix::fs::Mode) -> io::Result<()> {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+/// An event queue watching one process for exit.
+#[cfg(target_os = "macos")]
+pub struct ProcessExitQueue(std::os::fd::OwnedFd);
+
+#[cfg(target_os = "macos")]
+impl ProcessExitQueue {
+    /// Registers an exit filter before the process is signalled.
+    ///
+    /// # Errors
+    ///
+    /// Returns the kernel error if creating or registering the queue fails.
+    pub fn new(pid: rustix::process::Pid) -> rustix::io::Result<Self> {
+        use rustix::event::kqueue::{
+            Event, EventFilter, EventFlags, ProcessEvents, kevent, kqueue,
+        };
+
+        let fd = kqueue()?;
+        let change = Event::new(
+            EventFilter::Proc {
+                pid,
+                flags: ProcessEvents::EXIT,
+            },
+            EventFlags::ADD,
+            ptr::null_mut(),
+        );
+        // SAFETY: The process filter refers to a PID, not a file descriptor.
+        unsafe {
+            kevent(
+                &fd,
+                &[change],
+                &mut [change; 0],
+                Some(std::time::Duration::ZERO),
+            )?
+        };
+        Ok(Self(fd))
+    }
+
+    /// Waits up to `timeout` for the registered process to exit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the kernel error if waiting fails.
+    pub fn wait(&self, timeout: std::time::Duration) -> rustix::io::Result<bool> {
+        use rustix::event::kqueue::{Event, EventFlags, kevent_timespec};
+
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or(rustix::io::Errno::INVAL)?;
+        let mut events = [MaybeUninit::<Event>::uninit(); 1];
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let timeout = rustix::event::Timespec {
+                tv_sec: i64::try_from(remaining.as_secs()).map_err(|_| rustix::io::Errno::INVAL)?,
+                tv_nsec: remaining.subsec_nanos().into(),
+            };
+            // SAFETY: The queue contains only a process filter and no referenced file descriptors.
+            let result = unsafe { kevent_timespec(&self.0, &[], &mut events, Some(&timeout)) };
+            let events = match result {
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(error) => return Err(error),
+                Ok((events, _)) => events,
+            };
+            if let Some(event) = events.first() {
+                if event.flags().contains(EventFlags::ERROR) {
+                    return Err(rustix::io::Errno::from_raw_os_error(
+                        i32::try_from(event.data()).unwrap_or(rustix::io::Errno::IO.raw_os_error()),
+                    ));
+                }
+                return Ok(true);
+            }
+            return Ok(false);
+        }
     }
 }
 

@@ -245,7 +245,7 @@ cmd_converge() {
 cmd_restart() {
   require RUNNER_TEMP
   local plan="$RUNNER_TEMP/infra-plan.json"
-  local needed gang region controller command_id status wait_rc=0
+  local needed gang shape region controller command_id status wait_rc=0
 
   needed="$("$GANG" deploy restart-needed <"$plan")" || die "cannot parse $plan"
   if [[ "$needed" != true ]]; then
@@ -254,6 +254,12 @@ cmd_restart() {
   fi
 
   gang="$(tofu -chdir="$ROOT" output -json gang)"
+  shape="$(jq -er '.controller_shape // "instance"' <<<"$gang")" || die "output gang has an invalid controller_shape"
+  if [[ "$shape" == group ]]; then
+    log "controller group rolls configuration changes through instance refresh"
+    return 0
+  fi
+  [[ "$shape" == instance ]] || die "unknown controller_shape: $shape"
   region="$(jq -er '.region' <<<"$gang")" || die "output gang has no region"
   controller="$(jq -er '.controller_instance_id' <<<"$gang")" || die "output gang has no controller_instance_id"
 

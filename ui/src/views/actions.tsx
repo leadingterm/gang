@@ -3,9 +3,9 @@ import { useComputed } from "@preact/signals";
 import { useState } from "preact/hooks";
 import { idOf, ms } from "../wire-parse.ts";
 import type { Actions as ActionsSample, QueuedAction, RunningAction } from "../wire.ts";
-import { clock, workerInstance } from "../format.ts";
+import { workerInstance } from "../format.ts";
 import { actionsStale } from "../store.ts";
-import { Empty, FleetFilter, Ident, Num, Priority, Section, Since, Target, useClient, useEnter } from "../ui.tsx";
+import { Cell, Clock, Empty, FleetFilter, Ident, Num, Priority, Row, Section, Since, Table, Target, useClient } from "../ui.tsx";
 
 /** Queued longer than this, the wait reads as caution. */
 const AGED_MS = 3 * 60 * 1000;
@@ -14,54 +14,50 @@ const AGED_MS = 3 * 60 * 1000;
 export const AsOf = ({ actions }: { actions: ActionsSample }) => {
   const client = useClient();
   const stale = useComputed(() => actionsStale(actions, client.now.value)).value;
-  return <span class={stale ? "asof is-on" : "asof"}>AS OF {clock(ms(actions.sampleTime))}</span>;
+  return <span class={stale ? "asof is-on" : "asof"}>AS OF <Clock t={ms(actions.sampleTime)} /></span>;
 };
 
 const matches = (text: string, query: string): boolean => query === "" || text.toLowerCase().includes(query);
 
 const RunningRow = ({ a }: { a: RunningAction }) => {
-  const ref = useEnter<HTMLTableRowElement>();
   return (
-    <tr ref={ref}>
-      <td class="a-main">
-        <Target label={a.target} />
-        <Priority p={a.priority} />
-        {a.build && <div><a class="more" href={`/ui/builds/${encodeURIComponent(idOf(a.build))}`}>Build {idOf(a.build)}</a></div>}
-      </td>
-      <td class="a-kind">{a.mnemonic}</td>
-      <td class="a-m1 mono dim"><Ident text={idOf(a.fleet)} /></td>
-      <td class="a-m2 mono dim"><Ident text={workerInstance(idOf(a.worker))} /></td>
-      <td class="a-age r">
+    <Row enter>
+      <Cell cls="a-main">
+        <div class="line"><Target label={a.target} />{" "}<Priority p={a.priority} /></div>
+        {a.build && <a class="more line" href={`/ui/builds/${encodeURIComponent(idOf(a.build))}`}><span>Build</span>{" "}<Ident text={idOf(a.build)} /></a>}
+      </Cell>
+      <Cell cls="a-kind"><Ident text={a.mnemonic} /></Cell>
+      <Cell cls="a-m1 mono dim"><Ident text={idOf(a.fleet)} /></Cell>
+      <Cell cls="a-m2 mono dim"><Ident text={workerInstance(idOf(a.worker))} /></Cell>
+      <Cell cls="a-age r">
         <Since t={ms(a.startTime)} />
-      </td>
-    </tr>
+      </Cell>
+    </Row>
   );
 };
 
 const QueuedRow = ({ q }: { q: QueuedAction }) => {
   const client = useClient();
   const aged = useComputed(() => client.now.value - ms(q.queueTime) > AGED_MS).value;
-  const ref = useEnter<HTMLTableRowElement>();
   return (
-    <tr ref={ref}>
-      <td class="a-age">
+    <Row enter>
+      <Cell cls="a-age">
         <Since t={ms(q.queueTime)} cls={aged ? "caution" : ""} />
-      </td>
-      <td class="a-main">
-        <Target label={q.target} />
-        <Priority p={q.priority} />
-        {q.build && <div><a class="more" href={`/ui/builds/${encodeURIComponent(idOf(q.build))}`}>Build {idOf(q.build)}</a></div>}
+      </Cell>
+      <Cell cls="a-main">
+        <div class="line"><Target label={q.target} />{" "}<Priority p={q.priority} /></div>
+        {q.build && <a class="more line" href={`/ui/builds/${encodeURIComponent(idOf(q.build))}`}><span>Build</span>{" "}<Ident text={idOf(q.build)} /></a>}
         {q.refusal && <div class="action__refusal caution">{q.refusal}</div>}
-      </td>
-      <td class="a-kind">{q.mnemonic}</td>
-      <td class="a-m1 a-span">
+      </Cell>
+      <Cell cls="a-kind"><Ident text={q.mnemonic} /></Cell>
+      <Cell cls="a-m1 a-span">
         {q.candidates.length ? (
           <span class="chips">
             {q.candidates.map((candidate) => <span key={candidate} class="tag"><Ident text={idOf(candidate)} /></span>)}
           </span>
         ) : <span class="warning">no fleet</span>}
-      </td>
-    </tr>
+      </Cell>
+    </Row>
   );
 };
 
@@ -133,22 +129,17 @@ export const Actions = () => {
           count={<Num value={actions.running.length} />}
           aside={actions.truncated.running > 0 ? <span class="trunc">+{actions.truncated.running}</span> : undefined}
         >
-          <table class="table">
-            <thead>
-              <tr>
-                <th>Target</th>
-                <th>Mnemonic</th>
-                <th>Fleet</th>
-                <th>Worker</th>
-                <th class="r">Time</th>
-              </tr>
-            </thead>
-            <tbody>
-              {running.map((a) => (
-                <RunningRow key={a.name} a={a} />
-              ))}
-            </tbody>
-          </table>
+          <Table cols={[
+            { head: "Target", share: 1 },
+            { head: "Mnemonic", fit: 10 },
+            { head: "Fleet", fit: 20 },
+            { head: "Worker", fit: 12 },
+            { head: "Time", end: true },
+          ]}>
+            {running.map((a) => (
+              <RunningRow key={a.name} a={a} />
+            ))}
+          </Table>
         </Section>
       )}
       {actions.queued.length > 0 && (
@@ -158,21 +149,16 @@ export const Actions = () => {
           count={<Num value={state.queue.total} />}
           aside={actions.truncated.queued > 0 ? <span class="trunc">+{actions.truncated.queued}</span> : undefined}
         >
-          <table class="table">
-            <thead>
-              <tr>
-                <th>Wait</th>
-                <th>Target</th>
-                <th>Mnemonic</th>
-                <th>Fleets</th>
-              </tr>
-            </thead>
-            <tbody>
-              {queued.map((a) => (
-                <QueuedRow key={a.name} q={a} />
-              ))}
-            </tbody>
-          </table>
+          <Table cols={[
+            { head: "Wait" },
+            { head: "Target", share: 1 },
+            { head: "Mnemonic", fit: 10 },
+            { head: "Fleets", fit: 24 },
+          ]}>
+            {queued.map((a) => (
+              <QueuedRow key={a.name} q={a} />
+            ))}
+          </Table>
         </Section>
       )}
     </>

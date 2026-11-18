@@ -1,0 +1,7 @@
+{
+  "serve_path": "/serve",
+  "leader_path": "/leader",
+  "interval_seconds": 5,
+  "timeout_seconds": 2,
+  "threshold": 2
+}

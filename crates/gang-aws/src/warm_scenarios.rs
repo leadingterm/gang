@@ -83,10 +83,17 @@ async fn plain_group_terminates_with_one_atomic_decrement() -> TestResult {
     );
     let test_fleet = fleet(FLEET)?;
 
-    harness
-        .fleets
-        .terminate(test_fleet.view(), &id("i-1")?)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .terminate(
+                held,
+                test_fleet.view(),
+                &id("i-1").expect("test value is valid"),
+            )
+            .await
+    })
+    .await?;
 
     assert_eq!(harness.requests(TERMINATE), 1);
     assert_eq!(harness.requests(SET_PROTECTION), 0);
@@ -158,10 +165,17 @@ async fn supply_reports_max_of_desired_and_live_while_released_member_remains() 
         false,
     ));
     let test_fleet = fleet(FLEET)?;
-    harness
-        .fleets
-        .terminate(test_fleet.view(), &id("i-1")?)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .terminate(
+                held,
+                test_fleet.view(),
+                &id("i-1").expect("test value is valid"),
+            )
+            .await
+    })
+    .await?;
 
     let supply = supply_of(&harness).await?;
 
@@ -223,10 +237,17 @@ async fn release_unprotects_then_lowers_and_the_fake_moves_the_instance_to_the_p
     ));
     let test_fleet = fleet(FLEET)?;
 
-    harness
-        .fleets
-        .terminate(test_fleet.view(), &id("i-1")?)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .terminate(
+                held,
+                test_fleet.view(),
+                &id("i-1").expect("test value is valid"),
+            )
+            .await
+    })
+    .await?;
 
     assert_eq!(write_order(&harness), [SET_PROTECTION, SET_DESIRED]);
     assert_eq!(harness.desired(FLEET), Some(2));
@@ -234,6 +255,67 @@ async fn release_unprotects_then_lowers_and_the_fake_moves_the_instance_to_the_p
     assert_eq!(harness.warm_ids(FLEET), ["i-1"]);
     assert_eq!(harness.is_protected(FLEET, "i-2"), Some(true));
     assert_eq!(harness.is_protected(FLEET, "i-3"), Some(true));
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_expired_permission_releases_nothing_to_the_warm_pool() -> TestResult {
+    let harness = Harness::start().await?;
+    harness.add_group_with(reuse_group(1, &[("i-1", "InService", true)], true));
+    let test_fleet = fleet(FLEET)?;
+    let instance = id("i-1")?;
+
+    let result = gang_testkit::fence::with_expired_held(async |held| {
+        harness
+            .fleets
+            .terminate(held, test_fleet.view(), &instance)
+            .await
+    })
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(gang_spi::RunError::Failed(AwsError::LeaseLapsed(_)) | gang_spi::RunError::Overran(_))
+    ));
+    assert_eq!(harness.requests(SET_PROTECTION), 0);
+    assert_eq!(write_count(&harness), 0);
+    assert!(harness.warm_ids(FLEET).is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_permission_lapsing_between_two_writes_stops_the_second() -> TestResult {
+    use gang_clock::Clock;
+    use gang_spi::{Fence, RunError};
+    use gang_types::NonZeroDuration;
+    use std::time::Duration;
+
+    let harness = Harness::start().await?;
+    harness.add_group_with(reuse_group(1, &[("i-1", "InService", true)], true));
+    let test_fleet = fleet(FLEET)?;
+    let instance = id("i-1")?;
+    let clock = harness.clock.clone();
+    let (fence, keeper) = Fence::lease(clock.clone(), NonZeroDuration::from_secs(1));
+    keeper.extend_to(clock.monotonic() + Duration::from_secs(10));
+    harness.fake.state().advance_after_protection = Some(clock);
+
+    let result = fence
+        .run(async |held| {
+            harness
+                .fleets
+                .terminate(held, test_fleet.view(), &instance)
+                .await
+        })
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(RunError::Failed(AwsError::LeaseLapsed(_)) | RunError::Overran(_))
+    ));
+    assert_eq!(harness.requests(SET_PROTECTION), 1);
+    assert_eq!(harness.requests(SET_DESIRED), 0);
+    assert_eq!(harness.requests(TERMINATE), 0);
+    assert_eq!(harness.desired(FLEET), Some(1));
     Ok(())
 }
 
@@ -250,16 +332,30 @@ async fn releasing_the_same_instance_twice_lowers_capacity_once() -> TestResult 
         true,
     ));
     let test_fleet = fleet(FLEET)?;
-    harness
-        .fleets
-        .terminate(test_fleet.view(), &id("i-1")?)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .terminate(
+                held,
+                test_fleet.view(),
+                &id("i-1").expect("test value is valid"),
+            )
+            .await
+    })
+    .await?;
     let after_first = write_order(&harness);
 
-    harness
-        .fleets
-        .terminate(test_fleet.view(), &id("i-1")?)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .terminate(
+                held,
+                test_fleet.view(),
+                &id("i-1").expect("test value is valid"),
+            )
+            .await
+    })
+    .await?;
 
     assert_eq!(write_order(&harness), after_first);
     assert_eq!(harness.desired(FLEET), Some(2));
@@ -281,10 +377,17 @@ async fn crash_after_unprotect_before_lowering_completes_with_one_lowering() -> 
     let test_fleet = fleet(FLEET)?;
     harness.fail(SET_DESIRED, THROTTLED);
 
-    let first = harness
-        .fleets
-        .terminate(test_fleet.view(), &id("i-1")?)
-        .await;
+    let first = gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .terminate(
+                held,
+                test_fleet.view(),
+                &id("i-1").expect("test value is valid"),
+            )
+            .await
+    })
+    .await;
 
     assert!(first.is_err());
     assert_eq!(harness.is_protected(FLEET, "i-1"), Some(false));
@@ -292,10 +395,17 @@ async fn crash_after_unprotect_before_lowering_completes_with_one_lowering() -> 
     harness.clear_failure(SET_DESIRED);
     let lowerings_before_retry = harness.requests(SET_DESIRED);
 
-    harness
-        .fleets
-        .terminate(test_fleet.view(), &id("i-1")?)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .terminate(
+                held,
+                test_fleet.view(),
+                &id("i-1").expect("test value is valid"),
+            )
+            .await
+    })
+    .await?;
 
     assert_eq!(harness.requests(SET_PROTECTION), 1);
     assert_eq!(harness.requests(SET_DESIRED) - lowerings_before_retry, 1);
@@ -317,10 +427,17 @@ async fn crash_after_lowering_before_removal_writes_nothing_on_retry() -> TestRe
     ));
     let test_fleet = fleet(FLEET)?;
 
-    harness
-        .fleets
-        .terminate(test_fleet.view(), &id("i-1")?)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .terminate(
+                held,
+                test_fleet.view(),
+                &id("i-1").expect("test value is valid"),
+            )
+            .await
+    })
+    .await?;
 
     assert_eq!(harness.requests(SET_PROTECTION), 0);
     assert_eq!(harness.requests(SET_DESIRED), 0);
@@ -341,25 +458,46 @@ async fn second_release_lost_to_a_failed_lowering_completes_on_retry() -> TestRe
         true,
     ));
     let test_fleet = fleet(FLEET)?;
-    harness
-        .fleets
-        .terminate(test_fleet.view(), &id("i-1")?)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .terminate(
+                held,
+                test_fleet.view(),
+                &id("i-1").expect("test value is valid"),
+            )
+            .await
+    })
+    .await?;
     harness.fail(SET_DESIRED, THROTTLED);
 
-    let lost = harness
-        .fleets
-        .terminate(test_fleet.view(), &id("i-2")?)
-        .await;
+    let lost = gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .terminate(
+                held,
+                test_fleet.view(),
+                &id("i-2").expect("test value is valid"),
+            )
+            .await
+    })
+    .await;
 
     assert!(lost.is_err());
     assert_eq!(harness.desired(FLEET), Some(2));
     harness.clear_failure(SET_DESIRED);
 
-    harness
-        .fleets
-        .terminate(test_fleet.view(), &id("i-2")?)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .terminate(
+                held,
+                test_fleet.view(),
+                &id("i-2").expect("test value is valid"),
+            )
+            .await
+    })
+    .await?;
 
     assert_eq!(harness.desired(FLEET), Some(1));
     assert_eq!(harness.instance_ids(FLEET), ["i-3"]);
@@ -384,10 +522,17 @@ async fn in_flight_scale_out_is_kept_when_releasing_one_member() -> TestResult {
     ));
     let test_fleet = fleet(FLEET)?;
 
-    harness
-        .fleets
-        .terminate(test_fleet.view(), &id("i-1")?)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .terminate(
+                held,
+                test_fleet.view(),
+                &id("i-1").expect("test value is valid"),
+            )
+            .await
+    })
+    .await?;
 
     assert_eq!(harness.desired(FLEET), Some(4));
     Ok(())
@@ -407,13 +552,23 @@ async fn reuse_without_protection_is_a_config_error_with_no_writes() -> TestResu
     let mut into = FleetSupply::default();
 
     let supplied = harness.fleets.supply(test_fleet.view(), &mut into).await;
-    let terminated = harness
-        .fleets
-        .terminate(test_fleet.view(), &id("i-1")?)
-        .await;
+    let terminated = gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .terminate(
+                held,
+                test_fleet.view(),
+                &id("i-1").expect("test value is valid"),
+            )
+            .await
+    })
+    .await;
 
     assert!(matches!(supplied, Err(AwsError::Config { .. })));
-    assert!(matches!(terminated, Err(AwsError::Config { .. })));
+    assert!(matches!(
+        terminated,
+        Err(gang_spi::RunError::Failed(AwsError::Config { .. }))
+    ));
     assert_eq!(write_count(&harness), 0);
     Ok(())
 }
@@ -430,10 +585,17 @@ async fn reuse_flag_false_terminates_atomically() -> TestResult {
     harness.add_group_with(group);
     let test_fleet = fleet(FLEET)?;
 
-    harness
-        .fleets
-        .terminate(test_fleet.view(), &id("i-1")?)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .terminate(
+                held,
+                test_fleet.view(),
+                &id("i-1").expect("test value is valid"),
+            )
+            .await
+    })
+    .await?;
 
     assert_eq!(harness.requests(TERMINATE), 1);
     assert_eq!(harness.requests(SET_PROTECTION), 0);
@@ -456,10 +618,17 @@ async fn pending_member_terminates_atomically_even_in_a_reuse_group() -> TestRes
     ));
     let test_fleet = fleet(FLEET)?;
 
-    harness
-        .fleets
-        .terminate(test_fleet.view(), &id("i-1")?)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .terminate(
+                held,
+                test_fleet.view(),
+                &id("i-1").expect("test value is valid"),
+            )
+            .await
+    })
+    .await?;
 
     assert_eq!(harness.requests(TERMINATE), 1);
     assert_eq!(harness.requests(SET_PROTECTION), 0);
@@ -479,10 +648,17 @@ async fn warmed_member_is_already_leaving_so_terminate_writes_nothing() -> TestR
     ));
     let test_fleet = fleet(FLEET)?;
 
-    harness
-        .fleets
-        .terminate(test_fleet.view(), &id("i-1")?)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .terminate(
+                held,
+                test_fleet.view(),
+                &id("i-1").expect("test value is valid"),
+            )
+            .await
+    })
+    .await?;
 
     assert_eq!(write_count(&harness), 0);
     assert_eq!(harness.desired(FLEET), Some(2));
@@ -501,10 +677,13 @@ async fn warm_start_is_counted_as_capacity_after_a_raise_draws_the_pool_first() 
     harness.add_group_with(group);
     let test_fleet = fleet(FLEET)?;
 
-    harness
-        .fleets
-        .set_desired_capacity(test_fleet.view(), 3)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, test_fleet.view(), 3)
+            .await
+    })
+    .await?;
 
     assert_eq!(harness.desired(FLEET), Some(3));
     assert!(harness.warm_ids(FLEET).is_empty());
@@ -535,15 +714,25 @@ async fn honored_cooldown_applies_to_raises_and_release_lowerings() -> TestResul
         false,
     ));
     let test_fleet = fleet(FLEET)?;
-    harness
-        .fleets
-        .set_desired_capacity(test_fleet.view(), 3)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, test_fleet.view(), 3)
+            .await
+    })
+    .await?;
 
-    harness
-        .fleets
-        .terminate(test_fleet.view(), &id("i-1")?)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .terminate(
+                held,
+                test_fleet.view(),
+                &id("i-1").expect("test value is valid"),
+            )
+            .await
+    })
+    .await?;
 
     let writes: Vec<_> = harness
         .request_log()
@@ -572,17 +761,24 @@ async fn release_is_refused_while_a_pre_existing_unprotected_member_would_enter_
     ));
     let test_fleet = fleet(FLEET)?;
 
-    let result = harness
-        .fleets
-        .terminate(test_fleet.view(), &id("i-2")?)
-        .await;
+    let result = gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .terminate(
+                held,
+                test_fleet.view(),
+                &id("i-2").expect("test value is valid"),
+            )
+            .await
+    })
+    .await;
 
     assert!(matches!(
         result,
-        Err(AwsError::Config {
+        Err(gang_spi::RunError::Failed(AwsError::Config {
             field: "scale_in_protection",
             ..
-        })
+        }))
     ));
     assert_eq!(harness.requests(SET_PROTECTION), 0);
     assert_eq!(harness.requests(SET_DESIRED), 0);
@@ -604,10 +800,17 @@ async fn release_proceeds_once_desired_is_already_lowered_below_live() -> TestRe
     ));
     let test_fleet = fleet(FLEET)?;
 
-    harness
-        .fleets
-        .terminate(test_fleet.view(), &id("i-2")?)
-        .await?;
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .terminate(
+                held,
+                test_fleet.view(),
+                &id("i-2").expect("test value is valid"),
+            )
+            .await
+    })
+    .await?;
 
     assert_eq!(harness.requests(SET_PROTECTION), 1);
     assert_eq!(harness.requests(SET_DESIRED), 1);

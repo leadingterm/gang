@@ -15,7 +15,8 @@
 #         kms_key_arn: arn:aws:kms:us-east-1:000000000000:key/example
 #         plan_bucket: example-plans
 #         plan_prefix: plans
-#         gang_sha256: <SHA-256 of gang-x86_64-unknown-linux-musl, from the release's SHA256SUMS>
+#         runner: ubuntu-24.04-arm
+#         gang_sha256: <SHA-256 of gang-aarch64-unknown-linux-musl, from the release's SHA256SUMS>
 #       permissions:
 #         contents: read
 #         id-token: write

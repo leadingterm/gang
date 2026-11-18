@@ -1,6 +1,6 @@
 # ADR-12: Provisioner, cache and signer are separate domains
 
-Status: Accepted. Replaces the coarse `platform` domain.
+Status: Accepted. Replaces the coarse `platform` domain. Amended by ADR-43 (multiple controllers require a shared cache).
 
 ## Context
 - One `platform` domain bundled compute, storage and signing. Kubernetes and Slurm need to mix them, for example pods with an S3 cache and a KMS signer.

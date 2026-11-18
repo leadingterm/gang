@@ -18,7 +18,7 @@ Status: Accepted; amended: fixed adapters gang-mtls and gang-tls sit at tiers 27
 - A misspelled backend fails at parse time; core crates test against in-memory adapters.
 - Every plugin links into the single `gang` binary, so adding one needs a rebuild.
 - Plugins share data only through ports and host objects the server lends (ADR-05).
-- Ring and tier ordering has no automated check; review enforces it.
+- The `bazel/architecture` workspace test checks that normal and build dependencies between tiered workspace crates point strictly downward according to the tiers in PLAN.
 - Provisioner port names stay provisional until a provisioner beyond `aws` and `local` is specified.
 
 ## Rejected alternatives

@@ -3,11 +3,13 @@
 
 use std::error::Error;
 use std::ffi::OsString;
+use std::io;
 use std::num::NonZeroU32;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use futures::{Stream, StreamExt};
 use gang_config::InputLinks;
 use gang_exec::{Action, ExecError, execute, exit_status};
 use gang_spi::{
@@ -17,8 +19,9 @@ use gang_spi::{
 use gang_testkit::{CallLog, LimitsStep, RecordingLimits, ScriptedSandbox};
 use gang_types::NonZeroBytes;
 use parking_lot::Mutex;
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::sync::oneshot;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 /// A sandbox that records the link counts of the working directory each action starts in, then
 /// starts the action on `inner`.
@@ -84,9 +87,17 @@ fn action<'a>(
     })
 }
 
-/// A channel that never receives a termination: its sender is dropped.
-fn no_terminations() -> UnboundedReceiver<Termination> {
+fn termination_channel() -> (
+    UnboundedSender<Termination>,
+    impl Stream<Item = io::Result<Termination>> + Unpin,
+) {
     let (sender, receiver) = mpsc::unbounded_channel();
+    (sender, UnboundedReceiverStream::new(receiver).map(Ok))
+}
+
+/// A channel that never receives a termination: its sender is dropped.
+fn no_terminations() -> impl Stream<Item = io::Result<Termination>> + Unpin {
+    let (sender, receiver) = termination_channel();
     drop(sender);
     receiver
 }
@@ -299,7 +310,7 @@ async fn pending_termination_prevents_start_with_and_without_limits() -> Result<
             let argv = [OsString::from("cmd")];
             let directory = tempfile::tempdir()?;
             let action = action(&argv, directory.path(), directory.path())?;
-            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let (sender, mut receiver) = termination_channel();
             sender.send(termination)?;
 
             let outcome = execute(
@@ -330,11 +341,45 @@ async fn pending_termination_prevents_start_with_and_without_limits() -> Result<
 }
 
 #[tokio::test]
+async fn signal_stream_error_prevents_start_and_leaves_scope() -> Result<(), Box<dyn Error>> {
+    for with_limits in [false, true] {
+        let log = CallLog::default();
+        let sandbox = ScriptedSandbox::exiting(&log, ActionExecutionOutcome::Exited(0));
+        let limits_port = RecordingLimits::new(&log);
+        let argv = [OsString::from("cmd")];
+        let directory = tempfile::tempdir()?;
+        let action = action(&argv, directory.path(), directory.path())?;
+        let mut terminations = futures::stream::iter([Err(io::Error::other("signal read failed"))]);
+
+        let result = execute(
+            &sandbox,
+            with_limits.then_some(&limits_port),
+            InputLinks::Keep,
+            &action,
+            &mut terminations,
+            || {
+                log.record("leave_action_group");
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(ExecError::Signals(_))));
+        if with_limits {
+            assert_eq!(log.calls(), ["limits.enter", "limits.leave"]);
+        } else {
+            assert!(log.calls().is_empty());
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn an_action_in_its_own_group_keeps_gang_exec_in_the_action_group()
 -> Result<(), Box<dyn Error>> {
     for with_limits in [false, true] {
         let log = CallLog::default();
-        let (sender, mut terminations) = mpsc::unbounded_channel();
+        let (sender, mut terminations) = termination_channel();
         let relayed = Arc::new(Mutex::new(Vec::new()));
         let sandbox = Relaying {
             sender,
@@ -625,7 +670,7 @@ async fn break_failure_never_starts_the_sandbox() -> Result<(), Box<dyn Error>> 
 #[tokio::test]
 async fn a_termination_while_waiting_is_relayed_and_the_action_outcome_is_reported()
 -> Result<(), Box<dyn Error>> {
-    let (sender, mut terminations) = mpsc::unbounded_channel();
+    let (sender, mut terminations) = termination_channel();
     let relayed = Arc::new(Mutex::new(Vec::new()));
     let sandbox = Relaying {
         sender,
@@ -654,7 +699,7 @@ async fn a_termination_while_waiting_is_relayed_and_the_action_outcome_is_report
 #[tokio::test]
 async fn a_relayed_termination_still_leaves_the_limits_scope() -> Result<(), Box<dyn Error>> {
     let log = CallLog::default();
-    let (sender, mut terminations) = mpsc::unbounded_channel();
+    let (sender, mut terminations) = termination_channel();
     let relayed = Arc::new(Mutex::new(Vec::new()));
     let sandbox = Relaying {
         sender,

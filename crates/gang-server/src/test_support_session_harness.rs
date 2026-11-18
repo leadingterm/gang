@@ -41,8 +41,6 @@ pub struct HarnessOptions {
     pub device: bool,
     /// How long a sign-in cookie and a pending sign-in last.
     pub ttl: NonZeroDuration,
-    /// How many sign-ins may be pending at once.
-    pub max_pending: usize,
     /// The absolute lifetime of a browser session.
     pub session_max_age: SessionMaxAge,
     /// How long a renewal grant is shared.
@@ -56,7 +54,6 @@ impl Default for HarnessOptions {
             login: true,
             device: false,
             ttl: NonZeroDuration::from_mins(10),
-            max_pending: 8,
             session_max_age: SessionMaxAge::from_units(43_200),
             renewal_reuse: NonZeroDuration::from_mins(1),
         }
@@ -131,14 +128,11 @@ where
                 secret: ClientSecret::new("dashboard-secret-value"),
             },
             ttl: options.ttl,
-            max_pending: NonZeroUsize::new(options.max_pending)
-                .expect("test max_pending is non-zero"),
             session_max_age: options.session_max_age,
             renewal_reuse: options.renewal_reuse,
             device: options.device.then(|| DeviceSettings {
                 ttl: DeviceCodeTtl::from_units(600),
                 poll_interval: DevicePollInterval::from_units(5),
-                max_pending: NonZeroUsize::new(1024).expect("1024 is non-zero"),
             }),
         });
         let limiter = Arc::new(RateLimiter::new(

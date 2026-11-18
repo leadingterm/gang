@@ -57,6 +57,7 @@ type Worker = LocalWorker<WorkerApiClientWrapper, RunningActionsManagerImpl>;
 ///
 /// A worker whose certificate the controller refuses as revoked stops like on `stop` and fails
 /// with [`NativeLinkEmbedError::CertificateRevoked`]; it never reconnects.
+/// An observed revocation takes precedence over a concurrent stop or clean worker completion.
 pub(crate) async fn run(
     config: &NativeLinkConfig,
     endpoint: &Url,
@@ -78,11 +79,12 @@ pub(crate) async fn run(
     // The worker declines new actions once it receives the guard; it drops its clone when done.
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<ShutdownGuard>(1);
     let mut running = pin!(worker.run(shutdown_rx));
-    let revocation = tokio::select! {
-        biased;
-        result = &mut running => return result.map_err(NativeLinkEmbedError::native("worker")),
-        () = &mut stop => None,
-        revoked = revoked.raised() => Some(revoked),
+    let revocation = match wait_for_exit(&mut running, &mut stop, revoked.raised()).await {
+        WorkerExit::Finished(result) => {
+            return result.map_err(NativeLinkEmbedError::native("worker"));
+        }
+        WorkerExit::Stopped => None,
+        WorkerExit::Revoked(revoked) => Some(revoked),
     };
     // The send fails only once the worker has ended, when it has no action left to decline.
     let _ = shutdown_tx.send(ShutdownGuard::default());
@@ -100,6 +102,27 @@ pub(crate) async fn run(
     revocation.map_or(Ok(()), |revoked| {
         Err(NativeLinkEmbedError::CertificateRevoked(revoked))
     })
+}
+
+/// Why the running worker ended or was asked to shut down.
+enum WorkerExit<R> {
+    Finished(Result<(), Error>),
+    Stopped,
+    Revoked(R),
+}
+
+/// Preserves terminal revocation, then worker completion, before an ordinary stop.
+async fn wait_for_exit<R>(
+    running: impl Future<Output = Result<(), Error>>,
+    stop: impl Future<Output = ()>,
+    revoked: impl Future<Output = R>,
+) -> WorkerExit<R> {
+    tokio::select! {
+        biased;
+        revoked = revoked => WorkerExit::Revoked(revoked),
+        result = running => WorkerExit::Finished(result),
+        () = stop => WorkerExit::Stopped,
+    }
 }
 
 /// Builds the worker's stores, a fresh `work_directory`, the actions manager, and the local
@@ -163,8 +186,8 @@ async fn build(
     Ok((local, manager))
 }
 
-/// How the worker executes actions: Gang's entrypoint, environment and enforcement, and every
-/// other setting as `NativeLink` leaves it unset.
+/// How the worker executes actions: Gang's entrypoint, environment, enforcement and one-shot
+/// execution, with other settings left at `NativeLink` defaults.
 fn execution(worker: &LocalWorkerConfig, tuning: &WorkerTuning) -> ExecutionConfiguration {
     ExecutionConfiguration {
         resource_enforcement: worker
@@ -175,7 +198,11 @@ fn execution(worker: &LocalWorkerConfig, tuning: &WorkerTuning) -> ExecutionConf
         set_tmpdir: worker.set_tmpdir,
         entrypoint: Some(worker.entrypoint.clone()),
         additional_environment: worker.additional_environment.clone(),
-        persistent_workers: PersistentWorkersSettings::default(),
+        // The pooled process protocol bypasses Gang's per-action entrypoint; actions run one-shot.
+        persistent_workers: PersistentWorkersSettings {
+            enabled: false,
+            ..PersistentWorkersSettings::default()
+        },
         ..ExecutionConfiguration::default()
     }
 }
@@ -321,6 +348,7 @@ async fn fresh_directory(directory: &str) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::future::{pending, ready};
     use std::num::NonZeroU32;
     use std::path::PathBuf;
 
@@ -331,6 +359,47 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[tokio::test]
+    async fn a_ready_revocation_wins_a_simultaneously_ready_stop() {
+        assert!(matches!(
+            wait_for_exit(pending::<Result<(), Error>>(), ready(()), ready("revoked")).await,
+            WorkerExit::Revoked("revoked")
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_ready_revocation_wins_a_simultaneously_ready_worker_completion() {
+        assert!(matches!(
+            wait_for_exit(ready(Ok(())), ready(()), ready("revoked")).await,
+            WorkerExit::Revoked("revoked")
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_ready_worker_error_wins_a_simultaneously_ready_stop() {
+        let error = nativelink_error::make_err!(Code::Internal, "worker failed");
+        assert!(matches!(
+            wait_for_exit(ready(Err(error)), ready(()), pending::<()>()).await,
+            WorkerExit::Finished(Err(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_ready_stop_wins_when_other_futures_are_pending() {
+        assert!(matches!(
+            wait_for_exit(pending::<Result<(), Error>>(), ready(()), pending::<()>()).await,
+            WorkerExit::Stopped
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_ready_worker_completion_wins_when_other_futures_are_pending() {
+        assert!(matches!(
+            wait_for_exit(ready(Ok(())), pending::<()>(), pending::<()>()).await,
+            WorkerExit::Finished(Ok(()))
+        ));
+    }
 
     #[test]
     fn worker_tls_files_report_read_and_pem_errors() {
