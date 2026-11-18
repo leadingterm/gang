@@ -41,7 +41,7 @@ run "terminates_tls_with_http2_and_the_validated_certificate" {
   }
 
   assert {
-    condition     = aws_lb_listener.this.certificate_arn == aws_acm_certificate_validation.this.certificate_arn && aws_lb_listener.this.default_action[0].target_group_arn == aws_lb_target_group.this.arn
+    condition     = aws_lb_listener.this.certificate_arn == aws_acm_certificate_validation.this.certificate_arn && aws_lb_listener.this.default_action[0].target_group_arn == aws_lb_target_group.tcp.arn
     error_message = "The listener must use the validated certificate and forward to the controller target group."
   }
 
@@ -55,12 +55,12 @@ run "forwards_tls_to_the_controller_with_the_client_address" {
   command = apply
 
   assert {
-    condition     = aws_lb_target_group.this.protocol == "TLS" && aws_lb_target_group.this.port == 443 && aws_lb_target_group.this.target_type == "instance" && aws_lb_target_group.this.preserve_client_ip == "true"
+    condition     = aws_lb_target_group.tcp.protocol == "TLS" && aws_lb_target_group.tcp.port == 443 && aws_lb_target_group.tcp.target_type == "instance" && aws_lb_target_group.tcp.preserve_client_ip == "true"
     error_message = "The target group must forward TLS to instance targets on 443 while preserving client addresses."
   }
 
   assert {
-    condition     = aws_lb_target_group.this.health_check[0].protocol == "TCP" && aws_lb_target_group_attachment.this.target_id == var.controller_instance_id
+    condition     = aws_lb_target_group.tcp.health_check[0].protocol == "TCP" && aws_lb_target_group_attachment.this.target_id == var.controller_instance_id
     error_message = "The controller instance must be attached to a target group with TCP health checks."
   }
 }

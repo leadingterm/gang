@@ -85,9 +85,9 @@ resource "aws_lb" "this" {
   })
 }
 
-resource "aws_lb_target_group" "this" {
-  # A distinct name replaces an HTTP-health target group on a schema-compatible rollback.
-  # The AWS provider otherwise retains its computed HTTP matcher when planning TCP.
+resource "aws_lb_target_group" "tcp" {
+  # A fresh address and name avoid carrying computed HTTP matcher state into TCP.
+  # Deliberately do not move the prior HTTP-health target group into this resource.
   name        = "${var.name}-tcp"
   port        = var.port
   protocol    = "TLS"
@@ -109,7 +109,7 @@ resource "aws_lb_target_group" "this" {
 }
 
 resource "aws_lb_target_group_attachment" "this" {
-  target_group_arn = aws_lb_target_group.this.arn
+  target_group_arn = aws_lb_target_group.tcp.arn
   target_id        = var.controller_instance_id
   port             = var.port
 }
@@ -126,7 +126,7 @@ resource "aws_lb_listener" "this" {
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.this.arn
+    target_group_arn = aws_lb_target_group.tcp.arn
   }
 
   tags = merge(var.tags, {
