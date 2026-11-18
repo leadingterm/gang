@@ -45,8 +45,9 @@ mod state;
 pub mod time;
 
 pub use build::{
-    ActionTime, Build, BuildState, CacheCounts, Executions, ListBuildsResponse, MissedTarget,
-    MnemonicUsage, SlowAction, Timeline, TimelineBucket, Usage,
+    ActionTime, Build, BuildState, CacheCounts, Executions, IngestBuildsRequest,
+    IngestBuildsResponse, IngestCall, IngestLoss, IngestOrigin, IngestOutcome, IngestRpc,
+    ListBuildsResponse, MissedTarget, MnemonicUsage, SlowAction, Timeline, TimelineBucket, Usage,
 };
 pub use certificate::{Certificate, CreateCertificateRequest};
 pub use device::{

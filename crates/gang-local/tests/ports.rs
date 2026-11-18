@@ -7,8 +7,8 @@ use gang_local::{
     LocalFleetOptions,
 };
 use gang_spi::{
-    CertificateSignerPort, FleetSupply, NodeLifecyclePort, Plugin, PluginContext, PortError,
-    ProvisionerPort, ScratchVolumePort, WorkloadCredentialPort,
+    CertificateSignerPort, FleetSupply, LeaseLapsed, NodeLifecyclePort, Plugin, PluginContext,
+    PortError, ProvisionerPort, RunError, ScratchVolumePort, WorkloadCredentialPort,
 };
 use gang_types::{Bytes, Fleet, FleetName, InstanceId, Isa, Resources};
 use p256::ecdsa::DerSignature;
@@ -182,5 +182,49 @@ async fn supply_of_an_empty_fleet_is_empty() -> Result<(), Box<dyn std::error::E
 
     assert_eq!(supply.desired, 0);
     assert_eq!(supply.instances.len(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_port_refuses_changes_with_an_expired_permission()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let state = dir.path().join("state");
+    let local = build_local(&state)?;
+    let name = FleetName::try_new("local-workers")?;
+    let id = InstanceId::try_new("local-1")?;
+    let mut supply = FleetSupply::default();
+    local.supply(fleet(&name), &mut supply).await?;
+    assert_eq!(supply.desired, 0);
+
+    let results = [
+        gang_testkit::fence::with_expired_held(async |held| {
+            local.set_desired_capacity(held, fleet(&name), 1).await
+        })
+        .await,
+        gang_testkit::fence::with_expired_held(async |held| {
+            local.terminate(held, fleet(&name), &id).await
+        })
+        .await,
+        gang_testkit::fence::with_expired_held(async |held| {
+            local.converge(held, fleet(&name)).await
+        })
+        .await,
+    ];
+    for result in results {
+        match result {
+            Err(RunError::Failed(PortError::Unavailable(cause))) => {
+                assert!(cause.is::<LeaseLapsed>());
+            }
+            Err(RunError::Overran(_)) => {}
+            other => panic!("expected a lapsed permission or overrun, got {other:?}"),
+        }
+    }
+
+    local.supply(fleet(&name), &mut supply).await?;
+    assert_eq!(supply.desired, 0);
+    assert!(supply.instances.is_empty());
+    assert_eq!(std::fs::read_dir(state.join("fleets"))?.count(), 0);
+    assert_eq!(std::fs::read_dir(state.join("instances"))?.count(), 0);
     Ok(())
 }

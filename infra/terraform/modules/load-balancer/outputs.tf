@@ -26,3 +26,38 @@ output "security_group_id" {
   description = "Security group ID of the load balancer."
   value       = aws_security_group.this.id
 }
+
+output "serve_target_group_arn" {
+  description = "ARN of the public serve target group."
+  value       = aws_lb_target_group.this.arn
+}
+
+output "execute_target_group_arn" {
+  description = "ARN of the public execution target group, or null when disabled."
+  value       = one(aws_lb_target_group.execute[*].arn)
+}
+
+output "internal_serve_target_group_arn" {
+  description = "ARN of the internal serve target group, or null when disabled."
+  value       = var.execution ? aws_lb_target_group.internal["serve"].arn : null
+}
+
+output "internal_execute_target_group_arn" {
+  description = "ARN of the internal execution target group, or null when disabled."
+  value       = var.execution ? aws_lb_target_group.internal["execute"].arn : null
+}
+
+output "workers_target_group_arn" {
+  description = "ARN of the internal worker target group, or null when disabled."
+  value       = var.execution ? aws_lb_target_group.internal["workers"].arn : null
+}
+
+output "internal_dns_name" {
+  description = "DNS name of the internal load balancer, or null when disabled."
+  value       = one(aws_lb.internal[*].dns_name)
+}
+
+output "health_port" {
+  description = "Health listener port checked by the public serve target group."
+  value       = tonumber(aws_lb_target_group.this.health_check[0].port)
+}

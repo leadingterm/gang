@@ -12,6 +12,7 @@
 //!   exit 0.
 //! - `hang/-`: read stdin to EOF, then block until killed.
 //! - Invoked as `<fake> hang`, block until killed without reading stdin.
+//! - Invoked as `<fake> proof <text>`, write the UTF-8 text to stdout without reading stdin.
 //! - Anything else, or EOF before the mode and argument are known: write an error to stderr and
 //!   exit 2.
 
@@ -91,6 +92,15 @@ fn main() {
         loop {
             std::thread::park();
         }
+    }
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == "proof") {
+        let text = std::env::args_os()
+            .nth(2)
+            .unwrap_or_else(|| fail("missing proof text"))
+            .into_string()
+            .unwrap_or_else(|_| fail("proof text is not UTF-8"));
+        write_stdout(text.as_bytes());
+        return;
     }
     let mut stdin = std::io::stdin().lock();
     let mut request = Vec::new();

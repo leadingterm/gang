@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { clock, day, duration, gib, humanize, policyDuration, splitTarget, sum, workerInstance } from "../src/format.ts";
+import { clock, day, duration, gib, humanize, splitTail, sum, workerInstance } from "../src/format.ts";
 
 const AT = Date.UTC(2026, 0, 15, 10, 9, 30);
 const WORKER = "i-0abc123-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b";
@@ -20,16 +20,12 @@ test("duration is coarse and never negative", () => {
   for (const [ms, text] of cases) assert.equal(duration(ms), text, `${ms} ms`);
 });
 
-test("policy durations read in whole minutes when exact", () => {
-  assert.equal(policyDuration("600s"), "10m");
-  assert.equal(policyDuration("90s"), "90s");
-  assert.equal(policyDuration("45s"), "45s");
-});
 
-test("a target splits at its last colon", () => {
-  assert.deepEqual(splitTarget("//storage/blob:blob_store"), ["//storage/blob", ":blob_store"]);
-  assert.deepEqual(splitTarget("//a:b:c"), ["//a:b", ":c"]);
-  assert.deepEqual(splitTarget("plain"), ["", "plain"]);
+test("an identifier splits at its last colon", () => {
+  assert.deepEqual(splitTail("//storage/blob:blob_store"), ["//storage/blob", ":blob_store"]);
+  assert.deepEqual(splitTail("//a:b:c"), ["//a:b", ":c"]);
+  assert.deepEqual(splitTail("plain"), ["", "plain"]);
+  assert.deepEqual(splitTail(":x"), ["", ":x"]);
 });
 
 test("worker labels distinguish instances and preserve ids without an instance", () => {

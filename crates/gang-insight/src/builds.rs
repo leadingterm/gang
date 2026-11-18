@@ -51,7 +51,7 @@ impl Builds {
     pub fn lose(&mut self, at: Timestamp, key: &BuildKey, count: u64) {
         let record = self.record(at, key);
         record.touch(at);
-        record.build.unrecorded += count;
+        record.build.unrecorded = record.build.unrecorded.saturating_add(count);
     }
 
     /// Returns the full view of a build as of `now`.
@@ -63,25 +63,55 @@ impl Builds {
         Some(build)
     }
 
-    /// Returns matching basic views, latest activity first and ties by name.
+    /// Returns matching basic views ordered by latest activity, then ascending ID.
+    ///
+    /// A cursor excludes the specified row and everything before it in that order.
+    /// The boolean indicates whether more matching rows remain after this page,
+    /// including when `limit` is zero.
     #[must_use]
-    pub fn list(&self, filter: &BuildFilter, now: Timestamp) -> Vec<Build> {
-        let mut builds = Vec::with_capacity(self.records.len());
-        for record in self
+    pub fn list(
+        &self,
+        filter: &BuildFilter,
+        now: Timestamp,
+        cursor: Option<(Timestamp, BuildId)>,
+        limit: usize,
+    ) -> (Vec<Build>, bool) {
+        let mut records: Vec<&Record> = self
             .records
             .values()
-            .filter(|record| filter.matches(&record.build))
-        {
+            .filter(|record| {
+                filter.matches(&record.build)
+                    && match cursor {
+                        Some((time, id)) => {
+                            record.build.last_active_time < time
+                                || (record.build.last_active_time == time && record.id > id)
+                        }
+                        None => true,
+                    }
+            })
+            .collect();
+        let compare = |a: &&Record, b: &&Record| {
+            b.build
+                .last_active_time
+                .cmp(&a.build.last_active_time)
+                .then_with(|| a.id.cmp(&b.id))
+        };
+        let more = records.len() > limit;
+        if limit == 0 {
+            records.clear();
+        } else if more {
+            records.select_nth_unstable_by(limit, &compare);
+            records.truncate(limit);
+        }
+        records.sort_unstable_by(compare);
+
+        let mut builds = Vec::with_capacity(records.len());
+        for record in records {
             let mut build = Build::default();
             self.copy_basic(&record.build, now, &mut build);
             builds.push(build);
         }
-        builds.sort_by(|a, b| {
-            b.last_active_time
-                .cmp(&a.last_active_time)
-                .then_with(|| a.name.cmp(&b.name))
-        });
-        builds
+        (builds, more)
     }
 
     /// Overwrites `into` with recent basic views ordered by name, reusing row buffers.

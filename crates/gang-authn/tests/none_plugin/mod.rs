@@ -2,12 +2,14 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gang_authn::{Anonymous, NoneConfig};
 use gang_clock::Timestamp;
 use gang_spi::{
-    AuthenticationPort, Capabilities, CertificateIssue, CertificateTarget, ClientCertificates,
-    CredentialLifecyclePort, Peer, Plugin, PluginContext, PortError, Scheme, TokenIssue,
+    AuthenticationHost, AuthenticationPort, Capabilities, CertificateIssue, CertificateTarget,
+    ClientCertificates, CredentialLifecyclePort, Peer, Plugin, PluginContext, PortError, Scheme,
+    TokenIssue,
 };
 use gang_types::{CertSerial, CertificateRequestPem, Proof, ProviderName};
 
@@ -214,6 +216,7 @@ async fn issue_session_is_unsupported() {
                 provider: &provider,
                 proof: &proof,
             },
+            host.now() + Duration::from_mins(10),
         )
         .await
         .expect_err("the none plugin mints no session");

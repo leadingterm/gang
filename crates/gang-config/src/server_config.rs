@@ -94,6 +94,52 @@ const DEFAULT_MAX_REQUEST_SIZE: Bytes = Bytes::kib(64);
 /// The default time a control API request may take before it is abandoned: 30 seconds.
 const DEFAULT_REQUEST_TIMEOUT: NonZeroDuration = NonZeroDuration::from_secs(30);
 
+/// The default number of health connections open at once: 64.
+const DEFAULT_HEALTH_MAX_CONNECTIONS: NonZeroUsize = NonZeroUsize::new(64).expect("64 is non-zero");
+
+/// The smallest read buffer the HTTP/1 server accepts: 8 KiB.
+const MIN_HEALTH_MAX_HEADER_SIZE: Bytes = Bytes::kib(8);
+
+/// The default largest request head a health connection may send: 8 KiB.
+const DEFAULT_HEALTH_MAX_HEADER_SIZE: Bytes = Bytes::kib(8);
+
+/// Default controller leadership lease lifetime.
+const DEFAULT_LEADERSHIP_TTL: NonZeroDuration = NonZeroDuration::from_secs(10);
+/// Default interval between leadership renewals.
+const DEFAULT_LEADERSHIP_RENEW_INTERVAL: NonZeroDuration = NonZeroDuration::from_secs(3);
+/// Default minimum remaining validity before a provisioner mutation.
+const DEFAULT_LEADERSHIP_CALL_TIMEOUT: NonZeroDuration = NonZeroDuration::from_secs(2);
+/// Default allowance for clock skew between controllers.
+const DEFAULT_LEADERSHIP_CLOCK_SKEW: Duration = Duration::from_secs(2);
+/// Default interval between revocation refreshes.
+const DEFAULT_REVOCATION_REFRESH_INTERVAL: NonZeroDuration = NonZeroDuration::from_secs(5);
+
+/// Controller leadership lease timing settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LeadershipConfig {
+    /// Lease lifetime. Defaults to ten seconds.
+    pub ttl: NonZeroDuration,
+    /// Interval between renewals. Defaults to three seconds.
+    pub renew_interval: NonZeroDuration,
+    /// Minimum validity required before a provisioner mutation. Defaults to two seconds.
+    pub call_timeout: NonZeroDuration,
+    /// Allowance for clock skew. Defaults to two seconds.
+    #[serde(with = "gang_types::duration")]
+    pub clock_skew: Duration,
+}
+
+impl Default for LeadershipConfig {
+    fn default() -> Self {
+        Self {
+            ttl: DEFAULT_LEADERSHIP_TTL,
+            renew_interval: DEFAULT_LEADERSHIP_RENEW_INTERVAL,
+            call_timeout: DEFAULT_LEADERSHIP_CALL_TIMEOUT,
+            clock_skew: DEFAULT_LEADERSHIP_CLOCK_SKEW,
+        }
+    }
+}
+
 /// Settings of `gang server`. The section is required. Every field except the TLS trust
 /// domain has a default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +191,16 @@ pub struct ServerConfig {
     /// Limits on the routes that are open to anyone. Defaults to the bucket and tracking values
     /// documented on `RateLimitConfig`.
     pub rate_limit: RateLimitConfig,
+    /// Controller leadership timing. Defaults to the values on [`LeadershipConfig`].
+    pub leadership: LeadershipConfig,
+    /// Interval between revocation refreshes. Defaults to five seconds.
+    pub revocation_refresh_interval: NonZeroDuration,
+    /// How many health listener connections may be open at once; further connections wait in the
+    /// OS backlog. Defaults to 64.
+    pub health_max_connections: NonZeroUsize,
+    /// The largest request head a health listener connection may send, at least 8 KiB. Defaults
+    /// to 8 KiB.
+    pub health_max_header_size: Bytes,
 }
 
 /// The `[server]` table as written.
@@ -171,6 +227,10 @@ struct RawServer {
     max_request_size: Bytes,
     request_timeout: NonZeroDuration,
     rate_limit: RateLimitConfig,
+    leadership: LeadershipConfig,
+    revocation_refresh_interval: NonZeroDuration,
+    health_max_connections: NonZeroUsize,
+    health_max_header_size: Bytes,
 }
 
 impl Default for RawServer {
@@ -193,25 +253,43 @@ impl Default for RawServer {
             max_request_size: DEFAULT_MAX_REQUEST_SIZE,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             rate_limit: RateLimitConfig::default(),
+            leadership: LeadershipConfig::default(),
+            revocation_refresh_interval: DEFAULT_REVOCATION_REFRESH_INTERVAL,
+            health_max_connections: DEFAULT_HEALTH_MAX_CONNECTIONS,
+            health_max_header_size: DEFAULT_HEALTH_MAX_HEADER_SIZE,
         }
     }
 }
 
-/// The `tls` transport was selected without a `trust_domain`.
+/// A `[server]` table that names no valid server configuration.
 #[derive(Debug, thiserror::Error)]
-#[error("trust_domain is required when transport is \"tls\"")]
-pub(crate) struct MissingTrustDomain;
+pub(crate) enum InvalidServer {
+    /// The `tls` transport was selected without a `trust_domain`.
+    #[error("trust_domain is required when transport is \"tls\"")]
+    MissingTrustDomain,
+    /// The health header size is below the HTTP/1 server's smallest read buffer, or does not
+    /// fit in memory.
+    #[error(
+        "health_max_header_size must be at least {min} and fit in memory, not {0}",
+        min = MIN_HEALTH_MAX_HEADER_SIZE
+    )]
+    HealthMaxHeaderSize(Bytes),
+}
 
 impl TryFrom<RawServer> for ServerConfig {
-    type Error = MissingTrustDomain;
+    type Error = InvalidServer;
 
     fn try_from(raw: RawServer) -> Result<Self, Self::Error> {
         let transport = match (raw.transport, raw.trust_domain) {
             (ServerTransport::Tls, Some(trust_domain)) => Transport::Tls { trust_domain },
-            (ServerTransport::Tls, None) => return Err(MissingTrustDomain),
+            (ServerTransport::Tls, None) => return Err(InvalidServer::MissingTrustDomain),
             // A trust domain is ignored under plaintext.
             (ServerTransport::Plaintext, _) => Transport::Plaintext,
         };
+        let header_size = raw.health_max_header_size;
+        if header_size < MIN_HEALTH_MAX_HEADER_SIZE || usize::try_from(header_size.get()).is_err() {
+            return Err(InvalidServer::HealthMaxHeaderSize(header_size));
+        }
         Ok(Self {
             transport,
             certificate_ttl: raw.certificate_ttl,
@@ -229,6 +307,10 @@ impl TryFrom<RawServer> for ServerConfig {
             max_request_size: raw.max_request_size,
             request_timeout: raw.request_timeout,
             rate_limit: raw.rate_limit,
+            leadership: raw.leadership,
+            revocation_refresh_interval: raw.revocation_refresh_interval,
+            health_max_connections: raw.health_max_connections,
+            health_max_header_size: raw.health_max_header_size,
         })
     }
 }
@@ -257,6 +339,10 @@ impl From<ServerConfig> for RawServer {
             max_request_size: config.max_request_size,
             request_timeout: config.request_timeout,
             rate_limit: config.rate_limit,
+            leadership: config.leadership,
+            revocation_refresh_interval: config.revocation_refresh_interval,
+            health_max_connections: config.health_max_connections,
+            health_max_header_size: config.health_max_header_size,
         }
     }
 }

@@ -1,7 +1,7 @@
 //! Bounded, non-blocking build observation channel.
 
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -138,11 +138,14 @@ impl Observation {
 }
 /// An observation or a notification that losses are ready to drain.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Delivery {
-    /// An observation to fold.
-    Observation(Box<Observation>),
-    /// Losses were counted; drain them with `take_lost`.
-    Losses,
+pub struct Delivery(Option<Observation>);
+
+impl Delivery {
+    /// Returns the owned observation, or `None` if losses are ready to drain with `take_lost`.
+    #[must_use]
+    pub fn into_observation(self) -> Option<Observation> {
+        self.0
+    }
 }
 
 #[derive(Debug)]
@@ -154,17 +157,33 @@ struct Lost {
     notify: Notify,
 }
 impl Lost {
-    fn record(&self, key: &BuildKey) {
+    fn add(&self, key: &BuildKey, count: u64) {
         let mut each = self.each.lock();
-        if let Some(count) = each.get_mut(key) {
-            *count = count.saturating_add(1);
+        if let Some(existing) = each.get_mut(key) {
+            *existing = existing.saturating_add(count);
         } else if each.len() < self.capacity {
-            each.insert(key.clone(), 1);
+            each.insert(key.clone(), count);
         } else {
-            self.unattributed.fetch_add(1, Ordering::Relaxed);
+            self.add_unattributed_locked(count);
         }
         self.dirty.store(true, Ordering::Release);
         self.notify.notify_one();
+    }
+
+    fn add_unattributed(&self, count: u64) {
+        let _each = self.each.lock();
+        self.add_unattributed_locked(count);
+        self.dirty.store(true, Ordering::Release);
+        self.notify.notify_one();
+    }
+
+    // The caller holds `each`, so a drain cannot clear dirty between the count and notification.
+    fn add_unattributed_locked(&self, count: u64) {
+        let _ = self
+            .unattributed
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_add(count))
+            });
     }
 }
 
@@ -206,8 +225,19 @@ impl ObservationSink {
     /// Sends without waiting, or counts the observation lost if the channel is full or closed.
     pub fn record(&self, observation: Observation) {
         if let Err(error) = self.sender.try_send(observation) {
-            self.lost.record(&error.into_inner().origin().build);
+            self.lost.add(&error.into_inner().origin().build, 1);
         }
+    }
+
+    /// Counts lost observations for a build, or as unattributed when the build limit is reached.
+    /// Counts saturate at `u64::MAX` and are recorded even if the receiver is closed.
+    pub fn lose(&self, key: &BuildKey, count: NonZeroU64) {
+        self.lost.add(key, count.get());
+    }
+
+    /// Counts unattributed lost observations, saturating at `u64::MAX`.
+    pub fn lose_unattributed(&self, count: NonZeroU64) {
+        self.lost.add_unattributed(count.get());
     }
 }
 
@@ -218,8 +248,8 @@ impl Observations {
             biased;
             observation = self.receiver.recv() => {
                 match observation {
-                    Some(observation) => Some(Delivery::Observation(Box::new(observation))),
-                    None if self.lost.dirty.load(Ordering::Acquire) => Some(Delivery::Losses),
+                    Some(observation) => Some(Delivery(Some(observation))),
+                    None if self.lost.dirty.load(Ordering::Acquire) => Some(Delivery(None)),
                     None => None,
                 }
             }
@@ -230,7 +260,7 @@ impl Observations {
                     }
                     self.lost.notify.notified().await;
                 }
-            } => Some(Delivery::Losses),
+            } => Some(Delivery(None)),
         }
     }
 
@@ -304,10 +334,13 @@ mod tests {
             let next = observations.next();
             tokio::pin!(next);
             assert!(futures::poll!(&mut next).is_pending());
-            sink.lost.record(&observation.origin().build);
+            sink.lose(
+                &observation.origin().build,
+                NonZeroU64::new(3).expect("nonzero"),
+            );
             assert_eq!(
                 futures::poll!(&mut next),
-                std::task::Poll::Ready(Some(Delivery::Losses))
+                std::task::Poll::Ready(Some(Delivery(None)))
             );
         }
         let mut counts = HashMap::new();
@@ -317,7 +350,79 @@ mod tests {
             }),
             0
         );
-        assert_eq!(counts.get(&observation.origin().build), Some(&1));
+        assert_eq!(counts.get(&observation.origin().build), Some(&3));
+    }
+
+    #[tokio::test]
+    async fn counted_unattributed_loss_notifies_a_waiting_consumer() {
+        let (sink, mut observations) =
+            ObservationSink::channel(NonZeroUsize::MIN, NonZeroUsize::MIN);
+        {
+            let next = observations.next();
+            tokio::pin!(next);
+            assert!(futures::poll!(&mut next).is_pending());
+            sink.lose_unattributed(NonZeroU64::new(7).expect("nonzero"));
+            assert_eq!(
+                futures::poll!(&mut next),
+                std::task::Poll::Ready(Some(Delivery(None)))
+            );
+        }
+        assert_eq!(observations.take_lost(|_, _| panic!("unexpected key")), 7);
+        assert_eq!(observations.take_lost(|_, _| panic!("loss repeated")), 0);
+    }
+
+    #[test]
+    fn counted_losses_add_overflow_and_drain_once() {
+        let (sink, observations) = ObservationSink::channel(NonZeroUsize::MIN, NonZeroUsize::MIN);
+        let a = call("a");
+        let b = call("b");
+        sink.lose(&a.origin().build, NonZeroU64::new(3).expect("nonzero"));
+        sink.lose(&a.origin().build, NonZeroU64::new(4).expect("nonzero"));
+        sink.lose(&b.origin().build, NonZeroU64::new(5).expect("nonzero"));
+        let mut counts = HashMap::new();
+        assert_eq!(
+            observations.take_lost(|key, count| {
+                counts.insert(key, count);
+            }),
+            5
+        );
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts.get(&a.origin().build), Some(&7));
+        assert_eq!(observations.take_lost(|_, _| panic!("loss repeated")), 0);
+    }
+
+    #[test]
+    fn counted_losses_saturate_both_tallies() {
+        let (sink, observations) = ObservationSink::channel(NonZeroUsize::MIN, NonZeroUsize::MIN);
+        let a = call("a");
+        let b = call("b");
+        let max = NonZeroU64::new(u64::MAX).expect("nonzero");
+        sink.lose(&a.origin().build, max);
+        sink.lose(&a.origin().build, NonZeroU64::MIN);
+        sink.lose_unattributed(max);
+        sink.lose(&b.origin().build, NonZeroU64::MIN);
+        sink.lose_unattributed(NonZeroU64::MIN);
+        let mut counts = HashMap::new();
+        assert_eq!(
+            observations.take_lost(|key, count| {
+                counts.insert(key, count);
+            }),
+            u64::MAX
+        );
+        assert_eq!(counts.get(&a.origin().build), Some(&u64::MAX));
+        assert_eq!(observations.take_lost(|_, _| panic!("loss repeated")), 0);
+    }
+
+    #[test]
+    fn counted_losses_are_recorded_after_receiver_closes() {
+        let (sink, observations) = ObservationSink::channel(NonZeroUsize::MIN, NonZeroUsize::MIN);
+        drop(observations);
+        let a = call("a");
+        sink.lose(&a.origin().build, NonZeroU64::new(3).expect("nonzero"));
+        sink.lose_unattributed(NonZeroU64::new(5).expect("nonzero"));
+        assert_eq!(sink.lost.each.lock().get(&a.origin().build), Some(&3));
+        assert_eq!(sink.lost.unattributed.load(Ordering::Relaxed), 5);
+        assert!(sink.lost.dirty.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -329,13 +434,13 @@ mod tests {
         sink.record(observation.clone());
         assert_eq!(
             observations.next().await,
-            Some(Delivery::Observation(Box::new(observation.clone())))
+            Some(Delivery(Some(observation.clone())))
         );
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), observations.next())
                 .await
                 .expect("loss wakes the recorder"),
-            Some(Delivery::Losses)
+            Some(Delivery(None))
         );
         let mut counts = HashMap::new();
         assert_eq!(
@@ -366,10 +471,7 @@ mod tests {
         assert_eq!(counts.get(&a.origin().build), Some(&1));
         assert_eq!(counts.get(&b.origin().build), Some(&1));
         assert_eq!(observations.take_lost(|_, _| panic!("loss repeated")), 0);
-        assert_eq!(
-            observations.next().await,
-            Some(Delivery::Observation(Box::new(a)))
-        );
+        assert_eq!(observations.next().await, Some(Delivery(Some(a))));
         let another = sink.clone();
         drop(sink);
         drop(another);
@@ -386,9 +488,9 @@ mod tests {
         drop(sink);
         assert_eq!(
             observations.next().await,
-            Some(Delivery::Observation(Box::new(observation.clone())))
+            Some(Delivery(Some(observation.clone())))
         );
-        assert_eq!(observations.next().await, Some(Delivery::Losses));
+        assert_eq!(observations.next().await, Some(Delivery(None)));
         let mut counts = HashMap::new();
         assert_eq!(
             observations.take_lost(|key, count| {

@@ -1,4 +1,4 @@
-//! Bounded, short-lived device authorizations and their one-time grants.
+//! Short-lived, database-backed device authorizations and their one-time grants.
 
 use std::fmt;
 use std::net::IpAddr;
@@ -8,18 +8,22 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use gang_clock::{Clock, Tick, Timestamp};
-use gang_spi::{LoginClient, LoginGrant};
-use gang_types::{DeviceSecret, ProviderName, Url};
+use gang_clock::{Clock, Timestamp};
+use gang_spi::{
+    ExpiringRecordPort, Insert, LoginClient, LoginGrant, PortError, RecordId, RecordKey,
+    RecordKind, RecordVersion, Remove, Replace,
+};
+use gang_types::{DeviceSecret, Principal, Proof, ProviderName, RefreshToken, Url};
 use gang_wire::{
     DeviceAuthorization, DeviceAuthorizationState, USER_CODE_ALPHABET, USER_CODE_LENGTH,
 };
-use parking_lot::Mutex;
-use ring::digest::{SHA256, digest};
 use ring::rand::{SecureRandom, SystemRandom};
+use serde::{Deserialize, Serialize};
 
+use crate::records;
+use crate::renewal_flights::RenewalFlights;
+use crate::renewal_seal::RenewalSeal;
 use crate::settings::DeviceSettings;
-use crate::ttl_map::TtlMap;
 
 /// Largest multiple of the alphabet length within the number of possible byte values.
 const UNBIASED_BYTE_BOUND: usize =
@@ -28,6 +32,13 @@ const UNBIASED_BYTE_BOUND: usize =
 /// A normalized device user code.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct UserCode([u8; USER_CODE_LENGTH]);
+
+/// A pending device authorization identified by its code and original device record.
+#[derive(Debug, Clone)]
+pub(crate) struct ApprovalTarget {
+    pub(crate) code: UserCode,
+    pub(crate) device_digest: [u8; 32],
+}
 
 impl UserCode {
     /// Draws each character uniformly, rejecting the incomplete final byte range.
@@ -98,6 +109,9 @@ pub(crate) enum DeviceError {
     /// The operating system's random source failed.
     #[error("device login randomness unavailable")]
     Randomness,
+    /// The record store failed.
+    #[error(transparent)]
+    Storage(#[from] PortError),
 }
 
 /// The provider grant and verified principal accepted by the browser.
@@ -107,28 +121,29 @@ pub(crate) struct Approval {
     pub(crate) code: UserCode,
     /// The provider's login grant.
     pub(crate) grant: LoginGrant,
-    /// The verified principal.
-    pub(crate) principal: String,
 }
 
-/// A pending or approved device authorization.
+/// Persisted device state. Credential-bearing approval data is encrypted.
+#[derive(Serialize, Deserialize)]
 struct Pending {
-    /// The SHA-256 of the secret, never the secret itself.
-    secret_digest: [u8; 32],
-    /// The creator's observed address.
     client_address: Option<IpAddr>,
-    /// The wall-clock creation time.
-    create_time: Timestamp,
-    /// The wall-clock expiry time sent to clients.
-    expire_time: Timestamp,
-    /// The last accepted pending poll, without changing insertion order.
-    last_poll: Option<Tick>,
-    /// The first accepted approval, without changing insertion order.
-    approval: Option<Approval>,
-    /// The provider displayed to the approver.
+    create_time: u64,
+    last_poll: Option<u64>,
+    approval: Option<String>,
     provider: ProviderName,
-    /// The approval page displayed to the requester.
     verification_uri: Url,
+}
+
+#[derive(Serialize, Deserialize)]
+struct UserRecord {
+    device_digest: [u8; 32],
+}
+
+#[derive(Serialize, Deserialize)]
+struct GrantBody {
+    proof: String,
+    refresh_token: Option<String>,
+    principal: String,
 }
 
 /// The outcome of a redemption that did not return an approval.
@@ -142,15 +157,13 @@ pub(crate) enum Redeem {
     TooSoon(Duration),
 }
 
-/// A bounded table of device logins, shared by the API and browser routes.
+/// Device login configuration shared by the API and browser routes.
 pub(crate) struct DeviceLogins<C: Clock> {
-    /// Entries expire and are evicted in creation order.
-    entries: Mutex<TtlMap<UserCode, Pending>>,
     /// Lifetime of each authorization.
     ttl: Duration,
     /// Minimum interval between polls.
     poll_interval: Duration,
-    /// Source of monotonic and wall time.
+    /// Source of wall time.
     clock: Arc<C>,
 }
 
@@ -164,152 +177,263 @@ pub(crate) struct MountedDevice<C: Clock, V> {
     pub(crate) client: LoginClient,
     /// The interactive provider's verifier.
     pub(crate) verifier: Arc<V>,
+    /// Authenticated encryption shared with browser renewals.
+    pub(crate) seal: Arc<RenewalSeal>,
+    /// Refresh grants shared with browser renewals.
+    pub(crate) flights: Arc<RenewalFlights>,
     /// The dashboard page where a code is entered.
     pub(crate) verification_uri: Url,
 }
 
-impl<C: Clock, V> MountedDevice<C, V> {
-    /// Creates the shared state for a mounted device login.
-    pub(crate) fn new(
-        settings: &DeviceSettings,
-        provider: ProviderName,
-        client: LoginClient,
-        verifier: Arc<V>,
-        verification_uri: Url,
-        clock: Arc<C>,
-    ) -> Self {
-        Self {
-            logins: DeviceLogins::new(settings, clock),
-            provider,
-            client,
-            verifier,
-            verification_uri,
-        }
-    }
-}
-
 impl<C: Clock> DeviceLogins<C> {
-    /// Creates an empty table with the configured capacity, lifetime, and poll interval.
+    /// Creates the device service with the configured lifetime and poll interval.
     pub(crate) fn new(settings: &DeviceSettings, clock: Arc<C>) -> Self {
-        let ttl = settings.ttl.get();
         Self {
-            entries: Mutex::new(TtlMap::new(settings.max_pending, ttl)),
-            ttl,
+            ttl: settings.ttl.get(),
             poll_interval: settings.poll_interval.get(),
             clock,
         }
     }
 
-    /// Creates a device authorization and returns its secret only this once.
-    pub(crate) fn create(
+    /// Creates both indexes atomically and returns the secret only this once.
+    pub(crate) async fn create<R: ExpiringRecordPort>(
         &self,
+        repository: &R,
         client: Option<IpAddr>,
         verification_uri: &Url,
         provider: &ProviderName,
     ) -> Result<DeviceAuthorization, DeviceError> {
         let random = SystemRandom::new();
-        let mut secret_bytes = [0; 32];
-        random
-            .fill(&mut secret_bytes)
-            .map_err(|_| DeviceError::Randomness)?;
-        let secret = DeviceSecret::new(URL_SAFE_NO_PAD.encode(secret_bytes));
-        let secret_digest = secret_digest(&secret);
-        let mut entries = self.entries.lock();
-        let now = self.clock.monotonic();
-        let code = loop {
+        loop {
+            let mut secret_bytes = [0; 32];
+            random
+                .fill(&mut secret_bytes)
+                .map_err(|_| DeviceError::Randomness)?;
+            let secret = DeviceSecret::new(URL_SAFE_NO_PAD.encode(secret_bytes));
+            let device_key = records::key(RecordKind::DeviceCode, secret.expose().as_bytes());
             let code = UserCode::generate(&random)?;
-            if entries.get_live(&code, now).is_none() {
-                break code;
+            let user_key = records::key(RecordKind::UserCode, &code.0);
+            let now = self.clock.wall();
+            let expires_at = now + self.ttl;
+            let pending = Pending {
+                client_address: client,
+                create_time: now.as_unix_millis(),
+                last_poll: None,
+                approval: None,
+                provider: provider.clone(),
+                verification_uri: verification_uri.clone(),
+            };
+            let user = UserRecord {
+                device_digest: *device_key.id.as_bytes(),
+            };
+            if records::insert_pair(
+                repository,
+                (device_key, &pending),
+                (user_key, &user),
+                now,
+                expires_at,
+            )
+            .await?
+                == Insert::Inserted
+            {
+                tracing::info!(code = %code, client = ?client, "device login requested");
+                return Ok(self.resource(&code, &pending, expires_at, Some(secret)));
             }
+        }
+    }
+
+    /// Resolves a normalized user code to the device record.
+    async fn lookup<R: ExpiringRecordPort>(
+        &self,
+        repository: &R,
+        code: &UserCode,
+        now: Timestamp,
+    ) -> Result<Option<(RecordKey, records::Stored<Pending>, RecordVersion)>, PortError> {
+        let user_key = records::key(RecordKind::UserCode, &code.0);
+        let Some(user) = records::get::<_, UserRecord>(repository, &user_key, now).await? else {
+            return Ok(None);
         };
-        let create_time = self.clock.wall();
-        let pending = Pending {
-            secret_digest,
-            client_address: client,
-            create_time,
-            expire_time: create_time + self.ttl,
-            last_poll: None,
-            approval: None,
-            provider: provider.clone(),
-            verification_uri: verification_uri.clone(),
+        let key = RecordKey {
+            kind: RecordKind::DeviceCode,
+            id: RecordId::new(user.value.device_digest),
         };
-        let resource = self.resource(&code, &pending, Some(secret));
-        entries.insert(code.clone(), pending, now);
-        tracing::info!(code = %code, client = ?client, "device login requested");
-        Ok(resource)
+        Ok(records::get(repository, &key, now)
+            .await?
+            .map(|value| (key, value, user.version)))
     }
 
     /// Returns a live authorization without its secret.
-    pub(crate) fn get(&self, code: &str) -> Option<DeviceAuthorization> {
-        let code = code.parse::<UserCode>().ok()?;
-        let entries = self.entries.lock();
-        let pending = entries.get_live(&code, self.clock.monotonic())?;
-        Some(self.resource(&code, pending, None))
+    pub(crate) async fn get<R: ExpiringRecordPort>(
+        &self,
+        repository: &R,
+        code: &str,
+    ) -> Result<Option<DeviceAuthorization>, PortError> {
+        let Ok(code) = code.parse::<UserCode>() else {
+            return Ok(None);
+        };
+        Ok(self
+            .lookup(repository, &code, self.clock.wall())
+            .await?
+            .map(|(_, stored, _)| self.resource(&code, &stored.value, stored.expires_at, None)))
     }
 
     /// Redeems an approved grant once, or reports the pending poll state.
-    pub(crate) fn redeem(&self, code: &str, secret: &DeviceSecret) -> Result<Approval, Redeem> {
-        let code = code.parse::<UserCode>().map_err(|_| Redeem::NotFound)?;
-        let mut entries = self.entries.lock();
-        let now = self.clock.monotonic();
-        let pending = entries.get_live_mut(&code, now).ok_or(Redeem::NotFound)?;
-        let actual = secret_digest(secret);
-        if std::hint::black_box(
-            pending
-                .secret_digest
-                .iter()
-                .zip(&actual)
-                .fold(0, |acc, (x, y)| acc | (x ^ y)),
-        ) != 0
-        {
-            return Err(Redeem::NotFound);
-        }
-        if let Some(last) = pending.last_poll {
-            let elapsed = now.saturating_duration_since(last);
-            if elapsed < self.poll_interval {
-                return Err(Redeem::TooSoon(self.poll_interval.saturating_sub(elapsed)));
+    pub(crate) async fn redeem<R: ExpiringRecordPort>(
+        &self,
+        repository: &R,
+        seal: &RenewalSeal,
+        code: &str,
+        secret: &DeviceSecret,
+    ) -> Result<Result<Approval, Redeem>, PortError> {
+        let Ok(code) = code.parse::<UserCode>() else {
+            return Ok(Err(Redeem::NotFound));
+        };
+        let expected = records::key(RecordKind::DeviceCode, secret.expose().as_bytes());
+        for _ in 0..2 {
+            let now = self.clock.wall();
+            let Some((key, mut stored, user_version)) = self.lookup(repository, &code, now).await?
+            else {
+                return Ok(Err(Redeem::NotFound));
+            };
+            if std::hint::black_box(
+                key.id
+                    .as_bytes()
+                    .iter()
+                    .zip(expected.id.as_bytes())
+                    .fold(0, |acc, (x, y)| acc | (x ^ y)),
+            ) != 0
+            {
+                return Ok(Err(Redeem::NotFound));
+            }
+            if let Some(last) = stored.value.last_poll {
+                let elapsed = now.saturating_duration_since(Timestamp::from_unix_millis(last));
+                if elapsed < self.poll_interval {
+                    return Ok(Err(Redeem::TooSoon(
+                        self.poll_interval.saturating_sub(elapsed),
+                    )));
+                }
+            }
+            if let Some(encrypted) = &stored.value.approval {
+                let plaintext = seal
+                    .open_record(&key, encrypted)
+                    .map_err(PortError::backend)?;
+                let grant: GrantBody =
+                    serde_json::from_slice(&plaintext).map_err(PortError::backend)?;
+                let principal = Principal::try_new(grant.principal).map_err(PortError::backend)?;
+                if records::remove(repository, &key, stored.version, now).await? == Remove::Removed
+                {
+                    let user_key = records::key(RecordKind::UserCode, &code.0);
+                    if let Err(error) =
+                        records::remove(repository, &user_key, user_version, now).await
+                    {
+                        tracing::warn!(%error, "cannot remove redeemed user code");
+                    }
+                    return Ok(Ok(Approval {
+                        code,
+                        grant: LoginGrant {
+                            proof: Proof::new(grant.proof),
+                            refresh_token: grant.refresh_token.map(RefreshToken::new),
+                            principal,
+                        },
+                    }));
+                }
+            } else {
+                stored.value.last_poll = Some(now.as_unix_millis());
+                if matches!(
+                    records::replace(
+                        repository,
+                        &key,
+                        stored.version,
+                        &stored.value,
+                        now,
+                        stored.expires_at
+                    )
+                    .await?,
+                    Replace::Replaced(_)
+                ) {
+                    return Ok(Err(Redeem::Pending));
+                }
             }
         }
-        if pending.approval.is_none() {
-            pending.last_poll = Some(now);
-            return Err(Redeem::Pending);
-        }
-        entries
-            .take_live(&code, now)
-            .and_then(|entry| entry.approval)
-            .ok_or(Redeem::NotFound)
+        Err(contention())
     }
 
     /// Begins an approval only for a live, still-pending code.
-    pub(crate) fn begin_approval(&self, code: &str) -> Option<UserCode> {
-        let code = code.parse::<UserCode>().ok()?;
-        let entries = self.entries.lock();
-        let pending = entries.get_live(&code, self.clock.monotonic())?;
-        if pending.approval.is_some() {
-            return None;
-        }
-        Some(code)
+    pub(crate) async fn begin_approval<R: ExpiringRecordPort>(
+        &self,
+        repository: &R,
+        code: &str,
+    ) -> Result<Option<ApprovalTarget>, PortError> {
+        let Ok(code) = code.parse::<UserCode>() else {
+            return Ok(None);
+        };
+        Ok(self
+            .lookup(repository, &code, self.clock.wall())
+            .await?
+            .and_then(|(key, stored, _)| {
+                stored.value.approval.is_none().then_some(ApprovalTarget {
+                    code,
+                    device_digest: *key.id.as_bytes(),
+                })
+            }))
     }
 
     /// Accepts the first approval of a live code.
-    pub(crate) fn approve(&self, code: &UserCode, mut approval: Approval) -> bool {
-        let mut entries = self.entries.lock();
-        let Some(pending) = entries.get_live_mut(code, self.clock.monotonic()) else {
-            return false;
+    pub(crate) async fn approve<R: ExpiringRecordPort>(
+        &self,
+        repository: &R,
+        seal: &RenewalSeal,
+        target: &ApprovalTarget,
+        approval: Approval,
+    ) -> Result<bool, PortError> {
+        let body = GrantBody {
+            proof: approval.grant.proof.expose().to_owned(),
+            refresh_token: approval
+                .grant
+                .refresh_token
+                .as_ref()
+                .map(|token| token.expose().to_owned()),
+            principal: approval.grant.principal.as_str().to_owned(),
         };
-        if pending.approval.is_some() {
-            return false;
+        for _ in 0..2 {
+            let now = self.clock.wall();
+            let Some((key, mut stored, _)) = self.lookup(repository, &target.code, now).await?
+            else {
+                return Ok(false);
+            };
+            if key.id.as_bytes() != &target.device_digest || stored.value.approval.is_some() {
+                return Ok(false);
+            }
+            let encrypted = seal
+                .seal_record(
+                    &key,
+                    &serde_json::to_vec(&body).map_err(PortError::backend)?,
+                )
+                .map_err(PortError::backend)?;
+            stored.value.approval = Some(encrypted);
+            if matches!(
+                records::replace(
+                    repository,
+                    &key,
+                    stored.version,
+                    &stored.value,
+                    now,
+                    stored.expires_at
+                )
+                .await?,
+                Replace::Replaced(_)
+            ) {
+                return Ok(true);
+            }
         }
-        approval.code = code.clone();
-        pending.approval = Some(approval);
-        true
+        Err(contention())
     }
 
-    /// Constructs the public view without changing the table or its eviction order.
     fn resource(
         &self,
         code: &UserCode,
         pending: &Pending,
+        expires_at: Timestamp,
         secret: Option<DeviceSecret>,
     ) -> DeviceAuthorization {
         DeviceAuthorization {
@@ -322,229 +446,276 @@ impl<C: Clock> DeviceLogins<C> {
             } else {
                 DeviceAuthorizationState::Pending
             },
-            create_time: pending.create_time,
-            expire_time: pending.expire_time,
+            create_time: Timestamp::from_unix_millis(pending.create_time),
+            expire_time: expires_at,
             poll_interval: self.poll_interval,
             secret,
         }
     }
 }
 
-/// Hashes the exposed random secret; entries never retain the secret itself.
-fn secret_digest(secret: &DeviceSecret) -> [u8; 32] {
-    let digest = digest(&SHA256, secret.expose().as_bytes());
-    let mut bytes = [0; 32];
-    bytes.copy_from_slice(digest.as_ref());
-    bytes
+/// A repeated optimistic-write conflict is retryable by the caller.
+fn contention() -> PortError {
+    PortError::Unavailable(Box::new(std::io::Error::other(
+        "device login write contention",
+    )))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
-
-    use gang_clock::TestClock;
-    use gang_types::{DeviceCodeTtl, DevicePollInterval, Proof, RefreshToken};
-
     use super::*;
+    use gang_clock::TestClock;
+    use gang_testkit::{FakeRepository, TestResult};
+    use gang_types::{ClientSecret, DeviceCodeTtl, DevicePollInterval};
 
-    /// Creates a table with deterministic time.
-    fn table(capacity: usize) -> (DeviceLogins<TestClock>, Arc<TestClock>) {
-        let clock = Arc::new(TestClock::default());
-        let settings = DeviceSettings {
-            ttl: DeviceCodeTtl::from_units(60),
-            poll_interval: DevicePollInterval::from_units(5),
-            max_pending: NonZeroUsize::new(capacity).expect("nonzero capacity"),
-        };
-        (DeviceLogins::new(&settings, Arc::clone(&clock)), clock)
+    fn table(clock: Arc<TestClock>) -> DeviceLogins<TestClock> {
+        DeviceLogins::new(
+            &DeviceSettings {
+                ttl: DeviceCodeTtl::from_units(60),
+                poll_interval: DevicePollInterval::from_units(5),
+            },
+            clock,
+        )
     }
-
-    /// Creates an authorization for the test provider.
-    fn create(table: &DeviceLogins<TestClock>) -> DeviceAuthorization {
+    fn seal() -> RenewalSeal {
+        RenewalSeal::new(&ClientSecret::new("secret"), "https://example.org")
+    }
+    async fn create(
+        table: &DeviceLogins<TestClock>,
+        repository: &FakeRepository,
+    ) -> Result<DeviceAuthorization, DeviceError> {
         table
             .create(
-                Some("192.0.2.1".parse().expect("valid ip address")),
+                repository,
+                Some("192.0.2.1".parse().expect("valid address")),
                 &Url::parse("https://example.org/ui/device").expect("valid url"),
                 &ProviderName::try_new("example").expect("valid provider"),
             )
-            .expect("randomness available")
+            .await
     }
-
-    /// Extracts the code from a created resource name.
     fn code(resource: &DeviceAuthorization) -> &str {
         resource
             .name
             .strip_prefix("deviceAuthorizations/")
             .expect("resource name")
     }
-
-    /// Makes a grant that identifies its approver.
     fn approval(code: &UserCode, principal: &str) -> Approval {
         Approval {
             code: code.clone(),
             grant: LoginGrant {
                 proof: Proof::new(principal),
                 refresh_token: Some(RefreshToken::new("refresh")),
+                principal: Principal::try_new(principal).expect("valid principal"),
             },
-            principal: principal.to_owned(),
         }
     }
-
     #[test]
-    fn user_codes_use_the_alphabet_and_format() {
+    fn user_codes_use_the_alphabet_and_normalize_input() -> TestResult {
         let random = SystemRandom::new();
         for _ in 0..256 {
-            let code = UserCode::generate(&random).expect("randomness available");
+            let code = UserCode::generate(&random)?;
             let text = code.to_string();
             assert_eq!(text.len(), USER_CODE_LENGTH + 1);
-            assert_eq!(text.as_bytes()[USER_CODE_LENGTH / 2], b'-');
+            assert_eq!(text.parse::<UserCode>()?, code);
             assert!(
                 text.bytes()
                     .filter(|byte| *byte != b'-')
                     .all(|byte| USER_CODE_ALPHABET.as_bytes().contains(&byte))
             );
         }
-    }
-
-    #[test]
-    fn user_code_input_ignores_case_hyphens_and_spaces() {
-        let expected: UserCode = "BCDF-GHJK".parse().expect("valid code");
-        assert_eq!(
-            "bcdf-ghjk".parse::<UserCode>().expect("valid code"),
-            expected
-        );
-        assert_eq!(
-            " BCDF GHJK ".parse::<UserCode>().expect("valid code"),
-            expected
-        );
+        assert_eq!("bcdf-ghjk".parse::<UserCode>()?, " BCDF GHJK ".parse()?);
         assert!("BCDF-GHJ".parse::<UserCode>().is_err());
         assert!("BCDF-GHJA".parse::<UserCode>().is_err());
+        Ok(())
     }
-
-    #[test]
-    fn a_secret_has_256_bits() {
-        let (table, _) = table(2);
-        let resource = create(&table);
-        let secret = resource.secret.expect("create returns secret");
-        assert_eq!(secret.expose().len(), 43);
-        assert_eq!(
-            URL_SAFE_NO_PAD
-                .decode(secret.expose())
-                .expect("base64url")
-                .len(),
-            32
-        );
-    }
-
-    #[test]
-    fn redeem_before_approval_is_pending_then_too_soon() {
-        let (table, clock) = table(2);
-        let resource = create(&table);
+    #[tokio::test]
+    async fn shared_records_preserve_poll_approval_and_single_redemption() -> TestResult {
+        let clock = Arc::new(TestClock::default());
+        let a = table(Arc::clone(&clock));
+        let b = table(Arc::clone(&clock));
+        let repository = FakeRepository::default();
+        let resource = create(&a, &repository).await?;
         let secret = resource.secret.as_ref().expect("secret");
+        assert_eq!(URL_SAFE_NO_PAD.decode(secret.expose())?.len(), 32);
         assert!(matches!(
-            table.redeem(code(&resource), secret),
+            b.redeem(&repository, &seal(), code(&resource), secret)
+                .await?,
             Err(Redeem::Pending)
         ));
-        assert!(matches!(
-            table.redeem(code(&resource), secret),
-            Err(Redeem::TooSoon(d)) if d == Duration::from_secs(5)
-        ));
+        assert!(
+            matches!(b.redeem(&repository, &seal(), code(&resource), secret).await?, Err(Redeem::TooSoon(d)) if d == Duration::from_secs(5))
+        );
+        let user_code = b
+            .begin_approval(&repository, code(&resource))
+            .await?
+            .expect("pending");
+        assert!(
+            b.approve(
+                &repository,
+                &seal(),
+                &user_code,
+                approval(&user_code.code, "alice")
+            )
+            .await?
+        );
+        assert!(
+            !a.approve(
+                &repository,
+                &seal(),
+                &user_code,
+                approval(&user_code.code, "bob")
+            )
+            .await?
+        );
+        assert!(
+            b.get(&repository, code(&resource))
+                .await?
+                .expect("live")
+                .secret
+                .is_none()
+        );
         clock.advance(Duration::from_secs(5));
+        let first = b
+            .redeem(&repository, &seal(), code(&resource), secret)
+            .await?
+            .expect("approved");
+        assert_eq!(first.grant.principal.as_str(), "alice");
+        assert_eq!(first.grant.proof.expose(), "alice");
+        let user_key = records::key(RecordKind::UserCode, &user_code.code.0);
+        assert!(repository.get(&user_key, clock.wall()).await?.is_none());
         assert!(matches!(
-            table.redeem(code(&resource), secret),
-            Err(Redeem::Pending)
+            b.redeem(&repository, &seal(), code(&resource), secret)
+                .await?,
+            Err(Redeem::NotFound)
         ));
+        Ok(())
     }
-
-    #[test]
-    fn approval_then_redeem_returns_the_grant_once() {
-        let (table, _) = table(2);
-        let resource = create(&table);
-        let user_code = table.begin_approval(code(&resource)).expect("pending");
-        assert!(table.approve(&user_code, approval(&user_code, "alice")));
-        assert!(table.get(code(&resource)).expect("live").secret.is_none());
-        let secret = resource.secret.as_ref().expect("secret");
-        let result = table.redeem(code(&resource), secret).expect("approved");
-        assert_eq!(result.code, user_code);
-        assert_eq!(result.principal, "alice");
-        assert_eq!(result.grant.proof.expose(), "alice");
-        assert!(matches!(
-            table.redeem(code(&resource), secret),
-            Err(Redeem::NotFound)
-        ));
-    }
-
-    #[test]
-    fn unknown_expired_and_wrong_secret_are_not_found() {
-        let (table, clock) = table(2);
-        let resource = create(&table);
-        let secret = resource.secret.as_ref().expect("secret");
-        assert!(matches!(
-            table.redeem("invalid", secret),
-            Err(Redeem::NotFound)
-        ));
-        let unknown = if code(&resource) == "BCDF-GHJK" {
-            "BCDF-GHJL"
-        } else {
-            "BCDF-GHJK"
-        };
-        assert!(matches!(
-            table.redeem(unknown, secret),
-            Err(Redeem::NotFound)
-        ));
-        assert!(matches!(
-            table.redeem(code(&resource), &DeviceSecret::new("wrong")),
-            Err(Redeem::NotFound)
-        ));
-        assert!(matches!(
-            table.redeem(code(&resource), secret),
-            Err(Redeem::Pending)
-        ));
-        clock.advance(Duration::from_mins(1));
-        assert!(matches!(
-            table.redeem(code(&resource), secret),
-            Err(Redeem::NotFound)
-        ));
-        assert!(table.get(code(&resource)).is_none());
-    }
-
-    #[test]
-    fn the_first_approval_wins() {
-        let (table, _) = table(2);
-        let resource = create(&table);
-        let user_code = table.begin_approval(code(&resource)).expect("pending");
-        assert!(table.approve(&user_code, approval(&user_code, "alice")));
-        assert!(!table.approve(&user_code, approval(&user_code, "bob")));
-        assert!(table.begin_approval(code(&resource)).is_none());
-        assert_eq!(
-            table
-                .redeem(code(&resource), resource.secret.as_ref().expect("secret"))
-                .expect("approved")
-                .principal,
-            "alice"
+    #[tokio::test]
+    async fn concurrent_redemptions_have_one_winner() -> TestResult {
+        let clock = Arc::new(TestClock::default());
+        let a = table(Arc::clone(&clock));
+        let b = table(clock);
+        let repository = FakeRepository::default();
+        let resource = create(&a, &repository).await?;
+        let user_code = a
+            .begin_approval(&repository, code(&resource))
+            .await?
+            .expect("pending");
+        assert!(
+            a.approve(
+                &repository,
+                &seal(),
+                &user_code,
+                approval(&user_code.code, "alice")
+            )
+            .await?
         );
+        let secret = resource.secret.as_ref().expect("secret");
+        let first_seal = seal();
+        let second_seal = seal();
+        let (first, second) = tokio::join!(
+            a.redeem(&repository, &first_seal, code(&resource), secret),
+            b.redeem(&repository, &second_seal, code(&resource), secret),
+        );
+        let first = first?;
+        let second = second?;
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        assert!(matches!(first, Err(Redeem::NotFound)) || matches!(second, Err(Redeem::NotFound)));
+        Ok(())
     }
-
-    #[test]
-    fn an_expired_code_cannot_be_approved() {
-        let (table, clock) = table(2);
-        let resource = create(&table);
-        let user_code = table.begin_approval(code(&resource)).expect("pending");
+    #[tokio::test]
+    async fn approval_cannot_follow_a_reused_user_code() -> TestResult {
+        let clock = Arc::new(TestClock::default());
+        let table = table(Arc::clone(&clock));
+        let repository = FakeRepository::default();
+        let first = create(&table, &repository).await?;
+        let saved_code = table
+            .begin_approval(&repository, code(&first))
+            .await?
+            .expect("pending");
         clock.advance(Duration::from_mins(1));
-        assert!(table.begin_approval(code(&resource)).is_none());
-        assert!(!table.approve(&user_code, approval(&user_code, "alice")));
-    }
 
-    #[test]
-    fn a_full_table_evicts_the_oldest() {
-        let (table, clock) = table(2);
-        let first = create(&table);
-        clock.advance(Duration::from_secs(1));
-        let second = create(&table);
-        assert!(table.get(code(&first)).is_some());
-        clock.advance(Duration::from_secs(1));
-        let third = create(&table);
-        assert!(table.get(code(&first)).is_none());
-        assert!(table.get(code(&second)).is_some());
-        assert!(table.get(code(&third)).is_some());
+        let second = create(&table, &repository).await?;
+        let secret = second.secret.as_ref().expect("secret");
+        let device_key = records::key(RecordKind::DeviceCode, secret.expose().as_bytes());
+        let user_key = records::key(RecordKind::UserCode, &saved_code.code.0);
+        let now = clock.wall();
+        // The newly generated code could itself equal the saved code.
+        if let Some(existing) = records::get::<_, UserRecord>(&repository, &user_key, now).await? {
+            assert!(matches!(
+                records::remove(&repository, &user_key, existing.version, now).await?,
+                Remove::Removed
+            ));
+        }
+        assert!(matches!(
+            records::insert(
+                &repository,
+                user_key,
+                &UserRecord {
+                    device_digest: *device_key.id.as_bytes(),
+                },
+                RecordVersion::fresh().map_err(PortError::backend)?,
+                now,
+                now + Duration::from_mins(1),
+            )
+            .await?,
+            Insert::Inserted
+        ));
+
+        assert!(
+            !table
+                .approve(
+                    &repository,
+                    &seal(),
+                    &saved_code,
+                    approval(&saved_code.code, "alice")
+                )
+                .await?
+        );
+        assert!(matches!(
+            table
+                .redeem(&repository, &seal(), code(&second), secret)
+                .await?,
+            Err(Redeem::Pending)
+        ));
+        Ok(())
+    }
+    #[tokio::test]
+    async fn expiration_wrong_secret_and_capacity() -> TestResult {
+        let clock = Arc::new(TestClock::default());
+        let table = table(Arc::clone(&clock));
+        let repository = FakeRepository::default();
+        let first = create(&table, &repository).await?;
+        let second = create(&table, &repository).await?;
+        assert!(table.get(&repository, code(&first)).await?.is_some());
+        assert!(table.get(&repository, code(&second)).await?.is_some());
+        assert!(matches!(
+            table
+                .redeem(
+                    &repository,
+                    &seal(),
+                    code(&first),
+                    &DeviceSecret::new("wrong")
+                )
+                .await?,
+            Err(Redeem::NotFound)
+        ));
+        let user_code = table
+            .begin_approval(&repository, code(&first))
+            .await?
+            .expect("pending");
+        clock.advance(Duration::from_mins(1));
+        assert!(table.get(&repository, code(&first)).await?.is_none());
+        assert!(
+            !table
+                .approve(
+                    &repository,
+                    &seal(),
+                    &user_code,
+                    approval(&user_code.code, "alice")
+                )
+                .await?
+        );
+        Ok(())
     }
 }

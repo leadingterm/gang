@@ -52,6 +52,20 @@ pub struct GangConfig<P: PluginSet, F = Fleets<P>> {
     /// Where `gang server` accepts worker connections. A non-loopback listener requires a
     /// configured scheduler worker endpoint when the scheduler supports one.
     pub worker_listen: SocketAddr,
+    /// Where the leading controller accepts Execution, Capabilities, and leader routes. Omitted,
+    /// Execution is served on `listen`, which is bound only while leading (single-controller
+    /// shape).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_listen: Option<SocketAddr>,
+    /// Plaintext HTTP health listener for load balancers (ADR-51): `GET /serve` answers 200
+    /// while this controller serves, `GET /leader` only on the leader. Unset: no health listener.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_listen: Option<SocketAddr>,
+    /// URL clients dial to reach `execution_listen`, written into `--remote_executor`. It follows
+    /// the same scheme rules as `endpoint`. Omitted, it is derived from `execution_listen` and
+    /// only allowed when that listener is loopback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_endpoint: Option<Url>,
     /// The worker fleets in preference order.
     pub fleets: F,
     /// The identity providers that prove identity before a certificate or token is issued. The
@@ -125,6 +139,9 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
             listen,
             endpoint,
             worker_listen,
+            execution_listen,
+            health_listen,
+            execution_endpoint,
             fleets,
             identity,
             authentication,
@@ -141,14 +158,16 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
             sandbox,
             limits,
         } = self;
+        Self::check_listeners(
+            listen,
+            worker_listen,
+            execution_listen,
+            health_listen,
+            execution_endpoint.as_ref(),
+        )?;
+        Self::check_leadership(&server)?;
         let fleets = Fleets::resolve(fleets, &provisioner, &sandbox)?;
-        if !fleets
-            .policies()
-            .iter()
-            .any(|policy| policy.isa == default_isa)
-        {
-            return Err(ConfigError::DefaultIsaWithoutFleet(default_isa));
-        }
+        Self::check_fleet_settings(&fleets, &scheduler, default_isa)?;
         if let Some(name) = identity.providers.keys().find(|name| name.is_anonymous()) {
             return Err(ConfigError::ReservedProviderName(name.clone()));
         }
@@ -156,6 +175,14 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
             return Err(ConfigError::EndpointRequired { listen });
         }
         Self::check_transport(&server, endpoint.as_ref(), &authentication)?;
+        Self::check_execution_endpoint(&server.transport, execution_endpoint.as_ref())?;
+        Self::check_execution_host(
+            endpoint.as_ref(),
+            execution_endpoint.as_ref(),
+            listen,
+            execution_listen,
+            server.transport.kind(),
+        )?;
         Self::check_worker_endpoint(&server, worker_listen, &scheduler)?;
         Self::check_authentication_providers(&identity.providers, &authentication.clients)?;
         Self::check_authentication_providers(&identity.providers, &authentication.workers)?;
@@ -168,6 +195,9 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
             listen,
             endpoint,
             worker_listen,
+            execution_listen,
+            health_listen,
+            execution_endpoint,
             fleets,
             identity,
             authentication,
@@ -184,6 +214,213 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
             sandbox,
             limits,
         })
+    }
+
+    /// Checks scheduler shutdown timing and default ISA against resolved fleets.
+    fn check_fleet_settings(
+        fleets: &Fleets<P>,
+        scheduler: &P::Scheduler,
+        default_isa: Isa,
+    ) -> Result<(), ConfigError> {
+        if let Some((key, shutdown_grace)) = scheduler.shutdown_grace()
+            && let Some(fleet) = fleets
+                .policies()
+                .iter()
+                .find(|fleet| shutdown_grace >= fleet.boot_grace)
+        {
+            return Err(ConfigError::ShutdownGraceNotBelowBootGrace {
+                key,
+                shutdown_grace,
+                fleet: fleet.name.clone(),
+                boot_grace: fleet.boot_grace,
+            });
+        }
+        if !fleets
+            .policies()
+            .iter()
+            .any(|policy| policy.isa == default_isa)
+        {
+            return Err(ConfigError::DefaultIsaWithoutFleet(default_isa));
+        }
+        Ok(())
+    }
+
+    fn check_listeners(
+        listen: SocketAddr,
+        worker_listen: SocketAddr,
+        execution_listen: Option<SocketAddr>,
+        health_listen: Option<SocketAddr>,
+        execution_endpoint: Option<&Url>,
+    ) -> Result<(), ConfigError> {
+        Self::check_execution_listener(execution_listen, execution_endpoint, worker_listen)?;
+        Self::check_listener_collisions(listen, worker_listen, execution_listen, health_listen)
+    }
+
+    fn check_execution_host(
+        endpoint: Option<&Url>,
+        execution: Option<&Url>,
+        listen: SocketAddr,
+        execution_listen: Option<SocketAddr>,
+        transport: crate::ServerTransport,
+    ) -> Result<(), ConfigError> {
+        let public_host = endpoint.and_then(Url::host_str);
+        let execution_host = execution.and_then(Url::host_str);
+        let parse_ip = |host: &str| {
+            host.trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .ok()
+        };
+        let same_host = match (endpoint, execution, execution_listen) {
+            (_, None, None) => true,
+            (Some(_), Some(_), _) => public_host == execution_host,
+            (None, Some(_), _) => execution_host.and_then(parse_ip) == Some(listen.ip()),
+            (Some(_), None, Some(address)) => public_host.and_then(parse_ip) == Some(address.ip()),
+            (None, None, Some(address)) => listen.ip() == address.ip(),
+        };
+        if !same_host {
+            return Err(ConfigError::ExecutionEndpointHostMismatch {
+                endpoint: endpoint.map_or_else(|| listen.to_string(), ToString::to_string),
+                execution_endpoint: execution.map_or_else(
+                    || execution_listen.map_or_else(String::new, |address| address.to_string()),
+                    ToString::to_string,
+                ),
+            });
+        }
+        if let Some(address) = execution_listen {
+            let scheme = transport.public_scheme();
+            let public_scheme = endpoint.map_or(scheme, Url::scheme);
+            let execution_scheme = execution.map_or(scheme, Url::scheme);
+            let public_port = endpoint.map_or(Some(listen.port()), Url::port_or_known_default);
+            let execution_port = execution.map_or(Some(address.port()), Url::port_or_known_default);
+            if public_scheme == execution_scheme && public_port == execution_port {
+                return Err(ConfigError::ExecutionEndpointSelfRelay);
+            }
+        }
+        Ok(())
+    }
+
+    /// Rejects non-ephemeral listeners whose bind addresses overlap.
+    fn check_listener_collisions(
+        listen: SocketAddr,
+        worker_listen: SocketAddr,
+        execution_listen: Option<SocketAddr>,
+        health_listen: Option<SocketAddr>,
+    ) -> Result<(), ConfigError> {
+        let listeners = [
+            ("listen", Some(listen)),
+            ("worker_listen", Some(worker_listen)),
+            ("execution_listen", execution_listen),
+            ("health_listen", health_listen),
+        ];
+        for (index, (first, address)) in listeners.iter().enumerate() {
+            if let Some(address) = address
+                && address.port() != 0
+            {
+                for (second, other) in &listeners[index + 1..] {
+                    if let Some(other) = other
+                        && address.port() == other.port()
+                        && (address.ip() == other.ip()
+                            || ((address.ip().is_unspecified() || other.ip().is_unspecified())
+                                && address.is_ipv4() == other.is_ipv4()))
+                    {
+                        return Err(ConfigError::ListenerCollision {
+                            first,
+                            second,
+                            listen: *address,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks that the advertised execution endpoint's scheme matches the transport.
+    fn check_execution_endpoint(
+        transport: &Transport,
+        execution_endpoint: Option<&Url>,
+    ) -> Result<(), ConfigError> {
+        let Some(endpoint) = execution_endpoint else {
+            return Ok(());
+        };
+        match transport {
+            Transport::Tls { .. } if endpoint.scheme() != transport.kind().public_scheme() => {
+                Err(ConfigError::ExecutionEndpointNotHttps(endpoint.clone()))
+            }
+            Transport::Plaintext if !matches!(endpoint.scheme(), "http" | "https") => {
+                Err(ConfigError::ExecutionEndpointNotHttp(endpoint.clone()))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Checks the leader-only listeners and the advertised execution endpoint.
+    fn check_execution_listener(
+        execution_listen: Option<SocketAddr>,
+        execution_endpoint: Option<&Url>,
+        worker_listen: SocketAddr,
+    ) -> Result<(), ConfigError> {
+        if execution_endpoint.is_some() && execution_listen.is_none() {
+            return Err(ConfigError::ExecutionEndpointWithoutListen);
+        }
+        if let Some(listen) = execution_listen {
+            for (key, address) in [
+                ("execution_listen", listen),
+                ("worker_listen", worker_listen),
+            ] {
+                if address.port() == 0 {
+                    return Err(ConfigError::LeaderListenerPortUnset {
+                        key,
+                        listen: address,
+                    });
+                }
+            }
+            if execution_endpoint.is_none() && !listen.ip().is_loopback() {
+                return Err(ConfigError::ExecutionEndpointRequired { listen });
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks that renewal, mutation margin and clock skew fit strictly within the lease, and
+    /// that a takeover completes before clients drop a frozen leader.
+    fn check_leadership(server: &ServerConfig) -> Result<(), ConfigError> {
+        let leadership = &server.leadership;
+        if leadership
+            .ttl
+            .get()
+            .checked_sub(leadership.clock_skew)
+            .and_then(|remaining| remaining.checked_sub(leadership.call_timeout.get()))
+            .is_none_or(|remaining| leadership.renew_interval.get() >= remaining)
+        {
+            return Err(ConfigError::LeadershipRenewalTooLate {
+                ttl: leadership.ttl.get(),
+                renew_interval: leadership.renew_interval.get(),
+                call_timeout: leadership.call_timeout.get(),
+                clock_skew: leadership.clock_skew,
+            });
+        }
+        Self::check_leadership_keepalive(server)
+    }
+
+    /// Checks that a replacement leader becomes healthy before clients reconnect.
+    fn check_leadership_keepalive(server: &ServerConfig) -> Result<(), ConfigError> {
+        let leadership = &server.leadership;
+        let takeover = leadership
+            .ttl
+            .get()
+            .saturating_add(leadership.clock_skew)
+            .saturating_add(leadership.renew_interval.get());
+        let healthy_window = gang_types::health::health_check().healthy_window();
+        let keepalive_timeout = gang_types::health::CLIENT_KEEPALIVE_TIMEOUT;
+        if takeover.saturating_add(healthy_window) >= keepalive_timeout {
+            return Err(ConfigError::LeadershipOutlastsKeepalive {
+                takeover,
+                healthy_window,
+                keepalive_timeout,
+            });
+        }
+        Ok(())
     }
 
     /// Checks the scheduler's advertised worker endpoint against its listener and transport.

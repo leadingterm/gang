@@ -126,7 +126,7 @@ export const Activity = () => {
           ))}
           <div class="lanes__axis axis">
             {Array.from({ length: HOURS + 1 }, (_, i) => (
-              <span key={i}>{i === HOURS ? "now" : `−${HOURS - i}h`}</span>
+              <span key={i}>{i === HOURS ? "now" : <>−<time dateTime={`PT${HOURS - i}H`}>{HOURS - i}h</time></>}</span>
             ))}
           </div>
         </div>
@@ -134,7 +134,7 @@ export const Activity = () => {
       <Section id="log-h" title="Log" count={shown.length}>
         {byHour(shown, now).map(([hour, label, entries]) => (
           <Fragment key={hour}>
-            <h3 class="hour">{label}</h3>
+            <h3 class="hour"><time dateTime={`${hour}:00Z`}>{label}</time></h3>
             <ol class="events">
               {entries.map((e) => (
                 <EventRow key={e.name} e={e} withCause />

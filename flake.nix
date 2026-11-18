@@ -60,8 +60,12 @@
         doInstallCheck = true;
         installCheckPhase = ''
           runHook preInstallCheck
-          if ${pkgs.binutils}/bin/readelf -lW $out/bin/gang | grep -q INTERP \
-            || ${pkgs.binutils}/bin/readelf -dW $out/bin/gang | grep -q NEEDED; then
+          if ! ${pkgs.binutils}/bin/readelf -lW "$out/bin/gang" > program-headers \
+            || ! ${pkgs.binutils}/bin/readelf -dW "$out/bin/gang" > dynamic-section; then
+            echo 'gang is not an ELF binary' >&2
+            exit 1
+          fi
+          if grep -q INTERP program-headers || grep -q NEEDED dynamic-section; then
             echo "gang must be static: it has an ELF interpreter or a needed shared library" >&2
             exit 1
           fi
@@ -98,12 +102,10 @@
 
     checks = lib.genAttrs ["x86_64-linux"] (system: let
       pkgs = pkgsFor system;
-    in {
-      gang-scratch = import ./infra/nixos/tests/gang-scratch.nix {inherit pkgs;};
-      gang-config = import ./infra/nixos/tests/gang-config.nix {inherit pkgs;};
-      glibc-loader = import ./infra/nixos/tests/glibc-loader.nix {inherit pkgs;};
-      action-tools = import ./infra/nixos/tests/action-tools.nix {inherit pkgs;};
-    });
+      testsDir = ./infra/nixos/tests;
+      tests = lib.filterAttrs (file: type: type == "regular" && lib.hasSuffix ".nix" file) (builtins.readDir testsDir);
+    in
+      lib.mapAttrs' (file: _: lib.nameValuePair (lib.removeSuffix ".nix" file) (import (testsDir + "/${file}") {inherit pkgs;})) tests);
 
     packages = forLinuxSystems (system: let
       pkgs = pkgsFor system;
@@ -149,7 +151,7 @@
 
     devShells = forAllSystems (system: let
       pkgs = pkgsFor system;
-      actionTools = [pkgs.bash pkgs.coreutils pkgs.diffutils pkgs.gawk pkgs.gnugrep pkgs.gnused pkgs.findutils];
+      actionTools = [pkgs.bash pkgs.coreutils pkgs.diffutils pkgs.gawk pkgs.gnugrep pkgs.gnused pkgs.findutils] ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.util-linux];
       # macOS builds use Apple's toolchain through /usr/bin; Nix tools come first to keep bash and coreutils pinned.
       actionPath = lib.concatStringsSep ":" ([(lib.makeBinPath actionTools)] ++ lib.optional pkgs.stdenv.hostPlatform.isDarwin "/usr/bin");
       bazelrc = pkgs.writeText "gang.bazelrc" ''
@@ -170,7 +172,13 @@
       # The identity scenario's browser. Chromium aborts when fontconfig finds no fonts, so it gets a pinned configuration.
       e2eChromium = pkgs.runCommand "gang-e2e-chromium" {nativeBuildInputs = [pkgs.makeWrapper];} ''
         makeWrapper ${pkgs.chromium}/bin/chromium $out/bin/chromium \
-          --set FONTCONFIG_FILE ${pkgs.makeFontsConf {fontDirectories = [pkgs.dejavu_fonts];}}
+          --set FONTCONFIG_FILE ${pkgs.writeText "gang-fonts.conf" ''
+          <fontconfig><dir>${pkgs.dejavu_fonts}/share/fonts/truetype</dir><cachedir prefix='xdg'>fontconfig</cachedir></fontconfig>
+        ''}
+        ln -s ${pkgs.chromium}/bin/chromium $out/bin/chromium-bazel
+        mkdir -p $out/share/fonts
+        ln -s ${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans.ttf $out/share/fonts/DejaVuSans.ttf
+        ln -s ${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSansMono.ttf $out/share/fonts/DejaVuSansMono.ttf
       '';
       deployTools = [pkgs.awscli2 pkgs.coreutils pkgs.gh pkgs.git pkgs.jq pkgs.opentofu];
     in {
@@ -184,12 +192,18 @@
             paths = actionTools;
             pathsToLink = ["/bin"];
           }}/bin";
+          GANG_IMPORT_TEST_TOOLS = "${pkgs.buildEnv {
+            name = "gang-import-test-tools";
+            paths = [pkgs.jq pkgs.zstd];
+            pathsToLink = ["/bin"];
+          }}/bin";
           packages =
             [
               bazel
               pkgs.actionlint
               pkgs.alejandra
               pkgs.shellcheck
+              pkgs.yq-go
             ]
             ++ deployTools
             ++ lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.bubblewrap;

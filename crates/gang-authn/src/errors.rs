@@ -25,7 +25,7 @@ pub enum TokenError {
     #[error("token audience does not match")]
     #[failure(rejected(InvalidProof))]
     Audience,
-    /// The token expired before the current time, allowing for clock skew.
+    /// The token reached its expiry deadline, allowing clock skew for client tokens only.
     #[error("token has expired")]
     #[failure(rejected(InvalidProof))]
     Expired,

@@ -57,6 +57,33 @@ data "aws_iam_policy_document" "this" {
     ]
   }
 
+  dynamic "statement" {
+    for_each = local.group_shape ? [1] : []
+    content {
+      sid       = "ControllerLifecycle"
+      effect    = "Allow"
+      actions   = ["autoscaling:CompleteLifecycleAction", "autoscaling:DescribeLifecycleHooks"]
+      resources = ["arn:${data.aws_partition.this.partition}:autoscaling:${data.aws_region.this.region}:${data.aws_caller_identity.this.account_id}:autoScalingGroup:*:autoScalingGroupName/${var.name}"]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.dynamodb_table_arn == null ? [] : [var.dynamodb_table_arn]
+    content {
+      sid    = "Database"
+      effect = "Allow"
+      actions = [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:DeleteItem",
+        "dynamodb:Query",
+        "dynamodb:ConditionCheckItem",
+      ]
+      resources = [statement.value]
+    }
+  }
+
   # Describing instances does not support resource-level scoping.
   statement {
     sid       = "DescribeInstances"

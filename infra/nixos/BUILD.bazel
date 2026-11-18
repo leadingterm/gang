@@ -1,0 +1,5 @@
+# The PostgreSQL plugin's tests prove every certificate in the bundle loads.
+exports_files(
+    ["rds-ca-bundle.pem"],
+    visibility = ["//crates/gang-postgres:__pkg__"],
+)

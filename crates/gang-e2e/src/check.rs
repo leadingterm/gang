@@ -92,6 +92,16 @@ impl Check {
     }
 }
 
+/// Records the build verdict and says whether its reports can be read.
+pub(crate) fn record_build(
+    checks: &mut Vec<Check>,
+    outcome: &crate::build_output::BuildOutcome,
+    check: Check,
+) -> bool {
+    checks.push(check);
+    outcome.succeeded()
+}
+
 /// Turns the timeout of an awaited condition into a failed check named `name`, so that a system
 /// that never reaches the state is a verdict, not a harness error. Other errors pass through.
 ///
@@ -107,6 +117,17 @@ pub fn awaited<T>(name: impl Into<Cow<'static, str>>, result: Result<T>) -> Resu
         )),
         Err(error) => Err(error),
     }
+}
+
+/// Adds a variant label without discarding any of its verdicts.
+pub(crate) fn prefix_checks(checks: Vec<Check>, prefix: &str) -> Vec<Check> {
+    checks
+        .into_iter()
+        .map(|mut check| {
+            check.name = format!("{prefix}: {}", check.name).into();
+            check
+        })
+        .collect()
 }
 
 impl fmt::Display for Check {

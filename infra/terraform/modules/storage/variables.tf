@@ -47,6 +47,57 @@ variable "ca_signer_role_arn" {
   }
 }
 
+variable "dynamodb_table" {
+  description = "Optional DynamoDB table for shared controller state, identified by its table name."
+  type        = object({ name = string })
+  default     = null
+
+  validation {
+    condition     = var.dynamodb_table == null ? true : can(regex("^[a-zA-Z0-9_.-]{3,255}$", var.dynamodb_table.name))
+    error_message = "dynamodb_table.name must be 3 to 255 letters, digits, underscores, hyphens or periods."
+  }
+}
+
+variable "postgres_rds" {
+  description = "Optional PostgreSQL RDS instance and its private network configuration. Increment password_version to rotate the database password."
+  type = object({
+    instance_class           = string
+    multi_az                 = bool
+    storage_gib              = number
+    engine_version           = string
+    password_version         = optional(number, 1)
+    vpc_id                   = string
+    subnet_ids               = list(string)
+    client_security_group_id = string
+  })
+  default = null
+
+  validation {
+    condition     = var.postgres_rds == null ? true : try(var.postgres_rds.storage_gib >= 20, false)
+    error_message = "postgres_rds.storage_gib must be at least 20."
+  }
+
+  validation {
+    condition     = var.postgres_rds == null ? true : var.postgres_rds.multi_az != null
+    error_message = "postgres_rds.multi_az must be a boolean."
+  }
+
+  validation {
+    condition     = var.postgres_rds == null ? true : can(regex("^[0-9]+$", var.postgres_rds.engine_version))
+    error_message = "postgres_rds.engine_version must contain only major-version digits."
+  }
+
+  validation {
+    condition     = var.postgres_rds == null ? true : try(length(distinct(var.postgres_rds.subnet_ids)) >= 2, false)
+    error_message = "postgres_rds.subnet_ids must contain at least two distinct subnets in different availability zones."
+  }
+
+  validation {
+    condition     = var.postgres_rds == null ? true : var.postgres_rds.password_version >= 1 && floor(var.postgres_rds.password_version) == var.postgres_rds.password_version
+    error_message = "postgres_rds.password_version must be a whole number of at least 1."
+  }
+}
+
 variable "tags" {
   description = "Tags merged into every taggable resource in this module."
   type        = map(string)

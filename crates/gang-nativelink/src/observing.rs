@@ -8,7 +8,7 @@ use futures::StreamExt;
 use gang_clock::Timestamp;
 use gang_spi::{Executed, ExecutionTimes, Observation, ObservationSink, Phase};
 use gang_types::Identity;
-use nativelink_error::Error;
+use nativelink_error::{Code, Error, make_err};
 use nativelink_metric::{
     MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent, RootMetricsComponent,
 };
@@ -27,18 +27,23 @@ use nativelink_util::operation_state_manager::{
 };
 use nativelink_util::origin_event::OriginMetadata;
 use nativelink_util::shutdown_guard::ShutdownGuard;
+use tokio::sync::RwLock;
 
 use crate::actions::digest_text;
+use crate::handoff::HandOff;
 use crate::observer::origin;
 
 /// Forwards every call to the inner worker scheduler and counts the actions that reach a
 /// terminal result on a worker. Only a successful `Completed` update counts: errors, keep-alives,
-/// declines, disconnects and results served from the cache do not.
+/// declines, disconnects and results served from the cache do not. Once the hand-off begins, it
+/// refuses new and undrained workers and releases each worker when it falls idle.
 pub(crate) struct ObservingWorkerScheduler {
     inner: Arc<dyn WorkerScheduler>,
     operations: Arc<dyn ClientStateManager>,
     completed: Arc<AtomicU64>,
     sink: ObservationSink,
+    handoff: HandOff,
+    retiring: RwLock<bool>,
 }
 
 impl ObservingWorkerScheduler {
@@ -48,12 +53,65 @@ impl ObservingWorkerScheduler {
         operations: Arc<dyn ClientStateManager>,
         completed: Arc<AtomicU64>,
         sink: ObservationSink,
+        handoff: HandOff,
     ) -> Self {
         Self {
             inner,
             operations,
             completed,
             sink,
+            handoff,
+            retiring: RwLock::new(false),
+        }
+    }
+
+    /// Stops dispatch before notifying action streams, then disconnects idle workers.
+    pub(crate) async fn begin_hand_off(&self) {
+        let mut retiring = self.retiring.write().await;
+        if *retiring {
+            return;
+        }
+        *retiring = true;
+        let workers = self.inner.worker_snapshot().await;
+        drop(retiring);
+        for worker in &workers {
+            let id = WorkerId::from(worker.id.clone());
+            if let Err(error) = self.inner.set_drain_worker(&id, true).await {
+                tracing::warn!(?error, worker = %worker.id, "could not drain worker during hand-off");
+            }
+        }
+        self.handoff.begin();
+        for worker in self.inner.worker_snapshot().await {
+            if worker.running_actions == 0 {
+                let id = WorkerId::from(worker.id.clone());
+                if let Err(error) = self.inner.remove_worker(&id).await {
+                    tracing::warn!(?error, worker = %worker.id, "could not remove idle worker during hand-off");
+                }
+            }
+        }
+        self.signal_if_released().await;
+    }
+
+    async fn remove_if_retiring_and_idle(&self, worker_id: &WorkerId) {
+        let retiring = *self.retiring.read().await;
+        if retiring
+            && self
+                .inner
+                .worker_snapshot()
+                .await
+                .into_iter()
+                .any(|worker| worker.id == worker_id.0 && worker.running_actions == 0)
+            && let Err(error) = self.inner.remove_worker(worker_id).await
+        {
+            tracing::warn!(?error, worker = %worker_id.0, "could not remove idle worker during hand-off");
+        }
+        self.signal_if_released().await;
+    }
+
+    async fn signal_if_released(&self) {
+        let retiring = *self.retiring.read().await;
+        if retiring && self.inner.worker_snapshot().await.is_empty() {
+            self.handoff.release_workers();
         }
     }
 
@@ -128,6 +186,13 @@ impl WorkerScheduler for ObservingWorkerScheduler {
     }
 
     async fn add_worker(&self, worker: Worker) -> Result<(), Error> {
+        let retiring = self.retiring.read().await;
+        if *retiring {
+            return Err(make_err!(
+                Code::Unavailable,
+                "the controller is handing off"
+            ));
+        }
         self.inner.add_worker(worker).await
     }
 
@@ -148,9 +213,14 @@ impl WorkerScheduler for ObservingWorkerScheduler {
         reason: String,
         needs_kb: Option<u64>,
     ) -> Result<(), Error> {
-        self.inner
+        let result = self
+            .inner
             .worker_dispatch_declined(worker_id, operation_id, reason, needs_kb)
-            .await
+            .await;
+        if result.is_ok() {
+            self.remove_if_retiring_and_idle(worker_id).await;
+        }
+        result
     }
 
     async fn update_action(
@@ -159,6 +229,14 @@ impl WorkerScheduler for ObservingWorkerScheduler {
         operation_id: &OperationId,
         update: UpdateOperationType,
     ) -> Result<(), Error> {
+        let terminal = matches!(
+            update,
+            UpdateOperationType::UpdateWithActionStage(
+                ActionStage::Completed(_) | ActionStage::CompletedFromCache(_)
+            ) | UpdateOperationType::UpdateWithError(_)
+                | UpdateOperationType::UpdateWithDisconnect
+                | UpdateOperationType::UpdateWithDecline(_)
+        );
         let sent = match &update {
             UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(result)) => {
                 Some((result.exit_code, result.execution_metadata.clone()))
@@ -198,6 +276,9 @@ impl WorkerScheduler for ObservingWorkerScheduler {
                 self.sink.record(Observation::Executed(executed));
             }
         }
+        if terminal && result.is_ok() {
+            self.remove_if_retiring_and_idle(worker_id).await;
+        }
         result
     }
 
@@ -228,9 +309,14 @@ impl WorkerScheduler for ObservingWorkerScheduler {
         worker_id: &WorkerId,
         operation_ids: Vec<OperationId>,
     ) -> Result<(), Error> {
-        self.inner
+        let result = self
+            .inner
             .worker_running_operations_reported(worker_id, operation_ids)
-            .await
+            .await;
+        if result.is_ok() {
+            self.remove_if_retiring_and_idle(worker_id).await;
+        }
+        result
     }
 
     async fn worker_liveness_refreshed(
@@ -244,11 +330,15 @@ impl WorkerScheduler for ObservingWorkerScheduler {
     }
 
     async fn remove_worker(&self, worker_id: &WorkerId) -> Result<(), Error> {
-        self.inner.remove_worker(worker_id).await
+        let result = self.inner.remove_worker(worker_id).await;
+        self.signal_if_released().await;
+        result
     }
 
     async fn worker_disconnected(&self, worker_id: &WorkerId) -> Result<(), Error> {
-        self.inner.worker_disconnected(worker_id).await
+        let result = self.inner.worker_disconnected(worker_id).await;
+        self.signal_if_released().await;
+        result
     }
 
     async fn shutdown(&self, shutdown_guard: ShutdownGuard) {
@@ -256,10 +346,19 @@ impl WorkerScheduler for ObservingWorkerScheduler {
     }
 
     async fn remove_timedout_workers(&self, now_timestamp: WorkerTimestamp) -> Result<(), Error> {
-        self.inner.remove_timedout_workers(now_timestamp).await
+        let result = self.inner.remove_timedout_workers(now_timestamp).await;
+        self.signal_if_released().await;
+        result
     }
 
     async fn set_drain_worker(&self, worker_id: &WorkerId, is_draining: bool) -> Result<(), Error> {
+        let retiring = self.retiring.read().await;
+        if *retiring && !is_draining {
+            return Err(make_err!(
+                Code::Unavailable,
+                "the controller is handing off"
+            ));
+        }
         self.inner.set_drain_worker(worker_id, is_draining).await
     }
 
@@ -472,8 +571,13 @@ mod tests {
                     stage: Arc::clone(&inner.stage),
                 })
             };
-            let scheduler =
-                ObservingWorkerScheduler::new(inner, operations, Arc::clone(&completed), sink);
+            let scheduler = ObservingWorkerScheduler::new(
+                inner,
+                operations,
+                Arc::clone(&completed),
+                sink,
+                HandOff::new(),
+            );
             let forwarded = scheduler
                 .update_action(
                     &worker,
@@ -494,10 +598,10 @@ mod tests {
                 assert!(observation.is_none());
                 continue;
             }
-            let Some(gang_spi::Delivery::Observation(observation)) = observation else {
-                panic!("expected observation")
-            };
-            let Observation::Executed(executed) = *observation else {
+            let observation = observation
+                .and_then(gang_spi::Delivery::into_observation)
+                .expect("expected observation");
+            let Observation::Executed(executed) = observation else {
                 panic!("expected execution")
             };
             assert_eq!(
@@ -585,6 +689,7 @@ mod tests {
                 }),
                 Arc::clone(&completed),
                 sink,
+                HandOff::new(),
             );
             scheduler
                 .update_action(
@@ -614,25 +719,32 @@ mod tests {
 
     use super::*;
 
-    /// Fails `update_action` when asked to, and accepts every other call.
+    /// Fails `update_action` when asked to, and accepts every other call. With `workers` set, it
+    /// serves them as its snapshot, releases a slot per completion and records removals and drains.
     struct RecordingScheduler {
         fail_updates: bool,
+        block_first_worker: AtomicBool,
         published: AtomicBool,
         stage: Arc<parking_lot::Mutex<Option<ActionStage>>>,
         requeue: AtomicBool,
         replacement: parking_lot::Mutex<Option<ActionResult>>,
         manager: PlatformPropertyManager,
+        workers: parking_lot::Mutex<Option<Vec<WorkerSummary>>>,
+        events: parking_lot::Mutex<Vec<String>>,
     }
 
     impl RecordingScheduler {
         fn new(fail_updates: bool) -> Self {
             Self {
                 fail_updates,
+                block_first_worker: AtomicBool::new(false),
                 published: AtomicBool::new(false),
                 stage: Arc::new(parking_lot::Mutex::new(None)),
                 requeue: AtomicBool::new(false),
                 replacement: parking_lot::Mutex::new(None),
                 manager: PlatformPropertyManager::new(HashMap::new()),
+                workers: parking_lot::Mutex::new(None),
+                events: parking_lot::Mutex::new(Vec::new()),
             }
         }
     }
@@ -670,26 +782,41 @@ mod tests {
 
         async fn worker_dispatch_declined(
             &self,
-            _worker_id: &WorkerId,
+            worker_id: &WorkerId,
             _operation_id: &OperationId,
             _reason: String,
             _needs_kb: Option<u64>,
         ) -> Result<(), Error> {
+            if let Some(workers) = self.workers.lock().as_mut() {
+                let worker = workers
+                    .iter_mut()
+                    .find(|worker| worker.id == worker_id.0)
+                    .ok_or_else(|| make_err!(Code::NotFound, "worker missing"))?;
+                worker.running_actions = worker.running_actions.saturating_sub(1);
+            }
             Ok(())
         }
 
         async fn update_action(
             &self,
-            _worker_id: &WorkerId,
+            worker_id: &WorkerId,
             _operation_id: &OperationId,
             update: UpdateOperationType,
         ) -> Result<(), Error> {
+            if self.block_first_worker.load(Ordering::Relaxed) && worker_id.0 == "first" {
+                std::future::pending::<()>().await;
+            }
             if self.fail_updates {
                 return Err(make_err!(Code::Internal, "update rejected"));
             }
             if let UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(result)) =
                 update
             {
+                if let Some(workers) = self.workers.lock().as_mut()
+                    && let Some(worker) = workers.iter_mut().find(|worker| worker.id == worker_id.0)
+                {
+                    worker.running_actions = worker.running_actions.saturating_sub(1);
+                }
                 let mut stage = self.stage.lock();
                 if !matches!(*stage, Some(ActionStage::Completed(_))) {
                     *stage = Some(if self.requeue.load(Ordering::Relaxed) {
@@ -722,9 +849,18 @@ mod tests {
 
         async fn worker_running_operations_reported(
             &self,
-            _worker_id: &WorkerId,
-            _operation_ids: Vec<OperationId>,
+            worker_id: &WorkerId,
+            operation_ids: Vec<OperationId>,
         ) -> Result<(), Error> {
+            if let Some(workers) = self.workers.lock().as_mut() {
+                let worker = workers
+                    .iter_mut()
+                    .find(|worker| worker.id == worker_id.0)
+                    .ok_or_else(|| make_err!(Code::NotFound, "worker missing"))?;
+                if operation_ids.is_empty() {
+                    worker.running_actions = 0;
+                }
+            }
             Ok(())
         }
 
@@ -736,7 +872,11 @@ mod tests {
             Ok(())
         }
 
-        async fn remove_worker(&self, _worker_id: &WorkerId) -> Result<(), Error> {
+        async fn remove_worker(&self, worker_id: &WorkerId) -> Result<(), Error> {
+            self.events.lock().push(format!("remove:{}", worker_id.0));
+            if let Some(workers) = self.workers.lock().as_mut() {
+                workers.retain(|worker| worker.id != worker_id.0);
+            }
             Ok(())
         }
 
@@ -755,13 +895,19 @@ mod tests {
 
         async fn set_drain_worker(
             &self,
-            _worker_id: &WorkerId,
-            _is_draining: bool,
+            worker_id: &WorkerId,
+            is_draining: bool,
         ) -> Result<(), Error> {
+            self.events
+                .lock()
+                .push(format!("drain:{}:{is_draining}", worker_id.0));
             Ok(())
         }
 
         async fn worker_snapshot(&self) -> Vec<WorkerSummary> {
+            if let Some(workers) = self.workers.lock().as_ref() {
+                return workers.clone();
+            }
             vec![WorkerSummary {
                 id: "snap".to_owned(),
                 running_actions: 1,
@@ -797,8 +943,119 @@ mod tests {
             }),
             Arc::clone(&completed),
             ObservationSink::channel(std::num::NonZeroUsize::MIN, std::num::NonZeroUsize::MIN).0,
+            HandOff::new(),
         );
         (inner, counting, completed)
+    }
+
+    #[tokio::test]
+    async fn blocked_worker_update_does_not_block_other_workers() -> gang_testkit::TestResult {
+        let (inner, counting, _) = wrap(false);
+        inner.block_first_worker.store(true, Ordering::Relaxed);
+        let first = WorkerId("first".into());
+        let second = WorkerId("second".into());
+        let operation = OperationId::String("op-1".into());
+        let mut blocked = std::pin::pin!(counting.update_action(
+            &first,
+            &operation,
+            UpdateOperationType::KeepAlive
+        ));
+        assert!(futures::poll!(blocked.as_mut()).is_pending());
+        let mut independent = std::pin::pin!(counting.update_action(
+            &second,
+            &operation,
+            UpdateOperationType::KeepAlive
+        ));
+        assert!(matches!(
+            futures::poll!(independent.as_mut()),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handoff_releases_worker_after_decline_or_reconciliation() -> gang_testkit::TestResult {
+        for declined in [true, false] {
+            let (inner, counting, _) = wrap(false);
+            let mut worker = inner.worker_snapshot().await.remove(0);
+            worker.id = "busy".to_owned();
+            worker.running_actions = 1;
+            *inner.workers.lock() = Some(vec![worker]);
+            counting.begin_hand_off().await;
+            let mut released = std::pin::pin!(counting.handoff.workers_released());
+            assert!(futures::poll!(released.as_mut()).is_pending());
+            let id = WorkerId("busy".into());
+            if declined {
+                counting
+                    .worker_dispatch_declined(
+                        &id,
+                        &OperationId::String("op-1".into()),
+                        "declined".into(),
+                        None,
+                    )
+                    .await?;
+            } else {
+                counting
+                    .worker_running_operations_reported(&id, Vec::new())
+                    .await?;
+            }
+            assert!(
+                inner.worker_snapshot().await.is_empty(),
+                "idle worker was not released"
+            );
+            assert!(futures::poll!(released.as_mut()).is_ready());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handoff_drains_every_worker_before_removing_idle_and_releases_busy_at_completion() {
+        let (inner, counting, _) = wrap(false);
+        let mut idle = inner.worker_snapshot().await.remove(0);
+        idle.id = "idle".to_owned();
+        idle.running_actions = 0;
+        let mut busy = idle.clone();
+        busy.id = "busy".to_owned();
+        busy.running_actions = 1;
+        *inner.workers.lock() = Some(vec![idle, busy]);
+
+        counting.begin_hand_off().await;
+        assert!(counting.handoff.is_begun());
+        assert_eq!(
+            *inner.events.lock(),
+            vec!["drain:idle:true", "drain:busy:true", "remove:idle"]
+        );
+
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let worker = Worker::new(
+            WorkerId("new".into()),
+            nativelink_util::platform_properties::PlatformProperties::default(),
+            sender,
+            0,
+            0,
+        );
+        assert!(
+            matches!(counting.add_worker(worker).await, Err(error) if error.code == Code::Unavailable)
+        );
+        counting
+            .update_action(
+                &WorkerId("busy".into()),
+                &OperationId::String("op-1".into()),
+                UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(
+                    ActionResult::default(),
+                )),
+            )
+            .await
+            .expect("completion forwarded");
+        assert_eq!(
+            *inner.events.lock(),
+            vec![
+                "drain:idle:true",
+                "drain:busy:true",
+                "remove:idle",
+                "remove:busy"
+            ]
+        );
     }
 
     #[tokio::test]

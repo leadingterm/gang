@@ -22,8 +22,8 @@ use gang_types::{
     SessionMaxAge, TokenTtl, Url,
 };
 
-use crate::access::{IdentityKnobs, SIGN_IN_SUBJECT, Sessions, SignIn, StandingWorker};
-use crate::browser::{BROWSER_SUBJECT, SESSION_MAX_AGE, SESSION_TOKEN_TTL};
+use crate::access::{IdentityKnobs, Sessions, SignIn, StandingWorker};
+use crate::browser::{SESSION_MAX_AGE, SESSION_TOKEN_TTL};
 use crate::control::ControlKnobs;
 use crate::errors::{E2eError, Result};
 use crate::execution::{
@@ -186,8 +186,10 @@ pub(crate) fn place(
     if let SignerConfig::File(signer) = &mut document.signer {
         signer.key_file = absolute(placement.ca_key(), "the placement's CA key")?;
     }
-    let DatabaseConfig::Sqlite(sqlite) = &mut document.database;
-    sqlite.path = placement.database();
+    match &mut document.database {
+        DatabaseConfig::Sqlite(sqlite) => sqlite.path = placement.database(),
+        DatabaseConfig::Postgres(_) | DatabaseConfig::Dynamodb(_) => {}
+    }
     if let Some(noop) = &mut document.sandbox.noop {
         noop.scratch_dir = Some(absolute(
             placement.noop_scratch(),
@@ -358,6 +360,7 @@ impl ConfigTemplate {
         render_control(document, &variant.control)?;
         render_server(document, variant.server)?;
         render_execution(document, variant.execution)?;
+        constrain_shutdown_grace(document);
         Ok(self)
     }
 
@@ -599,22 +602,20 @@ fn configure_login(oidc: &mut gang_oidc::OidcConfig, subject: &str) -> Result<()
 
 /// Applies identity scenario tuning after the test issuer has been configured.
 fn render_identity(document: &mut Document<Plugins>, knobs: IdentityKnobs) -> Result<()> {
-    if knobs == IdentityKnobs::IDENTITY {
+    if knobs.standing_worker == StandingWorker::One
+        && knobs.sessions == Sessions::Default
+        && knobs.sign_in != SignIn::Absent
+    {
         document.dashboard.device.ttl =
             DeviceCodeTtl::try_new(DEVICE_TTL).map_err(template_error)?;
         document.server.rate_limit.client.burst = IDENTITY_CLIENT_BURST;
     }
-    if knobs.sign_in == SignIn::Offered {
+    if let Some(subject) = knobs.sign_in.subject(knobs.sessions) {
         let provider: ProviderName = PROVIDER.parse().map_err(template_error)?;
         let Some(IdentityProviderConfig::Oidc(oidc)) =
             document.identity.providers.get_mut(&provider)
         else {
             return Err(template_error("missing test identity provider"));
-        };
-        let subject = if knobs.sessions == Sessions::Short {
-            BROWSER_SUBJECT
-        } else {
-            SIGN_IN_SUBJECT
         };
         configure_login(oidc, subject)?;
         document.dashboard.login = Some(DashboardLogin {
@@ -636,7 +637,12 @@ fn render_identity(document: &mut Document<Plugins>, knobs: IdentityKnobs) -> Re
             permissions: [Permission::StateRead].into_iter().collect(),
             principals: vec![RolePrincipal {
                 provider: PROVIDER.parse().map_err(template_error)?,
-                principal: BROWSER_SUBJECT.parse().map_err(template_error)?,
+                principal: knobs
+                    .sign_in
+                    .subject(knobs.sessions)
+                    .ok_or_else(|| template_error("short sessions require interactive sign-in"))?
+                    .parse()
+                    .map_err(template_error)?,
             }],
         });
     }
@@ -709,6 +715,17 @@ fn render_control(document: &mut Document<Plugins>, knobs: &ControlKnobs) -> Res
             NonZeroDuration::try_new(interval).map_err(template_error)?;
     }
     Ok(())
+}
+
+/// Keeps scheduler drain below every fleet's boot grace. When it does not fit, use half the
+/// smallest boot grace; otherwise preserve the configured drain bound.
+fn constrain_shutdown_grace(document: &mut Document<Plugins>) {
+    if let Some(boot_grace) = document.fleets.iter().map(|fleet| fleet.boot_grace).min() {
+        let SchedulerConfig::Nativelink(scheduler) = &mut document.scheduler;
+        if scheduler.http2.shutdown_grace >= boot_grace {
+            scheduler.http2.shutdown_grace = boot_grace / 2;
+        }
+    }
 }
 
 /// Applies request, viewer and certificate tuning.

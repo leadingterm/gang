@@ -27,6 +27,9 @@ pub use errors::{PathIo, RunError, SpawnError};
 pub use lock::FileLock;
 pub use process::{
     ParentExit, ProcessGroup, RunOutput, join_parent_group, parent_process_group, run_bounded,
-    spawn_logged, terminate_process,
+    spawn_logged, spawn_logged_piped, terminate_process,
 };
 pub use signal::{TerminationsBlocked, block_terminations, clear_mask, shutdown_signal};
+pub use sys::PipeReader;
+#[cfg(target_os = "macos")]
+pub use sys::ProcessExitQueue;

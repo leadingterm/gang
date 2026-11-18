@@ -1,9 +1,9 @@
 // Builds observed in the recent window, and older builds still held by the server.
 import { useEffect, useState } from "preact/hooks";
-import { clock, duration, percent } from "../format.ts";
+import { percent } from "../format.ts";
 import { identityOf, ms, seconds, splitIdentity } from "../wire-parse.ts";
 import type { ActionTime, Build } from "../wire.ts";
-import { Empty, Num, Section, Since, useClient } from "../ui.tsx";
+import { Cell, Clock, Duration, Empty, Ident, Num, Row, Section, Since, Table, useClient } from "../ui.tsx";
 import { Forbidden } from "./gate.tsx";
 import type { Link } from "../client.ts";
 
@@ -31,25 +31,30 @@ const BuildRow = ({ build }: { build: Build }) => {
   const identity = identityOf(build.principal);
   const short = splitIdentity(identity)[1] || identity;
   return (
-    <tr>
-      <td class="a-main"><a href={`/ui/builds/${encodeURIComponent(build.name.slice("builds/".length))}`}>{short}</a></td>
-      <td class="a-kind"><span class="build-label">Started </span><Since t={ms(build.startTime)} /></td>
-      <td class="a-age"><span class="build-label">Span </span>{duration(ms(build.lastActiveTime) - ms(build.startTime))}</td>
-      <td class="a-m1"><span class="build-label">State </span><span class={build.state === "IDLE" ? "tag" : "tag tag--spot"}>{build.state}</span></td>
-      <td class="a-m2"><span class="build-label">Remote cache </span>{percent(cache.hits, cache.hits + cache.misses + cache.errors)}</td>
-      <td><span class="build-label">Executed </span>{build.usage.executions.completed + build.usage.executions.failed}</td>
-      <td><span class="build-label">Queued share </span>{percent(seconds(time.queued), actionSeconds(time))}</td>
-    </tr>
+    <Row>
+      <Cell cls="a-main"><a class="line" href={`/ui/builds/${encodeURIComponent(build.name.slice("builds/".length))}`}><Ident text={short} title={identity} /></a></Cell>
+      <Cell cls="a-kind"><span class="build-label">Started </span><Since t={ms(build.startTime)} /></Cell>
+      <Cell cls="a-age"><span class="build-label">Span </span><Duration ms={ms(build.lastActiveTime) - ms(build.startTime)} /></Cell>
+      <Cell cls="a-m1"><span class="build-label">State </span><span class={build.state === "IDLE" ? "tag" : "tag tag--spot"}>{build.state}</span></Cell>
+      <Cell cls="a-m2"><span class="build-label">Remote cache </span>{percent(cache.hits, cache.hits + cache.misses + cache.errors)}</Cell>
+      <Cell><span class="build-label">Executed </span>{build.usage.executions.completed + build.usage.executions.failed}</Cell>
+      <Cell><span class="build-label">Queued share </span>{percent(seconds(time.queued), actionSeconds(time))}</Cell>
+    </Row>
   );
 };
 
 const BuildTable = ({ builds }: { builds: readonly Build[] }) => (
-  <table class="table builds-table">
-    <thead>
-      <tr><th>Principal</th><th>Started</th><th>Span</th><th>State</th><th>Remote cache</th><th>Executed</th><th>Queued share</th></tr>
-    </thead>
-    <tbody>{builds.map((build) => <BuildRow key={build.name} build={build} />)}</tbody>
-  </table>
+  <Table cls="builds-table" cols={[
+    { head: "Principal", share: 1 },
+    { head: "Started" },
+    { head: "Span" },
+    { head: "State" },
+    { head: "Remote cache" },
+    { head: "Executed" },
+    { head: "Queued share" },
+  ]}>
+    {builds.map((build) => <BuildRow key={build.name} build={build} />)}
+  </Table>
 );
 
 export const Builds = () => {
@@ -80,7 +85,7 @@ export const Builds = () => {
       : <Empty><h2>Loading builds</h2></Empty>;
   return (
     <>
-      {earlier.kind === "loaded" && earlier.failing && <p class="caution" role="status">Could not refresh builds; showing them as of {clock(earlier.asOf)}</p>}
+      {earlier.kind === "loaded" && earlier.failing && <p class="caution" role="status">Could not refresh builds; showing them as of <Clock t={earlier.asOf} /></p>}
       <div class="toolbar" role="search">
         <label><input type="checkbox" checked={mine} onChange={(e) => setMine(e.currentTarget.checked)} /> Mine</label>
         <label class="field field--grow">

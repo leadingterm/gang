@@ -1,5 +1,10 @@
 load("//bazel/opentofu:defs.bzl", "opentofu_contract_test")
 
+exports_files(
+    ["health-check.json"],
+    visibility = ["//crates/gang-types:__pkg__"],
+)
+
 opentofu_contract_test(
     name = "load_balancer_contract",
 )

@@ -264,13 +264,25 @@ fn every_provisioner_port_reaches_the_selected_plugin() -> Result<(), Box<dyn Er
         "supply must overwrite its buffer"
     );
 
-    ready(provisioner.set_desired_capacity(fleet.view(), 4))?;
+    ready(gang_testkit::fence::with_held(async |held| {
+        provisioner
+            .set_desired_capacity(held, fleet.view(), 4)
+            .await
+    }))?;
     ready(provisioner.supply(fleet.view(), &mut supply))?;
     assert_eq!(supply.desired, 4);
-    ready(provisioner.set_desired_capacity(fleet.view(), 2))?;
+    ready(gang_testkit::fence::with_held(async |held| {
+        provisioner
+            .set_desired_capacity(held, fleet.view(), 2)
+            .await
+    }))?;
     ready(provisioner.supply(fleet.view(), &mut supply))?;
     assert_eq!(supply.desired, 2);
-    ready(provisioner.set_desired_capacity(fleet.view(), 0))?;
+    ready(gang_testkit::fence::with_held(async |held| {
+        provisioner
+            .set_desired_capacity(held, fleet.view(), 0)
+            .await
+    }))?;
     ready(provisioner.supply(fleet.view(), &mut supply))?;
     assert_eq!(
         supply.desired, 1,
@@ -278,8 +290,8 @@ fn every_provisioner_port_reaches_the_selected_plugin() -> Result<(), Box<dyn Er
     );
     let gone = instance(1)?;
     assert!(matches!(
-        ready(provisioner.terminate(fleet.view(), &gone)),
-        Err(PortError::NotFound(Subject::Instance(found))) if found == gone
+        ready(gang_testkit::fence::with_held(async |held| provisioner.terminate(held, fleet.view(), &gone).await)),
+        Err(gang_spi::RunError::Failed(PortError::NotFound(Subject::Instance(found)))) if found == gone
     ));
     assert_eq!(ready(provisioner.identity())?.instance, instance(2)?);
     assert_eq!(
@@ -295,6 +307,76 @@ fn every_provisioner_port_reaches_the_selected_plugin() -> Result<(), Box<dyn Er
     assert_eq!(
         ready(provisioner.workload_credential())?.expose(),
         "workload-2"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_composed_provisioner_delegates_converge() -> Result<(), Box<dyn Error>> {
+    let provisioner = Provisioner::build(parse(CONFIG)?.provisioner, &context())?;
+    let fleet = test_fleet(ProvisionerFleetOptions::Beta(OtherFleetOptions {}))?;
+    ready(gang_testkit::fence::with_held(async |held| {
+        provisioner.converge(held, fleet.view()).await
+    }))?;
+    let Provisioner::Beta(beta) = &provisioner else {
+        return Err("expected the beta provisioner".into());
+    };
+    assert_eq!(
+        *beta.converges.lock(),
+        1,
+        "the composed provisioner did not delegate converge"
+    );
+    Ok(())
+}
+
+/// A provisioner that inherits the default convergence behaviour.
+struct DefaultConverge;
+
+impl ProvisionerPort for DefaultConverge {
+    type FleetOptions = ProvisionerFleetOptions;
+
+    async fn supply(
+        &self,
+        _fleet: Fleet<'_, Self::FleetOptions>,
+        _into: &mut FleetSupply,
+    ) -> Result<(), PortError> {
+        Ok(())
+    }
+
+    async fn set_desired_capacity(
+        &self,
+        _held: &gang_spi::Held,
+        _fleet: Fleet<'_, Self::FleetOptions>,
+        _desired: u32,
+    ) -> Result<(), PortError> {
+        Ok(())
+    }
+
+    async fn terminate(
+        &self,
+        _held: &gang_spi::Held,
+        _fleet: Fleet<'_, Self::FleetOptions>,
+        _instance: &gang_types::InstanceId,
+    ) -> Result<(), PortError> {
+        Ok(())
+    }
+
+    fn worker_lifetime(&self) -> WorkerLifetime {
+        WorkerLifetime::LongLived
+    }
+}
+
+#[test]
+fn the_default_converge_refuses_an_expired_permission() -> Result<(), Box<dyn Error>> {
+    let fleet = test_fleet(ProvisionerFleetOptions::Beta(OtherFleetOptions {}))?;
+    assert!(
+        matches!(
+            ready(gang_testkit::fence::with_expired_held(async |held| {
+                DefaultConverge.converge(held, fleet.view()).await
+            })),
+            Err(gang_spi::RunError::Failed(PortError::Unavailable(_)))
+        ),
+        "the default converge accepted an expired permission"
     );
     Ok(())
 }
@@ -489,6 +571,7 @@ fn scheduler_runs_the_selected_controller_and_worker() -> Result<(), Box<dyn Err
             connections: futures::stream::empty().boxed(),
             gate: TestGate,
         },
+        execution: None,
         worker: Listening {
             connections: futures::stream::empty().boxed(),
             gate: TestGate,
@@ -862,7 +945,11 @@ fn each_provisioner_port_reaches_the_selected_plugin_with_its_options() -> Resul
 
     let mut supply = FleetSupply::default();
     ready(provisioner.supply(fleet.view(), &mut supply))?;
-    ready(provisioner.set_desired_capacity(fleet.view(), 1))?;
+    ready(gang_testkit::fence::with_held(async |held| {
+        provisioner
+            .set_desired_capacity(held, fleet.view(), 1)
+            .await
+    }))?;
     assert_eq!(seen_values(&alpha.seen), ["spot", "spot"]);
 
     let provisioner = Provisioner::build(parse(CONFIG)?.provisioner, &context())?;
@@ -891,13 +978,17 @@ fn foreign_fleet_options_are_rejected_without_panicking() -> Result<(), Box<dyn 
         Err(PortError::Config(_))
     ));
     assert!(matches!(
-        ready(provisioner.set_desired_capacity(fleet.view(), 2)),
-        Err(PortError::Config(_))
+        ready(gang_testkit::fence::with_held(async |held| provisioner
+            .set_desired_capacity(held, fleet.view(), 2)
+            .await)),
+        Err(gang_spi::RunError::Failed(PortError::Config(_)))
     ));
     let gone = instance(1)?;
     assert!(matches!(
-        ready(provisioner.terminate(fleet.view(), &gone)),
-        Err(PortError::Config(_))
+        ready(gang_testkit::fence::with_held(async |held| provisioner
+            .terminate(held, fleet.view(), &gone)
+            .await)),
+        Err(gang_spi::RunError::Failed(PortError::Config(_)))
     ));
     Ok(())
 }

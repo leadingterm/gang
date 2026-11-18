@@ -29,11 +29,16 @@
 
 mod authentication_port;
 mod cache_port;
+mod counter;
 mod credential_port;
 mod errors;
+mod expiring_port;
+mod fence;
 mod fleet_options;
+mod host_port;
 mod identity_port;
 mod isolation_port;
+mod lease_port;
 mod lifecycle_port;
 mod limits_port;
 mod observation_port;
@@ -42,8 +47,10 @@ mod private;
 mod provisioner_port;
 mod repository_port;
 mod scheduler_port;
+mod schema;
 mod scratch_port;
 mod signer_port;
+mod stored_scaling;
 
 pub use authentication_port::{
     Authenticated, AuthenticationHost, AuthenticationPort, AuthorityRequest, Capabilities,
@@ -53,8 +60,14 @@ pub use authentication_port::{
 pub use cache_port::{CacheStorePort, RenderedStoreSpec};
 pub use credential_port::WorkloadCredentialPort;
 pub use errors::{BoxedError, BuildError, PortError, Rejection, Subject};
+pub use expiring_port::{
+    ExpiringRecordPort, Insert, Record, RecordId, RecordKey, RecordKind, RecordVersion, Remove,
+    Replace,
+};
+pub use fence::{Deadline, Fence, Held, Keeper, LeaseLapsed, RunError, Work};
 pub use fleet_options::{FleetOptions, OptionSpec};
 pub use gang_macros::{FleetOptions, PortFailure, compose, port};
+pub use host_port::{ControllerHostPort, HostMilestone};
 pub use identity_port::{
     LoginChallenge, LoginClient, LoginGrant, LoginPort, LoginRequest, LoginSupport,
     ProofVerifierPort,
@@ -63,6 +76,7 @@ pub use isolation_port::{
     ActionCommand, ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort,
     EXEC_LINK_NAME, NETWORK_ENV, NetworkRequest, RESET_LINK_NAME, SandboxedAction, Termination,
 };
+pub use lease_port::{Acquisition, ControllerId, LeaderLeasePort, Lease, LeaseEpoch, Renewal};
 pub use lifecycle_port::{InstanceIdentity, NodeLifecyclePort, PreemptionNotice};
 pub use limits_port::{
     ActionLimits, ActionLimitsPort, ActionScope, ActionUsage, CPU_COUNT_ENV, GUARD_LINK_NAME,
@@ -79,8 +93,8 @@ pub use provisioner_port::{
     Sidecar,
 };
 pub use repository_port::{
-    CertStatus, IssuedCertRecord, PrincipalRecord, RecordedScalingEvent, ScalingAuditEvent,
-    ScalingEventKind, ScalingEventSeq, StateRepositoryPort,
+    CertStatus, IssuedCertRecord, PrincipalRecord, RecordedScalingEvent, RevocationEpoch,
+    ScalingAuditEvent, ScalingEventKind, ScalingEventSeq, StateRepositoryPort,
 };
 pub use scheduler_port::{
     Accepted, ActionInfo, ActionsView, Admitted, ApiRequestBody, ApiResponseBody, ApiService,
@@ -89,5 +103,7 @@ pub use scheduler_port::{
     RequestGate, RunningActionView, SchedulerPort, SchedulerSnapshot, Slots, StoreAccess,
     WorkerSpec, WorkerState, WorkerTls, full_body,
 };
+pub use schema::{SchemaPlan, SchemaTooNew, SchemaVersion};
 pub use scratch_port::{MountedScratchVolume, ScratchVolumePort};
 pub use signer_port::{CertificateSignerPort, SignatureAlgorithm};
+pub use stored_scaling::{StoredScalingKind, StoredScalingKindError};

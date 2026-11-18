@@ -83,15 +83,16 @@ impl Layout {
     /// Creates the directories, writes the sandbox configuration, and links the entrypoint and
     /// the join link.
     ///
-    /// The identity directory is emptied of the generations an earlier process left behind, then
-    /// created readable only by its owner. An existing sandbox file, entrypoint link, or join
-    /// link is replaced.
+    /// Abandoned work and identity generations from an earlier process are removed, while the
+    /// warm fast CAS is retained. The identity directory is created readable only by its owner.
+    /// An existing sandbox file, entrypoint link, or join link is replaced.
     ///
     /// # Errors
     ///
     /// Returns [`WorkerError::Io`] when a directory, the sandbox file, or the link cannot be
     /// created or written.
     pub fn prepare(&self, sandbox_file: &str, executable: &Path) -> Result<(), WorkerError> {
+        remove_dir_optional(&self.work_directory())?;
         create_directory(&self.work_directory())?;
         create_directory(&self.fast_cas_directory())?;
         create_directory(&self.bin_directory())?;

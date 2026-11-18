@@ -25,6 +25,8 @@ use url::Url;
 pub enum Side {
     /// The public listener: Bazel and `gang` clients.
     Public,
+    /// The execution listener: execution clients and leader API routes.
+    Execution,
     /// The worker listener: workers.
     Worker,
 }
@@ -49,6 +51,13 @@ trait Services: Send + Sync {
         parts: &'a mut http::request::Parts,
     ) -> BoxFuture<'a, Result<Admitted, PortError>>;
 
+    /// Applies the execution listener's gate, if that listener exists.
+    fn admit_execution<'a>(
+        &'a self,
+        peer: &'a Peer,
+        parts: &'a mut http::request::Parts,
+    ) -> BoxFuture<'a, Option<Result<Admitted, PortError>>>;
+
     /// Applies the worker listener's gate to a request.
     fn admit_worker<'a>(
         &'a self,
@@ -61,12 +70,20 @@ trait Services: Send + Sync {
         &self,
         request: http::Request<ApiRequestBody>,
     ) -> BoxFuture<'static, http::Response<ApiResponseBody>>;
+
+    /// Answers a request on the execution listener, if present.
+    fn call_execution_api(
+        &self,
+        request: http::Request<ApiRequestBody>,
+    ) -> BoxFuture<'static, Option<http::Response<ApiResponseBody>>>;
 }
 
-/// The gates of both listeners and the Gang API of one controller.
+/// The listener gates and the Gang API of one controller.
 struct Gates<P, W, A> {
     /// The public listener's gate.
     public: P,
+    /// The execution listener's gate, if present.
+    execution: Option<P>,
     /// The worker listener's gate.
     worker: W,
     /// The Gang API.
@@ -82,6 +99,19 @@ impl<P: RequestGate, W: RequestGate, A: ApiService> Services for Gates<P, W, A> 
         Box::pin(self.public.admit(peer, parts))
     }
 
+    fn admit_execution<'a>(
+        &'a self,
+        peer: &'a Peer,
+        parts: &'a mut http::request::Parts,
+    ) -> BoxFuture<'a, Option<Result<Admitted, PortError>>> {
+        Box::pin(async move {
+            match &self.execution {
+                Some(gate) => Some(gate.admit(peer, parts).await),
+                None => None,
+            }
+        })
+    }
+
     fn admit_worker<'a>(
         &'a self,
         peer: &'a Peer,
@@ -94,20 +124,37 @@ impl<P: RequestGate, W: RequestGate, A: ApiService> Services for Gates<P, W, A> 
         &self,
         request: http::Request<ApiRequestBody>,
     ) -> BoxFuture<'static, http::Response<ApiResponseBody>> {
+        Box::pin(admit_and_call(
+            self.public.clone(),
+            self.api.clone(),
+            request,
+        ))
+    }
+
+    fn call_execution_api(
+        &self,
+        request: http::Request<ApiRequestBody>,
+    ) -> BoxFuture<'static, Option<http::Response<ApiResponseBody>>> {
+        let gate = self.execution.clone();
         let api = self.api.clone();
-        let gate = self.public.clone();
-        Box::pin(async move {
-            let (mut parts, body) = request.into_parts();
-            match gate.admit(&Peer::default(), &mut parts).await {
-                Ok(admitted) => {
-                    if let Admitted::Authenticated(authenticated) = admitted {
-                        parts.extensions.insert(authenticated);
-                    }
-                    api.call(http::Request::from_parts(parts, body)).await
-                }
-                Err(error) => refusal(&error),
+        Box::pin(async move { Some(admit_and_call(gate?, api, request).await) })
+    }
+}
+
+async fn admit_and_call<P: RequestGate, A: ApiService>(
+    gate: P,
+    api: A,
+    request: http::Request<ApiRequestBody>,
+) -> http::Response<ApiResponseBody> {
+    let (mut parts, body) = request.into_parts();
+    match gate.admit(&Peer::default(), &mut parts).await {
+        Ok(admitted) => {
+            if let Admitted::Authenticated(authenticated) = admitted {
+                parts.extensions.insert(authenticated);
             }
-        })
+            api.call(http::Request::from_parts(parts, body)).await
+        }
+        Err(error) => refusal(&error),
     }
 }
 
@@ -158,6 +205,19 @@ impl Controller {
         self.services.admit_public(peer, parts).await
     }
 
+    /// Applies the execution listener's gate, or returns `None` without that listener.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the execution gate rejects the request with.
+    pub async fn admit_execution(
+        &self,
+        peer: &Peer,
+        parts: &mut http::request::Parts,
+    ) -> Option<Result<Admitted, PortError>> {
+        self.services.admit_execution(peer, parts).await
+    }
+
     /// Applies the worker listener's gate to a request, as the controller does before any worker
     /// service sees it.
     ///
@@ -179,6 +239,14 @@ impl Controller {
         request: http::Request<ApiRequestBody>,
     ) -> http::Response<ApiResponseBody> {
         self.services.call_api(request).await
+    }
+
+    /// Answers through the Gang API and execution gate, or returns `None` without that listener.
+    pub async fn call_execution_api(
+        &self,
+        request: http::Request<ApiRequestBody>,
+    ) -> Option<http::Response<ApiResponseBody>> {
+        self.services.call_execution_api(request).await
     }
 }
 
@@ -572,6 +640,7 @@ impl SchedulerPort for FakeScheduler {
         }
         let ControllerConnections {
             public,
+            execution,
             worker,
             api,
         } = connections;
@@ -579,6 +648,10 @@ impl SchedulerPort for FakeScheduler {
             connections: public_connections,
             gate: public_gate,
         } = public;
+        let (execution_connections, execution_gate) = match execution {
+            Some(Listening { connections, gate }) => (connections, Some(gate)),
+            None => (futures::stream::empty().boxed(), None),
+        };
         let Listening {
             connections: worker_connections,
             gate: worker_gate,
@@ -586,6 +659,7 @@ impl SchedulerPort for FakeScheduler {
         let controller = Controller {
             services: Arc::new(Gates {
                 public: public_gate,
+                execution: execution_gate,
                 worker: worker_gate,
                 api,
             }),
@@ -599,12 +673,20 @@ impl SchedulerPort for FakeScheduler {
             connection: accepted.connection,
             peer: accepted.peer,
         });
+        let execution_side = execution_connections.map(|accepted| Received {
+            side: Side::Execution,
+            connection: accepted.connection,
+            peer: accepted.peer,
+        });
         let worker_side = worker_connections.map(|accepted| Received {
             side: Side::Worker,
             connection: accepted.connection,
             peer: accepted.peer,
         });
-        let mut merged = futures::stream::select(public_side, worker_side);
+        let mut merged = futures::stream::select(
+            futures::stream::select(public_side, execution_side),
+            worker_side,
+        );
         while let Some(received) = merged.next().await {
             if let Some(sender) = &sender {
                 let _ = sender.send(received);
@@ -1020,6 +1102,25 @@ mod tests {
         }
     }
 
+    /// A request gate that admits like [`AdmitAll`] while open and refuses as unavailable while
+    /// closed.
+    #[derive(Clone)]
+    struct SwitchGate(bool);
+
+    impl RequestGate for SwitchGate {
+        async fn admit(
+            &self,
+            peer: &Peer,
+            parts: &mut http::request::Parts,
+        ) -> Result<Admitted, PortError> {
+            if self.0 {
+                AdmitAll.admit(peer, parts).await
+            } else {
+                Err(PortError::unavailable("gate is closed"))
+            }
+        }
+    }
+
     /// A Gang API that returns the admitted identity.
     #[derive(Clone)]
     struct CallerApi;
@@ -1042,10 +1143,201 @@ mod tests {
         }
     }
 
+    async fn assert_controller_gates(
+        controller: &Controller,
+        observations: &gang_spi::ObservationSink,
+    ) -> TestResult {
+        let public = controller.call_api(http::Request::new(full_body(""))).await;
+        assert_eq!(public.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        let execution = controller
+            .call_execution_api(http::Request::new(full_body("")))
+            .await
+            .ok_or("execution listener missing")?;
+        assert_eq!(execution.status(), http::StatusCode::OK);
+        let (mut parts, ()) = http::Request::new(()).into_parts();
+        assert!(matches!(
+            controller
+                .admit_execution(&Peer::default(), &mut parts)
+                .await,
+            Some(Ok(Admitted::Authenticated(_)))
+        ));
+        let rejecting = Controller {
+            services: Arc::new(Gates {
+                public: SwitchGate(true),
+                execution: Some(SwitchGate(false)),
+                worker: AdmitAll,
+                api: EmptyApi,
+            }),
+            observations: observations.clone(),
+        };
+        let denied = rejecting
+            .call_execution_api(http::Request::new(full_body("")))
+            .await
+            .ok_or("execution listener missing")?;
+        assert_eq!(denied.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execution_api_receives_the_admitted_identity() -> TestResult {
+        let gates = Gates {
+            public: AdmitAll,
+            execution: Some(AdmitAll),
+            worker: AdmitAll,
+            api: CallerApi,
+        };
+        let response = gates
+            .call_execution_api(http::Request::new(full_body("")))
+            .await
+            .ok_or("execution listener missing")?;
+        assert_eq!(response.headers()["x-caller"], "test:tester");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn controller_serves_all_listeners_until_each_stream_ends() -> TestResult {
+        let fixture = WorkerFixture::new()?;
+        let stores = gang_spi::RenderedStoreSpec(serde_json::Value::Null);
+        let catalog = gang_types::FleetCatalog::try_new(vec![fixture.properties.clone()])?;
+        let (observations, _receiver) = gang_spi::ObservationSink::channel(
+            std::num::NonZeroUsize::MIN,
+            std::num::NonZeroUsize::MIN,
+        );
+        let spec = ControllerSpec {
+            content_store: &stores,
+            action_store: &stores,
+            fleets: &catalog,
+            max_workers: 8,
+            client_action_timeout: std::time::Duration::from_mins(1),
+            observations: &observations,
+        };
+        for last in 0..3 {
+            let scheduler = FakeScheduler::new()?;
+            let mut received = scheduler.connections();
+            let (public_tx, public_rx) = futures::channel::mpsc::unbounded();
+            let (execution_tx, execution_rx) = futures::channel::mpsc::unbounded();
+            let (worker_tx, worker_rx) = futures::channel::mpsc::unbounded();
+            let mut senders = [Some(public_tx), Some(execution_tx), Some(worker_tx)];
+            let connections = ControllerConnections {
+                public: Listening {
+                    connections: public_rx.boxed(),
+                    gate: SwitchGate(false),
+                },
+                execution: Some(Listening {
+                    connections: execution_rx.boxed(),
+                    gate: SwitchGate(true),
+                }),
+                worker: Listening {
+                    connections: worker_rx.boxed(),
+                    gate: AdmitAll,
+                },
+                api: EmptyApi,
+            };
+            let (ready, mut readiness) = ControllerReady::channel();
+            let run = scheduler.run_controller(&spec, connections, ready);
+            futures::pin_mut!(run);
+            assert!(run.as_mut().now_or_never().is_none());
+            assert!(readiness.try_recv().is_ok());
+
+            let controller = scheduler
+                .controller()
+                .await
+                .ok_or("controller not published")?;
+            assert_controller_gates(&controller, &observations).await?;
+
+            for (sender, side) in senders
+                .iter()
+                .zip([Side::Public, Side::Execution, Side::Worker])
+            {
+                let (connection, _other) = tokio::io::duplex(64);
+                let accepted = gang_spi::Accepted {
+                    connection: Box::new(connection),
+                    peer: Peer::default(),
+                };
+                assert!(
+                    sender
+                        .as_ref()
+                        .ok_or("sender missing")?
+                        .unbounded_send(accepted)
+                        .is_ok()
+                );
+                assert!(run.as_mut().now_or_never().is_none());
+                assert_eq!(
+                    received.recv().await.ok_or("connection missing")?.side,
+                    side
+                );
+            }
+            for (index, sender) in senders.iter_mut().enumerate() {
+                if index != last {
+                    drop(sender.take());
+                    assert!(run.as_mut().now_or_never().is_none());
+                }
+            }
+            drop(senders[last].take());
+            assert!(matches!(run.as_mut().now_or_never(), Some(Ok(()))));
+            assert!(received.recv().await.is_none());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn controller_without_execution_listener_waits_for_public_and_worker() -> TestResult {
+        let fixture = WorkerFixture::new()?;
+        let stores = gang_spi::RenderedStoreSpec(serde_json::Value::Null);
+        let catalog = gang_types::FleetCatalog::try_new(vec![fixture.properties.clone()])?;
+        let (observations, _receiver) = gang_spi::ObservationSink::channel(
+            std::num::NonZeroUsize::MIN,
+            std::num::NonZeroUsize::MIN,
+        );
+        let spec = ControllerSpec {
+            content_store: &stores,
+            action_store: &stores,
+            fleets: &catalog,
+            max_workers: 8,
+            client_action_timeout: std::time::Duration::from_mins(1),
+            observations: &observations,
+        };
+        let scheduler = FakeScheduler::new()?;
+        let (public_tx, public_rx) = futures::channel::mpsc::unbounded();
+        let (worker_tx, worker_rx) = futures::channel::mpsc::unbounded();
+        let connections = ControllerConnections {
+            public: Listening {
+                connections: public_rx.boxed(),
+                gate: AdmitAll,
+            },
+            execution: None,
+            worker: Listening {
+                connections: worker_rx.boxed(),
+                gate: AdmitAll,
+            },
+            api: EmptyApi,
+        };
+        let (ready, _) = ControllerReady::channel();
+        let run = scheduler.run_controller(&spec, connections, ready);
+        futures::pin_mut!(run);
+        assert!(run.as_mut().now_or_never().is_none());
+        let controller = scheduler
+            .controller()
+            .await
+            .ok_or("controller not published")?;
+        assert!(
+            controller
+                .call_execution_api(http::Request::new(full_body("")))
+                .await
+                .is_none()
+        );
+        drop(public_tx);
+        assert!(run.as_mut().now_or_never().is_none());
+        drop(worker_tx);
+        assert!(matches!(run.as_mut().now_or_never(), Some(Ok(()))));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn the_api_receives_the_caller_its_gate_admitted() {
         let gates = Gates {
             public: AdmitAll,
+            execution: None,
             worker: AdmitAll,
             api: CallerApi,
         };
@@ -1079,6 +1371,7 @@ mod tests {
                 connections: futures::stream::empty().boxed(),
                 gate: AdmitAll,
             },
+            execution: None,
             worker: Listening {
                 connections: futures::stream::empty().boxed(),
                 gate: AdmitAll,
@@ -1120,6 +1413,7 @@ mod tests {
                 connections: futures::stream::empty().boxed(),
                 gate: AdmitAll,
             },
+            execution: None,
             worker: Listening {
                 connections: futures::stream::empty().boxed(),
                 gate: AdmitAll,

@@ -1,0 +1,26 @@
+[package]
+name = "gang-dynamodb"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aws-sdk-dynamodb.workspace = true
+gang-aws-sdk.workspace = true
+gang-clock.workspace = true
+gang-spi.workspace = true
+gang-types.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+aws-credential-types.workspace = true
+gang-testkit.workspace = true
+tokio.workspace = true

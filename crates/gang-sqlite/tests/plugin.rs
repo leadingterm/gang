@@ -1,5 +1,5 @@
 //! Tests for the `SQLite` plugin build and open path: config validation, lazy database creation,
-//! and working stores across concurrent instances.
+//! and concurrent use of one store.
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -37,7 +37,7 @@ fn building_does_not_create_the_database_file() {
     let built = try_open(SqliteConfig::new(path.clone()));
 
     assert!(built.is_ok(), "valid configuration builds");
-    assert!(!path.exists(), "build touches no disk");
+    assert!(!path.exists(), "build does not create the database");
 }
 
 #[tokio::test]
@@ -61,23 +61,21 @@ async fn valid_configuration_builds_a_working_store() {
 }
 
 #[tokio::test]
-async fn two_instances_write_to_the_same_file_concurrently() {
+async fn concurrent_writes_share_one_instance() {
     let dir = TempDir::new().expect("temp dir");
     let path = dir.path().join("gang.db");
-    // Creating the file and holding its write lock makes both writers wait for the COMMIT below,
-    // so the overlap does not depend on how quickly the two instances open the file.
+    // Holding the write lock makes both writers wait for the COMMIT below, so the overlap does
+    // not depend on how quickly the store opens the file.
     let holder = rusqlite::Connection::open(&path).expect("raw connection creates the file");
     holder
         .execute_batch("BEGIN IMMEDIATE")
         .expect("raw connection takes the write lock");
 
     // The busy timeout is generous: it only runs out if the writers are deadlocked.
-    let settings = || SqliteConfig {
+    let first = Arc::new(open(SqliteConfig {
         busy_timeout: NonZeroDuration::from_mins(5),
         ..SqliteConfig::new(path.clone())
-    };
-    let first = Arc::new(open(settings()));
-    let second = Arc::new(open(settings()));
+    }));
 
     let (armed_one, parked_one) = oneshot::channel();
     let (armed_two, parked_two) = oneshot::channel();
@@ -89,7 +87,7 @@ async fn two_instances_write_to_the_same_file_concurrently() {
         }
     });
     let writer_two = tokio::spawn({
-        let second = Arc::clone(&second);
+        let second = Arc::clone(&first);
         async move {
             let two = issued("02", 1_000);
             park_then_signal(second.record_issued(&two), armed_two).await
@@ -105,8 +103,8 @@ async fn two_instances_write_to_the_same_file_concurrently() {
 
     let written_one = writer_one.await.expect("first writer task completes");
     let written_two = writer_two.await.expect("second writer task completes");
-    written_one.expect("first instance writes its certificate");
-    written_two.expect("second instance writes its certificate");
+    written_one.expect("first write succeeds");
+    written_two.expect("second write succeeds");
 
     let one = issued("01", 1_000);
     let two = issued("02", 1_000);
@@ -151,8 +149,8 @@ async fn a_write_outlasting_the_busy_timeout_fails_as_busy() {
         .expect("raw connection releases the write lock");
 
     assert!(
-        matches!(error, PortError::Backend(_)),
-        "expected Backend, got {error:?}"
+        matches!(error, PortError::Unavailable(_)),
+        "expected Unavailable, got {error:?}"
     );
     let mut locked = false;
     let mut cause = error.source();

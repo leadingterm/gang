@@ -30,6 +30,10 @@ async fn renders_the_executor_cache_and_helper_with_the_server_ca() {
             "# Written by `gang bazelrc`. Do not edit.\n\
              build --remote_executor=grpcs://exec.example:443\n\
              build --remote_cache=grpcs://cache.example:443\n\
+             build --remote_retries=12\n\
+             build --remote_retry_max_delay=5s\n\
+             build --grpc_keepalive_time=10s\n\
+             build --grpc_keepalive_timeout=30s\n\
              # The gang that Bazel runs for credentials; run `gang bazelrc` again if it moves.\n\
              build --credential_helper={host}={HELPER}\n\
              build --remote_default_exec_properties=ISA=x86-64\n\
@@ -105,7 +109,7 @@ async fn server_error_status_is_a_server_error() {
     assert!(
         matches!(
             error,
-            ClientError::Server { status: 503, ref message } if message == "maintenance window"
+            ClientError::Server { status: 503, ref message, .. } if message == "maintenance window"
         ),
         "{error}"
     );

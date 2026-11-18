@@ -7,13 +7,13 @@ use std::process::ExitCode;
 use clap::Parser;
 use gang_spi::{EXEC_LINK_NAME, GUARD_LINK_NAME, JOIN_LINK_NAME, RESET_LINK_NAME};
 
-use crate::cli::{Cli, Command, LocalCommand};
-use crate::errors::Result;
+use crate::cli::{Cli, Command, DatabaseCommand, LocalCommand};
+use crate::errors::{MainError, Result};
 use crate::output::{Output, Record};
 use crate::{
-    bazel_command, ca_pin_command, client_command, deploy_command, doctor_command, exec_command,
-    guard_command, help, join_command, local_down, local_up, options_command, release_command,
-    reset_command, server_command, setup_command, worker_command,
+    bazel_command, ca_pin_command, client_command, database_command, deploy_command,
+    doctor_command, exec_command, guard_command, help, join_command, local_down, local_up,
+    options_command, release_command, reset_command, server_command, setup_command, worker_command,
 };
 
 /// What a process runs, decided from its argv0 and arguments.
@@ -96,7 +96,7 @@ pub(crate) fn parse(args: &[OsString]) -> std::result::Result<Parsed, clap::Erro
 ///
 /// Help and version screens go to stdout with exit code 0. A usage error is a `fail` record on
 /// stderr with exit code 2. A failing command prints its error as a `fail` record on stderr and
-/// exits with failure.
+/// exits with failure, except the local worker bootstrap, which writes a plain line instead.
 #[must_use]
 pub fn run(args: &[OsString]) -> ExitCode {
     if let Some(call) = multicall(args) {
@@ -134,10 +134,27 @@ pub fn run(args: &[OsString]) -> ExitCode {
     };
     output.set_quiet(quiet);
     let subject = command.subject();
+    let bootstrap = matches!(command, Command::LocalWorker(_));
     match execute(command, &entrypoint, &output) {
         Ok(code) => code,
+        Err(error) if bootstrap => bootstrap_failure(&output, subject, &error),
         Err(error) => output.failure(subject, &error),
     }
+}
+
+/// Reports a failed local worker bootstrap as one plain line with its causes. Its stderr is the
+/// worker log, where a `fail` record is the worker's own failure, so it never writes one.
+fn bootstrap_failure(output: &Output, subject: &str, error: &MainError) -> ExitCode {
+    use std::fmt::Write;
+
+    let mut line = format!("{subject}: {error}");
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        let _ = write!(line, ": {cause}");
+        source = cause.source();
+    }
+    output.notice(line);
+    ExitCode::FAILURE
 }
 
 /// Calls the handler for a command.
@@ -151,7 +168,20 @@ fn execute(command: Command, entrypoint: &Path, out: &Output) -> Result<ExitCode
         Command::Revoke(args) => client_command::revoke(args, out),
         Command::Restore(args) => client_command::restore(&args, out),
         Command::Server(args) => server_command::run(&args.config, out),
+        Command::Database(DatabaseCommand::Copy(args)) => database_command::run(args, out),
         Command::Worker(args) => worker_command::run(args, out),
+        Command::LocalWorker(args) => {
+            let (program, arguments) = args
+                .command
+                .split_first()
+                .ok_or(MainError::LocalWorkerUsage)?;
+            match gang_local::bootstrap_worker(
+                &args.record,
+                &args.lifetime_lock,
+                program,
+                arguments,
+            )? {}
+        }
         Command::Local(LocalCommand::Up(args)) => local_up::run(args, out),
         Command::Local(LocalCommand::Down(args)) => local_down::run(args, out),
         Command::Options(args) => options_command::run(args.provisioner.as_deref(), out),
@@ -476,5 +506,38 @@ mod tests {
         for (line, subject) in cases {
             assert_eq!(parse_str(line).command.subject(), subject, "{line:?}");
         }
+    }
+
+    /// The bootstrap shares the worker's log, where a line starting with `fail` is the worker's
+    /// own failure record; a bootstrap failure must not read as one.
+    #[test]
+    fn a_failed_local_worker_bootstrap_writes_no_worker_failure_record()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _gate = gang_testkit::fork_gate::spawner();
+        let dir = tempfile::tempdir()?;
+        // The built `gang` binary, because the bootstrap writes to the stderr of its own process.
+        let output = std::process::Command::new(
+            std::env::var_os("GANG_BIN").ok_or("GANG_BIN must name the gang binary")?,
+        )
+        .arg("__local-worker")
+        .arg("--record")
+        .arg(dir.path().join("missing-record.json"))
+        .arg("--lifetime-lock")
+        .arg(dir.path().join("lifetime.lock"))
+        .arg("--")
+        .arg(dir.path().join("worker"))
+        .stdin(std::process::Stdio::null())
+        .output()?;
+        let stderr = String::from_utf8(output.stderr)?;
+
+        assert!(!output.status.success());
+        assert!(!stderr.trim().is_empty());
+        assert!(
+            stderr
+                .lines()
+                .all(|line| line.split_whitespace().next() != Some("fail")),
+            "bootstrap failure reads as a worker failure record: {stderr}"
+        );
+        Ok(())
     }
 }

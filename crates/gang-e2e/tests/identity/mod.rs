@@ -718,7 +718,8 @@ impl SimulatedAccess {
                     ),
                 ));
             }
-            204
+            headers.push(("location".into(), "/ui/".into()));
+            303
         } else {
             403
         }

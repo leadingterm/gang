@@ -340,7 +340,7 @@ enum HoldPhase {
     Silent,
     /// `release` was called since the hold action started.
     Released,
-    /// The server killed the hold build.
+    /// The server's kill or a cancellation ended the hold build.
     Ended,
 }
 
@@ -743,6 +743,14 @@ impl Simulation {
             | Probe::SandboxRequested => Some(namespaces.to_string()),
             Probe::OverflowFirst => Some("ran=first\n".to_owned()),
             Probe::OverflowSecond => Some("ran=second\n".to_owned()),
+            Probe::ControllerLoss0
+            | Probe::ControllerLoss1
+            | Probe::ControllerLoss2
+            | Probe::ControllerLoss3
+            | Probe::ControllerLoss4
+            | Probe::ControllerLoss5
+            | Probe::ControllerLoss6
+            | Probe::ControllerLoss7 => Some("held=released\n".to_owned()),
             Probe::MemoryEscalation
             | Probe::DiskGuarded
             | Probe::TimeoutChild
@@ -1731,6 +1739,16 @@ impl gang_e2e::Limits for Simulation {
     fn abandon_hold(&self) -> Result<()> {
         let mut state = self.state.lock();
         state.hold_notifications.push_back(Signalled::Abandoned);
+        drop(state);
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    fn cancel_hold(&self) -> Result<()> {
+        let mut state = self.state.lock();
+        if state.hold == HoldPhase::Silent || state.hold == HoldPhase::Started {
+            state.hold = HoldPhase::Ended;
+        }
         drop(state);
         self.changed.notify_all();
         Ok(())

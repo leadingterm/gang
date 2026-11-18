@@ -54,6 +54,102 @@ variable "storage" {
   default     = {}
   nullable    = false
 }
+variable "database" {
+  type = object({
+    engine = optional(string, "sqlite")
+    postgres = optional(object({
+      rds = optional(object({
+        instance_class   = optional(string, "db.t4g.micro")
+        multi_az         = optional(bool, true)
+        storage_gib      = optional(number, 20)
+        engine_version   = optional(string, "17")
+        password_version = optional(number, 1)
+      }))
+      external = optional(object({
+        host               = string
+        port               = optional(number, 5432)
+        database           = string
+        user               = string
+        password_parameter = string
+        ca_parameter       = optional(string)
+      }))
+    }))
+  })
+  description = "Database engine: sqlite for one controller, or postgres or dynamodb for one or more controllers behind load balancers. postgres.rds creates an RDS PostgreSQL instance verified against the Amazon RDS CA bundle in infra/nixos/rds-ca-bundle.pem; increment postgres.rds.password_version to rotate its password. Refresh the bundle from https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem when AWS rotates its CAs. postgres.external connects to an existing server using an SSM password parameter and optional CA bundle parameter; without a CA parameter the system trust store is used."
+  default     = {}
+  nullable    = false
+
+  validation {
+    condition     = contains(["sqlite", "postgres", "dynamodb"], var.database.engine)
+    error_message = "database.engine must be sqlite, postgres, or dynamodb."
+  }
+
+  validation {
+    condition     = var.database.engine != "postgres" || ((try(var.database.postgres.rds, null) != null) != (try(var.database.postgres.external, null) != null))
+    error_message = "postgres requires exactly one of database.postgres.rds or database.postgres.external."
+  }
+
+  validation {
+    condition     = var.database.engine == "postgres" || var.database.postgres == null
+    error_message = "database.postgres may only be set when database.engine is postgres."
+  }
+
+  validation {
+    condition     = try(var.database.postgres.rds, null) == null ? true : coalesce(var.network.availability_zone_count, 3) >= 2
+    error_message = "postgres.rds requires at least two availability zones."
+  }
+
+  validation {
+    condition     = try(var.database.postgres.rds, null) == null ? true : var.database.postgres.rds.password_version >= 1 && floor(var.database.postgres.rds.password_version) == var.database.postgres.rds.password_version
+    error_message = "database.postgres.rds.password_version must be a whole number of at least 1."
+  }
+
+  validation {
+    condition = try(var.database.postgres.external, null) == null ? true : (
+      try(trimspace(var.database.postgres.external.host) != "", false) &&
+      try(trimspace(var.database.postgres.external.database) != "", false) &&
+      try(trimspace(var.database.postgres.external.user) != "", false) &&
+      try(trimspace(var.database.postgres.external.password_parameter) != "", false) &&
+      var.database.postgres.external.port >= 1 &&
+      var.database.postgres.external.port <= 65535 &&
+      floor(var.database.postgres.external.port) == var.database.postgres.external.port
+    )
+    error_message = "database.postgres.external requires non-empty host, database, user and password_parameter, and a whole-number port from 1 to 65535."
+  }
+
+  validation {
+    condition     = var.database.engine != "sqlite" || var.controller_count == 1
+    error_message = "sqlite requires controller_count to be 1."
+  }
+
+  validation {
+    condition     = var.database.engine == "sqlite" || var.load_balancer != null
+    error_message = "postgres and dynamodb require load_balancer."
+  }
+
+  validation {
+    condition     = var.database.engine == "sqlite" || !can(regex("(?m)^\\s*\\[cache\\.filesystem\\]", var.extra_config_toml))
+    error_message = "postgres and dynamodb require the shared S3 cache, not a filesystem cache."
+  }
+}
+
+variable "controller_count" {
+  type        = number
+  description = "Number of controllers; more than one requires at least two availability zones."
+  default     = 1
+  nullable    = false
+
+  validation {
+    condition     = var.controller_count >= 1 && floor(var.controller_count) == var.controller_count
+    error_message = "controller_count must be a positive whole number."
+  }
+
+  validation {
+    condition     = var.controller_count <= 1 || coalesce(var.network.availability_zone_count, 3) >= 2
+    error_message = "controller_count greater than one requires at least two availability zones."
+  }
+}
+
 
 variable "hostname" {
   type        = string
@@ -72,7 +168,7 @@ variable "load_balancer" {
     ssl_policy                     = optional(string, "ELBSecurityPolicy-TLS13-1-2-2021-06")
     certificate_validation_timeout = optional(string, "2h")
   })
-  description = "Publicly trusted TLS in front of the controller: an ACM certificate for hostname on a Network Load Balancer that terminates TLS (ALPN h2 then http/1.1) and re-encrypts to the controller's public listener, so browsers, Bazel and gang use their system roots; gang.toml then sets [server] endpoint_trust = \"system\". Requires hostname. The controller's public port then accepts only the load balancer and the workers, and its Elastic IP remains its egress address. Inside the VPC hostname resolves to the controller (a private hosted zone), so workers keep reaching its own listener. ssl_policy must be an ELBSecurityPolicy-TLS13-* policy (validated by the load-balancer module). The first apply waits up to certificate_validation_timeout until the record in certificate_validation_records is published. Null (the default) serves the public listener directly on the controller's Elastic IP with the gang CA certificate."
+  description = "Public TLS load balancer using an ACM certificate for hostname; required for shared database engines (postgres and dynamodb). SQLite keeps its controller Elastic IP and private DNS. Shared database engines use public and internal load balancers, with the hostname resolving privately to the internal load balancer. ssl_policy must be an ELBSecurityPolicy-TLS13-* policy. The first apply waits up to certificate_validation_timeout for DNS validation."
   default     = null
 
   validation {
@@ -177,7 +273,7 @@ variable "fleets" {
     max_instances: upper bound of the Auto Scaling group.
     min_instances, vcpus_per_instance, target_actions_per_instance, idle_timeout,
     max_drain_wait, boot_grace: scheduling policy written to gang.toml.
-    memory_per_instance: memory size at least 16MiB in B, KiB, MiB, GiB or TiB, written to gang.toml.
+    memory_per_instance: memory size at least 64MiB in B, KiB, MiB, GiB or TiB, written to gang.toml.
     disk_per_instance: non-zero disk size in B, KiB, MiB, GiB or TiB; lower bound of the disk the fleet's actions may fill in total, valid for every instance type of the fleet (scratch capacity minus the fast CAS budget minus an overshoot reserve); written to gang.toml.
     scratch_volume_gib: EBS scratch volume on /dev/sdf for EBS-only instance types. Null uses instance-store NVMe.
     root_volume_gib: size of the encrypted gp3 root volume in GiB. Unset uses the worker-fleet module's default.
@@ -252,11 +348,11 @@ variable "fleets" {
     condition = alltrue([
       for fleet in var.fleets : try(
         tonumber(regex("^(0*[1-9][0-9]*)(B|KiB|MiB|GiB|TiB)$", fleet.memory_per_instance)[0]) *
-        { B = 1, KiB = 1024, MiB = 1048576, GiB = 1073741824, TiB = 1099511627776 }[regex("^(0*[1-9][0-9]*)(B|KiB|MiB|GiB|TiB)$", fleet.memory_per_instance)[1]] >= 16777216,
+        { B = 1, KiB = 1024, MiB = 1048576, GiB = 1073741824, TiB = 1099511627776 }[regex("^(0*[1-9][0-9]*)(B|KiB|MiB|GiB|TiB)$", fleet.memory_per_instance)[1]] >= 67108864,
         false
       )
     ])
-    error_message = "Each fleet memory_per_instance must be at least 16MiB, the default [scheduler.nativelink.memory] min_reservation, which the controller refuses to exceed."
+    error_message = "Each fleet memory_per_instance must be at least 64MiB, the default [scheduler.nativelink.memory] min_reservation, which the controller refuses to exceed."
   }
 
   validation {
@@ -381,8 +477,11 @@ variable "extra_config_toml" {
     TOML tables, not a string: JSON-encoding it would quote it. It must consist of complete [table] sections (developer
     and CI identity providers, tunables), never bare top-level keys: a key there would join the last table. TOML tables
     already opened by this module cannot be reopened here, even for settings omitted from the template such as
-    [database.sqlite].busy_timeout and [authentication.workers.mtls].certificate_ttl. Its first non-blank,
-    non-comment line must start with "[". Content is public: it lands in the SSM parameter (gang.toml), not
+    [database.sqlite].busy_timeout and [authentication.workers.mtls].certificate_ttl. With database.engine "postgres" or
+    "dynamodb", the module opens [scheduler.nativelink.http2] and owns shutdown_grace, so all other keys in that table,
+    including max_connections and receive_window, retain their defaults. With "sqlite", the module does not open that
+    table, so it can be appended here. Its first non-blank, non-comment line must start with "[". Content is public: it
+    lands in the SSM parameter (gang.toml), not
     in EC2 user data. Put confidential values in controller_secret_parameters, never here, and reference them by their
     absolute path under /etc/gang/secrets.
   EOT
@@ -396,7 +495,7 @@ variable "extra_config_toml" {
 
 variable "config_parameter_name" {
   type        = string
-  description = "Name of the SSM parameter that holds the rendered gang.toml. Null uses /<name>/gang.toml. The name is plain-text EC2 user data and instances read the parameter at boot. The content lives in the parameter, so changing the configuration replaces no instance."
+  description = "Name of the SSM parameter that holds gang.toml. Null uses /<name>/gang.toml. Instances read it at boot. Configuration changes restart the SQLite instance or refresh the controller group for shared database engines (postgres and dynamodb)."
   default     = null
 }
 
@@ -431,6 +530,11 @@ variable "controller_secret_parameters" {
   type        = map(string)
   description = "Confidential values the controller reads at boot. Keys are file names under /etc/gang/secrets on the controller; values are the names of SSM SecureString parameters created outside this configuration, so the values never enter Terraform state. Reference a file from extra_config_toml by its absolute path. Workers receive none. Validated by the controller module."
   default     = {}
+
+  validation {
+    condition     = var.database.engine != "postgres" || (!contains(keys(var.controller_secret_parameters), "database-password") && !contains(keys(var.controller_secret_parameters), "database-ca.pem"))
+    error_message = "controller_secret_parameters must not use database-password or database-ca.pem with postgres."
+  }
 }
 
 variable "controller_secret_parameters_kms_key_arn" {

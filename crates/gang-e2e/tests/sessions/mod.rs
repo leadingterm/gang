@@ -114,7 +114,9 @@ behaviour! {
             /// Clear both cookies.
             ClearsBoth,
             /// Keep the renewal cookie.
-            KeepsRenewal
+            KeepsRenewal,
+            /// Clear both cookies without redirecting.
+            NoRedirect
         },
         /// Renewal after provider suspension.
         suspension: Suspension {
@@ -599,11 +601,16 @@ impl Browser for SimulatedBrowser {
                 if cross_site(request) {
                     Answer::empty(403)
                 } else {
-                    let answer = clear(Answer::empty(204), COOKIES.session, "Strict");
-                    if self.behaviour.logout == Logout::ClearsBoth {
-                        clear(answer, COOKIES.renewal, "Strict")
+                    let answer = if self.behaviour.logout == Logout::NoRedirect {
+                        Answer::empty(204)
                     } else {
+                        Answer::empty(303).with_header("location", "/ui/")
+                    };
+                    let answer = clear(answer, COOKIES.session, "Strict");
+                    if self.behaviour.logout == Logout::KeepsRenewal {
                         answer
+                    } else {
+                        clear(answer, COOKIES.renewal, "Strict")
                     }
                 }
             }
@@ -812,4 +819,5 @@ flaw!(always_offline_fails: sessions_checks(relogin = Relogin::AlwaysOffline) =>
 flaw!(no_recheck_fails: sessions_checks(relogin = Relogin::NoRecheck) => only [names::SIGN_IN_WITHOUT_CONSENT]);
 flaw!(revoked_renewal_fails: sessions_checks(revocation = RevokedRenewal::Renews) => only [names::REVOCATION_ENDS_RENEWAL]);
 flaw!(logout_keeps_renewal_fails: sessions_checks(logout = Logout::KeepsRenewal) => only [names::LOGOUT_CLEARS_BOTH]);
+flaw!(logout_without_navigation_fails: sessions_checks(logout = Logout::NoRedirect) => only [names::LOGOUT_CLEARS_BOTH]);
 flaw!(suspension_keeps_cookie_fails: sessions_checks(suspension = Suspension::KeepsCookie) => only [names::SUSPENSION_ENDS_RENEWAL]);

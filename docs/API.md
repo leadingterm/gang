@@ -89,7 +89,7 @@ A deployment on a trusted network with no authentication:
 
 ### Notes
 
-- `remoteExecutor` and `remoteCache` are the endpoints for Bazel's `--remote_executor` and `--remote_cache`; the scheme is `grpcs` when the listener serves TLS and `grpc` otherwise.
+- `remoteExecutor` and `remoteCache` are the endpoints for Bazel's `--remote_executor` and `--remote_cache`. `remoteExecutor` uses the execution endpoint when configured, otherwise the public endpoint; `remoteCache` uses the public endpoint.
 - `caCertificate` is the certificate authority the client should trust for those endpoints; it is omitted when the server has none, and when `[server] endpoint_trust = "system"`, where a publicly trusted terminator presents the endpoint and clients use their system roots.
 - `defaultIsa` is the instruction set a build gets when it does not name one. `gang bazelrc` writes it as `--remote_default_exec_properties=ISA=<defaultIsa>`.
 - `version` is the server's Gang version, for display; a server that predates it omits it.
@@ -302,12 +302,13 @@ curl -X POST https://gang.example.com/v1/deviceAuthorizations/BCDF-GHJK:redeem \
 | `DEVICE_AUTHORIZATION_NOT_FOUND` | the code is unknown, expired or already redeemed, or the secret is wrong; all give the identical `404` with `deviceAuthorization` metadata |
 | `RATE_LIMITED` | the caller exceeds the rate limit or polls before `pollInterval`; retry after `Retry-After` (`429`) |
 | `PRINCIPAL_REVOKED` | the approved principal is revoked at redemption (`403`); the authorization is consumed |
+| `DEPENDENCY_UNAVAILABLE` | the database cannot be reached while creating, reading or redeeming an authorization (`503`) |
 
 ### Notes
 
 - These routes are open and rate limited, and mounted only when device login is enabled and dashboard sign-in is mounted. `authentication.token.deviceLogin` announces the provider.
 - The user types the code at `verificationUri` and signs in to approve. `clientAddress`, when present, is the server-observed address of the creator. Codes ignore case, spaces and hyphens on input.
-- `secret` is returned only on create and is required for redemption. The authorization is in memory, bounded and expiring; the first approval wins, and successful redemption consumes it.
+- `secret` is returned only on create and is required for redemption. The authorization is stored in the database and expires; any controller can continue the flow, the first approval wins, and successful redemption consumes it.
 - Approval requests offline access. Redemption applies the normal issuance policy and revocation check and returns the provider refresh token; never expose the secret or refresh token to another user.
 
 ## state
@@ -535,9 +536,11 @@ data: {"reason":"VIEWER_CAP","retryDelay":"5s"}
 | `PRINCIPAL_REVOKED` | the caller's principal is revoked |
 | `MISSING_PERMISSION` | the caller lacks `state.read`; the metadata key is `permission` |
 | `ROUTE_NOT_FOUND` | the dashboard is disabled (`[dashboard] enabled = false`), so the state is not served |
+| `DEPENDENCY_UNAVAILABLE` | a follower cannot reach the leader; the error envelope has HTTP `503` and status `UNAVAILABLE` |
 
 ### Notes
 
+- **Leader.** The leader serves both routes; a follower relays the request and streaming response to it, preserving the caller's credentials.
 - **Frames.** `Frame` is the type of each stream message, defined once in `gang-wire`:
 
   | Event | Data | Sent |
@@ -580,8 +583,24 @@ data: {"reason":"VIEWER_CAP","retryDelay":"5s"}
 |---|---|---|
 | `GET` | `/v1/builds` | `builds.read` |
 | `GET` | `/v1/builds/{build}` | `builds.read` |
+| `POST` | `/v1/builds:ingest` | `open` |
 
 ### Examples
+
+Submit controller observations:
+
+```json request IngestBuildsRequest
+{
+  "origins": [{"principal": "example-idp:alice", "invocationId": "invocation-1"}],
+  "calls": [{"origin": 0, "rpc": "GET_ACTION_RESULT", "outcome": "OK"}],
+  "lost": [],
+  "unattributed": 0
+}
+```
+
+```json response IngestBuildsResponse
+{}
+```
 
 Get the full view:
 
@@ -675,6 +694,8 @@ Pass the returned `nextPageToken` as `pageToken` with the same filter to request
 
 ### Notes
 
+- **Leader and observations.** The leader serves both GET routes; a follower relays the request to it, preserving the caller's credentials. Followers forward bounded batches of cache-call observations to the leader. Cache counters are observed lower bounds, not completeness guarantees.
+- **Controller ingestion.** The ingest route runs only on the execution listener for controllers; public and worker routes return 404, even for administrators. It requires a unique `x-gang-controller` domain-separated CA-signed proof; an ordinary bearer token or session cookie is insufficient. The receiving controller must be the leader. The whole bounded batch is validated before application: an empty 200 response means it was accepted, and a non-2xx response means it was not applied. After an ambiguous send, the sender never retries delivered calls or carried loss counts. Observations are lower bounds, not a completeness guarantee.
 - **Scope and visibility.** A `builds.read` holder sees all held builds. Records are bounded in memory; at capacity the least recently active is dropped, and a restart clears them. Calls with no principal, no invocation id or an over-cap metadata field are not attributed to a build. Invocation ids, target labels and mnemonics are client-asserted; target labels can reveal repository structure.
 - **Filter and order.** `filter` is a conjunction of `field = "value"` terms joined by ` AND `, each field at most once: `principal`, `invocationId` and `correlatedInvocationsId`. Empty matches all. The list orders newest `lastActiveTime` first, ties by name; the opaque cursor resumes strictly after the last row.
 - **Views.** List and `State.builds` use the basic view; Get returns the full view, adding `mnemonics`, `otherMnemonics`, `missedTargets`, `slowest` and `timeline` when present. Optional empty fields are omitted.
@@ -683,7 +704,7 @@ Pass the returned `nextPageToken` as `pageToken` with the same filter to request
 - **Breakdowns.** Each `mnemonics` row holds the same usage shape; missing or excess mnemonics go into `otherMnemonics`. `missedTargets` uses Space-Saving: the true misses lie between `misses - overestimate` and `misses`. `slowest` is ordered by largest `span`, from `queueTime` to worker completion; its phase durations are action times.
 - **Timeline.** Buckets hold hit and miss counts and queued and executing action-time durations. Divide a duration by `step` for mean concurrency. As the timeline grows, adjacent buckets merge and `step` doubles, preserving totals.
 - **What the server cannot see.** Local and disk-cache hits, local-only actions except uploaded results, analysis time, Bazel job throttling, critical path and build success are not visible. A remote lookup hit whose outputs were evicted can be followed by an execution, so both may be counted; actions for which Bazel skips a remote lookup can execute without a lookup.
-- Both routes accept the session cookie.
+- Both GET routes accept the session cookie.
 
 ## principals
 
@@ -898,7 +919,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 | `REQUEST_TOO_LARGE` | the body exceeds `max_request_size` |
 | `UNKNOWN_PROVIDER` | `provider` names an identity provider the server does not configure; the metadata key is `provider` |
 | `PROOF_REJECTED` | the identity provider rejected the proof (`401`) |
-| `POLICY_DENIED` | the issuance policy refuses the principal |
+| `POLICY_DENIED` | the issuance policy refuses the principal, or a revocation or restoration completed while the certificate was being issued (the new certificate is revoked; retry) |
 | `PRINCIPAL_REVOKED` | the proof verified, but its principal is revoked |
 | `MISSING_PERMISSION` | revoke without `principals.revoke` |
 | `CERTIFICATE_NOT_FOUND` | revoke of a serial that no surface issued; the metadata key is `certificate` |
@@ -959,7 +980,7 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/roles
 
 ### Notes
 
-- **Order.** Roles are listed in configuration order, paged in memory over the configured list.
+- **Order.** Roles are listed in ascending resource-name order, paged in memory over the configured list.
 - A role's `permissions` are the permission names with `*` expanded, in canonical order (`state.read`, `principals.read`, `events.read`, `builds.read`, `principals.revoke`). `principals` are references to the principals the role names.
 - Roles are read through `principals.read`: they are principal data, so no separate permission exists.
 - The route accepts the session cookie.
@@ -1094,7 +1115,7 @@ What each reason means:
 - `CERTIFICATE_NOT_FOUND`, `PRINCIPAL_NOT_FOUND`, `BUILD_NOT_FOUND`: the named resource does not exist.
 - `DEVICE_AUTHORIZATION_NOT_FOUND`: the device authorization is unknown, expired or already redeemed, or its secret is wrong; these cases are indistinguishable.
 - `RATE_LIMITED`: a client address, or the server as a whole, sent more requests to an open route than `[server.rate_limit]` allows. The answer carries `Retry-After` and a `RetryInfo` detail; retry after that wait.
-- `DEPENDENCY_UNAVAILABLE`: the ledger, an identity provider or the signer cannot be reached, including when the gate cannot check the caller (`503` on every `/v1/**` route); retrying later may succeed.
+- `DEPENDENCY_UNAVAILABLE`: the database, an identity provider or the signer cannot be reached, including when the gate cannot check the caller (`503` on every `/v1/**` route); retrying later may succeed.
 - `REQUEST_TIMED_OUT`: the request did not finish within `request_timeout`.
 - `INTERNAL_ERROR`: the server failed; the cause is in its logs.
 
@@ -1239,11 +1260,11 @@ A path or method no route matches, for an authenticated caller:
 | Method | Path | Behaviour |
 |---|---|---|
 | `GET` | `/` | `302` to `/ui/`, so a browser opening the server lands on the dashboard; `HEAD` alike. No API route is served at `/`. |
-| `GET` | `/ui/login?next=` | Starts the sign-in: `302` to the identity provider's authorization URL and sets the sign-in cookie. `next` must be `/ui` or below; anything else is replaced by `/ui`. Mounted only when `[dashboard.login]` is configured. |
-| `GET` | `/ui/callback` | The registered OAuth redirect URI. A dashboard sign-in sets the session cookie and redirects to `next`; a device approval sets no session or renewal cookie and redirects to `/ui/device/approved`. Both clear the sign-in cookie; sign-in failures redirect to `/ui/error?reason=denied\|failed\|unavailable`, and device approval failures redirect to `/ui/device?reason=denied\|failed\|unavailable` once the device attempt is identified. Mounted like `/ui/login`. |
-| `POST` | `/ui/renew` | Renews from the sealed renewal cookie; requires `Sec-Fetch-Site: same-origin` or `Origin` equal to the endpoint's origin and is rate limited. Empty answers: `204` sets a new session cookie and reseals the renewal cookie only if the token rotated, keeping its deadline; `401` keeps the cookie past `session_max_age`, but clears it for a missing, invalid or refused token or another principal; `403` clears it for a revoked or denied principal but not for a cross-site request; `429` is rate limited; `503` keeps the cookie when the provider is unavailable. Mounted like `/ui/login`. |
-| `POST` | `/ui/logout` | Clears the session and renewal cookies: `204` when `Sec-Fetch-Site` is `same-origin` or `Origin` equals the endpoint's origin, otherwise `403`. |
-| `POST` | `/ui/device` | Starts approval of a device login. Send `Content-Type: application/json` and `{"userCode":"BCDF-GHJK"}`; unknown fields are refused. In order: cross-site requests get empty `403`; rate-limited requests get empty `429` with `Retry-After`; a missing or non-JSON content type gets empty `415` (media type is case-insensitive and may have parameters); unreadable or invalid JSON bodies get empty `400`; unknown, expired, invalid or already approved codes get empty `404`; sign-in start failures get empty `403` (denied), `500` (failed) or `503` (unavailable). A cross-site form cannot send this content type without a CORS preflight. Success is `200` JSON `{"authorizationUrl":"https://..."}` with the sign-in cookie. The page navigates to `authorizationUrl` itself because `form-action 'self'` also covers form redirects. Requires the same-origin rule and device login to be mounted; answers are not cached. |
+| `GET` | `/ui/login?next=` | Starts the sign-in: `302` to the identity provider's authorization URL and sets the sign-in cookie. `next` must be `/ui` or below; anything else is replaced by `/ui`. Database failure gives an empty `503`. Mounted only when `[dashboard.login]` is configured. |
+| `GET` | `/ui/callback` | The registered OAuth redirect URI. A dashboard sign-in sets the session cookie and redirects to `next`; a device approval sets no session or renewal cookie and redirects to `/ui/device/approved`. Both clear the sign-in cookie; sign-in failures redirect to `/ui/error?reason=denied\|failed\|unavailable`, and device approval failures redirect to `/ui/device?reason=denied\|failed\|unavailable` once the device attempt is identified. Database failure gives an empty `503` instead. Mounted like `/ui/login`. |
+| `POST` | `/ui/renew` | Renews from the sealed renewal cookie; requires `Sec-Fetch-Site: same-origin` or `Origin` equal to the endpoint's origin and is rate limited. Empty answers: `204` sets a new session cookie and reseals the renewal cookie only if the token rotated, keeping its deadline; `401` keeps the cookie past `session_max_age`, but clears it for a missing, invalid or refused token or another principal; `403` clears it for a revoked or denied principal but not for a cross-site request; `429` is rate limited; `503` keeps the cookie when the provider or database is unavailable. Mounted like `/ui/login`. |
+| `POST` | `/ui/logout` | Clears the session and renewal cookies: `303 See Other` with `Location: /ui/`, replacing the authenticated document, when `Sec-Fetch-Site` is `same-origin` or `Origin` equals the endpoint's origin, otherwise `403`. |
+| `POST` | `/ui/device` | Starts approval of a device login. Send `Content-Type: application/json` and `{"userCode":"BCDF-GHJK"}`; unknown fields are refused. In order: cross-site requests get empty `403`; rate-limited requests get empty `429` with `Retry-After`; a missing or non-JSON content type gets empty `415` (media type is case-insensitive and may have parameters); unreadable or invalid JSON bodies get empty `400`; unknown, expired, invalid or already approved codes get empty `404`; sign-in start failures get empty `403` (denied), `500` (failed) or `503` (unavailable). Database failure also gives an empty `503`. A cross-site form cannot send this content type without a CORS preflight. Success is `200` JSON `{"authorizationUrl":"https://..."}` with the sign-in cookie. The page navigates to `authorizationUrl` itself because `form-action 'self'` also covers form redirects. Requires the same-origin rule and device login to be mounted; answers are not cached. |
 | `GET` | `/ui/device` | The code-entry and approval page; it shows the request's server-observed address and age before approval. |
 | `GET` | `/ui/device/approved` | The page shown after a successful device approval. |
 | `GET` | `/ui/error?reason=` | The page that explains a failed sign-in. `reason` is `denied`, `failed` or `unavailable`; these are lowercase route parameters, not API enum values. |

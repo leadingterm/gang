@@ -101,6 +101,8 @@ enum LimitsConfig {
 #[serde(deny_unknown_fields)]
 struct NativeLinkSection {
     scheduler_name: String,
+    #[serde(default)]
+    shutdown_grace: Option<NonZeroDuration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -294,7 +296,15 @@ impl PluginSet for Plugins {
     }
 }
 
-impl SchedulerSettings for SchedulerConfig {}
+impl SchedulerSettings for SchedulerConfig {
+    fn shutdown_grace(&self) -> Option<(&'static str, Duration)> {
+        match self {
+            Self::Nativelink(section) => section
+                .shutdown_grace
+                .map(|grace| ("scheduler.nativelink.shutdown_grace", grace.get())),
+        }
+    }
+}
 
 impl AuthenticationSettings for ClientAuthenticationConfig {
     fn requires_tls(&self) -> bool {
@@ -586,6 +596,563 @@ impl Sections {
     fn parse(&self) -> Result<GangConfig<Plugins>, ConfigError> {
         self.text().parse()
     }
+}
+
+#[test]
+fn leadership_ttl_defaults_to_ten_seconds() -> Result<(), Box<dyn Error>> {
+    assert_eq!(
+        Sections::VALID.parse()?.server.leadership.ttl.get(),
+        Duration::from_secs(10)
+    );
+    Ok(())
+}
+
+#[test]
+fn leadership_renew_interval_defaults_to_three_seconds() -> Result<(), Box<dyn Error>> {
+    assert_eq!(
+        Sections::VALID
+            .parse()?
+            .server
+            .leadership
+            .renew_interval
+            .get(),
+        Duration::from_secs(3)
+    );
+    Ok(())
+}
+
+#[test]
+fn leadership_clock_skew_defaults_to_two_seconds() -> Result<(), Box<dyn Error>> {
+    assert_eq!(
+        Sections::VALID.parse()?.server.leadership.clock_skew,
+        Duration::from_secs(2)
+    );
+    Ok(())
+}
+
+#[test]
+fn revocation_refresh_interval_defaults_to_five_seconds() -> Result<(), Box<dyn Error>> {
+    assert_eq!(
+        Sections::VALID
+            .parse()?
+            .server
+            .revocation_refresh_interval
+            .get(),
+        Duration::from_secs(5)
+    );
+    Ok(())
+}
+
+#[test]
+fn execution_listener_defaults_to_none() -> Result<(), Box<dyn Error>> {
+    assert_eq!(Sections::VALID.parse()?.execution_listen, None);
+    Ok(())
+}
+
+#[test]
+fn health_listener_defaults_to_none_and_parses() -> Result<(), Box<dyn Error>> {
+    assert_eq!(Sections::VALID.parse()?.health_listen, None);
+    let top = format!("{TOP}\nhealth_listen = \"127.0.0.1:8080\"\n");
+    let config = Sections {
+        top: top.leak(),
+        ..Sections::VALID
+    }
+    .parse()?;
+    assert_eq!(config.health_listen, Some("127.0.0.1:8080".parse()?));
+    Ok(())
+}
+
+#[test]
+fn execution_endpoint_defaults_to_none() -> Result<(), Box<dyn Error>> {
+    assert_eq!(Sections::VALID.parse()?.execution_endpoint, None);
+    Ok(())
+}
+
+#[test]
+fn execution_endpoint_must_share_the_public_host() -> Result<(), Box<dyn Error>> {
+    let top = format!(
+        "{TOP}\nexecution_listen = \"127.0.0.1:9444\"\nexecution_endpoint = \"https://exec.example.com:9444\"\n"
+    );
+    let error = Sections {
+        top: top.leak(),
+        ..Sections::VALID
+    }
+    .parse()
+    .err()
+    .ok_or("different execution host was accepted")?;
+    assert!(matches!(
+        error,
+        ConfigError::ExecutionEndpointHostMismatch { .. }
+    ));
+    Ok(())
+}
+
+#[test]
+fn execution_endpoint_matches_the_derived_public_host() {
+    let top = TOP.replace("endpoint = \"https://gang.example.com:9443\"\n", "");
+    for (host, accepted) in [("127.0.0.1", true), ("exec.example.com", false)] {
+        let text = format!(
+            "{top}\nexecution_listen = \"127.0.0.1:9444\"\nexecution_endpoint = \"https://{host}:9444\"\n"
+        );
+        let result = Sections {
+            top: text.leak(),
+            ..Sections::VALID
+        }
+        .parse();
+        assert_eq!(result.is_ok(), accepted);
+    }
+}
+
+#[test]
+fn derived_execution_endpoint_must_share_the_public_host() {
+    let top = format!("{TOP}\nexecution_listen = \"127.0.0.1:9444\"\n");
+    let result = Sections {
+        top: top.leak(),
+        ..Sections::VALID
+    }
+    .parse();
+    assert!(matches!(
+        result,
+        Err(ConfigError::ExecutionEndpointHostMismatch { .. })
+    ));
+}
+
+#[test]
+fn execution_endpoint_requires_execution_listener() -> Result<(), Box<dyn Error>> {
+    let top = format!("{TOP}\nexecution_endpoint = \"https://example.com:9444\"\n");
+    let error = Sections {
+        top: top.leak(),
+        ..Sections::VALID
+    }
+    .parse()
+    .err()
+    .ok_or("accepted")?;
+    assert!(matches!(error, ConfigError::ExecutionEndpointWithoutListen));
+    let top = format!(
+        "{TOP}\nexecution_listen = \"127.0.0.1:9444\"\nexecution_endpoint = \"https://gang.example.com:9444\"\n"
+    );
+    assert!(
+        Sections {
+            top: top.leak(),
+            ..Sections::VALID
+        }
+        .parse()
+        .is_ok()
+    );
+    Ok(())
+}
+
+#[test]
+fn execution_listener_without_endpoint_must_be_loopback() -> Result<(), Box<dyn Error>> {
+    let top = format!(
+        "{}\nexecution_listen = \"127.0.0.1:9444\"\n",
+        TOP.replace("endpoint = \"https://gang.example.com:9443\"\n", "")
+    );
+    let config = Sections {
+        top: top.leak(),
+        ..Sections::VALID
+    }
+    .parse()?;
+    assert_eq!(config.execution_endpoint, None);
+    let top = format!("{TOP}\nexecution_listen = \"0.0.0.0:9444\"\n");
+    let error = Sections {
+        top: top.leak(),
+        ..Sections::VALID
+    }
+    .parse()
+    .err()
+    .ok_or("accepted")?;
+    assert!(matches!(
+        error,
+        ConfigError::ExecutionEndpointRequired { .. }
+    ));
+    let top = format!(
+        "{TOP}\nexecution_listen = \"0.0.0.0:9444\"\nexecution_endpoint = \"https://gang.example.com:9444\"\n"
+    );
+    assert!(
+        Sections {
+            top: top.leak(),
+            ..Sections::VALID
+        }
+        .parse()
+        .is_ok()
+    );
+    Ok(())
+}
+
+#[test]
+fn execution_endpoint_scheme_matches_transport() {
+    for (endpoint, valid) in [
+        ("https://gang.example.com", true),
+        ("http://gang.example.com", false),
+        ("ftp://gang.example.com", false),
+    ] {
+        let top = format!(
+            "{TOP}\nexecution_listen = \"127.0.0.1:9444\"\nexecution_endpoint = \"{endpoint}\"\n"
+        );
+        let result = Sections {
+            top: top.leak(),
+            ..Sections::VALID
+        }
+        .parse();
+        assert_eq!(result.is_ok(), valid);
+        if !valid {
+            assert!(matches!(
+                result,
+                Err(ConfigError::ExecutionEndpointNotHttps(_))
+            ));
+        }
+    }
+    for (endpoint, valid) in [
+        ("https://gang.example.com", true),
+        ("http://gang.example.com", true),
+        ("ftp://gang.example.com", false),
+    ] {
+        let top = format!(
+            "{TOP}\nexecution_listen = \"127.0.0.1:9444\"\nexecution_endpoint = \"{endpoint}\"\n"
+        );
+        let result = Sections {
+            top: top.leak(),
+            server: PLAINTEXT_SERVER,
+            authentication: PLAINTEXT_AUTHENTICATION,
+            ..Sections::VALID
+        }
+        .parse();
+        assert_eq!(result.is_ok(), valid);
+        if !valid {
+            assert!(matches!(
+                result,
+                Err(ConfigError::ExecutionEndpointNotHttp(_))
+            ));
+        }
+    }
+}
+
+#[test]
+fn leader_listener_ports_must_be_nonzero() -> Result<(), Box<dyn Error>> {
+    for key in ["execution_listen", "worker_listen"] {
+        let worker = if key == "worker_listen" {
+            "127.0.0.1:0"
+        } else {
+            "127.0.0.1:1"
+        };
+        let execution = if key == "execution_listen" {
+            "127.0.0.1:0"
+        } else {
+            "127.0.0.1:1"
+        };
+        let top = format!(
+            "{}\nexecution_listen = \"{execution}\"\n",
+            TOP.replace("127.0.0.1:9445", worker)
+        );
+        let error = Sections {
+            top: top.leak(),
+            ..Sections::VALID
+        }
+        .parse()
+        .err()
+        .ok_or("accepted")?;
+        assert!(
+            matches!(error, ConfigError::LeaderListenerPortUnset { key: actual, .. } if actual == key)
+        );
+    }
+    let top = format!(
+        "{}\nexecution_listen = \"127.0.0.1:1\"\n",
+        TOP.replace("127.0.0.1:9445", "127.0.0.1:1")
+            .replace("endpoint = \"https://gang.example.com:9443\"\n", "")
+    );
+    assert!(
+        Sections {
+            top: top.leak(),
+            ..Sections::VALID
+        }
+        .parse()
+        .is_err()
+    );
+    let top = TOP.replace("127.0.0.1:9445", "127.0.0.1:0");
+    assert!(
+        Sections {
+            top: top.leak(),
+            ..Sections::VALID
+        }
+        .parse()
+        .is_ok()
+    );
+    Ok(())
+}
+
+#[test]
+fn listener_addresses_must_not_collide() {
+    for (public, worker, execution) in [
+        ("127.0.0.1:1", "127.0.0.1:1", None),
+        ("127.0.0.1:1", "127.0.0.1:2", Some("127.0.0.1:1")),
+        ("127.0.0.1:1", "127.0.0.1:2", Some("127.0.0.1:2")),
+    ] {
+        let top = format!(
+            "{}{}",
+            TOP.replace("127.0.0.1:9443", public)
+                .replace("127.0.0.1:9445", worker),
+            execution.map_or_else(String::new, |addr| format!(
+                "\nexecution_listen = \"{addr}\"\n"
+            ))
+        );
+        assert!(matches!(
+            Sections {
+                top: top.leak(),
+                ..Sections::VALID
+            }
+            .parse(),
+            Err(ConfigError::ListenerCollision { .. })
+        ));
+    }
+}
+
+#[test]
+fn health_listener_must_not_collide_with_other_listeners() {
+    for (health, execution, first) in [
+        ("127.0.0.1:9443", "", "listen"),
+        ("127.0.0.1:9445", "", "worker_listen"),
+        (
+            "127.0.0.1:9444",
+            "execution_listen = \"127.0.0.1:9444\"\n",
+            "execution_listen",
+        ),
+    ] {
+        let top = format!("{TOP}\n{execution}health_listen = \"{health}\"\n");
+        assert!(matches!(
+            Sections {
+                top: top.leak(),
+                ..Sections::VALID
+            }
+            .parse(),
+            Err(ConfigError::ListenerCollision {
+                first: actual,
+                second: "health_listen",
+                ..
+            }) if actual == first
+        ));
+    }
+}
+
+#[test]
+fn wildcard_listener_collisions_respect_address_family() {
+    for (public, worker, collision) in [
+        ("0.0.0.0:9443", "127.0.0.1:9443", true),
+        ("127.0.0.1:9443", "0.0.0.0:9443", true),
+        ("[::]:9443", "[::1]:9443", true),
+        ("[::1]:9443", "[::]:9443", true),
+        ("0.0.0.0:9443", "[::1]:9443", false),
+        ("127.0.0.1:9443", "127.0.0.2:9443", false),
+    ] {
+        let top = TOP
+            .replace("127.0.0.1:9443", public)
+            .replace("127.0.0.1:9445", worker);
+        let result = Sections {
+            top: top.leak(),
+            ..Sections::VALID
+        }
+        .parse();
+        assert_eq!(
+            matches!(result, Err(ConfigError::ListenerCollision { .. })),
+            collision,
+            "{public} and {worker}"
+        );
+        if !collision {
+            assert!(result.is_ok(), "{public} and {worker}: {result:?}");
+        }
+    }
+}
+
+#[test]
+fn execution_endpoint_must_not_relay_to_public_frontend() {
+    for (public, execution, rejected) in [
+        (
+            "https://gang.example.com",
+            Some("https://gang.example.com:443"),
+            true,
+        ),
+        (
+            "https://gang.example.com:444",
+            Some("https://gang.example.com:443"),
+            false,
+        ),
+        ("https://127.0.0.1:9444", None, true),
+        ("https://127.0.0.1:9443", None, false),
+    ] {
+        let top = format!(
+            "{}\nexecution_listen = \"127.0.0.1:9444\"\n{}",
+            TOP.replace("https://gang.example.com:9443", public),
+            execution.map_or_else(String::new, |url| format!(
+                "execution_endpoint = \"{url}\"\n"
+            ))
+        );
+        let result = Sections {
+            top: top.leak(),
+            ..Sections::VALID
+        }
+        .parse();
+        if rejected {
+            assert!(
+                matches!(result, Err(ConfigError::ExecutionEndpointSelfRelay)),
+                "{public} {execution:?}"
+            );
+        } else {
+            assert!(result.is_ok(), "{public} {execution:?}");
+        }
+    }
+    let top = format!(
+        "{}\nexecution_listen = \"127.0.0.1:9444\"\nexecution_endpoint = \"https://127.0.0.1:9443\"\n",
+        TOP.replace("endpoint = \"https://gang.example.com:9443\"\n", "")
+    );
+    assert!(matches!(
+        Sections {
+            top: top.leak(),
+            ..Sections::VALID
+        }
+        .parse(),
+        Err(ConfigError::ExecutionEndpointSelfRelay)
+    ));
+}
+
+#[test]
+fn leadership_renewal_and_skew_must_be_strictly_below_ttl() {
+    for (renew, valid) in [("5s", true), ("6s", false), ("7s", false)] {
+        let server = format!(
+            "{SERVER}\n[server.leadership]\nttl = \"10s\"\nrenew_interval = \"{renew}\"\nclock_skew = \"2s\"\n"
+        );
+        let result = Sections {
+            server: server.leak(),
+            ..Sections::VALID
+        }
+        .parse();
+        assert_eq!(result.is_ok(), valid);
+        if !valid {
+            assert!(matches!(
+                result,
+                Err(ConfigError::LeadershipRenewalTooLate { .. })
+            ));
+        }
+    }
+}
+
+#[test]
+fn leadership_takeover_and_health_must_precede_keepalive_timeout() {
+    assert!(Sections::VALID.parse().is_ok());
+    for (ttl, valid) in [("14s", true), ("15s", false), ("20s", false)] {
+        let server = format!("{SERVER}\n[server.leadership]\nttl = \"{ttl}\"\n");
+        let result = Sections {
+            server: server.leak(),
+            ..Sections::VALID
+        }
+        .parse();
+        if valid {
+            assert!(result.is_ok());
+        } else {
+            let expected_takeover = if ttl == "15s" { 20 } else { 25 };
+            assert!(matches!(
+                result,
+                Err(ConfigError::LeadershipOutlastsKeepalive {
+                    takeover,
+                    healthy_window,
+                    keepalive_timeout,
+                }) if takeover == Duration::from_secs(expected_takeover)
+                    && healthy_window == Duration::from_secs(10)
+                    && keepalive_timeout == Duration::from_secs(30)
+            ));
+        }
+    }
+}
+
+#[test]
+fn leadership_call_timeout_must_fit_in_the_lease() {
+    let server = format!(
+        "{SERVER}\n[server.leadership]\nttl = \"10s\"\nrenew_interval = \"6s\"\nclock_skew = \"2s\"\n"
+    );
+    let result = Sections {
+        server: server.leak(),
+        ..Sections::VALID
+    }
+    .parse();
+    assert!(matches!(
+        result,
+        Err(ConfigError::LeadershipRenewalTooLate { .. })
+    ));
+}
+
+#[test]
+fn shutdown_grace_must_be_strictly_below_every_boot_grace() {
+    for (grace, valid) in [("29s", true), ("30s", false), ("31s", false)] {
+        let scheduler = format!("{SCHEDULER}\nshutdown_grace = \"{grace}\"\n");
+        let result = Sections {
+            scheduler: scheduler.leak(),
+            ..Sections::VALID
+        }
+        .parse();
+        assert_eq!(result.is_ok(), valid);
+        if !valid {
+            assert!(matches!(
+                result,
+                Err(ConfigError::ShutdownGraceNotBelowBootGrace { .. })
+            ));
+        }
+    }
+}
+
+#[test]
+fn shutdown_grace_checks_each_fleet() -> Result<(), Box<dyn Error>> {
+    let scheduler = format!("{SCHEDULER}\nshutdown_grace = \"30s\"\n");
+    let error = Sections {
+        fleet: TWO_FLEETS,
+        provisioner: AWS_PROVISIONER,
+        scheduler: scheduler.leak(),
+        ..Sections::VALID
+    }
+    .parse()
+    .err()
+    .ok_or("accepted")?;
+    assert!(
+        matches!(error, ConfigError::ShutdownGraceNotBelowBootGrace {
+        shutdown_grace, boot_grace, ..
+    } if shutdown_grace == Duration::from_secs(30) && boot_grace == Duration::from_secs(30))
+    );
+    Ok(())
+}
+
+#[test]
+fn leadership_settings_round_trip_and_reject_unknown_fields() -> Result<(), Box<dyn Error>> {
+    let server = format!(
+        "{SERVER}\nrevocation_refresh_interval = \"6s\"\n[server.leadership]\nttl = \"12s\"\nrenew_interval = \"4s\"\nclock_skew = \"3s\"\n"
+    );
+    let text = Sections {
+        server: server.leak(),
+        ..Sections::VALID
+    }
+    .text();
+    let config: GangConfig<Plugins> = text.parse()?;
+    assert_eq!(config.server.leadership.ttl.get(), Duration::from_secs(12));
+    assert_eq!(
+        config.server.leadership.renew_interval.get(),
+        Duration::from_secs(4)
+    );
+    assert_eq!(config.server.leadership.clock_skew, Duration::from_secs(3));
+    assert_eq!(
+        config.server.revocation_refresh_interval.get(),
+        Duration::from_secs(6)
+    );
+    let encoded = Document::<Plugins>::parse(&text)?.to_toml()?;
+    let decoded: GangConfig<Plugins> = encoded.parse()?;
+    assert_eq!(decoded.server, config.server);
+
+    let server = format!("{SERVER}\n[server.leadership]\nunknown = \"1s\"\n");
+    assert!(matches!(
+        Sections {
+            server: server.leak(),
+            ..Sections::VALID
+        }
+        .parse(),
+        Err(ConfigError::Gang(_))
+    ));
+    Ok(())
 }
 
 /// The message of `error` followed by the message of each of its sources, joined with `: `, the
@@ -957,6 +1524,31 @@ fn rejects_a_zero_max_pending_handshakes() -> Result<(), Box<dyn Error>> {
     .parse()
     .err()
     .ok_or("accepted")?;
+
+    assert!(matches!(error, ConfigError::Gang(_)));
+    Ok(())
+}
+
+#[test]
+fn health_header_size_must_hold_the_smallest_http_read_buffer() -> Result<(), Box<dyn Error>> {
+    let server = |size: &str| -> &'static str {
+        format!(
+            "[server]\ntrust_domain = \"gang.internal\"\nhealth_max_connections = 1\nhealth_max_header_size = \"{size}\"\n"
+        )
+        .leak()
+    };
+    Sections {
+        server: server("8KiB"),
+        ..Sections::VALID
+    }
+    .parse()?;
+    let error = Sections {
+        server: server("8191B"),
+        ..Sections::VALID
+    }
+    .parse()
+    .err()
+    .ok_or("a health header size below 8 KiB was accepted")?;
 
     assert!(matches!(error, ConfigError::Gang(_)));
     Ok(())
@@ -3294,7 +3886,6 @@ fn dashboard_defaults_apply_when_the_section_is_omitted() -> Result<(), Box<dyn 
     assert_eq!(dashboard.actions_stale_after, None);
     assert_eq!(dashboard.actions_stale_after(), Duration::from_secs(30));
     assert_eq!(dashboard.login_ttl, NonZeroDuration::from_mins(10));
-    assert_eq!(dashboard.max_pending_logins.get(), 1024);
     assert!(dashboard.login.is_none());
     Ok(())
 }
@@ -3306,17 +3897,35 @@ fn dashboard_device_defaults() -> Result<(), Box<dyn Error>> {
     assert!(device.enabled);
     assert_eq!(device.ttl.get(), Duration::from_mins(10));
     assert_eq!(device.poll_interval.get(), Duration::from_secs(5));
-    assert_eq!(device.max_pending.get(), 1024);
 
     let config = with_dashboard(
-        "[dashboard.device]\nenabled = false\nttl = \"2m\"\npoll_interval = \"10s\"\nmax_pending = 2\n",
+        "[dashboard.device]\nenabled = false\nttl = \"2m\"\npoll_interval = \"10s\"\n",
     )?;
     let device = &config.dashboard.device;
     assert!(!device.enabled);
     assert_eq!(device.ttl.get(), Duration::from_mins(2));
     assert_eq!(device.poll_interval.get(), Duration::from_secs(10));
-    assert_eq!(device.max_pending.get(), 2);
-    assert!(with_dashboard("[dashboard.device]\nmax_pending = 0\n").is_err());
+    Ok(())
+}
+
+#[test]
+fn removed_dashboard_pending_limits_are_rejected() -> Result<(), Box<dyn Error>> {
+    for (text, key) in [
+        (
+            "[dashboard]\nmax_pending_logins = 16\n",
+            "max_pending_logins",
+        ),
+        ("[dashboard.device]\nmax_pending = 2\n", "max_pending"),
+    ] {
+        let message = rejection(&Sections {
+            dashboard: text,
+            ..Sections::VALID
+        })?;
+        assert!(
+            message.contains("unknown field") && message.contains(key),
+            "{message}"
+        );
+    }
     Ok(())
 }
 
@@ -3443,7 +4052,6 @@ max_listed_queued = 10
 detail_interval = "3s"
 actions_stale_after = "45s"
 login_ttl = "5m"
-max_pending_logins = 16
 session_max_age = "24h"
 renewal_reuse = "2m"
 "#,
@@ -3467,7 +4075,6 @@ renewal_reuse = "2m"
     );
     assert_eq!(dashboard.actions_stale_after(), Duration::from_secs(45));
     assert_eq!(dashboard.login_ttl, NonZeroDuration::from_mins(5));
-    assert_eq!(dashboard.max_pending_logins.get(), 16);
     assert_eq!(dashboard.session_max_age.get(), Duration::from_hours(24));
     assert_eq!(dashboard.renewal_reuse, NonZeroDuration::from_mins(2));
     Ok(())

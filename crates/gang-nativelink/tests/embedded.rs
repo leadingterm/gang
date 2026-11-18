@@ -22,8 +22,8 @@ use gang_spi::{
 };
 use gang_testkit::{ChildTest, ExtendedKeyUsagePurpose, TestAuthority, TestResult};
 use gang_tls::{
-    AcceptorSettings, Alpn, CertificateRevoked, ClientAuth, Failure, IncomingSettings,
-    RevocationSet, TlsAcceptor,
+    AcceptorSettings, Alpn, CertificateRevoked, ClientAuth, IncomingSettings, RevocationSet,
+    TlsAcceptor,
 };
 use gang_types::{
     Bytes, CertSerial, FleetCatalog, FleetName, FleetProperties, FleetSet, Identity, InstanceId,
@@ -52,8 +52,10 @@ use prost::Message as _;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncReadExt;
+#[cfg(target_os = "linux")]
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tonic::Code;
 use tonic::codec::Streaming;
@@ -87,6 +89,12 @@ const GROUP_HOLD_ENV: &str = "GANG_TEST_GROUP_HOLD";
 /// The address for a helper that leaves its action group after starting a held child.
 #[cfg(target_os = "linux")]
 const GROUP_LEAVE_ENV: &str = "GANG_TEST_GROUP_LEAVE";
+/// The address for the default-memory-floor helper to report its reservation.
+#[cfg(target_os = "linux")]
+const MEMORY_ENV: &str = "GANG_TEST_MEMORY";
+/// The output directory used by the default-memory-floor helper.
+#[cfg(target_os = "linux")]
+const MEMORY_OUTPUT: &str = "memory-output";
 /// The input file of the action, materialised in its working directory.
 const INPUT_NAME: &str = "input.txt";
 /// The output file of the action, written by `entrypoint_helper`.
@@ -208,6 +216,7 @@ fn no_connections() -> ControllerConnections<TestGate, TestGate, TestApi> {
     };
     ControllerConnections {
         public: listening(),
+        execution: None,
         worker: listening(),
         api: TestApi,
     }
@@ -350,6 +359,7 @@ fn spawn_controller(
                 connections: announcing(accepted(public, public_peers), serving_tx),
                 gate: public_gate,
             },
+            execution: None,
             worker: Listening {
                 connections: accepted(worker, Vec::new()),
                 gate: TestGate::allow(),
@@ -627,7 +637,6 @@ async fn a_worker_whose_certificate_is_revoked_ends_instead_of_reconnecting() ->
     })?;
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let port = listener.local_addr()?.port();
-    let (refused_tx, mut refused) = mpsc::unbounded_channel();
     let _incoming = acceptor.incoming(
         listener,
         IncomingSettings {
@@ -635,11 +644,7 @@ async fn a_worker_whose_certificate_is_revoked_ends_instead_of_reconnecting() ->
             accept_error_backoff: NonZeroDuration::from_millis(100),
             refusal_linger: NonZeroDuration::from_secs(2),
         },
-        move |failure| {
-            if matches!(failure, Failure::Handshake { .. }) {
-                let _ = refused_tx.send(());
-            }
-        },
+        |_| {},
     );
 
     let plugin = build_plugin(config_with(
@@ -659,21 +664,20 @@ async fn a_worker_whose_certificate_is_revoked_ends_instead_of_reconnecting() ->
         store_access: StoreAccess::Direct,
         entrypoint: std::env::current_exe()?,
     };
-    let stop = async {
-        let _ = refused.recv().await;
-        let _ = refused.recv().await;
-    };
-    let result = plugin
-        .run_worker(
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        plugin.run_worker(
             &spec,
             WorkerTls::Mutual(ClientTls {
                 certificate: &certificate,
                 private_key: &private_key,
                 server_ca: &server_ca,
             }),
-            stop,
-        )
-        .await;
+            std::future::pending(),
+        ),
+    )
+    .await
+    .expect("a revoked worker terminates after receiving the TLS alert");
     let error = result.expect_err("a revoked worker ends with an error instead of reconnecting");
     assert!(
         std::iter::successors(Some(&error as &(dyn Error + 'static)), |&e| e.source())
@@ -855,6 +859,22 @@ fn entrypoint_helper() -> TestResult {
         return Ok(());
     }
     #[cfg(target_os = "linux")]
+    if let Some(address) = std::env::var_os(MEMORY_ENV) {
+        use std::io::Write as _;
+        use std::os::unix::fs::symlink;
+
+        std::fs::create_dir_all(MEMORY_OUTPUT)?;
+        let link = Path::new(MEMORY_OUTPUT).join("input-link");
+        symlink(std::env::current_dir()?.join(INPUT_NAME), &link)?;
+        let memory = vec![1_u8; 50 * 1024 * 1024];
+        std::hint::black_box(&memory);
+        let mut stream = std::net::TcpStream::connect(address.to_string_lossy().as_ref())?;
+        writeln!(stream, "{}", std::env::var("GANG_MEMORY_KB")?)?;
+        std::io::copy(&mut stream, &mut std::io::sink())?;
+        std::hint::black_box(&memory);
+        std::fs::remove_file(link)?;
+    }
+    #[cfg(target_os = "linux")]
     if let Some(address) = std::env::var_os(GROUP_LEAVE_ENV) {
         use std::io::Write as _;
         use std::os::unix::process::ExitStatusExt as _;
@@ -962,6 +982,12 @@ fn build_action_with(
         )
         .collect(),
         output_files: vec![OUTPUT_NAME.into()],
+        #[cfg(target_os = "linux")]
+        output_directories: if env.iter().any(|(name, _)| *name == MEMORY_ENV) {
+            vec![MEMORY_OUTPUT.into()]
+        } else {
+            Vec::new()
+        },
         platform: Some(platform.clone()),
         ..Default::default()
     };
@@ -1148,6 +1174,29 @@ async fn an_action_runs_and_its_result_is_cached() -> TestResult {
     Ok(())
 }
 
+/// A worker-marked action still runs the ordinary entrypoint and produces its output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_persistent_worker_marked_action_runs_the_entrypoint() -> TestResult {
+    let flow: Result<TestResult, _> = tokio::time::timeout(Duration::from_mins(2), async {
+        let scratch = tempfile::tempdir()?;
+        let mut harness = Harness::start().await?;
+        harness.add_worker(WorkerPaths::new(scratch.path(), "worker"), default_fleet()?)?;
+        let channel = public_channel(harness.public_port).await?;
+        let action = build_action(&[("ISA", "x86-64"), ("supports-workers", "1")])?;
+        upload_blobs(&channel, action.blobs).await?;
+
+        let response = run_action(&channel, &action.digest).await?;
+        let result = response
+            .result
+            .ok_or("the response carries no action result")?;
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(output_digest(&result)?, Some(&digest_of(HELLO)?));
+        Ok(())
+    })
+    .await;
+    flow.map_err(|_| "timed out waiting for the worker-marked action")?
+}
+
 /// Stopping a worker kills the complete action process group and removes its directory.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stopping_a_worker_ends_every_process_of_a_running_action() -> TestResult {
@@ -1230,6 +1279,49 @@ async fn nativelink_kill_never_reaches_the_workers_process_group() -> TestResult
     assert_eq!(&byte, b"k", "helper did not report a signalled child");
     worker.task.await??;
     Ok(())
+}
+
+/// A client-requested 26,864 KiB reservation is raised to the default memory floor before dispatch.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_subfloor_request_runs_with_the_default_memory_floor() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let scratch = tempfile::tempdir()?;
+        let mut harness = Harness::start().await?;
+        harness.add_worker(WorkerPaths::new(scratch.path(), "worker"), default_fleet()?)?;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let address = listener.local_addr()?.to_string();
+        let action = build_action_with(
+            &[("ISA", "x86-64"), ("memory_kb", "26864")],
+            &[(MEMORY_ENV, &address)],
+        )?;
+        let channel = public_channel(harness.public_port).await?;
+        upload_blobs(&channel, action.blobs).await?;
+        let execution = run_action(&channel, &action.digest);
+        tokio::pin!(execution);
+
+        let (stream, _) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            response = &mut execution => {
+                response?;
+                return Err("action completed before the memory helper connected".into());
+            }
+        };
+        let mut stream = BufReader::new(stream);
+        let mut reservation = String::new();
+        stream.read_line(&mut reservation).await?;
+        assert_eq!(reservation.trim(), "65536");
+        drop(stream);
+
+        let response = execution.await?;
+        let result = response
+            .result
+            .ok_or("the response carries no action result")?;
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(output_digest(&result)?, Some(&digest_of(HELLO)?));
+        Ok::<(), Box<dyn Error>>(())
+    })
+    .await?
 }
 
 /// Disk-guard backpressure requeues an action without exhausting its retry allowance.
@@ -1409,7 +1501,7 @@ async fn a_reservation_below_the_minimum_is_queued_at_the_minimum() -> TestResul
         vec![default_fleet()?],
         TestGate::allow(),
         Vec::new(),
-        json!({"memory": {"min_reservation": "64MiB"}}),
+        json!({"memory": {"min_reservation": "16MiB"}}),
     )
     .await?;
     let channel = public_channel(harness.public_port).await?;
@@ -1434,7 +1526,7 @@ async fn a_reservation_below_the_minimum_is_queued_at_the_minimum() -> TestResul
         .queued
         .first()
         .ok_or("the snapshot lists no queued action")?;
-    assert_eq!(queued.resources.memory, Bytes::mib(64));
+    assert_eq!(queued.resources.memory, Bytes::mib(16));
     Ok(())
 }
 

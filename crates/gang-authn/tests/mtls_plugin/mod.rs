@@ -1,8 +1,10 @@
 //! The `mtls` plugin against the shared fakes: issuance into the ledger, certificate
 //! authentication by serial, and revocation by serial or identity.
 
+use std::future::{Future, poll_fn};
 use std::path::Path;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use gang_authn::{Mtls, MtlsConfig};
@@ -212,6 +214,79 @@ async fn failed_ledger_write_leaves_no_usable_certificate() {
             ..
         })
     ));
+}
+
+#[tokio::test]
+async fn remote_revoke_and_restore_during_issuance_never_releases_the_certificate()
+-> Result<(), Box<dyn std::error::Error>> {
+    let plugin = mtls();
+    let host = host();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    host.repository().gate_record_issued(gate.clone());
+    let mut issuance = Box::pin(issue(&plugin, &host, PROVIDER, PROOF));
+    assert!(poll_fn(|cx| Poll::Ready(issuance.as_mut().poll(cx).is_pending())).await);
+
+    // Mutate the repository directly, as a controller on another host would.
+    let identity = identity(PROVIDER, PRINCIPAL);
+    host.repository()
+        .revoke_principal(&identity, host.now())
+        .await?;
+    host.repository().restore_principal(&identity).await?;
+
+    gate.notify_one();
+    assert!(matches!(
+        issuance.await,
+        Err(PortError::Rejected {
+            reason: Rejection::PolicyDenied,
+            ..
+        })
+    ));
+    let serial = first_serial();
+    let record = host.repository().certificate(&serial).await?;
+    assert!(matches!(
+        record.map(|record| record.status),
+        Some(CertStatus::Revoked { .. })
+    ));
+    assert!(matches!(
+        authenticate(&plugin, &host, &presenting(&serial)).await,
+        Ok(None) | Err(PortError::Rejected { .. })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn principal_revoked_durably_before_issuance_is_refused_despite_a_stale_host_cache()
+-> Result<(), Box<dyn std::error::Error>> {
+    let plugin = mtls();
+    let host = host();
+    // Another controller committed the revocation; this host's local cache has not caught up,
+    // so `verify` still accepts the proof.
+    let identity = identity(PROVIDER, PRINCIPAL);
+    host.repository()
+        .revoke_principal(&identity, host.now())
+        .await?;
+
+    assert!(matches!(
+        issue(&plugin, &host, PROVIDER, PROOF).await,
+        Err(PortError::Rejected {
+            reason: Rejection::PrincipalRevoked,
+            ..
+        })
+    ));
+
+    host.repository().restore_principal(&identity).await?;
+    assert!(
+        host.repository()
+            .certificates_of(&identity)
+            .await?
+            .iter()
+            .all(|record| record.status != CertStatus::Active)
+    );
+    assert!(matches!(
+        authenticate(&plugin, &host, &presenting(&first_serial())).await,
+        Ok(None) | Err(PortError::Rejected { .. })
+    ));
+    Ok(())
 }
 
 #[tokio::test]
@@ -641,6 +716,7 @@ async fn issue_session_is_unsupported() {
                 provider: &provider,
                 proof: &proof,
             },
+            host.now() + Duration::from_mins(10),
         )
         .await;
     assert!(matches!(

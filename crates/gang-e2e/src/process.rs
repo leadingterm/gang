@@ -253,6 +253,27 @@ impl Supervised {
             .map_err(E2eError::io("polling a child process"))
     }
 
+    /// Waits for the child without signalling it, killing it if the deadline expires.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the child cannot be waited for or does not exit by the deadline.
+    pub fn wait_within(&mut self, timeout: Duration, condition: &str) -> Result<ExitStatus> {
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| E2eError::system("process was already terminated"))?;
+        let result = match child
+            .try_wait()
+            .map_err(E2eError::io("reading child status"))?
+        {
+            Some(status) => Ok(status),
+            None => wait_within(child, timeout, condition),
+        };
+        self.child = None;
+        result
+    }
+
     /// Kills the process with SIGKILL and reaps it. A process that already exited is not an error.
     ///
     /// # Errors
@@ -275,6 +296,24 @@ impl Supervised {
             .map_err(E2eError::io(format!("waiting for process {pid}")))
     }
 
+    /// Requests that a running process exit without waiting for it.
+    pub(crate) fn request_exit(&mut self) -> Result<()> {
+        let pid = self.pid;
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| E2eError::system(format!("process {pid} was already terminated")))?;
+        if child
+            .try_wait()
+            .map_err(E2eError::io("polling a child process"))?
+            .is_none()
+        {
+            gang_os::terminate_process(pid)
+                .map_err(E2eError::io(format!("terminating process {pid}")))?;
+        }
+        Ok(())
+    }
+
     /// Asks the process to stop with SIGTERM and waits at most `timeout` for it to exit, reaping it.
     /// A process that already exited returns its status at once.
     ///
@@ -283,22 +322,8 @@ impl Supervised {
     /// [`E2eError::Timeout`] when it is still running after `timeout`; it is then killed and reaped.
     /// [`E2eError::Io`] when it cannot be signalled or waited for.
     pub fn terminate(&mut self, timeout: Duration) -> Result<ExitStatus> {
-        let pid = self.pid;
-        let already_terminated =
-            || E2eError::system(format!("process {pid} was already terminated"));
-        let child = self.child.as_mut().ok_or_else(already_terminated)?;
-        if let Some(status) = child
-            .try_wait()
-            .map_err(E2eError::io("polling a child process"))?
-        {
-            self.child = None;
-            return Ok(status);
-        }
-        gang_os::terminate_process(pid)
-            .map_err(E2eError::io(format!("terminating process {pid}")))?;
-        let result = wait_within(child, timeout, "the process to exit after SIGTERM");
-        self.child = None;
-        result
+        self.request_exit()?;
+        self.wait_within(timeout, "the process to exit after SIGTERM")
     }
 }
 
@@ -457,17 +482,121 @@ pub fn workers_of<'a>(entries: &'a [ProcessEntry], config: &Path) -> Vec<&'a Pro
         .collect()
 }
 
-/// Sends SIGTERM to every worker of the stack whose configuration is `config`. A worker that has
-/// already exited is not an error.
+/// Waits for a process to exit without requiring it to be our child.
+pub(crate) fn await_gone(pid: u32, timeout: Duration) -> Result<bool> {
+    match ExitHandle::open(pid)? {
+        Some(handle) => handle.wait(timeout),
+        None => Ok(true),
+    }
+}
+
+#[cfg(target_os = "linux")]
+type ExitFd = std::os::fd::OwnedFd;
+#[cfg(target_os = "macos")]
+type ExitFd = gang_os::ProcessExitQueue;
+
+struct ExitHandle {
+    fd: ExitFd,
+    pid: Pid,
+}
+
+impl ExitHandle {
+    fn open(pid: u32) -> Result<Option<Self>> {
+        let raw = i32::try_from(pid)
+            .map_err(|_| E2eError::system(format!("invalid process id {pid}")))?;
+        let target = Pid::from_raw(raw)
+            .ok_or_else(|| E2eError::system(format!("invalid process id {pid}")))?;
+        match open_exit_handle(target) {
+            Ok(fd) => Ok(Some(Self { fd, pid: target })),
+            Err(rustix::io::Errno::SRCH) => Ok(None),
+            Err(error) => Err(E2eError::system(format!(
+                "observing process {pid}: {error}"
+            ))),
+        }
+    }
+
+    fn signal(&self, signal: rustix::process::Signal) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        let result = rustix::process::pidfd_send_signal(&self.fd, signal);
+        #[cfg(target_os = "macos")]
+        let result = rustix::process::kill_process(self.pid, signal);
+        match result {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+            Err(error) => Err(E2eError::system(format!(
+                "signalling process {}: {error}",
+                self.pid
+            ))),
+        }
+    }
+
+    fn wait(&self, timeout: Duration) -> Result<bool> {
+        wait_exit_handle(&self.fd, timeout)
+            .map_err(|error| E2eError::system(format!("waiting for process {}: {error}", self.pid)))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_exit_handle(pid: Pid) -> rustix::io::Result<std::os::fd::OwnedFd> {
+    rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
+}
+
+#[cfg(target_os = "linux")]
+fn wait_exit_handle(fd: &std::os::fd::OwnedFd, timeout: Duration) -> rustix::io::Result<bool> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or(rustix::io::Errno::INVAL)?;
+    let mut fds = [PollFd::new(fd, PollFlags::IN)];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout = Timespec {
+            tv_sec: i64::try_from(remaining.as_secs()).map_err(|_| rustix::io::Errno::INVAL)?,
+            tv_nsec: remaining.subsec_nanos().into(),
+        };
+        match poll(&mut fds, Some(&timeout)) {
+            Err(rustix::io::Errno::INTR) => {}
+            result => return result.map(|ready| ready != 0),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_exit_handle(pid: Pid) -> rustix::io::Result<ExitFd> {
+    gang_os::ProcessExitQueue::new(pid)
+}
+
+#[cfg(target_os = "macos")]
+fn wait_exit_handle(fd: &ExitFd, timeout: Duration) -> rustix::io::Result<bool> {
+    fd.wait(timeout)
+}
+
+/// Terminates the stack's workers and waits for their exit, killing unresponsive workers.
 ///
 /// # Errors
 ///
-/// [`E2eError::Io`] when a signal cannot be sent.
+/// Returns an error if signalling or observing a worker fails, or a killed worker does not exit.
 pub fn terminate_workers(config: &Path) -> Result<()> {
+    use rustix::process::Signal;
+
     let entries = snapshot();
-    for worker in workers_of(&entries, config) {
-        gang_os::terminate_process(worker.pid)
-            .map_err(E2eError::io(format!("signalling worker {}", worker.pid)))?;
+    let workers = workers_of(&entries, config);
+    let mut targets = Vec::with_capacity(workers.len());
+    for worker in workers {
+        let Some(handle) = ExitHandle::open(worker.pid)? else {
+            continue;
+        };
+        handle.signal(Signal::TERM)?;
+        targets.push((worker.pid, handle));
+    }
+    let timeout = crate::settings::DEFAULT_COMMAND_TIMEOUT;
+    for (pid, handle) in targets {
+        if !handle.wait(timeout)? {
+            handle.signal(Signal::KILL)?;
+            if !handle.wait(timeout)? {
+                return Err(E2eError::timeout(format!("worker {pid} to exit"), timeout));
+            }
+        }
     }
     Ok(())
 }
@@ -507,6 +636,38 @@ mod tests {
 
     /// Marks the child that writes to both standard streams.
     const STREAMS_CHILD_MARKER: &str = "GANG_E2E_STREAMS_CHILD";
+
+    #[test]
+    fn terminating_workers_waits_for_their_sigterm_handler() -> gang_testkit::TestResult {
+        let dir = tempfile::tempdir()?;
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            dir.path().join("worker"),
+            "trap 'exit 0' TERM\nprintf 'ready\\n'\nread -r value\n",
+        )?;
+        // The worker argv contract requires a real shell process with `worker` as argv[1].
+        let bash = std::fs::canonicalize(
+            std::env::var_os("GANG_E2E_TEST_BASH").ok_or("Bazel supplies pinned Bash")?,
+        )?;
+        let mut child = Command::new(bash)
+            .current_dir(dir.path())
+            .arg("worker")
+            .arg(&config)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()?;
+        let stdout = child.stdout.take().ok_or("worker stdout missing")?;
+        let mut reader = BufReader::new(stdout);
+        let mut ready = String::new();
+        reader.read_line(&mut ready)?;
+        assert_eq!(ready, "ready\n");
+        terminate_workers(&config)?;
+        assert!(
+            child.try_wait()?.is_some(),
+            "worker still runs after termination"
+        );
+        Ok(())
+    }
 
     #[test]
     fn run_keeps_standard_output_apart_from_standard_error() {
@@ -620,6 +781,15 @@ mod tests {
             .expect("child starts");
         let error = wait_within(&mut child, Duration::ZERO, "child").expect_err("child times out");
         assert!(matches!(error, E2eError::Timeout { .. }));
+    }
+
+    #[test]
+    fn supervised_wait_reaps_without_signalling() -> gang_testkit::TestResult {
+        let dir = tempfile::tempdir()?;
+        let mut child = Supervised::spawn(&mut helper("output"), &dir.path().join("log"))?;
+        let status = child.wait_within(Duration::from_secs(30), "child to exit")?;
+        assert!(status.success());
+        Ok(())
     }
     #[test]
     fn announcements_timeout_kills_the_child() {

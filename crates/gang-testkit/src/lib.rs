@@ -19,6 +19,8 @@
 //! - [`TestSigner`], [`FailingSigner`], [`WrongKeySigner`], [`GarbageSigner`]: deterministic certificate signers.
 //! - [`TestAuthority`] and [`TestLeaf`]: a throwaway certificate authority that issues TLS test certificates.
 //! - [`FakeRepository`]: an in-memory state repository with failure injection.
+//! - [`Fixture`] and [`database_contract`]: shared database contract checks.
+//! - [`FakeDynamoDb`]: an in-memory `DynamoDB` protocol server.
 //! - [`FakeProvisioner`]: a configurable fleet and worker-side provisioner.
 //! - [`FakeScheduler`] and its [`Controller`], [`Behaviour`] and [`CallCount`] helpers.
 //! - [`TestPlugins`], [`OpaquePlugins`] and [`STANDARD_GANG_TOML`]: plugin sets and a standard configuration.
@@ -40,12 +42,22 @@ mod builders;
 mod cache;
 mod call_log;
 mod child_test;
+/// Shared contract checks for database implementations.
+pub mod database_contract;
 mod errors;
+/// Shared contract checks for expiring record implementations.
+pub mod expiring_contract;
+mod fake_dynamodb;
+/// Deterministic fencing permissions for tests.
+pub mod fence;
 pub mod fork_gate;
 mod jwt;
+/// Shared contract checks for leader lease implementations.
+pub mod lease_contract;
 mod limits;
 mod park;
 mod plugins;
+mod postgres;
 mod provisioner;
 /// Shared contract checks for `ProvisionerPort` implementations.
 pub mod provisioner_contract;
@@ -56,6 +68,8 @@ mod repository;
 pub mod repository_contract;
 mod sandbox;
 mod scheduler;
+/// Shared contract checks for database schema compatibility.
+pub mod schema_contract;
 mod signer;
 /// The contract suite that every `CertificateSignerPort` implementation must pass.
 pub mod signer_contract;
@@ -68,7 +82,9 @@ pub use builders::{fleet, fleet_of, fleet_policy, scheduled_minimum};
 pub use cache::FakeCache;
 pub use call_log::CallLog;
 pub use child_test::ChildTest;
+pub use database_contract::Fixture;
 pub use errors::assert_sources_not_repeated;
+pub use fake_dynamodb::{FakeDynamoDb, FakeDynamoError};
 pub use jwt::generate_es256_key;
 pub use limits::{LimitsStep, RecordedScope, RecordingLimits};
 pub use park::{must_ready, park_then_signal, ready_now};
@@ -76,7 +92,10 @@ pub use plugins::{
     BoxedSection, Opaque, OpaquePlugins, STANDARD_GANG_TOML, SandboxConfig, SandboxKey, TestLimits,
     TestPluginSet, TestPlugins,
 };
-pub use provisioner::FakeProvisioner;
+pub use postgres::{
+    POSTGRES_ARCHIVE_ENV, PostgresError, PostgresServer, SUPERUSER, shared_postgres,
+};
+pub use provisioner::{FakeProvisioner, FleetCall};
 #[cfg(unix)]
 pub use pty::{PtyOutput, run_answering};
 pub use repository::FakeRepository;

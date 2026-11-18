@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use gang_types::{FleetCatalog, FleetSet, Refusal};
+use gang_types::{FleetCatalog, FleetSet, Refusal, property};
 use nativelink_error::{Error, make_input_err};
 use nativelink_metric::{
     MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent, RootMetricsComponent,
@@ -62,6 +62,21 @@ pub(crate) fn refused<'r>(
     )
 }
 
+/// Computes the millicore reservation needed for an explicit core count, if it must increase.
+pub(crate) fn normalized_cpu_reservation(properties: &HashMap<String, String>) -> Option<u64> {
+    let count = properties.get(property::CPU_COUNT)?.parse::<u64>().ok()?;
+    if count == 0 {
+        return None;
+    }
+    let required = count.saturating_mul(property::MILLICORES_PER_CORE);
+    let existing = properties
+        .get(property::CPU_MILLICORES)
+        .and_then(|value| value.parse::<u64>().ok());
+    existing
+        .is_none_or(|millicores| millicores < required)
+        .then_some(required)
+}
+
 /// Forwards scheduler calls while refusing actions that cannot run on any declared fleet.
 pub(crate) struct PlaceableActions {
     inner: Arc<dyn KnownPlatformPropertyProvider>,
@@ -112,12 +127,17 @@ impl ClientStateManager for PlaceableActions {
     async fn add_action(
         &self,
         client_operation_id: OperationId,
-        action_info: Arc<ActionInfo>,
+        mut action_info: Arc<ActionInfo>,
     ) -> Result<Box<dyn ActionStateResult>, Error> {
         let properties = |key: &str| action_info.platform_properties.get(key).map(String::as_str);
         let admitted = self.fleets.accepting(properties);
         if admitted.is_empty() {
             return Err(refused(&self.fleets, properties));
+        }
+        if let Some(millicores) = normalized_cpu_reservation(&action_info.platform_properties) {
+            Arc::make_mut(&mut action_info)
+                .platform_properties
+                .insert(property::CPU_MILLICORES.to_owned(), millicores.to_string());
         }
         let _admission = self.admitted.insert(client_operation_id.clone(), admitted);
         self.inner
@@ -155,7 +175,7 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::*;
-    use crate::enforcement::MemoryTuning;
+    use crate::enforcement::{MemoryTuning, MinReservation};
     use crate::fitted::FittedActions;
 
     #[derive(Default)]
@@ -418,8 +438,33 @@ mod tests {
             .expect("fitted");
         assert_eq!(
             fake.calls.lock()[0].platform_properties[property::MEMORY_KB],
-            "16384"
+            "65536"
         );
+    }
+
+    #[tokio::test]
+    async fn fitted_uses_a_custom_memory_minimum() {
+        let fake = Arc::new(Fake::default());
+        let fitted = FittedActions::new(
+            fake.clone(),
+            large_memory_catalog(),
+            AdmittedFleets::default(),
+            MinReservation::from_units(4096),
+        );
+        for (value, expected) in [("252", "4096"), ("26864", "26864")] {
+            fitted
+                .add_action(operation(), info(property::MEMORY_KB, value))
+                .await
+                .expect("fitted");
+            assert_eq!(
+                fake.calls
+                    .lock()
+                    .last()
+                    .expect("recorded")
+                    .platform_properties[property::MEMORY_KB],
+                expected
+            );
+        }
     }
 
     #[tokio::test]

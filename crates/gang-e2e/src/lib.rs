@@ -20,6 +20,7 @@ mod access_secured;
 mod access_verdict;
 mod administrator;
 mod admission;
+mod balancer;
 mod bazel;
 mod browser;
 mod browser_secured;
@@ -31,8 +32,12 @@ mod checked_in;
 mod chromium;
 mod cli;
 mod cli_terminal;
+mod cluster;
 mod control;
+mod controller_loss;
+mod cross_revocation;
 mod dashboard;
+mod database_outage;
 mod device_verdict;
 mod disk;
 mod drain;
@@ -41,12 +46,15 @@ mod errors;
 mod event_log;
 mod execution;
 mod fake_bazel;
+mod fake_s3;
 mod fhs_tools;
 mod fifo;
 mod fleets;
+mod follower_builds;
 mod gang_cli;
 mod glibc_toolchain;
 mod h2_frames;
+mod held_build;
 mod hold;
 mod host;
 mod http;
@@ -55,8 +63,10 @@ mod input_root;
 mod integrity;
 mod issuer;
 mod journal;
+mod leader_failover;
 mod lifecycle;
 mod limits;
+mod login_across;
 mod memory;
 mod mirror;
 mod network;
@@ -72,6 +82,7 @@ mod reaper;
 mod report;
 mod restart;
 mod revocation;
+mod rolling_deploy;
 mod sandbox_contract;
 mod scheduled_minimum;
 mod secured;
@@ -114,6 +125,7 @@ pub use access_verdict::{
 };
 pub use administrator::{ADMINISTRATOR, Administrator};
 pub use admission::{cold_start_misfit, memory_escalation, oversized_fleet, unplaceable_disk};
+pub use balancer::{Balancer, Frontend, Probe as BalancerProbe};
 pub use bazel::Bazel;
 pub use browser::{BROWSER_SUBJECT, Browser, SESSION_MAX_AGE, SESSION_TOKEN_TTL, sessions};
 pub use browser_verdict::{
@@ -128,7 +140,9 @@ pub use chromium::{Chromium, Navigation};
 pub use cli::{
     Call, Colour, Local, Refused, RowStatus, StatusRow, Terminal, cli, plain, status_rows,
 };
+pub use cluster::Cluster;
 pub use control::{Control, ControlKnobs};
+pub use controller_loss::controller_loss;
 pub use dashboard::dashboard;
 pub use device_verdict::{
     DevicePrompt, browser_approved, cross_site_approval_refused, device_approved, device_only,
@@ -146,6 +160,7 @@ pub use execution::{
     WorkerCertificates, held_build, renewal_deadline, scope_of,
 };
 pub use fake_bazel::{FAKE_BAZEL_ENV, command_line_event, fake_bazel, fake_bazel_requested};
+pub use fake_s3::FakeS3;
 pub use fhs_tools::fhs_tools;
 pub use fleets::fleets;
 pub use gang_cli::GangCli;
@@ -195,7 +210,7 @@ pub use server::{
 pub use server_scenarios::{api, certificate_rotation, event_paging, request_limits, viewer_cap};
 pub use server_stack::ServerStream;
 pub use session::{SessionCookie, TokenUsage, cookie_name, session_cookie, signed_token};
-pub use settings::{ActionTools, GLIBC_LOADER_PATHS, Settings};
+pub use settings::{ActionTools, DeploymentInputs, GLIBC_LOADER_PATHS, Settings};
 pub use skipped_pass::skipped_pass;
 pub use sse::EventStream;
 pub use stack::Stack;

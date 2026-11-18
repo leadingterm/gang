@@ -2,14 +2,17 @@
 
 use std::fs;
 use std::future;
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use gang_clock::Timestamp;
-use gang_config::{SANDBOX_FILE_NAME, SandboxFile};
+use gang_config::{FleetMember, Fleets, SANDBOX_FILE_NAME, SandboxFile};
 use gang_spi::{InstanceIdentity, PreemptionNotice, StoreAccess};
 use gang_testkit::{SandboxKey, TestPlugins};
 use gang_types::{
-    Bytes, FleetName, InstanceId, Isa, NonZeroDuration, Percent, WorkerLifetime, property,
+    Bytes, FleetName, InstanceId, Isa, NonZeroBytes, NonZeroDuration, Percent, WorkerLifetime,
+    property,
 };
 use gang_worker::{Layout, ServerCaError, WorkerError, WorkerSettings};
 use tokio::task::JoinHandle;
@@ -725,6 +728,192 @@ async fn a_scratch_volume_below_the_fleet_disk_stops_the_worker_before_it_enroll
     assert_eq!(harness.enroller.calls(), 0);
     assert!(harness.limits.observed_at_prepare().is_empty());
     assert!(harness.scheduler.specs().is_empty());
+}
+
+#[tokio::test]
+async fn stale_work_is_reclaimed_before_capacity_check() {
+    let harness = Harness::new(Isa::X86_64, WorkerLifetime::LongLived);
+    harness.scheduler.set_behaviour(Behaviour::Finish);
+    harness
+        .provisioner
+        .set_capacity(Bytes::new(2 * GIB + 64 * 1024));
+    harness.provisioner.set_capacity_accounting(true);
+
+    let layout = Layout::new(&harness.volume);
+    let stale = layout.work_directory().join("stale");
+    fs::create_dir_all(layout.work_directory()).expect("work directory can be created");
+    fs::write(&stale, vec![1_u8; 1024 * 1024]).expect("stale work can be written");
+    assert!(
+        gang_os::fs::usage(&stale)
+            .expect("stale work usage can be measured")
+            .get()
+            > 0,
+        "stale work must occupy disk blocks"
+    );
+    fs::create_dir_all(layout.fast_cas_directory()).expect("fast CAS directory can be created");
+    let cached = layout.fast_cas_directory().join("cached");
+    let sentinel = b"warm cache sentinel";
+    fs::write(&cached, sentinel).expect("cached sentinel can be written");
+
+    let mut settings = harness.settings();
+    let fleet_name = FleetName::try_new("example-fleet").expect("test fleet name is valid");
+    let fleet = settings.fleets.by_name(&fleet_name).expect("fleet exists");
+    let mut policy = fleet.policy.clone();
+    policy.disk_per_instance = NonZeroBytes::gib(1);
+    settings.fleets = Fleets::try_new(vec![FleetMember {
+        policy,
+        sandbox: fleet.sandbox,
+        options: fleet.options.clone(),
+    }])
+    .expect("test fleet is valid");
+
+    gang_worker::run(
+        harness.parts(true),
+        settings,
+        harness.build_limits(),
+        future::pending(),
+    )
+    .await
+    .expect("reclaiming stale work leaves enough space for the fleet");
+
+    assert!(!stale.exists());
+    assert_eq!(
+        fs::read(cached)
+            .expect("cached sentinel is preserved")
+            .as_slice(),
+        sentinel
+    );
+    assert!(only_spec(&harness).fast_cas_budget.get() >= GIB);
+    assert_eq!(harness.enroller.calls(), 1);
+}
+
+/// Restores owner access to its directories, outermost first, when dropped, so a failed test
+/// leaves a tree its temporary directory can delete.
+struct OwnerAccess(Vec<PathBuf>);
+
+impl Drop for OwnerAccess {
+    fn drop(&mut self) {
+        for directory in &self.0 {
+            // A directory that was removed has nothing to restore.
+            let _ = fs::set_permissions(directory, fs::Permissions::from_mode(0o700));
+        }
+    }
+}
+
+/// A restarted worker reclaims stale work that an action left read-only or search-only, and
+/// removes a link to an external read-only directory without following it.
+#[tokio::test]
+async fn read_only_stale_work_is_reclaimed_without_following_links() {
+    let harness = Harness::new(Isa::X86_64, WorkerLifetime::LongLived);
+    harness.scheduler.set_behaviour(Behaviour::Finish);
+    let outside = tempfile::tempdir().expect("a temporary directory can be created");
+    let external = outside.path().join("external");
+    let layout = Layout::new(&harness.volume);
+    let action = layout.work_directory().join("action");
+    let read_only = action.join("read-only");
+    let search_only = read_only.join("search-only");
+    let _access = OwnerAccess(vec![
+        external.clone(),
+        read_only.clone(),
+        search_only.clone(),
+    ]);
+    fs::create_dir(&external).expect("external directory can be created");
+    fs::write(external.join("data"), b"external data").expect("external data can be written");
+    fs::set_permissions(&external, fs::Permissions::from_mode(0o555))
+        .expect("external directory can be made read-only");
+    fs::create_dir_all(&search_only).expect("stale work can be created");
+    fs::write(read_only.join("file"), b"stale").expect("stale work can be written");
+    fs::write(search_only.join("file"), b"stale").expect("stale work can be written");
+    std::os::unix::fs::symlink(&external, read_only.join("external"))
+        .expect("a link to the external directory can be created");
+    fs::set_permissions(&search_only, fs::Permissions::from_mode(0o100))
+        .expect("work can be made search-only");
+    fs::set_permissions(&read_only, fs::Permissions::from_mode(0o555))
+        .expect("work can be made read-only");
+
+    gang_worker::run(
+        harness.parts(false),
+        harness.settings(),
+        harness.build_limits(),
+        future::pending(),
+    )
+    .await
+    .expect("read-only stale work does not stop the worker");
+
+    assert_eq!(
+        fs::symlink_metadata(&action)
+            .map_err(|error| error.kind())
+            .err(),
+        Some(std::io::ErrorKind::NotFound)
+    );
+    only_spec(&harness);
+    let mode = fs::metadata(&external)
+        .expect("external directory remains")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o555);
+    assert_eq!(
+        fs::read(external.join("data")).expect("external data remains"),
+        b"external data"
+    );
+    assert_eq!(
+        fs::read_dir(&external)
+            .expect("external directory can be listed")
+            .count(),
+        1
+    );
+}
+
+/// Stale work an action left without owner read or search access is reclaimed on Linux. Apple
+/// cannot pin such a directory, so the worker stops before starting, naming the directory and
+/// leaving it and its contents untouched.
+#[tokio::test]
+async fn sealed_stale_work_is_reclaimed_where_pinnable() {
+    let harness = Harness::new(Isa::X86_64, WorkerLifetime::LongLived);
+    harness.scheduler.set_behaviour(Behaviour::Finish);
+    let layout = Layout::new(&harness.volume);
+    let action = layout.work_directory().join("action");
+    let sealed = action.join("sealed");
+    let _access = OwnerAccess(vec![sealed.clone()]);
+    fs::create_dir_all(&sealed).expect("stale work can be created");
+    fs::write(sealed.join("file"), b"stale").expect("stale work can be written");
+    fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000))
+        .expect("work can be made inaccessible");
+
+    let run = gang_worker::run(
+        harness.parts(false),
+        harness.settings(),
+        harness.build_limits(),
+        future::pending(),
+    )
+    .await;
+
+    if cfg!(target_os = "linux") {
+        run.expect("sealed stale work does not stop the worker");
+        assert_eq!(
+            fs::symlink_metadata(&action)
+                .map_err(|error| error.kind())
+                .err(),
+            Some(std::io::ErrorKind::NotFound)
+        );
+        only_spec(&harness);
+    } else {
+        let error = run.expect_err("a sealed directory cannot be pinned on Apple");
+        assert!(matches!(&error, WorkerError::Io(io)
+            if io.path == sealed && io.source.kind() == std::io::ErrorKind::PermissionDenied));
+        assert!(harness.scheduler.specs().is_empty());
+        let mode = fs::symlink_metadata(&sealed)
+            .expect("sealed work remains")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o000);
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o700))
+            .expect("sealed work can be opened for inspection");
+        assert_eq!(
+            fs::read(sealed.join("file")).expect("sealed work remains"),
+            b"stale"
+        );
+    }
 }
 
 #[tokio::test]

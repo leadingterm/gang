@@ -8,12 +8,12 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use gang_types::{
-    FleetName, MachineClass, NonZeroBytes, NonZeroDuration, Percent, WorkloadTokenSettings,
+    FleetName, MachineClass, NonZeroBytes, NonZeroDuration, Percent, Url, WorkloadTokenSettings,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::client_settings::ClientSettings;
-use crate::names::{BucketName, FleetTagKey, KeyId, KeyPrefix, MountPoint, Region};
+use crate::names::{BucketName, FleetTagKey, KeyId, KeyPrefix, MountPoint};
+use gang_aws_sdk::{ClientSettings, Region};
 
 /// Suffix that names the on-demand twin of an opted-in fleet's spot group.
 pub(crate) const ON_DEMAND_SUFFIX: &str = "-on-demand";
@@ -45,6 +45,9 @@ pub struct AwsConfig {
     /// Bound on each instance metadata (IMDS) request. Default `1s`. Must be greater than zero.
     #[serde(default = "default_imds_request_timeout")]
     pub imds_request_timeout: NonZeroDuration,
+    /// Interval between controller retirement metadata reads. Default `5s`.
+    #[serde(default = "default_retirement_poll_interval")]
+    pub retirement_poll_interval: NonZeroDuration,
     /// Key of the EC2 instance tag, readable through the instance metadata service, that names
     /// the node's fleet. Defaults to `gang-fleet`. Must be 1 to 128 characters of `a-z`, `A-Z`, `0-9` and
     /// `_ . : = + - @ ,`, and must not be `.`, `..` or `_index`, which the instance metadata
@@ -232,6 +235,12 @@ pub struct S3CacheConfig {
     /// Name of the bucket that holds cache objects. Required. Must be 3 to 63 characters of
     /// `a-z`, `0-9`, `.` and `-`.
     pub bucket: BucketName,
+    /// HTTP(S) S3-compatible service endpoint. Unset by default, using the AWS regional endpoint.
+    #[serde(default, deserialize_with = "deserialize_s3_endpoint")]
+    pub endpoint: Option<Url>,
+    /// Use path-style addressing, needed by many S3-compatible services. Defaults to false.
+    #[serde(default)]
+    pub force_path_style: bool,
     /// Prefix prepended to every object key. Defaults to an empty string. Must not start with `/`.
     #[serde(default)]
     pub key_prefix: KeyPrefix,
@@ -240,6 +249,22 @@ pub struct S3CacheConfig {
     /// See [`S3Tuning`] for each field.
     #[serde(default)]
     pub tuning: S3Tuning,
+}
+
+/// Parses the optional endpoint and rejects schemes the S3 HTTP client cannot use.
+fn deserialize_s3_endpoint<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Url>, D::Error> {
+    let endpoint = Option::<Url>::deserialize(deserializer)?;
+    if endpoint
+        .as_ref()
+        .is_some_and(|url| !matches!(url.scheme(), "http" | "https"))
+    {
+        return Err(serde::de::Error::custom(
+            "S3 endpoint must use http or https",
+        ));
+    }
+    Ok(endpoint)
 }
 
 /// Tuning of the `S3Cache` plugin's retries, multipart uploads and expiry, read from
@@ -341,6 +366,10 @@ pub struct KmsSignerConfig {
 /// Default bound on each instance metadata request.
 fn default_imds_request_timeout() -> NonZeroDuration {
     NonZeroDuration::from_secs(1)
+}
+
+fn default_retirement_poll_interval() -> NonZeroDuration {
+    NonZeroDuration::from_secs(5)
 }
 
 impl AwsFleetOptions {

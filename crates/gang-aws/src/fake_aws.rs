@@ -5,6 +5,7 @@
 //! [`FakeAws::sdk_config`], then inspect what the fake recorded.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
 use std::io;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -19,7 +20,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use gang_clock::Timestamp;
+use gang_clock::{TestClock, Timestamp};
 use gang_types::NonZeroDuration;
 use p256::ecdsa::signature::{Signer as _, hazmat::PrehashSigner as _};
 use p256::ecdsa::{Signature, SigningKey};
@@ -29,11 +30,9 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-use crate::client_settings::ClientSettings;
 use crate::errors::AwsError;
 use crate::lifecycle::imds_client;
-use crate::names::Region;
-use crate::sdk::{http_client, loader};
+use gang_aws_sdk::{ClientSettings, Region, http_client, loader};
 
 const LOOPBACK_BIND: &str = "127.0.0.1:0";
 const REGION: &str = "us-east-1";
@@ -104,6 +103,8 @@ const GRANTED_ACTIONS: &[&str] = &[
     "Sign",
     "SetInstanceProtection",
     "DescribeScalingActivities",
+    "DescribeLifecycleHooks",
+    "CompleteLifecycleAction",
 ];
 const UNKNOWN_KEY: &str = "key does not exist";
 const UNAUTHORIZED: &str = "missing or invalid session token";
@@ -203,6 +204,20 @@ impl FakeAws {
         imds_client(http_client(), UNREACHABLE_DEADLINE, Some(&self.endpoint))
     }
 
+    /// Returns a client with a test-controlled request timeout.
+    pub(crate) fn imds_client_with_timeout(
+        &self,
+        timeout: NonZeroDuration,
+    ) -> Result<aws_config::imds::Client, AwsError> {
+        imds_client(http_client(), timeout, Some(&self.endpoint))
+    }
+
+    /// Stops the endpoint so subsequent requests fail with a connection I/O error.
+    pub(crate) async fn stop(&mut self) {
+        self.server.abort();
+        let _ = (&mut self.server).await;
+    }
+
     /// Locks the fake's state for seeding or inspection.
     ///
     /// The server locks the same state while answering, so hold the guard only briefly and
@@ -212,11 +227,20 @@ impl FakeAws {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TokenFailure {
+    Timeout,
+}
+
 /// Everything the fake answers from. Tests seed it and inspect `requests`.
 #[derive(Debug, Clone)]
 pub(crate) struct FakeState {
     /// Auto Scaling groups, in the order they are described.
     pub(crate) groups: Vec<FakeGroup>,
+    /// Lifecycle hooks by group, as (name, transition).
+    pub(crate) lifecycle_hooks: HashMap<String, Vec<(String, String)>>,
+    /// Completed lifecycle actions, as (group, hook, instance).
+    pub(crate) lifecycle_completions: Vec<(String, String, String)>,
     /// EC2 instance id to RFC 3339 launch time; EC2 knows only these instances.
     pub(crate) launch_times: HashMap<String, String>,
     /// The KMS key answered for `GetPublicKey` and `Sign`.
@@ -229,10 +253,18 @@ pub(crate) struct FakeState {
     pub(crate) spot_instance_action: Option<String>,
     /// Value of every instance tag read through the metadata service; `None` answers 404.
     pub(crate) fleet_tag: Option<String>,
+    /// Auto Scaling group instance tag; `None` answers 404.
+    pub(crate) group_tag: Option<String>,
     /// Failures by operation name; each matching call is answered with the failure.
     pub(crate) failures: HashMap<&'static str, FakeFailure>,
+    /// Transport failure injected into the IMDS token request.
+    pub(crate) token_failure: Option<TokenFailure>,
+    /// Signals that the token endpoint has received a request.
+    pub(crate) token_started: Arc<tokio::sync::Notify>,
     /// Every request received, in order.
     pub(crate) requests: Vec<FakeRequest>,
+    /// Clock to advance after the next protection write is answered.
+    pub(crate) advance_after_protection: Option<Arc<TestClock>>,
     /// Scaling activities answered by `DescribeScalingActivities`, in the order they were recorded.
     pub(crate) activities: Vec<FakeActivity>,
     /// Value served at the target lifecycle state path; `None` answers 404.
@@ -247,14 +279,20 @@ impl Default for FakeState {
     fn default() -> Self {
         Self {
             groups: Vec::new(),
+            lifecycle_hooks: HashMap::new(),
+            lifecycle_completions: Vec::new(),
             launch_times: HashMap::new(),
             kms: None,
             web_identity_token: DEFAULT_WEB_IDENTITY_TOKEN.to_owned(),
             identity_document: None,
             spot_instance_action: None,
             fleet_tag: None,
+            group_tag: None,
             failures: HashMap::new(),
+            token_failure: None,
+            token_started: Arc::new(tokio::sync::Notify::new()),
             requests: Vec::new(),
+            advance_after_protection: None,
             activities: Vec::new(),
             target_lifecycle_state: None,
             launched: 0,
@@ -461,7 +499,13 @@ fn dispatch(
     if let Some(failure) = state.failures.get(operation).cloned() {
         return Err(failure);
     }
-    handle(&mut state, parameters)
+    let result = handle(&mut state, parameters);
+    if operation == "SetInstanceProtection"
+        && let Some(clock) = state.advance_after_protection.take()
+    {
+        clock.advance(std::time::Duration::from_secs(1));
+    }
+    result
 }
 
 /// The refusal for an operation the controller role is not granted.
@@ -504,6 +548,65 @@ fn query_operation(
     params: &Parameters,
 ) -> Result<String, FakeFailure> {
     match action {
+        "DescribeLifecycleHooks" => {
+            let group = required(params, "AutoScalingGroupName")?;
+            let mut hooks = String::new();
+            for (name, transition) in state.lifecycle_hooks.get(group).into_iter().flatten() {
+                write!(hooks, "<member><LifecycleHookName>{name}</LifecycleHookName><AutoScalingGroupName>{group}</AutoScalingGroupName><LifecycleTransition>{transition}</LifecycleTransition></member>").expect("writing to a String cannot fail");
+            }
+            Ok(query_ok(
+                QueryService::AutoScaling,
+                action,
+                Some(&format!("<LifecycleHooks>{hooks}</LifecycleHooks>")),
+            ))
+        }
+        "CompleteLifecycleAction" => {
+            let no_action = || invalid("no active lifecycle action");
+            let group_name = params.get("AutoScalingGroupName").ok_or_else(no_action)?;
+            let hook_name = params.get("LifecycleHookName").ok_or_else(no_action)?;
+            let instance_id = params.get("InstanceId").ok_or_else(no_action)?;
+            let result = required(params, "LifecycleActionResult")?;
+            if !matches!(result, "CONTINUE" | "ABANDON") {
+                return Err(invalid("invalid lifecycle action result"));
+            }
+            let transition = state
+                .lifecycle_hooks
+                .get(group_name)
+                .and_then(|hooks| hooks.iter().find(|(name, _)| name == hook_name))
+                .map(|(_, transition)| transition.as_str())
+                .ok_or_else(no_action)?;
+            let (waiting, proceeding) = match transition {
+                "autoscaling:EC2_INSTANCE_LAUNCHING" => ("Pending:Wait", "Pending:Proceed"),
+                "autoscaling:EC2_INSTANCE_TERMINATING" => {
+                    ("Terminating:Wait", "Terminating:Proceed")
+                }
+                _ => return Err(no_action()),
+            };
+            let member = state
+                .groups
+                .iter_mut()
+                .find(|group| group.name == *group_name)
+                .and_then(|group| {
+                    group
+                        .instances
+                        .iter_mut()
+                        .find(|member| member.id == *instance_id)
+                })
+                .filter(|member| member.lifecycle_state == waiting)
+                .ok_or_else(no_action)?;
+            member.lifecycle_state = if result == "ABANDON" {
+                "Terminating:Proceed"
+            } else {
+                proceeding
+            }
+            .to_owned();
+            state.lifecycle_completions.push((
+                group_name.clone(),
+                hook_name.clone(),
+                instance_id.clone(),
+            ));
+            Ok(query_ok(QueryService::AutoScaling, action, None))
+        }
         "DescribeAutoScalingGroups" => Ok(query_ok(
             QueryService::AutoScaling,
             action,
@@ -1021,6 +1124,15 @@ fn json_parameters(body: &[u8]) -> Parameters {
 
 /// `PUT /latest/api/token`: issues the session token with the TTL header `IMDSv2` requires.
 async fn imds_token(State(state): State<Shared>) -> Response {
+    let failure = {
+        let guard = state.lock();
+        guard.token_started.notify_one();
+        guard.token_failure
+    };
+    match failure {
+        Some(TokenFailure::Timeout) => return std::future::pending().await,
+        None => {}
+    }
     match dispatch(
         &state,
         IMDS_TOKEN_OPERATION,
@@ -1062,7 +1174,13 @@ async fn fleet_tag(
     headers: HeaderMap,
 ) -> Response {
     let path = format!("{FLEET_TAG_PATH_PREFIX}{key}");
-    imds_get(&state, &headers, &path, |fake| fake.fleet_tag.clone())
+    imds_get(&state, &headers, &path, |fake| {
+        if key == "aws:autoscaling:groupName" {
+            fake.group_tag.clone()
+        } else {
+            fake.fleet_tag.clone()
+        }
+    })
 }
 
 /// Serves the target lifecycle state through the metadata service.
@@ -1110,4 +1228,158 @@ fn text_outcome(outcome: Result<String, FakeFailure>) -> Response {
 /// Parses an `application/x-www-form-urlencoded` body into its decoded fields.
 fn parse_form(body: &[u8]) -> Parameters {
     url::form_urlencoded::parse(body).into_owned().collect()
+}
+
+#[test]
+fn lifecycle_completion_consumes_only_the_matching_active_action() {
+    for (transition, waiting, result, proceeding) in [
+        (
+            "autoscaling:EC2_INSTANCE_LAUNCHING",
+            "Pending:Wait",
+            "CONTINUE",
+            "Pending:Proceed",
+        ),
+        (
+            "autoscaling:EC2_INSTANCE_TERMINATING",
+            "Terminating:Wait",
+            "CONTINUE",
+            "Terminating:Proceed",
+        ),
+        (
+            "autoscaling:EC2_INSTANCE_LAUNCHING",
+            "Pending:Wait",
+            "ABANDON",
+            "Terminating:Proceed",
+        ),
+        (
+            "autoscaling:EC2_INSTANCE_TERMINATING",
+            "Terminating:Wait",
+            "ABANDON",
+            "Terminating:Proceed",
+        ),
+    ] {
+        let mut state = FakeState::default();
+        state
+            .groups
+            .push(FakeGroup::new("group", 1, &[("i-1", waiting)]));
+        state
+            .lifecycle_hooks
+            .insert("group".into(), vec![("hook".into(), transition.into())]);
+        let params: Parameters = [
+            ("AutoScalingGroupName", "group"),
+            ("LifecycleHookName", "hook"),
+            ("InstanceId", "i-1"),
+            ("LifecycleActionResult", result),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect();
+
+        assert!(query_operation(&mut state, "CompleteLifecycleAction", &params).is_ok());
+        assert_eq!(state.groups[0].instances[0].lifecycle_state, proceeding);
+        assert_eq!(
+            state.lifecycle_completions,
+            vec![("group".into(), "hook".into(), "i-1".into())]
+        );
+        let error = query_operation(&mut state, "CompleteLifecycleAction", &params).unwrap_err();
+        assert_eq!(
+            (error.status, error.code, error.message),
+            (400, "ValidationError", "no active lifecycle action")
+        );
+        assert_eq!(state.lifecycle_completions.len(), 1);
+    }
+}
+
+#[test]
+fn lifecycle_completion_rejects_nonmatching_actions_and_invalid_results() {
+    let mut state = FakeState::default();
+    state.groups.push(FakeGroup::new(
+        "group",
+        2,
+        &[("i-1", "Pending:Wait"), ("i-2", "InService")],
+    ));
+    state.lifecycle_hooks.insert(
+        "group".into(),
+        vec![("hook".into(), "autoscaling:EC2_INSTANCE_LAUNCHING".into())],
+    );
+    let params: Parameters = [
+        ("AutoScalingGroupName", "group"),
+        ("LifecycleHookName", "hook"),
+        ("InstanceId", "i-1"),
+        ("LifecycleActionResult", "CONTINUE"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.into(), value.into()))
+    .collect();
+
+    for (key, value) in [
+        ("AutoScalingGroupName", "other"),
+        ("LifecycleHookName", "other"),
+        ("InstanceId", "other"),
+        ("InstanceId", "i-2"),
+    ] {
+        let mut bad = params.clone();
+        bad.insert(key.into(), value.into());
+        let error = query_operation(&mut state, "CompleteLifecycleAction", &bad).unwrap_err();
+        assert_eq!(
+            (error.status, error.code, error.message),
+            (400, "ValidationError", "no active lifecycle action")
+        );
+        assert!(state.lifecycle_completions.is_empty());
+    }
+    for key in ["AutoScalingGroupName", "LifecycleHookName", "InstanceId"] {
+        let mut bad = params.clone();
+        bad.remove(key);
+        let error = query_operation(&mut state, "CompleteLifecycleAction", &bad).unwrap_err();
+        assert_eq!(
+            (error.status, error.code, error.message),
+            (400, "ValidationError", "no active lifecycle action")
+        );
+        assert!(state.lifecycle_completions.is_empty());
+    }
+    let mut bad_result = params.clone();
+    bad_result.insert("LifecycleActionResult".into(), "INVALID".into());
+    let error = query_operation(&mut state, "CompleteLifecycleAction", &bad_result).unwrap_err();
+    assert_eq!((error.status, error.code), (400, "ValidationError"));
+    assert!(state.lifecycle_completions.is_empty());
+    assert!(query_operation(&mut state, "CompleteLifecycleAction", &params).is_ok());
+    assert_eq!(state.lifecycle_completions.len(), 1);
+}
+
+// Real time, not paused: the 1 ms backoffs are real but tiny, and the verdict never depends on elapsed time.
+#[tokio::test]
+async fn retries_stop_at_max_attempts() -> Result<(), Box<dyn std::error::Error>> {
+    use gang_aws_sdk::{CallError, call_error};
+    use gang_types::NonZeroDuration;
+    use std::num::NonZeroU32;
+
+    let fake = FakeAws::start().await?;
+    fake.state().failures.insert(
+        "DescribeAutoScalingGroups",
+        FakeFailure {
+            status: 500,
+            code: "InternalFailure",
+            message: "injected",
+        },
+    );
+    let settings = ClientSettings {
+        request_timeout: NonZeroDuration::from_hours(24),
+        connect_timeout: NonZeroDuration::from_hours(24),
+        max_attempts: NonZeroU32::new(3).ok_or("zero attempts")?,
+        retry_initial_backoff: NonZeroDuration::from_millis(1),
+        retry_max_backoff: NonZeroDuration::from_millis(1),
+    };
+    let sdk = fake.sdk_config_with(&settings).await;
+    let error = aws_sdk_autoscaling::Client::new(&sdk)
+        .describe_auto_scaling_groups()
+        .send()
+        .await
+        .err()
+        .ok_or("describe unexpectedly succeeded")?;
+    assert_eq!(fake.state().requests.len(), 3);
+    assert!(matches!(
+        call_error("DescribeAutoScalingGroups", error),
+        CallError::Transient { .. }
+    ));
+    Ok(())
 }

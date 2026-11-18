@@ -8,10 +8,11 @@
 
 use aws_config::SdkConfig;
 use aws_sdk_sts::Client;
+use gang_aws_sdk::call_error;
 use gang_types::{Audience, Proof};
 
 use crate::config::{AwsConfig, WorkloadTokenAlgorithm};
-use crate::errors::{AwsError, sdk_error};
+use crate::errors::AwsError;
 
 const OPERATION: &str = "GetWebIdentityToken";
 
@@ -42,7 +43,7 @@ impl WebIdentity {
     ///
     /// # Errors
     ///
-    /// [`AwsError::Transient`] or [`AwsError::Refused`] when the call fails, and
+    /// [`AwsError::Call`] when the call fails, and
     /// [`AwsError::MalformedResponse`] when the response carries no token or an empty one.
     pub(crate) async fn token(&self) -> Result<Proof, AwsError> {
         let output = self
@@ -53,7 +54,7 @@ impl WebIdentity {
             .duration_seconds(self.duration_seconds)
             .send()
             .await
-            .map_err(|e| sdk_error(OPERATION, e))?;
+            .map_err(|e| call_error(OPERATION, e))?;
         let token = output
             .web_identity_token()
             .filter(|token| !token.is_empty())
@@ -184,10 +185,10 @@ mod tests {
         };
         assert!(matches!(
             error,
-            AwsError::Refused {
+            AwsError::Call(gang_aws_sdk::CallError::Refused {
                 operation: OPERATION,
                 ..
-            }
+            })
         ));
         Ok(())
     }
@@ -209,10 +210,10 @@ mod tests {
         };
         assert!(matches!(
             error,
-            AwsError::Transient {
+            AwsError::Call(gang_aws_sdk::CallError::Transient {
                 operation: OPERATION,
                 ..
-            }
+            })
         ));
         Ok(())
     }

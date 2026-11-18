@@ -922,7 +922,7 @@ export type SessionLogin = {
  */
 provider: string, };
 
-export type SkipReason = "SCHEDULER_UNAVAILABLE" | "PROVISIONER_UNAVAILABLE";
+export type SkipReason = "SCHEDULER_UNAVAILABLE" | "PROVISIONER_UNAVAILABLE" | "LEADERSHIP_LAPSED";
 
 export type SlowAction = { 
 /**
@@ -1179,6 +1179,7 @@ export const PATHS = {
   listEvents: "/v1/events",
   listBuilds: "/v1/builds",
   getBuild: "/v1/builds/{build}",
+  ingestBuilds: "/v1/builds:ingest",
   getState: "/v1/state",
   watchState: "/v1/state:watch",
   getSession: "/v1/session",

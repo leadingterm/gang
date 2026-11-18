@@ -17,6 +17,108 @@ wire_enum! {
     }
 }
 
+wire_enum! {
+    /// An observed RPC forwarded by a follower.
+    pub enum IngestRpc {
+        /// Action cache lookup.
+        GetActionResult = "GET_ACTION_RESULT",
+        /// Action cache upload.
+        UpdateActionResult = "UPDATE_ACTION_RESULT",
+        /// Action execution request.
+        Execute = "EXECUTE",
+    }
+}
+
+wire_enum! {
+    /// The outcome of a forwarded RPC.
+    pub enum IngestOutcome {
+        /// The call succeeded.
+        Ok = "OK",
+        /// The requested result was not found.
+        NotFound = "NOT_FOUND",
+        /// The call failed otherwise.
+        Error = "ERROR",
+    }
+}
+
+/// Body of `POST /v1/builds:ingest`: observations a follower made, for the leader to fold.
+#[derive(
+    gang_macros::Known, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS,
+)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(optional_fields)]
+pub struct IngestBuildsRequest {
+    /// Origins referenced by calls and losses.
+    pub origins: Vec<IngestOrigin>,
+    /// Observed calls.
+    pub calls: Vec<IngestCall>,
+    /// Counts of lost observations by origin.
+    #[serde(default)]
+    pub lost: Vec<IngestLoss>,
+    /// Lost observations that could not be attributed to an origin.
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub unattributed: u64,
+}
+
+/// A build and the Bazel metadata of the calls that reference it.
+#[derive(
+    gang_macros::Known, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, ts_rs::TS,
+)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(optional_fields)]
+pub struct IngestOrigin {
+    /// Principal identity in `provider:principal` form.
+    pub principal: String,
+    /// Bazel invocation identifier.
+    pub invocation_id: String,
+    /// Bazel correlated invocations identifier, when supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlated_invocations_id: Option<String>,
+    /// Tool name and version, when supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// Target label, when supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Action mnemonic, when supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mnemonic: Option<String>,
+}
+
+/// A call referring to an entry in the request's origins.
+#[derive(gang_macros::Known, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(optional_fields)]
+pub struct IngestCall {
+    /// Index into the request's origins.
+    pub origin: u32,
+    /// RPC that was called.
+    pub rpc: IngestRpc,
+    /// Outcome of the call.
+    pub outcome: IngestOutcome,
+}
+
+/// Lost observations attributed to an entry in the request's origins.
+#[derive(gang_macros::Known, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(optional_fields)]
+pub struct IngestLoss {
+    /// Index into the request's origins.
+    pub origin: u32,
+    /// Nonzero number of lost observations.
+    #[ts(type = "number")]
+    pub count: u64,
+}
+
+/// Successful response to a batch of forwarded observations.
+#[derive(
+    gang_macros::Known, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS,
+)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(optional_fields)]
+pub struct IngestBuildsResponse {}
+
 /// One observed build, named `builds/{id}`.
 #[derive(
     gang_macros::Known, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS,
@@ -303,6 +405,43 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn ingest_wire_round_trips_and_preserves_unknown_enum_values() {
+        let value = json!({
+            "origins": [{"principal": "provider:principal", "invocationId": "invocation"}],
+            "calls": [{"origin": 0, "rpc": "FOO", "outcome": "BAR"}]
+        });
+        let request: IngestBuildsRequest = serde_json::from_value(value).expect("request parses");
+        assert_eq!(request.calls[0].rpc, IngestRpc::Unrecognized("FOO".into()));
+        assert_eq!(
+            request.calls[0].outcome,
+            IngestOutcome::Unrecognized("BAR".into())
+        );
+        assert!(request.lost.is_empty());
+        assert_eq!(request.unattributed, 0);
+        let encoded = serde_json::to_value(&request).expect("request serializes");
+        assert_eq!(encoded["calls"][0]["rpc"], "FOO");
+        assert_eq!(encoded["calls"][0]["outcome"], "BAR");
+        assert!(encoded["origins"][0].get("tool").is_none());
+        assert_eq!(
+            serde_json::to_value(IngestBuildsResponse::default()).expect("response serializes"),
+            json!({})
+        );
+        assert!(serde_json::from_value::<IngestBuildsResponse>(json!({"extra": true})).is_err());
+    }
+
+    #[test]
+    fn ingest_rejects_unknown_fields_at_every_level() {
+        for value in [
+            json!({"origins": [], "calls": [], "extra": true}),
+            json!({"origins": [{"principal": "p", "invocationId": "i", "extra": true}], "calls": []}),
+            json!({"origins": [], "calls": [{"origin": 0, "rpc": "EXECUTE", "outcome": "OK", "extra": true}]}),
+            json!({"origins": [], "calls": [], "lost": [{"origin": 0, "count": 1, "extra": true}]}),
+        ] {
+            assert!(serde_json::from_value::<IngestBuildsRequest>(value).is_err());
+        }
+    }
 
     #[test]
     fn full_build_round_trips_with_wire_names() {

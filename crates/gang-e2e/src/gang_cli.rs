@@ -121,5 +121,6 @@ pub(crate) fn client_home(command: &mut Command, home: &Path) {
     command
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home)
+        .env("XDG_CACHE_HOME", home.join(".cache"))
         .env_remove("RUNNER_TEMP");
 }

@@ -7,8 +7,9 @@ use gang_clock::{Clock, Interval, Timestamp};
 use gang_config::{FleetConfig, Fleets, PluginSet};
 use gang_reconciler::{Action, FleetPass, HostedSnapshot, PassTime, Plan, PlanStep, Reconciler};
 use gang_spi::{
-    PortError, ProvisionerPort, RecordedScalingEvent, ScalingAuditEvent, ScalingEventKind,
-    SchedulerPort, SchedulerSnapshot, StateRepositoryPort, Subject, WorkerState,
+    Fence, LeaseLapsed, PortError, ProvisionerPort, RecordedScalingEvent, RunError,
+    ScalingAuditEvent, ScalingEventKind, SchedulerPort, SchedulerSnapshot, StateRepositoryPort,
+    Subject, WorkerState,
 };
 use gang_state::PassStatus;
 use gang_types::{FleetName, InstanceLifecycle, NonZeroDuration, WorkerId};
@@ -45,6 +46,8 @@ pub(crate) struct ControlLoop<'a, P: PluginSet, F, S, R, C> {
     incoming: SchedulerSnapshot,
     /// Workers seen in the previous completed pass.
     roster: WorkerRoster,
+    /// Scratch roster, committed only after its audit events are recorded.
+    roster_pending: WorkerRoster,
     /// The worker registration and deregistration events of the current pass, before recording.
     worker_changes: Vec<ScalingAuditEvent>,
     /// Last recorded launch failure reason for each fleet.
@@ -56,6 +59,7 @@ pub(crate) struct ControlLoop<'a, P: PluginSet, F, S, R, C> {
     scheduler: &'a S,
     repository: &'a R,
     clock: &'a C,
+    fence: Fence,
     /// Receives the state of each pass and of each recorded event, when set.
     publisher: Option<StatePublisher>,
 }
@@ -79,6 +83,7 @@ where
         scheduler: &'a S,
         repository: &'a R,
         clock: &'a C,
+        fence: Fence,
     ) -> Self {
         let configs: Vec<FleetConfig<'a, P>> = fleets.iter().collect();
         let passes = configs
@@ -94,6 +99,7 @@ where
             hosted: HostedSnapshot::default(),
             incoming: SchedulerSnapshot::default(),
             roster: WorkerRoster::default(),
+            roster_pending: WorkerRoster::default(),
             worker_changes: Vec::new(),
             launch_failures,
             plan: Plan::new(),
@@ -103,6 +109,7 @@ where
             scheduler,
             repository,
             clock,
+            fence,
             publisher: None,
         }
     }
@@ -114,12 +121,14 @@ where
         self
     }
 
-    /// Runs one pass: read the snapshot and supplies, sample the clocks, replace the indexed
-    /// snapshot, record worker registrations, deregistrations and early exits, reconcile, then apply
-    /// every planned step. The pass's state is published last with the same wall time as its events.
+    /// Runs one pass: read the snapshot, converge each fleet and read its supply, sample the clocks,
+    /// replace the indexed snapshot, record worker changes and early exits, reconcile, then apply
+    /// every planned step. Exit events use the current pass time. The pass's state is published
+    /// last with the same wall time as its events.
     ///
-    /// Only a failed snapshot or supply read skips a pass, before any step is applied. A skipped
-    /// pass samples its clock at the skip. A failed step does not stop the others.
+    /// A failed snapshot, converge or supply read, or lapsed leadership, skips the pass before
+    /// any step is applied. A skipped pass samples its clock at the skip. A failed step does not
+    /// stop the others.
     pub(crate) async fn pass(&mut self) -> PassOutcome {
         let (wall, outcome) = match self.plan_pass().await {
             Ok(time) => (time.wall, self.apply_plan().await),
@@ -132,14 +141,15 @@ where
         outcome
     }
 
-    /// Reads the snapshot and supplies, samples the clocks, replaces the indexed snapshot, records
-    /// worker changes and early exits and plans the steps. Returns the pass time or why it is skipped.
+    /// Reads the snapshot, converges and reads each fleet, samples the clocks, records worker
+    /// changes and early exits, and plans the steps. Returns the pass time or why it is skipped.
     async fn plan_pass(&mut self) -> Result<PassTime, SkipReason> {
         if !self.read_snapshot().await {
             return Err(SkipReason::SchedulerUnavailable);
         }
-        if !self.refresh_supplies().await {
-            return Err(SkipReason::ProvisionerUnavailable);
+        self.refresh_supplies().await?;
+        if !self.fence.holds() {
+            return Err(SkipReason::LeadershipLapsed);
         }
         let time = PassTime::read(self.clock);
         self.hosted.replace(&mut self.incoming);
@@ -210,36 +220,62 @@ where
     /// Records workers registered or deregistered since the previous pass, then remembers the
     /// workers of this snapshot. Every event is stamped with the wall clock of this pass.
     async fn record_worker_changes(&mut self, at: Timestamp) {
-        self.roster.diff(
+        self.roster_pending.clone_from(&self.roster);
+        self.roster_pending.diff(
             &self.hosted.snapshot().workers,
             self.fleets,
             at,
             &mut self.worker_changes,
         );
+        let mut recorded = true;
         for event in self.worker_changes.drain(..) {
-            Self::record_event(self.repository, self.publisher.as_ref(), event).await;
+            recorded &=
+                Self::record_event(self.repository, self.publisher.as_ref(), &self.fence, event)
+                    .await
+                    .is_ok();
+        }
+        if recorded && self.fence.holds() {
+            std::mem::swap(&mut self.roster, &mut self.roster_pending);
         }
     }
 
-    /// Records the instances whose worker failed soon after its launch, as this pass's supplies
-    /// report them. Every event is stamped with the wall clock of this pass.
+    /// Records and acknowledges early exits, stopping at the first failure.
     async fn record_exits(&mut self, at: Timestamp) {
-        for (config, pass) in self.configs.iter().zip(&self.passes) {
-            for exit in &pass.supply.exits {
-                Self::record_event(
-                    self.repository,
-                    self.publisher.as_ref(),
-                    ScalingAuditEvent {
-                        at,
-                        fleet: config.policy.name.clone(),
-                        kind: ScalingEventKind::ExitedEarly {
-                            instance: exit.instance.clone(),
-                            failure: exit.failure.clone(),
-                        },
-                        cause: None,
+        for (config, pass) in self.configs.iter().zip(self.passes.iter_mut()) {
+            for exit in pass.supply.exits.drain(..) {
+                let instance = exit.instance;
+                let event = ScalingAuditEvent {
+                    at,
+                    fleet: config.policy.name.clone(),
+                    kind: ScalingEventKind::ExitedEarly {
+                        instance: instance.clone(),
+                        failure: exit.failure,
                     },
-                )
-                .await;
+                    cause: None,
+                };
+                if Self::record_event(self.repository, self.publisher.as_ref(), &self.fence, event)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                if let Err(error) = self
+                    .fence
+                    .run(async |held| {
+                        self.provisioner
+                            .acknowledge_exit(held, config.fleet(), &instance)
+                            .await
+                    })
+                    .await
+                {
+                    tracing::warn!(
+                        fleet = %config.policy.name,
+                        %instance,
+                        %error,
+                        "failed to acknowledge early exit"
+                    );
+                    return;
+                }
             }
         }
     }
@@ -273,22 +309,36 @@ where
                     },
                     cause: None,
                 };
-                match self.repository.record_scaling_event(&event).await {
-                    Ok(seq) => {
-                        *last_reason = Some(failure.reason.clone());
-                        if let Some(publisher) = self.publisher.as_ref() {
-                            publisher.record_event(RecordedScalingEvent { seq, event });
-                        }
-                    }
-                    Err(error) => tracing::error!(%error, "failed to record scaling event"),
+                if Self::record_event(self.repository, self.publisher.as_ref(), &self.fence, event)
+                    .await
+                    .is_ok()
+                {
+                    *last_reason = Some(failure.reason.clone());
                 }
             }
         }
     }
 
-    /// Refreshes every fleet's supply. Returns whether the pass may continue.
-    async fn refresh_supplies(&mut self) -> bool {
+    /// Converges then reads each fleet's supply, or returns why the pass must be skipped.
+    async fn refresh_supplies(&mut self) -> Result<(), SkipReason> {
         for (config, pass) in self.configs.iter().zip(self.passes.iter_mut()) {
+            let provisioner = self.provisioner;
+            let fleet = config.fleet();
+            match self
+                .fence
+                .run(async |held| provisioner.converge(held, fleet).await)
+                .await
+            {
+                Ok(()) => {}
+                Err(error @ RunError::Lapsed(_)) => {
+                    tracing::debug!(fleet = %config.policy.name, %error, "leadership lapsed; skipping pass");
+                    return Err(SkipReason::LeadershipLapsed);
+                }
+                Err(error) => {
+                    tracing::warn!(fleet = %config.policy.name, %error, "provisioner converge failed; skipping pass");
+                    return Err(SkipReason::ProvisionerUnavailable);
+                }
+            }
             if let Err(error) = self
                 .provisioner
                 .supply(config.fleet(), &mut pass.supply)
@@ -299,10 +349,10 @@ where
                     %error,
                     "provisioner supply failed; skipping pass"
                 );
-                return false;
+                return Err(SkipReason::ProvisionerUnavailable);
             }
         }
-        true
+        Ok(())
     }
 
     /// Applies the planned steps in order and reports how many succeeded.
@@ -310,12 +360,26 @@ where
         let mut applied = 0;
         let mut failed = 0;
         for step in &self.plan.steps {
-            match Self::apply(self.provisioner, self.scheduler, &self.configs, step).await {
+            match Self::apply(
+                self.provisioner,
+                self.scheduler,
+                &self.configs,
+                step,
+                &self.fence,
+            )
+            .await
+            {
                 Ok(()) => {
                     applied += 1;
                     let event =
                         step.audit_event(self.plan.at, &self.passes[step.fleet].policy.name);
-                    Self::record_event(self.repository, self.publisher.as_ref(), event).await;
+                    let _ = Self::record_event(
+                        self.repository,
+                        self.publisher.as_ref(),
+                        &self.fence,
+                        event,
+                    )
+                    .await;
                 }
                 Err(PortError::NotFound(Subject::Worker(worker))) => {
                     tracing::debug!(worker = ?worker, "worker not found; skipping drain step");
@@ -338,37 +402,57 @@ where
         scheduler: &S,
         configs: &[FleetConfig<'_, P>],
         step: &PlanStep,
+        fence: &Fence,
     ) -> Result<(), PortError> {
+        if matches!(
+            &step.action,
+            Action::StartDrain(_) | Action::CancelDrain(_, _)
+        ) && !fence.holds()
+        {
+            return Err(PortError::from(LeaseLapsed));
+        }
         match &step.action {
             Action::ScaleOut { to, .. } | Action::Withdraw { to, .. } => {
-                provisioner
-                    .set_desired_capacity(configs[step.fleet].fleet(), *to)
+                let fleet = configs[step.fleet].fleet();
+                fence
+                    .run(async |held| provisioner.set_desired_capacity(held, fleet, *to).await)
                     .await
+                    .map_err(PortError::from)
             }
             Action::StartDrain(worker) => scheduler.set_draining(worker, true).await,
             Action::CancelDrain(worker, _) => scheduler.set_draining(worker, false).await,
             Action::Terminate { instance, .. } => {
-                provisioner
-                    .terminate(configs[step.fleet].fleet(), instance)
+                let fleet = configs[step.fleet].fleet();
+                fence
+                    .run(async |held| provisioner.terminate(held, fleet, instance).await)
                     .await
+                    .map_err(PortError::from)
             }
         }
     }
 
     /// Records one audit event and adds it to the published history. A recording failure is
-    /// logged and publishes nothing.
+    /// logged, publishes nothing, and returns the event to its caller.
     async fn record_event(
         repository: &R,
         publisher: Option<&StatePublisher>,
+        fence: &Fence,
         event: ScalingAuditEvent,
-    ) {
+    ) -> Result<(), ScalingAuditEvent> {
+        if !fence.holds() {
+            return Err(event);
+        }
         match repository.record_scaling_event(&event).await {
             Ok(seq) => {
                 if let Some(publisher) = publisher {
                     publisher.record_event(RecordedScalingEvent { seq, event });
                 }
+                Ok(())
             }
-            Err(error) => tracing::error!(%error, "failed to record scaling event"),
+            Err(error) => {
+                tracing::error!(%error, "failed to record scaling event");
+                Err(event)
+            }
         }
     }
 }
@@ -377,6 +461,20 @@ where
 #[derive(Debug, Default, PartialEq, Eq)]
 struct WorkerRoster {
     connected: Vec<(WorkerId, FleetName)>,
+}
+
+impl Clone for WorkerRoster {
+    fn clone(&self) -> Self {
+        Self {
+            connected: self.connected.clone(),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        if self != source {
+            self.connected.clone_from(&source.connected);
+        }
+    }
 }
 
 impl WorkerRoster {
@@ -683,5 +781,34 @@ mod tests {
         });
         assert_eq!(counts.count_total, 0, "unchanged worker set allocated");
         assert!(into.is_empty());
+    }
+
+    #[test]
+    fn staging_unchanged_workers_reuses_roster_storage() {
+        const PASSES: usize = 10;
+        let workers = [
+            worker("local-1", "arm"),
+            worker("local-2", "x86"),
+            worker("local-3", "x86"),
+        ];
+        let fleets = crate::test_support::fleets_of(vec![("x86", 4), ("arm", 4)]);
+        let now = at();
+        let mut committed = seen(&[("local-1", "arm"), ("local-2", "x86"), ("local-3", "x86")]);
+        let mut pending = WorkerRoster::default();
+        let mut events = Vec::with_capacity(workers.len());
+        pending.clone_from(&committed);
+        pending.diff(&workers, &fleets, now, &mut events);
+        std::mem::swap(&mut committed, &mut pending);
+        assert!(events.is_empty());
+
+        let counts = allocation_counter::measure(|| {
+            for _ in 0..PASSES {
+                pending.clone_from(&committed);
+                pending.diff(&workers, &fleets, now, &mut events);
+                std::mem::swap(&mut committed, &mut pending);
+            }
+        });
+        assert_eq!(counts.count_total, 0, "unchanged roster staging allocated");
+        assert!(events.is_empty());
     }
 }

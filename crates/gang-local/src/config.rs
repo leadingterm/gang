@@ -24,9 +24,11 @@ pub struct LocalConfig {
     pub relaunch_backoff: NonZeroDuration,
     /// Argv prefix prepended to the worker command line, so that each worker can run under a wrapper,
     /// for example `["systemd-run", "--user", "--scope", "-p", "Delegate=yes", "--"]`, which gives each
-    /// worker its own delegated cgroup subtree. The launcher must exec the command that follows it in
-    /// place (same process, pid, process group and standard input) rather than fork it. Default empty:
-    /// the worker is run directly.
+    /// worker its own delegated cgroup subtree. A nonempty launcher must place each worker in a new
+    /// private cgroup or scope owned exclusively by that worker, never joining an existing or shared
+    /// scope. It must exec the command that follows it in place (same process, pid, process group and
+    /// standard input) rather than fork it. On hosts without cgroups, cgroup reaping is inapplicable.
+    /// Default empty: the worker is run directly.
     #[serde(default)]
     pub worker_launcher: WorkerLauncher,
     /// How long a worker that was sent SIGTERM may keep running before the fleet kills its process

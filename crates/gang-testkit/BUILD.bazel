@@ -1,10 +1,24 @@
 load("//bazel/rust:defs.bzl", "workspace_rust_library")
 
+# The pinned PostgreSQL archive for the host platform.
+alias(
+    name = "postgresql_archive",
+    actual = select({
+        "//bazel/platforms:linux_x86_64": "@postgresql_linux_x86_64//file:postgresql.tar.gz",
+        "//bazel/platforms:linux_arm64": "@postgresql_linux_arm64//file:postgresql.tar.gz",
+        "//bazel/platforms:macos_arm64": "@postgresql_darwin_arm64//file:postgresql.tar.gz",
+    }),
+    visibility = ["//visibility:public"],
+)
+
 workspace_rust_library(
     name = "gang_testkit",
+    test_env = {"GANG_TEST_POSTGRES": "$(rootpath :postgresql_archive)"},
+    test_runtime_data = [":postgresql_archive"],
     deps = [
         "//crates/gang-clock:gang_clock",
         "//crates/gang-config:gang_config",
+        "//crates/gang-os:gang_os",
         "//crates/gang-spi:gang_spi",
         "//crates/gang-types:gang_types",
     ],

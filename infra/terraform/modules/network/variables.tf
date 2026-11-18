@@ -52,6 +52,20 @@ variable "client_ingress_cidrs" {
   }
 }
 
+variable "dynamodb_gateway_endpoint" {
+  description = "Create a DynamoDB gateway endpoint on the private route tables."
+  type        = bool
+  default     = false
+  nullable    = false
+}
+
+variable "controller_eip" {
+  description = "Allocate an Elastic IP for the single controller instance."
+  type        = bool
+  default     = true
+  nullable    = false
+}
+
 variable "tags" {
   description = "Tags merged into every taggable resource of the module."
   type        = map(string)

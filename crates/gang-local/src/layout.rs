@@ -36,6 +36,12 @@ impl StateLayout {
         self.root.join(FLEETS_DIR)
     }
 
+    /// Shared controller mutation lock, retained across leadership changes.
+    #[must_use]
+    pub(crate) fn mutation_lock_path(&self) -> PathBuf {
+        self.fleets_dir().join("mutation.lock")
+    }
+
     /// Directory holding per-instance worker logs.
     #[must_use]
     pub(crate) fn logs_dir(&self) -> PathBuf {
@@ -100,6 +106,19 @@ impl StateLayout {
             .join(format!("{}.early_exit", fleet.as_str()))
     }
 
+    /// Directory holding unacknowledged worker exits for one fleet.
+    #[must_use]
+    pub(crate) fn exits_dir(&self, fleet: &FleetName) -> PathBuf {
+        self.fleets_dir().join(format!("{}.exits", fleet.as_str()))
+    }
+
+    /// Persisted failure text for one unacknowledged worker exit.
+    #[must_use]
+    pub(crate) fn exit_path(&self, fleet: &FleetName, instance: &InstanceId) -> PathBuf {
+        self.exits_dir(fleet)
+            .join(format!("{}.exit", instance.as_str()))
+    }
+
     /// Persisted counter from which new instance numbers are taken.
     #[must_use]
     pub(crate) fn counter_path(&self) -> PathBuf {
@@ -151,6 +170,10 @@ mod tests {
 
         assert_eq!(layout.instances_dir(), PathBuf::from("/state/instances"));
         assert_eq!(layout.fleets_dir(), PathBuf::from("/state/fleets"));
+        assert_eq!(
+            layout.mutation_lock_path(),
+            PathBuf::from("/state/fleets/mutation.lock")
+        );
         assert_eq!(layout.logs_dir(), PathBuf::from("/state/logs"));
         assert_eq!(
             layout.instance_dir(&instance),
@@ -193,6 +216,7 @@ mod tests {
 
         for path in [
             layout.instances_dir(),
+            layout.mutation_lock_path(),
             layout.record_path(&instance),
             layout.desired_path(&fleet),
             layout.early_exit_path(&fleet),

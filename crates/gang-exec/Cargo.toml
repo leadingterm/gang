@@ -9,11 +9,13 @@ version.workspace = true
 workspace = true
 
 [dependencies]
+futures = { workspace = true }
 gang-config = { workspace = true }
 gang-os = { workspace = true }
 gang-spi = { workspace = true }
 gang-types = { workspace = true }
 rustix = { workspace = true }
+signal-hook = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -24,3 +26,4 @@ parking_lot = { workspace = true }
 serde = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { workspace = true }

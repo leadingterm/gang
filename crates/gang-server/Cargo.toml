@@ -27,6 +27,8 @@ gang-wire = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
 http-body-util = { workspace = true }
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
 ipnet = { workspace = true }
 lru = { workspace = true }
 parking_lot = { workspace = true }

@@ -65,7 +65,7 @@ fn sign_in_with_home(
         }
         Authentication::Token(_) => {}
     }
-    let stored = stored_login(&home)?;
+    let stored = runtime::block_on(stored_login(&home))?;
     let client = client_with_home(out, home)?;
     let matching = stored.as_ref().is_some_and(|login| {
         same_server(login.server.as_str(), &target.server)
@@ -73,10 +73,11 @@ fn sign_in_with_home(
     });
     if matching
         && (target.provider.is_none()
-            || client.stored_provider()?.as_ref() == target.provider.as_ref())
+            || runtime::block_on(client.stored_provider())?.as_ref() == target.provider.as_ref())
         && let SessionState::Active { principal } = runtime::block_on(client.session_state())?
     {
-        let provider = client.stored_provider()?.ok_or(ClientError::NotLoggedIn)?;
+        let provider =
+            runtime::block_on(client.stored_provider())?.ok_or(ClientError::NotLoggedIn)?;
         present(out, principal.as_deref(), &provider)?;
         return Ok(SignIn::Already);
     }

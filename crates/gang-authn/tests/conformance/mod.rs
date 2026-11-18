@@ -2,12 +2,13 @@
 //! offer answers `Unsupported` naming that operation, and every operation they offer does not.
 
 use std::path::Path;
+use std::time::Duration;
 
 use gang_authn::{Anonymous, Mtls, MtlsConfig, NoneConfig, Token, TokenConfig};
 use gang_clock::Timestamp;
 use gang_spi::{
-    AuthenticationPort, CertificateIssue, CertificateTarget, CredentialLifecyclePort, Plugin,
-    PluginContext, PortError, TokenIssue,
+    AuthenticationHost, AuthenticationPort, CertificateIssue, CertificateTarget,
+    CredentialLifecyclePort, Plugin, PluginContext, PortError, TokenIssue,
 };
 use gang_types::{CertificateRequestPem, Proof, ProviderName};
 
@@ -128,6 +129,7 @@ where
                 provider: &provider_name,
                 proof: &proof,
             },
+            host.now() + Duration::from_mins(10),
         )
         .await
         .map(|_| ());

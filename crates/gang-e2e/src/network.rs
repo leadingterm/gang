@@ -19,11 +19,13 @@ pub fn network<S: System>(system: &S, variant: &Variant) -> Result<Vec<Check>> {
 
     system.start_server()?;
     let outcome = system.build(&[Probe::Isolated, Probe::NetworkRequested])?;
-    checks.push(verdict::remote_execution(
+    if !crate::check::record_build(
+        &mut checks,
         &outcome,
-        2,
-        system.stderr_tail_lines(),
-    ));
+        verdict::remote_execution(&outcome, 2, system.stderr_tail_lines()),
+    ) {
+        return Ok(checks);
+    }
 
     let isolated = Namespaces::try_from(&system.report(Probe::Isolated)?)?;
     let requested = Namespaces::try_from(&system.report(Probe::NetworkRequested)?)?;

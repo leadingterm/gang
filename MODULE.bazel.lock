@@ -3150,8 +3150,8 @@
     },
     "@@rules_tf+//tf:extensions.bzl%tf_repositories": {
       "os:linux,arch:aarch64": {
-        "bzlTransitiveDigest": "nOoRARYYQvZENzWYXz8YfM9gu9dZAhoJylKAUK+4qkM=",
-        "usagesDigest": "iGvaPnYYay+sWvxIMmjzk4GJTRMy8M/so0Rg/CXjev0=",
+        "bzlTransitiveDigest": "rhMBZ1XsTYpPYTjjQiG1anqV1rx+OensWN4Zk1cgZHs=",
+        "usagesDigest": "NxsTPm9Hf8okxnP6tcF5MjKGrhVt8H8R/8SwGTdk3+c=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
         "envVariables": {},
@@ -3175,12 +3175,22 @@
           "gang__download_tf_0_linux_arm64": {
             "repoRuleId": "@@rules_tf+//tf/toolchains/tofu:toolchain.bzl%tofu_download",
             "attributes": {
-              "version": "1.11.6",
+              "version": "1.11.9",
               "os": "linux",
               "arch": "arm64",
               "mirror": {
                 "aws": "hashicorp/aws:6.72.0",
                 "http": "hashicorp/http:3.6.3"
+              },
+              "mirror_sha256": {
+                "hashicorp/aws:6.72.0/darwin_amd64": "15ac65be772bc93d911fb2d7ca366063b6df3af41d915503ad42ce3cac525f21",
+                "hashicorp/aws:6.72.0/darwin_arm64": "0d37e9dae7fd5252d869dd444687acc468684b128d11a9034510a8612ea51925",
+                "hashicorp/aws:6.72.0/linux_amd64": "afd61efd15d485cf0f621d5bdaf730143db6e763e862ed59f8e94b51d23e8a71",
+                "hashicorp/aws:6.72.0/linux_arm64": "8c3e82c6aa69b20f720ef2c4a842af11a85691e50fc0a93e29674bd24ad819c7",
+                "hashicorp/http:3.6.3/darwin_amd64": "80b341609f5f962f709bae424860334e69e1fe6d12b9027f9c0355a1da63eb02",
+                "hashicorp/http:3.6.3/darwin_arm64": "94cd85fd04a0b36a8e622efc63e08c34a6ba135713dd9c7a60059af55aea6876",
+                "hashicorp/http:3.6.3/linux_amd64": "c3534ef0998dba2a3b79d4c993197ed86f1482dd451479ae8244d92cf7b3b3a9",
+                "hashicorp/http:3.6.3/linux_arm64": "476a140b360acb9ca589b7de6a5a8a379aabab4e034fd2dbf4be033c21749907"
               }
             }
           },
@@ -3211,8 +3221,8 @@
         ]
       },
       "os:linux,arch:amd64": {
-        "bzlTransitiveDigest": "nOoRARYYQvZENzWYXz8YfM9gu9dZAhoJylKAUK+4qkM=",
-        "usagesDigest": "iGvaPnYYay+sWvxIMmjzk4GJTRMy8M/so0Rg/CXjev0=",
+        "bzlTransitiveDigest": "rhMBZ1XsTYpPYTjjQiG1anqV1rx+OensWN4Zk1cgZHs=",
+        "usagesDigest": "NxsTPm9Hf8okxnP6tcF5MjKGrhVt8H8R/8SwGTdk3+c=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
         "envVariables": {},
@@ -3236,12 +3246,22 @@
           "gang__download_tf_0_linux_amd64": {
             "repoRuleId": "@@rules_tf+//tf/toolchains/tofu:toolchain.bzl%tofu_download",
             "attributes": {
-              "version": "1.11.6",
+              "version": "1.11.9",
               "os": "linux",
               "arch": "amd64",
               "mirror": {
                 "aws": "hashicorp/aws:6.72.0",
                 "http": "hashicorp/http:3.6.3"
+              },
+              "mirror_sha256": {
+                "hashicorp/aws:6.72.0/darwin_amd64": "15ac65be772bc93d911fb2d7ca366063b6df3af41d915503ad42ce3cac525f21",
+                "hashicorp/aws:6.72.0/darwin_arm64": "0d37e9dae7fd5252d869dd444687acc468684b128d11a9034510a8612ea51925",
+                "hashicorp/aws:6.72.0/linux_amd64": "afd61efd15d485cf0f621d5bdaf730143db6e763e862ed59f8e94b51d23e8a71",
+                "hashicorp/aws:6.72.0/linux_arm64": "8c3e82c6aa69b20f720ef2c4a842af11a85691e50fc0a93e29674bd24ad819c7",
+                "hashicorp/http:3.6.3/darwin_amd64": "80b341609f5f962f709bae424860334e69e1fe6d12b9027f9c0355a1da63eb02",
+                "hashicorp/http:3.6.3/darwin_arm64": "94cd85fd04a0b36a8e622efc63e08c34a6ba135713dd9c7a60059af55aea6876",
+                "hashicorp/http:3.6.3/linux_amd64": "c3534ef0998dba2a3b79d4c993197ed86f1482dd451479ae8244d92cf7b3b3a9",
+                "hashicorp/http:3.6.3/linux_arm64": "476a140b360acb9ca589b7de6a5a8a379aabab4e034fd2dbf4be033c21749907"
               }
             }
           },
@@ -3272,8 +3292,8 @@
         ]
       },
       "os:osx,arch:aarch64": {
-        "bzlTransitiveDigest": "nOoRARYYQvZENzWYXz8YfM9gu9dZAhoJylKAUK+4qkM=",
-        "usagesDigest": "iGvaPnYYay+sWvxIMmjzk4GJTRMy8M/so0Rg/CXjev0=",
+        "bzlTransitiveDigest": "rhMBZ1XsTYpPYTjjQiG1anqV1rx+OensWN4Zk1cgZHs=",
+        "usagesDigest": "NxsTPm9Hf8okxnP6tcF5MjKGrhVt8H8R/8SwGTdk3+c=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
         "envVariables": {},
@@ -3297,12 +3317,22 @@
           "gang__download_tf_0_darwin_arm64": {
             "repoRuleId": "@@rules_tf+//tf/toolchains/tofu:toolchain.bzl%tofu_download",
             "attributes": {
-              "version": "1.11.6",
+              "version": "1.11.9",
               "os": "darwin",
               "arch": "arm64",
               "mirror": {
                 "aws": "hashicorp/aws:6.72.0",
                 "http": "hashicorp/http:3.6.3"
+              },
+              "mirror_sha256": {
+                "hashicorp/aws:6.72.0/darwin_amd64": "15ac65be772bc93d911fb2d7ca366063b6df3af41d915503ad42ce3cac525f21",
+                "hashicorp/aws:6.72.0/darwin_arm64": "0d37e9dae7fd5252d869dd444687acc468684b128d11a9034510a8612ea51925",
+                "hashicorp/aws:6.72.0/linux_amd64": "afd61efd15d485cf0f621d5bdaf730143db6e763e862ed59f8e94b51d23e8a71",
+                "hashicorp/aws:6.72.0/linux_arm64": "8c3e82c6aa69b20f720ef2c4a842af11a85691e50fc0a93e29674bd24ad819c7",
+                "hashicorp/http:3.6.3/darwin_amd64": "80b341609f5f962f709bae424860334e69e1fe6d12b9027f9c0355a1da63eb02",
+                "hashicorp/http:3.6.3/darwin_arm64": "94cd85fd04a0b36a8e622efc63e08c34a6ba135713dd9c7a60059af55aea6876",
+                "hashicorp/http:3.6.3/linux_amd64": "c3534ef0998dba2a3b79d4c993197ed86f1482dd451479ae8244d92cf7b3b3a9",
+                "hashicorp/http:3.6.3/linux_arm64": "476a140b360acb9ca589b7de6a5a8a379aabab4e034fd2dbf4be033c21749907"
               }
             }
           },

@@ -31,18 +31,17 @@
 //! ```
 
 mod cache;
-mod client_settings;
 mod config;
 mod credential;
 mod errors;
 mod fallback;
 mod fleet;
 mod group;
+mod host;
 mod lifecycle;
 mod names;
 mod plugin;
 mod scratch;
-mod sdk;
 mod signer;
 
 #[cfg(test)]
@@ -61,12 +60,11 @@ mod test_support;
 mod warm_scenarios;
 
 pub use cache::S3Cache;
-pub use client_settings::{ClientSettings, ClientSettingsError};
 pub use config::{
     AwsConfig, AwsFleetOptions, Capacity, CooldownPolicy, ExpiryAge, KmsSignerConfig,
     RetrySpotAfter, S3CacheConfig, S3Tuning, SpotFallback, WorkloadTokenAlgorithm,
 };
 pub use errors::{AwsError, ScratchError};
-pub use names::{AwsNameError, BucketName, FleetTagKey, KeyId, KeyPrefix, MountPoint, Region};
+pub use names::{AwsNameError, BucketName, FleetTagKey, KeyId, KeyPrefix, MountPoint};
 pub use plugin::Aws;
 pub use signer::KmsSigner;

@@ -1,4 +1,4 @@
 output "gang" {
-  description = "Every output of the deployment module: region, controller_instance_id, endpoint, issuer_url, gang_toml, ... The deploy workflow reads region and controller_instance_id from it."
+  description = "Every deployment output, including region, controller_shape, controller_instance_id, endpoint and gang_toml. The deploy workflow uses the shape to select configuration rollout behavior."
   value       = module.gang
 }

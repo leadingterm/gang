@@ -72,7 +72,7 @@ test("a worker event in a delta is appended once, after the held events", () => 
   const joined: ScalingEvent = {
     name: `events/${seq}`,
     createTime: snapshot.updateTime,
-    fleet: "fleets/build-worker-aarch64-spot",
+    fleet: "fleets/build-worker-aarch64-graviton4-spot-xl",
     workerRegistered: { worker: "workers/i-0f00000000000001-0194d5a2-7b3c-7f10-8a4e-1c2d3e4f5a6b" },
   };
   const next = apply(snapshot, after(snapshot, { events: [joined] }));

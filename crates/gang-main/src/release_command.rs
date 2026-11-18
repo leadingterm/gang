@@ -90,7 +90,7 @@ mod tests {
     fn backfill_of_empty_regions_has_no_steps() {
         let (code, stdout, _) = gang_release(
             &["ami-steps", "--home-region", "us-east-1", "--now", "0"],
-            r#"{"us-east-1":{"quota":10,"images":{"Images":[]}}}"#,
+            r#"{"us-east-1":{"quota":10,"images":{"Images":[]},"snapshots":{"Snapshots":[]}}}"#,
         );
         assert_eq!(code, ExitCode::SUCCESS);
         assert!(stdout.is_empty());
@@ -116,7 +116,7 @@ mod tests {
         steps_args.extend(args);
         let (code, stdout, _) = gang_release(
             &steps_args,
-            r#"{"us-east-1":{"quota":10,"images":{"Images":[]}}}"#,
+            r#"{"us-east-1":{"quota":10,"images":{"Images":[]},"snapshots":{"Snapshots":[]}}}"#,
         );
         assert_eq!(code, ExitCode::SUCCESS);
         assert!(stdout.contains("upload\tx86_64\tgang-x86_64-0000000000000000\t"));
@@ -140,7 +140,7 @@ mod tests {
             "us-east-1": {"quota": 10, "images": {"Images": [
                 image("ami-01", "x86_64", &x86[7..]),
                 image("ami-02", "aarch64", &arm[8..])
-            ]}}
+            ]}, "snapshots": {"Snapshots": []}}
         });
         let mut manifest_args = vec!["ami-manifest"];
         manifest_args.extend(args);

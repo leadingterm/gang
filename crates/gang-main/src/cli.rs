@@ -93,6 +93,12 @@ const RESTORE_EXAMPLES: &str = examples! {
         "gang restore --principal github-actions:acme/app",
     ];
 };
+/// The `after_help` of the database commands.
+const DATABASE_EXAMPLES: &str = examples! {
+    "copy durable state between stopped databases" => [
+        "gang database copy --from old.toml --to new.toml",
+    ];
+};
 /// The `after_help` of `gang server`.
 const SERVER_EXAMPLES: &str = examples! {
     "a laptop: run a server from a configuration file" => [
@@ -345,9 +351,15 @@ pub enum Command {
     /// Run the Gang server.
     #[command(after_help = SERVER_EXAMPLES)]
     Server(ConfigArgs),
+    /// Copy durable state between configured databases.
+    #[command(subcommand, after_help = DATABASE_EXAMPLES)]
+    Database(DatabaseCommand),
     /// Run a Gang worker.
     #[command(hide = true, after_help = WORKER_EXAMPLES)]
     Worker(WorkerArgs),
+    /// Commit a local worker's identity before executing its launcher.
+    #[command(name = "__local-worker", hide = true)]
+    LocalWorker(LocalWorkerArgs),
     /// Run a command in the sandbox; used through the sandbox entry point, not by people.
     #[command(hide = true, after_help = EXEC_EXAMPLES)]
     Exec(ExecArgs),
@@ -382,7 +394,9 @@ impl Command {
             Self::Revoke(_) => "gang revoke",
             Self::Restore(_) => "gang restore",
             Self::Server(_) => "gang server",
+            Self::Database(DatabaseCommand::Copy(_)) => "gang database copy",
             Self::Worker(_) => "gang worker",
+            Self::LocalWorker(_) => "gang local worker",
             Self::Exec(_) => "gang exec",
             Self::Local(LocalCommand::Up(_)) => "gang local up",
             Self::Local(LocalCommand::Down(_)) => "gang local down",
@@ -393,6 +407,29 @@ impl Command {
             Self::Release(command) => command.subject(),
         }
     }
+}
+
+/// Database administration commands.
+#[derive(Debug, Subcommand)]
+pub enum DatabaseCommand {
+    /// Copy durable records into an empty database.
+    ///
+    /// Scaling event sequence numbers are preserved when the source is contiguous from 1.
+    /// Stop writers to both databases before copying; a failed copy may leave partial state.
+    /// Leases and expiring records are not copied.
+    #[command(after_help = DATABASE_EXAMPLES)]
+    Copy(DatabaseCopyArgs),
+}
+
+/// Configuration files identifying the source and target databases.
+#[derive(Debug, Args)]
+pub struct DatabaseCopyArgs {
+    /// Source configuration file.
+    #[arg(long, value_name = "FILE")]
+    pub from: PathBuf,
+    /// Target configuration file.
+    #[arg(long, value_name = "FILE")]
+    pub to: PathBuf,
 }
 
 /// Arguments of `gang options`.
@@ -653,6 +690,25 @@ pub struct ExecArgs {
         trailing_var_arg = true,
         allow_hyphen_values = true,
         value_name = "COMMAND"
+    )]
+    pub command: Vec<OsString>,
+}
+
+/// Arguments of the hidden local worker bootstrap.
+#[derive(Debug, Args)]
+pub struct LocalWorkerArgs {
+    /// The instance record to commit before executing the worker.
+    #[arg(long)]
+    pub record: PathBuf,
+    /// The lock that protects the worker's lifetime.
+    #[arg(long, hide = true)]
+    pub lifetime_lock: PathBuf,
+    /// The launcher or worker command and its arguments.
+    #[arg(
+        required = true,
+        num_args = 1..,
+        trailing_var_arg = true,
+        allow_hyphen_values = true
     )]
     pub command: Vec<OsString>,
 }
@@ -1093,6 +1149,28 @@ mod tests {
         try_parse(args)
             .expect_err("the command line is rejected")
             .kind()
+    }
+
+    #[test]
+    fn local_worker_requires_lifetime_lock() {
+        assert_eq!(
+            rejection(&["gang", "__local-worker", "--record", "record", "worker"]),
+            ErrorKind::MissingRequiredArgument
+        );
+        let Command::LocalWorker(args) = command(&[
+            "gang",
+            "__local-worker",
+            "--record",
+            "record",
+            "--lifetime-lock",
+            "lifetime.lock",
+            "worker",
+        ]) else {
+            panic!("expected the local worker command");
+        };
+        assert_eq!(args.record, PathBuf::from("record"));
+        assert_eq!(args.lifetime_lock, PathBuf::from("lifetime.lock"));
+        assert_eq!(args.command, vec![OsString::from("worker")]);
     }
 
     fn login(extra: &[&str]) -> LoginArgs {

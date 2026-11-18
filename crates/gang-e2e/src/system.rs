@@ -232,6 +232,22 @@ gang_types::string_enum! {
         Stray = "stray",
         /// Reports to the journal and waits for the go flag.
         HeldRelease = "held_release",
+        /// First held controller-loss action.
+        ControllerLoss0 = "controller_loss_0",
+        /// Second held controller-loss action.
+        ControllerLoss1 = "controller_loss_1",
+        /// Third held controller-loss action.
+        ControllerLoss2 = "controller_loss_2",
+        /// Fourth held controller-loss action.
+        ControllerLoss3 = "controller_loss_3",
+        /// Fifth held controller-loss action.
+        ControllerLoss4 = "controller_loss_4",
+        /// Sixth held controller-loss action.
+        ControllerLoss5 = "controller_loss_5",
+        /// Seventh held controller-loss action.
+        ControllerLoss6 = "controller_loss_6",
+        /// Eighth held controller-loss action.
+        ControllerLoss7 = "controller_loss_7",
         /// Reports to the journal, waits for the go flag, then allocates far beyond its hard
         /// memory ceiling.
         HeldHog = "held_hog",
@@ -445,6 +461,15 @@ pub trait Limits: System {
     ///
     /// When the signal pipe cannot be written.
     fn abandon_hold(&self) -> Result<()>;
+
+    /// Ends the running hold build without releasing its action, whether or not the action runs
+    /// in a scope; a hold build that already ended is not an error. Unlike
+    /// [`Limits::abandon_hold`], this ends the build itself.
+    ///
+    /// # Errors
+    ///
+    /// When the build cannot be stopped.
+    fn cancel_hold(&self) -> Result<()>;
 
     /// The number of attempts the memory grower made: one line per attempt in the counter file
     /// the action appends to.

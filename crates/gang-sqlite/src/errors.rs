@@ -3,6 +3,26 @@ use std::path::PathBuf;
 /// Why the `SQLite` state store failed.
 #[derive(Debug, thiserror::Error, gang_spi::PortFailure)]
 pub enum SqliteError {
+    /// Another process holds the database lock.
+    #[error("database {} is in use by another process", path.display())]
+    #[failure(config)]
+    Locked {
+        /// The configured database file.
+        path: PathBuf,
+    },
+    /// The database lock file could not be opened or locked.
+    #[error(transparent)]
+    Lock(#[from] gang_os::PathIo),
+    /// The database path could not be resolved.
+    #[error("cannot resolve sqlite database path {}", path.display())]
+    #[failure(config)]
+    ResolvePath {
+        /// The configured database path.
+        path: PathBuf,
+        /// The filesystem error.
+        #[source]
+        source: std::io::Error,
+    },
     /// The database file could not be opened.
     #[error("cannot open sqlite database {}", path.display())]
     Open {
@@ -14,18 +34,21 @@ pub enum SqliteError {
     },
     /// A statement failed.
     #[error("sqlite statement failed")]
-    Query(#[from] rusqlite::Error),
+    Query(rusqlite::Error),
+    /// A statement could not acquire a `SQLite` lock.
+    #[error("sqlite database is busy")]
+    #[failure(unavailable)]
+    Busy(#[source] rusqlite::Error),
     /// The database thread cannot serve statements, so the work could not run or return.
     #[error("the sqlite database thread cannot serve statements")]
+    #[failure(unavailable)]
     Closed,
-    /// The database was written by a newer version of this crate than the one running.
-    #[error("schema version {found} is newer than the supported version {supported}")]
-    SchemaTooNew {
-        /// The version stored in the database.
-        found: i64,
-        /// The newest version this crate knows.
-        supported: i64,
-    },
+    /// The database schema requires a newer binary.
+    #[error("database schema cannot be used")]
+    Schema(#[from] gang_spi::SchemaTooNew),
+    /// The number of migrations cannot be represented as a schema version.
+    #[error("sqlite migration count exceeds the schema version range")]
+    MigrationCountOverflow,
     /// A timestamp, in unix milliseconds, does not fit in a stored integer.
     #[error("timestamp of {0} ms does not fit in the database")]
     TimestampRange(u64),
@@ -42,10 +65,29 @@ pub enum SqliteError {
     },
 }
 
+impl From<rusqlite::Error> for SqliteError {
+    fn from(error: rusqlite::Error) -> Self {
+        if matches!(
+            &error,
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked,
+                    ..
+                },
+                _
+            )
+        ) {
+            Self::Busy(error)
+        } else {
+            Self::Query(error)
+        }
+    }
+}
+
 impl From<tokio_rusqlite::Error<SqliteError>> for SqliteError {
     fn from(error: tokio_rusqlite::Error<SqliteError>) -> Self {
         match error {
-            tokio_rusqlite::Error::Close((_, source)) => Self::Query(source),
+            tokio_rusqlite::Error::Close((_, source)) => Self::from(source),
             tokio_rusqlite::Error::Error(inner) => inner,
             // Covers ConnectionClosed and any failure variant added to the non-exhaustive enum:
             // an unknown failure of the database thread means it is unusable.
@@ -61,6 +103,41 @@ mod tests {
     use super::SqliteError;
 
     #[test]
+    fn closed_and_lock_contention_are_unavailable() {
+        assert!(matches!(
+            gang_spi::PortError::from(SqliteError::Closed),
+            gang_spi::PortError::Unavailable(_)
+        ));
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            let driver = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
+            let error = SqliteError::from(driver);
+            assert!(matches!(
+                gang_spi::PortError::from(error),
+                gang_spi::PortError::Unavailable(_)
+            ));
+        }
+        let driver = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            None,
+        );
+        assert!(matches!(
+            gang_spi::PortError::from(SqliteError::from(driver)),
+            gang_spi::PortError::Backend(_)
+        ));
+        let schema = SqliteError::Schema(gang_spi::SchemaTooNew {
+            stored: gang_spi::SchemaVersion {
+                current: 2,
+                oldest_compatible: 2,
+            },
+            supported: 1,
+        });
+        assert!(matches!(
+            gang_spi::PortError::from(schema),
+            gang_spi::PortError::Backend(_)
+        ));
+    }
+
+    #[test]
     fn no_variant_repeats_its_source() {
         let errors = [
             SqliteError::Open {
@@ -69,10 +146,13 @@ mod tests {
             },
             SqliteError::Query(rusqlite::Error::InvalidQuery),
             SqliteError::Closed,
-            SqliteError::SchemaTooNew {
-                found: 2,
+            SqliteError::Schema(gang_spi::SchemaTooNew {
+                stored: gang_spi::SchemaVersion {
+                    current: 2,
+                    oldest_compatible: 2,
+                },
                 supported: 1,
-            },
+            }),
             SqliteError::TimestampRange(u64::MAX),
             SqliteError::SequenceRange(u64::MAX),
             SqliteError::Corrupt {

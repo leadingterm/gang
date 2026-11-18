@@ -26,7 +26,7 @@ jobs:
   # gh and sha256sum are the runner's own: this job checks out nothing and installs no Nix.
   locate:
     if: ${{ !(github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')) }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
     permissions:
       actions: read
@@ -42,12 +42,12 @@ jobs:
           GH_REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
         run: |
-          runs="$(gh api "repos/$GH_REPO/actions/workflows/release.yml/runs?head_sha=$SHA&event=workflow_dispatch" \
-            --jq '.workflow_runs[] | select(.conclusion == "success") | .id')"
+          runs="$(gh api --paginate "repos/$GH_REPO/actions/workflows/release.yml/runs?head_sha=$SHA&event=workflow_dispatch" \
+            | jq -rs '[.[].workflow_runs[] | select(.conclusion == "success") | .id] | .[]')"
           dry_run=""
           for candidate in $runs; do
-            imaged="$(gh api "repos/$GH_REPO/actions/runs/$candidate/jobs" \
-              --jq '[.jobs[] | select((.name | startswith("images (")) and .conclusion == "success")] | length')"
+            imaged="$(gh api --paginate "repos/$GH_REPO/actions/runs/$candidate/jobs" \
+              | jq -s '[.[].jobs[] | select((.name | startswith("images (")) and .conclusion == "success")] | length')"
             if [[ "$imaged" == 2 ]]; then
               dry_run="$candidate"
               break
@@ -67,8 +67,8 @@ jobs:
           SHA: ${{ github.sha }}
           EVENT: ${{ github.event_name }}
         run: |
-          run_id="$(gh api "repos/$GH_REPO/actions/workflows/ci.yml/runs?head_sha=$SHA" \
-            --jq "[.workflow_runs[] | select(.conclusion == \"success\" and ((.event == \"push\" and .head_branch == \"main\") or (\"$EVENT\" == \"workflow_dispatch\" and .event == \"pull_request\")))][0].id // empty")"
+          run_id="$(gh api --paginate "repos/$GH_REPO/actions/workflows/ci.yml/runs?head_sha=$SHA" \
+            | jq -rs --arg event "$EVENT" '[.[].workflow_runs[] | select(.conclusion == "success" and ((.event == "push" and .head_branch == "main") or ($event == "workflow_dispatch" and .event == "pull_request")))] | .[0].id // empty')"
           if [[ -z "$run_id" ]]; then
             echo "::error::no eligible successful CI run of $SHA" >&2
             exit 1
@@ -157,7 +157,7 @@ jobs:
   amis:
     needs: [locate, images]
     if: ${{ !cancelled() && ((github.event_name == 'push' && needs.locate.result == 'success' && needs.images.result == 'success') || (github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v'))) }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
     permissions:
       contents: read
@@ -170,7 +170,7 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         if: env.BACKFILL != 'true'
         with:
-          name: gang-x86_64-unknown-linux-musl
+          name: gang-aarch64-unknown-linux-musl
           path: staged
           run-id: ${{ needs.locate.outputs.run-id }}
           github-token: ${{ github.token }}
@@ -183,12 +183,12 @@ jobs:
         run: |
           mkdir -p staged
           cd staged
-          gh release download "$TAG" --pattern gang-x86_64-unknown-linux-musl --pattern SHA256SUMS
+          gh release download "$TAG" --pattern gang-aarch64-unknown-linux-musl --pattern SHA256SUMS
           sha256sum --check --ignore-missing --strict SHA256SUMS
-          gh attestation verify gang-x86_64-unknown-linux-musl --repo "$GH_REPO" \
+          gh attestation verify gang-aarch64-unknown-linux-musl --repo "$GH_REPO" \
             --cert-identity "https://github.com/$GH_REPO/.github/workflows/release.yml@refs/tags/$TAG" \
             --cert-oidc-issuer https://token.actions.githubusercontent.com --source-ref "refs/tags/$TAG"
-      - run: chmod +x staged/gang-x86_64-unknown-linux-musl
+      - run: chmod +x staged/gang-aarch64-unknown-linux-musl
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         if: env.PUBLISH == 'true'
         with:
@@ -207,7 +207,7 @@ jobs:
       - name: Converge public AMIs
         shell: nix develop .#release -c bash --noprofile --norc -euo pipefail {0}
         env:
-          GANG: ${{ github.workspace }}/staged/gang-x86_64-unknown-linux-musl
+          GANG: ${{ github.workspace }}/staged/gang-aarch64-unknown-linux-musl
           IMAGE_HOME_REGION: ${{ vars.IMAGE_HOME_REGION }}
           IMAGE_REGIONS: ${{ vars.IMAGE_REGIONS }}
           RELEASE: ${{ github.event_name == 'push' && github.ref_name || '' }}
@@ -223,7 +223,7 @@ jobs:
   publish:
     needs: [locate, images, amis]
     if: ${{ github.event_name == 'push' && !cancelled() && needs.locate.result == 'success' && needs.images.result == 'success' && needs.amis.result == 'success' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 15
     permissions:
       contents: write

@@ -1,6 +1,6 @@
 # ADR-11: The autoscaler persists no fleet state
 
-Status: Accepted
+Status: Accepted. Amended by ADR-43 (additional durable controller state) and ADR-44 (one leader runs the autoscaler).
 
 ## Context
 - The controller restarts, crashes and is redeployed while instances boot, drain or are preempted.

@@ -7,8 +7,9 @@ use std::path::PathBuf;
 
 use gang_clock::Timestamp;
 use gang_spi::{
-    CertStatus, IssuedCertRecord, PortError, PrincipalRecord, RecordedScalingEvent,
-    ScalingAuditEvent, ScalingEventKind, ScalingEventSeq, StateRepositoryPort, Subject,
+    CertStatus, IssuedCertRecord, Plugin, PluginContext, PortError, PrincipalRecord,
+    RecordedScalingEvent, ScalingAuditEvent, ScalingEventKind, ScalingEventSeq,
+    StateRepositoryPort, Subject,
 };
 use gang_sqlite::{JournalMode, Sqlite, SqliteConfig, SqliteError};
 use gang_types::{
@@ -102,6 +103,90 @@ mod fixtures {
 
 use fixtures::*;
 use support::{issued, open};
+
+#[test]
+fn database_lock_is_exclusive_until_drop() -> gang_testkit::TestResult {
+    let dir = TempDir::new()?;
+    let path = database_path(&dir);
+    let context = PluginContext {
+        config_path: std::path::Path::new("gang.toml"),
+    };
+    let first = Sqlite::build(SqliteConfig::new(path.clone()), &context)?;
+    let Err(error) = Sqlite::build(SqliteConfig::new(path.clone()), &context) else {
+        panic!("second database unexpectedly acquired the lock");
+    };
+    assert!(
+        matches!(&error, PortError::Config(cause) if matches!(cause.downcast_ref::<SqliteError>(), Some(SqliteError::Locked { path: locked }) if locked == &path))
+    );
+    drop(first);
+    let _reopened = Sqlite::build(SqliteConfig::new(path), &context)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn database_lock_excludes_symlink_aliases() -> gang_testkit::TestResult {
+    let dir = TempDir::new()?;
+    let path = database_path(&dir);
+    std::fs::File::create(&path)?;
+    let alias = dir.path().join("alias.db");
+    std::os::unix::fs::symlink(&path, &alias)?;
+    let context = PluginContext {
+        config_path: std::path::Path::new("gang.toml"),
+    };
+    let _first = Sqlite::build(SqliteConfig::new(path), &context)?;
+    assert!(matches!(
+        Sqlite::build(SqliteConfig::new(alias), &context),
+        Err(PortError::Config(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn relative_database_path_is_anchored_to_configuration() -> gang_testkit::TestResult {
+    let dir = TempDir::new()?;
+    let config_path = dir.path().join("gang.toml");
+    let context = PluginContext {
+        config_path: &config_path,
+    };
+    let _first = Sqlite::build(SqliteConfig::new("gang.db".into()), &context)?;
+    assert!(matches!(
+        Sqlite::build(SqliteConfig::new(dir.path().join("gang.db")), &context),
+        Err(PortError::Config(_))
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn version_two_upgrade_preserves_existing_rows() -> gang_testkit::TestResult {
+    let dir = TempDir::new()?;
+    let initial = store(&dir);
+    initial.revocation_epoch().await?;
+    initial.close().await?;
+    let db = raw_connection(&dir);
+    db.execute_batch(
+        "DROP TABLE counters;
+         DROP TABLE expiring_records;
+         PRAGMA user_version = 2;
+         INSERT INTO issued_certificates VALUES ('01', 'test', 'alice', 10, 20, NULL);
+         INSERT INTO principals VALUES ('test', 'alice', 10, 10, NULL);
+         INSERT INTO scaling_audit (at, fleet, kind) VALUES (10, 'fleet', 'terminated');",
+    )?;
+    drop(db);
+    let upgraded = store(&dir);
+    assert_eq!(upgraded.revocation_epoch().await?.get(), 0);
+    let db = raw_connection(&dir);
+    let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    assert_eq!(version, 3);
+    for table in ["issued_certificates", "principals", "scaling_audit"] {
+        let count: i64 = db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })?;
+        assert_eq!(count, 1, "{table}");
+    }
+    assert!(upgraded.certificate(&serial("01")).await?.is_some());
+    Ok(())
+}
 
 #[tokio::test]
 async fn record_then_certificate_returns_the_same_record() {
@@ -315,6 +400,7 @@ async fn data_survives_reopening_the_database() {
             .revoke(&serial("01"), ts(5_000))
             .await
             .expect("revoke succeeds");
+        store.close().await.expect("connection closes");
     }
 
     let reopened = store(&dir);
@@ -448,6 +534,7 @@ async fn certificates_of_survives_reopening_the_database() {
             .revoke(&serial("02"), ts(5_000))
             .await
             .expect("revoke succeeds");
+        store.close().await.expect("connection closes");
     }
 
     let reopened = store(&dir);
@@ -498,6 +585,7 @@ async fn reads_survive_a_reordered_schema() {
             .revoke(&serial("02"), ts(5_000))
             .await
             .expect("revoke succeeds");
+        store.close().await.expect("connection closes");
     }
     raw_connection(&dir)
         .execute_batch(REORDERED_ISSUED_CERTIFICATES)
@@ -1834,12 +1922,16 @@ async fn database_with_a_newer_schema_is_refused() {
             .certificate(&serial("01"))
             .await
             .expect("lookup migrates the database");
+        store.close().await.expect("connection closes");
     }
     {
         let connection = raw_connection(&dir);
         connection
             .execute("PRAGMA user_version = 999", [])
             .expect("version is bumped");
+        connection
+            .execute("DELETE FROM schema_compatibility", [])
+            .expect("legacy compatibility is simulated");
     }
 
     let store = store(&dir);
@@ -1861,7 +1953,10 @@ async fn database_with_a_newer_schema_is_refused() {
     assert!(
         matches!(
             schema_too_new,
-            Some(SqliteError::SchemaTooNew { found: 999, .. })
+            Some(SqliteError::Schema(gang_spi::SchemaTooNew {
+                stored: gang_spi::SchemaVersion { current: 999, .. },
+                ..
+            }))
         ),
         "expected SchemaTooNew in the source chain, got {schema_too_new:?}"
     );

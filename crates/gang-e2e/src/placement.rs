@@ -1,20 +1,21 @@
 //! Where one end-to-end run keeps its state: reserved loopback ports and a private scratch tree.
 //!
 //! A [`Placement`] owns a temporary directory that holds every file and directory the run
-//! writes. The directory is removed when the placement is dropped. Each directory is created
-//! with mode `0700` so that concurrent runs on one machine do not see each other.
+//! writes. The directory is removed when the last placement copy is dropped. Each directory is
+//! created with mode `0700` so that concurrent runs on one machine do not see each other.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::errors::{E2eError, Result};
 use crate::ports;
 
 /// The private scratch tree of one end-to-end run.
 ///
-/// The tree is removed when the placement is dropped.
-#[derive(Debug)]
+/// The tree is removed when the last copy of the placement is dropped.
+#[derive(Debug, Clone)]
 pub struct Placement {
-    root: tempfile::TempDir,
+    root: Arc<tempfile::TempDir>,
     public_port: u16,
     worker_port: u16,
     imds_port: u16,
@@ -38,7 +39,7 @@ impl Placement {
             .tempdir_in(base)
             .map_err(E2eError::io("creating the placement root"))?;
         let placement = Self {
-            root,
+            root: Arc::new(root),
             public_port: ports::reserve()?,
             worker_port: ports::reserve()?,
             imds_port: ports::reserve()?,

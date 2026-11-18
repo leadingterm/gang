@@ -10,6 +10,11 @@ mock_provider "aws" {
   mock_data "aws_iam_policy_document" {
     defaults = { json = "{}" }
   }
+
+  # The ephemeral password read validates its ARN argument whenever it opens.
+  mock_resource "aws_ssm_parameter" {
+    defaults = { arn = "arn:aws:ssm:eu-north-1:000000000000:parameter/gang/database-password" }
+  }
 }
 
 variables {
@@ -205,5 +210,259 @@ run "ca_key_alias_is_named_after_the_deployment" {
   assert {
     condition     = aws_kms_alias.this.name == "alias/other-ca"
     error_message = "The CA key alias must be named after the deployment."
+  }
+}
+
+run "shared_state_table" {
+  command = plan
+  variables {
+    dynamodb_table = { name = "gang-state" }
+  }
+  assert {
+    condition     = aws_dynamodb_table.this[0].name == "gang-state" && aws_dynamodb_table.this[0].billing_mode == "PAY_PER_REQUEST" && aws_dynamodb_table.this[0].hash_key == "pk" && aws_dynamodb_table.this[0].range_key == "sk" && aws_dynamodb_table.this[0].deletion_protection_enabled
+    error_message = "The shared state table must use on-demand billing, pk/sk keys and deletion protection."
+  }
+  assert {
+    condition     = toset([for a in aws_dynamodb_table.this[0].attribute : "${a.name}:${a.type}"]) == toset(["pk:S", "sk:S"]) && aws_dynamodb_table.this[0].point_in_time_recovery[0].enabled && aws_dynamodb_table.this[0].server_side_encryption[0].enabled && aws_dynamodb_table.this[0].ttl[0].enabled && aws_dynamodb_table.this[0].ttl[0].attribute_name == "ttl"
+    error_message = "The shared state table must use string keys, PITR, SSE and ttl expiration."
+  }
+  assert {
+    condition     = output.dynamodb_table_name == "gang-state"
+    error_message = "The table name must be exposed to the controller."
+  }
+}
+
+run "no_shared_state_table_by_default" {
+  command = plan
+  assert {
+    condition     = length(aws_dynamodb_table.this) == 0 && output.dynamodb_table_name == null && output.dynamodb_table_arn == null
+    error_message = "The default shape must not create a shared state table."
+  }
+}
+
+run "rejects_invalid_table_name" {
+  command = plan
+  variables {
+    dynamodb_table = { name = "bad name" }
+  }
+  expect_failures = [var.dynamodb_table]
+}
+
+run "no_postgres_by_default" {
+  command = plan
+
+  assert {
+    condition = alltrue([
+      length(aws_db_subnet_group.postgres) == 0,
+      length(aws_security_group.postgres) == 0,
+      length(aws_vpc_security_group_ingress_rule.postgres) == 0,
+      length(aws_db_parameter_group.postgres) == 0,
+      length(aws_db_instance.postgres) == 0,
+      length(aws_ssm_parameter.postgres_password) == 0,
+      output.postgres_address == null,
+      output.postgres_port == null,
+      output.postgres_database == null,
+      output.postgres_user == null,
+      output.postgres_password_parameter_name == null,
+    ])
+    error_message = "PostgreSQL resources and outputs must be absent by default."
+  }
+}
+
+run "postgres_rds_is_private_and_protected" {
+  command = plan
+
+  variables {
+    postgres_rds = {
+      instance_class           = "db.t4g.medium"
+      multi_az                 = true
+      storage_gib              = 20
+      engine_version           = "16"
+      password_version         = 3
+      vpc_id                   = "vpc-12345678"
+      subnet_ids               = ["subnet-12345678", "subnet-87654321"]
+      client_security_group_id = "sg-12345678"
+    }
+  }
+
+  assert {
+    condition = alltrue([
+      aws_db_instance.postgres[0].identifier == "gang-state",
+      aws_db_instance.postgres[0].engine == "postgres",
+      aws_db_instance.postgres[0].engine_version == "16",
+      aws_db_instance.postgres[0].instance_class == "db.t4g.medium",
+      aws_db_instance.postgres[0].allocated_storage == 20,
+      aws_db_instance.postgres[0].storage_type == "gp3",
+      aws_db_instance.postgres[0].storage_encrypted,
+      aws_db_instance.postgres[0].multi_az,
+      !aws_db_instance.postgres[0].publicly_accessible,
+      aws_db_instance.postgres[0].backup_retention_period == 7,
+      aws_db_instance.postgres[0].deletion_protection,
+      !aws_db_instance.postgres[0].skip_final_snapshot,
+      aws_db_instance.postgres[0].final_snapshot_identifier == "gang-state-final",
+      aws_db_instance.postgres[0].copy_tags_to_snapshot,
+      aws_db_instance.postgres[0].auto_minor_version_upgrade,
+      aws_db_instance.postgres[0].ca_cert_identifier == "rds-ca-rsa2048-g1",
+      aws_db_instance.postgres[0].password_wo_version == 3,
+    ])
+    error_message = "The PostgreSQL instance must be private, encrypted, backed up and protected from deletion."
+  }
+
+  assert {
+    condition = alltrue([
+      aws_security_group.postgres[0].vpc_id == var.postgres_rds.vpc_id,
+      toset(aws_db_subnet_group.postgres[0].subnet_ids) == toset(var.postgres_rds.subnet_ids),
+      length(aws_vpc_security_group_ingress_rule.postgres) == 1,
+      aws_vpc_security_group_ingress_rule.postgres[0].referenced_security_group_id == var.postgres_rds.client_security_group_id,
+      aws_vpc_security_group_ingress_rule.postgres[0].ip_protocol == "tcp",
+      aws_vpc_security_group_ingress_rule.postgres[0].from_port == 5432,
+      aws_vpc_security_group_ingress_rule.postgres[0].to_port == 5432,
+    ])
+    error_message = "PostgreSQL must accept TCP 5432 only from the client security group."
+  }
+
+  assert {
+    condition = aws_db_parameter_group.postgres[0].name_prefix == "gang-state-" && aws_db_parameter_group.postgres[0].family == "postgres16" && anytrue([
+      for p in aws_db_parameter_group.postgres[0].parameter :
+      p.name == "rds.force_ssl" && p.value == "1" && p.apply_method == "immediate"
+    ])
+    error_message = "The PostgreSQL parameter group must force SSL."
+  }
+
+  assert {
+    condition = alltrue([
+      output.postgres_database == "gang",
+      output.postgres_user == "gang",
+      output.postgres_password_parameter_name == "/gang/database-password",
+      aws_ssm_parameter.postgres_password[0].type == "SecureString",
+      aws_ssm_parameter.postgres_password[0].value_wo_version == 3,
+    ])
+    error_message = "The PostgreSQL credentials must use the shared database identity and SecureString parameter."
+  }
+}
+
+run "rejects_small_postgres_storage" {
+  command = plan
+  variables {
+    postgres_rds = {
+      instance_class           = "db.t4g.medium"
+      multi_az                 = true
+      storage_gib              = 19
+      engine_version           = "16"
+      vpc_id                   = "vpc-12345678"
+      subnet_ids               = ["subnet-12345678", "subnet-87654321"]
+      client_security_group_id = "sg-12345678"
+    }
+  }
+  expect_failures = [var.postgres_rds]
+}
+
+run "rejects_postgres_minor_version" {
+  command = plan
+  variables {
+    postgres_rds = {
+      instance_class           = "db.t4g.medium"
+      multi_az                 = true
+      storage_gib              = 20
+      engine_version           = "16.4"
+      vpc_id                   = "vpc-12345678"
+      subnet_ids               = ["subnet-12345678", "subnet-87654321"]
+      client_security_group_id = "sg-12345678"
+    }
+  }
+  expect_failures = [var.postgres_rds]
+}
+
+run "rejects_duplicate_postgres_subnets" {
+  command = plan
+  variables {
+    postgres_rds = {
+      instance_class           = "db.t4g.medium"
+      multi_az                 = false
+      storage_gib              = 20
+      engine_version           = "16"
+      vpc_id                   = "vpc-12345678"
+      subnet_ids               = ["subnet-12345678", "subnet-12345678"]
+      client_security_group_id = "sg-12345678"
+    }
+  }
+  expect_failures = [var.postgres_rds]
+}
+
+run "rejects_fractional_postgres_password_version" {
+  command = plan
+  variables {
+    postgres_rds = {
+      instance_class           = "db.t4g.medium"
+      multi_az                 = false
+      storage_gib              = 20
+      engine_version           = "16"
+      password_version         = 1.5
+      vpc_id                   = "vpc-12345678"
+      subnet_ids               = ["subnet-12345678", "subnet-87654321"]
+      client_security_group_id = "sg-12345678"
+    }
+  }
+  expect_failures = [var.postgres_rds]
+}
+
+run "rejects_zero_postgres_password_version" {
+  command = plan
+  variables {
+    postgres_rds = {
+      instance_class           = "db.t4g.medium"
+      multi_az                 = false
+      storage_gib              = 20
+      engine_version           = "16"
+      password_version         = 0
+      vpc_id                   = "vpc-12345678"
+      subnet_ids               = ["subnet-12345678", "subnet-87654321"]
+      client_security_group_id = "sg-12345678"
+    }
+  }
+  expect_failures = [var.postgres_rds]
+}
+
+# The two runs below must stay last: the apply leaves PostgreSQL in this file's state, and the plan that follows it
+# reads the existing password parameter during planning, as every pull-request plan does once it exists.
+run "postgres_password_is_decrypted_when_applying" {
+  command = apply
+
+  variables {
+    postgres_rds = {
+      instance_class           = "db.t4g.medium"
+      multi_az                 = true
+      storage_gib              = 20
+      engine_version           = "16"
+      vpc_id                   = "vpc-12345678"
+      subnet_ids               = ["subnet-12345678", "subnet-87654321"]
+      client_security_group_id = "sg-12345678"
+    }
+  }
+
+  assert {
+    condition     = ephemeral.aws_ssm_parameter.postgres_password[0].with_decryption == true
+    error_message = "Apply must decrypt the password parameter to set the RDS password."
+  }
+}
+
+run "postgres_password_is_not_decrypted_when_planning" {
+  command = plan
+
+  variables {
+    postgres_rds = {
+      instance_class           = "db.t4g.medium"
+      multi_az                 = true
+      storage_gib              = 20
+      engine_version           = "16"
+      vpc_id                   = "vpc-12345678"
+      subnet_ids               = ["subnet-12345678", "subnet-87654321"]
+      client_security_group_id = "sg-12345678"
+    }
+  }
+
+  assert {
+    condition     = ephemeral.aws_ssm_parameter.postgres_password[0].with_decryption == false
+    error_message = "Plan must read the password parameter without decryption, so the plan role needs no kms:Decrypt."
   }
 }

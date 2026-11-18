@@ -38,7 +38,8 @@ mod timestamp;
 
 pub use amis::{
     Ami, AmiManifest, AmiName, AmiState, Architecture, DEPRECATE_AFTER, DEREGISTER_AFTER, ImageId,
-    ImageSha256, Protection, Publication, Region, RegionImages, Regions, Release, ReleaseTag, Step,
+    ImageSha256, Protection, Publication, Region, RegionImages, Regions, Release, ReleaseTag,
+    SnapshotId, Step,
 };
 pub use comment::{CommentSource, PlanComment};
 pub use errors::{DeployError, Document, Expected};

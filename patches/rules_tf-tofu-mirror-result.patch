@@ -1,32 +1,69 @@
---- a/tf/toolchains/tofu/toolchain.bzl	2026-11-11 14:08:05.049869538 +0400
-+++ b/tf/toolchains/tofu/toolchain.bzl	2026-11-11 14:08:23.260354922 +0400
-@@ -72,11 +72,14 @@
+diff --git a/tf/toolchains/tofu/toolchain.bzl b/tf/toolchains/tofu/toolchain.bzl
+--- a/tf/toolchains/tofu/toolchain.bzl
++++ b/tf/toolchains/tofu/toolchain.bzl
+@@ -62,21 +62,23 @@
+             "source": elems[0], "version": elems[1],
+         }
  
-     ctx.file("versions.tf.json", content = json.encode(versions_tf))
- 
+-    versions_tf = {
+-        "terraform": [
+-            {
+-                "required_providers": [dict([(p, providers[p]) for p in providers ])],
+-            }
+-        ]
+-    }
+-
+-    ctx.file("versions.tf.json", content = json.encode(versions_tf))
+-
 -    ctx.execute([
 -        "bash",
 -        "-c",
 -        "mkdir -p mirror; tofu/tofu providers mirror ./mirror > /dev/null",
 -        ])
-+    # Upstream ignores this result, so a failed or timed-out mirror left a partial provider mirror behind
-+    # (not yet reported to yanndegat/rules_tf).
-+    res = ctx.execute(
-+        ["bash", "-c", "mkdir -p mirror; tofu/tofu providers mirror ./mirror > /dev/null"],
-+        timeout = ctx.attr.mirror_timeout,
-+    )
-+    if res.return_code != 0:
-+        fail("tofu providers mirror failed with exit code {}: {}".format(res.return_code, res.stderr))
++    # Download packed ZIPs through Bazel to use its repository cache.
++    # Archive checksums come from module pins.
++    for provider in providers.values():
++        source = provider["source"]
++        version = provider["version"]
++        name = source.split("/")[1]
++        platform = "{}_{}".format(ctx.attr.os, ctx.attr.arch)
++        key = "{}:{}/{}".format(source, version, platform)
++        sha256 = ctx.attr.mirror_sha256.get(key)
++        if not sha256:
++            fail("missing provider archive checksum for {}".format(key))
++        filename = "terraform-provider-{}_{}_{}.zip".format(name, version, platform)
++        ctx.download(
++            url = "https://github.com/opentofu/terraform-provider-{}/releases/download/v{}/{}".format(name, version, filename),
++            sha256 = sha256,
++            output = "mirror/registry.opentofu.org/{}/{}".format(source, filename),
++        )
  
      return
  
-@@ -87,6 +90,9 @@
+@@ -87,6 +89,7 @@
          "os": attr.string(mandatory = True),
          "arch": attr.string(mandatory = True),
          "mirror": attr.string_dict(mandatory = True),
-+        # A cold mirror downloads every provider (~155 MB for hashicorp/aws per platform): one hour covers
-+        # links down to ~45 KB/s, where Bazel's 600 s execute default needs ~260 KB/s.
-+        "mirror_timeout": attr.int(default = 3600, doc = "Seconds allowed for `tofu providers mirror`."),
++        "mirror_sha256": attr.string_dict(mandatory = True),
+     },
+ )
+ 
+diff --git a/tf/extensions.bzl b/tf/extensions.bzl
+--- a/tf/extensions.bzl
++++ b/tf/extensions.bzl
+@@ -86,6 +86,7 @@
+                     os = host_detected_os,
+                     arch = host_detected_arch,
+                     mirror = version_tag.mirror,
++                    mirror_sha256 = version_tag.mirror_sha256,
+                 )
+                 tofu_toolchains += [tf_repo_name]
+             else:
+@@ -115,6 +116,7 @@
+         "tflint_version": attr.string(default = TFLINT_VERSION),
+         "tfdoc_version": attr.string(default = TFDOC_VERSION),
+         "mirror": attr.string_dict(mandatory = True),
++        "mirror_sha256": attr.string_dict(default = {}),
      },
  )
  

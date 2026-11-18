@@ -8,9 +8,9 @@ use std::time::Duration;
 use gang_authn::{Token, TokenConfig};
 use gang_clock::Timestamp;
 use gang_spi::{
-    Authenticated, AuthenticationPort, Capabilities, CertificateIssue, CertificateTarget,
-    ClientCertificates, CredentialLifecyclePort, IssuedToken, Peer, Plugin, PluginContext,
-    PortError, Rejection, Scheme, Subject, TokenIssue,
+    Authenticated, AuthenticationHost, AuthenticationPort, Capabilities, CertificateIssue,
+    CertificateTarget, ClientCertificates, CredentialLifecyclePort, IssuedToken, Peer, Plugin,
+    PluginContext, PortError, Rejection, Scheme, Subject, TokenIssue,
 };
 use gang_types::{CertificateRequestPem, Identity, Proof, ProviderName};
 use http::HeaderMap;
@@ -117,6 +117,7 @@ async fn issue_session(
                 provider: &provider,
                 proof: &proof,
             },
+            host.now() + Duration::from_mins(10),
         )
         .await
 }
@@ -516,7 +517,7 @@ async fn a_session_token_authenticates_as_a_session_cookie() {
         * 1000;
     let expected = Authenticated {
         identity: Arc::new(identity(PROVIDER, ALICE)),
-        valid_until: Some(Timestamp::from_unix_millis(expires_at) + Duration::from_secs(5)),
+        valid_until: Some(Timestamp::from_unix_millis(expires_at)),
     };
     assert_eq!(found, Some(expected));
 }
@@ -658,4 +659,48 @@ async fn session_for_a_provider_known_to_host_but_not_to_plugin_is_not_found() {
         result,
         Err(PortError::NotFound(Subject::Provider(name))) if name.to_string() == "other-idp"
     ));
+}
+
+/// Issues Alice a session that must expire by `deadline`.
+async fn alice_session_until(
+    plugin: &Token,
+    host: &TestHost,
+    deadline: Timestamp,
+) -> Result<IssuedToken, PortError> {
+    let provider = ProviderName::try_new(PROVIDER).expect("test provider is a valid name");
+    let proof = Proof::new(ALICE_PROOF);
+    plugin
+        .issue_session(
+            host,
+            &TokenIssue {
+                provider: &provider,
+                proof: &proof,
+            },
+            deadline,
+        )
+        .await
+}
+
+#[tokio::test]
+async fn a_session_with_less_than_a_whole_second_left_is_refused() {
+    let host = host();
+    let plugin = plugin(r#"{"providers": ["example-idp"]}"#);
+    let exactly_one = alice_session_until(&plugin, &host, start() + Duration::from_secs(1))
+        .await
+        .expect("a whole second before the deadline is issued");
+    assert_eq!(exactly_one.expires_in, Duration::from_secs(1));
+
+    // Half a second before a whole-second deadline: a cookie would carry `Max-Age=0`.
+    host.advance(Duration::from_millis(500));
+    let result = alice_session_until(&plugin, &host, start() + Duration::from_secs(1)).await;
+    assert!(
+        matches!(
+            result,
+            Err(PortError::Rejected {
+                reason: Rejection::InvalidProof,
+                ..
+            })
+        ),
+        "a session with under a second left must not be issued, got {result:?}"
+    );
 }

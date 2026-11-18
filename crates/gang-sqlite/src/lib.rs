@@ -1,6 +1,6 @@
 //! `SQLite`-backed state for Gang: the certificate ledger and the scaling audit log.
 //!
-//! The store opens its database lazily, on first use, so building a plugin never touches disk.
+//! The plugin locks its database at build time and opens it lazily on first use.
 //!
 //! Each store drives its database on a dedicated thread, so statements never block async workers.
 //!
@@ -14,13 +14,19 @@
 //! assert_eq!(config.synchronous, Synchronous::Normal);
 //! ```
 
+#![forbid(unsafe_code)]
+#![deny(missing_docs)]
+
 mod codec;
 mod config;
 mod errors;
+mod expiring;
+mod lease;
 mod migrations;
 mod repository;
 mod store;
 
 pub use config::{JournalMode, SqliteConfig, Synchronous};
 pub use errors::SqliteError;
+pub use migrations::SCHEMA_VERSION;
 pub use store::Sqlite;

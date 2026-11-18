@@ -11,7 +11,7 @@ Status: Accepted
   - `gang-bwrap` (Linux) runs `bwrap` with all namespaces unshared, `--clearenv`, read-only binds, the action directory bound read-write with the command in its working directory, and the CAS directory and other actions' directories invisible. With the network namespace unshared the action reaches neither IMDS nor the controller.
   - `gang-noop` runs the action directly with an isolated `TMPDIR`, for macOS Local Mode and environments where the pod or job already isolates.
 - **Network** is shared only when the action's `network = requested` (exported as `GANG_NETWORK`) and `permit_network_property = true` on `gang-bwrap` are both set; `gang-noop` ignores it.
-- **`gang exec` is the boundary Gang owns.** It is NativeLink's worker `entrypoint`, reached by argv0 multicall through the `gang-exec` link. Its order is fixed: read the sandbox file, apply `input_links`, enter the limits scope, run the action, leave the scope, exit. `Exited(c)` exits `c` and `Signaled(n)` exits `128 + n`.
+- **`gang exec` is the boundary Gang owns.** It is NativeLink's worker `entrypoint`, reached by argv0 multicall through the `gang-exec` link. Its order is fixed: read the sandbox file, apply `input_links`, enter the limits scope, run the action, leave the scope, exit. `Exited(c)` exits `c` and `Signaled(n)` exits `128 + n`. Termination ownership is recorded in ADR-54.
 - **The sandbox file** written by `gang worker` beside the link is the only configuration `gang exec` reads. The environment is untrusted; a working directory outside the recorded work root is rejected.
 
 ## Consequences

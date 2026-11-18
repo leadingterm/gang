@@ -2,12 +2,12 @@
 
 use std::io;
 
+use futures::{FutureExt, Stream, StreamExt};
 use gang_config::InputLinks;
 use gang_spi::{
     ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, ActionLimits,
     ActionLimitsPort, ActionScope, ActionUsage, SandboxedAction, Termination,
 };
-use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::{ExecError, break_hard_links};
 
@@ -42,19 +42,26 @@ pub struct Action<'a> {
 ///   also returned when the action succeeded but the scope cannot be left.
 /// - [`ExecError::Sandbox`] when the sandbox cannot start the action or the action fails.
 /// - [`ExecError::LeaveActionGroup`] when `leave_action_group` fails; the action is dropped.
+/// - [`ExecError::Signals`] when a termination signal cannot be read.
 pub async fn execute<S: ActionIsolationPort, L: ActionLimitsPort>(
     sandbox: &S,
     limits: Option<&L>,
     input_links: InputLinks,
     action: &Action<'_>,
-    terminations: &mut UnboundedReceiver<Termination>,
+    terminations: &mut (impl Stream<Item = io::Result<Termination>> + Unpin),
     leave_action_group: impl FnOnce() -> io::Result<()>,
 ) -> Result<ActionExecutionOutcome, ExecError> {
     if matches!(input_links, InputLinks::Break) {
         break_hard_links(action.spec.action_directory)?;
     }
     let Some(port) = limits else {
-        if let Ok(termination) = terminations.try_recv() {
+        if let Some(termination) = terminations
+            .next()
+            .now_or_never()
+            .flatten()
+            .transpose()
+            .map_err(ExecError::Signals)?
+        {
             return Ok(ActionExecutionOutcome::Signaled(termination.signal()));
         }
         let mut running = sandbox
@@ -72,17 +79,21 @@ pub async fn execute<S: ActionIsolationPort, L: ActionLimitsPort>(
         launcher: scope.launcher(),
         ..action.spec
     };
-    let outcome = if let Ok(termination) = terminations.try_recv() {
-        Ok(ActionExecutionOutcome::Signaled(termination.signal()))
-    } else {
-        match sandbox.start(&spec).await {
-            Ok(mut running) => match leave_if_shared(&running, leave_action_group) {
-                Ok(()) => wait_relaying(&mut running, terminations).await,
-                Err(error) => Err(error),
-            },
-            Err(error) => Err(ExecError::Sandbox(error)),
+    let outcome = async {
+        if let Some(termination) = terminations
+            .next()
+            .now_or_never()
+            .flatten()
+            .transpose()
+            .map_err(ExecError::Signals)?
+        {
+            return Ok(ActionExecutionOutcome::Signaled(termination.signal()));
         }
-    };
+        let mut running = sandbox.start(&spec).await.map_err(ExecError::Sandbox)?;
+        leave_if_shared(&running, leave_action_group)?;
+        wait_relaying(&mut running, terminations).await
+    }
+    .await;
     let usage = port.leave(scope).await;
     match (outcome, usage) {
         (Ok(outcome), Ok(usage)) => {
@@ -105,13 +116,15 @@ pub async fn execute<S: ActionIsolationPort, L: ActionLimitsPort>(
 /// action. The wait is kept across relays, so it resumes where it left off.
 async fn wait_relaying(
     running: &mut SandboxedAction,
-    terminations: &mut UnboundedReceiver<Termination>,
+    terminations: &mut (impl Stream<Item = io::Result<Termination>> + Unpin),
 ) -> Result<ActionExecutionOutcome, ExecError> {
     loop {
         tokio::select! {
             outcome = running.wait() => return outcome.map_err(ExecError::Sandbox),
-            Some(termination) = terminations.recv() => {
-                running.relay(termination).map_err(ExecError::Sandbox)?;
+            Some(request) = terminations.next() => {
+                running
+                    .relay(request.map_err(ExecError::Signals)?)
+                    .map_err(ExecError::Sandbox)?;
             }
         }
     }

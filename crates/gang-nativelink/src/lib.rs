@@ -30,6 +30,9 @@ mod errors;
 mod fitted;
 mod gate;
 mod globals;
+mod handoff;
+#[cfg(test)]
+mod handoff_tests;
 mod observer;
 mod observing;
 mod open_file_limit;

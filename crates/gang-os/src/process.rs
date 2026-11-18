@@ -206,8 +206,9 @@ pub struct RunOutput {
 /// The runner replaces the command's standard streams. It writes `stdin`, if supplied, then
 /// closes the pipe; otherwise standard input is null. A broken pipe during input is accepted.
 /// Standard output exceeding `limit` fails the run. Standard error is truncated to `limit`
-/// while the remainder is drained. Input, both output streams and waiting run concurrently.
-/// A non-zero exit status is returned normally.
+/// while the remainder is drained. Input and both output streams run concurrently. The leader
+/// is reaped only after pipe work finishes, so cancellation cannot signal a reused process-group
+/// ID. A non-zero exit status is returned normally.
 ///
 /// Dropping this future kills the child's entire process group. To impose a timeout, compose
 /// it at the call site as `clock.timeout(duration, run_bounded(..)).await` using
@@ -281,9 +282,9 @@ pub async fn run_bounded(
             .map_err(io_error)?;
         Ok(output)
     };
-    let wait = async { child.wait().await.map_err(io_error) };
-    let ((), stdout, stderr, status) =
-        tokio::try_join!(write_input, read_stdout, read_stderr, wait)?;
+    // Keep the leader unreaped while pipe work can be canceled so its process-group ID cannot be reused.
+    let ((), stdout, stderr) = tokio::try_join!(write_input, read_stdout, read_stderr)?;
+    let status = child.wait().await.map_err(io_error)?;
     if let Some(group) = group {
         group.disarm();
     }
@@ -307,6 +308,33 @@ pub async fn run_bounded(
 /// Returns [`SpawnError::Log`] if the log cannot be opened or duplicated, and
 /// [`SpawnError::Spawn`] if the program cannot be started.
 pub fn spawn_logged(command: &mut Command, stdin: Stdio, log: &Path) -> Result<Child, SpawnError> {
+    spawn_logged_inner(command, stdin, log, false)
+}
+
+/// Starts `command` in its own process group, with stderr appended to `log` and stdout piped.
+///
+/// The log, stdin, environment and process-group behavior are the same as [`spawn_logged`].
+/// The caller owns the stdout pipe and must consume it, including any readiness protocol the
+/// child uses, so the child cannot block on a full pipe.
+///
+/// # Errors
+///
+/// Returns [`SpawnError::Log`] if the log cannot be opened, and [`SpawnError::Spawn`] if the
+/// program cannot be started.
+pub fn spawn_logged_piped(
+    command: &mut Command,
+    stdin: Stdio,
+    log: &Path,
+) -> Result<Child, SpawnError> {
+    spawn_logged_inner(command, stdin, log, true)
+}
+
+fn spawn_logged_inner(
+    command: &mut Command,
+    stdin: Stdio,
+    log: &Path,
+    pipe_stdout: bool,
+) -> Result<Child, SpawnError> {
     let file = rustix::fs::open(
         log,
         OFlags::WRONLY | OFlags::CREATE | OFlags::APPEND | OFlags::CLOEXEC,
@@ -314,7 +342,11 @@ pub fn spawn_logged(command: &mut Command, stdin: Stdio, log: &Path) -> Result<C
     )
     .map(File::from)
     .map_err(|errno| PathIo::new("open log file", log, errno.into()))?;
-    let stderr = file.try_clone().map_err(PathIo::at("open log file", log))?;
+    let stdout = if pipe_stdout {
+        Stdio::piped()
+    } else {
+        Stdio::from(file.try_clone().map_err(PathIo::at("open log file", log))?)
+    };
     // The log is a file: a forced colour request of the caller must not put escape codes in it.
     // Applied after any env the caller configured, so it also wins over them.
     // Own process group: the child survives the caller's terminal and receives only the caller's
@@ -322,8 +354,8 @@ pub fn spawn_logged(command: &mut Command, stdin: Stdio, log: &Path) -> Result<C
     command
         .env_remove("CLICOLOR_FORCE")
         .stdin(stdin)
-        .stdout(file)
-        .stderr(stderr)
+        .stdout(stdout)
+        .stderr(file)
         .process_group(0)
         .spawn()
         .map_err(|source| SpawnError::Spawn {
@@ -346,12 +378,74 @@ fn tolerate_gone(result: Result<(), Errno>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PipeReader;
     use gang_testkit::ChildTest;
     use std::error::Error;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::os::unix::process::ExitStatusExt;
+
+    #[tokio::test]
+    async fn pipe_reader_reads_one_byte() -> Result<(), Box<dyn Error>> {
+        let (reader, mut writer) = std::io::pipe()?;
+        writer.write_all(b"ready")?;
+        let reader = PipeReader::new(reader.into())?;
+        let mut byte = [0; 1];
+        assert_eq!(reader.read(&mut byte).await?, 1);
+        assert_eq!(byte, *b"r");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pipe_reader_reports_eof() -> Result<(), Box<dyn Error>> {
+        let (reader, writer) = std::io::pipe()?;
+        drop(writer);
+        let reader = PipeReader::new(reader.into())?;
+        assert_eq!(reader.read(&mut [0; 1]).await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelling_owned_pipe_reader_closes_reader() -> Result<(), Box<dyn Error>> {
+        use std::task::{Context, Poll, Waker};
+
+        let (reader, mut writer) = std::io::pipe()?;
+        let mut future = Box::pin(async move {
+            let reader = PipeReader::new(reader.into())?;
+            reader.read(&mut [0; 1]).await
+        });
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+        drop(future);
+        assert_eq!(
+            writer.write_all(b"x").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pipe_reader_retains_remaining_payload() -> Result<(), Box<dyn Error>> {
+        let (reader, mut writer) = std::io::pipe()?;
+        writer.write_all(b"Rpayload")?;
+        drop(writer);
+        let reader = PipeReader::new(reader.into())?;
+        assert_eq!(reader.read(&mut []).await?, 0);
+        let mut marker = [0; 1];
+        assert_eq!(reader.read(&mut marker).await?, 1);
+        assert_eq!(marker, *b"R");
+        let mut payload = [0; 7];
+        let mut received = 0;
+        while received < payload.len() {
+            let count = reader.read(&mut payload[received..]).await?;
+            assert_ne!(count, 0, "unexpected EOF in payload");
+            received += count;
+        }
+        assert_eq!(&payload, b"payload");
+        assert_eq!(reader.read(&mut marker).await?, 0);
+        Ok(())
+    }
 
     #[cfg(target_os = "linux")]
     const EXITING_PARENT: ChildTest = ChildTest::new("process::tests::exiting_parent");
@@ -557,6 +651,28 @@ mod tests {
                 io::copy(&mut io::stdin(), &mut io::sink())?;
                 drop(socket);
             }
+            #[cfg(target_os = "linux")]
+            "retained-leader" => {
+                let mut socket =
+                    UnixStream::connect(std::env::var_os(SOCKET_ENV).ok_or("missing socket")?)?;
+                writeln!(socket, "{}", std::process::id())?;
+                // Invoke the declared test binary so the holder uses the same test fixture.
+                BOUNDED_CHILD
+                    .command()?
+                    .env(CHILD_ENV, "detached-pipe-holder")
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .spawn()?;
+                socket.read_exact(&mut [0; 1])?;
+            }
+            #[cfg(target_os = "linux")]
+            "detached-pipe-holder" => {
+                rustix::process::setsid()?;
+                let mut socket =
+                    UnixStream::connect(std::env::var_os(SOCKET_ENV).ok_or("missing socket")?)?;
+                writeln!(socket, "holder-ready")?;
+                io::copy(&mut socket, &mut io::sink())?;
+            }
             _ => return Err("unexpected helper mode".into()),
         }
         BOUNDED_CHILD.complete();
@@ -710,6 +826,92 @@ mod tests {
         assert!(
             matches!(error, Err(RunError::Spawn { program, source }) if program == path && source.kind() == io::ErrorKind::NotFound)
         );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_run_retains_leader_until_pipes_close() -> Result<(), Box<dyn Error>> {
+        use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+        use std::future::Future;
+        use std::task::Poll;
+        use std::time::Duration;
+
+        let _spawn = gang_testkit::fork_gate::spawner();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("retained-leader.sock");
+        let listener = UnixListener::bind(&path)?;
+        let result = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_mins(1), async {
+                let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                tokio::task::spawn_blocking(move || {
+                    let ready = (|| -> io::Result<_> {
+                        let (leader, _) = listener.accept()?;
+                        let (holder, _) = listener.accept()?;
+                        let mut leader = BufReader::new(leader);
+                        let mut holder = BufReader::new(holder);
+                        let mut pid = String::new();
+                        let mut readiness = String::new();
+                        leader.read_line(&mut pid)?;
+                        holder.read_line(&mut readiness)?;
+                        let pid = pid
+                            .trim()
+                            .parse()
+                            .ok()
+                            .and_then(Pid::from_raw)
+                            .ok_or_else(|| {
+                                io::Error::new(io::ErrorKind::InvalidData, "invalid leader PID")
+                            })?;
+                        if readiness != "holder-ready\n" {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "holder not ready",
+                            ));
+                        }
+                        Ok((leader.into_inner(), holder.into_inner(), pid))
+                    })();
+                    let _ = ready_tx.send(ready);
+                });
+                let mut command = bounded_command("retained-leader")?;
+                command.env(SOCKET_ENV, &path);
+                let mut run = Box::pin(run_bounded(&mut command, None, byte_limit(4096)?));
+                let (mut leader, holder, pid) = tokio::select! {
+                    result = &mut run => return Err(format!("runner ended before helpers were ready: {result:?}").into()),
+                    ready = ready_rx => ready??,
+                };
+                leader.write_all(&[1])?;
+                let status = tokio::task::spawn_blocking(move || {
+                    waitid(WaitId::Pid(pid), WaitIdOptions::EXITED | WaitIdOptions::NOWAIT)
+                })
+                .await??;
+                assert_eq!(status.and_then(|status| status.exit_status()), Some(0));
+                let pending =
+                    std::future::poll_fn(|cx| Poll::Ready(run.as_mut().poll(cx).is_pending()))
+                        .await;
+                assert!(pending, "runner completed while the holder had the pipes open");
+                let status = waitid(
+                    WaitId::Pid(pid),
+                    WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+                )?;
+                assert_eq!(status.and_then(|status| status.exit_status()), Some(0));
+                drop(holder);
+                let output = run.await?;
+                assert!(output.status.success());
+                assert!(BOUNDED_CHILD.completed_in(std::str::from_utf8(&output.stdout)?));
+                Ok::<(), Box<dyn Error>>(())
+            })
+            .await
+        });
+        if !matches!(&result, Ok(Ok(()))) {
+            // Unblock either pending accept if the test ends before readiness.
+            for _ in 0..2 {
+                let _ = UnixStream::connect(&path);
+            }
+        }
+        result??;
         Ok(())
     }
 

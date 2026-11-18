@@ -4,12 +4,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD_NO_PAD;
 use bytes::Bytes;
 use gang_types::Url;
 use h2::client::{self, ResponseFuture, SendRequest};
 use h2::{Ping, PingPong, SendStream};
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use http::{HeaderMap, Method, Request, Version};
+use nativelink_proto::build::bazel::remote::execution::v2::{
+    GetActionResultRequest, RequestMetadata,
+};
+use prost::Message;
 use rustls_pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -22,6 +28,8 @@ use crate::identity::{Admission, Channel, ChannelEvent, Reply};
 
 /// The REAPI Capabilities method, which every authenticated client may call.
 const CAPABILITIES_PATH: &str = "/build.bazel.remote.execution.v2.Capabilities/GetCapabilities";
+const ACTION_RESULT_PATH: &str = "/build.bazel.remote.execution.v2.ActionCache/GetActionResult";
+const REQUEST_METADATA_HEADER: &str = "build.bazel.remote.execution.v2.requestmetadata-bin";
 
 /// An empty gRPC message: no compression flag and a zero length.
 const EMPTY_MESSAGE: [u8; 5] = [0; 5];
@@ -161,6 +169,44 @@ impl H2Channel {
             token: token.map(str::to_owned),
         })
     }
+
+    /// Sends one `ActionCache` request and returns its actual gRPC status, if present.
+    pub(crate) fn get_action_result(
+        &mut self,
+        request: &GetActionResultRequest,
+        metadata: &RequestMetadata,
+        timeout: Duration,
+    ) -> Result<Option<u32>> {
+        let capabilities = Url::parse(&self.capabilities)
+            .map_err(E2eError::system_from("parsing the Capabilities URL"))?;
+        let uri = capabilities
+            .join(ACTION_RESULT_PATH)
+            .map_err(E2eError::system_from("joining the ActionCache path"))?
+            .to_string();
+        let encoded_len = request.encoded_len();
+        let length = u32::try_from(encoded_len).map_err(E2eError::system_from(
+            "encoding the ActionCache request length",
+        ))?;
+        let mut frame = Vec::with_capacity(5 + encoded_len);
+        frame.push(0);
+        frame.extend_from_slice(&length.to_be_bytes());
+        request
+            .encode(&mut frame)
+            .map_err(E2eError::system_from("encoding the ActionCache request"))?;
+        let metadata = STANDARD_NO_PAD.encode(metadata.encode_to_vec());
+        let sender = self.sender.clone();
+        let token = self.token.as_deref();
+        self.runtime.block_on(async {
+            tokio::time::timeout(timeout, async {
+                let exchange = Exchange::open(sender, &uri, token, Some(&metadata))
+                    .await?
+                    .ok_or_else(|| E2eError::system("opening the ActionCache request failed"))?;
+                exchange.finish(Bytes::from(frame)).await
+            })
+            .await
+            .map_err(|_| E2eError::timeout("requesting an ActionCache result", timeout))?
+        })
+    }
 }
 
 impl Channel for H2Channel {
@@ -229,6 +275,7 @@ impl Exchange {
         sender: SendRequest<Bytes>,
         uri: &str,
         token: Option<&str>,
+        metadata: Option<&str>,
     ) -> Result<Option<Self>> {
         let Ok(mut sender) = sender.ready().await else {
             return Ok(None);
@@ -242,6 +289,9 @@ impl Exchange {
         if let Some(token) = token {
             builder = builder.header(AUTHORIZATION, format!("Bearer {token}"));
         }
+        if let Some(metadata) = metadata {
+            builder = builder.header(REQUEST_METADATA_HEADER, metadata);
+        }
         let request = builder
             .body(())
             .map_err(E2eError::system_from("building the request"))?;
@@ -251,32 +301,37 @@ impl Exchange {
         Ok(Some(Self { response, body }))
     }
 
-    /// Sends the request's empty message and classifies the server's answer by `grpc-status`.
-    /// The answer decides the reply, even when the server sent it before reading the body. A
-    /// connection that is gone has no answer, so it is [`Reply::Closed`].
-    async fn reply(mut self) -> Reply {
-        // A server may answer at the headers and then reset the unread stream with NO_ERROR
-        // (RFC 9113 §8.1), which fails this send: the answer, not the body, decides the reply.
-        let _ = self
-            .body
-            .send_data(Bytes::from_static(&EMPTY_MESSAGE), true);
-        let Ok(response) = self.response.await else {
-            return Reply::Closed;
-        };
+    /// Sends a frame and returns the status from the response headers or trailers.
+    async fn finish(mut self, message: Bytes) -> Result<Option<u32>> {
+        // An early response remains authoritative if the unread request body is reset.
+        let _ = self.body.send_data(message, true);
+        let response = self
+            .response
+            .await
+            .map_err(E2eError::system_from("receiving the gRPC response"))?;
         let (parts, mut body) = response.into_parts();
         if let Some(status) = grpc_status(&parts.headers) {
-            return classify(Some(status));
+            return Ok(Some(status));
         }
         while let Some(chunk) = body.data().await {
-            let Ok(chunk) = chunk else {
-                return Reply::Closed;
-            };
-            if body.flow_control().release_capacity(chunk.len()).is_err() {
-                return Reply::Closed;
-            }
+            let chunk = chunk.map_err(E2eError::system_from("reading the gRPC response body"))?;
+            body.flow_control()
+                .release_capacity(chunk.len())
+                .map_err(E2eError::system_from(
+                    "releasing response flow-control capacity",
+                ))?;
         }
-        match body.trailers().await {
-            Ok(trailers) => classify(trailers.as_ref().and_then(grpc_status)),
+        let trailers = body
+            .trailers()
+            .await
+            .map_err(E2eError::system_from("reading the gRPC response trailers"))?;
+        Ok(trailers.as_ref().and_then(grpc_status))
+    }
+
+    /// Classifies the response using the existing Capabilities semantics.
+    async fn reply(self) -> Reply {
+        match self.finish(Bytes::from_static(&EMPTY_MESSAGE)).await {
+            Ok(status) => classify(status),
             Err(_) => Reply::Closed,
         }
     }
@@ -289,7 +344,7 @@ async fn get_capabilities(
     uri: &str,
     token: Option<&str>,
 ) -> Result<Reply> {
-    Ok(match Exchange::open(sender, uri, token).await? {
+    Ok(match Exchange::open(sender, uri, token, None).await? {
         Some(exchange) => exchange.reply().await,
         None => Reply::Closed,
     })
@@ -315,10 +370,16 @@ mod tests {
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD_NO_PAD;
     use gang_clock::SystemClock;
     use gang_types::Url;
     use http::HeaderMap;
     use http::HeaderValue;
+    use nativelink_proto::build::bazel::remote::execution::v2::{
+        Digest, GetActionResultRequest, RequestMetadata,
+    };
+    use prost::Message;
     use tokio::io::DuplexStream;
     use tokio::runtime::{Builder, Runtime};
     use tokio::sync::oneshot;
@@ -331,6 +392,112 @@ mod tests {
     /// The Capabilities URI the test connections request.
     const CAPABILITIES: &str =
         "http://gang.test/build.bazel.remote.execution.v2.Capabilities/GetCapabilities";
+
+    fn action_result_roundtrip(status: Option<u32>) {
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("the test runtime starts");
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (close, close_rx) = oneshot::channel();
+        let server = runtime.spawn(async move {
+            let mut connection = h2::server::handshake(server_io)
+                .await
+                .expect("the server handshake succeeds");
+            let mut handlers = Vec::new();
+            let mut count = 0;
+            tokio::select! {
+                _ = close_rx => {}
+                () = async {
+                    while let Some(request) = connection.accept().await {
+                        let (request, mut respond) = request.expect("accepting the request succeeds");
+                        count += 1;
+                        assert_eq!(count, 1, "only one request is sent");
+                        handlers.push(tokio::spawn(async move {
+                            assert_eq!(request.method(), http::Method::POST);
+                            assert_eq!(request.uri().path(), super::ACTION_RESULT_PATH);
+                            assert_eq!(request.headers()["authorization"], "Bearer test-token");
+                            let metadata = STANDARD_NO_PAD
+                                .decode(request.headers()[super::REQUEST_METADATA_HEADER].as_bytes())
+                                .expect("metadata is unpadded base64");
+                            let metadata = RequestMetadata::decode(metadata.as_slice())
+                                .expect("metadata is protobuf");
+                            assert_eq!(metadata.tool_invocation_id, "controlled-invocation");
+                            let mut body = request.into_body();
+                            let mut frame = Vec::new();
+                            while let Some(chunk) = body.data().await {
+                                let chunk = chunk.expect("request data is readable");
+                                frame.extend_from_slice(&chunk);
+                                body.flow_control().release_capacity(chunk.len())
+                                    .expect("request flow control succeeds");
+                            }
+                            assert!(frame.len() >= 5);
+                            assert_eq!(frame[0], 0);
+                            let length = u32::from_be_bytes(frame[1..5].try_into().expect("length prefix"));
+                            assert_eq!(usize::try_from(length).expect("length fits"), frame.len() - 5);
+                            let request = GetActionResultRequest::decode(&frame[5..])
+                                .expect("request is protobuf");
+                            assert_eq!(request.instance_name, "test-instance");
+                            assert_eq!(request.digest_function, 1);
+                            let digest = request.action_digest.expect("digest is present");
+                            assert_eq!(digest.hash, "test-hash");
+                            assert_eq!(digest.size_bytes, 42);
+                            let response = http::Response::builder().status(200).body(())
+                                .expect("response is valid");
+                            let mut stream = respond.send_response(response, status.is_none())
+                                .expect("response headers are sent");
+                            if let Some(status) = status {
+                                let mut trailers = HeaderMap::new();
+                                trailers.insert("grpc-status", HeaderValue::from_str(&status.to_string())
+                                    .expect("status is a valid header"));
+                                stream.send_trailers(trailers).expect("trailers are sent");
+                            }
+                        }));
+                    }
+                } => {}
+            }
+            assert_eq!(count, 1);
+            for handler in handlers {
+                handler.await.expect("request handler succeeds");
+            }
+        });
+        let mut channel = H2Channel::establish(
+            runtime,
+            client_io,
+            CAPABILITIES.to_owned(),
+            Some("test-token"),
+            None,
+        )
+        .expect("the connection is established");
+        let request = GetActionResultRequest {
+            instance_name: "test-instance".to_owned(),
+            action_digest: Some(Digest {
+                hash: "test-hash".to_owned(),
+                size_bytes: 42,
+            }),
+            digest_function: 1,
+            ..Default::default()
+        };
+        let metadata = RequestMetadata {
+            tool_invocation_id: "controlled-invocation".to_owned(),
+            ..Default::default()
+        };
+        let result = channel.get_action_result(&request, &metadata, Duration::from_secs(5));
+        close.send(()).expect("server is open");
+        channel.runtime.block_on(server).expect("server succeeds");
+        assert_eq!(result.expect("request succeeds"), status);
+    }
+
+    #[test]
+    fn action_result_returns_numeric_trailer_status() {
+        action_result_roundtrip(Some(5));
+    }
+
+    #[test]
+    fn action_result_preserves_missing_status() {
+        action_result_roundtrip(None);
+    }
 
     #[test]
     fn silent_tls_peer_times_out() -> Result<(), Box<dyn std::error::Error>> {
@@ -471,7 +638,7 @@ mod tests {
         let mut pair = Pair::open();
         let sender = pair.channel.sender.clone();
         let reply = pair.channel.runtime.block_on(async move {
-            let mut exchange = Exchange::open(sender, CAPABILITIES, None)
+            let mut exchange = Exchange::open(sender, CAPABILITIES, None, None)
                 .await
                 .expect("the request is built")
                 .expect("the connection is open");

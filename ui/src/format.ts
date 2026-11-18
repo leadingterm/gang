@@ -1,6 +1,6 @@
 // Text formatting for the wire's units (durations, unix milliseconds, bytes), enum names and sums.
-import { seconds, type UnixMs } from "./wire-parse.ts";
-import type { Bytes, Duration } from "./wire.ts";
+import type { UnixMs } from "./wire-parse.ts";
+import type { Bytes } from "./wire.ts";
 
 const pad = (n: number): string => String(n).padStart(2, "0");
 
@@ -15,11 +15,6 @@ export const duration = (millis: number): string => {
   return `${Math.floor(h / 24)}d ${h % 24}h`;
 };
 
-/** A wire duration in whole minutes when exact: `10m`, `90s`. */
-export const policyDuration = (d: Duration): string => {
-  const s = Math.round(seconds(d));
-  return s % 60 === 0 ? `${s / 60}m` : `${s}s`;
-};
 
 /** `hh:mm:ss` in UTC. */
 export const clock = (t: UnixMs): string => new Date(t).toISOString().slice(11, 19);
@@ -33,10 +28,10 @@ const GIB = 1024 ** 3;
 /** Whole GiB. */
 export const gib = (bytes: Bytes): string => `${Math.round(bytes / GIB)} GiB`;
 
-/** The package and the name of a Bazel label, split at the last colon. */
-export const splitTarget = (target: string): readonly [pkg: string, name: string] => {
-  const i = target.lastIndexOf(":");
-  return i < 0 ? ["", target] : [target.slice(0, i), target.slice(i)];
+/** Splits at the last `:`, the part that tells similar identifiers apart (a Bazel target's name, an ARN's resource, an OIDC subject's ref); no head when there is no `:` or it leads. */
+export const splitTail = (text: string): readonly [head: string, tail: string] => {
+  const i = text.lastIndexOf(":");
+  return i <= 0 ? ["", text] : [text.slice(0, i), text.slice(i)];
 };
 
 /** The instance a worker id names, or the full id when it has no instance. */

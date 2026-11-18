@@ -166,6 +166,7 @@ impl ServerApi {
                 Err(ClientError::Server {
                     status: 401,
                     message: "proof rejected".to_owned(),
+                    retry_after: None,
                 })
             }
             other => other,
@@ -329,7 +330,8 @@ impl ServerApi {
             });
         }
         if !reply.status.is_success() {
-            if let Ok(envelope) = serde_json::from_slice::<ErrorResponse>(&reply.body) {
+            let envelope = serde_json::from_slice::<ErrorResponse>(&reply.body).ok();
+            if let Some(envelope) = &envelope {
                 match (reply.status, envelope.error.reason()) {
                     (StatusCode::BAD_REQUEST, Some(ErrorReason::AuthorizationPending)) => {
                         return Err(ClientError::AuthorizationPending);
@@ -345,9 +347,20 @@ impl ServerApi {
                     _ => {}
                 }
             }
+            // A 503 asks for a wait like a 429: its header first, else the envelope parsed above.
+            let retry_after = if reply.status == StatusCode::SERVICE_UNAVAILABLE {
+                retry_after_header(&reply.headers).or_else(|| {
+                    envelope
+                        .as_ref()
+                        .and_then(|envelope| envelope.error.retry_delay())
+                })
+            } else {
+                None
+            };
             return Err(ClientError::Server {
                 status: reply.status.as_u16(),
-                message: server_message(reply.status, &reply.body, self.max_error_chars),
+                message: server_message(envelope, reply.status, &reply.body, self.max_error_chars),
+                retry_after,
             });
         }
         let value = serde_json::from_slice(&reply.body).map_err(ClientError::Body)?;
@@ -438,10 +451,16 @@ fn envelope_retry_delay(body: &[u8]) -> Option<Duration> {
         .retry_delay()
 }
 
-/// The human-readable reason in a non-2xx body: the `message` of an [`ErrorResponse`] when the
-/// body is one, else the body text cut to `max_chars` characters, else the status reason.
-fn server_message(status: StatusCode, body: &[u8], max_chars: NonZeroUsize) -> String {
-    if let Ok(envelope) = serde_json::from_slice::<ErrorResponse>(body) {
+/// The human-readable reason of a non-2xx answer: the `message` of its parsed error `envelope`
+/// when it has one, else the `body` text cut to `max_chars` characters, else the status reason.
+/// The envelope is taken by value so its message moves out without a copy.
+fn server_message(
+    envelope: Option<ErrorResponse>,
+    status: StatusCode,
+    body: &[u8],
+    max_chars: NonZeroUsize,
+) -> String {
+    if let Some(envelope) = envelope {
         return envelope.error.message;
     }
     let text = String::from_utf8_lossy(body);
@@ -510,14 +529,14 @@ mod tests {
 
     #[test]
     fn error_envelope_yields_its_message() {
-        let body = serde_json::to_vec(&ErrorResponse::from(Status::new(
+        let envelope = ErrorResponse::from(Status::new(
             ErrorReason::ProofRejected,
             "proof rejected",
             [],
-        )))
-        .expect("error serializes");
+        ));
+        let body = serde_json::to_vec(&envelope).expect("error serializes");
         assert_eq!(
-            server_message(StatusCode::UNAUTHORIZED, &body, max_chars()),
+            server_message(Some(envelope), StatusCode::UNAUTHORIZED, &body, max_chars()),
             "proof rejected"
         );
     }
@@ -525,7 +544,12 @@ mod tests {
     #[test]
     fn plain_text_body_is_trimmed_and_used() {
         assert_eq!(
-            server_message(StatusCode::BAD_GATEWAY, b"  upstream down\n", max_chars()),
+            server_message(
+                None,
+                StatusCode::BAD_GATEWAY,
+                b"  upstream down\n",
+                max_chars()
+            ),
             "upstream down"
         );
     }
@@ -533,7 +557,7 @@ mod tests {
     #[test]
     fn empty_body_uses_the_status_reason() {
         assert_eq!(
-            server_message(StatusCode::NOT_FOUND, b"", max_chars()),
+            server_message(None, StatusCode::NOT_FOUND, b"", max_chars()),
             "Not Found"
         );
     }
@@ -542,7 +566,7 @@ mod tests {
     fn long_text_body_is_cut_at_the_configured_limit() {
         let limit = NonZeroUsize::new(5).expect("5 is non-zero");
 
-        let message = server_message(StatusCode::BAD_GATEWAY, b"abcdefgh", limit);
+        let message = server_message(None, StatusCode::BAD_GATEWAY, b"abcdefgh", limit);
 
         assert_eq!(message, "abcde...");
     }

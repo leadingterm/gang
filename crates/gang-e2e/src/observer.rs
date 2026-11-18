@@ -283,41 +283,7 @@ impl Execution for Observer {
     }
 
     fn await_gone(&self, pid: u32, timeout: Duration) -> Result<bool> {
-        #[cfg(target_os = "linux")]
-        {
-            use rustix::event::{PollFd, PollFlags, Timespec, poll};
-            use rustix::process::{Pid, PidfdFlags, pidfd_open};
-
-            let raw = i32::try_from(pid)
-                .map_err(|_| E2eError::system(format!("invalid process id {pid}")))?;
-            let target = Pid::from_raw(raw)
-                .ok_or_else(|| E2eError::system(format!("invalid process id {pid}")))?;
-            let fd = match pidfd_open(target, PidfdFlags::empty()) {
-                Ok(fd) => fd,
-                Err(rustix::io::Errno::SRCH) => return Ok(true),
-                Err(error) => {
-                    return Err(E2eError::system(format!(
-                        "opening pidfd for {pid}: {error}"
-                    )));
-                }
-            };
-            let timeout = Timespec {
-                tv_sec: i64::try_from(timeout.as_secs())
-                    .map_err(|_| E2eError::system("process wait timeout is too large"))?,
-                tv_nsec: timeout.subsec_nanos().into(),
-            };
-            let mut fds = [PollFd::new(&fd, PollFlags::IN)];
-            poll(&mut fds, Some(&timeout))
-                .map(|ready| ready != 0)
-                .map_err(|error| E2eError::system(format!("waiting for process {pid}: {error}")))
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (pid, timeout);
-            Err(E2eError::system(
-                "waiting for process exit using pidfd is Linux-only",
-            ))
-        }
+        process::await_gone(pid, timeout)
     }
 
     fn freeze(&self, cgroup: &Path, frozen: bool, timeout: Duration) -> Result<bool> {

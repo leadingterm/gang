@@ -51,7 +51,7 @@ class FakeEnvironment implements Environment {
   readonly responses = new Map<string, unknown>([[PATHS.getSession, defaultSession]]);
   readonly fetched: string[] = [];
   readonly posts: string[] = [];
-  readonly postResults: (number | Error)[] = [];
+  readonly postResults: (number | Error | Promise<number>)[] = [];
   clock = 1000;
   openStream(): StreamSource {
     const source = new FakeSource();
@@ -109,6 +109,23 @@ test("the fake environment cancels a pending entry, and nothing once it fired", 
   assert.deepEqual(ran, ["b"]);
 });
 
+test("a forbidden initial session is revoked and never retries", async () => {
+  const env = new FakeEnvironment();
+  env.responses.set(PATHS.getSession, new HttpError(403));
+  const client = new StateClient(env);
+  await client.start();
+  const initialLink = client.link.value.kind;
+  const requests = env.fetched.filter((path) => path === PATHS.getSession).length;
+  for (const entry of env.scheduled.filter((scheduled) => !scheduled.fired)) {
+    env.clock += entry.delay;
+    entry.run();
+  }
+  await flush();
+  assert.equal(initialLink, "revoked");
+  assert.equal(requests, 1);
+  assert.equal(env.fetched.filter((path) => path === PATHS.getSession).length, requests);
+});
+
 const live = async (): Promise<{ env: FakeEnvironment; client: StateClient }> => {
   const env = new FakeEnvironment();
   const client = new StateClient(env);
@@ -118,6 +135,12 @@ const live = async (): Promise<{ env: FakeEnvironment; client: StateClient }> =>
   assert.equal(client.link.value.kind, "live");
   assert.equal(client.state.value?.seq, snapshot.seq);
   return { env, client };
+};
+
+const loadedAccess = (client: StateClient) => {
+  const state = client.access.value;
+  assert.ok(state.kind === "loaded");
+  return state.data;
 };
 
 const LIST = `${PATHS.listBuilds}?pageSize=200`;
@@ -137,6 +160,17 @@ const buildOnly = async (over: Partial<Session> = {}): Promise<{ env: FakeEnviro
 
 const pendingRefreshes = (env: FakeEnvironment): Scheduled[] =>
   env.scheduled.filter((entry) => entry.delay === BUILDS_REFRESH_MS && !entry.fired);
+
+const probes = (env: FakeEnvironment): number => env.fetched.filter((path) => path === PATHS.getSession).length;
+
+/** The delays of every timer still pending. */
+const pendingDelays = (env: FakeEnvironment): number[] => env.scheduled.filter((entry) => !entry.fired).map((entry) => entry.delay);
+
+/** Answers a pending request: an `Error` rejects it, anything else is its body. */
+const settle = (pending: PromiseWithResolvers<unknown>, answer: unknown): void => {
+  if (answer instanceof Error) pending.reject(answer);
+  else pending.resolve(answer);
+};
 
 /** Fires the one scheduled builds refresh without waiting for it. */
 const startRefresh = (env: FakeEnvironment): void => {
@@ -487,10 +521,14 @@ test("a failed access load is retried for the same epoch", async () => {
   env.responses.set(REVOKED, { principals: [] });
   env.responses.set(PATHS.listRoles, new Error("offline"));
   await client.loadAccess();
-  assert.equal(client.access.value, null);
-  env.responses.set(PATHS.listRoles, { roles: [] });
-  await client.loadAccess();
-  assert.deepEqual(client.access.value, { principals: [], nextPageToken: undefined, revoked: [], roles: [] });
+  assert.equal(client.access.value.kind, "error");
+  const { promise, resolve } = Promise.withResolvers<unknown>();
+  env.responses.set(PATHS.listRoles, promise);
+  const retry = client.loadAccess();
+  assert.equal(client.access.value.kind, "loading");
+  resolve({ roles: [] });
+  await retry;
+  assert.deepEqual(loadedAccess(client), { principals: [], nextPageToken: undefined, revoked: [], roles: [] });
 });
 
 test("access loads every revoked principal and every role, and principals page by page", async () => {
@@ -511,15 +549,15 @@ test("access loads every revoked principal and every role, and principals page b
   env.responses.set(PATHS.listRoles, { roles: [{ name: "roles/viewer", permissions: [], principals: [] }], nextPageToken: "o2" });
   env.responses.set(`${PATHS.listRoles}?pageToken=o2`, { roles: [{ name: "roles/admin", permissions: [], principals: [] }] });
   await client.loadAccess();
-  assert.deepEqual(client.access.value?.revoked, [b, c]);
+  assert.deepEqual(loadedAccess(client).revoked, [b, c]);
   assert.deepEqual(
-    client.access.value?.roles.map((r) => r.name),
+    loadedAccess(client).roles.map((r) => r.name),
     ["roles/viewer", "roles/admin"],
   );
-  assert.equal(client.access.value?.nextPageToken, "p2");
+  assert.equal(loadedAccess(client).nextPageToken, "p2");
   await client.loadMorePrincipals();
-  assert.deepEqual(client.access.value?.principals, [a, b, c]);
-  assert.equal(client.access.value?.nextPageToken, undefined);
+  assert.deepEqual(loadedAccess(client).principals, [a, b, c]);
+  assert.equal(loadedAccess(client).nextPageToken, undefined);
 });
 
 test("an access answer for an epoch that moved on is dropped", async () => {
@@ -537,7 +575,7 @@ test("an access answer for an epoch that moved on is dropped", async () => {
   });
   resolve({ principals: [] });
   await loading;
-  assert.equal(client.access.value, null);
+  assert.equal(client.access.value.kind, "unloaded");
 });
 
 const principalRow = (name: string) => ({
@@ -547,6 +585,111 @@ const principalRow = (name: string) => ({
   createTime: snapshot.updateTime,
   lastSeenTime: snapshot.updateTime,
 });
+
+test("a failed access refresh keeps its observations and retry replaces them", async () => {
+  const { env, client } = await live();
+  const [a, b] = [principalRow("a"), principalRow("b")];
+  env.responses.set(PRINCIPALS, { principals: [a] });
+  env.responses.set(REVOKED, { principals: [] });
+  env.responses.set(PATHS.listRoles, { roles: [] });
+  await client.loadAccess();
+  const initial = client.access.value;
+  assert.ok(initial.kind === "loaded");
+  env.clock += 1000;
+  const { promise, reject } = Promise.withResolvers<unknown>();
+  env.responses.set(PATHS.listRoles, promise);
+  const refresh = client.loadAccess();
+  const refreshing = client.access.value;
+  assert.ok(refreshing.kind === "loaded" && refreshing.loading);
+  assert.deepEqual(loadedAccess(client).principals, [a]);
+  reject(new Error("offline"));
+  await refresh;
+  const failed = client.access.value;
+  assert.ok(failed.kind === "loaded" && failed.failing && !failed.loading);
+  assert.equal(failed.asOf, initial.asOf);
+  assert.deepEqual(loadedAccess(client).principals, [a]);
+  env.clock += 1000;
+  env.responses.set(PRINCIPALS, { principals: [b] });
+  env.responses.set(PATHS.listRoles, { roles: [] });
+  await client.loadAccess();
+  const retried = client.access.value;
+  assert.ok(retried.kind === "loaded" && !retried.failing && !retried.loading);
+  assert.equal(retried.asOf, client.serverNow());
+  assert.ok(retried.asOf > initial.asOf);
+  assert.deepEqual(loadedAccess(client).principals, [b]);
+});
+
+test("a superseded access answer cannot change a newer loading request", async () => {
+  const { env, client } = await live();
+  const old = Promise.withResolvers<unknown>();
+  const next = Promise.withResolvers<unknown>();
+  env.responses.set(REVOKED, { principals: [] });
+  env.responses.set(PATHS.listRoles, { roles: [] });
+  env.responses.set(PRINCIPALS, old.promise);
+  const first = client.loadAccess();
+  env.responses.set(PRINCIPALS, next.promise);
+  const second = client.loadAccess();
+  old.resolve({ principals: [principalRow("old")] });
+  await first;
+  assert.equal(client.access.value.kind, "loading");
+  next.resolve({ principals: [principalRow("new")] });
+  await second;
+  assert.deepEqual(loadedAccess(client).principals, [principalRow("new")]);
+});
+
+test("an obsolete refresh retains loaded observations and releases loading", async () => {
+  const { env, client } = await live();
+  const a = principalRow("a");
+  env.responses.set(PRINCIPALS, { principals: [a] });
+  env.responses.set(REVOKED, { principals: [] });
+  env.responses.set(PATHS.listRoles, { roles: [] });
+  await client.loadAccess();
+  const initial = client.access.value;
+  assert.ok(initial.kind === "loaded");
+  const pending = Promise.withResolvers<unknown>();
+  env.responses.set(PRINCIPALS, pending.promise);
+  const refresh = client.loadAccess();
+  env.source.emit("delta", {
+    seq: snapshot.seq + 1,
+    base: snapshot.seq,
+    updateTime: snapshot.updateTime,
+    principalsEpoch: snapshot.principalsEpoch + 1,
+  });
+  pending.resolve({ principals: [principalRow("obsolete")] });
+  await refresh;
+  const state = client.access.value;
+  assert.ok(state.kind === "loaded" && state.failing && !state.loading);
+  assert.equal(state.asOf, initial.asOf);
+  assert.deepEqual(loadedAccess(client).principals, [a]);
+});
+
+for (const withState of [true, false]) {
+  test(`access reload refreshes principals without an epoch change ${withState ? "with" : "without"} state.read`, async () => {
+    let env: FakeEnvironment;
+    let client: StateClient;
+    if (withState) {
+      ({ env, client } = await live());
+    } else {
+      env = new FakeEnvironment();
+      env.responses.set(PATHS.getSession, { ...defaultSession, permissions: ["principals.read"] });
+      client = new StateClient(env);
+      await client.start();
+    }
+    const epoch = client.state.value?.principalsEpoch;
+    const a = principalRow("a");
+    const updatedA = { ...a, lastSeenTime: iso(ms(a.lastSeenTime) + 1000) };
+    const b = principalRow("b");
+    env.responses.set(PRINCIPALS, { principals: [a] });
+    env.responses.set(REVOKED, { principals: [] });
+    env.responses.set(PATHS.listRoles, { roles: [] });
+    await client.loadAccess();
+    assert.deepEqual(loadedAccess(client).principals, [a]);
+    env.responses.set(PRINCIPALS, { principals: [updatedA, b] });
+    await client.loadAccess();
+    assert.equal(client.state.value?.principalsEpoch, epoch);
+    assert.deepEqual(loadedAccess(client).principals, [updatedA, b]);
+  });
+}
 
 test("a second request for more principals while the first is in flight does not append the page twice", async () => {
   const { env, client } = await live();
@@ -558,10 +701,11 @@ test("a second request for more principals while the first is in flight does not
   env.responses.set(`${PRINCIPALS}&pageToken=p2`, promise);
   await client.loadAccess();
   const first = client.loadMorePrincipals();
+  assert.ok(client.access.value.kind === "loaded" && client.access.value.moreLoading);
   const second = client.loadMorePrincipals();
   resolve({ principals: [b, c] });
   await Promise.all([first, second]);
-  assert.deepEqual(client.access.value?.principals, [a, b, c]);
+  assert.deepEqual(loadedAccess(client).principals, [a, b, c]);
   assert.equal(env.fetched.filter((path) => path === `${PRINCIPALS}&pageToken=p2`).length, 1);
 });
 
@@ -573,13 +717,15 @@ test("a failed request for more principals keeps the list and allows a retry", a
   env.responses.set(PATHS.listRoles, { roles: [] });
   env.responses.set(`${PRINCIPALS}&pageToken=p2`, new Error("offline"));
   await client.loadAccess();
-  const before = client.access.value;
   await client.loadMorePrincipals();
-  assert.equal(client.access.value, before);
+  assert.deepEqual(loadedAccess(client).principals, [a]);
+  assert.equal(loadedAccess(client).nextPageToken, "p2");
+  assert.ok(client.access.value.kind === "loaded" && client.access.value.moreFailed && !client.access.value.moreLoading);
   env.responses.set(`${PRINCIPALS}&pageToken=p2`, { principals: [b] });
   await client.loadMorePrincipals();
-  assert.deepEqual(client.access.value?.principals, [a, b]);
-  assert.equal(client.access.value?.nextPageToken, undefined);
+  assert.deepEqual(loadedAccess(client).principals, [a, b]);
+  assert.equal(loadedAccess(client).nextPageToken, undefined);
+  assert.ok(client.access.value.kind === "loaded" && !client.access.value.moreFailed);
 });
 
 test("more principals for an access list that was replaced are dropped", async () => {
@@ -598,11 +744,126 @@ test("more principals for an access list that was replaced are dropped", async (
     updateTime: snapshot.updateTime,
     principalsEpoch: snapshot.principalsEpoch + 1,
   });
-  env.responses.set(PRINCIPALS, { principals: [d] });
+  env.responses.set(PRINCIPALS, { principals: [d], nextPageToken: "p3" });
+  const next = Promise.withResolvers<unknown>();
+  env.responses.set(`${PRINCIPALS}&pageToken=p3`, next.promise);
   await client.loadAccess();
+  const newer = client.loadMorePrincipals();
   resolve({ principals: [b] });
   await loading;
-  assert.deepEqual(client.access.value?.principals, [d]);
+  assert.deepEqual(loadedAccess(client).principals, [d]);
+  assert.ok(client.access.value.kind === "loaded" && client.access.value.moreLoading);
+  next.resolve({ principals: [a] });
+  await newer;
+  assert.deepEqual(loadedAccess(client).principals, [d, a]);
+});
+
+test("a re-admission without principals.read drops loaded and in-flight access", async () => {
+  for (const [how, downgrade] of [
+    ["state.read only", { ...session, permissions: ["state.read"], ...EXPIRING }],
+    ["signed out", anonymous],
+  ] as const) {
+    for (const inFlight of [false, true]) {
+      const env = new FakeEnvironment();
+      env.responses.set(PATHS.getSession, { ...session, ...EXPIRING });
+      const client = new StateClient(env);
+      await client.start();
+      const answer = Promise.withResolvers<unknown>();
+      env.responses.set(PRINCIPALS, inFlight ? answer.promise : { principals: [principalRow("a")] });
+      env.responses.set(REVOKED, { principals: [] });
+      env.responses.set(PATHS.listRoles, { roles: [] });
+      const loading = client.loadAccess();
+      if (!inFlight) await loading;
+      env.responses.set(PATHS.getSession, downgrade);
+      await renew(env);
+      answer.resolve({ principals: [principalRow("a")] });
+      await loading;
+      assert.deepEqual(client.access.value, { kind: "unloaded" }, `${how}, in flight: ${inFlight}`);
+    }
+  }
+});
+
+test("a re-admission that keeps principals.read keeps the loaded access", async () => {
+  const env = new FakeEnvironment();
+  env.responses.set(PATHS.getSession, { ...session, ...EXPIRING });
+  const client = new StateClient(env);
+  await client.start();
+  env.responses.set(PRINCIPALS, { principals: [principalRow("a")] });
+  env.responses.set(REVOKED, { principals: [] });
+  env.responses.set(PATHS.listRoles, { roles: [] });
+  await client.loadAccess();
+  const loaded = client.access.value;
+  await renew(env);
+  assert.equal(client.access.value, loaded);
+});
+
+/** A session that may read access and nothing else: its link is forbidden, with nothing streamed or refreshed. */
+const accessOnly = async (): Promise<{ env: FakeEnvironment; client: StateClient }> => {
+  const env = new FakeEnvironment();
+  env.responses.set(PATHS.getSession, { ...defaultSession, permissions: ["principals.read"] });
+  const client = new StateClient(env);
+  await client.start();
+  assert.equal(client.link.value.kind, "forbidden");
+  env.responses.set(PRINCIPALS, { principals: [principalRow("a")], nextPageToken: "p2" });
+  env.responses.set(REVOKED, { principals: [] });
+  env.responses.set(PATHS.listRoles, { roles: [] });
+  return { env, client };
+};
+
+/** Has the first principals page, or the next one after a loaded first page, refused with `status`. */
+const refuseAccess = async (env: FakeEnvironment, client: StateClient, page: "first" | "more", status: number): Promise<void> => {
+  if (page === "first") {
+    env.responses.set(PRINCIPALS, new HttpError(status));
+    await client.loadAccess();
+  } else {
+    await client.loadAccess();
+    env.responses.set(`${PRINCIPALS}&pageToken=p2`, new HttpError(status));
+    await client.loadMorePrincipals();
+  }
+  await flush();
+};
+
+test("access refusals on a principals.read-only session classify revocation", async () => {
+  for (const page of ["first", "more"] as const) {
+    for (const status of [401, 403]) {
+      const { env, client } = await accessOnly();
+      env.responses.set(PATHS.getSession, new HttpError(403));
+      await refuseAccess(env, client, page, status);
+      assert.equal(client.link.value.kind, "revoked", `${page} ${status}`);
+    }
+  }
+});
+
+test("access refusals renew an expired principals.read-only session", async () => {
+  for (const page of ["first", "more"] as const) {
+    const { env, client } = await accessOnly();
+    env.responses.set(PATHS.getSession, { ...anonymous, login: session.login });
+    env.postResults.push(503);
+    await refuseAccess(env, client, page, 401);
+    assert.deepEqual(env.posts, [PATHS.renew], page);
+    assert.equal(client.link.value.kind, "forbidden", page);
+    assert.deepEqual(pendingDelays(env), [1000], page);
+  }
+});
+
+test("a re-admission after an access refusal reloads an errored or failing access", async () => {
+  for (const shown of ["error", "failing"] as const) {
+    const { env, client } = await accessOnly();
+    if (shown === "failing") await client.loadAccess();
+    const probe = Promise.withResolvers<unknown>();
+    env.responses.set(PATHS.getSession, probe.promise);
+    env.responses.set(PRINCIPALS, new HttpError(401));
+    await client.loadAccess();
+    const refusedAccess = client.access.value;
+    assert.ok(shown === "error" ? refusedAccess.kind === "error" : refusedAccess.kind === "loaded" && refusedAccess.failing, shown);
+    env.responses.set(PATHS.getSession, { ...defaultSession, permissions: ["principals.read"] });
+    env.responses.set(PRINCIPALS, { principals: [principalRow("b")] });
+    probe.resolve({ ...anonymous, login: session.login });
+    await flush();
+    assert.deepEqual(env.posts, [PATHS.renew], shown);
+    assert.deepEqual(loadedAccess(client).principals, [principalRow("b")], shown);
+    assert.ok(client.access.value.kind === "loaded" && !client.access.value.failing, shown);
+  }
 });
 
 test("shutdown retries after retryDelay, or backs off without it", async () => {
@@ -685,6 +946,92 @@ test("an empty earlier page retains events subsequently evicted from the stream"
   env.source.emit("delta", { seq: held.seq + 3, base: held.seq + 2, updateTime: held.updateTime, events: [event(14)] });
   assert.deepEqual(client.earlier.value, { kind: "loaded", events: [event(10), event(11)], next: undefined, loading: false });
   assert.deepEqual(seqs(client.state.value?.events), [12, 13, 14]);
+});
+
+test("earlier history overflow invalidates a pending page and reloads from the stream head", async () => {
+  const { env, client } = await live();
+  const base = snapshot.events[0];
+  assert.ok(base);
+  const event = (seq: number): ScalingEvent => eventAt(base, seq, t0);
+  const held: typeof snapshot = { ...snapshot, events: [event(10), event(11)], eventsLimit: 2 };
+  env.source.emit("snapshot", held);
+  const first = `${PATHS.listEvents}?pageSize=202`;
+  const next = `${PATHS.listEvents}?pageSize=200&pageToken=old-token`;
+  env.responses.set(first, { events: [event(11), event(10), event(9)], nextPageToken: "old-token" });
+  await client.loadEarlier();
+
+  // Keep the page exactly at the retention limit before starting the stale request.
+  for (let seq = 12; seq <= 5010; seq++) {
+    const frame = held.seq + seq - 11;
+    env.source.emit("delta", { seq: frame, base: frame - 1, updateTime: held.updateTime, events: [event(seq)] });
+  }
+  assert.equal(client.earlier.value.kind, "loaded");
+  if (client.earlier.value.kind === "loaded") {
+    assert.equal(client.earlier.value.events.length, 5000);
+    assert.equal(client.earlier.value.next, "old-token");
+  }
+  assert.deepEqual(seqs(client.state.value?.events), [5009, 5010]);
+
+  const pendingPage = Promise.withResolvers<unknown>();
+  env.responses.set(next, pendingPage.promise);
+  const pending = client.loadEarlier();
+  assert.equal(client.earlier.value.loading, true);
+  const finalFrame = held.seq + 5000;
+  env.source.emit("delta", { seq: finalFrame, base: finalFrame - 1, updateTime: held.updateTime, events: [event(5011)] });
+  assert.equal(client.earlier.value.kind, "unloaded");
+  assert.deepEqual(client.earlier.value, { kind: "unloaded", loading: false });
+
+  pendingPage.resolve({ events: [event(8)], nextPageToken: "stale-token" });
+  await pending;
+  assert.deepEqual(client.earlier.value, { kind: "unloaded", loading: false });
+  assert.deepEqual(seqs(client.state.value?.events), [5010, 5011]);
+
+  env.responses.set(first, {
+    events: Array.from({ length: 202 }, (_, i) => event(5011 - i)),
+    nextPageToken: "fresh-token",
+  });
+  await client.loadEarlier();
+  assert.deepEqual(client.earlier.value, {
+    kind: "loaded",
+    events: Array.from({ length: 200 }, (_, i) => event(4810 + i)),
+    next: "fresh-token",
+    loading: false,
+  });
+  assert.deepEqual(env.fetched.filter((path) => path.startsWith(PATHS.listEvents)), [first, next, first]);
+});
+
+test("loading earlier pages past the retention limit restarts from the stream head", async () => {
+  const { env, client } = await live();
+  const base = snapshot.events[0];
+  assert.ok(base);
+  const event = (seq: number): ScalingEvent => eventAt(base, seq, t0);
+  env.source.emit("snapshot", { ...snapshot, events: [event(6001), event(6002)] });
+  const first = `${PATHS.listEvents}?pageSize=202`;
+  const next = `${PATHS.listEvents}?pageSize=200&pageToken=next`;
+  env.responses.set(first, {
+    events: Array.from({ length: 202 }, (_, i) => event(6002 - i)),
+    nextPageToken: "next",
+  });
+  await client.loadEarlier();
+  for (let page = 1; page <= 25; page++) {
+    env.responses.set(next, {
+      events: Array.from({ length: 200 }, (_, i) => event(5800 - (page - 1) * 200 - i)),
+      nextPageToken: "next",
+    });
+    await client.loadEarlier();
+    if (page === 24) {
+      assert.equal(client.earlier.value.kind, "loaded");
+      if (client.earlier.value.kind === "loaded") assert.equal(client.earlier.value.events.length, 5000);
+    }
+  }
+  assert.deepEqual(client.earlier.value, { kind: "unloaded", loading: false });
+  await client.loadEarlier();
+  assert.equal(env.fetched.at(-1), first);
+  assert.equal(client.earlier.value.kind, "loaded");
+  if (client.earlier.value.kind === "loaded") {
+    assert.equal(client.earlier.value.events.length, 200);
+    assert.equal(client.earlier.value.next, "next");
+  }
 });
 
 test("a pending earlier page is discarded after a snapshot gap", async () => {
@@ -1147,7 +1494,7 @@ test("first-load build and list refusals renew an expired build-only session", a
   }
 });
 
-test("re-admission retries an errored open build and resets an errored first list page", async () => {
+test("re-admission retries an errored open build and an errored first list page", async () => {
   for (const resource of ["build", "list"] as const) {
     const { env, client } = await buildOnly();
     const id = idOf(build.name);
@@ -1166,11 +1513,113 @@ test("re-admission retries an errored open build and resets an errored first lis
     if (resource === "build") {
       assert.deepEqual(client.build.value, { kind: "loaded", id, build, asOf: 1000, failing: false });
     } else {
-      assert.deepEqual(client.earlierBuilds.value, { kind: "unloaded", loading: false });
-      await client.loadEarlierBuilds();
       assert.deepEqual(client.earlierBuilds.value, { kind: "loaded", builds: [build], next: undefined, loading: false, asOf: 1000, failing: false });
     }
   }
+});
+
+test("a refused first page of held builds is retried once per admission, not in a loop", async () => {
+  const { env, client } = await buildOnly();
+  env.responses.set(LIST, new HttpError(403));
+  await client.loadEarlierBuilds();
+  await flush();
+  assert.equal(env.fetched.filter((path) => path === LIST).length, 2);
+  assert.equal(probes(env), 2);
+  assert.deepEqual(client.earlierBuilds.value, { kind: "error", loading: false });
+  assert.equal(client.link.value.kind, "forbidden");
+  assert.equal(pendingRefreshes(env).length, 1);
+});
+
+test("a superseded or closed build load's refusal never reaches the session probe", async () => {
+  for (const how of ["superseded", "closed"] as const) {
+    const { env, client } = await buildOnly();
+    const id = idOf(build.name);
+    const answer = Promise.withResolvers<unknown>();
+    env.responses.set(pathOf(id), answer.promise);
+    env.responses.set(pathOf("other"), build);
+    const first = client.loadBuild(id);
+    if (how === "superseded") await client.loadBuild("other");
+    else client.closeBuild();
+    answer.reject(new HttpError(403));
+    await first;
+    await flush();
+    assert.equal(probes(env), 1, how);
+    assert.equal(client.link.value.kind, "forbidden", how);
+    assert.equal(pendingRefreshes(env).length, 1, how);
+    assert.deepEqual(client.build.value, how === "superseded" ? { kind: "loaded", id: "other", build, asOf: 1000, failing: false } : null, how);
+  }
+});
+
+test("a stopped client ignores the refusal of a request in flight", async () => {
+  for (const resource of ["build", "list"] as const) {
+    const { env, client } = await buildOnly();
+    const id = idOf(build.name);
+    const answer = Promise.withResolvers<unknown>();
+    env.responses.set(resource === "build" ? pathOf(id) : LIST, answer.promise);
+    const loading = resource === "build" ? client.loadBuild(id) : client.loadEarlierBuilds();
+    client.stop();
+    answer.reject(new HttpError(403));
+    await loading;
+    await flush();
+    assert.equal(probes(env), 1, resource);
+    assert.equal(pendingRefreshes(env).length, 0, resource);
+  }
+});
+
+test("a held-builds refresh superseded by loading the next page hands no refusal to the session", async () => {
+  const { env, client } = await buildOnly();
+  const [b1, b3] = ["b1", "b3"].map(named) as [Build, Build];
+  env.responses.set(LIST, { builds: [b1], nextPageToken: "tok" });
+  await client.loadEarlierBuilds();
+  const refresh = Promise.withResolvers<unknown>();
+  const page = Promise.withResolvers<unknown>();
+  env.responses.set(LIST, refresh.promise);
+  env.responses.set(`${LIST}&pageToken=tok`, page.promise);
+  startRefresh(env);
+  const loading = client.loadEarlierBuilds();
+  refresh.reject(new HttpError(403));
+  await flush();
+  page.resolve({ builds: [b3] });
+  await loading;
+  await flush();
+  assert.equal(probes(env), 1);
+  assert.deepEqual(client.earlierBuilds.value, { kind: "loaded", builds: [b1, b3], next: undefined, loading: false, asOf: 1000, failing: false });
+  assert.equal(pendingRefreshes(env).length, 1);
+});
+
+test("a refused build or list request on a streamed session never reopens the stream", async () => {
+  for (const resource of ["build", "list"] as const) {
+    const { env, client } = await live();
+    const id = idOf(build.name);
+    env.responses.set(resource === "build" ? pathOf(id) : LIST, new HttpError(403));
+    if (resource === "build") await client.loadBuild(id);
+    else await client.loadEarlierBuilds();
+    await flush();
+    assert.equal(env.sources.length, 1, resource);
+    assert.equal(probes(env), 1, resource);
+    assert.equal(client.link.value.kind, "live", resource);
+  }
+});
+
+test("a streamed renewal keeps the live or lost link and the loaded held builds until the new snapshot", async () => {
+  const env = new FakeEnvironment();
+  env.responses.set(PATHS.getSession, { ...session, ...EXPIRING });
+  const client = new StateClient(env);
+  await client.start();
+  env.source.emit("snapshot", snapshot);
+  env.responses.set(LIST, { builds: [build] });
+  await client.loadEarlierBuilds();
+  const loaded = client.earlierBuilds.value;
+  assert.equal(loaded.kind, "loaded");
+  await renew(env);
+  assert.equal(env.sources.length, 2);
+  assert.equal(client.link.value.kind, "live");
+  assert.equal(client.earlierBuilds.value, loaded);
+  env.source.emit("closed", { reason: "EXPIRED" });
+  await flush();
+  assert.equal(env.sources.length, 3);
+  assert.equal(client.link.value.kind, "lost");
+  assert.equal(client.earlierBuilds.value, loaded);
 });
 
 test("a newer first-load refusal supersedes an in-flight refusal probe", async () => {
@@ -1224,5 +1673,189 @@ test("a failed renewal after revocation never replaces the revoked link", async 
     env.postResults.push(503);
     await renew(env);
     assert.equal(client.link.value.kind, "revoked", source);
+  }
+});
+
+test("a client stopped while its session probe is pending does nothing more", async () => {
+  for (const [how, answer] of [
+    ["streamed", defaultSession],
+    ["expiring", { ...session, ...EXPIRING }],
+    ["offline", new Error("offline")],
+    ["revoked", new HttpError(403)],
+  ] as const) {
+    const env = new FakeEnvironment();
+    const probe = Promise.withResolvers<unknown>();
+    env.responses.set(PATHS.getSession, probe.promise);
+    const client = new StateClient(env);
+    const starting = client.start();
+    client.stop();
+    settle(probe, answer);
+    await starting;
+    await flush();
+    assert.equal(env.sources.length, 0, how);
+    assert.deepEqual(pendingDelays(env), [], how);
+    assert.deepEqual(client.link.value, { kind: "connecting" }, how);
+    assert.equal(client.session.value, null, how);
+  }
+});
+
+test("a client stopped while a failed stream is classified does nothing more", async () => {
+  for (const [how, answer] of [
+    ["still streamed", defaultSession],
+    ["expired", { ...anonymous, login: session.login }],
+    ["forbidden", { ...defaultSession, permissions: ["builds.read"] }],
+    ["offline", new Error("offline")],
+    ["revoked", new HttpError(403)],
+  ] as const) {
+    const { env, client } = await live();
+    const probe = Promise.withResolvers<unknown>();
+    env.responses.set(PATHS.getSession, probe.promise);
+    env.source.fail();
+    client.stop();
+    const link = client.link.value;
+    const state = client.state.value;
+    settle(probe, answer);
+    await flush();
+    assert.equal(client.link.value, link, how);
+    assert.equal(client.state.value, state, how);
+    assert.equal(env.sources.length, 1, how);
+    assert.deepEqual(env.posts, [], how);
+    assert.deepEqual(pendingDelays(env), [], how);
+  }
+});
+
+test("a client stopped while renewing does nothing more", async () => {
+  for (const status of [204, 401, 503]) {
+    const env = new FakeEnvironment();
+    env.responses.set(PATHS.getSession, { ...session, ...EXPIRING });
+    const client = new StateClient(env);
+    await client.start();
+    const answer = Promise.withResolvers<number>();
+    env.postResults.push(answer.promise);
+    await renew(env);
+    assert.deepEqual(env.posts, [PATHS.renew]);
+    client.stop();
+    const link = client.link.value;
+    answer.resolve(status);
+    await flush();
+    const how = String(status);
+    assert.equal(probes(env), 1, how);
+    assert.equal(env.sources.length, 1, how);
+    assert.deepEqual(env.navigations, [], how);
+    assert.deepEqual(pendingDelays(env), [], how);
+    assert.equal(client.link.value, link, how);
+  }
+});
+
+test("a client stopped while access and earlier events load keeps them as they were", async () => {
+  for (const outcome of ["answered", "failed"] as const) {
+    const { env, client } = await live();
+    const base = snapshot.events[0];
+    assert.ok(base);
+    const principals = Promise.withResolvers<unknown>();
+    const events = Promise.withResolvers<unknown>();
+    env.responses.set(PRINCIPALS, principals.promise);
+    env.responses.set(REVOKED, { principals: [] });
+    env.responses.set(PATHS.listRoles, { roles: [] });
+    env.responses.set(`${PATHS.listEvents}?pageSize=${snapshot.events.length + 200}`, events.promise);
+    const loading = Promise.all([client.loadAccess(), client.loadEarlier()]);
+    client.stop();
+    const access = client.access.value;
+    const earlier = client.earlier.value;
+    if (outcome === "answered") {
+      principals.resolve({ principals: [principalRow("a")] });
+      events.resolve({ events: [eventAt(base, Number(idOf(base.name)) - 1, t0)] });
+    } else {
+      principals.reject(new Error("offline"));
+      events.reject(new Error("offline"));
+    }
+    await loading;
+    assert.equal(client.access.value, access, `access ${outcome}`);
+    assert.equal(client.earlier.value, earlier, `earlier ${outcome}`);
+  }
+});
+
+test("a renewal requested while one is in flight joins it, so a late failure cannot undo its success", async () => {
+  for (const late of [429, 503]) {
+    const env = new FakeEnvironment();
+    env.responses.set(PATHS.getSession, { ...session, ...EXPIRING });
+    const client = new StateClient(env);
+    await client.start();
+    const first = Promise.withResolvers<number>();
+    const second = Promise.withResolvers<number>();
+    env.postResults.push(first.promise, second.promise);
+    await renew(env);
+    env.source.emit("closed", { reason: "EXPIRED" });
+    first.resolve(204);
+    await flush();
+    env.source.emit("snapshot", snapshot);
+    second.resolve(late);
+    await flush();
+    const how = String(late);
+    assert.deepEqual(env.posts, [PATHS.renew], how);
+    assert.equal(client.link.value.kind, "live", how);
+    assert.deepEqual(pendingDelays(env), [RENEWAL_MS], how);
+  }
+});
+
+test("a renewal left in flight by a stopped client neither blocks nor ends the restarted client's renewal", async () => {
+  const env = new FakeEnvironment();
+  env.responses.set(PATHS.getSession, { ...session, ...EXPIRING });
+  const client = new StateClient(env);
+  await client.start();
+  const old = Promise.withResolvers<number>();
+  const fresh = Promise.withResolvers<number>();
+  // A third renewal would be a duplicate: it fails, so it would also show as a retry.
+  env.postResults.push(old.promise, fresh.promise, 503);
+  await renew(env);
+  client.stop();
+  await client.start();
+  await renew(env);
+  assert.deepEqual(env.posts, [PATHS.renew, PATHS.renew]);
+  old.resolve(204);
+  await flush();
+  assert.equal(probes(env), 2);
+  assert.equal(env.sources.length, 2);
+  env.source.emit("closed", { reason: "EXPIRED" });
+  fresh.resolve(204);
+  await flush();
+  env.source.emit("snapshot", snapshot);
+  assert.deepEqual(env.posts, [PATHS.renew, PATHS.renew]);
+  assert.equal(probes(env), 3);
+  assert.equal(env.sources.length, 3);
+  assert.equal(client.link.value.kind, "live");
+  assert.deepEqual(env.navigations, []);
+  assert.deepEqual(pendingDelays(env), [RENEWAL_MS]);
+});
+
+test("an old renewal neither blocks nor ends a re-admitted client's renewal without stop", async () => {
+  for (const oldStatus of [204, 401, 503]) {
+    const env = new FakeEnvironment();
+    env.responses.set(PATHS.getSession, { ...session, ...EXPIRING });
+    const client = new StateClient(env);
+    await client.start();
+    const old = Promise.withResolvers<number>();
+    const fresh = Promise.withResolvers<number>();
+    env.postResults.push(old.promise, fresh.promise, 503);
+    await renew(env);
+    await client.start();
+    await renew(env);
+    const how = String(oldStatus);
+    assert.deepEqual(env.posts, [PATHS.renew, PATHS.renew], how);
+    old.resolve(oldStatus);
+    await flush();
+    assert.equal(probes(env), 2, how);
+    assert.equal(env.sources.length, 2, how);
+    assert.deepEqual(env.navigations, [], how);
+    env.source.emit("closed", { reason: "EXPIRED" });
+    fresh.resolve(204);
+    await flush();
+    env.source.emit("snapshot", snapshot);
+    assert.deepEqual(env.posts, [PATHS.renew, PATHS.renew], how);
+    assert.equal(probes(env), 3, how);
+    assert.equal(env.sources.length, 3, how);
+    assert.equal(client.link.value.kind, "live", how);
+    assert.deepEqual(env.navigations, [], how);
+    assert.deepEqual(pendingDelays(env), [RENEWAL_MS], how);
   }
 });

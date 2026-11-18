@@ -3,11 +3,15 @@
 use std::convert::Infallible;
 use std::sync::Arc;
 
+use futures::FutureExt;
 use gang_clock::Clock;
 use gang_config::BuildsConfig;
-use gang_insight::Builds;
-use gang_spi::{Delivery, ObservationSink, Observations};
+use gang_insight::{Builds, Outcome};
+use gang_spi::{CertificateSignerPort, Observation, ObservationSink, Observations};
 use parking_lot::Mutex;
+
+use crate::builds_forward::{Forwarding, Uplink};
+use crate::leadership::Leading;
 
 /// The builds held by the recorder and read by the API and publisher.
 #[derive(Clone)]
@@ -43,13 +47,101 @@ impl BuildsCell {
         clock: &C,
     ) -> Infallible {
         while let Some(delivery) = observations.next().await {
-            if let Delivery::Observation(observation) = delivery {
+            if let Some(observation) = delivery.into_observation() {
                 self.0.lock().observe(clock.wall(), &observation);
             }
             self.drain_lost(&observations, clock);
         }
         self.drain_lost(&observations, clock);
         std::future::pending().await
+    }
+
+    /// Forwards follower observations until promotion, then folds locally.
+    pub(crate) async fn record_or_forward<C: Clock, S: CertificateSignerPort, U: Uplink>(
+        &self,
+        mut observations: Observations,
+        clock: &C,
+        signer: &S,
+        leading: &Leading,
+        forwarding: Option<Forwarding<U>>,
+    ) -> Infallible {
+        let Some(mut forwarding) = forwarding else {
+            return self.record(observations, clock).await;
+        };
+        let mut first_pending = None;
+        let mut reachable = true;
+        while !leading.get() {
+            let wait = first_pending.map_or(forwarding.pause, |first| {
+                forwarding
+                    .pause
+                    .saturating_sub(clock.monotonic().saturating_duration_since(first))
+            });
+            let received = tokio::select! {
+                biased;
+                () = leading.wait() => break,
+                received = clock.timeout(wait, observations.next()) => received,
+            };
+            match received {
+                Ok(Some(delivery)) => {
+                    if let Some(observation) = delivery.into_observation() {
+                        forwarding.outbox.push(observation);
+                    }
+                }
+                Ok(None) => {
+                    leading.wait().await;
+                    break;
+                }
+                Err(_) => {}
+            }
+            let unattributed =
+                observations.take_lost(|key, count| forwarding.outbox.lose(key, count));
+            forwarding.outbox.lose_unattributed(unattributed);
+            while !forwarding.outbox.is_full() {
+                let Some(Some(delivery)) = observations.next().now_or_never() else {
+                    break;
+                };
+                if let Some(observation) = delivery.into_observation() {
+                    forwarding.outbox.push(observation);
+                }
+                let unattributed =
+                    observations.take_lost(|key, count| forwarding.outbox.lose(key, count));
+                forwarding.outbox.lose_unattributed(unattributed);
+            }
+            if leading.get() {
+                continue;
+            }
+            if forwarding.outbox.is_empty() {
+                first_pending = None;
+                continue;
+            }
+            let first = *first_pending.get_or_insert_with(|| clock.monotonic());
+            if !forwarding.outbox.is_full()
+                && clock.monotonic().saturating_duration_since(first) < forwarding.pause
+            {
+                continue;
+            }
+            forward_pending(&mut forwarding, clock, signer, leading, &mut reachable).await;
+            first_pending = if forwarding.outbox.is_empty() {
+                None
+            } else {
+                Some(first)
+            };
+        }
+        let (calls, lost, unattributed) = forwarding.outbox.into_local();
+        let at = clock.wall();
+        {
+            let mut builds = self.0.lock();
+            for call in calls {
+                builds.observe(at, &Observation::Call(call));
+            }
+            for (key, count) in lost {
+                builds.lose(at, &key, count);
+            }
+        }
+        if unattributed != 0 {
+            tracing::warn!(count = unattributed, "unattributed build observations lost");
+        }
+        self.record(observations, clock).await
     }
 
     /// Folds all loss counts observed so far.
@@ -59,6 +151,99 @@ impl BuildsCell {
         let unattributed = observations.take_lost(|key, count| builds.lose(at, &key, count));
         if unattributed != 0 {
             tracing::warn!(count = unattributed, "unattributed build observations lost");
+        }
+    }
+}
+
+/// Sends pending follower observations until the outbox is drained or forwarding stops.
+async fn forward_pending<C: Clock, S: CertificateSignerPort, U: Uplink>(
+    forwarding: &mut Forwarding<U>,
+    clock: &C,
+    signer: &S,
+    leading: &Leading,
+    reachable: &mut bool,
+) {
+    while !forwarding.outbox.is_empty() && !leading.get() {
+        let result = tokio::select! {
+            biased;
+            () = leading.wait() => break,
+            result = forwarding.proofs.current(signer, clock.wall()) => result,
+        };
+        if leading.get() {
+            break;
+        }
+        let proof = match result {
+            Ok(proof) => proof,
+            Err(error) => {
+                if *reachable {
+                    tracing::warn!(%error, "build observation forwarding unavailable");
+                    *reachable = false;
+                }
+                if let Some(dispatch) = forwarding.outbox.next_dispatch() {
+                    forwarding.outbox.resolve(dispatch, Outcome::NotApplied);
+                }
+                tokio::select! {
+                    biased;
+                    () = leading.wait() => {}
+                    () = clock.sleep(forwarding.pause) => {}
+                }
+                break;
+            }
+        };
+        let Some(dispatch) = forwarding.outbox.next_dispatch() else {
+            break;
+        };
+        let carried = dispatch.carried_losses();
+        let bytes = match serde_json::to_vec(dispatch.request()) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::error!(%error, "failed to encode build observations");
+                forwarding.outbox.resolve(dispatch, Outcome::NotApplied);
+                tokio::select! {
+                    biased;
+                    () = leading.wait() => {}
+                    () = clock.sleep(forwarding.pause) => {}
+                }
+                break;
+            }
+        };
+        let (outcome, promoted) = tokio::select! {
+            biased;
+            () = leading.wait() => (Outcome::Unknown, true),
+            outcome = forwarding.uplink.send(proof, bytes.into()) => (outcome, false),
+        };
+        if outcome == Outcome::Unknown && carried != 0 {
+            tracing::warn!(
+                dropped = carried,
+                "build observation loss counts dropped after an ambiguous send"
+            );
+        }
+        forwarding.outbox.resolve(dispatch, outcome);
+        if promoted {
+            break;
+        }
+        if outcome == Outcome::Accepted {
+            if !*reachable {
+                tracing::info!("build observation forwarding restored");
+                *reachable = true;
+            }
+            if leading.get() {
+                break;
+            }
+        } else {
+            if *reachable {
+                tracing::warn!("build observation forwarding unavailable");
+                *reachable = false;
+            }
+            if leading.get() {
+                break;
+            }
+            tokio::select! {
+                biased;
+                () = leading.wait() => {}
+                () = clock.sleep(forwarding.pause) => {}
+            }
+            break;
         }
     }
 }

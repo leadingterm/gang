@@ -34,11 +34,18 @@ impl FileLock {
     /// Returns an error when the file cannot be opened (action "open lock file") or the lock
     /// call fails for another reason (action "lock").
     pub fn try_exclusive(path: &Path) -> Result<Option<Self>, PathIo> {
-        let file = open_lock_file(path)?;
-        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => Ok(Some(Self { file })),
-            Err(Errno::WOULDBLOCK) => Ok(None),
-            Err(errno) => Err(PathIo::new("lock", path, errno.into())),
+        Self::try_exclusive_on(open_lock_file(path)?, path)
+    }
+
+    /// Attempts to lock an already opened file, retrying interruptions.
+    pub(crate) fn try_exclusive_on(file: File, path: &Path) -> Result<Option<Self>, PathIo> {
+        loop {
+            match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => return Ok(Some(Self { file })),
+                Err(Errno::INTR) => {}
+                Err(Errno::WOULDBLOCK) => return Ok(None),
+                Err(errno) => return Err(PathIo::new("lock", path, errno.into())),
+            }
         }
     }
 
@@ -93,6 +100,25 @@ impl FileLock {
     /// Returns the error from duplicating the descriptor.
     pub fn to_stdio(&self) -> io::Result<Stdio> {
         Ok(Stdio::from(self.file.try_clone()?))
+    }
+
+    /// Replaces this process's standard input with a duplicate of this lock.
+    ///
+    /// The previous stdin descriptor is closed atomically. Both this value and stdin then hold
+    /// the lock; dropping this value leaves stdin holding it. Intended for the dedicated worker
+    /// bootstrap before acknowledging readiness.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error from duplicating the descriptor.
+    pub fn replace_stdin(&self) -> io::Result<()> {
+        loop {
+            match rustix::stdio::dup2_stdin(&self.file) {
+                Ok(()) => return Ok(()),
+                Err(Errno::INTR) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 }
 

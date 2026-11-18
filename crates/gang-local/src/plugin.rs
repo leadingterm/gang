@@ -2,12 +2,12 @@ use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 
-use gang_clock::{SystemClock, Timestamp};
+use gang_clock::SystemClock;
 use gang_os::fs::ensure_private_dir;
 use gang_spi::{
-    FleetSupply, InstanceIdentity, MountedScratchVolume, NodeLifecyclePort, Plugin, PluginContext,
-    PortError, PreemptionNotice, ProvisionerPort, ScratchVolumePort, ServerEndpoints, Sidecar,
-    WorkloadCredentialPort,
+    ControllerHostPort, FleetSupply, Held, HostMilestone, InstanceIdentity, MountedScratchVolume,
+    NodeLifecyclePort, Plugin, PluginContext, PortError, PreemptionNotice, ProvisionerPort,
+    ScratchVolumePort, ServerEndpoints, Sidecar, WorkloadCredentialPort,
 };
 use gang_types::{
     Audience, Fleet, FleetName, InstanceId, Isa, Proof, Resources, TokenTtl, WorkerLifetime,
@@ -31,6 +31,16 @@ use crate::worker_identity::WorkerIdentity;
 /// Building the plugin has no filesystem effect, so it runs on every node that runs `gang`.
 /// Each role opens the resources it uses on first use: the state layout on the first
 /// filesystem-touching port call, and the mock IMDS state when the provisioner attaches.
+///
+/// It changes a fleet only through its [`ProvisionerPort`] methods, each under the fence's
+/// permission; it has no other way to write the state directory, such as recording a Spot
+/// interruption:
+///
+/// ```compile_fail
+/// fn interrupt(local: &gang_local::Local, instance: &gang_types::InstanceId) {
+///     let _ = local.request_preemption(&instance, gang_clock::Timestamp::from_unix_millis(0));
+/// }
+/// ```
 pub struct Local {
     /// Shared filesystem-backed provisioner state.
     state: Arc<LocalState>,
@@ -147,23 +157,34 @@ impl Local {
         }
     }
 
-    /// Simulates a Spot interruption: records that `instance` is to be terminated at
-    /// `terminate_at`, which the mock metadata service then reports to the node.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PortError::NotFound`] when the instance has no record.
-    pub fn request_preemption(
+    /// Checks and records endpoints before acquiring the supplied listener.
+    async fn attach_with(
         &self,
-        instance: &InstanceId,
-        terminate_at: Timestamp,
-    ) -> Result<(), PortError> {
-        self.state.layout()?;
-        self.state
-            .fleet
-            .records()
-            .write_preemption(instance, terminate_at)
-            .map_err(PortError::from)
+        endpoints: &ServerEndpoints,
+        listen: impl Future<Output = std::io::Result<tokio::net::TcpListener>> + Send,
+    ) -> Result<Option<Sidecar>, PortError> {
+        let endpoints = WorkerEndpoints {
+            public: endpoints.public.clone(),
+            worker: endpoints.worker.clone(),
+        };
+        self.state.fleet.set_server_endpoints(endpoints)?;
+        let listener = listen.await.map_err(LocalError::MockImdsListen)?;
+        let imds = self
+            .blocking(move |state| {
+                state.layout()?;
+                state.imds()
+            })
+            .await?;
+        let imds = MockImds::new(listener, imds.router());
+        let addr = imds.local_addr()?;
+        Ok(Some(Sidecar::new(addr, async move {
+            match imds.serve().await {
+                Err(error) => PortError::from(error),
+                Ok(()) => {
+                    PortError::backend(std::io::Error::other("mock metadata service stopped"))
+                }
+            }
+        })))
     }
 }
 
@@ -225,28 +246,68 @@ impl ProvisionerPort for Local {
         }
     }
 
+    fn converge(
+        &self,
+        held: &Held,
+        fleet: Fleet<'_, LocalFleetOptions>,
+    ) -> impl Future<Output = Result<(), PortError>> + Send {
+        let fleet = OwnedFleet::of(fleet);
+        let deadline = held.deadline();
+        self.blocking(move |state| {
+            deadline.check()?;
+            state.layout()?;
+            state.fleet.converge(&deadline, fleet.view())
+        })
+    }
+
     fn set_desired_capacity(
         &self,
+        held: &Held,
         fleet: Fleet<'_, LocalFleetOptions>,
         desired: u32,
     ) -> impl Future<Output = Result<(), PortError>> + Send {
         let fleet = OwnedFleet::of(fleet);
+        let deadline = held.deadline();
         self.blocking(move |state| {
+            deadline.check()?;
             state.layout()?;
-            state.fleet.set_desired_capacity(fleet.view(), desired)
+            state
+                .fleet
+                .set_desired_capacity(&deadline, fleet.view(), desired)
         })
     }
 
     fn terminate(
         &self,
+        held: &Held,
         fleet: Fleet<'_, LocalFleetOptions>,
         instance: &InstanceId,
     ) -> impl Future<Output = Result<(), PortError>> + Send {
         let fleet = OwnedFleet::of(fleet);
+        let deadline = held.deadline();
         let instance = instance.clone();
         self.blocking(move |state| {
+            deadline.check()?;
             state.layout()?;
-            state.fleet.terminate(fleet.view(), &instance)
+            state.fleet.terminate(&deadline, fleet.view(), &instance)
+        })
+    }
+
+    fn acknowledge_exit(
+        &self,
+        held: &Held,
+        fleet: Fleet<'_, LocalFleetOptions>,
+        instance: &InstanceId,
+    ) -> impl Future<Output = Result<(), PortError>> + Send {
+        let fleet = OwnedFleet::of(fleet);
+        let deadline = held.deadline();
+        let instance = instance.clone();
+        self.blocking(move |state| {
+            deadline.check()?;
+            state.layout()?;
+            state
+                .fleet
+                .acknowledge_exit(&deadline, fleet.view(), &instance)
         })
     }
 
@@ -254,39 +315,31 @@ impl ProvisionerPort for Local {
         WorkerLifetime::LongLived
     }
 
-    /// Records the server's endpoints, so every worker launched from now on is started with them
-    /// as `--endpoint` and `--worker-endpoint`, then binds the mock metadata service that workers
-    /// query. The returned sidecar serves it while the server runs.
+    /// Records worker endpoints before binding the mock metadata service. The returned sidecar
+    /// serves metadata while the server runs.
     ///
     /// # Errors
     ///
-    /// Returns a configuration error on a second attach, and an unavailable error when the metadata
-    /// listener cannot be bound. The endpoint claim is kept on failure; the server never retries attach.
+    /// Returns a configuration error for different endpoints, and an unavailable error when the
+    /// metadata listener cannot be bound. Retrying with the same endpoints is permitted.
     async fn attach(&self, endpoints: &ServerEndpoints) -> Result<Option<Sidecar>, PortError> {
-        let endpoints = WorkerEndpoints {
-            public: endpoints.public.clone(),
-            worker: endpoints.worker.clone(),
-        };
-        let imds = self
-            .blocking(move |state| {
-                state.layout()?;
-                state.fleet.set_server_endpoints(endpoints)?;
-                state.imds()
-            })
-            .await?;
-        let listener = tokio::net::TcpListener::bind(self.state.imds_listen)
-            .await
-            .map_err(LocalError::MockImdsListen)?;
-        let imds = MockImds::new(listener, imds.router());
-        let addr = imds.local_addr()?;
-        Ok(Some(Sidecar::new(addr, async move {
-            match imds.serve().await {
-                Err(error) => PortError::from(error),
-                Ok(()) => {
-                    PortError::backend(std::io::Error::other("mock metadata service stopped"))
-                }
-            }
-        })))
+        self.attach_with(
+            endpoints,
+            tokio::net::TcpListener::bind(self.state.imds_listen),
+        )
+        .await
+    }
+}
+
+impl ControllerHostPort for Local {
+    /// Nothing retires a local host; `gang server` hands off on SIGTERM instead.
+    async fn retiring(&self) -> Result<(), PortError> {
+        std::future::pending().await
+    }
+
+    /// Nothing waits for local host milestones.
+    async fn reached(&self, _milestone: HostMilestone) -> Result<(), PortError> {
+        Ok(())
     }
 }
 
@@ -435,9 +488,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_second_attach_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+    async fn attach_retries_after_bind_failure_and_accepts_the_same_endpoints()
+    -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
         let local = built_local(dir.path(), listener.local_addr()?)?;
         let endpoints = server_endpoints("http://127.0.0.1:41001")?;
 
@@ -445,8 +500,30 @@ mod tests {
             local.attach(&endpoints).await,
             Err(PortError::Unavailable(_))
         ));
+        let listen = || async { tokio::net::TcpListener::from_std(listener.try_clone()?) };
+        let first = local.attach_with(&endpoints, listen()).await?;
+        assert!(first.is_some());
+        drop(first);
+        let second = local.attach_with(&endpoints, listen()).await?;
+        assert!(second.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attach_records_endpoints_even_when_metadata_listener_is_busy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let local = built_local(dir.path(), listener.local_addr()?)?;
+        let first = server_endpoints("http://127.0.0.1:41001")?;
+        let different = server_endpoints("http://127.0.0.1:41002")?;
+
         assert!(matches!(
-            local.attach(&endpoints).await,
+            local.attach(&first).await,
+            Err(PortError::Unavailable(_))
+        ));
+        assert!(matches!(
+            local.attach(&different).await,
             Err(PortError::Config(_))
         ));
         Ok(())
@@ -457,32 +534,21 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let local = built_local(dir.path(), listener.local_addr()?)?;
-        assert!(matches!(
-            local
-                .attach(&server_endpoints("http://127.0.0.1:41001")?)
-                .await,
-            Err(PortError::Unavailable(_))
-        ));
+        listener.set_nonblocking(true)?;
+        let listen = listener.local_addr()?;
+        let local = built_local(dir.path(), listen)?;
+        let first = local
+            .attach_with(&server_endpoints("http://127.0.0.1:41001")?, async {
+                tokio::net::TcpListener::from_std(listener.try_clone()?)
+            })
+            .await?;
+        assert!(first.is_some());
 
         let second = local
             .attach(&server_endpoints("http://127.0.0.1:41002")?)
             .await;
 
         assert!(matches!(second, Err(PortError::Config(_))));
-        Ok(())
-    }
-
-    #[test]
-    fn request_preemption_of_an_unknown_instance_is_not_found()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let dir = tempfile::tempdir()?;
-        let local = built_local(dir.path(), "127.0.0.1:9".parse()?)?;
-        let instance = InstanceId::try_new(String::from("local-missing"))?;
-
-        let result = local.request_preemption(&instance, Timestamp::from_unix_millis(1));
-
-        assert!(matches!(result, Err(PortError::NotFound(_))));
         Ok(())
     }
 }

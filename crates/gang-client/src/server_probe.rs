@@ -58,7 +58,9 @@ impl ServerFault {
             ClientError::Transport { source, .. } => {
                 Self::Unreachable(error_chain(&source).to_string())
             }
-            ClientError::Server { status, message } => Self::Refused { status, message },
+            ClientError::Server {
+                status, message, ..
+            } => Self::Refused { status, message },
             ClientError::Body(_) | ClientError::BodyTooLarge { .. } => {
                 Self::NotGang(error_chain(&error).to_string())
             }
@@ -178,9 +180,9 @@ impl ClientProbe {
     async fn present(&self, token: &AccessToken) -> Result<(), CredentialFault> {
         match self.api.server(Some(token)).await {
             Ok(_) => Ok(()),
-            Err(ClientError::Server { status, message }) => {
-                Err(CredentialFault::Refused { status, message })
-            }
+            Err(ClientError::Server {
+                status, message, ..
+            }) => Err(CredentialFault::Refused { status, message }),
             Err(error) => Err(CredentialFault::Unreachable(
                 error_chain(&error).to_string(),
             )),
@@ -208,18 +210,29 @@ impl ServerProbe for ClientProbe {
 }
 
 /// Extracts the Bearer token from a credential helper's reply: a JSON object with an object
-/// member `headers`, whose `authorization` member (name compared ignoring ASCII case) holds a
-/// string or an array of strings. The first `Bearer` value wins; its token is returned.
+/// member `headers`, whose `authorization` member (name compared ignoring ASCII case) holds an
+/// array of strings. The first `Bearer` value wins; its token is returned.
 pub(crate) fn reply_token(stdout: &[u8]) -> Result<AccessToken, CredentialFault> {
     let reply: Value = serde_json::from_slice(stdout).map_err(|_| shape_error())?;
     let headers = reply
         .get("headers")
         .and_then(Value::as_object)
         .ok_or_else(shape_error)?;
+    if headers.values().any(|value| {
+        !value
+            .as_array()
+            .is_some_and(|items| items.iter().all(Value::is_string))
+    }) || reply
+        .get("expires")
+        .is_some_and(|value| !value.as_str().is_some_and(valid_helper_expiry))
+    {
+        return Err(shape_error());
+    }
     headers
         .iter()
         .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
-        .flat_map(|(_, value)| authorization_values(value))
+        .flat_map(|(_, value)| value.as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
         .find_map(parse_bearer)
         .map(AccessToken::new)
         .ok_or_else(|| {
@@ -227,13 +240,15 @@ pub(crate) fn reply_token(stdout: &[u8]) -> Result<AccessToken, CredentialFault>
         })
 }
 
-/// The string values of an authorization member: an array of strings, or a lone string.
-fn authorization_values(value: &Value) -> Vec<&str> {
-    match value {
-        Value::String(text) => vec![text.as_str()],
-        Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
-        _ => Vec::new(),
-    }
+/// Bazel's helper expiry format uses whole seconds and an uppercase UTC designator.
+fn valid_helper_expiry(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let suffix_valid = match bytes.len() {
+        20 => bytes.get(19) == Some(&b'Z'),
+        25 => matches!(bytes.get(19), Some(b'+' | b'-')) && bytes.get(22) == Some(&b':'),
+        _ => false,
+    };
+    bytes.get(10) == Some(&b'T') && suffix_valid && Timestamp::from_rfc3339(value).is_ok()
 }
 
 /// The fault for a reply whose shape Bazel cannot use.
@@ -275,8 +290,12 @@ pub fn pin_for(
 ///
 /// # Errors
 ///
-/// Returns the errors of [`Session::load`].
-pub fn stored_login(home: &ClientHome) -> Result<Option<StoredLogin>, ClientError> {
+/// Returns errors acquiring the client lock or loading the session.
+pub async fn stored_login(home: &ClientHome) -> Result<Option<StoredLogin>, ClientError> {
+    if !home.has_file(&home.session_file())? {
+        return Ok(None);
+    }
+    let _lock = home.lock().await?;
     Ok(Session::load(home)?.map(|session| StoredLogin {
         server: session.server,
         ca_pin: session.ca_pin,
@@ -398,6 +417,7 @@ mod tests {
         let fault = ServerFault::classify(ClientError::Server {
             status: 503,
             message: "down".to_owned(),
+            retry_after: None,
         });
 
         assert_eq!(
@@ -455,11 +475,40 @@ mod tests {
     }
 
     #[test]
-    fn lone_string_value_is_accepted() {
-        let token =
-            reply_token(br#"{"headers":{"AUTHORIZATION":"Bearer abc"}}"#).expect("bearer reply");
+    fn structurally_invalid_helper_replies_are_bad() {
+        let cases: &[(&str, &[u8])] = &[
+            ("scalar authorization", br#"{"headers":{"authorization":"Bearer abc"}}"#),
+            ("authorization array with number", br#"{"headers":{"authorization":["Bearer abc",1]}}"#),
+            ("authorization array with null", br#"{"headers":{"authorization":["Bearer abc",null]}}"#),
+            ("unrelated scalar header", br#"{"headers":{"authorization":["Bearer abc"],"other":"value"}}"#),
+            ("unrelated header array with nonstring", br#"{"headers":{"authorization":["Bearer abc"],"other":["value",1]}}"#),
+            ("numeric expires", br#"{"headers":{"authorization":["Bearer abc"]},"expires":1}"#),
+            ("null expires", br#"{"headers":{"authorization":["Bearer abc"]},"expires":null}"#),
+            ("object expires", br#"{"headers":{"authorization":["Bearer abc"]},"expires":{}}"#),
+            ("malformed expires", br#"{"headers":{"authorization":["Bearer abc"]},"expires":"not-a-date"}"#),
+            ("fractional seconds expires", br#"{"headers":{"authorization":["Bearer abc"]},"expires":"2030-01-02T03:04:05.123Z"}"#),
+        ];
 
-        assert_eq!(token.expose(), "abc");
+        for (case, reply) in cases {
+            assert!(
+                matches!(reply_token(reply), Err(CredentialFault::BadReply(_))),
+                "{case} must be rejected as a bad reply"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_helper_reply_extensions_and_expiry_preserve_token() {
+        let cases: &[(&str, &[u8])] = &[
+            ("unknown member", br#"{"headers":{"authorization":["Bearer abc"]},"extra":{"nested":true}}"#),
+            ("UTC expires", br#"{"headers":{"authorization":["Bearer abc"]},"expires":"2030-01-02T03:04:05Z"}"#),
+            ("offset expires", br#"{"headers":{"authorization":["Bearer abc"]},"expires":"2030-01-02T03:04:05+02:30"}"#),
+        ];
+
+        for (case, reply) in cases {
+            let token = reply_token(reply).unwrap_or_else(|_| panic!("{case} must be accepted"));
+            assert_eq!(token.expose(), "abc", "{case}");
+        }
     }
 
     #[test]
@@ -522,17 +571,17 @@ mod tests {
         assert_eq!(result.unwrap_err(), shape_error());
     }
 
-    #[test]
-    fn no_stored_login_when_never_logged_in() {
+    #[tokio::test]
+    async fn no_stored_login_when_never_logged_in() {
         let tmp = TempDir::new().expect("temp dir");
 
-        let stored = stored_login(&home_in(&tmp)).expect("load succeeds");
+        let stored = stored_login(&home_in(&tmp)).await.expect("load succeeds");
 
         assert_eq!(stored, None);
     }
 
-    #[test]
-    fn stored_login_reports_server_and_pin_after_store() {
+    #[tokio::test]
+    async fn stored_login_reports_server_and_pin_after_store() {
         let tmp = TempDir::new().expect("temp dir");
         let home = home_in(&tmp);
         let server = Url::parse("https://gang.test").expect("valid url");
@@ -546,7 +595,7 @@ mod tests {
         };
         session.store(&home).expect("store succeeds");
 
-        let stored = stored_login(&home).expect("load succeeds");
+        let stored = stored_login(&home).await.expect("load succeeds");
 
         assert_eq!(
             stored.map(|login| (login.server, login.ca_pin)),
@@ -764,6 +813,26 @@ mod tests {
             result,
             Err(ServerFault::Refused { status: 401, ref message }) if message == "denied"
         ));
+    }
+
+    #[tokio::test]
+    async fn credential_rejects_malformed_reply_before_presenting_token() {
+        let helper = fake_helper();
+        let server = answering(StatusCode::UNAUTHORIZED, "denied").await;
+        let probe = probe_at(&server, &ClientOptions::default());
+
+        // The pinned FAKE_CREDENTIAL_HELPER exercises the product doctor integration.
+        let result = probe
+            .credential(
+                &helper,
+                &fake_reply(
+                    "reply",
+                    br#"{"headers":{"authorization":["Bearer stale"]},"expires":1}"#,
+                ),
+            )
+            .await;
+
+        assert!(matches!(result, Err(CredentialFault::BadReply(_))));
     }
 
     #[tokio::test]

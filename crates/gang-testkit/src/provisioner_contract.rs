@@ -28,7 +28,10 @@ pub async fn abandoned_requests_contract<P: ProvisionerPort>(
         .checked_add(1)
         .ok_or("the fleet must have room to increase desired capacity")?;
 
-    provisioner.set_desired_capacity(fleet, desired).await?;
+    crate::fence::with_held(async |held| {
+        provisioner.set_desired_capacity(held, fleet, desired).await
+    })
+    .await?;
     provisioner.supply(fleet, &mut supply).await?;
     assert_eq!(
         supply.desired, desired,
@@ -39,7 +42,10 @@ pub async fn abandoned_requests_contract<P: ProvisionerPort>(
         "a call that changes desired changes only the requested count"
     );
 
-    provisioner.set_desired_capacity(fleet, desired).await?;
+    crate::fence::with_held(async |held| {
+        provisioner.set_desired_capacity(held, fleet, desired).await
+    })
+    .await?;
     provisioner.supply(fleet, &mut supply).await?;
     assert_eq!(
         supply.desired, desired,

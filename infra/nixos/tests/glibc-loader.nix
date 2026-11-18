@@ -10,11 +10,67 @@
     install -D -m 0755 ${pkgs.hello}/bin/hello $out/bin/hello
     patchelf --set-interpreter ${interpreter} --remove-rpath $out/bin/hello
   '';
-  # gang-bwrap's fixed sandbox arguments (crates/gang-bwrap/src/bwrap.rs), started with an empty environment.
-  sandbox = binds: "env -i ${pkgs.bubblewrap}/bin/bwrap --unshare-all --die-with-parent --new-session --proc /proc --dev /dev --tmpfs /tmp --clearenv ${pkgs.lib.concatMapStringsSep " " (path: "--ro-bind ${path} ${path}") binds} -- ${fhsHello}/bin/hello";
+  # FHS-interpreter gawk retains its own RUNPATH with an empty environment.
+  hermeticGawk = pkgs.runCommand "hermetic-gawk" {nativeBuildInputs = [pkgs.patchelf];} ''
+    install -D -m 0755 ${pkgs.gawk}/bin/gawk $out/bin/gawk
+    patchelf --set-interpreter ${interpreter} $out/bin/gawk
+  '';
+  envProbe = pkgs.runCommandCC "environment-writable-probe" {nativeBuildInputs = [pkgs.patchelf];} ''
+    cat > env-probe.c <<'EOF'
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <string.h>
+
+    extern char **environ;
+
+    int main(void) {
+      const char *library_path = getenv("LD_LIBRARY_PATH");
+      if (!library_path || *library_path != '\0') {
+        fprintf(stderr, "LD_LIBRARY_PATH must be present and empty\n");
+        return 1;
+      }
+      int wrote_library_path = 0;
+      for (char **entry = environ; *entry; ++entry) {
+        int is_library_path = strcmp(*entry, "LD_LIBRARY_PATH=") == 0;
+        volatile char *separator = strchr(*entry, '=');
+        if (separator) {
+          char saved = *separator;
+          *separator = '\0';
+          *separator = saved;
+        }
+        if (is_library_path) {
+          wrote_library_path = 1;
+        }
+      }
+      if (!wrote_library_path) {
+        fprintf(stderr, "LD_LIBRARY_PATH entry was not written\n");
+        return 1;
+      }
+      puts("environment writable");
+      return 0;
+    }
+    EOF
+    mkdir -p $out/bin
+    $CC -O2 -Wall -Wextra -Werror env-probe.c -o $out/bin/env-probe
+    patchelf --set-interpreter ${interpreter} $out/bin/env-probe
+  '';
+  fhsZstd = pkgs.runCommand "fhs-zstd" {nativeBuildInputs = [pkgs.patchelf];} ''
+    install -D -m 0755 ${pkgs.zstd}/bin/zstd $out/bin/zstd
+    patchelf --set-interpreter ${interpreter} --remove-rpath $out/bin/zstd
+  '';
+  # Clear bwrap's inserted PWD too, without injecting worker or action environment variables.
+  sandbox = binds: command: "env -i ${pkgs.bubblewrap}/bin/bwrap --unshare-all --die-with-parent --new-session --proc /proc --dev /dev --tmpfs /tmp --clearenv ${pkgs.lib.concatMapStringsSep " " (path: "--ro-bind ${path} ${path}") binds} -- ${pkgs.coreutils}/bin/env -i ${command}";
 in
   pkgs.testers.runNixOSTest {
     name = "glibc-loader";
+
+    nodeDefaults.virtualisation = {
+      memorySize = 1024;
+      cores = 1;
+      useNixStoreImage = true;
+      mountHostNixStore = false;
+      sharedDirectories = pkgs.lib.mkForce {};
+    };
 
     nodes.machine = {imports = [../glibc-loader.nix];};
 
@@ -24,10 +80,23 @@ in
       with subtest("both ELF interpreter directories exist, owned by root and writable by no one else"):
           assert machine.succeed("stat -c %U:%G:%a /lib /lib64").split() == ["root:root:755", "root:root:755"]
 
+      with subtest("a hermetic action tool runs under the shipped binds"):
+          assert machine.succeed("${sandbox shipped "${hermeticGawk}/bin/gawk 'BEGIN { print 6 * 7 }'"}").strip() == "42"
+
+      with subtest("the action environment is writable under the shipped binds"):
+          assert "environment writable" in machine.succeed("${sandbox shipped "${envProbe}/bin/env-probe"}")
+
+      with subtest("a program resolves non-glibc libraries under the shipped binds"):
+          assert "Zstandard" in machine.succeed("${sandbox shipped "${fhsZstd}/bin/zstd --version"}")
+
+      with subtest("an empty library profile cannot resolve zstd without RUNPATH"):
+          status, output = machine.execute("${sandbox shipped "NIX_LD_LIBRARY_PATH= ${fhsZstd}/bin/zstd --version"} 2>&1")
+          assert status != 0 and "libzstd.so.1" in output, output
+
       with subtest("a glibc program runs in the sandbox under the shipped binds"):
-          assert "Hello, world!" in machine.succeed("${sandbox shipped}")
+          assert "Hello, world!" in machine.succeed("${sandbox shipped "${fhsHello}/bin/hello"}")
 
       with subtest("without the interpreter directories it cannot start"):
-          machine.fail("${sandbox withoutLoader}")
+          machine.fail("${sandbox withoutLoader "${fhsHello}/bin/hello"}")
     '';
   }

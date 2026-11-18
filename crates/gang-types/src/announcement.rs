@@ -15,6 +15,8 @@ crate::string_enum! {
         Public = "public",
         /// The worker listener.
         Worker = "worker",
+        /// The plaintext load-balancer health listener.
+        Health = "health",
         /// The local provisioner's mock instance metadata listener.
         Imds = "imds",
     }
@@ -161,8 +163,15 @@ mod tests {
 
     #[test]
     fn listening_round_trips_through_display_and_from_str() {
-        let original = Announcement::Listening(ListenerRole::Public, address("127.0.0.1:9443"));
-        assert_eq!(original.to_string().parse::<Announcement>(), Ok(original));
+        for role in [
+            ListenerRole::Public,
+            ListenerRole::Worker,
+            ListenerRole::Health,
+            ListenerRole::Imds,
+        ] {
+            let original = Announcement::Listening(role, address("127.0.0.1:9443"));
+            assert_eq!(original.to_string().parse::<Announcement>(), Ok(original));
+        }
     }
 
     #[test]

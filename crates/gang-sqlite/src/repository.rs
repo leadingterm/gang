@@ -3,10 +3,12 @@ use std::num::NonZeroUsize;
 use gang_clock::Timestamp;
 use gang_spi::{
     CertStatus, IssuedCertRecord, PortError, PrincipalRecord, RecordedScalingEvent,
-    ScalingAuditEvent, ScalingEventSeq, StateRepositoryPort, Subject,
+    RevocationEpoch, ScalingAuditEvent, ScalingEventSeq, StateRepositoryPort, Subject,
 };
 use gang_types::{CertSerial, Identity};
-use rusqlite::{OptionalExtension, Params, Row, named_params, params};
+use rusqlite::{
+    Connection, OptionalExtension, Params, Row, TransactionBehavior, named_params, params,
+};
 
 use crate::codec::{
     ScalingRow, certificate_columns, certificate_from_row, millis, page, principal_columns,
@@ -28,6 +30,24 @@ const SELECT_REVOKED_CERTIFICATES: &str = concat!(
     " FROM issued_certificates ",
     "WHERE revoked_at IS NOT NULL ORDER BY revoked_at, serial"
 );
+
+/// One page of all certificates, ordered by serial.
+const SELECT_CERTIFICATES_PAGE: &str = concat!(
+    "SELECT ",
+    certificate_columns!(),
+    " FROM issued_certificates ",
+    "WHERE (?1 IS NULL OR serial > ?1) ORDER BY serial LIMIT ?2"
+);
+
+/// Advances the revocation counter in the caller's transaction.
+fn advance_revocation_epoch(db: &Connection) -> Result<(), SqliteError> {
+    db.execute(
+        "INSERT INTO counters (name, value) VALUES ('revocation', 1) \
+         ON CONFLICT (name) DO UPDATE SET value = value + 1",
+        [],
+    )?;
+    Ok(())
+}
 
 /// The unrevoked certificates of one identity, oldest first.
 const SELECT_CERTIFICATES_OF: &str = concat!(
@@ -132,16 +152,23 @@ impl StateRepositoryPort for Sqlite {
         let key = serial.as_str().to_owned();
         let at = millis(at)?;
         self.run(move |db| {
-            db.prepare_cached(concat!(
-                "UPDATE issued_certificates SET revoked_at = COALESCE(revoked_at, :at) ",
-                "WHERE serial = :serial RETURNING ",
-                certificate_columns!()
-            ))?
-            .query_row(named_params! { ":at": at, ":serial": key }, |row| {
-                Ok(certificate_from_row(row))
-            })
-            .optional()?
-            .transpose()
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let record = tx
+                .prepare_cached(concat!(
+                    "UPDATE issued_certificates SET revoked_at = COALESCE(revoked_at, :at) ",
+                    "WHERE serial = :serial RETURNING ",
+                    certificate_columns!()
+                ))?
+                .query_row(named_params! { ":at": at, ":serial": key }, |row| {
+                    Ok(certificate_from_row(row))
+                })
+                .optional()?
+                .transpose()?;
+            if record.is_some() {
+                advance_revocation_epoch(&tx)?;
+                tx.commit()?;
+            }
+            Ok(record)
         })
         .await?
         .ok_or_else(|| PortError::NotFound(Subject::Certificate(serial.clone())))
@@ -164,6 +191,43 @@ impl StateRepositoryPort for Sqlite {
         Ok(self
             .query_all(SELECT_CERTIFICATES_OF, params, certificate_from_row)
             .await?)
+    }
+
+    async fn certificates(
+        &self,
+        after: Option<&CertSerial>,
+        limit: NonZeroUsize,
+        into: &mut Vec<IssuedCertRecord>,
+    ) -> Result<bool, PortError> {
+        let params = (
+            after.map(|serial| serial.as_str().to_owned()),
+            fetch_count(limit),
+        );
+        let mut rows = self
+            .query_all(SELECT_CERTIFICATES_PAGE, params, certificate_from_row)
+            .await?;
+        let more = page(&mut rows, limit);
+        into.clear();
+        into.extend(rows);
+        Ok(more)
+    }
+
+    async fn revocation_epoch(&self) -> Result<RevocationEpoch, PortError> {
+        let epoch = self
+            .run(|db| {
+                Ok(db
+                    .query_row(
+                        "SELECT value FROM counters WHERE name = 'revocation'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?
+                    .unwrap_or(0))
+            })
+            .await?;
+        Ok(RevocationEpoch::new(crate::codec::unsigned(
+            "value", epoch,
+        )?))
     }
 
     async fn record_scaling_event(
@@ -270,23 +334,28 @@ impl StateRepositoryPort for Sqlite {
         let at = millis(at)?;
         Ok(self
             .run(move |db| {
-                db.prepare_cached(concat!(
-                    "INSERT INTO principals ",
-                    "(provider, principal, first_seen, last_seen, revoked_at) ",
-                    "VALUES (:provider, :principal, :at, :at, :at) ",
-                    "ON CONFLICT (provider, principal) ",
-                    "DO UPDATE SET revoked_at = COALESCE(revoked_at, excluded.revoked_at) ",
-                    "RETURNING ",
-                    principal_columns!()
-                ))?
-                .query_row(
-                    named_params! {
-                        ":provider": provider,
-                        ":principal": principal,
-                        ":at": at,
-                    },
-                    |row| Ok(principal_from_row(row)),
-                )?
+                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let record = tx
+                    .prepare_cached(concat!(
+                        "INSERT INTO principals ",
+                        "(provider, principal, first_seen, last_seen, revoked_at) ",
+                        "VALUES (:provider, :principal, :at, :at, :at) ",
+                        "ON CONFLICT (provider, principal) ",
+                        "DO UPDATE SET revoked_at = COALESCE(revoked_at, excluded.revoked_at) ",
+                        "RETURNING ",
+                        principal_columns!()
+                    ))?
+                    .query_row(
+                        named_params! {
+                            ":provider": provider,
+                            ":principal": principal,
+                            ":at": at,
+                        },
+                        |row| Ok(principal_from_row(row)),
+                    )??;
+                advance_revocation_epoch(&tx)?;
+                tx.commit()?;
+                Ok(record)
             })
             .await?)
     }
@@ -296,17 +365,24 @@ impl StateRepositoryPort for Sqlite {
         let provider = identity.provider.as_str().to_owned();
         let principal = identity.principal.as_str().to_owned();
         self.run(move |db| {
-            db.prepare_cached(concat!(
-                "UPDATE principals SET revoked_at = NULL ",
-                "WHERE provider = :provider AND principal = :principal RETURNING ",
-                principal_columns!()
-            ))?
-            .query_row(
-                named_params! { ":provider": provider, ":principal": principal },
-                |row| Ok(principal_from_row(row)),
-            )
-            .optional()?
-            .transpose()
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let record = tx
+                .prepare_cached(concat!(
+                    "UPDATE principals SET revoked_at = NULL ",
+                    "WHERE provider = :provider AND principal = :principal RETURNING ",
+                    principal_columns!()
+                ))?
+                .query_row(
+                    named_params! { ":provider": provider, ":principal": principal },
+                    |row| Ok(principal_from_row(row)),
+                )
+                .optional()?
+                .transpose()?;
+            if record.is_some() {
+                advance_revocation_epoch(&tx)?;
+                tx.commit()?;
+            }
+            Ok(record)
         })
         .await?
         .ok_or_else(|| PortError::NotFound(Subject::Principal(identity.clone())))

@@ -5,16 +5,19 @@
 //! fetches and refreshes itself. The identity document is fetched once per process.
 
 use aws_config::imds::Client;
-use aws_config::imds::client::error::ImdsError;
+use aws_config::imds::client::error::{ImdsError, TokenError};
 use aws_config::provider_config::ProviderConfig;
 use aws_smithy_runtime_api::client::http::SharedHttpClient;
+use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+use aws_smithy_runtime_api::client::result::SdkError;
+use gang_aws_sdk::{CallError, Retryability, classify};
 use gang_clock::{Rfc3339Error, Timestamp};
 use gang_spi::{InstanceIdentity, PreemptionNotice};
 use gang_types::{FleetName, InstanceId, Isa, NonZeroDuration};
 use serde::Deserialize;
 use tokio::sync::OnceCell;
 
-use crate::errors::{AwsError, Retryability, classify};
+use crate::errors::AwsError;
 
 /// Path of the signed instance identity document.
 const IDENTITY_PATH: &str = "/latest/dynamic/instance-identity/document";
@@ -25,6 +28,10 @@ const PREEMPTION_PATH: &str = "/latest/meta-data/spot/instance-action";
 const TARGET_LIFECYCLE_PATH: &str = "/latest/meta-data/autoscaling/target-lifecycle-state";
 /// Prefix of the target lifecycle state of an instance that its group keeps in the warm pool.
 const WARMED_PREFIX: &str = "Warmed:";
+/// Target state signaling that Auto Scaling is retiring the instance.
+const TERMINATED_STATE: &str = "Terminated";
+/// Auto Scaling's instance tag naming the group.
+const GROUP_TAG_PATH: &str = "/latest/meta-data/tags/instance/aws:autoscaling:groupName";
 
 /// Prefix of the metadata path of an instance tag; the tag key follows it. The Auto Scaling
 /// group propagates the fleet tag to its instances; requires instance metadata tags to be
@@ -127,14 +134,43 @@ impl Metadata {
         }
     }
 
-    /// Fetches and parses the identity document; the caller memoizes the result.
-    async fn fetch_identity(&self) -> Result<InstanceIdentity, AwsError> {
+    /// Whether Auto Scaling is retiring this instance; a missing state is not retiring.
+    pub(crate) async fn retiring(&self) -> Result<bool, AwsError> {
+        match self.imds.get(TARGET_LIFECYCLE_PATH).await {
+            Ok(body) => Ok(body.as_ref() == TERMINATED_STATE),
+            Err(error) if is_not_found(&error) => Ok(false),
+            Err(error) => Err(imds_error(error)),
+        }
+    }
+
+    /// The Auto Scaling group name, if the instance belongs to a group.
+    pub(crate) async fn group_name(&self) -> Result<Option<String>, AwsError> {
+        match self.imds.get(GROUP_TAG_PATH).await {
+            Ok(body) => Ok(Some(body.as_ref().to_owned())),
+            Err(error) if is_not_found(&error) => Ok(None),
+            Err(error) => Err(imds_error(error)),
+        }
+    }
+
+    /// The instance id without requiring a worker fleet tag.
+    pub(crate) async fn instance_id(&self) -> Result<InstanceId, AwsError> {
+        Ok(self.identity_document().await?.0)
+    }
+
+    /// Fetches and validates the identity document shared by controller and worker reads.
+    async fn identity_document(&self) -> Result<(InstanceId, String), AwsError> {
         let body = self.imds.get(IDENTITY_PATH).await.map_err(imds_error)?;
         let document: IdentityDocument = serde_json::from_str(body.as_ref())
             .map_err(|_| AwsError::malformed(IMDS_OPERATION, "instance identity document"))?;
         let instance = InstanceId::try_new(document.instance_id)
             .map_err(|_| AwsError::malformed(IMDS_OPERATION, "instance id"))?;
-        let isa = isa_of(&document.architecture)
+        Ok((instance, document.architecture))
+    }
+
+    /// Fetches and parses the identity document; the caller memoizes the result.
+    async fn fetch_identity(&self) -> Result<InstanceIdentity, AwsError> {
+        let (instance, architecture) = self.identity_document().await?;
+        let isa = isa_of(&architecture)
             .ok_or_else(|| AwsError::malformed(IMDS_OPERATION, "supported architecture"))?;
         let fleet = self.fetch_fleet().await?;
         Ok(InstanceIdentity {
@@ -209,26 +245,30 @@ fn is_not_found(error: &ImdsError) -> bool {
     matches!(error, ImdsError::ErrorResponse(response) if response.response().status().as_u16() == NOT_FOUND)
 }
 
-/// Classifies a failed metadata read: connection and throttling failures are transient, the rest
-/// are refusals.
+/// Classifies metadata refusals; transport and unexpected failures are retryable.
 fn imds_error(error: ImdsError) -> AwsError {
     let retryability = match &error {
-        ImdsError::FailedToLoadToken(token) if token.is_dispatch_failure() => {
-            Retryability::Transient
-        }
-        ImdsError::IoError(_) => Retryability::Transient,
         ImdsError::ErrorResponse(response) => {
             classify(None, Some(response.response().status().as_u16()))
         }
-        _ => Retryability::Permanent,
+        ImdsError::FailedToLoadToken(_) => {
+            let status = std::error::Error::source(&error)
+                .and_then(|source| source.downcast_ref::<SdkError<TokenError, HttpResponse>>())
+                .and_then(SdkError::raw_response)
+                .map(|response| response.status().as_u16());
+            status.map_or(Retryability::Transient, |status| {
+                classify(None, Some(status))
+            })
+        }
+        _ => Retryability::Transient,
     };
-    AwsError::failed(IMDS_OPERATION, retryability, Box::new(error))
+    CallError::failed(IMDS_OPERATION, retryability, Box::new(error)).into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fake_aws::{FakeAws, FakeFailure};
+    use crate::fake_aws::{FakeAws, FakeFailure, TokenFailure};
     use crate::names::FleetTagKey;
 
     const INSTANCE_ID: &str = "i-0123456789abcdef0";
@@ -301,7 +341,9 @@ mod tests {
     async fn unknown_architecture_is_malformed() -> Result<(), Box<dyn std::error::Error>> {
         let fake = FakeAws::start().await?;
         fake.state().identity_document = Some(identity_document("riscv64"));
-        let result = metadata(&fake)?.identity().await;
+        let meta = metadata(&fake)?;
+        assert_eq!(meta.instance_id().await?, InstanceId::try_new(INSTANCE_ID)?);
+        let result = meta.identity().await;
         assert!(matches!(
             result,
             Err(AwsError::MalformedResponse {
@@ -310,6 +352,88 @@ mod tests {
             })
         ));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_identity_document_is_rejected_by_both_reads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeAws::start().await?;
+        let meta = metadata(&fake)?;
+        for (body, expected) in [
+            ("{", "instance identity document"),
+            (
+                r#"{"instanceId":"invalid/id","architecture":"x86_64"}"#,
+                "instance id",
+            ),
+        ] {
+            fake.state().identity_document = Some(body.to_owned());
+            assert!(matches!(
+                meta.instance_id().await,
+                Err(AwsError::MalformedResponse { what, .. }) if what == expected
+            ));
+            assert!(matches!(
+                meta.identity().await,
+                Err(AwsError::MalformedResponse { what, .. }) if what == expected
+            ));
+        }
+        Ok(())
+    }
+
+    async fn identity_reader_failures_are_not_cached(
+        worker: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for (operation, status, code, message) in [
+            ("ImdsGet", 403, "AccessDenied", "denied"),
+            ("ImdsGet", 503, "ServiceUnavailable", "unavailable"),
+            ("ImdsToken", 403, "Forbidden", "forbidden"),
+            ("ImdsToken", 503, "ServiceUnavailable", "unavailable"),
+        ] {
+            let fake = FakeAws::start().await?;
+            let meta = metadata(&fake)?;
+            fake.state().failures.insert(
+                operation,
+                FakeFailure {
+                    status,
+                    code,
+                    message,
+                },
+            );
+            let result = if worker {
+                meta.identity().await.map(|_| ())
+            } else {
+                meta.instance_id().await.map(|_| ())
+            };
+            assert!(
+                match status {
+                    403 => matches!(result, Err(AwsError::Call(CallError::Refused { .. }))),
+                    503 => matches!(result, Err(AwsError::Call(CallError::Transient { .. }))),
+                    _ => false,
+                },
+                "{operation} status {status}: {result:?}"
+            );
+
+            fake.state().failures.remove(operation);
+            seed_identity(&fake, "x86_64");
+            if worker {
+                let identity = meta.identity().await?;
+                assert_eq!(identity.instance, InstanceId::try_new(INSTANCE_ID)?);
+                assert_eq!(identity.fleet, FleetName::try_new(FLEET)?);
+                assert_eq!(identity.isa, Isa::X86_64);
+            } else {
+                assert_eq!(meta.instance_id().await?, InstanceId::try_new(INSTANCE_ID)?);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn instance_id_recovers_from_imds_failures() -> Result<(), Box<dyn std::error::Error>> {
+        identity_reader_failures_are_not_cached(false).await
+    }
+
+    #[tokio::test]
+    async fn identity_recovers_from_imds_failures() -> Result<(), Box<dyn std::error::Error>> {
+        identity_reader_failures_are_not_cached(true).await
     }
 
     #[tokio::test]
@@ -328,7 +452,15 @@ mod tests {
     async fn missing_identity_document_is_an_error() -> Result<(), Box<dyn std::error::Error>> {
         let fake = FakeAws::start().await?;
         let result = metadata(&fake)?.identity().await;
-        assert!(matches!(result, Err(AwsError::Refused { .. })));
+        assert!(matches!(
+            result,
+            Err(AwsError::Call(CallError::Refused { .. }))
+        ));
+        let result = metadata(&fake)?.instance_id().await;
+        assert!(matches!(
+            result,
+            Err(AwsError::Call(CallError::Refused { .. }))
+        ));
         Ok(())
     }
 
@@ -504,10 +636,86 @@ mod tests {
             },
         );
         let result = metadata(&fake)?.parked().await;
-        assert!(matches!(result, Err(AwsError::Transient { .. })));
+        assert!(matches!(
+            result,
+            Err(AwsError::Call(CallError::Transient { .. }))
+        ));
         Ok(())
     }
 
+    #[tokio::test]
+    async fn failed_metadata_token_load_is_transient() -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeAws::start().await?;
+        fake.state().failures.insert(
+            "ImdsToken",
+            FakeFailure {
+                status: 503,
+                code: "ServiceUnavailable",
+                message: "unavailable",
+            },
+        );
+        assert!(matches!(
+            metadata(&fake)?.retiring().await,
+            Err(AwsError::Call(CallError::Transient { .. }))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forbidden_metadata_token_is_permanent() -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeAws::start().await?;
+        fake.state().failures.insert(
+            "ImdsToken",
+            FakeFailure {
+                status: 403,
+                code: "Forbidden",
+                message: "forbidden",
+            },
+        );
+        assert!(matches!(
+            metadata(&fake)?.retiring().await,
+            Err(AwsError::Call(CallError::Refused { .. }))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_token_put_is_transient() -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeAws::start().await?;
+        fake.state().token_failure = Some(TokenFailure::Timeout);
+        let started = fake.state().token_started.clone();
+        let client = fake.imds_client_with_timeout(NonZeroDuration::from_hours(24))?;
+        let task = tokio::spawn(async move { client.get(TARGET_LIFECYCLE_PATH).await });
+        started.notified().await;
+        tokio::time::advance(std::time::Duration::from_hours(24)).await;
+        let error = task.await?.err().ok_or("expected token failure")?;
+        assert!(matches!(
+            imds_error(error),
+            AwsError::Call(CallError::Transient { .. })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn token_put_io_failure_is_transient() -> Result<(), Box<dyn std::error::Error>> {
+        let mut fake = FakeAws::start().await?;
+        let client = fake.imds_client()?;
+        fake.stop().await;
+        let error = client
+            .get(TARGET_LIFECYCLE_PATH)
+            .await
+            .err()
+            .ok_or("expected token failure")?;
+        assert!(
+            matches!(&error, ImdsError::FailedToLoadToken(token) if token.is_dispatch_failure()),
+            "{error:?}"
+        );
+        assert!(matches!(
+            imds_error(error),
+            AwsError::Call(CallError::Transient { .. })
+        ));
+        Ok(())
+    }
     #[tokio::test]
     async fn refused_target_state_failure_is_refused() -> Result<(), Box<dyn std::error::Error>> {
         let fake = FakeAws::start().await?;
@@ -520,7 +728,10 @@ mod tests {
             },
         );
         let result = metadata(&fake)?.parked().await;
-        assert!(matches!(result, Err(AwsError::Refused { .. })));
+        assert!(matches!(
+            result,
+            Err(AwsError::Call(CallError::Refused { .. }))
+        ));
         Ok(())
     }
 }

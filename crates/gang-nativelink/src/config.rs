@@ -5,13 +5,14 @@ use std::time::Duration;
 
 use gang_types::{
     BoundedBytes, BoundedDuration, HeadroomPercent, NANOS_PER_SECOND, NonZeroBytes,
-    NonZeroDuration, SchedulerName, SchedulerSettings, Url,
+    NonZeroDuration, SaturatingInto, SchedulerName, SchedulerSettings, Url,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::enforcement::{ColdStartTuning, DiskTuning, MemoryTuning};
 use crate::errors::NativeLinkConfigError;
 use crate::open_file_limit::OpenFileLimit;
+use crate::serve::Listener;
 
 /// A non-zero whole number of seconds, capped at the representable maximum of about 584 years.
 pub(crate) type WholeSeconds =
@@ -26,9 +27,9 @@ const DEFAULT_WORKER_TIMEOUT: WholeSeconds = WholeSeconds::from_units(10);
 /// How long a completed action stays visible to clients after it finishes.
 const DEFAULT_RETAIN_COMPLETED_FOR: WholeSeconds = WholeSeconds::from_units(60);
 /// How many times an action is retried after its job fails.
-const DEFAULT_MAX_JOB_RETRIES: u32 = 3;
+const DEFAULT_MAX_JOB_RETRIES: NonZeroU32 = NonZeroU32::MIN.saturating_add(2);
 /// How many times an action is retried after the worker running it is lost.
-const DEFAULT_MAX_WORKER_LOSS_RETRIES: u32 = 10;
+const DEFAULT_MAX_WORKER_LOSS_RETRIES: NonZeroU32 = NonZeroU32::MIN.saturating_add(9);
 /// Extra reservation over measured usage, in percent.
 const DEFAULT_HEADROOM_PERCENT: HeadroomPercent = HeadroomPercent::from_percent(20);
 /// How many days a resource measurement counts: seven days.
@@ -49,8 +50,8 @@ const DEFAULT_CLEANUP_WAIT: WholeSeconds = WholeSeconds::from_units(30);
 const DEFAULT_WORKER_KEEPALIVE_INTERVAL: WholeSeconds = WholeSeconds::from_units(30);
 /// Largest gRPC message a connection accepts: 4 MiB.
 const DEFAULT_MAX_MESSAGE_SIZE: NonZeroBytes = NonZeroBytes::mib(4);
-/// How many connections the public listener serves at once: 128 × the default 16 MiB
-/// `receive_window` is 2 GiB, within the 4 GiB reference controller.
+/// How many connections each client listener serves at once: 128 × the default 16 MiB
+/// `receive_window` is 2 GiB per listener, within the 4 GiB reference controller when alone.
 const DEFAULT_MAX_CONNECTIONS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(127);
 /// How many requests one HTTP/2 connection runs at once: 100, as many as Bazel sends on one
 /// connection by default (`--remote_max_concurrency_per_connection`).
@@ -71,13 +72,16 @@ const DEFAULT_RECEIVE_WINDOW: ReceiveWindow = ReceiveWindow::from_units(16 * 102
 const DEFAULT_STREAM_IDLE_TIMEOUT: WholeSeconds = WholeSeconds::from_units(10);
 /// Interval of HTTP/2 keepalive pings sent to clients.
 const DEFAULT_HTTP2_KEEPALIVE_INTERVAL: NonZeroDuration = NonZeroDuration::from_secs(30);
-/// How long `run_controller` lets open connections finish after both connection streams have ended.
+/// How long `run_controller` lets open connections finish after all connection streams have ended.
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 /// How long an HTTP/1.1 connection may take to send a request head before it is closed.
 const DEFAULT_HEADER_READ_TIMEOUT: NonZeroDuration = NonZeroDuration::from_secs(30);
 
 /// The key of the worker endpoint in `[scheduler.nativelink]`.
 const WORKER_ENDPOINT: &str = "worker_endpoint";
+
+/// The full key of the controller hand-off bound.
+const SHUTDOWN_GRACE: &str = "scheduler.nativelink.http2.shutdown_grace";
 
 /// The controller's worker endpoint and how the controller is tuned.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,10 +175,10 @@ pub struct SchedulerTuning {
     pub worker_timeout: WholeSeconds,
     /// How long a completed action stays visible to clients. Default: `60s`.
     pub retain_completed_for: WholeSeconds,
-    /// How many times an action is retried after its job fails. Default: 3.
-    pub max_job_retries: u32,
-    /// How many times an action is retried after the worker running it is lost. Default: 10.
-    pub max_worker_loss_retries: u32,
+    /// Non-zero number of times an action is retried after its job fails. Default: 3.
+    pub max_job_retries: NonZeroU32,
+    /// Non-zero number of retries after the worker running an action is lost. Default: 10.
+    pub max_worker_loss_retries: NonZeroU32,
     /// Extra reservation over measured usage, in percent. Default: 20.
     pub headroom_percent: HeadroomPercent,
     /// How many days a resource measurement counts. Default: 7.
@@ -244,7 +248,7 @@ impl Default for WorkerTuning {
 pub struct Http2Tuning {
     /// Largest gRPC message a connection accepts. Default: `4MiB`.
     pub max_message_size: NonZeroBytes,
-    /// How many connections the public listener serves at once. A connection earns its place once
+    /// How many connections each public or execution listener serves at once. A connection earns its place once
     /// the gate admits an authenticated request on it; at the limit, a new connection replaces the
     /// oldest one that has not, an idle one first, and is closed only when every connection has.
     /// The worker listener serves two generations of every connection of every worker the fleets
@@ -253,7 +257,7 @@ pub struct Http2Tuning {
     /// Shortest time between two log lines of a listener's refused connections; each line counts
     /// the refusals since the previous one and in all. Default: `60s`.
     pub refusal_log_interval: NonZeroDuration,
-    /// How long a connection on the public listener that has not earned its place may stay without
+    /// How long a connection on a public or execution listener that has not earned its place may stay without
     /// a request in flight, before its first request included, before it is closed. Default: `30s`.
     pub unproven_idle_timeout: NonZeroDuration,
     /// How many requests one HTTP/2 connection runs at once; its client queues the rest.
@@ -267,13 +271,27 @@ pub struct Http2Tuning {
     pub stream_idle_timeout: WholeSeconds,
     /// Interval of HTTP/2 keepalive pings sent to clients. Default: `30s`.
     pub keepalive_interval: NonZeroDuration,
-    /// How long `run_controller` lets open connections finish after both connection streams have
+    /// How long `run_controller` lets open connections finish after all connection streams have
     /// ended, before it closes them. Default: `30s`.
     #[serde(with = "gang_types::duration")]
     pub shutdown_grace: Duration,
     /// How long an HTTP/1.1 connection may take to send a request head before it is closed. Does
     /// not apply to HTTP/2. Default: `30s`.
     pub header_read_timeout: NonZeroDuration,
+}
+
+impl Http2Tuning {
+    /// Execution carries no CAS uploads, so it needs at most one message per window.
+    pub(crate) fn window_for(&self, listener: Listener) -> u32 {
+        let window = self.receive_window.get().get();
+        let window = if listener == Listener::Execution {
+            window.min(self.max_message_size.as_u64().max(MIN_RECEIVE_WINDOW))
+        } else {
+            window
+        };
+        // `ReceiveWindow` is at most 2^31 - 1 bytes, so this conversion cannot saturate.
+        window.saturating_into()
+    }
 }
 
 impl Default for Http2Tuning {
@@ -332,6 +350,10 @@ impl SchedulerSettings for NativeLinkConfig {
     fn worker_endpoint_key(&self) -> Option<&'static str> {
         Some(WORKER_ENDPOINT)
     }
+
+    fn shutdown_grace(&self) -> Option<(&'static str, Duration)> {
+        Some((SHUTDOWN_GRACE, self.http2.shutdown_grace))
+    }
 }
 
 fn check_endpoint(endpoint: &'static str, url: &Url) -> Result<(), NativeLinkConfigError> {
@@ -366,6 +388,19 @@ mod tests {
     }
 
     #[test]
+    fn execution_window_is_capped_without_changing_other_listeners() {
+        use crate::serve::Listener;
+        let mut tuning = Http2Tuning::default();
+        assert_eq!(tuning.window_for(Listener::Execution), 4 * 1024 * 1024);
+        assert_eq!(tuning.window_for(Listener::Public), 16 * 1024 * 1024);
+        assert_eq!(tuning.window_for(Listener::Worker), 16 * 1024 * 1024);
+        tuning.max_message_size = NonZeroBytes::mib(1);
+        assert_eq!(tuning.window_for(Listener::Execution), 1024 * 1024);
+        tuning.max_message_size = NonZeroBytes::new(gang_types::Bytes::new(1)).expect("nonzero");
+        assert_eq!(tuning.window_for(Listener::Execution), 65_535);
+    }
+
+    #[test]
     fn empty_sections_take_the_defaults_and_round_trip() {
         let config = parse(base()).expect("valid config");
         assert_eq!(config.max_open_files.get(), 24_576);
@@ -389,6 +424,34 @@ mod tests {
 
         let serialized = serde_json::to_value(&config).expect("serializes");
         assert_eq!(parse(serialized).expect("round trips"), config);
+    }
+
+    #[test]
+    fn scheduler_retry_limits_reject_zero_and_preserve_one() {
+        let mut failures = Vec::new();
+        for key in ["max_job_retries", "max_worker_loss_retries"] {
+            let mut zero = base();
+            zero["scheduler"] = json!({ (key): 0 });
+            if parse(zero).is_ok() {
+                failures.push(format!("{key}: zero was accepted"));
+            }
+
+            let mut one = base();
+            one["scheduler"] = json!({ (key): 1 });
+            let round_trip = parse(one)
+                .and_then(|config| serde_json::to_value(&config))
+                .and_then(parse)
+                .and_then(|config| serde_json::to_value(&config));
+            match round_trip {
+                Ok(value) if value["scheduler"][key] == json!(1) => {}
+                Ok(value) => failures.push(format!(
+                    "{key}: round-tripped as {}",
+                    value["scheduler"][key]
+                )),
+                Err(error) => failures.push(format!("{key}: one failed to round-trip: {error}")),
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("; "));
     }
 
     #[test]
@@ -600,6 +663,18 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_grace_reports_key_and_value() {
+        let config = parse(base()).expect("valid config");
+        assert_eq!(
+            SchedulerSettings::shutdown_grace(&config),
+            Some((
+                "scheduler.nativelink.http2.shutdown_grace",
+                Duration::from_secs(30)
+            ))
+        );
+    }
+
+    #[test]
     fn scheduler_names_are_validated() {
         assert!(SchedulerName::try_new("MAIN_scheduler-1").is_ok());
         assert!(SchedulerName::try_new("").is_err());
@@ -743,14 +818,14 @@ mod tests {
         let mut value = base();
         value["memory"] = json!({
             "enforcement": "soft",
-            "min_reservation": "64MiB",
+            "min_reservation": "128MiB",
             "headroom_percent": 30,
             "escalation_percent": 150,
             "escalation_max_steps": 4,
         });
         let config = parse(value).expect("valid config");
         assert_eq!(config.memory.enforcement, MemoryEnforcement::Soft);
-        assert_eq!(config.memory.min_reservation.as_units(), 65_536);
+        assert_eq!(config.memory.min_reservation.as_units(), 131_072);
         assert_eq!(config.memory.headroom_percent.get(), 30);
         assert_eq!(config.memory.escalation_percent.get(), 150);
         assert_eq!(config.memory.escalation_max_steps, 4);

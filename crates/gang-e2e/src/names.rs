@@ -324,9 +324,8 @@ pub mod sessions {
     pub const SIGN_IN_WITHOUT_CONSENT: &str = "the sign-in after the absolute lifetime asks no offline access and re-checks the held refresh token with one grant";
     /// Revocation ends renewal.
     pub const REVOCATION_ENDS_RENEWAL: &str = "revoking the principal closes the stream and a renewal answers 403 clearing the renewal cookie";
-    /// Logout clears both cookies.
-    pub const LOGOUT_CLEARS_BOTH: &str =
-        "logout clears the session and renewal cookies, and a renewal afterwards answers 401";
+    /// Logout redirects and clears both cookies.
+    pub const LOGOUT_CLEARS_BOTH: &str = "logout redirects with 303 to /ui/ and clears the session and renewal cookies, and a renewal afterwards answers 401";
     /// A suspended account cannot renew or sign in.
     pub const SUSPENSION_ENDS_RENEWAL: &str = "a suspended account's renewal answers 401 clearing the cookie, and its sign-in fails at the provider";
     /// Every check, in the order the scenario emits them.
@@ -515,9 +514,8 @@ pub mod identity {
     /// B18: a cross-site logout is refused.
     pub const CROSS_SITE_LOGOUT_REFUSED: &str =
         "a cross-site logout is refused with 403 and clears no cookie";
-    /// B18: a same-origin logout clears the session.
-    pub const LOGOUT_CLEARS_SESSION: &str =
-        "a same-origin logout answers 204 and clears the session cookie with Max-Age=0";
+    /// B18: a same-origin logout redirects and clears the session.
+    pub const LOGOUT_CLEARS_SESSION: &str = "a same-origin logout redirects with 303 to /ui/ and clears the session cookie with Max-Age=0";
     /// B20: the proof command runs for the login.
     pub const COMMAND_LOGIN: &str = "gang login --token-command runs the command once";
     /// B20: a fresh token is reused.
@@ -1039,4 +1037,161 @@ pub mod event_paging {
         "walking /v1/events one page at a time lists every event of the full list once, in order";
     /// B3: the last page of the events carries no token.
     pub const LAST_PAGE_OMITS_TOKEN: &str = "the last page of /v1/events carries no nextPageToken";
+}
+
+/// Checks of controller loss during a build.
+pub mod controller_loss {
+    /// The held build succeeds.
+    pub const BUILD: &str = "controller loss: build succeeds without failed actions";
+    /// A leader becomes available.
+    pub const TAKEOVER: &str = "controller loss: leader available within takeover bound";
+    /// Retries stay within the number of executing actions.
+    pub const REEXECUTIONS: &str = "controller loss: re-executions bounded by executing actions";
+    /// No action overlaps across workers.
+    pub const NO_OVERLAP: &str = "controller loss: no action overlaps on two workers";
+    /// Work is both held and queued.
+    pub const HELD: &str = "controller loss: actions execute while others are queued";
+    /// The worker PID is not the action PID.
+    pub const WORKER_PID: &str = "controller loss: worker pid differs from the action attempt";
+    /// Two workers can execute concurrently.
+    pub const TWO_WORKERS: &str = "controller loss: two workers can execute concurrently";
+}
+
+/// Checks of rolling controller replacement.
+pub mod rolling_deploy {
+    /// Work is both held and queued.
+    pub const HELD: &str = "rolling deploy: actions execute while others are queued";
+    /// The build succeeds.
+    pub const BUILD: &str = "rolling deploy: build succeeds without failed actions";
+    /// Each action starts exactly once.
+    pub const ATTEMPTS: &str = "rolling deploy: every action executes exactly once";
+    /// Both retired controllers exit.
+    pub const RETIRED: &str = "rolling deploy: both retired controllers exit successfully";
+    /// A leader is retired.
+    pub const LEADER_RETIRED: &str = "rolling deploy: a leader is retired";
+    /// A leader remains.
+    pub const LEADER: &str = "rolling deploy: a leader exists after replacement";
+}
+
+/// Checks of follower cache-call forwarding.
+pub mod follower_builds {
+    /// Only followers serve the public frontend.
+    pub const FOLLOWER_ONLY_SERVE: &str =
+        "follower builds: only followers serve the public frontend";
+    /// A direct follower request returns the controlled cache miss.
+    pub const CONTROLLED_MISS: &str = "follower builds: controlled request returns not found";
+    /// The leader records exactly the controlled miss.
+    pub const CONTROLLED_LEADER: &str =
+        "follower builds: leader records exactly the controlled miss";
+    /// The follower relays the controlled accounting.
+    pub const CONTROLLED_FOLLOWER: &str =
+        "follower builds: follower relays the controlled miss accounting";
+    /// A warm build has no misses, errors, executions, or unrecorded usage.
+    pub const WARM_ZERO_USAGE: &str =
+        "warm build has no misses, errors, executions, or unrecorded usage";
+    /// Only the surviving follower serves the public frontend.
+    pub const SURVIVOR_ONLY_SERVE: &str =
+        "follower builds: only the surviving follower serves the public frontend";
+    /// The killed leader's build is not on the new leader.
+    pub const KILLED_BUILD_ABSENT: &str =
+        "follower builds: the new leader does not list the killed leader's build";
+}
+
+/// Checks of login across controllers.
+pub mod login_across {
+    /// Device authorization crosses controllers.
+    pub const DEVICE: &str = "login across: device login completes across controllers";
+    /// Browser login crosses controllers.
+    pub const BROWSER: &str = "login across: browser login completes across controllers";
+    /// Device authorization cannot be redeemed twice.
+    pub const REPLAY: &str = "login across: a redeemed device code cannot be redeemed again";
+}
+
+/// Checks of revocation across controllers.
+pub mod cross_revocation {
+    /// A credential is initially admitted.
+    pub const INITIAL_LOGIN: &str = "cross-revocation: principal initially admitted on B";
+    /// The stream is initially open.
+    pub const STREAM_OPEN: &str = "cross-revocation: principal stream initially open on B";
+    /// A new credential is refused.
+    pub const LOGIN_REFUSED: &str = "cross-revocation: B refuses a new credential";
+    /// The leader stream closes.
+    pub const STREAM_CLOSED: &str = "cross-revocation: B closes the principal stream";
+    /// The revoked worker is deregistered.
+    pub const WORKER_CUT: &str = "cross-revocation: leader deregisters the revoked worker";
+    /// Restoration permits a new credential.
+    pub const RESTORED: &str = "cross-revocation: A admits the restored principal";
+    /// An existing bearer is refused.
+    pub const BEARER_REFUSED: &str = "cross-revocation: B refuses an existing bearer token";
+    /// The follower stream closes.
+    pub const FOLLOWER_STREAM_CLOSED: &str =
+        "cross-revocation: follower closes the principal stream";
+}
+
+/// Checks of leader failover.
+pub mod leader_failover {
+    /// Demand is queued with an existing worker.
+    pub const DEMAND: &str = "leader failover: demand is queued while an old worker exists";
+    /// Another controller takes over.
+    pub const TAKEOVER: &str = "leader failover: another controller takes over";
+    /// Bazel's executions reach the new leader while the old one is frozen.
+    pub const ZOMBIE_REROUTED: &str = "leader failover: Bazel's executions reach the new leader while the former leader is frozen";
+    /// Demand does not cause duplicate scale-outs.
+    pub const SCALE_OUT: &str = "leader failover: demand does not cause duplicate scale-outs";
+    /// Existing workers survive.
+    pub const OLD_WORKERS: &str = "leader failover: existing instances are not terminated";
+    /// The build succeeds.
+    pub const BUILD: &str = "leader failover: build succeeds";
+    /// A former leader adds no scaling events.
+    pub const ZOMBIE_EVENTS: &str =
+        "leader failover: resumed former leader adds no scaling or termination";
+    /// A former leader creates no unaccounted instances.
+    pub const ZOMBIE_RECORDS: &str =
+        "leader failover: resumed former leader creates no unaccounted instances";
+    /// A former leader exits after losing leadership.
+    pub const ZOMBIE_EXIT: &str = "leader failover: former leader exits with lost leadership";
+}
+
+/// Checks of a shared database outage and partition.
+pub mod database_outage {
+    /// The build remains held.
+    pub const HELD: &str = "database outage: build is held with queued demand";
+    /// Device login is refused.
+    pub const REFUSED: &str = "database outage: new device login is refused during the outage";
+    /// Scaling pauses.
+    pub const PAUSED: &str = "database outage: scaling pauses after lease validity lapses";
+    /// Demand arrives after validity lapses.
+    pub const DEMAND_QUEUED: &str = "database outage: new demand queues after validity lapses";
+    /// No scaling event occurs during the outage.
+    pub const NO_EVENTS: &str = "database outage: no scaling event is recorded during the outage";
+    /// The same leader remains.
+    pub const LEADER: &str = "database outage: the same controller remains leader";
+    /// Login resumes.
+    pub const LOGIN: &str = "database outage: new device login works after recovery";
+    /// Queued demand is met.
+    pub const RESUMED: &str = "database outage: queued demand is met after recovery";
+    /// Recovery scales out exactly once.
+    pub const ONE_SCALE_OUT: &str = "database outage: recovery records exactly one scale-out";
+    /// Enrollment returns unavailable.
+    pub const ENROLLMENT_REFUSED: &str =
+        "database outage: worker certificate enrollment returns 503";
+    /// Revocation returns unavailable.
+    pub const REVOCATION_REFUSED: &str = "database outage: principal revocation returns 503";
+    /// Both builds succeed.
+    pub const BUILD: &str = "database outage: held build succeeds after recovery";
+    /// The partition build stays held.
+    pub const PARTITION_HELD: &str =
+        "database partition: build remains active during the partition";
+    /// The follower takes over.
+    pub const PARTITION_TAKEOVER: &str = "database partition: the follower takes over";
+    /// The old leader is fenced.
+    pub const PARTITION_FENCED: &str =
+        "database partition: the old leader makes no worker change after validity lapses";
+    /// The old leader exits.
+    pub const PARTITION_EXIT: &str =
+        "database partition: the old leader exits after losing leadership";
+    /// Exactly one leader remains.
+    pub const PARTITION_SINGLE: &str = "database partition: exactly one leader remains";
+    /// The partition build succeeds.
+    pub const PARTITION_BUILD: &str = "database partition: the build succeeds";
 }

@@ -157,10 +157,12 @@ impl Provider {
         let id_token = response
             .identity
             .ok_or(OidcError::MissingClaim("id_token"))?;
-        self.verify_id_token(&id_token, Some(session.nonce.as_str()))
+        let principal = self
+            .verify_id_token(&id_token, Some(session.nonce.as_str()))
             .await?;
         Ok(LoginGrant {
             proof: Proof::new(id_token),
+            principal,
             refresh_token: response.refresh.map(RefreshToken::new),
         })
     }
@@ -183,9 +185,10 @@ impl Provider {
         let id_token = response
             .identity
             .ok_or(OidcError::MissingClaim("id_token"))?;
-        self.verify_id_token(&id_token, None).await?;
+        let principal = self.verify_id_token(&id_token, None).await?;
         Ok(LoginGrant {
             proof: Proof::new(id_token),
+            principal,
             refresh_token: response.refresh.map(RefreshToken::new),
         })
     }

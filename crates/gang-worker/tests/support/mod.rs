@@ -222,7 +222,7 @@ impl Enroller for FakeEnroller {
         let mut state = self.state.lock();
         state.proofs.push(proof.expose().to_owned());
         if state.rate_limits.next_fails() {
-            return Err(EnrollError::rate_limited(
+            return Err(EnrollError::retry_later(
                 io::Error::other("rate limited"),
                 state.rate_limit_retry_after,
             ));

@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use gang_config::GangConfig;
 use gang_os::FileLock;
-use gang_spi::{FleetSupply, PluginContext, ProvisionerPort};
+use gang_spi::{Fence, FleetSupply, PluginContext, ProvisionerPort};
 use gang_types::Fleet;
 
 use crate::cli::LocalDownArgs;
@@ -33,8 +33,8 @@ pub(crate) enum Stopped {
 /// removes its record. Liveness is the lock, never a pid probe.
 ///
 /// The returned `FileLock` is the server lock, acquired by the caller. While it lives, no server
-/// can start in this state directory, so callers hold it until they have finished acting on the
-/// stopped server (such as terminating its workers).
+/// can start in this state directory. The caller transfers it to a fence that owns it until the
+/// caller has finished acting on the stopped server, including terminating its workers.
 pub(crate) fn stop_server(
     directory: &ServerDirectory,
     wait: &Wait,
@@ -118,14 +118,19 @@ pub(crate) fn run(args: LocalDownArgs, out: &Output) -> errors::Result<ExitCode>
         poll_interval: args.poll_interval,
     };
     let (outcome, lock) = stop_server(&directory, &wait, &LocalStackProcesses, out)?;
-    let workers = terminate_workers(config, &path)?;
+    let fence = Fence::exclusive(lock);
+    let workers = terminate_workers(config, &path, &fence)?;
     present(out, outcome, workers)?;
-    drop(lock);
+    drop(fence);
     Ok(ExitCode::SUCCESS)
 }
 
 /// Terminates every worker instance the configured fleets name; returns how many were terminated.
-fn terminate_workers(config: GangConfig<Plugins>, config_path: &Path) -> errors::Result<usize> {
+fn terminate_workers(
+    config: GangConfig<Plugins>,
+    config_path: &Path,
+    fence: &Fence,
+) -> errors::Result<usize> {
     let GangConfig {
         provisioner,
         fleets,
@@ -134,6 +139,7 @@ fn terminate_workers(config: GangConfig<Plugins>, config_path: &Path) -> errors:
     let provisioner = Provisioner::build(provisioner, &PluginContext { config_path })?;
     runtime::block_on(terminate_all(
         &provisioner,
+        fence,
         fleets.iter().map(|fleet| fleet.fleet()),
     ))
 }
@@ -141,38 +147,45 @@ fn terminate_workers(config: GangConfig<Plugins>, config_path: &Path) -> errors:
 /// Terminates each instance the provisioner reports for every fleet; returns how many were terminated.
 async fn terminate_all<'a, P: ProvisionerPort + 'a>(
     provisioner: &P,
+    fence: &Fence,
     fleets: impl IntoIterator<Item = Fleet<'a, P::FleetOptions>>,
 ) -> Result<usize, LocalCommandError> {
     let mut terminated = 0;
     for fleet in fleets {
-        terminated += terminate_fleet(provisioner, fleet).await?;
+        terminated += terminate_fleet(provisioner, fence, fleet).await?;
     }
     Ok(terminated)
 }
 
 /// Terminates every instance of `fleet` and returns how many there were.
 ///
-/// The desired capacity falls to zero before the instances are listed, so the provisioner
-/// does not launch replacements for the instances it terminates.
+/// The first capacity change prevents replacements; after terminating the listed instances, a
+/// second change retires workers that exited meanwhile and leaves desired capacity at zero
+/// once every live worker is terminating.
 async fn terminate_fleet<P: ProvisionerPort>(
     provisioner: &P,
+    fence: &Fence,
     fleet: Fleet<'_, P::FleetOptions>,
 ) -> Result<usize, LocalCommandError> {
-    provisioner
-        .set_desired_capacity(fleet, 0)
+    fence
+        .run(async |held| provisioner.set_desired_capacity(held, fleet, 0).await)
         .await
-        .map_err(LocalCommandError::Provisioner)?;
+        .map_err(|error| LocalCommandError::Provisioner(error.into()))?;
     let mut supply = FleetSupply::default();
     provisioner
         .supply(fleet, &mut supply)
         .await
         .map_err(LocalCommandError::Provisioner)?;
     for instance in &supply.instances {
-        provisioner
-            .terminate(fleet, &instance.id)
+        fence
+            .run(async |held| provisioner.terminate(held, fleet, &instance.id).await)
             .await
-            .map_err(LocalCommandError::Provisioner)?;
+            .map_err(|error| LocalCommandError::Provisioner(error.into()))?;
     }
+    fence
+        .run(async |held| provisioner.set_desired_capacity(held, fleet, 0).await)
+        .await
+        .map_err(|error| LocalCommandError::Provisioner(error.into()))?;
     Ok(supply.instances.len())
 }
 
@@ -185,7 +198,7 @@ mod tests {
     use std::time::Duration;
 
     use gang_clock::Timestamp;
-    use gang_spi::{FleetInstance, PortError};
+    use gang_spi::{FleetInstance, Held, PortError};
     use gang_types::{
         Bytes, FleetName, InstanceId, InstanceLifecycle, Isa, NonZeroDuration, Resources,
     };
@@ -257,6 +270,8 @@ mod tests {
         supplies: Vec<(&'static str, Vec<InstanceId>)>,
         failing_capacity: bool,
         calls: Mutex<Vec<String>>,
+        lock_path: Option<PathBuf>,
+        lock_observations: Mutex<Vec<bool>>,
     }
 
     impl RecordingProvisioner {
@@ -280,12 +295,20 @@ mod tests {
                     .collect(),
                 failing_capacity: false,
                 calls: Mutex::new(Vec::new()),
+                lock_path: None,
+                lock_observations: Mutex::new(Vec::new()),
             }
         }
 
         /// Makes every capacity change fail.
         fn failing_capacity(mut self) -> Self {
             self.failing_capacity = true;
+            self
+        }
+
+        /// Records whether the given lock is held during each changing call.
+        fn observing_lock(mut self, path: PathBuf) -> Self {
+            self.lock_path = Some(path);
             self
         }
 
@@ -298,6 +321,16 @@ mod tests {
 
         fn record(&self, call: String) {
             self.calls.lock().push(call);
+        }
+
+        fn record_change(&self, held: &Held) -> Result<(), PortError> {
+            held.check()?;
+            if let Some(path) = &self.lock_path {
+                self.lock_observations
+                    .lock()
+                    .push(FileLock::is_held(path).expect("probe lock"));
+            }
+            Ok(())
         }
 
         fn calls(&self) -> Vec<String> {
@@ -332,9 +365,11 @@ mod tests {
 
         async fn set_desired_capacity(
             &self,
+            held: &Held,
             fleet: Fleet<'_, ()>,
             desired: u32,
         ) -> Result<(), PortError> {
+            self.record_change(held)?;
             self.record(format!(
                 "set_desired_capacity({}, {desired})",
                 fleet.name.as_str()
@@ -347,14 +382,131 @@ mod tests {
 
         async fn terminate(
             &self,
+            held: &Held,
             fleet: Fleet<'_, ()>,
             instance: &InstanceId,
         ) -> Result<(), PortError> {
+            self.record_change(held)?;
             self.record(format!(
                 "terminate({}, {})",
                 fleet.name.as_str(),
                 instance.as_str()
             ));
+            Ok(())
+        }
+
+        fn worker_lifetime(&self) -> gang_types::WorkerLifetime {
+            gang_types::WorkerLifetime::LongLived
+        }
+    }
+
+    /// Models Local's capacity clamping and retirement when a worker exits during shutdown.
+    struct ClampingProvisioner {
+        state: Mutex<ClampingState>,
+    }
+
+    /// Desired capacity and the live and terminating flags for each recorded instance.
+    struct ClampingState {
+        desired: u32,
+        instances: Vec<(InstanceId, bool, bool)>,
+        capacity_calls: usize,
+    }
+
+    impl ClampingProvisioner {
+        fn new() -> Self {
+            Self {
+                state: Mutex::new(ClampingState {
+                    desired: 2,
+                    instances: ["local-1", "local-2"]
+                        .into_iter()
+                        .map(|id| {
+                            (
+                                InstanceId::try_new(id).expect("valid instance id"),
+                                true,
+                                false,
+                            )
+                        })
+                        .collect(),
+                    capacity_calls: 0,
+                }),
+            }
+        }
+    }
+
+    impl ProvisionerPort for ClampingProvisioner {
+        type FleetOptions = ();
+
+        async fn supply(
+            &self,
+            _fleet: Fleet<'_, ()>,
+            into: &mut FleetSupply,
+        ) -> Result<(), PortError> {
+            let state = self.state.lock();
+            *into = FleetSupply {
+                desired: state.desired,
+                instances: state
+                    .instances
+                    .iter()
+                    .filter(|(_, live, _)| *live)
+                    .map(|(id, _, _)| FleetInstance {
+                        id: id.clone(),
+                        lifecycle: InstanceLifecycle::InService,
+                        launched_at: Timestamp::UNIX_EPOCH,
+                        release_first: false,
+                    })
+                    .collect(),
+                ..FleetSupply::default()
+            };
+            Ok(())
+        }
+
+        async fn set_desired_capacity(
+            &self,
+            held: &Held,
+            _fleet: Fleet<'_, ()>,
+            desired: u32,
+        ) -> Result<(), PortError> {
+            held.check()?;
+            let mut state = self.state.lock();
+            state.instances.retain(|(_, live, _)| *live);
+            let serving = u32::try_from(
+                state
+                    .instances
+                    .iter()
+                    .filter(|(_, live, terminating)| *live && !*terminating)
+                    .count(),
+            )
+            .expect("the test fleet is small");
+            state.desired = desired.max(serving);
+            state.capacity_calls += 1;
+            if state.capacity_calls == 1
+                && let Some((_, live, _)) = state
+                    .instances
+                    .iter_mut()
+                    .find(|(id, _, _)| id.as_str() == "local-1")
+            {
+                *live = false;
+            }
+            Ok(())
+        }
+
+        async fn terminate(
+            &self,
+            held: &Held,
+            _fleet: Fleet<'_, ()>,
+            instance: &InstanceId,
+        ) -> Result<(), PortError> {
+            held.check()?;
+            let mut state = self.state.lock();
+            if let Some(index) = state.instances.iter().position(|(id, _, _)| id == instance) {
+                let (_, live, terminating) = &mut state.instances[index];
+                if !*live {
+                    state.instances.remove(index);
+                } else if !*terminating {
+                    *terminating = true;
+                    state.desired -= 1;
+                }
+            }
             Ok(())
         }
 
@@ -641,8 +793,12 @@ mod tests {
     fn workers_drop_desired_capacity_before_supply_and_terminate_each_instance() {
         let provisioner = RecordingProvisioner::new(&["local-1", "local-2"]);
         let name = fleet_name();
-        let terminated = runtime::block_on(terminate_fleet(&provisioner, fleet(&name)))
-            .expect("fleet terminates");
+        let terminated = runtime::block_on(terminate_fleet(
+            &provisioner,
+            &gang_testkit::fence::valid_fence(),
+            fleet(&name),
+        ))
+        .expect("fleet terminates");
 
         assert_eq!(terminated, 2);
         assert_eq!(
@@ -652,7 +808,52 @@ mod tests {
                 "supply(local-workers)",
                 "terminate(local-workers, local-1)",
                 "terminate(local-workers, local-2)",
+                "set_desired_capacity(local-workers, 0)",
             ]
+        );
+    }
+
+    #[test]
+    fn terminate_all_holds_the_exclusive_lock_for_every_change() {
+        let _gate = gang_testkit::fork_gate::lock_user();
+        let directory = TempDir::new().expect("create state dir");
+        let lock_path = directory.path().join("lock");
+        let lock = FileLock::try_exclusive(&lock_path)
+            .expect("acquire lock")
+            .expect("lock is available");
+        let fence = Fence::exclusive(lock);
+        let provisioner =
+            RecordingProvisioner::new(&["local-1", "local-2"]).observing_lock(lock_path.clone());
+        let name = fleet_name();
+
+        runtime::block_on(terminate_all(&provisioner, &fence, [fleet(&name)]))
+            .expect("fleet terminates");
+
+        assert_eq!(*provisioner.lock_observations.lock(), [true; 4]);
+        drop(fence);
+        assert!(!FileLock::is_held(&lock_path).expect("probe released lock"));
+    }
+
+    #[test]
+    fn a_worker_exiting_during_down_leaves_nothing_desired_or_unretired() {
+        let provisioner = ClampingProvisioner::new();
+        let name = fleet_name();
+
+        runtime::block_on(terminate_all(
+            &provisioner,
+            &gang_testkit::fence::valid_fence(),
+            [fleet(&name)],
+        ))
+        .expect("fleet terminates");
+
+        let state = provisioner.state.lock();
+        assert_eq!(
+            state.desired, 0,
+            "desired capacity stayed above zero after gang local down"
+        );
+        assert!(
+            state.instances.iter().all(|(_, live, _)| *live),
+            "an exited worker was left unretired"
         );
     }
 
@@ -661,7 +862,11 @@ mod tests {
         let provisioner = RecordingProvisioner::new(&["local-1", "local-2"]).failing_capacity();
         let name = fleet_name();
 
-        let result = runtime::block_on(terminate_fleet(&provisioner, fleet(&name)));
+        let result = runtime::block_on(terminate_fleet(
+            &provisioner,
+            &gang_testkit::fence::valid_fence(),
+            fleet(&name),
+        ));
 
         assert!(matches!(
             result,
@@ -684,9 +889,12 @@ mod tests {
         let alpha = FleetName::try_new("alpha").expect("valid fleet name");
         let beta = FleetName::try_new("beta").expect("valid fleet name");
 
-        let terminated =
-            runtime::block_on(terminate_all(&provisioner, [fleet(&alpha), fleet(&beta)]))
-                .expect("fleets terminate");
+        let terminated = runtime::block_on(terminate_all(
+            &provisioner,
+            &gang_testkit::fence::valid_fence(),
+            [fleet(&alpha), fleet(&beta)],
+        ))
+        .expect("fleets terminate");
 
         assert_eq!(terminated, 3);
         assert_eq!(
@@ -696,9 +904,11 @@ mod tests {
                 "supply(alpha)",
                 "terminate(alpha, alpha-1)",
                 "terminate(alpha, alpha-2)",
+                "set_desired_capacity(alpha, 0)",
                 "set_desired_capacity(beta, 0)",
                 "supply(beta)",
                 "terminate(beta, beta-1)",
+                "set_desired_capacity(beta, 0)",
             ]
         );
     }

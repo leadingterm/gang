@@ -1,4 +1,4 @@
-//! Tunables of the harness and the resolved tools used by sample actions.
+//! Tunables, resolved deployment inputs, and tools used by sample actions.
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -7,6 +7,27 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::errors::{E2eError, Result};
+
+/// The resolved inputs used to create harness deployments.
+#[derive(Debug, Clone)]
+pub struct DeploymentInputs {
+    /// The `gang` binary under test.
+    pub gang: PathBuf,
+    /// The Bazel binary the harness drives.
+    pub bazel: PathBuf,
+    /// The pinned `PostgreSQL` archive used by cluster scenarios.
+    pub postgres: PathBuf,
+    /// The base `gang.toml` the variants are applied to.
+    pub base_config: String,
+    /// The sample workspace the builds run in.
+    pub sample: PathBuf,
+    /// The directory of the checked-in gang.toml files.
+    pub configs: PathBuf,
+    /// The tunables of the harness.
+    pub settings: Settings,
+    /// The resolved tools used by the sample's actions.
+    pub action_tools: ActionTools,
+}
 
 /// Default for [`Settings::handshake_timeout`].
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -28,9 +49,6 @@ pub const DEFAULT_HOLD_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// Default for [`Settings::token_lifetime`]: ten minutes.
 pub const DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_mins(10);
-
-/// Default for [`Settings::remote_retries`].
-pub const DEFAULT_REMOTE_RETRIES: u32 = 10;
 
 /// Default for [`Settings::stderr_tail_lines`].
 pub const DEFAULT_STDERR_TAIL_LINES: usize = 30;
@@ -102,8 +120,6 @@ pub struct Settings {
     /// The lifetime of the tokens the in-process issuer mints.
     #[serde(with = "gang_types::duration")]
     pub token_lifetime: Duration,
-    /// How often Bazel retries a failed remote call (`--remote_retries`).
-    pub remote_retries: u32,
     /// The directory under which each scenario creates its scratch directory; the system
     /// temporary directory when absent.
     pub scratch_root: Option<PathBuf>,
@@ -138,7 +154,6 @@ impl Default for Settings {
             history_timeout: DEFAULT_HISTORY_TIMEOUT,
             hold_timeout: DEFAULT_HOLD_TIMEOUT,
             token_lifetime: DEFAULT_TOKEN_LIFETIME,
-            remote_retries: DEFAULT_REMOTE_RETRIES,
             scratch_root: None,
             worker_launcher: DEFAULT_WORKER_LAUNCHER
                 .iter()

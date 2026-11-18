@@ -130,6 +130,14 @@ run "one_spot_asg_per_fleet" {
   assert {
     condition = alltrue([
       for fleet in var.fleets :
+      aws_launch_template.this[fleet.name].update_default_version
+    ])
+    error_message = "Worker launch templates must promote new versions to the default."
+  }
+
+  assert {
+    condition = alltrue([
+      for fleet in var.fleets :
       aws_launch_template.this[fleet.name].metadata_options[0].http_tokens == "required"
       && aws_launch_template.this[fleet.name].metadata_options[0].http_put_response_hop_limit == 1
       && aws_launch_template.this[fleet.name].metadata_options[0].instance_metadata_tags == "enabled"

@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -8,28 +10,87 @@ use gang_types::NonZeroDuration;
 use crate::migrations::migrate;
 use crate::{SqliteConfig, SqliteError};
 
-/// The `SQLite`-backed state repository. The database is opened on first use, so building the
-/// plugin touches no disk.
+/// The `SQLite`-backed state repository. Its lock is acquired at build time and its database
+/// connection is opened on first use.
 pub struct Sqlite {
     config: SqliteConfig,
     connection: tokio::sync::OnceCell<tokio_rusqlite::Connection>,
+    lock: Arc<gang_os::FileLock>,
 }
 
 impl Plugin for Sqlite {
     type Config = SqliteConfig;
 
-    fn build(config: SqliteConfig, _context: &PluginContext<'_>) -> Result<Self, PortError> {
+    fn build(mut config: SqliteConfig, context: &PluginContext<'_>) -> Result<Self, PortError> {
         if config.path.as_os_str().is_empty() {
             return Err(PortError::config("sqlite path must not be empty"));
         }
+        let requested = if config.path.is_absolute() {
+            config.path.clone()
+        } else {
+            context
+                .config_path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(Path::new("."))
+                .join(&config.path)
+        };
+        config.path = resolve_path(&requested).map_err(|source| SqliteError::ResolvePath {
+            path: requested,
+            source,
+        })?;
+        let mut lock_path = config.path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lock_path = std::path::PathBuf::from(lock_path);
+        let lock = gang_os::FileLock::try_exclusive(&lock_path)
+            .map_err(SqliteError::from)?
+            .ok_or_else(|| SqliteError::Locked {
+                path: config.path.clone(),
+            })?;
         Ok(Self {
             config,
             connection: tokio::sync::OnceCell::new(),
+            lock: Arc::new(lock),
         })
     }
 }
 
+fn resolve_path(path: &Path) -> std::io::Result<PathBuf> {
+    match std::fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A dangling symlink must not create a second lock name for its eventual target.
+            match std::fs::symlink_metadata(path) {
+                Ok(_) => return Err(error),
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {}
+                Err(other) => return Err(other),
+            }
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let name = path.file_name().ok_or(error)?;
+            Ok(std::fs::canonicalize(parent)?.join(name))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 impl Sqlite {
+    /// Closes the connection and waits for its worker to release the database lock.
+    ///
+    /// # Errors
+    /// Returns an error if the connection cannot be closed.
+    pub async fn close(mut self) -> Result<(), SqliteError> {
+        if let Some(connection) = self.connection.take() {
+            connection.close().await.map_err(|error| match error {
+                tokio_rusqlite::Error::Close((_, source)) => SqliteError::from(source),
+                _ => SqliteError::Closed,
+            })?;
+        }
+        Ok(())
+    }
+
     /// Runs `work` on the database thread with the open, migrated connection; the first call
     /// opens the database (a failed open is not cached).
     pub(crate) async fn run<T: Send + 'static>(
@@ -44,9 +105,13 @@ impl Sqlite {
         let path = &self.config.path;
         let connection = tokio_rusqlite::Connection::open(path)
             .await
-            .map_err(|source| SqliteError::Open {
-                path: path.clone(),
-                source,
+            .map_err(|source| match SqliteError::from(source) {
+                SqliteError::Busy(source) => SqliteError::Busy(source),
+                SqliteError::Query(source) => SqliteError::Open {
+                    path: path.clone(),
+                    source,
+                },
+                other => other,
             })?;
         let settings = BringUp {
             busy_timeout: self.config.busy_timeout,
@@ -56,8 +121,20 @@ impl Sqlite {
                 self.config.synchronous.as_pragma(),
             ),
         };
+        let lock = Arc::clone(&self.lock);
         connection
-            .call(move |db| bring_up_with_retry(db, &settings, &mut thread::sleep))
+            .call(move |db| {
+                db.create_scalar_function(
+                    "__gang_lock_guard",
+                    0,
+                    rusqlite::functions::FunctionFlags::empty(),
+                    move |_| {
+                        let _guard = &lock;
+                        Ok(0_i64)
+                    },
+                )?;
+                bring_up_with_retry(db, &settings, &mut thread::sleep)
+            })
             .await?;
         Ok(connection)
     }
@@ -119,16 +196,7 @@ fn retry_while_busy(
 
 /// Whether the error is a lock held by another connection.
 fn is_busy(error: &SqliteError) -> bool {
-    matches!(
-        error,
-        SqliteError::Query(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error { code, .. },
-            _,
-        )) if matches!(
-            code,
-            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-        )
-    )
+    matches!(error, SqliteError::Busy(_))
 }
 
 #[cfg(test)]
@@ -142,6 +210,37 @@ mod tests {
     use super::*;
     use crate::Synchronous;
 
+    #[tokio::test]
+    async fn lock_survives_cancelled_work_until_worker_finishes() {
+        let dir = TempDir::new().expect("temp dir is created");
+        let config = SqliteConfig::new(dir.path().join("gang.db"));
+        let context = PluginContext {
+            config_path: Path::new("gang.toml"),
+        };
+        let store = Sqlite::build(config.clone(), &context).expect("store builds");
+        store.run(|_| Ok(())).await.expect("connection opens");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut work = Box::pin(store.run(move |_| {
+            let _ = started_tx.send(());
+            release_rx.recv().expect("worker released");
+            Ok(())
+        }));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(work.as_mut().poll(cx).is_pending()))
+                .await
+        );
+        started_rx.await.expect("worker started");
+        drop(work);
+        drop(store);
+        let successor = Sqlite::build(config, &context);
+        release_tx.send(()).expect("worker is still running");
+        assert!(
+            successor.is_err(),
+            "successor acquired lock while worker was running"
+        );
+    }
+
     #[test]
     fn only_lock_contention_is_busy() {
         let failure = sqlite_failure;
@@ -152,7 +251,7 @@ mod tests {
     }
 
     fn sqlite_failure(code: i32) -> SqliteError {
-        SqliteError::Query(rusqlite::Error::SqliteFailure(
+        SqliteError::from(rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(code),
             None,
         ))
@@ -241,7 +340,7 @@ mod tests {
             &settings,
             || {
                 calls += 1;
-                Err(SqliteError::Query(rusqlite::Error::SqliteFailure(
+                Err(SqliteError::Busy(rusqlite::Error::SqliteFailure(
                     rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
                     Some(format!("attempt {calls}")),
                 )))
@@ -259,7 +358,7 @@ mod tests {
             u32::try_from(pauses.len()).expect("pauses fit in u32"),
             attempts - 1
         );
-        let Err(SqliteError::Query(rusqlite::Error::SqliteFailure(_, message))) = result else {
+        let Err(SqliteError::Busy(rusqlite::Error::SqliteFailure(_, message))) = result else {
             panic!("a store that stays busy must return the busy error");
         };
         assert_eq!(message, Some(format!("attempt {attempts}")));
@@ -350,8 +449,9 @@ mod tests {
     #[tokio::test]
     async fn a_failed_open_is_not_cached() {
         let dir = TempDir::new().expect("temp dir is created");
-        let missing = dir.path().join("missing");
-        let config = SqliteConfig::new(missing.join("gang.db"));
+        let path = dir.path().join("gang.db");
+        fs::create_dir(&path).expect("a directory occupies the database path");
+        let config = SqliteConfig::new(path.clone());
         let context = PluginContext {
             config_path: Path::new("gang.toml"),
         };
@@ -360,10 +460,10 @@ mod tests {
         let failed = store.run(|_| Ok(())).await;
         assert!(matches!(failed, Err(SqliteError::Open { .. })));
 
-        fs::create_dir(&missing).expect("directory is created");
+        fs::remove_dir(&path).expect("the obstruction is removed");
         store
             .run(|_| Ok(()))
             .await
-            .expect("the store opens once the directory exists");
+            .expect("the store opens once the obstruction is removed");
     }
 }

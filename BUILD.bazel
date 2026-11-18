@@ -1,4 +1,5 @@
 load("@aspect_gazelle_prebuilt//:def.bzl", "aspect_gazelle")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//bazel/rust:defs.bzl", "workspace_rust_source_set")
 
 aspect_gazelle(
@@ -20,7 +21,17 @@ exports_files([
     "Cargo.toml",
     "MODULE.bazel",
     "clippy.toml",
+    "tools/e2e-gate.sh",
 ])
+
+sh_test(
+    name = "check-opentofu-tests_test",
+    size = "small",
+    timeout = "short",
+    srcs = ["tools/check-opentofu-tests_test.sh"],
+    data = ["tools/check-opentofu-tests.sh"],
+    env = {"GUARD_SCRIPT": "$(rootpath tools/check-opentofu-tests.sh)"},
+)
 
 workspace_rust_source_set(
     name = "rust_workspace_sources",
@@ -29,6 +40,7 @@ workspace_rust_source_set(
         "bazel/opentofu/runner",
         "crates/gang-authn",
         "crates/gang-aws",
+        "crates/gang-aws-sdk",
         "crates/gang-bindings",
         "crates/gang-bwrap",
         "crates/gang-cgroup",
@@ -36,6 +48,7 @@ workspace_rust_source_set(
         "crates/gang-clock",
         "crates/gang-config",
         "crates/gang-deploy",
+        "crates/gang-dynamodb",
         "crates/gang-e2e",
         "crates/gang-embed",
         "crates/gang-exec",
@@ -48,6 +61,7 @@ workspace_rust_source_set(
         "crates/gang-noop",
         "crates/gang-oidc",
         "crates/gang-os",
+        "crates/gang-postgres",
         "crates/gang-reconciler",
         "crates/gang-server",
         "crates/gang-spi",

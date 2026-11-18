@@ -18,9 +18,9 @@ use crate::identity::{Admission, Credentials, Identity, Issuance, Presenting};
 use crate::issuer::{TestIssuer, TokenSpec};
 use crate::process::run;
 use crate::session::SessionCookie;
+use crate::settings::DeploymentInputs;
 use crate::stack::Stack;
 use crate::state_api::{StateApi, StateStream};
-use crate::suite::Invocation;
 use crate::system::{Probe, System, Variant};
 use crate::template::{PROVIDER, Transport};
 use crate::tls_client::{self, ALPN_H2};
@@ -64,7 +64,7 @@ impl<'a> Secured<'a> {
     ///
     /// When the deployment cannot be created or the server does not start listening.
     pub fn create(
-        invocation: &Invocation,
+        invocation: &DeploymentInputs,
         variant: &Variant,
         issuer: &'a TestIssuer,
     ) -> Result<Self> {

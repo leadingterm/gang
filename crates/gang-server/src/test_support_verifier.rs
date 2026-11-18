@@ -9,6 +9,7 @@ use gang_spi::{
 };
 use gang_types::{LoginSession, Principal, Proof, RefreshToken, Url};
 use parking_lot::Mutex;
+use tokio::sync::Notify;
 
 const AUTHORIZE_URL: &str = "https://idp.example.test/authorize";
 
@@ -60,6 +61,8 @@ struct LoginFlow {
     renewal_outcomes: BTreeMap<String, RenewalOutcome>,
     /// Refresh token and client id for each renewal.
     renewals: Vec<(String, Option<String>)>,
+    /// A one-shot pause before returning the next renewal result.
+    renewal_pause: Option<(Arc<Notify>, Arc<Notify>)>,
     started: u64,
 }
 
@@ -148,6 +151,14 @@ impl FakeVerifier {
     #[must_use]
     pub fn renewals(&self) -> Vec<(String, Option<String>)> {
         self.flow.lock().renewals.clone()
+    }
+
+    /// Pauses the next renewal until the returned release notification is sent.
+    pub fn pause_renewal(&self) -> (Arc<Notify>, Arc<Notify>) {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        self.flow.lock().renewal_pause = Some((started.clone(), release.clone()));
+        (started, release)
     }
 
     fn set(&self, proof: &str, outcome: Outcome) {
@@ -248,9 +259,12 @@ impl LoginPort for FakeVerifier {
         }
         let code = query("code").ok_or(PortError::refused(Rejection::InvalidProof))?;
         let refresh_token = self.flow.lock().refresh_tokens.get(&code).cloned();
+        let proof = Proof::new(code);
+        let principal = self.verify(&proof).await?;
         Ok(LoginGrant {
-            proof: Proof::new(code),
+            proof,
             refresh_token: refresh_token.map(RefreshToken::new),
+            principal,
         })
     }
 
@@ -262,16 +276,32 @@ impl LoginPort for FakeVerifier {
         if self.login != LoginSupport::Interactive {
             return Err(PortError::Unsupported { operation: "renew" });
         }
-        let mut flow = self.flow.lock();
-        flow.renewals.push((
-            refresh_token.expose().to_owned(),
-            client.map(|client| client.id.clone()),
-        ));
-        match flow.renewal_outcomes.get(refresh_token.expose()) {
-            Some(RenewalOutcome::Grant(proof, rotated)) => Ok(LoginGrant {
-                proof: Proof::new(proof.clone()),
-                refresh_token: rotated.clone().map(RefreshToken::new),
-            }),
+        let pause = {
+            let mut flow = self.flow.lock();
+            flow.renewals.push((
+                refresh_token.expose().to_owned(),
+                client.map(|client| client.id.clone()),
+            ));
+            flow.renewal_pause.take()
+        };
+        if let Some((started, release)) = pause {
+            started.notify_one();
+            release.notified().await;
+        }
+        let outcome = {
+            let flow = self.flow.lock();
+            flow.renewal_outcomes.get(refresh_token.expose()).cloned()
+        };
+        match outcome {
+            Some(RenewalOutcome::Grant(proof, rotated)) => {
+                let proof = Proof::new(proof);
+                let principal = self.verify(&proof).await?;
+                Ok(LoginGrant {
+                    proof,
+                    refresh_token: rotated.map(RefreshToken::new),
+                    principal,
+                })
+            }
             Some(RenewalOutcome::Unavailable) => {
                 Err(PortError::unavailable("identity provider is unavailable"))
             }

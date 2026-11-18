@@ -23,6 +23,7 @@ pub(crate) const fn listen_key(role: ListenerRole) -> &'static str {
     match role {
         ListenerRole::Public => "listen",
         ListenerRole::Worker => "worker_listen",
+        ListenerRole::Health => "health_listen",
         ListenerRole::Imds => "mock_imds_listen",
     }
 }
@@ -33,6 +34,9 @@ pub(crate) enum MainError {
     /// The reset trampoline was not given a program.
     #[error("a program is required")]
     ResetUsage,
+    /// The local worker bootstrap was not given a program.
+    #[error("a local worker program is required")]
+    LocalWorkerUsage,
     /// The reset trampoline could not clear the signal mask.
     #[error("cannot reset the signal mask")]
     ResetMask(#[source] io::Error),
@@ -61,6 +65,47 @@ pub(crate) enum MainError {
         #[source]
         source: gang_config::ConfigError,
     },
+
+    /// The database section could not be parsed.
+    #[error("invalid database configuration `{}`", path.display())]
+    DatabaseConfig {
+        /// The configuration file.
+        path: PathBuf,
+        /// The parse failure.
+        #[source]
+        source: toml::de::Error,
+    },
+
+    /// The target database already contains durable records.
+    #[error("target database `{}` is not empty", path.display())]
+    DatabaseNotEmpty {
+        /// The target configuration file.
+        path: PathBuf,
+    },
+
+    /// A copied event was assigned a different sequence number.
+    #[error("target database `{}` assigned event sequence {} instead of {}", path.display(), actual.get(), expected.get())]
+    DatabaseSequence {
+        /// The target configuration file.
+        path: PathBuf,
+        /// The source sequence number.
+        expected: gang_spi::ScalingEventSeq,
+        /// The assigned sequence number.
+        actual: gang_spi::ScalingEventSeq,
+    },
+
+    /// The source audit has no event in the next sequence window.
+    #[error("source audit has a sequence gap after {} (latest is {})", after.get(), last.get())]
+    DatabaseSequenceGap {
+        /// The last event copied.
+        after: gang_spi::ScalingEventSeq,
+        /// The latest event observed in the source.
+        last: gang_spi::ScalingEventSeq,
+    },
+
+    /// A database operation failed.
+    #[error("database operation failed")]
+    Database(#[source] gang_spi::PortError),
 
     /// A plugin could not be constructed from its configuration section.
     #[error("cannot build the {domain} plugin")]
@@ -116,6 +161,10 @@ pub(crate) enum MainError {
     /// A listening socket's bound address could not be read.
     #[error("cannot read the bound address of a listener")]
     LocalAddress(#[source] io::Error),
+
+    /// The operating system could not generate a controller identifier.
+    #[error("cannot generate a controller id")]
+    ControllerId(#[source] getrandom::Error),
 
     /// A listener's URL cannot be derived from its bound address and transport scheme.
     #[error("cannot derive a listener url")]
@@ -229,10 +278,6 @@ pub(crate) enum MainError {
     #[error("cannot write the CA certificate")]
     CaCertificate(#[source] gang_os::PathIo),
 
-    /// A task the provisioner attached to the server stopped while the server was running.
-    #[error("a provisioner sidecar stopped")]
-    Sidecar(#[source] gang_spi::PortError),
-
     /// The dashboard login's client secret could not be loaded from its source.
     #[error("cannot load the dashboard login client secret")]
     #[fix(source)]
@@ -245,6 +290,14 @@ pub(crate) enum MainError {
     /// The gang server command failed.
     #[error(transparent)]
     Server(#[from] gang_server::ServerError),
+
+    /// The host could not be marked serving before its deadline.
+    #[error("cannot report the serving milestone")]
+    ServingMilestone(#[source] gang_spi::PortError),
+
+    /// The controller exceeded its shutdown grace.
+    #[error("controller shutdown exceeded its configured grace")]
+    ShutdownTimedOut(#[source] gang_clock::Elapsed),
 
     /// The gang worker command failed.
     #[error(transparent)]
@@ -268,6 +321,10 @@ pub(crate) enum MainError {
     #[error(transparent)]
     #[fix(source)]
     Local(#[from] LocalCommandError),
+
+    /// The local worker bootstrap could not commit or execute the worker.
+    #[error(transparent)]
+    LocalWorker(#[from] gang_local::LocalError),
 
     /// A deploy decision refused to go on, or could not read its input.
     #[error(transparent)]
@@ -485,6 +542,7 @@ mod tests {
     fn listen_keys_match_configuration() {
         assert_eq!(listen_key(ListenerRole::Public), "listen");
         assert_eq!(listen_key(ListenerRole::Worker), "worker_listen");
+        assert_eq!(listen_key(ListenerRole::Health), "health_listen");
         assert_eq!(listen_key(ListenerRole::Imds), "mock_imds_listen");
     }
 
@@ -515,6 +573,10 @@ mod tests {
         assert_eq!(
             fix(ListenerRole::Worker).as_deref(),
             Some("stop what holds 0.0.0.0:443, or change worker_listen in the configuration")
+        );
+        assert_eq!(
+            fix(ListenerRole::Health).as_deref(),
+            Some("stop what holds 0.0.0.0:443, or change health_listen in the configuration")
         );
         assert_eq!(
             fix(ListenerRole::Imds).as_deref(),
@@ -619,10 +681,6 @@ mod tests {
 
     #[test]
     fn internal_failures_carry_no_fix() {
-        assert_eq!(
-            MainError::Sidecar(gang_spi::PortError::backend(io::Error::other("stopped"))).fix(),
-            None
-        );
         assert_eq!(MainError::Stdin(io_cause()).fix(), None);
         let mismatch = LocalCommandError::PinMismatch {
             derived: CaPin::new([1; 32]),

@@ -37,10 +37,18 @@ export const clientFor = ({ state = snapshotOf(load("live")), session: who = ses
   client.session.value = who;
   client.link.value = link;
   client.access.value = {
-    principals: principals.principals,
-    nextPageToken: principals.nextPageToken,
-    revoked: principals.principals.filter((p) => p.revokeTime !== undefined),
-    roles: roles.roles,
+    kind: "loaded",
+    data: {
+      principals: principals.principals,
+      nextPageToken: principals.nextPageToken,
+      revoked: principals.principals.filter((p) => p.revokeTime !== undefined),
+      roles: roles.roles,
+    },
+    asOf: state ? ms(state.updateTime) : client.serverNow(),
+    loading: false,
+    failing: false,
+    moreLoading: false,
+    moreFailed: false,
   };
   if (state) {
     const at = ms(state.updateTime);

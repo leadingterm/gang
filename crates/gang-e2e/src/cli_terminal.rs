@@ -26,9 +26,9 @@ use crate::mirror::follow;
 use crate::observer::{tail, worker_logs};
 use crate::placement::Placement;
 use crate::process;
+use crate::settings::DeploymentInputs;
 use crate::sse::{self, EventStream as _};
 use crate::state_api::StateApi;
-use crate::suite::Invocation;
 use crate::system::Sandbox;
 
 /// How a command run by [`run_until`] finished.
@@ -198,7 +198,7 @@ impl LocalTerminal {
     ///
     /// When the placement cannot be created, the checked-in configuration cannot be read or
     /// parsed, or the configurations cannot be rendered or written.
-    pub(crate) fn create(invocation: &Invocation) -> Result<Self> {
+    pub(crate) fn create(invocation: &DeploymentInputs) -> Result<Self> {
         let placement = Placement::create(invocation.settings.scratch_root.as_deref())?;
         let path = invocation.configs.join(LOCAL_CONFIG);
         let text = fs::read_to_string(&path)

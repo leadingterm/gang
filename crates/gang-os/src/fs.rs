@@ -439,7 +439,28 @@ impl PrivateDir {
         contents: &[u8],
         mode: Mode,
     ) -> Result<(), PathIo> {
-        self.publish(name.as_ref(), contents, mode, false)
+        self.publish(name.as_ref(), contents, mode, false, || Ok(()))
+            .map(|_| ())
+    }
+
+    /// Atomically replaces a file after checking authority immediately before publication.
+    ///
+    /// The check runs after the temporary file is synced. If it fails, the temporary file is
+    /// removed and its error is returned without changing the destination.
+    ///
+    /// # Errors
+    /// Returns the check's error or a converted error for an invalid name or filesystem failure.
+    pub fn write_atomic_checked<E>(
+        &self,
+        name: impl AsRef<OsStr>,
+        contents: &[u8],
+        mode: Mode,
+        check: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E>
+    where
+        E: From<PathIo>,
+    {
+        self.publish(name.as_ref(), contents, mode, false, check)
             .map(|_| ())
     }
 
@@ -453,7 +474,7 @@ impl PrivateDir {
         contents: &[u8],
         mode: Mode,
     ) -> Result<bool, PathIo> {
-        self.publish(name.as_ref(), contents, mode, true)
+        self.publish(name.as_ref(), contents, mode, true, || Ok(()))
     }
 
     /// Reads a regular file in this directory without following links, or returns `None` if absent.
@@ -463,6 +484,26 @@ impl PrivateDir {
     pub fn read_optional(&self, name: impl AsRef<OsStr>) -> Result<Option<Vec<u8>>, PathIo> {
         let name = name.as_ref();
         let path = self.file_path(name, "read")?;
+        let Some(mut file) = self.open_regular(name, &path)? else {
+            return Ok(None);
+        };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(PathIo::at("read", &path))?;
+        Ok(Some(bytes))
+    }
+
+    /// Checks whether a regular file exists in this directory without following links or reading it.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid name, a non-regular file, or a failed open or inspection.
+    pub fn has_file(&self, name: impl AsRef<OsStr>) -> Result<bool, PathIo> {
+        let name = name.as_ref();
+        let path = self.file_path(name, "read")?;
+        Ok(self.open_regular(name, &path)?.is_some())
+    }
+
+    fn open_regular(&self, name: &OsStr, path: &Path) -> Result<Option<File>, PathIo> {
         let fd = match rustix::fs::openat(
             &self.directory,
             name,
@@ -471,33 +512,33 @@ impl PrivateDir {
         ) {
             Ok(fd) => fd,
             Err(rustix::io::Errno::NOENT) => return Ok(None),
-            Err(error) => return Err(PathIo::new("read", &path, error.into())),
+            Err(error) => return Err(PathIo::new("read", path, error.into())),
         };
         let stat =
-            rustix::fs::fstat(&fd).map_err(|error| PathIo::new("read", &path, error.into()))?;
+            rustix::fs::fstat(&fd).map_err(|error| PathIo::new("read", path, error.into()))?;
         if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile {
             return Err(PathIo::new(
                 "read",
-                &path,
+                path,
                 io::ErrorKind::InvalidInput.into(),
             ));
         }
-        let mut bytes = Vec::new();
-        File::from(fd)
-            .read_to_end(&mut bytes)
-            .map_err(PathIo::at("read", &path))?;
-        Ok(Some(bytes))
+        Ok(Some(File::from(fd)))
     }
 
     /// Removes a file in this directory, succeeding if it is absent.
+    /// The directory is synced after removal or confirmed absence before returning success.
     ///
     /// # Errors
-    /// Returns an error for an invalid name or a failed removal.
+    /// Returns an error for an invalid name, a failed removal, or a failed directory sync.
     pub fn remove_optional(&self, name: impl AsRef<OsStr>) -> Result<(), PathIo> {
         let name = name.as_ref();
         let path = self.file_path(name, "remove")?;
         match rustix::fs::unlinkat(&self.directory, name, rustix::fs::AtFlags::empty()) {
-            Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
+            Ok(()) | Err(rustix::io::Errno::NOENT) => self
+                .directory
+                .sync_all()
+                .map_err(PathIo::at("sync directory", &path)),
             Err(error) => Err(PathIo::new("remove", &path, error.into())),
         }
     }
@@ -511,23 +552,40 @@ impl PrivateDir {
     pub fn lock(&self, name: impl AsRef<OsStr>) -> Result<crate::FileLock, PathIo> {
         let name = name.as_ref();
         let path = self.file_path(name, "open lock file")?;
+        let file = self.open_lock_file(name, &path)?;
+        crate::FileLock::exclusive_blocking_on(file, &path)
+    }
+
+    /// Attempts an exclusive lock without blocking; returns `None` when it is held.
+    /// The file is created with mode 0600 when missing; links and non-regular files are refused.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid name, failed open or inspection, or failed lock operation.
+    pub fn try_lock(&self, name: impl AsRef<OsStr>) -> Result<Option<crate::FileLock>, PathIo> {
+        let name = name.as_ref();
+        let path = self.file_path(name, "open lock file")?;
+        let file = self.open_lock_file(name, &path)?;
+        crate::FileLock::try_exclusive_on(file, &path)
+    }
+
+    fn open_lock_file(&self, name: &OsStr, path: &Path) -> Result<File, PathIo> {
         let fd = rustix::fs::openat(
             &self.directory,
             name,
             OFlags::WRONLY | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
             PRIVATE_FILE,
         )
-        .map_err(|error| PathIo::new("open lock file", &path, error.into()))?;
+        .map_err(|error| PathIo::new("open lock file", path, error.into()))?;
         let stat = rustix::fs::fstat(&fd)
-            .map_err(|error| PathIo::new("open lock file", &path, error.into()))?;
+            .map_err(|error| PathIo::new("open lock file", path, error.into()))?;
         if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile {
             return Err(PathIo::new(
                 "open lock file",
-                &path,
+                path,
                 io::ErrorKind::InvalidInput.into(),
             ));
         }
-        crate::FileLock::exclusive_blocking_on(File::from(fd), &path)
+        Ok(File::from(fd))
     }
 
     /// Validates a single file name and constructs its diagnostic path.
@@ -549,27 +607,35 @@ impl PrivateDir {
     }
 
     /// Writes a temporary file and publishes it relative to the verified descriptor.
-    fn publish(
+    fn publish<E>(
         &self,
         name: &OsStr,
         contents: &[u8],
         mode: Mode,
         new: bool,
-    ) -> Result<bool, PathIo> {
+        check: impl FnOnce() -> Result<(), E>,
+    ) -> Result<bool, E>
+    where
+        E: From<PathIo>,
+    {
         let path = self.file_path(name, "write")?;
-        publish_at(&self.directory, name, &path, contents, mode, new)
+        publish_at(&self.directory, name, &path, contents, mode, new, check)
     }
 }
 
 /// Publishes bytes relative to an opened directory, naming `error_path` on failure.
-fn publish_at(
+fn publish_at<E>(
     directory: &File,
     name: &OsStr,
     error_path: &Path,
     contents: &[u8],
     mode: Mode,
     new: bool,
-) -> Result<bool, PathIo> {
+    check: impl FnOnce() -> Result<(), E>,
+) -> Result<bool, E>
+where
+    E: From<PathIo>,
+{
     static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let (temporary, mut file) = loop {
         let n = NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -583,21 +649,20 @@ fn publish_at(
             Ok(fd) => break (temporary, File::from(fd)),
             Err(rustix::io::Errno::EXIST) => {}
             Err(error) => {
-                return Err(PathIo::new(
-                    "create temporary file for",
-                    error_path,
-                    error.into(),
-                ));
+                return Err(
+                    PathIo::new("create temporary file for", error_path, error.into()).into(),
+                );
             }
         }
     };
     let mut renamed = false;
-    let result = (|| {
+    let result: Result<bool, E> = (|| {
         rustix::fs::fchmod(&file, mode)
             .map_err(|error| PathIo::new("set permissions of", error_path, error.into()))?;
         file.write_all(contents)
             .map_err(PathIo::at("write", error_path))?;
         file.sync_all().map_err(PathIo::at("sync", error_path))?;
+        check()?;
         if new {
             match rustix::fs::linkat(
                 directory,
@@ -608,7 +673,7 @@ fn publish_at(
             ) {
                 Ok(()) => {}
                 Err(rustix::io::Errno::EXIST) => return Ok(false),
-                Err(error) => return Err(PathIo::new("publish", error_path, error.into())),
+                Err(error) => return Err(PathIo::new("publish", error_path, error.into()).into()),
             }
         } else {
             rustix::fs::renameat(directory, temporary.as_str(), directory, name)
@@ -640,29 +705,25 @@ fn publish_at(
 /// permissions cannot be set, when the contents cannot be written or synced, or when the rename
 /// fails. Every error names `path`.
 pub fn write_atomic(path: &Path, contents: &[u8], mode: Mode) -> Result<(), PathIo> {
-    let (directory, name) = open_publish_parent(path)?;
-    publish_at(&directory, name, path, contents, mode, false).map(|_| ())
+    let (directory, name) = open_parent(path, "create temporary file for")?;
+    publish_at(&directory, name, path, contents, mode, false, || Ok(())).map(|_| ())
 }
 
-/// Opens a path's parent for the path-based write helpers.
-fn open_publish_parent(path: &Path) -> Result<(File, &OsStr), PathIo> {
+/// Opens a path's parent for the path-based helpers; every error names `path` and `action`.
+fn open_parent<'a>(path: &'a Path, action: &'static str) -> Result<(File, &'a OsStr), PathIo> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    let name = path.file_name().ok_or_else(|| {
-        PathIo::new(
-            "create temporary file for",
-            path,
-            io::ErrorKind::InvalidInput.into(),
-        )
-    })?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| PathIo::new(action, path, io::ErrorKind::InvalidInput.into()))?;
     let fd = rustix::fs::open(
         parent,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|error| PathIo::new("create temporary file for", path, error.into()))?;
+    .map_err(|error| PathIo::new(action, path, error.into()))?;
     Ok((File::from(fd), name))
 }
 
@@ -682,8 +743,8 @@ fn open_publish_parent(path: &Path) -> Result<(File, &OsStr), PathIo> {
 /// permissions cannot be set, when the contents cannot be written or synced, or when publishing
 /// fails for any reason other than `path` already existing. Every error names `path`.
 pub fn write_new_atomic(path: &Path, contents: &[u8], mode: Mode) -> Result<bool, PathIo> {
-    let (directory, name) = open_publish_parent(path)?;
-    publish_at(&directory, name, path, contents, mode, true)
+    let (directory, name) = open_parent(path, "create temporary file for")?;
+    publish_at(&directory, name, path, contents, mode, true, || Ok(()))
 }
 
 /// Reads the file at `path`, or returns `None` when it does not exist.
@@ -824,11 +885,315 @@ pub fn create_private_fifo(path: &Path) -> Result<(), PathIo> {
 
 /// Removes `path` and its contents; a missing directory is not an error.
 ///
+/// No link is followed: a link at `path` or beneath it is removed itself. A directory the
+/// effective user owns is given owner access before its contents are removed, so trees left
+/// read-only, search-only, or inaccessible are removed too. A directory its owner can neither read
+/// nor search is first pinned by a descriptor that grants no access: on Linux it is changed
+/// through that descriptor's `/proc/self/fd` entry, after `/proc` is checked to be a procfs.
+/// macOS cannot pin such a directory, so removal stops there and leaves it and its contents
+/// untouched.
+///
 /// # Errors
 ///
-/// Returns an error for any removal failure other than the directory being absent.
+/// Returns an error for any removal failure other than the directory being absent: when `path`
+/// is not a directory or a link, when a directory beneath it belongs to another user and denies
+/// access, or, on macOS, when a directory beneath it can be neither read nor searched by its
+/// owner. Every error names the entry that failed.
 pub fn remove_dir_optional(path: &Path) -> Result<(), PathIo> {
-    absent_as_none(fs::remove_dir_all(path), "remove directory", path).map(|_| ())
+    let (parent, name) = match open_parent(path, REMOVE_DIRECTORY) {
+        Ok(opened) => opened,
+        Err(error) if error.source.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let Some(stat) = lstat_at(&parent, name, path)? else {
+        return Ok(());
+    };
+    match rustix::fs::FileType::from_raw_mode(stat.st_mode) {
+        rustix::fs::FileType::Directory => remove_tree(&parent, name, path),
+        rustix::fs::FileType::Symlink => remove_file_at(&parent, name, path),
+        _ => Err(PathIo::new(
+            REMOVE_DIRECTORY,
+            path,
+            rustix::io::Errno::NOTDIR.into(),
+        )),
+    }
+}
+
+/// The action errors removing a directory name.
+const REMOVE_DIRECTORY: &str = "remove directory";
+
+/// A directory being emptied: its descriptor, its name in its parent, its path for errors, and
+/// the entries still to remove.
+struct Emptying {
+    directory: File,
+    name: OsString,
+    path: PathBuf,
+    entries: Vec<(OsString, rustix::fs::FileType)>,
+}
+
+/// Removes the directory `name` in `parent` and everything beneath it, depth first, keeping the
+/// open directories on a stack rather than recursing so a deep tree cannot exhaust the call stack.
+fn remove_tree(parent: &File, name: &OsStr, path: &Path) -> Result<(), PathIo> {
+    let mut opener = Opener::default();
+    let root = match open_for_removal(parent, name, path.to_path_buf(), &mut opener) {
+        Ok(root) => root,
+        Err(error) if error.source.kind() == io::ErrorKind::NotFound && error.path == path => {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let mut stack = vec![root];
+    while let Some(top) = stack.last_mut() {
+        if let Some((entry, file_type)) = top.entries.pop() {
+            if let Some(child) = remove_entry(top, &entry, file_type, &mut opener)? {
+                stack.push(child);
+            }
+        } else if let Some(emptied) = stack.pop() {
+            let above = stack.last().map_or(parent, |above| &above.directory);
+            match rustix::fs::unlinkat(above, &emptied.name, rustix::fs::AtFlags::REMOVEDIR) {
+                Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+                Err(errno) => {
+                    return Err(PathIo::new(REMOVE_DIRECTORY, &emptied.path, errno.into()));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Removes the entry `name` of `parent` unless it is a directory, which is opened and returned to
+/// be emptied.
+fn remove_entry(
+    parent: &Emptying,
+    name: &OsStr,
+    file_type: rustix::fs::FileType,
+    opener: &mut Opener,
+) -> Result<Option<Emptying>, PathIo> {
+    let file_type = match file_type {
+        rustix::fs::FileType::Unknown => {
+            match lstat_at(&parent.directory, name, &parent.path.join(name))? {
+                Some(stat) => rustix::fs::FileType::from_raw_mode(stat.st_mode),
+                None => return Ok(None),
+            }
+        }
+        known => known,
+    };
+    if file_type == rustix::fs::FileType::Directory {
+        return match open_for_removal(&parent.directory, name, parent.path.join(name), opener) {
+            Ok(child) => Ok(Some(child)),
+            Err(error)
+                if error.source.kind() == io::ErrorKind::NotFound
+                    && error.path == parent.path.join(name) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        };
+    }
+    match rustix::fs::unlinkat(&parent.directory, name, rustix::fs::AtFlags::empty()) {
+        Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(errno) => Err(PathIo::new("remove", &parent.path.join(name), errno.into())),
+    }
+}
+
+/// Removes the non-directory entry `name` of `directory`, which `path` names.
+fn remove_file_at(directory: &File, name: &OsStr, path: &Path) -> Result<(), PathIo> {
+    match rustix::fs::unlinkat(directory, name, rustix::fs::AtFlags::empty()) {
+        Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
+        Err(errno) => Err(PathIo::new("remove", path, errno.into())),
+    }
+}
+
+/// What opening directories for removal keeps between directories: on Linux, the trusted
+/// `/proc/self/fd`, opened at the first directory its owner can neither read nor search.
+#[derive(Default)]
+struct Opener {
+    /// `/proc/self/fd`, opened on first use.
+    #[cfg(target_os = "linux")]
+    proc_self_fd: Option<File>,
+}
+
+#[cfg(target_os = "linux")]
+impl Opener {
+    /// The trusted `/proc/self/fd`, opened on first use.
+    fn proc_self_fd(&mut self) -> Result<&File, PathIo> {
+        let descriptors = match self.proc_self_fd.take() {
+            Some(descriptors) => descriptors,
+            None => open_proc_self_fd()?,
+        };
+        Ok(self.proc_self_fd.insert(descriptors))
+    }
+}
+
+/// Opens the directory `name` in `parent`, which `path` names, without following a link, gives
+/// it owner access when the effective user owns it, and reads its entries.
+fn open_for_removal(
+    parent: &File,
+    name: &OsStr,
+    path: PathBuf,
+    opener: &mut Opener,
+) -> Result<Emptying, PathIo> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let directory = match rustix::fs::openat(parent, name, flags, Mode::empty()) {
+        Ok(fd) => File::from(fd),
+        Err(rustix::io::Errno::ACCESS) => open_sealed(parent, name, &path, opener)?,
+        Err(errno) => return Err(PathIo::new(REMOVE_DIRECTORY, &path, errno.into())),
+    };
+    grant_owner_access(&directory, &path)?;
+    let entries = read_entries(&directory, &path)?;
+    Ok(Emptying {
+        directory,
+        name: name.to_os_string(),
+        path,
+        entries,
+    })
+}
+
+/// Opens an owned directory its owner cannot read: pins it with a descriptor that grants no
+/// access, changes its mode through the pin's `/proc/self/fd` entry, and reopens the pin.
+#[cfg(target_os = "linux")]
+fn open_sealed(
+    parent: &File,
+    name: &OsStr,
+    path: &Path,
+    opener: &mut Opener,
+) -> Result<File, PathIo> {
+    let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let pinned = rustix::fs::openat(parent, name, flags, Mode::empty())
+        .map(File::from)
+        .map_err(|errno| PathIo::new(REMOVE_DIRECTORY, path, errno.into()))?;
+    let stat = rustix::fs::fstat(&pinned)
+        .map_err(|errno| PathIo::new("inspect directory", path, errno.into()))?;
+    if !owned(&stat) {
+        return Err(PathIo::new(
+            REMOVE_DIRECTORY,
+            path,
+            rustix::io::Errno::ACCESS.into(),
+        ));
+    }
+    rustix::fs::chmodat(
+        opener.proc_self_fd()?,
+        rustix::path::DecInt::from_fd(&pinned),
+        PRIVATE_DIR,
+        rustix::fs::AtFlags::empty(),
+    )
+    .map_err(|errno| PathIo::new("set permissions of directory", path, errno.into()))?;
+    reopen(&pinned, path)
+}
+
+/// Opens an owned directory its owner cannot read but can search: pins it for search only,
+/// gives it owner access through the pin, and reopens the pin. A directory its owner cannot
+/// search either cannot be pinned and is refused. macOS keeps no state between directories.
+#[cfg(target_os = "macos")]
+fn open_sealed(
+    parent: &File,
+    name: &OsStr,
+    path: &Path,
+    _opener: &mut Opener,
+) -> Result<File, PathIo> {
+    // rustix names no `O_SEARCH`; its flags pass unnamed bits through to `openat`.
+    let search = OFlags::from_bits_retain(libc::O_SEARCH.cast_unsigned());
+    let pinned = rustix::fs::openat(
+        parent,
+        name,
+        search | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|errno| PathIo::new(REMOVE_DIRECTORY, path, errno.into()))?;
+    grant_owner_access(&pinned, path)?;
+    reopen(&pinned, path)
+}
+
+/// Opens `/proc/self/fd`, whose entries name this process's descriptors, refusing anything that
+/// is not a procfs.
+#[cfg(target_os = "linux")]
+fn open_proc_self_fd() -> Result<File, PathIo> {
+    let proc_path = Path::new("/proc");
+    let path = Path::new("/proc/self/fd");
+    let proc = rustix::fs::open(
+        proc_path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|errno| PathIo::new("open directory", proc_path, errno.into()))?;
+    require_procfs(&proc, proc_path)?;
+    let descriptors = rustix::fs::openat(
+        &proc,
+        "self/fd",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|errno| PathIo::new("open directory", path, errno.into()))?;
+    require_procfs(&descriptors, path)?;
+    Ok(descriptors)
+}
+
+/// Refuses an opened directory that is not on a procfs.
+#[cfg(target_os = "linux")]
+fn require_procfs(directory: &File, path: &Path) -> Result<(), PathIo> {
+    let filesystem = rustix::fs::fstatfs(directory)
+        .map_err(|errno| PathIo::new("inspect directory", path, errno.into()))?;
+    if filesystem.f_type == rustix::fs::PROC_SUPER_MAGIC {
+        Ok(())
+    } else {
+        Err(refused(path, "is not a procfs"))
+    }
+}
+
+/// Opens the directory `pinned` refers to for reading, through the descriptor rather than a name.
+fn reopen(pinned: &File, path: &Path) -> Result<File, PathIo> {
+    rustix::fs::openat(
+        pinned,
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|errno| PathIo::new(REMOVE_DIRECTORY, path, errno.into()))
+}
+
+/// Gives an opened directory the effective user owns owner access, so its entries can be listed
+/// and removed. Other directories are left unchanged.
+fn grant_owner_access(directory: &File, path: &Path) -> Result<(), PathIo> {
+    let stat = rustix::fs::fstat(directory)
+        .map_err(|errno| PathIo::new("inspect directory", path, errno.into()))?;
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory {
+        return Err(PathIo::new(
+            "inspect directory",
+            path,
+            rustix::io::Errno::NOTDIR.into(),
+        ));
+    }
+    if !owned(&stat) || Mode::from_raw_mode(stat.st_mode).contains(Mode::RWXU) {
+        return Ok(());
+    }
+    rustix::fs::fchmod(directory, PRIVATE_DIR)
+        .map_err(|errno| PathIo::new("set permissions of directory", path, errno.into()))
+}
+
+/// Whether the effective user owns the file `stat` describes.
+fn owned(stat: &Stat) -> bool {
+    stat.st_uid == rustix::process::geteuid().as_raw()
+}
+
+/// The entries of an opened directory other than `.` and `..`, all read before any is removed.
+fn read_entries(
+    directory: &File,
+    path: &Path,
+) -> Result<Vec<(OsString, rustix::fs::FileType)>, PathIo> {
+    let read_error = |errno: rustix::io::Errno| PathIo::new("read directory", path, errno.into());
+    let mut entries = Vec::new();
+    for entry in rustix::fs::Dir::read_from(directory).map_err(read_error)? {
+        let entry = entry.map_err(read_error)?;
+        let name = entry.file_name().to_bytes();
+        if name != b"." && name != b".." {
+            entries.push((OsStr::from_bytes(name).to_os_string(), entry.file_type()));
+        }
+    }
+    Ok(entries)
 }
 
 /// Atomically replaces the file or symlink at `path` with a symlink to `target`.
@@ -877,6 +1242,51 @@ mod tests {
 
     fn mode_of(path: &Path) -> io::Result<u32> {
         Ok(fs::metadata(path)?.permissions().mode() & 0o777)
+    }
+
+    #[test]
+    fn remove_tree_accepts_a_missing_directory() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let parent = File::open(root.path())?;
+        let path = root.path().join("missing");
+        remove_tree(&parent, OsStr::new("missing"), &path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn remove_entry_accepts_a_directory_removed_after_enumeration() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let child = root.path().join("child");
+        fs::create_dir(&child)?;
+        let directory = File::open(root.path())?;
+        let mut parent = Emptying {
+            entries: read_entries(&directory, root.path())?,
+            directory,
+            name: OsString::new(),
+            path: root.path().to_path_buf(),
+        };
+        let (name, file_type) = parent.entries.pop().expect("captured child");
+        assert_eq!(file_type, rustix::fs::FileType::Directory);
+        fs::remove_dir(&child)?;
+        assert!(remove_entry(&parent, &name, file_type, &mut Opener::default())?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn grant_owner_access_refuses_regular_files() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("file");
+        let file = File::create(&path)?;
+        fs::set_permissions(&path, Permissions::from_mode(0o100))?;
+
+        let error = grant_owner_access(&file, &path).expect_err("regular files must be refused");
+        assert_eq!(error.action, "inspect directory");
+        assert_eq!(
+            error.source.raw_os_error(),
+            Some(rustix::io::Errno::NOTDIR.raw_os_error())
+        );
+        assert_eq!(mode_of(&path)?, 0o100);
+        Ok(())
     }
 
     /// Writable parents are refused without attributing the refusal to a link.
@@ -1564,6 +1974,71 @@ mod tests {
     }
 
     #[test]
+    fn checked_write_failure_preserves_destination_and_removes_temporary() -> TestResult {
+        #[derive(Debug)]
+        enum CheckError {
+            Io(PathIo),
+            Rejected,
+        }
+        impl From<PathIo> for CheckError {
+            fn from(error: PathIo) -> Self {
+                Self::Io(error)
+            }
+        }
+
+        let root = tempfile::tempdir()?;
+        let directory = root.path().join("private");
+        let cap = ensure_private_dir(&directory)?;
+        cap.write_atomic("state", b"old", PRIVATE_FILE)?;
+        let result = cap.write_atomic_checked("state", b"new", PRIVATE_FILE, || {
+            assert_eq!(
+                fs::read(directory.join("state")).expect("read destination"),
+                b"old"
+            );
+            assert_eq!(fs::read_dir(&directory).expect("read directory").count(), 2);
+            Err(CheckError::Rejected)
+        });
+        match result {
+            Err(CheckError::Rejected) => {}
+            Err(CheckError::Io(error)) => panic!("unexpected filesystem error: {error}"),
+            Ok(()) => panic!("the check must reject publication"),
+        }
+        assert_eq!(fs::read(directory.join("state"))?, b"old");
+        assert_eq!(fs::read_dir(&directory)?.count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn private_dir_try_lock_contends_and_releases_on_same_path() -> TestResult {
+        let _guard = gang_testkit::fork_gate::lock_user();
+        let root = tempfile::tempdir()?;
+        let directory = root.path().join("private");
+        let cap = ensure_private_dir(&directory)?;
+        let lock = cap
+            .try_lock("mutation.lock")?
+            .ok_or("first lock was busy")?;
+        assert_eq!(mode_of(&directory.join("mutation.lock"))?, 0o600);
+        assert!(cap.try_lock("mutation.lock")?.is_none());
+        drop(lock);
+        assert!(cap.try_lock("mutation.lock")?.is_some());
+        assert!(directory.join("mutation.lock").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn private_dir_try_lock_refuses_links_and_non_regular_files() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let directory = root.path().join("private");
+        let cap = ensure_private_dir(&directory)?;
+        fs::write(directory.join("target"), b"data")?;
+        std::os::unix::fs::symlink("target", directory.join("link"))?;
+        assert!(cap.try_lock("link").is_err());
+        fs::create_dir(directory.join("subdir"))?;
+        assert!(cap.try_lock("subdir").is_err());
+        Ok(())
+    }
+
+    #[test]
     fn existing_parents_are_left_unchanged() -> TestResult {
         let root = tempfile::tempdir()?;
         let parent = root.path().join("parent");
@@ -1870,6 +2345,100 @@ mod tests {
     fn remove_dir_optional_accepts_a_missing_directory() -> TestResult {
         let root = tempfile::tempdir()?;
         remove_dir_optional(&root.path().join("missing"))?;
+        Ok(())
+    }
+
+    /// Restores owner access to its directories, outermost first, when dropped, so a failed test
+    /// leaves a tree its temporary directory can delete.
+    struct OwnerAccess(Vec<PathBuf>);
+
+    impl Drop for OwnerAccess {
+        fn drop(&mut self) {
+            for directory in &self.0 {
+                // A directory that was removed has nothing to restore.
+                let _ = fs::set_permissions(directory, Permissions::from_mode(0o700));
+            }
+        }
+    }
+
+    /// Owned directories that are read-only or search-only are removed with their contents, and a
+    /// link to an external read-only directory is removed without being followed.
+    #[test]
+    fn remove_dir_optional_removes_owned_read_only_trees_without_following_links() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        let external = outside.path().join("external");
+        let tree = root.path().join("tree");
+        let read_only = tree.join("read-only");
+        let search_only = read_only.join("search-only");
+        let _access = OwnerAccess(vec![
+            external.clone(),
+            tree.clone(),
+            read_only.clone(),
+            search_only.clone(),
+        ]);
+        fs::create_dir(&external)?;
+        fs::write(external.join("data"), b"external data")?;
+        fs::set_permissions(&external, Permissions::from_mode(0o555))?;
+        fs::create_dir_all(&search_only)?;
+        fs::write(read_only.join("file"), b"stale")?;
+        fs::write(search_only.join("file"), b"stale")?;
+        std::os::unix::fs::symlink(&external, read_only.join("external"))?;
+        fs::set_permissions(&search_only, Permissions::from_mode(0o100))?;
+        fs::set_permissions(&read_only, Permissions::from_mode(0o555))?;
+        fs::set_permissions(&tree, Permissions::from_mode(0o555))?;
+
+        remove_dir_optional(&tree)?;
+
+        assert_eq!(
+            fs::symlink_metadata(&tree)
+                .map_err(|error| error.kind())
+                .err(),
+            Some(ErrorKind::NotFound)
+        );
+        assert_eq!(mode_of(&external)?, 0o555);
+        assert_eq!(fs::read(external.join("data"))?, b"external data");
+        assert_eq!(fs::read_dir(&external)?.count(), 1);
+        Ok(())
+    }
+
+    /// An owned directory without owner read or search access is removed on Linux, which pins it
+    /// without opening it for reading. Apple has no such pin, so removal fails closed, naming the
+    /// directory and leaving it and its contents untouched.
+    #[test]
+    fn remove_dir_optional_removes_sealed_directories_where_pinnable() -> TestResult {
+        for mode in [0o000, 0o200] {
+            let root = tempfile::tempdir()?;
+            let tree = root.path().join("tree");
+            let sealed = tree.join("sealed");
+            let _access = OwnerAccess(vec![tree.clone(), sealed.clone()]);
+            fs::create_dir_all(&sealed)?;
+            fs::write(sealed.join("file"), b"stale")?;
+            fs::set_permissions(&sealed, Permissions::from_mode(mode))?;
+            fs::set_permissions(&tree, Permissions::from_mode(0o555))?;
+
+            let removed = remove_dir_optional(&tree);
+
+            if cfg!(target_os = "linux") {
+                removed?;
+                assert_eq!(
+                    fs::symlink_metadata(&tree)
+                        .map_err(|error| error.kind())
+                        .err(),
+                    Some(ErrorKind::NotFound)
+                );
+            } else {
+                let error = removed.expect_err("a sealed directory cannot be pinned on Apple");
+                assert_eq!(error.path, sealed);
+                assert_eq!(error.source.kind(), ErrorKind::PermissionDenied);
+                assert_eq!(
+                    fs::symlink_metadata(&sealed)?.permissions().mode() & 0o777,
+                    mode
+                );
+                fs::set_permissions(&sealed, Permissions::from_mode(0o700))?;
+                assert_eq!(fs::read(sealed.join("file"))?, b"stale");
+            }
+        }
         Ok(())
     }
 

@@ -317,15 +317,22 @@ mod tests {
         fn add_instance(&self, id: &str, secret: &str) -> Result<WorkerIdentity, Box<dyn Error>> {
             let instance = InstanceId::try_new(id.to_owned())?;
             let secret = InstanceSecret::new(secret);
-            self.records.write(&InstanceRecord {
-                id: instance.clone(),
-                fleet: FleetName::try_new("workers-arm")?,
-                isa: Isa::Aarch64,
-                pid: Some(1),
-                launched_at: Timestamp::from_unix_millis(NOW_MILLIS),
-                terminating_since: None,
-                secret: secret.clone(),
-            })?;
+            let scope = gang_testkit::fence::DeadlineScope::try_new()?;
+            let mutation = self.records.mutation(scope.deadline())?;
+            self.records.write(
+                &mutation,
+                &InstanceRecord {
+                    id: instance.clone(),
+                    fleet: FleetName::try_new("workers-arm")?,
+                    isa: Isa::Aarch64,
+                    pid: Some(1),
+                    launch_cgroup: None,
+                    launched_at: Timestamp::from_unix_millis(NOW_MILLIS),
+                    exited_at: None,
+                    terminating_since: None,
+                    secret: secret.clone(),
+                },
+            )?;
             Ok(WorkerIdentity { instance, secret })
         }
 

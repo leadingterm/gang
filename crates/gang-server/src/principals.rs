@@ -15,8 +15,7 @@ use crate::ttl_map::TtlMap;
 
 /// The revoked principals and how many times they changed.
 pub(crate) struct Revoked {
-    /// How many actual membership changes occurred through [`RevokedPrincipals::revoke`] or
-    /// [`RevokedPrincipals::restore`].
+    /// How many actual membership changes occurred through the set's operations.
     pub(crate) epoch: u64,
     identities: HashSet<Identity>,
 }
@@ -51,7 +50,7 @@ impl RevokedPrincipals {
         Self(Arc::new(watch::channel(revoked).0))
     }
 
-    /// How many actual membership changes occurred through [`Self::revoke`] or [`Self::restore`].
+    /// How many actual membership changes occurred through the set's operations.
     #[must_use]
     pub(crate) fn epoch(&self) -> u64 {
         self.0.borrow().epoch
@@ -89,6 +88,29 @@ impl RevokedPrincipals {
             }
             changed
         });
+    }
+
+    /// Replaces the set only if it has not changed since `epoch` was observed.
+    pub(crate) fn replace_if_epoch(
+        &self,
+        epoch: u64,
+        identities: impl IntoIterator<Item = Identity>,
+    ) -> bool {
+        let identities: HashSet<_> = identities.into_iter().collect();
+        let mut applied = false;
+        self.0.send_if_modified(|revoked| {
+            if revoked.epoch != epoch {
+                return false;
+            }
+            applied = true;
+            if revoked.identities == identities {
+                return false;
+            }
+            revoked.identities = identities;
+            revoked.epoch += 1;
+            true
+        });
+        applied
     }
 }
 
@@ -159,6 +181,25 @@ mod tests {
 
         assert!(revoked_principals.contains(&ada));
         assert!(!revoked_principals.contains(&grace));
+    }
+
+    #[test]
+    fn replacement_notifies_only_on_change_and_rejects_stale_epochs() {
+        let ada = identity("ada@example.com");
+        let grace = identity("grace@example.com");
+        let revoked = RevokedPrincipals::from_identities([ada.clone()]);
+        let mut changes = revoked.subscribe();
+        assert!(revoked.replace_if_epoch(0, [grace.clone()]));
+        assert!(!revoked.contains(&ada));
+        assert!(revoked.contains(&grace));
+        assert_eq!(revoked.epoch(), 1);
+        assert!(changes.has_changed().expect("sender is alive"));
+        changes.borrow_and_update();
+        assert!(revoked.replace_if_epoch(1, [grace.clone()]));
+        assert!(!changes.has_changed().expect("sender is alive"));
+        assert!(!revoked.replace_if_epoch(0, [ada.clone()]));
+        assert!(revoked.contains(&grace));
+        assert!(!revoked.contains(&ada));
     }
 
     #[test]

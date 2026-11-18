@@ -121,6 +121,9 @@ pub enum ClientError {
         status: u16,
         /// The server's message, or the status reason when it sent none.
         message: String,
+        /// For a 503, how long the server asks the client to wait before it retries, when it
+        /// says so; `None` for every other status.
+        retry_after: Option<Duration>,
     },
     /// The server is rate limiting this client.
     #[error("the server is rate limiting this client")]
@@ -440,6 +443,7 @@ mod tests {
             ClientError::Server {
                 status: 500,
                 message: "boom".to_owned(),
+                retry_after: None,
             },
             ClientError::RateLimited {
                 retry_after: Some(Duration::from_secs(7)),
@@ -557,6 +561,7 @@ mod tests {
         let answered = |status| ClientError::Server {
             status,
             message: "forbidden".to_owned(),
+            retry_after: None,
         };
 
         assert_eq!(

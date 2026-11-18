@@ -19,6 +19,8 @@ wire_enum! {
         SchedulerUnavailable = "SCHEDULER_UNAVAILABLE",
         /// The provisioner could not be reached.
         ProvisionerUnavailable = "PROVISIONER_UNAVAILABLE",
+        /// The leader's confirmed lease is no longer valid.
+        LeadershipLapsed = "LEADERSHIP_LAPSED",
     }
 }
 

@@ -4,11 +4,9 @@ use std::num::NonZeroUsize;
 use gang_clock::Timestamp;
 use gang_spi::{
     CertStatus, IssuedCertRecord, PrincipalRecord, RecordedScalingEvent, ScalingAuditEvent,
-    ScalingEventKind, ScalingEventSeq,
+    ScalingEventKind, ScalingEventSeq, StoredScalingKind,
 };
-use gang_types::{
-    CertSerial, FleetName, Identity, InstanceId, Principal, ProviderName, ScalingCause, WorkerId,
-};
+use gang_types::{CertSerial, FleetName, Identity, Principal, ProviderName, ScalingCause};
 use rusqlite::Row;
 use rusqlite::types::{FromSql, ValueRef};
 
@@ -128,6 +126,16 @@ pub(crate) fn timestamp(column: &'static str, millis: i64) -> Result<Timestamp, 
         .map_err(|_| corrupt(column, format!("negative timestamp {millis}")))
 }
 
+/// Decodes a non-negative counter from `SQLite`'s signed integer representation.
+pub(crate) fn unsigned(column: &'static str, value: i64) -> Result<u64, SqliteError> {
+    u64::try_from(value).map_err(|error| corrupt(column, error))
+}
+
+/// Encodes a counter in `SQLite`'s signed integer representation.
+pub(crate) fn signed(column: &'static str, value: u64) -> Result<i64, SqliteError> {
+    i64::try_from(value).map_err(|error| corrupt(column, error))
+}
+
 /// Keyset paging for a query that fetched `limit + 1` rows. Returns whether more rows exist and,
 /// when they do, drops the extra last row so the page holds exactly `limit` rows.
 #[must_use]
@@ -137,38 +145,6 @@ pub(crate) fn page<T>(rows: &mut Vec<T>, limit: NonZeroUsize) -> bool {
         rows.pop();
     }
     more
-}
-
-gang_types::string_enum! {
-    /// The stored name of each scaling event kind.
-    /// This is the only place the names are spelled out.
-    enum KindTag("scaling event kind") {
-        ScaledOut = "scaled_out",
-        LaunchFailed = "launch_failed",
-        Withdrawn = "withdrawn",
-        DrainStarted = "drain_started",
-        DrainCancelled = "drain_cancelled",
-        Terminated = "terminated",
-        ExitedEarly = "exited_early",
-        WorkerRegistered = "worker_registered",
-        WorkerDeregistered = "worker_deregistered",
-    }
-}
-
-impl KindTag {
-    fn of(kind: &ScalingEventKind) -> Self {
-        match kind {
-            ScalingEventKind::ScaledOut { .. } => Self::ScaledOut,
-            ScalingEventKind::LaunchFailed { .. } => Self::LaunchFailed,
-            ScalingEventKind::Withdrawn { .. } => Self::Withdrawn,
-            ScalingEventKind::DrainStarted { .. } => Self::DrainStarted,
-            ScalingEventKind::DrainCancelled { .. } => Self::DrainCancelled,
-            ScalingEventKind::Terminated { .. } => Self::Terminated,
-            ScalingEventKind::ExitedEarly { .. } => Self::ExitedEarly,
-            ScalingEventKind::WorkerRegistered { .. } => Self::WorkerRegistered,
-            ScalingEventKind::WorkerDeregistered { .. } => Self::WorkerDeregistered,
-        }
-    }
 }
 
 /// A scaling audit event flattened to the columns of the `scaling_audit` table.
@@ -189,41 +165,16 @@ impl TryFrom<&ScalingAuditEvent> for ScalingRow {
     type Error = SqliteError;
 
     fn try_from(event: &ScalingAuditEvent) -> Result<Self, Self::Error> {
-        let (from_capacity, to_capacity, subject, detail) = match &event.kind {
-            ScalingEventKind::ScaledOut { from, to } | ScalingEventKind::Withdrawn { from, to } => {
-                (Some(i64::from(*from)), Some(i64::from(*to)), None, None)
-            }
-            ScalingEventKind::LaunchFailed { from, to, reason } => (
-                Some(i64::from(*from)),
-                Some(i64::from(*to)),
-                None,
-                Some(reason.clone()),
-            ),
-            ScalingEventKind::DrainStarted { worker }
-            | ScalingEventKind::DrainCancelled { worker }
-            | ScalingEventKind::WorkerRegistered { worker }
-            | ScalingEventKind::WorkerDeregistered { worker } => {
-                (None, None, Some(worker.as_str().to_owned()), None)
-            }
-            ScalingEventKind::Terminated { instance } => {
-                (None, None, Some(instance.as_str().to_owned()), None)
-            }
-            ScalingEventKind::ExitedEarly { instance, failure } => (
-                None,
-                None,
-                Some(instance.as_str().to_owned()),
-                Some(failure.clone()),
-            ),
-        };
+        let stored = event.kind.stored();
         Ok(Self {
             at: millis(event.at)?,
             fleet: event.fleet.as_str().to_owned(),
-            kind: KindTag::of(&event.kind).as_str(),
-            from_capacity,
-            to_capacity,
-            subject,
+            kind: stored.name,
+            from_capacity: stored.from_capacity.map(i64::from),
+            to_capacity: stored.to_capacity.map(i64::from),
+            subject: stored.subject.map(str::to_owned),
             cause: event.cause.map(ScalingCause::as_str),
-            detail,
+            detail: stored.detail.map(str::to_owned),
         })
     }
 }
@@ -265,45 +216,21 @@ pub(crate) fn scaling_seq(row: &Row<'_>) -> Result<ScalingEventSeq, SqliteError>
 
 /// Decodes the `kind` column together with the capacity or subject columns it determines.
 fn scaling_kind(row: &Row<'_>) -> Result<ScalingEventKind, SqliteError> {
-    let tag = text(row, "kind")?
-        .parse::<KindTag>()
-        .map_err(|error| corrupt("kind", error))?;
-    Ok(match tag {
-        KindTag::ScaledOut => ScalingEventKind::ScaledOut {
-            from: capacity(row, "from_capacity")?,
-            to: capacity(row, "to_capacity")?,
-        },
-        KindTag::LaunchFailed => ScalingEventKind::LaunchFailed {
-            from: capacity(row, "from_capacity")?,
-            to: capacity(row, "to_capacity")?,
-            reason: cell::<Option<String>>(row, "detail")?
-                .ok_or_else(|| corrupt("detail", "expected text"))?,
-        },
-        KindTag::Withdrawn => ScalingEventKind::Withdrawn {
-            from: capacity(row, "from_capacity")?,
-            to: capacity(row, "to_capacity")?,
-        },
-        KindTag::DrainStarted => ScalingEventKind::DrainStarted {
-            worker: worker(row)?,
-        },
-        KindTag::DrainCancelled => ScalingEventKind::DrainCancelled {
-            worker: worker(row)?,
-        },
-        KindTag::Terminated => ScalingEventKind::Terminated {
-            instance: instance(row)?,
-        },
-        KindTag::ExitedEarly => ScalingEventKind::ExitedEarly {
-            instance: instance(row)?,
-            failure: cell::<Option<String>>(row, "detail")?
-                .ok_or_else(|| corrupt("detail", "expected text"))?,
-        },
-        KindTag::WorkerRegistered => ScalingEventKind::WorkerRegistered {
-            worker: worker(row)?,
-        },
-        KindTag::WorkerDeregistered => ScalingEventKind::WorkerDeregistered {
-            worker: worker(row)?,
-        },
+    let optional_text = |column| {
+        if matches!(row.get_ref(column)?, ValueRef::Null) {
+            Ok(None)
+        } else {
+            text(row, column).map(Some)
+        }
+    };
+    ScalingEventKind::try_from(StoredScalingKind {
+        name: text(row, "kind")?,
+        from_capacity: capacity(row, "from_capacity")?,
+        to_capacity: capacity(row, "to_capacity")?,
+        subject: optional_text("subject")?,
+        detail: optional_text("detail")?,
     })
+    .map_err(|error| corrupt(error.field(), &error))
 }
 
 /// Decodes the `cause` column. `NULL` covers events without an autoscaler decision and rows
@@ -318,26 +245,13 @@ fn optional_cause(row: &Row<'_>) -> Result<Option<ScalingCause>, SqliteError> {
         .map_err(|error| corrupt("cause", error))
 }
 
-fn capacity(row: &Row<'_>, column: &'static str) -> Result<u32, SqliteError> {
-    let value =
-        cell::<Option<i64>>(row, column)?.ok_or_else(|| corrupt(column, "expected integer"))?;
-    u32::try_from(value).map_err(|_| corrupt(column, format!("capacity {value} out of range")))
-}
-
-/// Reads the required subject, preserving the missing-subject error.
-fn subject<'r>(row: &'r Row<'_>) -> Result<&'r str, SqliteError> {
-    if matches!(row.get_ref("subject")?, ValueRef::Null) {
-        return Err(corrupt("subject", "expected text"));
-    }
-    text(row, "subject")
-}
-
-fn worker(row: &Row<'_>) -> Result<WorkerId, SqliteError> {
-    WorkerId::try_new(subject(row)?).map_err(|error| corrupt("subject", error))
-}
-
-fn instance(row: &Row<'_>) -> Result<InstanceId, SqliteError> {
-    InstanceId::try_new(subject(row)?).map_err(|error| corrupt("subject", error))
+fn capacity(row: &Row<'_>, column: &'static str) -> Result<Option<u32>, SqliteError> {
+    cell::<Option<i64>>(row, column)?
+        .map(|value| {
+            u32::try_from(value)
+                .map_err(|_| corrupt(column, format!("capacity {value} out of range")))
+        })
+        .transpose()
 }
 
 fn corrupt(column: &'static str, detail: impl Display) -> SqliteError {
@@ -360,7 +274,7 @@ fn text<'r>(row: &'r Row<'_>, column: &'static str) -> Result<&'r str, SqliteErr
 fn cell<T: FromSql>(row: &Row<'_>, column: &'static str) -> Result<T, SqliteError> {
     row.get::<_, T>(column).map_err(|error| match error {
         rusqlite::Error::InvalidColumnType(..) => corrupt(column, "unexpected storage type"),
-        other => SqliteError::Query(other),
+        other => SqliteError::from(other),
     })
 }
 

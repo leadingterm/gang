@@ -10,7 +10,9 @@
       ],
       "principals": [
         "principals/google%3Aops%40example.org",
-        "principals/google%3Amira.okafor%40example.org"
+        "principals/google%3Amira.okafor%40example.org",
+        "principals/aws-workers%3Aarn%3Aaws%3Aiam%3A%3A000000000000%3Arole%2Fexample-build-worker-instance-role",
+        "principals/github-actions%3Arepository_owner_id%3A000000000%3Arepository_id%3A0000000000%3Aref%3Arefs%2Fheads%2Fbuild%2Fremote-build-aarch64"
       ]
     },
     {

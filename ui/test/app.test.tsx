@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ComponentChildren } from "preact";
 import { render } from "preact-render-to-string";
+import { clock } from "../src/format.ts";
 import { routeOf } from "../src/routes.ts";
 import { Shell } from "../src/shell.tsx";
 import { ClientContext } from "../src/ui.tsx";
@@ -26,7 +27,6 @@ test("the app root shows the screen the route and the link call for", async () =
     { name: "sign-in error takes precedence", pathname: "/ui/error", search: "?reason=denied", scenario: { link: { kind: "signed_out" } }, expected: <SignInError reason="denied" /> },
     { name: "device approval takes precedence", pathname: "/ui/device", search: "?reason=failed", scenario: { link: { kind: "signed_out" } }, absentSession: true, expected: <Device reason="failed" /> },
     { name: "device confirmation takes precedence", pathname: "/ui/device/approved", scenario: { link: { kind: "signed_out" } }, absentSession: true, expected: <DeviceApproved /> },
-    { name: "no session", pathname: "/ui/", scenario: {}, absentSession: true, expected: null },
   ];
   for (const row of rows) {
     route.value = routeOf(row.pathname, row.search ?? "");
@@ -38,6 +38,71 @@ test("the app root shows the screen the route and the link call for", async () =
       row.name,
     );
   }
+});
+
+test("the app shows bootstrap status without a session", async () => {
+  // App initializes its route from location at module evaluation.
+  const { App, route } = await import("../src/app.tsx");
+  route.value = routeOf("/ui/", "");
+  const scenarios: Scenario[] = [
+    { link: { kind: "connecting" } },
+    { link: { kind: "lost", frozenAt: null, retryAt: 60_000 } },
+    { link: { kind: "revoked" } },
+  ];
+  for (const scenario of scenarios) {
+    const client = clientFor(scenario);
+    client.session.value = null;
+    const markup = render(<App client={client} />);
+    const kind = client.link.value.kind;
+    assert.match(markup, kind === "revoked" ? /role="alert"/ : /role="status"/, kind);
+    const signIn = /<a\b[^>]*href="\/ui\/login\?next=%2Fui%2F"/;
+    if (kind === "revoked") assert.match(markup, signIn);
+    else assert.doesNotMatch(markup, signIn);
+  }
+});
+
+test("access distinguishes unknown, failed, and retained observations", () => {
+  const client = clientFor({});
+  const loaded = client.access.value;
+  assert.equal(loaded.kind, "loaded");
+  if (loaded.kind !== "loaded") throw new Error("expected loaded access fixture");
+  const accessMarkup = () => render(<ClientContext.Provider value={client}><Access /></ClientContext.Provider>);
+
+  for (const kind of ["unloaded", "loading"] as const) {
+    client.access.value = { kind };
+    const markup = accessMarkup();
+    assert.match(markup, /role="status"/);
+    assert.doesNotMatch(markup, /role="alert"|<table\b|<button\b|id="ro-h"|id="pr-h"/);
+    assert.match(markup, /id="se-h"/);
+  }
+
+  client.access.value = { kind: "error" };
+  const error = accessMarkup();
+  assert.match(error, /role="alert"/);
+  assert.match(error, /<button\b/);
+  assert.doesNotMatch(error, /<table\b|role="status"|id="ro-h"|id="pr-h"/);
+
+  client.access.value = { ...loaded, failing: true };
+  const stale = accessMarkup();
+  assert.match(stale, /role="alert"/);
+  assert.match(stale, /<button\b/);
+  assert.match(stale, /<table\b/);
+  assert.match(stale, /repo:example\/monorepo/);
+  assert.ok(stale.includes(clock(loaded.asOf)));
+
+  client.access.value = { ...loaded, loading: true };
+  const refreshing = accessMarkup();
+  assert.match(refreshing, /role="status"/);
+  assert.doesNotMatch(refreshing, /role="alert"/);
+  assert.match(refreshing, /repo:example\/monorepo/);
+
+  client.access.value = { ...loaded, data: { ...loaded.data, nextPageToken: "next" }, moreFailed: true };
+  const moreFailed = accessMarkup();
+  assert.match(moreFailed, /role="alert"/);
+  assert.match(moreFailed, /repo:example\/monorepo/);
+
+  client.access.value = { ...loaded, data: { ...loaded.data, nextPageToken: "next" }, moreLoading: true };
+  assert.match(accessMarkup(), /<button\b[^>]*disabled/);
 });
 
 test("a fetched device request shows its address and an approve button", async () => {
@@ -56,15 +121,15 @@ test("a fetched device request shows its address and an approve button", async (
   };
   const authorization = await lookupDevice("ABCD/EFGH", request);
   const markup = render(<DeviceRequest authorization={authorization} code="ABCD/EFGH" now={Date.parse("2026-01-01T00:01:00Z")} />);
-  assert.match(markup, /192\.0\.2\.1/);
-  assert.match(markup, /<dt>Requested<\/dt><dd>1m 00s ago<\/dd>/);
-  assert.match(markup, /<dt>Expires in<\/dt><dd>9m 00s<\/dd>/);
-  assert.match(markup, /<dt>Sign in with<\/dt><dd>Example<\/dd>/);
+  assert.match(markup, /<dt>From<\/dt><dd><span class="ident" title="192\.0\.2\.1">192\.0\.2\.1<\/span><\/dd>/);
+  assert.match(markup, /<dt>Requested<\/dt><dd><time>1m 00s<\/time> ago<\/dd>/);
+  assert.match(markup, /<dt>Expires in<\/dt><dd><time>9m 00s<\/time><\/dd>/);
+  assert.match(markup, /<dt>Sign in with<\/dt><dd><span class="ident" title="Example">Example<\/span><\/dd>/);
   assert.match(markup, /Pending login/);
   assert.match(markup, /Approve only if you just ran/);
   assert.doesNotMatch(markup, /<form\b/);
   assert.match(markup, /<button[^>]*type="button"/);
-  assert.match(markup, /Sign in with Example to approve/);
+  assert.match(markup, />Sign in to approve</);
 });
 
 test("device approval posts JSON and returns the authorization URL", async () => {

@@ -4,9 +4,9 @@
 pub(super) mod sim;
 
 use gang_e2e::{
-    ActionLimits, Check, ExecutionKnobs, Sandbox, SoftMemory, System as _, Variant, action_timeout,
-    cold_start_misfit, exit_signals, memory_escalation, names, oversized_fleet, preemption,
-    sandbox_contract, stale_scope, unplaceable_disk, worker_renewal,
+    ActionLimits, Check, E2eError, ExecutionKnobs, Probe, Sandbox, SoftMemory, System as _,
+    Variant, action_timeout, cold_start_misfit, exit_signals, held_build, memory_escalation, names,
+    oversized_fleet, preemption, sandbox_contract, stale_scope, unplaceable_disk, worker_renewal,
 };
 use sim::*;
 
@@ -258,3 +258,95 @@ flaw! { renewal_run_renewal_after_expiry: renewal_run(renewal = Renewal::AfterEx
 flaw! { renewal_run_renewal_keeps_previous: renewal_run(renewal = Renewal::KeepsPrevious) => only [names::renewal::PREVIOUS_REMOVED] }
 flaw! { renewal_run_renewal_restarts: renewal_run(renewal = Renewal::Restarts) => only [names::renewal::SAME_WORKER] }
 flaw! { renewal_run_renewal_hold_fails: renewal_run(renewal_hold = Held::Fails) => only [names::renewal::HELD_COMPLETES] }
+
+/// The error a failed observation of a held build returns.
+const OBSERVATION: &str = "the observation";
+
+/// Asserts that `result` is the system error `context`.
+fn assert_fails_with<T: std::fmt::Debug>(result: &gang_e2e::Result<T>, context: &str) {
+    assert!(
+        matches!(result, Err(E2eError::System { context: actual, .. }) if actual == context),
+        "expected the system error `{context}`, got {result:?}"
+    );
+}
+
+/// A sandbox contract run whose operation `fault` fails after the hold started.
+fn contract_with(fault: Fault) -> gang_e2e::Result<Vec<Check>> {
+    contract(Behaviour {
+        fault,
+        ..Behaviour::COMPLIANT
+    })
+}
+
+/// A started deployment whose operation `fault` fails, for [`held_build`].
+fn started(fault: Fault) -> gang_e2e::Result<ExecSim> {
+    let sim = ExecSim::new(
+        knob(ExecutionKnobs::NONE),
+        Behaviour {
+            fault,
+            ..Behaviour::COMPLIANT
+        },
+    );
+    sim.start_server()?;
+    Ok(sim)
+}
+
+#[test]
+fn contract_ends_the_hold_when_its_scope_cannot_be_read() {
+    assert_fails_with(&contract_with(Fault::CgroupMembers), INJECTED_FAULT);
+}
+
+#[test]
+fn contract_ends_the_hold_when_its_release_fails() {
+    assert_fails_with(&contract_with(Fault::Release), INJECTED_FAULT);
+}
+
+#[test]
+fn held_build_reports_the_observation_over_the_kill_it_induces() -> gang_e2e::Result<()> {
+    let sim = started(Fault::Never)?;
+    let result = held_build(&sim, &sim, &[Probe::HeldRelease], |lines| {
+        assert_eq!(lines.await_prefix("absent")?, None);
+        sim.kill_server()?;
+        Err::<(), _>(E2eError::system(OBSERVATION))
+    });
+    assert_fails_with(&result, OBSERVATION);
+    Ok(())
+}
+
+#[test]
+fn held_build_reports_a_failed_release_over_the_kill_it_induces() -> gang_e2e::Result<()> {
+    let sim = started(Fault::SetGo)?;
+    let result = held_build(&sim, &sim, &[Probe::HeldRelease], |lines| {
+        assert_eq!(lines.await_prefix("absent")?, None);
+        sim.kill_server()
+    });
+    assert_fails_with(&result, INJECTED_FAULT);
+    Ok(())
+}
+
+#[test]
+fn held_build_drains_and_joins_its_build_when_the_induced_kill_fails() -> gang_e2e::Result<()> {
+    let sim = started(Fault::Never)?;
+    let result = held_build(&sim, &sim, &[Probe::HeldRelease], |_| {
+        sim.kill_server()?;
+        Err::<(), _>(E2eError::system(OBSERVATION))
+    });
+    assert_fails_with(&result, OBSERVATION);
+    Ok(())
+}
+
+#[test]
+fn held_build_releases_and_joins_its_build_when_the_observation_panics() -> gang_e2e::Result<()> {
+    let sim = started(Fault::Never)?;
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        held_build(
+            &sim,
+            &sim,
+            &[Probe::HeldRelease],
+            |_| -> gang_e2e::Result<()> { panic!("the observation panicked") },
+        )
+    }));
+    assert!(unwound.is_err());
+    assert!(sim.go());
+    Ok(())
+}

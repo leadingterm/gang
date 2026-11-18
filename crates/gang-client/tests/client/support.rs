@@ -938,6 +938,7 @@ impl FakeProviders {
         let refresh = format!("refresh-{n}");
         *self.state.latest_refresh.lock() = Some(refresh.clone());
         LoginGrant {
+            principal: certificate_holder().principal,
             proof: self.mint_proof(n),
             refresh_token: Some(RefreshToken::new(refresh)),
         }
@@ -1035,6 +1036,7 @@ impl LoginPort for FakeProvider {
         if state.withhold.load(Ordering::SeqCst) {
             let n = state.grants.fetch_add(1, Ordering::SeqCst) + 1;
             return Ok(LoginGrant {
+                principal: certificate_holder().principal,
                 proof: self.providers.mint_proof(n),
                 refresh_token: None,
             });

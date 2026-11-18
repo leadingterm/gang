@@ -1,0 +1,37 @@
+name: Run e2e gate
+description: Run an e2e gate using the ARM64 build artifacts.
+inputs:
+  args:
+    description: Arguments passed to the e2e gate script.
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/setup-nix
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: e2e-harness-aarch64
+        path: ${{ runner.temp }}/e2e
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: gang-aarch64-unknown-linux-musl
+        path: ${{ runner.temp }}/e2e
+    - name: Delegate cgroup controllers to the user session
+      shell: nix develop -c bash --noprofile --norc -euo pipefail {0}
+      run: |
+        sudo mkdir -p /etc/systemd/system/user@.service.d
+        printf '[Service]\nDelegate=yes\n' | sudo tee /etc/systemd/system/user@.service.d/delegate.conf
+        sudo systemctl daemon-reload
+        sudo loginctl enable-linger "$(id -u)"
+        sudo systemctl restart "user@$(id -u).service"
+        sudo systemctl start "user@$(id -u).service"
+    # tools/e2e-gate.sh runs the harness as a delegated transient service of the runner's user manager, as
+    # tools/gate.sh does on any Linux host. Artifacts drop file modes; ARGS splits into the harness's arguments.
+    - name: Run the gate
+      shell: nix develop -c bash --noprofile --norc -euo pipefail {0}
+      env:
+        ARGS: ${{ inputs.args }}
+        E2E: ${{ runner.temp }}/e2e
+      run: |
+        chmod +x "$E2E"/*
+        tools/e2e-gate.sh "$E2E" "$E2E/gang-aarch64-unknown-linux-musl" $ARGS

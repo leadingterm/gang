@@ -72,6 +72,8 @@ fn fixture(permission: Permission) -> (Api<TlsDeployment>, BuildsCell) {
             Arc::clone(&harness.clock),
         )),
         dashboard: None,
+        leader_routes: None,
+        ingest: None,
         builds: builds.clone(),
         login_provider: None,
         device: None,
@@ -159,6 +161,56 @@ async fn list_and_get_show_recorded_builds() {
 }
 
 #[tokio::test]
+async fn pages_equal_timestamp_builds_in_name_order() {
+    let (api, builds) = fixture(Permission::BuildsRead);
+    let mut expected = Vec::new();
+    for invocation in ["one", "two", "three"] {
+        let obs = observation(invocation);
+        expected.push(format!("builds/{}", obs.origin().build.id()));
+        builds.observe(Timestamp::from_unix_millis(1_000), &obs);
+    }
+    expected.sort();
+    expected.dedup();
+    assert_eq!(expected.len(), 3);
+
+    let mut names = Vec::new();
+    let mut path = "/v1/builds?pageSize=1".to_owned();
+    loop {
+        let page: ListBuildsResponse = get(&api, &path).await.ok();
+        assert_eq!(page.builds.len(), 1);
+        names.push(page.builds[0].name.clone());
+        assert!(
+            names.len() <= expected.len(),
+            "pagination did not terminate"
+        );
+        let Some(token) = page.next_page_token else {
+            break;
+        };
+        path = format!("/v1/builds?pageSize=1&pageToken={}", token.as_str());
+    }
+    assert_eq!(names, expected);
+}
+
+#[tokio::test]
+async fn recorder_folds_observations_queued_before_it_runs() {
+    let (builds, sink, observations) = BuildsCell::channel(&BuildsConfig::default());
+    let obs = observation("follower");
+    let id = obs.origin().build.id();
+    let now = Timestamp::from_unix_millis(1_000);
+    let clock = TestClock::new(now);
+    let recorder = builds.record(observations, &clock);
+    tokio::pin!(recorder);
+    sink.record(obs);
+    assert!(futures::poll!(&mut recorder).is_pending());
+    assert!(builds.read(|builds| builds.get(id, now)).is_some());
+    let active = observation("leader");
+    let active_id = active.origin().build.id();
+    sink.record(active);
+    assert!(futures::poll!(&mut recorder).is_pending());
+    assert!(builds.read(|builds| builds.get(active_id, now)).is_some());
+}
+
+#[tokio::test]
 async fn the_recorder_folds_observations_and_losses() {
     let builds = BuildsCell::new(&BuildsConfig::default());
     let (sink, observations) = ObservationSink::channel(NonZeroUsize::MIN, NonZeroUsize::MIN);
@@ -207,4 +259,50 @@ async fn recorder_drains_losses_without_another_observation() {
         .expect("recorded build");
     assert_eq!(build.unrecorded, 1);
     assert_eq!(build.usage.cache.hits, 2);
+}
+
+#[test]
+fn receiving_observations_does_not_allocate() {
+    use std::future::Future;
+    use std::task::{Context, Poll};
+
+    let (_, sink, mut observations) = BuildsCell::channel(&BuildsConfig::default());
+    let inputs: Vec<_> = (0..10)
+        .map(|i| {
+            let observation = observation(&format!("allocation-{i}"));
+            let expected = observation.origin().build.clone();
+            (observation, expected)
+        })
+        .collect();
+    let warmup = observation("warmup");
+    let waker = futures::task::noop_waker_ref();
+    let mut context = Context::from_waker(waker);
+    sink.record(warmup);
+    {
+        let next = observations.next();
+        let mut next = std::pin::pin!(next);
+        assert!(matches!(
+            next.as_mut()
+                .poll(&mut context)
+                .map(|delivery| delivery.and_then(gang_spi::Delivery::into_observation)),
+            Poll::Ready(Some(_))
+        ));
+    }
+
+    for (observation, expected) in inputs {
+        sink.record(observation);
+        let next = observations.next();
+        let mut next = std::pin::pin!(next);
+        let mut result = None;
+        let allocations = allocation_counter::measure(|| {
+            result = Some(next.as_mut().poll(&mut context));
+        });
+        assert_eq!(allocations.count_total, 0);
+        assert_eq!(allocations.bytes_total, 0);
+        let Some(Poll::Ready(Some(delivery))) = result else {
+            panic!("expected a ready observation");
+        };
+        let observation = delivery.into_observation().expect("expected observation");
+        assert_eq!(observation.origin().build, expected);
+    }
 }

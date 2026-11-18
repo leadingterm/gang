@@ -17,8 +17,15 @@ hashed, precompressed bundle that the server embeds and serves under `/ui`. It r
 | `fixtures/` | Recorded streams (`*.sse`, each frame after an `: at <ms>` send time) and JSON bodies |
 | `tools/build.mjs` | The bundle build |
 | `tools/preview.mjs` | A preview server for the bundle against the fixtures |
+| `tools/preview-server.mjs` | Fixture-backed preview server shared by the CLI and layout test |
+| `tools/chromium.mjs` | DevTools driver for the layout test |
+| `test/layout.test.mjs` | Browser layout regression test |
 | `headers.json` | The security headers `gang-ui` sends on `/ui`, printed by `gang-bindings headers`; `//ui:headers_json_test` fails when the checked-in copy differs from production, and the preview server sends them |
 | `tsconfig.json`, `tsconfig.test.json` | `tsc --strict` settings: `src` is checked against DOM types only, the tests add Node's |
+
+`StateClient` owns one session admission at a time. Re-admission retires its previous renewal even
+without a stop; concurrent renewals within the same admission join one flight, and an older response
+cannot change the new admission.
 
 ## Embedding
 
@@ -41,23 +48,45 @@ immutable caching for hashed `assets/*`, and `no-store` for `index.html` and the
 ```
 bazel build //ui:dist        # bazel-bin/ui/dist: index.html and assets/*, text files with .gz and .br
 bazel test //ui/...          # tsc --strict, store, history, client, formatter and view tests, bundle budgets, headers
+bazel test //ui:layout_test  # every screen in the devShell's pinned Chromium
+bazel test //ui:overview_layout_test # Overview tile layout in pinned Chromium
 bazel run //ui:preview       # http://127.0.0.1:8412/ui/
 ```
+
+The layout test renders every screen from the fixtures and fails when an element leaves the document, two side-by-side boxes overlap, or an identifier or time wraps. The layout and driver tests need the Linux devShell's Chromium; on macOS `bazel test //ui/...` skips them, and naming them explicitly reports them incompatible.
+It uses a settled layout snapshot and batches identifier-head font reads.
+
+Browser shutdown terminates the browser process group and waits for inherited stderr to close before
+the test removes the profile.
+
+To opt in to screenshots, run `bazel test //ui:layout_test --test_env=GANG_LAYOUT_SCREENSHOTS=1`; it writes `<page>-<width>.png` to the test's undeclared outputs.
 
 The bundler runs for the execution platform even when Bazel cross-builds the server; the UI bundle
 does not depend on the server's target platform.
 
-`test/views.snapshot` holds every screen rendered per scenario with `preact-render-to-string`. After
-an intended change, refresh it from `ui/` with
-`node tools/bundle-test.mjs test/views.test.tsx test-bundle/views.test.mjs && node --test --test-update-snapshots test-bundle/views.test.mjs`.
-
 Add `?scenario=` to a preview page to pick what the fixtures serve: `live` (default), `stale` (the
-control pass is skipped), `lagging` (the action sample is older than its threshold), `empty`, `cold`
-(scaling from zero), `disconnected` (the stream drops and stays down), `forbidden` (signed in without
-`state.read`) or `signedout`.
+control pass is skipped), `lagging` (the action sample is older than its threshold), `empty`, `isolated`
+(a synthetic chart-edge fixture), `cold` (scaling from zero), `disconnected` (the stream drops and stays
+down), `forbidden` (signed in without `state.read`), `long-session` (signed in through a long provider
+and OIDC subject) or `signedout`.
 
 Budgets (ADR-31): JavaScript at most 60 KB gzip, CSS at most 15 KB gzip; `//ui:budget_test` enforces
 them.
+
+## Screen layout
+
+Identifiers truncate in the middle, keeping the part after their last `:` (`Ident`, `splitTail`) and the full value on hover; a Bazel label follows the same rule.
+Dates, clocks, and durations use `<time>` via `Day`, `Clock`, `Duration`, `Since`, or `Until` and never wrap; `.line` keeps an identifier with its marks.
+`Table` is a grid whose rows use its subgrid: `share` columns take free width, `fit` columns cap identifiers, and value columns fit one-line values.
+Tables are laid out as grids, so `Table`, `Row`, and `Cell` set table roles explicitly; at phone width the column heads are visually hidden, not removed.
+`.cols` lays columns side by side or wraps them with the aside below the main column. `html { scrollbar-gutter: stable }` prevents page shifts.
+The five Overview tiles share label, value, meter, caption, and chart tracks with equal insets.
+Row spacing lives inside each tile so dividers remain contiguous when tiles wrap.
+Action cache shows the lookup-weighted hit rate and lookup count over the server's configured recent window, or `no lookups` when there are none.
+Its chart plots lookups as a faint area and hits as a solid line on one shared count scale; recorded zero-lookup steps are zero, and only absent history is hatched.
+Charts fit the content width and contain their markers; Instances keeps an empty history slot.
+Event icons align with the first line when messages wrap, including when narrow layouts reflow details.
+`//ui:layout_test` enforces the screen layout; `//ui:overview_layout_test` covers the Overview tiles.
 
 ## Content Security Policy
 
@@ -67,4 +96,8 @@ custom properties set with CSSOM (`style.setProperty`), never a `style` attribut
 ## Fonts
 
 `fonts/` holds Atkinson Hyperlegible Next and Atkinson Hyperlegible Mono, Latin subsets, under the SIL
-Open Font License 1.1 (`fonts/OFL-sans.txt`, `fonts/OFL-mono.txt`).
+Open Font License 1.1 (`fonts/OFL-sans.txt`, `fonts/OFL-mono.txt`). The layout test's isolated
+fontconfig uses pinned DejaVu native fonts declared in the build graph and a profile-local cache.
+It checks the loaded app fonts, the fonts actually rendering identifier heads, and a visible sans
+text node on each screen. At 320px, both Access and the long-session You screen must leave at least
+1px beyond the first head glyph and its ellipsis.

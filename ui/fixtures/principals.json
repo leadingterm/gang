@@ -79,6 +79,27 @@
       "createTime": "2025-12-01T10:09:30.000Z",
       "lastSeenTime": "2025-12-30T10:09:30.000Z",
       "revokeTime": "2025-12-31T10:09:30.000Z"
+    },
+    {
+      "name": "principals/aws-workers%3Aarn%3Aaws%3Aiam%3A%3A000000000000%3Arole%2Fexample-build-worker-instance-role",
+      "provider": "aws-workers",
+      "principal": "arn:aws:iam::000000000000:role/example-build-worker-instance-role",
+      "createTime": "2026-01-13T10:09:30.000Z",
+      "lastSeenTime": "2026-01-15T08:28:30.000Z"
+    },
+    {
+      "name": "principals/github-actions%3Arepository_owner_id%3A000000000%3Arepository_id%3A0000000000%3Aref%3Arefs%2Fheads%2Fbuild%2Fremote-build-aarch64",
+      "provider": "github-actions",
+      "principal": "repository_owner_id:000000000:repository_id:0000000000:ref:refs/heads/build/remote-build-aarch64",
+      "createTime": "2026-01-14T10:09:30.000Z",
+      "lastSeenTime": "2026-01-14T09:09:30.000Z"
+    },
+    {
+      "name": "principals/github-actions%3Arepository_owner_id%3A000000000%3Arepository_id%3A0000000000%3Aref%3Arefs%2Fheads%2Fmain",
+      "provider": "github-actions",
+      "principal": "repository_owner_id:000000000:repository_id:0000000000:ref:refs/heads/main",
+      "createTime": "2026-01-13T10:09:30.000Z",
+      "lastSeenTime": "2026-01-15T08:29:30.000Z"
     }
   ]
 }

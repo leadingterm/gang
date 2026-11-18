@@ -5,6 +5,7 @@
 //! The server is started by [`System::start_server`], and everything the stack started is torn
 //! down when it is dropped.
 
+use std::cell::Cell;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -23,12 +24,15 @@ use tokio::sync::{Notify, oneshot};
 use crate::administrator::Administrator;
 use crate::bazel::Bazel;
 use crate::build_output::BuildOutcome;
+use crate::check::Check;
 use crate::errors::{E2eError, Result};
 use crate::event_log::{EventFollower, describe_early_exit, early_exit};
 use crate::execution::Run;
 use crate::flags::Remote;
 use crate::gang_cli::GangCli;
+use crate::held_build::Cancel;
 use crate::host::Host;
+use crate::identity::Credentials;
 use crate::issuer::{TestIssuer, TokenSpec};
 use crate::placement::Placement;
 use crate::process::{self, ProcessEntry, Supervised};
@@ -36,16 +40,48 @@ use crate::report::ProbeReport;
 use crate::sample::{self, SampleParameters};
 use crate::secured;
 use crate::session::{self, SessionCookie};
-use crate::settings::Settings;
+use crate::settings::{DeploymentInputs, Settings};
 use crate::signer_key;
 use crate::sse::{self, EventStream as _, STREAM_OK};
 use crate::state_api::StateApi;
-use crate::suite::Invocation;
 use crate::system::{
     HOLD_CPU_COUNT, HOLD_MEMORY_KB, LARGE_FLEET, Limits, Probe, Sandbox, ScopeFacts, System,
     Variant,
 };
 use crate::template::{ConfigTemplate, Transport};
+
+pub(crate) const DEMAND_ROOT: &str = "demand-bazel";
+pub(crate) const FOLLOWER_ROOT: &str = "follower-bazel";
+
+thread_local! {
+    /// Placements of the scenario running on this thread, kept alive until its verdict is known;
+    /// `None` outside [`with_failure_evidence`].
+    static EVIDENCE_PLACEMENTS: Cell<Option<Vec<(Placement, usize)>>> = const { Cell::new(None) };
+}
+
+/// Runs a scenario and prints evidence for every placement before removing it on failure.
+pub(crate) fn with_failure_evidence(run: impl FnOnce() -> Vec<Check>) -> Vec<Check> {
+    EVIDENCE_PLACEMENTS.set(Some(Vec::new()));
+    let checks = run();
+    let placements = EVIDENCE_PLACEMENTS.take();
+    if checks.iter().any(Check::is_failure) {
+        for (placement, limit) in placements.into_iter().flatten() {
+            println!("{}", failure_evidence(&placement, limit));
+        }
+    }
+    checks
+}
+
+/// Formats the server and local worker log tails for a placement.
+fn failure_evidence(placement: &Placement, limit: usize) -> String {
+    let server_log = placement.server_log();
+    format!(
+        "server log tail {}:\n{}\nlocal worker log tails:\n{}",
+        server_log.display(),
+        log_tail(&server_log, limit),
+        local_evidence(&placement.state_dir().join("logs"), false, limit)
+    )
+}
 
 /// A running `gang` deployment and the Bazel workspace that builds against it.
 pub struct Stack<'a> {
@@ -101,13 +137,17 @@ impl<'a> Stack<'a> {
     /// [`E2eError::Io`] when a file or directory cannot be written, and the errors of
     /// [`Placement::create`], [`sample::stage`], and [`signer_key::provision`].
     pub fn create(
-        invocation: &Invocation,
+        invocation: &DeploymentInputs,
         variant: &Variant,
         transport: Transport,
         issuer: &'a TestIssuer,
     ) -> Result<Self> {
         let settings = &invocation.settings;
         let placement = Placement::create(settings.scratch_root.as_deref())?;
+        if let Some(mut placements) = EVIDENCE_PLACEMENTS.take() {
+            placements.push((placement.clone(), settings.log_tail_bytes));
+            EVIDENCE_PLACEMENTS.set(Some(placements));
+        }
 
         let salt = sample::salt()?;
         let signal_dir = placement.root().join(format!("signal-{salt}"));
@@ -295,6 +335,31 @@ impl<'a> Stack<'a> {
         })
     }
 
+    /// How a build made as the deployment's administrator reaches the executor: the rc file is
+    /// rendered into the administrator's home.
+    pub(crate) fn administrator_remote(&self, credentials: &Credentials) -> Result<Remote> {
+        let endpoint = self.endpoint()?;
+        let host = endpoint
+            .host_str()
+            .ok_or_else(|| E2eError::system(format!("{endpoint} has no host")))?
+            .to_owned();
+        let bazelrc = secured::render_deployment_bazelrc(
+            &self.binary,
+            &self.config_file,
+            &endpoint,
+            self.ca_pin,
+            &self.placement.workspace(),
+            &credentials.home,
+            self.settings.command_timeout,
+        )?;
+        Ok(Remote::Gang {
+            host,
+            bazelrc,
+            home: credentials.home.clone(),
+            helper: self.binary.clone(),
+        })
+    }
+
     /// The `gang` binary under test.
     #[must_use]
     pub(crate) fn binary(&self) -> &Path {
@@ -403,6 +468,23 @@ impl<'a> Stack<'a> {
             }
         }
     }
+    /// Connects the existing client machinery to a separately supervised deployment.
+    pub(crate) fn connect_external(&self, endpoint: Url) -> Result<()> {
+        *self.endpoint.lock() = Some(endpoint);
+        secured::render_deployment_bazelrc(
+            &self.binary,
+            &self.config_file,
+            &self.endpoint()?,
+            self.ca_pin,
+            &self.placement.workspace(),
+            &self.placement.home(),
+            self.settings.command_timeout,
+        )?;
+        if let Some(pin) = self.ca_pin {
+            self.enroll_developer(pin)?;
+        }
+        Ok(())
+    }
 
     /// Runs a build until it finishes or the caller sends an abort reason.
     pub(crate) fn build_until_stopped(
@@ -416,6 +498,17 @@ impl<'a> Stack<'a> {
     /// Kills the Bazel server after its launcher was aborted, abandoning the build it still runs.
     pub(crate) fn kill_bazel(&self) -> Result<()> {
         self.bazel.kill_servers()
+    }
+
+    /// Kills the Bazel server for the stack or a distinct concurrent-build output root.
+    pub(crate) fn kill_bazel_in(&self, root: Option<&str>) -> Result<()> {
+        match root {
+            None => self.bazel.kill_servers(),
+            Some(root) => self
+                .bazel
+                .with_output_user_root(self.placement.root().join(root))
+                .kill_servers(),
+        }
     }
 
     /// Waits on the state stream, checking the authoritative GET state on each frame.
@@ -451,6 +544,38 @@ impl<'a> Stack<'a> {
         observed.ok_or_else(|| E2eError::system("the state stream ended without a matching state"))
     }
 
+    /// A concurrent build needs its own Bazel server; one output base serializes invocations.
+    pub(crate) fn build_additional(
+        &self,
+        probes: &[Probe],
+        run: &Run,
+        stop: oneshot::Receiver<String>,
+    ) -> Result<BuildOutcome> {
+        self.build_additional_in(probes, run, DEMAND_ROOT, stop)
+    }
+
+    /// Runs another concurrent build in a distinct Bazel output root.
+    pub(crate) fn build_additional_in(
+        &self,
+        probes: &[Probe],
+        run: &Run,
+        output_root: &str,
+        stop: oneshot::Receiver<String>,
+    ) -> Result<BuildOutcome> {
+        let remote = self.remote()?;
+        let driver = self
+            .bazel
+            .with_output_user_root(self.placement.root().join(output_root));
+        let result = driver.build_until(&remote, probes, Some(run), stop);
+        // A failed or cancelled build can leave its server wedged; only a finished one stops cleanly.
+        if result.is_ok() {
+            driver.shutdown(&remote);
+        } else if let Err(error) = driver.kill_servers() {
+            eprintln!("failed to kill the additional build's Bazel server: {error}");
+        }
+        result
+    }
+
     /// Builds `probes` through `remote`, as `run` when there is one, returning how the build ended.
     /// A follower accelerates failure on a newly recorded early exit; its own errors do not
     /// change the build result.
@@ -464,6 +589,19 @@ impl<'a> Stack<'a> {
         probes: &[Probe],
         run: Option<&Run>,
     ) -> Result<BuildOutcome> {
+        let (cancel, stop) = Cancel::pair();
+        self.run_build_until(remote, probes, run, &cancel, stop)
+    }
+
+    /// Runs a build with caller-owned cancellation and early-exit observation.
+    pub(crate) fn run_build_until(
+        &self,
+        remote: &Remote,
+        probes: &[Probe],
+        run: Option<&Run>,
+        cancel: &Cancel,
+        stop: oneshot::Receiver<String>,
+    ) -> Result<BuildOutcome> {
         let mut follower = match self.transport {
             Transport::Tls => self
                 .administrator()?
@@ -473,25 +611,35 @@ impl<'a> Stack<'a> {
             }
         };
         let baseline = follower.newest_seq();
-        let stop = Notify::new();
-        let (sender, receiver) = oneshot::channel();
+        let watcher_stop = Notify::new();
         std::thread::scope(|scope| {
             let watcher = scope.spawn(|| {
                 if let Ok(Some(events)) = follower.wait_for_or_stop(
                     |events| early_exit(events, baseline).is_some(),
                     self.settings.build_timeout,
-                    &stop,
+                    &watcher_stop,
                 ) && let Some(event) = early_exit(events, baseline)
                 {
-                    let _ = sender.send(describe_early_exit(event));
+                    cancel.fire(&describe_early_exit(event));
                 }
             });
-            let result = self.bazel.build_until(remote, probes, run, receiver);
-            stop.notify_one();
+            let result = self.bazel.build_until(remote, probes, run, stop);
+            watcher_stop.notify_one();
             // The follower is an accelerator, not a verdict, even if its thread fails.
             let _ = watcher.join();
             result
         })
+    }
+
+    /// Runs a named build with caller-owned cancellation.
+    pub(crate) fn build_run_until(
+        &self,
+        probes: &[Probe],
+        run: &Run,
+        cancel: &Cancel,
+        stop: oneshot::Receiver<String>,
+    ) -> Result<BuildOutcome> {
+        self.run_build_until(&self.remote()?, probes, Some(run), cancel, stop)
     }
 
     /// Cleans the Bazel output for `remote`, so that the next build reaches it again.
@@ -602,7 +750,7 @@ fn announced_listeners(lines: &[String]) -> Result<Listeners> {
         let slot = match role {
             ListenerRole::Public => &mut public,
             ListenerRole::Worker => &mut worker,
-            ListenerRole::Imds => continue,
+            ListenerRole::Health | ListenerRole::Imds => continue,
         };
         if slot.replace(address).is_some() {
             return Err(E2eError::system(format!(
@@ -626,6 +774,59 @@ fn log_tail(path: &Path, limit: usize) -> String {
             String::from_utf8_lossy(tail).into_owned()
         }
         Err(error) => format!("unreadable ({error})"),
+    }
+}
+
+/// Reads instance records with secrets redacted or per-worker log tails, reporting failures.
+pub(crate) fn local_evidence(directory: &Path, records: bool, limit: usize) -> String {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => return format!("{}: {error}", directory.display()),
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => {
+                let path = if records {
+                    entry.path().join("instance.json")
+                } else {
+                    entry.path()
+                };
+                if records || path.extension().is_some_and(|extension| extension == "log") {
+                    paths.push(path);
+                }
+            }
+            Err(error) => return format!("{}: {error}", directory.display()),
+        }
+    }
+    paths.sort();
+    if paths.is_empty() {
+        return format!("{}: no entries", directory.display());
+    }
+    paths
+        .into_iter()
+        .map(|path| {
+            let content = match fs::read(&path) {
+                Ok(bytes) if records => redacted_record(&bytes),
+                Ok(bytes) => crate::observer::tail(&bytes, limit),
+                Err(error) => format!("unreadable: {error}"),
+            };
+            format!("{}:\n{content}", path.display())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn redacted_record(bytes: &[u8]) -> String {
+    match serde_json::from_slice::<serde_json::Value>(bytes) {
+        Ok(serde_json::Value::Object(mut record)) => {
+            if let Some(secret) = record.get_mut("secret") {
+                *secret = serde_json::Value::String("<redacted>".into());
+            }
+            serde_json::Value::Object(record).to_string()
+        }
+        Ok(_) => "unreadable: instance record is not a JSON object".to_owned(),
+        Err(_) => "unreadable: invalid instance record JSON".to_owned(),
     }
 }
 
@@ -814,6 +1015,10 @@ impl Limits for Stack<'_> {
         self.signal.notify()
     }
 
+    fn cancel_hold(&self) -> Result<()> {
+        self.kill_bazel()
+    }
+
     fn running_scope(&self) -> Result<Option<ScopeFacts>> {
         let marker = self.orphan_marker();
         let entries = process::snapshot();
@@ -873,14 +1078,15 @@ impl Limits for Stack<'_> {
 }
 
 impl Drop for Stack<'_> {
-    /// Kills the server, terminates the workers of this configuration, and stops the Bazel
-    /// server. Failures are ignored: this runs on the way out of a scenario, whatever its outcome.
+    /// Kills the server, terminates workers, and stops the Bazel server.
     fn drop(&mut self) {
         let child = self.server.lock().take();
         if let Some(mut child) = child {
             let _ = child.kill();
         }
-        let _ = process::terminate_workers(&self.config_file);
+        if let Err(error) = process::terminate_workers(&self.config_file) {
+            eprintln!("worker cleanup for {}: {error}", self.config_file.display());
+        }
         if let Ok(remote) = self.remote() {
             self.bazel.shutdown(&remote);
         }
@@ -890,6 +1096,29 @@ impl Drop for Stack<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failure_evidence_contains_server_and_worker_log_tails() {
+        let placement = Placement::create(None).expect("placement");
+        let logs = placement.state_dir().join("logs");
+        fs::create_dir_all(&logs).expect("worker log directory");
+        fs::write(placement.server_log(), "prefix server-tail").expect("server log");
+        fs::write(logs.join("one.log"), "prefix worker-one").expect("first worker log");
+        fs::write(logs.join("two.log"), "prefix worker-two").expect("second worker log");
+
+        let evidence = failure_evidence(&placement, 10);
+        assert!(evidence.contains(&format!(
+            "server log tail {}:",
+            placement.server_log().display()
+        )));
+        assert!(evidence.contains("erver-tail"));
+        assert!(evidence.contains("local worker log tails:"));
+        assert!(evidence.contains(&format!("{}:", logs.join("one.log").display())));
+        assert!(evidence.contains(&format!("{}:", logs.join("two.log").display())));
+        assert!(evidence.contains("worker-one"));
+        assert!(evidence.contains("worker-two"));
+        assert!(!evidence.contains("prefix"));
+    }
 
     fn announcement(lines: &[&str]) -> Vec<String> {
         lines.iter().map(|line| (*line).to_owned()).collect()
