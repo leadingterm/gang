@@ -34,7 +34,7 @@ pub const BROWSER_SUBJECT: &str = "browser";
 /// `[authentication.clients.token] token_ttl` of the sessions deployment.
 pub const SESSION_TOKEN_TTL: Duration = Duration::from_secs(25);
 /// `[dashboard] session_max_age` of the sessions deployment.
-pub const SESSION_MAX_AGE: Duration = Duration::from_secs(60);
+pub const SESSION_MAX_AGE: Duration = Duration::from_mins(1);
 
 /// What the sessions scenario sees of a deployment whose dashboard signs browsers in and renews their
 /// sessions. Every method blocks until its observation is complete; an error is a harness failure,

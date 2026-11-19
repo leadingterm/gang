@@ -273,7 +273,7 @@ impl Scenario {
             Self::Memory | Self::Revocation | Self::Builds => 23,
             Self::UnplaceableDisk | Self::InputRoot => 27,
             Self::Disk => 57,
-            Self::Fleets => 75,
+            Self::Fleets | Self::LeaderFailover => 75,
             Self::ActionTimeout => 49,
             Self::ActionTimeoutNoop => 43,
             Self::WorkerRenewal | Self::LaunchFailure => 34,
@@ -298,7 +298,6 @@ impl Scenario {
             Self::ControllerLoss => 84,
             Self::RollingDeploy | Self::BurstFromZero => 62,
             Self::FollowerBuilds => 66,
-            Self::LeaderFailover => 75,
             Self::LoginAcross => 15,
             Self::ScheduledMinimum => 5,
             Self::BacklogGrowsFleet => 10,
@@ -954,7 +953,7 @@ fn parallel_variant_checks<T: Send, const N: usize>(
             let run = &run;
             scope.spawn(move || crate::stack::with_failure_evidence(|| run(variant)))
         });
-        let results = handles.map(|handle| handle.join());
+        let results = handles.map(std::thread::ScopedJoinHandle::join);
         results
             .into_iter()
             .flat_map(|result| match result {
@@ -1333,7 +1332,7 @@ mod tests {
                     ]
                 }
             });
-            let names: Vec<_> = checks.iter().map(|check| check.name.as_str()).collect();
+            let names: Vec<_> = checks.iter().map(|check| check.name).collect();
             assert_eq!(
                 names,
                 if variants[0] {
