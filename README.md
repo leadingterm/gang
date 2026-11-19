@@ -40,6 +40,8 @@ nix develop -c bazel test //...
 
 CI is the merge gate: `ci.yml` runs on every pull request, including drafts and updates, pushes to `main` and `master` and `v*` tags, and manual dispatch. Only documentation-only pull requests skip heavy jobs; `docs/API.md` and `docs/PLAN.md` are live test inputs and do not qualify. The PR critical path is exclusively x86-64: portable lint, Nix VM checks, the complete partitioned Linux test suite, a parallel binary and harness bundle build, and parallel end-to-end gates. ARM, cross and macOS validation run only on default-branch pushes and version tags and gate release artifact reuse through `release-validation`; private RunsOn repositories retain the unsupported-macOS exception. Superseded PR and branch runs are cancelled. Public CI uses GitHub's free standard runners; private CI uses ephemeral RunsOn Linux runners with 4 CPUs and 16 GB RAM. Require a successful `required` check on the latest PR revision before merging. CI uses read-only contents permission, no secrets, no OIDC and no Gang farm. See [specification §7.1](docs/SPECIFICATION.md#71-continuous-integration) for exact checks, skip policy, runners and cache budgets.
 
+The complete x86 test suite uses four shards. Each end-to-end gate uses eight deterministic, warm-timing-balanced shards with four parallel scenarios per harness: all 28 Gate 1 scenarios and the 21 Gate 2 additions run without reduced checks or repeated Gate 1 coverage. The binary and harness still build from source and upload separately; only their redundant cache working-set export is removed, with build BEP/profile artifacts retained even on failure. The nonrequired cache fan-in merges the four test-shard exports plus lint. Five-minute warm CI and two-minute whole E2E jobs remain targets pending real workflow measurements.
+
 Portable lint runs `bazel run //:gazelle.check`, infrastructure and workflow validation, and the behavioral guards, including `tools/check-required-jobs_test.sh`. Rustfmt and Clippy for every x86 Rust target, tests included, run in the full test shards rather than recompiling the workspace in lint; portable lint has a three-minute budget. Darwin all-target Clippy belongs to macOS release validation, not the PR gate. `tools/lint.sh --portable` and `tools/lint.sh --nix-vm` select the two local lint partitions; on x86 Linux, `tools/lint.sh` runs both. The required-jobs guard checks fail-closed status aggregation and dependency coverage. Run it locally with `nix develop -c tools/check-required-jobs_test.sh`. Cross-target toolchains are described in [specification §8.4](docs/SPECIFICATION.md#84-nixos-images).
 
 OpenTofu provider ZIPs are checksum-pinned in `MODULE.bazel` and fetched through
@@ -75,6 +77,8 @@ TLS Local Mode (`gang local up` without `--insecure`) accepts client tokens only
 The harness settings `startup_timeout` and `command_timeout` default to `2m`; `build_timeout`
 defaults to `30m` for each Bazel invocation, including shutdown. `handshake_timeout` defaults to
 `5s` and bounds connection setup.
+
+Gang-issued client tokens and local workload proofs accept a minimum TTL of `20s`; AWS STS workload proofs retain their `60s` minimum. Defaults remain `10m` for client tokens and `15m` for workload proofs. The browser sessions E2E fixture uses `25s` tokens and a `60s` absolute session age; this changes neither production defaults nor expiry/renewal coverage. Its 60-second shard weight is provisional until a new workflow measures it.
 
 ## Deploying
 

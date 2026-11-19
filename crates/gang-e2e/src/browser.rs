@@ -32,9 +32,9 @@ use crate::template::PROVIDER;
 /// The subject browsers sign in as in the sessions deployment (its `login_hint`).
 pub const BROWSER_SUBJECT: &str = "browser";
 /// `[authentication.clients.token] token_ttl` of the sessions deployment.
-pub const SESSION_TOKEN_TTL: Duration = Duration::from_mins(1);
+pub const SESSION_TOKEN_TTL: Duration = Duration::from_secs(25);
 /// `[dashboard] session_max_age` of the sessions deployment.
-pub const SESSION_MAX_AGE: Duration = Duration::from_mins(3);
+pub const SESSION_MAX_AGE: Duration = Duration::from_secs(60);
 
 /// What the sessions scenario sees of a deployment whose dashboard signs browsers in and renews their
 /// sessions. Every method blocks until its observation is complete; an error is a harness failure,
@@ -524,8 +524,9 @@ impl<B: Browser> Scenario<'_, B> {
 
 /// Runs the sessions scenario through `browser`; `margin` bounds each wait beyond a token lifetime.
 ///
-/// With zero clock skew, streams close at session expiry: two renewals occur before the three-minute
-/// absolute deadline, and the third expiry falls after it if overhead is below one token lifetime.
+/// With zero clock skew, streams close at session expiry: two renewals follow 25-second
+/// lifetimes before the 60-second absolute deadline clips the final session to its remaining
+/// lifetime, nominally 10 seconds.
 ///
 /// # Errors
 /// When a request cannot be sent or a stream cannot be read.

@@ -97,6 +97,41 @@ for job in e2e-gate-1-shards e2e-gate-2-shards; do
   job="$job" yq -i '.jobs[strenv(job)].needs = ["changes", "linux-arm64-bundle"]' "$fixture"
   expect failure "$job cannot consume an ARM-only producer" "$guard" "$fixture"
 done
+for job in e2e-gate-1-shards e2e-gate-2-shards; do
+  for matrix in '{"shard":[1,2,3,4]}' '{"shard":[1,2,3,4,5,6,7,7]}' '{"shard":[1,2,3,4,5,6,7,8],"exclude":[{"shard":8}]}' '{"shard":[1,2,3,4,5,6,7,8],"engine":["sqlite","postgres"]}'; do
+    cp "$workflow" "$fixture"
+    job="$job" matrix="$matrix" yq -i '.jobs[strenv(job)].strategy.matrix = (strenv(matrix) | from_json)' "$fixture"
+    expect failure "$job rejects incomplete, duplicate or expanded matrices: $matrix" "$guard" "$fixture"
+  done
+  for denominator in 4 8; do
+    cp "$workflow" "$fixture"
+    job="$job" denominator="$denominator" yq -i '(.jobs[strenv(job)].steps[] | select(.uses == "./.github/actions/run-e2e") | .with.args) |= sub("/.*$", "/" + strenv(denominator))' "$fixture"
+    expect failure "$job denominator must derive from matrix job total, not $denominator" "$guard" "$fixture"
+  done
+  cp "$workflow" "$fixture"
+  job="$job" yq -i '(.jobs[strenv(job)].steps[] | select(.uses == "./.github/actions/run-e2e") | .with.args) += " --scenario api"' "$fixture"
+  expect failure "$job cannot filter away scenarios" "$guard" "$fixture"
+done
+cp "$workflow" "$fixture"
+yq -i '(.jobs.e2e-gate-2-shards.steps[] | select(.uses == "./.github/actions/run-e2e") | .with.args) |= sub(" --additions", "")' "$fixture"
+expect failure 'Gate 2 must run additions without repeating Gate 1' "$guard" "$fixture"
+cp "$workflow" "$fixture"
+yq -i '.jobs.linux-x86_64-bundle.steps += [{"uses": "./.github/actions/save-bazel-cache", "with": {"mode": "export", "shard": "x86-bundle"}}]' "$fixture"
+expect failure 'bundle working-set export must stay removed' "$guard" "$fixture"
+for metric in bazel-build.bep.json bazel-build.profile.gz; do
+  cp "$workflow" "$fixture"
+  metric="$metric" yq -i '(.jobs.linux-x86_64-bundle.steps[] | select(.with.name == "bazel-metrics-x86-bundle") | .with.path) |= sub(strenv(metric), "missing")' "$fixture"
+  expect failure "bundle metrics must retain $metric" "$guard" "$fixture"
+done
+for mutation in condition pin retention; do
+  cp "$workflow" "$fixture"
+  case "$mutation" in
+    condition) yq -i '(.jobs.linux-x86_64-bundle.steps[] | select(.with.name == "bazel-metrics-x86-bundle") | .if) = "success()"' "$fixture" ;;
+    pin) yq -i '(.jobs.linux-x86_64-bundle.steps[] | select(.with.name == "bazel-metrics-x86-bundle") | .uses) = "actions/upload-artifact@main"' "$fixture" ;;
+    retention) yq -i '(.jobs.linux-x86_64-bundle.steps[] | select(.with.name == "bazel-metrics-x86-bundle") | .with."retention-days") = 90' "$fixture" ;;
+  esac
+  expect failure "bundle metrics enforce $mutation" "$guard" "$fixture"
+done
 
 # Execute actual GitHub job conditions with synthetic event values. Only the
 # repository-owned expression is shell code; fixture values remain quoted data.

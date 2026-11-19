@@ -111,12 +111,33 @@ trap 'rm -rf -- "$scratch"' EXIT
 
 case ${1-} in
   export)
-    (( $# == 5 )) || fail 'usage: export DISK_CACHE REPOSITORY_CACHE EPOCH DESTINATION'
+    (( $# >= 5 && $# <= 7 )) || fail 'usage: export DISK_CACHE REPOSITORY_CACHE EPOCH DESTINATION [USED_MANIFEST [RESTORED_MANIFEST]]'
     [[ $4 =~ ^[0-9]+$ ]] || fail 'epoch must be a nonnegative integer'
     epoch=$4
     disk=$(canonical "$2"); repo=$(canonical "$3"); dest=$(canonical "$5")
     separate "$dest" "$disk"; separate "$dest" "$repo"
-    fresh_destination "$dest"
+    used=
+    : >"$scratch/base"
+    if (( $# >= 6 )); then
+      used=$(canonical "$6")
+      separate "$used" "$dest"; separate "$used" "$disk"; separate "$used" "$repo"
+      [[ ! -e $used || -f $used ]] || fail "invalid used manifest destination: $used"
+    fi
+    if (( $# == 7 )) && [[ -n $7 ]]; then
+      base=$(canonical "$7")
+      separate "$dest" "$base"; separate "$used" "$base"
+      # Validate the entire restored set before creating any output. Only a
+      # restored payload, not an isolated marker, covers a repository checksum.
+      validate_manifest "$base" >"$scratch/restored"
+      while IFS= read -r -d '' rel; do
+        classify "$rel" f
+        if [[ $kind != repo || ${rel##*/} == file ]]; then
+          printf '%s\0' "$rel" >>"$scratch/base"
+        fi
+      done <"$scratch/restored"
+    fi
+    : >"$scratch/used"
+    : >"$scratch/units"
     if [[ -e $disk ]]; then
       [[ -d $disk ]] || fail "not a directory: $disk"
       find "$disk" -type f -printf '%T@ %p\0' >"$scratch/files"
@@ -126,7 +147,8 @@ case ${1-} in
         classify "disk/$rel" f
         [[ $kind == ac || $kind == cas ]] || continue
         (( 10#${timestamp%%.*} >= 10#$epoch )) || continue
-        copy_file "$file" "$dest/disk/$rel"
+        printf '%s\0' "disk/$rel" >>"$scratch/used"
+        printf '%s\0' "disk/$rel" >>"$scratch/units"
       done <"$scratch/files"
     fi
     if [[ -e $repo ]]; then
@@ -137,14 +159,36 @@ case ${1-} in
         [[ $timestamp != -* ]] || continue
         [[ $rel =~ ^content_addressable/sha256/[0-9a-f]{64}/file$ ]] || continue
         (( 10#${timestamp%%.*} >= 10#$epoch )) || continue
-        copy_file "$file" "$dest/repository/$rel"
+        printf '%s\0' "repository/$rel" >>"$scratch/used"
+        printf '%s\0' "repository/$rel" >>"$scratch/units"
         dir=${file%/*}
         find "$dir" -mindepth 1 -maxdepth 1 -type f -name 'id-?*' -print0 >"$scratch/markers"
         while IFS= read -r -d '' marker; do
-          copy_file "$marker" "$dest/repository/${rel%/*}/${marker##*/}"
+          printf '%s\0' "repository/${rel%/*}/${marker##*/}" >>"$scratch/used"
         done <"$scratch/markers"
       done <"$scratch/files"
     fi
+    sort -zu "$scratch/used" -o "$scratch/used"
+    sort -zu "$scratch/units" -o "$scratch/units"
+    sort -zu "$scratch/base" -o "$scratch/base"
+    comm -z -23 "$scratch/units" "$scratch/base" >"$scratch/delta"
+    fresh_destination "$dest"
+    # Copy only new units; the complete used set also names restored inputs.
+    while IFS= read -r -d '' rel; do
+      if [[ $rel == disk/* ]]; then
+        copy_file "$disk/${rel#disk/}" "$dest/$rel"
+      else
+        file=$repo/${rel#repository/}
+        copy_file "$file" "$dest/$rel"
+        dir=${file%/*}
+        find "$dir" -mindepth 1 -maxdepth 1 -type f -name 'id-?*' -print0 >"$scratch/markers"
+        while IFS= read -r -d '' marker; do
+          copy_file "$marker" "$dest/${rel%/*}/${marker##*/}"
+        done <"$scratch/markers"
+      fi
+    done <"$scratch/delta"
+    # Replace the output rather than overwriting a possible hardlink to inputs.
+    if [[ -n $used ]]; then mv -- "$scratch/used" "$used"; fi
     ;;
   manifest)
     (( $# == 3 )) || fail 'usage: manifest DISK_CACHE REPOSITORY_CACHE'

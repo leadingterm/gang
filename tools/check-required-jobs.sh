@@ -61,14 +61,21 @@ yq -o=json '.jobs' "$workflow" | jq -e '
   | needs("linux-x86_64-bundle"; ["changes"])
   | if ([$jobs["linux-x86_64-bundle"].steps[]? | select(.uses == "./.github/actions/setup-bazel")
          | select(.with."cache-job" == "linux-x86_64" and .with."restore-only" == "true")] | length) != 1
-       or ([$jobs["linux-x86_64-bundle"].steps[]? | select(.uses == "./.github/actions/save-bazel-cache")
-         | select(.with.mode == "export" and .with.shard == "x86-bundle")] | length) != 1
+       or ([$jobs["linux-x86_64-bundle"].steps[]? | select(.uses == "./.github/actions/save-bazel-cache")] | length) != 0
        or ([$jobs["linux-x86_64-bundle"].steps[]?.run | strings
          | select(contains("bazel build") and contains("//:gang") and contains("//crates/gang-e2e:bundle"))] | length) != 1
        or ([$jobs["linux-x86_64-bundle"].steps[]? | select(.uses == "./.github/actions/upload-gang")
          | select(.with.target == "x86_64-unknown-linux-musl")] | length) != 1
        or ([$jobs["linux-x86_64-bundle"].steps[]?.with.name | select(. == "e2e-harness-x86_64")] | length) != 1 then
-      error("x86 bundle must build and export the x86 gang, harness, and working set")
+      error("x86 bundle must build and upload gang and harness without a redundant working-set export")
+    else . end
+  | if ([$jobs["linux-x86_64-bundle"].steps[]?
+         | select(.uses == "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9")
+         | select(.if == "always()" and .with.name == "bazel-metrics-x86-bundle"
+           and .with."retention-days" == 7
+           and (.with.path | split("\n") | map(select(length > 0)) | sort)
+             == ["${{ runner.temp }}/bazel-build.bep.json", "${{ runner.temp }}/bazel-build.profile.gz"])] | length) != 1 then
+      error("x86 bundle must always upload its BEP and profile through the pinned artifact action")
     else . end
   | needs("cache-x86_64"; ["changes", "linux-x86_64-shards", "linux-x86_64-bundle", "lint"])
   | if ([$jobs["cache-x86_64"].steps[]?.with.pattern | select(. == "bazel-working-set-x86-*")] | length) != 1 then
@@ -86,7 +93,13 @@ yq -o=json '.jobs' "$workflow" | jq -e '
   | results("release-validation")
   | reduce ["e2e-gate-1", "e2e-gate-2"][] as $id (.;
       needs($id + "-shards"; ["changes", "linux-x86_64-bundle"])
-      | needs($id; ["changes", $id + "-shards"]))
+      | needs($id; ["changes", $id + "-shards"])
+      | if $jobs[$id + "-shards"].strategy.matrix == {"shard": [1, 2, 3, 4, 5, 6, 7, 8]} then .
+        else error($id + " must run all eight shards with no extra matrix dimensions or exclusions") end
+      | (if $id == "e2e-gate-1" then "--gate 1" else "--gate 2 --additions" end) as $selection
+      | if ([$jobs[$id + "-shards"].steps[]? | select(.uses == "./.github/actions/run-e2e")
+             | .with.args] == [$selection + " --shard ${{ matrix.shard }}/${{ strategy.job-total }}"]) then .
+        else error($id + " must run its complete selection with the matrix job total as denominator") end)
   | reduce ["linux-x86_64", "e2e-gate-1", "e2e-gate-2", "required"][] as $id (.;
       results($id)
       | if $jobs[$id].if == "always()" then .

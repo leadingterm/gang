@@ -37,23 +37,19 @@ runs:
         esac
     - name: Stop Bazel before exporting or saving
       id: shutdown
-      if: always() && runner.os == 'Linux' && runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64' && steps.validate.outcome != 'failure' && (inputs.mode == 'export' && inputs.prune == 'true' || inputs.mode == 'save' && env.BAZEL_DISK_CACHE_SAVE == 'true')
+      if: always() && runner.os == 'Linux' && runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64' && steps.validate.outcome != 'failure' && (inputs.mode == 'export' && inputs.prune == 'true' && env.BAZEL_CURRENT_CACHE_HIT != 'true' || inputs.mode == 'save' && env.BAZEL_DISK_CACHE_SAVE == 'true')
       shell: bash
       run: nix develop -c bazel shutdown
     - name: Export shard working set
-      if: runner.os == 'Linux' && runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64' && inputs.mode == 'export' && inputs.prune == 'true'
+      if: runner.os == 'Linux' && runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64' && inputs.mode == 'export' && inputs.prune == 'true' && env.BAZEL_CURRENT_CACHE_HIT != 'true'
       shell: bash
       run: |
         root="$RUNNER_TEMP/bazel-working-set"
         mkdir -p -- "$root"
-        tools/ci-cache.sh export "$BAZEL_DISK_CACHE" "$BAZEL_REPOSITORY_CACHE" "$BAZEL_DISK_CACHE_EPOCH_SECONDS" "$root/files"
-        # Keep the full used set even when its restored payload is omitted.
-        tools/ci-cache.sh manifest "$root/files/disk" "$root/files/repository" > "$root/used"
-        if [[ -n ${BAZEL_RESTORED_MANIFEST:-} ]]; then
-          tools/ci-cache.sh subtract "$root/files" "$BAZEL_RESTORED_MANIFEST"
-        fi
+        # Record the full used set, but never copy restored payloads into the delta.
+        tools/ci-cache.sh export "$BAZEL_DISK_CACHE" "$BAZEL_REPOSITORY_CACHE" "$BAZEL_DISK_CACHE_EPOCH_SECONDS" "$root/files" "$root/used" "${BAZEL_RESTORED_MANIFEST:-}"
     - name: Upload shard working set
-      if: runner.os == 'Linux' && runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64' && inputs.mode == 'export' && inputs.prune == 'true'
+      if: runner.os == 'Linux' && runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64' && inputs.mode == 'export' && inputs.prune == 'true' && env.BAZEL_CURRENT_CACHE_HIT != 'true'
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: bazel-working-set-${{ inputs.shard }}

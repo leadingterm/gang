@@ -2,6 +2,8 @@
 # The local x86_64 Linux diagnostic mirrors the PR gate, stopping at the first failure:
 # portable lint (including BUILD sync), nix-vm checks, the full workspace and bundle, then
 # Gate 1 and both Gate 2 addition shards through the same tools/e2e-gate.sh launcher as CI.
+# Run these harnesses sequentially: local parity means identical scenario coverage, not
+# launching CI's sixteen independent harness jobs together on one bounded host.
 # ARM, cross and macOS validation run separately on default-branch pushes and v* tags.
 # Usage: nix develop -c tools/gate.sh. BAZEL names the Bazel command (default: the devShell's `bazel`).
 set -euo pipefail

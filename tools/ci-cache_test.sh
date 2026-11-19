@@ -85,10 +85,111 @@ check 'missing input directories export as empty' "$cache" export "$scratch/no-d
 check 'empty export destination exists' test -d "$scratch/empty"
 check 'empty export contains no files' test -z "$(find "$scratch/empty" -type f -print 2>/dev/null)"
 reject 'export requires arguments' "$cache" export
-reject 'export rejects extra arguments' "$cache" export "$disk" "$repo" "$epoch" "$scratch/extra" extra
+reject 'export rejects extra arguments' "$cache" export "$disk" "$repo" "$epoch" "$scratch/extra" "$scratch/extra-used" '' extra
 reject 'export rejects invalid epoch' "$cache" export "$disk" "$repo" invalid "$scratch/bad-epoch"
 reject 'unknown command fails' "$cache" unknown
 reject 'missing command fails' "$cache"
+
+# Compare the optimized producer against the original full-export/subtract result.
+printf 'new marker\n' >"$repo/content_addressable/sha256/$key1/id-new"
+"$cache" export "$disk" "$repo" "$epoch" "$scratch/full-export"
+"$cache" manifest "$scratch/full-export/disk" "$scratch/full-export/repository" >"$scratch/full-used"
+printf '%s\0' "repository/content_addressable/sha256/$key1/file" \
+  "disk/ac/00/$key1" "disk/ac/00/$key1" >"$scratch/restored"
+cp -pR "$scratch/full-export" "$scratch/expected-delta"
+"$cache" subtract "$scratch/expected-delta" "$scratch/restored"
+cp -pR "$disk" "$scratch/export-disk-before"
+cp -pR "$repo" "$scratch/export-repo-before"
+cp "$scratch/restored" "$scratch/restored-before"
+
+# Intercept the existing copy boundary: even a later subtraction cannot hide a
+# forbidden copy of restored payloads or their checksum's new markers.
+mkdir -p "$scratch/copy-bin"
+real_cp=$(command -v cp)
+cat >"$scratch/copy-bin/cp" <<'EOF'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  if [[ $arg == "$BLOCKED_DISK" || $arg == "$BLOCKED_REPO"/* ]]; then
+    printf '%s\n' "$arg" >>"$COPY_VIOLATIONS"
+    exit 93
+  fi
+done
+exec "$REAL_CP" "$@"
+EOF
+chmod +x "$scratch/copy-bin/cp"
+check 'delta export never copies restored units' env PATH="$scratch/copy-bin:$PATH" \
+  REAL_CP="$real_cp" BLOCKED_DISK="$disk/ac/00/$key1" \
+  BLOCKED_REPO="$repo/content_addressable/sha256/$key1" \
+  COPY_VIOLATIONS="$scratch/restored-copies" \
+  "$cache" export "$disk" "$repo" "$epoch" "$scratch/producer-delta" "$scratch/producer-used" "$scratch/restored"
+check 'restored copy boundary has no side effects' test ! -e "$scratch/restored-copies"
+check 'delta bytes equal full export followed by subtraction' diff -r "$scratch/expected-delta" "$scratch/producer-delta"
+check 'used set includes every restored input and new marker' cmp -s "$scratch/full-used" "$scratch/producer-used"
+check 'delta export preserves new payload timestamps' test \
+  "$(stat -c %Y "$disk/cas/00/$key4")" -eq "$(stat -c %Y "$scratch/producer-delta/disk/cas/00/$key4")"
+check 'delta export leaves disk inputs immutable' diff -r "$scratch/export-disk-before" "$disk"
+check 'delta export leaves repository inputs immutable' diff -r "$scratch/export-repo-before" "$repo"
+check 'delta export leaves restored manifest immutable' cmp -s "$scratch/restored-before" "$scratch/restored"
+ln "$scratch/restored" "$scratch/export-hardlinked-used"
+check 'export replaces hardlinked output without overwriting restored metadata' "$cache" export \
+  "$disk" "$repo" "$epoch" "$scratch/export-hardlinked" \
+  "$scratch/export-hardlinked-used" "$scratch/restored"
+check 'hardlinked used output contains complete used set' cmp -s "$scratch/full-used" "$scratch/export-hardlinked-used"
+check 'hardlinked output leaves restored metadata immutable' cmp -s "$scratch/restored-before" "$scratch/restored"
+
+: >"$scratch/export-empty-restored"
+check 'export accepts an empty restored manifest' "$cache" export "$disk" "$repo" "$epoch" \
+  "$scratch/export-no-base" "$scratch/export-no-base-used" "$scratch/export-empty-restored"
+check 'empty restored manifest exports every used byte' diff -r "$scratch/full-export" "$scratch/export-no-base"
+check 'empty restored manifest retains complete used set' cmp -s "$scratch/full-used" "$scratch/export-no-base-used"
+check 'export accepts a fully restored used set' "$cache" export "$disk" "$repo" "$epoch" \
+  "$scratch/export-all-base" "$scratch/export-all-base-used" "$scratch/full-used"
+check 'fully restored export has no payloads' test -z "$(find "$scratch/export-all-base" -type f -print)"
+check 'fully restored export retains complete used set' cmp -s "$scratch/full-used" "$scratch/export-all-base-used"
+printf '%s\0' "repository/content_addressable/sha256/$key1/id-active" >"$scratch/export-marker-only"
+check 'export accepts marker-only restored metadata' "$cache" export "$disk" "$repo" "$epoch" \
+  "$scratch/export-marker-delta" "$scratch/export-marker-used" "$scratch/export-marker-only"
+check 'restored marker alone does not omit its atomic checksum' diff -r "$scratch/full-export" "$scratch/export-marker-delta"
+check 'empty inputs emit an empty used manifest with restored metadata' "$cache" export \
+  "$scratch/no-disk" "$scratch/no-repo" "$epoch" "$scratch/export-empty-delta" \
+  "$scratch/export-empty-used" "$scratch/full-used"
+check 'empty inputs have no used records' test ! -s "$scratch/export-empty-used"
+check 'empty inputs have no delta bytes' test -z "$(find "$scratch/export-empty-delta" -type f -print)"
+
+mkdir -p "$scratch/export-unchanged"
+printf 'unchanged used\n' >"$scratch/export-unchanged-used"
+cp "$scratch/export-unchanged-used" "$scratch/export-used-before"
+for invalid in "/disk/ac/00/$key1" "disk/../disk/ac/00/$key1" \
+  "disk//ac/00/$key1" "disk/./ac/00/$key1" "disk/ac/ff/$key1" \
+  "repository/content_addressable/sha256/$key1" ""; do
+  printf '%s\0' "disk/ac/00/$key1" "$invalid" >"$scratch/export-invalid-restored"
+  reject 'export validates every restored record before touching output' "$cache" export \
+    "$disk" "$repo" "$epoch" "$scratch/export-unchanged" \
+    "$scratch/export-unchanged-used" "$scratch/export-invalid-restored"
+  check 'invalid restored record leaves destination empty' test -z "$(find "$scratch/export-unchanged" -mindepth 1 -print)"
+  check 'invalid restored record leaves used manifest unchanged' cmp -s "$scratch/export-used-before" "$scratch/export-unchanged-used"
+done
+printf 'disk/ac/00/%s' "$key1" >"$scratch/export-invalid-restored"
+reject 'export rejects unterminated restored manifest before destination creation' "$cache" export \
+  "$disk" "$repo" "$epoch" "$scratch/export-not-created" \
+  "$scratch/export-unchanged-used" "$scratch/export-invalid-restored"
+check 'unterminated restored manifest creates no destination' test ! -e "$scratch/export-not-created"
+ln -s "$scratch/restored" "$scratch/export-restored-link"
+reject 'export rejects restored manifest symlink' "$cache" export "$disk" "$repo" "$epoch" \
+  "$scratch/export-not-created" "$scratch/export-unchanged-used" "$scratch/export-restored-link"
+mkdir -p "$scratch/export-path-component"
+reject 'export rejects restored manifest traversal' "$cache" export "$disk" "$repo" "$epoch" \
+  "$scratch/export-not-created" "$scratch/export-unchanged-used" "$scratch/export-path-component/../restored"
+reject 'export rejects restored manifest inside destination' "$cache" export "$disk" "$repo" "$epoch" \
+  "$scratch/export-unchanged" "$scratch/export-unchanged-used" "$scratch/export-unchanged/restored"
+ln -s "$scratch/restored" "$scratch/export-used-link"
+reject 'export rejects symlink used manifest destination' "$cache" export "$disk" "$repo" "$epoch" \
+  "$scratch/export-not-created" "$scratch/export-used-link" "$scratch/restored"
+reject 'export rejects aliased used and restored manifests' "$cache" export "$disk" "$repo" "$epoch" \
+  "$scratch/export-not-created" "$scratch/restored" "$scratch/restored"
+check 'rejected manifest paths create no destination' test ! -e "$scratch/export-not-created"
+check 'rejected manifest paths leave used output unchanged' cmp -s "$scratch/export-used-before" "$scratch/export-unchanged-used"
+rm -- "$repo/content_addressable/sha256/$key1/id-new"
 reject 'merge requires a destination and source' "$cache" merge "$scratch/no-source"
 
 source1="$scratch/source one"

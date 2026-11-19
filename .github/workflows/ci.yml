@@ -143,12 +143,17 @@ jobs:
           name: e2e-harness-x86_64
           path: ${{ runner.temp }}/e2e
           if-no-files-found: error
-      - name: Export the Bazel working set
-        uses: ./.github/actions/save-bazel-cache
+      # The four test shards already build the binary and harness; their exports plus lint
+      # cover the used inputs without delaying E2E on a redundant bundle export.
+      - name: Upload bundle build metrics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          mode: export
-          shard: x86-bundle
-          prune: 'true'
+          name: bazel-metrics-x86-bundle
+          path: |
+            ${{ runner.temp }}/bazel-build.bep.json
+            ${{ runner.temp }}/bazel-build.profile.gz
+          retention-days: 7
 
   linux-x86_64:
     needs: [changes, linux-x86_64-shards]
@@ -332,7 +337,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
     # The script bounds the gate itself; this timeout is only an outer backstop.
     timeout-minutes: 15
@@ -342,7 +347,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/run-e2e
         with:
-          args: --gate 1 --shard ${{ matrix.shard }}/4
+          args: --gate 1 --shard ${{ matrix.shard }}/${{ strategy.job-total }}
 
   e2e-gate-1:
     needs: [changes, e2e-gate-1-shards]
@@ -375,7 +380,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
     timeout-minutes: 15
     steps:
@@ -384,7 +389,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/run-e2e
         with:
-          args: --gate 2 --additions --shard ${{ matrix.shard }}/4
+          args: --gate 2 --additions --shard ${{ matrix.shard }}/${{ strategy.job-total }}
 
   e2e-gate-2:
     needs: [changes, e2e-gate-2-shards]

@@ -164,7 +164,7 @@ pub use execution::{
 pub use fake_bazel::{FAKE_BAZEL_ENV, command_line_event, fake_bazel, fake_bazel_requested};
 pub use fake_s3::FakeS3;
 pub use fhs_tools::fhs_tools;
-pub use fleets::fleets;
+pub use fleets::{run_cold_pair, run_drained_starts};
 pub use gang_cli::GangCli;
 pub use gang_config::InputLinks;
 pub use glibc_toolchain::glibc_toolchain;

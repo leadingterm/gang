@@ -56,12 +56,12 @@ mod support;
 use gang_e2e::Limits as _;
 use gang_e2e::System as _;
 use gang_e2e::{
-    ActionLimits, Check, FleetLayout, Identity, InputLinks, LARGE_FLEET, NOOP_FLEET, Outcome,
-    Probe, SMALL_FLEET, Sandbox, Settings, Signalled, SoftMemory, Variant, names,
+    ActionLimits, Check, ControlKnobs, FleetLayout, Identity, InputLinks, LARGE_FLEET, NOOP_FLEET,
+    Outcome, Probe, SMALL_FLEET, Sandbox, Settings, Signalled, SoftMemory, Variant, names,
 };
 use gang_e2e::{
-    disk, fhs_tools, fleets, glibc_toolchain, input_integrity, lifecycle, limits, memory, network,
-    plaintext, restart, revocation,
+    disk, fhs_tools, glibc_toolchain, input_integrity, lifecycle, limits, memory, network,
+    plaintext, restart, revocation, run_cold_pair, run_drained_starts,
 };
 use gang_wire::routes::{GET_STATE, WATCH_STATE};
 use support::{
@@ -957,6 +957,7 @@ flaw! {
 fn placement(sandbox: Sandbox) -> Variant {
     Variant {
         fleets: FleetLayout::Placement,
+        control: ControlKnobs::FLEETS,
         ..Variant::baseline(sandbox)
     }
 }
@@ -964,8 +965,11 @@ fn placement(sandbox: Sandbox) -> Variant {
 /// The verdicts of the fleets scenario against a simulation that behaves as `behaviour` says.
 fn fleets_checks(sandbox: Sandbox, behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
     let variant = placement(sandbox);
-    let system = Simulation::new(variant, behaviour);
-    fleets(&system, &variant)
+    let drained_starts = Simulation::new(variant, behaviour);
+    let cold_pair = Simulation::new(variant, behaviour);
+    let mut checks = run_drained_starts(&drained_starts, &variant)?;
+    checks.extend(run_cold_pair(&cold_pair, &variant)?);
+    Ok(checks)
 }
 
 /// The verdicts of the fleets scenario under bwrap against a simulation that behaves as
@@ -985,6 +989,83 @@ fn outcome_of(checks: &[Check], name: impl AsRef<str>) -> Option<&Outcome> {
 #[test]
 fn fleets_is_compliant_under_noop() -> gang_e2e::Result<()> {
     assert_compliant(&fleets_checks(Sandbox::Noop, Behaviour::COMPLIANT)?);
+    Ok(())
+}
+
+#[test]
+fn fresh_fleet_fixtures_keep_all_checks_in_order_without_restarting() -> gang_e2e::Result<()> {
+    let variant = placement(Sandbox::Bwrap);
+    let drained_starts = Simulation::new(variant, Behaviour::COMPLIANT);
+    let cold_pair = Simulation::new(variant, Behaviour::COMPLIANT);
+    let mut checks = run_drained_starts(&drained_starts, &variant)?;
+    assert_eq!(checks.len(), 24);
+    assert!(cold_pair.scaling_events()?.is_empty());
+    let pair_checks = run_cold_pair(&cold_pair, &variant)?;
+    assert_eq!(pair_checks.len(), 4);
+    checks.extend(pair_checks);
+    assert_compliant(&checks);
+    assert_eq!(drained_starts.server_pid(), Some(1));
+    assert_eq!(cold_pair.server_pid(), Some(1));
+    assert_eq!(drained_starts.worker_count()?, 0);
+    assert_eq!(cold_pair.worker_count()?, 0);
+
+    let mut expected = vec![names::fleets::START_AT_ZERO.to_owned()];
+    for (request, fleets, isolation) in [
+        (
+            names::fleets::UNCONSTRAINED,
+            &[SMALL_FLEET][..],
+            &[
+                names::isolation::NET_NAMESPACE,
+                names::isolation::MNT_NAMESPACE,
+            ][..],
+        ),
+        (
+            names::fleets::PINNED,
+            &[LARGE_FLEET][..],
+            &[
+                names::isolation::NET_NAMESPACE,
+                names::isolation::MNT_NAMESPACE,
+            ][..],
+        ),
+        (
+            names::fleets::MEMORY,
+            &[LARGE_FLEET][..],
+            &[
+                names::isolation::NET_NAMESPACE,
+                names::isolation::MNT_NAMESPACE,
+            ][..],
+        ),
+        (
+            names::fleets::NOOP_SANDBOX,
+            &[NOOP_FLEET][..],
+            &[names::isolation::NOOP_FLEET_UNISOLATED][..],
+        ),
+        (
+            names::fleets::OVERFLOW,
+            &[SMALL_FLEET, LARGE_FLEET][..],
+            &[][..],
+        ),
+    ] {
+        expected.push(names::fleets::labelled(
+            request,
+            names::build::REMOTE_EXECUTION,
+        ));
+        expected.push(names::fleets::placed(request, fleets));
+        expected.extend(
+            isolation
+                .iter()
+                .map(|name| names::fleets::labelled(request, name)),
+        );
+        expected.push(names::fleets::drained(request));
+        expected.push(names::fleets::terminated(request));
+    }
+    assert_eq!(
+        checks
+            .iter()
+            .map(|check| check.name.as_ref())
+            .collect::<Vec<_>>(),
+        expected.iter().map(String::as_str).collect::<Vec<_>>()
+    );
     Ok(())
 }
 

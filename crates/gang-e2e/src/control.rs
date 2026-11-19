@@ -28,6 +28,8 @@ pub struct ControlKnobs {
     pub boot_grace: Option<Duration>,
     /// `idle_timeout` of every `[[fleets]]` entry.
     pub idle_timeout: Option<Duration>,
+    /// `max_drain_wait` of every `[[fleets]]` entry.
+    pub max_drain_wait: Option<Duration>,
     /// `min_instances` of every `[[fleets]]` entry.
     pub min_instances: Option<u32>,
     /// `max_instances` of every `[[fleets]]` entry.
@@ -62,6 +64,7 @@ impl ControlKnobs {
         poll_interval: None,
         boot_grace: None,
         idle_timeout: None,
+        max_drain_wait: None,
         min_instances: None,
         max_instances: None,
         target_actions_per_instance: None,
@@ -73,6 +76,14 @@ impl ControlKnobs {
         max_concurrent_streams: None,
         broken_launcher: false,
         holdable_launches: false,
+    };
+
+    /// Fleet placement builds: retain the base poll interval, but drain idle workers after two
+    /// seconds and kill a terminating worker one second after `SIGTERM`.
+    pub const FLEETS: Self = Self {
+        idle_timeout: Some(Duration::from_secs(2)),
+        terminate_grace: Some(Duration::from_secs(1)),
+        ..Self::NONE
     };
 
     /// The orphan scenario: one standing instance and no more, a pass every second, a ten-second
@@ -91,12 +102,16 @@ impl ControlKnobs {
     /// second, so an action queued while passes are skipped shows in the state. The scenario
     /// reacts to a streamed drain within one `poll_interval`; two seconds leave that reaction,
     /// which does no I/O but one directory operation or one signal, a wide margin.
+    /// Demand resumes a drain before termination, even past its deadline. The ten-second bound
+    /// terminates only an unresumed drain; the interrupted build's outcome is not judged.
     pub const DRAIN_CANCEL: Self = Self {
         poll_interval: Some(Duration::from_secs(2)),
         idle_timeout: Some(Duration::from_secs(5)),
+        max_drain_wait: Some(Duration::from_secs(10)),
         min_instances: Some(0),
         max_instances: Some(1),
         detail_interval: Some(Duration::from_secs(1)),
+        terminate_grace: Some(Duration::from_secs(1)),
         ..Self::NONE
     };
 
@@ -167,9 +182,10 @@ impl ControlKnobs {
         ..Self::NONE
     };
 
-    /// Every preset a control scenario runs under, in suite order: the one list the suite's
-    /// presets and the configuration parse tests draw from.
-    pub const PRESETS: [Self; 8] = [
+    /// Every preset a fleet or control scenario runs under; configuration parse tests draw from
+    /// this list.
+    pub const PRESETS: [Self; 9] = [
+        Self::FLEETS,
         Self::ORPHAN,
         Self::DRAIN_CANCEL,
         Self::SKIPPED_PASS,

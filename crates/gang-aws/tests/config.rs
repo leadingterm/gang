@@ -201,12 +201,16 @@ fn workload_token_audience_bounds() {
     );
 }
 
-/// Workload token lifetimes are whole seconds from one minute to one hour.
+/// STS workload token lifetimes are whole seconds from one minute to one hour.
 #[test]
 fn workload_token_ttl_bounds() {
     assert_all_rejected(
         [
+            json!({"workload_token": {"ttl": "19s"}}),
+            json!({"workload_token": {"ttl": "20s"}}),
             json!({"workload_token": {"ttl": "30s"}}),
+            json!({"workload_token": {"ttl": "59s"}}),
+            json!({"workload_token": {"ttl": "3601s"}}),
             json!({"workload_token": {"ttl": "2h"}}),
             json!({"workload_token": {"ttl": "1500ms"}}),
             json!({"workload_token": {"ttl": "90500ms"}}),
@@ -216,6 +220,8 @@ fn workload_token_ttl_bounds() {
     assert_all_accepted(
         [
             json!({"workload_token": {"ttl": "1m"}}),
+            json!({"workload_token": {"ttl": "60s"}}),
+            json!({"workload_token": {"ttl": "3600s"}}),
             json!({"workload_token": {"ttl": "1h"}}),
         ],
         aws,

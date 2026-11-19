@@ -84,8 +84,8 @@ pub enum StandingWorker {
 pub enum Sessions {
     /// The configured defaults.
     Default,
-    /// Short lifetimes for the sessions scenario: `token_ttl = "1m"`, `clock_skew = "0s"` and
-    /// `[dashboard] session_max_age = "3m"`; browsers sign in as [`crate::BROWSER_SUBJECT`], which
+    /// Short lifetimes for the sessions scenario: `token_ttl = "25s"`, `clock_skew = "0s"` and
+    /// `[dashboard] session_max_age = "1m"`; browsers sign in as [`crate::BROWSER_SUBJECT`], which
     /// holds a role granting `state.read`.
     Short,
 }

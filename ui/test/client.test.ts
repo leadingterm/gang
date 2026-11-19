@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import { setImmediate as flush } from "node:timers/promises";
 import { BUILDS_REFRESH_MS, HttpError, loginUrl, PAGE_MAX, StateClient, type Environment, type FrameData, type StreamSource } from "../src/client.ts";
 import { idOf, ms } from "../src/wire-parse.ts";
@@ -165,6 +165,27 @@ const probes = (env: FakeEnvironment): number => env.fetched.filter((path) => pa
 
 /** The delays of every timer still pending. */
 const pendingDelays = (env: FakeEnvironment): number[] => env.scheduled.filter((entry) => !entry.fired).map((entry) => entry.delay);
+
+/** Drives the existing request fake with mock timers, advancing its clock before callbacks run. */
+const timedRenewals = (t: TestContext, env: FakeEnvironment): ((elapsed: number) => Promise<void>) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const schedule = env.schedule.bind(env);
+  t.mock.method(env, "schedule", (run: () => void, delay: number) => {
+    const cancel = schedule(run, delay);
+    const entry = env.scheduled.at(-1);
+    assert.ok(entry);
+    const timer = setTimeout(() => entry.run(), delay);
+    return () => {
+      clearTimeout(timer);
+      cancel();
+    };
+  });
+  return async (elapsed) => {
+    env.clock += elapsed;
+    t.mock.timers.tick(elapsed);
+    await flush();
+  };
+};
 
 /** Answers a pending request: an `Error` rejects it, anything else is its body. */
 const settle = (pending: PromiseWithResolvers<unknown>, answer: unknown): void => {
@@ -342,6 +363,121 @@ test("a one-minute session renews after thirty seconds, not at once", async () =
   await client.start();
   assert.deepEqual(env.scheduled.map((entry) => entry.delay), [30_000]);
   assert.deepEqual(env.posts, []);
+});
+
+test("a fresh twenty-second token and its clipped ten-second tail renew at half-life, joining concurrent requests", async (t) => {
+  for (const admittedAfter of [0, 10_000]) {
+    await t.test(admittedAfter === 0 ? "fresh token" : "same deadline, clipped tail", async (t) => {
+      const env = new FakeEnvironment();
+      const deadline = env.clock + 20_000;
+      env.responses.set(PATHS.getSession, { ...session, expireTime: iso(deadline) });
+      env.clock += admittedAfter;
+      const advance = timedRenewals(t, env);
+      const client = new StateClient(env);
+      t.after(() => client.stop());
+      const answer = Promise.withResolvers<number>();
+      env.postResults.push(answer.promise);
+      await client.start();
+      const delay = (20_000 - admittedAfter) / 2;
+      assert.deepEqual(pendingDelays(env), [delay]);
+      assert.deepEqual(env.posts, []);
+      assert.equal(probes(env), 1);
+      await advance(delay - 1);
+      assert.deepEqual(env.posts, []);
+      assert.equal(probes(env), 1);
+      await advance(1);
+      assert.deepEqual(env.posts, [PATHS.renew]);
+      assert.equal(probes(env), 1, "the session is not probed before renewal succeeds");
+      env.source.emit("closed", { reason: "EXPIRED" });
+      await flush();
+      assert.deepEqual(env.posts, [PATHS.renew], "expiry joins the scheduled renewal");
+      answer.resolve(204);
+      await flush();
+      assert.deepEqual(env.posts, [PATHS.renew]);
+      assert.deepEqual(env.fetched, [PATHS.getSession, PATHS.getSession]);
+      assert.deepEqual(pendingDelays(env), [delay / 2], "renewal keeps the absolute deadline");
+      assert.deepEqual(env.navigations, []);
+    });
+  }
+});
+
+test("a fixed twenty-second deadline halves repeatedly and ends on 401 without an immediate renewal burst", async (t) => {
+  const env = new FakeEnvironment();
+  const deadline = env.clock + 20_000;
+  env.responses.set(PATHS.getSession, { ...session, expireTime: iso(deadline) });
+  const advance = timedRenewals(t, env);
+  const client = new StateClient(env);
+  t.after(() => client.stop());
+  await client.start();
+  let requests = 0;
+  for (const delay of [10_000, 5000, 2500, 1250]) {
+    assert.deepEqual(pendingDelays(env), [delay]);
+    await advance(delay - 1);
+    assert.equal(env.posts.length, requests, "no request before the next half-life");
+    await advance(1);
+    requests += 1;
+    assert.deepEqual(env.posts, Array(requests).fill(PATHS.renew));
+    assert.equal(probes(env), requests + 1);
+    assert.deepEqual(pendingDelays(env), [delay / 2]);
+    await advance(0);
+    assert.equal(env.posts.length, requests, "successful renewal does not cause a zero-delay burst");
+    assert.deepEqual(env.navigations, []);
+  }
+  const answer = Promise.withResolvers<number>();
+  env.postResults.push(answer.promise);
+  await advance(624);
+  assert.equal(env.posts.length, requests);
+  await advance(1);
+  requests += 1;
+  assert.deepEqual(env.posts, Array(requests).fill(PATHS.renew));
+  assert.equal(probes(env), requests);
+  assert.deepEqual(pendingDelays(env), []);
+  // The last request crosses the absolute deadline while the server is answering.
+  await advance(deadline - env.clock);
+  assert.equal(env.clock, deadline);
+  assert.equal(env.posts.length, requests);
+  answer.resolve(401);
+  await flush();
+  assert.deepEqual(env.navigations, [loginUrl(env.here())]);
+  assert.deepEqual(pendingDelays(env), []);
+  await advance(60_000);
+  assert.deepEqual(env.posts, Array(requests).fill(PATHS.renew));
+  assert.equal(probes(env), requests, "401 does not probe or re-admit the expired session");
+  assert.deepEqual(env.navigations, [loginUrl("/ui/workers")]);
+});
+
+test("429 on a twenty-second token uses the existing bounded backoff, then 401 signs in", async (t) => {
+  const env = new FakeEnvironment();
+  env.responses.set(PATHS.getSession, { ...session, expireTime: iso(env.clock + 20_000) });
+  const advance = timedRenewals(t, env);
+  const client = new StateClient(env);
+  t.after(() => client.stop());
+  const backoffs = [1000, 2000, 4000, 8000, 16_000, 30_000, 30_000];
+  env.postResults.push(...backoffs.map(() => 429), 401);
+  await client.start();
+  await advance(9999);
+  assert.deepEqual(env.posts, []);
+  await advance(1);
+  let requests = 1;
+  assert.deepEqual(env.posts, [PATHS.renew]);
+  for (const delay of backoffs) {
+    assert.equal(client.link.value.kind, "lost");
+    assert.deepEqual(pendingDelays(env), [delay]);
+    assert.deepEqual(env.navigations, []);
+    assert.equal(probes(env), 1, "429 retries renewal, not the session probe");
+    await advance(delay - 1);
+    assert.equal(env.posts.length, requests, "backoff never retries early");
+    await advance(1);
+    requests += 1;
+    assert.deepEqual(env.posts, Array(requests).fill(PATHS.renew));
+  }
+  assert.equal(probes(env), 1);
+  assert.deepEqual(env.navigations, [loginUrl("/ui/workers")]);
+  assert.deepEqual(pendingDelays(env), []);
+  await advance(60_000);
+  assert.equal(env.posts.length, requests);
+  assert.equal(probes(env), 1);
+  assert.deepEqual(env.navigations, [loginUrl("/ui/workers")]);
 });
 
 test("EXPIRED renews and reconnects without navigating", async () => {

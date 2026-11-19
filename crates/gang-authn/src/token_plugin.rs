@@ -24,7 +24,7 @@ use crate::{Memo, TokenError, TokenKey, TokenUse, issuer_of, mint, verify};
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(try_from = "RawTokenConfig", into = "RawTokenConfig")]
 pub struct TokenConfig {
-    /// How long a minted token is valid, from 1 minute to 1 hour in whole seconds. Defaults to 10 minutes.
+    /// How long a minted token is valid, from 20 seconds to 1 hour in whole seconds. Defaults to 10 minutes.
     pub token_ttl: TokenTtl,
     /// Clock skew tolerated at validity start and client expiry, but not session expiry. Defaults to 30 seconds.
     pub clock_skew: Duration,
@@ -358,14 +358,18 @@ mod tests {
     }
 
     #[test]
-    fn token_ttl_accepts_both_bounds() {
-        assert!(build(r#"{"token_ttl": "1m", "providers": ["example"]}"#).is_ok());
-        assert!(build(r#"{"token_ttl": "1h", "providers": ["example"]}"#).is_ok());
+    fn token_ttl_accepts_both_bounds_and_subminute_lifetimes() {
+        for (ttl, seconds) in [("20s", 20), ("59s", 59), ("1m", 60), ("1h", 3600)] {
+            let json = format!(r#"{{"token_ttl": "{ttl}", "providers": ["example"]}}"#);
+            let config = parse(&json).expect("an in-range whole-second token TTL parses");
+            assert_eq!(config.token_ttl.get(), Duration::from_secs(seconds));
+            assert!(build(&json).is_ok(), "token_ttl {ttl} must build");
+        }
     }
 
     #[test]
     fn token_ttl_outside_the_bounds_is_rejected() {
-        for ttl in ["59s", "3601s", "0s"] {
+        for ttl in ["19s", "20001ms", "3601s", "0s"] {
             let json = format!(r#"{{"token_ttl": "{ttl}", "providers": ["example"]}}"#);
             assert!(parse(&json).is_err(), "token_ttl {ttl} must be rejected");
         }
