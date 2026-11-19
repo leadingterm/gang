@@ -8,6 +8,15 @@
 - Publish primary-region AMIs before independently completing the regional catalog and retirement.
 - Require successful release validation from same-repository main push CI for the exact release commit; never reuse PR artifacts or caches. Prioritize one bounded x86 Bazel baseline and Nix store with small PR deltas; disable optional architecture caches.
 
+## 0.3.2
+
+### Fixed
+
+- Restore remote execution and cache to one client endpoint on port 443; regenerate `gang bazelrc` after upgrading.
+- Grant controller lifecycle Describe calls at the scope required by Auto Scaling while retaining group-scoped lifecycle completion.
+- Preserve resource-kill outcomes when output upload fails so escalation remains effective.
+- Use sustained worker disk pressure instead of learned reservations as the default disk-kill trigger, requeue pressure kills with larger reservations, and floor nonzero disk reservations at 1 GiB by default.
+
 ## 0.3.1
 
 ### Added

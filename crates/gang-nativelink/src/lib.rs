@@ -51,8 +51,8 @@ mod worker;
 
 pub use config::{Http2Tuning, NativeLinkConfig, ReceiveWindow, SchedulerTuning, WorkerTuning};
 pub use enforcement::{
-    ColdStartTuning, DiskEnforcement, DiskTuning, EscalationError, EscalationPercent,
-    MemoryEnforcement, MemoryTuning, MinReservation, WholeKib,
+    ColdStartTuning, DiskEnforcement, DiskMinReservation, DiskTuning, EscalationError,
+    EscalationPercent, MemoryEnforcement, MemoryTuning, MinReservation, WholeKib,
 };
 pub use open_file_limit::{OpenFileLimit, OpenFileLimitError};
 pub use plugin::NativeLink;

@@ -2,6 +2,7 @@
 //! scheduler's controller and the control loop until shutdown.
 
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +16,7 @@ use gang_mtls::{ControllerKey, ProofError, SubjectName};
 use gang_spi::{
     Accepted, AuthenticationPort, CacheStorePort, CertificateSignerPort, ClientCertificates,
     ControllerConnections, ControllerId, ControllerReady, ControllerSpec, CredentialLifecyclePort,
-    Lease, Listening, ObservationSink, Observations, PortError, ProvisionerPort, RevocationEpoch,
+    Listening, ObservationSink, Observations, PortError, ProvisionerPort, RevocationEpoch,
     SchedulerPort, SchedulerSnapshot, Scheme, ServerEndpoints, StateRepositoryPort,
 };
 use gang_state::CacheBaseline;
@@ -288,6 +289,84 @@ fn deferred_connections(receiver: oneshot::Receiver<Connections>, stop: Stop) ->
     .boxed()
 }
 
+/// Leader listener work prepared before acquiring the lease.
+enum PreparedLeader<B> {
+    OnPublic,
+    Dedicated {
+        execution: SocketAddr,
+        worker: SocketAddr,
+        binder: B,
+        channels: LeadChannels,
+    },
+}
+
+/// Opens the worker stream immediately when it shares the public leader lifecycle.
+async fn prepare_leader<D: Deployment>(
+    leader: LeaderListeners<D::Binder>,
+    channels: LeadChannels,
+    core: &Core<D>,
+    certificates: &RevocationSet,
+    backoff: NonZeroDuration,
+) -> Result<PreparedLeader<D::Binder>, ServerError> {
+    match leader {
+        LeaderListeners::OnPublic { worker } => {
+            let worker =
+                open_listener::<D>(worker, EndpointRole::Worker, core, certificates, backoff)
+                    .await?;
+            let _ = channels
+                .worker
+                .send(worker.into_stream(channels.worker_ended));
+            Ok(PreparedLeader::OnPublic)
+        }
+        LeaderListeners::Dedicated {
+            execution,
+            worker,
+            binder,
+        } => Ok(PreparedLeader::Dedicated {
+            execution,
+            worker,
+            binder,
+            channels,
+        }),
+    }
+}
+
+/// Opens startup listeners and prepares the controller's streams before acquiring leadership.
+async fn prepare_listeners<D: Deployment>(
+    listeners: Listeners<D::Binder>,
+    gates: (Gate<D, D::Clients>, Gate<D, D::Workers>),
+    api: PublicService<D>,
+    security: (&Core<D>, &RevocationSet, NonZeroDuration),
+    readiness: &Readiness,
+    stop: Stop,
+) -> Result<
+    (
+        ControllerListening<D>,
+        PreparedLeader<D::Binder>,
+        ListenerEnds,
+    ),
+    ServerError,
+> {
+    let (core, certificates, backoff) = security;
+    let Listeners { public, leader } = listeners;
+    let public =
+        open_listener::<D>(public, EndpointRole::Public, core, certificates, backoff).await?;
+    readiness.serve();
+    let dedicated = matches!(&leader, LeaderListeners::Dedicated { .. });
+    let (public_gate, worker_gate) = if dedicated {
+        gates
+    } else {
+        (
+            gates.0.with_readiness(readiness.clone()),
+            gates.1.with_readiness(readiness.clone()),
+        )
+    };
+    let (connections, channels, ends) =
+        controller_connections::<D>(public, public_gate, worker_gate, api, dedicated, stop);
+    let leader = prepare_leader::<D>(leader, channels, core, certificates, backoff).await?;
+    Ok((connections, leader, ends))
+}
+
 /// The shared ports and settings the lead phase borrows.
 struct LeadContext<'a, D: Deployment> {
     core: &'a Core<D>,
@@ -311,27 +390,20 @@ struct LeadContext<'a, D: Deployment> {
 /// Acquires and holds the lease while the leader's work is running.
 async fn run_leader<D: Deployment>(
     context: LeadContext<'_, D>,
-    listeners: LeaderListeners<D::Binder>,
-    channels: LeadChannels,
-    initial_lease: Option<Lease>,
+    listeners: PreparedLeader<D::Binder>,
     (retiring, stop): (impl Future<Output = ()>, Stop),
 ) -> Result<(), ServerError> {
-    let fresh = initial_lease.is_some();
-    let mut lease = if let Some(lease) = initial_lease {
-        lease
-    } else {
-        tokio::select! {
-            biased;
-            () = retiring => return Ok(()),
-            () = stop.clone() => return Ok(()),
-            lease = context.leadership.acquire() => lease,
-        }
+    let mut lease = tokio::select! {
+        biased;
+        () = retiring => return Ok(()),
+        () = stop.clone() => return Ok(()),
+        lease = context.leadership.acquire() => lease,
     };
     let result = tokio::select! {
         biased;
         () = stop.clone() => Ok(()),
         () = context.leadership.hold(&mut lease) => Err(ServerError::LeadershipLost),
-        result = lead_work(&context, listeners, channels, stop.clone(), fresh) => result,
+        result = lead_work(&context, listeners, stop.clone()) => result,
     };
     if !matches!(&result, Err(ServerError::LeadershipLost)) {
         context.leadership.release(&lease).await;
@@ -339,16 +411,13 @@ async fn run_leader<D: Deployment>(
     result
 }
 
-/// Starts the term, then binds the leader listeners and runs its control loop, sidecar and
-/// dashboard work. The term starts once the dashboard's cache baseline is taken, while the lease
-/// is already being renewed; `fresh` says the engine started under this lease.
+/// Starts the term, then binds deferred leader listeners and runs the leader's work.
 async fn lead_work<D: Deployment>(
     context: &LeadContext<'_, D>,
-    listeners: LeaderListeners<D::Binder>,
-    channels: LeadChannels,
+    listeners: PreparedLeader<D::Binder>,
     stop: Stop,
-    fresh: bool,
 ) -> Result<(), ServerError> {
+    let fresh = matches!(&listeners, PreparedLeader::OnPublic);
     let baseline = match context.dashboard {
         Some(_) => Some(term_baseline(context, fresh).await),
         None => None,
@@ -359,51 +428,50 @@ async fn lead_work<D: Deployment>(
     {
         tracing::warn!(%error, "dashboard history reload failed during promotion");
     }
-    let worker = match listeners {
-        LeaderListeners::OnPublic { worker } => worker,
-        LeaderListeners::Dedicated {
-            execution,
-            worker,
-            binder,
-        } => {
-            let listener = binder
-                .bind(execution)
-                .await
-                .map_err(|source| ServerError::Bind {
-                    endpoint: "execution",
-                    source,
-                })?;
-            let listener = open_listener::<D>(
-                listener,
-                EndpointRole::Execution,
-                context.core,
-                context.revoked_certificates,
-                context.backoff,
-            )
-            .await?;
-            let _ = channels
-                .execution
-                .send(listener.into_stream(channels.execution_ended));
-            binder
-                .bind(worker)
-                .await
-                .map_err(|source| ServerError::Bind {
-                    endpoint: "worker",
-                    source,
-                })?
-        }
-    };
-    let worker = open_listener::<D>(
+    if let PreparedLeader::Dedicated {
+        execution,
         worker,
-        EndpointRole::Worker,
-        context.core,
-        context.revoked_certificates,
-        context.backoff,
-    )
-    .await?;
-    let _ = channels
-        .worker
-        .send(worker.into_stream(channels.worker_ended));
+        binder,
+        channels,
+    } = listeners
+    {
+        let listener = binder
+            .bind(execution)
+            .await
+            .map_err(|source| ServerError::Bind {
+                endpoint: "execution",
+                source,
+            })?;
+        let listener = open_listener::<D>(
+            listener,
+            EndpointRole::Execution,
+            context.core,
+            context.revoked_certificates,
+            context.backoff,
+        )
+        .await?;
+        let _ = channels
+            .execution
+            .send(listener.into_stream(channels.execution_ended));
+        let worker = binder
+            .bind(worker)
+            .await
+            .map_err(|source| ServerError::Bind {
+                endpoint: "worker",
+                source,
+            })?;
+        let worker = open_listener::<D>(
+            worker,
+            EndpointRole::Worker,
+            context.core,
+            context.revoked_certificates,
+            context.backoff,
+        )
+        .await?;
+        let _ = channels
+            .worker
+            .send(worker.into_stream(channels.worker_ended));
+    }
     context.readiness.lead();
     let sidecar = retry_sidecar(context);
     let clock = &context.core.host.clock;
@@ -500,45 +568,6 @@ async fn retry_sidecar<D: Deployment>(context: &LeadContext<'_, D>) -> Infallibl
             .clock
             .sleep(context.sidecar_retry_interval.get())
             .await;
-    }
-}
-
-/// Waits for leadership before serving the combined public listener, or stops on shutdown.
-/// `background` (every controller's work, leading or not) runs meanwhile.
-async fn initial_lease<D: Deployment>(
-    listeners: &LeaderListeners<D::Binder>,
-    leadership: &Leadership<'_, D::Repository, D::Clock>,
-    shutdown: impl Future<Output = ()>,
-    background: Pin<&mut impl Future<Output = Infallible>>,
-) -> Option<Option<Lease>> {
-    if matches!(listeners, LeaderListeners::Dedicated { .. }) {
-        return Some(None);
-    }
-    tokio::select! {
-        biased;
-        () = shutdown => None,
-        lease = leadership.acquire() => Some(Some(lease)),
-        never = background => match never {},
-    }
-}
-
-/// Opens the public listener, releasing an already-acquired lease if opening fails.
-async fn open_public<D: Deployment>(
-    public: D::Listener,
-    core: &Core<D>,
-    certificates: &RevocationSet,
-    backoff: NonZeroDuration,
-    lease: Option<&Lease>,
-    leadership: &Leadership<'_, D::Repository, D::Clock>,
-) -> Result<Accepting<D::Listener, Arc<D::Signer>, D::Clock>, ServerError> {
-    match open_listener::<D>(public, EndpointRole::Public, core, certificates, backoff).await {
-        Ok(public) => Ok(public),
-        Err(error) => {
-            if let Some(lease) = lease {
-                leadership.release(lease).await;
-            }
-            Err(error)
-        }
     }
 }
 
@@ -891,6 +920,7 @@ impl<D: Deployment> Server<D> {
             &self.controller,
             self.leadership,
         );
+        let readiness = self.readiness.with_fence(leadership.fence().clone());
         // Every controller refreshes revocations and drains its admitted observations.
         let mut background = Box::pin(run_background(
             core,
@@ -903,32 +933,17 @@ impl<D: Deployment> Server<D> {
             (self.observations, self.forwarding),
             &self.leading,
             self.health,
-            (self.readiness.clone(), self.health_limits),
+            (readiness.clone(), self.health_limits),
         ));
-        let Listeners { public, leader } = self.listeners;
-        let Some(lease) =
-            initial_lease::<D>(&leader, &leadership, shutdown.clone(), background.as_mut()).await
-        else {
-            return Ok(());
-        };
-        let public = open_public::<D>(
-            public,
-            core,
-            &self.revoked_certificates,
-            self.accept_error_backoff,
-            lease.as_ref(),
-            &leadership,
+        let (connections, leader, ends) = prepare_listeners::<D>(
+            self.listeners,
+            (self.public_gate, self.worker_gate),
+            self.public,
+            (core, &self.revoked_certificates, self.accept_error_backoff),
+            &readiness,
+            stop.clone(),
         )
         .await?;
-        self.readiness.serve();
-        let (connections, channels, ends) = controller_connections::<D>(
-            public,
-            self.public_gate,
-            self.worker_gate,
-            self.public,
-            matches!(&leader, LeaderListeners::Dedicated { .. }),
-            stop.clone(),
-        );
         let scheduler = &self.scheduler;
         let mut controller = Box::pin(scheduler.run_controller(&spec, connections, ready));
         let context = LeadContext {
@@ -942,25 +957,19 @@ impl<D: Deployment> Server<D> {
             sink: &self.observation_sink,
             cache: &self.cache,
             leading: &self.leading,
-            readiness: &self.readiness,
+            readiness: &readiness,
             leadership: &leadership,
             revoked_certificates: &self.revoked_certificates,
             backoff: self.accept_error_backoff,
             poll_interval: self.poll_interval,
             sidecar_retry_interval,
         };
-        let mut leader_task = Box::pin(run_leader(
-            context,
-            leader,
-            channels,
-            lease,
-            (shutdown.clone(), stop),
-        ));
+        let mut leader_task = Box::pin(run_leader(context, leader, (shutdown.clone(), stop)));
         drive_controller(
             shutdown,
             || {
                 let _ = stop_sender.send(());
-                self.readiness.stop();
+                readiness.stop();
             },
             self.dashboard.as_ref(),
             controller.as_mut(),

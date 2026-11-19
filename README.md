@@ -84,7 +84,7 @@ The deployment module defaults to `database.engine = "sqlite"` for one controlle
 
 ```hcl
 module "gang" {
-  source = "git::https://github.com/example-org/gang//infra/terraform/modules/deployment?ref=v0.3.1"
+  source = "git::https://github.com/example-org/gang//infra/terraform/modules/deployment?ref=v0.3.2"
   # variables as in the example root
 }
 ```

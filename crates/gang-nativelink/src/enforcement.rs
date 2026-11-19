@@ -5,8 +5,10 @@
 use std::fmt;
 use std::num::NonZeroU32;
 
-use gang_types::{BoundedBytes, HeadroomPercent};
+use gang_types::{BoundedBytes, HeadroomPercent, Percent};
 use serde::{Deserialize, Serialize};
+
+use crate::config::WholeSeconds;
 
 /// A size that is a whole, non-zero number of KiB, as `NativeLink` takes memory and disk sizes.
 pub type WholeKib = BoundedBytes<1024, 1, { u64::MAX / 1024 }>;
@@ -17,8 +19,19 @@ pub type WholeKib = BoundedBytes<1024, 1, { u64::MAX / 1024 }>;
 /// of that range.
 pub type MinReservation = BoundedBytes<1024, { 4 * 1024 }, { u64::MAX / 1024 }>;
 
+/// The least disk reservation: a whole number of KiB, at least 1 MiB.
+pub type DiskMinReservation = BoundedBytes<1024, 1024, { u64::MAX / 1024 }>;
+
 /// The default minimum reservation: 64 MiB.
 const DEFAULT_MIN_RESERVATION: MinReservation = MinReservation::from_units(64 * 1024);
+
+/// The default minimum disk reservation: 1 GiB.
+const DEFAULT_DISK_MIN_RESERVATION: DiskMinReservation =
+    DiskMinReservation::from_units(1024 * 1024);
+/// Free filesystem space at which sustained pressure can trigger a kill.
+const DEFAULT_DISK_PRESSURE_FREE_PERCENT: Percent = Percent::from_percent(5);
+/// How long free space must remain under the pressure threshold.
+const DEFAULT_DISK_PRESSURE_KILL_AFTER: WholeSeconds = WholeSeconds::from_units(5);
 
 /// Percent above the reservation an action may reach before it is killed.
 const DEFAULT_MEMORY_HEADROOM_PERCENT: HeadroomPercent = HeadroomPercent::from_percent(20);
@@ -67,11 +80,11 @@ pub struct MemoryTuning {
     pub min_reservation: MinReservation,
     /// Percent above its reservation an action may reach before `NativeLink` kills it. Default: 20.
     pub headroom_percent: HeadroomPercent,
-    /// A killed action is requeued with its reservation scaled to this percent, so 200 doubles
-    /// it and 150 adds half. Must be greater than 100. Default: 200.
+    /// A memory or pressure disk kill is requeued with its reservation scaled to this percent.
+    /// Must be greater than 100. Default: 200.
     pub escalation_percent: EscalationPercent,
-    /// The most requeues with a larger reservation before the action fails. 0 lets the largest
-    /// worker's memory alone bound them. Default: 8.
+    /// Maximum requeues shared by memory and pressure disk kills; 0 leaves the largest worker
+    /// as the bound. Default: 8.
     pub escalation_max_steps: u32,
 }
 
@@ -144,23 +157,25 @@ impl fmt::Display for EscalationError {
 impl std::error::Error for EscalationError {}
 
 gang_types::string_enum! {
-    /// How a worker holds an action to the disk it reserved.
+    /// How a worker guards or enforces an action's disk reservation.
     pub enum DiskEnforcement("disk enforcement") {
         /// Measure only: nothing is refused and nothing is killed.
         None = "none",
-        /// Refuse an action whose disk reservation exceeds the free space under the work directory,
-        /// less what the actions already admitted reserved.
+        /// Admission guarding only; never kill an action.
         Guard = "guard",
-        /// Guard, and kill an action whose own files pass its reservation plus headroom. Sampled every
-        /// ten seconds on Linux only; elsewhere `soft` acts as `guard`.
+        /// Guard admission and, under sustained disk pressure, kill and requeue the action
+        /// furthest over its reservation with a larger reservation.
+        Pressure = "pressure",
+        /// Opt in to a per-action ceiling. A disk kill fails the action and is not recommended.
+        /// Sampled every ten seconds on Linux only; elsewhere `soft` acts as `guard`.
         Soft = "soft",
     }
 }
 
 impl Default for DiskEnforcement {
-    /// Uses soft enforcement by default.
+    /// Uses pressure enforcement by default.
     fn default() -> Self {
-        Self::Soft
+        Self::Pressure
     }
 }
 
@@ -171,10 +186,17 @@ impl Default for DiskEnforcement {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct DiskTuning {
-    /// What a worker does with an action whose disk reservation the free space cannot hold, or
-    /// whose own files outgrow it. Default: `soft`.
+    /// Disk admission and enforcement mode. Default: `pressure`.
     pub enforcement: DiskEnforcement,
-    /// Percent above its reservation an action's own files may reach before it is killed.
+    /// Learned p95 reservations can be based on a few sampled peaks: 1.6 MiB and 38 MiB
+    /// were observed for actions needing 25 MiB and more. Positive reservations are raised
+    /// to this floor, which must not exceed any fleet's `disk_per_instance`. Default: 1 GiB.
+    pub min_reservation: DiskMinReservation,
+    /// Filesystem free-space threshold for pressure kills, from 1 to 100. Default: 5.
+    pub pressure_free_percent: Percent,
+    /// Time free space must remain at or below the threshold, in whole seconds. Default: 5s.
+    pub pressure_kill_after: WholeSeconds,
+    /// In `soft` mode only, percent above the reservation before an action is killed.
     /// Default: 20.
     pub headroom_percent: HeadroomPercent,
 }
@@ -183,6 +205,9 @@ impl Default for DiskTuning {
     fn default() -> Self {
         Self {
             enforcement: DiskEnforcement::default(),
+            min_reservation: DEFAULT_DISK_MIN_RESERVATION,
+            pressure_free_percent: DEFAULT_DISK_PRESSURE_FREE_PERCENT,
+            pressure_kill_after: DEFAULT_DISK_PRESSURE_KILL_AFTER,
             headroom_percent: DEFAULT_DISK_HEADROOM_PERCENT,
         }
     }
@@ -192,9 +217,9 @@ impl Default for DiskTuning {
 /// client reserved nothing.
 ///
 /// Until its kind is measured, a cold action reserves this much of its worker, so a worker runs
-/// fewer such actions at once until they are learned. Memory and disk enforcement hold the action
-/// to it: a memory kill requeues the action with a larger reservation, and a disk kill fails the
-/// action, after which the measured peak raises the reservation of its next run.
+/// fewer such actions at once until they are learned. A memory kill or pressure disk kill requeues
+/// the action with a larger reservation using the shared memory escalation budget. Opt-in `soft`
+/// disk enforcement instead fails an action that exceeds its ceiling.
 ///
 /// With `enabled = false`, unmeasured actions reserve nothing and so are not enforced.
 ///
@@ -248,6 +273,7 @@ mod tests {
         for (mode, name) in [
             (DiskEnforcement::None, "none"),
             (DiskEnforcement::Guard, "guard"),
+            (DiskEnforcement::Pressure, "pressure"),
             (DiskEnforcement::Soft, "soft"),
         ] {
             let json = format!("\"{name}\"");
@@ -267,6 +293,13 @@ mod tests {
         assert_eq!(memory.headroom_percent.get(), 20);
         assert_eq!(memory.escalation_max_steps, 8);
         assert_eq!(memory.min_reservation.as_units(), 65_536);
+
+        let disk = DiskTuning::default();
+        assert_eq!(disk.enforcement, DiskEnforcement::Pressure);
+        assert_eq!(disk.min_reservation.as_units(), 1024 * 1024);
+        assert_eq!(disk.pressure_free_percent.get(), 5);
+        assert_eq!(disk.pressure_kill_after.as_units(), 5);
+        assert_eq!(disk.headroom_percent.get(), 20);
 
         let cold = ColdStartTuning::default();
         assert!(cold.enabled);
@@ -300,6 +333,40 @@ mod tests {
         let memory: MemoryTuning =
             serde_json::from_str(r#"{"min_reservation":"16385KiB"}"#).expect("valid minimum");
         assert_eq!(memory.min_reservation.as_units(), 16_385);
+    }
+
+    #[test]
+    fn disk_tuning_bounds_are_enforced() {
+        for size in ["1023KiB", "1048577B"] {
+            assert!(
+                serde_json::from_value::<DiskTuning>(serde_json::json!({"min_reservation": size}))
+                    .is_err()
+            );
+        }
+        let disk: DiskTuning = serde_json::from_str(
+            r#"{"min_reservation":"1MiB","pressure_free_percent":100,"pressure_kill_after":"1s"}"#,
+        )
+        .unwrap();
+        assert_eq!(disk.min_reservation.as_units(), 1024);
+        assert_eq!(disk.pressure_free_percent.get(), 100);
+        assert_eq!(disk.pressure_kill_after.as_units(), 1);
+        assert_eq!(Percent::new(1).expect("valid percent").get(), 1);
+        for percent in [0, 101] {
+            assert!(
+                serde_json::from_value::<DiskTuning>(
+                    serde_json::json!({"pressure_free_percent": percent})
+                )
+                .is_err()
+            );
+        }
+        for duration in ["0s", "1500ms", "18446744074s"] {
+            assert!(
+                serde_json::from_value::<DiskTuning>(
+                    serde_json::json!({"pressure_kill_after": duration})
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

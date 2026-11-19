@@ -81,11 +81,6 @@ output "public_port" {
   value       = local.public_port
 }
 
-output "execution_port" {
-  description = "TCP port of the controller's execution listener in the multi-controller shape; reached only through the load balancers."
-  value       = local.execution_port
-}
-
 output "worker_port" {
   description = "TCP port of the controller's worker listener. Opened to the worker security group only."
   value       = local.worker_port

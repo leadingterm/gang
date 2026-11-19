@@ -95,6 +95,9 @@ const GROUP_LEAVE_ENV: &str = "GANG_TEST_GROUP_LEAVE";
 /// The address for the default-memory-floor helper to report its reservation.
 #[cfg(target_os = "linux")]
 const MEMORY_ENV: &str = "GANG_TEST_MEMORY";
+/// Makes the memory output contain a symlink whose target cannot be encoded in REAPI.
+#[cfg(target_os = "linux")]
+const MEMORY_INVALID_OUTPUT_ENV: &str = "GANG_TEST_MEMORY_INVALID_OUTPUT";
 /// The output directory used by the default-memory-floor helper.
 #[cfg(target_os = "linux")]
 const MEMORY_OUTPUT: &str = "memory-output";
@@ -875,20 +878,37 @@ fn entrypoint_helper() -> TestResult {
         create_symlink_output()?;
     }
     #[cfg(target_os = "linux")]
-    if let Some(address) = std::env::var_os(MEMORY_ENV) {
-        use std::io::Write as _;
+    if std::env::var_os(MEMORY_ENV).is_some()
+        || std::env::var_os(MEMORY_INVALID_OUTPUT_ENV).is_some()
+    {
+        use std::os::unix::ffi::OsStringExt as _;
         use std::os::unix::fs::symlink;
 
         std::fs::create_dir_all(MEMORY_OUTPUT)?;
         let link = Path::new(MEMORY_OUTPUT).join("input-link");
-        symlink(std::env::current_dir()?.join(INPUT_NAME), &link)?;
-        let memory = vec![1_u8; 50 * 1024 * 1024];
+        let target = if std::env::var_os(MEMORY_INVALID_OUTPUT_ENV).is_some() {
+            PathBuf::from(std::ffi::OsString::from_vec(vec![0xff]))
+        } else {
+            std::env::current_dir()?.join(INPUT_NAME)
+        };
+        symlink(target, link)?;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(address) = std::env::var_os(MEMORY_ENV) {
+        use std::io::Write as _;
+
+        let mib = if std::env::var_os(MEMORY_INVALID_OUTPUT_ENV).is_some() {
+            96
+        } else {
+            50
+        };
+        let memory = vec![1_u8; mib * 1024 * 1024];
         std::hint::black_box(&memory);
         let mut stream = std::net::TcpStream::connect(address.to_string_lossy().as_ref())?;
         writeln!(stream, "{}", std::env::var("GANG_MEMORY_KB")?)?;
         std::io::copy(&mut stream, &mut std::io::sink())?;
         std::hint::black_box(&memory);
-        std::fs::remove_file(link)?;
+        std::fs::remove_file(Path::new(MEMORY_OUTPUT).join("input-link"))?;
     }
     #[cfg(target_os = "linux")]
     if let Some(address) = std::env::var_os(GROUP_LEAVE_ENV) {
@@ -924,6 +944,10 @@ fn entrypoint_helper() -> TestResult {
     }
     let input = std::fs::read(INPUT_NAME)?;
     std::fs::write(OUTPUT_NAME, input)?;
+    #[cfg(target_os = "linux")]
+    if std::env::var_os(MEMORY_INVALID_OUTPUT_ENV).as_deref() == Some(std::ffi::OsStr::new("7")) {
+        std::process::exit(7);
+    }
     Ok(())
 }
 
@@ -1024,7 +1048,10 @@ fn build_action_with(
         output_directories: {
             let mut directories = Vec::new();
             #[cfg(target_os = "linux")]
-            if env.iter().any(|(name, _)| *name == MEMORY_ENV) {
+            if env
+                .iter()
+                .any(|(name, _)| *name == MEMORY_ENV || *name == MEMORY_INVALID_OUTPUT_ENV)
+            {
                 directories.push(MEMORY_OUTPUT.into());
             }
             if env.iter().any(|(name, _)| *name == SYMLINK_OUTPUT_ENV) {
@@ -1481,6 +1508,133 @@ async fn a_subfloor_request_runs_with_the_default_memory_floor() -> TestResult {
             .ok_or("the response carries no action result")?;
         assert_eq!(result.exit_code, 0);
         assert_eq!(output_digest(&result)?, Some(&digest_of(HELLO)?));
+        Ok::<(), Box<dyn Error>>(())
+    })
+    .await?
+}
+
+/// An upload error after a memory kill must not hide the kill from the retry scheduler.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_memory_kill_survives_an_output_upload_error() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let scratch = tempfile::tempdir()?;
+        let mut harness = Harness::start().await?;
+        harness.add_worker(WorkerPaths::new(scratch.path(), "worker"), default_fleet()?)?;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let address = listener.local_addr()?.to_string();
+        let action = build_action_with(
+            &[("ISA", "x86-64"), ("memory_kb", "65536")],
+            &[(MEMORY_ENV, &address), (MEMORY_INVALID_OUTPUT_ENV, "1")],
+        )?;
+        let channel = public_channel(harness.public_port).await?;
+        upload_blobs(&channel, action.blobs).await?;
+        let execution = run_action(&channel, &action.digest);
+        tokio::pin!(execution);
+
+        let (first, _) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            response = &mut execution => {
+                response?;
+                return Err("action completed before the first helper connected".into());
+            }
+        };
+        let mut first = BufReader::new(first);
+        let mut reservation = String::new();
+        tokio::select! {
+            read = first.read_line(&mut reservation) => { read?; }
+            response = &mut execution => {
+                response?;
+                return Err("action completed before the first reservation".into());
+            }
+        }
+        assert_eq!(reservation.trim(), "65536");
+        let mut byte = [0];
+        let closed = tokio::select! {
+            read = first.read(&mut byte) => read,
+            response = &mut execution => {
+                response?;
+                return Err("action completed before the first helper was killed".into());
+            }
+        };
+        match closed {
+            Ok(0) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            result => {
+                return Err(
+                    format!("first helper did not close its connection: {result:?}").into(),
+                );
+            }
+        }
+
+        let (second, _) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            response = &mut execution => {
+                response?;
+                return Err("action completed before the retry connected".into());
+            }
+        };
+        let mut second = BufReader::new(second);
+        reservation.clear();
+        tokio::select! {
+            read = second.read_line(&mut reservation) => { read?; }
+            response = &mut execution => {
+                response?;
+                return Err("action completed before the retry reservation".into());
+            }
+        }
+        assert_eq!(reservation.trim(), "131072");
+        drop(second);
+
+        let response = execution.await?;
+        let result = response
+            .result
+            .ok_or("the response carries no action result")?;
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(output_digest(&result)?, Some(&digest_of(HELLO)?));
+        Ok::<(), Box<dyn Error>>(())
+    })
+    .await?
+}
+
+/// Upload failures from normally completed actions remain errors.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_output_upload_error_is_not_a_successful_action() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let scratch = tempfile::tempdir()?;
+        let mut harness = Harness::start_configured(
+            vec![default_fleet()?],
+            TestGate::allow(),
+            Vec::new(),
+            json!({"scheduler": {"max_job_retries": 1}}),
+        )
+        .await?;
+        harness.add_worker(WorkerPaths::new(scratch.path(), "worker"), default_fleet()?)?;
+        let channel = public_channel(harness.public_port).await?;
+        for exit in ["0", "7"] {
+            let action =
+                build_action_with(&[("ISA", "x86-64")], &[(MEMORY_INVALID_OUTPUT_ENV, exit)])?;
+            upload_blobs(&channel, action.blobs).await?;
+            let response = run_action(&channel, &action.digest).await?;
+            let status = response.status.ok_or("upload failure has no status")?;
+            assert_ne!(status.code, 0, "exit {exit}: upload failure returned OK");
+            let message = status.message;
+            assert!(
+                message.contains("Error while uploading results")
+                    || message.contains("Could not convert") && message.contains("RelativePath"),
+                "exit {exit}: expected an upload or path conversion error, got {message}"
+            );
+            assert!(
+                response.result.as_ref().is_none_or(|result| {
+                    !result
+                        .output_files
+                        .iter()
+                        .any(|file| file.path == OUTPUT_NAME)
+                }),
+                "exit {exit}: upload failure returned the output file"
+            );
+        }
         Ok::<(), Box<dyn Error>>(())
     })
     .await?
