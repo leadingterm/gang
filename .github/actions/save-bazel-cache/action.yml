@@ -15,7 +15,7 @@ inputs:
     description: Directory containing downloaded working-set artifacts.
     default: ''
   snapshot-budget:
-    description: Override the compressed snapshot budget in bytes.
+    description: Lower the compressed snapshot budget in bytes.
     default: ''
 runs:
   using: composite
@@ -37,11 +37,11 @@ runs:
         esac
     - name: Stop Bazel before exporting or saving
       id: shutdown
-      if: always() && steps.validate.outcome != 'failure' && (inputs.mode == 'export' && inputs.prune == 'true' || inputs.mode == 'save' && env.BAZEL_DISK_CACHE_SAVE == 'true')
+      if: always() && runner.os == 'Linux' && runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64' && steps.validate.outcome != 'failure' && (inputs.mode == 'export' && inputs.prune == 'true' || inputs.mode == 'save' && env.BAZEL_DISK_CACHE_SAVE == 'true')
       shell: bash
       run: nix develop -c bazel shutdown
     - name: Export shard working set
-      if: inputs.mode == 'export' && inputs.prune == 'true'
+      if: runner.os == 'Linux' && runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64' && inputs.mode == 'export' && inputs.prune == 'true'
       shell: bash
       run: |
         root="$RUNNER_TEMP/bazel-working-set"
@@ -53,7 +53,7 @@ runs:
           tools/ci-cache.sh subtract "$root/files" "$BAZEL_RESTORED_MANIFEST"
         fi
     - name: Upload shard working set
-      if: inputs.mode == 'export' && inputs.prune == 'true'
+      if: runner.os == 'Linux' && runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64' && inputs.mode == 'export' && inputs.prune == 'true'
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: bazel-working-set-${{ inputs.shard }}
@@ -62,7 +62,7 @@ runs:
         retention-days: 1
     - name: Prepare snapshot
       id: prepare
-      if: always() && steps.validate.outcome == 'success' && env.BAZEL_DISK_CACHE_SAVE == 'true' && (inputs.mode == 'save' && inputs.prune == 'true' && steps.shutdown.outcome == 'success' || inputs.mode == 'merge' && job.status == 'success')
+      if: always() && runner.os == 'Linux' && runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64' && steps.validate.outcome == 'success' && env.BAZEL_DISK_CACHE_SAVE == 'true' && (inputs.mode == 'save' && inputs.prune == 'true' && steps.shutdown.outcome == 'success' || inputs.mode == 'merge' && job.status == 'success')
       shell: bash
       env:
         MODE: ${{ inputs.mode }}
@@ -131,16 +131,14 @@ runs:
           tools/ci-cache.sh subtract "$staging" "$BAZEL_BASE_MANIFEST"
         fi
         [[ -n $(find "$staging" -type f -print -quit) ]] || no_snapshot
-        budget=$SNAPSHOT_BUDGET
-        if [[ -z $budget ]]; then
-          case "$EVENT:${BAZEL_BASE_PRESENT:-false}:$BAZEL_CACHE_JOB" in
-            pull_request:true:linux-x86_64) budget=1000000000 ;;
-            pull_request:true:cross) budget=500000000 ;;
-            pull_request:true:*) budget=600000000 ;;
-            *:*:linux-x86_64) budget=2000000000 ;;
-            *:*:cross) budget=1000000000 ;;
-            *) budget=1300000000 ;;
-          esac
+        # PRs always save a small delta, even without a restored default-branch baseline.
+        # Callers may lower these compressed-byte caps, never raise them.
+        budget=3000000000
+        if [[ $EVENT == pull_request ]]; then
+          budget=300000000
+        fi
+        if [[ -n $SNAPSHOT_BUDGET && $SNAPSHOT_BUDGET -lt $budget ]]; then
+          budget=$SNAPSHOT_BUDGET
         fi
         limit_log="$RUNNER_TEMP/bazel-cache-limit.log"
         if ! tools/ci-cache.sh limit "$staging" "$budget" 2>"$limit_log"; then
@@ -161,7 +159,7 @@ runs:
         mv -- "$staging/repository/content_addressable" "$BAZEL_REPOSITORY_CACHE/content_addressable"
         echo 'has-snapshot=true' >> "$GITHUB_OUTPUT"
     - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      if: always() && steps.validate.outcome == 'success' && env.BAZEL_DISK_CACHE_SAVE == 'true' && steps.prepare.outcome == 'success' && steps.prepare.outputs.has-snapshot == 'true' && (inputs.mode == 'save' && steps.shutdown.outcome == 'success' || inputs.mode == 'merge' && job.status == 'success')
+      if: always() && runner.os == 'Linux' && runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64' && steps.validate.outcome == 'success' && env.BAZEL_DISK_CACHE_SAVE == 'true' && steps.prepare.outcome == 'success' && steps.prepare.outputs.has-snapshot == 'true' && (inputs.mode == 'save' && steps.shutdown.outcome == 'success' || inputs.mode == 'merge' && job.status == 'success')
       with:
         path: |
           ${{ env.BAZEL_DISK_CACHE }}

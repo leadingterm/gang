@@ -83,28 +83,46 @@ gh() {
       local event=push run_sha=$SHA branch=main head_repo=",\"head_repository\":{\"full_name\":\"$GH_REPO\"}"
       if [[ $CASE == ci_dispatch ]]; then event=workflow_dispatch; fi
       if [[ $CASE == same_repo_pr ]]; then event=pull_request; fi
+      if [[ $CASE == fork_pr ]]; then event=pull_request; head_repo=',"head_repository":{"full_name":"fork/gang"}'; fi
       if [[ $CASE == wrong_sha ]]; then run_sha=$OTHER_SHA; fi
       if [[ $CASE == wrong_branch ]]; then branch=other; fi
       if [[ $CASE == wrong_repo ]]; then head_repo=',"head_repository":{"full_name":"fork/gang"}'; fi
       if [[ $CASE == missing_repo ]]; then head_repo=''; fi
       if [[ $CASE == null_repo ]]; then head_repo=',"head_repository":null'; fi
       printf '{"workflow_runs":[{"id":101,"event":"%s","head_branch":"%s","head_sha":"%s","created_at":"2026-01-01","head_commit":{"tree":{"sha":"same-tree"}}%s}]}\n' "$event" "$branch" "$run_sha" "$head_repo"
-      if [[ $CASE == latest || $CASE == fallback_required || $CASE == fallback_artifact || $CASE == fallback_api_failure ]]; then
+      if [[ $CASE == latest || $CASE == fallback_required || $CASE == fallback_validation || $CASE == fallback_artifact || $CASE == fallback_api_failure ]]; then
         printf '{"workflow_runs":[{"id":202,"event":"push","head_branch":"main","head_sha":"%s","created_at":"2026-01-02","head_repository":{"full_name":"%s"}}]}\n' "$SHA" "$GH_REPO"
+      fi
+      if [[ $CASE == newer_tag_push ]]; then
+        printf '{"workflow_runs":[{"id":202,"event":"push","head_branch":"v1.2.3","head_sha":"%s","created_at":"2026-01-02","head_repository":{"full_name":"%s"}}]}\n' "$SHA" "$GH_REPO"
       fi ;;
     "repos/$GH_REPO/actions/runs/101/jobs?filter=latest&per_page=100" | "repos/$GH_REPO/actions/runs/202/jobs?filter=latest&per_page=100")
       if [[ $CASE == jobs_api_failure || ( $CASE == fallback_api_failure && $endpoint == *"/202/"* ) ]]; then return 23; fi
       if [[ $CASE == invalid_jobs ]]; then printf '{"jobs":null}\n'; return; fi
       if [[ $CASE == malformed_job ]]; then printf '{"jobs":[{"name":42,"conclusion":"success"}]}\n'; return; fi
-      if [[ $CASE == missing_required ]]; then printf '{"jobs":[]}\n'; return; fi
-      local conclusion='"success"'
+      local conclusion='"success"' validation='"success"'
+      if [[ $CASE == missing_required ]]; then
+        printf '{"jobs":[{"name":"release-validation","conclusion":"success"}]}\n'
+        return
+      fi
       if [[ $CASE == failed_required || ( $CASE == fallback_required && $endpoint == *"/202/"* ) ]]; then conclusion='"failure"'; fi
       if [[ $CASE == pending_required ]]; then conclusion=null; fi
       if [[ $CASE == duplicate_required ]]; then
-        printf '{"jobs":[{"name":"required","conclusion":"success"},{"name":"required","conclusion":"success"}]}\n'
+        printf '{"jobs":[{"name":"required","conclusion":"success"},{"name":"required","conclusion":"success"},{"name":"release-validation","conclusion":"success"}]}\n'
         return
       fi
-      printf '{"jobs":[{"name":"required","conclusion":%s}]}\n' "$conclusion" ;;
+      if [[ $CASE == missing_validation ]]; then
+        printf '{"jobs":[{"name":"required","conclusion":"success"}]}\n'
+        return
+      fi
+      if [[ $CASE == failed_validation || ( $CASE == fallback_validation && $endpoint == *"/202/"* ) ]]; then validation='"failure"'; fi
+      if [[ $CASE == cancelled_validation ]]; then validation='"cancelled"'; fi
+      if [[ $CASE == skipped_validation ]]; then validation='"skipped"'; fi
+      if [[ $CASE == latest_validation_failure ]]; then
+        printf '{"jobs":[{"name":"required","conclusion":"success"},{"name":"release-validation","conclusion":"success"},{"name":"release-validation","conclusion":"failure"}]}\n'
+        return
+      fi
+      printf '{"jobs":[{"name":"required","conclusion":%s},{"name":"release-validation","conclusion":%s}]}\n' "$conclusion" "$validation" ;;
     "repos/$GH_REPO/actions/runs/101/artifacts?per_page=100" | "repos/$GH_REPO/actions/runs/202/artifacts?per_page=100")
       if [[ $CASE == artifact_api_failure ]]; then return 23; fi
       if [[ $CASE == invalid_artifacts ]]; then printf '{"artifacts":null}\n'; return; fi
@@ -120,7 +138,7 @@ gh() {
 }
 export -f gh
 cases=0
-for scenario in direct:101 release_dispatch:101 same_repo_pr:fail ci_dispatch:fail wrong_sha:fail wrong_branch:fail wrong_repo:fail missing_repo:fail null_repo:fail api_failure:fail invalid_runs:fail malformed_json:fail failed_required:fail pending_required:fail missing_required:fail duplicate_required:fail jobs_api_failure:fail invalid_jobs:fail malformed_job:fail missing_artifact:fail expired_artifact:fail artifact_api_failure:fail invalid_artifacts:fail malformed_artifact:fail no_darwin:101 expired_darwin:101 latest:202 fallback_required:101 fallback_artifact:101 fallback_api_failure:fail; do
+for scenario in direct:101 release_dispatch:101 newer_tag_push:101 same_repo_pr:fail fork_pr:fail ci_dispatch:fail wrong_sha:fail wrong_branch:fail wrong_repo:fail missing_repo:fail null_repo:fail api_failure:fail invalid_runs:fail malformed_json:fail failed_required:fail pending_required:fail missing_required:fail duplicate_required:fail missing_validation:fail failed_validation:fail cancelled_validation:fail skipped_validation:fail latest_validation_failure:fail jobs_api_failure:fail invalid_jobs:fail malformed_job:fail missing_artifact:fail expired_artifact:fail artifact_api_failure:fail invalid_artifacts:fail malformed_artifact:fail no_darwin:101 expired_darwin:101 latest:202 fallback_required:101 fallback_validation:101 fallback_artifact:101 fallback_api_failure:fail; do
   export CASE=${scenario%:*} EVENT=push
   expected=${scenario#*:}
   if [[ $CASE == release_dispatch ]]; then EVENT=workflow_dispatch; fi

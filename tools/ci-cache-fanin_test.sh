@@ -13,9 +13,6 @@ yq -er '.runs.steps[] | select(.name == "Prepare snapshot") | .run' \
 export_body="$scratch/export.sh"
 yq -er '.runs.steps[] | select(.name == "Export shard working set") | .run' \
   "$repo/.github/actions/save-bazel-cache/action.yml" >"$export_body"
-arm_body="$scratch/arm-merge.sh"
-yq -er '.jobs["linux-arm64-checks"].steps[] | select(.name == "Merge the bundle working set") | .run' \
-  "$repo/.github/workflows/ci.yml" >"$arm_body"
 cd "$repo"
 
 key1=$(printf '%064x' 1)
@@ -23,6 +20,7 @@ key2=$(printf '%064x' 2)
 key3=$(printf '%064x' 3)
 key4=$(printf '%064x' 4)
 key5=$(printf '%064x' 5)
+key6=$(printf '%064x' 6)
 fixture="$scratch/fixture"
 mkdir -p "$fixture/disk/ac/00" "$fixture/repository/content_addressable/sha256/$key2"
 printf 'action entry\n' >"$fixture/disk/ac/00/$key1"
@@ -48,7 +46,7 @@ setup_case() {
   export MERGE_PATH="$case_dir/download" MODE=merge SNAPSHOT_BUDGET=1000000
   export EVENT=pull_request BAZEL_CACHE_JOB=linux-x86_64 BAZEL_DISK_CACHE_KEY=test-key
   export BAZEL_DISK_CACHE_EPOCH_SECONDS=1704067200
-  unset BAZEL_BASE_MANIFEST BAZEL_ADDITIONAL_USED_MANIFEST BAZEL_RESTORED_MANIFEST
+  unset BAZEL_BASE_MANIFEST BAZEL_BASE_PRESENT BAZEL_ADDITIONAL_USED_MANIFEST BAZEL_RESTORED_MANIFEST
   mkdir -p "$RUNNER_TEMP" "$BAZEL_DISK_CACHE/cas/00" \
     "$BAZEL_REPOSITORY_CACHE/content_addressable/sha256/$key3" \
     "$BAZEL_REPOSITORY_CACHE/content_addressable/sha256/$key4"
@@ -114,6 +112,25 @@ printf '%s\0' "repository/content_addressable/sha256/$key3/file" \
 run_prepare "$two"
 assert_snapshot
 cmp "$scratch/working-set/used" "$RUNNER_TEMP/bazel-merged-used"
+
+# The real x86 fan-in includes four checks shards plus the bundle and lint.
+six="$scratch/six"
+for shard in 1 2 3 4 bundle lint; do
+  mkdir -p "$six/download/bazel-working-set-x86-$shard"
+  cp "$scratch/working-set/used" "$six/download/bazel-working-set-x86-$shard/used"
+done
+cp -pR "$scratch/working-set/files" "$six/download/bazel-working-set-x86-1/"
+lint_files="$six/download/bazel-working-set-x86-lint/files/disk/cas/00"
+bundle_files="$six/download/bazel-working-set-x86-bundle/files/repository/content_addressable/sha256/$key6"
+mkdir -p "$lint_files" "$bundle_files"
+printf 'lint output\n' >"$lint_files/$key5"
+printf 'bundle output\n' >"$bundle_files/file"
+printf '%s\0' "disk/cas/00/$key5" >>"$six/download/bazel-working-set-x86-lint/used"
+printf '%s\0' "repository/content_addressable/sha256/$key6/file" >>"$six/download/bazel-working-set-x86-bundle/used"
+run_prepare "$six"
+assert_snapshot
+[[ $(<"$BAZEL_DISK_CACHE/cas/00/$key5") == 'lint output' ]]
+[[ $(<"$BAZEL_REPOSITORY_CACHE/content_addressable/sha256/$key6/file") == 'bundle output' ]]
 
 trusted="$scratch/trusted"
 mkdir -p "$trusted/download"
@@ -183,44 +200,23 @@ cmp "$producer/expected-used" "$RUNNER_TEMP/bazel-working-set/used"
 [[ $(find "$RUNNER_TEMP/bazel-working-set/files" -type f | wc -l) -eq 1 ]]
 [[ -f $RUNNER_TEMP/bazel-working-set/files/disk/cas/00/$key5 ]]
 
-# Exercise the actual ARM merge and save with old-mtime bundle outputs.
-for layout in flattened nested; do
-  arm="$scratch/arm-$layout"
-  setup_case "$arm"
-  downloaded="$RUNNER_TEMP/arm-bundle-working-set"
-  [[ $layout != nested ]] || downloaded="$downloaded/bazel-working-set-arm64-bundle"
-  mkdir -p "$downloaded"
-  cp -pR "$scratch/working-set/." "$downloaded/"
-  bash -euo pipefail "$arm_body"
-  while IFS='=' read -r name value; do export "$name=$value"; done <"$GITHUB_ENV"
-  [[ $BAZEL_ADDITIONAL_USED_MANIFEST == "$downloaded/used" ]]
-  [[ $(stat -c %Y "$BAZEL_DISK_CACHE/ac/00/$key1") -lt $BAZEL_DISK_CACHE_EPOCH_SECONDS ]]
-  printf 'checks job output\n' >"$BAZEL_DISK_CACHE/cas/00/$key5"
-  touch -t 202401010000.01 "$BAZEL_DISK_CACHE/cas/00/$key5"
-  export MODE=save
-  bash -euo pipefail "$body"
-  assert_snapshot
-  [[ $(<"$BAZEL_DISK_CACHE/cas/00/$key5") == 'checks job output' ]]
-  [[ $(stat -c %Y "$BAZEL_DISK_CACHE/ac/00/$key1") -eq \
-    $(stat -c %Y "$fixture/disk/ac/00/$key1") ]]
+# Execute the whole preparation body to observe the effective compressed cap.
+# Missing main cache must never promote a PR delta to the main snapshot budget.
+for event in pull_request push; do
+  if [[ $event == pull_request ]]; then cap=300000000; else cap=3000000000; fi
+  for base_present in true false; do
+    for override in '' 9000000000 1000000; do
+      budget_case="$scratch/budget-$event-$base_present-${override:-default}"
+      mkdir -p "$budget_case/download"
+      cp -pR "$scratch/working-set/." "$budget_case/download/"
+      setup_case "$budget_case"
+      export EVENT=$event BAZEL_BASE_PRESENT=$base_present SNAPSHOT_BUDGET=$override
+      bash -euo pipefail "$body"
+      expected=$cap
+      if [[ -n $override && $override -lt $cap ]]; then expected=$override; fi
+      [[ $(<"$GITHUB_OUTPUT") == $'has-snapshot=false\nhas-snapshot=true' ]]
+      [[ $(<"$GITHUB_STEP_SUMMARY") == *"(budget $expected)"* ]]
+    done
+  done
 done
-
-# A fully warm ARM bundle may contain metadata but no files/ after download.
-arm_warm="$scratch/arm-warm"
-setup_case "$arm_warm"
-downloaded="$RUNNER_TEMP/arm-bundle-working-set"
-mkdir -p "$downloaded"
-printf '%s\0' "disk/cas/00/$key3" \
-  "repository/content_addressable/sha256/$key3/file" >"$downloaded/used"
-bash -euo pipefail "$arm_body"
-while IFS='=' read -r name value; do export "$name=$value"; done <"$GITHUB_ENV"
-[[ $BAZEL_ADDITIONAL_USED_MANIFEST == "$downloaded/used" ]]
-[[ -f $BAZEL_DISK_CACHE/live-base ]]
-export MODE=save
-bash -euo pipefail "$body"
-[[ $(<"$GITHUB_OUTPUT") == $'has-snapshot=false\nhas-snapshot=true' ]]
-[[ -f $BAZEL_DISK_CACHE/cas/00/$key3 ]]
-[[ -f $BAZEL_REPOSITORY_CACHE/content_addressable/sha256/$key3/id-used ]]
-[[ ! -e $BAZEL_DISK_CACHE/cas/00/$key4 ]]
-[[ ! -e $BAZEL_REPOSITORY_CACHE/content_addressable/sha256/$key4 ]]
-printf 'Bazel cache fan-in: artifact layouts, exact used sets, empty reruns, producer deltas, and ARM save passed\n'
+printf 'Bazel cache fan-in: x86 shards, bundle and lint; artifact layouts; exact used sets; producer deltas; and compressed budget caps passed\n'

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# The local x86_64 Linux full workspace diagnostic mirrors CI checks, stopping at the first failure:
-# portable lint and nix-vm checks, BUILD files in sync, the full workspace, then Gate 1 and both
-# Gate 2 addition shards launched through the same tools/e2e-gate.sh launcher as CI.
-# Architecture-specific release and cross builds are verified separately in CI.
+# The local x86_64 Linux diagnostic mirrors the PR gate, stopping at the first failure:
+# portable lint (including BUILD sync), nix-vm checks, the full workspace and bundle, then
+# Gate 1 and both Gate 2 addition shards through the same tools/e2e-gate.sh launcher as CI.
+# ARM, cross and macOS validation run separately on default-branch pushes and v* tags.
 # Usage: nix develop -c tools/gate.sh. BAZEL names the Bazel command (default: the devShell's `bazel`).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -10,7 +10,6 @@ tools/lint.sh
 bazel=${BAZEL:-bazel}
 # Disable inherited remote services without disabling the local disk cache.
 flags=(--compilation_mode=opt --remote_cache= --remote_executor=)
-"$bazel" run "${flags[@]}" //:gazelle.check
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 BAZEL="$bazel" tools/ci-targets.sh --query | tools/ci-targets.sh 1 1 >"$scratch/targets"

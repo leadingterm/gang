@@ -73,9 +73,9 @@ jobs:
             | jq -rs --arg sha "$SHA" --arg repo "$GH_REPO" 'if length == 0 or any(.[]; (.workflow_runs | type) != "array") or any(.[].workflow_runs[]; type != "object" or (.id | type) != "number" or (.created_at | type) != "string" or (.head_sha | type) != "string" or (.event | type) != "string" or (.head_branch | type) != "string" or (.head_repository.full_name | type) != "string") then error("invalid runs") else [.[].workflow_runs[] | select(.head_sha == $sha and .head_repository.full_name == $repo and .event == "push" and .head_branch == "main")] | sort_by(.created_at) | reverse | .[].id end')"
           run_id=""
           for candidate in $runs; do
-            required="$(gh api --paginate "repos/$GH_REPO/actions/runs/$candidate/jobs?filter=latest&per_page=100" \
-              | jq -s 'if length == 0 or any(.[]; (.jobs | type) != "array") or any(.[].jobs[]; type != "object" or (.name | type) != "string" or ((.conclusion | type) != "string" and .conclusion != null)) then error("invalid jobs") else [.[].jobs[] | select(.name == "required")] end')"
-            if ! jq -e 'length == 1 and .[0].conclusion == "success"' <<< "$required" >/dev/null; then
+            gates="$(gh api --paginate "repos/$GH_REPO/actions/runs/$candidate/jobs?filter=latest&per_page=100" \
+              | jq -s 'if length == 0 or any(.[]; (.jobs | type) != "array") or any(.[].jobs[]; type != "object" or (.name | type) != "string" or ((.conclusion | type) != "string" and .conclusion != null)) then error("invalid jobs") else [.[].jobs[] | select(.name == "required" or .name == "release-validation")] end')"
+            if ! jq -e 'length == 2 and ([.[] | select(.name == "required" and .conclusion == "success")] | length == 1) and ([.[] | select(.name == "release-validation" and .conclusion == "success")] | length == 1)' <<< "$gates" >/dev/null; then
               continue
             fi
             artifacts="$(gh api --paginate "repos/$GH_REPO/actions/runs/$candidate/artifacts?per_page=100" \
@@ -86,7 +86,7 @@ jobs:
             fi
           done
           if [[ -z "$run_id" ]]; then
-            echo "::error::no main push CI run on exact commit $SHA has a successful latest required job and both required unexpired Linux artifacts" >&2
+            echo "::error::no main push CI run on exact commit $SHA has successful latest required and release-validation jobs and both required unexpired Linux artifacts" >&2
             exit 1
           fi
           echo "run-id=$run_id" >> "$GITHUB_OUTPUT"

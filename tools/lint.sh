@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# The canonical CI lint aggregate covers lint-arm64 (--portable) and the separate nix-vm job (--nix-vm).
-# Portable checks cover OpenTofu tests, formatting, shell scripts, workflows, flake evaluation, and macOS Clippy.
-# The VM checks require x86_64 Linux/KVM. Stops at the first failure.
+# The x86_64 PR gate runs portable lint and a separate nix-vm job.
+# Rustfmt and Clippy for every x86 Rust target, tests included, run in the full test shards.
+# Portable lint checks BUILD sync, infra, scripts, workflows and flake evaluation; no Darwin compilation.
+# With no arguments, run portable lint plus VM checks (x86_64 Linux/KVM). Stop at the first failure.
 # Usage: nix develop -c tools/lint.sh [--portable|--nix-vm]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 portable() {
+  "${BAZEL:-bazel}" run -c opt --remote_executor= --remote_cache= //:gazelle.check
   tools/check-required-jobs_test.sh
   tools/check-opentofu-tests.sh
   tools/ci-changes_test.sh
@@ -27,7 +29,6 @@ portable() {
     actionlint
   )
   nix flake check --no-build --all-systems
-  nix run .#darwin-check
 }
 
 nix_vm() {
