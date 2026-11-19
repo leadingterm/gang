@@ -131,6 +131,37 @@ end = "19:00"
 time_zone = "Europe/Paris"
 ```
 
+## Action capabilities
+
+Actions have no network grant by default. Unknown platform properties (except the harmless `supports-workers` and `gang_action_environment` properties), network requests without an eligible fleet grant, and requests exceeding action ceilings are rejected at admission. To grant public egress, extend an existing `bwrap` fleet in `gang.toml`:
+
+```toml
+[fleets.actions]
+grants = ["network"]
+
+[fleets.actions.resources]
+cpu_count = 4
+memory = "8GiB"
+disk = "20GiB"
+
+[execution.egress]
+protected_networks = ["10.20.0.0/16", "203.0.113.10/32"]
+dns_servers = ["1.1.1.1"]
+setup_timeout = "10s"
+
+[sandbox.bwrap.egress]
+```
+
+The resource ceilings are optional per-action request ceilings, not total worker capacity. Replace the example protected networks with the complete operator-specific private, controller, public load-balancer and worker address spaces, including IPv6. Both `protected_networks` and `dns_servers` must be nonempty; DNS servers must be public and outside protected networks. Actions use only those resolvers, not host DNS. `setup_timeout` bounds network setup and defaults to `10s`. A network grant requires an enforcing `bwrap` sandbox; `noop` cannot grant it. Request network explicitly on the relevant Bazel rule or execution platform:
+
+```starlark
+exec_properties = {"ISA": "x86-64", "network": "requested"}
+```
+
+Use the ISA of your selected execution platform. Bazel may not apply the `gang bazelrc` default ISA when explicit execution properties are present, so preserve it in the selected platform or the properties above.
+
+The `requires-network` tag alone does not transmit that remote request. See the [specification](docs/SPECIFICATION.md#34-sandboxes-gang-noop-gang-bwrap) for the complete policy, resolver and sandbox contract.
+
 ## Troubleshooting
 
 A build fails with `Action ... is missing from CAS`, or uploads go to a cache other than Gang's. Run `gang doctor` in the workspace, after `gang login`. It names the file and section that set each flag it finds wrong.
