@@ -149,7 +149,9 @@ impl AdditionalBuild {
         run: &Run,
         stop: oneshot::Receiver<String>,
     ) -> Result<BuildOutcome> {
-        let result = self.driver.build_until(&self.remote, probes, Some(run), stop);
+        let result = self
+            .driver
+            .build_until(&self.remote, probes, Some(run), stop);
         // A failed or cancelled build can leave its server wedged.
         if result.is_ok() {
             self.driver.shutdown(&self.remote);

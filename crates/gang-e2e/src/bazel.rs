@@ -351,8 +351,8 @@ mod tests {
 
     #[test]
     fn preparation_starts_only_the_server_in_the_selected_output_root() {
-        let driver = bazel(PathBuf::from("/output"))
-            .with_output_user_root(PathBuf::from("/demand-output"));
+        let driver =
+            bazel(PathBuf::from("/output")).with_output_user_root(PathBuf::from("/demand-output"));
         let remote = Remote::Plain {
             bazelrc: PathBuf::from("/plain/rc"),
             home: PathBuf::from("/plain/home"),
