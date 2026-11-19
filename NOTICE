@@ -9,8 +9,9 @@ The `gang` binary embeds NativeLink (https://github.com/TraceMachina/nativelink)
 Copyright 2025 Trace Machina, Inc., licensed under the Functional Source License,
 Version 1.1, Apache 2.0 Future License (FSL-1.1-ALv2). Gang links the NativeLink
 crates nativelink-config, nativelink-scheduler, nativelink-store, nativelink-service,
-nativelink-worker, nativelink-util, nativelink-error, and nativelink-proto at
-tag v1.8.3. The license text is at
+nativelink-worker, nativelink-util, nativelink-error, and nativelink-proto from
+the fork https://github.com/leadingterm/nativelink (branch gang: upstream tag
+v1.8.3 plus fixes). The license text is at
 https://github.com/TraceMachina/nativelink/blob/v1.8.3/LICENSE.
 
 The dashboard bundle (`ui/`) includes Preact and @preact/signals

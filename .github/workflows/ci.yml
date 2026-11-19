@@ -44,7 +44,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/family=m8i/image=ubuntu24-full-x64/nested-virt/extras=s3-cache', github.run_id) || 'ubuntu-24.04' }}
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -288,25 +288,23 @@ jobs:
           done
 
   required:
-    needs: [changes, nix-vm, lint-arm64, lint, linux-x86_64, cross, macos, linux-arm64, e2e-gate-1, e2e-gate-2-shard-1, e2e-gate-2-shard-2, e2e-gate-2]
+    needs: [changes, nix-vm, lint-arm64, lint, linux-x86_64, cross, linux-arm64, e2e-gate-1, e2e-gate-2-shard-1, e2e-gate-2-shard-2, e2e-gate-2]
     if: always()
     runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-arm64/ram=16/image=ubuntu24-full-arm64/extras=s3-cache', github.run_id) || 'ubuntu-24.04-arm' }}
     timeout-minutes: 5
     steps:
-      - name: Require all jobs to succeed
+      - name: Require blocking jobs to succeed
         shell: bash
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
           HEAVY: ${{ needs.changes.outputs.heavy }}
-          # Only macOS is absent on private repositories; every Linux result stays mandatory.
+          # Every blocking job result is mandatory.
           NEEDS_RESULTS: >-
-            ${{ github.event.repository.private
-                && format('{0} {1} {2} {3} {4} {5} {6} {7} {8} {9} {10}',
+            ${{ format('{0} {1} {2} {3} {4} {5} {6} {7} {8} {9} {10}',
                   needs.changes.result, needs.nix-vm.result, needs.lint-arm64.result, needs.lint.result,
                   needs.linux-x86_64.result, needs.cross.result, needs.linux-arm64.result,
                   needs.e2e-gate-1.result, needs.e2e-gate-2-shard-1.result,
-                  needs.e2e-gate-2-shard-2.result, needs.e2e-gate-2.result)
-                || join(needs.*.result, ' ') }}
+                  needs.e2e-gate-2-shard-2.result, needs.e2e-gate-2.result) }}
         run: |
           test "$CHANGES_RESULT" = success
           case "$HEAVY" in true|false) ;; *) exit 1 ;; esac

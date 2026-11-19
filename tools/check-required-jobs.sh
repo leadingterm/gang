@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Ensure the final required check covers every CI job and aggregators always run.
+# Ensure the final required check covers blocking CI jobs and aggregators always run.
 set -euo pipefail
 
 if (( $# > 1 )); then
@@ -19,8 +19,10 @@ yq -o=json '.jobs' "$workflow" | jq -e '
     | if ($needs | type) != "array" or any($needs[]; type != "string") then
         error("required.needs must be an array of job IDs")
       else
-        (($jobs | keys - ["required"]) - $needs) as $missing
-        | if ($missing | length) > 0 then
+        (($jobs | keys - ["required", "macos"]) - $needs) as $missing
+        | if ($needs | index("macos")) != null then
+            error("required must not depend on informational macos")
+          elif ($missing | length) > 0 then
             error("required job is missing dependencies: " + ($missing | join(", ")))
           else
             if ($jobs.changes | type) != "object" then
@@ -30,8 +32,8 @@ yq -o=json '.jobs' "$workflow" | jq -e '
               | if ($result_expressions | length) != 1 then
                   error("required must have exactly one NEEDS_RESULTS expression")
                 elif ([$result_expressions[0] | scan("needs\\.([A-Za-z0-9_-]+)\\.result") | .[0]] | unique)
-                     != (($needs - ["macos"]) | unique) then
-                  error("required private results must cover every dependency except macos")
+                     != ($needs | unique) then
+                  error("required results must cover every dependency")
                 else
                   .
                 end

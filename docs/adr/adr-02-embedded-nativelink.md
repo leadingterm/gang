@@ -7,7 +7,7 @@ Status: Accepted
 - Running it as a subprocess makes Gang a supervisor and puts TLS and revocation inside NativeLink, where changing certificate material needs a restart. Gang owns identity, so the controller must not own transport security.
 
 ## Decision
-- **Linked as libraries.** The NativeLink crates are Cargo git dependencies pinned to tag `v1.8.3`, linked into the `gang` binary. `gang-nativelink` reimplements only the glue of upstream `src/bin/nativelink.rs`. There is no process, config file, admin HTTP or loopback listener.
+- **Linked as libraries.** The NativeLink crates are Cargo git dependencies pinned to a revision of the carried fork, upstream tag `v1.8.3` plus commits listed in the specification (section 3.2), linked into the `gang` binary. `gang-nativelink` reimplements only the glue of upstream `src/bin/nativelink.rs`. There is no process, config file, admin HTTP or loopback listener.
 - **Typed configuration in memory.** Stores, scheduler and services are built from typed `nativelink-config` values deserialized in memory, so NativeLink's defaults apply.
 - **Direct calls.** `SchedulerPort` reads and changes scheduler state by function call, not by HTTP polling.
 - **The controller listens for nothing.** `run_controller` serves gRPC on connections `gang-server` has already accepted through `gang-tls` (ADR-03). Per-request authentication reaches it as a request gate (ADR-05). It holds no TLS, revocation or listener addresses.

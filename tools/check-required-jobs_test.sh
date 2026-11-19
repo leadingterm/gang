@@ -30,10 +30,16 @@ expect() {
   fi
 }
 
+jobs=$(yq -o=json '.jobs' "$workflow")
+expect success 'macos is informational' jq -e '(.macos | type) == "object" and (.required.needs | index("macos") == null)' <<<"$jobs"
+
 expect success 'current workflow coverage' "$guard" "$workflow"
 cp "$workflow" "$fixture"
 yq -i 'del(.jobs.required.needs[] | select(. == "lint"))' "$fixture"
 expect failure 'removed dependency' "$guard" "$fixture"
+cp "$workflow" "$fixture"
+yq -i '.jobs.required.needs += ["macos"] | (.jobs.required.steps[] | select(.env.NEEDS_RESULTS != null) | .env.NEEDS_RESULTS) |= sub("needs[.]lint[.]result", "needs.lint.result, needs.macos.result")' "$fixture"
+expect failure 'macos cannot be a required dependency' "$guard" "$fixture"
 cp "$workflow" "$fixture"
 yq -i '.jobs.guard_fixture."runs-on" = "ubuntu-latest" | .jobs.guard_fixture.steps = [{"run": "true"}]' "$fixture"
 expect failure 'new job without dependency' "$guard" "$fixture"
@@ -52,7 +58,7 @@ for dependency in changes e2e-gate-2-shard-1 e2e-gate-2-shard-2; do
 done
 cp "$workflow" "$fixture"
 yq -i '(.jobs.required.steps[] | select(.env.NEEDS_RESULTS != null) | .env.NEEDS_RESULTS) |= sub("needs[.]lint-arm64[.]result", "success")' "$fixture"
-expect failure 'private result omits a dependency' "$guard" "$fixture"
+expect failure 'required result omits a dependency' "$guard" "$fixture"
 cp "$workflow" "$fixture"
 yq -i 'del(.jobs.required)' "$fixture"
 expect failure 'missing required job' "$guard" "$fixture"
@@ -71,8 +77,6 @@ for job in lint e2e-gate-2 required; do
   job="$job" yq -i '.jobs[strenv(job)].if = "success()"' "$fixture"
   expect failure "conditional $job aggregator" "$guard" "$fixture"
 done
-
-jobs=$(yq -o=json '.jobs' "$workflow")
 
 # Execute the actual workflow body with Nix flake tools to test runner behavior.
 

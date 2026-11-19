@@ -10,6 +10,7 @@ portable() {
   tools/check-opentofu-tests.sh
   tools/ci-changes_test.sh
   tools/release-notes_test.sh
+  tools/release-ci_test.sh
   alejandra --check .
   shellcheck infra/scripts/*.sh tools/*.sh
   # actionlint requires a .git entry beside its configuration, workflows, and local actions.

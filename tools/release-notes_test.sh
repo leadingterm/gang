@@ -20,7 +20,7 @@ gh() {
   fi
   [[ $1 == release && $2 == create && $3 == "$TAG" ]] || return 1
   shift 3
-  local notes='' generated=false prerelease=false verified=false
+  local notes='' generated=false prerelease=false verified=false darwin=0 linux_x86=0 linux_arm=0 sums=0 expected_notes
   while (( $# )); do
     case "$1" in
       --notes) notes=$2; shift 2 ;;
@@ -28,26 +28,48 @@ gh() {
       --generate-notes) generated=true; shift ;;
       --prerelease) prerelease=true; shift ;;
       --verify-tag) verified=true; shift ;;
-      gang-* | SHA256SUMS) shift ;;
+      gang-aarch64-apple-darwin) ((darwin += 1)); shift ;;
+      gang-x86_64-unknown-linux-musl) ((linux_x86 += 1)); shift ;;
+      gang-aarch64-unknown-linux-musl) ((linux_arm += 1)); shift ;;
+      SHA256SUMS) ((sums += 1)); shift ;;
       *) return 1 ;;
     esac
   done
-  [[ $notes == "$COMMIT_MESSAGE"$'\n\n'"Binaries built and tested by CI run $RUN_URL. Public AMIs of each architecture in every image region: gang-amis.json." ]]
-  [[ $generated == true && $verified == true && $prerelease == "$EXPECTED_PRERELEASE" ]]
+  expected_notes="$COMMIT_MESSAGE"$'\n\n'"Binaries built and tested by CI run $RUN_URL. Public AMIs of each architecture in every image region: gang-amis.json."
+  if [[ $DARWIN == false ]]; then
+    expected_notes+=$'\n\n'"The macOS binary is not included in this release."
+  fi
+  [[ $notes == "$expected_notes" ]] || return 1
+  [[ $generated == true && $verified == true && $prerelease == "$EXPECTED_PRERELEASE" ]] || return 1
+  [[ $linux_x86 == 1 && $linux_arm == 1 && $sums == 1 ]] || return 1
+  if [[ $DARWIN == true ]]; then [[ $darwin == 1 ]] || return 1
+  else [[ $darwin == 0 ]] || return 1; fi
   printf 'published\n' >"$capture"
 }
 export -f gh
+cases=0
 for TAG in v1.2.3 v1.2.3-rc.1; do
   export TAG EXPECTED_PRERELEASE=false
   if [[ $TAG == *-* ]]; then EXPECTED_PRERELEASE=true; fi
-  bash --noprofile --norc -euo pipefail "$body"
-  [[ -f $capture ]]
-  rm "$capture"
+  for DARWIN in true false; do
+    export DARWIN
+    dist="$scratch/$TAG-$DARWIN/dist"
+    mkdir -p "$dist"
+    : >"$dist/gang-x86_64-unknown-linux-musl"
+    : >"$dist/gang-aarch64-unknown-linux-musl"
+    : >"$dist/SHA256SUMS"
+    if [[ $DARWIN == true ]]; then : >"$dist/gang-aarch64-apple-darwin"; fi
+    (cd "$dist" && bash --noprofile --norc -euo pipefail "$body")
+    [[ -f $capture ]]
+    rm "$capture"
+    ((cases += 1))
+  done
 done
 export API_FAIL=true
-if bash --noprofile --norc -euo pipefail "$body"; then
+if (cd "$dist" && bash --noprofile --norc -euo pipefail "$body"); then
   echo 'commit lookup failure must stop publication' >&2
   exit 1
 fi
 [[ ! -e $capture ]]
-printf '3 cases, 0 failures\n'
+((cases += 1))
+printf '%d cases, 0 failures\n' "$cases"

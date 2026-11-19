@@ -1,5 +1,5 @@
 {
-  "checksum": "6b181ca16ebb654823e0ffec838da4f71e684d7532ed6097f7681ae8e9c060fa",
+  "checksum": "4df3c699400c752b95dcf52d9b8ca075f2041324a9338dfcce42655b3eefbf79",
   "crates": {
     "adler2 2.0.1": {
       "name": "adler2",
@@ -23360,9 +23360,9 @@
       "package_url": null,
       "repository": {
         "Git": {
-          "remote": "https://github.com/TraceMachina/nativelink",
+          "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+            "Rev": "5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
           },
           "strip_prefix": "nativelink-config"
         }
@@ -23440,9 +23440,9 @@
       "package_url": null,
       "repository": {
         "Git": {
-          "remote": "https://github.com/TraceMachina/nativelink",
+          "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+            "Rev": "5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
           },
           "strip_prefix": "nativelink-error"
         }
@@ -23552,9 +23552,9 @@
       "package_url": null,
       "repository": {
         "Git": {
-          "remote": "https://github.com/TraceMachina/nativelink",
+          "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+            "Rev": "5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
           },
           "strip_prefix": "nativelink-metric"
         }
@@ -23621,9 +23621,9 @@
       "package_url": null,
       "repository": {
         "Git": {
-          "remote": "https://github.com/TraceMachina/nativelink",
+          "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+            "Rev": "5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
           },
           "strip_prefix": "nativelink-metric/nativelink-metric-macro-derive"
         }
@@ -23677,9 +23677,9 @@
       "package_url": null,
       "repository": {
         "Git": {
-          "remote": "https://github.com/TraceMachina/nativelink",
+          "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+            "Rev": "5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
           },
           "strip_prefix": "nativelink-proto"
         }
@@ -23741,9 +23741,9 @@
       "package_url": null,
       "repository": {
         "Git": {
-          "remote": "https://github.com/TraceMachina/nativelink",
+          "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+            "Rev": "5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
           },
           "strip_prefix": "nativelink-redis-tester"
         }
@@ -23813,9 +23813,9 @@
       "package_url": null,
       "repository": {
         "Git": {
-          "remote": "https://github.com/TraceMachina/nativelink",
+          "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+            "Rev": "5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
           },
           "strip_prefix": "nativelink-scheduler"
         }
@@ -23970,9 +23970,9 @@
       "package_url": null,
       "repository": {
         "Git": {
-          "remote": "https://github.com/TraceMachina/nativelink",
+          "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+            "Rev": "5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
           },
           "strip_prefix": "nativelink-service"
         }
@@ -24126,9 +24126,9 @@
       "package_url": null,
       "repository": {
         "Git": {
-          "remote": "https://github.com/TraceMachina/nativelink",
+          "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+            "Rev": "5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
           },
           "strip_prefix": "nativelink-store"
         }
@@ -24448,9 +24448,9 @@
       "package_url": null,
       "repository": {
         "Git": {
-          "remote": "https://github.com/TraceMachina/nativelink",
+          "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+            "Rev": "5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
           },
           "strip_prefix": "nativelink-util"
         }
@@ -24689,9 +24689,9 @@
       "package_url": null,
       "repository": {
         "Git": {
-          "remote": "https://github.com/TraceMachina/nativelink",
+          "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+            "Rev": "5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
           },
           "strip_prefix": "nativelink-worker"
         }
