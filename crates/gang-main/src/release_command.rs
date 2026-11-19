@@ -10,20 +10,31 @@ use crate::cli::{AmiPublicationArgs, ReleaseCommand};
 use crate::errors::{MainError, Result};
 use crate::output::Output;
 
+enum ReleaseOutput {
+    CatalogSteps,
+    ReleaseSteps,
+    Manifest,
+}
+
 /// Runs one `gang release` command.
 pub(crate) fn run(command: ReleaseCommand, mut input: impl Read, out: &Output) -> Result<ExitCode> {
-    let (args, release, manifest) = match command {
+    let (args, release, output) = match command {
         ReleaseCommand::AmiSteps(args) => (
             args.publication,
             args.release
                 .map(|tag| release(tag, args.image))
                 .transpose()?,
-            false,
+            ReleaseOutput::CatalogSteps,
+        ),
+        ReleaseCommand::AmiReleaseSteps(args) => (
+            args.publication,
+            Some(release(args.release, args.image)?),
+            ReleaseOutput::ReleaseSteps,
         ),
         ReleaseCommand::AmiManifest(args) => (
             args.publication,
             Some(release(args.release, args.image)?),
-            true,
+            ReleaseOutput::Manifest,
         ),
     };
     let mut text = String::new();
@@ -31,12 +42,20 @@ pub(crate) fn run(command: ReleaseCommand, mut input: impl Read, out: &Output) -
     let regions: Regions = serde_json::from_str(&text).map_err(MainError::ReleaseJson)?;
     let AmiPublicationArgs { home_region, now } = args;
     let publication = Publication::new(home_region, regions, release, now)?;
-    if manifest {
-        let manifest = publication.manifest()?;
-        out.data(serde_json::to_string_pretty(&manifest).map_err(MainError::ReleaseJson)?)?;
-    } else {
-        for step in publication.steps()? {
-            out.data(step.to_string())?;
+    match output {
+        ReleaseOutput::Manifest => {
+            let manifest = publication.manifest()?;
+            out.data(serde_json::to_string_pretty(&manifest).map_err(MainError::ReleaseJson)?)?;
+        }
+        ReleaseOutput::CatalogSteps => {
+            for step in publication.steps()? {
+                out.data(step.to_string())?;
+            }
+        }
+        ReleaseOutput::ReleaseSteps => {
+            for step in publication.release_steps()? {
+                out.data(step.to_string())?;
+            }
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -154,23 +173,95 @@ mod tests {
     }
 
     #[test]
-    fn release_requires_both_distinct_images() {
-        let sha = "x86_64=0000000000000000000000000000000000000000000000000000000000000000";
-        for images in [vec!["--image", sha], vec!["--image", sha, "--image", sha]] {
-            let mut args = vec![
+    fn release_steps_exclude_catalog_backfill_and_lifecycle() {
+        let x = "0000000000000000000000000000000000000000000000000000000000000000";
+        let a = "1111111111111111111111111111111111111111111111111111111111111111";
+        let old = "2222222222222222222222222222222222222222222222222222222222222222";
+        let image = |id: &str, sha: &str, tag: &str, state: &str| {
+            serde_json::json!({
+                "ImageId": id,
+                "Name": format!("gang-x86_64-{}", &sha[..16]),
+                "Architecture": "x86_64",
+                "State": state,
+                "Public": true,
+                "CreationDate": if tag == "v1" { "2024-01-01T00:00:00Z" } else { "2025-01-01T00:00:00Z" },
+                "DeregistrationProtection": "enabled-with-cooldown",
+                "Tags": [
+                    {"Key": "ec2:SharedTag/GangRelease", "Value": tag},
+                    {"Key": "ec2:SharedTag/ImageSha256", "Value": sha}
+                ]
+            })
+        };
+        let regions = serde_json::json!({
+            "us-east-1": {"quota": 10, "images": {"Images": [
+                image("ami-01", x, "v2", "available"),
+                image("ami-03", old, "v1", "available")
+            ]}, "snapshots": {"Snapshots": []}},
+            "us-west-1": {"quota": 10, "images": {"Images": []}, "snapshots": {"Snapshots": []}},
+            "us-west-2": {"quota": 10, "images": {"Images": [
+                image("ami-02", x, "v2", "pending")
+            ]}, "snapshots": {"Snapshots": []}}
+        })
+        .to_string();
+        let x_arg = format!("x86_64={x}");
+        let a_arg = format!("aarch64={a}");
+        let args = [
+            "--home-region",
+            "us-east-1",
+            "--now",
+            "1767312000",
+            "--release",
+            "v2",
+            "--image",
+            &x_arg,
+            "--image",
+            &a_arg,
+        ];
+        let mut release_args = vec!["ami-release-steps"];
+        release_args.extend(args);
+        let (code, stdout, stderr) = gang_release(&release_args, &regions);
+        assert_eq!(code, ExitCode::SUCCESS, "{stderr}");
+        assert!(stdout.contains("upload\taarch64\tgang-aarch64-1111111111111111\t"));
+        assert!(stdout.contains("copy\tus-west-1\tami-01\t"));
+        assert!(stdout.contains("wait\tus-west-2\tami-02"));
+        assert!(!stdout.contains("ami-03"));
+        assert!(!stdout.contains("deprecate\t"));
+
+        let (code, stdout, stderr) = gang_release(
+            &[
                 "ami-steps",
                 "--home-region",
                 "us-east-1",
                 "--now",
-                "0",
-                "--release",
-                "v1",
-            ];
-            args.extend(images);
-            let (code, stdout, stderr) = gang_release(&args, "{}");
-            assert_ne!(code, ExitCode::SUCCESS);
-            assert!(stdout.is_empty());
-            assert!(stderr.contains("exactly one image for each architecture"));
+                "1767312000",
+            ],
+            &regions,
+        );
+        assert_eq!(code, ExitCode::SUCCESS, "{stderr}");
+        assert!(stdout.contains("copy\tus-west-1\tami-03\t"));
+    }
+
+    #[test]
+    fn release_requires_both_distinct_images() {
+        let sha = "x86_64=0000000000000000000000000000000000000000000000000000000000000000";
+        for command in ["ami-steps", "ami-release-steps", "ami-manifest"] {
+            for images in [vec!["--image", sha], vec!["--image", sha, "--image", sha]] {
+                let mut args = vec![
+                    command,
+                    "--home-region",
+                    "us-east-1",
+                    "--now",
+                    "0",
+                    "--release",
+                    "v1",
+                ];
+                args.extend(images);
+                let (code, stdout, stderr) = gang_release(&args, "{}");
+                assert_ne!(code, ExitCode::SUCCESS);
+                assert!(stdout.is_empty());
+                assert!(stderr.contains("exactly one image for each architecture"));
+                assert!(stderr.contains(&format!("gang release {command}")));
+            }
         }
     }
 }

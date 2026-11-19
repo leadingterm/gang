@@ -5,6 +5,8 @@
 ### Changed
 
 - Partition the Linux x86-64 and end-to-end CI suites, start ARM end-to-end checks after the bundle build, and share bounded native GitHub cache snapshots.
+- Publish primary-region AMIs before independently completing the regional catalog and retirement.
+- Require successful main push CI for the exact release commit; never reuse PR artifacts or caches.
 
 ## 0.3.1
 

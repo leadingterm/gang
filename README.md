@@ -93,7 +93,7 @@ Call `.github/workflows/deploy.yml` as its header comment shows, pinned to the s
 
 The apply job uses the `production` GitHub environment by default. Set `apply_environment` to a different name to use that environment, or explicitly to `''` to run without one. Without an environment there are no environment protection rules or environment secrets; the apply role's OIDC trust must instead match the `main` branch subject. See the deployment contract for the trust policy.
 
-Every `v*` tag has a GitHub release with `gang-x86_64-unknown-linux-musl`, `gang-aarch64-unknown-linux-musl`, `gang-aarch64-apple-darwin`, disk images for x86_64 and aarch64, and `SHA256SUMS`. Public AMIs of each architecture in every image region are listed in `gang-amis.json` (specification section 7.2). Check downloaded assets with `sha256sum --check --ignore-missing SHA256SUMS`, and pin the binary checksum where you deploy it.
+Every `v*` tag has a GitHub release with Linux binaries, disk images for x86_64 and aarch64, and `SHA256SUMS`; the macOS binary is included when available. Release dry runs and tags require successful main push CI for the exact commit, never PR artifacts or caches. `gang-amis.json` lists the primary publication regions only; remaining public AMI copies and lifecycle work run independently (specification section 7.2). Deployment uses verified checksums and a provider-region AMI lookup, not the manifest. Check downloaded assets with `sha256sum --check --ignore-missing SHA256SUMS`, and pin the binary checksum where you deploy it.
 
 See section 8 of [`docs/SPECIFICATION.md`](docs/SPECIFICATION.md) for the deployment contract, and the example root [`infra/terraform/environments/example`](infra/terraform/environments/example).
 
