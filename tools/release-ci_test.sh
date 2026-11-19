@@ -28,11 +28,14 @@ gh() {
     "repos/$GH_REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=100")
       if [[ $CASE == api_failure ]]; then return 23; fi
       if [[ $CASE == direct* ]]; then
-        local event=push direct_sha=$SHA branch=main
+        local event=push direct_sha=$SHA branch=main head_repo=",\"head_repository\":{\"full_name\":\"$GH_REPO\"}"
         if [[ $CASE == direct_dispatch ]]; then event=workflow_dispatch; fi
         if [[ $CASE == direct_wrong_sha ]]; then direct_sha=$OTHER_SHA; fi
         if [[ $CASE == direct_wrong_branch ]]; then branch=other; fi
-        printf '{"workflow_runs":[{"id":101,"event":"%s","head_branch":"%s","head_sha":"%s","status":"in_progress","conclusion":null,"created_at":"2026-01-01"}]}\n' "$event" "$branch" "$direct_sha"
+        if [[ $CASE == direct_fork_repo ]]; then head_repo=',"head_repository":{"full_name":"fork/gang"}'; fi
+        if [[ $CASE == direct_missing_repo ]]; then head_repo=''; fi
+        if [[ $CASE == direct_null_repo ]]; then head_repo=',"head_repository":null'; fi
+        printf '{"workflow_runs":[{"id":101,"event":"%s","head_branch":"%s","head_sha":"%s","status":"in_progress","conclusion":null,"created_at":"2026-01-01"%s}]}\n' "$event" "$branch" "$direct_sha" "$head_repo"
       else
         printf '{"workflow_runs":[]}\n'
       fi ;;
@@ -42,19 +45,25 @@ gh() {
       if [[ $CASE == root_commit ]]; then parents=''; fi
       printf '{"commit":{"tree":{"sha":"%s"}},"parents":[%s]}\n' "$TREE_SHA" "$parents" ;;
     "repos/$GH_REPO/commits/$SHA/pulls?per_page=100")
-      if [[ $CASE == no_pr || $CASE == direct_wrong_sha || $CASE == direct_wrong_branch ]]; then printf '[]\n'; return; fi
-      local base=$BASE_SHA
+      if [[ $CASE == no_pr || $CASE == direct* ]]; then printf '[]\n'; return; fi
+      local base=$BASE_SHA head_repo=",\"repo\":{\"full_name\":\"$GH_REPO\"}"
       if [[ $CASE == wrong_base ]]; then base=$OTHER_SHA; fi
-      printf '[{"base":{"sha":"%s"},"head":{"sha":"%s"}}]\n' "$base" "$HEAD_SHA" ;;
+      if [[ $CASE == fork_associated_pr ]]; then head_repo=',"repo":{"full_name":"fork/gang"}'; fi
+      if [[ $CASE == missing_associated_repo ]]; then head_repo=''; fi
+      if [[ $CASE == null_associated_repo ]]; then head_repo=',"repo":null'; fi
+      printf '[{"base":{"sha":"%s"},"head":{"sha":"%s"%s}}]\n' "$base" "$HEAD_SHA" "$head_repo" ;;
     "repos/$GH_REPO/commits/$HEAD_SHA")
       local tree=$TREE_SHA
       if [[ $CASE == wrong_tree ]]; then tree=$OTHER_SHA; fi
       printf '{"commit":{"tree":{"sha":"%s"}}}\n' "$tree" ;;
     "repos/$GH_REPO/actions/workflows/ci.yml/runs?head_sha=$HEAD_SHA&event=pull_request&per_page=100")
-      local pr_sha=$HEAD_SHA pr_event=pull_request
+      local pr_sha=$HEAD_SHA pr_event=pull_request head_repo=",\"head_repository\":{\"full_name\":\"$GH_REPO\"}"
       if [[ $CASE == wrong_pr_sha ]]; then pr_sha=$OTHER_SHA; fi
       if [[ $CASE == wrong_pr_event ]]; then pr_event=push; fi
-      printf '{"workflow_runs":[{"id":202,"event":"%s","head_sha":"%s","conclusion":"failure","created_at":"2026-01-01","pull_requests":[]}]}\n' "$pr_event" "$pr_sha" ;;
+      if [[ $CASE == fork_pr_repo ]]; then head_repo=',"head_repository":{"full_name":"fork/gang"}'; fi
+      if [[ $CASE == missing_pr_repo ]]; then head_repo=''; fi
+      if [[ $CASE == null_pr_repo ]]; then head_repo=',"head_repository":null'; fi
+      printf '{"workflow_runs":[{"id":202,"event":"%s","head_sha":"%s","conclusion":"failure","created_at":"2026-01-01","pull_requests":[]%s}]}\n' "$pr_event" "$pr_sha" "$head_repo" ;;
     "repos/$GH_REPO/actions/runs/101/jobs?filter=latest&per_page=100" | "repos/$GH_REPO/actions/runs/202/jobs?filter=latest&per_page=100")
       if [[ $CASE == jobs_api_failure ]]; then return 23; fi
       if [[ $CASE == invalid_jobs ]]; then printf '{"jobs":null}\n'; return; fi
@@ -81,7 +90,7 @@ gh() {
 }
 export -f gh
 cases=0
-for scenario in direct:101 direct_dispatch:101 squash:202 dispatch:202 no_darwin:202 expired_darwin:202 direct_wrong_sha:fail direct_wrong_branch:fail wrong_tree:fail wrong_base:fail wrong_pr_sha:fail wrong_pr_event:fail failed_pr:fail pending_required:fail missing_required:fail duplicate_required:fail jobs_api_failure:fail invalid_jobs:fail missing_artifact:fail expired_artifact:fail no_pr:fail merge_parent:fail root_commit:fail api_failure:fail; do
+for scenario in direct:101 direct_dispatch:101 squash:202 dispatch:202 no_darwin:202 expired_darwin:202 direct_wrong_sha:fail direct_wrong_branch:fail direct_fork_repo:fail direct_missing_repo:fail direct_null_repo:fail fork_associated_pr:fail missing_associated_repo:fail null_associated_repo:fail fork_pr_repo:fail missing_pr_repo:fail null_pr_repo:fail wrong_tree:fail wrong_base:fail wrong_pr_sha:fail wrong_pr_event:fail failed_pr:fail pending_required:fail missing_required:fail duplicate_required:fail jobs_api_failure:fail invalid_jobs:fail missing_artifact:fail expired_artifact:fail no_pr:fail merge_parent:fail root_commit:fail api_failure:fail; do
   export CASE=${scenario%:*} EVENT=push
   expected=${scenario#*:}
   if [[ $CASE == dispatch ]]; then EVENT=workflow_dispatch; fi

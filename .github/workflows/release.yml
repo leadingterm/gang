@@ -68,20 +68,20 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           runs="$(gh api --paginate "repos/$GH_REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=100" \
-            | jq -rs --arg sha "$SHA" 'if length == 0 or any(.[]; (.workflow_runs | type) != "array") then error("invalid runs") else [.[].workflow_runs[] | select(.head_sha == $sha and (.event == "push" or .event == "workflow_dispatch") and .head_branch == "main")] | sort_by(.created_at) | reverse | .[].id end')"
+            | jq -rs --arg sha "$SHA" --arg repo "$GH_REPO" 'if length == 0 or any(.[]; (.workflow_runs | type) != "array") then error("invalid runs") else [.[].workflow_runs[] | select(.head_sha == $sha and .head_repository.full_name == $repo and (.event == "push" or .event == "workflow_dispatch") and .head_branch == "main")] | sort_by(.created_at) | reverse | .[].id end')"
           commit="$(gh api "repos/$GH_REPO/commits/$SHA")"
           tree="$(jq -er '.commit.tree.sha | strings | select(length > 0)' <<< "$commit")"
           parent="$(jq -r 'if (.parents | type) != "array" then error("invalid parents") elif (.parents | length) == 1 then .parents[0].sha | if type == "string" and length > 0 then . else error("invalid parent") end else "" end' <<< "$commit")"
           if [[ -n "$parent" ]]; then
             heads="$(gh api --paginate "repos/$GH_REPO/commits/$SHA/pulls?per_page=100" \
-              | jq -rs --arg parent "$parent" 'if length == 0 or any(.[]; type != "array") then error("invalid pulls") else [.[][] | select(.base.sha == $parent) | .head.sha | strings | select(length > 0)] | unique | .[] end')"
+              | jq -rs --arg parent "$parent" --arg repo "$GH_REPO" 'if length == 0 or any(.[]; type != "array") then error("invalid pulls") else [.[][] | select(.base.sha == $parent and .head.repo.full_name == $repo) | .head.sha | strings | select(length > 0)] | unique | .[] end')"
             for head in $heads; do
               head_tree="$(gh api "repos/$GH_REPO/commits/$head" | jq -er '.commit.tree.sha | strings | select(length > 0)')"
               if [[ "$head_tree" != "$tree" ]]; then
                 continue
               fi
               pr_runs="$(gh api --paginate "repos/$GH_REPO/actions/workflows/ci.yml/runs?head_sha=$head&event=pull_request&per_page=100" \
-                | jq -rs --arg head "$head" 'if length == 0 or any(.[]; (.workflow_runs | type) != "array") then error("invalid runs") else [.[].workflow_runs[] | select(.head_sha == $head and .event == "pull_request")] | sort_by(.created_at) | reverse | .[].id end')"
+                | jq -rs --arg head "$head" --arg repo "$GH_REPO" 'if length == 0 or any(.[]; (.workflow_runs | type) != "array") then error("invalid runs") else [.[].workflow_runs[] | select(.head_sha == $head and .head_repository.full_name == $repo and .event == "pull_request")] | sort_by(.created_at) | reverse | .[].id end')"
               runs="$runs"$'\n'"$pr_runs"
             done
           fi

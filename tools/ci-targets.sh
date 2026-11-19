@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
-# Partition newline-delimited Bazel labels into deterministic, one-based shards.
+# Query CI roots or partition newline-delimited labels into one-based shards.
 set -euo pipefail
 export LC_ALL=C
 
+if (( $# == 1 )) && [[ $1 == --query ]]; then
+  query=$(cat <<'QUERY'
+let roots = //... except attr("tags", "(^|, |\[)manual(, |\]$)", //...) in tests($roots) union (kind(".* rule", $roots) except kind(".*_test rule", $roots) except kind("test_suite rule", $roots))
+QUERY
+  )
+  exec "${BAZEL:-bazel}" query --output=label "$query"
+fi
+
 if (( $# != 2 )) || [[ ! $1 =~ ^[0-9]+$ || ! $2 =~ ^[0-9]+$ ]]; then
-  echo "Usage: $0 INDEX COUNT (positive decimal integers, INDEX <= COUNT)" >&2
+  echo "Usage: $0 --query | INDEX COUNT (positive decimal integers, INDEX <= COUNT)" >&2
   exit 2
 fi
 

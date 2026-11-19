@@ -98,5 +98,72 @@ expect_failure 'workspace label without colon' "$scratch/invalid" 1 1
 printf '@repo//alpha\n' >"$scratch/invalid"
 expect_failure 'external label without colon' "$scratch/invalid" 1 1
 
+mkdir -p "$scratch/bin" "$scratch/runner"
+cat >"$scratch/bin/bazel" <<'WRAPPER'
+#!/usr/bin/env bash
+exec "$CI_QUERY_BAZEL" "$@"
+WRAPPER
+chmod +x "$scratch/bin/bazel"
+cases=$((cases + 1))
+# Real Bazel validates manual and suite wildcard semantics, not just workflow text.
+if ! (
+  cd "$script_dir/.." || exit 1
+  CI_QUERY_BAZEL=$(command -v "${BAZEL:-bazel}") || exit 1
+  export CI_QUERY_BAZEL
+  yq -er '.jobs.linux-x86_64-shards.steps[] | select(.name == "Select shard targets") | .run' \
+    .github/workflows/ci.yml >"$scratch/workflow-step" || exit 1
+  PATH="$scratch/bin:$PATH" SHARD=1 RUNNER_TEMP="$scratch/runner" \
+    bash -euo pipefail "$scratch/workflow-step" || exit 1
+  [[ -s "$scratch/runner/targets" ]]
+); then
+  echo 'FAIL: actual workflow selects nonempty shard targets' >&2
+  failures=$((failures + 1))
+fi
+
+mkdir -p "$scratch/fixture"
+cat >"$scratch/fixture/MODULE.bazel" <<'EOF'
+module(name = "ci_targets_fixture")
+EOF
+printf '%s\n' 'common --incompatible_autoload_externally=' >"$scratch/fixture/.bazelrc"
+cat >"$scratch/fixture/test_rule.bzl" <<'EOF'
+def _impl(ctx):
+    executable = ctx.actions.declare_file(ctx.label.name + ".sh")
+    ctx.actions.write(executable, "#!/bin/sh\nexit 0\n", is_executable = True)
+    return [DefaultInfo(executable = executable)]
+
+fixture_test = rule(implementation = _impl, test = True)
+EOF
+cat >"$scratch/fixture/BUILD.bazel" <<'EOF'
+load(":test_rule.bzl", "fixture_test")
+
+fixture_test(name = "normal_test")
+fixture_test(name = "manual_standalone", tags = ["manual"])
+fixture_test(name = "visible_suite_child", tags = ["manual"])
+fixture_test(name = "manual_suite_child", tags = ["manual"])
+test_suite(name = "visible_suite", tests = [":visible_suite_child"])
+test_suite(name = "manual_suite", tags = ["manual"], tests = [":manual_suite_child"])
+genrule(name = "build_only", outs = ["built.txt"], cmd = "touch $@")
+EOF
+printf '%s\n' '//:build_only' '//:normal_test' '//:visible_suite_child' >"$scratch/fixture-expected"
+cat >"$scratch/bin/fixture-bazel" <<'WRAPPER'
+#!/usr/bin/env bash
+exec "$CI_QUERY_BAZEL" --batch --output_base="$CI_FIXTURE_OUTPUT" --nosystem_rc --nohome_rc "$@"
+WRAPPER
+chmod +x "$scratch/bin/fixture-bazel"
+cases=$((cases + 1))
+if ! (
+  cd "$script_dir/.." || exit 1
+  CI_QUERY_BAZEL=$(command -v "${BAZEL:-bazel}") || exit 1
+  CI_FIXTURE_OUTPUT="$scratch/fixture-output"
+  export CI_QUERY_BAZEL CI_FIXTURE_OUTPUT
+  cd "$scratch/fixture" || exit 1
+  BAZEL="$scratch/bin/fixture-bazel" "$helper" --query >"$scratch/fixture-actual" || exit 1
+  sort "$scratch/fixture-actual" >"$scratch/fixture-sorted"
+  cmp -s "$scratch/fixture-expected" "$scratch/fixture-sorted"
+); then
+  echo 'FAIL: query selects visible tests and build targets without manual-only targets or suites' >&2
+  failures=$((failures + 1))
+fi
+
 printf '%d cases, %d failures\n' "$cases" "$failures"
 exit "$((failures > 0))"

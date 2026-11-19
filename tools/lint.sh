@@ -11,6 +11,7 @@ portable() {
   tools/ci-changes_test.sh
   tools/ci-targets_test.sh
   tools/ci-cache_test.sh
+  tools/ci-cache-policy_test.sh
   tools/release-notes_test.sh
   tools/release-ci_test.sh
   alejandra --check .
