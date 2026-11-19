@@ -188,7 +188,7 @@ CACHE_HIT=false PR_CACHE_HIT=true EVENT=pull_request
 check 'Bazel exact PR cache hit does not save' "$bazel" false
 check 'Cargo save policy is independent of Bazel PR cache hit' "$cargo" true
 
-export RESTORED_KEY= BASE_KEY= PR_KEY=
+export RESTORED_KEY='' BASE_KEY='' PR_KEY=''
 OS=macOS
 for EVENT in pull_request push workflow_dispatch; do
   check "Bazel macOS $EVENT does not restore a base cache" "$bazel_base" false
@@ -206,13 +206,13 @@ for EVENT in push workflow_dispatch; do
   check "Bazel Linux $EVENT restores a current cache" "$bazel_restore" true
 done
 for EVENT in pull_request push workflow_dispatch; do
-  RESTORED_KEY= BASE_KEY= PR_KEY=
+  RESTORED_KEY='' BASE_KEY='' PR_KEY=''
   check "Bazel Linux $EVENT restores legacy only after all current caches miss" "$bazel_legacy" true
   RESTORED_KEY=current-match
   check "Bazel Linux $EVENT current match skips legacy restore" "$bazel_legacy" false
-  RESTORED_KEY= BASE_KEY=base-match
+  RESTORED_KEY='' BASE_KEY=base-match
   check "Bazel Linux $EVENT base match skips legacy restore" "$bazel_legacy" false
-  BASE_KEY= PR_KEY=pr-match
+  BASE_KEY='' PR_KEY=pr-match
   check "Bazel Linux $EVENT PR match skips legacy restore" "$bazel_legacy" false
 done
 
