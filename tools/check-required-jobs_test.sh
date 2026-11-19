@@ -31,13 +31,13 @@ jobs=$(yq -o=json '.jobs' "$workflow")
 expect success 'current workflow coverage' "$guard" "$workflow"
 # Follow the real dependency graph, not just required.needs: optional architectures
 # must not sneak into the PR critical path through an intermediate dependency.
-expect success 'PR graph excludes optional architectures and cache fan-in' jq -e '
-  . as $jobs
-  | def ancestors($id): [$id] + [($jobs[$id].needs // [] | if type == "array" then .[] else . end) | ancestors(.)[]];
-  (ancestors("required") | unique) as $pr
-  | all(["linux-arm64", "linux-arm64-bundle", "linux-arm64-checks", "cross", "macos", "cache-x86_64", "release-validation"][];
-        . as $id | ($pr | index($id)) == null)
-' <<<"$jobs"
+expect success 'PR graph excludes optional architectures and cache fan-in' jq -e "
+  . as \$jobs
+  | def ancestors(\$id): [\$id] + [(\$jobs[\$id].needs // [] | if type == \"array\" then .[] else . end) | ancestors(.)[]];
+  (ancestors(\"required\") | unique) as \$pr
+  | all([\"linux-arm64\", \"linux-arm64-bundle\", \"linux-arm64-checks\", \"cross\", \"macos\", \"cache-x86_64\", \"release-validation\"][];
+        . as \$id | (\$pr | index(\$id)) == null)
+" <<<"$jobs"
 
 for job in required nix-vm lint linux-x86_64-shards linux-x86_64 linux-x86_64-bundle cache-x86_64 linux-arm64 linux-arm64-bundle linux-arm64-checks cross macos release-validation e2e-gate-1-shards e2e-gate-1 e2e-gate-2-shards e2e-gate-2; do
   while IFS= read -r dependency; do
@@ -100,17 +100,17 @@ done
 
 # Execute actual GitHub job conditions with synthetic event values. Only the
 # repository-owned expression is shell code; fixture values remain quoted data.
-condition_matches() {
-  local expr=$1 dependency
-  expr=${expr#'${{'}
+expect_condition() {
+  local expected=$1 description=$2 expr=$3 dependency actual=failure
+  expr=${expr#"\${{"}
   expr=${expr%'}}'}
   expr=${expr//"always()"/true}
-  expr=${expr//"startsWith(github.ref, 'refs/tags/v')"/'"$REF" == refs/tags/v*'}
-  expr=${expr//github.event_name/'"$EVENT"'}
-  expr=${expr//github.ref/'"$REF"'}
-  expr=${expr//'!github.event.repository.private'/'"$PRIVATE" != true'}
-  expr=${expr//github.event.repository.private/'"$PRIVATE" == true'}
-  expr=${expr//needs.changes.outputs.heavy/'"$HEAVY"'}
+  expr=${expr//"startsWith(github.ref, 'refs/tags/v')"/"\"\$REF\" == refs/tags/v*"}
+  expr=${expr//github.event_name/"\"\$EVENT\""}
+  expr=${expr//github.ref/"\"\$REF\""}
+  expr=${expr//'!github.event.repository.private'/"\"\$PRIVATE\" != true"}
+  expr=${expr//github.event.repository.private/"\"\$PRIVATE\" == true"}
+  expr=${expr//needs.changes.outputs.heavy/"\"\$HEAVY\""}
   while IFS= read -r dependency; do
     expr=${expr//needs.$dependency.result/'"success"'}
   done < <(jq -r 'keys[]' <<<"$jobs")
@@ -120,36 +120,37 @@ condition_matches() {
   fi
   expr=${expr//\(/ ( }
   expr=${expr//\)/ ) }
-  bash --noprofile --norc -c "[[ $expr ]]"
+  if bash --noprofile --norc -c "[[ $expr ]]"; then actual=success; fi
+  expect success "$description" test "$actual" = "$expected"
 }
 export HEAVY=true PRIVATE=false
 for job in linux-arm64-bundle linux-arm64-checks linux-arm64 cross macos release-validation; do
   condition=$(jq -er --arg job "$job" '.[$job].if' <<<"$jobs")
   export EVENT=pull_request REF=refs/pull/1/merge
-  expect failure "$job intentionally skips a PR" condition_matches "$condition"
+  expect_condition failure "$job intentionally skips a PR" "$condition"
   # A PR targeting main must not bypass the event guard either.
   REF=refs/heads/main
-  expect failure "$job rejects a PR even with a main ref" condition_matches "$condition"
+  expect_condition failure "$job rejects a PR even with a main ref" "$condition"
   EVENT=push
   for REF in refs/heads/main refs/heads/master refs/tags/v0.3.2; do
-    expect success "$job runs on push $REF" condition_matches "$condition"
+    expect_condition success "$job runs on push $REF" "$condition"
   done
   for REF in refs/heads/feature refs/tags/not-a-release; do
-    expect failure "$job skips push $REF" condition_matches "$condition"
+    expect_condition failure "$job skips push $REF" "$condition"
   done
   EVENT=workflow_dispatch REF=refs/heads/main
-  expect failure "$job does not run on dispatch" condition_matches "$condition"
+  expect_condition failure "$job does not run on dispatch" "$condition"
   EVENT=push REF=refs/heads/main HEAVY=false
   if [[ $job == linux-arm64 || $job == release-validation ]]; then
     expected=success
   else
     expected=failure
   fi
-  expect "$expected" "$job docs-only push preserves intentional skips" condition_matches "$condition"
+  expect_condition "$expected" "$job docs-only push preserves intentional skips" "$condition"
   HEAVY=true
   if [[ $job == macos ]]; then
     PRIVATE=true
-    expect failure 'private repositories intentionally skip macOS' condition_matches "$condition"
+    expect_condition failure 'private repositories intentionally skip macOS' "$condition"
     PRIVATE=false
   fi
 done
