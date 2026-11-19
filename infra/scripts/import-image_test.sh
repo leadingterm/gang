@@ -20,6 +20,7 @@ export PATH
 cat >"$fixtures/coldsnap" <<'COLDSNAP'
 #!/usr/bin/env bash
 set -euo pipefail
+printf 'called\n' >>"$CASE_DIR/coldsnap-attempts"
 if [[ $# -ne 9 || $1 != upload || $2 != --wait || $3 != --no-progress ||
   $4 != --omit-zero-blocks || $5 != --description || $6 != gang-test-import ||
   $7 != --tag || $8 != 'Key=ec2:SharedTag/GangImportImage,Value=gang-test-import' ]]; then
@@ -45,7 +46,34 @@ fail() {
 operation=$2
 shift 2
 case "$operation" in
+  describe-images)
+    [[ $# -eq 8 && $1 == --owners && $2 == self && $3 == --include-deprecated &&
+      $4 == --include-disabled && $5 == --filters &&
+      $6 == Name=name,Values=gang-test-import && $7 == --output && $8 == json ]] || fail 'describe-images arguments' "$@"
+    case "$CASE_MODE" in
+      adopt|adopt_pending|wrong_tag|wrong_sha|wrong_arch_tag|wrong_arch|wrong_boot|wrong_state|wrong_name|duplicate|duplicate_tag|missing_tag)
+        jq -cn --arg sha "$IMAGE_SHA" --arg mode "$CASE_MODE" '
+          {Images:[{ImageId:"ami-existing",Name:"gang-test-import",Architecture:"x86_64",
+            BootMode:"uefi",State:"available",Tags:[
+              {Key:"ec2:SharedTag/ImageSha256",Value:$sha},
+              {Key:"ec2:SharedTag/GangRelease",Value:"v1.2.3"},
+              {Key:"ec2:SharedTag/GangImage",Value:"gang-image-x86_64"}]}]} |
+          if $mode == "adopt_pending" then .Images[0].State = "pending"
+          elif $mode == "wrong_tag" then .Images[0].Tags[1].Value = "v1.2.4"
+          elif $mode == "wrong_sha" then .Images[0].Tags[0].Value = ($sha[0:12] + "different")
+          elif $mode == "wrong_arch_tag" then .Images[0].Tags[2].Value = "gang-image-aarch64"
+          elif $mode == "wrong_arch" then .Images[0].Architecture = "arm64"
+          elif $mode == "wrong_boot" then .Images[0].BootMode = "legacy-bios"
+          elif $mode == "wrong_state" then .Images[0].State = "failed"
+          elif $mode == "wrong_name" then .Images[0].Name = "other"
+          elif $mode == "duplicate" then .Images += [.Images[0]]
+          elif $mode == "duplicate_tag" then .Images[0].Tags += [.Images[0].Tags[0]]
+          elif $mode == "missing_tag" then .Images[0].Tags |= map(select(.Key != "ec2:SharedTag/GangRelease"))
+          else . end' ;;
+      *) printf '{"Images":[]}\n' ;;
+    esac ;;
   register-image)
+    printf 'called\n' >>"$CASE_DIR/register-attempts"
     [[ ${AWS_MAX_ATTEMPTS:-} == 1 ]] || fail 'register-image must use one attempt'
     [[ $# -eq 25 ]] || fail 'register-image argument count' "$@"
     [[ $1 == --architecture && $2 == x86_64 && $3 == --boot-mode && $4 == uefi &&
@@ -70,6 +98,9 @@ case "$operation" in
         exit 255 ;;
       rejection|cleanupfailure)
         printf 'An error occurred (InvalidParameterValue) when calling the RegisterImage operation: rejected\n' >&2
+        exit 254 ;;
+      duplicate_rejection)
+        printf 'An error occurred (InvalidAMIName.Duplicate) when calling the RegisterImage operation (reached max retries: 0): already exists\n' >&2
         exit 254 ;;
       localreject) printf 'local parameter error\n' >&2; exit 252 ;;
       credentials) printf 'credentials error\n' >&2; exit 253 ;;
@@ -137,6 +168,17 @@ run_case() {
   if [[ $case_name == success && $output != ami-owned ]]; then
     fail "expected ami-owned output, got: $output"
   fi
+  if [[ $case_name == adopt || $case_name == adopt_pending ]]; then
+    if [[ $output != ami-existing ]]; then
+      fail "expected adopted image ID, got: $output"
+    fi
+  fi
+  case "$case_name" in
+    adopt|adopt_pending|wrong_tag|wrong_sha|wrong_arch_tag|wrong_arch|wrong_boot|wrong_state|wrong_name|duplicate|duplicate_tag|missing_tag)
+      if [[ -e $case_dir/coldsnap-attempts || -e $case_dir/register-attempts ]]; then
+        fail 'existing image must not trigger upload or registration'
+      fi ;;
+  esac
   if [[ $expected_snapshot == present ]]; then
     if [[ ! -f $case_dir/snap-owned || $(<"$case_dir/snap-owned") != gang-test-import ]]; then
       fail 'owned snapshot missing or has incorrect owner'
@@ -161,12 +203,25 @@ run_case() {
 
 run_case success 0 present present optional 0
 run_case rejection 254 absent absent optional 1
+run_case duplicate_rejection 254 absent absent optional 1
 run_case localreject 252 absent absent optional 1
 run_case credentials 253 absent absent optional 1
 run_case cleanupfailure 254 present absent required 1
 run_case committedtimeout 255 present present required 0
 run_case internalerror 254 present absent required 0
 run_case unknown 254 present absent required 0
+run_case adopt 0 absent absent optional 0
+run_case adopt_pending 0 absent absent optional 0
+run_case wrong_tag 1 absent absent optional 0
+run_case wrong_sha 1 absent absent optional 0
+run_case wrong_arch_tag 1 absent absent optional 0
+run_case wrong_arch 1 absent absent optional 0
+run_case wrong_boot 1 absent absent optional 0
+run_case wrong_state 1 absent absent optional 0
+run_case wrong_name 1 absent absent optional 0
+run_case duplicate 1 absent absent optional 0
+run_case duplicate_tag 1 absent absent optional 0
+run_case missing_tag 1 absent absent optional 0
 
 printf 'import-image: %d cases, %d assertion failures\n' "$cases" "$failures"
 exit "$((failures > 0))"

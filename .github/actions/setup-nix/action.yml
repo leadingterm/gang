@@ -7,10 +7,10 @@ inputs:
     description: Enable KVM access for VM builds on Linux x86-64.
     required: false
     default: 'false'
-  cache-scope:
-    description: Nix cache scope for the devShell, portable checks, or VM builds.
+  cache-save:
+    description: Save the shared Nix cache on eligible pull requests and default-branch pushes.
     required: false
-    default: devshell
+    default: 'false'
 runs:
   using: composite
   steps:
@@ -30,11 +30,28 @@ runs:
     - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
       with:
         enable_kvm: ${{ inputs.kvm }}
+    # One shared x86 store serves portable and VM jobs; optional architectures stay uncached.
     - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
+      if: runner.os == 'Linux' && runner.arch == 'X64' && github.job != 'cross'
       with:
-        primary-key: nix-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-scope }}-${{ hashFiles('flake.lock', 'flake.nix', 'MODULE.bazel', 'tools/darwin-check.sh', '.github/actions/setup-nix/action.yml') }}-${{ inputs.cache-scope == 'vm' && hashFiles('infra/nixos/**/*', 'configs/gang.aws.toml', 'infra/terraform/modules/network/ports.json') || 'shared' }}
-        restore-prefixes-first-match: nix-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-scope }}-
-        save: ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+        primary-key: nix-v3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'flake.nix', 'MODULE.bazel', 'tools/darwin-check.sh', '.github/actions/setup-nix/action.yml') }}-${{ hashFiles('infra/nixos/**/*.nix', 'configs/gang.aws.toml', 'infra/terraform/modules/network/ports.json') }}
+        restore-prefixes-first-match: |
+          nix-v3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'flake.nix', 'MODULE.bazel', 'tools/darwin-check.sh', '.github/actions/setup-nix/action.yml') }}-
+          nix-v3-${{ runner.os }}-${{ runner.arch }}-
+          nix-v2-${{ runner.os }}-${{ runner.arch }}-
+          nix-v1-${{ runner.os }}-${{ runner.arch }}-vm-
+          nix-v1-${{ runner.os }}-${{ runner.arch }}-portable-
+          nix-v1-${{ runner.os }}-${{ runner.arch }}-devshell-
+          nix-v1-${{ runner.os }}-${{ runner.arch }}-
+        save: ${{ inputs.cache-save == 'true' && runner.os == 'Linux' && runner.arch == 'X64' && github.job != 'cross' && ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))) }}
+        # Upstream bounds GC's live-store target, not the compressed /nix archive size.
+        # Rooted closures can exceed it: v7 has no hard store/archive cap and must preserve VM roots.
+        gc-max-store-size: 1G
+    # Root the devShell before post-job GC. VM result links can root their closures separately.
+    - name: Root shared devShell for cache
+      if: runner.os == 'Linux' && runner.arch == 'X64' && github.job != 'cross' && inputs.cache-save == 'true'
+      shell: bash
+      run: nix develop --profile "$RUNNER_TEMP/ci-devshell-profile" -c true
     - name: Verify KVM access and Nix system feature
       if: inputs.kvm == 'true' && runner.os == 'Linux' && runner.arch == 'X64'
       shell: bash

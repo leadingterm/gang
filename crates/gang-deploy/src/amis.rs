@@ -554,10 +554,13 @@ impl Publication {
             now,
         })
     }
-    fn ordered_regions(&self) -> Vec<(&Region, &RegionImages)> {
-        let mut regions: Vec<_> = self.regions.0.iter().collect();
-        regions.sort_by_key(|(r, _)| (*r != &self.home, *r));
-        regions
+    fn ordered_regions(&self) -> impl Iterator<Item = (&Region, &RegionImages)> {
+        self.regions.0.get_key_value(&self.home).into_iter().chain(
+            self.regions
+                .0
+                .iter()
+                .filter(move |(region, _)| *region != &self.home),
+        )
     }
     fn validate(&self) -> Result<()> {
         let mut identities: BTreeMap<(String, Architecture), String> = BTreeMap::new();
@@ -945,6 +948,99 @@ impl Publication {
         Ok(())
     }
 
+    /// Computes operations for the current release in the observed regions only.
+    ///
+    /// Unlike [`Self::steps`], this considers only supplied architectures and
+    /// does not backfill or change the lifecycle of older images or snapshots.
+    ///
+    /// # Errors
+    /// Returns an error if no release was supplied, images are inconsistent,
+    /// or an observed region lacks public image quota.
+    pub fn release_steps(&self) -> Result<Vec<Step>> {
+        let release = self.release.as_ref().ok_or(DeployError::NoRelease)?;
+        self.validate()?;
+        let mut images_iter = release
+            .images
+            .iter()
+            .map(|(arch, sha)| (*arch, sha, AmiName::new(*arch, sha)));
+        let names: [Option<_>; Architecture::ALL.len()] =
+            std::array::from_fn(|_| images_iter.next());
+        for (region, data) in self.ordered_regions() {
+            let public = data.images.public_other
+                + data
+                    .images
+                    .images
+                    .iter()
+                    .filter(|image| image.public)
+                    .count();
+            let new = names
+                .iter()
+                .flatten()
+                .filter(|(_, _, name)| {
+                    !data
+                        .images
+                        .images
+                        .iter()
+                        .any(|image| image.name == name.0 && image.public)
+                })
+                .count();
+            if public.saturating_add(new) > data.quota as usize {
+                return Err(DeployError::QuotaExceeded {
+                    region: region.to_string(),
+                    public,
+                    new,
+                    quota: data.quota,
+                });
+            }
+        }
+        let Some(home) = self.regions.0.get(&self.home) else {
+            return Err(DeployError::HomeRegionMissing {
+                region: self.home.to_string(),
+            });
+        };
+        let mut ordered: Vec<(bool, Region, u8, String, Step)> = Vec::new();
+        let mut push = |region: &Region, rank, key: String, step| {
+            ordered.push((region != &self.home, region.clone(), rank, key, step));
+        };
+        self.uploads(home, &mut push);
+        let successors = BTreeMap::new();
+        for (region, data) in self.ordered_regions() {
+            for (arch, sha, name) in names.iter().flatten() {
+                if region != &self.home
+                    && !data.images.images.iter().any(|image| image.name == name.0)
+                    && let Some(image) =
+                        home.images.images.iter().find(|image| {
+                            image.name == name.0 && image.state == AmiState::Available
+                        })
+                {
+                    push(
+                        region,
+                        1,
+                        image.id.to_string(),
+                        Step::Copy {
+                            region: region.clone(),
+                            source: image.id.clone(),
+                            name: name.clone(),
+                            description: description(*arch, &release.tag, sha),
+                        },
+                    );
+                }
+            }
+            for image in &data.images.images {
+                if names
+                    .iter()
+                    .flatten()
+                    .any(|(_, _, name)| image.name == name.0)
+                {
+                    self.image_steps(region, image, &successors, &successors, &mut push)?;
+                }
+            }
+        }
+        ordered.sort_by(|a, b| (&a.0, &a.1, &a.2, &a.3).cmp(&(&b.0, &b.1, &b.2, &b.3)));
+        ordered.dedup_by(|a, b| a.4 == b.4);
+        Ok(ordered.into_iter().map(|(_, _, _, _, step)| step).collect())
+    }
+
     /// Computes the ordered, idempotent publication operations.
     ///
     /// # Errors
@@ -1123,6 +1219,172 @@ mod tests {
     }
     fn lines(p: &Publication) -> Vec<String> {
         p.steps().unwrap().iter().map(ToString::to_string).collect()
+    }
+
+    fn release_lines(p: &Publication) -> Vec<String> {
+        p.release_steps()
+            .unwrap()
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn ordered_regions_prioritizes_home_then_key_order() {
+        let mut p = publication(&[], &[], true, 0, 10);
+        let data = p.regions.0.get(&p.home).unwrap().clone();
+        p.regions.0.clear();
+        for region in ["z-1", "c-1", "a-1", "b-1"] {
+            p.regions.0.insert(region.parse().unwrap(), data.clone());
+        }
+        p.home = "z-1".parse().unwrap();
+        assert_eq!(
+            p.ordered_regions()
+                .map(|(region, _)| region.as_str())
+                .collect::<Vec<_>>(),
+            vec!["z-1", "a-1", "b-1", "c-1"]
+        );
+        p.regions.0.remove(&p.home);
+        assert_eq!(
+            p.ordered_regions()
+                .map(|(region, _)| region.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-1", "b-1", "c-1"]
+        );
+    }
+
+    #[test]
+    fn release_steps_only_plans_supplied_architectures() {
+        let mut p = publication(&current(), &[], true, 0, 10);
+        p.release
+            .as_mut()
+            .unwrap()
+            .images
+            .remove(&Architecture::Aarch64);
+        p.regions
+            .0
+            .get_mut(&"other-1".parse().unwrap())
+            .unwrap()
+            .quota = 1;
+        assert_eq!(
+            release_lines(&p),
+            vec![format!(
+                "copy\tother-1\tami-01\tgang-x86_64-aaaaaaaaaaaaaaaa\tGang v2 gang-image-x86_64 sha256:{X}"
+            )]
+        );
+
+        p.release.as_mut().unwrap().images.clear();
+        assert!(release_lines(&p).is_empty());
+    }
+
+    #[test]
+    fn release_steps_uploads_and_copies_only_current_images() {
+        assert_eq!(
+            release_lines(&publication(&[], &[], true, 0, 10)),
+            lines(&publication(&[], &[], true, 0, 10))
+        );
+        let mut home = current();
+        home.push(old());
+        let result = release_lines(&publication(&home, &[], true, 0, 10));
+        assert_eq!(
+            result,
+            vec![
+                format!(
+                    "copy\tother-1\tami-01\tgang-x86_64-aaaaaaaaaaaaaaaa\tGang v2 gang-image-x86_64 sha256:{X}"
+                ),
+                format!(
+                    "copy\tother-1\tami-02\tgang-aarch64-bbbbbbbbbbbbbbbb\tGang v2 gang-image-aarch64 sha256:{A}"
+                ),
+            ]
+        );
+        home[0]["State"] = json!("pending");
+        let result = release_lines(&publication(&home, &[], true, 0, 10));
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], "wait\thome-1\tami-01");
+        assert!(result[1].starts_with("copy\tother-1\tami-02\t"));
+    }
+
+    #[test]
+    fn release_steps_waits_and_publishes_current_images() {
+        let mut home = current();
+        home[0]["Public"] = json!(false);
+        home[0]["DeregistrationProtection"] = json!("disabled");
+        let mut other = current();
+        other[0]["State"] = json!("pending");
+        other[1]["Public"] = json!(false);
+        assert_eq!(
+            release_lines(&publication(&home, &other, true, 0, 10)),
+            vec![
+                "protect\thome-1\tami-01",
+                "publish\thome-1\tami-01",
+                "wait\tother-1\tami-01",
+                "publish\tother-1\tami-02",
+            ]
+        );
+    }
+
+    #[test]
+    fn release_steps_ignores_legacy_lifecycle_and_snapshots() {
+        let mut legacy = old();
+        legacy["DeprecationTime"] = json!("2020-01-01T00:00:00Z");
+        legacy["DeregistrationProtection"] = json!("disabled");
+        legacy["Public"] = json!(false);
+        let mut home = current();
+        home.push(legacy);
+        let mut p = publication(&home, &current(), true, 1_800_000_000, 2);
+        p.regions.0.get_mut(&p.home).unwrap().snapshots =
+            serde_json::from_value(json!({"Snapshots": [{
+                "SnapshotId": "snap-01",
+                "State": "completed",
+                "Tags": [{"Key": "ec2:SharedTag/GangRetiredImage", "Value": "ami-04"}]
+            }]}))
+            .unwrap();
+        assert!(release_lines(&p).is_empty());
+    }
+
+    #[test]
+    fn release_steps_requires_release_and_preflights_observed_regions() {
+        assert!(matches!(
+            publication(&[], &[], false, 0, 10).release_steps(),
+            Err(DeployError::NoRelease)
+        ));
+        let mut p = publication(&[], &[], true, 0, 10);
+        p.regions
+            .0
+            .get_mut(&"other-1".parse().unwrap())
+            .unwrap()
+            .quota = 1;
+        assert!(matches!(
+            p.release_steps(),
+            Err(DeployError::QuotaExceeded { region, public: 0, new: 2, quota: 1 }) if region == "other-1"
+        ));
+        p.regions.0.remove(&"other-1".parse().unwrap());
+        assert_eq!(release_lines(&p).len(), 2);
+
+        let foreign = json!({"Public": true, "State": "failed"});
+        let mut private = current();
+        private[0]["Public"] = json!(false);
+        private.push(foreign);
+        assert!(matches!(
+            publication(&private, &[], true, 0, 2).release_steps(),
+            Err(DeployError::QuotaExceeded { region, public: 2, new: 1, quota: 2 }) if region == "home-1"
+        ));
+    }
+
+    #[test]
+    fn release_steps_preserves_identity_validation() {
+        let mut conflicting = current();
+        conflicting[0]["Tags"][1]["Value"] = json!(OLD);
+        assert!(matches!(
+            publication(&conflicting, &[], true, 0, 10).release_steps(),
+            Err(DeployError::ImageConflict { .. })
+        ));
+        let mut failed = old();
+        failed["State"] = json!("failed");
+        assert!(matches!(
+            publication(&[failed], &[], true, 0, 10).release_steps(),
+            Err(DeployError::FailedImage { .. })
+        ));
     }
 
     #[test]

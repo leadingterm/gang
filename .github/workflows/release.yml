@@ -1,5 +1,5 @@
 # Publishes every pushed v* tag as a GitHub release: CI's binaries, each architecture's disk image,
-# and its public AMI in every image region (gang-amis.json). Nothing is compiled here.
+# and its deployment-ready public AMIs (gang-amis.json). Catalog copies converge independently.
 # Dispatch on a branch or main is a dry run without AWS; dispatch on a v* tag backfills retained AMIs.
 
 name: Release
@@ -17,6 +17,8 @@ env:
   # Only a pushed v* tag publishes a release.
   PUBLISH: ${{ github.event_name == 'push' }}
   BACKFILL: ${{ github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v') }}
+  AMI_PUBLISHER_ROLE: arn:aws:iam::072320588884:role/LTPublicArtifactsGangPublisher
+  AMI_CONFIG_REGION: eu-west-2
 
 defaults:
   run:
@@ -68,39 +70,23 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           runs="$(gh api --paginate "repos/$GH_REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=100" \
-            | jq -rs --arg sha "$SHA" 'if length == 0 or any(.[]; (.workflow_runs | type) != "array") then error("invalid runs") else [.[].workflow_runs[] | select(.head_sha == $sha and (.event == "push" or .event == "workflow_dispatch") and .head_branch == "main")] | sort_by(.created_at) | reverse | .[].id end')"
-          commit="$(gh api "repos/$GH_REPO/commits/$SHA")"
-          tree="$(jq -er '.commit.tree.sha | strings | select(length > 0)' <<< "$commit")"
-          parent="$(jq -r 'if (.parents | type) != "array" then error("invalid parents") elif (.parents | length) == 1 then .parents[0].sha | if type == "string" and length > 0 then . else error("invalid parent") end else "" end' <<< "$commit")"
-          if [[ -n "$parent" ]]; then
-            heads="$(gh api --paginate "repos/$GH_REPO/commits/$SHA/pulls?per_page=100" \
-              | jq -rs --arg parent "$parent" 'if length == 0 or any(.[]; type != "array") then error("invalid pulls") else [.[][] | select(.base.sha == $parent) | .head.sha | strings | select(length > 0)] | unique | .[] end')"
-            for head in $heads; do
-              head_tree="$(gh api "repos/$GH_REPO/commits/$head" | jq -er '.commit.tree.sha | strings | select(length > 0)')"
-              if [[ "$head_tree" != "$tree" ]]; then
-                continue
-              fi
-              pr_runs="$(gh api --paginate "repos/$GH_REPO/actions/workflows/ci.yml/runs?head_sha=$head&event=pull_request&per_page=100" \
-                | jq -rs --arg head "$head" 'if length == 0 or any(.[]; (.workflow_runs | type) != "array") then error("invalid runs") else [.[].workflow_runs[] | select(.head_sha == $head and .event == "pull_request")] | sort_by(.created_at) | reverse | .[].id end')"
-              runs="$runs"$'\n'"$pr_runs"
-            done
-          fi
+            | jq -rs --arg sha "$SHA" --arg repo "$GH_REPO" 'if length == 0 or any(.[]; (.workflow_runs | type) != "array") or any(.[].workflow_runs[]; type != "object" or (.id | type) != "number" or (.created_at | type) != "string" or (.head_sha | type) != "string" or (.event | type) != "string" or (.head_branch | type) != "string" or (.head_repository.full_name | type) != "string") then error("invalid runs") else [.[].workflow_runs[] | select(.head_sha == $sha and .head_repository.full_name == $repo and .event == "push" and .head_branch == "main")] | sort_by(.created_at) | reverse | .[].id end')"
           run_id=""
           for candidate in $runs; do
-            required="$(gh api --paginate "repos/$GH_REPO/actions/runs/$candidate/jobs?filter=latest&per_page=100" \
-              | jq -s 'if length == 0 or any(.[]; (.jobs | type) != "array") then error("invalid jobs") else [.[].jobs[] | select(.name == "required")] end')"
-            if ! jq -e 'length == 1 and .[0].conclusion == "success"' <<< "$required" >/dev/null; then
+            gates="$(gh api --paginate "repos/$GH_REPO/actions/runs/$candidate/jobs?filter=latest&per_page=100" \
+              | jq -s 'if length == 0 or any(.[]; (.jobs | type) != "array") or any(.[].jobs[]; type != "object" or (.name | type) != "string" or ((.conclusion | type) != "string" and .conclusion != null)) then error("invalid jobs") else [.[].jobs[] | select(.name == "required" or .name == "release-validation")] end')"
+            if ! jq -e 'length == 2 and ([.[] | select(.name == "required" and .conclusion == "success")] | length == 1) and ([.[] | select(.name == "release-validation" and .conclusion == "success")] | length == 1)' <<< "$gates" >/dev/null; then
               continue
             fi
             artifacts="$(gh api --paginate "repos/$GH_REPO/actions/runs/$candidate/artifacts?per_page=100" \
-              | jq -s 'if length == 0 or any(.[]; (.artifacts | type) != "array") then error("invalid artifacts") else [.[].artifacts[] | select(.expired == false) | .name] end')"
+              | jq -s 'if length == 0 or any(.[]; (.artifacts | type) != "array") or any(.[].artifacts[]; type != "object" or (.name | type) != "string" or (.expired | type) != "boolean") then error("invalid artifacts") else [.[].artifacts[] | select(.expired == false) | .name] end')"
             if jq -e '["gang-x86_64-unknown-linux-musl", "gang-aarch64-unknown-linux-musl"] - . == []' <<< "$artifacts" >/dev/null; then
               run_id="$candidate"
               break
             fi
           done
           if [[ -z "$run_id" ]]; then
-            echo "::error::no eligible CI run has a successful latest required job and both required unexpired Linux artifacts: PR CI requires the exact release tree and PR base equal to its sole parent; dispatch ci.yml on main for full validation, then dispatch release.yml as a dry run" >&2
+            echo "::error::no main push CI run on exact commit $SHA has successful latest required and release-validation jobs and both required unexpired Linux artifacts" >&2
             exit 1
           fi
           echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
@@ -196,6 +182,9 @@ jobs:
       actions: read
       attestations: read
       id-token: write
+    outputs:
+      home-region: ${{ steps.config.outputs.home-region }}
+      image-regions: ${{ steps.config.outputs.image-regions }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-nix
@@ -234,12 +223,13 @@ jobs:
           echo "IMAGE_SHA256_aarch64=$(sha256sum images/gang-image-aarch64.raw.zst | cut -d' ' -f1)" >> "$GITHUB_ENV"
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
         with:
-          role-to-assume: arn:aws:iam::072320588884:role/LTPublicArtifactsGangPublisher
-          aws-region: eu-west-2
+          role-to-assume: ${{ env.AMI_PUBLISHER_ROLE }}
+          aws-region: ${{ env.AMI_CONFIG_REGION }}
       - name: Read public AMI configuration
+        id: config
         shell: nix develop .#release -c bash --noprofile --norc -euo pipefail {0}
         run: |
-          config="$(aws ssm get-parameter --region eu-west-2 --name /leadingterm/public-artifacts/gang --query Parameter.Value --output text)"
+          config="$(aws ssm get-parameter --region "$AMI_CONFIG_REGION" --name /leadingterm/public-artifacts/gang --query Parameter.Value --output text)"
           resolved="$(printf '%s' "$config" | jq -er -s '
             if length == 1 and (.[0] | type == "object") then .[0]
             else error("invalid public AMI configuration") end
@@ -250,12 +240,20 @@ jobs:
               else error("invalid public AMI configuration") end
           ')"
           printf '%s\n' "$resolved" >> "$GITHUB_ENV"
+          while IFS='=' read -r key value; do
+            case "$key" in
+              IMAGE_HOME_REGION) printf 'home-region=%s\n' "$value" >> "$GITHUB_OUTPUT" ;;
+              IMAGE_REGIONS) printf 'image-regions=%s\n' "$value" >> "$GITHUB_OUTPUT" ;;
+            esac
+          done <<< "$resolved"
       - name: Converge public AMIs
         shell: nix develop .#release -c bash --noprofile --norc -euo pipefail {0}
         env:
           GANG: ${{ github.workspace }}/staged/gang-aarch64-unknown-linux-musl
           RELEASE: ${{ github.event_name == 'push' && github.ref_name || '' }}
           IMAGES_DIR: ${{ github.event_name == 'push' && 'images' || '' }}
+          PUBLICATION_SCOPE: ${{ github.event_name == 'push' && 'release' || 'catalog' }}
+          AMI_DEPLOY_REGIONS: ${{ vars.AMI_DEPLOY_REGIONS }}
         run: infra/scripts/publish-amis.sh
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: env.PUBLISH == 'true'
@@ -263,6 +261,42 @@ jobs:
           name: gang-amis
           path: gang-amis.json
           retention-days: 1
+
+  # Full catalog convergence is independent of the immutable release manifest.
+  amiscopies:
+    needs: [locate, amis]
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-nix
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gang-aarch64-unknown-linux-musl
+          path: staged
+          run-id: ${{ needs.locate.outputs.run-id }}
+          github-token: ${{ github.token }}
+      - run: chmod +x staged/gang-aarch64-unknown-linux-musl
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
+        with:
+          role-to-assume: ${{ env.AMI_PUBLISHER_ROLE }}
+          aws-region: ${{ env.AMI_CONFIG_REGION }}
+      - name: Converge the public AMI catalog
+        shell: nix develop .#release -c bash --noprofile --norc -euo pipefail {0}
+        env:
+          GANG: ${{ github.workspace }}/staged/gang-aarch64-unknown-linux-musl
+          IMAGE_HOME_REGION: ${{ needs.amis.outputs.home-region }}
+          IMAGE_REGIONS: ${{ needs.amis.outputs.image-regions }}
+          PUBLICATION_SCOPE: catalog
+          RELEASE: ''
+        run: infra/scripts/publish-amis.sh
 
   publish:
     needs: [locate, images, amis]
@@ -329,7 +363,7 @@ jobs:
         run: |
           message="$(gh api "repos/$GH_REPO/commits/$RELEASE_COMMIT" --jq .commit.message)"
           printf -v notes '%s\n\n%s' "$message" \
-            "Binaries built and tested by CI run $RUN_URL. Public AMIs of each architecture in every image region: gang-amis.json."
+            "Binaries built and tested by CI run $RUN_URL. Primary public AMIs of each architecture: gang-amis.json."
           if [[ ! -f gang-aarch64-apple-darwin ]]; then
             notes+=$'\n\n'"The macOS binary is not included in this release."
           fi

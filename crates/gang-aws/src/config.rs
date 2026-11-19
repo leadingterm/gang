@@ -8,7 +8,8 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use gang_types::{
-    FleetName, MachineClass, NonZeroBytes, NonZeroDuration, Percent, Url, WorkloadTokenSettings,
+    Audience, BoundedDuration, FleetName, MachineClass, NANOS_PER_SECOND, NonZeroBytes,
+    NonZeroDuration, Percent, Url,
 };
 use serde::{Deserialize, Serialize};
 
@@ -32,7 +33,7 @@ pub struct AwsConfig {
     /// 15 minutes. The audience must be 1 to 1000 characters. The lifetime must be a whole
     /// number of seconds within `1m` to `1h`.
     #[serde(default)]
-    pub workload_token: WorkloadTokenSettings,
+    pub workload_token: WorkloadTokenConfig,
     /// Signing algorithm requested for workload tokens. Default `rs256`; `es384` is the other
     /// choice.
     #[serde(default)]
@@ -58,6 +59,30 @@ pub struct AwsConfig {
     /// `ignore`, which applies the capacity change at once; `honor` waits for the cooldown.
     #[serde(default)]
     pub set_capacity_cooldown: CooldownPolicy,
+}
+
+/// An STS workload token lifetime: whole seconds from one minute to one hour inclusive.
+///
+/// `GetWebIdentityToken` requires at least 60 seconds, independently of Gang's client-token bounds.
+pub type WorkloadTokenTtl = BoundedDuration<NANOS_PER_SECOND, 60, 3600>;
+
+/// Audience and lifetime requested from STS for a worker's workload token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkloadTokenConfig {
+    /// The audience the token is issued for.
+    pub audience: Audience,
+    /// The lifetime accepted by STS: whole seconds from one minute to one hour inclusive.
+    pub ttl: WorkloadTokenTtl,
+}
+
+impl Default for WorkloadTokenConfig {
+    fn default() -> Self {
+        Self {
+            audience: Audience::DEFAULT,
+            ttl: WorkloadTokenTtl::from_units(900),
+        }
+    }
 }
 
 gang_types::string_enum! {

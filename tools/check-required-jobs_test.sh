@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Exercise the coverage guard and the actual CI aggregator scripts.
+# Exercise the graph guard and execute the actual CI aggregator bodies.
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
@@ -16,71 +16,197 @@ fail() {
   failures=$((failures + 1))
 }
 
-# expect <success|failure> <description> <command> [args...]
 expect() {
   local expected=$1 description=$2
   shift 2
   cases=$((cases + 1))
   if "$@" >"$scratch/output" 2>&1; then
-    if [[ $expected != success ]]; then
-      fail "$description: unexpectedly succeeded"
-    fi
+    if [[ $expected != success ]]; then fail "$description: unexpectedly succeeded"; fi
   elif [[ $expected == success ]]; then
     fail "$description: unexpectedly failed: $(cat "$scratch/output")"
   fi
 }
 
 jobs=$(yq -o=json '.jobs' "$workflow")
-expect success 'macos is informational' jq -e '(.macos | type) == "object" and (.required.needs | index("macos") == null)' <<<"$jobs"
-
 expect success 'current workflow coverage' "$guard" "$workflow"
-cp "$workflow" "$fixture"
-yq -i 'del(.jobs.required.needs[] | select(. == "lint"))' "$fixture"
-expect failure 'removed dependency' "$guard" "$fixture"
-cp "$workflow" "$fixture"
-yq -i '.jobs.required.needs += ["macos"] | (.jobs.required.steps[] | select(.env.NEEDS_RESULTS != null) | .env.NEEDS_RESULTS) |= sub("needs[.]lint[.]result", "needs.lint.result, needs.macos.result")' "$fixture"
-expect failure 'macos cannot be a required dependency' "$guard" "$fixture"
-cp "$workflow" "$fixture"
-yq -i '.jobs.guard_fixture."runs-on" = "ubuntu-latest" | .jobs.guard_fixture.steps = [{"run": "true"}]' "$fixture"
-expect failure 'new job without dependency' "$guard" "$fixture"
-cp "$workflow" "$fixture"
-yq -i '.jobs.guard_fixture."runs-on" = "ubuntu-latest" | .jobs.guard_fixture.steps = [{"run": "true"}] | .jobs.required.needs += ["guard_fixture"] | (.jobs.required.steps[] | select(.env.NEEDS_RESULTS != null) | .env.NEEDS_RESULTS) |= sub("needs[.]lint[.]result", "needs.lint.result, needs.guard_fixture.result")' "$fixture"
-expect failure 'new required heavy job missing changes dependency' "$guard" "$fixture"
-for dependency in changes lint-arm64 nix-vm; do
-  cp "$workflow" "$fixture"
-  dependency="$dependency" yq -i 'del(.jobs.lint.needs[] | select(. == strenv(dependency)))' "$fixture"
-  expect failure "lint missing $dependency prerequisite" "$guard" "$fixture"
-done
-for dependency in changes e2e-gate-2-shard-1 e2e-gate-2-shard-2; do
-  cp "$workflow" "$fixture"
-  dependency="$dependency" yq -i 'del(.jobs.e2e-gate-2.needs[] | select(. == strenv(dependency)))' "$fixture"
-  expect failure "e2e-gate-2 missing $dependency prerequisite" "$guard" "$fixture"
-done
-cp "$workflow" "$fixture"
-yq -i '(.jobs.required.steps[] | select(.env.NEEDS_RESULTS != null) | .env.NEEDS_RESULTS) |= sub("needs[.]lint-arm64[.]result", "success")' "$fixture"
-expect failure 'required result omits a dependency' "$guard" "$fixture"
-cp "$workflow" "$fixture"
-yq -i 'del(.jobs.required)' "$fixture"
-expect failure 'missing required job' "$guard" "$fixture"
-cp "$workflow" "$fixture"
-yq -i 'del(.jobs.changes)' "$fixture"
-expect failure 'missing changes job' "$guard" "$fixture"
-cp "$workflow" "$fixture"
-yq -i 'del(.jobs.linux-arm64.needs)' "$fixture"
-expect failure 'heavy leaf missing changes dependency' "$guard" "$fixture"
-cp "$workflow" "$fixture"
-yq -i 'del(.jobs.e2e-gate-1.needs[] | select(. == "changes"))' "$fixture"
-expect failure 'e2e leaf missing changes dependency' "$guard" "$fixture"
+# Follow the real dependency graph, not just required.needs: optional architectures
+# must not sneak into the PR critical path through an intermediate dependency.
+expect success 'PR graph excludes optional architectures and cache fan-in' jq -e "
+  . as \$jobs
+  | def ancestors(\$id): [\$id] + [(\$jobs[\$id].needs // [] | if type == \"array\" then .[] else . end) | ancestors(.)[]];
+  (ancestors(\"required\") | unique) as \$pr
+  | all([\"linux-arm64\", \"linux-arm64-bundle\", \"linux-arm64-checks\", \"cross\", \"macos\", \"cache-x86_64\", \"release-validation\"][];
+        . as \$id | (\$pr | index(\$id)) == null)
+" <<<"$jobs"
 
-for job in lint e2e-gate-2 required; do
+for job in required nix-vm lint linux-x86_64-shards linux-x86_64 linux-x86_64-bundle cache-x86_64 linux-arm64 linux-arm64-bundle linux-arm64-checks cross macos release-validation e2e-gate-1-shards e2e-gate-1 e2e-gate-2-shards e2e-gate-2; do
+  while IFS= read -r dependency; do
+    cp "$workflow" "$fixture"
+    job="$job" dependency="$dependency" yq -i '.jobs[strenv(job)].needs |= ([.] | flatten) | del(.jobs[strenv(job)].needs[] | select(. == strenv(dependency)))' "$fixture"
+    expect failure "$job missing $dependency prerequisite" "$guard" "$fixture"
+  done < <(jq -r --arg job "$job" '.[$job].needs | if type == "array" then .[] else . end' <<<"$jobs")
+done
+for job in linux-arm64 linux-arm64-bundle linux-arm64-checks cross macos cache-x86_64 release-validation; do
+  cp "$workflow" "$fixture"
+  job="$job" yq -i '.jobs.required.needs += [strenv(job)]' "$fixture"
+  expect failure "$job cannot be a PR required dependency" "$guard" "$fixture"
+done
+for job in linux-x86_64 e2e-gate-1 e2e-gate-2 required; do
   cp "$workflow" "$fixture"
   job="$job" yq -i '.jobs[strenv(job)].if = "success()"' "$fixture"
   expect failure "conditional $job aggregator" "$guard" "$fixture"
 done
+for job in linux-arm64-bundle linux-arm64-checks linux-arm64 cross macos release-validation; do
+  cp "$workflow" "$fixture"
+  job="$job" yq -i '.jobs[strenv(job)].if = "always()"' "$fixture"
+  expect failure "$job cannot run on PRs" "$guard" "$fixture"
+done
+for job in required changes; do
+  cp "$workflow" "$fixture"
+  job="$job" yq -i 'del(.jobs[strenv(job)])' "$fixture"
+  expect failure "missing $job job" "$guard" "$fixture"
+done
+cp "$workflow" "$fixture"
+yq -i '.jobs.linux-x86_64.steps += [{"uses": "actions/checkout@fixture"}]' "$fixture"
+expect failure 'x86 aggregator cannot run extra steps' "$guard" "$fixture"
+cp "$workflow" "$fixture"
+yq -i '.jobs.guard_fixture."runs-on" = "ubuntu-latest" | .jobs.guard_fixture.steps = [{"run": "true"}]' "$fixture"
+expect failure 'new heavy job missing changes dependency' "$guard" "$fixture"
+cp "$workflow" "$fixture"
+yq -i '(.jobs.required.steps[] | select(.env.NEEDS_RESULTS != null) | .env.NEEDS_RESULTS) |= sub("needs[.]lint[.]result", "success")' "$fixture"
+expect failure 'required result omits a dependency' "$guard" "$fixture"
+cp "$workflow" "$fixture"
+yq -i '(.jobs.lint.steps[] | select(.run != null) | .run) |= sub("tools/lint.sh --portable", "true")' "$fixture"
+expect failure 'lint must perform portable lint rather than aggregate statuses' "$guard" "$fixture"
+cp "$workflow" "$fixture"
+yq -i '(.jobs.lint.steps[] | select(.name == "Lint") | ."timeout-minutes") = 4' "$fixture"
+expect failure 'portable lint cannot exceed three minutes' "$guard" "$fixture"
+cp "$workflow" "$fixture"
+yq -i '.jobs.release-validation.steps[0].env.ARM_RESULT = "success"' "$fixture"
+expect failure 'release results cannot omit ARM validation' "$guard" "$fixture"
+cp "$workflow" "$fixture"
+yq -i '.jobs.linux-x86_64-shards.needs = ["changes", "linux-arm64"]' "$fixture"
+expect failure 'x86 shards cannot transitively require optional ARM jobs' "$guard" "$fixture"
+for job in lint linux-x86_64-bundle e2e-gate-1-shards e2e-gate-2-shards; do
+  cp "$workflow" "$fixture"
+  job="$job" yq -i '.jobs[strenv(job)]."runs-on" = "ubuntu-24.04-arm"' "$fixture"
+  expect failure "$job must run on x86" "$guard" "$fixture"
+done
+for job in e2e-gate-1-shards e2e-gate-2-shards; do
+  cp "$workflow" "$fixture"
+  job="$job" yq -i '.jobs[strenv(job)].needs = ["changes", "linux-arm64-bundle"]' "$fixture"
+  expect failure "$job cannot consume an ARM-only producer" "$guard" "$fixture"
+done
+for job in e2e-gate-1-shards e2e-gate-2-shards; do
+  for matrix in '{"shard":[1,2,3,4]}' '{"shard":[1,2,3,4,5,6,7,7]}' '{"shard":[1,2,3,4,5,6,7,8],"exclude":[{"shard":8}]}' '{"shard":[1,2,3,4,5,6,7,8],"engine":["sqlite","postgres"]}'; do
+    cp "$workflow" "$fixture"
+    job="$job" matrix="$matrix" yq -i '.jobs[strenv(job)].strategy.matrix = (strenv(matrix) | from_json)' "$fixture"
+    expect failure "$job rejects incomplete, duplicate or expanded matrices: $matrix" "$guard" "$fixture"
+  done
+  for denominator in 4 8; do
+    cp "$workflow" "$fixture"
+    job="$job" denominator="$denominator" yq -i '(.jobs[strenv(job)].steps[] | select(.uses == "./.github/actions/run-e2e") | .with.args) |= sub("/.*$", "/" + strenv(denominator))' "$fixture"
+    expect failure "$job denominator must derive from matrix job total, not $denominator" "$guard" "$fixture"
+  done
+  cp "$workflow" "$fixture"
+  job="$job" yq -i '(.jobs[strenv(job)].steps[] | select(.uses == "./.github/actions/run-e2e") | .with.args) += " --scenario api"' "$fixture"
+  expect failure "$job cannot filter away scenarios" "$guard" "$fixture"
+done
+cp "$workflow" "$fixture"
+yq -i '(.jobs.e2e-gate-2-shards.steps[] | select(.uses == "./.github/actions/run-e2e") | .with.args) |= sub(" --additions", "")' "$fixture"
+expect failure 'Gate 2 must run additions without repeating Gate 1' "$guard" "$fixture"
+cp "$workflow" "$fixture"
+yq -i '(.jobs.linux-x86_64-bundle.steps[] | select(.name == "Build gang and e2e harness") | .run) |= sub("//crates/gang-e2e:bundle", "//:gang")' "$fixture"
+expect failure 'bundle producer must build the harness bundle' "$guard" "$fixture"
+cp "$workflow" "$fixture"
+yq -i '(.jobs.linux-x86_64-bundle.steps[] | select(.name == "Build gang and e2e harness") | .run) |= sub("//:gang ", "")' "$fixture"
+expect failure 'bundle producer must explicitly materialize gang for the release upload' "$guard" "$fixture"
+cp "$workflow" "$fixture"
+yq -i '.jobs.linux-x86_64-bundle.steps |= (map(select(.name != "Build gang and e2e harness")) + map(select(.name == "Build gang and e2e harness")))' "$fixture"
+expect failure 'bundle producer must materialize gang before the release upload' "$guard" "$fixture"
+cp "$workflow" "$fixture"
+yq -i 'del(.jobs.linux-x86_64-bundle.steps[] | select(.uses == "./.github/actions/upload-gang"))' "$fixture"
+expect failure 'bundle producer must upload the gang release artifact' "$guard" "$fixture"
+cp "$workflow" "$fixture"
+yq -i 'del(.jobs.linux-x86_64-bundle.steps[] | select(.with.name == "e2e-harness-x86_64"))' "$fixture"
+expect failure 'bundle producer must upload the harness artifact' "$guard" "$fixture"
+cp "$workflow" "$fixture"
+yq -i '.jobs.linux-x86_64-bundle.steps += [{"uses": "./.github/actions/save-bazel-cache", "with": {"mode": "export", "shard": "x86-bundle"}}]' "$fixture"
+expect failure 'bundle working-set export must stay removed' "$guard" "$fixture"
+for metric in bazel-build.bep.json bazel-build.profile.gz; do
+  cp "$workflow" "$fixture"
+  metric="$metric" yq -i '(.jobs.linux-x86_64-bundle.steps[] | select(.with.name == "bazel-metrics-x86-bundle") | .with.path) |= sub(strenv(metric), "missing")' "$fixture"
+  expect failure "bundle metrics must retain $metric" "$guard" "$fixture"
+done
+for mutation in condition pin retention; do
+  cp "$workflow" "$fixture"
+  case "$mutation" in
+    condition) yq -i '(.jobs.linux-x86_64-bundle.steps[] | select(.with.name == "bazel-metrics-x86-bundle") | .if) = "success()"' "$fixture" ;;
+    pin) yq -i '(.jobs.linux-x86_64-bundle.steps[] | select(.with.name == "bazel-metrics-x86-bundle") | .uses) = "actions/upload-artifact@main"' "$fixture" ;;
+    retention) yq -i '(.jobs.linux-x86_64-bundle.steps[] | select(.with.name == "bazel-metrics-x86-bundle") | .with."retention-days") = 90' "$fixture" ;;
+  esac
+  expect failure "bundle metrics enforce $mutation" "$guard" "$fixture"
+done
 
-# Execute the actual workflow body with Nix flake tools to test runner behavior.
+# Execute actual GitHub job conditions with synthetic event values. Only the
+# repository-owned expression is shell code; fixture values remain quoted data.
+expect_condition() {
+  local expected=$1 description=$2 expr=$3 dependency actual=failure
+  expr=${expr#"\${{"}
+  expr=${expr%'}}'}
+  expr=${expr//"always()"/true}
+  expr=${expr//"startsWith(github.ref, 'refs/tags/v')"/"\"\$REF\" == refs/tags/v*"}
+  expr=${expr//github.event_name/"\"\$EVENT\""}
+  expr=${expr//github.ref/"\"\$REF\""}
+  expr=${expr//'!github.event.repository.private'/"\"\$PRIVATE\" != true"}
+  expr=${expr//github.event.repository.private/"\"\$PRIVATE\" == true"}
+  expr=${expr//needs.changes.outputs.heavy/"\"\$HEAVY\""}
+  while IFS= read -r dependency; do
+    expr=${expr//needs.$dependency.result/'"success"'}
+  done < <(jq -r 'keys[]' <<<"$jobs")
+  if [[ $expr == *github.* || $expr == *needs.* || $expr == *startsWith* ]]; then
+    fail "Unsupported job condition: $expr"
+    return 2
+  fi
+  expr=${expr//\(/ ( }
+  expr=${expr//\)/ ) }
+  if bash --noprofile --norc -c "[[ $expr ]]"; then actual=success; fi
+  expect success "$description" test "$actual" = "$expected"
+}
+export HEAVY=true PRIVATE=false
+for job in linux-arm64-bundle linux-arm64-checks linux-arm64 cross macos release-validation; do
+  condition=$(jq -er --arg job "$job" '.[$job].if' <<<"$jobs")
+  export EVENT=pull_request REF=refs/pull/1/merge
+  expect_condition failure "$job intentionally skips a PR" "$condition"
+  # A PR targeting main must not bypass the event guard either.
+  REF=refs/heads/main
+  expect_condition failure "$job rejects a PR even with a main ref" "$condition"
+  EVENT=push
+  for REF in refs/heads/main refs/heads/master refs/tags/v0.3.2; do
+    expect_condition success "$job runs on push $REF" "$condition"
+  done
+  for REF in refs/heads/feature refs/tags/not-a-release; do
+    expect_condition failure "$job skips push $REF" "$condition"
+  done
+  EVENT=workflow_dispatch REF=refs/heads/main
+  expect_condition failure "$job does not run on dispatch" "$condition"
+  EVENT=push REF=refs/heads/main HEAVY=false
+  if [[ $job == linux-arm64 || $job == release-validation ]]; then
+    expected=success
+  else
+    expected=failure
+  fi
+  expect_condition "$expected" "$job docs-only push preserves intentional skips" "$condition"
+  HEAVY=true
+  if [[ $job == macos ]]; then
+    PRIVATE=true
+    expect_condition failure 'private repositories intentionally skip macOS' "$condition"
+    PRIVATE=false
+  fi
+done
 
-for job in lint e2e-gate-2 required; do
+# Execute the actual status aggregators using the devShell-pinned Bash.
+for job in linux-x86_64 linux-arm64 e2e-gate-1 e2e-gate-2 required; do
   body="$scratch/$job.sh"
   jq -er --arg job "$job" '
     [.[$job].steps[] | select(.env.NEEDS_RESULTS != null) | .run]
@@ -88,32 +214,22 @@ for job in lint e2e-gate-2 required; do
       else error("expected exactly one NEEDS_RESULTS run step") end
   ' <<<"$jobs" >"$body"
   needs_count=$(jq -er --arg job "$job" '.[$job].needs | arrays | length' <<<"$jobs")
-  if (( needs_count < 2 )); then
-    echo "$job must have at least two dependencies for the status matrix" >&2
-    exit 1
-  fi
-
   all_success=
   docs_results=
   for ((i = 0; i < needs_count; i++)); do
     all_success+="${all_success:+ }success"
-    if (( i % 2 == 0 )); then
-      docs_results+="${docs_results:+ }success"
-    else
-      docs_results+="${docs_results:+ }skipped"
-    fi
+    if (( i % 2 == 0 )); then docs_results+="${docs_results:+ }success"; else docs_results+="${docs_results:+ }skipped"; fi
   done
   expect success "$job: heavy all success" env CHANGES_RESULT=success HEAVY=true NEEDS_RESULTS="$all_success" bash --noprofile --norc -e -o pipefail <"$body"
   expect success "$job: docs success and skipped" env CHANGES_RESULT=success HEAVY=false NEEDS_RESULTS="$docs_results" bash --noprofile --norc -e -o pipefail <"$body"
-
+  expect failure "$job: missing one result" env CHANGES_RESULT=success HEAVY=true NEEDS_RESULTS="${all_success#success }" bash --noprofile --norc -e -o pipefail <"$body"
+  expect failure "$job: extra result" env CHANGES_RESULT=success HEAVY=true NEEDS_RESULTS="$all_success success" bash --noprofile --norc -e -o pipefail <"$body"
   for ((position = 0; position < needs_count; position++)); do
     for status in failure skipped cancelled; do
       results=
       for ((i = 0; i < needs_count; i++)); do
         result=success
-        if (( i == position )); then
-          result=$status
-        fi
+        if (( i == position )); then result=$status; fi
         results+="${results:+ }$result"
       done
       expect failure "$job: heavy position $position is $status" env CHANGES_RESULT=success HEAVY=true NEEDS_RESULTS="$results" bash --noprofile --norc -e -o pipefail <"$body"
@@ -130,8 +246,28 @@ for job in lint e2e-gate-2 required; do
     done
   done
   expect failure "$job: missing heavy output" env -u HEAVY CHANGES_RESULT=success NEEDS_RESULTS="$all_success" bash --noprofile --norc -e -u -o pipefail <"$body"
-  expect failure "$job: empty heavy output" env CHANGES_RESULT=success HEAVY='' NEEDS_RESULTS="$all_success" bash --noprofile --norc -e -o pipefail <"$body"
-  expect failure "$job: malformed heavy output" env CHANGES_RESULT=success HEAVY=invalid NEEDS_RESULTS="$all_success" bash --noprofile --norc -e -o pipefail <"$body"
+  for heavy in '' invalid; do
+    expect failure "$job: malformed heavy output '$heavy'" env CHANGES_RESULT=success HEAVY="$heavy" NEEDS_RESULTS="$all_success" bash --noprofile --norc -e -o pipefail <"$body"
+  done
+done
+
+release_body="$scratch/release-validation.sh"
+jq -er '.["release-validation"].steps[] | select(.env.REQUIRED_RESULT != null) | .run' <<<"$jobs" >"$release_body"
+unset HEAVY
+export CHANGES_RESULT=success REQUIRED_RESULT=success ARM_RESULT=success CROSS_RESULT=success MACOS_RESULT=success PRIVATE=false
+expect success 'public release validation requires all platforms' bash --noprofile --norc -e -u -o pipefail <"$release_body"
+for PRIVATE in false true; do
+  for variable in CHANGES_RESULT REQUIRED_RESULT ARM_RESULT CROSS_RESULT MACOS_RESULT; do
+    for status in failure cancelled skipped ''; do
+      if [[ $variable == MACOS_RESULT && $PRIVATE == true && $status == skipped ]]; then
+        expected=success
+      else
+        expected=failure
+      fi
+      expect "$expected" "release: heavy=false private=$PRIVATE $variable=$status" env HEAVY=false "$variable=$status" bash --noprofile --norc -e -u -o pipefail <"$release_body"
+    done
+  done
+  expect failure 'release: heavy=false cannot bypass architecture validation' env HEAVY=false ARM_RESULT=skipped CROSS_RESULT=skipped MACOS_RESULT=skipped bash --noprofile --norc -e -u -o pipefail <"$release_body"
 done
 
 printf '%d cases, %d failures\n' "$cases" "$failures"

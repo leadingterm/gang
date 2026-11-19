@@ -376,11 +376,13 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
 
-    use super::{Gate, Shard, non_empty_path, partition};
+    use clap::Parser;
+
+    use super::{Cli, Gate, Shard, non_empty_path, partition};
 
     #[test]
     fn shards_are_valid_deterministic_and_cover_the_selection() {
-        for invalid in ["", "0/1", "2/1", "1/0", "1", "1/2/3", "-1/2"] {
+        for invalid in ["", "0/1", "2/1", "1/0", "0/0", "1", "1/2/3", "-1/2"] {
             assert!(invalid.parse::<Shard>().is_err(), "{invalid}");
         }
         for selected in [
@@ -388,10 +390,12 @@ mod tests {
             Gate::Two.scenarios().collect(),
             Gate::Two.additions().collect(),
         ] {
-            for count in [1, 2] {
+            for count in [1, 2, 8] {
                 let shards: Vec<_> = (1..=count)
                     .map(|index| partition(&selected, format!("{index}/{count}").parse().unwrap()))
                     .collect();
+                assert!(shards.iter().all(|shard| !shard.is_empty()));
+                assert_eq!(shards.iter().map(Vec::len).sum::<usize>(), selected.len());
                 for scenario in &selected {
                     assert_eq!(
                         shards
@@ -402,6 +406,13 @@ mod tests {
                     );
                 }
                 for (index, shard) in shards.iter().enumerate() {
+                    assert!(shard.iter().all(|scenario| selected.contains(scenario)));
+                    let execution_order: Vec<_> = selected
+                        .iter()
+                        .copied()
+                        .filter(|scenario| shard.contains(scenario))
+                        .collect();
+                    assert_eq!(*shard, execution_order);
                     assert_eq!(
                         *shard,
                         partition(&selected, format!("{}/{count}", index + 1).parse().unwrap())
@@ -412,7 +423,75 @@ mod tests {
     }
 
     #[test]
-    fn gate_two_shards_fit_the_measured_budget() {
+    fn ci_gate_selections_retain_all_49_scenarios_exactly_once() {
+        let gate_one: Vec<_> = Gate::One.scenarios().collect();
+        let gate_two: Vec<_> = Gate::Two.additions().collect();
+        let all: Vec<_> = Gate::Two.scenarios().collect();
+        assert_eq!(gate_one.len(), 28);
+        assert_eq!(gate_two.len(), 21);
+        assert_eq!(all.len(), 49);
+        for scenario in all {
+            assert_ne!(gate_one.contains(&scenario), gate_two.contains(&scenario));
+        }
+    }
+
+    #[test]
+    fn excess_shards_are_empty_and_rejected_at_selection() {
+        for selected in [
+            Gate::One.scenarios().collect::<Vec<_>>(),
+            Gate::Two.additions().collect(),
+        ] {
+            let count = selected.len() + 1;
+            let populated: Vec<_> = (1..count)
+                .flat_map(|index| {
+                    partition(
+                        &selected,
+                        Shard {
+                            index: index - 1,
+                            count,
+                        },
+                    )
+                })
+                .collect();
+            assert_eq!(populated.len(), selected.len());
+            for scenario in &selected {
+                assert_eq!(populated.iter().filter(|item| *item == scenario).count(), 1);
+            }
+            let empty = Shard {
+                index: count - 1,
+                count,
+            };
+            assert!(partition(&selected, empty).is_empty());
+        }
+        let populated = Cli::try_parse_from([
+            "local",
+            "--gate",
+            "1",
+            "--scenario",
+            "lifecycle",
+            "--shard",
+            "1/2",
+        ])
+        .unwrap();
+        assert_eq!(populated.selected_scenarios().unwrap().len(), 1);
+        let empty = Cli::try_parse_from([
+            "local",
+            "--gate",
+            "1",
+            "--scenario",
+            "lifecycle",
+            "--shard",
+            "2/2",
+        ])
+        .unwrap();
+        assert_eq!(
+            empty.selected_scenarios().unwrap_err(),
+            "the selected shard has no scenarios"
+        );
+    }
+
+    #[test]
+    fn gate_two_ci_shards_fit_the_weighted_launcher_budget() {
         let path = std::env::var_os("GANG_E2E_GATE_SCRIPT")
             .map_or_else(|| PathBuf::from("../../tools/e2e-gate.sh"), PathBuf::from);
         let script = std::fs::read_to_string(path).expect("gate script is available");
@@ -423,8 +502,8 @@ mod tests {
             .parse()
             .expect("numeric budget");
         let selected: Vec<_> = Gate::Two.additions().collect();
-        for index in 1..=2 {
-            let shard = partition(&selected, format!("{index}/2").parse().unwrap());
+        for index in 1..=8 {
+            let shard = partition(&selected, format!("{index}/8").parse().unwrap());
             // run_bounded starts scenarios in selected order on the next available slot.
             let mut slots = vec![0_u64; gang_e2e::Settings::default().parallel_scenarios.get()];
             for scenario in shard {

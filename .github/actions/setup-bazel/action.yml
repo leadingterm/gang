@@ -3,27 +3,57 @@ description: >-
   Configure Bazel for this runner and restore the disk and repository archive caches that
   .github/actions/save-bazel-cache saved (docs/SPECIFICATION.md 7.1). Runs after
   .github/actions/setup-nix.
+inputs:
+  cache-job:
+    description: Shared cache identity (defaults to the current job).
+    default: ''
+  restore-only:
+    description: Restore without saving a cache.
+    default: 'false'
 runs:
   using: composite
   steps:
-    # Each default-branch push saves a snapshot per job, platform, input set, and run attempt.
+    # Pull requests save under their merge ref; default-branch snapshots use a run-specific key.
     - name: Name the Bazel caches
       id: name
       shell: bash
       env:
-        PLATFORM: bazel-v2-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}
+        CACHE_JOB: ${{ inputs.cache-job || github.job }}
+        OS: ${{ runner.os }}
+        ARCH: ${{ runner.arch }}
         INPUTS: ${{ hashFiles('.bazelversion', 'MODULE.bazel', 'MODULE.bazel.lock', 'Cargo.lock', 'flake.lock') }}
-        RUN: default-${{ github.run_id }}-${{ github.run_attempt }}
+        EVENT: ${{ github.event_name }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        SHA: ${{ github.sha }}
+        RUN: ${{ github.run_id }}-${{ github.run_attempt }}
       run: |
+        platform="bazel-v3-$CACHE_JOB-$OS-$ARCH"
+        v2="bazel-v2-$CACHE_JOB-$OS-$ARCH"
+        legacy="bazel-disk-$CACHE_JOB-$OS-$ARCH"
+        scope=default
+        suffix=$RUN
+        if [[ $EVENT == pull_request ]]; then
+          scope="pr${PR_NUMBER}"
+          suffix=$SHA
+        fi
         {
           echo "BAZEL_DISK_CACHE=$HOME/.cache/bazel-disk"
           echo "BAZEL_REPOSITORY_CACHE=$HOME/.cache/bazel-repository"
-          echo "BAZEL_DISK_CACHE_KEY=$PLATFORM-$INPUTS-$RUN"
+          echo "BAZEL_DISK_CACHE_KEY=$platform-$scope-$INPUTS-$suffix"
+          echo "BAZEL_CACHE_JOB=$CACHE_JOB"
           echo "BAZEL_DISK_CACHE_EPOCH=$RUNNER_TEMP/bazel-disk-cache-epoch"
         } >> "$GITHUB_ENV"
         {
-          echo "platform=$PLATFORM-"
-          echo "inputs=$PLATFORM-$INPUTS-"
+          echo "default-inputs=$platform-default-$INPUTS-"
+          echo "default=$platform-default-"
+          echo "pr-inputs=$platform-pr${PR_NUMBER}-$INPUTS-"
+          echo "pr=$platform-pr${PR_NUMBER}-"
+          echo "v2-platform=$v2-"
+          echo "v2-inputs=$v2-$INPUTS-"
+          echo "v2-default=$v2-$INPUTS-default-"
+          echo "v2-pr=$v2-$INPUTS-pr${PR_NUMBER}-"
+          echo "legacy=$legacy-$INPUTS"
+          echo "legacy-platform=$legacy-"
         } >> "$GITHUB_OUTPUT"
     # The runner's home rc, read by every Bazel command of the job, nested ones included. Actions run
     # without HOME, so zig's default cache /tmp/zig-cache would live in the sandbox's per-action /tmp
@@ -41,23 +71,87 @@ runs:
         build --repo_env=HERMETIC_CC_TOOLCHAIN_CACHE_PREFIX=$zig_cache
         build --sandbox_writable_path=$zig_cache
         EOF
+    # Only the canonical Linux x86 cache uses shared storage; other jobs keep local caches.
+    # On PRs, layer the PR working set over the default-branch baseline.
     - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      id: restore
+      id: base
+      if: runner.os == 'Linux' && runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64' && github.event_name == 'pull_request'
+      with:
+        path: |
+          ${{ env.BAZEL_DISK_CACHE }}
+          ${{ env.BAZEL_REPOSITORY_CACHE }}/content_addressable
+        key: ${{ steps.name.outputs.default-inputs }}baseline
+        restore-keys: |
+          ${{ steps.name.outputs.default-inputs }}
+          ${{ steps.name.outputs.default }}
+          ${{ steps.name.outputs.v2-default }}
+          ${{ steps.name.outputs.v2-platform }}
+    - name: Record trusted Bazel baseline
+      if: runner.os == 'Linux' && runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64' && github.event_name == 'pull_request'
+      shell: bash
+      run: |
+        manifest="$RUNNER_TEMP/bazel-base-manifest"
+        nix develop -c tools/ci-cache.sh manifest "$BAZEL_DISK_CACHE" "$BAZEL_REPOSITORY_CACHE" > "$manifest"
+        echo "BAZEL_BASE_MANIFEST=$manifest" >> "$GITHUB_ENV"
+    - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      id: pr
+      if: runner.os == 'Linux' && runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64' && github.event_name == 'pull_request'
+      env:
+        TAR_OPTIONS: --skip-old-files
       with:
         path: |
           ${{ env.BAZEL_DISK_CACHE }}
           ${{ env.BAZEL_REPOSITORY_CACHE }}/content_addressable
         key: ${{ env.BAZEL_DISK_CACHE_KEY }}
         restore-keys: |
-          ${{ steps.name.outputs.inputs }}
-          ${{ steps.name.outputs.platform }}
-    # Only default-branch pushes save; pull requests can restore but cannot write snapshots.
-    # Bazel refreshes disk entries and archive payload mtimes on use, allowing successful jobs
-    # to save their working sets while retaining the markers of used archives.
+          ${{ steps.name.outputs.pr-inputs }}
+          ${{ steps.name.outputs.pr }}
+          ${{ steps.name.outputs.v2-pr }}
+    - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      id: restore
+      if: runner.os == 'Linux' && runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64' && github.event_name != 'pull_request'
+      with:
+        path: |
+          ${{ env.BAZEL_DISK_CACHE }}
+          ${{ env.BAZEL_REPOSITORY_CACHE }}/content_addressable
+        key: ${{ env.BAZEL_DISK_CACHE_KEY }}
+        restore-keys: |
+          ${{ steps.name.outputs.default-inputs }}
+          ${{ steps.name.outputs.default }}
+          ${{ steps.name.outputs.v2-inputs }}
+          ${{ steps.name.outputs.v2-platform }}
+    # Legacy caches used a single path, which has a different GitHub cache version.
+    - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      id: legacy
+      if: runner.os == 'Linux' && runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64' && (steps.restore.outputs.cache-matched-key == '' && steps.base.outputs.cache-matched-key == '' && steps.pr.outputs.cache-matched-key == '')
+      with:
+        path: ${{ env.BAZEL_DISK_CACHE }}
+        key: ${{ steps.name.outputs.legacy }}
+        restore-keys: |
+          ${{ steps.name.outputs.legacy-platform }}
+    - name: Record restored Bazel cache
+      if: runner.os == 'Linux' && runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64'
+      shell: bash
+      env:
+        BASE_PRESENT: ${{ steps.base.outputs.cache-matched-key != '' }}
+      run: |
+        manifest="$RUNNER_TEMP/bazel-restored-manifest"
+        nix develop -c tools/ci-cache.sh manifest "$BAZEL_DISK_CACHE" "$BAZEL_REPOSITORY_CACHE" > "$manifest"
+        echo "BAZEL_RESTORED_MANIFEST=$manifest" >> "$GITHUB_ENV"
+        echo "BAZEL_BASE_PRESENT=$BASE_PRESENT" >> "$GITHUB_ENV"
+    # Bazel refreshes used entries, allowing a successful job to export its working set.
     - name: Mark the start of the build
       shell: bash
       env:
-        SAVE: ${{ steps.restore.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+        SAVE: ${{ runner.os == 'Linux' && runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64' && steps.restore.outputs.cache-hit != 'true' && steps.pr.outputs.cache-hit != 'true' && inputs.restore-only != 'true' && ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))) }}
+        CURRENT_CACHE_HIT: ${{ steps.restore.outputs.cache-hit == 'true' || steps.pr.outputs.cache-hit == 'true' }}
+        RESTORED_KEY: ${{ steps.restore.outputs.cache-matched-key }}
+        BASE_KEY: ${{ steps.base.outputs.cache-matched-key }}
+        PR_KEY: ${{ steps.pr.outputs.cache-matched-key }}
+        LEGACY_KEY: ${{ steps.legacy.outputs.cache-matched-key }}
       run: |
         echo "BAZEL_DISK_CACHE_SAVE=$SAVE" >> "$GITHUB_ENV"
+        echo "BAZEL_CURRENT_CACHE_HIT=$CURRENT_CACHE_HIT" >> "$GITHUB_ENV"
+        echo "Bazel caches restored: base=${BASE_KEY:-none}, PR=${PR_KEY:-none}, current=${RESTORED_KEY:-none}, legacy=${LEGACY_KEY:-none}" >> "$GITHUB_STEP_SUMMARY"
+        echo "BAZEL_DISK_CACHE_EPOCH_SECONDS=$(date +%s)" >> "$GITHUB_ENV"
         touch "$BAZEL_DISK_CACHE_EPOCH"

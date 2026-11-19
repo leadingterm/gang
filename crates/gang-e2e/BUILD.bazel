@@ -85,24 +85,27 @@ workspace_rust_binary(
     ],
 )
 
-# The harness with pinned Bazel, PostgreSQL archive and glibc probe as plain files,
+# The harness with Gang, pinned Bazel, PostgreSQL archive and glibc probe as plain files,
 # for a job that runs the harness without Bazel (CI's e2e gates pass them by flag).
 genrule(
     name = "bundle",
     srcs = [
         ":bazel",
         ":local",
+        "//crates/gang-main:gang",
         "//crates/gang-main/tests/preload:loaded_probe",
         "//crates/gang-testkit:postgresql_archive",
     ],
     outs = [
         "bundle/bazel",
+        "bundle/gang",
         "bundle/local",
         "bundle/loaded_probe",
         "bundle/postgresql.tar.gz",
     ],
     cmd = " && ".join([
         "cp $(execpath :bazel) $(execpath bundle/bazel)",
+        "cp $(execpath //crates/gang-main:gang) $(execpath bundle/gang)",
         "cp $(execpath :local) $(execpath bundle/local)",
         "cp $(execpath //crates/gang-main/tests/preload:loaded_probe) $(execpath bundle/loaded_probe)",
         "cp $(execpath //crates/gang-testkit:postgresql_archive) $(execpath bundle/postgresql.tar.gz)",

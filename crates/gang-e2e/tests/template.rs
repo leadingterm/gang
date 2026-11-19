@@ -1020,6 +1020,97 @@ fn launch_failure_preset_sets_missing_launcher_and_short_timeout() -> gang_e2e::
 }
 
 #[test]
+fn fleets_preset_shortens_cleanup_without_changing_placement_or_polling() -> gang_e2e::Result<()> {
+    let base = base_config()?;
+    for sandbox in [Sandbox::Noop, Sandbox::Bwrap] {
+        let variant = placement_variant(sandbox);
+        let untuned = typed_rendered(&ConfigTemplate::parse(&base)?.vary(
+            &variant,
+            &launcher(),
+            &tools(),
+        )?)?;
+        let tuned = typed_rendered(&ConfigTemplate::parse(&base)?.vary(
+            &Variant {
+                control: ControlKnobs::FLEETS,
+                ..variant
+            },
+            &launcher(),
+            &tools(),
+        )?)?;
+        assert_eq!(tuned.poll_interval, untuned.poll_interval);
+        assert_eq!(
+            tuned.poll_interval.get(),
+            std::time::Duration::from_millis(500)
+        );
+        assert_eq!(tuned.client_action_timeout, untuned.client_action_timeout);
+        assert_eq!(tuned.fleets.len(), 3);
+        for (fleet, before) in tuned.fleets.iter().zip(&untuned.fleets) {
+            assert_eq!(fleet.name, before.name);
+            assert_eq!(fleet.sandbox, before.sandbox);
+            assert_eq!(fleet.min_instances, before.min_instances);
+            assert_eq!(fleet.max_instances, before.max_instances);
+            assert_eq!(fleet.idle_timeout, std::time::Duration::from_secs(2));
+            assert_eq!(fleet.max_drain_wait, before.max_drain_wait);
+            assert_eq!(fleet.boot_grace, before.boot_grace);
+        }
+        let ProvisionerConfig::Local(local) = tuned.provisioner else {
+            panic!("local provisioner expected");
+        };
+        assert_eq!(
+            local.terminate_grace.get(),
+            std::time::Duration::from_secs(1)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn drain_cancel_bounds_only_its_drain_and_termination_waits() -> gang_e2e::Result<()> {
+    let base = base_config()?;
+    let variant = placement_variant(Sandbox::Noop);
+    let tuned = typed_rendered(&ConfigTemplate::parse(&base)?.vary(
+        &Variant {
+            control: ControlKnobs::DRAIN_CANCEL,
+            ..variant
+        },
+        &launcher(),
+        &tools(),
+    )?)?;
+    assert_eq!(tuned.poll_interval.get(), std::time::Duration::from_secs(2));
+    assert_eq!(
+        tuned.dashboard.detail_interval.get(),
+        std::time::Duration::from_secs(1)
+    );
+    for fleet in &tuned.fleets {
+        assert_eq!(fleet.idle_timeout, std::time::Duration::from_secs(5));
+        assert_eq!(fleet.max_drain_wait, std::time::Duration::from_secs(10));
+        assert_eq!(fleet.min_instances, 0);
+        assert_eq!(fleet.max_instances.get(), 1);
+    }
+    let untuned =
+        typed_rendered(&ConfigTemplate::parse(&base)?.vary(&variant, &launcher(), &tools())?)?;
+    assert_eq!(tuned.client_action_timeout, untuned.client_action_timeout);
+    for fleet in &untuned.fleets {
+        assert_eq!(fleet.max_drain_wait, std::time::Duration::from_mins(1));
+    }
+    let ProvisionerConfig::Local(local) = tuned.provisioner else {
+        panic!("local provisioner expected");
+    };
+    assert_eq!(
+        local.terminate_grace.get(),
+        std::time::Duration::from_secs(1)
+    );
+    let ProvisionerConfig::Local(local) = untuned.provisioner else {
+        panic!("local provisioner expected");
+    };
+    assert_eq!(
+        local.terminate_grace.get(),
+        std::time::Duration::from_secs(10)
+    );
+    Ok(())
+}
+
+#[test]
 fn scheduled_minimum_preset_applies_to_every_fleet() -> gang_e2e::Result<()> {
     let variant = Variant {
         control: ControlKnobs::SCHEDULED_MINIMUM,
@@ -1386,6 +1477,36 @@ fn rendered_tls_and_plaintext_configs_parse_as_gang_configs() -> gang_e2e::Resul
     Ok(())
 }
 
+fn check_base_variants(
+    check: &dyn Fn(Variant, Transport, &str) -> gang_e2e::Result<()>,
+) -> gang_e2e::Result<()> {
+    for sandbox in [Sandbox::Noop, Sandbox::Bwrap] {
+        for permit_network in [PermitNetwork::Denied, PermitNetwork::Permitted] {
+            for input_links in [InputLinks::Keep, InputLinks::Break] {
+                for limits in [ActionLimits::Absent, ActionLimits::Cgroup] {
+                    for fleets in [FleetLayout::Single, FleetLayout::Placement] {
+                        for soft_memory in [SoftMemory::Enforced, SoftMemory::Off] {
+                            let variant = Variant {
+                                sandbox,
+                                permit_network,
+                                input_links,
+                                limits,
+                                fleets,
+                                soft_memory,
+                                ..Variant::baseline(sandbox)
+                            };
+                            for transport in [Transport::Plain, Transport::Tls] {
+                                check(variant, transport, "base")?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn every_rendered_variant_parses_with_the_real_plugins() -> gang_e2e::Result<()> {
     let base = base_config()?;
@@ -1416,30 +1537,7 @@ fn every_rendered_variant_parses_with_the_real_plugins() -> gang_e2e::Result<()>
         })
     };
 
-    for sandbox in [Sandbox::Noop, Sandbox::Bwrap] {
-        for permit_network in [PermitNetwork::Denied, PermitNetwork::Permitted] {
-            for input_links in [InputLinks::Keep, InputLinks::Break] {
-                for limits in [ActionLimits::Absent, ActionLimits::Cgroup] {
-                    for fleets in [FleetLayout::Single, FleetLayout::Placement] {
-                        for soft_memory in [SoftMemory::Enforced, SoftMemory::Off] {
-                            let variant = Variant {
-                                sandbox,
-                                permit_network,
-                                input_links,
-                                limits,
-                                fleets,
-                                soft_memory,
-                                ..Variant::baseline(sandbox)
-                            };
-                            for transport in [Transport::Plain, Transport::Tls] {
-                                check(variant, transport, "base")?;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    check_base_variants(&check)?;
     // Exercise each family independently for each sandbox and transport, in addition to the
     // complete base product above, without multiplying the family presets by every base knob.
     for sandbox in [Sandbox::Noop, Sandbox::Bwrap] {
@@ -1469,6 +1567,11 @@ fn every_rendered_variant_parses_with_the_real_plugins() -> gang_e2e::Result<()>
                 check(
                     Variant {
                         control: preset,
+                        fleets: if preset == ControlKnobs::FLEETS {
+                            FleetLayout::Placement
+                        } else {
+                            baseline.fleets
+                        },
                         ..baseline
                     },
                     transport,

@@ -13,7 +13,7 @@ registration_rejected() {
     254) ;;
     *) return 1 ;;
   esac
-  if [[ $stderr =~ (^|$'\n')An\ error\ occurred\ \(([^()]*)\)\ when\ calling\ the\ RegisterImage\ operation: ]]; then
+  if [[ $stderr =~ (^|$'\n')An\ error\ occurred\ \(([^()]*)\)\ when\ calling\ the\ RegisterImage\ operation(\ \(reached\ max\ retries:\ 0\))?: ]]; then
     code=${BASH_REMATCH[2]}
     case "$code" in
       AuthFailure|Blocked|IncompleteSignature|InvalidAction|InvalidCharacter|InvalidClientTokenId|InvalidParameter|InvalidParameterCombination|InvalidParameterDependency|InvalidParameterValue|InvalidQueryParameter|MalformedQueryString|MissingAction|MissingAuthenticationToken|MissingParameter|OptInRequired|PendingVerification|RequestExpired|TagPolicyViolation|UnauthorizedOperation|UnknownParameter|UnsupportedOperation|UnsupportedProtocol|ValidationError|InvalidAMIName.Duplicate|InvalidAMIName.Malformed|InvalidBlockDeviceMapping|InvalidSnapshot.NotFound|InvalidSnapshotID.Malformed|InvalidSnapshotID.NotFound|InvalidKernelId.Malformed)
@@ -30,7 +30,7 @@ main() {
   fi
 
   local image="$1" info="$2" name="$3" arch="$4" sha="$5" tag="$6" description="$7"
-  local aws_arch actual boot_mode snapshot tags status
+  local aws_arch actual boot_mode snapshot tags status images image_id
   case "$arch" in
     x86_64) aws_arch=x86_64 ;;
     aarch64) aws_arch=arm64 ;;
@@ -44,6 +44,32 @@ main() {
     return 1
   fi
   boot_mode=$(jq -er '.boot_mode | strings | select(length > 0)' "$info")
+  images=$(aws ec2 describe-images --owners self --include-deprecated --include-disabled \
+    --filters "Name=name,Values=$name" --output json)
+  if ! image_id=$(jq -er --arg name "$name" --arg sha "$sha" --arg tag "$tag" \
+    --arg arch "$arch" --arg aws_arch "$aws_arch" --arg boot_mode "$boot_mode" '
+      if (.Images | type) != "array" then error("invalid image inventory")
+      elif (.Images | length) == 0 then ""
+      elif (.Images | length) != 1 then error("multiple images with the requested name")
+      else .Images[0] |
+        def tag_value($key): [.Tags[]? | select(.Key == $key) | .Value];
+        if .Name == $name and .Architecture == $aws_arch and .BootMode == $boot_mode
+          and (.State == "pending" or .State == "available")
+          and (tag_value("ec2:SharedTag/ImageSha256") == [$sha])
+          and (tag_value("ec2:SharedTag/GangRelease") == [$tag])
+          and (tag_value("ec2:SharedTag/GangImage") == ["gang-image-" + $arch])
+          and (.ImageId | type == "string" and length > 0)
+        then .ImageId
+        else error("existing image metadata does not match")
+        end
+      end' <<<"$images"); then
+    printf 'import-image: cannot safely adopt existing image %s\n' "$name" >&2
+    return 1
+  fi
+  if [[ -n $image_id ]]; then
+    printf '%s\n' "$image_id"
+    return 0
+  fi
   temp_dir=$(mktemp -d)
   trap 'rm -rf -- "$temp_dir"' EXIT
   zstd -d --stdout -- "$image" > "$temp_dir/image.raw"

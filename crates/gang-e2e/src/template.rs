@@ -720,6 +720,9 @@ fn render_control(document: &mut Document<Plugins>, knobs: &ControlKnobs) -> Res
         if let Some(timeout) = knobs.idle_timeout {
             fleet.idle_timeout = timeout;
         }
+        if let Some(wait) = knobs.max_drain_wait {
+            fleet.max_drain_wait = wait;
+        }
         if let Some(min) = knobs.min_instances {
             fleet.min_instances = min;
         }

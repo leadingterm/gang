@@ -416,6 +416,52 @@ run "on_demand_fleet_buys_only_on_demand_capacity" {
 }
 
 
+run "rejects_twenty_second_token_lifetime" {
+  command = plan
+
+  variables {
+    workload_token_max_seconds = 20
+  }
+
+  expect_failures = [var.workload_token_max_seconds]
+}
+
+run "rejects_fifty_nine_second_token_lifetime" {
+  command = plan
+
+  variables {
+    workload_token_max_seconds = 59
+  }
+
+  expect_failures = [var.workload_token_max_seconds]
+}
+
+run "accepts_sixty_second_token_lifetime" {
+  command = plan
+
+  variables {
+    workload_token_max_seconds = 60
+  }
+}
+
+run "accepts_one_hour_token_lifetime" {
+  command = plan
+
+  variables {
+    workload_token_max_seconds = 3600
+  }
+}
+
+run "rejects_token_lifetime_above_maximum" {
+  command = plan
+
+  variables {
+    workload_token_max_seconds = 3601
+  }
+
+  expect_failures = [var.workload_token_max_seconds]
+}
+
 run "rejects_token_lifetime_above_one_hour" {
   command = plan
 

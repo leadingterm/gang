@@ -27,7 +27,7 @@ use crate::drain_cancel::drain_cancel;
 use crate::errors::Result;
 use crate::execution::ExecutionKnobs;
 use crate::fhs_tools::fhs_tools;
-use crate::fleets::fleets;
+use crate::fleets::{run_cold_pair, run_drained_starts};
 use crate::glibc_toolchain::glibc_toolchain;
 use crate::input_root::input_root;
 use crate::integrity::input_integrity;
@@ -259,48 +259,49 @@ gang_types::string_enum! {
 }
 
 impl Scenario {
-    /// Estimated seconds for balancing shards, rounded up from CI scenario timings; where CI
-    /// failed, and for gate one, timings are from a four-CPU run. Follower builds uses a
-    /// provisional estimate combining builds and rolling deploy.
+    /// Seconds for LPT balancing, rounded up (minimum one) from warm x86 CI timings.
+    /// Provisional estimates after fixture changes: sessions 60s (was 181.1s), fleets 75s
+    /// (169.4s), leader failover 75s (120.4s), and database outage 100s (164.5s).
     #[must_use]
     pub const fn weight(self) -> u64 {
         match self {
-            Self::Lifecycle => 44,
-            Self::Network => 19,
-            Self::InputIntegrity => 36,
-            Self::Restart => 51,
-            Self::Limits | Self::SandboxContract => 18,
-            Self::Memory | Self::UnplaceableDisk => 16,
-            Self::Disk => 46,
-            Self::Fleets => 109,
-            Self::ActionTimeout => 37,
-            Self::ActionTimeoutNoop | Self::WorkerRenewal => 38,
-            Self::InputRoot | Self::GlibcToolchain | Self::FhsTools => 15,
-            Self::StaleScope => 50,
-            Self::MemoryEscalation | Self::OversizedFleet => 17,
+            Self::Lifecycle | Self::StaleScope => 56,
+            Self::Network | Self::Restart => 24,
+            Self::InputIntegrity => 33,
+            Self::Limits => 28,
+            Self::SandboxContract | Self::QueuedBehindShortWork => 32,
+            Self::Memory | Self::Revocation | Self::Builds => 23,
+            Self::UnplaceableDisk | Self::InputRoot => 27,
+            Self::Disk => 57,
+            Self::Fleets | Self::LeaderFailover => 75,
+            Self::ActionTimeout => 49,
+            Self::ActionTimeoutNoop => 43,
+            Self::WorkerRenewal | Self::LaunchFailure => 34,
+            Self::GlibcToolchain => 26,
+            Self::FhsTools => 20,
+            Self::MemoryEscalation => 13,
+            Self::OversizedFleet => 12,
             Self::ColdStartMisfit | Self::CheckedInConfigs | Self::Api => 1,
             Self::Preemption => 52,
-            Self::Orphan => 27,
-            Self::DrainCancel => 47,
-            Self::SkippedPass => 6,
-            Self::Cli => 2,
-            Self::Plaintext => 32,
-            Self::Setup => 92,
-            Self::Revocation => 20,
-            Self::Dashboard | Self::CrossRevocation => 14,
-            Self::LaunchFailure => 30,
-            Self::RequestLimits | Self::Builds => 9,
-            Self::ViewerCap => 3,
-            Self::CertificateRotation => 12,
-            Self::Identity => 78,
-            Self::Sessions => 184,
-            Self::ControllerLoss => 62,
-            Self::RollingDeploy => 25,
-            Self::FollowerBuilds => 34,
-            Self::LeaderFailover => 120,
-            Self::LoginAcross | Self::ScheduledMinimum => 4,
-            Self::BurstFromZero | Self::QueuedBehindShortWork | Self::BacklogGrowsFleet => 60,
-            Self::DatabaseOutage => 161,
+            Self::Orphan => 29,
+            Self::DrainCancel => 126,
+            Self::SkippedPass | Self::RequestLimits => 6,
+            Self::Cli => 3,
+            Self::Plaintext => 54,
+            Self::Setup => 88,
+            Self::Dashboard => 18,
+            Self::CrossRevocation => 22,
+            Self::ViewerCap => 2,
+            Self::CertificateRotation => 14,
+            Self::Identity => 80,
+            Self::Sessions => 60,
+            Self::ControllerLoss => 84,
+            Self::RollingDeploy | Self::BurstFromZero => 62,
+            Self::FollowerBuilds => 66,
+            Self::LoginAcross => 15,
+            Self::ScheduledMinimum => 5,
+            Self::BacklogGrowsFleet => 10,
+            Self::DatabaseOutage => 100,
         }
     }
 
@@ -532,15 +533,22 @@ impl Scenario {
     }
 }
 
-/// The verdicts of the fleets scenario on a fresh placement deployment.
+/// The drained-start and cold-pair verdicts on independent, fresh placement deployments.
 fn fleets_checks(ctx: &RunContext<'_>) -> Vec<Check> {
     let variant = Variant {
         fleets: FleetLayout::Placement,
+        control: ControlKnobs::FLEETS,
         ..ctx.baseline
     };
-    attempt(Scenario::Fleets, || {
-        let stack = Stack::create(ctx.inputs, &variant, Transport::Tls, ctx.issuer)?;
-        fleets(&stack, &variant)
+    parallel_variant_checks([false, true], |cold_pair| {
+        attempt(Scenario::Fleets, || {
+            let stack = Stack::create(ctx.inputs, &variant, Transport::Tls, ctx.issuer)?;
+            if cold_pair {
+                run_cold_pair(&stack, &variant)
+            } else {
+                run_drained_starts(&stack, &variant)
+            }
+        })
     })
 }
 
@@ -877,16 +885,16 @@ fn cluster_inputs(ctx: &RunContext<'_>, min: i64, max: i64) -> Result<Deployment
 fn leader_failover_checks(ctx: &RunContext<'_>, engine: Engine) -> Result<Vec<Check>> {
     let invocation = cluster_inputs(ctx, 1, 2)?;
     let variant = required_cluster_variant(Scenario::LeaderFailover, ctx.baseline)?;
-    let mut checks = Vec::new();
-    for zombie in [false, true] {
-        let cluster = crate::cluster::Cluster::start(&invocation, &variant, ctx.issuer, 2, engine)?;
-        let result = cluster.diagnose(crate::leader_failover::leader_failover(&cluster, zombie))?;
-        checks.extend(prefix_checks(
-            result,
+    Ok(parallel_variant_checks([false, true], |zombie| {
+        prefix_checks(
+            attempt(Scenario::LeaderFailover, || {
+                let cluster =
+                    crate::cluster::Cluster::start(&invocation, &variant, ctx.issuer, 2, engine)?;
+                cluster.diagnose(crate::leader_failover::leader_failover(&cluster, zombie))
+            }),
             if zombie { "zombie" } else { "killed" },
-        ));
-    }
-    Ok(checks)
+        )
+    }))
 }
 
 /// Runs the outage scenario with one and two controllers on separate deployments.
@@ -906,34 +914,49 @@ fn database_outage_checks(ctx: &RunContext<'_>, engine: Engine) -> Result<Vec<Ch
     );
     invocation.base_config = toml::to_string(&document).map_err(crate::template::template_error)?;
     let variant = required_cluster_variant(Scenario::DatabaseOutage, ctx.baseline)?;
-    let mut checks = Vec::new();
-    for count in [1, 2] {
-        let cluster =
-            crate::cluster::Cluster::start(&invocation, &variant, ctx.issuer, count, engine)?;
-        let result = cluster.diagnose(crate::database_outage::database_outage(&cluster, count))?;
-        checks.extend(prefix_checks(result, &format!("{count} controllers")));
-    }
-    Ok(checks)
+    Ok(parallel_variant_checks([1, 2], |count| {
+        prefix_checks(
+            attempt(Scenario::DatabaseOutage, || {
+                let cluster = crate::cluster::Cluster::start(
+                    &invocation,
+                    &variant,
+                    ctx.issuer,
+                    count,
+                    engine,
+                )?;
+                cluster.diagnose(crate::database_outage::database_outage(&cluster, count))
+            }),
+            &format!("{count} controllers"),
+        )
+    }))
 }
 
 /// Runs each cluster scenario on its own appropriately configured deployment.
 fn cluster_scenario_checks(scenario: Scenario, ctx: &RunContext<'_>) -> Vec<Check> {
-    cluster_engine_checks(|engine| {
-        crate::stack::with_failure_evidence(|| {
-            cluster_scenario_engine_checks(scenario, ctx, engine)
-        })
-    })
+    cluster_engine_checks(|engine| cluster_scenario_engine_checks(scenario, ctx, engine))
 }
 
 fn cluster_engine_checks(run: impl Fn(Engine) -> Vec<Check> + Sync) -> Vec<Check> {
+    parallel_variant_checks([Engine::DynamoDb, Engine::Postgres], |engine| {
+        prefix_checks(run(engine), engine.as_str())
+    })
+}
+
+/// Runs isolated variants concurrently, retaining evidence and verdict order on each worker.
+/// Join every worker before propagating a panic so no deployment outlives the variant group.
+fn parallel_variant_checks<T: Send, const N: usize>(
+    variants: [T; N],
+    run: impl Fn(T) -> Vec<Check> + Sync,
+) -> Vec<Check> {
     thread::scope(|scope| {
-        let handles = [Engine::DynamoDb, Engine::Postgres].map(|engine| {
+        let handles = variants.map(|variant| {
             let run = &run;
-            scope.spawn(move || prefix_checks(run(engine), engine.as_str()))
+            scope.spawn(move || crate::stack::with_failure_evidence(|| run(variant)))
         });
-        handles
+        let results = handles.map(std::thread::ScopedJoinHandle::join);
+        results
             .into_iter()
-            .flat_map(|handle| match handle.join() {
+            .flat_map(|result| match result {
                 Ok(checks) => checks,
                 Err(panic) => std::panic::resume_unwind(panic),
             })
@@ -1292,6 +1315,50 @@ mod tests {
         assert_ne!(threads[0], threads[1]);
         assert_eq!(checks[0].name, "dynamodb: check");
         assert_eq!(checks[1].name, "postgres: check");
+    }
+
+    #[test]
+    fn independent_variants_overlap_and_keep_complete_verdict_order() {
+        let both_started = std::sync::Barrier::new(2);
+        for variants in [[false, true], [true, false]] {
+            let checks = parallel_variant_checks(variants, |variant| {
+                both_started.wait();
+                if variant {
+                    vec![Check::passed("second")]
+                } else {
+                    vec![
+                        Check::failed("first", "variant failure"),
+                        Check::passed("first end"),
+                    ]
+                }
+            });
+            let names: Vec<_> = checks.iter().map(|check| check.name.as_ref()).collect();
+            assert_eq!(
+                names,
+                if variants[0] {
+                    vec!["second", "first", "first end"]
+                } else {
+                    vec!["first", "first end", "second"]
+                }
+            );
+            assert_eq!(checks.iter().filter(|check| check.is_failure()).count(), 1);
+        }
+    }
+
+    #[test]
+    fn independent_variant_panics_join_every_worker_before_propagating() {
+        let both_started = std::sync::Barrier::new(2);
+        let completed = AtomicUsize::new(0);
+        let result = std::panic::catch_unwind(|| {
+            parallel_variant_checks([true, false], |panic| {
+                both_started.wait();
+                assert!(!panic, "variant panic");
+                completed.fetch_add(1, Ordering::SeqCst);
+                vec![Check::passed("completed")]
+            })
+        });
+        assert!(result.is_err());
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
     }
 
     #[test]

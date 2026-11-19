@@ -356,10 +356,15 @@ pub fn database_outage(cluster: &Cluster<'_>, controller_count: usize) -> Result
             journal.write_line(JOURNAL_END)?;
             outcome
         });
+        // Only server startup overlaps the held build; demand still starts after lease lapse.
+        let preparation = scope.spawn(|| stack.prepare_additional_in(DEMAND_ROOT));
         let mut demand = None;
         let observation = observe_outage(cluster, &build, &journal, &run, || {
             demand = Some(hold.build(scope, Some(DEMAND_ROOT), |_, stop| {
-                let outcome = stack.build_additional(&PROBES[2..4], &demand_run, stop);
+                let prepared = preparation
+                    .join()
+                    .map_err(|_| E2eError::system("demand Bazel preparation thread panicked"))??;
+                let outcome = prepared.build_until(&PROBES[2..4], &demand_run, stop);
                 journal.write_line(JOURNAL_END)?;
                 outcome
             }));
@@ -473,6 +478,9 @@ fn partition(cluster: &Cluster<'_>, journal: &Journal, go: &std::path::Path) -> 
             journal.write_line(JOURNAL_END)?;
             outcome
         });
+        let mut demand_preparation = Some(scope.spawn(|| stack.prepare_additional_in(DEMAND_ROOT)));
+        let mut follower_preparation =
+            Some(scope.spawn(|| stack.prepare_additional_in(FOLLOWER_ROOT)));
         let mut demand = None;
         let mut follower = None;
         let mut cut_leader = None;
@@ -484,13 +492,27 @@ fn partition(cluster: &Cluster<'_>, journal: &Journal, go: &std::path::Path) -> 
             &build,
             |kind| match kind {
                 Demand::Fenced => {
+                    let preparation = demand_preparation.take();
                     demand = Some(hold.build(scope, Some(DEMAND_ROOT), |_, stop| {
-                        stack.build_additional(&PROBES[4..], &demand_run, stop)
+                        let preparation = preparation.ok_or_else(|| {
+                            E2eError::system("fenced demand preparation already consumed")
+                        })?;
+                        let prepared = preparation.join().map_err(|_| {
+                            E2eError::system("demand Bazel preparation thread panicked")
+                        })??;
+                        prepared.build_until(&PROBES[4..], &demand_run, stop)
                     }));
                 }
                 Demand::Follower => {
+                    let preparation = follower_preparation.take();
                     follower = Some(hold.build(scope, Some(FOLLOWER_ROOT), |_, stop| {
-                        stack.build_additional_in(&PROBES, &follower_run, FOLLOWER_ROOT, stop)
+                        let preparation = preparation.ok_or_else(|| {
+                            E2eError::system("follower demand preparation already consumed")
+                        })?;
+                        let prepared = preparation.join().map_err(|_| {
+                            E2eError::system("follower Bazel preparation thread panicked")
+                        })??;
+                        prepared.build_until(&PROBES, &follower_run, stop)
                     }));
                 }
             },

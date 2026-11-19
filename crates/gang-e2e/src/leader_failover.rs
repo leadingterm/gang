@@ -451,6 +451,19 @@ fn build_check(checks: &[Check], outcome: &crate::build_output::BuildOutcome) ->
     }
 }
 
+fn prepare_bazel_and_wait_for_worker(cluster: &Cluster<'_>, leader: usize) -> Result<()> {
+    // Minimum capacity makes the old-worker verdict non-vacuous before submitting demand.
+    std::thread::scope(|scope| -> Result<()> {
+        let preparation = scope.spawn(|| cluster.stack().prepare_bazel());
+        let ready = wait_state(cluster, leader, |state| !state.workers.is_empty());
+        let prepared = preparation
+            .join()
+            .map_err(|_| E2eError::system("Bazel preparation thread panicked"))?;
+        ready?;
+        prepared
+    })
+}
+
 /// Kills or pauses the leader while held actions create queued demand.
 ///
 /// The suite must configure one minimum and two maximum instances, two CPUs per
@@ -460,8 +473,7 @@ fn build_check(checks: &[Check], outcome: &crate::build_output::BuildOutcome) ->
 /// Returns an error if the cluster, journal, or build cannot be observed.
 pub fn leader_failover(cluster: &Cluster<'_>, zombie: bool) -> Result<Vec<Check>> {
     let old = cluster.wait_for_leader()?;
-    // Minimum capacity makes the old-worker verdict non-vacuous before submitting demand.
-    wait_state(cluster, old, |state| !state.workers.is_empty())?;
+    prepare_bazel_and_wait_for_worker(cluster, old)?;
     let before = event_history(cluster, old)?;
     let signal = cluster.stack().signal_path();
     let journal = Journal::create(

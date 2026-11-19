@@ -5,6 +5,7 @@ on:
   pull_request:
   push:
     branches: [main, master]
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
@@ -20,11 +21,9 @@ defaults:
 
 jobs:
   # Private Linux jobs use RunsOn (4 CPU/16 GB); public labels remain free standard runners.
-  # Existing required check IDs stay stable; aggregators validate every dependency.
-  # The final required check covers every job, including those stable contexts.
-  # Long Bazel step timeouts leave cache save room.
+  # The required check covers the x86 PR path; release-validation adds push-only platforms.
   changes:
-    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-arm64/ram=16/image=ubuntu24-full-arm64/extras=s3-cache', github.run_id) || 'ubuntu-24.04-arm' }}
+    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
     timeout-minutes: 5
     outputs:
       heavy: ${{ steps.filter.outputs.heavy }}
@@ -43,7 +42,7 @@ jobs:
   nix-vm:
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
-    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/family=m8i/image=ubuntu24-full-x64/nested-virt/extras=s3-cache', github.run_id) || 'ubuntu-24.04' }}
+    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/family=m8i/image=ubuntu24-full-x64/nested-virt', github.run_id) || 'ubuntu-24.04' }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -52,56 +51,44 @@ jobs:
       - uses: ./.github/actions/setup-nix
         with:
           kvm: 'true'
-          cache-scope: vm
+          cache-save: 'true'
       - name: Run NixOS VM checks
+        env:
+          NIX_CHECK_RESULTS: ${{ runner.temp }}/nix-check-results
         run: tools/lint.sh --nix-vm
 
-  lint-arm64:
+  lint:
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
-    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-arm64/ram=16/image=ubuntu24-full-arm64/extras=s3-cache', github.run_id) || 'ubuntu-24.04-arm' }}
+    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
     timeout-minutes: 15
-    env:
-      CARGO_BUILD_JOBS: '2'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-nix
+      - uses: ./.github/actions/setup-bazel
         with:
-          cache-scope: portable
-      # The portable checks include macOS Clippy of every Cargo target (docs/SPECIFICATION.md §7).
+          cache-job: linux-x86_64
+          restore-only: 'true'
       - name: Lint
+        timeout-minutes: 3
         run: tools/lint.sh --portable
+      - name: Export the Bazel working set
+        uses: ./.github/actions/save-bazel-cache
+        with:
+          mode: export
+          shard: x86-lint
+          prune: 'true'
 
-  lint:
-    needs: [changes, lint-arm64, nix-vm]
-    if: always()
-    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-arm64/ram=16/image=ubuntu24-full-arm64/extras=s3-cache', github.run_id) || 'ubuntu-24.04-arm' }}
-    timeout-minutes: 5
-    steps:
-      - name: Require lint jobs to succeed
-        shell: bash
-        env:
-          CHANGES_RESULT: ${{ needs.changes.result }}
-          HEAVY: ${{ needs.changes.outputs.heavy }}
-          NEEDS_RESULTS: ${{ join(needs.*.result, ' ') }}
-        run: |
-          test "$CHANGES_RESULT" = success
-          case "$HEAVY" in true|false) ;; *) exit 1 ;; esac
-          [[ $NEEDS_RESULTS =~ [^[:space:]] ]]
-          for result in $NEEDS_RESULTS; do
-            case "$result" in
-              success) ;;
-              skipped) test "$HEAVY" = false ;;
-              *) exit 1 ;;
-            esac
-          done
-
-  linux-x86_64:
+  linux-x86_64-shards:
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
-    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) || 'ubuntu-24.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -109,22 +96,120 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-nix
       - uses: ./.github/actions/setup-bazel
+        with:
+          cache-job: linux-x86_64
+          restore-only: 'true'
+      - name: Select shard targets
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: tools/ci-targets.sh --query | tools/ci-targets.sh "$SHARD" 4 > "$RUNNER_TEMP/targets"
       - name: Test
         timeout-minutes: 55
-        run: bazel test --build_event_json_file="$RUNNER_TEMP/bazel-test.bep.json" --profile="$RUNNER_TEMP/bazel-test.profile.gz" //...
+        run: bazel test --skip_incompatible_explicit_targets --target_pattern_file="$RUNNER_TEMP/targets" --build_event_json_file="$RUNNER_TEMP/bazel-test.bep.json" --profile="$RUNNER_TEMP/bazel-test.profile.gz"
+      - name: Export the Bazel working set
+        if: always() && job.status == 'success'
+        uses: ./.github/actions/save-bazel-cache
+        with:
+          mode: export
+          shard: x86-${{ matrix.shard }}
+          prune: ${{ job.status == 'success' }}
+
+  linux-x86_64-bundle:
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-nix
+      - uses: ./.github/actions/setup-bazel
+        with:
+          cache-job: linux-x86_64
+          restore-only: 'true'
+      - name: Build gang and e2e harness
+        timeout-minutes: 50
+        # Cache hits materialize only top-level outputs; upload-gang needs //:gang outside the bundle.
+        run: bazel build --build_event_json_file="$RUNNER_TEMP/bazel-build.bep.json" --profile="$RUNNER_TEMP/bazel-build.profile.gz" //:gang //crates/gang-e2e:bundle
       - uses: ./.github/actions/upload-gang
         with:
           target: x86_64-unknown-linux-musl
-      - name: Save the Bazel disk cache
+      - name: Collect the e2e harness
+        run: |
+          mkdir -p "$RUNNER_TEMP/e2e"
+          cp $(bazel cquery --output=files //crates/gang-e2e:bundle) "$RUNNER_TEMP/e2e/"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-harness-x86_64
+          path: ${{ runner.temp }}/e2e
+          if-no-files-found: error
+      # The four test shards already build the binary and harness; their exports plus lint
+      # cover the used inputs without delaying E2E on a redundant bundle export.
+      - name: Upload bundle build metrics
         if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bazel-metrics-x86-bundle
+          path: |
+            ${{ runner.temp }}/bazel-build.bep.json
+            ${{ runner.temp }}/bazel-build.profile.gz
+          retention-days: 7
+
+  linux-x86_64:
+    needs: [changes, linux-x86_64-shards]
+    if: always()
+    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
+    timeout-minutes: 10
+    steps:
+      - name: Require x86 shards to succeed
+        shell: bash
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          HEAVY: ${{ needs.changes.outputs.heavy }}
+          NEEDS_RESULTS: ${{ format('{0} {1}', needs.changes.result, needs.linux-x86_64-shards.result) }}
+        run: |
+          test "$CHANGES_RESULT" = success
+          case "$HEAVY" in true|false) ;; *) exit 1 ;; esac
+          read -r -a results <<< "$NEEDS_RESULTS"
+          test "${#results[@]}" -eq 2
+          for result in "${results[@]}"; do
+            case "$result" in
+              success) ;;
+              skipped) test "$HEAVY" = false ;;
+              *) exit 1 ;;
+            esac
+          done
+
+  cache-x86_64:
+    needs: [changes, linux-x86_64-shards, linux-x86_64-bundle, lint]
+    if: needs.changes.outputs.heavy == 'true' && needs.linux-x86_64-shards.result == 'success' && needs.linux-x86_64-bundle.result == 'success' && needs.lint.result == 'success'
+    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-nix
+      - uses: ./.github/actions/setup-bazel
+        with:
+          cache-job: linux-x86_64
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: bazel-working-set-x86-*
+          path: ${{ runner.temp }}/bazel-working-sets
+          merge-multiple: false
+      - name: Merge the Bazel working sets
         uses: ./.github/actions/save-bazel-cache
         with:
-          prune: ${{ job.status == 'success' }}
+          mode: merge
+          merge-path: ${{ runner.temp }}/bazel-working-sets
+          prune: 'true'
 
   cross:
     needs: changes
-    if: needs.changes.outputs.heavy == 'true'
-    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-arm64/ram=16/image=ubuntu24-full-arm64/extras=s3-cache', github.run_id) || 'ubuntu-24.04-arm' }}
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) && needs.changes.outputs.heavy == 'true'
+    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-arm64/ram=16/image=ubuntu24-full-arm64', github.run_id) || 'ubuntu-24.04-arm' }}
     timeout-minutes: 50
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -135,16 +220,11 @@ jobs:
       - name: Cross-build gang
         timeout-minutes: 45
         run: bazel build --build_event_json_file="$RUNNER_TEMP/bazel-cross.bep.json" --profile="$RUNNER_TEMP/bazel-cross.profile.gz" --platforms=@zig_sdk//libc_aware/platform:linux_amd64_musl //:gang
-      - name: Save the Bazel disk cache
-        if: always()
-        uses: ./.github/actions/save-bazel-cache
-        with:
-          prune: ${{ job.status == 'success' }}
 
   macos:
     # RunsOn does not support macOS; public release CI still runs this job.
     needs: changes
-    if: ${{ needs.changes.outputs.heavy == 'true' && !github.event.repository.private }}
+    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) && needs.changes.outputs.heavy == 'true' && !github.event.repository.private }}
     runs-on: macos-15
     timeout-minutes: 75
     env:
@@ -159,6 +239,8 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-nix
       - uses: ./.github/actions/setup-bazel
+      - name: Check all Darwin Cargo targets
+        run: nix run .#darwin-check
       - name: Build
         timeout-minutes: 60
         run: |
@@ -172,16 +254,11 @@ jobs:
         run: |
           read -r -a targets <<< "$MACOS_TEST_TARGETS"
           bazel test --build_event_json_file="$RUNNER_TEMP/bazel-darwin-test.bep.json" --profile="$RUNNER_TEMP/bazel-darwin-test.profile.gz" "${targets[@]}"
-      - name: Save the Bazel disk cache
-        if: always()
-        uses: ./.github/actions/save-bazel-cache
-        with:
-          prune: ${{ job.status == 'success' }}
 
-  linux-arm64:
+  linux-arm64-bundle:
     needs: changes
-    if: needs.changes.outputs.heavy == 'true'
-    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-arm64/ram=16/image=ubuntu24-full-arm64/extras=s3-cache', github.run_id) || 'ubuntu-24.04-arm' }}
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) && needs.changes.outputs.heavy == 'true'
+    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-arm64/ram=16/image=ubuntu24-full-arm64', github.run_id) || 'ubuntu-24.04-arm' }}
     timeout-minutes: 65
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -189,22 +266,9 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-nix
       - uses: ./.github/actions/setup-bazel
-      - name: Check BUILD files are in sync
-        run: bazel run //:gazelle.check
       - name: Build gang and e2e harness
         timeout-minutes: 50
         run: bazel build --build_event_json_file="$RUNNER_TEMP/bazel-build.bep.json" --profile="$RUNNER_TEMP/bazel-build.profile.gz" //:gang //crates/gang-e2e:bundle
-      # Native ELF, shell/signal and PostgreSQL boundaries complement the full x86 suite (docs/SPECIFICATION.md §7).
-      - name: Test
-        timeout-minutes: 10
-        run: >-
-          bazel test --build_event_json_file="$RUNNER_TEMP/bazel-test.bep.json" --profile="$RUNNER_TEMP/bazel-test.profile.gz"
-          //crates/gang-main:gang_main_integration_tests_tests/static_binary_test
-          //crates/gang-e2e:gang_e2e_integration_tests_tests/hold_signal_test
-          //crates/gang-postgres:gang_postgres_integration_tests_tests/tls_test
-          //crates/gang-postgres:gang_postgres_integration_tests_tests/contract_test
-          //crates/gang-postgres:gang_postgres_integration_tests_tests/plugin_test
-          //crates/gang-testkit:gang_testkit_integration_tests_tests/postgres_test
       - uses: ./.github/actions/upload-gang
         with:
           target: aarch64-unknown-linux-musl
@@ -217,16 +281,65 @@ jobs:
           name: e2e-harness-aarch64
           path: ${{ runner.temp }}/e2e
           if-no-files-found: error
-      - name: Save the Bazel disk cache
-        if: always()
-        uses: ./.github/actions/save-bazel-cache
-        with:
-          prune: ${{ job.status == 'success' }}
 
-  e2e-gate-1:
-    needs: [changes, linux-arm64]
+  linux-arm64-checks:
+    needs: [changes, linux-arm64-bundle]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) && needs.changes.outputs.heavy == 'true'
+    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-arm64/ram=16/image=ubuntu24-full-arm64', github.run_id) || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-nix
+      - uses: ./.github/actions/setup-bazel
+      - name: Check BUILD files are in sync
+        run: bazel run //:gazelle.check
+      # Native ELF, shell/signal and PostgreSQL boundaries complement the full x86 suite (docs/SPECIFICATION.md §7).
+      - name: Test
+        timeout-minutes: 10
+        run: >-
+          bazel test --build_event_json_file="$RUNNER_TEMP/bazel-test.bep.json" --profile="$RUNNER_TEMP/bazel-test.profile.gz"
+          //crates/gang-main:gang_main_integration_tests_tests/static_binary_test
+          //crates/gang-e2e:gang_e2e_integration_tests_tests/hold_signal_test
+          //crates/gang-postgres:gang_postgres_integration_tests_tests/tls_test
+          //crates/gang-postgres:gang_postgres_integration_tests_tests/contract_test
+          //crates/gang-postgres:gang_postgres_integration_tests_tests/plugin_test
+          //crates/gang-testkit:gang_testkit_integration_tests_tests/postgres_test
+
+  linux-arm64:
+    needs: [changes, linux-arm64-bundle, linux-arm64-checks]
+    if: always() && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
+    timeout-minutes: 5
+    steps:
+      - name: Require ARM jobs to succeed
+        shell: bash
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          HEAVY: ${{ needs.changes.outputs.heavy }}
+          NEEDS_RESULTS: ${{ format('{0} {1} {2}', needs.changes.result, needs.linux-arm64-bundle.result, needs.linux-arm64-checks.result) }}
+        run: |
+          test "$CHANGES_RESULT" = success
+          case "$HEAVY" in true|false) ;; *) exit 1 ;; esac
+          read -r -a results <<< "$NEEDS_RESULTS"
+          test "${#results[@]}" -eq 3
+          for result in "${results[@]}"; do
+            case "$result" in
+              success) ;;
+              skipped) test "$HEAVY" = false ;;
+              *) exit 1 ;;
+            esac
+          done
+
+  e2e-gate-1-shards:
+    needs: [changes, linux-x86_64-bundle]
     if: needs.changes.outputs.heavy == 'true'
-    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-arm64/ram=16/image=ubuntu24-full-arm64/extras=s3-cache', github.run_id) || 'ubuntu-24.04-arm' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
     # The script bounds the gate itself; this timeout is only an outer backstop.
     timeout-minutes: 15
     steps:
@@ -235,12 +348,41 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/run-e2e
         with:
-          args: --gate 1
+          args: --gate 1 --shard ${{ matrix.shard }}/${{ strategy.job-total }}
 
-  e2e-gate-2-shard-1:
-    needs: [changes, linux-arm64]
+  e2e-gate-1:
+    needs: [changes, e2e-gate-1-shards]
+    if: always()
+    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
+    timeout-minutes: 5
+    steps:
+      - name: Require gate 1 shards to succeed
+        shell: bash
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          HEAVY: ${{ needs.changes.outputs.heavy }}
+          NEEDS_RESULTS: ${{ format('{0} {1}', needs.changes.result, needs.e2e-gate-1-shards.result) }}
+        run: |
+          test "$CHANGES_RESULT" = success
+          case "$HEAVY" in true|false) ;; *) exit 1 ;; esac
+          read -r -a results <<< "$NEEDS_RESULTS"
+          test "${#results[@]}" -eq 2
+          for result in "${results[@]}"; do
+            case "$result" in
+              success) ;;
+              skipped) test "$HEAVY" = false ;;
+              *) exit 1 ;;
+            esac
+          done
+
+  e2e-gate-2-shards:
+    needs: [changes, linux-x86_64-bundle]
     if: needs.changes.outputs.heavy == 'true'
-    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-arm64/ram=16/image=ubuntu24-full-arm64/extras=s3-cache', github.run_id) || 'ubuntu-24.04-arm' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -248,25 +390,12 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/run-e2e
         with:
-          args: --gate 2 --additions --shard 1/2
-
-  e2e-gate-2-shard-2:
-    needs: [changes, linux-arm64]
-    if: needs.changes.outputs.heavy == 'true'
-    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-arm64/ram=16/image=ubuntu24-full-arm64/extras=s3-cache', github.run_id) || 'ubuntu-24.04-arm' }}
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/run-e2e
-        with:
-          args: --gate 2 --additions --shard 2/2
+          args: --gate 2 --additions --shard ${{ matrix.shard }}/${{ strategy.job-total }}
 
   e2e-gate-2:
-    needs: [changes, e2e-gate-2-shard-1, e2e-gate-2-shard-2]
+    needs: [changes, e2e-gate-2-shards]
     if: always()
-    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-arm64/ram=16/image=ubuntu24-full-arm64/extras=s3-cache', github.run_id) || 'ubuntu-24.04-arm' }}
+    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
     timeout-minutes: 5
     steps:
       - name: Require gate 2 shards to succeed
@@ -274,12 +403,13 @@ jobs:
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
           HEAVY: ${{ needs.changes.outputs.heavy }}
-          NEEDS_RESULTS: ${{ join(needs.*.result, ' ') }}
+          NEEDS_RESULTS: ${{ format('{0} {1}', needs.changes.result, needs.e2e-gate-2-shards.result) }}
         run: |
           test "$CHANGES_RESULT" = success
           case "$HEAVY" in true|false) ;; *) exit 1 ;; esac
-          [[ $NEEDS_RESULTS =~ [^[:space:]] ]]
-          for result in $NEEDS_RESULTS; do
+          read -r -a results <<< "$NEEDS_RESULTS"
+          test "${#results[@]}" -eq 2
+          for result in "${results[@]}"; do
             case "$result" in
               success) ;;
               skipped) test "$HEAVY" = false ;;
@@ -288,9 +418,9 @@ jobs:
           done
 
   required:
-    needs: [changes, nix-vm, lint-arm64, lint, linux-x86_64, cross, linux-arm64, e2e-gate-1, e2e-gate-2-shard-1, e2e-gate-2-shard-2, e2e-gate-2]
+    needs: [changes, nix-vm, lint, linux-x86_64-shards, linux-x86_64, linux-x86_64-bundle, e2e-gate-1-shards, e2e-gate-1, e2e-gate-2-shards, e2e-gate-2]
     if: always()
-    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-arm64/ram=16/image=ubuntu24-full-arm64/extras=s3-cache', github.run_id) || 'ubuntu-24.04-arm' }}
+    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
     timeout-minutes: 5
     steps:
       - name: Require blocking jobs to succeed
@@ -300,19 +430,46 @@ jobs:
           HEAVY: ${{ needs.changes.outputs.heavy }}
           # Every blocking job result is mandatory.
           NEEDS_RESULTS: >-
-            ${{ format('{0} {1} {2} {3} {4} {5} {6} {7} {8} {9} {10}',
-                  needs.changes.result, needs.nix-vm.result, needs.lint-arm64.result, needs.lint.result,
-                  needs.linux-x86_64.result, needs.cross.result, needs.linux-arm64.result,
-                  needs.e2e-gate-1.result, needs.e2e-gate-2-shard-1.result,
-                  needs.e2e-gate-2-shard-2.result, needs.e2e-gate-2.result) }}
+            ${{ format('{0} {1} {2} {3} {4} {5} {6} {7} {8} {9}',
+                  needs.changes.result, needs.nix-vm.result, needs.lint.result,
+                  needs.linux-x86_64-shards.result, needs.linux-x86_64.result, needs.linux-x86_64-bundle.result,
+                  needs.e2e-gate-1-shards.result, needs.e2e-gate-1.result,
+                  needs.e2e-gate-2-shards.result, needs.e2e-gate-2.result) }}
         run: |
           test "$CHANGES_RESULT" = success
           case "$HEAVY" in true|false) ;; *) exit 1 ;; esac
-          [[ $NEEDS_RESULTS =~ [^[:space:]] ]]
-          for result in $NEEDS_RESULTS; do
+          read -r -a results <<< "$NEEDS_RESULTS"
+          test "${#results[@]}" -eq 10
+          for result in "${results[@]}"; do
             case "$result" in
               success) ;;
               skipped) test "$HEAVY" = false ;;
               *) exit 1 ;;
             esac
           done
+
+  release-validation:
+    needs: [changes, required, linux-arm64, cross, macos]
+    if: always() && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
+    timeout-minutes: 5
+    steps:
+      - name: Require release platforms to succeed
+        shell: bash
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          REQUIRED_RESULT: ${{ needs.required.result }}
+          ARM_RESULT: ${{ needs.linux-arm64.result }}
+          CROSS_RESULT: ${{ needs.cross.result }}
+          MACOS_RESULT: ${{ needs.macos.result }}
+          PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          test "$CHANGES_RESULT" = success
+          test "$REQUIRED_RESULT" = success
+          test "$ARM_RESULT" = success
+          test "$CROSS_RESULT" = success
+          case "$MACOS_RESULT" in
+            success) ;;
+            skipped) test "$PRIVATE" = true ;;
+            *) exit 1 ;;
+          esac
