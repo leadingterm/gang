@@ -29,6 +29,7 @@ portable() {
     actionlint
   )
   nix flake check --no-build --all-systems
+  nix eval --raw .#packages.aarch64-darwin.darwin-check.drvPath >/dev/null
 }
 
 nix_vm() {

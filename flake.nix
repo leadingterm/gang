@@ -35,6 +35,36 @@
       lib.head (lib.findFirst (match: match != null) (throw "MODULE.bazel sets no RUST_VERSION")
         (map (builtins.match "RUST_VERSION = \"(.+)\"") (lib.splitString "\n" (builtins.readFile ./MODULE.bazel))));
 
+    # Lints every Cargo target of the workspace for macOS (tools/darwin-check.sh), which no Linux build compiles.
+    darwinCheck = pkgs: let
+      rust = (rust-overlay.lib.mkRustBin {} pkgs).stable.${rustVersion}.minimal.override {
+        extensions = ["clippy"];
+        targets = ["aarch64-apple-darwin"];
+      };
+      # Cross-checking on Linux links nothing; native macOS uses the real C toolchain.
+      stubCc = pkgs.writeShellScript "darwin-stub-cc" ''
+        out=
+        while [ "$#" -gt 0 ]; do
+          if [ "$1" = -o ]; then out=$2; fi
+          shift
+        done
+        if [ -n "$out" ]; then : >"$out"; fi
+      '';
+      stubAr = pkgs.writeShellScript "darwin-stub-ar" ''
+        if [ -n "''${2:-}" ]; then : >>"$2"; fi
+      '';
+    in
+      pkgs.writeShellApplication {
+        name = "darwin-check";
+        runtimeInputs = [rust pkgs.coreutils pkgs.rsync pkgs.stdenv.cc];
+        runtimeEnv = lib.optionalAttrs (!pkgs.stdenv.hostPlatform.isDarwin) {
+          CC_aarch64_apple_darwin = "${stubCc}";
+          CXX_aarch64_apple_darwin = "${stubCc}";
+          AR_aarch64_apple_darwin = "${stubAr}";
+        };
+        text = builtins.readFile ./tools/darwin-check.sh;
+      };
+
     # NixOS system architectures, keyed by the suffix used in nixosConfigurations names.
     nixosTargets = {
       x86_64 = "x86_64-linux";
@@ -107,45 +137,21 @@
     in
       lib.mapAttrs' (file: _: lib.nameValuePair (lib.removeSuffix ".nix" file) (import (testsDir + "/${file}") {inherit pkgs;})) tests);
 
-    packages = forLinuxSystems (system: let
-      pkgs = pkgsFor system;
-    in {
-      # Bazel is the only builder of gang (statically linked, dashboard embedded): the images carry exactly the binary it built, taken unchanged from the gang-binaries input.
-      gang = gangPackage pkgs "${gang-binaries}/${system}/gang";
-      image = self.lib.image {
-        inherit system;
-        binary = "${gang-binaries}/${system}/gang";
+    packages =
+      forLinuxSystems (system: let
+        pkgs = pkgsFor system;
+      in {
+        # Bazel is the only builder of gang (statically linked, dashboard embedded): the images carry exactly the binary it built, taken unchanged from the gang-binaries input.
+        gang = gangPackage pkgs "${gang-binaries}/${system}/gang";
+        image = self.lib.image {
+          inherit system;
+          binary = "${gang-binaries}/${system}/gang";
+        };
+        darwin-check = darwinCheck pkgs;
+      })
+      // {
+        aarch64-darwin.darwin-check = darwinCheck (pkgsFor "aarch64-darwin");
       };
-      # Lints every Cargo target of the workspace for macOS (tools/darwin-check.sh), which no Linux build compiles.
-      # Nothing is linked, so the target's C compiler and archiver only write empty objects and archives.
-      darwin-check = let
-        rust = (rust-overlay.lib.mkRustBin {} pkgs).stable.${rustVersion}.minimal.override {
-          extensions = ["clippy"];
-          targets = ["aarch64-apple-darwin"];
-        };
-        stubCc = pkgs.writeShellScript "darwin-stub-cc" ''
-          out=
-          while [ "$#" -gt 0 ]; do
-            if [ "$1" = -o ]; then out=$2; fi
-            shift
-          done
-          if [ -n "$out" ]; then : >"$out"; fi
-        '';
-        stubAr = pkgs.writeShellScript "darwin-stub-ar" ''
-          if [ -n "''${2:-}" ]; then : >>"$2"; fi
-        '';
-      in
-        pkgs.writeShellApplication {
-          name = "darwin-check";
-          runtimeInputs = [rust pkgs.coreutils pkgs.rsync pkgs.stdenv.cc];
-          runtimeEnv = {
-            CC_aarch64_apple_darwin = "${stubCc}";
-            CXX_aarch64_apple_darwin = "${stubCc}";
-            AR_aarch64_apple_darwin = "${stubAr}";
-          };
-          text = builtins.readFile ./tools/darwin-check.sh;
-        };
-    });
 
     nixosConfigurations = lib.mapAttrs' (arch: system: lib.nameValuePair "gang-${arch}" (mkNixos system self.packages.${system}.gang [])) nixosTargets;
 
