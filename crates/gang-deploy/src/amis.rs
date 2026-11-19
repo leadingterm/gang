@@ -554,10 +554,13 @@ impl Publication {
             now,
         })
     }
-    fn ordered_regions(&self) -> Vec<(&Region, &RegionImages)> {
-        let mut regions: Vec<_> = self.regions.0.iter().collect();
-        regions.sort_by_key(|(r, _)| (*r != &self.home, *r));
-        regions
+    fn ordered_regions(&self) -> impl Iterator<Item = (&Region, &RegionImages)> {
+        self.regions.0.get_key_value(&self.home).into_iter().chain(
+            self.regions
+                .0
+                .iter()
+                .filter(move |(region, _)| *region != &self.home),
+        )
     }
     fn validate(&self) -> Result<()> {
         let mut identities: BTreeMap<(String, Architecture), String> = BTreeMap::new();
@@ -947,8 +950,8 @@ impl Publication {
 
     /// Computes operations for the current release in the observed regions only.
     ///
-    /// Unlike [`Self::steps`], this does not backfill or change the lifecycle of
-    /// older images or snapshots.
+    /// Unlike [`Self::steps`], this considers only supplied architectures and
+    /// does not backfill or change the lifecycle of older images or snapshots.
     ///
     /// # Errors
     /// Returns an error if no release was supplied, images are inconsistent,
@@ -956,11 +959,12 @@ impl Publication {
     pub fn release_steps(&self) -> Result<Vec<Step>> {
         let release = self.release.as_ref().ok_or(DeployError::NoRelease)?;
         self.validate()?;
-        let names: Vec<_> = release
+        let mut images_iter = release
             .images
             .iter()
-            .map(|(arch, sha)| (*arch, sha, AmiName::new(*arch, sha)))
-            .collect();
+            .map(|(arch, sha)| (*arch, sha, AmiName::new(*arch, sha)));
+        let names: [Option<_>; Architecture::ALL.len()] =
+            std::array::from_fn(|_| images_iter.next());
         for (region, data) in self.ordered_regions() {
             let public = data.images.public_other
                 + data
@@ -971,6 +975,7 @@ impl Publication {
                     .count();
             let new = names
                 .iter()
+                .flatten()
                 .filter(|(_, _, name)| {
                     !data
                         .images
@@ -1000,7 +1005,7 @@ impl Publication {
         self.uploads(home, &mut push);
         let successors = BTreeMap::new();
         for (region, data) in self.ordered_regions() {
-            for (arch, sha, name) in &names {
+            for (arch, sha, name) in names.iter().flatten() {
                 if region != &self.home
                     && !data.images.images.iter().any(|image| image.name == name.0)
                     && let Some(image) =
@@ -1022,7 +1027,11 @@ impl Publication {
                 }
             }
             for image in &data.images.images {
-                if names.iter().any(|(_, _, name)| image.name == name.0) {
+                if names
+                    .iter()
+                    .flatten()
+                    .any(|(_, _, name)| image.name == name.0)
+                {
                     self.image_steps(region, image, &successors, &successors, &mut push)?;
                 }
             }
@@ -1218,6 +1227,54 @@ mod tests {
             .iter()
             .map(ToString::to_string)
             .collect()
+    }
+
+    #[test]
+    fn ordered_regions_prioritizes_home_then_key_order() {
+        let mut p = publication(&[], &[], true, 0, 10);
+        let data = p.regions.0.get(&p.home).unwrap().clone();
+        p.regions.0.clear();
+        for region in ["z-1", "c-1", "a-1", "b-1"] {
+            p.regions.0.insert(region.parse().unwrap(), data.clone());
+        }
+        p.home = "z-1".parse().unwrap();
+        assert_eq!(
+            p.ordered_regions()
+                .map(|(region, _)| region.as_str())
+                .collect::<Vec<_>>(),
+            vec!["z-1", "a-1", "b-1", "c-1"]
+        );
+        p.regions.0.remove(&p.home);
+        assert_eq!(
+            p.ordered_regions()
+                .map(|(region, _)| region.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-1", "b-1", "c-1"]
+        );
+    }
+
+    #[test]
+    fn release_steps_only_plans_supplied_architectures() {
+        let mut p = publication(&current(), &[], true, 0, 10);
+        p.release
+            .as_mut()
+            .unwrap()
+            .images
+            .remove(&Architecture::Aarch64);
+        p.regions
+            .0
+            .get_mut(&"other-1".parse().unwrap())
+            .unwrap()
+            .quota = 1;
+        assert_eq!(
+            release_lines(&p),
+            vec![format!(
+                "copy\tother-1\tami-01\tgang-x86_64-aaaaaaaaaaaaaaaa\tGang v2 gang-image-x86_64 sha256:{X}"
+            )]
+        );
+
+        p.release.as_mut().unwrap().images.clear();
+        assert!(release_lines(&p).is_empty());
     }
 
     #[test]
