@@ -253,8 +253,8 @@ run "direct_endpoint_without_load_balancer" {
     error_message = "SQLite direct deployments must not enable PROXY."
   }
   assert {
-    condition     = !strcontains(output.gang_toml, "[execution.egress]") && !strcontains(output.gang_toml, "[sandbox.bwrap.egress]") && strcontains(output.gang_toml, "grants = []")
-    error_message = "Default fleets must deny network and omit egress configuration."
+    condition     = !strcontains(output.gang_toml, "[execution.egress]") && !strcontains(output.gang_toml, "[sandbox.bwrap.egress]") && !strcontains(output.gang_toml, "[fleets.actions]") && !strcontains(output.gang_toml, "[fleets.actions.resources]")
+    error_message = "Default fleets must deny network and omit action policy and egress tables."
   }
 }
 
@@ -308,15 +308,15 @@ run "rejects_empty_egress_dns" {
   expect_failures = [var.execution_egress]
 }
 
-run "protects_assigned_addresses_when_network_granted" {
+run "protects_assigned_addresses_with_empty_additional_networks" {
   command = apply
   variables {
     hostname = "gang.example.com"
     load_balancer = {}
     execution_egress = {
-      protected_networks = ["198.51.100.0/24"]
-      dns_servers = ["1.1.1.1"]
-      setup_timeout = "12s"
+      protected_networks = []
+      dns_servers        = ["1.1.1.1"]
+      setup_timeout      = "12s"
     }
     fleets = [{
       name = "worker", isa = "x86-64", capacity = "spot"
@@ -338,11 +338,58 @@ run "protects_assigned_addresses_when_network_granted" {
       alltrue([for ip in values(module.load_balancer[0].public_static_ips) : contains(local.protected_networks, "${ip}/32")]),
       length(module.load_balancer[0].public_static_ips) == 1,
     ])
-    error_message = "Protection must include the assigned VPC CIDRs, controller EIP and every public NLB EIP."
+    error_message = "Even with no additional networks, protection must include the assigned VPC CIDRs, controller EIP and every public NLB EIP."
   }
   assert {
-    condition     = strcontains(output.gang_toml, "[execution.egress]") && strcontains(output.gang_toml, "[sandbox.bwrap.egress]") && strcontains(output.gang_toml, "cpu_count = 2")
-    error_message = "The rendered Gang configuration must carry the granted policy and helper section."
+    condition     = strcontains(output.gang_toml, "[execution.egress]\nprotected_networks = ${jsonencode(local.protected_networks)}") && length(local.protected_networks) > 0 && strcontains(output.gang_toml, "[sandbox.bwrap.egress]")
+    error_message = "The rendered egress policy must include the nonempty derived protected networks and helper section."
+  }
+  assert {
+    condition     = strcontains(output.gang_toml, "[fleets.actions]\ngrants = ${jsonencode(sort(tolist(var.fleets[0].actions.grants)))}") && strcontains(output.gang_toml, "[fleets.actions.resources]\ncpu_count = 2\nmemory = \"1GiB\"\ndisk = \"2GiB\"")
+    error_message = "The rendered action tables must include the sorted grants and configured resource ceilings."
+  }
+}
+
+run "network_grant_defaults_additional_networks_to_empty" {
+  command = apply
+  variables {
+    execution_egress = { dns_servers = ["1.1.1.1"] }
+    fleets = [{
+      name = "worker", isa = "x86-64", capacity = "spot"
+      instance_types = ["c6id.4xlarge"]
+      max_instances = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
+      disk_per_instance = "200GiB", target_actions_per_instance = 16
+      actions = { grants = ["network"] }
+    }]
+  }
+  override_resource {
+    target = module.network.aws_vpc.this
+    values = { cidr_block = "10.20.0.0/16", ipv6_cidr_block = "2600:1f00:abcd:1200::/56" }
+  }
+  assert {
+    condition     = length(var.execution_egress.protected_networks) == 0 && length(local.protected_networks) > 0 && contains(local.protected_networks, "10.20.0.0/16") && strcontains(output.gang_toml, "[execution.egress]\nprotected_networks = ${jsonencode(local.protected_networks)}")
+    error_message = "Omitting additional protected networks must default to an empty operator list while rendering derived address protection."
+  }
+  assert {
+    condition     = strcontains(output.gang_toml, "[fleets.actions]\ngrants = ${jsonencode(sort(tolist(var.fleets[0].actions.grants)))}") && !strcontains(output.gang_toml, "[fleets.actions.resources]")
+    error_message = "A grants-only fleet must render sorted grants without an empty resource table."
+  }
+}
+
+run "resource_ceilings_without_grants_omit_grants_table" {
+  command = apply
+  variables {
+    fleets = [{
+      name = "worker", isa = "x86-64", capacity = "spot"
+      instance_types = ["c6id.4xlarge"]
+      max_instances = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
+      disk_per_instance = "200GiB", target_actions_per_instance = 16
+      actions = { resources = { cpu_count = 2 } }
+    }]
+  }
+  assert {
+    condition     = !strcontains(output.gang_toml, "[fleets.actions]") && strcontains(output.gang_toml, "[fleets.actions.resources]\ncpu_count = 2\n\n[fleets.options]") && !strcontains(output.gang_toml, "[execution.egress]")
+    error_message = "A resources-only fleet must render only its configured ceiling table, without empty grants or egress tables."
   }
 }
 

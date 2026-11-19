@@ -24,9 +24,11 @@ target_actions_per_instance = ${f.target_actions_per_instance}
 idle_timeout = ${jsonencode(f.idle_timeout)}
 max_drain_wait = ${jsonencode(f.max_drain_wait)}
 boot_grace = ${jsonencode(f.boot_grace)}
+%{ if length(f.actions.grants) > 0 }
 [fleets.actions]
 grants = ${jsonencode(sort(tolist(f.actions.grants)))}
-
+%{ endif ~}
+%{ if f.actions.resources.cpu_count != null || f.actions.resources.memory != null || f.actions.resources.disk != null }
 [fleets.actions.resources]
 %{ if f.actions.resources.cpu_count != null ~}
 cpu_count = ${f.actions.resources.cpu_count}
@@ -37,8 +39,7 @@ memory = ${jsonencode(f.actions.resources.memory)}
 %{ if f.actions.resources.disk != null ~}
 disk = ${jsonencode(f.actions.resources.disk)}
 %{ endif ~}
-
-
+%{ endif }
 [fleets.options]
 capacity = ${jsonencode(f.capacity)}
 %{ if f.machine_class != null ~}

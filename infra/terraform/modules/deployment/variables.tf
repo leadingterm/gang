@@ -538,22 +538,21 @@ variable "gang_settings" {
 
 variable "execution_egress" {
   type = object({
-    protected_networks = list(string)
+    protected_networks = optional(list(string), [])
     dns_servers        = list(string)
     setup_timeout      = optional(string, "10s")
   })
   default     = null
-  description = "Additional host and network CIDRs to protect, public DNS server IP literals, and setup timeout. Required when a fleet grants network."
+  description = "Additional host and network CIDRs to protect (default none), public DNS server IP literals, and setup timeout. Required when a fleet grants network. The module always derives protection for the VPC CIDRs, controller public IP when present, and public load-balancer static IPs."
 
   validation {
     condition = var.execution_egress == null ? true : (
-      length(var.execution_egress.protected_networks) > 0 &&
       alltrue([for cidr in var.execution_egress.protected_networks : can(cidrhost(cidr, 0))]) &&
       length(var.execution_egress.dns_servers) > 0 &&
       alltrue([for ip in var.execution_egress.dns_servers : can(cidrhost("${ip}/${strcontains(ip, ":") ? 128 : 32}", 0))]) &&
       can(regex("^0*[1-9][0-9]*(ms|s|m|h|d)$", var.execution_egress.setup_timeout))
     )
-    error_message = "execution_egress requires nonempty CIDRs and DNS IP literals and a nonzero setup duration."
+    error_message = "execution_egress requires valid CIDRs, nonempty DNS IP literals and a nonzero setup duration."
   }
 }
 
