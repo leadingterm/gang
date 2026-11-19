@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { clock, day, duration, gib, humanize, splitTail, sum, workerInstance } from "../src/format.ts";
+import { bytes, clock, day, duration, gib, humanize, splitTail, sum, workerInstance } from "../src/format.ts";
 
 const AT = Date.UTC(2026, 0, 15, 10, 9, 30);
 const WORKER = "i-0abc123-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b";
@@ -54,4 +54,13 @@ test("an enum name reads as lowercase words", () => {
 test("a sum totals one number per row, and is zero without rows", () => {
   assert.equal(sum([{ n: 2 }, { n: 5 }, { n: 0 }], (row) => row.n), 7);
   assert.equal(sum([], () => 1), 0);
+});
+
+test("byte units use IEC boundaries and three significant digits", () => {
+  assert.equal(bytes(0), "0 B");
+  assert.equal(bytes(1023), "1,020 B");
+  assert.equal(bytes(1024), "1 KiB");
+  assert.equal(bytes(1536), "1.5 KiB");
+  assert.equal(bytes(1024 ** 2), "1 MiB");
+  assert.equal(bytes(12.345 * 1024 ** 3), "12.3 GiB");
 });

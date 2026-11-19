@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use gang_clock::Timestamp;
 use gang_reconciler::{FleetPass, HostedSnapshot};
-use gang_spi::ActionsView;
+use gang_spi::{ActionsView, MeasuredUsage, Traffic};
 use gang_types::FleetCatalog;
 use gang_wire::SkipReason;
 
@@ -68,6 +68,10 @@ pub struct Inputs<'a> {
     pub events: &'a [gang_wire::Event],
     /// The builds the recorder holds.
     pub builds: &'a gang_insight::Builds,
+    /// Cumulative farm-wide cache traffic.
+    pub traffic: Traffic,
+    /// The provider's latest successful external-store measurement.
+    pub measured: Option<&'a MeasuredUsage>,
     /// The epoch of the principal set, bumped whenever principals change.
     pub principals_epoch: u64,
 }

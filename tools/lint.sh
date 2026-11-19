@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# The two CI lint work jobs run --portable and --nix-vm, covered by the required lint aggregate; tools/gate.sh runs the full local gate.
+# The canonical CI lint aggregate covers lint-arm64 (--portable) and the separate nix-vm job (--nix-vm).
 # Portable checks cover OpenTofu tests, formatting, shell scripts, workflows, flake evaluation, and macOS Clippy.
 # The VM checks require x86_64 Linux/KVM. Stops at the first failure.
 # Usage: nix develop -c tools/lint.sh [--portable|--nix-vm]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 portable() {
-  tools/check-required-jobs.sh
   tools/check-required-jobs_test.sh
   tools/check-opentofu-tests.sh
+  tools/ci-changes_test.sh
+  tools/release-notes_test.sh
+  tools/release-ci_test.sh
   alejandra --check .
   shellcheck infra/scripts/*.sh tools/*.sh
   # actionlint requires a .git entry beside its configuration, workflows, and local actions.
@@ -29,7 +31,17 @@ nix_vm() {
     echo 'The Nix VM checks require Linux x86_64.' >&2
     return 1
   fi
-  nix flake check --all-systems --print-build-logs
+  local names name
+  local -a checks=()
+  names=$(nix eval --json .#checks.x86_64-linux --apply builtins.attrNames | jq -er '.[]')
+  if [[ -z $names ]]; then
+    echo 'No x86_64-linux Nix checks found.' >&2
+    return 1
+  fi
+  while IFS= read -r name; do
+    checks+=(".#checks.x86_64-linux.$name")
+  done <<< "$names"
+  nix build --no-link --print-build-logs "${checks[@]}"
 }
 
 if (( $# == 0 )); then

@@ -1,20 +1,26 @@
 //! The operator dashboard of one server: the hub its viewers read, the publisher that feeds it
-//! after every control pass, and the actions refresher that keeps the actions sample current.
+//! after every control pass, the actions refresher that keeps the actions sample current, and the
+//! sampler that keeps the cache provider's measurement current.
 
 use std::convert::Infallible;
 use std::time::Duration;
 
 use gang_clock::Clock;
 use gang_config::DashboardConfig;
-use gang_spi::{ListingLimits, ScalingEventSeq, SchedulerPort, StateRepositoryPort};
-use gang_state::{Builder, BuilderConfig};
+use gang_spi::{
+    CacheStorePort, ListingLimits, ObservationSink, ScalingEventSeq, SchedulerPort,
+    StateRepositoryPort,
+};
+use gang_state::{Builder, BuilderConfig, CacheBaseline};
 
 use crate::actions::{ActionsCache, ActionsRefresher};
 use crate::api::ApiDashboard;
 use crate::builds::BuildsCell;
+use crate::cache_usage::CacheUsage;
 use crate::errors::ServerError;
 use crate::events::wire_event;
 use crate::hub::{HubConfig, StateHub};
+use crate::leadership::Leading;
 use crate::principals::RevokedPrincipals;
 use crate::publish::StatePublisher;
 
@@ -22,6 +28,7 @@ use crate::publish::StatePublisher;
 pub(crate) struct Dashboard {
     hub: StateHub,
     cache: ActionsCache,
+    usage: CacheUsage,
     config: DashboardConfig,
     provisioner: String,
     poll_interval: Duration,
@@ -43,8 +50,11 @@ impl Dashboard {
         clock: &C,
         repository: &R,
     ) -> Result<Self, ServerError> {
-        let state = Builder::new(builder_config(&config, &provisioner, poll_interval))
-            .initial(clock.wall(), principals_epoch);
+        let state = Builder::new(
+            builder_config(&config, &provisioner, poll_interval),
+            CacheBaseline::default(),
+        )
+        .initial(clock.wall(), principals_epoch);
         let hub = StateHub::new(
             HubConfig {
                 max_viewers: config.max_viewers,
@@ -57,6 +67,7 @@ impl Dashboard {
         let dashboard = Self {
             hub,
             cache: ActionsCache::default(),
+            usage: CacheUsage::default(),
             config,
             provisioner,
             poll_interval,
@@ -94,15 +105,38 @@ impl Dashboard {
         }
     }
 
-    /// The publisher that turns each control pass into the next state frame of the hub.
+    /// The publisher that turns each control pass into the next state frame of the hub, with the
+    /// builds, the cache traffic `sink` counts and the latest cache measurement. Only what grew
+    /// past the term's `baseline` enters a sample.
     #[must_use]
-    pub(crate) fn publisher(&self, builds: BuildsCell) -> StatePublisher {
+    pub(crate) fn publisher(
+        &self,
+        builds: BuildsCell,
+        sink: ObservationSink,
+        baseline: CacheBaseline,
+    ) -> StatePublisher {
         StatePublisher::new(
             self.hub.clone(),
             builder_config(&self.config, &self.provisioner, self.poll_interval),
             self.cache.clone(),
             builds,
+            sink,
+            self.usage.clone(),
+            baseline,
         )
+    }
+
+    /// Keeps the cache provider's measurement current once this controller leads, fetching it
+    /// every history step. Never completes.
+    pub(crate) async fn sample_usage<P: CacheStorePort, C: Clock>(
+        &self,
+        cache: &P,
+        clock: &C,
+        leading: &Leading,
+    ) -> Infallible {
+        self.usage
+            .sample(cache, clock, leading, self.config.history_step.get())
+            .await
     }
 
     /// The refresher that stores the scheduler's actions in the cache at the detail interval.

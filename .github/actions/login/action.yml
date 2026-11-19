@@ -36,15 +36,17 @@ runs:
         set -euo pipefail
 
         if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" || -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]]; then
-          echo '::error::the job has no identity token: grant `id-token: write` to the job' >&2
+          echo "::error::the job has no identity token: grant \`id-token: write\` to the job" >&2
           exit 1
         fi
 
         script_dir="${RUNNER_TEMP}/gang"
         mkdir -p "${script_dir}"
         script="${script_dir}/job-token.sh"
-        cat >"${script}" <<'SCRIPT'
-        #!/usr/bin/env bash
+        {
+          printf '%s\n' '#!/usr/bin/env bash'
+          printf 'AUDIENCE=%q\n' "${AUDIENCE}"
+          cat <<'SCRIPT'
         set -euo pipefail
         response="$(curl --fail --silent --show-error --get \
           --data-urlencode "audience=${AUDIENCE}" \
@@ -57,6 +59,7 @@ runs:
         fi
         printf '%s' "${token}"
         SCRIPT
+        } >"${script}"
         chmod 0700 "${script}"
 
         login=("${GANG}" login --server "${SERVER}" --workload --provider "${PROVIDER}" --token-command "${script}")

@@ -249,6 +249,15 @@ pub struct S3CacheConfig {
     /// See [`S3Tuning`] for each field.
     #[serde(default)]
     pub tuning: S3Tuning,
+    /// How often the leader asks `CloudWatch` for the bucket's daily storage metrics. Defaults to
+    /// `1h`. Must be at least `1h`. See [`UsageInterval`].
+    #[serde(default)]
+    pub usage_interval: UsageInterval,
+    /// Timeouts, attempts and retry backoff of each `CloudWatch` request. Defaults to 10 seconds
+    /// per operation, 3 attempts, 3100 milliseconds to connect, and backoff from one to 20
+    /// seconds. See [`ClientSettings`] for each field.
+    #[serde(default)]
+    pub client: ClientSettings,
 }
 
 /// Parses the optional endpoint and rejects schemes the S3 HTTP client cannot use.
@@ -346,6 +355,73 @@ pub enum ExpiryAgeError {
     /// The duration is longer than `u32::MAX` seconds.
     #[error("consider_expired_after must be at most 4294967295 seconds")]
     TooLong,
+}
+
+/// How often the leader asks `CloudWatch` for the bucket's storage metrics, read from
+/// `usage_interval`. `CloudWatch` reports them once a day, so the interval is at least one hour.
+/// Defaults to one hour. Written as a duration such as `6h`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "NonZeroDuration", into = "NonZeroDuration")]
+pub struct UsageInterval(NonZeroDuration);
+
+impl UsageInterval {
+    /// Shortest accepted interval, one hour.
+    pub const MIN: Self = Self(NonZeroDuration::from_hours(1));
+
+    /// Wraps `value` if it is a whole number of milliseconds of at least [`Self::MIN`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UsageIntervalError::TooShort`] when `value` is shorter than [`Self::MIN`] or
+    /// not a valid duration.
+    pub fn try_new(value: Duration) -> Result<Self, UsageIntervalError> {
+        match NonZeroDuration::try_new(value) {
+            Ok(interval) if interval >= Self::MIN.0 => Ok(Self(interval)),
+            _ => Err(UsageIntervalError::TooShort {
+                min: Self::MIN.get(),
+            }),
+        }
+    }
+
+    /// Returns the interval.
+    #[must_use]
+    pub const fn get(self) -> Duration {
+        self.0.get()
+    }
+}
+
+impl Default for UsageInterval {
+    fn default() -> Self {
+        Self::MIN
+    }
+}
+
+impl TryFrom<NonZeroDuration> for UsageInterval {
+    type Error = UsageIntervalError;
+
+    fn try_from(value: NonZeroDuration) -> Result<Self, Self::Error> {
+        Self::try_new(value.get())
+    }
+}
+
+impl From<UsageInterval> for NonZeroDuration {
+    fn from(value: UsageInterval) -> Self {
+        value.0
+    }
+}
+
+/// Why a duration is not a valid [`UsageInterval`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum UsageIntervalError {
+    /// The duration is shorter than the accepted minimum.
+    #[error(
+        "usage_interval must be a whole number of milliseconds of at least {}",
+        gang_types::duration::display(*.min)
+    )]
+    TooShort {
+        /// Shortest accepted duration.
+        min: Duration,
+    },
 }
 
 /// Settings for the `KmsSigner` plugin, read from the `[signer.kms]` table.

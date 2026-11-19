@@ -24,7 +24,7 @@ mod inputs;
 pub mod sse;
 
 pub use apply::apply;
-pub use builder::Builder;
+pub use builder::{Builder, CacheBaseline};
 pub use diff::diff;
 pub use errors::{ApplyError, DecodeError, EncodeError};
 pub use inputs::{ActionsSample, BuilderConfig, Inputs, PassStatus};

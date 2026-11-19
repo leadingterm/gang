@@ -1,5 +1,5 @@
 {
-  "checksum": "412367eeb064f053fd7a7060bb4b3cba907b484ce5a82c100538f24147646d5d",
+  "checksum": "4df3c699400c752b95dcf52d9b8ca075f2041324a9338dfcce42655b3eefbf79",
   "crates": {
     "adler2 2.0.1": {
       "name": "adler2",
@@ -987,6 +987,57 @@
       ],
       "license_file": null
     },
+    "assert-json-diff 2.0.2": {
+      "name": "assert-json-diff",
+      "version": "2.0.2",
+      "package_url": "https://github.com/davidpdrsn/assert-json-diff.git",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/assert-json-diff/2.0.2/download",
+          "sha256": "47e4f2b81832e72834d7518d8487a0396a28cc408186a2e8854c0f98011faf12"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "assert_json_diff",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "assert_json_diff",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "serde 1.0.229",
+              "target": "serde"
+            },
+            {
+              "id": "serde_json 1.0.154",
+              "target": "serde_json"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2018",
+        "version": "2.0.2"
+      },
+      "license": "MIT",
+      "license_ids": [
+        "MIT"
+      ],
+      "license_file": "LICENSE"
+    },
     "async-lock 3.5.0": {
       "name": "async-lock",
       "version": "3.5.0",
@@ -1391,7 +1442,7 @@
               "target": "aws_credential_types"
             },
             {
-              "id": "aws-runtime 1.10.2",
+              "id": "aws-runtime 1.10.4",
               "target": "aws_runtime"
             },
             {
@@ -1419,19 +1470,19 @@
               "target": "aws_smithy_json"
             },
             {
-              "id": "aws-smithy-runtime 1.16.2",
+              "id": "aws-smithy-runtime 1.16.4",
               "target": "aws_smithy_runtime"
             },
             {
-              "id": "aws-smithy-runtime-api 1.19.2",
+              "id": "aws-smithy-runtime-api 1.22.0",
               "target": "aws_smithy_runtime_api"
             },
             {
-              "id": "aws-smithy-schema 1.1.2",
+              "id": "aws-smithy-schema 1.2.0",
               "target": "aws_smithy_schema"
             },
             {
-              "id": "aws-smithy-types 1.9.1",
+              "id": "aws-smithy-types 1.9.4",
               "target": "aws_smithy_types"
             },
             {
@@ -1532,11 +1583,11 @@
               "target": "aws_smithy_async"
             },
             {
-              "id": "aws-smithy-runtime-api 1.19.2",
+              "id": "aws-smithy-runtime-api 1.22.0",
               "target": "aws_smithy_runtime_api"
             },
             {
-              "id": "aws-smithy-types 1.9.1",
+              "id": "aws-smithy-types 1.9.4",
               "target": "aws_smithy_types"
             },
             {
@@ -1760,14 +1811,14 @@
       ],
       "license_file": "LICENSE"
     },
-    "aws-runtime 1.10.2": {
+    "aws-runtime 1.10.4": {
       "name": "aws-runtime",
-      "version": "1.10.2",
+      "version": "1.10.4",
       "package_url": "https://github.com/smithy-lang/smithy-rs",
       "repository": {
         "Http": {
-          "url": "https://static.crates.io/crates/aws-runtime/1.10.2/download",
-          "sha256": "9a0cc2144962cc5e358467b16e3d82981b1d424a7c3d34602be0036103814a1a"
+          "url": "https://static.crates.io/crates/aws-runtime/1.10.4/download",
+          "sha256": "de8930c11353c72ae54aa24dc94d692df74d59814839cbaf8069d63dbcb4c519"
         }
       },
       "targets": [
@@ -1803,7 +1854,7 @@
               "target": "aws_credential_types"
             },
             {
-              "id": "aws-sigv4 1.6.4",
+              "id": "aws-sigv4 1.6.6",
               "target": "aws_sigv4"
             },
             {
@@ -1819,15 +1870,15 @@
               "target": "aws_smithy_http"
             },
             {
-              "id": "aws-smithy-runtime 1.16.2",
+              "id": "aws-smithy-runtime 1.16.4",
               "target": "aws_smithy_runtime"
             },
             {
-              "id": "aws-smithy-runtime-api 1.19.2",
+              "id": "aws-smithy-runtime-api 1.22.0",
               "target": "aws_smithy_runtime_api"
             },
             {
-              "id": "aws-smithy-types 1.9.1",
+              "id": "aws-smithy-types 1.9.4",
               "target": "aws_smithy_types"
             },
             {
@@ -1876,7 +1927,7 @@
           "selects": {}
         },
         "edition": "2021",
-        "version": "1.10.2"
+        "version": "1.10.4"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -1931,7 +1982,7 @@
               "target": "aws_credential_types"
             },
             {
-              "id": "aws-runtime 1.10.2",
+              "id": "aws-runtime 1.10.4",
               "target": "aws_runtime"
             },
             {
@@ -1947,7 +1998,7 @@
               "target": "aws_smithy_json"
             },
             {
-              "id": "aws-smithy-observability 0.3.0",
+              "id": "aws-smithy-observability 0.3.1",
               "target": "aws_smithy_observability"
             },
             {
@@ -1955,19 +2006,19 @@
               "target": "aws_smithy_query"
             },
             {
-              "id": "aws-smithy-runtime 1.16.2",
+              "id": "aws-smithy-runtime 1.16.4",
               "target": "aws_smithy_runtime"
             },
             {
-              "id": "aws-smithy-runtime-api 1.19.2",
+              "id": "aws-smithy-runtime-api 1.22.0",
               "target": "aws_smithy_runtime_api"
             },
             {
-              "id": "aws-smithy-schema 1.1.2",
+              "id": "aws-smithy-schema 1.2.0",
               "target": "aws_smithy_schema"
             },
             {
-              "id": "aws-smithy-types 1.9.1",
+              "id": "aws-smithy-types 1.9.4",
               "target": "aws_smithy_types"
             },
             {
@@ -2000,6 +2051,142 @@
         },
         "edition": "2021",
         "version": "1.140.0"
+      },
+      "license": "Apache-2.0",
+      "license_ids": [
+        "Apache-2.0"
+      ],
+      "license_file": "LICENSE"
+    },
+    "aws-sdk-cloudwatch 1.144.0": {
+      "name": "aws-sdk-cloudwatch",
+      "version": "1.144.0",
+      "package_url": "https://github.com/awslabs/aws-sdk-rust",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/aws-sdk-cloudwatch/1.144.0/download",
+          "sha256": "f8f8fe67464c18d0018cb16b9743e9be25603d30f2615ff15fdaced55d8e5b54"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "aws_sdk_cloudwatch",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "aws_sdk_cloudwatch",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "behavior-version-latest",
+            "rt-tokio"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "arc-swap 1.9.3",
+              "target": "arc_swap"
+            },
+            {
+              "id": "aws-credential-types 1.3.1",
+              "target": "aws_credential_types"
+            },
+            {
+              "id": "aws-runtime 1.10.4",
+              "target": "aws_runtime"
+            },
+            {
+              "id": "aws-smithy-async 1.3.1",
+              "target": "aws_smithy_async"
+            },
+            {
+              "id": "aws-smithy-cbor 0.64.2",
+              "target": "aws_smithy_cbor"
+            },
+            {
+              "id": "aws-smithy-compression 0.2.0",
+              "target": "aws_smithy_compression"
+            },
+            {
+              "id": "aws-smithy-http 0.64.3",
+              "target": "aws_smithy_http"
+            },
+            {
+              "id": "aws-smithy-json 0.65.1",
+              "target": "aws_smithy_json"
+            },
+            {
+              "id": "aws-smithy-observability 0.3.1",
+              "target": "aws_smithy_observability"
+            },
+            {
+              "id": "aws-smithy-runtime 1.16.4",
+              "target": "aws_smithy_runtime"
+            },
+            {
+              "id": "aws-smithy-runtime-api 1.22.0",
+              "target": "aws_smithy_runtime_api"
+            },
+            {
+              "id": "aws-smithy-schema 1.2.0",
+              "target": "aws_smithy_schema"
+            },
+            {
+              "id": "aws-smithy-types 1.9.4",
+              "target": "aws_smithy_types"
+            },
+            {
+              "id": "aws-types 1.7.0",
+              "target": "aws_types"
+            },
+            {
+              "id": "fastrand 2.5.0",
+              "target": "fastrand"
+            },
+            {
+              "id": "flate2 1.1.10",
+              "target": "flate2"
+            },
+            {
+              "id": "http 1.5.0",
+              "target": "http",
+              "alias": "http_1x"
+            },
+            {
+              "id": "http-body 1.1.0",
+              "target": "http_body",
+              "alias": "http_body_1x"
+            },
+            {
+              "id": "http-body-util 0.1.5",
+              "target": "http_body_util"
+            },
+            {
+              "id": "regex-lite 0.1.9",
+              "target": "regex_lite"
+            },
+            {
+              "id": "tracing 0.1.44",
+              "target": "tracing"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "1.144.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -2054,7 +2241,7 @@
               "target": "aws_credential_types"
             },
             {
-              "id": "aws-runtime 1.10.2",
+              "id": "aws-runtime 1.10.4",
               "target": "aws_runtime"
             },
             {
@@ -2070,23 +2257,23 @@
               "target": "aws_smithy_json"
             },
             {
-              "id": "aws-smithy-observability 0.3.0",
+              "id": "aws-smithy-observability 0.3.1",
               "target": "aws_smithy_observability"
             },
             {
-              "id": "aws-smithy-runtime 1.16.2",
+              "id": "aws-smithy-runtime 1.16.4",
               "target": "aws_smithy_runtime"
             },
             {
-              "id": "aws-smithy-runtime-api 1.19.2",
+              "id": "aws-smithy-runtime-api 1.22.0",
               "target": "aws_smithy_runtime_api"
             },
             {
-              "id": "aws-smithy-schema 1.1.2",
+              "id": "aws-smithy-schema 1.2.0",
               "target": "aws_smithy_schema"
             },
             {
-              "id": "aws-smithy-types 1.9.1",
+              "id": "aws-smithy-types 1.9.4",
               "target": "aws_smithy_types"
             },
             {
@@ -2177,7 +2364,7 @@
               "target": "aws_credential_types"
             },
             {
-              "id": "aws-runtime 1.10.2",
+              "id": "aws-runtime 1.10.4",
               "target": "aws_runtime"
             },
             {
@@ -2193,7 +2380,7 @@
               "target": "aws_smithy_json"
             },
             {
-              "id": "aws-smithy-observability 0.3.0",
+              "id": "aws-smithy-observability 0.3.1",
               "target": "aws_smithy_observability"
             },
             {
@@ -2201,19 +2388,19 @@
               "target": "aws_smithy_query"
             },
             {
-              "id": "aws-smithy-runtime 1.16.2",
+              "id": "aws-smithy-runtime 1.16.4",
               "target": "aws_smithy_runtime"
             },
             {
-              "id": "aws-smithy-runtime-api 1.19.2",
+              "id": "aws-smithy-runtime-api 1.22.0",
               "target": "aws_smithy_runtime_api"
             },
             {
-              "id": "aws-smithy-schema 1.1.2",
+              "id": "aws-smithy-schema 1.2.0",
               "target": "aws_smithy_schema"
             },
             {
-              "id": "aws-smithy-types 1.9.1",
+              "id": "aws-smithy-types 1.9.4",
               "target": "aws_smithy_types"
             },
             {
@@ -2300,7 +2487,7 @@
               "target": "aws_credential_types"
             },
             {
-              "id": "aws-runtime 1.10.2",
+              "id": "aws-runtime 1.10.4",
               "target": "aws_runtime"
             },
             {
@@ -2316,23 +2503,23 @@
               "target": "aws_smithy_json"
             },
             {
-              "id": "aws-smithy-observability 0.3.0",
+              "id": "aws-smithy-observability 0.3.1",
               "target": "aws_smithy_observability"
             },
             {
-              "id": "aws-smithy-runtime 1.16.2",
+              "id": "aws-smithy-runtime 1.16.4",
               "target": "aws_smithy_runtime"
             },
             {
-              "id": "aws-smithy-runtime-api 1.19.2",
+              "id": "aws-smithy-runtime-api 1.22.0",
               "target": "aws_smithy_runtime_api"
             },
             {
-              "id": "aws-smithy-schema 1.1.2",
+              "id": "aws-smithy-schema 1.2.0",
               "target": "aws_smithy_schema"
             },
             {
-              "id": "aws-smithy-types 1.9.1",
+              "id": "aws-smithy-types 1.9.4",
               "target": "aws_smithy_types"
             },
             {
@@ -2419,11 +2606,11 @@
               "target": "aws_credential_types"
             },
             {
-              "id": "aws-runtime 1.10.2",
+              "id": "aws-runtime 1.10.4",
               "target": "aws_runtime"
             },
             {
-              "id": "aws-sigv4 1.6.4",
+              "id": "aws-sigv4 1.6.6",
               "target": "aws_sigv4"
             },
             {
@@ -2447,23 +2634,23 @@
               "target": "aws_smithy_json"
             },
             {
-              "id": "aws-smithy-observability 0.3.0",
+              "id": "aws-smithy-observability 0.3.1",
               "target": "aws_smithy_observability"
             },
             {
-              "id": "aws-smithy-runtime 1.16.2",
+              "id": "aws-smithy-runtime 1.16.4",
               "target": "aws_smithy_runtime"
             },
             {
-              "id": "aws-smithy-runtime-api 1.19.2",
+              "id": "aws-smithy-runtime-api 1.22.0",
               "target": "aws_smithy_runtime_api"
             },
             {
-              "id": "aws-smithy-schema 1.1.2",
+              "id": "aws-smithy-schema 1.2.0",
               "target": "aws_smithy_schema"
             },
             {
-              "id": "aws-smithy-types 1.9.1",
+              "id": "aws-smithy-types 1.9.4",
               "target": "aws_smithy_types"
             },
             {
@@ -2576,7 +2763,7 @@
               "target": "aws_credential_types"
             },
             {
-              "id": "aws-runtime 1.10.2",
+              "id": "aws-runtime 1.10.4",
               "target": "aws_runtime"
             },
             {
@@ -2592,23 +2779,23 @@
               "target": "aws_smithy_json"
             },
             {
-              "id": "aws-smithy-observability 0.3.0",
+              "id": "aws-smithy-observability 0.3.1",
               "target": "aws_smithy_observability"
             },
             {
-              "id": "aws-smithy-runtime 1.16.2",
+              "id": "aws-smithy-runtime 1.16.4",
               "target": "aws_smithy_runtime"
             },
             {
-              "id": "aws-smithy-runtime-api 1.19.2",
+              "id": "aws-smithy-runtime-api 1.22.0",
               "target": "aws_smithy_runtime_api"
             },
             {
-              "id": "aws-smithy-schema 1.1.2",
+              "id": "aws-smithy-schema 1.2.0",
               "target": "aws_smithy_schema"
             },
             {
-              "id": "aws-smithy-types 1.9.1",
+              "id": "aws-smithy-types 1.9.4",
               "target": "aws_smithy_types"
             },
             {
@@ -2688,7 +2875,7 @@
               "target": "aws_credential_types"
             },
             {
-              "id": "aws-runtime 1.10.2",
+              "id": "aws-runtime 1.10.4",
               "target": "aws_runtime"
             },
             {
@@ -2704,23 +2891,23 @@
               "target": "aws_smithy_json"
             },
             {
-              "id": "aws-smithy-observability 0.3.0",
+              "id": "aws-smithy-observability 0.3.1",
               "target": "aws_smithy_observability"
             },
             {
-              "id": "aws-smithy-runtime 1.16.2",
+              "id": "aws-smithy-runtime 1.16.4",
               "target": "aws_smithy_runtime"
             },
             {
-              "id": "aws-smithy-runtime-api 1.19.2",
+              "id": "aws-smithy-runtime-api 1.22.0",
               "target": "aws_smithy_runtime_api"
             },
             {
-              "id": "aws-smithy-schema 1.1.2",
+              "id": "aws-smithy-schema 1.2.0",
               "target": "aws_smithy_schema"
             },
             {
-              "id": "aws-smithy-types 1.9.1",
+              "id": "aws-smithy-types 1.9.4",
               "target": "aws_smithy_types"
             },
             {
@@ -2807,7 +2994,7 @@
               "target": "aws_credential_types"
             },
             {
-              "id": "aws-runtime 1.10.2",
+              "id": "aws-runtime 1.10.4",
               "target": "aws_runtime"
             },
             {
@@ -2823,7 +3010,7 @@
               "target": "aws_smithy_json"
             },
             {
-              "id": "aws-smithy-observability 0.3.0",
+              "id": "aws-smithy-observability 0.3.1",
               "target": "aws_smithy_observability"
             },
             {
@@ -2831,19 +3018,19 @@
               "target": "aws_smithy_query"
             },
             {
-              "id": "aws-smithy-runtime 1.16.2",
+              "id": "aws-smithy-runtime 1.16.4",
               "target": "aws_smithy_runtime"
             },
             {
-              "id": "aws-smithy-runtime-api 1.19.2",
+              "id": "aws-smithy-runtime-api 1.22.0",
               "target": "aws_smithy_runtime_api"
             },
             {
-              "id": "aws-smithy-schema 1.1.2",
+              "id": "aws-smithy-schema 1.2.0",
               "target": "aws_smithy_schema"
             },
             {
-              "id": "aws-smithy-types 1.9.1",
+              "id": "aws-smithy-types 1.9.4",
               "target": "aws_smithy_types"
             },
             {
@@ -2883,14 +3070,14 @@
       ],
       "license_file": "LICENSE"
     },
-    "aws-sigv4 1.6.4": {
+    "aws-sigv4 1.6.6": {
       "name": "aws-sigv4",
-      "version": "1.6.4",
+      "version": "1.6.6",
       "package_url": "https://github.com/smithy-lang/smithy-rs",
       "repository": {
         "Http": {
-          "url": "https://static.crates.io/crates/aws-sigv4/1.6.4/download",
-          "sha256": "f385da9b7757ed4c8214797ad663ff534fb622006143530aa80e21f8e06ff85c"
+          "url": "https://static.crates.io/crates/aws-sigv4/1.6.6/download",
+          "sha256": "6c5aa04c533733a77879294f1854c27b3715cc50ea71756d1f6a958702b1a9fb"
         }
       },
       "targets": [
@@ -2936,11 +3123,11 @@
               "target": "aws_smithy_http"
             },
             {
-              "id": "aws-smithy-runtime-api 1.19.2",
+              "id": "aws-smithy-runtime-api 1.22.0",
               "target": "aws_smithy_runtime_api"
             },
             {
-              "id": "aws-smithy-types 1.9.1",
+              "id": "aws-smithy-types 1.9.4",
               "target": "aws_smithy_types"
             },
             {
@@ -2983,7 +3170,7 @@
           "selects": {}
         },
         "edition": "2021",
-        "version": "1.6.4"
+        "version": "1.6.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -3052,6 +3239,73 @@
       ],
       "license_file": "LICENSE"
     },
+    "aws-smithy-cbor 0.64.2": {
+      "name": "aws-smithy-cbor",
+      "version": "0.64.2",
+      "package_url": "https://github.com/awslabs/smithy-rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/aws-smithy-cbor/0.64.2/download",
+          "sha256": "4266fb224b57a8fdab0aae88ec9948e530c2a007409fd7c6eee38da40591b307"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "aws_smithy_cbor",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "aws_smithy_cbor",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "aws-smithy-runtime-api 1.22.0",
+              "target": "aws_smithy_runtime_api"
+            },
+            {
+              "id": "aws-smithy-schema 1.2.0",
+              "target": "aws_smithy_schema"
+            },
+            {
+              "id": "aws-smithy-types 1.9.4",
+              "target": "aws_smithy_types"
+            },
+            {
+              "id": "bigdecimal 0.4.11",
+              "target": "bigdecimal"
+            },
+            {
+              "id": "minicbor 2.3.1",
+              "target": "minicbor"
+            },
+            {
+              "id": "num-bigint 0.4.8",
+              "target": "num_bigint"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.64.2"
+      },
+      "license": "Apache-2.0",
+      "license_ids": [
+        "Apache-2.0"
+      ],
+      "license_file": "LICENSE"
+    },
     "aws-smithy-checksums 0.65.0": {
       "name": "aws-smithy-checksums",
       "version": "0.65.0",
@@ -3088,7 +3342,7 @@
               "target": "aws_smithy_http"
             },
             {
-              "id": "aws-smithy-types 1.9.1",
+              "id": "aws-smithy-types 1.9.4",
               "target": "aws_smithy_types"
             },
             {
@@ -3149,6 +3403,91 @@
       ],
       "license_file": "LICENSE"
     },
+    "aws-smithy-compression 0.2.0": {
+      "name": "aws-smithy-compression",
+      "version": "0.2.0",
+      "package_url": "https://github.com/smithy-lang/smithy-rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/aws-smithy-compression/0.2.0/download",
+          "sha256": "016ef334a13c53bd75184bb8f89b0fb2aa4d56cb3cfc478ab3f05f13654b60a1"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "aws_smithy_compression",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "aws_smithy_compression",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "aws-smithy-runtime-api 1.22.0",
+              "target": "aws_smithy_runtime_api"
+            },
+            {
+              "id": "aws-smithy-types 1.9.4",
+              "target": "aws_smithy_types"
+            },
+            {
+              "id": "bytes 1.12.1",
+              "target": "bytes"
+            },
+            {
+              "id": "flate2 1.1.10",
+              "target": "flate2"
+            },
+            {
+              "id": "futures-util 0.3.34",
+              "target": "futures_util"
+            },
+            {
+              "id": "http 1.5.0",
+              "target": "http",
+              "alias": "http_1x"
+            },
+            {
+              "id": "http-body 1.1.0",
+              "target": "http_body",
+              "alias": "http_body_1x"
+            },
+            {
+              "id": "http-body-util 0.1.5",
+              "target": "http_body_util"
+            },
+            {
+              "id": "pin-project-lite 0.2.17",
+              "target": "pin_project_lite"
+            },
+            {
+              "id": "tracing 0.1.44",
+              "target": "tracing"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.2.0"
+      },
+      "license": "Apache-2.0",
+      "license_ids": [
+        "Apache-2.0"
+      ],
+      "license_file": "LICENSE"
+    },
     "aws-smithy-eventstream 0.61.6": {
       "name": "aws-smithy-eventstream",
       "version": "0.61.6",
@@ -3181,7 +3520,7 @@
         "deps": {
           "common": [
             {
-              "id": "aws-smithy-types 1.9.1",
+              "id": "aws-smithy-types 1.9.4",
               "target": "aws_smithy_types"
             },
             {
@@ -3247,11 +3586,11 @@
               "target": "aws_smithy_eventstream"
             },
             {
-              "id": "aws-smithy-runtime-api 1.19.2",
+              "id": "aws-smithy-runtime-api 1.22.0",
               "target": "aws_smithy_runtime_api"
             },
             {
-              "id": "aws-smithy-types 1.9.1",
+              "id": "aws-smithy-types 1.9.4",
               "target": "aws_smithy_types"
             },
             {
@@ -3342,7 +3681,8 @@
             "__rustls",
             "default-client",
             "rt-tokio",
-            "rustls-ring"
+            "rustls-ring",
+            "test-util"
           ],
           "selects": {}
         },
@@ -3353,12 +3693,20 @@
               "target": "aws_smithy_async"
             },
             {
-              "id": "aws-smithy-runtime-api 1.19.2",
+              "id": "aws-smithy-protocol-test 0.64.0",
+              "target": "aws_smithy_protocol_test"
+            },
+            {
+              "id": "aws-smithy-runtime-api 1.22.0",
               "target": "aws_smithy_runtime_api"
             },
             {
-              "id": "aws-smithy-types 1.9.1",
+              "id": "aws-smithy-types 1.9.4",
               "target": "aws_smithy_types"
+            },
+            {
+              "id": "bytes 1.12.1",
+              "target": "bytes"
             },
             {
               "id": "h2 0.4.20",
@@ -3368,6 +3716,11 @@
               "id": "http 1.5.0",
               "target": "http",
               "alias": "http_1x"
+            },
+            {
+              "id": "http-body 1.1.0",
+              "target": "http_body",
+              "alias": "http_body_1x"
             },
             {
               "id": "hyper 1.12.0",
@@ -3380,6 +3733,10 @@
             {
               "id": "hyper-util 0.1.21",
               "target": "hyper_util"
+            },
+            {
+              "id": "indexmap 2.14.2",
+              "target": "indexmap"
             },
             {
               "id": "pin-project-lite 0.2.17",
@@ -3396,6 +3753,14 @@
             {
               "id": "rustls-pki-types 1.15.1",
               "target": "rustls_pki_types"
+            },
+            {
+              "id": "serde 1.0.229",
+              "target": "serde"
+            },
+            {
+              "id": "serde_json 1.0.154",
+              "target": "serde_json"
             },
             {
               "id": "tokio 1.54.1",
@@ -3457,15 +3822,15 @@
         "deps": {
           "common": [
             {
-              "id": "aws-smithy-runtime-api 1.19.2",
+              "id": "aws-smithy-runtime-api 1.22.0",
               "target": "aws_smithy_runtime_api"
             },
             {
-              "id": "aws-smithy-schema 1.1.2",
+              "id": "aws-smithy-schema 1.2.0",
               "target": "aws_smithy_schema"
             },
             {
-              "id": "aws-smithy-types 1.9.1",
+              "id": "aws-smithy-types 1.9.4",
               "target": "aws_smithy_types"
             }
           ],
@@ -3480,14 +3845,14 @@
       ],
       "license_file": "LICENSE"
     },
-    "aws-smithy-observability 0.3.0": {
+    "aws-smithy-observability 0.3.1": {
       "name": "aws-smithy-observability",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": "https://github.com/awslabs/smithy-rs",
       "repository": {
         "Http": {
-          "url": "https://static.crates.io/crates/aws-smithy-observability/0.3.0/download",
-          "sha256": "8e86338c869539a581bf161247762a6e87f92c5c075060057b5ed6d06632ed0c"
+          "url": "https://static.crates.io/crates/aws-smithy-observability/0.3.1/download",
+          "sha256": "a416257d7b1b0f32a517a470a8c1dd354d8c4aa697ccab81a11a1e6cfb7418e3"
         }
       },
       "targets": [
@@ -3512,14 +3877,117 @@
         "deps": {
           "common": [
             {
-              "id": "aws-smithy-runtime-api 1.19.2",
+              "id": "aws-smithy-runtime-api 1.22.0",
               "target": "aws_smithy_runtime_api"
+            },
+            {
+              "id": "aws-smithy-types 1.9.4",
+              "target": "aws_smithy_types"
+            },
+            {
+              "id": "tracing 0.1.44",
+              "target": "tracing"
             }
           ],
           "selects": {}
         },
         "edition": "2021",
-        "version": "0.3.0"
+        "version": "0.3.1"
+      },
+      "license": "Apache-2.0",
+      "license_ids": [
+        "Apache-2.0"
+      ],
+      "license_file": "LICENSE"
+    },
+    "aws-smithy-protocol-test 0.64.0": {
+      "name": "aws-smithy-protocol-test",
+      "version": "0.64.0",
+      "package_url": "https://github.com/smithy-lang/smithy-rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/aws-smithy-protocol-test/0.64.0/download",
+          "sha256": "f76511a0e223ce78deb6a78b8afebda99cb737cfbc8a58d96dcb190f012dd40a"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "aws_smithy_protocol_test",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "aws_smithy_protocol_test",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default",
+            "http-02x"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "assert-json-diff 2.0.2",
+              "target": "assert_json_diff"
+            },
+            {
+              "id": "aws-smithy-runtime-api 1.22.0",
+              "target": "aws_smithy_runtime_api"
+            },
+            {
+              "id": "base64-simd 0.8.0",
+              "target": "base64_simd"
+            },
+            {
+              "id": "cbor-diag 0.1.12",
+              "target": "cbor_diag"
+            },
+            {
+              "id": "ciborium 0.2.2",
+              "target": "ciborium"
+            },
+            {
+              "id": "http 0.2.12",
+              "target": "http",
+              "alias": "http_0x"
+            },
+            {
+              "id": "pretty_assertions 1.4.1",
+              "target": "pretty_assertions"
+            },
+            {
+              "id": "regex-lite 0.1.9",
+              "target": "regex_lite"
+            },
+            {
+              "id": "roxmltree 0.14.1",
+              "target": "roxmltree"
+            },
+            {
+              "id": "serde_json 1.0.154",
+              "target": "serde_json"
+            },
+            {
+              "id": "thiserror 2.0.21",
+              "target": "thiserror"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.64.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -3559,15 +4027,15 @@
         "deps": {
           "common": [
             {
-              "id": "aws-smithy-runtime-api 1.19.2",
+              "id": "aws-smithy-runtime-api 1.22.0",
               "target": "aws_smithy_runtime_api"
             },
             {
-              "id": "aws-smithy-schema 1.1.2",
+              "id": "aws-smithy-schema 1.2.0",
               "target": "aws_smithy_schema"
             },
             {
-              "id": "aws-smithy-types 1.9.1",
+              "id": "aws-smithy-types 1.9.4",
               "target": "aws_smithy_types"
             },
             {
@@ -3590,14 +4058,14 @@
       ],
       "license_file": "LICENSE"
     },
-    "aws-smithy-runtime 1.16.2": {
+    "aws-smithy-runtime 1.16.4": {
       "name": "aws-smithy-runtime",
-      "version": "1.16.2",
+      "version": "1.16.4",
       "package_url": "https://github.com/smithy-lang/smithy-rs",
       "repository": {
         "Http": {
-          "url": "https://static.crates.io/crates/aws-smithy-runtime/1.16.2/download",
-          "sha256": "4cb80fb19c084da5fca9d797845735e184445e5b958599440d67529bf6ef1b64"
+          "url": "https://static.crates.io/crates/aws-smithy-runtime/1.16.4/download",
+          "sha256": "7ed38b842f93dd8220cc8816750c72ce914b22c6eb3df02beb9632333ccb366d"
         }
       },
       "targets": [
@@ -3637,19 +4105,19 @@
               "target": "aws_smithy_http"
             },
             {
-              "id": "aws-smithy-observability 0.3.0",
+              "id": "aws-smithy-observability 0.3.1",
               "target": "aws_smithy_observability"
             },
             {
-              "id": "aws-smithy-runtime-api 1.19.2",
+              "id": "aws-smithy-runtime-api 1.22.0",
               "target": "aws_smithy_runtime_api"
             },
             {
-              "id": "aws-smithy-schema 1.1.2",
+              "id": "aws-smithy-schema 1.2.0",
               "target": "aws_smithy_schema"
             },
             {
-              "id": "aws-smithy-types 1.9.1",
+              "id": "aws-smithy-types 1.9.4",
               "target": "aws_smithy_types"
             },
             {
@@ -3690,7 +4158,7 @@
           "selects": {}
         },
         "edition": "2021",
-        "version": "1.16.2"
+        "version": "1.16.4"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -3698,14 +4166,14 @@
       ],
       "license_file": "LICENSE"
     },
-    "aws-smithy-runtime-api 1.19.2": {
+    "aws-smithy-runtime-api 1.22.0": {
       "name": "aws-smithy-runtime-api",
-      "version": "1.19.2",
+      "version": "1.22.0",
       "package_url": "https://github.com/smithy-lang/smithy-rs",
       "repository": {
         "Http": {
-          "url": "https://static.crates.io/crates/aws-smithy-runtime-api/1.19.2/download",
-          "sha256": "8c4e85cffe9944b10d576b075432bd8f98dbc081e8681cb37d5b2d87dc27bc84"
+          "url": "https://static.crates.io/crates/aws-smithy-runtime-api/1.22.0/download",
+          "sha256": "c0b79dbb5331ccd297686df811d50ab3f39db171f5c765372a69272a0990b014"
         }
       },
       "targets": [
@@ -3744,7 +4212,7 @@
               "target": "aws_smithy_async"
             },
             {
-              "id": "aws-smithy-types 1.9.1",
+              "id": "aws-smithy-types 1.9.4",
               "target": "aws_smithy_types"
             },
             {
@@ -3785,7 +4253,7 @@
           ],
           "selects": {}
         },
-        "version": "1.19.2"
+        "version": "1.22.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -3848,14 +4316,14 @@
       ],
       "license_file": "LICENSE"
     },
-    "aws-smithy-schema 1.1.2": {
+    "aws-smithy-schema 1.2.0": {
       "name": "aws-smithy-schema",
-      "version": "1.1.2",
+      "version": "1.2.0",
       "package_url": "https://github.com/smithy-lang/smithy-rs",
       "repository": {
         "Http": {
-          "url": "https://static.crates.io/crates/aws-smithy-schema/1.1.2/download",
-          "sha256": "9543fc722ed4865ab29fb66bd7ed0bef7b029d265ba8c587144511e30006d431"
+          "url": "https://static.crates.io/crates/aws-smithy-schema/1.2.0/download",
+          "sha256": "f7ef30d39e131651359b60a1c560de9a9502a4c3754172ab2d6e8734fe21bcba"
         }
       },
       "targets": [
@@ -3880,11 +4348,11 @@
         "deps": {
           "common": [
             {
-              "id": "aws-smithy-runtime-api 1.19.2",
+              "id": "aws-smithy-runtime-api 1.22.0",
               "target": "aws_smithy_runtime_api"
             },
             {
-              "id": "aws-smithy-types 1.9.1",
+              "id": "aws-smithy-types 1.9.4",
               "target": "aws_smithy_types"
             },
             {
@@ -3895,7 +4363,7 @@
           "selects": {}
         },
         "edition": "2021",
-        "version": "1.1.2"
+        "version": "1.2.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -3903,14 +4371,14 @@
       ],
       "license_file": "LICENSE"
     },
-    "aws-smithy-types 1.9.1": {
+    "aws-smithy-types 1.9.4": {
       "name": "aws-smithy-types",
-      "version": "1.9.1",
+      "version": "1.9.4",
       "package_url": "https://github.com/smithy-lang/smithy-rs",
       "repository": {
         "Http": {
-          "url": "https://static.crates.io/crates/aws-smithy-types/1.9.1/download",
-          "sha256": "cf183d70774ea2cfcc101ca74a8884e4c76be8b9df65cd303f6a1175c88e8f80"
+          "url": "https://static.crates.io/crates/aws-smithy-types/1.9.4/download",
+          "sha256": "aff4bf014c512840b2bba80a20417b723cbd6a0a65c02e2d81f50b4268aedfc7"
         }
       },
       "targets": [
@@ -3978,10 +4446,6 @@
               "target": "itoa"
             },
             {
-              "id": "num-integer 0.1.47",
-              "target": "num_integer"
-            },
-            {
               "id": "pin-project-lite 0.2.17",
               "target": "pin_project_lite"
             },
@@ -4012,7 +4476,7 @@
           }
         },
         "edition": "2021",
-        "version": "1.9.1"
+        "version": "1.9.4"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -4052,15 +4516,15 @@
         "deps": {
           "common": [
             {
-              "id": "aws-smithy-runtime-api 1.19.2",
+              "id": "aws-smithy-runtime-api 1.22.0",
               "target": "aws_smithy_runtime_api"
             },
             {
-              "id": "aws-smithy-schema 1.1.2",
+              "id": "aws-smithy-schema 1.2.0",
               "target": "aws_smithy_schema"
             },
             {
-              "id": "aws-smithy-types 1.9.1",
+              "id": "aws-smithy-types 1.9.4",
               "target": "aws_smithy_types"
             },
             {
@@ -4131,15 +4595,15 @@
               "target": "aws_smithy_async"
             },
             {
-              "id": "aws-smithy-runtime-api 1.19.2",
+              "id": "aws-smithy-runtime-api 1.22.0",
               "target": "aws_smithy_runtime_api"
             },
             {
-              "id": "aws-smithy-schema 1.1.2",
+              "id": "aws-smithy-schema 1.2.0",
               "target": "aws_smithy_schema"
             },
             {
-              "id": "aws-smithy-types 1.9.1",
+              "id": "aws-smithy-types 1.9.4",
               "target": "aws_smithy_types"
             },
             {
@@ -5208,6 +5672,111 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
+    "bigdecimal 0.4.11": {
+      "name": "bigdecimal",
+      "version": "0.4.11",
+      "package_url": "https://github.com/akubera/bigdecimal-rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/bigdecimal/0.4.11/download",
+          "sha256": "8fa3f3d8cbf4dffcfe4991de61d012bef509a409ecbe9dd41049bfe32b4d4653"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "bigdecimal",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        },
+        {
+          "BuildScript": {
+            "crate_name": "build_script_build",
+            "crate_root": "build.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "bigdecimal",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default",
+            "std"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "libm 0.2.16",
+              "target": "libm"
+            },
+            {
+              "id": "num-bigint 0.4.8",
+              "target": "num_bigint"
+            },
+            {
+              "id": "num-integer 0.1.47",
+              "target": "num_integer"
+            },
+            {
+              "id": "num-traits 0.2.19",
+              "target": "num_traits"
+            }
+          ],
+          "selects": {}
+        },
+        "extra_deps": {
+          "common": [
+            ":build_script_build"
+          ],
+          "selects": {}
+        },
+        "edition": "2015",
+        "version": "0.4.11"
+      },
+      "build_script_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "compile_data_glob_excludes": [
+          "**/*.rs"
+        ],
+        "data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "autocfg 1.5.1",
+              "target": "autocfg"
+            }
+          ],
+          "selects": {}
+        }
+      },
+      "license": "MIT/Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
     "bit-vec 0.9.1": {
       "name": "bit-vec",
       "version": "0.9.1",
@@ -5562,6 +6131,51 @@
         "version": "0.12.1"
       },
       "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "bs58 0.5.1": {
+      "name": "bs58",
+      "version": "0.5.1",
+      "package_url": "https://github.com/Nullus157/bs58-rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/bs58/0.5.1/download",
+          "sha256": "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "bs58",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "bs58",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "alloc"
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.5.1"
+      },
+      "license": "MIT/Apache-2.0",
       "license_ids": [
         "Apache-2.0",
         "MIT"
@@ -5974,6 +6588,94 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
+    "cbor-diag 0.1.12": {
+      "name": "cbor-diag",
+      "version": "0.1.12",
+      "package_url": "https://github.com/Nullus157/cbor-diag-rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/cbor-diag/0.1.12/download",
+          "sha256": "dc245b6ecd09b23901a4fbad1ad975701fd5061ceaef6afa93a2d70605a64429"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "cbor_diag",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "cbor_diag",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "bs58 0.5.1",
+              "target": "bs58"
+            },
+            {
+              "id": "chrono 0.4.45",
+              "target": "chrono"
+            },
+            {
+              "id": "data-encoding 2.11.1",
+              "target": "data_encoding"
+            },
+            {
+              "id": "half 2.7.1",
+              "target": "half"
+            },
+            {
+              "id": "nom 7.1.3",
+              "target": "nom"
+            },
+            {
+              "id": "num-bigint 0.4.8",
+              "target": "num_bigint"
+            },
+            {
+              "id": "num-rational 0.4.2",
+              "target": "num_rational"
+            },
+            {
+              "id": "num-traits 0.2.19",
+              "target": "num_traits"
+            },
+            {
+              "id": "separator 0.4.1",
+              "target": "separator"
+            },
+            {
+              "id": "url 2.5.8",
+              "target": "url"
+            },
+            {
+              "id": "uuid 1.29.0",
+              "target": "uuid"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.1.12"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
     "cc 1.11.0": {
       "name": "cc",
       "version": "1.11.0",
@@ -6202,6 +6904,218 @@
         "MIT"
       ],
       "license_file": "LICENSE-APACHE"
+    },
+    "chrono 0.4.45": {
+      "name": "chrono",
+      "version": "0.4.45",
+      "package_url": "https://github.com/chronotope/chrono",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/chrono/0.4.45/download",
+          "sha256": "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "chrono",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "chrono",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "alloc"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "num-traits 0.2.19",
+              "target": "num_traits"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.4.45"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE.txt"
+    },
+    "ciborium 0.2.2": {
+      "name": "ciborium",
+      "version": "0.2.2",
+      "package_url": "https://github.com/enarx/ciborium",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/ciborium/0.2.2/download",
+          "sha256": "42e69ffd6f0917f5c029256a24d0161db17cea3997d185db0d35926308770f0e"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "ciborium",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "ciborium",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default",
+            "std"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "ciborium-io 0.2.2",
+              "target": "ciborium_io"
+            },
+            {
+              "id": "ciborium-ll 0.2.2",
+              "target": "ciborium_ll"
+            },
+            {
+              "id": "serde 1.0.229",
+              "target": "serde"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.2.2"
+      },
+      "license": "Apache-2.0",
+      "license_ids": [
+        "Apache-2.0"
+      ],
+      "license_file": "LICENSE"
+    },
+    "ciborium-io 0.2.2": {
+      "name": "ciborium-io",
+      "version": "0.2.2",
+      "package_url": "https://github.com/enarx/ciborium",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/ciborium-io/0.2.2/download",
+          "sha256": "05afea1e0a06c9be33d539b876f1ce3692f4afea2cb41f740e7743225ed1c757"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "ciborium_io",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "ciborium_io",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "alloc",
+            "std"
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.2.2"
+      },
+      "license": "Apache-2.0",
+      "license_ids": [
+        "Apache-2.0"
+      ],
+      "license_file": "LICENSE"
+    },
+    "ciborium-ll 0.2.2": {
+      "name": "ciborium-ll",
+      "version": "0.2.2",
+      "package_url": "https://github.com/enarx/ciborium",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/ciborium-ll/0.2.2/download",
+          "sha256": "57663b653d948a338bfb3eeba9bb2fd5fcfaecb9e199e87e1eda4d9e8b240fd9"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "ciborium_ll",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "ciborium_ll",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "ciborium-io 0.2.2",
+              "target": "ciborium_io"
+            },
+            {
+              "id": "half 2.7.1",
+              "target": "half"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.2.2"
+      },
+      "license": "Apache-2.0",
+      "license_ids": [
+        "Apache-2.0"
+      ],
+      "license_file": "LICENSE"
     },
     "clap 4.6.7": {
       "name": "clap",
@@ -9772,6 +10686,45 @@
       ],
       "license_file": "LICENSE"
     },
+    "diff 0.1.13": {
+      "name": "diff",
+      "version": "0.1.13",
+      "package_url": "https://github.com/utkarshkukreti/diff.rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/diff/0.1.13/download",
+          "sha256": "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "diff",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "diff",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "edition": "2015",
+        "version": "0.1.13"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
     "digest 0.10.7": {
       "name": "digest",
       "version": "0.10.7",
@@ -12408,9 +13361,9 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
-    "gang-authn 0.3.0": {
+    "gang-authn 0.3.1": {
       "name": "gang-authn",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -12483,7 +13436,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -12491,9 +13444,9 @@
       ],
       "license_file": null
     },
-    "gang-aws 0.3.0": {
+    "gang-aws 0.3.1": {
       "name": "gang-aws",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -12526,6 +13479,10 @@
               "target": "aws_sdk_autoscaling"
             },
             {
+              "id": "aws-sdk-cloudwatch 1.144.0",
+              "target": "aws_sdk_cloudwatch"
+            },
+            {
               "id": "aws-sdk-ec2 1.275.0",
               "target": "aws_sdk_ec2"
             },
@@ -12538,12 +13495,16 @@
               "target": "aws_sdk_sts"
             },
             {
-              "id": "aws-smithy-runtime-api 1.19.2",
+              "id": "aws-smithy-runtime-api 1.22.0",
               "target": "aws_smithy_runtime_api"
             },
             {
-              "id": "aws-smithy-types 1.9.1",
+              "id": "aws-smithy-types 1.9.4",
               "target": "aws_smithy_types"
+            },
+            {
+              "id": "num-traits 0.2.19",
+              "target": "num_traits"
             },
             {
               "id": "parking_lot 0.12.5",
@@ -12583,6 +13544,14 @@
               "target": "aws_credential_types"
             },
             {
+              "id": "aws-smithy-cbor 0.64.2",
+              "target": "aws_smithy_cbor"
+            },
+            {
+              "id": "aws-smithy-http-client 1.5.2",
+              "target": "aws_smithy_http_client"
+            },
+            {
               "id": "axum 0.8.9",
               "target": "axum"
             },
@@ -12610,7 +13579,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -12618,9 +13587,9 @@
       ],
       "license_file": null
     },
-    "gang-aws-sdk 0.3.0": {
+    "gang-aws-sdk 0.3.1": {
       "name": "gang-aws-sdk",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -12649,7 +13618,7 @@
               "target": "aws_config"
             },
             {
-              "id": "aws-runtime 1.10.2",
+              "id": "aws-runtime 1.10.4",
               "target": "aws_runtime"
             },
             {
@@ -12657,11 +13626,11 @@
               "target": "aws_smithy_http_client"
             },
             {
-              "id": "aws-smithy-runtime-api 1.19.2",
+              "id": "aws-smithy-runtime-api 1.22.0",
               "target": "aws_smithy_runtime_api"
             },
             {
-              "id": "aws-smithy-types 1.9.1",
+              "id": "aws-smithy-types 1.9.4",
               "target": "aws_smithy_types"
             },
             {
@@ -12685,7 +13654,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -12693,9 +13662,9 @@
       ],
       "license_file": null
     },
-    "gang-bindings 0.3.0": {
+    "gang-bindings 0.3.1": {
       "name": "gang-bindings",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [],
@@ -12726,7 +13695,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -12734,9 +13703,9 @@
       ],
       "license_file": null
     },
-    "gang-bwrap 0.3.0": {
+    "gang-bwrap 0.3.1": {
       "name": "gang-bwrap",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -12797,7 +13766,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -12805,9 +13774,9 @@
       ],
       "license_file": null
     },
-    "gang-cgroup 0.3.0": {
+    "gang-cgroup 0.3.1": {
       "name": "gang-cgroup",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -12872,7 +13841,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -12880,9 +13849,9 @@
       ],
       "license_file": null
     },
-    "gang-client 0.3.0": {
+    "gang-client 0.3.1": {
       "name": "gang-client",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -12979,7 +13948,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -12987,9 +13956,9 @@
       ],
       "license_file": null
     },
-    "gang-clock 0.3.0": {
+    "gang-clock 0.3.1": {
       "name": "gang-clock",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13050,7 +14019,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13058,9 +14027,9 @@
       ],
       "license_file": null
     },
-    "gang-config 0.3.0": {
+    "gang-config 0.3.1": {
       "name": "gang-config",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13117,7 +14086,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13125,9 +14094,9 @@
       ],
       "license_file": null
     },
-    "gang-deploy 0.3.0": {
+    "gang-deploy 0.3.1": {
       "name": "gang-deploy",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13183,7 +14152,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13191,9 +14160,9 @@
       ],
       "license_file": null
     },
-    "gang-dynamodb 0.3.0": {
+    "gang-dynamodb 0.3.1": {
       "name": "gang-dynamodb",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13254,7 +14223,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13262,9 +14231,9 @@
       ],
       "license_file": null
     },
-    "gang-e2e 0.3.0": {
+    "gang-e2e 0.3.1": {
       "name": "gang-e2e",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13413,7 +14382,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13421,9 +14390,9 @@
       ],
       "license_file": null
     },
-    "gang-embed 0.3.0": {
+    "gang-embed 0.3.1": {
       "name": "gang-embed",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13472,7 +14441,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13480,9 +14449,9 @@
       ],
       "license_file": null
     },
-    "gang-exec 0.3.0": {
+    "gang-exec 0.3.1": {
       "name": "gang-exec",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13555,7 +14524,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13563,9 +14532,9 @@
       ],
       "license_file": null
     },
-    "gang-insight 0.3.0": {
+    "gang-insight 0.3.1": {
       "name": "gang-insight",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13605,7 +14574,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13613,9 +14582,9 @@
       ],
       "license_file": null
     },
-    "gang-local 0.3.0": {
+    "gang-local 0.3.1": {
       "name": "gang-local",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13708,7 +14677,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13716,9 +14685,9 @@
       ],
       "license_file": null
     },
-    "gang-macros 0.3.0": {
+    "gang-macros 0.3.1": {
       "name": "gang-macros",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13758,7 +14727,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13766,9 +14735,9 @@
       ],
       "license_file": null
     },
-    "gang-main 0.3.0": {
+    "gang-main 0.3.1": {
       "name": "gang-main",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13885,7 +14854,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13893,9 +14862,9 @@
       ],
       "license_file": null
     },
-    "gang-mtls 0.3.0": {
+    "gang-mtls 0.3.1": {
       "name": "gang-mtls",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13984,7 +14953,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13992,9 +14961,9 @@
       ],
       "license_file": null
     },
-    "gang-nativelink 0.3.0": {
+    "gang-nativelink 0.3.1": {
       "name": "gang-nativelink",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14045,6 +15014,10 @@
             {
               "id": "hyper-util 0.1.21",
               "target": "hyper_util"
+            },
+            {
+              "id": "lru 0.18.5",
+              "target": "lru"
             },
             {
               "id": "nativelink-config 1.8.3",
@@ -14124,6 +15097,10 @@
         "deps_dev": {
           "common": [
             {
+              "id": "allocation-counter 0.8.1",
+              "target": "allocation_counter"
+            },
+            {
               "id": "base64 0.23.1",
               "target": "base64"
             },
@@ -14156,7 +15133,7 @@
           ],
           "selects": {}
         },
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14164,9 +15141,9 @@
       ],
       "license_file": null
     },
-    "gang-noop 0.3.0": {
+    "gang-noop 0.3.1": {
       "name": "gang-noop",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14223,7 +15200,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14231,9 +15208,9 @@
       ],
       "license_file": null
     },
-    "gang-oidc 0.3.0": {
+    "gang-oidc 0.3.1": {
       "name": "gang-oidc",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14314,7 +15291,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14322,9 +15299,9 @@
       ],
       "license_file": null
     },
-    "gang-os 0.3.0": {
+    "gang-os 0.3.1": {
       "name": "gang-os",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14372,7 +15349,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14380,9 +15357,9 @@
       ],
       "license_file": null
     },
-    "gang-postgres 0.3.0": {
+    "gang-postgres 0.3.1": {
       "name": "gang-postgres",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14455,7 +15432,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14463,9 +15440,9 @@
       ],
       "license_file": null
     },
-    "gang-reconciler 0.3.0": {
+    "gang-reconciler 0.3.1": {
       "name": "gang-reconciler",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14501,7 +15478,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14509,9 +15486,9 @@
       ],
       "license_file": null
     },
-    "gang-server 0.3.0": {
+    "gang-server 0.3.1": {
       "name": "gang-server",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14636,7 +15613,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14644,9 +15621,9 @@
       ],
       "license_file": null
     },
-    "gang-spi 0.3.0": {
+    "gang-spi 0.3.1": {
       "name": "gang-spi",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14731,7 +15708,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14739,9 +15716,9 @@
       ],
       "license_file": null
     },
-    "gang-sqlite 0.3.0": {
+    "gang-sqlite 0.3.1": {
       "name": "gang-sqlite",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14798,7 +15775,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14806,9 +15783,9 @@
       ],
       "license_file": null
     },
-    "gang-state 0.3.0": {
+    "gang-state 0.3.1": {
       "name": "gang-state",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14865,7 +15842,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14873,9 +15850,9 @@
       ],
       "license_file": null
     },
-    "gang-testkit 0.3.0": {
+    "gang-testkit 0.3.1": {
       "name": "gang-testkit",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -15004,7 +15981,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -15012,9 +15989,9 @@
       ],
       "license_file": null
     },
-    "gang-tls 0.3.0": {
+    "gang-tls 0.3.1": {
       "name": "gang-tls",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -15123,7 +16100,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -15131,9 +16108,9 @@
       ],
       "license_file": null
     },
-    "gang-types 0.3.0": {
+    "gang-types 0.3.1": {
       "name": "gang-types",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -15210,7 +16187,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -15218,9 +16195,9 @@
       ],
       "license_file": null
     },
-    "gang-ui 0.3.0": {
+    "gang-ui 0.3.1": {
       "name": "gang-ui",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -15256,7 +16233,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -15264,9 +16241,9 @@
       ],
       "license_file": null
     },
-    "gang-wire 0.3.0": {
+    "gang-wire 0.3.1": {
       "name": "gang-wire",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -15318,7 +16295,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -15326,9 +16303,9 @@
       ],
       "license_file": null
     },
-    "gang-worker 0.3.0": {
+    "gang-worker 0.3.1": {
       "name": "gang-worker",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -15389,7 +16366,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -16498,6 +17475,65 @@
       ],
       "license_file": "LICENSE"
     },
+    "half 2.7.1": {
+      "name": "half",
+      "version": "2.7.1",
+      "package_url": "https://github.com/VoidStarKat/half-rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/half/2.7.1/download",
+          "sha256": "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "half",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "half",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "cfg-if 1.0.5",
+              "target": "cfg_if"
+            },
+            {
+              "id": "zerocopy 0.8.63",
+              "target": "zerocopy"
+            }
+          ],
+          "selects": {
+            "cfg(target_arch = \"spirv\")": [
+              {
+                "id": "crunchy 0.2.4",
+                "target": "crunchy"
+              }
+            ]
+          }
+        },
+        "edition": "2021",
+        "version": "2.7.1"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
     "hashbrown 0.16.1": {
       "name": "hashbrown",
       "version": "0.16.1",
@@ -17274,6 +18310,62 @@
         },
         "edition": "2024",
         "version": "0.5.12"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "http 0.2.12": {
+      "name": "http",
+      "version": "0.2.12",
+      "package_url": "https://github.com/hyperium/http",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/http/0.2.12/download",
+          "sha256": "601cbb57e577e2f5ef5be8e7b83f0f63994f25aa94d673e54a92d5c516d101f1"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "http",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "http",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "bytes 1.12.1",
+              "target": "bytes"
+            },
+            {
+              "id": "fnv 1.0.7",
+              "target": "fnv"
+            },
+            {
+              "id": "itoa 1.0.18",
+              "target": "itoa"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2018",
+        "version": "0.2.12"
       },
       "license": "MIT OR Apache-2.0",
       "license_ids": [
@@ -18778,6 +19870,7 @@
         "crate_features": {
           "common": [
             "default",
+            "serde",
             "std"
           ],
           "selects": {}
@@ -18791,6 +19884,10 @@
             {
               "id": "hashbrown 0.17.1",
               "target": "hashbrown"
+            },
+            {
+              "id": "serde_core 1.0.229",
+              "target": "serde_core"
             }
           ],
           "selects": {}
@@ -21488,6 +22585,60 @@
       ],
       "license_file": "LICENSE"
     },
+    "minicbor 2.3.1": {
+      "name": "minicbor",
+      "version": "2.3.1",
+      "package_url": "https://github.com/twittner/minicbor",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/minicbor/2.3.1/download",
+          "sha256": "e7244eafd1e09e7c4e33043881997aa6ab6dffff3ed2cee3395a278980481d6e"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "minicbor",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "minicbor",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "alloc",
+            "half"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "half 2.7.1",
+              "target": "half"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "2.3.1"
+      },
+      "license": "BlueOak-1.0.0",
+      "license_ids": [
+        "BlueOak-1.0.0"
+      ],
+      "license_file": "LICENSE.md"
+    },
     "minimal-lexical 0.2.1": {
       "name": "minimal-lexical",
       "version": "0.2.1",
@@ -22209,9 +23360,9 @@
       "package_url": null,
       "repository": {
         "Git": {
-          "remote": "https://github.com/TraceMachina/nativelink",
+          "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+            "Rev": "5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
           },
           "strip_prefix": "nativelink-config"
         }
@@ -22289,9 +23440,9 @@
       "package_url": null,
       "repository": {
         "Git": {
-          "remote": "https://github.com/TraceMachina/nativelink",
+          "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+            "Rev": "5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
           },
           "strip_prefix": "nativelink-error"
         }
@@ -22401,9 +23552,9 @@
       "package_url": null,
       "repository": {
         "Git": {
-          "remote": "https://github.com/TraceMachina/nativelink",
+          "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+            "Rev": "5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
           },
           "strip_prefix": "nativelink-metric"
         }
@@ -22470,9 +23621,9 @@
       "package_url": null,
       "repository": {
         "Git": {
-          "remote": "https://github.com/TraceMachina/nativelink",
+          "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+            "Rev": "5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
           },
           "strip_prefix": "nativelink-metric/nativelink-metric-macro-derive"
         }
@@ -22526,9 +23677,9 @@
       "package_url": null,
       "repository": {
         "Git": {
-          "remote": "https://github.com/TraceMachina/nativelink",
+          "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+            "Rev": "5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
           },
           "strip_prefix": "nativelink-proto"
         }
@@ -22590,9 +23741,9 @@
       "package_url": null,
       "repository": {
         "Git": {
-          "remote": "https://github.com/TraceMachina/nativelink",
+          "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+            "Rev": "5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
           },
           "strip_prefix": "nativelink-redis-tester"
         }
@@ -22662,9 +23813,9 @@
       "package_url": null,
       "repository": {
         "Git": {
-          "remote": "https://github.com/TraceMachina/nativelink",
+          "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+            "Rev": "5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
           },
           "strip_prefix": "nativelink-scheduler"
         }
@@ -22819,9 +23970,9 @@
       "package_url": null,
       "repository": {
         "Git": {
-          "remote": "https://github.com/TraceMachina/nativelink",
+          "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+            "Rev": "5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
           },
           "strip_prefix": "nativelink-service"
         }
@@ -22975,9 +24126,9 @@
       "package_url": null,
       "repository": {
         "Git": {
-          "remote": "https://github.com/TraceMachina/nativelink",
+          "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+            "Rev": "5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
           },
           "strip_prefix": "nativelink-store"
         }
@@ -23028,11 +24179,11 @@
               "target": "aws_sdk_s3"
             },
             {
-              "id": "aws-smithy-runtime-api 1.19.2",
+              "id": "aws-smithy-runtime-api 1.22.0",
               "target": "aws_smithy_runtime_api"
             },
             {
-              "id": "aws-smithy-types 1.9.1",
+              "id": "aws-smithy-types 1.9.4",
               "target": "aws_smithy_types"
             },
             {
@@ -23297,9 +24448,9 @@
       "package_url": null,
       "repository": {
         "Git": {
-          "remote": "https://github.com/TraceMachina/nativelink",
+          "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+            "Rev": "5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
           },
           "strip_prefix": "nativelink-util"
         }
@@ -23538,9 +24689,9 @@
       "package_url": null,
       "repository": {
         "Git": {
-          "remote": "https://github.com/TraceMachina/nativelink",
+          "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+            "Rev": "5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
           },
           "strip_prefix": "nativelink-worker"
         }
@@ -24060,6 +25211,13 @@
         "compile_data_glob": [
           "**"
         ],
+        "crate_features": {
+          "common": [
+            "default",
+            "std"
+          ],
+          "selects": {}
+        },
         "deps": {
           "common": [
             {
@@ -24268,7 +25426,6 @@
         ],
         "crate_features": {
           "common": [
-            "default",
             "i128",
             "std"
           ],
@@ -24337,6 +25494,68 @@
         },
         "edition": "2018",
         "version": "0.1.46"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "num-rational 0.4.2": {
+      "name": "num-rational",
+      "version": "0.4.2",
+      "package_url": "https://github.com/rust-num/num-rational",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/num-rational/0.4.2/download",
+          "sha256": "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "num_rational",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "num_rational",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "num-bigint"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "num-bigint 0.4.8",
+              "target": "num_bigint"
+            },
+            {
+              "id": "num-integer 0.1.47",
+              "target": "num_integer"
+            },
+            {
+              "id": "num-traits 0.2.19",
+              "target": "num_traits"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.4.2"
       },
       "license": "MIT OR Apache-2.0",
       "license_ids": [
@@ -25486,9 +26705,9 @@
       ],
       "license_file": null
     },
-    "opentofu-runner 0.3.0": {
+    "opentofu-runner 0.3.1": {
       "name": "opentofu-runner",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -25524,7 +26743,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -27771,6 +28990,65 @@
         },
         "edition": "2021",
         "version": "0.8.4"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "pretty_assertions 1.4.1": {
+      "name": "pretty_assertions",
+      "version": "1.4.1",
+      "package_url": "https://github.com/rust-pretty-assertions/rust-pretty-assertions",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/pretty_assertions/1.4.1/download",
+          "sha256": "3ae130e2f271fbc2ac3a40fb1d07180839cdbbe443c7a27e1e3c13c5cac0116d"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "pretty_assertions",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "pretty_assertions",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default",
+            "std"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "diff 0.1.13",
+              "target": "diff"
+            },
+            {
+              "id": "yansi 1.0.1",
+              "target": "yansi"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2018",
+        "version": "1.4.1"
       },
       "license": "MIT OR Apache-2.0",
       "license_ids": [
@@ -30651,6 +31929,61 @@
       ],
       "license_file": "LICENSE"
     },
+    "roxmltree 0.14.1": {
+      "name": "roxmltree",
+      "version": "0.14.1",
+      "package_url": "https://github.com/RazrFalcon/roxmltree",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/roxmltree/0.14.1/download",
+          "sha256": "921904a62e410e37e215c40381b7117f830d9d89ba60ab5236170541dd25646b"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "roxmltree",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "roxmltree",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default",
+            "std"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "xmlparser 0.13.6",
+              "target": "xmlparser"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2018",
+        "version": "0.14.1"
+      },
+      "license": "MIT/Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
     "rsa 0.9.10": {
       "name": "rsa",
       "version": "0.9.10",
@@ -32413,6 +33746,44 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
+    "separator 0.4.1": {
+      "name": "separator",
+      "version": "0.4.1",
+      "package_url": "https://github.com/saghm/rust-separator",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/separator/0.4.1/download",
+          "sha256": "f97841a747eef040fcd2e7b3b9a220a7205926e60488e673d9e4926d27772ce5"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "separator",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "separator",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "edition": "2018",
+        "version": "0.4.1"
+      },
+      "license": "MIT",
+      "license_ids": [
+        "MIT"
+      ],
+      "license_file": "LICENSE"
+    },
     "serde 1.0.229": {
       "name": "serde",
       "version": "1.0.229",
@@ -32456,6 +33827,7 @@
         ],
         "crate_features": {
           "common": [
+            "alloc",
             "default",
             "derive",
             "rc",
@@ -43796,9 +45168,9 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
-    "workspace-architecture 0.3.0": {
+    "workspace-architecture 0.3.1": {
       "name": "workspace-architecture",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -43851,7 +45223,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.0"
+        "version": "0.3.1"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -44250,6 +45622,53 @@
       ],
       "license_file": "LICENSE"
     },
+    "yansi 1.0.1": {
+      "name": "yansi",
+      "version": "1.0.1",
+      "package_url": "https://github.com/SergioBenitez/yansi",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/yansi/1.0.1/download",
+          "sha256": "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "yansi",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "yansi",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "alloc",
+            "default",
+            "std"
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "1.0.1"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
     "yasna 0.6.0": {
       "name": "yasna",
       "version": "0.6.0",
@@ -44475,7 +45894,9 @@
         ],
         "crate_features": {
           "common": [
-            "simd"
+            "derive",
+            "simd",
+            "zerocopy-derive"
           ],
           "selects": {}
         },
@@ -44487,15 +45908,13 @@
         },
         "edition": "2021",
         "proc_macro_deps": {
-          "common": [],
-          "selects": {
-            "cfg(any())": [
-              {
-                "id": "zerocopy-derive 0.8.63",
-                "target": "zerocopy_derive"
-              }
-            ]
-          }
+          "common": [
+            {
+              "id": "zerocopy-derive 0.8.63",
+              "target": "zerocopy_derive"
+            }
+          ],
+          "selects": {}
         },
         "version": "0.8.63"
       },
@@ -45412,43 +46831,43 @@
   },
   "binary_crates": [],
   "workspace_members": {
-    "gang-authn 0.3.0": "crates/gang-authn",
-    "gang-aws 0.3.0": "crates/gang-aws",
-    "gang-aws-sdk 0.3.0": "crates/gang-aws-sdk",
-    "gang-bindings 0.3.0": "crates/gang-bindings",
-    "gang-bwrap 0.3.0": "crates/gang-bwrap",
-    "gang-cgroup 0.3.0": "crates/gang-cgroup",
-    "gang-client 0.3.0": "crates/gang-client",
-    "gang-clock 0.3.0": "crates/gang-clock",
-    "gang-config 0.3.0": "crates/gang-config",
-    "gang-deploy 0.3.0": "crates/gang-deploy",
-    "gang-dynamodb 0.3.0": "crates/gang-dynamodb",
-    "gang-e2e 0.3.0": "crates/gang-e2e",
-    "gang-embed 0.3.0": "crates/gang-embed",
-    "gang-exec 0.3.0": "crates/gang-exec",
-    "gang-insight 0.3.0": "crates/gang-insight",
-    "gang-local 0.3.0": "crates/gang-local",
-    "gang-macros 0.3.0": "crates/gang-macros",
-    "gang-main 0.3.0": "crates/gang-main",
-    "gang-mtls 0.3.0": "crates/gang-mtls",
-    "gang-nativelink 0.3.0": "crates/gang-nativelink",
-    "gang-noop 0.3.0": "crates/gang-noop",
-    "gang-oidc 0.3.0": "crates/gang-oidc",
-    "gang-os 0.3.0": "crates/gang-os",
-    "gang-postgres 0.3.0": "crates/gang-postgres",
-    "gang-reconciler 0.3.0": "crates/gang-reconciler",
-    "gang-server 0.3.0": "crates/gang-server",
-    "gang-spi 0.3.0": "crates/gang-spi",
-    "gang-sqlite 0.3.0": "crates/gang-sqlite",
-    "gang-state 0.3.0": "crates/gang-state",
-    "gang-testkit 0.3.0": "crates/gang-testkit",
-    "gang-tls 0.3.0": "crates/gang-tls",
-    "gang-types 0.3.0": "crates/gang-types",
-    "gang-ui 0.3.0": "crates/gang-ui",
-    "gang-wire 0.3.0": "crates/gang-wire",
-    "gang-worker 0.3.0": "crates/gang-worker",
-    "opentofu-runner 0.3.0": "bazel/opentofu/runner",
-    "workspace-architecture 0.3.0": "bazel/architecture"
+    "gang-authn 0.3.1": "crates/gang-authn",
+    "gang-aws 0.3.1": "crates/gang-aws",
+    "gang-aws-sdk 0.3.1": "crates/gang-aws-sdk",
+    "gang-bindings 0.3.1": "crates/gang-bindings",
+    "gang-bwrap 0.3.1": "crates/gang-bwrap",
+    "gang-cgroup 0.3.1": "crates/gang-cgroup",
+    "gang-client 0.3.1": "crates/gang-client",
+    "gang-clock 0.3.1": "crates/gang-clock",
+    "gang-config 0.3.1": "crates/gang-config",
+    "gang-deploy 0.3.1": "crates/gang-deploy",
+    "gang-dynamodb 0.3.1": "crates/gang-dynamodb",
+    "gang-e2e 0.3.1": "crates/gang-e2e",
+    "gang-embed 0.3.1": "crates/gang-embed",
+    "gang-exec 0.3.1": "crates/gang-exec",
+    "gang-insight 0.3.1": "crates/gang-insight",
+    "gang-local 0.3.1": "crates/gang-local",
+    "gang-macros 0.3.1": "crates/gang-macros",
+    "gang-main 0.3.1": "crates/gang-main",
+    "gang-mtls 0.3.1": "crates/gang-mtls",
+    "gang-nativelink 0.3.1": "crates/gang-nativelink",
+    "gang-noop 0.3.1": "crates/gang-noop",
+    "gang-oidc 0.3.1": "crates/gang-oidc",
+    "gang-os 0.3.1": "crates/gang-os",
+    "gang-postgres 0.3.1": "crates/gang-postgres",
+    "gang-reconciler 0.3.1": "crates/gang-reconciler",
+    "gang-server 0.3.1": "crates/gang-server",
+    "gang-spi 0.3.1": "crates/gang-spi",
+    "gang-sqlite 0.3.1": "crates/gang-sqlite",
+    "gang-state 0.3.1": "crates/gang-state",
+    "gang-testkit 0.3.1": "crates/gang-testkit",
+    "gang-tls 0.3.1": "crates/gang-tls",
+    "gang-types 0.3.1": "crates/gang-types",
+    "gang-ui 0.3.1": "crates/gang-ui",
+    "gang-wire 0.3.1": "crates/gang-wire",
+    "gang-worker 0.3.1": "crates/gang-worker",
+    "opentofu-runner 0.3.1": "bazel/opentofu/runner",
+    "workspace-architecture 0.3.1": "bazel/architecture"
   },
   "conditions": {
     "aarch64-apple-darwin": [
@@ -45656,6 +47075,7 @@
       "aarch64-apple-darwin",
       "aarch64-unknown-linux-gnu"
     ],
+    "cfg(target_arch = \"spirv\")": [],
     "cfg(target_arch = \"wasm32\")": [
       "wasm32-unknown-unknown",
       "wasm32-wasip1"
@@ -45719,15 +47139,16 @@
     "anstyle 1.0.14",
     "async-trait 0.1.92",
     "aws-config 1.13.0",
-    "aws-runtime 1.10.2",
+    "aws-runtime 1.10.4",
     "aws-sdk-autoscaling 1.140.0",
+    "aws-sdk-cloudwatch 1.144.0",
     "aws-sdk-dynamodb 1.137.0",
     "aws-sdk-ec2 1.275.0",
     "aws-sdk-kms 1.129.0",
     "aws-sdk-sts 1.124.0",
     "aws-smithy-http-client 1.5.2",
-    "aws-smithy-runtime-api 1.19.2",
-    "aws-smithy-types 1.9.1",
+    "aws-smithy-runtime-api 1.22.0",
+    "aws-smithy-types 1.9.4",
     "axum 0.8.9",
     "base64 0.23.1",
     "bytes 1.12.1",
@@ -45766,6 +47187,7 @@
     "nativelink-store 1.8.3",
     "nativelink-util 1.8.3",
     "nativelink-worker 1.8.3",
+    "num-traits 0.2.19",
     "opentelemetry 0.32.0",
     "p256 0.14.0",
     "parking_lot 0.12.5",
@@ -45816,6 +47238,7 @@
   "direct_dev_deps": [
     "allocation-counter 0.8.1",
     "aws-credential-types 1.3.1",
+    "aws-smithy-cbor 0.64.2",
     "object 0.39.1",
     "rustls-webpki 0.103.16"
   ],

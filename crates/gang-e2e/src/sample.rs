@@ -9,6 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use gang_types::Isa;
+use sha2::{Digest, Sha256};
 
 use crate::errors::{E2eError, Result};
 use crate::system::{Probe, Sandbox};
@@ -21,6 +22,22 @@ const GLIBC_TOOL_FILE: &str = "glibc-tool";
 
 /// The number of random bytes a salt is made of. Each byte becomes two hex digits.
 const SALT_BYTES: usize = 8;
+
+pub(crate) const CACHE_INPUT_FILE: &str = "cache-visibility-input";
+pub(crate) const CACHE_INPUT_SIZE: usize = 4 * 1024 * 1024;
+pub(crate) const CACHE_OUTPUT_PREFIX: &[u8] = b"cache-visibility-output\n";
+
+/// Deterministic, incompressible input whose output is a distinct CAS object.
+pub(crate) fn cache_input() -> Vec<u8> {
+    let mut data = Vec::with_capacity(CACHE_INPUT_SIZE);
+    for counter in 0..(CACHE_INPUT_SIZE / 32) {
+        let mut hash = Sha256::new();
+        hash.update(b"gang-cache-visibility");
+        hash.update((counter as u64).to_be_bytes());
+        data.extend_from_slice(&hash.finalize());
+    }
+    data
+}
 
 /// The parameters one run passes to its sample workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]

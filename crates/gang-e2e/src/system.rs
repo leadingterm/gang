@@ -170,6 +170,8 @@ gang_types::string_enum! {
         NetworkRequested = "network_requested",
         /// Records that it ran; sets the `ISA` exec property explicitly.
         Pinned = "pinned",
+        /// Copies a large input to a distinct output for cache traffic observation.
+        CacheVisibility = "cache_visibility",
         /// Runs `sh -c 'exit 3'`.
         ExitThree = "exit_three",
         /// Tries to modify its cached input in place.
@@ -248,6 +250,334 @@ gang_types::string_enum! {
         ControllerLoss6 = "controller_loss_6",
         /// Eighth held controller-loss action.
         ControllerLoss7 = "controller_loss_7",
+        /// Short burst probe 000.
+        Burst000 = "burst_000",
+        /// Short burst probe 001.
+        Burst001 = "burst_001",
+        /// Short burst probe 002.
+        Burst002 = "burst_002",
+        /// Short burst probe 003.
+        Burst003 = "burst_003",
+        /// Short burst probe 004.
+        Burst004 = "burst_004",
+        /// Short burst probe 005.
+        Burst005 = "burst_005",
+        /// Short burst probe 006.
+        Burst006 = "burst_006",
+        /// Short burst probe 007.
+        Burst007 = "burst_007",
+        /// Short burst probe 008.
+        Burst008 = "burst_008",
+        /// Short burst probe 009.
+        Burst009 = "burst_009",
+        /// Short burst probe 010.
+        Burst010 = "burst_010",
+        /// Short burst probe 011.
+        Burst011 = "burst_011",
+        /// Short burst probe 012.
+        Burst012 = "burst_012",
+        /// Short burst probe 013.
+        Burst013 = "burst_013",
+        /// Short burst probe 014.
+        Burst014 = "burst_014",
+        /// Short burst probe 015.
+        Burst015 = "burst_015",
+        /// Short burst probe 016.
+        Burst016 = "burst_016",
+        /// Short burst probe 017.
+        Burst017 = "burst_017",
+        /// Short burst probe 018.
+        Burst018 = "burst_018",
+        /// Short burst probe 019.
+        Burst019 = "burst_019",
+        /// Short burst probe 020.
+        Burst020 = "burst_020",
+        /// Short burst probe 021.
+        Burst021 = "burst_021",
+        /// Short burst probe 022.
+        Burst022 = "burst_022",
+        /// Short burst probe 023.
+        Burst023 = "burst_023",
+        /// Short burst probe 024.
+        Burst024 = "burst_024",
+        /// Short burst probe 025.
+        Burst025 = "burst_025",
+        /// Short burst probe 026.
+        Burst026 = "burst_026",
+        /// Short burst probe 027.
+        Burst027 = "burst_027",
+        /// Short burst probe 028.
+        Burst028 = "burst_028",
+        /// Short burst probe 029.
+        Burst029 = "burst_029",
+        /// Short burst probe 030.
+        Burst030 = "burst_030",
+        /// Short burst probe 031.
+        Burst031 = "burst_031",
+        /// Short burst probe 032.
+        Burst032 = "burst_032",
+        /// Short burst probe 033.
+        Burst033 = "burst_033",
+        /// Short burst probe 034.
+        Burst034 = "burst_034",
+        /// Short burst probe 035.
+        Burst035 = "burst_035",
+        /// Short burst probe 036.
+        Burst036 = "burst_036",
+        /// Short burst probe 037.
+        Burst037 = "burst_037",
+        /// Short burst probe 038.
+        Burst038 = "burst_038",
+        /// Short burst probe 039.
+        Burst039 = "burst_039",
+        /// Short burst probe 040.
+        Burst040 = "burst_040",
+        /// Short burst probe 041.
+        Burst041 = "burst_041",
+        /// Short burst probe 042.
+        Burst042 = "burst_042",
+        /// Short burst probe 043.
+        Burst043 = "burst_043",
+        /// Short burst probe 044.
+        Burst044 = "burst_044",
+        /// Short burst probe 045.
+        Burst045 = "burst_045",
+        /// Short burst probe 046.
+        Burst046 = "burst_046",
+        /// Short burst probe 047.
+        Burst047 = "burst_047",
+        /// Short burst probe 048.
+        Burst048 = "burst_048",
+        /// Short burst probe 049.
+        Burst049 = "burst_049",
+        /// Short burst probe 050.
+        Burst050 = "burst_050",
+        /// Short burst probe 051.
+        Burst051 = "burst_051",
+        /// Short burst probe 052.
+        Burst052 = "burst_052",
+        /// Short burst probe 053.
+        Burst053 = "burst_053",
+        /// Short burst probe 054.
+        Burst054 = "burst_054",
+        /// Short burst probe 055.
+        Burst055 = "burst_055",
+        /// Short burst probe 056.
+        Burst056 = "burst_056",
+        /// Short burst probe 057.
+        Burst057 = "burst_057",
+        /// Short burst probe 058.
+        Burst058 = "burst_058",
+        /// Short burst probe 059.
+        Burst059 = "burst_059",
+        /// Short burst probe 060.
+        Burst060 = "burst_060",
+        /// Short burst probe 061.
+        Burst061 = "burst_061",
+        /// Short burst probe 062.
+        Burst062 = "burst_062",
+        /// Short burst probe 063.
+        Burst063 = "burst_063",
+        /// Short burst probe 064.
+        Burst064 = "burst_064",
+        /// Short burst probe 065.
+        Burst065 = "burst_065",
+        /// Short burst probe 066.
+        Burst066 = "burst_066",
+        /// Short burst probe 067.
+        Burst067 = "burst_067",
+        /// Short burst probe 068.
+        Burst068 = "burst_068",
+        /// Short burst probe 069.
+        Burst069 = "burst_069",
+        /// Short burst probe 070.
+        Burst070 = "burst_070",
+        /// Short burst probe 071.
+        Burst071 = "burst_071",
+        /// Short burst probe 072.
+        Burst072 = "burst_072",
+        /// Short burst probe 073.
+        Burst073 = "burst_073",
+        /// Short burst probe 074.
+        Burst074 = "burst_074",
+        /// Short burst probe 075.
+        Burst075 = "burst_075",
+        /// Short burst probe 076.
+        Burst076 = "burst_076",
+        /// Short burst probe 077.
+        Burst077 = "burst_077",
+        /// Short burst probe 078.
+        Burst078 = "burst_078",
+        /// Short burst probe 079.
+        Burst079 = "burst_079",
+        /// Short burst probe 080.
+        Burst080 = "burst_080",
+        /// Short burst probe 081.
+        Burst081 = "burst_081",
+        /// Short burst probe 082.
+        Burst082 = "burst_082",
+        /// Short burst probe 083.
+        Burst083 = "burst_083",
+        /// Short burst probe 084.
+        Burst084 = "burst_084",
+        /// Short burst probe 085.
+        Burst085 = "burst_085",
+        /// Short burst probe 086.
+        Burst086 = "burst_086",
+        /// Short burst probe 087.
+        Burst087 = "burst_087",
+        /// Short burst probe 088.
+        Burst088 = "burst_088",
+        /// Short burst probe 089.
+        Burst089 = "burst_089",
+        /// Short burst probe 090.
+        Burst090 = "burst_090",
+        /// Short burst probe 091.
+        Burst091 = "burst_091",
+        /// Short burst probe 092.
+        Burst092 = "burst_092",
+        /// Short burst probe 093.
+        Burst093 = "burst_093",
+        /// Short burst probe 094.
+        Burst094 = "burst_094",
+        /// Short burst probe 095.
+        Burst095 = "burst_095",
+        /// Short burst probe 096.
+        Burst096 = "burst_096",
+        /// Short burst probe 097.
+        Burst097 = "burst_097",
+        /// Short burst probe 098.
+        Burst098 = "burst_098",
+        /// Short burst probe 099.
+        Burst099 = "burst_099",
+        /// Short burst probe 100.
+        Burst100 = "burst_100",
+        /// Short burst probe 101.
+        Burst101 = "burst_101",
+        /// Short burst probe 102.
+        Burst102 = "burst_102",
+        /// Short burst probe 103.
+        Burst103 = "burst_103",
+        /// Short burst probe 104.
+        Burst104 = "burst_104",
+        /// Short burst probe 105.
+        Burst105 = "burst_105",
+        /// Short burst probe 106.
+        Burst106 = "burst_106",
+        /// Short burst probe 107.
+        Burst107 = "burst_107",
+        /// Short burst probe 108.
+        Burst108 = "burst_108",
+        /// Short burst probe 109.
+        Burst109 = "burst_109",
+        /// Short burst probe 110.
+        Burst110 = "burst_110",
+        /// Short burst probe 111.
+        Burst111 = "burst_111",
+        /// Short burst probe 112.
+        Burst112 = "burst_112",
+        /// Short burst probe 113.
+        Burst113 = "burst_113",
+        /// Short burst probe 114.
+        Burst114 = "burst_114",
+        /// Short burst probe 115.
+        Burst115 = "burst_115",
+        /// Short burst probe 116.
+        Burst116 = "burst_116",
+        /// Short burst probe 117.
+        Burst117 = "burst_117",
+        /// Short burst probe 118.
+        Burst118 = "burst_118",
+        /// Short burst probe 119.
+        Burst119 = "burst_119",
+        /// Short burst probe 120.
+        Burst120 = "burst_120",
+        /// Short burst probe 121.
+        Burst121 = "burst_121",
+        /// Short burst probe 122.
+        Burst122 = "burst_122",
+        /// Short burst probe 123.
+        Burst123 = "burst_123",
+        /// Short burst probe 124.
+        Burst124 = "burst_124",
+        /// Short burst probe 125.
+        Burst125 = "burst_125",
+        /// Short burst probe 126.
+        Burst126 = "burst_126",
+        /// Short burst probe 127.
+        Burst127 = "burst_127",
+        /// Short burst probe 128.
+        Burst128 = "burst_128",
+        /// Short burst probe 129.
+        Burst129 = "burst_129",
+        /// Short burst probe 130.
+        Burst130 = "burst_130",
+        /// Short burst probe 131.
+        Burst131 = "burst_131",
+        /// Short burst probe 132.
+        Burst132 = "burst_132",
+        /// Short burst probe 133.
+        Burst133 = "burst_133",
+        /// Short burst probe 134.
+        Burst134 = "burst_134",
+        /// Short burst probe 135.
+        Burst135 = "burst_135",
+        /// Short burst probe 136.
+        Burst136 = "burst_136",
+        /// Short burst probe 137.
+        Burst137 = "burst_137",
+        /// Short burst probe 138.
+        Burst138 = "burst_138",
+        /// Short burst probe 139.
+        Burst139 = "burst_139",
+        /// Short burst probe 140.
+        Burst140 = "burst_140",
+        /// Short burst probe 141.
+        Burst141 = "burst_141",
+        /// Short burst probe 142.
+        Burst142 = "burst_142",
+        /// Short burst probe 143.
+        Burst143 = "burst_143",
+        /// Short burst probe 144.
+        Burst144 = "burst_144",
+        /// Short burst probe 145.
+        Burst145 = "burst_145",
+        /// Short burst probe 146.
+        Burst146 = "burst_146",
+        /// Short burst probe 147.
+        Burst147 = "burst_147",
+        /// Short burst probe 148.
+        Burst148 = "burst_148",
+        /// Short burst probe 149.
+        Burst149 = "burst_149",
+        /// Short burst probe 150.
+        Burst150 = "burst_150",
+        /// Short burst probe 151.
+        Burst151 = "burst_151",
+        /// Short burst probe 152.
+        Burst152 = "burst_152",
+        /// Short burst probe 153.
+        Burst153 = "burst_153",
+        /// Short burst probe 154.
+        Burst154 = "burst_154",
+        /// Short burst probe 155.
+        Burst155 = "burst_155",
+        /// Short burst probe 156.
+        Burst156 = "burst_156",
+        /// Short burst probe 157.
+        Burst157 = "burst_157",
+        /// Short burst probe 158.
+        Burst158 = "burst_158",
+        /// Short burst probe 159.
+        Burst159 = "burst_159",
+        /// Held work probe 0.
+        WorkHeld0 = "work_held_0",
+        /// Held work probe 1.
+        WorkHeld1 = "work_held_1",
+        /// Held work probe 2.
+        WorkHeld2 = "work_held_2",
+        /// Short work probe for training and queueing.
+        WorkPlain = "work_plain",
         /// Reports to the journal, waits for the go flag, then allocates far beyond its hard
         /// memory ceiling.
         HeldHog = "held_hog",

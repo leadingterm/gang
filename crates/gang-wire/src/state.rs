@@ -58,6 +58,16 @@ wire_enum! {
     }
 }
 
+wire_enum! {
+    /// A bounded engine cache store; readers tolerate unknown values.
+    pub enum CacheStore default Content {
+        /// Content-addressable store.
+        Content = "CAS",
+        /// Action cache.
+        Action = "AC",
+    }
+}
+
 /// The live state, the body of `GET /v1/state` and the payload of a `snapshot` frame.
 ///
 /// The default is an empty frame; served frames are built by the state builder.
@@ -102,11 +112,64 @@ pub struct State {
     /// What this server observed over its recent window.
     #[serde(default)]
     pub recent: Recent,
+    /// The leader's bounded stores and latest external bucket measurement.
+    #[serde(default)]
+    pub cache: Cache,
     /// Builds with an observation within the recent window, basic view, ordered by name; at most `max_live`.
     pub builds: Vec<Build>,
     /// Epoch of the principal set, which advances when principals change.
     #[ts(type = "number")]
     pub principals_epoch: u64,
+}
+
+/// Cache occupancy at the latest completed pass and provider measurement.
+#[derive(
+    gang_macros::Known, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS,
+)]
+#[serde(rename_all = "camelCase")]
+#[ts(optional_fields)]
+pub struct Cache {
+    /// Bounded engine stores, omitted when none are reported.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<StoreUsage>>", optional)]
+    pub stores: Vec<StoreUsage>,
+    /// Latest provider measurement, absent until available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<BucketUsage>,
+}
+
+/// Occupancy of one bounded engine store.
+#[derive(
+    gang_macros::Known, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct StoreUsage {
+    /// Which store was measured.
+    pub store: CacheStore,
+    /// Bytes held, rounded to filesystem blocks.
+    #[ts(type = "number")]
+    pub used_bytes: u64,
+    /// Eviction budget in bytes.
+    #[ts(type = "number")]
+    pub budget_bytes: u64,
+}
+
+/// Provider measurement of the entire external bucket.
+#[derive(
+    gang_macros::Known, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct BucketUsage {
+    /// Bytes held in the bucket.
+    #[ts(type = "number")]
+    pub bytes: u64,
+    /// Objects held in the bucket.
+    #[ts(type = "number")]
+    pub objects: u64,
+    /// When the provider measured the bucket.
+    #[serde(with = "crate::time")]
+    #[ts(type = "Timestamp")]
+    pub measure_time: Timestamp,
 }
 
 /// What this server observed over its recent window, oldest first. Every dashboard chart and rate
@@ -167,6 +230,18 @@ pub struct Sample {
     pub lookups: u32,
     /// Of `lookups`, remote cache hits.
     pub hits: u32,
+    /// Client-sent cache-service message bytes during the step.
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub uploaded_bytes: u64,
+    /// Client-received cache-service message bytes during the step.
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub downloaded_bytes: u64,
+    /// Bytes evicted by bounded stores during the step.
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub evicted_bytes: u64,
 }
 
 /// A phase a worker was in, from `start` until the next span's start (the last one lasts).
@@ -541,6 +616,7 @@ pub struct WorkerCounts {
     ts_rs::TS,
 )]
 #[serde(rename_all = "camelCase")]
+#[ts(optional_fields)]
 pub struct Demand {
     /// Actions running on the fleet.
     pub running: u32,
@@ -555,6 +631,22 @@ pub struct Demand {
     /// Memory in bytes the demand asks for.
     #[ts(type = "Bytes")]
     pub memory: u64,
+    /// Measured instance readiness, absent until a measurement is available.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::duration::option"
+    )]
+    #[ts(type = "Duration")]
+    pub readiness: Option<Duration>,
+    /// Latest expected queued action start at the planned capacity, absent without attributed queue.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::duration::option"
+    )]
+    #[ts(type = "Duration")]
+    pub expected_wait: Option<Duration>,
 }
 
 /// A connected worker, named `workers/{worker}`.
@@ -760,6 +852,74 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cache_and_old_sample_wire_contract() {
+        let mut value = serde_json::to_value(State::default()).expect("state serializes");
+        assert_eq!(value["cache"], json!({}));
+        value.as_object_mut().expect("object").remove("cache");
+        let old: State = serde_json::from_value(value).expect("old state parses");
+        assert_eq!(old.cache, Cache::default());
+        let sample: Sample = serde_json::from_value(json!({
+            "start": "1970-01-01T00:00:00.000Z", "completed": 0, "running": 0,
+            "queued": 0, "passes": 0, "skipped": 0, "lookups": 0, "hits": 0
+        }))
+        .expect("old sample parses");
+        assert_eq!(
+            (
+                sample.uploaded_bytes,
+                sample.downloaded_bytes,
+                sample.evicted_bytes
+            ),
+            (0, 0, 0)
+        );
+        let cache = Cache {
+            stores: vec![StoreUsage {
+                store: CacheStore::Action,
+                used_bytes: 4,
+                budget_bytes: 9,
+            }],
+            bucket: Some(BucketUsage {
+                bytes: 100,
+                objects: 2,
+                measure_time: Timestamp::from_unix_millis(0),
+            }),
+        };
+        let encoded = serde_json::to_value(&cache).expect("cache serializes");
+        assert_eq!(
+            encoded,
+            json!({"stores": [{"store": "AC", "usedBytes": 4, "budgetBytes": 9}],
+            "bucket": {"bytes": 100, "objects": 2, "measureTime": "1970-01-01T00:00:00.000Z"}})
+        );
+        assert_eq!(
+            serde_json::from_value::<Cache>(encoded).expect("cache parses"),
+            cache
+        );
+        assert_eq!(CacheStore::default(), CacheStore::Content);
+    }
+
+    #[test]
+    fn recent_increment_replaces_changed_byte_counts() {
+        let mut previous = Recent::new(Duration::from_secs(30), Duration::from_secs(10));
+        previous.sample_at(Timestamp::from_unix_millis(0), |_| {});
+        let mut current = previous.clone();
+        current.sample_at(Timestamp::from_unix_millis(0), |sample| {
+            sample.uploaded_bytes = 10;
+            sample.downloaded_bytes = 20;
+            sample.evicted_bytes = 30;
+        });
+        let increment = current.increment(&previous).expect("bytes changed");
+        previous.apply(&increment);
+        assert_eq!(previous, current);
+        assert_eq!(
+            (
+                previous.samples[0].uploaded_bytes,
+                previous.samples[0].downloaded_bytes,
+                previous.samples[0].evicted_bytes
+            ),
+            (10, 20, 30)
+        );
+    }
+
+    #[test]
     fn recent_samples_follow_steps_and_bound_the_window() {
         let mut recent = Recent::new(Duration::from_secs(30), Duration::from_secs(10));
         recent.sample_at(Timestamp::from_unix_millis(10_999), |sample| {
@@ -837,6 +997,9 @@ mod tests {
                 skipped: 5,
                 lookups: 6,
                 hits: 7,
+                uploaded_bytes: 8,
+                downloaded_bytes: 9,
+                evicted_bytes: 10,
             };
         });
         let state = State {
@@ -850,7 +1013,8 @@ mod tests {
             json!({
                 "window": "900s", "step": "10s",
                 "samples": [{"start": "1970-01-01T00:00:00.000Z", "completed": 1,
-                    "running": 2, "queued": 3, "passes": 4, "skipped": 5, "lookups": 6, "hits": 7}]
+                    "running": 2, "queued": 3, "passes": 4, "skipped": 5, "lookups": 6, "hits": 7,
+                    "uploadedBytes": 8, "downloadedBytes": 9, "evictedBytes": 10}]
             })
         );
         let mut worker = Worker::default();
@@ -982,6 +1146,42 @@ mod tests {
     }
 
     #[test]
+    fn demand_optional_durations_round_trip() {
+        let legacy = json!({
+            "running": 3, "queued": 7, "candidates": 9,
+            "needed": 3, "vcpus": 24, "memory": 1024,
+        });
+        let demand: Demand = round_trip(&legacy);
+        assert_eq!(demand.readiness, None);
+        assert_eq!(demand.expected_wait, None);
+
+        let mut both = legacy.clone();
+        both["readiness"] = json!("0.250s");
+        both["expectedWait"] = json!("0s");
+        let demand: Demand = round_trip(&both);
+        assert_eq!(demand.readiness, Some(Duration::from_millis(250)));
+        assert_eq!(demand.expected_wait, Some(Duration::ZERO));
+
+        let mut readiness_only = both.clone();
+        readiness_only
+            .as_object_mut()
+            .expect("demand object")
+            .remove("expectedWait");
+        let demand: Demand = round_trip(&readiness_only);
+        assert_eq!(demand.readiness, Some(Duration::from_millis(250)));
+        assert_eq!(demand.expected_wait, None);
+
+        let mut wait_only = both;
+        wait_only
+            .as_object_mut()
+            .expect("demand object")
+            .remove("readiness");
+        let demand: Demand = round_trip(&wait_only);
+        assert_eq!(demand.readiness, None);
+        assert_eq!(demand.expected_wait, Some(Duration::ZERO));
+    }
+
+    #[test]
     fn fleet_round_trips_with_unit_less_durations_and_unrenamed_property_keys() {
         let fleet: Fleet = round_trip(&fleet_value());
         assert_eq!(fleet.policy.boot_grace, Duration::from_millis(250));
@@ -1087,6 +1287,7 @@ mod tests {
             "eventsLimit": 200,
             "completed": 17,
             "recent": {"window": "0s", "step": "0s"},
+            "cache": {},
             "builds": [],
             "principalsEpoch": 3,
         });

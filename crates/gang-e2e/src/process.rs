@@ -464,8 +464,7 @@ pub fn snapshot() -> Vec<ProcessEntry> {
         .collect()
 }
 
-/// The entries that are workers of the stack whose configuration is `config`: the second argument
-/// is `worker`, and some argument is the config path or `--config=<path>`.
+/// Workers and held launch wrappers for the stack whose configuration is `config`.
 #[must_use]
 pub fn workers_of<'a>(entries: &'a [ProcessEntry], config: &Path) -> Vec<&'a ProcessEntry> {
     let config_path = config.to_string_lossy().into_owned();
@@ -473,9 +472,17 @@ pub fn workers_of<'a>(entries: &'a [ProcessEntry], config: &Path) -> Vec<&'a Pro
     entries
         .iter()
         .filter(|entry| {
-            entry.args.get(1).is_some_and(|arg| arg == "worker")
-                && entry
-                    .args
+            let args = if entry
+                .args
+                .get(1)
+                .is_some_and(|arg| arg == "--gang-e2e-launch-gate")
+            {
+                entry.args.get(4..).unwrap_or_default()
+            } else {
+                &entry.args
+            };
+            args.get(1).is_some_and(|arg| arg == "worker")
+                && args
                     .iter()
                     .any(|arg| *arg == config_path || *arg == config_flag)
         })

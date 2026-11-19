@@ -5,7 +5,8 @@
 //! - [`Aws`] is the provisioner, configured by `[provisioner.aws]` ([`AwsConfig`]). It runs the
 //!   worker fleet as an Auto Scaling group and serves the node lifecycle, scratch volume and
 //!   workload credential ports.
-//! - [`S3Cache`] is the cache, configured by `[cache.s3]` ([`S3CacheConfig`]).
+//! - [`S3Cache`] is the cache, configured by `[cache.s3]` ([`S3CacheConfig`]). It also reports
+//!   the bucket's size and object count from `CloudWatch`'s daily S3 storage metrics.
 //! - [`KmsSigner`] is the certificate signer, configured by `[signer.kms]`
 //!   ([`KmsSignerConfig`]).
 //!
@@ -31,6 +32,7 @@
 //! ```
 
 mod cache;
+mod cloudwatch;
 mod config;
 mod credential;
 mod errors;
@@ -43,6 +45,9 @@ mod names;
 mod plugin;
 mod scratch;
 mod signer;
+
+#[cfg(test)]
+mod cloudwatch_replay;
 
 #[cfg(test)]
 mod fake_aws;
@@ -62,7 +67,8 @@ mod warm_scenarios;
 pub use cache::S3Cache;
 pub use config::{
     AwsConfig, AwsFleetOptions, Capacity, CooldownPolicy, ExpiryAge, KmsSignerConfig,
-    RetrySpotAfter, S3CacheConfig, S3Tuning, SpotFallback, WorkloadTokenAlgorithm,
+    RetrySpotAfter, S3CacheConfig, S3Tuning, SpotFallback, UsageInterval, UsageIntervalError,
+    WorkloadTokenAlgorithm,
 };
 pub use errors::{AwsError, ScratchError};
 pub use names::{AwsNameError, BucketName, FleetTagKey, KeyId, KeyPrefix, MountPoint};

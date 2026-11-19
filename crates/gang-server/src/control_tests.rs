@@ -11,8 +11,9 @@ use crate::publish::StatePublisher;
 use futures::poll;
 use gang_clock::{Clock, Timestamp};
 use gang_spi::{
-    Fence, FleetInstance, FleetSupply, Held, InstanceExit, PortError, ProvisionerPort,
-    ScalingAuditEvent, ScalingEventKind, ScalingEventSeq, SchedulerSnapshot, WorkerState,
+    ExecutingDemand, Fence, FleetInstance, FleetSupply, Held, InstanceExit, PortError,
+    ProvisionerPort, ScalingAuditEvent, ScalingEventKind, ScalingEventSeq, SchedulerSnapshot,
+    WorkerState,
 };
 use gang_state::BuilderConfig;
 use gang_types::{
@@ -1395,44 +1396,60 @@ async fn audit_failure_still_counts_the_step_as_applied() -> Result<(), PortErro
 }
 
 #[tokio::test]
-async fn overflow_from_a_full_fleet_scales_the_next_candidate() -> TestResult {
-    let clock = clock_at(1_000_000);
-    let fleet = FakeProvisioner::default();
-    let scheduler = FakeScheduler::new().expect("the scheduler fake builds");
-    let repository = FakeRepository::default();
-    let fleets = fleets_of(vec![("first", 1), ("second", 4)]);
-    let first = FleetName::try_new("first").expect("first is a valid fleet name");
-    let second = FleetName::try_new("second").expect("second is a valid fleet name");
-    fleet.set_supply(&first, supply_with("first-1", clock.wall(), 1));
-    scheduler.set_snapshot(SchedulerSnapshot {
-        workers: vec![WorkerState {
-            fleet: first.clone(),
-            running_actions: 4,
-            ..idle_worker(&instance_id("first-1"), clock.wall())?
-        }],
-        queued: vec![queued_demand(
-            FleetSet::prefix(2).map_err(PortError::backend)?,
-        )],
-        ..SchedulerSnapshot::default()
-    });
-    let mut control = ControlLoop::new(
-        &fleets,
-        POLL_INTERVAL,
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
-        gang_testkit::fence::valid_fence(),
-    );
+async fn overflow_from_a_full_fleet_depends_on_running_action_duration() -> TestResult {
+    for (seconds, applied) in [(2, 0), (60, 1)] {
+        let clock = clock_at(1_000_000);
+        let fleet = FakeProvisioner::default();
+        let scheduler = FakeScheduler::new().expect("the scheduler fake builds");
+        let repository = FakeRepository::default();
+        let fleets = fleets_of(vec![("first", 1), ("second", 4)]);
+        let first = FleetName::try_new("first").expect("first is a valid fleet name");
+        let second = FleetName::try_new("second").expect("second is a valid fleet name");
+        fleet.set_supply(&first, supply_with("first-1", clock.wall(), 1));
+        scheduler.set_snapshot(SchedulerSnapshot {
+            workers: vec![WorkerState {
+                fleet: first.clone(),
+                running_actions: 4,
+                ..idle_worker(&instance_id("first-1"), clock.wall())?
+            }],
+            queued: vec![queued_demand(
+                FleetSet::prefix(2).map_err(PortError::backend)?,
+            )],
+            executing: (0..4)
+                .map(|_| ExecutingDemand {
+                    worker: 0,
+                    started: clock.wall(),
+                    expected: Some(Duration::from_secs(seconds)),
+                })
+                .collect(),
+            ..SchedulerSnapshot::default()
+        });
+        let mut control = ControlLoop::new(
+            &fleets,
+            POLL_INTERVAL,
+            &fleet,
+            &scheduler,
+            &repository,
+            &clock,
+            gang_testkit::fence::valid_fence(),
+        );
 
-    assert_eq!(
-        control.pass().await,
-        PassOutcome::Completed {
-            applied: 1,
-            failed: 0,
-        }
-    );
-    assert_eq!(fleet.desired_requests(), vec![(second, 1)]);
+        assert_eq!(
+            control.pass().await,
+            PassOutcome::Completed { applied, failed: 0 },
+            "running action duration: {seconds}s"
+        );
+        let expected_requests = if seconds == 60 {
+            vec![(second, 1)]
+        } else {
+            vec![]
+        };
+        assert_eq!(
+            fleet.desired_requests(),
+            expected_requests,
+            "running action duration: {seconds}s"
+        );
+    }
     Ok(())
 }
 
@@ -1738,7 +1755,7 @@ fn hub() -> StateHub {
     )
 }
 
-/// A publisher that writes into `hub`, with no actions sample.
+/// A publisher that writes into `hub`, with no actions sample, traffic or cache measurement.
 fn publisher(hub: &StateHub) -> StatePublisher {
     let config = BuilderConfig {
         events_limit: 100,
@@ -1748,11 +1765,16 @@ fn publisher(hub: &StateHub) -> StatePublisher {
         interval: POLL_INTERVAL.get(),
         provisioner: "local".to_owned(),
     };
+    let builds = gang_config::BuildsConfig::default();
+    let (builds, sink, _observations) = crate::builds::BuildsCell::channel(&builds);
     StatePublisher::new(
         hub.clone(),
         config,
         ActionsCache::default(),
-        crate::builds::BuildsCell::new(&gang_config::BuildsConfig::default()),
+        builds,
+        sink,
+        crate::cache_usage::CacheUsage::default(),
+        gang_state::CacheBaseline::default(),
     )
 }
 

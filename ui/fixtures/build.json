@@ -7,18 +7,18 @@
   "startTime": "2026-01-15T10:00:00.000Z",
   "lastActiveTime": "2026-01-15T10:09:30.000Z",
   "usage": {
-    "cache": { "hits": 80, "misses": 18, "errors": 2, "uploadedResults": 3 },
+    "cache": { "hits": 80, "misses": 18, "errors": 2, "uploadedResults": 3, "uploadedBytes": 31457280, "downloadedBytes": 1288490189 },
     "executions": { "executeCalls": 15, "rejected": 1, "completed": 10, "failed": 2 },
     "actionTime": { "queued": "30s", "inputFetch": "20s", "executing": "140s", "outputUpload": "10s" }
   },
   "unrecorded": 0,
   "mnemonics": [
-    { "mnemonic": "Rustc", "usage": { "cache": { "hits": 30, "misses": 6, "errors": 0, "uploadedResults": 0 }, "executions": { "executeCalls": 5, "rejected": 0, "completed": 3, "failed": 1 }, "actionTime": { "queued": "10s", "inputFetch": "6s", "executing": "50s", "outputUpload": "3s" } } },
-    { "mnemonic": "CppCompile", "usage": { "cache": { "hits": 20, "misses": 5, "errors": 1, "uploadedResults": 1 }, "executions": { "executeCalls": 4, "rejected": 0, "completed": 3, "failed": 0 }, "actionTime": { "queued": "7s", "inputFetch": "5s", "executing": "40s", "outputUpload": "2s" } } },
-    { "mnemonic": "Javac", "usage": { "cache": { "hits": 15, "misses": 3, "errors": 0, "uploadedResults": 1 }, "executions": { "executeCalls": 3, "rejected": 0, "completed": 2, "failed": 0 }, "actionTime": { "queued": "5s", "inputFetch": "4s", "executing": "25s", "outputUpload": "2s" } } },
-    { "mnemonic": "TestRunner", "usage": { "cache": { "hits": 10, "misses": 2, "errors": 1, "uploadedResults": 1 }, "executions": { "executeCalls": 2, "rejected": 1, "completed": 1, "failed": 1 }, "actionTime": { "queued": "5s", "inputFetch": "3s", "executing": "20s", "outputUpload": "2s" } } }
+    { "mnemonic": "Rustc", "usage": { "cache": { "hits": 30, "misses": 6, "errors": 0, "uploadedResults": 0, "uploadedBytes": 0, "downloadedBytes": 0 }, "executions": { "executeCalls": 5, "rejected": 0, "completed": 3, "failed": 1 }, "actionTime": { "queued": "10s", "inputFetch": "6s", "executing": "50s", "outputUpload": "3s" } } },
+    { "mnemonic": "CppCompile", "usage": { "cache": { "hits": 20, "misses": 5, "errors": 1, "uploadedResults": 1, "uploadedBytes": 0, "downloadedBytes": 0 }, "executions": { "executeCalls": 4, "rejected": 0, "completed": 3, "failed": 0 }, "actionTime": { "queued": "7s", "inputFetch": "5s", "executing": "40s", "outputUpload": "2s" } } },
+    { "mnemonic": "Javac", "usage": { "cache": { "hits": 15, "misses": 3, "errors": 0, "uploadedResults": 1, "uploadedBytes": 0, "downloadedBytes": 0 }, "executions": { "executeCalls": 3, "rejected": 0, "completed": 2, "failed": 0 }, "actionTime": { "queued": "5s", "inputFetch": "4s", "executing": "25s", "outputUpload": "2s" } } },
+    { "mnemonic": "TestRunner", "usage": { "cache": { "hits": 10, "misses": 2, "errors": 1, "uploadedResults": 1, "uploadedBytes": 0, "downloadedBytes": 0 }, "executions": { "executeCalls": 2, "rejected": 1, "completed": 1, "failed": 1 }, "actionTime": { "queued": "5s", "inputFetch": "3s", "executing": "20s", "outputUpload": "2s" } } }
   ],
-  "otherMnemonics": { "cache": { "hits": 5, "misses": 2, "errors": 0, "uploadedResults": 0 }, "executions": { "executeCalls": 1, "rejected": 0, "completed": 1, "failed": 0 }, "actionTime": { "queued": "3s", "inputFetch": "2s", "executing": "5s", "outputUpload": "1s" } },
+  "otherMnemonics": { "cache": { "hits": 5, "misses": 2, "errors": 0, "uploadedResults": 0, "uploadedBytes": 31457280, "downloadedBytes": 1288490189 }, "executions": { "executeCalls": 1, "rejected": 0, "completed": 1, "failed": 0 }, "actionTime": { "queued": "3s", "inputFetch": "2s", "executing": "5s", "outputUpload": "1s" } },
   "missedTargets": [
     { "target": "//crates/parser:parser", "misses": 6, "overestimate": 2 },
     { "target": "//rpc/server:server", "misses": 4, "overestimate": 0 },

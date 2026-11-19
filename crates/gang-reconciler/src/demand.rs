@@ -94,6 +94,23 @@ impl Demand {
         self.uncapped_need(policy) <= u64::from(policy.instances.max().get())
     }
 
+    pub(crate) fn slots_per_instance(&self, policy: &FleetPolicy) -> u32 {
+        let target = policy.target_actions_per_instance.get();
+        let slots = div_ceil(
+            self.actions,
+            NonZeroU64::from(policy.target_actions_per_instance),
+        );
+        let resources = self.resource_need(policy);
+        if slots >= resources {
+            target
+        } else {
+            (self.actions / resources)
+                .max(1)
+                .min(u64::from(target))
+                .saturating_into()
+        }
+    }
+
     /// Returns the uncapped instance need under `policy`.
     ///
     /// Action slots, vCPUs, memory and disk are each divided by their non-zero
@@ -103,12 +120,16 @@ impl Demand {
             self.actions,
             NonZeroU64::from(policy.target_actions_per_instance),
         );
+        by_actions.max(self.resource_need(policy))
+    }
+
+    fn resource_need(&self, policy: &FleetPolicy) -> u64 {
         let capacity = NonZeroU64::from(policy.vcpus_per_instance)
             .saturating_mul(NonZeroU64::MIN.saturating_add(999));
         let by_vcpus = div_ceil(self.millicores, capacity);
         let by_memory = div_ceil(self.memory, policy.memory_per_instance.as_nonzero_u64());
         let by_disk = div_ceil(self.disk, policy.disk_per_instance.as_nonzero_u64());
-        by_actions.max(by_vcpus).max(by_memory).max(by_disk)
+        by_vcpus.max(by_memory).max(by_disk)
     }
 }
 
@@ -177,6 +198,28 @@ mod tests {
             boot_grace: Duration::from_mins(10),
             ..fleet_policy("workers")?
         })
+    }
+
+    #[test]
+    fn effective_slots_preserve_slot_rounding_and_reduce_for_resources()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let policy = policy()?;
+        let mut demand = Demand::default();
+        demand.add_running(33);
+        assert_eq!(demand.slots_per_instance(&policy), 16);
+        let mut tie = Demand::default();
+        tie.add_queued(ActionResources {
+            cpu_millicores: 15_000,
+            ..ActionResources::default()
+        });
+        assert_eq!(tie.slots_per_instance(&policy), 16);
+        let mut resource_bound = Demand::default();
+        resource_bound.add_queued(ActionResources {
+            cpu_millicores: 30_000,
+            ..ActionResources::default()
+        });
+        assert_eq!(resource_bound.slots_per_instance(&policy), 1);
+        Ok(())
     }
 
     fn resources(cpu_millicores: u64, memory: Bytes) -> ActionResources {

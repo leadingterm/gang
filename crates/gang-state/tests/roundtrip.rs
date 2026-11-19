@@ -9,9 +9,9 @@ use gang_state::{ApplyError, apply, diff};
 use gang_types::{FleetName, InstanceId, WorkerId};
 use gang_wire::name;
 use gang_wire::{
-    Actions, Demand, Fleet, Instance, InstanceCounts, InstanceSize, Isa, Lifecycle, Pass, Phase,
-    Policy, Queue, QueuedAction, Recent, RunningAction, SkipReason, State, Truncated, Worker,
-    WorkerCounts,
+    Actions, Cache, Demand, Fleet, Instance, InstanceCounts, InstanceSize, Isa, Lifecycle, Pass,
+    Phase, Policy, Queue, QueuedAction, Recent, RunningAction, SkipReason, State, Truncated,
+    Worker, WorkerCounts,
 };
 use gang_wire::{Cause, Event, EventChange};
 use serde_json::json;
@@ -118,6 +118,39 @@ fn base_state() -> State {
     }
 }
 
+// Catches omitted cache deltas, merge-instead-of-replacement, and false nonempty deltas.
+#[test]
+fn cache_delta_replaces_the_whole_part() -> Result<(), Box<dyn Error>> {
+    let prev = base_state();
+    let mut cur = prev.clone();
+    cur.seq += 1;
+    cur.cache.stores.push(gang_wire::StoreUsage {
+        store: gang_wire::CacheStore::Content,
+        used_bytes: 12,
+        budget_bytes: 20,
+    });
+    cur.cache.bucket = Some(gang_wire::BucketUsage {
+        bytes: 50,
+        objects: 2,
+        measure_time: timestamped(10),
+    });
+    let delta = diff(&prev, &cur).ok_or("missing cache delta")?;
+    assert_eq!(delta.cache, Some(cur.cache.clone()));
+    let mut rebuilt = prev.clone();
+    apply(&mut rebuilt, &delta)?;
+    assert_eq!(rebuilt, cur);
+    let mut empty = cur.clone();
+    empty.seq += 1;
+    empty.cache = Cache::default();
+    let delta = diff(&cur, &empty).ok_or("missing clearing delta")?;
+    apply(&mut rebuilt, &delta)?;
+    assert_eq!(rebuilt, empty);
+    let mut unchanged = empty.clone();
+    unchanged.seq += 1;
+    assert!(diff(&empty, &unchanged).is_none());
+    Ok(())
+}
+
 fn worker(slot: usize, phase: Phase, running: u32) -> Result<Worker, Box<dyn Error>> {
     Ok(Worker {
         name: worker_name(slot)?,
@@ -190,6 +223,7 @@ struct World {
     update_time: Timestamp,
     pass: Pass,
     queue: Queue,
+    cache: Cache,
     fleets: Vec<Fleet>,
     workers: Vec<Option<Worker>>,
     instances: Vec<Option<Instance>>,
@@ -228,6 +262,28 @@ fn random_queue(rng: &mut Rng) -> Queue {
         unplaceable: rng.small() % 3,
         oldest_queue_time: rng.chance(50).then(|| timestamp(rng)),
     }
+}
+
+fn random_cache(rng: &mut Rng) -> Cache {
+    let mut stores = Vec::new();
+    for store in [
+        gang_wire::CacheStore::Content,
+        gang_wire::CacheStore::Action,
+    ] {
+        if rng.chance(50) {
+            stores.push(gang_wire::StoreUsage {
+                store,
+                used_bytes: 1 + rng.below(1_000),
+                budget_bytes: 1_000 + rng.below(1_000),
+            });
+        }
+    }
+    let bucket = rng.chance(50).then(|| gang_wire::BucketUsage {
+        bytes: 1 + rng.below(10_000),
+        objects: 1 + rng.below(1_000),
+        measure_time: timestamp(rng),
+    });
+    Cache { stores, bucket }
 }
 
 fn random_fleet(rng: &mut Rng, fleet: &str) -> Result<Fleet, Box<dyn Error>> {
@@ -273,6 +329,12 @@ fn random_fleet(rng: &mut Rng, fleet: &str) -> Result<Fleet, Box<dyn Error>> {
             needed: rng.small() % 6,
             vcpus: rng.small(),
             memory: u64::from(rng.small()),
+            readiness: rng
+                .chance(50)
+                .then(|| Duration::from_millis(u64::from(rng.small()))),
+            expected_wait: rng
+                .chance(50)
+                .then(|| Duration::from_millis(u64::from(rng.small()))),
         },
     })
 }
@@ -397,6 +459,7 @@ fn random_world(rng: &mut Rng) -> Result<World, Box<dyn Error>> {
         update_time: timestamp(rng),
         pass: random_pass(rng)?,
         queue: random_queue(rng),
+        cache: random_cache(rng),
         fleets: Vec::new(),
         workers: vec![None; WORKERS],
         instances: vec![None; INSTANCES],
@@ -449,6 +512,9 @@ fn advance(rng: &mut Rng, world: &mut World) -> Result<(), Box<dyn Error>> {
     }
     if rng.chance(50) {
         world.queue = random_queue(rng);
+    }
+    if rng.chance(50) {
+        world.cache = random_cache(rng);
     }
     evolve(rng, &mut world.workers[..], random_worker, tweak_worker)?;
     evolve(
@@ -521,6 +587,7 @@ fn snapshot(world: &World) -> State {
         events_limit: world.events_limit,
         completed: world.completed,
         recent: Recent::default(),
+        cache: world.cache.clone(),
         builds: Vec::new(),
         principals_epoch: world.principals_epoch,
     }
@@ -529,11 +596,15 @@ fn snapshot(world: &World) -> State {
 #[test]
 fn random_pairs_round_trip() -> Result<(), Box<dyn Error>> {
     let mut rng = Rng(SEED);
+    let mut changed_cache_with_queue = 0;
     for pair in 0..PAIRS {
         let mut world = random_world(&mut rng)?;
         let prev = snapshot(&world);
         advance(&mut rng, &mut world)?;
         let cur = snapshot(&world);
+        if prev.cache != cur.cache && cur.queue != Queue::default() {
+            changed_cache_with_queue += 1;
+        }
         if let Some(delta) = diff(&prev, &cur) {
             let mut state = prev.clone();
             apply(&mut state, &delta)?;
@@ -544,6 +615,41 @@ fn random_pairs_round_trip() -> Result<(), Box<dyn Error>> {
             same.update_time = prev.update_time;
             assert_eq!(same, prev, "pair {pair} has no delta but differs");
         }
+    }
+    // Ensures the generator exercises cache replacement alongside another populated part.
+    assert!(changed_cache_with_queue > 0);
+    Ok(())
+}
+
+#[test]
+fn demand_duration_wire_fields_are_independently_optional() -> Result<(), Box<dyn Error>> {
+    let legacy = json!({
+        "running": 0, "queued": 0, "candidates": 0, "needed": 0,
+        "vcpus": 0, "memory": 0
+    });
+    let cases = [
+        (None, None, None, None),
+        (
+            Some(Duration::ZERO),
+            Some(Duration::from_millis(1500)),
+            Some("0s"),
+            Some("1.500s"),
+        ),
+        (Some(Duration::from_millis(250)), None, Some("0.250s"), None),
+        (None, Some(Duration::ZERO), None, Some("0s")),
+    ];
+    for (readiness, expected_wait, readiness_json, wait_json) in cases {
+        let mut value = legacy.clone();
+        if let Some(text) = readiness_json {
+            value["readiness"] = json!(text);
+        }
+        if let Some(text) = wait_json {
+            value["expectedWait"] = json!(text);
+        }
+        let demand: Demand = serde_json::from_value(value.clone())?;
+        assert_eq!(demand.readiness, readiness);
+        assert_eq!(demand.expected_wait, expected_wait);
+        assert_eq!(serde_json::to_value(demand)?, value);
     }
     Ok(())
 }

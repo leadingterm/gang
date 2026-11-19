@@ -95,12 +95,48 @@ pub mod builds {
     pub const WARM_PRINCIPAL: &str = "warm build names its client principal";
     /// The two invocations have different build names.
     pub const DISTINCT: &str = "cold and warm builds have different names";
+    /// The output is large enough for `ByteStream` and is the expected distinct blob.
+    pub const BLOB_THRESHOLD: &str = "warm output is the expected ByteStream-sized blob";
+    /// The engine reports the configured budgets for both filesystem stores.
+    pub const ENGINE_BUDGETS: &str = "engine reports configured CAS and AC budgets";
+    /// The content store grows after the cold build.
+    pub const CAS_GROWTH: &str = "engine CAS usage grows after the build";
+    /// The cold build attributes traffic in both directions.
+    pub const COLD_BYTES: &str = "cold build attributes uploaded and downloaded bytes";
+    /// The warm build attributes at least the downloaded output blob.
+    pub const WARM_BYTES: &str = "warm build attributes downloaded output bytes";
 }
 
 /// Names of the checks of the scale-outs a build causes.
 pub mod scaling {
     /// The first scale-out starts the fleet's first worker.
     pub const FIRST_SCALE_OUT_FROM_ZERO: &str = "the first scale-out raises the fleet from 0 to 1";
+}
+
+/// Names of the checks of work-aware scaling.
+pub mod work_aware {
+    /// The training build finishes successfully.
+    pub const WARMUP_BUILD: &str = "warmup build succeeds";
+    /// The readiness sample includes the held launch.
+    pub const READINESS: &str = "readiness is measured";
+    /// The trained fleet drains before the burst.
+    pub const WARM_DRAIN: &str = "warm fleet drains to zero";
+    /// A trained burst buys at most one worker.
+    pub const BURST_SCALE_OUT: &str = "burst launches at most one worker";
+    /// The burst finishes successfully.
+    pub const BURST_BUILD: &str = "burst build succeeds";
+    /// Both held actions execute while the third stays queued.
+    pub const QUEUED: &str = "two held actions leave one queued";
+    /// Short running work absorbs the queued action.
+    pub const QUEUED_SCALE_OUT: &str = "queued short work does not scale out";
+    /// The queued build finishes successfully.
+    pub const QUEUED_BUILD: &str = "queued build succeeds";
+    /// The held actions' build finishes successfully.
+    pub const QUEUED_HELD_BUILD: &str = "held build succeeds";
+    /// Persistent held work grows the fleet to three workers.
+    pub const BACKLOG_WORKERS: &str = "held backlog reaches three workers";
+    /// The backlog build finishes successfully.
+    pub const BACKLOG_BUILD: &str = "backlog build succeeds";
 }
 
 /// Names of the checks of the lifecycle scenario.
@@ -419,8 +455,8 @@ pub mod fleets {
     pub const MEMORY: &str = "an action requesting more memory than the first fleet has";
     /// A step whose action asks for the noop sandbox.
     pub const NOOP_SANDBOX: &str = "an action requesting the noop sandbox";
-    /// A step of two actions at once, more than the first fleet holds.
-    pub const OVERFLOW: &str = "a pair of concurrent unconstrained actions";
+    /// A cold step of two actions at once, more than the first fleet holds.
+    pub const OVERFLOW: &str = "a cold pair of concurrent unconstrained actions";
 
     /// The scale-outs of `request` are exactly those of `fleets`, in order.
     #[must_use]
@@ -1080,6 +1116,14 @@ pub mod follower_builds {
         "follower builds: only followers serve the public frontend";
     /// A direct follower request returns the controlled cache miss.
     pub const CONTROLLED_MISS: &str = "follower builds: controlled request returns not found";
+    /// The follower stores and returns the controlled blob.
+    pub const CONTROLLED_BLOB: &str = "follower builds: controlled blob round trip succeeds";
+    /// The leader includes the follower's lookup in its recent window.
+    pub const CONTROLLED_LOOKUPS: &str =
+        "follower builds: leader recent lookups include the follower miss";
+    /// The leader includes the follower's download in its recent window.
+    pub const CONTROLLED_DOWNLOADED: &str =
+        "follower builds: leader recent downloaded bytes include the follower read";
     /// The leader records exactly the controlled miss.
     pub const CONTROLLED_LEADER: &str =
         "follower builds: leader records exactly the controlled miss";

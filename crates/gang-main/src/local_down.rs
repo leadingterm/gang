@@ -160,8 +160,8 @@ async fn terminate_all<'a, P: ProvisionerPort + 'a>(
 /// Terminates every instance of `fleet` and returns how many there were.
 ///
 /// The first capacity change prevents replacements; after terminating the listed instances, a
-/// second change retires workers that exited meanwhile and leaves desired capacity at zero
-/// once every live worker is terminating.
+/// second change leaves desired capacity at zero. The final convergence retires workers that
+/// died before or during shutdown, including their scratch space and cgroups.
 async fn terminate_fleet<P: ProvisionerPort>(
     provisioner: &P,
     fence: &Fence,
@@ -184,6 +184,10 @@ async fn terminate_fleet<P: ProvisionerPort>(
     }
     fence
         .run(async |held| provisioner.set_desired_capacity(held, fleet, 0).await)
+        .await
+        .map_err(|error| LocalCommandError::Provisioner(error.into()))?;
+    fence
+        .run(async |held| provisioner.converge(held, fleet).await)
         .await
         .map_err(|error| LocalCommandError::Provisioner(error.into()))?;
     Ok(supply.instances.len())
@@ -269,6 +273,7 @@ mod tests {
     struct RecordingProvisioner {
         supplies: Vec<(&'static str, Vec<InstanceId>)>,
         failing_capacity: bool,
+        failing_converge: bool,
         calls: Mutex<Vec<String>>,
         lock_path: Option<PathBuf>,
         lock_observations: Mutex<Vec<bool>>,
@@ -294,6 +299,7 @@ mod tests {
                     })
                     .collect(),
                 failing_capacity: false,
+                failing_converge: false,
                 calls: Mutex::new(Vec::new()),
                 lock_path: None,
                 lock_observations: Mutex::new(Vec::new()),
@@ -303,6 +309,12 @@ mod tests {
         /// Makes every capacity change fail.
         fn failing_capacity(mut self) -> Self {
             self.failing_capacity = true;
+            self
+        }
+
+        /// Makes convergence fail.
+        fn failing_converge(mut self) -> Self {
+            self.failing_converge = true;
             self
         }
 
@@ -395,6 +407,15 @@ mod tests {
             Ok(())
         }
 
+        async fn converge(&self, held: &Held, fleet: Fleet<'_, ()>) -> Result<(), PortError> {
+            self.record_change(held)?;
+            self.record(format!("converge({})", fleet.name.as_str()));
+            if self.failing_converge {
+                return Err(PortError::unavailable("convergence refused"));
+            }
+            Ok(())
+        }
+
         fn worker_lifetime(&self) -> gang_types::WorkerLifetime {
             gang_types::WorkerLifetime::LongLived
         }
@@ -417,12 +438,12 @@ mod tests {
             Self {
                 state: Mutex::new(ClampingState {
                     desired: 2,
-                    instances: ["local-1", "local-2"]
+                    instances: [("local-0", false), ("local-1", true), ("local-2", true)]
                         .into_iter()
-                        .map(|id| {
+                        .map(|(id, live)| {
                             (
                                 InstanceId::try_new(id).expect("valid instance id"),
-                                true,
+                                live,
                                 false,
                             )
                         })
@@ -468,7 +489,6 @@ mod tests {
         ) -> Result<(), PortError> {
             held.check()?;
             let mut state = self.state.lock();
-            state.instances.retain(|(_, live, _)| *live);
             let serving = u32::try_from(
                 state
                     .instances
@@ -504,9 +524,16 @@ mod tests {
                     state.instances.remove(index);
                 } else if !*terminating {
                     *terminating = true;
+                    *live = false;
                     state.desired -= 1;
                 }
             }
+            Ok(())
+        }
+
+        async fn converge(&self, held: &Held, _fleet: Fleet<'_, ()>) -> Result<(), PortError> {
+            held.check()?;
+            self.state.lock().instances.retain(|(_, live, _)| *live);
             Ok(())
         }
 
@@ -809,6 +836,7 @@ mod tests {
                 "terminate(local-workers, local-1)",
                 "terminate(local-workers, local-2)",
                 "set_desired_capacity(local-workers, 0)",
+                "converge(local-workers)",
             ]
         );
     }
@@ -829,7 +857,7 @@ mod tests {
         runtime::block_on(terminate_all(&provisioner, &fence, [fleet(&name)]))
             .expect("fleet terminates");
 
-        assert_eq!(*provisioner.lock_observations.lock(), [true; 4]);
+        assert_eq!(*provisioner.lock_observations.lock(), [true; 5]);
         drop(fence);
         assert!(!FileLock::is_held(&lock_path).expect("probe released lock"));
     }
@@ -852,8 +880,8 @@ mod tests {
             "desired capacity stayed above zero after gang local down"
         );
         assert!(
-            state.instances.iter().all(|(_, live, _)| *live),
-            "an exited worker was left unretired"
+            state.instances.is_empty(),
+            "exited workers were left unretired"
         );
     }
 
@@ -877,6 +905,35 @@ mod tests {
         assert_eq!(
             provisioner.calls(),
             ["set_desired_capacity(local-workers, 0)"]
+        );
+    }
+
+    #[test]
+    fn failed_convergence_propagates_after_termination() {
+        let provisioner = RecordingProvisioner::new(&["local-1"]).failing_converge();
+        let name = fleet_name();
+
+        let result = runtime::block_on(terminate_fleet(
+            &provisioner,
+            &gang_testkit::fence::valid_fence(),
+            fleet(&name),
+        ));
+
+        assert!(matches!(
+            result,
+            Err(crate::errors::MainError::Local(
+                LocalCommandError::Provisioner(_)
+            ))
+        ));
+        assert_eq!(
+            provisioner.calls(),
+            [
+                "set_desired_capacity(local-workers, 0)",
+                "supply(local-workers)",
+                "terminate(local-workers, local-1)",
+                "set_desired_capacity(local-workers, 0)",
+                "converge(local-workers)",
+            ]
         );
     }
 
@@ -905,10 +962,12 @@ mod tests {
                 "terminate(alpha, alpha-1)",
                 "terminate(alpha, alpha-2)",
                 "set_desired_capacity(alpha, 0)",
+                "converge(alpha)",
                 "set_desired_capacity(beta, 0)",
                 "supply(beta)",
                 "terminate(beta, beta-1)",
                 "set_desired_capacity(beta, 0)",
+                "converge(beta)",
             ]
         );
     }

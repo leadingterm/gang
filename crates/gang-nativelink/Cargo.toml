@@ -21,6 +21,7 @@ http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+lru = { workspace = true }
 nativelink-config = { workspace = true }
 nativelink-error = { workspace = true }
 nativelink-metric = { workspace = true }
@@ -41,6 +42,7 @@ tower = { workspace = true, features = ["util"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+allocation-counter = { workspace = true }
 base64 = { workspace = true }
 gang-os = { workspace = true }
 gang-testkit = { workspace = true }

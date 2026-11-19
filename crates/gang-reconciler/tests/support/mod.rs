@@ -161,6 +161,7 @@ impl Harness {
                 resources,
                 queued_since,
                 priority: 0,
+                expected: None,
             });
         }
     }
@@ -282,8 +283,33 @@ impl Harness {
     /// Removes the worker running on `instance` from the scheduler.
     pub fn disconnect(&mut self, instance: &str) -> TestResult {
         let id = worker_id(instance)?;
-        self.snapshot.workers.retain(|worker| worker.id != id);
+        self.retain_workers(|worker| worker.id != id);
         Ok(())
+    }
+
+    fn retain_workers(&mut self, mut keep: impl FnMut(&WorkerState) -> bool) {
+        let mut indices = Vec::with_capacity(self.snapshot.workers.len());
+        let mut next = 0;
+        self.snapshot.workers.retain(|worker| {
+            if keep(worker) {
+                indices.push(Some(next));
+                next += 1;
+                true
+            } else {
+                indices.push(None);
+                false
+            }
+        });
+        self.snapshot
+            .executing
+            .retain_mut(|execution| match indices.get(execution.worker) {
+                Some(Some(index)) => {
+                    execution.worker = *index;
+                    true
+                }
+                Some(None) => false,
+                None => true,
+            });
     }
 
     /// Sets how many actions the worker on `instance` is running.
@@ -325,7 +351,18 @@ impl Harness {
     pub fn reconcile(&mut self) -> Vec<PlanStep> {
         let mut scratch = self.snapshot.clone();
         // Tests connect workers in arbitrary order; the scheduler port returns them sorted.
-        scratch.workers.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+        let mut workers: Vec<_> = scratch.workers.drain(..).enumerate().collect();
+        workers.sort_unstable_by(|a, b| a.1.id.cmp(&b.1.id));
+        let mut sorted_index = vec![0; workers.len()];
+        for (new, (old, worker)) in workers.into_iter().enumerate() {
+            sorted_index[old] = new;
+            scratch.workers.push(worker);
+        }
+        for execution in &mut scratch.executing {
+            if let Some(&index) = sorted_index.get(execution.worker) {
+                execution.worker = index;
+            }
+        }
         self.hosted.replace(&mut scratch);
         self.reconciler.reconcile(
             &mut self.passes,
@@ -373,9 +410,7 @@ impl Harness {
                     }
                 }
                 Action::Terminate { instance, .. } => {
-                    self.snapshot
-                        .workers
-                        .retain(|worker| !instance.hosts(&worker.id));
+                    self.retain_workers(|worker| !instance.hosts(&worker.id));
                     if let Some(pass) = self.passes.get_mut(step.fleet) {
                         pass.supply.instances.retain(|entry| entry.id != instance);
                         pass.supply.desired = pass.supply.desired.saturating_sub(1);

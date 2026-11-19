@@ -24,6 +24,12 @@ pub enum IngestError {
     /// A wire enum value is not recognized.
     #[error("unknown observation value")]
     UnknownValue,
+    /// Cumulative hits exceed cumulative lookups.
+    #[error("traffic hits exceed lookups")]
+    ExcessHits,
+    /// Execute calls cannot carry cache-service bytes.
+    #[error("execute call has transferred bytes")]
+    ExecuteTransferred,
 }
 
 /// An observation outbox cannot be constructed with the supplied limits.

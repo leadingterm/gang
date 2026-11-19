@@ -30,23 +30,32 @@
 in
   pkgs.testers.runNixOSTest {
     name = "gang-scratch";
+    globalTimeout = 300;
+
+    nodeDefaults.virtualisation = {
+      memorySize = 1024;
+      cores = 1;
+      useNixStoreImage = true;
+      mountHostNixStore = false;
+      sharedDirectories = pkgs.lib.mkForce {};
+    };
 
     nodes = {
       raid = {
         imports = [base];
         virtualisation.emptyDiskImages = [512 512];
-        gang.scratch.instanceStoreGlob = "/dev/vd[bc]";
+        gang.scratch.instanceStoreGlob = "/dev/vd[cd]";
       };
 
       single = {
         imports = [base];
         virtualisation.emptyDiskImages = [512];
-        gang.scratch.instanceStoreGlob = "/dev/vd[b]";
+        gang.scratch.instanceStoreGlob = "/dev/vd[c]";
       };
 
       none = {
         imports = [base];
-        gang.scratch.instanceStoreGlob = "/dev/vd[b]";
+        gang.scratch.instanceStoreGlob = "/dev/vd[c]";
       };
     };
 

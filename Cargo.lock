@@ -162,6 +162,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "assert-json-diff"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47e4f2b81832e72834d7518d8487a0396a28cc408186a2e8854c0f98011faf12"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "async-lock"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -248,7 +258,7 @@ dependencies = [
  "bytes",
  "fastrand",
  "hex",
- "http",
+ "http 1.5.0",
  "sha1 0.10.7",
  "time",
  "tokio",
@@ -295,9 +305,9 @@ dependencies = [
 
 [[package]]
 name = "aws-runtime"
-version = "1.10.2"
+version = "1.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a0cc2144962cc5e358467b16e3d82981b1d424a7c3d34602be0036103814a1a"
+checksum = "de8930c11353c72ae54aa24dc94d692df74d59814839cbaf8069d63dbcb4c519"
 dependencies = [
  "aws-credential-types",
  "aws-sigv4",
@@ -311,7 +321,7 @@ dependencies = [
  "bytes",
  "bytes-utils",
  "fastrand",
- "http",
+ "http 1.5.0",
  "http-body",
  "percent-encoding",
  "pin-project-lite",
@@ -340,7 +350,36 @@ dependencies = [
  "aws-smithy-xml",
  "aws-types",
  "fastrand",
- "http",
+ "http 1.5.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-cloudwatch"
+version = "1.144.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8f8fe67464c18d0018cb16b9743e9be25603d30f2615ff15fdaced55d8e5b54"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-cbor",
+ "aws-smithy-compression",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "fastrand",
+ "flate2",
+ "http 1.5.0",
+ "http-body",
+ "http-body-util",
  "regex-lite",
  "tracing",
 ]
@@ -365,7 +404,7 @@ dependencies = [
  "aws-types",
  "bytes",
  "fastrand",
- "http",
+ "http 1.5.0",
  "regex-lite",
  "tracing",
  "url",
@@ -392,7 +431,7 @@ dependencies = [
  "aws-smithy-xml",
  "aws-types",
  "fastrand",
- "http",
+ "http 1.5.0",
  "regex-lite",
  "tracing",
 ]
@@ -417,7 +456,7 @@ dependencies = [
  "aws-types",
  "bytes",
  "fastrand",
- "http",
+ "http 1.5.0",
  "regex-lite",
  "tracing",
 ]
@@ -448,7 +487,7 @@ dependencies = [
  "fastrand",
  "hex",
  "hmac 0.13.0",
- "http",
+ "http 1.5.0",
  "http-body",
  "lru",
  "percent-encoding",
@@ -478,7 +517,7 @@ dependencies = [
  "aws-types",
  "bytes",
  "fastrand",
- "http",
+ "http 1.5.0",
  "regex-lite",
  "tracing",
 ]
@@ -503,7 +542,7 @@ dependencies = [
  "aws-types",
  "bytes",
  "fastrand",
- "http",
+ "http 1.5.0",
  "regex-lite",
  "tracing",
 ]
@@ -529,16 +568,16 @@ dependencies = [
  "aws-smithy-xml",
  "aws-types",
  "fastrand",
- "http",
+ "http 1.5.0",
  "regex-lite",
  "tracing",
 ]
 
 [[package]]
 name = "aws-sigv4"
-version = "1.6.4"
+version = "1.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f385da9b7757ed4c8214797ad663ff534fb622006143530aa80e21f8e06ff85c"
+checksum = "6c5aa04c533733a77879294f1854c27b3715cc50ea71756d1f6a958702b1a9fb"
 dependencies = [
  "aws-credential-types",
  "aws-smithy-eventstream",
@@ -549,7 +588,7 @@ dependencies = [
  "form_urlencoded",
  "hex",
  "hmac 0.13.0",
- "http",
+ "http 1.5.0",
  "percent-encoding",
  "sha2 0.11.1",
  "time",
@@ -568,6 +607,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-smithy-cbor"
+version = "0.64.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4266fb224b57a8fdab0aae88ec9948e530c2a007409fd7c6eee38da40591b307"
+dependencies = [
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "bigdecimal",
+ "minicbor",
+ "num-bigint",
+]
+
+[[package]]
 name = "aws-smithy-checksums"
 version = "0.65.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -578,13 +631,31 @@ dependencies = [
  "bytes",
  "crc-fast",
  "hex",
- "http",
+ "http 1.5.0",
  "http-body",
  "http-body-util",
  "md-5",
  "pin-project-lite",
  "sha1 0.11.0",
  "sha2 0.11.1",
+ "tracing",
+]
+
+[[package]]
+name = "aws-smithy-compression"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "016ef334a13c53bd75184bb8f89b0fb2aa4d56cb3cfc478ab3f05f13654b60a1"
+dependencies = [
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "bytes",
+ "flate2",
+ "futures-util",
+ "http 1.5.0",
+ "http-body",
+ "http-body-util",
+ "pin-project-lite",
  "tracing",
 ]
 
@@ -612,7 +683,7 @@ dependencies = [
  "bytes-utils",
  "futures-core",
  "futures-util",
- "http",
+ "http 1.5.0",
  "http-body",
  "http-body-util",
  "percent-encoding",
@@ -627,17 +698,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "859a81364f8185349c584fb41cd8765a400cf982f447adada590cf008a9f3b85"
 dependencies = [
  "aws-smithy-async",
+ "aws-smithy-protocol-test",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
+ "bytes",
  "h2",
- "http",
+ "http 1.5.0",
+ "http-body",
  "hyper",
  "hyper-rustls",
  "hyper-util",
+ "indexmap",
  "pin-project-lite",
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-rustls",
  "tower",
@@ -657,11 +734,32 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-observability"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e86338c869539a581bf161247762a6e87f92c5c075060057b5ed6d06632ed0c"
+checksum = "a416257d7b1b0f32a517a470a8c1dd354d8c4aa697ccab81a11a1e6cfb7418e3"
 dependencies = [
  "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "tracing",
+]
+
+[[package]]
+name = "aws-smithy-protocol-test"
+version = "0.64.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f76511a0e223ce78deb6a78b8afebda99cb737cfbc8a58d96dcb190f012dd40a"
+dependencies = [
+ "assert-json-diff",
+ "aws-smithy-runtime-api",
+ "base64-simd",
+ "cbor-diag",
+ "ciborium",
+ "http 0.2.12",
+ "pretty_assertions",
+ "regex-lite",
+ "roxmltree",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -679,9 +777,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-runtime"
-version = "1.16.2"
+version = "1.16.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cb80fb19c084da5fca9d797845735e184445e5b958599440d67529bf6ef1b64"
+checksum = "7ed38b842f93dd8220cc8816750c72ce914b22c6eb3df02beb9632333ccb366d"
 dependencies = [
  "aws-smithy-async",
  "aws-smithy-http",
@@ -691,7 +789,7 @@ dependencies = [
  "aws-smithy-types",
  "bytes",
  "fastrand",
- "http",
+ "http 1.5.0",
  "http-body",
  "http-body-util",
  "pin-project-lite",
@@ -701,15 +799,15 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-runtime-api"
-version = "1.19.2"
+version = "1.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c4e85cffe9944b10d576b075432bd8f98dbc081e8681cb37d5b2d87dc27bc84"
+checksum = "c0b79dbb5331ccd297686df811d50ab3f39db171f5c765372a69272a0990b014"
 dependencies = [
  "aws-smithy-async",
  "aws-smithy-runtime-api-macros",
  "aws-smithy-types",
  "bytes",
- "http",
+ "http 1.5.0",
  "pin-project-lite",
  "tokio",
  "tracing",
@@ -729,30 +827,29 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-schema"
-version = "1.1.2"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9543fc722ed4865ab29fb66bd7ed0bef7b029d265ba8c587144511e30006d431"
+checksum = "f7ef30d39e131651359b60a1c560de9a9502a4c3754172ab2d6e8734fe21bcba"
 dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
- "http",
+ "http 1.5.0",
 ]
 
 [[package]]
 name = "aws-smithy-types"
-version = "1.9.1"
+version = "1.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf183d70774ea2cfcc101ca74a8884e4c76be8b9df65cd303f6a1175c88e8f80"
+checksum = "aff4bf014c512840b2bba80a20417b723cbd6a0a65c02e2d81f50b4268aedfc7"
 dependencies = [
  "base64-simd",
  "bytes",
  "bytes-utils",
  "futures-core",
- "http",
+ "http 1.5.0",
  "http-body",
  "http-body-util",
  "itoa",
- "num-integer",
  "pin-project-lite",
  "ryu",
  "serde",
@@ -798,7 +895,7 @@ dependencies = [
  "bytes",
  "form_urlencoded",
  "futures-util",
- "http",
+ "http 1.5.0",
  "http-body",
  "http-body-util",
  "hyper",
@@ -828,7 +925,7 @@ checksum = "08c78f31d7b1291f7ee735c1c6780ccde7785daae9a9206026862dab7d8792d1"
 dependencies = [
  "bytes",
  "futures-core",
- "http",
+ "http 1.5.0",
  "http-body",
  "http-body-util",
  "mime",
@@ -971,6 +1068,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "bigdecimal"
+version = "0.4.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8fa3f3d8cbf4dffcfe4991de61d012bef509a409ecbe9dd41049bfe32b4d4653"
+dependencies = [
+ "autocfg",
+ "libm",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
 name = "bit-vec"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1027,6 +1137,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
+]
+
+[[package]]
+name = "bs58"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
+dependencies = [
+ "tinyvec",
 ]
 
 [[package]]
@@ -1097,6 +1216,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "cbor-diag"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc245b6ecd09b23901a4fbad1ad975701fd5061ceaef6afa93a2d70605a64429"
+dependencies = [
+ "bs58",
+ "chrono",
+ "data-encoding",
+ "half",
+ "nom",
+ "num-bigint",
+ "num-rational",
+ "num-traits",
+ "separator",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "cc"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1129,6 +1267,42 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "chrono"
+version = "0.4.45"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "ciborium"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42e69ffd6f0917f5c029256a24d0161db17cea3997d185db0d35926308770f0e"
+dependencies = [
+ "ciborium-io",
+ "ciborium-ll",
+ "serde",
+]
+
+[[package]]
+name = "ciborium-io"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05afea1e0a06c9be33d539b876f1ce3692f4afea2cb41f740e7743225ed1c757"
+
+[[package]]
+name = "ciborium-ll"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57663b653d948a338bfb3eeba9bb2fd5fcfaecb9e199e87e1eda4d9e8b240fd9"
+dependencies = [
+ "ciborium-io",
+ "half",
 ]
 
 [[package]]
@@ -1697,6 +1871,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "diff"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8"
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2117,7 +2297,7 @@ dependencies = [
 
 [[package]]
 name = "gang-authn"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "base64 0.23.1",
  "gang-clock",
@@ -2125,7 +2305,7 @@ dependencies = [
  "gang-testkit",
  "gang-types",
  "hex",
- "http",
+ "http 1.5.0",
  "p256 0.14.0",
  "parking_lot",
  "serde",
@@ -2137,14 +2317,17 @@ dependencies = [
 
 [[package]]
 name = "gang-aws"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-autoscaling",
+ "aws-sdk-cloudwatch",
  "aws-sdk-ec2",
  "aws-sdk-kms",
  "aws-sdk-sts",
+ "aws-smithy-cbor",
+ "aws-smithy-http-client",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "axum",
@@ -2156,6 +2339,7 @@ dependencies = [
  "gang-testkit",
  "gang-types",
  "nativelink-config",
+ "num-traits",
  "p256 0.14.0",
  "parking_lot",
  "rustix",
@@ -2170,7 +2354,7 @@ dependencies = [
 
 [[package]]
 name = "gang-aws-sdk"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aws-config",
  "aws-runtime",
@@ -2186,7 +2370,7 @@ dependencies = [
 
 [[package]]
 name = "gang-bindings"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "gang-types",
  "gang-ui",
@@ -2199,7 +2383,7 @@ dependencies = [
 
 [[package]]
 name = "gang-bwrap"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "gang-os",
  "gang-spi",
@@ -2215,7 +2399,7 @@ dependencies = [
 
 [[package]]
 name = "gang-cgroup"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "gang-clock",
  "gang-spi",
@@ -2232,7 +2416,7 @@ dependencies = [
 
 [[package]]
 name = "gang-client"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2245,7 +2429,7 @@ dependencies = [
  "gang-tls",
  "gang-types",
  "gang-wire",
- "http",
+ "http 1.5.0",
  "httpdate",
  "hyper-util",
  "parking_lot",
@@ -2262,7 +2446,7 @@ dependencies = [
 
 [[package]]
 name = "gang-clock"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "gang-types",
  "parking_lot",
@@ -2276,7 +2460,7 @@ dependencies = [
 
 [[package]]
 name = "gang-config"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "gang-clock",
  "gang-macros",
@@ -2291,7 +2475,7 @@ dependencies = [
 
 [[package]]
 name = "gang-deploy"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "base64 0.23.1",
  "hex",
@@ -2304,7 +2488,7 @@ dependencies = [
 
 [[package]]
 name = "gang-dynamodb"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aws-credential-types",
  "aws-sdk-dynamodb",
@@ -2322,7 +2506,7 @@ dependencies = [
 
 [[package]]
 name = "gang-e2e"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2349,7 +2533,7 @@ dependencies = [
  "getrandom 0.4.3",
  "h2",
  "hex",
- "http",
+ "http 1.5.0",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -2375,7 +2559,7 @@ dependencies = [
 
 [[package]]
 name = "gang-embed"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "hex",
  "sha2 0.11.1",
@@ -2385,7 +2569,7 @@ dependencies = [
 
 [[package]]
 name = "gang-exec"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "futures",
  "gang-config",
@@ -2406,7 +2590,7 @@ dependencies = [
 
 [[package]]
 name = "gang-insight"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "gang-clock",
  "gang-config",
@@ -2420,7 +2604,7 @@ dependencies = [
 
 [[package]]
 name = "gang-local"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2447,7 +2631,7 @@ dependencies = [
 
 [[package]]
 name = "gang-macros"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2456,7 +2640,7 @@ dependencies = [
 
 [[package]]
 name = "gang-main"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anstream",
  "anstyle",
@@ -2509,7 +2693,7 @@ dependencies = [
 
 [[package]]
 name = "gang-mtls"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "const-oid 0.10.2",
  "der 0.8.3",
@@ -2533,8 +2717,9 @@ dependencies = [
 
 [[package]]
 name = "gang-nativelink"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
+ "allocation-counter",
  "async-trait",
  "axum",
  "base64 0.23.1",
@@ -2547,10 +2732,11 @@ dependencies = [
  "gang-tls",
  "gang-types",
  "h2",
- "http",
+ "http 1.5.0",
  "http-body-util",
  "hyper",
  "hyper-util",
+ "lru",
  "nativelink-config",
  "nativelink-error",
  "nativelink-metric",
@@ -2576,7 +2762,7 @@ dependencies = [
 
 [[package]]
 name = "gang-noop"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "gang-os",
  "gang-spi",
@@ -2592,7 +2778,7 @@ dependencies = [
 
 [[package]]
 name = "gang-oidc"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2602,7 +2788,7 @@ dependencies = [
  "gang-tls",
  "gang-types",
  "getrandom 0.4.3",
- "http",
+ "http 1.5.0",
  "jsonwebtoken",
  "parking_lot",
  "serde",
@@ -2615,7 +2801,7 @@ dependencies = [
 
 [[package]]
 name = "gang-os"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "gang-testkit",
  "gang-types",
@@ -2628,7 +2814,7 @@ dependencies = [
 
 [[package]]
 name = "gang-postgres"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "deadpool-postgres",
  "gang-clock",
@@ -2649,7 +2835,7 @@ dependencies = [
 
 [[package]]
 name = "gang-reconciler"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "allocation-counter",
  "gang-clock",
@@ -2662,7 +2848,7 @@ dependencies = [
 
 [[package]]
 name = "gang-server"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "allocation-counter",
  "base64 0.23.1",
@@ -2682,7 +2868,7 @@ dependencies = [
  "gang-types",
  "gang-ui",
  "gang-wire",
- "http",
+ "http 1.5.0",
  "http-body",
  "http-body-util",
  "hyper",
@@ -2704,7 +2890,7 @@ dependencies = [
 
 [[package]]
 name = "gang-spi"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bytes",
  "futures",
@@ -2715,7 +2901,7 @@ dependencies = [
  "gang-testkit",
  "gang-types",
  "getrandom 0.4.3",
- "http",
+ "http 1.5.0",
  "http-body-util",
  "parking_lot",
  "serde",
@@ -2729,7 +2915,7 @@ dependencies = [
 
 [[package]]
 name = "gang-sqlite"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "gang-clock",
  "gang-os",
@@ -2746,7 +2932,7 @@ dependencies = [
 
 [[package]]
 name = "gang-state"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "allocation-counter",
  "bytes",
@@ -2766,7 +2952,7 @@ dependencies = [
 
 [[package]]
 name = "gang-testkit"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2780,7 +2966,7 @@ dependencies = [
  "gang-types",
  "getrandom 0.4.3",
  "hex",
- "http",
+ "http 1.5.0",
  "p256 0.14.0",
  "parking_lot",
  "rcgen",
@@ -2801,7 +2987,7 @@ dependencies = [
 
 [[package]]
 name = "gang-tls"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bytes",
  "futures-core",
@@ -2809,7 +2995,7 @@ dependencies = [
  "gang-testkit",
  "gang-types",
  "hex",
- "http",
+ "http 1.5.0",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -2829,7 +3015,7 @@ dependencies = [
 
 [[package]]
 name = "gang-types"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "allocation-counter",
  "base64 0.23.1",
@@ -2847,15 +3033,15 @@ dependencies = [
 
 [[package]]
 name = "gang-ui"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bytes",
- "http",
+ "http 1.5.0",
 ]
 
 [[package]]
 name = "gang-wire"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "base64 0.23.1",
  "gang-clock",
@@ -2870,7 +3056,7 @@ dependencies = [
 
 [[package]]
 name = "gang-worker"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "gang-clock",
  "gang-config",
@@ -3011,7 +3197,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "hickory-resolver",
- "http",
+ "http 1.5.0",
  "thiserror",
  "tokio",
  "tonic",
@@ -3052,12 +3238,23 @@ dependencies = [
  "fnv",
  "futures-core",
  "futures-sink",
- "http",
+ "http 1.5.0",
  "indexmap",
  "slab",
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "half"
+version = "2.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
+dependencies = [
+ "cfg-if",
+ "crunchy",
+ "zerocopy",
 ]
 
 [[package]]
@@ -3207,6 +3404,17 @@ dependencies = [
 
 [[package]]
 name = "http"
+version = "0.2.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "601cbb57e577e2f5ef5be8e7b83f0f63994f25aa94d673e54a92d5c516d101f1"
+dependencies = [
+ "bytes",
+ "fnv",
+ "itoa",
+]
+
+[[package]]
+name = "http"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "918d3568bebf352712bc2ef3d46a8bcf1a75b373be6539de198e9105cbbf9ce0"
@@ -3222,7 +3430,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ca2a8f2913ee65f60facd6a5905613afaa448497a0230cc41ce022d93290bc2c"
 dependencies = [
  "bytes",
- "http",
+ "http 1.5.0",
 ]
 
 [[package]]
@@ -3233,7 +3441,7 @@ checksum = "23169fe34a5fbcdd3f3862e78fb9b6fccd5f02a6dc6f732547005d45631ce71c"
 dependencies = [
  "bytes",
  "futures-core",
- "http",
+ "http 1.5.0",
  "http-body",
  "pin-project-lite",
  "tokio",
@@ -3279,7 +3487,7 @@ dependencies = [
  "futures-channel",
  "futures-core",
  "h2",
- "http",
+ "http 1.5.0",
  "http-body",
  "httparse",
  "httpdate",
@@ -3296,7 +3504,7 @@ version = "0.27.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa8e654703247911e29c23fbeaa261834bd9bb74efba2f9acddc37bfb127f53"
 dependencies = [
- "http",
+ "http 1.5.0",
  "hyper",
  "hyper-util",
  "rustls",
@@ -3330,7 +3538,7 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-util",
- "http",
+ "http 1.5.0",
  "http-body",
  "httparse",
  "hyper",
@@ -3462,6 +3670,8 @@ checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -3865,6 +4075,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "minicbor"
+version = "2.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7244eafd1e09e7c4e33043881997aa6ab6dffff3ed2cee3395a278980481d6e"
+dependencies = [
+ "half",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3995,7 +4214,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 [[package]]
 name = "nativelink-config"
 version = "1.8.3"
-source = "git+https://github.com/TraceMachina/nativelink?tag=v1.8.3#bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+source = "git+https://github.com/leadingterm/nativelink?rev=5f55ecf945a2539118b5e7e145d79cfbb8eb6862#5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
 dependencies = [
  "byte-unit",
  "humantime",
@@ -4011,7 +4230,7 @@ dependencies = [
 [[package]]
 name = "nativelink-error"
 version = "1.8.3"
-source = "git+https://github.com/TraceMachina/nativelink?tag=v1.8.3#bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+source = "git+https://github.com/leadingterm/nativelink?rev=5f55ecf945a2539118b5e7e145d79cfbb8eb6862#5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
 dependencies = [
  "base64 0.22.1",
  "mongodb",
@@ -4035,7 +4254,7 @@ dependencies = [
 [[package]]
 name = "nativelink-metric"
 version = "1.8.3"
-source = "git+https://github.com/TraceMachina/nativelink?tag=v1.8.3#bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+source = "git+https://github.com/leadingterm/nativelink?rev=5f55ecf945a2539118b5e7e145d79cfbb8eb6862#5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
 dependencies = [
  "async-lock",
  "nativelink-metric-macro-derive",
@@ -4047,7 +4266,7 @@ dependencies = [
 [[package]]
 name = "nativelink-metric-macro-derive"
 version = "1.8.3"
-source = "git+https://github.com/TraceMachina/nativelink?tag=v1.8.3#bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+source = "git+https://github.com/leadingterm/nativelink?rev=5f55ecf945a2539118b5e7e145d79cfbb8eb6862#5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4057,7 +4276,7 @@ dependencies = [
 [[package]]
 name = "nativelink-proto"
 version = "1.8.3"
-source = "git+https://github.com/TraceMachina/nativelink?tag=v1.8.3#bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+source = "git+https://github.com/leadingterm/nativelink?rev=5f55ecf945a2539118b5e7e145d79cfbb8eb6862#5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
 dependencies = [
  "derive_more",
  "prost",
@@ -4069,7 +4288,7 @@ dependencies = [
 [[package]]
 name = "nativelink-redis-tester"
 version = "1.8.3"
-source = "git+https://github.com/TraceMachina/nativelink?tag=v1.8.3#bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+source = "git+https://github.com/leadingterm/nativelink?rev=5f55ecf945a2539118b5e7e145d79cfbb8eb6862#5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
 dependencies = [
  "either",
  "nativelink-util",
@@ -4083,7 +4302,7 @@ dependencies = [
 [[package]]
 name = "nativelink-scheduler"
 version = "1.8.3"
-source = "git+https://github.com/TraceMachina/nativelink?tag=v1.8.3#bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+source = "git+https://github.com/leadingterm/nativelink?rev=5f55ecf945a2539118b5e7e145d79cfbb8eb6862#5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
 dependencies = [
  "async-lock",
  "async-trait",
@@ -4117,7 +4336,7 @@ dependencies = [
 [[package]]
 name = "nativelink-service"
 version = "1.8.3"
-source = "git+https://github.com/TraceMachina/nativelink?tag=v1.8.3#bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+source = "git+https://github.com/leadingterm/nativelink?rev=5f55ecf945a2539118b5e7e145d79cfbb8eb6862#5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
 dependencies = [
  "axum",
  "bytes",
@@ -4152,7 +4371,7 @@ dependencies = [
 [[package]]
 name = "nativelink-store"
 version = "1.8.3"
-source = "git+https://github.com/TraceMachina/nativelink?tag=v1.8.3#bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+source = "git+https://github.com/leadingterm/nativelink?rev=5f55ecf945a2539118b5e7e145d79cfbb8eb6862#5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
 dependencies = [
  "async-lock",
  "async-trait",
@@ -4173,7 +4392,7 @@ dependencies = [
  "gcloud-auth",
  "gcloud-storage",
  "hex",
- "http",
+ "http 1.5.0",
  "http-body",
  "http-body-util",
  "humantime",
@@ -4218,7 +4437,7 @@ dependencies = [
 [[package]]
 name = "nativelink-util"
 version = "1.8.3"
-source = "git+https://github.com/TraceMachina/nativelink?tag=v1.8.3#bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+source = "git+https://github.com/leadingterm/nativelink?rev=5f55ecf945a2539118b5e7e145d79cfbb8eb6862#5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4273,7 +4492,7 @@ dependencies = [
 [[package]]
 name = "nativelink-worker"
 version = "1.8.3"
-source = "git+https://github.com/TraceMachina/nativelink?tag=v1.8.3#bd336137d794a6a4e7ac32e561ab55e2d7e70ff3"
+source = "git+https://github.com/leadingterm/nativelink?rev=5f55ecf945a2539118b5e7e145d79cfbb8eb6862#5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
 dependencies = [
  "async-lock",
  "bytes",
@@ -4402,6 +4621,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "num-rational"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
+dependencies = [
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4513,7 +4743,7 @@ checksum = "5683015d09e2df236ef005b17f6f196f0d5f6313c4fa43a7b6a53b52776e4331"
 dependencies = [
  "async-trait",
  "bytes",
- "http",
+ "http 1.5.0",
  "opentelemetry",
 ]
 
@@ -4523,7 +4753,7 @@ version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9966929966d17620d7c316c643ba62631826e10021409357772d5eea84f62c35"
 dependencies = [
- "http",
+ "http 1.5.0",
  "opentelemetry",
  "opentelemetry-proto",
  "opentelemetry_sdk",
@@ -4571,7 +4801,7 @@ dependencies = [
 
 [[package]]
 name = "opentofu-runner"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "tempfile",
  "thiserror",
@@ -4933,6 +5163,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pretty_assertions"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ae130e2f271fbc2ac3a40fb1d07180839cdbbe443c7a27e1e3c13c5cac0116d"
+dependencies = [
+ "diff",
+ "yansi",
+]
+
+[[package]]
 name = "primefield"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5269,7 +5509,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "h2",
- "http",
+ "http 1.5.0",
  "http-body",
  "http-body-util",
  "hyper",
@@ -5309,7 +5549,7 @@ checksum = "07bc3f1384cffa4f274dad2d4ddd73aed32fed8f786d96c6be8aa4e5fd3c3b58"
 dependencies = [
  "anyhow",
  "async-trait",
- "http",
+ "http 1.5.0",
  "reqwest",
  "serde",
  "thiserror",
@@ -5363,6 +5603,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7043b63bd0cd1aaa628e476b80e6d4023a3b50eb32789f2728908107bd0c793a"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "roxmltree"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "921904a62e410e37e215c40381b7117f830d9d89ba60ab5236170541dd25646b"
+dependencies = [
+ "xmlparser",
 ]
 
 [[package]]
@@ -5627,6 +5876,12 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+
+[[package]]
+name = "separator"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f97841a747eef040fcd2e7b3b9a220a7205926e60488e673d9e4926d27772ce5"
 
 [[package]]
 name = "serde"
@@ -6453,7 +6708,7 @@ dependencies = [
  "bytes",
  "flate2",
  "h2",
- "http",
+ "http 1.5.0",
  "http-body",
  "http-body-util",
  "hyper",
@@ -6524,7 +6779,7 @@ dependencies = [
  "bitflags",
  "bytes",
  "futures-util",
- "http",
+ "http 1.5.0",
  "http-body",
  "pin-project-lite",
  "tower",
@@ -6692,7 +6947,7 @@ checksum = "e48ac77174b19c110a50ab2128b24215ac9cb40e0e12e093fb602d175c569d22"
 dependencies = [
  "bytes",
  "data-encoding",
- "http",
+ "http 1.5.0",
  "httparse",
  "log",
  "rand 0.10.3",
@@ -7392,7 +7647,7 @@ dependencies = [
 
 [[package]]
 name = "workspace-architecture"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "serde",
  "syn 2.0.119",
@@ -7471,6 +7726,12 @@ name = "xxhash-rust"
 version = "0.8.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
+
+[[package]]
+name = "yansi"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 
 [[package]]
 name = "yasna"

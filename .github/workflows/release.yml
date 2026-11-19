@@ -30,6 +30,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       actions: read
+      contents: read
     outputs:
       run-id: ${{ steps.ci.outputs.run-id }}
       dry-run-id: ${{ steps.dry-run.outputs.run-id }}
@@ -65,12 +66,41 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
-          EVENT: ${{ github.event_name }}
         run: |
-          run_id="$(gh api --paginate "repos/$GH_REPO/actions/workflows/ci.yml/runs?head_sha=$SHA" \
-            | jq -rs --arg event "$EVENT" '[.[].workflow_runs[] | select(.conclusion == "success" and ((.event == "push" and .head_branch == "main") or ($event == "workflow_dispatch" and .event == "pull_request")))] | .[0].id // empty')"
+          runs="$(gh api --paginate "repos/$GH_REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=100" \
+            | jq -rs --arg sha "$SHA" 'if length == 0 or any(.[]; (.workflow_runs | type) != "array") then error("invalid runs") else [.[].workflow_runs[] | select(.head_sha == $sha and (.event == "push" or .event == "workflow_dispatch") and .head_branch == "main")] | sort_by(.created_at) | reverse | .[].id end')"
+          commit="$(gh api "repos/$GH_REPO/commits/$SHA")"
+          tree="$(jq -er '.commit.tree.sha | strings | select(length > 0)' <<< "$commit")"
+          parent="$(jq -r 'if (.parents | type) != "array" then error("invalid parents") elif (.parents | length) == 1 then .parents[0].sha | if type == "string" and length > 0 then . else error("invalid parent") end else "" end' <<< "$commit")"
+          if [[ -n "$parent" ]]; then
+            heads="$(gh api --paginate "repos/$GH_REPO/commits/$SHA/pulls?per_page=100" \
+              | jq -rs --arg parent "$parent" 'if length == 0 or any(.[]; type != "array") then error("invalid pulls") else [.[][] | select(.base.sha == $parent) | .head.sha | strings | select(length > 0)] | unique | .[] end')"
+            for head in $heads; do
+              head_tree="$(gh api "repos/$GH_REPO/commits/$head" | jq -er '.commit.tree.sha | strings | select(length > 0)')"
+              if [[ "$head_tree" != "$tree" ]]; then
+                continue
+              fi
+              pr_runs="$(gh api --paginate "repos/$GH_REPO/actions/workflows/ci.yml/runs?head_sha=$head&event=pull_request&per_page=100" \
+                | jq -rs --arg head "$head" 'if length == 0 or any(.[]; (.workflow_runs | type) != "array") then error("invalid runs") else [.[].workflow_runs[] | select(.head_sha == $head and .event == "pull_request")] | sort_by(.created_at) | reverse | .[].id end')"
+              runs="$runs"$'\n'"$pr_runs"
+            done
+          fi
+          run_id=""
+          for candidate in $runs; do
+            required="$(gh api --paginate "repos/$GH_REPO/actions/runs/$candidate/jobs?filter=latest&per_page=100" \
+              | jq -s 'if length == 0 or any(.[]; (.jobs | type) != "array") then error("invalid jobs") else [.[].jobs[] | select(.name == "required")] end')"
+            if ! jq -e 'length == 1 and .[0].conclusion == "success"' <<< "$required" >/dev/null; then
+              continue
+            fi
+            artifacts="$(gh api --paginate "repos/$GH_REPO/actions/runs/$candidate/artifacts?per_page=100" \
+              | jq -s 'if length == 0 or any(.[]; (.artifacts | type) != "array") then error("invalid artifacts") else [.[].artifacts[] | select(.expired == false) | .name] end')"
+            if jq -e '["gang-x86_64-unknown-linux-musl", "gang-aarch64-unknown-linux-musl"] - . == []' <<< "$artifacts" >/dev/null; then
+              run_id="$candidate"
+              break
+            fi
+          done
           if [[ -z "$run_id" ]]; then
-            echo "::error::no eligible successful CI run of $SHA" >&2
+            echo "::error::no eligible CI run has a successful latest required job and both required unexpired Linux artifacts: PR CI requires the exact release tree and PR base equal to its sole parent; dispatch ci.yml on main for full validation, then dispatch release.yml as a dry run" >&2
             exit 1
           fi
           echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
@@ -97,6 +127,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-nix
+        with:
+          kvm: ${{ matrix.arch == 'x86_64' }}
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: gang-${{ matrix.arch }}-unknown-linux-musl
@@ -202,14 +234,26 @@ jobs:
           echo "IMAGE_SHA256_aarch64=$(sha256sum images/gang-image-aarch64.raw.zst | cut -d' ' -f1)" >> "$GITHUB_ENV"
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
         with:
-          role-to-assume: ${{ vars.IMAGE_PUBLISH_ROLE }}
-          aws-region: ${{ vars.IMAGE_HOME_REGION }}
+          role-to-assume: arn:aws:iam::072320588884:role/LTPublicArtifactsGangPublisher
+          aws-region: eu-west-2
+      - name: Read public AMI configuration
+        shell: nix develop .#release -c bash --noprofile --norc -euo pipefail {0}
+        run: |
+          config="$(aws ssm get-parameter --region eu-west-2 --name /leadingterm/public-artifacts/gang --query Parameter.Value --output text)"
+          resolved="$(printf '%s' "$config" | jq -er -s '
+            if length == 1 and (.[0] | type == "object") then .[0]
+            else error("invalid public AMI configuration") end
+            | if (.home_region | type == "string" and test("^[a-z0-9-]+\\z"))
+              and (.image_regions | type == "array" and length > 0
+                and all(.[]; type == "string" and test("^[a-z0-9-]+\\z")))
+              then "IMAGE_HOME_REGION=\(.home_region)\nIMAGE_REGIONS=\(.image_regions | join(" "))"
+              else error("invalid public AMI configuration") end
+          ')"
+          printf '%s\n' "$resolved" >> "$GITHUB_ENV"
       - name: Converge public AMIs
         shell: nix develop .#release -c bash --noprofile --norc -euo pipefail {0}
         env:
           GANG: ${{ github.workspace }}/staged/gang-aarch64-unknown-linux-musl
-          IMAGE_HOME_REGION: ${{ vars.IMAGE_HOME_REGION }}
-          IMAGE_REGIONS: ${{ vars.IMAGE_REGIONS }}
           RELEASE: ${{ github.event_name == 'push' && github.ref_name || '' }}
           IMAGES_DIR: ${{ github.event_name == 'push' && 'images' || '' }}
         run: infra/scripts/publish-amis.sh
@@ -231,9 +275,29 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - name: Select available CI binaries
+        id: binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ needs.locate.outputs.run-id }}
+        run: |
+          ids="$(gh api --paginate "repos/$GH_REPO/actions/runs/$RUN_ID/artifacts?per_page=100" \
+            | jq -rs '
+              if length == 0 or any(.[]; (.artifacts | type) != "array") then error("invalid artifacts") else
+                [.[].artifacts[] | select(.expired == false and
+                  (.name == "gang-x86_64-unknown-linux-musl" or .name == "gang-aarch64-unknown-linux-musl" or .name == "gang-aarch64-apple-darwin"))] as $binaries
+                | if ([$binaries[] | select(.name == "gang-x86_64-unknown-linux-musl")] | length) != 1
+                  or ([$binaries[] | select(.name == "gang-aarch64-unknown-linux-musl")] | length) != 1
+                  or ([$binaries[] | select(.name == "gang-aarch64-apple-darwin")] | length) > 1
+                  or any($binaries[]; (.id | type) != "number" or .id <= 0 or .id != (.id | floor))
+                  then error("missing or invalid CI binary artifacts")
+                  else [$binaries[].id | tostring] | join(",") end
+              end')"
+          echo "artifact-ids=$ids" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: gang-*
+          artifact-ids: ${{ steps.binaries.outputs.artifact-ids }}
           path: dist
           merge-multiple: true
           run-id: ${{ needs.locate.outputs.run-id }}
@@ -260,9 +324,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ needs.locate.outputs.run-id }}
         run: |
-          notes="Binaries built and tested by CI run $RUN_URL. Public AMIs of each architecture in every image region: gang-amis.json."
+          message="$(gh api "repos/$GH_REPO/commits/$RELEASE_COMMIT" --jq .commit.message)"
+          printf -v notes '%s\n\n%s' "$message" \
+            "Binaries built and tested by CI run $RUN_URL. Public AMIs of each architecture in every image region: gang-amis.json."
+          if [[ ! -f gang-aarch64-apple-darwin ]]; then
+            notes+=$'\n\n'"The macOS binary is not included in this release."
+          fi
           prerelease=()
           if [[ "$TAG" == *-* ]]; then
             prerelease=(--prerelease)

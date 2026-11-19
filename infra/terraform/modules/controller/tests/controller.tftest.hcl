@@ -62,6 +62,49 @@ variables {
   }
 }
 
+run "s3_cache_metrics_grant_prevents_access_denied" {
+  command = plan
+
+  assert {
+    condition = length([
+      for statement in data.aws_iam_policy_document.this.statement : statement
+      if statement.sid == "CacheStorageMetrics" && statement.effect == "Allow"
+      && toset(statement.actions) == toset(["cloudwatch:GetMetricData"])
+      && toset(statement.resources) == toset(["*"])
+    ]) == 1
+    error_message = "S3 cache metrics require exactly cloudwatch:GetMetricData on * or the controller receives AccessDenied."
+  }
+
+  assert {
+    condition = alltrue(flatten([
+      for statement in data.aws_iam_policy_document.this.statement : [
+        for action in statement.actions : action == "cloudwatch:GetMetricData"
+        if startswith(lower(action), "cloudwatch:")
+      ]
+    ]))
+    error_message = "The controller must not receive additional CloudWatch actions."
+  }
+}
+
+run "filesystem_cache_has_no_s3_or_cloudwatch_overgrant" {
+  command = plan
+
+  variables {
+    cache_bucket_arn = null
+  }
+
+  assert {
+    condition = !anytrue(flatten([
+      for statement in data.aws_iam_policy_document.this.statement : [
+        for action in statement.actions :
+        lower(action) == "*" || startswith(lower(action), "s3:") || startswith(lower(action), "cloudwatch:")
+        if statement.effect == "Allow"
+      ]
+    ]))
+    error_message = "A filesystem cache must not grant S3 or CloudWatch permissions."
+  }
+}
+
 run "instance_requires_imdsv2_with_hop_limit_one" {
   command = plan
 

@@ -219,9 +219,9 @@ variable "secret_parameters_kms_key_arn" {
 }
 
 variable "cache_bucket_arn" {
-  description = "ARN of the S3 cache bucket the controller reads and writes objects in."
+  description = "ARN of the S3 cache bucket the controller reads and writes; null means a filesystem cache with no S3 access."
   type        = string
-  nullable    = false
+  nullable    = true
 }
 
 variable "ca_key_arn" {

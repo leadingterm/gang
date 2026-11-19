@@ -2,12 +2,22 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
+use std::time::Duration;
+
+use futures::StreamExt;
 
 use gang_clock::Timestamp;
-use gang_spi::{QueuedDemand, SchedulerSnapshot, WorkerState};
+use gang_spi::{ExecutingDemand, QueuedDemand, SchedulerSnapshot, WorkerState};
 use gang_types::{ActionResources, Bytes, FleetCatalog, FleetName, WorkerId, property};
-use nativelink_scheduler::admin::QueuedDemand as NativeQueuedDemand;
+use nativelink_error::Error;
 use nativelink_scheduler::worker_scheduler::WorkerSummary;
+use nativelink_util::action_messages::ActionInfo as NativeActionInfo;
+use nativelink_util::operation_state_manager::{ClientStateManager, OperationStageFlags};
+use nativelink_util::origin_event::OriginMetadata;
+use parking_lot::Mutex;
+
+use crate::actions;
+use crate::durations::ActionDurations;
 
 /// Milliseconds in one second, the unit of `last_update_timestamp`.
 const MILLIS_PER_SECOND: u64 = 1000;
@@ -53,12 +63,17 @@ fn worker_state(summary: &WorkerSummary) -> Option<WorkerState> {
 /// The action's candidates are the fleets that accept its platform properties. An action no
 /// fleet accepts is kept with empty candidates and counts for nothing in the attribution.
 /// Each missing or malformed property contributes zero to its resource dimension.
-fn queued_demand(demand: &NativeQueuedDemand, fleets: &FleetCatalog) -> QueuedDemand {
+fn queued_demand(
+    info: &NativeActionInfo,
+    fleets: &FleetCatalog,
+    expected: Option<Duration>,
+) -> QueuedDemand {
     QueuedDemand {
-        candidates: fleets.accepting(|key| demand.platform_properties.get(key).map(String::as_str)),
-        resources: resources(&demand.platform_properties),
-        queued_since: Timestamp::from_unix_millis(demand.queued_since_ms),
-        priority: demand.priority,
+        candidates: fleets.accepting(|key| info.platform_properties.get(key).map(String::as_str)),
+        resources: resources(&info.platform_properties),
+        queued_since: Timestamp::from(info.insert_timestamp),
+        priority: info.priority,
+        expected,
     }
 }
 
@@ -86,27 +101,82 @@ fn resources(properties: &HashMap<String, String>) -> ActionResources {
     }
 }
 
-/// Overwrites `into` with managed workers sorted by id, every queued demand in input order,
-/// and the completed count. Existing buffers are cleared and reused, so their capacity is kept.
-pub(crate) fn fill(
+fn expected(
+    origin: Option<&OriginMetadata>,
+    durations: &Mutex<ActionDurations>,
+    now: Timestamp,
+) -> Option<Duration> {
+    let metadata = origin?.bazel_metadata.as_ref()?;
+    durations
+        .lock()
+        .expected(&metadata.target_id, &metadata.action_mnemonic, now)
+}
+
+/// Overwrites the snapshot while retaining the capacity of its buffers.
+pub(crate) async fn fill(
+    scheduler: &dyn ClientStateManager,
     workers: &[WorkerSummary],
-    demand: &[NativeQueuedDemand],
     fleets: &FleetCatalog,
+    durations: &Mutex<ActionDurations>,
+    now: Timestamp,
     completed: u64,
     into: &mut SchedulerSnapshot,
-) {
+) -> Result<(), Error> {
     into.completed = completed;
     into.workers.clear();
     into.workers.extend(workers.iter().filter_map(worker_state));
     into.workers.sort_unstable_by(|a, b| a.id.cmp(&b.id));
     into.queued.clear();
-    into.queued
-        .extend(demand.iter().map(|entry| queued_demand(entry, fleets)));
+    into.executing.clear();
+
+    let mut listing = scheduler
+        .filter_operations(actions::queued_filter())
+        .await?;
+    while let Some(result) = listing.next().await {
+        let Some(operation) =
+            actions::read_operation(&*result, OperationStageFlags::Queued).await?
+        else {
+            continue;
+        };
+        let duration = expected(operation.origin.as_ref(), durations, now);
+        into.queued
+            .push(queued_demand(&operation.info, fleets, duration));
+    }
+
+    for (worker, state) in into
+        .workers
+        .iter()
+        .enumerate()
+        .filter(|(_, state)| state.running_actions > 0)
+    {
+        let mut listing = scheduler
+            .filter_operations(actions::executing_filter(state.id.as_str()))
+            .await?;
+        while let Some(result) = listing.next().await {
+            let Some(operation) =
+                actions::read_operation(&*result, OperationStageFlags::Executing).await?
+            else {
+                continue;
+            };
+            into.executing.push(ExecutingDemand {
+                worker,
+                started: Timestamp::from(operation.state.last_transition_timestamp),
+                expected: expected(operation.origin.as_ref(), durations, now),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use std::num::{NonZeroU32, NonZeroUsize};
+    use std::sync::Arc;
+
+    use crate::actions::tests::{Fake, bazel, info, row};
     use gang_types::{FleetProperties, FleetSet, Isa, Resources};
+    use nativelink_util::action_messages::ActionStage;
+    use nativelink_util::operation_state_manager::OrderDirection;
 
     use super::*;
 
@@ -135,14 +205,19 @@ mod tests {
         }
     }
 
-    fn demand(priority: i32, pairs: &[(&str, &str)]) -> NativeQueuedDemand {
-        NativeQueuedDemand {
-            operation_id: format!("op-{priority}"),
-            queued_since_ms: 5000,
-            priority,
-            platform_properties: props(pairs),
-            client_last_seen_ms: None,
-        }
+    fn demand(priority: i32, pairs: &[(&str, &str)]) -> Arc<NativeActionInfo> {
+        info(priority, 5000, pairs)
+    }
+
+    fn queued_demand(info: &NativeActionInfo, fleets: &FleetCatalog) -> QueuedDemand {
+        super::queued_demand(info, fleets, None)
+    }
+
+    pub(crate) fn history() -> Mutex<ActionDurations> {
+        Mutex::new(ActionDurations::new(
+            NonZeroUsize::new(32).expect("nonzero"),
+            NonZeroU32::new(7).expect("nonzero"),
+        ))
     }
 
     /// Two fleets: `fleet-a` on x86-64 and `fleet-b` on aarch64.
@@ -167,7 +242,7 @@ mod tests {
         .expect("valid catalog")
     }
 
-    fn candidates(entry: &NativeQueuedDemand) -> Vec<usize> {
+    fn candidates(entry: &NativeActionInfo) -> Vec<usize> {
         queued_demand(entry, &catalog()).candidates.iter().collect()
     }
 
@@ -317,6 +392,7 @@ mod tests {
                 },
                 queued_since: Timestamp::from_unix_millis(5000),
                 priority: 3,
+                expected: None,
             }
         );
     }
@@ -472,69 +548,267 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fill_clears_previous_content_preserves_order_and_reuses_capacity() {
-        let first_workers = [
+    fn populated_listing() -> ([WorkerSummary; 3], Fake) {
+        let workers = [
             WorkerSummary {
                 running_actions: 1,
                 ..summary(OTHER_WORKER)
             },
             WorkerSummary {
-                running_actions: 2,
+                running_actions: 1,
                 ..summary(LEGACY_WORKER)
             },
             WorkerSummary {
-                running_actions: 3,
+                running_actions: 1,
                 ..summary(WORKER)
             },
         ];
-        let first_demand = [
-            demand(1, &[(property::ISA, "aarch64")]),
-            demand(2, &[]),
-            demand(3, &[(property::FLEET, "missing")]),
-            demand(4, &[(property::ISA, "x86-64")]),
-        ];
-        let fleets = catalog();
-        let mut into = SchedulerSnapshot::default();
-        fill(&first_workers, &first_demand, &fleets, 5, &mut into);
-        assert_eq!(into.completed, 5);
-
-        let running: Vec<u32> = into.workers.iter().map(|w| w.running_actions).collect();
-        assert_eq!(
-            running,
-            vec![3, 1],
-            "unmanaged worker is left out and workers are sorted"
-        );
-        let priorities: Vec<i32> = into.queued.iter().map(|a| a.priority).collect();
-        assert_eq!(priorities, vec![1, 2, 3, 4], "every action is kept");
-        assert!(into.queued[2].candidates.is_empty(), "no fleet accepts it");
-        let worker_capacity = into.workers.capacity();
-        let queued_capacity = into.queued.capacity();
-
-        let second_workers = [WorkerSummary {
-            running_actions: 9,
-            ..summary(OTHER_WORKER)
-        }];
-        fill(&second_workers, &[], &fleets, 6, &mut into);
-        assert_eq!(into.completed, 6);
-
-        assert_eq!(into.workers.len(), 1);
-        assert_eq!(into.workers[0].running_actions, 9);
-        assert_eq!(into.queued.len(), 0);
-        assert!(into.workers.capacity() >= worker_capacity);
-        assert!(into.queued.capacity() >= queued_capacity);
+        let fake = Fake {
+            queued: vec![
+                row(
+                    "q1",
+                    ActionStage::Queued,
+                    0,
+                    info(9, 1_000, &[(property::ISA, "aarch64")]),
+                    Some(bazel("//app:bin", "Compile")),
+                ),
+                row("q2", ActionStage::Queued, 0, info(9, 2_000, &[]), None),
+                row(
+                    "q3",
+                    ActionStage::Queued,
+                    0,
+                    info(1, 3_000, &[(property::FLEET, "missing")]),
+                    None,
+                ),
+            ],
+            by_worker: HashMap::from([
+                (
+                    OTHER_WORKER.to_owned(),
+                    vec![row(
+                        "r2",
+                        ActionStage::Executing,
+                        4_000,
+                        info(0, 0, &[]),
+                        None,
+                    )],
+                ),
+                (
+                    WORKER.to_owned(),
+                    vec![row(
+                        "r1",
+                        ActionStage::Executing,
+                        5_000,
+                        info(0, 0, &[]),
+                        Some(bazel("//app:bin", "Compile")),
+                    )],
+                ),
+            ]),
+            ..Default::default()
+        };
+        (workers, fake)
     }
 
-    #[test]
-    fn fill_sorts_workers_by_id() {
-        let workers = [summary(OTHER_WORKER), summary(WORKER)];
+    #[tokio::test]
+    async fn fill_maps_metadata_and_sorted_workers() {
+        let now = Timestamp::from_unix_millis(10_000);
+        let history = history();
+        history.lock().record("//app:bin", "Compile", 2_000, now);
+        let (workers, fake) = populated_listing();
         let mut into = SchedulerSnapshot::default();
-        fill(&workers, &[], &catalog(), 0, &mut into);
-        let ids: Vec<&str> = into
-            .workers
-            .iter()
-            .map(|worker| worker.id.as_str())
-            .collect();
-        assert_eq!(ids, vec![WORKER, OTHER_WORKER]);
+        fill(&fake, &workers, &catalog(), &history, now, 5, &mut into)
+            .await
+            .expect("snapshot");
+        assert_eq!(into.completed, 5);
+        assert_eq!(
+            into.workers
+                .iter()
+                .map(|w| w.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![WORKER, OTHER_WORKER]
+        );
+        assert_eq!(
+            into.queued.iter().map(|q| q.priority).collect::<Vec<_>>(),
+            vec![9, 9, 1]
+        );
+        assert_eq!(
+            into.queued[0].queued_since,
+            Timestamp::from_unix_millis(1_000)
+        );
+        assert_eq!(
+            into.queued[0].candidates.iter().collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(into.queued[0].expected, Some(Duration::from_secs(2)));
+        assert_eq!(into.queued[1].expected, None);
+        assert!(into.queued[2].candidates.is_empty());
+        assert_eq!(
+            into.executing,
+            vec![
+                ExecutingDemand {
+                    worker: 0,
+                    started: Timestamp::from_unix_millis(5_000),
+                    expected: Some(Duration::from_secs(2))
+                },
+                ExecutingDemand {
+                    worker: 1,
+                    started: Timestamp::from_unix_millis(4_000),
+                    expected: None
+                },
+            ]
+        );
+        let calls = fake.calls();
+        assert_eq!(
+            calls[0].order_by_priority_direction,
+            Some(OrderDirection::Desc)
+        );
+    }
+
+    #[tokio::test]
+    async fn fill_overwrites_and_reuses_all_buffers() {
+        let now = Timestamp::from_unix_millis(10_000);
+        let history = history();
+        let (workers, fake) = populated_listing();
+        let mut into = SchedulerSnapshot::default();
+        fill(&fake, &workers, &catalog(), &history, now, 5, &mut into)
+            .await
+            .expect("snapshot");
+        let capacities = (
+            into.workers.capacity(),
+            into.queued.capacity(),
+            into.executing.capacity(),
+        );
+        fill(
+            &Fake::default(),
+            &[summary(OTHER_WORKER)],
+            &catalog(),
+            &history,
+            now,
+            6,
+            &mut into,
+        )
+        .await
+        .expect("snapshot");
+        assert_eq!(into.completed, 6);
+        assert_eq!(into.workers.len(), 1);
+        assert!(into.queued.is_empty());
+        assert!(into.executing.is_empty());
+        assert!(into.workers.capacity() >= capacities.0);
+        assert!(into.queued.capacity() >= capacities.1);
+        assert!(into.executing.capacity() >= capacities.2);
+    }
+
+    #[tokio::test]
+    async fn vanished_records_are_skipped_and_other_errors_propagate_in_both_views() {
+        use gang_spi::{ActionsView, ListingLimits};
+        use nativelink_error::Code;
+        let now = Timestamp::from_unix_millis(10_000);
+        let history = history();
+        let fleets = catalog();
+        let mut state_missing = row("missing", ActionStage::Queued, 0, info(0, 0, &[]), None);
+        state_missing.state_error = Some(Code::NotFound);
+        let mut info_invalid = row("invalid", ActionStage::Queued, 0, info(0, 0, &[]), None);
+        info_invalid.info_error = Some(Code::InvalidArgument);
+        let good = row("good", ActionStage::Queued, 0, info(0, 0, &[]), None);
+        let fake = Fake {
+            queued: vec![state_missing, info_invalid, good],
+            ..Default::default()
+        };
+        let mut snapshot = SchedulerSnapshot::default();
+        fill(&fake, &[], &fleets, &history, now, 0, &mut snapshot)
+            .await
+            .expect("skip vanished");
+        assert_eq!(snapshot.queued.len(), 1);
+        let mut view = ActionsView::default();
+        let limits = ListingLimits {
+            running: 10,
+            queued: 10,
+        };
+        actions::list(&fake, &[], &fleets, limits, &mut view)
+            .await
+            .expect("skip vanished");
+        assert_eq!(view.queued.len(), 1);
+
+        for state_read in [true, false] {
+            let mut bad = row("bad", ActionStage::Queued, 0, info(0, 0, &[]), None);
+            if state_read {
+                bad.state_error = Some(Code::Internal);
+            } else {
+                bad.info_error = Some(Code::Internal);
+            }
+            let fake = Fake {
+                queued: vec![bad],
+                ..Default::default()
+            };
+            assert!(
+                fill(&fake, &[], &fleets, &history, now, 0, &mut snapshot)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                actions::list(&fake, &[], &fleets, limits, &mut view)
+                    .await
+                    .is_err()
+            );
+        }
+        let fake = Fake {
+            filter_error: Some(Code::Internal),
+            ..Default::default()
+        };
+        assert!(
+            fill(&fake, &[], &fleets, &history, now, 0, &mut snapshot)
+                .await
+                .is_err()
+        );
+        assert!(
+            actions::list(&fake, &[], &fleets, limits, &mut view)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn executing_reads_skip_vanished_and_propagate_other_errors() {
+        use gang_spi::{ActionsView, ListingLimits};
+        use nativelink_error::Code;
+        let now = Timestamp::from_unix_millis(10_000);
+        let history = history();
+        let fleets = catalog();
+        let workers = [WorkerSummary {
+            running_actions: 3,
+            ..summary(WORKER)
+        }];
+        let limits = ListingLimits {
+            running: 10,
+            queued: 10,
+        };
+        for code in [Code::NotFound, Code::InvalidArgument, Code::Internal] {
+            for state_read in [true, false] {
+                let mut bad = row("bad", ActionStage::Executing, 0, info(0, 0, &[]), None);
+                if state_read {
+                    bad.state_error = Some(code);
+                } else {
+                    bad.info_error = Some(code);
+                }
+                let good = row("good", ActionStage::Executing, 1, info(0, 0, &[]), None);
+                let fake = Fake {
+                    by_worker: HashMap::from([(WORKER.to_owned(), vec![bad, good])]),
+                    ..Default::default()
+                };
+                let mut snapshot = SchedulerSnapshot::default();
+                let mut view = ActionsView::default();
+                let snapshot_result =
+                    fill(&fake, &workers, &fleets, &history, now, 0, &mut snapshot).await;
+                let view_result = actions::list(&fake, &workers, &fleets, limits, &mut view).await;
+                if code == Code::Internal {
+                    assert!(snapshot_result.is_err());
+                    assert!(view_result.is_err());
+                } else {
+                    snapshot_result.expect("vanished executing action");
+                    view_result.expect("vanished executing action");
+                    assert_eq!(snapshot.executing.len(), 1);
+                    assert_eq!(view.running.len(), 1);
+                }
+            }
+        }
     }
 }

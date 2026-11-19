@@ -1,10 +1,9 @@
-name: Save the Bazel disk cache
+name: Save the Bazel caches
 description: >-
-  Save the Bazel disk cache that .github/actions/setup-bazel restored and the job's Bazel commands filled.
-  After a successful job the entries it did not use are dropped first, so the saved cache is the job's
-  working set; a failed or timed-out job saves without dropping, so a cold run's progress carries over.
-  Saves nothing when setup-bazel decided the job does not save: a fork's pull request, or a run that
-  restored its own key exactly.
+  Save the Bazel disk and repository archive caches restored by .github/actions/setup-bazel.
+  After a successful job unused disk entries and complete archive entries are dropped;
+  a failed or timed-out job preserves them so a cold run's progress carries over.
+  Only default-branch pushes with no exact restore save a cache.
 inputs:
   prune:
     description: Drop the entries this job did not use. Pass true only when every Bazel step of the job succeeded.
@@ -15,9 +14,34 @@ runs:
     - name: Drop the entries this job did not use
       if: env.BAZEL_DISK_CACHE_SAVE == 'true' && inputs.prune == 'true'
       shell: bash
-      run: find "$BAZEL_DISK_CACHE" -type f ! -newer "$BAZEL_DISK_CACHE_EPOCH" -delete
+      run: |
+        set -euo pipefail
+        find "$BAZEL_DISK_CACHE" -type f ! -newer "$BAZEL_DISK_CACHE_EPOCH" -delete
+        archive_root="$BAZEL_REPOSITORY_CACHE/content_addressable"
+        if [[ -d "$archive_root" ]]; then
+          find "$archive_root" -type f -name file ! -newer "$BAZEL_DISK_CACHE_EPOCH" -print0 |
+            while IFS= read -r -d '' archive; do
+              entry=${archive%/*}
+              if [[ ${entry%/*/*} != "$archive_root" ]]; then
+                echo "::error::Unexpected repository cache archive path: $archive" >&2
+                exit 1
+              fi
+              rm -rf -- "$entry"
+            done
+        fi
     - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       if: env.BAZEL_DISK_CACHE_SAVE == 'true'
       with:
-        path: ${{ env.BAZEL_DISK_CACHE }}
+        path: |
+          ${{ env.BAZEL_DISK_CACHE }}
+          ${{ env.BAZEL_REPOSITORY_CACHE }}/content_addressable
         key: ${{ env.BAZEL_DISK_CACHE_KEY }}
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      if: always()
+      with:
+        name: ci-metrics-${{ github.job }}-${{ github.run_attempt }}
+        path: |
+          ${{ runner.temp }}/bazel-*.json
+          ${{ runner.temp }}/bazel-*.gz
+        if-no-files-found: ignore
+        retention-days: 7

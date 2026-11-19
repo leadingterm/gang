@@ -67,6 +67,86 @@ fn workers_of_selects_only_workers_of_the_given_config() {
 }
 
 #[test]
+fn workers_of_includes_only_launch_gates_for_the_given_worker_config() {
+    let entries: Vec<ProcessEntry> = [
+        (
+            20,
+            vec![
+                "e2e",
+                "--gang-e2e-launch-gate",
+                "/gate",
+                "1000",
+                "gang",
+                "worker",
+                "--config",
+                "/tmp/a/gang.toml",
+            ],
+        ),
+        (
+            21,
+            vec![
+                "e2e",
+                "--gang-e2e-launch-gate",
+                "/gate",
+                "1000",
+                "gang",
+                "worker",
+                "--config=/tmp/b/gang.toml",
+            ],
+        ),
+        (
+            22,
+            vec![
+                "e2e",
+                "--gang-e2e-launch-gate",
+                "/tmp/a/gang.toml",
+                "1000",
+                "gang",
+                "worker",
+                "--config",
+                "/tmp/b/gang.toml",
+            ],
+        ),
+        (
+            23,
+            vec![
+                "e2e",
+                "--gang-e2e-launch-gate",
+                "/gate",
+                "1000",
+                "gang",
+                "server",
+                "--config",
+                "/tmp/a/gang.toml",
+            ],
+        ),
+        (
+            24,
+            vec![
+                "e2e",
+                "--gang-e2e-launch-gate",
+                "/gate",
+                "1000",
+                "gang",
+                "worker",
+                "--config=/tmp/a/gang.toml",
+            ],
+        ),
+    ]
+    .into_iter()
+    .map(|(pid, args)| ProcessEntry {
+        pid,
+        args: args.into_iter().map(str::to_owned).collect(),
+    })
+    .collect();
+    let pids: Vec<_> = workers_of(&entries, Path::new("/tmp/a/gang.toml"))
+        .iter()
+        .map(|entry| entry.pid)
+        .collect();
+    assert_eq!(pids, vec![20, 24]);
+}
+
+#[test]
 fn scrub_environment_removes_exactly_the_leaking_variables() {
     let mut command = Command::new("gang");
     scrub_environment(&mut command);

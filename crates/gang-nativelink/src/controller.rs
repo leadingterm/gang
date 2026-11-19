@@ -33,6 +33,7 @@ use nativelink_service::execution_server::ExecutionServer;
 use nativelink_service::wire_compression::RemoteCacheCompressionInstances;
 use nativelink_service::worker_api_server::WorkerApiServer;
 use nativelink_store::store_manager::StoreManager;
+use parking_lot::Mutex;
 use tokio::sync::{Notify, watch};
 use tonic::service::Routes;
 use tower::{Service, service_fn};
@@ -45,17 +46,19 @@ use gang_spi::{
 use gang_types::{FleetCatalog, SaturatingInto};
 
 use crate::config::{Http2Tuning, NativeLinkConfig};
+use crate::durations::ActionDurations;
 use crate::enforcement::MinReservation;
 use crate::errors::NativeLinkEmbedError;
 use crate::fitted::FittedActions;
 use crate::globals;
 use crate::handoff::{HandOff, HandOffActions};
-use crate::observer::{BuildObserverLayer, CacheCounters};
+use crate::observer::BuildObserverLayer;
 use crate::observing::ObservingWorkerScheduler;
 use crate::placeable::{AdmittedFleets, PlaceableActions};
 use crate::serve::{Listener, ServeShutdown, serve};
 use crate::settings;
 use crate::settings::WORKER_CONNECTIONS;
+use crate::store_usage::StoreUsage;
 use crate::stores::build_stores;
 
 /// What the running controller hands to the plugin: the scheduler handles it queries.
@@ -68,8 +71,12 @@ pub(crate) struct Handles {
     pub fleets: FleetCatalog,
     /// Actions that reached a terminal result on a worker since the controller started.
     pub completed: Arc<AtomicU64>,
-    /// Farm-wide cache lookup counts.
-    pub cache: Arc<CacheCounters>,
+    /// Learned worker slot durations.
+    pub durations: Arc<Mutex<ActionDurations>>,
+    /// Controller wall clock shared by duration writers and readers.
+    pub clock: Arc<dyn Clock>,
+    /// The controller stores' usage, read through one reused metrics collector.
+    pub stores: StoreUsage,
 }
 
 /// Resets the published handles to `None` when the controller stops, however it stops.
@@ -109,7 +116,11 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
     let action_scheduler: Arc<dyn KnownPlatformPropertyProvider> =
         Arc::new(HandOffActions::new(action_scheduler, handoff.clone()));
     let completed = Arc::new(AtomicU64::new(0));
-    let cache = Arc::new(CacheCounters::default());
+    let durations = Arc::new(Mutex::new(ActionDurations::new(
+        config.scheduler.duration_keys,
+        config.scheduler.window_days,
+    )));
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
     let draining = Arc::new(ObservingWorkerScheduler::new(
         worker_scheduler,
         Arc::clone(&action_scheduler)
@@ -117,6 +128,8 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         Arc::clone(&completed),
         spec.observations.clone(),
         handoff.clone(),
+        Arc::clone(&durations),
+        Arc::clone(&clock),
     ));
     let worker_scheduler: Arc<dyn WorkerScheduler> = draining.clone();
     let actions = HashMap::from([(scheduler.name.clone(), Arc::clone(&action_scheduler))]);
@@ -142,7 +155,9 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         action_scheduler,
         fleets: spec.fleets.clone(),
         completed,
-        cache: Arc::clone(&cache),
+        durations,
+        clock,
+        stores: StoreUsage::new(Arc::clone(&store_manager)),
     });
     let claimed = handles.send_if_modified(|slot| {
         if slot.is_some() {
@@ -161,13 +176,9 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         config,
         connections,
         ClientAndWorkerRoutes {
-            public: with_request_metadata(
-                client_router,
-                spec.observations.clone(),
-                Arc::clone(&cache),
-            ),
+            public: with_request_metadata(client_router, spec.observations.clone()),
             execution: execution_router
-                .map(|router| with_request_metadata(router, spec.observations.clone(), cache)),
+                .map(|router| with_request_metadata(router, spec.observations.clone())),
             worker: worker_router,
         },
         connection_limits(&config.http2, spec.max_workers),
@@ -391,15 +402,11 @@ fn action_stack(
     Ok((action_scheduler, worker_scheduler))
 }
 
-/// Decodes Bazel's `RequestMetadata` header into the request context so actions carry their target
-/// and mnemonic and the scheduler learns per target.
-fn with_request_metadata(
-    router: Router,
-    sink: gang_spi::ObservationSink,
-    cache: Arc<CacheCounters>,
-) -> Router {
+/// Observes the router's calls into `sink`, and decodes Bazel's `RequestMetadata` header into the
+/// request context so actions carry their target and mnemonic and the scheduler learns per target.
+fn with_request_metadata(router: Router, sink: gang_spi::ObservationSink) -> Router {
     router
-        .layer(BuildObserverLayer::new(sink, cache))
+        .layer(BuildObserverLayer::new(sink))
         .layer(nativelink_util::telemetry::OtlpLayer::new(false))
 }
 
@@ -1430,7 +1437,6 @@ mod tests {
                 }),
             ),
             sink,
-            Arc::new(CacheCounters::default()),
         )
         .layer(axum::Extension(gang_spi::Authenticated {
             identity: Arc::new(alice()),
@@ -1505,7 +1511,6 @@ mod tests {
                 std::num::NonZeroUsize::MIN,
             )
             .0,
-            Arc::new(CacheCounters::default()),
         );
         let response = router
             .oneshot(
@@ -1522,7 +1527,7 @@ mod tests {
         Ok(())
     }
 
-    fn observer_router(sink: gang_spi::ObservationSink, cache: Arc<CacheCounters>) -> Router {
+    fn observer_router(sink: gang_spi::ObservationSink) -> Router {
         let auth = gang_spi::Authenticated {
             identity: Arc::new(alice()),
             valid_until: None,
@@ -1533,7 +1538,6 @@ mod tests {
                 axum::routing::post(|| async { ([("grpc-status", "5")], "") }),
             ),
             sink,
-            cache,
         )
         .layer(axum::Extension(auth))
     }
@@ -1544,7 +1548,6 @@ mod tests {
             std::num::NonZeroUsize::new(4).expect("nonzero"),
             std::num::NonZeroUsize::MIN,
         );
-        let cache = Arc::new(CacheCounters::default());
         let metadata = RequestMetadata {
             tool_invocation_id: "invocation".to_owned(),
             target_id: "//pkg:lib".to_owned(),
@@ -1552,7 +1555,7 @@ mod tests {
             ..Default::default()
         };
         let header = BASE64_STANDARD_NO_PAD.encode(metadata.encode_to_vec());
-        let miss = observer_router(sink.clone(), Arc::clone(&cache));
+        let miss = observer_router(sink.clone());
         let auth = gang_spi::Authenticated {
             identity: Arc::new(alice()),
             valid_until: None,
@@ -1563,7 +1566,6 @@ mod tests {
                 axum::routing::post(|| async { "" }),
             ),
             sink,
-            Arc::clone(&cache),
         )
         .layer(axum::Extension(auth));
         for router in [miss, hit] {
@@ -1608,8 +1610,15 @@ mod tests {
                 Some("Rustc")
             );
         }
-        assert_eq!(cache.lookups.load(std::sync::atomic::Ordering::Relaxed), 2);
-        assert_eq!(cache.hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            observations.traffic(),
+            gang_spi::Traffic {
+                lookups: 2,
+                hits: 1,
+                uploaded: 0,
+                downloaded: 0,
+            }
+        );
         Ok(())
     }
 
@@ -1651,7 +1660,6 @@ mod tests {
                 axum::routing::post(handler),
             ),
             sink,
-            Arc::new(CacheCounters::default()),
         )
         .layer(axum::Extension(auth));
         let response = router
@@ -1679,7 +1687,6 @@ mod tests {
             std::num::NonZeroUsize::new(4).expect("nonzero"),
             std::num::NonZeroUsize::MIN,
         );
-        let cache = Arc::new(CacheCounters::default());
         let path = "/build.bazel.remote.execution.v2.ActionCache/GetActionResult";
         let auth = gang_spi::Authenticated {
             identity: Arc::new(alice()),
@@ -1697,7 +1704,6 @@ mod tests {
                     .post(|| async { StatusCode::METHOD_NOT_ALLOWED }),
             ),
             sink.clone(),
-            Arc::clone(&cache),
         )
         .layer(axum::Extension(auth.clone()));
         for request in [Request::get(path), Request::post(path)] {
@@ -1719,7 +1725,6 @@ mod tests {
                 axum::routing::post(|| async { ([("grpc-status", "0")], "") }),
             ),
             sink,
-            Arc::clone(&cache),
         )
         .layer(axum::Extension(auth));
         ok.oneshot(
@@ -1746,8 +1751,15 @@ mod tests {
             assert_eq!(call.outcome, expected);
         }
         assert!(observations.next().await.is_none());
-        assert_eq!(cache.lookups.load(std::sync::atomic::Ordering::Relaxed), 2);
-        assert_eq!(cache.hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            observations.traffic(),
+            gang_spi::Traffic {
+                lookups: 2,
+                hits: 1,
+                uploaded: 0,
+                downloaded: 0,
+            }
+        );
         Ok(())
     }
 
@@ -1773,7 +1785,6 @@ mod tests {
         let router = with_request_metadata(
             Router::new().route(path, axum::routing::post(handler)),
             sink,
-            Arc::new(CacheCounters::default()),
         );
         let response = router
             .oneshot(
@@ -1791,29 +1802,443 @@ mod tests {
         Ok(())
     }
 
+    const GET_ACTION_RESULT: &str = "/build.bazel.remote.execution.v2.ActionCache/GetActionResult";
+    const BYTE_STREAM_READ: &str = "/google.bytestream.ByteStream/Read";
+    const EXECUTE: &str = "/build.bazel.remote.execution.v2.Execution/Execute";
+    /// The gRPC header carrying Bazel's `RequestMetadata`.
+    const METADATA_HEADER: &str = "build.bazel.remote.execution.v2.requestmetadata-bin";
+
+    /// One frame of a test body.
+    type TestFrame = Result<hyper::body::Frame<bytes::Bytes>, Infallible>;
+    type FrameSender = futures::channel::mpsc::UnboundedSender<TestFrame>;
+
+    /// A body yielding the frames sent on the returned sender; it ends when the sender is dropped.
+    fn streamed() -> (FrameSender, Body) {
+        let (frames, stream) = futures::channel::mpsc::unbounded();
+        (frames, Body::new(http_body_util::StreamBody::new(stream)))
+    }
+
+    /// Sends one data frame holding `data`.
+    fn send_data(frames: &FrameSender, data: &'static [u8]) -> TestResult {
+        frames.unbounded_send(Ok(hyper::body::Frame::data(bytes::Bytes::from_static(
+            data,
+        ))))?;
+        Ok(())
+    }
+
+    /// Sends the trailers ending a gRPC response with `status`.
+    fn send_status(frames: &FrameSender, status: &'static str) -> TestResult {
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", http::HeaderValue::from_static(status));
+        frames.unbounded_send(Ok(hyper::body::Frame::trailers(trailers)))?;
+        Ok(())
+    }
+
+    /// Observes POST `path` for alice with a handler that reads the whole request and then
+    /// answers with `response`.
+    fn streaming_router(path: &str, sink: gang_spi::ObservationSink, response: Body) -> Router {
+        let response = Arc::new(parking_lot::Mutex::new(Some(response)));
+        with_request_metadata(
+            Router::new().route(
+                path,
+                axum::routing::post(move |request: Body| {
+                    let response = response.lock().take().unwrap_or_default();
+                    async move {
+                        axum::body::to_bytes(request, usize::MAX)
+                            .await
+                            .expect("the request is read");
+                        Response::new(response)
+                    }
+                }),
+            ),
+            sink,
+        )
+        .layer(axum::Extension(Authenticated {
+            identity: Arc::new(alice()),
+            valid_until: None,
+        }))
+    }
+
+    /// A POST to `path` carrying `body` and the metadata of the build `invocation`.
+    fn attributed(path: &str, body: Body) -> Result<Request<Body>, http::Error> {
+        let metadata = RequestMetadata {
+            tool_invocation_id: "invocation".to_owned(),
+            ..Default::default()
+        };
+        Request::post(path)
+            .header(
+                METADATA_HEADER,
+                BASE64_STANDARD_NO_PAD.encode(metadata.encode_to_vec()),
+            )
+            .body(body)
+    }
+
+    fn observation_channel() -> (gang_spi::ObservationSink, gang_spi::Observations) {
+        gang_spi::ObservationSink::channel(
+            std::num::NonZeroUsize::new(4).expect("nonzero"),
+            std::num::NonZeroUsize::MIN,
+        )
+    }
+
+    /// The next observation, which must be a call.
+    async fn next_call(observations: &mut gang_spi::Observations) -> gang_spi::Call {
+        match observations
+            .next()
+            .await
+            .and_then(gang_spi::Delivery::into_observation)
+        {
+            Some(gang_spi::Observation::Call(call)) => call,
+            other => panic!("expected a call, got {other:?}"),
+        }
+    }
+
+    /// Whether no observation is ready to read.
+    fn nothing_recorded(observations: &mut gang_spi::Observations) -> bool {
+        !matches!(
+            futures::FutureExt::now_or_never(observations.next()),
+            Some(Some(_))
+        )
+    }
+
+    /// U1. Simulated flaws: counting only the first frame; recording at the response head.
     #[tokio::test]
-    async fn calls_without_invocation_still_count_lookups() -> TestResult {
-        let (sink, mut observations) = gang_spi::ObservationSink::channel(
-            std::num::NonZeroUsize::MIN,
-            std::num::NonZeroUsize::MIN,
+    async fn a_byte_stream_call_counts_every_frame_and_records_once_at_its_end() -> TestResult {
+        let (sink, mut observations) = observation_channel();
+        let (upload, request) = streamed();
+        send_data(&upload, b"abc")?;
+        send_data(&upload, b"defg")?;
+        drop(upload);
+        let (download, response) = streamed();
+        let mut body = streaming_router(BYTE_STREAM_READ, sink, response)
+            .oneshot(attributed(BYTE_STREAM_READ, request)?)
+            .await?
+            .into_body();
+        send_data(&download, b"12345")?;
+        assert!(body.frame().await.transpose()?.is_some());
+        assert!(nothing_recorded(&mut observations));
+        assert_eq!(observations.traffic(), gang_spi::Traffic::default());
+
+        send_data(&download, b"678")?;
+        send_status(&download, "0")?;
+        drop(download);
+        while body.frame().await.transpose()?.is_some() {}
+        let call = next_call(&mut observations).await;
+        assert_eq!(call.rpc, gang_spi::Rpc::Cas);
+        assert_eq!(call.outcome, gang_spi::CallOutcome::Ok);
+        assert_eq!(
+            call.transferred,
+            gang_spi::Transferred {
+                uploaded: 7,
+                downloaded: 8,
+            }
         );
-        let cache = Arc::new(CacheCounters::default());
-        let router = observer_router(sink, Arc::clone(&cache));
+        drop(body);
+        assert!(nothing_recorded(&mut observations));
+        assert_eq!(
+            observations.traffic(),
+            gang_spi::Traffic {
+                lookups: 0,
+                hits: 0,
+                uploaded: 7,
+                downloaded: 8,
+            }
+        );
+        Ok(())
+    }
+
+    /// U2. Simulated flaw: recording only at the end of the stream, so a dropped call is lost.
+    #[tokio::test]
+    async fn a_response_dropped_mid_stream_records_what_crossed_once() -> TestResult {
+        let (sink, mut observations) = observation_channel();
+        let (download, response) = streamed();
+        let mut body = streaming_router(BYTE_STREAM_READ, sink, response)
+            .oneshot(attributed(BYTE_STREAM_READ, Body::from("abc"))?)
+            .await?
+            .into_body();
+        send_data(&download, b"12345")?;
+        assert!(body.frame().await.transpose()?.is_some());
+        drop(body);
+        let call = next_call(&mut observations).await;
+        assert_eq!(call.outcome, gang_spi::CallOutcome::Error);
+        assert_eq!(
+            call.transferred,
+            gang_spi::Transferred {
+                uploaded: 3,
+                downloaded: 5,
+            }
+        );
+        assert!(nothing_recorded(&mut observations));
+        assert_eq!(
+            observations.traffic(),
+            gang_spi::Traffic {
+                lookups: 0,
+                hits: 0,
+                uploaded: 3,
+                downloaded: 5,
+            }
+        );
+        Ok(())
+    }
+
+    /// U3. Simulated flaw: classifying the call from the response head only.
+    #[tokio::test]
+    async fn a_trailer_status_overrides_the_head_of_a_lookup() -> TestResult {
+        let (sink, mut observations) = observation_channel();
+        let (download, response) = streamed();
+        let body = streaming_router(GET_ACTION_RESULT, sink, response)
+            .oneshot(attributed(GET_ACTION_RESULT, Body::empty())?)
+            .await?
+            .into_body();
+        send_status(&download, "5")?;
+        drop(download);
+        axum::body::to_bytes(body, usize::MAX).await?;
+        let call = next_call(&mut observations).await;
+        assert_eq!(call.rpc, gang_spi::Rpc::GetActionResult);
+        assert_eq!(call.outcome, gang_spi::CallOutcome::NotFound);
+        assert_eq!(
+            observations.traffic(),
+            gang_spi::Traffic {
+                lookups: 1,
+                hits: 0,
+                uploaded: 0,
+                downloaded: 0,
+            }
+        );
+        Ok(())
+    }
+
+    /// Simulated flaw: a cancelled call keeps the outcome of its OK head and counts a hit.
+    #[tokio::test]
+    async fn a_lookup_cancelled_before_its_end_is_an_error_without_a_hit() -> TestResult {
+        let (sink, mut observations) = observation_channel();
+        let (download, response) = streamed();
+        let mut body = streaming_router(GET_ACTION_RESULT, sink, response)
+            .oneshot(attributed(GET_ACTION_RESULT, Body::empty())?)
+            .await?
+            .into_body();
+        send_data(&download, b"12")?;
+        assert!(body.frame().await.transpose()?.is_some());
+        drop(body);
+        let call = next_call(&mut observations).await;
+        assert_eq!(call.outcome, gang_spi::CallOutcome::Error);
+        assert_eq!(
+            observations.traffic(),
+            gang_spi::Traffic {
+                lookups: 1,
+                hits: 0,
+                uploaded: 0,
+                downloaded: 2,
+            }
+        );
+        Ok(())
+    }
+
+    /// U4. Simulated flaw: wrapping `Execute` like a cache call, which delays its record until
+    /// the action's stream ends and counts its bytes.
+    #[tokio::test]
+    async fn execute_is_recorded_at_its_head_while_its_stream_runs() -> TestResult {
+        let (sink, mut observations) = observation_channel();
+        let (download, response) = streamed();
+        let mut body = streaming_router(EXECUTE, sink, response)
+            .oneshot(attributed(EXECUTE, Body::from("abc"))?)
+            .await?
+            .into_body();
+        let Some(Some(delivery)) = futures::FutureExt::now_or_never(observations.next()) else {
+            panic!("Execute is recorded at its response head")
+        };
+        let Some(gang_spi::Observation::Call(call)) = delivery.into_observation() else {
+            panic!("expected a call")
+        };
+        assert_eq!(call.rpc, gang_spi::Rpc::Execute);
+        assert_eq!(call.outcome, gang_spi::CallOutcome::Ok);
+        assert_eq!(call.transferred, gang_spi::Transferred::default());
+        send_data(&download, b"12345")?;
+        assert!(body.frame().await.transpose()?.is_some());
+        drop(body);
+        assert!(nothing_recorded(&mut observations));
+        assert_eq!(observations.traffic(), gang_spi::Traffic::default());
+        Ok(())
+    }
+
+    /// U5. Simulated flaw: counting farm traffic only for attributed calls.
+    #[tokio::test]
+    async fn calls_without_build_metadata_count_traffic_and_record_no_call() -> TestResult {
+        let (sink, mut observations) = observation_channel();
+        let router = with_request_metadata(
+            Router::new().route(
+                GET_ACTION_RESULT,
+                axum::routing::post(|request: Body| async move {
+                    axum::body::to_bytes(request, usize::MAX)
+                        .await
+                        .expect("the request is read");
+                    ([("grpc-status", "0")], "wxyz")
+                }),
+            ),
+            sink,
+        )
+        .layer(axum::Extension(Authenticated {
+            identity: Arc::new(alice()),
+            valid_until: None,
+        }));
         let empty = BASE64_STANDARD_NO_PAD.encode(RequestMetadata::default().encode_to_vec());
         for header in [None, Some(empty)] {
-            let mut request =
-                Request::post("/build.bazel.remote.execution.v2.ActionCache/GetActionResult");
+            let mut request = Request::post(GET_ACTION_RESULT);
             if let Some(header) = header {
-                request = request.header(
-                    "build.bazel.remote.execution.v2.requestmetadata-bin",
-                    header,
-                );
+                request = request.header(METADATA_HEADER, header);
             }
-            router.clone().oneshot(request.body(Body::empty())?).await?;
+            let response = router
+                .clone()
+                .oneshot(request.body(Body::from("abc"))?)
+                .await?;
+            axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         }
         drop(router);
-        assert_eq!(cache.lookups.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(
+            observations.traffic(),
+            gang_spi::Traffic {
+                lookups: 2,
+                hits: 2,
+                uploaded: 6,
+                downloaded: 8,
+            }
+        );
         assert!(observations.next().await.is_none());
+        Ok(())
+    }
+
+    const BYTE_STREAM_WRITE: &str = "/google.bytestream.ByteStream/Write";
+
+    /// Observes POST `path` for alice with a handler that reads `frames` request frames, reports
+    /// that on `reading`, and then never answers.
+    fn stalled_router(
+        path: &str,
+        sink: gang_spi::ObservationSink,
+        frames: usize,
+        reading: tokio::sync::oneshot::Sender<()>,
+    ) -> Router {
+        let reading = Arc::new(parking_lot::Mutex::new(Some(reading)));
+        with_request_metadata(
+            Router::new().route(
+                path,
+                axum::routing::post(move |mut request: Body| {
+                    let reading = reading.lock().take();
+                    async move {
+                        for _ in 0..frames {
+                            request
+                                .frame()
+                                .await
+                                .expect("a request frame")
+                                .expect("a readable frame");
+                        }
+                        reading
+                            .expect("one request")
+                            .send(())
+                            .expect("the test waits");
+                        std::future::pending::<Response<Body>>().await
+                    }
+                }),
+            ),
+            sink,
+        )
+        .layer(axum::Extension(Authenticated {
+            identity: Arc::new(alice()),
+            valid_until: None,
+        }))
+    }
+
+    /// Polls `call` until its handler reports `read`, then cancels it before its response head.
+    async fn cancel_before_head<F: Future>(
+        call: F,
+        read: tokio::sync::oneshot::Receiver<()>,
+    ) -> TestResult {
+        tokio::pin!(call);
+        tokio::select! {
+            biased;
+            _ = &mut call => panic!("the stalled call has no response head"),
+            read = read => read?,
+        }
+        Ok(())
+    }
+
+    /// Simulated flaw: creating the call's record only once its response head arrives, so an
+    /// upload cancelled before the head is lost.
+    #[tokio::test]
+    async fn an_upload_cancelled_before_its_head_records_what_crossed() -> TestResult {
+        let (sink, mut observations) = observation_channel();
+        let (upload, request) = streamed();
+        send_data(&upload, b"abc")?;
+        send_data(&upload, b"defg")?;
+        let (reading, read) = tokio::sync::oneshot::channel();
+        let call = stalled_router(BYTE_STREAM_WRITE, sink, 2, reading)
+            .oneshot(attributed(BYTE_STREAM_WRITE, request)?);
+        cancel_before_head(call, read).await?;
+        let call = next_call(&mut observations).await;
+        assert_eq!(call.rpc, gang_spi::Rpc::Cas);
+        assert_eq!(call.outcome, gang_spi::CallOutcome::Error);
+        assert_eq!(
+            call.transferred,
+            gang_spi::Transferred {
+                uploaded: 7,
+                downloaded: 0,
+            }
+        );
+        assert!(nothing_recorded(&mut observations));
+        assert_eq!(
+            observations.traffic(),
+            gang_spi::Traffic {
+                lookups: 0,
+                hits: 0,
+                uploaded: 7,
+                downloaded: 0,
+            }
+        );
+        drop(upload);
+        Ok(())
+    }
+
+    /// Simulated flaw: a lookup cancelled before its head is neither recorded nor counted.
+    #[tokio::test]
+    async fn a_lookup_cancelled_before_its_head_is_an_error_without_a_hit() -> TestResult {
+        let (sink, mut observations) = observation_channel();
+        let (reading, read) = tokio::sync::oneshot::channel();
+        let call = stalled_router(GET_ACTION_RESULT, sink, 0, reading)
+            .oneshot(attributed(GET_ACTION_RESULT, Body::empty())?);
+        cancel_before_head(call, read).await?;
+        let call = next_call(&mut observations).await;
+        assert_eq!(call.rpc, gang_spi::Rpc::GetActionResult);
+        assert_eq!(call.outcome, gang_spi::CallOutcome::Error);
+        assert!(nothing_recorded(&mut observations));
+        assert_eq!(
+            observations.traffic(),
+            gang_spi::Traffic {
+                lookups: 1,
+                hits: 0,
+                uploaded: 0,
+                downloaded: 0,
+            }
+        );
+        Ok(())
+    }
+
+    /// Simulated flaw: an inner service error skips the farm count.
+    #[tokio::test]
+    async fn a_lookup_failing_before_its_head_counts_a_lookup_without_a_hit() -> TestResult {
+        let (sink, observations) = observation_channel();
+        let failing =
+            service_fn(|_: Request<Body>| async { Err::<Response<Body>, _>("the service failed") });
+        let result = tower::Layer::layer(&BuildObserverLayer::new(sink), failing)
+            .oneshot(Request::post(GET_ACTION_RESULT).body(Body::empty())?)
+            .await;
+        assert!(result.is_err());
+        assert_eq!(
+            observations.traffic(),
+            gang_spi::Traffic {
+                lookups: 1,
+                hits: 0,
+                uploaded: 0,
+                downloaded: 0,
+            }
+        );
         Ok(())
     }
 

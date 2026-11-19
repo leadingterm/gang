@@ -4,10 +4,12 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
 use std::num::NonZeroUsize;
 
-use gang_spi::{Call, CallOutcome, Observation, Origin, Rpc};
+use gang_clock::Timestamp;
+use gang_spi::{Call, CallOutcome, Observation, Origin, Rpc, Traffic};
 use gang_types::BuildKey;
 use gang_wire::{
     IngestBuildsRequest, IngestCall, IngestLoss, IngestOrigin, IngestOutcome, IngestRpc,
+    IngestTraffic,
 };
 
 use crate::OutboxError;
@@ -38,6 +40,8 @@ pub struct Outbox {
     max_keys: usize,
     budget: usize,
     used: usize,
+    traffic: Option<IngestTraffic>,
+    acknowledged: Option<IngestTraffic>,
 }
 
 /// A removed batch awaiting its delivery outcome.
@@ -84,7 +88,17 @@ impl Outbox {
     /// # Errors
     /// Returns [`OutboxError::CapTooSmall`] if the cap cannot hold the frame.
     pub fn try_new(max_keys: NonZeroUsize, max_bytes: NonZeroUsize) -> Result<Self, OutboxError> {
-        let frame = json_len(&IngestBuildsRequest::default()) + 20;
+        let frame_request = IngestBuildsRequest {
+            traffic: Some(IngestTraffic {
+                start_time: Timestamp::END_OF_TIME,
+                lookups: u64::MAX,
+                hits: u64::MAX,
+                uploaded_bytes: u64::MAX,
+                downloaded_bytes: u64::MAX,
+            }),
+            ..IngestBuildsRequest::default()
+        };
+        let frame = json_len(&frame_request) + 20;
         let budget = max_bytes
             .get()
             .checked_sub(frame)
@@ -96,6 +110,8 @@ impl Outbox {
             max_keys: max_keys.get(),
             budget,
             used: 0,
+            traffic: None,
+            acknowledged: None,
         })
     }
 
@@ -113,6 +129,8 @@ impl Outbox {
             origin: u32::MAX,
             rpc: wire_rpc(call.rpc),
             outcome: wire_outcome(call.outcome),
+            uploaded_bytes: call.transferred.uploaded,
+            downloaded_bytes: call.transferred.downloaded,
         };
         let origin_cost = json_len(&origin) + 1;
         let item_cost = json_len(&wire) + 1;
@@ -173,10 +191,24 @@ impl Outbox {
         self.unattributed = self.unattributed.saturating_add(count);
     }
 
+    /// Snapshots cumulative traffic for the sender's process.
+    pub fn traffic(&mut self, start: Timestamp, totals: Traffic) {
+        self.traffic = Some(IngestTraffic {
+            start_time: start,
+            lookups: totals.lookups,
+            hits: totals.hits,
+            uploaded_bytes: totals.uploaded,
+            downloaded_bytes: totals.downloaded,
+        });
+    }
+
     /// Whether there is nothing to dispatch or hand over locally.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.calls.is_empty() && self.lost.is_empty() && self.unattributed == 0
+        self.calls.is_empty()
+            && self.lost.is_empty()
+            && self.unattributed == 0
+            && self.traffic == self.acknowledged
     }
 
     /// Whether the conservative pending-size estimate reaches the request budget.
@@ -240,7 +272,10 @@ impl Outbox {
         }
         drop(dictionary);
 
-        let mut request = IngestBuildsRequest::default();
+        let mut request = IngestBuildsRequest {
+            traffic: self.traffic.clone(),
+            ..IngestBuildsRequest::default()
+        };
         let mut losses = Vec::with_capacity(selected_losses.len());
         for (key, index, new_origin) in selected_losses {
             let loss = self.lost.remove(&key)?;
@@ -278,6 +313,7 @@ impl Outbox {
     /// Resolves a dispatch without retrying calls or possibly delivered losses.
     pub fn resolve(&mut self, dispatch: Dispatch, outcome: Outcome) {
         if outcome == Outcome::Accepted {
+            self.acknowledged = dispatch.request.traffic;
             return;
         }
         if outcome == Outcome::NotApplied {
@@ -330,6 +366,7 @@ fn wire_rpc(rpc: Rpc) -> IngestRpc {
         Rpc::GetActionResult => IngestRpc::GetActionResult,
         Rpc::UpdateActionResult => IngestRpc::UpdateActionResult,
         Rpc::Execute => IngestRpc::Execute,
+        Rpc::Cas => IngestRpc::Cas,
     }
 }
 

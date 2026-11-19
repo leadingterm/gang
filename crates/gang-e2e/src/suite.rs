@@ -61,6 +61,7 @@ use crate::system::{
 };
 use crate::template::Transport;
 use crate::timeout::{action_timeout, exit_signals};
+use crate::work_aware::{backlog_grows_fleet, burst_from_zero, queued_behind_short_work};
 
 /// The configuration of one harness run.
 #[derive(Debug, Clone)]
@@ -248,6 +249,12 @@ gang_types::string_enum! {
         /// A fleet with `min_instances = 0` keeps one worker with no build while a scheduled
         /// minimum is in force, and the scale-out carries cause `MINIMUM`. Gate two only.
         ScheduledMinimum = "scheduled-minimum",
+        /// A burst from zero does not buy more than one worker.
+        BurstFromZero = "burst-from-zero",
+        /// Queued work waits for short running work rather than buying capacity.
+        QueuedBehindShortWork = "queued-behind-short-work",
+        /// A persistent backlog grows the fleet.
+        BacklogGrowsFleet = "backlog-grows-fleet",
     }
 }
 
@@ -292,6 +299,7 @@ impl Scenario {
             Self::FollowerBuilds => 34,
             Self::LeaderFailover => 120,
             Self::LoginAcross | Self::ScheduledMinimum => 4,
+            Self::BurstFromZero | Self::QueuedBehindShortWork | Self::BacklogGrowsFleet => 60,
             Self::DatabaseOutage => 161,
         }
     }
@@ -340,6 +348,9 @@ impl Scenario {
             | Self::FollowerBuilds
             | Self::Sessions
             | Self::ScheduledMinimum
+            | Self::BurstFromZero
+            | Self::QueuedBehindShortWork
+            | Self::BacklogGrowsFleet
             | Self::ControllerLoss
             | Self::RollingDeploy
             | Self::CrossRevocation
@@ -452,6 +463,9 @@ impl Scenario {
             Self::WorkerRenewal => execution_checks(ctx, ExecutionScenario::WorkerRenewal),
             Self::Orphan => control_checks(self, ctx, ControlKnobs::ORPHAN, orphan),
             Self::ScheduledMinimum => scheduled_minimum_checks(ctx),
+            Self::BurstFromZero | Self::QueuedBehindShortWork | Self::BacklogGrowsFleet => {
+                work_aware_dispatch(self, ctx)
+            }
             Self::DrainCancel => {
                 control_checks(self, ctx, ControlKnobs::DRAIN_CANCEL, drain_cancel)
             }
@@ -538,6 +552,49 @@ fn scheduled_minimum_checks(ctx: &RunContext<'_>) -> Vec<Check> {
         ControlKnobs::SCHEDULED_MINIMUM,
         scheduled_minimum,
     )
+}
+
+fn work_aware_dispatch(scenario: Scenario, ctx: &RunContext<'_>) -> Vec<Check> {
+    match scenario {
+        Scenario::BurstFromZero => work_aware_checks(
+            scenario,
+            ctx,
+            ControlKnobs::BURST_FROM_ZERO,
+            |stack, exec| burst_from_zero(stack, exec),
+        ),
+        Scenario::QueuedBehindShortWork => work_aware_checks(
+            scenario,
+            ctx,
+            ControlKnobs::QUEUED_BEHIND_SHORT_WORK,
+            |stack, exec| queued_behind_short_work(stack, exec),
+        ),
+        Scenario::BacklogGrowsFleet => work_aware_checks(
+            scenario,
+            ctx,
+            ControlKnobs::BACKLOG_GROWS_FLEET,
+            |stack, exec| backlog_grows_fleet(stack, exec),
+        ),
+        _ => attempt(scenario, || {
+            Err(crate::errors::E2eError::system("not a work-aware scenario"))
+        }),
+    }
+}
+
+fn work_aware_checks(
+    scenario: Scenario,
+    ctx: &RunContext<'_>,
+    control: ControlKnobs,
+    run: impl FnOnce(&Stack, &Observer) -> Result<Vec<Check>>,
+) -> Vec<Check> {
+    attempt(scenario, || {
+        let variant = Variant {
+            control,
+            ..ctx.baseline
+        };
+        let stack = Stack::create(ctx.inputs, &variant, Transport::Tls, ctx.issuer)?;
+        let exec = Observer::new(&stack, &ctx.inputs.settings)?;
+        run(&stack, &exec)
+    })
 }
 
 /// The verdicts of the dashboard scenario on fresh deployments.
@@ -1349,6 +1406,9 @@ mod tests {
             Scenario::Builds,
             Scenario::FollowerBuilds,
             Scenario::ScheduledMinimum,
+            Scenario::BurstFromZero,
+            Scenario::QueuedBehindShortWork,
+            Scenario::BacklogGrowsFleet,
         ];
         for scenario in gate_two_only {
             assert!(!runs.contains(&scenario), "{scenario}");
@@ -1363,7 +1423,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_minimum_is_last_and_gate_two_only() {
+    fn scheduled_minimum_and_work_aware_are_gate_two_additions() {
         assert_eq!(
             "scheduled-minimum".parse::<Scenario>().ok(),
             Some(Scenario::ScheduledMinimum)
@@ -1373,10 +1433,13 @@ mod tests {
                 .scenarios()
                 .any(|scenario| scenario == Scenario::ScheduledMinimum)
         );
-        assert_eq!(
-            Gate::Two.additions().last(),
-            Some(Scenario::ScheduledMinimum)
-        );
+        let additions: Vec<_> = Gate::Two.additions().collect();
+        assert!(additions.ends_with(&[
+            Scenario::ScheduledMinimum,
+            Scenario::BurstFromZero,
+            Scenario::QueuedBehindShortWork,
+            Scenario::BacklogGrowsFleet,
+        ]));
     }
 
     #[test]

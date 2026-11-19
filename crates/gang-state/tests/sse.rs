@@ -160,6 +160,7 @@ fn delta(seq: u64) -> Delta {
         update_time: Timestamp::from_unix_millis(1_768_471_772_000),
         pass: None,
         queue: None,
+        cache: None,
         fleets: None,
         workers: None,
         instances: None,
@@ -251,6 +252,27 @@ fn delta_frame_carries_seq_as_id_and_the_delta_json_as_data() -> Result<(), Box<
         "event: delta\nid: 2\ndata: {\"seq\":2,\"base\":1,\"updateTime\":\"2026-01-15T10:09:32.000Z\"}\n\n"
     );
     assert_eq!(frame, sse::encode(&Frame::Delta(delta))?);
+    Ok(())
+}
+
+// Catches a cache-only change being suppressed or omitted from the live SSE delta.
+#[test]
+fn cache_change_is_visible_in_live_delta() -> Result<(), Box<dyn Error>> {
+    let before = state(1);
+    let mut after = before.clone();
+    after.seq = 2;
+    after.cache.stores.push(gang_wire::StoreUsage {
+        store: gang_wire::CacheStore::Content,
+        used_bytes: 40,
+        budget_bytes: 100,
+    });
+    let delta = gang_state::diff(&before, &after).ok_or("missing cache delta")?;
+    let encoded = sse::encode(FrameRef::Delta(&delta))?;
+    let frame = single(std::str::from_utf8(&encoded)?)?;
+    assert_eq!(json(&frame.data)?["cache"]["stores"][0]["usedBytes"], 40);
+    let mut rebuilt = before;
+    gang_state::apply(&mut rebuilt, &delta)?;
+    assert_eq!(rebuilt, after);
     Ok(())
 }
 

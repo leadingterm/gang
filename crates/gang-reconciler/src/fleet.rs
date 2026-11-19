@@ -1,5 +1,7 @@
 //! One fleet as a reconcile pass sees it: its configuration, its supply, and its outlook.
 
+use std::time::Duration;
+
 use gang_config::FleetPolicy;
 use gang_spi::FleetSupply;
 
@@ -37,6 +39,10 @@ pub struct FleetOutlook {
     /// The queued actions that name the fleet as a candidate. Non-exclusive: one action can count
     /// for several fleets.
     pub candidates: u32,
+    /// Measured launch-to-worker readiness; absent until this term observes a sample.
+    pub readiness: Option<Duration>,
+    /// Latest predicted start of an attributed queued action at planned capacity.
+    pub expected_wait: Option<Duration>,
     /// The fleet's workers, unconnected instances, and running actions.
     pub workers: WorkerCounts,
 }

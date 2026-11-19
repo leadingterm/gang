@@ -16,8 +16,9 @@ use gang_spi::{
     Accepted, AuthenticationPort, CacheStorePort, CertificateSignerPort, ClientCertificates,
     ControllerConnections, ControllerId, ControllerReady, ControllerSpec, CredentialLifecyclePort,
     Lease, Listening, ObservationSink, Observations, PortError, ProvisionerPort, RevocationEpoch,
-    SchedulerPort, Scheme, ServerEndpoints, StateRepositoryPort,
+    SchedulerPort, SchedulerSnapshot, Scheme, ServerEndpoints, StateRepositoryPort,
 };
+use gang_state::CacheBaseline;
 use gang_tls::{
     Alpn, ClientAuth, HttpClient, HttpProtocol, HttpSettings, HttpTransport, RevocationSet,
     ServerTrust,
@@ -296,6 +297,8 @@ struct LeadContext<'a, D: Deployment> {
     worker_endpoint: &'a WorkerEndpoint,
     dashboard: Option<&'a Dashboard>,
     builds: &'a BuildsCell,
+    sink: &'a ObservationSink,
+    cache: &'a D::Cache,
     leading: &'a Leading,
     readiness: &'a Readiness,
     leadership: &'a Leadership<'a, D::Repository, D::Clock>,
@@ -313,6 +316,7 @@ async fn run_leader<D: Deployment>(
     initial_lease: Option<Lease>,
     (retiring, stop): (impl Future<Output = ()>, Stop),
 ) -> Result<(), ServerError> {
+    let fresh = initial_lease.is_some();
     let mut lease = if let Some(lease) = initial_lease {
         lease
     } else {
@@ -323,12 +327,11 @@ async fn run_leader<D: Deployment>(
             lease = context.leadership.acquire() => lease,
         }
     };
-    context.leading.set();
     let result = tokio::select! {
         biased;
         () = stop.clone() => Ok(()),
         () = context.leadership.hold(&mut lease) => Err(ServerError::LeadershipLost),
-        result = lead_work(&context, listeners, channels, stop.clone()) => result,
+        result = lead_work(&context, listeners, channels, stop.clone(), fresh) => result,
     };
     if !matches!(&result, Err(ServerError::LeadershipLost)) {
         context.leadership.release(&lease).await;
@@ -336,13 +339,21 @@ async fn run_leader<D: Deployment>(
     result
 }
 
-/// Binds the leader listeners and runs its control loop, sidecar and dashboard work.
+/// Starts the term, then binds the leader listeners and runs its control loop, sidecar and
+/// dashboard work. The term starts once the dashboard's cache baseline is taken, while the lease
+/// is already being renewed; `fresh` says the engine started under this lease.
 async fn lead_work<D: Deployment>(
     context: &LeadContext<'_, D>,
     listeners: LeaderListeners<D::Binder>,
     channels: LeadChannels,
     stop: Stop,
+    fresh: bool,
 ) -> Result<(), ServerError> {
+    let baseline = match context.dashboard {
+        Some(_) => Some(term_baseline(context, fresh).await),
+        None => None,
+    };
+    context.leading.set(context.core.host.clock.wall());
     if let Some(dashboard) = context.dashboard
         && let Err(error) = dashboard.reload_from(&context.core.host.repository).await
     {
@@ -405,8 +416,12 @@ async fn lead_work<D: Deployment>(
         clock,
         context.leadership.fence().clone(),
     );
-    let control = match context.dashboard {
-        Some(dashboard) => control.with_publisher(dashboard.publisher(context.builds.clone())),
+    let control = match context.dashboard.zip(baseline) {
+        Some((dashboard, baseline)) => control.with_publisher(dashboard.publisher(
+            context.builds.clone(),
+            context.sink.clone(),
+            baseline,
+        )),
         None => control,
     };
     tokio::select! {
@@ -414,8 +429,55 @@ async fn lead_work<D: Deployment>(
         () = stop => Ok(()),
         never = sidecar => match never {},
         never = control.run() => match never {},
-        never = dashboard_tasks(context.dashboard, context.scheduler, clock,
-            &context.core.host.revoked_principals) => match never {},
+        never = dashboard_tasks(context) => match never {},
+    }
+}
+
+/// The cache traffic and engine evictions counted before the term, which no sample may hold.
+/// A fresh engine has evicted nothing yet. Otherwise the engine is asked within one poll
+/// interval; when it cannot answer, the baseline is left to its first successful snapshot.
+async fn term_baseline<D: Deployment>(context: &LeadContext<'_, D>, fresh: bool) -> CacheBaseline {
+    let evicted = if fresh {
+        Some(0)
+    } else {
+        let mut snapshot = SchedulerSnapshot::default();
+        let read = context.core.host.clock.timeout(
+            context.poll_interval.get(),
+            context.scheduler.snapshot(&mut snapshot),
+        );
+        match read.await {
+            Ok(Ok(())) => Some(
+                snapshot
+                    .stores
+                    .iter()
+                    .fold(0_u64, |sum, store| sum.saturating_add(store.evicted)),
+            ),
+            Ok(Err(error @ PortError::Unavailable(_))) => {
+                tracing::debug!(
+                    %error,
+                    "engine not serving at the term start; evictions baseline later"
+                );
+                None
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    %error,
+                    "cannot read the engine at the term start; evictions baseline later"
+                );
+                None
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "engine read timed out at the term start; evictions baseline later"
+                );
+                None
+            }
+        }
+    };
+    CacheBaseline {
+        traffic: context.sink.traffic(),
+        evicted,
     }
 }
 
@@ -867,7 +929,6 @@ impl<D: Deployment> Server<D> {
             matches!(&leader, LeaderListeners::Dedicated { .. }),
             stop.clone(),
         );
-        let dashboard = self.dashboard.as_ref();
         let scheduler = &self.scheduler;
         let mut controller = Box::pin(scheduler.run_controller(&spec, connections, ready));
         let context = LeadContext {
@@ -876,8 +937,10 @@ impl<D: Deployment> Server<D> {
             fleets: &self.fleets,
             scheduler,
             worker_endpoint: &self.worker_endpoint,
-            dashboard,
+            dashboard: self.dashboard.as_ref(),
             builds: &self.builds,
+            sink: &self.observation_sink,
+            cache: &self.cache,
             leading: &self.leading,
             readiness: &self.readiness,
             leadership: &leadership,
@@ -899,7 +962,7 @@ impl<D: Deployment> Server<D> {
                 let _ = stop_sender.send(());
                 self.readiness.stop();
             },
-            dashboard,
+            self.dashboard.as_ref(),
             controller.as_mut(),
             leader_task.as_mut(),
             ends,
@@ -934,9 +997,9 @@ async fn build_forwarding<K: Stack>(
         leading.clone(),
         key,
         issuer.clone(),
-        leadership.clock_skew,
-        leadership.ttl,
+        leadership,
         builds.max_live.get(),
+        builds.max_traffic_series,
     );
     let forwarding = Forwarding::try_new(
         uplink.clone(),
@@ -944,6 +1007,7 @@ async fn build_forwarding<K: Stack>(
         leadership.renew_interval.get(),
         builds.max_live,
         max_request_size,
+        host.clock.wall(),
     )
     .map_err(ServerError::Forwarding)?;
     Ok((Some(ingest), Some(forwarding)))
@@ -1069,20 +1133,17 @@ async fn start_dashboard<K: Stack>(
     .map(Some)
 }
 
-/// The dashboard's background work: the actions refresher and the principals forwarder. Never
-/// completes; without a dashboard it waits forever.
-async fn dashboard_tasks<S: SchedulerPort, C: Clock>(
-    dashboard: Option<&Dashboard>,
-    scheduler: &S,
-    clock: &C,
-    revoked_principals: &RevokedPrincipals,
-) -> Infallible {
-    let Some(dashboard) = dashboard else {
+/// The dashboard's background work: the actions refresher, the principals forwarder and the cache
+/// usage sampler. Never completes; without a dashboard it waits forever.
+async fn dashboard_tasks<D: Deployment>(context: &LeadContext<'_, D>) -> Infallible {
+    let Some(dashboard) = context.dashboard else {
         return std::future::pending().await;
     };
+    let clock = &*context.core.host.clock;
     tokio::select! {
-        never = dashboard.refresher(scheduler, clock).run() => never,
-        never = dashboard.forward_principals(revoked_principals) => never,
+        never = dashboard.refresher(context.scheduler, clock).run() => never,
+        never = dashboard.forward_principals(&context.core.host.revoked_principals) => never,
+        never = dashboard.sample_usage(context.cache, clock, context.leading) => never,
     }
 }
 

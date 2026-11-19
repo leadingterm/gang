@@ -33,6 +33,15 @@ sh_test(
     env = {"GUARD_SCRIPT": "$(rootpath tools/check-opentofu-tests.sh)"},
 )
 
+sh_test(
+    name = "login_action_test",
+    size = "small",
+    timeout = "short",
+    srcs = [".github/actions/login/login_test.sh"],
+    data = [".github/actions/login/action.yml"],
+    env = {"LOGIN_ACTION": "$(rootpath .github/actions/login/action.yml)"},
+)
+
 workspace_rust_source_set(
     name = "rust_workspace_sources",
     packages = [

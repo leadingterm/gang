@@ -16,9 +16,10 @@ use futures::stream::{self, BoxStream};
 use gang_nativelink::{NativeLink, NativeLinkConfig};
 use gang_spi::{
     Accepted, Admitted, ApiRequestBody, ApiResponseBody, ApiService, Authenticated, ClientTls,
-    ControllerConnections, ControllerReady, ControllerSpec, Listening, Peer, Plugin, PluginContext,
-    PortError, Rejection, RenderedStoreSpec, RequestGate, SchedulerPort, SchedulerSnapshot, Slots,
-    StoreAccess, Subject, WorkerSpec, WorkerState, WorkerTls, full_body,
+    ControllerConnections, ControllerReady, ControllerSpec, Listening, ObservationSink, Peer,
+    Plugin, PluginContext, PortError, Rejection, RenderedStoreSpec, RequestGate, SchedulerPort,
+    SchedulerSnapshot, Slots, StoreAccess, StoreKind, Subject, WorkerSpec, WorkerState, WorkerTls,
+    full_body,
 };
 use gang_testkit::{ChildTest, ExtendedKeyUsagePurpose, TestAuthority, TestResult};
 use gang_tls::{
@@ -41,6 +42,8 @@ use nativelink_proto::build::bazel::remote::execution::v2::{
     GetCapabilitiesRequest, Platform, ServerCapabilities, batch_update_blobs_request, command,
     platform,
 };
+#[cfg(unix)]
+use nativelink_proto::build::bazel::remote::execution::v2::{BatchReadBlobsRequest, Tree};
 #[cfg(target_os = "linux")]
 use nativelink_proto::build::bazel::remote::execution::v2::{
     ExecuteOperationMetadata, execution_stage,
@@ -95,6 +98,12 @@ const MEMORY_ENV: &str = "GANG_TEST_MEMORY";
 /// The output directory used by the default-memory-floor helper.
 #[cfg(target_os = "linux")]
 const MEMORY_OUTPUT: &str = "memory-output";
+/// Enables the output-directory symlink fixture.
+#[cfg(unix)]
+const SYMLINK_OUTPUT_ENV: &str = "GANG_TEST_SYMLINK_OUTPUT";
+/// The output directory containing the symlink fixture.
+#[cfg(unix)]
+const SYMLINK_OUTPUT: &str = "symlink-output";
 /// The input file of the action, materialised in its working directory.
 const INPUT_NAME: &str = "input.txt";
 /// The output file of the action, written by `entrypoint_helper`.
@@ -322,9 +331,9 @@ async fn http1_get(
 }
 
 /// Starts the controller in a task. The task builds its own specs from owned stores and serves
-/// the connections accepted on its listeners. The public listener applies `public_gate` and
-/// labels its connections with `public_peers`. The readiness receiver resolves when built; the
-/// serving receiver resolves once it polls its public connections.
+/// the connections accepted on its listeners, recording into `observations`. The public listener
+/// applies `public_gate` and labels its connections with `public_peers`. The readiness receiver
+/// resolves when built; the serving receiver resolves once it polls its public connections.
 fn spawn_controller(
     plugin: Arc<NativeLink>,
     fleets: FleetCatalog,
@@ -332,6 +341,7 @@ fn spawn_controller(
     worker: TcpListener,
     public_gate: TestGate,
     public_peers: Vec<Peer>,
+    observations: ObservationSink,
 ) -> (
     JoinHandle<Result<(), PortError>>,
     oneshot::Receiver<()>,
@@ -341,10 +351,6 @@ fn spawn_controller(
     let (ready, readiness) = ControllerReady::channel();
     let controller = tokio::spawn(async move {
         let content = RenderedStoreSpec(json!({"memory": {}}));
-        let (observations, _receiver) = gang_spi::ObservationSink::channel(
-            std::num::NonZeroUsize::MIN,
-            std::num::NonZeroUsize::MIN,
-        );
         let action = RenderedStoreSpec(json!({"memory": {}}));
         let spec = ControllerSpec {
             content_store: &content,
@@ -437,6 +443,8 @@ struct Harness {
     workers: Vec<RunningWorker>,
     public_port: u16,
     worker_port: u16,
+    /// The controller's observation sink, whose traffic counters the tests read.
+    observations: ObservationSink,
 }
 
 impl Harness {
@@ -469,6 +477,8 @@ impl Harness {
         let worker_port = worker.local_addr()?.port();
         let plugin = Arc::new(build_plugin(config_with(worker_port, extra)?)?);
         let fleets = FleetCatalog::try_new(fleets)?;
+        let (observations, _receiver) =
+            ObservationSink::channel(NonZeroUsize::MIN, NonZeroUsize::MIN);
         let (mut controller, serving, readiness) = spawn_controller(
             Arc::clone(&plugin),
             fleets,
@@ -476,6 +486,7 @@ impl Harness {
             worker,
             public_gate,
             public_peers,
+            observations.clone(),
         );
         readiness
             .await
@@ -492,6 +503,7 @@ impl Harness {
             workers: Vec::new(),
             public_port,
             worker_port,
+            observations,
         })
     }
 
@@ -858,6 +870,10 @@ fn entrypoint_helper() -> TestResult {
     if std::env::var_os(ENTRYPOINT_ENV).is_none() {
         return Ok(());
     }
+    #[cfg(unix)]
+    if std::env::var_os(SYMLINK_OUTPUT_ENV).is_some() {
+        create_symlink_output()?;
+    }
     #[cfg(target_os = "linux")]
     if let Some(address) = std::env::var_os(MEMORY_ENV) {
         use std::io::Write as _;
@@ -908,6 +924,28 @@ fn entrypoint_helper() -> TestResult {
     }
     let input = std::fs::read(INPUT_NAME)?;
     std::fs::write(OUTPUT_NAME, input)?;
+    Ok(())
+}
+
+/// Creates links without resolving their targets, including dangling and external targets.
+#[cfg(unix)]
+fn create_symlink_output() -> TestResult {
+    use std::os::unix::fs::symlink;
+
+    let root = Path::new(SYMLINK_OUTPUT);
+    let nested = root.join("nested");
+    std::fs::create_dir_all(&nested)?;
+    std::fs::copy(INPUT_NAME, root.join("payload"))?;
+    let absolute_root = std::env::current_dir()?.join(root);
+    for (name, target) in [
+        ("absolute-internal", absolute_root.join("payload")),
+        ("absolute-dangling", absolute_root.join("missing")),
+        ("relative", PathBuf::from("../payload")),
+        ("absolute-external", PathBuf::from("/outside-action-root")),
+        ("absolute-lexical", absolute_root.join("nested/../payload")),
+    ] {
+        symlink(target, nested.join(name))?;
+    }
     Ok(())
 }
 
@@ -982,11 +1020,17 @@ fn build_action_with(
         )
         .collect(),
         output_files: vec![OUTPUT_NAME.into()],
-        #[cfg(target_os = "linux")]
-        output_directories: if env.iter().any(|(name, _)| *name == MEMORY_ENV) {
-            vec![MEMORY_OUTPUT.into()]
-        } else {
-            Vec::new()
+        #[cfg(unix)]
+        output_directories: {
+            let mut directories = Vec::new();
+            #[cfg(target_os = "linux")]
+            if env.iter().any(|(name, _)| *name == MEMORY_ENV) {
+                directories.push(MEMORY_OUTPUT.into());
+            }
+            if env.iter().any(|(name, _)| *name == SYMLINK_OUTPUT_ENV) {
+                directories.push(SYMLINK_OUTPUT.into());
+            }
+            directories
         },
         platform: Some(platform.clone()),
         ..Default::default()
@@ -1133,7 +1177,8 @@ fn output_digest(result: &ActionResult) -> Result<Option<&Digest>, Box<dyn Error
 /// An action runs on the worker with this test binary as its entrypoint, and its result is cached.
 ///
 /// This covers scheduling, input fetch through the worker listener's gRPC stores, execution
-/// through the entrypoint, and the upload of the result to the action cache.
+/// through the entrypoint, the upload of the result to the action cache, and the cache traffic
+/// and store usage the controller reports: client calls only, never the worker's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_action_runs_and_its_result_is_cached() -> TestResult {
     let scratch = tempfile::tempdir()?;
@@ -1143,8 +1188,13 @@ async fn an_action_runs_and_its_result_is_cached() -> TestResult {
     let channel = public_channel(harness.public_port).await?;
     let action = build_action(&[("ISA", "x86-64")])?;
     upload_blobs(&channel, action.blobs).await?;
+    let uploaded = harness.observations.traffic();
+    assert!(uploaded.uploaded > 0, "the client's blob upload is counted");
 
     let response = run_action(&channel, &action.digest).await?;
+    // The worker fetched inputs and uploaded the result over the unobserved worker listener, and
+    // `Execute` carries no counted bytes.
+    assert_eq!(harness.observations.traffic(), uploaded);
     let result = response
         .result
         .ok_or("the response carries no action result")?;
@@ -1157,6 +1207,15 @@ async fn an_action_runs_and_its_result_is_cached() -> TestResult {
     let cached = cached_result(&channel, &action.digest).await?;
     assert_eq!(cached.exit_code, 0);
     assert_eq!(output_digest(&cached)?, Some(&expected));
+    let looked_up = harness.observations.traffic();
+    assert_eq!((looked_up.lookups, looked_up.hits), (1, 1));
+    assert!(looked_up.downloaded > uploaded.downloaded);
+
+    // Both memory stores hold what the client and the worker uploaded.
+    let snapshot = read_snapshot(&harness).await?;
+    let stores: Vec<StoreKind> = snapshot.stores.iter().map(|row| row.store).collect();
+    assert_eq!(stores, [StoreKind::Content, StoreKind::Action]);
+    assert!(snapshot.stores.iter().all(|row| row.used > 0));
 
     // The worker uploaded the output blob to the shared CAS, so the client finds it present.
     let output = output_digest(&cached)?
@@ -1172,6 +1231,109 @@ async fn an_action_runs_and_its_result_is_cached() -> TestResult {
         .into_inner();
     assert_eq!(missing.missing_blob_digests.len(), 0);
     Ok(())
+}
+
+/// Reads one blob through the client listener.
+#[cfg(unix)]
+async fn read_blob(channel: &Channel, digest: Digest) -> Result<Vec<u8>, Box<dyn Error>> {
+    let response = ContentAddressableStorageClient::new(channel.clone())
+        .batch_read_blobs(BatchReadBlobsRequest {
+            instance_name: String::new(),
+            digests: vec![digest],
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    let blob = response
+        .responses
+        .into_iter()
+        .next()
+        .ok_or("missing blob response")?;
+    let status = blob.status.ok_or("missing blob status")?;
+    assert_eq!(status.code, 0, "blob read failed: {status:?}");
+    Ok(blob.data.to_vec())
+}
+
+/// Verifies the serialized tree and reads the copied payload from CAS.
+#[cfg(unix)]
+async fn assert_symlink_tree(channel: &Channel, tree_digest: Digest) -> TestResult {
+    let tree = Tree::decode(read_blob(channel, tree_digest).await?.as_slice())?;
+    let root = tree.root.ok_or("tree has no root")?;
+    assert_eq!(root.files.len(), 1);
+    assert_eq!(root.files[0].name, "payload");
+    let payload = root.files[0]
+        .digest
+        .clone()
+        .ok_or("payload has no digest")?;
+    assert_eq!(payload, digest_of(HELLO)?);
+    assert_eq!(read_blob(channel, payload).await?, HELLO);
+    assert!(root.symlinks.is_empty());
+    assert_eq!(root.directories.len(), 1);
+    assert_eq!(root.directories[0].name, "nested");
+    let nested_digest = root.directories[0]
+        .digest
+        .as_ref()
+        .ok_or("nested has no digest")?;
+    let nested = tree
+        .children
+        .iter()
+        .find(|child| {
+            digest_of(&child.encode_to_vec()).is_ok_and(|digest| &digest == nested_digest)
+        })
+        .ok_or("the tree does not hold the nested directory")?;
+    assert!(nested.files.is_empty());
+    assert!(nested.directories.is_empty());
+    let targets: std::collections::BTreeMap<_, _> = nested
+        .symlinks
+        .iter()
+        .map(|link| (link.name.as_str(), link.target.as_str()))
+        .collect();
+    assert_eq!(nested.symlinks.len(), 5);
+    assert_eq!(
+        targets,
+        [
+            ("absolute-dangling", "../missing"),
+            ("absolute-external", "/outside-action-root"),
+            ("absolute-internal", "../payload"),
+            ("absolute-lexical", "../payload"),
+            ("relative", "../payload"),
+        ]
+        .into_iter()
+        .collect()
+    );
+    Ok(())
+}
+
+/// Internal absolute links are rebased relative to their containing output directory.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn absolute_internal_output_symlinks_are_rebased_from_their_parent() -> TestResult {
+    let flow: Result<TestResult, _> = tokio::time::timeout(Duration::from_mins(2), async {
+        let scratch = tempfile::tempdir()?;
+        let mut harness = Harness::start().await?;
+        harness.add_worker(WorkerPaths::new(scratch.path(), "worker"), default_fleet()?)?;
+        let channel = public_channel(harness.public_port).await?;
+        let action = build_action_with(&[("ISA", "x86-64")], &[(SYMLINK_OUTPUT_ENV, "1")])?;
+        upload_blobs(&channel, action.blobs).await?;
+        let response = run_action(&channel, &action.digest).await?;
+        let status = response.status.ok_or("the response carries no status")?;
+        assert_eq!(status.code, 0, "action failed: {status:?}");
+        let result = response
+            .result
+            .ok_or("the response carries no action result")?;
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(output_digest(&result)?, Some(&digest_of(HELLO)?));
+        assert_eq!(result.output_directories.len(), 1);
+        let output = &result.output_directories[0];
+        assert_eq!(output.path, SYMLINK_OUTPUT);
+        let tree_digest = output
+            .tree_digest
+            .clone()
+            .ok_or("output has no tree digest")?;
+        assert_symlink_tree(&channel, tree_digest).await
+    })
+    .await;
+    flow.map_err(|_| "timed out waiting for the symlink output action")?
 }
 
 /// A worker-marked action still runs the ordinary entrypoint and produces its output.

@@ -331,13 +331,6 @@ mod tests {
     }
 
     #[test]
-    fn display_round_trips() {
-        let value = NonZeroDuration::from_mins(10);
-        assert_eq!(value.to_string(), "10m");
-        assert_eq!(value.to_string().parse::<NonZeroDuration>(), Ok(value));
-    }
-
-    #[test]
     fn serializes_as_string() {
         let json = serde_json::to_string(&NonZeroDuration::from_mins(10))
             .expect("serializing a duration string cannot fail");

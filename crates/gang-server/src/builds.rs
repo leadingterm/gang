@@ -57,6 +57,10 @@ impl BuildsCell {
     }
 
     /// Forwards follower observations until promotion, then folds locally.
+    ///
+    /// The process's cumulative traffic rides on every batch. The first batch leaves at once, so
+    /// the leader learns the series and its baseline early; afterwards the totals are sampled at
+    /// least every pause, so a change without calls reaches the leader within one pause.
     pub(crate) async fn record_or_forward<C: Clock, S: CertificateSignerPort, U: Uplink>(
         &self,
         mut observations: Observations,
@@ -68,30 +72,33 @@ impl BuildsCell {
         let Some(mut forwarding) = forwarding else {
             return self.record(observations, clock).await;
         };
-        let mut first_pending = None;
+        // The pause pending items wait out starts when the outbox was last empty, so anything that
+        // becomes pending, a traffic change included, leaves within one pause.
+        let mut window = clock.monotonic();
         let mut reachable = true;
+        let mut due = true;
         while !leading.get() {
-            let wait = first_pending.map_or(forwarding.pause, |first| {
-                forwarding
+            if !due {
+                let wait = forwarding
                     .pause
-                    .saturating_sub(clock.monotonic().saturating_duration_since(first))
-            });
-            let received = tokio::select! {
-                biased;
-                () = leading.wait() => break,
-                received = clock.timeout(wait, observations.next()) => received,
-            };
-            match received {
-                Ok(Some(delivery)) => {
-                    if let Some(observation) = delivery.into_observation() {
-                        forwarding.outbox.push(observation);
+                    .saturating_sub(clock.monotonic().saturating_duration_since(window));
+                let received = tokio::select! {
+                    biased;
+                    () = leading.wait() => break,
+                    received = clock.timeout(wait, observations.next()) => received,
+                };
+                match received {
+                    Ok(Some(delivery)) => {
+                        if let Some(observation) = delivery.into_observation() {
+                            forwarding.outbox.push(observation);
+                        }
                     }
+                    Ok(None) => {
+                        leading.wait().await;
+                        break;
+                    }
+                    Err(_) => due = true,
                 }
-                Ok(None) => {
-                    leading.wait().await;
-                    break;
-                }
-                Err(_) => {}
             }
             let unattributed =
                 observations.take_lost(|key, count| forwarding.outbox.lose(key, count));
@@ -107,25 +114,28 @@ impl BuildsCell {
                     observations.take_lost(|key, count| forwarding.outbox.lose(key, count));
                 forwarding.outbox.lose_unattributed(unattributed);
             }
+            forwarding
+                .outbox
+                .traffic(forwarding.start, observations.traffic());
             if leading.get() {
                 continue;
             }
             if forwarding.outbox.is_empty() {
-                first_pending = None;
+                window = clock.monotonic();
+                due = false;
                 continue;
             }
-            let first = *first_pending.get_or_insert_with(|| clock.monotonic());
-            if !forwarding.outbox.is_full()
-                && clock.monotonic().saturating_duration_since(first) < forwarding.pause
+            if !due
+                && !forwarding.outbox.is_full()
+                && clock.monotonic().saturating_duration_since(window) < forwarding.pause
             {
                 continue;
             }
+            due = false;
             forward_pending(&mut forwarding, clock, signer, leading, &mut reachable).await;
-            first_pending = if forwarding.outbox.is_empty() {
-                None
-            } else {
-                Some(first)
-            };
+            if forwarding.outbox.is_empty() {
+                window = clock.monotonic();
+            }
         }
         let (calls, lost, unattributed) = forwarding.outbox.into_local();
         let at = clock.wall();

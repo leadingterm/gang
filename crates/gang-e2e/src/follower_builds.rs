@@ -1,6 +1,7 @@
 //! Builds through follower-only public frontends and reads their accounting through each controller.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use gang_clock::{SystemClock, Timestamp};
 use gang_tls::{HttpProtocol, HttpTransport, ServerTrust};
@@ -8,6 +9,7 @@ use gang_wire::name;
 use nativelink_proto::build::bazel::remote::execution::v2::{
     Digest, GetActionResultRequest, RequestMetadata, digest_function,
 };
+use nativelink_proto::google::bytestream::{ReadRequest, WriteRequest};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
@@ -19,8 +21,9 @@ use crate::h2_frames::H2Channel;
 use crate::http::Http;
 use crate::identity::Admission;
 use crate::names::follower_builds::{
-    CONTROLLED_FOLLOWER, CONTROLLED_LEADER, CONTROLLED_MISS, FOLLOWER_ONLY_SERVE,
-    KILLED_BUILD_ABSENT, SURVIVOR_ONLY_SERVE, WARM_ZERO_USAGE,
+    CONTROLLED_BLOB, CONTROLLED_DOWNLOADED, CONTROLLED_FOLLOWER, CONTROLLED_LEADER,
+    CONTROLLED_LOOKUPS, CONTROLLED_MISS, FOLLOWER_ONLY_SERVE, KILLED_BUILD_ABSENT,
+    SURVIVOR_ONLY_SERVE, WARM_ZERO_USAGE,
 };
 use crate::server::{Presented, Request, ServerApi};
 use crate::system::Probe;
@@ -150,6 +153,103 @@ fn controlled_observe(
     latest.ok_or_else(|| E2eError::system("no controlled build observation"))
 }
 
+fn recent_traffic(
+    read: &dyn Fn(&Request) -> Result<crate::server::Answer>,
+    token: &str,
+) -> Result<(u64, u64)> {
+    let answer = read(&Request::get("/v1/state").presenting(Presented::Bearer(token.to_owned())))?;
+    if answer.status != 200 {
+        return Err(E2eError::system(format!(
+            "leader state status {}: {}",
+            answer.status,
+            answer.text()
+        )));
+    }
+    let value: Value = serde_json::from_slice(&answer.body)
+        .map_err(E2eError::system_from("parsing leader state"))?;
+    let recent = value
+        .get("recent")
+        .and_then(Value::as_object)
+        .ok_or_else(|| E2eError::system("leader state has no recent object"))?;
+    let Some(samples) = recent.get("samples") else {
+        return Ok((0, 0));
+    };
+    let samples = samples
+        .as_array()
+        .ok_or_else(|| E2eError::system("leader state samples is not an array"))?;
+    let mut totals = (0u64, 0u64);
+    for sample in samples {
+        let object = sample
+            .as_object()
+            .ok_or_else(|| E2eError::system("leader state sample is not an object"))?;
+        let count = |field| -> Result<u64> {
+            match object.get(field) {
+                None => Ok(0),
+                Some(value) => value.as_u64().ok_or_else(|| {
+                    E2eError::system(format!("leader state sample {field} is not a number"))
+                }),
+            }
+        };
+        totals.0 = totals.0.saturating_add(count("lookups")?);
+        totals.1 = totals.1.saturating_add(count("downloadedBytes")?);
+    }
+    Ok(totals)
+}
+
+fn traffic_checks(
+    stack: &crate::stack::Stack<'_>,
+    read: &dyn Fn(&Request) -> Result<crate::server::Answer>,
+    token: &str,
+    baseline: (u64, u64),
+) -> Result<Vec<Check>> {
+    let mut latest = baseline;
+    let mut failure = None;
+    let waited =
+        stack.wait_live_state(stack.settings().history_timeout, |_| {
+            match recent_traffic(read, token) {
+                Ok(totals) => {
+                    latest = totals;
+                    totals.0.saturating_sub(baseline.0) >= 1
+                        && totals.1.saturating_sub(baseline.1) >= FIXTURE.len() as u64
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    true
+                }
+            }
+        });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    if let Err(error) = waited
+        && !matches!(error, E2eError::Timeout { .. })
+    {
+        return Err(error);
+    }
+    let detail = || {
+        format!(
+            "baseline lookups {}, downloadedBytes {}; final lookups {}, downloadedBytes {}; expected increases of at least 1 and {}",
+            baseline.0,
+            baseline.1,
+            latest.0,
+            latest.1,
+            FIXTURE.len()
+        )
+    };
+    Ok(vec![
+        Check::expect(
+            CONTROLLED_LOOKUPS,
+            latest.0.saturating_sub(baseline.0) >= 1,
+            detail,
+        ),
+        Check::expect(
+            CONTROLLED_DOWNLOADED,
+            latest.1.saturating_sub(baseline.1) >= FIXTURE.len() as u64,
+            detail,
+        ),
+    ])
+}
+
 fn controlled_checks(
     cluster: &Cluster<'_>,
     client: &Http,
@@ -157,54 +257,26 @@ fn controlled_checks(
     principal: &str,
     pin: &gang_types::CaPin,
     controllers: (usize, usize),
-) -> Vec<Check> {
+) -> Result<Vec<Check>> {
     let stack = cluster.stack();
     let (leader, follower) = controllers;
-    let mut checks = Vec::with_capacity(3);
-    let controlled_rpc = (|| -> Result<Option<u32>> {
-        let config = gang_tls::client_config(
-            ServerTrust::Pin(pin),
-            None,
-            &[b"h2"],
-            Arc::new(SystemClock::new()),
-        )
-        .map_err(E2eError::system_from("configuring controlled request TLS"))?;
-        let endpoint = cluster.direct_endpoint(follower);
-        let mut channel = match H2Channel::connect(
-            Arc::new(config),
-            &endpoint,
-            Some(token),
-            stack.settings().handshake_timeout,
-        )? {
-            Admission::Accepted(channel) => channel,
-            Admission::Refused => {
-                return Err(E2eError::system("follower refused controlled connection"));
-            }
-        };
-        let request = GetActionResultRequest {
-            instance_name: String::new(),
-            action_digest: Some(Digest {
-                hash: hex::encode(Sha256::digest(FIXTURE)),
-                size_bytes: i64::try_from(FIXTURE.len())
-                    .map_err(E2eError::system_from("converting controlled fixture size"))?,
-            }),
-            digest_function: digest_function::Value::Sha256 as i32,
-            ..Default::default()
-        };
-        let metadata = RequestMetadata {
-            tool_invocation_id: CONTROLLED.to_owned(),
-            ..Default::default()
-        };
-        channel.get_action_result(&request, &metadata, stack.settings().command_timeout)
-    })();
-    checks.push(Check::expect(
-        CONTROLLED_MISS,
-        matches!(controlled_rpc, Ok(Some(5))),
-        || format!("expected gRPC status 5, got {controlled_rpc:?}"),
-    ));
+    let mut checks = Vec::with_capacity(6);
     let leader_endpoint = cluster.direct_endpoint(leader);
     let leader_read =
         |request: &Request| crate::login_across::exchange(client, &leader_endpoint, request);
+    let baseline = recent_traffic(&leader_read, token)?;
+    let controlled_rpc = controlled_rpc(cluster, token, pin, follower);
+    checks.push(Check::expect(
+        CONTROLLED_MISS,
+        matches!(controlled_rpc.as_ref(), Ok((Some(5), _))),
+        || format!("expected gRPC status 5, got {controlled_rpc:?}"),
+    ));
+    checks.push(Check::expect(
+        CONTROLLED_BLOB,
+        controlled_rpc.as_ref().is_ok_and(|(_, blob)| blob.is_ok()),
+        || format!("controlled blob round trip failed: {controlled_rpc:?}"),
+    ));
+    checks.extend(traffic_checks(stack, &leader_read, token, baseline)?);
     let controlled = controlled_observe(stack, &leader_read, token);
     checks.push(Check::expect(
         CONTROLLED_LEADER,
@@ -228,7 +300,88 @@ fn controlled_checks(
             }),
         || format!("unexpected controlled follower observation: {relayed:?}"),
     ));
-    checks
+    Ok(checks)
+}
+
+fn controlled_rpc(
+    cluster: &Cluster<'_>,
+    token: &str,
+    pin: &gang_types::CaPin,
+    follower: usize,
+) -> Result<(Option<u32>, Result<()>)> {
+    let stack = cluster.stack();
+    let config = gang_tls::client_config(
+        ServerTrust::Pin(pin),
+        None,
+        &[b"h2"],
+        Arc::new(SystemClock::new()),
+    )
+    .map_err(E2eError::system_from("configuring controlled request TLS"))?;
+    let endpoint = cluster.direct_endpoint(follower);
+    let mut channel = match H2Channel::connect(
+        Arc::new(config),
+        &endpoint,
+        Some(token),
+        stack.settings().handshake_timeout,
+    )? {
+        Admission::Accepted(channel) => channel,
+        Admission::Refused => {
+            return Err(E2eError::system("follower refused controlled connection"));
+        }
+    };
+    let request = GetActionResultRequest {
+        instance_name: String::new(),
+        action_digest: Some(Digest {
+            hash: hex::encode(Sha256::digest(FIXTURE)),
+            size_bytes: i64::try_from(FIXTURE.len())
+                .map_err(E2eError::system_from("converting controlled fixture size"))?,
+        }),
+        digest_function: digest_function::Value::Sha256 as i32,
+        ..Default::default()
+    };
+    let metadata = RequestMetadata {
+        tool_invocation_id: CONTROLLED.to_owned(),
+        ..Default::default()
+    };
+    let status =
+        channel.get_action_result(&request, &metadata, stack.settings().command_timeout)?;
+    let blob = (|| -> Result<()> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(E2eError::system_from("generating upload identifier"))?
+            .as_nanos();
+        let hash = hex::encode(Sha256::digest(FIXTURE));
+        let blob = format!("blobs/{hash}/{}", FIXTURE.len());
+        let write = WriteRequest {
+            resource_name: format!("uploads/{unique:x}-{:x}/{blob}", std::process::id()),
+            write_offset: 0,
+            finish_write: true,
+            data: bytes::Bytes::from_static(FIXTURE),
+        };
+        let committed = channel.write_blob(&write, &metadata, stack.settings().command_timeout)?;
+        if committed
+            != i64::try_from(FIXTURE.len())
+                .map_err(E2eError::system_from("converting controlled fixture size"))?
+        {
+            return Err(E2eError::system(format!(
+                "ByteStream committed {committed} bytes"
+            )));
+        }
+        let read = ReadRequest {
+            resource_name: blob,
+            read_offset: 0,
+            read_limit: 0,
+        };
+        let data = channel.read_blob(&read, &metadata, stack.settings().command_timeout)?;
+        if data != FIXTURE {
+            return Err(E2eError::system(format!(
+                "ByteStream returned {} unexpected bytes",
+                data.len()
+            )));
+        }
+        Ok(())
+    })();
+    Ok((status, blob))
 }
 
 fn observed_checks(
@@ -339,7 +492,7 @@ pub fn follower_builds(cluster: &Cluster<'_>) -> Result<Vec<Check>> {
         &principal,
         &pin,
         (leader, followers[0]),
-    ));
+    )?);
 
     let cold = build(A)?;
     stack.bazel().clean(&remote)?;

@@ -8,6 +8,9 @@
 //! release-first instances are drained before the others. When demand returns, the others are
 //! resumed before the release-first ones.
 
+use std::ops::Range;
+use std::time::Duration;
+
 use gang_clock::{Tick, Timestamp};
 use gang_config::FleetPolicy;
 use gang_spi::{FleetInstance, FleetSupply, WorkerState};
@@ -21,6 +24,7 @@ use crate::hosted_snapshot::HostedSnapshot;
 use crate::observations::{Observations, Seen};
 use crate::pass_time::PassTime;
 use crate::plan::{Action, NeedCause, Plan, PlanStep, TerminationCause};
+use crate::wait::{Capacity, WorkPlanner};
 
 /// A serving worker that may be drained, with the tick since which it has been idle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +155,14 @@ struct Census {
     release_first: u32,
 }
 
+#[derive(Debug, Default)]
+struct FleetCensus {
+    census: Census,
+    candidates: Range<usize>,
+    draining: Range<usize>,
+    orphans: usize,
+}
+
 /// One fleet's inputs for the pass: its index in the `fleets` slice, its policy, its provisioner
 /// supply, the instances needed after applying the minimum in force, and what sets that need.
 #[derive(Debug, Clone, Copy)]
@@ -193,6 +205,13 @@ pub struct Reconciler {
     draining: Vec<Draining>,
     /// The tick of this reconciler's first pass; `None` until it has run one.
     first_pass: Option<Tick>,
+    first_wall: Option<Timestamp>,
+    planner: WorkPlanner,
+    capacities: Vec<Capacity>,
+    census: Vec<FleetCensus>,
+    readiness: Vec<Option<Duration>>,
+    stream: Vec<bool>,
+    orphan_plan: Plan,
 }
 
 impl Reconciler {
@@ -205,11 +224,29 @@ impl Reconciler {
             .iter()
             .map(|policy| policy.instances.max().get() as usize)
             .sum();
+        let mut observations = Observations::new(fleets.len());
+        observations.reserve_readiness(fleets.iter().map(|p| p.instances.max().get() as usize));
         Self {
-            observations: Observations::new(fleets.len()),
+            observations,
             candidates: Vec::with_capacity(capacity),
             draining: Vec::with_capacity(capacity),
             first_pass: None,
+            first_wall: None,
+            planner: WorkPlanner::new(fleets),
+            capacities: fleets
+                .iter()
+                .map(|p| Capacity {
+                    live: 0,
+                    standing: 0,
+                    reliable: 0,
+                    draining: 0,
+                    instances: Vec::with_capacity(p.instances.max().get() as usize),
+                })
+                .collect(),
+            census: (0..fleets.len()).map(|_| FleetCensus::default()).collect(),
+            readiness: vec![None; fleets.len()],
+            stream: vec![false; fleets.len()],
+            orphan_plan: Plan::new(),
         }
     }
 
@@ -270,6 +307,7 @@ impl Reconciler {
         plan: &mut Plan,
     ) {
         let PassTime { wall, now } = time;
+        self.first_wall.get_or_insert(wall);
         let first_pass = *self.first_pass.get_or_insert(now);
         let demand_settled = now.saturating_duration_since(first_pass) >= CLIENT_REROUTE_BOUND;
         let snapshot = hosted.snapshot();
@@ -277,6 +315,13 @@ impl Reconciler {
         plan.at = wall;
 
         self.observations.begin_pass();
+        self.planner.begin_pass();
+        self.candidates.clear();
+        self.draining.clear();
+        self.stream.fill(false);
+        for capacity in &mut self.capacities {
+            capacity.instances.clear();
+        }
         for fleet in fleets.iter_mut() {
             fleet.outlook = FleetOutlook::default();
             fleet.past_boot_grace.clear();
@@ -286,9 +331,10 @@ impl Reconciler {
         }
         for worker in &snapshot.workers {
             let activity = Activity::from(worker);
-            if let Some(fleet) = fleets
+            if let Some((index, fleet)) = fleets
                 .iter_mut()
-                .find(|fleet| fleet.policy.name == worker.fleet)
+                .enumerate()
+                .find(|(_, fleet)| fleet.policy.name == worker.fleet)
             {
                 let counts = &mut fleet.outlook.workers;
                 let count = match activity {
@@ -299,6 +345,7 @@ impl Reconciler {
                 *count = count.saturating_add(1);
                 counts.running = counts.running.saturating_add(worker.running_actions);
                 if activity != Activity::Draining {
+                    self.stream[index] = true;
                     fleet.outlook.demand.add_running(worker.running_actions);
                 }
             }
@@ -314,6 +361,7 @@ impl Reconciler {
                     .get(index)
                     .map(|fleet| (&fleet.policy, fleet.outlook.demand))
             });
+            self.planner.attribute(chosen);
             if let Some(fleet) = chosen.and_then(|index| fleets.get_mut(index)) {
                 fleet.outlook.demand.add_queued(action.resources);
                 fleet.outlook.queued = fleet.outlook.queued.saturating_add(1);
@@ -326,10 +374,19 @@ impl Reconciler {
             now,
             demand_settled,
         };
+        let mut orphan_plan = std::mem::take(&mut self.orphan_plan);
+        self.classify_all(fleets, &pass, &mut orphan_plan);
+        self.planner.plan(
+            fleets,
+            hosted,
+            time,
+            &self.capacities,
+            &self.readiness,
+            &self.stream,
+        );
+        let mut orphans = orphan_plan.steps.drain(..);
         for (index, fleet) in fleets.iter_mut().enumerate() {
-            let work = fleet.outlook.demand.instances(&fleet.policy);
-            fleet.outlook.minimum = fleet.policy.instances.min_at(wall);
-            fleet.outlook.needed = work.max(fleet.outlook.minimum);
+            let work = self.planner.work(index);
             let need = if work < fleet.outlook.needed {
                 NeedCause::Minimum
             } else {
@@ -342,16 +399,65 @@ impl Reconciler {
                 needed: fleet.outlook.needed,
                 need,
             };
-            self.reconcile_fleet(
-                &pass,
+            let planned = plan.steps.len();
+            plan.steps
+                .extend(orphans.by_ref().take(self.census[index].orphans));
+            self.reconcile_fleet(&pass, &view, planned, plan);
+        }
+        drop(orphans);
+        self.orphan_plan = orphan_plan;
+
+        self.observations.finish_pass();
+    }
+
+    /// Classifies every fleet before planning so the simulation sees the whole census.
+    fn classify_all(&mut self, fleets: &mut [FleetPass], pass: &Pass<'_>, orphan_plan: &mut Plan) {
+        orphan_plan.steps.clear();
+        for (index, fleet) in fleets.iter_mut().enumerate() {
+            fleet.outlook.minimum = fleet.policy.instances.min_at(pass.wall);
+            let view = FleetView {
+                index,
+                policy: &fleet.policy,
+                supply: &fleet.supply,
+                needed: 0,
+                need: NeedCause::Demand,
+            };
+            let candidate_start = self.candidates.len();
+            let draining_start = self.draining.len();
+            let orphan_start = orphan_plan.steps.len();
+            let census = self.classify(
+                pass,
                 &view,
                 &mut fleet.past_boot_grace,
                 &mut fleet.outlook.workers,
-                plan,
+                orphan_plan,
+            );
+            self.capacities[index].live = census.live;
+            self.capacities[index].standing = census
+                .capacity
+                .saturating_add(fleet.supply.desired.saturating_sub(census.live));
+            self.capacities[index].reliable = if fleet.supply.launch_failure.is_some() {
+                census.capacity
+            } else {
+                self.capacities[index].standing
+            };
+            self.capacities[index].draining =
+                (self.draining.len() - draining_start).saturating_into();
+            self.census[index] = FleetCensus {
+                census,
+                candidates: candidate_start..self.candidates.len(),
+                draining: draining_start..self.draining.len(),
+                orphans: orphan_plan.steps.len() - orphan_start,
+            };
+            let readiness = self.observations.readiness(index);
+            self.readiness[index] = readiness;
+            self.stream[index] = self.observations.stream(
+                index,
+                fleet.outlook.queued > 0 && self.stream[index],
+                pass.now,
+                readiness.unwrap_or(fleet.policy.boot_grace),
             );
         }
-
-        self.observations.finish_pass();
     }
 
     /// Reports that the termination ordered for `instance` was not applied, so the next pass
@@ -397,22 +503,19 @@ impl Reconciler {
         &mut self,
         pass: &Pass<'_>,
         view: &FleetView<'_>,
-        past_boot_grace: &mut [bool],
-        workers: &mut WorkerCounts,
+        planned: usize,
         plan: &mut Plan,
     ) {
-        let planned = plan.steps.len();
-        self.candidates.clear();
-        self.draining.clear();
-        let Census {
-            live,
-            capacity: serving,
-            release_first,
-        } = self.classify(pass, view, past_boot_grace, workers, plan);
+        let Census { release_first, .. } = self.census[view.index].census;
+        let capacity = &self.capacities[view.index];
+        let live = capacity.live;
+        let standing = capacity.standing;
+        let reliable = capacity.reliable;
+        let draining = capacity.draining;
+        let range = self.census[view.index].draining.clone();
 
         let workers = &pass.hosted.snapshot().workers;
-        let draining: u32 = self.draining.len().saturating_into();
-        self.draining.sort_unstable_by(|a, b| {
+        self.draining[range].sort_unstable_by(|a, b| {
             b.running
                 .cmp(&a.running)
                 .then_with(|| a.release_first.cmp(&b.release_first))
@@ -421,13 +524,7 @@ impl Reconciler {
 
         // Instances the provisioner was asked for but has not launched yet.
         let unborn = view.supply.desired.saturating_sub(live);
-        // The capacity before any draining worker is resumed.
-        let standing = serving.saturating_add(unborn);
-        let reliable = if view.supply.launch_failure.is_some() {
-            serving
-        } else {
-            standing
-        };
+        // The capacity before any draining worker is resumed comes from the census.
         let resume = view.needed.saturating_sub(reliable).min(draining);
         self.resume_and_terminate(pass, view, resume, plan);
         let terminated: u32 = plan.steps[planned..]
@@ -505,6 +602,7 @@ impl Reconciler {
             ) == Standing::Capacity
             {
                 census.capacity += 1;
+                self.capacities[view.index].instances.push(position);
                 if instance.release_first {
                     census.release_first += 1;
                 }
@@ -553,6 +651,14 @@ impl Reconciler {
             .observations
             .observe_instance(view.index, &instance.id, unserved, pass.now);
         let launched_for = pass.wall.saturating_duration_since(instance.launched_at);
+        if !matches!(activity, HostedActivity::Unconnected) {
+            let sample = self
+                .first_wall
+                .filter(|first| instance.launched_at >= *first)
+                .map(|_| launched_for);
+            self.observations
+                .observe_connection(view.index, &instance.id, sample);
+        }
         let past_grace = unserved
             && launched_for >= policy.boot_grace
             && seen.unserved_since.is_some_and(|since| {
@@ -627,14 +733,15 @@ impl Reconciler {
     ) {
         let resumed: usize = resume.saturating_into();
         let workers = &pass.hosted.snapshot().workers;
-        for draining in &self.draining[..resumed] {
+        let draining = &self.draining[self.census[view.index].draining.clone()];
+        for draining in &draining[..resumed] {
             plan.steps.push(PlanStep {
                 fleet: view.index,
                 action: Action::CancelDrain(workers[draining.worker].id.clone(), view.need),
             });
         }
 
-        for draining in &self.draining[resumed..] {
+        for draining in &draining[resumed..] {
             let Some(cause) = draining.end else {
                 continue;
             };
@@ -666,20 +773,21 @@ impl Reconciler {
         let surplus: usize = surplus.saturating_into();
         let release_first_capacity: usize = release_first_capacity.saturating_into();
         let workers = &pass.hosted.snapshot().workers;
-        self.candidates.sort_unstable_by(|a, b| {
+        let candidates = &mut self.candidates[self.census[view.index].candidates.clone()];
+        candidates.sort_unstable_by(|a, b| {
             b.release_first
                 .cmp(&a.release_first)
                 .then_with(|| a.since.cmp(&b.since))
                 .then_with(|| workers[a.worker].id.cmp(&workers[b.worker].id))
         });
-        let release_first_len = self.candidates.partition_point(|c| c.release_first);
+        let release_first_len = candidates.partition_point(|c| c.release_first);
         let first = surplus.min(release_first_len);
         let rest = surplus
             .saturating_sub(release_first_capacity)
-            .min(self.candidates.len() - release_first_len);
-        let drained = self.candidates[..first]
+            .min(candidates.len() - release_first_len);
+        let drained = candidates[..first]
             .iter()
-            .chain(&self.candidates[release_first_len..release_first_len + rest]);
+            .chain(&candidates[release_first_len..release_first_len + rest]);
         for candidate in drained {
             plan.steps.push(PlanStep {
                 fleet: view.index,

@@ -8,7 +8,9 @@ use std::time::Duration;
 use gang_clock::Timestamp;
 use gang_config::BuildsConfig;
 use gang_insight::{BuildFilter, Builds};
-use gang_spi::{Call, CallOutcome, Executed, ExecutionTimes, Observation, Origin, Phase, Rpc};
+use gang_spi::{
+    Call, CallOutcome, Executed, ExecutionTimes, Observation, Origin, Phase, Rpc, Transferred,
+};
 use gang_types::BuildKey;
 use gang_wire::BuildState;
 
@@ -32,6 +34,7 @@ fn call(origin: &Origin, rpc: Rpc, outcome: CallOutcome) -> Observation {
         origin: origin.clone(),
         rpc,
         outcome,
+        transferred: Transferred::default(),
     })
 }
 fn executed(origin: &Origin, start: u64, span: u64, exit_code: i32) -> Observation {
@@ -333,6 +336,83 @@ fn mnemonic_cap_and_call_outcomes() {
             row.usage.cache.uploaded_results
         ),
         (1, 1, 1)
+    );
+}
+
+#[test]
+fn transferred_bytes_fold_into_each_usage_without_cas_counters() {
+    let config = BuildsConfig {
+        mnemonics: NonZeroUsize::new(1).unwrap(),
+        ..BuildsConfig::default()
+    };
+    let mut builds = Builds::new(&config);
+    let mut o = origin("alice", "bytes").unwrap();
+    o.mnemonic = Some("first".parse().unwrap());
+    for outcome in [CallOutcome::Ok, CallOutcome::NotFound, CallOutcome::Error] {
+        builds.observe(
+            time(0),
+            &Observation::Call(Call {
+                origin: o.clone(),
+                rpc: Rpc::Cas,
+                outcome,
+                transferred: Transferred {
+                    uploaded: 7,
+                    downloaded: 11,
+                },
+            }),
+        );
+    }
+    o.mnemonic = Some("overflow".parse().unwrap());
+    builds.observe(
+        time(1),
+        &Observation::Call(Call {
+            origin: o.clone(),
+            rpc: Rpc::GetActionResult,
+            outcome: CallOutcome::Ok,
+            transferred: Transferred {
+                uploaded: 2,
+                downloaded: 3,
+            },
+        }),
+    );
+    let row = builds.get(o.build.id(), time(1)).unwrap();
+    let cache = &row.usage.cache;
+    assert_eq!((cache.uploaded_bytes, cache.downloaded_bytes), (23, 36));
+    assert_eq!(
+        (
+            cache.hits,
+            cache.misses,
+            cache.errors,
+            cache.uploaded_results
+        ),
+        (1, 0, 0, 0)
+    );
+    assert_eq!(
+        (
+            row.usage.executions.execute_calls,
+            row.usage.executions.rejected
+        ),
+        (0, 0)
+    );
+    let cache = &row.mnemonics[0].usage.cache;
+    assert_eq!(
+        (
+            cache.uploaded_bytes,
+            cache.downloaded_bytes,
+            cache.hits,
+            cache.misses,
+            cache.errors
+        ),
+        (21, 33, 0, 0, 0)
+    );
+    let other = row.other_mnemonics.unwrap();
+    assert_eq!(
+        (
+            other.cache.uploaded_bytes,
+            other.cache.downloaded_bytes,
+            other.cache.hits
+        ),
+        (2, 3, 1)
     );
 }
 

@@ -21,6 +21,7 @@
 in
   pkgs.testers.runNixOSTest {
     name = "action-tools";
+    globalTimeout = 300;
 
     nodeDefaults.virtualisation = {
       memorySize = 1024;

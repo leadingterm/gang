@@ -203,15 +203,25 @@ fn phase_duration(phase: Option<Phase>) -> Duration {
 
 fn fold_usage(usage: &mut Usage, observation: &Observation) {
     match observation {
-        Observation::Call(call) => match (call.rpc, call.outcome) {
-            (Rpc::GetActionResult, CallOutcome::Ok) => usage.cache.hits += 1,
-            (Rpc::GetActionResult, CallOutcome::NotFound) => usage.cache.misses += 1,
-            (Rpc::GetActionResult, CallOutcome::Error) => usage.cache.errors += 1,
-            (Rpc::UpdateActionResult, CallOutcome::Ok) => usage.cache.uploaded_results += 1,
-            (Rpc::Execute, CallOutcome::Ok) => usage.executions.execute_calls += 1,
-            (Rpc::Execute, _) => usage.executions.rejected += 1,
-            (Rpc::UpdateActionResult, _) => {}
-        },
+        Observation::Call(call) => {
+            usage.cache.uploaded_bytes = usage
+                .cache
+                .uploaded_bytes
+                .saturating_add(call.transferred.uploaded);
+            usage.cache.downloaded_bytes = usage
+                .cache
+                .downloaded_bytes
+                .saturating_add(call.transferred.downloaded);
+            match (call.rpc, call.outcome) {
+                (Rpc::GetActionResult, CallOutcome::Ok) => usage.cache.hits += 1,
+                (Rpc::GetActionResult, CallOutcome::NotFound) => usage.cache.misses += 1,
+                (Rpc::GetActionResult, CallOutcome::Error) => usage.cache.errors += 1,
+                (Rpc::UpdateActionResult, CallOutcome::Ok) => usage.cache.uploaded_results += 1,
+                (Rpc::Execute, CallOutcome::Ok) => usage.executions.execute_calls += 1,
+                (Rpc::Execute, _) => usage.executions.rejected += 1,
+                (Rpc::UpdateActionResult | Rpc::Cas, _) => {}
+            }
+        }
         Observation::Executed(executed) => {
             if executed.exit_code == 0 && !executed.error {
                 usage.executions.completed += 1;
@@ -232,7 +242,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use gang_spi::{Call, Executed, ExecutionTimes, Origin};
+    use gang_spi::{Call, Executed, ExecutionTimes, Origin, Transferred};
 
     #[test]
     fn flood_preserves_record_vector_capacities() {
@@ -256,6 +266,7 @@ mod tests {
                 origin: origin.clone(),
                 rpc: Rpc::GetActionResult,
                 outcome: CallOutcome::NotFound,
+                transferred: Transferred::default(),
             });
             record.observe(at, &call);
             let times = ExecutionTimes {

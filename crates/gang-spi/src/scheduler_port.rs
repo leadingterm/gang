@@ -118,14 +118,37 @@ pub trait SchedulerPort: Send + Sync {
 pub struct SchedulerSnapshot {
     /// Actions that reached a terminal result on a worker since the controller started. Monotonic.
     pub completed: u64,
-    /// `GetActionResult` calls the controller answered since it started. Monotonic.
-    pub lookups: u64,
-    /// Of `lookups`, those answered with a result: remote cache hits. Monotonic.
-    pub hits: u64,
     /// The connected workers, with unique ids sorted by `WorkerId` ascending.
     pub workers: Vec<WorkerState>,
     /// The queued actions, highest priority first, then oldest.
     pub queued: Vec<QueuedDemand>,
+    /// Executing actions, referring to workers by their index in `workers`.
+    pub executing: Vec<ExecutingDemand>,
+    /// Engine-bounded stores and their cumulative eviction counters.
+    pub stores: Vec<EngineStore>,
+}
+
+/// A bounded engine store's usage and cumulative evictions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EngineStore {
+    /// The store's role.
+    pub store: StoreKind,
+    /// Bytes currently held.
+    pub used: u64,
+    /// Eviction budget in bytes.
+    pub budget: u64,
+    /// Bytes evicted since the engine started.
+    pub evicted: u64,
+}
+
+/// The role of an engine-bounded store.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StoreKind {
+    /// The content-addressed store.
+    #[default]
+    Content,
+    /// The action cache.
+    Action,
 }
 
 /// A connected worker.
@@ -160,6 +183,19 @@ pub struct QueuedDemand {
     pub queued_since: Timestamp,
     /// Scheduling priority; higher runs first.
     pub priority: i32,
+    /// Learned mean slot time, or `None` when no history is available.
+    pub expected: Option<Duration>,
+}
+
+/// An action executing on a connected worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutingDemand {
+    /// Index into the snapshot's workers, sorted by worker ID.
+    pub worker: usize,
+    /// When execution started.
+    pub started: Timestamp,
+    /// Learned mean slot time, or `None` when no history is available.
+    pub expected: Option<Duration>,
 }
 
 /// Limits on how many actions [`SchedulerPort::actions`] returns.

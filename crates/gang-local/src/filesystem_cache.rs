@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use gang_os::fs::{ensure_private_dir, require_private_dir, space};
-use gang_spi::{CacheStorePort, Plugin, PluginContext, PortError, RenderedStoreSpec, StoreAccess};
+use gang_spi::{
+    CacheStorePort, MeasuredUsage, Plugin, PluginContext, PortError, RenderedStoreSpec, StoreAccess,
+};
 use gang_types::{AbsolutePathBuf, Bytes, Percent};
 use serde::{Deserialize, Serialize};
 
@@ -137,6 +139,10 @@ impl CacheStorePort for FilesystemCache {
     fn worker_access(&self) -> StoreAccess {
         StoreAccess::ViaController
     }
+
+    async fn measured_usage(&self) -> Result<Option<MeasuredUsage>, PortError> {
+        Ok(None)
+    }
 }
 
 /// The eviction budgets of the content store and the action cache: the given shares of
@@ -230,6 +236,16 @@ mod tests {
 
     fn parse(value: serde_json::Value) -> Result<FilesystemCacheConfig, serde_json::Error> {
         serde_json::from_value(value)
+    }
+
+    #[tokio::test]
+    async fn filesystem_has_no_provider_measurement() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("cache");
+        let cache = FilesystemCache::build(config(&root), &plugin_context())?;
+        assert_eq!(cache.measured_usage().await?, None);
+        assert!(!root.exists());
+        Ok(())
     }
 
     #[test]

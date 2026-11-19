@@ -1,11 +1,15 @@
 //! Two authenticated Bazel invocations, cold then warm, appear as distinct builds with their
 //! principal, cache and execution usage, and ordered timestamps visible to the administrator.
 
+use std::fs;
 use std::time::Duration;
 
 use gang_clock::Timestamp;
+use gang_config::Document;
+use gang_main::plugins::{CacheConfig, Plugins};
 use gang_wire::name;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::bazel::Bazel;
 use crate::check::Check;
@@ -13,6 +17,7 @@ use crate::errors::{E2eError, Result};
 use crate::flags::Remote;
 use crate::issuer::TestIssuer;
 use crate::names;
+use crate::sample::{CACHE_INPUT_FILE, CACHE_INPUT_SIZE, CACHE_OUTPUT_PREFIX, cache_input};
 use crate::secured::Secured;
 use crate::server::{Answer, Presented, Request, ServerApi};
 use crate::settings::DeploymentInputs;
@@ -21,7 +26,8 @@ use crate::verdict;
 
 const COLD_ID: &str = "11111111-1111-4111-8111-111111111111";
 const WARM_ID: &str = "22222222-2222-4222-8222-222222222222";
-const PROBES: &[Probe] = &[Probe::Pinned];
+const PROBES: &[Probe] = &[Probe::CacheVisibility];
+const MAX_BATCH_BYTES: usize = 65_536;
 const HTTP_OK: u16 = 200;
 
 /// Runs the cold and warm builds and checks their administrator-visible accounting.
@@ -55,6 +61,10 @@ pub(crate) fn builds(
             stack.placement().bazel_root(),
         )
     };
+    let (cas_budget, ac_budget) = filesystem_budgets(stack)?;
+    let before = store_baseline(stack, invocation.settings.history_timeout)?;
+    let (input_digest, expected_digest) = stage_cache_input(stack)?;
+    let output_size = CACHE_OUTPUT_PREFIX.len() + CACHE_INPUT_SIZE;
     let cold_driver = driver(COLD_ID);
     let (_sender, receiver) = tokio::sync::oneshot::channel();
     let cold = cold_driver.build_until(&remote, PROBES, None, receiver)?;
@@ -62,28 +72,48 @@ pub(crate) fn builds(
     let warm_driver = driver(WARM_ID);
     let (_sender, receiver) = tokio::sync::oneshot::channel();
     let warm = warm_driver.build_until(&remote, PROBES, None, receiver)?;
+    let report_path = stack
+        .placement()
+        .workspace()
+        .join(Probe::CacheVisibility.report_path());
+    let report = fs::read(&report_path)
+        .map_err(E2eError::io(format!("reading {}", report_path.display())))?;
+    let actual_digest: [u8; 32] = Sha256::digest(&report).into();
+    let blob_ok = CACHE_INPUT_SIZE > MAX_BATCH_BYTES
+        && expected_digest != input_digest
+        && report.len() == output_size
+        && actual_digest == expected_digest;
+    let after = wait_for_growth(stack, invocation.settings.history_timeout, &before)?;
     let mut checks = vec![
         verdict::remote_execution(&cold, 1, stack.stderr_tail_lines()),
         verdict::cache_hit(&warm, 1, stack.stderr_tail_lines()),
     ];
-    let cold = observe(
+    checks.push(Check::expect(names::builds::BLOB_THRESHOLD, blob_ok, || {
+        format!("expected {output_size} bytes with digest {}; got {} bytes with digest {}; batch threshold {MAX_BATCH_BYTES}",
+            hex::encode(expected_digest), report.len(), hex::encode(actual_digest))
+    }));
+    checks.extend(store_checks(&before, &after, cas_budget, ac_budget));
+    let cold = observe_transfers(
         stack,
         &|request: &Request| ServerApi::send(stack, request),
         &credentials.token,
         COLD_ID,
         true,
         invocation.settings.history_timeout,
+        output_size as u64,
     )?;
-    let warm = observe(
+    let warm = observe_transfers(
         stack,
         &|request: &Request| ServerApi::send(stack, request),
         &credentials.token,
         WARM_ID,
         false,
         invocation.settings.history_timeout,
+        output_size as u64,
     )?;
     checks.extend(build_checks(&cold, true, &expected_principal));
     checks.extend(build_checks(&warm, false, &expected_principal));
+    checks.extend(transfer_checks(&cold, &warm, output_size as u64));
     checks.push(Check::expect(
         names::builds::DISTINCT,
         listed_name(&cold.list)
@@ -100,6 +130,69 @@ pub(crate) fn builds(
     Ok(checks)
 }
 
+fn stage_cache_input(stack: &crate::stack::Stack<'_>) -> Result<([u8; 32], [u8; 32])> {
+    let input = cache_input();
+    let input_path = stack.placement().workspace().join(CACHE_INPUT_FILE);
+    fs::write(&input_path, &input)
+        .map_err(E2eError::io(format!("writing {}", input_path.display())))?;
+    let input_digest = Sha256::digest(&input).into();
+    let mut expected = Sha256::new();
+    expected.update(CACHE_OUTPUT_PREFIX);
+    expected.update(&input);
+    Ok((input_digest, expected.finalize().into()))
+}
+
+fn store_baseline(stack: &crate::stack::Stack<'_>, timeout: Duration) -> Result<Value> {
+    let state = stack.wait_live_state(timeout, |state| {
+        serde_json::to_value(state)
+            .ok()
+            .is_some_and(|value| store(&value, "CAS").is_some() && store(&value, "AC").is_some())
+    })?;
+    serde_json::to_value(state).map_err(E2eError::system_from("encoding baseline state"))
+}
+fn filesystem_budgets(stack: &crate::stack::Stack<'_>) -> Result<(u64, u64)> {
+    let config_path = stack.placement().config_file();
+    let config = fs::read_to_string(&config_path)
+        .map_err(E2eError::io(format!("reading {}", config_path.display())))?;
+    let document = Document::<Plugins>::parse(&config).map_err(E2eError::parse("gang.toml"))?;
+    let CacheConfig::Filesystem(cache) = document.cache else {
+        return Err(E2eError::system(
+            "build accounting requires a filesystem cache",
+        ));
+    };
+    let capacity = gang_os::fs::space(cache.path.as_path())
+        .map_err(E2eError::system_from("measuring the cache filesystem"))?
+        .total;
+    Ok((
+        cache.content_store_percent.of_bytes(capacity).get(),
+        cache.action_store_percent.of_bytes(capacity).get(),
+    ))
+}
+
+fn wait_for_growth(
+    stack: &crate::stack::Stack<'_>,
+    timeout: Duration,
+    before: &Value,
+) -> Result<Value> {
+    let mut after = None;
+    let waited = stack.wait_live_state(timeout, |state| {
+        let value = serde_json::to_value(state).ok();
+        let grown = value
+            .as_ref()
+            .and_then(|value| store(value, "CAS"))
+            .zip(store(before, "CAS"))
+            .is_some_and(|(after, before)| after.0 > before.0);
+        after = value;
+        grown
+    });
+    match waited {
+        Ok(_) | Err(E2eError::Timeout { .. }) if after.is_some() => {}
+        Err(error) => return Err(error),
+        Ok(_) => return Err(E2eError::system("no post-build state")),
+    }
+    after.ok_or_else(|| E2eError::system("no post-build state"))
+}
+
 /// The last list and detail responses, including failures for diagnostic checks.
 pub(crate) struct Observed {
     pub(crate) list: Answer,
@@ -114,6 +207,30 @@ pub(crate) fn observe(
     id: &str,
     cold: bool,
     timeout: Duration,
+) -> Result<Observed> {
+    observe_with_transfer(stack, read, token, id, cold, timeout, None)
+}
+
+fn observe_transfers(
+    stack: &crate::stack::Stack<'_>,
+    read: &dyn Fn(&Request) -> Result<Answer>,
+    token: &str,
+    id: &str,
+    cold: bool,
+    timeout: Duration,
+    output_size: u64,
+) -> Result<Observed> {
+    observe_with_transfer(stack, read, token, id, cold, timeout, Some(output_size))
+}
+
+fn observe_with_transfer(
+    stack: &crate::stack::Stack<'_>,
+    read: &dyn Fn(&Request) -> Result<Answer>,
+    token: &str,
+    id: &str,
+    cold: bool,
+    timeout: Duration,
+    output_size: Option<u64>,
 ) -> Result<Observed> {
     let mut previous_usage = None;
     let mut latest = None;
@@ -149,8 +266,9 @@ pub(crate) fn observe(
             checks.get(1).is_some_and(Check::is_passed)
         };
         let stable = stable_usage(&mut previous_usage, &observed);
+        let traffic_ready = output_size.is_none_or(|size| transfer_ready(&observed, cold, size));
         latest = Some(observed);
-        ready && stable
+        ready && stable && traffic_ready
     });
     if let Some(error) = failure {
         return Err(error);
@@ -162,6 +280,85 @@ pub(crate) fn observe(
         Err(error) => Err(error),
         Ok(_) => Err(E2eError::system("no build observation")),
     }
+}
+
+fn cache_bytes(observed: &Observed, field: &str) -> Option<u64> {
+    let detail = observed
+        .detail
+        .as_ref()
+        .filter(|answer| answer.status == HTTP_OK)?;
+    let json: Value = serde_json::from_slice(&detail.body).ok()?;
+    json.pointer(&format!("/usage/cache/{field}"))?.as_u64()
+}
+
+fn transfer_ready(observed: &Observed, cold: bool, output_size: u64) -> bool {
+    let downloaded = cache_bytes(observed, "downloadedBytes");
+    if cold {
+        cache_bytes(observed, "uploadedBytes").is_some_and(|value| value > 0)
+            && downloaded.is_some_and(|value| value > 0)
+    } else {
+        downloaded.is_some_and(|value| value >= output_size)
+    }
+}
+
+fn transfer_checks(cold: &Observed, warm: &Observed, output_size: u64) -> Vec<Check> {
+    vec![
+        Check::expect(
+            names::builds::COLD_BYTES,
+            transfer_ready(cold, true, output_size),
+            || {
+                format!(
+                    "expected positive cold uploaded and downloaded bytes; detail: {:?}",
+                    cold.detail.as_ref().map(Answer::text)
+                )
+            },
+        ),
+        Check::expect(
+            names::builds::WARM_BYTES,
+            transfer_ready(warm, false, output_size),
+            || {
+                format!(
+                    "expected at least {output_size} warm downloaded bytes; detail: {:?}",
+                    warm.detail.as_ref().map(Answer::text)
+                )
+            },
+        ),
+    ]
+}
+
+fn store(state: &Value, name: &str) -> Option<(u64, u64)> {
+    let row = state
+        .pointer("/cache/stores")?
+        .as_array()?
+        .iter()
+        .find(|row| row.get("store").and_then(Value::as_str) == Some(name))?;
+    Some((
+        row.get("usedBytes")?.as_u64()?,
+        row.get("budgetBytes")?.as_u64()?,
+    ))
+}
+
+fn store_checks(before: &Value, after: &Value, cas_budget: u64, ac_budget: u64) -> Vec<Check> {
+    let cas = store(after, "CAS");
+    let ac = store(after, "AC");
+    let baseline = store(before, "CAS");
+    vec![
+        Check::expect(
+            names::builds::ENGINE_BUDGETS,
+            cas.is_some_and(|row| row.1 == cas_budget) && ac.is_some_and(|row| row.1 == ac_budget),
+            || {
+                format!(
+                    "expected CAS budget {cas_budget} and AC budget {ac_budget}; state: {after}"
+                )
+            },
+        ),
+        Check::expect(
+            names::builds::CAS_GROWTH,
+            cas.zip(baseline)
+                .is_some_and(|(after, before)| after.0 > before.0),
+            || format!("expected CAS used bytes to grow; baseline: {before}; post-build: {after}"),
+        ),
+    ]
 }
 
 /// Whether this successful detail has the same usage as the previous successful detail.
@@ -291,6 +488,15 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn cache_input_is_deterministic_and_exceeds_batch_limit() {
+        let input = cache_input();
+        assert_eq!(input.len(), CACHE_INPUT_SIZE);
+        assert!(input.len() > MAX_BATCH_BYTES);
+        assert_ne!(&input[..32], &input[32..64]);
+        assert_eq!(input, cache_input());
+    }
+
     fn observed(detail: &Value) -> Observed {
         Observed {
             list: Answer::json(HTTP_OK, &json!({"builds": [{"name": "builds/abc"}]}))
@@ -309,6 +515,44 @@ mod tests {
                 "executions": {"completed": 1}
             }
         })
+    }
+
+    #[test]
+    fn transfer_checks_reject_missing_cold_bytes_and_small_warm_cas() {
+        let mut cold = detail();
+        cold["usage"]["cache"]["uploadedBytes"] = json!(100);
+        cold["usage"]["cache"]["downloadedBytes"] = json!(200);
+        let mut warm = detail();
+        warm["usage"]["cache"]["downloadedBytes"] = json!(4096);
+        assert!(
+            transfer_checks(&observed(&cold), &observed(&warm), 4096)
+                .iter()
+                .all(Check::is_passed)
+        );
+        cold["usage"]["cache"]["uploadedBytes"] = json!(0);
+        warm["usage"]["cache"]["downloadedBytes"] = json!(4095);
+        assert!(
+            transfer_checks(&observed(&cold), &observed(&warm), 4096)
+                .iter()
+                .all(Check::is_failure)
+        );
+    }
+
+    #[test]
+    fn store_checks_reject_swapped_budgets_and_stale_cas() {
+        let before = json!({"cache":{"stores":[{"store":"CAS","usedBytes":10,"budgetBytes":100},{"store":"AC","usedBytes":1,"budgetBytes":20}]}});
+        let after = json!({"cache":{"stores":[{"store":"CAS","usedBytes":11,"budgetBytes":100},{"store":"AC","usedBytes":2,"budgetBytes":20}]}});
+        assert!(
+            store_checks(&before, &after, 100, 20)
+                .iter()
+                .all(Check::is_passed)
+        );
+        let stale = json!({"cache":{"stores":[{"store":"CAS","usedBytes":10,"budgetBytes":20},{"store":"AC","usedBytes":2,"budgetBytes":100}]}});
+        assert!(
+            store_checks(&before, &stale, 100, 20)
+                .iter()
+                .all(Check::is_failure)
+        );
     }
 
     #[test]

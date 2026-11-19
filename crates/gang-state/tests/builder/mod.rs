@@ -13,8 +13,8 @@ use gang_reconciler::{
     TerminationCause, WorkerCounts,
 };
 use gang_spi::{
-    ActionInfo, ActionsView, FleetInstance, FleetSupply, QueuedActionView, RunningActionView,
-    SchedulerSnapshot,
+    ActionInfo, ActionsView, EngineStore, FleetInstance, FleetSupply, MeasuredUsage,
+    QueuedActionView, RunningActionView, SchedulerSnapshot, StoreKind, Traffic,
 };
 use gang_state::{ActionsSample, Builder, Inputs, PassStatus, diff};
 use gang_testkit::{TestResult, worker_on};
@@ -42,6 +42,8 @@ struct World {
     snapshot: SchedulerSnapshot,
     actions: Option<ActionsSample>,
     builds: Option<gang_insight::Builds>,
+    traffic: Traffic,
+    measured: Option<MeasuredUsage>,
 }
 
 impl World {
@@ -160,6 +162,8 @@ fn fill_into(
         actions: world.actions.as_ref(),
         events: &[],
         builds: world.builds.as_ref().unwrap_or(&empty_builds),
+        traffic: world.traffic,
+        measured: world.measured.as_ref(),
         principals_epoch: 7,
     };
     builder.fill(cur, prev, seq, &inputs);
@@ -222,7 +226,7 @@ fn policy_min_is_the_minimum_in_force() -> TestResult {
         minimum: 2,
         ..FleetOutlook::default()
     }];
-    let mut builder = Builder::new(config());
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
 
     let raised = fill(&mut builder, &blank(), 1, &world, 1_000, ok(0))?;
     assert_eq!(raised.fleets[0].policy.min, 2);
@@ -274,10 +278,12 @@ fn fleets_follow_declaration_order_and_units() -> TestResult {
             queued: 1,
             candidates: 3,
             workers: WorkerCounts::default(),
+            readiness: None,
+            expected_wait: None,
         },
         FleetOutlook::default(),
     ];
-    let mut builder = Builder::new(config());
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
 
     let cur = fill(&mut builder, &blank(), 5, &world, 6_000, ok(2))?;
 
@@ -300,6 +306,51 @@ fn fleets_follow_declaration_order_and_units() -> TestResult {
 }
 
 #[test]
+fn fleet_durations_follow_each_outlook_and_round_trip() -> TestResult {
+    let mut world = World::default();
+    let alpha = policy("alpha", 100, 4)?;
+    world.properties = vec![properties(&alpha, Vec::new())];
+    world.policies = vec![alpha];
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let mut prev = blank();
+    let mut cur = blank();
+    let values = [
+        (None, None),
+        (Some(Duration::ZERO), Some(Duration::from_millis(1500))),
+        (Some(Duration::from_millis(250)), Some(Duration::ZERO)),
+        (None, Some(Duration::from_secs(2))),
+        (Some(Duration::from_secs(3)), None),
+        (None, None),
+    ];
+    for (index, (readiness, expected_wait)) in values.into_iter().enumerate() {
+        world.outlook = vec![FleetOutlook {
+            readiness,
+            expected_wait,
+            ..FleetOutlook::default()
+        }];
+        fill_into(
+            &mut builder,
+            &mut cur,
+            &prev,
+            index as u64 + 1,
+            &world,
+            index as u64 * 1_000,
+            ok(0),
+        )?;
+        assert_eq!(cur.fleets[0].demand.readiness, readiness);
+        assert_eq!(cur.fleets[0].demand.expected_wait, expected_wait);
+        if index > 0 {
+            let delta = diff(&prev, &cur).ok_or("missing fleet delta")?;
+            let mut applied = prev.clone();
+            gang_state::apply(&mut applied, &delta)?;
+            assert_eq!(applied, cur);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    Ok(())
+}
+
+#[test]
 fn provisioner_properties_exclude_reserved_keys() -> TestResult {
     let mut world = World::default();
     let alpha = policy("alpha", 100, 4)?;
@@ -314,7 +365,7 @@ fn provisioner_properties_exclude_reserved_keys() -> TestResult {
         launch_failure: None,
     }];
     world.outlook = vec![FleetOutlook::default()];
-    let mut builder = Builder::new(config());
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
 
     let cur = fill(&mut builder, &blank(), 1, &world, 1_000, ok(0))?;
 
@@ -391,7 +442,7 @@ fn counts_workers_by_phase_and_instances_by_lifecycle() -> TestResult {
             ..FleetOutlook::default()
         },
     ];
-    let mut builder = Builder::new(config());
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
 
     let cur = fill(&mut builder, &blank(), 1, &world, 1_000, ok(0))?;
 
@@ -456,7 +507,7 @@ fn worker_phase_and_phase_time_copy_or_reset_across_frames() -> TestResult {
         false,
         NonZeroU32::new(8),
     )?];
-    let mut builder = Builder::new(config());
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
 
     let first = fill(&mut builder, &blank(), 1, &world, 1_000, ok(0))?;
     let first_row = find_worker(&first, &worker).ok_or("worker missing")?;
@@ -517,7 +568,7 @@ fn launch_time_of_a_worker_without_instance_is_carried_over() -> TestResult {
         false,
         NonZeroU32::new(8),
     )?];
-    let mut builder = Builder::new(config());
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
 
     let first = fill(&mut builder, &blank(), 1, &world, 1_000, ok(0))?;
     let first_row = find_worker(&first, &worker).ok_or("worker missing")?;
@@ -590,7 +641,7 @@ fn merge_pairs_workers_and_instances_with_interleaving_ids() -> TestResult {
     world.snapshot.workers = workers;
 
     let frame = fill(
-        &mut Builder::new(config()),
+        &mut Builder::new(config(), gang_state::CacheBaseline::default()),
         &blank(),
         1,
         &world,
@@ -661,7 +712,7 @@ fn every_worker_on_an_instance_gets_its_launch_time() -> TestResult {
     ];
 
     let frame = fill(
-        &mut Builder::new(config()),
+        &mut Builder::new(config(), gang_state::CacheBaseline::default()),
         &blank(),
         1,
         &world,
@@ -698,7 +749,7 @@ fn slots_are_none_for_unbounded_workers() -> TestResult {
         worker_state(&bounded, "alpha", 0, false, NonZeroU32::new(4))?,
     ];
     world.snapshot.workers[1].paused = true;
-    let mut builder = Builder::new(config());
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
 
     let cur = fill(&mut builder, &blank(), 1, &world, 1_000, ok(0))?;
 
@@ -737,7 +788,7 @@ fn instances_without_worker_are_listed_with_boot_grace() -> TestResult {
         },
         ..FleetOutlook::default()
     }];
-    let mut builder = Builder::new(config());
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
 
     let before = fill(&mut builder, &blank(), 1, &world, 1_099, ok(0))?;
     assert_eq!(past_grace(&before, &young), Some(false));
@@ -769,7 +820,7 @@ fn old_unserved_instance_uses_the_pass_boot_grace_verdict() -> TestResult {
         launch_failure: None,
     }];
     world.past_boot_grace = vec![vec![false]];
-    let mut builder = Builder::new(config());
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
     let before = fill(&mut builder, &blank(), 1, &world, 3_600_000, ok(0))?;
     assert_eq!(past_grace(&before, &instance), Some(false));
     world.past_boot_grace[0][0] = true;
@@ -805,7 +856,7 @@ fn unplaceable_plus_charged_equals_queue_total() -> TestResult {
             launch_failure: None,
         },
     ];
-    let mut builder = Builder::new(config());
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
     for i in 0_u32..64 {
         let total = i % 9;
         let first = (i * 5) % (total + 1);
@@ -857,7 +908,7 @@ fn oldest_queue_time_is_the_earliest_queued_since_whatever_the_order() -> TestRe
         .into_iter()
         .map(|since| queued(since, FleetSet::default()))
         .collect();
-    let mut builder = Builder::new(config());
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
 
     let cur = fill(&mut builder, &blank(), 1, &world, 1_000, ok(0))?;
 
@@ -886,7 +937,7 @@ fn actions_follow_sample_and_drop_vanished_workers() -> TestResult {
         false,
         NonZeroU32::new(8),
     )?];
-    let mut builder = Builder::new(config());
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
 
     let without = fill(&mut builder, &blank(), 1, &world, 1_000, ok(0))?;
     assert!(without.actions.is_none());
@@ -971,9 +1022,9 @@ fn skipped_pass_keeps_rows_and_counts_skips() -> TestResult {
         NonZeroU32::new(8),
     )?];
     world.snapshot.completed = 9;
-    let mut builder = Builder::new(config());
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
 
-    let mut before_any_success = Builder::new(config());
+    let mut before_any_success = Builder::new(config(), gang_state::CacheBaseline::default());
     let early = fill(
         &mut before_any_success,
         &blank(),
@@ -1049,7 +1100,7 @@ fn skipped_pass_refreshes_the_actions_part() -> TestResult {
         NonZeroU32::new(8),
     )?];
     world.actions = Some(sample_at(4_000, vec![running_on(&worker, "op-a", 3_000)]));
-    let mut builder = Builder::new(config());
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
     let ok_frame = fill(&mut builder, &blank(), 1, &world, 1_000, ok(0))?;
 
     world.actions = Some(sample_at(
@@ -1111,7 +1162,7 @@ fn a_pass_without_a_sample_keeps_the_previous_actions() -> TestResult {
         false,
         NonZeroU32::new(8),
     )?];
-    let mut builder = Builder::new(config());
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
 
     world.actions = None;
     let blank_prev = fill(&mut builder, &blank(), 1, &world, 1_000, ok(0))?;
@@ -1188,7 +1239,7 @@ fn scale_sweep_matches_a_naive_reference() -> TestResult {
 
     let wall = 10_000;
     let frame = fill(
-        &mut Builder::new(config()),
+        &mut Builder::new(config(), gang_state::CacheBaseline::default()),
         &blank(),
         1,
         &world,
@@ -1297,7 +1348,7 @@ fn a_worker_of_another_fleet_does_not_host_the_instance() -> TestResult {
     );
 
     world.passes = passes;
-    let mut builder = Builder::new(config());
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
     let cur = fill(&mut builder, &blank(), 1, &world, 130_000, ok(0))?;
 
     assert_eq!(cur.instances.len(), 1);
@@ -1457,7 +1508,7 @@ fn refilling_a_non_empty_frame_equals_filling_a_blank_one() -> TestResult {
     let larger = larger_world()?;
     let smaller = smaller_world()?;
     let larger_frame = fill(
-        &mut Builder::new(config()),
+        &mut Builder::new(config(), gang_state::CacheBaseline::default()),
         &blank(),
         9,
         &larger,
@@ -1477,7 +1528,7 @@ fn refilling_a_non_empty_frame_equals_filling_a_blank_one() -> TestResult {
         Some(2)
     );
     let smaller_frame = fill(
-        &mut Builder::new(config()),
+        &mut Builder::new(config(), gang_state::CacheBaseline::default()),
         &blank(),
         9,
         &smaller,
@@ -1488,7 +1539,7 @@ fn refilling_a_non_empty_frame_equals_filling_a_blank_one() -> TestResult {
     assert_eq!(smaller_frame.workers.len(), 1);
     assert_eq!(smaller_frame.instances.len(), 0);
 
-    let mut builder = Builder::new(config());
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
     let mut cur = blank();
     fill_into(&mut builder, &mut cur, &blank(), 9, &larger, 7_000, ok(0))?;
     assert_eq!(cur, larger_frame, "the larger world fills a blank frame");
@@ -1525,7 +1576,7 @@ fn running_actions_are_sorted_by_encoded_name_and_round_trip() -> TestResult {
         NonZeroU32::new(8),
     )?];
     world.actions = Some(sample_at(1_000, vec![running_on(&worker, "a-1", 500)]));
-    let mut builder = Builder::new(config());
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
     let prev = fill(&mut builder, &blank(), 1, &world, 1_000, ok(0))?;
 
     world.actions = Some(sample_at(
@@ -1563,7 +1614,7 @@ fn events_keep_only_the_newest_configured_window() -> TestResult {
         .collect();
     let mut settings = config();
     settings.events_limit = 2;
-    let mut builder = Builder::new(settings);
+    let mut builder = Builder::new(settings, gang_state::CacheBaseline::default());
     let catalog = FleetCatalog::try_new(Vec::new())?;
     let builds = gang_insight::Builds::new(&gang_config::BuildsConfig::default());
     let mut prev = blank();
@@ -1575,6 +1626,8 @@ fn events_keep_only_the_newest_configured_window() -> TestResult {
         actions: None,
         events: &[],
         builds: &builds,
+        traffic: Traffic::default(),
+        measured: None,
         principals_epoch: 0,
     };
     builder.fill(&mut prev, &blank(), 0, &initial);
@@ -1587,6 +1640,8 @@ fn events_keep_only_the_newest_configured_window() -> TestResult {
         actions: None,
         events: &events,
         builds: &builds,
+        traffic: Traffic::default(),
+        measured: None,
         principals_epoch: 0,
     };
     builder.fill(&mut cur, &prev, 1, &inputs);
@@ -1618,7 +1673,7 @@ fn recent_samples_follow_completed_passes_and_restarts() -> TestResult {
         .iter()
         .map(|policy| properties(policy, Vec::new()))
         .collect();
-    let mut builder = Builder::new(config());
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
     let mut prev = builder.initial(ts(0), 7);
     assert!(prev.recent.samples.is_empty());
     for (index, completed) in [0, 5, 12, 12, 20].into_iter().enumerate() {
@@ -1656,6 +1711,7 @@ fn recent_samples_follow_completed_passes_and_restarts() -> TestResult {
                 skipped: 0,
                 lookups: 0,
                 hits: 0,
+                ..gang_wire::Sample::default()
             },
             gang_wire::Sample {
                 start: ts(10_000),
@@ -1666,6 +1722,7 @@ fn recent_samples_follow_completed_passes_and_restarts() -> TestResult {
                 skipped: 0,
                 lookups: 0,
                 hits: 0,
+                ..gang_wire::Sample::default()
             },
         ]
     );
@@ -1715,7 +1772,7 @@ fn worker_phase_history_keeps_the_span_overlapping_the_window() -> TestResult {
     world.snapshot.workers = vec![worker_state(&worker, "alpha", 0, false, None)?];
     let mut settings = config();
     settings.history_window = Duration::from_secs(10);
-    let mut builder = Builder::new(settings);
+    let mut builder = Builder::new(settings, gang_state::CacheBaseline::default());
     let mut prev = builder.initial(ts(0), 7);
     for (seq, wall, running) in [(1, 1_000, 0), (2, 4_000, 1), (3, 7_000, 0)] {
         world.snapshot.workers[0].running_actions = running;
@@ -1770,15 +1827,15 @@ fn worker_phase_history_keeps_the_span_overlapping_the_window() -> TestResult {
 #[test]
 fn cache_samples_follow_counter_deltas_skips_and_restarts() -> TestResult {
     let mut world = World::default();
-    let mut builder = Builder::new(config());
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
     let initial = builder.initial(ts(0), 0);
-    world.snapshot.lookups = 10;
-    world.snapshot.hits = 7;
+    world.traffic.lookups = 10;
+    world.traffic.hits = 7;
     let first = fill(&mut builder, &initial, 1, &world, 1_000, ok(0))?;
     let sample = first.recent.samples.last().ok_or("missing sample")?;
     assert_eq!((sample.lookups, sample.hits), (10, 7));
-    world.snapshot.lookups = 30;
-    world.snapshot.hits = 20;
+    world.traffic.lookups = 30;
+    world.traffic.hits = 20;
     let skipped = fill(
         &mut builder,
         &first,
@@ -1789,13 +1846,13 @@ fn cache_samples_follow_counter_deltas_skips_and_restarts() -> TestResult {
     )?;
     let sample = skipped.recent.samples.last().ok_or("missing sample")?;
     assert_eq!((sample.lookups, sample.hits), (0, 0));
-    world.snapshot.lookups = 20;
-    world.snapshot.hits = 14;
+    world.traffic.lookups = 20;
+    world.traffic.hits = 14;
     let resumed = fill(&mut builder, &skipped, 3, &world, 21_000, ok(0))?;
     let sample = resumed.recent.samples.last().ok_or("missing sample")?;
     assert_eq!((sample.lookups, sample.hits), (10, 7));
-    world.snapshot.lookups = 3;
-    world.snapshot.hits = 2;
+    world.traffic.lookups = 3;
+    world.traffic.hits = 2;
     let restarted = fill(&mut builder, &resumed, 4, &world, 31_000, ok(0))?;
     let sample = restarted.recent.samples.last().ok_or("missing sample")?;
     assert_eq!((sample.lookups, sample.hits), (3, 2));
@@ -1806,7 +1863,7 @@ fn cache_samples_follow_counter_deltas_skips_and_restarts() -> TestResult {
 fn recent_builds_expire_on_skipped_pass_and_round_trip() -> TestResult {
     let mut settings = config();
     settings.history_window = Duration::from_secs(10);
-    let mut builder = Builder::new(settings);
+    let mut builder = Builder::new(settings, gang_state::CacheBaseline::default());
     let mut world = World::default();
     let mut builds = gang_insight::Builds::new(&gang_config::BuildsConfig::default());
     let old = build_key("old")?;
@@ -1890,7 +1947,7 @@ fn action_build_names_are_written_and_cleared_on_reuse() -> TestResult {
             truncated_queued: 0,
         },
     });
-    let mut builder = Builder::new(config());
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
     let mut frame = blank();
     fill_into(&mut builder, &mut frame, &blank(), 1, &world, 1_000, ok(0))?;
     let actions = frame.actions.as_ref().ok_or("missing actions")?;
@@ -1905,5 +1962,379 @@ fn action_build_names_are_written_and_cleared_on_reuse() -> TestResult {
     let actions = frame.actions.as_ref().ok_or("missing actions")?;
     assert!(actions.running[0].build.is_empty());
     assert!(actions.queued[0].build.is_empty());
+    Ok(())
+}
+
+fn cache_counts(sample: &gang_wire::Sample) -> (u32, u32, u64, u64, u64) {
+    (
+        sample.lookups,
+        sample.hits,
+        sample.uploaded_bytes,
+        sample.downloaded_bytes,
+        sample.evicted_bytes,
+    )
+}
+
+// Catches mixing counters from different source generations after a partial decrease.
+#[test]
+fn traffic_restart_resets_the_entire_counter_tuple() -> TestResult {
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let mut world = World {
+        traffic: Traffic {
+            lookups: 100,
+            hits: 90,
+            uploaded: 200,
+            downloaded: 300,
+        },
+        ..World::default()
+    };
+    let initial = builder.initial(ts(0), 7);
+    let first = fill(&mut builder, &initial, 1, &world, 1_000, ok(0))?;
+    world.traffic = Traffic {
+        lookups: 120,
+        hits: 50,
+        uploaded: 250,
+        downloaded: 350,
+    };
+    let next = fill(&mut builder, &first, 2, &world, 11_000, ok(0))?;
+    let sample = next.recent.samples.last().ok_or("missing sample")?;
+    assert_eq!(cache_counts(sample), (120, 50, 250, 350, 0));
+    assert!(sample.hits <= sample.lookups);
+    Ok(())
+}
+
+// Catches counting pre-leadership traffic or an unknown eviction baseline as new usage.
+#[test]
+fn leadership_baseline_ignores_unknown_evictions_until_first_success() -> TestResult {
+    let initial_traffic = Traffic {
+        lookups: 10,
+        hits: 8,
+        uploaded: 100,
+        downloaded: 200,
+    };
+    let mut builder = Builder::new(
+        config(),
+        gang_state::CacheBaseline {
+            traffic: initial_traffic,
+            evicted: None,
+        },
+    );
+    let mut world = World {
+        traffic: initial_traffic,
+        snapshot: SchedulerSnapshot {
+            stores: vec![EngineStore {
+                store: StoreKind::Content,
+                used: 1,
+                budget: 10,
+                evicted: 70,
+            }],
+            ..SchedulerSnapshot::default()
+        },
+        ..World::default()
+    };
+    let initial = builder.initial(ts(0), 7);
+    let skipped = fill(
+        &mut builder,
+        &initial,
+        1,
+        &world,
+        1_000,
+        Outcome::Skipped(SkipReason::SchedulerUnavailable),
+    )?;
+    world.traffic.uploaded += 10;
+    let first = fill(&mut builder, &skipped, 2, &world, 11_000, ok(0))?;
+    assert_eq!(
+        cache_counts(first.recent.samples.last().ok_or("missing sample")?),
+        (0, 0, 10, 0, 0)
+    );
+    world.snapshot.stores[0].evicted = 75;
+    let second = fill(&mut builder, &first, 3, &world, 21_000, ok(0))?;
+    assert_eq!(
+        cache_counts(second.recent.samples.last().ok_or("missing sample")?),
+        (0, 0, 0, 0, 5)
+    );
+    Ok(())
+}
+
+// Catches counting pre-leadership evictions or losing increments before the first pass.
+#[test]
+fn known_eviction_baseline_counts_only_new_evictions() -> TestResult {
+    let mut builder = Builder::new(
+        config(),
+        gang_state::CacheBaseline {
+            traffic: Traffic::default(),
+            evicted: Some(60),
+        },
+    );
+    let world = World {
+        snapshot: SchedulerSnapshot {
+            stores: vec![EngineStore {
+                store: StoreKind::Content,
+                used: 1,
+                budget: 10,
+                evicted: 70,
+            }],
+            ..SchedulerSnapshot::default()
+        },
+        ..World::default()
+    };
+    let initial = builder.initial(ts(0), 7);
+    let first = fill(&mut builder, &initial, 1, &world, 1_000, ok(0))?;
+    assert_eq!(
+        cache_counts(first.recent.samples.last().ok_or("missing sample")?),
+        (0, 0, 0, 0, 10)
+    );
+    Ok(())
+}
+
+// Catches cumulative-instead-of-delta accounting and stale stores or measurements.
+#[test]
+fn cache_traffic_stores_and_measurements_follow_successful_passes() -> TestResult {
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let mut world = World {
+        traffic: Traffic {
+            lookups: 10,
+            hits: 7,
+            uploaded: 100,
+            downloaded: 200,
+        },
+        ..World::default()
+    };
+    world.snapshot.stores = vec![
+        EngineStore {
+            store: StoreKind::Content,
+            used: 42,
+            budget: 100,
+            evicted: 20,
+        },
+        EngineStore {
+            store: StoreKind::Action,
+            used: 8,
+            budget: 30,
+            evicted: 5,
+        },
+    ];
+    world.measured = Some(MeasuredUsage {
+        bytes: 500,
+        objects: 9,
+        measured: ts(123),
+    });
+    let initial = builder.initial(ts(0), 7);
+    let first = fill(&mut builder, &initial, 1, &world, 1_000, ok(0))?;
+    let sample = first.recent.samples.last().ok_or("missing sample")?;
+    assert_eq!(cache_counts(sample), (10, 7, 100, 200, 25));
+    assert_eq!(
+        first.cache.stores,
+        vec![
+            gang_wire::StoreUsage {
+                store: gang_wire::CacheStore::Content,
+                used_bytes: 42,
+                budget_bytes: 100
+            },
+            gang_wire::StoreUsage {
+                store: gang_wire::CacheStore::Action,
+                used_bytes: 8,
+                budget_bytes: 30
+            },
+        ]
+    );
+    assert_eq!(
+        first.cache.bucket,
+        Some(gang_wire::BucketUsage {
+            bytes: 500,
+            objects: 9,
+            measure_time: ts(123)
+        })
+    );
+
+    world.traffic = Traffic {
+        lookups: 14,
+        hits: 9,
+        uploaded: 120,
+        downloaded: 260,
+    };
+    world.snapshot.stores[0].evicted = 24;
+    world.snapshot.stores[1].evicted = 8;
+    world.snapshot.stores[0].used = 51;
+    world.measured = Some(MeasuredUsage {
+        bytes: 700,
+        objects: 11,
+        measured: ts(456),
+    });
+    let second = fill(&mut builder, &first, 2, &world, 11_000, ok(0))?;
+    let sample = second.recent.samples.last().ok_or("missing sample")?;
+    assert_eq!(cache_counts(sample), (4, 2, 20, 60, 7));
+    assert_eq!(second.cache.stores[0].used_bytes, 51);
+    assert_eq!(
+        second
+            .cache
+            .bucket
+            .as_ref()
+            .map(|b| (b.bytes, b.objects, b.measure_time)),
+        Some((700, 11, ts(456)))
+    );
+    Ok(())
+}
+
+// Catches sampling on a skipped pass, losing the last measurement, and reset mishandling.
+#[test]
+fn cache_skips_preserve_stores_and_latest_measurement() -> TestResult {
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let mut world = World {
+        traffic: Traffic {
+            lookups: 14,
+            hits: 9,
+            uploaded: 120,
+            downloaded: 260,
+        },
+        measured: Some(MeasuredUsage {
+            bytes: 700,
+            objects: 11,
+            measured: ts(456),
+        }),
+        snapshot: SchedulerSnapshot {
+            stores: vec![
+                EngineStore {
+                    store: StoreKind::Content,
+                    used: 51,
+                    budget: 100,
+                    evicted: 24,
+                },
+                EngineStore {
+                    store: StoreKind::Action,
+                    used: 8,
+                    budget: 30,
+                    evicted: 8,
+                },
+            ],
+            ..SchedulerSnapshot::default()
+        },
+        ..World::default()
+    };
+    let initial = builder.initial(ts(0), 7);
+    let second = fill(&mut builder, &initial, 2, &world, 11_000, ok(0))?;
+
+    world.traffic = Traffic {
+        lookups: 16,
+        hits: 10,
+        uploaded: 140,
+        downloaded: 280,
+    };
+    world.snapshot.stores[0].evicted = 99;
+    let skipped = fill(
+        &mut builder,
+        &second,
+        3,
+        &world,
+        21_000,
+        Outcome::Skipped(SkipReason::SchedulerUnavailable),
+    )?;
+    assert_eq!(skipped.cache.stores, second.cache.stores);
+    assert_eq!(skipped.cache.bucket, second.cache.bucket);
+    let sample = skipped.recent.samples.last().ok_or("missing sample")?;
+    assert_eq!(
+        (
+            sample.lookups,
+            sample.hits,
+            sample.uploaded_bytes,
+            sample.downloaded_bytes,
+            sample.evicted_bytes
+        ),
+        (0, 0, 0, 0, 0)
+    );
+    world.traffic = Traffic {
+        lookups: 2,
+        hits: 1,
+        uploaded: 3,
+        downloaded: 4,
+    };
+    world.snapshot.stores[0].evicted = 1;
+    world.snapshot.stores[1].evicted = 1;
+    let restarted = fill(&mut builder, &skipped, 4, &world, 31_000, ok(0))?;
+    let sample = restarted.recent.samples.last().ok_or("missing sample")?;
+    assert_eq!(
+        (
+            sample.lookups,
+            sample.hits,
+            sample.uploaded_bytes,
+            sample.downloaded_bytes,
+            sample.evicted_bytes
+        ),
+        (2, 1, 3, 4, 2)
+    );
+    assert_eq!(restarted.cache.bucket, second.cache.bucket);
+    Ok(())
+}
+
+// Catches sampling skipped passes, coupling traffic and eviction resets,
+// and replacing rather than accumulating increments within a step.
+#[test]
+fn cache_counters_bridge_skips_and_reset_sources_separately() -> TestResult {
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let mut world = World {
+        traffic: Traffic {
+            lookups: 10,
+            hits: 8,
+            uploaded: 100,
+            downloaded: 200,
+        },
+        ..World::default()
+    };
+    world.snapshot.stores = vec![EngineStore {
+        store: StoreKind::Content,
+        used: 1,
+        budget: 2,
+        evicted: 30,
+    }];
+    let initial = builder.initial(ts(0), 7);
+    let first = fill(&mut builder, &initial, 1, &world, 1_000, ok(0))?;
+    world.traffic = Traffic {
+        lookups: 12,
+        hits: 9,
+        uploaded: 120,
+        downloaded: 220,
+    };
+    world.snapshot.stores[0].evicted = 35;
+    let skipped = fill(
+        &mut builder,
+        &first,
+        2,
+        &world,
+        2_000,
+        Outcome::Skipped(SkipReason::SchedulerUnavailable),
+    )?;
+    world.traffic = Traffic {
+        lookups: 15,
+        hits: 2,
+        uploaded: 140,
+        downloaded: 4,
+    };
+    world.snapshot.stores[0].evicted = 40;
+    let next = fill(&mut builder, &skipped, 3, &world, 3_000, ok(0))?;
+    let sample = next.recent.samples.last().ok_or("missing sample")?;
+    assert_eq!(
+        (
+            sample.lookups,
+            sample.hits,
+            sample.uploaded_bytes,
+            sample.downloaded_bytes,
+            sample.evicted_bytes
+        ),
+        (25, 10, 240, 204, 40)
+    );
+    world.traffic = Traffic {
+        lookups: 18,
+        hits: 3,
+        uploaded: 150,
+        downloaded: 9,
+    };
+    world.snapshot.stores[0].evicted = 2;
+    let after_eviction_reset = fill(&mut builder, &next, 4, &world, 11_000, ok(0))?;
+    let sample = after_eviction_reset
+        .recent
+        .samples
+        .last()
+        .ok_or("missing sample")?;
+    assert_eq!(cache_counts(sample), (3, 1, 10, 5, 2));
     Ok(())
 }

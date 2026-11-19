@@ -3809,13 +3809,14 @@ fn builds_defaults_apply_when_the_section_is_omitted() -> Result<(), Box<dyn Err
     assert_eq!(builds.targets.get(), 20);
     assert_eq!(builds.slowest_actions.get(), 20);
     assert_eq!(builds.timeline_buckets.get(), 120);
+    assert_eq!(builds.max_traffic_series.get(), 1024);
     Ok(())
 }
 
 #[test]
 fn every_builds_key_can_be_overridden() -> Result<(), Box<dyn Error>> {
     let config = Sections {
-        builds: "[builds]\nmax_live = 10\nidle_after = \"2m\"\nqueue = 100\nmnemonics = 4\ntargets = 5\nslowest_actions = 6\ntimeline_buckets = 7\n",
+        builds: "[builds]\nmax_live = 10\nidle_after = \"2m\"\nqueue = 100\nmnemonics = 4\ntargets = 5\nslowest_actions = 6\ntimeline_buckets = 7\nmax_traffic_series = 17\n",
         ..Sections::VALID
     }
     .parse()?;
@@ -3827,6 +3828,7 @@ fn every_builds_key_can_be_overridden() -> Result<(), Box<dyn Error>> {
     assert_eq!(builds.targets.get(), 5);
     assert_eq!(builds.slowest_actions.get(), 6);
     assert_eq!(builds.timeline_buckets.get(), 7);
+    assert_eq!(builds.max_traffic_series.get(), 17);
     Ok(())
 }
 
@@ -3849,6 +3851,7 @@ fn zero_builds_limits_are_rejected() {
         "targets",
         "slowest_actions",
         "timeline_buckets",
+        "max_traffic_series",
     ] {
         let text = format!("{}\n[builds]\n{key} = 0\n", Sections::VALID.text());
         assert!(text.parse::<GangConfig<Plugins>>().is_err(), "{key}");

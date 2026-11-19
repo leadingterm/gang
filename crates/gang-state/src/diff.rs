@@ -15,6 +15,7 @@ pub fn diff(prev: &State, cur: &State) -> Option<Delta> {
         update_time: cur.update_time,
         pass: changed(&prev.pass, &cur.pass).cloned(),
         queue: changed(&prev.queue, &cur.queue).cloned(),
+        cache: changed(&prev.cache, &cur.cache).cloned(),
         fleets: fleets(&prev.fleets, &cur.fleets),
         workers: keyed(&prev.workers, &cur.workers),
         instances: keyed(&prev.instances, &cur.instances),

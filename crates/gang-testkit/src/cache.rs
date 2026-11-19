@@ -1,6 +1,6 @@
 //! A test double for the cache port, with in-memory stores.
 
-use gang_spi::{CacheStorePort, PortError, RenderedStoreSpec, StoreAccess};
+use gang_spi::{CacheStorePort, MeasuredUsage, PortError, RenderedStoreSpec, StoreAccess};
 
 /// A cache whose two stores are in-memory and whose workers open them directly.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -22,5 +22,19 @@ impl CacheStorePort for FakeCache {
 
     fn worker_access(&self) -> StoreAccess {
         StoreAccess::Direct
+    }
+
+    async fn measured_usage(&self) -> Result<Option<MeasuredUsage>, PortError> {
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fake_has_no_provider_measurement() {
+        assert_eq!(FakeCache.measured_usage().await.expect("measurement"), None);
     }
 }

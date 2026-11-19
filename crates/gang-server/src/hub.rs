@@ -210,6 +210,7 @@ impl StateHub {
             update_time: inner.latest.update_time,
             pass: None,
             queue: None,
+            cache: None,
             fleets: None,
             workers: None,
             instances: None,

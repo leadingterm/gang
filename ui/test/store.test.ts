@@ -90,7 +90,7 @@ const after = (state: State, parts: Omit<Delta, "seq" | "base" | "updateTime"> =
 
 test("a delta applies its recent increment", () => {
   const sample = (step: number, completed: number) => ({
-    start: iso(step * 10000), completed, running: 1, queued: 2, passes: 1, skipped: 0, lookups: 0, hits: 0,
+    start: iso(step * 10000), completed, running: 1, queued: 2, passes: 1, skipped: 0, lookups: 0, hits: 0, uploadedBytes: 0, downloadedBytes: 0, evictedBytes: 0,
   });
   const recent = { window: "30s", step: "10s", samples: [sample(0, 1), sample(1, 2), sample(2, 3)] };
   const state = { ...snapshot, recent };
@@ -98,6 +98,15 @@ test("a delta applies its recent increment", () => {
   assert.deepEqual(apply(state, after(state, { recent: increment })).recent, {
     ...recent, samples: [sample(1, 2), sample(2, 30), sample(3, 4)],
   });
+});
+
+test("cache deltas replace the whole part and omission preserves it", () => {
+  const state = { ...snapshot, cache: { stores: [{ store: "CAS" as const, usedBytes: 25, budgetBytes: 100 }] } };
+  const unchanged = apply(state, after(state));
+  assert.equal(unchanged.cache, state.cache);
+  const replaced = apply(unchanged, after(unchanged, { cache: { bucket: { bytes: 12, objects: 3, measureTime: iso(0) } } }));
+  assert.deepEqual(replaced.cache, { bucket: { bytes: 12, objects: 3, measureTime: iso(0) } });
+  assert.deepEqual(apply(replaced, after(replaced, { cache: {} })).cache, {});
 });
 
 test("a delta on another base asks for a resync", () => {

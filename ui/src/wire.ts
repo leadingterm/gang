@@ -85,6 +85,20 @@ export type ApproveDeviceAuthorizationResponse = {
  */
 authorizationUrl: string, };
 
+export type BucketUsage = { 
+/**
+ * Bytes held in the bucket.
+ */
+bytes: number, 
+/**
+ * Objects held in the bucket.
+ */
+objects: number, 
+/**
+ * When the provider measured the bucket.
+ */
+measureTime: Timestamp, };
+
 export type Build = { 
 /**
  * Resource name, `builds/{id}`.
@@ -149,6 +163,16 @@ timeline?: Timeline, };
 
 export type BuildState = "ACTIVE" | "IDLE";
 
+export type Cache = { 
+/**
+ * Bounded engine stores, omitted when none are reported.
+ */
+stores?: Array<StoreUsage>, 
+/**
+ * Latest provider measurement, absent until available.
+ */
+bucket?: BucketUsage, };
+
 export type CacheCounts = { 
 /**
  * Successful lookups.
@@ -165,7 +189,17 @@ errors: number,
 /**
  * Successful uploads of locally executed results.
  */
-uploadedResults: number, };
+uploadedResults: number, 
+/**
+ * Client-sent cache-service message bytes attributed to this build.
+ */
+uploadedBytes: number, 
+/**
+ * Client-received cache-service message bytes attributed to this build.
+ */
+downloadedBytes: number, };
+
+export type CacheStore = "CAS" | "AC";
 
 export type Cause = "DEMAND" | "MINIMUM" | "IDLE_TIMEOUT" | "ORPHAN" | "DRAIN_FINISHED" | "MAX_DRAIN_WAIT";
 
@@ -202,6 +236,10 @@ pass?: Pass,
  * A new action queue.
  */
 queue?: Queue, 
+/**
+ * A whole replacement of cache occupancy.
+ */
+cache?: Cache, 
 /**
  * Changes to the fleets.
  */
@@ -264,7 +302,15 @@ vcpus: number,
 /**
  * Memory in bytes the demand asks for.
  */
-memory: Bytes, };
+memory: Bytes, 
+/**
+ * Measured instance readiness, absent until a measurement is available.
+ */
+readiness?: Duration, 
+/**
+ * Latest expected queued action start at the planned capacity, absent without attributed queue.
+ */
+expectedWait?: Duration, };
 
 export type DeviceAuthorization = { 
 /**
@@ -816,7 +862,19 @@ lookups: number,
 /**
  * Of `lookups`, remote cache hits.
  */
-hits: number, };
+hits: number, 
+/**
+ * Client-sent cache-service message bytes during the step.
+ */
+uploadedBytes: number, 
+/**
+ * Client-received cache-service message bytes during the step.
+ */
+downloadedBytes: number, 
+/**
+ * Bytes evicted by bounded stores during the step.
+ */
+evictedBytes: number, };
 
 export type ScalingEvent = { 
 /**
@@ -1029,6 +1087,10 @@ completed: number,
  */
 recent: Recent, 
 /**
+ * The leader's bounded stores and latest external bucket measurement.
+ */
+cache: Cache, 
+/**
  * Builds with an observation within the recent window, basic view, ordered by name; at most `max_live`.
  */
 builds: Array<Build>, 
@@ -1036,6 +1098,20 @@ builds: Array<Build>,
  * Epoch of the principal set, which advances when principals change.
  */
 principalsEpoch: number, };
+
+export type StoreUsage = { 
+/**
+ * Which store was measured.
+ */
+store: CacheStore, 
+/**
+ * Bytes held, rounded to filesystem blocks.
+ */
+usedBytes: number, 
+/**
+ * Eviction budget in bytes.
+ */
+budgetBytes: number, };
 
 export type Tick = { 
 /**

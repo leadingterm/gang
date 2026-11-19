@@ -1,23 +1,23 @@
 name: Set up Bazel
 description: >-
-  Configure Bazel for this runner and restore the Bazel disk cache that
+  Configure Bazel for this runner and restore the disk and repository archive caches that
   .github/actions/save-bazel-cache saved (docs/SPECIFICATION.md 7.1). Runs after
   .github/actions/setup-nix.
 runs:
   using: composite
   steps:
-    # One key line per job, platform, and toolchain and dependency set; a push saves one entry per run
-    # attempt, a pull request one per line (docs/SPECIFICATION.md 7.1).
-    - name: Name the Bazel disk cache
+    # Each default-branch push saves a snapshot per job, platform, input set, and run attempt.
+    - name: Name the Bazel caches
       id: name
       shell: bash
       env:
-        PLATFORM: bazel-disk-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}
+        PLATFORM: bazel-v2-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}
         INPUTS: ${{ hashFiles('.bazelversion', 'MODULE.bazel', 'MODULE.bazel.lock', 'Cargo.lock', 'flake.lock') }}
-        RUN: ${{ github.event_name == 'pull_request' && format('pr{0}', github.event.pull_request.number) || format('{0}-{1}', github.run_id, github.run_attempt) }}
+        RUN: default-${{ github.run_id }}-${{ github.run_attempt }}
       run: |
         {
           echo "BAZEL_DISK_CACHE=$HOME/.cache/bazel-disk"
+          echo "BAZEL_REPOSITORY_CACHE=$HOME/.cache/bazel-repository"
           echo "BAZEL_DISK_CACHE_KEY=$PLATFORM-$INPUTS-$RUN"
           echo "BAZEL_DISK_CACHE_EPOCH=$RUNNER_TEMP/bazel-disk-cache-epoch"
         } >> "$GITHUB_ENV"
@@ -37,24 +37,27 @@ runs:
         cat > "$HOME/.bazelrc" <<EOF
         build --config=ci
         build --disk_cache=$BAZEL_DISK_CACHE
+        build --repository_cache=$BAZEL_REPOSITORY_CACHE
         build --repo_env=HERMETIC_CC_TOOLCHAIN_CACHE_PREFIX=$zig_cache
         build --sandbox_writable_path=$zig_cache
         EOF
     - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       id: restore
       with:
-        path: ${{ env.BAZEL_DISK_CACHE }}
+        path: |
+          ${{ env.BAZEL_DISK_CACHE }}
+          ${{ env.BAZEL_REPOSITORY_CACHE }}/content_addressable
         key: ${{ env.BAZEL_DISK_CACHE_KEY }}
         restore-keys: |
           ${{ steps.name.outputs.inputs }}
           ${{ steps.name.outputs.platform }}
-    # A fork's pull request saves nothing, so forks cannot evict main's entries; entries are immutable,
-    # so a run that restored its own key saves nothing. Bazel sets an entry's mtime when it stores or
-    # reads it, so the entries the job uses end up newer than the epoch; save-bazel-cache drops the others.
+    # Only default-branch pushes save; pull requests can restore but cannot write snapshots.
+    # Bazel refreshes disk entries and archive payload mtimes on use, allowing successful jobs
+    # to save their working sets while retaining the markers of used archives.
     - name: Mark the start of the build
       shell: bash
       env:
-        SAVE: ${{ steps.restore.outputs.cache-hit != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        SAVE: ${{ steps.restore.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       run: |
         echo "BAZEL_DISK_CACHE_SAVE=$SAVE" >> "$GITHUB_ENV"
         touch "$BAZEL_DISK_CACHE_EPOCH"

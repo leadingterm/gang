@@ -34,6 +34,7 @@
 //!         resources: ActionResources::default(),
 //!         queued_since: Timestamp::from_unix_millis(0),
 //!         priority: 0,
+//!         expected: None,
 //!     }],
 //!     ..SchedulerSnapshot::default()
 //! };
@@ -62,6 +63,7 @@ mod observations;
 mod pass_time;
 mod plan;
 mod reconciler;
+mod wait;
 
 pub use activity::Activity;
 pub use demand::Demand;

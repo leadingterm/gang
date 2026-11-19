@@ -86,6 +86,7 @@ pub(crate) fn fixture_build() -> gang_spi::Observation {
         },
         rpc: gang_spi::Rpc::GetActionResult,
         outcome: gang_spi::CallOutcome::Ok,
+        transferred: gang_spi::Transferred::default(),
     })
 }
 

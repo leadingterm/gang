@@ -32,6 +32,10 @@ pub struct ControlKnobs {
     pub min_instances: Option<u32>,
     /// `max_instances` of every `[[fleets]]` entry.
     pub max_instances: Option<u32>,
+    /// Concurrent actions targeted per instance in every fleet.
+    pub target_actions_per_instance: Option<u32>,
+    /// Virtual CPUs advertised per instance in every fleet.
+    pub vcpus_per_instance: Option<u32>,
     /// A `[[fleets.scheduled_minimum]]` window in force at every instant (all seven `days`,
     /// `00:00` to `24:00`, `time_zone = "Asia/Kathmandu"`) with this many `instances`, on every
     /// `[[fleets]]` entry.
@@ -44,8 +48,12 @@ pub struct ControlKnobs {
     pub detail_interval: Option<Duration>,
     /// The client action abandonment timeout.
     pub client_action_timeout: Option<Duration>,
+    /// HTTP/2 per-connection request limit for the held build.
+    pub max_concurrent_streams: Option<u32>,
     /// Use a nonexistent local worker launcher.
     pub broken_launcher: bool,
+    /// Install a gate for worker launches.
+    pub holdable_launches: bool,
 }
 
 impl ControlKnobs {
@@ -56,11 +64,15 @@ impl ControlKnobs {
         idle_timeout: None,
         min_instances: None,
         max_instances: None,
+        target_actions_per_instance: None,
+        vcpus_per_instance: None,
         scheduled_minimum: None,
         terminate_grace: None,
         detail_interval: None,
         client_action_timeout: None,
+        max_concurrent_streams: None,
         broken_launcher: false,
+        holdable_launches: false,
     };
 
     /// The orphan scenario: one standing instance and no more, a pass every second, a ten-second
@@ -115,19 +127,76 @@ impl ControlKnobs {
         ..Self::NONE
     };
 
+    /// A short burst arriving while the first worker boots.
+    pub const BURST_FROM_ZERO: Self = Self {
+        poll_interval: Some(Duration::from_secs(1)),
+        boot_grace: Some(Duration::from_mins(1)),
+        idle_timeout: Some(Duration::from_secs(5)),
+        min_instances: Some(0),
+        max_instances: Some(6),
+        target_actions_per_instance: Some(16),
+        vcpus_per_instance: Some(16),
+        // All 160 pending Execute RPCs must fit on one connection before launch release;
+        // the default limit of 100 can strand the last 60.
+        max_concurrent_streams: Some(160),
+        holdable_launches: true,
+        ..Self::NONE
+    };
+
+    /// Short running work can absorb an additional queued action.
+    pub const QUEUED_BEHIND_SHORT_WORK: Self = Self {
+        poll_interval: Some(Duration::from_secs(1)),
+        boot_grace: Some(Duration::from_mins(1)),
+        min_instances: Some(1),
+        max_instances: Some(3),
+        target_actions_per_instance: Some(2),
+        vcpus_per_instance: Some(2),
+        holdable_launches: true,
+        ..Self::NONE
+    };
+
+    /// A persistent backlog grows the fleet to its bound.
+    pub const BACKLOG_GROWS_FLEET: Self = Self {
+        poll_interval: Some(Duration::from_secs(1)),
+        boot_grace: Some(Duration::from_mins(1)),
+        min_instances: Some(0),
+        max_instances: Some(3),
+        target_actions_per_instance: Some(1),
+        vcpus_per_instance: Some(1),
+        holdable_launches: true,
+        ..Self::NONE
+    };
+
     /// Every preset a control scenario runs under, in suite order: the one list the suite's
     /// presets and the configuration parse tests draw from.
-    pub const PRESETS: [Self; 5] = [
+    pub const PRESETS: [Self; 8] = [
         Self::ORPHAN,
         Self::DRAIN_CANCEL,
         Self::SKIPPED_PASS,
         Self::LAUNCH_FAILURE,
         Self::SCHEDULED_MINIMUM,
+        Self::BURST_FROM_ZERO,
+        Self::QUEUED_BEHIND_SHORT_WORK,
+        Self::BACKLOG_GROWS_FLEET,
     ];
 }
 
 /// Faults a control scenario injects into a [`System`].
 pub trait Control: System {
+    /// Holds worker launches, including launches requested before the server starts.
+    ///
+    /// # Errors
+    ///
+    /// When the launch gate cannot be created.
+    fn hold_launches(&self) -> Result<()>;
+
+    /// Releases all held launches and allows future launches until the next hold.
+    ///
+    /// # Errors
+    ///
+    /// When the launch gate cannot be removed.
+    fn release_launches(&self) -> Result<()>;
+
     /// Makes the provisioner's supply read fail, so that every scheduling pass is skipped, until
     /// [`Control::release_supply`]. Works before the server starts too.
     ///
@@ -159,6 +228,17 @@ pub trait Control: System {
     /// When the process table cannot be read or a worker cannot be signalled.
     fn continue_workers(&self) -> Result<()>;
 
+    /// Builds a named run using an independent Bazel output root while a primary build runs.
+    ///
+    /// # Errors
+    ///
+    /// When the additional build cannot be run.
+    fn build_additional_run(
+        &self,
+        probes: &[Probe],
+        run: &crate::execution::Run,
+    ) -> Result<BuildOutcome>;
+
     /// Builds `probes` on another thread while `during` runs on this one, and returns how the
     /// build ended once both are done. An error of `during` is returned after the build ended.
     ///
@@ -180,9 +260,47 @@ pub trait Control: System {
             outcome
         })
     }
+    /// Builds a named run while `during` observes it on the calling thread.
+    ///
+    /// # Errors
+    ///
+    /// When the build fails to run, its thread panics, or `during` fails.
+    fn build_run_during(
+        &self,
+        probes: &[Probe],
+        run: &crate::execution::Run,
+        during: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<BuildOutcome> {
+        thread::scope(|scope| {
+            let build = scope.spawn(|| self.build_run(probes, run));
+            let observed = during();
+            let outcome = build
+                .join()
+                .map_err(|_| E2eError::system("the build thread panicked"))?;
+            observed?;
+            outcome
+        })
+    }
 }
 
 impl Control for Stack<'_> {
+    fn build_additional_run(
+        &self,
+        probes: &[Probe],
+        run: &crate::execution::Run,
+    ) -> Result<BuildOutcome> {
+        let (_cancel, stop) = crate::held_build::Cancel::pair();
+        self.build_additional(probes, run, stop)
+    }
+
+    fn hold_launches(&self) -> Result<()> {
+        self.hold_worker_launches()
+    }
+
+    fn release_launches(&self) -> Result<()> {
+        self.release_worker_launches()
+    }
+
     fn hold_supply(&self) -> Result<()> {
         let files = DesiredFiles::of(self)?;
         DirBuilder::new()

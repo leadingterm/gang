@@ -1,4 +1,5 @@
-//! Observes client calls and puts the authenticated principal in scheduler baggage.
+//! Observes client calls: counts cache traffic farm-wide, records the calls of builds, and puts
+//! the authenticated principal in scheduler baggage.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -6,9 +7,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context as TaskContext, Poll};
 
-use gang_spi::{Authenticated, Call, CallOutcome, Observation, ObservationSink, Origin, Rpc};
+use axum::body::Body;
+use bytes::Bytes;
+use gang_spi::{
+    Authenticated, Call, CallOutcome, Observation, ObservationSink, Origin, Rpc, Traffic,
+    Transferred,
+};
 use gang_types::{BuildKey, Identity, InvocationId, Mnemonic, TargetLabel, ToolDetails};
-use http::{Method, Request, Response, StatusCode};
+use http::{HeaderValue, Method, Request, Response, StatusCode};
+use hyper::body::{Body as HttpBody, Frame, SizeHint};
 use nativelink_proto::build::bazel::remote::execution::v2::RequestMetadata;
 use nativelink_util::origin_event::{BAZEL_METADATA_KEY, request_metadata_from_baggage};
 use opentelemetry::baggage::{BaggageExt, KeyValueMetadata};
@@ -18,21 +25,55 @@ use tower::{Layer, Service};
 /// OpenTelemetry's authenticated end-user baggage key.
 pub(crate) const ENDUSER_ID: &str = "enduser.id";
 
-const GET_ACTION_RESULT_PATH: &str = "/build.bazel.remote.execution.v2.ActionCache/GetActionResult";
-const UPDATE_ACTION_RESULT_PATH: &str =
-    "/build.bazel.remote.execution.v2.ActionCache/UpdateActionResult";
+/// The cache services: every method under these paths is a cache call.
+const ACTION_CACHE: &str = "/build.bazel.remote.execution.v2.ActionCache/";
+const CONTENT_STORAGE: &str = "/build.bazel.remote.execution.v2.ContentAddressableStorage/";
+const BYTE_STREAM: &str = "/google.bytestream.ByteStream/";
 const EXECUTE_PATH: &str = "/build.bazel.remote.execution.v2.Execution/Execute";
 const GRPC_STATUS_HEADER: &str = "grpc-status";
 const GRPC_NOT_FOUND: &[u8] = b"5";
 const GRPC_OK: &[u8] = b"0";
 
-/// Farm-wide action-cache lookup counters.
-#[derive(Default)]
-pub(crate) struct CacheCounters {
-    /// Completed action-cache lookups.
-    pub(crate) lookups: AtomicU64,
-    /// Lookups answered with a cache hit.
-    pub(crate) hits: AtomicU64,
+/// The observed call a POST to `path` makes, if any.
+fn classify(path: &str) -> Option<Rpc> {
+    if path == EXECUTE_PATH {
+        return Some(Rpc::Execute);
+    }
+    if let Some(method) = path.strip_prefix(ACTION_CACHE) {
+        return Some(match method {
+            "GetActionResult" => Rpc::GetActionResult,
+            "UpdateActionResult" => Rpc::UpdateActionResult,
+            _ => Rpc::Cas,
+        });
+    }
+    (path.starts_with(CONTENT_STORAGE) || path.starts_with(BYTE_STREAM)).then_some(Rpc::Cas)
+}
+
+/// The outcome a `grpc-status` value states.
+fn grpc_outcome(status: &HeaderValue) -> CallOutcome {
+    match status.as_bytes() {
+        GRPC_OK => CallOutcome::Ok,
+        GRPC_NOT_FOUND => CallOutcome::NotFound,
+        _ => CallOutcome::Error,
+    }
+}
+
+/// The outcome the response head states: HTTP 200, with `grpc-status` absent or stating it.
+fn head_outcome<B>(response: &Response<B>) -> CallOutcome {
+    if response.status() != StatusCode::OK {
+        return CallOutcome::Error;
+    }
+    response
+        .headers()
+        .get(GRPC_STATUS_HEADER)
+        .map_or(CallOutcome::Ok, grpc_outcome)
+}
+
+/// The message bytes `frame` carries: its data, or none for trailers.
+fn data_len(frame: &Frame<Bytes>) -> u64 {
+    frame
+        .data_ref()
+        .map_or(0, |data| u64::try_from(data.len()).unwrap_or(u64::MAX))
 }
 
 /// Builds an origin only when all supplied metadata is valid.
@@ -80,13 +121,12 @@ pub(crate) fn origin(principal: Arc<Identity>, metadata: &RequestMetadata) -> Op
 #[derive(Clone)]
 pub(crate) struct BuildObserverLayer {
     sink: ObservationSink,
-    counters: Arc<CacheCounters>,
 }
 
 impl BuildObserverLayer {
-    /// Builds a layer sharing the sink and farm-wide counters.
-    pub(crate) fn new(sink: ObservationSink, counters: Arc<CacheCounters>) -> Self {
-        Self { sink, counters }
+    /// Builds a layer that counts traffic in, and records calls to, `sink`.
+    pub(crate) fn new(sink: ObservationSink) -> Self {
+        Self { sink }
     }
 }
 
@@ -96,28 +136,25 @@ impl<S> Layer<S> for BuildObserverLayer {
         BuildObserver {
             inner,
             sink: self.sink.clone(),
-            counters: Arc::clone(&self.counters),
         }
     }
 }
 
-/// Observes response heads without consuming streaming response bodies.
+/// Observes calls as their bodies stream: a cache call once its response body ends or is
+/// dropped, `Execute` at its response head.
 #[derive(Clone)]
 pub(crate) struct BuildObserver<S> {
     inner: S,
     sink: ObservationSink,
-    counters: Arc<CacheCounters>,
 }
 
-impl<S, B, R> Service<Request<B>> for BuildObserver<S>
+impl<S> Service<Request<Body>> for BuildObserver<S>
 where
-    S: Service<Request<B>, Response = Response<R>> + Clone + Send + 'static,
+    S: Service<Request<Body>, Response = Response<Body>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: 'static,
-    B: Send + 'static,
-    R: 'static,
 {
-    type Response = Response<R>;
+    type Response = Response<Body>;
     type Error = S::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -125,14 +162,9 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, request: Request<B>) -> Self::Future {
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
         let rpc = if request.method() == Method::POST {
-            match request.uri().path() {
-                GET_ACTION_RESULT_PATH => Some(Rpc::GetActionResult),
-                UPDATE_ACTION_RESULT_PATH => Some(Rpc::UpdateActionResult),
-                EXECUTE_PATH => Some(Rpc::Execute),
-                _ => None,
-            }
+            classify(request.uri().path())
         } else {
             None
         };
@@ -140,10 +172,21 @@ where
             .extensions()
             .get::<Authenticated>()
             .map(|auth| Arc::clone(&auth.identity));
+        // A cache call counts the request bytes the service reads; `Execute` counts none.
+        let uploaded =
+            matches!(rpc, Some(rpc) if rpc != Rpc::Execute).then(|| Arc::new(AtomicU64::new(0)));
+        let request = match &uploaded {
+            Some(read) => request.map(|inner| {
+                Body::new(Counting {
+                    inner,
+                    read: Arc::clone(read),
+                })
+            }),
+            None => request,
+        };
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         let sink = self.sink.clone();
-        let counters = Arc::clone(&self.counters);
         Box::pin(async move {
             // OtlpLayer attaches the extracted context when it polls this future, not when it calls us.
             let context = Context::current();
@@ -168,37 +211,193 @@ where
             } else {
                 context
             };
-            let response = async move { inner.call(request).await }
-                .with_context(context)
-                .await?;
-            if let Some(rpc) = rpc {
-                let outcome = match (
-                    response.status(),
-                    response.headers().get(GRPC_STATUS_HEADER),
-                ) {
-                    (StatusCode::OK, None) => CallOutcome::Ok,
-                    (StatusCode::OK, Some(value)) if value.as_bytes() == GRPC_OK => CallOutcome::Ok,
-                    (StatusCode::OK, Some(value)) if value.as_bytes() == GRPC_NOT_FOUND => {
-                        CallOutcome::NotFound
-                    }
-                    _ => CallOutcome::Error,
-                };
-                if rpc == Rpc::GetActionResult {
-                    counters.lookups.fetch_add(1, Ordering::Relaxed);
-                    if outcome == CallOutcome::Ok {
-                        counters.hits.fetch_add(1, Ordering::Relaxed);
-                    }
+            let called = async move { inner.call(request).await }.with_context(context);
+            match (rpc, uploaded) {
+                (Some(rpc), Some(uploaded)) => {
+                    // Created before the call so that cancellation or failure before the head
+                    // still counts and records it, as an error.
+                    let mut recording = Recording::new(sink, rpc, origin, uploaded);
+                    let response = called.await?;
+                    recording.outcome = head_outcome(&response);
+                    Ok(response.map(|inner| Body::new(ObservedBody { inner, recording })))
                 }
-                if let Some(origin) = origin {
-                    sink.record(Observation::Call(Call {
-                        origin,
-                        rpc,
-                        outcome,
-                    }));
+                // `Execute` streams until its action ends, so it is recorded at its head.
+                (Some(rpc), None) => {
+                    let response = called.await?;
+                    if let Some(origin) = origin {
+                        sink.record(Observation::Call(Call {
+                            origin,
+                            rpc,
+                            outcome: head_outcome(&response),
+                            transferred: Transferred::default(),
+                        }));
+                    }
+                    Ok(response)
+                }
+                (None, _) => called.await,
+            }
+        })
+    }
+}
+
+/// A request body that adds the message bytes the service reads to a shared counter.
+struct Counting {
+    inner: Body,
+    read: Arc<AtomicU64>,
+}
+
+impl HttpBody for Counting {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_frame(cx);
+        if let Poll::Ready(Some(Ok(frame))) = &polled {
+            this.read.fetch_add(data_len(frame), Ordering::Relaxed);
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// A cache call, counted and recorded exactly once: by [`Recording::finish`], or as an error when
+/// dropped unfinished (cancelled or failed before its response head, or cut short mid-stream).
+struct Recording {
+    sink: ObservationSink,
+    rpc: Rpc,
+    /// The build the call belongs to, when its metadata names one; taken when recorded.
+    origin: Option<Origin>,
+    /// The head's outcome, until a trailer states another; an error until the head arrives.
+    outcome: CallOutcome,
+    /// The request message bytes the service read.
+    uploaded: Arc<AtomicU64>,
+    /// The response message bytes sent so far.
+    downloaded: u64,
+    /// Whether the call was counted and recorded.
+    finished: bool,
+}
+
+impl Recording {
+    fn new(
+        sink: ObservationSink,
+        rpc: Rpc,
+        origin: Option<Origin>,
+        uploaded: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            sink,
+            rpc,
+            origin,
+            outcome: CallOutcome::Error,
+            uploaded,
+            downloaded: 0,
+            finished: false,
+        }
+    }
+
+    /// Counts the call farm-wide and records it for its build, unless already done. A call that
+    /// did not reach its end is an error and never a hit.
+    fn finish(&mut self, ended: bool) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let outcome = if ended {
+            self.outcome
+        } else {
+            CallOutcome::Error
+        };
+        let transferred = Transferred {
+            uploaded: self.uploaded.load(Ordering::Relaxed),
+            downloaded: self.downloaded,
+        };
+        let lookup = self.rpc == Rpc::GetActionResult;
+        self.sink.count(Traffic {
+            lookups: u64::from(lookup),
+            hits: u64::from(lookup && outcome == CallOutcome::Ok),
+            uploaded: transferred.uploaded,
+            downloaded: transferred.downloaded,
+        });
+        if let Some(origin) = self.origin.take() {
+            self.sink.record(Observation::Call(Call {
+                origin,
+                rpc: self.rpc,
+                outcome,
+                transferred,
+            }));
+        }
+    }
+}
+
+impl Drop for Recording {
+    fn drop(&mut self) {
+        self.finish(false);
+    }
+}
+
+/// A cache call's response body. Its recording ends when the body ends, or when the body is
+/// dropped.
+struct ObservedBody {
+    inner: Body,
+    recording: Recording,
+}
+
+impl HttpBody for ObservedBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_frame(cx);
+        let recording = &mut this.recording;
+        match &polled {
+            Poll::Ready(Some(Ok(frame))) => {
+                recording.downloaded = recording.downloaded.saturating_add(data_len(frame));
+                // Trailers are the last frame; the server may not poll the body again.
+                if let Some(trailers) = frame.trailers_ref() {
+                    if let Some(status) = trailers.get(GRPC_STATUS_HEADER) {
+                        recording.outcome = grpc_outcome(status);
+                    }
+                    recording.finish(true);
+                } else if this.inner.is_end_stream() {
+                    recording.finish(true);
                 }
             }
-            Ok(response)
-        })
+            Poll::Ready(None) => recording.finish(true),
+            Poll::Ready(Some(Err(_))) => recording.finish(false),
+            Poll::Pending => {}
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for ObservedBody {
+    /// A body dropped after its last frame ended; one dropped before was cut short.
+    fn drop(&mut self) {
+        let ended = self.inner.is_end_stream();
+        self.recording.finish(ended);
     }
 }
 
@@ -246,5 +445,37 @@ mod tests {
                 .map(gang_types::ToolDetails::as_str),
             Some("bazel")
         );
+    }
+
+    /// Simulated flaws: observing only the action-cache lookups and uploads; matching a service
+    /// name as a bare prefix; wrapping the execution service like a cache.
+    #[test]
+    fn every_cache_service_method_is_observed_and_execute_alone_of_the_rest() {
+        let cases = [
+            ("ActionCache/GetActionResult", Some(Rpc::GetActionResult)),
+            (
+                "ActionCache/UpdateActionResult",
+                Some(Rpc::UpdateActionResult),
+            ),
+            ("ContentAddressableStorage/FindMissingBlobs", Some(Rpc::Cas)),
+            ("ContentAddressableStorage/BatchUpdateBlobs", Some(Rpc::Cas)),
+            ("ContentAddressableStorage/BatchReadBlobs", Some(Rpc::Cas)),
+            ("ContentAddressableStorage/GetTree", Some(Rpc::Cas)),
+            ("Execution/Execute", Some(Rpc::Execute)),
+            ("Execution/WaitExecution", None),
+            ("Capabilities/GetCapabilities", None),
+            ("ActionCacheMirror/GetActionResult", None),
+        ];
+        for (method, rpc) in cases {
+            let path = format!("/build.bazel.remote.execution.v2.{method}");
+            assert_eq!(classify(&path), rpc, "{path}");
+        }
+        for method in ["Read", "Write", "QueryWriteStatus"] {
+            let path = format!("/google.bytestream.ByteStream/{method}");
+            assert_eq!(classify(&path), Some(Rpc::Cas), "{path}");
+        }
+        for path in ["/google.longrunning.Operations/GetOperation", "/v1/status"] {
+            assert_eq!(classify(path), None, "{path}");
+        }
     }
 }

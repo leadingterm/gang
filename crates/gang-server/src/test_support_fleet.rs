@@ -61,5 +61,6 @@ pub fn queued_demand(candidates: FleetSet) -> QueuedDemand {
         resources: ActionResources::default(),
         queued_since: Timestamp::UNIX_EPOCH,
         priority: 0,
+        expected: None,
     }
 }

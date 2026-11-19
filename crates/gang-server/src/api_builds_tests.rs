@@ -6,7 +6,8 @@ use std::sync::Arc;
 use gang_clock::{TestClock, Timestamp};
 use gang_config::{BuildsConfig, EndpointTrust};
 use gang_spi::{
-    ApiService, Authenticated, Call, CallOutcome, Observation, ObservationSink, Origin, Rpc, Scheme,
+    ApiService, Authenticated, Call, CallOutcome, Observation, ObservationSink, Origin, Rpc,
+    Scheme, Transferred,
 };
 use gang_tls::RevocationSet;
 use gang_types::{BuildKey, InvocationId, Permission, PermissionSet};
@@ -38,6 +39,7 @@ fn observation(invocation: &str) -> Observation {
         },
         rpc: Rpc::GetActionResult,
         outcome: CallOutcome::Ok,
+        transferred: Transferred::default(),
     })
 }
 
