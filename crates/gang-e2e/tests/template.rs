@@ -386,6 +386,28 @@ fn vary_soft_memory_enforced_uses_default_memory_tuning() -> gang_e2e::Result<()
 }
 
 #[test]
+fn disk_soft_enforcement_is_opted_into_for_the_disk_scenario() -> gang_e2e::Result<()> {
+    let baseline = Variant::baseline(Sandbox::Noop);
+    let nativelink = varied_nativelink(baseline)?;
+    assert_eq!(
+        nativelink.disk.enforcement,
+        gang_nativelink::DiskEnforcement::Pressure
+    );
+
+    let variant = Variant {
+        soft_disk: true,
+        ..baseline
+    };
+    let nativelink = varied_nativelink(variant)?;
+    assert_eq!(
+        nativelink.disk.enforcement,
+        gang_nativelink::DiskEnforcement::Soft
+    );
+    assert_eq!(nativelink.disk.min_reservation.as_units(), 1024);
+    Ok(())
+}
+
+#[test]
 fn place_fails_naming_a_missing_section() -> gang_e2e::Result<()> {
     let text = base_config()?.replace("[cache.filesystem]", "[cache.other]");
     let error = ConfigTemplate::parse(&text).expect_err("an unknown cache plugin fails");

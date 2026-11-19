@@ -131,6 +131,8 @@ pub struct Variant {
     pub fleets: FleetLayout,
     /// Whether `NativeLink`'s soft memory enforcement runs beside the kernel limit.
     pub soft_memory: SoftMemory,
+    /// Whether the disk scenario opts into `NativeLink`'s soft disk enforcement.
+    pub soft_disk: bool,
     /// The identity family's knobs.
     pub identity: IdentityKnobs,
     /// The control-loop keys of the control scenarios.
@@ -152,6 +154,7 @@ impl Variant {
             limits: ActionLimits::Absent,
             fleets: FleetLayout::Single,
             soft_memory: SoftMemory::Enforced,
+            soft_disk: false,
             identity: IdentityKnobs::NONE,
             control: ControlKnobs::NONE,
             server: ServerKnobs::NONE,

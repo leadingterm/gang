@@ -76,6 +76,19 @@ pub(crate) enum NativeLinkConfigError {
         /// The fleet's memory, in KiB.
         memory_kb: u64,
     },
+    /// The minimum disk reservation cannot fit on this fleet.
+    #[error(
+        "[scheduler.nativelink.disk] min_reservation {min_kb} KiB is above fleet `{fleet}`'s disk of {disk_kb} KiB: lower [scheduler.nativelink.disk] min_reservation or raise the fleet's disk_per_instance"
+    )]
+    #[failure(config)]
+    DiskMinReservationAboveFleet {
+        /// The fleet that cannot fit the minimum.
+        fleet: String,
+        /// The minimum reservation, in KiB.
+        min_kb: u64,
+        /// The fleet's disk limit, in KiB.
+        disk_kb: u64,
+    },
 }
 
 /// Failures of the embedded `NativeLink` controller or worker.

@@ -387,6 +387,11 @@ impl ConfigTemplate {
         if variant.soft_memory == SoftMemory::Off {
             scheduler.memory.enforcement = gang_nativelink::MemoryEnforcement::None;
         }
+        if variant.soft_disk {
+            scheduler.disk.enforcement = gang_nativelink::DiskEnforcement::Soft;
+            // Keep the disk-hog probe's 4 MiB reservation below its 64 MiB output.
+            scheduler.disk.min_reservation = gang_nativelink::DiskMinReservation::from_units(1024);
+        }
         render_control(document, &variant.control)?;
         render_server(document, variant.server)?;
         render_execution(document, variant.execution)?;

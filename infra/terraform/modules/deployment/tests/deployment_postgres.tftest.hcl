@@ -160,7 +160,6 @@ override_module {
     controller_security_group_id = "sg-controller"
     worker_security_group_id     = "sg-worker"
     public_port                  = 443
-    execution_port               = 8443
     worker_port                  = 9090
     health_port                  = 8080
   }
@@ -214,6 +213,10 @@ run "rds_group_shape" {
   assert {
     condition     = output.controller_shape == "group" && strcontains(output.gang_toml, "[database.postgres]") && !strcontains(output.gang_toml, "[database.sqlite]") && strcontains(output.gang_toml, "host = \"${module.storage.postgres_address}\"") && module.storage.postgres_address != ""
     error_message = "RDS must use the group shape and render the instance address in the PostgreSQL section."
+  }
+  assert {
+    condition     = !strcontains(output.gang_toml, "execution_listen") && !strcontains(output.gang_toml, "execution_endpoint") && strcontains(output.gang_toml, "endpoint = \"https://gang.example.com\"") && strcontains(output.gang_toml, "worker_endpoint = \"grpcs://gang.example.com:9090\"")
+    error_message = "The PostgreSQL group must use one client endpoint and the private worker endpoint."
   }
   assert {
     condition     = strcontains(output.gang_toml, "password_file = \"/etc/gang/secrets/database-password\"") && strcontains(output.gang_toml, "ca_file = \"/etc/gang/rds-ca-bundle.pem\"")

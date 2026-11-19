@@ -19,6 +19,7 @@ use crate::composite::{ROOT_PATH, is_ui_path, under};
 use crate::cookies::cookie_value;
 use crate::core::Core;
 use crate::deployment::Stack;
+use crate::health::Readiness;
 
 /// The caller of one request on an open path, stored in the request's extensions when the gate
 /// has an outcome to report: who the request authenticated as, or why the gate refused its
@@ -77,6 +78,7 @@ pub(crate) struct Gate<K: Stack, P: AuthenticationPort> {
     /// The public listener's surface; `None` on the worker listener.
     public: Option<PublicSurface>,
     execution: bool,
+    readiness: Option<Readiness>,
 }
 
 impl<K: Stack, P: AuthenticationPort> Clone for Gate<K, P> {
@@ -86,6 +88,7 @@ impl<K: Stack, P: AuthenticationPort> Clone for Gate<K, P> {
             plugin: Arc::clone(&self.plugin),
             public: self.public.clone(),
             execution: self.execution,
+            readiness: self.readiness.clone(),
         }
     }
 }
@@ -100,6 +103,7 @@ impl<K: Stack> Gate<K, K::Clients> {
             core,
             public: Some(PublicSurface { proxies }),
             execution: false,
+            readiness: None,
         }
     }
 }
@@ -113,11 +117,18 @@ impl<K: Stack> Gate<K, K::Workers> {
             core,
             public: None,
             execution: false,
+            readiness: None,
         }
     }
 }
 
 impl<K: Stack, P: AuthenticationPort> Gate<K, P> {
+    /// Reject requests until this controller is serving as leader.
+    pub(crate) fn with_readiness(mut self, readiness: Readiness) -> Self {
+        self.readiness = Some(readiness);
+        self
+    }
+
     /// Marks open-path requests as originating on the execution listener.
     pub(crate) fn executing(mut self) -> Self {
         self.execution = true;
@@ -178,6 +189,13 @@ impl<K: Stack, P: AuthenticationPort + 'static> RequestGate for Gate<K, P> {
     /// stores nothing. A follower's ingest on the execution listener is admitted anonymously
     /// without asking the plugin. The result names the caller when it authenticated.
     async fn admit(&self, peer: &Peer, parts: &mut Parts) -> Result<Admitted, PortError> {
+        if self
+            .readiness
+            .as_ref()
+            .is_some_and(|ready| !ready.promoted())
+        {
+            return Err(PortError::unavailable("controller is not ready to lead"));
+        }
         let open_public = self
             .public
             .as_ref()

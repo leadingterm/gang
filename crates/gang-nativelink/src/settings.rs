@@ -17,7 +17,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
 use crate::config::{Http2Tuning, NativeLinkConfig, WholeSeconds};
-use crate::enforcement::{ColdStartTuning, DiskEnforcement, MemoryEnforcement, MemoryTuning};
+use crate::enforcement::{ColdStartTuning, DiskEnforcement, MemoryEnforcement};
 use crate::errors::NativeLinkConfigError;
 use crate::properties::{ACTION_STORE, CONTENT_STORE, WORKER_ACTION_STORE, WORKER_CONTENT_STORE};
 
@@ -46,6 +46,16 @@ pub(crate) fn scheduler(
                 fleet: fleet.name().to_owned(),
                 min_kb,
                 memory_kb,
+            });
+        }
+        let min_kb = config.disk.min_reservation.as_units();
+        if let Some(disk_kb) = fleet.limit(property::DISK_KB)
+            && min_kb > disk_kb
+        {
+            return Err(NativeLinkConfigError::DiskMinReservationAboveFleet {
+                fleet: fleet.name().to_owned(),
+                min_kb,
+                disk_kb,
             });
         }
     }
@@ -96,7 +106,7 @@ pub(crate) fn scheduler(
         "max_job_retries": tuning.max_job_retries,
         "max_worker_loss_retries": tuning.max_worker_loss_retries,
     });
-    if let Some(escalation) = memory_escalation(&config.memory) {
+    if let Some(escalation) = memory_escalation(config) {
         simple["memory_escalation"] = escalation;
     }
     let mut historical = json!({
@@ -115,15 +125,20 @@ pub(crate) fn scheduler(
     }))
 }
 
-/// The scheduler's memory escalation, which requeues a killed action with a larger reservation.
-/// Only `soft` memory enforcement kills actions, so it is absent otherwise.
-fn memory_escalation(memory: &MemoryTuning) -> Option<Value> {
-    (memory.enforcement == MemoryEnforcement::Soft).then(|| {
-        json!({
+/// Requeue memory kills and pressure disk kills with a shared escalation budget.
+fn memory_escalation(config: &NativeLinkConfig) -> Option<Value> {
+    let memory = &config.memory;
+    let pressure = config.disk.enforcement == DiskEnforcement::Pressure;
+    (memory.enforcement == MemoryEnforcement::Soft || pressure).then(|| {
+        let mut escalation = json!({
             "percent": memory.escalation_percent.get(),
             "max_steps": memory.escalation_max_steps,
             "cpu_property": property::CPU_MILLICORES,
-        })
+        });
+        if pressure {
+            escalation["disk_property"] = json!(property::DISK_KB);
+        }
+        escalation
     })
 }
 
@@ -394,6 +409,7 @@ fn resource_enforcement(config: &NativeLinkConfig) -> Option<Value> {
     let disk_name = match disk {
         DiskEnforcement::None => "none",
         DiskEnforcement::Guard => "guard",
+        DiskEnforcement::Pressure => "pressure",
         DiskEnforcement::Soft => "soft",
     };
     enforcement.insert("disk".to_owned(), json!(disk_name));
@@ -401,6 +417,16 @@ fn resource_enforcement(config: &NativeLinkConfig) -> Option<Value> {
         enforcement.insert(
             "disk_headroom_percent".to_owned(),
             json!(config.disk.headroom_percent),
+        );
+    }
+    if disk == DiskEnforcement::Pressure {
+        enforcement.insert(
+            "disk_pressure_free_percent".to_owned(),
+            json!(config.disk.pressure_free_percent),
+        );
+        enforcement.insert(
+            "disk_pressure_kill_after_s".to_owned(),
+            json!(config.disk.pressure_kill_after.as_units()),
         );
     }
     Some(Value::Object(enforcement))
@@ -484,7 +510,9 @@ mod tests {
 
     use super::*;
     use crate::config::NativeLinkConfig;
-    use crate::enforcement::{DiskTuning, EscalationPercent, MinReservation, WholeKib};
+    use crate::enforcement::{
+        DiskMinReservation, DiskTuning, EscalationPercent, MemoryTuning, MinReservation, WholeKib,
+    };
 
     fn config() -> NativeLinkConfig {
         serde_json::from_value(json!({
@@ -1183,6 +1211,7 @@ mod tests {
         assert_eq!(escalation.percent, 200);
         assert_eq!(escalation.max_steps, 8);
         assert_eq!(escalation.cpu_property, property::CPU_MILLICORES);
+        assert_eq!(escalation.disk_property, property::DISK_KB);
     }
 
     #[test]
@@ -1190,10 +1219,11 @@ mod tests {
         let content = memory_store();
         let action = memory_store();
         let fleets = catalog();
-        let config = config_with_memory(MemoryTuning {
+        let mut config = config_with_memory(MemoryTuning {
             enforcement: MemoryEnforcement::None,
             ..MemoryTuning::default()
         });
+        config.disk.enforcement = DiskEnforcement::Guard;
         let scheduler =
             scheduler(&config, &controller_spec(&content, &action, &fleets)).expect("scheduler");
         assert!(simple_of(&scheduler).memory_escalation.is_none());
@@ -1240,7 +1270,7 @@ mod tests {
         });
         let enforcement = resource_enforcement_of(&config).expect("resource_enforcement");
         assert_eq!(enforcement.memory, NativeMemoryEnforcement::None);
-        assert_eq!(enforcement.disk, NativeDiskEnforcement::Soft);
+        assert_eq!(enforcement.disk, NativeDiskEnforcement::Pressure);
     }
 
     #[test]
@@ -1257,10 +1287,45 @@ mod tests {
     }
 
     #[test]
-    fn worker_renders_disk_soft_enforcement_by_default() {
-        let enforcement = resource_enforcement_of(&config()).expect("resource_enforcement");
+    fn worker_renders_disk_pressure_enforcement_by_default() {
+        let config = config();
+        let enforcement = resource_enforcement_of(&config).expect("resource_enforcement");
+        assert_eq!(enforcement.disk, NativeDiskEnforcement::Pressure);
+        let rendered = resource_enforcement(&config).expect("resource_enforcement");
+        assert_eq!(rendered["disk"], "pressure");
+        assert_eq!(rendered["disk_pressure_free_percent"], 5);
+        assert_eq!(rendered["disk_pressure_kill_after_s"], 5);
+        assert!(rendered.get("disk_headroom_percent").is_none());
+    }
+
+    #[test]
+    fn custom_disk_pressure_settings_reach_the_worker() {
+        let config: NativeLinkConfig = serde_json::from_value(json!({
+            "scheduler_name": "MAIN_SCHEDULER",
+            "disk": { "pressure_free_percent": 12, "pressure_kill_after": "9s" }
+        }))
+        .expect("valid config");
+        let rendered = resource_enforcement(&config).expect("resource_enforcement");
+        assert_eq!(rendered["disk_pressure_free_percent"], 12);
+        assert_eq!(rendered["disk_pressure_kill_after_s"], 9);
+        let native = resource_enforcement_of(&config).expect("native resource enforcement");
+        assert_eq!(native.disk_pressure_free_percent, 12);
+        assert_eq!(native.disk_pressure_kill_after_s, 9);
+    }
+
+    #[test]
+    fn explicit_soft_disk_config_reaches_worker_with_headroom() {
+        let config: NativeLinkConfig = serde_json::from_value(json!({
+            "scheduler_name": "MAIN_SCHEDULER",
+            "disk": { "enforcement": "soft", "headroom_percent": 35 }
+        }))
+        .expect("valid config");
+        let enforcement = resource_enforcement_of(&config).expect("resource_enforcement");
         assert_eq!(enforcement.disk, NativeDiskEnforcement::Soft);
-        assert_eq!(enforcement.disk_headroom_percent, 20);
+        assert_eq!(enforcement.disk_headroom_percent, 35);
+        let rendered = resource_enforcement(&config).expect("resource_enforcement");
+        assert_eq!(rendered["disk"], "soft");
+        assert_eq!(rendered["disk_headroom_percent"], 35);
     }
 
     #[test]
@@ -1268,6 +1333,7 @@ mod tests {
         for (mode, expected) in [
             (DiskEnforcement::None, NativeDiskEnforcement::None),
             (DiskEnforcement::Guard, NativeDiskEnforcement::Guard),
+            (DiskEnforcement::Pressure, NativeDiskEnforcement::Pressure),
             (DiskEnforcement::Soft, NativeDiskEnforcement::Soft),
         ] {
             let config = config_with_disk(DiskTuning {
@@ -1285,6 +1351,7 @@ mod tests {
         let config = config_with_disk(DiskTuning {
             enforcement: DiskEnforcement::Soft,
             headroom_percent: HeadroomPercent::from_percent(35),
+            ..DiskTuning::default()
         });
         let enforcement = resource_enforcement_of(&config).expect("resource_enforcement");
         assert_eq!(enforcement.disk, NativeDiskEnforcement::Soft);
@@ -1447,6 +1514,47 @@ mod tests {
     }
 
     #[test]
+    fn disk_minimum_above_a_fleet_is_rejected() {
+        let content = memory_store();
+        let action = memory_store();
+        let fleets = catalog();
+        let mut config = config();
+        config.disk.min_reservation = DiskMinReservation::from_units(100 * 1024 * 1024 + 1);
+        assert!(matches!(
+            scheduler(&config, &controller_spec(&content, &action, &fleets)),
+            Err(NativeLinkConfigError::DiskMinReservationAboveFleet { fleet, .. }) if fleet == "fleet-a"
+        ));
+    }
+
+    #[test]
+    fn disk_escalation_is_only_enabled_for_pressure() {
+        let mut config = config();
+        for mode in [
+            DiskEnforcement::None,
+            DiskEnforcement::Guard,
+            DiskEnforcement::Soft,
+            DiskEnforcement::Pressure,
+        ] {
+            config.disk.enforcement = mode;
+            let escalation = memory_escalation(&config).expect("memory escalation");
+            assert_eq!(
+                escalation.get("disk_property").is_some(),
+                mode == DiskEnforcement::Pressure
+            );
+        }
+        config.memory.enforcement = MemoryEnforcement::None;
+        config.disk.enforcement = DiskEnforcement::Pressure;
+        assert_eq!(
+            memory_escalation(&config).expect("disk escalation")["disk_property"],
+            property::DISK_KB
+        );
+        assert_eq!(
+            resource_enforcement(&config).expect("disk enforcement")["memory"],
+            "none"
+        );
+    }
+
+    #[test]
     fn cold_start_one_kib_of_memory_over_the_only_fleet_is_rejected() {
         let content = memory_store();
         let action = memory_store();
@@ -1467,6 +1575,7 @@ mod tests {
         config.disk = DiskTuning {
             enforcement: DiskEnforcement::Soft,
             headroom_percent: HeadroomPercent::from_percent(35),
+            ..DiskTuning::default()
         };
         let enforcement = resource_enforcement_of(&config).expect("resource_enforcement");
         assert_eq!(enforcement.memory, NativeMemoryEnforcement::None);

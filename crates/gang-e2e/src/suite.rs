@@ -1018,7 +1018,10 @@ fn memory_checks(ctx: &RunContext<'_>) -> Vec<Check> {
 /// where the platform has one.
 fn disk_checks(ctx: &RunContext<'_>) -> Vec<Check> {
     attempt(Scenario::Disk, || {
-        let variant = Variant::baseline(Sandbox::native());
+        let variant = Variant {
+            soft_disk: true,
+            ..Variant::baseline(Sandbox::native())
+        };
         let stack = Stack::create(ctx.inputs, &variant, Transport::Tls, ctx.issuer)?;
         disk(&stack, stack.stderr_tail_lines(), cfg!(target_os = "linux"))
     })

@@ -126,8 +126,16 @@ run "group_resources_and_permissions" {
   }
 
   assert {
-    condition     = anytrue([for s in data.aws_iam_policy_document.this.statement : s.sid == "ControllerLifecycle" && contains(s.actions, "autoscaling:CompleteLifecycleAction") && contains(s.actions, "autoscaling:DescribeLifecycleHooks") && length(s.resources) == 1 && anytrue([for r in s.resources : endswith(r, ":autoScalingGroupName/${var.name}")])]) && anytrue([for s in data.aws_iam_policy_document.this.statement : s.sid == "Database" && length(s.resources) == 1 && contains(s.resources, var.dynamodb_table_arn) && contains(s.actions, "dynamodb:ConditionCheckItem")])
-    error_message = "Lifecycle and DynamoDB permissions must be scoped to the controller group and table."
+    condition     = anytrue([for s in data.aws_iam_policy_document.this.statement : s.sid == "ControllerLifecycle" && s.effect == "Allow" && toset(s.actions) == toset(["autoscaling:CompleteLifecycleAction"]) && toset(s.resources) == toset(["arn:aws:autoscaling:eu-north-1:000000000000:autoScalingGroup:*:autoScalingGroupName/${var.name}"])]) && anytrue([for s in data.aws_iam_policy_document.this.statement : s.sid == "Database" && length(s.resources) == 1 && contains(s.resources, var.dynamodb_table_arn) && contains(s.actions, "dynamodb:ConditionCheckItem")])
+    error_message = "Lifecycle completion and DynamoDB permissions must be scoped to the controller group and table."
+  }
+
+  assert {
+    condition = alltrue([
+      for action in ["autoscaling:DescribeAutoScalingGroups", "autoscaling:DescribeLifecycleHooks"] :
+      anytrue([for s in data.aws_iam_policy_document.this.statement : s.effect == "Allow" && contains(s.actions, action) && toset(s.resources) == toset(["*"])])
+    ])
+    error_message = "Controller group lifecycle discovery must allow both describe actions on all resources."
   }
 }
 

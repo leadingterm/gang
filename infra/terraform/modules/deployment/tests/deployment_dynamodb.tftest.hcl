@@ -195,8 +195,8 @@ run "dynamodb_group_shape" {
   }
 
   assert {
-    condition     = strcontains(output.gang_toml, "execution_listen = \"0.0.0.0:8443\"") && strcontains(output.gang_toml, "execution_endpoint = \"https://gang.example.com:8443\"") && strcontains(output.gang_toml, "worker_endpoint = \"grpcs://gang.example.com:9090\"")
-    error_message = "The group must use the public execution and private worker load-balancer endpoints."
+    condition     = !strcontains(output.gang_toml, "execution_listen") && !strcontains(output.gang_toml, "execution_endpoint") && strcontains(output.gang_toml, "endpoint = \"https://gang.example.com\"") && strcontains(output.gang_toml, "worker_endpoint = \"grpcs://gang.example.com:9090\"")
+    error_message = "The group must use one public endpoint and the private worker load-balancer endpoint."
   }
 
   assert {

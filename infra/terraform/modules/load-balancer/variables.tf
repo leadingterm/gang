@@ -56,8 +56,8 @@ variable "controller_instance_id" {
   default     = null
 
   validation {
-    condition     = var.execution || (var.controller_instance_id != null && var.controller_instance_id != "")
-    error_message = "controller_instance_id is required when execution is disabled."
+    condition     = var.shared_database || (var.controller_instance_id != null && var.controller_instance_id != "")
+    error_message = "controller_instance_id is required when shared_database is disabled."
   }
 }
 
@@ -67,8 +67,8 @@ variable "controller_private_ip" {
   default     = null
 
   validation {
-    condition     = var.execution || (var.controller_private_ip != null && var.controller_private_ip != "")
-    error_message = "controller_private_ip is required when execution is disabled."
+    condition     = var.shared_database || (var.controller_private_ip != null && var.controller_private_ip != "")
+    error_message = "controller_private_ip is required when shared_database is disabled."
   }
 }
 
@@ -89,8 +89,8 @@ variable "certificate_validation_timeout" {
   nullable    = false
 }
 
-variable "execution" {
-  description = "Enable the multi-controller execution and internal load balancer shape."
+variable "shared_database" {
+  description = "Enable the shared-database controller group and internal load balancer shape."
   type        = bool
   default     = false
   nullable    = false
@@ -103,8 +103,8 @@ variable "public_subnet_ids" {
   nullable    = false
 
   validation {
-    condition     = !var.execution || length(var.public_subnet_ids) > 0
-    error_message = "public_subnet_ids must not be empty when execution is enabled."
+    condition     = !var.shared_database || length(var.public_subnet_ids) > 0
+    error_message = "public_subnet_ids must not be empty when shared_database is enabled."
   }
 }
 
@@ -115,8 +115,8 @@ variable "private_subnet_ids" {
   nullable    = false
 
   validation {
-    condition     = !var.execution || length(var.private_subnet_ids) > 0
-    error_message = "private_subnet_ids must not be empty when execution is enabled."
+    condition     = !var.shared_database || length(var.private_subnet_ids) > 0
+    error_message = "private_subnet_ids must not be empty when shared_database is enabled."
   }
 }
 
@@ -126,8 +126,8 @@ variable "worker_security_group_id" {
   default     = null
 
   validation {
-    condition     = !var.execution || (var.worker_security_group_id != null && var.worker_security_group_id != "")
-    error_message = "worker_security_group_id is required when execution is enabled."
+    condition     = !var.shared_database || (var.worker_security_group_id != null && var.worker_security_group_id != "")
+    error_message = "worker_security_group_id is required when shared_database is enabled."
   }
 }
 
@@ -135,17 +135,6 @@ variable "private_zone_id" {
   description = "Existing private hosted zone ID, authoritative for hostname or a parent domain; null creates the hostname's private zone."
   type        = string
   default     = null
-}
-
-variable "execute_port" {
-  description = "Controller execution port: the execute listeners' port and their target port."
-  type        = number
-  nullable    = false
-
-  validation {
-    condition     = var.execute_port >= 1 && var.execute_port <= 65535 && floor(var.execute_port) == var.execute_port
-    error_message = "execute_port must be an integer TCP port from 1 to 65535."
-  }
 }
 
 variable "health_port" {

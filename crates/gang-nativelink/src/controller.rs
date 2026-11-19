@@ -47,7 +47,6 @@ use gang_types::{FleetCatalog, SaturatingInto};
 
 use crate::config::{Http2Tuning, NativeLinkConfig};
 use crate::durations::ActionDurations;
-use crate::enforcement::MinReservation;
 use crate::errors::NativeLinkEmbedError;
 use crate::fitted::FittedActions;
 use crate::globals;
@@ -110,8 +109,7 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
     let worker_services = settings::worker_services(config);
     let store_manager = build_stores(settings::controller_stores(spec)?).await?;
 
-    let (action_scheduler, worker_scheduler) =
-        scheduler_stack(&scheduler, spec.fleets, config.memory.min_reservation)?;
+    let (action_scheduler, worker_scheduler) = scheduler_stack(&scheduler, spec.fleets, config)?;
     let handoff = HandOff::new();
     let action_scheduler: Arc<dyn KnownPlatformPropertyProvider> =
         Arc::new(HandOffActions::new(action_scheduler, handoff.clone()));
@@ -320,21 +318,16 @@ type SchedulerHandles = (
 fn scheduler_stack(
     scheduler: &SchedulerConfig,
     fleets: &FleetCatalog,
-    min_reservation: MinReservation,
+    config: &NativeLinkConfig,
 ) -> Result<SchedulerHandles, NativeLinkEmbedError> {
-    action_stack(
-        scheduler,
-        fleets,
-        min_reservation,
-        |simple, notify, sketch| {
-            let db = memory_awaited_action_db_factory(
-                simple.retain_completed_for_s,
-                &notify,
-                SystemTime::now,
-            );
-            SimpleScheduler::new_with_resource_sketch(simple, db, notify, None, Some(sketch))
-        },
-    )
+    action_stack(scheduler, fleets, config, |simple, notify, sketch| {
+        let db = memory_awaited_action_db_factory(
+            simple.retain_completed_for_s,
+            &notify,
+            SystemTime::now,
+        );
+        SimpleScheduler::new_with_resource_sketch(simple, db, notify, None, Some(sketch))
+    })
 }
 
 /// Builds the action stack from the client inward: `PlaceableActions`,
@@ -345,7 +338,7 @@ fn scheduler_stack(
 fn action_stack(
     scheduler: &SchedulerConfig,
     fleets: &FleetCatalog,
-    min_reservation: MinReservation,
+    config: &NativeLinkConfig,
     simple_scheduler: impl FnOnce(
         &SimpleSpec,
         Arc<Notify>,
@@ -382,7 +375,8 @@ fn action_stack(
         simple_actions,
         fleets.clone(),
         admitted.clone(),
-        min_reservation,
+        config.memory.min_reservation,
+        config.disk.min_reservation,
     ));
     let historical = Arc::new(HistoricalResourceScheduler::new(
         historical_spec,
@@ -723,11 +717,8 @@ mod tests {
         let mut simple_slot = None;
         let mut sketch_slot = None;
         let mut notify_slot = None;
-        let (actions, workers) = action_stack(
-            &rendered,
-            fleets,
-            config.memory.min_reservation,
-            |simple, notify, sketch| {
+        let (actions, workers) =
+            action_stack(&rendered, fleets, config, |simple, notify, sketch| {
                 notify_slot = Some(Arc::clone(&notify));
                 let db = memory_awaited_action_db_factory(
                     simple.retain_completed_for_s,
@@ -756,8 +747,7 @@ mod tests {
                 simple_slot = Some(Arc::clone(&scheduler));
                 sketch_slot = Some(Arc::clone(&sketch));
                 (scheduler, workers)
-            },
-        )?;
+            })?;
         Ok((
             TestStack {
                 actions,
@@ -1324,8 +1314,7 @@ mod tests {
         };
         historical.learn_from_workers = false;
         let (actions, _workers) =
-            scheduler_stack(&scheduler, &fleets, config.memory.min_reservation)
-                .expect("scheduler stack");
+            scheduler_stack(&scheduler, &fleets, &config).expect("scheduler stack");
         let operation = OperationId::String("stack-wiring".to_owned());
         let digest = DigestInfo::new([1; 32], 1);
         let info = Arc::new(ActionInfo {
@@ -1414,8 +1403,7 @@ mod tests {
             panic!("historical scheduler")
         };
         historical.learn_from_workers = false;
-        let (actions, _) =
-            scheduler_stack(&scheduler, &fleets, config.memory.min_reservation).expect("stack");
+        let (actions, _) = scheduler_stack(&scheduler, &fleets, &config).expect("stack");
         let info = origin_test_action();
         let metadata = RequestMetadata {
             tool_invocation_id: "invocation".to_owned(),
