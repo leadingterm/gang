@@ -130,7 +130,7 @@ jobs:
           restore-only: 'true'
       - name: Build gang and e2e harness
         timeout-minutes: 50
-        run: bazel build --build_event_json_file="$RUNNER_TEMP/bazel-build.bep.json" --profile="$RUNNER_TEMP/bazel-build.profile.gz" //:gang //crates/gang-e2e:bundle
+        run: bazel build --build_event_json_file="$RUNNER_TEMP/bazel-build.bep.json" --profile="$RUNNER_TEMP/bazel-build.profile.gz" //crates/gang-e2e:bundle
       - uses: ./.github/actions/upload-gang
         with:
           target: x86_64-unknown-linux-musl

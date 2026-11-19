@@ -16,9 +16,9 @@ scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 BAZEL="$bazel" tools/ci-targets.sh --query | tools/ci-targets.sh 1 1 >"$scratch/targets"
 "$bazel" test "${flags[@]}" --skip_incompatible_explicit_targets --target_pattern_file="$scratch/targets"
-"$bazel" build "${flags[@]}" //:gang //crates/gang-e2e:bundle
-gang=$("$bazel" cquery "${flags[@]}" --output=files //:gang)
+"$bazel" build "${flags[@]}" //crates/gang-e2e:bundle
 bundle=$(dirname "$("$bazel" cquery "${flags[@]}" --output=files //crates/gang-e2e:bundle/local)")
+gang="$bundle/gang"
 tools/e2e-gate.sh "$bundle" "$gang" --gate 1
 tools/e2e-gate.sh "$bundle" "$gang" --gate 2 --additions --shard 1/2
 tools/e2e-gate.sh "$bundle" "$gang" --gate 2 --additions --shard 2/2
