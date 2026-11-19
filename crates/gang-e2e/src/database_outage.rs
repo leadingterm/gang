@@ -177,14 +177,14 @@ fn observe_unavailable(
 ) -> Result<(u16, bool, bool, bool)> {
     let started = clock.monotonic();
     let status = device_login(cluster)?;
-    let mut same_leader = cluster.leader() == Some(leader);
+    let mut no_other_leader = cluster.leaders().iter().all(|&index| index == leader);
     let mut workers_at_lapse = None;
     let mut no_new_workers = true;
     let mut worker_error = None;
     let mut demand = Some(start_demand);
     let mut queued = false;
     wait_state(cluster, |state| {
-        same_leader &= cluster.leader() == Some(leader);
+        no_other_leader &= cluster.leaders().iter().all(|&index| index == leader);
         if clock.monotonic().saturating_duration_since(started) >= VALIDITY {
             if let Some(start) = demand.take() {
                 start();
@@ -212,7 +212,7 @@ fn observe_unavailable(
     }
     Ok((
         status,
-        same_leader,
+        no_other_leader,
         no_new_workers && workers_at_lapse == Some(1),
         queued,
     ))
@@ -269,7 +269,8 @@ fn observe_outage(
     let during = observe_unavailable(cluster, leader, &clock, start_demand);
     cluster.database().set_unavailable(false)?;
     let restored_wall = clock.wall();
-    let (status, same_leader, no_new_workers, queued) = during?;
+    let (status, no_other_leader, no_new_workers, queued) = during?;
+    cluster.wait_for_single_leader(leader)?;
     let login = device_login(cluster)?;
     let after = cluster.scaling_events()?;
     let outage_events =
@@ -314,11 +315,11 @@ fn observe_outage(
         }),
         Check::expect(
             LEADER,
-            same_leader && cluster.leader() == Some(leader),
+            no_other_leader && cluster.leader() == Some(leader),
             || {
                 format!(
-                    "original leader {leader}, current leader {:?}",
-                    cluster.leader()
+                    "original leader {leader}, no_other_leader {no_other_leader}, final healthy leaders {:?}",
+                    cluster.leaders()
                 )
             },
         ),
