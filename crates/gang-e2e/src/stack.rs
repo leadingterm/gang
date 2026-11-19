@@ -136,6 +136,37 @@ pub struct Stack<'a> {
     pub(crate) server_http: Mutex<Option<Arc<crate::http::Http>>>,
 }
 
+/// Owns a separate Bazel server from preparation through its last build or early return.
+pub(crate) struct AdditionalBuild {
+    driver: Bazel,
+    remote: Remote,
+}
+
+impl AdditionalBuild {
+    pub(crate) fn build_until(
+        self,
+        probes: &[Probe],
+        run: &Run,
+        stop: oneshot::Receiver<String>,
+    ) -> Result<BuildOutcome> {
+        let result = self.driver.build_until(&self.remote, probes, Some(run), stop);
+        // A failed or cancelled build can leave its server wedged.
+        if result.is_ok() {
+            self.driver.shutdown(&self.remote);
+        }
+        result
+    }
+}
+
+impl Drop for AdditionalBuild {
+    fn drop(&mut self) {
+        // Also covers preparation failure, an unused prepared server, and failed shutdown.
+        if let Err(error) = self.driver.kill_servers() {
+            eprintln!("failed to kill the additional build's Bazel server: {error}");
+        }
+    }
+}
+
 impl<'a> Stack<'a> {
     /// Writes the configuration of `variant` over `transport` into a fresh placement, provisions
     /// the signer key of a mutual-TLS deployment, stages the sample into its workspace, and
@@ -595,18 +626,29 @@ impl<'a> Stack<'a> {
         output_root: &str,
         stop: oneshot::Receiver<String>,
     ) -> Result<BuildOutcome> {
-        let remote = self.remote()?;
-        let driver = self
-            .bazel
-            .with_output_user_root(self.placement.root().join(output_root));
-        let result = driver.build_until(&remote, probes, Some(run), stop);
-        // A failed or cancelled build can leave its server wedged; only a finished one stops cleanly.
-        if result.is_ok() {
-            driver.shutdown(&remote);
-        } else if let Err(error) = driver.kill_servers() {
-            eprintln!("failed to kill the additional build's Bazel server: {error}");
-        }
-        result
+        self.additional_build_in(output_root)?
+            .build_until(probes, run, stop)
+    }
+
+    /// Starts only the stack's Bazel server; the stack retains its cleanup ownership.
+    pub(crate) fn prepare_bazel(&self) -> Result<()> {
+        self.bazel.prepare(&self.remote()?)
+    }
+
+    /// Starts only the separate Bazel server, without loading or executing probe actions.
+    pub(crate) fn prepare_additional_in(&self, output_root: &str) -> Result<AdditionalBuild> {
+        let build = self.additional_build_in(output_root)?;
+        build.driver.prepare(&build.remote)?;
+        Ok(build)
+    }
+
+    fn additional_build_in(&self, output_root: &str) -> Result<AdditionalBuild> {
+        Ok(AdditionalBuild {
+            remote: self.remote()?,
+            driver: self
+                .bazel
+                .with_output_user_root(self.placement.root().join(output_root)),
+        })
     }
 
     /// Builds `probes` through `remote`, as `run` when there is one, returning how the build ended.

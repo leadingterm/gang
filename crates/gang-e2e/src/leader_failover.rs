@@ -461,7 +461,15 @@ fn build_check(checks: &[Check], outcome: &crate::build_output::BuildOutcome) ->
 pub fn leader_failover(cluster: &Cluster<'_>, zombie: bool) -> Result<Vec<Check>> {
     let old = cluster.wait_for_leader()?;
     // Minimum capacity makes the old-worker verdict non-vacuous before submitting demand.
-    wait_state(cluster, old, |state| !state.workers.is_empty())?;
+    std::thread::scope(|scope| -> Result<()> {
+        let preparation = scope.spawn(|| cluster.stack().prepare_bazel());
+        let ready = wait_state(cluster, old, |state| !state.workers.is_empty());
+        let prepared = preparation
+            .join()
+            .map_err(|_| E2eError::system("Bazel preparation thread panicked"))?;
+        ready?;
+        prepared
+    })?;
     let before = event_history(cluster, old)?;
     let signal = cluster.stack().signal_path();
     let journal = Journal::create(

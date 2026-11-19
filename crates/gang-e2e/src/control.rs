@@ -106,6 +106,7 @@ impl ControlKnobs {
     /// terminates only an unresumed drain; the interrupted build's outcome is not judged.
     pub const DRAIN_CANCEL: Self = Self {
         poll_interval: Some(Duration::from_secs(2)),
+        boot_grace: Some(Duration::from_secs(10)),
         idle_timeout: Some(Duration::from_secs(5)),
         max_drain_wait: Some(Duration::from_secs(10)),
         min_instances: Some(0),

@@ -149,6 +149,27 @@ impl Bazel {
         &self.action_tools.path
     }
 
+    /// Starts the server with `info output_base`, without loading targets or running actions.
+    /// The caller owns shutdown, including when preparation fails after starting a server.
+    pub(crate) fn prepare(&self, remote: &Remote) -> Result<()> {
+        let output = self.execute(self.prepare_command(remote))?;
+        if output.succeeded() {
+            return Ok(());
+        }
+        Err(E2eError::Command {
+            program: self.program.display().to_string(),
+            outcome: output.code.map_or_else(
+                || "terminated by a signal".to_owned(),
+                |code| format!("exited with status {code}"),
+            ),
+            output: output.combined(),
+        })
+    }
+
+    fn prepare_command(&self, remote: &Remote) -> Command {
+        self.invocation(remote, vec!["info".to_owned(), "output_base".to_owned()])
+    }
+
     /// Cleans the workspace's outputs through `remote`'s server.
     ///
     /// # Errors
@@ -326,6 +347,33 @@ mod tests {
                 assert!(env.contains(&(OsStr::new("PATH"), Some(OsStr::new(path)))));
             }
         }
+    }
+
+    #[test]
+    fn preparation_starts_only_the_server_in_the_selected_output_root() {
+        let driver = bazel(PathBuf::from("/output"))
+            .with_output_user_root(PathBuf::from("/demand-output"));
+        let remote = Remote::Plain {
+            bazelrc: PathBuf::from("/plain/rc"),
+            home: PathBuf::from("/plain/home"),
+        };
+        let command = driver.prepare_command(&remote);
+        let arguments: Vec<_> = command.get_args().collect();
+        assert_eq!(command.get_program(), OsStr::new("/tools/bazel"));
+        assert_eq!(command.get_current_dir(), Some(Path::new("/workspace")));
+        assert_eq!(
+            arguments,
+            [
+                "--output_user_root=/demand-output",
+                "--nohome_rc",
+                "--nosystem_rc",
+                "--noworkspace_rc",
+                "--bazelrc=/plain/rc",
+                "info",
+                "output_base",
+            ]
+            .map(OsStr::new),
+        );
     }
 
     #[test]

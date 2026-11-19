@@ -1332,7 +1332,7 @@ mod tests {
                     ]
                 }
             });
-            let names: Vec<_> = checks.iter().map(|check| check.name).collect();
+            let names: Vec<_> = checks.iter().map(|check| check.name.as_ref()).collect();
             assert_eq!(
                 names,
                 if variants[0] {
