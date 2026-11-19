@@ -75,7 +75,8 @@ run "assigned_ipv6_is_exported" {
     values = { ipv6_cidr_block = "2600:1f00:abcd:1200::/56" }
   }
   assert {
-    condition     = output.vpc_ipv6_cidr_blocks == ["2600:1f00:abcd:1200::/56"]
+    # The output's conditional unifies its branches to list(string), not a tuple.
+    condition     = output.vpc_ipv6_cidr_blocks == tolist(["2600:1f00:abcd:1200::/56"])
     error_message = "The network must expose its assigned IPv6 CIDR."
   }
 }

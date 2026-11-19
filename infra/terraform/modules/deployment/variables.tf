@@ -288,9 +288,9 @@ variable "controller_state_volume_gib" {
 
 variable "fleets" {
   type = list(object({
-    name                        = string
-    isa                         = string
-    sandbox                     = optional(string, "bwrap")
+    name    = string
+    isa     = string
+    sandbox = optional(string, "bwrap")
     actions = optional(object({
       grants = optional(set(string), [])
       resources = optional(object({

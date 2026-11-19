@@ -262,11 +262,11 @@ run "network_grant_requires_egress" {
   command = plan
   variables {
     fleets = [{
-      name = "worker", isa = "x86-64", capacity = "spot"
-      instance_types = ["c6id.4xlarge"]
-      max_instances = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
+      name              = "worker", isa = "x86-64", capacity = "spot"
+      instance_types    = ["c6id.4xlarge"]
+      max_instances     = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
       disk_per_instance = "200GiB", target_actions_per_instance = 16
-      actions = { grants = ["network"] }
+      actions           = { grants = ["network"] }
     }]
   }
   expect_failures = [terraform_data.input_checks]
@@ -276,11 +276,11 @@ run "rejects_unknown_capability" {
   command = plan
   variables {
     fleets = [{
-      name = "worker", isa = "x86-64", capacity = "spot"
-      instance_types = ["c6id.4xlarge"]
-      max_instances = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
+      name              = "worker", isa = "x86-64", capacity = "spot"
+      instance_types    = ["c6id.4xlarge"]
+      max_instances     = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
       disk_per_instance = "200GiB", target_actions_per_instance = 16
-      actions = { grants = ["unknown"] }
+      actions           = { grants = ["unknown"] }
     }]
   }
   expect_failures = [var.fleets]
@@ -290,11 +290,11 @@ run "rejects_invalid_action_cpu" {
   command = plan
   variables {
     fleets = [{
-      name = "worker", isa = "x86-64", capacity = "spot"
-      instance_types = ["c6id.4xlarge"]
-      max_instances = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
+      name              = "worker", isa = "x86-64", capacity = "spot"
+      instance_types    = ["c6id.4xlarge"]
+      max_instances     = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
       disk_per_instance = "200GiB", target_actions_per_instance = 16
-      actions = { resources = { cpu_count = 0 } }
+      actions           = { resources = { cpu_count = 0 } }
     }]
   }
   expect_failures = [var.fleets]
@@ -311,7 +311,7 @@ run "rejects_empty_egress_dns" {
 run "protects_assigned_addresses_with_empty_additional_networks" {
   command = apply
   variables {
-    hostname = "gang.example.com"
+    hostname      = "gang.example.com"
     load_balancer = {}
     execution_egress = {
       protected_networks = []
@@ -319,16 +319,17 @@ run "protects_assigned_addresses_with_empty_additional_networks" {
       setup_timeout      = "12s"
     }
     fleets = [{
-      name = "worker", isa = "x86-64", capacity = "spot"
-      instance_types = ["c6id.4xlarge"]
-      max_instances = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
+      name              = "worker", isa = "x86-64", capacity = "spot"
+      instance_types    = ["c6id.4xlarge"]
+      max_instances     = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
       disk_per_instance = "200GiB", target_actions_per_instance = 16
-      actions = { grants = ["network"], resources = { cpu_count = 2, memory = "1GiB", disk = "2GiB" } }
+      actions           = { grants = ["network"], resources = { cpu_count = 2, memory = "1GiB", disk = "2GiB" } }
     }]
   }
   override_resource {
     target = module.network.aws_vpc.this
-    values = { cidr_block = "10.20.0.0/16", ipv6_cidr_block = "2600:1f00:abcd:1200::/56" }
+    # IPv4 comes from var.cidr_block; only override the computed IPv6 attribute.
+    values = { ipv6_cidr_block = "2600:1f00:abcd:1200::/56" }
   }
   assert {
     condition = alltrue([
@@ -355,16 +356,16 @@ run "network_grant_defaults_additional_networks_to_empty" {
   variables {
     execution_egress = { dns_servers = ["1.1.1.1"] }
     fleets = [{
-      name = "worker", isa = "x86-64", capacity = "spot"
-      instance_types = ["c6id.4xlarge"]
-      max_instances = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
+      name              = "worker", isa = "x86-64", capacity = "spot"
+      instance_types    = ["c6id.4xlarge"]
+      max_instances     = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
       disk_per_instance = "200GiB", target_actions_per_instance = 16
-      actions = { grants = ["network"] }
+      actions           = { grants = ["network"] }
     }]
   }
   override_resource {
     target = module.network.aws_vpc.this
-    values = { cidr_block = "10.20.0.0/16", ipv6_cidr_block = "2600:1f00:abcd:1200::/56" }
+    values = { ipv6_cidr_block = "2600:1f00:abcd:1200::/56" }
   }
   assert {
     condition     = length(var.execution_egress.protected_networks) == 0 && length(local.protected_networks) > 0 && contains(local.protected_networks, "10.20.0.0/16") && strcontains(output.gang_toml, "[execution.egress]\nprotected_networks = ${jsonencode(local.protected_networks)}")
@@ -380,11 +381,11 @@ run "resource_ceilings_without_grants_omit_grants_table" {
   command = apply
   variables {
     fleets = [{
-      name = "worker", isa = "x86-64", capacity = "spot"
-      instance_types = ["c6id.4xlarge"]
-      max_instances = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
+      name              = "worker", isa = "x86-64", capacity = "spot"
+      instance_types    = ["c6id.4xlarge"]
+      max_instances     = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
       disk_per_instance = "200GiB", target_actions_per_instance = 16
-      actions = { resources = { cpu_count = 2 } }
+      actions           = { resources = { cpu_count = 2 } }
     }]
   }
   assert {
@@ -662,7 +663,7 @@ run "renders_gang_settings_override" {
 
   variables {
     gang_settings = {
-      poll_interval           = "3s"
+      poll_interval = "3s"
     }
   }
 
