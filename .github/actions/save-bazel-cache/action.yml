@@ -1,36 +1,114 @@
 name: Save the Bazel caches
 description: >-
-  Save the Bazel disk and repository archive caches restored by .github/actions/setup-bazel.
-  After a successful job unused disk entries and complete archive entries are dropped;
-  a failed or timed-out job preserves them so a cold run's progress carries over.
-  Only default-branch pushes with no exact restore save a cache.
+  Export or merge Bazel working sets, or save a single job's cache snapshot.
 inputs:
   prune:
-    description: Drop the entries this job did not use. Pass true only when every Bazel step of the job succeeded.
+    description: Export only used entries when all Bazel steps succeeded.
     required: true
+  mode:
+    description: One of save, export, or merge.
+    default: save
+  shard:
+    description: Shard identifier for artifacts and metrics.
+    default: ''
+  merge-path:
+    description: Directory containing downloaded working-set artifacts.
+    default: ''
+  snapshot-budget:
+    description: Override the compressed snapshot budget in bytes.
+    default: ''
 runs:
   using: composite
   steps:
-    - name: Drop the entries this job did not use
-      if: env.BAZEL_DISK_CACHE_SAVE == 'true' && inputs.prune == 'true'
+    - name: Validate cache mode
+      id: validate
+      if: always()
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        SHARD: ${{ inputs.shard }}
+        MERGE_PATH: ${{ inputs.merge-path }}
+      run: |
+        case "$MODE" in
+          save) ;;
+          export) test -n "$SHARD" ;;
+          merge) test -n "$MERGE_PATH" ;;
+          *) echo "::error::Invalid Bazel cache mode: $MODE"; exit 1 ;;
+        esac
+    - name: Stop Bazel before exporting or saving
+      id: shutdown
+      if: always() && steps.validate.outcome != 'failure' && (inputs.mode == 'export' && inputs.prune == 'true' || inputs.mode == 'save' && env.BAZEL_DISK_CACHE_SAVE == 'true')
+      shell: bash
+      run: nix develop -c bazel shutdown
+    - name: Export shard working set
+      if: inputs.mode == 'export' && inputs.prune == 'true'
       shell: bash
       run: |
+        tools/ci-cache.sh export "$BAZEL_DISK_CACHE" "$BAZEL_REPOSITORY_CACHE" "$BAZEL_DISK_CACHE_EPOCH_SECONDS" "$RUNNER_TEMP/bazel-working-set"
+    - name: Upload shard working set
+      if: inputs.mode == 'export' && inputs.prune == 'true'
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: bazel-working-set-${{ inputs.shard }}
+        path: ${{ runner.temp }}/bazel-working-set
+        if-no-files-found: error
+        retention-days: 1
+    - name: Prepare snapshot
+      id: prepare
+      if: always() && steps.validate.outcome == 'success' && env.BAZEL_DISK_CACHE_SAVE == 'true' && (inputs.mode == 'save' && inputs.prune == 'true' && steps.shutdown.outcome == 'success' || inputs.mode == 'merge' && job.status == 'success')
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        MERGE_PATH: ${{ inputs.merge-path }}
+        SNAPSHOT_BUDGET: ${{ inputs.snapshot-budget }}
+        EVENT: ${{ github.event_name }}
+      run: |
         set -euo pipefail
-        find "$BAZEL_DISK_CACHE" -type f ! -newer "$BAZEL_DISK_CACHE_EPOCH" -delete
-        archive_root="$BAZEL_REPOSITORY_CACHE/content_addressable"
-        if [[ -d "$archive_root" ]]; then
-          find "$archive_root" -type f -name file ! -newer "$BAZEL_DISK_CACHE_EPOCH" -print0 |
-            while IFS= read -r -d '' archive; do
-              entry=${archive%/*}
-              if [[ ${entry%/*/*} != "$archive_root" ]]; then
-                echo "::error::Unexpected repository cache archive path: $archive" >&2
-                exit 1
-              fi
-              rm -rf -- "$entry"
-            done
+        staging="$RUNNER_TEMP/bazel-merged"
+        if [[ $MODE == merge ]]; then
+          [[ -d $MERGE_PATH && ! -L $MERGE_PATH ]]
+          shopt -s nullglob
+          children=("$MERGE_PATH"/*/)
+          if (( ${#children[@]} == 0 )); then
+            echo '::error::No downloaded Bazel working sets found'
+            exit 1
+          fi
+          for child in "${children[@]}"; do
+            [[ ! -L ${child%/} ]] || { echo "::error::Symlink working-set directory"; exit 1; }
+          done
+          tools/ci-cache.sh merge "$staging" "${children[@]}"
+        else
+          tools/ci-cache.sh export "$BAZEL_DISK_CACHE" "$BAZEL_REPOSITORY_CACHE" "$BAZEL_DISK_CACHE_EPOCH_SECONDS" "$staging"
         fi
+        budget=$SNAPSHOT_BUDGET
+        if [[ -z $budget ]]; then
+          case "$EVENT:$BAZEL_CACHE_JOB" in
+            pull_request:linux-x86_64) budget=1200000000 ;;
+            pull_request:cross) budget=600000000 ;;
+            pull_request:*) budget=800000000 ;;
+            *:linux-x86_64) budget=1800000000 ;;
+            *:cross) budget=1000000000 ;;
+            *) budget=1200000000 ;;
+          esac
+        fi
+        limit_log="$RUNNER_TEMP/bazel-cache-limit.log"
+        if ! tools/ci-cache.sh limit "$staging" "$budget" 2>"$limit_log"; then
+          cat "$limit_log" >&2
+          exit 1
+        fi
+        cat "$limit_log"
+        while IFS= read -r line; do
+          if [[ $line =~ after=([0-9]+) ]]; then
+            echo "Bazel snapshot: ${BASH_REMATCH[1]} compressed bytes (budget $budget); key: $BAZEL_DISK_CACHE_KEY" >> "$GITHUB_STEP_SUMMARY"
+          fi
+        done < "$limit_log"
+        [[ $BAZEL_DISK_CACHE == "$HOME/.cache/bazel-disk" && $BAZEL_REPOSITORY_CACHE == "$HOME/.cache/bazel-repository" ]]
+        rm -rf -- "$BAZEL_DISK_CACHE" "$BAZEL_REPOSITORY_CACHE/content_addressable"
+        mkdir -p -- "$BAZEL_REPOSITORY_CACHE"
+        mv -- "$staging/disk" "$BAZEL_DISK_CACHE"
+        mv -- "$staging/repository/content_addressable" "$BAZEL_REPOSITORY_CACHE/content_addressable"
     - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      if: env.BAZEL_DISK_CACHE_SAVE == 'true'
+      if: always() && steps.validate.outcome == 'success' && env.BAZEL_DISK_CACHE_SAVE == 'true' && steps.prepare.outcome == 'success' && (inputs.mode == 'save' && steps.shutdown.outcome == 'success' || inputs.mode == 'merge' && job.status == 'success')
       with:
         path: |
           ${{ env.BAZEL_DISK_CACHE }}
@@ -39,7 +117,7 @@ runs:
     - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       if: always()
       with:
-        name: ci-metrics-${{ github.job }}-${{ github.run_attempt }}
+        name: ci-metrics-${{ github.job }}${{ inputs.shard != '' && format('-{0}', inputs.shard) || '' }}-${{ github.run_attempt }}
         path: |
           ${{ runner.temp }}/bazel-*.json
           ${{ runner.temp }}/bazel-*.gz

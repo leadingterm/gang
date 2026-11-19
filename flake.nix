@@ -202,8 +202,11 @@
               bazel
               pkgs.actionlint
               pkgs.alejandra
+              pkgs.findutils
+              pkgs.gnutar
               pkgs.shellcheck
               pkgs.yq-go
+              pkgs.zstd
             ]
             ++ deployTools
             ++ lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.bubblewrap;

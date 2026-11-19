@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Partition the Linux x86-64 CI suite and share bounded native GitHub cache snapshots.
+
 ## 0.3.1
 
 ### Added

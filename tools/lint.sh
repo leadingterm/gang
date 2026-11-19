@@ -9,6 +9,8 @@ portable() {
   tools/check-required-jobs_test.sh
   tools/check-opentofu-tests.sh
   tools/ci-changes_test.sh
+  tools/ci-targets_test.sh
+  tools/ci-cache_test.sh
   tools/release-notes_test.sh
   tools/release-ci_test.sh
   alejandra --check .

@@ -7,10 +7,10 @@ inputs:
     description: Enable KVM access for VM builds on Linux x86-64.
     required: false
     default: 'false'
-  cache-scope:
-    description: Nix cache scope for the devShell, portable checks, or VM builds.
+  cache-save:
+    description: Save the shared Nix cache on eligible pull requests and default-branch pushes.
     required: false
-    default: devshell
+    default: 'false'
 runs:
   using: composite
   steps:
@@ -31,10 +31,22 @@ runs:
       with:
         enable_kvm: ${{ inputs.kvm }}
     - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
+      if: runner.os != 'macOS'
       with:
-        primary-key: nix-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-scope }}-${{ hashFiles('flake.lock', 'flake.nix', 'MODULE.bazel', 'tools/darwin-check.sh', '.github/actions/setup-nix/action.yml') }}-${{ inputs.cache-scope == 'vm' && hashFiles('infra/nixos/**/*', 'configs/gang.aws.toml', 'infra/terraform/modules/network/ports.json') || 'shared' }}
-        restore-prefixes-first-match: nix-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-scope }}-
-        save: ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+        primary-key: nix-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'flake.nix', 'MODULE.bazel', 'tools/darwin-check.sh', '.github/actions/setup-nix/action.yml') }}
+        restore-prefixes-first-match: |
+          nix-v1-${{ runner.os }}-${{ runner.arch }}-vm-
+          nix-v1-${{ runner.os }}-${{ runner.arch }}-portable-
+          nix-v1-${{ runner.os }}-${{ runner.arch }}-devshell-
+          nix-v1-${{ runner.os }}-${{ runner.arch }}-
+        save: ${{ inputs.cache-save == 'true' && runner.os != 'macOS' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))) }}
+        gc-max-store-size: 1G
+    # Root the devShell before post-job GC. Roots can exceed the GC target;
+    # unrooted VM closures may need to be fetched or rebuilt.
+    - name: Root shared devShell for cache
+      if: runner.os == 'Linux' && inputs.cache-save == 'true'
+      shell: bash
+      run: nix develop --profile "$RUNNER_TEMP/ci-devshell-profile" -c true
     - name: Verify KVM access and Nix system feature
       if: inputs.kvm == 'true' && runner.os == 'Linux' && runner.arch == 'X64'
       shell: bash

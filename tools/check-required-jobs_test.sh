@@ -51,10 +51,17 @@ for dependency in changes lint-arm64 nix-vm; do
   dependency="$dependency" yq -i 'del(.jobs.lint.needs[] | select(. == strenv(dependency)))' "$fixture"
   expect failure "lint missing $dependency prerequisite" "$guard" "$fixture"
 done
-for dependency in changes e2e-gate-2-shard-1 e2e-gate-2-shard-2; do
+for dependency in changes linux-x86_64-shards; do
   cp "$workflow" "$fixture"
-  dependency="$dependency" yq -i 'del(.jobs.e2e-gate-2.needs[] | select(. == strenv(dependency)))' "$fixture"
-  expect failure "e2e-gate-2 missing $dependency prerequisite" "$guard" "$fixture"
+  dependency="$dependency" yq -i 'del(.jobs.linux-x86_64.needs[] | select(. == strenv(dependency)))' "$fixture"
+  expect failure "linux-x86_64 missing $dependency prerequisite" "$guard" "$fixture"
+done
+for job in e2e-gate-1 e2e-gate-2; do
+  for dependency in changes "$job-shards"; do
+    cp "$workflow" "$fixture"
+    job="$job" dependency="$dependency" yq -i 'del(.jobs[strenv(job)].needs[] | select(. == strenv(dependency)))' "$fixture"
+    expect failure "$job missing $dependency prerequisite" "$guard" "$fixture"
+  done
 done
 cp "$workflow" "$fixture"
 yq -i '(.jobs.required.steps[] | select(.env.NEEDS_RESULTS != null) | .env.NEEDS_RESULTS) |= sub("needs[.]lint-arm64[.]result", "success")' "$fixture"
@@ -69,10 +76,10 @@ cp "$workflow" "$fixture"
 yq -i 'del(.jobs.linux-arm64.needs)' "$fixture"
 expect failure 'heavy leaf missing changes dependency' "$guard" "$fixture"
 cp "$workflow" "$fixture"
-yq -i 'del(.jobs.e2e-gate-1.needs[] | select(. == "changes"))' "$fixture"
+yq -i 'del(.jobs.e2e-gate-1-shards.needs[] | select(. == "changes"))' "$fixture"
 expect failure 'e2e leaf missing changes dependency' "$guard" "$fixture"
 
-for job in lint e2e-gate-2 required; do
+for job in lint linux-x86_64 e2e-gate-1 e2e-gate-2 required; do
   cp "$workflow" "$fixture"
   job="$job" yq -i '.jobs[strenv(job)].if = "success()"' "$fixture"
   expect failure "conditional $job aggregator" "$guard" "$fixture"
@@ -80,7 +87,7 @@ done
 
 # Execute the actual workflow body with Nix flake tools to test runner behavior.
 
-for job in lint e2e-gate-2 required; do
+for job in lint linux-x86_64 e2e-gate-1 e2e-gate-2 required; do
   body="$scratch/$job.sh"
   jq -er --arg job "$job" '
     [.[$job].steps[] | select(.env.NEEDS_RESULTS != null) | .run]

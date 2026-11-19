@@ -38,7 +38,7 @@ yq -o=json '.jobs' "$workflow" | jq -e '
                   .
                 end
               |
-              reduce ["lint", "e2e-gate-2", "required"][] as $job (true;
+              reduce ["lint", "linux-x86_64", "e2e-gate-1", "e2e-gate-2", "required"][] as $job (true;
                 if ($jobs[$job] | if type == "object" then .if else null end) == "always()" then
                   .
                 else
@@ -47,13 +47,19 @@ yq -o=json '.jobs' "$workflow" | jq -e '
               | if ($jobs.lint.needs | if type == "array" then sort else . end)
                    != ["changes", "lint-arm64", "nix-vm"] then
                   error("lint must depend on changes, lint-arm64, and nix-vm")
+                elif ($jobs["linux-x86_64"].needs | if type == "array" then sort else . end)
+                     != ["changes", "linux-x86_64-shards"] then
+                  error("linux-x86_64 must depend on changes and all shards")
+                elif ($jobs["e2e-gate-1"].needs | if type == "array" then sort else . end)
+                     != ["changes", "e2e-gate-1-shards"] then
+                  error("e2e-gate-1 must depend on changes and all shards")
                 elif ($jobs["e2e-gate-2"].needs | if type == "array" then sort else . end)
-                     != ["changes", "e2e-gate-2-shard-1", "e2e-gate-2-shard-2"] then
-                  error("e2e-gate-2 must depend on changes and both shards")
+                     != ["changes", "e2e-gate-2-shards"] then
+                  error("e2e-gate-2 must depend on changes and all shards")
                 else
                   .
                 end
-              | reduce (($jobs | keys) - ["changes", "lint", "e2e-gate-2", "required"])[] as $job (.;
+              | reduce (($jobs | keys) - ["changes", "lint", "linux-x86_64", "e2e-gate-1", "e2e-gate-2", "required"])[] as $job (.;
                   ($jobs[$job].needs // []) as $deps
                   | if ($jobs[$job] | type) == "object"
                        and ($deps == "changes" or (($deps | type) == "array" and ($deps | index("changes")) != null)) then

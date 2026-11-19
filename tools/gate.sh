@@ -8,10 +8,19 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 tools/lint.sh
 bazel=${BAZEL:-bazel}
-# Use the shipping optimized configuration without uploading results to a remote cache.
-flags=(--compilation_mode=opt --remote_upload_local_results=false)
+# Disable inherited remote services without disabling the local disk cache.
+flags=(--compilation_mode=opt --remote_cache= --remote_executor=)
 "$bazel" run "${flags[@]}" //:gazelle.check
-"$bazel" test "${flags[@]}" //...
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+manual_tests=$("$bazel" query 'attr("tags", "(^|, |\\[)manual(, |\\]$)", kind(".*_test rule", //...) union kind("test_suite rule", //...))')
+if [[ -n $manual_tests ]]; then
+  printf 'Manual tests or test suites would be excluded:\n%s\n' "$manual_tests" >&2
+  exit 1
+fi
+"$bazel" query 'tests(//...) union (kind(".* rule", //...) except kind(".*_test rule", //...) except kind("test_suite rule", //...) except attr("tags", "(^|, |\\[)manual(, |\\]$)", //...))' |
+  tools/ci-targets.sh 1 1 >"$scratch/targets"
+"$bazel" test "${flags[@]}" --skip_incompatible_explicit_targets --target_pattern_file="$scratch/targets"
 "$bazel" build "${flags[@]}" //:gang //crates/gang-e2e:bundle
 gang=$("$bazel" cquery "${flags[@]}" --output=files //:gang)
 bundle=$(dirname "$("$bazel" cquery "${flags[@]}" --output=files //crates/gang-e2e:bundle/local)")
