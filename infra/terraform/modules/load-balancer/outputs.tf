@@ -32,24 +32,14 @@ output "serve_target_group_arn" {
   value       = aws_lb_target_group.this.arn
 }
 
-output "execute_target_group_arn" {
-  description = "ARN of the public execution target group, or null when disabled."
-  value       = one(aws_lb_target_group.execute[*].arn)
-}
-
 output "internal_serve_target_group_arn" {
   description = "ARN of the internal serve target group, or null when disabled."
-  value       = var.execution ? aws_lb_target_group.internal["serve"].arn : null
-}
-
-output "internal_execute_target_group_arn" {
-  description = "ARN of the internal execution target group, or null when disabled."
-  value       = var.execution ? aws_lb_target_group.internal["execute"].arn : null
+  value       = var.shared_database ? aws_lb_target_group.internal["serve"].arn : null
 }
 
 output "workers_target_group_arn" {
   description = "ARN of the internal worker target group, or null when disabled."
-  value       = var.execution ? aws_lb_target_group.internal["workers"].arn : null
+  value       = var.shared_database ? aws_lb_target_group.internal["workers"].arn : null
 }
 
 output "internal_dns_name" {

@@ -5,10 +5,6 @@ listen = ${jsonencode("0.0.0.0:${public_port}")}
 %{ if health_port != null ~}
 health_listen = ${jsonencode("0.0.0.0:${health_port}")}
 %{ endif ~}
-%{ if database_engine != "sqlite" ~}
-execution_listen = ${jsonencode("0.0.0.0:${execution_port}")}
-execution_endpoint = ${jsonencode(execution_endpoint)}
-%{ endif ~}
 worker_listen = ${jsonencode("0.0.0.0:${worker_port}")}
 endpoint = ${jsonencode(endpoint)}
 %{ for f in fleets }

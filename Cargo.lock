@@ -2297,7 +2297,7 @@ dependencies = [
 
 [[package]]
 name = "gang-authn"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "base64 0.23.1",
  "gang-clock",
@@ -2317,7 +2317,7 @@ dependencies = [
 
 [[package]]
 name = "gang-aws"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "aws-config",
  "aws-credential-types",
@@ -2354,7 +2354,7 @@ dependencies = [
 
 [[package]]
 name = "gang-aws-sdk"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "aws-config",
  "aws-runtime",
@@ -2370,7 +2370,7 @@ dependencies = [
 
 [[package]]
 name = "gang-bindings"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "gang-types",
  "gang-ui",
@@ -2383,7 +2383,7 @@ dependencies = [
 
 [[package]]
 name = "gang-bwrap"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "gang-os",
  "gang-spi",
@@ -2399,7 +2399,7 @@ dependencies = [
 
 [[package]]
 name = "gang-cgroup"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "gang-clock",
  "gang-spi",
@@ -2416,7 +2416,7 @@ dependencies = [
 
 [[package]]
 name = "gang-client"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2446,7 +2446,7 @@ dependencies = [
 
 [[package]]
 name = "gang-clock"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "gang-types",
  "parking_lot",
@@ -2460,7 +2460,7 @@ dependencies = [
 
 [[package]]
 name = "gang-config"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "gang-clock",
  "gang-macros",
@@ -2475,7 +2475,7 @@ dependencies = [
 
 [[package]]
 name = "gang-deploy"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "base64 0.23.1",
  "hex",
@@ -2488,7 +2488,7 @@ dependencies = [
 
 [[package]]
 name = "gang-dynamodb"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "aws-credential-types",
  "aws-sdk-dynamodb",
@@ -2506,7 +2506,7 @@ dependencies = [
 
 [[package]]
 name = "gang-e2e"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2559,7 +2559,7 @@ dependencies = [
 
 [[package]]
 name = "gang-embed"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "hex",
  "sha2 0.11.1",
@@ -2569,7 +2569,7 @@ dependencies = [
 
 [[package]]
 name = "gang-exec"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "futures",
  "gang-config",
@@ -2590,7 +2590,7 @@ dependencies = [
 
 [[package]]
 name = "gang-insight"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "gang-clock",
  "gang-config",
@@ -2604,7 +2604,7 @@ dependencies = [
 
 [[package]]
 name = "gang-local"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2631,7 +2631,7 @@ dependencies = [
 
 [[package]]
 name = "gang-macros"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2640,7 +2640,7 @@ dependencies = [
 
 [[package]]
 name = "gang-main"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anstream",
  "anstyle",
@@ -2693,7 +2693,7 @@ dependencies = [
 
 [[package]]
 name = "gang-mtls"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "const-oid 0.10.2",
  "der 0.8.3",
@@ -2717,7 +2717,7 @@ dependencies = [
 
 [[package]]
 name = "gang-nativelink"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "allocation-counter",
  "async-trait",
@@ -2762,7 +2762,7 @@ dependencies = [
 
 [[package]]
 name = "gang-noop"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "gang-os",
  "gang-spi",
@@ -2778,7 +2778,7 @@ dependencies = [
 
 [[package]]
 name = "gang-oidc"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2801,7 +2801,7 @@ dependencies = [
 
 [[package]]
 name = "gang-os"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "gang-testkit",
  "gang-types",
@@ -2814,7 +2814,7 @@ dependencies = [
 
 [[package]]
 name = "gang-postgres"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "deadpool-postgres",
  "gang-clock",
@@ -2835,7 +2835,7 @@ dependencies = [
 
 [[package]]
 name = "gang-reconciler"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "allocation-counter",
  "gang-clock",
@@ -2848,7 +2848,7 @@ dependencies = [
 
 [[package]]
 name = "gang-server"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "allocation-counter",
  "base64 0.23.1",
@@ -2890,7 +2890,7 @@ dependencies = [
 
 [[package]]
 name = "gang-spi"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "bytes",
  "futures",
@@ -2915,7 +2915,7 @@ dependencies = [
 
 [[package]]
 name = "gang-sqlite"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "gang-clock",
  "gang-os",
@@ -2932,7 +2932,7 @@ dependencies = [
 
 [[package]]
 name = "gang-state"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "allocation-counter",
  "bytes",
@@ -2952,7 +2952,7 @@ dependencies = [
 
 [[package]]
 name = "gang-testkit"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2987,7 +2987,7 @@ dependencies = [
 
 [[package]]
 name = "gang-tls"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "bytes",
  "futures-core",
@@ -3015,7 +3015,7 @@ dependencies = [
 
 [[package]]
 name = "gang-types"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "allocation-counter",
  "base64 0.23.1",
@@ -3033,7 +3033,7 @@ dependencies = [
 
 [[package]]
 name = "gang-ui"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "bytes",
  "http 1.5.0",
@@ -3041,7 +3041,7 @@ dependencies = [
 
 [[package]]
 name = "gang-wire"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "base64 0.23.1",
  "gang-clock",
@@ -3056,7 +3056,7 @@ dependencies = [
 
 [[package]]
 name = "gang-worker"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "gang-clock",
  "gang-config",
@@ -4214,7 +4214,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 [[package]]
 name = "nativelink-config"
 version = "1.8.3"
-source = "git+https://github.com/leadingterm/nativelink?rev=5f55ecf945a2539118b5e7e145d79cfbb8eb6862#5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
+source = "git+https://github.com/leadingterm/nativelink?rev=3d7af3f934e4f9f7a62f0339495267f491b42e1b#3d7af3f934e4f9f7a62f0339495267f491b42e1b"
 dependencies = [
  "byte-unit",
  "humantime",
@@ -4230,7 +4230,7 @@ dependencies = [
 [[package]]
 name = "nativelink-error"
 version = "1.8.3"
-source = "git+https://github.com/leadingterm/nativelink?rev=5f55ecf945a2539118b5e7e145d79cfbb8eb6862#5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
+source = "git+https://github.com/leadingterm/nativelink?rev=3d7af3f934e4f9f7a62f0339495267f491b42e1b#3d7af3f934e4f9f7a62f0339495267f491b42e1b"
 dependencies = [
  "base64 0.22.1",
  "mongodb",
@@ -4254,7 +4254,7 @@ dependencies = [
 [[package]]
 name = "nativelink-metric"
 version = "1.8.3"
-source = "git+https://github.com/leadingterm/nativelink?rev=5f55ecf945a2539118b5e7e145d79cfbb8eb6862#5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
+source = "git+https://github.com/leadingterm/nativelink?rev=3d7af3f934e4f9f7a62f0339495267f491b42e1b#3d7af3f934e4f9f7a62f0339495267f491b42e1b"
 dependencies = [
  "async-lock",
  "nativelink-metric-macro-derive",
@@ -4266,7 +4266,7 @@ dependencies = [
 [[package]]
 name = "nativelink-metric-macro-derive"
 version = "1.8.3"
-source = "git+https://github.com/leadingterm/nativelink?rev=5f55ecf945a2539118b5e7e145d79cfbb8eb6862#5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
+source = "git+https://github.com/leadingterm/nativelink?rev=3d7af3f934e4f9f7a62f0339495267f491b42e1b#3d7af3f934e4f9f7a62f0339495267f491b42e1b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4276,7 +4276,7 @@ dependencies = [
 [[package]]
 name = "nativelink-proto"
 version = "1.8.3"
-source = "git+https://github.com/leadingterm/nativelink?rev=5f55ecf945a2539118b5e7e145d79cfbb8eb6862#5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
+source = "git+https://github.com/leadingterm/nativelink?rev=3d7af3f934e4f9f7a62f0339495267f491b42e1b#3d7af3f934e4f9f7a62f0339495267f491b42e1b"
 dependencies = [
  "derive_more",
  "prost",
@@ -4288,7 +4288,7 @@ dependencies = [
 [[package]]
 name = "nativelink-redis-tester"
 version = "1.8.3"
-source = "git+https://github.com/leadingterm/nativelink?rev=5f55ecf945a2539118b5e7e145d79cfbb8eb6862#5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
+source = "git+https://github.com/leadingterm/nativelink?rev=3d7af3f934e4f9f7a62f0339495267f491b42e1b#3d7af3f934e4f9f7a62f0339495267f491b42e1b"
 dependencies = [
  "either",
  "nativelink-util",
@@ -4302,7 +4302,7 @@ dependencies = [
 [[package]]
 name = "nativelink-scheduler"
 version = "1.8.3"
-source = "git+https://github.com/leadingterm/nativelink?rev=5f55ecf945a2539118b5e7e145d79cfbb8eb6862#5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
+source = "git+https://github.com/leadingterm/nativelink?rev=3d7af3f934e4f9f7a62f0339495267f491b42e1b#3d7af3f934e4f9f7a62f0339495267f491b42e1b"
 dependencies = [
  "async-lock",
  "async-trait",
@@ -4336,7 +4336,7 @@ dependencies = [
 [[package]]
 name = "nativelink-service"
 version = "1.8.3"
-source = "git+https://github.com/leadingterm/nativelink?rev=5f55ecf945a2539118b5e7e145d79cfbb8eb6862#5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
+source = "git+https://github.com/leadingterm/nativelink?rev=3d7af3f934e4f9f7a62f0339495267f491b42e1b#3d7af3f934e4f9f7a62f0339495267f491b42e1b"
 dependencies = [
  "axum",
  "bytes",
@@ -4371,7 +4371,7 @@ dependencies = [
 [[package]]
 name = "nativelink-store"
 version = "1.8.3"
-source = "git+https://github.com/leadingterm/nativelink?rev=5f55ecf945a2539118b5e7e145d79cfbb8eb6862#5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
+source = "git+https://github.com/leadingterm/nativelink?rev=3d7af3f934e4f9f7a62f0339495267f491b42e1b#3d7af3f934e4f9f7a62f0339495267f491b42e1b"
 dependencies = [
  "async-lock",
  "async-trait",
@@ -4437,7 +4437,7 @@ dependencies = [
 [[package]]
 name = "nativelink-util"
 version = "1.8.3"
-source = "git+https://github.com/leadingterm/nativelink?rev=5f55ecf945a2539118b5e7e145d79cfbb8eb6862#5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
+source = "git+https://github.com/leadingterm/nativelink?rev=3d7af3f934e4f9f7a62f0339495267f491b42e1b#3d7af3f934e4f9f7a62f0339495267f491b42e1b"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4492,7 +4492,7 @@ dependencies = [
 [[package]]
 name = "nativelink-worker"
 version = "1.8.3"
-source = "git+https://github.com/leadingterm/nativelink?rev=5f55ecf945a2539118b5e7e145d79cfbb8eb6862#5f55ecf945a2539118b5e7e145d79cfbb8eb6862"
+source = "git+https://github.com/leadingterm/nativelink?rev=3d7af3f934e4f9f7a62f0339495267f491b42e1b#3d7af3f934e4f9f7a62f0339495267f491b42e1b"
 dependencies = [
  "async-lock",
  "bytes",
@@ -4801,7 +4801,7 @@ dependencies = [
 
 [[package]]
 name = "opentofu-runner"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "tempfile",
  "thiserror",
@@ -7647,7 +7647,7 @@ dependencies = [
 
 [[package]]
 name = "workspace-architecture"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "serde",
  "syn 2.0.119",

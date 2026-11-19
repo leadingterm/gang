@@ -79,8 +79,19 @@ data "aws_iam_policy_document" "this" {
     content {
       sid       = "ControllerLifecycle"
       effect    = "Allow"
-      actions   = ["autoscaling:CompleteLifecycleAction", "autoscaling:DescribeLifecycleHooks"]
+      actions   = ["autoscaling:CompleteLifecycleAction"]
       resources = ["arn:${data.aws_partition.this.partition}:autoscaling:${data.aws_region.this.region}:${data.aws_caller_identity.this.account_id}:autoScalingGroup:*:autoScalingGroupName/${var.name}"]
+    }
+  }
+
+  # DescribeLifecycleHooks does not support resource-level scoping.
+  dynamic "statement" {
+    for_each = local.group_shape ? [1] : []
+    content {
+      sid       = "DescribeControllerLifecycleHooks"
+      effect    = "Allow"
+      actions   = ["autoscaling:DescribeLifecycleHooks"]
+      resources = ["*"]
     }
   }
 

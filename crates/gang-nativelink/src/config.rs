@@ -884,6 +884,7 @@ mod tests {
         for (text, expected) in [
             ("none", DiskEnforcement::None),
             ("guard", DiskEnforcement::Guard),
+            ("pressure", DiskEnforcement::Pressure),
             ("soft", DiskEnforcement::Soft),
         ] {
             let mut value = base();
@@ -891,6 +892,28 @@ mod tests {
             let config = parse(value).expect("valid config");
             assert_eq!(config.disk.enforcement, expected);
         }
+    }
+
+    #[test]
+    fn disk_tuning_parses_all_fields() {
+        let defaults = parse(base()).expect("defaults").disk;
+        assert_eq!(defaults.enforcement, DiskEnforcement::Pressure);
+        assert_eq!(defaults.min_reservation.as_units(), 1_048_576);
+        assert_eq!(defaults.pressure_free_percent.get(), 5);
+        assert_eq!(defaults.pressure_kill_after.as_units(), 5);
+        let mut value = base();
+        value["disk"] = json!({
+            "enforcement": "pressure",
+            "min_reservation": "2GiB",
+            "pressure_free_percent": 10,
+            "pressure_kill_after": "12s",
+            "headroom_percent": 30,
+        });
+        let disk = parse(value).expect("valid config").disk;
+        assert_eq!(disk.min_reservation.as_units(), 2_097_152);
+        assert_eq!(disk.pressure_free_percent.get(), 10);
+        assert_eq!(disk.pressure_kill_after.as_units(), 12);
+        assert_eq!(disk.headroom_percent.get(), 30);
     }
 
     #[test]

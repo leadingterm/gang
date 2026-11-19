@@ -18,11 +18,10 @@ locals {
   nat_count                 = var.nat_mode == "single" ? 1 : var.availability_zone_count
   private_route_table_count = var.nat_mode == "per_az" ? var.availability_zone_count : 1
 
-  ports          = jsondecode(file("${path.module}/ports.json"))
-  public_port    = local.ports.public
-  execution_port = local.ports.execution
-  worker_port    = local.ports.worker
-  health_port    = local.ports.health
+  ports       = jsondecode(file("${path.module}/ports.json"))
+  public_port = local.ports.public
+  worker_port = local.ports.worker
+  health_port = local.ports.health
 
   # The controller sits in public subnet 0 at a fixed host offset so its private
   # address, and therefore its private DNS name, is deterministic.

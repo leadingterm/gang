@@ -1,9 +1,9 @@
 {gang, ...}: let
   ports = builtins.fromJSON (builtins.readFile ../terraform/modules/network/ports.json);
 in {
-  # The controller's listeners (public endpoint, the leader's execution endpoint, worker, health). One system serves
+  # The controller's listeners (public endpoint, worker, health). One system serves
   # both roles: on a worker nothing listens on them, and the worker security group has no ingress.
-  networking.firewall.allowedTCPPorts = [ports.public ports.execution ports.worker ports.health];
+  networking.firewall.allowedTCPPorts = [ports.public ports.worker ports.health];
 
   # Amazon's RDS certificate authorities, named by gang.toml's [database.postgres]
   # ca_file for database.postgres.rds in the deployment module. Refresh this file

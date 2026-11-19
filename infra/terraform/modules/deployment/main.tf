@@ -63,13 +63,11 @@ locals {
   group                  = var.database.engine != "sqlite"
   controller_shape       = local.group ? "group" : "instance"
   public_port            = module.network.public_port
-  execution_port         = module.network.execution_port
   worker_port            = module.network.worker_port
   shutdown_grace_seconds = 300
   public_host            = var.hostname != null ? var.hostname : module.network.controller_public_dns
   worker_host            = local.group ? var.hostname : module.network.controller_private_dns
   endpoint               = local.group && var.hostname == null ? null : (local.public_port == 443 ? "https://${local.public_host}" : "https://${local.public_host}:${local.public_port}")
-  execution_endpoint     = local.group && var.hostname == null ? null : "https://${local.public_host}:${local.execution_port}"
   worker_endpoint        = local.group && var.hostname == null ? null : "grpcs://${local.worker_host}:${local.worker_port}"
 
   database_secret_parameters = var.database.engine != "postgres" ? {} : merge(
@@ -111,8 +109,6 @@ locals {
     database_engine         = var.database.engine
     database_table_name     = module.storage.dynamodb_table_name
     database_postgres       = local.database_postgres
-    execution_port          = local.execution_port
-    execution_endpoint      = local.execution_endpoint
     shutdown_grace_seconds  = local.shutdown_grace_seconds
     scratch_mount_point     = var.scratch_mount_point
     workload_token_audience = var.workload_token_audience
@@ -151,9 +147,7 @@ module "controller" {
   subnet_ids       = values(module.network.private_subnet_ids)
   target_group_arns = local.group && var.load_balancer != null ? [
     module.load_balancer[0].serve_target_group_arn,
-    module.load_balancer[0].execute_target_group_arn,
     module.load_balancer[0].internal_serve_target_group_arn,
-    module.load_balancer[0].internal_execute_target_group_arn,
     module.load_balancer[0].workers_target_group_arn,
   ] : []
   shutdown_grace_seconds        = local.shutdown_grace_seconds
@@ -190,11 +184,10 @@ module "load_balancer" {
 
   name                           = var.name
   vpc_id                         = module.network.vpc_id
-  execution                      = local.group
+  shared_database                = local.group
   public_subnet_ids              = module.network.public_subnet_ids
   private_subnet_ids             = values(module.network.private_subnet_ids)
   worker_security_group_id       = module.network.worker_security_group_id
-  execute_port                   = local.execution_port
   workers_port                   = local.worker_port
   health_port                    = module.network.health_port
   shutdown_grace                 = local.shutdown_grace_seconds
