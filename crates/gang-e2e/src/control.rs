@@ -48,6 +48,8 @@ pub struct ControlKnobs {
     pub detail_interval: Option<Duration>,
     /// The client action abandonment timeout.
     pub client_action_timeout: Option<Duration>,
+    /// HTTP/2 per-connection request limit for the held build.
+    pub max_concurrent_streams: Option<u32>,
     /// Use a nonexistent local worker launcher.
     pub broken_launcher: bool,
     /// Install a gate for worker launches.
@@ -68,6 +70,7 @@ impl ControlKnobs {
         terminate_grace: None,
         detail_interval: None,
         client_action_timeout: None,
+        max_concurrent_streams: None,
         broken_launcher: false,
         holdable_launches: false,
     };
@@ -133,6 +136,9 @@ impl ControlKnobs {
         max_instances: Some(6),
         target_actions_per_instance: Some(16),
         vcpus_per_instance: Some(16),
+        // All 160 pending Execute RPCs must fit on one connection before launch release;
+        // the default limit of 100 can strand the last 60.
+        max_concurrent_streams: Some(160),
         holdable_launches: true,
         ..Self::NONE
     };

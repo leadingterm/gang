@@ -695,6 +695,11 @@ fn render_control(document: &mut Document<Plugins>, knobs: &ControlKnobs) -> Res
         document.client_action_timeout =
             NonZeroDuration::try_new(timeout).map_err(template_error)?;
     }
+    if let Some(max) = knobs.max_concurrent_streams {
+        let SchedulerConfig::Nativelink(scheduler) = &mut document.scheduler;
+        scheduler.http2.max_concurrent_streams = NonZeroU32::new(max)
+            .ok_or_else(|| template_error("max concurrent streams must be nonzero"))?;
+    }
     if knobs.broken_launcher {
         let ProvisionerConfig::Local(local) = &mut document.provisioner else {
             return Err(template_error("missing [provisioner.local]"));

@@ -315,6 +315,23 @@ fn varied_nativelink(variant: Variant) -> gang_e2e::Result<NativeLinkConfig> {
 }
 
 #[test]
+fn burst_queue_fits_one_http2_connection() -> gang_e2e::Result<()> {
+    for (control, expected) in [
+        (ControlKnobs::NONE, 100),
+        (ControlKnobs::QUEUED_BEHIND_SHORT_WORK, 100),
+        (ControlKnobs::BURST_FROM_ZERO, 160),
+    ] {
+        let variant = Variant {
+            control,
+            ..Variant::baseline(Sandbox::Noop)
+        };
+        let nativelink = varied_nativelink(variant)?;
+        assert_eq!(nativelink.http2.max_concurrent_streams.get(), expected);
+    }
+    Ok(())
+}
+
+#[test]
 fn short_boot_grace_bounds_shutdown_and_preserves_shorter_setting() -> gang_e2e::Result<()> {
     let variant = Variant {
         control: ControlKnobs::ORPHAN,
