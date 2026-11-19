@@ -1352,9 +1352,7 @@ mod tests {
         let result = std::panic::catch_unwind(|| {
             parallel_variant_checks([true, false], |panic| {
                 both_started.wait();
-                if panic {
-                    panic!("variant panic");
-                }
+                assert!(!panic, "variant panic");
                 completed.fetch_add(1, Ordering::SeqCst);
                 vec![Check::passed("completed")]
             })

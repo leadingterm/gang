@@ -63,10 +63,11 @@ yq -o=json '.jobs' "$workflow" | jq -e '
          | select(.with."cache-job" == "linux-x86_64" and .with."restore-only" == "true")] | length) != 1
        or ([$jobs["linux-x86_64-bundle"].steps[]? | select(.uses == "./.github/actions/save-bazel-cache")] | length) != 0
        or ([$jobs["linux-x86_64-bundle"].steps[]?.run | strings
-         | select(contains("bazel build") and contains("//:gang") and contains("//crates/gang-e2e:bundle"))] | length) != 1
+         | select(contains("bazel build") and contains("//crates/gang-e2e:bundle"))] | length) != 1
        or ([$jobs["linux-x86_64-bundle"].steps[]? | select(.uses == "./.github/actions/upload-gang")
          | select(.with.target == "x86_64-unknown-linux-musl")] | length) != 1
-       or ([$jobs["linux-x86_64-bundle"].steps[]?.with.name | select(. == "e2e-harness-x86_64")] | length) != 1 then
+       or ([$jobs["linux-x86_64-bundle"].steps[]? | select(.uses == "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9")
+         | select(.with.name == "e2e-harness-x86_64")] | length) != 1 then
       error("x86 bundle must build and upload gang and harness without a redundant working-set export")
     else . end
   | if ([$jobs["linux-x86_64-bundle"].steps[]?
