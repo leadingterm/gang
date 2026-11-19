@@ -83,6 +83,7 @@ jobs:
           {
             echo "CARGO_HOME=$root/cargo"
             echo "CARGO_TARGET_DIR=$root/target"
+            echo "DARWIN_SOURCE_DIR=$RUNNER_TEMP/darwin-source"
           } >> "$GITHUB_ENV"
           {
             echo "save=$SAVE"
@@ -115,14 +116,14 @@ jobs:
         env:
           SCOPE: ${{ steps.cargo.outputs.scope }}
         run: |
-          budget=600000000
-          if [[ $SCOPE != default ]]; then budget=400000000; fi
+          budget=1000000000
+          if [[ $SCOPE != default ]]; then budget=800000000; fi
           bytes=$(tar -C "$HOME/.cache/gang-darwin" --exclude='cargo/git/db/*.lock' --exclude='target/*/.cargo-lock' -cf - cargo/registry cargo/git/db target | zstd -3 -q | wc -c)
-          echo "Cargo cache compressed size: $bytes bytes (budget: $budget bytes)." >> "$GITHUB_STEP_SUMMARY"
+          echo "Cargo cache compressed size: $bytes bytes (budget: $budget bytes)." | tee -a "$GITHUB_STEP_SUMMARY"
           if (( bytes <= budget )); then
             echo "within-budget=true" >> "$GITHUB_OUTPUT"
           else
-            echo "Cargo cache save skipped: over budget." >> "$GITHUB_STEP_SUMMARY"
+            echo "Cargo cache save skipped: over budget." | tee -a "$GITHUB_STEP_SUMMARY"
           fi
       - name: Save the Cargo cache
         if: steps.cargo.outputs.save == 'true' && steps.cargo-restore.outputs.cache-hit != 'true' && steps.cargo-size.outputs.within-budget == 'true'
@@ -362,20 +363,24 @@ jobs:
         run: |
           downloaded="$RUNNER_TEMP/arm-bundle-working-set"
           [[ ! -L $downloaded ]]
-          if [[ ! -d $downloaded/disk && ! -d $downloaded/repository ]]; then
+          if [[ ! -e $downloaded/used && ! -e $downloaded/files ]]; then
             downloaded="$downloaded/bazel-working-set-arm64-bundle"
           fi
-          if [[ -d $downloaded/disk || -d $downloaded/repository ]]; then
-            [[ ! -L $downloaded ]]
-            base="$RUNNER_TEMP/arm-cache-base"
-            merged="$RUNNER_TEMP/arm-cache-merged"
-            tools/ci-cache.sh export "$BAZEL_DISK_CACHE" "$BAZEL_REPOSITORY_CACHE" 0 "$base"
-            tools/ci-cache.sh merge "$merged" "$base" "$downloaded"
-            [[ $BAZEL_DISK_CACHE == "$HOME/.cache/bazel-disk" && $BAZEL_REPOSITORY_CACHE == "$HOME/.cache/bazel-repository" ]]
-            rm -rf -- "$BAZEL_DISK_CACHE" "$BAZEL_REPOSITORY_CACHE/content_addressable"
-            mkdir -p -- "$BAZEL_REPOSITORY_CACHE"
-            mv -- "$merged/disk" "$BAZEL_DISK_CACHE"
-            mv -- "$merged/repository/content_addressable" "$BAZEL_REPOSITORY_CACHE/content_addressable"
+          if [[ -e $downloaded ]]; then
+            [[ -d $downloaded && ! -L $downloaded && -f $downloaded/used && ! -L $downloaded/used ]]
+            # Empty files/ directories are omitted by artifact transport.
+            if [[ -e $downloaded/files || -L $downloaded/files ]]; then
+              base="$RUNNER_TEMP/arm-cache-base"
+              merged="$RUNNER_TEMP/arm-cache-merged"
+              tools/ci-cache.sh export "$BAZEL_DISK_CACHE" "$BAZEL_REPOSITORY_CACHE" 0 "$base"
+              tools/ci-cache.sh merge "$merged" "$base" "$downloaded/files"
+              [[ $BAZEL_DISK_CACHE == "$HOME/.cache/bazel-disk" && $BAZEL_REPOSITORY_CACHE == "$HOME/.cache/bazel-repository" ]]
+              rm -rf -- "$BAZEL_DISK_CACHE" "$BAZEL_REPOSITORY_CACHE/content_addressable"
+              mkdir -p -- "$BAZEL_REPOSITORY_CACHE"
+              mv -- "$merged/disk" "$BAZEL_DISK_CACHE"
+              mv -- "$merged/repository/content_addressable" "$BAZEL_REPOSITORY_CACHE/content_addressable"
+            fi
+            echo "BAZEL_ADDITIONAL_USED_MANIFEST=$downloaded/used" >> "$GITHUB_ENV"
           fi
       - name: Check BUILD files are in sync
         run: bazel run //:gazelle.check

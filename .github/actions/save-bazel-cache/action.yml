@@ -44,9 +44,13 @@ runs:
       if: inputs.mode == 'export' && inputs.prune == 'true'
       shell: bash
       run: |
-        tools/ci-cache.sh export "$BAZEL_DISK_CACHE" "$BAZEL_REPOSITORY_CACHE" "$BAZEL_DISK_CACHE_EPOCH_SECONDS" "$RUNNER_TEMP/bazel-working-set"
-        if [[ -n ${BAZEL_BASE_MANIFEST:-} ]]; then
-          tools/ci-cache.sh subtract "$RUNNER_TEMP/bazel-working-set" "$BAZEL_BASE_MANIFEST"
+        root="$RUNNER_TEMP/bazel-working-set"
+        mkdir -p -- "$root"
+        tools/ci-cache.sh export "$BAZEL_DISK_CACHE" "$BAZEL_REPOSITORY_CACHE" "$BAZEL_DISK_CACHE_EPOCH_SECONDS" "$root/files"
+        # Keep the full used set even when its restored payload is omitted.
+        tools/ci-cache.sh manifest "$root/files/disk" "$root/files/repository" > "$root/used"
+        if [[ -n ${BAZEL_RESTORED_MANIFEST:-} ]]; then
+          tools/ci-cache.sh subtract "$root/files" "$BAZEL_RESTORED_MANIFEST"
         fi
     - name: Upload shard working set
       if: inputs.mode == 'export' && inputs.prune == 'true'
@@ -79,7 +83,7 @@ runs:
             no_snapshot
           fi
           [[ -d $MERGE_PATH ]]
-          if [[ -d $MERGE_PATH/disk || -d $MERGE_PATH/repository ]]; then
+          if [[ -e $MERGE_PATH/used || -e $MERGE_PATH/files ]]; then
             # download-artifact flattens a single match even with merge-multiple disabled.
             children=("$MERGE_PATH")
           else
@@ -87,12 +91,41 @@ runs:
             children=("$MERGE_PATH"/*/)
           fi
           (( ${#children[@]} > 0 )) || no_snapshot
+          sources=()
+          used="$RUNNER_TEMP/bazel-merged-used"
+          : > "$used"
           for child in "${children[@]}"; do
-            [[ ! -L ${child%/} ]] || { echo "::error::Symlink working-set directory"; exit 1; }
+            [[ ! -L ${child%/} && -f $child/used && ! -L $child/used ]] || { echo "::error::Invalid working-set artifact"; exit 1; }
+            # Artifact transport omits empty directories, including files/.
+            if [[ -e $child/files || -L $child/files ]]; then
+              sources+=("$child/files")
+            fi
+            record=
+            while IFS= read -r -d '' record; do
+              printf '%s\0' "$record" >> "$used"
+            done < "$child/used"
+            [[ -z $record ]] || { echo "::error::Unterminated used manifest"; exit 1; }
           done
-          tools/ci-cache.sh merge "$staging" "${children[@]}"
+          sort -zu "$used" -o "$used"
+          restored="$RUNNER_TEMP/bazel-merge-restored"
+          tools/ci-cache.sh select "$BAZEL_DISK_CACHE" "$BAZEL_REPOSITORY_CACHE" "$used" "$restored"
+          (( ${#sources[@]} > 0 )) || no_snapshot
+          tools/ci-cache.sh merge "$staging" "${sources[@]}"
+          # Used metadata alone must not create a duplicate warm snapshot.
+          [[ -n $(find "$staging" -type f -print -quit) ]] || no_snapshot
+          combined="$RUNNER_TEMP/bazel-merge-combined"
+          tools/ci-cache.sh merge "$combined" "$restored" "$staging"
+          staging=$combined
         else
           tools/ci-cache.sh export "$BAZEL_DISK_CACHE" "$BAZEL_REPOSITORY_CACHE" "$BAZEL_DISK_CACHE_EPOCH_SECONDS" "$staging"
+          if [[ -n ${BAZEL_ADDITIONAL_USED_MANIFEST:-} ]]; then
+            # Bundle files retain their original mtimes, predating this job's epoch.
+            additional="$RUNNER_TEMP/bazel-additional-used"
+            combined="$RUNNER_TEMP/bazel-save-combined"
+            tools/ci-cache.sh select "$BAZEL_DISK_CACHE" "$BAZEL_REPOSITORY_CACHE" "$BAZEL_ADDITIONAL_USED_MANIFEST" "$additional"
+            tools/ci-cache.sh merge "$combined" "$staging" "$additional"
+            staging=$combined
+          fi
         fi
         if [[ -n ${BAZEL_BASE_MANIFEST:-} ]]; then
           tools/ci-cache.sh subtract "$staging" "$BAZEL_BASE_MANIFEST"
@@ -100,13 +133,13 @@ runs:
         [[ -n $(find "$staging" -type f -print -quit) ]] || no_snapshot
         budget=$SNAPSHOT_BUDGET
         if [[ -z $budget ]]; then
-          case "$EVENT:$BAZEL_CACHE_JOB" in
-            pull_request:linux-x86_64) budget=1200000000 ;;
-            pull_request:cross) budget=600000000 ;;
-            pull_request:*) budget=800000000 ;;
-            *:linux-x86_64) budget=1800000000 ;;
-            *:cross) budget=1000000000 ;;
-            *) budget=1200000000 ;;
+          case "$EVENT:${BAZEL_BASE_PRESENT:-false}:$BAZEL_CACHE_JOB" in
+            pull_request:true:linux-x86_64) budget=1000000000 ;;
+            pull_request:true:cross) budget=500000000 ;;
+            pull_request:true:*) budget=600000000 ;;
+            *:*:linux-x86_64) budget=2000000000 ;;
+            *:*:cross) budget=1000000000 ;;
+            *) budget=1300000000 ;;
           esac
         fi
         limit_log="$RUNNER_TEMP/bazel-cache-limit.log"

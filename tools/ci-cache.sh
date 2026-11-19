@@ -77,6 +77,35 @@ copy_file() {
   cp -p -- "$src" "$dst"
 }
 
+validate_manifest() {
+  local manifest=$1 rel=
+  [[ -f $manifest && ! -L $manifest ]] || fail "invalid manifest: $manifest"
+  while IFS= read -r -d '' rel; do
+    [[ -n $rel && $rel != /* ]] || fail "invalid manifest entry: $rel"
+    path_ok "$rel"
+    classify "$rel" f
+    [[ -n $kind ]] || fail "invalid manifest entry: $rel"
+    printf '%s\0' "$rel"
+  done <"$manifest"
+  [[ -z $rel ]] || fail 'unterminated manifest entry'
+}
+
+# Missing entries are cache misses; other unexpected path types are errors.
+selected_file() {
+  local rel=$2 item=$1 component
+  while [[ $rel == */* ]]; do
+    component=${rel%%/*}; rel=${rel#*/}
+    item=$item/$component
+    [[ ! -L $item ]] || fail "symlink in cache: $item"
+    [[ -e $item ]] || return 1
+    [[ -d $item ]] || fail "not a directory: $item"
+  done
+  item=$item/$rel
+  [[ ! -L $item ]] || fail "symlink in cache: $item"
+  [[ -e $item ]] || return 1
+  [[ -f $item ]] || fail "non-regular cache entry: $item"
+}
+
 scratch=$(mktemp -d)
 trap 'rm -rf -- "$scratch"' EXIT
 
@@ -144,48 +173,72 @@ case ${1-} in
     fi
     sort -zu "$scratch/manifest"
     ;;
+  select)
+    # Manifests are NUL-delimited staging-relative paths; repository checksums
+    # are selected as complete payload-and-marker units, independent of mtime.
+    (( $# == 5 )) || fail 'usage: select DISK_CACHE REPOSITORY_CACHE MANIFEST DESTINATION'
+    disk=$(canonical "$2"); repo=$(canonical "$3")
+    manifest=$(canonical "$4"); dest=$(canonical "$5")
+    separate "$disk" "$repo"
+    separate "$dest" "$disk"; separate "$dest" "$repo"; separate "$dest" "$manifest"
+    validate_manifest "$manifest" >"$scratch/manifest"
+    sort -zu "$scratch/manifest" -o "$scratch/manifest"
+    for root in "$disk" "$repo"; do
+      [[ ! -e $root || -d $root ]] || fail "not a directory: $root"
+    done
+    : >"$scratch/selected"
+    : >"$scratch/checksums"
+    while IFS= read -r -d '' rel; do
+      classify "$rel" f
+      if [[ $kind == repo ]]; then
+        selected_file "$repo" "${rel#repository/}" || :
+        printf '%s\0' "${rel%/*}" >>"$scratch/checksums"
+      elif selected_file "$disk" "${rel#disk/}"; then
+        printf '%s\0' "$rel" >>"$scratch/selected"
+      fi
+    done <"$scratch/manifest"
+    sort -zu "$scratch/checksums" -o "$scratch/checksums"
+    while IFS= read -r -d '' rel; do
+      # Select the checksum atomically, even if the manifest names only a marker.
+      selected_file "$repo" "${rel#repository/}/file" || continue
+      dir=$repo/${rel#repository/}
+      find "$dir" -mindepth 1 -maxdepth 1 -print0 >"$scratch/markers"
+      while IFS= read -r -d '' file; do
+        entry=$rel/${file##*/}
+        classify "$entry" f
+        [[ $kind == repo ]] || fail "unknown cache path: $file"
+        [[ ! -L $file && -f $file ]] || fail "non-regular cache entry: $file"
+        printf '%s\0' "$entry" >>"$scratch/selected"
+      done <"$scratch/markers"
+    done <"$scratch/checksums"
+    # Nothing in the destination is touched until every record and source is safe.
+    fresh_destination "$dest"
+    sort -zu "$scratch/selected" -o "$scratch/selected"
+    while IFS= read -r -d '' rel; do
+      if [[ $rel == disk/* ]]; then source=$disk/${rel#disk/}
+      else source=$repo/${rel#repository/}
+      fi
+      copy_file "$source" "$dest/$rel"
+    done <"$scratch/selected"
+    ;;
   subtract)
     (( $# == 3 )) || fail 'usage: subtract STAGING BASE_MANIFEST'
     dest=$(canonical "$2"); base=$(canonical "$3")
     separate "$dest" "$base"
-    [[ -f $base ]] || fail "invalid manifest: $base"
+    validate_manifest "$base" >"$scratch/base"
     validate_tree "$dest"
-    : >"$scratch/base"
-    while IFS= read -r -d '' rel; do
-      [[ -n $rel && $rel != /* ]] || fail "invalid manifest entry: $rel"
-      path_ok "$rel"
-      classify "$rel" f
-      [[ -n $kind ]] || fail "invalid manifest entry: $rel"
-      printf '%s\0' "$rel" >>"$scratch/base"
-    done <"$base"
-    [[ -z $rel ]] || fail 'unterminated manifest entry'
     sort -zu "$scratch/base" -o "$scratch/base"
     find "$dest" -type f -printf '%P\0' | sort -z >"$scratch/staged"
     comm -z -12 "$scratch/staged" "$scratch/base" >"$scratch/shared"
-    comm -z -23 "$scratch/staged" "$scratch/base" >"$scratch/new"
     while IFS= read -r -d '' rel; do
       classify "$rel" f
       if [[ $kind == ac || $kind == cas ]]; then
         rm -- "$dest/$rel"
+      elif [[ $kind == repo && ${rel##*/} == file ]]; then
+        # A base payload covers the entire checksum, including new markers.
+        rm -r -- "${dest:?}/${rel%/*}"
       fi
     done <"$scratch/shared"
-    # A repository checksum is atomic: any new member retains the whole unit.
-    : >"$scratch/repo-shared"
-    : >"$scratch/repo-new"
-    while IFS= read -r -d '' rel; do
-      [[ $rel == repository/*/file ]] || continue
-      printf '%s\0' "${rel%/*}" >>"$scratch/repo-shared"
-    done <"$scratch/shared"
-    while IFS= read -r -d '' rel; do
-      [[ $rel == repository/* ]] || continue
-      printf '%s\0' "${rel%/*}" >>"$scratch/repo-new"
-    done <"$scratch/new"
-    sort -zu "$scratch/repo-shared" -o "$scratch/repo-shared"
-    sort -zu "$scratch/repo-new" -o "$scratch/repo-new"
-    comm -z -23 "$scratch/repo-shared" "$scratch/repo-new" >"$scratch/repo-remove"
-    while IFS= read -r -d '' dir; do
-      rm -r -- "${dest:?}/${dir:?}"
-    done <"$scratch/repo-remove"
     if [[ -d $dest/disk ]]; then
       find "$dest/disk" -depth -mindepth 1 -type d -empty -delete
     fi
@@ -292,5 +345,5 @@ case ${1-} in
     printf 'ci-cache: compressed bytes before=%s after=%s limit=%s\n' "$before" "$bytes" "$max" >&2
     (( bytes <= max )) || fail 'cache cannot fit limit'
     ;;
-  *) fail 'usage: ci-cache.sh {export|manifest|subtract|merge|limit} ...' ;;
+  *) fail 'usage: ci-cache.sh {export|manifest|select|subtract|merge|limit} ...' ;;
 esac

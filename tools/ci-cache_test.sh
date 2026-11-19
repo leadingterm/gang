@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Exercise cache export, manifest, subtraction, merge and limit using local fixtures.
+# Exercise cache export, manifest, selection, subtraction, merge and limit using local fixtures.
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
@@ -228,16 +228,20 @@ cp -pR "$exported" "$scratch/base-before"
 cp -pR "$exported" "$scratch/delta"
 printf 'new CAS\n' >"$scratch/delta/disk/cas/00/$key6"
 printf 'new marker\n' >"$scratch/delta/repository/content_addressable/sha256/$key2/id-new"
+mkdir -p "$scratch/delta/repository/content_addressable/sha256/$key3"
+printf 'unrelated payload\n' >"$scratch/delta/repository/content_addressable/sha256/$key3/file"
+printf 'unrelated marker\n' >"$scratch/delta/repository/content_addressable/sha256/$key3/id-new"
 check 'subtract accepts valid base manifest' "$cache" subtract "$scratch/delta" "$manifest"
 check 'subtract removes duplicate action' test ! -e "$scratch/delta/disk/ac/00/$key1"
 check 'subtract removes duplicate CAS' test ! -e "$scratch/delta/disk/cas/00/$key4"
 check 'subtract keeps new CAS' test -f "$scratch/delta/disk/cas/00/$key6"
 check 'subtract removes whole base repository unit' test ! -e "$scratch/delta/repository/content_addressable/sha256/$key1"
-check 'new marker keeps repository payload and old marker' cmp -s \
-  "$exported/repository/content_addressable/sha256/$key2/file" \
-  "$scratch/delta/repository/content_addressable/sha256/$key2/file"
-check 'new marker keeps old marker' test -f "$scratch/delta/repository/content_addressable/sha256/$key2/id-boundary"
-check 'new marker remains' test -f "$scratch/delta/repository/content_addressable/sha256/$key2/id-new"
+check 'new marker does not retain base repository unit' test ! -e \
+  "$scratch/delta/repository/content_addressable/sha256/$key2"
+check 'unrelated checksum payload remains' test -f \
+  "$scratch/delta/repository/content_addressable/sha256/$key3/file"
+check 'unrelated checksum marker remains' test -f \
+  "$scratch/delta/repository/content_addressable/sha256/$key3/id-new"
 check 'base cache remains unchanged' diff -r "$scratch/base-before" "$exported"
 check 'base manifest remains unchanged' cmp -s "$scratch/base-manifest-before" "$manifest"
 cp -pR "$exported" "$scratch/all-base"
@@ -249,6 +253,12 @@ check 'empty delta retains repository root' test -d "$scratch/all-base/repositor
 cp -pR "$exported" "$scratch/no-base"
 check 'empty manifest subtracts nothing' "$cache" subtract "$scratch/no-base" "$scratch/empty-manifest"
 check 'empty manifest retains all files' diff -r "$exported" "$scratch/no-base"
+cp -pR "$exported" "$scratch/marker-only-base"
+printf 'new marker\n' >"$scratch/marker-only-base/repository/content_addressable/sha256/$key1/id-new"
+cp -pR "$scratch/marker-only-base" "$scratch/marker-only-before"
+printf '%s\0' "repository/content_addressable/sha256/$key1/id-active" >"$scratch/marker-only-manifest"
+check 'marker-only manifest subtraction succeeds' "$cache" subtract "$scratch/marker-only-base" "$scratch/marker-only-manifest"
+check 'marker-only manifest preserves payload and all markers' diff -r "$scratch/marker-only-before" "$scratch/marker-only-base"
 reject 'manifest requires both roots' "$cache" manifest "$disk"
 reject 'manifest rejects filesystem root' "$cache" manifest / "$repo"
 reject 'manifest rejects root traversal' "$cache" manifest "$scratch/path-component/../disk input" "$repo"
@@ -266,7 +276,84 @@ for invalid in "/disk/ac/00/$key1" "disk/../disk/ac/00/$key1" \
 done
 printf 'disk/ac/00/%s' "$key1" >"$scratch/invalid-manifest"
 reject 'subtract rejects unterminated manifest' "$cache" subtract "$scratch/no-base" "$scratch/invalid-manifest"
+printf '%s\0' "disk/ac/00/$key1" \
+  "repository/content_addressable/sha256/$key1/file" "disk/../invalid" >"$scratch/invalid-manifest"
+reject 'subtract validates all records before removing disk or repository entries' \
+  "$cache" subtract "$scratch/no-base" "$scratch/invalid-manifest"
 check 'invalid manifests do not mutate stage' diff -r "$exported" "$scratch/no-base"
+
+# Selection is age-independent and validates every input before creating a stage.
+printf '%s\0' "disk/cas/00/$key5" \
+  "repository/content_addressable/sha256/$key2/id-boundary" \
+  "repository/content_addressable/sha256/$key2/id-boundary" \
+  "disk/cas/00/$key6" "repository/content_addressable/sha256/$key6/file" \
+  "repository/content_addressable/sha256/$key4/id-orphan" >"$scratch/selected-manifest"
+selected="$scratch/selected"
+check 'select accepts duplicates and genuine cache misses' \
+  "$cache" select "$disk" "$repo" "$scratch/selected-manifest" "$selected"
+mkdir -p "$scratch/selected-expected/disk/cas/00" \
+  "$scratch/selected-expected/repository/content_addressable/sha256/$key2"
+cp -p "$disk/cas/00/$key5" "$scratch/selected-expected/disk/cas/00/"
+cp -p "$repo/content_addressable/sha256/$key2/"* \
+  "$scratch/selected-expected/repository/content_addressable/sha256/$key2/"
+check 'select retains only chosen disk entries and atomic repository units' \
+  diff -r "$scratch/selected-expected" "$selected"
+check 'select preserves old file timestamp' test \
+  "$(stat -c %Y "$disk/cas/00/$key5")" -eq "$(stat -c %Y "$selected/disk/cas/00/$key5")"
+check 'select empty manifest succeeds' \
+  "$cache" select "$disk" "$repo" "$scratch/empty-manifest" "$scratch/selected-empty"
+check 'select empty manifest produces no files' test -z "$(find "$scratch/selected-empty" -type f -print)"
+reject 'select requires destination' "$cache" select "$disk" "$repo" "$manifest"
+reject 'select rejects extra arguments' "$cache" select "$disk" "$repo" "$manifest" "$scratch/extra-select" extra
+reject 'select rejects filesystem root' "$cache" select / "$repo" "$manifest" "$scratch/root-select"
+reject 'select rejects overlapping roots' "$cache" select "$disk" "$disk/sub" "$manifest" "$scratch/overlap-select"
+reject 'select rejects destination inside source' "$cache" select "$disk" "$repo" "$manifest" "$disk/selected"
+reject 'select rejects destination containing source' "$cache" select "$disk" "$repo" "$manifest" "$scratch"
+reject 'select rejects symlink root' "$cache" select "$scratch/disk-link" "$repo" "$manifest" "$scratch/link-select"
+reject 'select rejects symlink manifest' "$cache" select "$disk" "$repo" "$scratch/manifest-link" "$scratch/link-manifest-select"
+reject 'select rejects root traversal' "$cache" select "$scratch/path-component/../disk input" "$repo" "$manifest" "$scratch/traversal-select"
+mkdir -p "$scratch/selection-unchanged"
+for invalid in "/disk/ac/00/$key1" "disk/../disk/ac/00/$key1" \
+  "disk/ac/ff/$key1" "disk/tmp/$key1" ""; do
+  printf '%s\0' "disk/ac/00/$key1" "$invalid" >"$scratch/invalid-selection"
+  reject 'select validates all manifest records before destination mutation' \
+    "$cache" select "$disk" "$repo" "$scratch/invalid-selection" "$scratch/selection-unchanged"
+  check 'invalid manifest leaves destination empty' test -z "$(find "$scratch/selection-unchanged" -mindepth 1 -print)"
+done
+printf 'disk/ac/00/%s' "$key1" >"$scratch/invalid-selection"
+reject 'select rejects unterminated manifest without creating destination' \
+  "$cache" select "$disk" "$repo" "$scratch/invalid-selection" "$scratch/selection-not-created"
+check 'invalid selection destination remains absent' test ! -e "$scratch/selection-not-created"
+printf '%s\0' "disk/ac/00/$key1" "disk/ac/00/$key6" >"$scratch/invalid-selection"
+reject 'select rejects selected disk symlink before any copies' \
+  "$cache" select "$disk" "$repo" "$scratch/invalid-selection" "$scratch/selection-unchanged"
+printf '%s\0' "disk/ac/00/$key1" "repository/content_addressable/sha256/$key5/id-linked" >"$scratch/invalid-selection"
+reject 'select rejects symlink repository payload before any copies' \
+  "$cache" select "$disk" "$repo" "$scratch/invalid-selection" "$scratch/selection-unchanged"
+ln -s "$repo/content_addressable/sha256/$key2/id-boundary" "$repo/content_addressable/sha256/$key2/id-linked"
+printf '%s\0' "disk/ac/00/$key1" "repository/content_addressable/sha256/$key2/file" >"$scratch/invalid-selection"
+reject 'select validates every marker in a selected atomic checksum' \
+  "$cache" select "$disk" "$repo" "$scratch/invalid-selection" "$scratch/selection-unchanged"
+check 'source validation failures leave destination empty' test -z "$(find "$scratch/selection-unchanged" -mindepth 1 -print)"
+mkdir -p "$scratch/parent-links" "$disk/linked"
+ln -s "$disk/cas" "$disk/linked/cas"
+printf '%s\0' "disk/linked/cas/00/$key5" >"$scratch/linked-selection"
+reject 'select rejects symlink ancestor below canonical cache root' \
+  "$cache" select "$disk" "$repo" "$scratch/linked-selection" "$scratch/selection-unchanged"
+check 'linked selection leaves destination empty' test -z "$(find "$scratch/selection-unchanged" -mindepth 1 -print)"
+ln -s "$scratch/selection-unchanged" "$scratch/parent-links/destination"
+reject 'select rejects symlink destination root' \
+  "$cache" select "$disk" "$repo" "$manifest" "$scratch/parent-links/destination"
+ln -s "$scratch" "$scratch/parent-links/workspace"
+printf '%s\0' "disk/cas/00/$key5" >"$scratch/trusted-selection"
+alias_root="$scratch/parent-links/workspace"
+check 'select canonicalizes trusted ancestor aliases for all inputs' \
+  "$cache" select "$alias_root/disk input" "$alias_root/repository input" \
+  "$alias_root/trusted-selection" "$alias_root/ancestor-selected"
+check 'ancestor alias selection copies the selected payload' \
+  cmp -s "$disk/cas/00/$key5" "$scratch/ancestor-selected/disk/cas/00/$key5"
+check 'ancestor alias selection copies no unselected entries' test \
+  "$(find "$scratch/ancestor-selected" -type f | wc -l)" -eq 1
 
 printf '%d cases, %d failures\n' "$cases" "$failures"
 exit "$((failures > 0))"

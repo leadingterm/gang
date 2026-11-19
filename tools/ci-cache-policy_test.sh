@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Exercise the cache save expressions from the composite actions with synthetic events.
+# Exercise actual cache save expressions, Cargo budgets, and Darwin source-copy safety with synthetic events/paths.
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/gang-ci-cache-policy.XXXXXX")
+trap 'rm -rf "$scratch"' EXIT
+scratch=$(cd "$scratch" && pwd -P)
 cases=0
 failures=0
 
@@ -21,6 +24,9 @@ translate() {
   expr=${expr//github.ref/"\"\$REF\""}
   expr=${expr//github.repository/"\"\$REPO\""}
   expr=${expr//runner.os/"\"\$OS\""}
+  expr=${expr//steps.restore.outputs.cache-matched-key/"\"\$RESTORED_KEY\""}
+  expr=${expr//steps.base.outputs.cache-matched-key/"\"\$BASE_KEY\""}
+  expr=${expr//steps.pr.outputs.cache-matched-key/"\"\$PR_KEY\""}
   expr=${expr//steps.restore.outputs.cache-hit/"\"\$CACHE_HIT\""}
   expr=${expr//steps.pr.outputs.cache-hit/"\"\$PR_CACHE_HIT\""}
   expr=${expr//inputs.restore-only/"\"\$RESTORE_ONLY\""}
@@ -41,6 +47,18 @@ cargo=$(yq -er '.jobs.lint-arm64.steps[] | select(.name == "Name the Cargo cache
 bazel=$(translate "$bazel")
 nix=$(translate "$nix")
 cargo=$(translate "$cargo")
+bazel_base=$(yq -er '.runs.steps[] | select(.id == "base") | .if' "$script_dir/../.github/actions/setup-bazel/action.yml")
+bazel_pr=$(yq -er '.runs.steps[] | select(.id == "pr") | .if' "$script_dir/../.github/actions/setup-bazel/action.yml")
+bazel_restore=$(yq -er '.runs.steps[] | select(.id == "restore") | .if' "$script_dir/../.github/actions/setup-bazel/action.yml")
+bazel_legacy=$(yq -er '.runs.steps[] | select(.id == "legacy") | .if' "$script_dir/../.github/actions/setup-bazel/action.yml")
+# Step conditions omit the optional GitHub expression delimiters.
+bazel_base=$(translate "\${{ $bazel_base }}")
+bazel_pr=$(translate "\${{ $bazel_pr }}")
+bazel_restore=$(translate "\${{ $bazel_restore }}")
+bazel_legacy=$(translate "\${{ $bazel_legacy }}")
+cargo_budget=$(yq -er '.jobs.lint-arm64.steps[] | select(.name == "Measure the Cargo cache") | .run' "$script_dir/../.github/workflows/ci.yml")
+# Execute the real budget selection, stopping before the existing compression measurement.
+cargo_budget=${cargo_budget%%"bytes=\$("*}
 
 check() {
   local description=$1 expr=$2 expected=$3 actual
@@ -53,6 +71,77 @@ check() {
     printf 'FAIL: %s (expected %s, got %s)\n' "$description" "$expected" "$actual" >&2
     failures=$((failures + 1))
   fi
+}
+
+check_cargo_budget() {
+  local scope=$1 expected=$2 actual
+  cases=$((cases + 1))
+  if ! actual=$(SCOPE=$scope bash --noprofile --norc -c "$cargo_budget"$'\nprintf "%s" "$budget"'); then
+    printf 'FAIL: Cargo %s budget selection failed\n' "$scope" >&2
+    failures=$((failures + 1))
+  elif [[ $actual != "$expected" ]]; then
+    printf 'FAIL: Cargo %s budget (expected %s, got %s)\n' "$scope" "$expected" "$actual" >&2
+    failures=$((failures + 1))
+  fi
+}
+
+check_darwin_guard() {
+  local kind=$1 fixture checkout home target source expected spy output status dir command
+  local failed=false
+  cases=$((cases + 1))
+  fixture="$scratch/darwin-$kind"
+  checkout="$fixture/checkout"
+  home="$fixture/cargo-home"
+  target="$fixture/cargo-target"
+  expected=$checkout
+  case "$kind" in
+    root) source=/ ;;
+    checkout-child) source="$checkout/source" ;;
+    checkout-parent) source=$fixture ;;
+    home-child) source="$home/source"; expected=$home ;;
+    home-parent) source="$fixture/source"; home="$source/home"; expected=$home ;;
+    target-child) source="$target/source"; expected=$target ;;
+    target-parent) source="$fixture/source"; target="$source/target"; expected=$target ;;
+  esac
+  mkdir -p "$checkout" "$home" "$target" "$fixture/source" "$fixture/bin"
+  for dir in "$checkout" "$home" "$target" "$fixture/source"; do
+    printf '%s' unchanged >"$dir/sentinel"
+  done
+  spy="$fixture/commands-called"
+  # Run the real guard with devShell-pinned Bash; PATH spies prevent copying or compiling on a regression.
+  for command in rsync cargo; do
+    cat >"$fixture/bin/$command" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${0##*/}" >>"$DARWIN_GUARD_SPY"
+exit 97
+SH
+    chmod +x "$fixture/bin/$command"
+  done
+  if output=$(
+    cd "$checkout"
+    export PATH="$fixture/bin:$PATH"
+    export DARWIN_GUARD_SPY=$spy DARWIN_SOURCE_DIR=$source CARGO_HOME=$home CARGO_TARGET_DIR=$target
+    bash --noprofile --norc "$script_dir/darwin-check.sh" 2>&1
+  ); then
+    status=0
+  else
+    status=$?
+  fi
+  if [[ $status != 1 || $output != "Darwin source directory must not overlap the checkout or Cargo cache: $expected" ]]; then
+    printf 'FAIL: Darwin %s did not reject the overlap with its guard diagnostic (status %s): %s\n' "$kind" "$status" "$output" >&2
+    failed=true
+  fi
+  if [[ -e $spy ]]; then
+    printf 'FAIL: Darwin %s invoked a copy/build command before rejecting the overlap\n' "$kind" >&2
+    failed=true
+  fi
+  for dir in "$checkout" "$home" "$target" "$fixture/source"; do
+    if [[ ! -f $dir/sentinel ]] || [[ $(<"$dir/sentinel") != unchanged ]]; then
+      printf 'FAIL: Darwin %s changed the sentinel in %s\n' "$kind" "$dir" >&2
+      failed=true
+    fi
+  done
+  if [[ $failed == true ]]; then failures=$((failures + 1)); fi
 }
 
 export EVENT=pull_request REF=refs/pull/1/merge DEFAULT_REF=refs/heads/main
@@ -98,6 +187,41 @@ check 'Cargo save policy is independent of Bazel cache hit' "$cargo" true
 CACHE_HIT=false PR_CACHE_HIT=true EVENT=pull_request
 check 'Bazel exact PR cache hit does not save' "$bazel" false
 check 'Cargo save policy is independent of Bazel PR cache hit' "$cargo" true
+
+export RESTORED_KEY= BASE_KEY= PR_KEY=
+OS=macOS
+for EVENT in pull_request push workflow_dispatch; do
+  check "Bazel macOS $EVENT does not restore a base cache" "$bazel_base" false
+  check "Bazel macOS $EVENT does not restore a PR cache" "$bazel_pr" false
+  check "Bazel macOS $EVENT does not restore a current cache" "$bazel_restore" false
+  check "Bazel macOS $EVENT does not restore a legacy cache" "$bazel_legacy" false
+done
+OS=Linux EVENT=pull_request
+check 'Bazel Linux PR restores a base cache' "$bazel_base" true
+check 'Bazel Linux PR restores a PR cache' "$bazel_pr" true
+check 'Bazel Linux PR does not restore a non-PR cache' "$bazel_restore" false
+for EVENT in push workflow_dispatch; do
+  check "Bazel Linux $EVENT does not restore a base cache" "$bazel_base" false
+  check "Bazel Linux $EVENT does not restore a PR cache" "$bazel_pr" false
+  check "Bazel Linux $EVENT restores a current cache" "$bazel_restore" true
+done
+for EVENT in pull_request push workflow_dispatch; do
+  RESTORED_KEY= BASE_KEY= PR_KEY=
+  check "Bazel Linux $EVENT restores legacy only after all current caches miss" "$bazel_legacy" true
+  RESTORED_KEY=current-match
+  check "Bazel Linux $EVENT current match skips legacy restore" "$bazel_legacy" false
+  RESTORED_KEY= BASE_KEY=base-match
+  check "Bazel Linux $EVENT base match skips legacy restore" "$bazel_legacy" false
+  BASE_KEY= PR_KEY=pr-match
+  check "Bazel Linux $EVENT PR match skips legacy restore" "$bazel_legacy" false
+done
+
+check_cargo_budget default 1000000000
+check_cargo_budget pr1 800000000
+
+for kind in root checkout-child checkout-parent home-child home-parent target-child target-parent; do
+  check_darwin_guard "$kind"
+done
 
 printf '%s cases, %s failures\n' "$cases" "$failures"
 (( failures == 0 ))
