@@ -126,6 +126,7 @@ workspace_rust_library(
         "//crates/gang-mtls:gang_mtls",
         "//crates/gang-oidc:gang_oidc",
         "//crates/gang-os:gang_os",
+        "//crates/gang-spi:gang_spi",
         "//crates/gang-state:gang_state",
         "//crates/gang-testkit:gang_testkit",
         "//crates/gang-tls:gang_tls",
@@ -138,7 +139,7 @@ workspace_rust_library(
 workspace_rust_binary(
     name = "local",
     src = "src/main.rs",
-    # The glibc-toolchain scenario's dynamically linked glibc program, Linux only.
+    # The glibc-toolchain and egress scenario helpers are Linux only.
     data = [
         ":bazel",
         "//:tools/e2e-gate.sh",
@@ -153,6 +154,8 @@ workspace_rust_binary(
             ":historical_gang",
             ":previous_fixture",
             ":previous_gang",
+            ":egress_peer",
+            ":egress_probe",
             "//crates/gang-main/tests/preload:loaded_probe",
         ],
         "//conditions:default": [],
@@ -167,6 +170,8 @@ workspace_rust_binary(
             "GANG_E2E_HISTORICAL_GANG": "$(rootpath :historical_gang)",
             "GANG_E2E_PREVIOUS_FIXTURE": "$(rootpath :previous_fixture)",
             "GANG_E2E_PREVIOUS_GANG": "$(rootpath :previous_gang)",
+            "GANG_E2E_EGRESS_PEER": "$(rootpath :egress_peer)",
+            "GANG_E2E_EGRESS_PROBE": "$(rootpath :egress_probe)",
             "GANG_E2E_GANG": "$(rootpath //crates/gang-main:gang)",
             "GANG_E2E_GATE_SCRIPT": "$(rootpath //:tools/e2e-gate.sh)",
             "GANG_E2E_GLIBC_TOOL": "$(rootpath //crates/gang-main/tests/preload:loaded_probe)",
@@ -184,7 +189,7 @@ workspace_rust_binary(
     ],
 )
 
-# The harness with Gang, pinned Bazel, PostgreSQL archive and glibc probe as plain files,
+# The harness with Gang, pinned Bazel, PostgreSQL archive, glibc and egress probes as plain files,
 # for a job that runs the harness without Bazel (CI's e2e gates pass them by flag).
 e2e_bundle(
     name = "bundle",
@@ -192,6 +197,8 @@ e2e_bundle(
     calibration_fixture = ":calibration_fixture",
     calibration_gang = ":calibration_gang",
     candidate_fixture = ":candidate_fixture",
+    egress_peer = ":egress_peer",
+    egress_probe = ":egress_probe",
     gang = "//crates/gang-main:gang",
     harness = ":local",
     historical_fixture = ":historical_fixture",
@@ -201,4 +208,16 @@ e2e_bundle(
     previous_fixture = ":previous_fixture",
     previous_gang = ":previous_gang",
     target_compatible_with = ["@platforms//os:linux"],
+)
+
+workspace_rust_binary(
+    name = "egress_probe",
+    src = "src/egress_probe_main.rs",
+    deps = [":gang_e2e"],
+)
+
+workspace_rust_binary(
+    name = "egress_peer",
+    src = "src/egress_peer_main.rs",
+    deps = [":gang_e2e"],
 )

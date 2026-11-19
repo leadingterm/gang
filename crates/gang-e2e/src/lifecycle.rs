@@ -7,7 +7,7 @@ use crate::check::Check;
 use crate::drain::{DrainChecks, settle};
 use crate::errors::{E2eError, Result};
 use crate::names;
-use crate::report::{IsolationReport, Namespaces};
+use crate::report::IsolationReport;
 use crate::system::{Probe, System, Variant};
 use crate::verdict;
 
@@ -29,11 +29,11 @@ pub fn lifecycle<S: System>(system: &S, variant: &Variant) -> Result<Vec<Check>>
         || format!("{workers} workers were running before the first build"),
     )];
 
-    let cold = system.build(&[Probe::Isolated, Probe::NetworkRequested, Probe::Pinned])?;
+    let cold = system.build(&[Probe::Isolated, Probe::Pinned])?;
     if !crate::check::record_build(
         &mut checks,
         &cold,
-        verdict::remote_execution(&cold, 3, system.stderr_tail_lines()),
+        verdict::remote_execution(&cold, 2, system.stderr_tail_lines()),
     ) {
         return Ok(checks);
     }
@@ -81,7 +81,6 @@ pub fn lifecycle<S: System>(system: &S, variant: &Variant) -> Result<Vec<Check>>
     ));
 
     let isolated = IsolationReport::try_from(&system.report(Probe::Isolated)?)?;
-    let requested = Namespaces::try_from(&system.report(Probe::NetworkRequested)?)?;
     checks.extend(verdict::namespaces(
         variant.sandbox,
         system.host(),
@@ -89,13 +88,6 @@ pub fn lifecycle<S: System>(system: &S, variant: &Variant) -> Result<Vec<Check>>
     ));
     checks.push(verdict::siblings_hidden(variant.sandbox, &isolated));
     checks.extend(verdict::working_directory(system.tmp_path(), &isolated));
-    checks.extend(verdict::network(
-        variant.sandbox,
-        variant.permit_network,
-        system.host(),
-        &isolated.namespaces,
-        &requested,
-    ));
 
     let failing = system.build(&[Probe::ExitThree])?;
     checks.push(verdict::exit_status(&failing, 3));
@@ -114,8 +106,8 @@ pub fn lifecycle<S: System>(system: &S, variant: &Variant) -> Result<Vec<Check>>
     let baseline = scaled_out_count(&events);
 
     system.clean()?;
-    let warm = system.build(&[Probe::Isolated, Probe::NetworkRequested, Probe::Pinned])?;
-    checks.push(verdict::cache_hit(&warm, 3, system.stderr_tail_lines()));
+    let warm = system.build(&[Probe::Isolated, Probe::Pinned])?;
+    checks.push(verdict::cache_hit(&warm, 2, system.stderr_tail_lines()));
     let workers = system.worker_count()?;
     checks.push(Check::expect(
         names::lifecycle::CACHE_HIT_NEEDS_NO_WORKER,

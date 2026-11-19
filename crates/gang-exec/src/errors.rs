@@ -48,6 +48,15 @@ pub enum ExecError {
         #[source]
         source: PropertyError,
     },
+    /// The selected fleet did not grant the requested network capability.
+    #[error("network requested but the selected fleet does not grant network access")]
+    NetworkNotGranted,
+    /// The selected fleet's trusted network configuration is incomplete.
+    #[error("network requested but the selected fleet has no public egress policy")]
+    NetworkPolicyMissing,
+    /// The controller endpoints are required to protect them from action traffic.
+    #[error("network requested but the selected fleet has no trusted controller endpoints")]
+    NetworkEndpointsMissing,
     /// The current working directory cannot be determined.
     #[error("cannot determine the working directory")]
     WorkingDirectory(#[source] io::Error),

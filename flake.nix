@@ -228,11 +228,16 @@
               pkgs.zstd
             ]
             ++ deployTools
-            ++ lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.bubblewrap;
+            ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.bubblewrap pkgs.slirp4netns pkgs.nftables pkgs.util-linux pkgs.iproute2];
         }
         // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           GANG_E2E_ACTION_ROOTFS = "${self.packages.${system}.action-rootfs-e2e}";
           GANG_E2E_BWRAP = "${pkgs.bubblewrap}/bin/bwrap";
+          GANG_E2E_SLIRP4NETNS = "${pkgs.slirp4netns}/bin/slirp4netns";
+          GANG_E2E_NFT = "${pkgs.nftables}/bin/nft";
+          GANG_E2E_NSENTER = "${pkgs.util-linux}/bin/nsenter";
+          GANG_E2E_IP = "${pkgs.iproute2}/bin/ip";
+          GANG_E2E_UNSHARE = "${pkgs.util-linux}/bin/unshare";
           # The browser of the identity scenario's device approval, which observes what only a browser enforces: the dashboard's Content-Security-Policy.
           # Pinned by flake.lock's nixpkgs, like bubblewrap; never taken from the host PATH.
           GANG_E2E_CHROMIUM = "${e2eChromium}/bin/chromium";

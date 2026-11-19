@@ -2,7 +2,10 @@
 
 use std::fmt::Display;
 
-use crate::{ActionEnvironment, FleetName, Isa, Resources, property};
+use crate::{
+    ActionEnvironment, Capability, FleetActionPolicy, FleetName, Isa, NetworkRequest, Resources,
+    property,
+};
 
 /// How a request value matches a fleet's value for one key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,6 +14,8 @@ pub enum MatchKind {
     Exact,
     /// The request value must be a number no greater than the fleet's.
     Minimum,
+    /// A requested capability requires an immutable fleet grant.
+    Capability,
     /// The key imposes nothing on matching.
     Ignored,
 }
@@ -22,6 +27,8 @@ pub(crate) enum Rule {
     Exact,
     /// The request value must be no greater than the fleet's limit.
     Minimum(u64),
+    /// A capability granted by this fleet.
+    Capability,
 }
 
 /// One property of a fleet: its key, its value, and how requests match it.
@@ -30,12 +37,15 @@ struct Entry {
     key: &'static str,
     value: String,
     rule: Rule,
+    capacity: Option<u64>,
 }
 
 /// One fleet's properties: its name, ISA, sandbox, instance size and provisioner options.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FleetProperties {
     entries: Vec<Entry>,
+    option_count: usize,
+    actions: FleetActionPolicy,
 }
 
 impl FleetProperties {
@@ -55,44 +65,79 @@ impl FleetProperties {
         sandbox: &impl Display,
         environment: &ActionEnvironment,
         instance: Resources,
+        actions: &FleetActionPolicy,
         options: impl IntoIterator<Item = (&'static str, String)>,
     ) -> Self {
+        let effective = actions.resources.effective(instance);
         let fixed: [Entry; Self::FIXED_ENTRY_COUNT] = [
             Entry {
                 key: property::FLEET,
                 value: name.to_string(),
                 rule: Rule::Exact,
+                capacity: None,
             },
             Entry {
                 key: property::ISA,
                 value: isa.to_string(),
                 rule: Rule::Exact,
+                capacity: None,
             },
             Entry {
                 key: property::SANDBOX,
                 value: sandbox.to_string(),
                 rule: Rule::Exact,
+                capacity: None,
             },
             Entry {
                 key: property::ACTION_ENVIRONMENT,
                 value: environment.to_string(),
                 rule: Rule::Exact,
+                capacity: None,
             },
-            minimum(property::CPU_COUNT, u64::from(instance.vcpus)),
+            minimum(
+                property::CPU_COUNT,
+                u64::from(instance.vcpus),
+                u64::from(effective.vcpus),
+            ),
             minimum(
                 property::CPU_MILLICORES,
                 u64::from(instance.vcpus) * property::MILLICORES_PER_CORE,
+                u64::from(effective.vcpus) * property::MILLICORES_PER_CORE,
             ),
-            minimum(property::MEMORY_KB, instance.memory.get() / 1024),
-            minimum(property::DISK_KB, instance.disk.get() / 1024),
+            minimum(
+                property::MEMORY_KB,
+                instance.memory.get() / 1024,
+                effective.memory.get() / 1024,
+            ),
+            minimum(
+                property::DISK_KB,
+                instance.disk.get() / 1024,
+                effective.disk.get() / 1024,
+            ),
         ];
         let mut entries = Vec::from(fixed);
         entries.extend(options.into_iter().map(|(key, value)| Entry {
             key,
             value,
             rule: Rule::Exact,
+            capacity: None,
         }));
-        Self { entries }
+        let option_count = entries.len() - Self::FIXED_ENTRY_COUNT;
+        for capability in &actions.grants {
+            match capability {
+                Capability::Network => entries.push(Entry {
+                    key: capability.property(),
+                    value: NetworkRequest::Requested.as_str().to_owned(),
+                    rule: Rule::Capability,
+                    capacity: None,
+                }),
+            }
+        }
+        Self {
+            entries,
+            option_count,
+            actions: actions.clone(),
+        }
     }
 
     /// The sandbox the fleet's workers run actions in.
@@ -121,8 +166,45 @@ impl FleetProperties {
             .find(|entry| entry.key == key)
             .and_then(|entry| match entry.rule {
                 Rule::Minimum(limit) => Some(limit),
-                Rule::Exact => None,
+                Rule::Exact | Rule::Capability => None,
             })
+    }
+
+    /// Physical worker capacity for a resource key, independent of action ceilings.
+    #[must_use]
+    pub fn capacity(&self, key: &str) -> Option<u64> {
+        self.entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .and_then(|entry| entry.capacity)
+    }
+
+    /// The fleet's configured action grants and ceilings.
+    #[must_use]
+    pub fn actions(&self) -> &FleetActionPolicy {
+        &self.actions
+    }
+
+    /// Explicitly configured per-action resource ceilings in scheduler units.
+    pub fn action_ceilings(&self) -> impl Iterator<Item = (&'static str, u64)> + '_ {
+        [
+            self.actions.resources.cpu_count.map(|v| {
+                (
+                    property::CPU_MILLICORES,
+                    u64::from(v.get()) * property::MILLICORES_PER_CORE,
+                )
+            }),
+            self.actions
+                .resources
+                .memory
+                .map(|v| (property::MEMORY_KB, v.as_u64() / 1024)),
+            self.actions
+                .resources
+                .disk
+                .map(|v| (property::DISK_KB, v.as_u64() / 1024)),
+        ]
+        .into_iter()
+        .flatten()
     }
 
     /// The provisioner options, in registration order: every entry after the fleet, ISA,
@@ -131,6 +213,7 @@ impl FleetProperties {
         self.entries
             .iter()
             .skip(Self::FIXED_ENTRY_COUNT)
+            .take(self.option_count)
             .map(|entry| (entry.key, entry.value.as_str()))
     }
 
@@ -156,6 +239,7 @@ impl FleetProperties {
             let kind = match entry.rule {
                 Rule::Exact => MatchKind::Exact,
                 Rule::Minimum(_) => MatchKind::Minimum,
+                Rule::Capability => MatchKind::Capability,
             };
             (entry.key, kind)
         })
@@ -170,18 +254,19 @@ impl FleetProperties {
 }
 
 /// Creates an entry that matches requests up to `limit`.
-fn minimum(key: &'static str, limit: u64) -> Entry {
+fn minimum(key: &'static str, capacity: u64, limit: u64) -> Entry {
     Entry {
         key,
-        value: limit.to_string(),
+        value: capacity.to_string(),
         rule: Rule::Minimum(limit),
+        capacity: Some(capacity),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Bytes, FleetCatalog, FleetSet};
+    use crate::{Bytes, FleetCatalog};
 
     fn gang_x86() -> FleetProperties {
         let name = FleetName::try_new("gang-x86").unwrap();
@@ -195,6 +280,7 @@ mod tests {
                 memory: Bytes::new(29 << 30),
                 disk: Bytes::new(100 << 30),
             },
+            &FleetActionPolicy::default(),
             [("capacity", "spot".to_owned())],
         )
     }
@@ -231,6 +317,7 @@ mod tests {
             &"bwrap",
             &"host:test".parse().unwrap(),
             instance,
+            &FleetActionPolicy::default(),
             [("capacity", "spot".to_owned()), ("zone", "west".to_owned())],
         );
         assert_eq!(
@@ -244,6 +331,7 @@ mod tests {
             &"bwrap",
             &"host:test".parse().unwrap(),
             instance,
+            &FleetActionPolicy::default(),
             [],
         );
         assert_eq!(without_options.options().count(), 0);
@@ -335,15 +423,62 @@ mod tests {
     #[test]
     fn empty_minimum_request_accepts_no_fleet() {
         let catalog = FleetCatalog::try_new(vec![gang_x86()]).unwrap();
-        let accepting = catalog.accepting(|key| (key == "cpu_count").then_some(""));
-        assert_eq!(accepting, FleetSet::EMPTY);
+        assert!(catalog.admit([("cpu_count", "")]).is_err());
     }
 
     #[test]
     fn overflowing_minimum_request_accepts_no_fleet() {
         let catalog = FleetCatalog::try_new(vec![gang_x86()]).unwrap();
-        let accepting =
-            catalog.accepting(|key| (key == "cpu_count").then_some("18446744073709551616"));
-        assert_eq!(accepting, FleetSet::EMPTY);
+        assert!(
+            catalog
+                .admit([("cpu_count", "18446744073709551616")])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn action_ceilings_do_not_reduce_worker_capacity_or_options() {
+        let instance = Resources {
+            vcpus: 8,
+            memory: Bytes::new(16 << 30),
+            disk: Bytes::new(100 << 30),
+        };
+        let actions = FleetActionPolicy {
+            grants: [Capability::Network].into_iter().collect(),
+            resources: crate::ResourceCeilings {
+                cpu_count: std::num::NonZeroU32::new(4),
+                memory: Some(crate::NonZeroBytes::gib(4)),
+                disk: None,
+            },
+        };
+        let name = FleetName::try_new("capped").unwrap();
+        let fleet = FleetProperties::new(
+            &name,
+            Isa::X86_64,
+            &"bwrap",
+            &"host:test".parse().unwrap(),
+            instance,
+            &actions,
+            [("capacity", "spot".into())],
+        );
+        assert_eq!(fleet.capacity(property::CPU_MILLICORES), Some(8000));
+        assert_eq!(fleet.limit(property::CPU_MILLICORES), Some(4000));
+        assert_eq!(fleet.capacity(property::MEMORY_KB), Some(16 * 1024 * 1024));
+        assert_eq!(fleet.limit(property::MEMORY_KB), Some(4 * 1024 * 1024));
+        assert_eq!(fleet.get(property::CPU_MILLICORES), Some("8000"));
+        assert_eq!(fleet.get(property::NETWORK), Some("requested"));
+        assert_eq!(fleet.options().collect::<Vec<_>>(), [("capacity", "spot")]);
+        assert_eq!(
+            fleet.action_ceilings().collect::<Vec<_>>(),
+            [
+                (property::CPU_MILLICORES, 4000),
+                (property::MEMORY_KB, 4 * 1024 * 1024)
+            ]
+        );
+        // Two legal actions can consume the physical total despite the per-action cap.
+        assert_eq!(
+            2 * fleet.limit(property::CPU_MILLICORES).unwrap(),
+            fleet.capacity(property::CPU_MILLICORES).unwrap()
+        );
     }
 }

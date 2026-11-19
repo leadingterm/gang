@@ -291,6 +291,14 @@ variable "fleets" {
     name                        = string
     isa                         = string
     sandbox                     = optional(string, "bwrap")
+    actions = optional(object({
+      grants = optional(set(string), [])
+      resources = optional(object({
+        cpu_count = optional(number)
+        memory    = optional(string)
+        disk      = optional(string)
+      }), {})
+    }), {})
     capacity                    = string
     machine_class               = optional(string, null)
     image                       = optional(object({ owner = string, sha256 = string }), null)
@@ -330,6 +338,19 @@ variable "fleets" {
     fallback: opts a spot fleet in to on-demand fallback. The fleet keeps its spot group and gains the on-demand twin <name>-on-demand, which takes capacity while Spot is unavailable. Presence opts in; null keeps Spot only. Requires capacity spot. Written to gang.toml as [fleets.options.fallback]: retry_spot_after (default 5m) is how long capacity stays on the twin after a failed Spot launch before Spot is tried again; drain_on_demand_first (default true) releases on-demand instances before Spot ones when the fleet has surplus.
     scheduled_minimum: weekly windows during which the fleet keeps at least instances instances (days of mon..sun, start and end as HH:MM local time from 00:00 to 24:00 with start before end, an IANA time_zone). Written to gang.toml as [[fleets.scheduled_minimum]]; the controller rejects an unknown time zone when it starts.
   EOT
+
+  validation {
+    condition     = alltrue(flatten([for fleet in var.fleets : [for grant in fleet.actions.grants : grant == "network"]]))
+    error_message = "Fleet action grants may contain only network."
+  }
+
+  validation {
+    condition = alltrue([for fleet in var.fleets :
+      (fleet.actions.resources.cpu_count == null ? true : fleet.actions.resources.cpu_count > 0 && floor(fleet.actions.resources.cpu_count) == fleet.actions.resources.cpu_count && fleet.actions.resources.cpu_count <= 4294967295) &&
+      alltrue([for size in [fleet.actions.resources.memory, fleet.actions.resources.disk] : size == null ? true : can(regex("^[1-9][0-9]*(B|KiB|MiB|GiB|TiB)$", size))])
+    ])
+    error_message = "Action CPU ceilings must be positive whole u32 values; memory and disk ceilings must be nonzero byte sizes."
+  }
 
   validation {
     condition     = alltrue([for fleet in var.fleets : can(regex("^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$", fleet.name))])
@@ -476,10 +497,9 @@ variable "scratch_mount_point" {
 
 variable "gang_settings" {
   type = object({
-    poll_interval           = optional(string, "1s")
-    client_action_timeout   = optional(string, "2m")
-    input_links             = optional(string, "break")
-    permit_network_property = optional(bool, false)
+    poll_interval         = optional(string, "1s")
+    client_action_timeout = optional(string, "2m")
+    input_links           = optional(string, "break")
   })
   nullable    = false
   default     = {}
@@ -487,8 +507,6 @@ variable "gang_settings" {
     Gang settings owned by the generated tables. poll_interval controls autoscaler reconciliation;
     client_action_timeout bounds client action waits. Both are required by gang, so the deployment
     supplies 1s and 2m. input_links defaults to break rather than gang's keep to protect the CAS.
-    permit_network_property controls action-requested network access. Gang requires it; the
-    deployment defaults to false to disable action-requested network access.
     Each value must satisfy gang's own rule; the validations repeat it for plan-time feedback.
   EOT
 
@@ -515,6 +533,27 @@ variable "gang_settings" {
       false
     )
     error_message = "gang_settings.client_action_timeout must be a whole number of seconds in ms, s, m, h or d, such as 2m, from 1s to 18446744073s."
+  }
+}
+
+variable "execution_egress" {
+  type = object({
+    protected_networks = list(string)
+    dns_servers        = list(string)
+    setup_timeout      = optional(string, "10s")
+  })
+  default     = null
+  description = "Additional host and network CIDRs to protect, public DNS server IP literals, and setup timeout. Required when a fleet grants network."
+
+  validation {
+    condition = var.execution_egress == null ? true : (
+      length(var.execution_egress.protected_networks) > 0 &&
+      alltrue([for cidr in var.execution_egress.protected_networks : can(cidrhost(cidr, 0))]) &&
+      length(var.execution_egress.dns_servers) > 0 &&
+      alltrue([for ip in var.execution_egress.dns_servers : can(cidrhost("${ip}/${strcontains(ip, ":") ? 128 : 32}", 0))]) &&
+      can(regex("^0*[1-9][0-9]*(ms|s|m|h|d)$", var.execution_egress.setup_timeout))
+    )
+    error_message = "execution_egress requires nonempty CIDRs and DNS IP literals and a nonzero setup duration."
   }
 }
 

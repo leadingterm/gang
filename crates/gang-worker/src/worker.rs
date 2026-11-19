@@ -201,6 +201,7 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
         worker,
         sandbox,
         execution,
+        controller_endpoints,
         limits,
         executable,
         search_path,
@@ -209,13 +210,7 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
     let fleet = fleets
         .by_name(&identity.fleet)
         .ok_or_else(|| WorkerError::NoFleet(identity.fleet.clone()))?;
-    if fleet.policy.isa != identity.isa {
-        return Err(WorkerError::IsaMismatch {
-            fleet: identity.fleet,
-            configured: fleet.policy.isa,
-            actual: identity.isa,
-        });
-    }
+    check_isa(&identity, fleet.policy.isa)?;
     let slots = match provisioner.worker_lifetime() {
         WorkerLifetime::SingleUse => Slots::SingleUse,
         WorkerLifetime::LongLived => Slots::LongLived(fleet.policy.target_actions_per_instance),
@@ -231,12 +226,27 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
         &fleet.policy.action_environment,
         build_sandbox,
     )?;
+    let network_granted = fleet
+        .policy
+        .actions
+        .grants
+        .contains(&gang_types::Capability::Network);
+    let mut execution = execution;
+    if !network_granted {
+        execution.egress = None;
+    }
     let file = SandboxFile::<P> {
         work_directory: gang_types::AbsolutePathBuf::try_new(layout.work_directory())
             .map_err(|error| WorkerError::Config(error.to_string()))?,
         selected: fleet.sandbox,
         sandbox,
         execution,
+        actions: fleet.policy.actions.clone(),
+        controller_endpoints: if network_granted {
+            controller_endpoints
+        } else {
+            Box::default()
+        },
         limits,
     };
     let text = file
@@ -244,24 +254,22 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
         .map_err(|error| WorkerError::Config(error.to_string()))?;
     layout.prepare(&text, &executable)?;
     let volume = provisioner.mount(&identity.instance).await?;
-    let cached = gang_os::fs::usage(&layout.fast_cas_directory())?;
-    let scratch = volume.capacity.saturating_add(cached);
-    let fast_cas_budget = worker.fast_cas_percent.of_bytes(scratch);
-    let measured = scratch.saturating_sub(fast_cas_budget);
-    if measured < fleet.policy.disk_per_instance.get() {
-        return Err(WorkerError::FleetDiskUnavailable {
-            fleet: identity.fleet,
-            declared: fleet.policy.disk_per_instance.get(),
-            measured,
-        });
-    }
+    let fast_cas_budget = fast_cas_budget(
+        &layout,
+        &worker,
+        volume.capacity,
+        &identity.fleet,
+        fleet.policy.disk_per_instance.get(),
+    )?;
     let limits = file.limits.map(build_limits).transpose()?;
     let reserve = actions.memory.reserve.get();
-    let memory_pool = match &limits {
-        Some(limits) => limits.prepare(reserve).await?,
-        None => None,
-    };
-    check_memory_capacity(memory_pool.as_ref(), fleet.policy, &identity.fleet, reserve)?;
+    let memory_pool = prepare_memory_pool(
+        limits.as_ref(),
+        reserve,
+        fleet.policy.memory_per_instance.get(),
+        &identity.fleet,
+    )
+    .await?;
     let mut properties = fleet.properties.clone();
     properties.set_action_environment(&environment);
     let spec = WorkerSpec {
@@ -318,15 +326,52 @@ fn prepare_sandbox<S: SandboxSelection>(
     Ok(environment)
 }
 
-/// Checks the prepared memory pool against the fleet's advertised capacity.
-fn check_memory_capacity(
-    pool: Option<&gang_spi::ActionMemoryPool>,
-    policy: &gang_config::FleetPolicy,
-    fleet: &gang_types::FleetName,
-    reserve: gang_types::Bytes,
+fn check_isa(
+    identity: &gang_spi::InstanceIdentity,
+    configured: gang_types::Isa,
 ) -> Result<(), WorkerError> {
-    if let Some(pool) = pool {
-        let declared = policy.memory_per_instance.get();
+    if configured != identity.isa {
+        return Err(WorkerError::IsaMismatch {
+            fleet: identity.fleet.clone(),
+            configured,
+            actual: identity.isa,
+        });
+    }
+    Ok(())
+}
+
+fn fast_cas_budget(
+    layout: &Layout,
+    worker: &WorkerConfig,
+    capacity: gang_types::Bytes,
+    fleet: &gang_types::FleetName,
+    declared: gang_types::Bytes,
+) -> Result<gang_types::Bytes, WorkerError> {
+    let cached = gang_os::fs::usage(&layout.fast_cas_directory())?;
+    let scratch = capacity.saturating_add(cached);
+    let budget = worker.fast_cas_percent.of_bytes(scratch);
+    let measured = scratch.saturating_sub(budget);
+    if measured < declared {
+        return Err(WorkerError::FleetDiskUnavailable {
+            fleet: fleet.clone(),
+            declared,
+            measured,
+        });
+    }
+    Ok(budget)
+}
+
+async fn prepare_memory_pool<L: ActionLimitsPort>(
+    limits: Option<&L>,
+    reserve: gang_types::Bytes,
+    declared: gang_types::Bytes,
+    fleet: &gang_types::FleetName,
+) -> Result<Option<gang_spi::ActionMemoryPool>, WorkerError> {
+    let memory_pool = match limits {
+        Some(limits) => limits.prepare(reserve).await?,
+        None => None,
+    };
+    if let Some(pool) = &memory_pool {
         let capacity = pool.capacity.get();
         if declared > capacity {
             return Err(WorkerError::FleetMemoryUnavailable {
@@ -337,7 +382,7 @@ fn check_memory_capacity(
             });
         }
     }
-    Ok(())
+    Ok(memory_pool)
 }
 
 /// The TLS material of one generation: the files the worker reads, when to refresh them, and

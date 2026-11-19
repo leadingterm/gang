@@ -26,6 +26,7 @@
 //!     idle_timeout: Duration::from_secs(15),
 //!     max_drain_wait: Duration::from_mins(1),
 //!     boot_grace: Duration::from_secs(30),
+//!     actions: Default::default(),
 //! };
 //! let mut fleets = [FleetPass::new(policy.clone())];
 //!

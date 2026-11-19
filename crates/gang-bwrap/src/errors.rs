@@ -14,6 +14,16 @@ pub(crate) enum BwrapError {
     )]
     #[failure(config)]
     RelativeProgram(PathBuf),
+    /// Public egress was requested without configured helpers.
+    #[error("public egress helpers are not configured")]
+    NetworkNotConfigured,
+    /// Public egress setup failed.
+    #[error("cannot set up public egress")]
+    NetworkSetup(#[source] io::Error),
+    #[cfg(target_os = "linux")]
+    /// Public egress setup did not finish before its deadline.
+    #[error("public egress setup exceeded {0}")]
+    NetworkTimeout(gang_types::NonZeroDuration),
     /// The running gang executable could not be located.
     #[error("cannot locate the gang executable")]
     Executable(#[source] io::Error),

@@ -8,6 +8,11 @@ output "vpc_cidr_block" {
   value       = aws_vpc.this.cidr_block
 }
 
+output "vpc_ipv6_cidr_blocks" {
+  description = "Assigned VPC IPv6 CIDR, if present."
+  value       = aws_vpc.this.ipv6_cidr_block == null || aws_vpc.this.ipv6_cidr_block == "" ? [] : [aws_vpc.this.ipv6_cidr_block]
+}
+
 output "availability_zones" {
   description = "Availability zone names used by the subnets, in subnet index order."
   value       = local.availability_zones
@@ -16,6 +21,11 @@ output "availability_zones" {
 output "public_subnet_ids" {
   description = "Public subnet IDs in availability zone order. Element 0 hosts the controller and the NAT gateway in single mode."
   value       = aws_subnet.public[*].id
+}
+
+output "public_subnets_by_az" {
+  description = "Public subnet ID per availability zone name."
+  value       = { for subnet in aws_subnet.public : subnet.availability_zone => subnet.id }
 }
 
 output "public_subnet_cidr_blocks" {

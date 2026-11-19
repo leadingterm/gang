@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 
 use gang_noop::{Noop, NoopConfig};
 use gang_spi::{
-    ActionCommand, ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort,
-    NetworkRequest, Plugin, PluginContext, PortError,
+    ActionCommand, ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, NetworkAccess,
+    Plugin, PluginContext, PortError,
 };
 use gang_testkit::ChildTest;
 use gang_types::AbsolutePathBuf;
@@ -115,7 +115,7 @@ fn host() -> Result<(), Box<dyn Error>> {
         environment: &environment,
         action_directory: &working_directory,
         working_directory: &working_directory,
-        network: NetworkRequest::NotRequested,
+        network: NetworkAccess::Offline,
     };
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -195,7 +195,7 @@ async fn spec_run(
         environment,
         action_directory: working_directory,
         working_directory,
-        network: NetworkRequest::NotRequested,
+        network: NetworkAccess::Offline,
     };
     let mut running = noop.start(&spec).await?;
     Ok(running.wait().await?)
@@ -371,7 +371,7 @@ async fn dropping_the_running_action_kills_it() -> Result<(), Box<dyn Error>> {
         environment: &environment,
         action_directory: dir.path(),
         working_directory: dir.path(),
-        network: NetworkRequest::NotRequested,
+        network: NetworkAccess::Offline,
     };
     let running = noop.start(&spec).await?;
 

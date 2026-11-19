@@ -70,7 +70,7 @@ mod tests {
 
     use gang_config::InputLinks;
     use gang_spi::{
-        ActionCommand, ActionExecutionOutcome, ActionExecutionSpec, ActionLimits, NetworkRequest,
+        ActionCommand, ActionExecutionOutcome, ActionExecutionSpec, ActionLimits, NetworkAccess,
         Termination,
     };
     use gang_testkit::{CallLog, ChildTest, RecordingLimits, ScriptedSandbox};
@@ -124,7 +124,7 @@ mod tests {
                             environment: &[],
                             action_directory: directory.path(),
                             working_directory: directory.path(),
-                            network: NetworkRequest::NotRequested,
+                            network: NetworkAccess::Offline,
                             launcher: &[],
                         },
                         limits: ActionLimits {

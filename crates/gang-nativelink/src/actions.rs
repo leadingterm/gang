@@ -145,11 +145,13 @@ async fn queued(
         };
         let row = display(row);
         let properties = &row.info.platform_properties;
-        let candidates = fleets.accepting(|key| properties.get(key).map(String::as_str));
-        let refusal = if candidates.is_empty() {
-            fleets.refusal(|key| properties.get(key).map(String::as_str))
-        } else {
-            None
+        let (candidates, refusal) = match fleets.admit(
+            properties
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        ) {
+            Ok(candidates) => (candidates, None),
+            Err(refusal) => (gang_types::FleetSet::EMPTY, Some(refusal)),
         };
         into.queued.push(QueuedActionView {
             info: ActionInfo {
@@ -514,6 +516,7 @@ pub(crate) mod tests {
                 memory: Bytes::new(8_589_934_592),
                 disk: Bytes::new(0),
             },
+            &gang_types::FleetActionPolicy::default(),
             Vec::<(&'static str, String)>::new(),
         ))
     }
@@ -635,7 +638,7 @@ pub(crate) mod tests {
             "q-1",
             ActionStage::Queued,
             0,
-            info(7, 4_000, &[("cpu", "2")]),
+            info(7, 4_000, &[("cpu_count", "2")]),
             Some(bazel("//q:one", "Genrule")),
         );
         let second = row("q-2", ActionStage::Queued, 0, info(2, 5_000, &[]), None);
@@ -659,7 +662,7 @@ pub(crate) mod tests {
                         build: None,
                     },
                     queued_since: Timestamp::from_unix_millis(4_000),
-                    candidates: fleets.accepting(|key| (key == "cpu").then_some("2")),
+                    candidates: fleets.admit([("cpu_count", "2")]).expect("admitted"),
                     refusal: None,
                 },
                 QueuedActionView {
@@ -672,7 +675,7 @@ pub(crate) mod tests {
                         build: None,
                     },
                     queued_since: Timestamp::from_unix_millis(5_000),
-                    candidates: fleets.accepting(|_| None),
+                    candidates: fleets.admit(std::iter::empty()).expect("admitted"),
                     refusal: None,
                 },
             ]
@@ -707,7 +710,7 @@ pub(crate) mod tests {
         assert!(view.queued[0].candidates.is_empty());
         assert!(matches!(
             &view.queued[0].refusal,
-            Some(gang_types::Refusal::Minimum {
+            Some(gang_types::Refusal::Incompatible {
                 key: property::CPU_COUNT,
                 ..
             })

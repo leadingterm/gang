@@ -180,6 +180,19 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
         Self::check_leadership(&server)?;
         let fleets = Fleets::resolve(fleets, &provisioner, &sandbox)?;
         Self::check_fleet_settings(&fleets, &server, default_isa)?;
+        if let Some(policy) = &execution.egress {
+            policy.validate().map_err(ConfigError::InvalidEgress)?;
+        }
+        if execution.egress.is_none()
+            && fleets.policies().iter().any(|fleet| {
+                fleet
+                    .actions
+                    .grants
+                    .contains(&gang_types::Capability::Network)
+            })
+        {
+            return Err(ConfigError::MissingEgress);
+        }
         Self::check_actions(&fleets, &actions)?;
         if worker.connect_timeout.get() / 2 >= server.worker_timeout.get() {
             return Err(ConfigError::WorkerConnectTimeoutTooLong {
@@ -228,11 +241,12 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
 
     fn check_actions(fleets: &Fleets<P>, actions: &ActionsConfig) -> Result<(), ConfigError> {
         for fleet in fleets.policies() {
+            let effective = fleet.actions.resources.effective(fleet.instance());
             for (key, value, capacity, strict) in [
                 (
                     "actions.memory.min_reservation",
                     actions.memory.min_reservation.as_units() * 1024,
-                    fleet.memory_per_instance.as_u64(),
+                    effective.memory.get(),
                     false,
                 ),
                 (
@@ -244,7 +258,7 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
                 (
                     "actions.disk.min_reservation",
                     actions.disk.min_reservation.as_units() * 1024,
-                    fleet.disk_per_instance.as_u64(),
+                    effective.disk.get(),
                     false,
                 ),
             ] {
@@ -260,20 +274,13 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
             }
         }
         let cold = &actions.cold_start;
-        let cpu = cold.cpu_count.to_string();
-        let millicores = (u64::from(cold.cpu_count.get())
-            * gang_types::property::MILLICORES_PER_CORE)
-            .to_string();
-        let memory = cold.memory.as_units().to_string();
-        let disk = cold.disk.as_units().to_string();
-        let accepting = fleets.catalog().accepting(|key| match key {
-            gang_types::property::CPU_COUNT => Some(cpu.as_str()),
-            gang_types::property::CPU_MILLICORES => Some(millicores.as_str()),
-            gang_types::property::MEMORY_KB => Some(memory.as_str()),
-            gang_types::property::DISK_KB => Some(disk.as_str()),
-            _ => None,
+        let fits = fleets.policies().iter().any(|fleet| {
+            let effective = fleet.actions.resources.effective(fleet.instance());
+            effective.vcpus >= cold.cpu_count.get()
+                && effective.memory.get() >= cold.memory.as_units() * 1024
+                && effective.disk.get() >= cold.disk.as_units() * 1024
         });
-        if cold.enabled && accepting.is_empty() {
+        if cold.enabled && !fits {
             return Err(ConfigError::ColdStartFitsNoFleet {
                 cpu_count: cold.cpu_count.get(),
                 memory_kb: cold.memory.as_units(),

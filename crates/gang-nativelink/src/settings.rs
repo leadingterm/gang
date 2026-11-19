@@ -89,21 +89,29 @@ fn resource_escalation(actions: &ActionsConfig, fleets: &FleetCatalog) -> Value 
                 .iter()
                 .filter_map(|&(key, kind)| {
                     (kind == MatchKind::Minimum)
-                        .then(|| fleet.limit(key).map(|limit| (key.to_owned(), json!(limit))))
+                        .then(|| {
+                            fleet
+                                .capacity(key)
+                                .map(|limit| (key.to_owned(), json!(limit)))
+                        })
                         .flatten()
                 })
                 .collect();
-            // Environment partitions software, not the hardware capacities used to escalate.
+            // Preserve exact environment and capability identity when selecting a ceiling.
             let exact: Map<String, Value> = fleets
                 .declared()
                 .iter()
                 .filter_map(|&(key, kind)| {
-                    (kind == MatchKind::Exact && key != property::ACTION_ENVIRONMENT)
+                    (kind == MatchKind::Exact || kind == MatchKind::Capability)
                         .then(|| fleet.get(key).map(|value| (key.to_owned(), json!(value))))
                         .flatten()
                 })
                 .collect();
-            json!({ "minimum": minimum, "exact": exact })
+            let action_ceilings: Map<String, Value> = fleet
+                .action_ceilings()
+                .map(|(key, limit)| (key.to_owned(), json!(limit)))
+                .collect();
+            json!({ "minimum": minimum, "exact": exact, "action_ceilings": action_ceilings })
         })
         .collect();
     let mut escalation = json!({
@@ -159,7 +167,7 @@ fn supported_platform_properties(fleets: &FleetCatalog) -> Map<String, Value> {
 /// The `NativeLink` property type that matches a key of `kind`.
 const fn property_type(kind: MatchKind) -> &'static str {
     match kind {
-        MatchKind::Exact => "exact",
+        MatchKind::Exact | MatchKind::Capability => "exact",
         MatchKind::Minimum => "minimum",
         MatchKind::Ignored => "ignore",
     }
@@ -349,6 +357,11 @@ fn local_worker(
         .worker_properties()
         .map(|(key, value)| (key.to_owned(), json!({ "values": [value] })))
         .collect();
+    let action_ceilings: Map<String, Value> = spec
+        .properties
+        .action_ceilings()
+        .map(|(key, limit)| (key.to_owned(), json!(limit)))
+        .collect();
     let worker = json!({
         "name": spec.instance.worker_name(),
         "worker_api_endpoint": api_endpoint,
@@ -358,13 +371,14 @@ fn local_worker(
         "upload_action_result": { "ac_store": WORKER_ACTION_STORE },
         "work_directory": path_str(&spec.work_directory)?,
         "entrypoint": path_str(&spec.entrypoint)?,
-        "additional_environment": {
+        "enforced_environment": {
             (NETWORK_ENV): { "property": property::NETWORK },
             (CPU_COUNT_ENV): { "property": property::CPU_COUNT },
             (MEMORY_KB_ENV): { "property": property::MEMORY_KB },
             (SIDE_CHANNEL_FILE_ENV): "side_channel_file",
         },
         "platform_properties": platform_properties,
+        "action_ceilings": action_ceilings,
         "max_action_timeout_s": spec.actions.timeout.as_units(),
         "resource_enforcement": resource_enforcement(spec)?,
     });
@@ -500,6 +514,7 @@ mod tests {
                 memory: Bytes::new(8 * 1024 * 1024 * 1024),
                 disk: Bytes::new(100 << 30),
             },
+            &gang_types::FleetActionPolicy::default(),
             [("capacity", capacity.to_owned())],
         )
     }
@@ -607,6 +622,7 @@ mod tests {
                 memory: Bytes::gib(8),
                 disk: Bytes::gib(100),
             },
+            &gang_types::FleetActionPolicy::default(),
             [],
         );
         assert_eq!(
@@ -741,8 +757,65 @@ mod tests {
         );
         let rendered = local_worker(&config(), &spec, "grpc://127.0.0.1:9100").expect("worker");
         assert_eq!(
-            rendered["additional_environment"][SIDE_CHANNEL_FILE_ENV],
+            rendered["enforced_environment"][SIDE_CHANNEL_FILE_ENV],
             "side_channel_file"
+        );
+    }
+
+    #[test]
+    fn action_ceiling_does_not_reduce_physical_worker_capacity() {
+        let mut policy = gang_types::FleetActionPolicy::default();
+        policy.grants.insert(gang_types::Capability::Network);
+        policy.resources.memory = Some(gang_types::NonZeroBytes::gib(4));
+        let properties = FleetProperties::new(
+            &FleetName::try_new("limited").expect("fleet"),
+            Isa::X86_64,
+            &"docker",
+            &"host:test".parse().expect("valid environment"),
+            Resources {
+                vcpus: 4,
+                memory: Bytes::gib(8),
+                disk: Bytes::gib(100),
+            },
+            &policy,
+            [],
+        );
+        let instance = InstanceId::try_new("local-1").expect("instance");
+        let content = memory_store();
+        let action = memory_store();
+        let spec = worker_spec(
+            &instance,
+            &properties,
+            &content,
+            &action,
+            StoreAccess::Direct,
+        );
+        let rendered = local_worker(&config(), &spec, "grpc://127.0.0.1:9100").expect("worker");
+        assert_eq!(
+            rendered["platform_properties"][property::MEMORY_KB]["values"],
+            json!(["8388608"])
+        );
+        assert_eq!(
+            rendered["platform_properties"][property::NETWORK]["values"],
+            json!(["requested"])
+        );
+        assert_eq!(
+            rendered["action_ceilings"][property::MEMORY_KB],
+            json!(4_194_304)
+        );
+        let fleets = FleetCatalog::try_new(vec![properties]).expect("catalog");
+        let capacity = resource_escalation(&ActionsConfig::default(), &fleets);
+        assert_eq!(
+            capacity["capacities"][0]["minimum"][property::MEMORY_KB],
+            json!(8_388_608)
+        );
+        assert_eq!(
+            capacity["capacities"][0]["action_ceilings"][property::MEMORY_KB],
+            json!(4_194_304)
+        );
+        assert_eq!(
+            capacity["capacities"][0]["exact"][property::NETWORK],
+            json!("requested")
         );
     }
 
@@ -1186,7 +1259,7 @@ mod tests {
                 "disk_property_name": "disk_kb",
                 "disk_headroom_percent": 41,
                 "disk_soft_samples": 3,
-                "disk_sample_interval_ms": 13000,
+                "disk_sample_interval_ms": 13_000,
                 "disk_pressure_free_percent": 12,
                 "disk_pressure_poll_interval_ms": 2300,
                 "disk_pressure_kill_after_ms": 7500
@@ -1224,6 +1297,7 @@ mod tests {
                     memory: Bytes::gib(16),
                     disk: Bytes::gib(80),
                 },
+                &gang_types::FleetActionPolicy::default(),
                 [
                     ("capacity", "3".to_owned()),
                     ("machine_class", "arm".to_owned()),
@@ -1276,11 +1350,13 @@ mod tests {
             json!([
                 {
                     "minimum": { "cpu_count": 4, "cpu_millicores": 4000, "memory_kb": 8_388_608, "disk_kb": 104_857_600 },
-                    "exact": { "fleet": "fleet-a", "ISA": "x86-64", "sandbox": "docker", "capacity": "2" }
+                    "exact": { "fleet": "fleet-a", "ISA": "x86-64", "sandbox": "docker", "gang_action_environment": "host:test", "capacity": "2" },
+                    "action_ceilings": {}
                 },
                 {
                     "minimum": { "cpu_count": 6, "cpu_millicores": 6000, "memory_kb": 16_777_216, "disk_kb": 83_886_080 },
-                    "exact": { "fleet": "fleet-b", "ISA": "aarch64", "sandbox": "bwrap", "capacity": "3", "machine_class": "arm" }
+                    "exact": { "fleet": "fleet-b", "ISA": "aarch64", "sandbox": "bwrap", "gang_action_environment": "host:test", "capacity": "3", "machine_class": "arm" },
+                    "action_ceilings": {}
                 }
             ])
         );

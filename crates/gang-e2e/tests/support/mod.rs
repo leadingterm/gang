@@ -5,6 +5,7 @@
 //! misbehaviour is a value of one of the enums below, so a test names the flaw it injects.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -714,23 +715,25 @@ impl Simulation {
     }
 
     /// The report `probe` writes when it runs under `sandbox`, or `None` when it writes none.
-    fn report_for(&self, probe: Probe, sandbox: Sandbox) -> Option<String> {
+    fn report_for(&self, probe: Probe, sandbox: Sandbox) -> Result<Option<String>> {
         let namespaces = self.namespaces(sandbox);
-        match probe {
+        Ok(match probe {
             Probe::Isolated => Some(self.isolation_report(namespaces).to_string()),
-            Probe::NetworkRequested => {
-                let requested = if self.variant.permit_network == PermitNetwork::Permitted {
-                    HOST_NET
-                } else {
-                    OWN_NET
-                };
-                Some(
-                    Namespaces {
-                        net: self.readable(requested),
-                        ..namespaces
+            Probe::NetworkIsolated | Probe::NetworkRequested => {
+                let online = probe == Probe::NetworkRequested;
+                let access = if online { "ok" } else { "network_unreachable" };
+                let mut report = format!(
+                    "uid=1000\ngid=1000\nnet={}\nloopback4=ok\nloopback6=ok\nfd_leak=ok\nnft_mutation=permission_denied\npublic4={access}\npublic6={access}\nudp4={access}\nudp6={access}\ndns_public={access}\ndns_private=network_unreachable\n",
+                    namespaces.net,
+                );
+                for label in ["imds4", "alias4", "dns_alias4", "alias6"] {
+                    for protocol in ["tcp", "udp"] {
+                        writeln!(report, "blocked_{label}_{protocol}=network_unreachable").map_err(
+                            |error| E2eError::system(format!("formatting network report: {error}")),
+                        )?;
                     }
-                    .to_string(),
-                )
+                }
+                Some(report)
             }
             Probe::Pinned => {
                 (self.behaviour.serving == Serving::Keeps).then(|| "ran=yes\n".to_owned())
@@ -804,7 +807,7 @@ impl Simulation {
                 .to_string(),
             ),
             _ => Some("ran=yes\n".to_owned()),
-        }
+        })
     }
 
     /// Records a scaling change of `fleet` at the next instant of the log.
@@ -1577,22 +1580,8 @@ impl Control for Simulation {
 impl Simulation {
     /// The body of [`build`](Self::build), run while the build counts as in flight.
     fn run_build(&self, probes: &[Probe]) -> Result<BuildOutcome> {
-        if self.behaviour.build == BuildFailure::BeforeScaleOut {
-            return Ok(BuildOutcome::new(Some(34), "UNAVAILABLE".to_owned()));
-        }
-        if probes.contains(&Probe::Hold) {
-            return Ok(match self.behaviour.hold {
-                HoldBuild::Starts => self.hold()?,
-                HoldBuild::FailsEarly => {
-                    BuildOutcome::new(Some(1), "ERROR: //:hold failed: (Exit 1)\n".to_owned())
-                }
-            });
-        }
-        if probes.contains(&Probe::MemoryHog) {
-            return Ok(self.memory_hog());
-        }
-        if probes.contains(&Probe::MemoryGrower) {
-            return Ok(self.memory_grower());
+        if let Some(outcome) = self.special_build(probes)? {
+            return Ok(outcome);
         }
         let mut state = self.state.lock();
 
@@ -1662,7 +1651,7 @@ impl Simulation {
                     .and_then(|index| self.fleets.get(index))
                     .map_or(self.variant.sandbox, |fleet| fleet.sandbox)
             };
-            if let Some(text) = self.report_for(*probe, sandbox) {
+            if let Some(text) = self.report_for(*probe, sandbox)? {
                 state.reports.insert(probe.as_str(), text);
             }
             if !hit && *probe != Probe::ExitThree {
@@ -1675,6 +1664,36 @@ impl Simulation {
         stderr.push_str(&Self::summary(remote, hits));
         let exit_code = Some(i32::from(failed));
         Ok(BuildOutcome::new(exit_code, stderr))
+    }
+
+    fn special_build(&self, probes: &[Probe]) -> Result<Option<BuildOutcome>> {
+        if self.behaviour.build == BuildFailure::BeforeScaleOut {
+            return Ok(Some(BuildOutcome::new(Some(34), "UNAVAILABLE".to_owned())));
+        }
+        if probes.contains(&Probe::NetworkRequested)
+            && self.variant.permit_network == PermitNetwork::Denied
+            && self.behaviour.routing != Routing::IgnoresProperties
+        {
+            return Ok(Some(BuildOutcome::new(
+                Some(1),
+                "INVALID_ARGUMENT: network is not granted by fleet\n".to_owned(),
+            )));
+        }
+        if probes.contains(&Probe::Hold) {
+            return Ok(Some(match self.behaviour.hold {
+                HoldBuild::Starts => self.hold()?,
+                HoldBuild::FailsEarly => {
+                    BuildOutcome::new(Some(1), "ERROR: //:hold failed: (Exit 1)\n".to_owned())
+                }
+            }));
+        }
+        if probes.contains(&Probe::MemoryHog) {
+            return Ok(Some(self.memory_hog()));
+        }
+        if probes.contains(&Probe::MemoryGrower) {
+            return Ok(Some(self.memory_grower()));
+        }
+        Ok(None)
     }
 
     /// Runs the hold action: it scales out if nothing runs, publishes its scope and its orphan,

@@ -252,6 +252,98 @@ run "direct_endpoint_without_load_balancer" {
     condition     = !strcontains(output.gang_toml, "[server.proxy_protocol]")
     error_message = "SQLite direct deployments must not enable PROXY."
   }
+  assert {
+    condition     = !strcontains(output.gang_toml, "[execution.egress]") && !strcontains(output.gang_toml, "[sandbox.bwrap.egress]") && strcontains(output.gang_toml, "grants = []")
+    error_message = "Default fleets must deny network and omit egress configuration."
+  }
+}
+
+run "network_grant_requires_egress" {
+  command = plan
+  variables {
+    fleets = [{
+      name = "worker", isa = "x86-64", capacity = "spot"
+      instance_types = ["c6id.4xlarge"]
+      max_instances = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
+      disk_per_instance = "200GiB", target_actions_per_instance = 16
+      actions = { grants = ["network"] }
+    }]
+  }
+  expect_failures = [terraform_data.input_checks]
+}
+
+run "rejects_unknown_capability" {
+  command = plan
+  variables {
+    fleets = [{
+      name = "worker", isa = "x86-64", capacity = "spot"
+      instance_types = ["c6id.4xlarge"]
+      max_instances = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
+      disk_per_instance = "200GiB", target_actions_per_instance = 16
+      actions = { grants = ["unknown"] }
+    }]
+  }
+  expect_failures = [var.fleets]
+}
+
+run "rejects_invalid_action_cpu" {
+  command = plan
+  variables {
+    fleets = [{
+      name = "worker", isa = "x86-64", capacity = "spot"
+      instance_types = ["c6id.4xlarge"]
+      max_instances = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
+      disk_per_instance = "200GiB", target_actions_per_instance = 16
+      actions = { resources = { cpu_count = 0 } }
+    }]
+  }
+  expect_failures = [var.fleets]
+}
+
+run "rejects_empty_egress_dns" {
+  command = plan
+  variables {
+    execution_egress = { protected_networks = ["10.0.0.0/8"], dns_servers = [] }
+  }
+  expect_failures = [var.execution_egress]
+}
+
+run "protects_assigned_addresses_when_network_granted" {
+  command = apply
+  variables {
+    hostname = "gang.example.com"
+    load_balancer = {}
+    execution_egress = {
+      protected_networks = ["198.51.100.0/24"]
+      dns_servers = ["1.1.1.1"]
+      setup_timeout = "12s"
+    }
+    fleets = [{
+      name = "worker", isa = "x86-64", capacity = "spot"
+      instance_types = ["c6id.4xlarge"]
+      max_instances = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
+      disk_per_instance = "200GiB", target_actions_per_instance = 16
+      actions = { grants = ["network"], resources = { cpu_count = 2, memory = "1GiB", disk = "2GiB" } }
+    }]
+  }
+  override_resource {
+    target = module.network.aws_vpc.this
+    values = { cidr_block = "10.20.0.0/16", ipv6_cidr_block = "2600:1f00:abcd:1200::/56" }
+  }
+  assert {
+    condition = alltrue([
+      contains(local.protected_networks, "10.20.0.0/16"),
+      contains(local.protected_networks, "2600:1f00:abcd:1200::/56"),
+      contains(local.protected_networks, "${module.network.controller_public_ip}/32"),
+      alltrue([for ip in values(module.load_balancer[0].public_static_ips) : contains(local.protected_networks, "${ip}/32")]),
+      length(module.load_balancer[0].public_static_ips) == 1,
+    ])
+    error_message = "Protection must include the assigned VPC CIDRs, controller EIP and every public NLB EIP."
+  }
+  assert {
+    condition     = strcontains(output.gang_toml, "[execution.egress]") && strcontains(output.gang_toml, "[sandbox.bwrap.egress]") && strcontains(output.gang_toml, "cpu_count = 2")
+    error_message = "The rendered Gang configuration must carry the granted policy and helper section."
+  }
 }
 
 run "load_balancer_fronts_the_public_listener" {
@@ -524,18 +616,12 @@ run "renders_gang_settings_override" {
   variables {
     gang_settings = {
       poll_interval           = "3s"
-      permit_network_property = true
     }
   }
 
   assert {
     condition     = strcontains(output.gang_toml, "poll_interval = \"3s\"")
     error_message = "gang_settings must override the rendered poll interval."
-  }
-
-  assert {
-    condition     = strcontains(output.gang_toml, "permit_network_property = true")
-    error_message = "gang_settings must override the sandbox network setting."
   }
 }
 

@@ -26,7 +26,7 @@ use crate::template::{PROVIDER, Transport};
 use crate::tls_client::{self, ALPN_H2};
 
 /// The probes of a build made with a bearer token: every probe the lifecycle builds.
-const ALL_BUILD_PROBES: &[Probe] = &[Probe::Isolated, Probe::NetworkRequested, Probe::Pinned];
+const ALL_BUILD_PROBES: &[Probe] = &[Probe::Isolated, Probe::Pinned];
 
 /// The probe of a build made without a token.
 const PINNED_PROBE: &[Probe] = &[Probe::Pinned];

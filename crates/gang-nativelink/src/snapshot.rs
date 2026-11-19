@@ -76,7 +76,13 @@ fn queued_demand(
 ) -> Option<QueuedDemand> {
     Some(QueuedDemand {
         candidates: fleets
-            .accepting_base(|key| info.platform_properties.get(key).map(String::as_str)),
+            .admit(
+                info.platform_properties
+                    .iter()
+                    .filter(|(key, _)| key.as_str() != property::ACTION_ENVIRONMENT)
+                    .map(|(key, value)| (key.as_str(), value.as_str())),
+            )
+            .unwrap_or_default(),
         environment: info
             .platform_properties
             .get(property::ACTION_ENVIRONMENT)?
@@ -249,6 +255,7 @@ pub(crate) mod tests {
                     memory: Bytes::gib(8),
                     disk: Bytes::new(100 << 30),
                 },
+                &gang_types::FleetActionPolicy::default(),
                 Vec::<(&'static str, String)>::new(),
             )
         };
@@ -427,9 +434,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn undeclared_demand_keys_are_ignored() {
+    fn undeclared_demand_keys_have_no_candidates() {
         let entry = demand(0, &[("color", "teal")]);
-        assert_eq!(candidates(&entry), vec![0, 1]);
+        assert!(candidates(&entry).is_empty());
     }
 
     #[test]

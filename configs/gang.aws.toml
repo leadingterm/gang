@@ -72,7 +72,6 @@ path = "/var/lib/gang/gang.db"
 
 [sandbox.bwrap]
 root = "/etc/gang/action-rootfs"
-permit_network_property = false
 
 [limits.cgroup]
 

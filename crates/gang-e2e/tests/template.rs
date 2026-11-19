@@ -9,17 +9,18 @@ use gang_config::{
     SandboxSelection,
 };
 use gang_e2e::{
-    AUDIENCE, ActionLimits, ActionTools, ConfigTemplate, ControlKnobs, E2eError, ExecutionKnobs,
-    FleetLayout, IdentityKnobs, LARGE_FLEET, LIMIT_CPU_PERIOD_MICROS, LIMIT_MAX_PIDS, NOOP_FLEET,
-    ORGANIZATION, ORGANIZATION_CLAIM, PermitNetwork, Placement, SMALL_FLEET, Sandbox, ServerKnobs,
-    SoftMemory, Transport, Variant,
+    AUDIENCE, ActionLimits, ActionTools, ConfigTemplate, ControlKnobs, E2eError, EgressTools,
+    ExecutionKnobs, FleetLayout, IdentityKnobs, LARGE_FLEET, LIMIT_CPU_PERIOD_MICROS,
+    LIMIT_MAX_PIDS, NOOP_FLEET, ORGANIZATION, ORGANIZATION_CLAIM, PermitNetwork, Placement,
+    SMALL_FLEET, Sandbox, ServerKnobs, SoftMemory, Transport, Variant,
 };
 use gang_main::plugins::{
     CacheConfig, ClientAuthenticationConfig, DatabaseConfig, IdentityProviderConfig, LimitsConfig,
     Plugins, ProvisionerConfig, SandboxKey, SignerConfig, WorkerAuthenticationConfig,
 };
 use gang_types::{
-    AbsolutePathBuf, AuthenticationSettings, Bytes, CaPin, PermissionSet, ProviderName, Url,
+    AbsolutePathBuf, AuthenticationSettings, Bytes, CaPin, Capability, NonZeroDuration,
+    PermissionSet, ProviderName, PublicEgressPolicy, Url,
 };
 use toml::Table;
 
@@ -118,6 +119,32 @@ fn tools() -> gang_e2e::Result<TestTools> {
             path: "/nix/store/aaa-bash/bin:/nix/store/bbb-coreutils/bin".to_owned(),
             glibc_tool: None,
             action_rootfs: Some(rootfs.path().to_path_buf()),
+            egress: Some(EgressTools {
+                slirp4netns: "/nix/store/egress/bin/slirp4netns".into(),
+                nft: "/nix/store/egress/bin/nft".into(),
+                nsenter: "/nix/store/egress/bin/nsenter".into(),
+                ip: "/nix/store/egress/bin/ip".into(),
+                unshare: "/nix/store/egress/bin/unshare".into(),
+                probe: "/nix/store/egress/bin/egress_probe".into(),
+                peer: "/nix/store/egress/bin/egress_peer".into(),
+                policy: Some(PublicEgressPolicy {
+                    protected_networks: vec![
+                        "10.0.0.0/8"
+                            .parse()
+                            .map_err(|error| E2eError::system(format!("{error}")))?,
+                    ]
+                    .into_boxed_slice(),
+                    dns_servers: vec![
+                        "1.1.1.1"
+                            .parse()
+                            .map_err(|error| E2eError::system(format!("{error}")))?,
+                    ]
+                    .into_boxed_slice(),
+                    setup_timeout: NonZeroDuration::from_secs(10),
+                }),
+                targets: None,
+                repository_cache: None,
+            }),
         },
         rootfs,
     })
@@ -575,12 +602,9 @@ fn vary_bwrap_denied_breaks_input_links() -> gang_e2e::Result<()> {
         &*(tools()?),
     )?)?;
     assert_eq!(doc.fleets[0].sandbox, SandboxKey::Bwrap);
-    assert!(
-        !doc.sandbox
-            .bwrap
-            .expect("bwrap sandbox")
-            .permit_network_property
-    );
+    assert!(!doc.fleets[0].actions.grants.contains(&Capability::Network));
+    assert!(doc.execution.egress.is_none());
+    assert!(doc.sandbox.bwrap.expect("bwrap sandbox").egress.is_none());
     assert_eq!(doc.execution.input_links, InputLinks::Break);
     Ok(())
 }
@@ -597,13 +621,46 @@ fn vary_bwrap_permitted_keeps_input_links() -> gang_e2e::Result<()> {
         &launcher(),
         &*(tools()?),
     )?)?;
-    assert!(
-        doc.sandbox
-            .bwrap
-            .expect("bwrap sandbox")
-            .permit_network_property
-    );
+    assert!(doc.fleets[0].actions.grants.contains(&Capability::Network));
+    assert!(doc.execution.egress.is_some());
+    let egress = doc
+        .sandbox
+        .bwrap
+        .expect("bwrap sandbox")
+        .egress
+        .expect("egress helpers");
+    assert_eq!(egress.nft, PathBuf::from("/nix/store/egress/bin/nft"));
     assert_eq!(doc.execution.input_links, InputLinks::Keep);
+    Ok(())
+}
+
+#[test]
+fn network_grant_requires_tools_and_policy() -> gang_e2e::Result<()> {
+    let variant = Variant {
+        permit_network: PermitNetwork::Permitted,
+        ..Variant::baseline(Sandbox::Bwrap)
+    };
+    let mut missing_tools = tools()?;
+    missing_tools.egress = None;
+    assert!(
+        ConfigTemplate::parse(&base_config()?)?
+            .vary(&variant, &launcher(), &missing_tools)
+            .is_err()
+    );
+    let mut missing_policy = tools()?;
+    missing_policy.egress.as_mut().expect("egress tools").policy = None;
+    assert!(
+        ConfigTemplate::parse(&base_config()?)?
+            .vary(&variant, &launcher(), &missing_policy)
+            .is_err()
+    );
+    let mut relative_tool = tools()?;
+    relative_tool.egress.as_mut().expect("egress tools").nft = "nft".into();
+    assert!(
+        ConfigTemplate::parse(&base_config()?)?
+            .vary(&variant, &launcher(), &relative_tool)
+            .is_err()
+    );
     Ok(())
 }
 
@@ -1366,6 +1423,10 @@ impl SandboxSelection for OpaqueSandboxes {
         }
     }
 
+    fn supports_capability(&self, _key: Self::Key, _capability: Capability) -> bool {
+        false
+    }
+
     fn try_for_each_program<E>(
         &mut self,
         _key: Self::Key,
@@ -1451,6 +1512,9 @@ fn check_base_variants(
 ) -> gang_e2e::Result<()> {
     for sandbox in [Sandbox::Noop, Sandbox::Bwrap] {
         for permit_network in [PermitNetwork::Denied, PermitNetwork::Permitted] {
+            if sandbox == Sandbox::Noop && permit_network == PermitNetwork::Permitted {
+                continue;
+            }
             for input_links in [InputLinks::Keep, InputLinks::Break] {
                 for limits in [ActionLimits::Absent, ActionLimits::Cgroup] {
                     for fleets in [FleetLayout::Single, FleetLayout::Placement] {

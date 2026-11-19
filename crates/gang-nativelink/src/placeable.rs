@@ -69,11 +69,7 @@ impl AdmittedFleets {
 }
 
 /// The error a client gets when no declared fleet accepts its action, naming what was refused.
-pub(crate) fn refused<'r>(
-    fleets: &FleetCatalog,
-    request: impl Fn(&str) -> Option<&'r str>,
-) -> Error {
-    let refusal = fleets.refusal(request).unwrap_or(Refusal::Combination);
+pub(crate) fn refused(refusal: &Refusal) -> Error {
     make_input_err!(
         "no fleet accepts this action: {refusal}; change its exec_properties or declare a fleet that accepts them"
     )
@@ -169,6 +165,7 @@ fn worker_properties(
         p.get(property::SANDBOX)?,
         &environment,
         resources,
+        base.actions(),
         options,
     ))
 }
@@ -199,6 +196,11 @@ fn worker_accepts<'a>(
                 .platform_properties
                 .get(key)
                 .is_some_and(|actual| actual == requested),
+            MatchKind::Capability => {
+                requested.is_empty()
+                    || requested == "not-requested"
+                    || worker.platform_properties.get(key).is_some_and(|actual| actual == requested)
+            }
             MatchKind::Minimum => worker
                 .platform_properties
                 .get(key)
@@ -310,6 +312,15 @@ impl ClientStateManager for PlaceableActions {
         client_operation_id: OperationId,
         mut action_info: Arc<ActionInfo>,
     ) -> Result<Box<dyn ActionStateResult>, Error> {
+        if action_info
+            .platform_properties
+            .get(property::NETWORK)
+            .is_some_and(|value| value.is_empty() || value == "not-requested")
+        {
+            Arc::make_mut(&mut action_info)
+                .platform_properties
+                .remove(property::NETWORK);
+        }
         let properties = |key: &str| action_info.platform_properties.get(key).map(String::as_str);
         let served = || {
             self.fleets
@@ -327,19 +338,14 @@ impl ClientStateManager for PlaceableActions {
                 served()
             ));
         };
+        let base = self.fleets.admit(
+            action_info.platform_properties.iter()
+                .filter(|(key, _)| key.as_str() != property::ACTION_ENVIRONMENT)
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        ).map_err(|refusal| refused(&refusal))?;
         let admitted = self.fleets.accepting(properties);
         let mut live = None;
         if admitted.is_empty() {
-            let base = self.fleets.accepting_base(properties);
-            if base.is_empty() {
-                return Err(refused(&self.fleets, |key| {
-                    if key == property::ACTION_ENVIRONMENT {
-                        None
-                    } else {
-                        properties(key)
-                    }
-                }));
-            }
             if let Some(workers) = &self.workers {
                 live = live_catalog(
                     &workers.worker_snapshot().await,
@@ -506,6 +512,7 @@ mod tests {
                 memory: Bytes::new(1024),
                 disk: Bytes::new(1024),
             },
+            &gang_types::FleetActionPolicy::default(),
             Vec::<(&'static str, String)>::new(),
         )])
         .expect("valid catalog")
@@ -547,11 +554,21 @@ mod tests {
         let admitted = AdmittedFleets::default();
         let fleets = catalog();
         {
-            let _admission = admitted.insert(operation(), fleets.accepting(|_| None));
+            let _admission = admitted.insert(
+                operation(),
+                fleets
+                    .admit(std::iter::empty())
+                    .expect("baseline admission"),
+            );
             assert!(admitted.take(&operation()).is_some());
         }
         {
-            let _admission = admitted.insert(operation(), fleets.accepting(|_| None));
+            let _admission = admitted.insert(
+                operation(),
+                fleets
+                    .admit(std::iter::empty())
+                    .expect("baseline admission"),
+            );
         }
         assert!(admitted.take(&operation()).is_none());
     }
@@ -568,7 +585,9 @@ mod tests {
         };
         assert_eq!(error.code, Code::InvalidArgument);
         let message = error.to_string();
-        assert!(message.contains("cpu_count") && message.contains("99") && message.contains("15"));
+        assert!(
+            message.contains("cpu_count") && message.contains("99") && message.contains("fleet-a")
+        );
         assert!(fake.calls.lock().is_empty());
     }
 
@@ -603,7 +622,12 @@ mod tests {
             DiskMinReservation::from_units(2048),
         );
         for (value, expected) in [("871000", "15000"), ("12000", "12000")] {
-            let _admission = admitted.insert(operation(), fleets.accepting(|_| None));
+            let _admission = admitted.insert(
+                operation(),
+                fleets
+                    .admit(std::iter::empty())
+                    .expect("baseline admission"),
+            );
             fitted
                 .add_action(operation(), info(property::CPU_MILLICORES, value))
                 .await
@@ -777,6 +801,7 @@ mod tests {
                             memory: Bytes::gib(memory),
                             disk: Bytes::gib(100),
                         },
+                        &gang_types::FleetActionPolicy::default(),
                         Vec::<(&'static str, String)>::new(),
                     )
                 })
@@ -849,6 +874,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn live_catalog_preserves_grants_and_action_ceilings() {
+        let mut policy = gang_types::FleetActionPolicy::default();
+        policy.grants.insert(gang_types::Capability::Network);
+        policy.resources.memory = Some(gang_types::NonZeroBytes::gib(4));
+        let fleets = FleetCatalog::try_new(vec![FleetProperties::new(
+            &FleetName::try_new("small").expect("fleet"),
+            Isa::X86_64,
+            &"docker",
+            &"host:new".parse().expect("environment"),
+            Resources {
+                vcpus: 8,
+                memory: Bytes::gib(8),
+                disk: Bytes::gib(100),
+            },
+            &policy,
+            [],
+        )]).expect("catalog");
+        let mut worker = live_test_worker("small", 8, 100, 8);
+        let mut client = info(property::NETWORK, "requested");
+        Arc::make_mut(&mut client).platform_properties.insert(
+            property::ACTION_ENVIRONMENT.to_owned(),
+            "host:old".to_owned(),
+        );
+        let request = |key: &str| client.platform_properties.get(key).map(String::as_str);
+        let base = fleets.accepting_base(request);
+        let environment = "host:old".parse().expect("environment");
+        assert!(live_catalog(&[worker.clone()], &fleets, base, &environment, request).is_none());
+        worker.platform_properties.insert(property::NETWORK.to_owned(), "requested".to_owned());
+        let live = live_catalog(&[worker], &fleets, base, &environment, request)
+            .expect("granted worker is eligible");
+        assert_eq!(live.fleets()[0].capacity(property::MEMORY_KB), Some(8 << 20));
+        assert_eq!(live.fleets()[0].limit(property::MEMORY_KB), Some(4 << 20));
+        assert!(!live.accepting(request).is_empty());
+    }
+
     #[tokio::test]
     async fn oversized_reservation_fits_the_largest_of_two_fleets() {
         let fake = Arc::new(Fake::default());
@@ -866,6 +927,7 @@ mod tests {
                             memory: Bytes::new(gib << 30),
                             disk: Bytes::new(100_u64 << 30),
                         },
+                        &gang_types::FleetActionPolicy::default(),
                         Vec::<(&'static str, String)>::new(),
                     )
                 })
@@ -880,7 +942,12 @@ mod tests {
             MinReservation::from_units(8192),
             DiskMinReservation::from_units(2048),
         );
-        let _admission = admitted.insert(operation(), fleets.accepting(|_| None));
+        let _admission = admitted.insert(
+            operation(),
+            fleets
+                .admit(std::iter::empty())
+                .expect("baseline admission"),
+        );
         fitted
             .add_action(operation(), info(property::MEMORY_KB, "35232154"))
             .await
@@ -906,6 +973,7 @@ mod tests {
                 memory: Bytes::gib(64),
                 disk: Bytes::gib(100),
             },
+            &gang_types::FleetActionPolicy::default(),
             Vec::<(&'static str, String)>::new(),
         )])
         .expect("valid catalog")
@@ -924,6 +992,7 @@ mod tests {
                 memory: Bytes::gib(8),
                 disk: Bytes::gib(20),
             },
+            &gang_types::FleetActionPolicy::default(),
             Vec::<(&'static str, String)>::new(),
         )])
         .expect("catalog");
@@ -935,7 +1004,12 @@ mod tests {
             MinReservation::from_units(8192),
             gang_config::DiskMinReservation::from_units(2048),
         );
-        let _admission = admitted.insert(operation(), fleets.accepting(|_| None));
+        let _admission = admitted.insert(
+            operation(),
+            fleets
+                .admit(std::iter::empty())
+                .expect("baseline admission"),
+        );
         // ceil(7 GiB in KiB * 120 / 100), as supplied by historical learning.
         fitted
             .add_action(operation(), info(property::MEMORY_KB, "8808039"))
@@ -945,6 +1019,80 @@ mod tests {
         let properties = &calls[0].platform_properties;
         assert_eq!(properties[property::MEMORY_KB], "8388608");
         assert_eq!(properties[property::CPU_MILLICORES], "6000");
+    }
+
+    #[tokio::test]
+    async fn lower_action_memory_ceiling_does_not_reserve_whole_worker_cpu() {
+        let fake = Arc::new(Fake::default());
+        let mut policy = gang_types::FleetActionPolicy::default();
+        policy.resources.memory = Some(gang_types::NonZeroBytes::gib(4));
+        let fleets = FleetCatalog::try_new(vec![FleetProperties::new(
+            &FleetName::try_new("limited").expect("fleet name"),
+            Isa::X86_64,
+            &"docker",
+            &"host:test".parse().expect("valid environment"),
+            Resources {
+                vcpus: 6,
+                memory: Bytes::gib(8),
+                disk: Bytes::gib(20),
+            },
+            &policy,
+            [],
+        )])
+        .expect("catalog");
+        let admitted = AdmittedFleets::default();
+        let fitted = FittedActions::new(
+            fake.clone(),
+            fleets.clone(),
+            admitted.clone(),
+            MinReservation::from_units(8192),
+            DiskMinReservation::from_units(2048),
+        );
+        let _admission = admitted.insert(operation(), fleets.admit([]).expect("baseline"));
+        let mut action = info(property::MEMORY_KB, "6000000");
+        Arc::make_mut(&mut action)
+            .platform_properties
+            .insert(property::CPU_MILLICORES.to_owned(), "1000".to_owned());
+        fitted
+            .add_action(operation(), action)
+            .await
+            .expect("fitted");
+        let calls = fake.calls.lock();
+        assert_eq!(calls[0].platform_properties[property::MEMORY_KB], "4194304");
+        assert_eq!(
+            calls[0].platform_properties[property::CPU_MILLICORES],
+            "1000"
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_rejects_unknown_and_normalizes_only_baseline_network() {
+        let fake = Arc::new(Fake::default());
+        let outer = PlaceableActions::new(fake.clone(), catalog(), AdmittedFleets::default());
+        assert!(
+            outer
+                .add_action(operation(), info("unknown-property", "value"))
+                .await
+                .is_err()
+        );
+        assert!(
+            outer
+                .add_action(operation(), info(property::NETWORK, "requested"))
+                .await
+                .is_err()
+        );
+        for baseline in ["", "not-requested"] {
+            let action = info(property::NETWORK, baseline);
+            let digest = action.unique_qualifier.clone();
+            outer
+                .add_action(operation(), action)
+                .await
+                .expect("baseline admitted");
+            let calls = fake.calls.lock();
+            let observed = calls.last().expect("forwarded");
+            assert!(!observed.platform_properties.contains_key(property::NETWORK));
+            assert_eq!(observed.unique_qualifier, digest);
+        }
     }
 
     #[tokio::test]
@@ -959,7 +1107,12 @@ mod tests {
             MinReservation::from_units(8192),
             gang_config::DiskMinReservation::from_units(2048),
         );
-        let _admission = admitted.insert(operation(), fleets.accepting(|_| None));
+        let _admission = admitted.insert(
+            operation(),
+            fleets
+                .admit(std::iter::empty())
+                .expect("baseline admission"),
+        );
         fitted
             .add_action(operation(), info(property::MEMORY_KB, "73400320"))
             .await
@@ -987,6 +1140,7 @@ mod tests {
                             memory: Bytes::gib(memory),
                             disk: Bytes::gib(disk),
                         },
+                        &gang_types::FleetActionPolicy::default(),
                         Vec::<(&'static str, String)>::new(),
                     )
                 })
@@ -1001,7 +1155,12 @@ mod tests {
             MinReservation::from_units(8192),
             DiskMinReservation::from_units(2048),
         );
-        let _admission = admitted.insert(operation(), fleets.accepting(|_| None));
+        let _admission = admitted.insert(
+            operation(),
+            fleets
+                .admit(std::iter::empty())
+                .expect("baseline admission"),
+        );
         let mut action = info(property::MEMORY_KB, "40000000");
         Arc::make_mut(&mut action).platform_properties.insert(
             property::DISK_KB.to_owned(),

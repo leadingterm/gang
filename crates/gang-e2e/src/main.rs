@@ -15,7 +15,7 @@ use std::str::FromStr;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 use gang_e2e::{
-    ActionTools, DeploymentInputs, Gate, Invocation, ReleaseInput, Scenario, Settings,
+    ActionTools, DeploymentInputs, EgressTools, Gate, Invocation, ReleaseInput, Scenario, Settings,
     UpgradeInputs, UpgradeProcedure, anchored, run, unknown_scenarios,
 };
 
@@ -106,6 +106,28 @@ struct Cli {
     /// How many independent scenarios run at once; overrides the settings.
     #[arg(long, value_name = "N")]
     parallel: Option<NonZeroUsize>,
+
+    /// Pinned rootless network implementation.
+    #[arg(long, value_name = "PATH")]
+    slirp4netns: Option<PathBuf>,
+    /// Pinned nftables program.
+    #[arg(long, value_name = "PATH")]
+    nft: Option<PathBuf>,
+    /// Pinned namespace entry program.
+    #[arg(long, value_name = "PATH")]
+    nsenter: Option<PathBuf>,
+    /// Pinned network configuration program.
+    #[arg(long, value_name = "PATH")]
+    ip: Option<PathBuf>,
+    /// Pinned namespace creation program.
+    #[arg(long, value_name = "PATH")]
+    unshare: Option<PathBuf>,
+    /// Repo-built action egress probe.
+    #[arg(long, value_name = "PATH")]
+    egress_probe: Option<PathBuf>,
+    /// Repo-built fixture peer.
+    #[arg(long, value_name = "PATH")]
+    egress_peer: Option<PathBuf>,
 }
 
 impl Cli {
@@ -126,6 +148,7 @@ impl Cli {
             None => Settings::default(),
         };
         self.apply_settings_overrides(&mut settings);
+        let egress = self.resolve_egress_tools(&directory, &current);
         let gang = resolve_binary(self.gang, &directory, &current, "GANG_E2E_GANG", "--gang")?;
         let bazel = resolve_binary(
             self.bazel,
@@ -177,8 +200,11 @@ impl Cli {
                 .clone()
                 .or_else(|| env::var_os("GANG_E2E_BWRAP").map(PathBuf::from)),
             glibc_tool: env::var_os("GANG_E2E_GLIBC_TOOL").map(|path| current.join(path)),
-            action_rootfs: settings.action_rootfs.clone()
+            action_rootfs: settings
+                .action_rootfs
+                .clone()
                 .or_else(|| env::var_os("GANG_E2E_ACTION_ROOTFS").map(PathBuf::from)),
+            egress,
         };
         if settings.chromium.is_none() {
             settings.chromium = env::var_os("GANG_E2E_CHROMIUM").map(PathBuf::from);
@@ -275,6 +301,45 @@ impl Cli {
         }))
     }
 
+    fn resolve_egress_tools(&self, directory: &Path, current: &Path) -> Option<EgressTools> {
+        let optional_tool = |flag: &Option<PathBuf>, variable: &str| {
+            flag.as_ref()
+                .map(|path| anchored(path, directory))
+                .or_else(|| non_empty_path(env::var_os(variable)).map(|path| current.join(path)))
+        };
+        match (
+            optional_tool(&self.slirp4netns, "GANG_E2E_SLIRP4NETNS"),
+            optional_tool(&self.nft, "GANG_E2E_NFT"),
+            optional_tool(&self.nsenter, "GANG_E2E_NSENTER"),
+            optional_tool(&self.ip, "GANG_E2E_IP"),
+            optional_tool(&self.unshare, "GANG_E2E_UNSHARE"),
+            optional_tool(&self.egress_probe, "GANG_E2E_EGRESS_PROBE"),
+            optional_tool(&self.egress_peer, "GANG_E2E_EGRESS_PEER"),
+        ) {
+            (
+                Some(slirp4netns),
+                Some(nft),
+                Some(nsenter),
+                Some(ip),
+                Some(unshare),
+                Some(probe),
+                Some(peer),
+            ) => Some(EgressTools {
+                slirp4netns,
+                nft,
+                nsenter,
+                ip,
+                unshare,
+                probe,
+                peer,
+                policy: None,
+                targets: None,
+                repository_cache: None,
+            }),
+            _ => None,
+        }
+    }
+
     fn selected_scenarios(&self) -> Result<Vec<Scenario>, String> {
         let selected: Vec<_> = if self.additions {
             self.gate.additions().collect()
@@ -347,6 +412,12 @@ fn partition(scenarios: &[Scenario], shard: Shard) -> Vec<Scenario> {
 fn main() -> ExitCode {
     // `gang login --token-command` re-executes this binary to print a workload proof.
     let arguments: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some(status) = gang_e2e::egress_fixture::private_main(&arguments[1..]) {
+        return status;
+    }
+    if let Some(status) = gang_e2e::egress_lifecycle::private_main(&arguments[1..]) {
+        return status;
+    }
     if arguments
         .get(1)
         .is_some_and(|argument| argument == "--gang-e2e-action-environment-probe")

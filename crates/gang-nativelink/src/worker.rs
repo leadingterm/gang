@@ -150,6 +150,7 @@ async fn build(
         RunningActionsManagerImpl::new(RunningActionsManagerArgs {
             root_action_directory: worker.work_directory.clone(),
             execution_configuration: execution(&worker, spec.actions.kill_grace),
+            enforced_environment: worker.enforced_environment.clone(),
             cas_store: fast_slow,
             ac_store: Some(action_cache),
             // Settings never name a historical results store, so it is the content store.
@@ -519,6 +520,7 @@ mod tests {
                     memory: Bytes::new(8 * 1024 * 1024 * 1024),
                     disk: Bytes::new(100 << 30),
                 },
+                &gang_types::FleetActionPolicy::default(),
                 [("capacity", "2".to_owned())],
             ),
             slots: Slots::LongLived(NonZeroU32::new(4).expect("non-zero slots")),

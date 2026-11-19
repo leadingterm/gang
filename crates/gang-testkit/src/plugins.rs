@@ -72,6 +72,17 @@ impl SandboxSelection for SandboxConfig {
         }
     }
 
+    fn supports_capability(&self, key: SandboxKey, capability: gang_types::Capability) -> bool {
+        match (key, capability) {
+            (SandboxKey::Bwrap, gang_types::Capability::Network) => self
+                .bwrap
+                .as_ref()
+                .is_some_and(|section| section.0.contains_key("egress")),
+            (SandboxKey::Boxed, gang_types::Capability::Network) => self.boxed.is_some(),
+            _ => false,
+        }
+    }
+
     fn try_for_each_program<E>(
         &mut self,
         key: SandboxKey,

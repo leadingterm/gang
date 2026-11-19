@@ -27,6 +27,15 @@ pub enum SandboxFileError {
     #[error("selected sandbox `{0}` has no [sandbox.{0}] section")]
     #[fix("add the [sandbox.<plugin>] section, or select a configured sandbox")]
     SelectedNotConfigured(String),
+    /// A granted capability is unavailable in the selected sandbox.
+    #[error("selected sandbox does not support capability `{0}`")]
+    UnsupportedCapability(gang_types::Capability),
+    /// Network access needs a policy and controller endpoints.
+    #[error("network capability requires execution.egress and controller endpoints")]
+    MissingEgress,
+    /// The configured egress policy is invalid.
+    #[error("invalid execution.egress policy")]
+    InvalidEgress(#[source] gang_types::EgressPolicyError),
 }
 
 /// The configuration a worker hands to `gang exec`: the work directory, the selected sandbox,
@@ -44,6 +53,12 @@ pub struct SandboxFile<P: PluginSet> {
     /// The `[execution]` section.
     #[serde(default)]
     pub execution: ExecutionConfig,
+    /// The selected fleet's action policy.
+    #[serde(default)]
+    pub actions: gang_types::FleetActionPolicy,
+    /// Trusted controller endpoints protected from action traffic.
+    #[serde(default)]
+    pub controller_endpoints: Box<[gang_types::Url]>,
     /// The `[limits.<plugin>]` section, when one is configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<P::Limits>,
@@ -72,6 +87,19 @@ impl<P: PluginSet> SandboxFile<P> {
             return Err(SandboxFileError::SelectedNotConfigured(
                 self.selected.to_string(),
             ));
+        }
+        if let Some(policy) = &self.execution.egress {
+            policy.validate().map_err(SandboxFileError::InvalidEgress)?;
+        }
+        for &capability in &self.actions.grants {
+            if !self.sandbox.supports_capability(self.selected, capability) {
+                return Err(SandboxFileError::UnsupportedCapability(capability));
+            }
+            if capability == gang_types::Capability::Network
+                && (self.execution.egress.is_none() || self.controller_endpoints.is_empty())
+            {
+                return Err(SandboxFileError::MissingEgress);
+            }
         }
         Ok(self)
     }

@@ -6,6 +6,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use gang_e2e::egress_wire::EgressTargets;
 use gang_e2e::sample::{SampleParameters, salt, stage};
 use gang_e2e::{E2eError, Probe, SIGNAL_COMMAND, Sandbox};
 use gang_types::Isa;
@@ -89,6 +91,8 @@ fn parameters() -> SampleParameters {
         large_memory_kb: 16_777_216,
         requested_sandbox: Sandbox::Noop,
         glibc_tool: None,
+        egress_probe: None,
+        egress_targets: None,
     }
 }
 
@@ -223,6 +227,67 @@ fn staged_glibc_tool_keeps_content_and_permissions() {
             & 0o777,
         0o755
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn stages_egress_inputs_with_executable_permissions_and_round_trips_targets() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = tempfile::tempdir().expect("work directory is created");
+    let source = work.path().join("source");
+    fs::create_dir(&source).expect("source is created");
+    fs::write(
+        source.join("BUILD.bazel"),
+        build_file(Probe::ALL).expect("build file formats"),
+    )
+    .expect("build file is written");
+    let tool = work.path().join("probe");
+    fs::write(&tool, b"probe executable").expect("probe is written");
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).expect("mode is set");
+    let targets: EgressTargets = serde_json::from_value(serde_json::json!({
+        "public_ipv4": "93.184.216.34:8000",
+        "public_ipv6": "[2001:4860:1234::34]:8001",
+        "blocked": {"vpc4": "10.20.0.10:8002"},
+        "dns": "93.184.216.34",
+        "nonce": "fixture-nonce",
+        "uid": 1234,
+        "gid": 5678,
+        "nft": "/nix/store/test-nft/bin/nft",
+        "timeout": "5s",
+        "policy": {
+            "protected_networks": ["10.20.0.0/16"],
+            "dns_servers": ["93.184.216.34"]
+        }
+    }))
+    .expect("targets deserialize");
+    let destination = work.path().join("staged");
+    let parameters = SampleParameters {
+        egress_probe: Some(tool),
+        egress_targets: Some(targets.clone()),
+        ..parameters()
+    };
+
+    stage(&source, &destination, &parameters).expect("sample stages");
+
+    let staged = destination.join("egress-probe");
+    assert_eq!(
+        fs::read(&staged).expect("probe is readable"),
+        b"probe executable"
+    );
+    assert_eq!(
+        fs::metadata(&staged)
+            .expect("probe exists")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    let staged_targets: EgressTargets = serde_json::from_slice(
+        &fs::read(destination.join("egress-targets.json")).expect("targets exist"),
+    )
+    .expect("targets deserialize");
+    assert_eq!(staged_targets, targets);
 }
 
 #[test]

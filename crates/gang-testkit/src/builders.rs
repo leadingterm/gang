@@ -9,7 +9,7 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use gang_config::{FleetPolicy, InstanceBounds, ScheduledMinimum, Weekday, Weekdays};
-use gang_types::{FleetName, FleetProperties, Isa, NonZeroBytes, nonzero_u32};
+use gang_types::{FleetActionPolicy, FleetName, FleetProperties, Isa, NonZeroBytes, nonzero_u32};
 
 use crate::TestResult;
 use crate::plugins::SandboxKey;
@@ -55,6 +55,7 @@ pub fn fleet_policy(name: &str) -> TestResult<FleetPolicy> {
         idle_timeout: Duration::from_secs(15),
         max_drain_wait: Duration::from_mins(1),
         boot_grace: Duration::from_secs(30),
+        actions: FleetActionPolicy::default(),
     })
 }
 
@@ -121,6 +122,7 @@ mod tests {
                 idle_timeout: Duration::from_secs(15),
                 max_drain_wait: Duration::from_mins(1),
                 boot_grace: Duration::from_secs(30),
+                actions: FleetActionPolicy::default(),
             }
         );
         Ok(())

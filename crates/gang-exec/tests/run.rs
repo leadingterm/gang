@@ -18,13 +18,15 @@ use gang_exec::{ExecError, Invocation, run_with};
 use gang_spi::{
     ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, ActionLimits,
     ActionLimitsPort, ActionMemoryPool, ActionScope, ActionUsage, CPU_COUNT_ENV, MEMORY_KB_ENV,
-    PortError, SIDE_CHANNEL_FILE_ENV, SandboxedAction,
+    NETWORK_ENV, PortError, SIDE_CHANNEL_FILE_ENV, SandboxedAction,
 };
 use gang_testkit::{
     CallLog, Opaque, RecordedScope, RecordingLimits, SandboxConfig, SandboxKey, ScriptedSandbox,
     TestLimits, TestPlugins,
 };
-use gang_types::{Bytes, NonZeroBytes};
+use gang_types::{
+    Bytes, Capability, FleetActionPolicy, NonZeroBytes, NonZeroDuration, PublicEgressPolicy,
+};
 use parking_lot::Mutex;
 use tempfile::TempDir;
 
@@ -81,7 +83,12 @@ fn sandbox_file(
             )),
             ..SandboxConfig::default()
         },
-        execution: ExecutionConfig { input_links },
+        execution: ExecutionConfig {
+            input_links,
+            egress: None,
+        },
+        actions: FleetActionPolicy::default(),
+        controller_endpoints: Box::default(),
         limits,
     };
     Ok(file.to_toml()?)
@@ -228,6 +235,80 @@ fn error_of(result: Result<ExitCode, ExecError>) -> Result<ExecError, Box<dyn Er
         Ok(code) => Err(format!("expected an error, got {code:?}").into()),
         Err(error) => Ok(error),
     }
+}
+
+#[test]
+fn network_is_authorized_only_by_the_selected_fleet_file() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new(InputLinks::Keep)?;
+    let path = fixture.entrypoint.with_file_name("sandbox.toml");
+    let mut file: SandboxFile<TestPlugins> =
+        sandbox_file(&fixture.root, "trusted", InputLinks::Keep, None)?.parse()?;
+    let policy = PublicEgressPolicy {
+        protected_networks: vec!["10.0.0.0/8".parse()?].into_boxed_slice(),
+        dns_servers: vec!["8.8.8.8".parse()?].into_boxed_slice(),
+        setup_timeout: NonZeroDuration::from_secs(10),
+    };
+    let endpoints = vec!["https://controller.example:443".parse()?].into_boxed_slice();
+    file.execution.egress = Some(policy.clone());
+    file.controller_endpoints = endpoints.clone();
+    fs::write(&path, file.to_toml()?)?;
+    let request = [(OsString::from(NETWORK_ENV), OsString::from("requested"))];
+    let started = Events::default();
+    let calls = Calls::default();
+    assert!(matches!(
+        run_action_counting(
+            &argv(),
+            &fixture.entrypoint,
+            &fixture.working_directory,
+            &request,
+            &started,
+            &calls
+        ),
+        Err(ExecError::NetworkNotGranted)
+    ));
+    assert_eq!(calls.sandbox_builds.load(Ordering::SeqCst), 0);
+
+    file.selected = SandboxKey::Bwrap;
+    file.sandbox.bwrap = Some(Opaque(
+        [(String::from("egress"), true.into())]
+            .into_iter()
+            .collect(),
+    ));
+    file.actions.grants.insert(Capability::Network);
+    fs::write(&path, file.to_toml()?)?;
+    let args = argv();
+    let invocation = Invocation {
+        entrypoint: &fixture.entrypoint,
+        argv: &args,
+        environment: &request,
+        working_directory: &fixture.working_directory,
+    };
+    let sandbox = ScriptedSandbox::exiting(&CallLog::default(), ActionExecutionOutcome::Exited(0));
+    run_with::<TestPlugins, ScriptedSandbox, RecordingLimits>(
+        &invocation,
+        |_, _, _| Ok(sandbox.clone()),
+        |_, _| Ok(RecordingLimits::new(&CallLog::default())),
+        || Ok(()),
+    )?;
+    assert_eq!(sandbox.started()[0].network, Some((policy, endpoints)));
+
+    for value in ["", "not-requested"] {
+        let env = [(OsString::from(NETWORK_ENV), OsString::from(value))];
+        let invocation = Invocation {
+            environment: &env,
+            ..invocation
+        };
+        let sandbox =
+            ScriptedSandbox::exiting(&CallLog::default(), ActionExecutionOutcome::Exited(0));
+        run_with::<TestPlugins, ScriptedSandbox, RecordingLimits>(
+            &invocation,
+            |_, _, _| Ok(sandbox.clone()),
+            |_, _| Ok(RecordingLimits::new(&CallLog::default())),
+            || Ok(()),
+        )?;
+        assert_eq!(sandbox.started()[0].network, None);
+    }
+    Ok(())
 }
 
 /// The link count of the file at `path`.
@@ -551,6 +632,59 @@ fn oom_report_preserves_nonzero_action_status() -> Result<(), Box<dyn Error>> {
         fs::read(path)?,
         br#"{"failure":"memory","peak_memory_kb":4}"#
     );
+    Ok(())
+}
+
+#[test]
+fn setup_failure_reports_scope_usage_and_keeps_original_error() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new(InputLinks::Keep)?;
+    fs::write(
+        fixture.entrypoint.with_file_name("sandbox.toml"),
+        sandbox_file(
+            &fixture.root,
+            "trusted",
+            InputLinks::Keep,
+            Some(TestLimits { max_pids: 1 }),
+        )?,
+    )?;
+    let path = fixture.root.join(".side_channels/a1/report");
+    fs::create_dir_all(path.parent().ok_or("missing parent")?)?;
+    let env = [(
+        OsString::from(SIDE_CHANNEL_FILE_ENV),
+        path.clone().into_os_string(),
+    )];
+    let args = argv();
+    let invocation = Invocation {
+        entrypoint: &fixture.entrypoint,
+        argv: &args,
+        environment: &env,
+        working_directory: &fixture.working_directory,
+    };
+    let log = CallLog::default();
+    for (kills, expected) in [
+        (1, br#"{"failure":"memory","peak_memory_kb":4}"#.as_slice()),
+        (0, br#"{"peak_memory_kb":4}"#.as_slice()),
+    ] {
+        let error = error_of(run_with::<TestPlugins, ScriptedSandbox, RecordingLimits>(
+            &invocation,
+            |_, _, _| Ok(ScriptedSandbox::failing_to_start(&log)),
+            |_, _| Ok(RecordingLimits::new(&log).with_oom_kills(kills)),
+            || Ok(()),
+        ))?;
+        assert!(matches!(error, ExecError::Sandbox(_)));
+        assert_eq!(fs::read(&path)?, expected);
+        fs::remove_file(&path)?;
+    }
+    let target = fixture.base.join("victim");
+    std::os::unix::fs::symlink(&target, &path)?;
+    let error = error_of(run_with::<TestPlugins, ScriptedSandbox, RecordingLimits>(
+        &invocation,
+        |_, _, _| Ok(ScriptedSandbox::failing_to_start(&log)),
+        |_, _| Ok(RecordingLimits::new(&log).with_oom_kills(1)),
+        || Ok(()),
+    ))?;
+    assert!(matches!(error, ExecError::Sandbox(_)));
+    assert!(!target.exists());
     Ok(())
 }
 

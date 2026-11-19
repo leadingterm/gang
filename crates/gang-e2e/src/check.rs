@@ -3,10 +3,12 @@
 use std::borrow::Cow;
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use crate::errors::{E2eError, Result};
 
 /// How one check ended.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Outcome {
     /// The system behaved as required.
     Passed,
@@ -17,7 +19,7 @@ pub enum Outcome {
 }
 
 /// One named verdict.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[must_use]
 pub struct Check {
     /// What was checked, as a statement that should hold.
@@ -141,7 +143,7 @@ impl fmt::Display for Check {
 }
 
 /// Every verdict of one run, in the order reached.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[must_use]
 pub struct Report {
     /// The verdicts.

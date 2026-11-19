@@ -210,15 +210,15 @@ mimalloc = { version = "0.1" }
 # Carried fork of TraceMachina/nativelink v1.8.3: branch gang is the upstream
 # tag plus fix commits listed in docs/SPECIFICATION.md §3.2. Remove when a
 # pinned upstream release contains them.
-nativelink-config = { git = "https://github.com/leadingterm/nativelink", rev = "c4f8e2329619529e51d1cd9b6944fea56ed2ea95" }
-nativelink-error = { git = "https://github.com/leadingterm/nativelink", rev = "c4f8e2329619529e51d1cd9b6944fea56ed2ea95" }
-nativelink-metric = { git = "https://github.com/leadingterm/nativelink", rev = "c4f8e2329619529e51d1cd9b6944fea56ed2ea95" }
-nativelink-proto = { git = "https://github.com/leadingterm/nativelink", rev = "c4f8e2329619529e51d1cd9b6944fea56ed2ea95" }
-nativelink-scheduler = { git = "https://github.com/leadingterm/nativelink", rev = "c4f8e2329619529e51d1cd9b6944fea56ed2ea95" }
-nativelink-service = { git = "https://github.com/leadingterm/nativelink", rev = "c4f8e2329619529e51d1cd9b6944fea56ed2ea95" }
-nativelink-store = { git = "https://github.com/leadingterm/nativelink", rev = "c4f8e2329619529e51d1cd9b6944fea56ed2ea95" }
-nativelink-util = { git = "https://github.com/leadingterm/nativelink", rev = "c4f8e2329619529e51d1cd9b6944fea56ed2ea95" }
-nativelink-worker = { git = "https://github.com/leadingterm/nativelink", rev = "c4f8e2329619529e51d1cd9b6944fea56ed2ea95" }
+nativelink-config = { git = "https://github.com/leadingterm/nativelink", rev = "9a9ca336f9921c4ce8a024a1ea1930994c5b55e7" }
+nativelink-error = { git = "https://github.com/leadingterm/nativelink", rev = "9a9ca336f9921c4ce8a024a1ea1930994c5b55e7" }
+nativelink-metric = { git = "https://github.com/leadingterm/nativelink", rev = "9a9ca336f9921c4ce8a024a1ea1930994c5b55e7" }
+nativelink-proto = { git = "https://github.com/leadingterm/nativelink", rev = "9a9ca336f9921c4ce8a024a1ea1930994c5b55e7" }
+nativelink-scheduler = { git = "https://github.com/leadingterm/nativelink", rev = "9a9ca336f9921c4ce8a024a1ea1930994c5b55e7" }
+nativelink-service = { git = "https://github.com/leadingterm/nativelink", rev = "9a9ca336f9921c4ce8a024a1ea1930994c5b55e7" }
+nativelink-store = { git = "https://github.com/leadingterm/nativelink", rev = "9a9ca336f9921c4ce8a024a1ea1930994c5b55e7" }
+nativelink-util = { git = "https://github.com/leadingterm/nativelink", rev = "9a9ca336f9921c4ce8a024a1ea1930994c5b55e7" }
+nativelink-worker = { git = "https://github.com/leadingterm/nativelink", rev = "9a9ca336f9921c4ce8a024a1ea1930994c5b55e7" }
 num-traits = { default-features = false, version = "0.2.19" }
 object = { default-features = false, features = [
     "elf",
@@ -252,6 +252,7 @@ rusqlite = { features = [
 rustix = { features = [
     "event",
     "fs",
+    "net",
     "process",
     "pty",
     "stdio",

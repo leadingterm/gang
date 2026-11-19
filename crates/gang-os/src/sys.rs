@@ -1,6 +1,6 @@
 #![expect(
     unsafe_code,
-    reason = "signal masks, mkfifo, kqueue process filters and owned readiness registration require unsafe calls"
+    reason = "signal masks, mkfifo, kqueue, namespace ioctls and inherited descriptor operations require unsafe calls"
 )]
 
 use std::ffi::CStr;
@@ -8,6 +8,63 @@ use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::OwnedFd;
 use std::ptr;
+
+/// Duplicates an inherited descriptor without taking ownership of the original.
+///
+/// Both the original and the returned descriptor are marked close-on-exec.
+///
+/// # Errors
+/// Returns an I/O error if the descriptor is invalid or cannot be duplicated.
+pub fn duplicate_inherited_fd(fd: std::os::fd::RawFd) -> io::Result<OwnedFd> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: fcntl operates on the numeric descriptor without taking ownership.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: marking this inherited descriptor close-on-exec does not transfer ownership.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: F_DUPFD_CLOEXEC returns a new, independently owned descriptor.
+    let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if copy < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful fcntl call created this unique descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(copy) })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn namespace_owner(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<OwnedFd> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    // SAFETY: both namespace ioctls take no pointer arguments and do not consume fd.
+    let kind = unsafe { libc::ioctl(fd.as_raw_fd(), libc::NS_GET_NSTYPE) };
+    if kind < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if kind != libc::CLONE_NEWNET {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a network namespace",
+        ));
+    }
+    // SAFETY: NS_GET_USERNS returns a newly owned close-on-exec descriptor.
+    let owner = unsafe { libc::ioctl(fd.as_raw_fd(), libc::NS_GET_USERNS) };
+    if owner < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the ioctl returned a unique descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(owner) })
+}
+
+pub(crate) fn register_execution_gate(
+    gate: crate::ExecutionGateParent,
+) -> io::Result<tokio::io::unix::AsyncFd<crate::ExecutionGateParent>> {
+    // SAFETY: The owned descriptor remains open and unchanged until AsyncFd deregisters it,
+    // including when into_inner consumes the registration.
+    Ok(unsafe { tokio::io::unix::AsyncFd::register(gate) }?)
+}
 
 /// An asynchronously readable owned pipe. Dropping the reader closes its descriptor.
 pub struct PipeReader {

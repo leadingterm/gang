@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gang_spi::{
-    ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, NetworkRequest, PortError,
+    ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, NetworkAccess, PortError,
     SandboxedAction,
 };
 use gang_types::ActionEnvironment;
@@ -25,8 +25,8 @@ pub struct StartedAction {
     pub action_directory: PathBuf,
     /// The directory the command runs in.
     pub working_directory: PathBuf,
-    /// Whether the action asked for network access.
-    pub network: NetworkRequest,
+    /// The trusted egress policy and controller endpoints, or none for offline actions.
+    pub network: Option<(gang_types::PublicEgressPolicy, Box<[gang_types::Url]>)>,
     /// The command prefix the action was started through: empty when it started without a limits scope.
     pub launcher: Vec<OsString>,
 }
@@ -122,7 +122,13 @@ impl ActionIsolationPort for ScriptedSandbox {
             environment: spec.environment.to_vec(),
             action_directory: spec.action_directory.to_path_buf(),
             working_directory: spec.working_directory.to_path_buf(),
-            network: spec.network,
+            network: match spec.network {
+                NetworkAccess::Offline => None,
+                NetworkAccess::PublicEgress {
+                    policy,
+                    controller_endpoints,
+                } => Some((policy.clone(), controller_endpoints.into())),
+            },
             launcher: spec.launcher.to_vec(),
         });
         let outcome = match self.start {
@@ -148,7 +154,7 @@ mod tests {
 
     use gang_spi::{
         ActionCommand, ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort,
-        NetworkRequest, PortError, SandboxedAction,
+        NetworkAccess, PortError, SandboxedAction,
     };
 
     use super::{ScriptedSandbox, StartedAction};
@@ -166,7 +172,7 @@ mod tests {
         vec![(OsString::from("PATH"), OsString::from("/bin"))]
     }
 
-    /// Starts one action with the sample spec: `sh -c true` in `/work`, network requested.
+    /// Starts one action with the sample spec: `sh -c true` in `/work`, offline.
     fn start_action(
         sandbox: &ScriptedSandbox,
     ) -> Result<SandboxedAction, Box<dyn std::error::Error>> {
@@ -175,7 +181,7 @@ mod tests {
             environment: &sample_environment(),
             action_directory: Path::new("/work"),
             working_directory: Path::new("/work"),
-            network: NetworkRequest::Requested,
+            network: NetworkAccess::Offline,
             launcher: &[],
         }))?)
     }
@@ -232,6 +238,34 @@ mod tests {
     }
 
     #[test]
+    fn records_public_egress_policy_and_controller_endpoints() -> TestResult {
+        let log = CallLog::default();
+        let sandbox = ScriptedSandbox::try_exiting(&log, ActionExecutionOutcome::Exited(0))?;
+        let policy = gang_types::PublicEgressPolicy {
+            protected_networks: vec!["10.0.0.0/8".parse()?].into_boxed_slice(),
+            dns_servers: vec!["1.1.1.1".parse()?].into_boxed_slice(),
+            setup_timeout: gang_types::NonZeroDuration::from_secs(10),
+        };
+        let endpoints = vec!["https://controller.example:443".parse()?].into_boxed_slice();
+        let argv = sample_argv();
+        let environment = sample_environment();
+        let action = ActionExecutionSpec {
+            command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
+            environment: &environment,
+            action_directory: Path::new("/work"),
+            working_directory: Path::new("/work"),
+            network: NetworkAccess::PublicEgress {
+                policy: &policy,
+                controller_endpoints: &endpoints,
+            },
+            launcher: &[],
+        };
+        let _action = ready(sandbox.start(&action))?;
+        assert_eq!(sandbox.started()[0].network, Some((policy, endpoints)));
+        Ok(())
+    }
+
+    #[test]
     fn started_records_every_spec_including_failed_starts() -> TestResult {
         let log = CallLog::default();
         let sandbox = ScriptedSandbox::try_failing_to_start(&log)?;
@@ -245,7 +279,7 @@ mod tests {
                 environment: sample_environment(),
                 action_directory: PathBuf::from("/work"),
                 working_directory: PathBuf::from("/work"),
-                network: NetworkRequest::Requested,
+                network: None,
                 launcher: Vec::new(),
             }]
         );

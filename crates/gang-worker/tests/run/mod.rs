@@ -206,6 +206,93 @@ async fn selected_root_is_pinned_before_identity_and_serialization() {
 }
 
 #[tokio::test]
+async fn fleet_without_network_grant_does_not_receive_egress_configuration() {
+    let harness = Harness::new(Isa::X86_64, WorkerLifetime::LongLived);
+    harness.scheduler.set_behaviour(Behaviour::Finish);
+    let mut settings = harness.settings();
+    settings.controller_endpoints =
+        vec!["https://controller.example:443".parse().expect("URL")].into_boxed_slice();
+    settings.execution.egress = Some(gang_types::PublicEgressPolicy {
+        protected_networks: vec!["10.0.0.0/8".parse().expect("network")].into_boxed_slice(),
+        dns_servers: vec!["1.1.1.1".parse().expect("address")].into_boxed_slice(),
+        setup_timeout: gang_types::NonZeroDuration::from_secs(10),
+    });
+    gang_worker::run(
+        harness.parts(false),
+        settings,
+        harness.build_limits(),
+        harness.build_sandbox(),
+        future::pending(),
+    )
+    .await
+    .expect("the scheduler finished");
+
+    let file: SandboxFile<TestPlugins> =
+        fs::read_to_string(Layout::new(&harness.volume).sandbox_file())
+            .expect("sandbox file is readable")
+            .parse()
+            .expect("sandbox file parses");
+    assert!(file.actions.grants.is_empty());
+    assert!(file.controller_endpoints.is_empty());
+    assert!(file.execution.egress.is_none());
+}
+
+#[tokio::test]
+async fn selected_network_grant_projects_policy_and_effective_endpoints() {
+    let harness = Harness::new(Isa::X86_64, WorkerLifetime::LongLived);
+    harness.scheduler.set_behaviour(Behaviour::Finish);
+    let mut settings = harness.settings();
+    let name = FleetName::try_new("example-fleet").expect("test fleet name is valid");
+    let fleet = settings.fleets.by_name(&name).expect("fleet exists");
+    let mut policy = fleet.policy.clone();
+    policy
+        .actions
+        .grants
+        .insert(gang_types::Capability::Network);
+    settings.fleets = Fleets::try_new(vec![FleetMember {
+        policy,
+        sandbox: SandboxKey::Boxed,
+        options: fleet.options.clone(),
+    }])
+    .expect("test fleet is valid");
+    let endpoints = vec![
+        "https://controller.example:443"
+            .parse()
+            .expect("public URL"),
+        "grpcs://worker.example:443".parse().expect("worker URL"),
+    ]
+    .into_boxed_slice();
+    let egress = gang_types::PublicEgressPolicy {
+        protected_networks: vec!["10.0.0.0/8".parse().expect("network")].into_boxed_slice(),
+        dns_servers: vec!["1.1.1.1".parse().expect("address")].into_boxed_slice(),
+        setup_timeout: gang_types::NonZeroDuration::from_secs(10),
+    };
+    settings.controller_endpoints = endpoints.clone();
+    settings.execution.egress = Some(egress.clone());
+    gang_worker::run(
+        harness.parts(false),
+        settings,
+        harness.build_limits(),
+        harness.build_sandbox(),
+        future::pending(),
+    )
+    .await
+    .expect("the scheduler finished");
+
+    let file: SandboxFile<TestPlugins> =
+        fs::read_to_string(Layout::new(&harness.volume).sandbox_file())
+            .expect("sandbox file is readable")
+            .parse()
+            .expect("sandbox file parses");
+    assert_eq!(
+        file.actions.grants,
+        [gang_types::Capability::Network].into_iter().collect()
+    );
+    assert_eq!(file.controller_endpoints, endpoints);
+    assert_eq!(file.execution.egress, Some(egress));
+}
+
+#[tokio::test]
 async fn single_use_worker_takes_one_action_and_run_returns_ok() {
     let harness = Harness::new(Isa::X86_64, WorkerLifetime::SingleUse);
     harness.scheduler.set_behaviour(Behaviour::Finish);

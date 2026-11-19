@@ -2017,20 +2017,13 @@ fn adapt_local_plugins(
         &["state_dir", "mock_imds_listen", "worker_launcher"],
     )?;
     copy_local_fields(doc, staged, &["signer", "file"], &["key_file"])?;
-    copy_local_fields(
-        doc,
-        staged,
-        &["sandbox", "bwrap"],
-        &[
-            "program",
-            "readonly_bind_paths",
-            "readonly_bind_mounts",
-            "permit_network_property",
-        ],
-    )?;
+    copy_local_fields(doc, staged, &["sandbox", "bwrap"], &["program"])?;
     copy_local_fields(doc, staged, &["sandbox", "noop"], &["scratch_dir"])?;
     if local["sandbox"]["bwrap"].get("root").is_some() {
         copy_local_fields(doc, staged, &["sandbox", "bwrap"], &["root"])?;
+    }
+    if local["sandbox"]["bwrap"].get("egress").is_some() {
+        copy_local_fields(doc, staged, &["sandbox", "bwrap"], &["egress"])?;
     }
     if local["sandbox"]["noop"].get("environment").is_some() {
         copy_local_fields(doc, staged, &["sandbox", "noop"], &["environment"])?;

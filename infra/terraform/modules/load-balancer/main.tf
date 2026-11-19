@@ -93,13 +93,27 @@ resource "aws_vpc_security_group_ingress_rule" "controller_health" {
   tags                         = merge(var.tags, { Name = "${var.name}-health-ingress" })
 }
 
+resource "aws_eip" "public" {
+  for_each = var.static_public_ips ? (var.shared_database ? var.public_subnets_by_az : { controller = var.subnet_id }) : {}
+  domain   = "vpc"
+  tags     = merge(var.tags, { Name = "${var.name}-public-${each.key}" })
+}
+
 resource "aws_lb" "this" {
   name                             = var.name
   internal                         = false
   load_balancer_type               = "network"
-  subnets                          = var.shared_database ? var.public_subnet_ids : [var.subnet_id]
+  subnets                          = var.static_public_ips ? null : (var.shared_database ? var.public_subnet_ids : [var.subnet_id])
   enable_cross_zone_load_balancing = var.shared_database ? true : null
   security_groups                  = [aws_security_group.this.id]
+
+  dynamic "subnet_mapping" {
+    for_each = aws_eip.public
+    content {
+      subnet_id     = var.shared_database ? var.public_subnets_by_az[subnet_mapping.key] : var.subnet_id
+      allocation_id = subnet_mapping.value.id
+    }
+  }
 
   tags = merge(var.tags, {
     Name = var.name

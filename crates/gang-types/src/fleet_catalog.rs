@@ -1,7 +1,10 @@
 //! The fleets a controller matches requests against, in preference order.
 
 use crate::fleet_properties::Rule;
-use crate::{FleetCountError, FleetProperties, FleetSet, MatchKind, Refusal, property};
+use crate::{
+    Capability, FleetCountError, FleetProperties, FleetSet, MatchKind, NetworkRequest, Refusal,
+    property,
+};
 
 /// Every fleet's properties, in preference order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +38,8 @@ enum ColumnRule {
     Exact(Box<[(Box<str>, FleetSet)]>),
     /// Each distinct fleet limit, ascending, with the fleets whose limit is at least it.
     Minimum(Box<[(u64, FleetSet)]>),
+    /// Fleets granted the capability.
+    Capability(FleetSet),
 }
 
 impl ColumnRule {
@@ -53,6 +58,7 @@ impl ColumnRule {
                     limits.get(limits.partition_point(|(limit, _)| *limit < requested))
                 })
                 .map_or(FleetSet::EMPTY, |(_, mask)| *mask),
+            Self::Capability(mask) => *mask,
         }
     }
 }
@@ -99,15 +105,10 @@ fn exact_rule(key: &str, fleets: &[FleetProperties]) -> ColumnRule {
 fn minimum_rule(key: &str, fleets: &[FleetProperties]) -> ColumnRule {
     let mut limits = Vec::new();
     for (index, fleet) in fleets.iter().enumerate() {
-        if let Some((_, value, rule)) = fleet.entries().find(|(entry_key, _, _)| *entry_key == key)
+        if let Some((_, _, Rule::Minimum(limit))) =
+            fleet.entries().find(|(entry_key, _, _)| *entry_key == key)
         {
-            let limit = match rule {
-                Rule::Exact => value.parse::<u64>().ok(),
-                Rule::Minimum(limit) => Some(limit),
-            };
-            if let Some(limit) = limit {
-                add_to_mask(&mut limits, limit, index);
-            }
+            add_to_mask(&mut limits, limit, index);
         }
     }
     limits.sort_unstable_by_key(|(limit, _)| *limit);
@@ -136,7 +137,13 @@ impl FleetCatalog {
                 }
             }
         }
-        for key in property::IGNORED {
+        for capability in Capability::ALL {
+            let key = capability.property();
+            if !declared.iter().any(|(known, _)| *known == key) {
+                declared.push((key, MatchKind::Capability));
+            }
+        }
+        for key in property::HARMLESS_PROPERTIES {
             if !declared.iter().any(|(known, _)| *known == key) {
                 declared.push((key, MatchKind::Ignored));
             }
@@ -147,6 +154,15 @@ impl FleetCatalog {
                 let rule = match kind {
                     MatchKind::Exact => exact_rule(key, &fleets),
                     MatchKind::Minimum => minimum_rule(key, &fleets),
+                    MatchKind::Capability => {
+                        let mut mask = FleetSet::EMPTY;
+                        for (index, fleet) in fleets.iter().enumerate() {
+                            if fleet.get(key).is_some() {
+                                mask.insert(index);
+                            }
+                        }
+                        ColumnRule::Capability(mask)
+                    }
                     MatchKind::Ignored => return None,
                 };
                 Some(Column { key, rule })
@@ -179,36 +195,43 @@ impl FleetCatalog {
     }
 
     /// Returns every key the scheduler declares with how it matches, each once, in first-seen
-    /// order: the fleets' own keys, then the keys that impose nothing.
+    /// order: the fleets' own keys, then capabilities and harmless properties.
     #[must_use]
     pub fn declared(&self) -> &[(&'static str, MatchKind)] {
         &self.declared
     }
 
-    /// Returns the fleets that accept a request, given the request's value for each key.
+    /// Returns fleets matching the declared properties supplied by `request`.
     ///
-    /// `request(key)` returns the request's value for `key`, or `None` when the request does not
-    /// set it. A fleet accepts the request when, for every key the request sets and that some
-    /// fleet matches exactly or by minimum, the fleet accepts that value. Other keys impose
-    /// nothing.
+    /// Call [`Self::admit`] on the complete request to reject undeclared properties.
     pub fn accepting<'r>(&self, request: impl Fn(&str) -> Option<&'r str>) -> FleetSet {
         let mut accepting = self.all;
         for column in &self.columns {
-            if accepting.is_empty() {
-                break;
-            }
             let Some(value) = request(column.key) else {
                 continue;
             };
-            accepting &= column.rule.mask(value);
+            if let ColumnRule::Capability(mask) = &column.rule {
+                if value.is_empty() {
+                    continue;
+                }
+                match value.parse::<NetworkRequest>() {
+                    Ok(NetworkRequest::NotRequested) => continue,
+                    Ok(NetworkRequest::Requested) => accepting &= *mask,
+                    Err(_) => return FleetSet::EMPTY,
+                }
+            } else {
+                accepting &= column.rule.mask(value);
+            }
+            if accepting.is_empty() {
+                break;
+            }
         }
         accepting
     }
 
-    /// Returns fleets matching all requested properties except the action environment.
+    /// Returns matching fleets without constraining the action environment.
     ///
-    /// This is for admission against live worker identities; launch fitting must use
-    /// [`Self::accepting`] and retain the environment constraint.
+    /// Used when matching against live worker identities rather than launch identities.
     pub fn accepting_base<'r>(&self, request: impl Fn(&str) -> Option<&'r str>) -> FleetSet {
         self.accepting(|key| {
             if key == property::ACTION_ENVIRONMENT {
@@ -219,47 +242,84 @@ impl FleetCatalog {
         })
     }
 
-    /// Explains why no fleet accepts the request, or returns `None` when one does.
+    /// Validates every request property and returns the eligible fleets.
     ///
-    /// The first individually unsatisfied property in declaration order is reported;
-    /// if every property is individually satisfied, the refusal is a combination.
-    pub fn refusal<'r>(&self, request: impl Fn(&str) -> Option<&'r str>) -> Option<Refusal> {
+    /// # Errors
+    /// Returns a deterministic refusal for an unknown, malformed or unsatisfied property.
+    pub fn admit<'a>(
+        &self,
+        request: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Result<FleetSet, Refusal> {
+        let mut pairs: Vec<_> = request.into_iter().collect();
+        pairs.sort_unstable_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(b.1)));
         let mut accepting = self.all;
-        let mut refusal = None;
-        for column in &self.columns {
-            let Some(value) = request(column.key) else {
-                continue;
-            };
-            let mask = column.rule.mask(value);
-            accepting &= mask;
-            if mask.is_empty() && refusal.is_none() {
-                refusal = Some(match &column.rule {
-                    ColumnRule::Minimum(limits) => {
-                        if value.parse::<u64>().is_ok() {
-                            Refusal::Minimum {
-                                key: column.key,
-                                requested: value.to_owned(),
-                                largest: limits.last().map_or(0, |(limit, _)| *limit),
-                            }
-                        } else {
-                            Refusal::InvalidMinimum {
-                                key: column.key,
-                                requested: value.to_owned(),
-                            }
-                        }
-                    }
-                    ColumnRule::Exact(values) => Refusal::Exact {
-                        key: column.key,
-                        requested: value.to_owned(),
-                        offered: values.iter().map(|(value, _)| value.to_string()).collect(),
-                    },
+        let mut capability = None;
+        let mut mismatch = None;
+        for (key, value) in pairs {
+            let Some(column) = self.columns.iter().find(|column| column.key == key) else {
+                if property::HARMLESS_PROPERTIES.contains(&key) {
+                    continue;
+                }
+                return Err(Refusal::Unknown {
+                    key: key.to_owned(),
                 });
+            };
+            if let ColumnRule::Capability(mask) = &column.rule {
+                if value.is_empty() {
+                    continue;
+                }
+                match value.parse::<NetworkRequest>() {
+                    Ok(NetworkRequest::NotRequested) => continue,
+                    Ok(NetworkRequest::Requested) => capability = Some((column.key, value, *mask)),
+                    Err(error) => {
+                        return Err(Refusal::InvalidCapability {
+                            key: column.key,
+                            requested: value.to_owned(),
+                            error,
+                        });
+                    }
+                }
+                continue;
+            }
+            if let ColumnRule::Minimum(_) = &column.rule
+                && value.parse::<u64>().is_err()
+            {
+                return Err(Refusal::InvalidMinimum {
+                    key: column.key,
+                    requested: value.to_owned(),
+                });
+            }
+            let before = accepting;
+            accepting &= column.rule.mask(value);
+            if accepting.is_empty() && mismatch.is_none() {
+                mismatch = Some(self.incompatible(column.key, value, before));
+            }
+        }
+        if let Some(refusal) = mismatch {
+            return Err(refusal);
+        }
+        if let Some((key, value, mask)) = capability {
+            let before = accepting;
+            accepting &= mask;
+            if accepting.is_empty() {
+                return Err(self.incompatible(key, value, before));
             }
         }
         if accepting.is_empty() {
-            Some(refusal.unwrap_or(Refusal::Combination))
+            Err(Refusal::Combination)
         } else {
-            None
+            Ok(accepting)
+        }
+    }
+
+    fn incompatible(&self, key: &'static str, requested: &str, eligible: FleetSet) -> Refusal {
+        Refusal::Incompatible {
+            key,
+            requested: requested.to_owned(),
+            fleets: eligible
+                .iter()
+                .map(|index| self.fleets[index].name().to_owned())
+                .collect(),
         }
     }
 
@@ -345,6 +405,7 @@ mod tests {
                 memory: Bytes::new(gib << 30),
                 disk: Bytes::new(disk_gib << 30),
             },
+            &crate::FleetActionPolicy::default(),
             options
                 .iter()
                 .map(|(key, value)| (*key, (*value).to_owned())),
@@ -365,6 +426,11 @@ mod tests {
 
     fn set(indices: &[usize]) -> FleetSet {
         FleetSet::try_from_indices(indices.iter().copied()).expect("indices in range")
+    }
+    fn admitted(catalog: &FleetCatalog, pairs: &[(&str, &str)]) -> FleetSet {
+        catalog
+            .admit(pairs.iter().copied())
+            .unwrap_or(FleetSet::EMPTY)
     }
 
     fn catalog() -> FleetCatalog {
@@ -401,62 +467,92 @@ mod tests {
 
     #[test]
     fn empty_request_accepts_every_fleet() {
-        assert_eq!(catalog().accepting(request(&[])), set(&[0, 1, 2]));
+        assert_eq!(catalog().admit([]), Ok(set(&[0, 1, 2])));
+    }
+
+    #[test]
+    fn persistent_worker_marker_does_not_restrict_fleets() {
+        let catalog = catalog();
+        for value in ["1", "", "any value"] {
+            assert_eq!(
+                catalog.admit([(property::SUPPORTS_WORKERS, value)]),
+                Ok(set(&[0, 1, 2]))
+            );
+            assert_eq!(
+                catalog.admit([(property::SUPPORTS_WORKERS, value), ("ISA", "aarch64")]),
+                Ok(set(&[2]))
+            );
+        }
+    }
+
+    #[test]
+    fn action_policy_rejects_ungranted_network() {
+        assert_eq!(
+            catalog().admit([("network", "requested")]).unwrap_err(),
+            Refusal::Incompatible {
+                key: "network",
+                requested: "requested".into(),
+                fleets: vec!["spot-x86".into(), "on-demand-x86".into(), "arm".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn action_policy_rejects_unknown_property() {
+        assert_eq!(
+            catalog()
+                .admit([("ISA", "x86-64"), ("unrecognized-capability", "requested"),])
+                .unwrap_err(),
+            Refusal::Unknown {
+                key: "unrecognized-capability".into()
+            }
+        );
     }
 
     #[test]
     fn fleet_name_pins_one_fleet() {
         assert_eq!(
-            catalog().accepting(request(&[("fleet", "on-demand-x86")])),
+            admitted(&catalog(), &[("fleet", "on-demand-x86")]),
             set(&[1])
         );
     }
 
     #[test]
     fn an_unknown_fleet_name_matches_nothing() {
-        assert_eq!(catalog().accepting(request(&[("fleet", "nope")])), set(&[]));
+        assert_eq!(admitted(&catalog(), &[("fleet", "nope")]), set(&[]));
     }
 
     #[test]
     fn isa_selects_fleets_of_that_isa() {
         let catalog = catalog();
-        assert_eq!(
-            catalog.accepting(request(&[("ISA", "x86-64")])),
-            set(&[0, 1])
-        );
-        assert_eq!(catalog.accepting(request(&[("ISA", "aarch64")])), set(&[2]));
+        assert_eq!(admitted(&catalog, &[("ISA", "x86-64")]), set(&[0, 1]));
+        assert_eq!(admitted(&catalog, &[("ISA", "aarch64")]), set(&[2]));
     }
 
     #[test]
     fn contradictory_isa_and_capacity_accept_nothing() {
-        let accepting = catalog().accepting(request(&[("ISA", "aarch64"), ("capacity", "spot")]));
+        let accepting = admitted(&catalog(), &[("ISA", "aarch64"), ("capacity", "spot")]);
         assert_eq!(accepting, set(&[]));
     }
 
     #[test]
     fn exact_option_selects_matching_fleets() {
         assert_eq!(
-            catalog().accepting(request(&[("capacity", "on-demand")])),
+            admitted(&catalog(), &[("capacity", "on-demand")]),
             set(&[1, 2])
         );
     }
 
     #[test]
     fn sandbox_no_fleet_declares_accepts_nothing() {
-        assert_eq!(
-            catalog().accepting(request(&[("sandbox", "noop")])),
-            set(&[])
-        );
+        assert_eq!(admitted(&catalog(), &[("sandbox", "noop")]), set(&[]));
     }
 
     #[test]
     fn cpu_count_is_a_minimum() {
         let catalog = catalog();
-        assert_eq!(
-            catalog.accepting(request(&[("cpu_count", "8")])),
-            set(&[0, 1])
-        );
-        assert_eq!(catalog.accepting(request(&[("cpu_count", "9")])), set(&[]));
+        assert_eq!(admitted(&catalog, &[("cpu_count", "8")]), set(&[0, 1]));
+        assert_eq!(admitted(&catalog, &[("cpu_count", "9")]), set(&[]));
     }
 
     #[test]
@@ -464,33 +560,43 @@ mod tests {
         let catalog = catalog();
         // 16 GiB is 16777216 KiB; the arm fleet has 8 GiB.
         assert_eq!(
-            catalog.accepting(request(&[("memory_kb", "16777216")])),
+            admitted(&catalog, &[("memory_kb", "16777216")]),
             set(&[0, 1])
         );
+        assert_eq!(admitted(&catalog, &[("memory_kb", "16777217")]), set(&[]));
         assert_eq!(
-            catalog.accepting(request(&[("memory_kb", "16777217")])),
-            set(&[])
-        );
-        assert_eq!(
-            catalog.accepting(request(&[("memory_kb", "8388608")])),
+            admitted(&catalog, &[("memory_kb", "8388608")]),
             set(&[0, 1, 2])
         );
     }
 
     #[test]
     fn unparseable_minimum_accepts_nothing() {
-        assert_eq!(
-            catalog().accepting(request(&[("cpu_count", "eight")])),
-            set(&[])
-        );
+        assert_eq!(admitted(&catalog(), &[("cpu_count", "eight")]), set(&[]));
     }
 
     #[test]
-    fn undeclared_keys_impose_nothing() {
+    fn undeclared_keys_are_rejected() {
+        assert!(matches!(
+            catalog().admit([("colour", "red")]),
+            Err(Refusal::Unknown { .. })
+        ));
+    }
+
+    #[test]
+    fn action_environment_constrains_admission() {
+        let catalog = catalog();
         assert_eq!(
-            catalog().accepting(request(&[("colour", "red")])),
-            set(&[0, 1, 2])
+            catalog.admit([
+                (property::ISA, "aarch64"),
+                (property::ACTION_ENVIRONMENT, "host:test"),
+                (property::SUPPORTS_WORKERS, "any value"),
+            ]),
+            Ok(set(&[2]))
         );
+        for value in ["host:other", ""] {
+            assert!(catalog.admit([(property::ACTION_ENVIRONMENT, value)]).is_err());
+        }
     }
 
     #[test]
@@ -501,18 +607,9 @@ mod tests {
         ])
         .unwrap();
         // 200 GiB is 209715200 KiB; the small fleet has 100 GiB.
-        assert_eq!(
-            catalog.accepting(request(&[("disk_kb", "209715200")])),
-            set(&[1])
-        );
-        assert_eq!(
-            catalog.accepting(request(&[("disk_kb", "209715201")])),
-            set(&[])
-        );
-        assert_eq!(
-            catalog.accepting(request(&[("disk_kb", "1")])),
-            set(&[0, 1])
-        );
+        assert_eq!(admitted(&catalog, &[("disk_kb", "209715200")]), set(&[1]));
+        assert_eq!(admitted(&catalog, &[("disk_kb", "209715201")]), set(&[]));
+        assert_eq!(admitted(&catalog, &[("disk_kb", "1")]), set(&[0, 1]));
     }
 
     #[test]
@@ -530,14 +627,8 @@ mod tests {
             fleet("cpu-arm", Isa::Aarch64, 4, 8, 100, &[]),
         ])
         .unwrap();
-        assert_eq!(
-            catalog.accepting(request(&[("machine_class", "gpu")])),
-            set(&[0])
-        );
-        assert_eq!(
-            catalog.accepting(request(&[("machine_class", "cpu")])),
-            set(&[])
-        );
+        assert_eq!(admitted(&catalog, &[("machine_class", "gpu")]), set(&[0]));
+        assert_eq!(admitted(&catalog, &[("machine_class", "cpu")]), set(&[]));
     }
 
     #[test]
@@ -554,7 +645,8 @@ mod tests {
                 ("memory_kb", MatchKind::Minimum),
                 ("disk_kb", MatchKind::Minimum),
                 ("capacity", MatchKind::Exact),
-                ("network", MatchKind::Ignored),
+                ("network", MatchKind::Capability),
+                ("supports-workers", MatchKind::Ignored),
             ]
         );
     }
@@ -588,6 +680,7 @@ mod tests {
                 "capacity",
                 "zone",
                 "network",
+                "supports-workers",
             ]
         );
     }
@@ -613,11 +706,8 @@ mod tests {
 
     #[test]
     fn non_numeric_minimum_request_accepts_no_fleet() {
-        assert_eq!(
-            catalog().accepting(request(&[("memory_kb", "16 GiB")])),
-            set(&[])
-        );
-        assert_eq!(catalog().accepting(request(&[("cpu_count", "")])), set(&[]));
+        assert_eq!(admitted(&catalog(), &[("memory_kb", "16 GiB")]), set(&[]));
+        assert_eq!(admitted(&catalog(), &[("cpu_count", "")]), set(&[]));
     }
 
     #[test]
@@ -634,51 +724,112 @@ mod tests {
             fleet("cpu-x86", Isa::X86_64, 8, 16, 200, &[]),
         ])
         .unwrap();
-        assert_eq!(
-            catalog.accepting(request(&[("machine_class", "gpu")])),
-            set(&[0])
+        assert_eq!(admitted(&catalog, &[("machine_class", "gpu")]), set(&[0]));
+        assert_eq!(admitted(&catalog, &[("machine_class", "")]), set(&[]));
+    }
+
+    #[test]
+    fn baseline_network_values_do_not_restrict_fleets() {
+        for value in ["", "not-requested"] {
+            assert_eq!(catalog().admit([("network", value)]), Ok(set(&[0, 1, 2])));
+        }
+        assert!(matches!(
+            catalog().admit([("network", "eth0")]),
+            Err(Refusal::InvalidCapability { .. })
+        ));
+    }
+
+    #[test]
+    fn grant_and_isa_intersect_and_fit_preserves_admission() {
+        let policy = crate::FleetActionPolicy {
+            grants: [Capability::Network].into_iter().collect(),
+            resources: crate::ResourceCeilings {
+                cpu_count: std::num::NonZeroU32::new(2),
+                ..Default::default()
+            },
+        };
+        let network_fleet = FleetProperties::new(
+            &FleetName::try_new("network-arm").unwrap(),
+            Isa::Aarch64,
+            &"bwrap",
+            &"host:test".parse().unwrap(),
+            Resources {
+                vcpus: 8,
+                memory: Bytes::new(16 << 30),
+                disk: Bytes::new(100 << 30),
+            },
+            &policy,
+            [],
         );
+        let catalog = FleetCatalog::try_new(vec![
+            fleet("offline-x86", Isa::X86_64, 8, 16, 100, &[]),
+            network_fleet,
+        ])
+        .unwrap();
+        let admitted = catalog.admit([("network", "requested")]).unwrap();
+        assert_eq!(admitted, set(&[1]));
+        let with_environment = [
+            (property::NETWORK, "requested"),
+            (property::ACTION_ENVIRONMENT, "host:test"),
+        ];
+        assert_eq!(catalog.admit(with_environment), Ok(set(&[1])));
+        assert_eq!(catalog.accepting(request(&with_environment)), set(&[1]));
         assert_eq!(
-            catalog.accepting(request(&[("machine_class", "")])),
+            catalog.accepting(request(&[
+                (property::NETWORK, "requested"),
+                (property::ACTION_ENVIRONMENT, "host:other"),
+            ])),
             set(&[])
         );
-    }
-
-    #[test]
-    fn request_is_called_once_per_declared_non_ignored_key() {
-        let catalog = catalog();
-        let declared = catalog.declared();
-        let calls: Vec<std::cell::Cell<u8>> =
-            declared.iter().map(|_| std::cell::Cell::new(0)).collect();
-        let pairs: &[(&'static str, &'static str)] = &[("capacity", "spot"), ("network", "eth0")];
-        let lookup = request(pairs);
-        let accepting = catalog.accepting(|key| {
-            if let Some(count) = declared
-                .iter()
-                .position(|(known, _)| *known == key)
-                .and_then(|index| calls.get(index))
-            {
-                count.set(count.get() + 1);
+        assert_eq!(
+            catalog.accepting_base(request(&[
+                (property::NETWORK, "requested"),
+                (property::ACTION_ENVIRONMENT, "host:other"),
+            ])),
+            set(&[1])
+        );
+        assert_eq!(
+            catalog.admit([("ISA", "aarch64"), ("network", "requested")]),
+            Ok(set(&[1]))
+        );
+        let refusal = catalog
+            .admit([("network", "requested"), ("ISA", "x86-64")])
+            .unwrap_err();
+        assert_eq!(
+            refusal,
+            Refusal::Incompatible {
+                key: "network",
+                requested: "requested".into(),
+                fleets: vec!["offline-x86".into()],
             }
-            lookup(key)
-        });
-        assert_eq!(accepting, set(&[0]));
-        let expected: Vec<u8> = declared
-            .iter()
-            .map(|(_, kind)| u8::from(*kind != MatchKind::Ignored))
-            .collect();
-        assert_eq!(
-            calls.iter().map(std::cell::Cell::get).collect::<Vec<_>>(),
-            expected
         );
-    }
-
-    #[test]
-    fn ignored_key_imposes_nothing() {
-        assert_eq!(
-            catalog().accepting(request(&[("network", "eth0")])),
-            set(&[0, 1, 2])
+        assert!(
+            catalog
+                .admit([("network", "requested"), ("cpu_count", "3")])
+                .is_err()
         );
+        assert_eq!(
+            catalog.fit(admitted, request(&[("cpu_count", "8")])),
+            Some(Fit {
+                fleet: 1,
+                lowered: vec![("cpu_count", 2)],
+            })
+        );
+        for request in [
+            vec![
+                ("ISA", "aarch64"),
+                ("cpu_count", "1"),
+                ("memory_kb", "1024"),
+                ("disk_kb", "1024"),
+            ],
+            vec![
+                ("ISA", "x86-64"),
+                ("cpu_millicores", "1000"),
+                ("network", "not-requested"),
+            ],
+        ] {
+            assert!(catalog.admit(request).is_ok());
+        }
     }
 
     #[test]
@@ -696,41 +847,28 @@ mod tests {
             ],
         )])
         .unwrap();
-        assert_eq!(
-            catalog.accepting(request(&[("capacity", "spot")])),
-            set(&[0])
-        );
-        assert_eq!(
-            catalog.accepting(request(&[("capacity", "on-demand")])),
-            set(&[])
-        );
-        assert_eq!(catalog.accepting(request(&[("cpu_count", "5")])), set(&[]));
+        assert_eq!(admitted(&catalog, &[("capacity", "spot")]), set(&[0]));
+        assert_eq!(admitted(&catalog, &[("capacity", "on-demand")]), set(&[]));
+        assert_eq!(admitted(&catalog, &[("cpu_count", "5")]), set(&[]));
     }
 
     #[test]
     fn refusal_explains_minimum_values() {
         let catalog = catalog();
-        assert_eq!(catalog.refusal(request(&[("cpu_count", "8")])), None);
-        let refusal = catalog.refusal(request(&[("cpu_count", "9")])).unwrap();
+        assert_eq!(catalog.admit([("cpu_count", "8")]), Ok(set(&[0, 1])));
         assert_eq!(
-            refusal,
-            Refusal::Minimum {
+            catalog.admit([("cpu_count", "9")]).unwrap_err(),
+            Refusal::Incompatible {
                 key: "cpu_count",
                 requested: "9".into(),
-                largest: 8,
+                fleets: vec!["spot-x86".into(), "on-demand-x86".into(), "arm".into()],
             }
-        );
-        assert_eq!(
-            refusal.to_string(),
-            "cpu_count 9 is above the largest fleet's 8"
         );
     }
 
     #[test]
     fn refusal_names_a_minimum_that_is_not_a_number() {
-        let refusal = catalog()
-            .refusal(request(&[("memory_kb", "4GiB")]))
-            .unwrap();
+        let refusal = catalog().admit([("memory_kb", "4GiB")]).unwrap_err();
         assert_eq!(
             refusal,
             Refusal::InvalidMinimum {
@@ -745,43 +883,35 @@ mod tests {
     }
 
     #[test]
-    fn refusal_uses_first_individually_unsatisfied_column() {
-        assert_eq!(
-            catalog().refusal(request(&[("capacity", "reserved"), ("cpu_count", "20")])),
-            Some(Refusal::Minimum {
-                key: "cpu_count",
-                requested: "20".into(),
-                largest: 8,
-            })
-        );
+    fn refusal_is_stable_across_input_order() {
+        let first = [("capacity", "reserved"), ("cpu_count", "20")];
+        let second = [("cpu_count", "20"), ("capacity", "reserved")];
+        assert_eq!(catalog().admit(first), catalog().admit(second));
     }
 
     #[test]
     fn refusal_explains_exact_values_and_combinations() {
         let catalog = catalog();
-        let refusal = catalog
-            .refusal(request(&[("capacity", "reserved")]))
-            .unwrap();
-        assert_eq!(
+        let refusal = catalog.admit([("capacity", "reserved")]).unwrap_err();
+        assert!(matches!(
             refusal,
-            Refusal::Exact {
+            Refusal::Incompatible {
                 key: "capacity",
-                requested: "reserved".into(),
-                offered: vec!["on-demand".into(), "spot".into()],
+                ..
+            }
+        ));
+        let combination = catalog
+            .admit([("ISA", "aarch64"), ("capacity", "spot")])
+            .unwrap_err();
+        assert_eq!(
+            combination,
+            Refusal::Incompatible {
+                key: "capacity",
+                requested: "spot".into(),
+                fleets: vec!["arm".into()],
             }
         );
-        assert_eq!(
-            refusal.to_string(),
-            "capacity reserved matches no fleet (fleets offer on-demand, spot)"
-        );
-        let combination = catalog
-            .refusal(request(&[("ISA", "aarch64"), ("capacity", "spot")]))
-            .unwrap();
-        assert_eq!(combination, Refusal::Combination);
-        assert_eq!(
-            combination.to_string(),
-            "no single fleet accepts every requested property"
-        );
+        assert!(combination.to_string().contains("arm"));
     }
 
     #[test]
@@ -791,19 +921,10 @@ mod tests {
             key: "empty",
             rule: ColumnRule::Exact(Box::new([])),
         });
-        let refusal = catalog.refusal(request(&[("empty", "value")])).unwrap();
-        assert_eq!(
-            refusal,
-            Refusal::Exact {
-                key: "empty",
-                requested: "value".into(),
-                offered: vec![]
-            }
-        );
-        assert_eq!(
-            refusal.to_string(),
-            "empty value matches no fleet (no fleet declares empty)"
-        );
+        assert!(matches!(
+            catalog.admit([("empty", "value")]),
+            Err(Refusal::Incompatible { key: "empty", .. })
+        ));
     }
 
     #[test]
@@ -987,9 +1108,6 @@ mod tests {
 
     #[test]
     fn minimum_between_limits_accepts_only_larger_fleets() {
-        assert_eq!(
-            catalog().accepting(request(&[("cpu_count", "5")])),
-            set(&[0, 1])
-        );
+        assert_eq!(admitted(&catalog(), &[("cpu_count", "5")]), set(&[0, 1]));
     }
 }

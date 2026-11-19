@@ -64,6 +64,48 @@ run "terminates_tls_with_http2_and_the_validated_certificate" {
   }
 }
 
+run "no_static_addresses_by_default" {
+  command = plan
+  assert {
+    condition     = length(aws_eip.public) == 0 && length(output.public_static_ips) == 0
+    error_message = "The default load balancer must not allocate public EIPs."
+  }
+}
+
+run "static_addresses_follow_availability_zones" {
+  command = apply
+  variables {
+    shared_database          = true
+    public_subnet_ids        = ["subnet-public-a", "subnet-public-b"]
+    public_subnets_by_az     = { az-a = "subnet-public-a", az-b = "subnet-public-b" }
+    static_public_ips        = true
+    private_subnet_ids       = ["subnet-private"]
+    worker_security_group_id = "sg-workers"
+    private_zone_id          = "ZPRIVATE"
+  }
+  assert {
+    condition     = toset(keys(aws_eip.public)) == toset(["az-a", "az-b"]) && toset(keys(output.public_static_ips)) == toset(["az-a", "az-b"])
+    error_message = "A static EIP must be allocated for every public availability zone."
+  }
+  assert {
+    condition = alltrue([for key, eip in aws_eip.public :
+      anytrue([for mapping in aws_lb.this.subnet_mapping : mapping.subnet_id == var.public_subnets_by_az[key] && mapping.allocation_id == eip.id])
+    ])
+    error_message = "Each public subnet must use its own stable EIP allocation."
+  }
+}
+
+run "single_controller_uses_semantic_key" {
+  command = plan
+  variables {
+    static_public_ips = true
+  }
+  assert {
+    condition     = toset(keys(aws_eip.public)) == toset(["controller"])
+    error_message = "The single-controller EIP must use a stable controller key."
+  }
+}
+
 run "forwards_tls_to_the_controller_with_the_client_address" {
   command = apply
 

@@ -10,8 +10,9 @@ use std::process::{Command, ExitCode, Stdio};
 use gang_config::{PluginSet, SandboxFile};
 use gang_spi::{
     ActionCommand, ActionExecutionSpec, ActionIsolationPort, ActionLimitsPort, GUARD_LINK_NAME,
-    PluginContext, PortError, SIDE_CHANNEL_FILE_ENV,
+    NetworkAccess, PluginContext, PortError, SIDE_CHANNEL_FILE_ENV,
 };
+use gang_types::{Capability, NetworkRequest};
 
 use crate::action_directory::ActionDirectory;
 use crate::errors::ExecError;
@@ -156,6 +157,26 @@ where
     let path = SandboxFile::<P>::beside(invocation.entrypoint);
     let file = read_sandbox_file::<P>(&path)?;
     let properties = ActionProperties::from_environment(invocation.environment)?;
+    let network = match properties.network {
+        NetworkRequest::NotRequested => NetworkAccess::Offline,
+        NetworkRequest::Requested => {
+            if !file.actions.grants.contains(&Capability::Network) {
+                return Err(ExecError::NetworkNotGranted);
+            }
+            let policy = file
+                .execution
+                .egress
+                .as_ref()
+                .ok_or(ExecError::NetworkPolicyMissing)?;
+            if file.controller_endpoints.is_empty() {
+                return Err(ExecError::NetworkEndpointsMissing);
+            }
+            NetworkAccess::PublicEgress {
+                policy,
+                controller_endpoints: &file.controller_endpoints,
+            }
+        }
+    };
     let directory = ActionDirectory::try_new(&file.work_directory, invocation.working_directory)?;
     let context = PluginContext { config_path: &path };
 
@@ -183,7 +204,7 @@ where
             environment: &environment,
             action_directory: &directory.path,
             working_directory: &directory.working_directory,
-            network: properties.network,
+            network,
             launcher: &[],
         },
         limits: properties.limits,
@@ -204,9 +225,17 @@ where
             leave_action_group,
         )
         .await
-    })?;
-    side_channel::report(invocation.environment, &directory.path, execution.usage);
-    Ok(ExitCode::from(exit_status(execution.outcome)))
+    });
+    match execution {
+        Ok(execution) => {
+            side_channel::report(invocation.environment, &directory.path, execution.usage);
+            Ok(ExitCode::from(exit_status(execution.outcome)))
+        }
+        Err(failure) => {
+            side_channel::report(invocation.environment, &directory.path, failure.usage);
+            Err(failure.error)
+        }
+    }
 }
 
 /// Reads and parses the sandbox file at `path`.

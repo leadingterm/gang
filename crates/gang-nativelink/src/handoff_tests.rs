@@ -294,6 +294,7 @@ async fn public_listener_serves_execution_and_waits_for_worker_stream() -> gang_
                 memory: Bytes::new(8 << 30),
                 disk: Bytes::new(16 << 30),
             },
+            &gang_types::FleetActionPolicy::default(),
             Vec::<(&'static str, String)>::new(),
         )])
         .expect("valid fleet");

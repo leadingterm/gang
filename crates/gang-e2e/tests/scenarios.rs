@@ -297,6 +297,8 @@ mod control;
 
 mod execution;
 
+type Scenario<'a> = &'a dyn Fn(&Simulation, &Variant) -> gang_e2e::Result<Vec<Check>>;
+
 #[test]
 fn failed_builds_report_stderr_instead_of_missing_reports() -> gang_e2e::Result<()> {
     let variant = baseline(Sandbox::Bwrap);
@@ -304,7 +306,13 @@ fn failed_builds_report_stderr_instead_of_missing_reports() -> gang_e2e::Result<
         build: BuildFailure::BeforeScaleOut,
         ..Behaviour::COMPLIANT
     };
-    for scenario in [lifecycle, network, input_integrity] {
+    let targets = network_targets()?;
+    let scenarios: [Scenario<'_>; 3] = [
+        &lifecycle,
+        &|system, variant| network(system, variant, &targets),
+        &input_integrity,
+    ];
+    for scenario in scenarios {
         let system = Simulation::new(&variant, behaviour);
         let checks = scenario(&system, &variant)?;
         assert!(
@@ -333,6 +341,16 @@ fn lifecycle_is_compliant_under_bwrap() {
     let variant = baseline(Sandbox::Bwrap);
     let system = Simulation::new(&variant, Behaviour::COMPLIANT);
     assert_compliant(&lifecycle(&system, &variant).expect("the lifecycle runs"));
+}
+
+#[test]
+fn lifecycle_does_not_request_network() {
+    let variant = baseline(Sandbox::Bwrap);
+    let system = Simulation::new(&variant, Behaviour::COMPLIANT);
+    assert_compliant(&lifecycle(&system, &variant).expect("the lifecycle runs"));
+    assert!(system.report(Probe::Isolated).is_ok());
+    assert!(system.report(Probe::Pinned).is_ok());
+    assert!(system.report(Probe::NetworkRequested).is_err());
 }
 
 #[test]
@@ -386,11 +404,99 @@ flaw! {
         => only [names::lifecycle::IDLE_DRAIN]
 }
 
+fn network_targets() -> gang_e2e::Result<gang_e2e::EgressTargets> {
+    Ok(gang_e2e::EgressTargets {
+        public_ipv4: "93.184.216.34:1234"
+            .parse()
+            .map_err(|error| gang_e2e::E2eError::system(format!("{error}")))?,
+        public_ipv6: "[2001:4860:1234::34]:1234"
+            .parse()
+            .map_err(|error| gang_e2e::E2eError::system(format!("{error}")))?,
+        blocked: [(
+            "imds4".to_owned(),
+            "169.254.169.254:1234"
+                .parse()
+                .map_err(|error| gang_e2e::E2eError::system(format!("{error}")))?,
+        )]
+        .into(),
+        dns: "93.184.216.34"
+            .parse()
+            .map_err(|error| gang_e2e::E2eError::system(format!("{error}")))?,
+        nonce: "fixture".to_owned(),
+        uid: 1000,
+        gid: 1000,
+        timeout: std::time::Duration::from_secs(1),
+        policy: gang_types::PublicEgressPolicy {
+            protected_networks: vec![
+                "10.0.0.0/8"
+                    .parse()
+                    .map_err(|error| gang_e2e::E2eError::system(format!("{error}")))?,
+            ]
+            .into_boxed_slice(),
+            dns_servers: vec![
+                "93.184.216.34"
+                    .parse()
+                    .map_err(|error| gang_e2e::E2eError::system(format!("{error}")))?,
+            ]
+            .into_boxed_slice(),
+            setup_timeout: gang_types::NonZeroDuration::from_secs(1),
+        },
+    })
+}
+
 #[test]
-fn network_is_compliant_when_isolated() {
+fn network_admission_and_egress_are_compliant() -> gang_e2e::Result<()> {
+    for permit_network in [
+        gang_e2e::PermitNetwork::Denied,
+        gang_e2e::PermitNetwork::Permitted,
+    ] {
+        let variant = Variant {
+            permit_network,
+            ..baseline(Sandbox::Bwrap)
+        };
+        let system = Simulation::new(&variant, Behaviour::COMPLIANT);
+        assert_compliant(&network(&system, &variant, &network_targets()?)?);
+    }
+    Ok(())
+}
+
+#[test]
+fn network_rejects_unisolated_granted_actions() -> gang_e2e::Result<()> {
+    let variant = Variant {
+        permit_network: gang_e2e::PermitNetwork::Permitted,
+        ..baseline(Sandbox::Bwrap)
+    };
+    let system = Simulation::new(
+        &variant,
+        Behaviour {
+            isolation: Isolation::Leaky,
+            ..Behaviour::COMPLIANT
+        },
+    );
+    assert!(
+        network(&system, &variant, &network_targets()?)?
+            .iter()
+            .any(Check::is_failure)
+    );
+    Ok(())
+}
+
+#[test]
+fn network_rejects_missing_admission() -> gang_e2e::Result<()> {
     let variant = baseline(Sandbox::Bwrap);
-    let system = Simulation::new(&variant, Behaviour::COMPLIANT);
-    assert_compliant(&network(&system, &variant).expect("the network scenario runs"));
+    let system = Simulation::new(
+        &variant,
+        Behaviour {
+            routing: Routing::IgnoresProperties,
+            ..Behaviour::COMPLIANT
+        },
+    );
+    assert!(
+        network(&system, &variant, &network_targets()?)?
+            .iter()
+            .any(Check::is_failure)
+    );
+    Ok(())
 }
 
 #[test]

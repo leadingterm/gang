@@ -1,5 +1,4 @@
-//! Checks that `FleetCatalog::accepting` agrees with `NativeLink`'s platform property matcher
-//! for normalized requests over a pool of fleets and request properties.
+//! Checks catalog admission against `NativeLink` matching and per-action ceilings.
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -35,6 +34,11 @@ fn fleet(
     disk_gib: u64,
     options: &[(&'static str, &str)],
 ) -> Result<FleetProperties, Box<dyn Error>> {
+    let mut policy = gang_types::FleetActionPolicy::default();
+    if name == NAMES[1] {
+        policy.grants.insert(gang_types::Capability::Network);
+        policy.resources.memory = Some(gang_types::NonZeroBytes::gib(8));
+    }
     Ok(FleetProperties::new(
         &FleetName::try_new(name)?,
         isa,
@@ -45,6 +49,7 @@ fn fleet(
             memory: Bytes::new(gib << 30),
             disk: Bytes::new(disk_gib << 30),
         },
+        &policy,
         options
             .iter()
             .map(|(key, value)| (*key, (*value).to_owned())),
@@ -103,14 +108,13 @@ fn request_groups() -> Vec<(&'static str, Vec<&'static str>)> {
                 "1048576", "4194304", "8388608", "16777216", "16777217", "33554432",
             ],
         ),
-        ("colour", vec!["red"]),
         // Fits every fleet, exactly the small fleets' disk, exactly the largest fleets' disk,
         // and one KiB above every fleet.
         (
             property::DISK_KB,
             vec!["1", "52428800", "104857600", "104857601"],
         ),
-        (property::NETWORK, vec!["on"]),
+        (property::NETWORK, vec!["", "not-requested", "requested"]),
     ]
 }
 
@@ -200,6 +204,13 @@ fn native_properties<K: AsRef<str>, V: AsRef<str>>(
     {
         map.insert(property::CPU_MILLICORES.to_owned(), millicores.to_string());
     }
+    if normalize_request
+        && map
+            .get(property::NETWORK)
+            .is_some_and(|value| value.is_empty() || value == "not-requested")
+    {
+        map.remove(property::NETWORK);
+    }
     Ok(manager
         .make_platform_properties(map)
         .map_err(|error| error.to_string())?)
@@ -258,16 +269,17 @@ fn catalog_accepts_exactly_the_fleets_native_matches_for_normalized_requests() -
 
     let mut any_accepted = false;
     for request in requests(&request_groups()) {
-        let lookup = |key: &str| {
-            request
-                .iter()
-                .find(|(name, _)| *name == key)
-                .map(|(_, value)| *value)
-        };
-        let accepting = catalog.accepting(lookup);
+        let accepting = catalog.admit(request.iter().copied()).unwrap_or_default();
         let native = native_properties(&manager, request.iter().copied(), true)?;
         for (index, worker) in workers.iter().enumerate() {
-            let expected = native.is_satisfied_by(worker, false);
+            let within_ceiling = fleets[index].action_ceilings().all(|(key, limit)| {
+                request
+                    .iter()
+                    .find(|(name, _)| *name == key)
+                    .and_then(|(_, value)| value.parse::<u64>().ok())
+                    .is_none_or(|value| value <= limit)
+            });
+            let expected = native.is_satisfied_by(worker, false) && within_ceiling;
             assert_eq!(
                 accepting.contains(index),
                 expected,
@@ -277,5 +289,22 @@ fn catalog_accepts_exactly_the_fleets_native_matches_for_normalized_requests() -
         }
     }
     assert!(any_accepted, "no request was accepted by any fleet");
+    Ok(())
+}
+
+#[test]
+fn admission_rejects_unknown_invalid_and_ungranted_properties() -> TestResult {
+    let catalog = FleetCatalog::try_new(fleets()?)?;
+    assert!(catalog.admit([("unrecognized", "value")]).is_err());
+    assert!(catalog.admit([(property::NETWORK, "invalid")]).is_err());
+    let requested = catalog
+        .admit([(property::ISA, "x86-64"), (property::NETWORK, "requested")])
+        .map_err(|error| error.to_string())?;
+    assert_eq!(requested.iter().collect::<Vec<_>>(), vec![1]);
+    assert!(
+        catalog
+            .admit([(property::ISA, "aarch64"), (property::NETWORK, "requested")])
+            .is_err()
+    );
     Ok(())
 }

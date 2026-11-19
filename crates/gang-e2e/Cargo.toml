@@ -25,6 +25,7 @@ gang-mtls = { workspace = true }
 gang-oidc = { workspace = true }
 gang-os = { workspace = true }
 gang-state = { workspace = true }
+gang-spi = { workspace = true }
 gang-tls = { workspace = true }
 gang-testkit = { workspace = true }
 gang-types = { workspace = true }
@@ -71,8 +72,15 @@ nativelink-worker = { workspace = true }
 tonic = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 http-body-util = { workspace = true }
-gang-spi = { workspace = true }
 
 [[bin]]
 name = "local"
 path = "src/main.rs"
+
+[[bin]]
+name = "egress_probe"
+path = "src/egress_probe_main.rs"
+
+[[bin]]
+name = "egress_peer"
+path = "src/egress_peer_main.rs"

@@ -141,8 +141,8 @@ fn sigterm() -> Signal {
 fn bwrap(argv: &[OsString]) -> ! {
     let (info_fd, action) = split_arguments(argv);
     let action = action
-        .strip_prefix(&[OsString::from("/gang-reset")])
-        .unwrap_or_else(|| fail("missing reset trampoline"));
+        .strip_prefix(&[OsString::from("/gang-reset"), OsString::from("--")])
+        .unwrap_or_else(|| fail("missing offline reset trampoline separator"));
     let (mode, operands) = split_mode(action);
     match mode {
         "mask" => {

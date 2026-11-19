@@ -4,7 +4,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::errors::{E2eError, Result};
 
@@ -42,7 +42,7 @@ pub struct UpgradeInputs {
 }
 
 /// The resolved inputs used to create harness deployments.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeploymentInputs {
     /// The `gang` binary under test.
     pub gang: PathBuf,
@@ -120,7 +120,7 @@ pub const DEFAULT_WORKER_LAUNCHER: &[&str] = &[
 ];
 
 /// How the harness drives Bazel, waits, and shapes the environment of actions.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Settings {
     /// Extra Bazel startup options, placed before the command.
@@ -258,7 +258,7 @@ impl Settings {
 }
 
 /// The resolved shell and PATH used by the sample's actions.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionTools {
     /// The shell Bazel uses to run each action.
     pub shell: PathBuf,
@@ -272,6 +272,34 @@ pub struct ActionTools {
     pub glibc_tool: Option<PathBuf>,
     /// Rootfs envelope used by bubblewrap workers.
     pub action_rootfs: Option<PathBuf>,
+    /// Pinned tools for the isolated public-egress fixture, when available.
+    pub egress: Option<EgressTools>,
+}
+
+/// Pinned programs and fixture state for the public-egress scenario.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressTools {
+    /// Rootless network implementation.
+    pub slirp4netns: PathBuf,
+    /// Firewall program.
+    pub nft: PathBuf,
+    /// Namespace entry program.
+    pub nsenter: PathBuf,
+    /// Network configuration program.
+    pub ip: PathBuf,
+    /// Namespace creation program.
+    pub unshare: PathBuf,
+    /// Action-side network probe.
+    pub probe: PathBuf,
+    /// Fixture peer.
+    pub peer: PathBuf,
+    /// Policy installed by the fixture.
+    pub policy: Option<gang_types::PublicEgressPolicy>,
+    /// Targets installed by the fixture.
+    pub targets: Option<crate::egress_wire::EgressTargets>,
+    /// Host-prefetched Bazel repositories, replayed offline only by the isolated fixture.
+    #[serde(default)]
+    pub repository_cache: Option<PathBuf>,
 }
 
 impl ActionTools {

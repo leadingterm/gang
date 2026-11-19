@@ -177,8 +177,8 @@ pub struct ActionExecutionSpec<'a> {
     pub action_directory: &'a Path,
     /// The directory the command runs in, inside `action_directory`.
     pub working_directory: &'a Path,
-    /// Whether the action asked for network access.
-    pub network: NetworkRequest,
+    /// The selected fleet's effective network access.
+    pub network: NetworkAccess<'a>,
     /// The command prefix the sandbox starts its own first process through: empty without a
     /// limits plugin; otherwise [`crate::ActionLimitsPort::launcher`], which starts that process
     /// inside the action's limits scope. The sandbox runs `launcher` followed by the command it
@@ -186,15 +186,18 @@ pub struct ActionExecutionSpec<'a> {
     pub launcher: &'a [OsString],
 }
 
-gang_types::string_enum! {
-    /// Whether the action asked for network access. A sandbox grants it only if its own
-    /// configuration permits.
-    pub enum NetworkRequest("network request") {
-        /// The action needs no network access.
-        NotRequested = "not-requested",
-        /// The action asked for network access.
-        Requested = "requested",
-    }
+/// Network access authorized for an action by its selected fleet.
+#[derive(Debug, Clone, Copy)]
+pub enum NetworkAccess<'a> {
+    /// No external network access.
+    Offline,
+    /// Public egress subject to the trusted fleet policy and controller exclusions.
+    PublicEgress {
+        /// The validated public egress policy.
+        policy: &'a gang_types::PublicEgressPolicy,
+        /// Controller endpoints that must not be reachable by actions.
+        controller_endpoints: &'a [gang_types::Url],
+    },
 }
 
 /// How an action ended.
@@ -235,10 +238,7 @@ mod tests {
     use gang_testkit::must_ready as ready;
     use parking_lot::Mutex;
 
-    use super::{
-        ActionCommand, ActionExecutionOutcome, NetworkRequest, PortError, SandboxedAction,
-        Termination,
-    };
+    use super::{ActionCommand, ActionExecutionOutcome, PortError, SandboxedAction, Termination};
 
     #[test]
     fn command_requires_a_program_and_preserves_arguments() -> Result<(), Box<dyn std::error::Error>>
@@ -254,33 +254,6 @@ mod tests {
         assert_eq!(command.program(), OsStr::new("program"));
         assert!(command.args().is_empty());
         Ok(())
-    }
-
-    #[test]
-    fn network_request_round_trips_through_its_text() {
-        for request in [NetworkRequest::NotRequested, NetworkRequest::Requested] {
-            let text = request.to_string();
-
-            assert_eq!(text.parse::<NetworkRequest>().ok(), Some(request));
-        }
-    }
-
-    #[test]
-    fn network_request_text_is_the_accepted_value() {
-        assert_eq!(NetworkRequest::NotRequested.as_str(), "not-requested");
-        assert_eq!(NetworkRequest::Requested.to_string(), "requested");
-    }
-
-    #[test]
-    fn unknown_network_request_lists_the_accepted_names() {
-        let error = "networked"
-            .parse::<NetworkRequest>()
-            .expect_err("unknown text parses");
-
-        assert_eq!(
-            error.to_string(),
-            "unknown network request `networked`, expected one of not-requested, requested"
-        );
     }
 
     #[test]

@@ -17,6 +17,7 @@
 
 pub mod cgroup;
 mod errors;
+mod execution_gate;
 pub mod fs;
 mod lock;
 mod process;
@@ -24,12 +25,16 @@ mod signal;
 mod sys;
 
 pub use errors::{PathIo, RunError, SpawnError};
+pub use execution_gate::{
+    AsyncExecutionGate, ExecutionGateChild, ExecutionGateParent, ExecutionReady,
+    execution_gate_pair, namespace_owner, read_execution_environment, write_execution_environment,
+};
 pub use lock::FileLock;
 pub use process::{
     ParentExit, ProcessGroup, RunOutput, join_parent_group, parent_process_group, run_bounded,
     spawn_logged, spawn_logged_piped, terminate_process,
 };
 pub use signal::{TerminationsBlocked, block_terminations, clear_mask, shutdown_signal};
-pub use sys::PipeReader;
 #[cfg(target_os = "macos")]
 pub use sys::ProcessExitQueue;
+pub use sys::{PipeReader, duplicate_inherited_fd};

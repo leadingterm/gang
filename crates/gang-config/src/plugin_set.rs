@@ -77,6 +77,9 @@ pub trait SandboxSelection {
     /// Whether the `[sandbox.<plugin>]` section named by `key` is present.
     fn is_configured(&self, key: Self::Key) -> bool;
 
+    /// Whether the selected sandbox supports the capability.
+    fn supports_capability(&self, key: Self::Key, capability: gang_types::Capability) -> bool;
+
     /// Calls `visit` on every program path of the `[sandbox.<plugin>]` section `key` names
     /// (nothing when that section is absent or names no program), and stops at the first error.
     ///

@@ -7,8 +7,8 @@ use std::num::NonZeroU32;
 use std::os::unix::ffi::OsStringExt;
 
 use gang_exec::{ActionProperties, ExecError, PropertyError};
-use gang_spi::{CPU_COUNT_ENV, MEMORY_KB_ENV, NETWORK_ENV, NetworkRequest};
-use gang_types::NonZeroBytes;
+use gang_spi::{CPU_COUNT_ENV, MEMORY_KB_ENV, NETWORK_ENV};
+use gang_types::{NetworkRequest, NonZeroBytes};
 
 type TestResult = Result<(), Box<dyn Error>>;
 

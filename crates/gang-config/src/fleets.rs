@@ -5,8 +5,8 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use gang_types::{
-    ActionEnvironment, Fleet, FleetCatalog, FleetCountError, FleetName, FleetProperties, Isa,
-    MAX_FLEETS, NonZeroBytes,
+    ActionEnvironment, Fleet, FleetActionPolicy, FleetCatalog, FleetCountError, FleetName,
+    FleetProperties, Isa, MAX_FLEETS, NonZeroBytes,
 };
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +50,9 @@ pub struct RawFleet<K> {
     pub boot_grace: Duration,
     /// Sandbox used by the fleet.
     pub sandbox: K,
+    /// Capabilities and resource ceilings available to actions in this fleet.
+    #[serde(default)]
+    pub actions: FleetActionPolicy,
     /// Provisioner-specific options.
     #[serde(default)]
     pub options: FleetOptionsTable,
@@ -75,6 +78,7 @@ impl<K> RawFleet<K> {
             max_drain_wait,
             boot_grace,
             sandbox,
+            actions,
             options,
             scheduled_minimum,
         } = self;
@@ -103,6 +107,7 @@ impl<K> RawFleet<K> {
             idle_timeout,
             max_drain_wait,
             boot_grace,
+            actions,
         };
         Ok((policy, sandbox, options))
     }
@@ -161,6 +166,22 @@ impl<P: PluginSet> Fleets<P> {
                     fleet: policy.name.clone(),
                     key: key.to_string(),
                 });
+            }
+            policy
+                .actions
+                .validate(policy.instance())
+                .map_err(|source| ConfigError::FleetActionPolicy {
+                    fleet: policy.name.clone(),
+                    source,
+                })?;
+            for &capability in &policy.actions.grants {
+                if !sandbox.supports_capability(key, capability) {
+                    return Err(ConfigError::UnsupportedCapability {
+                        fleet: policy.name.clone(),
+                        key: key.to_string(),
+                        capability,
+                    });
+                }
             }
             let typed = P::fleet_options(provisioner, options_table).map_err(|source| {
                 ConfigError::FleetOptions {
@@ -344,6 +365,7 @@ sandbox = "bwrap"
         assert_eq!(policy.name, "gang-arm64".parse::<FleetName>()?);
         assert_eq!(policy.isa, "aarch64".parse::<Isa>()?);
         assert_eq!(policy.action_environment.as_str(), "host:test");
+        assert!(policy.actions.grants.is_empty());
         assert_eq!(
             policy.instance(),
             Resources {
@@ -363,6 +385,29 @@ sandbox = "bwrap"
         assert!(toml::from_str::<RawFleet<String>>(&missing).is_err());
         let invalid = FLEET.replace("host:test", "host:");
         assert!(toml::from_str::<RawFleet<String>>(&invalid).is_err());
+    }
+
+    #[test]
+    fn action_policy_and_environment_are_both_preserved() -> Result<(), Box<dyn Error>> {
+        let config = format!(
+            "{FLEET}\n[actions]\ngrants = [\"network\"]\n[actions.resources]\ncpu_count = 4\n"
+        );
+        let raw: RawFleet<String> = toml::from_str(&config)?;
+        let (policy, _, _) = raw.into_parts()?;
+        assert_eq!(policy.action_environment.as_str(), "host:test");
+        assert!(policy.actions.grants.contains(&gang_types::Capability::Network));
+        assert_eq!(policy.actions.resources.cpu_count.map(NonZeroU32::get), Some(4));
+        assert!(policy.actions.validate(policy.instance()).is_ok());
+        let properties = policy.properties(&"bwrap", []);
+        assert_eq!(properties.get(gang_types::property::ACTION_ENVIRONMENT), Some("host:test"));
+        assert_eq!(properties.get(gang_types::property::NETWORK), Some("requested"));
+        assert_eq!(properties.limit(gang_types::property::CPU_COUNT), Some(4));
+        assert_eq!(properties.capacity(gang_types::property::CPU_COUNT), Some(8));
+        assert!(toml::from_str::<RawFleet<String>>(&format!(
+            "{FLEET}\n[actions]\nunknown = true\n"
+        ))
+        .is_err());
+        Ok(())
     }
 
     #[test]

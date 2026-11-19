@@ -68,6 +68,7 @@ async fn serve(
     } = config;
     let context = PluginContext { config_path: &path };
     let endpoint = effective_endpoint(endpoint_flag, configured_endpoint);
+    let public_endpoint = endpoint.clone();
     let access = server_access(&authentication.workers, endpoint)?;
     let pin = ServerPin::try_new(server.ca_pin, signer, &context)?;
     let worker_endpoint = effective_endpoint(worker_endpoint_flag, worker_endpoint);
@@ -75,6 +76,12 @@ async fn serve(
     let cache = Cache::build(cache, &context)?;
     let scheduler = NativeLink::try_new(NativeLinkConfig::for_worker(worker_endpoint, &worker))
         .map_err(MainError::Scheduler)?;
+    let controller_endpoints = public_endpoint
+        .into_iter()
+        .chain(std::iter::once(
+            SchedulerPort::endpoints(&scheduler).worker.clone(),
+        ))
+        .collect();
     let transport = worker_transport(
         access,
         &SchedulerPort::endpoints(&scheduler).worker,
@@ -89,6 +96,7 @@ async fn serve(
         worker,
         sandbox,
         execution,
+        controller_endpoints,
         limits,
         executable: std::env::current_exe().map_err(MainError::CurrentExecutable)?,
         // Unset PATH resolves sandbox programs to nothing; the worker then fails to start.

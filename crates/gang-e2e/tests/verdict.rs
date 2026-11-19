@@ -6,8 +6,8 @@ use gang_clock::Timestamp;
 use gang_e2e::verdict;
 use gang_e2e::{
     BuildOutcome, Check, HOLD_CPU_COUNT, Host, InputLinks, InputRootReport, IsolationReport,
-    LIMIT_CPU_PERIOD_MICROS, LIMIT_MAX_PIDS, Namespaces, Outcome, PermitNetwork, PoisonReport,
-    Sandbox, ScopeFacts, VictimReport, names,
+    LIMIT_CPU_PERIOD_MICROS, LIMIT_MAX_PIDS, Namespaces, Outcome, PoisonReport, Sandbox,
+    ScopeFacts, VictimReport, names,
 };
 use gang_types::{FleetName, InstanceId, WorkerId};
 use gang_wire::{Event, EventChange, name};
@@ -278,114 +278,6 @@ fn working_directory_outside_tmp_skips_the_visibility_check() {
     assert_eq!(checks.len(), 2);
     assert!(checks[0].is_passed());
     assert!(checks[1].is_skipped());
-}
-
-fn network_checks(permit: PermitNetwork, requested_net: &str) -> Vec<Check> {
-    let isolated = namespaces(OTHER_NET, OTHER_MNT);
-    let requested = namespaces(requested_net, OTHER_MNT);
-    verdict::network(Sandbox::Bwrap, permit, &host(), &isolated, &requested)
-}
-
-#[test]
-fn network_denied_and_requested_on_own_namespace_passes() {
-    let checks = network_checks(PermitNetwork::Denied, OTHER_NET);
-    assert_eq!(checks.len(), 2);
-    assert_eq!(checks[0].name, names::network::OWN_NAMESPACE_BY_DEFAULT);
-    assert_eq!(checks[1].name, names::network::REQUEST_NOT_PERMITTED);
-    assert!(checks.iter().all(Check::is_passed));
-}
-
-#[test]
-fn network_denied_but_requested_on_host_namespace_fails() {
-    let checks = network_checks(PermitNetwork::Denied, HOST_NET);
-    assert_eq!(checks.len(), 2);
-    assert!(checks[0].is_passed());
-    assert!(checks[1].is_failure());
-}
-
-#[test]
-fn network_permitted_and_requested_on_host_namespace_passes() {
-    let checks = network_checks(PermitNetwork::Permitted, HOST_NET);
-    assert_eq!(checks.len(), 2);
-    assert_eq!(checks[1].name, names::network::REQUEST_SHARED);
-    assert!(checks.iter().all(Check::is_passed));
-}
-
-#[test]
-fn network_permitted_but_requested_on_own_namespace_fails() {
-    let checks = network_checks(PermitNetwork::Permitted, OTHER_NET);
-    assert_eq!(checks.len(), 2);
-    assert!(checks[0].is_passed());
-    assert!(checks[1].is_failure());
-}
-
-#[test]
-fn network_action_sharing_the_host_namespace_fails_the_isolation_check() {
-    let isolated = namespaces(HOST_NET, OTHER_MNT);
-    let requested = namespaces(OTHER_NET, OTHER_MNT);
-    let checks = verdict::network(
-        Sandbox::Bwrap,
-        PermitNetwork::Denied,
-        &host(),
-        &isolated,
-        &requested,
-    );
-    assert!(checks[0].is_failure());
-}
-
-#[test]
-fn network_skips_under_noop() {
-    let isolated = namespaces(OTHER_NET, OTHER_MNT);
-    let requested = namespaces(OTHER_NET, OTHER_MNT);
-    let checks = verdict::network(
-        Sandbox::Noop,
-        PermitNetwork::Denied,
-        &host(),
-        &isolated,
-        &requested,
-    );
-    assert_eq!(checks.len(), 1);
-    assert_eq!(checks[0].name, names::network::SHARING);
-    assert!(checks[0].is_skipped());
-}
-
-#[test]
-fn network_skips_when_the_host_net_is_unreadable() {
-    let unreadable = Host {
-        net: None,
-        mnt: Some(HOST_MNT.to_owned()),
-    };
-    let isolated = namespaces(OTHER_NET, OTHER_MNT);
-    let requested = namespaces(OTHER_NET, OTHER_MNT);
-    let checks = verdict::network(
-        Sandbox::Bwrap,
-        PermitNetwork::Denied,
-        &unreadable,
-        &isolated,
-        &requested,
-    );
-    assert_eq!(checks.len(), 1);
-    assert!(checks[0].is_skipped());
-}
-
-#[test]
-fn network_unavailable_isolated_namespace_fails_the_shape_check() {
-    let isolated = namespaces("unavailable", OTHER_MNT);
-    let requested = namespaces(OTHER_NET, OTHER_MNT);
-    let checks = verdict::network(
-        Sandbox::Bwrap,
-        PermitNetwork::Denied,
-        &host(),
-        &isolated,
-        &requested,
-    );
-    assert!(failure(&checks[0]).contains("not a net namespace id"));
-}
-
-#[test]
-fn network_empty_requested_namespace_fails_when_denied() {
-    let checks = network_checks(PermitNetwork::Denied, "");
-    assert!(checks[1].is_failure());
 }
 
 #[test]

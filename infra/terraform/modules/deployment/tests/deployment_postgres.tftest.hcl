@@ -161,9 +161,11 @@ override_module {
   outputs = {
     vpc_id                       = "vpc-test"
     vpc_cidr_block               = "10.20.0.0/16"
+    vpc_ipv6_cidr_blocks         = []
     availability_zones           = ["az-a", "az-b"]
     public_subnet_ids            = ["subnet-public-a", "subnet-public-b"]
     public_subnet_cidr_blocks    = ["10.20.0.0/20", "10.20.16.0/20"]
+    public_subnets_by_az         = { "az-a" = "subnet-public-a", "az-b" = "subnet-public-b" }
     private_subnet_ids           = { "az-a" = "subnet-private-a", "az-b" = "subnet-private-b" }
     controller_security_group_id = "sg-controller"
     worker_security_group_id     = "sg-worker"

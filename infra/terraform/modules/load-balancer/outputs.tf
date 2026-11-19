@@ -3,6 +3,11 @@ output "dns_name" {
   value       = aws_lb.this.dns_name
 }
 
+output "public_static_ips" {
+  description = "Allocated public load balancer addresses, keyed by availability zone or controller."
+  value       = { for key, eip in aws_eip.public : key => eip.public_ip }
+}
+
 output "zone_id" {
   description = "Route 53 hosted zone of the load balancer, for alias records."
   value       = aws_lb.this.zone_id

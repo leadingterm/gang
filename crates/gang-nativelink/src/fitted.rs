@@ -107,16 +107,15 @@ impl ClientStateManager for FittedActions {
                 continue;
             };
             let eligible = admitted
-                & fleets.accepting(|other| {
-                    if other == key {
-                        None
-                    } else {
+                & fleets
+                    .admit(
                         action_info
                             .platform_properties
-                            .get(other)
-                            .map(String::as_str)
-                    }
-                });
+                            .iter()
+                            .filter(|(other, _)| other.as_str() != key)
+                            .map(|(other, value)| (other.as_str(), value.as_str())),
+                    )
+                    .unwrap_or_default();
             let largest = eligible
                 .iter()
                 .filter_map(|index| fleets.fleets().get(index))
@@ -125,9 +124,10 @@ impl ClientStateManager for FittedActions {
             if let Some((capacity, fleet)) = largest
                 && reserved > capacity
             {
-                let whole_cpu = (key == property::MEMORY_KB)
-                    .then(|| fleet.limit(property::CPU_MILLICORES))
-                    .flatten();
+                let whole_cpu = (key == property::MEMORY_KB
+                    && fleet.capacity(key) == Some(capacity))
+                .then(|| fleet.limit(property::CPU_MILLICORES))
+                .flatten();
                 let properties = &mut Arc::make_mut(&mut action_info).platform_properties;
                 properties.insert(key.to_owned(), capacity.to_string());
                 if let Some(whole_cpu) = whole_cpu {
@@ -140,14 +140,15 @@ impl ClientStateManager for FittedActions {
             && !fit.lowered.is_empty()
         {
             tracing::info!(operation_id = %operation, fleet = fit.fleet, keys = ?fit.lowered, "fitting action reservation to fleet");
-            let memory_lowered = fit
-                .lowered
-                .iter()
-                .any(|(key, _)| *key == property::MEMORY_KB);
-            let whole_cpu = memory_lowered
-                .then(|| fleets.fleets().get(fit.fleet))
-                .flatten()
-                .and_then(|fleet| fleet.limit(property::CPU_MILLICORES));
+            let whole_cpu = fleets.fleets().get(fit.fleet).and_then(|fleet| {
+                fit.lowered
+                    .iter()
+                    .any(|(key, limit)| {
+                        *key == property::MEMORY_KB && fleet.capacity(key) == Some(*limit)
+                    })
+                    .then(|| fleet.limit(property::CPU_MILLICORES))
+                    .flatten()
+            });
             let properties = &mut Arc::make_mut(&mut action_info).platform_properties;
             for (key, limit) in fit.lowered {
                 properties.insert(key.to_owned(), limit.to_string());

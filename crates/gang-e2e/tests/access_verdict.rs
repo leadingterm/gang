@@ -46,6 +46,7 @@ fn tools(placement: &Placement) -> gang_e2e::Result<ActionTools> {
         )),
         glibc_tool: None,
         action_rootfs: Some(root),
+        egress: None,
     })
 }
 

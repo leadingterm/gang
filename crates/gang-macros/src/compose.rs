@@ -641,6 +641,14 @@ impl Composed {
                     }
                 }
 
+                fn supports_capability(&self, key: #key, capability: ::gang_spi::__private::gang_types::Capability) -> bool {
+                    let _ = capability;
+                    match key {
+                        #( #key::#variants => self.#fields.as_ref().is_some_and(|section|
+                            ::gang_spi::SandboxPrograms::supports_capability(section, capability)), )*
+                    }
+                }
+
                 fn try_for_each_program<E>(
                     &mut self,
                     key: #key,
@@ -859,6 +867,18 @@ mod tests {
         }
         assert!(!output.contains("__private :: gang_config"), "{output}");
         assert!(!output.contains("type Scheduler ="), "{output}");
+    }
+
+    #[test]
+    fn sandbox_capabilities_dispatch_to_the_selected_section() {
+        let output = expand(invocation(&quote! { a: P }))
+            .expect("the invocation expands")
+            .to_string();
+        assert!(
+            output.contains("SandboxPrograms :: supports_capability"),
+            "{output}"
+        );
+        assert!(output.contains("self . sandbox . as_ref"), "{output}");
     }
 
     #[test]

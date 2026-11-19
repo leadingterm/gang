@@ -24,6 +24,7 @@ fn action_tools() -> ActionTools {
         bwrap: None,
         glibc_tool: None,
         action_rootfs: None,
+        egress: None,
     }
 }
 
