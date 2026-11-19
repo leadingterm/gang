@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use gang_clock::Clock;
+use gang_spi::Fence;
 use gang_tls::Listener;
 use gang_types::{NonZeroDuration, health::health_check};
 use http::{Response, StatusCode};
@@ -20,17 +21,24 @@ use tokio::task::JoinSet;
 struct Flags {
     serving: AtomicBool,
     leading: AtomicBool,
+    promoted: AtomicBool,
 }
 
-#[derive(Clone, Default, Debug)]
-pub(crate) struct Readiness(Arc<Flags>);
+#[derive(Clone, Default)]
+pub(crate) struct Readiness(Arc<Flags>, Option<Fence>);
 
 impl Readiness {
+    pub(crate) fn with_fence(mut self, fence: Fence) -> Self {
+        self.1 = Some(fence);
+        self
+    }
+
     pub(crate) fn serve(&self) {
         self.0.serving.store(true, Ordering::Release);
     }
 
     pub(crate) fn lead(&self) {
+        self.0.promoted.store(true, Ordering::Release);
         self.0.leading.store(true, Ordering::Release);
     }
 
@@ -39,12 +47,23 @@ impl Readiness {
         self.0.serving.store(false, Ordering::Release);
     }
 
+    pub(crate) fn ready(&self) -> bool {
+        self.0.serving.load(Ordering::Acquire)
+            && self.0.leading.load(Ordering::Acquire)
+            && self.1.as_ref().is_some_and(Fence::holds)
+    }
+
+    /// Promotion is sticky so admitted connections can drain and survive lease outages.
+    pub(crate) fn promoted(&self) -> bool {
+        self.0.promoted.load(Ordering::Acquire)
+    }
+
     pub(crate) fn status(&self, path: &str) -> StatusCode {
         let check = health_check();
         let ready = if path == check.serve_path() {
             self.0.serving.load(Ordering::Acquire)
         } else if path == check.leader_path() {
-            self.0.leading.load(Ordering::Acquire)
+            self.ready()
         } else {
             return StatusCode::NOT_FOUND;
         };
@@ -118,8 +137,11 @@ mod tests {
     use std::pin::pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use bytes::Bytes;
+    use gang_clock::Clock;
+    use gang_spi::{Fence, Keeper};
     use gang_tls::Listener;
     use gang_types::{NonZeroDuration, health::health_check};
     use http::{Request, StatusCode};
@@ -129,6 +151,13 @@ mod tests {
 
     use super::{HealthLimits, Readiness, serve_health};
     use crate::test_support_memory::{MemoryDialer, MemoryListener, memory_listener};
+
+    fn valid_fence() -> (Fence, Keeper) {
+        let clock = crate::test_support_clock::start();
+        let (fence, keeper) = Fence::lease(clock.clone(), NonZeroDuration::from_secs(1));
+        keeper.extend_to(clock.monotonic() + Duration::from_mins(1));
+        (fence, keeper)
+    }
 
     /// Limits that admit `max_connections` connections with the smallest header buffer.
     fn limits(max_connections: usize) -> HealthLimits {
@@ -166,7 +195,7 @@ mod tests {
 
     #[test]
     fn status_tracks_lifecycle() {
-        let readiness = Readiness::default();
+        let mut readiness = Readiness::default();
         assert_statuses(
             &readiness,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -175,7 +204,12 @@ mod tests {
         readiness.serve();
         assert_statuses(&readiness, StatusCode::OK, StatusCode::SERVICE_UNAVAILABLE);
         readiness.lead();
+        assert_statuses(&readiness, StatusCode::OK, StatusCode::SERVICE_UNAVAILABLE);
+        let (fence, keeper) = valid_fence();
+        readiness = readiness.with_fence(fence);
         assert_statuses(&readiness, StatusCode::OK, StatusCode::OK);
+        keeper.revoke();
+        assert_statuses(&readiness, StatusCode::OK, StatusCode::SERVICE_UNAVAILABLE);
         readiness.stop();
         assert_statuses(
             &readiness,
@@ -216,7 +250,8 @@ mod tests {
     #[tokio::test]
     async fn listener_serves_lifecycle_statuses() -> gang_testkit::TestResult {
         let (listener, dialer) = memory_listener();
-        let readiness = Readiness::default();
+        let (fence, _keeper) = valid_fence();
+        let readiness = Readiness::default().with_fence(fence);
         let clock = crate::test_support_clock::start();
         let server_readiness = readiness.clone();
         let task = tokio::spawn(async move {
