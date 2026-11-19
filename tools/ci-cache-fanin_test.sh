@@ -231,21 +231,27 @@ fi
 [[ $(<"$BAZEL_DISK_CACHE/cas/00/$key3") == 'used restored CAS' ]]
 
 # Execute the whole preparation body to observe the effective compressed cap.
-# Missing main cache must never promote a PR delta to the main snapshot budget.
+# Only a PR with a restored x86 base uses the larger delta budget.
 for event in pull_request push; do
-  if [[ $event == pull_request ]]; then cap=300000000; else cap=3000000000; fi
   for base_present in true false; do
-    for override in '' 9000000000 1000000; do
-      budget_case="$scratch/budget-$event-$base_present-${override:-default}"
-      mkdir -p "$budget_case/download"
-      cp -pR "$scratch/working-set/." "$budget_case/download/"
-      setup_case "$budget_case"
-      export EVENT=$event BAZEL_BASE_PRESENT=$base_present SNAPSHOT_BUDGET=$override
-      bash -euo pipefail "$body"
-      expected=$cap
-      if [[ -n $override && $override -lt $cap ]]; then expected=$override; fi
-      [[ $(<"$GITHUB_OUTPUT") == $'has-snapshot=false\nhas-snapshot=true' ]]
-      [[ $(<"$GITHUB_STEP_SUMMARY") == *"(budget $expected)"* ]]
+    for job in linux-x86_64 linux-arm64; do
+      cap=3000000000
+      if [[ $event == pull_request ]]; then
+        cap=300000000
+        if [[ $job == linux-x86_64 && $base_present == true ]]; then cap=400000000; fi
+      fi
+      for override in '' 9000000000 1000000; do
+        budget_case="$scratch/budget-$event-$base_present-$job-${override:-default}"
+        mkdir -p "$budget_case/download"
+        cp -pR "$scratch/working-set/." "$budget_case/download/"
+        setup_case "$budget_case"
+        export EVENT=$event BAZEL_BASE_PRESENT=$base_present BAZEL_CACHE_JOB=$job SNAPSHOT_BUDGET=$override
+        bash -euo pipefail "$body"
+        expected=$cap
+        if [[ -n $override && $override -lt $cap ]]; then expected=$override; fi
+        [[ $(<"$GITHUB_OUTPUT") == $'has-snapshot=false\nhas-snapshot=true' ]]
+        [[ $(<"$GITHUB_STEP_SUMMARY") == *"(budget $expected)"* ]]
+      done
     done
   done
 done

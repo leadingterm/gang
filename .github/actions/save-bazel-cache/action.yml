@@ -127,11 +127,14 @@ runs:
           tools/ci-cache.sh subtract "$staging" "$BAZEL_BASE_MANIFEST"
         fi
         [[ -n $(find "$staging" -type f -print -quit) ]] || no_snapshot
-        # PRs always save a small delta, even without a restored default-branch baseline.
+        # PRs save a small delta, including without a restored default-branch baseline.
         # Callers may lower these compressed-byte caps, never raise them.
         budget=3000000000
         if [[ $EVENT == pull_request ]]; then
           budget=300000000
+          if [[ ${BAZEL_CACHE_JOB:-} == linux-x86_64 && ${BAZEL_BASE_PRESENT:-false} == true ]]; then
+            budget=400000000
+          fi
         fi
         if [[ -n $SNAPSHOT_BUDGET && $SNAPSHOT_BUDGET -lt $budget ]]; then
           budget=$SNAPSHOT_BUDGET

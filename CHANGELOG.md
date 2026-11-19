@@ -9,7 +9,7 @@
 - Run independent leader-failover and database-outage variants concurrently on fresh clusters without shortening lease/fencing windows. Run fleet drained-start checks alongside a separate fresh cold-pair placement, retaining all 28 checks.
 - Accept Gang-issued client-token and local workload-proof TTLs down to 20 seconds without changing production defaults; AWS STS proofs retain their 60-second minimum. Use 25-second tokens and a 60-second absolute browser-session age only in the E2E fixture. The sessions shard weight is an estimate pending measurement; warm-CI and whole-job latency targets are not claimed as measured results.
 - Publish primary-region AMIs before independently completing the regional catalog and retirement.
-- Require successful release validation from same-repository main push CI for the exact release commit; never reuse PR artifacts or caches. Prioritize one bounded x86 Bazel baseline and Nix store with small PR deltas; disable optional architecture caches.
+- Require successful release validation from same-repository main push CI for the exact release commit; never reuse PR artifacts or caches. Prioritize one bounded x86 Bazel baseline and Nix store, allowing a 400 MB PR delta for the measured 316 MB working set; disable optional architecture caches.
 
 ## 0.3.2
 
