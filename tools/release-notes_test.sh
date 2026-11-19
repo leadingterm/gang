@@ -35,7 +35,7 @@ gh() {
       *) return 1 ;;
     esac
   done
-  expected_notes="$COMMIT_MESSAGE"$'\n\n'"Binaries built and tested by CI run $RUN_URL. Public AMIs of each architecture in every image region: gang-amis.json."
+  expected_notes="$COMMIT_MESSAGE"$'\n\n'"Binaries built and tested by CI run $RUN_URL. Primary public AMIs of each architecture: gang-amis.json."
   if [[ $DARWIN == false ]]; then
     expected_notes+=$'\n\n'"The macOS binary is not included in this release."
   fi

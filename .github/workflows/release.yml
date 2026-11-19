@@ -363,7 +363,7 @@ jobs:
         run: |
           message="$(gh api "repos/$GH_REPO/commits/$RELEASE_COMMIT" --jq .commit.message)"
           printf -v notes '%s\n\n%s' "$message" \
-            "Binaries built and tested by CI run $RUN_URL. Public AMIs of each architecture in every image region: gang-amis.json."
+            "Binaries built and tested by CI run $RUN_URL. Primary public AMIs of each architecture: gang-amis.json."
           if [[ ! -f gang-aarch64-apple-darwin ]]; then
             notes+=$'\n\n'"The macOS binary is not included in this release."
           fi
