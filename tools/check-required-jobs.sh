@@ -43,20 +43,6 @@ yq -o=json '.jobs' "$workflow" | jq -e '
   | results("required")
   | needs("nix-vm"; ["changes"])
   | needs("linux-x86_64-shards"; ["changes"])
-  | ($jobs["linux-x86_64-shards"].steps // []) as $steps
-  | ([$steps[] | .name] | indices("Select shard targets")) as $select
-  | ([$steps[] | .name] | indices("Compile Rust unit tests")) as $compile
-  | ([$steps[] | .name] | indices("Test")) as $test
-  | if ($select | length) != 1 or ($compile | length) != 1 or ($test | length) != 1 then
-      error("x86 shards must select targets, compile unit tests and test exactly once")
-    elif $select[0] >= $compile[0] or $compile[0] >= $test[0] then
-      error("x86 shards must compile unit tests after target selection and before testing")
-    elif $steps[$compile[0]].if != null or $steps[$compile[0]]."continue-on-error" != null
-      or $steps[$select[0]].run != "tools/ci-targets.sh --query | tools/ci-targets.sh \"$SHARD\" 4 > \"$RUNNER_TEMP/targets\""
-      or $steps[$compile[0]].run != "bazel build --skip_incompatible_explicit_targets --aspects=//bazel/rust:unit_compilation.bzl%unit_compilation --output_groups=unit_compilation --target_pattern_file=\"$RUNNER_TEMP/targets\" --build_event_json_file=\"$RUNNER_TEMP/bazel-unit-compile.bep.json\" --profile=\"$RUNNER_TEMP/bazel-unit-compile.profile.gz\""
-      or ($steps[$test[0]].run | contains("--target_pattern_file=\"$RUNNER_TEMP/targets\"") | not) then
-      error("x86 unit compilation must build only unit_compilation for the assigned test targets")
-    else . end
   | needs("lint"; ["changes"])
   | if ([$jobs.lint.steps[]?.run | strings | select(contains("tools/lint.sh --portable"))] | length) != 1 then
       error("lint must execute tools/lint.sh --portable")

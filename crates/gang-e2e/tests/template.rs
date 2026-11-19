@@ -1024,8 +1024,11 @@ fn fleets_preset_shortens_cleanup_without_changing_placement_or_polling() -> gan
     let base = base_config()?;
     for sandbox in [Sandbox::Noop, Sandbox::Bwrap] {
         let variant = placement_variant(sandbox);
-        let untuned =
-            typed_rendered(&ConfigTemplate::parse(&base)?.vary(&variant, &launcher(), &tools())?)?;
+        let untuned = typed_rendered(&ConfigTemplate::parse(&base)?.vary(
+            &variant,
+            &launcher(),
+            &tools(),
+        )?)?;
         let tuned = typed_rendered(&ConfigTemplate::parse(&base)?.vary(
             &Variant {
                 control: ControlKnobs::FLEETS,
@@ -1474,6 +1477,36 @@ fn rendered_tls_and_plaintext_configs_parse_as_gang_configs() -> gang_e2e::Resul
     Ok(())
 }
 
+fn check_base_variants(
+    check: &dyn Fn(Variant, Transport, &str) -> gang_e2e::Result<()>,
+) -> gang_e2e::Result<()> {
+    for sandbox in [Sandbox::Noop, Sandbox::Bwrap] {
+        for permit_network in [PermitNetwork::Denied, PermitNetwork::Permitted] {
+            for input_links in [InputLinks::Keep, InputLinks::Break] {
+                for limits in [ActionLimits::Absent, ActionLimits::Cgroup] {
+                    for fleets in [FleetLayout::Single, FleetLayout::Placement] {
+                        for soft_memory in [SoftMemory::Enforced, SoftMemory::Off] {
+                            let variant = Variant {
+                                sandbox,
+                                permit_network,
+                                input_links,
+                                limits,
+                                fleets,
+                                soft_memory,
+                                ..Variant::baseline(sandbox)
+                            };
+                            for transport in [Transport::Plain, Transport::Tls] {
+                                check(variant, transport, "base")?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn every_rendered_variant_parses_with_the_real_plugins() -> gang_e2e::Result<()> {
     let base = base_config()?;
@@ -1504,30 +1537,7 @@ fn every_rendered_variant_parses_with_the_real_plugins() -> gang_e2e::Result<()>
         })
     };
 
-    for sandbox in [Sandbox::Noop, Sandbox::Bwrap] {
-        for permit_network in [PermitNetwork::Denied, PermitNetwork::Permitted] {
-            for input_links in [InputLinks::Keep, InputLinks::Break] {
-                for limits in [ActionLimits::Absent, ActionLimits::Cgroup] {
-                    for fleets in [FleetLayout::Single, FleetLayout::Placement] {
-                        for soft_memory in [SoftMemory::Enforced, SoftMemory::Off] {
-                            let variant = Variant {
-                                sandbox,
-                                permit_network,
-                                input_links,
-                                limits,
-                                fleets,
-                                soft_memory,
-                                ..Variant::baseline(sandbox)
-                            };
-                            for transport in [Transport::Plain, Transport::Tls] {
-                                check(variant, transport, "base")?;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    check_base_variants(&check)?;
     // Exercise each family independently for each sandbox and transport, in addition to the
     // complete base product above, without multiplying the family presets by every base knob.
     for sandbox in [Sandbox::Noop, Sandbox::Bwrap] {
