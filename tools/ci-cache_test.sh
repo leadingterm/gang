@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Exercise cache export and merge using local filesystem fixtures.
+# Exercise cache export, manifest, subtraction, merge and limit using local fixtures.
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
@@ -202,6 +202,71 @@ reject 'limit rejects nonnumeric budget' "$cache" limit "$scratch/limit-under-bu
 mkdir -p "$scratch/limit-symlink/disk/cas/00"
 ln -s "$payload" "$scratch/limit-symlink/disk/cas/00/$key1"
 reject 'limit rejects symlink entries' "$cache" limit "$scratch/limit-symlink" 65536
+
+# Manifest captures all reusable entries regardless of age, but ignores noise and symlinks.
+manifest="$scratch/base-manifest"
+check 'manifest accepts live cache roots' "$cache" manifest "$disk" "$repo" >"$scratch/live-manifest"
+printf '%s\0' \
+  "disk/ac/00/$key1" "disk/ac/00/$key2" "disk/ac/00/$key3" \
+  "disk/cas/00/$key4" "disk/cas/00/$key5" \
+  "repository/content_addressable/sha256/$key1/file" \
+  "repository/content_addressable/sha256/$key1/id-active" \
+  "repository/content_addressable/sha256/$key2/file" \
+  "repository/content_addressable/sha256/$key2/id-boundary" \
+  "repository/content_addressable/sha256/$key3/file" \
+  "repository/content_addressable/sha256/$key3/id-old" >"$scratch/expected-manifest"
+check 'manifest is sorted and contains only reusable entries' cmp -s "$scratch/expected-manifest" "$scratch/live-manifest"
+mkdir -p "$repo/content_addressable/sha256/$key4" "$repo/content_addressable/sha256/$key5"
+printf 'orphan' >"$repo/content_addressable/sha256/$key4/id-orphan"
+ln -s "$repo/content_addressable/sha256/$key1/file" "$repo/content_addressable/sha256/$key5/file"
+printf 'linked payload marker' >"$repo/content_addressable/sha256/$key5/id-linked"
+"$cache" manifest "$disk" "$repo" >"$scratch/no-orphans"
+check 'manifest excludes markers without regular payloads' cmp -s "$scratch/expected-manifest" "$scratch/no-orphans"
+"$cache" manifest "$exported/disk" "$exported/repository" >"$manifest"
+cp "$manifest" "$scratch/base-manifest-before"
+cp -pR "$exported" "$scratch/base-before"
+cp -pR "$exported" "$scratch/delta"
+printf 'new CAS\n' >"$scratch/delta/disk/cas/00/$key6"
+printf 'new marker\n' >"$scratch/delta/repository/content_addressable/sha256/$key2/id-new"
+check 'subtract accepts valid base manifest' "$cache" subtract "$scratch/delta" "$manifest"
+check 'subtract removes duplicate action' test ! -e "$scratch/delta/disk/ac/00/$key1"
+check 'subtract removes duplicate CAS' test ! -e "$scratch/delta/disk/cas/00/$key4"
+check 'subtract keeps new CAS' test -f "$scratch/delta/disk/cas/00/$key6"
+check 'subtract removes whole base repository unit' test ! -e "$scratch/delta/repository/content_addressable/sha256/$key1"
+check 'new marker keeps repository payload and old marker' cmp -s \
+  "$exported/repository/content_addressable/sha256/$key2/file" \
+  "$scratch/delta/repository/content_addressable/sha256/$key2/file"
+check 'new marker keeps old marker' test -f "$scratch/delta/repository/content_addressable/sha256/$key2/id-boundary"
+check 'new marker remains' test -f "$scratch/delta/repository/content_addressable/sha256/$key2/id-new"
+check 'base cache remains unchanged' diff -r "$scratch/base-before" "$exported"
+check 'base manifest remains unchanged' cmp -s "$scratch/base-manifest-before" "$manifest"
+cp -pR "$exported" "$scratch/all-base"
+check 'all-base subtraction succeeds' "$cache" subtract "$scratch/all-base" "$manifest"
+check 'all-base subtraction leaves no files' test -z "$(find "$scratch/all-base" -type f -print)"
+check 'empty delta retains disk root' test -d "$scratch/all-base/disk"
+check 'empty delta retains repository root' test -d "$scratch/all-base/repository/content_addressable"
+: >"$scratch/empty-manifest"
+cp -pR "$exported" "$scratch/no-base"
+check 'empty manifest subtracts nothing' "$cache" subtract "$scratch/no-base" "$scratch/empty-manifest"
+check 'empty manifest retains all files' diff -r "$exported" "$scratch/no-base"
+reject 'manifest requires both roots' "$cache" manifest "$disk"
+reject 'manifest rejects filesystem root' "$cache" manifest / "$repo"
+reject 'manifest rejects root traversal' "$cache" manifest "$scratch/path-component/../disk input" "$repo"
+ln -s "$disk" "$scratch/disk-link"
+reject 'manifest rejects symlink root' "$cache" manifest "$scratch/disk-link" "$repo"
+reject 'subtract rejects staging root symlink' "$cache" subtract "$scratch/disk-link" "$manifest"
+ln -s "$manifest" "$scratch/manifest-link"
+reject 'subtract rejects manifest symlink' "$cache" subtract "$scratch/no-base" "$scratch/manifest-link"
+reject 'subtract rejects staging symlink entries' "$cache" subtract "$scratch/limit-symlink" "$manifest"
+reject 'subtract rejects traversal in staging root' "$cache" subtract "$scratch/path-component/../no-base" "$manifest"
+for invalid in "/disk/ac/00/$key1" "disk/../disk/ac/00/$key1" \
+  "disk/ac/ff/$key1" "disk/tmp/$key1" "repository/content_addressable/sha256/$key1" ""; do
+  printf '%s\0' "$invalid" >"$scratch/invalid-manifest"
+  reject 'subtract rejects invalid manifest path' "$cache" subtract "$scratch/no-base" "$scratch/invalid-manifest"
+done
+printf 'disk/ac/00/%s' "$key1" >"$scratch/invalid-manifest"
+reject 'subtract rejects unterminated manifest' "$cache" subtract "$scratch/no-base" "$scratch/invalid-manifest"
+check 'invalid manifests do not mutate stage' diff -r "$exported" "$scratch/no-base"
 
 printf '%d cases, %d failures\n' "$cases" "$failures"
 exit "$((failures > 0))"

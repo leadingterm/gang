@@ -32,6 +32,7 @@ expect() {
 
 jobs=$(yq -o=json '.jobs' "$workflow")
 expect success 'macos is informational' jq -e '(.macos | type) == "object" and (.required.needs | index("macos") == null)' <<<"$jobs"
+expect success 'x86 cache is informational' jq -e '(.["cache-x86_64"] | type) == "object" and (.required.needs | index("cache-x86_64") == null)' <<<"$jobs"
 
 expect success 'current workflow coverage' "$guard" "$workflow"
 cp "$workflow" "$fixture"
@@ -40,6 +41,12 @@ expect failure 'removed dependency' "$guard" "$fixture"
 cp "$workflow" "$fixture"
 yq -i '.jobs.required.needs += ["macos"] | (.jobs.required.steps[] | select(.env.NEEDS_RESULTS != null) | .env.NEEDS_RESULTS) |= sub("needs[.]lint[.]result", "needs.lint.result, needs.macos.result")' "$fixture"
 expect failure 'macos cannot be a required dependency' "$guard" "$fixture"
+cp "$workflow" "$fixture"
+yq -i '.jobs.required.needs += ["cache-x86_64"] | (.jobs.required.steps[] | select(.env.NEEDS_RESULTS != null) | .env.NEEDS_RESULTS) |= sub("needs[.]lint[.]result", "needs.lint.result, needs.cache-x86_64.result")' "$fixture"
+expect failure 'x86 cache cannot be a required dependency' "$guard" "$fixture"
+cp "$workflow" "$fixture"
+yq -i '.jobs.linux-x86_64.steps += [{"uses": "actions/checkout@fixture"}]' "$fixture"
+expect failure 'x86 aggregator cannot run extra steps' "$guard" "$fixture"
 cp "$workflow" "$fixture"
 yq -i '.jobs.guard_fixture."runs-on" = "ubuntu-latest" | .jobs.guard_fixture.steps = [{"run": "true"}]' "$fixture"
 expect failure 'new job without dependency' "$guard" "$fixture"
@@ -55,6 +62,33 @@ for dependency in changes linux-x86_64-shards; do
   cp "$workflow" "$fixture"
   dependency="$dependency" yq -i 'del(.jobs.linux-x86_64.needs[] | select(. == strenv(dependency)))' "$fixture"
   expect failure "linux-x86_64 missing $dependency prerequisite" "$guard" "$fixture"
+done
+for dependency in changes linux-x86_64-shards; do
+  cp "$workflow" "$fixture"
+  dependency="$dependency" yq -i 'del(.jobs.cache-x86_64.needs[] | select(. == strenv(dependency)))' "$fixture"
+  expect failure "cache-x86_64 missing $dependency prerequisite" "$guard" "$fixture"
+done
+for dependency in changes linux-arm64-bundle linux-arm64-checks; do
+  cp "$workflow" "$fixture"
+  dependency="$dependency" yq -i 'del(.jobs.linux-arm64.needs[] | select(. == strenv(dependency)))' "$fixture"
+  expect failure "linux-arm64 missing $dependency prerequisite" "$guard" "$fixture"
+done
+for dependency in changes linux-arm64-bundle; do
+  cp "$workflow" "$fixture"
+  dependency="$dependency" yq -i 'del(.jobs.linux-arm64-checks.needs[] | select(. == strenv(dependency)))' "$fixture"
+  expect failure "linux-arm64-checks missing $dependency prerequisite" "$guard" "$fixture"
+done
+for job in e2e-gate-1-shards e2e-gate-2-shards; do
+  for dependency in changes linux-arm64-bundle; do
+    cp "$workflow" "$fixture"
+    job="$job" dependency="$dependency" yq -i 'del(.jobs[strenv(job)].needs[] | select(. == strenv(dependency)))' "$fixture"
+    expect failure "$job missing $dependency prerequisite" "$guard" "$fixture"
+  done
+done
+for job in linux-arm64 linux-arm64-bundle linux-arm64-checks; do
+  cp "$workflow" "$fixture"
+  job="$job" yq -i 'del(.jobs.required.needs[] | select(. == strenv(job)))' "$fixture"
+  expect failure "required missing $job" "$guard" "$fixture"
 done
 for job in e2e-gate-1 e2e-gate-2; do
   for dependency in changes "$job-shards"; do
@@ -73,13 +107,13 @@ cp "$workflow" "$fixture"
 yq -i 'del(.jobs.changes)' "$fixture"
 expect failure 'missing changes job' "$guard" "$fixture"
 cp "$workflow" "$fixture"
-yq -i 'del(.jobs.linux-arm64.needs)' "$fixture"
+yq -i 'del(.jobs.linux-arm64-bundle.needs)' "$fixture"
 expect failure 'heavy leaf missing changes dependency' "$guard" "$fixture"
 cp "$workflow" "$fixture"
 yq -i 'del(.jobs.e2e-gate-1-shards.needs[] | select(. == "changes"))' "$fixture"
 expect failure 'e2e leaf missing changes dependency' "$guard" "$fixture"
 
-for job in lint linux-x86_64 e2e-gate-1 e2e-gate-2 required; do
+for job in lint linux-x86_64 linux-arm64 e2e-gate-1 e2e-gate-2 required; do
   cp "$workflow" "$fixture"
   job="$job" yq -i '.jobs[strenv(job)].if = "success()"' "$fixture"
   expect failure "conditional $job aggregator" "$guard" "$fixture"
@@ -87,7 +121,7 @@ done
 
 # Execute the actual workflow body with Nix flake tools to test runner behavior.
 
-for job in lint linux-x86_64 e2e-gate-1 e2e-gate-2 required; do
+for job in lint linux-x86_64 linux-arm64 e2e-gate-1 e2e-gate-2 required; do
   body="$scratch/$job.sh"
   jq -er --arg job "$job" '
     [.[$job].steps[] | select(.env.NEEDS_RESULTS != null) | .run]

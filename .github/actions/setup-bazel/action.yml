@@ -85,6 +85,13 @@ runs:
           ${{ steps.name.outputs.default }}
           ${{ steps.name.outputs.v2-default }}
           ${{ steps.name.outputs.v2-platform }}
+    - name: Record trusted Bazel baseline
+      if: github.event_name == 'pull_request' && runner.os == 'Linux'
+      shell: bash
+      run: |
+        manifest="$RUNNER_TEMP/bazel-base-manifest"
+        nix develop -c tools/ci-cache.sh manifest "$BAZEL_DISK_CACHE" "$BAZEL_REPOSITORY_CACHE" > "$manifest"
+        echo "BAZEL_BASE_MANIFEST=$manifest" >> "$GITHUB_ENV"
     - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       id: pr
       if: github.event_name == 'pull_request'

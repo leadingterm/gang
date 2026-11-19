@@ -19,9 +19,9 @@ yq -o=json '.jobs' "$workflow" | jq -e '
     | if ($needs | type) != "array" or any($needs[]; type != "string") then
         error("required.needs must be an array of job IDs")
       else
-        (($jobs | keys - ["required", "macos"]) - $needs) as $missing
-        | if ($needs | index("macos")) != null then
-            error("required must not depend on informational macos")
+        (($jobs | keys - ["required", "macos", "cache-x86_64"]) - $needs) as $missing
+        | if any(["macos", "cache-x86_64"][]; . as $id | ($needs | index($id)) != null) then
+            error("required must not depend on informational jobs")
           elif ($missing | length) > 0 then
             error("required job is missing dependencies: " + ($missing | join(", ")))
           else
@@ -38,7 +38,7 @@ yq -o=json '.jobs' "$workflow" | jq -e '
                   .
                 end
               |
-              reduce ["lint", "linux-x86_64", "e2e-gate-1", "e2e-gate-2", "required"][] as $job (true;
+              reduce ["lint", "linux-x86_64", "linux-arm64", "e2e-gate-1", "e2e-gate-2", "required"][] as $job (true;
                 if ($jobs[$job] | if type == "object" then .if else null end) == "always()" then
                   .
                 else
@@ -50,6 +50,27 @@ yq -o=json '.jobs' "$workflow" | jq -e '
                 elif ($jobs["linux-x86_64"].needs | if type == "array" then sort else . end)
                      != ["changes", "linux-x86_64-shards"] then
                   error("linux-x86_64 must depend on changes and all shards")
+                elif ($jobs["linux-x86_64"].steps | type) != "array"
+                     or ($jobs["linux-x86_64"].steps | length) != 1
+                     or ($jobs["linux-x86_64"].steps[0].uses != null)
+                     or ($jobs["linux-x86_64"].steps[0].run | type) != "string"
+                     or ($jobs["linux-x86_64"].steps[0].env.NEEDS_RESULTS | type) != "string" then
+                  error("linux-x86_64 must contain only its status check")
+                elif ($jobs["cache-x86_64"].needs | if type == "array" then sort else . end)
+                     != ["changes", "linux-x86_64-shards"] then
+                  error("cache-x86_64 must depend on changes and all shards")
+                elif ($jobs["linux-arm64"].needs | if type == "array" then sort else . end)
+                     != ["changes", "linux-arm64-bundle", "linux-arm64-checks"] then
+                  error("linux-arm64 must depend on changes, bundle, and checks")
+                elif ($jobs["linux-arm64-checks"].needs | if type == "array" then sort else . end)
+                     != ["changes", "linux-arm64-bundle"] then
+                  error("linux-arm64-checks must depend on changes and bundle")
+                elif ($jobs["linux-arm64-bundle"] | type) != "object" then
+                  error("workflow must contain linux-arm64-bundle")
+                elif any(["e2e-gate-1-shards", "e2e-gate-2-shards"][];
+                         ($jobs[.].needs | if type == "array" then sort else . end)
+                         != ["changes", "linux-arm64-bundle"]) then
+                  error("e2e shards must depend on changes and linux-arm64-bundle")
                 elif ($jobs["e2e-gate-1"].needs | if type == "array" then sort else . end)
                      != ["changes", "e2e-gate-1-shards"] then
                   error("e2e-gate-1 must depend on changes and all shards")
@@ -59,7 +80,7 @@ yq -o=json '.jobs' "$workflow" | jq -e '
                 else
                   .
                 end
-              | reduce (($jobs | keys) - ["changes", "lint", "linux-x86_64", "e2e-gate-1", "e2e-gate-2", "required"])[] as $job (.;
+              | reduce (($jobs | keys) - ["changes", "lint", "linux-x86_64", "linux-arm64", "e2e-gate-1", "e2e-gate-2", "required"])[] as $job (.;
                   ($jobs[$job].needs // []) as $deps
                   | if ($jobs[$job] | type) == "object"
                        and ($deps == "changes" or (($deps | type) == "array" and ($deps | index("changes")) != null)) then

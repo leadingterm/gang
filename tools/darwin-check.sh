@@ -9,7 +9,7 @@
 set -euo pipefail
 scratch=$(mktemp -d)
 trap 'chmod -R u+w "$scratch" && rm -rf "$scratch"' EXIT
-export CARGO_HOME=$scratch/cargo CARGO_TARGET_DIR=$scratch/target
+export CARGO_HOME="${CARGO_HOME:-$scratch/cargo}" CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$scratch/target}"
 rsync -a --exclude=/.git --filter=':- .gitignore' ./ "$scratch/src/"
 mkdir "$scratch/dist"
 cd "$scratch/src"

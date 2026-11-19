@@ -4,7 +4,7 @@
 
 ### Changed
 
-- Partition the Linux x86-64 CI suite and share bounded native GitHub cache snapshots.
+- Partition the Linux x86-64 and end-to-end CI suites, start ARM end-to-end checks after the bundle build, and share bounded native GitHub cache snapshots.
 
 ## 0.3.1
 

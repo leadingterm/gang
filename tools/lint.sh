@@ -12,6 +12,7 @@ portable() {
   tools/ci-targets_test.sh
   tools/ci-cache_test.sh
   tools/ci-cache-policy_test.sh
+  tools/ci-cache-fanin_test.sh
   tools/release-notes_test.sh
   tools/release-ci_test.sh
   alejandra --check .
@@ -35,7 +36,7 @@ nix_vm() {
     return 1
   fi
   local names name
-  local -a checks=()
+  local -a checks=() link_args=(--no-link)
   names=$(nix eval --json .#checks.x86_64-linux --apply builtins.attrNames | jq -er '.[]')
   if [[ -z $names ]]; then
     echo 'No x86_64-linux Nix checks found.' >&2
@@ -44,7 +45,10 @@ nix_vm() {
   while IFS= read -r name; do
     checks+=(".#checks.x86_64-linux.$name")
   done <<< "$names"
-  nix build --no-link --print-build-logs "${checks[@]}"
+  if [[ -n ${NIX_CHECK_RESULTS:-} ]]; then
+    link_args=(--out-link "$NIX_CHECK_RESULTS")
+  fi
+  nix build "${link_args[@]}" --print-build-logs "${checks[@]}"
 }
 
 if (( $# == 0 )); then

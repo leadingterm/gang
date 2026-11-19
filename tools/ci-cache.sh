@@ -117,6 +117,83 @@ case ${1-} in
       done <"$scratch/files"
     fi
     ;;
+  manifest)
+    (( $# == 3 )) || fail 'usage: manifest DISK_CACHE REPOSITORY_CACHE'
+    disk=$(canonical "$2"); repo=$(canonical "$3")
+    [[ $disk != / && $repo != / ]] || fail 'cache paths must not be filesystem root'
+    : >"$scratch/manifest"
+    if [[ -e $disk ]]; then
+      [[ -d $disk ]] || fail "not a directory: $disk"
+      find "$disk" -type f -print0 >"$scratch/files"
+      while IFS= read -r -d '' file; do
+        rel=disk/${file#"$disk"/}
+        classify "$rel" f
+        [[ $kind == ac || $kind == cas ]] || continue
+        printf '%s\0' "$rel" >>"$scratch/manifest"
+      done <"$scratch/files"
+    fi
+    if [[ -e $repo ]]; then
+      [[ -d $repo ]] || fail "not a directory: $repo"
+      find "$repo" -type f -print0 >"$scratch/files"
+      while IFS= read -r -d '' file; do
+        rel=repository/${file#"$repo"/}
+        classify "$rel" f
+        [[ $kind == repo && -f ${file%/*}/file && ! -L ${file%/*}/file ]] || continue
+        printf '%s\0' "$rel" >>"$scratch/manifest"
+      done <"$scratch/files"
+    fi
+    sort -zu "$scratch/manifest"
+    ;;
+  subtract)
+    (( $# == 3 )) || fail 'usage: subtract STAGING BASE_MANIFEST'
+    dest=$(canonical "$2"); base=$(canonical "$3")
+    separate "$dest" "$base"
+    [[ -f $base ]] || fail "invalid manifest: $base"
+    validate_tree "$dest"
+    : >"$scratch/base"
+    while IFS= read -r -d '' rel; do
+      [[ -n $rel && $rel != /* ]] || fail "invalid manifest entry: $rel"
+      path_ok "$rel"
+      classify "$rel" f
+      [[ -n $kind ]] || fail "invalid manifest entry: $rel"
+      printf '%s\0' "$rel" >>"$scratch/base"
+    done <"$base"
+    [[ -z $rel ]] || fail 'unterminated manifest entry'
+    sort -zu "$scratch/base" -o "$scratch/base"
+    find "$dest" -type f -printf '%P\0' | sort -z >"$scratch/staged"
+    comm -z -12 "$scratch/staged" "$scratch/base" >"$scratch/shared"
+    comm -z -23 "$scratch/staged" "$scratch/base" >"$scratch/new"
+    while IFS= read -r -d '' rel; do
+      classify "$rel" f
+      if [[ $kind == ac || $kind == cas ]]; then
+        rm -- "$dest/$rel"
+      fi
+    done <"$scratch/shared"
+    # A repository checksum is atomic: any new member retains the whole unit.
+    : >"$scratch/repo-shared"
+    : >"$scratch/repo-new"
+    while IFS= read -r -d '' rel; do
+      [[ $rel == repository/*/file ]] || continue
+      printf '%s\0' "${rel%/*}" >>"$scratch/repo-shared"
+    done <"$scratch/shared"
+    while IFS= read -r -d '' rel; do
+      [[ $rel == repository/* ]] || continue
+      printf '%s\0' "${rel%/*}" >>"$scratch/repo-new"
+    done <"$scratch/new"
+    sort -zu "$scratch/repo-shared" -o "$scratch/repo-shared"
+    sort -zu "$scratch/repo-new" -o "$scratch/repo-new"
+    comm -z -23 "$scratch/repo-shared" "$scratch/repo-new" >"$scratch/repo-remove"
+    while IFS= read -r -d '' dir; do
+      rm -r -- "${dest:?}/${dir:?}"
+    done <"$scratch/repo-remove"
+    if [[ -d $dest/disk ]]; then
+      find "$dest/disk" -depth -mindepth 1 -type d -empty -delete
+    fi
+    if [[ -d $dest/repository/content_addressable ]]; then
+      find "$dest/repository/content_addressable" -depth -mindepth 1 -type d -empty -delete
+    fi
+    mkdir -p -- "$dest/disk" "$dest/repository/content_addressable"
+    ;;
   merge)
     (( $# >= 3 )) || fail 'usage: merge DESTINATION SOURCE...'
     dest=$(canonical "$2"); shift 2
@@ -215,5 +292,5 @@ case ${1-} in
     printf 'ci-cache: compressed bytes before=%s after=%s limit=%s\n' "$before" "$bytes" "$max" >&2
     (( bytes <= max )) || fail 'cache cannot fit limit'
     ;;
-  *) fail 'usage: ci-cache.sh {export|merge|limit} ...' ;;
+  *) fail 'usage: ci-cache.sh {export|manifest|subtract|merge|limit} ...' ;;
 esac
