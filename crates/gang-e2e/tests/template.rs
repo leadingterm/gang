@@ -1021,11 +1021,12 @@ fn launch_failure_preset_sets_missing_launcher_and_short_timeout() -> gang_e2e::
 
 #[test]
 fn fleets_preset_shortens_cleanup_without_changing_placement_or_polling() -> gang_e2e::Result<()> {
-    let base = ConfigTemplate::parse(&base_config()?)?;
+    let base = base_config()?;
     for sandbox in [Sandbox::Noop, Sandbox::Bwrap] {
         let variant = placement_variant(sandbox);
-        let untuned = typed_rendered(&base.vary(&variant, &launcher(), &tools())?)?;
-        let tuned = typed_rendered(&base.vary(
+        let untuned =
+            typed_rendered(&ConfigTemplate::parse(&base)?.vary(&variant, &launcher(), &tools())?)?;
+        let tuned = typed_rendered(&ConfigTemplate::parse(&base)?.vary(
             &Variant {
                 control: ControlKnobs::FLEETS,
                 ..variant
@@ -1062,9 +1063,9 @@ fn fleets_preset_shortens_cleanup_without_changing_placement_or_polling() -> gan
 
 #[test]
 fn drain_cancel_bounds_only_its_drain_and_termination_waits() -> gang_e2e::Result<()> {
-    let base = ConfigTemplate::parse(&base_config()?)?;
+    let base = base_config()?;
     let variant = placement_variant(Sandbox::Noop);
-    let tuned = typed_rendered(&base.vary(
+    let tuned = typed_rendered(&ConfigTemplate::parse(&base)?.vary(
         &Variant {
             control: ControlKnobs::DRAIN_CANCEL,
             ..variant
@@ -1083,7 +1084,8 @@ fn drain_cancel_bounds_only_its_drain_and_termination_waits() -> gang_e2e::Resul
         assert_eq!(fleet.min_instances, 0);
         assert_eq!(fleet.max_instances.get(), 1);
     }
-    let untuned = typed_rendered(&base.vary(&variant, &launcher(), &tools())?)?;
+    let untuned =
+        typed_rendered(&ConfigTemplate::parse(&base)?.vary(&variant, &launcher(), &tools())?)?;
     assert_eq!(tuned.client_action_timeout, untuned.client_action_timeout);
     for fleet in &untuned.fleets {
         assert_eq!(fleet.max_drain_wait, std::time::Duration::from_mins(1));

@@ -87,6 +87,20 @@ expect failure 'release results cannot omit ARM validation' "$guard" "$fixture"
 cp "$workflow" "$fixture"
 yq -i '.jobs.linux-x86_64-shards.needs = ["changes", "linux-arm64"]' "$fixture"
 expect failure 'x86 shards cannot transitively require optional ARM jobs' "$guard" "$fixture"
+for mutation in missing before-selection after-test additive default other-target test-other-target skipped; do
+  cp "$workflow" "$fixture"
+  case "$mutation" in
+    missing) yq -i 'del(.jobs.linux-x86_64-shards.steps[] | select(.name == "Compile Rust unit tests"))' "$fixture" ;;
+    before-selection) yq -i '.jobs.linux-x86_64-shards.steps |= (map(select(.name == "Compile Rust unit tests")) + map(select(.name != "Compile Rust unit tests")))' "$fixture" ;;
+    after-test) yq -i '.jobs.linux-x86_64-shards.steps |= (map(select(.name != "Compile Rust unit tests")) + map(select(.name == "Compile Rust unit tests")))' "$fixture" ;;
+    additive) yq -i '(.jobs.linux-x86_64-shards.steps[] | select(.name == "Compile Rust unit tests") | .run) |= sub("--output_groups=unit_compilation", "--output_groups=+unit_compilation")' "$fixture" ;;
+    default) yq -i '(.jobs.linux-x86_64-shards.steps[] | select(.name == "Compile Rust unit tests") | .run) |= sub("--output_groups=unit_compilation", "--output_groups=unit_compilation,default")' "$fixture" ;;
+    other-target) yq -i '(.jobs.linux-x86_64-shards.steps[] | select(.name == "Compile Rust unit tests") | .run) |= sub("RUNNER_TEMP/targets", "RUNNER_TEMP/other-targets")' "$fixture" ;;
+    test-other-target) yq -i '(.jobs.linux-x86_64-shards.steps[] | select(.name == "Test") | .run) |= sub("RUNNER_TEMP/targets", "RUNNER_TEMP/other-targets")' "$fixture" ;;
+    skipped) yq -i '(.jobs.linux-x86_64-shards.steps[] | select(.name == "Compile Rust unit tests") | .if) = "false"' "$fixture" ;;
+  esac
+  expect failure "unit compilation rejects $mutation" "$guard" "$fixture"
+done
 for job in lint linux-x86_64-bundle e2e-gate-1-shards e2e-gate-2-shards; do
   cp "$workflow" "$fixture"
   job="$job" yq -i '.jobs[strenv(job)]."runs-on" = "ubuntu-24.04-arm"' "$fixture"

@@ -103,6 +103,8 @@ jobs:
         env:
           SHARD: ${{ matrix.shard }}
         run: tools/ci-targets.sh --query | tools/ci-targets.sh "$SHARD" 4 > "$RUNNER_TEMP/targets"
+      - name: Compile Rust unit tests
+        run: bazel build --skip_incompatible_explicit_targets --aspects=//bazel/rust:unit_compilation.bzl%unit_compilation --output_groups=unit_compilation --target_pattern_file="$RUNNER_TEMP/targets" --build_event_json_file="$RUNNER_TEMP/bazel-unit-compile.bep.json" --profile="$RUNNER_TEMP/bazel-unit-compile.profile.gz"
       - name: Test
         timeout-minutes: 55
         run: bazel test --skip_incompatible_explicit_targets --target_pattern_file="$RUNNER_TEMP/targets" --build_event_json_file="$RUNNER_TEMP/bazel-test.bep.json" --profile="$RUNNER_TEMP/bazel-test.profile.gz"

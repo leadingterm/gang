@@ -15,6 +15,7 @@ flags=(--compilation_mode=opt --remote_cache= --remote_executor=)
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 BAZEL="$bazel" tools/ci-targets.sh --query | tools/ci-targets.sh 1 1 >"$scratch/targets"
+"$bazel" build "${flags[@]}" --skip_incompatible_explicit_targets --aspects=//bazel/rust:unit_compilation.bzl%unit_compilation --output_groups=unit_compilation --target_pattern_file="$scratch/targets"
 "$bazel" test "${flags[@]}" --skip_incompatible_explicit_targets --target_pattern_file="$scratch/targets"
 "$bazel" build "${flags[@]}" //crates/gang-e2e:bundle
 bundle=$(dirname "$("$bazel" cquery "${flags[@]}" --output=files //crates/gang-e2e:bundle/local)")
