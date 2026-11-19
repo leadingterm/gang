@@ -554,13 +554,10 @@ impl Publication {
             now,
         })
     }
-    fn ordered_regions(&self) -> impl Iterator<Item = (&Region, &RegionImages)> {
-        self.regions.0.get_key_value(&self.home).into_iter().chain(
-            self.regions
-                .0
-                .iter()
-                .filter(move |(region, _)| *region != &self.home),
-        )
+    fn ordered_regions(&self) -> Vec<(&Region, &RegionImages)> {
+        let mut regions: Vec<_> = self.regions.0.iter().collect();
+        regions.sort_by_key(|(r, _)| (*r != &self.home, *r));
+        regions
     }
     fn validate(&self) -> Result<()> {
         let mut identities: BTreeMap<(String, Architecture), String> = BTreeMap::new();
@@ -959,12 +956,11 @@ impl Publication {
     pub fn release_steps(&self) -> Result<Vec<Step>> {
         let release = self.release.as_ref().ok_or(DeployError::NoRelease)?;
         self.validate()?;
-        let mut images_iter = release
+        let names: Vec<_> = release
             .images
             .iter()
-            .map(|(arch, sha)| (*arch, sha, AmiName::new(*arch, sha)));
-        let names: [Option<_>; Architecture::ALL.len()] =
-            std::array::from_fn(|_| images_iter.next());
+            .map(|(arch, sha)| (*arch, sha, AmiName::new(*arch, sha)))
+            .collect();
         for (region, data) in self.ordered_regions() {
             let public = data.images.public_other
                 + data
@@ -975,7 +971,6 @@ impl Publication {
                     .count();
             let new = names
                 .iter()
-                .flatten()
                 .filter(|(_, _, name)| {
                     !data
                         .images
@@ -1005,7 +1000,7 @@ impl Publication {
         self.uploads(home, &mut push);
         let successors = BTreeMap::new();
         for (region, data) in self.ordered_regions() {
-            for (arch, sha, name) in names.iter().flatten() {
+            for (arch, sha, name) in &names {
                 if region != &self.home
                     && !data.images.images.iter().any(|image| image.name == name.0)
                     && let Some(image) =
@@ -1027,11 +1022,7 @@ impl Publication {
                 }
             }
             for image in &data.images.images {
-                if names
-                    .iter()
-                    .flatten()
-                    .any(|(_, _, name)| image.name == name.0)
-                {
+                if names.iter().any(|(_, _, name)| image.name == name.0) {
                     self.image_steps(region, image, &successors, &successors, &mut push)?;
                 }
             }
@@ -1240,6 +1231,7 @@ mod tests {
         p.home = "z-1".parse().unwrap();
         assert_eq!(
             p.ordered_regions()
+                .into_iter()
                 .map(|(region, _)| region.as_str())
                 .collect::<Vec<_>>(),
             vec!["z-1", "a-1", "b-1", "c-1"]
@@ -1247,6 +1239,7 @@ mod tests {
         p.regions.0.remove(&p.home);
         assert_eq!(
             p.ordered_regions()
+                .into_iter()
                 .map(|(region, _)| region.as_str())
                 .collect::<Vec<_>>(),
             vec!["a-1", "b-1", "c-1"]
