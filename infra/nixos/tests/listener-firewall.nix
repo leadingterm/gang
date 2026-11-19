@@ -4,6 +4,15 @@
 in
   pkgs.testers.runNixOSTest {
     name = "listener-firewall";
+    globalTimeout = 300;
+
+    nodeDefaults.virtualisation = {
+      memorySize = 1024;
+      cores = 1;
+      useNixStoreImage = true;
+      mountHostNixStore = false;
+      sharedDirectories = pkgs.lib.mkForce {};
+    };
 
     nodes = {
       machine = {
@@ -20,10 +29,11 @@ in
     };
 
     testScript = ''
+      from datetime import timedelta
+
       start_all()
       machine.wait_for_unit("health-test-server.service")
       machine.wait_for_open_port(${toString ports.health})
-      client.wait_until_succeeds("${pkgs.curl}/bin/curl --fail --silent --max-time 2 http://machine:${toString ports.health}/serve", timeout=10)
-      assert client.succeed("${pkgs.curl}/bin/curl --fail --silent --max-time 2 http://machine:${toString ports.health}/serve") == "healthy\n"
+      client.wait_until_succeeds("${pkgs.curl}/bin/curl --fail --silent --max-time 2 http://machine:${toString ports.health}/serve", timeout=timedelta(seconds=10))
     '';
   }

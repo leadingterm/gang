@@ -1,40 +1,45 @@
 //! Leadership: the leader lease taken, held and released on the injected clock, and the
 //! validity of the fence that controls what the leader may still change.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use gang_clock::{Clock, Tick};
+use gang_clock::{Clock, Tick, Timestamp};
 use gang_config::LeadershipConfig;
 use gang_spi::{
     Acquisition, ControllerId, Fence, Keeper, LeaderLeasePort, Lease, PortError, Renewal,
 };
 
 /// The `stale_before` under which no lease counts as stale, so only a released lease is free.
-const ONLY_RELEASED: gang_clock::Timestamp = gang_clock::Timestamp::from_unix_millis(0);
+const ONLY_RELEASED: Timestamp = Timestamp::from_unix_millis(0);
 
-/// Whether this controller leads: set once when it takes the lease and never cleared, since a
-/// leader that loses the lease hands off and exits. Requests read it to serve a leader route
-/// locally or forward it to the leader.
+/// Whether this controller leads, and since when: set once when its term starts, after it takes
+/// the lease and its cache baseline, and never cleared, since a leader that loses the lease hands
+/// off and exits. Requests read it to serve a leader route locally or forward it to the leader;
+/// ingest reads the start to tell a follower's traffic of this term from traffic it counted
+/// before.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Leading(Arc<LeadingState>);
 
 #[derive(Debug, Default)]
 struct LeadingState {
-    leading: std::sync::atomic::AtomicBool,
+    start: OnceLock<Timestamp>,
     changed: tokio::sync::Notify,
 }
 
 impl Leading {
     /// Whether this controller leads.
     pub(crate) fn get(&self) -> bool {
-        self.0.leading.load(std::sync::atomic::Ordering::Acquire)
+        self.0.start.get().is_some()
     }
 
-    /// Records that this controller leads.
-    pub(crate) fn set(&self) {
-        self.0
-            .leading
-            .store(true, std::sync::atomic::Ordering::Release);
+    /// The wall time this controller began leading, once it leads.
+    pub(crate) fn start(&self) -> Option<Timestamp> {
+        self.0.start.get().copied()
+    }
+
+    /// Records that this controller leads since `at`. Only the first call sets the start.
+    pub(crate) fn set(&self, at: Timestamp) {
+        let _ = self.0.start.set(at);
         self.0.changed.notify_waiters();
     }
 
@@ -179,11 +184,7 @@ impl<'a, L: LeaderLeasePort, C: Clock + 'static> Leadership<'a, L, C> {
     }
 
     /// One renewal, bounded by `renew_interval`.
-    async fn renew(
-        &self,
-        lease: &Lease,
-        expires_at: gang_clock::Timestamp,
-    ) -> Result<Renewal, PortError> {
+    async fn renew(&self, lease: &Lease, expires_at: Timestamp) -> Result<Renewal, PortError> {
         self.clock
             .timeout(
                 self.config.renew_interval.get(),

@@ -3,11 +3,15 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use gang_clock::Timestamp;
 use gang_insight::{IngestError, Outbox, OutboxError, Outcome, decode};
-use gang_spi::{Call, CallOutcome, Executed, ExecutionTimes, Observation, Origin, Rpc};
+use gang_spi::{
+    Call, CallOutcome, Executed, ExecutionTimes, Observation, Origin, Rpc, Traffic, Transferred,
+};
 use gang_types::BuildKey;
 use gang_wire::{
     IngestBuildsRequest, IngestCall, IngestLoss, IngestOrigin, IngestOutcome, IngestRpc,
+    IngestTraffic,
 };
 
 fn origin(principal: &str, invocation: &str) -> Result<Origin, Box<dyn std::error::Error>> {
@@ -27,6 +31,7 @@ fn call(origin: &Origin, rpc: Rpc, outcome: CallOutcome) -> Call {
         origin: origin.clone(),
         rpc,
         outcome,
+        transferred: Transferred::default(),
     }
 }
 fn outbox(keys: usize, bytes: usize) -> Result<Outbox, Box<dyn std::error::Error>> {
@@ -36,7 +41,17 @@ fn outbox(keys: usize, bytes: usize) -> Result<Outbox, Box<dyn std::error::Error
     )?)
 }
 fn frame() -> Result<usize, Box<dyn std::error::Error>> {
-    Ok(serde_json::to_vec(&IngestBuildsRequest::default())?.len() + 20)
+    let request = IngestBuildsRequest {
+        traffic: Some(IngestTraffic {
+            start_time: Timestamp::END_OF_TIME,
+            lookups: u64::MAX,
+            hits: u64::MAX,
+            uploaded_bytes: u64::MAX,
+            downloaded_bytes: u64::MAX,
+        }),
+        ..IngestBuildsRequest::default()
+    };
+    Ok(serde_json::to_vec(&request)?.len() + 20)
 }
 fn wire_origin(origin: &Origin) -> IngestOrigin {
     IngestOrigin {
@@ -55,6 +70,8 @@ fn call_cost(origin: &Origin) -> Result<usize, Box<dyn std::error::Error>> {
             origin: u32::MAX,
             rpc: IngestRpc::Execute,
             outcome: IngestOutcome::Ok,
+            uploaded_bytes: 0,
+            downloaded_bytes: 0,
         })?
         .len()
         + 1)
@@ -123,10 +140,16 @@ fn roundtrip_dedup_split_and_fifo() -> Result<(), Box<dyn std::error::Error>> {
             .expect("fixture correlation is a valid name"),
     );
     metadata.mnemonic = Some("Compile".parse().expect("fixture mnemonic is a valid name"));
+    let mut cas = call(&metadata, Rpc::Cas, CallOutcome::Error);
+    cas.transferred = Transferred {
+        uploaded: 123,
+        downloaded: 456,
+    };
     let calls = vec![
         call(&alice, Rpc::GetActionResult, CallOutcome::Ok),
         call(&alice, Rpc::UpdateActionResult, CallOutcome::NotFound),
         call(&metadata, Rpc::Execute, CallOutcome::Error),
+        cas,
     ];
     let mut box_ = outbox(4, 8192)?;
     box_.lose(alice.build.clone(), 3);
@@ -339,9 +362,12 @@ fn decode_rejects_invalid_input_and_unknown_wire_enums() -> Result<(), Box<dyn s
             origin: 0,
             rpc: IngestRpc::Execute,
             outcome: IngestOutcome::Ok,
+            uploaded_bytes: 0,
+            downloaded_bytes: 0,
         }],
         lost: vec![],
         unattributed: 0,
+        traffic: None,
     };
     let mut invalid = good.clone();
     invalid.principal = "bad".into();
@@ -382,8 +408,115 @@ fn decode_rejects_invalid_input_and_unknown_wire_enums() -> Result<(), Box<dyn s
         origin: 1,
         rpc: IngestRpc::Execute,
         outcome: IngestOutcome::Ok,
+        uploaded_bytes: 0,
+        downloaded_bytes: 0,
     });
     let result = decode(req, 1).expect("two valid fixture origins decode");
     assert_ne!(result.calls[0].origin.build, result.calls[1].origin.build);
+    Ok(())
+}
+
+#[test]
+fn traffic_acknowledges_only_the_snapshot_that_was_dispatched()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut b = outbox(2, 4096)?;
+    let start = Timestamp::from_unix_millis(1234);
+    let first = Traffic {
+        lookups: 5,
+        hits: 3,
+        uploaded: 7,
+        downloaded: 11,
+    };
+    let newer = Traffic {
+        lookups: 8,
+        ..first
+    };
+    b.traffic(start, first);
+    assert!(!b.is_empty());
+    let old = b.next_dispatch().unwrap();
+    assert_eq!(old.request().traffic.as_ref().unwrap().lookups, 5);
+    b.traffic(start, newer);
+    b.resolve(old, Outcome::Accepted);
+    assert!(!b.is_empty());
+    let current = b.next_dispatch().unwrap();
+    assert_eq!(current.request().traffic.as_ref().unwrap().lookups, 8);
+    b.resolve(current, Outcome::Accepted);
+    assert!(b.is_empty());
+    b.traffic(start, newer);
+    assert!(b.is_empty());
+    b.lose_unattributed(1);
+    let duplicate = b.next_dispatch().unwrap();
+    assert_eq!(duplicate.request().traffic.as_ref().unwrap().lookups, 8);
+    b.resolve(duplicate, Outcome::Accepted);
+    assert!(b.is_empty());
+    Ok(())
+}
+
+#[test]
+fn ambiguous_and_not_applied_traffic_retransmit_latest() -> Result<(), Box<dyn std::error::Error>> {
+    for outcome in [Outcome::Unknown, Outcome::NotApplied] {
+        let mut b = outbox(2, 4096)?;
+        let start = Timestamp::UNIX_EPOCH;
+        let old = Traffic {
+            uploaded: 1,
+            ..Traffic::default()
+        };
+        let new = Traffic { uploaded: 2, ..old };
+        b.traffic(start, old);
+        let d = b.next_dispatch().unwrap();
+        b.resolve(d, outcome);
+        assert_eq!(
+            b.next_dispatch()
+                .unwrap()
+                .request()
+                .traffic
+                .as_ref()
+                .unwrap()
+                .uploaded_bytes,
+            1
+        );
+        b.traffic(start, new);
+        let d = b.next_dispatch().unwrap();
+        assert_eq!(d.request().traffic.as_ref().unwrap().uploaded_bytes, 2);
+        b.resolve(d, Outcome::Accepted);
+        assert!(b.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn full_batch_with_maximum_traffic_and_call_bytes_fits() -> Result<(), Box<dyn std::error::Error>> {
+    let o = origin("alice", "inv")?;
+    let mut max = call(&o, Rpc::Cas, CallOutcome::Error);
+    max.transferred = Transferred {
+        uploaded: u64::MAX,
+        downloaded: u64::MAX,
+    };
+    let cap = frame()? + call_cost(&o)? + 100;
+    let mut b = outbox(2, cap)?;
+    b.traffic(
+        Timestamp::END_OF_TIME,
+        Traffic {
+            lookups: u64::MAX,
+            hits: u64::MAX,
+            uploaded: u64::MAX,
+            downloaded: u64::MAX,
+        },
+    );
+    for _ in 0..8 {
+        b.push(Observation::Call(max.clone()));
+    }
+    let mut received = 0;
+    while !b.is_empty() {
+        let d = b.next_dispatch().unwrap();
+        assert_cap(d.request(), cap)?;
+        assert_eq!(
+            d.request().traffic.as_ref().unwrap().downloaded_bytes,
+            u64::MAX
+        );
+        received += d.request().calls.len();
+        b.resolve(d, Outcome::Accepted);
+    }
+    assert_eq!(received, 8);
     Ok(())
 }

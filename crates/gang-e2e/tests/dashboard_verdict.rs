@@ -73,6 +73,8 @@ fn fleet(in_service: u32) -> Fleet {
             needed: in_service,
             vcpus: 0,
             memory: 0,
+            readiness: None,
+            expected_wait: None,
         },
     }
 }
@@ -121,6 +123,7 @@ fn state(seq: u64, in_service: u32, workers: Vec<Worker>, completed: u64) -> Sta
         events_limit: 100,
         completed,
         recent: Recent::default(),
+        cache: gang_wire::Cache::default(),
         builds: Vec::new(),
         principals_epoch: 0,
     }
@@ -177,6 +180,7 @@ fn delta(base: u64, seq: u64, events: Vec<Event>) -> Delta {
         events,
         completed: None,
         recent: None,
+        cache: None,
         builds: None,
         principals_epoch: None,
     }

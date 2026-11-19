@@ -6,8 +6,8 @@ use std::num::NonZeroU32;
 use gang_config::FleetPolicy;
 use gang_reconciler::{FleetOutlook, FleetPass, HostedSnapshot, WorkerCounts};
 use gang_spi::{
-    ActionInfo, ActionsView, FleetInstance, FleetSupply, QueuedActionView, RunningActionView,
-    SchedulerSnapshot,
+    ActionInfo, ActionsView, EngineStore, FleetInstance, FleetSupply, QueuedActionView,
+    RunningActionView, SchedulerSnapshot, StoreKind, Traffic,
 };
 use gang_state::{ActionsSample, Builder, Inputs, PassStatus};
 use gang_testkit::{TestResult, worker_on};
@@ -86,6 +86,8 @@ fn outlook() -> FleetOutlook {
         queued: 4,
         candidates: 2,
         workers: WorkerCounts::default(),
+        readiness: None,
+        expected_wait: None,
     }
 }
 
@@ -99,6 +101,13 @@ fn inputs(world: &World) -> Inputs<'_> {
         actions: world.actions.as_ref(),
         events: &world.events,
         builds: &world.builds,
+        traffic: Traffic {
+            lookups: 12,
+            hits: 8,
+            uploaded: 4096,
+            downloaded: 8192,
+        },
+        measured: None,
         principals_epoch: 7,
     }
 }
@@ -176,10 +185,23 @@ fn scheduler_snapshot() -> Result<SchedulerSnapshot, Box<dyn Error>> {
     }
     Ok(SchedulerSnapshot {
         completed: 100,
-        lookups: 0,
-        hits: 0,
+        stores: vec![
+            EngineStore {
+                store: StoreKind::Content,
+                used: 512,
+                budget: 1024,
+                evicted: 20,
+            },
+            EngineStore {
+                store: StoreKind::Action,
+                used: 64,
+                budget: 128,
+                evicted: 3,
+            },
+        ],
         workers,
         queued: queued_actions,
+        executing: Vec::new(),
     })
 }
 
@@ -300,8 +322,8 @@ fn world() -> Result<World, Box<dyn Error>> {
 #[test]
 fn steady_completed_pass_allocates_nothing() -> TestResult {
     let world = world()?;
-    let view = inputs(&world);
-    let mut builder = Builder::new(config());
+    let mut view = inputs(&world);
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
     let mut cur = blank();
     let mut prev = blank();
 
@@ -312,6 +334,8 @@ fn steady_completed_pass_allocates_nothing() -> TestResult {
         std::mem::swap(&mut cur, &mut prev);
     }
 
+    view.traffic.uploaded += 128;
+    view.traffic.downloaded += 256;
     seq += 1;
     let info = allocation_counter::measure(|| {
         builder.fill(&mut cur, &prev, seq, &view);
@@ -340,7 +364,7 @@ fn steady_skipped_pass_allocates_nothing() -> TestResult {
         actions: None,
         ..inputs(&world)
     };
-    let mut builder = Builder::new(config());
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
     let mut cur = blank();
     let mut prev = blank();
 

@@ -23,6 +23,7 @@
 mod actions;
 mod config;
 mod controller;
+mod durations;
 mod enforcement;
 #[cfg(test)]
 mod equivalence;
@@ -44,6 +45,7 @@ mod serve;
 mod settings;
 mod snapshot;
 mod standing;
+mod store_usage;
 mod stores;
 mod worker;
 

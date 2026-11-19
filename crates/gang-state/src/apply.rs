@@ -25,6 +25,9 @@ pub fn apply(state: &mut State, delta: &Delta) -> Result<(), ApplyError> {
     if let Some(queue) = &delta.queue {
         state.queue.clone_from(queue);
     }
+    if let Some(cache) = &delta.cache {
+        state.cache.clone_from(cache);
+    }
     if let Some(fleets) = &delta.fleets {
         apply_declared(&mut state.fleets, fleets);
     }

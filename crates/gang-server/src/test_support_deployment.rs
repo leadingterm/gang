@@ -26,6 +26,7 @@ use gang_types::{
 };
 use parking_lot::Mutex;
 use serde_json::json;
+use tokio::sync::oneshot;
 
 use crate::test_support::start_clock;
 use crate::test_support_fleet::fleets;
@@ -36,6 +37,7 @@ use crate::test_support_verifier::FakeVerifier;
 #[derive(Clone, Default)]
 pub struct MemoryBinder {
     dials: Arc<Mutex<BTreeMap<SocketAddr, MemoryDialer>>>,
+    holds: Arc<Mutex<BTreeMap<SocketAddr, oneshot::Receiver<()>>>>,
 }
 
 impl MemoryBinder {
@@ -43,12 +45,23 @@ impl MemoryBinder {
     pub fn dialer(&self, address: SocketAddr) -> Option<MemoryDialer> {
         self.dials.lock().get(&address).cloned()
     }
+
+    /// Holds the next bind of `address` until the returned sender fires or is dropped.
+    pub fn hold(&self, address: SocketAddr) -> oneshot::Sender<()> {
+        let (release, held) = oneshot::channel();
+        self.holds.lock().insert(address, held);
+        release
+    }
 }
 
 impl Binder for MemoryBinder {
     type Listener = MemoryListener;
 
     async fn bind(&self, address: SocketAddr) -> Result<MemoryListener, BoxedError> {
+        let held = self.holds.lock().remove(&address);
+        if let Some(held) = held {
+            let _ = held.await;
+        }
         let (listener, dialer) = memory_listener();
         self.dials.lock().insert(address, dialer);
         Ok(listener)

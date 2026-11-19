@@ -72,7 +72,7 @@ on:
         required: true
         type: string
       apply_environment:
-        description: "GitHub environment of the apply job."
+        description: "GitHub environment of the apply job; empty runs without an environment."
         type: string
         default: production
       plan_max_age:
@@ -184,18 +184,18 @@ jobs:
 
   apply:
     needs: validate
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.apply_environment != ''
     runs-on: ${{ inputs.runner }}
     environment: ${{ inputs.apply_environment }}
-    permissions:
+    permissions: &apply_permissions
       contents: read
       id-token: write
       actions: read
       pull-requests: read
-    concurrency:
+    concurrency: &apply_concurrency
       group: deploy-apply-${{ github.repository }}
       cancel-in-progress: false
-    steps:
+    steps: &apply_steps
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
@@ -239,3 +239,11 @@ jobs:
         run: .gang/infra/scripts/reviewed-plan.sh converge
       - name: Restart controller on configuration change
         run: .gang/infra/scripts/reviewed-plan.sh restart
+
+  apply_without_environment:
+    needs: validate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.apply_environment == ''
+    runs-on: ${{ inputs.runner }}
+    permissions: *apply_permissions
+    concurrency: *apply_concurrency
+    steps: *apply_steps

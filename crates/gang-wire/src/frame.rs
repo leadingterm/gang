@@ -11,7 +11,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::state::{
-    Fleet, Instance, Pass, Queue, QueuedAction, Recent, RunningAction, State, Truncated, Worker,
+    Cache, Fleet, Instance, Pass, Queue, QueuedAction, Recent, RunningAction, State, Truncated,
+    Worker,
 };
 use crate::{Build, Event, FrameError};
 
@@ -109,6 +110,9 @@ pub struct Delta {
     /// A new action queue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue: Option<Queue>,
+    /// A whole replacement of cache occupancy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<Cache>,
     /// Changes to the fleets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fleets: Option<Keyed<Fleet>>,
@@ -151,6 +155,7 @@ impl Delta {
     pub fn is_empty(&self) -> bool {
         self.pass.is_none()
             && self.queue.is_none()
+            && self.cache.is_none()
             && keyed_is_empty(self.fleets.as_ref())
             && keyed_is_empty(self.workers.as_ref())
             && keyed_is_empty(self.instances.as_ref())
@@ -360,6 +365,7 @@ mod tests {
             "eventsLimit": 200,
             "completed": 0,
             "recent": {"window": "0s", "step": "0s"},
+            "cache": {},
             "builds": [],
             "principalsEpoch": 0,
         })
@@ -411,6 +417,21 @@ mod tests {
     }
 
     #[test]
+    fn cache_only_delta_is_not_empty_even_when_clearing() {
+        let mut delta: Delta = serde_json::from_value(json!({
+            "seq": 2, "base": 1, "updateTime": "1970-01-01T00:00:00.000Z"
+        }))
+        .expect("delta parses");
+        assert!(delta.is_empty());
+        delta.cache = Some(Cache::default());
+        assert!(!delta.is_empty());
+        assert_eq!(
+            serde_json::to_value(delta).expect("serializes")["cache"],
+            json!({})
+        );
+    }
+
+    #[test]
     fn delta_with_every_part_round_trips() {
         let value = json!({
             "seq": 8,
@@ -418,6 +439,8 @@ mod tests {
             "updateTime": "2026-01-14T09:19:32.000Z",
             "pass": {"state": "OK", "interval": "2s", "applied": 1, "failed": 0},
             "queue": {"total": 1, "unplaceable": 0, "oldestQueueTime": "2026-01-14T09:19:31.000Z"},
+            "cache": {"stores": [{"store": "CAS", "usedBytes": 10, "budgetBytes": 20}],
+                "bucket": {"bytes": 30, "objects": 3, "measureTime": "2026-01-14T00:00:00.000Z"}},
             "fleets": {"remove": ["fleets/gone"]},
             "workers": {"upsert": [{
                 "name": "workers/w1",
@@ -452,6 +475,8 @@ mod tests {
         };
         assert_eq!(delta.events.len(), 1);
         assert_eq!(delta.completed, Some(5));
+        assert!(!delta.is_empty());
+        assert_eq!(delta.cache.expect("cache").stores[0].used_bytes, 10);
     }
 
     #[test]

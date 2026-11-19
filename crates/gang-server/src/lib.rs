@@ -25,6 +25,7 @@ mod attempts;
 mod authorizer;
 mod builds;
 mod builds_forward;
+mod cache_usage;
 mod client_address;
 mod composite;
 mod control;
@@ -93,6 +94,8 @@ mod api_test_support;
 #[cfg(test)]
 mod builds_forward_tests;
 #[cfg(test)]
+mod cache_usage_tests;
+#[cfg(test)]
 mod composite_tests;
 #[cfg(test)]
 mod control_tests;
@@ -134,6 +137,8 @@ mod session_tests;
 mod shutdown_tests;
 #[cfg(test)]
 mod stream_tests;
+#[cfg(test)]
+mod term_baseline_tests;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]

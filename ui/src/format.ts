@@ -24,9 +24,22 @@ export const day = (t: UnixMs): string =>
   new Date(t).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
 
 const GIB = 1024 ** 3;
+const BYTE_UNITS = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+const BYTE_NUMBER = new Intl.NumberFormat("en-US", { maximumSignificantDigits: 3 });
 
 /** Whole GiB. */
 export const gib = (bytes: Bytes): string => `${Math.round(bytes / GIB)} GiB`;
+
+/** IEC byte units with three significant digits. */
+export const bytes = (n: number): string => {
+  let value = n;
+  let unit = 0;
+  while (value >= 1024 && unit < BYTE_UNITS.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${BYTE_NUMBER.format(value)} ${BYTE_UNITS[unit]}`;
+};
 
 /** Splits at the last `:`, the part that tells similar identifiers apart (a Bazel target's name, an ARN's resource, an OIDC subject's ref); no head when there is no `:` or it leads. */
 export const splitTail = (text: string): readonly [head: string, tail: string] => {

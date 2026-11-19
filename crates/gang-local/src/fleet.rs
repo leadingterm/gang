@@ -122,13 +122,21 @@ impl<P: Processes, C: Clock> LocalFleet<P, C> {
             }
         }
         into.desired = self.records.desired(fleet.name)?;
-        into.launch_failure =
+        let serving = into
+            .instances
+            .iter()
+            .filter(|instance| instance.lifecycle != InstanceLifecycle::Terminating)
+            .count();
+        into.launch_failure = if serving < into.desired as usize {
             self.launch_failures
                 .lock()
                 .get(fleet.name)
                 .map(|reason| LaunchFailure {
                     reason: reason.clone(),
-                });
+                })
+        } else {
+            None
+        };
         self.records.fill_exits(fleet.name, &mut into.exits)?;
         Ok(())
     }
@@ -142,12 +150,11 @@ impl<P: Processes, C: Clock> LocalFleet<P, C> {
     ) -> Result<(), LocalError> {
         let mutation = self.records.mutation(deadline)?;
         self.processes.reap();
-        self.reconcile(&mutation, fleet, None)
+        self.reconcile(&mutation, fleet)
     }
 
-    /// Persists the requested capacity, clamped to the serving count, and
-    /// launches missing workers. Lowering it never stops a worker; scale-in is
-    /// done by [`LocalFleet::terminate`].
+    /// Persists the requested capacity, clamped to live non-terminating workers.
+    /// Lowering it never stops a worker; scale-in is done by [`LocalFleet::terminate`].
     pub(crate) fn set_desired_capacity(
         &self,
         deadline: &Deadline,
@@ -155,8 +162,23 @@ impl<P: Processes, C: Clock> LocalFleet<P, C> {
         desired: u32,
     ) -> Result<(), LocalError> {
         let mutation = self.records.mutation(deadline)?;
-        self.processes.reap();
-        self.reconcile(&mutation, fleet, Some(desired))
+        self.records.recover_release(&mutation, fleet.name)?;
+        let mut serving = 0_u32;
+        for record in self.records.records()? {
+            let record = record?;
+            if record.fleet == *fleet.name
+                && !record.is_terminating()
+                && gang_os::FileLock::is_held(&self.layout.lock_path(&record.id))?
+            {
+                serving = serving.saturating_add(1);
+            }
+        }
+        let desired = desired.max(serving);
+        self.records.set_desired(&mutation, fleet.name, desired)?;
+        if serving >= desired {
+            self.launch_failures.lock().remove(fleet.name);
+        }
+        Ok(())
     }
 
     /// Drains one instance: marks it terminating and signals its process, or removes it outright
@@ -299,7 +321,6 @@ impl<P: Processes, C: Clock> LocalFleet<P, C> {
         &self,
         mutation: &Mutation,
         fleet: Fleet<'_, LocalFleetOptions>,
-        requested: Option<u32>,
     ) -> Result<(), LocalError> {
         self.records.recover_release(mutation, fleet.name)?;
         let now = self.clock.wall();
@@ -345,13 +366,7 @@ impl<P: Processes, C: Clock> LocalFleet<P, C> {
                 None => serving = serving.saturating_add(1),
             }
         }
-        let desired = if let Some(requested) = requested {
-            let desired = requested.max(serving);
-            self.records.set_desired(mutation, fleet.name, desired)?;
-            desired
-        } else {
-            self.records.desired(fleet.name)?
-        };
+        let desired = self.records.desired(fleet.name)?;
         if serving >= desired {
             self.launch_failures.lock().remove(fleet.name);
             return Ok(());
@@ -884,6 +899,9 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet_view(&name, Isa::X86_64), 1)
             .unwrap();
+        manager
+            .converge(deadline().deadline(), fleet_view(&name, Isa::X86_64))
+            .unwrap();
     }
 
     #[cfg(unix)]
@@ -1034,6 +1052,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 2)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
 
         let supply = supply_of(&manager, fleet);
         let launched_at = clock.wall();
@@ -1078,6 +1097,9 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet_view(&name, Isa::X86_64), 1)
             .unwrap();
+        manager
+            .converge(deadline().deadline(), fleet_view(&name, Isa::X86_64))
+            .unwrap();
 
         let commands = processes.commands.lock().clone();
         assert_eq!(commands.len(), 1);
@@ -1112,6 +1134,9 @@ mod tests {
 
         manager
             .set_desired_capacity(deadline().deadline(), fleet_view(&name, Isa::X86_64), 1)
+            .unwrap();
+        manager
+            .converge(deadline().deadline(), fleet_view(&name, Isa::X86_64))
             .unwrap();
 
         let commands = processes.commands.lock().clone();
@@ -1155,6 +1180,90 @@ mod tests {
     }
 
     #[test]
+    fn desired_capacity_is_committed_without_realizing_supply() {
+        let _gate = gang_testkit::fork_gate::lock_user();
+        let dir = TempDir::new().unwrap();
+        let layout = layout_in(dir.path());
+        let processes = FakeProcesses::new();
+        let clock = clock();
+        let manager = new_manager(&layout, processes.clone(), &clock);
+        let name = fleet_name("local");
+        let fleet = fleet_view(&name, Isa::X86_64);
+        let scope = deadline();
+        let deadline_clock = Arc::clone(scope.clock());
+        *processes.spawn_probe.lock() = Some(Box::new(move |_: &WorkerCommand| {
+            deadline_clock.advance(Duration::from_secs(1));
+        }));
+
+        manager
+            .set_desired_capacity(scope.deadline(), fleet, 2)
+            .unwrap();
+        let supply = supply_of(&manager, fleet);
+        assert_eq!(supply.desired, 2);
+        assert!(supply.instances.is_empty());
+        assert_eq!(processes.launched(), 0);
+
+        *processes.spawn_probe.lock() = None;
+        manager.converge(deadline().deadline(), fleet).unwrap();
+        assert_eq!(supply_of(&manager, fleet).instances.len(), 2);
+        assert_eq!(processes.launched(), 2);
+    }
+
+    #[test]
+    fn desired_capacity_clamps_only_live_nonterminating_workers_in_the_fleet() {
+        let _gate = gang_testkit::fork_gate::lock_user();
+        let dir = TempDir::new().unwrap();
+        let layout = layout_in(dir.path());
+        let processes = FakeProcesses::new();
+        let clock = clock();
+        let manager = new_manager(&layout, processes.clone(), &clock);
+        let name = fleet_name("local");
+        let fleet = fleet_view(&name, Isa::X86_64);
+        let other_name = fleet_name("other");
+        let other = fleet_view(&other_name, Isa::X86_64);
+        manager
+            .set_desired_capacity(deadline().deadline(), fleet, 3)
+            .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
+        manager
+            .set_desired_capacity(deadline().deadline(), other, 1)
+            .unwrap();
+        manager.converge(deadline().deadline(), other).unwrap();
+
+        manager
+            .terminate(deadline().deadline(), fleet, &id("local-3"))
+            .unwrap();
+        let dead_pid = manager
+            .records()
+            .read(&id("local-2"))
+            .unwrap()
+            .unwrap()
+            .pid
+            .unwrap();
+        processes.exit(dead_pid);
+        manager
+            .set_desired_capacity(deadline().deadline(), fleet, 0)
+            .unwrap();
+        assert_eq!(supply_of(&manager, fleet).desired, 1);
+        assert_eq!(processes.launched(), 4);
+
+        let last_pid = manager
+            .records()
+            .read(&id("local-1"))
+            .unwrap()
+            .unwrap()
+            .pid
+            .unwrap();
+        processes.exit(last_pid);
+        manager
+            .set_desired_capacity(deadline().deadline(), fleet, 0)
+            .unwrap();
+        assert_eq!(supply_of(&manager, fleet).desired, 0);
+        assert_eq!(supply_of(&manager, other).instances.len(), 1);
+        assert_eq!(processes.launched(), 4);
+    }
+
+    #[test]
     fn set_desired_capacity_is_idempotent() {
         let _gate = gang_testkit::fork_gate::lock_user();
         let dir = TempDir::new().unwrap();
@@ -1168,9 +1277,11 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 2)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 2)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
 
         assert_eq!(processes.launched(), 2);
     }
@@ -1189,13 +1300,16 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         *processes.fail_next_spawn.lock() = true;
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 4)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 0)
             .unwrap();
+        assert!(!manager.launch_failures.lock().contains_key(&name));
         assert_eq!(manager.records().desired(&name).unwrap(), 1);
         assert!(processes.terminated.lock().is_empty());
         assert_eq!(processes.launched(), 1);
@@ -1204,6 +1318,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 2)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         assert_eq!(processes.launched(), 2);
         assert_eq!(supply_of(&manager, fleet).desired, 2);
         assert!(processes.terminated.lock().is_empty());
@@ -1223,6 +1338,7 @@ mod tests {
             manager
                 .set_desired_capacity(deadline().deadline(), fleet, 2)
                 .unwrap();
+            manager.converge(deadline().deadline(), fleet).unwrap();
             supply_of(&manager, fleet)
         };
 
@@ -1232,6 +1348,7 @@ mod tests {
         restarted
             .set_desired_capacity(deadline().deadline(), fleet, 2)
             .unwrap();
+        restarted.converge(deadline().deadline(), fleet).unwrap();
         assert_eq!(processes.launched(), 2);
     }
 
@@ -1248,6 +1365,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 2)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         clock.advance(Duration::from_secs(31));
         let dead = id("local-1");
         let dead_pid = manager.records().read(&dead).unwrap().unwrap().pid.unwrap();
@@ -1279,6 +1397,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let dead = id("local-1");
         manager
             .records()
@@ -1293,7 +1412,7 @@ mod tests {
             lapse_clock.advance(Duration::from_secs(1));
         }));
 
-        assert!(manager.set_desired_capacity(lapsing, fleet, 3).is_err());
+        assert!(manager.converge(lapsing, fleet).is_err());
         assert!(
             manager.records().read(&dead).unwrap().is_some(),
             "the dead record was removed after the permission lapsed"
@@ -1301,7 +1420,7 @@ mod tests {
         assert_eq!(
             manager.records().desired(&name).unwrap(),
             1,
-            "the desired count was written after the permission lapsed"
+            "convergence changed the desired count"
         );
         assert_eq!(processes.launched(), 1);
     }
@@ -1319,6 +1438,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let dead = id("local-1");
         manager
             .records()
@@ -1374,6 +1494,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 2)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let target = id("local-1");
         let lapse_scope = deadline();
         let lapsing = lapse_scope.deadline();
@@ -1420,13 +1541,14 @@ mod tests {
         let manager = new_manager(&layout, processes.clone(), &clock);
         let name = fleet_name("local");
         let fleet = fleet_view(&name, Isa::X86_64);
+        manager.set_desired_capacity(deadline().deadline(), fleet, 1)?;
         let lapse_scope = deadline();
         let lapse_clock = Arc::clone(lapse_scope.clock());
         *processes.spawn_probe.lock() = Some(Box::new(move |_: &WorkerCommand| {
             lapse_clock.advance(Duration::from_secs(1));
         }));
         assert!(matches!(
-            manager.set_desired_capacity(lapse_scope.deadline(), fleet, 1),
+            manager.converge(lapse_scope.deadline(), fleet),
             Err(LocalError::LeaseLapsed(_))
         ));
         *processes.spawn_probe.lock() = None;
@@ -1466,6 +1588,7 @@ mod tests {
         let name = fleet_name("local");
         let fleet = fleet_view(&name, Isa::X86_64);
         manager.set_desired_capacity(deadline().deadline(), fleet, 2)?;
+        manager.converge(deadline().deadline(), fleet)?;
         let target = id("local-1");
         let record = manager
             .records()
@@ -1513,6 +1636,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let dead = id("local-1");
         let scope = PathBuf::from("/fake/cgroup/run-1.scope");
         manager
@@ -1547,6 +1671,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let dead = id("local-1");
         let scope = PathBuf::from("/fake/cgroup/run-1.scope");
         manager
@@ -1595,6 +1720,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let dead = id("local-1");
         let pid = manager.records().read(&dead).unwrap().unwrap().pid.unwrap();
         clock.advance(Duration::from_secs(31));
@@ -1627,6 +1753,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let dead = id("local-1");
         let pid = manager.records().read(&dead).unwrap().unwrap().pid.unwrap();
         clock.advance(Duration::from_secs(31));
@@ -1658,6 +1785,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let dead = id("local-1");
         manager
             .records()
@@ -1693,6 +1821,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let dead = id("local-1");
         manager
             .records()
@@ -1712,6 +1841,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 0)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         manager
             .terminate(deadline().deadline(), fleet, &dead)
             .unwrap();
@@ -1731,6 +1861,7 @@ mod tests {
             manager
                 .set_desired_capacity(deadline().deadline(), fleet, 0)
                 .unwrap();
+            manager.converge(deadline().deadline(), fleet).unwrap();
         });
         assert_eq!(warnings.count(), 0);
         assert!(manager.records().read(&dead).unwrap().is_none());
@@ -1753,6 +1884,7 @@ mod tests {
             manager
                 .set_desired_capacity(deadline().deadline(), fleet, 1)
                 .unwrap();
+            manager.converge(deadline().deadline(), fleet).unwrap();
             let dead = id("local-1");
             manager
                 .records()
@@ -1773,6 +1905,7 @@ mod tests {
             manager
                 .set_desired_capacity(deadline().deadline(), fleet, 0)
                 .unwrap();
+            manager.converge(deadline().deadline(), fleet).unwrap();
             assert!(manager.records().read(&dead).unwrap().is_none());
             assert!(supply_of(&manager, fleet).instances.is_empty());
             assert!(processes.reaped_cgroups.lock().is_empty());
@@ -1792,6 +1925,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let dead = id("local-1");
         manager
             .records()
@@ -1807,6 +1941,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 0)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         assert!(manager.records().read(&dead).unwrap().is_none());
         assert!(supply_of(&manager, fleet).instances.is_empty());
         assert_eq!(processes.launched(), 1);
@@ -1826,6 +1961,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let dead = id("local-1");
         let scope = PathBuf::from("/fake/cgroup/worker.scope");
         manager
@@ -1846,6 +1982,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 0)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         manager
             .terminate(deadline().deadline(), fleet, &dead)
             .unwrap();
@@ -1863,6 +2000,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 0)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         assert!(manager.records().read(&dead).unwrap().is_none());
         assert!(supply_of(&manager, fleet).instances.is_empty());
         assert_eq!(processes.launched(), 1);
@@ -1882,6 +2020,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let dead = id("local-1");
         manager
             .records()
@@ -1904,6 +2043,7 @@ mod tests {
             manager
                 .set_desired_capacity(deadline().deadline(), fleet, 0)
                 .unwrap();
+            manager.converge(deadline().deadline(), fleet).unwrap();
         });
         assert_eq!(warnings.count(), 1);
         assert!(manager.records().read(&dead).unwrap().is_none());
@@ -1925,6 +2065,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let dead = id("local-1");
         manager
             .records()
@@ -1961,6 +2102,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let dead = id("local-1");
         manager
             .records()
@@ -2002,6 +2144,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 2)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let dead = id("local-1");
         manager
             .records()
@@ -2046,6 +2189,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 2)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let target = id("local-1");
         let target_pid = manager
             .records()
@@ -2131,6 +2275,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 2)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let target = id("local-1");
 
         manager
@@ -2157,6 +2302,7 @@ mod tests {
             manager
                 .set_desired_capacity(deadline().deadline(), fleet, 1)
                 .unwrap();
+            manager.converge(deadline().deadline(), fleet).unwrap();
             let target = id("local-1");
             let pid = manager
                 .records()
@@ -2223,9 +2369,11 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), small, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), small).unwrap();
         manager
             .set_desired_capacity(deadline().deadline(), big, 2)
             .unwrap();
+        manager.converge(deadline().deadline(), big).unwrap();
 
         let launched_at = clock.wall();
         assert_eq!(
@@ -2324,9 +2472,11 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), x86, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), x86).unwrap();
         manager
             .set_desired_capacity(deadline().deadline(), arm, 2)
             .unwrap();
+        manager.converge(deadline().deadline(), arm).unwrap();
 
         let launched_at = clock.wall();
         assert_eq!(
@@ -2401,6 +2551,9 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet_view(&name, Isa::X86_64), 1)
             .unwrap();
+        manager
+            .converge(deadline().deadline(), fleet_view(&name, Isa::X86_64))
+            .unwrap();
 
         assert!(*observed.lock());
     }
@@ -2417,6 +2570,9 @@ mod tests {
 
         manager
             .set_desired_capacity(deadline().deadline(), fleet_view(&name, Isa::X86_64), 1)
+            .unwrap();
+        manager
+            .converge(deadline().deadline(), fleet_view(&name, Isa::X86_64))
             .unwrap();
 
         let launched = processes.commands.lock();
@@ -2448,6 +2604,7 @@ mod tests {
         let name = fleet_name("local");
 
         manager.set_desired_capacity(deadline().deadline(), fleet_view(&name, Isa::X86_64), 2)?;
+        manager.converge(deadline().deadline(), fleet_view(&name, Isa::X86_64))?;
 
         let first = manager
             .records()
@@ -2474,6 +2631,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 2)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         clock.advance(Duration::from_secs(31));
         let dead_pid = manager
             .records()
@@ -2506,6 +2664,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 2)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let target = id("local-1");
         let target_pid = manager
             .records()
@@ -2571,6 +2730,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let dead = id("local-1");
         let pid = manager.records().read(&dead).unwrap().unwrap().pid.unwrap();
         std::fs::write(
@@ -2617,6 +2777,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let dead = id("local-1");
         let pid = manager.records().read(&dead).unwrap().unwrap().pid.unwrap();
         std::fs::write(
@@ -2657,6 +2818,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let dead = id("local-1");
         let pid = manager.records().read(&dead).unwrap().unwrap().pid.unwrap();
         std::fs::write(layout.log_path(&dead), "INFO worker stopped\n").unwrap();
@@ -2666,7 +2828,7 @@ mod tests {
     }
 
     #[test]
-    fn an_exit_seen_during_capacity_change_is_reported_by_the_next_supply() {
+    fn an_exit_seen_during_convergence_is_reported_by_the_next_supply() {
         let _gate = gang_testkit::fork_gate::lock_user();
         let dir = TempDir::new().unwrap();
         let layout = layout_in(dir.path());
@@ -2678,6 +2840,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let dead = id("local-1");
         let pid = manager.records().read(&dead).unwrap().unwrap().pid.unwrap();
         std::fs::write(layout.log_path(&dead), "fail  worker failed\n").unwrap();
@@ -2685,6 +2848,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         assert_eq!(
             supply_of(&manager, fleet).exits,
             vec![InstanceExit {
@@ -2711,6 +2875,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let dead = id("local-1");
         let pid = manager.records().read(&dead).unwrap().unwrap().pid.unwrap();
         std::fs::write(layout.log_path(&dead), "fail  worker failed\n").unwrap();
@@ -2748,6 +2913,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let dead_pid = manager
             .records()
             .read(&id("local-1"))
@@ -2782,6 +2948,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let dead_pid = manager
             .records()
             .read(&id("local-1"))
@@ -2816,6 +2983,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let dead_pid = manager
             .records()
             .read(&id("local-1"))
@@ -2848,6 +3016,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let target = id("local-1");
         let target_pid = manager
             .records()
@@ -2870,6 +3039,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         assert_eq!(processes.launched(), 2);
     }
 
@@ -2886,6 +3056,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let instance = id("local-1");
         let dead_pid = manager
             .records()
@@ -2918,6 +3089,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 2)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let target = id("local-1");
         let target_pid = manager
             .records()
@@ -2958,6 +3130,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let target = id("local-1");
         let target_pid = manager
             .records()
@@ -2993,6 +3166,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 2)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let target = id("local-1");
         let target_pid = manager
             .records()
@@ -3030,6 +3204,7 @@ mod tests {
         let instance = id("local-1");
         *processes.fail_next_spawn.lock() = true;
         manager.set_desired_capacity(deadline().deadline(), fleet, 1)?;
+        manager.converge(deadline().deadline(), fleet)?;
         assert!(!layout.instance_dir(&instance).exists());
         assert!(manager.records().read(&instance)?.is_none());
 
@@ -3062,6 +3237,33 @@ mod tests {
     }
 
     #[test]
+    fn met_supply_hides_another_managers_stale_launch_failure() {
+        let _gate = gang_testkit::fork_gate::lock_user();
+        let dir = TempDir::new().unwrap();
+        let layout = layout_in(dir.path());
+        let processes = FakeProcesses::new();
+        let clock = clock();
+        let first = new_manager(&layout, processes.clone(), &clock);
+        let second = new_manager(&layout, processes.clone(), &clock);
+        let name = fleet_name("local");
+        let fleet = fleet_view(&name, Isa::X86_64);
+        first
+            .set_desired_capacity(deadline().deadline(), fleet, 1)
+            .unwrap();
+        *processes.fail_next_spawn.lock() = true;
+        first.converge(deadline().deadline(), fleet).unwrap();
+        assert!(supply_of(&first, fleet).launch_failure.is_some());
+
+        second.converge(deadline().deadline(), fleet).unwrap();
+        assert!(first.launch_failures.lock().contains_key(&name));
+        let supply = supply_of(&first, fleet);
+        assert_eq!(supply.desired, 1);
+        assert_eq!(supply.instances.len(), 1);
+        assert!(supply.launch_failure.is_none());
+        assert_eq!(processes.launched(), 1);
+    }
+
+    #[test]
     fn withdrawing_failed_request_to_zero_clears_failure() {
         let _gate = gang_testkit::fork_gate::lock_user();
         let dir = TempDir::new().unwrap();
@@ -3075,9 +3277,12 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
+        assert!(manager.launch_failures.lock().contains_key(&name));
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 0)
             .unwrap();
+        assert!(!manager.launch_failures.lock().contains_key(&name));
         assert_eq!(manager.records().desired(&name).unwrap(), 0);
         let supply = supply_of(&manager, fleet);
         assert!(supply.instances.is_empty());
@@ -3100,6 +3305,7 @@ mod tests {
 
         let fleet = fleet_view(&name, Isa::X86_64);
         manager.set_desired_capacity(deadline().deadline(), fleet, 1)?;
+        manager.converge(deadline().deadline(), fleet)?;
         assert!(manager.launch_failures.lock().contains_key(&name));
         assert!(manager.records().read(&id("local-1"))?.is_none());
         assert_eq!(processes.launched(), 0);
@@ -3129,6 +3335,7 @@ mod tests {
         let name = fleet_name("local");
         let fleet = fleet_view(&name, Isa::X86_64);
         manager.set_desired_capacity(deadline().deadline(), fleet, 1)?;
+        manager.converge(deadline().deadline(), fleet)?;
         let target = id("local-1");
         let target_pid = manager
             .records()
@@ -3162,6 +3369,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         manager
             .records()
             .set_desired(
@@ -3194,6 +3402,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let target = id("local-1");
         let _target_pid = manager
             .records()
@@ -3229,6 +3438,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let target = id("local-1");
         let target_pid = manager
             .records()
@@ -3265,6 +3475,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         manager
             .records()
             .set_desired(
@@ -3314,6 +3525,7 @@ mod tests {
         manager
             .set_desired_capacity(deadline().deadline(), fleet, 1)
             .unwrap();
+        manager.converge(deadline().deadline(), fleet).unwrap();
         let expired_scope = deadline();
         expired_scope.clock().advance(Duration::from_secs(1));
         let expired = expired_scope.deadline();

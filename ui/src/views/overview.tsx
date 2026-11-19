@@ -2,9 +2,9 @@
 import type { ComponentChildren } from "preact";
 import { eventKind, idOf, ms } from "../wire-parse.ts";
 import type { Cause, Fleet, Recent, ScalingEvent, State } from "../wire.ts";
-import { cacheWindow, donePerMinute, doneSeries, passBars, queuedSeries, runningSeries, unrecordedSlots, windowMs } from "../recent.ts";
-import { humanize, sum } from "../format.ts";
-import { Clock, Duration, Empty, EVENT_VIEW, EventWhat, Glyph, Ident, Num, Section, Since, useClient, useEnter } from "../ui.tsx";
+import { bytesSeries, cacheWindow, donePerMinute, doneSeries, evictedSeries, passBars, queuedSeries, runningSeries, transferred, unrecordedSlots, windowMs } from "../recent.ts";
+import { bytes, humanize, percent, sum } from "../format.ts";
+import { Cell, Clock, Duration, Empty, EVENT_VIEW, EventWhat, Glyph, Ident, Num, Row, Section, Since, Table, useClient, useEnter } from "../ui.tsx";
 import { Legend, Tape } from "./fleet.tsx";
 
 /** Scaling events the Overview shows, however old. */
@@ -14,9 +14,10 @@ const SPARK_W = 300;
 const SPARK_H = 44;
 const SPARK_POINT_RADIUS = 2;
 
-const Spark = ({ values, areaValues, label, recent }: {
+const Spark = ({ values, areaValues, secondary, label, recent }: {
   values: readonly (number | null)[];
   areaValues?: readonly (number | null)[];
+  secondary?: readonly (number | null)[];
   label: string;
   recent: Recent;
 }) => {
@@ -25,6 +26,7 @@ const Spark = ({ values, areaValues, label, recent }: {
   let peak = 1;
   for (const value of values) if (value !== null) peak = Math.max(peak, value);
   if (areaValues) for (const value of areaValues) if (value !== null) peak = Math.max(peak, value);
+  if (secondary) for (const value of secondary) if (value !== null) peak = Math.max(peak, value);
   const x = (i: number): number => values.length > 1 ? SPARK_POINT_RADIUS + (i / (values.length - 1)) * (SPARK_W - 2 * SPARK_POINT_RADIUS) : SPARK_POINT_RADIUS;
   const y = (value: number): number => SPARK_H - SPARK_POINT_RADIUS - (value / peak) * (SPARK_H - 2 * SPARK_POINT_RADIUS);
   const trace = (series: readonly (number | null)[], fillToBaseline = false): string => {
@@ -68,8 +70,12 @@ const Spark = ({ values, areaValues, label, recent }: {
       )}
       {areaValues && <path class="spark__area" d={trace(areaValues, true)} />}
       <path class="spark__run" d={path} />
+      {secondary && <path class="spark__run spark__run--secondary" d={trace(secondary)} />}
       {values.map((value, i) => value !== null && values[i - 1] == null && values[i + 1] == null && (
         <circle key={i} class="spark__point" cx={x(i)} cy={y(value)} r={SPARK_POINT_RADIUS} />
+      ))}
+      {secondary?.map((value, i) => value !== null && secondary[i - 1] == null && secondary[i + 1] == null && (
+        <circle key={i} class="spark__point spark__point--secondary" cx={x(i)} cy={y(value)} r={SPARK_POINT_RADIUS} />
       ))}
     </svg>
   );
@@ -110,6 +116,8 @@ const Readouts = ({ state }: { state: State }) => {
   const done = donePerMinute(state.recent);
   const cache = cacheWindow(state.recent);
   const { queue } = state;
+  const traffic = transferred(state.recent);
+  const cas = state.cache.stores?.find((store) => store.store === "CAS");
   return (
     <section class="readouts" aria-label="Farm readouts">
       <Readout
@@ -146,10 +154,43 @@ const Readouts = ({ state }: { state: State }) => {
       <Readout
         label="Action cache"
         value={cache.rate === null ? <span class="cache-rate__empty">no lookups</span> : <span class="cache-rate">{Math.round(cache.rate * 100)}%{" "}<span class="cache-rate__of">of {cache.lookups} lookups</span></span>}
-        caption={<span>hit rate · <Duration ms={windowMs(state.recent)} /></span>}
+        meter={cas && <Meter g={cas.budgetBytes > 0 ? cas.usedBytes / cas.budgetBytes : 0} label={`CAS ${percent(cas.usedBytes, cas.budgetBytes)} of budget`} />}
+        caption={<><span>hit rate · <Duration ms={windowMs(state.recent)} /></span><span>{traffic ? `↓ ${bytes(traffic.downloaded)} · ↑ ${bytes(traffic.uploaded)}` : "—"}</span></>}
         chart={<Spark values={cache.hitsPerStep} areaValues={cache.lookupsPerStep} label="Action-cache lookups as area and hits as line per step" recent={state.recent} />}
       />
     </section>
+  );
+};
+
+const Cache = ({ state }: { state: State }) => {
+  const stores = state.cache.stores ?? [];
+  const bucket = state.cache.bucket;
+  const samples = state.recent.samples ?? [];
+  const evicted = sum(samples, (s) => s.evictedBytes);
+  return (
+    <Section id="cache-h" title="Cache">
+      {stores.length > 0 && (
+        <Table cls="cache-table" cols={[{ head: "Store", share: 1 }, { head: "Used" }, { head: "Budget" }, { head: "Usage" }, { head: "Evicted (window, all stores)" }]}>
+          {stores.map((store, index) => (
+            <Row key={store.store}>
+              <Cell><span class="build-label">Store </span>{store.store}</Cell><Cell><span class="build-label">Used </span>{bytes(store.usedBytes)}</Cell><Cell><span class="build-label">Budget </span>{bytes(store.budgetBytes)}</Cell>
+              <Cell><span class="build-label">Usage </span><Meter g={store.budgetBytes > 0 ? store.usedBytes / store.budgetBytes : 0} label={`${store.store} ${percent(store.usedBytes, store.budgetBytes)} of budget`} /></Cell>
+              <Cell><span class="build-label">Evicted (window, all stores) </span>{index === 0 ? bytes(evicted) : "—"}</Cell>
+            </Row>
+          ))}
+        </Table>
+      )}
+      {bucket && (
+        <Table cls="cache-table" cols={[{ head: "Bytes" }, { head: "Objects" }, { head: "Measurement", share: 1 }]}>
+          <Row><Cell><span class="build-label">Bytes </span>{bytes(bucket.bytes)}</Cell><Cell><span class="build-label">Objects </span><Num value={bucket.objects} /></Cell><Cell cls="a-span"><span class="build-label">Measurement </span>as of <Since t={ms(bucket.measureTime)} /> · expiry by bucket lifecycle</Cell></Row>
+        </Table>
+      )}
+      {!stores.length && !bucket && <p>Bucket size not measured yet; S3 reports once a day.</p>}
+      <div class="cache-sparks">
+        <div><h3 class="label">Transferred per step</h3><p class="cache-sparks__legend"><span>↓ Downloaded</span><span>↑ Uploaded</span></p><Spark values={bytesSeries(state.recent, "downloadedBytes")} secondary={bytesSeries(state.recent, "uploadedBytes")} label="Transferred per step" recent={state.recent} /></div>
+        <div><h3 class="label">Evicted per step</h3><Spark values={evictedSeries(state.recent)} label="Evicted per step" recent={state.recent} /></div>
+      </div>
+    </Section>
   );
 };
 
@@ -267,6 +308,7 @@ export const Overview = () => {
           ))}
         </ol>
       </Section>
+      <Cache state={state} />
       <div class="cols">
         <Section id="pass-h" title="Control pass">
           <PassBar state={state} />

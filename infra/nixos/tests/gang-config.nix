@@ -161,9 +161,10 @@ in
   assert lib.assertMsg (controllerService.TimeoutStopSec == "infinity") "gang-server shutdown must not have a systemd deadline";
     pkgs.testers.runNixOSTest {
       name = "gang-config";
+      globalTimeout = 600;
 
       nodeDefaults = {
-        # Each independent scenario runs alone within the CI runner budget.
+        # At most four guests run at once: 4 GiB guest memory and one vCPU each.
         virtualisation.memorySize = 1024;
         virtualisation.cores = 1;
         # The store image avoids asynchronous virtiofs socket startup; no host shares are needed.
@@ -282,18 +283,37 @@ in
 
         @contextmanager
         def guest(machine: QemuMachine) -> Generator[None]:
-            assert not any(node.booted for node in machines_qemu)
             # Keep failed scenarios for the driver to diagnose and clean up.
             yield
             machine.shutdown()
             # Store images belong to one scenario, not the whole test.
             if not machine.keep_machine_state:
                 shutil.rmtree(machine.state_dir)
+            next_machine = next(pending, None)
+            if next_machine is not None:
+                next_machine.start()
 
 
         TOML = ${builtins.toJSON tomlText}
         JOURNAL = "journalctl -u gang-config.service"
         SECRET = "/etc/gang/secrets/dashboard-client-secret"
+
+        # Bound concurrent boots to the CI runner's resource budget.
+        boot_parallelism = 4
+        pending = iter([
+            withSecrets,
+            controllerstate,
+            plain,
+            badname,
+            missing,
+            badrole,
+            noparameter,
+            extratoken,
+            workerstate,
+            wrongdevice,
+        ])
+        for _ in range(boot_parallelism):
+            next(pending).start()
 
         with guest(withSecrets):
             with subtest("withSecrets installs gang.toml and secrets before dependents start"):

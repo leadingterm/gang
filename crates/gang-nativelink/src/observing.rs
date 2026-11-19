@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use gang_clock::Timestamp;
+use gang_clock::{Clock, Timestamp};
 use gang_spi::{Executed, ExecutionTimes, Observation, ObservationSink, Phase};
 use gang_types::Identity;
 use nativelink_error::{Code, Error, make_err};
@@ -27,9 +27,11 @@ use nativelink_util::operation_state_manager::{
 };
 use nativelink_util::origin_event::OriginMetadata;
 use nativelink_util::shutdown_guard::ShutdownGuard;
+use parking_lot::Mutex;
 use tokio::sync::RwLock;
 
 use crate::actions::digest_text;
+use crate::durations::ActionDurations;
 use crate::handoff::HandOff;
 use crate::observer::origin;
 
@@ -43,6 +45,8 @@ pub(crate) struct ObservingWorkerScheduler {
     completed: Arc<AtomicU64>,
     sink: ObservationSink,
     handoff: HandOff,
+    durations: Arc<Mutex<ActionDurations>>,
+    clock: Arc<dyn Clock>,
     retiring: RwLock<bool>,
 }
 
@@ -54,6 +58,8 @@ impl ObservingWorkerScheduler {
         completed: Arc<AtomicU64>,
         sink: ObservationSink,
         handoff: HandOff,
+        durations: Arc<Mutex<ActionDurations>>,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             inner,
@@ -61,6 +67,8 @@ impl ObservingWorkerScheduler {
             completed,
             sink,
             handoff,
+            durations,
+            clock,
             retiring: RwLock::new(false),
         }
     }
@@ -265,13 +273,33 @@ impl WorkerScheduler for ObservingWorkerScheduler {
             .await;
         if result.is_ok()
             && let Some(operation) = operation
-            && let Ok((state, _)) = operation.as_state().await
+            && let Ok((state, origin)) = operation.as_state().await
             && let ActionStage::Completed(completed) = &state.stage
             && let Some((exit_code, metadata)) = sent
             && completed.exit_code == exit_code
             && completed.execution_metadata == metadata
         {
             self.completed.fetch_add(1, Ordering::Relaxed);
+            if let Some(metadata) = origin.and_then(|origin| origin.bazel_metadata)
+                && !metadata.action_mnemonic.is_empty()
+                && completed.execution_metadata.worker_start_timestamp
+                    != std::time::SystemTime::UNIX_EPOCH
+                && completed.execution_metadata.worker_completed_timestamp
+                    != std::time::SystemTime::UNIX_EPOCH
+            {
+                let elapsed = completed
+                    .execution_metadata
+                    .worker_completed_timestamp
+                    .duration_since(completed.execution_metadata.worker_start_timestamp)
+                    .unwrap_or_default();
+                let slot_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+                self.durations.lock().record(
+                    &metadata.target_id,
+                    &metadata.action_mnemonic,
+                    slot_ms,
+                    self.clock.wall(),
+                );
+            }
             if let Some(executed) = self.executed(worker_id, &*operation, completed).await {
                 self.sink.record(Observation::Executed(executed));
             }
@@ -377,6 +405,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, SystemTime};
 
+    use gang_clock::TestClock;
     use nativelink_error::{Code, make_err};
     use nativelink_proto::build::bazel::remote::execution::v2::ActionResult as ProtoActionResult;
     use nativelink_util::action_messages::{
@@ -416,6 +445,7 @@ mod tests {
     struct Operation {
         info: Arc<ActionInfo>,
         stage: Arc<parking_lot::Mutex<Option<ActionStage>>>,
+        origin: Option<OriginMetadata>,
     }
     #[async_trait]
     impl ActionStateResult for Operation {
@@ -432,30 +462,20 @@ mod tests {
                     client_operation_id: OperationId::String("op-1".to_owned()),
                     action_digest: self.info.digest(),
                 }),
-                None,
+                self.origin.clone(),
             ))
         }
         async fn changed(&mut self) -> Result<(Arc<ActionState>, Option<OriginMetadata>), Error> {
             Err(make_err!(Code::Internal, "not implemented"))
         }
         async fn as_action_info(&self) -> Result<(Arc<ActionInfo>, Option<OriginMetadata>), Error> {
-            Ok((
-                Arc::clone(&self.info),
-                Some(OriginMetadata {
-                    identity: "local:alice".to_owned(),
-                    bazel_metadata: Some(
-                        nativelink_proto::build::bazel::remote::execution::v2::RequestMetadata {
-                            tool_invocation_id: "build".to_owned(),
-                            ..Default::default()
-                        },
-                    ),
-                }),
-            ))
+            Ok((Arc::clone(&self.info), self.origin.clone()))
         }
     }
     struct Operations {
         info: Arc<ActionInfo>,
         stage: Arc<parking_lot::Mutex<Option<ActionStage>>>,
+        origin: Option<OriginMetadata>,
     }
     impl MetricsComponent for Operations {
         fn publish(
@@ -497,9 +517,35 @@ mod tests {
             let row = Box::new(Operation {
                 info: Arc::clone(&self.info),
                 stage: Arc::clone(&self.stage),
+                origin: self.origin.clone(),
             }) as Box<dyn ActionStateResult>;
             Ok(Box::pin(futures::stream::iter([row])))
         }
+    }
+
+    fn test_origin(identity: &str) -> OriginMetadata {
+        OriginMetadata {
+            identity: identity.to_owned(),
+            bazel_metadata: Some(
+                nativelink_proto::build::bazel::remote::execution::v2::RequestMetadata {
+                    tool_invocation_id: "build".to_owned(),
+                    target_id: "//pkg:target".to_owned(),
+                    action_mnemonic: "Compile".to_owned(),
+                    ..Default::default()
+                },
+            ),
+        }
+    }
+
+    fn test_durations() -> Arc<Mutex<ActionDurations>> {
+        Arc::new(Mutex::new(ActionDurations::new(
+            std::num::NonZeroUsize::MIN.saturating_add(9),
+            std::num::NonZeroU32::MIN.saturating_add(6),
+        )))
+    }
+
+    fn test_clock() -> Arc<dyn Clock> {
+        Arc::new(TestClock::new(Timestamp::from_unix_millis(1_000_000_000)))
     }
 
     fn test_action_info() -> Arc<ActionInfo> {
@@ -569,6 +615,7 @@ mod tests {
                 Arc::new(Operations {
                     info: Arc::clone(&info),
                     stage: Arc::clone(&inner.stage),
+                    origin: Some(test_origin("local:alice")),
                 })
             };
             let scheduler = ObservingWorkerScheduler::new(
@@ -577,6 +624,8 @@ mod tests {
                 Arc::clone(&completed),
                 sink,
                 HandOff::new(),
+                test_durations(),
+                test_clock(),
             );
             let forwarded = scheduler
                 .update_action(
@@ -614,43 +663,47 @@ mod tests {
             );
             assert_eq!(executed.exit_code, 7);
             assert!(!executed.error);
-            assert_eq!(
-                executed.times.queued,
-                Phase::reported(
-                    Timestamp::from(t),
-                    Timestamp::from(t + Duration::from_secs(4))
-                )
-            );
-            assert_eq!(
-                executed.times.input_fetch,
-                Phase::reported(
-                    Timestamp::from(t + Duration::from_secs(5)),
-                    Timestamp::from(t + Duration::from_secs(6))
-                )
-            );
-            assert_eq!(
-                executed.times.executing,
-                Phase::reported(
-                    Timestamp::from(t + Duration::from_secs(7)),
-                    Timestamp::from(t + Duration::from_secs(8))
-                )
-            );
-            assert_eq!(
-                executed.times.output_upload,
-                Phase::reported(
-                    Timestamp::from(t + Duration::from_secs(9)),
-                    Timestamp::from(t + Duration::from_secs(10))
-                )
-            );
-            assert_eq!(
-                executed.times.whole,
-                Phase::reported(
-                    Timestamp::from(t),
-                    Timestamp::from(t + Duration::from_secs(11))
-                )
-            );
+            assert_execution_times(&executed.times, t);
             assert!(receiver.next().await.is_none());
         }
+    }
+
+    fn assert_execution_times(times: &ExecutionTimes, t: SystemTime) {
+        assert_eq!(
+            times.queued,
+            Phase::reported(
+                Timestamp::from(t),
+                Timestamp::from(t + Duration::from_secs(4))
+            )
+        );
+        assert_eq!(
+            times.input_fetch,
+            Phase::reported(
+                Timestamp::from(t + Duration::from_secs(5)),
+                Timestamp::from(t + Duration::from_secs(6))
+            )
+        );
+        assert_eq!(
+            times.executing,
+            Phase::reported(
+                Timestamp::from(t + Duration::from_secs(7)),
+                Timestamp::from(t + Duration::from_secs(8))
+            )
+        );
+        assert_eq!(
+            times.output_upload,
+            Phase::reported(
+                Timestamp::from(t + Duration::from_secs(9)),
+                Timestamp::from(t + Duration::from_secs(10))
+            )
+        );
+        assert_eq!(
+            times.whole,
+            Phase::reported(
+                Timestamp::from(t),
+                Timestamp::from(t + Duration::from_secs(11))
+            )
+        );
     }
 
     #[tokio::test]
@@ -686,10 +739,13 @@ mod tests {
                 Arc::new(Operations {
                     info: test_action_info(),
                     stage: Arc::clone(&inner.stage),
+                    origin: Some(test_origin("local:alice")),
                 }),
                 Arc::clone(&completed),
                 sink,
                 HandOff::new(),
+                test_durations(),
+                test_clock(),
             );
             scheduler
                 .update_action(
@@ -704,6 +760,88 @@ mod tests {
             assert_eq!(completed.load(Ordering::Relaxed), 0);
             drop(scheduler);
             assert!(observations.next().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn duration_history_only_records_verified_worker_completions() {
+        let worker = WorkerId("w-1".to_owned());
+        let operation = OperationId::String("op-1".to_owned());
+        let now = Timestamp::from_unix_millis(1_000_000_000);
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        for case in 0..14 {
+            let inner = Arc::new(RecordingScheduler::new(case == 7));
+            let mut origin = Some(test_origin(if case == 1 { "" } else { "local:alice" }));
+            if case == 2 {
+                origin = None;
+            } else if case == 3 {
+                origin.as_mut().expect("origin").bazel_metadata = None;
+            } else if case == 4 {
+                origin
+                    .as_mut()
+                    .expect("origin")
+                    .bazel_metadata
+                    .as_mut()
+                    .expect("metadata")
+                    .action_mnemonic
+                    .clear();
+            }
+            let mut result = completed_result(t);
+            if case == 5 {
+                result.execution_metadata.worker_start_timestamp = SystemTime::UNIX_EPOCH;
+            } else if case == 6 {
+                result.execution_metadata.worker_completed_timestamp = SystemTime::UNIX_EPOCH;
+            } else if case == 11 {
+                result.execution_metadata.worker_completed_timestamp = t;
+            }
+            if case == 8 || case == 12 {
+                let mut replacement = result.clone();
+                if case == 8 {
+                    replacement.exit_code += 1;
+                } else {
+                    replacement.execution_metadata.worker = "different".to_owned();
+                }
+                *inner.replacement.lock() = Some(replacement);
+            }
+            let durations = test_durations();
+            let operations: Arc<dyn ClientStateManager> = if case == 13 {
+                Arc::new(NoOperations)
+            } else {
+                Arc::new(Operations {
+                    info: test_action_info(),
+                    stage: Arc::clone(&inner.stage),
+                    origin,
+                })
+            };
+            let scheduler = ObservingWorkerScheduler::new(
+                Arc::clone(&inner) as Arc<dyn WorkerScheduler>,
+                operations,
+                Arc::new(AtomicU64::new(0)),
+                ObservationSink::channel(std::num::NonZeroUsize::MIN, std::num::NonZeroUsize::MIN)
+                    .0,
+                HandOff::new(),
+                Arc::clone(&durations),
+                test_clock(),
+            );
+            let update = match case {
+                9 => UpdateOperationType::UpdateWithActionStage(ActionStage::CompletedFromCache(
+                    ProtoActionResult::default(),
+                )),
+                10 => UpdateOperationType::UpdateWithError(make_err!(Code::Internal, "failed")),
+                _ => UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(result)),
+            };
+            let forwarded = scheduler.update_action(&worker, &operation, update).await;
+            assert_eq!(forwarded.is_err(), case == 7);
+            let expected = match case {
+                0 | 1 => Some(Duration::from_secs(7)),
+                11 => Some(Duration::ZERO),
+                _ => None,
+            };
+            assert_eq!(
+                durations.lock().expected("//pkg:target", "Compile", now),
+                expected,
+                "case {case}"
+            );
         }
     }
 
@@ -940,10 +1078,13 @@ mod tests {
             Arc::new(Operations {
                 info: test_action_info(),
                 stage: Arc::clone(&inner.stage),
+                origin: Some(test_origin("local:alice")),
             }),
             Arc::clone(&completed),
             ObservationSink::channel(std::num::NonZeroUsize::MIN, std::num::NonZeroUsize::MIN).0,
             HandOff::new(),
+            test_durations(),
+            test_clock(),
         );
         (inner, counting, completed)
     }

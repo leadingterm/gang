@@ -44,7 +44,7 @@ resolver = "2"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
-version = "0.3.0"
+version = "0.3.1"
 
 [workspace.lints.rust]
 missing_docs = "deny"
@@ -71,6 +71,10 @@ aws-sdk-autoscaling = { default-features = false, features = [
     "behavior-version-latest",
     "rt-tokio",
 ], version = "1.140" }
+aws-sdk-cloudwatch = { default-features = false, features = [
+    "behavior-version-latest",
+    "rt-tokio",
+], version = "1.144" }
 aws-sdk-dynamodb = { default-features = false, features = [
     "behavior-version-latest",
     "rt-tokio",
@@ -87,6 +91,7 @@ aws-sdk-sts = { default-features = false, features = [
     "behavior-version-latest",
     "rt-tokio",
 ], version = "1.124" }
+aws-smithy-cbor = { default-features = false, version = "0.64" }
 aws-smithy-http-client = { default-features = false, features = [
     "rt-tokio",
     "rustls-ring",
@@ -207,6 +212,7 @@ nativelink-service = { git = "https://github.com/TraceMachina/nativelink", tag =
 nativelink-store = { git = "https://github.com/TraceMachina/nativelink", tag = "v1.8.3" }
 nativelink-util = { git = "https://github.com/TraceMachina/nativelink", tag = "v1.8.3" }
 nativelink-worker = { git = "https://github.com/TraceMachina/nativelink", tag = "v1.8.3" }
+num-traits = { default-features = false, version = "0.2.19" }
 object = { default-features = false, features = [
     "elf",
     "read_core",

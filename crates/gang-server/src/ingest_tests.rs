@@ -8,18 +8,19 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::{FutureExt, stream};
 use gang_authn::anonymous;
-use gang_clock::{Clock, TestClock};
-use gang_config::{BuildsConfig, EndpointTrust};
+use gang_clock::{Clock, TestClock, Timestamp};
+use gang_config::{BuildsConfig, EndpointTrust, LeadershipConfig};
+use gang_insight::Ingested;
 use gang_mtls::{ControllerKey, MAX_PROOF_BYTES, PROOF_HEADER, mint};
 use gang_spi::{
-    ApiRequestBody, ApiService, Authenticated, AuthenticationPort, BoxedError,
-    CertificateSignerPort, ControllerId, Observation, ObservationSink, Observations, Peer,
-    RequestGate, StateRepositoryPort,
+    ApiRequestBody, ApiService, Authenticated, AuthenticationPort, BoxedError, Call, CallOutcome,
+    CertificateSignerPort, ControllerId, Observation, ObservationSink, Observations, Origin, Peer,
+    RequestGate, Rpc, StateRepositoryPort, Traffic, Transferred,
 };
 use gang_testkit::TestSigner;
 use gang_tls::RevocationSet;
-use gang_types::{NonZeroDuration, PermissionSet};
-use gang_wire::ErrorReason;
+use gang_types::{BuildKey, InvocationId, NonZeroDuration, PermissionSet};
+use gang_wire::{ErrorReason, IngestTraffic};
 use http::{
     Request,
     header::{AUTHORIZATION, CONTENT_LENGTH},
@@ -45,6 +46,19 @@ use crate::test_support_session_harness::{Harness, HarnessOptions};
 const PATH: &str = "/v1/builds:ingest";
 const ISSUER: &str = "https://gang.example.test";
 const LIMIT: usize = 1024;
+/// The most follower traffic series an ingest keeps.
+const MAX_SERIES: NonZeroUsize = NonZeroUsize::new(8).expect("8 is non-zero");
+/// When the ingesting leader began leading.
+const TERM: Timestamp = Timestamp::from_unix_millis(100_000);
+
+/// Proofs are checked without skew and live ten seconds.
+fn leadership() -> LeadershipConfig {
+    LeadershipConfig {
+        ttl: NonZeroDuration::from_secs(10),
+        clock_skew: Duration::ZERO,
+        ..LeadershipConfig::default()
+    }
+}
 
 struct Fixture<K: Stack = TlsDeployment> {
     harness: Harness<K>,
@@ -74,7 +88,7 @@ async fn fixture_on<K: Stack<Signer = TestSigner, Clock = TestClock>>(
     .expect("server info");
     let leading = Leading::default();
     if leader {
-        leading.set();
+        leading.set(harness.clock.wall());
     }
     let (sink, observations) = ObservationSink::channel(
         NonZeroUsize::new(1).expect("nonzero"),
@@ -94,9 +108,9 @@ async fn fixture_on<K: Stack<Signer = TestSigner, Clock = TestClock>>(
             leading,
             key,
             ISSUER.to_owned(),
-            Duration::ZERO,
-            NonZeroDuration::from_secs(10),
+            &leadership(),
             8,
+            MAX_SERIES,
         ))
     } else {
         None
@@ -439,4 +453,459 @@ async fn accepted_batch_applies_calls_losses_and_queue_overflow() {
         .take_lost(|key, count| losses.push((key, count)));
     assert_eq!(unattributed, 2);
     assert_eq!(losses, vec![(call.origin.build, 4)]);
+}
+
+// Catches the API dropping the decoded traffic, keying a fresh series per request, or counting a
+// resent batch twice.
+#[tokio::test]
+async fn accepted_traffic_counts_its_increase_once() {
+    let f = fixture(true, true).await;
+    let proof = proof(&f, ISSUER).await;
+    let mut value = batch();
+    value["traffic"] = json!({
+        "startTime": f.harness.clock.wall().to_rfc3339(),
+        "lookups": 4,
+        "hits": 3,
+        "uploadedBytes": 2,
+        "downloadedBytes": 1,
+    });
+    for _ in 0..2 {
+        let mut req = request(encoded(&value), Arc::new(AtomicUsize::new(0)), true);
+        req.headers_mut()
+            .insert(PROOF_HEADER, proof.parse().expect("header"));
+        assert_eq!(send(&f, req).await.value(), json!({}));
+    }
+    assert_eq!(
+        f.observations.traffic(),
+        Traffic {
+            lookups: 4,
+            hits: 3,
+            uploaded: 2,
+            downloaded: 1,
+        }
+    );
+}
+
+/// An ingest whose leader leads since [`TERM`], with the observations its sink feeds.
+async fn traffic_ingest() -> (Ingest, Observations) {
+    capped_ingest(MAX_SERIES).await
+}
+
+/// [`traffic_ingest`] keeping at most `max_series` series.
+async fn capped_ingest(max_series: NonZeroUsize) -> (Ingest, Observations) {
+    let signer = TestSigner::authority().expect("signer");
+    let public_key = signer.public_key().await.expect("public key");
+    let key = ControllerKey::from_spki(&public_key).expect("controller key");
+    let leading = Leading::default();
+    leading.set(TERM);
+    let (sink, observations) = ObservationSink::channel(
+        NonZeroUsize::new(8).expect("nonzero"),
+        NonZeroUsize::new(8).expect("nonzero"),
+    );
+    let ingest = Ingest::new(
+        sink,
+        leading,
+        key,
+        ISSUER.to_owned(),
+        &leadership(),
+        8,
+        max_series,
+    );
+    (ingest, observations)
+}
+
+/// Totals that differ per counter, so a mixed-up counter shows, and whose growth never has more
+/// hits than lookups, as real traffic does.
+fn scaled(n: u64) -> Traffic {
+    Traffic {
+        lookups: n,
+        hits: n / 2,
+        uploaded: 3 * n,
+        downloaded: 4 * n,
+    }
+}
+
+/// A batch carrying only the cumulative totals `scaled(n)` of a process started at `start`.
+fn report(start: Timestamp, n: u64) -> Ingested {
+    let totals = scaled(n);
+    Ingested {
+        calls: Vec::new(),
+        lost: Vec::new(),
+        unattributed: 0,
+        traffic: Some(IngestTraffic {
+            start_time: start,
+            lookups: totals.lookups,
+            hits: totals.hits,
+            uploaded_bytes: totals.uploaded,
+            downloaded_bytes: totals.downloaded,
+        }),
+    }
+}
+
+// Catches counting cumulative totals instead of their increase, counting a resend twice, and a
+// restart that is ignored or subtracted instead of counted in full.
+#[tokio::test]
+async fn series_counts_increases_and_a_restart_in_full() {
+    let (ingest, observations) = traffic_ingest().await;
+    let a = ControllerId::new("a");
+    let first = TERM + Duration::from_secs(1);
+    let restart = TERM + Duration::from_secs(5);
+    let restarted = Traffic {
+        lookups: 18,
+        hits: 8,
+        uploaded: 54,
+        downloaded: 72,
+    };
+    for (now, start, n, total) in [
+        (2_000, first, 10, scaled(10)),
+        (3_000, first, 15, scaled(15)),
+        (4_000, first, 15, scaled(15)),
+        (6_000, restart, 3, restarted),
+    ] {
+        ingest.apply(&a, TERM + Duration::from_millis(now), report(start, n));
+        assert_eq!(observations.traffic(), total, "after {n} at {now}");
+    }
+}
+
+// Catches counting traffic a follower served before this leader's term.
+#[tokio::test]
+async fn series_started_before_the_term_only_sets_the_baseline() {
+    let (ingest, observations) = traffic_ingest().await;
+    let a = ControllerId::new("a");
+    let start = TERM - Duration::from_mins(1);
+    ingest.apply(&a, TERM + Duration::from_secs(1), report(start, 1000));
+    assert_eq!(observations.traffic(), Traffic::default());
+    ingest.apply(&a, TERM + Duration::from_secs(2), report(start, 1004));
+    assert_eq!(observations.traffic(), scaled(4));
+}
+
+// Catches a delayed, lower report lowering the stored totals, so the next report recounts.
+#[tokio::test]
+async fn regressing_totals_never_lower_the_series() {
+    let (ingest, observations) = traffic_ingest().await;
+    let a = ControllerId::new("a");
+    let start = TERM + Duration::from_secs(1);
+    ingest.apply(&a, TERM + Duration::from_secs(2), report(start, 10));
+    ingest.apply(&a, TERM + Duration::from_secs(3), report(start, 8));
+    assert_eq!(observations.traffic(), scaled(10));
+    ingest.apply(&a, TERM + Duration::from_secs(4), report(start, 12));
+    assert_eq!(observations.traffic(), scaled(12));
+}
+
+/// A batch carrying one call and the cumulative `totals` of a process started at `start`.
+fn report_with_call(start: Timestamp, totals: Traffic, call: Call) -> Ingested {
+    Ingested {
+        calls: vec![call],
+        lost: Vec::new(),
+        unattributed: 0,
+        traffic: Some(IngestTraffic {
+            start_time: start,
+            lookups: totals.lookups,
+            hits: totals.hits,
+            uploaded_bytes: totals.uploaded,
+            downloaded_bytes: totals.downloaded,
+        }),
+    }
+}
+
+/// A cache-service call of the build `one` of `alice`.
+fn cas_call() -> Call {
+    Call {
+        origin: Origin {
+            build: BuildKey {
+                principal: Arc::new(identity("alice")),
+                invocation: InvocationId::try_new("one").expect("valid invocation"),
+            },
+            correlated: None,
+            tool: None,
+            target: None,
+            mnemonic: None,
+        },
+        rpc: Rpc::Cas,
+        outcome: CallOutcome::Ok,
+        transferred: Transferred::default(),
+    }
+}
+
+// Catches a report where any counter went backwards being folded counter by counter (taking
+// the higher of each, or clamping), which counts growth from a report that cannot be trusted
+// and then undercounts the next valid one; and catches the rejection dropping the batch's calls.
+#[tokio::test]
+async fn a_report_with_any_counter_going_backwards_is_rejected_whole() {
+    let (ingest, mut observations) = traffic_ingest().await;
+    let a = ControllerId::new("a");
+    let start = TERM + Duration::from_secs(1);
+    let valid = Traffic {
+        lookups: 10,
+        hits: 6,
+        uploaded: 100,
+        downloaded: 100,
+    };
+    let mixed = Traffic {
+        lookups: 10,
+        hits: 7,
+        uploaded: 99,
+        downloaded: 101,
+    };
+    let later = Traffic {
+        lookups: 12,
+        hits: 8,
+        uploaded: 105,
+        downloaded: 103,
+    };
+    ingest.apply(
+        &a,
+        TERM + Duration::from_secs(2),
+        report_with_call(start, valid, cas_call()),
+    );
+    assert_eq!(observations.traffic(), valid);
+    ingest.apply(
+        &a,
+        TERM + Duration::from_secs(3),
+        report_with_call(start, mixed, cas_call()),
+    );
+    assert_eq!(
+        observations.traffic(),
+        valid,
+        "a backwards counter rejects the whole report"
+    );
+    ingest.apply(
+        &a,
+        TERM + Duration::from_secs(4),
+        report_with_call(start, later, cas_call()),
+    );
+    assert_eq!(
+        observations.traffic(),
+        later,
+        "growth counts from the last valid report"
+    );
+    for _ in 0..3 {
+        let delivered = observations
+            .next()
+            .await
+            .and_then(gang_spi::Delivery::into_observation);
+        assert_eq!(
+            delivered,
+            Some(Observation::Call(cas_call())),
+            "calls still record"
+        );
+    }
+}
+
+// Catches accepting growth no traffic can produce: every hit is a lookup, so a report adding
+// more hits than lookups is rejected whole even though no counter went backwards; otherwise a
+// step would show a hit without its lookup. The next valid report grows from the last valid one.
+#[tokio::test]
+async fn a_report_adding_more_hits_than_lookups_is_rejected_whole() {
+    let (ingest, mut observations) = traffic_ingest().await;
+    let a = ControllerId::new("a");
+    let start = TERM + Duration::from_secs(1);
+    let valid = Traffic {
+        lookups: 10,
+        hits: 6,
+        uploaded: 100,
+        downloaded: 100,
+    };
+    let impossible = Traffic {
+        lookups: 10,
+        hits: 7,
+        uploaded: 110,
+        downloaded: 105,
+    };
+    let later = Traffic {
+        lookups: 12,
+        hits: 8,
+        uploaded: 120,
+        downloaded: 110,
+    };
+    ingest.apply(
+        &a,
+        TERM + Duration::from_secs(2),
+        report_with_call(start, valid, cas_call()),
+    );
+    let at = TERM + Duration::from_secs(3);
+    ingest.apply(&a, at, report_with_call(start, impossible, cas_call()));
+    assert_eq!(
+        observations.traffic(),
+        valid,
+        "a hit without its lookup rejects the report"
+    );
+    ingest.apply(
+        &a,
+        TERM + Duration::from_secs(4),
+        report_with_call(start, later, cas_call()),
+    );
+    assert_eq!(
+        observations.traffic(),
+        later,
+        "growth counts from the last valid report"
+    );
+    for _ in 0..3 {
+        let delivered = observations
+            .next()
+            .await
+            .and_then(gang_spi::Delivery::into_observation);
+        assert_eq!(
+            delivered,
+            Some(Observation::Call(cas_call())),
+            "calls still record"
+        );
+    }
+}
+
+// Catches a rejected report refreshing its series, which would make the cap evict a series that
+// reported validly more recently instead.
+#[tokio::test]
+async fn a_rejected_report_keeps_its_series_least_recently_updated() {
+    let (ingest, observations) = capped_ingest(NonZeroUsize::new(2).expect("nonzero")).await;
+    let (a, b, c) = (
+        ControllerId::new("a"),
+        ControllerId::new("b"),
+        ControllerId::new("c"),
+    );
+    let start = TERM + Duration::from_secs(1);
+    let at = |secs| TERM + Duration::from_secs(secs);
+    ingest.apply(&a, at(2), report(start, 10));
+    ingest.apply(&b, at(3), report(start, 10));
+    ingest.apply(&a, at(4), report(start, 9));
+    ingest.apply(&c, at(5), report(start, 5));
+    assert_eq!(observations.traffic(), scaled(25));
+    ingest.apply(&b, at(6), report(start, 12));
+    assert_eq!(
+        observations.traffic(),
+        scaled(27),
+        "b was kept and adds only its growth"
+    );
+}
+
+// Catches forgetting a quiet follower's watermark (by age, or while others report), which would
+// count its whole totals again when it reports once more.
+#[tokio::test]
+async fn quiet_series_resume_without_recounting() {
+    let (ingest, observations) = traffic_ingest().await;
+    let a = ControllerId::new("a");
+    let b = ControllerId::new("b");
+    let start = TERM + Duration::from_secs(1);
+    ingest.apply(&a, TERM + Duration::from_secs(2), report(start, 10));
+    for hour in 1..=24 {
+        let now = TERM + Duration::from_hours(hour);
+        ingest.apply(&b, now, report(TERM - Duration::from_secs(1), 0));
+    }
+    ingest.apply(&a, TERM + Duration::from_hours(25), report(start, 10));
+    assert_eq!(
+        observations.traffic(),
+        scaled(10),
+        "an unchanged report adds nothing"
+    );
+    ingest.apply(&a, TERM + Duration::from_secs(90_001), report(start, 13));
+    assert_eq!(observations.traffic(), scaled(13));
+}
+
+// Catches a follower cut off for longer than the dashboard window being treated as new when it
+// reconnects: only what it counted meanwhile is added.
+#[tokio::test]
+async fn a_partitioned_follower_adds_only_what_it_counted_meanwhile() {
+    let (ingest, observations) = traffic_ingest().await;
+    let a = ControllerId::new("a");
+    let start = TERM + Duration::from_secs(1);
+    ingest.apply(&a, TERM + Duration::from_secs(2), report(start, 10));
+    ingest.apply(&a, TERM + Duration::from_hours(2), report(start, 25));
+    assert_eq!(observations.traffic(), scaled(25));
+}
+
+// Catches an unbounded map, evicting anything but the least recently updated series, a surviving
+// series recounted after an eviction, and an evicted series that can never report again.
+#[tokio::test]
+async fn the_cap_evicts_the_least_recently_updated_series() {
+    let (ingest, observations) = capped_ingest(NonZeroUsize::new(2).expect("nonzero")).await;
+    let (a, b, c) = (
+        ControllerId::new("a"),
+        ControllerId::new("b"),
+        ControllerId::new("c"),
+    );
+    let start = TERM + Duration::from_secs(1);
+    let at = |secs| TERM + Duration::from_secs(secs);
+    ingest.apply(&a, at(2), report(start, 10));
+    ingest.apply(&b, at(3), report(start, 10));
+    ingest.apply(&c, at(4), report(start, 5));
+    assert_eq!(observations.traffic(), scaled(25));
+    ingest.apply(&b, at(5), report(start, 12));
+    assert_eq!(
+        observations.traffic(),
+        scaled(27),
+        "b survived and adds only its growth"
+    );
+    ingest.apply(&a, at(6), report(start, 10));
+    assert_eq!(
+        observations.traffic(),
+        scaled(37),
+        "evicted a counts as a new process"
+    );
+}
+
+// Catches keying series by anything in the payload: two controllers reporting the same process
+// start and totals are two series.
+#[tokio::test]
+async fn series_are_keyed_by_the_admitted_controller() {
+    let (ingest, observations) = traffic_ingest().await;
+    let start = TERM + Duration::from_secs(1);
+    let now = TERM + Duration::from_secs(2);
+    ingest.apply(&ControllerId::new("a"), now, report(start, 10));
+    ingest.apply(&ControllerId::new("b"), now, report(start, 10));
+    assert_eq!(observations.traffic(), scaled(20));
+    ingest.apply(&ControllerId::new("a"), now, report(start, 10));
+    assert_eq!(observations.traffic(), scaled(20));
+}
+
+// Catches a delayed batch of an older process replacing the newer series, which would count the
+// old totals and then the newer process in full again.
+#[tokio::test]
+async fn delayed_older_process_does_not_replace_the_newer_one() {
+    let (ingest, observations) = traffic_ingest().await;
+    let a = ControllerId::new("a");
+    let older = TERM + Duration::from_secs(1);
+    let newer = TERM + Duration::from_secs(5);
+    ingest.apply(&a, TERM + Duration::from_secs(6), report(newer, 5));
+    ingest.apply(&a, TERM + Duration::from_secs(7), report(older, 100));
+    assert_eq!(observations.traffic(), scaled(5));
+    ingest.apply(&a, TERM + Duration::from_secs(8), report(newer, 7));
+    assert_eq!(observations.traffic(), scaled(7));
+}
+
+// Catches counting the bytes of forwarded calls on top of the series increase that already holds
+// them, and dropping the calls themselves.
+#[tokio::test]
+async fn forwarded_calls_are_recorded_without_counting_traffic() {
+    let (ingest, mut observations) = traffic_ingest().await;
+    let call = Call {
+        origin: Origin {
+            build: BuildKey {
+                principal: Arc::new(identity("alice")),
+                invocation: InvocationId::try_new("one").expect("valid invocation"),
+            },
+            correlated: None,
+            tool: None,
+            target: None,
+            mnemonic: None,
+        },
+        rpc: Rpc::Cas,
+        outcome: CallOutcome::Ok,
+        transferred: Transferred {
+            uploaded: 50,
+            downloaded: 70,
+        },
+    };
+    let mut batch = report(TERM + Duration::from_secs(1), 1);
+    batch.calls.push(call.clone());
+    ingest.apply(
+        &ControllerId::new("a"),
+        TERM + Duration::from_secs(2),
+        batch,
+    );
+    assert_eq!(observations.traffic(), scaled(1));
+    let delivered = observations
+        .next()
+        .await
+        .and_then(gang_spi::Delivery::into_observation);
+    assert_eq!(delivered, Some(Observation::Call(call)));
 }

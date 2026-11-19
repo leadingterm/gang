@@ -15,6 +15,9 @@ use http::{HeaderMap, Method, Request, Version};
 use nativelink_proto::build::bazel::remote::execution::v2::{
     GetActionResultRequest, RequestMetadata,
 };
+use nativelink_proto::google::bytestream::{
+    ReadRequest, ReadResponse, WriteRequest, WriteResponse,
+};
 use prost::Message;
 use rustls_pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -29,6 +32,8 @@ use crate::identity::{Admission, Channel, ChannelEvent, Reply};
 /// The REAPI Capabilities method, which every authenticated client may call.
 const CAPABILITIES_PATH: &str = "/build.bazel.remote.execution.v2.Capabilities/GetCapabilities";
 const ACTION_RESULT_PATH: &str = "/build.bazel.remote.execution.v2.ActionCache/GetActionResult";
+const BYTESTREAM_WRITE_PATH: &str = "/google.bytestream.ByteStream/Write";
+const BYTESTREAM_READ_PATH: &str = "/google.bytestream.ByteStream/Read";
 const REQUEST_METADATA_HEADER: &str = "build.bazel.remote.execution.v2.requestmetadata-bin";
 
 /// An empty gRPC message: no compression flag and a zero length.
@@ -207,6 +212,98 @@ impl H2Channel {
             .map_err(|_| E2eError::timeout("requesting an ActionCache result", timeout))?
         })
     }
+
+    pub(crate) fn write_blob(
+        &mut self,
+        request: &WriteRequest,
+        metadata: &RequestMetadata,
+        timeout: Duration,
+    ) -> Result<i64> {
+        let messages = self.bytestream(BYTESTREAM_WRITE_PATH, request, metadata, timeout)?;
+        if messages.len() != 1 {
+            return Err(E2eError::system(
+                "ByteStream write did not return one response",
+            ));
+        }
+        let response = WriteResponse::decode(messages[0].as_slice())
+            .map_err(E2eError::system_from("decoding ByteStream write response"))?;
+        Ok(response.committed_size)
+    }
+
+    pub(crate) fn read_blob(
+        &mut self,
+        request: &ReadRequest,
+        metadata: &RequestMetadata,
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
+        let messages = self.bytestream(BYTESTREAM_READ_PATH, request, metadata, timeout)?;
+        let mut data = Vec::new();
+        for message in messages {
+            let response = ReadResponse::decode(message.as_slice())
+                .map_err(E2eError::system_from("decoding ByteStream read response"))?;
+            data.extend_from_slice(&response.data);
+        }
+        Ok(data)
+    }
+
+    fn bytestream(
+        &mut self,
+        path: &str,
+        request: &impl Message,
+        metadata: &RequestMetadata,
+        timeout: Duration,
+    ) -> Result<Vec<Vec<u8>>> {
+        let uri = Url::parse(&self.capabilities)
+            .and_then(|url| url.join(path))
+            .map_err(E2eError::system_from("joining ByteStream path"))?
+            .to_string();
+        let length = u32::try_from(request.encoded_len())
+            .map_err(E2eError::system_from("encoding ByteStream request length"))?;
+        let mut frame = Vec::with_capacity(5 + request.encoded_len());
+        frame.push(0);
+        frame.extend_from_slice(&length.to_be_bytes());
+        request
+            .encode(&mut frame)
+            .map_err(E2eError::system_from("encoding ByteStream request"))?;
+        let metadata = STANDARD_NO_PAD.encode(metadata.encode_to_vec());
+        let sender = self.sender.clone();
+        let token = self.token.as_deref();
+        self.runtime.block_on(async {
+            tokio::time::timeout(timeout, async {
+                let exchange = Exchange::open(sender, &uri, token, Some(&metadata))
+                    .await?
+                    .ok_or_else(|| E2eError::system("opening ByteStream request failed"))?;
+                let (status, body) = exchange.finish_with_body(Bytes::from(frame)).await?;
+                if status != Some(0) {
+                    return Err(E2eError::system(format!(
+                        "ByteStream gRPC status {status:?}"
+                    )));
+                }
+                let mut messages = Vec::new();
+                let mut remaining = body.as_slice();
+                while !remaining.is_empty() {
+                    if remaining.len() < 5 || remaining[0] != 0 {
+                        return Err(E2eError::system("invalid ByteStream gRPC frame header"));
+                    }
+                    let length = u32::from_be_bytes([
+                        remaining[1],
+                        remaining[2],
+                        remaining[3],
+                        remaining[4],
+                    ]) as usize;
+                    remaining = &remaining[5..];
+                    if remaining.len() < length {
+                        return Err(E2eError::system("truncated ByteStream gRPC frame"));
+                    }
+                    messages.push(remaining[..length].to_vec());
+                    remaining = &remaining[length..];
+                }
+                Ok(messages)
+            })
+            .await
+            .map_err(|_| E2eError::timeout("requesting ByteStream", timeout))?
+        })
+    }
 }
 
 impl Channel for H2Channel {
@@ -326,6 +423,40 @@ impl Exchange {
             .await
             .map_err(E2eError::system_from("reading the gRPC response trailers"))?;
         Ok(trailers.as_ref().and_then(grpc_status))
+    }
+
+    async fn finish_with_body(mut self, message: Bytes) -> Result<(Option<u32>, Vec<u8>)> {
+        let _ = self.body.send_data(message, true);
+        let response = self
+            .response
+            .await
+            .map_err(E2eError::system_from("receiving the gRPC response"))?;
+        let (parts, mut body) = response.into_parts();
+        if parts.status != http::StatusCode::OK {
+            return Err(E2eError::system(format!(
+                "ByteStream HTTP status {}",
+                parts.status
+            )));
+        }
+        let head_status = grpc_status(&parts.headers);
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.map_err(E2eError::system_from("reading the gRPC response body"))?;
+            bytes.extend_from_slice(&chunk);
+            body.flow_control()
+                .release_capacity(chunk.len())
+                .map_err(E2eError::system_from(
+                    "releasing response flow-control capacity",
+                ))?;
+        }
+        let trailers = body
+            .trailers()
+            .await
+            .map_err(E2eError::system_from("reading the gRPC response trailers"))?;
+        Ok((
+            trailers.as_ref().and_then(grpc_status).or(head_status),
+            bytes,
+        ))
     }
 
     /// Classifies the response using the existing Capabilities semantics.

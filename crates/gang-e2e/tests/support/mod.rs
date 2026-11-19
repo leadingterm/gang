@@ -532,6 +532,10 @@ struct SimState {
     completed: u64,
     /// Whether the provisioner's supply is held, so that no pass places a queued action.
     supply_held: bool,
+    /// Whether newly launched workers are held before registration.
+    launches_held: bool,
+    /// Instances awaiting worker registration behind the launch gate.
+    pending_launches: Vec<(&'static str, u32)>,
     /// The builds begun before the supply was last held.
     held_after: u32,
     /// The actions queued while the supply is held.
@@ -567,6 +571,8 @@ impl Simulation {
                 attempts: 0,
                 completed: 0,
                 supply_held: false,
+                launches_held: false,
+                pending_launches: Vec::new(),
                 held_after: 0,
                 queued: 0,
             }),
@@ -684,24 +690,26 @@ impl Simulation {
         }
     }
 
+    /// The isolation probe's report for the action's namespaces.
+    fn isolation_report(&self, namespaces: Namespaces) -> IsolationReport {
+        IsolationReport {
+            namespaces,
+            cwd: SIM_CWD.to_owned(),
+            cwd_name: SIM_CWD_NAME.to_owned(),
+            parent_name: SIM_PARENT_NAME.to_owned(),
+            parent_entries: self.parent_entries(),
+            grandparent_name: SIM_GRANDPARENT_NAME.to_owned(),
+            grandparent_entries: vec![SIM_PARENT_NAME.to_owned()],
+            great_grandparent_entries: self.great_grandparent_entries(),
+            cwd_writable: true,
+        }
+    }
+
     /// The report `probe` writes when it runs under `sandbox`, or `None` when it writes none.
     fn report_for(&self, probe: Probe, sandbox: Sandbox) -> Option<String> {
         let namespaces = self.namespaces(sandbox);
         match probe {
-            Probe::Isolated => Some(
-                IsolationReport {
-                    namespaces,
-                    cwd: SIM_CWD.to_owned(),
-                    cwd_name: SIM_CWD_NAME.to_owned(),
-                    parent_name: SIM_PARENT_NAME.to_owned(),
-                    parent_entries: self.parent_entries(),
-                    grandparent_name: SIM_GRANDPARENT_NAME.to_owned(),
-                    grandparent_entries: vec![SIM_PARENT_NAME.to_owned()],
-                    great_grandparent_entries: self.great_grandparent_entries(),
-                    cwd_writable: true,
-                }
-                .to_string(),
-            ),
+            Probe::Isolated => Some(self.isolation_report(namespaces).to_string()),
             Probe::NetworkRequested => {
                 let requested = if self.variant.permit_network == PermitNetwork::Permitted {
                     HOST_NET
@@ -751,7 +759,8 @@ impl Simulation {
             | Probe::ControllerLoss5
             | Probe::ControllerLoss6
             | Probe::ControllerLoss7 => Some("held=released\n".to_owned()),
-            Probe::MemoryEscalation
+            Probe::CacheVisibility
+            | Probe::MemoryEscalation
             | Probe::DiskGuarded
             | Probe::TimeoutChild
             | Probe::TermTrap
@@ -784,6 +793,7 @@ impl Simulation {
                 }
                 .to_string(),
             ),
+            _ => Some("ran=yes\n".to_owned()),
         }
     }
 
@@ -893,10 +903,14 @@ impl Simulation {
                 Self::record(state, fleet.name, change)?;
             }
             for &number in &numbers {
-                let change = EventChange::WorkerRegistered {
-                    worker: worker_name(number)?,
-                };
-                Self::record(state, fleet.name, change)?;
+                if state.launches_held {
+                    state.pending_launches.push((fleet.name, number));
+                } else {
+                    let change = EventChange::WorkerRegistered {
+                        worker: worker_name(number)?,
+                    };
+                    Self::record(state, fleet.name, change)?;
+                }
             }
             scaled = true;
         }
@@ -1043,6 +1057,7 @@ pub(crate) fn state_frame(
         events_limit: EVENTS_LIMIT,
         completed,
         recent: Recent::default(),
+        cache: gang_wire::Cache::default(),
         builds: Vec::new(),
         principals_epoch: 0,
     }
@@ -1156,6 +1171,8 @@ impl Simulation {
                 needed: count,
                 vcpus: 0,
                 memory: 0,
+                readiness: None,
+                expected_wait: None,
             },
         })
     }
@@ -1193,7 +1210,16 @@ impl Simulation {
 
     /// The live state of the deployment as `state` has it, numbered by the events recorded so far.
     fn snapshot(&self, state: &SimState) -> Result<State> {
-        let (fleets, workers) = self.rows(&state.instances, &Phase::Idle)?;
+        let (mut fleets, mut workers) = self.rows(&state.instances, &Phase::Idle)?;
+        for (name, number) in &state.pending_launches {
+            let worker = worker_name(*number)?;
+            let fleet_name = fleet_name(name)?;
+            workers.retain(|row| row.name != worker);
+            if let Some(fleet) = fleets.iter_mut().find(|fleet| fleet.name == fleet_name) {
+                fleet.workers.idle = fleet.workers.idle.saturating_sub(1);
+                fleet.workers.unconnected += 1;
+            }
+        }
         let seq = sequence(state.events.len());
         let mut frame = state_frame(
             seq,
@@ -1252,6 +1278,7 @@ impl Simulation {
                 events,
                 completed: None,
                 recent: None,
+                cache: None,
                 builds: None,
                 principals_epoch: None,
             };
@@ -1358,6 +1385,9 @@ impl System for Simulation {
     fn worker_count(&self) -> Result<usize> {
         let mut state = self.state.lock();
         let running: usize = state.instances.iter().map(Vec::len).sum();
+        if !state.pending_launches.is_empty() {
+            return Ok(running.saturating_sub(state.pending_launches.len()));
+        }
         if running == 0 {
             return Ok(0);
         }
@@ -1493,6 +1523,31 @@ impl Control for Simulation {
         Ok(())
     }
 
+    fn hold_launches(&self) -> Result<()> {
+        self.state.lock().launches_held = true;
+        Ok(())
+    }
+
+    fn release_launches(&self) -> Result<()> {
+        let mut state = self.state.lock();
+        state.launches_held = false;
+        for (fleet, number) in std::mem::take(&mut state.pending_launches) {
+            Self::record(
+                &mut state,
+                fleet,
+                EventChange::WorkerRegistered {
+                    worker: worker_name(number)?,
+                },
+            )?;
+        }
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    fn build_additional_run(&self, probes: &[Probe], run: &Run) -> Result<BuildOutcome> {
+        self.build_run(probes, run)
+    }
+
     fn stop_workers(&self) -> Result<usize> {
         Err(E2eError::system(
             "the fleets simulation runs no worker process to stop",
@@ -1568,7 +1623,10 @@ impl Simulation {
             if self.scale_out(&mut state, &batch_placed)? {
                 self.changed.notify_all();
                 let scaled_under = state.starts;
-                while state.pid.is_none() || (self.slow_boot && state.starts == scaled_under) {
+                while state.pid.is_none()
+                    || state.launches_held
+                    || (self.slow_boot && state.starts == scaled_under)
+                {
                     self.changed.wait(&mut state);
                 }
             }

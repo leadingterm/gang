@@ -1,6 +1,6 @@
 // Builds observed in the recent window, and older builds still held by the server.
 import { useEffect, useState } from "preact/hooks";
-import { percent } from "../format.ts";
+import { bytes, percent } from "../format.ts";
 import { identityOf, ms, seconds, splitIdentity } from "../wire-parse.ts";
 import type { ActionTime, Build } from "../wire.ts";
 import { Cell, Clock, Duration, Empty, Ident, Num, Row, Section, Since, Table, useClient } from "../ui.tsx";
@@ -37,6 +37,7 @@ const BuildRow = ({ build }: { build: Build }) => {
       <Cell cls="a-age"><span class="build-label">Span </span><Duration ms={ms(build.lastActiveTime) - ms(build.startTime)} /></Cell>
       <Cell cls="a-m1"><span class="build-label">State </span><span class={build.state === "IDLE" ? "tag" : "tag tag--spot"}>{build.state}</span></Cell>
       <Cell cls="a-m2"><span class="build-label">Remote cache </span>{percent(cache.hits, cache.hits + cache.misses + cache.errors)}</Cell>
+      <Cell cls="a-span"><span class="build-label">Transferred </span>↓ {bytes(cache.downloadedBytes)} ↑ {bytes(cache.uploadedBytes)}</Cell>
       <Cell><span class="build-label">Executed </span>{build.usage.executions.completed + build.usage.executions.failed}</Cell>
       <Cell><span class="build-label">Queued share </span>{percent(seconds(time.queued), actionSeconds(time))}</Cell>
     </Row>
@@ -50,6 +51,7 @@ const BuildTable = ({ builds }: { builds: readonly Build[] }) => (
     { head: "Span" },
     { head: "State" },
     { head: "Remote cache" },
+    { head: "Transferred" },
     { head: "Executed" },
     { head: "Queued share" },
   ]}>

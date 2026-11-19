@@ -1,6 +1,6 @@
 # ADR-40: The server owns the dashboard's recent history
 
-Status: Accepted. Supersedes ADR-25's "no server-side phase history"; amends ADR-27 (a watched pass always sends a delta).
+Status: Accepted. Supersedes ADR-25's "no server-side phase history"; amends ADR-27 (a watched pass always sends a delta). Amended by [ADR-55](adr-55-cache-facts-at-their-owners.md) for farm-wide cache traffic and evictions.
 
 ## Context
 - The dashboard accumulated its charts in the browser (ADR-25): `Done / min` showed `–` for the first seconds, the spark, the control-pass strip and the worker lanes started empty, and two viewers of one farm saw different numbers depending on when they opened the page.

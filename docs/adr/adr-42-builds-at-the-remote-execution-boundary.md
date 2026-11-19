@@ -1,6 +1,6 @@
 # ADR-42: Builds are observed at the remote-execution boundary
 
-Status: Accepted.
+Status: Accepted. Amended by [ADR-55](adr-55-cache-facts-at-their-owners.md) for cache-service body completion and transferred bytes.
 
 ## Context
 - Users ask why a build was slow and how often the cache hit. Gang sees every remote call; Bazel's Build Event Service would add client truth.

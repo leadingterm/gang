@@ -16,13 +16,13 @@ use gang_spi::{
     ExpiringRecordPort, FleetInstance, FleetOptions, FleetSupply, Held, HostMilestone, Insert,
     InstanceIdentity, IssuedCertRecord, IssuedCertificate, IssuedToken, LeaderLeasePort, Lease,
     LeaseEpoch, ListingLimits, LoginChallenge, LoginClient, LoginGrant, LoginPort, LoginRequest,
-    LoginSupport, MountedScratchVolume, NodeLifecyclePort, Plugin, PluginContext, PortError,
-    PreemptionNotice, PrincipalRecord, ProofVerifierPort, ProvisionerPort, QueuedDemand, Record,
-    RecordKey, RecordVersion, RecordedScalingEvent, Rejection, Remove, RenderedStoreSpec, Renewal,
-    Replace, RequestGate, RevocationEpoch, SandboxPrograms, SandboxedAction, ScalingAuditEvent,
-    ScalingEventSeq, SchedulerPort, SchedulerSnapshot, Scheme, ScratchVolumePort,
-    SignatureAlgorithm, StateRepositoryPort, StoreAccess, Subject, TokenIssue, WorkerSpec,
-    WorkerTls, WorkloadCredentialPort,
+    LoginSupport, MeasuredUsage, MountedScratchVolume, NodeLifecyclePort, Plugin, PluginContext,
+    PortError, PreemptionNotice, PrincipalRecord, ProofVerifierPort, ProvisionerPort, QueuedDemand,
+    Record, RecordKey, RecordVersion, RecordedScalingEvent, Rejection, Remove, RenderedStoreSpec,
+    Renewal, Replace, RequestGate, RevocationEpoch, SandboxPrograms, SandboxedAction,
+    ScalingAuditEvent, ScalingEventSeq, SchedulerPort, SchedulerSnapshot, Scheme,
+    ScratchVolumePort, SignatureAlgorithm, StateRepositoryPort, StoreAccess, Subject, TokenIssue,
+    WorkerSpec, WorkerTls, WorkloadCredentialPort,
 };
 use gang_types::{
     ActionResources, AuthenticationSettings, Bytes, CertSerial, Fleet, FleetName, FleetSet,
@@ -300,6 +300,10 @@ macro_rules! cache_plugin {
             fn worker_access(&self) -> StoreAccess {
                 StoreAccess::ViaController
             }
+
+            async fn measured_usage(&self) -> Result<Option<MeasuredUsage>, PortError> {
+                Ok(None)
+            }
         }
     };
 }
@@ -359,12 +363,14 @@ impl SchedulerPort for Stub {
         into.workers.clear();
         // An empty worker list is sorted by id.
         into.queued.clear();
+        into.executing.clear();
         let candidates = FleetSet::prefix(1).map_err(PortError::backend)?;
         into.queued.push(QueuedDemand {
             candidates,
             resources: ActionResources::default(),
             queued_since: Timestamp::UNIX_EPOCH,
             priority: i32::try_from(self.number).map_err(PortError::backend)?,
+            expected: None,
         });
         Ok(())
     }

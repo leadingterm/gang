@@ -47,7 +47,8 @@ pub mod time;
 pub use build::{
     ActionTime, Build, BuildState, CacheCounts, Executions, IngestBuildsRequest,
     IngestBuildsResponse, IngestCall, IngestLoss, IngestOrigin, IngestOutcome, IngestRpc,
-    ListBuildsResponse, MissedTarget, MnemonicUsage, SlowAction, Timeline, TimelineBucket, Usage,
+    IngestTraffic, ListBuildsResponse, MissedTarget, MnemonicUsage, SlowAction, Timeline,
+    TimelineBucket, Usage,
 };
 pub use certificate::{Certificate, CreateCertificateRequest};
 pub use device::{
@@ -78,7 +79,8 @@ pub use session::{
     AuthenticateRequest, AuthenticateResponse, CookieNames, Credential, Session, SessionLogin,
 };
 pub use state::{
-    Actions, Demand, Fleet, Instance, InstanceCounts, InstanceSize, LaunchFailure, Lifecycle,
-    Named, Pass, PassState, Phase, PhaseSpan, Policy, Queue, QueuedAction, Recent, RunningAction,
-    Sample, SkipReason, State, Truncated, Worker, WorkerCounts,
+    Actions, BucketUsage, Cache, CacheStore, Demand, Fleet, Instance, InstanceCounts, InstanceSize,
+    LaunchFailure, Lifecycle, Named, Pass, PassState, Phase, PhaseSpan, Policy, Queue,
+    QueuedAction, Recent, RunningAction, Sample, SkipReason, State, StoreUsage, Truncated, Worker,
+    WorkerCounts,
 };

@@ -83,6 +83,15 @@ fn failure_evidence(placement: &Placement, limit: usize) -> String {
     )
 }
 
+/// Creates the private signal directory and its hold-probe FIFO.
+fn signal_in(directory: &Path) -> Result<(PathBuf, crate::hold::Signal)> {
+    gang_os::fs::ensure_private_dir(directory)
+        .map_err(E2eError::system_from("creating the signal directory"))?;
+    let path = directory.join("started");
+    let signal = crate::hold::Signal::create(&path)?;
+    Ok((path, signal))
+}
+
 /// A running `gang` deployment and the Bazel workspace that builds against it.
 pub struct Stack<'a> {
     placement: Placement,
@@ -106,6 +115,8 @@ pub struct Stack<'a> {
     signal_path: PathBuf,
     /// The harness's end of the pipe at `signal_path`, which the hold action signals through.
     signal: crate::hold::Signal,
+    /// The launch gate path and its held writer, when enabled for this scenario.
+    launch_gate: Option<(PathBuf, Mutex<Option<fs::File>>)>,
     salt: String,
     issuer: &'a TestIssuer,
     /// The CA pin of a mutual-TLS deployment; `None` for a plaintext one.
@@ -151,15 +162,18 @@ impl<'a> Stack<'a> {
 
         let salt = sample::salt()?;
         let signal_dir = placement.root().join(format!("signal-{salt}"));
-        gang_os::fs::ensure_private_dir(&signal_dir)
-            .map_err(E2eError::system_from("creating the signal directory"))?;
-        let signal_path = signal_dir.join("started");
-        let signal = crate::hold::Signal::create(&signal_path)?;
+        let (signal_path, signal) = signal_in(&signal_dir)?;
 
+        let gate_path = variant
+            .control
+            .holdable_launches
+            .then(|| signal_dir.join("launch-gate"));
         let template = ConfigTemplate::parse(&invocation.base_config)?
             .place(&placement, transport)?
             .vary(variant, &settings.worker_launcher, &invocation.action_tools)?
-            .with_signal_dir(&signal_dir)?;
+            .with_signal_dir(&signal_dir)?
+            .with_launch_gate(gate_path.as_deref(), settings.history_timeout)?;
+        let launch_gate = gate_path.map(|path| (path, Mutex::new(None)));
         let (template, ca_pin, signer_key) = match transport {
             Transport::Tls => {
                 let template = template.with_identity(issuer.url(), variant.identity)?;
@@ -228,6 +242,7 @@ impl<'a> Stack<'a> {
             tmp_path,
             signal_path,
             signal,
+            launch_gate,
             salt,
             issuer,
             ca_pin,
@@ -248,6 +263,41 @@ impl<'a> Stack<'a> {
     #[must_use]
     pub(crate) const fn placement(&self) -> &Placement {
         &self.placement
+    }
+    /// Holds launches by keeping a private FIFO open until release.
+    pub(crate) fn hold_worker_launches(&self) -> Result<()> {
+        let (path, held) = self
+            .launch_gate
+            .as_ref()
+            .ok_or_else(|| E2eError::system("worker launch gate is not enabled"))?;
+        let mut held = held.lock();
+        if held.is_some() {
+            return Err(E2eError::system("worker launches are already held"));
+        }
+        let pending = path.with_extension("pending");
+        let file = crate::fifo::create_private(&pending, "the launch gate")?;
+        if let Err(error) = fs::rename(&pending, path) {
+            let _ = fs::remove_file(&pending);
+            return Err(E2eError::io(format!("publishing {}", path.display()))(
+                error,
+            ));
+        }
+        *held = Some(file);
+        Ok(())
+    }
+
+    /// Unlinks the gate before closing its writer, broadcasting EOF to every waiting launcher.
+    pub(crate) fn release_worker_launches(&self) -> Result<()> {
+        let (path, held) = self
+            .launch_gate
+            .as_ref()
+            .ok_or_else(|| E2eError::system("worker launch gate is not enabled"))?;
+        let mut held = held.lock();
+        if held.is_some() {
+            fs::remove_file(path).map_err(E2eError::io(format!("removing {}", path.display())))?;
+            held.take();
+        }
+        Ok(())
     }
 
     /// Stages another copy of the sample this deployment was staged from, with the same parameters.
@@ -511,13 +561,12 @@ impl<'a> Stack<'a> {
         }
     }
 
-    /// Waits on the state stream, checking the authoritative GET state on each frame.
+    /// Waits for the state reconstructed from the stream to satisfy the condition.
     pub(crate) fn wait_live_state(
         &self,
         timeout: Duration,
         mut done: impl FnMut(&State) -> bool,
     ) -> Result<State> {
-        let api = self.state_api()?;
         let mut stream = self.state_api()?.open_stream()?;
         if stream.status() != STREAM_OK {
             return Err(E2eError::system(format!(
@@ -525,23 +574,7 @@ impl<'a> Stack<'a> {
                 stream.status()
             )));
         }
-        let mut observed = None;
-        let mut failed = None;
-        sse::await_frames(&mut stream, timeout, &mut |_| match api.state() {
-            Ok(state) if done(&state) => {
-                observed = Some(state);
-                true
-            }
-            Ok(_) => false,
-            Err(error) => {
-                failed = Some(error);
-                true
-            }
-        })?;
-        if let Some(error) = failed {
-            return Err(error);
-        }
-        observed.ok_or_else(|| E2eError::system("the state stream ended without a matching state"))
+        sse::await_state(&mut stream, timeout, &mut done)
     }
 
     /// A concurrent build needs its own Bazel server; one output base serializes invocations.
@@ -1081,11 +1114,33 @@ impl Drop for Stack<'_> {
     /// Kills the server, terminates workers, and stops the Bazel server.
     fn drop(&mut self) {
         let child = self.server.lock().take();
-        if let Some(mut child) = child {
-            let _ = child.kill();
-        }
-        if let Err(error) = process::terminate_workers(&self.config_file) {
-            eprintln!("worker cleanup for {}: {error}", self.config_file.display());
+        let server_stopped = if let Some(mut child) = child {
+            match child.kill() {
+                Ok(()) => true,
+                Err(error) => {
+                    eprintln!("server cleanup for {}: {error}", self.config_file.display());
+                    false
+                }
+            }
+        } else {
+            true
+        };
+        let workers_stopped = match process::terminate_workers(&self.config_file) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("worker cleanup for {}: {error}", self.config_file.display());
+                false
+            }
+        };
+        if server_stopped
+            && workers_stopped
+            && self.launch_gate.is_some()
+            && let Err(error) = self.release_worker_launches()
+        {
+            eprintln!(
+                "launch gate cleanup for {}: {error}",
+                self.config_file.display()
+            );
         }
         if let Ok(remote) = self.remote() {
             self.bazel.shutdown(&remote);

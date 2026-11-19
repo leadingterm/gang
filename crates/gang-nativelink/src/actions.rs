@@ -7,10 +7,10 @@ use gang_clock::Timestamp;
 use gang_spi::{ActionInfo, ActionsView, ListingLimits, QueuedActionView, RunningActionView};
 use gang_types::{BuildId, Identity};
 use gang_types::{FleetCatalog, WorkerId};
-use nativelink_error::Error;
+use nativelink_error::{Code, Error};
 use nativelink_scheduler::worker_scheduler::WorkerSummary;
 use nativelink_util::action_messages::{
-    ActionInfo as NativeActionInfo, ActionState, WorkerId as NativeWorkerId,
+    ActionInfo as NativeActionInfo, ActionStage, ActionState, WorkerId as NativeWorkerId,
 };
 use nativelink_util::common::DigestInfo;
 use nativelink_util::operation_state_manager::{
@@ -76,14 +76,15 @@ async fn running(
             continue;
         };
         let mut operations = scheduler
-            .filter_operations(OperationFilter {
-                stages: OperationStageFlags::Executing,
-                worker_id: Some(NativeWorkerId::from(summary.id.clone())),
-                ..OperationFilter::default()
-            })
+            .filter_operations(executing_filter(&summary.id))
             .await?;
         while let Some(result) = operations.next().await {
-            let (state, origin) = result.as_state().await?;
+            let Some((state, origin)) = still_listed(result.as_state().await)? else {
+                continue;
+            };
+            if !matches!(state.stage, ActionStage::Executing) {
+                continue;
+            }
             rows.push(RunningRow {
                 state,
                 origin,
@@ -106,7 +107,10 @@ async fn running(
         result,
     } in rows.into_iter().take(limit)
     {
-        let row = read(state, origin, &*result).await?;
+        let Some(row) = read(state, origin, &*result).await? else {
+            continue;
+        };
+        let row = display(row);
         into.running.push(RunningActionView {
             info: ActionInfo {
                 op: row.op,
@@ -130,20 +134,16 @@ async fn queued(
     limit: usize,
     into: &mut ActionsView,
 ) -> Result<(), Error> {
-    let mut listing = scheduler
-        .filter_operations(OperationFilter {
-            stages: OperationStageFlags::Queued,
-            order_by_priority_direction: Some(OrderDirection::Desc),
-            ..OperationFilter::default()
-        })
-        .await?;
+    let mut listing = scheduler.filter_operations(queued_filter()).await?;
     while let Some(result) = listing.next().await {
         if into.queued.len() >= limit {
             into.truncated_queued += 1;
             continue;
         }
-        let (state, origin) = result.as_state().await?;
-        let row = read(state, origin, &*result).await?;
+        let Some(row) = read_operation(&*result, OperationStageFlags::Queued).await? else {
+            continue;
+        };
+        let row = display(row);
         let properties = &row.info.platform_properties;
         let candidates = fleets.accepting(|key| properties.get(key).map(String::as_str));
         let refusal = if candidates.is_empty() {
@@ -168,7 +168,69 @@ async fn queued(
     Ok(())
 }
 
-/// One operation read from a listing, with the fields both listings need.
+pub(crate) fn queued_filter() -> OperationFilter {
+    OperationFilter {
+        stages: OperationStageFlags::Queued,
+        order_by_priority_direction: Some(OrderDirection::Desc),
+        ..OperationFilter::default()
+    }
+}
+
+pub(crate) fn executing_filter(worker: &str) -> OperationFilter {
+    OperationFilter {
+        stages: OperationStageFlags::Executing,
+        worker_id: Some(NativeWorkerId::from(worker.to_owned())),
+        ..OperationFilter::default()
+    }
+}
+
+/// A listed operation without allocating its display representation.
+pub(crate) struct Operation {
+    pub(crate) state: Arc<ActionState>,
+    pub(crate) info: Arc<NativeActionInfo>,
+    pub(crate) origin: Option<OriginMetadata>,
+}
+
+pub(crate) fn still_listed<T>(read: Result<T, Error>) -> Result<Option<T>, Error> {
+    match read {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if matches!(error.code, Code::NotFound | Code::InvalidArgument) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) async fn read(
+    state: Arc<ActionState>,
+    origin: Option<OriginMetadata>,
+    result: &dyn ActionStateResult,
+) -> Result<Option<Operation>, Error> {
+    let Some((info, _)) = still_listed(result.as_action_info().await)? else {
+        return Ok(None);
+    };
+    Ok(Some(Operation {
+        state,
+        info,
+        origin,
+    }))
+}
+
+pub(crate) async fn read_operation(
+    result: &dyn ActionStateResult,
+    required: OperationStageFlags,
+) -> Result<Option<Operation>, Error> {
+    let Some((state, origin)) = still_listed(result.as_state().await)? else {
+        return Ok(None);
+    };
+    let matches_stage = (required == OperationStageFlags::Queued
+        && matches!(state.stage, ActionStage::Queued))
+        || (required == OperationStageFlags::Executing
+            && matches!(state.stage, ActionStage::Executing));
+    if !matches_stage {
+        return Ok(None);
+    }
+    read(state, origin, result).await
+}
+
 struct Listed {
     op: String,
     digest: String,
@@ -179,13 +241,13 @@ struct Listed {
     info: Arc<NativeActionInfo>,
 }
 
-/// Reads an operation's action info and combines it with its state and request metadata.
-async fn read(
-    state: Arc<ActionState>,
-    origin: Option<OriginMetadata>,
-    result: &dyn ActionStateResult,
-) -> Result<Listed, Error> {
-    let (info, _) = result.as_action_info().await?;
+fn display(
+    Operation {
+        state,
+        info,
+        origin,
+    }: Operation,
+) -> Listed {
     let build = origin.as_ref().and_then(|origin| {
         let principal = Arc::new(origin.identity.parse::<Identity>().ok()?);
         Some(
@@ -198,7 +260,7 @@ async fn read(
         || (String::new(), String::new()),
         |metadata| (metadata.target_id, metadata.action_mnemonic),
     );
-    Ok(Listed {
+    Listed {
         op: state.client_operation_id.to_string(),
         digest: digest_text(state.action_digest),
         target,
@@ -206,11 +268,11 @@ async fn read(
         started: Timestamp::from(state.last_transition_timestamp),
         build,
         info,
-    })
+    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -252,13 +314,15 @@ mod tests {
 
     /// A fake operation: the state and action info a listing yields, plus its request metadata.
     #[derive(Clone)]
-    struct Row {
+    pub(crate) struct Row {
         state: Arc<ActionState>,
         info: Arc<NativeActionInfo>,
         origin: Option<RequestMetadata>,
         identity: String,
         state_reads: Arc<AtomicUsize>,
         info_reads: Arc<AtomicUsize>,
+        pub(crate) state_error: Option<Code>,
+        pub(crate) info_error: Option<Code>,
     }
 
     impl Row {
@@ -273,6 +337,9 @@ mod tests {
     #[async_trait]
     impl ActionStateResult for Row {
         async fn as_state(&self) -> Result<(Arc<ActionState>, Option<OriginMetadata>), Error> {
+            if let Some(code) = self.state_error {
+                return Err(Error::new(code, "state read".to_owned()));
+            }
             self.state_reads.fetch_add(1, Ordering::Relaxed);
             Ok((Arc::clone(&self.state), Some(self.origin())))
         }
@@ -288,20 +355,24 @@ mod tests {
             &self,
         ) -> Result<(Arc<NativeActionInfo>, Option<OriginMetadata>), Error> {
             self.info_reads.fetch_add(1, Ordering::Relaxed);
+            if let Some(code) = self.info_error {
+                return Err(Error::new(code, "info read".to_owned()));
+            }
             Ok((Arc::clone(&self.info), Some(self.origin())))
         }
     }
 
     /// A fake scheduler that serves fixed listings and records every filter it receives.
     #[derive(Default)]
-    struct Fake {
-        queued: Vec<Row>,
-        by_worker: HashMap<String, Vec<Row>>,
-        calls: Mutex<Vec<OperationFilter>>,
+    pub(crate) struct Fake {
+        pub(crate) queued: Vec<Row>,
+        pub(crate) by_worker: HashMap<String, Vec<Row>>,
+        pub(crate) calls: Mutex<Vec<OperationFilter>>,
+        pub(crate) filter_error: Option<Code>,
     }
 
     impl Fake {
-        fn calls(&self) -> Vec<OperationFilter> {
+        pub(crate) fn calls(&self) -> Vec<OperationFilter> {
             self.calls.lock().clone()
         }
     }
@@ -333,6 +404,9 @@ mod tests {
             &self,
             filter: OperationFilter,
         ) -> Result<ActionStateResultStream<'_>, Error> {
+            if let Some(code) = self.filter_error {
+                return Err(Error::new(code, "filter".to_owned()));
+            }
             let rows = match &filter.worker_id {
                 Some(worker) => self.by_worker.get(&worker.0).cloned().unwrap_or_default(),
                 None if filter.stages == OperationStageFlags::Queued => self.queued.clone(),
@@ -351,7 +425,7 @@ mod tests {
         DigestInfo::new([byte; 32], size)
     }
 
-    fn bazel(target: &str, mnemonic: &str) -> RequestMetadata {
+    pub(crate) fn bazel(target: &str, mnemonic: &str) -> RequestMetadata {
         RequestMetadata {
             target_id: target.to_owned(),
             action_mnemonic: mnemonic.to_owned(),
@@ -359,7 +433,11 @@ mod tests {
         }
     }
 
-    fn info(priority: i32, inserted_ms: u64, platform: &[(&str, &str)]) -> Arc<NativeActionInfo> {
+    pub(crate) fn info(
+        priority: i32,
+        inserted_ms: u64,
+        platform: &[(&str, &str)],
+    ) -> Arc<NativeActionInfo> {
         Arc::new(NativeActionInfo {
             command_digest: digest(1, 10),
             input_root_digest: digest(2, 20),
@@ -380,7 +458,7 @@ mod tests {
         })
     }
 
-    fn row(
+    pub(crate) fn row(
         op: &str,
         stage: ActionStage,
         started_ms: u64,
@@ -399,6 +477,8 @@ mod tests {
             identity: String::new(),
             state_reads: Arc::new(AtomicUsize::new(0)),
             info_reads: Arc::new(AtomicUsize::new(0)),
+            state_error: None,
+            info_error: None,
         }
     }
 
@@ -749,7 +829,18 @@ mod tests {
             ..Fake::default()
         };
         let mut snapshot = gang_spi::SchedulerSnapshot::default();
-        crate::snapshot::fill(&workers, &[], &fleets, 0, &mut snapshot);
+        let history = crate::snapshot::tests::history();
+        crate::snapshot::fill(
+            &fake,
+            &workers,
+            &fleets,
+            &history,
+            Timestamp::from_unix_millis(0),
+            0,
+            &mut snapshot,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
 
         let view = run(&fake, &workers, &fleets, ALL).await?;
 

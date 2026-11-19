@@ -212,7 +212,7 @@ run "load_balancer_fronts_the_public_listener" {
   }
 
   assert {
-    condition     = can(regex("(?s)\\[server\\][^\\[]*ca_pin = \"signer\"\n# A load balancer presents a publicly trusted certificate for endpoint, so clients use their system roots.\nendpoint_trust = \"system\"\n\n\\[authentication", output.gang_toml))
+    condition     = can(regex("(?s)\\[server\\][^\\[]*\\n[ \\t]*ca_pin[ \\t]*=[ \\t]*\"signer\"", output.gang_toml)) && can(regex("(?s)\\[server\\][^\\[]*\\n[ \\t]*endpoint_trust[ \\t]*=[ \\t]*\"system\"", output.gang_toml))
     error_message = "The load balancer endpoint must use system roots in gang.toml."
   }
 

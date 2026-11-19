@@ -22,9 +22,9 @@ use crate::verdict;
 enum Arrival {
     /// As the build sends them.
     AsSent,
-    /// All at once: every pass is skipped until the live state shows each action of the step
-    /// queued, so the first pass that places them sees them together, before any worker could
-    /// run one of them.
+    /// With a fresh controller and unknown action durations, all at once: every pass is skipped
+    /// until the live state shows each action queued, so the first pass that places them sees
+    /// them together, before any worker could run one of them.
     Together,
 }
 
@@ -100,9 +100,9 @@ const STEPS: [Step; 5] = [
         observed: Observed::Noop(Probe::SandboxRequested),
         arrival: Arrival::AsSent,
     },
-    // Placed by one pass that sees both actions queued: the first fills the small fleet's one
-    // instance, so the second overflows. Sent as they come, the second can reach a small worker
-    // that already serves, which packs both, before any pass sees it queued.
+    // With unknown durations, one pass sees both actions queued: the first fills the small
+    // fleet's one instance, so the second overflows. Sent as they come, the second can reach a
+    // small worker that already serves and packs both before any pass sees it queued.
     Step {
         request: names::fleets::OVERFLOW,
         probes: &[Probe::OverflowFirst, Probe::OverflowSecond],
@@ -122,8 +122,8 @@ const STEPS: [Step; 5] = [
 /// the build and the history read after it. The scale-outs must be exactly those of the fleets
 /// the step's exec properties select. Where the variant's own sandbox is noop, the first two
 /// fleets run under it too, so a request for the noop sandbox fits the first fleet. A step whose
-/// actions must be placed together holds the provisioner's supply while it builds, so no pass
-/// runs until the live state shows all of them queued.
+/// actions must be placed together starts with a fresh controller and holds the provisioner's
+/// supply while it builds, so no pass runs until the live state shows all of them queued.
 ///
 /// # Errors
 ///
@@ -140,6 +140,12 @@ pub fn fleets<S: Control>(system: &S, variant: &Variant) -> Result<Vec<Check>> {
     ));
 
     for step in &STEPS {
+        if step.arrival == Arrival::Together {
+            // Clear process-local duration history: this is a cold, unknown-duration routing
+            // test, not an assertion of coarse overflow for learned short work.
+            system.kill_server()?;
+            system.start_server()?;
+        }
         let before = system.scaling_events()?;
         let since = before.last().map_or(Ok(0), sequence)?;
         let outcome = match step.arrival {

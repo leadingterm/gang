@@ -20,12 +20,14 @@ pub enum Rpc {
     UpdateActionResult,
     /// An execution request.
     Execute,
+    /// Any other action cache, content-addressable storage, or byte stream call.
+    Cas,
 }
 
-/// How the call was answered from the response head.
+/// The final outcome of a call, including its cache-service trailer status when present.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallOutcome {
-    /// HTTP 200 with `grpc-status` absent or zero.
+    /// The call succeeded.
     Ok,
     /// The status was `NOT_FOUND`.
     NotFound,
@@ -48,7 +50,7 @@ pub struct Origin {
     pub mnemonic: Option<Mnemonic>,
 }
 
-/// A client call to the action cache or the execution service.
+/// A client call to a cache or execution service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Call {
     /// The request's origin.
@@ -57,6 +59,30 @@ pub struct Call {
     pub rpc: Rpc,
     /// The response outcome.
     pub outcome: CallOutcome,
+    /// Message bytes transferred by this call.
+    pub transferred: Transferred,
+}
+
+/// gRPC message bytes sent and received by a client call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Transferred {
+    /// Bytes sent by the client.
+    pub uploaded: u64,
+    /// Bytes received by the client.
+    pub downloaded: u64,
+}
+
+/// Cumulative cache traffic counted by this controller, including folded follower traffic.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Traffic {
+    /// Action cache lookups.
+    pub lookups: u64,
+    /// Successful action cache lookups.
+    pub hits: u64,
+    /// Message bytes sent by clients.
+    pub uploaded: u64,
+    /// Message bytes received by clients.
+    pub downloaded: u64,
 }
 
 /// One phase of an execution, as the worker reported it.
@@ -192,6 +218,7 @@ impl Lost {
 pub struct ObservationSink {
     sender: mpsc::Sender<Observation>,
     lost: Arc<Lost>,
+    traffic: Arc<Mutex<Traffic>>,
 }
 
 /// The consuming side, owned by the server's recorder.
@@ -199,6 +226,7 @@ pub struct ObservationSink {
 pub struct Observations {
     receiver: mpsc::Receiver<Observation>,
     lost: Arc<Lost>,
+    traffic: Arc<Mutex<Traffic>>,
 }
 
 impl ObservationSink {
@@ -213,13 +241,39 @@ impl ObservationSink {
             dirty: AtomicBool::new(false),
             notify: Notify::new(),
         });
+        let traffic = Arc::new(Mutex::new(Traffic::default()));
         (
             Self {
                 sender,
                 lost: Arc::clone(&lost),
+                traffic: Arc::clone(&traffic),
             },
-            Observations { receiver, lost },
+            Observations {
+                receiver,
+                lost,
+                traffic,
+            },
         )
+    }
+
+    /// Adds cache traffic independently of attributed observations and channel losses.
+    /// Each counter saturates at `u64::MAX`. Callers must count a hit together with its lookup
+    /// so that hits do not exceed lookups; the delta is not validated.
+    pub fn count(&self, delta: Traffic) {
+        if delta == Traffic::default() {
+            return;
+        }
+        let mut traffic = self.traffic.lock();
+        traffic.lookups = traffic.lookups.saturating_add(delta.lookups);
+        traffic.hits = traffic.hits.saturating_add(delta.hits);
+        traffic.uploaded = traffic.uploaded.saturating_add(delta.uploaded);
+        traffic.downloaded = traffic.downloaded.saturating_add(delta.downloaded);
+    }
+
+    /// Reads a coherent snapshot of the cumulative counters.
+    #[must_use]
+    pub fn traffic(&self) -> Traffic {
+        *self.traffic.lock()
     }
 
     /// Sends without waiting, or counts the observation lost if the channel is full or closed.
@@ -242,6 +296,12 @@ impl ObservationSink {
 }
 
 impl Observations {
+    /// Reads a coherent snapshot of the counters shared with all sinks.
+    #[must_use]
+    pub fn traffic(&self) -> Traffic {
+        *self.traffic.lock()
+    }
+
     /// The next observation or loss notification; `None` once sinks and pending losses are gone.
     pub async fn next(&mut self) -> Option<Delivery> {
         tokio::select! {
@@ -305,8 +365,118 @@ mod tests {
             },
             rpc: Rpc::GetActionResult,
             outcome: CallOutcome::Ok,
+            transferred: Transferred::default(),
         })
     }
+
+    #[tokio::test]
+    async fn traffic_is_shared_and_independent_of_records_and_losses() {
+        let (sink, mut observations) =
+            ObservationSink::channel(NonZeroUsize::MIN, NonZeroUsize::MIN);
+        let clone = sink.clone();
+        assert_eq!(sink.traffic(), Traffic::default());
+        assert_eq!(observations.traffic(), Traffic::default());
+        let delta = Traffic {
+            lookups: 2,
+            hits: 1,
+            uploaded: 5,
+            downloaded: 7,
+        };
+        {
+            let next = observations.next();
+            tokio::pin!(next);
+            assert!(futures::poll!(&mut next).is_pending());
+            clone.count(delta);
+            assert!(futures::poll!(&mut next).is_pending());
+        }
+        let observation = call("a");
+        sink.record(observation.clone());
+        sink.record(observation.clone());
+        sink.lose_unattributed(NonZeroU64::MIN);
+        assert_eq!(sink.traffic(), delta);
+        assert_eq!(clone.traffic(), delta);
+        assert_eq!(observations.traffic(), delta);
+        assert_eq!(observations.next().await, Some(Delivery(Some(observation))));
+        assert_eq!(observations.take_lost(|_, count| assert_eq!(count, 1)), 1);
+        assert_eq!(observations.traffic(), delta);
+        sink.count(delta);
+        assert_eq!(
+            clone.traffic(),
+            Traffic {
+                lookups: 4,
+                hits: 2,
+                uploaded: 10,
+                downloaded: 14,
+            }
+        );
+        drop(observations);
+        clone.count(delta);
+        assert_eq!(sink.traffic().downloaded, 21);
+    }
+
+    #[test]
+    fn traffic_counters_saturate_independently() {
+        let (sink, observations) = ObservationSink::channel(NonZeroUsize::MIN, NonZeroUsize::MIN);
+        sink.count(Traffic {
+            lookups: u64::MAX,
+            hits: u64::MAX - 1,
+            uploaded: u64::MAX,
+            downloaded: u64::MAX - 1,
+        });
+        sink.count(Traffic {
+            lookups: 1,
+            hits: 2,
+            uploaded: 2,
+            downloaded: 1,
+        });
+        assert_eq!(
+            observations.traffic(),
+            Traffic {
+                lookups: u64::MAX,
+                hits: u64::MAX,
+                uploaded: u64::MAX,
+                downloaded: u64::MAX,
+            }
+        );
+    }
+
+    #[test]
+    fn concurrent_traffic_reads_are_coherent() {
+        const ITERATIONS: u64 = 200_000;
+        let (sink, observations) = ObservationSink::channel(NonZeroUsize::MIN, NonZeroUsize::MIN);
+        let barrier = std::sync::Barrier::new(3);
+        std::thread::scope(|scope| {
+            let writers: Vec<_> = (0..2)
+                .map(|_| {
+                    let sink = sink.clone();
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for _ in 0..ITERATIONS {
+                            sink.count(Traffic {
+                                lookups: 1,
+                                hits: 1,
+                                uploaded: 1,
+                                downloaded: 1,
+                            });
+                        }
+                    })
+                })
+                .collect();
+            barrier.wait();
+            for _ in 0..ITERATIONS {
+                let traffic = observations.traffic();
+                assert_eq!(traffic.hits, traffic.lookups, "{traffic:?}");
+                assert_eq!(traffic.uploaded, traffic.lookups, "{traffic:?}");
+                assert_eq!(traffic.downloaded, traffic.lookups, "{traffic:?}");
+            }
+            for writer in writers {
+                writer.join().expect("traffic writer completed");
+            }
+        });
+        assert_eq!(observations.traffic().hits, 2 * ITERATIONS);
+    }
+
     #[test]
     fn reported_phase_requires_endpoints_and_clamps_clock_skew() {
         let epoch = Timestamp::UNIX_EPOCH;

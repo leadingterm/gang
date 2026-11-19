@@ -13,16 +13,36 @@ use std::time::Duration;
 
 use gang_clock::Timestamp;
 use gang_reconciler::{Activity, FleetPass, HostedSnapshot};
-use gang_spi::{FleetInstance, FleetSupply, QueuedActionView, SchedulerSnapshot};
+use gang_spi::{
+    FleetInstance, FleetSupply, QueuedActionView, SchedulerSnapshot, StoreKind, Traffic,
+};
 use gang_types::{FleetCatalog, FleetProperties, InstanceLifecycle, SaturatingInto};
 use gang_wire::{
-    Actions, Demand, Event, Fleet, Instance, InstanceCounts, InstanceSize, Isa, Lifecycle, Pass,
-    Phase, PhaseSpan, Policy, Queue, QueuedAction, Recent, RunningAction, SkipReason, State,
-    Truncated, Worker, WorkerCounts, name,
+    Actions, BucketUsage, CacheStore, Demand, Event, Fleet, Instance, InstanceCounts, InstanceSize,
+    Isa, Lifecycle, Pass, Phase, PhaseSpan, Policy, Queue, QueuedAction, Recent, RunningAction,
+    SkipReason, State, StoreUsage, Truncated, Worker, WorkerCounts, name,
 };
 
 use crate::events::newer;
 use crate::inputs::{ActionsSample, BuilderConfig, Inputs, PassStatus};
+
+/// Cache counters observed at leadership start, before sampling begins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheBaseline {
+    /// Farm-wide traffic already counted before leadership.
+    pub traffic: Traffic,
+    /// Engine eviction total, or `None` if the engine could not be sampled.
+    pub evicted: Option<u64>,
+}
+
+impl Default for CacheBaseline {
+    fn default() -> Self {
+        Self {
+            traffic: Traffic::default(),
+            evicted: Some(0),
+        }
+    }
+}
 
 /// Fills state frames, and remembers the pass history that a skipped pass reports.
 #[derive(Debug)]
@@ -30,7 +50,8 @@ pub struct Builder {
     config: BuilderConfig,
     last_ok: Option<Timestamp>,
     skipped: u32,
-    last_cache_counts: Option<(u64, u64)>,
+    last_traffic: Traffic,
+    last_evicted: Option<u64>,
     scratch: Scratch,
 }
 
@@ -45,14 +66,15 @@ struct Scratch {
 }
 
 impl Builder {
-    /// Creates a builder that has seen no successful pass yet.
+    /// Creates a builder with cache counters observed at the start of leadership.
     #[must_use]
-    pub fn new(config: BuilderConfig) -> Self {
+    pub fn new(config: BuilderConfig, baseline: CacheBaseline) -> Self {
         Self {
             config,
             last_ok: None,
             skipped: 0,
-            last_cache_counts: None,
+            last_traffic: baseline.traffic,
+            last_evicted: baseline.evicted,
             scratch: Scratch::default(),
         }
     }
@@ -103,6 +125,11 @@ impl Builder {
         inputs
             .builds
             .fill_recent(since, inputs.wall, &mut cur.builds);
+        cur.cache.bucket = inputs.measured.map(|measured| BucketUsage {
+            bytes: measured.bytes,
+            objects: measured.objects,
+            measure_time: measured.measured,
+        });
         let interval = self.config.interval;
         match &inputs.pass {
             PassStatus::Ok {
@@ -126,20 +153,15 @@ impl Builder {
                 );
                 fill_fleets(cur, inputs.fleets, inputs.catalog);
                 fill_queue(cur, inputs.fleets, snapshot);
+                let (traffic, evicted) = self.cache_increase(cur, snapshot, inputs.traffic);
                 let completed = snapshot
                     .completed
                     .checked_sub(prev.completed)
                     .unwrap_or(snapshot.completed);
-                let (last_lookups, last_hits) = self.last_cache_counts.unwrap_or_default();
-                let lookups = snapshot
-                    .lookups
-                    .checked_sub(last_lookups)
-                    .unwrap_or(snapshot.lookups);
-                let hits = snapshot
-                    .hits
-                    .checked_sub(last_hits)
-                    .unwrap_or(snapshot.hits);
-                self.last_cache_counts = Some((snapshot.lookups, snapshot.hits));
+                let lookups = traffic.lookups;
+                let hits = traffic.hits;
+                let uploaded = traffic.uploaded;
+                let downloaded = traffic.downloaded;
                 let running = cur
                     .fleets
                     .iter()
@@ -149,6 +171,9 @@ impl Builder {
                     sample.completed = sample.completed.saturating_add(completed.saturating_into());
                     sample.lookups = sample.lookups.saturating_add(lookups.saturating_into());
                     sample.hits = sample.hits.saturating_add(hits.saturating_into());
+                    sample.uploaded_bytes = sample.uploaded_bytes.saturating_add(uploaded);
+                    sample.downloaded_bytes = sample.downloaded_bytes.saturating_add(downloaded);
+                    sample.evicted_bytes = sample.evicted_bytes.saturating_add(evicted);
                     sample.running = running;
                     sample.queued = queued;
                     sample.passes = sample.passes.saturating_add(1);
@@ -161,6 +186,7 @@ impl Builder {
                 copy_if_changed(&mut cur.workers, &prev.workers);
                 copy_if_changed(&mut cur.instances, &prev.instances);
                 copy_if_changed(&mut cur.queue, &prev.queue);
+                cur.cache.stores.clone_from(&prev.cache.stores);
                 cur.completed = prev.completed;
                 cur.recent.sample_at(inputs.wall, |sample| {
                     sample.skipped = sample.skipped.saturating_add(1);
@@ -175,6 +201,56 @@ impl Builder {
             &mut self.scratch.running_order,
         );
     }
+
+    /// Refreshes bounded stores and advances cumulative cache baselines on a successful pass.
+    fn cache_increase(
+        &mut self,
+        cur: &mut State,
+        snapshot: &SchedulerSnapshot,
+        traffic: Traffic,
+    ) -> (Traffic, u64) {
+        refill(&mut cur.cache.stores, &snapshot.stores, |row, store| {
+            *row = StoreUsage {
+                store: match store.store {
+                    StoreKind::Content => CacheStore::Content,
+                    StoreKind::Action => CacheStore::Action,
+                },
+                used_bytes: store.used,
+                budget_bytes: store.budget,
+            };
+            true
+        });
+        let last = self.last_traffic;
+        let delta = if traffic.lookups < last.lookups
+            || traffic.hits < last.hits
+            || traffic.uploaded < last.uploaded
+            || traffic.downloaded < last.downloaded
+        {
+            traffic
+        } else {
+            Traffic {
+                lookups: traffic.lookups - last.lookups,
+                hits: traffic.hits - last.hits,
+                uploaded: traffic.uploaded - last.uploaded,
+                downloaded: traffic.downloaded - last.downloaded,
+            }
+        };
+        let evicted_total = snapshot
+            .stores
+            .iter()
+            .fold(0_u64, |sum, store| sum.saturating_add(store.evicted));
+        let evicted = self
+            .last_evicted
+            .map_or(0, |last| increase(evicted_total, last));
+        self.last_traffic = traffic;
+        self.last_evicted = Some(evicted_total);
+        (delta, evicted)
+    }
+}
+
+/// A counter decrease indicates a restarted source.
+fn increase(total: u64, previous: u64) -> u64 {
+    total.checked_sub(previous).unwrap_or(total)
 }
 
 // Derived row `clone_from` reallocates unchanged nested data.
@@ -429,6 +505,8 @@ fn fill_fleet(row: &mut Fleet, pass: &FleetPass, properties: &FleetProperties) {
         needed: pass.outlook.needed,
         vcpus: pass.outlook.demand.vcpus().saturating_into(),
         memory: pass.outlook.demand.memory(),
+        readiness: pass.outlook.readiness,
+        expected_wait: pass.outlook.expected_wait,
     };
 }
 

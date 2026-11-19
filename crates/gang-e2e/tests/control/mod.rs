@@ -204,6 +204,7 @@ struct World {
     minimum_fault: MinimumFault,
     up: bool,
     held: bool,
+    launches_held: bool,
     pass: u64,
     skipped: u32,
     last_ok: Option<Timestamp>,
@@ -226,6 +227,7 @@ impl World {
             minimum_fault: MinimumFault::None,
             up: false,
             held: false,
+            launches_held: false,
             pass: 0,
             skipped: 0,
             last_ok: None,
@@ -339,6 +341,7 @@ impl World {
         };
         let (worker, link, interrupted) = (machine.worker(), machine.link, machine.interrupted);
         let next = match link {
+            Link::Booting if self.launches_held => Link::Booting,
             Link::Booting => {
                 self.record(None, EventChange::WorkerRegistered { worker });
                 Link::Idle(0)
@@ -527,6 +530,7 @@ impl World {
             events_limit: 1_000,
             completed: 0,
             recent: Recent::default(),
+            cache: gang_wire::Cache::default(),
             builds: Vec::new(),
             principals_epoch: 0,
         }
@@ -747,6 +751,20 @@ impl Control for ControlSim {
         Ok(())
     }
 
+    fn hold_launches(&self) -> Result<()> {
+        self.world.lock().launches_held = true;
+        Ok(())
+    }
+
+    fn release_launches(&self) -> Result<()> {
+        self.world.lock().launches_held = false;
+        Ok(())
+    }
+
+    fn build_additional_run(&self, probes: &[Probe], run: &Run) -> Result<BuildOutcome> {
+        self.build_run(probes, run)
+    }
+
     fn stop_workers(&self) -> Result<usize> {
         let mut world = self.world.lock();
         let mut stopped = 0;
@@ -795,6 +813,20 @@ fn drain_cancel_checks(behaviour: Behaviour) -> Result<Vec<Check>> {
 /// behaves as `behaviour` says.
 fn skipped_pass_checks(behaviour: Behaviour) -> Result<Vec<Check>> {
     skipped_pass(&ControlSim::new(behaviour, 0))
+}
+
+#[test]
+fn held_launches_do_not_register_until_released() -> Result<()> {
+    let system = ControlSim::new(Behaviour::COMPLIANT, 1);
+    system.hold_launches()?;
+    system.start_server()?;
+    let launched = system.step()?;
+    assert_eq!(launched.instances.len(), 1);
+    assert!(system.step()?.workers.is_empty());
+    assert!(system.step()?.workers.is_empty());
+    system.release_launches()?;
+    assert_eq!(system.step()?.workers.len(), 1);
+    Ok(())
 }
 
 #[test]

@@ -213,3 +213,45 @@ fn a_new_worker_allocates_only_when_it_first_appears() -> TestResult {
     assert_eq!(allocated, 0, "passes after the worker appeared allocated");
     Ok(())
 }
+
+#[test]
+fn queued_simulation_with_headroom_does_not_allocate_after_warmup() -> TestResult {
+    let mut primary = policy()?;
+    primary.instances =
+        InstanceBounds::try_new(0, std::num::NonZeroU32::new(20).ok_or("zero maximum")?)?;
+    primary.target_actions_per_instance = std::num::NonZeroU32::new(16).ok_or("zero target")?;
+    primary.boot_grace = Duration::from_secs(150);
+    let mut h = Harness::with_policy(primary);
+    for name in ["local-1", "local-2"] {
+        h.launch(
+            X86,
+            name,
+            InstanceLifecycle::InService,
+            Duration::from_mins(5),
+        )?;
+        h.connect(X86, name)?;
+        h.snapshot
+            .workers
+            .last_mut()
+            .ok_or("missing worker")?
+            .max_inflight_actions = std::num::NonZeroU32::new(16);
+    }
+    h.set_desired_capacity(X86, 2);
+    h.queue(X86, 1000)?;
+    for action in &mut h.snapshot.queued {
+        action.expected = Some(Duration::from_secs(30));
+    }
+    let mut world = World::new(&h);
+    for _ in 0..WARM_UP_PASSES {
+        world.counted_reconcile();
+    }
+    assert!(world.plan.steps.iter().any(|step| matches!(
+        step.action,
+        gang_reconciler::Action::ScaleOut { from: 2, .. }
+    )));
+    let allocated: u64 = (0..MEASURED_PASSES)
+        .map(|_| world.counted_reconcile())
+        .sum();
+    assert_eq!(allocated, 0, "queued simulation allocated after warmup");
+    Ok(())
+}

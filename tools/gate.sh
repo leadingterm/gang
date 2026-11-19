@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# The pre-merge gate on the assigned x86_64 Linux host, stopping at the first failure (docs/SPECIFICATION.md §7):
-# Both CI lint partitions (tools/lint.sh, macOS Clippy of every Cargo target included), BUILD files in sync, the full workspace, then
-# Gate 1 and both Gate 2 addition shards launched exactly as CI's e2e jobs launch them (tools/e2e-gate.sh).
+# The local x86_64 Linux full workspace diagnostic mirrors CI checks, stopping at the first failure:
+# portable lint and nix-vm checks, BUILD files in sync, the full workspace, then Gate 1 and both
+# Gate 2 addition shards launched through the same tools/e2e-gate.sh launcher as CI.
+# Architecture-specific release and cross builds are verified separately in CI.
 # Usage: nix develop -c tools/gate.sh. BAZEL names the Bazel command (default: the devShell's `bazel`).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 tools/lint.sh
 bazel=${BAZEL:-bazel}
-# CI builds and tests in the configuration Gang ships (.bazelrc `build:ci`); a gate uploads nothing to a remote cache.
+# Use the shipping optimized configuration without uploading results to a remote cache.
 flags=(--compilation_mode=opt --remote_upload_local_results=false)
 "$bazel" run "${flags[@]}" //:gazelle.check
 "$bazel" test "${flags[@]}" //...

@@ -400,6 +400,8 @@ fn fill_window(
         actions: world.actions.as_ref(),
         events,
         builds: world.builds.as_ref().unwrap_or(&empty_builds),
+        traffic: world.traffic,
+        measured: world.measured.as_ref(),
         principals_epoch: 7,
     };
     builder.fill(cur, prev, seq, &inputs);
@@ -413,7 +415,7 @@ fn launch_failure_is_reported_and_cleared_on_reuse() -> TestResult {
     world.supplies[0].launch_failure = Some(gang_spi::LaunchFailure {
         reason: "capacity unavailable".to_owned(),
     });
-    let mut builder = Builder::new(config());
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
     let mut frame = blank();
     let prev = blank();
     fill_into(&mut builder, &mut frame, &prev, 1, &world, 1_000, ok(0))?;
@@ -437,7 +439,7 @@ fn queued_refusal_is_reported_and_cleared_on_reuse() -> TestResult {
     let mut queued = waiting("op-q", 500, 0, &[]);
     queued.refusal = Some(gang_types::Refusal::Combination);
     world.actions = Some(sample(1_000, vec![], vec![queued]));
-    let mut builder = Builder::new(config());
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
     let mut frame = blank();
     let prev = blank();
     fill_into(&mut builder, &mut frame, &prev, 1, &world, 1_000, ok(0))?;
@@ -464,8 +466,8 @@ fn queued_refusal_is_reported_and_cleared_on_reuse() -> TestResult {
 
 #[test]
 fn reused_frames_equal_chained_blank_fills_across_changing_worlds() -> TestResult {
-    let mut reused = Builder::new(config());
-    let mut reference = Builder::new(config());
+    let mut reused = Builder::new(config(), gang_state::CacheBaseline::default());
+    let mut reference = Builder::new(config(), gang_state::CacheBaseline::default());
     let mut a = blank();
     let mut b = blank();
     let mut expected = blank();
@@ -497,7 +499,7 @@ fn event_window_slide_is_correct_across_reused_frames() -> TestResult {
         &events[6..7],
     ];
     let world = smaller_world()?;
-    let mut builder = Builder::new(config());
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
     let mut a = blank();
     let mut b = blank();
     for (index, window) in windows.iter().enumerate() {
@@ -516,7 +518,7 @@ fn event_window_slide_is_correct_across_reused_frames() -> TestResult {
 #[test]
 fn a_pass_without_a_sample_after_a_sample_round_trips_through_diff_and_apply() -> TestResult {
     let mut world = larger_world()?;
-    let mut builder = Builder::new(config());
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
     let first = fill(&mut builder, &blank(), 1, &world, 5_000, ok(0))?;
     assert!(first.actions.is_some(), "the first pass carries a sample");
 

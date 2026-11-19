@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { applyRecent, cacheWindow, donePerMinute, doneSeries, passBars, slots, unrecordedSlots } from "../src/recent.ts";
+import { applyRecent, bytesSeries, cacheWindow, donePerMinute, doneSeries, evictedSeries, passBars, slots, transferred, unrecordedSlots } from "../src/recent.ts";
 import type { Recent, Sample } from "../src/wire.ts";
 import { iso } from "./sse.ts";
 
 const sample = (step: number, completed = 0): Sample => ({
-  start: iso(step * 10000), completed, running: 0, queued: 0, passes: 0, skipped: 0, lookups: 0, hits: 0,
+  start: iso(step * 10000), completed, running: 0, queued: 0, passes: 0, skipped: 0, lookups: 0, hits: 0, uploadedBytes: 0, downloadedBytes: 0, evictedBytes: 0,
 });
 const recent = (samples: Sample[], window = "60s"): Recent => ({ window, step: "10s", samples });
 
@@ -81,4 +81,13 @@ test("cache window excludes samples older than the window", () => {
     lookups: 40, hits: 35, rate: 35 / 40,
     lookupsPerStep: [10, 30], hitsPerStep: [5, 30],
   });
+});
+
+test("transfer and eviction series distinguish missing steps from recorded zero", () => {
+  const r = recent([{ ...sample(0), uploadedBytes: 3, downloadedBytes: 7, evictedBytes: 5 }, sample(1)], "30s");
+  assert.deepEqual(transferred(r), { uploaded: 3, downloaded: 7 });
+  assert.deepEqual(bytesSeries(r, "downloadedBytes"), [null, 7, 0]);
+  assert.deepEqual(bytesSeries(r, "uploadedBytes"), [null, 3, 0]);
+  assert.deepEqual(evictedSeries(r), [null, 5, 0]);
+  assert.equal(transferred(recent([])), null);
 });

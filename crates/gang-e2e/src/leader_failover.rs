@@ -8,12 +8,13 @@ use gang_tls::{HttpProtocol, HttpRequest, HttpTransport, ServerTrust};
 use gang_types::health::CLIENT_REROUTE_BOUND;
 use gang_wire::page::{PAGE_SIZE_MAX, PageToken};
 use gang_wire::routes::LIST_EVENTS;
-use gang_wire::{Event, EventChange, ListEventsResponse, State};
+use gang_wire::{Event, EventChange, ListEventsResponse, PassState, SkipReason, State};
 use http::Method;
 use http::header::{AUTHORIZATION, HeaderValue};
 
 use crate::check::{Check, awaited};
 use crate::cluster::Cluster;
+use crate::control::Control;
 use crate::errors::{E2eError, Result};
 use crate::event_log::sequence;
 use crate::execution::Run;
@@ -158,11 +159,6 @@ fn wait_state_until(
 ) -> Result<State> {
     let stack = cluster.stack();
     let credentials = stack.administrator()?.credentials(&stack.ca_pin()?)?;
-    let api = StateApi::with_bearer(
-        &cluster.direct_endpoint(leader),
-        &credentials,
-        stack.settings().handshake_timeout,
-    )?;
     let mut stream = StateApi::with_bearer(
         &cluster.direct_endpoint(leader),
         &credentials,
@@ -175,27 +171,11 @@ fn wait_state_until(
             stream.status()
         )));
     }
-    let mut found = None;
-    let mut error = None;
-    sse::await_frames(
+    sse::await_state(
         &mut stream,
         deadline.saturating_duration_since(Instant::now()),
-        &mut |_| match api.state() {
-            Ok(state) if done(&state) => {
-                found = Some(state);
-                true
-            }
-            Ok(_) => false,
-            Err(cause) => {
-                error = Some(cause);
-                true
-            }
-        },
-    )?;
-    if let Some(error) = error {
-        return Err(error);
-    }
-    found.ok_or_else(|| E2eError::system("state stream ended without the awaited state"))
+        &mut done,
+    )
 }
 
 // Logs survive retirement, unlike instance records, and name every spawned worker.
@@ -393,17 +373,14 @@ fn wait_for_rerouted_demand(
     }
 }
 
-fn demand_ready(state: &State, zombie: bool) -> bool {
-    state.queue.total > 0
-        && !state.workers.is_empty()
+fn demand_ready(state: &State) -> bool {
+    state.actions.as_ref().is_some_and(|actions| {
+        !actions.queued.is_empty()
+            && actions.running.len() + actions.queued.len() == PROBES.len()
+            && actions.truncated.running == 0
+            && actions.truncated.queued == 0
+    }) && !state.workers.is_empty()
         && instance_names(state).len() == 1
-        // Every running or queued probe is pinned to the old leader.
-        && (!zombie
-            || usize::try_from(
-                state.workers.iter().map(|worker| u64::from(worker.running)).sum::<u64>()
-                    + u64::from(state.queue.total),
-            )
-            .is_ok_and(|count| count == PROBES.len()))
 }
 
 /// Records queued demand and the observed leader takeover.
@@ -416,11 +393,18 @@ fn initial_checks(
     vec![
         Check::expect(
             DEMAND,
-            state.queue.total > 0 && !old_instances.is_empty(),
+            state
+                .actions
+                .as_ref()
+                .is_some_and(|actions| !actions.queued.is_empty())
+                && !old_instances.is_empty(),
             || {
                 format!(
-                    "queued {}, existing instances {old_instances:?}",
-                    state.queue.total
+                    "queued detail count {}, existing instances {old_instances:?}",
+                    state
+                        .actions
+                        .as_ref()
+                        .map_or(0, |actions| actions.queued.len())
                 )
             },
         ),
@@ -428,6 +412,43 @@ fn initial_checks(
             format!("old leader {old}, observed {leader}")
         }),
     ]
+}
+
+fn hold_supply_until_skipped(cluster: &Cluster<'_>, old: usize) -> Result<()> {
+    let stack = cluster.stack();
+    stack.hold_supply()?;
+    if let Err(error) = wait_state(cluster, old, |state| {
+        state.pass.state == PassState::Skipped
+            && state.pass.skip_reason == Some(SkipReason::ProvisionerUnavailable)
+    }) {
+        if let Err(release_error) = stack.release_supply() {
+            eprintln!("failed to restore supply after barrier error: {release_error}");
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn restore_supply(cluster: &Cluster<'_>, observation: Result<Vec<Check>>) -> Result<Vec<Check>> {
+    match (observation, cluster.stack().release_supply()) {
+        (Err(error), Err(release_error)) => {
+            eprintln!("failed to restore supply after observation error: {release_error}");
+            Err(error)
+        }
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        (Ok(checks), Ok(())) => Ok(checks),
+    }
+}
+
+fn build_check(checks: &[Check], outcome: &crate::build_output::BuildOutcome) -> Check {
+    if checks
+        .iter()
+        .any(|check| check.name == ZOMBIE_REROUTED && check.is_failure())
+    {
+        Check::skipped(BUILD, "no rerouted demand")
+    } else {
+        Check::expect(BUILD, outcome.succeeded(), || outcome.exit_summary())
+    }
 }
 
 /// Kills or pauses the leader while held actions create queued demand.
@@ -451,12 +472,15 @@ pub fn leader_failover(cluster: &Cluster<'_>, zombie: bool) -> Result<Vec<Check>
     let run = Run::fresh()?;
     journal.prepare_attempts(run.as_ref(), PROBES.iter().map(|probe| probe.as_str()))?;
     std::thread::scope(|scope| -> Result<Vec<Check>> {
+        let stack = cluster.stack();
+        hold_supply_until_skipped(cluster, old)?;
+        let mut supply_held = true;
         let hold = Hold::new(&go, |root| cluster.stack().kill_bazel_in(root));
         let build = hold.build(scope, None, |cancel, stop| {
             cluster.stack().build_run_until(&PROBES, &run, cancel, stop)
         });
         let observation = (|| -> Result<Vec<Check>> {
-            let state = wait_state(cluster, old, |state| demand_ready(state, zombie))?;
+            let state = wait_state(cluster, old, demand_ready)?;
             let old_instances = records(cluster)?;
             let before_launches = launched(cluster)?;
             let started = Instant::now();
@@ -466,6 +490,8 @@ pub fn leader_failover(cluster: &Cluster<'_>, zombie: bool) -> Result<Vec<Check>
                 cluster.kill(old)?;
             }
             let observed = (|| -> Result<Vec<Check>> {
+                supply_held = false;
+                stack.release_supply()?;
                 let leader = cluster.wait_for_leader_matching(
                     cluster.stack().settings().startup_timeout,
                     |leader| leader != old,
@@ -520,6 +546,11 @@ pub fn leader_failover(cluster: &Cluster<'_>, zombie: bool) -> Result<Vec<Check>
             }
             observed
         })();
+        let observation = if supply_held {
+            restore_supply(cluster, observation)
+        } else {
+            observation
+        };
         let settled = hold.settle(observation, || Ok(()));
         // Keep the FIFO alive for the probe writers until the build has finished.
         let _journal = &journal;
@@ -527,16 +558,75 @@ pub fn leader_failover(cluster: &Cluster<'_>, zombie: bool) -> Result<Vec<Check>
         hold.disarm();
         let mut checks = settled?;
         let outcome = completed?;
-        if checks
-            .iter()
-            .any(|check| check.name == ZOMBIE_REROUTED && check.is_failure())
-        {
-            checks.push(Check::skipped(BUILD, "no rerouted demand"));
-        } else {
-            checks.push(Check::expect(BUILD, outcome.succeeded(), || {
-                outcome.exit_summary()
-            }));
-        }
+        checks.push(build_check(&checks, &outcome));
         Ok(checks)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use gang_wire::{Actions, Instance, QueuedAction, RunningAction, State, Worker};
+
+    use super::{PROBES, demand_ready};
+
+    fn full_demand() -> State {
+        State {
+            workers: vec![Worker {
+                instance: "instances/one".to_owned(),
+                ..Worker::default()
+            }],
+            actions: Some(Actions {
+                running: vec![RunningAction::default(); PROBES.len() - 1],
+                queued: vec![QueuedAction::default()],
+                ..Actions::default()
+            }),
+            ..State::default()
+        }
+    }
+
+    #[test]
+    fn demand_uses_action_details_when_queue_summary_is_stale() {
+        let state = full_demand();
+        assert_eq!(state.queue.total, 0);
+        assert!(demand_ready(&state));
+    }
+
+    #[test]
+    fn demand_requires_complete_untruncated_details_and_queued_work() {
+        let mut state = full_demand();
+        let actions = state.actions.as_mut().expect("fixture has actions");
+        actions.running.pop();
+        assert!(!demand_ready(&state));
+
+        let mut state = full_demand();
+        let actions = state.actions.as_mut().expect("fixture has actions");
+        actions.queued.clear();
+        actions.running.push(RunningAction::default());
+        assert!(!demand_ready(&state));
+
+        for running in [true, false] {
+            let mut state = full_demand();
+            let actions = state.actions.as_mut().expect("fixture has actions");
+            if running {
+                actions.truncated.running = 1;
+            } else {
+                actions.truncated.queued = 1;
+            }
+            assert!(!demand_ready(&state));
+        }
+    }
+
+    #[test]
+    fn demand_requires_one_instance_and_a_worker() {
+        let mut state = full_demand();
+        state.instances.push(Instance {
+            name: "instances/two".to_owned(),
+            ..Instance::default()
+        });
+        assert!(!demand_ready(&state));
+
+        let mut state = full_demand();
+        state.workers.clear();
+        assert!(!demand_ready(&state));
+    }
 }

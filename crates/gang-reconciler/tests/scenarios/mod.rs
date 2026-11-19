@@ -1,3 +1,5 @@
+mod work_aware;
+
 use std::num::NonZeroU32;
 use std::time::Duration;
 
@@ -689,7 +691,7 @@ fn restart_mid_scale_out_does_not_repeat_it() -> TestResult {
 }
 
 #[test]
-fn scale_out_counts_running_actions() -> TestResult {
+fn busy_unknown_queue_buys_capacity_at_boot_boundary() -> TestResult {
     let mut h = Harness::new()?;
     serve(&mut h, "local-1", Duration::ZERO)?;
     h.set_running("local-1", 4)?;
@@ -705,6 +707,10 @@ fn scale_out_counts_running_actions() -> TestResult {
             },
         }]
     );
+    let outlook = h.outlook(X86)?;
+    assert_eq!(outlook.demand.actions(), 5);
+    assert_eq!(outlook.demand.instances(&h.passes[X86].policy), 2);
+    assert_eq!(outlook.needed, 2);
     Ok(())
 }
 

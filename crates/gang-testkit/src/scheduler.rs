@@ -191,6 +191,11 @@ impl Controller {
         self.observations.record(observation);
     }
 
+    /// Simulates traffic through the controller's observation sink.
+    pub fn count(&self, delta: gang_spi::Traffic) {
+        self.observations.count(delta);
+    }
+
     /// Applies the public listener's gate to a request, as the controller does before any
     /// public service sees it.
     ///
@@ -321,6 +326,8 @@ struct SchedulerState {
     endpoint: Url,
     /// The snapshot `snapshot` reports.
     snapshot: SchedulerSnapshot,
+    /// Release of the next held snapshot.
+    snapshot_hold: Option<oneshot::Receiver<()>>,
     /// The actions `actions` reports.
     actions: ActionsView,
     /// Workers that are no longer connected; drain requests for them report not found.
@@ -429,6 +436,7 @@ impl FakeScheduler {
             state: Arc::new(Mutex::new(SchedulerState {
                 endpoint,
                 snapshot: SchedulerSnapshot::default(),
+                snapshot_hold: None,
                 actions: ActionsView::default(),
                 vanished: Vec::new(),
                 failing: Failing::default(),
@@ -463,8 +471,31 @@ impl FakeScheduler {
 
     /// Sets the snapshot returned by [`SchedulerPort::snapshot`], sorting workers by id.
     pub fn set_snapshot(&self, mut snapshot: SchedulerSnapshot) {
-        snapshot.workers.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+        if snapshot.executing.is_empty() {
+            snapshot.workers.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+        } else {
+            let mut workers: Vec<_> = snapshot.workers.drain(..).enumerate().collect();
+            workers.sort_unstable_by(|a, b| a.1.id.cmp(&b.1.id));
+            let mut sorted_index = vec![0; workers.len()];
+            for (new, (old, worker)) in workers.into_iter().enumerate() {
+                sorted_index[old] = new;
+                snapshot.workers.push(worker);
+            }
+            for execution in &mut snapshot.executing {
+                if let Some(&index) = sorted_index.get(execution.worker) {
+                    execution.worker = index;
+                }
+            }
+        }
         self.state.lock().snapshot = snapshot;
+    }
+
+    /// Pauses the next snapshot until the returned sender sends or is dropped.
+    #[must_use]
+    pub fn hold_snapshot(&self) -> oneshot::Sender<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.state.lock().snapshot_hold = Some(receiver);
+        sender
     }
 
     /// Makes snapshot queries fail while `fail` is true.
@@ -578,12 +609,20 @@ impl FakeScheduler {
 
 impl SchedulerPort for FakeScheduler {
     async fn snapshot(&self, into: &mut SchedulerSnapshot) -> Result<(), PortError> {
+        let hold = self.state.lock().snapshot_hold.take();
         self.snapshots.bump();
+        if let Some(hold) = hold {
+            let _ = hold.await;
+        }
         let state = self.state.lock();
         if state.failing.snapshot {
             return Err(PortError::unavailable("scheduler is unavailable"));
         }
-        *into = state.snapshot.clone();
+        into.completed = state.snapshot.completed;
+        into.stores.clone_from(&state.snapshot.stores);
+        into.workers.clone_from(&state.snapshot.workers);
+        into.queued.clone_from(&state.snapshot.queued);
+        into.executing.clone_from(&state.snapshot.executing);
         Ok(())
     }
 
@@ -755,7 +794,7 @@ mod tests {
     use std::path::Path;
 
     use futures::FutureExt;
-    use gang_spi::Authenticated;
+    use gang_spi::{Authenticated, EngineStore, StoreKind};
     use gang_types::{FleetName, Identity, Isa, Principal, ProviderName, Resources};
 
     use super::*;
@@ -811,11 +850,34 @@ mod tests {
         let scheduler = FakeScheduler::new()?;
         scheduler.set_snapshot(SchedulerSnapshot {
             completed: 3,
+            stores: vec![EngineStore {
+                store: StoreKind::Action,
+                used: 3,
+                budget: 7,
+                evicted: 11,
+            }],
             ..SchedulerSnapshot::default()
         });
         let mut into = SchedulerSnapshot::default();
         scheduler.snapshot(&mut into).await?;
         assert_eq!(into.completed, 3);
+        assert_eq!(
+            into.stores,
+            vec![EngineStore {
+                store: StoreKind::Action,
+                used: 3,
+                budget: 7,
+                evicted: 11,
+            }]
+        );
+        scheduler.set_snapshot(SchedulerSnapshot::default());
+        scheduler.snapshot(&mut into).await?;
+        assert!(into.stores.is_empty());
+
+        scheduler.set_snapshot(SchedulerSnapshot {
+            completed: 3,
+            ..SchedulerSnapshot::default()
+        });
 
         scheduler.fail_snapshot(true);
         let failed = scheduler.snapshot(&mut into).await;
@@ -824,6 +886,138 @@ mod tests {
         scheduler.fail_snapshot(false);
         scheduler.snapshot(&mut into).await?;
         assert_eq!(into.completed, 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_sorts_workers_remaps_executions_and_reuses_buffers() -> TestResult {
+        use std::time::Duration;
+
+        use gang_clock::Timestamp;
+        use gang_spi::{ExecutingDemand, QueuedDemand, WorkerState};
+        use gang_types::{ActionResources, FleetSet};
+
+        let scheduler = FakeScheduler::new()?;
+        let worker = |name| -> TestResult<WorkerState> {
+            Ok(WorkerState {
+                id: crate::worker_id(name)?,
+                fleet: FleetName::try_new("example-fleet")?,
+                running_actions: 1,
+                max_inflight_actions: None,
+                draining: false,
+                paused: false,
+                last_seen: Timestamp::UNIX_EPOCH,
+            })
+        };
+        let queued = QueuedDemand {
+            candidates: FleetSet::prefix(1)?,
+            resources: ActionResources::default(),
+            queued_since: Timestamp::UNIX_EPOCH,
+            priority: 0,
+            expected: Some(Duration::from_secs(7)),
+        };
+        let executions = vec![
+            ExecutingDemand {
+                worker: 0,
+                started: Timestamp::from_unix_millis(10),
+                expected: Some(Duration::from_secs(3)),
+            },
+            ExecutingDemand {
+                worker: 1,
+                started: Timestamp::from_unix_millis(20),
+                expected: None,
+            },
+        ];
+        scheduler.set_snapshot(SchedulerSnapshot {
+            workers: vec![worker("z")?, worker("a")?],
+            queued: vec![queued.clone()],
+            executing: executions.clone(),
+            ..SchedulerSnapshot::default()
+        });
+        let mut into = SchedulerSnapshot {
+            workers: Vec::with_capacity(8),
+            queued: Vec::with_capacity(8),
+            executing: Vec::with_capacity(8),
+            ..SchedulerSnapshot::default()
+        };
+        into.workers.push(worker("stale")?);
+        into.queued.push(queued.clone());
+        into.executing.push(executions[0].clone());
+        let capacities = (
+            into.workers.capacity(),
+            into.queued.capacity(),
+            into.executing.capacity(),
+        );
+        scheduler.snapshot(&mut into).await?;
+        assert_eq!(into.workers[0].id, crate::worker_id("a")?);
+        assert_eq!(into.workers[1].id, crate::worker_id("z")?);
+        assert_eq!(into.executing[0].worker, 1);
+        assert_eq!(into.executing[1].worker, 0);
+        assert_eq!(into.executing[0].started, executions[0].started);
+        assert_eq!(into.executing[0].expected, executions[0].expected);
+        assert_eq!(into.queued, vec![queued.clone()]);
+        assert_eq!(
+            (
+                into.workers.capacity(),
+                into.queued.capacity(),
+                into.executing.capacity()
+            ),
+            capacities
+        );
+
+        scheduler.set_snapshot(SchedulerSnapshot::default());
+        scheduler.snapshot(&mut into).await?;
+        assert!(into.workers.is_empty() && into.queued.is_empty() && into.executing.is_empty());
+        let mut expected = executions[1].clone();
+        expected.worker = 0;
+        scheduler.set_snapshot(SchedulerSnapshot {
+            workers: vec![worker("a")?],
+            queued: vec![queued.clone()],
+            executing: vec![expected.clone()],
+            ..SchedulerSnapshot::default()
+        });
+        scheduler.snapshot(&mut into).await?;
+        assert_eq!(into.workers[0].id, crate::worker_id("a")?);
+        assert_eq!(into.queued, vec![queued]);
+        assert_eq!(into.executing, vec![expected]);
+        assert_eq!(
+            (
+                into.workers.capacity(),
+                into.queued.capacity(),
+                into.executing.capacity()
+            ),
+            capacities
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_hold_releases_on_send_or_drop_and_only_holds_once() -> TestResult {
+        let scheduler = FakeScheduler::new()?;
+        let mut into = SchedulerSnapshot::default();
+        let release = scheduler.hold_snapshot();
+        {
+            let snapshot = scheduler.snapshot(&mut into);
+            tokio::pin!(snapshot);
+            assert!(futures::poll!(&mut snapshot).is_pending());
+            scheduler.set_snapshot(SchedulerSnapshot {
+                completed: 7,
+                ..SchedulerSnapshot::default()
+            });
+            release.send(()).expect("snapshot is waiting");
+            snapshot.await?;
+        }
+        assert_eq!(into.completed, 7);
+        scheduler.snapshot(&mut into).await?;
+        let release = scheduler.hold_snapshot();
+        {
+            let snapshot = scheduler.snapshot(&mut into);
+            tokio::pin!(snapshot);
+            assert!(futures::poll!(&mut snapshot).is_pending());
+            scheduler.fail_snapshot(true);
+            drop(release);
+            assert!(matches!(snapshot.await, Err(PortError::Unavailable(_))));
+        }
         Ok(())
     }
 

@@ -63,6 +63,7 @@ mod input_root;
 mod integrity;
 mod issuer;
 mod journal;
+mod launch_gate;
 mod leader_failover;
 mod lifecycle;
 mod limits;
@@ -103,6 +104,7 @@ mod system;
 mod template;
 mod timeout;
 mod tls_client;
+mod work_aware;
 
 pub mod flags;
 pub mod launch_failure;
@@ -179,6 +181,7 @@ pub use issuer::{
     OFFLINE_ACCESS, ORGANIZATION, ORGANIZATION_CLAIM, RefreshOutcome, RefreshRecord, SubjectPolicy,
     TestIssuer, TokenSpec,
 };
+pub use launch_gate::run_launch_gate;
 pub use lifecycle::lifecycle;
 pub use limits::limits;
 pub use memory::memory;
@@ -224,3 +227,7 @@ pub use system::{
 };
 pub use template::{ConfigTemplate, Transport};
 pub use timeout::{action_timeout, exit_signals};
+pub use work_aware::{
+    backlog_checks, backlog_grows_fleet, burst_capacity_check, burst_checks, burst_from_zero,
+    queued_behind_short_work, short_checks,
+};

@@ -26,6 +26,8 @@ wire_enum! {
         UpdateActionResult = "UPDATE_ACTION_RESULT",
         /// Action execution request.
         Execute = "EXECUTE",
+        /// Other `ActionCache`, `ContentAddressableStorage` or `ByteStream` call.
+        Cas = "CAS",
     }
 }
 
@@ -59,6 +61,37 @@ pub struct IngestBuildsRequest {
     #[serde(default)]
     #[ts(type = "number")]
     pub unattributed: u64,
+    /// Sender's cumulative cache traffic since its process started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic: Option<IngestTraffic>,
+}
+
+/// Cumulative cache traffic from one controller process.
+#[derive(
+    gang_macros::Known, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS,
+)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IngestTraffic {
+    /// Start of the sender's process.
+    #[serde(with = "crate::time")]
+    #[ts(type = "Timestamp")]
+    pub start_time: Timestamp,
+    /// Action cache lookups.
+    #[ts(type = "number")]
+    pub lookups: u64,
+    /// Successful action cache lookups.
+    #[ts(type = "number")]
+    pub hits: u64,
+    /// Client-sent cache-service message bytes.
+    #[ts(type = "number")]
+    pub uploaded_bytes: u64,
+    /// Client-received cache-service message bytes.
+    #[ts(type = "number")]
+    pub downloaded_bytes: u64,
+}
+
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
 }
 
 /// A build and the Bazel metadata of the calls that reference it.
@@ -97,6 +130,14 @@ pub struct IngestCall {
     pub rpc: IngestRpc,
     /// Outcome of the call.
     pub outcome: IngestOutcome,
+    /// Client-sent message bytes, omitted when zero.
+    #[serde(default, skip_serializing_if = "is_default")]
+    #[ts(type = "number")]
+    pub uploaded_bytes: u64,
+    /// Client-received message bytes, omitted when zero.
+    #[serde(default, skip_serializing_if = "is_default")]
+    #[ts(type = "number")]
+    pub downloaded_bytes: u64,
 }
 
 /// Lost observations attributed to an entry in the request's origins.
@@ -215,6 +256,14 @@ pub struct CacheCounts {
     /// Successful uploads of locally executed results.
     #[ts(type = "number")]
     pub uploaded_results: u64,
+    /// Client-sent cache-service message bytes attributed to this build.
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub uploaded_bytes: u64,
+    /// Client-received cache-service message bytes attributed to this build.
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub downloaded_bytes: u64,
 }
 
 /// Observed execution calls and own execution outcomes.
@@ -420,15 +469,50 @@ mod tests {
         );
         assert!(request.lost.is_empty());
         assert_eq!(request.unattributed, 0);
+        assert_eq!(request.calls[0].uploaded_bytes, 0);
+        assert_eq!(request.calls[0].downloaded_bytes, 0);
+        assert!(request.traffic.is_none());
         let encoded = serde_json::to_value(&request).expect("request serializes");
         assert_eq!(encoded["calls"][0]["rpc"], "FOO");
         assert_eq!(encoded["calls"][0]["outcome"], "BAR");
+        assert!(encoded["calls"][0].get("uploadedBytes").is_none());
+        assert!(encoded["calls"][0].get("downloadedBytes").is_none());
+        assert!(encoded.get("traffic").is_none());
         assert!(encoded["origins"][0].get("tool").is_none());
         assert_eq!(
             serde_json::to_value(IngestBuildsResponse::default()).expect("response serializes"),
             json!({})
         );
         assert!(serde_json::from_value::<IngestBuildsResponse>(json!({"extra": true})).is_err());
+    }
+
+    #[test]
+    fn ingest_traffic_and_call_bytes_round_trip() {
+        let value = json!({
+            "origins": [],
+            "calls": [{"origin": 0, "rpc": "CAS", "outcome": "OK",
+                "uploadedBytes": 123, "downloadedBytes": 456}],
+            "lost": [], "unattributed": 0,
+            "traffic": {"startTime": "2026-01-14T09:00:00.000Z", "lookups": 7,
+                "hits": 6, "uploadedBytes": 1234, "downloadedBytes": 4567}
+        });
+        let request: IngestBuildsRequest = serde_json::from_value(value.clone()).expect("parses");
+        assert_eq!(request.calls[0].rpc, IngestRpc::Cas);
+        assert_eq!(request.calls[0].uploaded_bytes, 123);
+        assert_eq!(
+            request.traffic.as_ref().expect("traffic").downloaded_bytes,
+            4567
+        );
+        assert_eq!(serde_json::to_value(request).expect("serializes"), value);
+    }
+
+    #[test]
+    fn older_cache_counts_default_bytes() {
+        let counts: CacheCounts = serde_json::from_value(json!({
+            "hits": 1, "misses": 2, "errors": 3, "uploadedResults": 4
+        }))
+        .expect("old counts parse");
+        assert_eq!((counts.uploaded_bytes, counts.downloaded_bytes), (0, 0));
     }
 
     #[test]
@@ -445,7 +529,7 @@ mod tests {
 
     #[test]
     fn full_build_round_trips_with_wire_names() {
-        let usage = json!({"cache": {"hits": 1, "misses": 2, "errors": 3, "uploadedResults": 4},
+        let usage = json!({"cache": {"hits": 1, "misses": 2, "errors": 3, "uploadedResults": 4, "uploadedBytes": 42, "downloadedBytes": 73},
             "executions": {"executeCalls": 5, "rejected": 6, "completed": 7, "failed": 8},
             "actionTime": {"queued": "1.500s", "inputFetch": "2s", "executing": "3s", "outputUpload": "4s"}});
         let value = json!({

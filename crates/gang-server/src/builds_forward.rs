@@ -8,7 +8,7 @@ use bytes::Bytes;
 use gang_clock::Timestamp;
 use gang_insight::{Outbox, OutboxError, Outcome};
 use gang_mtls::{ControllerProof, ProofError};
-use gang_spi::{CertificateSignerPort, ControllerId};
+use gang_spi::{CertificateSignerPort, ControllerId, Traffic};
 use gang_types::NonZeroDuration;
 
 pub(crate) trait Uplink: Send + Sync {
@@ -62,22 +62,30 @@ pub(crate) struct Forwarding<U: Uplink> {
     pub(crate) proofs: ProofSource,
     pub(crate) outbox: Outbox,
     pub(crate) pause: Duration,
+    /// When this process began counting the traffic it forwards.
+    pub(crate) start: Timestamp,
 }
 
 impl<U: Uplink> Forwarding<U> {
+    /// Forwarding for a process that began counting traffic at `start`. The outbox starts with
+    /// zero traffic, so the first dispatch tells the leader the series exists.
     pub(crate) fn try_new(
         uplink: U,
         proofs: ProofSource,
         pause: Duration,
         max_keys: NonZeroUsize,
         max_request_size: usize,
+        start: Timestamp,
     ) -> Result<Self, OutboxError> {
         let max_bytes = NonZeroUsize::new(max_request_size).unwrap_or(NonZeroUsize::MIN);
+        let mut outbox = Outbox::try_new(max_keys, max_bytes)?;
+        outbox.traffic(start, Traffic::default());
         Ok(Self {
             uplink,
             proofs,
-            outbox: Outbox::try_new(max_keys, max_bytes)?,
+            outbox,
             pause,
+            start,
         })
     }
 }

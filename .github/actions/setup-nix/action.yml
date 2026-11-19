@@ -1,7 +1,16 @@
 name: Set up Nix
 description: >-
-  Enable unprivileged user namespaces on Linux and VM KVM access on Linux x86-64, and install
-  Nix for the repository's devShell.
+  Enable unprivileged user namespaces on Linux, optionally enable KVM on Linux x86-64,
+  and install and cache Nix for the repository's devShell.
+inputs:
+  kvm:
+    description: Enable KVM access for VM builds on Linux x86-64.
+    required: false
+    default: 'false'
+  cache-scope:
+    description: Nix cache scope for the devShell, portable checks, or VM builds.
+    required: false
+    default: devshell
 runs:
   using: composite
   steps:
@@ -10,7 +19,7 @@ runs:
       shell: bash
       run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
     - name: Enable KVM access
-      if: runner.os == 'Linux' && runner.arch == 'X64'
+      if: inputs.kvm == 'true' && runner.os == 'Linux' && runner.arch == 'X64'
       shell: bash
       run: |
         if [[ ! -e /dev/kvm ]]; then
@@ -19,8 +28,15 @@ runs:
         fi
         sudo -n chmod 0666 /dev/kvm
     - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+      with:
+        enable_kvm: ${{ inputs.kvm }}
+    - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
+      with:
+        primary-key: nix-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-scope }}-${{ hashFiles('flake.lock', 'flake.nix', 'MODULE.bazel', 'tools/darwin-check.sh', '.github/actions/setup-nix/action.yml') }}-${{ inputs.cache-scope == 'vm' && hashFiles('infra/nixos/**/*', 'configs/gang.aws.toml', 'infra/terraform/modules/network/ports.json') || 'shared' }}
+        restore-prefixes-first-match: nix-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-scope }}-
+        save: ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
     - name: Verify KVM access and Nix system feature
-      if: runner.os == 'Linux' && runner.arch == 'X64'
+      if: inputs.kvm == 'true' && runner.os == 'Linux' && runner.arch == 'X64'
       shell: bash
       run: |
         if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then

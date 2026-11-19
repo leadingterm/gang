@@ -252,6 +252,12 @@ fn main() -> ExitCode {
     let arguments: Vec<std::ffi::OsString> = std::env::args_os().collect();
     if arguments
         .get(1)
+        .is_some_and(|argument| argument == "--gang-e2e-launch-gate")
+    {
+        return gang_e2e::run_launch_gate(&arguments[2..]);
+    }
+    if arguments
+        .get(1)
         .is_some_and(|argument| argument == "proof-command")
     {
         return gang_e2e::proof_command(&arguments[2..]);

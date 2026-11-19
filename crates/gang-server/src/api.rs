@@ -678,7 +678,7 @@ impl<K: Stack> Api<K> {
             tracing::debug!(%error, %controller, "rejected build observations");
             malformed_body()
         })?;
-        ingest.apply(ingested);
+        ingest.apply(&controller, host.clock.wall(), ingested);
         Ok(IngestBuildsResponse {})
     }
 

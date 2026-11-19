@@ -57,7 +57,7 @@ pub use authentication_port::{
     CertificateIssue, CertificateTarget, ClientCertificates, CredentialLifecyclePort, Evidence,
     IssuedCertificate, IssuedToken, Peer, Scheme, TokenIssue,
 };
-pub use cache_port::{CacheStorePort, RenderedStoreSpec};
+pub use cache_port::{CacheStorePort, MeasuredUsage, RenderedStoreSpec};
 pub use credential_port::WorkloadCredentialPort;
 pub use errors::{BoxedError, BuildError, PortError, Rejection, Subject};
 pub use expiring_port::{
@@ -84,7 +84,7 @@ pub use limits_port::{
 };
 pub use observation_port::{
     Call, CallOutcome, Delivery, Executed, ExecutionTimes, Observation, ObservationSink,
-    Observations, Origin, Phase, Rpc,
+    Observations, Origin, Phase, Rpc, Traffic, Transferred,
 };
 pub use plugin::{Plugin, PluginContext, SandboxPrograms};
 pub use private::__private;
@@ -99,9 +99,10 @@ pub use repository_port::{
 pub use scheduler_port::{
     Accepted, ActionInfo, ActionsView, Admitted, ApiRequestBody, ApiResponseBody, ApiService,
     BoxedConnection, ClientTls, Connection, ControllerConnections, ControllerEndpoints,
-    ControllerReady, ControllerSpec, Listening, ListingLimits, QueuedActionView, QueuedDemand,
-    RequestGate, RunningActionView, SchedulerPort, SchedulerSnapshot, Slots, StoreAccess,
-    WorkerSpec, WorkerState, WorkerTls, full_body,
+    ControllerReady, ControllerSpec, EngineStore, ExecutingDemand, Listening, ListingLimits,
+    QueuedActionView, QueuedDemand, RequestGate, RunningActionView, SchedulerPort,
+    SchedulerSnapshot, Slots, StoreAccess, StoreKind, WorkerSpec, WorkerState, WorkerTls,
+    full_body,
 };
 pub use schema::{SchemaPlan, SchemaTooNew, SchemaVersion};
 pub use scratch_port::{MountedScratchVolume, ScratchVolumePort};

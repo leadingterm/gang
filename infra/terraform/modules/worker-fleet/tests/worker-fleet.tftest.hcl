@@ -229,6 +229,17 @@ run "worker_role_reads_cache_and_requests_bounded_identity_tokens_only" {
   }
 
   assert {
+    condition = !anytrue(flatten([
+      for statement in data.aws_iam_policy_document.worker.statement : [
+        for action in statement.actions :
+        lower(action) == "*" || startswith(lower(action), "cloudwatch:")
+        if statement.effect == "Allow"
+      ]
+    ]))
+    error_message = "CloudWatch cache metrics are controller-only; granting them to workers is an overgrant."
+  }
+
+  assert {
     condition = anytrue([
       for statement in data.aws_iam_policy_document.worker.statement :
       contains(statement.resources, "arn:aws:s3:::gang-cache-example/*")

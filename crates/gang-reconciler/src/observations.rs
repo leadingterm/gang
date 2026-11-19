@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::time::Duration;
 
 use gang_clock::Tick;
 use gang_spi::WorkerState;
@@ -29,6 +30,8 @@ pub(crate) struct InstanceObservation {
     pub(crate) unserved_since: Option<Tick>,
     /// When termination of the instance was last ordered, if it has been.
     pub(crate) ordered_at: Option<Tick>,
+    /// Whether a worker has ever been observed on this instance in this term.
+    pub(crate) connected: bool,
 }
 
 /// A table whose values are each tagged with the pass that last touched them; the entries a pass did not touch are swept at its end.
@@ -74,6 +77,42 @@ impl<K: Hash + Eq + Clone, V> Ledger<K, V> {
         self.entries.retain(|_, (_, tag)| *tag == epoch);
     }
 }
+#[derive(Debug, Default)]
+struct Readiness {
+    samples: Vec<Duration>,
+    scratch: Vec<Duration>,
+    limit: usize,
+    next: usize,
+    median: Option<Duration>,
+    backlog: Option<Tick>,
+}
+
+impl Readiness {
+    fn sample(&mut self, value: Duration) {
+        if self.samples.len() < self.limit {
+            self.samples.push(value);
+        } else if !self.samples.is_empty() {
+            self.samples[self.next] = value;
+            self.next = (self.next + 1) % self.samples.len();
+        }
+        self.scratch.clear();
+        self.scratch.extend_from_slice(&self.samples);
+        self.scratch.sort_unstable();
+        let n = self.scratch.len();
+        if n != 0 {
+            let millis = if n.is_multiple_of(2) {
+                self.scratch[n / 2 - 1]
+                    .as_millis()
+                    .midpoint(self.scratch[n / 2].as_millis())
+            } else {
+                self.scratch[n / 2].as_millis()
+            };
+            self.median = Some(Duration::from_millis(
+                u64::try_from(millis).unwrap_or(u64::MAX),
+            ));
+        }
+    }
+}
 
 /// The stored state of every worker and instance, each tagged with the pass that last observed it.
 #[derive(Debug)]
@@ -81,6 +120,7 @@ pub(crate) struct Observations {
     epoch: u64,
     workers: Ledger<WorkerId, Seen>,
     instances: Vec<Ledger<InstanceId, InstanceObservation>>,
+    readiness: Vec<Readiness>,
 }
 
 impl Observations {
@@ -90,7 +130,49 @@ impl Observations {
             epoch: 0,
             workers: Ledger::default(),
             instances: (0..fleets).map(|_| Ledger::default()).collect(),
+            readiness: (0..fleets).map(|_| Readiness::default()).collect(),
         }
+    }
+
+    /// Reserves one readiness ring per fleet.
+    pub(crate) fn reserve_readiness(&mut self, capacities: impl Iterator<Item = usize>) {
+        for (readiness, capacity) in self.readiness.iter_mut().zip(capacities) {
+            readiness.limit = capacity;
+            readiness.samples = Vec::with_capacity(capacity);
+            readiness.scratch = Vec::with_capacity(capacity);
+        }
+    }
+
+    /// Records only the first worker observation, including excluded pre-term instances.
+    pub(crate) fn observe_connection(
+        &mut self,
+        fleet: usize,
+        id: &InstanceId,
+        sample: Option<Duration>,
+    ) {
+        let first =
+            self.instances[fleet].touch(id, self.epoch, InstanceObservation::default, |held| {
+                let first = !held.connected;
+                held.connected = true;
+                first
+            });
+        if first && let Some(sample) = sample {
+            self.readiness[fleet].sample(sample);
+        }
+    }
+
+    pub(crate) fn readiness(&self, fleet: usize) -> Option<Duration> {
+        self.readiness[fleet].median
+    }
+
+    pub(crate) fn stream(&mut self, fleet: usize, active: bool, now: Tick, boot: Duration) -> bool {
+        let backlog = &mut self.readiness[fleet].backlog;
+        if !active {
+            *backlog = None;
+            return false;
+        }
+        let since = *backlog.get_or_insert(now);
+        now.saturating_duration_since(since) >= boot.saturating_mul(2)
     }
 
     /// Starts a new pass; every worker and instance must be observed again before the pass ends.

@@ -393,8 +393,17 @@ time { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .spark { display: block; min-width: 0; width: 100%; height: 100%; transition: opacity var(--dur-long) var(--ease-out); }
 .spark__area { fill: var(--color-accent-moss); stroke: none; }
 .spark__run { fill: none; stroke: var(--color-accent); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.spark__run--secondary { stroke: var(--color-accent-deep); }
 .spark__point { fill: var(--color-accent); }
+.spark__point--secondary { fill: var(--color-accent-deep); }
 .spark__unrecorded { opacity: 0.35; }
+
+.cache-table .meter { width: 8rem; }
+.cache-table td.a-span { white-space: normal; }
+.cache-sparks { display: flex; flex-wrap: wrap; gap: var(--space-2xl); margin-block-start: var(--space-xl); }
+.cache-sparks > div { flex: 1 1 12rem; min-width: 0; }
+.cache-sparks__legend { display: flex; gap: var(--space-md); color: var(--color-accent); }
+.cache-sparks__legend span + span { color: var(--color-accent-deep); }
 
 /* ── Legend and tallies ────────────────────────────────────────────── */
 
@@ -1074,6 +1083,23 @@ time { white-space: nowrap; font-variant-numeric: tabular-nums; }
   .readout:nth-child(n + 3) { border-block-start: var(--rule-hair) solid var(--color-rule); }
   .fleet { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "id nums" "gauge gauge"; }
   .wgrid { grid-template-columns: minmax(180px, 1fr) max-content 72px minmax(0, 1.4fr); }
+  .builds-table thead { display: block; position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .table.builds-table { display: block; }
+  .builds-table tr {
+    grid-column: auto;
+    grid-template-columns: minmax(0, 1fr) fit-content(45%);
+    grid-template-areas: "main main" "kind age" "m1 m2";
+    gap: var(--space-3xs) var(--space-sm);
+    padding-block: var(--space-sm);
+  }
+  .builds-table td { padding: 0; }
+  .builds-table .a-main { grid-area: main; }
+  .builds-table .a-kind { grid-area: kind; }
+  .builds-table .a-age { grid-area: age; text-align: end; }
+  .builds-table .a-m1 { grid-area: m1; }
+  .builds-table .a-m2 { grid-area: m2; text-align: end; }
+  .builds-table .a-span { grid-column: 1 / -1; }
+  .builds-table .build-label { display: inline; color: var(--color-muted); }
 }
 
 @media (max-width: 760px) {
@@ -1121,6 +1147,7 @@ time { white-space: nowrap; font-variant-numeric: tabular-nums; }
   .table .a-m1 { grid-area: m1; }
   .table .a-m2 { grid-area: m2; text-align: end; }
   .table .a-span { grid-column: 1 / -1; }
+  .cache-table td { grid-column: 1 / -1; white-space: normal; }
 
   .wgrid { grid-template-columns: minmax(0, 1fr) auto; }
   .wgrid__axis { display: none; }

@@ -1,4 +1,5 @@
-//! SDK client tunables, read from `[provisioner.aws.client]` and `[signer.kms.client]`.
+//! SDK client tunables, read from `[provisioner.aws.client]`, `[signer.kms.client]` and
+//! `[cache.s3.client]`.
 
 use std::num::NonZeroU32;
 

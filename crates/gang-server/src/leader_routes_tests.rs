@@ -237,7 +237,7 @@ async fn leader_serves_local_state_without_connecting() -> TestResult {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = Url::parse(&format!("http://{}", listener.local_addr()?))?;
     let leading = Leading::default();
-    leading.set();
+    leading.set(gang_clock::Timestamp::UNIX_EPOCH);
     let api = api(endpoint, leading)?;
     let response = api.call(request(GET_STATE.template)).await;
     assert_eq!(response.status(), StatusCode::OK);

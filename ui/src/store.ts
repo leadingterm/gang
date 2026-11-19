@@ -78,6 +78,7 @@ export const applyDelta = (state: State, delta: Delta): Applied => {
       updateTime: delta.updateTime,
       pass: delta.pass ?? state.pass,
       queue: delta.queue ?? state.queue,
+      cache: delta.cache ?? state.cache,
       fleets: mergeKeyed(state.fleets, delta.fleets, byName, "declared"),
       workers: mergeKeyed(state.workers, delta.workers, byName, "sorted"),
       instances: mergeKeyed(state.instances, delta.instances, byName, "sorted"),

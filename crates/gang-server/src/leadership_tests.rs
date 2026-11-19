@@ -18,22 +18,26 @@ use crate::leadership::{Leadership, Leading};
 const RENEW: Duration = Duration::from_secs(3);
 const VALID_FOR: Duration = Duration::from_secs(8);
 
+const TERM: Timestamp = Timestamp::from_unix_millis(5_000);
+
 #[tokio::test]
 async fn leading_wait_before_set_resolves() {
     let leading = Leading::default();
     let wait = leading.wait();
     pin_mut!(wait);
     assert!(!leading.get());
+    assert_eq!(leading.start(), None);
     assert!(poll!(wait.as_mut()).is_pending());
-    leading.set();
+    leading.set(TERM);
     assert!(leading.get());
+    assert_eq!(leading.start(), Some(TERM));
     assert!(poll!(wait.as_mut()).is_ready());
 }
 
 #[tokio::test]
 async fn leading_wait_after_set_resolves_immediately() {
     let leading = Leading::default();
-    leading.set();
+    leading.set(TERM);
     let wait = leading.wait();
     pin_mut!(wait);
     assert!(poll!(wait.as_mut()).is_ready());
@@ -48,21 +52,24 @@ async fn leading_set_notifies_all_registered_waiters() {
     pin_mut!(first, second);
     assert!(poll!(first.as_mut()).is_pending());
     assert!(poll!(second.as_mut()).is_pending());
-    leading.set();
+    leading.set(TERM);
     assert!(poll!(first.as_mut()).is_ready());
     assert!(poll!(second.as_mut()).is_ready());
 }
 
+// Catches a repeated set moving the term start, which would let ingest count a follower's
+// pre-term traffic in full.
 #[tokio::test]
-async fn leading_repeated_set_is_harmless() {
+async fn leading_repeated_set_keeps_the_first_start() {
     let leading = Leading::default();
     let cloned = leading.clone();
     let wait = cloned.wait();
     pin_mut!(wait);
     assert!(poll!(wait.as_mut()).is_pending());
-    leading.set();
-    leading.set();
+    leading.set(TERM);
+    leading.set(TERM + Duration::from_mins(1));
     assert!(cloned.get());
+    assert_eq!(cloned.start(), Some(TERM));
     assert!(poll!(wait.as_mut()).is_ready());
     let after = cloned.wait();
     pin_mut!(after);

@@ -63,6 +63,7 @@
 in
   pkgs.testers.runNixOSTest {
     name = "glibc-loader";
+    globalTimeout = 300;
 
     nodeDefaults.virtualisation = {
       memorySize = 1024;

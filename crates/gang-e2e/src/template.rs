@@ -265,6 +265,36 @@ impl ConfigTemplate {
             .push(absolute(directory.to_path_buf(), "the signal directory")?);
         Ok(self)
     }
+    /// Wraps the Local launcher with the harness's FIFO gate, retaining its entire argv.
+    pub(crate) fn with_launch_gate(
+        mut self,
+        gate: Option<&Path>,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let Some(gate) = gate else {
+            return Ok(self);
+        };
+        let ProvisionerConfig::Local(local) = &mut self.document.provisioner else {
+            return Err(template_error("missing [provisioner.local]"));
+        };
+        let executable =
+            std::env::current_exe().map_err(E2eError::io("locating the harness executable"))?;
+        let executable = executable
+            .to_str()
+            .ok_or_else(|| template_error("harness executable path is not UTF-8"))?;
+        let gate = gate
+            .to_str()
+            .ok_or_else(|| template_error("launch gate path is not UTF-8"))?;
+        let mut launcher = vec![
+            executable.to_owned(),
+            "--gang-e2e-launch-gate".to_owned(),
+            gate.to_owned(),
+            timeout.as_millis().to_string(),
+        ];
+        launcher.extend(local.worker_launcher.argv().iter().cloned());
+        local.worker_launcher = launcher.try_into().map_err(template_error)?;
+        Ok(self)
+    }
 
     /// Applies the scenario's sandbox, fleet, execution, control and server knobs.
     ///
@@ -686,6 +716,14 @@ fn render_control(document: &mut Document<Plugins>, knobs: &ControlKnobs) -> Res
         if let Some(max) = knobs.max_instances {
             fleet.max_instances = NonZeroU32::new(max)
                 .ok_or_else(|| template_error("max instances must be nonzero"))?;
+        }
+        if let Some(target) = knobs.target_actions_per_instance {
+            fleet.target_actions_per_instance = NonZeroU32::new(target)
+                .ok_or_else(|| template_error("target actions per instance must be nonzero"))?;
+        }
+        if let Some(vcpus) = knobs.vcpus_per_instance {
+            fleet.vcpus_per_instance = NonZeroU32::new(vcpus)
+                .ok_or_else(|| template_error("vcpus per instance must be nonzero"))?;
         }
         if let Some(instances) = knobs.scheduled_minimum {
             let instances = NonZeroU32::new(instances)

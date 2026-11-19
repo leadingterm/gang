@@ -121,6 +121,7 @@ pub fn queued(since: u64, candidates: FleetSet) -> QueuedDemand {
         resources: ActionResources::default(),
         queued_since: ts(since),
         priority: 0,
+        expected: None,
     }
 }
 

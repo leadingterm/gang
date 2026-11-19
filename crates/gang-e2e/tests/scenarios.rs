@@ -579,13 +579,6 @@ flaw! {
         => only [names::revocation::ANONYMOUS_REQUEST]
 }
 
-#[test]
-fn plaintext_is_compliant_under_noop() {
-    let variant = baseline(Sandbox::Noop);
-    let system = Simulation::new(variant, Behaviour::COMPLIANT);
-    assert_compliant(&plaintext(&system).expect("the plaintext scenario runs"));
-}
-
 /// The verdicts of the plaintext scenario against a simulation that behaves as `behaviour` says.
 fn plaintext_checks(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
     let system = Simulation::new(baseline(Sandbox::Noop), behaviour);
@@ -601,6 +594,7 @@ flaw! {
 #[test]
 fn plaintext_judges_the_state_before_after_and_drain() -> gang_e2e::Result<()> {
     let checks = plaintext_checks(Behaviour::COMPLIANT)?;
+    assert_compliant(&checks);
     for name in [
         names::plaintext::STATE_IDLE,
         names::plaintext::STATE_SCALED_OUT,
@@ -989,12 +983,6 @@ fn outcome_of(checks: &[Check], name: impl AsRef<str>) -> Option<&Outcome> {
 }
 
 #[test]
-fn fleets_is_compliant_under_bwrap() -> gang_e2e::Result<()> {
-    assert_compliant(&fleets_checks(Sandbox::Bwrap, Behaviour::COMPLIANT)?);
-    Ok(())
-}
-
-#[test]
 fn fleets_is_compliant_under_noop() -> gang_e2e::Result<()> {
     assert_compliant(&fleets_checks(Sandbox::Noop, Behaviour::COMPLIANT)?);
     Ok(())
@@ -1015,6 +1003,7 @@ fn fleets_is_compliant_when_bazel_sends_the_pair_one_by_one() -> gang_e2e::Resul
 #[test]
 fn fleets_judges_the_placement_of_every_step() -> gang_e2e::Result<()> {
     let checks = fleets_checks(Sandbox::Bwrap, Behaviour::COMPLIANT)?;
+    assert_compliant(&checks);
     for name in [
         unconstrained_placed(),
         pinned_placed(),
@@ -1136,4 +1125,101 @@ fn a_fleets_step_whose_build_fails_before_any_scale_out_is_judged_without_waitin
         );
     }
     Ok(())
+}
+
+fn work_aware_scale_out(from: u32, to: u32) -> gang_wire::Event {
+    gang_wire::Event {
+        name: "events/1".to_owned(),
+        create_time: gang_clock::Timestamp::from_unix_millis(0),
+        fleet: "fleets/local".to_owned(),
+        cause: Some(gang_wire::Cause::Demand),
+        change: gang_wire::EventChange::ScaledOut { from, to },
+    }
+}
+
+#[test]
+fn burst_verdict_rejects_extra_scaleout_missing_readiness_and_failed_build() {
+    use gang_e2e::{BuildOutcome, burst_checks};
+    use std::time::Duration;
+
+    let success = BuildOutcome::new(Some(0), String::new());
+    let failure = BuildOutcome::new(Some(1), "build failed".to_owned());
+    let first = work_aware_scale_out(0, 1);
+    assert_compliant(&burst_checks(
+        std::slice::from_ref(&first),
+        Some(Duration::from_secs(9)),
+        &success,
+    ));
+    assert_fails(
+        &burst_checks(
+            &[first.clone(), work_aware_scale_out(1, 3)],
+            Some(Duration::from_secs(9)),
+            &success,
+        ),
+        names::work_aware::BURST_SCALE_OUT,
+    );
+    assert_fails(
+        &burst_checks(std::slice::from_ref(&first), None, &success),
+        names::work_aware::READINESS,
+    );
+    assert_fails(
+        &burst_checks(
+            std::slice::from_ref(&first),
+            Some(Duration::from_secs(8)),
+            &success,
+        ),
+        names::work_aware::READINESS,
+    );
+    assert_fails(
+        &burst_checks(&[first], Some(Duration::from_secs(9)), &failure),
+        names::work_aware::BURST_BUILD,
+    );
+    assert_fails(
+        &burst_checks(&[], Some(Duration::from_secs(9)), &success),
+        names::work_aware::BURST_SCALE_OUT,
+    );
+}
+
+#[test]
+fn burst_capacity_verdict_rejects_excess_desired_capacity() {
+    assert!(gang_e2e::burst_capacity_check(1).is_passed());
+    assert!(gang_e2e::burst_capacity_check(2).is_failure());
+}
+
+#[test]
+fn short_work_verdict_rejects_scaleout_missing_observation_and_failed_build() {
+    use gang_e2e::{BuildOutcome, short_checks};
+
+    let success = BuildOutcome::new(Some(0), String::new());
+    let failure = BuildOutcome::new(Some(1), "build failed".to_owned());
+    assert_compliant(&short_checks(&[], true, &success));
+    assert_fails(
+        &short_checks(&[work_aware_scale_out(1, 2)], true, &success),
+        names::work_aware::QUEUED_SCALE_OUT,
+    );
+    assert_fails(
+        &short_checks(&[], false, &success),
+        names::work_aware::QUEUED,
+    );
+    assert_fails(
+        &short_checks(&[], true, &failure),
+        names::work_aware::QUEUED_BUILD,
+    );
+}
+
+#[test]
+fn backlog_verdict_rejects_missing_workers_and_failed_build() {
+    use gang_e2e::{BuildOutcome, backlog_checks};
+
+    let success = BuildOutcome::new(Some(0), String::new());
+    let failure = BuildOutcome::new(Some(1), "build failed".to_owned());
+    assert_compliant(&backlog_checks(true, &success));
+    assert_fails(
+        &backlog_checks(false, &success),
+        names::work_aware::BACKLOG_WORKERS,
+    );
+    assert_fails(
+        &backlog_checks(true, &failure),
+        names::work_aware::BACKLOG_BUILD,
+    );
 }

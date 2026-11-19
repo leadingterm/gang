@@ -393,6 +393,7 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
         "candidates": 0,
         "needed": 2,
         "vcpus": 2,
+        "readiness": "42.500s",
         "memory": 4294967296
       }
     }
@@ -493,11 +494,15 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
     "window": "900s",
     "step": "10s",
     "samples": [
-      {"start": "2026-01-14T09:19:40.000Z", "completed": 12, "running": 3, "queued": 0, "passes": 5, "skipped": 0, "lookups": 20, "hits": 18},
-      {"start": "2026-01-14T09:19:50.000Z", "completed": 9, "running": 2, "queued": 1, "passes": 5, "skipped": 0, "lookups": 10, "hits": 9},
-      {"start": "2026-01-14T09:20:00.000Z", "completed": 1, "running": 1, "queued": 1, "passes": 1, "skipped": 0, "lookups": 2, "hits": 1}
+      {"start": "2026-01-14T09:19:40.000Z", "completed": 12, "running": 3, "queued": 0, "passes": 5, "skipped": 0, "lookups": 20, "hits": 18, "uploadedBytes": 1048576, "downloadedBytes": 73400320, "evictedBytes": 0},
+      {"start": "2026-01-14T09:19:50.000Z", "completed": 9, "running": 2, "queued": 1, "passes": 5, "skipped": 0, "lookups": 10, "hits": 9, "uploadedBytes": 4096, "downloadedBytes": 8192, "evictedBytes": 1024},
+      {"start": "2026-01-14T09:20:00.000Z", "completed": 1, "running": 1, "queued": 1, "passes": 1, "skipped": 0, "lookups": 2, "hits": 1, "uploadedBytes": 0, "downloadedBytes": 512, "evictedBytes": 0}
     ]
   },
+  "cache": {"stores": [
+    {"store": "CAS", "usedBytes": 53687091200, "budgetBytes": 64424509440},
+    {"store": "AC", "usedBytes": 104857600, "budgetBytes": 5153960755}
+  ]},
   "builds": [],
   "principalsEpoch": 3
 }
@@ -512,11 +517,11 @@ curl -N -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state:watc
 ```sse
 event: snapshot
 id: 4812
-data: {"name":"state","seq":4812,"updateTime":"2026-01-14T09:20:02.000Z","provisioner":"aws","pass":{"state":"OK","interval":"2s","applied":0,"failed":0},"queue":{"total":0,"unplaceable":0},"fleets":[],"workers":[],"instances":[],"events":[{"name":"events/996","createTime":"2026-01-14T09:19:58.000Z","fleet":"fleets/x86-64-spot","workerRegistered":{"worker":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b"}}],"eventsLimit":200,"completed":980,"recent":{"window":"900s","step":"10s","samples":[{"start":"2026-01-14T09:20:00.000Z","completed":0,"running":0,"queued":0,"passes":1,"skipped":0,"lookups":0,"hits":0}]},"builds":[],"principalsEpoch":3}
+data: {"name":"state","seq":4812,"updateTime":"2026-01-14T09:20:02.000Z","provisioner":"aws","pass":{"state":"OK","interval":"2s","applied":0,"failed":0},"queue":{"total":0,"unplaceable":0},"fleets":[],"workers":[],"instances":[],"events":[{"name":"events/996","createTime":"2026-01-14T09:19:58.000Z","fleet":"fleets/x86-64-spot","workerRegistered":{"worker":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b"}}],"eventsLimit":200,"completed":980,"recent":{"window":"900s","step":"10s","samples":[{"start":"2026-01-14T09:20:00.000Z","completed":0,"running":0,"queued":0,"passes":1,"skipped":0,"lookups":0,"hits":0,"uploadedBytes":0,"downloadedBytes":0,"evictedBytes":0}]},"cache":{},"builds":[],"principalsEpoch":3}
 
 event: delta
 id: 4813
-data: {"seq":4813,"base":4812,"updateTime":"2026-01-14T09:20:04.000Z","queue":{"total":0,"unplaceable":0},"workers":{"upsert":[{"name":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b","fleet":"fleets/x86-64-spot","instance":"instances/i-0e1000000000000a","phase":"IDLE","phaseTime":"2026-01-14T09:20:04.000Z","running":0,"slots":4,"paused":false,"launchTime":"2026-01-14T09:18:30.000Z","phases":[{"phase":"BUSY","start":"2026-01-14T09:19:58.000Z"},{"phase":"IDLE","start":"2026-01-14T09:20:04.000Z"}]}]},"actions":{"sampleTime":"2026-01-14T09:20:04.000Z","running":{"remove":["actions/ac9b1c52-3d0e-4f61-9a27-51c6d7e8f901"]},"queued":[]},"events":[{"name":"events/997","createTime":"2026-01-14T09:20:04.000Z","fleet":"fleets/x86-64-spot","cause":"IDLE_TIMEOUT","drainStarted":{"worker":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b"}}],"completed":981,"recent":{"window":"900s","step":"10s","samples":[{"start":"2026-01-14T09:20:00.000Z","completed":0,"running":0,"queued":0,"passes":2,"skipped":0,"lookups":0,"hits":0}]}}
+data: {"seq":4813,"base":4812,"updateTime":"2026-01-14T09:20:04.000Z","queue":{"total":0,"unplaceable":0},"workers":{"upsert":[{"name":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b","fleet":"fleets/x86-64-spot","instance":"instances/i-0e1000000000000a","phase":"IDLE","phaseTime":"2026-01-14T09:20:04.000Z","running":0,"slots":4,"paused":false,"launchTime":"2026-01-14T09:18:30.000Z","phases":[{"phase":"BUSY","start":"2026-01-14T09:19:58.000Z"},{"phase":"IDLE","start":"2026-01-14T09:20:04.000Z"}]}]},"actions":{"sampleTime":"2026-01-14T09:20:04.000Z","running":{"remove":["actions/ac9b1c52-3d0e-4f61-9a27-51c6d7e8f901"]},"queued":[]},"events":[{"name":"events/997","createTime":"2026-01-14T09:20:04.000Z","fleet":"fleets/x86-64-spot","cause":"IDLE_TIMEOUT","drainStarted":{"worker":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b"}}],"completed":981,"recent":{"window":"900s","step":"10s","samples":[{"start":"2026-01-14T09:20:00.000Z","completed":0,"running":0,"queued":0,"passes":2,"skipped":0,"lookups":0,"hits":0,"uploadedBytes":0,"downloadedBytes":0,"evictedBytes":0}]}}
 
 event: tick
 id: 4813
@@ -541,20 +546,23 @@ data: {"reason":"VIEWER_CAP","retryDelay":"5s"}
 ### Notes
 
 - **Leader.** The leader serves both routes; a follower relays the request and streaming response to it, preserving the caller's credentials.
+- **Fleet demand estimates.** `demand.readiness` and `demand.expectedWait` are independently optional Google Duration strings, for example `"42.5s"` and `"0s"`. `readiness` is the measured launch-to-first-worker latency; it is omitted until measured, even while the planner uses `bootGrace` as its prior. `expectedWait` is the latest simulated start delay among the fleet's attributed queued actions at the final planned capacity; it is omitted when there is no attributed queue. Zero is a valid estimate, not an absent value.
 - **Frames.** `Frame` is the type of each stream message, defined once in `gang-wire`:
 
   | Event | Data | Sent |
   |---|---|---|
   | `snapshot` | `State` | first on every connect, and again when a viewer fell behind the broadcast |
-  | `delta` | `{seq, base, updateTime, pass?, queue?, fleets?, workers?, instances?, actions?, events?, completed?, recent?, builds?, principalsEpoch?}` | when a pass changed something and a viewer is connected |
+  | `delta` | `{seq, base, updateTime, pass?, queue?, cache?, fleets?, workers?, instances?, actions?, events?, completed?, recent?, builds?, principalsEpoch?}` | when a pass changed something and a viewer is connected |
   | `tick` | `{seq, time}` | every heartbeat interval, with the current `seq` |
   | `closed` | `{reason, retryDelay?}` | last, when the server ends the stream deliberately |
 
   The SSE event names `snapshot`, `delta`, `tick` and `closed` are protocol identifiers and stay lowercase. `id:` is the frame's `seq`. The server may also write comment lines starting with `:` between frames; a reader ignores them.
-- **Applying a delta.** A delta moves the state from `base` to `seq`. A part that is present replaces the whole part (`pass`, `queue`, `completed`, `principalsEpoch`); `fleets`, `workers` and `instances` are `{upsert[], remove[]}` keyed by `name`, and a name is in at most one of the two lists (empty lists are omitted); `events` are appended, newest last; `recent` carries `window`, `step` and the samples from the first one that changed: drop your samples from that sample's `start` on, append these, then drop samples that start a whole `window` or more before the last. The `actions` patch is `{sampleTime?, staleAfter?, running?, queued?, truncated?}`: `running` is keyed by `name`, `queued` replaces the whole list. When `actions` first appears, the patch carries every field and all rows in `running.upsert`.
+- **Applying a delta.** A delta moves the state from `base` to `seq`. A part that is present replaces the whole part (`pass`, `queue`, `cache`, `completed`, `principalsEpoch`); `fleets`, `workers` and `instances` are `{upsert[], remove[]}` keyed by `name`, and a name is in at most one of the two lists (empty lists are omitted); `events` are appended, newest last; `recent` carries `window`, `step` and the samples from the first one that changed: drop your samples from that sample's `start` on, append these, then drop samples that start a whole `window` or more before the last. The `actions` patch is `{sampleTime?, staleAfter?, running?, queued?, truncated?}`: `running` is keyed by `name`, `queued` replaces the whole list. When `actions` first appears, the patch carries every field and all rows in `running.upsert`.
 - **Resynchronizing.** `seq` advances only when a delta is sent, and only while a viewer is connected. A client reconnects when a delta's `base` differs from its own `seq`, or when a tick's `seq` is behind its own state. A tick whose `seq` equals or runs ahead of the client's is normal (a delta may still be queued for that viewer). There is no replay and no `Last-Event-ID` handling: every connect begins with a snapshot, and a second `snapshot` on an open stream replaces the client's state.
 - **Recent window.** `recent` is what the server observed over its last `window` (`[dashboard] history_window`), one sample per `step` (`history_step`), oldest first and without holes; the last sample is the step in progress. A sample counts `completed` actions in its step, the `running` and `queued` actions at its latest completed pass, and its completed and `skipped` passes. A worker's `phases` are its phase spans within the window, the last being its current phase. The window lives in the server's memory: after a restart the steps before the first sample were not recorded and must not be read as zero.
-- **Builds in the state.** `State.builds` contains the basic build view for records observed within the recent window, ordered by name and bounded by `max_live`; `Delta.builds` applies `{upsert[], remove[]}` keyed by name. RunningAction and QueuedAction `build` references the first submitter's build, and is absent when unattributable. Each Sample's `lookups` and `hits` count farm-wide remote cache lookups and hits in the step, including unattributable calls. See [builds](#builds) for the build view.
+- **Cache.** `cache.stores` lists the leader engine's bounded stores, read at the latest completed pass. `store` is `CAS` or `AC`; readers tolerate future values. `usedBytes` is on-disk occupancy rounded to filesystem blocks, and `budgetBytes` is the eviction budget. `cache.bucket` is the provider's latest whole-bucket measurement, irrespective of key prefix; `measureTime` is when it was measured, not read, and can be more than a day old. S3 objects expire by bucket lifecycle, which Gang does not observe. Empty `stores` and absent `bucket` are omitted; the `cache` object is always present. For example: `{"bucket":{"bytes":912680550400,"objects":4210336,"measureTime":"2026-01-14T00:00:00.000Z"}}`.
+- **Cache traffic.** Each sample's `lookups`, `hits`, `uploadedBytes` and `downloadedBytes` count calls served by every controller, including calls without attributable metadata. Traffic snapshots are coherent: hits never exceed lookups. Followers forward their totals in the next batch, so counts are lower bounds. Bytes are gRPC message bytes on ActionCache, ContentAddressableStorage and ByteStream calls between clients and Gang, including partial streams, compressed when sent compressed and counting every attempt, without HTTP/2 or TLS framing. Worker-to-store traffic is excluded. `evictedBytes` counts bounded-store evictions in the step.
+- **Builds in the state.** `State.builds` contains the basic build view for records observed within the recent window, ordered by name and bounded by `max_live`; `Delta.builds` applies `{upsert[], remove[]}` keyed by name. RunningAction and QueuedAction `build` references the first submitter's build, and is absent when unattributable. See [builds](#builds) for the build view.
 - **Events in the state.** `State.events` holds the newest `eventsLimit` scaling events, newest last (ascending). The same events are on `GET /v1/events`, which pages the whole history newest first.
 - **Closing.** `closed.reason` is one of the values below. `retryDelay` is a `Duration` and the SSE `retry:` line repeats it in milliseconds. A client treats a reason it does not know as terminal and reconnects only after the delay, if there is one.
 
@@ -592,9 +600,10 @@ Submit controller observations:
 ```json request IngestBuildsRequest
 {
   "origins": [{"principal": "example-idp:alice", "invocationId": "invocation-1"}],
-  "calls": [{"origin": 0, "rpc": "GET_ACTION_RESULT", "outcome": "OK"}],
+  "calls": [{"origin": 0, "rpc": "CAS", "outcome": "OK", "uploadedBytes": 128, "downloadedBytes": 4096}],
   "lost": [],
-  "unattributed": 0
+  "unattributed": 0,
+  "traffic": {"startTime": "2026-01-14T09:00:00.000Z", "lookups": 5, "hits": 4, "uploadedBytes": 128, "downloadedBytes": 4096}
 }
 ```
 
@@ -619,7 +628,7 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.org/v1/builds/k3q9w2
   "startTime": "2026-01-14T09:20:00.000Z",
   "lastActiveTime": "2026-01-14T09:20:10.000Z",
   "usage": {
-    "cache": {"hits": 3, "misses": 1, "errors": 0, "uploadedResults": 1},
+    "cache": {"hits": 3, "misses": 1, "errors": 0, "uploadedResults": 1, "uploadedBytes": 128, "downloadedBytes": 4096},
     "executions": {"executeCalls": 1, "rejected": 0, "completed": 1, "failed": 0},
     "actionTime": {"queued": "1s", "inputFetch": "0.250s", "executing": "2s", "outputUpload": "0.500s"}
   },
@@ -627,13 +636,13 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.org/v1/builds/k3q9w2
   "mnemonics": [{
     "mnemonic": "CppCompile",
     "usage": {
-      "cache": {"hits": 3, "misses": 1, "errors": 0, "uploadedResults": 1},
+      "cache": {"hits": 3, "misses": 1, "errors": 0, "uploadedResults": 1, "uploadedBytes": 128, "downloadedBytes": 4096},
       "executions": {"executeCalls": 1, "rejected": 0, "completed": 1, "failed": 0},
       "actionTime": {"queued": "1s", "inputFetch": "0.250s", "executing": "2s", "outputUpload": "0.500s"}
     }
   }],
   "otherMnemonics": {
-    "cache": {"hits": 0, "misses": 0, "errors": 0, "uploadedResults": 0},
+    "cache": {"hits": 0, "misses": 0, "errors": 0, "uploadedResults": 0, "uploadedBytes": 0, "downloadedBytes": 0},
     "executions": {"executeCalls": 0, "rejected": 0, "completed": 0, "failed": 0},
     "actionTime": {"queued": "0s", "inputFetch": "0s", "executing": "0s", "outputUpload": "0s"}
   },
@@ -671,7 +680,7 @@ curl -G -H "Authorization: Bearer $TOKEN" https://gang.example.org/v1/builds \
     "startTime": "2026-01-14T09:20:00.000Z",
     "lastActiveTime": "2026-01-14T09:20:10.000Z",
     "usage": {
-      "cache": {"hits": 3, "misses": 1, "errors": 0, "uploadedResults": 1},
+      "cache": {"hits": 3, "misses": 1, "errors": 0, "uploadedResults": 1, "uploadedBytes": 128, "downloadedBytes": 4096},
       "executions": {"executeCalls": 1, "rejected": 0, "completed": 1, "failed": 0},
       "actionTime": {"queued": "1s", "inputFetch": "0.250s", "executing": "2s", "outputUpload": "0.500s"}
     },
@@ -696,14 +705,16 @@ Pass the returned `nextPageToken` as `pageToken` with the same filter to request
 
 - **Leader and observations.** The leader serves both GET routes; a follower relays the request to it, preserving the caller's credentials. Followers forward bounded batches of cache-call observations to the leader. Cache counters are observed lower bounds, not completeness guarantees.
 - **Controller ingestion.** The ingest route runs only on the execution listener for controllers; public and worker routes return 404, even for administrators. It requires a unique `x-gang-controller` domain-separated CA-signed proof; an ordinary bearer token or session cookie is insufficient. The receiving controller must be the leader. The whole bounded batch is validated before application: an empty 200 response means it was accepted, and a non-2xx response means it was not applied. After an ambiguous send, the sender never retries delivered calls or carried loss counts. Observations are lower bounds, not a completeness guarantee.
+- **Ingest traffic.** `calls[].rpc` accepts `GET_ACTION_RESULT`, `UPDATE_ACTION_RESULT`, `EXECUTE` and `CAS`; unknown RPCs are rejected. Call `uploadedBytes` and `downloadedBytes` default to zero and are omitted when zero; an `EXECUTE` call with nonzero bytes is malformed. Optional `traffic` carries cumulative totals since `startTime`; hits exceeding lookups are malformed. Malformed batches are rejected before effects. The leader keys series by authenticated controller and start time, adds coherent increases for a known series, and counts a new series in full only when it started at or after leadership began. For the same incarnation, any total regression or an increase in hits exceeding the increase in lookups causes the entire traffic update to be ignored with a warning, not partially clamped; valid calls and losses in that batch are still processed. A new `startTime` denotes a restart. The leader captures its own counter baseline before leadership begins, so only subsequent growth is counted, following the same rule as a pre-existing follower series. Watermarks are retained for the whole leadership term, independently of the chart's `history_window`, and cleared on a term change. A follower resuming after an idle period or partition longer than `history_window` therefore contributes only its increase, without extra traffic or a heartbeat. `[builds] max_traffic_series` bounds retained controllers (default 1024, minimum 1); at capacity, an unknown controller evicts the least recently updated watermark and logs a warning. Eviction is the only case where old totals may be counted again. Ambiguous sends do not acknowledge traffic; a subsequent batch carries current totals. During a rolling upgrade an older leader rejects a newer follower's request fields, losing those observations.
 - **Scope and visibility.** A `builds.read` holder sees all held builds. Records are bounded in memory; at capacity the least recently active is dropped, and a restart clears them. Calls with no principal, no invocation id or an over-cap metadata field are not attributed to a build. Invocation ids, target labels and mnemonics are client-asserted; target labels can reveal repository structure.
 - **Filter and order.** `filter` is a conjunction of `field = "value"` terms joined by ` AND `, each field at most once: `principal`, `invocationId` and `correlatedInvocationsId`. Empty matches all. The list orders newest `lastActiveTime` first, ties by name; the opaque cursor resumes strictly after the last row.
 - **Views.** List and `State.builds` use the basic view; Get returns the full view, adding `mnemonics`, `otherMnemonics`, `missedTargets`, `slowest` and `timeline` when present. Optional empty fields are omitted.
 - **State and loss.** `ACTIVE` means an observation arrived within `[builds] idle_after`; `IDLE` means none did. Neither says the command finished or succeeded. `unrecorded` counts observations lost to the bounded channel; further losses that cannot be attributed to a held loss counter are logged, not assigned to a build.
 - **Cache and execution.** `usage.cache` counts remote lookup hits, misses and errors and successful result uploads; a successful upload is a locally executed result uploaded by the client. `usage.executions` counts successful execute calls, rejected calls and own completed and failed worker executions. NativeLink deduplicates in-flight work: a later submitter joins the first submitter's execution. Clients derive joined as `max(0, executeCalls - completed - failed)`; joined wait is not timed. `usage.actionTime` sums worker-reported phase durations, not elapsed build time; phases the worker did not report are left out of the sums and slowest actions.
+- **Transferred bytes.** `usage.cache.uploadedBytes` and `downloadedBytes` are client-sent and client-received cache-service message bytes attributed to the build; each mnemonic and `otherMnemonics` use the same shape. Calls lacking build metadata still count farm-wide but cannot be assigned to a build.
 - **Breakdowns.** Each `mnemonics` row holds the same usage shape; missing or excess mnemonics go into `otherMnemonics`. `missedTargets` uses Space-Saving: the true misses lie between `misses - overestimate` and `misses`. `slowest` is ordered by largest `span`, from `queueTime` to worker completion; its phase durations are action times.
 - **Timeline.** Buckets hold hit and miss counts and queued and executing action-time durations. Divide a duration by `step` for mean concurrency. As the timeline grows, adjacent buckets merge and `step` doubles, preserving totals.
-- **What the server cannot see.** Local and disk-cache hits, local-only actions except uploaded results, analysis time, Bazel job throttling, critical path and build success are not visible. A remote lookup hit whose outputs were evicted can be followed by an execution, so both may be counted; actions for which Bazel skips a remote lookup can execute without a lookup.
+- **What the server cannot see.** Local and disk-cache hits and transfers, worker transfers, local-only actions except uploaded results, analysis time, Bazel job throttling, critical path and build success are not visible. A remote lookup hit whose outputs were evicted can be followed by an execution, so both may be counted; actions for which Bazel skips a remote lookup can execute without a lookup.
 - Both GET routes accept the session cookie.
 
 ## principals

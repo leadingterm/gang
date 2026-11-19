@@ -1,6 +1,6 @@
 // One build's full, in-memory view, refreshed by its streamed row or the build-only refresh.
 import { useEffect } from "preact/hooks";
-import { duration, percent } from "../format.ts";
+import { bytes, duration, percent } from "../format.ts";
 import { identityOf, ms, seconds } from "../wire-parse.ts";
 import type { Build as BuildData, ScalingEvent, State } from "../wire.ts";
 import { Cell, Clock, Duration, Empty, Ident, Num, Row, Section, Table, Target, useClient } from "../ui.tsx";
@@ -107,6 +107,7 @@ const CacheCard = ({ build }: { build: BuildData }) => {
   return (
     <Section id="build-cache" title="Remote cache">
       <p>Hit rate <strong>{percent(cache.hits, cache.hits + cache.misses + cache.errors)}</strong> · {cache.hits} hits · {cache.misses} misses · {cache.errors} errors</p>
+      <p>Downloaded {bytes(cache.downloadedBytes)} · Uploaded {bytes(cache.uploadedBytes)}</p>
       <h3 class="label">Misses by mnemonic</h3>
       {mnemonics.length === 0 && other === 0 ? <p class="dim">No mnemonic misses recorded.</p> : (
         <Table cls="build-counts" cols={[{ share: 1 }, { end: true }]}>

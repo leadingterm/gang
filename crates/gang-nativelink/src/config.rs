@@ -32,8 +32,10 @@ const DEFAULT_MAX_JOB_RETRIES: NonZeroU32 = NonZeroU32::MIN.saturating_add(2);
 const DEFAULT_MAX_WORKER_LOSS_RETRIES: NonZeroU32 = NonZeroU32::MIN.saturating_add(9);
 /// Extra reservation over measured usage, in percent.
 const DEFAULT_HEADROOM_PERCENT: HeadroomPercent = HeadroomPercent::from_percent(20);
-/// How many days a resource measurement counts: seven days.
+/// How many days a resource or duration measurement counts: seven days.
 const DEFAULT_WINDOW_DAYS: NonZeroU32 = NonZeroU32::MIN.saturating_add(6);
+/// Maximum number of learned action duration keys.
+const DEFAULT_DURATION_KEYS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(65_535);
 /// Longest time one action may run on a worker.
 const DEFAULT_ACTION_TIMEOUT: WholeSeconds = WholeSeconds::from_units(20 * 60);
 /// Longest time a worker may spend uploading the outputs of one action.
@@ -181,8 +183,10 @@ pub struct SchedulerTuning {
     pub max_worker_loss_retries: NonZeroU32,
     /// Extra reservation over measured usage, in percent. Default: 20.
     pub headroom_percent: HeadroomPercent,
-    /// How many days a resource measurement counts. Default: 7.
+    /// How many days a resource or duration measurement counts. Default: 7.
     pub window_days: NonZeroU32,
+    /// Maximum number of learned action duration keys. Default: 65,536.
+    pub duration_keys: NonZeroUsize,
 }
 
 impl Default for SchedulerTuning {
@@ -194,6 +198,7 @@ impl Default for SchedulerTuning {
             max_worker_loss_retries: DEFAULT_MAX_WORKER_LOSS_RETRIES,
             headroom_percent: DEFAULT_HEADROOM_PERCENT,
             window_days: DEFAULT_WINDOW_DAYS,
+            duration_keys: DEFAULT_DURATION_KEYS,
         }
     }
 }
@@ -416,6 +421,7 @@ mod tests {
             NonZeroDuration::from_secs(30)
         );
         assert_eq!(config.scheduler, SchedulerTuning::default());
+        assert_eq!(config.scheduler.duration_keys.get(), 65_536);
         assert_eq!(config.worker, WorkerTuning::default());
         assert_eq!(config.http2, Http2Tuning::default());
         assert_eq!(config.memory, MemoryTuning::default());
@@ -539,6 +545,24 @@ mod tests {
             value["worker"] = json!({ "action_timeout": text });
             assert!(parse(value).is_err());
         }
+    }
+
+    #[test]
+    fn duration_keys_accepts_custom_nonzero_and_rejects_zero() {
+        let mut value = base();
+        value["scheduler"] = json!({ "duration_keys": 42 });
+        assert_eq!(
+            parse(value)
+                .expect("valid limit")
+                .scheduler
+                .duration_keys
+                .get(),
+            42
+        );
+
+        let mut value = base();
+        value["scheduler"] = json!({ "duration_keys": 0 });
+        assert!(parse(value).is_err());
     }
 
     #[test]

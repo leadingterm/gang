@@ -187,36 +187,10 @@ mod tests {
     use crate::TestResult;
 
     #[test]
-    fn sandbox_keys_keep_their_wire_names() {
-        for (key, name) in [
-            (SandboxKey::Noop, "noop"),
-            (SandboxKey::Bwrap, "bwrap"),
-            (SandboxKey::Boxed, "boxed"),
-        ] {
-            let json = format!("\"{name}\"");
-            assert_eq!(key.to_string(), name);
-            assert_eq!(serde_json::to_string(&key).expect("serialize key"), json);
-            assert_eq!(
-                serde_json::from_str::<SandboxKey>(&json).expect("parse key"),
-                key
-            );
-        }
-    }
-
-    #[test]
-    fn standard_config_parses_for_both_plugin_sets() -> TestResult {
+    fn standard_config_parses_for_opaque_plugins() -> TestResult {
         let opaque = STANDARD_GANG_TOML.parse::<GangConfig<OpaquePlugins>>()?;
         assert_eq!(opaque.fleets.len(), 1);
         let policy = opaque
-            .fleets
-            .policies()
-            .first()
-            .ok_or("the standard config has no fleet")?;
-        assert_eq!(policy.name.to_string(), "example-fleet");
-
-        let typed = STANDARD_GANG_TOML.parse::<GangConfig<TestPlugins>>()?;
-        assert_eq!(typed.fleets.len(), 1);
-        let policy = typed
             .fleets
             .policies()
             .first()

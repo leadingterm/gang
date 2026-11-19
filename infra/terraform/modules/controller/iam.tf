@@ -13,25 +13,42 @@ data "aws_iam_policy_document" "this" {
     resources = [var.ca_key_arn]
   }
 
-  # Cache objects. Object-level actions apply to keys inside the bucket only.
-  statement {
-    sid    = "CacheObjects"
-    effect = "Allow"
-    actions = [
-      "s3:GetObject",
-      "s3:PutObject",
-      "s3:DeleteObject",
-      "s3:AbortMultipartUpload",
-      "s3:ListMultipartUploadParts",
-    ]
-    resources = ["${var.cache_bucket_arn}/*"]
+  # Object-level actions apply to keys inside the bucket only.
+  dynamic "statement" {
+    for_each = var.cache_bucket_arn == null ? [] : [var.cache_bucket_arn]
+    content {
+      sid    = "CacheObjects"
+      effect = "Allow"
+      actions = [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:AbortMultipartUpload",
+        "s3:ListMultipartUploadParts",
+      ]
+      resources = ["${statement.value}/*"]
+    }
   }
 
-  statement {
-    sid       = "CacheBucket"
-    effect    = "Allow"
-    actions   = ["s3:ListBucket", "s3:GetBucketLocation"]
-    resources = [var.cache_bucket_arn]
+  dynamic "statement" {
+    for_each = var.cache_bucket_arn == null ? [] : [var.cache_bucket_arn]
+    content {
+      sid       = "CacheBucket"
+      effect    = "Allow"
+      actions   = ["s3:ListBucket", "s3:GetBucketLocation"]
+      resources = [statement.value]
+    }
+  }
+
+  # GetMetricData does not support resource-level scoping.
+  dynamic "statement" {
+    for_each = var.cache_bucket_arn == null ? [] : [var.cache_bucket_arn]
+    content {
+      sid       = "CacheStorageMetrics"
+      effect    = "Allow"
+      actions   = ["cloudwatch:GetMetricData"]
+      resources = ["*"]
+    }
   }
 
   # Describing Auto Scaling groups does not support resource-level scoping.

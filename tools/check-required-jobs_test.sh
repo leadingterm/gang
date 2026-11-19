@@ -32,17 +32,47 @@ expect() {
 
 expect success 'current workflow coverage' "$guard" "$workflow"
 cp "$workflow" "$fixture"
-yq -i 'del(.jobs.required.needs[] | select(. == "lint-arm64"))' "$fixture"
+yq -i 'del(.jobs.required.needs[] | select(. == "lint"))' "$fixture"
 expect failure 'removed dependency' "$guard" "$fixture"
 cp "$workflow" "$fixture"
 yq -i '.jobs.guard_fixture."runs-on" = "ubuntu-latest" | .jobs.guard_fixture.steps = [{"run": "true"}]' "$fixture"
 expect failure 'new job without dependency' "$guard" "$fixture"
 cp "$workflow" "$fixture"
+yq -i '.jobs.guard_fixture."runs-on" = "ubuntu-latest" | .jobs.guard_fixture.steps = [{"run": "true"}] | .jobs.required.needs += ["guard_fixture"] | (.jobs.required.steps[] | select(.env.NEEDS_RESULTS != null) | .env.NEEDS_RESULTS) |= sub("needs[.]lint[.]result", "needs.lint.result, needs.guard_fixture.result")' "$fixture"
+expect failure 'new required heavy job missing changes dependency' "$guard" "$fixture"
+for dependency in changes lint-arm64 nix-vm; do
+  cp "$workflow" "$fixture"
+  dependency="$dependency" yq -i 'del(.jobs.lint.needs[] | select(. == strenv(dependency)))' "$fixture"
+  expect failure "lint missing $dependency prerequisite" "$guard" "$fixture"
+done
+for dependency in changes e2e-gate-2-shard-1 e2e-gate-2-shard-2; do
+  cp "$workflow" "$fixture"
+  dependency="$dependency" yq -i 'del(.jobs.e2e-gate-2.needs[] | select(. == strenv(dependency)))' "$fixture"
+  expect failure "e2e-gate-2 missing $dependency prerequisite" "$guard" "$fixture"
+done
+cp "$workflow" "$fixture"
+yq -i '(.jobs.required.steps[] | select(.env.NEEDS_RESULTS != null) | .env.NEEDS_RESULTS) |= sub("needs[.]lint-arm64[.]result", "success")' "$fixture"
+expect failure 'private result omits a dependency' "$guard" "$fixture"
+cp "$workflow" "$fixture"
 yq -i 'del(.jobs.required)' "$fixture"
 expect failure 'missing required job' "$guard" "$fixture"
+cp "$workflow" "$fixture"
+yq -i 'del(.jobs.changes)' "$fixture"
+expect failure 'missing changes job' "$guard" "$fixture"
+cp "$workflow" "$fixture"
+yq -i 'del(.jobs.linux-arm64.needs)' "$fixture"
+expect failure 'heavy leaf missing changes dependency' "$guard" "$fixture"
+cp "$workflow" "$fixture"
+yq -i 'del(.jobs.e2e-gate-1.needs[] | select(. == "changes"))' "$fixture"
+expect failure 'e2e leaf missing changes dependency' "$guard" "$fixture"
+
+for job in lint e2e-gate-2 required; do
+  cp "$workflow" "$fixture"
+  job="$job" yq -i '.jobs[strenv(job)].if = "success()"' "$fixture"
+  expect failure "conditional $job aggregator" "$guard" "$fixture"
+done
 
 jobs=$(yq -o=json '.jobs' "$workflow")
-statuses=(success failure skipped cancelled)
 
 # Execute the actual workflow body with Nix flake tools to test runner behavior.
 
@@ -59,21 +89,20 @@ for job in lint e2e-gate-2 required; do
     exit 1
   fi
 
-  for first in "${statuses[@]}"; do
-    for second in "${statuses[@]}"; do
-      results="$first $second"
-      for ((position = 2; position < needs_count; position++)); do
-        results+=' success'
-      done
-      expected=failure
-      if [[ $first == success && $second == success ]]; then
-        expected=success
-      fi
-      expect "$expected" "$job: $results" env NEEDS_RESULTS="$results" bash --noprofile --norc -e -o pipefail <"$body"
-    done
+  all_success=
+  docs_results=
+  for ((i = 0; i < needs_count; i++)); do
+    all_success+="${all_success:+ }success"
+    if (( i % 2 == 0 )); then
+      docs_results+="${docs_results:+ }success"
+    else
+      docs_results+="${docs_results:+ }skipped"
+    fi
   done
+  expect success "$job: heavy all success" env CHANGES_RESULT=success HEAVY=true NEEDS_RESULTS="$all_success" bash --noprofile --norc -e -o pipefail <"$body"
+  expect success "$job: docs success and skipped" env CHANGES_RESULT=success HEAVY=false NEEDS_RESULTS="$docs_results" bash --noprofile --norc -e -o pipefail <"$body"
 
-  for ((position = 2; position < needs_count; position++)); do
+  for ((position = 0; position < needs_count; position++)); do
     for status in failure skipped cancelled; do
       results=
       for ((i = 0; i < needs_count; i++)); do
@@ -83,10 +112,22 @@ for job in lint e2e-gate-2 required; do
         fi
         results+="${results:+ }$result"
       done
-      expect failure "$job: position $position is $status" env NEEDS_RESULTS="$results" bash --noprofile --norc -e -o pipefail <"$body"
+      expect failure "$job: heavy position $position is $status" env CHANGES_RESULT=success HEAVY=true NEEDS_RESULTS="$results" bash --noprofile --norc -e -o pipefail <"$body"
+      if [[ $status != skipped ]]; then
+        expect failure "$job: docs position $position is $status" env CHANGES_RESULT=success HEAVY=false NEEDS_RESULTS="$results" bash --noprofile --norc -e -o pipefail <"$body"
+      fi
     done
   done
-  expect failure "$job: empty results" env NEEDS_RESULTS='' bash --noprofile --norc -e -o pipefail <"$body"
+  for heavy in true false; do
+    expect failure "$job: $heavy empty results" env CHANGES_RESULT=success HEAVY="$heavy" NEEDS_RESULTS='' bash --noprofile --norc -e -o pipefail <"$body"
+    expect failure "$job: $heavy whitespace-only results" env CHANGES_RESULT=success HEAVY="$heavy" NEEDS_RESULTS='   ' bash --noprofile --norc -e -o pipefail <"$body"
+    for status in failure cancelled skipped; do
+      expect failure "$job: detector $status, heavy $heavy" env CHANGES_RESULT="$status" HEAVY="$heavy" NEEDS_RESULTS="$all_success" bash --noprofile --norc -e -o pipefail <"$body"
+    done
+  done
+  expect failure "$job: missing heavy output" env -u HEAVY CHANGES_RESULT=success NEEDS_RESULTS="$all_success" bash --noprofile --norc -e -u -o pipefail <"$body"
+  expect failure "$job: empty heavy output" env CHANGES_RESULT=success HEAVY='' NEEDS_RESULTS="$all_success" bash --noprofile --norc -e -o pipefail <"$body"
+  expect failure "$job: malformed heavy output" env CHANGES_RESULT=success HEAVY=invalid NEEDS_RESULTS="$all_success" bash --noprofile --norc -e -o pipefail <"$body"
 done
 
 printf '%d cases, %d failures\n' "$cases" "$failures"

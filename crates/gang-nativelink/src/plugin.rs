@@ -10,7 +10,6 @@ use gang_spi::{
     SchedulerSnapshot, Subject, WorkerSpec, WorkerTls,
 };
 use gang_types::{Url, WorkerId};
-use nativelink_scheduler::admin::queued_demand;
 use nativelink_util::action_messages::WorkerId as NativeWorkerId;
 use tokio::sync::watch;
 
@@ -75,7 +74,8 @@ impl Plugin for NativeLink {
 }
 
 impl SchedulerPort for NativeLink {
-    /// Reads the connected workers and the queued demand from the serving controller.
+    /// Reads the connected workers, the queued demand, and the bounded stores' usage from the
+    /// serving controller.
     ///
     /// # Errors
     ///
@@ -84,13 +84,19 @@ impl SchedulerPort for NativeLink {
     async fn snapshot(&self, into: &mut SchedulerSnapshot) -> Result<(), PortError> {
         let handles = self.current()?;
         let workers = handles.worker_scheduler.worker_snapshot().await;
-        let demand = queued_demand(&*handles.action_scheduler)
-            .await
-            .map_err(PortError::backend)?;
         let completed = handles.completed.load(Ordering::Relaxed);
-        snapshot::fill(&workers, &demand, &handles.fleets, completed, into);
-        into.lookups = handles.cache.lookups.load(Ordering::Relaxed);
-        into.hits = handles.cache.hits.load(Ordering::Relaxed);
+        snapshot::fill(
+            &*handles.action_scheduler,
+            &workers,
+            &handles.fleets,
+            &handles.durations,
+            handles.clock.wall(),
+            completed,
+            into,
+        )
+        .await
+        .map_err(PortError::backend)?;
+        handles.stores.fill(&mut into.stores);
         Ok(())
     }
 

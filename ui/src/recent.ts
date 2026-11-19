@@ -77,6 +77,24 @@ export const cacheWindow = (r: Recent): CacheWindow => {
   return { lookups, hits, rate: lookups > 0 ? hits / lookups : null, lookupsPerStep, hitsPerStep };
 };
 
+/** Total recorded traffic, or null when the window has no samples. */
+export const transferred = (r: Recent): { uploaded: number; downloaded: number } | null => {
+  const samples = slots(r).filter((s): s is Sample => s !== null);
+  if (!samples.length) return null;
+  return {
+    uploaded: sum(samples, (s) => s.uploadedBytes),
+    downloaded: sum(samples, (s) => s.downloadedBytes),
+  };
+};
+
+/** Traffic per recorded step; missing steps remain null. */
+export const bytesSeries = (r: Recent, direction: "uploadedBytes" | "downloadedBytes"): readonly (number | null)[] =>
+  slots(r).map((s) => s ? s[direction] : null);
+
+/** Evicted bytes per recorded step. */
+export const evictedSeries = (r: Recent): readonly (number | null)[] =>
+  slots(r).map((s) => s ? s.evictedBytes : null);
+
 export type Bar = "ok" | "skipped" | "idle" | "unrecorded";
 
 /** Pass outcome per slot, with skipped passes taking precedence. */

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use gang_aws::{
     AwsConfig, AwsFleetOptions, CooldownPolicy, ExpiryAge, KmsSignerConfig, RetrySpotAfter,
-    S3CacheConfig, SpotFallback, WorkloadTokenAlgorithm,
+    S3CacheConfig, SpotFallback, UsageInterval, WorkloadTokenAlgorithm,
 };
 use gang_aws_sdk::ClientSettings;
 use gang_types::Bytes;
@@ -349,6 +349,8 @@ fn s3_defaults_apply_when_optional_keys_are_absent() -> TestResult {
     assert_eq!(config.tuning.multipart_max_concurrent_uploads.get(), 10);
     assert_eq!(config.tuning.retry_buffer_per_request.get(), Bytes::mib(5));
     assert!(config.tuning.consider_expired_after.is_none());
+    assert_eq!(config.usage_interval.get(), Duration::from_hours(1));
+    assert_eq!(config.client, ClientSettings::default());
     Ok(())
 }
 
@@ -366,6 +368,71 @@ fn s3_endpoint_and_path_style_parse() -> TestResult {
     assert!(s3(json!({"endpoint": "https://example.com"})).is_ok());
     assert!(s3(json!({"endpoint": "not a url"})).is_err());
     assert!(s3(json!({"endpoint": "ftp://example.com"})).is_err());
+    Ok(())
+}
+
+/// `usage_interval` is at least one hour: the boundary parses and anything shorter does not.
+/// Catches an exclusive minimum, a minute minimum, or a missing check.
+#[test]
+fn usage_interval_is_at_least_one_hour() -> TestResult {
+    assert_all_accepted(
+        [
+            json!({"usage_interval": "1h"}),
+            json!({"usage_interval": "60m"}),
+            json!({"usage_interval": "3600000ms"}),
+            json!({"usage_interval": "6h"}),
+            json!({"usage_interval": "1d"}),
+        ],
+        s3,
+    );
+    assert_all_rejected(
+        [
+            json!({"usage_interval": "3599999ms"}),
+            json!({"usage_interval": "59m"}),
+            json!({"usage_interval": "1m"}),
+            json!({"usage_interval": "0s"}),
+            json!({"usage_interval": "an hour"}),
+        ],
+        s3,
+    );
+    assert_eq!(
+        s3(json!({"usage_interval": "6h"}))?.usage_interval.get(),
+        Duration::from_hours(6)
+    );
+    assert_eq!(UsageInterval::default(), UsageInterval::MIN);
+    assert_eq!(
+        UsageInterval::try_new(Duration::from_hours(1))?.get(),
+        Duration::from_hours(1)
+    );
+    let error = UsageInterval::try_new(Duration::from_secs(3_599))
+        .err()
+        .ok_or("59m59s was accepted")?;
+    assert_eq!(
+        error.to_string(),
+        "usage_interval must be a whole number of milliseconds of at least 1h"
+    );
+    Ok(())
+}
+
+/// The `[cache.s3.client]` table is the shared `ClientSettings`: its values parse and its
+/// bounds are checked. Catches a cache client table that ignores or skips validating its keys.
+#[test]
+fn s3_client_settings_parse_and_are_bounded() -> TestResult {
+    let config = s3(json!({"client": {"request_timeout": "20s", "max_attempts": 5}}))?;
+    assert_eq!(config.client.request_timeout.get(), Duration::from_secs(20));
+    assert_eq!(config.client.max_attempts.get(), 5);
+    assert_eq!(
+        config.client.connect_timeout,
+        ClientSettings::default().connect_timeout
+    );
+    assert_all_rejected(
+        [
+            json!({"client": {"max_attempts": 0}}),
+            json!({"client": {"request_timeout": "0s"}}),
+            json!({"client": {"retry_initial_backoff": "30s", "retry_max_backoff": "20s"}}),
+        ],
+        s3,
+    );
     Ok(())
 }
 
@@ -450,6 +517,7 @@ fn unknown_keys_are_rejected() {
     assert_all_rejected([json!({"client": {"unexpected": 1}})], aws);
     assert_all_rejected([json!({"unexpected": true})], s3);
     assert_all_rejected([json!({"tuning": {"unexpected": 1}})], s3);
+    assert_all_rejected([json!({"client": {"unexpected": 1}})], s3);
     assert_all_rejected([json!({"unexpected": true})], kms);
     assert_all_rejected([json!({"client": {"unexpected": 1}})], kms);
     assert_all_rejected([json!({"unexpected": "x"})], fleet_from_value);
@@ -618,6 +686,10 @@ fn configuration_round_trips() -> TestResult {
             "retry_buffer_per_request": "8MiB",
             "consider_expired_after": "6d",
         },
+    }))?)?;
+    assert_round_trip(&s3(json!({
+        "usage_interval": "6h",
+        "client": {"request_timeout": "20s", "max_attempts": 5},
     }))?)?;
     assert_round_trip(&kms(json!({}))?)?;
     assert_round_trip(&ClientSettings::default())?;

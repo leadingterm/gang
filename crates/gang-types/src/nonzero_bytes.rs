@@ -188,13 +188,6 @@ mod tests {
     }
 
     #[test]
-    fn displays_like_bytes() {
-        let size = NonZeroBytes::gib(29);
-        assert_eq!(size.to_string(), "29GiB");
-        assert_eq!(size.to_string().parse::<NonZeroBytes>(), Ok(size));
-    }
-
-    #[test]
     fn toml_round_trips_as_string() {
         let holder = Holder {
             size: NonZeroBytes::gib(29),

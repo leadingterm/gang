@@ -102,7 +102,7 @@ export const Tally = ({ items }: { items: Counts }) => (
   </span>
 );
 
-const TapeKey = ({ f }: { f: Fleet }) => {
+export const TapeKey = ({ f }: { f: Fleet }) => {
   const size = f.instanceSize ? [`${f.instanceSize.vcpus} vCPU`, gib(f.instanceSize.memory)] : [];
   const machine = [f.isa, f.sandbox, f.properties["machine_class"], ...size];
   const rows: [string, ComponentChildren][] = [
@@ -114,6 +114,8 @@ const TapeKey = ({ f }: { f: Fleet }) => {
       <><span class="clause">{f.policy.targetActions}/instance</span>{" · "}<span class="clause">idle <Duration ms={seconds(f.policy.idleTimeout) * 1000} /></span>{" · "}<span class="clause">grace <Duration ms={seconds(f.policy.bootGrace) * 1000} /></span></>,
     ],
   ];
+  if (f.demand.readiness !== undefined) rows.push(["measured readiness", <Duration ms={seconds(f.demand.readiness) * 1000} />]);
+  if (f.demand.expectedWait !== undefined) rows.push(["expected wait", <Duration ms={seconds(f.demand.expectedWait) * 1000} />]);
   return (
     <>
       <Tally items={fleetCounts(f)} />

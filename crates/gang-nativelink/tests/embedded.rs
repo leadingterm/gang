@@ -16,9 +16,10 @@ use futures::stream::{self, BoxStream};
 use gang_nativelink::{NativeLink, NativeLinkConfig};
 use gang_spi::{
     Accepted, Admitted, ApiRequestBody, ApiResponseBody, ApiService, Authenticated, ClientTls,
-    ControllerConnections, ControllerReady, ControllerSpec, Listening, Peer, Plugin, PluginContext,
-    PortError, Rejection, RenderedStoreSpec, RequestGate, SchedulerPort, SchedulerSnapshot, Slots,
-    StoreAccess, Subject, WorkerSpec, WorkerState, WorkerTls, full_body,
+    ControllerConnections, ControllerReady, ControllerSpec, Listening, ObservationSink, Peer,
+    Plugin, PluginContext, PortError, Rejection, RenderedStoreSpec, RequestGate, SchedulerPort,
+    SchedulerSnapshot, Slots, StoreAccess, StoreKind, Subject, WorkerSpec, WorkerState, WorkerTls,
+    full_body,
 };
 use gang_testkit::{ChildTest, ExtendedKeyUsagePurpose, TestAuthority, TestResult};
 use gang_tls::{
@@ -322,9 +323,9 @@ async fn http1_get(
 }
 
 /// Starts the controller in a task. The task builds its own specs from owned stores and serves
-/// the connections accepted on its listeners. The public listener applies `public_gate` and
-/// labels its connections with `public_peers`. The readiness receiver resolves when built; the
-/// serving receiver resolves once it polls its public connections.
+/// the connections accepted on its listeners, recording into `observations`. The public listener
+/// applies `public_gate` and labels its connections with `public_peers`. The readiness receiver
+/// resolves when built; the serving receiver resolves once it polls its public connections.
 fn spawn_controller(
     plugin: Arc<NativeLink>,
     fleets: FleetCatalog,
@@ -332,6 +333,7 @@ fn spawn_controller(
     worker: TcpListener,
     public_gate: TestGate,
     public_peers: Vec<Peer>,
+    observations: ObservationSink,
 ) -> (
     JoinHandle<Result<(), PortError>>,
     oneshot::Receiver<()>,
@@ -341,10 +343,6 @@ fn spawn_controller(
     let (ready, readiness) = ControllerReady::channel();
     let controller = tokio::spawn(async move {
         let content = RenderedStoreSpec(json!({"memory": {}}));
-        let (observations, _receiver) = gang_spi::ObservationSink::channel(
-            std::num::NonZeroUsize::MIN,
-            std::num::NonZeroUsize::MIN,
-        );
         let action = RenderedStoreSpec(json!({"memory": {}}));
         let spec = ControllerSpec {
             content_store: &content,
@@ -437,6 +435,8 @@ struct Harness {
     workers: Vec<RunningWorker>,
     public_port: u16,
     worker_port: u16,
+    /// The controller's observation sink, whose traffic counters the tests read.
+    observations: ObservationSink,
 }
 
 impl Harness {
@@ -469,6 +469,8 @@ impl Harness {
         let worker_port = worker.local_addr()?.port();
         let plugin = Arc::new(build_plugin(config_with(worker_port, extra)?)?);
         let fleets = FleetCatalog::try_new(fleets)?;
+        let (observations, _receiver) =
+            ObservationSink::channel(NonZeroUsize::MIN, NonZeroUsize::MIN);
         let (mut controller, serving, readiness) = spawn_controller(
             Arc::clone(&plugin),
             fleets,
@@ -476,6 +478,7 @@ impl Harness {
             worker,
             public_gate,
             public_peers,
+            observations.clone(),
         );
         readiness
             .await
@@ -492,6 +495,7 @@ impl Harness {
             workers: Vec::new(),
             public_port,
             worker_port,
+            observations,
         })
     }
 
@@ -1133,7 +1137,8 @@ fn output_digest(result: &ActionResult) -> Result<Option<&Digest>, Box<dyn Error
 /// An action runs on the worker with this test binary as its entrypoint, and its result is cached.
 ///
 /// This covers scheduling, input fetch through the worker listener's gRPC stores, execution
-/// through the entrypoint, and the upload of the result to the action cache.
+/// through the entrypoint, the upload of the result to the action cache, and the cache traffic
+/// and store usage the controller reports: client calls only, never the worker's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_action_runs_and_its_result_is_cached() -> TestResult {
     let scratch = tempfile::tempdir()?;
@@ -1143,8 +1148,13 @@ async fn an_action_runs_and_its_result_is_cached() -> TestResult {
     let channel = public_channel(harness.public_port).await?;
     let action = build_action(&[("ISA", "x86-64")])?;
     upload_blobs(&channel, action.blobs).await?;
+    let uploaded = harness.observations.traffic();
+    assert!(uploaded.uploaded > 0, "the client's blob upload is counted");
 
     let response = run_action(&channel, &action.digest).await?;
+    // The worker fetched inputs and uploaded the result over the unobserved worker listener, and
+    // `Execute` carries no counted bytes.
+    assert_eq!(harness.observations.traffic(), uploaded);
     let result = response
         .result
         .ok_or("the response carries no action result")?;
@@ -1157,6 +1167,15 @@ async fn an_action_runs_and_its_result_is_cached() -> TestResult {
     let cached = cached_result(&channel, &action.digest).await?;
     assert_eq!(cached.exit_code, 0);
     assert_eq!(output_digest(&cached)?, Some(&expected));
+    let looked_up = harness.observations.traffic();
+    assert_eq!((looked_up.lookups, looked_up.hits), (1, 1));
+    assert!(looked_up.downloaded > uploaded.downloaded);
+
+    // Both memory stores hold what the client and the worker uploaded.
+    let snapshot = read_snapshot(&harness).await?;
+    let stores: Vec<StoreKind> = snapshot.stores.iter().map(|row| row.store).collect();
+    assert_eq!(stores, [StoreKind::Content, StoreKind::Action]);
+    assert!(snapshot.stores.iter().all(|row| row.used > 0));
 
     // The worker uploaded the output blob to the shared CAS, so the client finds it present.
     let output = output_digest(&cached)?

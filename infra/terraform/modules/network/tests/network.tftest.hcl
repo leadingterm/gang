@@ -29,11 +29,6 @@ run "subnets_per_az" {
   }
 
   assert {
-    condition     = length(aws_subnet.public) == 3 && length(aws_subnet.private) == 3
-    error_message = "Expected one public and one private subnet per availability zone."
-  }
-
-  assert {
     condition     = aws_subnet.public[*].cidr_block == ["10.20.0.0/20", "10.20.16.0/20", "10.20.32.0/20"] && aws_subnet.private[*].cidr_block == ["10.20.128.0/20", "10.20.144.0/20", "10.20.160.0/20"]
     error_message = "Public subnets must be 10.20.0.0/20, 10.20.16.0/20, 10.20.32.0/20 and private subnets 10.20.128.0/20, 10.20.144.0/20, 10.20.160.0/20 for the first three zones."
   }

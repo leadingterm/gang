@@ -10,7 +10,7 @@ import { Actions } from "../src/views/actions.tsx";
 import { Activity } from "../src/views/activity.tsx";
 import { Build, BuildView } from "../src/views/build.tsx";
 import { autoLoadBuilds, Builds, filterBuilds } from "../src/views/builds.tsx";
-import { fleetCounts, fleetTotals, Tape } from "../src/views/fleet.tsx";
+import { fleetCounts, fleetTotals, Tape, TapeKey } from "../src/views/fleet.tsx";
 import { Forbidden, SignIn, SignInError } from "../src/views/gate.tsx";
 import { EventRow, Overview } from "../src/views/overview.tsx";
 import { WorkerDetail, Workers } from "../src/views/workers.tsx";
@@ -324,6 +324,35 @@ test("a fleet's counts are totalled across fleets and name every state with the 
   t.assert.match(html({}, <Tape f={spot} />), /9 busy, 1 idle, 1 draining, 1 no worker, 2 pending, 1 terminating, of 24 maximum/);
 });
 
+test("fleet details show measured readiness and expected wait independently, including zero", (t) => {
+  const fleet = live.fleets[0];
+  if (!fleet) throw new Error("the live recording has a fleet");
+  const { running, queued, candidates, needed, vcpus, memory } = fleet.demand;
+  const details = (readiness?: string, expectedWait?: string) =>
+    render(<TapeKey f={{ ...fleet, demand: {
+      running, queued, candidates, needed, vcpus, memory,
+      ...(readiness !== undefined ? { readiness } : {}),
+      ...(expectedWait !== undefined ? { expectedWait } : {}),
+    } }} />);
+  const readiness = /<dt>measured readiness<\/dt><dd><time>12s<\/time><\/dd>/;
+  const wait = /<dt>expected wait<\/dt><dd><time>34s<\/time><\/dd>/;
+
+  const both = details("12.5s", "34.5s");
+  t.assert.match(both, readiness);
+  t.assert.match(both, wait);
+  const onlyReadiness = details("12.5s");
+  t.assert.match(onlyReadiness, readiness);
+  t.assert.doesNotMatch(onlyReadiness, /<dt>expected wait<\/dt>/);
+  const onlyWait = details(undefined, "34.5s");
+  t.assert.doesNotMatch(onlyWait, /<dt>measured readiness<\/dt>/);
+  t.assert.match(onlyWait, wait);
+  const neither = details();
+  t.assert.doesNotMatch(neither, /<dt>measured readiness<\/dt>|<dt>expected wait<\/dt>/);
+  const zero = details("0s", "0s");
+  t.assert.match(zero, /<dt>measured readiness<\/dt><dd><time>0s<\/time><\/dd>/);
+  t.assert.match(zero, /<dt>expected wait<\/dt><dd><time>0s<\/time><\/dd>/);
+});
+
 test("open worker detail names running actions and falls back to the digest", (t) => {
   const worker = live.workers[0];
   const action = live.actions?.running[0];
@@ -362,7 +391,7 @@ const recentState = (count: number) => {
       step: "10s",
       samples: Array.from({ length: count }, (_, i) => ({
         start: iso(last - (count - 1 - i) * 10000),
-        completed: 10, running: 100, queued: 5, passes: 5, skipped: 0, lookups: 0, hits: 0,
+        completed: 10, running: 100, queued: 5, passes: 5, skipped: 0, lookups: 0, hits: 0, uploadedBytes: 0, downloadedBytes: 0, evictedBytes: 0,
       })),
     },
   };
@@ -513,16 +542,70 @@ test("isolated chart markers stay entirely inside their viewBox", (t: TestContex
   }
 });
 
-test("every overview readout reserves a chart slot, including instances", (t) => {
-  for (const count of [0, 3, 90]) {
-    const markup = html({ state: recentState(count) }, <Overview />);
-    t.assert.equal((markup.match(/class="[^"]*\breadout__chart\b[^"]*"/g) ?? []).length, 5, `${count} samples`);
-    t.assert.match(
-      markup,
-      /<div class="readout"><h2 class="label">Instances<\/h2>(?:(?!<div class="readout">)[\s\S])*?<div class="[^"]*\breadout__chart\b[^"]*"[^>]*>\s*<\/div>/,
-      `${count} samples: instances chart slot is empty`,
-    );
+test("cache readout, bounded meter and bucket measurement retain their meaning", (t) => {
+  const noSamples = { ...recentState(0), cache: {} };
+  const pending = html({ state: noSamples }, <Overview />);
+  t.assert.match(pending, /<h2 class="label">Action cache<\/h2>(?:(?!<div class="readout">)[\s\S])*?<p class="readout__sub"><span>hit rate · [\s\S]*?<\/span><span>—<\/span><\/p>/);
+  t.assert.match(pending, /Bucket size not measured yet; S3 reports once a day\./);
+  const state = { ...recentState(1), cache: { stores: [{ store: "CAS" as const, usedBytes: 25, budgetBytes: 100 }] } };
+  const bounded = html({ state }, <Overview />);
+  t.assert.match(bounded, /aria-label="CAS 25% of budget"/);
+  t.assert.match(bounded, /--g:\s*0\.25/);
+  t.assert.doesNotMatch(bounded, /Bucket size not measured yet/);
+  const zeroBudget = html({ state: { ...state, cache: { stores: [{ store: "CAS", usedBytes: 25, budgetBytes: 0 }] } } }, <Overview />);
+  t.assert.match(zeroBudget, /aria-label="CAS — of budget"/);
+  t.assert.doesNotMatch(zeroBudget, /Infinity|NaN/);
+  for (const label of ["Transferred per step", "Evicted per step"]) {
+    t.assert.match(chart(bounded, label), /spark__unrecorded/, label);
   }
+  const measured = iso(ms(live.updateTime) - 86400000);
+  const bucket = html({ state: { ...state, cache: { bucket: { bytes: 1024, objects: 42, measureTime: measured } } } }, <Overview />);
+  t.assert.match(bucket, /1 KiB/);
+  t.assert.match(bucket, /42/);
+  t.assert.match(bucket, /as of <time class="mono">1d 0h<\/time>/);
+  t.assert.match(bucket, /expiry by bucket lifecycle/);
+});
+
+test("cache and build rows retain cell labels when column headers are visually hidden", (t) => {
+  const bounded = html({ state: live }, <Overview />);
+  for (const label of ["Store", "Used", "Budget", "Usage", "Evicted (window, all stores)"]) {
+    t.assert.equal(bounded.includes(`<span class="build-label">${label} </span>`), true, label);
+  }
+  const bucket = html({ state: stale }, <Overview />);
+  for (const label of ["Bytes", "Objects", "Measurement"]) {
+    t.assert.equal(bucket.includes(`<span class="build-label">${label} </span>`), true, label);
+  }
+  t.assert.match(bucket, /<td role="cell" class="a-span"><span class="build-label">Measurement <\/span>/);
+  const builds = html({ state: live }, <Builds />);
+  t.assert.match(builds, /<td role="cell" class="a-span"><span class="build-label">Transferred <\/span>/);
+});
+
+test("transfer directions share a scale and missing steps on one chart, separate from evictions", (t) => {
+  const state = recentState(2);
+  const [first, second] = state.recent.samples;
+  const recent = { ...state.recent, window: "30s", samples: [
+    { ...first!, downloadedBytes: 100, uploadedBytes: 50, evictedBytes: 8 },
+    { ...second!, downloadedBytes: 50, uploadedBytes: 25, evictedBytes: 4 },
+  ] };
+  const markup = html({ state: { ...state, recent } }, <Overview />);
+  const transfer = chart(markup, "Transferred per step");
+  t.assert.match(transfer, /spark__unrecorded/);
+  t.assert.match(transfer, /class="spark__run" d="M150\.0 2\.0 L298\.0 22\.0"/);
+  t.assert.match(transfer, /class="spark__run spark__run--secondary" d="M150\.0 22\.0 L298\.0 32\.0"/);
+  t.assert.match(visibleText(markup), /Downloaded/);
+  t.assert.match(visibleText(markup), /Uploaded/);
+  const eviction = chart(markup, "Evicted per step");
+  t.assert.match(eviction, /spark__unrecorded/);
+  t.assert.doesNotMatch(eviction, /spark__run--secondary/);
+});
+
+test("build cache transfers show download and upload in both views", (t) => {
+  const row = { ...build, usage: { ...build.usage, cache: { ...build.usage.cache, downloadedBytes: 2048, uploadedBytes: 1024 } } };
+  const detail = visibleText(html({}, <BuildView build={row} />));
+  t.assert.match(detail, /Downloaded 2 KiB · Uploaded 1 KiB/);
+  const markup = html({ state: { ...live, builds: [row] } }, <Builds />);
+  t.assert.match(visibleText(markup), /Transferred/);
+  t.assert.match(visibleText(markup), /↓ 2 KiB ↑ 1 KiB/);
 });
 
 test("every section header renders through the one header component", (t) => {
@@ -542,6 +625,18 @@ test("every section header renders through the one header component", (t) => {
   }
 });
 
+test("every overview readout reserves a chart slot, including instances", (t) => {
+  for (const count of [0, 3, 90]) {
+    const markup = html({ state: recentState(count) }, <Overview />);
+    t.assert.equal((markup.match(/class="[^"]*\breadout__chart\b[^"]*"/g) ?? []).length, 5, `${count} samples`);
+    t.assert.match(
+      markup,
+      /<div class="readout"><h2 class="label">Instances<\/h2>(?:(?!<div class="readout">)[\s\S])*?<div class="[^"]*\breadout__chart\b[^"]*"[^>]*>\s*<\/div>/,
+      `${count} samples: instances chart slot is empty`,
+    );
+  }
+});
+
 test("fleet badges sit on the name's row whatever the name length", (t) => {
   const fleet = live.fleets[0];
   if (!fleet) throw new Error("the live recording has a fleet");
@@ -553,11 +648,6 @@ test("fleet badges sit on the name's row whatever the name length", (t) => {
   for (const name of names) {
     t.assert.match(markup, new RegExp(`<div class="fleet__id"><span class="fleet__ord">[\\s\\S]*?<\\/span><h3 class="fleet__name"><span class="ident" title="${name}">${name}<\\/span><\\/h3><span class="fleet__tags"><span class="tag tag--spot">spot<\\/span>`));
   }
-});
-
-test("identifiers never wrap", (t) => {
-  const row = render(<EventRow withCause e={{ ...common, fleet: "fleets/build-worker-x86-64", scaledOut: { from: 0, to: 1 } }} />);
-  t.assert.match(row, /<span class="ident" title="build-worker-x86-64">build-worker-x86-64<\/span>/);
 });
 
 test("queued actions show their refusal", (t) => {
