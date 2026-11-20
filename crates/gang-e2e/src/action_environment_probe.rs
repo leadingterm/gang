@@ -61,14 +61,25 @@ pub fn action_environment_probe(arguments: &[OsString]) -> ExitCode {
 
 fn environment_witness(output: &OsStr, marker: &OsStr) -> Result<(), String> {
     let environment: BTreeMap<_, _> = std::env::vars_os().collect();
-    let expected = [
-        "GANG_CPU_COUNT",
-        "GANG_E2E_EXACT_ENV",
-        "GANG_MEMORY_KB",
-        "GANG_NETWORK",
-        "PWD",
-        "TMPDIR",
-    ];
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let tmp = cwd
+        .parent()
+        .ok_or_else(|| "action working directory has no parent".to_owned())?
+        .join("tmp");
+    validate_environment(&environment, &cwd, &tmp, marker)?;
+    if !tmp.is_dir() {
+        return Err("action temporary directory does not exist".to_owned());
+    }
+    std::fs::write(output, b"ok\n").map_err(|error| error.to_string())
+}
+
+fn validate_environment(
+    environment: &BTreeMap<OsString, OsString>,
+    cwd: &Path,
+    tmp: &Path,
+    marker: &OsStr,
+) -> Result<(), String> {
+    let expected = ["GANG_E2E_EXACT_ENV", "GANG_MEMORY_KB", "PWD", "TMPDIR"];
     if environment
         .keys()
         .map(OsString::as_os_str)
@@ -79,33 +90,97 @@ fn environment_witness(output: &OsStr, marker: &OsStr) -> Result<(), String> {
             environment.keys()
         ));
     }
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    let tmp = cwd
-        .parent()
-        .ok_or_else(|| "action working directory has no parent".to_owned())?
-        .join("tmp");
+    let memory = environment
+        .get(OsStr::new("GANG_MEMORY_KB"))
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.parse::<u64>().ok());
     if environment
         .get(OsStr::new("GANG_E2E_EXACT_ENV"))
         .map(OsString::as_os_str)
         != Some(marker)
-        || environment
-            .get(OsStr::new("GANG_NETWORK"))
-            .is_none_or(|v| !v.is_empty())
-        || ["GANG_CPU_COUNT", "GANG_MEMORY_KB"].iter().any(|key| {
-            environment.get(OsStr::new(key)).is_none_or(|value| {
-                value.to_str().is_none_or(|text| {
-                    !text.is_empty() && !text.bytes().all(|byte| byte.is_ascii_digit())
-                })
-            })
-        })
+        || memory.is_none_or(|value| value == 0)
         || environment.get(OsStr::new("PWD")).map(OsString::as_os_str) != Some(cwd.as_os_str())
         || environment
             .get(OsStr::new("TMPDIR"))
             .map(OsString::as_os_str)
             != Some(tmp.as_os_str())
-        || !tmp.is_dir()
     {
         return Err("unexpected action environment values".to_owned());
     }
-    std::fs::write(output, b"ok\n").map_err(|error| error.to_string())
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn environment() -> BTreeMap<OsString, OsString> {
+        [
+            ("GANG_E2E_EXACT_ENV", "declared-marker"),
+            ("GANG_MEMORY_KB", "1024"),
+            ("PWD", "/action/work"),
+            ("TMPDIR", "/action/tmp"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+        .collect()
+    }
+
+    fn validate(environment: &BTreeMap<OsString, OsString>) -> Result<(), String> {
+        validate_environment(
+            environment,
+            Path::new("/action/work"),
+            Path::new("/action/tmp"),
+            OsStr::new("declared-marker"),
+        )
+    }
+
+    #[test]
+    fn accepts_exact_action_environment() {
+        assert!(validate(&environment()).is_ok());
+    }
+
+    #[test]
+    fn rejects_unrequested_reserved_and_ambient_keys() {
+        for key in [
+            "GANG_CPU_COUNT",
+            "GANG_NETWORK",
+            "HOME",
+            "PATH",
+            "LD_LIBRARY_PATH",
+        ] {
+            let mut values = environment();
+            values.insert(OsString::from(key), OsString::new());
+            assert!(validate(&values).is_err(), "accepted extra key {key}");
+        }
+        let mut values = environment();
+        values.insert(OsString::from("GANG_CPU_COUNT"), OsString::new());
+        values.insert(OsString::from("GANG_NETWORK"), OsString::new());
+        assert!(validate(&values).is_err());
+    }
+
+    #[test]
+    fn rejects_missing_or_invalid_memory() {
+        for value in ["", "0", "-1", "not-a-number", "18446744073709551616"] {
+            let mut values = environment();
+            values.insert(OsString::from("GANG_MEMORY_KB"), OsString::from(value));
+            assert!(validate(&values).is_err(), "accepted memory {value:?}");
+        }
+        let mut values = environment();
+        values.remove(OsStr::new("GANG_MEMORY_KB"));
+        assert!(validate(&values).is_err());
+    }
+
+    #[test]
+    fn rejects_wrong_marker_and_runtime_paths() {
+        for (key, value) in [
+            ("GANG_E2E_EXACT_ENV", "wrong-marker"),
+            ("PWD", "/action/other"),
+            ("TMPDIR", "/action/other"),
+        ] {
+            let mut values = environment();
+            values.insert(OsString::from(key), OsString::from(value));
+            assert!(validate(&values).is_err(), "accepted wrong {key}");
+        }
+    }
 }
