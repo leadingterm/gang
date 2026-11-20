@@ -32,19 +32,21 @@ fn launcher() -> Vec<String> {
         .to_vec()
 }
 
-/// Pinned action tools under the Nix store, as the bwrap sandbox requires.
-fn tools() -> ActionTools {
-    ActionTools {
+/// Pinned host tools used when rendering the deployment.
+fn tools(placement: &Placement) -> gang_e2e::Result<ActionTools> {
+    let root = placement.root().join("rootfs");
+    std::fs::create_dir_all(&root).map_err(E2eError::io("creating rootfs fixture"))?;
+    std::fs::write(root.join("identity"), format!("{}\n", "a".repeat(64)))
+        .map_err(E2eError::io("writing rootfs identity"))?;
+    Ok(ActionTools {
         shell: std::path::PathBuf::from("/nix/store/aaa-bash/bin/bash"),
         path: "/nix/store/aaa-bash/bin:/nix/store/bbb-coreutils/bin".to_owned(),
-        action_bin: std::path::PathBuf::from("/nix/store/ddd-action-tools/bin"),
-        ca_bundle: None,
         bwrap: Some(std::path::PathBuf::from(
             "/nix/store/ccc-bubblewrap/bin/bwrap",
         )),
         glibc_tool: None,
-        glibc_loader: Vec::new(),
-    }
+        action_rootfs: Some(root),
+    })
 }
 
 /// An answer with `status` and `headers` (lower-case names), and an empty body.
@@ -370,7 +372,7 @@ fn rendered_identity_variant_sends_the_sign_in_login_hint() -> gang_e2e::Result<
     };
     let text = ConfigTemplate::parse(&base_config()?)?
         .place(&placement, Transport::Tls)?
-        .vary(&variant, &launcher(), &tools())?
+        .vary(&variant, &launcher(), &tools(&placement)?)?
         .with_identity(&issuer, variant.identity)?
         .render()?;
 
@@ -418,7 +420,11 @@ fn rendered_identity_variant_sends_the_sign_in_login_hint() -> gang_e2e::Result<
 
     let baseline = ConfigTemplate::parse(&base_config()?)?
         .place(&placement, Transport::Tls)?
-        .vary(&Variant::baseline(Sandbox::Bwrap), &launcher(), &tools())?
+        .vary(
+            &Variant::baseline(Sandbox::Bwrap),
+            &launcher(),
+            &tools(&placement)?,
+        )?
         .with_identity(&issuer, IdentityKnobs::NONE)?
         .render()?;
     assert!(
@@ -595,7 +601,7 @@ fn rendered_sessions_variant() -> gang_e2e::Result<()> {
     };
     let text = ConfigTemplate::parse(&base_config()?)?
         .place(&placement, Transport::Tls)?
-        .vary(&variant, &launcher(), &tools())?
+        .vary(&variant, &launcher(), &tools(&placement)?)?
         .with_identity(&issuer, variant.identity)?
         .render()?;
     let config = parsed(&text)?;

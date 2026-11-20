@@ -106,6 +106,7 @@ pub fn worker_state(
     Ok(WorkerState {
         id: id.clone(),
         fleet: FleetName::try_new(fleet)?,
+        environment: Some("host:test".parse()?),
         running_actions: running,
         max_inflight_actions: max_inflight,
         draining,
@@ -115,14 +116,15 @@ pub fn worker_state(
 }
 
 /// A queued action since `since` milliseconds, with no resource request and priority zero.
-pub fn queued(since: u64, candidates: FleetSet) -> QueuedDemand {
-    QueuedDemand {
+pub fn queued(since: u64, candidates: FleetSet) -> Result<QueuedDemand, Box<dyn Error>> {
+    Ok(QueuedDemand {
         candidates,
+        environment: "host:test".parse()?,
         resources: ActionResources::default(),
         queued_since: ts(since),
         priority: 0,
         expected: None,
-    }
+    })
 }
 
 /// An empty state frame: no fleets, workers, instances or actions, and a passing pass.

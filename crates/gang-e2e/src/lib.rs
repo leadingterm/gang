@@ -19,6 +19,8 @@ mod access;
 mod access_secured;
 mod access_verdict;
 mod action_environment_probe;
+#[cfg(target_os = "linux")]
+mod action_ipc;
 mod administrator;
 mod admission;
 mod balancer;
@@ -223,8 +225,7 @@ pub use server_scenarios::{api, certificate_rotation, event_paging, request_limi
 pub use server_stack::ServerStream;
 pub use session::{SessionCookie, TokenUsage, cookie_name, session_cookie, signed_token};
 pub use settings::{
-    ActionTools, DeploymentInputs, GLIBC_LOADER_PATHS, ReleaseInput, Settings, UpgradeInputs,
-    UpgradeProcedure,
+    ActionTools, DeploymentInputs, ReleaseInput, Settings, UpgradeInputs, UpgradeProcedure,
 };
 pub use skipped_pass::skipped_pass;
 pub use sse::EventStream;

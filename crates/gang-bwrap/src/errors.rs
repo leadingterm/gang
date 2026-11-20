@@ -29,9 +29,22 @@ pub(crate) enum BwrapError {
     /// The pipe `bwrap` reports the sandbox on could not be created or prepared.
     #[error("cannot create the pipe bwrap reports the sandbox on")]
     InfoPipe(#[source] io::Error),
-    /// The synthetic identity pipes could not be created or prepared.
-    #[error("cannot prepare the sandbox identity")]
-    Identity(#[source] io::Error),
+    /// The rootfs envelope or tree cannot be read.
+    #[error("cannot read action rootfs {}", .0.display())]
+    #[failure(config)]
+    Root(PathBuf, #[source] io::Error),
+    /// The rootfs identity is absent, malformed, or not a rootfs digest.
+    #[error("invalid action rootfs identity in {}", .0.display())]
+    #[failure(config)]
+    RootIdentity(PathBuf),
+    /// An entry cannot be represented safely in the sandbox.
+    #[error("invalid or reserved action rootfs entry {}", .0.display())]
+    #[failure(config)]
+    RootEntry(PathBuf),
+    /// The action directory would obscure a protected mount.
+    #[error("action directory {} overlaps a protected sandbox path", .0.display())]
+    #[failure(config)]
+    ActionDirectory(PathBuf),
     /// The sandbox report could not be read from the pipe.
     #[error("cannot read the sandbox bwrap reported")]
     Info(#[source] io::Error),

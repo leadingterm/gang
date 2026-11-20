@@ -14,9 +14,8 @@ const RESET_PATH: &str = "/gang-reset";
 impl Bwrap {
     /// Builds the `bwrap` invocation that runs `spec`.
     ///
-    /// The sandbox root starts empty, so the only host paths visible inside it are the prefix's
-    /// read-only binds (each at its own path, then each mount at its path inside the sandbox) and
-    /// the action directory; the content store and other actions' directories are never mapped.
+    /// The sandbox root contains the immutable rootfs entries and the action directory;
+    /// the content store and other actions' directories are never mapped.
     /// The action directory is bound read-write, so every input resolves,
     /// including those outside the working directory (`../input`, relative symlinks); the working
     /// directory inside it becomes the current directory. `--share-net` must follow
@@ -33,12 +32,7 @@ impl Bwrap {
     /// With limits, the launcher starts `bwrap` itself, so the whole sandbox, `bwrap` included,
     /// starts inside the limits scope.
     #[must_use]
-    pub(crate) fn command(
-        &self,
-        spec: &ActionExecutionSpec<'_>,
-        info_fd: RawFd,
-        identity: &[Option<RawFd>; 3],
-    ) -> Command {
+    pub(crate) fn command(&self, spec: &ActionExecutionSpec<'_>, info_fd: RawFd) -> Command {
         let action_directory = spec.action_directory.as_os_str();
         let mut command = match spec.launcher.split_first() {
             Some((launcher, launcher_arguments)) => {
@@ -50,17 +44,6 @@ impl Bwrap {
         };
         command.env_clear();
         command.args(self.prefix.iter());
-        for (destination, fd) in ["/etc/passwd", "/etc/group", "/etc/nsswitch.conf"]
-            .into_iter()
-            .zip(identity)
-        {
-            if let Some(fd) = fd {
-                command
-                    .arg("--ro-bind-data")
-                    .arg(fd.to_string())
-                    .arg(destination);
-            }
-        }
         command.arg("--info-fd").arg(info_fd.to_string());
         command.args([
             OsStr::new("--bind"),
@@ -79,6 +62,8 @@ impl Bwrap {
             .arg("--ro-bind")
             .arg(&self.executable)
             .arg(RESET_PATH)
+            .arg("--remount-ro")
+            .arg("/")
             .arg("--")
             .arg(RESET_PATH)
             .arg(spec.command.program())
@@ -89,42 +74,34 @@ impl Bwrap {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::ffi::{OsStr, OsString};
     use std::os::fd::RawFd;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::process::Command;
 
     #[cfg(target_os = "linux")]
     use gang_spi::ActionIsolationPort;
     use gang_spi::{ActionCommand, ActionExecutionSpec, NetworkRequest, Plugin, PluginContext};
-    use gang_types::AbsolutePathBuf;
 
-    use crate::{Bwrap, BwrapConfig};
-
-    const READONLY: [&str; 2] = ["/nix/store", "/usr"];
+    use crate::Bwrap;
+    #[cfg(target_os = "linux")]
+    use crate::BwrapConfig;
+    use crate::bwrap::tests::config;
 
     /// The descriptor the tests report the sandbox on; the command line only names it.
     const INFO_FD: RawFd = 7;
 
-    fn abs(path: &str) -> AbsolutePathBuf {
-        AbsolutePathBuf::try_new(path).expect("absolute")
-    }
-
     fn bwrap(permit_network_property: bool) -> Bwrap {
+        let directory = tempfile::tempdir().expect("fixture");
+        let mut config = config(directory.path());
+        config.permit_network_property = permit_network_property;
         Bwrap::build(
-            BwrapConfig {
-                readonly_bind_paths: READONLY.iter().copied().map(abs).collect(),
-                readonly_bind_mounts: BTreeMap::new(),
-                permit_network_property,
-                program: PathBuf::from("/usr/bin/bwrap"),
-                tmp_path: abs("/tmp"),
-            },
+            config,
             &PluginContext {
                 config_path: Path::new("sandbox.toml"),
             },
         )
-        .expect("bwrap plugin builds from its config")
+        .expect("fixture builds")
     }
 
     fn command(
@@ -150,15 +127,7 @@ mod tests {
             working_directory,
             network,
         };
-        let identity = [8, 9, 10].map(Some);
-        let identity = std::array::from_fn(|index| {
-            if bwrap.identity_overrides[index] {
-                None
-            } else {
-                identity[index]
-            }
-        });
-        Ok(bwrap.command(&spec, INFO_FD, &identity))
+        Ok(bwrap.command(&spec, INFO_FD))
     }
 
     fn args(command: &Command) -> Vec<String> {
@@ -183,154 +152,42 @@ mod tests {
     }
 
     #[test]
-    fn full_command_line_for_unshared_network() -> Result<(), Box<dyn std::error::Error>> {
-        let bwrap = bwrap(false);
-
-        let command = command(
-            &bwrap,
-            Path::new("/work/a"),
-            Path::new("/work/a/sub"),
-            NetworkRequest::NotRequested,
-        )?;
-
-        assert_eq!(command.get_program(), "/usr/bin/bwrap");
-        assert_eq!(
-            args(&command),
-            [
-                "--unshare-all",
-                "--die-with-parent",
-                "--new-session",
-                "--proc",
-                "/proc",
-                "--dev",
-                "/dev",
-                "--tmpfs",
-                "/tmp",
-                "--clearenv",
-                "--ro-bind",
-                "/nix/store",
-                "/nix/store",
-                "--ro-bind",
-                "/usr",
-                "/usr",
-                "--ro-bind-data",
-                "8",
-                "/etc/passwd",
-                "--ro-bind-data",
-                "9",
-                "/etc/group",
-                "--ro-bind-data",
-                "10",
-                "/etc/nsswitch.conf",
-                "--info-fd",
-                "7",
-                "--bind",
-                "/work/a",
-                "/work/a",
-                "--chdir",
-                "/work/a/sub",
-                "--setenv",
-                "A",
-                "1",
-                "--setenv",
-                "B",
-                "two words",
-                "--ro-bind",
-                &bwrap.executable.to_string_lossy(),
-                "/gang-reset",
-                "--",
-                "/gang-reset",
-                "/bin/sh",
-                "-c",
-                "echo hi there",
-            ]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn readonly_bind_mounts_follow_the_same_path_binds() -> Result<(), Box<dyn std::error::Error>> {
+    fn root_entries_and_mount_order_are_explicit() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().expect("fixture");
+        let config = config(directory.path());
+        symlink("usr/bin", config.root.join("root/bin")).expect("fixture symlink");
         let bwrap = Bwrap::build(
-            BwrapConfig {
-                readonly_bind_paths: READONLY.iter().copied().map(abs).collect(),
-                readonly_bind_mounts: BTreeMap::from([
-                    (abs("/bin"), abs("/opt/tools/bin")),
-                    (abs("/usr/bin"), abs("/opt/tools/bin")),
-                ]),
-                permit_network_property: false,
-                program: PathBuf::from("/usr/bin/bwrap"),
-                tmp_path: abs("/tmp"),
-            },
+            config,
             &PluginContext {
-                config_path: Path::new("sandbox.toml"),
+                config_path: Path::new("/"),
             },
         )
-        .expect("bwrap plugin builds from its config");
+        .expect("build");
         let command = command(
             &bwrap,
-            Path::new("/work/a"),
-            Path::new("/work/a"),
+            Path::new("/tmp/action"),
+            Path::new("/tmp/action"),
             NetworkRequest::NotRequested,
-        )?;
+        )
+        .expect("command");
         let args = args(&command);
-        let usr = position(&args, "/usr");
-        assert_eq!(
-            &args[usr - 1..usr + 9],
-            [
-                "--ro-bind",
-                "/usr",
-                "/usr",
-                "--ro-bind",
-                "/opt/tools/bin",
-                "/bin",
-                "--ro-bind",
-                "/opt/tools/bin",
-                "/usr/bin",
-                "--ro-bind-data",
-            ]
+        assert!(
+            args.windows(3)
+                .any(|a| a == ["--symlink", "usr/bin", "/bin"])
         );
-        Ok(())
-    }
-
-    #[test]
-    fn explicit_identity_mounts_replace_only_their_generated_files()
-    -> Result<(), Box<dyn std::error::Error>> {
-        for destination in ["/etc/passwd", "/etc/group", "/etc/nsswitch.conf"] {
-            let bwrap = Bwrap::build(
-                BwrapConfig {
-                    readonly_bind_paths: vec![abs("/etc")],
-                    readonly_bind_mounts: BTreeMap::from([(
-                        abs(destination),
-                        abs("/custom/identity"),
-                    )]),
-                    permit_network_property: false,
-                    program: PathBuf::from("/usr/bin/bwrap"),
-                    tmp_path: abs("/tmp"),
-                },
-                &PluginContext {
-                    config_path: Path::new("sandbox.toml"),
-                },
-            )?;
-            let arguments = args(&command(
-                &bwrap,
-                Path::new("/work"),
-                Path::new("/work"),
-                NetworkRequest::NotRequested,
-            )?);
-            let generated: Vec<_> = arguments
-                .windows(3)
-                .filter(|window| window[0] == "--ro-bind-data")
-                .map(|window| window[2].as_str())
-                .collect();
-            assert_eq!(generated.len(), 2);
-            assert!(!generated.contains(&destination));
-            assert!(
-                arguments
-                    .windows(3)
-                    .any(|window| window == ["--ro-bind", "/custom/identity", destination])
-            );
-        }
-        Ok(())
+        assert!(
+            args.windows(3)
+                .any(|a| a[0] == "--ro-bind" && a[2] == "/usr")
+        );
+        assert!(args.windows(2).any(|a| a == ["--uid", "1000"]));
+        assert!(args.windows(2).any(|a| a == ["--gid", "1000"]));
+        assert!(args.windows(3).any(|a| a == ["--setenv", "B", "two words"]));
+        assert!(position(&args, "/usr") < position(&args, "--proc"));
+        assert!(position(&args, "--tmpfs") < position(&args, "--bind"));
+        assert!(position(&args, "--bind") < position(&args, "--remount-ro"));
+        assert!(position(&args, "--remount-ro") < position(&args, "--"));
+        assert!(!args.iter().any(|a| a == "--ro-bind-data"));
     }
 
     #[test]
@@ -384,37 +241,6 @@ mod tests {
     }
 
     #[test]
-    fn uses_configured_program_and_tmp_path() -> Result<(), Box<dyn std::error::Error>> {
-        let bwrap = Bwrap::build(
-            BwrapConfig {
-                readonly_bind_paths: Vec::new(),
-                readonly_bind_mounts: BTreeMap::new(),
-                permit_network_property: false,
-                program: PathBuf::from("/custom/bwrap"),
-                tmp_path: abs("/scratch"),
-            },
-            &PluginContext {
-                config_path: Path::new("sandbox.toml"),
-            },
-        )
-        .expect("bwrap plugin builds from its config");
-
-        let command = command(
-            &bwrap,
-            Path::new("/work/a"),
-            Path::new("/work/a"),
-            NetworkRequest::NotRequested,
-        )?;
-
-        assert_eq!(command.get_program(), "/custom/bwrap");
-        let args = args(&command);
-        let tmpfs = position(&args, "--tmpfs");
-        assert_eq!(args[tmpfs + 1], "/scratch");
-        assert!(tmpfs < position(&args, "--bind"), "{args:?}");
-        Ok(())
-    }
-
-    #[test]
     fn the_launcher_wraps_bwrap() -> Result<(), Box<dyn std::error::Error>> {
         let bwrap = bwrap(false);
         let argv = [OsString::from("/bin/true")];
@@ -431,7 +257,7 @@ mod tests {
             network: NetworkRequest::NotRequested,
         };
 
-        let command = bwrap.command(&spec, INFO_FD, &[Some(8), Some(9), Some(10)]);
+        let command = bwrap.command(&spec, INFO_FD);
 
         assert_eq!(command.get_program(), launcher[0].as_os_str());
         let arguments: Vec<&OsStr> = command.get_args().collect();
@@ -458,11 +284,8 @@ mod tests {
         let output = directory.path().join("environment.txt");
         let bwrap = Bwrap::build(
             BwrapConfig {
-                readonly_bind_paths: Vec::new(),
-                readonly_bind_mounts: BTreeMap::new(),
-                permit_network_property: false,
                 program: std::env::current_dir()?.join(fake),
-                tmp_path: abs("/tmp"),
+                ..config(directory.path())
             },
             &PluginContext {
                 config_path: Path::new("sandbox.toml"),

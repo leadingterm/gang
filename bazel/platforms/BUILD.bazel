@@ -1,8 +1,11 @@
+load("@gang_env//:defs.bzl", "EXEC_PROPERTIES")
+
 # The Linux target platform of every Gang build: the host's OS and CPU with the musl libc, so that
 # every Linux binary is static and never runs the dynamic loader.
 platform(
     name = "linux_musl",
     constraint_values = ["@zig_sdk//libc:musl"],
+    exec_properties = EXEC_PROPERTIES,
     parents = ["@platforms//host"],
     visibility = ["//visibility:public"],
 )
@@ -42,9 +45,9 @@ platform(
         "@platforms//os:linux",
         "@platforms//cpu:aarch64",
     ],
-    exec_properties = {
-        "ISA": "aarch64",
-        "gang_action_environment": "identity-roots-v1",
-    },
+    exec_properties = dict(
+        EXEC_PROPERTIES,
+        ISA = "aarch64",
+    ),
     visibility = ["//visibility:public"],
 )

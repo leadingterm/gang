@@ -139,15 +139,9 @@ pub struct Settings {
     /// The PATH of the sample's actions. Defaults to `GANG_E2E_ACTION_PATH`, which the flake's devShell sets.
     #[serde(default)]
     pub action_path: Option<String>,
-    /// The directory of the sample's action tools, bound at `/bin` and `/usr/bin` in bwrap
-    /// sandboxes as the worker image binds its action tools. Defaults to `GANG_E2E_ACTION_BIN`,
-    /// which the flake's devShell sets.
+    /// Rootfs envelope used by bubblewrap workers, supplied by `GANG_E2E_ACTION_ROOTFS`.
     #[serde(default)]
-    pub action_bin: Option<PathBuf>,
-    /// Public CA bundle mounted at conventional system trust paths in bwrap actions.
-    /// Defaults to `GANG_E2E_CA_BUNDLE` from the devShell.
-    #[serde(default)]
-    pub ca_bundle: Option<PathBuf>,
+    pub action_rootfs: Option<PathBuf>,
     /// How long connection setup, TLS, and the first HTTP/2 frame may take.
     #[serde(with = "gang_types::duration")]
     pub handshake_timeout: Duration,
@@ -220,8 +214,7 @@ impl Default for Settings {
             bwrap: None,
             chromium: None,
             action_path: None,
-            action_bin: None,
-            ca_bundle: None,
+            action_rootfs: None,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             command_timeout: DEFAULT_COMMAND_TIMEOUT,
@@ -264,13 +257,6 @@ impl Settings {
     }
 }
 
-/// Host paths a dynamically linked glibc program needs: the ELF interpreter directories (`/lib64`
-/// on x86-64, `/lib` on aarch64, holding the loader on an FHS host and the nix-ld stub on NixOS),
-/// `/usr` (an FHS host's libraries) and `/run/current-system/sw` (nix-ld's libraries on NixOS). The
-/// harness binds those the host has, read-only, as the worker image binds `/lib`, `/lib64` and
-/// `/run/current-system/sw`.
-pub const GLIBC_LOADER_PATHS: [&str; 4] = ["/lib", "/lib64", "/usr", "/run/current-system/sw"];
-
 /// The resolved shell and PATH used by the sample's actions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionTools {
@@ -278,32 +264,17 @@ pub struct ActionTools {
     pub shell: PathBuf,
     /// The PATH provided to each action.
     pub path: String,
-    /// The directory of the action tools, bound at `/bin` and `/usr/bin` in bwrap sandboxes.
-    pub action_bin: PathBuf,
-    /// Public CA bundle to mount in the action, if available.
-    pub ca_bundle: Option<PathBuf>,
     /// The bubblewrap binary a bwrap-sandboxed worker runs (`[sandbox.bwrap] program`);
     /// `None` where the platform has no bwrap.
     pub bwrap: Option<PathBuf>,
     /// A dynamically linked glibc program, as the toolchains Bazel downloads are, that the sample's
     /// `glibc_tool` probe runs; `None` where the platform has no bwrap.
     pub glibc_tool: Option<PathBuf>,
-    /// The host's [`GLIBC_LOADER_PATHS`] that exist, bound read-only in bwrap sandboxes so that
-    /// dynamically linked glibc programs start.
-    pub glibc_loader: Vec<PathBuf>,
+    /// Rootfs envelope used by bubblewrap workers.
+    pub action_rootfs: Option<PathBuf>,
 }
 
 impl ActionTools {
-    /// The host's [`GLIBC_LOADER_PATHS`] that exist.
-    #[must_use]
-    pub fn host_glibc_loader() -> Vec<PathBuf> {
-        GLIBC_LOADER_PATHS
-            .iter()
-            .map(PathBuf::from)
-            .filter(|path| path.exists())
-            .collect()
-    }
-
     /// The bubblewrap binary bwrap-sandboxed workers run.
     ///
     /// # Errors

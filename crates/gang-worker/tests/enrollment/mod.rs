@@ -23,6 +23,7 @@ async fn rate_limited_first_enrollment_waits_for_retry_after_then_succeeds() {
         harness.parts(true),
         harness.settings(),
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     ));
 
@@ -51,6 +52,7 @@ async fn rate_limit_without_retry_after_waits_the_retry_interval() {
         harness.parts(true),
         settings,
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     ));
 
@@ -79,6 +81,7 @@ async fn rate_limit_refusals_past_the_enrollment_deadline_are_fatal() {
         harness.parts(true),
         settings,
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     ));
 
@@ -114,6 +117,7 @@ async fn a_retry_that_would_exceed_the_deadline_is_not_started() {
         harness.parts(true),
         settings,
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     ));
 
@@ -144,6 +148,7 @@ async fn retry_after_longer_than_deadline_fails_immediately() {
         harness.parts(true),
         settings,
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     )
     .await;
@@ -161,6 +166,7 @@ async fn already_expired_certificate_is_rejected() {
         harness.parts(true),
         harness.settings(),
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     )
     .await;
@@ -180,6 +186,7 @@ async fn ordinary_enrollment_failure_is_fatal_after_one_attempt() {
             harness.parts(true),
             harness.settings(),
             harness.build_limits(),
+            harness.build_sandbox(),
             future::pending(),
         ))
         .await;
@@ -206,6 +213,7 @@ async fn shutdown_during_a_rate_limited_first_enrollment_ends_the_run() {
         harness.parts(true),
         harness.settings(),
         harness.build_limits(),
+        harness.build_sandbox(),
         async move {
             rx.await.ok();
         },
@@ -250,6 +258,7 @@ async fn preemption_during_a_rate_limited_first_enrollment_ends_the_run() {
         harness.parts(true),
         harness.settings(),
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     ));
 

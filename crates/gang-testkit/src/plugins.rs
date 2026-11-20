@@ -36,6 +36,9 @@ pub struct BoxedSection {
     /// The program the boxed sandbox runs when its section names none, `fake-sandbox`.
     #[serde(default = "default_program")]
     pub program: PathBuf,
+    /// The immutable root used by the sandbox, when configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<gang_types::AbsolutePathBuf>,
 }
 
 /// The program the boxed sandbox runs when its configuration names none.
@@ -81,6 +84,22 @@ impl SandboxSelection for SandboxConfig {
                 None => Ok(()),
             },
         }
+    }
+
+    fn try_for_each_root<E>(
+        &mut self,
+        key: SandboxKey,
+        mut visit: impl FnMut(&mut gang_types::AbsolutePathBuf) -> Result<(), E>,
+    ) -> Result<(), E> {
+        if let SandboxKey::Boxed = key
+            && let Some(root) = self
+                .boxed
+                .as_mut()
+                .and_then(|section| section.root.as_mut())
+        {
+            visit(root)?;
+        }
+        Ok(())
     }
 }
 
@@ -141,6 +160,7 @@ endpoint = "https://gang.example.com:9443"
 name = "example-fleet"
 isa = "x86-64"
 sandbox = "noop"
+action_environment = "host:test"
 min_instances = 0
 max_instances = 4
 vcpus_per_instance = 4
@@ -160,6 +180,7 @@ boot_grace = "30s"
 [database.test]
 
 [sandbox.noop]
+environment = "host:test"
 
 [authentication.clients.none]
 
@@ -229,10 +250,40 @@ mod tests {
     }
 
     #[test]
+    fn only_selected_boxed_root_is_visited() -> TestResult {
+        let mut config = SandboxConfig {
+            boxed: Some(BoxedSection {
+                program: PathBuf::from("sandbox"),
+                root: Some(gang_types::AbsolutePathBuf::try_new("/root")?),
+            }),
+            ..SandboxConfig::default()
+        };
+        let mut visits = 0;
+        config.try_for_each_root(SandboxKey::Noop, |_| {
+            visits += 1;
+            Ok::<(), String>(())
+        })?;
+        assert_eq!(visits, 0);
+        config.try_for_each_root(SandboxKey::Boxed, |root| {
+            visits += 1;
+            *root = gang_types::AbsolutePathBuf::try_new("/pinned")
+                .map_err(|error| error.to_string())?;
+            Ok::<(), String>(())
+        })?;
+        assert_eq!(visits, 1);
+        assert_eq!(
+            config.boxed.and_then(|section| section.root),
+            Some(gang_types::AbsolutePathBuf::try_new("/pinned")?)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn boxed_program_is_visited_once_and_can_be_rewritten() -> TestResult {
         let mut config = SandboxConfig {
             boxed: Some(BoxedSection {
                 program: PathBuf::from("old"),
+                root: None,
             }),
             ..SandboxConfig::default()
         };
@@ -274,6 +325,7 @@ mod tests {
         let mut config = SandboxConfig {
             boxed: Some(BoxedSection {
                 program: PathBuf::from("a"),
+                root: None,
             }),
             ..SandboxConfig::default()
         };

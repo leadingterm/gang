@@ -1,7 +1,6 @@
 //! The `gang.toml` template of a run: the base configuration, adapted to one placement, one
 //! variant, and one transport. Every key a scenario does not name is carried over unchanged.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -47,10 +46,6 @@ use crate::system::{
     PermitNetwork, SMALL_FLEET, Sandbox, SoftMemory, Variant,
 };
 
-/// The paths inside the sandbox at which the worker image binds its action tools
-/// (`configs/gang.aws.toml`); the harness binds the sample's action tools there.
-const ACTION_TOOL_PATHS: [&str; 2] = ["/bin", "/usr/bin"];
-
 /// The `max_instances` of [`SMALL_FLEET`] and [`NOOP_FLEET`].
 const SMALL_MAX_INSTANCES: NonZeroU32 = NonZeroU32::MIN;
 
@@ -59,60 +54,6 @@ const LARGE_MAX_INSTANCES: u32 = 2;
 
 /// The factor by which [`LARGE_FLEET`]'s instances exceed the base fleet's.
 const LARGE_FACTOR: u32 = 2;
-
-/// The shared root containing the self-contained closures of the action tools.
-const NIX_STORE: &str = "/nix/store";
-
-/// Returns the bind roots: the Nix store roots of the action shell and PATH, in first-seen order,
-/// then the host's glibc loader paths.
-///
-/// # Errors
-///
-/// Returns a system error when a tool is outside the Nix store, since host tools may need
-/// libraries that are not available inside bwrap.
-fn bind_roots(tools: &ActionTools) -> Result<Vec<PathBuf>> {
-    let mut roots = Vec::new();
-    for path in std::iter::once(tools.shell.clone()).chain(std::env::split_paths(&tools.path)) {
-        if !path.starts_with(NIX_STORE) || path == Path::new(NIX_STORE) {
-            return Err(E2eError::system(format!(
-                "under bwrap the action tools must come from the Nix store, whose closures are self-contained: {}",
-                path.display()
-            )));
-        }
-        let root = PathBuf::from(NIX_STORE);
-        if !roots.contains(&root) {
-            roots.push(root);
-        }
-    }
-    roots.extend(tools.glibc_loader.iter().cloned());
-    Ok(roots)
-}
-
-fn action_tool_mounts(tools: &ActionTools) -> Result<BTreeMap<AbsolutePathBuf, AbsolutePathBuf>> {
-    let tools_directory = absolute(tools.action_bin.clone(), "the action tools directory")?;
-    let mut mounts = ACTION_TOOL_PATHS
-        .iter()
-        .copied()
-        .map(|path| {
-            absolute(PathBuf::from(path), "an action tool path")
-                .map(|path| (path, tools_directory.clone()))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
-    if let Some(bundle) = &tools.ca_bundle {
-        let source = absolute(bundle.clone(), "the public CA bundle")?;
-        for path in [
-            "/etc/ssl/certs/ca-certificates.crt",
-            "/etc/ssl/cert.pem",
-            "/etc/pki/tls/certs/ca-bundle.crt",
-        ] {
-            mounts.insert(
-                absolute(PathBuf::from(path), "a system CA bundle path")?,
-                source.clone(),
-            );
-        }
-    }
-    Ok(mounts)
-}
 
 /// Four unreserved cold actions fit one 6 GiB worker instead of scaling out.
 const COLD_START_MEMORY: &str = "1536MiB";
@@ -284,6 +225,54 @@ fn render_resource_policy(
     }
 }
 
+/// Prepares the first fleet and sandbox from the same action environment.
+pub(crate) fn prepare_sandbox(
+    document: &mut Document<Plugins>,
+    sandbox: Sandbox,
+    tools: &ActionTools,
+) -> Result<()> {
+    let fleet = document
+        .fleets
+        .first_mut()
+        .ok_or_else(|| template_error("missing the first [[fleets]] entry"))?;
+    fleet.sandbox = match sandbox {
+        Sandbox::Bwrap => SandboxKey::Bwrap,
+        Sandbox::Noop => SandboxKey::Noop,
+    };
+    if let Some(noop) = document.sandbox.noop.as_mut() {
+        noop.environment = "host:e2e".parse().map_err(template_error)?;
+    }
+    match sandbox {
+        Sandbox::Bwrap => {
+            let bwrap = document
+                .sandbox
+                .bwrap
+                .as_mut()
+                .ok_or_else(|| template_error("missing [sandbox.bwrap]"))?;
+            bwrap.program = tools.bwrap_program()?.to_path_buf();
+            let root = tools
+                .action_rootfs
+                .as_ref()
+                .ok_or_else(|| template_error("GANG_E2E_ACTION_ROOTFS is required for bwrap"))?;
+            let root = fs::canonicalize(root)
+                .map_err(E2eError::io("canonicalizing the action rootfs envelope"))?;
+            fleet.action_environment = fs::read_to_string(root.join("identity"))
+                .map_err(E2eError::io("reading action rootfs identity"))?
+                .trim()
+                .parse()
+                .map_err(template_error)?;
+            bwrap.root = absolute(root, "the action rootfs envelope")?;
+        }
+        Sandbox::Noop => {
+            fleet.action_environment = "host:e2e".parse().map_err(template_error)?;
+            if document.sandbox.noop.is_none() {
+                return Err(template_error("missing [sandbox.noop]"));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl ConfigTemplate {
     /// Parses the base configuration text.
     ///
@@ -305,22 +294,6 @@ impl ConfigTemplate {
         Ok(self)
     }
 
-    /// Adds the signal directory to the bubblewrap read-only bind paths.
-    ///
-    /// # Errors
-    /// Returns an error if bubblewrap is absent or the path is not absolute.
-    pub fn with_signal_dir(mut self, directory: &Path) -> Result<Self> {
-        let bwrap = self
-            .document
-            .sandbox
-            .bwrap
-            .as_mut()
-            .ok_or_else(|| template_error("missing [sandbox.bwrap]"))?;
-        bwrap
-            .readonly_bind_paths
-            .push(absolute(directory.to_path_buf(), "the signal directory")?);
-        Ok(self)
-    }
     /// Wraps the Local launcher with the harness's FIFO gate, retaining its entire argv.
     pub(crate) fn with_launch_gate(
         mut self,
@@ -363,34 +336,11 @@ impl ConfigTemplate {
         tools: &ActionTools,
     ) -> Result<Self> {
         let document = &mut self.document;
-        let fleet = document
-            .fleets
-            .first_mut()
-            .ok_or_else(|| template_error("missing the first [[fleets]] entry"))?;
-        fleet.sandbox = match variant.sandbox {
-            Sandbox::Bwrap => SandboxKey::Bwrap,
-            Sandbox::Noop => SandboxKey::Noop,
-        };
-        match variant.sandbox {
-            Sandbox::Bwrap => {
-                let bwrap = document
-                    .sandbox
-                    .bwrap
-                    .as_mut()
-                    .ok_or_else(|| template_error("missing [sandbox.bwrap]"))?;
-                bwrap.program = tools.bwrap_program()?.to_path_buf();
-                bwrap.readonly_bind_paths = bind_roots(tools)?
-                    .into_iter()
-                    .map(|root| absolute(root, "the action tool bind root"))
-                    .collect::<Result<_>>()?;
-                bwrap.readonly_bind_mounts = action_tool_mounts(tools)?;
-                bwrap.permit_network_property = variant.permit_network == PermitNetwork::Permitted;
-            }
-            Sandbox::Noop => {
-                if document.sandbox.noop.is_none() {
-                    return Err(template_error("missing [sandbox.noop]"));
-                }
-            }
+        prepare_sandbox(document, variant.sandbox, tools)?;
+        if let Some(bwrap) = document.sandbox.bwrap.as_mut()
+            && variant.sandbox == Sandbox::Bwrap
+        {
+            bwrap.permit_network_property = variant.permit_network == PermitNetwork::Permitted;
         }
         if variant.fleets == FleetLayout::Placement {
             if document.sandbox.noop.is_none() {
@@ -538,20 +488,6 @@ impl ConfigTemplate {
         Ok(self.document.default_isa)
     }
 
-    /// Returns the bubblewrap tmp path, including the plugin's default.
-    ///
-    /// # Errors
-    /// Returns a template error if bubblewrap is not configured.
-    pub fn tmp_path(&self) -> Result<PathBuf> {
-        let bwrap = self
-            .document
-            .sandbox
-            .bwrap
-            .as_ref()
-            .ok_or_else(|| template_error("missing [sandbox.bwrap]"))?;
-        Ok(bwrap.tmp_path.as_path().to_path_buf())
-    }
-
     /// Returns the large fleet's memory in KiB.
     ///
     /// # Errors
@@ -598,6 +534,7 @@ fn placement_fleet(
     Ok(RawFleet {
         name: name.parse().map_err(template_error)?,
         isa: base.isa,
+        action_environment: base.action_environment.clone(),
         min_instances: 0,
         max_instances: max,
         vcpus_per_instance: base.vcpus_per_instance,
@@ -633,6 +570,7 @@ fn placement_fleets(fleets: &mut Vec<RawFleet<SandboxKey>>) -> Result<()> {
     large.memory_per_instance = memory;
     let mut noop = placement_fleet(base, NOOP_FLEET, SMALL_MAX_INSTANCES)?;
     noop.sandbox = SandboxKey::Noop;
+    noop.action_environment = "host:e2e".parse().map_err(template_error)?;
     *fleets = vec![small, large, noop];
     Ok(())
 }

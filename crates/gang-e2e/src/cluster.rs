@@ -2029,6 +2029,12 @@ fn adapt_local_plugins(
         ],
     )?;
     copy_local_fields(doc, staged, &["sandbox", "noop"], &["scratch_dir"])?;
+    if local["sandbox"]["bwrap"].get("root").is_some() {
+        copy_local_fields(doc, staged, &["sandbox", "bwrap"], &["root"])?;
+    }
+    if local["sandbox"]["noop"].get("environment").is_some() {
+        copy_local_fields(doc, staged, &["sandbox", "noop"], &["environment"])?;
+    }
     copy_local_fields(
         doc,
         staged,
@@ -2135,6 +2141,16 @@ fn adapt_fleet(
             if let Some(value) = staged_fleet.get(key) {
                 fleet.insert(key.into(), value.clone());
             }
+        }
+        if local
+            .get("fleets")
+            .and_then(toml::Value::as_array)
+            .and_then(|fleets| fleets.first())
+            .and_then(|fleet| fleet.get("action_environment"))
+            .is_some()
+            && let Some(value) = staged_fleet.get("action_environment")
+        {
+            fleet.insert("action_environment".into(), value.clone());
         }
     }
     fleet.insert("max_instances".into(), toml::Value::Integer(1));
@@ -2683,18 +2699,58 @@ mod tests {
         Ok(())
     }
 
+    fn old_local_schema(local: &mut toml::Value) -> TestResult {
+        local["fleets"][0]
+            .as_table_mut()
+            .ok_or("missing fleet")?
+            .remove("action_environment");
+        local["sandbox"]["noop"]
+            .as_table_mut()
+            .ok_or("missing noop")?
+            .remove("environment");
+        let bwrap = local["sandbox"]["bwrap"]
+            .as_table_mut()
+            .ok_or("missing bwrap")?;
+        bwrap.remove("root");
+        bwrap.insert("readonly_bind_paths".into(), toml::Value::Array(Vec::new()));
+        Ok(())
+    }
+
+    fn assert_environment_schema(doc: &toml::Value, modern: bool) {
+        let fleet = &doc["fleets"][0];
+        assert_eq!(fleet.get("action_environment").is_some(), modern);
+        assert_eq!(doc["sandbox"]["noop"].get("environment").is_some(), modern);
+        assert_eq!(doc["sandbox"]["bwrap"].get("root").is_some(), modern);
+        if modern {
+            assert_eq!(fleet["action_environment"].as_str(), Some("host:e2e"));
+            assert_eq!(
+                doc["sandbox"]["noop"]["environment"].as_str(),
+                Some("host:e2e")
+            );
+            assert_eq!(
+                doc["sandbox"]["bwrap"]["root"].as_str(),
+                Some("/staged-root")
+            );
+        } else {
+            assert!(doc["sandbox"]["bwrap"].get("readonly_bind_paths").is_some());
+        }
+    }
+
     #[test]
     fn versioned_topology_preserves_combined_and_split_execution() -> TestResult {
         let local: toml::Value = toml::from_str(
             r#"
 [[fleets]]
 name = "local"
+action_environment = "host:e2e"
 [provisioner.local]
 state_dir = "/tmp/local"
 [signer.file]
 key_file = "/tmp/key"
 [sandbox.noop]
+environment = "host:e2e"
 [sandbox.bwrap]
+root = "/old-root"
 [identity.providers.local-workers.oidc]
 issuer_url = "http://127.0.0.1:1"
 [authentication.clients.token]
@@ -2702,6 +2758,7 @@ providers = ["local-workers"]
 "#,
         )?;
         let mut staged = local.clone();
+        staged["sandbox"]["bwrap"]["root"] = toml::Value::String("/staged-root".into());
         let identity = staged
             .get_mut("identity")
             .and_then(|v| v.get_mut("providers"))
@@ -2718,16 +2775,22 @@ providers = ["local-workers"]
         let address = "127.0.0.1:1234".parse()?;
         let public = gang_types::Url::parse("https://127.0.0.1:1234")?;
         let worker = gang_types::Url::parse("grpcs://127.0.0.1:1234")?;
-        for (split, source) in [
+        for (split, source, modern) in [
             (
                 true,
                 "[server]\n[scheduler.nativelink]\nworker_endpoint = 'grpcs://old:1'\n",
+                false,
             ),
             (
                 false,
                 "worker_endpoint = 'grpcs://old:1'\n[server]\n[server.http2]\n",
+                true,
             ),
         ] {
+            let mut local = local.clone();
+            if !modern {
+                old_local_schema(&mut local)?;
+            }
             let mut doc: toml::Value = toml::from_str(&format!(
                 "{source}\n[[fleets]]\nname = 'production'\nvcpus_per_instance = 2\ntarget_actions_per_instance = 2\n[fleets.options]\ncapacity = 'spot'\n[limits.cgroup]\n"
             ))?;
@@ -2755,6 +2818,7 @@ providers = ["local-workers"]
             let fleet = &doc["fleets"][0];
             assert_eq!(fleet["vcpus_per_instance"].as_integer(), Some(2));
             assert_eq!(fleet["target_actions_per_instance"].as_integer(), Some(2));
+            assert_environment_schema(&doc, modern);
             assert!(fleet.get("options").is_none());
             assert!(doc.get("limits").is_none());
             if split {

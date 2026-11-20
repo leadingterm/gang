@@ -1,6 +1,7 @@
 //! Mixed-release controller handoff with an old client and an enrolled old worker.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -9,7 +10,7 @@ use std::sync::{Arc, mpsc};
 use std::thread::{Scope, ScopedJoinHandle};
 use std::time::{Duration, Instant};
 
-use gang_types::Url;
+use gang_types::{ActionEnvironment, Url};
 
 use crate::bazel::Bazel;
 use crate::build_output::BuildOutcome;
@@ -104,6 +105,25 @@ fn drain(journal: &Journal, run: &Run, attempts: &mut Attempts) -> Result<()> {
         }
         record_attempt(&line, run.as_ref(), attempts)?;
     }
+}
+
+// Keys are action and attempt PID; values are original worker PID and start timestamp.
+type InFlight = BTreeMap<(String, u32), (u32, u64)>;
+
+fn capture_in_flight(attempts: &Attempts) -> InFlight {
+    attempts
+        .iter()
+        .map(|(key, attempt)| (key.clone(), (attempt.worker, attempt.start)))
+        .collect()
+}
+
+fn uninterrupted(frozen: &InFlight, final_attempts: &Attempts) -> bool {
+    !frozen.is_empty()
+        && frozen.iter().all(|(key, &(worker, start))| {
+            final_attempts.get(key).is_some_and(|attempt| {
+                attempt.worker == worker && attempt.start == start && attempt.end.is_some()
+            })
+        })
 }
 
 fn exact_attempts(attempts: &Attempts, expected: usize) -> bool {
@@ -937,6 +957,7 @@ struct VerdictInputs<'a> {
     initial_outcome: &'a BuildOutcome,
     initial_evidence: &'a BuildEvidence,
     initial_attempts: &'a Attempts,
+    in_flight: &'a InFlight,
     post_outcome: &'a BuildOutcome,
     post_evidence: &'a BuildEvidence,
     post_attempts: &'a Attempts,
@@ -971,7 +992,7 @@ fn final_verdict(input: &VerdictInputs<'_>) -> Vec<Check> {
     let ok = build_ok(input.initial_outcome, input.initial_evidence, 8)
         && build_ok(input.post_outcome, input.post_evidence, 1)
         && once
-        && workers.len() == 1
+        && uninterrupted(input.in_flight, input.initial_attempts)
         && input.status.success()
         && input.leader
         && input.cold_mints == 2
@@ -994,7 +1015,7 @@ fn final_verdict(input: &VerdictInputs<'_>) -> Vec<Check> {
         HeldDrainWitness::receipt,
     );
     let metrics = format!(
-        "procedure={:?}, operator_step={}, observed_plain_guard_checked={}, termination={termination}, warmup actual/scaled={:?}/{:?}, drain actual/scaled={:?}/{:?}, drain elapsed={:?}, old leader before/after={}/{}, versions={:?}->{:?}, initial exit={:?} post exit={:?}, failed actions={}/{}, successful actions={}/{}, attempts={attempts}, reexecutions={}, workers={workers:?}, rpc calls={}/{}, rpc failures={}/{}, rpc retries={}/{}, execute/wait correlations={}/{}, warmcold_mints={}, probe failures={}, repeated probes after failures={}, max gap={:?}, lease takeover={:?}, client promotion={:?}, old exit={}, final leader={}, total={:?}, {drain_receipt}, stop apply offset={:?}",
+        "procedure={:?}, operator_step={}, observed_plain_guard_checked={}, termination={termination}, warmup actual/scaled={:?}/{:?}, drain actual/scaled={:?}/{:?}, drain elapsed={:?}, old leader before/after={}/{}, versions={:?}->{:?}, initial exit={:?} post exit={:?}, failed actions={}/{}, successful actions={}/{}, attempts={attempts}, reexecutions={}, workers={workers:?}, frozen in-flight={:?}, rpc calls={}/{}, rpc failures={}/{}, rpc retries={}/{}, execute/wait correlations={}/{}, warmcold_mints={}, probe failures={}, repeated probes after failures={}, max gap={:?}, lease takeover={:?}, client promotion={:?}, old exit={}, final leader={}, total={:?}, {drain_receipt}, stop apply offset={:?}",
         input.procedure,
         input.procedure == UpgradeProcedure::PreStop,
         input.procedure == UpgradeProcedure::InstanceRefresh,
@@ -1014,6 +1035,7 @@ fn final_verdict(input: &VerdictInputs<'_>) -> Vec<Check> {
         input.initial_evidence.successful_actions,
         input.post_evidence.successful_actions,
         attempts.saturating_sub(9),
+        input.in_flight,
         input.initial_evidence.rpc_calls,
         input.post_evidence.rpc_calls,
         input.initial_evidence.rpc_failures,
@@ -1247,10 +1269,70 @@ fn select_releases(
     })
 }
 
+fn is_environment_assignment(line: &str) -> bool {
+    let mut words = line.split_whitespace();
+    let Some(scope) = words.next() else {
+        return false;
+    };
+    if scope != "build" && scope != "common" {
+        return false;
+    }
+    let Some(option) = words.next() else {
+        return false;
+    };
+    if words.next().is_some() {
+        return false;
+    }
+    let matches_key = |prefix: &str, key: &str| {
+        option
+            .strip_prefix(prefix)
+            .map(|value| value.trim_start_matches(['\'', '"']))
+            .and_then(|value| value.strip_prefix(key))
+            .is_some_and(|suffix| suffix.starts_with('='))
+    };
+    matches_key("--repo_env=", "GANG_ACTION_ENVIRONMENT")
+        || matches_key(
+            "--remote_default_exec_properties=",
+            gang_types::property::ACTION_ENVIRONMENT,
+        )
+}
+
+fn configure_upgrade_client(config: &Path, bazelrc: &Path) -> Result<()> {
+    let config = fs::read_to_string(config)
+        .map_err(E2eError::io("reading candidate local configuration"))?;
+    let config: toml::Value = toml::from_str(&config).map_err(crate::template::template_error)?;
+    let environment: ActionEnvironment = config
+        .get("fleets")
+        .and_then(toml::Value::as_array)
+        .and_then(|fleets| fleets.first())
+        .and_then(|fleet| fleet.get("action_environment"))
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| E2eError::system("candidate local fleet has no action environment"))?
+        .parse()
+        .map_err(E2eError::system_from(
+            "parsing candidate action environment",
+        ))?;
+    let rc = fs::read_to_string(bazelrc).map_err(E2eError::io("reading old client bazelrc"))?;
+    let mut updated: String = rc
+        .split_inclusive('\n')
+        .filter(|line| !is_environment_assignment(line))
+        .collect();
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    let _ = write!(
+        updated,
+        "common --repo_env=GANG_ACTION_ENVIRONMENT={environment}\nbuild --remote_default_exec_properties={}={environment}\n",
+        gang_types::property::ACTION_ENVIRONMENT
+    );
+    fs::write(bazelrc, updated).map_err(E2eError::io("writing upgrade client bazelrc"))
+}
+
 fn prepare_client(cluster: &Cluster<'_>) -> Result<OldClient> {
     let stack = cluster.stack();
     let credentials = stack.administrator()?.credentials(&stack.ca_pin()?)?;
     let remote = stack.administrator_remote(&credentials)?;
+    configure_upgrade_client(&stack.placement().config_file(), remote.bazelrc())?;
     let endpoint = executor(remote.bazelrc())?;
     probe_capabilities(
         &endpoint,
@@ -1355,6 +1437,7 @@ struct InitialObservation {
     )>,
     build: Result<BuildOutcome>,
     attempts: Attempts,
+    in_flight: InFlight,
     continuity_observed: bool,
     verified_gap: bool,
     applied: Instant,
@@ -1457,6 +1540,7 @@ impl Upgrade<'_> {
             &self.releases.old.binary,
             &mut attempts,
         )?;
+        let in_flight = capture_in_flight(&attempts);
         let removed = self.releases.old_fixture.execution.is_some()
             && self.releases.candidate.execution.is_none();
         let mut monitor = self.start_monitor(scope, hold, removed)?;
@@ -1519,6 +1603,7 @@ impl Upgrade<'_> {
             handoff: settled,
             build: joined(initial),
             attempts,
+            in_flight,
             continuity_observed,
             verified_gap,
             applied,
@@ -1581,7 +1666,13 @@ impl Upgrade<'_> {
                 &self.releases,
             )]);
         }
-        self.report(&initial, &promotion, &post?, &outcome)
+        self.report(
+            &initial,
+            &observation.in_flight,
+            &promotion,
+            &post?,
+            &outcome,
+        )
     }
 
     fn prepare_drain_credentials(&self) -> Result<Option<DrainCredentials>> {
@@ -1748,6 +1839,7 @@ impl Upgrade<'_> {
     fn report(
         &self,
         initial: &ObservedBuild,
+        in_flight: &InFlight,
         promotion: &Promotion,
         post: &ObservedBuild,
         monitor: &MonitorOutcome,
@@ -1758,6 +1850,7 @@ impl Upgrade<'_> {
             initial_outcome: &initial.outcome,
             initial_evidence: &initial.evidence,
             initial_attempts: &initial.attempts,
+            in_flight,
             post_outcome: &post.outcome,
             post_evidence: &post.evidence,
             post_attempts: &post.attempts,
@@ -1798,6 +1891,34 @@ mod tests {
     use crate::upgrade_credentials::SharedCredentialWitness;
 
     #[test]
+    fn upgrade_client_uses_candidate_identity_for_default_and_explicit_platforms()
+    -> gang_testkit::TestResult {
+        let root = tempfile::tempdir()?;
+        let config = root.path().join("candidate.toml");
+        let rc = root.path().join("old-client.bazelrc");
+        fs::write(&config, "[[fleets]]\naction_environment = 'host:e2e'\n")?;
+        let preserved = "build --remote_executor=grpcs://127.0.0.1:1234\nbuild --remote_default_exec_properties=ISA=x86-64\ncommon --repo_env=OTHER=value\n";
+        fs::write(
+            &rc,
+            format!(
+                "{preserved}build --remote_default_exec_properties=gang_action_environment=identity-roots-v1\ncommon --repo_env=\"GANG_ACTION_ENVIRONMENT=host:stale\"\n"
+            ),
+        )?;
+        configure_upgrade_client(&config, &rc)?;
+        let rendered = fs::read_to_string(&rc)?;
+        assert_eq!(
+            rendered,
+            format!(
+                "{preserved}common --repo_env=GANG_ACTION_ENVIRONMENT=host:e2e\nbuild --remote_default_exec_properties=gang_action_environment=host:e2e\n"
+            )
+        );
+        fs::write(&config, "[[fleets]]\naction_environment = 'invalid'\n")?;
+        assert!(configure_upgrade_client(&config, &rc).is_err());
+        assert_eq!(fs::read_to_string(&rc)?, rendered);
+        Ok(())
+    }
+
+    #[test]
     fn failed_action_and_long_gap_fail_normal_verdict() {
         let outcome = BuildOutcome::new(Some(0), "INFO: 8 processes: 8 remote.".to_owned());
         let mut evidence = BuildEvidence {
@@ -1819,9 +1940,9 @@ mod tests {
         ));
     }
 
-    fn verdict_attempts() -> (Attempts, Attempts) {
+    fn verdict_attempts() -> (InFlight, Attempts, Attempts) {
         let mut initial_attempts = Attempts::new();
-        for (index, probe) in PROBES.iter().enumerate() {
+        for (index, probe) in PROBES.iter().take(2).enumerate() {
             let pid = index + 100;
             let action = probe.as_str();
             record_attempt(
@@ -1830,8 +1951,22 @@ mod tests {
                 &mut initial_attempts,
             )
             .expect("start");
+        }
+        let in_flight = capture_in_flight(&initial_attempts);
+        for (index, probe) in PROBES.iter().enumerate() {
+            let pid = index + 100;
+            let action = probe.as_str();
+            let worker = if index < 2 { 42 } else { 43 };
+            if index >= 2 {
+                record_attempt(
+                    &format!("run loss start {action} {worker} {pid} 10 exclusive"),
+                    "run",
+                    &mut initial_attempts,
+                )
+                .expect("start");
+            }
             record_attempt(
-                &format!("run loss end {action} 42 {pid} 20"),
+                &format!("run loss end {action} {worker} {pid} 20"),
                 "run",
                 &mut initial_attempts,
             )
@@ -1840,18 +1975,61 @@ mod tests {
         let mut post_attempts = Attempts::new();
         let action = Probe::ControllerLoss0.as_str();
         record_attempt(
-            &format!("post loss start {action} 42 200 30 exclusive"),
+            &format!("post loss start {action} 43 200 30 exclusive"),
             "post",
             &mut post_attempts,
         )
         .expect("start");
         record_attempt(
-            &format!("post loss end {action} 42 200 40"),
+            &format!("post loss end {action} 43 200 40"),
             "post",
             &mut post_attempts,
         )
         .expect("end");
-        (initial_attempts, post_attempts)
+        (in_flight, initial_attempts, post_attempts)
+    }
+
+    #[test]
+    fn frozen_attempts_must_finish_unchanged_without_reexecution() {
+        let (frozen, mut initial, post) = verdict_attempts();
+        assert_eq!(frozen.len(), 2);
+        assert!(uninterrupted(&frozen, &initial));
+        assert!(exact_attempts(&initial, PROBES.len()));
+        assert!(exact_attempts(&post, 1));
+        assert!(!uninterrupted(&InFlight::new(), &initial));
+
+        let key = frozen.keys().next().expect("frozen attempt").clone();
+        let attempt = initial.get_mut(&key).expect("initial attempt");
+        attempt.worker += 1;
+        assert!(!uninterrupted(&frozen, &initial));
+        let attempt = initial.get_mut(&key).expect("initial attempt");
+        attempt.worker -= 1;
+        attempt.start += 1;
+        assert!(!uninterrupted(&frozen, &initial));
+        let attempt = initial.get_mut(&key).expect("initial attempt");
+        attempt.start -= 1;
+        let end = attempt.end.take();
+        assert!(!uninterrupted(&frozen, &initial));
+        initial.get_mut(&key).expect("initial attempt").end = end;
+        let removed = initial.remove(&key).expect("initial attempt");
+        assert!(!uninterrupted(&frozen, &initial));
+        initial.insert(key.clone(), removed);
+        assert!(uninterrupted(&frozen, &initial));
+
+        record_attempt(
+            &format!("run loss start {} 43 999 30 exclusive", key.0),
+            "run",
+            &mut initial,
+        )
+        .expect("reexecution start");
+        record_attempt(
+            &format!("run loss end {} 43 999 40", key.0),
+            "run",
+            &mut initial,
+        )
+        .expect("reexecution end");
+        assert!(uninterrupted(&frozen, &initial));
+        assert!(!exact_attempts(&initial, PROBES.len()));
     }
 
     #[test]
@@ -1872,13 +2050,14 @@ mod tests {
             rpc_calls: 1,
             ..BuildEvidence::default()
         };
-        let (initial_attempts, post_attempts) = verdict_attempts();
+        let (in_flight, initial_attempts, post_attempts) = verdict_attempts();
         let availability = Availability::default();
         let drain = DrainWitness::default();
         let mut input = VerdictInputs {
             initial_outcome: &initial_outcome,
             initial_evidence: &initial_evidence,
             initial_attempts: &initial_attempts,
+            in_flight: &in_flight,
             post_outcome: &post_outcome,
             post_evidence: &post_evidence,
             post_attempts: &post_attempts,
@@ -1920,6 +2099,27 @@ mod tests {
         input.drain = &drain;
         input.procedure = UpgradeProcedure::PreStop;
         assert!(final_verdict(&input).iter().all(Check::is_passed));
+        let empty = InFlight::new();
+        input.in_flight = &empty;
+        assert!(final_verdict(&input).iter().any(Check::is_failure));
+        input.in_flight = &in_flight;
+        let (_, mut reexecuted, _) = verdict_attempts();
+        let action = PROBES[0].as_str();
+        record_attempt(
+            &format!("run loss start {action} 43 999 30 exclusive"),
+            "run",
+            &mut reexecuted,
+        )
+        .expect("reexecution start");
+        record_attempt(
+            &format!("run loss end {action} 43 999 40"),
+            "run",
+            &mut reexecuted,
+        )
+        .expect("reexecution end");
+        input.initial_attempts = &reexecuted;
+        assert!(final_verdict(&input).iter().any(Check::is_failure));
+        input.initial_attempts = &initial_attempts;
         for count in [0, 1, 3] {
             input.cold_mints = count;
             assert!(final_verdict(&input).iter().any(Check::is_failure));

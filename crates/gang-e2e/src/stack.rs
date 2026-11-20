@@ -89,9 +89,66 @@ fn failure_evidence(placement: &Placement, limit: usize) -> String {
 fn signal_in(directory: &Path) -> Result<(PathBuf, crate::hold::Signal)> {
     gang_os::fs::ensure_private_dir(directory)
         .map_err(E2eError::system_from("creating the signal directory"))?;
+    for name in ["attempts", "go", "churn"] {
+        let path = directory.join(name);
+        fs::write(&path, b"").map_err(E2eError::io(format!("creating {}", path.display())))?;
+    }
     let path = directory.join("started");
     let signal = crate::hold::Signal::create(&path)?;
     Ok((path, signal))
+}
+
+fn sample_parameters(
+    invocation: &DeploymentInputs,
+    variant: &Variant,
+    salt: &str,
+    signal_path: &Path,
+    isa: gang_types::Isa,
+    large_memory_kb: u64,
+) -> SampleParameters {
+    SampleParameters {
+        salt: salt.to_owned(),
+        action_path: if variant.sandbox == Sandbox::Bwrap {
+            "/bin:/usr/bin".to_owned()
+        } else {
+            invocation.action_tools.path.clone()
+        },
+        action_shell: if variant.sandbox == Sandbox::Bwrap {
+            PathBuf::from("/bin/bash")
+        } else {
+            invocation.action_tools.shell.clone()
+        },
+        action_ipc: variant.sandbox == Sandbox::Bwrap,
+        host_action_path: invocation.action_tools.path.clone(),
+        host_action_shell: invocation.action_tools.shell.clone(),
+        signal: signal_path.to_path_buf(),
+        attempts: crate::flags::attempts_path(signal_path),
+        isa,
+        memory_kb: HOLD_MEMORY_KB,
+        cpu_count: HOLD_CPU_COUNT,
+        large_fleet: LARGE_FLEET.to_owned(),
+        large_memory_kb,
+        requested_sandbox: Sandbox::Noop,
+        glibc_tool: invocation.action_tools.glibc_tool.clone(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn start_action_ipc(
+    placement: &Placement,
+    sandbox: Sandbox,
+    signal_dir: &Path,
+    salt: &str,
+) -> Result<Option<Arc<crate::action_ipc::ActionIpc>>> {
+    if sandbox != Sandbox::Bwrap {
+        return Ok(None);
+    }
+    let instances = placement.state_dir().join("instances");
+    gang_os::fs::ensure_private_dir(&instances)
+        .map_err(E2eError::system_from("creating instance directory"))?;
+    Ok(Some(Arc::new(crate::action_ipc::ActionIpc::start(
+        &instances, signal_dir, salt,
+    )?)))
 }
 
 fn prepare_admin_directories(placement: &Placement, transport: Transport) -> Result<()> {
@@ -170,6 +227,8 @@ pub struct Stack<'a> {
     signal_path: PathBuf,
     /// The harness's end of the pipe at `signal_path`, which the hold action signals through.
     signal: crate::hold::Signal,
+    #[cfg(target_os = "linux")]
+    action_ipc: Option<Arc<crate::action_ipc::ActionIpc>>,
     /// The launch gate path and its held writer, when enabled for this scenario.
     launch_gate: Option<(PathBuf, Mutex<Option<fs::File>>)>,
     salt: String,
@@ -195,6 +254,8 @@ pub struct Stack<'a> {
 pub(crate) struct AdditionalBuild {
     driver: Bazel,
     remote: Remote,
+    #[cfg(target_os = "linux")]
+    action_ipc: Option<Arc<crate::action_ipc::ActionIpc>>,
 }
 
 impl AdditionalBuild {
@@ -204,9 +265,17 @@ impl AdditionalBuild {
         run: &Run,
         stop: oneshot::Receiver<String>,
     ) -> Result<BuildOutcome> {
+        #[cfg(target_os = "linux")]
+        if let Some(ipc) = &self.action_ipc {
+            ipc.check()?;
+        }
         let result = self
             .driver
             .build_until(&self.remote, probes, Some(run), stop);
+        #[cfg(target_os = "linux")]
+        if let Some(ipc) = &self.action_ipc {
+            ipc.check()?;
+        }
         // A failed or cancelled build can leave its server wedged.
         if result.is_ok() {
             self.driver.shutdown(&self.remote);
@@ -251,6 +320,8 @@ impl<'a> Stack<'a> {
         let salt = sample::salt()?;
         let signal_dir = placement.root().join(format!("signal-{salt}"));
         let (signal_path, signal) = signal_in(&signal_dir)?;
+        #[cfg(target_os = "linux")]
+        let action_ipc = start_action_ipc(&placement, variant.sandbox, &signal_dir, &salt)?;
 
         let gate_path = variant
             .control
@@ -259,7 +330,6 @@ impl<'a> Stack<'a> {
         let template = ConfigTemplate::parse(&invocation.base_config)?
             .place(&placement, transport)?
             .vary(variant, &settings.worker_launcher, &invocation.action_tools)?
-            .with_signal_dir(&signal_dir)?
             .with_launch_gate(gate_path.as_deref(), settings.history_timeout)?;
         let launch_gate = gate_path.map(|path| (path, Mutex::new(None)));
         let (template, ca_pin, signer_key) = match transport {
@@ -277,29 +347,26 @@ impl<'a> Stack<'a> {
         };
 
         let isa = template.default_isa()?;
-        let tmp_path = template.tmp_path()?;
+        let tmp_path = PathBuf::from("/tmp");
         let large_memory_kb = template.large_memory_kb()?;
         let rendered = template.render()?;
         let config_file = placement.config_file();
         fs::write(&config_file, rendered)
             .map_err(E2eError::io(format!("writing {}", config_file.display())))?;
 
-        let parameters = SampleParameters {
-            salt: salt.clone(),
-            action_path: invocation.action_tools.path.clone(),
-            signal: signal_path.clone(),
-            attempts: crate::flags::attempts_path(&signal_path),
+        let parameters = sample_parameters(
+            invocation,
+            variant,
+            &salt,
+            &signal_path,
             isa,
-            memory_kb: HOLD_MEMORY_KB,
-            cpu_count: HOLD_CPU_COUNT,
-            large_fleet: LARGE_FLEET.to_owned(),
             large_memory_kb,
-            requested_sandbox: Sandbox::Noop,
-            glibc_tool: invocation.action_tools.glibc_tool.clone(),
-        };
+        );
         sample::stage(&invocation.sample, &placement.workspace(), &parameters)?;
 
         prepare_admin_directories(&placement, transport)?;
+        let mut bazel_tools = invocation.action_tools.clone();
+        bazel_tools.shell.clone_from(&parameters.action_shell);
 
         Ok(Self {
             cli: GangCli::new(
@@ -310,7 +377,7 @@ impl<'a> Stack<'a> {
             bazel: Bazel::new(
                 invocation.bazel.clone(),
                 settings.clone(),
-                invocation.action_tools.clone(),
+                bazel_tools,
                 placement.workspace(),
                 placement.bazel_root(),
             ),
@@ -322,6 +389,8 @@ impl<'a> Stack<'a> {
             tmp_path,
             signal_path,
             signal,
+            #[cfg(target_os = "linux")]
+            action_ipc,
             launch_gate,
             salt,
             issuer,
@@ -733,7 +802,58 @@ impl<'a> Stack<'a> {
             driver: self
                 .bazel
                 .with_output_user_root(self.placement.root().join(output_root)),
+            #[cfg(target_os = "linux")]
+            action_ipc: self.action_ipc.clone(),
         })
+    }
+
+    /// Runs the rootfs test and requires its uncached remote test result in the BEP.
+    pub(crate) fn rootfs_test(&self) -> Result<Check> {
+        let bep = self.placement.root().join("rootfs-test.bep");
+        let outcome = self.bazel.rootfs_test(&self.remote()?, &bep)?;
+        #[cfg(target_os = "linux")]
+        if let Some(ipc) = &self.action_ipc {
+            ipc.check()?;
+        }
+        let events = fs::read_to_string(&bep).map_err(E2eError::io("reading rootfs test BEP"))?;
+        let mut passed_remote = false;
+        for line in events.lines() {
+            let event: serde_json::Value = serde_json::from_str(line)
+                .map_err(E2eError::system_from("decoding rootfs test BEP"))?;
+            if event
+                .pointer("/id/testResult/label")
+                .and_then(serde_json::Value::as_str)
+                == Some("//:rootfs_sh_test")
+                && event
+                    .pointer("/testResult/status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("PASSED")
+                && event
+                    .pointer("/testResult/executionInfo/strategy")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("remote")
+                && event
+                    .pointer("/testResult/cachedLocally")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+                && event
+                    .pointer("/testResult/executionInfo/cachedRemotely")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+            {
+                passed_remote = true;
+            }
+        }
+        Ok(Check::expect(
+            "rootfs Bazel test executes remotely",
+            outcome.succeeded() && outcome.processes.remote() > 0 && passed_remote,
+            || {
+                format!(
+                    "rootfs test lacked an uncached remote passing BEP result: {}",
+                    outcome.exit_summary()
+                )
+            },
+        ))
     }
 
     /// Builds `probes` through `remote`, as `run` when there is one, returning how the build ended.
@@ -762,6 +882,10 @@ impl<'a> Stack<'a> {
         cancel: &Cancel,
         stop: oneshot::Receiver<String>,
     ) -> Result<BuildOutcome> {
+        #[cfg(target_os = "linux")]
+        if let Some(ipc) = &self.action_ipc {
+            ipc.check()?;
+        }
         let mut follower = match self.transport {
             Transport::Tls => self
                 .administrator()?
@@ -772,7 +896,7 @@ impl<'a> Stack<'a> {
         };
         let baseline = follower.newest_seq();
         let watcher_stop = Notify::new();
-        std::thread::scope(|scope| {
+        let result = std::thread::scope(|scope| {
             let watcher = scope.spawn(|| {
                 if let Ok(Some(events)) = follower.wait_for_or_stop(
                     |events| early_exit(events, baseline).is_some(),
@@ -788,7 +912,12 @@ impl<'a> Stack<'a> {
             // The follower is an accelerator, not a verdict, even if its thread fails.
             let _ = watcher.join();
             result
-        })
+        });
+        #[cfg(target_os = "linux")]
+        if let Some(ipc) = &self.action_ipc {
+            ipc.check()?;
+        }
+        result
     }
 
     /// Runs a named build with caller-owned cancellation.
@@ -1357,7 +1486,7 @@ impl Limits for Stack<'_> {
         let mut file = std::fs::File::from(fd);
         write!(file, "{high_bytes}").map_err(E2eError::io("lowering memory.high"))?;
         let churn = self.signal_path.with_file_name("churn");
-        if let Err(error) = fs::write(&churn, "") {
+        if let Err(error) = fs::write(&churn, b"1") {
             fs::write(&high, &original).map_err(E2eError::io("restoring memory.high"))?;
             return Err(E2eError::io(format!("creating {}", churn.display()))(error));
         }
@@ -1375,7 +1504,7 @@ impl Limits for Stack<'_> {
         })();
         let restored = fs::write(&high, original).map_err(E2eError::io("restoring memory.high"));
         let removed =
-            fs::remove_file(&churn).map_err(E2eError::io(format!("removing {}", churn.display())));
+            fs::write(&churn, b"").map_err(E2eError::io(format!("clearing {}", churn.display())));
         restored?;
         removed?;
         let victim_exited = victim_killed?;
@@ -1476,6 +1605,16 @@ impl Drop for Stack<'_> {
         }
         if let Ok(remote) = self.remote() {
             self.bazel.shutdown(&remote);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(ipc) = self.action_ipc.take()
+            && let Ok(ipc) = Arc::try_unwrap(ipc)
+            && let Err(error) = ipc.finish()
+        {
+            eprintln!(
+                "action IPC cleanup for {}: {error}",
+                self.config_file.display()
+            );
         }
     }
 }

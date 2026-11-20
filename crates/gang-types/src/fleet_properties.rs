@@ -2,7 +2,7 @@
 
 use std::fmt::Display;
 
-use crate::{FleetName, Isa, Resources, property};
+use crate::{ActionEnvironment, FleetName, Isa, Resources, property};
 
 /// How a request value matches a fleet's value for one key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,17 +41,19 @@ pub struct FleetProperties {
 impl FleetProperties {
     const FLEET_POSITION: usize = 0;
     const SANDBOX_POSITION: usize = 2;
-    const FIXED_ENTRY_COUNT: usize = 7;
+    const ENVIRONMENT_POSITION: usize = 3;
+    const FIXED_ENTRY_COUNT: usize = 8;
 
     /// Creates a fleet's properties.
     ///
-    /// The entries are the fleet, ISA, sandbox, `cpu_count`, `cpu_millicores`, `memory_kb`
-    /// and `disk_kb`; the resource entries are minimums, with memory and disk in KiB.
-    /// Provisioner options follow as exact entries.
+    /// The entries are the fleet, ISA, sandbox, action environment, `cpu_count`,
+    /// `cpu_millicores`, `memory_kb` and `disk_kb`; resource entries are minimums,
+    /// with memory and disk in KiB. Provisioner options follow as exact entries.
     pub fn new(
         name: &FleetName,
         isa: Isa,
         sandbox: &impl Display,
+        environment: &ActionEnvironment,
         instance: Resources,
         options: impl IntoIterator<Item = (&'static str, String)>,
     ) -> Self {
@@ -69,6 +71,11 @@ impl FleetProperties {
             Entry {
                 key: property::SANDBOX,
                 value: sandbox.to_string(),
+                rule: Rule::Exact,
+            },
+            Entry {
+                key: property::ACTION_ENVIRONMENT,
+                value: environment.to_string(),
                 rule: Rule::Exact,
             },
             minimum(property::CPU_COUNT, u64::from(instance.vcpus)),
@@ -92,6 +99,11 @@ impl FleetProperties {
     #[must_use]
     pub fn sandbox(&self) -> &str {
         self.entries[Self::SANDBOX_POSITION].value.as_str()
+    }
+
+    /// Replaces the launch identity with the actual local sandbox identity.
+    pub fn set_action_environment(&mut self, environment: &ActionEnvironment) {
+        self.entries[Self::ENVIRONMENT_POSITION].value = environment.to_string();
     }
 
     /// The fleet's name.
@@ -177,6 +189,7 @@ mod tests {
             &name,
             Isa::X86_64,
             &"bwrap",
+            &"host:test".parse().unwrap(),
             Resources {
                 vcpus: 15,
                 memory: Bytes::new(29 << 30),
@@ -216,6 +229,7 @@ mod tests {
             &name,
             Isa::X86_64,
             &"bwrap",
+            &"host:test".parse().unwrap(),
             instance,
             [("capacity", "spot".to_owned()), ("zone", "west".to_owned())],
         );
@@ -224,7 +238,14 @@ mod tests {
             [("capacity", "spot"), ("zone", "west")]
         );
 
-        let without_options = FleetProperties::new(&name, Isa::X86_64, &"bwrap", instance, []);
+        let without_options = FleetProperties::new(
+            &name,
+            Isa::X86_64,
+            &"bwrap",
+            &"host:test".parse().unwrap(),
+            instance,
+            [],
+        );
         assert_eq!(without_options.options().count(), 0);
     }
 
@@ -238,6 +259,7 @@ mod tests {
                 ("fleet", "gang-x86"),
                 ("ISA", "x86-64"),
                 ("sandbox", "bwrap"),
+                ("gang_action_environment", "host:test"),
                 ("cpu_count", "15"),
                 ("cpu_millicores", "15000"),
                 ("memory_kb", "30408704"),
@@ -264,6 +286,7 @@ mod tests {
                 ("fleet", MatchKind::Exact),
                 ("ISA", MatchKind::Exact),
                 ("sandbox", MatchKind::Exact),
+                ("gang_action_environment", MatchKind::Exact),
                 ("cpu_count", MatchKind::Minimum),
                 ("cpu_millicores", MatchKind::Minimum),
                 ("memory_kb", MatchKind::Minimum),
@@ -282,12 +305,30 @@ mod tests {
                 ("fleet", "gang-x86", Rule::Exact),
                 ("ISA", "x86-64", Rule::Exact),
                 ("sandbox", "bwrap", Rule::Exact),
+                ("gang_action_environment", "host:test", Rule::Exact),
                 ("cpu_count", "15", Rule::Minimum(15)),
                 ("cpu_millicores", "15000", Rule::Minimum(15000)),
                 ("memory_kb", "30408704", Rule::Minimum(30_408_704)),
                 ("disk_kb", "104857600", Rule::Minimum(104_857_600)),
                 ("capacity", "spot", Rule::Exact),
             ]
+        );
+    }
+
+    #[test]
+    fn worker_identity_replaces_launch_identity() {
+        let mut properties = gang_x86();
+        properties.set_action_environment(&"host:actual".parse().unwrap());
+        assert_eq!(
+            properties.get(property::ACTION_ENVIRONMENT),
+            Some("host:actual")
+        );
+        assert_eq!(
+            properties
+                .worker_properties()
+                .filter(|(key, _)| *key == property::ACTION_ENVIRONMENT)
+                .count(),
+            1
         );
     }
 

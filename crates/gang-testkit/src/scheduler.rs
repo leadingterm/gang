@@ -1159,6 +1159,7 @@ mod tests {
                     &name,
                     Isa::Aarch64,
                     &"noop",
+                    &"host:test".parse()?,
                     Resources {
                         vcpus: 1,
                         memory: Bytes::new(GIB),
@@ -1245,6 +1246,7 @@ mod tests {
             Ok(WorkerState {
                 id: crate::worker_id(name)?,
                 fleet: FleetName::try_new("example-fleet")?,
+                environment: Some("host:test".parse()?),
                 running_actions: 1,
                 max_inflight_actions: None,
                 draining: false,
@@ -1254,6 +1256,7 @@ mod tests {
         };
         let queued = QueuedDemand {
             candidates: FleetSet::prefix(1)?,
+            environment: "host:test".parse()?,
             resources: ActionResources::default(),
             queued_since: Timestamp::UNIX_EPOCH,
             priority: 0,

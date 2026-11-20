@@ -13,7 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use gang_config::Document;
-use gang_main::plugins::{Plugins, SandboxKey};
+use gang_main::plugins::Plugins;
 use gang_os::ProcessGroup;
 use gang_types::Url;
 
@@ -26,10 +26,11 @@ use crate::mirror::follow;
 use crate::observer::{tail, worker_logs};
 use crate::placement::Placement;
 use crate::process;
-use crate::settings::DeploymentInputs;
+use crate::settings::{ActionTools, DeploymentInputs};
 use crate::sse::{self, EventStream as _};
 use crate::state_api::StateApi;
 use crate::system::Sandbox;
+use crate::template::prepare_sandbox;
 
 /// How a command run by [`run_until`] finished.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,6 +181,7 @@ pub(crate) struct LocalTerminal {
     placement: Placement,
     pinned: PathBuf,
     insecure: PathBuf,
+    action_environment: gang_types::ActionEnvironment,
     unparsable: PathBuf,
     public_listen: PathBuf,
     deadline: Duration,
@@ -211,12 +213,16 @@ impl LocalTerminal {
         let pinned_text = retarget(parse()?, &placement)?
             .to_toml()
             .map_err(E2eError::system_from("rendering the pinned configuration"))?;
-        let bwrap = if Sandbox::native() == Sandbox::Bwrap {
-            Some(invocation.action_tools.bwrap_program()?)
-        } else {
-            None
-        };
-        let insecure_text = kept_worker(&pinned_text, bwrap)?;
+        let insecure_text = kept_worker(&pinned_text, &invocation.action_tools)?;
+        let insecure_document = Document::<Plugins>::parse(&insecure_text)
+            .map_err(E2eError::parse("the insecure configuration"))?;
+        let action_environment = insecure_document
+            .fleets
+            .iter()
+            .find(|fleet| fleet.isa == insecure_document.default_isa)
+            .ok_or_else(|| E2eError::system("the insecure configuration has no default ISA fleet"))?
+            .action_environment
+            .clone();
         let mut open = retarget(parse()?, &placement)?;
         open.listen = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
         let public_text = open.to_toml().map_err(E2eError::system_from(
@@ -235,6 +241,7 @@ impl LocalTerminal {
             placement,
             pinned,
             insecure,
+            action_environment,
             unparsable,
             public_listen,
             deadline: invocation.settings.history_timeout,
@@ -269,24 +276,15 @@ impl LocalTerminal {
 }
 
 /// `text` with its first fleet keeping one worker under the native sandbox.
-fn kept_worker(text: &str, bwrap: Option<&Path>) -> Result<String> {
+fn kept_worker(text: &str, tools: &ActionTools) -> Result<String> {
     let mut document =
         Document::<Plugins>::parse(text).map_err(E2eError::parse("the pinned configuration"))?;
+    prepare_sandbox(&mut document, Sandbox::native(), tools)?;
     let first = document
         .fleets
         .first_mut()
         .ok_or_else(|| E2eError::system("the pinned configuration has no [[fleets]] entry"))?;
     first.min_instances = 1;
-    first.sandbox = match Sandbox::native() {
-        Sandbox::Bwrap => SandboxKey::Bwrap,
-        Sandbox::Noop => SandboxKey::Noop,
-    };
-    if let Some(program) = bwrap {
-        let sandbox = document.sandbox.bwrap.as_mut().ok_or_else(|| {
-            E2eError::system("the pinned configuration has no [sandbox.bwrap] section")
-        })?;
-        sandbox.program = program.to_path_buf();
-    }
     document.to_toml().map_err(E2eError::system_from(
         "rendering the insecure configuration",
     ))
@@ -367,6 +365,14 @@ impl Terminal for LocalTerminal {
                     .arg(bazel)
                     .arg("--")
                     .arg(format!("--remote_executor={executor}"))
+                    .arg(format!(
+                        "--repo_env=GANG_ACTION_ENVIRONMENT={}",
+                        self.action_environment
+                    ))
+                    .arg(format!(
+                        "--remote_default_exec_properties=gang_action_environment={}",
+                        self.action_environment
+                    ))
                     .env(FAKE_BAZEL_ENV, "1");
             }
             Call::Worker {
@@ -452,7 +458,48 @@ mod tests {
 
     use crate::process::ProcessEntry;
 
-    use super::worker_commands_for;
+    use super::{ActionTools, Document, Plugins, Sandbox, kept_worker, worker_commands_for};
+
+    #[test]
+    fn kept_worker_pins_environment_without_restoring_endpoints() {
+        let config = std::env::var("GANG_E2E_BASE_CONFIG").expect("base config runfile");
+        let text = std::fs::read_to_string(config).expect("base config");
+        let mut document = Document::<Plugins>::parse(&text).expect("base config parses");
+        document.endpoint = None;
+        document.worker_endpoint = None;
+        let dir = tempfile::tempdir().expect("rootfs envelope");
+        let identity = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        std::fs::write(dir.path().join("identity"), identity).expect("rootfs identity");
+        let tools = ActionTools {
+            shell: "/bin/bash".into(),
+            path: "/bin".to_owned(),
+            bwrap: Some("/bin/bwrap".into()),
+            glibc_tool: None,
+            action_rootfs: Some(dir.path().to_path_buf()),
+        };
+        let rendered = kept_worker(&document.to_toml().expect("config renders"), &tools)
+            .expect("worker configuration");
+        let actual = Document::<Plugins>::parse(&rendered).expect("worker config parses");
+        assert!(actual.endpoint.is_none());
+        assert!(actual.worker_endpoint.is_none());
+        assert_eq!(actual.fleets[0].min_instances, 1);
+        match Sandbox::native() {
+            Sandbox::Bwrap => {
+                assert_eq!(actual.fleets[0].action_environment.as_str(), identity);
+                assert_eq!(
+                    actual.sandbox.bwrap.expect("bwrap").root.as_path(),
+                    std::fs::canonicalize(dir.path()).expect("canonical rootfs")
+                );
+            }
+            Sandbox::Noop => {
+                assert_eq!(actual.fleets[0].action_environment.as_str(), "host:e2e");
+                assert_eq!(
+                    actual.sandbox.noop.expect("noop").environment.as_str(),
+                    "host:e2e"
+                );
+            }
+        }
+    }
 
     #[test]
     fn worker_commands_require_the_exact_generated_config_path() {

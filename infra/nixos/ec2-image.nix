@@ -76,7 +76,8 @@ in {
     mkdir -p $out/nix-support
     jq -n --arg label ${lib.escapeShellArg config.system.nixos.version} --arg system ${pkgs.stdenv.hostPlatform.system} \
       --arg logical_bytes "$(stat -c %s $file)" --arg file "$file" \
-      '{label: $label, boot_mode: "uefi", system: $system, logical_bytes: $logical_bytes, file: $file, disks: {root: {logical_bytes: $logical_bytes, file: $file}}}' \
+      --arg action_environment "$(cat ${config.environment.etc."gang/action-rootfs".source}/identity)" \
+      '{label: $label, boot_mode: "uefi", system: $system, action_environment: $action_environment, logical_bytes: $logical_bytes, file: $file, disks: {root: {logical_bytes: $logical_bytes, file: $file}}}' \
       >$out/nix-support/image-info.json
     ln -s $file $out/
   '';

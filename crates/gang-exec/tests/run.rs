@@ -72,9 +72,12 @@ fn sandbox_file(
         selected: SandboxKey::Noop,
         sandbox: SandboxConfig {
             noop: Some(Opaque(
-                [(String::from("marker"), marker.to_owned().into())]
-                    .into_iter()
-                    .collect(),
+                [
+                    (String::from("marker"), marker.to_owned().into()),
+                    (String::from("environment"), "host:test".into()),
+                ]
+                .into_iter()
+                .collect(),
             )),
             ..SandboxConfig::default()
         },
@@ -186,18 +189,28 @@ fn run_action_counting(
         &invocation,
         |_key, sandbox, _context| {
             calls.sandbox_builds.fetch_add(1, Ordering::SeqCst);
-            let marker = sandbox
+            let section = sandbox
                 .noop
-                .and_then(|section| {
-                    section
-                        .0
-                        .get("marker")
-                        .and_then(|value| value.as_str())
-                        .map(str::to_owned)
-                })
-                .unwrap_or_default();
-            let sandbox =
-                ScriptedSandbox::exiting(&CallLog::default(), ActionExecutionOutcome::Exited(0));
+                .ok_or_else(|| PortError::backend("missing sandbox"))?;
+            let marker = section
+                .0
+                .get("marker")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            let environment = section
+                .0
+                .get("environment")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| PortError::backend("missing sandbox environment"))?
+                .parse()
+                .map_err(PortError::backend)?;
+            let sandbox = ScriptedSandbox::try_exiting(
+                &CallLog::default(),
+                ActionExecutionOutcome::Exited(0),
+            )
+            .map_err(PortError::backend)?
+            .with_environment(environment);
             started.lock().push((marker, sandbox.clone()));
             Ok(sandbox)
         },
@@ -527,10 +540,8 @@ fn oom_report_preserves_nonzero_action_status() -> Result<(), Box<dyn Error>> {
     let status = run_with::<TestPlugins, ScriptedSandbox, RecordingLimits>(
         &invocation,
         |_, _, _| {
-            Ok(ScriptedSandbox::exiting(
-                &CallLog::default(),
-                ActionExecutionOutcome::Signaled(9),
-            ))
+            ScriptedSandbox::try_exiting(&CallLog::default(), ActionExecutionOutcome::Signaled(9))
+                .map_err(PortError::backend)
         },
         |_, _| Ok(RecordingLimits::new(&CallLog::default()).with_oom_kills(1)),
         || Ok(()),
@@ -624,9 +635,13 @@ impl ActionLimitsPort for LimitsWithCgroup {
     }
 }
 
-struct MetadataCheckingSandbox(PathBuf);
+struct MetadataCheckingSandbox(PathBuf, gang_types::ActionEnvironment);
 
 impl ActionIsolationPort for MetadataCheckingSandbox {
+    fn environment(&self) -> &gang_types::ActionEnvironment {
+        &self.1
+    }
+
     async fn start(&self, _: &ActionExecutionSpec<'_>) -> Result<SandboxedAction, PortError> {
         let metadata = fs::read(&self.0).map_err(PortError::backend)?;
         if metadata != b"/sys/fs/cgroup/actions/123-456-7" {
@@ -670,7 +685,12 @@ fn publishes_scope_metadata_before_start_with_aliased_work_root() -> Result<(), 
     let metadata = path.with_file_name("report.cgroup");
     let status = run_with::<TestPlugins, MetadataCheckingSandbox, LimitsWithCgroup>(
         &invocation,
-        |_, _, _| Ok(MetadataCheckingSandbox(metadata.clone())),
+        |_, _, _| {
+            Ok(MetadataCheckingSandbox(
+                metadata.clone(),
+                "host:test".parse().map_err(PortError::config)?,
+            ))
+        },
         |_, _| Ok(LimitsWithCgroup(RecordingLimits::new(&CallLog::default()))),
         || Ok(()),
     )?;

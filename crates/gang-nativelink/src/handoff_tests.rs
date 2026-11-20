@@ -288,6 +288,7 @@ async fn public_listener_serves_execution_and_waits_for_worker_stream() -> gang_
             &FleetName::try_new("test").expect("valid fleet name"),
             Isa::X86_64,
             &"docker",
+            &"host:test".parse().expect("valid environment"),
             Resources {
                 vcpus: 4,
                 memory: Bytes::new(8 << 30),
@@ -455,6 +456,7 @@ async fn run_held_controller(
         &FleetName::try_new("test").expect("valid fleet name"),
         Isa::X86_64,
         &"docker",
+        &"host:test".parse().expect("valid environment"),
         Resources {
             vcpus: 4,
             memory: Bytes::new(8 << 30),

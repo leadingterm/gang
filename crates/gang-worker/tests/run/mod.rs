@@ -39,6 +39,7 @@ async fn spawn_run(
         harness.parts(tls),
         settings,
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     ));
     harness.settle().await;
@@ -53,6 +54,7 @@ async fn plain_mode_records_the_identity_fleet_and_layout() {
         harness.parts(false),
         harness.settings(),
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     )
     .await;
@@ -64,6 +66,10 @@ async fn plain_mode_records_the_identity_fleet_and_layout() {
     assert_eq!(spec.properties.get(property::FLEET), Some("example-fleet"));
     assert_eq!(spec.properties.get(property::ISA), Some("x86-64"));
     assert_eq!(spec.properties.get(property::SANDBOX), Some("noop"));
+    assert_eq!(
+        spec.properties.get(property::ACTION_ENVIRONMENT),
+        Some("host:test")
+    );
     assert_eq!(spec.properties.get(property::CPU_COUNT), Some("4"));
     assert_eq!(spec.properties.get(property::MEMORY_KB), Some("8388608"));
     assert_eq!(spec.slots.count().get(), 4);
@@ -93,6 +99,113 @@ async fn plain_mode_records_the_identity_fleet_and_layout() {
 }
 
 #[tokio::test]
+async fn wrong_image_is_rejected_before_enrollment_and_registration() {
+    let harness = Harness::new(Isa::X86_64, WorkerLifetime::LongLived);
+    let mut settings = harness.settings();
+    let fleet_name = FleetName::try_new("example-fleet").expect("valid fleet");
+    let fleet = settings.fleets.by_name(&fleet_name).expect("fleet exists");
+    let mut policy = fleet.policy.clone();
+    policy.action_environment = "1111111111111111111111111111111111111111111111111111111111111111"
+        .parse()
+        .expect("valid E1 identity");
+    settings.fleets = Fleets::try_new(vec![FleetMember {
+        policy,
+        sandbox: fleet.sandbox,
+        options: fleet.options.clone(),
+    }])
+    .expect("valid fleet");
+    let error = gang_worker::run(
+        harness.parts(true),
+        settings,
+        harness.build_limits(),
+        |_, _| {
+            Ok(
+                "2222222222222222222222222222222222222222222222222222222222222222"
+                    .parse()
+                    .expect("valid E2 identity"),
+            )
+        },
+        future::pending(),
+    )
+    .await
+    .expect_err("a different local environment cannot register");
+    assert!(matches!(error, WorkerError::EnvironmentMismatch { .. }));
+    assert_eq!(harness.enroller.enrollments().get(), 0);
+    assert!(harness.scheduler.specs().is_empty());
+}
+
+#[tokio::test]
+async fn selected_root_is_pinned_before_identity_and_serialization() {
+    use std::os::unix::fs::symlink;
+
+    let harness = Harness::new(Isa::X86_64, WorkerLifetime::LongLived);
+    harness.scheduler.set_behaviour(Behaviour::Finish);
+    harness
+        .provisioner
+        .set_identity(identity_of("example-boxed", Isa::X86_64));
+    let first = harness.volume.join("image-one");
+    let second = harness.volume.join("image-two");
+    let link = harness.volume.join("current-image");
+    fs::create_dir(&first).expect("first image");
+    fs::create_dir(&second).expect("second image");
+    fs::write(first.join("identity"), "host:test").expect("first identity");
+    fs::write(second.join("identity"), "host:other").expect("second identity");
+    symlink(&first, &link).expect("image link");
+    let expected = fs::canonicalize(&first).expect("canonical first image");
+    let mut settings = harness.settings();
+    settings.sandbox.boxed.as_mut().expect("boxed section").root =
+        Some(gang_types::AbsolutePathBuf::try_new(&link).expect("absolute link"));
+
+    gang_worker::run(
+        harness.parts(false),
+        settings,
+        harness.build_limits(),
+        |key, sandbox| {
+            assert_eq!(key, SandboxKey::Boxed);
+            let root = sandbox
+                .boxed
+                .as_ref()
+                .expect("boxed section")
+                .root
+                .as_ref()
+                .expect("root");
+            assert_eq!(root.as_path(), expected);
+            fs::remove_file(&link).expect("remove link");
+            symlink(&second, &link).expect("switch image link");
+            Ok(fs::read_to_string(root.join("identity"))
+                .expect("pinned identity")
+                .parse()
+                .expect("valid identity"))
+        },
+        future::pending(),
+    )
+    .await
+    .expect("worker registers");
+
+    let sandbox: SandboxFile<TestPlugins> =
+        fs::read_to_string(Layout::new(&harness.volume).sandbox_file())
+            .expect("sandbox file")
+            .parse()
+            .expect("valid sandbox file");
+    assert_eq!(
+        sandbox
+            .sandbox
+            .boxed
+            .expect("boxed section")
+            .root
+            .expect("root")
+            .as_path(),
+        expected
+    );
+    assert_eq!(
+        only_spec(&harness)
+            .properties
+            .get(property::ACTION_ENVIRONMENT),
+        Some("host:test")
+    );
+}
+
+#[tokio::test]
 async fn single_use_worker_takes_one_action_and_run_returns_ok() {
     let harness = Harness::new(Isa::X86_64, WorkerLifetime::SingleUse);
     harness.scheduler.set_behaviour(Behaviour::Finish);
@@ -100,6 +213,7 @@ async fn single_use_worker_takes_one_action_and_run_returns_ok() {
         harness.parts(false),
         harness.settings(),
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     )
     .await;
@@ -117,6 +231,7 @@ async fn limits_are_prepared_once_before_the_first_worker_starts() {
         harness.parts(false),
         harness.settings(),
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     )
     .await;
@@ -144,6 +259,7 @@ async fn memory_pool_and_actions_reach_the_scheduler() {
         harness.parts(false),
         settings,
         move |_| Ok(limits),
+        harness.build_sandbox(),
         future::pending(),
     )
     .await
@@ -168,6 +284,7 @@ async fn insufficient_memory_pool_fails_before_enrollment() {
         harness.parts(true),
         harness.settings(),
         move |_| Ok(limits),
+        harness.build_sandbox(),
         future::pending(),
     )
     .await
@@ -200,6 +317,7 @@ async fn no_limits_plugin_passes_no_pool() {
         harness.parts(false),
         settings,
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     )
     .await
@@ -216,6 +334,7 @@ async fn tls_mode_enrolls_with_the_proof_and_passes_the_credential_paths() {
         harness.parts(true),
         harness.settings(),
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     )
     .await;
@@ -267,6 +386,7 @@ async fn server_only_transport_passes_custom_ca_or_system_roots() {
             harness.server_only_parts(),
             harness.settings(),
             harness.build_limits(),
+            harness.build_sandbox(),
             future::pending(),
         )
         .await
@@ -295,6 +415,7 @@ async fn shutdown_stops_a_running_generation() {
         harness.parts(false),
         harness.settings(),
         harness.build_limits(),
+        harness.build_sandbox(),
         async {
             let _ = receive.await;
         },
@@ -473,6 +594,7 @@ async fn a_preemption_notice_inside_the_margin_returns_immediately_and_starts_no
             harness.parts(false),
             harness.settings(),
             harness.build_limits(),
+            harness.build_sandbox(),
             future::pending(),
         ))
         .await;
@@ -490,6 +612,7 @@ async fn shutdown_ends_the_run_with_ok() {
         harness.parts(false),
         harness.settings(),
         harness.build_limits(),
+        harness.build_sandbox(),
         future::ready(()),
     )
     .await;
@@ -573,6 +696,7 @@ async fn shutdown_while_parked_ends_the_run_without_enrolling() {
         harness.parts(true),
         harness.settings(),
         harness.build_limits(),
+        harness.build_sandbox(),
         async {
             let _ = stopped.await;
         },
@@ -596,6 +720,7 @@ async fn a_parked_server_only_node_fetches_no_server_ca_until_it_serves() {
         harness.server_only_parts(),
         harness.settings(),
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     ));
     harness.settle().await;
@@ -624,6 +749,7 @@ async fn shutdown_while_parked_ends_a_server_only_run_without_fetching_the_serve
         harness.server_only_parts(),
         harness.settings(),
         harness.build_limits(),
+        harness.build_sandbox(),
         async {
             let _ = stopped.await;
         },
@@ -652,6 +778,7 @@ async fn a_preemption_notice_at_unparking_ends_a_server_only_run_without_fetchin
             harness.server_only_parts(),
             harness.settings(),
             harness.build_limits(),
+            harness.build_sandbox(),
             future::pending(),
         ))
         .await;
@@ -671,6 +798,7 @@ async fn shutdown_during_the_server_ca_fetch_ends_the_run() {
         harness.server_only_parts(),
         harness.settings(),
         harness.build_limits(),
+        harness.build_sandbox(),
         async {
             let _ = stopped.await;
         },
@@ -693,6 +821,7 @@ async fn preemption_during_the_server_ca_fetch_ends_the_run() {
         harness.server_only_parts(),
         harness.settings(),
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     ));
     harness.settle().await;
@@ -720,6 +849,7 @@ async fn a_pinned_server_without_a_ca_fails_the_run_after_unparking() {
         harness.server_only_parts(),
         harness.settings(),
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     ));
     let polls = harness.provisioner.parked_calls();
@@ -756,6 +886,7 @@ async fn unknown_fleet_has_no_fleet() {
         harness.parts(false),
         harness.settings(),
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     )
     .await
@@ -773,6 +904,7 @@ async fn isa_mismatch_stops_before_anything_starts() {
         harness.parts(false),
         harness.settings(),
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     )
     .await
@@ -800,6 +932,7 @@ async fn a_scratch_volume_below_the_fleet_disk_stops_the_worker_before_it_enroll
         harness.parts(true),
         settings,
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     )
     .await
@@ -855,6 +988,7 @@ async fn stale_work_is_reclaimed_before_capacity_check() {
         harness.parts(true),
         settings,
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     )
     .await
@@ -919,6 +1053,7 @@ async fn read_only_stale_work_is_reclaimed_without_following_links() {
         harness.parts(false),
         harness.settings(),
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     )
     .await
@@ -968,6 +1103,7 @@ async fn sealed_stale_work_is_reclaimed_where_pinnable() {
         harness.parts(false),
         harness.settings(),
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     )
     .await;
@@ -1011,6 +1147,7 @@ async fn sandbox_file_selects_the_identity_fleets_sandbox() {
         harness.parts(false),
         harness.settings(),
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     )
     .await;
@@ -1034,6 +1171,7 @@ async fn scheduler_failure_is_reported_as_a_worker_stop() {
         harness.parts(false),
         harness.settings(),
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     )
     .await
@@ -1049,6 +1187,7 @@ async fn enroller_failure_is_reported_as_an_enroll_error() {
         harness.parts(true),
         harness.settings(),
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     )
     .await
@@ -1227,6 +1366,7 @@ async fn sandbox_file_names_the_canonical_program_path() {
         harness.parts(false),
         harness.settings(),
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     )
     .await;
@@ -1273,6 +1413,7 @@ async fn fast_cas_percent_20_gives_a_two_gib_budget() {
         harness.parts(false),
         settings,
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     )
     .await;
@@ -1303,6 +1444,7 @@ async fn a_restart_with_a_filled_fast_cas_keeps_the_cold_start_budget() {
         harness.parts(false),
         settings,
         harness.build_limits(),
+        harness.build_sandbox(),
         future::pending(),
     )
     .await;

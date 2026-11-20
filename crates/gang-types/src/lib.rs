@@ -17,6 +17,7 @@
 mod validated;
 
 mod absolute_path;
+mod action_environment;
 mod authentication;
 mod bearer;
 mod bounded_bytes;
@@ -65,6 +66,7 @@ pub mod property;
 pub mod __private;
 
 pub use absolute_path::{AbsolutePathBuf, AbsolutePathError};
+pub use action_environment::ActionEnvironment;
 pub use authentication::AuthenticationSettings;
 pub use bearer::parse_bearer;
 pub use bounded_bytes::{BoundedBytes, BoundedBytesError};
@@ -77,8 +79,8 @@ pub use bytes::Bytes;
 pub use ca_pin::CaPin;
 pub use error_chain::{ErrorChain, error_chain};
 pub use errors::{
-    BuildIdError, CaPinError, FleetCountError, FleetIndexError, IdentityError, NameError, PemError,
-    QuantityError,
+    ActionEnvironmentError, BuildIdError, CaPinError, FleetCountError, FleetIndexError,
+    IdentityError, NameError, PemError, QuantityError,
 };
 pub use fix::Fix;
 pub use fleet::{Fleet, WorkerLifetime};

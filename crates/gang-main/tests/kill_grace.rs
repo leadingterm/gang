@@ -35,7 +35,7 @@ const ACTION_PREFIX: &str = "grace:";
 /// action inputs linked and sets no limits.
 fn sandbox_file(work_directory: &Path) -> String {
     format!(
-        "work_directory = \"{}\"\nselected = \"noop\"\n\n[sandbox.noop]\n\n[execution]\ninput_links = \"keep\"\n",
+        "work_directory = \"{}\"\nselected = \"noop\"\n\n[sandbox.noop]\nenvironment = \"host:test\"\n\n[execution]\ninput_links = \"keep\"\n",
         work_directory.display()
     )
 }

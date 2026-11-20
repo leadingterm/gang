@@ -84,6 +84,7 @@ mod tests {
         Ok(WorkerState {
             id,
             fleet: FleetName::try_new(fleet)?,
+            environment: Some("host:test".parse()?),
             running_actions: 0,
             max_inflight_actions: NonZeroU32::new(4),
             draining: false,

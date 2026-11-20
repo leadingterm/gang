@@ -98,6 +98,19 @@ impl Bazel {
         );
         self.build_command(command, Some(abort))
     }
+    /// Runs the rootfs test without accepting cached action or test results.
+    pub(crate) fn rootfs_test(&self, remote: &Remote, bep: &Path) -> Result<BuildOutcome> {
+        let mut args = flags::build_args(&self.settings, &self.action_tools, remote, &[], None);
+        "test".clone_into(&mut args[0]);
+        args.extend([
+            "--noremote_accept_cached".to_owned(),
+            "--cache_test_results=no".to_owned(),
+            format!("--build_event_json_file={}", bep.display()),
+            "--build_event_publish_all_actions".to_owned(),
+            "//:rootfs_sh_test".to_owned(),
+        ]);
+        self.build_command(self.invocation(remote, args), None)
+    }
 
     /// Builds using Bazel's normal rc discovery in the supplied workspace and home.
     ///
@@ -304,11 +317,9 @@ mod tests {
             ActionTools {
                 shell: PathBuf::from("/tools/sh"),
                 path: "/pinned/bin:/pinned/other".to_owned(),
-                action_bin: PathBuf::from("/nix/store/ddd-action-tools/bin"),
-                ca_bundle: None,
                 bwrap: None,
                 glibc_tool: None,
-                glibc_loader: Vec::new(),
+                action_rootfs: None,
             },
             PathBuf::from("/workspace"),
             output_user_root,
