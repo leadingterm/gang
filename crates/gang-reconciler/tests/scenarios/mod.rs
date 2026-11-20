@@ -24,13 +24,18 @@ fn queued_environment_selects_only_matching_launch_fleet() -> TestResult {
     h.queue_candidates(FleetSet::prefix(2)?, 1);
     h.snapshot.queued[0].environment = "host:other".parse()?;
     let steps = h.reconcile();
-    assert!(steps.iter().any(|step| step.fleet == 1
-        && matches!(step.action, Action::ScaleOut { to: 1, .. })));
-    assert!(!steps.iter().any(|step| step.fleet == 0
-        && matches!(step.action, Action::ScaleOut { .. })));
+    assert!(
+        steps
+            .iter()
+            .any(|step| step.fleet == 1 && matches!(step.action, Action::ScaleOut { to: 1, .. }))
+    );
+    assert!(
+        !steps
+            .iter()
+            .any(|step| step.fleet == 0 && matches!(step.action, Action::ScaleOut { .. }))
+    );
     Ok(())
 }
-
 
 #[test]
 fn stale_idle_worker_retires_at_maximum_before_replacement() -> TestResult {
@@ -65,9 +70,11 @@ fn stale_idle_worker_retires_at_maximum_before_replacement() -> TestResult {
             .iter()
             .any(|step| matches!(step.action, Action::CancelDrain(..)))
     );
-    assert!(second.iter().any(|step| matches!(
-        step.action, Action::ScaleOut { to: 1, .. }
-    )));
+    assert!(
+        second
+            .iter()
+            .any(|step| matches!(step.action, Action::ScaleOut { to: 1, .. }))
+    );
     Ok(())
 }
 
@@ -226,9 +233,11 @@ fn unknown_idle_worker_retires_before_replacement() -> TestResult {
             ..
         }
     )));
-    assert!(second.iter().any(|step| matches!(
-        step.action, Action::ScaleOut { to: 1, .. }
-    )));
+    assert!(
+        second
+            .iter()
+            .any(|step| matches!(step.action, Action::ScaleOut { to: 1, .. }))
+    );
     Ok(())
 }
 
@@ -258,7 +267,10 @@ fn serve(h: &mut Harness, name: &str, launched_ago: Duration) -> TestResult {
 fn terminate(name: &str, cause: TerminationCause) -> TestResult<PlanStep> {
     Ok(PlanStep {
         fleet: X86,
-        action: Action::Terminate { instance: InstanceId::try_new(name)?, cause },
+        action: Action::Terminate {
+            instance: InstanceId::try_new(name)?,
+            cause,
+        },
     })
 }
 

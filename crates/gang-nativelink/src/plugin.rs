@@ -16,6 +16,7 @@ use gang_spi::{
 };
 use gang_types::{FleetName, InstanceId, Url};
 use nativelink_scheduler::resource_sketch::ResourceSketch;
+use nativelink_scheduler::worker_scheduler::WorkerScheduler;
 use tokio::sync::watch;
 
 use crate::config::NativeLinkConfig;

@@ -557,25 +557,50 @@ mod linux {
             );
             fs::create_dir_all(&marker_dir).map_err(E2eError::io("creating action"))?;
             fs::create_dir(&shared).map_err(E2eError::io("creating shared directory"))?;
-            for name in ["started", "attempts", "go", "churn", "release-rate_a_0_00", "release-rate_b_0_00"] {
+            for name in [
+                "started",
+                "attempts",
+                "go",
+                "churn",
+                "release-rate_a_0_00",
+                "release-rate_b_0_00",
+            ] {
                 fs::write(shared.join(name), b"").map_err(E2eError::io("creating shared inode"))?;
             }
             mkfifoat(CWD, marker_dir.join("ack"), Mode::RUSR | Mode::WUSR)
                 .map_err(|error| E2eError::io("creating acknowledgement FIFO")(error.into()))?;
             let watcher = ActionIpc::start(&instances, &shared, "0123456789abcdef")?;
             let mut ack = File::from(
-                open(marker_dir.join("ack"), OFlags::RDONLY | OFlags::NONBLOCK, Mode::empty())
-                    .map_err(|error| E2eError::io("opening acknowledgement FIFO")(error.into()))?,
+                open(
+                    marker_dir.join("ack"),
+                    OFlags::RDONLY | OFlags::NONBLOCK,
+                    Mode::empty(),
+                )
+                .map_err(|error| E2eError::io("opening acknowledgement FIFO")(error.into()))?,
             );
             let mut ready = [0; 6];
-            ack.read_exact(&mut ready).map_err(E2eError::io("reading acknowledgement"))?;
+            ack.read_exact(&mut ready)
+                .map_err(E2eError::io("reading acknowledgement"))?;
             assert_eq!(&ready, b"ready\n");
             let linked = marker_dir.join("release-rate_a_0_00");
-            assert_eq!(fs::read(&linked).map_err(E2eError::io("reading release"))?, b"");
+            assert_eq!(
+                fs::read(&linked).map_err(E2eError::io("reading release"))?,
+                b""
+            );
             super::super::super::rate_scaling::release(&shared, "//:rate_a_0_00")?;
-            assert_eq!(fs::read(&linked).map_err(E2eError::io("reading release"))?, b"1");
-            assert_eq!(fs::read(shared.join("release-rate_b_0_00")).map_err(E2eError::io("reading other release"))?, b"");
-            assert_eq!(fs::read(marker_dir.join("go")).map_err(E2eError::io("reading go"))?, b"");
+            assert_eq!(
+                fs::read(&linked).map_err(E2eError::io("reading release"))?,
+                b"1"
+            );
+            assert_eq!(
+                fs::read(shared.join("release-rate_b_0_00"))
+                    .map_err(E2eError::io("reading other release"))?,
+                b""
+            );
+            assert_eq!(
+                fs::read(marker_dir.join("go")).map_err(E2eError::io("reading go"))?,
+                b""
+            );
             watcher.finish()
         }
 

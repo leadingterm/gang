@@ -491,8 +491,8 @@ pub(crate) mod tests {
     fn old_environment_demand_keeps_authenticated_source() {
         let entry = demand(0, &[(property::ACTION_ENVIRONMENT, "host:old")]);
         let source = SourceId::from_identity_str("local:alice");
-        let demand = super::queued_demand(&entry, &catalog(), None, source)
-            .expect("valid environment");
+        let demand =
+            super::queued_demand(&entry, &catalog(), None, source).expect("valid environment");
         assert_eq!(demand.source, source);
         assert_eq!(demand.environment.as_str(), "host:old");
         assert_eq!(demand.candidates.iter().collect::<Vec<_>>(), vec![0, 1]);
@@ -506,9 +506,10 @@ pub(crate) mod tests {
             .remove(property::ACTION_ENVIRONMENT);
         let source = SourceId::from_identity_str("local:alice");
         assert!(super::queued_demand(&entry, &catalog(), None, source).is_none());
-        Arc::make_mut(&mut entry)
-            .platform_properties
-            .insert(property::ACTION_ENVIRONMENT.to_owned(), "invalid".to_owned());
+        Arc::make_mut(&mut entry).platform_properties.insert(
+            property::ACTION_ENVIRONMENT.to_owned(),
+            "invalid".to_owned(),
+        );
         assert!(super::queued_demand(&entry, &catalog(), None, source).is_none());
     }
 

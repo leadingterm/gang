@@ -341,6 +341,19 @@ struct LeadContext<'a, D: Deployment> {
     milestone_timeout: Duration,
 }
 
+fn controller_leadership<'a, D: Deployment>(
+    core: &'a Core<D>,
+    controller: &'a ControllerId,
+    settings: LeadershipConfig,
+) -> Leadership<'a, D::Repository, D::Clock> {
+    Leadership::new(
+        &core.host.repository,
+        &core.host.clock,
+        controller,
+        settings,
+    )
+}
+
 fn start_standby<D: Deployment>(
     scheduler: &D::Scheduler,
     listeners: OpenListeners<D>,
@@ -1477,12 +1490,7 @@ impl<D: Deployment> Server<D> {
                 .await?;
                 return Ok(());
             }
-            let leadership = Leadership::new(
-                &core.host.repository,
-                &core.host.clock,
-                &self.controller,
-                self.leadership.clone(),
-            );
+            let leadership = controller_leadership(core, &self.controller, self.leadership.clone());
             let leading = Leading::default();
             let (stop_sender, stop) = stop_channel();
             let connections = term_connections::<D>(

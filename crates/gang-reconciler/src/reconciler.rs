@@ -32,6 +32,33 @@ struct Candidate {
     release_first: bool,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum EnvironmentClass {
+    #[default]
+    CurrentMatching,
+    Unknown,
+    KnownStale,
+}
+
+impl EnvironmentClass {
+    fn observe(
+        self,
+        environment: Option<&gang_types::ActionEnvironment>,
+        current: &gang_types::ActionEnvironment,
+    ) -> Self {
+        let observed = match environment {
+            Some(environment) if environment == current => Self::CurrentMatching,
+            Some(_) => Self::KnownStale,
+            None => Self::Unknown,
+        };
+        self.min(observed)
+    }
+
+    fn is_stale(self) -> bool {
+        self != Self::CurrentMatching
+    }
+}
+
 /// All connections contribute to physical occupancy, including partially applied cordons.
 #[derive(Debug, Default, Clone, Copy)]
 struct Hosted {
@@ -41,8 +68,7 @@ struct Hosted {
     serving: bool,
     busy: bool,
     running: u32,
-    stale: bool,
-    known_stale: bool,
+    environment: EnvironmentClass,
 }
 
 impl Hosted {
@@ -91,7 +117,7 @@ struct Draining {
     release_first: bool,
     owned: bool,
     resumed: bool,
-    stale: bool,
+    environment: EnvironmentClass,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -326,7 +352,8 @@ impl Reconciler {
                     .id
                     .instance_name()
                     .is_some_and(|id| hosted.is_cordoned(index, id));
-                if !worker.draining && !owned
+                if !worker.draining
+                    && !owned
                     && worker.environment.as_ref() == Some(&fleet.policy.action_environment)
                 {
                     fleet.outlook.demand.add_running(worker.running_actions);
@@ -432,6 +459,28 @@ impl Reconciler {
         }
     }
 
+    fn hosted(
+        &mut self,
+        pass: &Pass<'_>,
+        view: &FleetView<'_>,
+        instance: &FleetInstance,
+    ) -> Hosted {
+        let workers = &pass.hosted.snapshot().workers;
+        let mut hosted = Hosted::default();
+        let mut environment = EnvironmentClass::KnownStale;
+        for index in pass.hosted.workers_on(&view.policy.name, &instance.id) {
+            environment = environment.observe(
+                workers[index].environment.as_ref(),
+                &view.policy.action_environment,
+            );
+            let seen = self.observations.observe_worker(&workers[index], pass.now);
+            hosted.add(index, seen, workers);
+        }
+        if hosted.worker.is_some() {
+            hosted.environment = environment;
+        }
+        hosted
+    }
 
     fn classify_instance(
         &mut self,
@@ -444,19 +493,7 @@ impl Reconciler {
     ) -> Standing {
         let (position, instance) = entry;
         let (past_boot_grace, counts) = outlook;
-        let workers = &pass.hosted.snapshot().workers;
-        let mut hosted = Hosted::default();
-        let mut stale = true;
-        let mut known_stale = true;
-        for index in pass.hosted.workers_on(&view.policy.name, &instance.id) {
-            stale &= workers[index].environment.as_ref() != Some(&view.policy.action_environment);
-            known_stale &= workers[index].environment.as_ref()
-                .is_some_and(|environment| environment != &view.policy.action_environment);
-            let seen = self.observations.observe_worker(&workers[index], pass.now);
-            hosted.add(index, seen, workers);
-        }
-        hosted.stale = hosted.worker.is_some() && stale;
-        hosted.known_stale = hosted.worker.is_some() && known_stale;
+        let hosted = self.hosted(pass, view, instance);
         let owned = pass.hosted.is_cordoned(view.index, instance.id.as_str());
         if owned {
             self.observations.observe_cordon(view.index, &instance.id);
@@ -513,25 +550,16 @@ impl Reconciler {
             self.terminate(pass, view, &instance.id, TerminationCause::Orphan, plan);
             return Standing::Ordered;
         };
-        if hosted.stale {
+        if hosted.environment.is_stale() {
             census.stale_retained = census.stale_retained.saturating_add(1);
-            if owned || !hosted.serving {
-                return self.classify_drain(
-                    pass, view, entry, hosted,
-                    (worker, owned, draining_since.unwrap_or(pass.now)),
-                );
-            }
-            if !hosted.busy && hosted.running == 0 {
-                plan.steps.push(PlanStep {
-                    fleet: view.index,
-                    action: Action::StartDrain {
-                        worker: workers[worker].id.clone(),
-                        reason: DrainReason::IdleTimeout,
-                        summary: None,
-                    },
-                });
-            }
-            return Standing::Retained;
+            return self.classify_stale(
+                pass,
+                view,
+                entry,
+                hosted,
+                (worker, owned, draining_since.unwrap_or(pass.now)),
+                plan,
+            );
         }
         if owned || !hosted.serving {
             return self.classify_drain(
@@ -564,6 +592,32 @@ impl Reconciler {
         Standing::Usable
     }
 
+    fn classify_stale(
+        &mut self,
+        pass: &Pass<'_>,
+        view: &FleetView<'_>,
+        entry: (usize, &FleetInstance),
+        hosted: Hosted,
+        drain: (usize, bool, Tick),
+        plan: &mut Plan,
+    ) -> Standing {
+        let (worker, owned, _) = drain;
+        if owned || !hosted.serving {
+            return self.classify_drain(pass, view, entry, hosted, drain);
+        }
+        if !hosted.busy && hosted.running == 0 {
+            plan.steps.push(PlanStep {
+                fleet: view.index,
+                action: Action::StartDrain {
+                    worker: pass.hosted.snapshot().workers[worker].id.clone(),
+                    reason: DrainReason::IdleTimeout,
+                    summary: None,
+                },
+            });
+        }
+        Standing::Retained
+    }
+
     fn classify_drain(
         &mut self,
         pass: &Pass<'_>,
@@ -572,13 +626,20 @@ impl Reconciler {
         hosted: Hosted,
         (worker, owned, since): (usize, bool, Tick),
     ) -> Standing {
-        if !hosted.stale && !owned && pass.now.saturating_duration_since(since) < view.policy.boot_grace {
+        if !hosted.environment.is_stale()
+            && !owned
+            && pass.now.saturating_duration_since(since) < view.policy.boot_grace
+        {
             return Standing::Transient;
         }
         let end = if !hosted.serving && hosted.running == 0 {
-            Some(if hosted.stale { TerminationCause::StaleEnvironment } else { TerminationCause::DrainFinished })
+            Some(if hosted.environment.is_stale() {
+                TerminationCause::StaleEnvironment
+            } else {
+                TerminationCause::DrainFinished
+            })
         } else if !hosted.serving
-            && !hosted.known_stale
+            && hosted.environment != EnvironmentClass::KnownStale
             && pass.now.saturating_duration_since(since) >= view.policy.max_drain_wait
         {
             Some(TerminationCause::MaxDrainWait)
@@ -603,7 +664,7 @@ impl Reconciler {
             release_first: instance.release_first,
             owned,
             resumed: false,
-            stale: hosted.stale,
+            environment: hosted.environment,
         });
         Standing::Retained
     }
@@ -628,15 +689,20 @@ impl Reconciler {
             .saturating_into();
         let retaining: u32 = self.draining[range]
             .iter()
-            .filter(|d| !d.stale && !d.resumed && d.end.is_none() && d.running > 0)
+            .filter(|d| !d.environment.is_stale() && !d.resumed && d.end.is_none() && d.running > 0)
             .count()
             .saturating_into();
         let from = view.supply.desired.saturating_sub(terminated);
         let stale_terminated: u32 = self.draining[self.census[index].draining.clone()]
-            .iter().filter(|d| d.stale && d.end.is_some()).count().saturating_into();
-        let to = purchase_target(view.needed, retaining.saturating_add(
-            census.stale_retained.saturating_sub(stale_terminated)
-        ), view.policy.instances.max().get());
+            .iter()
+            .filter(|d| d.environment.is_stale() && d.end.is_some())
+            .count()
+            .saturating_into();
+        let to = purchase_target(
+            view.needed,
+            retaining.saturating_add(census.stale_retained.saturating_sub(stale_terminated)),
+            view.policy.instances.max().get(),
+        );
         if view.supply.abandoned > 0 && resumed == 0 {
             plan.steps.push(PlanStep {
                 fleet: index,
@@ -719,7 +785,7 @@ impl Reconciler {
         let mut extra = SlotVector::default();
         for position in range.clone() {
             let drain = self.draining[position];
-            if !drain.owned || drain.stale {
+            if !drain.owned || drain.environment.is_stale() {
                 continue;
             }
             let ordinary = remaining_rescues > 0;
@@ -925,6 +991,31 @@ fn victim_order(
 mod tests {
     use super::*;
     use gang_testkit::{TestResult, worker_id};
+
+    #[test]
+    fn environment_class_aggregates_mixed_generations_in_any_order() -> TestResult {
+        let current = "host:current".parse()?;
+        let old = "host:old".parse()?;
+        let classify = |values: &[Option<&gang_types::ActionEnvironment>]| {
+            values
+                .iter()
+                .fold(EnvironmentClass::KnownStale, |class, value| {
+                    class.observe(*value, &current)
+                })
+        };
+        assert_eq!(classify(&[Some(&old)]), EnvironmentClass::KnownStale);
+        assert_eq!(classify(&[Some(&old), None]), EnvironmentClass::Unknown);
+        assert_eq!(classify(&[None, Some(&old)]), EnvironmentClass::Unknown);
+        assert_eq!(
+            classify(&[Some(&old), None, Some(&current)]),
+            EnvironmentClass::CurrentMatching
+        );
+        assert_eq!(
+            classify(&[Some(&current), None, Some(&old)]),
+            EnvironmentClass::CurrentMatching
+        );
+        Ok(())
+    }
 
     fn fixture(
         minimum: u32,

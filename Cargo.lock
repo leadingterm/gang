@@ -2883,6 +2883,11 @@ dependencies = [
  "gang-spi",
  "gang-testkit",
  "gang-types",
+ "lru",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
  "thiserror",
 ]
 

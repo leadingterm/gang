@@ -730,7 +730,12 @@ impl WorkPlanner {
             }
             self.reachable[index] |= planned > 0;
         }
-        self.dispatch.dispatch(hosted.snapshot(), &self.attribution, &self.matching, &self.rates);
+        self.dispatch.dispatch(
+            hosted.snapshot(),
+            &self.attribution,
+            &self.matching,
+            &self.rates,
+        );
         for (index, fleet) in fleets.iter_mut().enumerate() {
             fleet.outlook.expected_wait = self.dispatch.waits[index].map(Duration::from_millis);
         }
@@ -847,7 +852,9 @@ mod tests {
             source: None,
             candidates: FleetSet::try_from_indices(candidates.iter().copied())
                 .expect("valid fleets"),
-            environment: gang_testkit::fleet_policy("workers").expect("valid policy").action_environment,
+            environment: gang_testkit::fleet_policy("workers")
+                .expect("valid policy")
+                .action_environment,
             resources: ActionResources::default(),
             queued_since: Timestamp::from_unix_millis(1_000_000),
             priority: 0,

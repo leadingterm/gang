@@ -819,6 +819,8 @@ impl<'a> Stack<'a> {
             driver: self
                 .bazel
                 .with_output_user_root(self.placement.root().join(output_root)),
+            #[cfg(target_os = "linux")]
+            action_ipc: self.action_ipc.clone(),
         }
         .build_until(probes, run, stop)
     }

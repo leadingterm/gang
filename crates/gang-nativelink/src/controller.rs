@@ -213,16 +213,7 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
     let action_scheduler: Arc<dyn KnownPlatformPropertyProvider> =
         Arc::new(HandOffActions::new(action_scheduler, handoff.clone()));
     let completed = Arc::new(AtomicU64::new(0));
-    let history = Arc::clone(histories.lock().get_or_insert_with(|| {
-        Arc::new(Histories::new(
-            resource,
-            Arc::new(Mutex::new(ActionDurations::new(
-                spec.actions.history_keys,
-                spec.actions.history_window,
-            ))),
-        ))
-    }));
-    let durations = Arc::clone(&history.durations);
+    let durations = retained_durations(histories, resource, &spec.actions);
     let clock = Arc::clone(&spec.clock);
     let fleets = Arc::new(spec.fleets.clone());
     let rates = Arc::new(
@@ -274,16 +265,7 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         scratch: tokio::sync::Mutex::new(crate::snapshot::Scratch::default()),
         stores: StoreUsage::new(Arc::clone(store_manager)),
     });
-    let claimed = handles.send_if_modified(|slot| {
-        if slot.is_some() {
-            return false;
-        }
-        *slot = Some(published);
-        true
-    });
-    if !claimed {
-        return Err(NativeLinkEmbedError::AlreadyServing);
-    }
+    publish(handles, published)?;
     let _serving = Serving(handles);
     ready.signal();
 
@@ -305,6 +287,41 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         handoff,
     )
     .await
+}
+
+fn retained_durations(
+    histories: &Mutex<Option<Arc<Histories>>>,
+    resource: Arc<ResourceSketch>,
+    actions: &gang_config::ActionsConfig,
+) -> Arc<Mutex<ActionDurations>> {
+    let history = Arc::clone(histories.lock().get_or_insert_with(|| {
+        Arc::new(Histories::new(
+            resource,
+            Arc::new(Mutex::new(ActionDurations::new(
+                actions.history_keys,
+                actions.history_window,
+            ))),
+        ))
+    }));
+    Arc::clone(&history.durations)
+}
+
+fn publish(
+    handles: &watch::Sender<Option<Arc<Handles>>>,
+    published: Arc<Handles>,
+) -> Result<(), NativeLinkEmbedError> {
+    let claimed = handles.send_if_modified(|slot| {
+        if slot.is_some() {
+            return false;
+        }
+        *slot = Some(published);
+        true
+    });
+    if claimed {
+        Ok(())
+    } else {
+        Err(NativeLinkEmbedError::AlreadyServing)
+    }
 }
 
 /// Routers built for the client and worker listener roles.
@@ -1835,11 +1852,8 @@ mod tests {
         Ok((status, String::from_utf8(body.to_vec())?))
     }
 
-    /// The cold-start memory exceeds the only fleet eligible for the requested CPU. Fitting
-    /// clamps memory to that fleet and reserves all its CPU.
-    #[tokio::test]
-    async fn scheduler_stack_clamps_to_eligible_capacity_and_reserves_whole_cpu() {
-        let fleets = FleetCatalog::try_new(
+    fn capacity_test_fleets() -> FleetCatalog {
+        FleetCatalog::try_new(
             [("fleet-a", 16, 8_u64), ("fleet-b", 4, 32)]
                 .into_iter()
                 .map(|(name, vcpus, memory_gib)| {
@@ -1859,7 +1873,14 @@ mod tests {
                 })
                 .collect(),
         )
-        .expect("valid fleet catalog");
+        .expect("valid fleet catalog")
+    }
+
+    /// The cold-start memory exceeds the only fleet eligible for the requested CPU. Fitting
+    /// clamps memory to that fleet and reserves all its CPU.
+    #[tokio::test]
+    async fn scheduler_stack_clamps_to_eligible_capacity_and_reserves_whole_cpu() {
+        let fleets = capacity_test_fleets();
         let config = default_config();
         let actions = Arc::new(
             serde_json::from_value(json!({
@@ -1888,15 +1909,14 @@ mod tests {
             panic!("expected historical scheduler");
         };
         historical.learn_from_workers = false;
-        let SchedulerStack { actions, .. } =
-            scheduler_stack(
-                &scheduler,
-                &fleets,
-                &actions,
-                &OnceLock::new(),
-                Arc::clone(&spec.clock),
-            )
-            .expect("scheduler stack");
+        let SchedulerStack { actions, .. } = scheduler_stack(
+            &scheduler,
+            &fleets,
+            &actions,
+            &OnceLock::new(),
+            Arc::clone(&spec.clock),
+        )
+        .expect("scheduler stack");
         let operation = OperationId::String("stack-wiring".to_owned());
         let digest = DigestInfo::new([1; 32], 1);
         let info = Arc::new(ActionInfo {
@@ -1996,15 +2016,14 @@ mod tests {
             panic!("historical scheduler")
         };
         historical.learn_from_workers = false;
-        let SchedulerStack { actions, .. } =
-            scheduler_stack(
-                &scheduler,
-                &fleets,
-                &spec.actions,
-                &OnceLock::new(),
-                Arc::clone(&spec.clock),
-            )
-            .expect("stack");
+        let SchedulerStack { actions, .. } = scheduler_stack(
+            &scheduler,
+            &fleets,
+            &spec.actions,
+            &OnceLock::new(),
+            Arc::clone(&spec.clock),
+        )
+        .expect("stack");
         let info = origin_test_action();
         let metadata = RequestMetadata {
             tool_invocation_id: "invocation".to_owned(),

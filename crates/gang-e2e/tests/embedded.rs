@@ -18,8 +18,8 @@ use gang_spi::{
     Accepted, Admitted, ApiRequestBody, ApiResponseBody, ApiService, Authenticated, ClientTls,
     ControllerConnections, ControllerReady, ControllerSpec, GateDecision, Listening,
     ObservationSink, Peer, PortError, Rejection, RenderedStoreSpec, RequestGate, RequestScope,
-    SchedulerPort, SchedulerSnapshot, Slots, StoreAccess, StoreKind, Subject, WorkerSpec,
-    WorkerState, WorkerTls, full_body,
+    SchedulerPort, SchedulerSnapshot, Slots, StoreAccess, StoreKind, WorkerSpec, WorkerState,
+    WorkerTls, full_body,
 };
 use gang_testkit::{ChildTest, ExtendedKeyUsagePurpose, TestAuthority, TestResult};
 use gang_tls::{

@@ -17,7 +17,7 @@ use gang_spi::{
     ControllerConnections, ControllerEndpoints, ControllerReady, ControllerSpec, FleetSupply,
     GateDecision, LeaderUnavailable, LearnedHistory, Listening, ListingLimits, Peer, PortError,
     RecordKind, Rejection, RequestGate, RequestScope, SchedulerPort, SchedulerSnapshot, Slots,
-    Subject, WorkerSpec, WorkerTls, full_body,
+    WorkerSpec, WorkerTls, full_body,
 };
 use gang_types::{Bytes, FleetName, FleetProperties, InstanceId};
 use parking_lot::Mutex;
