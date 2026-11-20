@@ -38,6 +38,7 @@ translate() {
   expr=${expr//inputs.restore-only/"\"\$RESTORE_ONLY\""}
   expr=${expr//inputs.cache-save/"\"\$CACHE_SAVE\""}
   expr=${expr//inputs.mode/"\"\$MODE\""}
+  expr=${expr//inputs.shell/"\"\$CACHE_SHELL\""}
   expr=${expr//inputs.prune/"\"\$PRUNE\""}
   expr=${expr//"always()"/true}
   if [[ $expr == *github.* || $expr == *inputs.* || $expr == *steps.* || $expr == *runner.* || $expr == *env.* || $expr == *'format('* ]]; then
@@ -183,7 +184,7 @@ SH
 export EVENT=pull_request REF=refs/pull/1/merge DEFAULT_REF=refs/heads/main
 export REPO=example-org/gang HEAD_REPO=example-org/gang OS=Linux ARCH=X64
 export JOB=cache-x86_64 BAZEL_CACHE_JOB=linux-x86_64
-export CACHE_HIT=false PR_CACHE_HIT=false RESTORE_ONLY=false CACHE_SAVE=true
+export CACHE_HIT=false PR_CACHE_HIT=false RESTORE_ONLY=false CACHE_SAVE=true CACHE_SHELL=
 
 check 'Bazel same-repository PR saves' "$bazel" true
 check 'Nix same-repository PR saves' "$nix" true
@@ -212,6 +213,14 @@ OS=Linux RESTORE_ONLY=true
 check 'Bazel restore-only does not save' "$bazel" false
 RESTORE_ONLY=false CACHE_SAVE=false
 check 'Nix cache-save false does not save' "$nix" false
+ARCH=ARM64 CACHE_SAVE=true EVENT=pull_request REF=refs/pull/1/merge
+check 'Nix default shell on ARM does not save' "$nix" false
+check 'Nix default shell on ARM does not restore' "$nix_restore" false
+CACHE_SHELL=deploy
+check 'Nix deploy shell on ARM saves' "$nix" true
+check 'Nix deploy shell on ARM restores' "$nix_restore" true
+ARCH=X64 CACHE_SHELL=
+EVENT=push REF=$DEFAULT_REF
 CACHE_SAVE=true CACHE_HIT=true
 check 'Bazel exact restore hit does not save' "$bazel" false
 CACHE_HIT=false PR_CACHE_HIT=true EVENT=pull_request
