@@ -1350,14 +1350,11 @@ async fn assert_symlink_tree(channel: &Channel, tree_digest: Digest) -> TestResu
     Ok(())
 }
 
-/// Internal absolute links are rebased relative to their containing output directory.
 #[cfg(unix)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn absolute_internal_output_symlinks_are_rebased_from_their_parent() -> TestResult {
+async fn assert_absolute_internal_output_symlinks_are_rebased(paths: WorkerPaths) -> TestResult {
     let flow: Result<TestResult, _> = tokio::time::timeout(Duration::from_mins(2), async {
-        let scratch = tempfile::tempdir()?;
         let mut harness = Harness::start().await?;
-        harness.add_worker(WorkerPaths::new(scratch.path(), "worker"), default_fleet()?)?;
+        harness.add_worker(paths, default_fleet()?)?;
         let channel = public_channel(harness.public_port).await?;
         let action = build_action_with(&[("ISA", "x86-64")], &[(SYMLINK_OUTPUT_ENV, "1")])?;
         upload_blobs(&channel, action.blobs).await?;
@@ -1380,6 +1377,28 @@ async fn absolute_internal_output_symlinks_are_rebased_from_their_parent() -> Te
     })
     .await;
     flow.map_err(|_| "timed out waiting for the symlink output action")?
+}
+
+/// Internal absolute links are rebased relative to their containing output directory.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn absolute_internal_output_symlinks_are_rebased_from_their_parent() -> TestResult {
+    let scratch = tempfile::tempdir()?;
+    assert_absolute_internal_output_symlinks_are_rebased(WorkerPaths::new(scratch.path(), "worker"))
+        .await
+}
+
+/// A symlinked work root does not prevent internal absolute links from being rebased.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn absolute_internal_output_symlinks_are_rebased_through_a_symlinked_work_root() -> TestResult
+{
+    let scratch = tempfile::tempdir()?;
+    let physical = scratch.path().join("physical");
+    std::fs::create_dir(&physical)?;
+    let alias = scratch.path().join("alias");
+    std::os::unix::fs::symlink(physical.canonicalize()?, &alias)?;
+    assert_absolute_internal_output_symlinks_are_rebased(WorkerPaths::new(&alias, "worker")).await
 }
 
 /// A worker-marked action still runs the ordinary entrypoint and produces its output.
