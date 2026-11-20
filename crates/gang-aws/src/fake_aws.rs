@@ -338,6 +338,13 @@ impl FakeState {
     }
 }
 
+/// The ASG field that carries its launch template.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FakeTemplateKind {
+    Direct,
+    Mixed,
+}
+
 /// An Auto Scaling group with its current desired capacity and members.
 #[derive(Debug, Clone)]
 pub(crate) struct FakeGroup {
@@ -350,6 +357,10 @@ pub(crate) struct FakeGroup {
     /// Whether a scaling activity is in progress; `SetDesiredCapacity` with `HonorCooldown` is refused meanwhile.
     pub(crate) in_cooldown: bool,
     pub(crate) instances: Vec<FakeInstance>,
+    /// Members launched with an older launch-template version.
+    pub(crate) stale_instances: Vec<String>,
+    /// The ASG field that declares the current launch template.
+    pub(crate) template_kind: FakeTemplateKind,
     /// Whether instances entering the group start protected from scale-in.
     pub(crate) new_instances_protected: bool,
     /// `None` when the group has no warm pool; `Some(reuse)` when it has one with that reuse flag.
@@ -378,6 +389,8 @@ impl FakeGroup {
                     protected: false,
                 })
                 .collect(),
+            stale_instances: Vec::new(),
+            template_kind: FakeTemplateKind::Direct,
             new_instances_protected: false,
             reuse_on_scale_in: None,
             warm_pool: Vec::new(),
@@ -744,10 +757,11 @@ fn group_xml(group: &FakeGroup) -> String {
         .iter()
         .map(|instance| {
             format!(
-                "<member><InstanceId>{id}</InstanceId><AvailabilityZone>{ZONE}</AvailabilityZone><HealthStatus>Healthy</HealthStatus><LifecycleState>{state}</LifecycleState><ProtectedFromScaleIn>{protected}</ProtectedFromScaleIn></member>",
+                "<member><InstanceId>{id}</InstanceId><AvailabilityZone>{ZONE}</AvailabilityZone><HealthStatus>Healthy</HealthStatus><LifecycleState>{state}</LifecycleState><ProtectedFromScaleIn>{protected}</ProtectedFromScaleIn><LaunchTemplate><LaunchTemplateId>lt-test</LaunchTemplateId><Version>{version}</Version></LaunchTemplate></member>",
                 id = instance.id,
                 state = instance.lifecycle_state,
                 protected = instance.protected,
+                version = if group.stale_instances.contains(&instance.id) { "1" } else { "2" },
             )
         })
         .collect::<Vec<_>>()
@@ -759,8 +773,16 @@ fn group_xml(group: &FakeGroup) -> String {
         ),
         None => String::new(),
     };
+    let template = match group.template_kind {
+        FakeTemplateKind::Mixed => {
+            "<MixedInstancesPolicy><LaunchTemplate><LaunchTemplateSpecification><LaunchTemplateId>lt-test</LaunchTemplateId><Version>2</Version></LaunchTemplateSpecification></LaunchTemplate></MixedInstancesPolicy>"
+        }
+        FakeTemplateKind::Direct => {
+            "<LaunchTemplate><LaunchTemplateId>lt-test</LaunchTemplateId><Version>2</Version></LaunchTemplate>"
+        }
+    };
     format!(
-        "<member><AutoScalingGroupName>{name}</AutoScalingGroupName><AvailabilityZones><member>{ZONE}</member></AvailabilityZones><CreatedTime>{CREATED_TIME}</CreatedTime><DefaultCooldown>{DEFAULT_COOLDOWN}</DefaultCooldown><DesiredCapacity>{desired}</DesiredCapacity><MinSize>{min_size}</MinSize><MaxSize>{max_size}</MaxSize><HealthCheckType>EC2</HealthCheckType><Instances>{instances}</Instances><NewInstancesProtectedFromScaleIn>{protected}</NewInstancesProtectedFromScaleIn>{warm_pool}</member>",
+        "<member><AutoScalingGroupName>{name}</AutoScalingGroupName><AvailabilityZones><member>{ZONE}</member></AvailabilityZones><CreatedTime>{CREATED_TIME}</CreatedTime><DefaultCooldown>{DEFAULT_COOLDOWN}</DefaultCooldown><DesiredCapacity>{desired}</DesiredCapacity><MinSize>{min_size}</MinSize><MaxSize>{max_size}</MaxSize><HealthCheckType>EC2</HealthCheckType><Instances>{instances}</Instances><NewInstancesProtectedFromScaleIn>{protected}</NewInstancesProtectedFromScaleIn>{warm_pool}{template}</member>",
         name = group.name,
         desired = group.desired,
         min_size = group.min_size,

@@ -1018,6 +1018,7 @@ mod tests {
             remote_cache: Url::parse("grpcs://cache.example.test:443").expect("valid url"),
             ca_certificate: None,
             default_isa: gang_wire::Isa::X86_64,
+            action_environment: "host:test".parse().expect("valid test environment"),
             version: None,
             authentication: Authentication::Unrecognized(serde_json::Map::new()),
         };

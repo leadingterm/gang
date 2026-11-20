@@ -18,7 +18,7 @@ pub const MEMORY_KB: &str = "memory_kb";
 pub const DISK_KB: &str = "disk_kb";
 /// The network. Imposes nothing on matching.
 pub const NETWORK: &str = "network";
-/// Cache identity for the action environment; does not affect fleet matching.
+/// The action environment identity. Matches exactly.
 pub const ACTION_ENVIRONMENT: &str = "gang_action_environment";
 
 /// Every reserved property key.
@@ -35,7 +35,7 @@ pub const RESERVED: [&str; 9] = [
 ];
 
 /// Keys that impose nothing on matching.
-pub const IGNORED: [&str; 2] = [NETWORK, ACTION_ENVIRONMENT];
+pub const IGNORED: [&str; 1] = [NETWORK];
 
 /// Returns whether `key` is one of the [`RESERVED`] keys.
 ///

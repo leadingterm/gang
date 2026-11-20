@@ -78,6 +78,15 @@ if [[ -n "${RELEASE:-}" ]]; then
   : "${IMAGE_SHA256_x86_64:?IMAGE_SHA256_x86_64 is required with RELEASE}"
   : "${IMAGE_SHA256_aarch64:?IMAGE_SHA256_aarch64 is required with RELEASE}"
   release_args=(--release "$RELEASE" --image "x86_64=$IMAGE_SHA256_x86_64" --image "aarch64=$IMAGE_SHA256_aarch64")
+  if ! action_environment=$(jq -er '.action_environment | strings | select(test("^[0-9a-f]{64}\\z"))' "$IMAGES_DIR/gang-image-x86_64.json") ||
+    ! arm_environment=$(jq -er '.action_environment | strings | select(test("^[0-9a-f]{64}\\z"))' "$IMAGES_DIR/gang-image-aarch64.json"); then
+    printf 'publish-amis: both image-info files must contain a valid action_environment\n' >&2
+    exit 1
+  fi
+  if [[ "$action_environment" != "$arm_environment" ]]; then
+    printf 'publish-amis: image action_environment values differ between architectures\n' >&2
+    exit 1
+  fi
 fi
 mkdir -p "$temp_dir/known" "$temp_dir/imports"
 for region in ${regions[@]+"${regions[@]}"}; do mkdir -p "$temp_dir/known/$region"; done
@@ -240,6 +249,17 @@ main() {
   if [[ "$publication_scope" == release ]]; then operation=ami-release-steps; fi
   for ((round = 1; round <= 40; round++)); do
     collect_regions
+    if [[ -n "${RELEASE:-}" ]]; then
+      if ! jq -e --arg environment "$action_environment" \
+        --arg x "gang-x86_64-${IMAGE_SHA256_x86_64:0:16}" \
+        --arg a "gang-aarch64-${IMAGE_SHA256_aarch64:0:16}" '
+          all(.[] | .images.Images[] | select(.Name == $x or .Name == $a);
+            [.Tags[]? | select(.Key == "ec2:SharedTag/ActionEnvironment") | .Value] == [$environment])
+        ' "$temp_dir/regions.json" >/dev/null; then
+        printf 'publish-amis: release AMI action environment does not match image-info.json\n' >&2
+        return 1
+      fi
+    fi
     now=$(date +%s)
     steps=$("$GANG" release "$operation" --home-region "$IMAGE_HOME_REGION" --now "$now" \
       ${release_args[@]+"${release_args[@]}"} < "$temp_dir/regions.json")

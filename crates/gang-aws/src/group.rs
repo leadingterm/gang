@@ -22,6 +22,8 @@ pub(crate) struct Member {
     pub lifecycle: InstanceLifecycle,
     /// Whether the group protects the instance from scale-in.
     pub protected: bool,
+    /// The instance is proven to use the group's current immutable launch template version.
+    pub current_generation: bool,
 }
 
 /// An auto scaling group as read from AWS, with the warm-pool rules that govern its release.
@@ -80,10 +82,16 @@ impl Group {
         let desired = group
             .desired_capacity()
             .ok_or_else(|| AwsError::malformed(DESCRIBE_GROUPS, "desired capacity"))?;
+        let template = group.launch_template().or_else(|| {
+            group
+                .mixed_instances_policy()
+                .and_then(|policy| policy.launch_template())
+                .and_then(|launch| launch.launch_template_specification())
+        });
         let members = group
             .instances()
             .iter()
-            .map(member)
+            .map(|instance| member(instance, template))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             name: name.to_owned(),
@@ -168,7 +176,10 @@ impl From<&Group> for Counts {
 }
 
 /// Converts one listed instance of a group to a member.
-fn member(instance: &AutoScalingInstance) -> Result<Member, AwsError> {
+fn member(
+    instance: &AutoScalingInstance,
+    template: Option<&aws_sdk_autoscaling::types::LaunchTemplateSpecification>,
+) -> Result<Member, AwsError> {
     let raw_id = instance
         .instance_id()
         .ok_or_else(|| AwsError::malformed(DESCRIBE_GROUPS, "instance id"))?;
@@ -181,6 +192,23 @@ fn member(instance: &AutoScalingInstance) -> Result<Member, AwsError> {
         id,
         lifecycle: lifecycle_of(state),
         protected: instance.protected_from_scale_in().unwrap_or_default(),
+        current_generation: template.zip(instance.launch_template()).is_some_and(
+            |(current, launched)| match (
+                current.launch_template_id(),
+                current.version(),
+                launched.launch_template_id(),
+                launched.version(),
+            ) {
+                (Some(id), Some(version), Some(actual_id), Some(actual_version)) => {
+                    !id.is_empty()
+                        && !version.is_empty()
+                        && version.bytes().all(|byte| byte.is_ascii_digit())
+                        && id == actual_id
+                        && version == actual_version
+                }
+                _ => false,
+            },
+        ),
     })
 }
 

@@ -75,10 +75,11 @@ impl ClientStateManager for FittedActions {
         operation: OperationId,
         mut action_info: Arc<ActionInfo>,
     ) -> Result<Box<dyn ActionStateResult>, Error> {
-        let admitted = self
+        let (admitted, live_catalog) = self
             .admitted
             .take(&operation)
-            .unwrap_or_else(|| self.fleets.accepting(|_| None));
+            .unwrap_or_else(|| (self.fleets.accepting(|_| None), None));
+        let fleets = live_catalog.as_ref().unwrap_or(&self.fleets);
         for (key, min_kb) in [
             (property::MEMORY_KB, self.min_reservation.as_units()),
             (property::DISK_KB, self.disk_min_reservation.as_units()),
@@ -106,7 +107,7 @@ impl ClientStateManager for FittedActions {
                 continue;
             };
             let eligible = admitted
-                & self.fleets.accepting(|other| {
+                & fleets.accepting(|other| {
                     if other == key {
                         None
                     } else {
@@ -118,7 +119,7 @@ impl ClientStateManager for FittedActions {
                 });
             let largest = eligible
                 .iter()
-                .filter_map(|index| self.fleets.fleets().get(index))
+                .filter_map(|index| fleets.fleets().get(index))
                 .filter_map(|fleet| fleet.limit(key).map(|capacity| (capacity, fleet)))
                 .max_by_key(|(capacity, _)| *capacity);
             if let Some((capacity, fleet)) = largest
@@ -135,7 +136,7 @@ impl ClientStateManager for FittedActions {
             }
         }
         let properties = |key: &str| action_info.platform_properties.get(key).map(String::as_str);
-        if let Some(fit) = self.fleets.fit(admitted, properties)
+        if let Some(fit) = fleets.fit(admitted, properties)
             && !fit.lowered.is_empty()
         {
             tracing::info!(operation_id = %operation, fleet = fit.fleet, keys = ?fit.lowered, "fitting action reservation to fleet");
@@ -144,7 +145,7 @@ impl ClientStateManager for FittedActions {
                 .iter()
                 .any(|(key, _)| *key == property::MEMORY_KB);
             let whole_cpu = memory_lowered
-                .then(|| self.fleets.fleets().get(fit.fleet))
+                .then(|| fleets.fleets().get(fit.fleet))
                 .flatten()
                 .and_then(|fleet| fleet.limit(property::CPU_MILLICORES));
             let properties = &mut Arc::make_mut(&mut action_info).platform_properties;

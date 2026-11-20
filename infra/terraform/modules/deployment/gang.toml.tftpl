@@ -14,6 +14,7 @@ endpoint = ${jsonencode(endpoint)}
 name = ${jsonencode(f.name)}
 isa = ${jsonencode(f.isa)}
 sandbox = ${jsonencode(f.sandbox)}
+action_environment = ${jsonencode(f.action_environment)}
 min_instances = ${f.min_instances}
 max_instances = ${f.max_instances}
 vcpus_per_instance = ${f.vcpus_per_instance}
@@ -96,20 +97,8 @@ path = "/var/lib/gang/gang.db"
 %{ endif ~}
 
 [sandbox.bwrap]
-# The NixOS worker image provides these paths for sandboxed actions: the Nix store, the system
-# profile, and the ELF interpreter directories through which nix-ld runs dynamically linked glibc
-# programs such as the toolchains Bazel downloads (infra/nixos/glibc-loader.nix).
-readonly_bind_paths = ["/nix/store", "/run/current-system/sw", "/lib", "/lib64"]
+root = "/etc/gang/action-rootfs"
 permit_network_property = ${gang_settings.permit_network_property}
-
-# The worker image's action tools (infra/nixos/action-tools.nix) where a Linux build host has them:
-# /bin/sh, /bin/bash, /usr/bin/env and the tools of Bazel's strict action PATH.
-[sandbox.bwrap.readonly_bind_mounts]
-"/bin" = "/etc/gang-action-tools/bin"
-"/usr/bin" = "/etc/gang-action-tools/bin"
-"/etc/ssl/certs/ca-certificates.crt" = "/etc/gang-action-ca.crt"
-"/etc/ssl/cert.pem" = "/etc/gang-action-ca.crt"
-"/etc/pki/tls/certs/ca-bundle.crt" = "/etc/gang-action-ca.crt"
 
 [limits.cgroup]
 

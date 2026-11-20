@@ -2,6 +2,10 @@
 
 SALT = ""
 ACTION_PATH = ""
+ACTION_SHELL = "/bin/bash"
+ACTION_IPC = False
+HOST_ACTION_PATH = ""
+HOST_ACTION_SHELL = "/bin/bash"
 SIGNAL = ""
 ATTEMPTS = ""
 ISA = "x86-64"

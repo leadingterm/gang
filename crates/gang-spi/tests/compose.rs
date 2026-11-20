@@ -159,6 +159,7 @@ number = 13
 name = "workers"
 isa = "x86-64"
 sandbox = "boxed"
+action_environment = "host:test"
 min_instances = 0
 max_instances = 4
 vcpus_per_instance = 4
@@ -183,9 +184,11 @@ number = 4
 
 [sandbox.direct]
 number = 5
+environment = "host:direct"
 
 [sandbox.boxed]
 number = 6
+environment = "host:test"
 
 [identity.providers.corp.token]
 number = 7
@@ -296,7 +299,7 @@ fn every_provisioner_port_reaches_the_selected_plugin() -> Result<(), Box<dyn Er
     );
     let gone = instance(1)?;
     assert!(matches!(
-        ready(gang_testkit::fence::with_held(async |held| provisioner.terminate(held, fleet.view(), &gone).await)),
+        ready(gang_testkit::fence::with_held(async |held| provisioner.terminate(held, fleet.view(), &gone, gang_spi::RetirementReason::Idle).await)),
         Err(gang_spi::RunError::Failed(PortError::NotFound(Subject::Instance(found)))) if found == gone
     ));
     assert_eq!(ready(provisioner.identity())?.instance, instance(2)?);
@@ -363,6 +366,7 @@ impl ProvisionerPort for DefaultConverge {
         _held: &gang_spi::Held,
         _fleet: Fleet<'_, Self::FleetOptions>,
         _instance: &gang_types::InstanceId,
+        _reason: gang_spi::RetirementReason,
     ) -> Result<(), PortError> {
         Ok(())
     }
@@ -551,6 +555,7 @@ fn scheduler_runs_controller_and_worker() -> Result<(), Box<dyn Error>> {
         &name,
         Isa::X86_64,
         &"boxed",
+        &"host:test".parse()?,
         Resources {
             vcpus: 4,
             memory: Bytes::new(1),
@@ -712,6 +717,8 @@ fn sandbox_builds_the_selected_plugin_and_dispatches_by_variant() -> Result<(), 
 
     assert!(matches!(direct, Sandbox::Direct(_)));
     assert!(matches!(boxed, Sandbox::Boxed(_)));
+    assert_eq!(direct.environment().as_str(), "host:direct");
+    assert_eq!(boxed.environment().as_str(), "host:test");
     assert_eq!(execute(&direct)?, ActionExecutionOutcome::Exited(5));
     assert_eq!(execute(&boxed)?, ActionExecutionOutcome::Exited(6));
     Ok(())
@@ -719,7 +726,10 @@ fn sandbox_builds_the_selected_plugin_and_dispatches_by_variant() -> Result<(), 
 
 #[test]
 fn a_sandbox_whose_section_is_absent_is_not_built() -> Result<(), Box<dyn Error>> {
-    let text = CONFIG.replace("[sandbox.direct]\nnumber = 5\n", "");
+    let text = CONFIG.replace(
+        "[sandbox.direct]\nnumber = 5\nenvironment = \"host:direct\"\n",
+        "",
+    );
 
     let result = Sandbox::build(SandboxKey::Direct, sandbox_config(&text)?, &context());
     assert!(matches!(
@@ -884,7 +894,10 @@ fn sandbox_programs_are_visited_for_the_selected_section_only() -> Result<(), Bo
     let mut absent = sandbox_config(
         &CONFIG
             .replace("sandbox = \"boxed\"", "sandbox = \"direct\"")
-            .replace("[sandbox.boxed]\nnumber = 6\n", ""),
+            .replace(
+                "[sandbox.boxed]\nnumber = 6\nenvironment = \"host:test\"\n",
+                "",
+            ),
     )?;
     assert!(visited_programs(&mut absent, SandboxKey::Boxed).is_empty());
     Ok(())
@@ -1057,7 +1070,7 @@ fn foreign_fleet_options_are_rejected_without_panicking() -> Result<(), Box<dyn 
     let gone = instance(1)?;
     assert!(matches!(
         ready(gang_testkit::fence::with_held(async |held| provisioner
-            .terminate(held, fleet.view(), &gone)
+            .terminate(held, fleet.view(), &gone, gang_spi::RetirementReason::Idle)
             .await)),
         Err(gang_spi::RunError::Failed(PortError::Config(_)))
     ));

@@ -844,6 +844,7 @@ async fn terminate_on_demand_member_decrements_only_the_twin() -> TestResult {
                 held,
                 fleet.view(),
                 &InstanceId::try_new("i-od-1").expect("test value is valid"),
+                gang_spi::RetirementReason::Idle,
             )
             .await
     })
@@ -891,6 +892,7 @@ async fn terminate_spot_member_decrements_only_spot() -> TestResult {
                 held,
                 fleet.view(),
                 &InstanceId::try_new("i-spot-1").expect("test value is valid"),
+                gang_spi::RetirementReason::Idle,
             )
             .await
     })
@@ -935,6 +937,7 @@ async fn terminate_warm_twin_member_releases_into_pool() -> TestResult {
                 held,
                 fleet.view(),
                 &InstanceId::try_new("i-od-1").expect("test value is valid"),
+                gang_spi::RetirementReason::Idle,
             )
             .await
     })
@@ -1008,6 +1011,7 @@ async fn terminate_spot_member_beside_warm_twin_skips_protection() -> TestResult
                 held,
                 fleet.view(),
                 &InstanceId::try_new("i-spot-1").expect("test value is valid"),
+                gang_spi::RetirementReason::Idle,
             )
             .await
     })

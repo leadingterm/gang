@@ -38,6 +38,7 @@ known_leaves!(
     isize,
     Duration,
     gang_clock::Timestamp,
+    gang_types::ActionEnvironment,
     gang_types::Url,
     gang_types::CertificatePem,
     gang_types::CertificateRequestPem,

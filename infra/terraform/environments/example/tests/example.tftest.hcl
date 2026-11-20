@@ -92,7 +92,7 @@ override_data {
   values = {
     name             = "gang-x86_64-aaaaaaaaaaaaaaaa"
     boot_mode        = "uefi"
-    tags             = { "ec2:SharedTag/ImageSha256" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+    tags             = { "ec2:SharedTag/ImageSha256" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ec2:SharedTag/ActionEnvironment" = "0000000000000000000000000000000000000000000000000000000000000000" }
     deprecation_time = ""
   }
 }

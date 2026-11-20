@@ -34,6 +34,7 @@ fn fleet_member(name: &str, max_instances: u32) -> FleetMember<TestPlugins> {
     let policy = FleetPolicy {
         name: FleetName::try_new(name).expect("test fleet name is valid"),
         isa: Isa::X86_64,
+        action_environment: "host:test".parse().expect("valid test environment"),
         instances: InstanceBounds::up_to(
             NonZeroU32::new(max_instances).expect("test maximum is nonzero"),
         ),
@@ -58,6 +59,7 @@ fn fleet_member(name: &str, max_instances: u32) -> FleetMember<TestPlugins> {
 pub fn queued_demand(candidates: FleetSet) -> QueuedDemand {
     QueuedDemand {
         candidates,
+        environment: "host:test".parse().expect("valid test environment"),
         resources: ActionResources::default(),
         queued_since: Timestamp::UNIX_EPOCH,
         priority: 0,

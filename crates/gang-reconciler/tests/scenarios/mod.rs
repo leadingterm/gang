@@ -13,6 +13,227 @@ use gang_types::{FleetName, FleetSet, InstanceId, InstanceLifecycle, Isa, Scalin
 
 use crate::support::*;
 
+#[test]
+fn stale_idle_worker_retires_at_maximum_before_replacement() -> TestResult {
+    let mut policy = policy()?;
+    policy.instances = InstanceBounds::try_new(1, NonZeroU32::MIN)?;
+    let mut h = Harness::with_policy(policy);
+    h.settle_term()?;
+    serve(&mut h, "local-1", secs(60))?;
+    h.snapshot.workers[0].environment = Some("host:old".parse()?);
+    h.queue(X86, 1)?;
+    let first = h.run();
+    assert!(
+        first
+            .iter()
+            .any(|step| matches!(step.action, Action::StartDrain(_)))
+    );
+    assert!(
+        !first
+            .iter()
+            .any(|step| matches!(step.action, Action::ScaleOut { .. }))
+    );
+    let second = h.run();
+    assert!(second.iter().any(|step| matches!(
+        step.action,
+        Action::Terminate {
+            cause: TerminationCause::StaleEnvironment,
+            ..
+        }
+    )));
+    assert!(
+        !second
+            .iter()
+            .any(|step| matches!(step.action, Action::CancelDrain(..)))
+    );
+    let third = h.run();
+    assert!(
+        third
+            .iter()
+            .any(|step| matches!(step.action, Action::ScaleOut { to: 1, .. }))
+    );
+    Ok(())
+}
+
+#[test]
+fn finished_stale_drain_is_not_counted_in_replacement_target() -> TestResult {
+    let mut policy = policy()?;
+    policy.instances = InstanceBounds::try_new(0, NonZeroU32::MIN.saturating_add(3))?;
+    let mut h = Harness::with_policy(policy);
+    h.settle_term()?;
+    serve(&mut h, "local-1", secs(60))?;
+    h.snapshot.workers[0].environment = Some("host:old".parse()?);
+    h.set_draining("local-1", true)?;
+    h.queue(X86, 1)?;
+
+    let steps = h.reconcile();
+    assert_eq!(steps.len(), 2);
+    assert_eq!(
+        steps[0],
+        terminate("local-1", TerminationCause::StaleEnvironment)?
+    );
+    assert!(matches!(steps[1].action, Action::ScaleOut { to: 1, .. }));
+    Ok(())
+}
+
+#[test]
+fn ordered_stale_instance_lingering_in_listing_does_not_repurchase() -> TestResult {
+    let mut policy = policy()?;
+    policy.instances = InstanceBounds::try_new(0, NonZeroU32::MIN.saturating_add(3))?;
+    let mut h = Harness::with_policy(policy);
+    h.settle_term()?;
+    serve(&mut h, "local-1", secs(60))?;
+    h.snapshot.workers[0].environment = Some("host:old".parse()?);
+    h.set_draining("local-1", true)?;
+    h.queue(X86, 1)?;
+
+    let first = h.reconcile();
+    assert!(matches!(first[0].action, Action::Terminate { .. }));
+    assert!(matches!(first[1].action, Action::ScaleOut { to: 1, .. }));
+    // The termination and replacement were ordered, but the old instance is still listed.
+    assert_eq!(h.supply(X86)?.desired, 1);
+    for _ in 0..2 {
+        let steps = h.reconcile();
+        assert!(!steps.iter().any(|step| matches!(
+            step.action,
+            Action::Terminate { .. } | Action::ScaleOut { .. }
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn busy_stale_and_unborn_replacement_do_not_repeat_scale_out_at_target() -> TestResult {
+    let mut policy = policy()?;
+    policy.instances = InstanceBounds::try_new(0, NonZeroU32::MIN.saturating_add(1))?;
+    let mut h = Harness::with_policy(policy);
+    h.settle_term()?;
+    serve(&mut h, "local-1", secs(60))?;
+    h.snapshot.workers[0].environment = Some("host:old".parse()?);
+    h.set_running("local-1", 1)?;
+    h.set_desired_capacity(X86, 2);
+    h.queue(X86, 5)?;
+
+    for _ in 0..2 {
+        let steps = h.run();
+        assert!(!steps.iter().any(|step| matches!(
+            step.action,
+            Action::ScaleOut { .. } | Action::StartDrain(_) | Action::Terminate { .. }
+        )));
+        assert_eq!(h.supply(X86)?.desired, 2);
+    }
+    Ok(())
+}
+
+#[test]
+fn stale_busy_worker_finishes_and_live_only_demand_does_not_scale() -> TestResult {
+    let mut policy = policy()?;
+    policy.instances = InstanceBounds::try_new(0, NonZeroU32::MIN.saturating_add(1))?;
+    let mut h = Harness::with_policy(policy);
+    h.settle_term()?;
+    serve(&mut h, "local-1", secs(60))?;
+    h.snapshot.workers[0].environment = Some("host:old".parse()?);
+    h.set_running("local-1", 1)?;
+    h.queue(X86, 1)?;
+    h.snapshot.queued[0].environment = "host:old".parse()?;
+    assert!(h.run().is_empty());
+    h.set_running("local-1", 0)?;
+    let steps = h.run();
+    assert!(
+        steps
+            .iter()
+            .any(|step| matches!(step.action, Action::StartDrain(_)))
+    );
+    Ok(())
+}
+
+#[test]
+fn unknown_busy_worker_stays_connected_beyond_boot_grace() -> TestResult {
+    let mut h = Harness::new()?;
+    serve(&mut h, "local-1", secs(3600))?;
+    h.snapshot.workers[0].environment = None;
+    h.set_running("local-1", 1)?;
+    assert!(h.reconcile().is_empty());
+    h.advance(Duration::from_hours(1));
+    assert!(h.reconcile().is_empty());
+    Ok(())
+}
+
+#[test]
+fn unknown_busy_worker_does_not_supply_queued_identity_capacity() -> TestResult {
+    let mut policy = policy()?;
+    policy.instances = InstanceBounds::try_new(0, NonZeroU32::MIN.saturating_add(1))?;
+    let mut h = Harness::with_policy(policy);
+    h.settle_term()?;
+    serve(&mut h, "local-1", secs(3600))?;
+    h.snapshot.workers[0].environment = None;
+    h.set_running("local-1", 1)?;
+    h.queue(X86, 1)?;
+    let steps = h.reconcile();
+    assert!(
+        steps
+            .iter()
+            .any(|step| matches!(step.action, Action::ScaleOut { to: 2, .. }))
+    );
+    assert!(!steps.iter().any(|step| matches!(
+        step.action,
+        Action::StartDrain(_) | Action::Terminate { .. }
+    )));
+    Ok(())
+}
+
+#[test]
+fn unknown_idle_worker_retires_before_replacement() -> TestResult {
+    let mut policy = policy()?;
+    policy.instances = InstanceBounds::try_new(1, NonZeroU32::MIN)?;
+    let mut h = Harness::with_policy(policy);
+    h.settle_term()?;
+    serve(&mut h, "local-1", secs(60))?;
+    h.snapshot.workers[0].environment = None;
+    h.queue(X86, 1)?;
+    let first = h.run();
+    assert!(
+        first
+            .iter()
+            .any(|step| matches!(step.action, Action::StartDrain(_)))
+    );
+    assert!(
+        !first
+            .iter()
+            .any(|step| matches!(step.action, Action::ScaleOut { .. }))
+    );
+    let second = h.run();
+    assert!(second.iter().any(|step| matches!(
+        step.action,
+        Action::Terminate {
+            cause: TerminationCause::StaleEnvironment,
+            ..
+        }
+    )));
+    assert!(
+        h.run()
+            .iter()
+            .any(|step| matches!(step.action, Action::ScaleOut { to: 1, .. }))
+    );
+    Ok(())
+}
+
+#[test]
+fn unknown_busy_draining_worker_obeys_max_drain_wait() -> TestResult {
+    let mut h = Harness::new()?;
+    serve(&mut h, "local-1", secs(60))?;
+    h.snapshot.workers[0].environment = None;
+    h.set_running("local-1", 2)?;
+    h.set_draining("local-1", true)?;
+    assert!(h.reconcile().is_empty());
+    h.advance(secs(60));
+    assert_eq!(
+        h.reconcile(),
+        vec![terminate("local-1", TerminationCause::MaxDrainWait)?]
+    );
+    Ok(())
+}
+
 /// Index of the spot fleet in the preference test.
 const SPOT: usize = 0;
 

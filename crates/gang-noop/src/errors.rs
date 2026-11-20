@@ -5,6 +5,9 @@ use std::io;
 /// Why an action could not be run.
 #[derive(Debug, thiserror::Error, gang_spi::PortFailure)]
 pub(crate) enum NoopError {
+    /// A no-op sandbox cannot claim an isolated root filesystem.
+    #[error("noop sandbox requires a host environment identity")]
+    RootfsEnvironment,
     /// The per-action TMPDIR could not be created.
     #[error("cannot create the temporary directory")]
     TemporaryDirectory(#[source] io::Error),

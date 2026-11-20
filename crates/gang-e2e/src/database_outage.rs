@@ -515,7 +515,7 @@ pub fn database_outage(cluster: &Cluster<'_>, controller_count: usize) -> Result
         for _ in 0..2 {
             while journal.read_line()? != JOURNAL_END {}
         }
-        fs::remove_file(&go).map_err(E2eError::io("resetting the held-action signal"))?;
+        fs::write(&go, b"").map_err(E2eError::io("resetting the held-action signal"))?;
         checks.extend(
             partition(cluster, &journal, &go)
                 .map_err(|error| variant_error(controller_count, "database partition", &error))?,

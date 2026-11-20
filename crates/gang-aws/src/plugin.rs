@@ -244,9 +244,13 @@ impl ProvisionerPort for Aws {
         held: &Held,
         fleet: Fleet<'_, AwsFleetOptions>,
         instance: &InstanceId,
+        reason: gang_spi::RetirementReason,
     ) -> Result<(), PortError> {
         let runtime = self.runtime().await?;
-        runtime.fleets.terminate(held, fleet, instance).await?;
+        runtime
+            .fleets
+            .terminate(held, fleet, instance, reason)
+            .await?;
         Ok(())
     }
 
@@ -507,6 +511,7 @@ mod tests {
                 held,
                 fleet(GROUP).expect("test value is valid").view(),
                 &InstanceId::try_new(OTHER_INSTANCE).expect("test value is valid"),
+                gang_spi::RetirementReason::Idle,
             )
             .await
         })

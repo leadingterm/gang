@@ -1178,7 +1178,7 @@ fn noop_fleet_isolation_is_skipped_when_the_host_is_unreadable() {
 }
 
 #[test]
-fn pool_oom_requires_kernel_evidence_and_one_escalated_retry() {
+fn pool_oom_requires_kernel_evidence_and_escalated_retries() {
     use gang_e2e::{AttemptRecord, pool_oom_verdicts};
     let records = [
         AttemptRecord {
@@ -1221,4 +1221,120 @@ fn pool_oom_requires_kernel_evidence_and_one_escalated_retry() {
             .iter()
             .all(Check::is_passed)
     );
+}
+
+#[test]
+fn pool_oom_accepts_retries_of_both_actions() {
+    use gang_e2e::{AttemptRecord, pool_oom_verdicts};
+    let ci_records = [
+        AttemptRecord {
+            action: "pressure_victim".to_owned(),
+            memory_kb: 65_536,
+        },
+        AttemptRecord {
+            action: "pressure_neighbour".to_owned(),
+            memory_kb: 327_680,
+        },
+        AttemptRecord {
+            action: "pressure_victim".to_owned(),
+            memory_kb: 243_630,
+        },
+        AttemptRecord {
+            action: "pressure_neighbour".to_owned(),
+            memory_kb: 458_752,
+        },
+    ];
+    assert!(
+        pool_oom_verdicts(1, true, &ci_records, 250, 458_752)
+            .iter()
+            .all(Check::is_passed)
+    );
+}
+
+fn pool_oom_multiple_attempts() -> [gang_e2e::AttemptRecord; 6] {
+    use gang_e2e::AttemptRecord;
+    [
+        AttemptRecord {
+            action: "pressure_victim".to_owned(),
+            memory_kb: 10,
+        },
+        AttemptRecord {
+            action: "pressure_neighbour".to_owned(),
+            memory_kb: 20,
+        },
+        AttemptRecord {
+            action: "pressure_victim".to_owned(),
+            memory_kb: 25,
+        },
+        AttemptRecord {
+            action: "pressure_neighbour".to_owned(),
+            memory_kb: 50,
+        },
+        AttemptRecord {
+            action: "pressure_victim".to_owned(),
+            memory_kb: 63,
+        },
+        AttemptRecord {
+            action: "pressure_neighbour".to_owned(),
+            memory_kb: 100,
+        },
+    ]
+}
+
+#[test]
+fn pool_oom_accepts_multiple_escalations() {
+    use gang_e2e::pool_oom_verdicts;
+    let multiple = pool_oom_multiple_attempts();
+    assert!(
+        pool_oom_verdicts(1, true, &multiple, 250, 100)
+            .iter()
+            .all(Check::is_passed)
+    );
+}
+
+#[test]
+fn pool_oom_rejects_invalid_reservations_and_actions() {
+    use gang_e2e::{AttemptRecord, pool_oom_verdicts};
+    let multiple = pool_oom_multiple_attempts();
+    let mut invalid = multiple.clone();
+    invalid[4].memory_kb = 62;
+    assert!(pool_oom_verdicts(1, true, &invalid, 250, 100)[1].is_failure());
+    invalid = multiple.clone();
+    invalid[5].memory_kb = 50;
+    assert!(pool_oom_verdicts(1, true, &invalid, 250, 100)[1].is_failure());
+    invalid = multiple.clone();
+    invalid[0].memory_kb = 0;
+    assert!(pool_oom_verdicts(1, true, &invalid, 250, 100)[1].is_failure());
+    invalid = multiple.clone();
+    invalid[1].memory_kb = 101;
+    assert!(pool_oom_verdicts(1, true, &invalid, 250, 100)[1].is_failure());
+    invalid = multiple.clone();
+    invalid[5].memory_kb = 101;
+    assert!(pool_oom_verdicts(1, true, &invalid, 250, 100)[1].is_failure());
+    invalid = multiple.clone();
+    invalid[4].action = "unexpected".to_owned();
+    assert!(pool_oom_verdicts(1, true, &invalid, 250, 100)[1].is_failure());
+    assert!(
+        pool_oom_verdicts(
+            1,
+            true,
+            &[multiple[0].clone(), multiple[2].clone()],
+            250,
+            100
+        )[1]
+        .is_failure()
+    );
+    let at_capacity = [
+        multiple[0].clone(),
+        multiple[1].clone(),
+        AttemptRecord {
+            action: "pressure_victim".to_owned(),
+            memory_kb: 100,
+        },
+        AttemptRecord {
+            action: "pressure_victim".to_owned(),
+            memory_kb: 100,
+        },
+    ];
+    assert!(pool_oom_verdicts(1, true, &at_capacity, 250, 100)[1].is_failure());
 }

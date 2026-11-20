@@ -76,12 +76,13 @@ impl Simulation {
     fn dispatch(
         &mut self,
         snapshot: &SchedulerSnapshot,
-        attribution: &[Option<usize>],
+        placement: (&[Option<usize>], &[gang_types::FleetSet]),
         boots: &[u64],
         start: usize,
         stop_at: Option<u64>,
         tracked: Option<(usize, u32)>,
     ) -> usize {
+        let (attribution, matching) = placement;
         for (index, action) in snapshot.queued.iter().enumerate().skip(start) {
             let Some(fleet) = attribution
                 .get(index)
@@ -91,7 +92,7 @@ impl Simulation {
             else {
                 continue;
             };
-            let best = self.best(action.candidates);
+            let best = self.best(matching[index]);
             if stop_at.is_some_and(|boot| best.is_none_or(|(slot, _)| slot.free >= boot)) {
                 return index;
             }
@@ -135,6 +136,7 @@ fn project_running(remaining: &mut Vec<u64>, cap: usize) {
 #[derive(Debug)]
 pub(crate) struct WorkPlanner {
     attribution: Vec<Option<usize>>,
+    matching: Vec<gang_types::FleetSet>,
     work: Vec<u32>,
     slots: Vec<u32>,
     boots: Vec<u64>,
@@ -150,6 +152,7 @@ impl WorkPlanner {
         let n = fleets.len();
         Self {
             attribution: Vec::new(),
+            matching: Vec::new(),
             work: vec![0; n],
             slots: vec![0; n],
             boots: vec![0; n],
@@ -163,9 +166,11 @@ impl WorkPlanner {
 
     pub(crate) fn begin_pass(&mut self) {
         self.attribution.clear();
+        self.matching.clear();
     }
-    pub(crate) fn attribute(&mut self, chosen: Option<usize>) {
+    pub(crate) fn attribute(&mut self, chosen: Option<usize>, matching: gang_types::FleetSet) {
         self.attribution.push(chosen);
+        self.matching.push(matching);
     }
     pub(crate) fn work(&self, index: usize) -> u32 {
         self.work[index]
@@ -207,7 +212,9 @@ impl WorkPlanner {
                 let mut connected = false;
                 for worker_index in hosted.workers_on(&fleet.policy.name, &instance.id) {
                     let worker = &snapshot.workers[worker_index];
-                    if worker.draining {
+                    if worker.draining
+                        || worker.environment.as_ref() != Some(&fleet.policy.action_environment)
+                    {
                         continue;
                     }
                     connected = true;
@@ -265,14 +272,14 @@ impl WorkPlanner {
     }
 
     fn repaying_count(&mut self, index: usize, headroom: u32, snapshot: &SchedulerSnapshot) -> u32 {
-        let floor = u32::from(snapshot.queued.iter().enumerate().any(|(i, action)| {
+        let floor = u32::from(snapshot.queued.iter().enumerate().any(|(i, _)| {
             self.attribution.get(i) == Some(&Some(index))
-                && self.base.best(action.candidates).is_none()
+                && self.base.best(self.matching[i]).is_none()
         }));
         self.checkpoint.copy_from(&self.base);
         let prefix = self.checkpoint.dispatch(
             snapshot,
-            &self.attribution,
+            (&self.attribution, &self.matching),
             &self.boots,
             0,
             Some(self.boots[index]),
@@ -294,7 +301,7 @@ impl WorkPlanner {
             }
             self.trial.dispatch(
                 snapshot,
-                &self.attribution,
+                (&self.attribution, &self.matching),
                 &self.boots,
                 prefix,
                 None,
@@ -374,8 +381,14 @@ impl WorkPlanner {
                 self.ordinals[index] = self.ordinals[index].saturating_add(1);
             }
         }
-        self.base
-            .dispatch(snapshot, &self.attribution, &self.boots, 0, None, None);
+        self.base.dispatch(
+            snapshot,
+            (&self.attribution, &self.matching),
+            &self.boots,
+            0,
+            None,
+            None,
+        );
         for (index, fleet) in fleets.iter_mut().enumerate() {
             fleet.outlook.expected_wait = self.base.waits[index].map(Duration::from_millis);
         }
@@ -393,11 +406,38 @@ mod tests {
         QueuedDemand {
             candidates: FleetSet::try_from_indices(fleets.iter().copied())
                 .expect("valid fleet indices"),
+            environment: gang_testkit::fleet_policy("test")
+                .expect("valid fleet")
+                .action_environment,
             resources: ActionResources::default(),
             queued_since: Timestamp::from_unix_millis(0),
             priority: 0,
             expected: Some(Duration::from_millis(duration)),
         }
+    }
+
+    #[test]
+    fn dispatch_uses_only_environment_matching_fleets() {
+        let snapshot = SchedulerSnapshot {
+            queued: vec![action(&[0, 1], 10)],
+            ..SchedulerSnapshot::default()
+        };
+        let mut sim = Simulation::new(2);
+        sim.add_instance(0, 0, 1, 0);
+        sim.add_instance(1, 0, 1, 50);
+        sim.dispatch(
+            &snapshot,
+            (
+                &[Some(1)],
+                &[FleetSet::try_from_indices([1]).expect("valid fleet")],
+            ),
+            &[100, 100],
+            0,
+            None,
+            None,
+        );
+        assert_eq!(sim.waits[1], Some(50));
+        assert_eq!(sim.heaps[0].peek().expect("slot").0.free, 0);
     }
 
     #[test]
@@ -412,7 +452,14 @@ mod tests {
             for i in 0..n {
                 sim.add_instance(0, i, 1, 150);
             }
-            sim.dispatch(&snapshot, &[Some(0); 4], &[150], 0, None, None);
+            sim.dispatch(
+                &snapshot,
+                (&[Some(0); 4], &[FleetSet::prefix(1).expect("valid"); 4]),
+                &[150],
+                0,
+                None,
+                None,
+            );
             times.push(sim.completion);
         }
         assert_eq!(times, [550, 350, 350, 250]);
@@ -442,7 +489,14 @@ mod tests {
             }
             sim.dispatch(
                 &snapshot,
-                &[Some(0), Some(0), Some(1)],
+                (
+                    &[Some(0), Some(0), Some(1)],
+                    &[
+                        FleetSet::prefix(1).expect("valid"),
+                        FleetSet::prefix(2).expect("valid"),
+                        FleetSet::try_from_indices([1]).expect("valid"),
+                    ],
+                ),
                 &[150, 150],
                 0,
                 None,
@@ -501,7 +555,7 @@ mod tests {
         hosted.replace(&mut snapshot);
         let mut planner = WorkPlanner::new(&[policy]);
         for _ in 0..count {
-            planner.attribute(Some(0));
+            planner.attribute(Some(0), FleetSet::prefix(1).expect("valid"));
         }
         let capacity = Capacity {
             live: standing,
@@ -571,6 +625,7 @@ mod tests {
             workers: vec![WorkerState {
                 id: gang_testkit::worker_id("worker").expect("valid worker"),
                 fleet: policy.name.clone(),
+                environment: Some(policy.action_environment.clone()),
                 running_actions: 3,
                 max_inflight_actions: Some(nonzero_u32(2)),
                 draining: false,
@@ -595,7 +650,7 @@ mod tests {
         let mut hosted = HostedSnapshot::default();
         hosted.replace(&mut snapshot);
         let mut planner = WorkPlanner::new(&[policy]);
-        planner.attribute(Some(0));
+        planner.attribute(Some(0), FleetSet::prefix(1).expect("valid"));
         let capacity = Capacity {
             live: 1,
             standing: 1,
@@ -644,6 +699,7 @@ mod tests {
             workers: vec![WorkerState {
                 id: gang_testkit::worker_id("worker").expect("valid worker"),
                 fleet: policy.name.clone(),
+                environment: Some(policy.action_environment.clone()),
                 running_actions: 16,
                 max_inflight_actions: Some(nonzero_u32(16)),
                 draining: false,
@@ -670,7 +726,7 @@ mod tests {
         hosted.replace(&mut snapshot);
         let mut planner = WorkPlanner::new(&[policy]);
         for _ in 0..16 {
-            planner.attribute(Some(0));
+            planner.attribute(Some(0), FleetSet::prefix(1).expect("valid"));
         }
         let capacity = Capacity {
             live: 1,

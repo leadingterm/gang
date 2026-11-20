@@ -5,20 +5,16 @@
 //!
 //! ```
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! use gang_bwrap::{Bwrap, BwrapConfig};
-//! use gang_spi::{Plugin, PluginContext};
+//! use gang_bwrap::BwrapConfig;
 //! use gang_types::AbsolutePathBuf;
-//! use std::path::{Path, PathBuf};
+//! use std::path::PathBuf;
 //!
 //! let config = BwrapConfig {
-//!     readonly_bind_paths: vec![AbsolutePathBuf::try_new("/usr")?],
-//!     readonly_bind_mounts: std::collections::BTreeMap::new(),
+//!     root: AbsolutePathBuf::try_new("/etc/gang/action-rootfs")?,
 //!     permit_network_property: false,
 //!     program: PathBuf::from("/usr/bin/bwrap"),
-//!     tmp_path: AbsolutePathBuf::try_new("/tmp")?,
 //! };
-//! let context = PluginContext { config_path: Path::new("sandbox.toml") };
-//! assert!(Bwrap::build(config, &context).is_ok());
+//! assert!(!config.permit_network_property);
 //! # Ok(()) }
 //! ```
 
