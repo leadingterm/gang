@@ -282,6 +282,7 @@ mod tests {
         Ok(WorkerState {
             id: worker_id("i-0abc123")?,
             fleet: FleetName::try_new("aarch64-fleet")?,
+            environment: Some("host:test".parse()?),
             running_actions,
             max_inflight_actions: NonZeroU32::new(4),
             paused: false,

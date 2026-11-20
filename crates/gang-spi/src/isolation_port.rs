@@ -21,6 +21,9 @@ pub const RESET_LINK_NAME: &str = "gang-reset";
 /// A sandbox for actions.
 #[port]
 pub trait ActionIsolationPort: Send + Sync {
+    /// The environment actually provided by this sandbox.
+    fn environment(&self) -> &gang_types::ActionEnvironment;
+
     /// Starts the action with the caller's standard streams and returns as soon as it is running.
     ///
     /// # Errors

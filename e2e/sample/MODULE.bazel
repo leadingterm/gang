@@ -5,3 +5,6 @@ module(name = "gang_e2e_sample")
 shared_input = use_repo_rule("//:repositories.bzl", "shared_input")
 
 shared_input(name = "shared_input")
+
+action_environment_repository = use_repo_rule("//:action_environment.bzl", "action_environment_repository")
+action_environment_repository(name = "gang_env")

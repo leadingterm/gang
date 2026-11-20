@@ -177,6 +177,14 @@ impl SandboxSelection for SandboxConfig {
             },
         }
     }
+
+    fn try_for_each_root<E>(
+        &mut self,
+        _: SandboxKey,
+        _: impl FnMut(&mut gang_types::AbsolutePathBuf) -> Result<(), E>,
+    ) -> Result<(), E> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -327,6 +335,7 @@ const FLEET: &str = r#"
 [[fleets]]
 name = "local-worker-x86-64"
 isa = "x86-64"
+action_environment = "host:test"
 sandbox = "bwrap"
 min_instances = 0
 max_instances = 4
@@ -352,6 +361,7 @@ const TWO_FLEETS: &str = r#"
 [[fleets]]
 name = "amd64-spot"
 isa = "x86-64"
+action_environment = "host:test"
 sandbox = "bwrap"
 min_instances = 0
 max_instances = 4
@@ -369,6 +379,7 @@ capacity = "spot"
 [[fleets]]
 name = "arm64-on-demand"
 isa = "aarch64"
+action_environment = "host:test"
 sandbox = "noop"
 min_instances = 1
 max_instances = 2
@@ -1051,7 +1062,7 @@ fn toml_rejection(sections: &Sections) -> Result<String, Box<dyn Error>> {
 /// A `[[fleets]]` entry on the local provisioner with the given name and no options.
 fn fleet_block(name: &str) -> String {
     format!(
-        "[[fleets]]\nname = \"{name}\"\nisa = \"x86-64\"\nsandbox = \"bwrap\"\nmin_instances = 0\nmax_instances = 1\nvcpus_per_instance = 1\nmemory_per_instance = \"8GiB\"\ndisk_per_instance = \"100GiB\"\ntarget_actions_per_instance = 1\nidle_timeout = \"15s\"\nmax_drain_wait = \"1m\"\nboot_grace = \"1m\"\n"
+        "[[fleets]]\nname = \"{name}\"\nisa = \"x86-64\"\naction_environment = \"host:test\"\nsandbox = \"bwrap\"\nmin_instances = 0\nmax_instances = 1\nvcpus_per_instance = 1\nmemory_per_instance = \"8GiB\"\ndisk_per_instance = \"100GiB\"\ntarget_actions_per_instance = 1\nidle_timeout = \"15s\"\nmax_drain_wait = \"1m\"\nboot_grace = \"1m\"\n"
     )
 }
 
@@ -3573,6 +3584,7 @@ fn hand_member(
     let policy = FleetPolicy {
         name: name.parse()?,
         isa,
+        action_environment: "host:test".parse()?,
         instances: InstanceBounds::up_to(NonZeroU32::MIN.saturating_add(3)),
         vcpus_per_instance: NonZeroU32::MIN,
         memory_per_instance: NonZeroBytes::gib(8),

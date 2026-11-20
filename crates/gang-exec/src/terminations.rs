@@ -114,7 +114,8 @@ mod tests {
                     std::fs::write(&input, b"input")?;
                     std::fs::hard_link(&input, directory.path().join("linked-input"))?;
                     let log = CallLog::default();
-                    let sandbox = ScriptedSandbox::exiting(&log, ActionExecutionOutcome::Exited(0));
+                    let sandbox =
+                        ScriptedSandbox::try_exiting(&log, ActionExecutionOutcome::Exited(0))?;
                     let limits = RecordingLimits::new(&log);
                     let argv = [OsString::from("cmd")];
                     let action = Action {

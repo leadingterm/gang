@@ -13,8 +13,8 @@ use tokio::sync::oneshot;
 
 use gang_clock::Timestamp;
 use gang_types::{
-    ActionResources, BuildId, Bytes, FleetCatalog, FleetName, FleetProperties, FleetSet,
-    InstanceId, Refusal, Url, WorkerId,
+    ActionEnvironment, ActionResources, BuildId, Bytes, FleetCatalog, FleetName, FleetProperties,
+    FleetSet, InstanceId, Refusal, Url, WorkerId,
 };
 
 use crate::{
@@ -215,6 +215,8 @@ pub struct WorkerState {
     pub id: WorkerId,
     /// The fleet the worker registered.
     pub fleet: FleetName,
+    /// The action environment actually served, if the worker reported a valid identity.
+    pub environment: Option<ActionEnvironment>,
     /// Actions it is running.
     pub running_actions: u32,
     /// Actions it accepts at once; `None` when the worker accepts any number.
@@ -234,6 +236,8 @@ pub struct QueuedDemand {
     /// The fleets that accept the action, as indices into [`ControllerSpec::fleets`], in
     /// preference order; empty when none accepts it.
     pub candidates: FleetSet,
+    /// The exact action environment required by this action.
+    pub environment: ActionEnvironment,
     /// The resources the action requests, each dimension zero when the action does not request it.
     pub resources: ActionResources,
     /// When it was queued.

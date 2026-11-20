@@ -1,9 +1,8 @@
 //! The rendezvous between the harness and the hold probe: a named pipe in the signal directory.
 //!
-//! The hold action runs in a sandbox whose only host mounts are its working directory, the
-//! configuration's read-only binds, and an empty `tmp_path`, so a file it creates is invisible to
-//! the harness. A named pipe is visible through a bind. The harness keeps the pipe open for reading
-//! and writing, so opening it never blocks. Once the hold action's orphan runs, it opens the pipe
+//! The harness keeps the pipe open for reading and writing, so opening it never blocks.
+//! Bwrap actions access it through a hard link in their writable working directory.
+//! Once the hold action's orphan runs, it opens the pipe
 //! for writing and writes a byte, which ends [`Signal::wait`]. When the hold build ends without
 //! the orphan ever running, the harness itself calls [`Signal::notify`], so a wait always ends.
 //! The harness bounds its wait with a deadline, so a hold action that never signals fails its

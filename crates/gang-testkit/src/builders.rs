@@ -9,7 +9,7 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use gang_config::{FleetPolicy, InstanceBounds, ScheduledMinimum, Weekday, Weekdays};
-use gang_types::{FleetName, FleetProperties, Isa, NameError, NonZeroBytes, nonzero_u32};
+use gang_types::{FleetName, FleetProperties, Isa, NonZeroBytes, nonzero_u32};
 
 use crate::TestResult;
 use crate::plugins::SandboxKey;
@@ -41,11 +41,12 @@ pub fn scheduled_minimum(
 ///
 /// # Errors
 ///
-/// [`NameError`] when `name` is not a valid fleet name.
-pub fn fleet_policy(name: &str) -> Result<FleetPolicy, NameError> {
+/// When `name` or the sample action environment is invalid.
+pub fn fleet_policy(name: &str) -> TestResult<FleetPolicy> {
     Ok(FleetPolicy {
         name: FleetName::try_new(name)?,
         isa: Isa::X86_64,
+        action_environment: "host:test".parse()?,
         instances: InstanceBounds::up_to(nonzero_u32(4)),
         vcpus_per_instance: nonzero_u32(4),
         memory_per_instance: NonZeroBytes::gib(8),
@@ -69,8 +70,8 @@ pub fn fleet_of(policy: &FleetPolicy) -> FleetProperties {
 ///
 /// # Errors
 ///
-/// [`NameError`] when `name` is not a valid fleet name.
-pub fn fleet(name: &str) -> Result<FleetProperties, NameError> {
+/// When `name` or the sample action environment is invalid.
+pub fn fleet(name: &str) -> TestResult<FleetProperties> {
     Ok(fleet_of(&fleet_policy(name)?))
 }
 
@@ -111,6 +112,7 @@ mod tests {
             FleetPolicy {
                 name: FleetName::try_new("workers")?,
                 isa: Isa::X86_64,
+                action_environment: "host:test".parse()?,
                 instances: InstanceBounds::up_to(nonzero_u32(4)),
                 vcpus_per_instance: NonZeroU32::new(4).ok_or("four is not zero")?,
                 memory_per_instance: NonZeroBytes::gib(8),

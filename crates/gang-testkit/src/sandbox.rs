@@ -9,6 +9,7 @@ use gang_spi::{
     ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, NetworkRequest, PortError,
     SandboxedAction,
 };
+use gang_types::ActionEnvironment;
 use parking_lot::Mutex;
 
 use crate::CallLog;
@@ -43,6 +44,7 @@ enum Start {
 /// with, and ends each started action with a scripted outcome. Clones share what they were asked.
 #[derive(Clone)]
 pub struct ScriptedSandbox {
+    environment: ActionEnvironment,
     log: CallLog,
     start: Start,
     failing_wait: bool,
@@ -50,16 +52,32 @@ pub struct ScriptedSandbox {
 }
 
 impl ScriptedSandbox {
-    /// Creates a sandbox whose every action starts and resolves to `Ok(outcome)` when waited for.
-    #[must_use]
-    pub fn exiting(log: &CallLog, outcome: ActionExecutionOutcome) -> Self {
-        Self::with_start(log, Start::Exits(outcome))
+    /// Creates a sandbox whose actions resolve to `Ok(outcome)` when waited for.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the test host identity is invalid.
+    pub fn try_exiting(
+        log: &CallLog,
+        outcome: ActionExecutionOutcome,
+    ) -> Result<Self, gang_types::ActionEnvironmentError> {
+        Self::try_with_start(log, Start::Exits(outcome))
     }
 
     /// Creates a sandbox whose every start fails with a backend error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the test host identity is invalid.
+    pub fn try_failing_to_start(log: &CallLog) -> Result<Self, gang_types::ActionEnvironmentError> {
+        Self::try_with_start(log, Start::Fails)
+    }
+
+    /// Sets the environment reported by the sandbox.
     #[must_use]
-    pub fn failing_to_start(log: &CallLog) -> Self {
-        Self::with_start(log, Start::Fails)
+    pub fn with_environment(mut self, environment: ActionEnvironment) -> Self {
+        self.environment = environment;
+        self
     }
 
     /// Makes every started action resolve to a backend error when waited for.
@@ -76,17 +94,25 @@ impl ScriptedSandbox {
         self.started.lock().clone()
     }
 
-    fn with_start(log: &CallLog, start: Start) -> Self {
-        Self {
+    fn try_with_start(
+        log: &CallLog,
+        start: Start,
+    ) -> Result<Self, gang_types::ActionEnvironmentError> {
+        Ok(Self {
+            environment: "host:test".parse()?,
             log: log.clone(),
             start,
             failing_wait: false,
             started: Arc::default(),
-        }
+        })
     }
 }
 
 impl ActionIsolationPort for ScriptedSandbox {
+    fn environment(&self) -> &ActionEnvironment {
+        &self.environment
+    }
+
     async fn start(&self, spec: &ActionExecutionSpec<'_>) -> Result<SandboxedAction, PortError> {
         self.log.record("sandbox.start");
         self.started.lock().push(StartedAction {
@@ -155,9 +181,19 @@ mod tests {
     }
 
     #[test]
+    fn reports_configured_environment() -> TestResult {
+        let identity = "a".repeat(64).parse()?;
+        let sandbox =
+            ScriptedSandbox::try_exiting(&CallLog::default(), ActionExecutionOutcome::Exited(0))?
+                .with_environment(identity);
+        assert_eq!(sandbox.environment().as_str(), "a".repeat(64));
+        Ok(())
+    }
+
+    #[test]
     fn exiting_sandbox_starts_then_resolves_to_its_outcome() -> TestResult {
         let log = CallLog::default();
-        let sandbox = ScriptedSandbox::exiting(&log, ActionExecutionOutcome::Exited(3));
+        let sandbox = ScriptedSandbox::try_exiting(&log, ActionExecutionOutcome::Exited(3))?;
 
         let mut action = start_action(&sandbox)?;
         assert_eq!(log.calls(), ["sandbox.start"]);
@@ -168,9 +204,9 @@ mod tests {
     }
 
     #[test]
-    fn failing_start_logs_the_start_and_errors_with_backend() {
+    fn failing_start_logs_the_start_and_errors_with_backend() -> TestResult {
         let log = CallLog::default();
-        let sandbox = ScriptedSandbox::failing_to_start(&log);
+        let sandbox = ScriptedSandbox::try_failing_to_start(&log)?;
 
         assert!(matches!(
             start_action(&sandbox)
@@ -179,13 +215,14 @@ mod tests {
             Some(error) if matches!(*error, PortError::Backend(_))
         ));
         assert_eq!(log.calls(), ["sandbox.start"]);
+        Ok(())
     }
 
     #[test]
     fn failing_wait_resolves_the_action_to_a_backend_error() -> TestResult {
         let log = CallLog::default();
-        let sandbox =
-            ScriptedSandbox::exiting(&log, ActionExecutionOutcome::Exited(0)).failing_to_wait();
+        let sandbox = ScriptedSandbox::try_exiting(&log, ActionExecutionOutcome::Exited(0))?
+            .failing_to_wait();
 
         let mut action = start_action(&sandbox)?;
 
@@ -195,9 +232,9 @@ mod tests {
     }
 
     #[test]
-    fn started_records_every_spec_including_failed_starts() {
+    fn started_records_every_spec_including_failed_starts() -> TestResult {
         let log = CallLog::default();
-        let sandbox = ScriptedSandbox::failing_to_start(&log);
+        let sandbox = ScriptedSandbox::try_failing_to_start(&log)?;
 
         assert!(start_action(&sandbox).is_err());
 
@@ -212,5 +249,6 @@ mod tests {
                 launcher: Vec::new(),
             }]
         );
+        Ok(())
     }
 }

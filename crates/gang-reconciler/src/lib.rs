@@ -17,6 +17,7 @@
 //! let policy = FleetPolicy {
 //!     name: FleetName::try_new("x86-64-fleet")?,
 //!     isa: Isa::X86_64,
+//!     action_environment: "host:test".parse()?,
 //!     instances: InstanceBounds::up_to(nonzero_u32(4)),
 //!     vcpus_per_instance: nonzero_u32(4),
 //!     memory_per_instance: NonZeroBytes::gib(8),
@@ -31,6 +32,7 @@
 //! let mut snapshot = SchedulerSnapshot {
 //!     queued: vec![QueuedDemand {
 //!         candidates: FleetSet::prefix(1)?,
+//!         environment: policy.action_environment.clone(),
 //!         resources: ActionResources::default(),
 //!         queued_since: Timestamp::from_unix_millis(0),
 //!         priority: 0,

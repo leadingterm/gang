@@ -513,6 +513,7 @@ mod tests {
                 &FleetName::try_new("fleet-a").expect("fleet name"),
                 Isa::X86_64,
                 &"docker",
+                &"host:test".parse().expect("valid environment"),
                 Resources {
                     vcpus: 4,
                     memory: Bytes::new(8 * 1024 * 1024 * 1024),

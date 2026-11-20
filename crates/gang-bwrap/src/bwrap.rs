@@ -1,12 +1,13 @@
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use gang_spi::{
     ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, Plugin, PluginContext,
     PortError, SandboxedAction,
 };
+use gang_types::ActionEnvironment;
 use rustix::process::Pid;
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
@@ -15,16 +16,7 @@ use crate::BwrapConfig;
 use crate::errors::BwrapError;
 use crate::relay::Relay;
 
-/// The arguments every sandbox gets before its tmpfs, which the configured tmp path fills in.
-const FIXED_ARGUMENTS: [&str; 7] = [
-    "--unshare-all",
-    "--die-with-parent",
-    "--new-session",
-    "--proc",
-    "/proc",
-    "--dev",
-    "/dev",
-];
+const RESERVED: [&str; 4] = ["/proc", "/dev", "/tmp", "/gang-reset"];
 
 /// The most bytes read from bwrap's info report; the report is one small JSON object, well under this.
 const INFO_LIMIT: u64 = 4096;
@@ -42,8 +34,10 @@ pub struct Bwrap {
     pub(crate) prefix: Box<[OsString]>,
     /// Whether the configuration permits the action to share the host network.
     pub(crate) permit_network: bool,
-    /// Identity files supplied explicitly by the operator.
-    pub(crate) identity_overrides: [bool; 3],
+    /// Identity of the immutable rootfs selected at worker preparation.
+    pub(crate) environment: ActionEnvironment,
+    /// Absolute destinations of the immutable top-level entries.
+    pub(crate) entries: Box<[PathBuf]>,
 }
 
 impl Plugin for Bwrap {
@@ -51,50 +45,95 @@ impl Plugin for Bwrap {
 
     fn build(config: Self::Config, _context: &PluginContext<'_>) -> Result<Self, PortError> {
         let BwrapConfig {
-            readonly_bind_paths,
-            readonly_bind_mounts,
+            root,
             permit_network_property,
             program,
-            tmp_path,
         } = config;
 
         if !program.is_absolute() {
             return Err(BwrapError::RelativeProgram(program).into());
         }
 
-        let identity_overrides = ["/etc/passwd", "/etc/group", "/etc/nsswitch.conf"].map(|path| {
-            readonly_bind_mounts
-                .keys()
-                .any(|destination| destination.as_path() == std::path::Path::new(path))
-        });
-        let mut prefix = Vec::with_capacity(
-            FIXED_ARGUMENTS.len()
-                + 3
-                + 3 * readonly_bind_paths.len()
-                + 3 * readonly_bind_mounts.len(),
+        let envelope = std::fs::canonicalize(root.as_path())
+            .map_err(|error| BwrapError::Root(root.as_path().to_path_buf(), error))?;
+        let identity_path = envelope.join("identity");
+        let mut identity = std::fs::read_to_string(&identity_path)
+            .map_err(|error| BwrapError::Root(identity_path.clone(), error))?;
+        if identity.pop() != Some('\n') {
+            return Err(BwrapError::RootIdentity(identity_path).into());
+        }
+        let environment = ActionEnvironment::try_from(identity)
+            .ok()
+            .filter(ActionEnvironment::is_rootfs)
+            .ok_or(BwrapError::RootIdentity(identity_path))?;
+        let tree = envelope.join("root");
+        let listing =
+            std::fs::read_dir(&tree).map_err(|error| BwrapError::Root(tree.clone(), error))?;
+        let mut roots = Vec::new();
+        for item in listing {
+            let item = item.map_err(|error| BwrapError::Root(tree.clone(), error))?;
+            roots.push(item);
+        }
+        roots.sort_by_key(std::fs::DirEntry::file_name);
+        let mut prefix: Vec<OsString> = [
+            "--unshare-all",
+            "--unshare-user",
+            "--uid",
+            "1000",
+            "--gid",
+            "1000",
+            "--die-with-parent",
+            "--new-session",
+            "--clearenv",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        let mut entries = Vec::with_capacity(roots.len());
+        for item in roots {
+            let source = item.path();
+            let destination = Path::new("/").join(item.file_name());
+            if RESERVED.iter().any(|path| destination == Path::new(path)) {
+                return Err(BwrapError::RootEntry(destination).into());
+            }
+            let kind = item
+                .file_type()
+                .map_err(|error| BwrapError::Root(source.clone(), error))?;
+            if kind.is_dir() {
+                prefix.push("--ro-bind".into());
+                prefix.push(source.into_os_string());
+                prefix.push(destination.as_os_str().to_owned());
+            } else if kind.is_symlink() {
+                let target = std::fs::read_link(&source)
+                    .map_err(|error| BwrapError::Root(source.clone(), error))?;
+                if target.is_absolute()
+                    || target
+                        .components()
+                        .any(|c| matches!(c, Component::ParentDir))
+                {
+                    return Err(BwrapError::RootEntry(source).into());
+                }
+                prefix.push("--symlink".into());
+                prefix.push(target.into_os_string());
+                prefix.push(destination.as_os_str().to_owned());
+            } else {
+                return Err(BwrapError::RootEntry(source).into());
+            }
+            entries.push(destination);
+        }
+        prefix.extend(
+            ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
+                .into_iter()
+                .map(OsString::from),
         );
-        prefix.extend(FIXED_ARGUMENTS.iter().copied().map(OsString::from));
-        prefix.push(OsString::from("--tmpfs"));
-        prefix.push(tmp_path.into_path_buf().into_os_string());
-        prefix.push(OsString::from("--clearenv"));
-        for path in readonly_bind_paths {
-            let source = path.into_path_buf().into_os_string();
-            prefix.push(OsString::from("--ro-bind"));
-            prefix.push(source.clone());
-            prefix.push(source);
-        }
-        for (destination, source) in readonly_bind_mounts {
-            prefix.push(OsString::from("--ro-bind"));
-            prefix.push(source.into_path_buf().into_os_string());
-            prefix.push(destination.into_path_buf().into_os_string());
-        }
 
         Ok(Self {
             program,
             executable: std::env::current_exe().map_err(BwrapError::Executable)?,
             prefix: prefix.into_boxed_slice(),
             permit_network: permit_network_property,
-            identity_overrides,
+            environment,
+            entries: entries.into_boxed_slice(),
         })
     }
 }
@@ -116,30 +155,31 @@ impl Plugin for Bwrap {
 /// With limits, `bwrap` is started through the scope's launcher, so the sandbox and every process
 /// in it run inside the scope.
 impl ActionIsolationPort for Bwrap {
+    fn environment(&self) -> &ActionEnvironment {
+        &self.environment
+    }
+
     async fn start(&self, spec: &ActionExecutionSpec<'_>) -> Result<SandboxedAction, PortError> {
-        let uid = rustix::process::getuid().as_raw();
-        let gid = rustix::process::getgid().as_raw();
-        let identity = [
-            (!self.identity_overrides[0])
-                .then(|| {
-                    identity_pipe(format_args!(
-                        "builder:x:{uid}:{gid}:Sandbox user:/:/bin/sh\n"
-                    ))
-                })
-                .transpose()?,
-            (!self.identity_overrides[1])
-                .then(|| identity_pipe(format_args!("builder:x:{gid}:\n")))
-                .transpose()?,
-            (!self.identity_overrides[2])
-                .then(|| identity_pipe(format_args!("passwd: files\ngroup: files\n")))
-                .transpose()?,
-        ];
+        let action = spec.action_directory;
+        if !action.is_absolute()
+            || action
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+            || self
+                .entries
+                .iter()
+                .any(|entry| action.starts_with(entry) || entry.starts_with(action))
+            || RESERVED.iter().any(|reserved| {
+                let reserved = Path::new(reserved);
+                action == reserved
+                    || reserved.starts_with(action)
+                    || (reserved != Path::new("/tmp") && action.starts_with(reserved))
+            })
+        {
+            return Err(BwrapError::ActionDirectory(action.to_path_buf()).into());
+        }
         let (reader, writer) = std::io::pipe().map_err(BwrapError::InfoPipe)?;
-        let descriptors = identity
-            .each_ref()
-            .map(|pipe| pipe.as_ref().map(AsRawFd::as_raw_fd));
-        let mut command =
-            tokio::process::Command::from(self.command(spec, writer.as_raw_fd(), &descriptors));
+        let mut command = tokio::process::Command::from(self.command(spec, writer.as_raw_fd()));
         command.kill_on_drop(true);
         // NativeLink signals every member group. Bubblewrap has no termination handler, so
         // block these signals across spawn; gang-reset clears the inherited mask for the action.
@@ -147,12 +187,7 @@ impl ActionIsolationPort for Bwrap {
         // These descriptors are inherited by bwrap (and by gang-join when a launcher is used).
         rustix::io::fcntl_setfd(&writer, rustix::io::FdFlags::empty())
             .map_err(|errno| BwrapError::InfoPipe(io::Error::from(errno)))?;
-        for pipe in identity.iter().flatten() {
-            rustix::io::fcntl_setfd(pipe, rustix::io::FdFlags::empty())
-                .map_err(|errno| BwrapError::Identity(io::Error::from(errno)))?;
-        }
         let spawned = command.spawn();
-        drop(identity);
         drop(blocked);
         let mut child = spawned.map_err(BwrapError::Run)?;
         drop(writer);
@@ -172,14 +207,6 @@ impl ActionIsolationPort for Bwrap {
             _ => Ok(SandboxedAction::new(wait)),
         }
     }
-}
-
-/// Supplies immutable, bounded data to one `--ro-bind-data` mount.
-fn identity_pipe(data: std::fmt::Arguments<'_>) -> Result<std::io::PipeReader, BwrapError> {
-    let (reader, mut writer) = std::io::pipe().map_err(BwrapError::Identity)?;
-    writer.write_fmt(data).map_err(BwrapError::Identity)?;
-    drop(writer);
-    Ok(reader)
 }
 
 /// The report `bwrap` writes on its `--info-fd`; fields it does not name are ignored.
@@ -241,7 +268,6 @@ async fn sandbox_pid(reader: std::io::PipeReader) -> Result<Option<Pid>, BwrapEr
 
 #[cfg(test)]
 pub(super) mod tests {
-    use std::collections::BTreeMap;
     use std::ffi::OsString;
     #[cfg(target_os = "linux")]
     use std::fs::File;
@@ -278,14 +304,98 @@ pub(super) mod tests {
         }
     }
 
-    fn config() -> BwrapConfig {
+    pub(crate) fn config(directory: &Path) -> BwrapConfig {
+        let envelope = directory.join("envelope");
+        std::fs::create_dir_all(envelope.join("root/usr")).expect("create fixture root");
+        std::fs::write(envelope.join("identity"), format!("{}\n", "a".repeat(64)))
+            .expect("write fixture identity");
         BwrapConfig {
-            readonly_bind_paths: Vec::new(),
-            readonly_bind_mounts: BTreeMap::new(),
+            root: AbsolutePathBuf::try_new(envelope).expect("fixture path is absolute"),
             permit_network_property: false,
             program: PathBuf::from("/usr/bin/bwrap"),
-            tmp_path: AbsolutePathBuf::try_new("/tmp").expect("`/tmp` is absolute"),
         }
+    }
+
+    #[test]
+    fn rejects_missing_and_invalid_root_identity() {
+        let directory = tempfile::tempdir().expect("fixture");
+        let config = config(directory.path());
+        let identity = config.root.join("identity");
+        std::fs::remove_file(&identity).expect("remove identity");
+        assert!(Bwrap::build(config.clone(), &context()).is_err());
+        for value in [
+            "",
+            "host:local\n",
+            "INVALID\n",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            std::fs::write(&identity, value).expect("write identity");
+            assert!(
+                Bwrap::build(config.clone(), &context()).is_err(),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_reserved_or_unsupported_root_entries() {
+        let directory = tempfile::tempdir().expect("fixture");
+        let config = config(directory.path());
+        let tree = config.root.join("root");
+        for name in ["proc", "dev", "tmp", "gang-reset"] {
+            std::fs::create_dir(tree.join(name)).expect("create reserved entry");
+            assert!(Bwrap::build(config.clone(), &context()).is_err(), "{name}");
+            std::fs::remove_dir(tree.join(name)).expect("remove entry");
+        }
+        std::fs::write(tree.join("file"), "not a directory").expect("create file");
+        assert!(Bwrap::build(config.clone(), &context()).is_err());
+        std::fs::remove_file(tree.join("file")).expect("remove file");
+        std::os::unix::fs::symlink("/etc", tree.join("escape")).expect("create symlink");
+        assert!(Bwrap::build(config, &context()).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn action_directory_must_not_cover_protected_mounts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _spawn = SPAWN.lock().await;
+        let directory = tempfile::tempdir()?;
+        let mut config = config(directory.path());
+        config.program = fake_bwrap()?;
+        let sandbox = Bwrap::build(config, &context())?;
+        let argv = [OsString::from("exit"), OsString::from("0")];
+        for path in [
+            "/",
+            "/tmp",
+            "/usr",
+            "/usr/bin",
+            "/proc/self",
+            "/dev/null",
+            "/gang-reset",
+        ] {
+            let spec = ActionExecutionSpec {
+                command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
+                environment: &[],
+                action_directory: Path::new(path),
+                working_directory: Path::new(path),
+                network: NetworkRequest::NotRequested,
+                launcher: &[],
+            };
+            assert!(sandbox.start(&spec).await.is_err(), "{path}");
+        }
+        let spec = ActionExecutionSpec {
+            command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
+            environment: &[],
+            action_directory: Path::new("/tmp/action"),
+            working_directory: Path::new("/tmp/action"),
+            network: NetworkRequest::NotRequested,
+            launcher: &[],
+        };
+        assert_eq!(
+            sandbox.start(&spec).await?.wait().await?,
+            ActionExecutionOutcome::Exited(0)
+        );
+        Ok(())
     }
 
     /// The bound on every blocking read and wait in these tests.
@@ -340,10 +450,11 @@ pub(super) mod tests {
 
     #[test]
     fn rejects_a_program_that_is_not_absolute() {
+        let directory = tempfile::tempdir().expect("temporary directory");
         for program in ["bwrap", "./bwrap"] {
             let config = BwrapConfig {
                 program: PathBuf::from(program),
-                ..config()
+                ..config(directory.path())
             };
 
             assert!(
@@ -363,7 +474,7 @@ pub(super) mod tests {
         let bwrap = Bwrap::build(
             BwrapConfig {
                 program: fake_bwrap()?,
-                ..config()
+                ..config(directory.path())
             },
             &context(),
         )?;
@@ -412,7 +523,7 @@ pub(super) mod tests {
         let bwrap = Bwrap::build(
             BwrapConfig {
                 program,
-                ..config()
+                ..config(directory.path())
             },
             &context(),
         )?;
@@ -434,14 +545,13 @@ pub(super) mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn identity_pipes_are_fresh_for_repeated_and_concurrent_starts()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn repeated_and_concurrent_starts_work() -> Result<(), Box<dyn std::error::Error>> {
         let _spawn = SPAWN.lock().await;
         let directory = tempfile::tempdir()?;
         let bwrap = Bwrap::build(
             BwrapConfig {
                 program: fake_bwrap()?,
-                ..config()
+                ..config(directory.path())
             },
             &context(),
         )?;
@@ -475,7 +585,7 @@ pub(super) mod tests {
         let bwrap = Bwrap::build(
             BwrapConfig {
                 program: fake_bwrap()?,
-                ..config()
+                ..config(directory.path())
             },
             &context(),
         )?;
@@ -520,7 +630,7 @@ pub(super) mod tests {
         let bwrap = Bwrap::build(
             BwrapConfig {
                 program,
-                ..config()
+                ..config(directory.path())
             },
             &context(),
         )?;
@@ -552,7 +662,7 @@ pub(super) mod tests {
         let bwrap = Bwrap::build(
             BwrapConfig {
                 program,
-                ..config()
+                ..config(directory.path())
             },
             &context(),
         )?;
@@ -600,7 +710,7 @@ pub(super) mod tests {
         let bwrap = Bwrap::build(
             BwrapConfig {
                 program: fake_bwrap()?,
-                ..config()
+                ..config(directory.path())
             },
             &context(),
         )?;
@@ -638,7 +748,7 @@ pub(super) mod tests {
         let bwrap = Bwrap::build(
             BwrapConfig {
                 program: fake_bwrap()?,
-                ..config()
+                ..config(directory.path())
             },
             &context(),
         )?;

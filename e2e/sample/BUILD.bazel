@@ -1,7 +1,20 @@
+load("@gang_env//:defs.bzl", "EXEC_PROPERTIES")
 load(":config.bzl", "CPU_COUNT", "ISA", "LARGE_FLEET", "LARGE_MEMORY_KB", "MEMORY_KB", "REQUESTED_SANDBOX", "SIGNAL_COMMAND")
-load(":rules.bzl", "input_root_probe", "probe")
+load(":rules.bzl", "environment_witness", "input_root_probe", "probe")
 
-IDENTITY_ROOTS = "identity-roots-v1"
+environment_witness(
+    name = "rootfs_environment",
+    probe = "action-environment-probe",
+    exec_properties = dict(EXEC_PROPERTIES, ISA = ISA),
+)
+
+sh_test(
+    name = "rootfs_sh_test",
+    srcs = ["rootfs-test.sh"],
+    data = ["action-environment-probe", ":rootfs_environment"],
+    env = {"GANG_E2E_EXACT_ENV": "declared"},
+    exec_properties = dict(EXEC_PROPERTIES, ISA = ISA),
+)
 
 # Namespaces of the action, as `readlink` prints them (`net:[4026531992]`); `unavailable` without /proc.
 NAMESPACES = """
@@ -33,24 +46,20 @@ probe(
 probe(
     name = "network_requested",
     script = NAMESPACES,
-    exec_properties = {
-        "ISA": ISA,
-        "gang_action_environment": IDENTITY_ROOTS,
-        "network": "requested",
-    },
+    exec_properties = dict(EXEC_PROPERTIES, ISA = ISA, network = "requested"),
 )
 
 probe(
     name = "pinned",
     script = "echo ran=yes",
-    exec_properties = {"ISA": ISA, "gang_action_environment": IDENTITY_ROOTS},
+    exec_properties = dict(EXEC_PROPERTIES, ISA = ISA),
 )
 
 probe(
     name = "cache_visibility",
     srcs = ["cache-visibility-input"],
     script = "printf 'cache-visibility-output\\n'; cat cache-visibility-input",
-    exec_properties = {"ISA": ISA, "gang_action_environment": IDENTITY_ROOTS},
+    exec_properties = dict(EXEC_PROPERTIES, ISA = ISA),
 )
 
 # The placement probes: which fleet runs an action follows from its exec properties alone. Each
@@ -58,37 +67,26 @@ probe(
 probe(
     name = "fleet_unconstrained",
     script = NAMESPACES,
-    exec_properties = {"ISA": ISA, "gang_action_environment": IDENTITY_ROOTS},
+    exec_properties = dict(EXEC_PROPERTIES, ISA = ISA),
 )
 
 probe(
     name = "fleet_requested",
     script = NAMESPACES,
-    exec_properties = {
-        "ISA": ISA,
-        "gang_action_environment": IDENTITY_ROOTS,
-        "fleet": LARGE_FLEET,
-    },
+    exec_properties = dict(EXEC_PROPERTIES, ISA = ISA, fleet = LARGE_FLEET),
 )
 
 probe(
     name = "memory_requested",
     script = NAMESPACES,
-    exec_properties = {
-        "ISA": ISA,
-        "gang_action_environment": IDENTITY_ROOTS,
-        "memory_kb": str(LARGE_MEMORY_KB),
-    },
+    exec_properties = dict(EXEC_PROPERTIES, ISA = ISA, memory_kb = str(LARGE_MEMORY_KB)),
 )
 
 probe(
     name = "sandbox_requested",
+    host = True,
     script = NAMESPACES,
-    exec_properties = {
-        "ISA": ISA,
-        "gang_action_environment": IDENTITY_ROOTS,
-        "sandbox": REQUESTED_SANDBOX,
-    },
+    exec_properties = dict(EXEC_PROPERTIES, ISA = ISA, sandbox = REQUESTED_SANDBOX, gang_action_environment = "host:e2e"),
 )
 
 # Built together while the harness holds every pass until both are queued (crates/gang-e2e/src/fleets.rs), so
@@ -96,13 +94,13 @@ probe(
 probe(
     name = "overflow_first",
     script = "echo ran=first",
-    exec_properties = {"ISA": ISA, "gang_action_environment": IDENTITY_ROOTS},
+    exec_properties = dict(EXEC_PROPERTIES, ISA = ISA),
 )
 
 probe(
     name = "overflow_second",
     script = "echo ran=second",
-    exec_properties = {"ISA": ISA, "gang_action_environment": IDENTITY_ROOTS},
+    exec_properties = dict(EXEC_PROPERTIES, ISA = ISA),
 )
 
 probe(
@@ -152,20 +150,15 @@ echo "sibling_links=$(stat -L -c %h "$E2E_SHARED" 2>/dev/null || echo unreadable
 """,
 )
 
-LIMITS = {
-    "ISA": ISA,
-    "gang_action_environment": IDENTITY_ROOTS,
-    "cpu_count": str(CPU_COUNT),
-    "memory_kb": str(MEMORY_KB),
-}
+LIMITS = dict(EXEC_PROPERTIES, ISA = ISA, cpu_count = str(CPU_COUNT), memory_kb = str(MEMORY_KB))
 
 # Runs until the harness creates `release` in its working directory, and leaves behind a process
 # whose command line carries a marker the harness looks for. The orphan runs `SIGNAL_COMMAND`, which
 # the harness owns (crates/gang-e2e/src/hold.rs) and stages in config.bzl: once it runs, it writes
-# one byte to the signal pipe, which tells the harness the orphan exists. The probe rule passes
-# `E2E_SIGNAL` from the staged config.bzl to the action as an environment variable.
+# one byte to the signal pipe, which tells the harness the orphan exists.
 probe(
     name = "hold",
+    controlled = True,
     exec_properties = LIMITS,
     script = """
 marker=e2e-orphan
@@ -177,17 +170,13 @@ echo released=yes
 
 # Limits of the memory and disk probes, in KiB, as their platform properties. They live here rather
 # than in config.bzl, which the harness overwrites in each staged copy.
-MEMORY_HOG = {
-    "ISA": ISA,
-    "gang_action_environment": IDENTITY_ROOTS,
-    "cpu_count": str(CPU_COUNT),
-    "memory_kb": "65536",
-}
+MEMORY_HOG = dict(EXEC_PROPERTIES, ISA = ISA, cpu_count = str(CPU_COUNT), memory_kb = "65536")
 
 # Touches a 192 MiB buffer against a 64 MiB reservation on a healthy worker. A reservation is not
 # an action memory ceiling, so the first attempt must complete. Each attempt records itself first.
 probe(
     name = "memory_hog",
+    controlled = True,
     exec_properties = MEMORY_HOG,
     script = """
 echo "$E2E_ACTION ${GANG_MEMORY_KB:-0}" >> "$E2E_ATTEMPTS"
@@ -200,6 +189,7 @@ echo hogged=yes
 # The requeued attempt completes at once. `dd` holds the buffer while its pipe reader sleeps.
 probe(
     name = "memory_grower",
+    controlled = True,
     exec_properties = MEMORY_HOG,
     script = """
 echo "$E2E_ACTION ${GANG_MEMORY_KB:-0}" >> "$E2E_ATTEMPTS"
@@ -214,11 +204,7 @@ echo "grown=yes"
 # the worker's disk kill ends the wait; the Bazel watchdog bounds a deployment that never kills it.
 probe(
     name = "disk_hog",
-    exec_properties = {
-        "ISA": ISA,
-        "gang_action_environment": IDENTITY_ROOTS,
-        "disk_kb": "4096",
-    },
+    exec_properties = dict(EXEC_PROPERTIES, ISA = ISA, disk_kb = "4096"),
     script = """
 head -c 67108864 /dev/zero > hog.bin
 sleep 300
@@ -230,11 +216,7 @@ echo hogged=yes
 # file holds exactly 30 * 256 KiB. Its 64 MiB reservation is far above what it writes.
 probe(
     name = "disk_neighbour",
-    exec_properties = {
-        "ISA": ISA,
-        "gang_action_environment": IDENTITY_ROOTS,
-        "disk_kb": "65536",
-    },
+    exec_properties = dict(EXEC_PROPERTIES, ISA = ISA, disk_kb = "65536"),
     script = """
 i=0
 while [ $i -lt 30 ]; do
@@ -247,16 +229,15 @@ if [ "$size" -eq 7864320 ]; then neighbour=ok; else neighbour=bad; fi
 echo "neighbour=$neighbour"
 """,
 )
-# The execution probes talk to the harness through two paths beside the hold signal: the journal, a named pipe
-# they write lines to, and the go flag, a file whose existence releases them. Both are reachable under bwrap,
-# whose only host mounts are the working directory and the read-only binds. Every journal line starts with
-# $E2E_RUN and a space, so the harness reads only the lines of the held build it observes.
+# The observer links the journal and persistent go flag alongside the signal pipe in the action
+# directory. Every journal line starts with $E2E_RUN, so the harness selects the held build.
 JOURNAL = 'J="$(dirname "$E2E_SIGNAL")/journal"; G="$(dirname "$E2E_SIGNAL")/go"\n'
 
 # Starts a background child that ignores SIGTERM and carries a marker, then waits forever: only the action
 # timeout ends it.
 probe(
     name = "timeout_child",
+    controlled = True,
     script = JOURNAL + """
 sh -c 'trap "" TERM; echo "$E2E_RUN child started" > "$2"; while :; do sleep 1; done' sh e2e-timeout-child "$J" &
 while :; do sleep 1; done
@@ -267,6 +248,7 @@ while :; do sleep 1; done
 # line names its TMPDIR, the per-action directory of the noop sandbox.
 probe(
     name = "term_trap",
+    controlled = True,
     script = JOURNAL + """
 trap 'echo "$E2E_RUN trap term" > "$J"; sleep 1; echo "$E2E_RUN trap clean" > "$J"; exit 0' TERM
 echo "$E2E_RUN trap started ${TMPDIR:-none}" > "$J"
@@ -278,6 +260,7 @@ while :; do sleep 1 & wait $!; done
 # second, which only a process that outlives SIGTERM can do.
 probe(
     name = "term_ignorer",
+    controlled = True,
     script = JOURNAL + """
 termed=0
 trap 'termed=1; echo "$E2E_RUN ignore term" > "$J"' TERM
@@ -303,10 +286,7 @@ probe(
     script = "kill -TERM $$",
 )
 
-# Records what the sandbox exposes: the names of its environment variables, the entries of /tmp other than the
-# directories bwrap creates to hold its binds (the working directory and the read-only binds may live under
-# /tmp on the host), its filesystem type, whether each mount point can be touched (`erofs` when the mount is
-# read-only), and whether its working directory is writable.
+# Records environment names, tmpfs contents, mount flags, and working-directory writability.
 probe(
     name = "sandbox_contract",
     srcs = ["action-environment-probe", "action-environment-postgresql.tar.gz"],
@@ -326,17 +306,21 @@ done
 if touch ./writable-probe 2>/dev/null; then echo cwd_writable=yes; else echo cwd_writable=no; fi
 uid=$(id -u)
 gid=$(id -g)
-if [ "$(id -un 2>/dev/null)" = builder ] && [ "$(id -gn 2>/dev/null)" = builder ] &&
-   [ "$(awk -F: -v uid="$uid" '$3 == uid && $1 == "builder" { ok++ } END { print NR ":" ok }' /etc/passwd)" = "1:1" ] &&
-   [ "$(awk -F: -v gid="$gid" '$3 == gid && $1 == "builder" { ok++ } END { print NR ":" ok }' /etc/group)" = "1:1" ]; then
+if [ "$uid" = 1000 ] && [ "$gid" = 1000 ] &&
+   [ "$(id -un 2>/dev/null)" = builder ] && [ "$(id -gn 2>/dev/null)" = builder ] &&
+   [ "$(awk -F: -v uid="$uid" '$3 == uid && $1 == "builder" { ok++ } END { print ok }' /etc/passwd)" = 1 ] &&
+   [ "$(awk -F: -v gid="$gid" '$3 == gid && $1 == "builder" { ok++ } END { print ok }' /etc/group)" = 1 ]; then
   echo identity=yes
 else echo identity=no; fi
-if [ "$(cat /etc/nsswitch.conf 2>/dev/null | tr -s ' ')" = "$(printf 'passwd: files\\ngroup: files')" ]; then echo nss=yes; else echo nss=no; fi
-if [ "$(find /etc -mindepth 1 | sort | tr '\\n' ',')" = "/etc/group,/etc/nsswitch.conf,/etc/passwd,/etc/pki,/etc/pki/tls,/etc/pki/tls/certs,/etc/pki/tls/certs/ca-bundle.crt,/etc/ssl,/etc/ssl/cert.pem,/etc/ssl/certs,/etc/ssl/certs/ca-certificates.crt," ]; then echo etc_contents=yes; else echo etc_contents=no; fi
+if [ "$(cat /etc/nsswitch.conf 2>/dev/null | tr -s ' ')" = "$(printf 'passwd: files\\ngroup: files\\nhosts: files')" ]; then echo nss=yes; else echo nss=no; fi
+if [ "$(find /etc -mindepth 1 | sort | tr '\\n' ',')" = "/etc/group,/etc/hosts,/etc/nsswitch.conf,/etc/passwd,/etc/pki,/etc/pki/tls,/etc/pki/tls/certs,/etc/pki/tls/certs/ca-bundle.crt,/etc/ssl,/etc/ssl/cert.pem,/etc/ssl/certs,/etc/ssl/certs/ca-certificates.crt," ]; then echo etc_contents=yes; else echo etc_contents=no; fi
 readonly=yes
-for file in /etc/passwd /etc/group /etc/nsswitch.conf /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem /etc/pki/tls/certs/ca-bundle.crt; do
-  options=$(awk -v p="$file" '$5 == p { print $6 }' /proc/self/mountinfo)
-  case ",$options," in *,ro,*) [ -f "$file" ] || readonly=no ;; *) readonly=no ;; esac
+for file in /etc/passwd /etc/group /etc/hosts /etc/nsswitch.conf /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem /etc/pki/tls/certs/ca-bundle.crt; do
+  [ -f "$file" ] || readonly=no
+done
+for point in / /etc /usr; do
+  options=$(awk -v p="$point" '$5 == p { print $6 }' /proc/self/mountinfo)
+  case ",$options," in *,ro,*) ;; *) readonly=no ;; esac
 done
 echo "identity_roots_readonly=$readonly"
 if out=$(./action-environment-probe --gang-e2e-action-environment-probe roots 2>&1); then echo roots=yes; else echo "roots=failed: $(printf '%s' "$out" | tr '\\n' ' ')"; fi
@@ -362,7 +346,7 @@ fi
 probe(
     name = "fhs_tools",
     srcs = ["fhs-tools.sh"],
-    path = "/bin:/usr/bin:/usr/local/bin",
+    path = "/bin:/usr/bin",
     script = """
 if out=$(./fhs-tools.sh 2>&1); then echo "fhs_tools=$out"
 else echo "fhs_tools=failed: ${out//$'\\n'/ }"
@@ -370,16 +354,16 @@ fi
 """,
 )
 
-# Leaves behind a process in its own process group, marked and named in the journal, then waits for the go
-# flag. Once the flag exists it succeeds at once, so a requeued attempt leaves nothing behind.
+# Leaves a marked process in its own process group. A nonempty go flag releases later attempts.
 probe(
     name = "stray",
+    controlled = True,
     script = JOURNAL + """
-if [ -e "$G" ]; then echo stray=skipped; exit 0; fi
+if [ -s "$G" ]; then echo stray=skipped; exit 0; fi
 set -m
 sh -c 'echo "$E2E_RUN stray $$" > "$2"; while :; do sleep 1; done' sh e2e-stray "$J" &
 set +m
-while [ ! -e "$G" ]; do sleep 1; done
+while [ ! -s "$G" ]; do sleep 1; done
 echo stray=released
 """,
 )
@@ -387,25 +371,20 @@ echo stray=released
 # Reports to the journal, then waits for the go flag.
 probe(
     name = "held_release",
+    controlled = True,
     script = JOURNAL + """
 echo "$E2E_RUN held started" > "$J"
-while [ ! -e "$G" ]; do sleep 1; done
+while [ ! -s "$G" ]; do sleep 1; done
 echo held=released
 """,
 )
 # Independent held actions for controller failover. The worker is identified by walking the
 # process ancestry on the Local Mode host, and each attempt records both ends of its interval.
-CONTROLLER_LOSS = JOURNAL + """
-# The harness precreates this file in the read-only signal directory. Locking is
-# nonblocking and observational: a contended attempt still runs rather than serializing.
-exec 9< "$(dirname "$E2E_SIGNAL")/$E2E_RUN-$E2E_ACTION.lock" || exit 1
-if flock --exclusive --nonblock --conflict-exit-code 42 9; then
-  witness=exclusive
-else
-  status=$?
-  [ "$status" -eq 42 ] || exit "$status"
-  witness=contended
-fi
+CONTROLLER_LOSS = """
+script=$(cat <<'GANG_CONTROLLER_LOSS'
+J="$(dirname "$E2E_SIGNAL")/journal"
+G="$(dirname "$E2E_SIGNAL")/go"
+witness=$E2E_LOCK_WITNESS
 worker=$PPID
 while [ "$worker" -gt 1 ]; do
   exec 3< "/proc/$worker/cmdline"
@@ -423,21 +402,24 @@ done
 [ "$worker" -gt 1 ] || exit 1
 attempt=$$
 echo "$E2E_RUN loss start $E2E_ACTION $worker $attempt $(date +%s%N) $witness" > "$J"
-while [ ! -e "$G" ]; do sleep 1; done
+while [ ! -s "$G" ]; do sleep 1; done
 echo "$E2E_RUN loss end $E2E_ACTION $worker $attempt $(date +%s%N)" > "$J"
 echo held=released
+GANG_CONTROLLER_LOSS
+)
+./action-environment-probe --gang-e2e-action-environment-probe lock "$(dirname "$E2E_SIGNAL")/$E2E_RUN-$E2E_ACTION.lock" "$0" "$script"
 """
-probe(name = "controller_loss_0", script = CONTROLLER_LOSS, exec_properties = LIMITS)
-probe(name = "controller_loss_1", script = CONTROLLER_LOSS, exec_properties = LIMITS)
-probe(name = "controller_loss_2", script = CONTROLLER_LOSS, exec_properties = LIMITS)
-probe(name = "controller_loss_3", script = CONTROLLER_LOSS, exec_properties = LIMITS)
-probe(name = "controller_loss_4", script = CONTROLLER_LOSS, exec_properties = LIMITS)
-probe(name = "controller_loss_5", script = CONTROLLER_LOSS, exec_properties = LIMITS)
-probe(name = "controller_loss_6", script = CONTROLLER_LOSS, exec_properties = LIMITS)
-probe(name = "controller_loss_7", script = CONTROLLER_LOSS, exec_properties = LIMITS)
+probe(name = "controller_loss_0", srcs = ["action-environment-probe"], script = CONTROLLER_LOSS, controlled = True, exec_properties = LIMITS)
+probe(name = "controller_loss_1", srcs = ["action-environment-probe"], script = CONTROLLER_LOSS, controlled = True, exec_properties = LIMITS)
+probe(name = "controller_loss_2", srcs = ["action-environment-probe"], script = CONTROLLER_LOSS, controlled = True, exec_properties = LIMITS)
+probe(name = "controller_loss_3", srcs = ["action-environment-probe"], script = CONTROLLER_LOSS, controlled = True, exec_properties = LIMITS)
+probe(name = "controller_loss_4", srcs = ["action-environment-probe"], script = CONTROLLER_LOSS, controlled = True, exec_properties = LIMITS)
+probe(name = "controller_loss_5", srcs = ["action-environment-probe"], script = CONTROLLER_LOSS, controlled = True, exec_properties = LIMITS)
+probe(name = "controller_loss_6", srcs = ["action-environment-probe"], script = CONTROLLER_LOSS, controlled = True, exec_properties = LIMITS)
+probe(name = "controller_loss_7", srcs = ["action-environment-probe"], script = CONTROLLER_LOSS, controlled = True, exec_properties = LIMITS)
 
 
-WORK_PROPERTIES = {"ISA": ISA, "gang_action_environment": IDENTITY_ROOTS, "cpu_count": "1", "memory_kb": "65536", "disk_kb": "65536"}
+WORK_PROPERTIES = dict(EXEC_PROPERTIES, ISA = ISA, cpu_count = "1", memory_kb = "65536", disk_kb = "65536")
 
 # Distinct short actions for a scale-out burst.
 probe(name = "burst_000", script = "echo ran=yes", exec_properties = WORK_PROPERTIES)
@@ -603,21 +585,22 @@ probe(name = "burst_159", script = "echo ran=yes", exec_properties = WORK_PROPER
 
 WORK_HELD = JOURNAL + """
 echo "$E2E_RUN $E2E_ACTION started" > "$J"
-while [ ! -e "$G" ]; do sleep 1; done
+while [ ! -s "$G" ]; do sleep 1; done
 echo held=released
 """
-probe(name = "work_held_0", script = WORK_HELD, exec_properties = WORK_PROPERTIES)
-probe(name = "work_held_1", script = WORK_HELD, exec_properties = WORK_PROPERTIES)
-probe(name = "work_held_2", script = WORK_HELD, exec_properties = WORK_PROPERTIES)
+probe(name = "work_held_0", script = WORK_HELD, controlled = True, exec_properties = WORK_PROPERTIES)
+probe(name = "work_held_1", script = WORK_HELD, controlled = True, exec_properties = WORK_PROPERTIES)
+probe(name = "work_held_2", script = WORK_HELD, controlled = True, exec_properties = WORK_PROPERTIES)
 probe(name = "work_plain", script = "echo ran=yes", exec_properties = WORK_PROPERTIES)
 
 # The memory hog, held until the go flag exists, so that its scope can be observed while it runs.
 probe(
     name = "held_hog",
+    controlled = True,
     exec_properties = MEMORY_HOG,
     script = JOURNAL + """
 echo "$E2E_RUN hog started" > "$J"
-while [ ! -e "$G" ]; do sleep 1; done
+while [ ! -s "$G" ]; do sleep 1; done
 dd if=/dev/zero of=/dev/null bs=1G count=1 2>/dev/null
 echo hogged=yes
 """,
@@ -629,6 +612,7 @@ echo hogged=yes
 # cgroup ceiling. Appends a line per attempt to $E2E_ATTEMPTS first.
 probe(
     name = "memory_escalation",
+    controlled = True,
     exec_properties = MEMORY_HOG,
     script = """
 echo "$E2E_ACTION ${GANG_MEMORY_KB:-0}" >> "$E2E_ATTEMPTS"
@@ -644,11 +628,8 @@ echo "grown=yes"
 # Reserves 512 TiB of disk, more than any host has free. It would record an attempt if it ran.
 probe(
     name = "disk_guarded",
-    exec_properties = {
-        "ISA": ISA,
-        "gang_action_environment": IDENTITY_ROOTS,
-        "disk_kb": "549755813888",
-    },
+    controlled = True,
+    exec_properties = dict(EXEC_PROPERTIES, ISA = ISA, disk_kb = "549755813888"),
     script = """
 echo "$E2E_ACTION ${GANG_MEMORY_KB:-0}" >> "$E2E_ATTEMPTS"
 echo ran=yes
@@ -665,12 +646,8 @@ PRESSURE_CHURN_BYTES = 8388608
 # and learned reservations run to completion without requiring another kill.
 probe(
     name = "pressure_victim",
-    exec_properties = {
-        "ISA": ISA,
-        "gang_action_environment": IDENTITY_ROOTS,
-        "cpu_count": str(CPU_COUNT),
-        "memory_kb": "65536",
-    },
+    controlled = True,
+    exec_properties = dict(EXEC_PROPERTIES, ISA = ISA, cpu_count = str(CPU_COUNT), memory_kb = "65536"),
     script = JOURNAL + """
 echo "$E2E_ACTION ${{GANG_MEMORY_KB:-0}}" >> "$E2E_ATTEMPTS" || exit 1
 if [ "${{GANG_MEMORY_KB:-0}}" -lt 196608 ]; then
@@ -682,12 +659,12 @@ if [ "${{GANG_MEMORY_KB:-0}}" -lt 196608 ]; then
   writer=$!
   (
     C="$(dirname "$E2E_SIGNAL")/churn"
-    while [ ! -e "$C" ] && [ ! -e "$G" ]; do read -r -t 0.05 <&4 || :; done
-    while [ -e "$C" ] && [ ! -e "$G" ]; do dd if=/dev/zero of=/dev/null bs={churn} count=1 2>/dev/null || exit 1; done
+    while [ ! -s "$C" ] && [ ! -s "$G" ]; do read -r -t 0.05 <&4 || :; done
+    while [ -s "$C" ] && [ ! -s "$G" ]; do dd if=/dev/zero of=/dev/null bs={churn} count=1 2>/dev/null || exit 1; done
   ) &
   churn=$!
   echo "$E2E_RUN pressure victim $$" > "$J" || exit 1
-  while [ ! -e "$G" ]; do read -r -t 0.05 <&4 || :; done
+  while [ ! -s "$G" ]; do read -r -t 0.05 <&4 || :; done
   wait "$churn" || exit 1
   exec 4>&-
   exec 3< pressure-buffer || exit 1
@@ -709,12 +686,8 @@ echo pressure=complete
 # The harness releases it only after observing the pressure kill.
 probe(
     name = "pressure_neighbour",
-    exec_properties = {
-        "ISA": ISA,
-        "gang_action_environment": IDENTITY_ROOTS,
-        "cpu_count": str(CPU_COUNT),
-        "memory_kb": "327680",
-    },
+    controlled = True,
+    exec_properties = dict(EXEC_PROPERTIES, ISA = ISA, cpu_count = str(CPU_COUNT), memory_kb = "327680"),
     script = JOURNAL + """
 echo "$E2E_ACTION ${{GANG_MEMORY_KB:-0}}" >> "$E2E_ATTEMPTS" || exit 1
 mkfifo pressure-buffer pressure-wait || exit 1
@@ -724,7 +697,7 @@ reader=$!
 dd if=/dev/zero of=pressure-buffer bs={size} count=1 2>/dev/null &
 writer=$!
 echo "$E2E_RUN pressure neighbour $$" > "$J" || exit 1
-while [ ! -e "$G" ]; do read -r -t 0.05 <&4 || :; done
+while [ ! -s "$G" ]; do read -r -t 0.05 <&4 || :; done
 exec 4>&-
 exec 3< pressure-buffer || exit 1
 cat <&3 > /dev/null &

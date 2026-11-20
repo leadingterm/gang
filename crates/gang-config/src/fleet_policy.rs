@@ -5,7 +5,7 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use gang_clock::Timestamp;
-use gang_types::{FleetName, FleetProperties, Isa, NonZeroBytes, Resources};
+use gang_types::{ActionEnvironment, FleetName, FleetProperties, Isa, NonZeroBytes, Resources};
 
 use crate::ScheduledMinimum;
 
@@ -101,6 +101,8 @@ pub struct FleetPolicy {
     pub name: FleetName,
     /// The instruction set its workers run.
     pub isa: Isa,
+    /// The action environment of newly launched workers.
+    pub action_environment: ActionEnvironment,
     /// The validated minimum and maximum instance counts.
     pub instances: InstanceBounds,
     /// CPU cores of one worker.
@@ -143,7 +145,14 @@ impl FleetPolicy {
         sandbox: &impl Display,
         options: impl IntoIterator<Item = (&'static str, String)>,
     ) -> FleetProperties {
-        FleetProperties::new(&self.name, self.isa, sandbox, self.instance(), options)
+        FleetProperties::new(
+            &self.name,
+            self.isa,
+            sandbox,
+            &self.action_environment,
+            self.instance(),
+            options,
+        )
     }
 }
 

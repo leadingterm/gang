@@ -45,4 +45,14 @@ pub trait SandboxPrograms {
         &mut self,
         visit: &mut impl FnMut(&mut PathBuf) -> Result<(), E>,
     ) -> Result<(), E>;
+
+    /// Calls `visit` on every immutable root path named by the section.
+    ///
+    /// # Errors
+    ///
+    /// The first error `visit` returns.
+    fn try_for_each_root<E>(
+        &mut self,
+        visit: &mut impl FnMut(&mut gang_types::AbsolutePathBuf) -> Result<(), E>,
+    ) -> Result<(), E>;
 }

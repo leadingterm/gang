@@ -11,7 +11,8 @@ worker_endpoint = "grpcs://127.0.0.1:9090"  # dialed by workers; gang-server lis
 [[fleets]]
 name = "local-worker-x86-64"
 isa = "x86-64"
-sandbox = "bwrap"  # on macOS: "noop", because bubblewrap is Linux-only
+sandbox = "noop"  # no isolation: only use this on a trusted local machine
+action_environment = "host:local"
 min_instances = 0
 max_instances = 4
 vcpus_per_instance = 4
@@ -39,16 +40,13 @@ path = "/tmp/gang-local/gang.db"
 busy_timeout = "5s"
 
 [sandbox.noop]
+environment = "host:local"
 
 [sandbox.bwrap]
-# On hosts without Nix, list directories containing actions' shells, tools, and libraries instead (e.g. "/usr", "/bin", "/lib", "/lib64").
-# On NixOS with nix-ld, add "/run/current-system/sw" and "/lib64" (x86-64) or "/lib" (aarch64) so the dynamically linked glibc toolchains Bazel downloads can start.
-readonly_bind_paths = ["/nix/store"]
+# For Linux bwrap, select it in the fleet and set action_environment to the
+# digest in this envelope's identity file.
+root = "/etc/gang/action-rootfs"
 permit_network_property = false
-# Optional readonly_bind_mounts show a directory of tools where actions name them, as the worker image does, e.g. on NixOS:
-# [sandbox.bwrap.readonly_bind_mounts]
-# "/bin" = "/run/current-system/sw/bin"
-# "/usr/bin" = "/run/current-system/sw/bin"
 
 # Optional [limits.cgroup] (Linux only): needs a delegated cgroup v2 subtree; locally set delegation = "trusted", because the user manager sets no delegate marker on the worker_launcher's scope (systemd_marker needs a system unit with Delegate=yes). Its keys and defaults are documented in crates/gang-cgroup/src/config.rs.
 

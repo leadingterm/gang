@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use gang_clock::Timestamp;
 use gang_spi::PortError;
-use gang_types::{Bytes, FleetName, Isa};
+use gang_types::{ActionEnvironment, Bytes, FleetName, Isa};
 
 use crate::credentials::EnrollError;
 use crate::transport::ServerCaError;
@@ -29,6 +29,19 @@ pub enum WorkerError {
         configured: Isa,
         /// The instruction set the node runs on.
         actual: Isa,
+    },
+    /// The local sandbox does not match this worker generation's launch identity.
+    #[error(
+        "fleet `{fleet}` expects action environment {configured}, but this worker has {actual}"
+    )]
+    #[fix("launch a worker image with the action environment configured for this fleet")]
+    EnvironmentMismatch {
+        /// The fleet of the instance.
+        fleet: FleetName,
+        /// The identity pinned in this worker generation's configuration.
+        configured: ActionEnvironment,
+        /// The identity reported by the local sandbox.
+        actual: ActionEnvironment,
     },
     /// The scratch volume leaves the worker's actions less disk than its fleet declares.
     #[error(
@@ -67,8 +80,8 @@ pub enum WorkerError {
         /// The memory reserved outside the action pool.
         reserve: Bytes,
     },
-    /// A provisioner, cache, or limits port failed.
-    #[error("a provisioner, cache, or limits port failed")]
+    /// A provisioner, cache, sandbox, or limits port failed.
+    #[error("a provisioner, cache, sandbox, or limits port failed")]
     Port(#[from] PortError),
     /// Enrollment with the certificate authority failed.
     #[error("cannot enroll with the certificate authority")]
@@ -125,6 +138,11 @@ mod tests {
                 fleet: fleet("linux-arm64"),
                 configured: Isa::Aarch64,
                 actual: Isa::X86_64,
+            },
+            WorkerError::EnvironmentMismatch {
+                fleet: fleet("linux-arm64"),
+                configured: "host:expected".parse().expect("valid identity"),
+                actual: "host:actual".parse().expect("valid identity"),
             },
             WorkerError::FleetDiskUnavailable {
                 fleet: fleet("linux-arm64"),

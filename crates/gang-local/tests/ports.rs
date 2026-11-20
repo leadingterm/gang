@@ -203,7 +203,9 @@ async fn the_port_refuses_changes_with_an_expired_permission()
         })
         .await,
         gang_testkit::fence::with_expired_held(async |held| {
-            local.terminate(held, fleet(&name), &id).await
+            local
+                .terminate(held, fleet(&name), &id, gang_spi::RetirementReason::Idle)
+                .await
         })
         .await,
         gang_testkit::fence::with_expired_held(async |held| {

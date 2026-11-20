@@ -115,7 +115,7 @@ override_data {
   values = {
     name             = "gang-x86_64-aaaaaaaaaaaaaaaa"
     boot_mode        = "uefi"
-    tags             = { "ec2:SharedTag/ImageSha256" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+    tags             = { "ec2:SharedTag/ImageSha256" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ec2:SharedTag/ActionEnvironment" = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }
     deprecation_time = ""
   }
 }
@@ -330,6 +330,11 @@ run "renders_gang_toml_for_every_fleet" {
   assert {
     condition     = can(regex("(?s)name = \"gang-worker-x86-64\"[^\\[]*sandbox = \"bwrap\"", output.gang_toml)) && can(regex("(?s)name = \"gang-worker-aarch64\"[^\\[]*sandbox = \"bwrap\"", output.gang_toml)) && !strcontains(output.gang_toml, "default_sandbox")
     error_message = "Each fleet must carry its sandbox and gang.toml must not carry a top-level default_sandbox."
+  }
+
+  assert {
+    condition     = length(regexall("action_environment = \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"", output.gang_toml)) == 2 && strcontains(output.gang_toml, "root = \"/etc/gang/action-rootfs\"") && !strcontains(output.gang_toml, "readonly_bind")
+    error_message = "Each fleet must use its selected AMI action environment and the rootfs sandbox."
   }
 
   assert {
@@ -1393,11 +1398,39 @@ run "tag_mismatch_fails" {
     values = {
       name             = "gang-x86_64-aaaaaaaaaaaaaaaa"
       boot_mode        = "uefi"
-      tags             = { "ec2:SharedTag/ImageSha256" = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
+      tags             = { "ec2:SharedTag/ImageSha256" = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "ec2:SharedTag/ActionEnvironment" = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }
       deprecation_time = ""
     }
   }
 
+  expect_failures = [data.aws_ami.image]
+}
+
+run "missing_action_environment_fails" {
+  command = plan
+  override_data {
+    target = data.aws_ami.image
+    values = {
+      name             = "gang-x86_64-aaaaaaaaaaaaaaaa"
+      boot_mode        = "uefi"
+      tags             = { "ec2:SharedTag/ImageSha256" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+      deprecation_time = ""
+    }
+  }
+  expect_failures = [data.aws_ami.image]
+}
+
+run "malformed_action_environment_fails" {
+  command = plan
+  override_data {
+    target = data.aws_ami.image
+    values = {
+      name             = "gang-x86_64-aaaaaaaaaaaaaaaa"
+      boot_mode        = "uefi"
+      tags             = { "ec2:SharedTag/ImageSha256" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ec2:SharedTag/ActionEnvironment" = "host:invalid" }
+      deprecation_time = ""
+    }
+  }
   expect_failures = [data.aws_ami.image]
 }
 
@@ -1410,7 +1443,7 @@ run "legacy_boot_mode_fails" {
     values = {
       name             = "gang-x86_64-aaaaaaaaaaaaaaaa"
       boot_mode        = "legacy-bios"
-      tags             = { "ec2:SharedTag/ImageSha256" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+      tags             = { "ec2:SharedTag/ImageSha256" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ec2:SharedTag/ActionEnvironment" = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }
       deprecation_time = ""
     }
   }
@@ -1463,7 +1496,7 @@ run "fleet_image_override" {
       id               = "ami-00000000000000001"
       name             = "gang-x86_64-bbbbbbbbbbbbbbbb"
       boot_mode        = "uefi"
-      tags             = { "ec2:SharedTag/ImageSha256" = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
+      tags             = { "ec2:SharedTag/ImageSha256" = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "ec2:SharedTag/ActionEnvironment" = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" }
       deprecation_time = ""
     }
   }
@@ -1471,6 +1504,11 @@ run "fleet_image_override" {
   assert {
     condition     = output.images["worker"] == data.aws_ami.image["000000000000/x86_64/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"].id
     error_message = "The worker image must be the AMI resolved for its fleet override."
+  }
+
+  assert {
+    condition     = strcontains(output.gang_toml, "action_environment = \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"")
+    error_message = "The override's selected AMI supplies its own action environment."
   }
 }
 
@@ -1506,7 +1544,7 @@ run "deprecation_warns" {
     values = {
       name             = "gang-x86_64-aaaaaaaaaaaaaaaa"
       boot_mode        = "uefi"
-      tags             = { "ec2:SharedTag/ImageSha256" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+      tags             = { "ec2:SharedTag/ImageSha256" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ec2:SharedTag/ActionEnvironment" = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }
       deprecation_time = "2000-01-01T00:00:00Z"
     }
   }
@@ -1523,7 +1561,7 @@ run "deprecation_beyond_window_passes" {
     values = {
       name             = "gang-x86_64-aaaaaaaaaaaaaaaa"
       boot_mode        = "uefi"
-      tags             = { "ec2:SharedTag/ImageSha256" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+      tags             = { "ec2:SharedTag/ImageSha256" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ec2:SharedTag/ActionEnvironment" = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }
       deprecation_time = "2099-01-01T00:00:00Z"
     }
   }

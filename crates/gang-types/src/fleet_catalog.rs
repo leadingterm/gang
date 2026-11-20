@@ -205,6 +205,20 @@ impl FleetCatalog {
         accepting
     }
 
+    /// Returns fleets matching all requested properties except the action environment.
+    ///
+    /// This is for admission against live worker identities; launch fitting must use
+    /// [`Self::accepting`] and retain the environment constraint.
+    pub fn accepting_base<'r>(&self, request: impl Fn(&str) -> Option<&'r str>) -> FleetSet {
+        self.accepting(|key| {
+            if key == property::ACTION_ENVIRONMENT {
+                None
+            } else {
+                request(key)
+            }
+        })
+    }
+
     /// Explains why no fleet accepts the request, or returns `None` when one does.
     ///
     /// The first individually unsatisfied property in declaration order is reported;
@@ -325,6 +339,7 @@ mod tests {
             &FleetName::try_new(name).unwrap(),
             isa,
             &"bwrap",
+            &"host:test".parse().unwrap(),
             Resources {
                 vcpus,
                 memory: Bytes::new(gib << 30),
@@ -366,6 +381,22 @@ mod tests {
             fleet("arm", Isa::Aarch64, 4, 8, 100, &[("capacity", "on-demand")]),
         ])
         .unwrap()
+    }
+
+    #[test]
+    fn environment_matches_exactly_except_in_base_admission() {
+        let catalog = catalog();
+        let wrong = request(&[
+            (property::ACTION_ENVIRONMENT, "host:other"),
+            (property::ISA, "x86-64"),
+        ]);
+        assert_eq!(catalog.accepting(&wrong), set(&[]));
+        assert_eq!(catalog.accepting_base(&wrong), set(&[0, 1]));
+        assert_eq!(
+            catalog.accepting(request(&[(property::ACTION_ENVIRONMENT, "host:test")])),
+            set(&[0, 1, 2])
+        );
+        assert!(catalog.fit(set(&[0, 1, 2]), &wrong).is_none());
     }
 
     #[test]
@@ -463,17 +494,6 @@ mod tests {
     }
 
     #[test]
-    fn action_environment_does_not_constrain_matching() {
-        let catalog = catalog();
-        for revision in ["identity-roots-v1", "another-revision"] {
-            assert_eq!(
-                catalog.accepting(request(&[(property::ACTION_ENVIRONMENT, revision)])),
-                set(&[0, 1, 2])
-            );
-        }
-    }
-
-    #[test]
     fn disk_is_a_minimum() {
         let catalog = FleetCatalog::try_new(vec![
             fleet("small-x86", Isa::X86_64, 8, 16, 100, &[]),
@@ -528,13 +548,13 @@ mod tests {
                 ("fleet", MatchKind::Exact),
                 ("ISA", MatchKind::Exact),
                 ("sandbox", MatchKind::Exact),
+                ("gang_action_environment", MatchKind::Exact),
                 ("cpu_count", MatchKind::Minimum),
                 ("cpu_millicores", MatchKind::Minimum),
                 ("memory_kb", MatchKind::Minimum),
                 ("disk_kb", MatchKind::Minimum),
                 ("capacity", MatchKind::Exact),
                 ("network", MatchKind::Ignored),
-                ("gang_action_environment", MatchKind::Ignored),
             ]
         );
     }
@@ -560,6 +580,7 @@ mod tests {
                 "fleet",
                 "ISA",
                 "sandbox",
+                "gang_action_environment",
                 "cpu_count",
                 "cpu_millicores",
                 "memory_kb",
@@ -567,7 +588,6 @@ mod tests {
                 "capacity",
                 "zone",
                 "network",
-                "gang_action_environment",
             ]
         );
     }

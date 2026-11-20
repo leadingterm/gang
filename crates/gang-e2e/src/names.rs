@@ -695,8 +695,9 @@ pub mod sandbox_contract {
         "no variable of the gang worker's own environment reaches a bwrap action";
     /// /tmp in a bwrap action is a fresh, empty tmpfs.
     pub const TMP_FRESH: &str = "/tmp in a bwrap action is a fresh, empty tmpfs";
-    /// Every `readonly_bind_paths` and `readonly_bind_mounts` path is read-only inside a bwrap action.
-    pub const READONLY_BINDS: &str = "every readonly_bind_paths and readonly_bind_mounts path is read-only inside a bwrap action";
+    /// The root, /usr and /etc mounts are read-only inside a bwrap action.
+    pub const READONLY_BINDS: &str =
+        "the root, /usr and /etc mounts are read-only inside a bwrap action";
     /// The working directory of a bwrap action is writable.
     pub const WORKDIR_WRITABLE: &str = "the working directory of a bwrap action is writable";
     /// The numeric action identity resolves uniquely to builder.

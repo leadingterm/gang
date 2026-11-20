@@ -33,19 +33,24 @@ pub(crate) fn managed_worker(summary: &WorkerSummary) -> Option<(WorkerId, Fleet
 
 /// Converts a connected worker into a scheduler worker.
 ///
-/// Returns `None` for workers Gang does not manage: those whose id is not a valid worker id
-/// naming an instance, and those whose `fleet` property is missing or is not a valid fleet
-/// name. `NativeLink` reports `max_inflight_tasks` 0 for a worker without a limit, which maps to
+/// Returns `None` for workers without a managed id or valid fleet. Missing or invalid
+/// environments are retained as unknown.
+/// `NativeLink` reports `max_inflight_tasks` 0 for a worker without a limit, which maps to
 /// `None`, as do counts above `u32::MAX`. A paused worker is not draining: only the draining
 /// flag counts; the pause itself is reported by `paused`.
 fn worker_state(summary: &WorkerSummary) -> Option<WorkerState> {
     let (id, fleet) = managed_worker(summary)?;
+    let environment = summary
+        .platform_properties
+        .get(property::ACTION_ENVIRONMENT)
+        .and_then(|value| value.parse().ok());
     let max_inflight_actions = u32::try_from(summary.max_inflight_tasks)
         .ok()
         .and_then(NonZeroU32::new);
     Some(WorkerState {
         id,
         fleet,
+        environment,
         running_actions: summary.running_actions,
         max_inflight_actions,
         draining: summary.is_draining,
@@ -60,21 +65,28 @@ fn worker_state(summary: &WorkerSummary) -> Option<WorkerState> {
 
 /// Converts a queued operation into a scheduler demand.
 ///
-/// The action's candidates are the fleets that accept its platform properties. An action no
-/// fleet accepts is kept with empty candidates and counts for nothing in the attribution.
-/// Each missing or malformed property contributes zero to its resource dimension.
+/// Candidates ignore environment so an old live worker can satisfy demand; capacity accounting
+/// checks the identity separately before attributing work or launching workers.
+/// Each missing or malformed resource property contributes zero to its dimension. Actions
+/// without a valid environment are omitted.
 fn queued_demand(
     info: &NativeActionInfo,
     fleets: &FleetCatalog,
     expected: Option<Duration>,
-) -> QueuedDemand {
-    QueuedDemand {
-        candidates: fleets.accepting(|key| info.platform_properties.get(key).map(String::as_str)),
+) -> Option<QueuedDemand> {
+    Some(QueuedDemand {
+        candidates: fleets
+            .accepting_base(|key| info.platform_properties.get(key).map(String::as_str)),
+        environment: info
+            .platform_properties
+            .get(property::ACTION_ENVIRONMENT)?
+            .parse()
+            .ok()?,
         resources: resources(&info.platform_properties),
         queued_since: Timestamp::from(info.insert_timestamp),
         priority: info.priority,
         expected,
-    }
+    })
 }
 
 fn parse<T: std::str::FromStr + Default>(properties: &HashMap<String, String>, key: &str) -> T {
@@ -139,8 +151,9 @@ pub(crate) async fn fill(
             continue;
         };
         let duration = expected(operation.origin.as_ref(), durations, now);
-        into.queued
-            .push(queued_demand(&operation.info, fleets, duration));
+        if let Some(demand) = queued_demand(&operation.info, fleets, duration) {
+            into.queued.push(demand);
+        }
     }
 
     for (worker, state) in into
@@ -199,7 +212,10 @@ pub(crate) mod tests {
             is_paused: false,
             is_draining: false,
             last_update_timestamp: 100,
-            platform_properties: props(&[(property::FLEET, "fleet-a")]),
+            platform_properties: props(&[
+                (property::FLEET, "fleet-a"),
+                (property::ACTION_ENVIRONMENT, "host:test"),
+            ]),
             available_platform_properties: HashMap::new(),
             free_memory_kb: None,
         }
@@ -210,7 +226,7 @@ pub(crate) mod tests {
     }
 
     fn queued_demand(info: &NativeActionInfo, fleets: &FleetCatalog) -> QueuedDemand {
-        super::queued_demand(info, fleets, None)
+        super::queued_demand(info, fleets, None).expect("valid environment")
     }
 
     pub(crate) fn history() -> Mutex<ActionDurations> {
@@ -227,6 +243,7 @@ pub(crate) mod tests {
                 &FleetName::try_new(name).expect("valid fleet name"),
                 isa,
                 &"docker",
+                &"host:test".parse().expect("valid environment"),
                 Resources {
                     vcpus: 4,
                     memory: Bytes::gib(8),
@@ -261,6 +278,7 @@ pub(crate) mod tests {
             WorkerState {
                 id: WorkerId::try_new(WORKER).expect("valid worker id"),
                 fleet: FleetName::try_new("fleet-a").expect("valid fleet name"),
+                environment: Some("host:test".parse().expect("valid environment")),
                 running_actions: 2,
                 max_inflight_actions: NonZeroU32::new(8),
                 draining: true,
@@ -289,6 +307,52 @@ pub(crate) mod tests {
         let mut invalid = summary(WORKER);
         invalid.platform_properties = props(&[(property::FLEET, "Not A Fleet")]);
         assert_eq!(worker_state(&invalid), None);
+    }
+
+    #[test]
+    fn unknown_worker_environment_preserves_connected_state() {
+        let mut worker = summary(WORKER);
+        worker.running_actions = 2;
+        worker.is_paused = true;
+        worker.is_draining = true;
+        worker
+            .platform_properties
+            .remove(property::ACTION_ENVIRONMENT);
+        for environment in [None, Some("legacy")] {
+            if let Some(value) = environment {
+                worker
+                    .platform_properties
+                    .insert(property::ACTION_ENVIRONMENT.to_owned(), value.to_owned());
+            }
+            let state = worker_state(&worker).expect("managed worker remains connected");
+            assert_eq!(
+                state.id,
+                WorkerId::try_new(WORKER).expect("valid worker id")
+            );
+            assert_eq!(
+                state.fleet,
+                FleetName::try_new("fleet-a").expect("valid fleet")
+            );
+            assert_eq!(state.environment, None);
+            assert_eq!(state.running_actions, 2);
+            assert!(state.paused);
+            assert!(state.draining);
+            assert_eq!(state.last_seen, Timestamp::from_unix_millis(100_000));
+        }
+    }
+
+    #[test]
+    fn demand_retains_identity_and_base_candidates() {
+        let entry = demand(
+            0,
+            &[
+                (property::ISA, "aarch64"),
+                (property::ACTION_ENVIRONMENT, "host:old"),
+            ],
+        );
+        let demand = queued_demand(&entry, &catalog());
+        assert_eq!(demand.environment.as_str(), "host:old");
+        assert_eq!(demand.candidates.iter().collect::<Vec<_>>(), vec![1]);
     }
 
     #[test]
@@ -385,6 +449,7 @@ pub(crate) mod tests {
             action,
             QueuedDemand {
                 candidates: FleetSet::prefix(1).expect("fleet count in range"),
+                environment: "host:test".parse().expect("valid environment"),
                 resources: ActionResources {
                     cpu_millicores: 4000,
                     memory: Bytes::kib(1024),
@@ -606,6 +671,39 @@ pub(crate) mod tests {
             ..Default::default()
         };
         (workers, fake)
+    }
+
+    #[tokio::test]
+    async fn fill_retains_running_workers_with_unknown_environments() {
+        let (mut workers, fake) = populated_listing();
+        workers[0]
+            .platform_properties
+            .remove(property::ACTION_ENVIRONMENT);
+        workers[2]
+            .platform_properties
+            .insert(property::ACTION_ENVIRONMENT.to_owned(), "legacy".to_owned());
+        let mut snapshot = SchedulerSnapshot::default();
+        fill(
+            &fake,
+            &workers,
+            &catalog(),
+            &history(),
+            Timestamp::from_unix_millis(10_000),
+            0,
+            &mut snapshot,
+        )
+        .await
+        .expect("snapshot");
+        assert_eq!(snapshot.workers.len(), 2);
+        assert!(
+            snapshot
+                .workers
+                .iter()
+                .all(|worker| { worker.environment.is_none() && worker.running_actions == 1 })
+        );
+        assert_eq!(snapshot.executing.len(), 2);
+        assert_eq!(snapshot.executing[0].worker, 0);
+        assert_eq!(snapshot.executing[1].worker, 1);
     }
 
     #[tokio::test]

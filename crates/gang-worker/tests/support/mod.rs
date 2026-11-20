@@ -23,8 +23,8 @@ use gang_config::{
 };
 use gang_spi::{InstanceIdentity, PortError};
 use gang_types::{
-    Bytes, CertificatePem, FleetName, InstanceId, Isa, NonZeroBytes, PrivateKeyPem, Proof,
-    WorkerLifetime,
+    ActionEnvironment, Bytes, CertificatePem, FleetName, InstanceId, Isa, NonZeroBytes,
+    PrivateKeyPem, Proof, WorkerLifetime,
 };
 use gang_worker::{
     Credentials, EnrollError, Enroller, ServerCaError, ServerCaSource, Transport, WorkerDeployment,
@@ -67,6 +67,7 @@ fn fleet_member(
     let policy = FleetPolicy {
         name: FleetName::try_new(name).expect("test fleet name is valid"),
         isa: Isa::X86_64,
+        action_environment: "host:test".parse().expect("test identity is valid"),
         instances: InstanceBounds::up_to(NonZeroU32::MIN.saturating_add(3)),
         vcpus_per_instance: NonZeroU32::new(vcpus).expect("test fleets have vCPUs"),
         memory_per_instance: NonZeroBytes::gib(memory_gib),
@@ -406,6 +407,7 @@ pub struct Harness {
     pub clock: Arc<TestClock>,
     /// The idle flags of the tasks spawned through [`Harness::spawn`].
     idle: Mutex<Vec<Arc<AtomicBool>>>,
+    sandbox_environment: Result<ActionEnvironment, gang_types::ActionEnvironmentError>,
 }
 
 impl Harness {
@@ -452,6 +454,7 @@ impl Harness {
             server_ca: FakeServerCa::new(),
             clock: Arc::new(TestClock::default()),
             idle: Mutex::new(Vec::new()),
+            sandbox_environment: "host:test".parse(),
         }
     }
 
@@ -524,6 +527,7 @@ impl Harness {
                 noop: Some(Opaque::default()),
                 boxed: Some(BoxedSection {
                     program: PathBuf::from("fake-sandbox"),
+                    root: None,
                 }),
                 ..SandboxConfig::default()
             },
@@ -541,6 +545,15 @@ impl Harness {
     ) -> impl FnOnce(TestLimits) -> Result<RecordingLimits, PortError> + use<> {
         let limits = self.limits.clone();
         move |_| Ok(limits)
+    }
+
+    /// Builds the test sandbox's declared local environment.
+    pub fn build_sandbox(
+        &self,
+    ) -> impl FnOnce(SandboxKey, &mut SandboxConfig) -> Result<ActionEnvironment, PortError> + use<>
+    {
+        let environment = self.sandbox_environment.clone();
+        move |_, _| environment.map_err(PortError::config)
     }
 
     /// Advances the clock by `by`, then lets every tracked task run until it is idle.

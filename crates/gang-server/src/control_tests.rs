@@ -12,8 +12,8 @@ use futures::poll;
 use gang_clock::{Clock, Timestamp};
 use gang_spi::{
     ExecutingDemand, Fence, FleetInstance, FleetSupply, Held, InstanceExit, PortError,
-    ProvisionerPort, ScalingAuditEvent, ScalingEventKind, ScalingEventSeq, SchedulerSnapshot,
-    WorkerState,
+    ProvisionerPort, RetirementReason, ScalingAuditEvent, ScalingEventKind, ScalingEventSeq,
+    SchedulerSnapshot, WorkerState,
 };
 use gang_state::BuilderConfig;
 use gang_types::{
@@ -67,8 +67,9 @@ impl ProvisionerPort for LapsingProvisioner {
         held: &Held,
         fleet: Fleet<'_, Opaque>,
         instance: &InstanceId,
+        reason: gang_spi::RetirementReason,
     ) -> Result<(), PortError> {
-        self.inner.terminate(held, fleet, instance).await?;
+        self.inner.terminate(held, fleet, instance, reason).await?;
         if self.lapse.swap(false, Ordering::SeqCst) {
             self.clock.advance(Duration::from_secs(8));
         }
@@ -129,8 +130,9 @@ impl ProvisionerPort for CommittedTerminationProvisioner {
         held: &Held,
         fleet: Fleet<'_, Opaque>,
         instance: &InstanceId,
+        reason: RetirementReason,
     ) -> Result<(), PortError> {
-        self.inner.terminate(held, fleet, instance).await?;
+        self.inner.terminate(held, fleet, instance, reason).await?;
         if self.fail_after_commit.swap(false, Ordering::SeqCst) {
             self.block_converge.store(true, Ordering::SeqCst);
             return Err(PortError::unavailable("termination deadline elapsed"));
@@ -274,6 +276,7 @@ fn idle_worker(instance: &InstanceId, last_seen: Timestamp) -> TestResult<Worker
     Ok(WorkerState {
         id: worker_on(instance)?,
         fleet: fleet_name(),
+        environment: Some("host:test".parse().expect("valid test environment")),
         running_actions: 0,
         max_inflight_actions: NonZeroU32::new(4),
         draining: false,
@@ -2643,8 +2646,9 @@ impl ProvisionerPort for EventProvisioner {
         held: &Held,
         fleet: Fleet<'_, Opaque>,
         instance: &InstanceId,
+        reason: gang_spi::RetirementReason,
     ) -> Result<(), PortError> {
-        self.inner.terminate(held, fleet, instance).await
+        self.inner.terminate(held, fleet, instance, reason).await
     }
 
     fn worker_lifetime(&self) -> gang_types::WorkerLifetime {

@@ -118,7 +118,7 @@ locals {
   gang_toml = templatefile("${path.module}/gang.toml.tftpl", {
     default_isa                       = var.default_isa
     gang_settings                     = var.gang_settings
-    fleets                            = var.fleets
+    fleets                            = [for fleet in var.fleets : merge(fleet, { action_environment = local.node_action_environments[fleet.name] })]
     region                            = var.region
     events_queue_url                  = var.aws_events_enabled ? aws_sqs_queue.events[0].url : null
     public_port                       = local.public_port

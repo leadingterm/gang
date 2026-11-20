@@ -2,7 +2,7 @@
 
 use gang_config::EndpointTrust;
 use gang_spi::{LoginPort, Scheme};
-use gang_types::{CertificatePem, Isa, ProviderName};
+use gang_types::{ActionEnvironment, CertificatePem, Isa, ProviderName};
 use gang_wire::name::SERVER;
 use gang_wire::{Authentication, DeviceLogin, NoAuthentication, Server, TokenAuthentication};
 
@@ -16,6 +16,7 @@ use crate::identity::Providers;
 pub(crate) fn wire_server<V: LoginPort>(
     endpoint: &PublicEndpoint,
     default_isa: Isa,
+    action_environment: &ActionEnvironment,
     endpoint_trust: EndpointTrust,
     ca: Option<CertificatePem>,
     scheme: Scheme,
@@ -45,6 +46,7 @@ pub(crate) fn wire_server<V: LoginPort>(
             EndpointTrust::System => None,
         },
         default_isa: default_isa.into(),
+        action_environment: action_environment.clone(),
         version: Some(env!("CARGO_PKG_VERSION").to_owned()),
         authentication,
     })
@@ -117,6 +119,7 @@ mod tests {
         let info = wire_server(
             &endpoint("https://gang.example.test:443/"),
             Isa::X86_64,
+            &"host:test".parse().expect("valid test environment"),
             EndpointTrust::Ca,
             None,
             Scheme::Token,
@@ -139,6 +142,7 @@ mod tests {
         let info = wire_server(
             &endpoint("https://gang.example.test/"),
             Isa::Aarch64,
+            &"host:test".parse().expect("valid test environment"),
             EndpointTrust::Ca,
             None,
             Scheme::None,
@@ -147,6 +151,7 @@ mod tests {
         .expect("server info builds");
 
         assert_eq!(info.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(info.action_environment.as_str(), "host:test");
         assert_eq!(
             info.authentication,
             Authentication::None(NoAuthentication {})
@@ -158,6 +163,7 @@ mod tests {
         let result = wire_server(
             &endpoint("https://gang.example.test/"),
             Isa::X86_64,
+            &"host:test".parse().expect("valid test environment"),
             EndpointTrust::Ca,
             None,
             Scheme::Mtls,
@@ -172,6 +178,7 @@ mod tests {
         let secure = wire_server(
             &endpoint("https://gang.example.test:8443/base"),
             Isa::X86_64,
+            &"host:test".parse().expect("valid test environment"),
             EndpointTrust::Ca,
             None,
             Scheme::None,
@@ -190,6 +197,7 @@ mod tests {
         let with_ca = wire_server(
             &endpoint("https://gang.example.test/"),
             Isa::X86_64,
+            &"host:test".parse().expect("valid test environment"),
             EndpointTrust::Ca,
             Some(ca()),
             Scheme::None,
@@ -201,6 +209,7 @@ mod tests {
         let without_ca = wire_server(
             &endpoint("https://gang.example.test/"),
             Isa::X86_64,
+            &"host:test".parse().expect("valid test environment"),
             EndpointTrust::Ca,
             None,
             Scheme::None,
@@ -215,6 +224,7 @@ mod tests {
         let info = wire_server(
             &endpoint("https://gang.example.test/"),
             Isa::X86_64,
+            &"host:test".parse().expect("valid test environment"),
             EndpointTrust::System,
             Some(ca()),
             Scheme::None,
