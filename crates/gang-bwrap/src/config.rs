@@ -94,7 +94,10 @@ mod tests {
         assert!(with.supports_capability(Capability::Network));
         assert_eq!(with.egress, Some(EgressPrograms::default()));
         assert!(toml::from_str::<BwrapConfig>("root = '/rootfs'\n[egress]\nunknown = 1").is_err());
-        assert!(toml::from_str::<BwrapConfig>("root = '/rootfs'\npermit_network_property = true").is_err());
+        assert!(
+            toml::from_str::<BwrapConfig>("root = '/rootfs'\npermit_network_property = true")
+                .is_err()
+        );
     }
 
     #[test]
@@ -113,11 +116,13 @@ mod tests {
     fn visits_and_rewrites_bwrap_program() {
         let mut config: BwrapConfig = toml::from_str("root = '/rootfs'").expect("config");
         let mut visited = Vec::new();
-        config.try_for_each_program(&mut |program| -> Result<(), Infallible> {
-            visited.push(program.clone());
-            *program = PathBuf::from("/resolved/bwrap");
-            Ok(())
-        }).expect("visitor");
+        config
+            .try_for_each_program(&mut |program| -> Result<(), Infallible> {
+                visited.push(program.clone());
+                *program = PathBuf::from("/resolved/bwrap");
+                Ok(())
+            })
+            .expect("visitor");
         assert_eq!(visited, [PathBuf::from("bwrap")]);
         assert_eq!(config.program, PathBuf::from("/resolved/bwrap"));
     }

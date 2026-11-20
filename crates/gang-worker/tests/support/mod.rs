@@ -24,8 +24,7 @@ use gang_config::{
 use gang_spi::{InstanceIdentity, PortError};
 use gang_types::{
     ActionEnvironment, Bytes, CertificatePem, FleetActionPolicy, FleetName, InstanceId, Isa,
-    NonZeroBytes,
-    PrivateKeyPem, Proof, WorkerLifetime,
+    NonZeroBytes, PrivateKeyPem, Proof, WorkerLifetime,
 };
 use gang_worker::{
     Credentials, EnrollError, Enroller, ServerCaError, ServerCaSource, Transport, WorkerDeployment,

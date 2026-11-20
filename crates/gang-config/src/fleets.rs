@@ -395,18 +395,35 @@ sandbox = "bwrap"
         let raw: RawFleet<String> = toml::from_str(&config)?;
         let (policy, _, _) = raw.into_parts()?;
         assert_eq!(policy.action_environment.as_str(), "host:test");
-        assert!(policy.actions.grants.contains(&gang_types::Capability::Network));
-        assert_eq!(policy.actions.resources.cpu_count.map(NonZeroU32::get), Some(4));
+        assert!(
+            policy
+                .actions
+                .grants
+                .contains(&gang_types::Capability::Network)
+        );
+        assert_eq!(
+            policy.actions.resources.cpu_count.map(NonZeroU32::get),
+            Some(4)
+        );
         assert!(policy.actions.validate(policy.instance()).is_ok());
         let properties = policy.properties(&"bwrap", []);
-        assert_eq!(properties.get(gang_types::property::ACTION_ENVIRONMENT), Some("host:test"));
-        assert_eq!(properties.get(gang_types::property::NETWORK), Some("requested"));
+        assert_eq!(
+            properties.get(gang_types::property::ACTION_ENVIRONMENT),
+            Some("host:test")
+        );
+        assert_eq!(
+            properties.get(gang_types::property::NETWORK),
+            Some("requested")
+        );
         assert_eq!(properties.limit(gang_types::property::CPU_COUNT), Some(4));
-        assert_eq!(properties.capacity(gang_types::property::CPU_COUNT), Some(8));
-        assert!(toml::from_str::<RawFleet<String>>(&format!(
-            "{FLEET}\n[actions]\nunknown = true\n"
-        ))
-        .is_err());
+        assert_eq!(
+            properties.capacity(gang_types::property::CPU_COUNT),
+            Some(8)
+        );
+        assert!(
+            toml::from_str::<RawFleet<String>>(&format!("{FLEET}\n[actions]\nunknown = true\n"))
+                .is_err()
+        );
         Ok(())
     }
 

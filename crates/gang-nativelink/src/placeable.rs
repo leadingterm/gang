@@ -199,7 +199,10 @@ fn worker_accepts<'a>(
             MatchKind::Capability => {
                 requested.is_empty()
                     || requested == "not-requested"
-                    || worker.platform_properties.get(key).is_some_and(|actual| actual == requested)
+                    || worker
+                        .platform_properties
+                        .get(key)
+                        .is_some_and(|actual| actual == requested)
             }
             MatchKind::Minimum => worker
                 .platform_properties
@@ -338,11 +341,16 @@ impl ClientStateManager for PlaceableActions {
                 served()
             ));
         };
-        let base = self.fleets.admit(
-            action_info.platform_properties.iter()
-                .filter(|(key, _)| key.as_str() != property::ACTION_ENVIRONMENT)
-                .map(|(key, value)| (key.as_str(), value.as_str())),
-        ).map_err(|refusal| refused(&refusal))?;
+        let base = self
+            .fleets
+            .admit(
+                action_info
+                    .platform_properties
+                    .iter()
+                    .filter(|(key, _)| key.as_str() != property::ACTION_ENVIRONMENT)
+                    .map(|(key, value)| (key.as_str(), value.as_str())),
+            )
+            .map_err(|refusal| refused(&refusal))?;
         let admitted = self.fleets.accepting(properties);
         let mut live = None;
         if admitted.is_empty() {
@@ -891,7 +899,8 @@ mod tests {
             },
             &policy,
             [],
-        )]).expect("catalog");
+        )])
+        .expect("catalog");
         let mut worker = live_test_worker("small", 8, 100, 8);
         let mut client = info(property::NETWORK, "requested");
         Arc::make_mut(&mut client).platform_properties.insert(
@@ -902,10 +911,15 @@ mod tests {
         let base = fleets.accepting_base(request);
         let environment = "host:old".parse().expect("environment");
         assert!(live_catalog(&[worker.clone()], &fleets, base, &environment, request).is_none());
-        worker.platform_properties.insert(property::NETWORK.to_owned(), "requested".to_owned());
+        worker
+            .platform_properties
+            .insert(property::NETWORK.to_owned(), "requested".to_owned());
         let live = live_catalog(&[worker], &fleets, base, &environment, request)
             .expect("granted worker is eligible");
-        assert_eq!(live.fleets()[0].capacity(property::MEMORY_KB), Some(8 << 20));
+        assert_eq!(
+            live.fleets()[0].capacity(property::MEMORY_KB),
+            Some(8 << 20)
+        );
         assert_eq!(live.fleets()[0].limit(property::MEMORY_KB), Some(4 << 20));
         assert!(!live.accepting(request).is_empty());
     }

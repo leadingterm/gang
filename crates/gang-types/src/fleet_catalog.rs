@@ -595,7 +595,11 @@ mod tests {
             Ok(set(&[2]))
         );
         for value in ["host:other", ""] {
-            assert!(catalog.admit([(property::ACTION_ENVIRONMENT, value)]).is_err());
+            assert!(
+                catalog
+                    .admit([(property::ACTION_ENVIRONMENT, value)])
+                    .is_err()
+            );
         }
     }
 

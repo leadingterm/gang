@@ -97,9 +97,9 @@ mod tests {
     use gang_spi::ActionIsolationPort;
     use gang_spi::{ActionCommand, ActionExecutionSpec, NetworkAccess, Plugin, PluginContext};
 
-    use crate::bwrap::tests::config;
     use crate::Bwrap;
     use crate::BwrapConfig;
+    use crate::bwrap::tests::config;
 
     /// The descriptor the tests report the sandbox on; the command line only names it.
     const INFO_FD: RawFd = 7;
@@ -189,7 +189,10 @@ mod tests {
             args.windows(3)
                 .any(|a| a == ["--symlink", "usr/bin", "/bin"])
         );
-        assert!(args.windows(3).any(|a| a[0] == "--ro-bind" && a[2] == "/usr"));
+        assert!(
+            args.windows(3)
+                .any(|a| a[0] == "--ro-bind" && a[2] == "/usr")
+        );
         assert!(args.windows(2).any(|a| a == ["--uid", "1000"]));
         assert!(args.windows(2).any(|a| a == ["--gid", "1000"]));
         assert!(args.windows(3).any(|a| a == ["--setenv", "B", "two words"]));
@@ -208,11 +211,23 @@ mod tests {
         for file in ["passwd", "group", "nsswitch.conf"] {
             std::fs::write(config.root.join("root/etc").join(file), file)?;
         }
-        let bwrap = Bwrap::build(config, &PluginContext { config_path: Path::new("/") })?;
+        let bwrap = Bwrap::build(
+            config,
+            &PluginContext {
+                config_path: Path::new("/"),
+            },
+        )?;
         let args = args(&command(
-            &bwrap, Path::new("/work"), Path::new("/work"), NetworkAccess::Offline, None,
+            &bwrap,
+            Path::new("/work"),
+            Path::new("/work"),
+            NetworkAccess::Offline,
+            None,
         )?);
-        assert!(args.windows(3).any(|a| a[0] == "--ro-bind" && a[2] == "/etc"));
+        assert!(
+            args.windows(3)
+                .any(|a| a[0] == "--ro-bind" && a[2] == "/etc")
+        );
         assert!(!args.iter().any(|a| a == "--ro-bind-data"));
         Ok(())
     }
@@ -220,25 +235,68 @@ mod tests {
     #[test]
     fn full_command_line_for_unshared_network() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
-        let bwrap = Bwrap::build(config(directory.path()), &PluginContext {
-            config_path: Path::new("/"),
-        })?;
+        let bwrap = Bwrap::build(
+            config(directory.path()),
+            &PluginContext {
+                config_path: Path::new("/"),
+            },
+        )?;
         let command = command(
-            &bwrap, Path::new("/work/a"), Path::new("/work/a/sub"),
-            NetworkAccess::Offline, None,
+            &bwrap,
+            Path::new("/work/a"),
+            Path::new("/work/a/sub"),
+            NetworkAccess::Offline,
+            None,
         )?;
         assert_eq!(command.get_program(), "/usr/bin/bwrap");
         let root = std::fs::canonicalize(directory.path().join("envelope/root/usr"))?;
-        assert_eq!(args(&command), [
-            "--unshare-all", "--unshare-user", "--uid", "1000", "--gid", "1000",
-            "--die-with-parent", "--new-session", "--clearenv",
-            "--ro-bind", &root.to_string_lossy(), "/usr",
-            "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
-            "--info-fd", "7", "--bind", "/work/a", "/work/a", "--chdir", "/work/a/sub",
-            "--setenv", "A", "1", "--setenv", "B", "two words",
-            "--ro-bind", &bwrap.executable.to_string_lossy(), "/gang-reset",
-            "--remount-ro", "/", "--", "/gang-reset", "--", "/bin/sh", "-c", "echo hi there",
-        ]);
+        assert_eq!(
+            args(&command),
+            [
+                "--unshare-all",
+                "--unshare-user",
+                "--uid",
+                "1000",
+                "--gid",
+                "1000",
+                "--die-with-parent",
+                "--new-session",
+                "--clearenv",
+                "--ro-bind",
+                &root.to_string_lossy(),
+                "/usr",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--tmpfs",
+                "/tmp",
+                "--info-fd",
+                "7",
+                "--bind",
+                "/work/a",
+                "/work/a",
+                "--chdir",
+                "/work/a/sub",
+                "--setenv",
+                "A",
+                "1",
+                "--setenv",
+                "B",
+                "two words",
+                "--ro-bind",
+                &bwrap.executable.to_string_lossy(),
+                "/gang-reset",
+                "--remount-ro",
+                "/",
+                "--",
+                "/gang-reset",
+                "--",
+                "/bin/sh",
+                "-c",
+                "echo hi there",
+            ]
+        );
         Ok(())
     }
 
@@ -253,17 +311,32 @@ mod tests {
         let policy: gang_types::PublicEgressPolicy =
             toml::from_str("protected_networks = [\"10.0.0.0/8\"]\ndns_servers = [\"1.1.1.1\"]")?;
         let args = args(&command(
-            &bwrap, Path::new("/work/a"), Path::new("/work/a"),
-            NetworkAccess::PublicEgress { policy: &policy, controller_endpoints: &[] },
+            &bwrap,
+            Path::new("/work/a"),
+            Path::new("/work/a"),
+            NetworkAccess::PublicEgress {
+                policy: &policy,
+                controller_endpoints: &[],
+            },
             Some((gate.as_fd(), resolver.as_fd())),
         )?);
         assert!(args.iter().any(|arg| arg == "--unshare-all"), "{args:?}");
         assert!(!args.iter().any(|arg| arg == "--share-net"), "{args:?}");
         assert!(!args.iter().any(|arg| arg == "--setenv"), "{args:?}");
         let resolver = position(&args, "/etc/resolv.conf");
-        assert_eq!(&args[resolver - 2..=resolver], ["--ro-bind-data".into(), resolver_fd, "/etc/resolv.conf".into()]);
+        assert_eq!(
+            &args[resolver - 2..=resolver],
+            [
+                "--ro-bind-data".into(),
+                resolver_fd,
+                "/etc/resolv.conf".into()
+            ]
+        );
         let gate = position(&args, "--execution-gate-fd");
-        assert_eq!(&args[gate + 1..gate + 4], [gate_fd, "--".into(), "/bin/sh".into()]);
+        assert_eq!(
+            &args[gate + 1..gate + 4],
+            [gate_fd, "--".into(), "/bin/sh".into()]
+        );
         Ok(())
     }
 
@@ -289,10 +362,21 @@ mod tests {
     fn uses_configured_program() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let bwrap = Bwrap::build(
-            BwrapConfig { program: "/custom/bwrap".into(), ..config(directory.path()) },
-            &PluginContext { config_path: Path::new("sandbox.toml") },
+            BwrapConfig {
+                program: "/custom/bwrap".into(),
+                ..config(directory.path())
+            },
+            &PluginContext {
+                config_path: Path::new("sandbox.toml"),
+            },
         )?;
-        let command = command(&bwrap, Path::new("/work/a"), Path::new("/work/a"), NetworkAccess::Offline, None)?;
+        let command = command(
+            &bwrap,
+            Path::new("/work/a"),
+            Path::new("/work/a"),
+            NetworkAccess::Offline,
+            None,
+        )?;
         assert_eq!(command.get_program(), "/custom/bwrap");
         Ok(())
     }

@@ -206,7 +206,8 @@ mod netfilter_probe {
             if data.len() < 16 {
                 return Err("invalid_response");
             }
-            let len = u32::from_ne_bytes(data[0..4].try_into().map_err(|_| "invalid_response")?) as usize;
+            let len =
+                u32::from_ne_bytes(data[0..4].try_into().map_err(|_| "invalid_response")?) as usize;
             if len < 16 || len > data.len() {
                 return Err("invalid_response");
             }
@@ -217,12 +218,18 @@ mod netfilter_probe {
                     return Err("invalid_response");
                 }
                 let original_kind = u16::from_ne_bytes([data[24], data[25]]);
-                let original_seq = u32::from_ne_bytes(data[28..32].try_into().map_err(|_| "invalid_response")?);
-                let expected_kind = if seq == BEGIN_SEQ { BATCH_BEGIN } else { NEW_TABLE };
+                let original_seq =
+                    u32::from_ne_bytes(data[28..32].try_into().map_err(|_| "invalid_response")?);
+                let expected_kind = if seq == BEGIN_SEQ {
+                    BATCH_BEGIN
+                } else {
+                    NEW_TABLE
+                };
                 if original_seq != seq || original_kind != expected_kind {
                     return Err("invalid_response");
                 }
-                let error = i32::from_ne_bytes(data[16..20].try_into().map_err(|_| "invalid_response")?);
+                let error =
+                    i32::from_ne_bytes(data[16..20].try_into().map_err(|_| "invalid_response")?);
                 return if error == -EPERM {
                     Ok(Some(()))
                 } else if error == 0 {
@@ -241,17 +248,25 @@ mod netfilter_probe {
     }
 
     pub(super) fn run(timeout: Duration) -> Result<(), &'static str> {
-        let deadline = Instant::now().checked_add(timeout).ok_or("invalid_timeout")?;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or("invalid_timeout")?;
         let socket = socket_with(
             AddressFamily::NETLINK,
             SocketType::RAW,
             SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
             Some(netlink::NETFILTER),
-        ).map_err(|_| "socket_error")?;
+        )
+        .map_err(|_| "socket_error")?;
         bind(&socket, &netlink::SocketAddrNetlink::new(0, 0)).map_err(|_| "bind_error")?;
         let request = request();
-        let sent = sendto(&socket, &request, SendFlags::empty(), &netlink::SocketAddrNetlink::new(0, 0))
-            .map_err(|_| "send_error")?;
+        let sent = sendto(
+            &socket,
+            &request,
+            SendFlags::empty(),
+            &netlink::SocketAddrNetlink::new(0, 0),
+        )
+        .map_err(|_| "send_error")?;
         if sent != request.len() {
             return Err("send_error");
         }
@@ -334,11 +349,23 @@ mod netfilter_probe {
         fn accepts_only_matching_eperm() {
             let denied = error_message(TABLE_SEQ, NEW_TABLE, -1);
             assert_eq!(response(&denied), Ok(Some(())));
-            assert_eq!(response(&error_message(BEGIN_SEQ, BATCH_BEGIN, -1)), Ok(Some(())));
-            assert_eq!(response(&error_message(TABLE_SEQ, NEW_TABLE, -13)), Err("unexpected_errno"));
-            assert_eq!(response(&error_message(TABLE_SEQ, NEW_TABLE, 0)), Err("unexpected_success"));
+            assert_eq!(
+                response(&error_message(BEGIN_SEQ, BATCH_BEGIN, -1)),
+                Ok(Some(()))
+            );
+            assert_eq!(
+                response(&error_message(TABLE_SEQ, NEW_TABLE, -13)),
+                Err("unexpected_errno")
+            );
+            assert_eq!(
+                response(&error_message(TABLE_SEQ, NEW_TABLE, 0)),
+                Err("unexpected_success")
+            );
             assert_eq!(response(&error_message(99, NEW_TABLE, -1)), Ok(None));
-            assert_eq!(response(&error_message(TABLE_SEQ, BATCH_BEGIN, -1)), Err("invalid_response"));
+            assert_eq!(
+                response(&error_message(TABLE_SEQ, BATCH_BEGIN, -1)),
+                Err("invalid_response")
+            );
             assert_eq!(response(&denied[..35]), Err("invalid_response"));
             let mut wrong_sequence = denied;
             wrong_sequence[28..32].copy_from_slice(&99_u32.to_ne_bytes());

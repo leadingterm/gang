@@ -152,12 +152,18 @@ impl Plugin for Bwrap {
                 .map(OsString::from),
         );
         if let Some(helpers) = &egress {
-            for path in [&helpers.slirp4netns, &helpers.nft, &helpers.nsenter, &helpers.ip] {
+            for path in [
+                &helpers.slirp4netns,
+                &helpers.nft,
+                &helpers.nsenter,
+                &helpers.ip,
+            ] {
                 if !path.is_absolute() {
                     return Err(BwrapError::NetworkSetup(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!("egress helper path {} is not absolute", path.display()),
-                    )).into());
+                    ))
+                    .into());
                 }
             }
         }
@@ -202,11 +208,8 @@ impl Bwrap {
             rustix::io::fcntl_setfd(resolver, rustix::io::FdFlags::empty())
                 .map_err(|errno| BwrapError::NetworkSetup(io::Error::from(errno)))?;
         }
-        let mut command = tokio::process::Command::from(self.command(
-            spec,
-            writer.as_raw_fd(),
-            network,
-        ));
+        let mut command =
+            tokio::process::Command::from(self.command(spec, writer.as_raw_fd(), network));
         command.kill_on_drop(true);
         let blocked = gang_os::block_terminations().map_err(BwrapError::SignalMask)?;
         // These descriptors are inherited by bwrap (and by gang-join when a launcher is used).
@@ -234,11 +237,17 @@ impl ActionIsolationPort for Bwrap {
     async fn start(&self, spec: &ActionExecutionSpec<'_>) -> Result<SandboxedAction, PortError> {
         let action = spec.action_directory;
         if !action.is_absolute()
-            || action.components().any(|component| matches!(component, Component::ParentDir))
-            || self.entries.iter().any(|entry| action.starts_with(entry) || entry.starts_with(action))
+            || action
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+            || self
+                .entries
+                .iter()
+                .any(|entry| action.starts_with(entry) || entry.starts_with(action))
             || RESERVED.iter().any(|reserved| {
                 let reserved = Path::new(reserved);
-                action == reserved || reserved.starts_with(action)
+                action == reserved
+                    || reserved.starts_with(action)
                     || (reserved != Path::new("/tmp") && action.starts_with(reserved))
             })
         {
