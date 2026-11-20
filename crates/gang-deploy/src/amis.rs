@@ -276,6 +276,24 @@ impl Ami {
         self.state == AmiState::Available && self.public && self.protection == Protection::Enabled
     }
 }
+
+fn action_environment<'a>(image: &'a Ami, region: &Region) -> Result<&'a str> {
+    let mut tags = image
+        .tags
+        .iter()
+        .filter(|tag| tag.key == "ec2:SharedTag/ActionEnvironment");
+    let environment = tags.next().map_or("", |tag| tag.value.as_str());
+    if tags.next().is_some() || lower_hex(environment, 64, Expected::PlanSha256).is_err() {
+        return Err(DeployError::ImageConflict {
+            region: region.to_string(),
+            name: image.name.clone(),
+            expected: "ec2:SharedTag/ActionEnvironment with 64 lowercase hexadecimal digits"
+                .to_owned(),
+            found: environment.to_owned(),
+        });
+    }
+    Ok(environment)
+}
 #[derive(Debug, Clone)]
 struct ImageInventory {
     images: Vec<Ami>,
@@ -508,6 +526,7 @@ pub struct AmiManifest(BTreeMap<Architecture, ManifestImage>);
 #[derive(Debug, Serialize)]
 struct ManifestImage {
     sha256: ImageSha256,
+    action_environment: String,
     regions: BTreeMap<Region, ImageId>,
 }
 fn description(arch: Architecture, tag: &ReleaseTag, sha: &ImageSha256) -> String {
@@ -564,6 +583,7 @@ impl Publication {
     }
     fn validate(&self) -> Result<()> {
         let mut identities: BTreeMap<(String, Architecture), String> = BTreeMap::new();
+        let mut environments: BTreeMap<String, String> = BTreeMap::new();
         if let Some(release) = &self.release {
             for (arch, sha) in &release.images {
                 identities.insert((release.tag.to_string(), *arch), sha.to_string());
@@ -601,6 +621,27 @@ impl Publication {
                         name: image.name.clone(),
                     });
                 };
+                if self
+                    .release
+                    .as_ref()
+                    .is_some_and(|release| release.tag == tag)
+                {
+                    let environment = action_environment(image, region)?;
+                    match environments.get(tag.as_str()) {
+                        Some(expected) if expected != environment => {
+                            return Err(DeployError::ImageConflict {
+                                region: region.to_string(),
+                                name: image.name.clone(),
+                                expected: expected.clone(),
+                                found: environment.to_owned(),
+                            });
+                        }
+                        None => {
+                            environments.insert(tag.to_string(), environment.to_owned());
+                        }
+                        Some(_) => {}
+                    }
+                }
                 if let AmiState::Failed(state) = &image.state {
                     return Err(DeployError::FailedImage {
                         region: region.to_string(),
@@ -796,6 +837,7 @@ impl Publication {
                 {
                     continue;
                 }
+                action_environment(image, &self.home)?;
                 if let Some((arch, tag, sha)) = image.identity() {
                     push(
                         region,
@@ -918,6 +960,7 @@ impl Publication {
             );
         }
         if !image.public {
+            action_environment(image, region)?;
             push(
                 region,
                 4,
@@ -1128,6 +1171,7 @@ impl Publication {
         for (arch, sha) in &release.images {
             let name = AmiName::new(*arch, sha);
             let mut regions = BTreeMap::new();
+            let mut action_environment = None;
             for (region, data) in self.ordered_regions() {
                 let image = data.images.images.iter().find(|i| i.name == name.0);
                 let reason = match image {
@@ -1145,6 +1189,9 @@ impl Publication {
                     });
                 }
                 if let Some(image) = image {
+                    action_environment = image
+                        .tag("ec2:SharedTag/ActionEnvironment")
+                        .map(str::to_owned);
                     regions.insert(region.clone(), image.id.clone());
                 }
             }
@@ -1152,6 +1199,13 @@ impl Publication {
                 *arch,
                 ManifestImage {
                     sha256: sha.clone(),
+                    action_environment: action_environment.ok_or_else(|| {
+                        DeployError::NotConverged {
+                            region: self.home.to_string(),
+                            name: name.to_string(),
+                            reason: "missing action environment".to_owned(),
+                        }
+                    })?,
                     regions,
                 },
             );
@@ -1179,7 +1233,8 @@ mod tests {
         "State": "available", "Public": true, "CreationDate": date,
         "DeregistrationProtection": "enabled-with-cooldown",
         "Tags": [{"Key":"ec2:SharedTag/GangRelease", "Value":tag},
-                 {"Key":"ec2:SharedTag/ImageSha256", "Value":sha}]})
+                 {"Key":"ec2:SharedTag/ImageSha256", "Value":sha},
+                 {"Key":"ec2:SharedTag/ActionEnvironment", "Value":D}]})
     }
     fn current() -> Vec<Value> {
         vec![
@@ -1693,12 +1748,56 @@ mod tests {
         );
     }
     #[test]
+    fn action_environment_must_be_valid_and_match_across_architectures_and_regions() {
+        let mut images = current();
+        images[0]["Tags"][2]["Value"] = json!("host:wrong");
+        assert!(matches!(
+            publication(&images, &[], true, 0, 10).release_steps(),
+            Err(DeployError::ImageConflict { .. })
+        ));
+        images[0]["Tags"][2]["Value"] = json!(X);
+        assert!(matches!(
+            publication(&images, &[], true, 0, 10).manifest(),
+            Err(DeployError::ImageConflict { .. })
+        ));
+        let mut copies = current();
+        copies[0]["Tags"][2]["Value"] = json!(X);
+        assert!(matches!(
+            publication(&current(), &copies, true, 0, 10).manifest(),
+            Err(DeployError::ImageConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn selected_release_requires_environment_but_retained_history_does_not() {
+        let mut selected = current();
+        selected[0]["Tags"].as_array_mut().unwrap().pop();
+        assert!(matches!(
+            publication(&selected, &current(), true, 0, 10).manifest(),
+            Err(DeployError::ImageConflict { .. })
+        ));
+
+        let mut historical = old();
+        historical["Tags"].as_array_mut().unwrap().pop();
+        let mut home = current();
+        home.push(historical.clone());
+        let mut other = current();
+        other.push(historical);
+        assert!(publication(&home, &other, true, 0, 10).manifest().is_ok());
+        assert!(publication(&home, &other, false, 0, 10).steps().is_ok());
+        assert!(matches!(
+            publication(&home, &current(), false, 0, 10).steps(),
+            Err(DeployError::ImageConflict { .. })
+        ));
+    }
+
+    #[test]
     fn manifest_is_exact_and_missing_region_is_reported() {
         let p = publication(&current(), &current(), true, 0, 10);
         assert_eq!(
             serde_json::to_string_pretty(&p.manifest().unwrap()).unwrap(),
             format!(
-                "{{\n  \"aarch64\": {{\n    \"sha256\": \"{A}\",\n    \"regions\": {{\n      \"home-1\": \"ami-02\",\n      \"other-1\": \"ami-02\"\n    }}\n  }},\n  \"x86_64\": {{\n    \"sha256\": \"{X}\",\n    \"regions\": {{\n      \"home-1\": \"ami-01\",\n      \"other-1\": \"ami-01\"\n    }}\n  }}\n}}"
+                "{{\n  \"aarch64\": {{\n    \"sha256\": \"{A}\",\n    \"action_environment\": \"{D}\",\n    \"regions\": {{\n      \"home-1\": \"ami-02\",\n      \"other-1\": \"ami-02\"\n    }}\n  }},\n  \"x86_64\": {{\n    \"sha256\": \"{X}\",\n    \"action_environment\": \"{D}\",\n    \"regions\": {{\n      \"home-1\": \"ami-01\",\n      \"other-1\": \"ami-01\"\n    }}\n  }}\n}}"
             )
         );
         let err = publication(&current(), &[], true, 0, 10)

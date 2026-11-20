@@ -8,8 +8,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use gang_clock::{Clock as _, SystemClock};
-use gang_config::Document;
-use gang_main::plugins::Plugins;
 use gang_types::announcement::Announcement;
 use x509_cert::Certificate;
 use x509_cert::der::DecodePem;
@@ -129,21 +127,10 @@ impl Execution for Observer {
     }
 
     fn set_go(&self, go: bool) -> Result<()> {
-        if go {
-            fs::write(&self.go, b"").map_err(E2eError::io(format!(
-                "setting the go flag {}",
-                self.go.display()
-            )))
-        } else {
-            match fs::remove_file(&self.go) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(error).map_err(E2eError::io(format!(
-                    "clearing the go flag {}",
-                    self.go.display()
-                ))),
-            }
-        }
+        fs::write(&self.go, if go { b"1".as_slice() } else { b"" }).map_err(E2eError::io(format!(
+            "setting the go flag {}",
+            self.go.display()
+        )))
     }
 
     fn processes(&self) -> Result<Vec<Proc>> {
@@ -394,22 +381,6 @@ impl Execution for Observer {
         names.sort();
         names.dedup();
         Ok(names)
-    }
-
-    fn readonly_bind_paths(&self) -> Result<Vec<String>> {
-        let content =
-            fs::read_to_string(&self.config_file).map_err(E2eError::io("reading gang.toml"))?;
-        let document =
-            Document::<Plugins>::parse(&content).map_err(E2eError::parse("gang.toml"))?;
-        let bwrap = document.sandbox.bwrap.ok_or_else(|| {
-            E2eError::system("[sandbox.bwrap] readonly_bind_paths is not a list of paths")
-        })?;
-        Ok(bwrap
-            .readonly_bind_paths
-            .iter()
-            .chain(bwrap.readonly_bind_mounts.keys())
-            .map(|path| path.as_path().to_string_lossy().into_owned())
-            .collect())
     }
 
     fn temp_dirs(&self) -> Result<Vec<PathBuf>> {

@@ -86,7 +86,7 @@ impl<'a, K: Fn(Option<&str>) -> Result<()>> Hold<'a, K> {
     }
 
     pub(crate) fn release(&self) -> Result<()> {
-        let result = fs::write(self.go, b"").map_err(E2eError::io("releasing held probes"));
+        let result = fs::write(self.go, b"1").map_err(E2eError::io("releasing held probes"));
         if result.is_err() {
             self.cancel("release failed");
         } else {
@@ -97,10 +97,11 @@ impl<'a, K: Fn(Option<&str>) -> Result<()>> Hold<'a, K> {
 
     pub(crate) fn is_held(&self) -> Result<bool> {
         let state = self.state.lock();
-        let released = self
-            .go
-            .try_exists()
-            .map_err(E2eError::io("observing held probe release"))?;
+        let released = match fs::metadata(self.go) {
+            Ok(metadata) => metadata.len() != 0,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(E2eError::io("observing held probe release")(error)),
+        };
         Ok(!state.released && !state.cancelled && !released)
     }
 
@@ -399,7 +400,7 @@ mod tests {
         assert!(!hold.is_held().expect("cancelled state"));
         hold.disarm();
         let hold = Hold::new(&go, |_| Ok(()));
-        fs::write(&go, b"").expect("external release");
+        fs::write(&go, b"1").expect("external release");
         assert!(!hold.is_held().expect("external release state"));
         hold.disarm();
     }

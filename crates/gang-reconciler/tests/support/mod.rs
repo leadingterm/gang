@@ -17,9 +17,7 @@ use gang_spi::{
 };
 use gang_testkit::{TestResult, worker_id};
 use gang_types::health::CLIENT_REROUTE_BOUND;
-use gang_types::{
-    ActionResources, Bytes, FleetName, FleetSet, InstanceId, InstanceLifecycle, Isa, NameError,
-};
+use gang_types::{ActionResources, Bytes, FleetName, FleetSet, InstanceId, InstanceLifecycle, Isa};
 
 /// Index of the x86-64 test fleet in the harness's fleets.
 pub const X86: usize = 0;
@@ -39,16 +37,17 @@ pub enum HarnessError {
     /// No instance of the fleet has the given id.
     #[error("unknown instance {0}")]
     UnknownInstance(String),
-    /// The fleet name is not a valid name.
-    #[error("invalid fleet name: {0}")]
-    FleetName(#[from] NameError),
 }
 
 /// Concurrent actions a connected worker accepts in these tests.
 const MAX_INFLIGHT_ACTIONS: Option<NonZeroU32> = NonZeroU32::new(4);
 
 /// A fleet policy named `name` for `isa`, otherwise as [`gang_testkit::fleet_policy`].
-pub fn policy_named(name: &str, isa: Isa) -> Result<FleetPolicy, HarnessError> {
+///
+/// # Errors
+///
+/// Returns the fixture construction error if the fleet name or environment is invalid.
+pub fn policy_named(name: &str, isa: Isa) -> TestResult<FleetPolicy> {
     Ok(FleetPolicy {
         isa,
         ..gang_testkit::fleet_policy(name)?
@@ -56,7 +55,11 @@ pub fn policy_named(name: &str, isa: Isa) -> Result<FleetPolicy, HarnessError> {
 }
 
 /// The x86-64 fleet policy used by the harness, named `gang-x86`.
-pub fn policy() -> Result<FleetPolicy, HarnessError> {
+///
+/// # Errors
+///
+/// Returns the fixture construction error if the fleet name or environment is invalid.
+pub fn policy() -> TestResult<FleetPolicy> {
     policy_named("gang-x86", Isa::X86_64)
 }
 
@@ -89,7 +92,11 @@ pub struct Harness {
 impl Harness {
     /// A harness with one x86-64 fleet built from [`policy`], an empty scheduler, and a
     /// provisioner with no instances.
-    pub fn new() -> Result<Self, HarnessError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the fixture construction error if the fleet policy cannot be created.
+    pub fn new() -> TestResult<Self> {
         Ok(Self::with_policy(policy()?))
     }
 
@@ -158,6 +165,13 @@ impl Harness {
         for _ in 0..count {
             self.snapshot.queued.push(QueuedDemand {
                 candidates,
+                environment: candidates
+                    .iter()
+                    .find_map(|index| self.passes.get(index))
+                    .unwrap_or(&self.passes[0])
+                    .policy
+                    .action_environment
+                    .clone(),
                 resources,
                 queued_since,
                 priority: 0,
@@ -270,6 +284,15 @@ impl Harness {
         let last_seen = self.clock.wall();
         self.snapshot.workers.push(WorkerState {
             id: worker_id(instance)?,
+            environment: Some(
+                self.passes
+                    .iter()
+                    .find(|pass| pass.policy.name == fleet)
+                    .unwrap_or(&self.passes[0])
+                    .policy
+                    .action_environment
+                    .clone(),
+            ),
             fleet,
             running_actions: 0,
             max_inflight_actions: MAX_INFLIGHT_ACTIONS,

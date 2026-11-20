@@ -1,5 +1,5 @@
-//! The journal the execution probes write to: a named pipe beside the hold signal, which a bwrap action can
-//! write through its read-only bind. Lines are shorter than `PIPE_BUF`, so each arrives whole.
+//! The journal the execution probes write to: a named pipe hard-linked into each action.
+//! Lines are shorter than `PIPE_BUF`, so each arrives whole.
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};

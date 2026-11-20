@@ -184,7 +184,7 @@ fn scheduler_snapshot() -> Result<SchedulerSnapshot, Box<dyn Error>> {
     workers.sort_unstable_by(|a, b| a.id.cmp(&b.id));
     let mut queued_actions = Vec::new();
     for index in 0..QUEUED {
-        queued_actions.push(queued(index, two_fleets()?));
+        queued_actions.push(queued(index, two_fleets()?)?);
     }
     Ok(SchedulerSnapshot {
         completed: 100,

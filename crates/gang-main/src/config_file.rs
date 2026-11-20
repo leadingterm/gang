@@ -153,6 +153,7 @@ disk = "3GiB"
 name = "local-worker-x86-64"
 isa = "x86-64"
 sandbox = "bwrap"
+action_environment = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 min_instances = 0
 max_instances = 4
 vcpus_per_instance = 4
@@ -177,9 +178,10 @@ key_file = "/tmp/gang-local/ca.key"
 path = "/tmp/gang-local/gang.db"
 
 [sandbox.noop]
+environment = "host:test"
 
 [sandbox.bwrap]
-readonly_bind_paths = ["/nix/store", "/run/current-system/sw"]
+root = "/etc/gang/action-rootfs"
 permit_network_property = false
 
 [server]

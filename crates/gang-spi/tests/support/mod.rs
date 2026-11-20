@@ -49,6 +49,13 @@ impl SandboxPrograms for NumberConfig {
     ) -> Result<(), E> {
         Ok(())
     }
+
+    fn try_for_each_root<E>(
+        &mut self,
+        _visit: &mut impl FnMut(&mut gang_types::AbsolutePathBuf) -> Result<(), E>,
+    ) -> Result<(), E> {
+        Ok(())
+    }
 }
 
 /// Declares a plugin built from `number = N`. Test crates reuse it through `#[macro_use] mod support;`.
@@ -235,6 +242,7 @@ macro_rules! provisioner_plugin {
                 held: &Held,
                 fleet: Fleet<'_, Self::FleetOptions>,
                 instance: &InstanceId,
+                _reason: gang_spi::RetirementReason,
             ) -> Result<(), PortError> {
                 held.check()?;
                 self.record(fleet.options);
@@ -429,6 +437,7 @@ impl SchedulerPort for Stub {
         let candidates = FleetSet::prefix(1).map_err(PortError::backend)?;
         into.queued.push(QueuedDemand {
             candidates,
+            environment: "host:test".parse().map_err(PortError::backend)?,
             resources: ActionResources::default(),
             queued_since: Timestamp::UNIX_EPOCH,
             priority: i32::try_from(self.number).map_err(PortError::backend)?,
@@ -1074,6 +1083,10 @@ impl ExpiringRecordPort for Memory {
 macro_rules! sandbox_port {
     ($plugin:ident) => {
         impl ActionIsolationPort for $plugin {
+            fn environment(&self) -> &gang_types::ActionEnvironment {
+                &self.environment
+            }
+
             async fn start(
                 &self,
                 _spec: &ActionExecutionSpec<'_>,
@@ -1087,15 +1100,50 @@ macro_rules! sandbox_port {
     };
 }
 
-macro_rules! sandbox_plugin {
-    ($plugin:ident) => {
-        numbered_plugin!($plugin);
-
-        sandbox_port!($plugin);
-    };
+/// Configuration for the direct sandbox.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectConfig {
+    /// The number its actions exit with.
+    pub number: u32,
+    /// The action environment the sandbox provides.
+    pub environment: gang_types::ActionEnvironment,
 }
 
-sandbox_plugin!(Direct);
+impl SandboxPrograms for DirectConfig {
+    fn try_for_each_program<E>(
+        &mut self,
+        _: &mut impl FnMut(&mut PathBuf) -> Result<(), E>,
+    ) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn try_for_each_root<E>(
+        &mut self,
+        _: &mut impl FnMut(&mut gang_types::AbsolutePathBuf) -> Result<(), E>,
+    ) -> Result<(), E> {
+        Ok(())
+    }
+}
+
+/// A direct sandbox with configured behavior.
+pub struct Direct {
+    number: u32,
+    environment: gang_types::ActionEnvironment,
+}
+
+impl Plugin for Direct {
+    type Config = DirectConfig;
+
+    fn build(config: DirectConfig, _: &PluginContext<'_>) -> Result<Self, PortError> {
+        Ok(Self {
+            number: config.number,
+            environment: config.environment,
+        })
+    }
+}
+
+sandbox_port!(Direct);
 
 /// The `[sandbox.boxed]` section: the number its actions exit with, and the program that runs it.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -1103,6 +1151,8 @@ sandbox_plugin!(Direct);
 pub struct BoxedConfig {
     /// The number the boxed plugin's actions exit with.
     pub number: u32,
+    /// The action environment the sandbox provides.
+    pub environment: gang_types::ActionEnvironment,
     /// The program the boxed action runs; empty when the section omits it.
     #[serde(default)]
     pub program: PathBuf,
@@ -1115,11 +1165,19 @@ impl SandboxPrograms for BoxedConfig {
     ) -> Result<(), E> {
         visit(&mut self.program)
     }
+
+    fn try_for_each_root<E>(
+        &mut self,
+        _visit: &mut impl FnMut(&mut gang_types::AbsolutePathBuf) -> Result<(), E>,
+    ) -> Result<(), E> {
+        Ok(())
+    }
 }
 
 /// The sandbox plugin whose section names the program that runs it.
 pub struct Boxed {
     number: u32,
+    environment: gang_types::ActionEnvironment,
 }
 
 impl Plugin for Boxed {
@@ -1128,6 +1186,7 @@ impl Plugin for Boxed {
     fn build(config: BoxedConfig, _context: &PluginContext<'_>) -> Result<Self, PortError> {
         Ok(Self {
             number: config.number,
+            environment: config.environment,
         })
     }
 }

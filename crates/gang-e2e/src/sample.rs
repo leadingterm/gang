@@ -46,6 +46,14 @@ pub struct SampleParameters {
     pub salt: String,
     /// The PATH of every action.
     pub action_path: String,
+    /// Shell used by actions in this deployment.
+    pub action_shell: PathBuf,
+    /// Whether actions use the action-local channel handshake.
+    pub action_ipc: bool,
+    /// Host PATH for explicitly noop-sandboxed actions.
+    pub host_action_path: String,
+    /// Host shell for explicitly noop-sandboxed actions.
+    pub host_action_shell: PathBuf,
     /// The signal pipe actions see as `E2E_SIGNAL`.
     pub signal: PathBuf,
     /// The attempt counter actions see as `E2E_ATTEMPTS`.
@@ -87,6 +95,11 @@ pub fn stage(source: &Path, destination: &Path, parameters: &SampleParameters) -
         destination.display()
     )))?;
     copy_tree(source, destination)?;
+    let repository_rule = include_str!("../../../bazel/action_environment/repository.bzl");
+    fs::write(destination.join("action_environment.bzl"), repository_rule).map_err(
+        E2eError::io("staging the action environment repository rule"),
+    )?;
+    stage_action_environment_probe(destination)?;
     if let Some(tool) = &parameters.glibc_tool {
         let staged = destination.join(GLIBC_TOOL_FILE);
         fs::copy(tool, &staged).map_err(E2eError::io(format!(
@@ -109,6 +122,10 @@ pub fn stage(source: &Path, destination: &Path, parameters: &SampleParameters) -
          \n\
          SALT = \"{}\"\n\
          ACTION_PATH = \"{}\"\n\
+         ACTION_SHELL = \"{}\"\n\
+         ACTION_IPC = {}\n\
+         HOST_ACTION_PATH = \"{}\"\n\
+         HOST_ACTION_SHELL = \"{}\"\n\
          SIGNAL = \"{}\"\n\
          ATTEMPTS = \"{}\"\n\
          ISA = \"{}\"\n\
@@ -120,6 +137,14 @@ pub fn stage(source: &Path, destination: &Path, parameters: &SampleParameters) -
          SIGNAL_COMMAND = \"{}\"\n",
         escape(&parameters.salt),
         escape(&parameters.action_path),
+        escape(&parameters.action_shell.to_string_lossy()),
+        if parameters.action_ipc {
+            "True"
+        } else {
+            "False"
+        },
+        escape(&parameters.host_action_path),
+        escape(&parameters.host_action_shell.to_string_lossy()),
         escape(&parameters.signal.to_string_lossy()),
         escape(&parameters.attempts.to_string_lossy()),
         parameters.isa.as_str(),
@@ -135,21 +160,29 @@ pub fn stage(source: &Path, destination: &Path, parameters: &SampleParameters) -
         .map_err(E2eError::io(format!("writing {}", config_path.display())))
 }
 
-/// Stages the actual harness and pinned `PostgreSQL` archive for the sandbox contract action.
-pub(crate) fn stage_action_environment(destination: &Path, archive: &Path) -> Result<()> {
+fn stage_action_environment_probe(destination: &Path) -> Result<()> {
     let executable =
         std::env::current_exe().map_err(E2eError::io("locating the action environment probe"))?;
-    for (source, name) in [
-        (executable.as_path(), "action-environment-probe"),
-        (archive, "action-environment-postgresql.tar.gz"),
-    ] {
-        let target = destination.join(name);
-        fs::copy(source, &target).map_err(E2eError::io(format!(
-            "copying {} to {}",
-            source.display(),
-            target.display()
-        )))?;
-    }
+    let temporary = tempfile::NamedTempFile::new_in(destination).map_err(E2eError::io(
+        "creating the action environment probe temporary file",
+    ))?;
+    fs::copy(&executable, temporary.path())
+        .map_err(E2eError::io("copying the action environment probe"))?;
+    temporary
+        .persist(destination.join("action-environment-probe"))
+        .map_err(|error| E2eError::io("installing the action environment probe")(error.error))?;
+    Ok(())
+}
+
+/// Stages the actual harness and pinned `PostgreSQL` archive for the sandbox contract action.
+pub(crate) fn stage_action_environment(destination: &Path, archive: &Path) -> Result<()> {
+    stage_action_environment_probe(destination)?;
+    let target = destination.join("action-environment-postgresql.tar.gz");
+    fs::copy(archive, &target).map_err(E2eError::io(format!(
+        "copying {} to {}",
+        archive.display(),
+        target.display()
+    )))?;
     Ok(())
 }
 

@@ -451,6 +451,7 @@ impl ProvisionerPort for FakeProvisioner {
         held: &Held,
         fleet: Fleet<'_, Opaque>,
         instance: &InstanceId,
+        _reason: gang_spi::RetirementReason,
     ) -> Result<(), PortError> {
         held.check()?;
         let mut state = self.state.lock();
@@ -668,7 +669,7 @@ mod tests {
         ));
         assert!(matches!(
             crate::fence::with_expired_held(async |held| fake
-                .terminate(held, fleet, &instance)
+                .terminate(held, fleet, &instance, gang_spi::RetirementReason::Idle)
                 .await)
             .await,
             Err(gang_spi::RunError::Failed(PortError::Unavailable(_)))
@@ -836,7 +837,11 @@ mod tests {
             },
         );
 
-        crate::fence::with_held(async |held| fake.terminate(held, fleet, &first).await).await?;
+        crate::fence::with_held(async |held| {
+            fake.terminate(held, fleet, &first, gang_spi::RetirementReason::Idle)
+                .await
+        })
+        .await?;
         let mut supply = FleetSupply::default();
         fake.supply(fleet, &mut supply).await?;
         assert_eq!(supply.desired, 1);
@@ -844,22 +849,38 @@ mod tests {
         assert_eq!(supply.instances[0].id, second);
 
         let unknown = InstanceId::try_new("unknown")?;
-        crate::fence::with_held(async |held| fake.terminate(held, fleet, &unknown).await).await?;
-        crate::fence::with_held(async |held| fake.terminate(held, fleet, &first).await).await?;
+        crate::fence::with_held(async |held| {
+            fake.terminate(held, fleet, &unknown, gang_spi::RetirementReason::Idle)
+                .await
+        })
+        .await?;
+        crate::fence::with_held(async |held| {
+            fake.terminate(held, fleet, &first, gang_spi::RetirementReason::Idle)
+                .await
+        })
+        .await?;
         let mut after = FleetSupply::default();
         fake.supply(fleet, &mut after).await?;
         assert_eq!(after, supply);
 
         supply.instances[0].lifecycle = InstanceLifecycle::Terminating;
         fake.set_supply(&name, supply.clone());
-        crate::fence::with_held(async |held| fake.terminate(held, fleet, &second).await).await?;
+        crate::fence::with_held(async |held| {
+            fake.terminate(held, fleet, &second, gang_spi::RetirementReason::Idle)
+                .await
+        })
+        .await?;
         fake.supply(fleet, &mut after).await?;
         assert_eq!(after, supply);
 
         supply.desired = 0;
         supply.instances[0].lifecycle = InstanceLifecycle::Pending;
         fake.set_supply(&name, supply);
-        crate::fence::with_held(async |held| fake.terminate(held, fleet, &second).await).await?;
+        crate::fence::with_held(async |held| {
+            fake.terminate(held, fleet, &second, gang_spi::RetirementReason::Idle)
+                .await
+        })
+        .await?;
         fake.supply(fleet, &mut after).await?;
         assert_eq!(after.desired, 0);
         assert!(after.instances.is_empty());
@@ -978,12 +999,18 @@ mod tests {
                 .is_err()
         );
         assert_eq!(fake.desired_requests(), vec![(name.clone(), 2)]);
-        crate::fence::with_held(async |held| fake.terminate(held, fleet, &instance).await).await?;
+        crate::fence::with_held(async |held| {
+            fake.terminate(held, fleet, &instance, gang_spi::RetirementReason::Idle)
+                .await
+        })
+        .await?;
         fake.fail_terminate(true);
         assert!(
-            crate::fence::with_held(async |held| fake.terminate(held, fleet, &instance).await)
-                .await
-                .is_err()
+            crate::fence::with_held(async |held| fake
+                .terminate(held, fleet, &instance, gang_spi::RetirementReason::Idle)
+                .await)
+            .await
+            .is_err()
         );
         assert_eq!(fake.terminations(), vec![instance]);
         fake.fail_supply(false);

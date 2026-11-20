@@ -4,7 +4,7 @@ use gang_spi::{
     ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, Plugin, PluginContext,
     PortError, SandboxedAction,
 };
-use gang_types::AbsolutePathBuf;
+use gang_types::{AbsolutePathBuf, ActionEnvironment};
 use tempfile::TempDir;
 use tokio::process::Child;
 
@@ -16,6 +16,7 @@ use crate::errors::NoopError;
 /// removed when the action ends.
 #[derive(Debug)]
 pub struct Noop {
+    environment: ActionEnvironment,
     /// The directory under which each action's `TMPDIR` is created, or the system temporary
     /// directory when `None`.
     scratch_dir: Option<AbsolutePathBuf>,
@@ -25,13 +26,21 @@ impl Plugin for Noop {
     type Config = NoopConfig;
 
     fn build(config: NoopConfig, _context: &PluginContext<'_>) -> Result<Self, PortError> {
+        if config.environment.is_rootfs() {
+            return Err(PortError::config(NoopError::RootfsEnvironment));
+        }
         Ok(Self {
+            environment: config.environment,
             scratch_dir: config.scratch_dir,
         })
     }
 }
 
 impl ActionIsolationPort for Noop {
+    fn environment(&self) -> &ActionEnvironment {
+        &self.environment
+    }
+
     /// Spawns the action in the calling process's own process group, so a signal to that group
     /// reaches it. Spawning is synchronous, so this returns once the action is running. Dropping
     /// the [`SandboxedAction`] kills the action's process.

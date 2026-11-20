@@ -151,7 +151,8 @@ mod tests {
                 "DeregistrationProtection": "enabled-with-cooldown",
                 "Tags": [
                     {"Key": "ec2:SharedTag/GangRelease", "Value": "v1"},
-                    {"Key": "ec2:SharedTag/ImageSha256", "Value": sha}
+                    {"Key": "ec2:SharedTag/ImageSha256", "Value": sha},
+                    {"Key": "ec2:SharedTag/ActionEnvironment", "Value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}
                 ]
             })
         };
@@ -167,6 +168,10 @@ mod tests {
         assert_eq!(code, ExitCode::SUCCESS);
         let manifest: serde_json::Value = serde_json::from_str(&stdout).expect("manifest json");
         assert_eq!(manifest["x86_64"]["sha256"], &x86[7..]);
+        assert_eq!(
+            manifest["x86_64"]["action_environment"],
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        );
         assert_eq!(manifest["x86_64"]["regions"]["us-east-1"], "ami-01");
         assert_eq!(manifest["aarch64"]["sha256"], &arm[8..]);
         assert_eq!(manifest["aarch64"]["regions"]["us-east-1"], "ami-02");
@@ -188,7 +193,8 @@ mod tests {
                 "DeregistrationProtection": "enabled-with-cooldown",
                 "Tags": [
                     {"Key": "ec2:SharedTag/GangRelease", "Value": tag},
-                    {"Key": "ec2:SharedTag/ImageSha256", "Value": sha}
+                    {"Key": "ec2:SharedTag/ImageSha256", "Value": sha},
+                    {"Key": "ec2:SharedTag/ActionEnvironment", "Value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}
                 ]
             })
         };

@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use gang_config::{FleetPolicy, InstanceBounds};
 use gang_reconciler::Demand;
-use gang_testkit::fleet_policy;
-use gang_types::{ActionResources, Bytes, NameError, NonZeroBytes};
+use gang_testkit::{TestResult, fleet_policy};
+use gang_types::{ActionResources, Bytes, NonZeroBytes};
 
-fn policy() -> Result<FleetPolicy, NameError> {
+fn policy() -> TestResult<FleetPolicy> {
     Ok(FleetPolicy {
         instances: InstanceBounds::up_to(gang_types::nonzero_u32(100)),
         vcpus_per_instance: gang_types::nonzero_u32(15),

@@ -442,9 +442,10 @@ pub(crate) mod tests {
             command_digest: digest(1, 10),
             input_root_digest: digest(2, 20),
             timeout: Duration::from_mins(1),
-            platform_properties: platform
-                .iter()
-                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            platform_properties: [(property::ACTION_ENVIRONMENT, "host:test")]
+                .into_iter()
+                .chain(platform.iter().copied())
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
                 .collect(),
             priority,
             load_timestamp: UNIX_EPOCH,
@@ -490,10 +491,13 @@ pub(crate) mod tests {
             is_paused: false,
             is_draining: false,
             last_update_timestamp: 100,
-            platform_properties: HashMap::from([(
-                property::FLEET.to_owned(),
-                "fleet-a".to_owned(),
-            )]),
+            platform_properties: HashMap::from([
+                (property::FLEET.to_owned(), "fleet-a".to_owned()),
+                (
+                    property::ACTION_ENVIRONMENT.to_owned(),
+                    "host:test".to_owned(),
+                ),
+            ]),
             available_platform_properties: HashMap::new(),
             free_memory_kb: None,
         }
@@ -504,6 +508,7 @@ pub(crate) mod tests {
             &FleetName::try_new(name)?,
             isa,
             &"docker",
+            &"host:test".parse().expect("valid environment"),
             Resources {
                 vcpus: 4,
                 memory: Bytes::new(8_589_934_592),

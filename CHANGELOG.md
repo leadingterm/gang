@@ -11,6 +11,8 @@
 
 ### Changed
 
+- **Action environment cutover:** run `gang setup` after upgrading; old caches and requests with absent or obsolete action-environment identities are unsupported. Explicit execution platforms and target execution properties must merge `@gang_env//:defs.bzl`'s `EXEC_PROPERTIES`; see [the specification](docs/SPECIFICATION.md#42-client-wiring--github-actions). Bwrap now uses a content-addressed read-only rootfs; noop retains its operator-asserted host environment. Running builds are not interrupted by the cutover. Already queued work for an identity no longer served can wait until its existing timeout.
+
 - Check follower shared responses against the leader and verify marked leader-only refusals in the build scenario.
 - Include bounded state, redacted local launch records and build status in launch-failure scenario timeout diagnostics.
 - Run cross-backend learned-history and embedded integration tests in the end-to-end crate, keeping lower-layer test dependencies independent of server orchestration.
@@ -33,7 +35,7 @@
 - Move the production apply runtime from OpenTofu 1.13.5 to the 1.13.9 patch release, aligning Bazel tests with the deploy runtime.
 - Hand leadership to a routable newer controller during shared-database refresh without terminating the former leader process. Prepared controllers serve shared authentication, API and cache services before promotion and throughout handoff; leader-only refusals safely retire connections while admitted streams drain. Host priority survives restart, and a bounded learned-history snapshot precedes release, though late measurements may be lost. The v0.3.3 health listener retains `/leader` as an exact `/ready` alias for mixed-version rollout.
 - Generate `--remote_download_outputs=toplevel` in client rc files so unused remote intermediate outputs are not downloaded.
-- Supply sandboxed actions with a synthetic worker identity and public TLS roots, and partition caches by action environment revision.
+- Supply sandboxed actions with a synthetic worker identity and public TLS roots.
 - Avoid killing actions for ambient memory stalls without a sustained action-pool shortage.
 - Align dashboard sections and cache charts using shared responsive layout.
 - Preserve client identity with PROXY v2 while avoiding cross-zone NLB backend connection collisions in shared-database deployments. Keep the default `accept` stage during the v0.3.3 release deploy; after every binary has rolled out, apply `proxied` and `require` in separate steps, waiting after each. Roll back one stage per apply in reverse: `require` → `proxied` → `accept` → `off`, waiting after each; reach `off` before downgrading to a parserless binary. See the deployment specification for trust and rollout details.

@@ -3,7 +3,7 @@
 use std::fmt::{Debug, Display};
 use std::path::PathBuf;
 
-use gang_types::{AuthenticationSettings, FleetName};
+use gang_types::{AbsolutePathBuf, AuthenticationSettings, FleetName};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -87,6 +87,17 @@ pub trait SandboxSelection {
         &mut self,
         key: Self::Key,
         visit: impl FnMut(&mut PathBuf) -> Result<(), E>,
+    ) -> Result<(), E>;
+
+    /// Calls `visit` on each immutable sandbox root of the selected section.
+    ///
+    /// # Errors
+    ///
+    /// The first error `visit` returns.
+    fn try_for_each_root<E>(
+        &mut self,
+        key: Self::Key,
+        visit: impl FnMut(&mut AbsolutePathBuf) -> Result<(), E>,
     ) -> Result<(), E>;
 }
 

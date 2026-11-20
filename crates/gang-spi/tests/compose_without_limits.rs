@@ -49,6 +49,7 @@ number = 13
 name = "workers"
 isa = "x86-64"
 sandbox = "boxed"
+action_environment = "host:test"
 min_instances = 0
 max_instances = 4
 vcpus_per_instance = 4
@@ -73,9 +74,11 @@ number = 4
 
 [sandbox.direct]
 number = 5
+environment = "host:test"
 
 [sandbox.boxed]
 number = 6
+environment = "host:test"
 
 [identity.providers.corp.token]
 number = 7

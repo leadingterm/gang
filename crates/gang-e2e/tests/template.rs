@@ -69,17 +69,58 @@ fn launcher() -> Vec<String> {
         .to_vec()
 }
 
-/// Self-contained tools from two Nix store closures.
-fn tools() -> ActionTools {
-    ActionTools {
-        shell: PathBuf::from("/nix/store/aaa-bash/bin/bash"),
-        bwrap: Some(PathBuf::from("/nix/store/ccc-bubblewrap/bin/bwrap")),
-        path: "/nix/store/aaa-bash/bin:/nix/store/bbb-coreutils/bin".to_owned(),
-        action_bin: PathBuf::from("/nix/store/ddd-action-tools/bin"),
-        ca_bundle: None,
-        glibc_tool: None,
-        glibc_loader: Vec::new(),
+const ROOTFS_IDENTITY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+struct TestTools {
+    tools: ActionTools,
+    rootfs: tempfile::TempDir,
+}
+
+impl std::ops::Deref for TestTools {
+    type Target = ActionTools;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tools
     }
+}
+
+impl std::ops::DerefMut for TestTools {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.tools
+    }
+}
+
+/// A rootfs envelope for configuration rendering; its files are not executed.
+fn tools() -> gang_e2e::Result<TestTools> {
+    let rootfs = tempfile::tempdir().map_err(E2eError::io("creating rootfs envelope"))?;
+    let root = rootfs.path().join("root");
+    std::fs::create_dir_all(root.join("etc")).map_err(E2eError::io("creating rootfs tree"))?;
+    std::fs::create_dir_all(root.join("usr/bin")).map_err(E2eError::io("creating rootfs bin"))?;
+    std::os::unix::fs::symlink("usr/bin", root.join("bin"))
+        .map_err(E2eError::io("linking merged bin"))?;
+    std::fs::write(root.join("usr/bin/bash"), "").map_err(E2eError::io("writing fixture shell"))?;
+    std::fs::write(
+        root.join("etc/passwd"),
+        "builder:x:1000:1000:builder:/home/builder:/bin/bash\n",
+    )
+    .map_err(E2eError::io("writing rootfs passwd"))?;
+    std::fs::write(root.join("etc/group"), "builder:x:1000:\n")
+        .map_err(E2eError::io("writing rootfs group"))?;
+    std::fs::write(
+        rootfs.path().join("identity"),
+        format!("{ROOTFS_IDENTITY}\n"),
+    )
+    .map_err(E2eError::io("writing rootfs identity"))?;
+    Ok(TestTools {
+        tools: ActionTools {
+            shell: PathBuf::from("/nix/store/aaa-bash/bin/bash"),
+            bwrap: Some(PathBuf::from("/nix/store/ccc-bubblewrap/bin/bwrap")),
+            path: "/nix/store/aaa-bash/bin:/nix/store/bbb-coreutils/bin".to_owned(),
+            glibc_tool: None,
+            action_rootfs: Some(rootfs.path().to_path_buf()),
+        },
+        rootfs,
+    })
 }
 
 #[test]
@@ -123,7 +164,11 @@ fn place_gives_every_local_fleet_the_harness_fleet_disk() -> gang_e2e::Result<()
     let placement = Placement::create(None)?;
     let template = ConfigTemplate::parse(&base_config()?)?
         .place(&placement, Transport::Tls)?
-        .vary(&placement_variant(Sandbox::Bwrap), &launcher(), &tools())?;
+        .vary(
+            &placement_variant(Sandbox::Bwrap),
+            &launcher(),
+            &*(tools()?),
+        )?;
     let doc = typed_rendered(&template)?;
     assert_eq!(doc.fleets.len(), 3);
     for fleet in &doc.fleets {
@@ -282,7 +327,11 @@ fn place_action_settings_parse_as_domain_config() -> gang_e2e::Result<()> {
 #[test]
 fn cold_actions_fit_one_placed_worker() -> gang_e2e::Result<()> {
     let (_, template) = placed(Transport::Tls)?;
-    let template = template.vary(&placement_variant(Sandbox::Bwrap), &launcher(), &tools())?;
+    let template = template.vary(
+        &placement_variant(Sandbox::Bwrap),
+        &launcher(),
+        &*(tools()?),
+    )?;
     let doc = typed_rendered(&template)?;
     let cold_memory = doc.actions.cold_start.memory.get().get();
     let cold_disk = doc.actions.cold_start.disk.get().get();
@@ -302,7 +351,11 @@ fn cold_actions_fit_one_placed_worker() -> gang_e2e::Result<()> {
 
 /// The document of the fixture varied by `variant`.
 fn varied_document(variant: &Variant) -> gang_e2e::Result<Document<Plugins>> {
-    typed_rendered(&ConfigTemplate::parse(&base_config()?)?.vary(variant, &launcher(), &tools())?)
+    typed_rendered(&ConfigTemplate::parse(&base_config()?)?.vary(
+        variant,
+        &launcher(),
+        &*(tools()?),
+    )?)
 }
 
 /// The action policy of the fixture varied by `variant`.
@@ -342,7 +395,7 @@ fn short_boot_grace_bounds_shutdown_and_preserves_shorter_setting() -> gang_e2e:
     ] {
         let base = format!("{}{suffix}", base_config()?);
         let text = ConfigTemplate::parse(&base)?
-            .vary(&variant, &launcher(), &tools())?
+            .vary(&variant, &launcher(), &*(tools()?))?
             .render()?;
         let config = text
             .parse::<GangConfig<Plugins>>()
@@ -419,113 +472,65 @@ fn place_fails_naming_a_missing_section() -> gang_e2e::Result<()> {
 }
 
 #[test]
-fn bwrap_binds_only_action_tool_roots_and_signal_dir() -> gang_e2e::Result<()> {
+fn bwrap_uses_the_envelope_and_its_identity() -> gang_e2e::Result<()> {
     let (_, template) = placed(Transport::Plain)?;
-    let signal = std::path::Path::new("/tmp/e2e-signal");
-    let template = template
-        .vary(&Variant::baseline(Sandbox::Bwrap), &launcher(), &tools())?
-        .with_signal_dir(signal)?;
-    let doc = typed_rendered(&template)?;
-    let bwrap = doc.sandbox.bwrap.as_ref().expect("bwrap sandbox");
+    let tools = tools()?;
+    let doc =
+        typed_rendered(&template.vary(&Variant::baseline(Sandbox::Bwrap), &launcher(), &tools)?)?;
+    let bwrap = doc.sandbox.bwrap.expect("bwrap sandbox");
     assert_eq!(
         bwrap.program,
         PathBuf::from("/nix/store/ccc-bubblewrap/bin/bwrap")
     );
-    let paths: Vec<_> = bwrap
-        .readonly_bind_paths
-        .iter()
-        .map(AbsolutePathBuf::as_path)
-        .collect();
-    assert_eq!(paths, vec![std::path::Path::new("/nix/store"), signal]);
-    Ok(())
-}
-
-#[test]
-fn bwrap_binds_action_tools_at_standard_paths() -> gang_e2e::Result<()> {
-    let (_, template) = placed(Transport::Plain)?;
-    let tools = tools();
-    let template = template.vary(&Variant::baseline(Sandbox::Bwrap), &launcher(), &tools)?;
-    let doc = typed_rendered(&template)?;
-    let bwrap = doc.sandbox.bwrap.as_ref().expect("bwrap sandbox");
-    let mounts: Vec<_> = bwrap
-        .readonly_bind_mounts
-        .iter()
-        .map(|(destination, source)| (destination.as_path(), source.as_path()))
-        .collect();
     assert_eq!(
-        mounts,
-        vec![
-            (std::path::Path::new("/bin"), tools.action_bin.as_path()),
-            (std::path::Path::new("/usr/bin"), tools.action_bin.as_path()),
-        ]
+        bwrap.root.as_path(),
+        std::fs::canonicalize(tools.rootfs.path())
+            .map_err(E2eError::io("canonicalizing rootfs envelope"))?
     );
+    assert_eq!(doc.fleets[0].action_environment.as_str(), ROOTFS_IDENTITY);
     Ok(())
 }
 
 #[test]
-fn bwrap_mounts_the_public_bundle_at_each_system_path() -> gang_e2e::Result<()> {
-    let (_, template) = placed(Transport::Plain)?;
-    let mut tools = tools();
-    let bundle = PathBuf::from("/nix/store/example-cacert/ca-bundle.crt");
-    tools.ca_bundle = Some(bundle.clone());
-    let template = template.vary(&Variant::baseline(Sandbox::Bwrap), &launcher(), &tools)?;
-    let doc = typed_rendered(&template)?;
-    let bwrap = doc.sandbox.bwrap.as_ref().expect("bwrap sandbox");
-    for path in [
-        "/etc/ssl/certs/ca-certificates.crt",
-        "/etc/ssl/cert.pem",
-        "/etc/pki/tls/certs/ca-bundle.crt",
-    ] {
-        assert!(bwrap.readonly_bind_mounts.iter().any(
-            |(destination, source)| destination.as_path() == std::path::Path::new(path)
-                && source.as_path() == bundle.as_path()
-        ));
-    }
-    assert!(
-        !bwrap
-            .readonly_bind_paths
-            .iter()
-            .any(|path| path.as_path() == std::path::Path::new("/etc"))
-    );
+fn bwrap_requires_a_rootfs_identity() -> gang_e2e::Result<()> {
+    let mut tools = tools()?;
+    tools.action_rootfs = None;
+    let error = ConfigTemplate::parse(&base_config()?)?
+        .vary(&Variant::baseline(Sandbox::Bwrap), &launcher(), &tools)
+        .expect_err("bwrap requires an envelope");
+    assert!(error.to_string().contains("GANG_E2E_ACTION_ROOTFS"));
+
+    tools.action_rootfs = Some(tools.rootfs.path().to_path_buf());
+    std::fs::write(tools.rootfs.path().join("identity"), "invalid\n")
+        .map_err(E2eError::io("writing invalid identity"))?;
+    ConfigTemplate::parse(&base_config()?)?
+        .vary(&Variant::baseline(Sandbox::Bwrap), &launcher(), &tools)
+        .expect_err("bwrap rejects an invalid identity");
     Ok(())
 }
 
-/// Loader paths follow the action tool roots and precede the signal directory.
 #[test]
-fn bwrap_binds_the_host_glibc_loader_after_the_tool_roots() -> gang_e2e::Result<()> {
-    let (_, template) = placed(Transport::Plain)?;
-    let signal = std::path::Path::new("/tmp/e2e-signal");
-    let mut tools = tools();
-    tools.glibc_loader = vec![
-        PathBuf::from("/lib64"),
-        PathBuf::from("/run/current-system/sw"),
-    ];
-    let template = template
-        .vary(&Variant::baseline(Sandbox::Bwrap), &launcher(), &tools)?
-        .with_signal_dir(signal)?;
-    let doc = typed_rendered(&template)?;
-    let bwrap = doc.sandbox.bwrap.as_ref().expect("bwrap sandbox");
-    let paths: Vec<_> = bwrap
-        .readonly_bind_paths
-        .iter()
-        .map(AbsolutePathBuf::as_path)
-        .collect();
-    assert_eq!(
-        paths,
-        vec![
-            std::path::Path::new("/nix/store"),
-            std::path::Path::new("/lib64"),
-            std::path::Path::new("/run/current-system/sw"),
-            signal,
-        ]
-    );
+fn bwrap_reads_identity_from_the_selected_envelope() -> gang_e2e::Result<()> {
+    let tools = tools()?;
+    let identity = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    std::fs::write(
+        tools.rootfs.path().join("identity"),
+        format!("{identity}\n"),
+    )
+    .map_err(E2eError::io("writing identity"))?;
+    let doc = typed_rendered(&ConfigTemplate::parse(&base_config()?)?.vary(
+        &Variant::baseline(Sandbox::Bwrap),
+        &launcher(),
+        &tools,
+    )?)?;
+    assert_eq!(doc.fleets[0].action_environment.as_str(), identity);
     Ok(())
 }
 
 #[test]
 fn bwrap_requires_a_program() -> gang_e2e::Result<()> {
     let (_, template) = placed(Transport::Plain)?;
-    let mut tools = tools();
+    let mut tools = tools()?;
     tools.bwrap = None;
     let error = template
         .vary(&Variant::baseline(Sandbox::Bwrap), &launcher(), &tools)
@@ -544,7 +549,7 @@ fn oversized_fleet_renders_disk_and_relaunch_backoff() -> gang_e2e::Result<()> {
         execution: ExecutionKnobs::OVERSIZED_FLEET,
         ..Variant::baseline(Sandbox::Noop)
     };
-    let doc = typed_rendered(&template.vary(&variant, &launcher(), &tools())?)?;
+    let doc = typed_rendered(&template.vary(&variant, &launcher(), &*(tools()?))?)?;
     assert_eq!(
         doc.fleets[0].disk_per_instance.get(),
         "1024TiB".parse::<Bytes>().expect("fleet disk is valid")
@@ -560,53 +565,6 @@ fn oversized_fleet_renders_disk_and_relaunch_backoff() -> gang_e2e::Result<()> {
 }
 
 #[test]
-fn bwrap_rejects_host_action_tools_but_noop_does_not() -> gang_e2e::Result<()> {
-    for (tools, offending) in [
-        (
-            ActionTools {
-                shell: PathBuf::from("/usr/bin/bash"),
-                bwrap: Some(PathBuf::from("/nix/store/ccc-bubblewrap/bin/bwrap")),
-                path: "/usr/bin:/bin".to_owned(),
-                action_bin: PathBuf::from("/nix/store/ddd-action-tools/bin"),
-                ca_bundle: None,
-                glibc_tool: None,
-                glibc_loader: Vec::new(),
-            },
-            "/usr/bin/bash",
-        ),
-        (
-            ActionTools {
-                shell: PathBuf::from("/nix/store/aaa-bash/bin/bash"),
-                bwrap: Some(PathBuf::from("/nix/store/ccc-bubblewrap/bin/bwrap")),
-                path: "/usr/bin:/bin".to_owned(),
-                action_bin: PathBuf::from("/nix/store/ddd-action-tools/bin"),
-                ca_bundle: None,
-                glibc_tool: None,
-                glibc_loader: Vec::new(),
-            },
-            "/usr/bin",
-        ),
-    ] {
-        let text = base_config()?;
-        let error = ConfigTemplate::parse(&text)?
-            .vary(&Variant::baseline(Sandbox::Bwrap), &launcher(), &tools)
-            .expect_err("bwrap rejects host action tools");
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "system under test: under bwrap the action tools must come from the Nix store, whose closures are self-contained: {offending}"
-            )
-        );
-        ConfigTemplate::parse(&text)?.vary(
-            &Variant::baseline(Sandbox::Noop),
-            &launcher(),
-            &tools,
-        )?;
-    }
-    Ok(())
-}
-
-#[test]
 fn vary_bwrap_denied_breaks_input_links() -> gang_e2e::Result<()> {
     let variant = Variant {
         ..Variant::baseline(Sandbox::Bwrap)
@@ -614,7 +572,7 @@ fn vary_bwrap_denied_breaks_input_links() -> gang_e2e::Result<()> {
     let doc = typed_rendered(&ConfigTemplate::parse(&base_config()?)?.vary(
         &variant,
         &launcher(),
-        &tools(),
+        &*(tools()?),
     )?)?;
     assert_eq!(doc.fleets[0].sandbox, SandboxKey::Bwrap);
     assert!(
@@ -637,7 +595,7 @@ fn vary_bwrap_permitted_keeps_input_links() -> gang_e2e::Result<()> {
     let doc = typed_rendered(&ConfigTemplate::parse(&base_config()?)?.vary(
         &variant,
         &launcher(),
-        &tools(),
+        &*(tools()?),
     )?)?;
     assert!(
         doc.sandbox
@@ -652,14 +610,17 @@ fn vary_bwrap_permitted_keeps_input_links() -> gang_e2e::Result<()> {
 #[test]
 fn vary_noop_selects_the_noop_sandbox() -> gang_e2e::Result<()> {
     let template = ConfigTemplate::parse(&base_config()?)?;
-    let doc = typed_rendered(&template.vary(
-        &Variant::baseline(Sandbox::Noop),
-        &launcher(),
-        &tools(),
-    )?)?;
+    let mut tools = tools()?;
+    tools.action_rootfs = None;
+    let doc =
+        typed_rendered(&template.vary(&Variant::baseline(Sandbox::Noop), &launcher(), &tools)?)?;
     assert_eq!(doc.fleets[0].sandbox, SandboxKey::Noop);
+    assert_eq!(doc.fleets[0].action_environment.as_str(), "host:e2e");
     assert_eq!(doc.execution.input_links, InputLinks::Break);
-    assert!(doc.sandbox.noop.is_some());
+    assert_eq!(
+        doc.sandbox.noop.expect("noop sandbox").environment.as_str(),
+        "host:e2e"
+    );
     Ok(())
 }
 
@@ -667,7 +628,11 @@ fn vary_noop_selects_the_noop_sandbox() -> gang_e2e::Result<()> {
 fn vary_bwrap_without_its_section_fails_naming_it() -> gang_e2e::Result<()> {
     let template = ConfigTemplate::parse(&without_sandbox(SandboxKey::Bwrap)?)?;
     let error = template
-        .vary(&Variant::baseline(Sandbox::Bwrap), &launcher(), &tools())
+        .vary(
+            &Variant::baseline(Sandbox::Bwrap),
+            &launcher(),
+            &*(tools()?),
+        )
         .expect_err("a bwrap variant without [sandbox.bwrap] fails");
     assert!(
         error.to_string().contains("sandbox.bwrap"),
@@ -681,7 +646,7 @@ fn vary_bwrap_without_its_section_fails_naming_it() -> gang_e2e::Result<()> {
 fn vary_noop_without_its_section_fails_naming_it() -> gang_e2e::Result<()> {
     let template = ConfigTemplate::parse(&without_sandbox(SandboxKey::Noop)?)?;
     let error = template
-        .vary(&Variant::baseline(Sandbox::Noop), &launcher(), &tools())
+        .vary(&Variant::baseline(Sandbox::Noop), &launcher(), &*(tools()?))
         .expect_err("a noop variant without [sandbox.noop] fails");
     assert!(
         error.to_string().contains("sandbox.noop"),
@@ -700,7 +665,7 @@ fn vary_cgroup_adds_the_action_limits() -> gang_e2e::Result<()> {
     let doc = typed_rendered(&ConfigTemplate::parse(&base_config()?)?.vary(
         &variant,
         &launcher(),
-        &tools(),
+        &*(tools()?),
     )?)?;
     let Some(LimitsConfig::Cgroup(cgroup)) = doc.limits else {
         panic!("cgroup limits expected");
@@ -722,8 +687,11 @@ fn vary_absent_removes_a_limits_table_of_the_base() -> gang_e2e::Result<()> {
     );
     let base = ConfigTemplate::parse(&text)?;
     assert!(typed_rendered(&base)?.limits.is_some());
-    let doc =
-        typed_rendered(&base.vary(&Variant::baseline(Sandbox::Bwrap), &launcher(), &tools())?)?;
+    let doc = typed_rendered(&base.vary(
+        &Variant::baseline(Sandbox::Bwrap),
+        &launcher(),
+        &*(tools()?),
+    )?)?;
     assert!(doc.limits.is_none());
     Ok(())
 }
@@ -891,67 +859,6 @@ fn place_fails_naming_the_local_workers_oidc_table() -> gang_e2e::Result<()> {
 }
 
 #[test]
-fn tmp_path_defaults_to_bwrap_default() -> gang_e2e::Result<()> {
-    let template = ConfigTemplate::parse(&base_config()?)?;
-    assert_eq!(template.tmp_path()?, PathBuf::from("/tmp"));
-    Ok(())
-}
-
-#[test]
-fn tmp_path_is_the_configured_path() -> gang_e2e::Result<()> {
-    let text = base_config()?.replace(
-        "[sandbox.bwrap]",
-        "[sandbox.bwrap]\ntmp_path = \"/var/tmp/gang\"",
-    );
-    assert_eq!(
-        ConfigTemplate::parse(&text)?.tmp_path()?,
-        PathBuf::from("/var/tmp/gang")
-    );
-    Ok(())
-}
-
-#[test]
-fn tmp_path_fails_without_a_bwrap_section() -> gang_e2e::Result<()> {
-    let template = ConfigTemplate::parse(&without_sandbox(SandboxKey::Bwrap)?)?;
-    let error = template
-        .tmp_path()
-        .expect_err("a configuration without [sandbox.bwrap] has no tmp path");
-    assert!(error.to_string().contains("sandbox.bwrap"));
-    Ok(())
-}
-
-#[test]
-fn with_signal_dir_adds_it_to_the_read_only_binds() -> gang_e2e::Result<()> {
-    let (_placement, template) = placed(Transport::Tls)?;
-    let signal = std::path::Path::new("/scratch/signal-salt");
-    let doc = typed_rendered(&template.with_signal_dir(signal)?)?;
-    let bwrap = doc.sandbox.bwrap.expect("bwrap sandbox");
-    assert!(
-        bwrap
-            .readonly_bind_paths
-            .iter()
-            .any(|path| path.as_path() == signal)
-    );
-    assert!(
-        bwrap
-            .readonly_bind_paths
-            .iter()
-            .any(|path| path.as_path() == std::path::Path::new("/nix/store"))
-    );
-    Ok(())
-}
-
-#[test]
-fn with_signal_dir_fails_without_a_bwrap_section() -> gang_e2e::Result<()> {
-    let text = without_sandbox(SandboxKey::Bwrap)?;
-    let error = ConfigTemplate::parse(&text)?
-        .with_signal_dir(std::path::Path::new("/scratch/signal-salt"))
-        .expect_err("a configuration without [sandbox.bwrap] has no binds to extend");
-    assert!(error.to_string().contains("sandbox.bwrap"));
-    Ok(())
-}
-
-#[test]
 fn with_ca_pin_sets_the_server_pin() -> gang_e2e::Result<()> {
     let (_placement, template) = placed(Transport::Tls)?;
     let pin = CaPin::new([0x42; 32]);
@@ -1005,7 +912,7 @@ fn vary_cgroup_writes_the_worker_launcher_in_order() -> gang_e2e::Result<()> {
     let doc = typed_rendered(&ConfigTemplate::parse(&base_config()?)?.vary(
         &variant,
         &launcher(),
-        &tools(),
+        &*(tools()?),
     )?)?;
     let ProvisionerConfig::Local(local) = doc.provisioner else {
         panic!("local provisioner expected");
@@ -1023,7 +930,7 @@ fn launch_failure_preset_sets_missing_launcher_and_short_timeout() -> gang_e2e::
     let doc = typed_rendered(&ConfigTemplate::parse(&base_config()?)?.vary(
         &variant,
         &launcher(),
-        &tools(),
+        &*(tools()?),
     )?)?;
     assert_eq!(
         doc.client_action_timeout.get(),
@@ -1052,7 +959,7 @@ fn fleets_preset_shortens_cleanup_without_changing_placement_or_polling() -> gan
         let untuned = typed_rendered(&ConfigTemplate::parse(&base)?.vary(
             &variant,
             &launcher(),
-            &tools(),
+            &*(tools()?),
         )?)?;
         let tuned = typed_rendered(&ConfigTemplate::parse(&base)?.vary(
             &Variant {
@@ -1060,7 +967,7 @@ fn fleets_preset_shortens_cleanup_without_changing_placement_or_polling() -> gan
                 ..variant
             },
             &launcher(),
-            &tools(),
+            &*(tools()?),
         )?)?;
         assert_eq!(tuned.poll_interval, untuned.poll_interval);
         assert_eq!(
@@ -1099,7 +1006,7 @@ fn drain_cancel_bounds_only_its_drain_and_termination_waits() -> gang_e2e::Resul
             ..variant
         },
         &launcher(),
-        &tools(),
+        &*(tools()?),
     )?)?;
     assert_eq!(tuned.poll_interval.get(), std::time::Duration::from_secs(2));
     assert_eq!(
@@ -1112,8 +1019,11 @@ fn drain_cancel_bounds_only_its_drain_and_termination_waits() -> gang_e2e::Resul
         assert_eq!(fleet.min_instances, 0);
         assert_eq!(fleet.max_instances.get(), 1);
     }
-    let untuned =
-        typed_rendered(&ConfigTemplate::parse(&base)?.vary(&variant, &launcher(), &tools())?)?;
+    let untuned = typed_rendered(&ConfigTemplate::parse(&base)?.vary(
+        &variant,
+        &launcher(),
+        &*(tools()?),
+    )?)?;
     assert_eq!(tuned.client_action_timeout, untuned.client_action_timeout);
     for fleet in &untuned.fleets {
         assert_eq!(fleet.max_drain_wait, std::time::Duration::from_mins(1));
@@ -1142,7 +1052,8 @@ fn scheduled_minimum_preset_applies_to_every_fleet() -> gang_e2e::Result<()> {
         fleets: FleetLayout::Placement,
         ..Variant::baseline(Sandbox::Noop)
     };
-    let template = ConfigTemplate::parse(&base_config()?)?.vary(&variant, &launcher(), &tools())?;
+    let template =
+        ConfigTemplate::parse(&base_config()?)?.vary(&variant, &launcher(), &*(tools()?))?;
     let text = template.render()?;
     let document: toml::Table = text
         .parse()
@@ -1181,7 +1092,7 @@ fn scheduled_minimum_zero_is_a_template_error() -> gang_e2e::Result<()> {
         },
         ..Variant::baseline(Sandbox::Noop)
     };
-    let result = ConfigTemplate::parse(&base_config()?)?.vary(&variant, &launcher(), &tools());
+    let result = ConfigTemplate::parse(&base_config()?)?.vary(&variant, &launcher(), &*(tools()?));
     assert!(matches!(result, Err(E2eError::Template(_))));
     Ok(())
 }
@@ -1198,8 +1109,11 @@ fn vary_absent_removes_the_worker_launcher_of_the_base() -> gang_e2e::Result<()>
         panic!("local provisioner expected");
     };
     assert_eq!(local.worker_launcher.argv().len(), 1);
-    let doc =
-        typed_rendered(&base.vary(&Variant::baseline(Sandbox::Bwrap), &launcher(), &tools())?)?;
+    let doc = typed_rendered(&base.vary(
+        &Variant::baseline(Sandbox::Bwrap),
+        &launcher(),
+        &*(tools()?),
+    )?)?;
     let ProvisionerConfig::Local(local) = doc.provisioner else {
         panic!("local provisioner expected");
     };
@@ -1220,7 +1134,7 @@ fn placement_fleets(sandbox: Sandbox) -> gang_e2e::Result<Vec<RawFleet<SandboxKe
     let template = ConfigTemplate::parse(&base_config()?)?.vary(
         &placement_variant(sandbox),
         &launcher(),
-        &tools(),
+        &*(tools()?),
     )?;
     Ok(typed_rendered(&template)?.fleets)
 }
@@ -1231,7 +1145,7 @@ fn single_layout_keeps_the_one_fleet_of_the_base() -> gang_e2e::Result<()> {
     let doc = typed_rendered(&template.vary(
         &Variant::baseline(Sandbox::Bwrap),
         &launcher(),
-        &tools(),
+        &*(tools()?),
     )?)?;
     assert_eq!(doc.fleets.len(), 1);
     assert_eq!(doc.fleets[0].name.as_str(), "local-worker-x86-64");
@@ -1251,6 +1165,7 @@ fn placement_small_fleet_keeps_the_base_sizing_and_holds_one_instance() -> gang_
     let fleets = placement_fleets(Sandbox::Bwrap)?;
     let small = &fleets[0];
     assert_eq!(small.sandbox, SandboxKey::Bwrap);
+    assert_eq!(small.action_environment.as_str(), ROOTFS_IDENTITY);
     assert_eq!(small.vcpus_per_instance.get(), 4);
     assert_eq!(small.memory_per_instance, gang_types::NonZeroBytes::gib(8));
     assert_eq!(small.disk_per_instance, gang_types::NonZeroBytes::gib(20));
@@ -1265,6 +1180,7 @@ fn placement_large_fleet_doubles_the_size_under_the_same_sandbox() -> gang_e2e::
     let fleets = placement_fleets(Sandbox::Bwrap)?;
     let large = &fleets[1];
     assert_eq!(large.sandbox, SandboxKey::Bwrap);
+    assert_eq!(large.action_environment.as_str(), ROOTFS_IDENTITY);
     assert_eq!(large.vcpus_per_instance.get(), 8);
     assert_eq!(large.memory_per_instance, gang_types::NonZeroBytes::gib(16));
     assert_eq!(large.disk_per_instance, gang_types::NonZeroBytes::gib(20));
@@ -1279,6 +1195,7 @@ fn placement_noop_fleet_has_the_small_size_under_the_noop_sandbox() -> gang_e2e:
     let fleets = placement_fleets(Sandbox::Bwrap)?;
     let noop = &fleets[2];
     assert_eq!(noop.sandbox, SandboxKey::Noop);
+    assert_eq!(noop.action_environment.as_str(), "host:e2e");
     assert_eq!(noop.vcpus_per_instance.get(), 4);
     assert_eq!(noop.memory_per_instance, gang_types::NonZeroBytes::gib(8));
     assert_eq!(noop.disk_per_instance, gang_types::NonZeroBytes::gib(20));
@@ -1292,6 +1209,7 @@ fn placement_layout_puts_the_first_two_fleets_under_the_variants_sandbox() -> ga
     let fleets = placement_fleets(Sandbox::Noop)?;
     for fleet in &fleets {
         assert_eq!(fleet.sandbox, SandboxKey::Noop);
+        assert_eq!(fleet.action_environment.as_str(), "host:e2e");
     }
     Ok(())
 }
@@ -1307,7 +1225,11 @@ fn placement_layout_carries_over_the_other_keys_of_the_base() -> gang_e2e::Resul
         assert_eq!(fleet.max_drain_wait, base_fleet.max_drain_wait);
         assert_eq!(fleet.boot_grace, base_fleet.boot_grace);
     }
-    let template = base.vary(&placement_variant(Sandbox::Bwrap), &launcher(), &tools())?;
+    let template = base.vary(
+        &placement_variant(Sandbox::Bwrap),
+        &launcher(),
+        &*(tools()?),
+    )?;
     let doc = typed_rendered(&template)?;
     assert_eq!(doc.default_isa, base_doc.default_isa);
     assert!(doc.sandbox.noop.is_some());
@@ -1318,7 +1240,11 @@ fn placement_layout_carries_over_the_other_keys_of_the_base() -> gang_e2e::Resul
 fn placement_layout_needs_the_noop_sandbox_section() -> gang_e2e::Result<()> {
     let text = without_sandbox(SandboxKey::Noop)?;
     let error = ConfigTemplate::parse(&text)?
-        .vary(&placement_variant(Sandbox::Bwrap), &launcher(), &tools())
+        .vary(
+            &placement_variant(Sandbox::Bwrap),
+            &launcher(),
+            &*(tools()?),
+        )
         .expect_err("the noop fleet has no sandbox section");
     assert!(
         error.to_string().contains("sandbox.noop"),
@@ -1344,7 +1270,11 @@ fn placement_layout_needs_exactly_one_base_fleet() -> gang_e2e::Result<()> {
     fleets.push(extra);
     let text = toml::to_string(&table).expect("base renders");
     let error = ConfigTemplate::parse(&text)?
-        .vary(&placement_variant(Sandbox::Bwrap), &launcher(), &tools())
+        .vary(
+            &placement_variant(Sandbox::Bwrap),
+            &launcher(),
+            &*(tools()?),
+        )
         .expect_err("two base fleets are ambiguous");
     assert!(
         error.to_string().contains("exactly one"),
@@ -1379,7 +1309,7 @@ fn large_memory_is_the_same_for_the_base_and_its_placement_layout() -> gang_e2e:
     let placed = ConfigTemplate::parse(&base_config()?)?.vary(
         &placement_variant(Sandbox::Bwrap),
         &launcher(),
-        &tools(),
+        &*(tools()?),
     )?;
     assert_eq!(template.large_memory_kb()?, placed.large_memory_kb()?);
     Ok(())
@@ -1443,6 +1373,14 @@ impl SandboxSelection for OpaqueSandboxes {
     ) -> Result<(), E> {
         Ok(())
     }
+
+    fn try_for_each_root<E>(
+        &mut self,
+        _key: Self::Key,
+        _visit: impl FnMut(&mut AbsolutePathBuf) -> Result<(), E>,
+    ) -> Result<(), E> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1485,8 +1423,7 @@ impl PluginSet for OpaquePlugins {
 fn rendered_tls_and_plaintext_configs_parse_as_gang_configs() -> gang_e2e::Result<()> {
     for (label, transport) in [("tls", Transport::Tls), ("plaintext", Transport::Plain)] {
         let (_placement, template) = placed(transport)?;
-        let signal = std::path::Path::new("/scratch/signal-salt");
-        let text = template.with_signal_dir(signal)?.render()?;
+        let text = template.render()?;
         if let Err(error) = text.parse::<GangConfig<OpaquePlugins>>() {
             panic!("the {label} config does not parse as a gang.toml: {error}");
         }
@@ -1550,7 +1487,7 @@ fn every_rendered_variant_parses_with_the_real_plugins() -> gang_e2e::Result<()>
         let result: gang_e2e::Result<()> = (|| {
             let template = ConfigTemplate::parse(&base)?
                 .place(&placement, transport)?
-                .vary(&variant, &worker_launcher, &tools())?;
+                .vary(&variant, &worker_launcher, &*(tools()?))?;
             let template = if transport == Transport::Tls {
                 template.with_identity(&issuer, variant.identity)?
             } else {

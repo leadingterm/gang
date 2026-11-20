@@ -1,6 +1,5 @@
-//! The sandbox contract under bwrap: an action sees none of the worker's own environment, a fresh empty
-//! tmpfs on /tmp, every read-only bind read-only and its working directory writable; it runs with bwrap inside its
-//! own scope while `gang exec` stays in the worker's leaf; and the held action's scope is cleaned up.
+//! The sandbox contract under bwrap: the worker environment is hidden, the rootfs is
+//! read-only, /tmp is fresh, and the action's working directory is writable.
 
 use std::collections::BTreeSet;
 
@@ -102,24 +101,18 @@ fn environment<S: System, E: Execution>(
         || format!("/tmp holds `{entries}` on a `{fs}` filesystem"),
     ));
 
-    let paths = exec.readonly_bind_paths()?;
     let mut offenders = Vec::new();
-    for path in &paths {
+    for path in ["/", "/etc", "/usr"] {
         match report.get(&format!("mount:{path}")) {
             Ok("erofs") => {}
             Ok(value) => offenders.push(format!("{path}: {value}")),
             Err(_) => offenders.push(format!("{path}: not mounted")),
         }
     }
-    let readonly_reason = if paths.is_empty() {
-        "no readonly_bind_paths are configured".to_owned()
-    } else {
-        offenders.join("; ")
-    };
     checks.push(Check::expect(
         sandbox_contract::READONLY_BINDS,
-        !paths.is_empty() && offenders.is_empty(),
-        || readonly_reason,
+        offenders.is_empty(),
+        || offenders.join("; "),
     ));
     let cwd = report.get("cwd_writable")?;
     checks.push(Check::expect(

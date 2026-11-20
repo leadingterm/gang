@@ -13,13 +13,14 @@ use gang_types::Isa;
 /// Lists every entry under `root` as its relative path, with its content or link target and
 /// its permission bits, so two trees can be compared exactly.
 #[cfg(unix)]
-fn snapshot(root: &Path) -> io::Result<BTreeMap<PathBuf, (String, u32)>> {
+fn snapshot(root: &Path, excluded: Option<&Path>) -> io::Result<BTreeMap<PathBuf, (Vec<u8>, u32)>> {
     use std::os::unix::fs::PermissionsExt;
 
     fn walk(
         root: &Path,
         current: &Path,
-        out: &mut BTreeMap<PathBuf, (String, u32)>,
+        excluded: Option<&Path>,
+        out: &mut BTreeMap<PathBuf, (Vec<u8>, u32)>,
     ) -> io::Result<()> {
         for entry in fs::read_dir(current)? {
             let path = entry?.path();
@@ -27,27 +28,58 @@ fn snapshot(root: &Path) -> io::Result<BTreeMap<PathBuf, (String, u32)>> {
                 .strip_prefix(root)
                 .map_err(io::Error::other)?
                 .to_path_buf();
+            if excluded == Some(relative.as_path()) {
+                continue;
+            }
             let metadata = fs::metadata(&path)?;
             let mode = metadata.permissions().mode() & 0o777;
             if metadata.is_dir() {
-                out.insert(relative, ("dir".to_owned(), mode));
-                walk(root, &path, out)?;
+                out.insert(relative, (b"dir".to_vec(), mode));
+                walk(root, &path, excluded, out)?;
             } else {
-                out.insert(relative, (fs::read_to_string(&path)?, mode));
+                out.insert(relative, (fs::read(&path)?, mode));
             }
         }
         Ok(())
     }
 
     let mut out = BTreeMap::new();
-    walk(root, root, &mut out)?;
+    walk(root, root, excluded, &mut out)?;
     Ok(out)
+}
+
+#[cfg(unix)]
+fn same_file_contents(first: &Path, second: &Path) -> io::Result<bool> {
+    use std::io::Read;
+
+    let mut first = fs::File::open(first)?;
+    let mut second = fs::File::open(second)?;
+    let mut remaining = first.metadata()?.len();
+    if remaining != second.metadata()?.len() {
+        return Ok(false);
+    }
+    let mut a = [0_u8; 8192];
+    let mut b = [0_u8; 8192];
+    while remaining != 0 {
+        let size = usize::try_from(remaining.min(a.len() as u64)).map_err(io::Error::other)?;
+        first.read_exact(&mut a[..size])?;
+        second.read_exact(&mut b[..size])?;
+        if a[..size] != b[..size] {
+            return Ok(false);
+        }
+        remaining -= size as u64;
+    }
+    Ok(true)
 }
 
 fn parameters() -> SampleParameters {
     SampleParameters {
         salt: "00ff10ab20cd30ef".to_owned(),
         action_path: "/usr/bin:/bin".to_owned(),
+        action_shell: PathBuf::from("/bin/bash"),
+        action_ipc: false,
+        host_action_path: "/usr/bin:/bin".to_owned(),
+        host_action_shell: PathBuf::from("/bin/bash"),
         signal: PathBuf::from("/tmp/e2e-signal"),
         attempts: PathBuf::from("/tmp/e2e-attempts"),
         isa: Isa::X86_64,
@@ -92,9 +124,69 @@ fn staged_tree_equals_the_source_with_permissions() {
     let destination = work.path().join("staged");
     stage(&source, &destination, &parameters()).expect("sample stages");
 
-    let mut staged = snapshot(&destination).expect("staged tree is readable");
+    let mut staged = snapshot(&destination, Some(Path::new("action-environment-probe")))
+        .expect("staged tree is readable");
     staged.remove(Path::new("config.bzl"));
-    assert_eq!(staged, snapshot(&source).expect("source tree is readable"));
+    assert!(staged.remove(Path::new("action_environment.bzl")).is_some());
+    let executable = std::env::current_exe().expect("current executable");
+    let probe = destination.join("action-environment-probe");
+    assert!(same_file_contents(&probe, &executable).expect("comparing executable contents"));
+    assert_eq!(
+        fs::metadata(probe)
+            .expect("probe metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        fs::metadata(executable)
+            .expect("executable metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+    );
+    assert_eq!(
+        staged,
+        snapshot(&source, None).expect("source tree is readable")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn restaging_replaces_readonly_stale_action_probe() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = tempfile::tempdir().expect("work directory is created");
+    let source = work.path().join("source");
+    fs::create_dir(&source).expect("source directory is created");
+    fs::write(
+        source.join("BUILD.bazel"),
+        build_file(Probe::ALL).expect("build file formats"),
+    )
+    .expect("build file is written");
+    let first = work.path().join("first");
+    stage(&source, &first, &parameters()).expect("first sample stages");
+    let stale = first.join("action-environment-probe");
+    fs::remove_file(&stale).expect("remove first probe");
+    fs::write(&stale, b"stale").expect("write stale probe");
+    fs::set_permissions(&stale, fs::Permissions::from_mode(0o555))
+        .expect("make stale probe readonly");
+
+    let second = work.path().join("second");
+    stage(&first, &second, &parameters()).expect("sample restages over readonly probe");
+    let executable = std::env::current_exe().expect("current executable");
+    let probe = second.join("action-environment-probe");
+    assert!(same_file_contents(&probe, &executable).expect("comparing executable contents"));
+    assert_eq!(
+        fs::metadata(probe)
+            .expect("probe metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        fs::metadata(executable)
+            .expect("executable metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+    );
 }
 
 #[cfg(unix)]
@@ -176,6 +268,19 @@ fn config_bzl_defines_the_action_environment() {
     let config = fs::read_to_string(destination.join("config.bzl")).expect("config is written");
     assert!(
         config.contains("ACTION_PATH = \"/usr/bin:/bin\"\n"),
+        "{config}"
+    );
+    assert!(
+        config.contains("ACTION_SHELL = \"/bin/bash\"\n"),
+        "{config}"
+    );
+    assert!(config.contains("ACTION_IPC = False\n"), "{config}");
+    assert!(
+        config.contains("HOST_ACTION_PATH = \"/usr/bin:/bin\"\n"),
+        "{config}"
+    );
+    assert!(
+        config.contains("HOST_ACTION_SHELL = \"/bin/bash\"\n"),
         "{config}"
     );
     assert!(

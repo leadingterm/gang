@@ -41,6 +41,10 @@ impl LinkCounting {
 }
 
 impl ActionIsolationPort for LinkCounting {
+    fn environment(&self) -> &gang_types::ActionEnvironment {
+        self.inner.environment()
+    }
+
     async fn start(&self, spec: &ActionExecutionSpec<'_>) -> Result<SandboxedAction, PortError> {
         *self.counts.lock() = link_counts(spec.working_directory);
         self.inner.start(spec).await
@@ -105,11 +109,16 @@ fn no_terminations() -> impl Stream<Item = io::Result<Termination>> + Unpin {
 /// A sandbox whose action is terminated while it waits: `start` sends `Interrupt` on `sender`,
 /// and the action ends once `relay` has received it. Every relayed termination is recorded.
 struct Relaying {
+    environment: gang_types::ActionEnvironment,
     sender: UnboundedSender<Termination>,
     relayed: Arc<Mutex<Vec<Termination>>>,
 }
 
 impl ActionIsolationPort for Relaying {
+    fn environment(&self) -> &gang_types::ActionEnvironment {
+        &self.environment
+    }
+
     async fn start(&self, _spec: &ActionExecutionSpec<'_>) -> Result<SandboxedAction, PortError> {
         self.sender
             .send(Termination::Interrupt)
@@ -143,9 +152,13 @@ impl Drop for DropAction {
 }
 
 /// An action whose lifetime is visible even if its wait is never polled.
-struct DropSandbox(CallLog);
+struct DropSandbox(CallLog, gang_types::ActionEnvironment);
 
 impl ActionIsolationPort for DropSandbox {
+    fn environment(&self) -> &gang_types::ActionEnvironment {
+        &self.1
+    }
+
     async fn start(&self, _spec: &ActionExecutionSpec<'_>) -> Result<SandboxedAction, PortError> {
         self.0.record("sandbox.start");
         let guard = DropAction(self.0.clone());
@@ -187,7 +200,7 @@ fn exit_status_maps_exit_codes_and_signals() {
 #[tokio::test]
 async fn enters_starts_waits_and_leaves_in_order() -> Result<(), Box<dyn Error>> {
     let log = CallLog::default();
-    let sandbox = ScriptedSandbox::exiting(&log, ActionExecutionOutcome::Exited(3));
+    let sandbox = ScriptedSandbox::try_exiting(&log, ActionExecutionOutcome::Exited(3))?;
     let limits_port = RecordingLimits::new(&log).with_oom_kills(2);
     let argv = [OsString::from("cmd")];
     let directory = tempfile::tempdir()?;
@@ -225,7 +238,7 @@ async fn enters_starts_waits_and_leaves_in_order() -> Result<(), Box<dyn Error>>
 #[tokio::test]
 async fn without_limits_neither_enters_nor_leaves() -> Result<(), Box<dyn Error>> {
     let log = CallLog::default();
-    let sandbox = ScriptedSandbox::exiting(&log, ActionExecutionOutcome::Signaled(9));
+    let sandbox = ScriptedSandbox::try_exiting(&log, ActionExecutionOutcome::Signaled(9))?;
     let argv = [OsString::from("cmd")];
     let directory = tempfile::tempdir()?;
     let action = action(&argv, directory.path(), directory.path())?;
@@ -259,7 +272,7 @@ async fn leave_action_group_failure_drops_action_and_leaves_scope() -> Result<()
     for with_limits in [false, true] {
         for leave_fails in [false, true] {
             let log = CallLog::default();
-            let sandbox = DropSandbox(log.clone());
+            let sandbox = DropSandbox(log.clone(), "host:test".parse()?);
             let limits_port = if leave_fails {
                 RecordingLimits::new(&log).failing(LimitsStep::Leave)
             } else {
@@ -310,7 +323,7 @@ async fn pending_termination_prevents_start_with_and_without_limits() -> Result<
     for termination in [Termination::Terminate, Termination::Interrupt] {
         for with_limits in [false, true] {
             let log = CallLog::default();
-            let sandbox = ScriptedSandbox::exiting(&log, ActionExecutionOutcome::Exited(0));
+            let sandbox = ScriptedSandbox::try_exiting(&log, ActionExecutionOutcome::Exited(0))?;
             let limits_port = RecordingLimits::new(&log);
             let argv = [OsString::from("cmd")];
             let directory = tempfile::tempdir()?;
@@ -350,7 +363,7 @@ async fn pending_termination_prevents_start_with_and_without_limits() -> Result<
 async fn signal_stream_error_prevents_start_and_leaves_scope() -> Result<(), Box<dyn Error>> {
     for with_limits in [false, true] {
         let log = CallLog::default();
-        let sandbox = ScriptedSandbox::exiting(&log, ActionExecutionOutcome::Exited(0));
+        let sandbox = ScriptedSandbox::try_exiting(&log, ActionExecutionOutcome::Exited(0))?;
         let limits_port = RecordingLimits::new(&log);
         let argv = [OsString::from("cmd")];
         let directory = tempfile::tempdir()?;
@@ -389,6 +402,7 @@ async fn an_action_in_its_own_group_keeps_gang_exec_in_the_action_group()
         let (sender, mut terminations) = termination_channel();
         let relayed = Arc::new(Mutex::new(Vec::new()));
         let sandbox = Relaying {
+            environment: "host:test".parse()?,
             sender,
             relayed: Arc::clone(&relayed),
         };
@@ -425,7 +439,7 @@ async fn an_action_in_its_own_group_keeps_gang_exec_in_the_action_group()
 #[tokio::test]
 async fn leaves_the_scope_when_the_sandbox_fails_to_start() -> Result<(), Box<dyn Error>> {
     let log = CallLog::default();
-    let sandbox = ScriptedSandbox::failing_to_start(&log);
+    let sandbox = ScriptedSandbox::try_failing_to_start(&log)?;
     let limits_port = RecordingLimits::new(&log);
     let argv = [OsString::from("cmd")];
     let directory = tempfile::tempdir()?;
@@ -455,7 +469,7 @@ async fn a_failing_wait_while_limits_are_active_is_a_sandbox_error_and_the_scope
 -> Result<(), Box<dyn Error>> {
     let log = CallLog::default();
     let sandbox =
-        ScriptedSandbox::exiting(&log, ActionExecutionOutcome::Exited(0)).failing_to_wait();
+        ScriptedSandbox::try_exiting(&log, ActionExecutionOutcome::Exited(0))?.failing_to_wait();
     let limits_port = RecordingLimits::new(&log);
     let argv = [OsString::from("cmd")];
     let directory = tempfile::tempdir()?;
@@ -488,7 +502,7 @@ async fn a_failing_wait_while_limits_are_active_is_a_sandbox_error_and_the_scope
 #[tokio::test]
 async fn leave_failure_after_success_is_a_limits_error() -> Result<(), Box<dyn Error>> {
     let log = CallLog::default();
-    let sandbox = ScriptedSandbox::exiting(&log, ActionExecutionOutcome::Exited(0));
+    let sandbox = ScriptedSandbox::try_exiting(&log, ActionExecutionOutcome::Exited(0))?;
     let limits_port = RecordingLimits::new(&log).failing(LimitsStep::Leave);
     let argv = [OsString::from("cmd")];
     let directory = tempfile::tempdir()?;
@@ -521,7 +535,7 @@ async fn leave_failure_after_success_is_a_limits_error() -> Result<(), Box<dyn E
 #[tokio::test]
 async fn sandbox_error_wins_over_leave_error() -> Result<(), Box<dyn Error>> {
     let log = CallLog::default();
-    let sandbox = ScriptedSandbox::failing_to_start(&log);
+    let sandbox = ScriptedSandbox::try_failing_to_start(&log)?;
     let limits_port = RecordingLimits::new(&log).failing(LimitsStep::Leave);
     let argv = [OsString::from("cmd")];
     let directory = tempfile::tempdir()?;
@@ -545,7 +559,7 @@ async fn sandbox_error_wins_over_leave_error() -> Result<(), Box<dyn Error>> {
 #[tokio::test]
 async fn enter_failure_never_starts_the_sandbox() -> Result<(), Box<dyn Error>> {
     let log = CallLog::default();
-    let sandbox = ScriptedSandbox::exiting(&log, ActionExecutionOutcome::Exited(0));
+    let sandbox = ScriptedSandbox::try_exiting(&log, ActionExecutionOutcome::Exited(0))?;
     let limits_port = RecordingLimits::new(&log).failing(LimitsStep::Enter);
     let argv = [OsString::from("cmd")];
     let directory = tempfile::tempdir()?;
@@ -570,10 +584,10 @@ async fn enter_failure_never_starts_the_sandbox() -> Result<(), Box<dyn Error>> 
 #[tokio::test]
 async fn break_leaves_one_link_per_file_before_the_sandbox_starts() -> Result<(), Box<dyn Error>> {
     let log = CallLog::default();
-    let sandbox = LinkCounting::new(ScriptedSandbox::exiting(
+    let sandbox = LinkCounting::new(ScriptedSandbox::try_exiting(
         &log,
         ActionExecutionOutcome::Exited(0),
-    ));
+    )?);
     let argv = [OsString::from("cmd")];
     let directory = tempfile::tempdir()?;
     let first = directory.path().join("first");
@@ -601,7 +615,7 @@ async fn break_leaves_one_link_per_file_before_the_sandbox_starts() -> Result<()
 async fn breaks_links_under_the_action_directory_outside_the_working_directory()
 -> Result<(), Box<dyn Error>> {
     let log = CallLog::default();
-    let sandbox = ScriptedSandbox::exiting(&log, ActionExecutionOutcome::Exited(0));
+    let sandbox = ScriptedSandbox::try_exiting(&log, ActionExecutionOutcome::Exited(0))?;
     let argv = [OsString::from("cmd")];
     let root = tempfile::tempdir()?;
     let (action_directory, working_directory) = linked_inputs(root.path())?;
@@ -627,10 +641,10 @@ async fn breaks_links_under_the_action_directory_outside_the_working_directory()
 #[tokio::test]
 async fn keep_leaves_hard_links_in_place() -> Result<(), Box<dyn Error>> {
     let log = CallLog::default();
-    let sandbox = LinkCounting::new(ScriptedSandbox::exiting(
+    let sandbox = LinkCounting::new(ScriptedSandbox::try_exiting(
         &log,
         ActionExecutionOutcome::Exited(0),
-    ));
+    )?);
     let argv = [OsString::from("cmd")];
     let root = tempfile::tempdir()?;
     let (action_directory, working_directory) = linked_inputs(root.path())?;
@@ -660,7 +674,7 @@ async fn keep_leaves_hard_links_in_place() -> Result<(), Box<dyn Error>> {
 #[tokio::test]
 async fn break_failure_never_starts_the_sandbox() -> Result<(), Box<dyn Error>> {
     let log = CallLog::default();
-    let sandbox = ScriptedSandbox::exiting(&log, ActionExecutionOutcome::Exited(0));
+    let sandbox = ScriptedSandbox::try_exiting(&log, ActionExecutionOutcome::Exited(0))?;
     let argv = [OsString::from("cmd")];
     let directory = tempfile::tempdir()?;
     let missing = directory.path().join("missing");
@@ -690,6 +704,7 @@ async fn a_termination_while_waiting_is_relayed_and_the_action_outcome_is_report
     let (sender, mut terminations) = termination_channel();
     let relayed = Arc::new(Mutex::new(Vec::new()));
     let sandbox = Relaying {
+        environment: "host:test".parse()?,
         sender,
         relayed: Arc::clone(&relayed),
     };
@@ -720,6 +735,7 @@ async fn a_relayed_termination_still_leaves_the_limits_scope() -> Result<(), Box
     let (sender, mut terminations) = termination_channel();
     let relayed = Arc::new(Mutex::new(Vec::new()));
     let sandbox = Relaying {
+        environment: "host:test".parse()?,
         sender,
         relayed: Arc::clone(&relayed),
     };
@@ -748,7 +764,7 @@ async fn a_relayed_termination_still_leaves_the_limits_scope() -> Result<(), Box
 #[tokio::test]
 async fn the_action_starts_through_the_scope_launcher() -> Result<(), Box<dyn Error>> {
     let log = CallLog::default();
-    let sandbox = ScriptedSandbox::exiting(&log, ActionExecutionOutcome::Exited(0));
+    let sandbox = ScriptedSandbox::try_exiting(&log, ActionExecutionOutcome::Exited(0))?;
     let limits_port = RecordingLimits::new(&log);
     let argv = [OsString::from("cmd")];
     let directory = tempfile::tempdir()?;
@@ -775,7 +791,7 @@ async fn the_action_starts_through_the_scope_launcher() -> Result<(), Box<dyn Er
 #[tokio::test]
 async fn without_limits_the_action_starts_without_a_launcher() -> Result<(), Box<dyn Error>> {
     let log = CallLog::default();
-    let sandbox = ScriptedSandbox::exiting(&log, ActionExecutionOutcome::Exited(0));
+    let sandbox = ScriptedSandbox::try_exiting(&log, ActionExecutionOutcome::Exited(0))?;
     let argv = [OsString::from("cmd")];
     let directory = tempfile::tempdir()?;
     let action = action(&argv, directory.path(), directory.path())?;

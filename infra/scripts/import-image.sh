@@ -30,7 +30,7 @@ main() {
   fi
 
   local image="$1" info="$2" name="$3" arch="$4" sha="$5" tag="$6" description="$7"
-  local aws_arch actual boot_mode snapshot tags status images image_id
+  local aws_arch actual boot_mode action_environment snapshot tags status images image_id
   case "$arch" in
     x86_64) aws_arch=x86_64 ;;
     aarch64) aws_arch=arm64 ;;
@@ -44,10 +44,14 @@ main() {
     return 1
   fi
   boot_mode=$(jq -er '.boot_mode | strings | select(length > 0)' "$info")
+  if ! action_environment=$(jq -er '.action_environment | strings | select(test("^[0-9a-f]{64}\\z"))' "$info"); then
+    printf 'import-image: image-info action_environment must be 64 lowercase hexadecimal digits\n' >&2
+    return 1
+  fi
   images=$(aws ec2 describe-images --owners self --include-deprecated --include-disabled \
     --filters "Name=name,Values=$name" --output json)
   if ! image_id=$(jq -er --arg name "$name" --arg sha "$sha" --arg tag "$tag" \
-    --arg arch "$arch" --arg aws_arch "$aws_arch" --arg boot_mode "$boot_mode" '
+    --arg arch "$arch" --arg aws_arch "$aws_arch" --arg boot_mode "$boot_mode" --arg action_environment "$action_environment" '
       if (.Images | type) != "array" then error("invalid image inventory")
       elif (.Images | length) == 0 then ""
       elif (.Images | length) != 1 then error("multiple images with the requested name")
@@ -56,6 +60,7 @@ main() {
         if .Name == $name and .Architecture == $aws_arch and .BootMode == $boot_mode
           and (.State == "pending" or .State == "available")
           and (tag_value("ec2:SharedTag/ImageSha256") == [$sha])
+          and (tag_value("ec2:SharedTag/ActionEnvironment") == [$action_environment])
           and (tag_value("ec2:SharedTag/GangRelease") == [$tag])
           and (tag_value("ec2:SharedTag/GangImage") == ["gang-image-" + $arch])
           and (.ImageId | type == "string" and length > 0)
@@ -76,8 +81,8 @@ main() {
   snapshot=$(coldsnap upload --wait --no-progress --omit-zero-blocks --description "$name" \
     --tag "Key=ec2:SharedTag/GangImportImage,Value=$name" "$temp_dir/image.raw")
   printf 'import-image: snapshot %s owned by import %s\n' "$snapshot" "$name" >&2
-  tags=$(jq -cn --arg sha "$sha" --arg tag "$tag" --arg arch "$arch" \
-    '[{ResourceType:"image",Tags:[{Key:"ec2:SharedTag/ImageSha256",Value:$sha},{Key:"ec2:SharedTag/GangRelease",Value:$tag},{Key:"ec2:SharedTag/GangImage",Value:("gang-image-" + $arch)}]}]')
+  tags=$(jq -cn --arg sha "$sha" --arg tag "$tag" --arg arch "$arch" --arg action_environment "$action_environment" \
+    '[{ResourceType:"image",Tags:[{Key:"ec2:SharedTag/ImageSha256",Value:$sha},{Key:"ec2:SharedTag/ActionEnvironment",Value:$action_environment},{Key:"ec2:SharedTag/GangRelease",Value:$tag},{Key:"ec2:SharedTag/GangImage",Value:("gang-image-" + $arch)}]}]')
   # A single attempt makes a client rejection definitive; ambiguous outcomes retain the snapshot.
   if AWS_MAX_ATTEMPTS=1 aws ec2 register-image --architecture "$aws_arch" --boot-mode "$boot_mode" \
     --ena-support --sriov-net-support simple --virtualization-type hvm --imds-support v2.0 \

@@ -146,6 +146,8 @@
       in {
         # Bazel is the only builder of gang (statically linked, dashboard embedded): the images carry exactly the binary it built, taken unchanged from the gang-binaries input.
         gang = gangPackage pkgs "${gang-binaries}/${system}/gang";
+        action-rootfs = import ./infra/nixos/action-rootfs {inherit pkgs;};
+        action-rootfs-e2e = self.packages.${system}.action-rootfs;
         image = self.lib.image {
           inherit system;
           binary = "${gang-binaries}/${system}/gang";
@@ -209,13 +211,6 @@
           # The e2e harness uses pinned action tools without the host toolchain.
           GANG_E2E_ACTION_SHELL = "${pkgs.bash}/bin/bash";
           GANG_E2E_ACTION_PATH = lib.makeBinPath actionTools;
-          GANG_E2E_CA_BUNDLE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
-          # The same tools in one directory, which the harness's bwrap sandbox binds at /bin and /usr/bin as the worker image binds its action tools.
-          GANG_E2E_ACTION_BIN = "${pkgs.buildEnv {
-            name = "gang-e2e-action-tools";
-            paths = actionTools;
-            pathsToLink = ["/bin"];
-          }}/bin";
           GANG_IMPORT_TEST_TOOLS = "${pkgs.buildEnv {
             name = "gang-import-test-tools";
             paths = [pkgs.jq pkgs.zstd];
@@ -236,6 +231,7 @@
             ++ lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.bubblewrap;
         }
         // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          GANG_E2E_ACTION_ROOTFS = "${self.packages.${system}.action-rootfs-e2e}";
           GANG_E2E_BWRAP = "${pkgs.bubblewrap}/bin/bwrap";
           # The browser of the identity scenario's device approval, which observes what only a browser enforces: the dashboard's Content-Security-Policy.
           # Pinned by flake.lock's nixpkgs, like bubblewrap; never taken from the host PATH.

@@ -1280,13 +1280,6 @@ fn execution_checks(ctx: &RunContext<'_>, scenario: ExecutionScenario) -> Vec<Ch
         )];
     }
     attempt(scenario.scenario(), || {
-        if matches!(scenario, ExecutionScenario::SandboxContract)
-            && ctx.inputs.action_tools.ca_bundle.is_none()
-        {
-            return Err(crate::errors::E2eError::system(
-                "the sandbox contract requires a public CA bundle",
-            ));
-        }
         let stack = Stack::create(ctx.inputs, &variant, Transport::Tls, ctx.issuer)?;
         if matches!(scenario, ExecutionScenario::SandboxContract) {
             crate::sample::stage_action_environment(
@@ -1303,7 +1296,11 @@ fn execution_checks(ctx: &RunContext<'_>, scenario: ExecutionScenario) -> Vec<Ch
                 checks.extend(exit_signals(&stack, tail)?);
                 Ok(checks)
             }
-            ExecutionScenario::SandboxContract => sandbox_contract(&stack, &exec, tail),
+            ExecutionScenario::SandboxContract => {
+                let mut checks = sandbox_contract(&stack, &exec, tail)?;
+                checks.push(stack.rootfs_test()?);
+                Ok(checks)
+            }
             ExecutionScenario::StaleScope => {
                 stale_scope(&stack, &exec, tail, ctx.inputs.settings.hold_timeout)
             }
@@ -1459,11 +1456,9 @@ mod tests {
             action_tools: crate::settings::ActionTools {
                 shell: PathBuf::default(),
                 path: String::default(),
-                action_bin: PathBuf::default(),
-                ca_bundle: None,
                 bwrap: None,
                 glibc_tool: None,
-                glibc_loader: Vec::new(),
+                action_rootfs: None,
             },
             upgrade: None,
         };

@@ -12,6 +12,7 @@
 //! let policy = FleetPolicy {
 //!     name: FleetName::try_new("workers")?,
 //!     isa: Isa::Aarch64,
+//!     action_environment: "host:test".parse()?,
 //!     instances: InstanceBounds::try_new(3, nonzero_u32(100))?,
 //!     vcpus_per_instance: nonzero_u32(15),
 //!     memory_per_instance: NonZeroBytes::gib(29),
@@ -172,8 +173,8 @@ mod tests {
     use std::time::Duration;
 
     use gang_config::InstanceBounds;
-    use gang_testkit::fleet_policy;
-    use gang_types::{Bytes, NameError, NonZeroBytes, nonzero_u32};
+    use gang_testkit::{TestResult, fleet_policy};
+    use gang_types::{Bytes, NonZeroBytes, nonzero_u32};
 
     use super::*;
 
@@ -187,7 +188,7 @@ mod tests {
         assert_eq!(div_ceil(u64::MAX, three), u64::MAX / 3);
     }
 
-    fn policy() -> Result<FleetPolicy, NameError> {
+    fn policy() -> TestResult<FleetPolicy> {
         Ok(FleetPolicy {
             instances: InstanceBounds::up_to(nonzero_u32(100)),
             vcpus_per_instance: nonzero_u32(15),

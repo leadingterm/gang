@@ -80,13 +80,17 @@ pub enum TerminationCause {
     DrainFinished,
     /// A draining worker reached the longest allowed wait and was retired anyway.
     MaxDrainWait,
+    /// An idle worker served an obsolete action environment.
+    StaleEnvironment,
 }
 
 impl From<TerminationCause> for ScalingCause {
     fn from(cause: TerminationCause) -> Self {
         match cause {
             TerminationCause::Orphan => Self::Orphan,
-            TerminationCause::DrainFinished => Self::DrainFinished,
+            TerminationCause::DrainFinished | TerminationCause::StaleEnvironment => {
+                Self::DrainFinished
+            }
             TerminationCause::MaxDrainWait => Self::MaxDrainWait,
         }
     }
