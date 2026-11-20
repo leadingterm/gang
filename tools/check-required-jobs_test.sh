@@ -38,6 +38,11 @@ expect success 'PR graph excludes optional architectures and cache fan-in' jq -e
   | all([\"linux-arm64\", \"linux-arm64-bundle\", \"linux-arm64-checks\", \"cross\", \"macos\", \"cache-x86_64\", \"release-validation\"][];
         . as \$id | (\$pr | index(\$id)) == null)
 " <<<"$jobs"
+expect success 'release validation graph excludes macOS' jq -e "
+  . as \$jobs
+  | def ancestors(\$id): [\$id] + [(\$jobs[\$id].needs // [] | if type == \"array\" then .[] else . end) | ancestors(.)[]];
+  ancestors(\"release-validation\") | index(\"macos\") == null
+" <<<"$jobs"
 
 for job in required nix-vm lint linux-x86_64-shards linux-x86_64 linux-x86_64-bundle cache-x86_64 linux-arm64 linux-arm64-bundle linux-arm64-checks cross macos release-validation e2e-gate-1-shards e2e-gate-1 e2e-gate-2-shards e2e-gate-2; do
   while IFS= read -r dependency; do
@@ -51,6 +56,9 @@ for job in linux-arm64 linux-arm64-bundle linux-arm64-checks cross macos cache-x
   job="$job" yq -i '.jobs.required.needs += [strenv(job)]' "$fixture"
   expect failure "$job cannot be a PR required dependency" "$guard" "$fixture"
 done
+cp "$workflow" "$fixture"
+yq -i '.jobs.release-validation.needs += ["macos"]' "$fixture"
+expect failure 'macOS cannot be a release validation dependency' "$guard" "$fixture"
 for job in linux-x86_64 e2e-gate-1 e2e-gate-2 required; do
   cp "$workflow" "$fixture"
   job="$job" yq -i '.jobs[strenv(job)].if = "success()"' "$fixture"
@@ -367,20 +375,19 @@ done
 release_body="$scratch/release-validation.sh"
 jq -er '.["release-validation"].steps[] | select(.env.REQUIRED_RESULT != null) | .run' <<<"$jobs" >"$release_body"
 unset HEAVY
-export CHANGES_RESULT=success REQUIRED_RESULT=success ARM_RESULT=success CROSS_RESULT=success MACOS_RESULT=success PRIVATE=false
-expect success 'public release validation requires all platforms' bash --noprofile --norc -e -u -o pipefail <"$release_body"
+export CHANGES_RESULT=success REQUIRED_RESULT=success ARM_RESULT=success CROSS_RESULT=success
+expect success 'release validation requires mandatory platforms' bash --noprofile --norc -e -u -o pipefail <"$release_body"
 for PRIVATE in false true; do
-  for variable in CHANGES_RESULT REQUIRED_RESULT ARM_RESULT CROSS_RESULT MACOS_RESULT; do
+  for variable in CHANGES_RESULT REQUIRED_RESULT ARM_RESULT CROSS_RESULT; do
     for status in failure cancelled skipped ''; do
-      if [[ $variable == MACOS_RESULT && $PRIVATE == true && $status == skipped ]]; then
-        expected=success
-      else
-        expected=failure
-      fi
-      expect "$expected" "release: heavy=false private=$PRIVATE $variable=$status" env HEAVY=false "$variable=$status" bash --noprofile --norc -e -u -o pipefail <"$release_body"
+      expect failure "release: heavy=false private=$PRIVATE $variable=$status" env HEAVY=false "$variable=$status" bash --noprofile --norc -e -u -o pipefail <"$release_body"
     done
   done
-  expect failure 'release: heavy=false cannot bypass architecture validation' env HEAVY=false ARM_RESULT=skipped CROSS_RESULT=skipped MACOS_RESULT=skipped bash --noprofile --norc -e -u -o pipefail <"$release_body"
+  for status in success failure cancelled skipped in_progress ''; do
+    expect success "release: private=$PRIVATE macos=$status" env MACOS_RESULT="$status" bash --noprofile --norc -e -u -o pipefail <"$release_body"
+  done
+  expect success "release: private=$PRIVATE macos unset" env -u MACOS_RESULT bash --noprofile --norc -e -u -o pipefail <"$release_body"
+  expect failure 'release: heavy=false cannot bypass architecture validation' env HEAVY=false ARM_RESULT=skipped CROSS_RESULT=skipped bash --noprofile --norc -e -u -o pipefail <"$release_body"
 done
 
 printf '%d cases, %d failures\n' "$cases" "$failures"

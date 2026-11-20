@@ -23,6 +23,7 @@
 
 ### Fixed
 
+- Restore macOS validation as advisory, without delaying or blocking releases.
 - Give native ARM checks a cold-compilation step budget.
 - Train burst scale-out qualification on the actual short-action targets rather than extrapolating one cold worker/CAS sample to the entire queue.
 - Run the local E2E gate with the same CI-derived shard partitions and per-shard budget as CI.
