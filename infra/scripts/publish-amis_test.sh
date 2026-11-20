@@ -34,7 +34,9 @@ case "$1 $2" in
       esac
     else
       [[ $# == 10 && $3 == --region && $5 == --owners && $6 == self && $7 == --include-deprecated && $8 == --include-disabled && $9 == --output && ${10} == json ]] || exit 92
-      if [[ $4 == region-a && -f $CASE_DIR/image ]]; then
+      if [[ ${WRONG_ENVIRONMENT:-} == 1 ]]; then
+        printf '{"Images":[{"Name":"gang-x86_64-sha-x","Tags":[{"Key":"ec2:SharedTag/ActionEnvironment","Value":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}]}]}\n'
+      elif [[ $4 == region-a && -f $CASE_DIR/image ]]; then
         printf '{"Images":[{"ImageId":"ami-old","State":"disabled"}]}\n'
       elif [[ $4 == region-b && -f $CASE_DIR/copied-region-b && ${STALE_LISTING:-} == 1 ]]; then
         printf '{"Images":[{"ImageId":"ami-fedcba","State":"pending"}]}\n'
@@ -152,6 +154,25 @@ chmod +x "$fixtures/aws" "$fixtures/gang"
 : >"$case_dir/snapshot"
 export GANG="$fixtures/gang" IMAGE_HOME_REGION=region-a IMAGE_REGIONS=region-a RELEASE=v1
 export IMAGES_DIR="$case_dir/images" IMAGE_SHA256_x86_64=sha-x IMAGE_SHA256_aarch64=sha-a
+printf '{"action_environment":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}\n' >"$IMAGES_DIR/gang-image-x86_64.json"
+printf '{"action_environment":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}\n' >"$IMAGES_DIR/gang-image-aarch64.json"
+
+for bad_info in '{}' '{"action_environment":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}'; do
+  printf '%s\n' "$bad_info" >"$IMAGES_DIR/gang-image-aarch64.json"
+  : >"$case_dir/aws-calls"
+  if PUBLICATION_SCOPE=release "$case_dir/scripts/publish-amis.sh" >"$case_dir/out" 2>"$case_dir/err"; then
+    printf 'accepted missing or mismatched image action environment\n' >&2
+    exit 1
+  fi
+  [[ ! -s "$case_dir/aws-calls" ]] || { printf 'AWS called before rejecting image metadata\n' >&2; exit 1; }
+done
+printf '{"action_environment":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}\n' >"$IMAGES_DIR/gang-image-aarch64.json"
+: >"$case_dir/operations"
+if PUBLICATION_SCOPE=release WRONG_ENVIRONMENT=1 "$case_dir/scripts/publish-amis.sh" >"$case_dir/out" 2>"$case_dir/err"; then
+  printf 'accepted an AMI with an unrelated action environment\n' >&2
+  exit 1
+fi
+[[ ! -s "$case_dir/operations" ]] || { printf 'planned publication before checking AMI identity\n' >&2; exit 1; }
 
 cd "$case_dir"
 if "$case_dir/scripts/publish-amis.sh" >out 2>err; then

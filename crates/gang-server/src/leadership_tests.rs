@@ -386,8 +386,9 @@ impl ProvisionerPort for HungProvisioner {
         held: &Held,
         fleet: Fleet<'_, Opaque>,
         instance: &InstanceId,
+        reason: gang_spi::RetirementReason,
     ) -> Result<(), PortError> {
-        self.0.terminate(held, fleet, instance).await
+        self.0.terminate(held, fleet, instance, reason).await
     }
 
     fn worker_lifetime(&self) -> gang_types::WorkerLifetime {
@@ -439,8 +440,9 @@ impl ProvisionerPort for SlowReadProvisioner {
         held: &Held,
         fleet: Fleet<'_, Opaque>,
         instance: &InstanceId,
+        reason: gang_spi::RetirementReason,
     ) -> Result<(), PortError> {
-        self.inner.terminate(held, fleet, instance).await
+        self.inner.terminate(held, fleet, instance, reason).await
     }
 
     fn worker_lifetime(&self) -> gang_types::WorkerLifetime {
@@ -784,7 +786,11 @@ async fn fence_admits_changes_only_inside_validity() -> TestResult {
     ));
     assert!(matches!(
         fence
-            .run(async |held| provisioner_ref.terminate(held, fleet, instance_ref).await)
+            .run(async |held| {
+                provisioner_ref
+                    .terminate(held, fleet, instance_ref, gang_spi::RetirementReason::Idle)
+                    .await
+            })
             .await,
         Err(RunError::Lapsed(_))
     ));
@@ -796,7 +802,11 @@ async fn fence_admits_changes_only_inside_validity() -> TestResult {
         .run(async |held| provisioner_ref.set_desired_capacity(held, fleet, 3).await)
         .await?;
     fence
-        .run(async |held| provisioner_ref.terminate(held, fleet, instance_ref).await)
+        .run(async |held| {
+            provisioner_ref
+                .terminate(held, fleet, instance_ref, gang_spi::RetirementReason::Idle)
+                .await
+        })
         .await?;
     assert_eq!(provisioner.desired_requests(), vec![(name.clone(), 3)]);
     assert_eq!(provisioner.terminations(), vec![instance.clone()]);
@@ -818,7 +828,11 @@ async fn fence_admits_changes_only_inside_validity() -> TestResult {
     ));
     assert!(matches!(
         fence
-            .run(async |held| provisioner_ref.terminate(held, fleet, instance_ref).await)
+            .run(async |held| {
+                provisioner_ref
+                    .terminate(held, fleet, instance_ref, gang_spi::RetirementReason::Idle)
+                    .await
+            })
             .await,
         Err(RunError::Lapsed(_))
     ));

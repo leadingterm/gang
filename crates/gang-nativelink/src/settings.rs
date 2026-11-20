@@ -93,11 +93,12 @@ fn resource_escalation(actions: &ActionsConfig, fleets: &FleetCatalog) -> Value 
                         .flatten()
                 })
                 .collect();
+            // Environment partitions software, not the hardware capacities used to escalate.
             let exact: Map<String, Value> = fleets
                 .declared()
                 .iter()
                 .filter_map(|&(key, kind)| {
-                    (kind == MatchKind::Exact)
+                    (kind == MatchKind::Exact && key != property::ACTION_ENVIRONMENT)
                         .then(|| fleet.get(key).map(|value| (key.to_owned(), json!(value))))
                         .flatten()
                 })
@@ -113,6 +114,7 @@ fn resource_escalation(actions: &ActionsConfig, fleets: &FleetCatalog) -> Value 
         },
         "headroom_percent": actions.reservation_headroom_percent,
         "cpu_property": property::CPU_MILLICORES,
+        "capacity_ignored_properties": [property::ACTION_ENVIRONMENT],
         "capacities": capacities,
     });
     if actions.disk.enforcement == DiskEnforcement::Pressure {
@@ -492,6 +494,7 @@ mod tests {
             &FleetName::try_new(name).expect("valid fleet name"),
             isa,
             &"docker",
+            &"host:test".parse().expect("valid environment"),
             Resources {
                 vcpus: 4,
                 memory: Bytes::new(8 * 1024 * 1024 * 1024),
@@ -598,6 +601,7 @@ mod tests {
             &FleetName::try_new("fleet-a").expect("valid fleet name"),
             Isa::X86_64,
             &"docker",
+            &"host:test".parse().expect("valid environment"),
             Resources {
                 vcpus: 15,
                 memory: Bytes::gib(8),
@@ -1214,6 +1218,7 @@ mod tests {
                 &FleetName::try_new("fleet-b").expect("fleet name"),
                 Isa::Aarch64,
                 &"bwrap",
+                &"host:test".parse().expect("valid environment"),
                 Resources {
                     vcpus: 6,
                     memory: Bytes::gib(16),
@@ -1282,6 +1287,10 @@ mod tests {
         let json = serde_json::to_value(simple).expect("simple json");
         assert!(json.get("memory_escalation").is_none());
         let escalation_json = &json["resource_escalation"];
+        assert_eq!(
+            escalation_json["capacity_ignored_properties"],
+            json!([property::ACTION_ENVIRONMENT])
+        );
         for removed in ["ladder_kb", "max_kb", "max_steps", "disk_property"] {
             assert!(escalation_json.get(removed).is_none());
         }

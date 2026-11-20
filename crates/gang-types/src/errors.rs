@@ -3,6 +3,12 @@
 use thiserror::Error;
 
 use crate::MAX_FLEETS;
+
+/// An action environment is neither a rootfs digest nor a valid host assertion.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("action environment must be 64 lowercase hex digits or host:<safe identifier>")]
+pub struct ActionEnvironmentError;
+
 /// A build id is not canonical lowercase Crockford base32.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("build id must be 16 base32 characters")]

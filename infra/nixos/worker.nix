@@ -4,9 +4,9 @@
   gang,
   ...
 }: {
-  imports = [./gang-scratch.nix ./glibc-loader.nix ./action-tools.nix ./action-environment.nix];
+  imports = [./gang-scratch.nix];
 
-  # bwrap bind paths reference /run/current-system/sw.
+  environment.etc."gang/action-rootfs".source = import ./action-rootfs {inherit pkgs;};
   environment.systemPackages = [pkgs.bubblewrap];
 
   users.users.gang.home = "/var/lib/gang-home";

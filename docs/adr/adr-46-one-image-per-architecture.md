@@ -11,7 +11,7 @@ Status: Accepted.
 - The boot check runs three times: controller without the state token, controller with it, and worker. It asserts the role's target is active and no other role's target was ever active, and that a blank state disk is formatted and mounted only when named.
 
 ## Consequences
-- The controller's closure gains the worker's inactive tools (bubblewrap, nix-ld loader, mdadm, xfsprogs, yq-go, RAID0/XFS modules and action tools), about 70 MB.
+- The controller's closure includes the worker's inactive tools and action rootfs. ADR-61 replaces the former nix-ld and action-tools closure with the digested rootfs.
 - Nothing changes on workers except the controller's four firewall ports (public, execution, worker, health) with no listener.
 - One image name and one AMI per architecture; a custom image passes the same three-run check.
 - The controller module that renders the state token ships in the same release as the image.

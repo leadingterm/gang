@@ -5,7 +5,8 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use gang_types::{
-    Fleet, FleetCatalog, FleetCountError, FleetName, FleetProperties, Isa, MAX_FLEETS, NonZeroBytes,
+    ActionEnvironment, Fleet, FleetCatalog, FleetCountError, FleetName, FleetProperties, Isa,
+    MAX_FLEETS, NonZeroBytes,
 };
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +25,8 @@ pub struct RawFleet<K> {
     pub name: FleetName,
     /// Instruction set architecture.
     pub isa: Isa,
+    /// The action environment of newly launched workers.
+    pub action_environment: ActionEnvironment,
     /// Minimum number of instances.
     pub min_instances: u32,
     /// Maximum number of instances.
@@ -61,6 +64,7 @@ impl<K> RawFleet<K> {
         let RawFleet {
             name,
             isa,
+            action_environment,
             min_instances,
             max_instances,
             vcpus_per_instance,
@@ -90,6 +94,7 @@ impl<K> RawFleet<K> {
         let policy = FleetPolicy {
             name,
             isa,
+            action_environment,
             instances,
             vcpus_per_instance,
             memory_per_instance,
@@ -318,6 +323,7 @@ mod tests {
     const FLEET: &str = r#"
 name = "gang-arm64"
 isa = "aarch64"
+action_environment = "host:test"
 min_instances = 0
 max_instances = 4
 vcpus_per_instance = 8
@@ -337,6 +343,7 @@ sandbox = "bwrap"
 
         assert_eq!(policy.name, "gang-arm64".parse::<FleetName>()?);
         assert_eq!(policy.isa, "aarch64".parse::<Isa>()?);
+        assert_eq!(policy.action_environment.as_str(), "host:test");
         assert_eq!(
             policy.instance(),
             Resources {
@@ -348,6 +355,14 @@ sandbox = "bwrap"
         assert_eq!(sandbox, "bwrap");
         assert!(options.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn action_environment_is_required_and_validated() {
+        let missing = FLEET.replace("action_environment = \"host:test\"\n", "");
+        assert!(toml::from_str::<RawFleet<String>>(&missing).is_err());
+        let invalid = FLEET.replace("host:test", "host:");
+        assert!(toml::from_str::<RawFleet<String>>(&invalid).is_err());
     }
 
     #[test]

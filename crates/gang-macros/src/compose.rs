@@ -658,6 +658,24 @@ impl Composed {
                         )*
                     }
                 }
+
+                fn try_for_each_root<E>(
+                    &mut self,
+                    key: #key,
+                    visit: impl FnMut(&mut ::gang_spi::__private::gang_types::AbsolutePathBuf) -> ::core::result::Result<(), E>,
+                ) -> ::core::result::Result<(), E> {
+                    #visit_binding
+                    match key {
+                        #(
+                            #key::#variants => match &mut self.#fields {
+                                ::core::option::Option::Some(section) => {
+                                    ::gang_spi::SandboxPrograms::try_for_each_root(section, &mut visit)
+                                }
+                                ::core::option::Option::None => ::core::result::Result::Ok(()),
+                            },
+                        )*
+                    }
+                }
             }
         }
     }

@@ -94,6 +94,7 @@ upgrade_fixture(
 
 workspace_rust_library(
     name = "gang_e2e",
+    compile_data = ["//bazel/action_environment:repository.bzl"],
     dev_deps = [
         "//crates/gang-spi:gang_spi",
         "//crates/gang-aws-sdk:gang_aws_sdk",

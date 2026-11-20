@@ -695,18 +695,21 @@ pub mod sandbox_contract {
         "no variable of the gang worker's own environment reaches a bwrap action";
     /// /tmp in a bwrap action is a fresh, empty tmpfs.
     pub const TMP_FRESH: &str = "/tmp in a bwrap action is a fresh, empty tmpfs";
-    /// Every `readonly_bind_paths` and `readonly_bind_mounts` path is read-only inside a bwrap action.
-    pub const READONLY_BINDS: &str = "every readonly_bind_paths and readonly_bind_mounts path is read-only inside a bwrap action";
+    /// The root, /usr and /etc mounts are read-only inside a bwrap action.
+    pub const READONLY_BINDS: &str =
+        "the root, /usr and /etc mounts are read-only inside a bwrap action";
     /// The working directory of a bwrap action is writable.
     pub const WORKDIR_WRITABLE: &str = "the working directory of a bwrap action is writable";
     /// The numeric action identity resolves uniquely to builder.
     pub const IDENTITY: &str = "the action identity resolves uniquely to builder";
-    /// The action uses only files for user and group lookup.
-    pub const NSS: &str = "the action uses files-only identity lookup";
+    /// User and group lookup use files; host lookup uses files then DNS.
+    pub const NSS: &str = "the action uses files for identity and files then DNS for hosts";
     /// No other host configuration is visible under /etc.
-    pub const ETC_CONTENTS: &str = "the action sees only identity and public roots under /etc";
-    /// Identity and public root files are read-only.
-    pub const IDENTITY_ROOTS_READONLY: &str = "identity and public root files are read-only";
+    pub const ETC_CONTENTS: &str =
+        "the action sees only identity, resolver and public roots under /etc";
+    /// Identity, resolver and public root files are read-only.
+    pub const IDENTITY_ROOTS_READONLY: &str =
+        "identity, resolver and public root files are read-only";
     /// Native TLS loads the public system roots.
     pub const ROOTS: &str = "native TLS loads public system roots";
     /// Native TLS respects explicit missing certificate overrides.

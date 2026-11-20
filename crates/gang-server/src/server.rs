@@ -68,11 +68,13 @@ impl From<&ServerSettings> for HealthLimits {
 fn server_info<K: Stack>(
     core: &Core<K>,
     isa: Isa,
+    action_environment: &gang_types::ActionEnvironment,
     trust: EndpointTrust,
 ) -> Result<gang_wire::Server<serde_json::Value>, ServerError> {
     wire_server(
         &core.host.endpoint,
         isa,
+        action_environment,
         trust,
         core.host.security.certificate(),
         core.clients.scheme(),
@@ -83,9 +85,10 @@ fn server_info<K: Stack>(
 async fn initial_server_info<K: Stack>(
     core: &Core<K>,
     isa: Isa,
+    action_environment: &gang_types::ActionEnvironment,
     trust: EndpointTrust,
 ) -> Result<(gang_wire::Server<serde_json::Value>, RevocationSet), ServerError> {
-    let info = server_info(core, isa, trust)?;
+    let info = server_info(core, isa, action_environment, trust)?;
     let certificates = revoked_certificates(core).await?;
     Ok((info, certificates))
 }
@@ -1292,7 +1295,12 @@ impl<D: Deployment> Server<D> {
             parts.clients,
             parts.workers,
         );
-        let initial = initial_server_info(&core, settings.default_isa, endpoint_trust);
+        let initial = initial_server_info(
+            &core,
+            settings.default_isa,
+            &settings.action_environment,
+            endpoint_trust,
+        );
         let (info, revoked_certificates) = initial.await?;
         let readiness = Readiness::default();
         let (builds, observation_sink, observations) = BuildsCell::channel(&settings.builds);

@@ -139,6 +139,7 @@ jobs:
           # The image output links its disk; zstd skips a symbolic link, so it gets the store file itself.
           zstd -19 --long=27 -T0 -q "$(realpath image/*.raw)" -o "dist/gang-image-${{ matrix.arch }}.raw.zst"
           cp image/nix-support/image-info.json "dist/gang-image-${{ matrix.arch }}.json"
+          jq -e '.action_environment | strings | test("^[0-9a-f]{64}\\z")' "dist/gang-image-${{ matrix.arch }}.json" >/dev/null
           (cd dist && sha256sum gang-*) >"images-${{ matrix.arch }}.sha256"
           (cd dist && wc -c gang-* && cat ../"images-${{ matrix.arch }}.sha256") >>"$GITHUB_STEP_SUMMARY"
       # A release stores only images that its dry run, built on another runner, reproduced byte for byte.

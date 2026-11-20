@@ -51,17 +51,20 @@ case "$operation" in
       $4 == --include-disabled && $5 == --filters &&
       $6 == Name=name,Values=gang-test-import && $7 == --output && $8 == json ]] || fail 'describe-images arguments' "$@"
     case "$CASE_MODE" in
-      adopt|adopt_pending|wrong_tag|wrong_sha|wrong_arch_tag|wrong_arch|wrong_boot|wrong_state|wrong_name|duplicate|duplicate_tag|missing_tag)
+      adopt|adopt_pending|wrong_tag|wrong_sha|wrong_environment|missing_environment|wrong_arch_tag|wrong_arch|wrong_boot|wrong_state|wrong_name|duplicate|duplicate_tag|missing_tag)
         jq -cn --arg sha "$IMAGE_SHA" --arg mode "$CASE_MODE" '
           {Images:[{ImageId:"ami-existing",Name:"gang-test-import",Architecture:"x86_64",
             BootMode:"uefi",State:"available",Tags:[
               {Key:"ec2:SharedTag/ImageSha256",Value:$sha},
               {Key:"ec2:SharedTag/GangRelease",Value:"v1.2.3"},
-              {Key:"ec2:SharedTag/GangImage",Value:"gang-image-x86_64"}]}]} |
+              {Key:"ec2:SharedTag/GangImage",Value:"gang-image-x86_64"},
+              {Key:"ec2:SharedTag/ActionEnvironment",Value:"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}]}]} |
           if $mode == "adopt_pending" then .Images[0].State = "pending"
           elif $mode == "wrong_tag" then .Images[0].Tags[1].Value = "v1.2.4"
           elif $mode == "wrong_sha" then .Images[0].Tags[0].Value = ($sha[0:12] + "different")
           elif $mode == "wrong_arch_tag" then .Images[0].Tags[2].Value = "gang-image-aarch64"
+          elif $mode == "wrong_environment" then .Images[0].Tags[3].Value = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+          elif $mode == "missing_environment" then .Images[0].Tags |= map(select(.Key != "ec2:SharedTag/ActionEnvironment"))
           elif $mode == "wrong_arch" then .Images[0].Architecture = "arm64"
           elif $mode == "wrong_boot" then .Images[0].BootMode = "legacy-bios"
           elif $mode == "wrong_state" then .Images[0].State = "failed"
@@ -85,7 +88,7 @@ case "$operation" in
       ${16} == --name && ${17} == gang-test-import && ${18} == --description &&
       ${19} == 'test import description' && ${20} == --tag-specifications &&
       ${22} == --query && ${23} == ImageId && ${24} == --output && ${25} == text ]] || fail 'register-image arguments' "$@"
-    jq -e --arg sha "$IMAGE_SHA" '. == [{ResourceType:"image",Tags:[{Key:"ec2:SharedTag/ImageSha256",Value:$sha},{Key:"ec2:SharedTag/GangRelease",Value:"v1.2.3"},{Key:"ec2:SharedTag/GangImage",Value:"gang-image-x86_64"}]}]' <<<"${21}" >/dev/null || fail 'register-image tags'
+    jq -e --arg sha "$IMAGE_SHA" '. == [{ResourceType:"image",Tags:[{Key:"ec2:SharedTag/ImageSha256",Value:$sha},{Key:"ec2:SharedTag/ActionEnvironment",Value:"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},{Key:"ec2:SharedTag/GangRelease",Value:"v1.2.3"},{Key:"ec2:SharedTag/GangImage",Value:"gang-image-x86_64"}]}]' <<<"${21}" >/dev/null || fail 'register-image tags'
     [[ -f $CASE_DIR/snap-owned && $(<"$CASE_DIR/snap-owned") == gang-test-import ]] || fail 'snapshot not owned by import'
     case "$CASE_MODE" in
       success|committedtimeout)
@@ -147,7 +150,8 @@ run_case() {
   zstd -q -f -o "$case_dir/image.raw.zst" -- "$case_dir/image.raw"
   image_sha=$(sha256sum <"$case_dir/image.raw.zst")
   image_sha=${image_sha%% *}
-  printf '{"boot_mode":"uefi"}\n' >"$case_dir/info.json"
+  printf '{"boot_mode":"uefi","action_environment":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}\n' >"$case_dir/info.json"
+  if [[ $case_name == invalid_info ]]; then printf '{"boot_mode":"uefi"}\n' >"$case_dir/info.json"; fi
   printf '%s\n' unrelated-owner >"$case_dir/snap-unrelated"
   if CASE_DIR="$case_dir" CASE_MODE="$case_name" IMAGE_SHA="$image_sha" TMPDIR="$case_dir/tmp" \
     "$script" "$case_dir/image.raw.zst" "$case_dir/info.json" gang-test-import x86_64 \
@@ -174,7 +178,7 @@ run_case() {
     fi
   fi
   case "$case_name" in
-    adopt|adopt_pending|wrong_tag|wrong_sha|wrong_arch_tag|wrong_arch|wrong_boot|wrong_state|wrong_name|duplicate|duplicate_tag|missing_tag)
+    adopt|adopt_pending|wrong_tag|wrong_sha|wrong_environment|missing_environment|wrong_arch_tag|wrong_arch|wrong_boot|wrong_state|wrong_name|duplicate|duplicate_tag|missing_tag)
       if [[ -e $case_dir/coldsnap-attempts || -e $case_dir/register-attempts ]]; then
         fail 'existing image must not trigger upload or registration'
       fi ;;
@@ -212,8 +216,11 @@ run_case internalerror 254 present absent required 0
 run_case unknown 254 present absent required 0
 run_case adopt 0 absent absent optional 0
 run_case adopt_pending 0 absent absent optional 0
+run_case invalid_info 1 absent absent optional 0
 run_case wrong_tag 1 absent absent optional 0
 run_case wrong_sha 1 absent absent optional 0
+run_case wrong_environment 1 absent absent optional 0
+run_case missing_environment 1 absent absent optional 0
 run_case wrong_arch_tag 1 absent absent optional 0
 run_case wrong_arch 1 absent absent optional 0
 run_case wrong_boot 1 absent absent optional 0

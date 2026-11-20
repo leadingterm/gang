@@ -419,6 +419,7 @@ fn scheduler_stack(
         fleets,
         actions,
         resources,
+        Arc::new(SystemClock::new()),
         |simple, notify, sketch| {
             resource = Some(Arc::clone(&sketch));
             let db = memory_awaited_action_db_factory(
@@ -452,6 +453,7 @@ fn action_stack(
     fleets: &FleetCatalog,
     actions: &gang_config::ActionsConfig,
     resources: &OnceLock<Arc<ResourceSketch>>,
+    clock: Arc<dyn Clock>,
     simple_scheduler: impl FnOnce(
         &SimpleSpec,
         Arc<Notify>,
@@ -507,8 +509,13 @@ fn action_stack(
         fitted,
         Arc::clone(sketch),
     ));
-    let action_scheduler: Arc<dyn KnownPlatformPropertyProvider> =
-        Arc::new(PlaceableActions::new(historical, fleets.clone(), admitted));
+    let action_scheduler: Arc<dyn KnownPlatformPropertyProvider> = Arc::new(
+        PlaceableActions::new(historical, fleets.clone(), admitted).with_workers(
+            Arc::clone(&worker_scheduler),
+            clock,
+            std::time::Duration::from_secs(simple.worker_timeout_s),
+        ),
+    );
     Ok((action_scheduler, worker_scheduler))
 }
 
@@ -715,7 +722,9 @@ mod tests {
     use nativelink_util::common::DigestInfo;
     use nativelink_util::digest_hasher::DigestHasherFunc;
     use nativelink_util::instant_wrapper::InstantWrapper;
-    use nativelink_util::operation_state_manager::{OperationFilter, UpdateOperationType};
+    use nativelink_util::operation_state_manager::{
+        ClientStateManager, OperationFilter, UpdateOperationType,
+    };
     use nativelink_util::origin_event::{BAZEL_METADATA_KEY, request_metadata_from_baggage};
     use nativelink_util::platform_properties::{PlatformProperties, PlatformPropertyValue};
     use opentelemetry::baggage::BaggageExt;
@@ -802,6 +811,7 @@ mod tests {
             &FleetName::try_new(name).expect("valid fleet name"),
             isa,
             &"docker",
+            &"host:test".parse().expect("valid environment"),
             Resources {
                 vcpus: 4,
                 memory: Bytes::new(8 << 30),
@@ -897,6 +907,7 @@ mod tests {
             fleets,
             actions,
             resources,
+            Arc::new(SystemClock::new()),
             |simple, notify, sketch| {
                 notify_slot = Some(Arc::clone(&notify));
                 let db = memory_awaited_action_db_factory(
@@ -953,6 +964,15 @@ mod tests {
         id: &WorkerId,
         max_inflight_tasks: u64,
     ) -> TestResult<mpsc::Receiver<UpdateForWorker>> {
+        connect_arm_worker_with_environment(workers, id, max_inflight_tasks, "host:test").await
+    }
+
+    async fn connect_arm_worker_with_environment(
+        workers: &dyn WorkerScheduler,
+        id: &WorkerId,
+        max_inflight_tasks: u64,
+        environment: &str,
+    ) -> TestResult<mpsc::Receiver<UpdateForWorker>> {
         let (tx, rx) = mpsc::channel(64);
         let properties = PlatformProperties::new(HashMap::from([
             (
@@ -966,6 +986,10 @@ mod tests {
             (
                 property::SANDBOX.to_owned(),
                 PlatformPropertyValue::Exact("docker".to_owned()),
+            ),
+            (
+                property::ACTION_ENVIRONMENT.to_owned(),
+                PlatformPropertyValue::Exact(environment.to_owned()),
             ),
             (
                 property::CPU_COUNT.to_owned(),
@@ -999,7 +1023,13 @@ mod tests {
     /// An action requiring the given instruction set and optional memory reservation.
     fn action(isa: Isa, memory_kb: Option<&str>) -> Arc<ActionInfo> {
         let digest = DigestInfo::new([1; 32], 1);
-        let mut platform_properties = HashMap::from([(property::ISA.to_owned(), isa.to_string())]);
+        let mut platform_properties = HashMap::from([
+            (property::ISA.to_owned(), isa.to_string()),
+            (
+                property::ACTION_ENVIRONMENT.to_owned(),
+                "host:test".to_owned(),
+            ),
+        ]);
         if let Some(memory_kb) = memory_kb {
             platform_properties.insert(property::MEMORY_KB.to_owned(), memory_kb.to_owned());
         }
@@ -1085,6 +1115,98 @@ mod tests {
                 .map(String::as_str),
             Some(expected)
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_requires_the_actual_worker_environment() -> TestResult {
+        NOW.set(Duration::from_secs(1_000_000));
+        let fleets = x86_and_arm_fleets();
+        let (ready_tx, mut ready_rx) = mpsc::channel(1);
+        let (stack, notify) =
+            stack_on_test_clock_with_matching_gate(&fleets, &default_config(), Some(ready_tx))?;
+        notify.notify_one();
+        ready_rx
+            .recv()
+            .await
+            .expect("background matcher reached the gate");
+        let old_id = WorkerId("old-worker".to_owned());
+        let mut old =
+            connect_arm_worker_with_environment(stack.workers.as_ref(), &old_id, 1, "host:old")
+                .await?;
+        old.try_recv().expect("connection acknowledgement");
+        let client = OperationId::from("identity-client");
+        let _subscription = stack
+            .actions
+            .add_action(client.clone(), action(Isa::Aarch64, Some("252")))
+            .await?;
+        stack.simple.do_try_match_for_test().await?;
+        assert_eq!(
+            stage_of(stack.actions.as_ref(), &client).await?,
+            Some(ActionStage::Queued)
+        );
+        assert!(matches!(
+            old.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let current_id = WorkerId("current-worker".to_owned());
+        let mut current = connect_arm_worker(stack.workers.as_ref(), &current_id).await?;
+        current.try_recv().expect("connection acknowledgement");
+        stack.simple.do_try_match_for_test().await?;
+        let _ = next_dispatch(&mut current).await;
+        assert!(matches!(
+            old.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_old_environment_and_promotion_window() -> TestResult {
+        let fleets = x86_and_arm_fleets();
+        let stack = stack_on_test_clock(&fleets, &default_config())?;
+        let clock = Arc::new(gang_clock::TestClock::default());
+        let timeout = Duration::from_secs(30);
+        let wrapper =
+            PlaceableActions::new(stack.actions.clone(), fleets, AdmittedFleets::default())
+                .with_workers(stack.workers.clone(), clock.clone(), timeout);
+        let mut old_action = action(Isa::Aarch64, Some("252"));
+        Arc::make_mut(&mut old_action).platform_properties.insert(
+            property::ACTION_ENVIRONMENT.to_owned(),
+            "host:old".to_owned(),
+        );
+        let mut missing = old_action.clone();
+        Arc::make_mut(&mut missing)
+            .platform_properties
+            .remove(property::ACTION_ENVIRONMENT);
+        let error = wrapper
+            .add_action(OperationId::from("missing"), missing)
+            .await
+            .err()
+            .expect("missing identity rejected");
+        assert_eq!(error.code, Code::InvalidArgument);
+        assert!(error.to_string().contains("gang setup"));
+        let error = wrapper
+            .add_action(OperationId::from("reconnect"), old_action.clone())
+            .await
+            .err()
+            .expect("old worker has not reconnected");
+        assert_eq!(error.code, Code::Unavailable);
+        let id = WorkerId("old-worker".to_owned());
+        let _rx =
+            connect_arm_worker_with_environment(stack.workers.as_ref(), &id, 1, "host:old").await?;
+        let _subscription = wrapper
+            .add_action(OperationId::from("live"), old_action.clone())
+            .await?;
+        clock.advance(timeout);
+        stack.workers.remove_worker(&id).await?;
+        let error = wrapper
+            .add_action(OperationId::from("gone"), old_action)
+            .await
+            .err()
+            .expect("last old worker departed");
+        assert_eq!(error.code, Code::InvalidArgument);
+        assert!(error.to_string().contains("gang setup"));
+        Ok(())
     }
 
     /// A whole-CPU request must debit the same ledger as a millicore request.
@@ -1260,10 +1382,8 @@ mod tests {
         Ok(())
     }
 
-    /// A request below the configured minimum escalates from that minimum after a memory kill.
-    #[tokio::test]
-    async fn a_reservation_raised_to_the_minimum_escalates_from_it_after_a_memory_kill()
-    -> TestResult {
+    /// A request below the configured minimum escalates after a memory kill.
+    async fn reservation_escalates(environment: &str) -> TestResult {
         NOW.set(Duration::from_secs(1_000_000));
         let config = default_config();
         let actions = Arc::new(serde_json::from_value(json!({
@@ -1273,7 +1393,9 @@ mod tests {
         let fleets = x86_and_arm_fleets();
         let stack = stack_with_actions(&fleets, &config, None, &actions)?.0;
         let worker_id = WorkerId("arm-worker".to_owned());
-        let mut rx = connect_arm_worker(stack.workers.as_ref(), &worker_id).await?;
+        let mut rx =
+            connect_arm_worker_with_environment(stack.workers.as_ref(), &worker_id, 1, environment)
+                .await?;
         let connected = rx
             .try_recv()
             .expect("the worker receives a connection result");
@@ -1281,13 +1403,15 @@ mod tests {
             connected.update,
             Some(update_for_worker::Update::ConnectionResult(_))
         ));
+        let mut request = action(Isa::Aarch64, Some("252"));
+        Arc::make_mut(&mut request).platform_properties.insert(
+            property::ACTION_ENVIRONMENT.to_owned(),
+            environment.to_owned(),
+        );
 
         let _subscription = stack
             .actions
-            .add_action(
-                OperationId::from("client"),
-                action(Isa::Aarch64, Some("252")),
-            )
+            .add_action(OperationId::from("client"), request)
             .await?;
         stack.simple.do_try_match_for_test().await?;
         let (start, memory_kb) = next_dispatch(&mut rx).await;
@@ -1337,6 +1461,16 @@ mod tests {
             "the configured multiplier applies to the raised reservation"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn reservation_escalates_on_launch_environment() -> TestResult {
+        reservation_escalates("host:test").await
+    }
+
+    #[tokio::test]
+    async fn reservation_escalates_on_live_old_environment() -> TestResult {
+        reservation_escalates("host:old").await
     }
 
     /// A configured minimum raises a learned reservation.
@@ -1689,6 +1823,7 @@ mod tests {
                         &FleetName::try_new(name).expect("valid fleet name"),
                         Isa::X86_64,
                         &"docker",
+                        &"host:test".parse().expect("valid environment"),
                         Resources {
                             vcpus,
                             memory: Bytes::new(memory_gib << 30),
@@ -1735,9 +1870,15 @@ mod tests {
             command_digest: digest,
             input_root_digest: digest,
             timeout: Duration::from_mins(1),
-            platform_properties: [(property::CPU_MILLICORES.to_owned(), "12000".to_owned())]
-                .into_iter()
-                .collect(),
+            platform_properties: [
+                (property::CPU_MILLICORES.to_owned(), "12000".to_owned()),
+                (
+                    property::ACTION_ENVIRONMENT.to_owned(),
+                    "host:test".to_owned(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
             priority: 0,
             load_timestamp: UNIX_EPOCH,
             insert_timestamp: UNIX_EPOCH,
@@ -1780,7 +1921,10 @@ mod tests {
             command_digest: digest,
             input_root_digest: digest,
             timeout: Duration::from_mins(1),
-            platform_properties: HashMap::new(),
+            platform_properties: HashMap::from([(
+                property::ACTION_ENVIRONMENT.to_owned(),
+                "host:test".to_owned(),
+            )]),
             priority: 0,
             load_timestamp: UNIX_EPOCH,
             insert_timestamp: UNIX_EPOCH,

@@ -189,6 +189,13 @@ impl gang_config::SandboxSelection for Sandboxes {
     ) -> Result<(), E> {
         Ok(())
     }
+    fn try_for_each_root<E>(
+        &mut self,
+        _: SandboxKey,
+        _: impl FnMut(&mut gang_types::AbsolutePathBuf) -> Result<(), E>,
+    ) -> Result<(), E> {
+        Ok(())
+    }
 }
 #[derive(Debug)]
 struct Plugins;
@@ -224,6 +231,7 @@ worker_listen = "127.0.0.1:9090"
 [[fleets]]
 name = "small"
 isa = "x86-64"
+action_environment = "host:test"
 sandbox = "noop"
 min_instances = 0
 max_instances = 2
@@ -239,6 +247,7 @@ boot_grace = "1m"
 [signer.local]
 [database.local]
 [sandbox.noop]
+environment = "host:test"
 [server]
 transport = "plaintext"
 [authentication.clients.none]
@@ -298,6 +307,7 @@ fn every_fleet_is_checked_and_minimum_equality_is_allowed() {
 [[fleets]]
 name = "tiny"
 isa = "x86-64"
+action_environment = "host:test"
 sandbox = "noop"
 min_instances = 0
 max_instances = 2

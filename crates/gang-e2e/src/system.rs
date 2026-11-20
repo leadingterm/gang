@@ -720,7 +720,7 @@ pub trait System: Sync {
     /// the timeout has passed; otherwise when the system cannot be observed.
     fn await_history(&self, done: &mut dyn FnMut(&[Event]) -> bool) -> Result<Vec<Event>>;
 
-    /// The directory the sandbox mounts as an empty tmpfs (`[sandbox.bwrap] tmp_path`).
+    /// The directory the bwrap sandbox mounts as an empty tmpfs.
     fn tmp_path(&self) -> &Path;
 
     /// How many trailing lines of a process's stderr a failed check quotes.

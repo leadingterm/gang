@@ -1,11 +1,8 @@
 //! The contract the execution scenarios share: the configuration knobs they vary, what they
 //! observe of a deployment beyond [`System`], and the held build they all run.
 //!
-//! The execution probes of the sample workspace write lines to a journal, a named pipe beside the
-//! hold signal (`$(dirname "$E2E_SIGNAL")/journal`), because a bwrap action can write nowhere else
-//! the harness sees; and they wait for a flag file beside it (`$(dirname "$E2E_SIGNAL")/go`),
-//! which the harness creates to release them. [`Execution`] reads the journal, sets the flag, and
-//! observes the processes and cgroups of the deployment.
+//! Execution probes use action-local links to a harness-owned journal and persistent release flag.
+//! Attempts on different workers share the same underlying inodes.
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -405,14 +402,6 @@ pub trait Execution: Sync {
     ///
     /// When the worker's environment cannot be read.
     fn worker_only_environment(&self, worker: u32) -> Result<Vec<String>>;
-
-    /// Paths inside the sandbox of `[sandbox.bwrap] readonly_bind_paths` and
-    /// `readonly_bind_mounts` in the deployment's configuration.
-    ///
-    /// # Errors
-    ///
-    /// When the configuration cannot be read or does not list them.
-    fn readonly_bind_paths(&self) -> Result<Vec<String>>;
 
     /// The `gang-action-*` directories under the noop sandbox's scratch directory.
     ///

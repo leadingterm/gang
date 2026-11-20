@@ -126,17 +126,39 @@ fn host() -> Result<(), Box<dyn Error>> {
 
 fn noop() -> Result<Noop, PortError> {
     Noop::build(
-        NoopConfig { scratch_dir: None },
+        NoopConfig {
+            environment: "host:test".parse().map_err(PortError::config)?,
+            scratch_dir: None,
+        },
         &PluginContext {
             config_path: Path::new("sandbox.toml"),
         },
     )
 }
 
+#[test]
+fn advertises_host_identity_and_rejects_rootfs_identity() -> Result<(), Box<dyn Error>> {
+    let sandbox = noop()?;
+    assert_eq!(sandbox.environment().as_str(), "host:test");
+    let config = NoopConfig {
+        environment: "a".repeat(64).parse()?,
+        scratch_dir: None,
+    };
+    let result = Noop::build(
+        config,
+        &PluginContext {
+            config_path: Path::new("sandbox.toml"),
+        },
+    );
+    assert!(matches!(result, Err(PortError::Config(_))));
+    Ok(())
+}
+
 /// A no-op sandbox whose actions get their temporary directory under `scratch`.
 fn scratch_noop(scratch: &Path) -> Result<Noop, Box<dyn Error>> {
     Ok(Noop::build(
         NoopConfig {
+            environment: "host:test".parse()?,
             scratch_dir: Some(AbsolutePathBuf::try_new(scratch)?),
         },
         &PluginContext {

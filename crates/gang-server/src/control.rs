@@ -654,10 +654,15 @@ where
             }
             Action::StartDrain(worker) => scheduler.set_draining(worker, true).await,
             Action::CancelDrain(worker, _) => scheduler.set_draining(worker, false).await,
-            Action::Terminate { instance, .. } => {
+            Action::Terminate { instance, cause } => {
                 let fleet = configs[step.fleet].fleet();
+                let reason = if *cause == gang_reconciler::TerminationCause::StaleEnvironment {
+                    gang_spi::RetirementReason::StaleEnvironment
+                } else {
+                    gang_spi::RetirementReason::Idle
+                };
                 fence
-                    .run(async |held| provisioner.terminate(held, fleet, instance).await)
+                    .run(async |held| provisioner.terminate(held, fleet, instance, reason).await)
                     .await
                     .map_err(PortError::from)
             }
@@ -802,6 +807,7 @@ mod tests {
         WorkerState {
             id: WorkerId::try_new(id).unwrap(),
             fleet: FleetName::try_new(fleet).unwrap(),
+            environment: Some("host:test".parse().unwrap()),
             running_actions: 0,
             max_inflight_actions: NonZeroU32::new(1),
             draining: false,

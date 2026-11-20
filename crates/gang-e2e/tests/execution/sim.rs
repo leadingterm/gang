@@ -819,7 +819,7 @@ impl ExecSim {
         let postgres = verdict(ActionEnvironment::Postgres);
         format!(
             "env_names=PATH,E2E_OUT,GANG_NETWORK,{leaked}\ntmp_entries={entries}\n\
-             tmp_fs={filesystem}\nmount:/nix/store={store}\nmount:/proc=other\n\
+             tmp_fs={filesystem}\nmount:/={store}\nmount:/usr={store}\nmount:/etc={store}\nmount:/proc=other\n\
              cwd_writable={writable}\nidentity={identity}\nnss={nss}\netc_contents={etc}\n\
              identity_roots_readonly={readonly}\nroots={roots}\nroots_override={root_override}\npostgres={postgres}\n"
         )
@@ -1351,10 +1351,6 @@ impl Execution for ExecSim {
             "GANG_LOCAL_INSTANCE".to_owned(),
             "GANG_LOCAL_INSTANCE_SECRET".to_owned(),
         ])
-    }
-
-    fn readonly_bind_paths(&self) -> Result<Vec<String>> {
-        Ok(vec!["/nix/store".to_owned()])
     }
 
     fn temp_dirs(&self) -> Result<Vec<PathBuf>> {

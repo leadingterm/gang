@@ -17,9 +17,10 @@ locals {
     { for fleet in var.fleets : fleet.name => merge(fleet.image == null ? local.architecture_images[local.isa_architectures[fleet.isa]] : fleet.image, { architecture = local.isa_architectures[fleet.isa] }) },
   )
   # Correctness: Group nodes sharing an image into one lookup.
-  grouped_images = { for image in values(local.node_images) : "${image.owner}/${image.architecture}/${image.sha256}" => image... }
-  image_lookups  = { for key, images in local.grouped_images : key => images[0] }
-  node_ami_ids   = { for node, image in local.node_images : node => data.aws_ami.image["${image.owner}/${image.architecture}/${image.sha256}"].id }
+  grouped_images           = { for image in values(local.node_images) : "${image.owner}/${image.architecture}/${image.sha256}" => image... }
+  image_lookups            = { for key, images in local.grouped_images : key => images[0] }
+  node_ami_ids             = { for node, image in local.node_images : node => data.aws_ami.image["${image.owner}/${image.architecture}/${image.sha256}"].id }
+  node_action_environments = { for node, image in local.node_images : node => lookup(data.aws_ami.image["${image.owner}/${image.architecture}/${image.sha256}"].tags, "ec2:SharedTag/ActionEnvironment", "") }
   # Ownership: A superseded release is deprecated at least 184 days after its successor and deregistered at least 92 days later.
   deprecation_warning_window = "4416h"
   deregistration_delay       = "2208h"
@@ -63,6 +64,10 @@ data "aws_ami" "image" {
     postcondition {
       condition     = lookup(self.tags, "ec2:SharedTag/ImageSha256", "") == each.value.sha256 && self.boot_mode == "uefi"
       error_message = "${self.name} (${self.id}) of ${each.value.owner} must carry ec2:SharedTag/ImageSha256 = ${each.value.sha256} and boot UEFI."
+    }
+    postcondition {
+      condition     = can(regex("^[0-9a-f]{64}$", lookup(self.tags, "ec2:SharedTag/ActionEnvironment", "")))
+      error_message = "${self.name} (${self.id}) must carry ec2:SharedTag/ActionEnvironment as 64 lowercase hexadecimal digits."
     }
   }
 }

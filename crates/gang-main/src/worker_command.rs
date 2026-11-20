@@ -7,7 +7,7 @@ use gang_client::ClientOptions;
 use gang_clock::{Clock, SystemClock};
 use gang_config::{GangConfig, WorkerConfig};
 use gang_nativelink::{NativeLink, NativeLinkConfig};
-use gang_spi::{PluginContext, SchedulerPort};
+use gang_spi::{ActionIsolationPort, PluginContext, SchedulerPort};
 use gang_types::{AuthenticationSettings, ProviderName, Url};
 use gang_worker::{Transport, WorkerDeployment, WorkerParts, WorkerSettings};
 
@@ -17,7 +17,7 @@ use crate::enroller::WorkloadEnroller;
 use crate::errors::{MainError, Result};
 use crate::logging;
 use crate::output::Output;
-use crate::plugins::{Cache, Limits, Plugins, Provisioner, WorkerAuthenticationConfig};
+use crate::plugins::{Cache, Limits, Plugins, Provisioner, Sandbox, WorkerAuthenticationConfig};
 use crate::runtime;
 use crate::worker_server::{AdvertisedCa, ServerPin, WorkerServer};
 
@@ -105,6 +105,11 @@ async fn serve(
         parts,
         settings,
         |config| Limits::build(config, &context).map_err(|error| error.source),
+        |key, config| {
+            let sandbox =
+                Sandbox::build(key, config.clone(), &context).map_err(|error| error.source)?;
+            Ok(sandbox.environment().clone())
+        },
         shutdown,
     ))
     .await?;

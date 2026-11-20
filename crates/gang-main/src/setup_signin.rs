@@ -130,6 +130,7 @@ mod tests {
             "remoteExecutor": "grpcs://example.test:443",
             "remoteCache": "grpcs://example.test:443",
             "defaultIsa": "x86-64",
+            "actionEnvironment": "host:test",
             "authentication": authentication
         }))
         .expect("valid server document")

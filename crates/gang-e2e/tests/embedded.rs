@@ -167,6 +167,7 @@ fn fleet_with_disk(
         &FleetName::try_new(name)?,
         isa,
         &SANDBOX,
+        &"host:test".parse()?,
         Resources {
             vcpus,
             memory: Bytes::new(memory),
@@ -1038,9 +1039,14 @@ fn build_action_with(
     let platform = Platform {
         properties: platform_properties
             .iter()
+            .copied()
+            .chain(std::iter::once((
+                gang_types::property::ACTION_ENVIRONMENT,
+                "host:test",
+            )))
             .map(|(name, value)| platform::Property {
-                name: (*name).into(),
-                value: (*value).into(),
+                name: name.into(),
+                value: value.into(),
             })
             .collect(),
     };
@@ -2109,6 +2115,7 @@ fn worker_server_settings(port: u16) -> Result<gang_server::ServerSettings, Box<
         poll_interval: NonZeroDuration::from_secs(1),
         client_action_timeout: NonZeroDuration::from_mins(1),
         default_isa: Isa::X86_64,
+        action_environment: "host:test".parse()?,
         endpoint: gang_server::PublicEndpoint::try_new(
             format!("http://127.0.0.1:{port}").parse()?,
         )?,
@@ -2187,6 +2194,7 @@ fn worker_fleets() -> Result<gang_config::Fleets<gang_testkit::TestPlugins>, Box
             policy: gang_config::FleetPolicy {
                 name: FleetName::try_new(DEFAULT_FLEET)?,
                 isa: Isa::X86_64,
+                action_environment: "host:test".parse()?,
                 instances: gang_config::InstanceBounds::up_to(
                     NonZeroU32::new(4).ok_or("nonzero instance limit")?,
                 ),

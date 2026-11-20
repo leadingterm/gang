@@ -172,19 +172,13 @@ impl Cli {
                 .clone()
                 .or_else(|| env::var("GANG_E2E_ACTION_PATH").ok())
                 .ok_or_else(|| "the sample's action PATH is unset: run the harness inside `nix develop`, or set `action_path` in the settings".to_owned())?,
-            action_bin: settings
-                .action_bin
-                .clone()
-                .or_else(|| env::var_os("GANG_E2E_ACTION_BIN").map(PathBuf::from))
-                .ok_or_else(|| "the sample's action tools directory is unset: run the harness inside `nix develop`, or set `action_bin` in the settings".to_owned())?,
-            ca_bundle: settings.ca_bundle.clone()
-                .or_else(|| env::var_os("GANG_E2E_CA_BUNDLE").map(PathBuf::from)),
             bwrap: settings
                 .bwrap
                 .clone()
                 .or_else(|| env::var_os("GANG_E2E_BWRAP").map(PathBuf::from)),
             glibc_tool: env::var_os("GANG_E2E_GLIBC_TOOL").map(|path| current.join(path)),
-            glibc_loader: ActionTools::host_glibc_loader(),
+            action_rootfs: settings.action_rootfs.clone()
+                .or_else(|| env::var_os("GANG_E2E_ACTION_ROOTFS").map(PathBuf::from)),
         };
         if settings.chromium.is_none() {
             settings.chromium = env::var_os("GANG_E2E_CHROMIUM").map(PathBuf::from);

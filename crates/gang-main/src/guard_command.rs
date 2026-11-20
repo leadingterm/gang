@@ -48,7 +48,7 @@ mod tests {
         let entrypoint = dir.path().join("gang-guard");
         std::fs::write(
             SandboxFile::<Plugins>::beside(&entrypoint),
-            "work_directory = \"/tmp\"\nselected = \"noop\"\n\n[sandbox.noop]\n",
+            "work_directory = \"/tmp\"\nselected = \"noop\"\n\n[sandbox.noop]\nenvironment = \"host:test\"\n",
         )?;
         assert_eq!(run(&entrypoint, 42)?, ExitCode::SUCCESS);
         Ok(())

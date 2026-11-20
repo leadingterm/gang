@@ -524,6 +524,7 @@ mod tests {
             "remoteExecutor": "grpcs://example.test:443",
             "remoteCache": "grpcs://example.test:443",
             "defaultIsa": "x86-64",
+            "actionEnvironment": "host:test",
             "authentication": {"none": {}}
         }))
         .expect("server fixture");
@@ -699,6 +700,7 @@ mod tests {
             "remoteExecutor": "grpcs://example.test:443",
             "remoteCache": "grpcs://example.test:443",
             "defaultIsa": "x86-64",
+            "actionEnvironment": "host:test",
             "authentication": {"token": {"login": {}}}
         }))
         .expect("server fixture");

@@ -11,7 +11,7 @@ use gang_spi::{
     ActionLimitsPort, CacheStorePort, ClientTls, NodeLifecyclePort, PortError, ProvisionerPort,
     SchedulerPort, ScratchVolumePort, Slots, WorkerSpec, WorkerTls, WorkloadCredentialPort,
 };
-use gang_types::WorkerLifetime;
+use gang_types::{ActionEnvironment, WorkerLifetime};
 
 use crate::credentials::Enroller;
 use crate::deployment::{WorkerDeployment, WorkerParts, WorkerSettings};
@@ -43,6 +43,8 @@ use crate::transport::{ServerCaSource, Transport};
 /// [`WorkerError::Config`] when the sandbox file cannot be rendered;
 /// [`WorkerError::SandboxProgram`] when a sandbox program does not resolve to an executable
 /// file;
+/// [`WorkerError::EnvironmentMismatch`] when the local sandbox differs from this worker
+/// generation's configured launch identity;
 /// [`WorkerError::Port`] or [`WorkerError::Io`] when the instance cannot be prepared;
 /// [`WorkerError::Enroll`] when enrollment cannot be retried within its deadline;
 /// [`WorkerError::ServerCa`] when the server-only transport's CA certificate cannot be obtained;
@@ -52,6 +54,7 @@ pub async fn run<D: WorkerDeployment, P: PluginSet>(
     parts: WorkerParts<D>,
     settings: WorkerSettings<P>,
     build_limits: impl FnOnce(P::Limits) -> Result<D::Limits, PortError>,
+    build_sandbox: impl FnOnce(P::SandboxKey, &mut P::Sandbox) -> Result<ActionEnvironment, PortError>,
     shutdown: impl Future<Output = ()> + Send,
 ) -> Result<(), WorkerError> {
     let WorkerParts {
@@ -68,7 +71,8 @@ pub async fn run<D: WorkerDeployment, P: PluginSet>(
         () = requested(shutdown.as_mut()) => return Ok(()),
         () = wait_until_serving(&provisioner, &clock, interval) => {}
     }
-    let (plan, _limits) = describe::<D, P>(&provisioner, &cache, settings, build_limits).await?;
+    let (plan, _limits) =
+        describe::<D, P>(&provisioner, &cache, settings, build_limits, build_sandbox).await?;
     let mut generation = tokio::select! {
         biased;
         () = requested(shutdown.as_mut()) => return Ok(()),
@@ -189,6 +193,7 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
     cache: &D::Cache,
     settings: WorkerSettings<P>,
     build_limits: impl FnOnce(P::Limits) -> Result<D::Limits, PortError>,
+    build_sandbox: impl FnOnce(P::SandboxKey, &mut P::Sandbox) -> Result<ActionEnvironment, PortError>,
 ) -> Result<(Plan, Option<D::Limits>), WorkerError> {
     let WorkerSettings {
         fleets,
@@ -218,10 +223,14 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
     let volume = provisioner.mount(&identity.instance).await?;
     let layout = Layout::new(&volume.path);
     let mut sandbox = sandbox;
-    sandbox.try_for_each_program(fleet.sandbox, |program| {
-        *program = resolve_program(program.as_path(), &search_path)?;
-        Ok::<(), WorkerError>(())
-    })?;
+    let environment = prepare_sandbox(
+        &mut sandbox,
+        fleet.sandbox,
+        &search_path,
+        &identity.fleet,
+        &fleet.policy.action_environment,
+        build_sandbox,
+    )?;
     let file = SandboxFile::<P> {
         work_directory: gang_types::AbsolutePathBuf::try_new(layout.work_directory())
             .map_err(|error| WorkerError::Config(error.to_string()))?,
@@ -252,23 +261,14 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
         Some(limits) => limits.prepare(reserve).await?,
         None => None,
     };
-    if let Some(pool) = &memory_pool {
-        let declared = fleet.policy.memory_per_instance.get();
-        let capacity = pool.capacity.get();
-        if declared > capacity {
-            return Err(WorkerError::FleetMemoryUnavailable {
-                fleet: identity.fleet,
-                declared,
-                capacity,
-                reserve,
-            });
-        }
-    }
+    check_memory_capacity(memory_pool.as_ref(), fleet.policy, &identity.fleet, reserve)?;
+    let mut properties = fleet.properties.clone();
+    properties.set_action_environment(&environment);
     let spec = WorkerSpec {
         actions,
         memory_pool,
         instance: identity.instance,
-        properties: fleet.properties.clone(),
+        properties,
         slots,
         work_directory: layout.work_directory(),
         fast_cas_directory: layout.fast_cas_directory(),
@@ -284,6 +284,60 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
         spec,
     };
     Ok((plan, limits))
+}
+
+/// Resolves and pins the selected sandbox before checking its local identity.
+fn prepare_sandbox<S: SandboxSelection>(
+    sandbox: &mut S,
+    key: S::Key,
+    search_path: &std::ffi::OsStr,
+    fleet: &gang_types::FleetName,
+    configured: &ActionEnvironment,
+    build_sandbox: impl FnOnce(S::Key, &mut S) -> Result<ActionEnvironment, PortError>,
+) -> Result<ActionEnvironment, WorkerError> {
+    sandbox.try_for_each_program(key, |program| {
+        *program = resolve_program(program.as_path(), search_path)?;
+        Ok::<(), WorkerError>(())
+    })?;
+    sandbox.try_for_each_root(key, |root| {
+        let canonical = std::fs::canonicalize(root.as_path()).map_err(|error| {
+            gang_os::PathIo::new("canonicalize sandbox root", root.as_path(), error)
+        })?;
+        *root = gang_types::AbsolutePathBuf::try_new(canonical)
+            .map_err(|error| WorkerError::Config(error.to_string()))?;
+        Ok::<(), WorkerError>(())
+    })?;
+    let environment = build_sandbox(key, sandbox)?;
+    if &environment != configured {
+        return Err(WorkerError::EnvironmentMismatch {
+            fleet: fleet.clone(),
+            configured: configured.clone(),
+            actual: environment,
+        });
+    }
+    Ok(environment)
+}
+
+/// Checks the prepared memory pool against the fleet's advertised capacity.
+fn check_memory_capacity(
+    pool: Option<&gang_spi::ActionMemoryPool>,
+    policy: &gang_config::FleetPolicy,
+    fleet: &gang_types::FleetName,
+    reserve: gang_types::Bytes,
+) -> Result<(), WorkerError> {
+    if let Some(pool) = pool {
+        let declared = policy.memory_per_instance.get();
+        let capacity = pool.capacity.get();
+        if declared > capacity {
+            return Err(WorkerError::FleetMemoryUnavailable {
+                fleet: fleet.clone(),
+                declared,
+                capacity,
+                reserve,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The TLS material of one generation: the files the worker reads, when to refresh them, and

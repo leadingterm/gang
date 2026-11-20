@@ -53,6 +53,14 @@
 //!     ) -> Result<(), E> {
 //!         Ok(())
 //!     }
+//!
+//!     fn try_for_each_root<E>(
+//!         &mut self,
+//!         _key: SandboxKey,
+//!         _visit: impl FnMut(&mut gang_types::AbsolutePathBuf) -> Result<(), E>,
+//!     ) -> Result<(), E> {
+//!         Ok(())
+//!     }
 //! }
 //!
 //! impl AuthenticationSettings for Backend {}
