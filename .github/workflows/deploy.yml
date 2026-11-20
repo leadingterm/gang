@@ -91,9 +91,8 @@ on:
 permissions:
   contents: read
 
-# Every run step executes inside the deploy dev shell. That shell exists only after the checkout
-# and nix-install steps of each job, which therefore stay as plain steps: a composite action
-# cannot carry them, because a local action resolves only after the Gang checkout it would perform.
+# Run steps execute inside the deploy devShell after the Gang checkout and setup-nix action.
+# The local setup action can only be resolved after the Gang checkout.
 defaults:
   run:
     shell: nix develop ./.gang#deploy -c bash -euo pipefail {0}
@@ -129,7 +128,11 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .gang
           persist-credentials: false
-      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+      - uses: ./.gang/.github/actions/setup-nix
+        with:
+          path: .gang
+          shell: deploy
+          cache-save: 'true'
       - name: Validate the OpenTofu root
         run: .gang/infra/scripts/reviewed-plan.sh validate
 
@@ -151,7 +154,11 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .gang
           persist-credentials: false
-      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+      - uses: ./.gang/.github/actions/setup-nix
+        with:
+          path: .gang
+          shell: deploy
+          cache-save: 'true'
       - name: Install gang
         env:
           GH_TOKEN: ${{ github.token }}
@@ -206,7 +213,11 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .gang
           persist-credentials: false
-      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+      - uses: ./.gang/.github/actions/setup-nix
+        with:
+          path: .gang
+          shell: deploy
+          cache-save: 'true'
       - name: Install gang
         env:
           GH_TOKEN: ${{ github.token }}
