@@ -45,8 +45,9 @@
       ${lib.optionalString (arch == "x86_64") ''ln -s usr/lib64 "$out/lib64"''}
       printf 'builder:x:1000:1000:Sandbox user:/:/bin/sh\nnobody:x:65534:65534::/:/usr/sbin/nologin\n' > "$out/etc/passwd"
       printf 'builder:x:1000:\nnogroup:x:65534:\n' > "$out/etc/group"
-      printf 'passwd: files\ngroup: files\nhosts: files\n' > "$out/etc/nsswitch.conf"
+      printf 'passwd: files\ngroup: files\nhosts: files dns\n' > "$out/etc/nsswitch.conf"
       printf '127.0.0.1 localhost\n::1 localhost\n' > "$out/etc/hosts"
+      : > "$out/etc/resolv.conf"
       cp -L ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt "$out/etc/ssl/certs/ca-certificates.crt"
       ln -s certs/ca-certificates.crt "$out/etc/ssl/cert.pem"
       mkdir -p "$out/etc/pki/tls/certs"

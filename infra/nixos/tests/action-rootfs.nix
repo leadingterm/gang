@@ -61,6 +61,7 @@
     gawk -i inplace '{print "changed"}' /tmp/awk-input
     cat /tmp/awk-input
   '';
+  resolver = pkgs.writeText "gang-rootfs-resolv.conf" "nameserver 192.0.2.53\n";
   sandbox = extra: command: "${pkgs.bubblewrap}/bin/bwrap --unshare-all --unshare-user --uid 1000 --gid 1000 --die-with-parent --tmpfs / --ro-bind ${rootfs}/root/usr /usr --ro-bind ${rootfs}/root/etc /etc --symlink usr/bin /bin --symlink usr/sbin /sbin --symlink usr/lib /lib ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isx86_64 "--symlink usr/lib64 /lib64"} --proc /proc --dev /dev --tmpfs /tmp --ro-bind ${probe} /probe --ro-bind ${roots} /roots --ro-bind ${script} /script --clearenv ${extra} --remount-ro / -- ${command}";
 in
   pkgs.testers.runNixOSTest {
@@ -86,6 +87,10 @@ in
               assert output.splitlines() == ["ORIGINAL_MARKER=declared", f"LD_LIBRARY_PATH={value}"]
       with subtest("fixed uid, passwd, group and localhost work without host NSS"):
           machine.succeed("${sandbox "" "/probe identity"}")
+      with subtest("resolver overlay is readable and read-only"):
+          machine.succeed("${sandbox "" "/bin/sh -c 'test -f /etc/resolv.conf && test ! -s /etc/resolv.conf'"}")
+          assert machine.succeed("${sandbox "--ro-bind ${resolver} /etc/resolv.conf" "/bin/cat /etc/resolv.conf"}") == "nameserver 192.0.2.53\n"
+          machine.fail("${sandbox "--ro-bind ${resolver} /etc/resolv.conf" "/bin/sh -c 'echo changed > /etc/resolv.conf'"}")
       with subtest("native trust roots are present and read-only"):
           machine.succeed("${sandbox "" "/roots"}")
           machine.fail("${sandbox "--tmpfs /etc/ssl --tmpfs /etc/pki" "/roots"}")
