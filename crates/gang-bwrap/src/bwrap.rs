@@ -151,22 +151,7 @@ impl Plugin for Bwrap {
                 .into_iter()
                 .map(OsString::from),
         );
-        if let Some(helpers) = &egress {
-            for path in [
-                &helpers.slirp4netns,
-                &helpers.nft,
-                &helpers.nsenter,
-                &helpers.ip,
-            ] {
-                if !path.is_absolute() {
-                    return Err(BwrapError::NetworkSetup(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("egress helper path {} is not absolute", path.display()),
-                    ))
-                    .into());
-                }
-            }
-        }
+        validate_egress_paths(egress.as_ref())?;
 
         Ok(Self {
             program,
@@ -177,6 +162,26 @@ impl Plugin for Bwrap {
             egress,
         })
     }
+}
+
+fn validate_egress_paths(egress: Option<&EgressPrograms>) -> Result<(), PortError> {
+    if let Some(helpers) = egress {
+        for path in [
+            &helpers.slirp4netns,
+            &helpers.nft,
+            &helpers.nsenter,
+            &helpers.ip,
+        ] {
+            if !path.is_absolute() {
+                return Err(BwrapError::NetworkSetup(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("egress helper path {} is not absolute", path.display()),
+                ))
+                .into());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Starts the action under `bwrap`; the returned `SandboxedAction` waits for it.

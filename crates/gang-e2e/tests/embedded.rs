@@ -1,6 +1,6 @@
 //! End-to-end tests of the embedded controller and worker, in one process over loopback.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt::Write as _;
 use std::net::Ipv4Addr;
@@ -1126,7 +1126,13 @@ fn build_action_platforms(
     let action = Action {
         command_digest: Some(command_digest.clone()),
         input_root_digest: Some(root_digest.clone()),
-        platform: action_properties.map(platform),
+        platform: action_properties.map(|properties| {
+            if properties.is_empty() {
+                Platform::default()
+            } else {
+                platform(properties)
+            }
+        }),
         ..Default::default()
     };
     let action_bytes = action.encode_to_vec();
@@ -1140,6 +1146,46 @@ fn build_action_platforms(
             (action_digest, action_bytes),
         ],
     })
+}
+
+#[test]
+fn empty_action_platform_preserves_command_fallback() -> TestResult {
+    let fixture = build_action_platforms(Some(&[]), &[("cpu_count", "3")], &[])?;
+    let action_bytes = fixture
+        .blobs
+        .iter()
+        .find(|(digest, _)| *digest == fixture.digest)
+        .map(|(_, bytes)| bytes)
+        .ok_or("missing action blob")?;
+    let action = Action::decode(action_bytes.as_slice())?;
+    assert!(
+        action
+            .platform
+            .ok_or("missing action platform")?
+            .properties
+            .is_empty()
+    );
+    let command_digest = action.command_digest.ok_or("missing command digest")?;
+    let command_bytes = fixture
+        .blobs
+        .iter()
+        .find(|(digest, _)| *digest == command_digest)
+        .map(|(_, bytes)| bytes)
+        .ok_or("missing command blob")?;
+    let command = Command::decode(command_bytes.as_slice())?;
+    let properties = command
+        .platform
+        .ok_or("missing command platform")?
+        .properties;
+    assert!(properties.iter().any(|property| {
+        property.name == gang_types::property::ACTION_ENVIRONMENT && property.value == "host:test"
+    }));
+    assert!(
+        properties
+            .iter()
+            .any(|property| { property.name == "cpu_count" && property.value == "3" })
+    );
+    Ok(())
 }
 
 /// Uploads `blobs` through the client listener's content-addressable storage.
@@ -1896,6 +1942,7 @@ async fn network_request_runs_on_granted_fleet() -> TestResult {
         &FleetName::try_new(DEFAULT_FLEET)?,
         Isa::X86_64,
         &SANDBOX,
+        &"host:test".parse()?,
         Resources {
             vcpus: WORKER_VCPUS,
             memory: Bytes::new(WORKER_MEMORY),
@@ -1939,6 +1986,7 @@ async fn reserved_environment_and_platform_authority_survive_client_spoofing() -
             &FleetName::try_new(DEFAULT_FLEET)?,
             Isa::X86_64,
             &SANDBOX,
+            &"host:test".parse()?,
             Resources {
                 vcpus: WORKER_VCPUS,
                 memory: Bytes::new(WORKER_MEMORY),
@@ -2393,6 +2441,7 @@ fn worker_fleets() -> Result<gang_config::Fleets<gang_testkit::TestPlugins>, Box
                 idle_timeout: Duration::from_secs(15),
                 max_drain_wait: Duration::from_mins(1),
                 boot_grace: Duration::from_secs(30),
+                actions: gang_types::FleetActionPolicy::default(),
             },
             sandbox: gang_testkit::SandboxKey::Noop,
             options: gang_testkit::Opaque::default(),
@@ -2670,6 +2719,7 @@ fn worker_registration(
         worker_id_prefix: InstanceId::try_new(instance)?.worker_name(),
         max_inflight_tasks: max,
         admits_when_idle: true,
+        action_ceilings: HashMap::default(),
     })
 }
 

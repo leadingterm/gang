@@ -463,6 +463,7 @@ async fn run_held_controller(
             memory: Bytes::new(8 << 30),
             disk: Bytes::new(16 << 30),
         },
+        &gang_types::FleetActionPolicy::default(),
         Vec::<(&'static str, String)>::new(),
     )])
     .expect("valid test fleet");

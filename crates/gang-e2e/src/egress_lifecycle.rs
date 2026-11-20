@@ -471,8 +471,10 @@ mod linux {
     }
 
     pub(super) fn run(inputs: &DeploymentInputs, targets: &EgressTargets) -> Result<Report> {
-        let host_uid = rustix::process::getuid().as_raw();
-        let host_gid = rustix::process::getgid().as_raw();
+        let host_identity = (
+            rustix::process::getuid().as_raw(),
+            rustix::process::getgid().as_raw(),
+        );
         let launcher = &inputs.settings.worker_launcher;
         let program = launcher.first().ok_or_else(|| {
             E2eError::system("egress lifecycle requires a systemd-run worker launcher")
@@ -517,8 +519,8 @@ mod linux {
             .arg("--gang-e2e-egress-lifecycle")
             .arg(input_path)
             .arg(target_path)
-            .arg(host_uid.to_string())
-            .arg(host_gid.to_string());
+            .arg(host_identity.0.to_string())
+            .arg(host_identity.1.to_string());
         let timeout = inputs
             .settings
             .command_timeout

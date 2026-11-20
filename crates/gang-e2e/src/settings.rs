@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::errors::{E2eError, Result};
 
 /// Procedure used to retire the old controller during a mixed-version upgrade.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum UpgradeProcedure {
     /// Stop the old server before deregistering its targets.
@@ -20,7 +20,7 @@ pub enum UpgradeProcedure {
 }
 
 /// Binary and rendered deployment fixture for one release.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseInput {
     /// Release executable.
     pub binary: PathBuf,
@@ -29,7 +29,7 @@ pub struct ReleaseInput {
 }
 
 /// Inputs needed by the mixed-version upgrade scenarios.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpgradeInputs {
     /// Release upgraded or restarted by the positive mixed-version scenarios.
     pub previous: ReleaseInput,
@@ -333,6 +333,94 @@ impl ActionTools {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deployment_inputs_round_trip_upgrade_and_egress() {
+        let policy: gang_types::PublicEgressPolicy = serde_json::from_value(serde_json::json!({
+            "protected_networks": ["10.0.0.0/8"],
+            "dns_servers": ["8.8.8.8"],
+            "setup_timeout": "10s"
+        }))
+        .expect("egress policy parses");
+        let targets = crate::egress_wire::EgressTargets {
+            public_ipv4: "192.0.2.1:8080".parse().expect("IPv4 address parses"),
+            public_ipv6: "[2001:db8::1]:8080".parse().expect("IPv6 address parses"),
+            blocked: [(
+                "private".to_owned(),
+                "10.0.0.1:8080".parse().expect("address parses"),
+            )]
+            .into_iter()
+            .collect(),
+            dns: "8.8.8.8".parse().expect("DNS address parses"),
+            nonce: "fixture-nonce".to_owned(),
+            uid: 1234,
+            gid: 5678,
+            timeout: Duration::from_secs(3),
+            policy: policy.clone(),
+        };
+        let tools = EgressTools {
+            slirp4netns: "slirp4netns".into(),
+            nft: "nft".into(),
+            nsenter: "nsenter".into(),
+            ip: "ip".into(),
+            unshare: "unshare".into(),
+            probe: "probe".into(),
+            peer: "peer".into(),
+            policy: Some(policy),
+            targets: Some(targets),
+            repository_cache: Some("repository-cache".into()),
+        };
+        let release = |name: &str| ReleaseInput {
+            binary: format!("{name}-binary").into(),
+            fixture: format!("{name}-fixture").into(),
+        };
+        for procedure in [UpgradeProcedure::PreStop, UpgradeProcedure::InstanceRefresh] {
+            let inputs = DeploymentInputs {
+                gang: "gang".into(),
+                bazel: "bazel".into(),
+                postgres: "postgres".into(),
+                base_config: "base config".to_owned(),
+                sample: "sample".into(),
+                configs: "configs".into(),
+                settings: Settings {
+                    upgrade_procedure: procedure,
+                    ..Settings::default()
+                },
+                action_tools: ActionTools {
+                    shell: "shell".into(),
+                    path: "action-path".to_owned(),
+                    bwrap: Some("bwrap".into()),
+                    glibc_tool: Some("glibc".into()),
+                    action_rootfs: Some("rootfs".into()),
+                    egress: Some(tools.clone()),
+                },
+                upgrade: Some(UpgradeInputs {
+                    previous: release("previous"),
+                    historical: release("historical"),
+                    calibration: release("calibration"),
+                    candidate_fixture: "candidate-fixture".into(),
+                }),
+            };
+            let bytes = serde_json::to_vec(&inputs).expect("deployment inputs serialize");
+            let decoded: DeploymentInputs =
+                serde_json::from_slice(&bytes).expect("deployment inputs deserialize");
+            assert_eq!(decoded.settings, inputs.settings);
+            assert_eq!(decoded.action_tools, inputs.action_tools);
+            let upgrade = decoded.upgrade.expect("upgrade inputs survive transport");
+            for (actual, name) in [
+                (upgrade.previous, "previous"),
+                (upgrade.historical, "historical"),
+                (upgrade.calibration, "calibration"),
+            ] {
+                assert_eq!(actual.binary, PathBuf::from(format!("{name}-binary")));
+                assert_eq!(actual.fixture, PathBuf::from(format!("{name}-fixture")));
+            }
+            assert_eq!(
+                upgrade.candidate_fixture,
+                PathBuf::from("candidate-fixture")
+            );
+        }
+    }
 
     #[test]
     fn chromium_defaults_to_unset_and_accepts_override() {

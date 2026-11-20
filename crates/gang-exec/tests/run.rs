@@ -283,7 +283,8 @@ fn network_is_authorized_only_by_the_selected_fleet_file() -> Result<(), Box<dyn
         environment: &request,
         working_directory: &fixture.working_directory,
     };
-    let sandbox = ScriptedSandbox::exiting(&CallLog::default(), ActionExecutionOutcome::Exited(0));
+    let sandbox =
+        ScriptedSandbox::try_exiting(&CallLog::default(), ActionExecutionOutcome::Exited(0))?;
     run_with::<TestPlugins, ScriptedSandbox, RecordingLimits>(
         &invocation,
         |_, _, _| Ok(sandbox.clone()),
@@ -299,7 +300,7 @@ fn network_is_authorized_only_by_the_selected_fleet_file() -> Result<(), Box<dyn
             ..invocation
         };
         let sandbox =
-            ScriptedSandbox::exiting(&CallLog::default(), ActionExecutionOutcome::Exited(0));
+            ScriptedSandbox::try_exiting(&CallLog::default(), ActionExecutionOutcome::Exited(0))?;
         run_with::<TestPlugins, ScriptedSandbox, RecordingLimits>(
             &invocation,
             |_, _, _| Ok(sandbox.clone()),
@@ -665,9 +666,10 @@ fn setup_failure_reports_scope_usage_and_keeps_original_error() -> Result<(), Bo
         (1, br#"{"failure":"memory","peak_memory_kb":4}"#.as_slice()),
         (0, br#"{"peak_memory_kb":4}"#.as_slice()),
     ] {
+        let sandbox = ScriptedSandbox::try_failing_to_start(&log)?;
         let error = error_of(run_with::<TestPlugins, ScriptedSandbox, RecordingLimits>(
             &invocation,
-            |_, _, _| Ok(ScriptedSandbox::failing_to_start(&log)),
+            |_, _, _| Ok(sandbox),
             |_, _| Ok(RecordingLimits::new(&log).with_oom_kills(kills)),
             || Ok(()),
         ))?;
@@ -677,9 +679,10 @@ fn setup_failure_reports_scope_usage_and_keeps_original_error() -> Result<(), Bo
     }
     let target = fixture.base.join("victim");
     std::os::unix::fs::symlink(&target, &path)?;
+    let sandbox = ScriptedSandbox::try_failing_to_start(&log)?;
     let error = error_of(run_with::<TestPlugins, ScriptedSandbox, RecordingLimits>(
         &invocation,
-        |_, _, _| Ok(ScriptedSandbox::failing_to_start(&log)),
+        |_, _, _| Ok(sandbox),
         |_, _| Ok(RecordingLimits::new(&log).with_oom_kills(1)),
         || Ok(()),
     ))?;

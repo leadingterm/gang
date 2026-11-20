@@ -80,14 +80,14 @@ module "storage" {
 }
 
 locals {
-  config_parameter_name             = coalesce(var.config_parameter_name, "/${var.name}/gang.toml")
-  group                             = var.database.engine != "sqlite"
-  controller_shape                  = local.group ? "group" : "instance"
-  public_port                       = module.network.public_port
-  worker_port                       = module.network.worker_port
-  shutdown_grace_seconds            = 300
-  network_granted                   = anytrue([for fleet in var.fleets : contains(fleet.actions.grants, "network")])
-  public_subnets                    = module.network.public_subnets_by_az
+  config_parameter_name  = coalesce(var.config_parameter_name, "/${var.name}/gang.toml")
+  group                  = var.database.engine != "sqlite"
+  controller_shape       = local.group ? "group" : "instance"
+  public_port            = module.network.public_port
+  worker_port            = module.network.worker_port
+  shutdown_grace_seconds = 300
+  network_granted        = anytrue([for fleet in var.fleets : contains(fleet.actions.grants, "network")])
+  public_subnets         = module.network.public_subnets_by_az
   protected_networks = local.network_granted && var.execution_egress != null ? concat(
     var.execution_egress.protected_networks,
     [module.network.vpc_cidr_block],

@@ -172,12 +172,17 @@ impl ActionIsolationPort for DropSandbox {
 
 /// Holds startup at a barrier and records cancellation before a payload could be released.
 struct PendingStartup {
+    environment: gang_types::ActionEnvironment,
     log: CallLog,
     started: Arc<Barrier>,
     release: Mutex<Option<oneshot::Receiver<()>>>,
 }
 
 impl ActionIsolationPort for PendingStartup {
+    fn environment(&self) -> &gang_types::ActionEnvironment {
+        &self.environment
+    }
+
     async fn start(&self, _spec: &ActionExecutionSpec<'_>) -> Result<SandboxedAction, PortError> {
         self.log.record("sandbox.start");
         let _guard = DropAction(self.log.clone());
@@ -395,6 +400,7 @@ async fn termination_during_startup_drops_start_and_leaves_scope() -> Result<(),
         let started = Arc::new(Barrier::new(2));
         let (release, released) = oneshot::channel();
         let sandbox = PendingStartup {
+            environment: "host:test".parse()?,
             log: log.clone(),
             started: Arc::clone(&started),
             release: Mutex::new(Some(released)),
@@ -460,6 +466,7 @@ async fn signal_error_during_startup_drops_start_and_preserves_usage() -> Result
         let started = Arc::new(Barrier::new(2));
         let (release, released) = oneshot::channel();
         let sandbox = PendingStartup {
+            environment: "host:test".parse()?,
             log: log.clone(),
             started: Arc::clone(&started),
             release: Mutex::new(Some(released)),

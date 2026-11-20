@@ -1115,6 +1115,10 @@ pub struct DirectConfig {
 }
 
 impl SandboxPrograms for DirectConfig {
+    fn supports_capability(&self, _: gang_types::Capability) -> bool {
+        false
+    }
+
     fn try_for_each_program<E>(
         &mut self,
         _: &mut impl FnMut(&mut PathBuf) -> Result<(), E>,
