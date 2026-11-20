@@ -134,6 +134,30 @@ pub enum DeployError {
         source: serde_json::Error,
     },
 
+    /// The plan does not contain a deployment configuration generation.
+    #[error("plan has no module deployment aws_ssm_parameter.config_generation")]
+    ConfigurationMissing,
+    /// More than one deployment configuration generation is present.
+    #[error("plan has multiple configuration generations: {first} and {second}")]
+    ConfigurationMultiple {
+        /// Address of the first generation.
+        first: String,
+        /// Address of the second generation.
+        second: String,
+    },
+    /// The planned configuration value is not known until apply.
+    #[error("plan {address} after_unknown.value is true")]
+    ConfigurationUnknown {
+        /// Address of the generation.
+        address: String,
+    },
+    /// The planned configuration value is missing, empty, or not a string.
+    #[error("plan {address} after.value must be a non-empty string")]
+    ConfigurationInvalid {
+        /// Address of the generation.
+        address: String,
+    },
+
     /// A comment does not carry exactly one manifest line.
     #[error("expected exactly one manifest line in comment, found {found}")]
     ManifestLines {

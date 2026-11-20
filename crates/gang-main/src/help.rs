@@ -29,6 +29,7 @@ pub(crate) const GROUPS: &[(&str, &[&str])] = &[
         &[
             "server",
             "ca-pin",
+            "config check",
             "options",
             "database copy",
             "revoke",

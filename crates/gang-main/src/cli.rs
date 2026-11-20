@@ -93,6 +93,12 @@ const RESTORE_EXAMPLES: &str = examples! {
         "gang restore --principal github-actions:acme/app",
     ];
 };
+/// The `after_help` of the configuration commands.
+const CONFIG_EXAMPLES: &str = examples! {
+    "a laptop or CI job: validate a configuration before rolling it out" => [
+        "gang config check gang.toml",
+    ];
+};
 /// The `after_help` of the database commands.
 const DATABASE_EXAMPLES: &str = examples! {
     "copy durable state between stopped databases" => [
@@ -358,6 +364,9 @@ pub enum Command {
     /// Run the Gang server.
     #[command(after_help = SERVER_EXAMPLES)]
     Server(ConfigArgs),
+    /// Check a configuration without starting the server.
+    #[command(subcommand, after_help = CONFIG_EXAMPLES)]
+    Config(ConfigCommand),
     /// Copy durable state between configured databases.
     #[command(subcommand, after_help = DATABASE_EXAMPLES)]
     Database(DatabaseCommand),
@@ -401,6 +410,7 @@ impl Command {
             Self::Revoke(_) => "gang revoke",
             Self::Restore(_) => "gang restore",
             Self::Server(_) => "gang server",
+            Self::Config(ConfigCommand::Check(_)) => "gang config check",
             Self::Database(DatabaseCommand::Copy(_)) => "gang database copy",
             Self::Worker(_) => "gang worker",
             Self::LocalWorker(_) => "gang local worker",
@@ -414,6 +424,22 @@ impl Command {
             Self::Release(command) => command.subject(),
         }
     }
+}
+
+/// Configuration commands.
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Parse and validate a server configuration.
+    #[command(after_help = CONFIG_EXAMPLES)]
+    Check(ConfigCheckArgs),
+}
+
+/// Arguments of `gang config check`.
+#[derive(Debug, Args)]
+pub struct ConfigCheckArgs {
+    /// Configuration file to check.
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
 }
 
 /// Database administration commands.
@@ -838,6 +864,8 @@ pub enum DeployCommand {
     /// Print whether applying a `tofu show -json` plan needs the controller to reload its configuration.
     #[command(after_help = DEPLOY_RESTART_NEEDED_EXAMPLES)]
     RestartNeeded,
+    /// Print the exact planned immutable configuration bytes from plan JSON on standard input.
+    Configuration,
     /// Print the store request of a saved plan, read from its `tofu show -json` on standard input.
     #[command(after_help = DEPLOY_STORE_REQUEST_EXAMPLES)]
     StoreRequest(StoreRequestArgs),
@@ -879,6 +907,7 @@ impl DeployCommand {
         match self {
             Self::Policy => "gang deploy policy",
             Self::RestartNeeded => "gang deploy restart-needed",
+            Self::Configuration => "gang deploy configuration",
             Self::StoreRequest(_) => "gang deploy store-request",
             Self::Manifest(_) => "gang deploy manifest",
             Self::Comment(_) => "gang deploy comment",
@@ -1160,6 +1189,34 @@ mod tests {
         try_parse(args)
             .expect_err("the command line is rejected")
             .kind()
+    }
+
+    #[test]
+    fn config_check_requires_a_positional_file() {
+        let Command::Config(ConfigCommand::Check(args)) =
+            command(&["gang", "config", "check", "gang.toml"])
+        else {
+            panic!("expected config check");
+        };
+        assert_eq!(args.file, PathBuf::from("gang.toml"));
+        assert_eq!(
+            rejection(&["gang", "config", "check"]),
+            ErrorKind::MissingRequiredArgument
+        );
+        assert_eq!(
+            rejection(&["gang", "config", "check", "--config", "gang.toml"]),
+            ErrorKind::UnknownArgument
+        );
+    }
+
+    #[test]
+    fn deploy_configuration_parses() {
+        let parsed = command(&["gang", "deploy", "configuration"]);
+        assert_eq!(parsed.subject(), "gang deploy configuration");
+        assert!(matches!(
+            parsed,
+            Command::Deploy(DeployCommand::Configuration)
+        ));
     }
 
     #[test]

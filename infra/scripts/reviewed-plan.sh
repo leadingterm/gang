@@ -64,6 +64,7 @@ cmd_plan() {
   require RUNNER_TEMP GITHUB_OUTPUT
   local plan_file="$RUNNER_TEMP/infra.tfplan"
   local json_file="$RUNNER_TEMP/infra-plan.json"
+  local config_file="$RUNNER_TEMP/planned-gang.toml"
   local rc=0 policy_rc=0
 
   tofu -chdir="$ROOT" plan -detailed-exitcode -input=false -lock=false -out="$plan_file" || rc=$?
@@ -73,6 +74,8 @@ cmd_plan() {
   esac
 
   tofu -chdir="$ROOT" show -json "$plan_file" >"$json_file"
+  "$GANG" deploy configuration <"$json_file" >"$config_file"
+  "$GANG" config check "$config_file"
   "$GANG" deploy policy <"$json_file" >>"$GITHUB_OUTPUT" || policy_rc=$?
   case "$policy_rc" in
     0) ;;

@@ -3,6 +3,7 @@
 
 use std::fmt;
 
+use crate::errors::{DeployError, Result};
 use crate::plan::{Action, Actions, Change, Plan, ResourceChange};
 
 /// Resource types whose deletion or replacement blocks a merge: they hold state that cannot be
@@ -49,6 +50,41 @@ impl fmt::Display for ProtectedChange<'_> {
 }
 
 impl Plan {
+    /// The exact planned immutable configuration generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the generation is missing, ambiguous, unknown, or has no non-empty
+    /// string value.
+    pub fn configuration(&self) -> Result<&str> {
+        let mut generations = self.resource_changes().iter().filter(|resource| {
+            resource.resource_type == "aws_ssm_parameter"
+                && is_module_resource(&resource.address, CONFIG_GENERATION_PARAMETER)
+        });
+        let generation = generations
+            .next()
+            .ok_or(DeployError::ConfigurationMissing)?;
+        if let Some(other) = generations.next() {
+            return Err(DeployError::ConfigurationMultiple {
+                first: generation.address.clone(),
+                second: other.address.clone(),
+            });
+        }
+        if generation.change.is_unknown_after("value") {
+            return Err(DeployError::ConfigurationUnknown {
+                address: generation.address.clone(),
+            });
+        }
+        generation
+            .change
+            .after_attribute("value")
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| DeployError::ConfigurationInvalid {
+                address: generation.address.clone(),
+            })
+    }
+
     /// The protected resource deletions or replacements, in plan order.
     #[must_use]
     pub fn protected_changes(&self) -> Vec<ProtectedChange<'_>> {
@@ -124,6 +160,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::PROTECTED_TYPES;
+    use crate::errors::DeployError;
     use crate::plan::tests::{fixture, plan, resource};
 
     /// An update of the parameter at `address` from `before` to `after`.
@@ -147,6 +184,87 @@ mod tests {
             &json!({"value": "b"}),
             &json!({}),
         )
+    }
+
+    #[test]
+    fn configuration_preserves_exact_bytes_for_no_op_generation() {
+        let configuration = "server:\n  name: example\n\n";
+        let generation = json!({
+            "address": "module.gang.aws_ssm_parameter.config_generation",
+            "type": "aws_ssm_parameter",
+            "change": {"actions": ["no-op"], "after": {"value": configuration}},
+        });
+        let plan = plan(&[generation]);
+        assert_eq!(plan.configuration().expect("configuration"), configuration);
+    }
+
+    #[test]
+    fn configuration_rejects_unknown_value_even_when_after_contains_a_value() {
+        let address = "module.gang.aws_ssm_parameter.config_generation";
+        let generation = parameter_update(
+            address,
+            &json!({}),
+            &json!({"value": "stale"}),
+            &json!({"value": true}),
+        );
+        let plan = plan(&[generation]);
+        let error = plan.configuration().expect_err("unknown value");
+        assert!(
+            matches!(&error, DeployError::ConfigurationUnknown { address: found } if found == address)
+        );
+        assert!(error.to_string().contains("after_unknown.value"));
+    }
+
+    #[test]
+    fn configuration_rejects_missing_generation() {
+        assert!(matches!(
+            plan(&[]).configuration(),
+            Err(DeployError::ConfigurationMissing)
+        ));
+    }
+
+    #[test]
+    fn configuration_rejects_multiple_generations() {
+        let first = "module.first.aws_ssm_parameter.config_generation";
+        let second = "module.second.aws_ssm_parameter.config_generation";
+        let plan = plan(&[value_update(first), value_update(second)]);
+        assert!(matches!(
+            plan.configuration(),
+            Err(DeployError::ConfigurationMultiple { first: a, second: b })
+                if a == first && b == second
+        ));
+    }
+
+    #[test]
+    fn configuration_ignores_unrelated_and_nested_resources() {
+        let address = "module.gang.aws_ssm_parameter.config_generation";
+        let plan = plan(&[
+            value_update("aws_ssm_parameter.config_generation"),
+            value_update("module.gang.module.child.aws_ssm_parameter.config_generation"),
+            value_update("module.gang.aws_ssm_parameter.config"),
+            resource("other_type", address, &["no-op"]),
+            value_update(address),
+        ]);
+        assert_eq!(plan.configuration().expect("configuration"), "b");
+    }
+
+    #[test]
+    fn configuration_rejects_missing_empty_and_non_string_values() {
+        let address = "module.gang.aws_ssm_parameter.config_generation";
+        for after in [
+            json!({}),
+            json!({"value": ""}),
+            json!({"value": 42}),
+            json!({"value": null}),
+        ] {
+            let generation = parameter_update(address, &json!({}), &after, &json!({}));
+            let plan = plan(&[generation]);
+            let error = plan.configuration().expect_err("invalid value");
+            assert!(
+                matches!(&error, DeployError::ConfigurationInvalid { address: found } if found == address)
+            );
+            assert!(error.to_string().contains("after.value"));
+        }
     }
 
     #[test]
