@@ -1,10 +1,13 @@
 //! The steps one reconcile pass decided on, in the order the caller applies them.
 
+use std::fmt;
+use std::time::Duration;
+
 use gang_clock::Timestamp;
 use gang_spi::{ScalingAuditEvent, ScalingEventKind};
 use gang_types::{FleetName, InstanceId, ScalingCause, WorkerId};
 
-use crate::{CordonDecision, ScaleDecision};
+use crate::{CordonDecision, Metric, ScaleDecision};
 
 /// An idempotent plan. The caller records audit events only after successful application.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -32,26 +35,71 @@ pub struct PlanStep {
     pub action: Action,
 }
 
+/// At most 14 ASCII bytes: fixed four decimals below 1e9, trimmed, or scientific notation.
+/// Rounding the fixed branch up to 1e9 leaves just ten digits after trimming.
+struct MetricText(Metric);
+
+impl fmt::Display for MetricText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = self.0.get();
+        if value < 1e-6 {
+            return formatter.write_str("0");
+        }
+        if value >= 1e9 {
+            return write!(formatter, "{value:.4e}");
+        }
+        // The intermediate fixed representation is at most 15 bytes before zero trimming.
+        let mut buffer = [0u8; 15];
+        let mut remaining = &mut buffer[..];
+        std::io::Write::write_fmt(&mut remaining, format_args!("{value:.4}"))
+            .map_err(|_| fmt::Error)?;
+        let length = 15 - remaining.len();
+        let text = std::str::from_utf8(&buffer[..length]).map_err(|_| fmt::Error)?;
+        formatter.write_str(text.trim_end_matches('0').trim_end_matches('.'))
+    }
+}
+
+/// At most 25 ASCII bytes: a u64 seconds count, optional three millisecond digits, and `s`.
+/// Sub-millisecond precision is omitted from this diagnostic, never from decision arithmetic.
+struct DurationText(Duration);
+
+impl fmt::Display for DurationText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let seconds = self.0.as_secs();
+        let millis = self.0.subsec_millis();
+        if millis == 0 {
+            write!(formatter, "{seconds}s")
+        } else {
+            write!(formatter, "{seconds}.{millis:03}s")
+        }
+    }
+}
+
 impl PlanStep {
     /// Records a successfully applied decision. Physical cordon repairs are silent.
+    ///
+    /// Scale-out detail is at most 420 bytes. Its bound is `214 + 7 + 2*25 + 6*14 + 6*10 + 5`:
+    /// literal text, dimension, durations, metrics, u32 values and a boolean, respectively.
+    /// Drain detail is at most 315 bytes, bounded by `148 + 7 + 4*25 + 3*14 + 10 + 3 + 5`;
+    /// its last numeric values are one u32 and one u8. Both fit storage for every summary.
     #[must_use]
     pub fn audit_event(&self, at: Timestamp, fleet: &FleetName) -> Option<ScalingAuditEvent> {
         let mut kind = self.action.kind()?;
         match (&self.action, &mut kind) {
             (Action::ScaleOut { summary, .. }, ScalingEventKind::ScaledOut { detail, .. }) => {
                 *detail = Some(format!(
-                    "dimension={} readiness={:?} horizon={:?} slots={} reliable={} capacity={} pre_ready={} persistent_load={} transient_backlog={} transient_extra={} persistent_queue={} extra_instances={} reachability={} persistent_streams={} streams={} zero_overhead={}",
+                    "dimension={} readiness={} horizon={} slots={} reliable={} capacity={} pre_ready={} persistent_load={} transient_backlog={} transient_extra={} persistent_queue={} extra_instances={} reachability={} persistent_streams={} streams={} zero_overhead={}",
                     summary.dimension.as_str(),
-                    summary.readiness,
-                    summary.horizon,
+                    DurationText(summary.readiness),
+                    DurationText(summary.horizon),
                     summary.slots,
                     summary.reliable,
-                    summary.capacity.get(),
-                    summary.pre_ready.get(),
-                    summary.persistent_load.get(),
-                    summary.transient_backlog.get(),
-                    summary.transient_extra.get(),
-                    summary.persistent_queue.get(),
+                    MetricText(summary.capacity),
+                    MetricText(summary.pre_ready),
+                    MetricText(summary.persistent_load),
+                    MetricText(summary.transient_backlog),
+                    MetricText(summary.transient_extra),
+                    MetricText(summary.persistent_queue),
                     summary.extra_instances,
                     summary.reachability,
                     summary.persistent_streams,
@@ -67,17 +115,17 @@ impl PlanStep {
                 ScalingEventKind::DrainStarted { detail, .. },
             ) => {
                 *detail = Some(format!(
-                    "dimension={} readiness={:?} horizon={:?} serving_instances={} remaining_capacity={} total_load={} queued_work={} waterline_percent={} dwell={:?} empty_after={:?} zero_overhead={}",
+                    "dimension={} readiness={} horizon={} serving_instances={} remaining_capacity={} total_load={} queued_work={} waterline_percent={} dwell={} empty_after={} zero_overhead={}",
                     summary.dimension.as_str(),
-                    summary.readiness,
-                    summary.horizon,
+                    DurationText(summary.readiness),
+                    DurationText(summary.horizon),
                     summary.serving_instances,
-                    summary.remaining_capacity.get(),
-                    summary.total_load.get(),
-                    summary.queued_work.get(),
+                    MetricText(summary.remaining_capacity),
+                    MetricText(summary.total_load),
+                    MetricText(summary.queued_work),
                     summary.waterline_percent,
-                    summary.dwell,
-                    summary.empty_after,
+                    DurationText(summary.dwell),
+                    DurationText(summary.empty_after),
                     summary.horizon.is_zero(),
                 ));
             }
@@ -252,6 +300,124 @@ mod tests {
                 &FleetName::try_new("workers")?,
             )
             .ok_or_else(|| "expected an audited decision".into())
+    }
+
+    #[test]
+    fn decision_scalar_format_is_compact_and_preserves_ordinary_values() {
+        for (value, expected) in [
+            (f64::from_bits(1), "0"),
+            (1e-7, "0"),
+            (0.000_06, "0.0001"),
+            (1.0 / 3.0, "0.3333"),
+            (17.0, "17"),
+            (12.5, "12.5"),
+            (999_999_999.999_9, "999999999.9999"),
+            (999_999_999.999_99, "1000000000"),
+            (1e9, "1.0000e9"),
+            (f64::MAX, "1.7977e308"),
+        ] {
+            let text = MetricText(metric(value)).to_string();
+            assert_eq!(text, expected);
+            assert!(text.len() <= 14);
+        }
+        assert_eq!(DurationText(Duration::ZERO).to_string(), "0s");
+        assert_eq!(DurationText(Duration::from_mins(5)).to_string(), "300s");
+        assert_eq!(
+            DurationText(Duration::from_millis(1_234)).to_string(),
+            "1.234s"
+        );
+        assert_eq!(
+            DurationText(Duration::MAX).to_string(),
+            "18446744073709551615.999s",
+        );
+        assert!(DurationText(Duration::MAX).to_string().len() <= 25);
+    }
+
+    #[test]
+    fn extreme_scale_summaries_always_validate_within_the_proven_bound() -> TestResult {
+        for value in [
+            f64::from_bits(1),
+            1.0 / 3.0,
+            f64::MAX,
+            999_999_999.999_9,
+            999_999_999.999_99,
+        ] {
+            let value = metric(value);
+            let audit = event(Action::ScaleOut {
+                from: 0,
+                to: u32::MAX,
+                need: NeedCause::Demand,
+                summary: ScaleDecision {
+                    readiness: Duration::MAX,
+                    horizon: Duration::MAX,
+                    slots: u32::MAX,
+                    reliable: u32::MAX,
+                    dimension: ScalingDimension::Cpu,
+                    capacity: value,
+                    pre_ready: value,
+                    persistent_load: value,
+                    transient_backlog: value,
+                    transient_extra: value,
+                    persistent_queue: value,
+                    extra_instances: u32::MAX,
+                    reachability: u32::MAX,
+                    persistent_streams: u32::MAX,
+                    streams: u32::MAX,
+                    zero_overhead: true,
+                },
+            })?;
+            assert!(audit.kind.validate().is_ok());
+            let ScalingEventKind::ScaledOut {
+                detail: Some(detail),
+                ..
+            } = audit.kind
+            else {
+                return Err("missing scale summary".into());
+            };
+            assert!(detail.len() <= 420);
+            assert!(detail.len() <= ScalingEventKind::MAX_DECISION_DETAIL_BYTES);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn extreme_cordon_summaries_always_validate_within_the_proven_bound() -> TestResult {
+        for value in [
+            f64::from_bits(1),
+            1.0 / 3.0,
+            f64::MAX,
+            999_999_999.999_9,
+            999_999_999.999_99,
+        ] {
+            let value = metric(value);
+            let audit = event(Action::StartDrain {
+                worker: worker_id("i-0abc123")?,
+                reason: DrainReason::Utilization,
+                summary: Some(CordonDecision {
+                    readiness: Duration::MAX,
+                    horizon: Duration::MAX,
+                    dimension: ScalingDimension::Cpu,
+                    serving_instances: u32::MAX,
+                    remaining_capacity: value,
+                    total_load: value,
+                    queued_work: value,
+                    waterline_percent: u8::MAX,
+                    dwell: Duration::MAX,
+                    empty_after: Duration::MAX,
+                }),
+            })?;
+            assert!(audit.kind.validate().is_ok());
+            let ScalingEventKind::DrainStarted {
+                detail: Some(detail),
+                ..
+            } = audit.kind
+            else {
+                return Err("missing cordon summary".into());
+            };
+            assert!(detail.len() <= 315);
+            assert!(detail.len() <= ScalingEventKind::MAX_DECISION_DETAIL_BYTES);
+        }
+        Ok(())
     }
 
     #[test]
