@@ -27,8 +27,8 @@ use gang_spi::{
 use gang_testkit::must_ready as ready;
 use gang_types::{
     AuthenticationSettings, Bytes, CertSerial, Fleet, FleetActionPolicy, FleetCatalog, FleetName,
-    FleetProperties, Identity, InstanceLifecycle, Isa, NetworkRequest, NonZeroBytes, Principal,
-    Proof, ProviderName, RefreshToken, Resources, Url, WorkerId, WorkerLifetime,
+    FleetProperties, Identity, InstanceId, InstanceLifecycle, Isa, NetworkRequest, NonZeroBytes,
+    Principal, Proof, ProviderName, RefreshToken, Resources, Url, WorkerLifetime,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -500,10 +500,19 @@ fn scheduler_ports_reach_their_plugin() -> Result<(), Box<dyn Error>> {
         "snapshot must overwrite its buffer"
     );
 
-    let worker = WorkerId::try_new("node-1abc")?;
+    let fleet = FleetName::try_new("example")?;
+    let instance = InstanceId::try_new("node-1")?;
     assert!(matches!(
-        ready(scheduler.set_draining(&worker, true)),
-        Err(PortError::NotFound(Subject::Worker(found))) if found == worker
+        ready(scheduler.set_draining(&fleet, &instance, true)),
+        Err(PortError::Unavailable(_))
+    ));
+    assert!(matches!(
+        ready(scheduler.retain_drains(
+            gang_clock::Tick::ORIGIN,
+            Duration::from_secs(30),
+            &[(&fleet, &gang_spi::FleetSupply::default())],
+        )),
+        Err(PortError::Unavailable(_))
     ));
 
     Ok(())
@@ -571,6 +580,10 @@ fn scheduler_runs_controller_and_worker() -> Result<(), Box<dyn Error>> {
     );
     let controller = ControllerSpec {
         actions: Arc::new(gang_config::ActionsConfig::default()),
+        scaling: Arc::new(gang_config::ScalingConfig::default()),
+        clock: Arc::new(gang_clock::TestClock::new(
+            gang_clock::Timestamp::UNIX_EPOCH,
+        )),
         content_store: &stores,
         action_store: &stores,
         fleets: &catalog,

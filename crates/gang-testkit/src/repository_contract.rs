@@ -259,7 +259,7 @@ pub async fn scaling_events_get_increasing_sequence_numbers<R: StateRepositoryPo
     Ok(())
 }
 
-/// Launch failures and withdrawals retain capacities and the provider's exact reason.
+/// Failure details, optional bounded decision summaries and every scaling cause survive storage.
 ///
 /// # Errors
 ///
@@ -308,6 +308,67 @@ pub async fn launch_failure_and_withdrawal_round_trip<R: StateRepositoryPort>(
                 event: exited,
             },
         ]
+    );
+    decision_details_and_causes_round_trip(repository, exited_seq).await?;
+    Ok(())
+}
+
+async fn decision_details_and_causes_round_trip<R: StateRepositoryPort>(
+    repository: &R,
+    since: ScalingEventSeq,
+) -> TestResult {
+    let mut expected = Vec::new();
+    for cause in gang_types::ScalingCause::ALL {
+        for detail in [None, Some(String::new()), Some("é".repeat(256))] {
+            for kind in [
+                ScalingEventKind::ScaledOut {
+                    from: 1,
+                    to: 2,
+                    detail: detail.clone(),
+                },
+                ScalingEventKind::DrainStarted {
+                    worker: WorkerId::try_new("worker-1")?,
+                    detail: detail.clone(),
+                },
+            ] {
+                let audit = ScalingAuditEvent {
+                    kind,
+                    cause: Some(cause),
+                    ..event("worker-1")?
+                };
+                expected.push(RecordedScalingEvent {
+                    seq: repository.record_scaling_event(&audit).await?,
+                    event: audit,
+                });
+            }
+        }
+    }
+    for kind in [
+        ScalingEventKind::ScaledOut {
+            from: 1,
+            to: 2,
+            detail: Some("x".repeat(ScalingEventKind::MAX_DECISION_DETAIL_BYTES + 1)),
+        },
+        ScalingEventKind::DrainStarted {
+            worker: WorkerId::try_new("worker-1")?,
+            detail: Some("é".repeat(257)),
+        },
+    ] {
+        let audit = ScalingAuditEvent {
+            kind,
+            ..event("worker-1")?
+        };
+        assert!(repository.record_scaling_event(&audit).await.is_err());
+    }
+    let mut actual = Vec::new();
+    assert!(
+        !repository
+            .scaling_events(since, None, limit(expected.len() + 1)?, &mut actual)
+            .await?
+    );
+    assert_eq!(
+        actual, expected,
+        "detail, absent old detail and every cause survive storage"
     );
     Ok(())
 }

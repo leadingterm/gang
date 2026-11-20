@@ -912,6 +912,7 @@ impl Simulation {
                 let change = EventChange::ScaledOut {
                     from: 0,
                     to: needed,
+                    detail: None,
                 };
                 Self::record(state, fleet.name, change)?;
             }
@@ -1097,6 +1098,7 @@ impl Simulation {
                 fleet,
                 EventChange::DrainStarted {
                     worker: worker.clone(),
+                    detail: None,
                 },
             )?;
             if self.behaviour.drain == Drain::Completes {
@@ -1187,6 +1189,9 @@ impl Simulation {
                 memory: 0,
                 readiness: None,
                 expected_wait: None,
+                load: None,
+                backlog: None,
+                utilization: None,
             },
         })
     }
@@ -1367,7 +1372,11 @@ impl System for Simulation {
             Self::record(
                 &mut state,
                 &fleet,
-                EventChange::ScaledOut { from: 0, to: 1 },
+                EventChange::ScaledOut {
+                    from: 0,
+                    to: 1,
+                    detail: None,
+                },
             )?;
         }
         drop(state);

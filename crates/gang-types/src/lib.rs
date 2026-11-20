@@ -52,6 +52,7 @@ mod resources;
 mod saturating;
 mod scaling_cause;
 mod secret;
+mod source;
 mod string_enum;
 mod workload_token_settings;
 
@@ -86,7 +87,7 @@ pub use ca_pin::CaPin;
 pub use error_chain::{ErrorChain, error_chain};
 pub use errors::{
     ActionEnvironmentError, BuildIdError, CaPinError, FleetCountError, FleetIndexError,
-    IdentityError, NameError, PemError, QuantityError,
+    IdentityError, NameError, PemError, QuantityError, SourceIdError,
 };
 pub use fix::Fix;
 pub use fleet::{Fleet, WorkerLifetime};
@@ -115,6 +116,7 @@ pub use resources::{ActionResources, Resources};
 pub use saturating::SaturatingInto;
 pub use scaling_cause::ScalingCause;
 pub use secret::{AccessToken, ClientSecret, DeviceSecret, LoginSession, Proof, RefreshToken};
+pub use source::SourceId;
 pub use string_enum::UnknownVariantError;
 pub use url::Url;
 pub use workload_token_settings::WorkloadTokenSettings;

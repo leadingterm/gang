@@ -146,6 +146,25 @@ impl<'a> Secured<'a> {
         })
     }
 
+    /// Runs selected, fresh probes as this session, with an independent Bazel output root.
+    /// The held-build owner supplies cancellation and joins the build on every exit path.
+    pub(crate) fn build_run_as_until(
+        &self,
+        credentials: &Credentials,
+        probes: &[Probe],
+        run: &crate::execution::Run,
+        output_root: &str,
+        stop: tokio::sync::oneshot::Receiver<String>,
+    ) -> Result<BuildOutcome> {
+        self.stack.build_selected_until(
+            self.remote(&credentials.home)?,
+            probes,
+            run,
+            output_root,
+            stop,
+        )
+    }
+
     /// The Bazel remote of an anonymous client: its rc file is a copy of the one `gang bazelrc`
     /// renders in a fresh home, without the credential helper, so Bazel sends no credentials and
     /// the server answers for an unauthenticated client.

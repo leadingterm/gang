@@ -155,6 +155,9 @@ export const TapeKey = ({ f, census }: { f: Fleet; census: FleetCensus }) => {
   ];
   if (f.demand.readiness !== undefined) rows.push(["measured readiness", <Duration ms={seconds(f.demand.readiness) * 1000} />]);
   if (f.demand.expectedWait !== undefined) rows.push(["expected wait", <Duration ms={seconds(f.demand.expectedWait) * 1000} />]);
+  if (f.demand.load !== undefined) rows.push(["load", `${(f.demand.load / 10).toFixed(1)} slots`]);
+  if (f.demand.backlog !== undefined) rows.push(["backlog", <Duration ms={seconds(f.demand.backlog) * 1000} />]);
+  if (f.demand.utilization !== undefined) rows.push(["utilization", `${f.demand.utilization / 10}%`]);
   return (
     <>
       <Tally items={fleetCounts(f, census)} />

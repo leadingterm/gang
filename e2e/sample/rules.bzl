@@ -2,7 +2,7 @@
 
 load(":config.bzl", "ACTION_IPC", "ACTION_PATH", "ACTION_SHELL", "ATTEMPTS", "HOST_ACTION_PATH", "HOST_ACTION_SHELL", "SALT", "SIGNAL")
 
-def _report(ctx, script, inputs, env, host = False, controlled = False):
+def _report(ctx, script, inputs, env, host = False, controlled = False, mnemonic = "E2eProbe"):
     report = ctx.actions.declare_file(ctx.label.name + ".report")
     # The action sees exactly this environment; the harness stages the values per deployment.
     env_all = {
@@ -34,14 +34,14 @@ export E2E_SIGNAL="$ipc/started" E2E_ATTEMPTS="$ipc/attempts"
         outputs = [report],
         inputs = inputs,
         env = env_all,
-        mnemonic = "E2eProbe",
+        mnemonic = mnemonic,
         progress_message = "Probing %{label}",
     )
     return [DefaultInfo(files = depset([report]))]
 
 def _probe_impl(ctx):
     path = HOST_ACTION_PATH if ctx.attr.host else ACTION_PATH
-    return _report(ctx, ctx.attr.script, ctx.files.srcs, {"PATH": ctx.attr.path or path}, host = ctx.attr.host, controlled = ctx.attr.controlled)
+    return _report(ctx, ctx.attr.script, ctx.files.srcs, {"PATH": ctx.attr.path or path}, host = ctx.attr.host, controlled = ctx.attr.controlled, mnemonic = ctx.attr.mnemonic)
 
 def _input_root_probe_impl(ctx):
     shared = ctx.file.shared
@@ -75,6 +75,7 @@ probe = rule(
         "host": attr.bool(doc = "Run on the noop host environment rather than the default sandbox."),
         "path": attr.string(doc = "The action's PATH; empty: the harness's ACTION_PATH."),
         "srcs": attr.label_list(allow_files = True, doc = "Inputs of the action."),
+        "mnemonic": attr.string(default = "E2eProbe", doc = "Action mnemonic; separate values isolate learned duration history."),
     },
 )
 
@@ -96,3 +97,36 @@ environment_witness = rule(
     implementation = _environment_witness_impl,
     attrs = {"probe": attr.label(allow_single_file = True, mandatory = True)},
 )
+
+def _rate_step(step):
+    return ("0" if step < 10 else "") + str(step)
+
+def rate_stream(name, properties):
+    """One held dependency lane; each completion submits a new remote action."""
+    for step in range(64):
+        current = name if step == 63 else name[:-2] + _rate_step(step)
+        previous = [] if step == 0 else [":" + name[:-2] + _rate_step(step - 1)]
+        probe(
+            name = current,
+            script = """
+D=$(dirname "$E2E_SIGNAL")
+while [ ! -s "$D/go" ] && [ ! -s "$D/release-$E2E_ACTION" ]; do sleep 1; done
+echo held=released
+""",
+            srcs = previous,
+            controlled = True,
+            exec_properties = properties,
+        )
+
+def rate_held(name, count, properties):
+    for step in range(count):
+        probe(
+            name = name + "_" + _rate_step(step),
+            script = """
+D=$(dirname "$E2E_SIGNAL")
+while [ ! -s "$D/go" ] && [ ! -s "$D/release-$E2E_ACTION" ]; do sleep 1; done
+echo held=released
+""",
+            controlled = True,
+            exec_properties = properties,
+        )

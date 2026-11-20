@@ -93,7 +93,8 @@ pub trait StateRepositoryPort: Send + Sync {
     ///
     /// # Errors
     ///
-    /// [`PortError`] when the record cannot be written.
+    /// [`PortError`] when a decision detail exceeds [`ScalingEventKind::MAX_DECISION_DETAIL_BYTES`]
+    /// or the record cannot be written.
     async fn record_scaling_event(
         &self,
         event: &ScalingAuditEvent,
@@ -264,6 +265,8 @@ pub enum ScalingEventKind {
         from: u32,
         /// Capacity requested.
         to: u32,
+        /// Optional decision summary, bounded by [`Self::MAX_DECISION_DETAIL_BYTES`].
+        detail: Option<String>,
     },
     /// The newest launch attempt failed with no launch in flight.
     LaunchFailed {
@@ -285,6 +288,8 @@ pub enum ScalingEventKind {
     DrainStarted {
         /// The drained worker.
         worker: WorkerId,
+        /// Optional decision summary, bounded by [`Self::MAX_DECISION_DETAIL_BYTES`].
+        detail: Option<String>,
     },
     /// A draining worker was told to take actions again.
     DrainCancelled {

@@ -30,7 +30,7 @@ pub fn scheduled_minimum<S: Control>(system: &S) -> Result<Vec<Check>> {
     let states = states(&frames)?;
     let events: Vec<_> = states.iter().flat_map(|state| &state.events).collect();
     let scaled = events.iter().any(|event| {
-        matches!(event.change, EventChange::ScaledOut { from: 0, to: 1 })
+        matches!(event.change, EventChange::ScaledOut { from: 0, to: 1, .. })
             && event.cause == Some(Cause::Minimum)
     });
     let min = states

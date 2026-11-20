@@ -4,18 +4,18 @@ use std::future::Future;
 use std::num::NonZeroUsize;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
-use gang_clock::{SystemClock, Timestamp};
+use gang_clock::{SystemClock, Tick, Timestamp};
 use parking_lot::Mutex;
 
 use gang_spi::{
     ActionsView, ApiService, ControllerConnections, ControllerEndpoints, ControllerReady,
-    ControllerSpec, LearnedHistory, ListingLimits, PortError, RequestGate, SchedulerPort,
-    SchedulerSnapshot, Subject, WorkerSpec, WorkerTls,
+    ControllerSpec, FleetSupply, LearnedHistory, ListingLimits, PortError, RequestGate,
+    SchedulerPort, SchedulerSnapshot, WorkerSpec, WorkerTls,
 };
-use gang_types::{Url, WorkerId};
+use gang_types::{FleetName, InstanceId, Url};
 use nativelink_scheduler::resource_sketch::ResourceSketch;
-use nativelink_util::action_messages::WorkerId as NativeWorkerId;
 use tokio::sync::watch;
 
 use crate::config::NativeLinkConfig;
@@ -141,6 +141,11 @@ impl SchedulerPort for NativeLink {
     /// when the scheduler cannot list its workers or queued operations.
     async fn snapshot(&self, into: &mut SchedulerSnapshot) -> Result<(), PortError> {
         let handles = self.current()?;
+        let mut scratch = handles.scratch.lock().await;
+        handles
+            .worker_scheduler
+            .cordons_into(&mut into.cordons)
+            .await;
         let workers = handles.worker_scheduler.worker_snapshot().await;
         let completed = handles.completed.load(Ordering::Relaxed);
         snapshot::fill(
@@ -150,6 +155,8 @@ impl SchedulerPort for NativeLink {
             &handles.durations,
             handles.clock.wall(),
             completed,
+            &handles.rates,
+            &mut scratch,
             into,
         )
         .await
@@ -182,38 +189,30 @@ impl SchedulerPort for NativeLink {
         .map_err(PortError::backend)
     }
 
-    /// Stops (`true`) or resumes (`false`) assigning new actions to a worker.
-    ///
-    /// An unknown worker is detected by the connected workers list, not by the error code: the
-    /// scheduler reports a missing worker with a plain error. When `set_drain_worker` fails, the
-    /// worker is looked up in that list; a worker missing from it is [`PortError::NotFound`].
-    ///
-    /// # Errors
-    ///
-    /// [`PortError::NotFound`] with [`Subject::Worker`] when the worker is not connected;
-    /// [`PortError::Unavailable`] while the controller is not serving; [`PortError::Backend`]
-    /// for any other scheduler failure.
-    async fn set_draining(&self, worker: &WorkerId, draining: bool) -> Result<(), PortError> {
-        let handles = self.current()?;
-        let id = NativeWorkerId::from(worker.as_str().to_owned());
-        let Err(error) = handles
+    /// Stops or resumes every connection of a physical instance, including future connections.
+    async fn set_draining(
+        &self,
+        fleet: &FleetName,
+        instance: &InstanceId,
+        draining: bool,
+    ) -> Result<(), PortError> {
+        self.current()?
             .worker_scheduler
-            .set_drain_worker(&id, draining)
+            .set_draining(fleet, instance, draining)
             .await
-        else {
-            return Ok(());
-        };
-        let connected = handles
+    }
+
+    async fn retain_drains(
+        &self,
+        now: Tick,
+        grace: Duration,
+        live: &[(&FleetName, &FleetSupply)],
+    ) -> Result<(), PortError> {
+        self.current()?
             .worker_scheduler
-            .worker_snapshot()
-            .await
-            .iter()
-            .any(|summary| summary.id == worker.as_str());
-        if connected {
-            Err(PortError::backend(error))
-        } else {
-            Err(PortError::NotFound(Subject::Worker(worker.clone())))
-        }
+            .retain_drains(now, grace, live)
+            .await;
+        Ok(())
     }
 
     fn endpoints(&self) -> ControllerEndpoints {
@@ -479,9 +478,10 @@ mod tests {
             Err(PortError::Unavailable(_))
         ));
 
-        let worker = WorkerId::try_new("i-0-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b")?;
+        let fleet = FleetName::try_new("fleet-a")?;
+        let instance = InstanceId::try_new("i-0")?;
         assert!(matches!(
-            plugin.set_draining(&worker, true).await,
+            plugin.set_draining(&fleet, &instance, true).await,
             Err(PortError::Unavailable(_))
         ));
         Ok(())

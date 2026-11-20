@@ -39,6 +39,8 @@ wire_enum! {
         Minimum = "MINIMUM",
         /// A worker stayed idle past its timeout.
         IdleTimeout = "IDLE_TIMEOUT",
+        /// A worker was cordoned because measured fleet load stayed below the waterline for the dwell.
+        Utilization = "UTILIZATION",
         /// A worker lost its host and no longer has a reason to run.
         Orphan = "ORPHAN",
         /// A draining worker finished its work and was retired.
@@ -153,6 +155,10 @@ pub enum EventChange {
         from: u32,
         /// Size after the change.
         to: u32,
+        /// The scaling decision's explanation, when recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        detail: Option<String>,
     },
     /// The provider's newest launch attempt failed while the fleet's request is unmet.
     LaunchFailed {
@@ -174,6 +180,10 @@ pub enum EventChange {
     DrainStarted {
         /// Reference `workers/{worker}` of the worker that started to drain.
         worker: String,
+        /// The scaling decision's explanation, when recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        detail: Option<String>,
     },
     /// A draining worker stopped draining.
     DrainCancelled {
@@ -242,6 +252,127 @@ mod tests {
     }
 
     #[test]
+    fn scaling_detail_round_trips_and_old_events_omit_it() {
+        for (member, body) in [
+            ("scaledOut", json!({"from": 0, "to": 2})),
+            ("drainStarted", json!({"worker": "workers/w"})),
+        ] {
+            let mut value = json!({
+                "name": "events/1",
+                "createTime": "2026-01-14T09:19:30.000Z",
+                "fleet": "fleets/spot",
+                "cause": "DEMAND",
+            });
+            value[member] = body;
+            let old = round_trip(&value);
+            assert!(matches!(
+                old.change,
+                EventChange::ScaledOut { detail: None, .. }
+                    | EventChange::DrainStarted { detail: None, .. }
+            ));
+            value[member]["detail"] = json!("measured load justifies the decision");
+            let detailed = round_trip(&value);
+            let detail = match detailed.change {
+                EventChange::ScaledOut { detail, .. }
+                | EventChange::DrainStarted { detail, .. } => detail,
+                other => panic!("expected a recognized scaling decision, got {other:?}"),
+            };
+            assert_eq!(
+                detail.as_deref(),
+                Some("measured load justifies the decision")
+            );
+        }
+    }
+
+    #[test]
+    fn previous_event_reader_recognizes_detailed_scaling_members() {
+        // The v0.3.3 flattened resource and its change variants, before decision detail.
+        #[derive(Debug, Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PreviousEvent {
+            name: String,
+            #[serde(with = "crate::time")]
+            create_time: Timestamp,
+            fleet: String,
+            #[serde(default)]
+            cause: Option<Cause>,
+            #[serde(flatten)]
+            change: PreviousChange,
+        }
+        #[derive(Debug, PartialEq, Eq, Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        enum PreviousChange {
+            ScaledOut {
+                from: u32,
+                to: u32,
+            },
+            LaunchFailed {
+                from: u32,
+                to: u32,
+                reason: String,
+            },
+            Withdrawn {
+                from: u32,
+                to: u32,
+            },
+            DrainStarted {
+                worker: String,
+            },
+            DrainCancelled {
+                worker: String,
+            },
+            Terminated {
+                instance: String,
+            },
+            ExitedEarly {
+                instance: String,
+                failure: String,
+            },
+            WorkerRegistered {
+                worker: String,
+            },
+            WorkerDeregistered {
+                worker: String,
+            },
+            Aws {
+                event: AwsEvent,
+            },
+            #[serde(untagged)]
+            Unrecognized(Map<String, Value>),
+        }
+        for (body, expected) in [
+            (
+                json!({"scaledOut": {"from": 1, "to": 2, "detail": "queued work"}}),
+                PreviousChange::ScaledOut { from: 1, to: 2 },
+            ),
+            (
+                json!({"drainStarted": {"worker": "workers/w", "detail": "low load"}}),
+                PreviousChange::DrainStarted {
+                    worker: "workers/w".into(),
+                },
+            ),
+        ] {
+            let mut value = json!({
+                "name": "events/1",
+                "createTime": "2026-01-14T09:19:30.000Z",
+                "fleet": "fleets/spot",
+                "cause": "DEMAND",
+            });
+            value
+                .as_object_mut()
+                .expect("event object")
+                .extend(body.as_object().expect("member object").clone());
+            let event: PreviousEvent =
+                serde_json::from_value(value.clone()).expect("old reader parses");
+            assert_eq!(event.name, "events/1");
+            assert_eq!(event.create_time, round_trip(&value).create_time);
+            assert_eq!(event.fleet, "fleets/spot");
+            assert_eq!(event.cause, Some(Cause::Demand));
+            assert_eq!(event.change, expected);
+        }
+    }
+
+    #[test]
     fn aws_status_preserves_source_time_and_interruption_action() {
         let value = json!({
             "name": "awsEvents/notice-1",
@@ -304,7 +435,8 @@ mod tests {
         assert_eq!(
             event.change,
             EventChange::DrainStarted {
-                worker: "workers/i-0e1000000000000a-0194d5a2".to_owned()
+                worker: "workers/i-0e1000000000000a-0194d5a2".to_owned(),
+                detail: None,
             }
         );
     }
@@ -402,7 +534,14 @@ mod tests {
             "scaledOut": {"from": 1, "to": 2, "reason": "future"},
         }))
         .expect("event parses");
-        assert_eq!(event.change, EventChange::ScaledOut { from: 1, to: 2 });
+        assert_eq!(
+            event.change,
+            EventChange::ScaledOut {
+                from: 1,
+                to: 2,
+                detail: None,
+            }
+        );
     }
 
     #[test]
@@ -448,6 +587,12 @@ mod tests {
             assert_eq!(
                 Cause::from(cause).as_str(),
                 cause.as_str().to_ascii_uppercase()
+            );
+            let wire = Cause::from(cause);
+            let value = serde_json::to_value(&wire).expect("cause serializes");
+            assert_eq!(
+                serde_json::from_value::<Cause>(value).expect("cause parses"),
+                wire
             );
         }
     }

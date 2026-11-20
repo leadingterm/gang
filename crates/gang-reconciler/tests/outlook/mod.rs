@@ -24,6 +24,9 @@ fn needed_follows_each_fleets_demand() -> TestResult {
     h.connect(X86, "local-1")?;
     h.set_running("local-1", 2)?;
     h.queue(X86, 9)?;
+    for row in &mut h.snapshot.queued {
+        row.expected = Some(Duration::from_hours(1));
+    }
     h.reconcile();
 
     let x86 = h.outlook(X86)?;
@@ -45,6 +48,9 @@ fn needed_is_the_work_raised_to_the_minimum_in_force() -> TestResult {
     assert_eq!(h.outlook(X86)?.needed, 2);
 
     h.queue(X86, 8)?;
+    for row in &mut h.snapshot.queued {
+        row.expected = Some(Duration::from_hours(1));
+    }
     h.reconcile();
     assert_eq!(h.outlook(X86)?.minimum, 2);
     assert_eq!(h.outlook(X86)?.needed, 3);

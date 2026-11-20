@@ -49,7 +49,11 @@ fn scaling_event(seq: u64) -> Event {
         create_time: Timestamp::from_unix_millis(1_000_000 + seq),
         fleet: name::of::<name::Fleets>(&fleet),
         cause: None,
-        change: EventChange::ScaledOut { from: 0, to: 1 },
+        change: EventChange::ScaledOut {
+            from: 0,
+            to: 1,
+            detail: None,
+        },
     }
 }
 

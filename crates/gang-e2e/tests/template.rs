@@ -408,6 +408,94 @@ fn burst_queue_fits_one_http2_connection() -> gang_e2e::Result<()> {
 }
 
 #[test]
+fn rate_scaling_presets_render_typed_knobs() -> gang_e2e::Result<()> {
+    let backlog = varied_document(&Variant {
+        control: ControlKnobs::BACKLOG_GROWS_FLEET,
+        ..Variant::baseline(Sandbox::Noop)
+    })?;
+    assert_eq!(
+        backlog.scaling.unknown_action_duration.get(),
+        std::time::Duration::from_mins(10),
+    );
+    let burst = varied_document(&Variant {
+        control: ControlKnobs::BURST_FROM_ZERO,
+        ..Variant::baseline(Sandbox::Noop)
+    })?;
+    assert_eq!(burst.scaling, gang_config::ScalingConfig::default());
+    for control in [
+        ControlKnobs::SUSTAINED_STREAM,
+        ControlKnobs::TWO_SOURCES,
+        ControlKnobs::UTILIZATION_SCALE_IN,
+    ] {
+        let document = varied_document(&Variant {
+            control,
+            ..Variant::baseline(Sandbox::Noop)
+        })?;
+        assert_eq!(document.scaling.payback_percent.get(), 50);
+        assert_eq!(
+            document.scaling.load_half_life.get(),
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(
+            document.scaling.source_idle.get(),
+            std::time::Duration::from_secs(4)
+        );
+        assert_eq!(
+            document.scaling.readiness_prior.get(),
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(
+            document.scaling.scale_in_dwell.get(),
+            std::time::Duration::from_secs(4)
+        );
+        assert_eq!(document.scaling.max_cordons, 1);
+        assert_eq!(
+            document.scaling.unknown_action_duration.get(),
+            control
+                .unknown_action_duration
+                .expect("preset service prior")
+        );
+        assert_eq!(
+            document.fleets[0].idle_timeout,
+            control.idle_timeout.expect("preset idle timeout")
+        );
+        assert_eq!(
+            document.fleets[0].target_actions_per_instance.get(),
+            control.target_actions_per_instance.expect("preset target")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn database_outage_preset_justifies_follower_work_before_partition_heals() -> gang_e2e::Result<()> {
+    let document = varied_document(&Variant {
+        control: ControlKnobs::DATABASE_OUTAGE,
+        ..Variant::baseline(Sandbox::Noop)
+    })?;
+    assert_eq!(document.scaling.payback_percent.get(), 50);
+    assert_eq!(
+        document.scaling.unknown_action_duration.get(),
+        std::time::Duration::from_mins(10),
+    );
+    assert_eq!(
+        document.dashboard.detail_interval.get(),
+        std::time::Duration::from_secs(1),
+    );
+    for fleet in &document.fleets {
+        assert_eq!(fleet.target_actions_per_instance.get(), 2);
+        let boot = document.scaling.readiness_prior.get().min(fleet.boot_grace);
+        let horizon = (boot + fleet.idle_timeout) / 2;
+        // Conservatively credit two two-slot instances throughout B and H.
+        // Four unknown queued actions must still pay for another two-slot worker.
+        let work = 4 * document.scaling.unknown_action_duration.get().as_nanos();
+        let credited = 4 * (boot + horizon).as_nanos();
+        assert!(work > credited + 2 * horizon.as_nanos());
+    }
+    Ok(())
+}
+
+#[test]
 fn short_boot_grace_bounds_shutdown_and_preserves_shorter_setting() -> gang_e2e::Result<()> {
     let variant = Variant {
         control: ControlKnobs::ORPHAN,
@@ -1009,7 +1097,8 @@ fn launch_failure_preset_sets_missing_launcher_and_short_timeout() -> gang_e2e::
 }
 
 #[test]
-fn fleets_preset_shortens_cleanup_without_changing_placement_or_polling() -> gang_e2e::Result<()> {
+fn fleets_preset_justifies_overflow_without_changing_placement_or_polling() -> gang_e2e::Result<()>
+{
     let base = base_config()?;
     for sandbox in [Sandbox::Noop, Sandbox::Bwrap] {
         let variant = placement_variant(sandbox);
@@ -1033,6 +1122,11 @@ fn fleets_preset_shortens_cleanup_without_changing_placement_or_polling() -> gan
         );
         assert_eq!(tuned.client_action_timeout, untuned.client_action_timeout);
         assert_eq!(tuned.fleets.len(), 3);
+        assert_eq!(tuned.scaling.payback_percent.get(), 50);
+        assert_eq!(
+            tuned.scaling.unknown_action_duration.get(),
+            std::time::Duration::from_mins(10),
+        );
         for (fleet, before) in tuned.fleets.iter().zip(&untuned.fleets) {
             assert_eq!(fleet.name, before.name);
             assert_eq!(fleet.sandbox, before.sandbox);
@@ -1041,6 +1135,13 @@ fn fleets_preset_shortens_cleanup_without_changing_placement_or_polling() -> gan
             assert_eq!(fleet.idle_timeout, std::time::Duration::from_secs(2));
             assert_eq!(fleet.max_drain_wait, before.max_drain_wait);
             assert_eq!(fleet.boot_grace, before.boot_grace);
+            assert_eq!(fleet.target_actions_per_instance.get(), 1);
+            let boot = tuned.scaling.readiness_prior.get().min(fleet.boot_grace);
+            let horizon = (boot + fleet.idle_timeout) / 2;
+            assert!(
+                tuned.scaling.unknown_action_duration.get().as_nanos() >= 2 * horizon.as_nanos(),
+                "one queued action must justify another whole slot after crediting the planned slot",
+            );
         }
         let ProvisionerConfig::Local(local) = tuned.provisioner else {
             panic!("local provisioner expected");

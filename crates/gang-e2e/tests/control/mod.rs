@@ -372,7 +372,10 @@ impl World {
                 {
                     self.record(
                         Some(Cause::IdleTimeout),
-                        EventChange::DrainStarted { worker },
+                        EventChange::DrainStarted {
+                            worker,
+                            detail: None,
+                        },
                     );
                     Link::Draining
                 } else {
@@ -448,6 +451,7 @@ impl World {
             EventChange::ScaledOut {
                 from: live,
                 to: needed,
+                detail: None,
             },
         );
         for _ in live..needed {
@@ -663,11 +667,11 @@ impl System for ControlSim {
         let mut history = world.ledger.clone();
         if world.behaviour.resumed == Resumed::MissingDrainHistory {
             let worker = history.iter().find_map(|event| match &event.change {
-                EventChange::DrainStarted { worker } => Some(worker.clone()),
+                EventChange::DrainStarted { worker, .. } => Some(worker.clone()),
                 _ => None,
             });
             history.retain(|event| {
-                !matches!(&event.change, EventChange::DrainStarted { worker: named } if Some(named) == worker.as_ref())
+                !matches!(&event.change, EventChange::DrainStarted { worker: named, .. } if Some(named) == worker.as_ref())
             });
         }
         Ok(history)

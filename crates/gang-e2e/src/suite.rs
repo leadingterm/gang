@@ -264,6 +264,14 @@ gang_types::string_enum! {
         QueuedBehindShortWork = "queued-behind-short-work",
         /// A persistent backlog grows the fleet.
         BacklogGrowsFleet = "backlog-grows-fleet",
+        /// The burst's one-worker bound without any training build.
+        ColdBurstFromZero = "cold-burst-from-zero",
+        /// One authenticated workload continuously refills past its payback horizon.
+        SustainedStream = "sustained-stream",
+        /// Distinct principals retain separate activity ages and offered load.
+        TwoSources = "two-sources",
+        /// Distributed busy workers cordon and drain for measured utilization.
+        UtilizationScaleIn = "utilization-scale-in",
     }
 }
 
@@ -271,6 +279,8 @@ impl Scenario {
     /// Seconds for LPT balancing, rounded up (minimum one) from warm x86 CI timings.
     /// Provisional estimates after fixture changes: sessions 60s (was 181.1s), fleets 75s
     /// (169.4s), leader failover 75s (120.4s), and database outage 100s (164.5s).
+    /// Cold burst 20s and rate scenarios 65/95/110s are provisional fixture estimates,
+    /// not measured improvements; the eight-shard launcher-budget test uses these too.
     #[must_use]
     pub const fn weight(self) -> u64 {
         match self {
@@ -287,7 +297,7 @@ impl Scenario {
             Self::ActionTimeoutNoop => 43,
             Self::WorkerRenewal | Self::LaunchFailure => 34,
             Self::GlibcToolchain => 26,
-            Self::FhsTools => 20,
+            Self::FhsTools | Self::ColdBurstFromZero => 20,
             Self::MemoryEscalation => 13,
             Self::OversizedFleet => 12,
             Self::Pressure | Self::PoolOom => 16,
@@ -316,6 +326,9 @@ impl Scenario {
             Self::BacklogGrowsFleet => 10,
             Self::DatabaseOutage => 100,
             Self::ConfigRefetchRestart => 120,
+            Self::SustainedStream => 65,
+            Self::TwoSources => 95,
+            Self::UtilizationScaleIn => 110,
         }
     }
 
@@ -366,6 +379,10 @@ impl Scenario {
             | Self::BurstFromZero
             | Self::QueuedBehindShortWork
             | Self::BacklogGrowsFleet
+            | Self::ColdBurstFromZero
+            | Self::SustainedStream
+            | Self::TwoSources
+            | Self::UtilizationScaleIn
             | Self::ControllerLoss
             | Self::RollingDeploy
             | Self::RollingUpgrade
@@ -484,9 +501,13 @@ impl Scenario {
             Self::WorkerRenewal => execution_checks(ctx, ExecutionScenario::WorkerRenewal),
             Self::Orphan => control_checks(self, ctx, ControlKnobs::ORPHAN, orphan),
             Self::ScheduledMinimum => scheduled_minimum_checks(ctx),
-            Self::BurstFromZero | Self::QueuedBehindShortWork | Self::BacklogGrowsFleet => {
-                work_aware_dispatch(self, ctx)
-            }
+            Self::BurstFromZero
+            | Self::ColdBurstFromZero
+            | Self::QueuedBehindShortWork
+            | Self::BacklogGrowsFleet
+            | Self::SustainedStream
+            | Self::TwoSources
+            | Self::UtilizationScaleIn => work_aware_dispatch(self, ctx),
             Self::DrainCancel => {
                 control_checks(self, ctx, ControlKnobs::DRAIN_CANCEL, drain_cancel)
             }
@@ -646,6 +667,33 @@ fn work_aware_dispatch(scenario: Scenario, ctx: &RunContext<'_>) -> Vec<Check> {
             ControlKnobs::BACKLOG_GROWS_FLEET,
             |stack, exec| backlog_grows_fleet(stack, exec),
         ),
+        Scenario::ColdBurstFromZero => work_aware_checks(
+            scenario,
+            ctx,
+            ControlKnobs::BURST_FROM_ZERO,
+            |stack, exec| crate::cold_burst_from_zero(stack, exec),
+        ),
+        Scenario::SustainedStream => {
+            work_aware_checks(scenario, ctx, ControlKnobs::SUSTAINED_STREAM, |stack, _| {
+                crate::sustained_stream(stack)
+            })
+        }
+        Scenario::TwoSources => attempt(scenario, || {
+            let variant = Variant {
+                control: ControlKnobs::TWO_SOURCES,
+                ..ctx.baseline
+            };
+            let secured = Secured::create(ctx.inputs, &variant, ctx.issuer)?;
+            crate::two_sources(&secured)
+        }),
+        Scenario::UtilizationScaleIn => attempt(scenario, || {
+            let variant = Variant {
+                control: ControlKnobs::UTILIZATION_SCALE_IN,
+                ..ctx.baseline
+            };
+            let secured = Secured::create(ctx.inputs, &variant, ctx.issuer)?;
+            crate::utilization_scale_in(&secured)
+        }),
         _ => attempt(scenario, || {
             Err(crate::errors::E2eError::system("not a work-aware scenario"))
         }),
@@ -896,10 +944,7 @@ fn cluster_variant(scenario: Scenario, baseline: &Variant) -> Option<Variant> {
         },
         Scenario::DatabaseOutage => Variant {
             identity: IdentityKnobs::SIGN_IN,
-            control: ControlKnobs {
-                detail_interval: Some(std::time::Duration::from_secs(1)),
-                ..ControlKnobs::NONE
-            },
+            control: ControlKnobs::DATABASE_OUTAGE,
             ..Variant::baseline(Sandbox::Noop)
         },
         _ => return None,
@@ -1009,20 +1054,7 @@ fn leader_failover_checks(ctx: &RunContext<'_>, engine: Engine) -> Result<Vec<Ch
 
 /// Runs the outage scenario with one and two controllers on separate deployments.
 fn database_outage_checks(ctx: &RunContext<'_>, engine: Engine) -> Result<Vec<Check>> {
-    let mut invocation = cluster_inputs(ctx, 1, 3)?;
-    let mut document: toml::Value =
-        toml::from_str(&invocation.base_config).map_err(crate::template::template_error)?;
-    let fleet = document
-        .get_mut("fleets")
-        .and_then(toml::Value::as_array_mut)
-        .and_then(|fleets| fleets.first_mut())
-        .and_then(toml::Value::as_table_mut)
-        .ok_or_else(|| crate::errors::E2eError::system("missing first fleet"))?;
-    fleet.insert(
-        "target_actions_per_instance".into(),
-        toml::Value::Integer(2),
-    );
-    invocation.base_config = toml::to_string(&document).map_err(crate::template::template_error)?;
+    let invocation = cluster_inputs(ctx, 1, 3)?;
     let variant = required_cluster_variant(Scenario::DatabaseOutage, &ctx.baseline)?;
     Ok(parallel_variant_checks([1, 2], |count| {
         prefix_checks(
@@ -1713,6 +1745,10 @@ mod tests {
             Scenario::BurstFromZero,
             Scenario::QueuedBehindShortWork,
             Scenario::BacklogGrowsFleet,
+            Scenario::ColdBurstFromZero,
+            Scenario::SustainedStream,
+            Scenario::TwoSources,
+            Scenario::UtilizationScaleIn,
         ];
         for scenario in gate_two_only {
             assert!(!runs.contains(&scenario), "{scenario}");
@@ -1743,6 +1779,10 @@ mod tests {
             Scenario::BurstFromZero,
             Scenario::QueuedBehindShortWork,
             Scenario::BacklogGrowsFleet,
+            Scenario::ColdBurstFromZero,
+            Scenario::SustainedStream,
+            Scenario::TwoSources,
+            Scenario::UtilizationScaleIn,
         ]));
     }
 

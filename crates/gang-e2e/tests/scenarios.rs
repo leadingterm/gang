@@ -1320,7 +1320,11 @@ fn work_aware_scale_out(from: u32, to: u32) -> gang_wire::Event {
         create_time: gang_clock::Timestamp::from_unix_millis(0),
         fleet: "fleets/local".to_owned(),
         cause: Some(gang_wire::Cause::Demand),
-        change: gang_wire::EventChange::ScaledOut { from, to },
+        change: gang_wire::EventChange::ScaledOut {
+            from,
+            to,
+            detail: None,
+        },
     }
 }
 

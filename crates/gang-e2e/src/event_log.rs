@@ -574,7 +574,11 @@ mod tests {
     #[test]
     fn early_exit_finds_the_first_exited_early_event() {
         let history = [
-            event(EventChange::ScaledOut { from: 0, to: 1 }),
+            event(EventChange::ScaledOut {
+                from: 0,
+                to: 1,
+                detail: None,
+            }),
             event(EventChange::ExitedEarly {
                 instance: "instances/first".to_owned(),
                 failure: "first failure".to_owned(),
@@ -590,7 +594,17 @@ mod tests {
     #[test]
     fn early_exit_is_none_without_one() {
         assert!(early_exit(&[], None).is_none());
-        assert!(early_exit(&[event(EventChange::ScaledOut { from: 0, to: 1 })], None).is_none());
+        assert!(
+            early_exit(
+                &[event(EventChange::ScaledOut {
+                    from: 0,
+                    to: 1,
+                    detail: None
+                })],
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -640,16 +654,25 @@ mod tests {
     fn only_a_scaled_out_event_records_a_scale_out() {
         let drain = [event(EventChange::DrainStarted {
             worker: worker("worker-1"),
+            detail: None,
         })];
         assert!(!scale_out_recorded(&drain));
 
-        let scaled = [event(EventChange::ScaledOut { from: 1, to: 2 })];
+        let scaled = [event(EventChange::ScaledOut {
+            from: 1,
+            to: 2,
+            detail: None,
+        })];
         assert!(scale_out_recorded(&scaled));
     }
 
     #[test]
     fn fleet_drained_needs_a_registered_worker_and_none_connected() {
-        let scaled_out = event(EventChange::ScaledOut { from: 0, to: 1 });
+        let scaled_out = event(EventChange::ScaledOut {
+            from: 0,
+            to: 1,
+            detail: None,
+        });
         let registered = event(EventChange::WorkerRegistered {
             worker: worker("worker-1"),
         });
@@ -670,6 +693,7 @@ mod tests {
                 ..event(EventChange::ScaledOut {
                     from: seq,
                     to: seq + 1,
+                    detail: None,
                 })
             })
             .collect();

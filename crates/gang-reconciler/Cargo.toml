@@ -13,6 +13,11 @@ gang-clock = { workspace = true }
 gang-config = { workspace = true }
 gang-spi = { workspace = true }
 gang-types = { workspace = true }
+lru = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 allocation-counter = { workspace = true }

@@ -106,6 +106,8 @@ pub struct DeviceSettings {
 pub struct ServerSettings {
     /// Shared action scheduling and resource policy.
     pub actions: Arc<gang_config::ActionsConfig>,
+    /// Shared rate-based scaling policy for the adapter and each leadership term.
+    pub scaling: Arc<gang_config::ScalingConfig>,
     /// Shared trusted PROXY protocol listener settings.
     pub proxy_protocol: Arc<gang_config::ProxyProtocolConfig>,
     /// Lease timing for this controller.

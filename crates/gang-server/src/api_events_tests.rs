@@ -41,7 +41,15 @@ fn ledger_event(
 
 /// A scale-out ledger event at `millis` with no cause.
 fn scaled_out(millis: u64) -> ScalingAuditEvent {
-    ledger_event(millis, ScalingEventKind::ScaledOut { from: 0, to: 1 }, None)
+    ledger_event(
+        millis,
+        ScalingEventKind::ScaledOut {
+            from: 0,
+            to: 1,
+            detail: None,
+        },
+        None,
+    )
 }
 
 /// Records `events` in order; the first gets sequence number 1.
@@ -69,9 +77,14 @@ fn wire_event(seq: u64, millis: u64, change: EventChange, cause: Option<Cause>) 
 /// One event of each kind, one second apart, oldest first.
 fn all_kinds(worker: &WorkerId) -> Vec<ScalingAuditEvent> {
     let kinds = [
-        ScalingEventKind::ScaledOut { from: 0, to: 3 },
+        ScalingEventKind::ScaledOut {
+            from: 0,
+            to: 3,
+            detail: None,
+        },
         ScalingEventKind::DrainStarted {
             worker: worker.clone(),
+            detail: None,
         },
         ScalingEventKind::DrainCancelled {
             worker: worker.clone(),
@@ -91,9 +104,14 @@ fn all_kinds(worker: &WorkerId) -> Vec<ScalingAuditEvent> {
 fn all_kinds_on_the_wire(worker: &WorkerId) -> Vec<Event> {
     let worker = name::of::<name::Workers>(worker);
     let changes = [
-        EventChange::ScaledOut { from: 0, to: 3 },
+        EventChange::ScaledOut {
+            from: 0,
+            to: 3,
+            detail: None,
+        },
         EventChange::DrainStarted {
             worker: worker.clone(),
+            detail: None,
         },
         EventChange::DrainCancelled { worker },
         EventChange::Terminated {
@@ -285,13 +303,18 @@ async fn events_carry_their_cause_in_upper_snake_case_and_omit_it_when_absent() 
         &[
             ledger_event(
                 1_000,
-                ScalingEventKind::ScaledOut { from: 0, to: 1 },
+                ScalingEventKind::ScaledOut {
+                    from: 0,
+                    to: 1,
+                    detail: None,
+                },
                 Some(ScalingCause::IdleTimeout),
             ),
             ledger_event(
                 2_000,
                 ScalingEventKind::DrainStarted {
                     worker: worker_id("local-1")?,
+                    detail: None,
                 },
                 None,
             ),

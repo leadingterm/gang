@@ -1,17 +1,36 @@
+mod episodes;
+mod rate_history;
 mod work_aware;
 
 use std::num::NonZeroU32;
 use std::time::Duration;
 
 use gang_clock::{Clock, Timestamp};
-use gang_config::{FleetPolicy, InstanceBounds, Weekday};
-use gang_reconciler::{Action, NeedCause, PlanStep, TerminationCause};
-use gang_spi::{ScalingAuditEvent, ScalingEventKind};
+use gang_config::{InstanceBounds, Weekday};
+use gang_reconciler::{Action, DrainReason, NeedCause, PlanStep, TerminationCause};
+use gang_spi::{ScalingEventKind, WorkerState};
 use gang_testkit::{TestResult, scheduled_minimum, worker_id};
 use gang_types::health::CLIENT_REROUTE_BOUND;
-use gang_types::{FleetName, FleetSet, InstanceId, InstanceLifecycle, Isa, ScalingCause, WorkerId};
+use gang_types::{FleetSet, InstanceId, InstanceLifecycle, Isa, ScalingCause, WorkerId};
 
-use crate::support::*;
+use crate::support::{ARM, Harness, X86, policy, policy_named};
+use work_aware::{Workload, fleet, purchases, secs, settings, source};
+#[test]
+fn queued_environment_selects_only_matching_launch_fleet() -> TestResult {
+    let first = policy_named("first", Isa::X86_64)?;
+    let mut second = policy_named("second", Isa::X86_64)?;
+    second.action_environment = "host:other".parse()?;
+    let mut h = Harness::with_fleets(vec![first, second]);
+    h.queue_candidates(FleetSet::prefix(2)?, 1);
+    h.snapshot.queued[0].environment = "host:other".parse()?;
+    let steps = h.reconcile();
+    assert!(steps.iter().any(|step| step.fleet == 1
+        && matches!(step.action, Action::ScaleOut { to: 1, .. })));
+    assert!(!steps.iter().any(|step| step.fleet == 0
+        && matches!(step.action, Action::ScaleOut { .. })));
+    Ok(())
+}
+
 
 #[test]
 fn stale_idle_worker_retires_at_maximum_before_replacement() -> TestResult {
@@ -26,7 +45,7 @@ fn stale_idle_worker_retires_at_maximum_before_replacement() -> TestResult {
     assert!(
         first
             .iter()
-            .any(|step| matches!(step.action, Action::StartDrain(_)))
+            .any(|step| matches!(step.action, Action::StartDrain { .. }))
     );
     assert!(
         !first
@@ -46,12 +65,9 @@ fn stale_idle_worker_retires_at_maximum_before_replacement() -> TestResult {
             .iter()
             .any(|step| matches!(step.action, Action::CancelDrain(..)))
     );
-    let third = h.run();
-    assert!(
-        third
-            .iter()
-            .any(|step| matches!(step.action, Action::ScaleOut { to: 1, .. }))
-    );
+    assert!(second.iter().any(|step| matches!(
+        step.action, Action::ScaleOut { to: 1, .. }
+    )));
     Ok(())
 }
 
@@ -118,7 +134,7 @@ fn busy_stale_and_unborn_replacement_do_not_repeat_scale_out_at_target() -> Test
         let steps = h.run();
         assert!(!steps.iter().any(|step| matches!(
             step.action,
-            Action::ScaleOut { .. } | Action::StartDrain(_) | Action::Terminate { .. }
+            Action::ScaleOut { .. } | Action::StartDrain { .. } | Action::Terminate { .. }
         )));
         assert_eq!(h.supply(X86)?.desired, 2);
     }
@@ -142,7 +158,7 @@ fn stale_busy_worker_finishes_and_live_only_demand_does_not_scale() -> TestResul
     assert!(
         steps
             .iter()
-            .any(|step| matches!(step.action, Action::StartDrain(_)))
+            .any(|step| matches!(step.action, Action::StartDrain { .. }))
     );
     Ok(())
 }
@@ -177,7 +193,7 @@ fn unknown_busy_worker_does_not_supply_queued_identity_capacity() -> TestResult 
     );
     assert!(!steps.iter().any(|step| matches!(
         step.action,
-        Action::StartDrain(_) | Action::Terminate { .. }
+        Action::StartDrain { .. } | Action::Terminate { .. }
     )));
     Ok(())
 }
@@ -195,7 +211,7 @@ fn unknown_idle_worker_retires_before_replacement() -> TestResult {
     assert!(
         first
             .iter()
-            .any(|step| matches!(step.action, Action::StartDrain(_)))
+            .any(|step| matches!(step.action, Action::StartDrain { .. }))
     );
     assert!(
         !first
@@ -210,11 +226,9 @@ fn unknown_idle_worker_retires_before_replacement() -> TestResult {
             ..
         }
     )));
-    assert!(
-        h.run()
-            .iter()
-            .any(|step| matches!(step.action, Action::ScaleOut { to: 1, .. }))
-    );
+    assert!(second.iter().any(|step| matches!(
+        step.action, Action::ScaleOut { to: 1, .. }
+    )));
     Ok(())
 }
 
@@ -234,2006 +248,1112 @@ fn unknown_busy_draining_worker_obeys_max_drain_wait() -> TestResult {
     Ok(())
 }
 
-/// Index of the spot fleet in the preference test.
-const SPOT: usize = 0;
-
-/// Index of the on-demand fleet in the preference test.
-const ONDEMAND: usize = 1;
-
-/// A second worker on `instance`, sorting after the shared test worker.
-fn renewed_worker(instance: &InstanceId) -> TestResult<WorkerId> {
-    Ok(WorkerId::try_new(format!(
-        "{}6c5e4f3a-9b1d-4e2a-8f7c-000000000002",
-        instance.worker_name()
-    ))?)
-}
-
-fn secs(n: u64) -> Duration {
-    Duration::from_secs(n)
-}
-
-fn x86_name() -> TestResult<FleetName> {
-    Ok(FleetName::try_new("gang-x86")?)
-}
-
-fn instance(name: &str) -> TestResult<InstanceId> {
-    Ok(InstanceId::try_new(name)?)
+fn serve(h: &mut Harness, name: &str, launched_ago: Duration) -> TestResult {
+    let desired = h.supply(X86)?.desired;
+    h.launch(X86, name, InstanceLifecycle::InService, launched_ago)?;
+    h.set_desired_capacity(X86, desired + 1);
+    h.connect(X86, name)
 }
 
 fn terminate(name: &str, cause: TerminationCause) -> TestResult<PlanStep> {
     Ok(PlanStep {
         fleet: X86,
-        action: Action::Terminate {
-            instance: instance(name)?,
-            cause,
-        },
+        action: Action::Terminate { instance: InstanceId::try_new(name)?, cause },
     })
 }
 
-fn cancel_drain(name: &str) -> TestResult<PlanStep> {
-    Ok(PlanStep {
-        fleet: X86,
-        action: Action::CancelDrain(worker_id(name)?, NeedCause::Demand),
+// Legacy lifecycle scenarios intentionally compare decisions, not newly added diagnostics.
+// The rate scenarios inspect ScaleDecision and CordonDecision directly.
+#[derive(Debug, PartialEq, Eq)]
+enum Change {
+    Scale(usize, u32, u32, NeedCause),
+    Withdraw(usize, u32, u32),
+    Drain(usize, String, DrainReason),
+    Cancel(usize, String, NeedCause),
+    Terminate(usize, String, TerminationCause),
+    Reinforce(usize, String),
+}
+
+fn changes(steps: &[PlanStep]) -> Vec<Change> {
+    steps
+        .iter()
+        .map(|step| match &step.action {
+            Action::ScaleOut { from, to, need, .. } => Change::Scale(step.fleet, *from, *to, *need),
+            Action::Withdraw { from, to } => Change::Withdraw(step.fleet, *from, *to),
+            Action::StartDrain { worker, reason, .. } => Change::Drain(
+                step.fleet,
+                worker.instance_name().unwrap_or(worker.as_str()).to_owned(),
+                *reason,
+            ),
+            Action::CancelDrain(worker, need) => Change::Cancel(
+                step.fleet,
+                worker.instance_name().unwrap_or(worker.as_str()).to_owned(),
+                *need,
+            ),
+            Action::Terminate { instance, cause } => {
+                Change::Terminate(step.fleet, instance.as_str().to_owned(), *cause)
+            }
+            Action::ReinforceDrain(worker) => Change::Reinforce(
+                step.fleet,
+                worker.instance_name().unwrap_or(worker.as_str()).to_owned(),
+            ),
+        })
+        .collect()
+}
+
+fn idle_world(minimum: u32, timeout: u64) -> TestResult<Workload> {
+    let mut p = fleet("gang-x86", 6, 16)?;
+    p.instances = InstanceBounds::try_new(minimum, p.instances.max())?;
+    p.idle_timeout = secs(timeout);
+    let mut scaling = settings(50)?;
+    scaling.max_cordons = 0;
+    Ok(Workload {
+        h: Harness::with_scaling(vec![p], scaling),
     })
 }
 
-/// Launches `name` in the fleet at index `fleet` in service `launched_ago` ago, raises that
-/// fleet's desired capacity to count it, and connects its idle worker.
-fn serve_in(h: &mut Harness, fleet: usize, name: &str, launched_ago: Duration) -> TestResult {
-    let desired = h.supply(fleet)?.desired;
-    h.launch(fleet, name, InstanceLifecycle::InService, launched_ago)?;
-    h.set_desired_capacity(fleet, desired + 1);
-    h.connect(fleet, name)?;
-    Ok(())
+fn renewed(old: &WorkerState, ordinal: u32) -> TestResult<WorkerState> {
+    let mut worker = old.clone();
+    worker.id = WorkerId::try_new(format!(
+        "{}6c5e4f3a-9b1d-4e2a-8f7c-{ordinal:012}",
+        old.id
+            .instance_name()
+            .ok_or("missing physical id")?
+            .to_owned()
+            + "-"
+    ))?;
+    Ok(worker)
 }
 
-/// Launches `name` in service `launched_ago` ago, raises the desired capacity to count it, and
-/// connects its idle worker.
-fn serve(h: &mut Harness, name: &str, launched_ago: Duration) -> TestResult {
-    serve_in(h, X86, name, launched_ago)
-}
-
-/// Launches `name` as a release-first instance in the fleet at index `fleet` in service
-/// `launched_ago` ago, raises that fleet's desired capacity to count it, and connects its idle
-/// worker.
-fn serve_release_first(
-    h: &mut Harness,
-    fleet: usize,
-    name: &str,
-    launched_ago: Duration,
-) -> TestResult {
-    let desired = h.supply(fleet)?.desired;
-    h.launch_release_first(fleet, name, InstanceLifecycle::InService, launched_ago)?;
-    h.set_desired_capacity(fleet, desired + 1);
-    h.connect(fleet, name)?;
-    Ok(())
-}
-
-/// The x86-64 policy with the ten-minute idle timeout that the release-order scenarios assume.
-fn ten_minute_policy() -> TestResult<FleetPolicy> {
-    let mut policy = policy()?;
-    policy.idle_timeout = Duration::from_mins(10);
-    Ok(policy)
-}
-
-/// Four serving instances, of which `local-3` and `local-4` are idle and draining. Four
-/// unmeasured actions are queued, so one instance is needed and the two draining ones are
-/// surplus.
-fn surplus_draining_fleet() -> TestResult<Harness> {
-    let mut h = Harness::new()?;
-    for name in ["local-1", "local-2", "local-3", "local-4"] {
-        serve(&mut h, name, secs(3600))?;
-    }
-    h.set_draining("local-3", true)?;
-    h.set_draining("local-4", true)?;
-    h.queue(X86, 4)?;
-    Ok(h)
-}
-
-fn scheduled_policy() -> TestResult<FleetPolicy> {
-    let mut policy = policy()?;
-    let window = scheduled_minimum(1, &Weekday::ALL[..5], "08:00", "19:00", "Europe/Paris")?;
-    policy.instances =
-        InstanceBounds::try_new(0, policy.instances.max())?.with_schedule(vec![window])?;
-    Ok(policy)
-}
-
-fn scheduled_harness(wall: &str) -> TestResult<Harness> {
-    Ok(Harness::with_policy_at(
-        scheduled_policy()?,
-        Timestamp::from_rfc3339(wall)?,
-    ))
-}
-
-fn minimum_scale_out() -> PlanStep {
-    PlanStep {
-        fleet: X86,
-        action: Action::ScaleOut {
-            from: 0,
-            to: 1,
-            need: NeedCause::Minimum,
-        },
-    }
+fn settle_low(w: &mut Workload) {
+    w.pass();
+    w.h.advance(CLIENT_REROUTE_BOUND);
+    w.pass();
 }
 
 #[test]
-fn work_equal_to_the_window_scales_out_for_demand() -> TestResult {
-    let mut h = scheduled_harness("2026-11-16T16:00:00Z")?;
-    h.queue(X86, 1)?;
+fn minimum_scales_and_rescues_before_buying_with_audited_cause() -> TestResult {
+    let mut w = idle_world(1, 600)?;
     assert_eq!(
-        h.reconcile(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::ScaleOut {
-                from: 0,
-                to: 1,
-                need: NeedCause::Demand,
-            },
-        }]
+        changes(&w.run()),
+        vec![Change::Scale(X86, 0, 1, NeedCause::Minimum)]
     );
-    Ok(())
-}
-
-#[test]
-fn min_instances_scales_out_for_the_minimum() -> TestResult {
-    let mut policy = policy()?;
-    policy.instances = InstanceBounds::try_new(1, policy.instances.max())?;
-    let mut h = Harness::with_policy(policy);
-    assert_eq!(h.reconcile(), vec![minimum_scale_out()]);
+    let events = w.h.audit_events()?;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].cause, Some(ScalingCause::Minimum));
+    assert!(
+        matches!(&events[0].kind, ScalingEventKind::ScaledOut { from: 0, to: 1, detail: Some(detail) } if !detail.is_empty())
+    );
+    w.h.launch(X86, "local-1", InstanceLifecycle::InService, secs(60))?;
+    w.h.connect(X86, "local-1")?;
+    w.h.set_draining("local-1", true)?;
     assert_eq!(
-        h.audit_events()?,
-        vec![ScalingAuditEvent {
-            at: h.clock.wall(),
-            fleet: x86_name()?,
-            kind: ScalingEventKind::ScaledOut { from: 0, to: 1 },
-            cause: Some(ScalingCause::Minimum),
-        }]
+        changes(&w.run()),
+        vec![Change::Cancel(X86, "local-1".into(), NeedCause::Minimum)]
     );
+    assert_eq!(w.h.audit_events()?[0].cause, Some(ScalingCause::Minimum));
+    assert!(w.h.snapshot.cordons.is_empty());
     Ok(())
 }
 
 #[test]
-fn min_instances_resumes_a_draining_worker_for_the_minimum() -> TestResult {
-    let mut policy = policy()?;
-    policy.instances = InstanceBounds::try_new(1, policy.instances.max())?;
-    let mut h = Harness::with_policy(policy);
-    serve(&mut h, "local-1", secs(60))?;
-    h.set_draining("local-1", true)?;
-    assert_eq!(
-        h.reconcile(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::CancelDrain(worker_id("local-1")?, NeedCause::Minimum),
-        }]
-    );
-    Ok(())
-}
-
-#[test]
-fn scheduled_minimum_scales_out_when_its_window_opens() -> TestResult {
-    let mut h = scheduled_harness("2026-11-16T06:59:00Z")?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(60));
-    assert_eq!(h.reconcile(), vec![minimum_scale_out()]);
-    Ok(())
-}
-
-#[test]
-fn a_window_keeps_an_idle_worker_until_it_closes() -> TestResult {
-    let mut h = scheduled_harness("2026-11-16T16:00:00Z")?;
-    serve(&mut h, "local-1", secs(60))?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(Duration::from_millis(7_199_999));
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(Duration::from_millis(1));
-    assert_eq!(
-        h.reconcile(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::StartDrain(worker_id("local-1")?),
-        }]
-    );
-    Ok(())
-}
-
-#[test]
-fn a_window_drains_only_the_workers_above_it() -> TestResult {
-    let mut h = scheduled_harness("2026-11-16T16:00:00Z")?;
-    h.settle_term()?;
-    serve(&mut h, "local-1", secs(60))?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(5));
-    serve(&mut h, "local-2", secs(60))?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(30));
-    assert_eq!(
-        h.reconcile(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::StartDrain(worker_id("local-1")?),
-        }]
-    );
-    Ok(())
-}
-
-#[test]
-fn work_above_the_window_scales_out_for_demand() -> TestResult {
-    let policy = scheduled_policy()?;
-    let queued = usize::try_from(policy.target_actions_per_instance.get())? + 1;
-    let mut h = Harness::with_policy_at(policy, Timestamp::from_rfc3339("2026-11-16T16:00:00Z")?);
-    h.queue(X86, queued)?;
-    assert_eq!(
-        h.reconcile(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::ScaleOut {
-                from: 0,
-                to: 2,
-                need: NeedCause::Demand,
-            },
-        }]
-    );
-    Ok(())
-}
-
-#[test]
-fn a_window_resumes_a_draining_worker() -> TestResult {
-    let mut h = scheduled_harness("2026-11-16T06:59:00Z")?;
-    serve(&mut h, "local-1", secs(60))?;
-    h.set_draining("local-1", true)?;
-    h.advance(secs(60));
-    assert_eq!(
-        h.reconcile(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::CancelDrain(worker_id("local-1")?, NeedCause::Minimum),
-        }]
-    );
-    Ok(())
-}
-
-#[test]
-fn the_window_opens_at_local_time_across_daylight_saving() -> TestResult {
-    for wall in ["2026-03-27T06:59:00Z", "2026-03-30T05:59:00Z"] {
-        let mut h = scheduled_harness(wall)?;
-        assert_eq!(h.reconcile(), Vec::new());
+fn scheduled_minimum_opens_closes_and_observes_daylight_saving() -> TestResult {
+    for start in [
+        "2026-03-27T06:59:00Z",
+        "2026-03-30T05:59:00Z",
+        "2026-11-16T06:59:00Z",
+    ] {
+        let mut p = fleet("gang-x86", 6, 16)?;
+        p.instances = InstanceBounds::try_new(0, p.instances.max())?.with_schedule(vec![
+            scheduled_minimum(1, &Weekday::ALL[..5], "08:00", "19:00", "Europe/Paris")?,
+        ])?;
+        let mut h = Harness::with_scaling(vec![p], settings(50)?);
+        h.clock = gang_clock::TestClock::new(Timestamp::from_rfc3339(start)?);
+        assert!(h.reconcile().is_empty());
         h.advance(secs(60));
-        assert_eq!(h.reconcile(), vec![minimum_scale_out()]);
+        assert_eq!(purchases(&h.run()), vec![(X86, 0, 1, NeedCause::Minimum)]);
+        h.launch(X86, "local-1", InstanceLifecycle::InService, secs(60))?;
+        h.connect(X86, "local-1")?;
+        h.reconcile();
+        h.advance(secs(11 * 3600 - 1));
+        assert!(h.reconcile().is_empty());
+        h.advance(secs(1));
+        assert_eq!(
+            changes(&h.reconcile()),
+            vec![Change::Drain(
+                X86,
+                "local-1".into(),
+                DrainReason::IdleTimeout
+            )]
+        );
     }
     Ok(())
 }
 
 #[test]
-fn the_scale_out_audit_names_the_minimum() -> TestResult {
-    let mut h = scheduled_harness("2026-11-16T06:59:00Z")?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(60));
-    assert_eq!(h.reconcile(), vec![minimum_scale_out()]);
+fn demand_equal_to_minimum_has_demand_cause_and_maximum_is_respected() -> TestResult {
+    let mut w = idle_world(1, 600)?;
+    w.queue(Some(source(1)?), X86, 1, None)?;
+    assert_eq!(purchases(&w.pass()), vec![(X86, 0, 1, NeedCause::Demand)]);
+    let mut bounded = Workload::new(4, 16, 50)?;
+    bounded.queue(Some(source(1)?), X86, 2000, Some(secs(3600)))?;
     assert_eq!(
-        h.audit_events()?,
-        vec![ScalingAuditEvent {
-            at: h.clock.wall(),
-            fleet: x86_name()?,
-            kind: ScalingEventKind::ScaledOut { from: 0, to: 1 },
-            cause: Some(ScalingCause::Minimum),
-        }]
+        purchases(&bounded.pass()),
+        vec![(X86, 0, 4, NeedCause::Demand)]
     );
     Ok(())
 }
 
 #[test]
-fn cold_scale_out_from_zero() -> TestResult {
-    let mut h = Harness::new()?;
-    h.queue(X86, 1)?;
+fn idle_timeout_drain_terminates_once_and_records_original_causes() -> TestResult {
+    let mut w = idle_world(0, 600)?;
+    w.h.settle_term()?;
+    w.serve(X86, "local-1")?;
+    assert!(w.run().is_empty());
+    w.h.advance(secs(599));
+    assert!(w.run().is_empty());
+    w.h.advance(secs(1));
     assert_eq!(
-        h.run(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::ScaleOut {
-                from: 0,
-                to: 1,
-                need: NeedCause::Demand,
-            },
-        }]
-    );
-    Ok(())
-}
-
-#[test]
-fn scale_out_is_clamped_at_max_instances() -> TestResult {
-    let mut h = Harness::new()?;
-    h.queue(X86, 100)?;
-    assert_eq!(
-        h.run(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::ScaleOut {
-                from: 0,
-                to: 4,
-                need: NeedCause::Demand,
-            },
-        }]
-    );
-    Ok(())
-}
-
-fn failed_launch_fleet() -> TestResult<Harness> {
-    let mut h = Harness::new()?;
-    for name in ["local-1", "local-2"] {
-        serve(&mut h, name, secs(3600))?;
-        h.set_running(name, 4)?;
-    }
-    h.set_desired_capacity(X86, 4);
-    h.supply_mut(X86)?.launch_failure = Some(gang_spi::LaunchFailure {
-        reason: "launch failed".to_owned(),
-    });
-    Ok(h)
-}
-
-#[test]
-fn abandoned_requests_are_withdrawn_by_the_plan() -> TestResult {
-    let mut h = failed_launch_fleet()?;
-    h.supply_mut(X86)?.launch_failure = None;
-    h.supply_mut(X86)?.abandoned = 3;
-    assert_eq!(
-        h.reconcile(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::Withdraw { from: 7, to: 4 },
-        }],
-        "abandoned requests must be withdrawn even without surplus demand"
-    );
-    Ok(())
-}
-
-#[test]
-fn abandoned_requests_are_withdrawn_in_their_own_step() -> TestResult {
-    let mut h = failed_launch_fleet()?;
-    h.supply_mut(X86)?.abandoned = 3;
-    assert_eq!(
-        h.reconcile(),
-        vec![
-            PlanStep {
-                fleet: X86,
-                action: Action::Withdraw { from: 7, to: 4 },
-            },
-            PlanStep {
-                fleet: X86,
-                action: Action::Withdraw { from: 4, to: 2 },
-            },
-        ],
-        "abandoned and failed requests have separate withdrawals"
-    );
-    Ok(())
-}
-
-#[test]
-fn abandoned_requests_are_withdrawn_before_a_scale_out() -> TestResult {
-    let mut h = Harness::new()?;
-    h.supply_mut(X86)?.abandoned = 3;
-    h.queue(X86, 1)?;
-    assert_eq!(
-        h.reconcile(),
-        vec![
-            PlanStep {
-                fleet: X86,
-                action: Action::Withdraw { from: 3, to: 0 },
-            },
-            PlanStep {
-                fleet: X86,
-                action: Action::ScaleOut {
-                    from: 0,
-                    to: 1,
-                    need: NeedCause::Demand,
-                },
-            },
-        ],
-        "abandoned requests are withdrawn before scale-out"
-    );
-    Ok(())
-}
-
-#[test]
-fn failed_launch_withdraws_surplus_unborn_capacity() -> TestResult {
-    let mut h = failed_launch_fleet()?;
-    assert_eq!(
-        h.reconcile(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::Withdraw { from: 4, to: 2 },
-        }]
-    );
-    Ok(())
-}
-
-#[test]
-fn failed_launch_withdraws_only_the_surplus() -> TestResult {
-    let mut h = failed_launch_fleet()?;
-    h.queue(X86, 4)?;
-    assert_eq!(
-        h.reconcile(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::Withdraw { from: 4, to: 3 },
-        }]
-    );
-    Ok(())
-}
-
-#[test]
-fn in_flight_launches_are_not_withdrawn() -> TestResult {
-    let mut h = failed_launch_fleet()?;
-    h.supply_mut(X86)?.launch_failure = None;
-    assert_eq!(h.reconcile(), Vec::new());
-    Ok(())
-}
-
-#[test]
-fn failed_launch_with_full_demand_keeps_request_without_repeating_scale_out() -> TestResult {
-    let mut h = failed_launch_fleet()?;
-    h.queue(X86, 8)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    Ok(())
-}
-
-/// While an action stays queued for a fleet that cannot launch, the plan keeps the fleet's request
-/// however long the action waits: nothing withdraws it, so the fleet keeps showing `can't launch`
-/// and the reason, and no timer gives up on the action. Only its client owns that deadline.
-#[test]
-fn a_queued_action_keeps_the_request_of_a_fleet_that_cannot_launch_however_long_it_waits()
--> TestResult {
-    let mut h = Harness::new()?;
-    h.queue(X86, 1)?;
-    assert_eq!(
-        h.reconcile(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::ScaleOut {
-                from: 0,
-                to: 1,
-                need: NeedCause::Demand,
-            },
-        }]
-    );
-    h.set_desired_capacity(X86, 1);
-    h.supply_mut(X86)?.launch_failure = Some(gang_spi::LaunchFailure {
-        reason: "launch failed".to_owned(),
-    });
-    for day in 1..=30 {
-        h.advance(secs(86_400));
-        assert_eq!(h.reconcile(), Vec::new(), "day {day}");
-        let outlook = h.outlook(X86)?;
-        assert_eq!(outlook.queued, 1, "day {day}");
-        assert_eq!(outlook.needed, 1, "day {day}");
-    }
-    Ok(())
-}
-
-#[test]
-fn withdraw_counts_from_the_capacity_left_after_finished_drains() -> TestResult {
-    let mut h = Harness::new()?;
-    for name in ["local-1", "local-2"] {
-        serve(&mut h, name, secs(3600))?;
-        h.set_draining(name, true)?;
-    }
-    h.set_desired_capacity(X86, 3);
-    h.supply_mut(X86)?.launch_failure = Some(gang_spi::LaunchFailure {
-        reason: "launch failed".to_owned(),
-    });
-    assert_eq!(
-        h.reconcile(),
-        vec![
-            terminate("local-1", TerminationCause::DrainFinished)?,
-            terminate("local-2", TerminationCause::DrainFinished)?,
-            PlanStep {
-                fleet: X86,
-                action: Action::Withdraw { from: 1, to: 0 },
-            },
-        ]
-    );
-    Ok(())
-}
-
-#[test]
-fn withdraw_counts_from_the_capacity_left_after_orphans() -> TestResult {
-    let mut h = Harness::new()?;
-    h.set_desired_capacity(X86, 2);
-    h.launch(X86, "local-1", InstanceLifecycle::InService, secs(3600))?;
-    h.reconcile();
-    h.advance(secs(30));
-    h.supply_mut(X86)?.launch_failure = Some(gang_spi::LaunchFailure {
-        reason: "launch failed".to_owned(),
-    });
-    assert_eq!(
-        h.reconcile(),
-        vec![
-            terminate("local-1", TerminationCause::Orphan)?,
-            PlanStep {
-                fleet: X86,
-                action: Action::Withdraw { from: 1, to: 0 },
-            },
-        ]
-    );
-    Ok(())
-}
-
-#[test]
-fn failed_launch_resumes_a_finished_drain_before_terminating_it() -> TestResult {
-    let mut h = Harness::new()?;
-    serve(&mut h, "local-1", secs(3600))?;
-    h.set_draining("local-1", true)?;
-    h.set_desired_capacity(X86, 2);
-    h.supply_mut(X86)?.launch_failure = Some(gang_spi::LaunchFailure {
-        reason: "launch failed".to_owned(),
-    });
-    h.queue(X86, 1)?;
-    assert_eq!(
-        h.reconcile(),
-        vec![
-            cancel_drain("local-1")?,
-            PlanStep {
-                fleet: X86,
-                action: Action::Withdraw { from: 2, to: 1 },
-            },
-        ]
-    );
-    Ok(())
-}
-
-#[test]
-fn failed_launch_is_withdrawn_before_surplus_workers_are_drained() -> TestResult {
-    let mut h = failed_launch_fleet()?;
-    h.settle_term()?;
-    h.set_running("local-1", 0)?;
-    h.set_running("local-2", 0)?;
-    // Observe the idle workers before their timeout starts.
-    assert_eq!(
-        h.reconcile(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::Withdraw { from: 4, to: 2 },
-        }]
-    );
-    let idle_timeout = h.passes[X86].policy.idle_timeout;
-    h.advance(idle_timeout);
-    assert_eq!(
-        h.reconcile(),
-        vec![
-            PlanStep {
-                fleet: X86,
-                action: Action::Withdraw { from: 4, to: 2 },
-            },
-            PlanStep {
-                fleet: X86,
-                action: Action::StartDrain(worker_id("local-1")?),
-            },
-            PlanStep {
-                fleet: X86,
-                action: Action::StartDrain(worker_id("local-2")?),
-            },
-        ]
-    );
-    Ok(())
-}
-
-#[test]
-fn lowering_desired_keeps_live_instances_but_not_terminating_instances() -> TestResult {
-    let mut h = Harness::new()?;
-    h.set_desired_capacity(X86, 5);
-    h.launch(X86, "local-1", InstanceLifecycle::InService, secs(1))?;
-    h.launch(X86, "local-2", InstanceLifecycle::Pending, secs(1))?;
-    h.launch(X86, "local-3", InstanceLifecycle::Terminating, secs(1))?;
-    h.set_desired_capacity(X86, 0);
-    assert_eq!(h.supply(X86)?.desired, 2);
-    Ok(())
-}
-
-#[test]
-fn failed_scale_out_then_disappearing_demand_reaches_zero() -> TestResult {
-    let mut h = Harness::new()?;
-    h.settle_term()?;
-    for name in ["local-1", "local-2"] {
-        serve(&mut h, name, secs(3600))?;
-        h.set_running(name, 4)?;
-    }
-    h.queue(X86, 8)?;
-    assert_eq!(
-        h.run(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::ScaleOut {
-                from: 2,
-                to: 4,
-                need: NeedCause::Demand,
-            },
-        }]
-    );
-    h.supply_mut(X86)?.launch_failure = Some(gang_spi::LaunchFailure {
-        reason: "launch failed".to_owned(),
-    });
-    assert_eq!(h.run(), Vec::new());
-    h.snapshot.queued.clear();
-    h.set_running("local-1", 0)?;
-    h.set_running("local-2", 0)?;
-    assert_eq!(
-        h.run(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::Withdraw { from: 4, to: 2 },
-        }]
-    );
-    let idle_timeout = h.passes[X86].policy.idle_timeout;
-    h.advance(idle_timeout);
-    assert_eq!(
-        h.run(),
-        vec![
-            PlanStep {
-                fleet: X86,
-                action: Action::StartDrain(worker_id("local-1")?),
-            },
-            PlanStep {
-                fleet: X86,
-                action: Action::StartDrain(worker_id("local-2")?),
-            },
-        ]
+        changes(&w.run()),
+        vec![Change::Drain(
+            X86,
+            "local-1".into(),
+            DrainReason::IdleTimeout
+        )]
     );
     assert_eq!(
-        h.run(),
-        vec![
-            terminate("local-1", TerminationCause::DrainFinished)?,
-            terminate("local-2", TerminationCause::DrainFinished)?,
-        ]
-    );
-    assert_eq!(h.supply(X86)?.desired, 0);
-    assert!(h.supply(X86)?.instances.is_empty());
-    assert_eq!(h.run(), Vec::new());
-    Ok(())
-}
-
-#[test]
-fn booting_instance_does_not_repeat_scale_out() -> TestResult {
-    let mut h = Harness::new()?;
-    h.queue(X86, 1)?;
-    h.run();
-    h.launch(X86, "local-1", InstanceLifecycle::Pending, secs(1))?;
-    assert_eq!(h.reconcile(), Vec::new());
-    Ok(())
-}
-
-#[test]
-fn restart_mid_scale_out_does_not_repeat_it() -> TestResult {
-    let mut h = Harness::new()?;
-    h.queue(X86, 1)?;
-    h.run();
-    h.launch(X86, "local-1", InstanceLifecycle::Pending, secs(1))?;
-    h.restart();
-    assert_eq!(h.reconcile(), Vec::new());
-    Ok(())
-}
-
-#[test]
-fn busy_unknown_queue_buys_capacity_at_boot_boundary() -> TestResult {
-    let mut h = Harness::new()?;
-    serve(&mut h, "local-1", Duration::ZERO)?;
-    h.set_running("local-1", 4)?;
-    h.queue(X86, 1)?;
-    assert_eq!(
-        h.run(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::ScaleOut {
-                from: 1,
-                to: 2,
-                need: NeedCause::Demand,
-            },
-        }]
-    );
-    let outlook = h.outlook(X86)?;
-    assert_eq!(outlook.demand.actions(), 5);
-    assert_eq!(outlook.demand.instances(&h.passes[X86].policy), 2);
-    assert_eq!(outlook.needed, 2);
-    Ok(())
-}
-
-#[test]
-fn measured_resources_drive_scale_out() -> TestResult {
-    let mut h = Harness::new()?;
-    h.queue_sized(X86, 2, x86_resources(4000))?;
-    assert_eq!(
-        h.run(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::ScaleOut {
-                from: 0,
-                to: 2,
-                need: NeedCause::Demand,
-            },
-        }]
-    );
-    Ok(())
-}
-
-#[test]
-fn draining_worker_is_not_capacity() -> TestResult {
-    let mut h = Harness::new()?;
-    serve(&mut h, "local-1", Duration::ZERO)?;
-    h.set_running("local-1", 1)?;
-    h.set_draining("local-1", true)?;
-    h.queue(X86, 9)?;
-    assert_eq!(
-        h.run(),
-        vec![
-            cancel_drain("local-1")?,
-            PlanStep {
-                fleet: X86,
-                action: Action::ScaleOut {
-                    from: 1,
-                    to: 3,
-                    need: NeedCause::Demand,
-                },
-            },
-        ]
-    );
-    Ok(())
-}
-
-#[test]
-fn demand_returning_resumes_a_draining_worker_before_scaling_out() -> TestResult {
-    let mut h = Harness::new()?;
-    serve(&mut h, "local-1", Duration::ZERO)?;
-    h.set_running("local-1", 2)?;
-    h.set_draining("local-1", true)?;
-    h.queue(X86, 1)?;
-    assert_eq!(h.run(), vec![cancel_drain("local-1")?]);
-    assert_eq!(h.reconcile(), Vec::new());
-    assert!(h.snapshot.workers.iter().all(|worker| !worker.draining));
-    Ok(())
-}
-
-#[test]
-fn a_drained_worker_is_resumed_instead_of_terminated_when_demand_returns() -> TestResult {
-    let mut h = Harness::new()?;
-    serve(&mut h, "local-1", Duration::ZERO)?;
-    h.set_draining("local-1", true)?;
-    h.queue(X86, 1)?;
-    assert_eq!(h.run(), vec![cancel_drain("local-1")?]);
-    Ok(())
-}
-
-#[test]
-fn resumes_the_busiest_draining_workers_first_then_scales_out() -> TestResult {
-    let mut h = Harness::new()?;
-    serve(&mut h, "local-1", Duration::ZERO)?;
-    serve(&mut h, "local-2", Duration::ZERO)?;
-    h.set_running("local-1", 1)?;
-    h.set_draining("local-1", true)?;
-    h.set_running("local-2", 3)?;
-    h.set_draining("local-2", true)?;
-    h.queue(X86, 9)?;
-    assert_eq!(
-        h.run(),
-        vec![
-            cancel_drain("local-2")?,
-            cancel_drain("local-1")?,
-            PlanStep {
-                fleet: X86,
-                action: Action::ScaleOut {
-                    from: 2,
-                    to: 3,
-                    need: NeedCause::Demand,
-                },
-            },
-        ]
-    );
-    Ok(())
-}
-
-#[test]
-fn resumes_only_the_shortfall_and_terminates_the_other_finished_drain() -> TestResult {
-    let mut h = Harness::new()?;
-    serve(&mut h, "local-1", Duration::ZERO)?;
-    serve(&mut h, "local-2", Duration::ZERO)?;
-    h.set_draining("local-1", true)?;
-    h.set_draining("local-2", true)?;
-    h.queue(X86, 1)?;
-    assert_eq!(
-        h.run(),
-        vec![
-            cancel_drain("local-1")?,
-            terminate("local-2", TerminationCause::DrainFinished)?
-        ]
-    );
-    Ok(())
-}
-
-#[test]
-fn resume_ties_break_by_worker_id() -> TestResult {
-    let mut h = Harness::new()?;
-    serve(&mut h, "local-2", Duration::ZERO)?;
-    serve(&mut h, "local-1", Duration::ZERO)?;
-    h.set_running("local-2", 1)?;
-    h.set_running("local-1", 1)?;
-    h.set_draining("local-2", true)?;
-    h.set_draining("local-1", true)?;
-    h.queue(X86, 1)?;
-    assert_eq!(h.run(), vec![cancel_drain("local-1")?]);
-    Ok(())
-}
-
-#[test]
-fn draining_workers_are_not_resumed_without_demand() -> TestResult {
-    let mut h = Harness::new()?;
-    serve(&mut h, "local-1", Duration::ZERO)?;
-    h.set_running("local-1", 1)?;
-    h.set_draining("local-1", true)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    Ok(())
-}
-
-#[test]
-fn a_renewed_worker_keeps_its_instance_while_the_drained_old_one_lingers() -> TestResult {
-    let mut h = Harness::new()?;
-    serve(&mut h, "local-1", secs(3600))?;
-    h.set_draining("local-1", true)?;
-    let mut renewed = h.snapshot.workers[0].clone();
-    renewed.id = renewed_worker(&instance("local-1")?)?;
-    renewed.draining = false;
-    renewed.running_actions = 2;
-    renewed.last_seen = h.clock.wall();
-    h.snapshot.workers.push(renewed);
-
-    assert_eq!(h.reconcile(), Vec::new());
-    Ok(())
-}
-
-#[test]
-fn an_instance_drains_only_when_all_its_workers_drain() -> TestResult {
-    let mut h = Harness::new()?;
-    serve(&mut h, "local-1", secs(3600))?;
-    h.set_draining("local-1", true)?;
-    let mut renewed = h.snapshot.workers[0].clone();
-    renewed.id = renewed_worker(&instance("local-1")?)?;
-    renewed.running_actions = 1;
-    h.snapshot.workers.push(renewed);
-
-    assert_eq!(h.reconcile(), Vec::new());
-    h.snapshot.workers[1].running_actions = 0;
-    assert_eq!(
-        h.reconcile(),
-        vec![terminate("local-1", TerminationCause::DrainFinished)?]
-    );
-    Ok(())
-}
-
-#[test]
-fn an_idle_instance_with_two_connections_drains_its_newest_worker() -> TestResult {
-    let mut h = Harness::new()?;
-    h.settle_term()?;
-    serve(&mut h, "local-1", secs(3600))?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(1));
-    let mut renewed = h.snapshot.workers[0].clone();
-    renewed.id = renewed_worker(&instance("local-1")?)?;
-    renewed.last_seen = h.clock.wall();
-    let newest = renewed.id.clone();
-    h.snapshot.workers.push(renewed);
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(15));
-    assert_eq!(
-        h.reconcile(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::StartDrain(newest),
-        }]
-    );
-    Ok(())
-}
-
-#[test]
-fn idle_worker_drains_after_idle_timeout_then_terminates_once_drained() -> TestResult {
-    let mut h = Harness::new()?;
-    h.settle_term()?;
-    serve(&mut h, "local-1", secs(60))?;
-    assert_eq!(h.run(), Vec::new());
-    h.advance(secs(14));
-    assert_eq!(h.run(), Vec::new());
-    h.advance(secs(1));
-    assert_eq!(
-        h.run(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::StartDrain(worker_id("local-1")?),
-        }]
+        w.h.audit_events()?[0].cause,
+        Some(ScalingCause::IdleTimeout)
     );
     assert_eq!(
-        h.run(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::Terminate {
-                instance: instance("local-1")?,
-                cause: TerminationCause::DrainFinished,
-            },
-        }]
+        changes(&w.run()),
+        vec![Change::Terminate(
+            X86,
+            "local-1".into(),
+            TerminationCause::DrainFinished
+        )]
     );
-    assert_eq!(h.supply(X86)?.desired, 0);
-    assert!(h.supply(X86)?.instances.is_empty());
-    assert_eq!(h.reconcile(), Vec::new());
-    Ok(())
-}
-
-/// A new leader cannot see the demand queued on the leader it replaced until that leader's
-/// clients detect the loss through their keepalive and resubmit. Until then it drains no idle
-/// worker as surplus, even one idle for longer than `idle_timeout`, so the capacity its
-/// predecessor raised for that demand still serves it once it arrives.
-#[test]
-fn a_new_leader_drains_no_idle_worker_before_lost_demand_can_reroute() -> TestResult {
-    let mut policy = policy()?;
-    policy.instances = InstanceBounds::try_new(1, NonZeroU32::MIN.saturating_add(1))?;
-    let demand = 2 * usize::try_from(policy.target_actions_per_instance.get())?;
-    assert!(policy.idle_timeout < CLIENT_REROUTE_BOUND);
-    let mut h = Harness::with_policy(policy);
-    // The previous leader scaled out to two for queued demand; the second instance is not listed.
-    serve(&mut h, "local-1", secs(3600))?;
-    h.set_desired_capacity(X86, 2);
-
-    assert_eq!(h.run(), Vec::new());
-    h.advance(CLIENT_REROUTE_BOUND.saturating_sub(Duration::from_millis(1)));
-    assert_eq!(h.run(), Vec::new());
-    h.queue(X86, demand)?;
-    assert_eq!(h.run(), Vec::new());
-    assert_eq!(h.supply(X86)?.desired, 2);
-    Ok(())
-}
-
-/// A restarted reconciler leads a new term: it again starts no drain until the demand of the
-/// leader it replaced can have rerouted, then drains an idle surplus worker as usual.
-#[test]
-fn a_new_term_drains_an_idle_worker_only_once_lost_demand_can_have_rerouted() -> TestResult {
-    let mut h = Harness::new()?;
-    h.settle_term()?;
-    serve(&mut h, "local-1", secs(60))?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.restart();
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(CLIENT_REROUTE_BOUND.saturating_sub(Duration::from_millis(1)));
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(Duration::from_millis(1));
     assert_eq!(
-        h.reconcile(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::StartDrain(worker_id("local-1")?),
-        }]
+        w.h.audit_events()?[0].cause,
+        Some(ScalingCause::DrainFinished)
     );
+    assert_eq!(w.h.supply(X86)?.desired, 0);
+    assert!(w.run().is_empty());
     Ok(())
 }
 
 #[test]
-fn busy_worker_resets_its_idle_timer() -> TestResult {
-    let mut h = Harness::new()?;
-    h.settle_term()?;
-    serve(&mut h, "local-1", secs(60))?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(10));
-    h.set_running("local-1", 1)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.set_running("local-1", 0)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(14));
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(1));
-    assert_eq!(
-        h.reconcile(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::StartDrain(worker_id("local-1")?),
-        }]
-    );
-    Ok(())
-}
-
-#[test]
-fn min_instances_keeps_an_idle_worker() -> TestResult {
-    let mut policy: FleetPolicy = policy()?;
-    policy.instances = InstanceBounds::try_new(1, policy.instances.max())?;
-    let mut h = Harness::with_policy(policy);
-    serve(&mut h, "local-1", secs(60))?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(Duration::from_hours(1));
-    assert_eq!(h.reconcile(), Vec::new());
-    Ok(())
-}
-
-#[test]
-fn drain_waits_for_running_actions_until_max_drain_wait() -> TestResult {
-    let mut h = Harness::new()?;
-    serve(&mut h, "local-1", secs(60))?;
-    h.set_running("local-1", 2)?;
-    h.set_draining("local-1", true)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(59));
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(1));
-    assert_eq!(
-        h.reconcile(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::Terminate {
-                instance: instance("local-1")?,
-                cause: TerminationCause::MaxDrainWait,
-            },
-        }]
-    );
-    Ok(())
-}
-
-#[test]
-fn drain_ends_when_actions_finish() -> TestResult {
-    let mut h = Harness::new()?;
-    serve(&mut h, "local-1", secs(60))?;
-    h.set_running("local-1", 2)?;
-    h.set_draining("local-1", true)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.set_running("local-1", 0)?;
-    assert_eq!(
-        h.reconcile(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::Terminate {
-                instance: instance("local-1")?,
-                cause: TerminationCause::DrainFinished,
-            },
-        }]
-    );
-    Ok(())
-}
-
-#[test]
-fn restart_mid_drain_resumes_from_the_drain_flag() -> TestResult {
-    let mut h = Harness::new()?;
-    serve(&mut h, "local-1", Duration::ZERO)?;
-    h.set_running("local-1", 1)?;
-    h.set_draining("local-1", true)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.restart();
-    assert_eq!(h.reconcile(), Vec::new());
-    h.set_running("local-1", 0)?;
-    assert_eq!(
-        h.reconcile(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::Terminate {
-                instance: instance("local-1")?,
-                cause: TerminationCause::DrainFinished,
-            },
-        }]
-    );
-    Ok(())
-}
-
-#[test]
-fn restart_mid_drain_restarts_the_drain_wait() -> TestResult {
-    let mut h = Harness::new()?;
-    serve(&mut h, "local-1", Duration::ZERO)?;
-    h.set_running("local-1", 1)?;
-    h.set_draining("local-1", true)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(30));
-    h.restart();
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(59));
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(1));
-    assert_eq!(
-        h.reconcile(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::Terminate {
-                instance: instance("local-1")?,
-                cause: TerminationCause::MaxDrainWait,
-            },
-        }]
-    );
-    Ok(())
-}
-
-#[test]
-fn restart_restarts_idle_timers() -> TestResult {
-    let mut h = Harness::with_policy(ten_minute_policy()?);
-    serve(&mut h, "local-1", Duration::ZERO)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(9 * 60));
-    assert_eq!(h.reconcile(), Vec::new());
-    h.restart();
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(9 * 60));
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(60));
-    assert_eq!(
-        h.reconcile(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::StartDrain(worker_id("local-1")?),
-        }]
-    );
-    Ok(())
-}
-
-#[test]
-fn worker_that_disconnects_restarts_its_idle_timer() -> TestResult {
-    let mut h = Harness::new()?;
-    h.settle_term()?;
-    serve(&mut h, "local-1", Duration::ZERO)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(14));
-    assert_eq!(h.reconcile(), Vec::new());
-    h.disconnect("local-1")?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.connect(X86, "local-1")?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(14));
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(1));
-    assert_eq!(
-        h.reconcile(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::StartDrain(worker_id("local-1")?),
-        }]
-    );
-    Ok(())
-}
-
-#[test]
-fn booting_instance_is_not_an_orphan_within_boot_grace() -> TestResult {
-    let mut h = Harness::new()?;
-    h.set_desired_capacity(X86, 1);
-    h.launch(X86, "local-1", InstanceLifecycle::Pending, secs(10))?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(19));
-    assert_eq!(h.reconcile(), Vec::new());
-    Ok(())
-}
-
-#[test]
-fn orphan_instance_is_terminated_after_boot_grace() -> TestResult {
-    let mut h = Harness::new()?;
-    h.set_desired_capacity(X86, 1);
-    h.launch(X86, "local-1", InstanceLifecycle::InService, secs(30))?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(29));
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(1));
-    assert_eq!(
-        h.run(),
-        vec![terminate("local-1", TerminationCause::Orphan)?]
-    );
-    assert_eq!(h.supply(X86)?.desired, 0);
-    Ok(())
-}
-
-#[test]
-fn orphan_is_terminated_before_the_same_pass_scales_out() -> TestResult {
-    let mut h = Harness::new()?;
-    h.set_desired_capacity(X86, 2);
-    h.launch(X86, "local-1", InstanceLifecycle::InService, secs(3600))?;
-    h.launch(X86, "local-2", InstanceLifecycle::InService, secs(3600))?;
-    h.connect(X86, "local-2")?;
-    h.set_running("local-2", 4)?;
-    h.queue(X86, 1)?;
-    h.reconcile();
-    h.advance(secs(30));
-    assert_eq!(
-        h.reconcile(),
-        vec![
-            terminate("local-1", TerminationCause::Orphan)?,
-            PlanStep {
-                fleet: X86,
-                action: Action::ScaleOut {
-                    from: 1,
-                    to: 2,
-                    need: NeedCause::Demand,
-                },
-            },
-        ]
-    );
-    Ok(())
-}
-
-#[test]
-fn pending_instance_is_never_an_orphan_however_long_it_waits() -> TestResult {
-    let mut h = Harness::new()?;
-    h.set_desired_capacity(X86, 1);
-    h.queue(X86, 1)?;
-    h.launch(
-        X86,
-        "local-1",
-        InstanceLifecycle::Pending,
-        Duration::from_hours(1),
-    )?;
-    for _ in 0..5 {
-        assert_eq!(h.reconcile(), Vec::new());
-        h.advance(secs(60));
-    }
-    assert_eq!(h.supply(X86)?.desired, 1);
-    Ok(())
-}
-
-#[test]
-fn a_long_pending_instance_gets_its_boot_grace_once_in_service() -> TestResult {
-    let mut h = Harness::new()?;
-    h.set_desired_capacity(X86, 1);
-    h.launch(X86, "local-1", InstanceLifecycle::Pending, secs(3600))?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(60));
-    assert_eq!(h.reconcile(), Vec::new());
-    h.set_lifecycle(X86, "local-1", InstanceLifecycle::InService, secs(3660))?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(30));
-    assert_eq!(
-        h.reconcile(),
-        vec![terminate("local-1", TerminationCause::Orphan)?]
-    );
-    Ok(())
-}
-
-#[test]
-fn fleets_sharing_an_instance_id_keep_separate_timers() -> TestResult {
-    let mut h = Harness::with_fleets(vec![policy()?, policy_named("gang-arm", Isa::Aarch64)?]);
-    serve_in(&mut h, X86, "local-1", secs(3600))?;
-    h.set_running("local-1", 1)?;
-    h.set_desired_capacity(ARM, 1);
-    h.launch(ARM, "local-1", InstanceLifecycle::InService, secs(3600))?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(30));
-    let mut step = terminate("local-1", TerminationCause::Orphan)?;
-    step.fleet = ARM;
-    assert_eq!(h.reconcile(), vec![step]);
-    Ok(())
-}
-
-#[test]
-fn pending_instance_is_terminated_only_after_boot_grace_from_when_it_starts_running() -> TestResult
-{
-    let mut h = Harness::new()?;
-    h.set_desired_capacity(X86, 1);
-    h.launch(
-        X86,
-        "local-1",
-        InstanceLifecycle::Pending,
-        Duration::from_hours(1),
-    )?;
-    h.advance(secs(60));
-    assert_eq!(h.reconcile(), Vec::new());
-    h.set_lifecycle(X86, "local-1", InstanceLifecycle::InService, Duration::ZERO)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(29));
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(1));
-    assert_eq!(
-        h.run(),
-        vec![terminate("local-1", TerminationCause::Orphan)?]
-    );
-    assert_eq!(h.supply(X86)?.desired, 0);
-    Ok(())
-}
-
-#[test]
-fn long_running_instance_that_loses_its_worker_is_not_an_orphan_at_once() -> TestResult {
-    let mut h = Harness::new()?;
-    serve(&mut h, "local-1", secs(3600))?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.disconnect("local-1")?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(29));
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(1));
-    assert_eq!(
-        h.reconcile(),
-        vec![terminate("local-1", TerminationCause::Orphan)?]
-    );
-    Ok(())
-}
-
-#[test]
-fn restart_with_an_empty_snapshot_does_not_orphan_long_running_instances() -> TestResult {
-    let mut h = Harness::new()?;
-    serve(&mut h, "local-1", secs(3600))?;
-    h.disconnect("local-1")?;
-    h.restart();
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(29));
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(1));
-    assert_eq!(
-        h.reconcile(),
-        vec![terminate("local-1", TerminationCause::Orphan)?]
-    );
-    Ok(())
-}
-
-#[test]
-fn an_ordered_termination_is_not_repeated_or_recounted_while_the_provisioner_lags() -> TestResult {
-    let mut h = surplus_draining_fleet()?;
-    assert_eq!(
-        h.reconcile(),
-        vec![
-            terminate("local-3", TerminationCause::DrainFinished)?,
-            terminate("local-4", TerminationCause::DrainFinished)?,
-        ]
-    );
-    // The provisioner has not applied the terminations: it still lists both instances and its
-    // desired capacity is unchanged.
-    assert_eq!(h.reconcile(), Vec::new());
-    Ok(())
-}
-
-#[test]
-fn an_ordered_termination_does_not_drain_below_min_instances() -> TestResult {
-    let mut policy: FleetPolicy = policy()?;
-    policy.instances = InstanceBounds::try_new(1, policy.instances.max())?;
-    let idle_timeout = policy.idle_timeout;
-    let mut h = Harness::with_policy(policy);
-    serve(&mut h, "local-1", secs(3600))?;
-    serve(&mut h, "local-2", secs(3600))?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(idle_timeout);
-    h.set_draining("local-2", true)?;
-    assert_eq!(
-        h.reconcile(),
-        vec![terminate("local-2", TerminationCause::DrainFinished)?]
-    );
-    assert_eq!(h.reconcile(), Vec::new());
-    Ok(())
-}
-
-#[test]
-fn an_ordered_termination_does_not_hide_a_needed_scale_out() -> TestResult {
-    let mut policy: FleetPolicy = policy()?;
-    policy.instances = InstanceBounds::try_new(1, policy.instances.max())?;
-    let idle_timeout = policy.idle_timeout;
-    let queued = usize::try_from(policy.target_actions_per_instance.get())? + 1;
-    let mut h = Harness::with_policy(policy);
-    serve(&mut h, "local-1", secs(3600))?;
-    serve(&mut h, "local-2", secs(3600))?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(idle_timeout);
-    h.set_draining("local-2", true)?;
-    assert_eq!(
-        h.reconcile(),
-        vec![terminate("local-2", TerminationCause::DrainFinished)?]
-    );
-    h.queue(X86, queued)?;
-    assert_eq!(
-        h.reconcile(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::ScaleOut {
-                from: 1,
-                to: 2,
-                need: NeedCause::Demand,
-            },
-        }]
-    );
-    Ok(())
-}
-
-#[test]
-/// The order counts as lost once `boot_grace` has passed, so it is issued again.
-fn a_lost_termination_order_is_issued_again_after_boot_grace() -> TestResult {
-    let mut h = surplus_draining_fleet()?;
-    h.set_running("local-1", 1)?;
-    h.set_running("local-2", 1)?;
-    assert_eq!(
-        h.reconcile(),
-        vec![
-            terminate("local-3", TerminationCause::DrainFinished)?,
-            terminate("local-4", TerminationCause::DrainFinished)?,
-        ]
-    );
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(29));
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(1));
-    assert_eq!(
-        h.reconcile(),
-        vec![
-            terminate("local-3", TerminationCause::DrainFinished)?,
-            terminate("local-4", TerminationCause::DrainFinished)?,
-        ]
-    );
-    Ok(())
-}
-
-#[test]
-fn a_withdrawn_termination_order_is_issued_again_at_once() -> TestResult {
-    let mut h = Harness::new()?;
-    h.set_desired_capacity(X86, 1);
-    h.launch(X86, "local-1", InstanceLifecycle::InService, secs(3600))?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(30));
-    assert_eq!(
-        h.reconcile(),
-        vec![terminate("local-1", TerminationCause::Orphan)?]
-    );
-    assert_eq!(h.reconcile(), Vec::new());
-    h.reconciler.forget_order(X86, &instance("local-1")?);
-    assert_eq!(
-        h.reconcile(),
-        vec![terminate("local-1", TerminationCause::Orphan)?]
-    );
-    Ok(())
-}
-
-#[test]
-fn terminating_instances_are_forgotten_after_an_order() -> TestResult {
-    let mut h = surplus_draining_fleet()?;
-    assert_eq!(
-        h.reconcile(),
-        vec![
-            terminate("local-3", TerminationCause::DrainFinished)?,
-            terminate("local-4", TerminationCause::DrainFinished)?,
-        ]
-    );
-    let supply = h.supply_mut(X86)?;
-    let ordered = [instance("local-3")?, instance("local-4")?];
-    for entry in &mut supply.instances {
-        if ordered.contains(&entry.id) {
-            entry.lifecycle = InstanceLifecycle::Terminating;
+fn activity_disconnect_and_new_term_restart_idle_timer() -> TestResult {
+    for reset in ["busy", "disconnect", "term"] {
+        let mut w = idle_world(0, 600)?;
+        w.h.settle_term()?;
+        w.serve(X86, "local-1")?;
+        w.pass();
+        w.h.advance(secs(599));
+        match reset {
+            "busy" => {
+                w.running("local-1", 1, None, Duration::ZERO, None)?;
+                w.pass();
+                w.running("local-1", 0, None, Duration::ZERO, None)?;
+            }
+            "disconnect" => {
+                w.h.disconnect("local-1")?;
+                w.pass();
+                w.h.connect(X86, "local-1")?;
+            }
+            _ => w.h.restart(),
         }
+        assert!(w.pass().is_empty());
+        w.h.advance(secs(599));
+        assert!(w.pass().is_empty());
+        w.h.advance(secs(1));
+        assert!(w.pass().iter().any(|step| matches!(
+            step.action,
+            Action::StartDrain {
+                reason: DrainReason::IdleTimeout,
+                ..
+            }
+        )));
     }
-    h.set_desired_capacity(X86, 2);
-    h.set_running("local-1", 1)?;
-    h.set_running("local-2", 1)?;
-    h.advance(secs(31));
-    assert_eq!(h.reconcile(), Vec::new());
     Ok(())
 }
 
 #[test]
-fn terminating_instances_are_left_alone() -> TestResult {
-    let mut h = Harness::new()?;
-    h.launch(X86, "local-1", InstanceLifecycle::Terminating, secs(3600))?;
-    assert_eq!(h.reconcile(), Vec::new());
+fn term_settle_protects_previous_leaders_unseen_demand() -> TestResult {
+    let mut w = idle_world(1, 15)?;
+    w.serve(X86, "local-1")?;
+    w.h.set_desired_capacity(X86, 2);
+    assert!(w.run().is_empty());
+    w.h.advance(CLIENT_REROUTE_BOUND.saturating_sub(Duration::from_millis(1)));
+    assert!(w.run().is_empty());
+    w.queue(Some(source(1)?), X86, 32, None)?;
+    assert!(
+        w.run()
+            .iter()
+            .all(|step| !matches!(step.action, Action::StartDrain { .. }))
+    );
+    assert_eq!(w.h.supply(X86)?.desired, 2);
     Ok(())
 }
 
 #[test]
-fn drains_longest_idle_first_up_to_the_excess() -> TestResult {
-    let mut policy: FleetPolicy = policy()?;
-    policy.instances = InstanceBounds::try_new(1, policy.instances.max())?;
-    let mut h = Harness::with_policy(policy);
-    h.settle_term()?;
-    serve(&mut h, "local-1", Duration::ZERO)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(5));
-    serve(&mut h, "local-2", Duration::ZERO)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(5));
-    serve(&mut h, "local-3", Duration::ZERO)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(15));
+fn busy_owned_drain_finishes_or_times_out_and_term_replacement_keeps_intent() -> TestResult {
+    for (finish, restart) in [(true, false), (false, false), (true, true), (false, true)] {
+        let mut w = idle_world(0, 600)?;
+        w.h.passes[X86].policy.max_drain_wait = secs(60);
+        w.serve(X86, "local-1")?;
+        // A sole busy cordon must be resumed by the waterline rule. Keep one
+        // healthy instance so this case isolates completion/max-drain lifetime.
+        w.serve(X86, "local-2")?;
+        w.running(
+            "local-1",
+            2,
+            Some(source(1)?),
+            Duration::ZERO,
+            Some(secs(600)),
+        )?;
+        w.h.set_draining("local-1", true)?;
+        assert!(w.pass().is_empty());
+        if restart {
+            w.h.advance(secs(30));
+            w.h.restart();
+            w.pass();
+        }
+        w.h.advance(secs(59));
+        assert!(w.pass().is_empty());
+        if finish {
+            w.running("local-1", 0, Some(source(1)?), Duration::ZERO, None)?;
+        }
+        w.h.advance(secs(1));
+        let cause = if finish {
+            TerminationCause::DrainFinished
+        } else {
+            TerminationCause::MaxDrainWait
+        };
+        assert_eq!(
+            changes(&w.pass()),
+            vec![Change::Terminate(X86, "local-1".into(), cause)]
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn orphan_grace_starts_on_observed_inservice_or_disconnect_not_launch() -> TestResult {
+    for from_pending in [false, true] {
+        let mut w = idle_world(0, 600)?;
+        w.h.passes[X86].policy.boot_grace = secs(30);
+        w.h.set_desired_capacity(X86, 1);
+        if from_pending {
+            w.h.launch(X86, "local-1", InstanceLifecycle::Pending, secs(3600))?;
+            w.pass();
+            w.h.advance(secs(600));
+            assert!(w.pass().is_empty());
+            w.h.set_lifecycle(X86, "local-1", InstanceLifecycle::InService, secs(4200))?;
+        } else {
+            w.h.launch(X86, "local-1", InstanceLifecycle::InService, secs(3600))?;
+            w.h.connect(X86, "local-1")?;
+            w.pass();
+            w.h.disconnect("local-1")?;
+        }
+        assert!(w.pass().is_empty());
+        w.h.advance(secs(29));
+        assert!(w.pass().is_empty());
+        w.h.advance(secs(1));
+        assert_eq!(
+            changes(&w.run()),
+            vec![Change::Terminate(
+                X86,
+                "local-1".into(),
+                TerminationCause::Orphan
+            )]
+        );
+        assert!(w.h.supply(X86)?.instances.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn pending_and_terminating_members_are_not_orphans() -> TestResult {
+    let mut w = idle_world(0, 600)?;
+    w.h.set_desired_capacity(X86, 1);
+    w.h.launch(X86, "local-1", InstanceLifecycle::Pending, secs(7200))?;
+    w.h.launch(X86, "local-2", InstanceLifecycle::Terminating, secs(7200))?;
+    for _ in 0..5 {
+        assert!(w.pass().is_empty());
+        w.h.advance(secs(600));
+    }
+    Ok(())
+}
+
+#[test]
+fn ordered_termination_not_repeated_recounted_or_kept_after_forget() -> TestResult {
+    let mut w = idle_world(0, 600)?;
+    w.serve(X86, "local-1")?;
+    w.h.set_draining("local-1", true)?;
+    let expected = vec![Change::Terminate(
+        X86,
+        "local-1".into(),
+        TerminationCause::DrainFinished,
+    )];
+    assert_eq!(changes(&w.pass()), expected);
+    assert!(
+        w.pass().is_empty(),
+        "eventually consistent census still lists the ordered host"
+    );
+    w.h.reconciler
+        .forget_order(X86, &InstanceId::try_new("local-1")?);
+    assert_eq!(changes(&w.pass()), expected);
+    w.h.advance(secs(600));
     assert_eq!(
-        h.reconcile(),
+        changes(&w.pass()),
+        expected,
+        "a lost order expires at boot_grace"
+    );
+    Ok(())
+}
+
+#[test]
+fn failed_unborn_withdraws_cancelled_burst_with_and_without_serving_worker() -> TestResult {
+    for serving in [0, 1] {
+        let mut w = idle_world(0, 600)?;
+        if serving == 1 {
+            w.serve(X86, "local-1")?;
+        }
+        w.h.set_desired_capacity(X86, 6);
+        w.h.supply_mut(X86)?.launch_failure = Some(gang_spi::LaunchFailure {
+            reason: "Spot capacity".into(),
+        });
+        assert_eq!(changes(&w.pass()), vec![Change::Withdraw(X86, 6, serving)]);
+    }
+    Ok(())
+}
+
+#[test]
+fn failed_unborn_surplus_is_withdrawn_even_when_usable_is_below_needed() -> TestResult {
+    let mut w = Workload::new(6, 16, 50)?;
+    w.learn_profile(source(1)?, secs(1800))?;
+    w.serve(X86, "local-1")?;
+    w.running(
+        "local-1",
+        16,
+        Some(source(1)?),
+        Duration::ZERO,
+        Some(secs(30)),
+    )?;
+    w.h.set_desired_capacity(X86, 6);
+    w.h.supply_mut(X86)?.launch_failure = Some(gang_spi::LaunchFailure {
+        reason: "Spot capacity".into(),
+    });
+    w.queue(Some(source(1)?), X86, 32, None)?;
+    assert_eq!(w.h.supply(X86)?.desired, 6);
+    assert_eq!(changes(&w.pass()), vec![Change::Withdraw(X86, 6, 3)]);
+    assert_eq!(w.h.outlook(X86)?.needed, 3);
+    Ok(())
+}
+
+#[test]
+fn spot_abandoned_withdrawal_precedes_exact_twin_raise() -> TestResult {
+    let mut w = Workload {
+        h: Harness::with_scaling(
+            vec![fleet("gang-spot", 2, 1)?, fleet("gang-twin", 4, 1)?],
+            settings(50)?,
+        ),
+    };
+    w.learn_profile(source(1)?, secs(1800))?;
+    w.h.supply_mut(0)?.abandoned = 3;
+    w.h.queue_candidates(FleetSet::prefix(2)?, 3);
+    for row in &mut w.h.snapshot.queued {
+        row.source = Some(source(1)?);
+        row.expected = Some(secs(3600));
+    }
+    assert_eq!(
+        changes(&w.pass()),
         vec![
-            PlanStep {
-                fleet: X86,
-                action: Action::StartDrain(worker_id("local-1")?),
-            },
-            PlanStep {
-                fleet: X86,
-                action: Action::StartDrain(worker_id("local-2")?),
-            },
+            Change::Withdraw(0, 3, 0),
+            Change::Scale(0, 0, 2, NeedCause::Demand),
+            Change::Scale(1, 0, 1, NeedCause::Demand)
         ]
     );
     Ok(())
 }
 
 #[test]
-fn surplus_drain_ties_break_by_worker_id() -> TestResult {
-    let mut h = Harness::new()?;
-    h.settle_term()?;
-    serve(&mut h, "local-3", Duration::ZERO)?;
-    serve(&mut h, "local-1", Duration::ZERO)?;
-    h.queue(X86, 1)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(16));
+fn failed_launch_request_is_not_repeated_or_abandoned_by_a_timer() -> TestResult {
+    let mut w = Workload::new(6, 16, 50)?;
+    w.queue(Some(source(1)?), X86, 1, None)?;
+    assert_eq!(purchases(&w.run()), vec![(X86, 0, 1, NeedCause::Demand)]);
+    w.h.supply_mut(X86)?.launch_failure = Some(gang_spi::LaunchFailure {
+        reason: "capacity".into(),
+    });
+    for _ in 0..30 {
+        w.h.advance(secs(86400));
+        assert!(w.pass().is_empty());
+        assert_eq!(w.h.outlook(X86)?.needed, 1);
+    }
+    Ok(())
+}
+
+#[test]
+fn busy_drains_rescue_before_purchase_and_cancel_suppresses_withdraw() -> TestResult {
+    let mut w = Workload::new(6, 16, 50)?;
+    w.learn_profile(source(1)?, secs(1800))?;
+    for (name, running) in [("local-1", 1), ("local-2", 3)] {
+        w.serve(X86, name)?;
+        w.running(
+            name,
+            running,
+            Some(source(1)?),
+            Duration::ZERO,
+            Some(secs(600)),
+        )?;
+        w.h.set_draining(name, true)?;
+    }
+    w.h.set_desired_capacity(X86, 4);
+    w.h.supply_mut(X86)?.launch_failure = Some(gang_spi::LaunchFailure {
+        reason: "capacity".into(),
+    });
+    w.queue(Some(source(1)?), X86, 48, None)?;
+    let decisions = changes(&w.run());
     assert_eq!(
-        h.reconcile(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::StartDrain(worker_id("local-1")?),
-        }]
+        decisions.first(),
+        Some(&Change::Cancel(X86, "local-2".into(), NeedCause::Demand))
+    );
+    assert!(decisions.contains(&Change::Cancel(X86, "local-1".into(), NeedCause::Demand)));
+    assert!(
+        !decisions
+            .iter()
+            .any(|change| matches!(change, Change::Withdraw(..) | Change::Drain(..)))
     );
     Ok(())
 }
 
 #[test]
-fn fleets_are_independent_per_isa() -> TestResult {
-    let mut h = Harness::with_fleets(vec![policy()?, policy_named("gang-arm", Isa::Aarch64)?]);
-    h.queue(ARM, 1)?;
+fn empty_drain_is_rescued_for_ordinary_demand_not_waterline_alone() -> TestResult {
+    let mut w = idle_world(0, 600)?;
+    w.serve(X86, "local-1")?;
+    w.h.set_draining("local-1", true)?;
+    w.queue(Some(source(1)?), X86, 1, None)?;
     assert_eq!(
-        h.run(),
-        vec![PlanStep {
-            fleet: ARM,
-            action: Action::ScaleOut {
-                from: 0,
-                to: 1,
-                need: NeedCause::Demand,
-            },
-        }]
+        changes(&w.run()),
+        vec![Change::Cancel(X86, "local-1".into(), NeedCause::Demand)]
     );
-    assert_eq!(h.supply(X86)?.desired, 0);
-    Ok(())
-}
-
-#[test]
-fn demand_for_an_unconfigured_isa_is_ignored() -> TestResult {
-    let mut h = Harness::new()?;
-    h.queue(ARM, 1)?;
-    assert_eq!(h.run(), Vec::new());
-    Ok(())
-}
-
-#[test]
-fn audit_events_record_scale_out() -> TestResult {
-    let mut h = Harness::new()?;
-    h.queue(X86, 1)?;
-    h.run();
-    let events: Vec<ScalingAuditEvent> = h.audit_events()?;
+    w.h.snapshot.queued.clear();
+    w.h.set_draining("local-1", true)?;
     assert_eq!(
-        events,
-        vec![ScalingAuditEvent {
-            at: h.clock.wall(),
-            fleet: x86_name()?,
-            kind: ScalingEventKind::ScaledOut { from: 0, to: 1 },
-            cause: Some(ScalingCause::Demand),
-        }]
+        changes(&w.pass()),
+        vec![Change::Terminate(
+            X86,
+            "local-1".into(),
+            TerminationCause::DrainFinished
+        )]
     );
     Ok(())
 }
 
 #[test]
-fn audit_events_record_drain_start() -> TestResult {
-    let mut h = Harness::new()?;
-    h.settle_term()?;
-    serve(&mut h, "local-1", secs(60))?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(15));
-    h.reconcile();
-    let events: Vec<ScalingAuditEvent> = h.audit_events()?;
-    assert_eq!(
-        events,
-        vec![ScalingAuditEvent {
-            at: h.clock.wall(),
-            fleet: x86_name()?,
-            kind: ScalingEventKind::DrainStarted {
-                worker: worker_id("local-1")?,
-            },
-            cause: Some(ScalingCause::IdleTimeout),
-        }]
-    );
+fn resume_order_prefers_non_release_first_then_running_then_worker_id() -> TestResult {
+    let mut w = idle_world(1, 600)?;
+    for name in ["local-2", "local-1"] {
+        w.serve(X86, name)?;
+        w.h.set_draining(name, true)?;
+    }
+    w.h.supply_mut(X86)?.instances[1].release_first = true;
+    let steps = changes(&w.run());
+    assert!(steps.contains(&Change::Cancel(X86, "local-2".into(), NeedCause::Minimum)));
+    assert!(!steps.contains(&Change::Cancel(X86, "local-1".into(), NeedCause::Minimum)));
     Ok(())
 }
 
 #[test]
-fn audit_events_record_termination() -> TestResult {
-    let mut h = Harness::new()?;
-    serve(&mut h, "local-1", secs(60))?;
-    h.set_running("local-1", 0)?;
-    h.set_draining("local-1", true)?;
-    h.reconcile();
-    let events: Vec<ScalingAuditEvent> = h.audit_events()?;
+fn idle_drain_order_release_first_then_longest_idle_then_worker_id() -> TestResult {
+    let mut w = idle_world(1, 600)?;
+    w.h.settle_term()?;
+    w.serve(X86, "local-3")?;
+    w.pass();
+    w.h.advance(secs(5));
+    w.serve(X86, "local-2")?;
+    w.serve(X86, "local-1")?;
+    w.h.supply_mut(X86)?.instances[1].release_first = true;
+    w.pass();
+    w.h.advance(secs(600));
     assert_eq!(
-        events,
-        vec![ScalingAuditEvent {
-            at: h.clock.wall(),
-            fleet: x86_name()?,
-            kind: ScalingEventKind::Terminated {
-                instance: instance("local-1")?,
-            },
-            cause: Some(ScalingCause::DrainFinished),
-        }]
-    );
-    Ok(())
-}
-
-#[test]
-fn cancel_drain_is_audited() -> TestResult {
-    let mut h = Harness::new()?;
-    serve(&mut h, "local-1", Duration::ZERO)?;
-    h.set_draining("local-1", true)?;
-    h.queue(X86, 1)?;
-    assert_eq!(h.reconcile(), vec![cancel_drain("local-1")?]);
-    let events: Vec<ScalingAuditEvent> = h.audit_events()?;
-    assert_eq!(
-        events,
-        vec![ScalingAuditEvent {
-            at: h.clock.wall(),
-            fleet: x86_name()?,
-            kind: ScalingEventKind::DrainCancelled {
-                worker: worker_id("local-1")?,
-            },
-            cause: Some(ScalingCause::Demand),
-        }]
-    );
-    Ok(())
-}
-
-#[test]
-fn same_inputs_give_the_same_plan() -> TestResult {
-    let mut h = Harness::new()?;
-    serve(&mut h, "local-1", secs(60))?;
-    h.queue(X86, 5)?;
-    h.reconcile();
-    let first = h.plan.clone();
-    h.restart();
-    h.reconcile();
-    assert_eq!(h.plan, first);
-    Ok(())
-}
-
-#[test]
-fn preference_fills_the_first_fleet_then_overflows_to_the_next() -> TestResult {
-    let mut spot = policy_named("gang-spot", Isa::X86_64)?;
-    spot.instances = InstanceBounds::try_new(0, NonZeroU32::MIN.saturating_add(1))?;
-    spot.target_actions_per_instance = NonZeroU32::MIN;
-    let mut ondemand = policy_named("gang-ondemand", Isa::X86_64)?;
-    ondemand.instances = InstanceBounds::try_new(0, NonZeroU32::MIN.saturating_add(4))?;
-    ondemand.target_actions_per_instance = NonZeroU32::MIN;
-    let mut h = Harness::with_fleets(vec![spot, ondemand]);
-    h.queue_candidates(FleetSet::try_from_indices([SPOT, ONDEMAND])?, 3);
-    assert_eq!(
-        h.run(),
+        changes(&w.run()),
         vec![
-            PlanStep {
-                fleet: SPOT,
-                action: Action::ScaleOut {
-                    from: 0,
-                    to: 2,
-                    need: NeedCause::Demand,
-                },
-            },
-            PlanStep {
-                fleet: ONDEMAND,
-                action: Action::ScaleOut {
-                    from: 0,
-                    to: 1,
-                    need: NeedCause::Demand,
-                },
-            },
+            Change::Drain(X86, "local-2".into(), DrainReason::IdleTimeout),
+            Change::Drain(X86, "local-3".into(), DrainReason::IdleTimeout)
         ]
     );
     Ok(())
 }
 
 #[test]
-fn pinned_action_scales_only_its_candidate_fleet() -> TestResult {
-    let mut h = Harness::with_fleets(vec![policy()?, policy_named("gang-arm", Isa::Aarch64)?]);
-    h.queue_candidates(FleetSet::try_from_indices([ARM])?, 1);
+fn release_first_busy_or_booting_member_holds_back_idle_spot() -> TestResult {
+    for booting in [false, true] {
+        let mut w = idle_world(0, 600)?;
+        w.h.settle_term()?;
+        w.serve(X86, "local-1")?;
+        if booting {
+            w.h.launch_release_first(X86, "local-2", InstanceLifecycle::Pending, Duration::ZERO)?;
+            w.h.set_desired_capacity(X86, 2);
+        } else {
+            w.serve(X86, "local-2")?;
+            w.h.supply_mut(X86)?.instances[1].release_first = true;
+            w.running("local-2", 1, None, Duration::ZERO, Some(secs(3600)))?;
+        }
+        w.queue(None, X86, 1, None)?;
+        w.pass();
+        w.h.advance(secs(600));
+        assert!(
+            !w.pass()
+                .iter()
+                .any(|step| matches!(step.action, Action::StartDrain { .. }))
+        );
+    }
+    Ok(())
+}
+
+fn spread() -> TestResult<Workload> {
+    let mut w = Workload::new(6, 16, 50)?;
+    w.h.passes[X86].policy.idle_timeout = secs(3600);
+    for name in ["local-1", "local-2", "local-3", "local-4"] {
+        w.serve(X86, name)?;
+        w.running(name, 2, Some(source(1)?), Duration::ZERO, Some(secs(600)))?;
+    }
+    Ok(w)
+}
+
+#[test]
+fn n_minus_one_dwell_cordons_one_busy_physical_instance() -> TestResult {
+    let mut w = spread()?;
+    settle_low(&mut w);
+    w.h.advance(secs(299));
+    assert!(w.pass().is_empty());
+    w.h.advance(secs(1));
+    let steps = w.run();
     assert_eq!(
-        h.run(),
-        vec![PlanStep {
-            fleet: ARM,
-            action: Action::ScaleOut {
-                from: 0,
-                to: 1,
-                need: NeedCause::Demand,
-            },
-        }]
+        changes(&steps),
+        vec![Change::Drain(
+            X86,
+            "local-1".into(),
+            DrainReason::Utilization
+        )]
     );
-    assert_eq!(h.supply(X86)?.desired, 0);
-    Ok(())
-}
-
-#[test]
-fn action_without_candidates_scales_nothing() -> TestResult {
-    let mut h = Harness::with_fleets(vec![policy()?, policy_named("gang-arm", Isa::Aarch64)?]);
-    h.queue_candidates(FleetSet::EMPTY, 3);
-    assert_eq!(h.run(), Vec::new());
-    assert_eq!(h.supply(X86)?.desired, 0);
-    assert_eq!(h.supply(ARM)?.desired, 0);
-    Ok(())
-}
-
-#[test]
-fn running_actions_count_on_their_own_fleet_only() -> TestResult {
-    let mut h = Harness::with_fleets(vec![policy()?, policy_named("gang-arm", Isa::Aarch64)?]);
-    serve_in(&mut h, ARM, "local-2", Duration::ZERO)?;
-    h.set_running("local-2", 4)?;
-    // A worker of a fleet that is not configured runs four actions too; it must be ignored.
-    h.connect_as(FleetName::try_new("gang-unknown")?, "local-9")?;
-    h.set_running("local-9", 4)?;
-    h.queue(X86, 1)?;
+    let Action::StartDrain {
+        summary: Some(summary),
+        ..
+    } = steps[0].action
+    else {
+        return Err("missing cordon summary".into());
+    };
+    assert_eq!(summary.dwell, secs(300));
+    assert_eq!(summary.serving_instances, 4);
+    assert_eq!(summary.waterline_percent, 70);
     assert_eq!(
-        h.run(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::ScaleOut {
-                from: 0,
-                to: 1,
-                need: NeedCause::Demand,
-            },
-        }]
+        w.h.audit_events()?[0].cause,
+        Some(ScalingCause::Utilization)
     );
-    assert_eq!(h.supply(ARM)?.desired, 1);
+    w.h.advance(secs(300));
+    assert!(!w.pass().iter().any(|step| matches!(
+        step.action,
+        Action::StartDrain {
+            reason: DrainReason::Utilization,
+            ..
+        }
+    )));
     Ok(())
 }
 
 #[test]
-fn fleets_with_the_same_isa_are_reconciled_independently() -> TestResult {
-    let mut h = Harness::with_fleets(vec![policy()?, policy_named("gang-x86-b", Isa::X86_64)?]);
-    h.settle_term()?;
-    serve(&mut h, "local-1", secs(60))?;
-    serve_in(&mut h, ONDEMAND, "local-2", secs(60))?;
-    h.set_running("local-2", 1)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(15));
+fn cordon_victim_order_empty_time_release_first_running_then_id() -> TestResult {
+    for tie in ["empty", "release", "running", "id"] {
+        let mut w = spread()?;
+        for name in ["local-1", "local-2", "local-3", "local-4"] {
+            w.running(name, 2, Some(source(1)?), Duration::ZERO, Some(secs(1200)))?;
+        }
+        w.running(
+            "local-2",
+            if tie == "running" { 1 } else { 2 },
+            Some(source(1)?),
+            Duration::ZERO,
+            Some(secs(if tie == "empty" { 900 } else { 1200 })),
+        )?;
+        if tie == "release" {
+            w.h.supply_mut(X86)?.instances[1].release_first = true;
+        }
+        settle_low(&mut w);
+        w.h.advance(secs(300));
+        let victim = if tie == "id" { "local-1" } else { "local-2" };
+        assert_eq!(
+            changes(&w.pass()),
+            vec![Change::Drain(X86, victim.into(), DrainReason::Utilization)],
+            "tie={tie}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn skipped_pass_resets_dwell_and_keeps_existing_cordons() -> TestResult {
+    let mut w = spread()?;
+    settle_low(&mut w);
+    w.h.advance(secs(299));
+    w.pass();
+    w.h.reconciler.interrupt();
+    w.h.advance(secs(100));
+    assert!(w.pass().is_empty());
+    w.h.advance(secs(299));
+    assert!(w.pass().is_empty());
+    w.h.advance(secs(1));
     assert_eq!(
-        h.run(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::StartDrain(worker_id("local-1")?),
-        }]
+        changes(&w.run()),
+        vec![Change::Drain(
+            X86,
+            "local-1".into(),
+            DrainReason::Utilization
+        )]
     );
+    w.h.reconciler.interrupt();
+    assert_eq!(w.h.snapshot.cordons.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn max_cordons_zero_soak_keeps_idle_timeout_drains_enabled() -> TestResult {
+    let mut w = spread()?;
+    let mut scaling = *w.h.scaling;
+    scaling.max_cordons = 0;
+    let policies = w.h.passes.iter().map(|pass| pass.policy.clone()).collect();
+    let mut h = Harness::with_scaling(policies, scaling);
+    h.snapshot = w.h.snapshot;
+    for (to, from) in h.passes.iter_mut().zip(w.h.passes) {
+        to.supply = from.supply;
+    }
+    w.h = h;
+    settle_low(&mut w);
+    w.h.advance(secs(300));
+    assert!(w.pass().is_empty());
+    for name in ["local-1", "local-2", "local-3", "local-4"] {
+        w.running(name, 0, None, Duration::ZERO, None)?;
+    }
+    w.pass();
+    w.h.advance(secs(3600));
+    let steps = w.pass();
+    assert!(steps.iter().any(|step| matches!(
+        step.action,
+        Action::StartDrain {
+            reason: DrainReason::IdleTimeout,
+            ..
+        }
+    )));
+    assert!(steps.iter().all(|step| !matches!(
+        step.action,
+        Action::StartDrain {
+            reason: DrainReason::Utilization,
+            ..
+        }
+    )));
+    Ok(())
+}
+
+#[test]
+fn n_one_to_zero_after_observed_quiet_before_idle_timeout() -> TestResult {
+    let mut w = Workload::new(6, 16, 50)?;
+    w.h.passes[X86].policy.idle_timeout = secs(3600);
+    w.serve(X86, "local-1")?;
+    w.running(
+        "local-1",
+        1,
+        Some(source(1)?),
+        Duration::ZERO,
+        Some(secs(10)),
+    )?;
+    w.pass();
+    w.h.advance(secs(10));
+    w.running("local-1", 0, Some(source(1)?), Duration::ZERO, None)?;
+    w.complete(
+        Some(source(1)?),
+        X86,
+        1,
+        Some(secs(10)),
+        gang_types::ActionResources::default(),
+    );
+    w.pass();
+    w.h.advance(secs(1));
+    w.pass();
+    w.h.advance(secs(60));
+    w.pass();
+    assert_eq!(w.h.outlook(X86)?.load, Some(0));
+    // Settle must have elapsed before N−1 begins proving its dwell.
+    w.h.advance(CLIENT_REROUTE_BOUND);
+    w.pass();
+    w.h.advance(secs(300));
     assert_eq!(
-        h.run(),
-        vec![terminate("local-1", TerminationCause::DrainFinished)?]
+        changes(&w.run()),
+        vec![Change::Drain(
+            X86,
+            "local-1".into(),
+            DrainReason::Utilization
+        )]
     );
-    assert_eq!(h.supply(ONDEMAND)?.desired, 1);
-    assert_eq!(h.supply(ONDEMAND)?.instances.len(), 1);
+    assert!(w.h.clock.monotonic().elapsed() < secs(3600));
     Ok(())
 }
 
-/// R1: the on-demand (release-first) worker drains although the Spot worker has been idle longer.
 #[test]
-fn release_order_drains_the_on_demand_worker_before_a_longer_idle_spot_worker() -> TestResult {
-    let mut h = Harness::with_policy(ten_minute_policy()?);
-    h.queue(X86, 1)?;
-    serve(&mut h, "local-1", Duration::ZERO)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(19 * 60));
-    serve_release_first(&mut h, X86, "local-2", Duration::ZERO)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(11 * 60));
+fn returning_busy_load_uncordons_before_buying_and_resets_dwell() -> TestResult {
+    let mut w = spread()?;
+    settle_low(&mut w);
+    w.h.advance(secs(300));
+    w.run();
+    for name in ["local-1", "local-2", "local-3", "local-4"] {
+        w.running(name, 12, Some(source(1)?), Duration::ZERO, Some(secs(600)))?;
+    }
+    let steps = w.run();
+    assert!(
+        steps
+            .iter()
+            .any(|step| matches!(step.action, Action::CancelDrain(..)))
+    );
+    assert!(purchases(&steps).is_empty());
+    assert!(steps.iter().all(|step| !matches!(
+        step.action,
+        Action::Withdraw { .. } | Action::StartDrain { .. }
+    )));
+    for name in ["local-1", "local-2", "local-3", "local-4"] {
+        w.running(name, 2, Some(source(1)?), Duration::ZERO, Some(secs(600)))?;
+    }
+    assert!(
+        w.pass()
+            .iter()
+            .all(|step| !matches!(step.action, Action::StartDrain { .. }))
+    );
+    Ok(())
+}
+
+#[test]
+fn all_generation_cordon_and_partial_reinforcement_are_physical_and_silent() -> TestResult {
+    let mut w = spread()?;
+    let mut next = renewed(&w.h.snapshot.workers[0], 2)?;
+    next.running_actions = 0;
+    w.h.snapshot.workers.push(next);
+    settle_low(&mut w);
+    w.h.advance(secs(300));
+    w.run();
+    let id = InstanceId::try_new("local-1")?;
+    assert!(
+        w.h.snapshot
+            .workers
+            .iter()
+            .filter(|worker| id.hosts(&worker.id))
+            .all(|worker| worker.draining)
+    );
+    let connected = worker_id("local-1")?;
+    let index =
+        w.h.snapshot
+            .workers
+            .iter()
+            .position(|worker| worker.id == connected)
+            .ok_or("missing worker")?;
+    w.h.snapshot.workers[index].draining = false;
+    for _ in 0..5 {
+        let steps = w.pass();
+        assert!(
+            steps
+                .iter()
+                .any(|step| matches!(step.action, Action::ReinforceDrain(_)))
+        );
+        assert!(steps.iter().all(|step| !matches!(
+            step.action,
+            Action::Terminate { .. } | Action::StartDrain { .. }
+        )));
+        assert!(
+            w.h.audit_events()?.is_empty(),
+            "repair writes zero audit rows"
+        );
+    }
+    w.h.apply();
+    assert!(
+        w.pass()
+            .iter()
+            .all(|step| !matches!(step.action, Action::ReinforceDrain(_)))
+    );
+    Ok(())
+}
+
+#[test]
+fn unowned_self_drain_refresh_overlap_and_gap_never_resume_terminate_or_buy() -> TestResult {
+    let mut w = idle_world(1, 600)?;
+    w.serve(X86, "local-1")?;
+    w.pass();
+    w.h.snapshot.workers[0].draining = true;
+    assert!(w.h.snapshot.cordons.is_empty());
+    assert!(w.pass().is_empty(), "all-draining refresh gap is transient");
+    w.h.advance(secs(30));
+    let mut next = renewed(&w.h.snapshot.workers[0], 2)?;
+    next.draining = false;
+    next.running_actions = 1;
+    w.h.snapshot.workers.push(next);
+    assert!(
+        w.pass().is_empty(),
+        "overlapping generations are one physical instance"
+    );
+    w.h.snapshot.workers.remove(0);
+    assert!(w.pass().is_empty());
+    Ok(())
+}
+
+#[test]
+fn unowned_drain_after_grace_terminates_and_replaces_exactly_once() -> TestResult {
+    let mut w = idle_world(2, 600)?;
+    for name in ["local-1", "local-2"] {
+        w.serve(X86, name)?;
+    }
+    w.h.snapshot.workers[1].draining = true;
+    assert!(w.pass().is_empty());
+    w.h.advance(secs(600));
     assert_eq!(
-        h.run(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::StartDrain(worker_id("local-2")?),
-        }]
+        changes(&w.pass()),
+        vec![
+            Change::Terminate(X86, "local-2".into(), TerminationCause::DrainFinished),
+            Change::Scale(X86, 1, 2, NeedCause::Minimum)
+        ]
     );
+    // Provider desired reflects the commands but the census still contains the ordered member.
+    w.h.supply_mut(X86)?.desired = 2;
+    assert!(w.pass().is_empty());
     Ok(())
 }
 
 #[test]
-fn audit_events_record_an_orphan_termination() -> TestResult {
-    let mut h = Harness::new()?;
-    h.set_desired_capacity(X86, 1);
-    h.launch(X86, "local-1", InstanceLifecycle::InService, secs(3600))?;
-    h.reconcile();
-    h.advance(secs(30));
-    h.reconcile();
-    let events: Vec<ScalingAuditEvent> = h.audit_events()?;
-    assert_eq!(
-        events,
-        vec![ScalingAuditEvent {
-            at: h.clock.wall(),
-            fleet: x86_name()?,
-            kind: ScalingEventKind::Terminated {
-                instance: instance("local-1")?,
-            },
-            cause: Some(ScalingCause::Orphan),
-        }]
+fn needed_at_max_with_retained_busy_drain_never_requests_over_maximum() -> TestResult {
+    let mut w = idle_world(6, 600)?;
+    for i in 1..=6 {
+        w.serve(X86, &format!("local-{i}"))?;
+    }
+    w.running("local-1", 1, None, Duration::ZERO, Some(secs(3600)))?;
+    // A self-drain remains retained after grace, not rescuable controller capacity.
+    w.h.snapshot.workers[0].draining = true;
+    w.pass();
+    w.h.advance(secs(600));
+    assert!(purchases(&w.pass()).is_empty());
+    assert_eq!(w.h.supply(X86)?.desired, 6);
+    Ok(())
+}
+
+#[test]
+fn transient_neighbour_never_justifies_draining_healthy_minimum_or_rescuing_unrelated_cordon()
+-> TestResult {
+    let mut w = idle_world(1, 600)?;
+    w.h.settle_term()?;
+    w.serve(X86, "local-1")?;
+    w.serve(X86, "local-2")?;
+    w.h.snapshot.workers[1].draining = true;
+    w.pass();
+    w.h.advance(secs(599));
+    assert!(
+        w.pass().is_empty(),
+        "transient is need coverage, not surplus coverage"
     );
-    Ok(())
-}
-
-/// R2: an on-demand worker is not eligible before its own idle timeout, so the Spot worker is kept.
-#[test]
-fn on_demand_worker_is_not_eligible_before_its_idle_timeout() -> TestResult {
-    let mut h = Harness::with_policy(ten_minute_policy()?);
-    h.queue(X86, 1)?;
-    serve(&mut h, "local-1", Duration::ZERO)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(25 * 60));
-    serve_release_first(&mut h, X86, "local-2", Duration::ZERO)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(5 * 60));
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(5 * 60));
-    assert_eq!(
-        h.run(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::StartDrain(worker_id("local-2")?),
-        }]
-    );
-    Ok(())
-}
-
-/// R3: a busy on-demand worker holds back an idle Spot worker.
-#[test]
-fn busy_on_demand_worker_holds_back_an_idle_spot_worker() -> TestResult {
-    let mut h = Harness::with_policy(ten_minute_policy()?);
-    h.queue(X86, 1)?;
-    serve(&mut h, "local-1", Duration::ZERO)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(30 * 60));
-    serve_release_first(&mut h, X86, "local-2", Duration::ZERO)?;
-    h.set_running("local-2", 1)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(10 * 60));
-    assert_eq!(h.reconcile(), Vec::new());
-    Ok(())
-}
-
-/// R3 (surplus 2): one busy on-demand worker and two idle Spot workers; exactly one Spot drains.
-#[test]
-fn surplus_beyond_a_busy_on_demand_worker_drains_one_spot_worker() -> TestResult {
-    let mut h = Harness::with_policy(ten_minute_policy()?);
-    h.queue(X86, 1)?;
-    serve(&mut h, "local-1", Duration::ZERO)?;
-    serve(&mut h, "local-3", Duration::ZERO)?;
-    serve_release_first(&mut h, X86, "local-2", Duration::ZERO)?;
-    h.set_running("local-2", 1)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(10 * 60));
-    assert_eq!(
-        h.run(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::StartDrain(worker_id("local-1")?),
-        }]
-    );
-    Ok(())
-}
-
-/// R4: a busy Spot worker is never a drain candidate, however large the surplus.
-#[test]
-fn busy_spot_workers_are_never_drain_candidates() -> TestResult {
-    let mut h = Harness::with_policy(ten_minute_policy()?);
+    let mut other = idle_world(2, 600)?;
     for name in ["local-1", "local-2", "local-3"] {
-        serve(&mut h, name, Duration::ZERO)?;
-        h.set_running(name, 1)?;
+        other.serve(X86, name)?;
     }
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(30 * 60));
-    assert_eq!(h.reconcile(), Vec::new());
-    Ok(())
-}
-
-/// R5: a plain fleet (no release-first instance) drains its longest-idle worker first.
-#[test]
-fn plain_fleet_drains_the_longest_idle_worker_first() -> TestResult {
-    let mut h = Harness::with_policy(ten_minute_policy()?);
-    serve(&mut h, "local-1", Duration::ZERO)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(5 * 60));
-    serve(&mut h, "local-2", Duration::ZERO)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(5 * 60));
-    assert_eq!(
-        h.run(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::StartDrain(worker_id("local-1")?),
-        }]
-    );
-    Ok(())
-}
-
-/// R5: a plain fleet drains an idle worker, then terminates it once it has drained.
-#[test]
-fn plain_fleet_drains_an_idle_worker_then_terminates_it() -> TestResult {
-    let mut h = Harness::with_policy(ten_minute_policy()?);
-    serve(&mut h, "local-1", Duration::ZERO)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(10 * 60));
-    assert_eq!(
-        h.run(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::StartDrain(worker_id("local-1")?),
-        }]
-    );
-    assert_eq!(
-        h.run(),
-        vec![terminate("local-1", TerminationCause::DrainFinished)?]
-    );
-    Ok(())
-}
-
-/// R6: a booting on-demand instance is included in the release set, so the idle Spot worker is kept.
-#[test]
-fn booting_on_demand_instance_counts_toward_release_first_capacity() -> TestResult {
-    let mut h = Harness::with_policy(ten_minute_policy()?);
-    h.queue(X86, 1)?;
-    serve(&mut h, "local-1", Duration::ZERO)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(30 * 60));
-    h.launch_release_first(X86, "local-2", InstanceLifecycle::Pending, secs(1))?;
-    h.set_desired_capacity(X86, 2);
-    assert_eq!(h.reconcile(), Vec::new());
-    Ok(())
-}
-
-/// R7: with one shortfall, the Spot worker is resumed first; the on-demand worker is terminated
-/// once it has finished draining.
-#[test]
-fn resume_takes_the_spot_worker_before_the_on_demand_one() -> TestResult {
-    let mut h = Harness::with_policy(ten_minute_policy()?);
-    serve_release_first(&mut h, X86, "local-1", Duration::ZERO)?;
-    serve(&mut h, "local-2", Duration::ZERO)?;
-    h.set_draining("local-1", true)?;
-    h.set_draining("local-2", true)?;
-    h.queue(X86, 1)?;
-    let first = h.run();
-    assert!(first.contains(&cancel_drain("local-2")?));
-    assert!(!first.contains(&cancel_drain("local-1")?));
-    let mut terminated = first.contains(&terminate("local-1", TerminationCause::DrainFinished)?);
-    terminated |= h
-        .run()
-        .contains(&terminate("local-1", TerminationCause::DrainFinished)?);
-    assert!(terminated);
-    Ok(())
-}
-
-/// R8: a restarted reconciler recovers an on-demand drain from the worker's drain flag and
-/// terminates the finished instance.
-#[test]
-fn restart_recovers_a_release_first_drain_from_the_worker_flag() -> TestResult {
-    let mut h = Harness::with_policy(ten_minute_policy()?);
-    serve(&mut h, "local-1", Duration::ZERO)?;
-    serve_release_first(&mut h, X86, "local-2", Duration::ZERO)?;
-    h.queue(X86, 1)?;
-    h.set_draining("local-2", true)?;
-    h.restart();
-    assert_eq!(h.supply(X86)?.desired, 2);
-    assert_eq!(
-        h.run(),
-        vec![terminate("local-2", TerminationCause::DrainFinished)?]
-    );
-    Ok(())
-}
-
-/// R9: a restarted reconciler waits a full idle timeout in the new process, then drains the
-/// release-first worker before the other worker of equal idle start.
-#[test]
-fn restart_resets_idle_timers_and_drains_the_release_first_worker_first() -> TestResult {
-    let mut h = Harness::with_policy(ten_minute_policy()?);
-    h.queue(X86, 1)?;
-    serve(&mut h, "local-1", Duration::ZERO)?;
-    serve_release_first(&mut h, X86, "local-2", Duration::ZERO)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(9 * 60));
-    h.restart();
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(10 * 60 - 1));
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(1));
-    assert_eq!(
-        h.run(),
-        vec![PlanStep {
-            fleet: X86,
-            action: Action::StartDrain(worker_id("local-2")?),
-        }]
+    other.h.snapshot.workers[1].draining = true;
+    other.running("local-3", 1, None, Duration::ZERO, Some(secs(3600)))?;
+    other.h.set_draining("local-3", true)?;
+    assert!(
+        !other
+            .pass()
+            .iter()
+            .any(|step| matches!(step.action, Action::CancelDrain(..)))
     );
     Ok(())
 }
 
 #[test]
-fn a_timed_out_drain_reports_drain_finished_once_its_worker_is_empty() -> TestResult {
-    let mut h = Harness::new()?;
-    serve(&mut h, "local-1", secs(60))?;
-    h.set_running("local-1", 2)?;
-    h.set_draining("local-1", true)?;
-    assert_eq!(h.reconcile(), Vec::new());
-    h.advance(secs(60));
-    h.set_running("local-1", 0)?;
+fn zero_connection_owned_cordon_is_not_capacity_and_rescues_only_after_reconnect() -> TestResult {
+    let mut w = idle_world(1, 600)?;
+    w.serve(X86, "local-1")?;
+    w.h.set_draining("local-1", true)?;
+    w.h.disconnect("local-1")?;
+    assert!(w.pass().is_empty());
+    assert_eq!(w.h.outlook(X86)?.utilization, None);
+    w.h.connect(X86, "local-1")?;
+    assert!(w.h.snapshot.workers[0].draining);
     assert_eq!(
-        h.reconcile(),
-        vec![terminate("local-1", TerminationCause::DrainFinished)?]
+        changes(&w.run()),
+        vec![Change::Cancel(X86, "local-1".into(), NeedCause::Minimum)]
     );
+    assert_eq!(w.h.audit_events()?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn absent_and_ordered_cordon_registry_entries_do_not_consume_live_budget() -> TestResult {
+    let mut w = spread()?;
+    w.h.snapshot.cordons.push(gang_spi::InstanceCordon {
+        fleet: X86,
+        instance: std::sync::Arc::new(InstanceId::try_new("local-absent")?),
+    });
+    settle_low(&mut w);
+    w.h.advance(secs(300));
+    assert!(w.pass().iter().any(|step| matches!(
+        step.action,
+        Action::StartDrain {
+            reason: DrainReason::Utilization,
+            ..
+        }
+    )));
+    Ok(())
+}
+
+#[test]
+fn distinct_fleets_candidate_attribution_and_unknown_workers_stay_isolated() -> TestResult {
+    let mut w = Workload {
+        h: Harness::with_fleets(vec![policy()?, policy_named("gang-arm", Isa::Aarch64)?]),
+    };
+    w.serve(ARM, "local-2")?;
+    w.running("local-2", 4, None, Duration::ZERO, None)?;
+    w.h.connect_as(gang_types::FleetName::try_new("gang-unknown")?, "local-9")?;
+    w.h.set_running("local-9", 4)?;
+    w.queue(None, X86, 1, None)?;
+    assert_eq!(purchases(&w.run()), vec![(X86, 0, 1, NeedCause::Demand)]);
+    assert_eq!(w.h.supply(ARM)?.desired, 1);
+    w.h.snapshot.queued.clear();
+    w.h.queue_candidates(FleetSet::EMPTY, 3);
+    w.h.queue_candidates(FleetSet::try_from_indices([5])?, 3);
+    assert!(purchases(&w.pass()).is_empty());
+    Ok(())
+}
+
+#[test]
+fn removing_workers_remaps_executing_without_losing_sources_or_resources() -> TestResult {
+    let mut w = Workload::new(6, 16, 50)?;
+    for name in ["local-1", "local-2", "local-3"] {
+        w.serve(X86, name)?;
+    }
+    w.running("local-1", 1, Some(source(1)?), secs(1), Some(secs(3)))?;
+    w.running("local-2", 1, Some(source(2)?), secs(2), Some(secs(5)))?;
+    w.h.disconnect("local-1")?;
+    assert_eq!(w.h.snapshot.executing.len(), 1);
+    assert_eq!(w.h.snapshot.executing[0].worker, 0);
+    assert_eq!(w.h.snapshot.executing[0].source, Some(source(2)?));
+    w.h.plan.steps = vec![PlanStep {
+        fleet: X86,
+        action: Action::Terminate {
+            instance: InstanceId::try_new("local-2")?,
+            cause: TerminationCause::DrainFinished,
+        },
+    }];
+    w.h.apply();
+    assert!(w.h.snapshot.executing.is_empty());
+    Ok(())
+}
+
+#[test]
+fn same_inputs_in_new_term_produce_same_decision() -> TestResult {
+    let mut w = Workload::new(6, 16, 50)?;
+    w.queue(Some(source(1)?), X86, 1, None)?;
+    let first = w.pass();
+    w.h.restart();
+    assert_eq!(w.pass(), first);
+    Ok(())
+}
+
+#[test]
+fn ordered_live_cordon_does_not_consume_busy_cordon_budget() -> TestResult {
+    let mut w = spread()?;
+    w.serve(X86, "local-5")?;
+    w.h.set_draining("local-5", true)?;
+    assert!(
+        w.pass()
+            .iter()
+            .any(|step| matches!(step.action, Action::Terminate { .. }))
+    );
+    // Successful provider command, eventually consistent listing retains local-5.
+    w.h.supply_mut(X86)?.desired = 4;
+    w.h.advance(CLIENT_REROUTE_BOUND);
+    w.pass();
+    w.h.advance(secs(300));
+    assert!(w.pass().iter().any(|step| matches!(
+        step.action,
+        Action::StartDrain {
+            reason: DrainReason::Utilization,
+            ..
+        }
+    )));
+    Ok(())
+}
+
+#[test]
+fn pending_unborn_and_zero_connection_capacity_block_n_minus_one() -> TestResult {
+    for class in ["pending", "unborn", "unconnected", "owned-empty"] {
+        let mut w = spread()?;
+        w.h.set_desired_capacity(X86, 5);
+        if class != "unborn" {
+            let lifecycle = if class == "pending" {
+                InstanceLifecycle::Pending
+            } else {
+                InstanceLifecycle::InService
+            };
+            w.h.launch(X86, "local-5", lifecycle, Duration::ZERO)?;
+        }
+        if class == "owned-empty" {
+            w.h.connect(X86, "local-5")?;
+            w.h.set_draining("local-5", true)?;
+            w.h.disconnect("local-5")?;
+        }
+        settle_low(&mut w);
+        w.h.advance(secs(300));
+        assert!(
+            w.pass().iter().all(|step| !matches!(
+                step.action,
+                Action::StartDrain {
+                    reason: DrainReason::Utilization,
+                    ..
+                }
+            )),
+            "unreliable class {class}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn scale_out_resets_utilization_dwell() -> TestResult {
+    let mut w = spread()?;
+    settle_low(&mut w);
+    w.h.advance(secs(299));
+    w.pass();
+    w.queue(Some(source(2)?), X86, 2000, Some(secs(3600)))?;
+    assert!(!purchases(&w.pass()).is_empty());
+    w.h.snapshot.queued.clear();
+    w.h.advance(secs(1));
+    assert!(
+        w.pass()
+            .iter()
+            .all(|step| !matches!(step.action, Action::StartDrain { .. }))
+    );
+    Ok(())
+}
+
+#[test]
+fn fresh_engine_has_no_controller_intent_but_same_engine_model_replacement_does() -> TestResult {
+    let mut w = idle_world(1, 600)?;
+    w.serve(X86, "local-1")?;
+    w.h.set_draining("local-1", true)?;
+    w.h.restart();
+    assert!(
+        w.pass()
+            .iter()
+            .any(|step| matches!(step.action, Action::CancelDrain(..)))
+    );
+    w.h.snapshot.cordons.clear();
+    w.h.restart();
+    assert!(w.pass().iter().all(|step| !matches!(
+        step.action,
+        Action::CancelDrain(..) | Action::ReinforceDrain(_)
+    )));
     Ok(())
 }

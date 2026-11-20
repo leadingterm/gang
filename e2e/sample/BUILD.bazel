@@ -1,6 +1,6 @@
 load("@gang_env//:defs.bzl", "EXEC_PROPERTIES")
 load(":config.bzl", "CPU_COUNT", "ISA", "LARGE_FLEET", "LARGE_MEMORY_KB", "MEMORY_KB", "REQUESTED_SANDBOX", "SIGNAL_COMMAND")
-load(":rules.bzl", "environment_witness", "input_root_probe", "probe")
+load(":rules.bzl", "environment_witness", "input_root_probe", "probe", "rate_held", "rate_stream")
 
 environment_witness(
     name = "rootfs_environment",
@@ -429,6 +429,17 @@ probe(name = "controller_loss_5", srcs = ["action-environment-probe"], script = 
 probe(name = "controller_loss_6", srcs = ["action-environment-probe"], script = CONTROLLER_LOSS, controlled = True, exec_properties = LIMITS)
 probe(name = "controller_loss_7", srcs = ["action-environment-probe"], script = CONTROLLER_LOSS, controlled = True, exec_properties = LIMITS)
 
+# The database partition follows a completed outage build. A distinct mnemonic and
+# targets keep its held work unknown even after E2eProbe target/mnemonic learning.
+probe(name = "partition_0", script = CONTROLLER_LOSS, mnemonic = "E2ePartition", exec_properties = LIMITS)
+probe(name = "partition_1", script = CONTROLLER_LOSS, mnemonic = "E2ePartition", exec_properties = LIMITS)
+probe(name = "partition_2", script = CONTROLLER_LOSS, mnemonic = "E2ePartition", exec_properties = LIMITS)
+probe(name = "partition_3", script = CONTROLLER_LOSS, mnemonic = "E2ePartition", exec_properties = LIMITS)
+probe(name = "partition_4", script = CONTROLLER_LOSS, mnemonic = "E2ePartition", exec_properties = LIMITS)
+probe(name = "partition_5", script = CONTROLLER_LOSS, mnemonic = "E2ePartition", exec_properties = LIMITS)
+probe(name = "partition_6", script = CONTROLLER_LOSS, mnemonic = "E2ePartition", exec_properties = LIMITS)
+probe(name = "partition_7", script = CONTROLLER_LOSS, mnemonic = "E2ePartition", exec_properties = LIMITS)
+
 
 WORK_PROPERTIES = dict(EXEC_PROPERTIES, ISA = ISA, cpu_count = "1", memory_kb = "65536", disk_kb = "65536")
 
@@ -603,6 +614,20 @@ probe(name = "work_held_0", script = WORK_HELD, controlled = True, exec_properti
 probe(name = "work_held_1", script = WORK_HELD, controlled = True, exec_properties = WORK_PROPERTIES)
 probe(name = "work_held_2", script = WORK_HELD, controlled = True, exec_properties = WORK_PROPERTIES)
 probe(name = "work_plain", script = "echo ran=yes", exec_properties = WORK_PROPERTIES)
+
+# Dependency chains expose fresh queued actions after each observed completion.
+# No journal writes: the streamed action targets identify each independent release flag.
+rate_stream(name = "rate_a_0_63", properties = WORK_PROPERTIES)
+rate_stream(name = "rate_a_1_63", properties = WORK_PROPERTIES)
+rate_stream(name = "rate_a_2_63", properties = WORK_PROPERTIES)
+rate_stream(name = "rate_b_0_63", properties = WORK_PROPERTIES)
+rate_stream(name = "rate_b_1_63", properties = WORK_PROPERTIES)
+rate_stream(name = "rate_b_2_63", properties = WORK_PROPERTIES)
+rate_stream(name = "rate_b_3_63", properties = WORK_PROPERTIES)
+rate_stream(name = "rate_b_4_63", properties = WORK_PROPERTIES)
+
+rate_held(name = "rate_hold", count = 24, properties = WORK_PROPERTIES)
+rate_held(name = "rate_return", count = 8, properties = WORK_PROPERTIES)
 
 # The memory hog, held until the go flag exists, so that its scope can be observed while it runs.
 probe(

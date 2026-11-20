@@ -4,13 +4,14 @@ mod reuse;
 
 use std::error::Error;
 use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gang_clock::{TestClock, Timestamp};
-use gang_config::FleetPolicy;
+use gang_config::{ActionsConfig, FleetPolicy, ScalingConfig};
 use gang_reconciler::{
     Action, FleetOutlook, FleetPass, HostedSnapshot, PassTime, Plan, PlanStep, Reconciler,
-    TerminationCause, WorkerCounts,
+    SourceProfiles, TerminationCause, WorkerCounts,
 };
 use gang_spi::{
     ActionInfo, ActionsView, EngineStore, FleetInstance, FleetSupply, MeasuredUsage,
@@ -286,6 +287,9 @@ fn fleets_follow_declaration_order_and_units() -> TestResult {
             workers: WorkerCounts::default(),
             readiness: None,
             expected_wait: None,
+            load: None,
+            backlog: None,
+            utilization: None,
         },
         FleetOutlook::default(),
     ];
@@ -347,6 +351,55 @@ fn fleet_durations_follow_each_outlook_and_round_trip() -> TestResult {
         assert_eq!(cur.fleets[0].demand.expected_wait, expected_wait);
         if index > 0 {
             let delta = diff(&prev, &cur).ok_or("missing fleet delta")?;
+            let mut applied = prev.clone();
+            gang_state::apply(&mut applied, &delta)?;
+            assert_eq!(applied, cur);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    Ok(())
+}
+
+#[test]
+fn fleet_rate_diagnostics_follow_outlook_and_round_trip() -> TestResult {
+    let mut world = World::default();
+    let alpha = policy("alpha", 100, 4)?;
+    world.properties = vec![properties(&alpha, Vec::new())];
+    world.policies = vec![alpha];
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let mut prev = blank();
+    let mut cur = blank();
+    let values = [
+        (None, None, None),
+        (Some(125), Some(Duration::from_secs(42)), Some(735)),
+        (Some(0), Some(Duration::ZERO), Some(0)),
+        (Some(3), None, None),
+        (None, Some(Duration::from_secs(1)), None),
+        (None, None, Some(1)),
+        (None, None, None),
+    ];
+    for (index, (load, backlog, utilization)) in values.into_iter().enumerate() {
+        world.outlook = vec![FleetOutlook {
+            load,
+            backlog,
+            utilization,
+            ..FleetOutlook::default()
+        }];
+        fill_into(
+            &mut builder,
+            &mut cur,
+            &prev,
+            index as u64 + 1,
+            &world,
+            index as u64 * 1_000,
+            ok(0),
+        )?;
+        let demand = cur.fleets[0].demand;
+        assert_eq!(demand.load, load);
+        assert_eq!(demand.backlog, backlog);
+        assert_eq!(demand.utilization, utilization);
+        if index > 0 {
+            let delta = diff(&prev, &cur).ok_or("missing fleet rate diagnostic delta")?;
             let mut applied = prev.clone();
             gang_state::apply(&mut applied, &delta)?;
             assert_eq!(applied, cur);
@@ -1376,7 +1429,9 @@ fn a_worker_of_another_fleet_does_not_host_the_instance() -> TestResult {
     )?];
 
     let mut passes = world.passes();
-    let mut reconciler = Reconciler::new(&world.policies);
+    let scaling = Arc::new(ScalingConfig::default());
+    let profiles = SourceProfiles::new(&scaling, ActionsConfig::default().history_window);
+    let mut reconciler = Reconciler::new(&world.policies, scaling, profiles);
     let mut plan = Plan::new();
     let clock = TestClock::new(ts(100_000));
     let mut hosted = HostedSnapshot::default();
@@ -1663,7 +1718,11 @@ fn events_keep_only_the_newest_configured_window() -> TestResult {
             create_time: ts(index),
             fleet: "fleets/alpha".to_owned(),
             cause: None,
-            change: gang_wire::EventChange::ScaledOut { from: 1, to: 2 },
+            change: gang_wire::EventChange::ScaledOut {
+                from: 1,
+                to: 2,
+                detail: None,
+            },
         })
         .collect();
     let mut settings = config();

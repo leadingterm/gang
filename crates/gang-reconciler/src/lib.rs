@@ -7,10 +7,11 @@
 //!
 //! ```
 //! use std::time::Duration;
+//! use std::sync::Arc;
 //!
 //! use gang_clock::{TestClock, Timestamp};
-//! use gang_config::{FleetPolicy, InstanceBounds};
-//! use gang_reconciler::{Action, FleetPass, HostedSnapshot, NeedCause, PassTime, Plan, PlanStep, Reconciler};
+//! use gang_config::{FleetPolicy, HistoryWindow, InstanceBounds, ScalingConfig};
+//! use gang_reconciler::{Action, FleetPass, HostedSnapshot, NeedCause, PassTime, Plan, Reconciler, SourceProfiles};
 //! use gang_spi::{QueuedDemand, SchedulerSnapshot};
 //! use gang_types::{ActionResources, FleetName, FleetSet, Isa, NonZeroBytes, nonzero_u32};
 //!
@@ -34,6 +35,7 @@
 //!     queued: vec![QueuedDemand {
 //!         candidates: FleetSet::prefix(1)?,
 //!         environment: policy.action_environment.clone(),
+//!         source: None,
 //!         resources: ActionResources::default(),
 //!         queued_since: Timestamp::from_unix_millis(0),
 //!         priority: 0,
@@ -45,33 +47,38 @@
 //! hosted.replace(&mut snapshot);
 //! let clock = TestClock::new(Timestamp::from_unix_millis(1_000));
 //!
-//! let mut reconciler = Reconciler::new(std::slice::from_ref(&policy));
+//! let scaling = Arc::new(ScalingConfig::default());
+//! let profiles = SourceProfiles::new(&scaling, HistoryWindow::from_units(1));
+//! let mut reconciler = Reconciler::new(std::slice::from_ref(&policy), scaling, profiles);
 //! let mut plan = Plan::new();
 //! reconciler.reconcile(&mut fleets, &hosted, PassTime::read(&clock), &mut plan);
-//! assert_eq!(
-//!     plan.steps,
-//!     [PlanStep {
-//!         fleet: 0,
-//!         action: Action::ScaleOut { from: 0, to: 1, need: NeedCause::Demand },
-//!     }]
-//! );
+//! assert!(matches!(
+//!     plan.steps.as_slice(),
+//!     [step] if matches!(step.action, Action::ScaleOut { from: 0, to: 1, need: NeedCause::Demand, .. })
+//! ));
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
 mod activity;
+mod decision;
 mod demand;
 mod fleet;
 mod hosted_snapshot;
 mod observations;
 mod pass_time;
 mod plan;
+mod profile;
+mod rates;
 mod reconciler;
+mod vectors;
 mod wait;
 
 pub use activity::Activity;
+pub use decision::{CordonDecision, Metric, ScaleDecision, ScalingDimension};
 pub use demand::Demand;
 pub use fleet::{FleetOutlook, FleetPass, WorkerCounts};
 pub use hosted_snapshot::HostedSnapshot;
 pub use pass_time::PassTime;
-pub use plan::{Action, NeedCause, Plan, PlanStep, TerminationCause};
+pub use plan::{Action, DrainReason, NeedCause, Plan, PlanStep, TerminationCause};
+pub use profile::SourceProfiles;
 pub use reconciler::Reconciler;

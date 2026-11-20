@@ -159,7 +159,7 @@ fn ends_drain(event: &Event, worker: &str, instance: &str) -> bool {
 /// Whether `event` concerns `worker` or its `instance`.
 fn concerns(event: &Event, worker: &str, instance: &str) -> bool {
     match &event.change {
-        EventChange::DrainStarted { worker: named }
+        EventChange::DrainStarted { worker: named, .. }
         | EventChange::DrainCancelled { worker: named }
         | EventChange::WorkerRegistered { worker: named }
         | EventChange::WorkerDeregistered { worker: named } => named == worker,

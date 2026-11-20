@@ -9,6 +9,8 @@ crate::string_enum! {
         Minimum = "minimum",
         /// A worker stayed idle past its timeout.
         IdleTimeout = "idle_timeout",
+        /// A worker was cordoned because measured fleet load stayed below the waterline for the dwell.
+        Utilization = "utilization",
         /// An in-service instance had no connected worker for its fleet's boot grace.
         Orphan = "orphan",
         /// A draining worker finished its work and was retired.
@@ -28,6 +30,13 @@ mod tests {
             assert_eq!(cause.as_str().parse::<ScalingCause>(), Ok(cause));
             assert_eq!(cause.to_string(), cause.as_str());
         }
+    }
+
+    #[test]
+    fn utilization_has_a_stable_storage_name_and_is_enumerated() {
+        assert_eq!("utilization".parse(), Ok(ScalingCause::Utilization));
+        assert_eq!(ScalingCause::Utilization.as_str(), "utilization");
+        assert!(ScalingCause::ALL.contains(&ScalingCause::Utilization));
     }
 
     #[test]

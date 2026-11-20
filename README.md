@@ -87,6 +87,7 @@ Gang-issued client tokens and local workload proofs accept a minimum TTL of `20s
 Gang is deployed from a separate repository that calls its modules and reusable workflow at one release tag. This repository holds no deployment.
 
 The deployment module defaults to `database.engine = "sqlite"` for one controller. Choose `postgres` or `dynamodb` for one or several controllers behind load balancers; shared engines require a shared S3 cache. See the [configuration reference](docs/SPECIFICATION.md) for the settings.
+Rate-based purchases and N−1 utilization scale-in are configured under `[scaling]`; see the [configuration reference](docs/SPECIFICATION.md#12-cratesgang-configsrc) for defaults, bounds and rollback constraints.
 
 Action scheduling and resource policy are configured under `[actions]`,
 `[actions.memory]`, `[actions.disk]`, and `[actions.cold_start]`. Memory

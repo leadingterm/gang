@@ -175,11 +175,19 @@ async fn every_route_is_served_and_every_json_key_is_lower_camel_case() -> TestR
     let (parts, _dials, handles) = tls_parts();
     handles.repository.insert(worker_certificate(SERIAL));
     for event in [
-        ledger_event(1_000, ScalingEventKind::ScaledOut { from: 0, to: 1 }),
+        ledger_event(
+            1_000,
+            ScalingEventKind::ScaledOut {
+                from: 0,
+                to: 1,
+                detail: None,
+            },
+        ),
         ledger_event(
             2_000,
             ScalingEventKind::DrainStarted {
                 worker: worker_id("local-1")?,
+                detail: None,
             },
         ),
     ] {

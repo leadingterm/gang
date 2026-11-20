@@ -79,6 +79,17 @@ pub enum ConfigError {
         /// Reserved disk in KiB.
         disk_kb: u64,
     },
+    /// The N−1 dwell is too short for the load estimator to observe a drop.
+    #[error(
+        "scaling.scale_in_dwell {scale_in_dwell:?} must be at least scaling.load_half_life {load_half_life:?}"
+    )]
+    #[fix("set scaling.scale_in_dwell at or above scaling.load_half_life")]
+    ScaleInDwellTooShort {
+        /// Configured continuous N−1 dwell.
+        scale_in_dwell: Duration,
+        /// Load-estimator half-life.
+        load_half_life: Duration,
+    },
     /// `default_isa` matches no fleet's instruction set.
     #[error("default_isa `{0}` matches no fleet")]
     #[fix("set default_isa to the instruction set of a declared fleet")]
@@ -328,6 +339,33 @@ pub enum ConfigError {
 #[error("expected `signer` or sha256:<64 lowercase hex>")]
 pub struct CaPinSettingError;
 
+/// A payback percentage outside 1 through 1000 inclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error, gang_types::Fix)]
+pub enum PaybackPercentError {
+    /// The percentage is outside the supported range.
+    #[error("scaling.payback_percent {0} must be between 1 and 1000")]
+    #[fix("set scaling.payback_percent between 1 and 1000")]
+    OutOfRange(#[doc = "The rejected percentage."] u16),
+}
+
+/// A source limit outside 1 through 65536 inclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error, gang_types::Fix)]
+pub enum SourceLimitError {
+    /// The source count is outside the supported range.
+    #[error("scaling.max_sources {0} must be between 1 and 65536")]
+    #[fix("set scaling.max_sources between 1 and 65536")]
+    OutOfRange(#[doc = "The rejected source count."] usize),
+}
+
+/// A waterline percentage outside 1 through 99 inclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error, gang_types::Fix)]
+pub enum WaterlinePercentError {
+    /// The percentage is outside the supported range.
+    #[error("scaling.scale_in_waterline_percent {0} must be between 1 and 99")]
+    #[fix("set scaling.scale_in_waterline_percent between 1 and 99")]
+    OutOfRange(#[doc = "The rejected percentage."] u8),
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -375,6 +413,10 @@ mod tests {
             ConfigError::Render(
                 toml::to_string(&Unserializable).expect_err("the value cannot be serialized"),
             ),
+            ConfigError::ScaleInDwellTooShort {
+                scale_in_dwell: Duration::from_secs(59),
+                load_half_life: Duration::from_mins(1),
+            },
             ConfigError::DefaultIsaWithoutFleet(Isa::Aarch64),
             ConfigError::FleetOptions {
                 fleet: fleet(),

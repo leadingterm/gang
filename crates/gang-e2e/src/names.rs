@@ -127,6 +127,30 @@ pub mod work_aware {
     pub const BACKLOG_WORKERS: &str = "held backlog reaches three workers";
     /// The backlog build finishes successfully.
     pub const BACKLOG_BUILD: &str = "backlog build succeeds";
+    /// Completion evidence spans the measured classification horizon.
+    pub const STREAM_REFILL: &str = "stream refills beyond readiness plus payback";
+    /// Purchases advance one worker at a time.
+    pub const STREAM_STEPS: &str = "stream scales out in bounded steps";
+    /// Purchases never exceed the outstanding-work ceiling.
+    pub const STREAM_CEILING: &str = "stream respects concurrency ceiling";
+    /// Successful purchases carry their decision inputs.
+    pub const DECISION_DETAIL: &str = "scale-out audit includes decision detail";
+    /// The streaming build succeeds after release.
+    pub const STREAM_BUILD: &str = "sustained stream build succeeds";
+    /// An old principal cannot make a different young principal persistent.
+    pub const SOURCE_ISOLATION: &str = "authenticated sources have isolated activity ages";
+    /// Both independent principal builds finish.
+    pub const SOURCES_BUILD: &str = "both source builds succeed";
+    /// Light work occupies all three workers before scale-in.
+    pub const LIGHT_LOAD_SPREAD: &str = "light load is distributed over three workers";
+    /// Busy drains are audited with utilization evidence.
+    pub const UTILIZATION_DRAINS: &str = "three workers drain to one for UTILIZATION";
+    /// At most one physical instance is cordoned concurrently.
+    pub const CORDON_BOUND: &str = "max_cordons is respected";
+    /// Held and later returning work both complete.
+    pub const UTILIZATION_BUILD: &str = "held and returning-wave builds succeed";
+    /// The same physical worker remains after all actions finish.
+    pub const SURVIVING_WORKER: &str = "builds finish with the surviving worker";
 }
 
 /// Names of the checks of the lifecycle scenario.
@@ -443,8 +467,8 @@ pub mod fleets {
     pub const MEMORY: &str = "an action requesting more memory than the first fleet has";
     /// A step whose action asks for the noop sandbox.
     pub const NOOP_SANDBOX: &str = "an action requesting the noop sandbox";
-    /// A cold step of two actions at once, more than the first fleet holds.
-    pub const OVERFLOW: &str = "a cold pair of concurrent unconstrained actions";
+    /// A cold pair whose configured unknown-duration work justifies overflow capacity.
+    pub const OVERFLOW: &str = "a cost-justified cold pair of unconstrained actions";
 
     /// The scale-outs of `request` are exactly those of `fleets`, in order.
     #[must_use]

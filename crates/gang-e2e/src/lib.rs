@@ -82,6 +82,7 @@ mod placement;
 mod plaintext;
 mod ports;
 mod preemption;
+mod rate_scaling;
 mod reaper;
 mod report;
 mod restart;
@@ -211,6 +212,9 @@ pub use placement::Placement;
 pub use plaintext::plaintext;
 pub use preemption::{preemption, worker_renewal};
 pub use process::Ran;
+pub use rate_scaling::{
+    stream_checks, sustained_stream, two_sources, utilization_checks, utilization_scale_in,
+};
 pub use reaper::reaped;
 pub use report::{
     DiskNeighbourReport, InputRootReport, IsolationReport, Namespaces, PoisonReport, ProbeReport,
@@ -249,5 +253,5 @@ pub use template::{ConfigTemplate, Transport};
 pub use timeout::{action_timeout, exit_signals};
 pub use work_aware::{
     backlog_checks, backlog_grows_fleet, burst_capacity_check, burst_checks, burst_from_zero,
-    queued_behind_short_work, short_checks,
+    cold_burst_from_zero, queued_behind_short_work, short_checks,
 };

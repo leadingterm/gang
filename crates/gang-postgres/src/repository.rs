@@ -126,6 +126,10 @@ impl StateRepositoryPort for Postgres {
         &self,
         event: &ScalingAuditEvent,
     ) -> Result<ScalingEventSeq, PortError> {
+        event
+            .kind
+            .validate()
+            .map_err(|error| corrupt(error.field(), &error))?;
         let when = at(event.at)?;
         let kind = event.kind.stored();
         let from = kind.from_capacity.map(i64::from);

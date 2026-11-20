@@ -8,13 +8,16 @@ use gang_wire::{Cause, Event, EventChange};
 pub(crate) fn wire_event(recorded: RecordedScalingEvent) -> Event {
     let RecordedScalingEvent { seq, event } = recorded;
     let change = match event.kind {
-        ScalingEventKind::ScaledOut { from, to } => EventChange::ScaledOut { from, to },
+        ScalingEventKind::ScaledOut { from, to, detail } => {
+            EventChange::ScaledOut { from, to, detail }
+        }
         ScalingEventKind::LaunchFailed { from, to, reason } => {
             EventChange::LaunchFailed { from, to, reason }
         }
         ScalingEventKind::Withdrawn { from, to } => EventChange::Withdrawn { from, to },
-        ScalingEventKind::DrainStarted { worker } => EventChange::DrainStarted {
+        ScalingEventKind::DrainStarted { worker, detail } => EventChange::DrainStarted {
             worker: name::of::<Workers>(&worker),
+            detail,
         },
         ScalingEventKind::DrainCancelled { worker } => EventChange::DrainCancelled {
             worker: name::of::<Workers>(&worker),

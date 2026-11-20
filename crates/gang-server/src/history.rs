@@ -1,4 +1,4 @@
-//! Fenced persistence of opaque scheduler history.
+//! Fenced persistence of scheduler history and source activity profiles.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
@@ -183,7 +183,11 @@ impl LearnedHistoryStore {
         let mut referenced = BTreeSet::new();
         let mut page = Vec::new();
         let limit = NonZeroUsize::MIN.saturating_add(BATCH_LIMIT - 1);
-        for kind in [RecordKind::ResourceHistory, RecordKind::DurationHistory] {
+        for kind in [
+            RecordKind::ResourceHistory,
+            RecordKind::DurationHistory,
+            RecordKind::SourceProfile,
+        ] {
             let mut after = None;
             loop {
                 let more = repository
@@ -404,7 +408,9 @@ impl LearnedHistoryStore {
         for record in records {
             if !matches!(
                 record.key.kind,
-                RecordKind::ResourceHistory | RecordKind::DurationHistory
+                RecordKind::ResourceHistory
+                    | RecordKind::DurationHistory
+                    | RecordKind::SourceProfile
             ) || record.body.len() > self.max_record_bytes.get()
                 || desired.insert(record.key, record).is_some()
             {

@@ -28,7 +28,7 @@ use gang_tls::{
 };
 use gang_types::{
     Bytes, CertSerial, FleetCatalog, FleetName, FleetProperties, FleetSet, Identity, InstanceId,
-    Isa, NonZeroDuration, Principal, ProviderName, Resources, WorkerId,
+    Isa, NonZeroDuration, Principal, ProviderName, Resources,
 };
 use hyper::client::conn::{http1, http2};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -80,8 +80,6 @@ const WORKER_MEMORY: u64 = 8 * GIB;
 const FLEET_DISK: u64 = 100 * GIB;
 /// The fast cache budget of the test worker.
 const FAST_CAS_BUDGET: u64 = GIB;
-/// A well-formed worker id that no worker of these tests has.
-const UNKNOWN_WORKER: &str = "local-9-6c5e4f3a-9b1d-4e2a-8f7c-0d3b2a1e9f58";
 const ENTRYPOINT_HELPER: ChildTest = ChildTest::new("entrypoint_helper");
 /// The environment variable that makes `entrypoint_helper` do its work.
 const ENTRYPOINT_ENV: &str = "GANG_TEST_ENTRYPOINT";
@@ -352,6 +350,8 @@ fn spawn_controller(
         let action = RenderedStoreSpec(json!({"memory": {}}));
         let spec = ControllerSpec {
             actions,
+            scaling: Arc::new(gang_config::ScalingConfig::default()),
+            clock: Arc::new(gang_clock::SystemClock::new()),
             content_store: &content,
             action_store: &action,
             fleets: &fleets,
@@ -753,33 +753,48 @@ async fn snapshot_is_empty_then_shows_a_registered_worker() -> TestResult {
     Ok(())
 }
 
-/// Draining a worker shows in the snapshot, and resuming it clears the flag.
+/// A physical controller drain publishes its intent as well as the connection flag.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn draining_a_worker_is_visible_in_the_snapshot() -> TestResult {
     let scratch = tempfile::tempdir()?;
     let mut harness = Harness::start().await?;
     harness.add_worker(WorkerPaths::new(scratch.path(), "worker"), default_fleet()?)?;
     await_registration(&harness).await?;
-    let worker = sole_worker(&read_snapshot(&harness).await?)?.id.clone();
+    let fleet = FleetName::try_new(DEFAULT_FLEET)?;
+    let instance = InstanceId::try_new(WORKER_INSTANCE)?;
 
-    harness.plugin.set_draining(&worker, true).await?;
-    assert!(sole_worker(&read_snapshot(&harness).await?)?.draining);
+    harness.plugin.set_draining(&fleet, &instance, true).await?;
+    let snapshot = read_snapshot(&harness).await?;
+    assert!(sole_worker(&snapshot)?.draining);
+    assert_eq!(snapshot.cordons.len(), 1);
+    assert_eq!(*snapshot.cordons[0].instance, instance);
 
-    harness.plugin.set_draining(&worker, false).await?;
-    assert!(!sole_worker(&read_snapshot(&harness).await?)?.draining);
+    harness
+        .plugin
+        .set_draining(&fleet, &instance, false)
+        .await?;
+    let snapshot = read_snapshot(&harness).await?;
+    assert!(!sole_worker(&snapshot)?.draining);
+    assert!(snapshot.cordons.is_empty());
     Ok(())
 }
 
-/// Draining a worker that is not connected is `NotFound`.
+/// A physical intent with no connection succeeds and is visible until cancelled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn draining_an_unknown_worker_is_not_found() -> TestResult {
+async fn draining_an_unconnected_instance_records_intent() -> TestResult {
     let harness = Harness::start().await?;
-    let unknown = WorkerId::try_new(UNKNOWN_WORKER)?;
-    let result = harness.plugin.set_draining(&unknown, true).await;
-    assert!(matches!(
-        result,
-        Err(PortError::NotFound(Subject::Worker(_)))
-    ));
+    let fleet = FleetName::try_new(DEFAULT_FLEET)?;
+    let instance = InstanceId::try_new("local-9")?;
+    harness.plugin.set_draining(&fleet, &instance, true).await?;
+    let snapshot = read_snapshot(&harness).await?;
+    assert!(snapshot.workers.is_empty());
+    assert_eq!(snapshot.cordons.len(), 1);
+    assert_eq!(*snapshot.cordons[0].instance, instance);
+    harness
+        .plugin
+        .set_draining(&fleet, &instance, false)
+        .await?;
+    assert!(read_snapshot(&harness).await?.cordons.is_empty());
     Ok(())
 }
 
@@ -807,6 +822,8 @@ async fn a_second_controller_is_refused() -> TestResult {
     );
     let spec = ControllerSpec {
         actions: Arc::new(gang_config::ActionsConfig::default()),
+        scaling: Arc::new(gang_config::ScalingConfig::default()),
+        clock: Arc::new(gang_clock::SystemClock::new()),
         content_store: &content,
         action_store: &action,
         fleets: &fleets,
@@ -833,6 +850,8 @@ async fn sequential_controller_terms_drain_and_republish() -> TestResult {
     let (observations, _receiver) = ObservationSink::channel(NonZeroUsize::MIN, NonZeroUsize::MIN);
     let spec = ControllerSpec {
         actions: Arc::new(gang_config::ActionsConfig::default()),
+        scaling: Arc::new(gang_config::ScalingConfig::default()),
+        clock: Arc::new(gang_clock::SystemClock::new()),
         content_store: &content,
         action_store: &action,
         fleets: &fleets,
@@ -2343,6 +2362,7 @@ fn worker_server_settings(port: u16) -> Result<gang_server::ServerSettings, Box<
             kill_grace: NonZeroDuration::from_secs(7),
             ..gang_config::ActionsConfig::default()
         }),
+        scaling: Arc::new(gang_config::ScalingConfig::default()),
         proxy_protocol: Arc::new(gang_config::ProxyProtocolConfig::default()),
         leadership: gang_config::LeadershipConfig::default(),
         standby_routability_delay: Duration::ZERO,

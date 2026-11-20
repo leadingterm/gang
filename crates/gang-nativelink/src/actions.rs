@@ -838,6 +838,14 @@ pub(crate) mod tests {
         };
         let mut snapshot = gang_spi::SchedulerSnapshot::default();
         let history = crate::snapshot::tests::history();
+        let clock = Arc::new(gang_clock::TestClock::new(Timestamp::from_unix_millis(0)));
+        let rates = crate::source_rates::SourceRates::new(
+            &gang_config::ScalingConfig::default(),
+            fleets.len(),
+            clock,
+        )
+        .map_err(|error| error.to_string())?;
+        let mut scratch = crate::snapshot::Scratch::default();
         crate::snapshot::fill(
             &fake,
             &workers,
@@ -845,6 +853,8 @@ pub(crate) mod tests {
             &history,
             Timestamp::from_unix_millis(0),
             0,
+            &rates,
+            &mut scratch,
             &mut snapshot,
         )
         .await

@@ -19,6 +19,7 @@ use crate::identity_config::IdentityConfig;
 use crate::plugin_set::PluginSet;
 use crate::proxy_protocol_config::ProxyProtocol;
 use crate::role_config::RoleConfig;
+use crate::scaling::ScalingConfig;
 use crate::server_config::{EndpointTrust, ServerConfig, Transport};
 use crate::worker_config::WorkerConfig;
 
@@ -65,6 +66,9 @@ pub struct GangConfig<P: PluginSet, F = Fleets<P>> {
     /// Scheduling and enforcement policy for actions.
     #[serde(default)]
     pub actions: ActionsConfig,
+    /// Rate-based scaling policy. The section may be omitted.
+    #[serde(default)]
+    pub scaling: ScalingConfig,
     /// The identity providers that prove identity before a certificate or token is issued. The
     /// section may be omitted, which means no providers: the `none` plugins need none, and a
     /// plugin that names a provider is rejected by validation.
@@ -159,6 +163,7 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
             health_listen,
             fleets,
             actions,
+            scaling,
             identity,
             authentication,
             execution,
@@ -194,6 +199,12 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
             return Err(ConfigError::MissingEgress);
         }
         Self::check_actions(&fleets, &actions)?;
+        if scaling.scale_in_dwell.get() < scaling.load_half_life.get() {
+            return Err(ConfigError::ScaleInDwellTooShort {
+                scale_in_dwell: scaling.scale_in_dwell.get(),
+                load_half_life: scaling.load_half_life.get(),
+            });
+        }
         if worker.connect_timeout.get() / 2 >= server.worker_timeout.get() {
             return Err(ConfigError::WorkerConnectTimeoutTooLong {
                 connect_timeout: worker.connect_timeout.get(),
@@ -223,6 +234,7 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
             health_listen,
             fleets,
             actions,
+            scaling,
             identity,
             authentication,
             execution,

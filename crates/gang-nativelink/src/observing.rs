@@ -2,12 +2,16 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use gang_clock::{Clock, Timestamp};
-use gang_spi::{Executed, ExecutionTimes, Observation, ObservationSink, Phase};
-use gang_types::Identity;
+use gang_clock::{Clock, Tick, Timestamp};
+use gang_spi::{
+    Executed, ExecutionTimes, FleetSupply, InstanceCordon, Observation, ObservationSink, Phase,
+    PortError,
+};
+use gang_types::{FleetCatalog, FleetName, Identity, InstanceId};
 use nativelink_error::{Code, Error, make_err};
 use nativelink_metric::{
     MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent, RootMetricsComponent,
@@ -19,11 +23,12 @@ use nativelink_scheduler::platform_property_manager::PlatformPropertyManager;
 use nativelink_scheduler::worker::{Worker, WorkerTimestamp};
 use nativelink_scheduler::worker_scheduler::{WorkerScheduler, WorkerSummary};
 use nativelink_util::action_messages::{
-    ActionResult, ActionStage, ExecutionMetadata, OperationId, WorkerId,
+    ActionInfo as NativeActionInfo, ActionResult, ActionStage, ExecutionMetadata, OperationId,
+    WorkerId,
 };
 use nativelink_util::operation_state_manager::UpdateOperationType;
 use nativelink_util::operation_state_manager::{
-    ActionStateResult, ClientStateManager, OperationFilter, OperationStageFlags,
+    ClientStateManager, OperationFilter, OperationStageFlags,
 };
 use nativelink_util::origin_event::OriginMetadata;
 use nativelink_util::shutdown_guard::ShutdownGuard;
@@ -31,9 +36,11 @@ use parking_lot::Mutex;
 use tokio::sync::RwLock;
 
 use crate::actions::digest_text;
+use crate::cordons::InstanceCordons;
 use crate::durations::ActionDurations;
 use crate::handoff::HandOff;
 use crate::observer::origin;
+use crate::source_rates::{self, SourceRates};
 
 /// Forwards every call to the inner worker scheduler and counts the actions that reach a
 /// terminal result on a worker. Only a successful `Completed` update counts: errors, keep-alives,
@@ -47,11 +54,15 @@ pub(crate) struct ObservingWorkerScheduler {
     handoff: HandOff,
     durations: Arc<Mutex<ActionDurations>>,
     clock: Arc<dyn Clock>,
+    fleets: Arc<FleetCatalog>,
+    rates: Arc<SourceRates>,
+    cordons: InstanceCordons,
     retiring: RwLock<bool>,
 }
 
 impl ObservingWorkerScheduler {
     /// Wraps the worker scheduler, counting and observing completed actions.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         inner: Arc<dyn WorkerScheduler>,
         operations: Arc<dyn ClientStateManager>,
@@ -60,6 +71,8 @@ impl ObservingWorkerScheduler {
         handoff: HandOff,
         durations: Arc<Mutex<ActionDurations>>,
         clock: Arc<dyn Clock>,
+        fleets: Arc<FleetCatalog>,
+        rates: Arc<SourceRates>,
     ) -> Self {
         Self {
             inner,
@@ -69,7 +82,55 @@ impl ObservingWorkerScheduler {
             handoff,
             durations,
             clock,
+            cordons: InstanceCordons::new(Arc::clone(&fleets)),
+            fleets,
+            rates,
             retiring: RwLock::new(false),
+        }
+    }
+
+    /// A physical controller command, separate from worker-owned self-drain flags.
+    pub(crate) async fn set_draining(
+        &self,
+        fleet: &FleetName,
+        instance: &InstanceId,
+        draining: bool,
+    ) -> Result<(), PortError> {
+        let retiring = self.retiring.read().await;
+        if *retiring && !draining {
+            return Err(PortError::backend(make_err!(
+                Code::Unavailable,
+                "the controller is handing off"
+            )));
+        }
+        self.cordons
+            .set_draining(&*self.inner, fleet, instance, draining)
+            .await
+    }
+
+    pub(crate) async fn retain_drains(
+        &self,
+        now: Tick,
+        grace: Duration,
+        live: &[(&FleetName, &FleetSupply)],
+    ) {
+        self.cordons.retain(now, grace, live).await;
+    }
+
+    pub(crate) async fn cordons_into(&self, into: &mut Vec<InstanceCordon>) {
+        self.cordons.snapshot_into(into).await;
+    }
+
+    async fn forget_if_disconnected(&self, worker: &WorkerId, removed: bool) {
+        if removed
+            || !self
+                .inner
+                .worker_snapshot()
+                .await
+                .iter()
+                .any(|row| row.id == worker.0)
+        {
+            self.cordons.disconnected(worker).await;
         }
     }
 
@@ -94,6 +155,8 @@ impl ObservingWorkerScheduler {
                 let id = WorkerId::from(worker.id.clone());
                 if let Err(error) = self.inner.remove_worker(&id).await {
                     tracing::warn!(?error, worker = %worker.id, "could not remove idle worker during hand-off");
+                } else {
+                    self.cordons.disconnected(&id).await;
                 }
             }
         }
@@ -109,9 +172,12 @@ impl ObservingWorkerScheduler {
                 .await
                 .into_iter()
                 .any(|worker| worker.id == worker_id.0 && worker.running_actions == 0)
-            && let Err(error) = self.inner.remove_worker(worker_id).await
         {
-            tracing::warn!(?error, worker = %worker_id.0, "could not remove idle worker during hand-off");
+            if let Err(error) = self.inner.remove_worker(worker_id).await {
+                tracing::warn!(?error, worker = %worker_id.0, "could not remove idle worker during hand-off");
+            } else {
+                self.cordons.disconnected(worker_id).await;
+            }
         }
         self.signal_if_released().await;
     }
@@ -124,13 +190,12 @@ impl ObservingWorkerScheduler {
     }
 
     /// Builds an observation from the retained operation and its final result.
-    async fn executed(
-        &self,
+    fn executed(
         worker_id: &WorkerId,
-        operation: &dyn ActionStateResult,
+        info: &NativeActionInfo,
+        metadata: Option<&OriginMetadata>,
         result: &ActionResult,
     ) -> Option<Executed> {
-        let (info, metadata) = operation.as_action_info().await.ok()?;
         let OriginMetadata {
             identity,
             bazel_metadata,
@@ -193,7 +258,7 @@ impl WorkerScheduler for ObservingWorkerScheduler {
         self.inner.get_platform_property_manager()
     }
 
-    async fn add_worker(&self, worker: Worker) -> Result<(), Error> {
+    async fn add_worker(&self, mut worker: Worker) -> Result<(), Error> {
         let retiring = self.retiring.read().await;
         if *retiring {
             return Err(make_err!(
@@ -201,6 +266,7 @@ impl WorkerScheduler for ObservingWorkerScheduler {
                 "the controller is handing off"
             ));
         }
+        let _admission = self.cordons.admission(&*self.inner, &mut worker).await;
         self.inner.add_worker(worker).await
     }
 
@@ -280,6 +346,27 @@ impl WorkerScheduler for ObservingWorkerScheduler {
             && completed.execution_metadata == metadata
         {
             self.completed.fetch_add(1, Ordering::Relaxed);
+            let action = operation.as_action_info().await.ok();
+            if let Some((info, _)) = &action
+                && info
+                    .platform_properties
+                    .get(gang_types::property::ACTION_ENVIRONMENT)
+                    .and_then(|value| value.parse::<gang_types::ActionEnvironment>().ok())
+                    .is_some()
+                && let Some(preferred) = self
+                    .fleets
+                    .accepting(|key| info.platform_properties.get(key).map(String::as_str))
+                    .iter()
+                    .next()
+            {
+                let source = self.rates.source(origin.as_ref());
+                self.rates.record(
+                    source,
+                    preferred,
+                    crate::snapshot::resources(&info.platform_properties),
+                    source_rates::timing(&completed.execution_metadata),
+                );
+            }
             if let Some(metadata) = origin.and_then(|origin| origin.bazel_metadata)
                 && !metadata.action_mnemonic.is_empty()
                 && completed.execution_metadata.worker_start_timestamp
@@ -300,7 +387,10 @@ impl WorkerScheduler for ObservingWorkerScheduler {
                     self.clock.wall(),
                 );
             }
-            if let Some(executed) = self.executed(worker_id, &*operation, completed).await {
+            if let Some((info, metadata)) = &action
+                && let Some(executed) =
+                    Self::executed(worker_id, info, metadata.as_ref(), completed)
+            {
                 self.sink.record(Observation::Executed(executed));
             }
         }
@@ -359,12 +449,14 @@ impl WorkerScheduler for ObservingWorkerScheduler {
 
     async fn remove_worker(&self, worker_id: &WorkerId) -> Result<(), Error> {
         let result = self.inner.remove_worker(worker_id).await;
+        self.forget_if_disconnected(worker_id, result.is_ok()).await;
         self.signal_if_released().await;
         result
     }
 
     async fn worker_disconnected(&self, worker_id: &WorkerId) -> Result<(), Error> {
         let result = self.inner.worker_disconnected(worker_id).await;
+        self.forget_if_disconnected(worker_id, result.is_ok()).await;
         self.signal_if_released().await;
         result
     }
@@ -387,7 +479,9 @@ impl WorkerScheduler for ObservingWorkerScheduler {
                 "the controller is handing off"
             ));
         }
-        self.inner.set_drain_worker(worker_id, is_draining).await
+        self.cordons
+            .set_worker_draining(&*self.inner, worker_id, is_draining)
+            .await
     }
 
     async fn worker_snapshot(&self) -> Vec<WorkerSummary> {
@@ -547,6 +641,16 @@ mod tests {
     fn test_clock() -> Arc<dyn Clock> {
         Arc::new(TestClock::new(Timestamp::from_unix_millis(1_000_000_000)))
     }
+    fn test_fleets() -> Arc<FleetCatalog> {
+        Arc::new(crate::snapshot::tests::catalog())
+    }
+
+    fn test_rates() -> Arc<SourceRates> {
+        Arc::new(
+            SourceRates::new(&gang_config::ScalingConfig::default(), 2, test_clock())
+                .expect("bounded test table"),
+        )
+    }
 
     fn test_action_info() -> Arc<ActionInfo> {
         let digest = DigestInfo::new([3; 32], 30);
@@ -554,7 +658,10 @@ mod tests {
             command_digest: digest,
             input_root_digest: digest,
             timeout: Duration::from_mins(1),
-            platform_properties: HashMap::new(),
+            platform_properties: HashMap::from([(
+                gang_types::property::ACTION_ENVIRONMENT.to_owned(),
+                "host:test".to_owned(),
+            )]),
             priority: 0,
             load_timestamp: SystemTime::UNIX_EPOCH,
             insert_timestamp: SystemTime::UNIX_EPOCH,
@@ -626,6 +733,8 @@ mod tests {
                 HandOff::new(),
                 test_durations(),
                 test_clock(),
+                test_fleets(),
+                test_rates(),
             );
             let forwarded = scheduler
                 .update_action(
@@ -641,6 +750,9 @@ mod tests {
                 completed.load(Ordering::Relaxed),
                 u64::from(!fail && !read_fails && !requeue)
             );
+            let mut moments = Vec::new();
+            scheduler.rates.snapshot_into(&mut moments);
+            assert_eq!(moments.len(), usize::from(!fail && !read_fails && !requeue));
             drop(scheduler);
             let observation = receiver.next().await;
             if fail || read_fails || requeue {
@@ -746,6 +858,8 @@ mod tests {
                 HandOff::new(),
                 test_durations(),
                 test_clock(),
+                test_fleets(),
+                test_rates(),
             );
             scheduler
                 .update_action(
@@ -758,18 +872,22 @@ mod tests {
                 .await
                 .expect("ignored update forwards");
             assert_eq!(completed.load(Ordering::Relaxed), 0);
+            let mut moments = Vec::new();
+            scheduler.rates.snapshot_into(&mut moments);
+            assert!(moments.is_empty());
             drop(scheduler);
             assert!(observations.next().await.is_none());
         }
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn duration_history_only_records_verified_worker_completions() {
         let worker = WorkerId("w-1".to_owned());
         let operation = OperationId::String("op-1".to_owned());
         let now = Timestamp::from_unix_millis(1_000_000_000);
         let t = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
-        for case in 0..14 {
+        for case in 0..17 {
             let inner = Arc::new(RecordingScheduler::new(case == 7));
             let mut origin = Some(test_origin(if case == 1 { "" } else { "local:alice" }));
             if case == 2 {
@@ -794,6 +912,10 @@ mod tests {
             } else if case == 11 {
                 result.execution_metadata.worker_completed_timestamp = t;
             }
+            if case == 14 {
+                result.execution_metadata.worker_completed_timestamp =
+                    result.execution_metadata.worker_start_timestamp;
+            }
             if case == 8 || case == 12 {
                 let mut replacement = result.clone();
                 if case == 8 {
@@ -804,11 +926,37 @@ mod tests {
                 *inner.replacement.lock() = Some(replacement);
             }
             let durations = test_durations();
+            let mut info = test_action_info();
+            let properties = &mut Arc::make_mut(&mut info).platform_properties;
+            properties.insert(
+                gang_types::property::CPU_MILLICORES.to_owned(),
+                "2000".to_owned(),
+            );
+            properties.insert(gang_types::property::MEMORY_KB.to_owned(), "4".to_owned());
+            properties.insert(gang_types::property::DISK_KB.to_owned(), "8".to_owned());
+            if case == 15 {
+                properties.insert(
+                    gang_types::property::FLEET.to_owned(),
+                    "unknown-fleet".to_owned(),
+                );
+            }
+            if case == 16 {
+                properties.insert(
+                    gang_types::property::ACTION_ENVIRONMENT.to_owned(),
+                    "host:old".to_owned(),
+                );
+            }
+            let clock = Arc::new(TestClock::new(now));
+            clock.advance(Duration::from_hours(4));
+            let rates = Arc::new(
+                SourceRates::new(&gang_config::ScalingConfig::default(), 2, clock.clone())
+                    .expect("bounded table"),
+            );
             let operations: Arc<dyn ClientStateManager> = if case == 13 {
                 Arc::new(NoOperations)
             } else {
                 Arc::new(Operations {
-                    info: test_action_info(),
+                    info,
                     stage: Arc::clone(&inner.stage),
                     origin,
                 })
@@ -821,8 +969,11 @@ mod tests {
                     .0,
                 HandOff::new(),
                 Arc::clone(&durations),
-                test_clock(),
+                clock.clone(),
+                test_fleets(),
+                Arc::clone(&rates),
             );
+            let duplicate = result.clone();
             let update = match case {
                 9 => UpdateOperationType::UpdateWithActionStage(ActionStage::CompletedFromCache(
                     ProtoActionResult::default(),
@@ -832,13 +983,69 @@ mod tests {
             };
             let forwarded = scheduler.update_action(&worker, &operation, update).await;
             assert_eq!(forwarded.is_err(), case == 7);
+            let mut moments = Vec::new();
+            scheduler.rates.snapshot_into(&mut moments);
+            let verified = matches!(case, 0..=6 | 11 | 14);
+            assert_eq!(moments.len(), usize::from(verified), "case {case}");
+            if verified {
+                let row = moments[0];
+                let kappa = std::f64::consts::LN_2 / 60.0;
+                assert_eq!(
+                    row.completions.get().to_bits(),
+                    kappa.to_bits(),
+                    "case {case}"
+                );
+                assert_eq!(row.at, clock.monotonic(), "case {case}");
+                assert_eq!(row.source.is_some(), !matches!(case, 1 | 2), "case {case}");
+                let timed = !matches!(case, 5 | 6 | 11);
+                assert_eq!(
+                    row.timed_completions.get().to_bits(),
+                    (if timed { kappa } else { 0.0 }).to_bits(),
+                    "case {case}"
+                );
+                let seconds = if timed && case != 14 { 7.0 } else { 0.0 };
+                assert_eq!(
+                    row.work.actions.get().to_bits(),
+                    (kappa * seconds).to_bits(),
+                    "case {case}"
+                );
+                assert_eq!(
+                    row.work.cpu_millicores.get().to_bits(),
+                    (kappa * seconds * 2000.0).to_bits(),
+                    "case {case}"
+                );
+                assert_eq!(
+                    row.work.memory.get().to_bits(),
+                    (kappa * seconds * 4096.0).to_bits(),
+                    "case {case}"
+                );
+                assert_eq!(
+                    row.work.disk.get().to_bits(),
+                    (kappa * seconds * 8192.0).to_bits(),
+                    "case {case}"
+                );
+                scheduler
+                    .update_action(
+                        &worker,
+                        &operation,
+                        UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(
+                            duplicate,
+                        )),
+                    )
+                    .await
+                    .expect("duplicate forwards");
+                rates.snapshot_into(&mut moments);
+                assert_eq!(moments, [row], "duplicate must not add moments");
+            }
             let expected = match case {
-                0 | 1 => Some(Duration::from_secs(7)),
-                11 => Some(Duration::ZERO),
+                0 | 1 | 15 | 16 => Some(Duration::from_secs(7)),
+                11 | 14 => Some(Duration::ZERO),
                 _ => None,
             };
             assert_eq!(
-                durations.lock().expected("//pkg:target", "Compile", now),
+                durations
+                    .lock()
+                    .expected("//pkg:target", "Compile", clock.wall()),
                 expected,
                 "case {case}"
             );
@@ -869,6 +1076,7 @@ mod tests {
         manager: PlatformPropertyManager,
         workers: parking_lot::Mutex<Option<Vec<WorkerSummary>>>,
         events: parking_lot::Mutex<Vec<String>>,
+        admitted_flags: parking_lot::Mutex<Vec<bool>>,
     }
 
     impl RecordingScheduler {
@@ -883,6 +1091,7 @@ mod tests {
                 manager: PlatformPropertyManager::new(HashMap::new()),
                 workers: parking_lot::Mutex::new(None),
                 events: parking_lot::Mutex::new(Vec::new()),
+                admitted_flags: parking_lot::Mutex::new(Vec::new()),
             }
         }
     }
@@ -906,7 +1115,8 @@ mod tests {
             &self.manager
         }
 
-        async fn add_worker(&self, _worker: Worker) -> Result<(), Error> {
+        async fn add_worker(&self, worker: Worker) -> Result<(), Error> {
+            self.admitted_flags.lock().push(worker.is_draining);
             Ok(())
         }
 
@@ -1039,6 +1249,11 @@ mod tests {
             self.events
                 .lock()
                 .push(format!("drain:{}:{is_draining}", worker_id.0));
+            if let Some(workers) = self.workers.lock().as_mut()
+                && let Some(worker) = workers.iter_mut().find(|worker| worker.id == worker_id.0)
+            {
+                worker.is_draining = is_draining;
+            }
             Ok(())
         }
 
@@ -1085,8 +1300,88 @@ mod tests {
             HandOff::new(),
             test_durations(),
             test_clock(),
+            test_fleets(),
+            test_rates(),
         );
         (inner, counting, completed)
+    }
+    #[tokio::test]
+    async fn worker_self_drain_and_controller_cordon_keep_separate_owners() {
+        let (inner, scheduler, _) = wrap(false);
+        let old = WorkerId("local-1-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b".to_owned());
+        let new = WorkerId("local-1-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6c".to_owned());
+        let mut summary = inner.worker_snapshot().await.remove(0);
+        summary.id.clone_from(&old.0);
+        summary
+            .platform_properties
+            .insert(gang_types::property::FLEET.to_owned(), "fleet-a".to_owned());
+        let mut healthy = summary.clone();
+        healthy.id.clone_from(&new.0);
+        *inner.workers.lock() = Some(vec![summary, healthy]);
+        let fleet = FleetName::try_new("fleet-a").expect("fleet");
+        let instance = InstanceId::try_new("local-1").expect("instance");
+        let mut cordons = Vec::new();
+        scheduler
+            .set_drain_worker(&old, true)
+            .await
+            .expect("self drain");
+        scheduler.cordons_into(&mut cordons).await;
+        assert!(cordons.is_empty());
+        scheduler
+            .set_draining(&fleet, &instance, true)
+            .await
+            .expect("controller cordon");
+        scheduler.cordons_into(&mut cordons).await;
+        assert_eq!(cordons.len(), 1);
+        scheduler
+            .set_drain_worker(&new, false)
+            .await
+            .expect("self resume cannot override controller");
+        assert!(
+            inner
+                .worker_snapshot()
+                .await
+                .iter()
+                .all(|worker| worker.is_draining)
+        );
+        scheduler
+            .set_draining(&fleet, &instance, false)
+            .await
+            .expect("controller cancel");
+        let workers = inner.worker_snapshot().await;
+        assert!(workers[0].is_draining);
+        assert!(!workers[1].is_draining);
+        scheduler.cordons_into(&mut cordons).await;
+        assert!(cordons.is_empty());
+    }
+
+    #[tokio::test]
+    async fn worker_admission_inherits_physical_intent_before_forwarding() {
+        let (inner, scheduler, _) = wrap(false);
+        *inner.workers.lock() = Some(Vec::new());
+        let fleet = FleetName::try_new("fleet-a").expect("fleet");
+        let instance = InstanceId::try_new("local-1").expect("instance");
+        scheduler
+            .set_draining(&fleet, &instance, true)
+            .await
+            .expect("unconnected cordon");
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let worker = Worker::new(
+            WorkerId("local-1-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b".to_owned()),
+            nativelink_util::platform_properties::PlatformProperties {
+                properties: HashMap::from([(
+                    gang_types::property::FLEET.to_owned(),
+                    nativelink_util::platform_properties::PlatformPropertyValue::Exact(
+                        "fleet-a".to_owned(),
+                    ),
+                )]),
+            },
+            sender,
+            0,
+            0,
+        );
+        scheduler.add_worker(worker).await.expect("admission");
+        assert_eq!(*inner.admitted_flags.lock(), [true]);
     }
 
     #[tokio::test]

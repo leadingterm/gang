@@ -59,6 +59,7 @@ fn fleet_member(name: &str, max_instances: u32) -> FleetMember<TestPlugins> {
 #[must_use]
 pub fn queued_demand(candidates: FleetSet) -> QueuedDemand {
     QueuedDemand {
+        source: None,
         candidates,
         environment: "host:test".parse().expect("valid test environment"),
         resources: ActionResources::default(),

@@ -30,6 +30,7 @@
 mod actions;
 mod config;
 mod controller;
+mod cordons;
 mod durations;
 #[cfg(test)]
 mod equivalence;
@@ -52,6 +53,7 @@ mod refusals;
 mod serve;
 mod settings;
 mod snapshot;
+mod source_rates;
 mod standing;
 mod store_usage;
 mod stores;

@@ -253,6 +253,7 @@ const PassBar = ({ state }: { state: State }) => {
 const CAUSE_TEXT: Partial<Record<Cause, string>> = {
   ORPHAN: "no worker within boot grace",
   MAX_DRAIN_WAIT: "max drain wait reached",
+  UTILIZATION: "measured fleet load stayed below the waterline for the dwell",
 };
 
 /** Causes that point at something gone wrong. */
