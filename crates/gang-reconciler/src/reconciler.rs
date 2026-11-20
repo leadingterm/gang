@@ -445,7 +445,7 @@ impl Reconciler {
             };
             capacity.draining = self.draining[draining..]
                 .iter()
-                .filter(|d| d.owned)
+                .filter(|d| d.owned && !d.environment.is_stale())
                 .count()
                 .saturating_into();
             self.census[index] = FleetCensus {
@@ -698,11 +698,17 @@ impl Reconciler {
             .filter(|d| d.environment.is_stale() && d.end.is_some())
             .count()
             .saturating_into();
+        let max = view.policy.instances.max().get();
         let to = purchase_target(
             view.needed,
             retaining.saturating_add(census.stale_retained.saturating_sub(stale_terminated)),
-            view.policy.instances.max().get(),
+            max,
         );
+        let to = if census.stale_retained > 0 {
+            to.min(from.saturating_add(max.saturating_sub(census.live)))
+        } else {
+            to
+        };
         if view.supply.abandoned > 0 && resumed == 0 {
             plan.steps.push(PlanStep {
                 fleet: index,

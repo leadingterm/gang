@@ -38,6 +38,51 @@ fn queued_environment_selects_only_matching_launch_fleet() -> TestResult {
 }
 
 #[test]
+fn stale_owned_drain_with_launch_failure_has_no_expected_wait() -> TestResult {
+    for unknown in [false, true] {
+        let mut h = Harness::with_policy(fleet("gang-first", 1, 16)?);
+        serve(&mut h, "local-1", secs(60))?;
+        h.snapshot.workers[0].environment = if unknown {
+            None
+        } else {
+            Some("host:old".parse()?)
+        };
+        h.set_running("local-1", 1)?;
+        h.set_draining("local-1", true)?;
+        h.supply_mut(X86)?.launch_failure = Some(gang_spi::LaunchFailure {
+            reason: "capacity unavailable".into(),
+        });
+        h.queue(X86, 1)?;
+        h.reconcile();
+        assert_eq!(h.outlook(X86)?.expected_wait, None);
+    }
+    Ok(())
+}
+
+#[test]
+fn stale_owned_drain_does_not_block_fallback_after_launch_failure() -> TestResult {
+    let mut h = Harness::with_fleets(vec![
+        fleet("gang-first", 1, 16)?,
+        fleet("gang-second", 2, 16)?,
+    ]);
+    serve(&mut h, "local-1", secs(60))?;
+    h.snapshot.workers[0].environment = Some("host:old".parse()?);
+    h.set_running("local-1", 1)?;
+    h.set_draining("local-1", true)?;
+    h.supply_mut(X86)?.launch_failure = Some(gang_spi::LaunchFailure {
+        reason: "capacity unavailable".into(),
+    });
+    h.queue_candidates(FleetSet::prefix(2)?, 17);
+    let steps = h.reconcile();
+    assert!(
+        steps.iter().any(|step| {
+            step.fleet == 1 && matches!(step.action, Action::ScaleOut { to: 1, .. })
+        })
+    );
+    Ok(())
+}
+
+#[test]
 fn stale_idle_worker_retires_at_maximum_before_replacement() -> TestResult {
     let mut policy = policy()?;
     policy.instances = InstanceBounds::try_new(1, NonZeroU32::MIN)?;
@@ -71,7 +116,13 @@ fn stale_idle_worker_retires_at_maximum_before_replacement() -> TestResult {
             .any(|step| matches!(step.action, Action::CancelDrain(..)))
     );
     assert!(
-        second
+        !second
+            .iter()
+            .any(|step| matches!(step.action, Action::ScaleOut { .. }))
+    );
+    let third = h.run();
+    assert!(
+        third
             .iter()
             .any(|step| matches!(step.action, Action::ScaleOut { to: 1, .. }))
     );
@@ -234,7 +285,12 @@ fn unknown_idle_worker_retires_before_replacement() -> TestResult {
         }
     )));
     assert!(
-        second
+        !second
+            .iter()
+            .any(|step| matches!(step.action, Action::ScaleOut { .. }))
+    );
+    assert!(
+        h.run()
             .iter()
             .any(|step| matches!(step.action, Action::ScaleOut { to: 1, .. }))
     );
