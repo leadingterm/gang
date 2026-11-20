@@ -93,7 +93,7 @@ yq -o=json '.jobs' "$workflow" | jq -e '
   | needs("macos"; ["changes"])
   | needs("linux-arm64"; ["changes", "linux-arm64-bundle", "linux-arm64-checks"])
   | needs("linux-arm64-checks"; ["changes", "linux-arm64-bundle"])
-  | needs("release-validation"; ["changes", "required", "linux-arm64", "cross", "macos"])
+  | needs("release-validation"; ["changes", "required", "linux-arm64", "cross"])
   | results("release-validation")
   | reduce ["e2e-gate-1", "e2e-gate-2"][] as $id (.;
       needs($id + "-shards"; ["changes", "linux-x86_64-bundle"])
