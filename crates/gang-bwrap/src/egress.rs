@@ -426,13 +426,13 @@ async fn configure(
     let (resolver, environment) = prepare_sealed_inputs(spec, policy)?;
     let (gate, gate_child) = gang_os::execution_gate_pair().map_err(BwrapError::NetworkSetup)?;
     state.gate = Some(gate.into_async().map_err(BwrapError::NetworkSetup)?);
-    state.bwrap = Some(bwrap.spawn(
-        spec,
-        Some(NetworkSetup {
+    state.bwrap = Some({
+        let network = NetworkSetup {
             gate: gate_child,
             resolver,
-        }),
-    )?);
+        };
+        bwrap.spawn(spec, Some((network.gate.as_fd(), network.resolver.as_fd())))?
+    });
     state
         .bwrap
         .as_mut()

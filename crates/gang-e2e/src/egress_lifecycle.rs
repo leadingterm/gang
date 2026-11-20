@@ -471,6 +471,8 @@ mod linux {
     }
 
     pub(super) fn run(inputs: &DeploymentInputs, targets: &EgressTargets) -> Result<Report> {
+        let host_uid = rustix::process::getuid().as_raw();
+        let host_gid = rustix::process::getgid().as_raw();
         let launcher = &inputs.settings.worker_launcher;
         let program = launcher.first().ok_or_else(|| {
             E2eError::system("egress lifecycle requires a systemd-run worker launcher")
@@ -514,7 +516,9 @@ mod linux {
             .arg(executable)
             .arg("--gang-e2e-egress-lifecycle")
             .arg(input_path)
-            .arg(target_path);
+            .arg(target_path)
+            .arg(host_uid.to_string())
+            .arg(host_gid.to_string());
         let timeout = inputs
             .settings
             .command_timeout
@@ -531,23 +535,38 @@ mod linux {
         serde_json::from_str(&output.stdout).map_err(E2eError::parse("egress lifecycle report"))
     }
 
+    fn validate_driver_identity(args: &[OsString], actual: (u32, u32)) -> Result<()> {
+        if args.len() != 5 {
+            return Err(E2eError::system("invalid egress lifecycle arguments"));
+        }
+        let identity = args[3]
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+            .zip(args[4].to_str().and_then(|value| value.parse::<u32>().ok()))
+            .filter(|(uid, _)| *uid != 0)
+            .ok_or_else(|| E2eError::system("invalid lifecycle driver identity"))?;
+        if identity != actual {
+            return Err(E2eError::system(
+                "lifecycle driver identity differs from caller identity",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn private_main(args: &[OsString]) -> Option<ExitCode> {
         if args.first()?.to_str()? != "--gang-e2e-egress-lifecycle" {
             return None;
         }
         let result = (|| {
-            if args.len() != 3 {
-                return Err(E2eError::system("invalid egress lifecycle arguments"));
-            }
+            validate_driver_identity(
+                args,
+                (
+                    rustix::process::getuid().as_raw(),
+                    rustix::process::getgid().as_raw(),
+                ),
+            )?;
             let inputs: DeploymentInputs = json_read(Path::new(&args[1]))?;
             let mut targets: EgressTargets = json_read(Path::new(&args[2]))?;
-            if rustix::process::getuid().as_raw() != targets.uid
-                || rustix::process::getgid().as_raw() != targets.gid
-            {
-                return Err(E2eError::system(
-                    "lifecycle driver identity differs from fixture identity",
-                ));
-            }
             host_policy(&inputs, &mut targets)?;
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1246,8 +1265,42 @@ mod linux {
 
     #[cfg(test)]
     mod tests {
-        use super::parse_interface_addresses;
+        use super::{parse_interface_addresses, validate_driver_identity};
+        use std::ffi::OsString;
         use std::net::IpAddr;
+
+        #[test]
+        fn lifecycle_driver_checks_host_identity_not_sandbox_identity() {
+            for (uid, gid) in [(1001, 1001), (1000, 100), (1001, 0)] {
+                let args: Vec<OsString> = [
+                    "--gang-e2e-egress-lifecycle".into(),
+                    "inputs.json".into(),
+                    "targets.json".into(),
+                    uid.to_string().into(),
+                    gid.to_string().into(),
+                ]
+                .into();
+                assert!(validate_driver_identity(&args, (uid, gid)).is_ok());
+                assert!(validate_driver_identity(&args, (uid + 1, gid)).is_err());
+                assert!(validate_driver_identity(&args, (uid, gid + 1)).is_err());
+                assert!(validate_driver_identity(&args, (1000, 1000)).is_err());
+            }
+        }
+
+        #[test]
+        fn lifecycle_driver_rejects_malformed_identity_arguments() {
+            for args in [
+                vec!["command", "inputs", "targets", "1001"],
+                vec!["command", "inputs", "targets", "1001", "1001", "extra"],
+                vec!["command", "inputs", "targets", "bad", "1001"],
+                vec!["command", "inputs", "targets", "1001", "-1"],
+                vec!["command", "inputs", "targets", "0", "1001"],
+                vec!["command", "inputs", "targets", "4294967296", "1001"],
+            ] {
+                let args: Vec<OsString> = args.into_iter().map(OsString::from).collect();
+                assert!(validate_driver_identity(&args, (1001, 1001)).is_err());
+            }
+        }
 
         #[test]
         fn parses_all_host_interface_addresses() {

@@ -253,7 +253,6 @@ fn stages_egress_inputs_with_executable_permissions_and_round_trips_targets() {
         "nonce": "fixture-nonce",
         "uid": 1234,
         "gid": 5678,
-        "nft": "/nix/store/test-nft/bin/nft",
         "timeout": "5s",
         "policy": {
             "protected_networks": ["10.20.0.0/16"],

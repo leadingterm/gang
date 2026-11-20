@@ -1,10 +1,10 @@
 //! The `bwrap` command line of one action.
 
 use std::ffi::OsStr;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::process::Command;
 
-use crate::bwrap::{Bwrap, NetworkSetup};
+use crate::bwrap::Bwrap;
 use gang_spi::ActionExecutionSpec;
 
 /// The bound multicall executable inside the sandbox.
@@ -32,7 +32,7 @@ impl Bwrap {
         &self,
         spec: &ActionExecutionSpec<'_>,
         info_fd: RawFd,
-        network: Option<&NetworkSetup>,
+        network: Option<(BorrowedFd<'_>, BorrowedFd<'_>)>,
     ) -> Command {
         let action_directory = spec.action_directory.as_os_str();
         let mut command = match spec.launcher.split_first() {
@@ -53,10 +53,10 @@ impl Bwrap {
             OsStr::new("--chdir"),
             spec.working_directory.as_os_str(),
         ]);
-        if let Some(network) = network {
+        if let Some((_gate, resolver)) = network {
             command
                 .arg("--ro-bind-data")
-                .arg(network.resolver.as_raw_fd().to_string())
+                .arg(resolver.as_raw_fd().to_string())
                 .arg("/etc/resolv.conf");
         } else {
             for (name, value) in spec.environment {
@@ -71,10 +71,10 @@ impl Bwrap {
             .arg("/")
             .arg("--")
             .arg(RESET_PATH);
-        if let Some(network) = network {
+        if let Some((gate, _resolver)) = network {
             command
                 .arg("--execution-gate-fd")
-                .arg(network.gate.as_raw_fd().to_string());
+                .arg(gate.as_raw_fd().to_string());
         }
         command
             .arg("--")
@@ -88,8 +88,8 @@ impl Bwrap {
 mod tests {
     use std::ffi::{OsStr, OsString};
     #[cfg(target_os = "linux")]
-    use std::os::fd::AsRawFd;
-    use std::os::fd::RawFd;
+    use std::os::fd::{AsFd, AsRawFd};
+    use std::os::fd::{BorrowedFd, RawFd};
     use std::path::Path;
     use std::process::Command;
 
@@ -97,7 +97,7 @@ mod tests {
     use gang_spi::ActionIsolationPort;
     use gang_spi::{ActionCommand, ActionExecutionSpec, NetworkAccess, Plugin, PluginContext};
 
-    use crate::bwrap::{NetworkSetup, tests::config};
+    use crate::bwrap::tests::config;
     use crate::Bwrap;
     use crate::BwrapConfig;
 
@@ -120,7 +120,7 @@ mod tests {
         action_directory: &Path,
         working_directory: &Path,
         network: NetworkAccess<'_>,
-        setup: Option<&NetworkSetup>,
+        setup: Option<(BorrowedFd<'_>, BorrowedFd<'_>)>,
     ) -> Result<Command, Box<dyn std::error::Error>> {
         let argv = [
             OsString::from("/bin/sh"),
@@ -250,13 +250,12 @@ mod tests {
         let resolver = tempfile::tempfile()?;
         let gate_fd = gate.as_raw_fd().to_string();
         let resolver_fd = resolver.as_raw_fd().to_string();
-        let setup = NetworkSetup { gate, resolver };
         let policy: gang_types::PublicEgressPolicy =
             toml::from_str("protected_networks = [\"10.0.0.0/8\"]\ndns_servers = [\"1.1.1.1\"]")?;
         let args = args(&command(
             &bwrap, Path::new("/work/a"), Path::new("/work/a"),
             NetworkAccess::PublicEgress { policy: &policy, controller_endpoints: &[] },
-            Some(&setup),
+            Some((gate.as_fd(), resolver.as_fd())),
         )?);
         assert!(args.iter().any(|arg| arg == "--unshare-all"), "{args:?}");
         assert!(!args.iter().any(|arg| arg == "--share-net"), "{args:?}");

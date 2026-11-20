@@ -155,10 +155,12 @@ setup_timeout = "10s"
 The resource ceilings are optional per-action request ceilings, not total worker capacity. For a hand-written `gang.toml`, replace the example protected networks with the complete operator-specific private, controller, public load-balancer and worker address spaces, including IPv6. The runtime `protected_networks` and `dns_servers` must be nonempty; DNS servers must be public and outside protected networks. In the Terraform/OpenTofu deployment module, `execution_egress.protected_networks` instead adds address spaces to the module-derived VPC IPv4 and assigned IPv6 CIDRs, controller public IP when present, and public load-balancer static IPs; this optional operator list defaults to `[]`. The module omits `[fleets.actions]` when grants are empty and `[fleets.actions.resources]` when no ceilings are set. Actions use only the configured resolvers, not host DNS. `setup_timeout` bounds network setup and defaults to `10s`. A network grant requires an enforcing `bwrap` sandbox; `noop` cannot grant it. Request network explicitly on the relevant Bazel rule or execution platform:
 
 ```starlark
-exec_properties = {"ISA": "x86-64", "network": "requested"}
+load("@gang_env//:defs.bzl", "EXEC_PROPERTIES")
+
+exec_properties = dict(EXEC_PROPERTIES, ISA = "x86-64", network = "requested")
 ```
 
-Use the ISA of your selected execution platform. Bazel may not apply the `gang bazelrc` default ISA when explicit execution properties are present, so preserve it in the selected platform or the properties above.
+Explicit execution properties may override defaults, so retain both the exact action environment identity from `EXEC_PROPERTIES` and the ISA of your selected execution platform. Bazel may not apply the `gang bazelrc` default ISA when explicit execution properties are present.
 
 The `requires-network` tag alone does not transmit that remote request. See the [specification](docs/SPECIFICATION.md#34-sandboxes-gang-noop-gang-bwrap) for the complete policy, resolver and sandbox contract.
 

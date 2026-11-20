@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 
 use gang_spi::{
@@ -41,6 +41,7 @@ pub struct Bwrap {
 }
 
 /// Descriptors inherited only by the initial bubblewrap spawn.
+#[cfg(target_os = "linux")]
 pub(crate) struct NetworkSetup {
     pub gate: gang_os::ExecutionGateChild,
     pub resolver: std::fs::File,
@@ -192,19 +193,19 @@ impl Bwrap {
     pub(crate) fn spawn(
         &self,
         spec: &ActionExecutionSpec<'_>,
-        network: Option<NetworkSetup>,
+        network: Option<(BorrowedFd<'_>, BorrowedFd<'_>)>,
     ) -> Result<StartedBwrap, BwrapError> {
         let (reader, writer) = std::io::pipe().map_err(BwrapError::InfoPipe)?;
-        if let Some(network) = &network {
-            rustix::io::fcntl_setfd(&network.gate, rustix::io::FdFlags::empty())
+        if let Some((gate, resolver)) = network {
+            rustix::io::fcntl_setfd(gate, rustix::io::FdFlags::empty())
                 .map_err(|errno| BwrapError::NetworkSetup(io::Error::from(errno)))?;
-            rustix::io::fcntl_setfd(&network.resolver, rustix::io::FdFlags::empty())
+            rustix::io::fcntl_setfd(resolver, rustix::io::FdFlags::empty())
                 .map_err(|errno| BwrapError::NetworkSetup(io::Error::from(errno)))?;
         }
         let mut command = tokio::process::Command::from(self.command(
             spec,
             writer.as_raw_fd(),
-            network.as_ref(),
+            network,
         ));
         command.kill_on_drop(true);
         let blocked = gang_os::block_terminations().map_err(BwrapError::SignalMask)?;
@@ -213,7 +214,6 @@ impl Bwrap {
             .map_err(|errno| BwrapError::InfoPipe(io::Error::from(errno)))?;
         let spawned = command.spawn();
         drop(blocked);
-        drop(network);
         drop(writer);
         let child = spawned.map_err(BwrapError::Run)?;
         let launcher = child.id().and_then(pid);
