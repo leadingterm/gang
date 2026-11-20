@@ -13,9 +13,9 @@ use gang_config::{
     ServerTransport, Transport, WorkerConfig,
 };
 use gang_types::{
-    AbsolutePathBuf, AuthenticationSettings, Bytes, CaPin, ClientSecret, FleetCountError,
-    FleetName, Isa, MAX_FLEETS, NonZeroBytes, NonZeroDuration, Percent, Permission, PermissionSet,
-    ProviderName, TrustDomain, Url,
+    AbsolutePathBuf, AuthenticationSettings, Bytes, CaPin, ClientSecret, FleetActionPolicy,
+    FleetCountError, FleetName, Isa, MAX_FLEETS, NonZeroBytes, NonZeroDuration, Percent,
+    Permission, PermissionSet, ProviderName, TrustDomain, Url,
 };
 use serde::{Deserialize, Serialize};
 
@@ -121,7 +121,8 @@ struct NoopSection {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BwrapSection {
-    permit_network_property: bool,
+    #[serde(default)]
+    egress: Option<toml::Table>,
     #[serde(default)]
     program: PathBuf,
 }
@@ -159,6 +160,16 @@ impl SandboxSelection for SandboxConfig {
             SandboxKey::Noop => self.noop.is_some(),
             SandboxKey::Bwrap => self.bwrap.is_some(),
         }
+    }
+
+    fn supports_capability(&self, key: SandboxKey, capability: gang_types::Capability) -> bool {
+        matches!(
+            (key, capability),
+            (SandboxKey::Bwrap, gang_types::Capability::Network)
+        ) && self
+            .bwrap
+            .as_ref()
+            .is_some_and(|section| section.egress.is_some())
     }
 
     fn try_for_each_program<E>(
@@ -425,7 +436,6 @@ const SANDBOX: &str = r#"
 kill_grace = "2s"
 
 [sandbox.bwrap]
-permit_network_property = false
 "#;
 
 const IDENTITY: &str = r#"
@@ -503,7 +513,6 @@ selected = "bwrap"
 kill_grace = "2s"
 
 [sandbox.bwrap]
-permit_network_property = false
 
 [execution]
 input_links = "break"
@@ -673,6 +682,122 @@ fn optional_health_proxy_mode_requires_its_listener() {
         );
         assert!(text.parse::<GangConfig<Plugins>>().is_ok(), "health {mode}");
     }
+}
+
+#[test]
+fn network_policy_is_validated_after_raw_parse() -> Result<(), Box<dyn Error>> {
+    let text = Sections::VALID.text().replace(
+        "sandbox = \"bwrap\"",
+        "sandbox = \"noop\"\nactions = { grants = [\"network\"] }",
+    );
+    let document = gang_config::Document::<Plugins>::parse(&text)?;
+    assert!(matches!(
+        document.resolve(),
+        Err(ConfigError::UnsupportedCapability { .. })
+    ));
+
+    let malformed = text.replace("\"network\"", "\"unknown\"");
+    assert!(gang_config::Document::<Plugins>::parse(&malformed).is_err());
+
+    let supported = text
+        .replace("[sandbox.bwrap]", "[sandbox.bwrap]\negress = {}")
+        .replace("sandbox = \"noop\"", "sandbox = \"bwrap\"");
+    assert!(matches!(
+        supported.parse::<GangConfig<Plugins>>(),
+        Err(ConfigError::MissingEgress)
+    ));
+    let valid = format!(
+        "{supported}\n[execution.egress]\nprotected_networks = [\"10.0.0.0/8\"]\ndns_servers = [\"8.8.8.8\"]\n"
+    );
+    let resolved: GangConfig<Plugins> = valid.parse()?;
+    assert!(
+        resolved.fleets.policies()[0]
+            .actions
+            .grants
+            .contains(&gang_types::Capability::Network)
+    );
+
+    let over_capacity = Sections::VALID.text().replace(
+        "sandbox = \"bwrap\"",
+        "sandbox = \"bwrap\"\nactions = { resources = { memory = \"9GiB\" } }",
+    );
+    assert!(matches!(
+        over_capacity.parse::<GangConfig<Plugins>>(),
+        Err(ConfigError::FleetActionPolicy { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn fleet_ceilings_constrain_root_reservations_and_cold_start() {
+    let fleet = Sections::VALID.text();
+    let small_memory = fleet.replace(
+        "sandbox = \"bwrap\"",
+        "sandbox = \"bwrap\"\nactions = { resources = { memory = \"32MiB\" } }",
+    );
+    assert!(matches!(
+        small_memory.parse::<GangConfig<Plugins>>(),
+        Err(ConfigError::ActionResourceDoesNotFit { .. })
+    ));
+
+    let small_cpu = fleet.replace(
+        "sandbox = \"bwrap\"",
+        "sandbox = \"bwrap\"\nactions = { resources = { cpu_count = 1 } }",
+    );
+    let larger_cold_start = format!("{small_cpu}\n[actions.cold_start]\ncpu_count = 2\n");
+    assert!(matches!(
+        larger_cold_start.parse::<GangConfig<Plugins>>(),
+        Err(ConfigError::ColdStartFitsNoFleet { .. })
+    ));
+}
+
+#[test]
+fn selected_network_policy_round_trips_and_requires_trusted_inputs() -> Result<(), Box<dyn Error>> {
+    let base = r#"
+work_directory = "/var/lib/gang/work"
+selected = "bwrap"
+controller_endpoints = ["https://controller.example.com"]
+[actions]
+grants = ["network"]
+[sandbox.bwrap]
+egress = {}
+[execution.egress]
+protected_networks = ["10.0.0.0/8"]
+dns_servers = ["8.8.8.8"]
+"#;
+    let file: SandboxFile<Plugins> = base.parse()?;
+    let again: SandboxFile<Plugins> = file.to_toml()?.parse()?;
+    assert_eq!(again.actions, file.actions);
+    assert_eq!(again.controller_endpoints, file.controller_endpoints);
+    assert_eq!(again.execution.egress, file.execution.egress);
+
+    let missing_endpoints = base.replace(
+        "controller_endpoints = [\"https://controller.example.com\"]",
+        "",
+    );
+    assert!(matches!(
+        missing_endpoints.parse::<SandboxFile<Plugins>>(),
+        Err(SandboxFileError::MissingEgress)
+    ));
+    let missing_policy = base.replace(
+        "[execution.egress]\nprotected_networks = [\"10.0.0.0/8\"]\ndns_servers = [\"8.8.8.8\"]",
+        "",
+    );
+    assert!(matches!(
+        missing_policy.parse::<SandboxFile<Plugins>>(),
+        Err(SandboxFileError::MissingEgress)
+    ));
+    let unsupported = base.replace("egress = {}", "");
+    assert!(matches!(
+        unsupported.parse::<SandboxFile<Plugins>>(),
+        Err(SandboxFileError::UnsupportedCapability(_))
+    ));
+    let unsafe_dns = base.replace("8.8.8.8", "10.0.0.1");
+    assert!(matches!(
+        unsafe_dns.parse::<SandboxFile<Plugins>>(),
+        Err(SandboxFileError::InvalidEgress(_))
+    ));
+    Ok(())
 }
 
 #[test]
@@ -1111,7 +1236,7 @@ fn parses_a_complete_file_into_typed_values() -> Result<(), Box<dyn Error>> {
         config
             .sandbox
             .bwrap
-            .is_some_and(|bwrap| !bwrap.permit_network_property)
+            .is_some_and(|bwrap| bwrap.egress.is_none())
     );
     assert!(matches!(
         &config.authentication.workers,
@@ -3453,7 +3578,7 @@ fn sandbox_file_round_trips_through_toml() -> Result<(), Box<dyn Error>> {
             .sandbox
             .bwrap
             .as_ref()
-            .is_some_and(|bwrap| !bwrap.permit_network_property)
+            .is_some_and(|bwrap| bwrap.egress.is_none())
     );
     assert!(matches!(again.execution.input_links, InputLinks::Break));
     assert!(matches!(
@@ -3466,7 +3591,7 @@ fn sandbox_file_round_trips_through_toml() -> Result<(), Box<dyn Error>> {
 #[test]
 fn sandbox_file_without_execution_or_limits_defaults() -> Result<(), Box<dyn Error>> {
     let file: SandboxFile<Plugins> =
-        "work_directory = \"/var/lib/gang/work\"\nselected = \"bwrap\"\n\n[sandbox.bwrap]\npermit_network_property = false\n"
+        "work_directory = \"/var/lib/gang/work\"\nselected = \"bwrap\"\n\n[sandbox.bwrap]\n"
             .parse()?;
 
     assert!(matches!(file.execution.input_links, InputLinks::Keep));
@@ -3490,7 +3615,7 @@ fn sandbox_file_rejects_a_selected_sandbox_without_a_section() -> Result<(), Box
 
 #[test]
 fn sandbox_file_rejects_an_unknown_top_level_field() -> Result<(), Box<dyn Error>> {
-    let error = "work_directory = \"/var/lib/gang/work\"\nselected = \"bwrap\"\nbogus = 1\n\n[sandbox.bwrap]\npermit_network_property = false\n"
+    let error = "work_directory = \"/var/lib/gang/work\"\nselected = \"bwrap\"\nbogus = 1\n\n[sandbox.bwrap]\n"
         .parse::<SandboxFile<Plugins>>()
         .err()
         .ok_or("accepted")?;
@@ -3514,7 +3639,7 @@ fn sandbox_file_work_directory_round_trips_through_toml() -> Result<(), Box<dyn 
 
 #[test]
 fn sandbox_file_without_work_directory_is_rejected() -> Result<(), Box<dyn Error>> {
-    let error = "selected = \"bwrap\"\n\n[sandbox.bwrap]\npermit_network_property = false\n"
+    let error = "selected = \"bwrap\"\n\n[sandbox.bwrap]\n"
         .parse::<SandboxFile<Plugins>>()
         .err()
         .ok_or("accepted")?;
@@ -3526,7 +3651,7 @@ fn sandbox_file_without_work_directory_is_rejected() -> Result<(), Box<dyn Error
 
 #[test]
 fn sandbox_file_rejects_a_relative_work_directory() -> Result<(), Box<dyn Error>> {
-    let error = "work_directory = \"relative/work\"\nselected = \"bwrap\"\n\n[sandbox.bwrap]\npermit_network_property = false\n"
+    let error = "work_directory = \"relative/work\"\nselected = \"bwrap\"\n\n[sandbox.bwrap]\n"
         .parse::<SandboxFile<Plugins>>()
         .err()
         .ok_or("accepted")?;
@@ -3593,6 +3718,7 @@ fn hand_member(
         idle_timeout: Duration::from_secs(15),
         max_drain_wait: Duration::from_mins(1),
         boot_grace: Duration::from_secs(30),
+        actions: FleetActionPolicy::default(),
     };
     Ok(FleetMember {
         policy,
@@ -3672,7 +3798,7 @@ fn an_empty_fleet_set_reports_empty() -> Result<(), Box<dyn Error>> {
 #[test]
 fn sandbox_programs_visit_only_the_selected_section() -> Result<(), Box<dyn Error>> {
     let mut sandbox: SandboxConfig = toml::from_str(
-        "[noop]\nkill_grace = \"2s\"\nprogram = \"noop-a\"\n\n[bwrap]\npermit_network_property = false\nprogram = \"bwrap-b\"\n",
+        "[noop]\nkill_grace = \"2s\"\nprogram = \"noop-a\"\n\n[bwrap]\nprogram = \"bwrap-b\"\n",
     )?;
     let mut visited = Vec::new();
     let result: Result<(), &str> = sandbox.try_for_each_program(SandboxKey::Bwrap, |program| {
@@ -3747,7 +3873,7 @@ fn try_new_rejects_more_fleets_than_the_catalog_holds() -> Result<(), Box<dyn Er
 #[test]
 fn sandbox_programs_stop_at_the_first_error() -> Result<(), Box<dyn Error>> {
     let mut sandbox: SandboxConfig = toml::from_str(
-        "[noop]\nkill_grace = \"2s\"\nprogram = \"noop-a\"\n\n[bwrap]\npermit_network_property = false\nprogram = \"bwrap-b\"\n",
+        "[noop]\nkill_grace = \"2s\"\nprogram = \"noop-a\"\n\n[bwrap]\nprogram = \"bwrap-b\"\n",
     )?;
     let mut calls = 0;
     let stopped = sandbox.try_for_each_program(SandboxKey::Noop, |_| {

@@ -52,12 +52,12 @@ impl fmt::Display for Sandbox {
     }
 }
 
-/// Whether `[sandbox.bwrap] permit_network_property` is on.
+/// Whether the fleet grants the network capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermitNetwork {
-    /// An action never shares the host network.
+    /// The fleet does not grant network access.
     Denied,
-    /// An action that requests the network shares the host network.
+    /// The fleet grants public egress to requesting actions.
     Permitted,
 }
 
@@ -116,7 +116,7 @@ pub enum FleetLayout {
 pub struct Variant {
     /// The sandbox of the workers.
     pub sandbox: Sandbox,
-    /// `[sandbox.bwrap] permit_network_property`.
+    /// Whether the fleet grants the network capability.
     pub permit_network: PermitNetwork,
     /// `[execution] input_links`.
     pub input_links: InputLinks,
@@ -164,7 +164,9 @@ gang_types::string_enum! {
         /// Records the net and mnt namespaces, the visibility of a stand-in for the CAS, and whether
         /// its working directory is writable.
         Isolated = "isolated",
-        /// Records the net and mnt namespaces; requests `network = requested`.
+        /// Probes network access without requesting the network capability.
+        NetworkIsolated = "network_isolated",
+        /// Probes network access with `network = requested`.
         NetworkRequested = "network_requested",
         /// Records that it ran; sets the `ISA` exec property explicitly.
         Pinned = "pinned",

@@ -36,6 +36,9 @@ pub trait Plugin: Sized + Send + Sync + 'static {
 /// relative program name is replaced by the absolute path the worker resolves through its own
 /// `PATH`.
 pub trait SandboxPrograms {
+    /// Whether this configured sandbox supports the capability.
+    fn supports_capability(&self, capability: gang_types::Capability) -> bool;
+
     /// Calls `visit` on every program path the section names, in order, and stops at the first error.
     ///
     /// # Errors

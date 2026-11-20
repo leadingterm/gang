@@ -1,7 +1,6 @@
 //! The `[sandbox.bwrap]` plugin: runs actions under bubblewrap.
 //!
-//! Each action runs in fresh namespaces with no view of the CAS, and without network unless the
-//! plugin permits it and the action requests it.
+//! Each action runs in fresh namespaces with no host-network sharing.
 //!
 //! ```
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -11,18 +10,22 @@
 //!
 //! let config = BwrapConfig {
 //!     root: AbsolutePathBuf::try_new("/etc/gang/action-rootfs")?,
-//!     permit_network_property: false,
+//!     egress: None,
 //!     program: PathBuf::from("/usr/bin/bwrap"),
 //! };
-//! assert!(!config.permit_network_property);
+//! assert!(config.egress.is_none());
 //! # Ok(()) }
 //! ```
 
 mod bwrap;
 mod command_line;
 mod config;
+#[cfg(target_os = "linux")]
+mod egress;
+#[cfg(target_os = "linux")]
+mod egress_policy;
 mod errors;
 mod relay;
 
 pub use bwrap::Bwrap;
-pub use config::BwrapConfig;
+pub use config::{BwrapConfig, EgressPrograms};

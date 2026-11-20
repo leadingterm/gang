@@ -46,7 +46,6 @@ environment = "host:local"
 # For Linux bwrap, select it in the fleet and set action_environment to the
 # digest in this envelope's identity file.
 root = "/etc/gang/action-rootfs"
-permit_network_property = false
 
 # Optional [limits.cgroup] (Linux only): needs a delegated cgroup v2 subtree; locally set delegation = "trusted", because the user manager sets no delegate marker on the worker_launcher's scope (systemd_marker needs a system unit with Delegate=yes). Its keys and defaults are documented in crates/gang-cgroup/src/config.rs.
 

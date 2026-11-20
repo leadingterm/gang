@@ -21,6 +21,7 @@
 //!     idle_timeout: Duration::from_mins(10),
 //!     max_drain_wait: Duration::from_mins(25),
 //!     boot_grace: Duration::from_mins(10),
+//!     actions: Default::default(),
 //! };
 //!
 //! let mut demand = Demand::default();

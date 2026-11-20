@@ -43,6 +43,10 @@ pub struct NumberConfig {
 }
 
 impl SandboxPrograms for NumberConfig {
+    fn supports_capability(&self, _: gang_types::Capability) -> bool {
+        false
+    }
+
     fn try_for_each_program<E>(
         &mut self,
         _visit: &mut impl FnMut(&mut PathBuf) -> Result<(), E>,
@@ -1111,6 +1115,10 @@ pub struct DirectConfig {
 }
 
 impl SandboxPrograms for DirectConfig {
+    fn supports_capability(&self, _: gang_types::Capability) -> bool {
+        false
+    }
+
     fn try_for_each_program<E>(
         &mut self,
         _: &mut impl FnMut(&mut PathBuf) -> Result<(), E>,
@@ -1159,6 +1167,10 @@ pub struct BoxedConfig {
 }
 
 impl SandboxPrograms for BoxedConfig {
+    fn supports_capability(&self, _: gang_types::Capability) -> bool {
+        false
+    }
+
     fn try_for_each_program<E>(
         &mut self,
         visit: &mut impl FnMut(&mut PathBuf) -> Result<(), E>,

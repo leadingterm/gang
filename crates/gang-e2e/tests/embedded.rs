@@ -1,6 +1,6 @@
 //! End-to-end tests of the embedded controller and worker, in one process over loopback.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt::Write as _;
 use std::net::Ipv4Addr;
@@ -173,6 +173,7 @@ fn fleet_with_disk(
             memory: Bytes::new(memory),
             disk: Bytes::new(disk),
         },
+        &gang_types::FleetActionPolicy::default(),
         [],
     ))
 }
@@ -227,6 +228,14 @@ fn caller() -> Result<Authenticated, PortError> {
         valid_until: None,
     })
 }
+
+#[cfg(target_os = "linux")]
+type PlatformCase<'a> = (
+    Option<&'a [(&'a str, &'a str)]>,
+    &'a [(&'a str, &'a str)],
+    &'a str,
+    &'a str,
+);
 
 /// A gate that refuses every request with `denial`, or admits every request when there is none.
 /// It records the peer of each request it sees.
@@ -893,6 +902,23 @@ fn entrypoint_helper() -> TestResult {
     if std::env::var_os(ENTRYPOINT_ENV).is_none() {
         return Ok(());
     }
+    for (expected, actual) in [
+        ("GANG_TEST_EXPECT_NETWORK", "GANG_NETWORK"),
+        ("GANG_TEST_EXPECT_CPU", "GANG_CPU_COUNT"),
+        ("GANG_TEST_EXPECT_MEMORY", "GANG_MEMORY_KB"),
+    ] {
+        if let Ok(value) = std::env::var(expected) {
+            let observed = std::env::var(actual).ok();
+            assert_eq!(
+                observed.as_deref(),
+                (value != "<absent>").then_some(value.as_str()),
+                "{actual}",
+            );
+        }
+    }
+    if std::env::var_os("GANG_TEST_EXPECT_SIDE_CHANNEL").is_some() {
+        assert_ne!(std::env::var("GANG_SIDE_CHANNEL_FILE")?, "spoofed");
+    }
     #[cfg(unix)]
     if std::env::var_os(SYMLINK_OUTPUT_ENV).is_some() {
         create_symlink_output()?;
@@ -1023,6 +1049,14 @@ fn build_action_with(
     platform_properties: &[(&str, &str)],
     env: &[(&str, &str)],
 ) -> Result<TestAction, Box<dyn Error>> {
+    build_action_platforms(Some(platform_properties), platform_properties, env)
+}
+
+fn build_action_platforms(
+    action_properties: Option<&[(&str, &str)]>,
+    command_properties: &[(&str, &str)],
+    env: &[(&str, &str)],
+) -> Result<TestAction, Box<dyn Error>> {
     let input = HELLO.to_vec();
     let input_digest = digest_of(&input)?;
     let root = Directory {
@@ -1036,8 +1070,8 @@ fn build_action_with(
     };
     let root_bytes = root.encode_to_vec();
     let root_digest = digest_of(&root_bytes)?;
-    let platform = Platform {
-        properties: platform_properties
+    let platform = |properties: &[(&str, &str)]| Platform {
+        properties: properties
             .iter()
             .copied()
             .chain(std::iter::once((
@@ -1084,7 +1118,7 @@ fn build_action_with(
             }
             directories
         },
-        platform: Some(platform.clone()),
+        platform: Some(platform(command_properties)),
         ..Default::default()
     };
     let command_bytes = command.encode_to_vec();
@@ -1092,7 +1126,13 @@ fn build_action_with(
     let action = Action {
         command_digest: Some(command_digest.clone()),
         input_root_digest: Some(root_digest.clone()),
-        platform: Some(platform),
+        platform: action_properties.map(|properties| {
+            if properties.is_empty() {
+                Platform::default()
+            } else {
+                platform(properties)
+            }
+        }),
         ..Default::default()
     };
     let action_bytes = action.encode_to_vec();
@@ -1106,6 +1146,46 @@ fn build_action_with(
             (action_digest, action_bytes),
         ],
     })
+}
+
+#[test]
+fn empty_action_platform_preserves_command_fallback() -> TestResult {
+    let fixture = build_action_platforms(Some(&[]), &[("cpu_count", "3")], &[])?;
+    let action_bytes = fixture
+        .blobs
+        .iter()
+        .find(|(digest, _)| *digest == fixture.digest)
+        .map(|(_, bytes)| bytes)
+        .ok_or("missing action blob")?;
+    let action = Action::decode(action_bytes.as_slice())?;
+    assert!(
+        action
+            .platform
+            .ok_or("missing action platform")?
+            .properties
+            .is_empty()
+    );
+    let command_digest = action.command_digest.ok_or("missing command digest")?;
+    let command_bytes = fixture
+        .blobs
+        .iter()
+        .find(|(digest, _)| *digest == command_digest)
+        .map(|(_, bytes)| bytes)
+        .ok_or("missing command blob")?;
+    let command = Command::decode(command_bytes.as_slice())?;
+    let properties = command
+        .platform
+        .ok_or("missing command platform")?
+        .properties;
+    assert!(properties.iter().any(|property| {
+        property.name == gang_types::property::ACTION_ENVIRONMENT && property.value == "host:test"
+    }));
+    assert!(
+        properties
+            .iter()
+            .any(|property| { property.name == "cpu_count" && property.value == "3" })
+    );
+    Ok(())
 }
 
 /// Uploads `blobs` through the client listener's content-addressable storage.
@@ -1832,6 +1912,162 @@ async fn an_action_no_fleet_accepts_is_refused_when_submitted() -> TestResult {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn network_grant_is_required_and_unknown_properties_are_refused() -> TestResult {
+    let harness = Harness::start().await?;
+    let channel = public_channel(harness.public_port).await?;
+    for (key, value) in [("network", "requested"), ("unknown-property", "value")] {
+        let action = build_action(&[(key, value)])?;
+        upload_blobs(&channel, action.blobs).await?;
+        let status = ExecutionClient::new(channel.clone())
+            .execute(ExecuteRequest {
+                skip_cache_lookup: true,
+                action_digest: Some(action.digest),
+                ..Default::default()
+            })
+            .await
+            .expect_err("ungranted or unknown property must be refused");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains(key), "{}", status.message());
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn network_request_runs_on_granted_fleet() -> TestResult {
+    let scratch = tempfile::tempdir()?;
+    let mut policy = gang_types::FleetActionPolicy::default();
+    policy.grants.insert(gang_types::Capability::Network);
+    let fleet = FleetProperties::new(
+        &FleetName::try_new(DEFAULT_FLEET)?,
+        Isa::X86_64,
+        &SANDBOX,
+        &"host:test".parse()?,
+        Resources {
+            vcpus: WORKER_VCPUS,
+            memory: Bytes::new(WORKER_MEMORY),
+            disk: Bytes::new(FLEET_DISK),
+        },
+        &policy,
+        [],
+    );
+    let mut harness =
+        Harness::start_with(vec![fleet.clone()], TestGate::allow(), Vec::new()).await?;
+    harness.add_worker(WorkerPaths::new(scratch.path(), "worker"), fleet)?;
+    let channel = public_channel(harness.public_port).await?;
+    let action = build_action(&[("network", "requested")])?;
+    upload_blobs(&channel, action.blobs).await?;
+    let response = tokio::time::timeout(
+        Duration::from_secs(30),
+        run_action(&channel, &action.digest),
+    )
+    .await??;
+    assert_eq!(response.result.ok_or("missing result")?.exit_code, 0);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reserved_environment_and_platform_authority_survive_client_spoofing() -> TestResult {
+    for actions in [
+        gang_config::ActionsConfig::default(),
+        gang_config::ActionsConfig {
+            memory: gang_config::MemoryTuning {
+                enforcement: gang_config::MemoryEnforcement::Soft,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    ] {
+        let scratch = tempfile::tempdir()?;
+        let mut policy = gang_types::FleetActionPolicy::default();
+        policy.grants.insert(gang_types::Capability::Network);
+        let fleet = FleetProperties::new(
+            &FleetName::try_new(DEFAULT_FLEET)?,
+            Isa::X86_64,
+            &SANDBOX,
+            &"host:test".parse()?,
+            Resources {
+                vcpus: WORKER_VCPUS,
+                memory: Bytes::new(WORKER_MEMORY),
+                disk: Bytes::new(FLEET_DISK),
+            },
+            &policy,
+            [],
+        );
+        let mut harness = Harness::start_configured(
+            vec![fleet.clone()],
+            TestGate::allow(),
+            Vec::new(),
+            actions,
+            gang_config::WorkerConfig::default(),
+        )
+        .await?;
+        harness.add_worker(WorkerPaths::new(scratch.path(), "worker"), fleet)?;
+        let channel = public_channel(harness.public_port).await?;
+        // The 16 MiB request is raised to the configured minimum before dispatch.
+        let memory = harness
+            .actions
+            .memory
+            .min_reservation
+            .as_units()
+            .to_string();
+        let cases: [PlatformCase<'_>; 3] = [
+            (
+                Some(&[
+                    ("cpu_count", "2"),
+                    ("memory_kb", "16384"),
+                    ("network", "requested"),
+                ]),
+                &[("cpu_count", "3")],
+                "2",
+                "requested",
+            ),
+            (
+                None,
+                &[
+                    ("cpu_count", "3"),
+                    ("memory_kb", "16384"),
+                    ("network", "not-requested"),
+                ],
+                "3",
+                "<absent>",
+            ),
+            (
+                Some(&[]),
+                &[("cpu_count", "3"), ("memory_kb", "16384")],
+                "3",
+                "<absent>",
+            ),
+        ];
+        for (action_platform, command_platform, cpu, network) in cases {
+            let env = [
+                ("GANG_NETWORK", "spoofed"),
+                ("GANG_CPU_COUNT", "spoofed"),
+                ("GANG_MEMORY_KB", "spoofed"),
+                ("GANG_TEST_EXPECT_MEMORY", memory.as_str()),
+                ("GANG_SIDE_CHANNEL_FILE", "spoofed"),
+                ("GANG_TEST_EXPECT_NETWORK", network),
+                ("GANG_TEST_EXPECT_CPU", cpu),
+                ("GANG_TEST_EXPECT_SIDE_CHANNEL", "1"),
+            ];
+            let action = build_action_platforms(action_platform, command_platform, &env)?;
+            upload_blobs(&channel, action.blobs).await?;
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                run_action(&channel, &action.digest),
+            )
+            .await??;
+            assert_eq!(
+                result.result.ok_or("missing result")?.exit_code,
+                0,
+                "action platform {action_platform:?}, command platform {command_platform:?}",
+            );
+        }
+    }
+    Ok(())
+}
+
 /// A queued action is a candidate of exactly the fleets that fit it, and a worker of one of those
 /// fleets registers under that fleet's name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2205,6 +2441,7 @@ fn worker_fleets() -> Result<gang_config::Fleets<gang_testkit::TestPlugins>, Box
                 idle_timeout: Duration::from_secs(15),
                 max_drain_wait: Duration::from_mins(1),
                 boot_grace: Duration::from_secs(30),
+                actions: gang_types::FleetActionPolicy::default(),
             },
             sandbox: gang_testkit::SandboxKey::Noop,
             options: gang_testkit::Opaque::default(),
@@ -2482,6 +2719,7 @@ fn worker_registration(
         worker_id_prefix: InstanceId::try_new(instance)?.worker_name(),
         max_inflight_tasks: max,
         admits_when_idle: true,
+        action_ceilings: HashMap::default(),
     })
 }
 

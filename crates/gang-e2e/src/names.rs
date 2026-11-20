@@ -27,22 +27,12 @@ pub mod isolation {
         "an action of the noop fleet runs in the host's net and mnt namespaces";
 }
 
-/// Names of the checks of network-namespace sharing.
+/// Names of the checks of network capability admission and isolation.
 pub mod network {
-    /// Sharing follows the configuration and the request.
-    pub const SHARING: &str =
-        "network namespace sharing follows permit_network_property and the request";
-    /// An action without the network property is isolated.
-    pub const OWN_NAMESPACE_BY_DEFAULT: &str =
-        "an action without the network property gets its own net namespace";
-    /// A permitted request for the network shares the host's namespace.
-    pub const REQUEST_SHARED: &str =
-        "an action requesting the network shares the host net namespace";
-    /// A request for the network that is not permitted stays isolated.
-    pub const REQUEST_NOT_PERMITTED: &str = "an action requesting the network still gets its own net namespace when it is not permitted";
-    /// The scenario's verdict where the noop sandbox cannot isolate.
-    pub const PERMITTED_REQUEST_SHARES: &str =
-        "a permitted network request shares the host network";
+    /// The noop sandbox cannot provide the network fixture.
+    pub const SUPPORTED: &str = "the sandbox supports public egress";
+    /// An ungranted request is rejected before the action reports output.
+    pub const ADMISSION: &str = "an ungranted network request is rejected before execution";
 }
 
 /// Names of the checks of dynamically linked glibc programs in the sandbox.

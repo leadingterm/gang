@@ -96,6 +96,23 @@ variable "shared_database" {
   nullable    = false
 }
 
+variable "public_subnets_by_az" {
+  description = "Public subnet IDs keyed by availability zone, used for stable public IP allocations."
+  type        = map(string)
+  default     = {}
+}
+
+variable "static_public_ips" {
+  description = "Allocate stable public load balancer IPs for action egress protection."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !var.static_public_ips || !var.shared_database || (length(var.public_subnets_by_az) > 0 && toset(values(var.public_subnets_by_az)) == toset(var.public_subnet_ids))
+    error_message = "Static public IPs require an availability-zone map covering all public subnets."
+  }
+}
+
 variable "proxy_protocol_stage" {
   description = "Shared-database only; defaults to accept. Move one adjacent step per apply through off, accept, proxied, require (or reverse), waiting for all controller refreshes before the next step."
   type        = string

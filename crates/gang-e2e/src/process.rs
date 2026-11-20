@@ -19,7 +19,7 @@ use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use crate::errors::{E2eError, Result};
 
 /// Maximum captured size of each command output stream.
-const OUTPUT_LIMIT: NonZeroBytes = NonZeroBytes::mib(64);
+pub(crate) const OUTPUT_LIMIT: NonZeroBytes = NonZeroBytes::mib(64);
 
 /// How a finished command ended and what it printed, decoded lossily.
 #[derive(Debug, Clone, PartialEq, Eq)]

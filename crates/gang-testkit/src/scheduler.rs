@@ -1165,6 +1165,7 @@ mod tests {
                         memory: Bytes::new(GIB),
                         disk: Bytes::new(GIB),
                     },
+                    &gang_types::FleetActionPolicy::default(),
                     std::iter::empty::<(&'static str, String)>(),
                 ),
                 store: gang_spi::RenderedStoreSpec(serde_json::Value::Null),

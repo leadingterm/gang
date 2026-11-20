@@ -23,8 +23,8 @@ use gang_config::{
 };
 use gang_spi::{InstanceIdentity, PortError};
 use gang_types::{
-    ActionEnvironment, Bytes, CertificatePem, FleetName, InstanceId, Isa, NonZeroBytes,
-    PrivateKeyPem, Proof, WorkerLifetime,
+    ActionEnvironment, Bytes, CertificatePem, FleetActionPolicy, FleetName, InstanceId, Isa,
+    NonZeroBytes, PrivateKeyPem, Proof, WorkerLifetime,
 };
 use gang_worker::{
     Credentials, EnrollError, Enroller, ServerCaError, ServerCaSource, Transport, WorkerDeployment,
@@ -68,6 +68,7 @@ fn fleet_member(
         name: FleetName::try_new(name).expect("test fleet name is valid"),
         isa: Isa::X86_64,
         action_environment: "host:test".parse().expect("test identity is valid"),
+        actions: FleetActionPolicy::default(),
         instances: InstanceBounds::up_to(NonZeroU32::MIN.saturating_add(3)),
         vcpus_per_instance: NonZeroU32::new(vcpus).expect("test fleets have vCPUs"),
         memory_per_instance: NonZeroBytes::gib(memory_gib),
@@ -532,6 +533,7 @@ impl Harness {
                 ..SandboxConfig::default()
             },
             execution: ExecutionConfig::default(),
+            controller_endpoints: Box::default(),
             limits: Some(TestLimits { max_pids: 512 }),
             search_path: self.bin.clone().into_os_string(),
             executable: self.executable.clone(),

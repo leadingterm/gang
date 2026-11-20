@@ -182,7 +182,6 @@ environment = "host:test"
 
 [sandbox.bwrap]
 root = "/etc/gang/action-rootfs"
-permit_network_property = false
 
 [server]
 trust_domain = "gang.local"

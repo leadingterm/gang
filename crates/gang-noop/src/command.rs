@@ -38,7 +38,7 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use std::path::Path;
 
-    use gang_spi::{ActionCommand, ActionExecutionSpec, NetworkRequest};
+    use gang_spi::{ActionCommand, ActionExecutionSpec, NetworkAccess};
 
     use super::command;
 
@@ -55,7 +55,7 @@ mod tests {
             environment: &[],
             action_directory: Path::new("/work"),
             working_directory: Path::new("/work"),
-            network: NetworkRequest::NotRequested,
+            network: NetworkAccess::Offline,
         };
 
         let command = command(&spec, Path::new("/tmp/action"));

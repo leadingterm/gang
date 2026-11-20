@@ -3,8 +3,8 @@
 use std::ffi::{OsStr, OsString};
 use std::num::NonZeroU32;
 
-use gang_spi::{ActionLimits, CPU_COUNT_ENV, MEMORY_KB_ENV, NETWORK_ENV, NetworkRequest};
-use gang_types::{Bytes, NonZeroBytes};
+use gang_spi::{ActionLimits, CPU_COUNT_ENV, MEMORY_KB_ENV, NETWORK_ENV};
+use gang_types::{Bytes, NetworkRequest, NonZeroBytes};
 
 use crate::{ExecError, PropertyError};
 

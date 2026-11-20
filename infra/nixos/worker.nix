@@ -7,7 +7,8 @@
   imports = [./gang-scratch.nix];
 
   environment.etc."gang/action-rootfs".source = import ./action-rootfs {inherit pkgs;};
-  environment.systemPackages = [pkgs.bubblewrap];
+  environment.systemPackages = [pkgs.bubblewrap pkgs.slirp4netns pkgs.nftables pkgs.util-linux pkgs.iproute2];
+  boot.kernelModules = ["nf_tables"];
 
   users.users.gang.home = "/var/lib/gang-home";
 
@@ -21,7 +22,7 @@
       "network-online.target"
     ];
     wants = ["network-online.target"];
-    path = [pkgs.bubblewrap];
+    path = [pkgs.bubblewrap pkgs.slirp4netns pkgs.nftables pkgs.util-linux pkgs.iproute2];
     serviceConfig = {
       User = "gang";
       Group = "gang";

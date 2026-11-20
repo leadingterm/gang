@@ -17,9 +17,7 @@ use crate::host::Host;
 use crate::mirror::follow;
 use crate::names;
 use crate::report::{InputRootReport, IsolationReport, Namespaces, PoisonReport, VictimReport};
-use crate::system::{
-    HOLD_CPU_COUNT, LIMIT_CPU_PERIOD_MICROS, LIMIT_MAX_PIDS, PermitNetwork, Sandbox, ScopeFacts,
-};
+use crate::system::{HOLD_CPU_COUNT, LIMIT_CPU_PERIOD_MICROS, LIMIT_MAX_PIDS, Sandbox, ScopeFacts};
 
 /// Whether the workers' net and mnt namespaces differ from the host's.
 #[must_use]
@@ -134,53 +132,6 @@ pub fn working_directory(tmp_path: &Path, isolated: &IsolationReport) -> Vec<Che
             "the working directory is not under the sandbox tmp path",
         ));
     }
-    checks
-}
-
-/// Whether network-namespace sharing follows `permit_network_property` and the request.
-#[must_use]
-pub fn network(
-    sandbox: Sandbox,
-    permit: PermitNetwork,
-    host: &Host,
-    isolated: &Namespaces,
-    requested: &Namespaces,
-) -> Vec<Check> {
-    let host_net = match (sandbox, host.net.as_deref()) {
-        (Sandbox::Noop, _) => {
-            return vec![Check::skipped(
-                names::network::SHARING,
-                "the noop sandbox does not isolate",
-            )];
-        }
-        (Sandbox::Bwrap, None) => {
-            return vec![Check::skipped(
-                names::network::SHARING,
-                "host namespaces are not readable on this platform",
-            )];
-        }
-        (Sandbox::Bwrap, Some(net)) => net,
-    };
-    let requested_net = requested.net.as_str();
-    let mut checks = vec![differs_from_host(
-        names::network::OWN_NAMESPACE_BY_DEFAULT,
-        "net",
-        &isolated.net,
-        host_net,
-    )];
-    checks.push(match permit {
-        PermitNetwork::Permitted => Check::expect(
-            names::network::REQUEST_SHARED,
-            requested_net == host_net,
-            || format!("the requesting action ran in net namespace {requested_net}"),
-        ),
-        PermitNetwork::Denied => differs_from_host(
-            names::network::REQUEST_NOT_PERMITTED,
-            "net",
-            requested_net,
-            host_net,
-        ),
-    });
     checks
 }
 

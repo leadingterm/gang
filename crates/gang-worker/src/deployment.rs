@@ -65,6 +65,8 @@ pub struct WorkerSettings<P: PluginSet> {
     pub sandbox: P::Sandbox,
     /// The `[execution]` section of the sandbox file.
     pub execution: ExecutionConfig,
+    /// Effective controller endpoints excluded from action egress.
+    pub controller_endpoints: Box<[gang_types::Url]>,
     /// The `[limits.<plugin>]` section of the sandbox file, when one is configured.
     pub limits: Option<P::Limits>,
     /// The `gang` binary, which the worker's entrypoint links to.

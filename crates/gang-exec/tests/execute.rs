@@ -11,14 +11,15 @@ use std::sync::Arc;
 
 use futures::{Stream, StreamExt};
 use gang_config::InputLinks;
-use gang_exec::{Action, ExecError, execute, exit_status};
+use gang_exec::{Action, ExecError, ExecFailure, execute, exit_status};
 use gang_spi::{
     ActionCommand, ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, ActionLimits,
-    ActionLimitsPort, ActionScope, NetworkRequest, PortError, SandboxedAction, Termination,
+    ActionLimitsPort, ActionScope, NetworkAccess, PortError, SandboxedAction, Termination,
 };
 use gang_testkit::{CallLog, LimitsStep, RecordingLimits, ScriptedSandbox};
-use gang_types::NonZeroBytes;
+use gang_types::{Bytes, NonZeroBytes};
 use parking_lot::Mutex;
+use tokio::sync::Barrier;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -84,7 +85,7 @@ fn action<'a>(
             environment: &[],
             action_directory,
             working_directory,
-            network: NetworkRequest::NotRequested,
+            network: NetworkAccess::Offline,
             launcher: &[],
         },
         limits: limits(),
@@ -164,6 +165,36 @@ impl ActionIsolationPort for DropSandbox {
         let guard = DropAction(self.0.clone());
         Ok(SandboxedAction::new(async move {
             let _guard = guard;
+            Ok(ActionExecutionOutcome::Exited(0))
+        }))
+    }
+}
+
+/// Holds startup at a barrier and records cancellation before a payload could be released.
+struct PendingStartup {
+    environment: gang_types::ActionEnvironment,
+    log: CallLog,
+    started: Arc<Barrier>,
+    release: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+impl ActionIsolationPort for PendingStartup {
+    fn environment(&self) -> &gang_types::ActionEnvironment {
+        &self.environment
+    }
+
+    async fn start(&self, _spec: &ActionExecutionSpec<'_>) -> Result<SandboxedAction, PortError> {
+        self.log.record("sandbox.start");
+        let _guard = DropAction(self.log.clone());
+        let release = self
+            .release
+            .lock()
+            .take()
+            .ok_or_else(|| PortError::backend("startup is called once"))?;
+        self.started.wait().await;
+        release.await.map_err(PortError::backend)?;
+        self.log.record("payload");
+        Ok(SandboxedAction::new(async {
             Ok(ActionExecutionOutcome::Exited(0))
         }))
     }
@@ -294,7 +325,9 @@ async fn leave_action_group_failure_drops_action_and_leaves_scope() -> Result<()
                 },
             )
             .await;
-            assert!(matches!(result, Err(ExecError::LeaveActionGroup(_))));
+            let failure = result.expect_err("group transition must fail");
+            assert!(matches!(failure.error, ExecError::LeaveActionGroup(_)));
+            assert_eq!(failure.usage.is_some(), with_limits && !leave_fails);
             if with_limits {
                 assert_eq!(
                     log.calls(),
@@ -349,11 +382,141 @@ async fn pending_termination_prevents_start_with_and_without_limits() -> Result<
                 outcome.outcome,
                 ActionExecutionOutcome::Signaled(termination.signal())
             );
+            assert_eq!(outcome.usage.is_some(), with_limits);
             if with_limits {
                 assert_eq!(log.calls(), ["limits.enter", "limits.leave"]);
             } else {
                 assert!(log.calls().is_empty());
             }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn termination_during_startup_drops_start_and_leaves_scope() -> Result<(), Box<dyn Error>> {
+    for with_limits in [false, true] {
+        let log = CallLog::default();
+        let started = Arc::new(Barrier::new(2));
+        let (release, released) = oneshot::channel();
+        let sandbox = PendingStartup {
+            environment: "host:test".parse()?,
+            log: log.clone(),
+            started: Arc::clone(&started),
+            release: Mutex::new(Some(released)),
+        };
+        let limits_port = RecordingLimits::new(&log).with_oom_kills(2);
+        let argv = [OsString::from("cmd")];
+        let directory = tempfile::tempdir()?;
+        let action = action(&argv, directory.path(), directory.path())?;
+        let (sender, mut terminations) = termination_channel();
+
+        let (outcome, sent) = tokio::join!(
+            execute(
+                &sandbox,
+                with_limits.then_some(&limits_port),
+                InputLinks::Keep,
+                &action,
+                &mut terminations,
+                |_| {},
+                || {
+                    log.record("leave_action_group");
+                    Ok(())
+                },
+            ),
+            async {
+                started.wait().await;
+                sender.send(Termination::Terminate)?;
+                let _ = release.send(());
+                Ok::<_, mpsc::error::SendError<Termination>>(())
+            }
+        );
+        sent?;
+        let outcome = outcome?;
+        assert_eq!(
+            outcome.outcome,
+            ActionExecutionOutcome::Signaled(Termination::Terminate.signal())
+        );
+        assert_eq!(
+            outcome.usage.map(|usage| usage.oom_kills),
+            with_limits.then_some(2)
+        );
+        if with_limits {
+            assert_eq!(
+                log.calls(),
+                [
+                    "limits.enter",
+                    "sandbox.start",
+                    "sandbox.drop",
+                    "limits.leave"
+                ]
+            );
+        } else {
+            assert_eq!(log.calls(), ["sandbox.start", "sandbox.drop"]);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn signal_error_during_startup_drops_start_and_preserves_usage() -> Result<(), Box<dyn Error>>
+{
+    for with_limits in [false, true] {
+        let log = CallLog::default();
+        let started = Arc::new(Barrier::new(2));
+        let (release, released) = oneshot::channel();
+        let sandbox = PendingStartup {
+            environment: "host:test".parse()?,
+            log: log.clone(),
+            started: Arc::clone(&started),
+            release: Mutex::new(Some(released)),
+        };
+        let limits_port = RecordingLimits::new(&log).with_oom_kills(2);
+        let argv = [OsString::from("cmd")];
+        let directory = tempfile::tempdir()?;
+        let action = action(&argv, directory.path(), directory.path())?;
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let mut terminations = UnboundedReceiverStream::new(receiver);
+
+        let (outcome, sent) = tokio::join!(
+            execute(
+                &sandbox,
+                with_limits.then_some(&limits_port),
+                InputLinks::Keep,
+                &action,
+                &mut terminations,
+                |_| {},
+                || {
+                    log.record("leave_action_group");
+                    Ok(())
+                },
+            ),
+            async {
+                started.wait().await;
+                sender.send(Err(io::Error::other("signal read failed")))?;
+                let _ = release.send(());
+                Ok::<_, mpsc::error::SendError<io::Result<Termination>>>(())
+            }
+        );
+        sent?;
+        let failure = outcome.expect_err("signal stream must fail");
+        assert!(matches!(failure.error, ExecError::Signals(_)));
+        assert_eq!(
+            failure.usage.map(|usage| usage.oom_kills),
+            with_limits.then_some(2)
+        );
+        if with_limits {
+            assert_eq!(
+                log.calls(),
+                [
+                    "limits.enter",
+                    "sandbox.start",
+                    "sandbox.drop",
+                    "limits.leave"
+                ]
+            );
+        } else {
+            assert_eq!(log.calls(), ["sandbox.start", "sandbox.drop"]);
         }
     }
     Ok(())
@@ -384,7 +547,9 @@ async fn signal_stream_error_prevents_start_and_leaves_scope() -> Result<(), Box
         )
         .await;
 
-        assert!(matches!(result, Err(ExecError::Signals(_))));
+        let failure = result.expect_err("signal stream must fail");
+        assert!(matches!(failure.error, ExecError::Signals(_)));
+        assert_eq!(failure.usage.is_some(), with_limits);
         if with_limits {
             assert_eq!(log.calls(), ["limits.enter", "limits.leave"]);
         } else {
@@ -456,7 +621,10 @@ async fn leaves_the_scope_when_the_sandbox_fails_to_start() -> Result<(), Box<dy
     )
     .await;
 
-    assert!(matches!(result, Err(ExecError::Sandbox(_))));
+    let failure = result.expect_err("sandbox start must fail");
+    assert!(matches!(failure.error, ExecError::Sandbox(_)));
+    let usage = failure.usage.ok_or("missing scope usage")?;
+    assert_eq!(usage.peak_memory.map(Bytes::get), Some(4096));
     assert_eq!(
         log.calls(),
         ["limits.enter", "sandbox.start", "limits.leave"]
@@ -486,7 +654,13 @@ async fn a_failing_wait_while_limits_are_active_is_a_sandbox_error_and_the_scope
     )
     .await;
 
-    assert!(matches!(result, Err(ExecError::Sandbox(_))));
+    assert!(matches!(
+        result,
+        Err(ExecFailure {
+            error: ExecError::Sandbox(_),
+            usage: Some(_)
+        })
+    ));
     assert_eq!(
         log.calls(),
         [
@@ -519,7 +693,13 @@ async fn leave_failure_after_success_is_a_limits_error() -> Result<(), Box<dyn E
     )
     .await;
 
-    assert!(matches!(result, Err(ExecError::Limits(_))));
+    assert!(matches!(
+        result,
+        Err(ExecFailure {
+            error: ExecError::Limits(_),
+            usage: None
+        })
+    ));
     assert_eq!(
         log.calls(),
         [
@@ -552,7 +732,13 @@ async fn sandbox_error_wins_over_leave_error() -> Result<(), Box<dyn Error>> {
     )
     .await;
 
-    assert!(matches!(result, Err(ExecError::Sandbox(_))));
+    assert!(matches!(
+        result,
+        Err(ExecFailure {
+            error: ExecError::Sandbox(_),
+            usage: None
+        })
+    ));
     Ok(())
 }
 
@@ -576,7 +762,13 @@ async fn enter_failure_never_starts_the_sandbox() -> Result<(), Box<dyn Error>> 
     )
     .await;
 
-    assert!(matches!(result, Err(ExecError::Limits(_))));
+    assert!(matches!(
+        result,
+        Err(ExecFailure {
+            error: ExecError::Limits(_),
+            usage: None
+        })
+    ));
     assert_eq!(log.calls(), ["limits.enter"]);
     Ok(())
 }
@@ -691,7 +883,13 @@ async fn break_failure_never_starts_the_sandbox() -> Result<(), Box<dyn Error>> 
     )
     .await;
 
-    assert!(matches!(result, Err(ExecError::LinkBreak(_))));
+    assert!(matches!(
+        result,
+        Err(ExecFailure {
+            error: ExecError::LinkBreak(_),
+            usage: None
+        })
+    ));
     assert!(log.calls().is_empty());
     Ok(())
 }

@@ -68,6 +68,39 @@ run "private_subnet_ids_map_each_zone_to_its_private_subnet" {
   }
 }
 
+run "assigned_ipv6_is_exported" {
+  command = apply
+  override_resource {
+    target = aws_vpc.this
+    values = { ipv6_cidr_block = "2600:1f00:abcd:1200::/56" }
+  }
+  assert {
+    # The output's conditional unifies its branches to list(string), not a tuple.
+    condition     = output.vpc_ipv6_cidr_blocks == tolist(["2600:1f00:abcd:1200::/56"])
+    error_message = "The network must expose its assigned IPv6 CIDR."
+  }
+}
+
+run "unassigned_ipv6_is_empty" {
+  command = apply
+  override_resource {
+    target = aws_vpc.this
+    values = { ipv6_cidr_block = "" }
+  }
+  assert {
+    condition     = length(output.vpc_ipv6_cidr_blocks) == 0
+    error_message = "An unassigned IPv6 CIDR must produce an empty list."
+  }
+}
+
+run "public_subnets_are_keyed_by_zone" {
+  command = apply
+  assert {
+    condition     = alltrue([for subnet in aws_subnet.public : output.public_subnets_by_az[subnet.availability_zone] == subnet.id])
+    error_message = "Each public subnet must be keyed by its availability zone."
+  }
+}
+
 run "two_zones_two_subnets_each" {
   command = plan
 

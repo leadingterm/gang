@@ -712,21 +712,57 @@ fn sessions_checks(ctx: &RunContext<'_>) -> Vec<Check> {
     })
 }
 
-/// The verdicts of the network scenario, or one skipped check where the sandbox does not isolate.
+/// Runs both admission variants inside the isolated fixture worker.
+pub fn egress_worker(inputs: &DeploymentInputs, targets: &crate::EgressTargets) -> Report {
+    let mut report = Report::default();
+    let issuer = match TestIssuer::start(&inputs.settings) {
+        Ok(issuer) => issuer,
+        Err(error) => {
+            report.extend([Check::failed(
+                names::suite::ISSUER_STARTS,
+                gang_types::error_chain(&error).to_string(),
+            )]);
+            return report;
+        }
+    };
+    let baseline = Variant::baseline(Sandbox::Bwrap);
+    for permit_network in [PermitNetwork::Denied, PermitNetwork::Permitted] {
+        let variant = Variant {
+            permit_network,
+            ..baseline
+        };
+        report.extend(attempt(Scenario::Network, || {
+            let stack = Stack::create(inputs, &variant, Transport::Tls, &issuer)?;
+            network(&stack, &variant, targets)
+        }));
+    }
+    report
+}
+
+/// The network scenario uses a separate fixture before constructing any deployment.
 fn network_checks(ctx: &RunContext<'_>) -> Vec<Check> {
     match ctx.sandbox {
         Sandbox::Bwrap => {
-            let permitted = Variant {
-                permit_network: PermitNetwork::Permitted,
-                ..ctx.baseline
+            let mut checks = match crate::egress_fixture::launch(ctx.inputs) {
+                Ok(report) => report.checks,
+                Err(error) => vec![Check::failed(
+                    names::suite::scenario_completes(Scenario::Network),
+                    gang_types::error_chain(&error).to_string(),
+                )],
             };
-            attempt(Scenario::Network, || {
-                let stack = Stack::create(ctx.inputs, &permitted, Transport::Tls, ctx.issuer)?;
-                network(&stack, &permitted)
-            })
+            match crate::egress_fixture::lifecycle_targets(ctx.inputs)
+                .and_then(|targets| crate::egress_lifecycle::run(ctx.inputs, &targets))
+            {
+                Ok(report) => checks.extend(report.checks),
+                Err(error) => checks.push(Check::failed(
+                    "egress lifecycle: delegated driver",
+                    gang_types::error_chain(&error).to_string(),
+                )),
+            }
+            checks
         }
         Sandbox::Noop => vec![Check::skipped(
-            names::network::PERMITTED_REQUEST_SHARES,
+            names::suite::scenario_completes(Scenario::Network),
             "the noop sandbox does not isolate",
         )],
     }
@@ -1459,6 +1495,7 @@ mod tests {
                 bwrap: None,
                 glibc_tool: None,
                 action_rootfs: None,
+                egress: None,
             },
             upgrade: None,
         };

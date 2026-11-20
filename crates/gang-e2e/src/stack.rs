@@ -98,7 +98,7 @@ fn signal_in(directory: &Path) -> Result<(PathBuf, crate::hold::Signal)> {
     Ok((path, signal))
 }
 
-fn sample_parameters(
+pub(crate) fn sample_parameters(
     invocation: &DeploymentInputs,
     variant: &Variant,
     salt: &str,
@@ -130,6 +130,16 @@ fn sample_parameters(
         large_memory_kb,
         requested_sandbox: Sandbox::Noop,
         glibc_tool: invocation.action_tools.glibc_tool.clone(),
+        egress_probe: invocation
+            .action_tools
+            .egress
+            .as_ref()
+            .map(|tools| tools.probe.clone()),
+        egress_targets: invocation
+            .action_tools
+            .egress
+            .as_ref()
+            .and_then(|tools| tools.targets.clone()),
     }
 }
 
@@ -162,6 +172,27 @@ fn prepare_admin_directories(placement: &Placement, transport: Transport) -> Res
         }
     }
     Ok(())
+}
+
+fn configure_identity(
+    template: ConfigTemplate,
+    transport: Transport,
+    issuer: &TestIssuer,
+    variant: &Variant,
+) -> Result<(ConfigTemplate, Option<CaPin>, Option<PathBuf>)> {
+    match transport {
+        Transport::Tls => {
+            let template = template.with_identity(issuer.url(), variant.identity)?;
+            let signer_key = template.signer_key_file()?;
+            let ca_pin = signer_key::provision(&signer_key)?;
+            Ok((
+                template.with_ca_pin(&ca_pin)?,
+                Some(ca_pin),
+                Some(signer_key),
+            ))
+        }
+        Transport::Plain => Ok((template, None, None)),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -332,19 +363,8 @@ impl<'a> Stack<'a> {
             .vary(variant, &settings.worker_launcher, &invocation.action_tools)?
             .with_launch_gate(gate_path.as_deref(), settings.history_timeout)?;
         let launch_gate = gate_path.map(|path| (path, Mutex::new(None)));
-        let (template, ca_pin, signer_key) = match transport {
-            Transport::Tls => {
-                let template = template.with_identity(issuer.url(), variant.identity)?;
-                let signer_key = template.signer_key_file()?;
-                let ca_pin = signer_key::provision(&signer_key)?;
-                (
-                    template.with_ca_pin(&ca_pin)?,
-                    Some(ca_pin),
-                    Some(signer_key),
-                )
-            }
-            Transport::Plain => (template, None, None),
-        };
+        let (template, ca_pin, signer_key) =
+            configure_identity(template, transport, issuer, variant)?;
 
         let isa = template.default_isa()?;
         let tmp_path = PathBuf::from("/tmp");

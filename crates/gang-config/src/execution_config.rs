@@ -3,12 +3,15 @@
 use serde::{Deserialize, Serialize};
 
 /// The `[execution]` section: how `gang exec` prepares an action before it runs.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionConfig {
     /// Whether action inputs stay hard links to the cached files. Defaults to `keep`.
     #[serde(default)]
     pub input_links: InputLinks,
+    /// Public egress policy, required by fleets that grant network access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<gang_types::PublicEgressPolicy>,
 }
 
 /// Whether `gang exec` leaves an action's inputs hard-linked to the cached files.

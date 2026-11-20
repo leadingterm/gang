@@ -10,7 +10,7 @@ Status: Accepted
 - **Validation is serde plus the type,** at `GangConfig::from_str`: unknown keys, bad values and missing required keys fail naming the fleet (`ConfigError::FleetOptions`). `Plugin::build` never sees fleets.
   `FleetOptions::validate_fleets` checks rules that span the provisioner's fleets.
 - **Options are selectable scalars** registered as exact worker properties, except launch-only options (`#[option(launch)]`), which shape how instances are launched, register no property and may be any `Deserialize` type (ADR-23 uses one).
-- **One vocabulary source.** `FleetConfig.properties` is built once from the typed struct; `gang options [<provisioner>]` and SPEC §3.1 derive from it. Reserved keys (`fleet`, `ISA`, `sandbox`, `cpu_count`, `memory_kb`, `disk_kb`, `network`) cannot be option names (compile error).
+- **One vocabulary source.** `FleetConfig.properties` is built once from the typed struct; `gang options [<provisioner>]` and SPEC §3.1 derive from it. Reserved keys (`fleet`, `ISA`, `sandbox`, `cpu_count`, `cpu_millicores`, `memory_kb`, `disk_kb`, `network`, `supports-workers`) cannot be option names (compile error).
 
 ## Consequences
 - AWS declares `capacity` and `machine_class`; Local declares none, so every option is rejected.

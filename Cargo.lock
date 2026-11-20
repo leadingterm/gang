@@ -2421,6 +2421,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "tracing",
 ]
 
 [[package]]
@@ -3061,6 +3062,7 @@ dependencies = [
  "base64 0.23.1",
  "gang-macros",
  "hex",
+ "ipnet",
  "p256 0.14.0",
  "serde",
  "serde_json",
@@ -4254,7 +4256,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 [[package]]
 name = "nativelink-config"
 version = "1.8.3"
-source = "git+https://github.com/leadingterm/nativelink?rev=c4f8e2329619529e51d1cd9b6944fea56ed2ea95#c4f8e2329619529e51d1cd9b6944fea56ed2ea95"
+source = "git+https://github.com/leadingterm/nativelink?rev=889376efd2328873e60e633a91ebdc6404b2b094#889376efd2328873e60e633a91ebdc6404b2b094"
 dependencies = [
  "byte-unit",
  "humantime",
@@ -4270,7 +4272,7 @@ dependencies = [
 [[package]]
 name = "nativelink-error"
 version = "1.8.3"
-source = "git+https://github.com/leadingterm/nativelink?rev=c4f8e2329619529e51d1cd9b6944fea56ed2ea95#c4f8e2329619529e51d1cd9b6944fea56ed2ea95"
+source = "git+https://github.com/leadingterm/nativelink?rev=889376efd2328873e60e633a91ebdc6404b2b094#889376efd2328873e60e633a91ebdc6404b2b094"
 dependencies = [
  "base64 0.22.1",
  "mongodb",
@@ -4294,7 +4296,7 @@ dependencies = [
 [[package]]
 name = "nativelink-metric"
 version = "1.8.3"
-source = "git+https://github.com/leadingterm/nativelink?rev=c4f8e2329619529e51d1cd9b6944fea56ed2ea95#c4f8e2329619529e51d1cd9b6944fea56ed2ea95"
+source = "git+https://github.com/leadingterm/nativelink?rev=889376efd2328873e60e633a91ebdc6404b2b094#889376efd2328873e60e633a91ebdc6404b2b094"
 dependencies = [
  "async-lock",
  "nativelink-metric-macro-derive",
@@ -4306,7 +4308,7 @@ dependencies = [
 [[package]]
 name = "nativelink-metric-macro-derive"
 version = "1.8.3"
-source = "git+https://github.com/leadingterm/nativelink?rev=c4f8e2329619529e51d1cd9b6944fea56ed2ea95#c4f8e2329619529e51d1cd9b6944fea56ed2ea95"
+source = "git+https://github.com/leadingterm/nativelink?rev=889376efd2328873e60e633a91ebdc6404b2b094#889376efd2328873e60e633a91ebdc6404b2b094"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4316,7 +4318,7 @@ dependencies = [
 [[package]]
 name = "nativelink-proto"
 version = "1.8.3"
-source = "git+https://github.com/leadingterm/nativelink?rev=c4f8e2329619529e51d1cd9b6944fea56ed2ea95#c4f8e2329619529e51d1cd9b6944fea56ed2ea95"
+source = "git+https://github.com/leadingterm/nativelink?rev=889376efd2328873e60e633a91ebdc6404b2b094#889376efd2328873e60e633a91ebdc6404b2b094"
 dependencies = [
  "derive_more",
  "prost",
@@ -4328,7 +4330,7 @@ dependencies = [
 [[package]]
 name = "nativelink-redis-tester"
 version = "1.8.3"
-source = "git+https://github.com/leadingterm/nativelink?rev=c4f8e2329619529e51d1cd9b6944fea56ed2ea95#c4f8e2329619529e51d1cd9b6944fea56ed2ea95"
+source = "git+https://github.com/leadingterm/nativelink?rev=889376efd2328873e60e633a91ebdc6404b2b094#889376efd2328873e60e633a91ebdc6404b2b094"
 dependencies = [
  "either",
  "nativelink-util",
@@ -4342,7 +4344,7 @@ dependencies = [
 [[package]]
 name = "nativelink-scheduler"
 version = "1.8.3"
-source = "git+https://github.com/leadingterm/nativelink?rev=c4f8e2329619529e51d1cd9b6944fea56ed2ea95#c4f8e2329619529e51d1cd9b6944fea56ed2ea95"
+source = "git+https://github.com/leadingterm/nativelink?rev=889376efd2328873e60e633a91ebdc6404b2b094#889376efd2328873e60e633a91ebdc6404b2b094"
 dependencies = [
  "async-lock",
  "async-trait",
@@ -4376,7 +4378,7 @@ dependencies = [
 [[package]]
 name = "nativelink-service"
 version = "1.8.3"
-source = "git+https://github.com/leadingterm/nativelink?rev=c4f8e2329619529e51d1cd9b6944fea56ed2ea95#c4f8e2329619529e51d1cd9b6944fea56ed2ea95"
+source = "git+https://github.com/leadingterm/nativelink?rev=889376efd2328873e60e633a91ebdc6404b2b094#889376efd2328873e60e633a91ebdc6404b2b094"
 dependencies = [
  "axum",
  "bytes",
@@ -4411,7 +4413,7 @@ dependencies = [
 [[package]]
 name = "nativelink-store"
 version = "1.8.3"
-source = "git+https://github.com/leadingterm/nativelink?rev=c4f8e2329619529e51d1cd9b6944fea56ed2ea95#c4f8e2329619529e51d1cd9b6944fea56ed2ea95"
+source = "git+https://github.com/leadingterm/nativelink?rev=889376efd2328873e60e633a91ebdc6404b2b094#889376efd2328873e60e633a91ebdc6404b2b094"
 dependencies = [
  "async-lock",
  "async-trait",
@@ -4477,7 +4479,7 @@ dependencies = [
 [[package]]
 name = "nativelink-util"
 version = "1.8.3"
-source = "git+https://github.com/leadingterm/nativelink?rev=c4f8e2329619529e51d1cd9b6944fea56ed2ea95#c4f8e2329619529e51d1cd9b6944fea56ed2ea95"
+source = "git+https://github.com/leadingterm/nativelink?rev=889376efd2328873e60e633a91ebdc6404b2b094#889376efd2328873e60e633a91ebdc6404b2b094"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4532,7 +4534,7 @@ dependencies = [
 [[package]]
 name = "nativelink-worker"
 version = "1.8.3"
-source = "git+https://github.com/leadingterm/nativelink?rev=c4f8e2329619529e51d1cd9b6944fea56ed2ea95#c4f8e2329619529e51d1cd9b6944fea56ed2ea95"
+source = "git+https://github.com/leadingterm/nativelink?rev=889376efd2328873e60e633a91ebdc6404b2b094#889376efd2328873e60e633a91ebdc6404b2b094"
 dependencies = [
  "async-lock",
  "bytes",

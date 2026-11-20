@@ -16,13 +16,15 @@ pub const MILLICORES_PER_CORE: u64 = 1000;
 pub const MEMORY_KB: &str = "memory_kb";
 /// Disk in KiB. Matches when the fleet has at least the requested amount.
 pub const DISK_KB: &str = "disk_kb";
-/// The network. Imposes nothing on matching.
+/// The action's requested network capability.
 pub const NETWORK: &str = "network";
+/// Persistent-worker marker; actions still execute one-shot.
+pub const SUPPORTS_WORKERS: &str = "supports-workers";
 /// The action environment identity. Matches exactly.
 pub const ACTION_ENVIRONMENT: &str = "gang_action_environment";
 
 /// Every reserved property key.
-pub const RESERVED: [&str; 9] = [
+pub const RESERVED: [&str; 10] = [
     FLEET,
     ISA,
     SANDBOX,
@@ -31,11 +33,12 @@ pub const RESERVED: [&str; 9] = [
     MEMORY_KB,
     DISK_KB,
     NETWORK,
+    SUPPORTS_WORKERS,
     ACTION_ENVIRONMENT,
 ];
 
-/// Keys that impose nothing on matching.
-pub const IGNORED: [&str; 1] = [NETWORK];
+/// Explicitly harmless properties that impose nothing on matching.
+pub const HARMLESS_PROPERTIES: [&str; 1] = [SUPPORTS_WORKERS];
 
 /// Returns whether `key` is one of the [`RESERVED`] keys.
 ///
@@ -76,6 +79,7 @@ mod tests {
             "memory_kb",
             "disk_kb",
             "network",
+            "supports-workers",
             "gang_action_environment",
         ] {
             assert!(is_reserved(key), "{key}");
@@ -90,8 +94,8 @@ mod tests {
     }
 
     #[test]
-    fn every_ignored_key_is_reserved() {
-        for key in IGNORED {
+    fn every_harmless_key_is_reserved() {
+        for key in HARMLESS_PROPERTIES {
             assert!(is_reserved(key), "{key}");
         }
     }

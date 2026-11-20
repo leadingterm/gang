@@ -17,7 +17,7 @@ use gang_spi::{
     ApiResponseBody, ApiService, Authenticated, AuthenticationPort, BuildError, CacheStorePort,
     CertificateSignerPort, ControllerConnections, ControllerEndpoints, ControllerReady,
     ControllerSpec, ExpiringRecordPort, FleetInstance, FleetSupply, GateDecision, Listening,
-    LoginPort, LoginRequest, LoginSupport, NetworkRequest, NodeLifecyclePort, Peer, Plugin,
+    LoginPort, LoginRequest, LoginSupport, NetworkAccess, NodeLifecyclePort, Peer, Plugin,
     PluginContext, PortError, PreemptionNotice, ProofVerifierPort, ProvisionerPort, RecordId,
     RecordKey, RecordKind, RecordVersion, Rejection, RenderedStoreSpec, RequestGate, RequestScope,
     SchedulerPort, SchedulerSnapshot, Scheme, ScratchVolumePort, SignatureAlgorithm, Slots,
@@ -26,9 +26,9 @@ use gang_spi::{
 };
 use gang_testkit::must_ready as ready;
 use gang_types::{
-    AuthenticationSettings, Bytes, CertSerial, Fleet, FleetCatalog, FleetName, FleetProperties,
-    Identity, InstanceLifecycle, Isa, NonZeroBytes, Principal, Proof, ProviderName, RefreshToken,
-    Resources, Url, WorkerId, WorkerLifetime,
+    AuthenticationSettings, Bytes, CertSerial, Fleet, FleetActionPolicy, FleetCatalog, FleetName,
+    FleetProperties, Identity, InstanceLifecycle, Isa, NetworkRequest, NonZeroBytes, Principal,
+    Proof, ProviderName, RefreshToken, Resources, Url, WorkerId, WorkerLifetime,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -241,7 +241,7 @@ fn execute(sandbox: &Sandbox) -> Result<ActionExecutionOutcome, Box<dyn Error>> 
         environment: &[],
         action_directory: Path::new("/work"),
         working_directory: Path::new("/work"),
-        network: NetworkRequest::NotRequested,
+        network: NetworkAccess::Offline,
     };
     Ok(ready(async { sandbox.start(&spec).await?.wait().await })?)
 }
@@ -561,6 +561,7 @@ fn scheduler_runs_controller_and_worker() -> Result<(), Box<dyn Error>> {
             memory: Bytes::new(1),
             disk: Bytes::new(100 << 30),
         },
+        &FleetActionPolicy::default(),
         [],
     );
     let catalog = FleetCatalog::try_new(vec![properties.clone()])?;

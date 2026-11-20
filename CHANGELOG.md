@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Configure per-fleet action capability grants and optional per-action resource ceilings separately from worker capacity.
+- Opt in to isolated public network egress with protected networks for enforcing sandboxes.
+- Configure public action DNS resolvers with `dns_servers`; host and slirp DNS are not used.
+- Bound network setup with `setup_timeout` (default `10s`).
+
+### Changed
+
+- Reject unknown platform properties, ungranted network requests and over-ceiling requests at admission instead of silently accepting them.
+
 ## 0.3.3
 
 ### Added

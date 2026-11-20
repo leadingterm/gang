@@ -1,12 +1,11 @@
 //! The `bwrap` command line of one action.
 
 use std::ffi::OsStr;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::process::Command;
 
-use gang_spi::{ActionExecutionSpec, NetworkRequest};
-
 use crate::bwrap::Bwrap;
+use gang_spi::ActionExecutionSpec;
 
 /// The bound multicall executable inside the sandbox.
 const RESET_PATH: &str = "/gang-reset";
@@ -18,12 +17,9 @@ impl Bwrap {
     /// the content store and other actions' directories are never mapped.
     /// The action directory is bound read-write, so every input resolves,
     /// including those outside the working directory (`../input`, relative symlinks); the working
-    /// directory inside it becomes the current directory. `--share-net` must follow
-    /// `--unshare-all`, which the prefix contains, so it re-enables the network only when both the
-    /// plugin permits it and the action requests it. The `bwrap` process itself starts with an
-    /// empty environment, so a host variable such as `LD_PRELOAD` never reaches it; inside the
-    /// sandbox the environment is replaced wholesale with `--clearenv` and `--setenv`, so nothing
-    /// is inherited.
+    /// directory inside it becomes the current directory. The host network is never shared.
+    /// The `bwrap` process itself starts with an empty environment. For gated actions the
+    /// trusted reset process also starts empty; the environment is delivered after setup.
     ///
     /// `info_fd` is the descriptor `bwrap` writes its `--info-fd` report to. It is passed through
     /// unchanged, so the caller keeps it open in the spawned process; `bwrap` writes the report
@@ -32,7 +28,12 @@ impl Bwrap {
     /// With limits, the launcher starts `bwrap` itself, so the whole sandbox, `bwrap` included,
     /// starts inside the limits scope.
     #[must_use]
-    pub(crate) fn command(&self, spec: &ActionExecutionSpec<'_>, info_fd: RawFd) -> Command {
+    pub(crate) fn command(
+        &self,
+        spec: &ActionExecutionSpec<'_>,
+        info_fd: RawFd,
+        network: Option<(BorrowedFd<'_>, BorrowedFd<'_>)>,
+    ) -> Command {
         let action_directory = spec.action_directory.as_os_str();
         let mut command = match spec.launcher.split_first() {
             Some((launcher, launcher_arguments)) => {
@@ -52,11 +53,15 @@ impl Bwrap {
             OsStr::new("--chdir"),
             spec.working_directory.as_os_str(),
         ]);
-        if self.permit_network && spec.network == NetworkRequest::Requested {
-            command.arg("--share-net");
-        }
-        for (name, value) in spec.environment {
-            command.arg("--setenv").arg(name).arg(value);
+        if let Some((_gate, resolver)) = network {
+            command
+                .arg("--ro-bind-data")
+                .arg(resolver.as_raw_fd().to_string())
+                .arg("/etc/resolv.conf");
+        } else {
+            for (name, value) in spec.environment {
+                command.arg("--setenv").arg(name).arg(value);
+            }
         }
         command
             .arg("--ro-bind")
@@ -65,7 +70,14 @@ impl Bwrap {
             .arg("--remount-ro")
             .arg("/")
             .arg("--")
-            .arg(RESET_PATH)
+            .arg(RESET_PATH);
+        if let Some((gate, _resolver)) = network {
+            command
+                .arg("--execution-gate-fd")
+                .arg(gate.as_raw_fd().to_string());
+        }
+        command
+            .arg("--")
             .arg(spec.command.program())
             .args(spec.command.args());
         command
@@ -75,28 +87,27 @@ impl Bwrap {
 #[cfg(test)]
 mod tests {
     use std::ffi::{OsStr, OsString};
-    use std::os::fd::RawFd;
+    #[cfg(target_os = "linux")]
+    use std::os::fd::{AsFd, AsRawFd};
+    use std::os::fd::{BorrowedFd, RawFd};
     use std::path::Path;
     use std::process::Command;
 
     #[cfg(target_os = "linux")]
     use gang_spi::ActionIsolationPort;
-    use gang_spi::{ActionCommand, ActionExecutionSpec, NetworkRequest, Plugin, PluginContext};
+    use gang_spi::{ActionCommand, ActionExecutionSpec, NetworkAccess, Plugin, PluginContext};
 
     use crate::Bwrap;
-    #[cfg(target_os = "linux")]
     use crate::BwrapConfig;
     use crate::bwrap::tests::config;
 
     /// The descriptor the tests report the sandbox on; the command line only names it.
     const INFO_FD: RawFd = 7;
 
-    fn bwrap(permit_network_property: bool) -> Bwrap {
+    fn bwrap() -> Bwrap {
         let directory = tempfile::tempdir().expect("fixture");
-        let mut config = config(directory.path());
-        config.permit_network_property = permit_network_property;
         Bwrap::build(
-            config,
+            config(directory.path()),
             &PluginContext {
                 config_path: Path::new("sandbox.toml"),
             },
@@ -108,7 +119,8 @@ mod tests {
         bwrap: &Bwrap,
         action_directory: &Path,
         working_directory: &Path,
-        network: NetworkRequest,
+        network: NetworkAccess<'_>,
+        setup: Option<(BorrowedFd<'_>, BorrowedFd<'_>)>,
     ) -> Result<Command, Box<dyn std::error::Error>> {
         let argv = [
             OsString::from("/bin/sh"),
@@ -127,7 +139,7 @@ mod tests {
             working_directory,
             network,
         };
-        Ok(bwrap.command(&spec, INFO_FD))
+        Ok(bwrap.command(&spec, INFO_FD, setup))
     }
 
     fn args(command: &Command) -> Vec<String> {
@@ -168,7 +180,8 @@ mod tests {
             &bwrap,
             Path::new("/tmp/action"),
             Path::new("/tmp/action"),
-            NetworkRequest::NotRequested,
+            NetworkAccess::Offline,
+            None,
         )
         .expect("command");
         let args = args(&command);
@@ -191,47 +204,152 @@ mod tests {
     }
 
     #[test]
-    fn share_net_only_when_permitted_and_requested() -> Result<(), Box<dyn std::error::Error>> {
-        let cases = [
-            (false, NetworkRequest::NotRequested, false),
-            (false, NetworkRequest::Requested, false),
-            (true, NetworkRequest::NotRequested, false),
-            (true, NetworkRequest::Requested, true),
-        ];
-
-        for (permit, request, expected) in cases {
-            let bwrap = bwrap(permit);
-            let args = args(&command(
-                &bwrap,
-                Path::new("/work/a"),
-                Path::new("/work/a"),
-                request,
-            )?);
-
-            let occurrences = args.iter().filter(|arg| *arg == "--share-net").count();
-            assert_eq!(
-                occurrences,
-                usize::from(expected),
-                "permit={permit}, request={request:?}: {args:?}"
-            );
-            if expected {
-                let share = position(&args, "--share-net");
-                assert!(position(&args, "--unshare-all") < share, "{args:?}");
-                assert!(share < position(&args, "--"), "{args:?}");
-            }
+    fn rootfs_identity_files_are_not_replaced() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = config(directory.path());
+        std::fs::create_dir(config.root.join("root/etc"))?;
+        for file in ["passwd", "group", "nsswitch.conf"] {
+            std::fs::write(config.root.join("root/etc").join(file), file)?;
         }
+        let bwrap = Bwrap::build(
+            config,
+            &PluginContext {
+                config_path: Path::new("/"),
+            },
+        )?;
+        let args = args(&command(
+            &bwrap,
+            Path::new("/work"),
+            Path::new("/work"),
+            NetworkAccess::Offline,
+            None,
+        )?);
+        assert!(
+            args.windows(3)
+                .any(|a| a[0] == "--ro-bind" && a[2] == "/etc")
+        );
+        assert!(!args.iter().any(|a| a == "--ro-bind-data"));
+        Ok(())
+    }
+
+    #[test]
+    fn full_command_line_for_unshared_network() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let bwrap = Bwrap::build(
+            config(directory.path()),
+            &PluginContext {
+                config_path: Path::new("/"),
+            },
+        )?;
+        let command = command(
+            &bwrap,
+            Path::new("/work/a"),
+            Path::new("/work/a/sub"),
+            NetworkAccess::Offline,
+            None,
+        )?;
+        assert_eq!(command.get_program(), "/usr/bin/bwrap");
+        let root = std::fs::canonicalize(directory.path().join("envelope/root/usr"))?;
+        assert_eq!(
+            args(&command),
+            [
+                "--unshare-all",
+                "--unshare-user",
+                "--uid",
+                "1000",
+                "--gid",
+                "1000",
+                "--die-with-parent",
+                "--new-session",
+                "--clearenv",
+                "--ro-bind",
+                &root.to_string_lossy(),
+                "/usr",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--tmpfs",
+                "/tmp",
+                "--info-fd",
+                "7",
+                "--bind",
+                "/work/a",
+                "/work/a",
+                "--chdir",
+                "/work/a/sub",
+                "--setenv",
+                "A",
+                "1",
+                "--setenv",
+                "B",
+                "two words",
+                "--ro-bind",
+                &bwrap.executable.to_string_lossy(),
+                "/gang-reset",
+                "--remount-ro",
+                "/",
+                "--",
+                "/gang-reset",
+                "--",
+                "/bin/sh",
+                "-c",
+                "echo hi there",
+            ]
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn action_policy_never_shares_host_network() -> Result<(), Box<dyn std::error::Error>> {
+        let bwrap = bwrap();
+        let (_parent, gate) = gang_os::execution_gate_pair()?;
+        let resolver = tempfile::tempfile()?;
+        let gate_fd = gate.as_raw_fd().to_string();
+        let resolver_fd = resolver.as_raw_fd().to_string();
+        let policy: gang_types::PublicEgressPolicy =
+            toml::from_str("protected_networks = [\"10.0.0.0/8\"]\ndns_servers = [\"1.1.1.1\"]")?;
+        let args = args(&command(
+            &bwrap,
+            Path::new("/work/a"),
+            Path::new("/work/a"),
+            NetworkAccess::PublicEgress {
+                policy: &policy,
+                controller_endpoints: &[],
+            },
+            Some((gate.as_fd(), resolver.as_fd())),
+        )?);
+        assert!(args.iter().any(|arg| arg == "--unshare-all"), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "--share-net"), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "--setenv"), "{args:?}");
+        let resolver = position(&args, "/etc/resolv.conf");
+        assert_eq!(
+            &args[resolver - 2..=resolver],
+            [
+                "--ro-bind-data".into(),
+                resolver_fd,
+                "/etc/resolv.conf".into()
+            ]
+        );
+        let gate = position(&args, "--execution-gate-fd");
+        assert_eq!(
+            &args[gate + 1..gate + 4],
+            [gate_fd, "--".into(), "/bin/sh".into()]
+        );
         Ok(())
     }
 
     #[test]
     fn tmpfs_tmp_precedes_action_directory_bind() -> Result<(), Box<dyn std::error::Error>> {
-        let bwrap = bwrap(false);
+        let bwrap = bwrap();
 
         let args = args(&command(
             &bwrap,
             Path::new("/tmp/work"),
             Path::new("/tmp/work"),
-            NetworkRequest::NotRequested,
+            NetworkAccess::Offline,
+            None,
         )?);
 
         let tmpfs = position(&args, "--tmpfs");
@@ -241,8 +359,31 @@ mod tests {
     }
 
     #[test]
+    fn uses_configured_program() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let bwrap = Bwrap::build(
+            BwrapConfig {
+                program: "/custom/bwrap".into(),
+                ..config(directory.path())
+            },
+            &PluginContext {
+                config_path: Path::new("sandbox.toml"),
+            },
+        )?;
+        let command = command(
+            &bwrap,
+            Path::new("/work/a"),
+            Path::new("/work/a"),
+            NetworkAccess::Offline,
+            None,
+        )?;
+        assert_eq!(command.get_program(), "/custom/bwrap");
+        Ok(())
+    }
+
+    #[test]
     fn the_launcher_wraps_bwrap() -> Result<(), Box<dyn std::error::Error>> {
-        let bwrap = bwrap(false);
+        let bwrap = bwrap();
         let argv = [OsString::from("/bin/true")];
         let launcher = [
             OsString::from("/usr/bin/gang-join"),
@@ -254,10 +395,10 @@ mod tests {
             environment: &[],
             action_directory: Path::new("/work/a"),
             working_directory: Path::new("/work/a"),
-            network: NetworkRequest::NotRequested,
+            network: NetworkAccess::Offline,
         };
 
-        let command = bwrap.command(&spec, INFO_FD);
+        let command = bwrap.command(&spec, INFO_FD, None);
 
         assert_eq!(command.get_program(), launcher[0].as_os_str());
         let arguments: Vec<&OsStr> = command.get_args().collect();
@@ -302,7 +443,7 @@ mod tests {
             environment: &[],
             action_directory: directory.path(),
             working_directory: directory.path(),
-            network: NetworkRequest::NotRequested,
+            network: NetworkAccess::Offline,
         };
         // The bwrap stand-in is a Bazel-built binary: no host program runs.
         let outcome = bwrap.start(&spec).await?.wait().await?;

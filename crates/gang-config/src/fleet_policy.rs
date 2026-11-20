@@ -5,7 +5,9 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use gang_clock::Timestamp;
-use gang_types::{ActionEnvironment, FleetName, FleetProperties, Isa, NonZeroBytes, Resources};
+use gang_types::{
+    ActionEnvironment, FleetActionPolicy, FleetName, FleetProperties, Isa, NonZeroBytes, Resources,
+};
 
 use crate::ScheduledMinimum;
 
@@ -125,6 +127,8 @@ pub struct FleetPolicy {
     pub max_drain_wait: Duration,
     /// How long an instance may run without its worker connecting before it counts as an orphan.
     pub boot_grace: Duration,
+    /// Capabilities and per-action resource ceilings for this fleet.
+    pub actions: FleetActionPolicy,
 }
 
 impl FleetPolicy {
@@ -151,6 +155,7 @@ impl FleetPolicy {
             sandbox,
             &self.action_environment,
             self.instance(),
+            &self.actions,
             options,
         )
     }

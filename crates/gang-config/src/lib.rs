@@ -45,6 +45,10 @@
 //!             SandboxKey::Noop => self.noop.is_some(),
 //!         }
 //!     }
+//!     fn supports_capability(&self, _: SandboxKey, _: gang_types::Capability) -> bool {
+//!         false
+//!     }
+//!
 
 //!     fn try_for_each_program<E>(
 //!         &mut self,

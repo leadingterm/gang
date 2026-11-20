@@ -4,12 +4,12 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::errors::{E2eError, Result};
 
 /// Procedure used to retire the old controller during a mixed-version upgrade.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum UpgradeProcedure {
     /// Stop the old server before deregistering its targets.
@@ -20,7 +20,7 @@ pub enum UpgradeProcedure {
 }
 
 /// Binary and rendered deployment fixture for one release.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseInput {
     /// Release executable.
     pub binary: PathBuf,
@@ -29,7 +29,7 @@ pub struct ReleaseInput {
 }
 
 /// Inputs needed by the mixed-version upgrade scenarios.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpgradeInputs {
     /// Release upgraded or restarted by the positive mixed-version scenarios.
     pub previous: ReleaseInput,
@@ -42,7 +42,7 @@ pub struct UpgradeInputs {
 }
 
 /// The resolved inputs used to create harness deployments.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeploymentInputs {
     /// The `gang` binary under test.
     pub gang: PathBuf,
@@ -120,7 +120,7 @@ pub const DEFAULT_WORKER_LAUNCHER: &[&str] = &[
 ];
 
 /// How the harness drives Bazel, waits, and shapes the environment of actions.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Settings {
     /// Extra Bazel startup options, placed before the command.
@@ -258,7 +258,7 @@ impl Settings {
 }
 
 /// The resolved shell and PATH used by the sample's actions.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionTools {
     /// The shell Bazel uses to run each action.
     pub shell: PathBuf,
@@ -272,6 +272,34 @@ pub struct ActionTools {
     pub glibc_tool: Option<PathBuf>,
     /// Rootfs envelope used by bubblewrap workers.
     pub action_rootfs: Option<PathBuf>,
+    /// Pinned tools for the isolated public-egress fixture, when available.
+    pub egress: Option<EgressTools>,
+}
+
+/// Pinned programs and fixture state for the public-egress scenario.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressTools {
+    /// Rootless network implementation.
+    pub slirp4netns: PathBuf,
+    /// Firewall program.
+    pub nft: PathBuf,
+    /// Namespace entry program.
+    pub nsenter: PathBuf,
+    /// Network configuration program.
+    pub ip: PathBuf,
+    /// Namespace creation program.
+    pub unshare: PathBuf,
+    /// Action-side network probe.
+    pub probe: PathBuf,
+    /// Fixture peer.
+    pub peer: PathBuf,
+    /// Policy installed by the fixture.
+    pub policy: Option<gang_types::PublicEgressPolicy>,
+    /// Targets installed by the fixture.
+    pub targets: Option<crate::egress_wire::EgressTargets>,
+    /// Host-prefetched Bazel repositories, replayed offline only by the isolated fixture.
+    #[serde(default)]
+    pub repository_cache: Option<PathBuf>,
 }
 
 impl ActionTools {
@@ -305,6 +333,94 @@ impl ActionTools {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deployment_inputs_round_trip_upgrade_and_egress() {
+        let policy: gang_types::PublicEgressPolicy = serde_json::from_value(serde_json::json!({
+            "protected_networks": ["10.0.0.0/8"],
+            "dns_servers": ["8.8.8.8"],
+            "setup_timeout": "10s"
+        }))
+        .expect("egress policy parses");
+        let targets = crate::egress_wire::EgressTargets {
+            public_ipv4: "192.0.2.1:8080".parse().expect("IPv4 address parses"),
+            public_ipv6: "[2001:db8::1]:8080".parse().expect("IPv6 address parses"),
+            blocked: [(
+                "private".to_owned(),
+                "10.0.0.1:8080".parse().expect("address parses"),
+            )]
+            .into_iter()
+            .collect(),
+            dns: "8.8.8.8".parse().expect("DNS address parses"),
+            nonce: "fixture-nonce".to_owned(),
+            uid: 1234,
+            gid: 5678,
+            timeout: Duration::from_secs(3),
+            policy: policy.clone(),
+        };
+        let tools = EgressTools {
+            slirp4netns: "slirp4netns".into(),
+            nft: "nft".into(),
+            nsenter: "nsenter".into(),
+            ip: "ip".into(),
+            unshare: "unshare".into(),
+            probe: "probe".into(),
+            peer: "peer".into(),
+            policy: Some(policy),
+            targets: Some(targets),
+            repository_cache: Some("repository-cache".into()),
+        };
+        let release = |name: &str| ReleaseInput {
+            binary: format!("{name}-binary").into(),
+            fixture: format!("{name}-fixture").into(),
+        };
+        for procedure in [UpgradeProcedure::PreStop, UpgradeProcedure::InstanceRefresh] {
+            let inputs = DeploymentInputs {
+                gang: "gang".into(),
+                bazel: "bazel".into(),
+                postgres: "postgres".into(),
+                base_config: "base config".to_owned(),
+                sample: "sample".into(),
+                configs: "configs".into(),
+                settings: Settings {
+                    upgrade_procedure: procedure,
+                    ..Settings::default()
+                },
+                action_tools: ActionTools {
+                    shell: "shell".into(),
+                    path: "action-path".to_owned(),
+                    bwrap: Some("bwrap".into()),
+                    glibc_tool: Some("glibc".into()),
+                    action_rootfs: Some("rootfs".into()),
+                    egress: Some(tools.clone()),
+                },
+                upgrade: Some(UpgradeInputs {
+                    previous: release("previous"),
+                    historical: release("historical"),
+                    calibration: release("calibration"),
+                    candidate_fixture: "candidate-fixture".into(),
+                }),
+            };
+            let bytes = serde_json::to_vec(&inputs).expect("deployment inputs serialize");
+            let decoded: DeploymentInputs =
+                serde_json::from_slice(&bytes).expect("deployment inputs deserialize");
+            assert_eq!(decoded.settings, inputs.settings);
+            assert_eq!(decoded.action_tools, inputs.action_tools);
+            let upgrade = decoded.upgrade.expect("upgrade inputs survive transport");
+            for (actual, name) in [
+                (upgrade.previous, "previous"),
+                (upgrade.historical, "historical"),
+                (upgrade.calibration, "calibration"),
+            ] {
+                assert_eq!(actual.binary, PathBuf::from(format!("{name}-binary")));
+                assert_eq!(actual.fixture, PathBuf::from(format!("{name}-fixture")));
+            }
+            assert_eq!(
+                upgrade.candidate_fixture,
+                PathBuf::from("candidate-fixture")
+            );
+        }
+    }
 
     #[test]
     fn chromium_defaults_to_unset_and_accepts_override() {

@@ -19,6 +19,10 @@ pub struct NoopConfig {
 }
 
 impl SandboxPrograms for NoopConfig {
+    fn supports_capability(&self, _capability: gang_types::Capability) -> bool {
+        false
+    }
+
     fn try_for_each_program<E>(
         &mut self,
         _visit: &mut impl FnMut(&mut PathBuf) -> Result<(), E>,
@@ -104,6 +108,13 @@ mod tests {
         let rejected = toml::from_str::<NoopConfig>("environment = \"host:test\"\nextra = true");
 
         assert!(rejected.is_err());
+    }
+
+    #[test]
+    fn noop_cannot_grant_network() -> Result<(), Box<dyn std::error::Error>> {
+        let config: NoopConfig = toml::from_str("environment = 'host:test'")?;
+        assert!(!config.supports_capability(gang_types::Capability::Network));
+        Ok(())
     }
 
     #[test]

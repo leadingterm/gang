@@ -18,6 +18,7 @@ mod validated;
 
 mod absolute_path;
 mod action_environment;
+mod action_policy;
 mod authentication;
 mod bearer;
 mod bounded_bytes;
@@ -67,6 +68,11 @@ pub mod __private;
 
 pub use absolute_path::{AbsolutePathBuf, AbsolutePathError};
 pub use action_environment::ActionEnvironment;
+pub use action_policy::{
+    ActionPolicyError, Capability, EgressPolicyError, FORBIDDEN_IPV4, FORBIDDEN_IPV6,
+    FleetActionPolicy, NetworkRequest, PUBLIC_IPV6, PublicEgressPolicy, ResourceCeilings,
+    is_public_destination,
+};
 pub use authentication::AuthenticationSettings;
 pub use bearer::parse_bearer;
 pub use bounded_bytes::{BoundedBytes, BoundedBytesError};

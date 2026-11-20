@@ -43,9 +43,17 @@ probe(
     script = ISOLATION,
 )
 
+# The helper and fixture addresses are action inputs, staged only for the network scenario.
+probe(
+    name = "network_isolated",
+    srcs = ["egress-probe", "egress-targets.json"],
+    script = "./egress-probe egress-targets.json",
+)
+
 probe(
     name = "network_requested",
-    script = NAMESPACES,
+    srcs = ["egress-probe", "egress-targets.json"],
+    script = "./egress-probe egress-targets.json",
     exec_properties = dict(EXEC_PROPERTIES, ISA = ISA, network = "requested"),
 )
 

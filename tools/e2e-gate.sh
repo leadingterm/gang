@@ -50,7 +50,8 @@ systemd-run --user --unit="$unit" --collect --pipe --wait --same-dir --slice=gan
   --setenv=GANG_E2E_CANDIDATE_FIXTURE="$candidate_fixture" -- \
   nix develop -c env -u XDG_CONFIG_HOME -u XDG_CACHE_HOME HOME="$home" \
   "$bundle/local" --gang "$gang" --bazel "$bundle/bazel" --postgres "$bundle/postgresql.tar.gz" \
-  --config configs/gang.local.toml --sample e2e/sample --configs configs "$@" | tee "$report" || status=$?
+  --config configs/gang.local.toml --sample e2e/sample --configs configs \
+  --egress-probe "$bundle/egress_probe" --egress-peer "$bundle/egress_peer" "$@" | tee "$report" || status=$?
 if (( status != 0 )); then
   if (( SECONDS - start >= budget )); then
     echo "tools/e2e-gate.sh: the gate exceeded its $budget s budget" >&2

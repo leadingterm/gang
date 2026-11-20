@@ -24,7 +24,22 @@ target_actions_per_instance = ${f.target_actions_per_instance}
 idle_timeout = ${jsonencode(f.idle_timeout)}
 max_drain_wait = ${jsonencode(f.max_drain_wait)}
 boot_grace = ${jsonencode(f.boot_grace)}
-
+%{ if length(f.actions.grants) > 0 }
+[fleets.actions]
+grants = ${jsonencode(sort(tolist(f.actions.grants)))}
+%{ endif ~}
+%{ if f.actions.resources.cpu_count != null || f.actions.resources.memory != null || f.actions.resources.disk != null }
+[fleets.actions.resources]
+%{ if f.actions.resources.cpu_count != null ~}
+cpu_count = ${f.actions.resources.cpu_count}
+%{ endif ~}
+%{ if f.actions.resources.memory != null ~}
+memory = ${jsonencode(f.actions.resources.memory)}
+%{ endif ~}
+%{ if f.actions.resources.disk != null ~}
+disk = ${jsonencode(f.actions.resources.disk)}
+%{ endif ~}
+%{ endif }
 [fleets.options]
 capacity = ${jsonencode(f.capacity)}
 %{ if f.machine_class != null ~}
@@ -48,6 +63,13 @@ time_zone = ${jsonencode(w.time_zone)}
 
 [execution]
 input_links = ${jsonencode(gang_settings.input_links)}
+%{ if network_granted ~}
+
+[execution.egress]
+protected_networks = ${jsonencode(protected_networks)}
+dns_servers = ${jsonencode(execution_egress.dns_servers)}
+setup_timeout = ${jsonencode(execution_egress.setup_timeout)}
+%{ endif ~}
 
 [provisioner.aws]
 region = ${jsonencode(region)}
@@ -98,7 +120,9 @@ path = "/var/lib/gang/gang.db"
 
 [sandbox.bwrap]
 root = "/etc/gang/action-rootfs"
-permit_network_property = ${gang_settings.permit_network_property}
+%{ if network_granted ~}
+[sandbox.bwrap.egress]
+%{ endif ~}
 
 [limits.cgroup]
 

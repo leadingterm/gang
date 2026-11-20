@@ -27,6 +27,10 @@ resource "terraform_data" "input_checks" {
       ])) : secret != local.config_parameter_name && !startswith(secret, "${local.config_parameter_name}/generations/")])
       error_message = "Controller secret parameters must not overlap the legacy config parameter or its generations subtree."
     }
+    precondition {
+      condition     = !local.network_granted || var.execution_egress != null
+      error_message = "A network grant requires execution_egress."
+    }
   }
 }
 
@@ -76,12 +80,21 @@ module "storage" {
 }
 
 locals {
-  config_parameter_name             = coalesce(var.config_parameter_name, "/${var.name}/gang.toml")
-  group                             = var.database.engine != "sqlite"
-  controller_shape                  = local.group ? "group" : "instance"
-  public_port                       = module.network.public_port
-  worker_port                       = module.network.worker_port
-  shutdown_grace_seconds            = 300
+  config_parameter_name  = coalesce(var.config_parameter_name, "/${var.name}/gang.toml")
+  group                  = var.database.engine != "sqlite"
+  controller_shape       = local.group ? "group" : "instance"
+  public_port            = module.network.public_port
+  worker_port            = module.network.worker_port
+  shutdown_grace_seconds = 300
+  network_granted        = anytrue([for fleet in var.fleets : contains(fleet.actions.grants, "network")])
+  public_subnets         = module.network.public_subnets_by_az
+  protected_networks = local.network_granted && var.execution_egress != null ? concat(
+    var.execution_egress.protected_networks,
+    [module.network.vpc_cidr_block],
+    module.network.vpc_ipv6_cidr_blocks,
+    local.group ? [] : ["${module.network.controller_public_ip}/32"],
+    var.load_balancer == null ? [] : [for ip in module.load_balancer[0].public_static_ips : "${ip}/32"]
+  ) : []
   public_host                       = var.hostname != null ? var.hostname : module.network.controller_public_dns
   worker_host                       = local.group ? var.hostname : module.network.controller_private_dns
   endpoint                          = local.group && var.hostname == null ? null : (local.public_port == 443 ? "https://${local.public_host}" : "https://${local.public_host}:${local.public_port}")
@@ -119,6 +132,9 @@ locals {
     default_isa                       = var.default_isa
     gang_settings                     = var.gang_settings
     fleets                            = [for fleet in var.fleets : merge(fleet, { action_environment = local.node_action_environments[fleet.name] })]
+    network_granted                   = local.network_granted && var.execution_egress != null
+    execution_egress                  = var.execution_egress
+    protected_networks                = local.protected_networks
     region                            = var.region
     events_queue_url                  = var.aws_events_enabled ? aws_sqs_queue.events[0].url : null
     public_port                       = local.public_port
@@ -246,6 +262,8 @@ module "load_balancer" {
   shared_database                = local.group
   proxy_protocol_stage           = var.load_balancer.proxy_protocol_stage
   public_subnet_ids              = module.network.public_subnet_ids
+  public_subnets_by_az           = local.public_subnets
+  static_public_ips              = local.network_granted
   private_subnet_ids             = values(module.network.private_subnet_ids)
   worker_security_group_id       = module.network.worker_security_group_id
   workers_port                   = local.worker_port

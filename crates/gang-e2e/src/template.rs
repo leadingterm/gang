@@ -16,8 +16,9 @@ use gang_main::plugins::{
     Plugins, ProvisionerConfig, SandboxKey, SignerConfig, WorkerAuthenticationConfig,
 };
 use gang_types::{
-    AbsolutePathBuf, Bytes, CaPin, ClientSecret, DeviceCodeTtl, Isa, NonZeroBytes, NonZeroDuration,
-    Percent, Permission, PermissionSet, ProviderName, SessionMaxAge, TokenTtl, Url,
+    AbsolutePathBuf, Bytes, CaPin, Capability, ClientSecret, DeviceCodeTtl, Isa, NonZeroBytes,
+    NonZeroDuration, Percent, Permission, PermissionSet, ProviderName, SessionMaxAge, TokenTtl,
+    Url,
 };
 
 use crate::access::{IdentityKnobs, Sessions, SignIn, StandingWorker};
@@ -58,13 +59,13 @@ const LARGE_FACTOR: u32 = 2;
 /// Four unreserved cold actions fit one 6 GiB worker instead of scaling out.
 const COLD_START_MEMORY: &str = "1536MiB";
 
-/// Three unreserved cold lifecycle actions must fit one worker's [`FLEET_DISK`] too.
+/// Two unreserved cold lifecycle actions must fit one worker's [`FLEET_DISK`] too.
 const COLD_START_DISK: &str = "2GiB";
 
 /// The `disk_per_instance` of every Local Mode fleet the harness starts. A worker refuses a fleet
 /// disk that its scratch volume's free space, less the fast content store's budget, cannot hold,
 /// so the gate must not inherit the checked-in 20GiB that may exceed the available disk space. It
-/// holds three of the harness's cold-start disks ([`COLD_START_DISK`]), so three cold lifecycle
+/// holds at least two of the harness's cold-start disks ([`COLD_START_DISK`]), so cold lifecycle
 /// actions share one worker as they share its memory, and it needs about 16GiB free under the
 /// default fast content store share of 50%.
 const FLEET_DISK: &str = "8GiB";
@@ -325,30 +326,75 @@ impl ConfigTemplate {
         Ok(self)
     }
 
-    /// Applies the scenario's sandbox, fleet, execution, control and server knobs.
-    ///
-    /// # Errors
-    /// Returns an error when the configuration cannot support the selected variant.
-    pub fn vary(
-        mut self,
+    fn project_egress(
+        document: &mut Document<Plugins>,
+        variant: &Variant,
+        tools: &ActionTools,
+    ) -> Result<()> {
+        let fleet = document
+            .fleets
+            .first_mut()
+            .ok_or_else(|| template_error("missing the first [[fleets]] entry"))?;
+        fleet.sandbox = match variant.sandbox {
+            Sandbox::Bwrap => SandboxKey::Bwrap,
+            Sandbox::Noop => SandboxKey::Noop,
+        };
+        fleet.actions.grants.remove(&Capability::Network);
+        document.execution.egress = None;
+        if let Some(bwrap) = document.sandbox.bwrap.as_mut() {
+            bwrap.egress = None;
+        }
+        if variant.permit_network == PermitNetwork::Permitted {
+            if variant.sandbox != Sandbox::Bwrap {
+                return Err(template_error("network grants require the bwrap sandbox"));
+            }
+            let egress = tools
+                .egress
+                .as_ref()
+                .ok_or_else(|| template_error("missing egress tools"))?;
+            for path in [
+                &egress.slirp4netns,
+                &egress.nft,
+                &egress.nsenter,
+                &egress.ip,
+                &egress.unshare,
+                &egress.probe,
+                &egress.peer,
+            ] {
+                if !path.is_absolute() {
+                    return Err(template_error(format!(
+                        "egress tool path is not absolute: {}",
+                        path.display()
+                    )));
+                }
+            }
+            document.execution.egress = Some(
+                egress
+                    .policy
+                    .clone()
+                    .ok_or_else(|| template_error("missing egress policy"))?,
+            );
+            fleet.actions.grants.insert(Capability::Network);
+            let bwrap = document
+                .sandbox
+                .bwrap
+                .as_mut()
+                .ok_or_else(|| template_error("missing [sandbox.bwrap]"))?;
+            bwrap.egress = Some(gang_bwrap::EgressPrograms {
+                slirp4netns: egress.slirp4netns.clone(),
+                nft: egress.nft.clone(),
+                nsenter: egress.nsenter.clone(),
+                ip: egress.ip.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn project_limits(
+        document: &mut Document<Plugins>,
         variant: &Variant,
         worker_launcher: &[String],
-        tools: &ActionTools,
-    ) -> Result<Self> {
-        let document = &mut self.document;
-        prepare_sandbox(document, variant.sandbox, tools)?;
-        if let Some(bwrap) = document.sandbox.bwrap.as_mut()
-            && variant.sandbox == Sandbox::Bwrap
-        {
-            bwrap.permit_network_property = variant.permit_network == PermitNetwork::Permitted;
-        }
-        if variant.fleets == FleetLayout::Placement {
-            if document.sandbox.noop.is_none() {
-                return Err(template_error("missing [sandbox.noop]"));
-            }
-            placement_fleets(&mut document.fleets)?;
-        }
-        document.execution.input_links = variant.input_links;
+    ) -> Result<()> {
         match variant.limits {
             ActionLimits::Absent => {
                 document.limits = None;
@@ -387,6 +433,30 @@ impl ConfigTemplate {
                 local.worker_launcher = launcher.try_into().map_err(template_error)?;
             }
         }
+        Ok(())
+    }
+
+    /// Applies the scenario's sandbox, fleet, execution, control and server knobs.
+    ///
+    /// # Errors
+    /// Returns an error when the configuration cannot support the selected variant.
+    pub fn vary(
+        mut self,
+        variant: &Variant,
+        worker_launcher: &[String],
+        tools: &ActionTools,
+    ) -> Result<Self> {
+        let document = &mut self.document;
+        Self::project_egress(document, variant, tools)?;
+        prepare_sandbox(document, variant.sandbox, tools)?;
+        if variant.fleets == FleetLayout::Placement {
+            if document.sandbox.noop.is_none() {
+                return Err(template_error("missing [sandbox.noop]"));
+            }
+            placement_fleets(&mut document.fleets)?;
+        }
+        document.execution.input_links = variant.input_links;
+        Self::project_limits(document, variant, worker_launcher)?;
         if variant.soft_memory == SoftMemory::Enforced {
             document.actions.memory.enforcement = gang_config::MemoryEnforcement::Soft;
         }
@@ -545,6 +615,7 @@ fn placement_fleet(
         max_drain_wait: base.max_drain_wait,
         boot_grace: base.boot_grace,
         sandbox: base.sandbox,
+        actions: base.actions.clone(),
         options: base.options.clone(),
         scheduled_minimum: Vec::new(),
     })
@@ -571,6 +642,7 @@ fn placement_fleets(fleets: &mut Vec<RawFleet<SandboxKey>>) -> Result<()> {
     let mut noop = placement_fleet(base, NOOP_FLEET, SMALL_MAX_INSTANCES)?;
     noop.sandbox = SandboxKey::Noop;
     noop.action_environment = "host:e2e".parse().map_err(template_error)?;
+    noop.actions.grants.remove(&Capability::Network);
     *fleets = vec![small, large, noop];
     Ok(())
 }

@@ -26,6 +26,31 @@ pub enum ConfigError {
     /// A configuration could not be rendered as TOML.
     #[error("cannot render configuration")]
     Render(#[from] toml::ser::Error),
+    /// A fleet's action ceilings are invalid.
+    #[error("invalid action policy for fleet `{fleet}`")]
+    FleetActionPolicy {
+        /// Fleet with the invalid policy.
+        fleet: FleetName,
+        /// The invalid ceiling.
+        #[source]
+        source: gang_types::ActionPolicyError,
+    },
+    /// A selected sandbox cannot provide a granted capability.
+    #[error("fleet `{fleet}` sandbox `{key}` does not support capability `{capability}`")]
+    UnsupportedCapability {
+        /// Fleet granting the capability.
+        fleet: FleetName,
+        /// Selected sandbox.
+        key: String,
+        /// Unsupported capability.
+        capability: gang_types::Capability,
+    },
+    /// Network access requires a public egress policy.
+    #[error("network capability requires execution.egress")]
+    MissingEgress,
+    /// A public egress policy is invalid.
+    #[error("invalid execution.egress policy")]
+    InvalidEgress(#[source] gang_types::EgressPolicyError),
     /// A configured action resource setting does not fit a fleet.
     #[error("{key} {value} bytes must be {relation} fleet `{fleet}` capacity {capacity} bytes")]
     #[fix("adjust the action setting or the named fleet's capacity")]

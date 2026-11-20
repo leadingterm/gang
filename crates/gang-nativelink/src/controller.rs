@@ -817,6 +817,7 @@ mod tests {
                 memory: Bytes::new(8 << 30),
                 disk: Bytes::new(100 << 30),
             },
+            &gang_types::FleetActionPolicy::default(),
             Vec::<(&'static str, String)>::new(),
         )
     }
@@ -1829,6 +1830,7 @@ mod tests {
                             memory: Bytes::new(memory_gib << 30),
                             disk: Bytes::new(100_u64 << 30),
                         },
+                        &gang_types::FleetActionPolicy::default(),
                         Vec::<(&'static str, String)>::new(),
                     )
                 })

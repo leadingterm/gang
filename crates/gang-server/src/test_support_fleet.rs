@@ -7,7 +7,7 @@ use gang_clock::Timestamp;
 use gang_config::{FleetMember, FleetPolicy, Fleets, InstanceBounds};
 use gang_spi::QueuedDemand;
 use gang_testkit::{Opaque, SandboxKey, TestPlugins};
-use gang_types::{ActionResources, FleetName, FleetSet, Isa, NonZeroBytes};
+use gang_types::{ActionResources, FleetActionPolicy, FleetName, FleetSet, Isa, NonZeroBytes};
 
 /// The fleets of the test composition in preference order: one x86-64 fleet, `example-fleet`,
 /// of up to four 4-vCPU, 8 `GiB` workers.
@@ -45,6 +45,7 @@ fn fleet_member(name: &str, max_instances: u32) -> FleetMember<TestPlugins> {
         idle_timeout: Duration::from_secs(15),
         max_drain_wait: Duration::from_mins(1),
         boot_grace: Duration::from_secs(30),
+        actions: FleetActionPolicy::default(),
     };
     FleetMember {
         policy,

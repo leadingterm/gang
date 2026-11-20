@@ -3,7 +3,7 @@
 use std::io;
 use std::path::PathBuf;
 
-use futures::{FutureExt, Stream, StreamExt};
+use futures::{Stream, StreamExt};
 use gang_config::InputLinks;
 use gang_spi::{
     ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, ActionLimits,
@@ -29,6 +29,22 @@ pub struct Execution {
     /// Usage measured before leaving the scope.
     pub usage: Option<ActionUsage>,
 }
+/// An execution error and any usage measured when leaving its limits scope.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub struct ExecFailure {
+    /// The original execution failure.
+    #[source]
+    pub error: ExecError,
+    /// Usage measured before leaving the scope, if available.
+    pub usage: Option<ActionUsage>,
+}
+
+impl From<ExecError> for ExecFailure {
+    fn from(error: ExecError) -> Self {
+        Self { error, usage: None }
+    }
+}
 
 /// Runs `action` in `sandbox`.
 ///
@@ -40,7 +56,7 @@ pub struct Execution {
 /// own group, which the sandbox relays to, leaves `gang exec` where it is); wait for the action,
 /// while each termination is relayed to the action (`SandboxedAction::relay`); leave the scope.
 /// After entering a scope, `publish_cgroup` receives its memory cgroup before the sandbox starts.
-/// A termination pending before the action starts prevents it from being started.
+/// A termination received before startup completes cancels startup and prevents the action from running.
 ///
 /// `gang exec` never enters the scope, so an out-of-memory kill of the scope never reaches it.
 /// The scope is left whenever it was entered, even when the sandbox failed. A sandbox or limits
@@ -62,30 +78,15 @@ pub async fn execute<S: ActionIsolationPort, L: ActionLimitsPort>(
     terminations: &mut (impl Stream<Item = io::Result<Termination>> + Unpin),
     publish_cgroup: impl FnOnce(Option<PathBuf>),
     leave_action_group: impl FnOnce() -> io::Result<()>,
-) -> Result<Execution, ExecError> {
+) -> Result<Execution, ExecFailure> {
     if matches!(input_links, InputLinks::Break) {
-        break_hard_links(action.spec.action_directory)?;
+        break_hard_links(action.spec.action_directory).map_err(ExecError::from)?;
     }
     let Some(port) = limits else {
-        if let Some(termination) = terminations
-            .next()
-            .now_or_never()
-            .flatten()
-            .transpose()
-            .map_err(ExecError::Signals)?
-        {
-            return Ok(Execution {
-                outcome: ActionExecutionOutcome::Signaled(termination.signal()),
-                usage: None,
-            });
-        }
-        let mut running = sandbox
-            .start(&action.spec)
-            .await
-            .map_err(ExecError::Sandbox)?;
-        leave_if_shared(&running, leave_action_group)?;
+        let outcome =
+            start_and_wait(sandbox, &action.spec, terminations, leave_action_group).await?;
         return Ok(Execution {
-            outcome: wait_relaying(&mut running, terminations).await?,
+            outcome,
             usage: None,
         });
     };
@@ -98,21 +99,7 @@ pub async fn execute<S: ActionIsolationPort, L: ActionLimitsPort>(
         launcher: scope.launcher(),
         ..action.spec
     };
-    let outcome = async {
-        if let Some(termination) = terminations
-            .next()
-            .now_or_never()
-            .flatten()
-            .transpose()
-            .map_err(ExecError::Signals)?
-        {
-            return Ok(ActionExecutionOutcome::Signaled(termination.signal()));
-        }
-        let mut running = sandbox.start(&spec).await.map_err(ExecError::Sandbox)?;
-        leave_if_shared(&running, leave_action_group)?;
-        wait_relaying(&mut running, terminations).await
-    }
-    .await;
+    let outcome = start_and_wait(sandbox, &spec, terminations, leave_action_group).await;
     let usage = port.leave(scope).await;
     match (outcome, usage) {
         (Ok(outcome), Ok(usage)) => {
@@ -122,16 +109,39 @@ pub async fn execute<S: ActionIsolationPort, L: ActionLimitsPort>(
                 usage: Some(usage),
             })
         }
-        (Ok(_), Err(error)) => Err(ExecError::Limits(error)),
+        (Ok(_), Err(error)) => Err(ExecError::Limits(error).into()),
         (Err(error), Ok(usage)) => {
             log_usage(&usage);
-            Err(error)
+            Err(ExecFailure {
+                error,
+                usage: Some(usage),
+            })
         }
         (Err(error), Err(leave)) => {
             tracing::warn!(error = %gang_types::error_chain(&leave), "cannot leave the action's limits scope");
-            Err(error)
+            Err(error.into())
         }
     }
+}
+
+/// Cancels a pending startup on termination, before handing a started action to the relay loop.
+async fn start_and_wait<S: ActionIsolationPort>(
+    sandbox: &S,
+    spec: &ActionExecutionSpec<'_>,
+    terminations: &mut (impl Stream<Item = io::Result<Termination>> + Unpin),
+    leave_action_group: impl FnOnce() -> io::Result<()>,
+) -> Result<ActionExecutionOutcome, ExecError> {
+    let mut running = tokio::select! {
+        biased;
+        Some(request) = terminations.next() => {
+            return Ok(ActionExecutionOutcome::Signaled(
+                request.map_err(ExecError::Signals)?.signal(),
+            ));
+        }
+        started = sandbox.start(spec) => started.map_err(ExecError::Sandbox)?,
+    };
+    leave_if_shared(&running, leave_action_group)?;
+    wait_relaying(&mut running, terminations).await
 }
 
 /// Waits for `running` to end, passing each termination that `terminations` receives on to the
