@@ -93,6 +93,7 @@ fn configuration(input: impl Read, mut output: impl Write) -> Result<ExitCode> {
     let plan: Plan = stdin_document(input)?;
     output
         .write_all(plan.configuration()?.as_bytes())
+        .and_then(|()| output.flush())
         .map_err(MainError::Stdout)?;
     Ok(ExitCode::SUCCESS)
 }
@@ -232,8 +233,27 @@ mod tests {
     use super::*;
     use crate::cli::Command;
 
+    /// A writer that, like a line-buffered standard output, keeps the last partial line until flushed.
+    #[derive(Default)]
+    struct Buffered {
+        pending: Vec<u8>,
+        flushed: Vec<u8>,
+    }
+
+    impl Write for Buffered {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.pending.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushed.append(&mut self.pending);
+            Ok(())
+        }
+    }
+
     #[test]
-    fn configuration_writes_exact_planned_bytes() {
+    fn configuration_writes_and_flushes_exact_planned_bytes() {
         for value in ["no newline", "one\n", "two\n\n"] {
             let plan = json!({"resource_changes": [{
                 "address": "module.gang.aws_ssm_parameter.config_generation",
@@ -241,12 +261,12 @@ mod tests {
                 "change": {"actions": ["no-op"], "after": {"value": value}}
             }]})
             .to_string();
-            let mut output = Vec::new();
+            let mut output = Buffered::default();
             assert_eq!(
                 configuration(plan.as_bytes(), &mut output).expect("write configuration"),
                 ExitCode::SUCCESS
             );
-            assert_eq!(output, value.as_bytes());
+            assert_eq!(output.flushed, value.as_bytes());
         }
     }
 

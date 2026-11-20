@@ -184,6 +184,12 @@ const DEPLOY_POLICY_EXAMPLES: &str = examples! {
         "gang deploy policy < infra-plan.json >> \"$GITHUB_OUTPUT\"",
     ];
 };
+/// The `after_help` of `gang deploy configuration`.
+const DEPLOY_CONFIGURATION_EXAMPLES: &str = examples! {
+    "a plan job: the exact planned gang.toml, to check before anything rolls out" => [
+        "gang deploy configuration < infra-plan.json > planned-gang.toml",
+    ];
+};
 /// The `after_help` of `gang deploy restart-needed`.
 const DEPLOY_RESTART_NEEDED_EXAMPLES: &str = examples! {
     "an apply job: does the controller reload its configuration?" => [
@@ -865,6 +871,7 @@ pub enum DeployCommand {
     #[command(after_help = DEPLOY_RESTART_NEEDED_EXAMPLES)]
     RestartNeeded,
     /// Print the exact planned immutable configuration bytes from plan JSON on standard input.
+    #[command(after_help = DEPLOY_CONFIGURATION_EXAMPLES)]
     Configuration,
     /// Print the store request of a saved plan, read from its `tofu show -json` on standard input.
     #[command(after_help = DEPLOY_STORE_REQUEST_EXAMPLES)]
