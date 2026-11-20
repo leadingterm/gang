@@ -88,8 +88,8 @@ pub struct SampleParameters {
 /// `destination` is created and must not exist. Directories and regular files are copied
 /// with their permissions. Any other entry (a symbolic link, a socket, a device) is an error,
 /// because it could make the staged copy differ from the source in ways the run cannot see.
-/// After the copy, `BUILD.bazel` is checked for every probe target, and `config.bzl` in
-/// `destination` is overwritten with the parameters.
+/// After the copy, `BUILD.bazel` is checked for a literal name attribute for every probe,
+/// and `config.bzl` in `destination` is overwritten with the parameters.
 /// The glibc tool, when set, is copied in as `glibc-tool` with its permissions.
 /// The optional egress probe and its targets are staged as `egress-probe` and
 /// `egress-targets.json`, respectively.

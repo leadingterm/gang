@@ -442,6 +442,20 @@ fn config_bzl_overwrites_a_config_bzl_from_the_source() {
 }
 
 #[test]
+fn checked_in_sample_declares_all_probe_targets() {
+    let work = tempfile::tempdir().expect("work directory is created");
+    let source = work.path().join("source");
+    fs::create_dir(&source).expect("source is created");
+    fs::write(
+        source.join("BUILD.bazel"),
+        include_str!("../../../e2e/sample/BUILD.bazel"),
+    )
+    .expect("build file is written");
+
+    stage(&source, &work.path().join("staged"), &parameters()).expect("checked-in sample stages");
+}
+
+#[test]
 fn stage_accepts_all_probe_targets_with_varying_spaces() {
     let work = tempfile::tempdir().expect("work directory is created");
     let source = work.path().join("source");

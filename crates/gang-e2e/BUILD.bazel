@@ -103,6 +103,14 @@ workspace_rust_library(
         "//crates/gang-server:gang_server",
         "//crates/gang-sqlite:gang_sqlite",
     ],
+    test_data = glob(
+        [
+            "Cargo.toml",
+            "src/**/*.rs",
+            "tests/fixtures/**",
+        ],
+        allow_empty = True,
+    ) + ["//:e2e/sample/BUILD.bazel"],
     test_env = {
         "GANG_E2E_BASE_CONFIG": "$(rootpath //configs:gang.local.toml)",
         "GANG_E2E_TEST_BASH": "$(rootpath :test_bash)",

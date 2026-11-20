@@ -118,15 +118,14 @@ echo held=released
             exec_properties = properties,
         )
 
-def rate_held(name, count, properties):
-    for step in range(count):
-        probe(
-            name = name + "_" + _rate_step(step),
-            script = """
+def rate_held(name, properties):
+    probe(
+        name = name,
+        script = """
 D=$(dirname "$E2E_SIGNAL")
 while [ ! -s "$D/go" ] && [ ! -s "$D/release-$E2E_ACTION" ]; do sleep 1; done
 echo held=released
 """,
-            controlled = True,
-            exec_properties = properties,
-        )
+        controlled = True,
+        exec_properties = properties,
+    )
