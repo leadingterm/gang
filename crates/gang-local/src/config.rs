@@ -139,6 +139,8 @@ fn default_terminate_grace() -> NonZeroDuration {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use serde_json::json;
 
@@ -223,8 +225,21 @@ mod tests {
     }
 
     #[test]
-    fn workload_token_rejects_a_ttl_below_a_minute() {
-        assert!(with("workload_token", json!({"ttl": "30s"})).is_err());
+    fn workload_token_ttl_bounds() -> Result<(), Box<dyn std::error::Error>> {
+        for ttl in ["19s", "20001ms", "3601s"] {
+            assert!(
+                with("workload_token", json!({"ttl": ttl})).is_err(),
+                "ttl {ttl} must be rejected"
+            );
+        }
+        for (ttl, seconds) in [("20s", 20), ("30s", 30), ("59s", 59), ("1h", 3600)] {
+            let config = with("workload_token", json!({"ttl": ttl}))?;
+            assert_eq!(
+                config.workload_token.ttl.get(),
+                Duration::from_secs(seconds)
+            );
+        }
+        Ok(())
     }
 
     #[test]

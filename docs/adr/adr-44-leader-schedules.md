@@ -1,6 +1,6 @@
 # ADR-44: One leader schedules and autoscales
 
-Status: Accepted. Builds on ADR-43 and amends ADR-11.
+Status: Accepted. Builds on ADR-43 and amends ADR-11. Partly superseded by ADR-59: voluntary handoff returns the leader process to standby rather than exiting.
 
 ## Context
 - The scheduler and worker registry are process-local. Multiple control loops would compete to change fleet capacity.

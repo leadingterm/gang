@@ -16,7 +16,7 @@ aspect.gazelle_rule_kind(SOURCE_SET, {
 aspect.gazelle_rule_kind(LIBRARY, {
     "From": "//bazel/rust:defs.bzl",
     "NonEmptyAttrs": ["srcs"],
-    "ResolveAttrs": ["deps", "dev_deps", "proc_macro_deps"],
+    "ResolveAttrs": ["deps", "dev_deps", "proc_macro_deps", "test_support_deps"],
 })
 
 aspect.gazelle_rule_kind(BINARY, {
@@ -49,11 +49,15 @@ def prepare(_):
             ),
             "dependencies": aspect.TomlQuery(
                 filter = "Cargo.toml",
-                query = ".dependencies // {} | keys | .[]",
+                query = ".dependencies // {}",
             ),
             "dev_dependencies": aspect.TomlQuery(
                 filter = "Cargo.toml",
-                query = ".\"dev-dependencies\" // {} | keys | .[]",
+                query = ".\"dev-dependencies\" // {}",
+            ),
+            "features": aspect.TomlQuery(
+                filter = "Cargo.toml",
+                query = ".features // {}",
             ),
             "bins": aspect.TomlQuery(
                 filter = "Cargo.toml",
@@ -66,10 +70,10 @@ def prepare(_):
         },
     )
 
-def imports(names, provider):
+def imports(names, provider, suffix = ""):
     return [
         aspect.Import(
-            id = name,
+            id = name + suffix,
             provider = provider,
             optional = True,
             src = "Cargo.toml",
@@ -102,8 +106,22 @@ def declare(ctx):
             )
         return
 
-    dependency_names = query_results["dependencies"]
-    dev_dependency_names = query_results["dev_dependencies"]
+    dependencies = result(query_results, "dependencies", {})
+    dev_dependencies = result(query_results, "dev_dependencies", {})
+    features = result(query_results, "features", {})
+    dependency_names = [
+        name
+        for name in sorted(dependencies.keys())
+        if type(dependencies[name]) != "dict" or not dependencies[name].get("optional", False)
+    ]
+    dev_dependency_names = []
+    test_support_dev_dependencies = []
+    for name in sorted(dev_dependencies.keys()):
+        value = dev_dependencies[name]
+        if type(value) == "dict" and "test-support" in value.get("features", []):
+            test_support_dev_dependencies.append(name)
+        else:
+            dev_dependency_names.append(name)
     configured_lib_name = result(query_results, "lib_name")
     lib_name = configured_lib_name or package_name.replace("-", "_")
     has_library = ctx.has_file("src/lib.rs") or configured_lib_name != None
@@ -117,9 +135,26 @@ def declare(ctx):
         if is_proc_macro:
             symbols = [aspect.Symbol(id = package_name, provider = PROC_MACRO_PROVIDER)]
         else:
-            attrs["dev_deps"] = imports(dev_dependency_names, LIBRARY_PROVIDER)
+            attrs["dev_deps"] = imports(dev_dependency_names, LIBRARY_PROVIDER) + imports(
+                test_support_dev_dependencies,
+                LIBRARY_PROVIDER,
+                suffix = "#test-support",
+            )
             attrs["proc_macro_deps"] = imports(dependency_names, PROC_MACRO_PROVIDER)
             symbols = [aspect.Symbol(id = package_name, provider = LIBRARY_PROVIDER)]
+            if "test-support" in features:
+                attrs["test_support"] = True
+                attrs["test_support_deps"] = imports([
+                    feature[4:]
+                    for feature in features["test-support"]
+                    if feature.startswith("dep:")
+                ], LIBRARY_PROVIDER)
+                # A separate symbol selects the feature-enabled library without changing the default provider.
+                ctx.add_symbol(
+                    id = package_name + "#test-support",
+                    provider_type = LIBRARY_PROVIDER,
+                    label = aspect.Label(pkg = ctx.rel, name = lib_name + "_test_support"),
+                )
         ctx.targets.add(
             name = lib_name,
             kind = kind,

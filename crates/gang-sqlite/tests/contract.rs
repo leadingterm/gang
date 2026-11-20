@@ -8,18 +8,22 @@ use gang_sqlite::{Sqlite, SqliteConfig};
 use tempfile::TempDir;
 
 gang_testkit::database_contract!(
-    || async {
-        let dir = TempDir::new()?;
-        let context = PluginContext {
-            config_path: Path::new("gang.toml"),
-        };
-        let db = Sqlite::build(SqliteConfig::new(dir.path().join("gang.db")), &context)?;
-        Ok::<_, Box<dyn std::error::Error>>(gang_testkit::Fixture::keeping(db, dir))
-    },
-    exclusive,
-    schema: gang_sqlite::SCHEMA_VERSION,
-    stamped
+    fresh, exclusive, schema: gang_sqlite::SCHEMA_VERSION, stamped
 );
+
+fn fresh() -> std::future::Ready<Result<gang_testkit::Fixture<Sqlite>, Box<dyn std::error::Error>>>
+{
+    std::future::ready(fresh_database())
+}
+
+fn fresh_database() -> Result<gang_testkit::Fixture<Sqlite>, Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    let context = PluginContext {
+        config_path: Path::new("gang.toml"),
+    };
+    let db = Sqlite::build(SqliteConfig::new(dir.path().join("gang.db")), &context)?;
+    Ok(gang_testkit::Fixture::keeping(db, dir))
+}
 
 async fn stamped(
     stored: gang_spi::SchemaVersion,

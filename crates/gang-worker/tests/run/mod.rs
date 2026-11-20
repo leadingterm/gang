@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use gang_clock::Timestamp;
 use gang_config::{FleetMember, Fleets, SANDBOX_FILE_NAME, SandboxFile};
-use gang_spi::{InstanceIdentity, PreemptionNotice, StoreAccess};
+use gang_spi::{ActionMemoryPool, InstanceIdentity, PreemptionNotice, StoreAccess};
 use gang_testkit::{SandboxKey, TestPlugins};
 use gang_types::{
     Bytes, FleetName, InstanceId, Isa, NonZeroBytes, NonZeroDuration, Percent, WorkerLifetime,
@@ -122,6 +122,90 @@ async fn limits_are_prepared_once_before_the_first_worker_starts() {
     .await;
     result.expect("the scheduler finished");
     assert_eq!(harness.limits.observed_at_prepare(), [0]);
+    assert_eq!(
+        harness.limits.prepared_reserve(),
+        Some(NonZeroBytes::gib(2).get())
+    );
+    assert_eq!(only_spec(&harness).memory_pool, None);
+}
+
+#[tokio::test]
+async fn memory_pool_and_actions_reach_the_scheduler() {
+    let harness = Harness::new(Isa::X86_64, WorkerLifetime::LongLived);
+    harness.scheduler.set_behaviour(Behaviour::Finish);
+    let settings = harness.settings();
+    let actions = settings.actions.clone();
+    let pool = ActionMemoryPool {
+        cgroup: PathBuf::from("/test/action-pool"),
+        capacity: NonZeroBytes::gib(8),
+    };
+    let limits = harness.limits.clone().with_memory_pool(pool.clone());
+    gang_worker::run(
+        harness.parts(false),
+        settings,
+        move |_| Ok(limits),
+        future::pending(),
+    )
+    .await
+    .expect("a pool equal to the declared memory is accepted");
+    assert_eq!(
+        harness.limits.prepared_reserve(),
+        Some(NonZeroBytes::gib(2).get())
+    );
+    let spec = only_spec(&harness);
+    assert_eq!(spec.memory_pool, Some(pool));
+    assert!(std::sync::Arc::ptr_eq(&spec.actions, &actions));
+}
+
+#[tokio::test]
+async fn insufficient_memory_pool_fails_before_enrollment() {
+    let harness = Harness::new(Isa::X86_64, WorkerLifetime::LongLived);
+    let limits = harness.limits.clone().with_memory_pool(ActionMemoryPool {
+        cgroup: PathBuf::from("/test/action-pool"),
+        capacity: NonZeroBytes::gib(7),
+    });
+    let error = gang_worker::run(
+        harness.parts(true),
+        harness.settings(),
+        move |_| Ok(limits),
+        future::pending(),
+    )
+    .await
+    .expect_err("a smaller action pool is rejected");
+    match error {
+        WorkerError::FleetMemoryUnavailable {
+            fleet,
+            declared,
+            capacity,
+            reserve,
+        } => {
+            assert_eq!(fleet.as_str(), "example-fleet");
+            assert_eq!(declared, NonZeroBytes::gib(8).get());
+            assert_eq!(capacity, NonZeroBytes::gib(7).get());
+            assert_eq!(reserve, NonZeroBytes::gib(2).get());
+        }
+        other => panic!("unexpected worker error: {other:?}"),
+    }
+    assert_eq!(harness.enroller.calls(), 0);
+    assert!(harness.scheduler.specs().is_empty());
+}
+
+#[tokio::test]
+async fn no_limits_plugin_passes_no_pool() {
+    let harness = Harness::new(Isa::X86_64, WorkerLifetime::LongLived);
+    harness.scheduler.set_behaviour(Behaviour::Finish);
+    let mut settings = harness.settings();
+    settings.limits = None;
+    gang_worker::run(
+        harness.parts(false),
+        settings,
+        harness.build_limits(),
+        future::pending(),
+    )
+    .await
+    .expect("a worker without limits starts");
+    assert_eq!(harness.limits.prepared_reserve(), None);
+    assert_eq!(only_spec(&harness).memory_pool, None);
 }
 
 #[tokio::test]

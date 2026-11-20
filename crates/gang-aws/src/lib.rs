@@ -36,6 +36,7 @@ mod cloudwatch;
 mod config;
 mod credential;
 mod errors;
+mod events;
 mod fallback;
 mod fleet;
 mod group;
@@ -68,7 +69,7 @@ pub use cache::S3Cache;
 pub use config::{
     AwsConfig, AwsFleetOptions, Capacity, CooldownPolicy, ExpiryAge, KmsSignerConfig,
     RetrySpotAfter, S3CacheConfig, S3Tuning, SpotFallback, UsageInterval, UsageIntervalError,
-    WorkloadTokenAlgorithm,
+    WorkloadTokenAlgorithm, WorkloadTokenConfig, WorkloadTokenTtl,
 };
 pub use errors::{AwsError, ScratchError};
 pub use names::{AwsNameError, BucketName, FleetTagKey, KeyId, KeyPrefix, MountPoint};

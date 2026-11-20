@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gang_clock::{Clock, TestClock};
-use gang_spi::{AuthenticationHost, AuthorityRequest, PortError, Rejection, Subject};
+use gang_spi::{
+    AuthenticationHost, AuthorityRequest, PortError, Rejection, StateRepositoryPort, Subject,
+};
 use gang_testkit::{FakeRepository, TestSigner};
 use gang_types::{Identity, NonZeroDuration, Principal, Proof, ProviderName, Url};
 
@@ -38,6 +40,7 @@ fn host(
 ) -> Host<TlsDeployment> {
     let (providers, _verifier) = providers();
     Host {
+        proxy_protocol: Arc::new(gang_config::ProxyProtocolConfig::default()),
         repository: repository.clone(),
         signer: Arc::new(TestSigner::authority().expect("the test signer builds")),
         security,
@@ -112,6 +115,37 @@ async fn a_revoked_principal_is_refused_and_not_recorded() {
         })
     ));
     assert!(repository.principals().is_empty());
+}
+
+#[tokio::test]
+async fn a_durably_revoked_principal_is_refused_before_refresh() {
+    let clock = start_clock();
+    let repository = FakeRepository::default();
+    let host = plaintext_host(&clock, &repository, RevokedPrincipals::new());
+    repository
+        .revoke_principal(&alice(), clock.wall())
+        .await
+        .expect("durable revocation succeeds");
+
+    let result = host.verify(&provider(), &Proof::new("alice-proof")).await;
+    assert!(matches!(
+        result,
+        Err(PortError::Rejected {
+            reason: Rejection::PrincipalRevoked,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn principal_lookup_failure_refuses_proof_verification() {
+    let clock = start_clock();
+    let repository = FakeRepository::default();
+    let host = plaintext_host(&clock, &repository, RevokedPrincipals::new());
+    repository.fail_principals(true);
+
+    let result = host.verify(&provider(), &Proof::new("alice-proof")).await;
+    assert!(matches!(result, Err(PortError::Unavailable(_))));
 }
 
 #[tokio::test]

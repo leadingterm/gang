@@ -9,7 +9,8 @@ use aws_config::SdkConfig;
 use gang_clock::{Clock, TestClock, Timestamp};
 use gang_types::{Bytes, Fleet, FleetName, Isa, Resources};
 
-use crate::config::{AwsFleetOptions, Capacity, CooldownPolicy};
+use crate::config::{AwsConfig, AwsFleetOptions, Capacity, CooldownPolicy};
+use crate::events::{Events, Managed};
 use crate::fake_aws::{FakeActivity, FakeAws, FakeFailure, FakeGroup};
 use crate::fleet::Fleets;
 
@@ -30,6 +31,7 @@ pub(crate) struct Harness {
     sdk: SdkConfig,
     /// The cooldown policy the adapter was built with; kept so a restart keeps it.
     cooldown: CooldownPolicy,
+    config: AwsConfig,
 }
 
 impl Harness {
@@ -43,13 +45,18 @@ impl Harness {
         let fake = FakeAws::start().await?;
         let sdk = fake.sdk_config().await;
         let clock = Arc::new(TestClock::new(Timestamp::from_unix_millis(NOW_MILLIS)));
-        let fleets = Fleets::new(&sdk, clock.clone(), cooldown);
+        let config: AwsConfig = serde_json::from_value(serde_json::json!({
+            "region": "us-east-1", "scratch_mount_point": "/mnt/scratch"
+        }))?;
+        let events = Events::new(&sdk, &config, clock.clone(), Arc::new(Managed::default()));
+        let fleets = Fleets::new(&sdk, clock.clone(), cooldown, events);
         Ok(Self {
             fake,
             fleets,
             clock,
             sdk,
             cooldown,
+            config,
         })
     }
 
@@ -57,7 +64,13 @@ impl Harness {
     /// restart does: nothing it held in memory survives.
     pub(crate) fn restart(&mut self) {
         let clock: Arc<dyn Clock> = self.clock.clone();
-        self.fleets = Fleets::new(&self.sdk, clock, self.cooldown);
+        let events = Events::new(
+            &self.sdk,
+            &self.config,
+            Arc::clone(&clock),
+            Arc::new(Managed::default()),
+        );
+        self.fleets = Fleets::new(&self.sdk, clock, self.cooldown, events);
     }
 
     /// Adds an unprotected group with the given members and no warm pool; the fake applies no
@@ -160,6 +173,22 @@ impl Harness {
             .requests
             .iter()
             .filter(|request| request.operation == operation)
+            .count()
+    }
+
+    /// Count one-record scaling probes, excluding visibility history reads.
+    pub(crate) fn activity_probes(&self) -> usize {
+        self.fake
+            .state()
+            .requests
+            .iter()
+            .filter(|request| {
+                request.operation == "DescribeScalingActivities"
+                    && request
+                        .parameters
+                        .get("MaxRecords")
+                        .is_some_and(|value| value == "1")
+            })
             .count()
     }
 

@@ -1,13 +1,14 @@
 //! The settings the server is composed from, built by the binary field by field.
 
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gang_config::{DashboardConfig, EndpointTrust, LeadershipConfig, RoleConfig};
 use gang_spi::LoginClient;
 use gang_types::{
     DeviceCodeTtl, DevicePollInterval, Isa, NonZeroDuration, Percent, ProviderName, SessionMaxAge,
-    TrustDomain, Url,
+    TrustDomain,
 };
 
 use crate::endpoint::PublicEndpoint;
@@ -103,12 +104,18 @@ pub struct DeviceSettings {
 /// Everything the server needs to run, apart from the ports it is given.
 #[derive(Debug, Clone)]
 pub struct ServerSettings {
+    /// Shared action scheduling and resource policy.
+    pub actions: Arc<gang_config::ActionsConfig>,
+    /// Shared trusted PROXY protocol listener settings.
+    pub proxy_protocol: Arc<gang_config::ProxyProtocolConfig>,
     /// Lease timing for this controller.
     pub leadership: LeadershipConfig,
+    /// Time a newer standby must remain routable before requesting handover.
+    pub standby_routability_delay: Duration,
+    /// Bound on voluntary handover, derived from the process shutdown backstop.
+    pub handoff_timeout: Duration,
     /// How often to refresh revocations written by other controllers.
     pub revocation_refresh_interval: NonZeroDuration,
-    /// The dedicated execution endpoint, when execution has its own listener.
-    pub execution_endpoint: Option<Url>,
     /// How often the control loop runs a reconcile pass.
     pub poll_interval: NonZeroDuration,
     /// How long a client action may take before the scheduler gives up on it.

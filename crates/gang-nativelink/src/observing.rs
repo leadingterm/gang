@@ -540,7 +540,7 @@ mod tests {
     fn test_durations() -> Arc<Mutex<ActionDurations>> {
         Arc::new(Mutex::new(ActionDurations::new(
             std::num::NonZeroUsize::MIN.saturating_add(9),
-            std::num::NonZeroU32::MIN.saturating_add(6),
+            gang_config::HistoryWindow::from_units(7),
         )))
     }
 

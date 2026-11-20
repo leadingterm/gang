@@ -106,6 +106,7 @@ where
         let (providers, verifier) = providers();
         let core = Core::new(
             Host {
+                proxy_protocol: Arc::default(),
                 repository: FakeRepository::default(),
                 signer: Arc::new(TestSigner::authority().expect("the test signer builds")),
                 security: Security::Plaintext,
@@ -161,7 +162,9 @@ where
         request: Request<ApiRequestBody>,
     ) -> Result<Response<ApiResponseBody>, PortError> {
         let (mut parts, body) = request.into_parts();
-        self.gate.admit(&Peer::default(), &mut parts).await?;
+        self.gate
+            .admit(gang_spi::RequestScope::Shared, &Peer::default(), &mut parts)
+            .await?;
         let request = Request::from_parts(parts, body);
         let route = UiRoute::of(request.uri().path()).expect("a server ui path");
         Ok(self.routes.answer(route, request).await)

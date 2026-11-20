@@ -25,6 +25,7 @@ pub fn diff(prev: &State, cur: &State) -> Option<Delta> {
         events: newer(&prev.events, &cur.events)
             .unwrap_or(&cur.events)
             .to_vec(),
+        status_events: changed(&prev.status_events, &cur.status_events).cloned(),
         completed: changed(&prev.completed, &cur.completed).copied(),
         recent: cur.recent.increment(&prev.recent),
         builds: keyed(&prev.builds, &cur.builds),

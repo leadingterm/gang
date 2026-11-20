@@ -245,15 +245,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let gone = loop {
             #[cfg(target_os = "linux")]
-            let gone = match fs::read_to_string(format!("/proc/{raw_pid}/stat")) {
-                Ok(stat) => {
-                    stat.rsplit_once(')')
-                        .and_then(|(_, fields)| fields.split_whitespace().next())
-                        == Some("Z")
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => true,
-                Err(error) => return Err(error.into()),
-            };
+            let gone = process_is_gone(fs::read_to_string(format!("/proc/{raw_pid}/stat")))?;
             #[cfg(not(target_os = "linux"))]
             let gone = rustix::process::test_kill_process(pid).is_err();
             #[cfg(target_os = "linux")]
@@ -264,6 +256,46 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         };
         assert!(gone, "a grandchild survived the timeout");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_is_gone(stat: io::Result<String>) -> io::Result<bool> {
+        match stat {
+            Ok(stat) => Ok(stat
+                .rsplit_once(')')
+                .and_then(|(_, fields)| fields.split_whitespace().next())
+                == Some("Z")),
+            // Linux returns ESRCH if the process is reaped between opening and reading stat.
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) =>
+            {
+                Ok(true)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// A process can be reaped after its proc stat file is opened but before it is read.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reaped_process_is_gone_when_proc_stat_read_returns_esrch() -> io::Result<()> {
+        let mut child = PROMPTING_CHILD
+            .command()?
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()?;
+        let stat = fs::File::open(format!("/proc/{}/stat", child.id()))?;
+        child.kill()?;
+        child.wait()?;
+        let stat = io::read_to_string(stat);
+        assert_eq!(
+            stat.as_ref().err().and_then(io::Error::raw_os_error),
+            Some(rustix::io::Errno::SRCH.raw_os_error()),
+            "reading proc stat after reaping must exercise the ESRCH race"
+        );
+        assert!(process_is_gone(stat)?, "a reaped process is gone");
         Ok(())
     }
 

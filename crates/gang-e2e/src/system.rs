@@ -67,9 +67,6 @@ pub const HOLD_MEMORY_KB: u64 = 65_536;
 /// The `cpu_count` platform property of the limit probes.
 pub const HOLD_CPU_COUNT: u32 = 1;
 
-/// The `[limits.cgroup] memory_headroom_percent` the workers are configured with.
-pub const LIMIT_HEADROOM_PERCENT: u32 = 100;
-
 /// The `[limits.cgroup] max_pids` the workers are configured with.
 pub const LIMIT_MAX_PIDS: u32 = 4096;
 
@@ -81,18 +78,16 @@ pub const LIMIT_CPU_PERIOD_MICROS: u64 = 100_000;
 pub enum ActionLimits {
     /// The workers set no per-action limits.
     Absent,
-    /// The workers run every action in a cgroup with memory, CPU and pid limits.
+    /// The workers run every action in a cgroup with CPU and pid limits and group OOM handling.
     Cgroup,
 }
 
-/// Whether `NativeLink`'s soft memory enforcement runs beside the kernel's memory limit.
+/// Whether opt-in soft memory enforcement is enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SoftMemory {
-    /// `NativeLink` samples each action's memory and kills one that outgrows its reservation, so
-    /// the scheduler requeues it on a larger one: its default.
+    /// Kill an action over its soft ceiling and requeue it.
     Enforced,
-    /// `[scheduler.nativelink.memory] enforcement = "none"`: `NativeLink` never ends an action
-    /// for its memory, so only the kernel limit can.
+    /// Soft enforcement is disabled.
     Off,
 }
 
@@ -153,7 +148,7 @@ impl Variant {
             input_links: InputLinks::Break,
             limits: ActionLimits::Absent,
             fleets: FleetLayout::Single,
-            soft_memory: SoftMemory::Enforced,
+            soft_memory: SoftMemory::Off,
             soft_disk: false,
             identity: IdentityKnobs::NONE,
             control: ControlKnobs::NONE,
@@ -186,12 +181,14 @@ gang_types::string_enum! {
         InputRoot = "input_root",
         /// Runs in its own cgroup scope and waits until released, leaving an orphan process behind.
         Hold = "hold",
-        /// Allocates far beyond its hard memory ceiling.
+        /// Allocates above its reservation on a healthy worker.
         MemoryHog = "memory_hog",
-        /// Grows to a plateau above the soft limit of its reservation and below the kernel's ceiling,
-        /// and holds it until `NativeLink`'s sampler kills it; the scheduler requeues it with a
-        /// doubled reservation, on which it completes.
+        /// Holds a plateau above the explicitly enabled soft limit until killed and requeued.
         MemoryGrower = "memory_grower",
+        /// Holds the action selected as the memory-pressure victim.
+        PressureVictim = "pressure_victim",
+        /// Holds a larger resident allocation while a neighbour experiences pressure.
+        PressureNeighbour = "pressure_neighbour",
         /// Writes 64 MiB under its working directory, past its disk reservation, and waits to be
         /// killed by the worker.
         DiskHog = "disk_hog",
@@ -747,6 +744,26 @@ pub struct ScopeFacts {
     pub pids_max: String,
 }
 
+/// One action start recorded by a memory probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptRecord {
+    /// Stable probe action identifier.
+    pub action: String,
+    /// Scheduler-provided memory reservation, in KiB.
+    pub memory_kb: u64,
+}
+
+/// Evidence gathered while the worker action pool is under memory pressure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PressureObservation {
+    /// Exact victim cgroup peak, rounded up to KiB before the kill.
+    pub victim_peak_kb: u64,
+    /// Whether the victim's scope was killed.
+    pub victim_killed: bool,
+    /// Whether the neighbour survived at least three pressure-kill windows after restoration.
+    pub neighbour_alive: bool,
+}
+
 /// Observes and releases the per-action limits of a [`System`] whose workers enforce them.
 pub trait Limits: System {
     /// The scope of the hold probe's orphan process, or `None` until it runs in an action scope.
@@ -804,13 +821,26 @@ pub trait Limits: System {
     /// When the build cannot be stopped.
     fn cancel_hold(&self) -> Result<()>;
 
-    /// The number of attempts the memory grower made: one line per attempt in the counter file
-    /// the action appends to.
+    /// Reads the action identifier and reservation recorded for each attempt.
     ///
     /// # Errors
     ///
-    /// When the counter file exists but cannot be read.
-    fn attempts(&self) -> Result<usize>;
+    /// When the records cannot be read or contain an invalid reservation.
+    fn attempt_records(&self) -> Result<Vec<AttemptRecord>>;
+
+    /// Induces genuine pool PSI and observes the victim and its neighbour.
+    ///
+    /// # Errors
+    ///
+    /// When the scopes cannot be observed or their pool cannot be controlled.
+    fn induce_pressure(&self, victim_pid: u32, neighbour_pid: u32) -> Result<PressureObservation>;
+
+    /// Waits for a kernel OOM kill in the pool shared by the two probe processes.
+    ///
+    /// # Errors
+    ///
+    /// When the pool or its memory events cannot be observed.
+    fn await_pool_oom(&self, victim_pid: u32, neighbour_pid: u32) -> Result<u64>;
 }
 
 #[cfg(test)]

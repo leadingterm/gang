@@ -15,7 +15,7 @@ use gang_config::{
 use gang_types::{
     AbsolutePathBuf, AuthenticationSettings, Bytes, CaPin, ClientSecret, FleetCountError,
     FleetName, Isa, MAX_FLEETS, NonZeroBytes, NonZeroDuration, Percent, Permission, PermissionSet,
-    ProviderName, SchedulerSettings, TrustDomain, Url,
+    ProviderName, TrustDomain, Url,
 };
 use serde::{Deserialize, Serialize};
 
@@ -95,20 +95,6 @@ struct RlimitSection {
 enum LimitsConfig {
     Cgroup(CgroupSection),
     Rlimit(RlimitSection),
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NativeLinkSection {
-    scheduler_name: String,
-    #[serde(default)]
-    shutdown_grace: Option<NonZeroDuration>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum SchedulerConfig {
-    Nativelink(NativeLinkSection),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -247,7 +233,6 @@ impl PluginSet for Plugins {
     type Provisioner = ProvisionerConfig;
     type Cache = CacheConfig;
     type Signer = SignerConfig;
-    type Scheduler = SchedulerConfig;
     type Database = DatabaseConfig;
     type SandboxKey = SandboxKey;
     type Sandbox = SandboxConfig;
@@ -292,16 +277,6 @@ impl PluginSet for Plugins {
         match options {
             FleetOptions::Aws(aws) => vec![("capacity", aws.capacity.clone())],
             FleetOptions::Local(_) => Vec::new(),
-        }
-    }
-}
-
-impl SchedulerSettings for SchedulerConfig {
-    fn shutdown_grace(&self) -> Option<(&'static str, Duration)> {
-        match self {
-            Self::Nativelink(section) => section
-                .shutdown_grace
-                .map(|grace| ("scheduler.nativelink.shutdown_grace", grace.get())),
         }
     }
 }
@@ -361,7 +336,7 @@ disk_per_instance = "100GiB"
 target_actions_per_instance = 4
 idle_timeout = "15s"
 max_drain_wait = "1m"
-boot_grace = "30s"
+boot_grace = "1m"
 "#;
 
 const SCHEDULED_MINIMUM: &str = r#"
@@ -403,7 +378,7 @@ disk_per_instance = "100GiB"
 target_actions_per_instance = 1
 idle_timeout = "15s"
 max_drain_wait = "1m"
-boot_grace = "30s"
+boot_grace = "1m"
 
 [fleets.options]
 capacity = "on-demand"
@@ -427,11 +402,6 @@ path = "/tmp/gang-local/cache"
 const SIGNER: &str = r#"
 [signer.file]
 key_path = "/tmp/gang-local/ca.pem"
-"#;
-
-const SCHEDULER: &str = r#"
-[scheduler.nativelink]
-scheduler_name = "MAIN_SCHEDULER"
 "#;
 
 const DATABASE: &str = r#"
@@ -538,13 +508,13 @@ struct Sections {
     provisioner: &'static str,
     cache: &'static str,
     signer: &'static str,
-    scheduler: &'static str,
     database: &'static str,
     sandbox: &'static str,
     identity: &'static str,
     authentication: &'static str,
     execution: &'static str,
     limits: &'static str,
+    actions: &'static str,
     server: &'static str,
     worker: &'static str,
     dashboard: &'static str,
@@ -558,13 +528,13 @@ impl Sections {
         provisioner: PROVISIONER,
         cache: CACHE,
         signer: SIGNER,
-        scheduler: SCHEDULER,
         database: DATABASE,
         sandbox: SANDBOX,
         identity: IDENTITY,
         authentication: AUTHENTICATION,
         execution: "",
         limits: "",
+        actions: "",
         server: SERVER,
         worker: "",
         dashboard: "",
@@ -578,13 +548,13 @@ impl Sections {
             self.provisioner,
             self.cache,
             self.signer,
-            self.scheduler,
             self.database,
             self.sandbox,
             self.identity,
             self.authentication,
             self.execution,
             self.limits,
+            self.actions,
             self.server,
             self.worker,
             self.dashboard,
@@ -595,6 +565,102 @@ impl Sections {
 
     fn parse(&self) -> Result<GangConfig<Plugins>, ConfigError> {
         self.text().parse()
+    }
+}
+#[test]
+fn proxy_protocol_defaults_are_off_and_bounded() -> Result<(), Box<dyn Error>> {
+    let proxy = Sections::VALID.parse()?.server.proxy_protocol;
+    assert_eq!(proxy.public, gang_config::ProxyProtocol::Off);
+    assert_eq!(proxy.worker, gang_config::ProxyProtocol::Off);
+    assert_eq!(proxy.health, gang_config::ProxyProtocol::Off);
+    assert!(proxy.trusted_cidrs.is_empty());
+    assert_eq!(proxy.header_timeout.get(), Duration::from_secs(10));
+    assert_eq!(proxy.max_pending_headers.get(), 256);
+    assert_eq!(proxy.max_header_size, Bytes::kib(4));
+    Ok(())
+}
+
+#[test]
+fn proxy_protocol_document_round_trips_modes_and_networks() -> Result<(), Box<dyn Error>> {
+    let text = format!(
+        "health_listen = \"127.0.0.1:9446\"\n{}\n[server.proxy_protocol]\npublic = \"require\"\nworker = \"accept\"\nhealth = \"accept\"\ntrusted_cidrs = [\"192.0.2.1/32\", \"2001:db8::/64\"]\nheader_timeout = \"3s\"\nmax_pending_headers = 17\nmax_header_size = \"65551B\"\n",
+        Sections::VALID.text()
+    );
+    let document = Document::<Plugins>::parse(&text)?;
+    let proxy = &document.server.proxy_protocol;
+    assert_eq!(proxy.public, gang_config::ProxyProtocol::Require);
+    assert_eq!(proxy.worker, gang_config::ProxyProtocol::Accept);
+    assert_eq!(proxy.health, gang_config::ProxyProtocol::Accept);
+    assert_eq!(proxy.trusted_cidrs[0].to_string(), "192.0.2.1/32");
+    assert_eq!(proxy.trusted_cidrs[1].to_string(), "2001:db8::/64");
+    assert_eq!(proxy.header_timeout.get(), Duration::from_secs(3));
+    assert_eq!(proxy.max_pending_headers.get(), 17);
+    assert_eq!(proxy.max_header_size, Bytes::new(65_551));
+    let reparsed = Document::<Plugins>::parse(&document.to_toml()?)?;
+    assert_eq!(reparsed.server.proxy_protocol, *proxy);
+    Ok(())
+}
+
+#[test]
+fn proxy_protocol_rejects_invalid_fields_and_limits() {
+    for input in [
+        "public = \"disabled\"",
+        "public = \"v1\"",
+        "public = \"v2\"",
+        "unknown = true",
+        "execution = \"off\"",
+        "trusted_cidrs = [\"not-a-network\"]",
+        "public = \"accept\"",
+        "worker = \"require\"",
+        "header_timeout = \"0s\"",
+        "max_pending_headers = 0",
+        "max_header_size = \"15B\"",
+        "max_header_size = \"65552B\"",
+    ] {
+        assert!(
+            toml::from_str::<gang_config::ProxyProtocolConfig>(input).is_err(),
+            "accepted {input}"
+        );
+    }
+    for listener in ["public", "worker", "health"] {
+        for mode in ["accept", "require"] {
+            let input = format!("{listener} = \"{mode}\"");
+            assert!(
+                toml::from_str::<gang_config::ProxyProtocolConfig>(&input).is_err(),
+                "accepted {input} without trusted CIDRs"
+            );
+        }
+    }
+    for size in ["16B", "65551B"] {
+        let input = format!("max_header_size = \"{size}\"");
+        assert!(
+            toml::from_str::<gang_config::ProxyProtocolConfig>(&input).is_ok(),
+            "rejected {input}"
+        );
+    }
+}
+
+#[test]
+fn optional_health_proxy_mode_requires_its_listener() {
+    let off = format!(
+        "{}\n[server.proxy_protocol]\nhealth = \"off\"\n",
+        Sections::VALID.text()
+    );
+    assert!(off.parse::<GangConfig<Plugins>>().is_ok());
+    for mode in ["accept", "require"] {
+        let proxy = format!(
+            "\n[server.proxy_protocol]\nhealth = \"{mode}\"\ntrusted_cidrs = [\"192.0.2.1/32\"]\n"
+        );
+        let missing = format!("{}{proxy}", Sections::VALID.text());
+        assert!(matches!(
+            missing.parse::<GangConfig<Plugins>>(),
+            Err(ConfigError::ProxyProtocolWithoutListener { listener: "health" })
+        ));
+        let text = format!(
+            "health_listen = \"127.0.0.1:9446\"\n{}{proxy}",
+            Sections::VALID.text()
+        );
+        assert!(text.parse::<GangConfig<Plugins>>().is_ok(), "health {mode}");
     }
 }
 
@@ -644,12 +710,6 @@ fn revocation_refresh_interval_defaults_to_five_seconds() -> Result<(), Box<dyn 
 }
 
 #[test]
-fn execution_listener_defaults_to_none() -> Result<(), Box<dyn Error>> {
-    assert_eq!(Sections::VALID.parse()?.execution_listen, None);
-    Ok(())
-}
-
-#[test]
 fn health_listener_defaults_to_none_and_parses() -> Result<(), Box<dyn Error>> {
     assert_eq!(Sections::VALID.parse()?.health_listen, None);
     let top = format!("{TOP}\nhealth_listen = \"127.0.0.1:8080\"\n");
@@ -663,212 +723,54 @@ fn health_listener_defaults_to_none_and_parses() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn execution_endpoint_defaults_to_none() -> Result<(), Box<dyn Error>> {
-    assert_eq!(Sections::VALID.parse()?.execution_endpoint, None);
-    Ok(())
-}
-
-#[test]
-fn execution_endpoint_must_share_the_public_host() -> Result<(), Box<dyn Error>> {
-    let top = format!(
-        "{TOP}\nexecution_listen = \"127.0.0.1:9444\"\nexecution_endpoint = \"https://exec.example.com:9444\"\n"
-    );
-    let error = Sections {
-        top: top.leak(),
-        ..Sections::VALID
-    }
-    .parse()
-    .err()
-    .ok_or("different execution host was accepted")?;
-    assert!(matches!(
-        error,
-        ConfigError::ExecutionEndpointHostMismatch { .. }
-    ));
-    Ok(())
-}
-
-#[test]
-fn execution_endpoint_matches_the_derived_public_host() {
-    let top = TOP.replace("endpoint = \"https://gang.example.com:9443\"\n", "");
-    for (host, accepted) in [("127.0.0.1", true), ("exec.example.com", false)] {
-        let text = format!(
-            "{top}\nexecution_listen = \"127.0.0.1:9444\"\nexecution_endpoint = \"https://{host}:9444\"\n"
-        );
-        let result = Sections {
-            top: text.leak(),
-            ..Sections::VALID
-        }
-        .parse();
-        assert_eq!(result.is_ok(), accepted);
-    }
-}
-
-#[test]
-fn derived_execution_endpoint_must_share_the_public_host() {
-    let top = format!("{TOP}\nexecution_listen = \"127.0.0.1:9444\"\n");
-    let result = Sections {
-        top: top.leak(),
-        ..Sections::VALID
-    }
-    .parse();
-    assert!(matches!(
-        result,
-        Err(ConfigError::ExecutionEndpointHostMismatch { .. })
-    ));
-}
-
-#[test]
-fn execution_endpoint_requires_execution_listener() -> Result<(), Box<dyn Error>> {
-    let top = format!("{TOP}\nexecution_endpoint = \"https://example.com:9444\"\n");
-    let error = Sections {
-        top: top.leak(),
-        ..Sections::VALID
-    }
-    .parse()
-    .err()
-    .ok_or("accepted")?;
-    assert!(matches!(error, ConfigError::ExecutionEndpointWithoutListen));
-    let top = format!(
-        "{TOP}\nexecution_listen = \"127.0.0.1:9444\"\nexecution_endpoint = \"https://gang.example.com:9444\"\n"
-    );
-    assert!(
-        Sections {
-            top: top.leak(),
-            ..Sections::VALID
-        }
-        .parse()
-        .is_ok()
-    );
-    Ok(())
-}
-
-#[test]
-fn execution_listener_without_endpoint_must_be_loopback() -> Result<(), Box<dyn Error>> {
-    let top = format!(
-        "{}\nexecution_listen = \"127.0.0.1:9444\"\n",
-        TOP.replace("endpoint = \"https://gang.example.com:9443\"\n", "")
-    );
-    let config = Sections {
-        top: top.leak(),
-        ..Sections::VALID
-    }
-    .parse()?;
-    assert_eq!(config.execution_endpoint, None);
-    let top = format!("{TOP}\nexecution_listen = \"0.0.0.0:9444\"\n");
-    let error = Sections {
-        top: top.leak(),
-        ..Sections::VALID
-    }
-    .parse()
-    .err()
-    .ok_or("accepted")?;
-    assert!(matches!(
-        error,
-        ConfigError::ExecutionEndpointRequired { .. }
-    ));
-    let top = format!(
-        "{TOP}\nexecution_listen = \"0.0.0.0:9444\"\nexecution_endpoint = \"https://gang.example.com:9444\"\n"
-    );
-    assert!(
-        Sections {
-            top: top.leak(),
-            ..Sections::VALID
-        }
-        .parse()
-        .is_ok()
-    );
-    Ok(())
-}
-
-#[test]
-fn execution_endpoint_scheme_matches_transport() {
-    for (endpoint, valid) in [
-        ("https://gang.example.com", true),
-        ("http://gang.example.com", false),
-        ("ftp://gang.example.com", false),
+fn removed_execution_keys_name_their_replacements() {
+    for (key, value, replacement) in [
+        (
+            "execution_endpoint",
+            "https://gang.example.com:9444",
+            "endpoint",
+        ),
+        ("execution_listen", "127.0.0.1:9444", "listen"),
     ] {
-        let top = format!(
-            "{TOP}\nexecution_listen = \"127.0.0.1:9444\"\nexecution_endpoint = \"{endpoint}\"\n"
-        );
-        let result = Sections {
+        let top = format!("{TOP}\n{key} = \"{value}\"\n");
+        let text = Sections {
             top: top.leak(),
             ..Sections::VALID
         }
-        .parse();
-        assert_eq!(result.is_ok(), valid);
-        if !valid {
-            assert!(matches!(
-                result,
-                Err(ConfigError::ExecutionEndpointNotHttps(_))
-            ));
-        }
-    }
-    for (endpoint, valid) in [
-        ("https://gang.example.com", true),
-        ("http://gang.example.com", true),
-        ("ftp://gang.example.com", false),
-    ] {
-        let top = format!(
-            "{TOP}\nexecution_listen = \"127.0.0.1:9444\"\nexecution_endpoint = \"{endpoint}\"\n"
-        );
-        let result = Sections {
-            top: top.leak(),
-            server: PLAINTEXT_SERVER,
-            authentication: PLAINTEXT_AUTHENTICATION,
-            ..Sections::VALID
-        }
-        .parse();
-        assert_eq!(result.is_ok(), valid);
-        if !valid {
-            assert!(matches!(
-                result,
-                Err(ConfigError::ExecutionEndpointNotHttp(_))
-            ));
+        .text();
+        let document_error = Document::<Plugins>::parse(&text).expect_err("removed key");
+        let config_error = text
+            .parse::<GangConfig<Plugins>>()
+            .expect_err("removed key");
+        for error in [document_error, config_error] {
+            let ConfigError::Gang(source) = error else {
+                panic!("expected a schema error");
+            };
+            let message = source.to_string();
+            assert!(message.contains(&format!("`{key}`")), "{message}");
+            assert!(
+                message.contains(&format!("use `{replacement}` instead")),
+                "{message}"
+            );
         }
     }
 }
 
 #[test]
-fn leader_listener_ports_must_be_nonzero() -> Result<(), Box<dyn Error>> {
-    for key in ["execution_listen", "worker_listen"] {
-        let worker = if key == "worker_listen" {
-            "127.0.0.1:0"
-        } else {
-            "127.0.0.1:1"
-        };
-        let execution = if key == "execution_listen" {
-            "127.0.0.1:0"
-        } else {
-            "127.0.0.1:1"
-        };
-        let top = format!(
-            "{}\nexecution_listen = \"{execution}\"\n",
-            TOP.replace("127.0.0.1:9445", worker)
-        );
-        let error = Sections {
-            top: top.leak(),
-            ..Sections::VALID
-        }
-        .parse()
-        .err()
-        .ok_or("accepted")?;
-        assert!(
-            matches!(error, ConfigError::LeaderListenerPortUnset { key: actual, .. } if actual == key)
-        );
-    }
-    let top = format!(
-        "{}\nexecution_listen = \"127.0.0.1:1\"\n",
-        TOP.replace("127.0.0.1:9445", "127.0.0.1:1")
-            .replace("endpoint = \"https://gang.example.com:9443\"\n", "")
-    );
-    assert!(
+fn listener_addresses_must_not_collide() {
+    let top = TOP.replace("127.0.0.1:9445", "127.0.0.1:9443");
+    assert!(matches!(
         Sections {
             top: top.leak(),
             ..Sections::VALID
         }
-        .parse()
-        .is_err()
-    );
+        .parse(),
+        Err(ConfigError::ListenerCollision { .. })
+    ));
+}
+
+#[test]
+fn ephemeral_worker_listener_is_allowed() {
     let top = TOP.replace("127.0.0.1:9445", "127.0.0.1:0");
     assert!(
         Sections {
@@ -878,47 +780,15 @@ fn leader_listener_ports_must_be_nonzero() -> Result<(), Box<dyn Error>> {
         .parse()
         .is_ok()
     );
-    Ok(())
-}
-
-#[test]
-fn listener_addresses_must_not_collide() {
-    for (public, worker, execution) in [
-        ("127.0.0.1:1", "127.0.0.1:1", None),
-        ("127.0.0.1:1", "127.0.0.1:2", Some("127.0.0.1:1")),
-        ("127.0.0.1:1", "127.0.0.1:2", Some("127.0.0.1:2")),
-    ] {
-        let top = format!(
-            "{}{}",
-            TOP.replace("127.0.0.1:9443", public)
-                .replace("127.0.0.1:9445", worker),
-            execution.map_or_else(String::new, |addr| format!(
-                "\nexecution_listen = \"{addr}\"\n"
-            ))
-        );
-        assert!(matches!(
-            Sections {
-                top: top.leak(),
-                ..Sections::VALID
-            }
-            .parse(),
-            Err(ConfigError::ListenerCollision { .. })
-        ));
-    }
 }
 
 #[test]
 fn health_listener_must_not_collide_with_other_listeners() {
-    for (health, execution, first) in [
-        ("127.0.0.1:9443", "", "listen"),
-        ("127.0.0.1:9445", "", "worker_listen"),
-        (
-            "127.0.0.1:9444",
-            "execution_listen = \"127.0.0.1:9444\"\n",
-            "execution_listen",
-        ),
+    for (health, first) in [
+        ("127.0.0.1:9443", "listen"),
+        ("127.0.0.1:9445", "worker_listen"),
     ] {
-        let top = format!("{TOP}\n{execution}health_listen = \"{health}\"\n");
+        let top = format!("{TOP}\nhealth_listen = \"{health}\"\n");
         assert!(matches!(
             Sections {
                 top: top.leak(),
@@ -961,57 +831,6 @@ fn wildcard_listener_collisions_respect_address_family() {
             assert!(result.is_ok(), "{public} and {worker}: {result:?}");
         }
     }
-}
-
-#[test]
-fn execution_endpoint_must_not_relay_to_public_frontend() {
-    for (public, execution, rejected) in [
-        (
-            "https://gang.example.com",
-            Some("https://gang.example.com:443"),
-            true,
-        ),
-        (
-            "https://gang.example.com:444",
-            Some("https://gang.example.com:443"),
-            false,
-        ),
-        ("https://127.0.0.1:9444", None, true),
-        ("https://127.0.0.1:9443", None, false),
-    ] {
-        let top = format!(
-            "{}\nexecution_listen = \"127.0.0.1:9444\"\n{}",
-            TOP.replace("https://gang.example.com:9443", public),
-            execution.map_or_else(String::new, |url| format!(
-                "execution_endpoint = \"{url}\"\n"
-            ))
-        );
-        let result = Sections {
-            top: top.leak(),
-            ..Sections::VALID
-        }
-        .parse();
-        if rejected {
-            assert!(
-                matches!(result, Err(ConfigError::ExecutionEndpointSelfRelay)),
-                "{public} {execution:?}"
-            );
-        } else {
-            assert!(result.is_ok(), "{public} {execution:?}");
-        }
-    }
-    let top = format!(
-        "{}\nexecution_listen = \"127.0.0.1:9444\"\nexecution_endpoint = \"https://127.0.0.1:9443\"\n",
-        TOP.replace("endpoint = \"https://gang.example.com:9443\"\n", "")
-    );
-    assert!(matches!(
-        Sections {
-            top: top.leak(),
-            ..Sections::VALID
-        }
-        .parse(),
-        Err(ConfigError::ExecutionEndpointSelfRelay)
-    ));
 }
 
 #[test]
@@ -1080,11 +899,40 @@ fn leadership_call_timeout_must_fit_in_the_lease() {
 }
 
 #[test]
+fn worker_connect_timeout_must_be_below_twice_worker_timeout() {
+    for seconds in [19, 20, 21] {
+        let server = format!("{SERVER}\nworker_timeout = \"10s\"\n");
+        let worker = format!("[worker]\nconnect_timeout = \"{seconds}s\"\n");
+        let result = Sections {
+            server: server.leak(),
+            worker: worker.leak(),
+            ..Sections::VALID
+        }
+        .parse();
+        if seconds == 19 {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            assert!(matches!(
+                result,
+                Err(ConfigError::WorkerConnectTimeoutTooLong {
+                    connect_timeout,
+                    worker_timeout,
+                }) if connect_timeout == Duration::from_secs(seconds)
+                    && worker_timeout == Duration::from_secs(10)
+            ));
+        }
+    }
+}
+
+#[test]
 fn shutdown_grace_must_be_strictly_below_every_boot_grace() {
     for (grace, valid) in [("29s", true), ("30s", false), ("31s", false)] {
-        let scheduler = format!("{SCHEDULER}\nshutdown_grace = \"{grace}\"\n");
+        let server = format!("{SERVER}\n[server.http2]\nshutdown_grace = \"{grace}\"\n");
         let result = Sections {
-            scheduler: scheduler.leak(),
+            fleet: FLEET
+                .replace("boot_grace = \"1m\"", "boot_grace = \"30s\"")
+                .leak(),
+            server: server.leak(),
             ..Sections::VALID
         }
         .parse();
@@ -1100,11 +948,13 @@ fn shutdown_grace_must_be_strictly_below_every_boot_grace() {
 
 #[test]
 fn shutdown_grace_checks_each_fleet() -> Result<(), Box<dyn Error>> {
-    let scheduler = format!("{SCHEDULER}\nshutdown_grace = \"30s\"\n");
+    let server = format!("{SERVER}\n[server.http2]\nshutdown_grace = \"30s\"\n");
     let error = Sections {
-        fleet: TWO_FLEETS,
+        fleet: TWO_FLEETS
+            .replace("boot_grace = \"1m\"", "boot_grace = \"30s\"")
+            .leak(),
         provisioner: AWS_PROVISIONER,
-        scheduler: scheduler.leak(),
+        server: server.leak(),
         ..Sections::VALID
     }
     .parse()
@@ -1116,6 +966,19 @@ fn shutdown_grace_checks_each_fleet() -> Result<(), Box<dyn Error>> {
     } if shutdown_grace == Duration::from_secs(30) && boot_grace == Duration::from_secs(30))
     );
     Ok(())
+}
+
+#[test]
+fn default_shutdown_grace_must_be_below_boot_grace() {
+    let fleet = FLEET.replace("boot_grace = \"1m\"", "boot_grace = \"30s\"");
+    assert!(matches!(
+        Sections {
+            fleet: fleet.leak(),
+            ..Sections::VALID
+        }
+        .parse(),
+        Err(ConfigError::ShutdownGraceNotBelowBootGrace { .. })
+    ));
 }
 
 #[test]
@@ -1188,7 +1051,7 @@ fn toml_rejection(sections: &Sections) -> Result<String, Box<dyn Error>> {
 /// A `[[fleets]]` entry on the local provisioner with the given name and no options.
 fn fleet_block(name: &str) -> String {
     format!(
-        "[[fleets]]\nname = \"{name}\"\nisa = \"x86-64\"\nsandbox = \"bwrap\"\nmin_instances = 0\nmax_instances = 1\nvcpus_per_instance = 1\nmemory_per_instance = \"1GiB\"\ndisk_per_instance = \"100GiB\"\ntarget_actions_per_instance = 1\nidle_timeout = \"15s\"\nmax_drain_wait = \"1m\"\nboot_grace = \"30s\"\n"
+        "[[fleets]]\nname = \"{name}\"\nisa = \"x86-64\"\nsandbox = \"bwrap\"\nmin_instances = 0\nmax_instances = 1\nvcpus_per_instance = 1\nmemory_per_instance = \"8GiB\"\ndisk_per_instance = \"100GiB\"\ntarget_actions_per_instance = 1\nidle_timeout = \"15s\"\nmax_drain_wait = \"1m\"\nboot_grace = \"1m\"\n"
     )
 }
 
@@ -1227,9 +1090,7 @@ fn parses_a_complete_file_into_typed_values() -> Result<(), Box<dyn Error>> {
     assert!(
         matches!(&config.signer, SignerConfig::File(signer) if signer.key_path == "/tmp/gang-local/ca.pem")
     );
-    assert!(
-        matches!(&config.scheduler, SchedulerConfig::Nativelink(section) if section.scheduler_name == "MAIN_SCHEDULER")
-    );
+    assert!(config.worker_endpoint.is_none());
     assert!(
         matches!(&config.database, DatabaseConfig::Sqlite(section) if section.path.ends_with("gang.db"))
     );
@@ -1264,6 +1125,100 @@ fn a_document_written_back_parses_to_the_same_configuration() -> Result<(), Box<
     assert_eq!(reparsed.server.transport, original.server.transport);
     assert_eq!(reparsed.fleets.len(), original.fleets.len());
     assert_eq!(Document::<Plugins>::parse(&rendered)?.to_toml()?, rendered);
+    Ok(())
+}
+
+#[test]
+fn scheduler_is_not_required_or_serialized_and_legacy_tables_are_rejected()
+-> Result<(), Box<dyn Error>> {
+    let text = Sections::VALID.text();
+    let rendered = Document::<Plugins>::parse(&text)?.to_toml()?;
+    assert!(!rendered.contains("[scheduler"), "{rendered}");
+    for (legacy, destinations) in [
+        ("[scheduler]\n", &["worker_endpoint"][..]),
+        (
+            "[scheduler.nativelink]\nscheduler_name = \"MAIN_SCHEDULER\"\n",
+            &["worker_endpoint"][..],
+        ),
+        ("[scheduler.nativelink.memory]\n", &["actions.memory"][..]),
+        ("[scheduler.nativelink.disk]\n", &["actions.disk"][..]),
+        (
+            "[scheduler.nativelink.cold_start]\n",
+            &["actions.cold_start"][..],
+        ),
+        ("[scheduler.nativelink.http2]\n", &["server.http2"][..]),
+        (
+            "[scheduler.nativelink.worker]\n",
+            &["worker", "actions.timeout"][..],
+        ),
+        (
+            "[scheduler.nativelink.scheduler]\n",
+            &["actions", "server.worker_timeout"][..],
+        ),
+    ] {
+        let text = format!("{text}\n{legacy}");
+        let error = text
+            .parse::<GangConfig<Plugins>>()
+            .err()
+            .ok_or("accepted scheduler")?;
+        assert!(matches!(error, ConfigError::RemovedScheduler(_)), "{error}");
+        let message = error.to_string();
+        for name in [
+            "scheduler",
+            "actions",
+            "server",
+            "worker",
+            "worker_endpoint",
+        ] {
+            assert!(message.contains(name), "{message}");
+        }
+        let fix = gang_types::Fix::fix(&error).ok_or("missing scheduler migration guidance")?;
+        for destination in destinations {
+            assert!(fix.contains(destination), "{legacy}: {fix}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn nondefault_runtime_domains_round_trip() -> Result<(), Box<dyn Error>> {
+    let top = format!("{TOP}\nworker_endpoint = \"grpcs://worker.example.com:9445\"\n");
+    let server = format!(
+        "{SERVER}\nworker_timeout = \"20s\"\nmax_open_files = 8192\n[server.http2]\nshutdown_grace = \"12s\"\nmax_connections = 64\n"
+    );
+    let text = Sections {
+        top: top.leak(),
+        actions: "[actions]\nretain_completed_for = \"75s\"\n",
+        server: server.leak(),
+        worker: "[worker]\nmax_open_files = 8192\nupload_timeout = \"11s\"\ndownload_timeout = \"12s\"\nconnect_timeout = \"3s\"\ncleanup_wait = \"14s\"\nkeepalive_interval = \"15s\"\n",
+        ..Sections::VALID
+    }.text();
+    let original = text.parse::<GangConfig<Plugins>>()?;
+    let rendered = Document::<Plugins>::parse(&text)?.to_toml()?;
+    let reparsed = rendered.parse::<GangConfig<Plugins>>()?;
+    assert_eq!(reparsed.worker_endpoint, original.worker_endpoint);
+    assert_eq!(
+        reparsed.actions.retain_completed_for.get(),
+        Duration::from_secs(75)
+    );
+    assert_eq!(reparsed.server.http2, original.server.http2);
+    assert_eq!(
+        reparsed.server.worker_timeout,
+        original.server.worker_timeout
+    );
+    assert_eq!(
+        reparsed.server.max_open_files,
+        original.server.max_open_files
+    );
+    assert_eq!(reparsed.worker, original.worker);
+    assert_eq!(
+        reparsed.server.http2.shutdown_grace,
+        Duration::from_secs(12)
+    );
+    assert_eq!(
+        reparsed.worker.upload_timeout.get(),
+        Duration::from_secs(11)
+    );
     Ok(())
 }
 
@@ -2254,7 +2209,7 @@ fn rejects_a_zero_target_actions_per_instance() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn rejects_a_fleet_without_a_boot_grace() -> Result<(), Box<dyn Error>> {
-    let without = FLEET.replace("boot_grace = \"30s\"\n", "");
+    let without = FLEET.replace("boot_grace = \"1m\"\n", "");
     assert_ne!(without, FLEET, "fixture must contain boot_grace");
 
     let error = Sections {
@@ -2272,7 +2227,7 @@ fn rejects_a_fleet_without_a_boot_grace() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn parses_a_boot_grace_in_minutes() -> Result<(), Box<dyn Error>> {
-    let minutes = FLEET.replace("boot_grace = \"30s\"", "boot_grace = \"10m\"");
+    let minutes = FLEET.replace("boot_grace = \"1m\"", "boot_grace = \"10m\"");
 
     let config = Sections {
         fleet: minutes.leak(),
@@ -2498,10 +2453,7 @@ fn rejects_more_fleets_than_the_catalog_holds() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn rejects_an_unknown_field_in_a_fleet_entry() -> Result<(), Box<dyn Error>> {
-    let bogus = FLEET.replace(
-        "boot_grace = \"30s\"\n",
-        "boot_grace = \"30s\"\nbogus = 1\n",
-    );
+    let bogus = FLEET.replace("boot_grace = \"1m\"\n", "boot_grace = \"1m\"\nbogus = 1\n");
 
     let error = Sections {
         fleet: bogus.leak(),
@@ -2568,8 +2520,8 @@ fn rejects_a_fleet_options_value_that_is_not_a_table() -> Result<(), Box<dyn Err
     let error = Sections {
         fleet: FLEET
             .replace(
-                "boot_grace = \"30s\"\n",
-                "boot_grace = \"30s\"\noptions = \"x\"\n",
+                "boot_grace = \"1m\"\n",
+                "boot_grace = \"1m\"\noptions = \"x\"\n",
             )
             .leak(),
         ..Sections::VALID
@@ -2584,10 +2536,7 @@ fn rejects_a_fleet_options_value_that_is_not_a_table() -> Result<(), Box<dyn Err
 
 #[test]
 fn unknown_fleet_key_lists_sandbox_and_options_as_accepted() -> Result<(), Box<dyn Error>> {
-    let bogus = FLEET.replace(
-        "boot_grace = \"30s\"\n",
-        "boot_grace = \"30s\"\nbogus = 1\n",
-    );
+    let bogus = FLEET.replace("boot_grace = \"1m\"\n", "boot_grace = \"1m\"\nbogus = 1\n");
 
     let error = Sections {
         fleet: bogus.leak(),
@@ -3626,7 +3575,7 @@ fn hand_member(
         isa,
         instances: InstanceBounds::up_to(NonZeroU32::MIN.saturating_add(3)),
         vcpus_per_instance: NonZeroU32::MIN,
-        memory_per_instance: NonZeroBytes::gib(1),
+        memory_per_instance: NonZeroBytes::gib(8),
         disk_per_instance: NonZeroBytes::gib(100),
         target_actions_per_instance: NonZeroU32::MIN,
         idle_timeout: Duration::from_secs(15),
@@ -3809,14 +3758,13 @@ fn builds_defaults_apply_when_the_section_is_omitted() -> Result<(), Box<dyn Err
     assert_eq!(builds.targets.get(), 20);
     assert_eq!(builds.slowest_actions.get(), 20);
     assert_eq!(builds.timeline_buckets.get(), 120);
-    assert_eq!(builds.max_traffic_series.get(), 1024);
     Ok(())
 }
 
 #[test]
 fn every_builds_key_can_be_overridden() -> Result<(), Box<dyn Error>> {
     let config = Sections {
-        builds: "[builds]\nmax_live = 10\nidle_after = \"2m\"\nqueue = 100\nmnemonics = 4\ntargets = 5\nslowest_actions = 6\ntimeline_buckets = 7\nmax_traffic_series = 17\n",
+        builds: "[builds]\nmax_live = 10\nidle_after = \"2m\"\nqueue = 100\nmnemonics = 4\ntargets = 5\nslowest_actions = 6\ntimeline_buckets = 7\n",
         ..Sections::VALID
     }
     .parse()?;
@@ -3828,7 +3776,6 @@ fn every_builds_key_can_be_overridden() -> Result<(), Box<dyn Error>> {
     assert_eq!(builds.targets.get(), 5);
     assert_eq!(builds.slowest_actions.get(), 6);
     assert_eq!(builds.timeline_buckets.get(), 7);
-    assert_eq!(builds.max_traffic_series.get(), 17);
     Ok(())
 }
 
@@ -3851,7 +3798,6 @@ fn zero_builds_limits_are_rejected() {
         "targets",
         "slowest_actions",
         "timeline_buckets",
-        "max_traffic_series",
     ] {
         let text = format!("{}\n[builds]\n{key} = 0\n", Sections::VALID.text());
         assert!(text.parse::<GangConfig<Plugins>>().is_err(), "{key}");
@@ -4389,63 +4335,6 @@ fn unknown_dashboard_key_is_rejected_and_named() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Scheduler fixture exposing a configurable worker endpoint.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WorkerEndpointSection {
-    scheduler_name: String,
-    worker_endpoint: Option<Url>,
-}
-
-/// Scheduler selections for worker endpoint validation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum WorkerEndpointScheduler {
-    Nativelink(WorkerEndpointSection),
-}
-
-impl SchedulerSettings for WorkerEndpointScheduler {
-    fn worker_endpoint(&self) -> Option<&Url> {
-        match self {
-            Self::Nativelink(section) => section.worker_endpoint.as_ref(),
-        }
-    }
-
-    fn worker_endpoint_key(&self) -> Option<&'static str> {
-        Some("worker_endpoint")
-    }
-}
-
-/// Plugin composition using the worker endpoint scheduler fixture.
-#[derive(Debug)]
-struct WorkerEndpointPlugins;
-
-impl PluginSet for WorkerEndpointPlugins {
-    type Provisioner = ProvisionerConfig;
-    type Cache = CacheConfig;
-    type Signer = SignerConfig;
-    type Scheduler = WorkerEndpointScheduler;
-    type Database = DatabaseConfig;
-    type SandboxKey = SandboxKey;
-    type Sandbox = SandboxConfig;
-    type IdentityProvider = IdentityProviderConfig;
-    type Limits = LimitsConfig;
-    type FleetOptions = FleetOptions;
-    type ClientAuthentication = ClientAuthenticationConfig;
-    type WorkerAuthentication = WorkerAuthenticationConfig;
-
-    fn fleet_options(
-        provisioner: &ProvisionerConfig,
-        table: FleetOptionsTable,
-    ) -> Result<FleetOptions, FleetOptionsError> {
-        Plugins::fleet_options(provisioner, table)
-    }
-
-    fn option_properties(options: &FleetOptions) -> Vec<(&'static str, String)> {
-        Plugins::option_properties(options)
-    }
-}
-
 #[test]
 fn an_omitted_worker_endpoint_on_a_non_loopback_worker_listen_is_rejected()
 -> Result<(), Box<dyn Error>> {
@@ -4460,7 +4349,7 @@ fn an_omitted_worker_endpoint_on_a_non_loopback_worker_listen_is_rejected()
     };
     let error = sections
         .text()
-        .parse::<GangConfig<WorkerEndpointPlugins>>()
+        .parse::<GangConfig<Plugins>>()
         .err()
         .ok_or("accepted a missing worker endpoint")?;
     assert!(
@@ -4480,12 +4369,12 @@ fn an_omitted_worker_endpoint_on_a_non_loopback_worker_listen_is_rejected()
 #[test]
 fn a_plaintext_worker_endpoint_under_tls_is_rejected() -> Result<(), Box<dyn Error>> {
     let sections = Sections {
-        scheduler: "[scheduler.nativelink]\nscheduler_name = \"MAIN_SCHEDULER\"\nworker_endpoint = \"grpc://scheduler.example.com:9445\"\n",
+        top: format!("{TOP}\nworker_endpoint = \"grpc://scheduler.example.com:9445\"\n").leak(),
         ..Sections::VALID
     };
     let error = sections
         .text()
-        .parse::<GangConfig<WorkerEndpointPlugins>>()
+        .parse::<GangConfig<Plugins>>()
         .err()
         .ok_or("accepted a plaintext worker endpoint under TLS")?;
     assert!(
@@ -4513,18 +4402,15 @@ fn worker_endpoint_scheme_respects_the_server_transport() -> Result<(), Box<dyn 
         (PLAINTEXT_SERVER, PLAINTEXT_AUTHENTICATION, "grpc"),
         (PLAINTEXT_SERVER, PLAINTEXT_AUTHENTICATION, "grpcs"),
     ] {
-        let scheduler = format!(
-            "[scheduler.nativelink]\nscheduler_name = \"MAIN_SCHEDULER\"\n\
-             worker_endpoint = \"{scheme}://scheduler.example.com:9445\"\n"
-        );
+        let top = format!("{TOP}\nworker_endpoint = \"{scheme}://scheduler.example.com:9445\"\n");
         Sections {
             server,
             authentication,
-            scheduler: scheduler.leak(),
+            top: top.leak(),
             ..Sections::VALID
         }
         .text()
-        .parse::<GangConfig<WorkerEndpointPlugins>>()?;
+        .parse::<GangConfig<Plugins>>()?;
     }
     Ok(())
 }
@@ -4534,12 +4420,12 @@ fn plaintext_rejects_a_non_grpc_worker_endpoint() -> Result<(), Box<dyn Error>> 
     let sections = Sections {
         server: PLAINTEXT_SERVER,
         authentication: PLAINTEXT_AUTHENTICATION,
-        scheduler: "[scheduler.nativelink]\nscheduler_name = \"MAIN_SCHEDULER\"\nworker_endpoint = \"https://scheduler.example.com:9445\"\n",
+        top: format!("{TOP}\nworker_endpoint = \"https://scheduler.example.com:9445\"\n").leak(),
         ..Sections::VALID
     };
     let error = sections
         .text()
-        .parse::<GangConfig<WorkerEndpointPlugins>>()
+        .parse::<GangConfig<Plugins>>()
         .err()
         .ok_or("accepted a non-grpc worker endpoint")?;
     assert!(
@@ -4551,25 +4437,7 @@ fn plaintext_rejects_a_non_grpc_worker_endpoint() -> Result<(), Box<dyn Error>> 
 
 #[test]
 fn an_omitted_worker_endpoint_on_loopback_is_accepted() -> Result<(), Box<dyn Error>> {
-    Sections::VALID
-        .text()
-        .parse::<GangConfig<WorkerEndpointPlugins>>()?;
-    Ok(())
-}
-
-#[test]
-fn a_scheduler_without_a_worker_endpoint_key_accepts_a_public_worker_listener()
--> Result<(), Box<dyn Error>> {
-    Sections {
-        top: TOP
-            .replace(
-                "worker_listen = \"127.0.0.1:9445\"",
-                "worker_listen = \"0.0.0.0:9445\"",
-            )
-            .leak(),
-        ..Sections::VALID
-    }
-    .parse()?;
+    Sections::VALID.text().parse::<GangConfig<Plugins>>()?;
     Ok(())
 }
 
@@ -4612,12 +4480,12 @@ fn worker_enrollment_client_limits_default_when_omitted() -> Result<(), Box<dyn 
 #[test]
 fn a_hostless_worker_endpoint_is_rejected() -> Result<(), Box<dyn Error>> {
     let sections = Sections {
-        scheduler: "[scheduler.nativelink]\nscheduler_name = \"MAIN_SCHEDULER\"\nworker_endpoint = \"grpcs:worker\"\n",
+        top: format!("{TOP}\nworker_endpoint = \"grpcs:worker\"\n").leak(),
         ..Sections::VALID
     };
     let error = sections
         .text()
-        .parse::<GangConfig<WorkerEndpointPlugins>>()
+        .parse::<GangConfig<Plugins>>()
         .err()
         .ok_or("accepted a hostless worker endpoint")?;
     assert!(
@@ -4626,7 +4494,7 @@ fn a_hostless_worker_endpoint_is_rejected() -> Result<(), Box<dyn Error>> {
     );
     assert_eq!(
         error.to_string(),
-        "worker endpoint `grpcs:worker` has no host"
+        "worker_endpoint `grpcs:worker` has no host"
     );
     Ok(())
 }

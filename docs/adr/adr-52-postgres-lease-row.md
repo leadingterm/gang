@@ -1,6 +1,6 @@
 # ADR-52: The PostgreSQL leader lease is a conditionally updated row
 
-Status: Accepted. Builds on ADR-44 and ADR-48.
+Status: Accepted. Builds on ADR-44 and ADR-48. Partly superseded by ADR-59: the lease row also coordinates successor priority for cooperative handoff.
 
 ## Context
 - `gang-postgres` implements `LeaderLeasePort`: acquire with `stale_before`, renew, release and epoch fencing. It keeps no session state.

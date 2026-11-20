@@ -1,4 +1,4 @@
-//! Cross-controller principal and worker revocation over direct public endpoints.
+//! Principal and worker revocation, followed by a leader handoff and restoration.
 
 use std::fs;
 use std::io::ErrorKind;
@@ -18,7 +18,7 @@ use crate::gang_cli::{GangCli, client_home};
 use crate::identity::Issuance;
 use crate::issuer::{TestIssuer, TokenSpec};
 use crate::names::cross_revocation::{
-    BEARER_REFUSED, FOLLOWER_STREAM_CLOSED, INITIAL_LOGIN, LOGIN_REFUSED, RESTORED, STREAM_CLOSED,
+    BEARER_REFUSED, INITIAL_LOGIN, LOGIN_REFUSED, RESTORED, SECOND_STREAM_CLOSED, STREAM_CLOSED,
     STREAM_OPEN, WORKER_CUT,
 };
 use crate::process;
@@ -250,7 +250,7 @@ fn observe_revocation(
     deadlines: (Instant, Instant, Duration),
 ) -> Result<((bool, bool, bool), bool)> {
     let (principal_deadline, worker_deadline, pace) = deadlines;
-    let (stream, follower_stream) = streams;
+    let (stream, second_stream) = streams;
     std::thread::scope(|scope| -> Result<_> {
         let login = scope.spawn(|| {
             issue_until(
@@ -264,7 +264,7 @@ fn observe_revocation(
             )
         });
         let closure = scope.spawn(|| stream_closed(stream, principal_deadline));
-        let follower = scope.spawn(|| stream_closed(follower_stream, principal_deadline));
+        let second = scope.spawn(|| stream_closed(second_stream, principal_deadline));
         let worker_wait = scope.spawn(|| {
             let remaining = worker_deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -289,10 +289,10 @@ fn observe_revocation(
                 .join()
                 .map_err(|_| E2eError::system("worker observation panicked"))??,
         );
-        let follower_closed = follower
+        let second_closed = second
             .join()
-            .map_err(|_| E2eError::system("follower stream observation panicked"))??;
-        Ok((observed, follower_closed))
+            .map_err(|_| E2eError::system("second stream observation panicked"))??;
+        Ok((observed, second_closed))
     })
 }
 
@@ -302,7 +302,7 @@ fn revocation_checks(
     restored: bool,
     worker: &str,
     bound: Duration,
-    follower_closed: bool,
+    second_closed: bool,
     bearer_status: u16,
 ) -> Vec<Check> {
     let (refused, closed, cut) = observed;
@@ -310,51 +310,102 @@ fn revocation_checks(
         Check::passed(INITIAL_LOGIN),
         Check::passed(STREAM_OPEN),
         Check::expect(LOGIN_REFUSED, refused, || {
-            format!("B did not refuse a fresh login within {bound:?}")
+            format!("leader did not refuse a fresh login within {bound:?}")
         }),
         Check::expect(STREAM_CLOSED, closed, || {
-            format!("B's stream did not close as revoked within {bound:?}")
+            format!("leader's stream did not close as revoked within {bound:?}")
         }),
         Check::expect(WORKER_CUT, cut, || {
             format!("worker {worker} remained registered past {bound:?}")
         }),
         Check::expect(RESTORED, restored, || {
-            format!("A did not issue a credential within {bound:?} of restoration")
+            format!("new leader did not issue a credential within {bound:?} of restoration")
         }),
         Check::expect(BEARER_REFUSED, matches!(bearer_status, 401 | 403), || {
             format!("existing bearer answered {bearer_status} after revocation")
         }),
-        Check::expect(FOLLOWER_STREAM_CLOSED, follower_closed, || {
-            format!("follower stream did not close as revoked within {bound:?}")
+        Check::expect(SECOND_STREAM_CLOSED, second_closed, || {
+            format!("second leader stream did not close as revoked within {bound:?}")
         }),
     ]
 }
 
-fn cross_inputs(
+fn leader_inputs(
     cluster: &Cluster<'_>,
-    a: &gang_types::Url,
-    b: &gang_types::Url,
+    endpoint: &gang_types::Url,
     credentials: &crate::identity::Credentials,
     cookie: &crate::session::SessionCookie,
 ) -> Result<(crate::state_api::StateStream, StateApi)> {
     let timeout = cluster.stack().settings().handshake_timeout;
-    let mut follower = StateApi::with_cookie(a, credentials.authority.as_deref(), cookie, timeout)?
-        .open_stream()?;
-    if follower.status() != STREAM_OK || follower.next_event_within(timeout)?.is_none() {
+    let mut second =
+        StateApi::with_cookie(endpoint, credentials.authority.as_deref(), cookie, timeout)?
+            .open_stream()?;
+    if second.status() != STREAM_OK || second.next_event_within(timeout)?.is_none() {
         return Err(E2eError::system(
-            "follower stream did not open before revocation",
+            "second leader stream did not open before revocation",
         ));
     }
-    let bearer = StateApi::with_bearer(b, credentials, timeout)?;
+    let bearer = StateApi::with_bearer(endpoint, credentials, timeout)?;
     if bearer.status(gang_wire::routes::GET_STATE.template)? != 200 {
         return Err(E2eError::system(
             "existing bearer was refused before revocation",
         ));
     }
-    Ok((follower, bearer))
+    Ok((second, bearer))
 }
 
-/// Revokes through A and observes B and the leader, then restores through B and observes A.
+fn restore_after_handoff(
+    cluster: &Cluster<'_>,
+    issuer: &TestIssuer,
+    leader: usize,
+    principal_cli: &GangCli,
+    credentials: &crate::identity::Credentials,
+    pin: &gang_types::CaPin,
+    (bound, pace): (Duration, Duration),
+) -> Result<(u16, bool, bool)> {
+    let stack = cluster.stack();
+    cluster.retire(leader)?;
+    let next = cluster.wait_for_leader_except(Some(leader))?;
+    cluster.wait_for_single_leader(next)?;
+    let next_endpoint = cluster.direct_endpoint(next);
+    let bearer_status = StateApi::with_bearer(
+        &next_endpoint,
+        credentials,
+        stack.settings().handshake_timeout,
+    )?
+    .status(gang_wire::routes::GET_STATE.template)?;
+    let persisted_refusal = issue_until(
+        cluster,
+        issuer,
+        principal_cli,
+        &next_endpoint,
+        Instant::now() + bound,
+        false,
+        pace,
+    )?;
+    let admin_next = Administrator::new(
+        cli(cluster, "cross-admin-next")?,
+        issuer,
+        next_endpoint.clone(),
+        stack.placement().workspace(),
+        stack.settings().command_timeout,
+    );
+    admin_next.enroll(pin)?;
+    let restored_deadline = Instant::now() + bound;
+    admin_next.restore(pin, &credentials.principal)?;
+    let restored = issue_until(
+        cluster,
+        issuer,
+        principal_cli,
+        &next_endpoint,
+        restored_deadline,
+        true,
+        pace,
+    )?;
+    Ok((bearer_status, persisted_refusal, restored))
+}
+
+/// Revokes on the leader, then verifies and restores on its successor.
 ///
 /// # Errors
 /// Returns an error when the cluster, clients or observations cannot be operated.
@@ -365,32 +416,23 @@ pub fn cross_revocation(cluster: &Cluster<'_>, issuer: &TestIssuer) -> Result<Ve
         .saturating_add(REFRESH_MARGIN)
         .saturating_add(pace);
     let leader = cluster.wait_for_leader()?;
-    let a = cluster.direct_endpoint(usize::from(leader == 0));
-    let b = cluster.direct_endpoint(leader);
+    let endpoint = cluster.direct_endpoint(leader);
     let administrator_cli = cli(cluster, "cross-admin-a")?;
     let admin_a = Administrator::new(
         administrator_cli.clone(),
         issuer,
-        a.clone(),
-        stack.placement().workspace(),
-        stack.settings().command_timeout,
-    );
-    let admin_b = Administrator::new(
-        cli(cluster, "cross-admin-b")?,
-        issuer,
-        b.clone(),
+        endpoint.clone(),
         stack.placement().workspace(),
         stack.settings().command_timeout,
     );
     let pin = stack.ca_pin()?;
     admin_a.enroll(&pin)?;
-    admin_b.enroll(&pin)?;
     let principal_cli = cli(cluster, "cross-principal")?;
     let initial = log_in(
         &principal_cli,
         issuer,
         &TokenSpec::admitted(CROSS_REVOCATION_SUBJECT),
-        &b,
+        &endpoint,
         &pin,
         &stack.placement().workspace(),
         stack.settings().command_timeout,
@@ -404,7 +446,7 @@ pub fn cross_revocation(cluster: &Cluster<'_>, issuer: &TestIssuer) -> Result<Ve
     };
     let cookie = stack.session_cookie(&credentials.principal)?;
     let api = StateApi::with_cookie(
-        &b,
+        &endpoint,
         credentials.authority.as_deref(),
         &cookie,
         stack.settings().handshake_timeout,
@@ -425,37 +467,46 @@ pub fn cross_revocation(cluster: &Cluster<'_>, issuer: &TestIssuer) -> Result<Ve
             Check::failed(STREAM_OPEN, "stream ended before revocation"),
         ]);
     }
-    let (mut follower_stream, bearer) = cross_inputs(cluster, &a, &b, &credentials, &cookie)?;
+    let (mut second_stream, bearer) = leader_inputs(cluster, &endpoint, &credentials, &cookie)?;
     let (worker, worker_deadline) = revoke_worker(cluster, &administrator_cli, bound)?;
     let principal_deadline = Instant::now() + bound;
     admin_a.revoke(&pin, &credentials.principal)?;
-    let (observed, follower_closed) = observe_revocation(
+    let (observed, second_closed) = observe_revocation(
         cluster,
         issuer,
         &principal_cli,
-        &b,
-        (&mut stream, &mut follower_stream),
+        &endpoint,
+        (&mut stream, &mut second_stream),
         &worker,
         (principal_deadline, worker_deadline, pace),
     )?;
-    let bearer_status = bearer.status(gang_wire::routes::GET_STATE.template)?;
-    let restored_deadline = Instant::now() + bound;
-    admin_b.restore(&pin, &credentials.principal)?;
-    let restored = issue_until(
+    let original_bearer_status = bearer.status(gang_wire::routes::GET_STATE.template)?;
+    let (bearer_status, persisted_refusal, restored) = restore_after_handoff(
         cluster,
         issuer,
+        leader,
         &principal_cli,
-        &a,
-        restored_deadline,
-        true,
-        pace,
+        &credentials,
+        &pin,
+        (bound, pace),
     )?;
-    Ok(revocation_checks(
+    let mut checks = revocation_checks(
         observed,
         restored,
         &worker,
         bound,
-        follower_closed,
+        second_closed,
         bearer_status,
-    ))
+    );
+    checks.push(Check::expect(
+        "cross-revocation: original leader refuses revoked bearer",
+        matches!(original_bearer_status, 401 | 403),
+        || format!("original leader answered {original_bearer_status} after revocation"),
+    ));
+    checks.push(Check::expect(
+        "cross-revocation: new leader refuses revoked login",
+        persisted_refusal,
+        || "new leader issued a revoked principal's credential".to_owned(),
+    ));
+    Ok(checks)
 }

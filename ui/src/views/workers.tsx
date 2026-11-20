@@ -2,18 +2,18 @@
 // instances without a worker sit under their fleet as counts.
 import { useState } from "preact/hooks";
 import { idOf, ms, type UnixMs } from "../wire-parse.ts";
-import type { Fleet, Instance, Phase, State, Worker } from "../wire.ts";
+import type { Fleet, InfrastructureStatus, Instance, Phase, State, Worker } from "../wire.ts";
 import { windowMs } from "../recent.ts";
 import { sum, workerInstance } from "../format.ts";
-import { Cell, Clock, Disclosure, Duration, Empty, FleetFilter, Ident, Row, SectionHead, Since, Table, Target, useClient, useNowStep } from "../ui.tsx";
+import { Cell, Clock, Disclosure, Duration, Empty, FleetFilter, Ident, Row, Section, Since, Table, Target, useClient, useNowStep } from "../ui.tsx";
 import { AsOf } from "./actions.tsx";
-import { fleetCounts, fleetTotals, STATE_NAME, StaticCell, Tally, type Counted } from "./fleet.tsx";
+import { fleetCounts, fleetTotals, STATE_NAME, StaticCell, Tally, unhostedInstances, type Counted, type FleetCensus } from "./fleet.tsx";
 
 /** The instances without a worker are listed under their fleet. */
-const GHOSTED: Record<Counted, boolean> = { busy: false, idle: false, draining: false, unconnected: true, pending: true, terminating: true, warm: false };
+const GHOSTED: Record<Counted, boolean> = { busy: false, idle: false, draining: false, unconnected: true, pending: true, terminating: true, replacing: false, replacement: false, unknown: true, warm: false };
 
 /** The toolbar tallies workers by phase, and the instances that have none yet. */
-const TALLIED: Record<Counted, boolean> = { busy: true, idle: true, draining: true, unconnected: true, pending: true, terminating: false, warm: false };
+const TALLIED: Record<Counted, boolean> = { busy: true, idle: true, draining: true, unconnected: true, pending: true, terminating: false, replacing: true, replacement: true, unknown: true, warm: false };
 
 /** Lanes move at this resolution, so rows do not re-render every second. */
 const LANE_STEP_MS = 10 * 1000;
@@ -74,6 +74,13 @@ const Pips = ({ w }: { w: Worker }) => (
   </span>
 );
 
+const Infrastructure = ({ status }: { status: InfrastructureStatus }) => (
+  <span>
+    {status.phase.toLowerCase()} · {status.reason.toLowerCase().replaceAll("_", " ")}
+    {status.otherInstance && <> · {status.phase === "REPLACING" ? "replacement" : "replacing"} {idOf(status.otherInstance)}</>}
+  </span>
+);
+
 export const WorkerDetail = ({ w, state }: { w: Worker; state: State }) => {
   const client = useClient();
   const acts = state.actions?.running.filter((a) => a.worker === w.name) ?? [];
@@ -100,6 +107,7 @@ export const WorkerDetail = ({ w, state }: { w: Worker; state: State }) => {
         <dd class="mono">
           {w.running}/{w.slots ?? "?"}
         </dd>
+        {w.infrastructure && <><dt>infrastructure</dt><dd><Infrastructure status={w.infrastructure} /></dd></>}
       </dl>
       {segments.length > 0 && (
         <ol class="phases" aria-label="Phase history">
@@ -161,6 +169,7 @@ const WorkerRow = ({ w, state, now }: { w: Worker; state: State; now: UnixMs }) 
               <span class="phase__since">
                 <Since t={ms(w.phaseTime)} />
               </span>
+              {w.infrastructure && <> · <Infrastructure status={w.infrastructure} /></>}
               {w.paused && <span class="paused">paused</span>}
             </span>
             <Pips w={w} />
@@ -187,12 +196,22 @@ const Ghost = ({ state, n, overdue }: { state: Counted; n: number; overdue: numb
   </div>
 );
 
-const ghosts = (f: Fleet, instances: readonly Instance[]) => {
-  const overdue = instances.filter((i) => i.fleet === f.name && i.pastBootGrace).length;
-  return fleetCounts(f)
+const ghosts = (f: Fleet, census: FleetCensus) => {
+  const instances = unhostedInstances(f, census).filter((i) => !i.infrastructure);
+  const overdue = instances.filter((i) => i.lifecycle === "IN_SERVICE" && i.pastBootGrace).length;
+  return fleetCounts(f, { workers: [], instances })
     .filter(([state, n]) => n > 0 && GHOSTED[state])
     .map(([state, n]) => ({ state, n, overdue: state === "unconnected" ? overdue : 0 }));
 };
+
+const InfrastructureInstance = ({ instance }: { instance: Instance }) => (
+  <div class="wghost">
+    <span><Ident text={idOf(instance.name)} /> · {instance.lifecycle.toLowerCase().replaceAll("_", " ")}</span>
+    <span>{instance.infrastructure && <Infrastructure status={instance.infrastructure} />}</span>
+    <span />
+    <span class="wghost__lane" aria-hidden="true" />
+  </div>
+);
 
 export const Workers = () => {
   const client = useClient();
@@ -204,7 +223,7 @@ export const Workers = () => {
   const window = windowMs(state.recent);
   const ws = state.workers;
   const pending = sum(state.fleets, (f) => f.instances.pending);
-  if (ws.length === 0) {
+  if (ws.length === 0 && state.instances.length === 0) {
     return (
       <Empty>
         <h2>{pending ? `No workers yet · ${pending} booting` : "No workers"}</h2>
@@ -215,7 +234,7 @@ export const Workers = () => {
     <>
       <div class="toolbar">
         <FleetFilter id="wfleet" fleets={state.fleets} value={fleet} onChange={setFleet} count={(f) => ws.filter((w) => w.fleet === f.name).length} />
-        <Tally items={fleetTotals(state.fleets).filter(([s]) => TALLIED[s])} />
+        <Tally items={fleetTotals(state.fleets, state).filter(([s]) => TALLIED[s])} />
       </div>
       <div class="wgrid">
         <div class="wgrid__axis" aria-hidden="true">
@@ -231,18 +250,19 @@ export const Workers = () => {
         </div>
         {state.fleets.map((f) => {
           const rows = ws.filter((w) => w.fleet === f.name);
-          const gs = ghosts(f, state.instances);
-          if (rows.length === 0 && gs.length === 0) return null;
+          const gs = ghosts(f, state);
+          const marked = unhostedInstances(f, state).filter((i) => i.infrastructure);
+          if (rows.length === 0 && gs.length === 0 && marked.length === 0) return null;
           return (
-            <section key={f.name} class="wgroup" aria-labelledby={`wg-${idOf(f.name)}`} hidden={fleet !== "" && fleet !== f.name}>
-              <SectionHead id={`wg-${idOf(f.name)}`} title={idOf(f.name)} count={rows.length} mono />
+            <Section key={f.name} id={`wg-${idOf(f.name)}`} title={idOf(f.name)} count={rows.length} mono variant="plain" cls="wgroup" hidden={fleet !== "" && fleet !== f.name}>
               {rows.map((w) => (
                 <WorkerRow key={w.name} w={w} state={state} now={now} />
               ))}
               {gs.map((g) => (
                 <Ghost key={g.state} {...g} />
               ))}
-            </section>
+              {marked.map((instance) => <InfrastructureInstance key={instance.name} instance={instance} />)}
+            </Section>
           );
         })}
       </div>

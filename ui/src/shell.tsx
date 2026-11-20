@@ -7,7 +7,7 @@ import { identityOf, ms, splitIdentity } from "./wire-parse.ts";
 import { PATHS } from "./wire.ts";
 import { humanize } from "./format.ts";
 import { actionsStale } from "./store.ts";
-import { Brand, Clock, Ident, Since, Until, useClient, useTitle } from "./ui.tsx";
+import { Brand, Clock, Ident, PageGrid, Since, Until, useClient, useTitle } from "./ui.tsx";
 import { SCREENS, type Screen } from "./routes.ts";
 
 type Level = "normal" | "live" | "caution" | "warning";
@@ -223,7 +223,7 @@ export const Shell = ({ screen, children }: { screen: Screen; children: Componen
       <Banner />
       <main id="main" class="main shell" tabIndex={-1} data-fresh={frozen ? "frozen" : undefined}>
         <h1 class="visually-hidden">{label}</h1>
-        {children}
+        <PageGrid>{children}</PageGrid>
       </main>
       <nav class="tabbar" aria-label="Screens">
         <NavLinks current={screen} keys={false} />

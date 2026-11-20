@@ -1,4 +1,8 @@
 mock_provider "aws" {
+  mock_data "aws_network_interface" {
+    defaults = { private_ips = ["10.20.2.10", "10.20.2.11"] }
+  }
+
   mock_data "aws_partition" {
     defaults = {
       partition = "aws"
@@ -66,8 +70,9 @@ mock_provider "aws" {
 
   mock_resource "aws_lb" {
     defaults = {
-      arn      = "arn:aws:elasticloadbalancing:eu-north-1:000000000000:loadbalancer/net/gang/0000000000000000"
-      dns_name = "gang-0000000000.elb.eu-north-1.amazonaws.com"
+      arn        = "arn:aws:elasticloadbalancing:eu-north-1:000000000000:loadbalancer/net/gang/0000000000000000"
+      arn_suffix = "net/gang/0000000000000000"
+      dns_name   = "gang-0000000000.elb.eu-north-1.amazonaws.com"
     }
   }
 
@@ -179,7 +184,7 @@ variables {
 }
 
 run "dynamodb_group_shape" {
-  command = plan
+  command = apply
 
   variables {
     database         = { engine = "dynamodb" }
@@ -200,13 +205,27 @@ run "dynamodb_group_shape" {
   }
 
   assert {
+    condition     = can(regex("(?s)\\[server\\.http2\\][^\\[]*shutdown_grace = \"300s\"", output.gang_toml))
+    error_message = "The group must configure shutdown_grace in [server.http2]."
+  }
+
+  assert {
     condition     = strcontains(output.gang_toml, "health_listen = \"0.0.0.0:${module.network.health_port}\"") && module.load_balancer[0].health_port == module.network.health_port
     error_message = "The group must use the network health port in its server listener and load balancer."
   }
+  assert {
+    condition     = strcontains(output.gang_toml, "standby_routability_delay = \"${local.health.interval_seconds * local.health.threshold}s\"") && strcontains(output.gang_toml, "[server.leadership]\nrenew_interval = \"${local.health.renew_interval_seconds}s\"\ncall_timeout = \"${local.health.call_timeout_seconds}s\"")
+    error_message = "A shared deployment must use the health window and the refresh policy's renewal interval and call timeout."
+  }
+
 
   assert {
     condition     = module.storage.dynamodb_table_name == "gang-state" && output.controller_public_ip == null
     error_message = "The group must use its deployment-named table without a controller Elastic IP."
+  }
+  assert {
+    condition     = strcontains(output.gang_toml, "[server.proxy_protocol]\npublic = \"accept\"\nworker = \"accept\"\nhealth = \"accept\"\ntrusted_cidrs = [\"10.20.2.10/32\",\"10.20.2.11/32\"]") && !strcontains(output.gang_toml, "10.20.0.0/16")
+    error_message = "DynamoDB must render accept mode and exact NLB interface addresses."
   }
 }
 

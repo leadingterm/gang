@@ -1,12 +1,51 @@
 use std::borrow::Borrow;
 use std::hash::{Hash, Hasher};
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use gang_clock::Timestamp;
+use gang_config::HistoryWindow;
 use lru::LruCache;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, PartialEq, Eq)]
+use crate::history::history_id;
+use gang_spi::{LearnedHistory, PortError, RecordKey, RecordKind};
+
+const FORMAT_VERSION: u32 = 1;
+const SAMPLER_GENERATION: u32 = nativelink_scheduler::resource_sketch::SAMPLER_GENERATION;
+
+#[derive(Serialize, Deserialize)]
+struct StoredDuration {
+    version: u32,
+    sampler_generation: u32,
+    window_ms: u64,
+    key: Key,
+    entry: Entry,
+}
+
+#[derive(Serialize)]
+struct StoredDurationRef<'a> {
+    version: u32,
+    sampler_generation: u32,
+    window_ms: u64,
+    key: &'a Key,
+    entry: &'a Entry,
+}
+
+impl Key {
+    fn record_key(&self) -> RecordKey {
+        let id = match self {
+            Self::Target { mnemonic, target } => history_id(0, &[mnemonic, target]),
+            Self::Mnemonic(mnemonic) => history_id(1, &[mnemonic]),
+        };
+        RecordKey {
+            kind: RecordKind::DurationHistory,
+            id,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Key {
     Target { mnemonic: String, target: String },
     Mnemonic(String),
@@ -77,7 +116,7 @@ impl ToOwned for dyn KeyView + '_ {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
 struct Half {
     sum_ms: u64,
     count: u32,
@@ -94,10 +133,12 @@ impl Half {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 struct Entry {
     period: u64,
     current: Half,
     previous: Half,
+    last_seen_ms: u64,
 }
 
 impl Entry {
@@ -106,6 +147,7 @@ impl Entry {
             period,
             current: Half::default(),
             previous: Half::default(),
+            last_seen_ms: 0,
         }
     }
 
@@ -137,9 +179,10 @@ pub(crate) struct ActionDurations {
 }
 
 impl ActionDurations {
-    pub(crate) fn new(keys: NonZeroUsize, window_days: NonZeroU32) -> Self {
+    pub(crate) fn new(keys: NonZeroUsize, window: HistoryWindow) -> Self {
         Self {
-            half_window_ms: u64::from(window_days.get()) * 86_400_000 / 2,
+            // The whole-day window is bounded in nanoseconds by u64.
+            half_window_ms: window.get().as_secs() * 1_000 / 2,
             entries: LruCache::new(keys),
         }
     }
@@ -150,17 +193,28 @@ impl ActionDurations {
         }
         let period = now.as_unix_millis() / self.half_window_ms;
         if !target.is_empty() {
-            self.record_key(KeyParts::Target { mnemonic, target }, slot_ms, period);
+            self.record_key(
+                KeyParts::Target { mnemonic, target },
+                slot_ms,
+                period,
+                now.as_unix_millis(),
+            );
         }
-        self.record_key(KeyParts::Mnemonic(mnemonic), slot_ms, period);
+        self.record_key(
+            KeyParts::Mnemonic(mnemonic),
+            slot_ms,
+            period,
+            now.as_unix_millis(),
+        );
     }
 
-    fn record_key(&mut self, parts: KeyParts<'_>, slot_ms: u64, period: u64) {
+    fn record_key(&mut self, parts: KeyParts<'_>, slot_ms: u64, period: u64, now_ms: u64) {
         let query: &dyn KeyView = &parts;
         let entry = self
             .entries
             .get_or_insert_mut_ref(query, || Entry::new(period));
         entry.settle(period);
+        entry.last_seen_ms = now_ms;
         entry.current.record(slot_ms);
     }
 
@@ -188,6 +242,68 @@ impl ActionDurations {
         entry.settle(period);
         entry.expected()
     }
+
+    pub(crate) fn snapshot(
+        &self,
+        now: Timestamp,
+        into: &mut Vec<LearnedHistory>,
+    ) -> Result<(), PortError> {
+        let window_ms = self.half_window_ms * 2;
+        for (key, entry) in self.entries.iter().rev() {
+            let expires = entry.last_seen_ms.saturating_add(window_ms);
+            let mut settled = entry.clone();
+            settled.settle(now.as_unix_millis() / self.half_window_ms);
+            if expires <= now.as_unix_millis() || settled.expected().is_none() {
+                continue;
+            }
+            let stored = StoredDurationRef {
+                version: FORMAT_VERSION,
+                sampler_generation: SAMPLER_GENERATION,
+                window_ms,
+                key,
+                entry,
+            };
+            let body = serde_json::to_vec(&stored).map_err(PortError::backend)?;
+            into.push(LearnedHistory {
+                key: key.record_key(),
+                body,
+                expires_at: Timestamp::from_unix_millis(expires),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn restore(&mut self, now: Timestamp, records: &[LearnedHistory]) {
+        self.entries.clear();
+        let window_ms = self.half_window_ms * 2;
+        let mut entries = Vec::new();
+        for record in records {
+            if record.key.kind != RecordKind::DurationHistory || record.expires_at <= now {
+                continue;
+            }
+            let Ok(stored) = serde_json::from_slice::<StoredDuration>(&record.body) else {
+                continue;
+            };
+            if stored.version != FORMAT_VERSION
+                || stored.sampler_generation != SAMPLER_GENERATION
+                || stored.window_ms != window_ms
+                || stored.key.record_key() != record.key
+                || stored.entry.last_seen_ms.saturating_add(window_ms)
+                    != record.expires_at.as_unix_millis()
+            {
+                continue;
+            }
+            let mut settled = stored.entry.clone();
+            settled.settle(now.as_unix_millis() / self.half_window_ms);
+            if settled.expected().is_some() {
+                entries.push(stored);
+            }
+        }
+        entries.sort_by_key(|stored| stored.entry.last_seen_ms);
+        for stored in entries {
+            self.entries.put(stored.key, stored.entry);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -200,12 +316,47 @@ mod tests {
     fn history(capacity: usize) -> ActionDurations {
         ActionDurations::new(
             NonZeroUsize::new(capacity).expect("nonzero capacity"),
-            NonZeroU32::new(1).expect("nonzero window"),
+            HistoryWindow::from_units(1),
         )
     }
 
     fn at(ms: u64) -> Timestamp {
         Timestamp::from_unix_millis(ms)
+    }
+
+    #[test]
+    fn persisted_durations_keep_age_caps_and_compatible_configuration() {
+        let mut source = history(2);
+        source.record("", "old", 10, at(1));
+        source.record("", "new", 20, at(2));
+        let mut records = Vec::new();
+        source.snapshot(at(3), &mut records).unwrap();
+        let mut later = Vec::new();
+        source.snapshot(at(4), &mut later).unwrap();
+        assert_eq!(records, later);
+
+        let mut restored = history(1);
+        let mut reverse_order = records.clone();
+        reverse_order.reverse();
+        restored.restore(at(3), &reverse_order);
+        assert_eq!(restored.expected("", "old", at(3)), None);
+        assert_eq!(
+            restored.expected("", "new", at(3)),
+            Some(Duration::from_millis(20))
+        );
+        restored.restore(at(2 + 2 * HALF_DAY), &records);
+        assert_eq!(restored.expected("", "new", at(2 + 2 * HALF_DAY)), None);
+
+        let mut incompatible =
+            ActionDurations::new(NonZeroUsize::MIN, HistoryWindow::from_units(2));
+        incompatible.restore(at(3), &records);
+        assert_eq!(incompatible.expected("", "new", at(3)), None);
+        let mut corrupt = records.clone();
+        let mut body: serde_json::Value = serde_json::from_slice(&corrupt[1].body).unwrap();
+        body["sampler_generation"] = serde_json::json!(999);
+        corrupt[1].body = serde_json::to_vec(&body).unwrap();
+        restored.restore(at(3), &corrupt);
+        assert_eq!(restored.expected("", "new", at(3)), None);
     }
 
     #[test]
@@ -291,6 +442,20 @@ mod tests {
             Some(Duration::from_millis(30))
         );
         assert_eq!(h.expected("a", "m", at(3 * HALF_DAY)), None);
+    }
+
+    #[test]
+    fn configured_window_controls_expiry() {
+        let mut h = ActionDurations::new(
+            NonZeroUsize::new(5).expect("nonzero capacity"),
+            gang_config::HistoryWindow::from_units(3),
+        );
+        h.record("a", "m", 17, at(0));
+        assert_eq!(
+            h.expected("a", "m", at(3 * HALF_DAY)),
+            Some(Duration::from_millis(17))
+        );
+        assert_eq!(h.expected("a", "m", at(6 * HALF_DAY)), None);
     }
 
     #[test]

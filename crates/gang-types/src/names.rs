@@ -48,10 +48,6 @@ fn is_free_text_char(character: char) -> bool {
     !character.is_control()
 }
 
-fn is_scheduler_name_char(character: char) -> bool {
-    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
-}
-
 macro_rules! define_name {
     ($(#[$meta:meta])* $name:ident, $kind:literal, $allowed:path) => {
         define_name!($(#[$meta])* $name, $kind, $allowed, None, false);
@@ -126,17 +122,6 @@ impl RoleName {
     /// The role that grants every permission when the server is configured without
     /// authentication.
     pub const ADMINISTRATOR: Self = Self(Cow::Borrowed("administrator"));
-}
-
-/// Longest allowed scheduler name, in characters.
-const SCHEDULER_NAME_MAX_LENGTH: usize = 64;
-
-define_name! {
-    /// Name of a scheduler instance; allowed characters and maximum length.
-    ///
-    /// Allowed characters: `A-Z`, `a-z`, `0-9`, `-` and `_`. Hyphens and underscores are allowed
-    /// at either edge. At most 64 characters.
-    SchedulerName, "scheduler name", is_scheduler_name_char, Some(SCHEDULER_NAME_MAX_LENGTH)
 }
 
 /// Longest allowed audience, in characters.
@@ -416,41 +401,6 @@ mod tests {
             Err(NameError::InvalidCharacter {
                 kind: "role name",
                 character: 'A',
-            })
-        );
-    }
-
-    #[test]
-    fn scheduler_name_accepts_identifiers_and_rejects_bad_input() {
-        assert!(SchedulerName::try_new("a").is_ok());
-        assert!(SchedulerName::try_new("Sched_1-x").is_ok());
-        assert!(SchedulerName::try_new("-edge_").is_ok());
-        assert_eq!(
-            SchedulerName::try_new(""),
-            Err(NameError::Empty {
-                kind: "scheduler name"
-            })
-        );
-        assert_eq!(
-            SchedulerName::try_new("a b"),
-            Err(NameError::InvalidCharacter {
-                kind: "scheduler name",
-                character: ' ',
-            })
-        );
-        assert_eq!(
-            SchedulerName::try_new("a.b"),
-            Err(NameError::InvalidCharacter {
-                kind: "scheduler name",
-                character: '.',
-            })
-        );
-        assert!(SchedulerName::try_new("a".repeat(64)).is_ok());
-        assert_eq!(
-            SchedulerName::try_new("a".repeat(65)),
-            Err(NameError::TooLong {
-                kind: "scheduler name",
-                max: 64,
             })
         );
     }

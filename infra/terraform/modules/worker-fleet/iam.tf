@@ -52,6 +52,6 @@ module "instance_role" {
   iam_name_prefix              = var.iam_name_prefix
   iam_permissions_boundary_arn = var.iam_permissions_boundary_arn
   tags                         = var.tags
-  readable_parameter_arns      = [var.config_parameter_arn]
+  readable_parameter_arns      = var.config_parameter_arns
   policy_json                  = data.aws_iam_policy_document.worker.json
 }

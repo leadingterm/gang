@@ -3,7 +3,8 @@
 //! Bazel starts the binary in the runfiles workspace. It reads `OPENTOFU_TOFU` and
 //! `OPENTOFU_PROVIDER_MIRROR` (made absolute against the current directory), and
 //! `OPENTOFU_ROOT` (relative to the sources directory) and `OPENTOFU_TEST_FILE` (relative to the
-//! root). The current directory holds the `infra/` tree. The work directory is a fresh directory
+//! root). The current directory holds the `infra/` tree. `OPENTOFU_TEST_EXPECTATIONS`, when set,
+//! names a JSON runfile resolved against that directory. The work directory is a fresh directory
 //! under `TEST_TMPDIR`, removed when the run ends.
 
 use std::env;
@@ -24,6 +25,26 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
+    let args: Vec<_> = env::args_os().skip(1).collect();
+    if !args.is_empty() {
+        if args.len() != 11
+            || args[0] != "--upgrade-fixture"
+            || args[1] != "--source-root"
+            || args[3] != "--test-file"
+            || args[5] != "--tofu"
+            || args[7] != "--provider-mirror"
+            || args[9] != "--output"
+        {
+            return Err("expected --upgrade-fixture --source-root ROOT --test-file FILE --tofu TF --provider-mirror MIRROR --output OUT".into());
+        }
+        return opentofu_runner::upgrade_fixture(
+            args[2].as_os_str().as_ref(),
+            args[4].as_os_str().as_ref(),
+            args[6].as_os_str().as_ref(),
+            args[8].as_os_str().as_ref(),
+            args[10].as_os_str().as_ref(),
+        );
+    }
     let cwd = env::current_dir()?;
     let contract = Contract {
         tofu: cwd.join(required("OPENTOFU_TOFU")?),
@@ -31,6 +52,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         sources: cwd.clone(),
         root: required("OPENTOFU_ROOT")?.into(),
         test_file: required("OPENTOFU_TEST_FILE")?.into(),
+        test_expectations: env::var_os("OPENTOFU_TEST_EXPECTATIONS").map(|path| cwd.join(path)),
     };
 
     let work = tempfile::TempDir::new_in(required("TEST_TMPDIR")?)?;

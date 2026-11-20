@@ -63,6 +63,9 @@ struct Scratch {
     launches: Vec<Option<Timestamp>>,
     /// Indices of sampled running actions, ordered by encoded action name.
     running_order: Vec<usize>,
+    status_order: Vec<usize>,
+    status_name: String,
+    instance_name: String,
 }
 
 impl Builder {
@@ -152,6 +155,13 @@ impl Builder {
                     self.config.history_window,
                 );
                 fill_fleets(cur, inputs.fleets, inputs.catalog);
+                fill_infrastructure(
+                    cur,
+                    inputs.fleets,
+                    inputs.infrastructure,
+                    self.config.events_limit,
+                    &mut self.scratch,
+                );
                 fill_queue(cur, inputs.fleets, snapshot);
                 let (traffic, evicted) = self.cache_increase(cur, snapshot, inputs.traffic);
                 let completed = snapshot
@@ -182,12 +192,7 @@ impl Builder {
             PassStatus::Skipped(reason) => {
                 self.skipped = self.skipped.saturating_add(1);
                 cur.pass = Pass::skipped(interval, reason.clone(), self.last_ok, self.skipped);
-                copy_if_changed(&mut cur.fleets, &prev.fleets);
-                copy_if_changed(&mut cur.workers, &prev.workers);
-                copy_if_changed(&mut cur.instances, &prev.instances);
-                copy_if_changed(&mut cur.queue, &prev.queue);
-                cur.cache.stores.clone_from(&prev.cache.stores);
-                cur.completed = prev.completed;
+                copy_skipped_state(cur, prev);
                 cur.recent.sample_at(inputs.wall, |sample| {
                     sample.skipped = sample.skipped.saturating_add(1);
                 });
@@ -248,9 +253,129 @@ impl Builder {
     }
 }
 
+/// Projects live operational observations without changing physical fleet counts.
+fn fill_infrastructure(
+    cur: &mut State,
+    fleets: &[FleetPass],
+    records: &[gang_spi::FleetInfrastructureEvent],
+    limit: usize,
+    scratch: &mut Scratch,
+) {
+    scratch.status_order.clear();
+    scratch.status_order.extend(0..records.len());
+    scratch.status_order.sort_unstable_by(|&a, &b| {
+        records[a].event.at.cmp(&records[b].event.at).then_with(|| {
+            name::cmp_of::<name::AwsEvents>(&records[a].event.id, &records[b].event.id)
+        })
+    });
+    let start = scratch.status_order.len().saturating_sub(limit);
+    let selected = &scratch.status_order[start..];
+    for (index, &source) in selected.iter().enumerate() {
+        let record = &records[source];
+        let pass = fleets.iter().find(|pass| pass.policy.name == record.fleet);
+        if let Some(offset) = cur.status_events.iter().skip(index).position(|event| {
+            matches!(&event.change, gang_wire::EventChange::Aws { event } if event.id == record.event.id)
+        }) {
+            cur.status_events.swap(index, index + offset);
+        }
+        if let Some(existing) = cur.status_events.get_mut(index) {
+            if !crate::infrastructure::status_event_matches(
+                existing,
+                record,
+                pass,
+                records,
+                &mut scratch.status_name,
+            ) {
+                *existing = crate::infrastructure::status_event(record, pass, records);
+            }
+        } else {
+            cur.status_events
+                .push(crate::infrastructure::status_event(record, pass, records));
+        }
+    }
+    cur.status_events.truncate(selected.len());
+    for (pass, fleet) in fleets.iter().zip(&cur.fleets) {
+        for worker in cur
+            .workers
+            .iter_mut()
+            .filter(|worker| worker.fleet == fleet.name)
+        {
+            let member = pass.supply.instances.iter().find(|instance| {
+                name::write_of::<name::Instances>(&mut scratch.instance_name, &instance.id);
+                worker.instance == scratch.instance_name
+            });
+            let status = member.and_then(|member| {
+                crate::infrastructure::member_status_ref(pass, records, &member.id)
+            });
+            update_infrastructure(&mut worker.infrastructure, status, &mut scratch.status_name);
+        }
+        for row in cur
+            .instances
+            .iter_mut()
+            .filter(|row| row.fleet == fleet.name)
+        {
+            let member = pass.supply.instances.iter().find(|instance| {
+                name::write_of::<name::Instances>(&mut scratch.instance_name, &instance.id);
+                row.name == scratch.instance_name
+            });
+            let status = member.and_then(|member| {
+                crate::infrastructure::member_status_ref(pass, records, &member.id)
+            });
+            update_infrastructure(&mut row.infrastructure, status, &mut scratch.status_name);
+        }
+    }
+    for worker in &mut cur.workers {
+        if !cur.fleets.iter().any(|fleet| fleet.name == worker.fleet) {
+            worker.infrastructure = None;
+        }
+    }
+}
+
+fn update_infrastructure(
+    slot: &mut Option<gang_wire::InfrastructureStatus>,
+    status: Option<crate::infrastructure::MemberStatus<'_>>,
+    scratch: &mut String,
+) {
+    let Some(status) = status else {
+        *slot = None;
+        return;
+    };
+    if let Some(other) = status.other {
+        name::write_of::<name::Instances>(scratch, other);
+    }
+    if let Some(existing) = slot {
+        existing.phase = status.phase;
+        existing.reason = status.reason;
+        if status.other.is_some() {
+            existing
+                .other_instance
+                .get_or_insert_with(String::new)
+                .clone_from(scratch);
+        } else {
+            existing.other_instance = None;
+        }
+    } else {
+        *slot = Some(gang_wire::InfrastructureStatus {
+            phase: status.phase,
+            reason: status.reason,
+            other_instance: status.other.map(|_| scratch.clone()),
+        });
+    }
+}
+
 /// A counter decrease indicates a restarted source.
 fn increase(total: u64, previous: u64) -> u64 {
     total.checked_sub(previous).unwrap_or(total)
+}
+
+fn copy_skipped_state(cur: &mut State, prev: &State) {
+    copy_if_changed(&mut cur.fleets, &prev.fleets);
+    copy_if_changed(&mut cur.workers, &prev.workers);
+    copy_if_changed(&mut cur.instances, &prev.instances);
+    copy_if_changed(&mut cur.status_events, &prev.status_events);
+    copy_if_changed(&mut cur.queue, &prev.queue);
+    cur.cache.stores.clone_from(&prev.cache.stores);
+    cur.completed = prev.completed;
 }
 
 // Derived row `clone_from` reallocates unchanged nested data.
@@ -480,7 +605,7 @@ fn fill_fleet(row: &mut Fleet, pass: &FleetPass, properties: &FleetProperties) {
         max_drain_wait: policy.max_drain_wait,
         boot_grace: policy.boot_grace,
     };
-    row.desired = pass.supply.desired;
+    row.desired = pass.supply.requested.unwrap_or(pass.supply.desired);
     if let Some(failure) = &pass.supply.launch_failure {
         row.launch_failure
             .get_or_insert_with(|| gang_wire::LaunchFailure {

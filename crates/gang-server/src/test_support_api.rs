@@ -42,6 +42,8 @@ pub struct ApiReply {
     pub status: StatusCode,
     /// HTTP headers returned by the server.
     pub headers: HeaderMap,
+    /// Whether the response refused a leader operation before dispatch.
+    pub leader_unavailable: bool,
     /// Fully collected response body.
     pub body: Bytes,
 }
@@ -150,6 +152,10 @@ pub async fn read(response: http::Response<ApiResponseBody>) -> ApiReply {
         .to_bytes();
     ApiReply {
         status: parts.status,
+        leader_unavailable: parts
+            .extensions
+            .get::<gang_spi::LeaderUnavailable>()
+            .is_some(),
         headers: parts.headers,
         body,
     }
@@ -302,7 +308,7 @@ pub fn request_parts(path: &str, bearer: Option<&AccessToken>) -> http::request:
 pub async fn admits(controller: &Controller, token: &AccessToken) -> bool {
     let mut parts = request_parts(GET_SERVER.template, Some(token));
     controller
-        .admit_public(&Peer::default(), &mut parts)
+        .admit_public(gang_spi::RequestScope::Shared, &Peer::default(), &mut parts)
         .await
         .expect("the public gate admits every request on the Gang API");
     matches!(Caller::of(&parts.extensions), Caller::Authenticated(_))
@@ -327,6 +333,7 @@ pub async fn mint_token(controller: &Controller, provider: &str, proof: &str) ->
     );
     let reply = read(controller.call_api(request).await).await;
     assert_eq!(reply.status, StatusCode::OK, "minting a token succeeds");
+    assert!(!reply.leader_unavailable, "minting is shared work");
     let response: AuthenticateResponse = reply.json();
     response.token
 }

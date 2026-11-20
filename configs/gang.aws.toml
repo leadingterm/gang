@@ -4,6 +4,7 @@ default_isa = "x86-64"
 listen = "0.0.0.0:443"
 health_listen = "0.0.0.0:8080"
 worker_listen = "0.0.0.0:9090"
+worker_endpoint = "grpcs://ip-10-20-0-10.eu-north-1.compute.internal:9090"
 endpoint = "https://gang.example.com"
 
 
@@ -62,10 +63,6 @@ bucket = "example-gang-cache"
 region = "eu-north-1"
 key_id = "alias/gang-ca"
 
-[scheduler.nativelink]
-worker_endpoint = "grpcs://ip-10-20-0-10.eu-north-1.compute.internal:9090"
-# NativeLink's controller and worker use this scheduler name.
-scheduler_name = "MAIN_SCHEDULER"
 
 [database.sqlite]
 # The controller keeps its state under this path.
@@ -83,6 +80,9 @@ permit_network_property = false
 [sandbox.bwrap.readonly_bind_mounts]
 "/bin" = "/etc/gang-action-tools/bin"
 "/usr/bin" = "/etc/gang-action-tools/bin"
+"/etc/ssl/certs/ca-certificates.crt" = "/etc/gang-action-ca.crt"
+"/etc/ssl/cert.pem" = "/etc/gang-action-ca.crt"
+"/etc/pki/tls/certs/ca-bundle.crt" = "/etc/gang-action-ca.crt"
 
 [limits.cgroup]
 

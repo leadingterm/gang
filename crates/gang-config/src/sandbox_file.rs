@@ -35,7 +35,7 @@ pub enum SandboxFileError {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, bound = "")]
 pub struct SandboxFile<P: PluginSet> {
-    /// `NativeLink`'s work directory root: each action gets a directory directly under it.
+    /// The worker's action work-directory root: each action gets a directory directly under it.
     pub work_directory: AbsolutePathBuf,
     /// The sandbox of the worker's fleet: the one every action runs in.
     pub selected: P::SandboxKey,

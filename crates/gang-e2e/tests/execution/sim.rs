@@ -11,9 +11,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use gang_e2e::{
-    BuildOutcome, COLD_START_MISFIT_MESSAGE, E2eError, Execution, ExecutionKnobs, FleetDisk,
-    Generations, Host, Limits, Probe, ProbeReport, Proc, Result, Role, Run, Sandbox, ScopeFacts,
-    ServerExit, Signalled, System, Variant,
+    AttemptRecord, BuildOutcome, COLD_START_MISFIT_MESSAGE, E2eError, Execution, ExecutionKnobs,
+    FleetDisk, Generations, Host, Limits, PressureObservation, Probe, ProbeReport, Proc, Result,
+    Role, Run, Sandbox, ScopeFacts, ServerExit, Signalled, System, Variant,
 };
 use gang_wire::{
     Event, EventChange, Frame, Instance, Lifecycle, Phase, State as WireState, Worker,
@@ -131,6 +131,25 @@ behaviour! {
             /// `ReadOnly`.
             ReadOnly,
         },
+        /// Which action environment check fails.
+        action_environment: ActionEnvironment {
+            /// All checks pass.
+            Healthy,
+            /// Identity lookup fails.
+            Identity,
+            /// NSS configuration is wrong.
+            Nss,
+            /// Unexpected files are visible.
+            Etc,
+            /// Identity or roots are writable.
+            Writable,
+            /// Native roots cannot load.
+            Roots,
+            /// Certificate overrides are ignored.
+            Override,
+            /// `PostgreSQL` cannot start.
+            Postgres,
+        },
         /// See [`ScopeReport`]. Whether the held action's scope is published.
         hold_scope: ScopeReport {
             /// `Published`.
@@ -159,13 +178,6 @@ behaviour! {
             Completes,
             /// `Fails`.
             Fails,
-        },
-        /// See [`OomKill`]. Whether the kernel kills an action past `memory.max`.
-        oom_kill: OomKill {
-            /// `Kernel`.
-            Kernel,
-            /// `Spared`.
-            Spared,
         },
         /// See [`OomScope`]. Whether the scope of an action killed for memory is removed.
         oom_scope: OomScope {
@@ -503,7 +515,7 @@ fn ok() -> BuildOutcome {
 
 impl ExecSim {
     /// A deployment of `variant` that behaves as `behaviour` says.
-    pub fn new(variant: Variant, behaviour: Behaviour) -> Self {
+    pub fn new(variant: &Variant, behaviour: Behaviour) -> Self {
         let scope_report = if behaviour.hold_scope == ScopeReport::Missing {
             support::ScopeReport::Missing
         } else {
@@ -739,10 +751,7 @@ impl ExecSim {
                     state.scopes.remove(Path::new(EXEC_SCOPE));
                 }
                 state.failing = behaviour.after_oom == AfterOom::Fails;
-                Step::Done(match behaviour.oom_kill {
-                    OomKill::Kernel => failed(probe, "(Exit 137)"),
-                    OomKill::Spared => ok(),
-                })
+                Step::Done(ok())
             }
             _ => self.finish(state, ok()),
         }
@@ -794,10 +803,25 @@ impl ExecSim {
             Workdir::Writable => "yes",
             Workdir::ReadOnly => "no",
         };
+        let verdict = |failure| {
+            if behaviour.action_environment == failure {
+                "no"
+            } else {
+                "yes"
+            }
+        };
+        let identity = verdict(ActionEnvironment::Identity);
+        let nss = verdict(ActionEnvironment::Nss);
+        let etc = verdict(ActionEnvironment::Etc);
+        let readonly = verdict(ActionEnvironment::Writable);
+        let roots = verdict(ActionEnvironment::Roots);
+        let root_override = verdict(ActionEnvironment::Override);
+        let postgres = verdict(ActionEnvironment::Postgres);
         format!(
             "env_names=PATH,E2E_OUT,GANG_NETWORK,{leaked}\ntmp_entries={entries}\n\
              tmp_fs={filesystem}\nmount:/nix/store={store}\nmount:/proc=other\n\
-             cwd_writable={writable}\n"
+             cwd_writable={writable}\nidentity={identity}\nnss={nss}\netc_contents={etc}\n\
+             identity_roots_readonly={readonly}\nroots={roots}\nroots_override={root_override}\npostgres={postgres}\n"
         )
     }
 }
@@ -848,6 +872,7 @@ impl System for ExecSim {
             lifecycle: Lifecycle::InService,
             launch_time: at,
             past_boot_grace: false,
+            infrastructure: None,
         };
         let first = WireState {
             instances: vec![instance(1)],
@@ -872,6 +897,7 @@ impl System for ExecSim {
                 paused: false,
                 launch_time: at,
                 phases: Vec::new(),
+                infrastructure: None,
             }];
         }
         let frames = vec![Frame::Snapshot(first), Frame::Snapshot(second)];
@@ -1092,8 +1118,26 @@ impl Limits for ExecSim {
         self.inner.cancel_hold()
     }
 
-    fn attempts(&self) -> Result<usize> {
-        Ok(self.state.lock().attempts)
+    fn attempt_records(&self) -> Result<Vec<AttemptRecord>> {
+        let mut memory_kb: u64 = 65_536;
+        Ok((0..self.state.lock().attempts)
+            .map(|_| {
+                let record = AttemptRecord {
+                    action: "memory_escalation".to_owned(),
+                    memory_kb,
+                };
+                memory_kb = memory_kb.saturating_mul(2);
+                record
+            })
+            .collect())
+    }
+
+    fn induce_pressure(&self, victim_pid: u32, neighbour_pid: u32) -> Result<PressureObservation> {
+        self.inner.induce_pressure(victim_pid, neighbour_pid)
+    }
+
+    fn await_pool_oom(&self, victim_pid: u32, neighbour_pid: u32) -> Result<u64> {
+        self.inner.await_pool_oom(victim_pid, neighbour_pid)
     }
 }
 
@@ -1358,8 +1402,8 @@ impl Execution for ExecSim {
 
     fn start_refused_server(&self) -> Result<ServerExit> {
         let refused = format!(
-            "  fail  gang server: cold_start reserves 1 cpus, 67108864 KiB of memory and 4194304 \
-             KiB of disk, {COLD_START_MISFIT_MESSAGE}\n"
+            "  fail  gang server: {COLD_START_MISFIT_MESSAGE} cpu_count 1, memory 67108864 KiB \
+             and disk 4194304 KiB fit no fleet\n"
         );
         Ok(match self.behaviour.cold_start {
             ColdStartExit::Refused => ServerExit {

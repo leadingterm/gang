@@ -188,7 +188,7 @@ fn exit_status_maps_exit_codes_and_signals() {
 async fn enters_starts_waits_and_leaves_in_order() -> Result<(), Box<dyn Error>> {
     let log = CallLog::default();
     let sandbox = ScriptedSandbox::exiting(&log, ActionExecutionOutcome::Exited(3));
-    let limits_port = RecordingLimits::new(&log);
+    let limits_port = RecordingLimits::new(&log).with_oom_kills(2);
     let argv = [OsString::from("cmd")];
     let directory = tempfile::tempdir()?;
     let action = action(&argv, directory.path(), directory.path())?;
@@ -199,6 +199,7 @@ async fn enters_starts_waits_and_leaves_in_order() -> Result<(), Box<dyn Error>>
         InputLinks::Keep,
         &action,
         &mut no_terminations(),
+        |_| {},
         || {
             log.record("leave_action_group");
             Ok(())
@@ -206,7 +207,8 @@ async fn enters_starts_waits_and_leaves_in_order() -> Result<(), Box<dyn Error>>
     )
     .await?;
 
-    assert_eq!(outcome, ActionExecutionOutcome::Exited(3));
+    assert_eq!(outcome.outcome, ActionExecutionOutcome::Exited(3));
+    assert_eq!(outcome.usage.map(|usage| usage.oom_kills), Some(2));
     assert_eq!(
         log.calls(),
         [
@@ -234,6 +236,7 @@ async fn without_limits_neither_enters_nor_leaves() -> Result<(), Box<dyn Error>
         InputLinks::Keep,
         &action,
         &mut no_terminations(),
+        |_| {},
         || {
             log.record("leave_action_group");
             Ok(())
@@ -241,7 +244,8 @@ async fn without_limits_neither_enters_nor_leaves() -> Result<(), Box<dyn Error>
     )
     .await?;
 
-    assert_eq!(outcome, ActionExecutionOutcome::Signaled(9));
+    assert_eq!(outcome.outcome, ActionExecutionOutcome::Signaled(9));
+    assert_eq!(outcome.usage, None);
     assert_eq!(
         log.calls(),
         ["sandbox.start", "leave_action_group", "sandbox.wait"]
@@ -270,6 +274,7 @@ async fn leave_action_group_failure_drops_action_and_leaves_scope() -> Result<()
                 InputLinks::Keep,
                 &action,
                 &mut no_terminations(),
+                |_| {},
                 || {
                     log.record("leave_action_group");
                     Err(std::io::Error::other("transition failed"))
@@ -319,6 +324,7 @@ async fn pending_termination_prevents_start_with_and_without_limits() -> Result<
                 InputLinks::Keep,
                 &action,
                 &mut receiver,
+                |_| {},
                 || {
                     log.record("leave_action_group");
                     Ok(())
@@ -327,7 +333,7 @@ async fn pending_termination_prevents_start_with_and_without_limits() -> Result<
             .await?;
 
             assert_eq!(
-                outcome,
+                outcome.outcome,
                 ActionExecutionOutcome::Signaled(termination.signal())
             );
             if with_limits {
@@ -357,6 +363,7 @@ async fn signal_stream_error_prevents_start_and_leaves_scope() -> Result<(), Box
             InputLinks::Keep,
             &action,
             &mut terminations,
+            |_| {},
             || {
                 log.record("leave_action_group");
                 Ok(())
@@ -396,6 +403,7 @@ async fn an_action_in_its_own_group_keeps_gang_exec_in_the_action_group()
             InputLinks::Keep,
             &action,
             &mut terminations,
+            |_| {},
             || {
                 log.record("leave_action_group");
                 Ok(())
@@ -403,7 +411,7 @@ async fn an_action_in_its_own_group_keeps_gang_exec_in_the_action_group()
         )
         .await?;
 
-        assert_eq!(outcome, ActionExecutionOutcome::Exited(0));
+        assert_eq!(outcome.outcome, ActionExecutionOutcome::Exited(0));
         assert_eq!(*relayed.lock(), vec![Termination::Interrupt]);
         if with_limits {
             assert_eq!(log.calls(), ["limits.enter", "limits.leave"]);
@@ -429,6 +437,7 @@ async fn leaves_the_scope_when_the_sandbox_fails_to_start() -> Result<(), Box<dy
         InputLinks::Keep,
         &action,
         &mut no_terminations(),
+        |_| {},
         || Ok(()),
     )
     .await;
@@ -458,6 +467,7 @@ async fn a_failing_wait_while_limits_are_active_is_a_sandbox_error_and_the_scope
         InputLinks::Keep,
         &action,
         &mut no_terminations(),
+        |_| {},
         || Ok(()),
     )
     .await;
@@ -490,6 +500,7 @@ async fn leave_failure_after_success_is_a_limits_error() -> Result<(), Box<dyn E
         InputLinks::Keep,
         &action,
         &mut no_terminations(),
+        |_| {},
         || Ok(()),
     )
     .await;
@@ -522,6 +533,7 @@ async fn sandbox_error_wins_over_leave_error() -> Result<(), Box<dyn Error>> {
         InputLinks::Keep,
         &action,
         &mut no_terminations(),
+        |_| {},
         || Ok(()),
     )
     .await;
@@ -545,6 +557,7 @@ async fn enter_failure_never_starts_the_sandbox() -> Result<(), Box<dyn Error>> 
         InputLinks::Keep,
         &action,
         &mut no_terminations(),
+        |_| {},
         || Ok(()),
     )
     .await;
@@ -574,11 +587,12 @@ async fn break_leaves_one_link_per_file_before_the_sandbox_starts() -> Result<()
         InputLinks::Break,
         &action,
         &mut no_terminations(),
+        |_| {},
         || Ok(()),
     )
     .await?;
 
-    assert_eq!(outcome, ActionExecutionOutcome::Exited(0));
+    assert_eq!(outcome.outcome, ActionExecutionOutcome::Exited(0));
     assert_eq!(*sandbox.counts.lock(), vec![1, 1]);
     Ok(())
 }
@@ -599,11 +613,12 @@ async fn breaks_links_under_the_action_directory_outside_the_working_directory()
         InputLinks::Break,
         &action,
         &mut no_terminations(),
+        |_| {},
         || Ok(()),
     )
     .await?;
 
-    assert_eq!(outcome, ActionExecutionOutcome::Exited(0));
+    assert_eq!(outcome.outcome, ActionExecutionOutcome::Exited(0));
     assert_eq!(link_count(&action_directory.join("inputs/shared"))?, 1);
     assert_eq!(link_count(&root.path().join("partner"))?, 1);
     Ok(())
@@ -630,10 +645,11 @@ async fn keep_leaves_hard_links_in_place() -> Result<(), Box<dyn Error>> {
         InputLinks::Keep,
         &action,
         &mut no_terminations(),
+        |_| {},
         || Ok(()),
     )
     .await?;
-    assert_eq!(outcome, ActionExecutionOutcome::Exited(0));
+    assert_eq!(outcome.outcome, ActionExecutionOutcome::Exited(0));
 
     assert_eq!(*sandbox.counts.lock(), vec![2, 2]);
     assert_eq!(link_count(&action_directory.join("inputs/shared"))?, 2);
@@ -656,6 +672,7 @@ async fn break_failure_never_starts_the_sandbox() -> Result<(), Box<dyn Error>> 
         InputLinks::Break,
         &action,
         &mut no_terminations(),
+        |_| {},
         || Ok(()),
     )
     .await;
@@ -686,11 +703,12 @@ async fn a_termination_while_waiting_is_relayed_and_the_action_outcome_is_report
         InputLinks::Keep,
         &action,
         &mut terminations,
+        |_| {},
         || Ok(()),
     )
     .await?;
 
-    assert_eq!(outcome, ActionExecutionOutcome::Exited(0));
+    assert_eq!(outcome.outcome, ActionExecutionOutcome::Exited(0));
     assert_eq!(*relayed.lock(), vec![Termination::Interrupt]);
     Ok(())
 }
@@ -716,11 +734,12 @@ async fn a_relayed_termination_still_leaves_the_limits_scope() -> Result<(), Box
         InputLinks::Keep,
         &action,
         &mut terminations,
+        |_| {},
         || Ok(()),
     )
     .await?;
 
-    assert_eq!(outcome, ActionExecutionOutcome::Exited(0));
+    assert_eq!(outcome.outcome, ActionExecutionOutcome::Exited(0));
     assert_eq!(*relayed.lock(), vec![Termination::Interrupt]);
     assert_eq!(log.calls(), ["limits.enter", "limits.leave"]);
     Ok(())
@@ -743,10 +762,11 @@ async fn the_action_starts_through_the_scope_launcher() -> Result<(), Box<dyn Er
         InputLinks::Keep,
         &action,
         &mut no_terminations(),
+        |_| {},
         || Ok(()),
     )
     .await?;
-    assert_eq!(outcome, ActionExecutionOutcome::Exited(0));
+    assert_eq!(outcome.outcome, ActionExecutionOutcome::Exited(0));
 
     assert_eq!(sandbox.started()[0].launcher, scope.launcher().to_vec());
     Ok(())
@@ -766,10 +786,11 @@ async fn without_limits_the_action_starts_without_a_launcher() -> Result<(), Box
         InputLinks::Keep,
         &action,
         &mut no_terminations(),
+        |_| {},
         || Ok(()),
     )
     .await?;
-    assert_eq!(outcome, ActionExecutionOutcome::Exited(0));
+    assert_eq!(outcome.outcome, ActionExecutionOutcome::Exited(0));
 
     assert!(sandbox.started()[0].launcher.is_empty());
     Ok(())

@@ -59,11 +59,15 @@ impl Bazel {
         driver
     }
 
-    /// The same driver with one more Bazel build flag.
+    /// Records JSON build events, all action results, and remote RPCs at the supplied paths.
     #[must_use]
-    pub(crate) fn with_flag(&self, flag: impl Into<String>) -> Self {
+    pub(crate) fn with_build_logs(&self, bep: &Path, rpc: &Path) -> Self {
         let mut driver = self.clone();
-        driver.settings.bazel_flags.push(flag.into());
+        driver.settings.bazel_flags.extend([
+            format!("--build_event_json_file={}", bep.display()),
+            "--build_event_publish_all_actions".to_owned(),
+            format!("--remote_grpc_log={}", rpc.display()),
+        ]);
         driver
     }
 
@@ -147,6 +151,27 @@ impl Bazel {
     /// The pinned tool path used by Bazel clients.
     pub(crate) fn action_path(&self) -> &str {
         &self.action_tools.path
+    }
+
+    /// Starts the server with `info output_base`, without loading targets or running actions.
+    /// The caller owns shutdown, including when preparation fails after starting a server.
+    pub(crate) fn prepare(&self, remote: &Remote) -> Result<()> {
+        let output = self.execute(self.prepare_command(remote))?;
+        if output.succeeded() {
+            return Ok(());
+        }
+        Err(E2eError::Command {
+            program: self.program.display().to_string(),
+            outcome: output.code.map_or_else(
+                || "terminated by a signal".to_owned(),
+                |code| format!("exited with status {code}"),
+            ),
+            output: output.combined(),
+        })
+    }
+
+    fn prepare_command(&self, remote: &Remote) -> Command {
+        self.invocation(remote, vec!["info".to_owned(), "output_base".to_owned()])
     }
 
     /// Cleans the workspace's outputs through `remote`'s server.
@@ -280,6 +305,7 @@ mod tests {
                 shell: PathBuf::from("/tools/sh"),
                 path: "/pinned/bin:/pinned/other".to_owned(),
                 action_bin: PathBuf::from("/nix/store/ddd-action-tools/bin"),
+                ca_bundle: None,
                 bwrap: None,
                 glibc_tool: None,
                 glibc_loader: Vec::new(),
@@ -287,6 +313,69 @@ mod tests {
             PathBuf::from("/workspace"),
             output_user_root,
         )
+    }
+
+    #[test]
+    fn build_logs_preserve_the_driver_and_record_both_builds() {
+        let mut bazel = bazel(PathBuf::from("/old output"));
+        bazel.program = PathBuf::from("/old/bin/bazel");
+        bazel.workspace = PathBuf::from("/old workspace");
+        bazel.settings.build_timeout = std::time::Duration::from_secs(37);
+        bazel
+            .settings
+            .bazel_startup_flags
+            .push("--max_idle_secs=29".to_owned());
+        bazel
+            .settings
+            .bazel_flags
+            .push("--remote_timeout=37".to_owned());
+        let remote = Remote::Gang {
+            host: "example.test".to_owned(),
+            bazelrc: PathBuf::from("/old client/bazelrc"),
+            helper: PathBuf::from("/old client/bin/gang"),
+            home: PathBuf::from("/old client/home"),
+        };
+        let probes = [Probe::ControllerLoss0];
+        let original = bazel.invocation(
+            &remote,
+            flags::build_args(&bazel.settings, &bazel.action_tools, &remote, &probes, None),
+        );
+        let original_args: Vec<_> = original.get_args().map(OsString::from).collect();
+        let insertion = original_args
+            .iter()
+            .position(|arg| arg == "--remote_timeout=37")
+            .expect("the configured build flag is present")
+            + 1;
+        for name in ["initial", "post"] {
+            let bep = PathBuf::from(format!("/build logs/upgrade-{name}.bep"));
+            let rpc = PathBuf::from(format!("/build logs/upgrade-{name}.rpc"));
+            let driver = bazel.with_build_logs(&bep, &rpc);
+            let command = driver.invocation(
+                &remote,
+                flags::build_args(
+                    &driver.settings,
+                    &driver.action_tools,
+                    &remote,
+                    &probes,
+                    None,
+                ),
+            );
+            let mut expected = original_args.clone();
+            expected.splice(
+                insertion..insertion,
+                [
+                    OsString::from(format!("--build_event_json_file={}", bep.display())),
+                    OsString::from("--build_event_publish_all_actions"),
+                    OsString::from(format!("--remote_grpc_log={}", rpc.display())),
+                ],
+            );
+            assert_eq!(command.get_args().collect::<Vec<_>>(), expected);
+            assert_eq!(command.get_program(), original.get_program());
+            assert_eq!(command.get_current_dir(), original.get_current_dir());
+            assert!(command.get_envs().eq(original.get_envs()));
+            assert_eq!(driver.settings.build_timeout, bazel.settings.build_timeout);
+        }
+        assert_eq!(bazel.settings.bazel_flags, ["--remote_timeout=37"]);
     }
 
     #[test]
@@ -326,6 +415,33 @@ mod tests {
                 assert!(env.contains(&(OsStr::new("PATH"), Some(OsStr::new(path)))));
             }
         }
+    }
+
+    #[test]
+    fn preparation_starts_only_the_server_in_the_selected_output_root() {
+        let driver =
+            bazel(PathBuf::from("/output")).with_output_user_root(PathBuf::from("/demand-output"));
+        let remote = Remote::Plain {
+            bazelrc: PathBuf::from("/plain/rc"),
+            home: PathBuf::from("/plain/home"),
+        };
+        let command = driver.prepare_command(&remote);
+        let arguments: Vec<_> = command.get_args().collect();
+        assert_eq!(command.get_program(), OsStr::new("/tools/bazel"));
+        assert_eq!(command.get_current_dir(), Some(Path::new("/workspace")));
+        assert_eq!(
+            arguments,
+            [
+                "--output_user_root=/demand-output",
+                "--nohome_rc",
+                "--nosystem_rc",
+                "--noworkspace_rc",
+                "--bazelrc=/plain/rc",
+                "info",
+                "output_base",
+            ]
+            .map(OsStr::new),
+        );
     }
 
     #[test]
@@ -371,27 +487,41 @@ mod tests {
     fn kill_servers_kills_the_server_each_output_base_records()
     -> Result<(), Box<dyn std::error::Error>> {
         use std::os::unix::process::ExitStatusExt;
+        use std::time::Duration;
 
         let root = tempfile::tempdir()?;
         let output_root = root
             .path()
             .join(format!("dir with spaces {}", "x".repeat(200)));
         let base = output_root.join("0123456789abcdef");
-        let mut server = Command::new("sh")
-            .args([
+        // Pinned Bash supplies a real, non-exiting process with an arbitrary Bazel-style argv.
+        let shell = std::fs::canonicalize(
+            std::env::var_os("GANG_E2E_TEST_BASH").ok_or("Bazel supplies pinned Bash")?,
+        )?;
+        let mut server = process::Supervised::spawn(
+            Command::new(shell).args([
                 "-c",
-                "read -r line",
+                "printf 'ready\\n'; kill -STOP $$",
                 &format!("--output_base={}", base.display()),
-            ])
-            .stdin(std::process::Stdio::piped())
-            .spawn()?;
+            ]),
+            &root.path().join("server.log"),
+        )?;
+        // Spawn can return before argv is visible. Publish the fixture's pid only after its
+        // readiness event makes startup ordering deterministic.
+        assert!(
+            server
+                .await_announcements(Duration::from_secs(30), |line| line == "ready")?
+                .is_some(),
+            "the server must announce readiness before its pid is recorded"
+        );
         fs::create_dir_all(base.join("server"))?;
-        fs::write(base.join(SERVER_PID_FILE), server.id().to_string())?;
+        fs::write(base.join(SERVER_PID_FILE), server.pid().to_string())?;
         fs::create_dir_all(output_root.join("install"))?;
         bazel(output_root).kill_servers()?;
-        drop(server.stdin.take());
         assert_eq!(
-            server.wait()?.signal(),
+            server
+                .wait_within(Duration::from_secs(30), "the Bazel server to be killed")?
+                .signal(),
             Some(Signal::KILL.as_raw()),
             "the server with a long, space-containing output base must be killed"
         );

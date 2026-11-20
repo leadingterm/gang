@@ -4,9 +4,9 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, OnceLock};
+use std::time::SystemTime;
 
 use axum::Router;
 use axum::body::Body;
@@ -18,9 +18,7 @@ use nativelink_config::schedulers::{
 };
 use nativelink_error::{Code, make_err};
 use nativelink_scheduler::default_scheduler_factory::memory_awaited_action_db_factory;
-use nativelink_scheduler::historical_resource_scheduler::{
-    HistoricalResourceScheduler, replica_id, snapshot_key,
-};
+use nativelink_scheduler::historical_resource_scheduler::HistoricalResourceScheduler;
 use nativelink_scheduler::known_platform_property_provider::KnownPlatformPropertyProvider;
 use nativelink_scheduler::resource_sketch::ResourceSketch;
 use nativelink_scheduler::simple_scheduler::SimpleScheduler;
@@ -34,27 +32,29 @@ use nativelink_service::wire_compression::RemoteCacheCompressionInstances;
 use nativelink_service::worker_api_server::WorkerApiServer;
 use nativelink_store::store_manager::StoreManager;
 use parking_lot::Mutex;
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Notify, OnceCell, watch};
 use tonic::service::Routes;
 use tower::{Service, service_fn};
 
 use gang_clock::{Clock, SystemClock};
+use gang_config::Http2Config;
 use gang_spi::{
     ApiRequestBody, ApiService, BoxedError, ControllerConnections, ControllerReady, ControllerSpec,
     RequestGate,
 };
 use gang_types::{FleetCatalog, SaturatingInto};
 
-use crate::config::{Http2Tuning, NativeLinkConfig};
+use crate::config::NativeLinkConfig;
 use crate::durations::ActionDurations;
 use crate::errors::NativeLinkEmbedError;
 use crate::fitted::FittedActions;
 use crate::globals;
 use crate::handoff::{HandOff, HandOffActions};
+use crate::history::Histories;
 use crate::observer::BuildObserverLayer;
 use crate::observing::ObservingWorkerScheduler;
 use crate::placeable::{AdmittedFleets, PlaceableActions};
-use crate::serve::{Listener, ServeShutdown, serve};
+use crate::serve::{Listener, ScopedRoutes, ServeShutdown, serve};
 use crate::settings;
 use crate::settings::WORKER_CONNECTIONS;
 use crate::store_usage::StoreUsage;
@@ -78,6 +78,14 @@ pub(crate) struct Handles {
     pub stores: StoreUsage,
 }
 
+/// Borrowed view of process-owned controller state.
+pub(crate) struct ControllerState<'a> {
+    pub(crate) handles: &'a watch::Sender<Option<Arc<Handles>>>,
+    pub(crate) histories: &'a Mutex<Option<Arc<Histories>>>,
+    pub(crate) resources: &'a OnceLock<Arc<ResourceSketch>>,
+    pub(crate) shared: &'a SharedServices,
+}
+
 /// Resets the published handles to `None` when the controller stops, however it stops.
 struct Serving<'a>(&'a watch::Sender<Option<Arc<Handles>>>);
 
@@ -87,7 +95,80 @@ impl Drop for Serving<'_> {
     }
 }
 
-/// Builds the controller and serves its public, optional execution, and worker connections.
+/// Process-lived stores and shared handlers, reused across controller terms and standby.
+/// The first term creates stores before its scheduler, then builds shared routes from copied
+/// capabilities metadata. The cached routes must not retain a term's scheduler.
+#[derive(Default)]
+pub(crate) struct SharedServices {
+    /// Initialized before the first term's scheduler.
+    stores: OnceCell<Arc<StoreManager>>,
+    /// Initialized after the first scheduler supplies capabilities metadata.
+    routes: OnceCell<SharedRoutes>,
+}
+
+struct SharedRoutes {
+    public: Router,
+    worker: Router,
+    standby_public: Router,
+    standby_worker: Router,
+    limits: ConnectionLimits,
+}
+
+impl SharedServices {
+    async fn stores(
+        &self,
+        spec: &ControllerSpec<'_>,
+    ) -> Result<&Arc<StoreManager>, NativeLinkEmbedError> {
+        self.stores
+            .get_or_try_init(|| async { build_stores(settings::controller_stores(spec)?).await })
+            .await
+    }
+
+    async fn prepared_routes(
+        &self,
+        config: &NativeLinkConfig,
+        spec: &ControllerSpec<'_>,
+        shared: &Shared<'_>,
+        services: (&settings::ClientServices, &settings::WorkerServices),
+        standby: (Router, Router),
+    ) -> Result<&SharedRoutes, NativeLinkEmbedError> {
+        self.routes
+            .get_or_try_init(|| async {
+                Ok::<_, NativeLinkEmbedError>(SharedRoutes {
+                    public: with_request_metadata(
+                        client_routes(services.0, shared).await?,
+                        spec.observations.clone(),
+                    ),
+                    worker: worker_routes(services.1, shared)?,
+                    standby_public: with_request_metadata(standby.0, spec.observations.clone()),
+                    standby_worker: standby.1,
+                    limits: connection_limits(&config.http2, spec.max_workers),
+                })
+            })
+            .await
+    }
+
+    pub(crate) fn standby<A: ApiService>(
+        &self,
+        api: A,
+    ) -> Option<(ScopedRoutes, ScopedRoutes, NonZeroUsize, NonZeroUsize)> {
+        let routes = self.routes.get()?;
+        Some((
+            ScopedRoutes {
+                shared: routes.public.clone().fallback_service(api_service(api)),
+                leader: routes.standby_public.clone(),
+            },
+            ScopedRoutes {
+                shared: routes.worker.clone(),
+                leader: routes.standby_worker.clone(),
+            },
+            routes.limits.public,
+            routes.limits.worker,
+        ))
+    }
+}
+
+/// Builds the controller and serves its public and worker connections.
 /// After all listener streams end, it drains the controller within the configured grace.
 /// It signals `ready` once the controller is built, before it serves; a run that fails first
 /// drops `ready` unsent.
@@ -96,7 +177,12 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
     spec: &ControllerSpec<'_>,
     connections: ControllerConnections<P, W, A>,
     ready: ControllerReady,
-    handles: &watch::Sender<Option<Arc<Handles>>>,
+    ControllerState {
+        handles,
+        histories,
+        resources,
+        shared: shared_services,
+    }: ControllerState<'_>,
 ) -> Result<(), NativeLinkEmbedError> {
     if handles.borrow().is_some() {
         return Err(NativeLinkEmbedError::AlreadyServing);
@@ -107,17 +193,27 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
     let scheduler = settings::scheduler(config, spec)?;
     let client_services = settings::client_services(config);
     let worker_services = settings::worker_services(config);
-    let store_manager = build_stores(settings::controller_stores(spec)?).await?;
+    let store_manager = shared_services.stores(spec).await?;
 
-    let (action_scheduler, worker_scheduler) = scheduler_stack(&scheduler, spec.fleets, config)?;
+    let SchedulerStack {
+        actions: action_scheduler,
+        workers: worker_scheduler,
+        resource,
+    } = scheduler_stack(&scheduler, spec.fleets, &spec.actions, resources)?;
     let handoff = HandOff::new();
     let action_scheduler: Arc<dyn KnownPlatformPropertyProvider> =
         Arc::new(HandOffActions::new(action_scheduler, handoff.clone()));
     let completed = Arc::new(AtomicU64::new(0));
-    let durations = Arc::new(Mutex::new(ActionDurations::new(
-        config.scheduler.duration_keys,
-        config.scheduler.window_days,
-    )));
+    let history = Arc::clone(histories.lock().get_or_insert_with(|| {
+        Arc::new(Histories::new(
+            resource,
+            Arc::new(Mutex::new(ActionDurations::new(
+                spec.actions.history_keys,
+                spec.actions.history_window,
+            ))),
+        ))
+    }));
+    let durations = Arc::clone(&history.durations);
     let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
     let draining = Arc::new(ObservingWorkerScheduler::new(
         worker_scheduler,
@@ -134,19 +230,22 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
     let workers = HashMap::from([(scheduler.name.clone(), Arc::clone(&worker_scheduler))]);
 
     let shared = Shared {
-        store_manager: &store_manager,
+        store_manager,
         actions: &actions,
         workers: &workers,
         max_decoding_message_size: config.http2.max_message_size.get().as_usize(),
     };
-    let has_execution = connections.execution.is_some();
-    let client_router = client_routes(&client_services, &shared, true, !has_execution).await?;
-    let execution_router = if has_execution {
-        Some(client_routes(&client_services, &shared, false, true).await?)
-    } else {
-        None
-    };
-    let worker_router = worker_routes(&worker_services, &shared)?;
+    let (client_leader, standby_public) = client_leader_routes(&client_services, &shared)?;
+    let (worker_leader, standby_worker) = worker_leader_routes(&worker_services, &shared)?;
+    let routes = shared_services
+        .prepared_routes(
+            config,
+            spec,
+            &shared,
+            (&client_services, &worker_services),
+            (standby_public, standby_worker),
+        )
+        .await?;
 
     let published = Arc::new(Handles {
         worker_scheduler,
@@ -155,7 +254,7 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         completed,
         durations,
         clock,
-        stores: StoreUsage::new(Arc::clone(&store_manager)),
+        stores: StoreUsage::new(Arc::clone(store_manager)),
     });
     let claimed = handles.send_if_modified(|slot| {
         if slot.is_some() {
@@ -174,23 +273,26 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         config,
         connections,
         ClientAndWorkerRoutes {
-            public: with_request_metadata(client_router, spec.observations.clone()),
-            execution: execution_router
-                .map(|router| with_request_metadata(router, spec.observations.clone())),
-            worker: worker_router,
+            public: ScopedRoutes {
+                shared: routes.public.clone(),
+                leader: with_request_metadata(client_leader, spec.observations.clone()),
+            },
+            worker: ScopedRoutes {
+                shared: routes.worker.clone(),
+                leader: worker_leader,
+            },
         },
-        connection_limits(&config.http2, spec.max_workers),
+        routes.limits,
         &draining,
         handoff,
     )
     .await
 }
 
-/// Routers built for the three listener roles.
+/// Routers built for the client and worker listener roles.
 struct ClientAndWorkerRoutes {
-    public: Router,
-    execution: Option<Router>,
-    worker: Router,
+    public: ScopedRoutes,
+    worker: ScopedRoutes,
 }
 
 /// Serves all listeners, then drains the scheduler after the last connection stream ends.
@@ -202,40 +304,26 @@ async fn serve_connections<P: RequestGate, W: RequestGate, A: ApiService>(
     draining: &ObservingWorkerScheduler,
     handoff: HandOff,
 ) -> Result<(), NativeLinkEmbedError> {
-    let has_execution = connections.execution.is_some();
     let ClientAndWorkerRoutes {
         public: client_router,
-        execution: execution_router,
         worker: worker_router,
     } = routes;
     let ControllerConnections {
         public,
-        execution,
         worker,
         api,
     } = connections;
-    let public_router = client_router.fallback_service(api_service(api.clone()));
-    let execution_router = execution_router.map(|router| router.fallback_service(api_service(api)));
-    let (ended, mut endings) = tokio::sync::mpsc::unbounded_channel();
-    let shutdown = ServeShutdown { ended, handoff };
-    let clock = SystemClock::new();
-    let execution_shutdown = shutdown.clone();
-    let execution_serving = async {
-        if let (Some(listening), Some(router)) = (execution, execution_router) {
-            serve(
-                listening,
-                router,
-                &config.http2,
-                Listener::Execution,
-                limits.public,
-                clock,
-                execution_shutdown,
-            )
-            .await
-        } else {
-            Ok(())
-        }
+    let public_router = ScopedRoutes {
+        shared: client_router.shared.fallback_service(api_service(api)),
+        leader: client_router.leader,
     };
+    let (ended, mut endings) = tokio::sync::mpsc::unbounded_channel();
+    let shutdown = ServeShutdown {
+        ended,
+        handoff,
+        mode: crate::serve::ServeMode::Controller,
+    };
+    let clock = SystemClock::new();
     let serving = async {
         tokio::try_join!(
             serve(
@@ -247,7 +335,6 @@ async fn serve_connections<P: RequestGate, W: RequestGate, A: ApiService>(
                 clock,
                 shutdown.clone()
             ),
-            execution_serving,
             serve(
                 worker,
                 worker_router,
@@ -261,8 +348,7 @@ async fn serve_connections<P: RequestGate, W: RequestGate, A: ApiService>(
         Ok::<(), NativeLinkEmbedError>(())
     };
     tokio::pin!(serving);
-    let listener_count = if has_execution { 3 } else { 2 };
-    for _ in 0..listener_count {
+    for _ in 0..2 {
         tokio::select! {
             result = &mut serving => return result,
             _ = endings.recv() => {}
@@ -297,7 +383,7 @@ struct ConnectionLimits {
 }
 
 /// The connection limits of the listeners under `tuning`, for fleets of at most `max_workers`.
-fn connection_limits(tuning: &Http2Tuning, max_workers: u64) -> ConnectionLimits {
+fn connection_limits(tuning: &Http2Config, max_workers: u64) -> ConnectionLimits {
     let worker: usize = max_workers
         .saturating_mul(WORKER_GENERATIONS)
         .saturating_mul(WORKER_CONNECTIONS)
@@ -314,19 +400,45 @@ type SchedulerHandles = (
     Arc<dyn WorkerScheduler>,
 );
 
+struct SchedulerStack {
+    actions: Arc<dyn KnownPlatformPropertyProvider>,
+    workers: Arc<dyn WorkerScheduler>,
+    resource: Arc<ResourceSketch>,
+}
+
 /// The action stack over `NativeLink`'s simple scheduler on the system clock.
 fn scheduler_stack(
     scheduler: &SchedulerConfig,
     fleets: &FleetCatalog,
-    config: &NativeLinkConfig,
-) -> Result<SchedulerHandles, NativeLinkEmbedError> {
-    action_stack(scheduler, fleets, config, |simple, notify, sketch| {
-        let db = memory_awaited_action_db_factory(
-            simple.retain_completed_for_s,
-            &notify,
-            SystemTime::now,
-        );
-        SimpleScheduler::new_with_resource_sketch(simple, db, notify, None, Some(sketch))
+    actions: &gang_config::ActionsConfig,
+    resources: &OnceLock<Arc<ResourceSketch>>,
+) -> Result<SchedulerStack, NativeLinkEmbedError> {
+    let mut resource = None;
+    let (actions, workers) = action_stack(
+        scheduler,
+        fleets,
+        actions,
+        resources,
+        |simple, notify, sketch| {
+            resource = Some(Arc::clone(&sketch));
+            let db = memory_awaited_action_db_factory(
+                simple.retain_completed_for_s,
+                &notify,
+                SystemTime::now,
+            );
+            SimpleScheduler::new_with_resource_sketch(simple, db, notify, None, Some(sketch))
+        },
+    )?;
+    let resource = resource.ok_or_else(|| {
+        NativeLinkEmbedError::native("scheduler creation failed")(make_err!(
+            Code::Internal,
+            "resource sketch was not constructed"
+        ))
+    })?;
+    Ok(SchedulerStack {
+        actions,
+        workers,
+        resource,
     })
 }
 
@@ -338,7 +450,8 @@ fn scheduler_stack(
 fn action_stack(
     scheduler: &SchedulerConfig,
     fleets: &FleetCatalog,
-    config: &NativeLinkConfig,
+    actions: &gang_config::ActionsConfig,
+    resources: &OnceLock<Arc<ResourceSketch>>,
     simple_scheduler: impl FnOnce(
         &SimpleSpec,
         Arc<Notify>,
@@ -365,32 +478,35 @@ fn action_stack(
     }
     HistoricalResourceScheduler::validate(historical_spec)
         .map_err(NativeLinkEmbedError::native("scheduler creation failed"))?;
-    let sketch = Arc::new(HistoricalResourceScheduler::sketch_from_spec(
-        historical_spec,
-    ));
+    let sketch = resources.get_or_init(|| {
+        let sketch = Arc::new(HistoricalResourceScheduler::sketch_from_spec(
+            historical_spec,
+        ));
+        // Maintenance settles half-window histograms and expires stale entries. Gang's
+        // learned-history port owns persistence, so no native store or replica key is used.
+        HistoricalResourceScheduler::spawn_snapshot_writer(
+            Arc::clone(&sketch),
+            None,
+            actions.history_flush_interval.get(),
+            String::new(),
+        );
+        sketch
+    });
     let notify = Arc::new(Notify::new());
-    let (simple_actions, worker_scheduler) = simple_scheduler(simple, notify, sketch.clone());
+    let (simple_actions, worker_scheduler) = simple_scheduler(simple, notify, Arc::clone(sketch));
     let admitted = AdmittedFleets::default();
     let fitted = Arc::new(FittedActions::new(
         simple_actions,
         fleets.clone(),
         admitted.clone(),
-        config.memory.min_reservation,
-        config.disk.min_reservation,
+        actions.memory.min_reservation,
+        actions.disk.min_reservation,
     ));
     let historical = Arc::new(HistoricalResourceScheduler::new(
         historical_spec,
         fitted,
-        sketch.clone(),
+        Arc::clone(sketch),
     ));
-    if historical_spec.learn_from_workers {
-        HistoricalResourceScheduler::spawn_snapshot_writer(
-            sketch,
-            None,
-            Duration::from_secs(historical_spec.snapshot_interval_s),
-            snapshot_key(&replica_id(&historical_spec.replica_id)),
-        );
-    }
     let action_scheduler: Arc<dyn KnownPlatformPropertyProvider> =
         Arc::new(PlaceableActions::new(historical, fleets.clone(), admitted));
     Ok((action_scheduler, worker_scheduler))
@@ -443,8 +559,6 @@ struct Shared<'a> {
 async fn client_routes(
     services: &settings::ClientServices,
     shared: &Shared<'_>,
-    cache: bool,
-    execute: bool,
 ) -> Result<Router, NativeLinkEmbedError> {
     let limit = shared.max_decoding_message_size;
     let compression =
@@ -453,8 +567,6 @@ async fn client_routes(
         .map_err(NativeLinkEmbedError::native("action cache service"))?;
     let cas = CasServer::new(&services.cas, shared.store_manager, &compression)
         .map_err(NativeLinkEmbedError::native("cas service"))?;
-    let execution = ExecutionServer::new(&services.execution, shared.actions, shared.store_manager)
-        .map_err(NativeLinkEmbedError::native("execution service"))?;
     let bytestream =
         ByteStreamServer::new(&services.bytestream, shared.store_manager, &compression)
             .map_err(NativeLinkEmbedError::native("bytestream service"))?;
@@ -466,42 +578,13 @@ async fn client_routes(
     )
     .await
     .map_err(NativeLinkEmbedError::native("capabilities service"))?;
-    let mut routes = Routes::builder().routes();
-    if cache {
-        routes = routes
-            .add_service(ac.into_service().max_decoding_message_size(limit))
-            .add_service(cas.into_service().max_decoding_message_size(limit))
-            .add_service(bytestream.into_service().max_decoding_message_size(limit));
-    }
-    if execute {
-        routes = routes
-            .add_service(
-                execution
-                    .clone()
-                    .into_service()
-                    .max_decoding_message_size(limit),
-            )
-            .add_service(
-                execution
-                    .into_operations_service()
-                    .max_decoding_message_size(limit),
-            );
-    }
-    let routes = routes.add_service(capabilities.into_service().max_decoding_message_size(limit));
-    let routes = routes.into_axum_router();
-    if cache && !execute {
-        // Do not let the API fallback accidentally claim the execution services.
-        return Ok(routes
-            .route(
-                "/build.bazel.remote.execution.v2.Execution/{*method}",
-                axum::routing::any(|| async { http::StatusCode::NOT_FOUND }),
-            )
-            .route(
-                "/google.longrunning.Operations/{*method}",
-                axum::routing::any(|| async { http::StatusCode::NOT_FOUND }),
-            ));
-    }
-    Ok(routes)
+    let routes = Routes::builder()
+        .routes()
+        .add_service(ac.into_service().max_decoding_message_size(limit))
+        .add_service(cas.into_service().max_decoding_message_size(limit))
+        .add_service(bytestream.into_service().max_decoding_message_size(limit))
+        .add_service(capabilities.into_service().max_decoding_message_size(limit));
+    Ok(routes.into_axum_router())
 }
 
 /// The gRPC services of the worker listener, served as an axum router.
@@ -518,22 +601,90 @@ fn worker_routes(
     let bytestream =
         ByteStreamServer::new(&services.bytestream, shared.store_manager, &compression)
             .map_err(NativeLinkEmbedError::native("bytestream service"))?;
-    let worker_api = WorkerApiServer::new(&services.worker_api, shared.workers)
-        .map_err(NativeLinkEmbedError::native("worker api service"))?;
     let routes = Routes::builder()
         .routes()
         .add_service(ac.into_service().max_decoding_message_size(limit))
         .add_service(cas.into_service().max_decoding_message_size(limit))
-        .add_service(bytestream.into_service().max_decoding_message_size(limit))
-        .add_service(worker_api.into_service().max_decoding_message_size(limit));
+        .add_service(bytestream.into_service().max_decoding_message_size(limit));
     Ok(routes.into_axum_router())
+}
+
+fn client_leader_routes(
+    services: &settings::ClientServices,
+    shared: &Shared<'_>,
+) -> Result<(Router, Router), NativeLinkEmbedError> {
+    let limit = shared.max_decoding_message_size;
+    let execution = ExecutionServer::new(&services.execution, shared.actions, shared.store_manager)
+        .map_err(NativeLinkEmbedError::native("execution service"))?;
+    let exec = execution
+        .clone()
+        .into_service()
+        .max_decoding_message_size(limit);
+    let ops = execution
+        .into_operations_service()
+        .max_decoding_message_size(limit);
+    let standby = Routes::from(Router::new())
+        .add_service(unavailable_like(&exec))
+        .add_service(unavailable_like(&ops));
+    let live = Routes::from(Router::new())
+        .add_service(exec)
+        .add_service(ops);
+    Ok((live.into_axum_router(), standby.into_axum_router()))
+}
+
+fn worker_leader_routes(
+    services: &settings::WorkerServices,
+    shared: &Shared<'_>,
+) -> Result<(Router, Router), NativeLinkEmbedError> {
+    let limit = shared.max_decoding_message_size;
+    let worker_api = WorkerApiServer::new(&services.worker_api, shared.workers)
+        .map_err(NativeLinkEmbedError::native("worker api service"))?
+        .into_service()
+        .max_decoding_message_size(limit);
+    let standby = Routes::from(Router::new()).add_service(unavailable_like(&worker_api));
+    let live = Routes::from(Router::new()).add_service(worker_api);
+    Ok((live.into_axum_router(), standby.into_axum_router()))
+}
+
+/// Registers the live service's name without retaining the service or its scheduler.
+struct Unavailable<T>(std::marker::PhantomData<fn() -> T>);
+
+impl<T> Clone for Unavailable<T> {
+    fn clone(&self) -> Self {
+        Self(std::marker::PhantomData)
+    }
+}
+
+impl<T: tonic::server::NamedService> tonic::server::NamedService for Unavailable<T> {
+    const NAME: &'static str = T::NAME;
+}
+
+impl<T> Service<Request<tonic::body::Body>> for Unavailable<T> {
+    type Response = Response<tonic::body::Body>;
+    type Error = Infallible;
+    type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _: Request<tonic::body::Body>) -> Self::Future {
+        std::future::ready(Ok(tonic::Status::unavailable("not leading").into_http()))
+    }
+}
+
+fn unavailable_like<T: tonic::server::NamedService>(_: &T) -> Unavailable<T> {
+    Unavailable(std::marker::PhantomData)
 }
 
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
     use std::error::Error;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use axum::middleware::from_fn_with_state;
     use axum::routing::get;
@@ -541,7 +692,8 @@ mod tests {
     use base64::prelude::BASE64_STANDARD_NO_PAD;
     use futures::StreamExt;
     use gang_spi::{
-        Admitted, ApiResponseBody, Authenticated, Peer, PortError, RenderedStoreSpec, full_body,
+        Admitted, ApiResponseBody, Authenticated, GateDecision, Peer, PortError, RenderedStoreSpec,
+        RequestScope, full_body,
     };
     use gang_testkit::TestResult;
     use gang_types::{
@@ -573,13 +725,13 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::gate::admit;
+    use crate::gate::{GateState, admit};
 
     #[test]
     fn the_public_limit_is_configured_and_the_worker_limit_follows_the_fleets() {
-        let tuning = Http2Tuning {
+        let tuning = Http2Config {
             max_connections: NonZeroUsize::MIN.saturating_add(6),
-            ..Http2Tuning::default()
+            ..Http2Config::default()
         };
         let limits = connection_limits(&tuning, 2);
         assert_eq!((limits.public.get(), limits.worker.get()), (7, 12));
@@ -678,10 +830,8 @@ mod tests {
     }
 
     /// The default scheduler configuration used by the test-controlled stack.
-    fn default_config() -> TestResult<NativeLinkConfig> {
-        Ok(serde_json::from_value(
-            json!({ "scheduler_name": "MAIN_SCHEDULER" }),
-        )?)
+    fn default_config() -> NativeLinkConfig {
+        NativeLinkConfig::default()
     }
 
     /// Builds the rendered stack on the test clock with the deployment's default client timeout.
@@ -698,6 +848,30 @@ mod tests {
         config: &NativeLinkConfig,
         ready: Option<mpsc::Sender<()>>,
     ) -> TestResult<(TestStack, Arc<tokio::sync::Notify>)> {
+        stack_with_actions(
+            fleets,
+            config,
+            ready,
+            &Arc::new(gang_config::ActionsConfig::default()),
+        )
+    }
+
+    fn stack_with_actions(
+        fleets: &FleetCatalog,
+        config: &NativeLinkConfig,
+        ready: Option<mpsc::Sender<()>>,
+        actions: &Arc<gang_config::ActionsConfig>,
+    ) -> TestResult<(TestStack, Arc<tokio::sync::Notify>)> {
+        stack_with_resources(fleets, config, ready, actions, &OnceLock::new())
+    }
+
+    fn stack_with_resources(
+        fleets: &FleetCatalog,
+        config: &NativeLinkConfig,
+        ready: Option<mpsc::Sender<()>>,
+        actions: &Arc<gang_config::ActionsConfig>,
+        resources: &OnceLock<Arc<ResourceSketch>>,
+    ) -> TestResult<(TestStack, Arc<tokio::sync::Notify>)> {
         let memory = RenderedStoreSpec(json!({ "memory": {} }));
         let (observations, _receiver) = gang_spi::ObservationSink::channel(
             std::num::NonZeroUsize::MIN,
@@ -706,6 +880,7 @@ mod tests {
         let rendered = settings::scheduler(
             config,
             &ControllerSpec {
+                actions: Arc::clone(actions),
                 content_store: &memory,
                 action_store: &memory,
                 fleets,
@@ -717,8 +892,12 @@ mod tests {
         let mut simple_slot = None;
         let mut sketch_slot = None;
         let mut notify_slot = None;
-        let (actions, workers) =
-            action_stack(&rendered, fleets, config, |simple, notify, sketch| {
+        let (actions, workers) = action_stack(
+            &rendered,
+            fleets,
+            actions,
+            resources,
+            |simple, notify, sketch| {
                 notify_slot = Some(Arc::clone(&notify));
                 let db = memory_awaited_action_db_factory(
                     simple.retain_completed_for_s,
@@ -747,7 +926,8 @@ mod tests {
                 simple_slot = Some(Arc::clone(&scheduler));
                 sketch_slot = Some(Arc::clone(&sketch));
                 (scheduler, workers)
-            })?;
+            },
+        )?;
         Ok((
             TestStack {
                 actions,
@@ -914,7 +1094,7 @@ mod tests {
         let fleets = x86_and_arm_fleets();
         let (ready_tx, mut ready_rx) = mpsc::channel(1);
         let (stack, notify) =
-            stack_on_test_clock_with_matching_gate(&fleets, &default_config()?, Some(ready_tx))?;
+            stack_on_test_clock_with_matching_gate(&fleets, &default_config(), Some(ready_tx))?;
         notify.notify_one();
         ready_rx
             .recv()
@@ -1020,7 +1200,7 @@ mod tests {
         for (case, arm_worker) in [("no worker", false), ("arm worker", true)] {
             NOW.set(Duration::from_secs(1_000_000));
             let fleets = x86_and_arm_fleets();
-            let stack = stack_on_test_clock(&fleets, &default_config()?)?;
+            let stack = stack_on_test_clock(&fleets, &default_config())?;
             let worker_id = WorkerId("arm-worker".to_owned());
             let _rx = if arm_worker {
                 Some(connect_arm_worker(stack.workers.as_ref(), &worker_id).await?)
@@ -1080,18 +1260,18 @@ mod tests {
         Ok(())
     }
 
-    /// A request below the minimum reaches the worker at the minimum, and a memory kill
-    /// doubles that raised reservation rather than treating the minimum as a cap.
+    /// A request below the configured minimum escalates from that minimum after a memory kill.
     #[tokio::test]
     async fn a_reservation_raised_to_the_minimum_escalates_from_it_after_a_memory_kill()
     -> TestResult {
         NOW.set(Duration::from_secs(1_000_000));
-        let config: NativeLinkConfig = serde_json::from_value(json!({
-            "scheduler_name": "MAIN_SCHEDULER",
-            "memory": { "min_reservation": "128MiB" },
-        }))?;
+        let config = default_config();
+        let actions = Arc::new(serde_json::from_value(json!({
+            "reservation_headroom_percent": 13,
+            "memory": { "min_reservation": "128MiB", "escalation_percent": 175, "max_steps": 4 }
+        }))?);
         let fleets = x86_and_arm_fleets();
-        let stack = stack_on_test_clock(&fleets, &config)?;
+        let stack = stack_with_actions(&fleets, &config, None, &actions)?.0;
         let worker_id = WorkerId("arm-worker".to_owned());
         let mut rx = connect_arm_worker(stack.workers.as_ref(), &worker_id).await?;
         let connected = rx
@@ -1153,22 +1333,22 @@ mod tests {
         let (retry, memory_kb) = next_dispatch(&mut rx).await;
         assert_eq!(retry.operation_id, start.operation_id);
         assert_eq!(
-            memory_kb, 262_144,
-            "the escalation doubles the raised reservation"
+            memory_kb, 229_376,
+            "the configured multiplier applies to the raised reservation"
         );
         Ok(())
     }
 
-    /// The default small-action floor protects actions observed around 50 MiB from a
-    /// learned 26,864 KiB reservation that would be too tight for them.
+    /// A configured minimum raises a learned reservation.
     #[tokio::test]
-    async fn the_default_small_action_floor_raises_a_too_tight_learned_reservation() -> TestResult {
+    async fn the_configured_floor_raises_a_too_tight_learned_reservation() -> TestResult {
         NOW.set(Duration::from_secs(1_000_000));
-        let config: NativeLinkConfig = serde_json::from_value(json!({
-            "scheduler_name": "MAIN_SCHEDULER",
-        }))?;
+        let config = NativeLinkConfig::default();
         let fleets = x86_and_arm_fleets();
-        let stack = stack_on_test_clock(&fleets, &config)?;
+        let actions = Arc::new(serde_json::from_value(json!({
+            "memory": { "min_reservation": "96MiB" }
+        }))?);
+        let stack = stack_with_actions(&fleets, &config, None, &actions)?.0;
         let worker_id = WorkerId("arm-worker".to_owned());
         let mut rx = connect_arm_worker(stack.workers.as_ref(), &worker_id).await?;
         let connected = rx
@@ -1194,7 +1374,7 @@ mod tests {
             .sketch
             .lookup(&key, now_s)
             .expect("sample was learned");
-        assert_eq!(stack.sketch.shape(&entry).memory_kb, 26_864);
+        assert_eq!(stack.sketch.shape(&entry).memory_kb, 26_865);
 
         let _subscription = stack
             .actions
@@ -1203,9 +1383,230 @@ mod tests {
         stack.simple.do_try_match_for_test().await?;
         let (_, memory_kb) = next_dispatch(&mut rx).await;
         assert_eq!(
-            memory_kb, 65_536,
-            "the learned reservation is raised to the default small-action floor"
+            memory_kb, 98_304,
+            "the learned reservation is raised to the configured small-action floor"
         );
+        Ok(())
+    }
+
+    fn seed_controller_history(history: &Histories, now: gang_clock::Timestamp) {
+        let now_s = now.as_unix_millis() / 1000;
+        let key = SketchKey::for_attempt(Some("target"), Some("compile"), "");
+        let observation = Observation {
+            peak_memory_kb: 22_387,
+            now_s,
+            ..Default::default()
+        };
+        // Only anonymous command keys need probation. A named target records
+        // immediately and also trains the mnemonic fallback.
+        assert!(history.resource.observe(key.clone(), &observation));
+        assert_eq!(
+            history
+                .resource
+                .lookup(&key, now_s)
+                .expect("target learned")
+                .samples,
+            1,
+        );
+        let mnemonic = SketchKey::for_attempt(None, Some("compile"), "");
+        assert_eq!(
+            history
+                .resource
+                .lookup(&mnemonic, now_s)
+                .expect("mnemonic fallback learned")
+                .samples,
+            1,
+        );
+        history
+            .durations
+            .lock()
+            .record("target", "compile", 800, now);
+    }
+
+    #[tokio::test]
+    async fn controller_terms_retain_resource_and_duration_history() -> TestResult {
+        let config = default_config();
+        let fleets = x86_and_arm_fleets();
+        let histories = Mutex::new(None);
+        let resources = OnceLock::new();
+        let shared = SharedServices::default();
+        let (handles, _) = watch::channel(None);
+        let store = RenderedStoreSpec(json!({"memory": {}}));
+        let (observations, _receiver) =
+            gang_spi::ObservationSink::channel(NonZeroUsize::MIN, NonZeroUsize::MIN);
+        let spec = ControllerSpec {
+            actions: Arc::new(gang_config::ActionsConfig::default()),
+            content_store: &store,
+            action_store: &store,
+            fleets: &fleets,
+            max_workers: 8,
+            observations: &observations,
+            client_action_timeout: CLIENT_ACTION_TIMEOUT,
+        };
+        let mut previous = None;
+        let mut expected = Vec::new();
+        let now_s = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let now = gang_clock::Timestamp::from_unix_millis(now_s * 1000);
+        for _ in 0..2 {
+            let connections = ControllerConnections {
+                public: gang_spi::Listening {
+                    connections: futures::stream::empty().boxed(),
+                    gate: Identify,
+                },
+                worker: gang_spi::Listening {
+                    connections: futures::stream::empty().boxed(),
+                    gate: Identify,
+                },
+                api: Echo,
+            };
+            let (ready, waiting) = ControllerReady::channel();
+            run(
+                &config,
+                &spec,
+                connections,
+                ready,
+                ControllerState {
+                    handles: &handles,
+                    histories: &histories,
+                    resources: &resources,
+                    shared: &shared,
+                },
+            )
+            .await?;
+            waiting.await?;
+            assert!(handles.borrow().is_none(), "drain clears serving handles");
+            let history = histories
+                .lock()
+                .clone()
+                .expect("learned history is retained");
+            assert!(Arc::ptr_eq(
+                &history.resource,
+                resources.get().expect("resource sketch was initialized"),
+            ));
+            if let Some(previous) = &previous {
+                assert!(Arc::ptr_eq(previous, &history));
+                let mut actual = Vec::new();
+                history.snapshot(now, &mut actual)?;
+                assert_eq!(actual, expected, "both learned models survive a term");
+            } else {
+                seed_controller_history(&history, now);
+                history.snapshot(now, &mut expected)?;
+                assert!(
+                    expected
+                        .iter()
+                        .any(|record| { record.key.kind == gang_spi::RecordKind::ResourceHistory })
+                );
+                assert!(
+                    expected
+                        .iter()
+                        .any(|record| { record.key.kind == gang_spi::RecordKind::DurationHistory })
+                );
+                previous = Some(history);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learned_reservation_survives_a_new_scheduler_term() -> TestResult {
+        NOW.set(Duration::from_secs(1_000_000));
+        let config = default_config();
+        let fleets = x86_and_arm_fleets();
+        let actions = Arc::new(gang_config::ActionsConfig::default());
+        let resources = OnceLock::new();
+        let first = stack_with_resources(&fleets, &config, None, &actions, &resources)?.0;
+        let action = action(Isa::Aarch64, None);
+        let key = SketchKey::for_attempt(None, None, &action.command_digest.to_string());
+        let now_s = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let observation = Observation {
+            peak_memory_kb: 22_387,
+            now_s,
+            ..Default::default()
+        };
+        assert!(!first.sketch.observe(key.clone(), &observation));
+        assert!(first.sketch.observe(key.clone(), &observation));
+        drop(first);
+        let second = stack_with_resources(&fleets, &config, None, &actions, &resources)?.0;
+        let entry = second
+            .sketch
+            .lookup(&key, now_s)
+            .expect("reservation survived");
+        assert_eq!(second.sketch.shape(&entry).memory_kb, 26_865);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restored_history_shapes_queued_actions_in_the_real_stack() -> TestResult {
+        async fn queued_reservations(
+            stack: &TestStack,
+            action: Arc<ActionInfo>,
+        ) -> TestResult<Vec<Option<String>>> {
+            let operation = OperationId::from("history-restart");
+            let _subscription = stack.actions.add_action(operation.clone(), action).await?;
+            let mut results = stack
+                .actions
+                .filter_operations(OperationFilter {
+                    client_operation_id: Some(operation),
+                    ..Default::default()
+                })
+                .await?;
+            let queued = results
+                .next()
+                .await
+                .expect("action remains queued without a worker");
+            let (info, _) = queued.as_action_info().await?;
+            Ok([
+                property::MEMORY_KB,
+                property::DISK_KB,
+                property::CPU_MILLICORES,
+            ]
+            .iter()
+            .map(|key| info.platform_properties.get(*key).cloned())
+            .collect())
+        }
+
+        NOW.set(Duration::from_secs(1_000_000));
+        let config = default_config();
+        let fleets = x86_and_arm_fleets();
+        let source = stack_on_test_clock(&fleets, &config)?;
+        let request = action(Isa::Aarch64, None);
+        let key = SketchKey::for_attempt(None, None, &request.command_digest.to_string());
+        // HistoricalResourceScheduler reads the system wall clock; use the same clock for
+        // the observation while keeping the scheduler's test clock deterministic.
+        let now_s = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let observation = Observation {
+            now_s,
+            peak_memory_kb: 200_000,
+            peak_disk_kb: 500_000,
+            cpu_millicores: Some(1_200),
+            ..Default::default()
+        };
+        assert!(!source.sketch.observe(key.clone(), &observation));
+        assert!(source.sketch.observe(key, &observation));
+        let durations = || {
+            Arc::new(Mutex::new(ActionDurations::new(
+                NonZeroUsize::MIN,
+                gang_config::HistoryWindow::from_units(1),
+            )))
+        };
+        let history = Histories::new(Arc::clone(&source.sketch), durations());
+        let now = gang_clock::Timestamp::from_unix_millis(now_s * 1000);
+        let mut records = Vec::new();
+        history.snapshot(now, &mut records)?;
+        assert!(!records.is_empty());
+
+        let restored = stack_on_test_clock(&fleets, &config)?;
+        Histories::new(Arc::clone(&restored.sketch), durations()).restore(now, &records)?;
+        let cold = stack_on_test_clock(&fleets, &config)?;
+        let learned = queued_reservations(&source, Arc::clone(&request)).await?;
+        let restarted = queued_reservations(&restored, Arc::clone(&request)).await?;
+        let cold_reservations = queued_reservations(&cold, request).await?;
+        assert_eq!(restarted, learned);
+        assert_ne!(
+            restarted, cold_reservations,
+            "restored admission must not use cold defaults"
+        );
+        assert!(restarted.iter().all(Option::is_some));
         Ok(())
     }
 
@@ -1216,13 +1617,16 @@ mod tests {
     impl RequestGate for Identify {
         fn admit(
             &self,
+            _scope: RequestScope,
             _peer: &Peer,
             _parts: &mut http::request::Parts,
-        ) -> impl Future<Output = Result<Admitted, PortError>> + Send {
-            std::future::ready(Ok(Admitted::Authenticated(Authenticated {
-                identity: Arc::new(alice()),
-                valid_until: None,
-            })))
+        ) -> impl Future<Output = Result<GateDecision, PortError>> + Send {
+            std::future::ready(Ok(GateDecision::Admit(Admitted::Authenticated(
+                Authenticated {
+                    identity: Arc::new(alice()),
+                    valid_until: None,
+                },
+            ))))
         }
     }
 
@@ -1257,7 +1661,14 @@ mod tests {
         let router = Router::new()
             .route("/reapi.Service/Method", get(|| async { "reapi" }))
             .fallback_service(api_service(Echo))
-            .layer(from_fn_with_state(Identify, admit::<Identify>));
+            .layer(from_fn_with_state(
+                GateState {
+                    gate: Identify,
+                    scope: RequestScope::Shared,
+                    force_not_leading: false,
+                },
+                admit::<Identify>,
+            ));
         let response = router
             .oneshot(Request::get(path).body(Body::empty())?)
             .await?;
@@ -1266,11 +1677,10 @@ mod tests {
         Ok((status, String::from_utf8(body.to_vec())?))
     }
 
-    /// Fitting outside the historical layer would leave memory at 30 GiB. Losing the operation
-    /// ID handoff would fit against all fleets: B's CPU reduction (8000/12000) is smaller than
-    /// A's memory reduction (22/30), so CPU would become 4000 instead of remaining 12000.
+    /// The cold-start memory exceeds the only fleet eligible for the requested CPU. Fitting
+    /// clamps memory to that fleet and reserves all its CPU.
     #[tokio::test]
-    async fn scheduler_stack_fits_reservations_to_the_admitted_fleet() {
+    async fn scheduler_stack_clamps_to_eligible_capacity_and_reserves_whole_cpu() {
         let fleets = FleetCatalog::try_new(
             [("fleet-a", 16, 8_u64), ("fleet-b", 4, 32)]
                 .into_iter()
@@ -1290,17 +1700,20 @@ mod tests {
                 .collect(),
         )
         .expect("valid fleet catalog");
-        let config: NativeLinkConfig = serde_json::from_value(json!({
-            "scheduler_name": "MAIN_SCHEDULER",
-            "cold_start": { "memory": "30GiB" },
-        }))
-        .expect("valid controller config");
+        let config = default_config();
+        let actions = Arc::new(
+            serde_json::from_value(json!({
+                "cold_start": { "memory": "30GiB" }
+            }))
+            .expect("valid action policy"),
+        );
         let store = RenderedStoreSpec(json!({ "memory": {} }));
         let (observations, _receiver) = gang_spi::ObservationSink::channel(
             std::num::NonZeroUsize::MIN,
             std::num::NonZeroUsize::MIN,
         );
         let spec = ControllerSpec {
+            actions: Arc::clone(&actions),
             content_store: &store,
             action_store: &store,
             fleets: &fleets,
@@ -1313,8 +1726,9 @@ mod tests {
             panic!("expected historical scheduler");
         };
         historical.learn_from_workers = false;
-        let (actions, _workers) =
-            scheduler_stack(&scheduler, &fleets, &config).expect("scheduler stack");
+        let SchedulerStack { actions, .. } =
+            scheduler_stack(&scheduler, &fleets, &actions, &OnceLock::new())
+                .expect("scheduler stack");
         let operation = OperationId::String("stack-wiring".to_owned());
         let digest = DigestInfo::new([1; 32], 1);
         let info = Arc::new(ActionInfo {
@@ -1349,8 +1763,8 @@ mod tests {
         let (info, _) = result.as_action_info().await.expect("queued action info");
         assert_eq!(
             info.platform_properties[property::CPU_MILLICORES],
-            "12000",
-            "scheduler stack must hand the admitted fleet to fitting by operation ID"
+            "16000",
+            "memory clamped to fleet A's capacity reserves its whole CPU"
         );
         assert_eq!(
             info.platform_properties[property::MEMORY_KB],
@@ -1383,14 +1797,14 @@ mod tests {
     async fn operation_origin_identity_is_the_gates_principal() {
         let fleets =
             FleetCatalog::try_new(vec![fleet("fleet-a", Isa::X86_64)]).expect("valid catalog");
-        let config: NativeLinkConfig =
-            serde_json::from_value(json!({ "scheduler_name": "MAIN_SCHEDULER" })).expect("config");
+        let config = NativeLinkConfig::default();
         let store = RenderedStoreSpec(json!({ "memory": {} }));
         let (sink, _receiver) = gang_spi::ObservationSink::channel(
             std::num::NonZeroUsize::MIN,
             std::num::NonZeroUsize::MIN,
         );
         let spec = ControllerSpec {
+            actions: Arc::new(gang_config::ActionsConfig::default()),
             content_store: &store,
             action_store: &store,
             fleets: &fleets,
@@ -1403,7 +1817,8 @@ mod tests {
             panic!("historical scheduler")
         };
         historical.learn_from_workers = false;
-        let (actions, _) = scheduler_stack(&scheduler, &fleets, &config).expect("stack");
+        let SchedulerStack { actions, .. } =
+            scheduler_stack(&scheduler, &fleets, &spec.actions, &OnceLock::new()).expect("stack");
         let info = origin_test_action();
         let metadata = RequestMetadata {
             tool_invocation_id: "invocation".to_owned(),

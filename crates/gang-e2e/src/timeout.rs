@@ -11,7 +11,7 @@ use crate::execution::{Execution, Lines, Role, held_build, running_scope};
 use crate::names::{action_timeout, exit_signal};
 use crate::system::{Probe, Sandbox, System};
 
-/// Runs under `[scheduler.nativelink.worker] action_timeout = "5s"` with per-action cgroups;
+/// Runs under `[actions] timeout = "5s"` with per-action cgroups;
 /// `sandbox` says whether the action's own `TMPDIR` is expected (noop) or none at all (bwrap).
 ///
 /// # Errors

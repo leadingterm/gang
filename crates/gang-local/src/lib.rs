@@ -12,8 +12,9 @@
 //!   kept in one PKCS#8 file.
 //!
 //! Building a plugin validates its configuration only. Each role opens the resources it uses
-//! on first use, so a plugin builds on every node that runs `gang`. The worker environment
-//! variable is exported as a constant:
+//! on first use, so a plugin builds on every node that runs `gang`. Controller incarnation alone
+//! may create private identity metadata; fleet changes still require the provisioner's fence.
+//! The worker environment variable is exported as a constant:
 //!
 //! ```
 //! use gang_local::INSTANCE_ENV;
@@ -25,6 +26,7 @@ mod errors;
 mod file_signer;
 mod filesystem_cache;
 mod fleet;
+mod host_identity;
 mod imds;
 mod imds_client;
 mod jwt;

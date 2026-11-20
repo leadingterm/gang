@@ -11,9 +11,10 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gang_clock::{Clock as _, SystemClock};
+use gang_tls::{HttpProtocol, HttpTransport, ServerTrust};
 use gang_types::announcement::{Announcement, ListenerRole, last_ca_pin};
 use gang_types::{CaPin, Url};
 use gang_wire::routes::LIST_EVENTS;
@@ -32,6 +33,7 @@ use crate::flags::Remote;
 use crate::gang_cli::GangCli;
 use crate::held_build::Cancel;
 use crate::host::Host;
+use crate::http::Http;
 use crate::identity::Credentials;
 use crate::issuer::{TestIssuer, TokenSpec};
 use crate::placement::Placement;
@@ -45,8 +47,8 @@ use crate::signer_key;
 use crate::sse::{self, EventStream as _, STREAM_OK};
 use crate::state_api::StateApi;
 use crate::system::{
-    HOLD_CPU_COUNT, HOLD_MEMORY_KB, LARGE_FLEET, Limits, Probe, Sandbox, ScopeFacts, System,
-    Variant,
+    AttemptRecord, HOLD_CPU_COUNT, HOLD_MEMORY_KB, LARGE_FLEET, Limits, PressureObservation, Probe,
+    Sandbox, ScopeFacts, System, Variant,
 };
 use crate::template::{ConfigTemplate, Transport};
 
@@ -92,10 +94,63 @@ fn signal_in(directory: &Path) -> Result<(PathBuf, crate::hold::Signal)> {
     Ok((path, signal))
 }
 
+fn prepare_admin_directories(placement: &Placement, transport: Transport) -> Result<()> {
+    if transport == Transport::Tls {
+        for directory in [
+            placement.home().join("admin"),
+            placement.home().join("admin-workspace"),
+        ] {
+            fs::create_dir_all(&directory)
+                .map_err(E2eError::io(format!("creating {}", directory.display())))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn populated(scope: &Path) -> Result<bool> {
+    let events = scope.join("cgroup.events");
+    let text = match fs::read_to_string(&events) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(E2eError::io(format!("reading {}", events.display()))(error)),
+    };
+    match text
+        .lines()
+        .find_map(|line| line.strip_prefix("populated "))
+    {
+        Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        _ => Err(E2eError::system(format!(
+            "invalid populated state in {}",
+            events.display()
+        ))),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_exited(pid: u32) -> Result<bool> {
+    let path = format!("/proc/{pid}/status");
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(E2eError::io(format!("reading {path}"))(error)),
+    };
+    let state = text
+        .lines()
+        .find_map(|line| line.strip_prefix("State:"))
+        .and_then(|value| value.split_whitespace().next())
+        .ok_or_else(|| E2eError::system(format!("missing process state in {path}")))?;
+    Ok(state == "Z" || state == "X")
+}
+
 /// A running `gang` deployment and the Bazel workspace that builds against it.
 pub struct Stack<'a> {
     placement: Placement,
     settings: Settings,
+    /// Sustained memory pressure duration configured for this scenario.
+    #[cfg(target_os = "linux")]
+    pressure_kill_after: Option<Duration>,
     /// Parameters used to stage another copy of this deployment's sample.
     sample_parameters: SampleParameters,
     /// The sample workspace this deployment was staged from.
@@ -131,9 +186,42 @@ pub struct Stack<'a> {
     /// The administrator of the running server, shared by every read of the scaling history and
     /// every revocation. A start replaces the endpoint it dials, so each start and kill drops it.
     administrator: Mutex<Option<Arc<Administrator<'a>>>>,
-    /// The HTTP client of the running server's API, built on first use once the CA pin is known.
+    /// The HTTP client of the running server's API, built on first use after its announcement.
     /// Its pooled connections reach one server process, so each start and kill drops it.
-    pub(crate) server_http: Mutex<Option<Arc<crate::http::Http>>>,
+    server_http: Mutex<Option<Arc<Http>>>,
+}
+
+/// Owns a separate Bazel server from preparation through its last build or early return.
+pub(crate) struct AdditionalBuild {
+    driver: Bazel,
+    remote: Remote,
+}
+
+impl AdditionalBuild {
+    pub(crate) fn build_until(
+        self,
+        probes: &[Probe],
+        run: &Run,
+        stop: oneshot::Receiver<String>,
+    ) -> Result<BuildOutcome> {
+        let result = self
+            .driver
+            .build_until(&self.remote, probes, Some(run), stop);
+        // A failed or cancelled build can leave its server wedged.
+        if result.is_ok() {
+            self.driver.shutdown(&self.remote);
+        }
+        result
+    }
+}
+
+impl Drop for AdditionalBuild {
+    fn drop(&mut self) {
+        // Also covers preparation failure, an unused prepared server, and failed shutdown.
+        if let Err(error) = self.driver.kill_servers() {
+            eprintln!("failed to kill the additional build's Bazel server: {error}");
+        }
+    }
 }
 
 impl<'a> Stack<'a> {
@@ -211,15 +299,7 @@ impl<'a> Stack<'a> {
         };
         sample::stage(&invocation.sample, &placement.workspace(), &parameters)?;
 
-        if transport == Transport::Tls {
-            for directory in [
-                placement.home().join("admin"),
-                placement.home().join("admin-workspace"),
-            ] {
-                fs::create_dir_all(&directory)
-                    .map_err(E2eError::io(format!("creating {}", directory.display())))?;
-            }
-        }
+        prepare_admin_directories(&placement, transport)?;
 
         Ok(Self {
             cli: GangCli::new(
@@ -250,6 +330,11 @@ impl<'a> Stack<'a> {
             developer: Mutex::new(false),
             host: Host::observe(),
             settings: settings.clone(),
+            #[cfg(target_os = "linux")]
+            pressure_kill_after: variant
+                .execution
+                .resource_policy
+                .map(|policy| policy.memory.pressure_kill_after.get()),
             sample_parameters: parameters,
             sample_source: invocation.sample.clone(),
             server: Mutex::new(None),
@@ -263,6 +348,16 @@ impl<'a> Stack<'a> {
     #[must_use]
     pub(crate) const fn placement(&self) -> &Placement {
         &self.placement
+    }
+
+    /// The selected client binary, configuration and original credential home.
+    pub(crate) const fn gang_cli(&self) -> &GangCli {
+        &self.cli
+    }
+
+    pub(crate) fn use_client_config(&mut self, config: PathBuf) {
+        self.cli = GangCli::new(self.binary.clone(), config.clone(), self.placement.home());
+        self.config_file = config;
     }
     /// Holds launches by keeping a private FIFO open until release.
     pub(crate) fn hold_worker_launches(&self) -> Result<()> {
@@ -476,6 +571,27 @@ impl<'a> Stack<'a> {
             .ok_or_else(|| E2eError::system("a plaintext deployment has no certificate authority"))
     }
 
+    /// Reuses the running server's plaintext or pinned TLS client across startup and API calls.
+    pub(crate) fn server_client(&self) -> Result<Arc<Http>> {
+        let mut slot = self.server_http.lock();
+        if let Some(client) = slot.as_ref() {
+            return Ok(Arc::clone(client));
+        }
+        let transport = match self.ca_pin.as_ref() {
+            Some(pin) => HttpTransport::Tls {
+                trust: ServerTrust::Pin(pin),
+            },
+            None => HttpTransport::Plain,
+        };
+        let http = Arc::new(Http::try_new(
+            transport,
+            HttpProtocol::Http2,
+            self.settings.command_timeout,
+        )?);
+        *slot = Some(Arc::clone(&http));
+        Ok(http)
+    }
+
     /// The session cookie of `principal` (`provider:principal`) for the running server, signed
     /// with the key the deployment was provisioned with and valid for the token lifetime.
     ///
@@ -595,18 +711,29 @@ impl<'a> Stack<'a> {
         output_root: &str,
         stop: oneshot::Receiver<String>,
     ) -> Result<BuildOutcome> {
-        let remote = self.remote()?;
-        let driver = self
-            .bazel
-            .with_output_user_root(self.placement.root().join(output_root));
-        let result = driver.build_until(&remote, probes, Some(run), stop);
-        // A failed or cancelled build can leave its server wedged; only a finished one stops cleanly.
-        if result.is_ok() {
-            driver.shutdown(&remote);
-        } else if let Err(error) = driver.kill_servers() {
-            eprintln!("failed to kill the additional build's Bazel server: {error}");
-        }
-        result
+        self.additional_build_in(output_root)?
+            .build_until(probes, run, stop)
+    }
+
+    /// Starts only the stack's Bazel server; the stack retains its cleanup ownership.
+    pub(crate) fn prepare_bazel(&self) -> Result<()> {
+        self.bazel.prepare(&self.remote()?)
+    }
+
+    /// Starts only the separate Bazel server, without loading or executing probe actions.
+    pub(crate) fn prepare_additional_in(&self, output_root: &str) -> Result<AdditionalBuild> {
+        let build = self.additional_build_in(output_root)?;
+        build.driver.prepare(&build.remote)?;
+        Ok(build)
+    }
+
+    fn additional_build_in(&self, output_root: &str) -> Result<AdditionalBuild> {
+        Ok(AdditionalBuild {
+            remote: self.remote()?,
+            driver: self
+                .bazel
+                .with_output_user_root(self.placement.root().join(output_root)),
+        })
     }
 
     /// Builds `probes` through `remote`, as `run` when there is one, returning how the build ended.
@@ -723,6 +850,27 @@ impl<'a> Stack<'a> {
         }
         *enrolled = true;
         Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    fn pressure_number(&self, path: &Path) -> Result<u64> {
+        let value = match read_trimmed(path) {
+            Ok(value) => value,
+            Err(E2eError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                let logs = local_evidence(
+                    &self.placement.state_dir().join("logs"),
+                    false,
+                    self.settings.log_tail_bytes,
+                );
+                return Err(E2eError::system(format!(
+                    "pressure action scope vanished before the observation at {}; worker logs:\n{logs}",
+                    path.display()
+                )));
+            }
+            Err(error) => return Err(error),
+        };
+        value
+            .parse()
+            .map_err(|_| E2eError::system(format!("invalid number in {}", path.display())))
     }
 }
 
@@ -887,13 +1035,24 @@ impl System for Stack<'_> {
         }
         let log = self.placement.server_log();
         let mut command = self.cli.server();
+        let started = Instant::now();
+        let remaining_startup = || {
+            self.settings
+                .startup_timeout
+                .checked_sub(started.elapsed())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| {
+                    E2eError::timeout(
+                        "the server to start and admit client traffic",
+                        self.settings.startup_timeout,
+                    )
+                })
+        };
         let mut child = Supervised::spawn(&mut command, &log)?;
-        // The server prints the addresses it bound, then its startup line: its CA pin, or its
-        // plaintext endpoint. That line is the event that the deployment accepts connections.
-        // The wait ends with it, or when the server's output closes, which happens when it exits.
-        let Some(lines) =
-            child.await_announcements(self.settings.startup_timeout, is_announcement)?
-        else {
+        // The CA pin or plaintext endpoint announces the warm launch milestone, not promotion.
+        // Record the child and its listeners before waiting for client traffic admission.
+        // The announcement wait ends when stdout closes if the server exits first.
+        let Some(lines) = child.await_announcements(remaining_startup()?, is_announcement)? else {
             return Err(E2eError::system(format!(
                 "the gang server exited before announcing itself; log tail: {}",
                 log_tail(&log, self.settings.log_tail_bytes)
@@ -926,6 +1085,8 @@ impl System for Stack<'_> {
         drop(slot);
         *self.worker.lock() = Some(listeners.worker);
         *self.endpoint.lock() = Some(endpoint);
+        let client = self.server_client()?;
+        client.wait_for_client_traffic(&self.endpoint()?, remaining_startup()?)?;
         secured::render_deployment_bazelrc(
             &self.binary,
             &self.config_file,
@@ -1097,16 +1258,187 @@ impl Limits for Stack<'_> {
         Ok(scope.directory.exists())
     }
 
-    fn attempts(&self) -> Result<usize> {
+    fn attempt_records(&self) -> Result<Vec<AttemptRecord>> {
         let path = crate::flags::attempts_path(&self.signal_path);
-        match std::fs::read_to_string(&path) {
-            Ok(text) => Ok(text.lines().count()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
-            Err(error) => Err(E2eError::Io {
-                operation: format!("reading the attempts {}", path.display()),
-                source: error,
-            }),
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(E2eError::Io {
+                    operation: format!("reading the attempts {}", path.display()),
+                    source,
+                });
+            }
+        };
+        text.lines()
+            .map(|line| {
+                let mut fields = line.split_whitespace();
+                let (Some(action), Some(memory), None) =
+                    (fields.next(), fields.next(), fields.next())
+                else {
+                    return Err(E2eError::system(format!("invalid attempt record: {line}")));
+                };
+                let memory_kb = memory.parse().map_err(|_| {
+                    E2eError::system(format!("invalid attempt reservation: {line}"))
+                })?;
+                Ok(AttemptRecord {
+                    action: action.to_owned(),
+                    memory_kb,
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn induce_pressure(&self, victim_pid: u32, neighbour_pid: u32) -> Result<PressureObservation> {
+        use std::io::Write as _;
+        use std::time::Instant;
+
+        let scope = |pid: u32| -> Result<PathBuf> {
+            let path = format!("/proc/{pid}/cgroup");
+            let text =
+                fs::read_to_string(&path).map_err(E2eError::io(format!("reading {path}")))?;
+            let relative = text
+                .lines()
+                .find_map(|line| line.strip_prefix("0::"))
+                .ok_or_else(|| E2eError::system(format!("process {pid} has no unified cgroup")))?;
+            Ok(self
+                .settings
+                .cgroup_root
+                .join(relative.trim_start_matches('/')))
+        };
+        let victim = scope(victim_pid)?;
+        let neighbour = scope(neighbour_pid)?;
+        let pool = victim
+            .parent()
+            .ok_or_else(|| E2eError::system("victim has no pool"))?;
+        if neighbour.parent() != Some(pool) {
+            return Err(E2eError::system(
+                "pressure probes are not in the same action pool",
+            ));
         }
+        let settle = self
+            .pressure_kill_after
+            .ok_or_else(|| E2eError::system("pressure scenario has no resource policy"))?
+            .saturating_mul(3);
+        let hold_timeout = self.settings.hold_timeout.max(settle);
+        let deadline = Instant::now() + hold_timeout;
+        let mut previous_peak = None;
+        let mut stable_peak = None;
+        while Instant::now() < deadline {
+            let held = self.pressure_number(&victim.join("memory.current"))?
+                >= self.settings.pressure_victim_minimum.as_u64()
+                && self.pressure_number(&neighbour.join("memory.current"))?
+                    >= self.settings.pressure_neighbour_minimum.as_u64();
+            let peak = self.pressure_number(&victim.join("memory.peak"))?;
+            if held && previous_peak == Some(peak) {
+                stable_peak = Some(peak);
+                break;
+            }
+            previous_peak = held.then_some(peak);
+            std::thread::sleep(self.settings.pressure_observe_interval);
+        }
+        let peak = stable_peak.ok_or_else(|| {
+            E2eError::system("pressure probes did not reach stable held allocations")
+        })?;
+        let high = pool.join("memory.high");
+        let original = read_trimmed(&high)?;
+        let victim_current = self.pressure_number(&victim.join("memory.current"))?;
+        let neighbour_current = self.pressure_number(&neighbour.join("memory.current"))?;
+        let high_bytes = neighbour_current
+            .checked_add(victim_current / 2)
+            .ok_or_else(|| E2eError::system("pressure threshold exceeds u64"))?;
+        let fd = rustix::fs::open(
+            &high,
+            rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(E2eError::system_from("opening memory.high"))?;
+        let mut file = std::fs::File::from(fd);
+        write!(file, "{high_bytes}").map_err(E2eError::io("lowering memory.high"))?;
+        let churn = self.signal_path.with_file_name("churn");
+        if let Err(error) = fs::write(&churn, "") {
+            fs::write(&high, &original).map_err(E2eError::io("restoring memory.high"))?;
+            return Err(E2eError::io(format!("creating {}", churn.display()))(error));
+        }
+        let deadline = Instant::now() + hold_timeout;
+        let victim_killed = (|| -> Result<bool> {
+            loop {
+                if process_exited(victim_pid)? {
+                    return Ok(true);
+                }
+                if Instant::now() >= deadline {
+                    return Ok(false);
+                }
+                std::thread::sleep(self.settings.pressure_observe_interval);
+            }
+        })();
+        let restored = fs::write(&high, original).map_err(E2eError::io("restoring memory.high"));
+        let removed =
+            fs::remove_file(&churn).map_err(E2eError::io(format!("removing {}", churn.display())));
+        restored?;
+        removed?;
+        let victim_exited = victim_killed?;
+        while victim_exited && populated(&victim)? && Instant::now() < deadline {
+            std::thread::sleep(self.settings.pressure_observe_interval);
+        }
+        let victim_killed = victim_exited && !populated(&victim)?;
+        std::thread::sleep(settle);
+        let observed = PressureObservation {
+            victim_peak_kb: peak.div_ceil(1024),
+            victim_killed,
+            neighbour_alive: populated(&neighbour)?,
+        };
+        Ok(observed)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn induce_pressure(
+        &self,
+        _victim_pid: u32,
+        _neighbour_pid: u32,
+    ) -> Result<PressureObservation> {
+        Err(E2eError::system("memory pressure requires Linux cgroups"))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn await_pool_oom(&self, victim_pid: u32, neighbour_pid: u32) -> Result<u64> {
+        let pool = [victim_pid, neighbour_pid]
+            .into_iter()
+            .find_map(|pid| {
+                let text = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+                let relative = text.lines().find_map(|line| line.strip_prefix("0::"))?;
+                let scope = self
+                    .settings
+                    .cgroup_root
+                    .join(relative.trim_start_matches('/'));
+                scope.parent().map(Path::to_path_buf)
+            })
+            .ok_or_else(|| E2eError::system("neither pool OOM probe has a cgroup"))?;
+        let events = pool.join("memory.events");
+        let deadline = std::time::Instant::now() + self.settings.hold_timeout;
+        loop {
+            let text = fs::read_to_string(&events)
+                .map_err(E2eError::io(format!("reading {}", events.display())))?;
+            let value = text
+                .lines()
+                .find_map(|line| line.strip_prefix("oom_kill "))
+                .ok_or_else(|| E2eError::system("pool memory.events has no oom_kill count"))?;
+            let count = value
+                .parse::<u64>()
+                .map_err(E2eError::system_from("parsing pool oom_kill count"))?;
+            if count > 0 || std::time::Instant::now() >= deadline {
+                return Ok(count);
+            }
+            std::thread::sleep(self.settings.pressure_observe_interval);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn await_pool_oom(&self, _victim_pid: u32, _neighbour_pid: u32) -> Result<u64> {
+        Err(E2eError::system(
+            "pool OOM observation requires Linux cgroups",
+        ))
     }
 }
 

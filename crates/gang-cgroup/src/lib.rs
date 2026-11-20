@@ -24,7 +24,7 @@ mod parse;
 mod test_tree;
 
 pub use cgroup::Cgroup;
-pub use config::{CgroupConfig, CpuPeriod, CpuPeriodError, Delegation, OomGroup};
+pub use config::{CgroupConfig, CpuPeriod, CpuPeriodError, Delegation};
 pub use controller::CgroupScope;
 pub use errors::CgroupError;
 pub use join::join;

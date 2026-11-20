@@ -14,6 +14,4 @@ gang-config = { workspace = true }
 gang-spi = { workspace = true }
 gang-types = { workspace = true }
 gang-wire = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 thiserror = { workspace = true }

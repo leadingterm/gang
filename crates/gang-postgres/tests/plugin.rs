@@ -11,14 +11,406 @@ use std::time::Duration;
 use gang_clock::Timestamp;
 use gang_postgres::{Postgres, PostgresConfig, PostgresError, Tls};
 use gang_spi::{
-    Acquisition, CertStatus, ControllerId, ExpiringRecordPort, IssuedCertRecord, LeaderLeasePort,
-    PortError, RecordId, RecordKey, RecordKind, RecordVersion, RecordedScalingEvent,
-    ScalingAuditEvent, ScalingEventKind, ScalingEventSeq, StateRepositoryPort,
+    Acquisition, ApplyRecords, CandidateGeneration, CandidatePriority, CertStatus,
+    ControllerHostIdentity, ControllerId, ExpiringRecordPort, Insert, IssuedCertRecord,
+    LeaderLeasePort, LeaseCandidate, PortError, RecordBatchSeq, RecordChange, RecordId, RecordKey,
+    RecordKind, RecordVersion, RecordedScalingEvent, Renewal, ScalingAuditEvent, ScalingEventKind,
+    ScalingEventSeq, StateRepositoryPort, Takeover,
 };
 use gang_testkit::{POSTGRES_ARCHIVE_ENV, PostgresServer, SUPERUSER, shared_postgres};
 use gang_types::{
-    CertSerial, FleetName, Identity, NonZeroDuration, Principal, ProviderName, WorkerId,
+    CertSerial, FleetName, Identity, InstanceId, NonZeroDuration, Principal, ProviderName, WorkerId,
 };
+
+fn candidate(holder: &str) -> LeaseCandidate {
+    LeaseCandidate {
+        holder: ControllerId::new(holder),
+        priority: CandidatePriority::registered(CandidateGeneration::default()),
+    }
+}
+
+fn host(name: &str) -> Result<ControllerHostIdentity, Box<dyn Error>> {
+    Ok(ControllerHostIdentity::Persistent(InstanceId::try_new(
+        name,
+    )?))
+}
+
+#[tokio::test]
+async fn legacy_writer_epoch_invalidates_priority_binding() -> Result<(), Box<dyn Error>> {
+    let server = shared_postgres()?;
+    let config = support::database(&server).await?;
+    let db = support::build(config.clone())?;
+    let older = db
+        .register_candidate(&ControllerId::new("older"), &host("older-host")?)
+        .await?;
+    let newer = db
+        .register_candidate(&ControllerId::new("newer"), &host("newer-host")?)
+        .await?;
+    let now = Timestamp::from_unix_millis(1);
+    let expires = Timestamp::from_unix_millis(1000);
+    let Acquisition::Acquired(lease) = db
+        .acquire(&newer, now, now, expires, Takeover::Observe)
+        .await?
+    else {
+        return Err("newer candidate did not acquire".into());
+    };
+    db.release(&lease).await?;
+    let raw = support::raw(&server, &config.database).await?;
+    raw.execute(
+        "UPDATE leases SET holder = 'legacy', epoch = epoch + 1, holder_priority = 'invalid', pending_holder = 'newer', pending_priority = $1, pending_epoch = epoch, pending_expires_at = expires_at WHERE name = 'leader'",
+        &[&newer.priority.as_str()],
+    )
+    .await?;
+    let Acquisition::Contending(legacy) = db
+        .acquire(&older, now, now, expires, Takeover::Request)
+        .await?
+    else {
+        return Err("older candidate did not contend with legacy holder".into());
+    };
+    assert_eq!(legacy.holder, ControllerId::new("legacy"));
+    assert!(matches!(
+        db.renew(&legacy, now, expires).await?,
+        gang_spi::Renewal::YieldRequested(_)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_host_registration_is_permanent_and_idempotent() -> Result<(), Box<dyn Error>> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let server = shared_postgres()?;
+        let config = support::database(&server).await?;
+        let a = support::build(config.clone())?;
+        let b = support::build(config.clone())?;
+        tokio::try_join!(a.revocation_epoch(), b.revocation_epoch())?;
+        let identity = host("original-host")?;
+        let first_holder = ControllerId::new("first-process");
+        let second_holder = ControllerId::new("second-process");
+        let (first, second) = tokio::try_join!(
+            a.register_candidate(&first_holder, &identity),
+            b.register_candidate(&second_holder, &identity),
+        )?;
+        assert_eq!(first.priority, second.priority);
+        assert_eq!(
+            first.priority,
+            CandidatePriority::registered(CandidateGeneration::new(1))
+        );
+        let replacement = b
+            .register_candidate(&ControllerId::new("replacement"), &host("replacement-host")?)
+            .await?;
+        assert!(replacement.priority > first.priority);
+        drop(a);
+        drop(b);
+        let restarted = support::build(config.clone())?
+            .register_candidate(&ControllerId::new("restarted-process"), &identity)
+            .await?;
+        assert_eq!(restarted.priority, first.priority);
+        assert_ne!(restarted.holder, first.holder);
+        let raw = support::raw(&server, &config.database).await?;
+        let row = raw
+            .query_one(
+                "SELECT value, (SELECT count(*) FROM controller_hosts) AS hosts FROM counters WHERE name = 'candidate'",
+                &[],
+            )
+            .await?;
+        assert_eq!(row.get::<_, i64>("value"), 2);
+        assert_eq!(row.get::<_, i64>("hosts"), 2);
+        Ok::<(), Box<dyn Error>>(())
+    })
+    .await?
+}
+
+async fn restart_cannot_reverse_handoff(
+    old_host: &ControllerHostIdentity,
+    new_host: &ControllerHostIdentity,
+) -> Result<(), Box<dyn Error>> {
+    let server = shared_postgres()?;
+    let config = support::database(&server).await?;
+    let db = support::build(config.clone())?;
+    let older = db
+        .register_candidate(&ControllerId::new("old-process"), old_host)
+        .await?;
+    let newer = db
+        .register_candidate(&ControllerId::new("new-process"), new_host)
+        .await?;
+    let now = Timestamp::from_unix_millis(1);
+    let expires = Timestamp::from_unix_millis(1000);
+    let Acquisition::Acquired(old_lease) = db
+        .acquire(&older, now, now, expires, Takeover::Observe)
+        .await?
+    else {
+        return Err("old host did not acquire".into());
+    };
+    assert!(matches!(
+        db.acquire(&newer, now, now, expires, Takeover::Request)
+            .await?,
+        Acquisition::Contending(_)
+    ));
+    assert!(matches!(
+        db.renew(&old_lease, now, expires).await?,
+        Renewal::YieldRequested(_)
+    ));
+    db.release(&old_lease).await?;
+    let Acquisition::Acquired(new_lease) = db
+        .acquire(&newer, now, now, expires, Takeover::Observe)
+        .await?
+    else {
+        return Err("replacement did not acquire its reservation".into());
+    };
+    let restarted_db = support::build(config)?;
+    let restarted = restarted_db
+        .register_candidate(&ControllerId::new("restarted-process"), old_host)
+        .await?;
+    assert_eq!(restarted.priority, older.priority);
+    assert!(restarted.priority < newer.priority);
+    let same_host = restarted_db
+        .register_candidate(&ControllerId::new("same-host-process"), new_host)
+        .await?;
+    assert_eq!(same_host.priority, newer.priority);
+    for tick in 2..5 {
+        let now = Timestamp::from_unix_millis(tick);
+        assert_eq!(
+            restarted_db
+                .acquire(&restarted, now, now, expires, Takeover::Request)
+                .await?,
+            Acquisition::Held(new_lease.clone())
+        );
+        assert_eq!(
+            restarted_db
+                .acquire(&same_host, now, now, expires, Takeover::Request)
+                .await?,
+            Acquisition::Held(new_lease.clone())
+        );
+        assert_eq!(
+            db.renew(&new_lease, now, expires).await?,
+            Renewal::Renewed(new_lease.clone())
+        );
+    }
+    assert_eq!(db.renew(&old_lease, now, expires).await?, Renewal::Lost);
+    db.release(&old_lease).await?;
+    assert_eq!(
+        db.renew(&new_lease, now, expires).await?,
+        Renewal::Renewed(new_lease)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn restarted_persistent_host_cannot_reverse_handoff() -> Result<(), Box<dyn Error>> {
+    restart_cannot_reverse_handoff(&host("old-host")?, &host("new-host")?).await
+}
+
+#[tokio::test]
+async fn launched_priority_uses_metadata_without_allocating_generations()
+-> Result<(), Box<dyn Error>> {
+    let server = shared_postgres()?;
+    let config = support::database(&server).await?;
+    let db = support::build(config.clone())?;
+    let launched = |millis, instance: &str| -> Result<ControllerHostIdentity, Box<dyn Error>> {
+        Ok(ControllerHostIdentity::Launched {
+            at: Timestamp::from_unix_millis(millis),
+            instance: InstanceId::try_new(instance)?,
+        })
+    };
+    let latest_host = launched(20, "instance-a")?;
+    let older_host = launched(10, "instance-z")?;
+    let tied_host = launched(20, "instance-z")?;
+    let latest = db
+        .register_candidate(&ControllerId::new("latest"), &latest_host)
+        .await?;
+    let older = db
+        .register_candidate(&ControllerId::new("older"), &older_host)
+        .await?;
+    let tied = db
+        .register_candidate(&ControllerId::new("tied"), &tied_host)
+        .await?;
+    assert!(older.priority < latest.priority);
+    assert!(latest.priority < tied.priority);
+    let restarted = support::build(config.clone())?
+        .register_candidate(&ControllerId::new("restart"), &latest_host)
+        .await?;
+    assert_eq!(restarted.priority, latest.priority);
+    let raw = support::raw(&server, &config.database).await?;
+    let row = raw
+        .query_one(
+            "SELECT value, (SELECT count(*) FROM controller_hosts) AS hosts FROM counters WHERE name = 'candidate'",
+            &[],
+        )
+        .await?;
+    assert_eq!(row.get::<_, i64>("value"), 0);
+    assert_eq!(row.get::<_, i64>("hosts"), 0);
+    restart_cannot_reverse_handoff(&older_host, &latest_host).await?;
+    restart_cannot_reverse_handoff(&latest_host, &tied_host).await
+}
+
+#[tokio::test]
+async fn only_current_live_priorities_are_validated() -> Result<(), Box<dyn Error>> {
+    let server = shared_postgres()?;
+    let config = support::database(&server).await?;
+    let db = support::build(config.clone())?;
+    let owner = db
+        .register_candidate(&ControllerId::new("owner"), &host("owner-host")?)
+        .await?;
+    let next = db
+        .register_candidate(&ControllerId::new("next"), &host("next-host")?)
+        .await?;
+    let now = Timestamp::from_unix_millis(1);
+    let expires = Timestamp::from_unix_millis(1000);
+    let Acquisition::Acquired(lease) = db
+        .acquire(&owner, now, now, expires, Takeover::Observe)
+        .await?
+    else {
+        return Err("owner did not acquire".into());
+    };
+    let raw = support::raw(&server, &config.database).await?;
+    raw.batch_execute("UPDATE leases SET holder_priority = 'invalid'")
+        .await?;
+    assert_corrupt(
+        db.acquire(&next, now, now, expires, Takeover::Request)
+            .await,
+        "holder_priority",
+    );
+    assert_corrupt(db.renew(&lease, now, expires).await, "holder_priority");
+    raw.execute(
+        "UPDATE leases SET holder_priority = $1, pending_holder = 'next', pending_priority = 'invalid', pending_epoch = epoch, pending_expires_at = expires_at",
+        &[&owner.priority.as_str()],
+    )
+    .await?;
+    assert_corrupt(
+        db.acquire(&next, now, now, expires, Takeover::Request)
+            .await,
+        "pending_priority",
+    );
+    assert_corrupt(db.renew(&lease, now, expires).await, "pending_priority");
+    raw.batch_execute("UPDATE leases SET pending_epoch = epoch - 1")
+        .await?;
+    assert!(matches!(
+        db.renew(&lease, now, expires).await?,
+        Renewal::Renewed(_)
+    ));
+    raw.batch_execute(
+        "UPDATE leases SET pending_epoch = epoch, pending_expires_at = '1970-01-01T00:00:00Z'",
+    )
+    .await?;
+    assert!(matches!(
+        db.renew(&lease, now, expires).await?,
+        Renewal::Renewed(_)
+    ));
+    raw.batch_execute(
+        "UPDATE leases SET holder_priority = NULL, pending_holder = NULL, pending_priority = NULL",
+    )
+    .await?;
+    assert!(matches!(
+        db.acquire(
+            &candidate("legacy-ranked"),
+            now,
+            now,
+            expires,
+            Takeover::Request
+        )
+        .await?,
+        Acquisition::Contending(_)
+    ));
+    assert!(matches!(
+        db.renew(&lease, now, expires).await?,
+        Renewal::YieldRequested(_)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn expiring_records_pages_live_records_by_kind_and_id() -> Result<(), Box<dyn Error>> {
+    let server = shared_postgres()?;
+    let config = support::database(&server).await?;
+    let db = support::build(config)?;
+    let ts = Timestamp::from_unix_millis;
+    let now = ts(1_000);
+    let key = |kind, byte| RecordKey {
+        kind,
+        id: RecordId::new([byte; 32]),
+    };
+    let first = key(RecordKind::InfrastructureEvent, 1);
+    let expired = key(RecordKind::InfrastructureEvent, 2);
+    let second = key(RecordKind::InfrastructureEvent, 3);
+    let foreign = key(RecordKind::LoginAttempt, 4);
+    assert_eq!(
+        db.insert(
+            &[
+                (first, b"first"),
+                (second, b"second"),
+                (foreign, b"foreign")
+            ],
+            RecordVersion::new(7),
+            now,
+            ts(3_000)
+        )
+        .await?,
+        Insert::Inserted
+    );
+    assert_eq!(
+        db.insert(
+            &[(expired, b"expired")],
+            RecordVersion::new(8),
+            now,
+            ts(2_000)
+        )
+        .await?,
+        Insert::Inserted
+    );
+    let mut records = Vec::new();
+    let limit = NonZeroUsize::new(1).ok_or("nonzero limit")?;
+    assert!(
+        db.records(
+            RecordKind::InfrastructureEvent,
+            None,
+            limit,
+            ts(2_000),
+            &mut records
+        )
+        .await?
+    );
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].0, first.id);
+    assert_eq!(records[0].1.body, b"first");
+    assert_eq!(records[0].1.version, RecordVersion::new(7));
+    assert_eq!(records[0].1.expires_at, ts(3_000));
+    assert!(
+        !db.records(
+            RecordKind::InfrastructureEvent,
+            Some(first.id),
+            limit,
+            ts(2_000),
+            &mut records
+        )
+        .await?
+    );
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].0, second.id);
+    assert_eq!(records[0].1.body, b"second");
+    assert!(
+        !db.records(
+            RecordKind::InfrastructureEvent,
+            Some(second.id),
+            limit,
+            ts(2_000),
+            &mut records
+        )
+        .await?
+    );
+    assert!(records.is_empty());
+    assert!(
+        !db.records(
+            RecordKind::InfrastructureEvent,
+            None,
+            limit,
+            ts(3_000),
+            &mut records
+        )
+        .await?
+    );
+    assert!(records.is_empty());
+    Ok(())
+}
 
 #[tokio::test]
 async fn concurrent_plugins_migrate_one_database() -> Result<(), Box<dyn Error>> {
@@ -49,6 +441,11 @@ async fn text_audit_details_migrate_without_loss() -> Result<(), Box<dyn Error>>
     let raw = support::raw(&server, &config.database).await?;
     raw.batch_execute(
         "ALTER TABLE scaling_audit ALTER COLUMN detail TYPE text USING convert_from(detail, 'UTF8'); \
+         ALTER TABLE leases DROP COLUMN record_sequence; \
+         ALTER TABLE leases DROP COLUMN holder_priority, DROP COLUMN holder_priority_epoch, \
+             DROP COLUMN pending_holder, DROP COLUMN pending_priority, DROP COLUMN pending_epoch, DROP COLUMN pending_expires_at; \
+         DROP TABLE controller_hosts; \
+         DELETE FROM counters WHERE name = 'candidate'; \
          UPDATE schema_version SET current = 1, oldest_compatible = 1;",
     )
     .await?;
@@ -98,6 +495,155 @@ async fn text_audit_details_migrate_without_loss() -> Result<(), Box<dyn Error>>
 }
 
 #[tokio::test]
+async fn lease_and_history_survive_version_two_migration() -> Result<(), Box<dyn Error>> {
+    let server = shared_postgres()?;
+    let config = support::database(&server).await?;
+    let db = support::build(config.clone())?;
+    let now = Timestamp::from_unix_millis(10);
+    let expires = Timestamp::from_unix_millis(100);
+    let Acquisition::Acquired(lease) = db
+        .acquire(&candidate("original"), now, now, expires, Takeover::Observe)
+        .await?
+    else {
+        return Err("lease not acquired".into());
+    };
+    let key = RecordKey {
+        kind: RecordKind::ResourceHistory,
+        id: RecordId::new([42; 32]),
+    };
+    db.insert(&[(key, b"history")], RecordVersion::new(9), now, expires)
+        .await?;
+    let raw = support::raw(&server, &config.database).await?;
+    raw.batch_execute(
+        "ALTER TABLE leases DROP COLUMN record_sequence, DROP COLUMN holder_priority, \
+             DROP COLUMN holder_priority_epoch, DROP COLUMN pending_holder, \
+             DROP COLUMN pending_priority, DROP COLUMN pending_epoch, DROP COLUMN pending_expires_at; \
+         DROP TABLE controller_hosts; \
+         DELETE FROM counters WHERE name = 'candidate'; \
+         UPDATE schema_version SET current = 2, oldest_compatible = 2;",
+    )
+    .await?;
+    drop(db);
+
+    let db = support::build(config)?;
+    let record = db
+        .get(&key, now)
+        .await?
+        .ok_or("history missing after migration")?;
+    assert_eq!(record.body, b"history");
+    assert_eq!(record.version, RecordVersion::new(9));
+    assert_eq!(record.expires_at, expires);
+    let renewed = match db.renew(&lease, now, expires).await? {
+        Renewal::Renewed(renewed) => renewed,
+        Renewal::Lost => return Err("lease lost during migration".into()),
+        Renewal::YieldRequested(_) => return Err("unexpected handoff during migration".into()),
+    };
+    assert_eq!(renewed.holder, lease.holder);
+    assert_eq!(renewed.epoch, lease.epoch);
+    assert_eq!(
+        db.apply(
+            &renewed,
+            RecordBatchSeq::new(1),
+            RecordVersion::new(10),
+            now,
+            &[]
+        )
+        .await?,
+        ApplyRecords::Applied
+    );
+    let delete = [RecordChange::Delete { key }];
+    assert_eq!(
+        db.apply(
+            &renewed,
+            RecordBatchSeq::new(1),
+            RecordVersion::new(11),
+            now,
+            &delete
+        )
+        .await?,
+        ApplyRecords::Fenced
+    );
+    assert_eq!(
+        db.get(&key, now)
+            .await?
+            .ok_or("history deleted by stale batch")?
+            .body,
+        b"history"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn version_three_migration_preserves_record_sequence_fencing() -> Result<(), Box<dyn Error>> {
+    let server = shared_postgres()?;
+    let config = support::database(&server).await?;
+    let db = support::build(config.clone())?;
+    let now = Timestamp::from_unix_millis(10);
+    let expires = Timestamp::from_unix_millis(100);
+    let Acquisition::Acquired(lease) = db
+        .acquire(&candidate("original"), now, now, expires, Takeover::Observe)
+        .await?
+    else {
+        return Err("lease not acquired".into());
+    };
+    assert_eq!(
+        db.apply(
+            &lease,
+            RecordBatchSeq::new(4),
+            RecordVersion::new(9),
+            now,
+            &[],
+        )
+        .await?,
+        ApplyRecords::Applied
+    );
+    let raw = support::raw(&server, &config.database).await?;
+    raw.batch_execute(
+        "ALTER TABLE leases DROP COLUMN holder_priority, DROP COLUMN holder_priority_epoch, \
+             DROP COLUMN pending_holder, DROP COLUMN pending_priority, \
+             DROP COLUMN pending_epoch, DROP COLUMN pending_expires_at; \
+         DROP TABLE controller_hosts; \
+         DELETE FROM counters WHERE name = 'candidate'; \
+         UPDATE schema_version SET current = 3, oldest_compatible = 2;",
+    )
+    .await?;
+    drop(db);
+    let db = support::build(config)?;
+    assert_eq!(
+        db.renew(&lease, now, expires).await?,
+        Renewal::Renewed(lease.clone())
+    );
+    assert_eq!(
+        db.apply(
+            &lease,
+            RecordBatchSeq::new(4),
+            RecordVersion::new(10),
+            now,
+            &[],
+        )
+        .await?,
+        ApplyRecords::Fenced
+    );
+    assert_eq!(
+        db.apply(
+            &lease,
+            RecordBatchSeq::new(5),
+            RecordVersion::new(11),
+            now,
+            &[],
+        )
+        .await?,
+        ApplyRecords::Applied
+    );
+    let row = raw
+        .query_one("SELECT current, oldest_compatible FROM schema_version", &[])
+        .await?;
+    assert_eq!(row.get::<_, i32>("current"), 4);
+    assert_eq!(row.get::<_, i32>("oldest_compatible"), 2);
+    Ok(())
+}
+
+#[tokio::test]
 async fn unreachable_server_is_unavailable() -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
@@ -131,6 +677,29 @@ async fn timed_out_connection_is_discarded() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn launched_registration_checks_database_after_schema_is_cached() -> Result<(), Box<dyn Error>>
+{
+    let server = PostgresServer::from_env()?;
+    let mut config = support::database(&server).await?;
+    config.connect_timeout = NonZeroDuration::from_millis(500);
+    config.statement_timeout = NonZeroDuration::from_millis(500);
+    let db = support::build(config)?;
+    let identity = ControllerHostIdentity::Launched {
+        at: Timestamp::from_unix_millis(10),
+        instance: InstanceId::try_new("instance-a")?,
+    };
+    let holder = ControllerId::new("first");
+    let first = db.register_candidate(&holder, &identity).await?;
+    server.pause()?;
+    let paused = db.register_candidate(&holder, &identity).await;
+    server.resume()?;
+    assert!(matches!(paused, Err(PortError::Unavailable(_))));
+    assert_eq!(db.register_candidate(&holder, &identity).await?, first);
+    Ok(())
+}
+
 #[tokio::test]
 async fn incompatible_schema_refuses_all_port_families() -> Result<(), Box<dyn Error>> {
     let server = shared_postgres()?;
@@ -159,7 +728,8 @@ async fn incompatible_schema_refuses_all_port_families() -> Result<(), Box<dyn E
         Err(PortError::Backend(_))
     ));
     assert!(matches!(
-        db.acquire(&ControllerId::new("a"), now, expires).await,
+        db.acquire(&candidate("a"), now, now, expires, Takeover::Observe)
+            .await,
         Err(PortError::Backend(_))
     ));
     let key = RecordKey {
@@ -236,11 +806,13 @@ async fn no_named_prepared_statements() -> Result<(), Box<dyn Error>> {
     .await?;
     db.scaling_events(ScalingEventSeq::new(0), None, limit, &mut Vec::new())
         .await?;
-    let Acquisition::Acquired(lease) = db.acquire(&ControllerId::new("a"), now, expires).await?
+    let Acquisition::Acquired(lease) = db
+        .acquire(&candidate("a"), now, now, expires, Takeover::Observe)
+        .await?
     else {
         return Err("lease was not acquired".into());
     };
-    db.renew(&lease, expires).await?;
+    db.renew(&lease, now, expires).await?;
     db.release(&lease).await?;
     let key = RecordKey {
         kind: RecordKind::LoginAttempt,
@@ -364,9 +936,11 @@ async fn a_transient_sql_error_discards_its_connection() -> Result<(), Box<dyn E
     .await??;
     let failed = db
         .acquire(
-            &ControllerId::new("a"),
+            &candidate("a"),
+            Timestamp::from_unix_millis(1),
             Timestamp::from_unix_millis(1),
             Timestamp::from_unix_millis(100),
+            Takeover::Observe,
         )
         .await;
     admin
@@ -428,7 +1002,11 @@ async fn malformed_stored_values_and_missing_counter_are_backend_errors()
          DELETE FROM counters WHERE name = 'revocation'"
     ).await?;
     let now = Timestamp::from_unix_millis(1);
-    assert_corrupt(db.acquire(&ControllerId::new("b"), now, now).await, "epoch");
+    assert_corrupt(
+        db.acquire(&candidate("b"), now, now, now, Takeover::Observe)
+            .await,
+        "epoch",
+    );
     client
         .batch_execute("ALTER TABLE leases ALTER COLUMN expires_at DROP NOT NULL; UPDATE leases SET epoch = 1, expires_at = NULL WHERE name = 'leader'")
         .await?;
@@ -441,7 +1019,8 @@ async fn malformed_stored_values_and_missing_counter_are_backend_errors()
         "NULL must fail timestamp decoding"
     );
     assert_corrupt(
-        db.acquire(&ControllerId::new("b"), now, now).await,
+        db.acquire(&candidate("b"), now, now, now, Takeover::Observe)
+            .await,
         "expires_at",
     );
     assert_corrupt(db.revocation_epoch().await, "counters");
@@ -495,9 +1074,11 @@ async fn a_cancelled_lease_call_cannot_commit_once_its_lock_is_free() -> Result<
         let db: Postgres = support::build(config)?;
         let seeded = db
             .acquire(
-                &ControllerId::new("seed"),
+                &candidate("seed"),
+                Timestamp::from_unix_millis(1),
                 Timestamp::from_unix_millis(1),
                 Timestamp::from_unix_millis(1001),
+                Takeover::Observe,
             )
             .await?;
         if !matches!(seeded, Acquisition::Acquired(_)) {
@@ -511,11 +1092,13 @@ async fn a_cancelled_lease_call_cannot_commit_once_its_lock_is_free() -> Result<
             .query("SELECT 1 FROM leases WHERE name = 'leader' FOR UPDATE", &[])
             .await?;
         {
-            let next = ControllerId::new("next");
+            let next = candidate("next");
             let acquire = db.acquire(
                 &next,
                 Timestamp::from_unix_millis(2000),
+                Timestamp::from_unix_millis(2000),
                 Timestamp::from_unix_millis(3000),
+                Takeover::Observe,
             );
             tokio::select! {
                 result = acquire => {

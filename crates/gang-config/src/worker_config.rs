@@ -5,6 +5,8 @@ use std::time::Duration;
 use gang_types::{NonZeroBytes, NonZeroDuration, Percent};
 use serde::{Deserialize, Serialize};
 
+use crate::{OpenFileLimit, WholeSeconds};
+
 /// The default share of the scratch volume given to the fast CAS: 50 percent.
 const DEFAULT_FAST_CAS_PERCENT: Percent = Percent::from_percent(50);
 
@@ -58,6 +60,20 @@ pub struct WorkerConfig {
     pub enrollment_request_timeout: NonZeroDuration,
     /// The largest enrollment response body accepted. Defaults to 1 MiB.
     pub enrollment_max_response_size: NonZeroBytes,
+    /// Process open-file limit. Defaults to 24,576.
+    pub max_open_files: OpenFileLimit,
+    /// Longest time the outputs of one action may take to upload. Defaults to 10 minutes.
+    pub upload_timeout: WholeSeconds,
+    /// Longest time the inputs of one action may take to download. Defaults to 10 minutes.
+    pub download_timeout: WholeSeconds,
+    /// Longest time to connect to the controller and for each request. The worker's scheduler
+    /// keepalive interval is half this value; it must be below twice `server.worker_timeout`.
+    /// Defaults to 5 seconds.
+    pub connect_timeout: WholeSeconds,
+    /// Time to wait for the last action directory to be cleaned up. Defaults to 30 seconds.
+    pub cleanup_wait: WholeSeconds,
+    /// Interval of HTTP/2 keepalive pings from the worker. Defaults to 30 seconds.
+    pub keepalive_interval: WholeSeconds,
 }
 
 impl Default for WorkerConfig {
@@ -71,6 +87,44 @@ impl Default for WorkerConfig {
             enrollment_deadline: DEFAULT_ENROLLMENT_DEADLINE,
             enrollment_request_timeout: DEFAULT_ENROLLMENT_REQUEST_TIMEOUT,
             enrollment_max_response_size: DEFAULT_ENROLLMENT_MAX_RESPONSE_SIZE,
+            max_open_files: OpenFileLimit::default(),
+            upload_timeout: WholeSeconds::from_units(10 * 60),
+            download_timeout: WholeSeconds::from_units(10 * 60),
+            connect_timeout: WholeSeconds::from_units(5),
+            cleanup_wait: WholeSeconds::from_units(30),
+            keepalive_interval: WholeSeconds::from_units(30),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkerConfig;
+    use crate::WholeSeconds;
+
+    #[test]
+    fn worker_connection_settings_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+        let config: WorkerConfig = toml::from_str(
+            "max_open_files = 8192\nupload_timeout = '11s'\ndownload_timeout = '12s'\nconnect_timeout = '3s'\ncleanup_wait = '14s'\nkeepalive_interval = '15s'",
+        )?;
+        assert_eq!(config.max_open_files.get(), 8192);
+        assert_eq!(config.upload_timeout, WholeSeconds::from_units(11));
+        assert_eq!(config.download_timeout, WholeSeconds::from_units(12));
+        assert_eq!(config.connect_timeout, WholeSeconds::from_units(3));
+        assert_eq!(config.cleanup_wait, WholeSeconds::from_units(14));
+        assert_eq!(config.keepalive_interval, WholeSeconds::from_units(15));
+        assert_eq!(
+            toml::from_str::<WorkerConfig>(&toml::to_string(&config)?)?,
+            config
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn worker_connection_settings_reject_invalid_values() {
+        assert!(toml::from_str::<WorkerConfig>("connect_timeout = '0s'").is_err());
+        assert!(toml::from_str::<WorkerConfig>("upload_timeout = '1500ms'").is_err());
+        assert!(toml::from_str::<WorkerConfig>("max_open_files = 7").is_err());
+        assert!(toml::from_str::<WorkerConfig>("unknown = 1").is_err());
     }
 }

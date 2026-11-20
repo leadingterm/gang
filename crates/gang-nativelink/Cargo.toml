@@ -8,12 +8,17 @@ version.workspace = true
 [lints]
 workspace = true
 
+[features]
+test-support = []
+
+
 [dependencies]
 async-trait = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 gang-clock = { workspace = true }
+gang-config = { workspace = true }
 gang-spi = { workspace = true }
 gang-tls = { workspace = true }
 gang-types = { workspace = true }
@@ -35,6 +40,7 @@ opentelemetry = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
@@ -44,11 +50,9 @@ tracing = { workspace = true }
 [dev-dependencies]
 allocation-counter = { workspace = true }
 base64 = { workspace = true }
-gang-os = { workspace = true }
 gang-testkit = { workspace = true }
 h2 = { workspace = true }
 prost = { workspace = true }
-sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }

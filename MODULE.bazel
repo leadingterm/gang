@@ -9,6 +9,7 @@ gang_version = use_extension("//bazel/version:extensions.bzl", "workspace_versio
 use_repo(gang_version, "gang_version")
 
 RUST_VERSION = "1.97.1"
+OPENTOFU_VERSION = "1.13.9"
 
 # zig's musl supplies the C runtime, so rustc must not add its own self-contained copy (duplicate _start).
 MUSL_RUSTC_FLAGS = ["-Clink-self-contained=no"]
@@ -51,12 +52,83 @@ single_version_override(
 )
 
 http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 devshell_chromium = use_repo_rule("//bazel/chromium:chromium.bzl", "devshell_chromium")
 devshell_import_tools = use_repo_rule("//infra/scripts:tools.bzl", "devshell_import_tools")
 
 # The devShell's pinned headless Chromium (flake.nix e2eChromium), for //ui:layout_test.
 devshell_chromium(name = "chromium", dev_dependency = True)
 devshell_import_tools(name = "import_test_tools", dev_dependency = True)
+
+# Released Linux binaries and source trees used by the mixed-version upgrade gate.
+http_file(
+    name = "gang_v031_linux_x86_64",
+    dev_dependency = True,
+    downloaded_file_path = "gang",
+    executable = True,
+    sha256 = "2a28e4b01faf85df477567796bd50c051c05fb69cde923dae87fe8bac2f8435f",
+    urls = ["https://github.com/leadingterm/gang/releases/download/v0.3.1/gang-x86_64-unknown-linux-musl"],
+)
+
+http_file(
+    name = "gang_v031_linux_arm64",
+    dev_dependency = True,
+    downloaded_file_path = "gang",
+    executable = True,
+    sha256 = "1cf623ed64e8770bfed7563bf5c468400aca74a1c9426ce5ee858361f591ea92",
+    urls = ["https://github.com/leadingterm/gang/releases/download/v0.3.1/gang-aarch64-unknown-linux-musl"],
+)
+
+http_file(
+    name = "gang_v032_linux_x86_64",
+    dev_dependency = True,
+    downloaded_file_path = "gang",
+    executable = True,
+    sha256 = "88c1a8acb4748a4bed9f43bd494c381e0c208fcab38c764dbd451aaa440b8484",
+    urls = ["https://github.com/leadingterm/gang/releases/download/v0.3.2/gang-x86_64-unknown-linux-musl"],
+)
+
+http_file(
+    name = "gang_v032_linux_arm64",
+    dev_dependency = True,
+    downloaded_file_path = "gang",
+    executable = True,
+    sha256 = "8ca48bac73e41d44d5849fb65568effe44de6cba07cc8304df98c7cab5ccd254",
+    urls = ["https://github.com/leadingterm/gang/releases/download/v0.3.2/gang-aarch64-unknown-linux-musl"],
+)
+
+# Remove archive package boundaries so the generated root filegroup sees every source.
+UPGRADE_SOURCE_BUILD = """
+exports_files(["Cargo.toml"])
+filegroup(
+    name = "sources",
+    srcs = glob(["infra/**", "configs/**"]) + ["Cargo.toml"],
+    visibility = ["//visibility:public"],
+)
+"""
+UPGRADE_SOURCE_PATCH = "find infra configs -type f \\( -name BUILD -o -name BUILD.bazel \\) -delete"
+
+http_archive(
+    name = "gang_v031_source",
+    build_file_content = UPGRADE_SOURCE_BUILD,
+    dev_dependency = True,
+    patch_cmds = [UPGRADE_SOURCE_PATCH],
+    sha256 = "5709b2fce98f51b229045e2d448b2a9425b66ff5633e7d1a38572adb4639c65a",
+    strip_prefix = "gang-0.3.1",
+    type = "tar.gz",
+    urls = ["https://codeload.github.com/leadingterm/gang/tar.gz/refs/tags/v0.3.1"],
+)
+
+http_archive(
+    name = "gang_v032_source",
+    build_file_content = UPGRADE_SOURCE_BUILD,
+    dev_dependency = True,
+    patch_cmds = [UPGRADE_SOURCE_PATCH],
+    sha256 = "9e1a7baee282eff7f2fa4223c1afafcc305c57b1aa62fc23c8f4ebd86c888e17",
+    strip_prefix = "gang-0.3.2",
+    type = "tar.gz",
+    urls = ["https://codeload.github.com/leadingterm/gang/tar.gz/refs/tags/v0.3.2"],
+)
 
 # The Bazel the e2e harness drives in its sample workspace (crates/gang-e2e); each download below is pinned by checksum.
 BAZEL_VERSION = "8.7.0"
@@ -269,7 +341,7 @@ tf.download(
         "hashicorp/http:3.6.3/linux_arm64": "476a140b360acb9ca589b7de6a5a8a379aabab4e034fd2dbf4be033c21749907",
     },
     use_tofu = True,
-    version = "1.11.9",
+    version = OPENTOFU_VERSION,
 )
 use_repo(tf, "tf_toolchains")
 

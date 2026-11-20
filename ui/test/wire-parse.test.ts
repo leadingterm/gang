@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { eventKind, identityOf, idOf, ms, seconds, splitIdentity } from "../src/wire-parse.ts";
+import { eventKind, identityOf, idOf, ms, scalingLog, seconds, splitIdentity } from "../src/wire-parse.ts";
 import type { Fleet, QueuedAction, ScalingEvent } from "../src/wire.ts";
 
 test("timestamps parse to unix milliseconds, in any offset", () => {
@@ -56,4 +56,41 @@ test("launch failure and withdrawal events parse and identify their kinds", () =
   assert.equal(eventKind(withdrawn), "withdrawn");
   assert.deepEqual("launchFailed" in failed && failed.launchFailed, { from: 2, to: 4, reason: "capacity unavailable" });
   assert.deepEqual("withdrawn" in withdrawn && withdrawn.withdrawn, { from: 4, to: 2 });
+});
+
+test("AWS statuses merge by source time and unknown events survive", () => {
+  const base = { createTime: "2026-01-15T10:09:30Z", fleet: "fleets/a" };
+  const unknown = { ...base, name: "events/3", unknownFuture: { x: 1 } } as unknown as ScalingEvent;
+  const aws: ScalingEvent = { ...base, name: "awsEvents/a", aws: { event: {
+    id: "a", at: base.createTime, kind: { type: "capacityUnavailable", reason: "no capacity" },
+  } } };
+  const older: ScalingEvent = { ...base, name: "events/2", createTime: "2026-01-15T10:08:00Z", scaledOut: { from: 0, to: 1 } };
+  assert.equal(eventKind(aws), "aws");
+  assert.equal(eventKind(unknown), undefined);
+  assert.deepEqual(scalingLog([unknown, older], [aws, aws]).map((e) => e.name), ["events/2", "awsEvents/a", "events/3"]);
+  const enriched: ScalingEvent = { ...base, name: "awsEvents/a", aws: { event: {
+    id: "a", at: base.createTime, kind: { type: "replacementLaunched", instance: "instances/i-new", replacing: "instances/i-old" },
+  } } };
+  assert.deepEqual(scalingLog([aws], [enriched]), [enriched]);
+  assert.deepEqual(scalingLog([unknown])[0], unknown);
+});
+
+test("unknown AWS variants remain identifiable and retain their payload", () => {
+  const value = JSON.parse('{"name":"awsEvents/a","createTime":"2026-01-15T10:09:30Z","fleet":"fleets/a","aws":{"event":{"id":"a","at":"2026-01-15T10:09:30Z","kind":{"type":"futureNotice","detail":"kept"}}}}') as ScalingEvent;
+  assert.equal(eventKind(value), "aws");
+  assert.deepEqual(JSON.parse(JSON.stringify(scalingLog([value])[0])), value);
+});
+
+test("equal-time audit IDs keep decimal order without losing u64 precision", () => {
+  const common = { createTime: "2026-01-15T10:09:30Z", fleet: "fleets/a" };
+  const names = ["events/9007199254740993", "events/100", "events/10", "events/99", "events/9", "events/9007199254740992"];
+  const audit: ScalingEvent[] = names.map((name) => ({ ...common, name, scaledOut: { from: 0, to: 1 } }));
+  const aws: ScalingEvent = { ...common, name: "awsEvents/a", aws: { event: {
+    id: "a", at: common.createTime, kind: { type: "capacityUnavailable", reason: "capacity" },
+  } } };
+  assert.deepEqual(scalingLog(audit, [aws, aws]).map((e) => e.name), [
+    "awsEvents/a", "events/9", "events/10", "events/99", "events/100", "events/9007199254740992", "events/9007199254740993",
+  ]);
+  const earlier = { ...audit[0]!, createTime: "2026-01-15T10:08:00Z" };
+  assert.equal(scalingLog([audit[4]!, earlier])[0], earlier);
 });

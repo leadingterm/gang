@@ -25,7 +25,7 @@ use crate::system::{Limits, Probe, System};
 pub fn memory_escalation<S: Limits>(system: &S, stderr_tail_lines: usize) -> Result<Vec<Check>> {
     system.start_server()?;
     let outcome = system.build(&[Probe::MemoryEscalation])?;
-    let attempts = system.attempts()?;
+    let attempts = system.attempt_records()?.len();
     let expected = usize::try_from(ESCALATION_MAX_STEPS)
         .map_err(E2eError::system_from("the escalation steps"))?
         + 1;
@@ -58,7 +58,7 @@ pub fn unplaceable_disk<S: Limits, E: Execution>(
     let outcome = match system.build(&[Probe::DiskGuarded]) {
         Ok(outcome) => outcome,
         Err(error) => {
-            let attempts = system.attempts()?;
+            let attempts = system.attempt_records()?.len();
             return Ok(vec![
                 Check::failed(
                     disk_guard::REFUSED,
@@ -79,7 +79,7 @@ pub fn unplaceable_disk<S: Limits, E: Execution>(
             ]);
         }
     };
-    let attempts = system.attempts()?;
+    let attempts = system.attempt_records()?.len();
     let after = system.build(&[Probe::Pinned])?;
 
     Ok(vec![
@@ -281,10 +281,10 @@ pub fn cold_start_misfit<E: Execution>(exec: &E) -> Result<Vec<Check>> {
         }),
         Check::expect(
             cold_start::MESSAGE,
-            exit.log.contains(COLD_START_MISFIT_MESSAGE),
+            exit.log.contains(COLD_START_MISFIT_MESSAGE) && exit.log.contains("fit no fleet"),
             || {
                 format!(
-                    "the log does not contain `{COLD_START_MISFIT_MESSAGE}`; it ends with:\n{tail}"
+                    "the log does not identify `{COLD_START_MISFIT_MESSAGE}` and `fit no fleet`; it ends with:\n{tail}"
                 )
             },
         ),

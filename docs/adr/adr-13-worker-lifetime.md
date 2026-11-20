@@ -8,7 +8,7 @@ Status: Accepted
 
 ## Decision
 - **The plugin reports it.** `ProvisionerPort::worker_lifetime()` returns `LongLived` or `SingleUse`, synchronously and without I/O. It is a setting of the plugin section only where both modes work (`[provisioner.kubernetes]`, `[provisioner.slurm]`); `aws` and `local` always report `LongLived`.
-- **One source.** `gang worker` and `gang server` read it from the same plugin; it is never copied into `[fleets]` or `[scheduler.nativelink]`.
+- **One source.** `gang worker` and `gang server` read it from the same plugin; it is never copied into `[fleets]` or scheduler configuration.
 - **`SingleUse` sets NativeLink `single_use`,** requires `max_inflight_actions == 1` (else `PortError::Config`), and the worker exits 0 after uploading one action. The instance becomes `Terminating` and drops out of desired capacity.
 - **Kubernetes defaults to `SingleUse`, one action per pod.** Pods come only from demand-driven `set_desired_capacity` while queued plus running exceeds live capacity; there is no per-action creation call. `idle_timeout` reaps pods created for demand that has gone. A `Running` pod whose worker does not connect within `boot_grace` is an orphan; `Pending` pods are exempt. Slurm defaults to `LongLived`.
 

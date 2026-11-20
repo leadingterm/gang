@@ -10,7 +10,7 @@
 //! server reads them, so a client far away uploads a whole window per round trip. A listener serves
 //! a bounded number of connections at once; connections earn their place by an authenticated
 //! request. An HTTP/2 connection runs at most `max_concurrent_streams` requests at once; with the
-//! window, these bound the request data held (see [`Http2Tuning`]).
+//! window, these bound the request data held (see [`Http2Config`]).
 
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
@@ -21,16 +21,17 @@ use axum::Router;
 use axum::middleware::from_fn_with_state;
 use futures::StreamExt;
 use gang_clock::Clock;
-use gang_spi::{Listening, RequestGate};
+use gang_config::Http2Config;
+use gang_spi::{Listening, RequestGate, RequestScope};
+use gang_types::{NonZeroDuration, SaturatingInto};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
-use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
+use tokio::sync::watch;
 use tokio::task::{AbortHandle, JoinError, JoinSet};
 
-use crate::config::Http2Tuning;
 use crate::errors::NativeLinkEmbedError;
-use crate::gate::admit;
+use crate::gate::{GateState, admit};
 use crate::handoff::HandOff;
 use crate::refusals::Refusals;
 use crate::standing::Standing;
@@ -41,8 +42,6 @@ pub(crate) enum Listener {
     /// The public listener: detects HTTP/1.1 or HTTP/2 on each connection, including HTTP/2 with
     /// prior knowledge.
     Public,
-    /// The execution listener has the same client transport and limits as public.
-    Execution,
     /// The worker listener: serves HTTP/2 only. A connection that does not speak HTTP/2 is
     /// closed.
     Worker,
@@ -53,9 +52,86 @@ impl Listener {
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Public => "public",
-            Self::Execution => "execution",
             Self::Worker => "worker",
         }
+    }
+}
+
+/// The configured receive window is bounded by HTTP/2's RFC limits.
+fn window_for(tuning: &Http2Config, _listener: Listener) -> u32 {
+    // ReceiveWindow is between 65,535 and 2^31 - 1 bytes.
+    tuning.receive_window.get().get().saturating_into()
+}
+
+fn http_server(tuning: &Http2Config, listener: Listener) -> auto::Builder<TokioExecutor> {
+    let mut http = match listener {
+        Listener::Worker => auto::Builder::new(TokioExecutor::new()).http2_only(),
+        Listener::Public => {
+            let mut http = auto::Builder::new(TokioExecutor::new());
+            http.http1()
+                .timer(TokioTimer::new())
+                .header_read_timeout(tuning.header_read_timeout.get());
+            http
+        }
+    };
+    let window = window_for(tuning, listener);
+    http.http2()
+        .timer(TokioTimer::new())
+        .keep_alive_interval(tuning.keepalive_interval.get())
+        .max_concurrent_streams(tuning.max_concurrent_streams.get())
+        .initial_connection_window_size(window)
+        .initial_stream_window_size(window);
+    http
+}
+
+/// Admission-serving policy; standby transports never own controller work.
+#[derive(Clone, Copy)]
+pub(crate) enum ServeMode {
+    Controller,
+    Standby(NonZeroDuration),
+}
+
+impl ServeMode {
+    fn idle_timeout(self, listener: Listener, tuning: &Http2Config) -> Option<std::time::Duration> {
+        (matches!(self, Self::Standby(_)) || listener == Listener::Public)
+            .then_some(tuning.unproven_idle_timeout.get())
+    }
+
+    fn shutdown_grace(self, tuning: &Http2Config) -> std::time::Duration {
+        match self {
+            Self::Controller => tuning.shutdown_grace,
+            Self::Standby(request_timeout) => tuning.shutdown_grace.min(request_timeout.get()),
+        }
+    }
+}
+
+/// Routers grouped by their admission scope, with the fallback owned by `shared`.
+pub(crate) struct ScopedRoutes {
+    /// Leader-independent services and the listener's fallback.
+    pub(crate) shared: Router,
+    /// Leader-only services, without a separate fallback.
+    pub(crate) leader: Router,
+}
+
+impl ScopedRoutes {
+    fn gated<G: RequestGate>(self, gate: G, mode: ServeMode) -> Router {
+        let shared = self.shared.layer(from_fn_with_state(
+            GateState {
+                gate: gate.clone(),
+                scope: RequestScope::Shared,
+                force_not_leading: false,
+            },
+            admit::<G>,
+        ));
+        let leader = self.leader.layer(from_fn_with_state(
+            GateState {
+                gate,
+                scope: RequestScope::Leader,
+                force_not_leading: matches!(mode, ServeMode::Standby(_)),
+            },
+            admit::<G>,
+        ));
+        shared.merge(leader)
     }
 }
 
@@ -64,6 +140,7 @@ impl Listener {
 pub(crate) struct ServeShutdown {
     pub(crate) ended: tokio::sync::mpsc::UnboundedSender<()>,
     pub(crate) handoff: HandOff,
+    pub(crate) mode: ServeMode,
 }
 
 /// Serves `router` on the connections of `listening` until the stream ends and the served
@@ -87,7 +164,7 @@ pub(crate) struct ServeShutdown {
 /// oldest connection that has not earned its place, an idle one first, and is closed at once only
 /// when every connection has; the stream is always read, so its end is seen however many
 /// connections are open. Refusals are logged at most once per `tuning.refusal_log_interval` of
-/// `clock`. On the public and execution listeners, a connection that has not earned its place is also closed once
+/// `clock`. On the public listener, a connection that has not earned its place is also closed once
 /// it has had no request in flight for `tuning.unproven_idle_timeout`, before its first request
 /// included; the worker listener's connections are bounded by the fleets, and a worker's store
 /// connections may stay idle until it runs an action.
@@ -95,8 +172,8 @@ pub(crate) struct ServeShutdown {
 /// A failing connection is logged and never stops the loop.
 pub(crate) async fn serve<G: RequestGate, C: Clock + Clone + Send + Sync + 'static>(
     listening: Listening<G>,
-    router: Router,
-    tuning: &Http2Tuning,
+    routes: ScopedRoutes,
+    tuning: &Http2Config,
     listener: Listener,
     max_connections: NonZeroUsize,
     clock: C,
@@ -106,29 +183,13 @@ pub(crate) async fn serve<G: RequestGate, C: Clock + Clone + Send + Sync + 'stat
         mut connections,
         gate,
     } = listening;
-    let gated = router.layer(from_fn_with_state(gate, admit::<G>));
-    let mut http = match listener {
-        Listener::Worker => auto::Builder::new(TokioExecutor::new()).http2_only(),
-        Listener::Public | Listener::Execution => {
-            let mut http = auto::Builder::new(TokioExecutor::new());
-            http.http1()
-                .timer(TokioTimer::new())
-                .header_read_timeout(tuning.header_read_timeout.get());
-            http
-        }
-    };
-    let window = tuning.window_for(listener);
-    http.http2()
-        .timer(TokioTimer::new())
-        .keep_alive_interval(tuning.keepalive_interval.get())
-        .max_concurrent_streams(tuning.max_concurrent_streams.get())
-        .initial_connection_window_size(window)
-        .initial_stream_window_size(window);
-    let graceful = GracefulShutdown::new();
+    let gated = routes.gated(gate, shutdown.mode);
+    let http = http_server(tuning, listener);
+    let (graceful, _) = watch::channel(());
     let mut served = JoinSet::new();
     let mut refusals = Refusals::new(listener, max_connections, tuning.refusal_log_interval);
     let mut open: VecDeque<Open> = VecDeque::new();
-    let idle = (listener != Listener::Worker).then_some(tuning.unproven_idle_timeout.get());
+    let idle = shutdown.mode.idle_timeout(listener, tuning);
     loop {
         tokio::select! {
             next = connections.next() => if let Some(accepted) = next {
@@ -149,26 +210,36 @@ pub(crate) async fn serve<G: RequestGate, C: Clock + Clone + Send + Sync + 'stat
                         .clone()
                         .layer(Extension(accepted.peer))
                         .layer(Extension(Arc::clone(&standing)));
-                    let watcher = graceful.watcher();
+                    let mut shutdown = graceful.subscribe();
                     let http = http.clone();
                     let clock = clock.clone();
                     let expiring = Arc::clone(&standing);
                     let abort = served.spawn(async move {
-                        let connection = watcher.watch(http.serve_connection(
+                        let connection = http.serve_connection(
                             TokioIo::new(accepted.connection),
                             TowerToHyperService::new(service),
-                        ));
+                        );
+                        tokio::pin!(connection);
                         let expired = async {
                             match idle {
                                 Some(idle) => expiring.expired(&clock, idle).await,
                                 None => std::future::pending().await,
                             }
                         };
-                        tokio::select! {
-                            served = connection => if let Err(error) = served {
-                                tracing::warn!(error = %gang_types::error_chain(error.as_ref()), "connection ended with an error");
-                            },
-                            () = expired => {}
+                        tokio::pin!(expired);
+                        let result = tokio::select! {
+                            result = &mut connection => Some(result),
+                            () = &mut expired => None,
+                            () = graceful_trigger(&mut shutdown, &expiring) => {
+                                connection.as_mut().graceful_shutdown();
+                                tokio::select! {
+                                    result = &mut connection => Some(result),
+                                    () = &mut expired => None,
+                                }
+                            }
+                        };
+                        if let Some(Err(error)) = result {
+                            tracing::warn!(error = %gang_types::error_chain(error.as_ref()), "connection ended with an error");
                         }
                     });
                     open.push_back(Open {
@@ -182,14 +253,14 @@ pub(crate) async fn serve<G: RequestGate, C: Clock + Clone + Send + Sync + 'stat
             Some(finished) = served.join_next_with_id(), if !served.is_empty() => reap(finished, &mut open),
         }
     }
-    // Close the listening sockets before waiting for existing connections to drain.
+    // Release listening sockets and pending shared accept guards before connection drain.
     drop(connections);
     let _ = shutdown.ended.send(());
     drain_connections(
         &clock,
         tuning,
         listener,
-        &shutdown.handoff,
+        &shutdown,
         graceful,
         &mut served,
         &mut open,
@@ -198,36 +269,44 @@ pub(crate) async fn serve<G: RequestGate, C: Clock + Clone + Send + Sync + 'stat
     Ok(())
 }
 
+/// Waits for listener shutdown or this connection's retry decision.
+async fn graceful_trigger(shutdown: &mut watch::Receiver<()>, standing: &Standing) {
+    tokio::select! {
+        _ = shutdown.changed() => {}
+        () = standing.retry_requested() => {}
+    }
+}
+
 /// Waits for the common hand-off, then drains connections within the grace period.
 async fn drain_connections<C: Clock>(
     clock: &C,
-    tuning: &Http2Tuning,
+    tuning: &Http2Config,
     listener: Listener,
-    handoff: &HandOff,
-    graceful: GracefulShutdown,
+    shutdown: &ServeShutdown,
+    graceful: watch::Sender<()>,
     served: &mut JoinSet<()>,
     open: &mut VecDeque<Open>,
 ) {
     loop {
         tokio::select! {
-            () = handoff.begun() => break,
+            () = shutdown.handoff.begun() => break,
             Some(finished) = served.join_next_with_id(), if !served.is_empty() => reap(finished, open),
         }
     }
     let drained = clock
-        .timeout(tuning.shutdown_grace, async {
-            if listener == Listener::Worker {
+        .timeout(shutdown.mode.shutdown_grace(tuning), async {
+            if listener == Listener::Worker && matches!(shutdown.mode, ServeMode::Controller) {
                 loop {
                     if served.is_empty() {
                         return;
                     }
                     tokio::select! {
-                        () = handoff.workers_released() => break,
+                        () = shutdown.handoff.workers_released() => break,
                         Some(finished) = served.join_next_with_id() => reap(finished, open),
                     }
                 }
             }
-            graceful.shutdown().await;
+            let _ = graceful.send(());
             while let Some(finished) = served.join_next_with_id().await {
                 reap(finished, open);
             }
@@ -299,7 +378,7 @@ mod tests {
     use axum::routing::{get, post};
     use futures::stream;
     use gang_clock::{SystemClock, TestClock, Timestamp};
-    use gang_spi::{Accepted, Admitted, Authenticated, Peer, PortError};
+    use gang_spi::{Accepted, Admitted, Authenticated, GateDecision, Peer, PortError};
     use gang_testkit::TestResult;
     use gang_types::health::CLIENT_KEEPALIVE_TIME;
     use gang_types::{CertSerial, Identity, NonZeroDuration, Principal, ProviderName};
@@ -313,7 +392,21 @@ mod tests {
     use tokio::task::JoinHandle;
 
     use super::*;
-    use crate::config::ReceiveWindow;
+    use gang_config::ReceiveWindow;
+
+    #[test]
+    fn public_and_worker_windows_preserve_the_configured_rfc_bounds() {
+        let mut tuning = Http2Config::default();
+        assert_eq!(window_for(&tuning, Listener::Public), 16 * 1024 * 1024);
+        assert_eq!(window_for(&tuning, Listener::Worker), 16 * 1024 * 1024);
+        tuning.max_message_size =
+            gang_types::NonZeroBytes::new(gang_types::Bytes::new(1)).expect("nonzero");
+        for window in [65_535_u32, 2_147_483_647] {
+            tuning.receive_window = ReceiveWindow::from_units(u64::from(window));
+            assert_eq!(window_for(&tuning, Listener::Public), window);
+            assert_eq!(window_for(&tuning, Listener::Worker), window);
+        }
+    }
 
     /// Buffer of each in-memory connection.
     const PIPE_BUFFER: usize = 64 * 1024;
@@ -361,18 +454,22 @@ mod tests {
         let handoff = HandOff::new();
         let (ended, mut endings) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
-            let tuning = Http2Tuning::default();
+            let tuning = Http2Config::default();
             serve(
                 Listening {
                     connections,
                     gate: Allow,
                 },
-                router,
+                shared_routes(router),
                 &tuning,
                 Listener::Public,
                 tuning.max_connections,
                 SystemClock::new(),
-                ServeShutdown { ended, handoff },
+                ServeShutdown {
+                    ended,
+                    handoff,
+                    mode: ServeMode::Controller,
+                },
             )
             .await
         });
@@ -390,6 +487,140 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
         task.abort();
         Ok(())
+    }
+
+    fn shared_intake(
+        listener: Arc<tokio::sync::Mutex<tokio::net::TcpListener>>,
+        locked: mpsc::UnboundedSender<()>,
+    ) -> futures::stream::BoxStream<'static, Accepted> {
+        stream::unfold(listener, move |listener| {
+            let locked = locked.clone();
+            async move {
+                let (connection, _) = {
+                    let guard = listener.lock().await;
+                    let _ = locked.send(());
+                    guard.accept().await.ok()?
+                };
+                Some((
+                    Accepted {
+                        connection: Box::new(connection),
+                        peer: Peer::default(),
+                    },
+                    listener,
+                ))
+            }
+        })
+        .boxed()
+    }
+
+    #[tokio::test]
+    async fn ended_intake_releases_shared_accept_guard_before_either_mode_drains() -> TestResult {
+        for mode in [
+            ServeMode::Controller,
+            ServeMode::Standby(NonZeroDuration::from_secs(5)),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+            let listener = Arc::new(tokio::sync::Mutex::new(listener));
+            let (locked, mut locks) = mpsc::unbounded_channel();
+            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+            let connections = shared_intake(Arc::clone(&listener), locked)
+                .take_until(async {
+                    let _ = stopped.await;
+                })
+                .boxed();
+            let (entered, mut entries) = mpsc::unbounded_channel();
+            let release = Arc::new(tokio::sync::Notify::new());
+            let released = Arc::clone(&release);
+            let router = Router::new().route(
+                "/",
+                get(move || {
+                    let entered = entered.clone();
+                    let released = Arc::clone(&released);
+                    async move {
+                        let _ = entered.send(());
+                        released.notified().await;
+                        "completed"
+                    }
+                }),
+            );
+            let handoff = HandOff::new();
+            if matches!(mode, ServeMode::Standby(_)) {
+                handoff.begin();
+                handoff.release_workers();
+            }
+            let (ended, mut endings) = mpsc::unbounded_channel();
+            let shutdown = ServeShutdown {
+                ended,
+                handoff: handoff.clone(),
+                mode,
+            };
+            let task = tokio::spawn(async move {
+                let tuning = Http2Config::default();
+                serve(
+                    Listening {
+                        connections,
+                        gate: Allow,
+                    },
+                    shared_routes(router),
+                    &tuning,
+                    Listener::Public,
+                    tuning.max_connections,
+                    SystemClock::new(),
+                    shutdown,
+                )
+                .await
+            });
+            let response = tokio::spawn(async move {
+                let mut client = tokio::net::TcpStream::connect(address).await?;
+                client
+                    .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .await?;
+                let mut response = Vec::new();
+                client.read_to_end(&mut response).await?;
+                Ok::<_, std::io::Error>(response)
+            });
+            entries
+                .recv()
+                .await
+                .ok_or("admitted request did not start")?;
+            // The second acquisition is the suspended next accept, not the completed first one.
+            for _ in 0..2 {
+                locks
+                    .recv()
+                    .await
+                    .ok_or("intake never held its shared accept guard")?;
+            }
+            stop.send(()).map_err(|()| "intake stopped early")?;
+            endings.recv().await.ok_or("intake end was not reported")?;
+            assert!(
+                !task.is_finished(),
+                "the old admitted request still holds drain"
+            );
+            let next_accept = async {
+                let guard = listener.lock().await;
+                guard.accept().await
+            };
+            let (accepted, fresh) = tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::try_join!(next_accept, tokio::net::TcpStream::connect(address))
+            })
+            .await??;
+            drop((accepted, fresh));
+            handoff.begin();
+            handoff.release_workers();
+            release.notify_one();
+            let response = tokio::time::timeout(Duration::from_secs(1), response).await???;
+            assert!(response.ends_with(b"completed"));
+            finished(task).await?;
+        }
+        Ok(())
+    }
+
+    fn shared_routes(shared: Router) -> ScopedRoutes {
+        ScopedRoutes {
+            shared,
+            leader: Router::new(),
+        }
     }
 
     fn router() -> Router {
@@ -428,10 +659,11 @@ mod tests {
     impl RequestGate for Allow {
         fn admit(
             &self,
+            _scope: RequestScope,
             _peer: &Peer,
             _parts: &mut http::request::Parts,
-        ) -> impl Future<Output = Result<Admitted, PortError>> + Send {
-            std::future::ready(Ok(Admitted::Authenticated(caller())))
+        ) -> impl Future<Output = Result<GateDecision, PortError>> + Send {
+            std::future::ready(Ok(GateDecision::Admit(Admitted::Authenticated(caller()))))
         }
     }
 
@@ -444,14 +676,15 @@ mod tests {
     impl RequestGate for Recording {
         fn admit(
             &self,
+            _scope: RequestScope,
             peer: &Peer,
             _parts: &mut http::request::Parts,
-        ) -> impl Future<Output = Result<Admitted, PortError>> + Send {
+        ) -> impl Future<Output = Result<GateDecision, PortError>> + Send {
             let peers = Arc::clone(&self.peers);
             let peer = peer.clone();
             async move {
                 peers.lock().push(peer);
-                Ok(Admitted::Authenticated(caller()))
+                Ok(GateDecision::Admit(Admitted::Authenticated(caller())))
             }
         }
     }
@@ -464,15 +697,41 @@ mod tests {
     impl RequestGate for ByAuthorization {
         fn admit(
             &self,
+            _scope: RequestScope,
             _peer: &Peer,
             parts: &mut http::request::Parts,
-        ) -> impl Future<Output = Result<Admitted, PortError>> + Send {
+        ) -> impl Future<Output = Result<GateDecision, PortError>> + Send {
             let admitted = if parts.headers.contains_key(http::header::AUTHORIZATION) {
                 Admitted::Authenticated(caller())
             } else {
                 Admitted::Anonymous
             };
-            std::future::ready(Ok(admitted))
+            std::future::ready(Ok(GateDecision::Admit(admitted)))
+        }
+    }
+
+    /// Selects the admission outcome with a test-only request header.
+    #[derive(Clone)]
+    struct ByOutcome;
+
+    impl RequestGate for ByOutcome {
+        fn admit(
+            &self,
+            _scope: RequestScope,
+            _peer: &Peer,
+            parts: &mut http::request::Parts,
+        ) -> impl Future<Output = Result<GateDecision, PortError>> + Send {
+            let outcome = match parts
+                .headers
+                .get("x-test-outcome")
+                .and_then(|v| v.to_str().ok())
+            {
+                Some("authenticated") => Ok(GateDecision::Admit(Admitted::Authenticated(caller()))),
+                Some("unavailable") => Err(PortError::unavailable("test unavailable")),
+                Some("invalid") => Err(PortError::refused(gang_spi::Rejection::InvalidProof)),
+                _ => Ok(GateDecision::Admit(Admitted::Anonymous)),
+            };
+            std::future::ready(outcome)
         }
     }
 
@@ -481,7 +740,7 @@ mod tests {
     fn start_gated<G: RequestGate>(
         router: Router,
         gate: G,
-        tuning: Http2Tuning,
+        tuning: Http2Config,
         listener: Listener,
     ) -> (
         mpsc::UnboundedSender<Accepted>,
@@ -494,9 +753,37 @@ mod tests {
     fn start_clocked<G: RequestGate, C: Clock + Clone + Send + Sync + 'static>(
         router: Router,
         gate: G,
-        tuning: Http2Tuning,
+        tuning: Http2Config,
         listener: Listener,
         clock: C,
+    ) -> (
+        mpsc::UnboundedSender<Accepted>,
+        JoinHandle<Result<(), NativeLinkEmbedError>>,
+    ) {
+        start_in_mode(router, gate, tuning, listener, clock, ServeMode::Controller)
+    }
+
+    fn start_in_mode<G: RequestGate, C: Clock + Clone + Send + Sync + 'static>(
+        router: Router,
+        gate: G,
+        tuning: Http2Config,
+        listener: Listener,
+        clock: C,
+        mode: ServeMode,
+    ) -> (
+        mpsc::UnboundedSender<Accepted>,
+        JoinHandle<Result<(), NativeLinkEmbedError>>,
+    ) {
+        start_scoped_in_mode(shared_routes(router), gate, tuning, listener, clock, mode)
+    }
+
+    fn start_scoped_in_mode<G: RequestGate, C: Clock + Clone + Send + Sync + 'static>(
+        routes: ScopedRoutes,
+        gate: G,
+        tuning: Http2Config,
+        listener: Listener,
+        clock: C,
+        mode: ServeMode,
     ) -> (
         mpsc::UnboundedSender<Accepted>,
         JoinHandle<Result<(), NativeLinkEmbedError>>,
@@ -509,11 +796,15 @@ mod tests {
         .boxed();
         let listening = Listening { connections, gate };
         let handoff = HandOff::new();
+        if matches!(mode, ServeMode::Standby(_)) {
+            handoff.begin();
+            handoff.release_workers();
+        }
         let (ended, mut endings) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
             let serving = serve(
                 listening,
-                router,
+                routes,
                 &tuning,
                 listener,
                 tuning.max_connections,
@@ -521,6 +812,7 @@ mod tests {
                 ServeShutdown {
                     ended,
                     handoff: handoff.clone(),
+                    mode,
                 },
             );
             tokio::pin!(serving);
@@ -539,7 +831,7 @@ mod tests {
     /// [`start_gated`].
     fn start_tuned(
         router: Router,
-        tuning: Http2Tuning,
+        tuning: Http2Config,
     ) -> (
         mpsc::UnboundedSender<Accepted>,
         JoinHandle<Result<(), NativeLinkEmbedError>>,
@@ -554,7 +846,7 @@ mod tests {
         mpsc::UnboundedSender<Accepted>,
         JoinHandle<Result<(), NativeLinkEmbedError>>,
     ) {
-        start_tuned(router, Http2Tuning::default())
+        start_tuned(router, Http2Config::default())
     }
 
     /// Hands the server half of a new in-memory connection to `serve`, with the default peer, and
@@ -662,6 +954,27 @@ mod tests {
         Ok(sender.send_request(request).await?.status())
     }
 
+    /// Sends a gRPC-shaped request and drains its response before the next request.
+    async fn request_outcome(
+        sender: &mut SendRequest<Body>,
+        outcome: &str,
+    ) -> TestResult<(StatusCode, Option<String>)> {
+        sender.ready().await?;
+        let request = Request::get("http://localhost/")
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .header("x-test-outcome", outcome)
+            .body(Body::empty())?;
+        let response = sender.send_request(request).await?;
+        let status = response.status();
+        let grpc_status = response
+            .headers()
+            .get("grpc-status")
+            .map(|value| value.to_str().map(str::to_owned))
+            .transpose()?;
+        axum::body::to_bytes(Body::new(response.into_body()), BODY_LIMIT).await?;
+        Ok((status, grpc_status))
+    }
+
     /// Lets every task run until all are idle: on the paused runtime, time moves only then.
     async fn settle() {
         tokio::time::sleep(Duration::from_millis(1)).await;
@@ -729,7 +1042,7 @@ mod tests {
 
     #[tokio::test]
     async fn serve_returns_when_the_stream_ends_and_idle_connections_close() -> TestResult {
-        let (feed, task) = start_gated(router(), Allow, Http2Tuning::default(), Listener::Public);
+        let (feed, task) = start_gated(router(), Allow, Http2Config::default(), Listener::Public);
         let (mut sender, connection) = open(connect(&feed)?).await?;
         let (status, _) = get_root(&mut sender).await?;
         assert_eq!(status, StatusCode::OK);
@@ -751,10 +1064,11 @@ mod tests {
         .boxed();
         let handoff = HandOff::new();
         let (ended, mut endings) = mpsc::unbounded_channel();
-        let tuning = Http2Tuning::default();
+        let tuning = Http2Config::default();
         let shutdown = ServeShutdown {
             ended,
             handoff: handoff.clone(),
+            mode: ServeMode::Controller,
         };
         let task = tokio::spawn(async move {
             serve(
@@ -762,7 +1076,7 @@ mod tests {
                     connections,
                     gate: Allow,
                 },
-                router(),
+                shared_routes(router()),
                 &tuning,
                 Listener::Worker,
                 tuning.max_connections,
@@ -793,16 +1107,17 @@ mod tests {
         let shutdown = ServeShutdown {
             ended,
             handoff: handoff.clone(),
+            mode: ServeMode::Controller,
         };
         let clock = Arc::new(TestClock::new(Timestamp::from_unix_millis(0)));
         let task = tokio::spawn(async move {
-            let tuning = Http2Tuning::default();
+            let tuning = Http2Config::default();
             serve(
                 Listening {
                     connections,
                     gate: Allow,
                 },
-                router(),
+                shared_routes(router()),
                 &tuning,
                 Listener::Worker,
                 tuning.max_connections,
@@ -836,9 +1151,9 @@ mod tests {
                 }
             }),
         );
-        let tuning = Http2Tuning {
+        let tuning = Http2Config {
             shutdown_grace: Duration::ZERO,
-            ..Http2Tuning::default()
+            ..Http2Config::default()
         };
         let (feed, task) = start_tuned(hanging, tuning);
         let (mut sender, connection) = open(connect(&feed)?).await?;
@@ -891,7 +1206,7 @@ mod tests {
     async fn the_gate_sees_the_connections_peer() -> TestResult {
         let gate = Recording::default();
         let seen = Arc::clone(&gate.peers);
-        let (feed, task) = start_gated(router(), gate, Http2Tuning::default(), Listener::Worker);
+        let (feed, task) = start_gated(router(), gate, Http2Config::default(), Listener::Worker);
         let peer = Peer {
             certificate: Some(CertSerial::from_be_bytes(&[0x2a])?),
             ..Peer::default()
@@ -909,7 +1224,7 @@ mod tests {
     async fn the_gate_also_sees_requests_no_route_handles() -> TestResult {
         let gate = Recording::default();
         let seen = Arc::clone(&gate.peers);
-        let (feed, task) = start_gated(router(), gate, Http2Tuning::default(), Listener::Worker);
+        let (feed, task) = start_gated(router(), gate, Http2Config::default(), Listener::Worker);
         let (mut sender, connection) = open(connect(&feed)?).await?;
         sender.ready().await?;
         let request = Request::get("http://localhost/unknown").body(Body::empty())?;
@@ -921,6 +1236,309 @@ mod tests {
         finished(task).await
     }
 
+    #[derive(Clone)]
+    struct ScopedTestGate {
+        entered: mpsc::UnboundedSender<()>,
+        release: Arc<tokio::sync::Notify>,
+        leading: bool,
+    }
+
+    impl RequestGate for ScopedTestGate {
+        async fn admit(
+            &self,
+            scope: RequestScope,
+            _peer: &Peer,
+            parts: &mut http::request::Parts,
+        ) -> Result<GateDecision, PortError> {
+            if scope == RequestScope::Leader && !self.leading {
+                return Ok(GateDecision::NotLeading);
+            }
+            if parts.headers.contains_key("x-hold-admission") {
+                let _ = self.entered.send(());
+                self.release.notified().await;
+            }
+            let admitted = if parts.headers.contains_key(http::header::AUTHORIZATION) {
+                Admitted::Authenticated(caller())
+            } else {
+                Admitted::Anonymous
+            };
+            Ok(GateDecision::Admit(admitted))
+        }
+    }
+
+    fn retirement_routes(
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        entered: mpsc::UnboundedSender<()>,
+        released: Arc<tokio::sync::Notify>,
+    ) -> ScopedRoutes {
+        use std::sync::atomic::Ordering;
+
+        let shared = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .route(
+                "/held",
+                get(move || {
+                    let entered = entered.clone();
+                    let released = Arc::clone(&released);
+                    async move {
+                        let _ = entered.send(());
+                        released.notified().await;
+                        "completed"
+                    }
+                }),
+            )
+            .route(
+                "/api",
+                get(|| async {
+                    let mut response = axum::response::IntoResponse::into_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                    );
+                    response
+                        .extensions_mut()
+                        .insert(gang_spi::LeaderUnavailable);
+                    response
+                }),
+            );
+        let leader = Router::new().route(
+            "/leader",
+            post(move || {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    "must not run"
+                }
+            }),
+        );
+        ScopedRoutes { shared, leader }
+    }
+
+    fn hold_server_eof(server: DuplexStream) -> (DuplexStream, JoinHandle<()>, JoinHandle<()>) {
+        let (client, proxy) = tokio::io::duplex(PIPE_BUFFER);
+        let (mut server_read, mut server_write) = tokio::io::split(server);
+        let (mut proxy_read, mut proxy_write) = tokio::io::split(proxy);
+        let upstream = tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut proxy_read, &mut server_write).await;
+        });
+        // Retain the client-facing write half after server EOF: a clean client
+        // connection completion therefore requires HTTP/2 GOAWAY, not socket EOF.
+        let downstream = tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut server_read, &mut proxy_write).await;
+            std::future::pending::<()>().await;
+            drop(proxy_write);
+        });
+        (client, upstream, downstream)
+    }
+
+    async fn assert_retirement_preserves_shared_streams(
+        authenticated: bool,
+        listener: Listener,
+        standby: bool,
+        api_marker: bool,
+    ) -> TestResult {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered, mut entries) = mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (gate_entered, mut gate_entries) = mpsc::unbounded_channel();
+        let gate_release = Arc::new(tokio::sync::Notify::new());
+        let routes = retirement_routes(Arc::clone(&calls), entered, Arc::clone(&release));
+        let (feed, task) = start_scoped_in_mode(
+            routes,
+            ScopedTestGate {
+                entered: gate_entered,
+                release: Arc::clone(&gate_release),
+                leading: standby,
+            },
+            Http2Config::default(),
+            listener,
+            SystemClock::new(),
+            if standby {
+                ServeMode::Standby(NonZeroDuration::from_secs(5))
+            } else {
+                ServeMode::Controller
+            },
+        );
+        let (client, upstream, downstream) = hold_server_eof(connect(&feed)?);
+        let (mut sender, connection) = h2::client::handshake(client).await?;
+        let connection = tokio::spawn(connection);
+        let mut first = Request::get("http://localhost/");
+        if authenticated {
+            first = first.header(http::header::AUTHORIZATION, "token");
+        }
+        let (response, _) = sender.send_request(first.body(())?, true)?;
+        assert_eq!(response.await?.status(), StatusCode::OK);
+        let mut held = Vec::new();
+        sender = sender.ready().await?;
+        let (response, _) =
+            sender.send_request(Request::get("http://localhost/held").body(())?, true)?;
+        held.push(response);
+        entries.recv().await.ok_or("shared handler did not start")?;
+        sender = sender.ready().await?;
+        let (response, _) = sender.send_request(
+            Request::get("http://localhost/held")
+                .header("x-hold-admission", "true")
+                .body(())?,
+            true,
+        )?;
+        held.push(response);
+        gate_entries
+            .recv()
+            .await
+            .ok_or("shared admission did not start")?;
+        sender = sender.ready().await?;
+        let request = if api_marker {
+            Request::get("http://localhost/api")
+        } else {
+            Request::post("http://localhost/leader")
+                .header(http::header::CONTENT_TYPE, "application/grpc")
+        };
+        let (response, _) = sender.send_request(request.body(())?, true)?;
+        let response = response.await?;
+        if api_marker {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        } else {
+            assert_eq!(response.headers()["grpc-status"], "14");
+            assert_eq!(
+                response.headers()[gang_types::handover::REQUEST_NOT_STARTED_HEADER],
+                "true"
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(!connection.is_finished());
+        gate_release.notify_one();
+        entries
+            .recv()
+            .await
+            .ok_or("accepted shared request was rejected")?;
+        release.notify_waiters();
+        for response in held {
+            let mut body = response.await?.into_body();
+            assert_eq!(
+                body.data().await.ok_or("missing shared body")??,
+                "completed"
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(1), connection).await???;
+        upstream.abort();
+        downstream.abort();
+        drop(sender);
+        drop(feed);
+        finished(task).await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leadership_retirement_sends_goaway_without_cancelling_accepted_shared_streams()
+    -> TestResult {
+        for authenticated in [false, true] {
+            for (listener, standby, api_marker) in [
+                (Listener::Public, false, false),
+                (Listener::Public, false, true),
+                (Listener::Public, true, false),
+                (Listener::Worker, false, false),
+                (Listener::Worker, true, false),
+            ] {
+                assert_retirement_preserves_shared_streams(
+                    authenticated,
+                    listener,
+                    standby,
+                    api_marker,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fresh_unavailable_grpc_retires_both_http2_listeners() -> TestResult {
+        for listener in [Listener::Public, Listener::Worker] {
+            let (feed, task) = start_gated(router(), ByOutcome, Http2Config::default(), listener);
+            let (mut sender, connection) = open(connect(&feed)?).await?;
+            assert_eq!(
+                request_outcome(&mut sender, "unavailable").await?,
+                (StatusCode::OK, Some("14".to_owned()))
+            );
+            // Keep the sender alive: closure must come from the server, not the client.
+            tokio::time::timeout(Duration::from_secs(1), connection).await???;
+            drop(sender);
+            drop(feed);
+            finished(task).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fresh_unavailable_http1_returns_503_then_closes() -> TestResult {
+        let (feed, task) = start_gated(
+            router(),
+            ByOutcome,
+            Http2Config::default(),
+            Listener::Public,
+        );
+        let mut client = connect(&feed)?;
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nx-test-outcome: unavailable\r\n\r\n")
+            .await?;
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), client.read_to_end(&mut response)).await??;
+        assert!(
+            response.starts_with(b"HTTP/1.1 503 "),
+            "unexpected response: {}",
+            String::from_utf8_lossy(&response)
+        );
+        drop(client);
+        drop(feed);
+        finished(task).await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admitted_http2_connections_survive_later_unavailable() -> TestResult {
+        for listener in [Listener::Public, Listener::Worker] {
+            for admitted in ["authenticated", "anonymous"] {
+                let (feed, task) =
+                    start_gated(router(), ByOutcome, Http2Config::default(), listener);
+                let (mut sender, connection) = open(connect(&feed)?).await?;
+                assert_eq!(
+                    request_outcome(&mut sender, admitted).await?,
+                    (StatusCode::OK, None)
+                );
+                assert_eq!(
+                    request_outcome(&mut sender, "unavailable").await?,
+                    (StatusCode::OK, Some("14".to_owned()))
+                );
+                assert_eq!(
+                    request_outcome(&mut sender, admitted).await?,
+                    (StatusCode::OK, None)
+                );
+                connection.abort();
+                drop(feed);
+                finished(task).await?;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fresh_invalid_proof_does_not_retire_http2_connection() -> TestResult {
+        for listener in [Listener::Public, Listener::Worker] {
+            let (feed, task) = start_gated(router(), ByOutcome, Http2Config::default(), listener);
+            let (mut sender, connection) = open(connect(&feed)?).await?;
+            assert_eq!(
+                request_outcome(&mut sender, "invalid").await?,
+                (StatusCode::OK, Some("16".to_owned()))
+            );
+            assert_eq!(
+                request_outcome(&mut sender, "anonymous").await?,
+                (StatusCode::OK, None)
+            );
+            connection.abort();
+            drop(feed);
+            finished(task).await?;
+        }
+        Ok(())
+    }
+
     /// Bazel pings every `CLIENT_KEEPALIVE_TIME` while an Execute or `WaitExecution` call waits, for
     /// as long as the action runs. No listener may answer that with a GOAWAY (gRPC's
     /// `too_many_pings`) or by ending the call. The span outlasts every server-side timer.
@@ -929,7 +1547,7 @@ mod tests {
         const IDLE_SPAN: Duration = Duration::from_hours(1);
         let pings_in_span = IDLE_SPAN.as_secs() / CLIENT_KEEPALIVE_TIME.as_secs();
 
-        for listener in [Listener::Public, Listener::Execution, Listener::Worker] {
+        for listener in [Listener::Public, Listener::Worker] {
             let (entered, mut entered_rx) = mpsc::unbounded_channel();
             let router = Router::new().route(
                 "/",
@@ -941,7 +1559,7 @@ mod tests {
                     }
                 }),
             );
-            let (feed, task) = start_gated(router, Allow, Http2Tuning::default(), listener);
+            let (feed, task) = start_gated(router, Allow, Http2Config::default(), listener);
             let (mut sender, mut connection) = h2::client::handshake::<_>(connect(&feed)?).await?;
             let mut pings = connection.ping_pong().ok_or("ping handle unavailable")?;
             let connection = tokio::spawn(connection);
@@ -978,7 +1596,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_public_listener_serves_http2_connections() -> TestResult {
-        let (feed, task) = start_gated(router(), Allow, Http2Tuning::default(), Listener::Public);
+        let (feed, task) = start_gated(router(), Allow, Http2Config::default(), Listener::Public);
         let (mut sender, connection) = open(connect(&feed)?).await?;
         let (status, body) = get_root(&mut sender).await?;
         assert_eq!(status, StatusCode::OK);
@@ -990,7 +1608,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_public_listener_serves_http1_connections() -> TestResult {
-        let (feed, task) = start_gated(router(), Allow, Http2Tuning::default(), Listener::Public);
+        let (feed, task) = start_gated(router(), Allow, Http2Config::default(), Listener::Public);
         let (mut sender, connection) = open_http1(connect(&feed)?).await?;
         let (status, body) = get_root_http1(&mut sender).await?;
         assert_eq!(status, StatusCode::OK);
@@ -1001,22 +1619,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_execution_listener_serves_http1_and_http2() -> TestResult {
-        let (feed, task) =
-            start_gated(router(), Allow, Http2Tuning::default(), Listener::Execution);
-        let (mut h1, h1_connection) = open_http1(connect(&feed)?).await?;
-        let (mut h2, h2_connection) = open(connect(&feed)?).await?;
-        assert_eq!(get_root_http1(&mut h1).await?.0, StatusCode::OK);
-        assert_eq!(get_root(&mut h2).await?.0, StatusCode::OK);
-        h1_connection.abort();
-        h2_connection.abort();
-        drop(feed);
-        finished(task).await
-    }
-
-    #[tokio::test]
     async fn the_worker_listener_rejects_http1_connections() -> TestResult {
-        let (feed, task) = start_gated(router(), Allow, Http2Tuning::default(), Listener::Worker);
+        let (feed, task) = start_gated(router(), Allow, Http2Config::default(), Listener::Worker);
         let (mut sender, connection) = open_http1(connect(&feed)?).await?;
         let request = Request::get("http://localhost/").body(Body::empty())?;
         // The server reads the request as a broken HTTP/2 preface and closes the connection, which
@@ -1033,7 +1637,7 @@ mod tests {
 
     #[tokio::test]
     async fn serve_returns_with_an_idle_http1_connection_open() -> TestResult {
-        let (feed, task) = start_gated(router(), Allow, Http2Tuning::default(), Listener::Public);
+        let (feed, task) = start_gated(router(), Allow, Http2Config::default(), Listener::Public);
         let (mut sender, connection) = open_http1(connect(&feed)?).await?;
         let (status, _) = get_root_http1(&mut sender).await?;
         assert_eq!(status, StatusCode::OK);
@@ -1048,9 +1652,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_stalled_http1_request_head_is_closed_after_the_header_read_timeout() -> TestResult {
-        let tuning = Http2Tuning {
+        let tuning = Http2Config {
             header_read_timeout: NonZeroDuration::from_secs(5),
-            ..Http2Tuning::default()
+            ..Http2Config::default()
         };
         let (feed, task) = start_gated(router(), Allow, tuning, Listener::Public);
         let mut client = connect(&feed)?;
@@ -1070,9 +1674,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_complete_http1_request_is_served_within_the_header_read_timeout() -> TestResult {
-        let tuning = Http2Tuning {
+        let tuning = Http2Config {
             header_read_timeout: NonZeroDuration::from_secs(5),
-            ..Http2Tuning::default()
+            ..Http2Config::default()
         };
         let (feed, task) = start_gated(router(), Allow, tuning, Listener::Public);
         let (mut sender, connection) = open_http1(connect(&feed)?).await?;
@@ -1096,7 +1700,7 @@ mod tests {
     /// with `tuning` as `listener`, and returns how many whole round trips the uploads took. A
     /// request answered first puts the server's settings and connection window in effect.
     async fn upload_round_trips(
-        tuning: Http2Tuning,
+        tuning: Http2Config,
         listener: Listener,
         sizes: &[usize],
     ) -> TestResult<u128> {
@@ -1128,13 +1732,13 @@ mod tests {
     /// A client a long round trip away sends a whole receive window before the server's first
     /// acknowledgement: uploading exactly the window takes one round trip and one byte more takes
     /// two, whether one stream sends it or two streams share the connection's window. The default
-    /// window is 16 MiB except on execution, where it is capped at 4 MiB by default.
+    /// window is 16 MiB on both listeners.
     #[tokio::test(start_paused = true)]
     async fn a_client_sends_one_receive_window_per_round_trip() -> TestResult {
-        let default = Http2Tuning::default;
-        let four_mib = || Http2Tuning {
+        let default = Http2Config::default;
+        let four_mib = || Http2Config {
             receive_window: ReceiveWindow::from_units(4 * 1024 * 1024),
-            ..Http2Tuning::default()
+            ..Http2Config::default()
         };
         let cases = [
             (default(), Listener::Worker, vec![16 * MIB], 1),
@@ -1143,8 +1747,6 @@ mod tests {
             (default(), Listener::Worker, vec![8 * MIB, 8 * MIB + 1], 2),
             (default(), Listener::Public, vec![16 * MIB], 1),
             (default(), Listener::Public, vec![16 * MIB + 1], 2),
-            (default(), Listener::Execution, vec![4 * MIB], 1),
-            (default(), Listener::Execution, vec![4 * MIB + 1], 2),
             (four_mib(), Listener::Worker, vec![4 * MIB], 1),
             (four_mib(), Listener::Worker, vec![4 * MIB + 1], 2),
         ];
@@ -1158,9 +1760,9 @@ mod tests {
     /// Silent connections cannot prevent authenticated clients from earning the available places.
     #[tokio::test(start_paused = true)]
     async fn an_anonymous_flood_at_the_limit_never_blocks_an_authenticated_client() -> TestResult {
-        let tuning = Http2Tuning {
+        let tuning = Http2Config {
             max_connections: NonZeroUsize::new(2).ok_or("nonzero")?,
-            ..Http2Tuning::default()
+            ..Http2Config::default()
         };
         let (feed, task) = start_gated(router(), ByAuthorization, tuning, Listener::Public);
         let _first_raw = connect(&feed)?;
@@ -1186,9 +1788,9 @@ mod tests {
     /// The oldest connection that has not earned its place is displaced first.
     #[tokio::test(start_paused = true)]
     async fn at_the_limit_the_oldest_unproven_connection_makes_room() -> TestResult {
-        let tuning = Http2Tuning {
+        let tuning = Http2Config {
             max_connections: NonZeroUsize::new(3).ok_or("nonzero")?,
-            ..Http2Tuning::default()
+            ..Http2Config::default()
         };
         let (feed, task) = start_gated(router(), ByAuthorization, tuning, Listener::Public);
         let (mut proven, proven_connection) = open(connect(&feed)?).await?;
@@ -1217,9 +1819,9 @@ mod tests {
     /// An idle unproven connection is displaced before a request in flight.
     #[tokio::test(start_paused = true)]
     async fn an_idle_unproven_connection_makes_room_before_a_busy_one() -> TestResult {
-        let tuning = Http2Tuning {
+        let tuning = Http2Config {
             max_connections: NonZeroUsize::new(3).ok_or("nonzero")?,
-            ..Http2Tuning::default()
+            ..Http2Config::default()
         };
         let hanging = router().route("/hang", get(std::future::pending::<&'static str>));
         let (feed, task) = start_gated(hanging, ByAuthorization, tuning, Listener::Public);
@@ -1256,9 +1858,9 @@ mod tests {
     /// When every unproven connection has a request in flight, an authenticated client still gets in: the oldest unproven connection makes room.
     #[tokio::test(start_paused = true)]
     async fn when_every_unproven_connection_is_busy_the_oldest_makes_room() -> TestResult {
-        let tuning = Http2Tuning {
+        let tuning = Http2Config {
             max_connections: NonZeroUsize::new(2).ok_or("nonzero")?,
-            ..Http2Tuning::default()
+            ..Http2Config::default()
         };
         let hanging = router().route("/hang", get(std::future::pending::<&'static str>));
         let (feed, task) = start_gated(hanging, ByAuthorization, tuning, Listener::Public);
@@ -1290,7 +1892,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_unproven_worker_connection_does_not_expire() -> TestResult {
         let clock = Arc::new(TestClock::new(Timestamp::from_unix_millis(0)));
-        let tuning = Http2Tuning::default();
+        let tuning = Http2Config::default();
         let idle = tuning.unproven_idle_timeout.get();
         let (feed, task) = start_clocked(
             router(),
@@ -1314,7 +1916,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_anonymous_streamed_response_keeps_its_connection_until_it_ends() -> TestResult {
         let clock = Arc::new(TestClock::new(Timestamp::from_unix_millis(0)));
-        let tuning = Http2Tuning::default();
+        let tuning = Http2Config::default();
         let idle = tuning.unproven_idle_timeout.get();
         let (chunks, receiver) = mpsc::unbounded_channel::<Result<Bytes, Infallible>>();
         let receiver = Arc::new(Mutex::new(Some(receiver)));
@@ -1377,7 +1979,7 @@ mod tests {
     async fn an_unproven_public_connection_expires_after_the_idle_timeout_on_the_clock()
     -> TestResult {
         let clock = Arc::new(TestClock::new(Timestamp::from_unix_millis(0)));
-        let tuning = Http2Tuning::default();
+        let tuning = Http2Config::default();
         let idle = tuning.unproven_idle_timeout.get();
         let (feed, task) = start_clocked(
             router(),
@@ -1408,7 +2010,7 @@ mod tests {
 
     /// Sends twice `tuning.max_concurrent_streams` requests that never finish on one connection,
     /// and returns how many of them the handler saw.
-    async fn concurrent_requests(tuning: Http2Tuning) -> TestResult<u32> {
+    async fn concurrent_requests(tuning: Http2Config) -> TestResult<u32> {
         let (entered, mut entries) = mpsc::unbounded_channel::<()>();
         let hanging = router().route(
             "/hang",
@@ -1457,12 +2059,193 @@ mod tests {
     /// default, or as tuned; its client queues the rest.
     #[tokio::test(start_paused = true)]
     async fn a_connection_runs_at_most_max_concurrent_streams_requests() -> TestResult {
-        let three = Http2Tuning {
+        let three = Http2Config {
             max_concurrent_streams: NonZeroU32::MIN.saturating_add(2),
-            ..Http2Tuning::default()
+            ..Http2Config::default()
         };
-        assert_eq!(concurrent_requests(Http2Tuning::default()).await?, 100);
+        assert_eq!(concurrent_requests(Http2Config::default()).await?, 100);
         assert_eq!(concurrent_requests(three).await?, 3);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refusal_idle_deadlines_survive_graceful_shutdown_on_both_roles() -> TestResult {
+        for listener in [Listener::Public, Listener::Worker] {
+            for prefix in [b"".as_slice(), b"PRI * HTTP/2.0\r\n".as_slice()] {
+                let clock = Arc::new(TestClock::new(Timestamp::UNIX_EPOCH));
+                let tuning = Http2Config {
+                    unproven_idle_timeout: NonZeroDuration::from_secs(5),
+                    ..Http2Config::default()
+                };
+                let (feed, task) = start_in_mode(
+                    Router::new(),
+                    Allow,
+                    tuning,
+                    listener,
+                    Arc::clone(&clock),
+                    ServeMode::Standby(NonZeroDuration::from_secs(20)),
+                );
+                let mut peer = connect(&feed)?;
+                peer.write_all(prefix).await?;
+                settle().await;
+                clock.advance(Duration::from_secs(4));
+                settle().await;
+                drop(feed);
+                settle().await;
+                clock.advance(Duration::from_secs(1));
+                tokio::time::timeout(Duration::from_secs(1), finished(task)).await??;
+                peer.read_to_end(&mut Vec::new()).await?;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refusal_drain_cap_and_same_tick_idle_expiry_close_without_fatal_errors() -> TestResult
+    {
+        for listener in [Listener::Public, Listener::Worker] {
+            for (grace_s, request_s, idle_s) in [(5, 20, 60), (30, 5, 60), (5, 5, 5)] {
+                let clock = Arc::new(TestClock::new(Timestamp::UNIX_EPOCH));
+                let tuning = Http2Config {
+                    shutdown_grace: Duration::from_secs(grace_s),
+                    unproven_idle_timeout: NonZeroDuration::from_secs(idle_s),
+                    ..Http2Config::default()
+                };
+                let (feed, task) = start_in_mode(
+                    Router::new(),
+                    Allow,
+                    tuning,
+                    listener,
+                    Arc::clone(&clock),
+                    ServeMode::Standby(NonZeroDuration::from_secs(request_s)),
+                );
+                let mut peer = connect(&feed)?;
+                peer.write_all(b"PRI * HTTP/2.0\r\n").await?;
+                settle().await;
+                drop(feed);
+                settle().await;
+                clock.advance(Duration::from_secs(grace_s.min(request_s)));
+                tokio::time::timeout(Duration::from_secs(1), finished(task)).await??;
+                peer.read_to_end(&mut Vec::new()).await?;
+            }
+        }
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    struct SignalledRefusal {
+        entered: mpsc::UnboundedSender<()>,
+        release: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    impl RequestGate for SignalledRefusal {
+        async fn admit(
+            &self,
+            _scope: RequestScope,
+            _peer: &Peer,
+            _parts: &mut http::request::Parts,
+        ) -> Result<GateDecision, PortError> {
+            let _ = self.entered.send(());
+            if let Some(release) = &self.release {
+                release.notified().await;
+            }
+            Err(PortError::unavailable("controller is draining"))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_marked_503_finishes_after_refusal_intake_stops() -> TestResult {
+        let (entered, mut entries) = mpsc::unbounded_channel();
+        let (feed, task) = start_in_mode(
+            Router::new().fallback(|| async { StatusCode::NOT_FOUND }),
+            SignalledRefusal {
+                entered,
+                release: None,
+            },
+            Http2Config::default(),
+            Listener::Public,
+            SystemClock::new(),
+            ServeMode::Standby(NonZeroDuration::from_secs(5)),
+        );
+        // One byte of downstream buffering keeps the actual response pending until read.
+        let (server, mut peer) = tokio::io::duplex(1);
+        feed.send(Accepted {
+            connection: Box::new(server),
+            peer: Peer::default(),
+        })
+        .map_err(|_| "refusal listener stopped")?;
+        peer.write_all(b"POST /v1/login HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
+            .await?;
+        entries
+            .recv()
+            .await
+            .ok_or("request never reached the refusal gate")?;
+        drop(feed);
+        settle().await;
+        assert!(
+            !task.is_finished(),
+            "the pending response must not be cancelled"
+        );
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), peer.read_to_end(&mut response)).await??;
+        let response = String::from_utf8(response)?;
+        assert!(response.starts_with("HTTP/1.1 503 "));
+        assert!(response.contains("gang-request-not-started: true\r\n"));
+        assert!(response.ends_with("unavailable"));
+        finished(task).await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_grpc_refusals_finish_after_intake_stops_on_both_roles() -> TestResult {
+        for listener in [Listener::Public, Listener::Worker] {
+            let (entered, mut entries) = mpsc::unbounded_channel();
+            let release = Arc::new(tokio::sync::Notify::new());
+            let (feed, task) = start_in_mode(
+                Router::new().fallback(|| async { StatusCode::NOT_FOUND }),
+                SignalledRefusal {
+                    entered,
+                    release: Some(Arc::clone(&release)),
+                },
+                Http2Config::default(),
+                listener,
+                SystemClock::new(),
+                ServeMode::Standby(NonZeroDuration::from_secs(5)),
+            );
+            let (mut sender, connection) = open(connect(&feed)?).await?;
+            let response = tokio::spawn(async move {
+                sender.ready().await?;
+                sender
+                    .send_request(
+                        Request::post("http://localhost/grpc.Service/Method")
+                            .header(http::header::CONTENT_TYPE, "application/grpc")
+                            .body(Body::empty())
+                            .expect("valid request"),
+                    )
+                    .await
+            });
+            entries
+                .recv()
+                .await
+                .ok_or("request never reached the refusal gate")?;
+            drop(feed);
+            settle().await;
+            assert!(
+                !task.is_finished(),
+                "the pending refusal must not be cancelled"
+            );
+            release.notify_one();
+            let response = response.await??;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["grpc-status"], "14");
+            assert_eq!(
+                response.headers()[gang_types::handover::REQUEST_NOT_STARTED_HEADER],
+                "true"
+            );
+            let body = axum::body::to_bytes(Body::new(response.into_body()), BODY_LIMIT).await?;
+            assert!(body.is_empty());
+            tokio::time::timeout(Duration::from_secs(1), connection).await???;
+            finished(task).await?;
+        }
         Ok(())
     }
 }

@@ -520,6 +520,7 @@ impl World {
                     past_boot_grace: !machine.terminating
                         && self.behaviour.boot_flag == BootFlag::Raised
                         && self.pass - machine.launched >= BOOT_GRACE_PASSES,
+                    infrastructure: None,
                 })
                 .collect(),
             actions: Some(Actions {
@@ -527,6 +528,7 @@ impl World {
                 ..Actions::default()
             }),
             events: self.ledger.clone(),
+            status_events: Vec::new(),
             events_limit: 1_000,
             completed: 0,
             recent: Recent::default(),
@@ -548,7 +550,7 @@ impl ControlSim {
     fn new(behaviour: Behaviour, min_instances: u32) -> Self {
         Self {
             inner: Simulation::new(
-                Variant::baseline(Sandbox::Bwrap),
+                &Variant::baseline(Sandbox::Bwrap),
                 support::Behaviour::COMPLIANT,
             ),
             world: Mutex::new(World::new(behaviour, min_instances)),

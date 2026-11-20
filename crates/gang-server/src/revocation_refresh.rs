@@ -3,7 +3,9 @@
 use std::convert::Infallible;
 
 use gang_clock::Clock;
-use gang_spi::{AuthenticationPort, ExpiringRecordPort, RevocationEpoch, StateRepositoryPort};
+use gang_spi::{
+    AuthenticationPort, ExpiringRecordPort, PortError, RevocationEpoch, StateRepositoryPort,
+};
 use gang_tls::RevocationSet;
 use gang_types::NonZeroDuration;
 
@@ -30,34 +32,52 @@ pub(crate) async fn refresh_revocations<K: Stack>(
         if next == applied {
             continue;
         }
-        // Do not overwrite a local revocation or restore that completes during these reads.
-        let local_epoch = core.host.revoked_principals.epoch();
-        let serials = match core.host.repository.revoked().await {
-            Ok(serials) => serials,
-            Err(error) => {
-                tracing::warn!(%error, "cannot refresh revoked certificates");
-                continue;
-            }
-        };
-        let principals = match core.host.repository.revoked_principals().await {
-            Ok(principals) => principals,
-            Err(error) => {
-                tracing::warn!(%error, "cannot refresh revoked principals");
-                continue;
-            }
-        };
-        for record in serials {
-            core.workers.forget_revoked_certificate(&record.serial);
-            certificates.revoke(record.serial);
+        if let Ok(true) = apply_snapshot(core, certificates).await {
+            applied = next;
         }
-        if !core.host.revoked_principals.replace_if_epoch(
-            local_epoch,
-            principals.into_iter().map(|principal| principal.identity),
-        ) {
-            continue;
-        }
-        applied = next;
     }
+}
+
+/// Reloads revocations before admitting requests as leader.
+pub(crate) async fn synchronize_revocations<K: Stack>(
+    core: &Core<K>,
+    certificates: &RevocationSet,
+) -> Result<(), PortError> {
+    let _guard = core.revocation_lock.lock().await;
+    if !apply_snapshot(core, certificates).await? {
+        return Err(PortError::unavailable(
+            "revocations changed during synchronization",
+        ));
+    }
+    Ok(())
+}
+
+/// Reads both snapshots before applying either; the caller holds the revocation lock.
+async fn apply_snapshot<K: Stack>(
+    core: &Core<K>,
+    certificates: &RevocationSet,
+) -> Result<bool, PortError> {
+    // Do not overwrite a direct local change that completes during these reads.
+    let local_epoch = core.host.revoked_principals.epoch();
+    let serials = core.host.repository.revoked().await.inspect_err(|error| {
+        tracing::warn!(%error, "cannot refresh revoked certificates");
+    })?;
+    let principals = core
+        .host
+        .repository
+        .revoked_principals()
+        .await
+        .inspect_err(|error| {
+            tracing::warn!(%error, "cannot refresh revoked principals");
+        })?;
+    for record in serials {
+        core.workers.forget_revoked_certificate(&record.serial);
+        certificates.revoke(record.serial);
+    }
+    Ok(core.host.revoked_principals.replace_if_epoch(
+        local_epoch,
+        principals.into_iter().map(|principal| principal.identity),
+    ))
 }
 
 /// Periodically requests cleanup independently of revocation refresh.

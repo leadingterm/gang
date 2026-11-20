@@ -13,6 +13,7 @@ use gang_clock::{Clock, TestClock};
 use gang_mtls::{CertificateAuthority, SubjectName};
 use gang_spi::{Accepted, Peer};
 use gang_testkit::TestSigner;
+use gang_tls::Listener;
 use gang_tls::{Alpn, ClientAuth, RevocationSet, ServerTrust, TransportError};
 use gang_types::{NonZeroDuration, Percent, TrustDomain};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -37,6 +38,24 @@ const REISSUE_AT: Percent = Percent::from_percent(50);
 const H2: &[u8] = b"h2";
 const HTTP1: &[u8] = b"http/1.1";
 
+struct ProxyPeer(MemoryListener);
+
+impl Listener for ProxyPeer {
+    type Io = DuplexStream;
+    type Addr = u32;
+
+    async fn accept(&mut self) -> std::io::Result<(Self::Io, Self::Addr)> {
+        self.0.accept().await
+    }
+
+    fn peer_ip(_: &Self::Addr) -> Option<std::net::IpAddr> {
+        Some(std::net::Ipv4Addr::new(10, 0, 1, 4).into())
+    }
+}
+
+fn proxy_frame() -> &'static [u8] {
+    b"\r\n\r\n\0\r\nQUIT\n\x21\x11\0\x0c\xc0\0\x02\x01\xc0\0\x02\x02\0\x01\0\x02"
+}
 type Tls = Accepting<MemoryListener, TestSigner, TestClock>;
 
 /// Polls `future` once with a no-op waker. `Pending` means nothing was ready at that point.
@@ -86,6 +105,8 @@ fn policy(
         reissue_at_percent,
         handshake,
         accept_error_backoff: ACCEPT_ERROR_BACKOFF,
+        proxy_mode: gang_config::ProxyProtocol::Off,
+        proxy_protocol: Arc::default(),
     }
 }
 
@@ -143,6 +164,8 @@ async fn plain_endpoint_reports_an_anonymous_caller() {
         listener,
         ACCEPT_ERROR_BACKOFF,
         start_clock(),
+        gang_config::ProxyProtocol::Off,
+        Arc::default(),
     );
 
     let mut client = dialer.dial();
@@ -162,6 +185,165 @@ async fn plain_endpoint_reports_an_anonymous_caller() {
         .await
         .expect("connection carries the client's bytes");
     assert_eq!(&received, b"ping");
+}
+
+#[tokio::test]
+async fn plain_accepting_listener_reports_proxied_source_and_replays_direct_http() {
+    let (listener, dialer) = memory_listener();
+    let config = Arc::new(gang_config::ProxyProtocolConfig {
+        trusted_cidrs: vec!["10.0.1.4/32".parse().expect("test network")],
+        ..gang_config::ProxyProtocolConfig::default()
+    });
+    let mut endpoint = Accepting::<ProxyPeer, TestSigner, TestClock>::plain(
+        ProxyPeer(listener),
+        ACCEPT_ERROR_BACKOFF,
+        start_clock(),
+        gang_config::ProxyProtocol::Accept,
+        config,
+    );
+    let mut client = dialer.dial();
+    client.write_all(proxy_frame()).await.expect("proxy header");
+    client.write_all(b"GET").await.expect("request");
+    let Accepted {
+        mut connection,
+        peer,
+    } = endpoint.accept().await.expect("proxied connection");
+    assert_eq!(
+        peer.address,
+        Some(std::net::Ipv4Addr::new(192, 0, 2, 1).into())
+    );
+    let mut bytes = [0; 3];
+    connection
+        .read_exact(&mut bytes)
+        .await
+        .expect("request bytes");
+    assert_eq!(&bytes, b"GET");
+    let mut client = dialer.dial();
+    client.write_all(b"GET").await.expect("direct request");
+    let Accepted {
+        mut connection,
+        peer,
+    } = endpoint.accept().await.expect("direct connection");
+    assert_eq!(
+        peer.address,
+        Some(std::net::Ipv4Addr::new(10, 0, 1, 4).into())
+    );
+    connection
+        .read_exact(&mut bytes)
+        .await
+        .expect("replayed request");
+    assert_eq!(&bytes, b"GET");
+}
+
+#[tokio::test]
+async fn accept_mode_replays_a_direct_tls_client_hello() {
+    let clock = start_clock();
+    let authority = Arc::new(authority(&clock).await);
+    let (listener, dialer) = memory_listener();
+    let mut policy = policy(
+        ClientAuth::Optional,
+        Alpn::H2,
+        RevocationSet::from_serials(Vec::new()),
+        handshake_settings(),
+        REISSUE_AT,
+    );
+    policy.proxy_mode = gang_config::ProxyProtocol::Accept;
+    policy.proxy_protocol = Arc::new(gang_config::ProxyProtocolConfig {
+        trusted_cidrs: vec!["10.0.1.4/32".parse().expect("test network")],
+        ..gang_config::ProxyProtocolConfig::default()
+    });
+    let mut endpoint = Accepting::<ProxyPeer, TestSigner, TestClock>::secured(
+        ProxyPeer(listener),
+        Arc::clone(&authority),
+        policy,
+        Arc::clone(&clock),
+    )
+    .await
+    .expect("tls endpoint");
+    let (client, accepted) = tokio::join!(
+        tls_client_over(dialer.dial(), HOST, authority.certificate(), None, &clock),
+        endpoint.accept()
+    );
+    client.expect("direct tls handshake");
+    assert_eq!(
+        accepted.expect("direct tls accepted").peer.address,
+        Some(std::net::Ipv4Addr::new(10, 0, 1, 4).into())
+    );
+    let mut framed = dialer.dial();
+    framed.write_all(proxy_frame()).await.expect("proxy header");
+    let (client, accepted) = tokio::join!(
+        tls_client_over(framed, HOST, authority.certificate(), None, &clock),
+        endpoint.accept()
+    );
+    client.expect("proxied tls handshake");
+    assert_eq!(
+        accepted.expect("proxied tls accepted").peer.address,
+        Some(std::net::Ipv4Addr::new(192, 0, 2, 1).into())
+    );
+}
+
+#[tokio::test]
+async fn pending_proxy_header_survives_tls_certificate_rotation() {
+    let clock = start_clock();
+    let authority = Arc::new(authority(&clock).await);
+    let (listener, dialer) = memory_listener();
+    let mut policy = policy(
+        ClientAuth::Optional,
+        Alpn::H2,
+        RevocationSet::from_serials(Vec::new()),
+        handshake_settings(),
+        REISSUE_AT,
+    );
+    policy.proxy_mode = gang_config::ProxyProtocol::Require;
+    policy.proxy_protocol = Arc::new(gang_config::ProxyProtocolConfig {
+        trusted_cidrs: vec!["10.0.1.4/32".parse().expect("test address")],
+        header_timeout: NonZeroDuration::from_hours(1),
+        ..gang_config::ProxyProtocolConfig::default()
+    });
+    let mut endpoint = Accepting::<ProxyPeer, TestSigner, TestClock>::secured(
+        ProxyPeer(listener),
+        Arc::clone(&authority),
+        policy,
+        Arc::clone(&clock),
+    )
+    .await
+    .expect("tls endpoint");
+    let mut pending = dialer.dial();
+    pending
+        .write_all(&proxy_frame()[..5])
+        .await
+        .expect("partial header");
+    let mut ready = dialer.dial();
+    ready
+        .write_all(proxy_frame())
+        .await
+        .expect("complete header");
+    let (client, accepted) = tokio::join!(
+        tls_client_over(ready, HOST, authority.certificate(), None, &clock),
+        endpoint.accept()
+    );
+    client.expect("initial tls connection");
+    assert_eq!(
+        accepted.expect("initial accepted connection").peer.address,
+        Some(std::net::Ipv4Addr::new(192, 0, 2, 1).into())
+    );
+    clock.advance(ROTATION_ADVANCE);
+    pending
+        .write_all(&proxy_frame()[5..])
+        .await
+        .expect("complete pending header");
+    let (client, accepted) = tokio::join!(
+        tls_client_over(pending, HOST, authority.certificate(), None, &clock),
+        endpoint.accept()
+    );
+    client.expect("tls connection after rotation");
+    assert_eq!(
+        accepted
+            .expect("pending connection survives rotation")
+            .peer
+            .address,
+        Some(std::net::Ipv4Addr::new(192, 0, 2, 1).into())
+    );
 }
 
 #[tokio::test]

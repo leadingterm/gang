@@ -1,6 +1,6 @@
 # ADR-36: A publicly trusted endpoint re-encrypts to Gang's TLS
 
-Status: Accepted. Amends ADR-09's consequence on public-certificate proxies; transport stays `tls` (ADR-03). Amended by ADR-45 (separate execution and internal load-balanced endpoints).
+Status: Accepted. Amends ADR-09's consequence on public-certificate proxies; transport stays `tls` (ADR-03). Amended by ADR-45 (single client endpoint and internal load-balanced endpoints).
 
 ## Context
 - Browsers must open the dashboard without a certificate warning or CA installation; Bazel and `gang` should use system trust.

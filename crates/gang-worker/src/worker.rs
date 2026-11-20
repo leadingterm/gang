@@ -192,6 +192,7 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
 ) -> Result<(Plan, Option<D::Limits>), WorkerError> {
     let WorkerSettings {
         fleets,
+        actions,
         worker,
         sandbox,
         execution,
@@ -246,10 +247,26 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
         });
     }
     let limits = file.limits.map(build_limits).transpose()?;
-    if let Some(limits) = &limits {
-        limits.prepare().await?;
+    let reserve = actions.memory.reserve.get();
+    let memory_pool = match &limits {
+        Some(limits) => limits.prepare(reserve).await?,
+        None => None,
+    };
+    if let Some(pool) = &memory_pool {
+        let declared = fleet.policy.memory_per_instance.get();
+        let capacity = pool.capacity.get();
+        if declared > capacity {
+            return Err(WorkerError::FleetMemoryUnavailable {
+                fleet: identity.fleet,
+                declared,
+                capacity,
+                reserve,
+            });
+        }
     }
     let spec = WorkerSpec {
+        actions,
+        memory_pool,
         instance: identity.instance,
         properties: fleet.properties.clone(),
         slots,

@@ -38,6 +38,7 @@ fn tools() -> ActionTools {
         shell: std::path::PathBuf::from("/nix/store/aaa-bash/bin/bash"),
         path: "/nix/store/aaa-bash/bin:/nix/store/bbb-coreutils/bin".to_owned(),
         action_bin: std::path::PathBuf::from("/nix/store/ddd-action-tools/bin"),
+        ca_bundle: None,
         bwrap: Some(std::path::PathBuf::from(
             "/nix/store/ccc-bubblewrap/bin/bwrap",
         )),
@@ -601,7 +602,7 @@ fn rendered_sessions_variant() -> gang_e2e::Result<()> {
     assert_eq!(config.dashboard.session_max_age.get(), SESSION_MAX_AGE);
     let doc: Table = toml::from_str(&text).expect("the rendered config is TOML");
     let token = &doc["authentication"]["clients"]["token"];
-    assert_eq!(token["token_ttl"].as_str(), Some("1m"));
+    assert_eq!(token["token_ttl"].as_str(), Some("25s"));
     assert_eq!(token["clock_skew"].as_str(), Some("0s"));
     let login = &doc["identity"]["providers"][PROVIDER]["oidc"]["login"];
     assert_eq!(

@@ -7,8 +7,10 @@ use gang_types::{Bytes, NonZeroDuration, Percent, TrustDomain};
 use serde::{Deserialize, Serialize};
 
 use crate::ca_pin_setting::CaPinSetting;
+use crate::proxy_protocol_config::ProxyProtocolConfig;
 use crate::rate_limit_config::RateLimitConfig;
 use crate::role_config::RoleConfig;
+use crate::{Http2Config, OpenFileLimit, WholeSeconds};
 
 /// How `gang server` carries its connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -105,14 +107,13 @@ const DEFAULT_HEALTH_MAX_HEADER_SIZE: Bytes = Bytes::kib(8);
 
 /// Default controller leadership lease lifetime.
 const DEFAULT_LEADERSHIP_TTL: NonZeroDuration = NonZeroDuration::from_secs(10);
-/// Default interval between leadership renewals.
-const DEFAULT_LEADERSHIP_RENEW_INTERVAL: NonZeroDuration = NonZeroDuration::from_secs(3);
-/// Default minimum remaining validity before a provisioner mutation.
-const DEFAULT_LEADERSHIP_CALL_TIMEOUT: NonZeroDuration = NonZeroDuration::from_secs(2);
 /// Default allowance for clock skew between controllers.
 const DEFAULT_LEADERSHIP_CLOCK_SKEW: Duration = Duration::from_secs(2);
 /// Default interval between revocation refreshes.
 const DEFAULT_REVOCATION_REFRESH_INTERVAL: NonZeroDuration = NonZeroDuration::from_secs(5);
+
+/// Default time a worker may be silent before the scheduler drops it: 10 seconds.
+pub const DEFAULT_WORKER_TIMEOUT: WholeSeconds = WholeSeconds::from_units(10);
 
 /// Controller leadership lease timing settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,8 +134,12 @@ impl Default for LeadershipConfig {
     fn default() -> Self {
         Self {
             ttl: DEFAULT_LEADERSHIP_TTL,
-            renew_interval: DEFAULT_LEADERSHIP_RENEW_INTERVAL,
-            call_timeout: DEFAULT_LEADERSHIP_CALL_TIMEOUT,
+            renew_interval: NonZeroDuration::from_secs(
+                gang_types::handover::DEFAULT_RENEW_INTERVAL.as_secs(),
+            ),
+            call_timeout: NonZeroDuration::from_secs(
+                gang_types::handover::DEFAULT_CALL_TIMEOUT.as_secs(),
+            ),
             clock_skew: DEFAULT_LEADERSHIP_CLOCK_SKEW,
         }
     }
@@ -191,8 +196,12 @@ pub struct ServerConfig {
     /// Limits on the routes that are open to anyone. Defaults to the bucket and tracking values
     /// documented on `RateLimitConfig`.
     pub rate_limit: RateLimitConfig,
+    /// Trusted PROXY v2 listener settings; all listeners default to off.
+    pub proxy_protocol: ProxyProtocolConfig,
     /// Controller leadership timing. Defaults to the values on [`LeadershipConfig`].
     pub leadership: LeadershipConfig,
+    /// Time a newer standby must be routable before requesting handover. Defaults to zero.
+    pub standby_routability_delay: Duration,
     /// Interval between revocation refreshes. Defaults to five seconds.
     pub revocation_refresh_interval: NonZeroDuration,
     /// How many health listener connections may be open at once; further connections wait in the
@@ -201,6 +210,12 @@ pub struct ServerConfig {
     /// The largest request head a health listener connection may send, at least 8 KiB. Defaults
     /// to 8 KiB.
     pub health_max_header_size: Bytes,
+    /// HTTP/2 connection and message limits and timeouts.
+    pub http2: Http2Config,
+    /// Time a worker may be silent before the scheduler drops it. Defaults to 10 seconds.
+    pub worker_timeout: WholeSeconds,
+    /// Process open-file limit. Defaults to 24,576.
+    pub max_open_files: OpenFileLimit,
 }
 
 /// The `[server]` table as written.
@@ -227,10 +242,16 @@ struct RawServer {
     max_request_size: Bytes,
     request_timeout: NonZeroDuration,
     rate_limit: RateLimitConfig,
+    proxy_protocol: ProxyProtocolConfig,
     leadership: LeadershipConfig,
+    #[serde(with = "gang_types::duration")]
+    standby_routability_delay: Duration,
     revocation_refresh_interval: NonZeroDuration,
     health_max_connections: NonZeroUsize,
     health_max_header_size: Bytes,
+    http2: Http2Config,
+    worker_timeout: WholeSeconds,
+    max_open_files: OpenFileLimit,
 }
 
 impl Default for RawServer {
@@ -253,10 +274,15 @@ impl Default for RawServer {
             max_request_size: DEFAULT_MAX_REQUEST_SIZE,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             rate_limit: RateLimitConfig::default(),
+            proxy_protocol: ProxyProtocolConfig::default(),
             leadership: LeadershipConfig::default(),
+            standby_routability_delay: Duration::ZERO,
             revocation_refresh_interval: DEFAULT_REVOCATION_REFRESH_INTERVAL,
             health_max_connections: DEFAULT_HEALTH_MAX_CONNECTIONS,
             health_max_header_size: DEFAULT_HEALTH_MAX_HEADER_SIZE,
+            http2: Http2Config::default(),
+            worker_timeout: DEFAULT_WORKER_TIMEOUT,
+            max_open_files: OpenFileLimit::default(),
         }
     }
 }
@@ -307,10 +333,15 @@ impl TryFrom<RawServer> for ServerConfig {
             max_request_size: raw.max_request_size,
             request_timeout: raw.request_timeout,
             rate_limit: raw.rate_limit,
+            proxy_protocol: raw.proxy_protocol,
             leadership: raw.leadership,
+            standby_routability_delay: raw.standby_routability_delay,
             revocation_refresh_interval: raw.revocation_refresh_interval,
             health_max_connections: raw.health_max_connections,
             health_max_header_size: raw.health_max_header_size,
+            http2: raw.http2,
+            worker_timeout: raw.worker_timeout,
+            max_open_files: raw.max_open_files,
         })
     }
 }
@@ -339,10 +370,15 @@ impl From<ServerConfig> for RawServer {
             max_request_size: config.max_request_size,
             request_timeout: config.request_timeout,
             rate_limit: config.rate_limit,
+            proxy_protocol: config.proxy_protocol,
             leadership: config.leadership,
+            standby_routability_delay: config.standby_routability_delay,
             revocation_refresh_interval: config.revocation_refresh_interval,
             health_max_connections: config.health_max_connections,
             health_max_header_size: config.health_max_header_size,
+            http2: config.http2,
+            worker_timeout: config.worker_timeout,
+            max_open_files: config.max_open_files,
         }
     }
 }
@@ -350,6 +386,54 @@ impl From<ServerConfig> for RawServer {
 #[cfg(test)]
 mod tests {
     use super::{EndpointTrust, ServerConfig};
+
+    #[test]
+    fn connection_settings_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+        let config: ServerConfig = toml::from_str(
+            "transport = 'plaintext'\nworker_timeout = '17s'\nmax_open_files = 8192\n[http2]\nreceive_window = '65535B'\nmax_connections = 42",
+        )?;
+        assert_eq!(config.worker_timeout, crate::WholeSeconds::from_units(17));
+        assert_eq!(config.max_open_files.get(), 8192);
+        assert_eq!(config.http2.receive_window.get().get(), 65_535);
+        assert_eq!(config.http2.max_connections.get(), 42);
+        assert_eq!(
+            toml::from_str::<ServerConfig>(&toml::to_string(&config)?)?,
+            config
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn standby_routability_delay_defaults_and_round_trips() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let default: ServerConfig = toml::from_str("transport = 'plaintext'")?;
+        assert_eq!(default.standby_routability_delay, std::time::Duration::ZERO);
+        let config: ServerConfig =
+            toml::from_str("transport = 'plaintext'\nstandby_routability_delay = '10s'")?;
+        assert_eq!(
+            config.standby_routability_delay,
+            std::time::Duration::from_secs(10)
+        );
+        let serialized = toml::to_string(&config)?;
+        let reparsed: ServerConfig = toml::from_str(&serialized)?;
+        assert_eq!(reparsed, config);
+        Ok(())
+    }
+
+    #[test]
+    fn connection_settings_reject_invalid_values() {
+        assert!(
+            toml::from_str::<ServerConfig>("transport = 'plaintext'\nworker_timeout = '0s'")
+                .is_err()
+        );
+        assert!(
+            toml::from_str::<ServerConfig>("transport = 'plaintext'\nmax_open_files = 7").is_err()
+        );
+        assert!(
+            toml::from_str::<ServerConfig>("transport = 'plaintext'\n[http2]\nunknown = 1")
+                .is_err()
+        );
+    }
 
     #[test]
     fn endpoint_trust_defaults_to_ca() -> Result<(), Box<dyn std::error::Error>> {

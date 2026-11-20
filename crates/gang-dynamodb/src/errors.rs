@@ -13,6 +13,12 @@ pub enum DynamoError {
         /// The invalid attribute.
         attribute: &'static str,
     },
+    /// A durable monotonic counter has reached its maximum.
+    #[error("dynamodb counter exhausted: {counter}")]
+    CounterExhausted {
+        /// The exhausted counter.
+        counter: &'static str,
+    },
     /// The stored schema is incompatible with this binary.
     #[error("database schema cannot be used")]
     Schema(#[from] gang_spi::SchemaTooNew),

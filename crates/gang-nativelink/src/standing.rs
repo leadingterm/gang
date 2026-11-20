@@ -3,7 +3,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -14,6 +14,14 @@ use gang_clock::Clock;
 use hyper::body::{Body as HttpBody, Frame, SizeHint};
 use tokio::sync::Notify;
 
+/// Admission and retirement compete for the first decision on a connection.
+#[repr(u8)]
+enum Admission {
+    Fresh = 0,
+    Admitted = 1,
+    Retrying = 2,
+}
+
 /// Whether a connection has earned its place, and how many of its requests are in flight.
 #[derive(Debug, Default)]
 pub(crate) struct Standing {
@@ -23,9 +31,63 @@ pub(crate) struct Standing {
     in_flight: AtomicUsize,
     /// Woken on every change of the two above.
     changed: Notify,
+    /// The canonical first admission or retry decision.
+    admission: AtomicU8,
+    /// Explicit leadership retirement is independent of the first admission decision.
+    leadership_retired: AtomicBool,
+    /// Wakes the connection's sole retry waiter.
+    retry: Notify,
 }
 
 impl Standing {
+    /// Permits a request unless retirement won before any request was admitted.
+    pub(crate) fn admit(&self) -> bool {
+        match self.admission.compare_exchange(
+            Admission::Fresh as u8,
+            Admission::Admitted as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => true,
+            Err(state) => state == Admission::Admitted as u8,
+        }
+    }
+
+    /// Requests graceful retirement only if no request has yet been admitted.
+    pub(crate) fn request_retry(&self) {
+        if self
+            .admission
+            .compare_exchange(
+                Admission::Fresh as u8,
+                Admission::Retrying as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.retry.notify_one();
+        }
+    }
+
+    /// Retires the connection without preventing already accepted requests from admission.
+    pub(crate) fn retire_leadership(&self) {
+        self.leadership_retired.store(true, Ordering::Release);
+        self.retry.notify_one();
+    }
+
+    /// Waits for the irreversible retry decision.
+    pub(crate) async fn retry_requested(&self) {
+        loop {
+            let notified = self.retry.notified();
+            if self.leadership_retired.load(Ordering::Acquire)
+                || self.admission.load(Ordering::Acquire) == Admission::Retrying as u8
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     /// Whether the gate has admitted an authenticated request on the connection.
     pub(crate) fn is_proven(&self) -> bool {
         self.proven.load(Ordering::Acquire)
@@ -123,6 +185,54 @@ mod tests {
     const IDLE: Duration = Duration::from_secs(30);
     const TICK: Duration = Duration::from_millis(1);
     const BEFORE_IDLE: Duration = IDLE.checked_sub(TICK).unwrap();
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn admission_prevents_retry() {
+        let standing = Standing::default();
+        let retry = standing.retry_requested();
+        tokio::pin!(retry);
+        assert!(futures::poll!(&mut retry).is_pending());
+        assert!(standing.admit());
+        assert!(standing.admit());
+        standing.request_retry();
+        standing.request_retry();
+        assert!(futures::poll!(&mut retry).is_pending());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_prevents_admission() {
+        let standing = Standing::default();
+        let retry = standing.retry_requested();
+        tokio::pin!(retry);
+        assert!(futures::poll!(&mut retry).is_pending());
+        standing.request_retry();
+        standing.request_retry();
+        assert!(futures::poll!(&mut retry).is_ready());
+        assert!(!standing.admit());
+        assert!(!standing.admit());
+        let retry_again = standing.retry_requested();
+        tokio::pin!(retry_again);
+        assert!(futures::poll!(&mut retry_again).is_ready());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn leadership_retirement_is_independent_of_admission() {
+        for admitted_first in [false, true] {
+            let standing = Standing::default();
+            if admitted_first {
+                assert!(standing.admit());
+            }
+            let retry = standing.retry_requested();
+            tokio::pin!(retry);
+            assert!(futures::poll!(&mut retry).is_pending());
+            standing.retire_leadership();
+            assert!(futures::poll!(&mut retry).is_ready());
+            assert!(standing.admit());
+            let later = standing.retry_requested();
+            tokio::pin!(later);
+            assert!(futures::poll!(&mut later).is_ready());
+        }
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn an_unproven_idle_connection_expires_after_the_idle_timeout() {

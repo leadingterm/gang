@@ -164,21 +164,26 @@ variable "workload_token_max_seconds" {
   }
 }
 
-variable "config_parameter_name" {
-  description = "Name of the SSM parameter holding the rendered gang.toml. Named on the first EC2 user-data line after the role (worker <name>); workers read the parameter at boot."
+variable "config_parameter_reference" {
+  description = "Absolute SSM configuration parameter path with a positive numeric version selector."
   type        = string
   nullable    = false
 
   validation {
-    condition     = length(var.config_parameter_name) <= 1011 && can(regex("^/[A-Za-z0-9_./-]+$", var.config_parameter_name))
-    error_message = "config_parameter_name must be an SSM parameter name: / followed by A-Z a-z 0-9 _ . - / characters, at most 1011 in total."
+    condition     = can(regex("^/([A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+:[0-9]*[1-9][0-9]*$", var.config_parameter_reference)) && length(split(":", var.config_parameter_reference)[0]) <= 1011
+    error_message = "config_parameter_reference must be an absolute SSM path of at most 1011 characters followed by a positive numeric :version."
   }
 }
 
-variable "config_parameter_arn" {
-  description = "ARN of the SSM parameter named by config_parameter_name. The worker role may read it (ssm:GetParameter)."
-  type        = string
+variable "config_parameter_arns" {
+  description = "SSM parameter ARNs readable by workers."
+  type        = list(string)
   nullable    = false
+
+  validation {
+    condition     = length(var.config_parameter_arns) > 0
+    error_message = "config_parameter_arns must not be empty."
+  }
 }
 
 variable "tags" {

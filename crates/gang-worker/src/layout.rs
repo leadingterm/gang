@@ -84,7 +84,7 @@ impl Layout {
     /// the join link.
     ///
     /// Abandoned work and identity generations from an earlier process are removed, while the
-    /// warm fast CAS is retained. The identity directory is created readable only by its owner.
+    /// warm fast CAS is retained. The identity and action side-channel directories are private.
     /// An existing sandbox file, entrypoint link, or join link is replaced.
     ///
     /// # Errors
@@ -94,6 +94,7 @@ impl Layout {
     pub fn prepare(&self, sandbox_file: &str, executable: &Path) -> Result<(), WorkerError> {
         remove_dir_optional(&self.work_directory())?;
         create_directory(&self.work_directory())?;
+        ensure_private_dir(&self.work_directory().join(".side_channels"))?;
         create_directory(&self.fast_cas_directory())?;
         create_directory(&self.bin_directory())?;
         remove_dir_optional(&self.identity_directory())?;

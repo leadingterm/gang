@@ -14,6 +14,8 @@ pub(crate) const MEMBERSHIP_FILE: &str = "/proc/self/cgroup";
 
 /// Procfs directory holding one entry per live process.
 pub(crate) const PROC_ROOT: &str = "/proc";
+/// Physical memory information provided by procfs.
+pub(crate) const MEMINFO_FILE: &str = "/proc/meminfo";
 
 /// Interface file listing the controllers the cgroup offers.
 pub(crate) const CONTROLLERS: &str = "cgroup.controllers";
@@ -33,6 +35,8 @@ pub(crate) const MEMORY_SWAP_MAX: &str = "memory.swap.max";
 pub(crate) const MEMORY_OOM_GROUP: &str = "memory.oom.group";
 /// Interface file holding the peak memory use of the cgroup.
 pub(crate) const MEMORY_PEAK: &str = "memory.peak";
+/// Interface file holding hierarchical memory event counts.
+pub(crate) const MEMORY_EVENTS: &str = "memory.events";
 /// Interface file holding the CPU bandwidth limit of the cgroup.
 pub(crate) const CPU_MAX: &str = "cpu.max";
 /// Interface file holding the CPU statistics of the cgroup.
@@ -55,6 +59,9 @@ const TRUSTED_DELEGATE_XATTR: &str = "trusted.delegate";
 pub(crate) trait Cgroupfs: Send + Sync {
     /// The cgroup the calling process is in.
     fn own_cgroup(&self) -> io::Result<PathBuf>;
+
+    /// The contents of `/proc/meminfo`.
+    fn meminfo(&self) -> io::Result<String>;
 
     /// Where `cgroup` is on the host filesystem: the directory that a process outside this
     /// adapter, such as the `gang-join` trampoline, opens.
@@ -143,6 +150,10 @@ impl Cgroupfs for Kernel {
         let membership = fs::read_to_string(MEMBERSHIP_FILE)?;
         parse::own_cgroup(&membership)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+    }
+
+    fn meminfo(&self) -> io::Result<String> {
+        fs::read_to_string(MEMINFO_FILE)
     }
 
     fn absolute(&self, cgroup: &Path) -> PathBuf {

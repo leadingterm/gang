@@ -19,8 +19,6 @@ const DEFAULT_TARGETS: NonZeroUsize = NonZeroUsize::new(20).expect("20 is non-ze
 const DEFAULT_SLOWEST_ACTIONS: NonZeroUsize = NonZeroUsize::new(20).expect("20 is non-zero");
 /// The default number of timeline buckets per build: 120.
 const DEFAULT_TIMELINE_BUCKETS: NonZeroUsize = NonZeroUsize::new(120).expect("120 is non-zero");
-/// The default number of controller traffic watermarks retained per leadership term: 1024.
-const DEFAULT_MAX_TRAFFIC_SERIES: NonZeroUsize = NonZeroUsize::new(1024).expect("1024 is non-zero");
 
 /// Settings of in-memory build insight. Every field has a default, so the section may be omitted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,9 +38,6 @@ pub struct BuildsConfig {
     pub slowest_actions: NonZeroUsize,
     /// Timeline buckets per build. Defaults to 120.
     pub timeline_buckets: NonZeroUsize,
-    /// Controller traffic watermarks retained per leadership term; at the cap the least recently
-    /// updated is evicted. Defaults to 1024.
-    pub max_traffic_series: NonZeroUsize,
 }
 
 impl Default for BuildsConfig {
@@ -55,7 +50,6 @@ impl Default for BuildsConfig {
             targets: DEFAULT_TARGETS,
             slowest_actions: DEFAULT_SLOWEST_ACTIONS,
             timeline_buckets: DEFAULT_TIMELINE_BUCKETS,
-            max_traffic_series: DEFAULT_MAX_TRAFFIC_SERIES,
         }
     }
 }

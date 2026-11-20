@@ -5,6 +5,11 @@ use gang_types::{CertSerial, Identity, InstanceId, ProviderName, WorkerId};
 /// A boxed cause from a backend.
 pub type BoxedError = Box<dyn std::error::Error + Send + Sync>;
 
+/// A stored candidate priority is not a canonical ordered key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("invalid candidate priority key")]
+pub struct CandidatePriorityError;
+
 /// Why a port call or a plugin build failed. The variants tell the caller what to do:
 /// retry on the next pass, reject the client, or stop.
 #[derive(Debug, thiserror::Error)]

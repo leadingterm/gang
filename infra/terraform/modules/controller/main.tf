@@ -7,6 +7,8 @@ locals {
   # The image's gang.stateDevice; the role line names it.
   state_device             = "/dev/sdg"
   lifecycle_margin_seconds = 120
+  health                   = jsondecode(file("${path.module}/../load-balancer/health-check.json"))
+  instance_warmup          = local.health.interval_seconds * local.health.threshold + local.health.renew_interval_seconds + local.health.promotion_seconds + local.health.handover_margin_seconds + min(local.health.call_timeout_seconds, local.health.renew_interval_seconds)
 }
 
 moved {
@@ -46,6 +48,7 @@ data "aws_ec2_instance_type" "this" {
 }
 
 resource "aws_instance" "this" {
+  depends_on             = [module.instance_role]
   count                  = local.instance_shape ? 1 : 0
   ami                    = var.ami_id
   instance_type          = var.instance_type
@@ -55,7 +58,7 @@ resource "aws_instance" "this" {
   iam_instance_profile   = module.instance_role.instance_profile_name
   monitoring             = true
   # Line 1 names the role, config parameter and state device; then one "<file>=<parameter>" line per secret.
-  user_data                   = join("\n", concat(["controller ${var.config_parameter_name} state=${local.state_device}"], [for file, parameter in var.secret_parameters : "${file}=${parameter}"]))
+  user_data                   = join("\n", concat(["controller ${var.config_parameter_reference} state=${local.state_device}"], [for file, parameter in var.secret_parameters : "${file}=${parameter}"]))
   user_data_replace_on_change = true
 
   # IMDSv2 only; a hop limit of 1 keeps the metadata service unreachable from containers.
@@ -144,12 +147,13 @@ data "aws_ami" "controller" {
 }
 
 resource "aws_launch_template" "controller" {
+  depends_on             = [module.instance_role]
   count                  = local.group_shape ? 1 : 0
   name_prefix            = "${var.name}-"
   image_id               = var.ami_id
   instance_type          = var.instance_type
   vpc_security_group_ids = [var.security_group_id]
-  user_data              = base64encode(join("\n", concat(["controller ${var.config_parameter_name}"], [for file, parameter in var.secret_parameters : "${file}=${parameter}"], ["# config-digest ${var.config_digest}"])))
+  user_data              = base64encode(join("\n", concat(["controller ${var.config_parameter_reference}"], [for file, parameter in var.secret_parameters : "${file}=${parameter}"], ["# config-digest ${var.config_digest}"])))
   update_default_version = true
 
   iam_instance_profile {
@@ -219,6 +223,7 @@ resource "aws_autoscaling_group" "controller" {
     preferences {
       min_healthy_percentage = 100
       max_healthy_percentage = 200
+      instance_warmup        = local.instance_warmup
     }
   }
 

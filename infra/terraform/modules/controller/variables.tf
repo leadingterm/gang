@@ -87,6 +87,17 @@ variable "dynamodb_table_arn" {
   }
 }
 
+variable "events_queue_arn" {
+  description = "SQS queue ARN for AWS event observation; null omits the grant."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.events_queue_arn == null || can(regex("^arn:aws[a-z-]*:sqs:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_-]+$", var.events_queue_arn))
+    error_message = "events_queue_arn must be null or a standard SQS queue ARN."
+  }
+}
+
 variable "iam_name_prefix" {
   description = "Prefix of the name of every IAM role and instance profile, including any separator (for example `example-`). Empty keeps the module's own names. Use it where IAM names must sit under a prefix."
   type        = string
@@ -175,21 +186,26 @@ variable "state_volume_gib" {
   }
 }
 
-variable "config_parameter_name" {
-  description = "Name of the SSM parameter holding the rendered gang.toml. Delivered as plain-text EC2 user data; the instance reads the parameter at boot."
+variable "config_parameter_reference" {
+  description = "Absolute SSM configuration parameter path with a positive numeric version selector."
   type        = string
   nullable    = false
 
   validation {
-    condition     = length(var.config_parameter_name) <= 1011 && can(regex("^/[A-Za-z0-9_./-]+$", var.config_parameter_name))
-    error_message = "config_parameter_name must be an SSM parameter name: / followed by A-Z a-z 0-9 _ . - / characters, at most 1011 in total."
+    condition     = can(regex("^/([A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+:[0-9]*[1-9][0-9]*$", var.config_parameter_reference)) && length(split(":", var.config_parameter_reference)[0]) <= 1011
+    error_message = "config_parameter_reference must be an absolute SSM path of at most 1011 characters followed by a positive numeric :version."
   }
 }
 
-variable "config_parameter_arn" {
-  description = "ARN of the SSM parameter named by config_parameter_name. The controller role may read only this parameter."
-  type        = string
+variable "config_parameter_arns" {
+  description = "SSM parameter ARNs readable by the controller."
+  type        = list(string)
   nullable    = false
+
+  validation {
+    condition     = length(var.config_parameter_arns) > 0
+    error_message = "config_parameter_arns must not be empty."
+  }
 }
 
 variable "secret_parameters" {

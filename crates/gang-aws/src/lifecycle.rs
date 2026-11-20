@@ -2,7 +2,7 @@
 //! the node is parked.
 //!
 //! Reads go to the instance metadata service through `IMDSv2` session tokens, which the SDK client
-//! fetches and refreshes itself. The identity document is fetched once per process.
+//! fetches and refreshes itself. Worker and controller identities are memoized independently.
 
 use aws_config::imds::Client;
 use aws_config::imds::client::error::{ImdsError, TokenError};
@@ -12,7 +12,7 @@ use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_runtime_api::client::result::SdkError;
 use gang_aws_sdk::{CallError, Retryability, classify};
 use gang_clock::{Rfc3339Error, Timestamp};
-use gang_spi::{InstanceIdentity, PreemptionNotice};
+use gang_spi::{ControllerHostIdentity, InstanceIdentity, PreemptionNotice};
 use gang_types::{FleetName, InstanceId, Isa, NonZeroDuration};
 use serde::Deserialize;
 use tokio::sync::OnceCell;
@@ -88,6 +88,7 @@ pub(crate) struct Metadata {
     fleet_tag_key: String,
     fleet_tag_path: String,
     identity: OnceCell<InstanceIdentity>,
+    controller_identity: OnceCell<ControllerHostIdentity>,
 }
 
 impl Metadata {
@@ -99,6 +100,7 @@ impl Metadata {
             fleet_tag_key: fleet_tag_key.to_owned(),
             fleet_tag_path: format!("{FLEET_TAG_PATH_PREFIX}{fleet_tag_key}"),
             identity: OnceCell::new(),
+            controller_identity: OnceCell::new(),
         }
     }
 
@@ -106,6 +108,25 @@ impl Metadata {
     pub(crate) async fn identity(&self) -> Result<InstanceIdentity, AwsError> {
         self.identity
             .get_or_try_init(|| self.fetch_identity())
+            .await
+            .cloned()
+    }
+
+    /// This controller's immutable launch identity, independent of the worker fleet tag.
+    pub(crate) async fn incarnation(&self) -> Result<ControllerHostIdentity, AwsError> {
+        self.controller_identity
+            .get_or_try_init(|| async {
+                let body = self.imds.get(IDENTITY_PATH).await.map_err(imds_error)?;
+                let document: ControllerIdentityDocument = serde_json::from_str(body.as_ref())
+                    .map_err(|_| {
+                        AwsError::malformed(IMDS_OPERATION, "controller identity document")
+                    })?;
+                let instance = InstanceId::try_new(document.instance_id)
+                    .map_err(|_| AwsError::malformed(IMDS_OPERATION, "instance id"))?;
+                let at = Timestamp::from_rfc3339(&document.pending_time)
+                    .map_err(|_| AwsError::malformed(IMDS_OPERATION, "controller launch time"))?;
+                Ok(ControllerHostIdentity::Launched { at, instance })
+            })
             .await
             .cloned()
     }
@@ -212,6 +233,14 @@ impl Metadata {
 struct IdentityDocument {
     instance_id: String,
     architecture: String,
+}
+
+/// Controller launch fields are required only for controller reads, never for worker identity.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ControllerIdentityDocument {
+    instance_id: String,
+    pending_time: String,
 }
 
 /// The spot interruption notice, as far as this crate reads it. Every action ends the node.
@@ -325,6 +354,37 @@ mod tests {
         assert_eq!(identity.instance, InstanceId::try_new(INSTANCE_ID)?);
         assert_eq!(identity.fleet, FleetName::try_new(FLEET)?);
         assert_eq!(identity.isa, Isa::X86_64);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn worker_identity_does_not_require_or_validate_controller_launch_time()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeAws::start().await?;
+        for pending in [
+            None,
+            Some(serde_json::json!("not-a-time")),
+            Some(serde_json::json!(42)),
+        ] {
+            seed_identity(&fake, "x86_64");
+            let mut document = serde_json::json!({
+                "instanceId": INSTANCE_ID,
+                "architecture": "x86_64",
+            });
+            if let Some(pending) = pending {
+                document["pendingTime"] = pending;
+            }
+            fake.state().identity_document = Some(document.to_string());
+            let meta = metadata(&fake)?;
+            assert!(matches!(
+                meta.incarnation().await,
+                Err(AwsError::MalformedResponse { .. })
+            ));
+            let worker = meta.identity().await?;
+            assert_eq!(worker.instance, InstanceId::try_new(INSTANCE_ID)?);
+            assert_eq!(worker.fleet, FleetName::try_new(FLEET)?);
+            assert_eq!(worker.isa, Isa::X86_64);
+        }
         Ok(())
     }
 

@@ -7,9 +7,10 @@
 use std::sync::Arc;
 
 use gang_spi::{
-    Admitted, Authenticated, AuthenticationPort, Evidence, Peer, PortError, Rejection, RequestGate,
+    Admitted, Authenticated, AuthenticationPort, Evidence, GateDecision, Peer, PortError,
+    Rejection, RequestGate, RequestScope,
 };
-use gang_wire::routes::{self, Method as RouteMethod, RouteId, accepts_cookie};
+use gang_wire::routes::{Method as RouteMethod, accepts_cookie};
 use http::header::AUTHORIZATION;
 use http::request::Parts;
 use http::{Extensions, Method};
@@ -58,10 +59,6 @@ impl Caller {
     }
 }
 
-/// Marks an open-path request admitted by the execution listener's public gate.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ExecutionListener;
-
 /// What only the public listener's gate has: it reads the session cookie, and resolves the client
 /// address of each open-path request through the proxies whose `X-Forwarded-For` it believes.
 #[derive(Clone)]
@@ -77,7 +74,6 @@ pub(crate) struct Gate<K: Stack, P: AuthenticationPort> {
     plugin: Arc<P>,
     /// The public listener's surface; `None` on the worker listener.
     public: Option<PublicSurface>,
-    execution: bool,
     readiness: Option<Readiness>,
 }
 
@@ -87,7 +83,6 @@ impl<K: Stack, P: AuthenticationPort> Clone for Gate<K, P> {
             core: Arc::clone(&self.core),
             plugin: Arc::clone(&self.plugin),
             public: self.public.clone(),
-            execution: self.execution,
             readiness: self.readiness.clone(),
         }
     }
@@ -102,7 +97,6 @@ impl<K: Stack> Gate<K, K::Clients> {
             plugin: Arc::clone(&core.clients),
             core,
             public: Some(PublicSurface { proxies }),
-            execution: false,
             readiness: None,
         }
     }
@@ -116,22 +110,15 @@ impl<K: Stack> Gate<K, K::Workers> {
             plugin: Arc::clone(&core.workers),
             core,
             public: None,
-            execution: false,
             readiness: None,
         }
     }
 }
 
 impl<K: Stack, P: AuthenticationPort> Gate<K, P> {
-    /// Reject requests until this controller is serving as leader.
+    /// Reject leader-scoped requests unless this controller is serving a promoted term.
     pub(crate) fn with_readiness(mut self, readiness: Readiness) -> Self {
         self.readiness = Some(readiness);
-        self
-    }
-
-    /// Marks open-path requests as originating on the execution listener.
-    pub(crate) fn executing(mut self) -> Self {
-        self.execution = true;
         self
     }
 
@@ -170,31 +157,24 @@ fn is_session_only(parts: &Parts, session: Option<&str>) -> bool {
         && !parts.headers.contains_key(AUTHORIZATION)
 }
 
-/// Whether `parts` is a follower's observation ingest, which only its controller proof
-/// authenticates.
-fn is_ingest(parts: &Parts) -> bool {
-    parts
-        .method
-        .as_str()
-        .parse::<RouteMethod>()
-        .ok()
-        .and_then(|method| routes::lookup(method, parts.uri.path()))
-        .is_some_and(|(route, _)| matches!(route.id, RouteId::IngestBuilds))
-}
-
 impl<K: Stack, P: AuthenticationPort + 'static> RequestGate for Gate<K, P> {
     /// Admits the request, or refuses it with the plugin's error. On the public listener's open
     /// paths nothing is refused here: a refusal or an authenticated caller is recorded in the
     /// request's [`Caller`] for the services behind the gate to decide, and an anonymous request
-    /// stores nothing. A follower's ingest on the execution listener is admitted anonymously
-    /// without asking the plugin. The result names the caller when it authenticated.
-    async fn admit(&self, peer: &Peer, parts: &mut Parts) -> Result<Admitted, PortError> {
-        if self
-            .readiness
-            .as_ref()
-            .is_some_and(|ready| !ready.promoted())
+    /// stores nothing. The result names the caller when it authenticated.
+    async fn admit(
+        &self,
+        scope: RequestScope,
+        peer: &Peer,
+        parts: &mut Parts,
+    ) -> Result<GateDecision, PortError> {
+        if scope == RequestScope::Leader
+            && self
+                .readiness
+                .as_ref()
+                .is_some_and(|ready| !ready.admitting())
         {
-            return Err(PortError::unavailable("controller is not ready to lead"));
+            return Ok(GateDecision::NotLeading);
         }
         let open_public = self
             .public
@@ -205,12 +185,6 @@ impl<K: Stack, P: AuthenticationPort + 'static> RequestGate for Gate<K, P> {
             && let Some(client) = public.proxies.client(peer.address, &parts.headers)
         {
             parts.extensions.insert(ClientAddress(client));
-        }
-        if self.execution && open {
-            parts.extensions.insert(ExecutionListener);
-            if is_ingest(parts) {
-                return Ok(Admitted::Anonymous);
-            }
         }
         let session = self.session_cookie(parts);
         let authenticated = match self.authenticate_caller(peer, parts, session).await {
@@ -223,7 +197,7 @@ impl<K: Stack, P: AuthenticationPort + 'static> RequestGate for Gate<K, P> {
         };
         let Some(authenticated) = authenticated else {
             return if open {
-                Ok(Admitted::Anonymous)
+                Ok(GateDecision::Admit(Admitted::Anonymous))
             } else {
                 Err(PortError::refused(Rejection::InvalidProof))
             };
@@ -236,21 +210,33 @@ impl<K: Stack, P: AuthenticationPort + 'static> RequestGate for Gate<K, P> {
         {
             return refuse(parts, open, PortError::refused(Rejection::PrincipalRevoked));
         }
+        if self
+            .readiness
+            .as_ref()
+            .is_none_or(|ready| !ready.admitting())
+            && let Err(error) = self
+                .core
+                .host
+                .admit_principal(&authenticated.identity)
+                .await
+        {
+            return refuse(parts, open, error);
+        }
         self.core.host.observe(&authenticated.identity).await;
         if open {
             parts
                 .extensions
                 .insert(Caller::Authenticated(authenticated.clone()));
         }
-        Ok(Admitted::Authenticated(authenticated))
+        Ok(GateDecision::Admit(Admitted::Authenticated(authenticated)))
     }
 }
 
 /// Records `error` as the refusal of an open path's request, or returns it as the gate's error.
-fn refuse(parts: &mut Parts, open: bool, error: PortError) -> Result<Admitted, PortError> {
+fn refuse(parts: &mut Parts, open: bool, error: PortError) -> Result<GateDecision, PortError> {
     if open {
         parts.extensions.insert(Caller::Refused(Arc::new(error)));
-        Ok(Admitted::Anonymous)
+        Ok(GateDecision::Admit(Admitted::Anonymous))
     } else {
         Err(error)
     }

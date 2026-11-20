@@ -40,3 +40,18 @@ opentofu_contract_test(
         "//infra/terraform/modules/worker-fleet:sources",
     ],
 )
+
+opentofu_contract_test(
+    name = "deployment_config_generations_contract",
+    test_expectations = "tests/config_generations.expectations.json",
+    test_file = "tests/config_generations.tftest.hcl",
+    deps = [
+        "//:Cargo.toml",
+        "//infra/terraform/modules/controller:sources",
+        "//infra/terraform/modules/instance-role:sources",
+        "//infra/terraform/modules/load-balancer:sources",
+        "//infra/terraform/modules/network:sources",
+        "//infra/terraform/modules/storage:sources",
+        "//infra/terraform/modules/worker-fleet:sources",
+    ],
+)

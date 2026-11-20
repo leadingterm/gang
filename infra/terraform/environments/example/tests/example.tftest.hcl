@@ -156,6 +156,11 @@ run "plans_the_example_deployment" {
   }
 
   assert {
+    condition     = !strcontains(output.gang.gang_toml, "standby_routability_delay") && !strcontains(output.gang.gang_toml, "[server.leadership]")
+    error_message = "The checked-in SQLite example must retain the default zero standby delay."
+  }
+
+  assert {
     condition     = strcontains(output.gang.gang_toml, "[authentication.clients.token]\nproviders = [\"google\",\"github-actions\"]")
     error_message = "gang.toml must list the example client token providers."
   }

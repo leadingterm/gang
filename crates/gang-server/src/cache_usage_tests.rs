@@ -179,7 +179,7 @@ async fn published_state_carries_sink_traffic_and_the_sampled_measurement() -> T
         failed: 0,
         hosted: &hosted,
     };
-    publisher.publish(clock.wall(), ok(), &[], fleets.catalog());
+    publisher.publish(clock.wall(), ok(), &[], fleets.catalog(), &[]);
     sink.count(Traffic {
         lookups: 3,
         hits: 2,
@@ -187,7 +187,7 @@ async fn published_state_carries_sink_traffic_and_the_sampled_measurement() -> T
         downloaded: 20,
     });
     clock.advance(Duration::from_secs(1));
-    publisher.publish(clock.wall(), ok(), &[], fleets.catalog());
+    publisher.publish(clock.wall(), ok(), &[], fleets.catalog(), &[]);
     let state: State = serde_json::from_slice(&dashboard.api().hub.state_json()?)?;
     assert_eq!(
         state.cache.bucket,
@@ -259,7 +259,7 @@ async fn a_promoted_publisher_samples_only_traffic_from_its_term() -> TestResult
         failed: 0,
         hosted: &hosted,
     };
-    publisher.publish(clock.wall(), ok(), &[], fleets.catalog());
+    publisher.publish(clock.wall(), ok(), &[], fleets.catalog(), &[]);
     let state: State = serde_json::from_slice(&dashboard.api().hub.state_json()?)?;
     assert_eq!(
         recent_traffic(&state),

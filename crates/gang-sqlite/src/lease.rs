@@ -1,10 +1,14 @@
 //! The leader lease of a `SQLite` deployment. The plugin takes the database file's exclusive lock
 //! when it is built and holds it for the life of the process, so exactly one controller can use
-//! the database: that lock is the lease. Taking, renewing and releasing it never touch the
-//! database, so a busy database can never lapse it and fence the only controller.
+//! the database: that lock is the lease. Registering a host always returns priority one, ignoring
+//! its identity; registration, taking, renewal and release never touch the database, so a busy
+//! database can never lapse the lease and fence the only controller.
 
 use gang_clock::Timestamp;
-use gang_spi::{Acquisition, ControllerId, LeaderLeasePort, Lease, LeaseEpoch, PortError, Renewal};
+use gang_spi::{
+    Acquisition, CandidateGeneration, CandidatePriority, ControllerHostIdentity, ControllerId,
+    LeaderLeasePort, Lease, LeaseCandidate, LeaseEpoch, PortError, Renewal, Takeover,
+};
 
 use crate::Sqlite;
 
@@ -12,20 +16,38 @@ use crate::Sqlite;
 const ONLY_TAKING: LeaseEpoch = LeaseEpoch::new(1);
 
 impl LeaderLeasePort for Sqlite {
-    async fn acquire(
+    async fn register_candidate(
         &self,
         holder: &ControllerId,
+        _host: &ControllerHostIdentity,
+    ) -> Result<LeaseCandidate, PortError> {
+        Ok(LeaseCandidate {
+            holder: holder.clone(),
+            priority: CandidatePriority::registered(CandidateGeneration::new(1)),
+        })
+    }
+
+    async fn acquire(
+        &self,
+        candidate: &LeaseCandidate,
+        _now: Timestamp,
         _stale_before: Timestamp,
         expires_at: Timestamp,
+        _takeover: Takeover,
     ) -> Result<Acquisition, PortError> {
         Ok(Acquisition::Acquired(Lease {
-            holder: holder.clone(),
+            holder: candidate.holder.clone(),
             epoch: ONLY_TAKING,
             expires_at,
         }))
     }
 
-    async fn renew(&self, lease: &Lease, expires_at: Timestamp) -> Result<Renewal, PortError> {
+    async fn renew(
+        &self,
+        lease: &Lease,
+        _now: Timestamp,
+        expires_at: Timestamp,
+    ) -> Result<Renewal, PortError> {
         Ok(Renewal::Renewed(Lease {
             expires_at,
             ..lease.clone()
@@ -44,6 +66,7 @@ mod tests {
     use std::task::{Context, Poll, Waker};
 
     use gang_spi::{Plugin, PluginContext};
+    use gang_types::InstanceId;
     use tempfile::TempDir;
 
     use super::*;
@@ -73,13 +96,27 @@ mod tests {
 
         let holder = ControllerId::new("controller-a".to_owned());
         let at = |millis| Timestamp::from_unix_millis(millis);
-        let acquired = pin!(db.acquire(&holder, at(0), at(10))).poll(&mut cx);
+        let host = ControllerHostIdentity::Launched {
+            at: at(42),
+            instance: InstanceId::try_new("sqlite-host")?,
+        };
+        let candidate = pin!(db.register_candidate(&holder, &host)).poll(&mut cx);
+        let candidate = match candidate {
+            Poll::Ready(Ok(candidate)) => candidate,
+            other => return Err(format!("registration blocked: {other:?}").into()),
+        };
+        assert_eq!(
+            candidate.priority,
+            CandidatePriority::registered(CandidateGeneration::new(1))
+        );
+        let acquired =
+            pin!(db.acquire(&candidate, at(0), at(0), at(10), Takeover::Observe)).poll(&mut cx);
         let lease = Lease {
             holder: holder.clone(),
             epoch: LeaseEpoch::new(1),
             expires_at: at(10),
         };
-        let renewed = pin!(db.renew(&lease, at(20))).poll(&mut cx);
+        let renewed = pin!(db.renew(&lease, at(0), at(20))).poll(&mut cx);
         let released = pin!(db.release(&lease)).poll(&mut cx);
         release.send(())?;
         busy.await?;

@@ -1,4 +1,8 @@
 mock_provider "aws" {
+  mock_data "aws_network_interface" {
+    defaults = { private_ips = ["10.20.1.10", "10.20.1.11"] }
+  }
+
   mock_data "aws_partition" {
     defaults = {
       partition = "aws"
@@ -66,8 +70,9 @@ mock_provider "aws" {
 
   mock_resource "aws_lb" {
     defaults = {
-      arn      = "arn:aws:elasticloadbalancing:eu-north-1:000000000000:loadbalancer/net/gang/0000000000000000"
-      dns_name = "gang-0000000000.elb.eu-north-1.amazonaws.com"
+      arn        = "arn:aws:elasticloadbalancing:eu-north-1:000000000000:loadbalancer/net/gang/0000000000000000"
+      arn_suffix = "net/gang/0000000000000000"
+      dns_name   = "gang-0000000000.elb.eu-north-1.amazonaws.com"
     }
   }
 
@@ -155,10 +160,19 @@ override_module {
   target = module.network
   outputs = {
     vpc_id                       = "vpc-test"
+    vpc_cidr_block               = "10.20.0.0/16"
+    availability_zones           = ["az-a", "az-b"]
     public_subnet_ids            = ["subnet-public-a", "subnet-public-b"]
+    public_subnet_cidr_blocks    = ["10.20.0.0/20", "10.20.16.0/20"]
     private_subnet_ids           = { "az-a" = "subnet-private-a", "az-b" = "subnet-private-b" }
     controller_security_group_id = "sg-controller"
     worker_security_group_id     = "sg-worker"
+    controller_eip_allocation_id = null
+    controller_public_ip         = null
+    controller_public_dns        = null
+    controller_private_ip        = "10.20.0.10"
+    controller_private_dns       = "ip-10-20-0-10.eu-north-1.compute.internal"
+    nat_public_ips               = ["203.0.113.10"]
     public_port                  = 443
     worker_port                  = 9090
     health_port                  = 8080
@@ -200,6 +214,21 @@ variables {
 }
 
 
+run "proxy_off_omits_section" {
+  command = apply
+  variables {
+    database         = { engine = "postgres", postgres = { rds = {} } }
+    controller_count = 2
+    hostname         = "gang.example.com"
+    load_balancer    = { proxy_protocol_stage = "off" }
+    nat_mode         = "per_az"
+  }
+  assert {
+    condition     = !strcontains(output.gang_toml, "[server.proxy_protocol]")
+    error_message = "Off must leave PROXY disabled by default."
+  }
+}
+
 run "rds_group_shape" {
   command = apply
   variables {
@@ -219,6 +248,11 @@ run "rds_group_shape" {
     error_message = "The PostgreSQL group must use one client endpoint and the private worker endpoint."
   }
   assert {
+    condition     = strcontains(output.gang_toml, "standby_routability_delay = \"${local.health.interval_seconds * local.health.threshold}s\"") && strcontains(output.gang_toml, "[server.leadership]\nrenew_interval = \"${local.health.renew_interval_seconds}s\"\ncall_timeout = \"${local.health.call_timeout_seconds}s\"")
+    error_message = "PostgreSQL must render the same routing, renewal and call timeout policy as the controller refresh."
+  }
+
+  assert {
     condition     = strcontains(output.gang_toml, "password_file = \"/etc/gang/secrets/database-password\"") && strcontains(output.gang_toml, "ca_file = \"/etc/gang/rds-ca-bundle.pem\"")
     error_message = "RDS must use the secret password file and the bundled RDS CA."
   }
@@ -230,7 +264,12 @@ run "rds_group_shape" {
     condition     = output.controller_config_digest == sha256("${output.gang_toml}\npassword_version=1")
     error_message = "The RDS controller digest must include the initial password version."
   }
+  assert {
+    condition     = strcontains(output.gang_toml, "[server.proxy_protocol]\npublic = \"accept\"\nworker = \"accept\"\nhealth = \"accept\"\ntrusted_cidrs = [\"10.20.1.10/32\",\"10.20.1.11/32\"]") && !strcontains(output.gang_toml, "10.20.0.0/16")
+    error_message = "Default shared deployment must trust only exact ENI addresses in accept mode."
+  }
 }
+
 
 run "rds_password_rotation_refreshes_controllers" {
   command = apply
@@ -250,6 +289,38 @@ run "rds_password_rotation_refreshes_controllers" {
   }
 }
 
+run "proxy_proxied_does_not_refresh_controller" {
+  command = apply
+  variables {
+    database           = { engine = "postgres", postgres = { rds = { password_version = 2 } } }
+    controller_count   = 2
+    hostname           = "gang.example.com"
+    load_balancer      = { proxy_protocol_stage = "proxied" }
+    nat_mode           = "per_az"
+    previous_gang_toml = run.rds_password_rotation_refreshes_controllers.gang_toml
+    previous_digest    = run.rds_password_rotation_refreshes_controllers.controller_config_digest
+  }
+  assert {
+    condition     = output.gang_toml == var.previous_gang_toml && output.controller_config_digest == var.previous_digest
+    error_message = "Switching accept to proxied must not change controller configuration or digest."
+  }
+}
+
+run "proxy_require_renders_modes" {
+  command = apply
+  variables {
+    database         = { engine = "postgres", postgres = { rds = { password_version = 2 } } }
+    controller_count = 2
+    hostname         = "gang.example.com"
+    load_balancer    = { proxy_protocol_stage = "require" }
+    nat_mode         = "per_az"
+  }
+  assert {
+    condition     = strcontains(output.gang_toml, "[server.proxy_protocol]\npublic = \"require\"\nworker = \"require\"\nhealth = \"require\"") && strcontains(output.gang_toml, "10.20.1.10/32")
+    error_message = "Require must render typed listener modes and exact ENI trust."
+  }
+}
+
 run "dynamodb_digest_unchanged" {
   command = apply
   variables {
@@ -265,7 +336,7 @@ run "dynamodb_digest_unchanged" {
 }
 
 run "external_with_ca" {
-  command = plan
+  command = apply
   variables {
     database = { engine = "postgres", postgres = { external = {
       host = "db.example.com", database = "gang", user = "gang", password_parameter = "/gang/db/password", ca_parameter = "/gang/db/ca"
@@ -288,7 +359,7 @@ run "external_with_ca" {
 }
 
 run "external_without_ca" {
-  command = plan
+  command = apply
   variables {
     database = { engine = "postgres", postgres = { external = {
       host = "db.example.com", port = 6432, database = "builds", user = "builder", password_parameter = "/gang/db/password"
@@ -486,4 +557,28 @@ run "rejects_fractional_external_port" {
     load_balancer = {}
   }
   expect_failures = [var.database]
+}
+
+run "rejects_external_password_in_generations" {
+  command = plan
+  variables {
+    database = { engine = "postgres", postgres = { external = {
+      host = "db.example.com", database = "gang", user = "gang", password_parameter = "/gang/gang.toml/generations/password"
+    } } }
+    hostname      = "gang.example.com"
+    load_balancer = {}
+  }
+  expect_failures = [terraform_data.input_checks]
+}
+
+run "rejects_external_ca_in_generations" {
+  command = plan
+  variables {
+    database = { engine = "postgres", postgres = { external = {
+      host = "db.example.com", database = "gang", user = "gang", password_parameter = "/gang/db/password", ca_parameter = "/gang/gang.toml/generations/ca"
+    } } }
+    hostname      = "gang.example.com"
+    load_balancer = {}
+  }
+  expect_failures = [terraform_data.input_checks]
 }

@@ -117,6 +117,10 @@ pub(crate) enum MainError {
         source: gang_spi::PortError,
     },
 
+    /// The fixed scheduler adapter could not be constructed.
+    #[error("cannot build the scheduler")]
+    Scheduler(#[source] gang_spi::PortError),
+
     /// An identity provider's configuration section could not be serialized.
     #[error("cannot serialize the identity provider `{provider}`")]
     ProviderSection {
@@ -290,10 +294,6 @@ pub(crate) enum MainError {
     /// The gang server command failed.
     #[error(transparent)]
     Server(#[from] gang_server::ServerError),
-
-    /// The host could not be marked serving before its deadline.
-    #[error("cannot report the serving milestone")]
-    ServingMilestone(#[source] gang_spi::PortError),
 
     /// The controller exceeded its shutdown grace.
     #[error("controller shutdown exceeded its configured grace")]
@@ -704,6 +704,7 @@ mod tests {
                 domain: "signer",
                 source: gang_spi::PortError::config(SOURCE_TEXT),
             },
+            MainError::Scheduler(gang_spi::PortError::config(SOURCE_TEXT)),
             MainError::Bind {
                 role: ListenerRole::Worker,
                 address: address(),

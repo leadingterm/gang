@@ -3,9 +3,10 @@
 
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use gang_clock::Clock;
-use gang_config::{ExecutionConfig, Fleets, PluginSet, WorkerConfig};
+use gang_config::{ActionsConfig, ExecutionConfig, Fleets, PluginSet, WorkerConfig};
 use gang_spi::{
     ActionLimitsPort, CacheStorePort, NodeLifecyclePort, ProvisionerPort, SchedulerPort,
     ScratchVolumePort, WorkloadCredentialPort,
@@ -56,6 +57,8 @@ pub struct WorkerParts<D: WorkerDeployment> {
 pub struct WorkerSettings<P: PluginSet> {
     /// The worker fleets in preference order; the worker runs the fleet its identity names.
     pub fleets: Fleets<P>,
+    /// The shared action resource and scheduling configuration.
+    pub actions: Arc<ActionsConfig>,
     /// The `[worker]` section.
     pub worker: WorkerConfig,
     /// The sandbox plugin sections that the sandbox file of the worker's fleet carries.

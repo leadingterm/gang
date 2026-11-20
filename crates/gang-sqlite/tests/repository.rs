@@ -7,9 +7,9 @@ use std::path::PathBuf;
 
 use gang_clock::Timestamp;
 use gang_spi::{
-    CertStatus, IssuedCertRecord, Plugin, PluginContext, PortError, PrincipalRecord,
-    RecordedScalingEvent, ScalingAuditEvent, ScalingEventKind, ScalingEventSeq,
-    StateRepositoryPort, Subject,
+    CertStatus, ExpiringRecordPort, Insert, IssuedCertRecord, Plugin, PluginContext, PortError,
+    PrincipalRecord, RecordId, RecordKey, RecordKind, RecordVersion, RecordedScalingEvent,
+    ScalingAuditEvent, ScalingEventKind, ScalingEventSeq, StateRepositoryPort, Subject,
 };
 use gang_sqlite::{JournalMode, Sqlite, SqliteConfig, SqliteError};
 use gang_types::{
@@ -103,6 +103,98 @@ mod fixtures {
 
 use fixtures::*;
 use support::{issued, open};
+
+#[tokio::test]
+async fn expiring_records_pages_live_records_by_kind_and_id() -> gang_testkit::TestResult {
+    let dir = TempDir::new()?;
+    let db = store(&dir);
+    let now = ts(1_000);
+    let key = |kind, byte| RecordKey {
+        kind,
+        id: RecordId::new([byte; 32]),
+    };
+    let first = key(RecordKind::InfrastructureEvent, 1);
+    let expired = key(RecordKind::InfrastructureEvent, 2);
+    let second = key(RecordKind::InfrastructureEvent, 3);
+    let foreign = key(RecordKind::LoginAttempt, 4);
+    assert_eq!(
+        db.insert(
+            &[
+                (first, b"first"),
+                (second, b"second"),
+                (foreign, b"foreign")
+            ],
+            RecordVersion::new(7),
+            now,
+            ts(3_000)
+        )
+        .await?,
+        Insert::Inserted
+    );
+    assert_eq!(
+        db.insert(
+            &[(expired, b"expired")],
+            RecordVersion::new(8),
+            now,
+            ts(2_000)
+        )
+        .await?,
+        Insert::Inserted
+    );
+    let mut records = Vec::new();
+    let limit = NonZeroUsize::new(1).ok_or("nonzero limit")?;
+    assert!(
+        db.records(
+            RecordKind::InfrastructureEvent,
+            None,
+            limit,
+            ts(2_000),
+            &mut records
+        )
+        .await?
+    );
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].0, first.id);
+    assert_eq!(records[0].1.body, b"first");
+    assert_eq!(records[0].1.version, RecordVersion::new(7));
+    assert_eq!(records[0].1.expires_at, ts(3_000));
+    assert!(
+        !db.records(
+            RecordKind::InfrastructureEvent,
+            Some(first.id),
+            limit,
+            ts(2_000),
+            &mut records
+        )
+        .await?
+    );
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].0, second.id);
+    assert_eq!(records[0].1.body, b"second");
+    assert!(
+        !db.records(
+            RecordKind::InfrastructureEvent,
+            Some(second.id),
+            limit,
+            ts(2_000),
+            &mut records
+        )
+        .await?
+    );
+    assert!(records.is_empty());
+    assert!(
+        !db.records(
+            RecordKind::InfrastructureEvent,
+            None,
+            limit,
+            ts(3_000),
+            &mut records
+        )
+        .await?
+    );
+    assert!(records.is_empty());
+    Ok(())
+}
 
 #[test]
 fn database_lock_is_exclusive_until_drop() -> gang_testkit::TestResult {

@@ -1,22 +1,29 @@
-//! A database outage while held actions leave queued demand on the leader.
+//! Held actions and retried demand during a shared database outage.
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gang_clock::{Clock, SystemClock};
+use gang_tls::{HttpProtocol, HttpTransport, ServerTrust};
 use gang_wire::EventChange;
 use gang_wire::routes::{CREATE_CERTIFICATE, CREATE_DEVICE_AUTHORIZATION};
 use http::Method;
+use nativelink_proto::build::bazel::remote::execution::v2::{
+    Digest, GetActionResultRequest, RequestMetadata, digest_function,
+};
 
 use crate::check::{Check, awaited};
 use crate::cluster::Cluster;
 use crate::errors::{E2eError, Result};
 use crate::execution::{JOURNAL_END, Run};
+use crate::h2_frames::H2Channel;
 use crate::held_build::{Hold, joined};
+use crate::identity::Admission;
 use crate::journal::Journal;
 use crate::names::database_outage::{
-    BUILD, DEMAND_QUEUED, ENROLLMENT_REFUSED, HELD, LEADER, LOGIN, NO_EVENTS, ONE_SCALE_OUT,
+    BUILD, DEMAND_PENDING, ENROLLMENT_REFUSED, HELD, LEADER, LOGIN, NO_EVENTS, ONE_SCALE_OUT,
     PARTITION_BUILD, PARTITION_EXIT, PARTITION_FENCED, PARTITION_HELD, PARTITION_SINGLE,
     PARTITION_TAKEOVER, PAUSED, REFUSED, RESUMED, REVOCATION_REFUSED,
 };
@@ -169,31 +176,73 @@ fn variant_error(count: usize, variant: &str, error: &E2eError) -> E2eError {
     ))
 }
 
-fn observe_unavailable(
+fn absent_action_result_request() -> GetActionResultRequest {
+    GetActionResultRequest {
+        action_digest: Some(Digest {
+            hash: "0000000000000000000000000000000000000000000000000000000000000000".into(),
+            size_bytes: 0,
+        }),
+        digest_function: digest_function::Value::Sha256.into(),
+        ..Default::default()
+    }
+}
+
+fn frontends_unready(serving: &[usize], workers: &[usize]) -> bool {
+    serving.is_empty() && workers.is_empty()
+}
+
+fn observe_readiness_loss(
     cluster: &Cluster<'_>,
     leader: usize,
     clock: &SystemClock,
-    start_demand: impl FnOnce(),
-) -> Result<(u16, bool, bool, bool)> {
+    mut demand_pending: impl FnMut() -> bool,
+    client: &crate::http::Http,
+    channel: &mut H2Channel,
+) -> Result<(u16, Option<u32>, bool, bool, bool)> {
     let started = clock.monotonic();
-    let status = device_login(cluster)?;
-    let mut no_other_leader = cluster.leaders().iter().all(|&index| index == leader);
+    let endpoint = cluster.direct_endpoint(leader);
+    let mut status = None;
+    let mut grpc = None;
+    let mut no_other_ready = true;
     let mut workers_at_lapse = None;
     let mut no_new_workers = true;
     let mut worker_error = None;
-    let mut demand = Some(start_demand);
-    let mut queued = false;
-    wait_state(cluster, |state| {
-        no_other_leader &= cluster.leaders().iter().all(|&index| index == leader);
+    let mut pending = true;
+    wait_state(cluster, |_| {
         if clock.monotonic().saturating_duration_since(started) >= VALIDITY {
-            if let Some(start) = demand.take() {
-                start();
+            let serving = cluster.serving();
+            let workers = cluster.leaders();
+            no_other_ready &= serving
+                .iter()
+                .chain(workers.iter())
+                .all(|&index| index == leader);
+            if status.is_some() {
+                no_other_ready &= workers.is_empty();
+                pending &= demand_pending();
             }
-            // Queue totals come from completed control passes, which stop after lease lapse.
-            queued |= state
-                .actions
-                .as_ref()
-                .is_some_and(|actions| !actions.queued.is_empty());
+            if status.is_none() && frontends_unready(&serving, &workers) {
+                pending &= demand_pending();
+                let response = crate::login_across::exchange(
+                    client,
+                    &endpoint,
+                    &Request::new(Method::POST, CREATE_DEVICE_AUTHORIZATION.template),
+                );
+                let rpc = channel.get_action_result(
+                    &absent_action_result_request(),
+                    &RequestMetadata::default(),
+                    cluster.stack().settings().command_timeout,
+                );
+                match (response, rpc) {
+                    (Ok(response), Ok(code)) => {
+                        status = Some(response.status);
+                        grpc = Some(code);
+                    }
+                    (Err(error), _) | (_, Err(error)) => {
+                        worker_error = Some(error);
+                        return true;
+                    }
+                }
+            }
             match cluster.worker_count() {
                 Ok(count) => {
                     let initial = *workers_at_lapse.get_or_insert(count);
@@ -205,16 +254,17 @@ fn observe_unavailable(
                 }
             }
         }
-        queued && clock.monotonic().saturating_duration_since(started) >= OUTAGE
+        status.is_some() && clock.monotonic().saturating_duration_since(started) >= OUTAGE
     })?;
     if let Some(error) = worker_error {
         return Err(error);
     }
     Ok((
-        status,
-        no_other_leader,
+        status.ok_or_else(|| E2eError::system("outage client request was not sent"))?,
+        grpc.flatten(),
+        no_other_ready,
         no_new_workers && workers_at_lapse == Some(1),
-        queued,
+        pending,
     ))
 }
 
@@ -242,12 +292,53 @@ fn scaling_during_outage(
         .count()
 }
 
+fn outage_clients(cluster: &Cluster<'_>, leader: usize) -> Result<(crate::http::Http, H2Channel)> {
+    let pin = cluster.stack().ca_pin()?;
+    let credentials = cluster.stack().administrator()?.credentials(&pin)?;
+    let client = crate::http::Http::try_new(
+        HttpTransport::Tls {
+            trust: ServerTrust::Pin(&pin),
+        },
+        HttpProtocol::Http2,
+        cluster.stack().settings().command_timeout,
+    )?;
+    let config = gang_tls::client_config(
+        ServerTrust::Pin(&pin),
+        None,
+        &[b"h2"],
+        Arc::new(SystemClock::new()),
+    )
+    .map_err(E2eError::system_from("configuring outage request TLS"))?;
+    let mut channel = match H2Channel::connect(
+        Arc::new(config),
+        &cluster.direct_endpoint(leader),
+        Some(&credentials.token),
+        cluster.stack().settings().handshake_timeout,
+    )? {
+        Admission::Accepted(channel) => channel,
+        Admission::Refused => {
+            return Err(E2eError::system("leader refused outage test connection"));
+        }
+    };
+    let baseline = channel.get_action_result(
+        &absent_action_result_request(),
+        &RequestMetadata::default(),
+        cluster.stack().settings().command_timeout,
+    )?;
+    if baseline != Some(5) {
+        return Err(E2eError::system(format!(
+            "database outage baseline grpc-status {baseline:?}, expected 5"
+        )));
+    }
+    Ok((client, channel))
+}
+
 fn observe_outage(
     cluster: &Cluster<'_>,
     build: &std::thread::ScopedJoinHandle<'_, Result<crate::build_output::BuildOutcome>>,
     journal: &Journal,
     run: &Run,
-    start_demand: impl FnOnce(),
+    demand_pending: impl FnMut() -> bool,
 ) -> Result<Vec<Check>> {
     let line = journal.read_line()?;
     if line == JOURNAL_END || !line.starts_with(&format!("{} loss start ", run.as_ref())) {
@@ -261,16 +352,28 @@ fn observe_outage(
     let before = cluster.scaling_events()?;
     let last_event = before.last().map(|event| event.name.clone());
     let (enroll, revoke) = outage_requests(cluster)?;
+    let (client, mut channel) = outage_clients(cluster, leader)?;
     let clock = SystemClock::new();
     let outage_wall = clock.wall();
     cluster.database().set_unavailable(true)?;
-    let enroll_status = cluster.stack().send(&enroll)?.status;
-    let revoke_status = cluster.stack().send(&revoke)?.status;
-    let during = observe_unavailable(cluster, leader, &clock, start_demand);
+    let during = observe_readiness_loss(
+        cluster,
+        leader,
+        &clock,
+        demand_pending,
+        &client,
+        &mut channel,
+    );
+    let endpoint = cluster.direct_endpoint(leader);
+    let enroll_status = crate::login_across::exchange(&client, &endpoint, &enroll);
+    let revoke_status = crate::login_across::exchange(&client, &endpoint, &revoke);
     cluster.database().set_unavailable(false)?;
     let restored_wall = clock.wall();
-    let (status, no_other_leader, no_new_workers, queued) = during?;
+    let (status, grpc, no_other_ready, no_new_workers, pending) = during?;
+    let enroll_status = enroll_status?.status;
+    let revoke_status = revoke_status?.status;
     cluster.wait_for_single_leader(leader)?;
+    cluster.wait_for_serving(&[leader])?;
     let login = device_login(cluster)?;
     let after = cluster.scaling_events()?;
     let outage_events =
@@ -303,9 +406,14 @@ fn observe_outage(
         Check::expect(PAUSED, no_new_workers, || {
             "worker count increased after lease validity lapsed".to_owned()
         }),
-        Check::expect(DEMAND_QUEUED, queued, || {
-            "new demand was not queued after the lease lapsed".to_owned()
+        Check::expect(DEMAND_PENDING, pending, || {
+            "new demand did not remain pending while the lease was invalid".to_owned()
         }),
+        Check::expect(
+            "database outage: promoted cache requests remain admitted",
+            grpc == Some(5),
+            || format!("grpc-status {grpc:?}, expected 5"),
+        ),
         resumed,
         Check::expect(ONE_SCALE_OUT, recoveries == 1, || {
             format!("recovery recorded {recoveries} scale-outs from one to two")
@@ -315,11 +423,11 @@ fn observe_outage(
         }),
         Check::expect(
             LEADER,
-            no_other_leader && cluster.leader() == Some(leader),
+            no_other_ready && cluster.leader() == Some(leader),
             || {
                 format!(
-                    "original leader {leader}, no_other_leader {no_other_leader}, final healthy leaders {:?}",
-                    cluster.leaders()
+                    "no controller ready after lapse: {no_other_ready}; original leader {leader}, current leader {:?}",
+                    cluster.leader()
                 )
             },
         ),
@@ -356,13 +464,27 @@ pub fn database_outage(cluster: &Cluster<'_>, controller_count: usize) -> Result
             journal.write_line(JOURNAL_END)?;
             outcome
         });
+        // Only server startup overlaps the held build; demand still starts after lease lapse.
+        let mut preparation = Some(scope.spawn(|| stack.prepare_additional_in(DEMAND_ROOT)));
         let mut demand = None;
         let observation = observe_outage(cluster, &build, &journal, &run, || {
-            demand = Some(hold.build(scope, Some(DEMAND_ROOT), |_, stop| {
-                let outcome = stack.build_additional(&PROBES[2..4], &demand_run, stop);
-                journal.write_line(JOURNAL_END)?;
-                outcome
-            }));
+            let handle = demand.get_or_insert_with(|| {
+                let preparation = preparation.take();
+                let demand_run = &demand_run;
+                let journal = &journal;
+                hold.build(scope, Some(DEMAND_ROOT), move |_, stop| {
+                    let preparation = preparation.ok_or_else(|| {
+                        E2eError::system("demand Bazel preparation was already consumed")
+                    })?;
+                    let prepared = preparation.join().map_err(|_| {
+                        E2eError::system("demand Bazel preparation thread panicked")
+                    })??;
+                    let outcome = prepared.build_until(&PROBES[2..4], demand_run, stop);
+                    journal.write_line(JOURNAL_END)?;
+                    outcome
+                })
+            });
+            !handle.is_finished()
         });
         // Always restore the database before settling, including on an observation error.
         let restore = cluster.database().set_unavailable(false);
@@ -424,14 +546,13 @@ fn check_exit_deadline(cluster: &Cluster<'_>) -> Result<()> {
     ))?;
     let config: toml::Value = toml::from_str(&text).map_err(crate::template::template_error)?;
     let grace = config
-        .get("scheduler")
-        .and_then(|value| value.get("nativelink"))
+        .get("server")
         .and_then(|value| value.get("http2"))
         .and_then(|value| value.get("shutdown_grace"))
         .and_then(toml::Value::as_str)
-        .ok_or_else(|| E2eError::system("missing configured scheduler shutdown grace"))?;
+        .ok_or_else(|| E2eError::system("missing configured server.http2.shutdown_grace"))?;
     let shutdown_grace = gang_types::duration::parse(grace)
-        .map_err(E2eError::system_from("parsing scheduler shutdown grace"))?;
+        .map_err(E2eError::system_from("parsing server.http2.shutdown_grace"))?;
     let required = TTL
         .saturating_add(RENEW_INTERVAL)
         .saturating_add(shutdown_grace);
@@ -448,7 +569,7 @@ fn single_leader_check(cluster: &Cluster<'_>, follower: usize) -> Check {
     let single = cluster.wait_for_single_leader(follower).is_ok();
     let leaders = cluster.leaders();
     Check::expect(PARTITION_SINGLE, single && leaders == [follower], || {
-        format!("healthy execution listeners: {leaders:?}")
+        format!("healthy leader checks: {leaders:?}")
     })
 }
 
@@ -473,6 +594,9 @@ fn partition(cluster: &Cluster<'_>, journal: &Journal, go: &std::path::Path) -> 
             journal.write_line(JOURNAL_END)?;
             outcome
         });
+        let mut demand_preparation = Some(scope.spawn(|| stack.prepare_additional_in(DEMAND_ROOT)));
+        let mut follower_preparation =
+            Some(scope.spawn(|| stack.prepare_additional_in(FOLLOWER_ROOT)));
         let mut demand = None;
         let mut follower = None;
         let mut cut_leader = None;
@@ -484,13 +608,27 @@ fn partition(cluster: &Cluster<'_>, journal: &Journal, go: &std::path::Path) -> 
             &build,
             |kind| match kind {
                 Demand::Fenced => {
+                    let preparation = demand_preparation.take();
                     demand = Some(hold.build(scope, Some(DEMAND_ROOT), |_, stop| {
-                        stack.build_additional(&PROBES[4..], &demand_run, stop)
+                        let preparation = preparation.ok_or_else(|| {
+                            E2eError::system("fenced demand preparation already consumed")
+                        })?;
+                        let prepared = preparation.join().map_err(|_| {
+                            E2eError::system("demand Bazel preparation thread panicked")
+                        })??;
+                        prepared.build_until(&PROBES[4..], &demand_run, stop)
                     }));
                 }
                 Demand::Follower => {
+                    let preparation = follower_preparation.take();
                     follower = Some(hold.build(scope, Some(FOLLOWER_ROOT), |_, stop| {
-                        stack.build_additional_in(&PROBES, &follower_run, FOLLOWER_ROOT, stop)
+                        let preparation = preparation.ok_or_else(|| {
+                            E2eError::system("follower demand preparation already consumed")
+                        })?;
+                        let prepared = preparation.join().map_err(|_| {
+                            E2eError::system("follower Bazel preparation thread panicked")
+                        })??;
+                        prepared.build_until(&PROBES, &follower_run, stop)
                     }));
                 }
             },
@@ -531,15 +669,7 @@ enum Demand {
     Follower,
 }
 
-fn observe_partition(
-    cluster: &Cluster<'_>,
-    journal: &Journal,
-    release: impl FnOnce() -> Result<()>,
-    run: &Run,
-    build: &std::thread::ScopedJoinHandle<'_, Result<crate::build_output::BuildOutcome>>,
-    mut start_demand: impl FnMut(Demand),
-    cut_leader: &mut Option<usize>,
-) -> Result<Vec<Check>> {
+fn partition_leader(cluster: &Cluster<'_>, journal: &Journal, run: &Run) -> Result<usize> {
     let line = journal.read_line()?;
     if line == JOURNAL_END || !line.starts_with(&format!("{} loss start ", run.as_ref())) {
         return Err(E2eError::system(format!(
@@ -553,7 +683,19 @@ fn observe_partition(
             "expected one leader before partition, found {leaders:?}"
         )));
     };
-    let old = *old;
+    Ok(*old)
+}
+
+fn observe_partition(
+    cluster: &Cluster<'_>,
+    journal: &Journal,
+    release: impl FnOnce() -> Result<()>,
+    run: &Run,
+    build: &std::thread::ScopedJoinHandle<'_, Result<crate::build_output::BuildOutcome>>,
+    mut start_demand: impl FnMut(Demand),
+    cut_leader: &mut Option<usize>,
+) -> Result<Vec<Check>> {
+    let old = partition_leader(cluster, journal, run)?;
     check_exit_deadline(cluster)?;
     let follower = usize::from(old == 0);
     let clock = SystemClock::new();
@@ -567,10 +709,12 @@ fn observe_partition(
     let mut follower_acted = false;
     let mut fenced_started = false;
     let mut follower_started = false;
-    wait_state(cluster, |_| {
+    let timeout = cluster.stack().settings().history_timeout;
+    let wait_started = Instant::now();
+    let mut observe = |_: &gang_wire::State| {
         takeover |= cluster.leaders().contains(&follower);
         if takeover && !follower_started {
-            cluster.unroute_execution(old);
+            cluster.unroute_public(old);
             start_demand(Demand::Follower);
             follower_started = true;
         }
@@ -586,7 +730,17 @@ fn observe_partition(
         }
         let elapsed = clock.monotonic().saturating_duration_since(started);
         elapsed >= OUTAGE && (follower_acted || elapsed >= OUTAGE.saturating_mul(2))
-    })?;
+    };
+    if let Err(error) = cluster.stack().wait_live_state(timeout, &mut observe) {
+        cluster.wait_for_leader_except(Some(old))?;
+        cluster.unroute_public(old);
+        cluster.wait_for_serving(&[follower])?;
+        let remaining = timeout.saturating_sub(wait_started.elapsed());
+        if remaining.is_zero() {
+            return Err(error);
+        }
+        cluster.stack().wait_live_state(remaining, &mut observe)?;
+    }
     cluster.cut_database(old, false);
     let healed_at = clock.wall();
     let healed_after = clock.monotonic().saturating_duration_since(started);
@@ -633,4 +787,17 @@ fn observe_partition(
         ),
         single_leader_check(cluster, follower),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::frontends_unready;
+
+    #[test]
+    fn readiness_loss_waits_for_both_frontends() {
+        assert!(frontends_unready(&[], &[]));
+        assert!(!frontends_unready(&[], &[0]));
+        assert!(!frontends_unready(&[0], &[]));
+        assert!(!frontends_unready(&[0], &[0]));
+    }
 }

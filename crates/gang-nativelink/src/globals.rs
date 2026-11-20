@@ -7,14 +7,13 @@
 use std::collections::BTreeSet;
 use std::sync::Once;
 
+use gang_config::OpenFileLimit;
 use nativelink_config::stores::ConfigDigestHashFunction;
 use nativelink_util::digest_hasher::{DigestHasherFunc, set_default_digest_hasher_func};
 use nativelink_util::fs::set_open_file_limit;
 use nativelink_util::store_trait::{
     DEFAULT_DIGEST_SIZE_HEALTH_CHECK_CFG, set_default_digest_size_health_check,
 };
-
-use crate::open_file_limit::OpenFileLimit;
 
 /// Guards the process-wide setup so that a second embedding reuses the first one's settings.
 static INIT: Once = Once::new();

@@ -22,6 +22,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, ExitStatus, Stdio};
 
@@ -72,10 +73,84 @@ fn write_line(record: &mut File, line: &str) {
 
 /// Splits bubblewrap's argv at `--`, returning the `--info-fd` descriptor and the action argv.
 fn split_arguments(argv: &[OsString]) -> (i32, &[OsString]) {
+    let status = std::fs::read_to_string("/proc/self/status")
+        .unwrap_or_else(|error| fail(format!("reading process identity: {error}")));
+    let id = |name: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .and_then(|line| line.split_whitespace().next())
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or_else(|| fail(format!("missing {name} in process status")))
+    };
+    let uid = id("Uid:");
+    let gid = id("Gid:");
+    let mut seen = [false; 3];
+    let mut descriptors = Vec::new();
+    let mut overridden = [false; 3];
+    let paths = ["/etc/passwd", "/etc/group", "/etc/nsswitch.conf"];
     let mut info_fd = None;
     let mut arguments = argv.iter();
     while let Some(argument) = arguments.next() {
         match argument.to_str() {
+            Some("--ro-bind") => {
+                arguments
+                    .next()
+                    .unwrap_or_else(|| fail("--ro-bind needs a source"));
+                let destination = arguments
+                    .next()
+                    .unwrap_or_else(|| fail("--ro-bind needs a destination"));
+                for (index, path) in paths.iter().enumerate() {
+                    if destination.as_os_str() == OsStr::new(path) {
+                        overridden[index] = true;
+                    }
+                }
+            }
+            Some("--ro-bind-data") => {
+                let fd = arguments
+                    .next()
+                    .and_then(|value| value.to_str())
+                    .and_then(|value| value.parse::<i32>().ok())
+                    .filter(|fd| *fd >= 3)
+                    .unwrap_or_else(|| fail("--ro-bind-data needs a descriptor"));
+                if descriptors.contains(&fd) {
+                    fail("reused identity descriptor");
+                }
+                descriptors.push(fd);
+                let probe = File::open(format!("/proc/self/fd/{fd}"))
+                    .unwrap_or_else(|error| fail(format!("opening identity descriptor: {error}")));
+                drop(probe);
+                let destination = arguments
+                    .next()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_else(|| fail("--ro-bind-data needs a destination"));
+                let index = paths
+                    .iter()
+                    .position(|path| *path == destination)
+                    .unwrap_or_else(|| fail("unexpected data mount"));
+                if seen[index] || overridden[index] {
+                    fail("duplicate or overridden identity mount");
+                }
+                seen[index] = true;
+                let expected = match index {
+                    0 => format!("builder:x:{uid}:{gid}:Sandbox user:/:/bin/sh\n"),
+                    1 => format!("builder:x:{gid}:\n"),
+                    _ => "passwd: files\ngroup: files\n".to_owned(),
+                };
+                // SAFETY: bwrap owns each distinct inherited data descriptor and closes it after reading.
+                #[expect(
+                    unsafe_code,
+                    reason = "taking ownership of an inherited descriptor requires from_raw_fd"
+                )]
+                let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+                let mut file = File::from(owned);
+                let mut data = String::new();
+                file.read_to_string(&mut data)
+                    .unwrap_or_else(|error| fail(format!("reading identity: {error}")));
+                if data != expected {
+                    fail(format!("invalid identity data for {destination}"));
+                }
+            }
             Some("--info-fd") => {
                 let value = arguments
                     .next()
@@ -85,6 +160,13 @@ fn split_arguments(argv: &[OsString]) -> (i32, &[OsString]) {
                 info_fd = Some(value);
             }
             Some("--") => {
+                if seen
+                    .iter()
+                    .zip(overridden)
+                    .any(|(seen, overridden)| *seen == overridden)
+                {
+                    fail("missing or overridden identity data");
+                }
                 let info_fd = info_fd.unwrap_or_else(|| fail("--info-fd is missing before --"));
                 return (info_fd, arguments.as_slice());
             }

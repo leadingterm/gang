@@ -80,6 +80,69 @@ impl ProvisionerPort for LapsingProvisioner {
     }
 }
 
+struct CommittedTerminationProvisioner {
+    inner: FakeProvisioner,
+    fail_after_commit: AtomicBool,
+    block_converge: AtomicBool,
+}
+
+impl ProvisionerPort for CommittedTerminationProvisioner {
+    type FleetOptions = Opaque;
+
+    async fn supply(
+        &self,
+        fleet: Fleet<'_, Opaque>,
+        into: &mut FleetSupply,
+    ) -> Result<(), PortError> {
+        self.inner.supply(fleet, into).await
+    }
+
+    async fn converge(&self, held: &Held, fleet: Fleet<'_, Opaque>) -> Result<(), PortError> {
+        if self.block_converge.swap(false, Ordering::SeqCst) {
+            return Err(PortError::unavailable(std::io::Error::from(
+                std::io::ErrorKind::WouldBlock,
+            )));
+        }
+        self.inner.converge(held, fleet).await
+    }
+
+    async fn acknowledge_exit(
+        &self,
+        held: &Held,
+        fleet: Fleet<'_, Opaque>,
+        instance: &InstanceId,
+    ) -> Result<(), PortError> {
+        self.inner.acknowledge_exit(held, fleet, instance).await
+    }
+
+    async fn set_desired_capacity(
+        &self,
+        held: &Held,
+        fleet: Fleet<'_, Opaque>,
+        desired: u32,
+    ) -> Result<(), PortError> {
+        self.inner.set_desired_capacity(held, fleet, desired).await
+    }
+
+    async fn terminate(
+        &self,
+        held: &Held,
+        fleet: Fleet<'_, Opaque>,
+        instance: &InstanceId,
+    ) -> Result<(), PortError> {
+        self.inner.terminate(held, fleet, instance).await?;
+        if self.fail_after_commit.swap(false, Ordering::SeqCst) {
+            self.block_converge.store(true, Ordering::SeqCst);
+            return Err(PortError::unavailable("termination deadline elapsed"));
+        }
+        Ok(())
+    }
+
+    fn worker_lifetime(&self) -> gang_types::WorkerLifetime {
+        self.inner.worker_lifetime()
+    }
+}
+
 #[tokio::test]
 async fn mid_pass_lapse_forgets_unapplied_termination() -> TestResult {
     let clock = clock_at(1_000_000);
@@ -118,13 +181,27 @@ async fn mid_pass_lapse_forgets_unapplied_termination() -> TestResult {
         &id,
         gang_config::LeadershipConfig::default(),
     );
-    let mut lease = leader.acquire().await;
+    let mut lease = leader
+        .acquire(
+            &gang_spi::LeaseCandidate {
+                holder: id.clone(),
+                priority: gang_spi::CandidatePriority::registered(
+                    gang_spi::CandidateGeneration::default(),
+                ),
+            },
+            &crate::health::Readiness::default(),
+            Duration::ZERO,
+        )
+        .await;
     let hold = leader.hold(&mut lease);
     futures::pin_mut!(hold);
     assert!(poll!(hold.as_mut()).is_pending());
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -176,6 +253,8 @@ fn queued_snapshot() -> Result<SchedulerSnapshot, PortError> {
 /// `desired`.
 fn supply_with(name: &str, launched_at: Timestamp, desired: u32) -> FleetSupply {
     FleetSupply {
+        requested: None,
+        events: Vec::new(),
         abandoned: 0,
         desired,
         instances: vec![FleetInstance {
@@ -221,7 +300,10 @@ async fn lapsed_leader_does_not_record_worker_registration() -> TestResult {
     scheduler.set_snapshot(snapshot_with(vec![worker]));
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -230,7 +312,18 @@ async fn lapsed_leader_does_not_record_worker_registration() -> TestResult {
     );
     control.pass().await;
     assert!(repository.scaling_events().is_empty());
-    let _lease = leader.acquire().await;
+    let _lease = leader
+        .acquire(
+            &gang_spi::LeaseCandidate {
+                holder: id.clone(),
+                priority: gang_spi::CandidatePriority::registered(
+                    gang_spi::CandidateGeneration::default(),
+                ),
+            },
+            &crate::health::Readiness::default(),
+            Duration::ZERO,
+        )
+        .await;
     control.pass().await;
     assert_eq!(repository.scaling_events().len(), 1);
     Ok(())
@@ -249,7 +342,10 @@ async fn lapsed_leader_converges_no_fleet() -> TestResult {
     );
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -286,7 +382,10 @@ async fn a_lease_lapsing_during_converge_skips_the_pass_as_lapsed() -> TestResul
     keeper.extend_to(clock.monotonic() + Duration::from_secs(10));
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -320,7 +419,10 @@ async fn a_converge_failure_while_the_lease_holds_skips_as_provisioner_unavailab
     keeper.extend_to(clock.monotonic() + Duration::from_secs(10));
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -344,7 +446,10 @@ async fn leader_converges_every_fleet_before_reading_it() -> TestResult {
     let repository = FakeRepository::default();
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -375,6 +480,8 @@ async fn a_supplied_exit_is_recorded_as_an_exited_early_event() -> TestResult {
     fleet.set_supply(
         &fleet_name(),
         FleetSupply {
+            requested: None,
+            events: Vec::new(),
             abandoned: 0,
             exits: vec![InstanceExit {
                 instance: instance.clone(),
@@ -385,7 +492,10 @@ async fn a_supplied_exit_is_recorded_as_an_exited_early_event() -> TestResult {
     );
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -421,6 +531,8 @@ async fn exit_survives_failed_audit() -> TestResult {
     fleet.set_supply(
         &fleet_name(),
         FleetSupply {
+            requested: None,
+            events: Vec::new(),
             exits: vec![InstanceExit {
                 instance: instance.clone(),
                 failure: "fail  worker failed".to_owned(),
@@ -430,7 +542,10 @@ async fn exit_survives_failed_audit() -> TestResult {
     );
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -446,7 +561,10 @@ async fn exit_survives_failed_audit() -> TestResult {
     repository.fail_scaling_events(false);
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -480,6 +598,8 @@ async fn exit_survives_leadership_lapse() -> TestResult {
     fleet.set_supply(
         &fleet_name(),
         FleetSupply {
+            requested: None,
+            events: Vec::new(),
             exits: vec![InstanceExit {
                 instance: instance.clone(),
                 failure: "fail  worker failed".to_owned(),
@@ -494,13 +614,27 @@ async fn exit_survives_leadership_lapse() -> TestResult {
         &id,
         gang_config::LeadershipConfig::default(),
     );
-    let mut lease = leader.acquire().await;
+    let mut lease = leader
+        .acquire(
+            &gang_spi::LeaseCandidate {
+                holder: id.clone(),
+                priority: gang_spi::CandidatePriority::registered(
+                    gang_spi::CandidateGeneration::default(),
+                ),
+            },
+            &crate::health::Readiness::default(),
+            Duration::ZERO,
+        )
+        .await;
     let hold = leader.hold(&mut lease);
     futures::pin_mut!(hold);
     assert!(poll!(hold.as_mut()).is_pending());
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -520,7 +654,10 @@ async fn exit_survives_leadership_lapse() -> TestResult {
     assert!(poll!(hold.as_mut()).is_pending());
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -558,6 +695,8 @@ async fn exit_survives_failed_acknowledgement() -> TestResult {
     fleet.set_supply(
         &fleet_name(),
         FleetSupply {
+            requested: None,
+            events: Vec::new(),
             exits: vec![exit.clone()],
             ..FleetSupply::default()
         },
@@ -565,7 +704,10 @@ async fn exit_survives_failed_acknowledgement() -> TestResult {
     fleet.fail_acknowledge_exit(true);
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -592,7 +734,10 @@ async fn exit_survives_failed_acknowledgement() -> TestResult {
     fleet.fail_acknowledge_exit(false);
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -618,7 +763,10 @@ async fn launch_failures_are_recorded_once_per_reason_until_request_is_met() -> 
     let repository = FakeRepository::default();
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -706,7 +854,10 @@ async fn failed_unneeded_request_is_withdrawn_and_audited() -> TestResult {
     fleet.set_supply(&fleet_name(), supply);
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -739,7 +890,10 @@ async fn an_abandoned_request_is_withdrawn_and_audited_once() -> TestResult {
     });
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -799,7 +953,10 @@ async fn terminations_and_withdrawal_in_one_pass_never_raise_desired() -> TestRe
     });
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -836,7 +993,10 @@ async fn queued_action_scales_out_from_an_empty_fleet() -> Result<(), PortError>
     scheduler.set_snapshot(queued_snapshot()?);
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -873,7 +1033,10 @@ async fn failed_capacity_request_records_no_audit_event() -> Result<(), PortErro
     fleet.fail_set_desired_capacity(true);
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -903,7 +1066,10 @@ async fn failed_snapshot_skips_the_pass_without_touching_the_fleet() -> Result<(
     scheduler.fail_snapshot(true);
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -931,7 +1097,10 @@ async fn failed_supply_skips_the_pass_without_applying_steps() -> Result<(), Por
     fleet.fail_supply(true);
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -961,7 +1130,10 @@ async fn failed_supply_defers_worker_registration_until_a_completed_pass() -> Te
     fleet.fail_supply(true);
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -1014,7 +1186,10 @@ async fn unconfigured_fleet_worker_joins_and_leaves_without_audit_events() -> Te
     scheduler.set_snapshot(snapshot_with(vec![worker]));
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -1057,7 +1232,10 @@ async fn drain_of_a_worker_that_left_is_neither_applied_nor_audited() -> TestRes
     });
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -1116,7 +1294,10 @@ async fn idle_worker_is_drained_then_terminated_once_empty() -> TestResult {
     });
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -1206,7 +1387,10 @@ async fn a_draining_worker_with_new_demand_is_resumed() -> TestResult {
     });
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -1260,7 +1444,10 @@ async fn an_idle_worker_is_drained() -> TestResult {
     });
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -1302,6 +1489,371 @@ async fn an_idle_worker_is_drained() -> TestResult {
 }
 
 #[tokio::test]
+async fn early_exit_clears_only_the_matching_fleet_termination() -> TestResult {
+    let clock = clock_at(1_000_000);
+    let fleets = fleets_of(vec![("first", 4), ("second", 4)]);
+    let fleet = FakeProvisioner::default();
+    let scheduler = FakeScheduler::new()?;
+    let repository = FakeRepository::default();
+    let first = FleetName::try_new("first")?;
+    let second = FleetName::try_new("second")?;
+    let name = instance_id("shared-1");
+    for fleet_name in [&first, &second] {
+        fleet.set_supply(
+            fleet_name,
+            supply_with("shared-1", Timestamp::from_unix_millis(0), 1),
+        );
+    }
+    let boot_grace = fleets
+        .policies()
+        .iter()
+        .map(|policy| policy.boot_grace)
+        .max()
+        .expect("two fleets");
+    let mut control = ControlLoop::new(
+        &fleets,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
+        &fleet,
+        &scheduler,
+        &repository,
+        &clock,
+        gang_testkit::fence::valid_fence(),
+    );
+    assert_eq!(
+        control.pass().await,
+        PassOutcome::Completed {
+            applied: 0,
+            failed: 0
+        }
+    );
+    clock.advance(boot_grace);
+    fleet.fail_terminate(true);
+    assert_eq!(
+        control.pass().await,
+        PassOutcome::Completed {
+            applied: 0,
+            failed: 2
+        }
+    );
+    fleet.fail_terminate(false);
+    fleet.set_supply(
+        &first,
+        FleetSupply {
+            exits: vec![InstanceExit {
+                instance: name.clone(),
+                failure: "worker exited".to_owned(),
+            }],
+            ..FleetSupply::default()
+        },
+    );
+    fleet.set_supply(&second, FleetSupply::default());
+    assert_eq!(
+        control.pass().await,
+        PassOutcome::Completed {
+            applied: 1,
+            failed: 0
+        }
+    );
+    assert_eq!(fleet.terminations(), vec![name]);
+    let events = repository.scaling_events();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].fleet, first);
+    assert!(matches!(
+        events[0].kind,
+        ScalingEventKind::ExitedEarly { .. }
+    ));
+    assert_eq!(events[1].fleet, second);
+    assert!(matches!(
+        events[1].kind,
+        ScalingEventKind::Terminated { .. }
+    ));
+    assert_eq!(events[1].cause, Some(ScalingCause::Orphan));
+    Ok(())
+}
+
+#[tokio::test]
+async fn early_exit_clears_a_failed_termination_without_a_termination_audit() -> TestResult {
+    let clock = clock_at(1_000_000);
+    let fleets = fleets();
+    let fleet = FakeProvisioner::default();
+    let scheduler = FakeScheduler::new()?;
+    let repository = FakeRepository::default();
+    let name = instance_id("orphan-1");
+    fleet.set_supply(
+        &fleet_name(),
+        supply_with("orphan-1", Timestamp::from_unix_millis(0), 1),
+    );
+    let boot_grace = fleets.policies().first().expect("one fleet").boot_grace;
+    let mut control = ControlLoop::new(
+        &fleets,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
+        &fleet,
+        &scheduler,
+        &repository,
+        &clock,
+        gang_testkit::fence::valid_fence(),
+    );
+    assert_eq!(
+        control.pass().await,
+        PassOutcome::Completed {
+            applied: 0,
+            failed: 0
+        }
+    );
+    clock.advance(boot_grace);
+    fleet.fail_terminate(true);
+    assert_eq!(
+        control.pass().await,
+        PassOutcome::Completed {
+            applied: 0,
+            failed: 1
+        }
+    );
+    fleet.fail_terminate(false);
+    fleet.set_supply(
+        &fleet_name(),
+        FleetSupply {
+            exits: vec![InstanceExit {
+                instance: name,
+                failure: "worker exited".to_owned(),
+            }],
+            ..FleetSupply::default()
+        },
+    );
+    assert_eq!(
+        control.pass().await,
+        PassOutcome::Completed {
+            applied: 0,
+            failed: 0
+        }
+    );
+    assert!(fleet.terminations().is_empty());
+    let events = repository.scaling_events();
+    assert!(matches!(
+        events.as_slice(),
+        [ScalingAuditEvent {
+            kind: ScalingEventKind::ExitedEarly { .. },
+            ..
+        }]
+    ));
+    assert_eq!(
+        control.pass().await,
+        PassOutcome::Completed {
+            applied: 0,
+            failed: 0
+        }
+    );
+    assert!(fleet.terminations().is_empty());
+    assert_eq!(repository.scaling_events().len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_termination_of_live_worker_is_cancelled_when_demand_returns() -> TestResult {
+    let clock = clock_at(1_000_000);
+    let fleets = fleets();
+    let fleet = FakeProvisioner::default();
+    let scheduler = FakeScheduler::new()?;
+    let repository = FakeRepository::default();
+    let name = instance_id("local-1");
+    fleet.set_supply(
+        &fleet_name(),
+        supply_with("local-1", Timestamp::from_unix_millis(0), 1),
+    );
+    scheduler.set_snapshot(SchedulerSnapshot {
+        workers: vec![idle_worker(&name, clock.wall())?],
+        ..SchedulerSnapshot::default()
+    });
+    let mut control = ControlLoop::new(
+        &fleets,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
+        &fleet,
+        &scheduler,
+        &repository,
+        &clock,
+        gang_testkit::fence::valid_fence(),
+    );
+    assert_eq!(
+        control.pass().await,
+        PassOutcome::Completed {
+            applied: 0,
+            failed: 0
+        }
+    );
+    clock.advance(Duration::from_secs(16).max(gang_types::health::CLIENT_REROUTE_BOUND));
+    assert_eq!(
+        control.pass().await,
+        PassOutcome::Completed {
+            applied: 1,
+            failed: 0
+        }
+    );
+    scheduler.set_snapshot(SchedulerSnapshot {
+        workers: vec![WorkerState {
+            draining: true,
+            ..idle_worker(&name, clock.wall())?
+        }],
+        ..SchedulerSnapshot::default()
+    });
+    fleet.fail_terminate(true);
+    assert_eq!(
+        control.pass().await,
+        PassOutcome::Completed {
+            applied: 0,
+            failed: 1
+        }
+    );
+    fleet.fail_terminate(false);
+    scheduler.set_snapshot(SchedulerSnapshot {
+        workers: vec![WorkerState {
+            draining: true,
+            ..idle_worker(&name, clock.wall())?
+        }],
+        ..queued_snapshot()?
+    });
+    assert_eq!(
+        control.pass().await,
+        PassOutcome::Completed {
+            applied: 1,
+            failed: 0
+        }
+    );
+    assert!(fleet.terminations().is_empty());
+    assert_eq!(
+        scheduler.draining_calls(),
+        vec![(worker_on(&name)?, true), (worker_on(&name)?, false)]
+    );
+    assert!(
+        !repository
+            .scaling_events()
+            .iter()
+            .any(|event| { matches!(event.kind, ScalingEventKind::Terminated { .. }) })
+    );
+    Ok(())
+}
+
+fn assert_drain_finished_terminations(repository: &FakeRepository, expected: usize) {
+    let events = repository.scaling_events();
+    let terminated: Vec<_> = events
+        .iter()
+        .filter(|event| matches!(event.kind, ScalingEventKind::Terminated { .. }))
+        .collect();
+    assert_eq!(terminated.len(), expected);
+    for event in terminated {
+        assert_eq!(event.cause, Some(ScalingCause::DrainFinished));
+    }
+}
+
+#[tokio::test]
+async fn committed_termination_is_retried_after_supply_disappears_or_terminates() -> TestResult {
+    for terminating in [false, true] {
+        let clock = clock_at(1_000_000);
+        let fleets = fleets();
+        let fleet = CommittedTerminationProvisioner {
+            inner: FakeProvisioner::default(),
+            fail_after_commit: AtomicBool::new(true),
+            block_converge: AtomicBool::new(false),
+        };
+        let scheduler = FakeScheduler::new()?;
+        let repository = FakeRepository::default();
+        let name = instance_id("local-1");
+        fleet.inner.set_supply(
+            &fleet_name(),
+            supply_with("local-1", Timestamp::from_unix_millis(0), 1),
+        );
+        scheduler.set_snapshot(SchedulerSnapshot {
+            workers: vec![idle_worker(&name, clock.wall())?],
+            ..SchedulerSnapshot::default()
+        });
+        let mut control = ControlLoop::new(
+            &fleets,
+            crate::control::ControlSettings::new(
+                POLL_INTERVAL,
+                &gang_config::DashboardConfig::default(),
+            ),
+            &fleet,
+            &scheduler,
+            &repository,
+            &clock,
+            gang_testkit::fence::valid_fence(),
+        );
+
+        assert_eq!(
+            control.pass().await,
+            PassOutcome::Completed {
+                applied: 0,
+                failed: 0
+            }
+        );
+        clock.advance(Duration::from_secs(16).max(gang_types::health::CLIENT_REROUTE_BOUND));
+        assert_eq!(
+            control.pass().await,
+            PassOutcome::Completed {
+                applied: 1,
+                failed: 0
+            }
+        );
+        scheduler.set_snapshot(SchedulerSnapshot {
+            workers: vec![WorkerState {
+                draining: true,
+                ..idle_worker(&name, clock.wall())?
+            }],
+            ..SchedulerSnapshot::default()
+        });
+        assert_eq!(
+            control.pass().await,
+            PassOutcome::Completed {
+                applied: 0,
+                failed: 1
+            }
+        );
+        assert_eq!(fleet.inner.terminations(), vec![name.clone()]);
+        assert_drain_finished_terminations(&repository, 0);
+
+        assert_eq!(
+            control.pass().await,
+            PassOutcome::Skipped(SkipReason::ProvisionerUnavailable)
+        );
+        assert_eq!(fleet.inner.terminations(), vec![name.clone()]);
+        assert_drain_finished_terminations(&repository, 0);
+        if terminating {
+            let mut supply = supply_with("local-1", Timestamp::from_unix_millis(0), 0);
+            supply.instances[0].lifecycle = InstanceLifecycle::Terminating;
+            fleet.inner.set_supply(&fleet_name(), supply);
+        }
+        assert_eq!(
+            control.pass().await,
+            PassOutcome::Completed {
+                applied: 1,
+                failed: 0
+            }
+        );
+        assert_eq!(fleet.inner.terminations(), vec![name.clone(), name.clone()]);
+        assert_drain_finished_terminations(&repository, 1);
+
+        assert_eq!(
+            control.pass().await,
+            PassOutcome::Completed {
+                applied: 0,
+                failed: 0
+            }
+        );
+        assert_eq!(fleet.inner.terminations(), vec![name.clone(), name]);
+        assert_drain_finished_terminations(&repository, 1);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn failed_terminate_is_planned_again_on_the_next_pass() {
     let clock = clock_at(1_000_000);
     let fleets = fleets();
@@ -1320,7 +1872,10 @@ async fn failed_terminate_is_planned_again_on_the_next_pass() {
         .boot_grace;
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -1352,6 +1907,12 @@ async fn failed_terminate_is_planned_again_on_the_next_pass() {
             failed: 1,
         }
     );
+    assert!(
+        !repository
+            .scaling_events()
+            .iter()
+            .any(|event| { matches!(event.kind, ScalingEventKind::Terminated { .. }) })
+    );
 
     fleet.fail_terminate(false);
     assert_eq!(
@@ -1375,7 +1936,10 @@ async fn audit_failure_still_counts_the_step_as_applied() -> Result<(), PortErro
     repository.fail_scaling_events(true);
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -1426,7 +1990,10 @@ async fn overflow_from_a_full_fleet_depends_on_running_action_duration() -> Test
         });
         let mut control = ControlLoop::new(
             &fleets,
-            POLL_INTERVAL,
+            crate::control::ControlSettings::new(
+                POLL_INTERVAL,
+                &gang_config::DashboardConfig::default(),
+            ),
             &fleet,
             &scheduler,
             &repository,
@@ -1462,7 +2029,10 @@ async fn each_fleet_supply_is_refreshed_in_declaration_order() {
     let fleets = fleets_of(vec![("second", 4), ("first", 4)]);
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -1515,6 +2085,8 @@ async fn registrations_follow_snapshot_worker_id_order() -> TestResult {
     fleet.set_supply(
         &fleet_name(),
         FleetSupply {
+            requested: None,
+            events: Vec::new(),
             abandoned: 0,
             desired: 2,
             instances: vec![in_service("local-1"), in_service("local-2")],
@@ -1530,7 +2102,10 @@ async fn registrations_follow_snapshot_worker_id_order() -> TestResult {
     ]));
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -1575,6 +2150,8 @@ async fn vanished_worker_is_recorded_as_deregistered_from_the_fleet_it_was_in() 
     fleet.set_supply(
         &second,
         FleetSupply {
+            requested: None,
+            events: Vec::new(),
             abandoned: 0,
             desired: 1,
             instances: vec![in_service("local-1")],
@@ -1589,7 +2166,10 @@ async fn vanished_worker_is_recorded_as_deregistered_from_the_fleet_it_was_in() 
     }]));
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -1645,6 +2225,8 @@ async fn unchanged_worker_set_records_nothing_on_the_next_pass() -> TestResult {
     fleet.set_supply(
         &fleet_name(),
         FleetSupply {
+            requested: None,
+            events: Vec::new(),
             abandoned: 0,
             desired: 2,
             instances: vec![in_service("local-1"), in_service("local-2")],
@@ -1659,7 +2241,10 @@ async fn unchanged_worker_set_records_nothing_on_the_next_pass() -> TestResult {
     ]));
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -1699,6 +2284,8 @@ async fn failed_worker_event_recording_is_not_published() -> TestResult {
     fleet.set_supply(
         &fleet_name(),
         FleetSupply {
+            requested: None,
+            events: Vec::new(),
             abandoned: 0,
             desired: 1,
             instances: vec![in_service("local-1")],
@@ -1711,7 +2298,10 @@ async fn failed_worker_event_recording_is_not_published() -> TestResult {
     repository.fail_scaling_events(true);
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -1795,7 +2385,10 @@ async fn completed_pass_publishes_an_ok_pass_with_the_fleet_rows() -> Result<(),
     scheduler.set_snapshot(queued_snapshot()?);
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -1835,7 +2428,10 @@ async fn skipped_pass_publishes_its_reason_with_no_good_pass_before() -> Result<
     scheduler.fail_snapshot(true);
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -1871,7 +2467,10 @@ async fn skipped_pass_reports_the_last_good_pass_and_keeps_the_rows() -> Result<
     scheduler.set_snapshot(queued_snapshot()?);
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -1919,7 +2518,10 @@ async fn worker_joins_recorded_in_a_pass_are_in_that_pass_state() -> TestResult 
     });
     let mut control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -1968,7 +2570,10 @@ async fn run_passes_at_once_then_once_per_poll_interval() -> Result<(), PortErro
     let snapshots = scheduler.snapshots();
     let control = ControlLoop::new(
         &fleets,
-        POLL_INTERVAL,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
         &fleet,
         &scheduler,
         &repository,
@@ -1994,5 +2599,368 @@ async fn run_passes_at_once_then_once_per_poll_interval() -> Result<(), PortErro
         2,
         "the next pass runs one poll interval later"
     );
+    Ok(())
+}
+
+struct EventProvisioner {
+    inner: FakeProvisioner,
+    acknowledgements: std::sync::atomic::AtomicUsize,
+}
+
+impl ProvisionerPort for EventProvisioner {
+    type FleetOptions = Opaque;
+
+    async fn supply(
+        &self,
+        fleet: Fleet<'_, Opaque>,
+        into: &mut FleetSupply,
+    ) -> Result<(), PortError> {
+        self.inner.supply(fleet, into).await
+    }
+
+    async fn acknowledge_event(
+        &self,
+        held: &Held,
+        _: Fleet<'_, Opaque>,
+        _: &str,
+    ) -> Result<(), PortError> {
+        held.check()?;
+        self.acknowledgements.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn set_desired_capacity(
+        &self,
+        held: &Held,
+        fleet: Fleet<'_, Opaque>,
+        desired: u32,
+    ) -> Result<(), PortError> {
+        self.inner.set_desired_capacity(held, fleet, desired).await
+    }
+
+    async fn terminate(
+        &self,
+        held: &Held,
+        fleet: Fleet<'_, Opaque>,
+        instance: &InstanceId,
+    ) -> Result<(), PortError> {
+        self.inner.terminate(held, fleet, instance).await
+    }
+
+    fn worker_lifetime(&self) -> gang_types::WorkerLifetime {
+        self.inner.worker_lifetime()
+    }
+}
+
+fn assert_replacement_visible(hub: &StateHub) {
+    let state = served(hub);
+    assert_eq!(state.status_events.len(), 1);
+    assert_eq!(
+        state
+            .workers
+            .iter()
+            .filter(|worker| worker.infrastructure.is_some())
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn infrastructure_delivery_retries_and_replays_without_audit_duplicates() -> TestResult {
+    use gang_spi::{InfrastructureEvent, InfrastructureEventKind};
+    let clock = clock_at(1_000_000);
+    let fleets = fleets();
+    let fleet = EventProvisioner {
+        inner: FakeProvisioner::default(),
+        acknowledgements: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let scheduler = FakeScheduler::new()?;
+    let repository = FakeRepository::default();
+    let old = instance_id("local-1");
+    let new = instance_id("local-2");
+    let mut supply = supply_with("local-1", clock.wall(), 2);
+    supply.requested = Some(1);
+    supply.instances.push(in_service("local-2"));
+    supply.events.push(InfrastructureEvent {
+        id: "rebalance-1".to_owned(),
+        at: clock.wall(),
+        kind: InfrastructureEventKind::ReplacementLaunched {
+            instance: new.clone(),
+            replacing: Some(old.clone()),
+        },
+    });
+    fleet.inner.set_supply(&fleet_name(), supply);
+    scheduler.set_snapshot(snapshot_with(vec![
+        idle_worker(&old, clock.wall())?,
+        idle_worker(&new, clock.wall())?,
+    ]));
+    let initial_hub = hub();
+    let dashboard = gang_config::DashboardConfig::default();
+    let mut control = ControlLoop::new(
+        &fleets,
+        crate::control::ControlSettings::new(POLL_INTERVAL, &dashboard),
+        &fleet,
+        &scheduler,
+        &repository,
+        &clock,
+        gang_testkit::fence::valid_fence(),
+    )
+    .with_publisher(publisher(&initial_hub));
+    repository.fail_records(true);
+    control.pass().await;
+    assert_eq!(fleet.acknowledgements.load(Ordering::SeqCst), 0);
+    assert!(repository.scaling_events().is_empty());
+    repository.fail_records(false);
+    control.pass().await;
+    assert_eq!(fleet.acknowledgements.load(Ordering::SeqCst), 1);
+    assert_replacement_visible(&initial_hub);
+    assert_eq!(repository.scaling_events().len(), 1);
+    let mut redelivery = FleetSupply::default();
+    fleet
+        .inner
+        .supply(
+            fleets.iter().next().expect("test fleet exists").fleet(),
+            &mut redelivery,
+        )
+        .await?;
+    redelivery.events[0].kind = InfrastructureEventKind::InstanceLaunched {
+        instance: new.clone(),
+    };
+    fleet.inner.set_supply(&fleet_name(), redelivery);
+    control.pass().await;
+    assert_replacement_visible(&initial_hub);
+    assert_eq!(repository.scaling_events().len(), 1);
+    drop(control);
+    let mut after_ack = FleetSupply::default();
+    fleet
+        .inner
+        .supply(
+            fleets.iter().next().expect("test fleet exists").fleet(),
+            &mut after_ack,
+        )
+        .await?;
+    after_ack.events.clear();
+    fleet.inner.set_supply(&fleet_name(), after_ack);
+    let restarted = hub();
+    let mut control = ControlLoop::new(
+        &fleets,
+        crate::control::ControlSettings::new(POLL_INTERVAL, &dashboard),
+        &fleet,
+        &scheduler,
+        &repository,
+        &clock,
+        gang_testkit::fence::valid_fence(),
+    )
+    .with_publisher(publisher(&restarted));
+    control.pass().await;
+    assert_replacement_visible(&restarted);
+    Ok(())
+}
+
+#[tokio::test]
+async fn capacity_status_preserves_launch_audit_through_redelivery_and_expiry() -> TestResult {
+    use gang_spi::{InfrastructureEvent, InfrastructureEventKind};
+    let clock = clock_at(1_000_000);
+    let fleets = fleets();
+    let fleet = EventProvisioner {
+        inner: FakeProvisioner::default(),
+        acknowledgements: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let scheduler = FakeScheduler::new()?;
+    let repository = FakeRepository::default();
+    let mut supply = supply_with("local-1", clock.wall(), 3);
+    supply.launch_failure = Some(gang_spi::LaunchFailure {
+        reason: "capacity".into(),
+    });
+    supply.events.push(InfrastructureEvent {
+        id: "capacity-1".into(),
+        at: clock.wall(),
+        kind: InfrastructureEventKind::CapacityUnavailable {
+            reason: "capacity".into(),
+        },
+    });
+    let dashboard = gang_config::DashboardConfig::default();
+    let hub = hub();
+    let mut control = ControlLoop::new(
+        &fleets,
+        crate::control::ControlSettings::new(POLL_INTERVAL, &dashboard),
+        &fleet,
+        &scheduler,
+        &repository,
+        &clock,
+        gang_testkit::fence::valid_fence(),
+    )
+    .with_publisher(publisher(&hub));
+    let failures = || {
+        repository
+            .scaling_events()
+            .into_iter()
+            .filter(|event| matches!(event.kind, ScalingEventKind::LaunchFailed { .. }))
+            .collect::<Vec<_>>()
+    };
+    let first = ScalingAuditEvent {
+        at: clock.wall(),
+        fleet: fleet_name(),
+        kind: ScalingEventKind::LaunchFailed {
+            from: 1,
+            to: 3,
+            reason: "capacity".into(),
+        },
+        cause: None,
+    };
+    fleet.inner.set_supply(&fleet_name(), supply.clone());
+    control.pass().await;
+    assert_eq!(failures(), vec![first.clone()]);
+    assert_eq!(served(&hub).status_events.len(), 1);
+    assert_eq!(fleet.acknowledgements.load(Ordering::SeqCst), 1);
+
+    clock.advance(Duration::from_secs(1));
+    fleet.inner.set_supply(&fleet_name(), supply.clone());
+    control.pass().await;
+    assert_eq!(failures(), vec![first.clone()]);
+    assert_eq!(served(&hub).status_events.len(), 1);
+    assert_eq!(fleet.acknowledgements.load(Ordering::SeqCst), 2);
+
+    // Expired redelivery must not resurrect operational status or erase durable audit.
+    clock.advance(dashboard.history_window.get() + Duration::from_secs(1));
+    supply.instances[0].launched_at = clock.wall();
+    fleet.inner.set_supply(&fleet_name(), supply.clone());
+    control.pass().await;
+    assert_eq!(failures(), vec![first.clone()]);
+    assert!(served(&hub).status_events.is_empty());
+    assert_eq!(fleet.acknowledgements.load(Ordering::SeqCst), 3);
+
+    // A new capacity observation must not mask a different concurrent launch failure.
+    supply.launch_failure = Some(gang_spi::LaunchFailure {
+        reason: "different failure".into(),
+    });
+    supply.events[0].id = "capacity-2".into();
+    supply.events[0].at = clock.wall();
+    let second = ScalingAuditEvent {
+        at: clock.wall(),
+        fleet: fleet_name(),
+        kind: ScalingEventKind::LaunchFailed {
+            from: 1,
+            to: 3,
+            reason: "different failure".into(),
+        },
+        cause: None,
+    };
+    fleet.inner.set_supply(&fleet_name(), supply.clone());
+    control.pass().await;
+    assert_eq!(failures(), vec![first.clone(), second.clone()]);
+    assert_eq!(served(&hub).status_events.len(), 1);
+    assert_eq!(fleet.acknowledgements.load(Ordering::SeqCst), 4);
+
+    clock.advance(Duration::from_secs(1));
+    fleet.inner.set_supply(&fleet_name(), supply);
+    control.pass().await;
+    assert_eq!(failures(), vec![first, second]);
+    assert_eq!(served(&hub).status_events.len(), 1);
+    assert_eq!(fleet.acknowledgements.load(Ordering::SeqCst), 5);
+    Ok(())
+}
+
+#[tokio::test]
+async fn ordinary_provider_launch_does_not_suppress_worker_registration() -> TestResult {
+    use gang_spi::{InfrastructureEvent, InfrastructureEventKind};
+    let clock = clock_at(1_000_000);
+    let fleets = fleets();
+    let fleet = FakeProvisioner::default();
+    let scheduler = FakeScheduler::new()?;
+    let repository = FakeRepository::default();
+    let instance = instance_id("local-1");
+    let mut supply = supply_with("local-1", clock.wall(), 1);
+    supply.events.push(InfrastructureEvent {
+        id: "ordinary-launch".into(),
+        at: clock.wall(),
+        kind: InfrastructureEventKind::InstanceLaunched {
+            instance: instance.clone(),
+        },
+    });
+    fleet.set_supply(&fleet_name(), supply);
+    scheduler.set_snapshot(snapshot_with(vec![idle_worker(&instance, clock.wall())?]));
+    let dashboard = gang_config::DashboardConfig::default();
+    let hub = hub();
+    let mut control = ControlLoop::new(
+        &fleets,
+        crate::control::ControlSettings::new(POLL_INTERVAL, &dashboard),
+        &fleet,
+        &scheduler,
+        &repository,
+        &clock,
+        gang_testkit::fence::valid_fence(),
+    )
+    .with_publisher(publisher(&hub));
+    control.pass().await;
+    assert!(matches!(
+        &repository.scaling_events()[0].kind,
+        ScalingEventKind::WorkerRegistered { .. }
+    ));
+    assert!(served(&hub).workers[0].infrastructure.is_none());
+    assert_eq!(served(&hub).status_events.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_status_reload_clears_expired_risk_without_stopping_reconciliation() -> TestResult {
+    use gang_spi::{InfrastructureEvent, InfrastructureEventKind};
+    let clock = clock_at(1_000_000);
+    let fleets = fleets();
+    let fleet = FakeProvisioner::default();
+    let scheduler = FakeScheduler::new()?;
+    let repository = FakeRepository::default();
+    let instance = instance_id("local-1");
+    let mut supply = supply_with("local-1", clock.wall(), 1);
+    supply.events.push(InfrastructureEvent {
+        id: "risk".into(),
+        at: clock.wall(),
+        kind: InfrastructureEventKind::RebalanceRecommendation {
+            instance: instance.clone(),
+        },
+    });
+    fleet.set_supply(&fleet_name(), supply.clone());
+    let dashboard = gang_config::DashboardConfig::default();
+    let hub = hub();
+    let mut control = ControlLoop::new(
+        &fleets,
+        crate::control::ControlSettings::new(POLL_INTERVAL, &dashboard),
+        &fleet,
+        &scheduler,
+        &repository,
+        &clock,
+        gang_testkit::fence::valid_fence(),
+    )
+    .with_publisher(publisher(&hub));
+    control.pass().await;
+    let before = served(&hub);
+    assert_eq!(before.status_events.len(), 1);
+    assert!(before.instances[0].infrastructure.is_some());
+    let mut viewer = hub.join().expect("viewer joins");
+
+    clock.advance(dashboard.history_window.get() + Duration::from_secs(1));
+    supply.events.clear();
+    supply.desired = 3;
+    supply.instances[0].launched_at = clock.wall();
+    supply.launch_failure = Some(gang_spi::LaunchFailure {
+        reason: "capacity".into(),
+    });
+    fleet.set_supply(&fleet_name(), supply);
+    repository.fail_records(true);
+    assert!(matches!(
+        control.pass().await,
+        PassOutcome::Completed { .. }
+    ));
+    assert_eq!(fleet.desired_requests(), vec![(fleet_name(), 1)]);
+    let after = served(&hub);
+    assert!(after.status_events.is_empty());
+    assert!(after.instances[0].infrastructure.is_none());
+    let crate::hub::Next::Frame(bytes) = viewer.next().await else {
+        panic!("the viewer receives the status removal delta");
+    };
+    let gang_wire::Frame::Delta(delta) = crate::test_support::decode_sse(&bytes) else {
+        panic!("the viewer receives a delta");
+    };
+    assert_eq!(delta.status_events, Some(Vec::new()));
     Ok(())
 }

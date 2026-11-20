@@ -390,9 +390,8 @@ pub mod limits {
     pub const HOLD_HAS_SCOPE: &str = "the hold action runs in its own scope";
     /// The hold action signals that its orphan runs before the hold timeout.
     pub const HOLD_SIGNALLED: &str = "the hold action signals that its orphan runs";
-    /// `memory.max` is the reservation plus the headroom.
-    pub const MEMORY_MAX: &str =
-        "the action runs with memory.max at its reservation plus the headroom";
+    /// `memory.max` is unbounded in each action scope.
+    pub const MEMORY_MAX: &str = "the action scope has no reservation-derived memory.max";
     /// The kernel kills the whole action on an out-of-memory event.
     pub const OOM_GROUP: &str = "the kernel kills the whole action on an out-of-memory event";
     /// `cpu.max` is the count times the period.
@@ -408,15 +407,14 @@ pub mod limits {
         "a process left behind by the action is killed when the action ends";
     /// The scope directory is removed with the action.
     pub const SCOPE_REMOVED: &str = "the action's scope is removed afterwards";
-    /// An action past the hard memory ceiling is killed.
-    pub const HARD_CEILING: &str =
-        "an action exceeding the hard memory ceiling is killed and reports exit 137";
+    /// A healthy spike above its reservation completes on the first attempt.
+    pub const HARD_CEILING: &str = "a healthy memory spike completes on its first attempt";
 }
 
 /// Names of the checks of the soft memory scenario.
 pub mod memory {
-    /// The platform enforces memory limits with cgroups.
-    pub const CGROUPS_ENFORCED: &str = "per-action memory limits are enforced by cgroups";
+    /// The platform supports cgroup action scopes.
+    pub const CGROUPS_ENFORCED: &str = "action scopes are available with cgroups";
     /// An action over its soft reservation is requeued once and completes.
     pub const SOFT_REQUEUE: &str =
         "an action over its soft memory reservation is killed once, requeued, and completes";
@@ -701,6 +699,20 @@ pub mod sandbox_contract {
     pub const READONLY_BINDS: &str = "every readonly_bind_paths and readonly_bind_mounts path is read-only inside a bwrap action";
     /// The working directory of a bwrap action is writable.
     pub const WORKDIR_WRITABLE: &str = "the working directory of a bwrap action is writable";
+    /// The numeric action identity resolves uniquely to builder.
+    pub const IDENTITY: &str = "the action identity resolves uniquely to builder";
+    /// The action uses only files for user and group lookup.
+    pub const NSS: &str = "the action uses files-only identity lookup";
+    /// No other host configuration is visible under /etc.
+    pub const ETC_CONTENTS: &str = "the action sees only identity and public roots under /etc";
+    /// Identity and public root files are read-only.
+    pub const IDENTITY_ROOTS_READONLY: &str = "identity and public root files are read-only";
+    /// Native TLS loads the public system roots.
+    pub const ROOTS: &str = "native TLS loads public system roots";
+    /// Native TLS respects explicit missing certificate overrides.
+    pub const ROOTS_OVERRIDE: &str = "native TLS honors explicit certificate overrides";
+    /// `PostgreSQL` initializes and starts under the action identity.
+    pub const POSTGRES: &str = "PostgreSQL initializes and starts under the action identity";
     /// The held bwrap action runs in its own scope.
     pub const HOLD_HAS_SCOPE: &str = "the held bwrap action runs in its own scope";
     /// Bwrap runs inside the action's scope.
@@ -712,15 +724,14 @@ pub mod sandbox_contract {
     pub const HOLD_COMPLETES: &str = "the held bwrap action completes once released";
 }
 
-/// Names of the checks of an out-of-memory kill under per-action cgroups.
+/// Names of the held memory action's cleanup checks.
 pub mod oom {
-    /// An action past memory.max is killed by the kernel and fails with exit status 137.
-    pub const KILLED: &str =
-        "an action past memory.max is killed by the kernel and fails with exit status 137";
-    /// Gang exec removes the scope of an action killed for memory.
-    pub const SCOPE_REMOVED: &str = "gang exec removes the scope of an action killed for memory";
-    /// The next action succeeds after an out-of-memory kill.
-    pub const SERVING: &str = "the next action succeeds after an out-of-memory kill";
+    /// The held memory action completes.
+    pub const KILLED: &str = "the held memory action completes";
+    /// Gang exec removes the action scope.
+    pub const SCOPE_REMOVED: &str = "gang exec removes the held memory action's scope";
+    /// The next action succeeds.
+    pub const SERVING: &str = "the next action succeeds after the held memory action";
 }
 
 /// Names of the checks of the stale scope scenario.
@@ -1109,44 +1120,12 @@ pub mod rolling_deploy {
     pub const LEADER: &str = "rolling deploy: a leader exists after replacement";
 }
 
-/// Checks of follower cache-call forwarding.
-pub mod follower_builds {
-    /// Only followers serve the public frontend.
-    pub const FOLLOWER_ONLY_SERVE: &str =
-        "follower builds: only followers serve the public frontend";
-    /// A direct follower request returns the controlled cache miss.
-    pub const CONTROLLED_MISS: &str = "follower builds: controlled request returns not found";
-    /// The follower stores and returns the controlled blob.
-    pub const CONTROLLED_BLOB: &str = "follower builds: controlled blob round trip succeeds";
-    /// The leader includes the follower's lookup in its recent window.
-    pub const CONTROLLED_LOOKUPS: &str =
-        "follower builds: leader recent lookups include the follower miss";
-    /// The leader includes the follower's download in its recent window.
-    pub const CONTROLLED_DOWNLOADED: &str =
-        "follower builds: leader recent downloaded bytes include the follower read";
-    /// The leader records exactly the controlled miss.
-    pub const CONTROLLED_LEADER: &str =
-        "follower builds: leader records exactly the controlled miss";
-    /// The follower relays the controlled accounting.
-    pub const CONTROLLED_FOLLOWER: &str =
-        "follower builds: follower relays the controlled miss accounting";
-    /// A warm build has no misses, errors, executions, or unrecorded usage.
-    pub const WARM_ZERO_USAGE: &str =
-        "warm build has no misses, errors, executions, or unrecorded usage";
-    /// Only the surviving follower serves the public frontend.
-    pub const SURVIVOR_ONLY_SERVE: &str =
-        "follower builds: only the surviving follower serves the public frontend";
-    /// The killed leader's build is not on the new leader.
-    pub const KILLED_BUILD_ABSENT: &str =
-        "follower builds: the new leader does not list the killed leader's build";
-}
-
 /// Checks of login across controllers.
 pub mod login_across {
     /// Device authorization crosses controllers.
     pub const DEVICE: &str = "login across: device login completes across controllers";
-    /// Browser login crosses controllers.
-    pub const BROWSER: &str = "login across: browser login completes across controllers";
+    /// A browser session survives leadership changing.
+    pub const BROWSER: &str = "login across: browser session survives leader handoff";
     /// Device authorization cannot be redeemed twice.
     pub const REPLAY: &str = "login across: a redeemed device code cannot be redeemed again";
 }
@@ -1154,22 +1133,23 @@ pub mod login_across {
 /// Checks of revocation across controllers.
 pub mod cross_revocation {
     /// A credential is initially admitted.
-    pub const INITIAL_LOGIN: &str = "cross-revocation: principal initially admitted on B";
+    pub const INITIAL_LOGIN: &str = "cross-revocation: principal initially admitted on leader";
     /// The stream is initially open.
-    pub const STREAM_OPEN: &str = "cross-revocation: principal stream initially open on B";
+    pub const STREAM_OPEN: &str = "cross-revocation: principal stream initially open on leader";
     /// A new credential is refused.
-    pub const LOGIN_REFUSED: &str = "cross-revocation: B refuses a new credential";
+    pub const LOGIN_REFUSED: &str = "cross-revocation: leader refuses a new credential";
     /// The leader stream closes.
-    pub const STREAM_CLOSED: &str = "cross-revocation: B closes the principal stream";
+    pub const STREAM_CLOSED: &str = "cross-revocation: leader closes the principal stream";
     /// The revoked worker is deregistered.
     pub const WORKER_CUT: &str = "cross-revocation: leader deregisters the revoked worker";
     /// Restoration permits a new credential.
-    pub const RESTORED: &str = "cross-revocation: A admits the restored principal";
+    pub const RESTORED: &str = "cross-revocation: new leader admits the restored principal";
     /// An existing bearer is refused.
-    pub const BEARER_REFUSED: &str = "cross-revocation: B refuses an existing bearer token";
-    /// The follower stream closes.
-    pub const FOLLOWER_STREAM_CLOSED: &str =
-        "cross-revocation: follower closes the principal stream";
+    pub const BEARER_REFUSED: &str =
+        "cross-revocation: new leader refuses an existing bearer token";
+    /// A second stream closes.
+    pub const SECOND_STREAM_CLOSED: &str =
+        "cross-revocation: leader closes the second principal stream";
 }
 
 /// Checks of leader failover.
@@ -1199,21 +1179,22 @@ pub mod leader_failover {
 /// Checks of a shared database outage and partition.
 pub mod database_outage {
     /// The build remains held.
-    pub const HELD: &str = "database outage: build is held with queued demand";
+    pub const HELD: &str = "database outage: existing build remains held";
     /// Device login is refused.
     pub const REFUSED: &str = "database outage: new device login is refused during the outage";
     /// Scaling pauses.
     pub const PAUSED: &str = "database outage: scaling pauses after lease validity lapses";
-    /// Demand arrives after validity lapses.
-    pub const DEMAND_QUEUED: &str = "database outage: new demand queues after validity lapses";
+    /// Demand stays pending while readiness is lost.
+    pub const DEMAND_PENDING: &str = "database outage: new demand remains pending until recovery";
     /// No scaling event occurs during the outage.
     pub const NO_EVENTS: &str = "database outage: no scaling event is recorded during the outage";
-    /// The same leader remains.
-    pub const LEADER: &str = "database outage: the same controller remains leader";
+    /// No other controller becomes ready, and the original leader recovers.
+    pub const LEADER: &str =
+        "database outage: original leader becomes ready again without takeover";
     /// Login resumes.
     pub const LOGIN: &str = "database outage: new device login works after recovery";
-    /// Queued demand is met.
-    pub const RESUMED: &str = "database outage: queued demand is met after recovery";
+    /// Retried demand is met.
+    pub const RESUMED: &str = "database outage: retried demand is met after recovery";
     /// Recovery scales out exactly once.
     pub const ONE_SCALE_OUT: &str = "database outage: recovery records exactly one scale-out";
     /// Enrollment returns unavailable.

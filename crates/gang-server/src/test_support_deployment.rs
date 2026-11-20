@@ -2,7 +2,6 @@
 //! plugin configurations the server is composed from.
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
@@ -10,13 +9,13 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crate::{
-    Binder, Deployment, HandshakeSettings, LeaderListeners, Listeners, Parts, Provider, Providers,
-    PublicEndpoint, RequestLimits, ServerSettings, Stack, TlsSettings, TransportSettings,
+    Deployment, HandshakeSettings, Listeners, Parts, Provider, Providers, PublicEndpoint,
+    RequestLimits, ServerSettings, Stack, TlsSettings, TransportSettings,
 };
 use gang_authn::{Anonymous, Mtls, MtlsConfig, NoneConfig, Token, TokenConfig};
 use gang_clock::TestClock;
 use gang_config::{DashboardConfig, EndpointTrust, RoleConfig, RolePrincipal};
-use gang_spi::{BoxedError, ControllerId, LoginSupport, Plugin, PluginContext};
+use gang_spi::{ControllerId, LoginSupport, Plugin, PluginContext};
 use gang_testkit::{
     FakeCache, FakeProvisioner, FakeRepository, FakeScheduler, TestPlugins, TestSigner,
 };
@@ -24,49 +23,12 @@ use gang_types::{
     Isa, NonZeroDuration, Percent, PermissionSet, Principal, ProviderName, RoleName, TrustDomain,
     Url,
 };
-use parking_lot::Mutex;
 use serde_json::json;
-use tokio::sync::oneshot;
 
 use crate::test_support::start_clock;
 use crate::test_support_fleet::fleets;
 use crate::test_support_memory::{MemoryDialer, MemoryListener, memory_listener};
 use crate::test_support_verifier::FakeVerifier;
-
-/// In-memory binding registry for dedicated listener tests.
-#[derive(Clone, Default)]
-pub struct MemoryBinder {
-    dials: Arc<Mutex<BTreeMap<SocketAddr, MemoryDialer>>>,
-    holds: Arc<Mutex<BTreeMap<SocketAddr, oneshot::Receiver<()>>>>,
-}
-
-impl MemoryBinder {
-    /// Returns a dialer for an address that has been bound.
-    pub fn dialer(&self, address: SocketAddr) -> Option<MemoryDialer> {
-        self.dials.lock().get(&address).cloned()
-    }
-
-    /// Holds the next bind of `address` until the returned sender fires or is dropped.
-    pub fn hold(&self, address: SocketAddr) -> oneshot::Sender<()> {
-        let (release, held) = oneshot::channel();
-        self.holds.lock().insert(address, held);
-        release
-    }
-}
-
-impl Binder for MemoryBinder {
-    type Listener = MemoryListener;
-
-    async fn bind(&self, address: SocketAddr) -> Result<MemoryListener, BoxedError> {
-        let held = self.holds.lock().remove(&address);
-        if let Some(held) = held {
-            let _ = held.await;
-        }
-        let (listener, dialer) = memory_listener();
-        self.dials.lock().insert(address, dialer);
-        Ok(listener)
-    }
-}
 
 /// The deployment of a TLS server: client tokens and worker certificates, both under the
 /// certificate authority.
@@ -86,7 +48,6 @@ impl Deployment for TlsDeployment {
     type Cache = FakeCache;
     type Scheduler = FakeScheduler;
     type Listener = MemoryListener;
-    type Binder = MemoryBinder;
     type Plugins = TestPlugins;
 }
 
@@ -107,7 +68,6 @@ impl Deployment for PlainDeployment {
     type Cache = FakeCache;
     type Scheduler = FakeScheduler;
     type Listener = MemoryListener;
-    type Binder = MemoryBinder;
     type Plugins = TestPlugins;
 }
 
@@ -141,7 +101,7 @@ struct Wiring {
     repository: FakeRepository,
     clock: Arc<TestClock>,
     providers: Providers<FakeVerifier>,
-    listeners: Listeners<MemoryBinder>,
+    listeners: Listeners<MemoryListener>,
 }
 
 /// Builds the shared state over fresh fakes and memory listeners.
@@ -158,10 +118,7 @@ fn wire(scheduler: FakeScheduler) -> (Wiring, Dials, Handles) {
         repository: repository.clone(),
         clock: clock.clone(),
         providers,
-        listeners: Listeners {
-            public,
-            leader: LeaderListeners::OnPublic { worker },
-        },
+        listeners: Listeners { public, worker },
     };
     let dials = Dials {
         public: public_dial,
@@ -240,9 +197,15 @@ pub(super) fn anonymous() -> Anonymous {
 #[must_use]
 pub fn tls_settings() -> ServerSettings {
     ServerSettings {
+        actions: Arc::new(gang_config::ActionsConfig {
+            kill_grace: NonZeroDuration::from_secs(7),
+            ..gang_config::ActionsConfig::default()
+        }),
+        proxy_protocol: std::sync::Arc::new(gang_config::ProxyProtocolConfig::default()),
         leadership: gang_config::LeadershipConfig::default(),
+        standby_routability_delay: Duration::ZERO,
+        handoff_timeout: Duration::from_mins(1),
         revocation_refresh_interval: NonZeroDuration::from_secs(1),
-        execution_endpoint: None,
         poll_interval: NonZeroDuration::from_secs(1),
         client_action_timeout: NonZeroDuration::from_mins(1),
         default_isa: Isa::X86_64,

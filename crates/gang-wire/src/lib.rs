@@ -45,10 +45,8 @@ mod state;
 pub mod time;
 
 pub use build::{
-    ActionTime, Build, BuildState, CacheCounts, Executions, IngestBuildsRequest,
-    IngestBuildsResponse, IngestCall, IngestLoss, IngestOrigin, IngestOutcome, IngestRpc,
-    IngestTraffic, ListBuildsResponse, MissedTarget, MnemonicUsage, SlowAction, Timeline,
-    TimelineBucket, Usage,
+    ActionTime, Build, BuildState, CacheCounts, Executions, ListBuildsResponse, MissedTarget,
+    MnemonicUsage, SlowAction, Timeline, TimelineBucket, Usage,
 };
 pub use certificate::{Certificate, CreateCertificateRequest};
 pub use device::{
@@ -61,7 +59,10 @@ pub use error::{
     INTERNAL_ERROR_BODY, RetryInfo, Status, UnknownErrorReason,
 };
 pub use errors::{FrameError, PageError, ResourceNameError, WireDurationError};
-pub use event::{Cause, Event, EventChange, ListEventsResponse};
+pub use event::{
+    AwsEvent, AwsEventKind, AwsInterruptionAction, AwsTerminationReason, Cause, Event, EventChange,
+    ListEventsResponse,
+};
 pub use frame::{
     ActionsDelta, CLOSED_EVENT, Closed, ClosedReason, DELTA_EVENT, Delta, Frame, FrameRef, Keyed,
     SNAPSHOT_EVENT, TICK_EVENT, Tick,
@@ -79,7 +80,8 @@ pub use session::{
     AuthenticateRequest, AuthenticateResponse, CookieNames, Credential, Session, SessionLogin,
 };
 pub use state::{
-    Actions, BucketUsage, Cache, CacheStore, Demand, Fleet, Instance, InstanceCounts, InstanceSize,
+    Actions, BucketUsage, Cache, CacheStore, Demand, Fleet, InfrastructurePhase,
+    InfrastructureReason, InfrastructureStatus, Instance, InstanceCounts, InstanceSize,
     LaunchFailure, Lifecycle, Named, Pass, PassState, Phase, PhaseSpan, Policy, Queue,
     QueuedAction, Recent, RunningAction, Sample, SkipReason, State, StoreUsage, Truncated, Worker,
     WorkerCounts,

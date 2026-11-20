@@ -28,6 +28,12 @@ pub struct ClientOptions {
     /// The total time allowed for one request to the server, including reading the body.
     /// Must not be zero.
     pub http_timeout: NonZeroDuration,
+    /// Initial delay between safe API retries.
+    pub api_retry_initial_backoff: NonZeroDuration,
+    /// Maximum exponential delay between safe API retries.
+    pub api_retry_max_backoff: NonZeroDuration,
+    /// Total time allowed for API attempts and retry delays.
+    pub api_retry_budget: NonZeroDuration,
     /// The largest response body accepted from the server. Must not be zero.
     pub max_response_size: NonZeroBytes,
     /// The largest request head the loopback login server reads from one connection; a larger
@@ -70,6 +76,17 @@ impl Default for ClientOptions {
     fn default() -> Self {
         Self {
             http_timeout: NonZeroDuration::from_secs(10),
+            api_retry_initial_backoff: NonZeroDuration::from_millis(100),
+            api_retry_max_backoff: NonZeroDuration::from_secs(
+                gang_types::health::CLIENT_RETRY_MAX_DELAY.as_secs(),
+            ),
+            api_retry_budget: NonZeroDuration::from_secs(
+                gang_types::handover::handover_window(
+                    gang_types::handover::DEFAULT_RENEW_INTERVAL,
+                    gang_types::handover::DEFAULT_CALL_TIMEOUT,
+                )
+                .as_secs(),
+            ),
             max_response_size: NonZeroBytes::mib(1),
             callback_max_head_size: NonZeroBytes::kib(64),
             max_error_message_chars: DEFAULT_MAX_ERROR_MESSAGE_CHARS,
@@ -101,6 +118,12 @@ mod tests {
         let options = ClientOptions::default();
 
         assert_eq!(options.http_timeout, NonZeroDuration::from_secs(10));
+        assert_eq!(
+            options.api_retry_initial_backoff,
+            NonZeroDuration::from_millis(100)
+        );
+        assert_eq!(options.api_retry_max_backoff, NonZeroDuration::from_secs(5));
+        assert_eq!(options.api_retry_budget, NonZeroDuration::from_secs(21));
         assert_eq!(options.max_response_size, NonZeroBytes::mib(1));
         assert_eq!(options.callback_max_head_size, NonZeroBytes::kib(64));
         assert_eq!(
@@ -126,6 +149,9 @@ mod tests {
     fn json_round_trip_keeps_every_field() {
         let options = ClientOptions {
             http_timeout: NonZeroDuration::from_secs(3),
+            api_retry_initial_backoff: NonZeroDuration::from_millis(50),
+            api_retry_max_backoff: NonZeroDuration::from_secs(2),
+            api_retry_budget: NonZeroDuration::from_secs(8),
             max_response_size: NonZeroBytes::kib(4),
             callback_max_head_size: NonZeroBytes::kib(2),
             max_error_message_chars: NonZeroUsize::new(77).expect("77 is non-zero"),
@@ -257,6 +283,15 @@ mod tests {
     #[test]
     fn zero_durations_and_sizes_are_rejected() {
         assert!(serde_json::from_str::<ClientOptions>(r#"{"http_timeout":"0s"}"#).is_err());
+        for field in [
+            "api_retry_initial_backoff",
+            "api_retry_max_backoff",
+            "api_retry_budget",
+        ] {
+            assert!(
+                serde_json::from_str::<ClientOptions>(&format!(r#"{{"{field}":"0s"}}"#)).is_err()
+            );
+        }
         assert!(serde_json::from_str::<ClientOptions>(r#"{"max_clock_skew":"0s"}"#).is_err());
         assert!(serde_json::from_str::<ClientOptions>(r#"{"max_response_size":"0B"}"#).is_err());
         assert!(

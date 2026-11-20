@@ -17,3 +17,9 @@ workspace_rust_binary(
     src = "src/main.rs",
     deps = [":opentofu_runner"],
 )
+
+filegroup(
+    name = "upgrade_test",
+    srcs = ["tests/upgrade.tftest.hcl"],
+    visibility = ["//visibility:public"],
+)

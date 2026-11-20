@@ -4,21 +4,25 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use gang_clock::TestClock;
 use gang_spi::{
-    ControllerHostPort, FleetSupply, Held, HostMilestone, InstanceIdentity, LaunchFailure,
-    MountedScratchVolume, NodeLifecyclePort, PortError, PreemptionNotice, ProvisionerPort,
-    ScratchVolumePort, ServerEndpoints, Sidecar, WorkloadCredentialPort,
+    ControllerHostIdentity, ControllerHostPort, FleetSupply, Held, HostMilestone, InstanceIdentity,
+    LaunchFailure, MountedScratchVolume, NodeLifecyclePort, PortError, PreemptionNotice,
+    ProvisionerPort, ScratchVolumePort, ServerEndpoints, Sidecar, WorkloadCredentialPort,
 };
 use gang_types::{
-    Bytes, Fleet, FleetName, InstanceId, InstanceLifecycle, Isa, Proof, WorkerLifetime,
+    Bytes, Fleet, FleetName, InstanceId, InstanceLifecycle, Isa, NameError, Proof, WorkerLifetime,
 };
 use parking_lot::Mutex;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 use crate::{CallCount, Opaque};
+
+/// Each new fake represents a different host; cloning never allocates a new ordinal.
+static NEXT_HOST: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Default)]
 struct Script {
@@ -69,9 +73,11 @@ struct State {
     desired: Vec<(FleetName, u32)>,
     terminations: Vec<InstanceId>,
     milestones: Vec<HostMilestone>,
+    serving_hold: Option<oneshot::Receiver<()>>,
     failures: Failures,
     advance_on_supply: Option<(Arc<TestClock>, Duration)>,
     identity: Option<InstanceIdentity>,
+    host_identity: Result<ControllerHostIdentity, NameError>,
     lifetime: WorkerLifetime,
     notice: Option<PreemptionNotice>,
     volume: PathBuf,
@@ -91,6 +97,7 @@ struct State {
 /// leaves them untouched.
 ///
 /// The default has no node identity; configure one with [`Self::set_identity`] or [`Self::new`].
+/// Every new fake has a unique persistent controller host identity, retained by clones.
 #[derive(Clone)]
 pub struct FakeProvisioner {
     state: Arc<Mutex<State>>,
@@ -98,6 +105,7 @@ pub struct FakeProvisioner {
     credential_requests: CallCount,
     parked_polls: CallCount,
     attach_requests: CallCount,
+    serving_attempts: CallCount,
 }
 
 impl Default for FakeProvisioner {
@@ -140,9 +148,15 @@ impl FakeProvisioner {
                 desired: Vec::new(),
                 terminations: Vec::new(),
                 milestones: Vec::new(),
+                serving_hold: None,
                 failures: Failures::default(),
                 advance_on_supply: None,
                 identity,
+                host_identity: InstanceId::try_new(format!(
+                    "fake-host-{}",
+                    NEXT_HOST.fetch_add(1, Ordering::Relaxed)
+                ))
+                .map(ControllerHostIdentity::Persistent),
                 lifetime,
                 notice: None,
                 volume,
@@ -157,7 +171,15 @@ impl FakeProvisioner {
             credential_requests: CallCount::new(),
             parked_polls: CallCount::new(),
             attach_requests: CallCount::new(),
+            serving_attempts: CallCount::new(),
         }
+    }
+
+    /// Assigns the immutable host identity used by controller restart and launch-order tests.
+    #[must_use]
+    pub fn with_host_identity(self, identity: ControllerHostIdentity) -> Self {
+        self.state.lock().host_identity = Ok(identity);
+        self
     }
 
     /// Configures the supply returned for a fleet, including its instance list.
@@ -213,6 +235,20 @@ impl FakeProvisioner {
     pub fn milestones(&self) -> Vec<HostMilestone> {
         self.state.lock().milestones.clone()
     }
+    /// Holds the next serving milestone until the returned sender is completed or dropped.
+    #[must_use]
+    pub fn hold_serving(&self) -> oneshot::Sender<()> {
+        let (release, hold) = oneshot::channel();
+        self.state.lock().serving_hold = Some(hold);
+        release
+    }
+
+    /// Returns the number of serving milestone attempts started.
+    #[must_use]
+    pub fn serving_attempts(&self) -> CallCount {
+        self.serving_attempts.clone()
+    }
+
     /// Retires the host, releasing all current and future retirement waiters.
     pub fn retire(&self) {
         self.retirement.send_replace(true);
@@ -321,17 +357,21 @@ impl ProvisionerPort for FakeProvisioner {
         }
         if let Some(supply) = state.supplies.get(fleet.name) {
             into.desired = supply.desired;
+            into.requested = supply.requested;
             into.warm = supply.warm;
             into.abandoned = supply.abandoned;
             into.instances.clone_from(&supply.instances);
             into.exits.clone_from(&supply.exits);
+            into.events.clone_from(&supply.events);
             into.launch_failure.clone_from(&supply.launch_failure);
         } else {
             into.desired = 0;
+            into.requested = None;
             into.warm = 0;
             into.abandoned = 0;
             into.instances.clear();
             into.exits.clear();
+            into.events.clear();
             into.launch_failure = None;
         }
         let live = into
@@ -436,6 +476,14 @@ impl ProvisionerPort for FakeProvisioner {
 }
 
 impl ControllerHostPort for FakeProvisioner {
+    async fn incarnation(&self) -> Result<ControllerHostIdentity, PortError> {
+        self.state
+            .lock()
+            .host_identity
+            .clone()
+            .map_err(PortError::backend)
+    }
+
     async fn retiring(&self) -> Result<(), PortError> {
         let mut retirement = self.retirement.subscribe();
         retirement
@@ -446,6 +494,13 @@ impl ControllerHostPort for FakeProvisioner {
     }
 
     async fn reached(&self, milestone: HostMilestone) -> Result<(), PortError> {
+        if milestone == HostMilestone::Serving {
+            let hold = self.state.lock().serving_hold.take();
+            self.serving_attempts.bump();
+            if let Some(hold) = hold {
+                let _ = hold.await;
+            }
+        }
         self.state.lock().milestones.push(milestone);
         Ok(())
     }
@@ -507,8 +562,38 @@ impl WorkloadCredentialPort for FakeProvisioner {
 mod tests {
     use super::*;
     use gang_clock::Timestamp;
-    use gang_spi::FleetInstance;
+    use gang_spi::{FleetInstance, InfrastructureEvent, InfrastructureEventKind};
     use gang_types::{InstanceLifecycle, Resources};
+
+    #[tokio::test]
+    async fn new_hosts_are_distinct_and_clones_keep_the_same_identity() -> crate::TestResult {
+        let first = FakeProvisioner::default();
+        let clone = first.clone();
+        let second = FakeProvisioner::default();
+        let identity = first.incarnation().await?;
+        assert!(matches!(identity, ControllerHostIdentity::Persistent(_)));
+        assert_eq!(identity, clone.incarnation().await?);
+        assert_ne!(identity, second.incarnation().await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_host_identity_survives_cloning_without_affecting_milestones()
+    -> crate::TestResult {
+        let identity = ControllerHostIdentity::Launched {
+            at: Timestamp::from_unix_millis(42),
+            instance: InstanceId::try_new("i-controller")?,
+        };
+        let host = FakeProvisioner::default().with_host_identity(identity.clone());
+        let clone = host.clone();
+        assert_eq!(host.incarnation().await?, identity);
+        assert_eq!(clone.incarnation().await?, identity);
+        clone.reached(HostMilestone::Serving).await?;
+        assert_eq!(host.milestones(), vec![HostMilestone::Serving]);
+        host.retire();
+        clone.retiring().await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn converge_records_the_fleet_and_changes_nothing() -> crate::TestResult {
@@ -852,6 +937,7 @@ mod tests {
         let supply = FleetSupply {
             abandoned: 0,
             desired: 1,
+            requested: Some(1),
             warm: 0,
             instances: vec![FleetInstance {
                 id: instance.clone(),
@@ -860,6 +946,13 @@ mod tests {
                 release_first: false,
             }],
             exits: Vec::new(),
+            events: vec![InfrastructureEvent {
+                id: "event-1".to_owned(),
+                at: Timestamp::from_unix_millis(1),
+                kind: InfrastructureEventKind::CapacityUnavailable {
+                    reason: "capacity unavailable".to_owned(),
+                },
+            }],
             launch_failure: None,
         };
         fake.set_supply(&name, supply.clone());
@@ -893,6 +986,21 @@ mod tests {
                 .is_err()
         );
         assert_eq!(fake.terminations(), vec![instance]);
+        fake.fail_supply(false);
+        fake.supply(fleet, &mut actual).await?;
+        assert_eq!(actual.events, supply.events);
+        assert_eq!(actual.requested, supply.requested);
+        let unknown_name = FleetName::try_new("unknown")?;
+        let unknown = Fleet {
+            name: &unknown_name,
+            ..fleet
+        };
+        fake.supply(unknown, &mut actual).await?;
+        assert_eq!(actual, FleetSupply::default());
+        fake.supply(fleet, &mut actual).await?;
+        fake.set_supply(&unknown_name, FleetSupply::default());
+        fake.supply(unknown, &mut actual).await?;
+        assert_eq!(actual, FleetSupply::default());
         Ok(())
     }
 

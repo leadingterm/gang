@@ -19,9 +19,15 @@ pub(crate) enum NativeLinkConfigError {
     #[failure(config)]
     EndpointHost(&'static str),
     /// `worker_endpoint` was omitted and the server has not derived it from a worker listener.
-    #[error("worker_endpoint is not resolved: the server must derive it from its worker listener")]
+    #[error(
+        "worker_endpoint is required for gang worker; set worker_endpoint or --worker-endpoint"
+    )]
     #[failure(config)]
     WorkerEndpointUnresolved,
+    /// Refusal serving requires the controller's configured request deadline.
+    #[error("request_timeout requires controller settings")]
+    #[failure(config)]
+    ControllerRequestTimeoutRequired,
     /// The worker endpoint's scheme does not match whether TLS is configured.
     #[error("worker_endpoint must use {expected}")]
     #[failure(config)]
@@ -50,45 +56,6 @@ pub(crate) enum NativeLinkConfigError {
     #[error("invalid store spec: {0}")]
     #[failure(config)]
     StoreSpec(&'static str),
-    /// The cold start reserves more than any fleet accepts, so an unmeasured action could never run.
-    #[error(
-        "cold_start reserves {cpu_count} cpus, {memory_kb} KiB of memory and {disk_kb} KiB of disk, which no fleet accepts: lower [scheduler.nativelink.cold_start] or enlarge a fleet"
-    )]
-    #[failure(config)]
-    ColdStartFitsNoFleet {
-        /// The cores the cold start reserves.
-        cpu_count: u32,
-        /// The memory the cold start reserves, in KiB.
-        memory_kb: u64,
-        /// The disk the cold start reserves, in KiB.
-        disk_kb: u64,
-    },
-    /// The minimum reservation cannot fit on this fleet.
-    #[error(
-        "[scheduler.nativelink.memory] min_reservation {min_kb} KiB is above fleet `{fleet}`'s memory of {memory_kb} KiB: lower [scheduler.nativelink.memory] min_reservation or raise the fleet's memory_per_instance"
-    )]
-    #[failure(config)]
-    MinReservationAboveFleet {
-        /// The fleet that cannot fit the minimum.
-        fleet: String,
-        /// The minimum reservation, in KiB.
-        min_kb: u64,
-        /// The fleet's memory, in KiB.
-        memory_kb: u64,
-    },
-    /// The minimum disk reservation cannot fit on this fleet.
-    #[error(
-        "[scheduler.nativelink.disk] min_reservation {min_kb} KiB is above fleet `{fleet}`'s disk of {disk_kb} KiB: lower [scheduler.nativelink.disk] min_reservation or raise the fleet's disk_per_instance"
-    )]
-    #[failure(config)]
-    DiskMinReservationAboveFleet {
-        /// The fleet that cannot fit the minimum.
-        fleet: String,
-        /// The minimum reservation, in KiB.
-        min_kb: u64,
-        /// The fleet's disk limit, in KiB.
-        disk_kb: u64,
-    },
 }
 
 /// Failures of the embedded `NativeLink` controller or worker.
@@ -126,7 +93,7 @@ pub(crate) enum NativeLinkEmbedError {
     #[error("the controller refused the worker certificate")]
     CertificateRevoked(#[source] gang_tls::CertificateRevoked),
     /// `NativeLink` rejected a component it was asked to build or run.
-    #[error("nativelink {context}")]
+    #[error("scheduler {context}")]
     NativeLink {
         /// The component that failed.
         context: &'static str,
@@ -213,6 +180,7 @@ mod tests {
     fn native_wraps_the_context_and_source() -> Result<(), Box<dyn std::error::Error>> {
         let error =
             NativeLinkEmbedError::native("worker init")(make_err!(Code::Internal, "store down"));
+        assert_eq!(error.to_string(), "scheduler worker init");
         assert!(matches!(
             error,
             NativeLinkEmbedError::NativeLink {
@@ -228,7 +196,7 @@ mod tests {
     #[test]
     fn duration_errors_map_to_config() {
         let config = NativeLinkConfigError::Duration {
-            field: "scheduler.worker_timeout",
+            field: "server.worker_timeout",
             requirement: "must be a whole number of seconds, at least 1s",
         };
         assert!(matches!(PortError::from(config), PortError::Config(_)));
@@ -238,29 +206,5 @@ mod tests {
             requirement: "must be a whole number of seconds, at least 1s",
         });
         assert!(matches!(PortError::from(embed), PortError::Config(_)));
-    }
-
-    #[test]
-    fn cold_start_fitting_no_fleet_is_a_config_error() {
-        let config = NativeLinkConfigError::ColdStartFitsNoFleet {
-            cpu_count: 1,
-            memory_kb: 67_108_864,
-            disk_kb: 4_194_304,
-        };
-        assert!(matches!(PortError::from(config), PortError::Config(_)));
-    }
-
-    #[test]
-    fn minimum_above_fleet_is_a_config_error() {
-        let config = NativeLinkConfigError::MinReservationAboveFleet {
-            fleet: "fleet-a".to_owned(),
-            min_kb: 16_384,
-            memory_kb: 8_192,
-        };
-        assert_eq!(
-            config.to_string(),
-            "[scheduler.nativelink.memory] min_reservation 16384 KiB is above fleet `fleet-a`'s memory of 8192 KiB: lower [scheduler.nativelink.memory] min_reservation or raise the fleet's memory_per_instance"
-        );
-        assert!(matches!(PortError::from(config), PortError::Config(_)));
     }
 }

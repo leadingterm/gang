@@ -11,17 +11,18 @@ use gang_config::{
     AuthenticationConfig, DashboardConfig, GangConfig, IdentityConfig, PluginSet, ServerConfig,
     Transport,
 };
+use gang_nativelink::{NativeLink, NativeLinkConfig};
 use gang_server::{
-    DeviceSettings, HandshakeSettings, LeaderListeners, Listeners, LoginSettings, Parts, Provider,
-    Providers, PublicEndpoint, RequestLimits, Server, ServerError, ServerSettings, TlsSettings,
+    DeviceSettings, HandshakeSettings, Listeners, LoginSettings, Parts, Provider, Providers,
+    PublicEndpoint, RequestLimits, Server, ServerError, ServerSettings, TlsSettings,
     TransportSettings,
 };
 use gang_spi::{
-    BoxedError, ControllerHostPort, ControllerId, ControllerReady, HostMilestone, LoginClient,
-    PluginContext, PortError,
+    ControllerHostPort, ControllerId, ControllerReady, HostMilestone, LoginClient, PluginContext,
+    PortError,
 };
 use gang_types::announcement::{Announcement, ListenerRole};
-use gang_types::{Isa, NonZeroDuration, ProviderName, SchedulerSettings, Url};
+use gang_types::{Isa, NonZeroDuration, ProviderName, Url};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
@@ -30,8 +31,8 @@ use crate::errors::{MainError, Result};
 use crate::logging;
 use crate::output::Output;
 use crate::plugins::{
-    Cache, ClientAuthentication, Database, IdentityProvider, Plugins, Provisioner, Scheduler,
-    SchedulerConfig, Signer, WorkerAuthentication,
+    Cache, ClientAuthentication, Database, IdentityProvider, Plugins, Provisioner, Signer,
+    WorkerAuthentication,
 };
 /// The shutdown deadline elapsed; service managers must not restart a retiring controller. Distinct
 /// from every other exit status (2 is usage, 3 a blocked deploy), so the unit can single it out.
@@ -62,30 +63,17 @@ impl gang_server::Deployment for GangDeployment {
     type Plugins = Plugins;
     type Provisioner = Arc<Provisioner>;
     type Cache = Cache;
-    type Scheduler = Scheduler;
+    type Scheduler = NativeLink;
     type Listener = TcpListener;
-    type Binder = TcpBinder;
-}
-
-/// Binds leader-only TCP listeners using the same socket defaults as the public listener.
-struct TcpBinder;
-
-impl gang_server::Binder for TcpBinder {
-    type Listener = TcpListener;
-
-    async fn bind(&self, address: SocketAddr) -> std::result::Result<TcpListener, BoxedError> {
-        TcpListener::bind(address).await.map_err(Into::into)
-    }
 }
 
 /// Generates an identifier unique to this controller process.
 fn controller_id() -> Result<ControllerId> {
     let mut bytes = [0_u8; 16];
     getrandom::fill(&mut bytes).map_err(MainError::ControllerId)?;
-    Ok(ControllerId::new(format!(
-        "{:032x}",
-        u128::from_be_bytes(bytes)
-    )))
+    let controller = ControllerId::new(format!("{:032x}", u128::from_be_bytes(bytes)));
+    tracing::info!(%controller, "starting controller");
+    Ok(controller)
 }
 
 /// Runs `gang server` with the configuration at `config` until shutdown.
@@ -105,6 +93,10 @@ fn shutdown_exit_status(result: Result<ExitCode>) -> Result<ExitCode> {
     match result {
         Err(MainError::ShutdownTimedOut(error)) => {
             tracing::error!(%error, "shutdown deadline elapsed");
+            Ok(ExitCode::from(SHUTDOWN_DEADLINE_EXIT_CODE))
+        }
+        Err(MainError::Server(ServerError::HandoffTimedOut(error))) => {
+            tracing::error!(%error, "handoff deadline elapsed");
             Ok(ExitCode::from(SHUTDOWN_DEADLINE_EXIT_CODE))
         }
         other => other,
@@ -158,18 +150,17 @@ async fn serve_prepared(
     prepared: oneshot::Sender<()>,
 ) -> Result<ExitCode> {
     let controller = controller_id()?;
-    tracing::info!(%controller, "starting controller");
     let LoadedConfig { path, config, .. } = loaded;
     let GangConfig {
+        actions,
         poll_interval,
         client_action_timeout,
         default_isa,
         listen,
         worker_listen,
         health_listen,
-        execution_listen,
-        execution_endpoint,
         endpoint,
+        worker_endpoint,
         fleets,
         identity,
         authentication,
@@ -177,7 +168,6 @@ async fn serve_prepared(
         provisioner,
         cache,
         signer,
-        scheduler,
         database,
         dashboard,
         builds,
@@ -188,41 +178,39 @@ async fn serve_prepared(
 
     let (health, health_address) = bind_health(health_listen).await?;
 
-    let (listeners, public_address, worker_address) =
-        bind_listeners(listen, worker_listen, execution_listen).await?;
+    let (listeners, public_address, worker_address) = bind_listeners(listen, worker_listen).await?;
     let endpoint = resolve_public_endpoint(endpoint, server.transport.kind(), public_address)?;
-    let execution_endpoint = resolve_execution_endpoint(
-        execution_listen,
-        execution_endpoint,
-        server.transport.kind(),
-    )?;
     let derived_worker_endpoint = server.transport.kind().worker_url(worker_address)?;
-    let (scheduler, _) = resolve_worker_endpoint(scheduler, derived_worker_endpoint);
-    let grace = scheduler
-        .shutdown_grace()
-        .map_or(std::time::Duration::ZERO, |(_, grace)| grace);
+    let worker_endpoint = resolve_worker_endpoint(worker_endpoint, derived_worker_endpoint);
+    let grace = server.http2.shutdown_grace;
 
     let provisioner_name = provisioner.key();
     let fleet = Arc::new(Provisioner::build(provisioner, &context)?);
     let cache = Cache::build(cache, &context)?;
     let signer = Signer::build(signer, &context)?;
-    let scheduler = Scheduler::build(scheduler, &context)?;
+    let scheduler = NativeLink::try_new(NativeLinkConfig::for_controller(worker_endpoint, &server))
+        .map_err(MainError::Scheduler)?;
     let repository = Database::build(database, &context)?;
     let (clients, workers) = build_authentication(authentication, &context)?;
-    let transport = transport_settings(&server);
     let providers = identity_providers(identity, &context)?;
     let lead = server.leadership.clone();
-    let backstop = shutdown_backstop(grace, &lead, server.request_timeout.get());
+    let backstop = shutdown_backstop(
+        grace,
+        actions.history_flush_interval.get(),
+        &lead,
+        server.request_timeout.get(),
+    );
     let clock = Arc::new(SystemClock::new());
 
     let settings = server_settings(
         SettingsSource {
+            actions: Arc::new(actions),
             poll_interval,
+            handoff_timeout: backstop,
             client_action_timeout,
             default_isa,
             endpoint: endpoint.clone(),
-            execution_endpoint,
-            transport,
+            transport: transport_settings(&server),
             dashboard,
             builds,
             login,
@@ -254,8 +242,7 @@ async fn serve_prepared(
     let notes = server_announcements(
         &server,
         endpoint,
-        (public_address, worker_address, health_address),
-        execution_listen,
+        (public_address, Some(worker_address), health_address),
     );
     let args = (fleet, out, &notes[..], (&*clock, &lead, backstop));
     let _ = prepared.send(());
@@ -293,12 +280,14 @@ async fn bind_health(
 
 fn shutdown_backstop(
     grace: std::time::Duration,
+    history_flush_interval: std::time::Duration,
     leadership: &gang_config::LeadershipConfig,
     request_timeout: std::time::Duration,
 ) -> std::time::Duration {
-    // Deployment defaults: 3s release + 10s milestone + 30s request = 43s,
+    // Deployment defaults: 30s history + 3s release + 10s milestone + 30s request = 73s,
     // below the lifecycle hook's 120s margin above shutdown_grace.
     grace
+        .saturating_add(history_flush_interval)
         .saturating_add(leadership.renew_interval.get())
         .saturating_add(leadership.ttl.get())
         .saturating_add(request_timeout)
@@ -307,44 +296,25 @@ fn shutdown_backstop(
 fn server_announcements(
     server: &Server<GangDeployment>,
     endpoint: Url,
-    (public_address, worker, health): (SocketAddr, SocketAddr, Option<SocketAddr>),
-    execution_listen: Option<SocketAddr>,
+    (public_address, worker, health): (SocketAddr, Option<SocketAddr>, Option<SocketAddr>),
 ) -> Vec<Announcement> {
     let startup = match server.ca_pin() {
         Some(pin) => Announcement::CaPin(pin),
         None => Announcement::Plaintext(endpoint),
     };
-    announcements(
-        public_address,
-        execution_listen.is_none().then_some(worker),
-        health,
-        startup,
-    )
+    announcements(public_address, worker, health, startup)
 }
 
-/// Binds the public listener and, in the single-controller shape, the worker listener.
+/// Binds both listeners before the controller begins serving.
 async fn bind_listeners(
     listen: SocketAddr,
     worker_listen: SocketAddr,
-    execution_listen: Option<SocketAddr>,
-) -> Result<(Listeners<TcpBinder>, SocketAddr, SocketAddr)> {
+) -> Result<(Listeners<TcpListener>, SocketAddr, SocketAddr)> {
     let public = bind(ListenerRole::Public, listen).await?;
     let public_address = public.local_addr().map_err(MainError::LocalAddress)?;
-    let (leader, worker_address) = if let Some(execution) = execution_listen {
-        (
-            LeaderListeners::Dedicated {
-                execution,
-                worker: worker_listen,
-                binder: TcpBinder,
-            },
-            worker_listen,
-        )
-    } else {
-        let worker = bind(ListenerRole::Worker, worker_listen).await?;
-        let address = worker.local_addr().map_err(MainError::LocalAddress)?;
-        (LeaderListeners::OnPublic { worker }, address)
-    };
-    Ok((Listeners { public, leader }, public_address, worker_address))
+    let worker = bind(ListenerRole::Worker, worker_listen).await?;
+    let worker_address = worker.local_addr().map_err(MainError::LocalAddress)?;
+    Ok((Listeners { public, worker }, public_address, worker_address))
 }
 
 /// Runs `server`, printing `announcements` once the controller is ready.
@@ -370,18 +340,7 @@ async fn run_announced(
         let _ = stop.send(());
     };
     let announced = async {
-        Box::pin(announce_when_ready(readiness, out, announcements, async {
-            report_milestone(
-                fleet.as_ref(),
-                HostMilestone::Serving,
-                clock,
-                leadership.renew_interval.get(),
-                leadership.ttl.get(),
-            )
-            .await
-            .map_err(MainError::ServingMilestone)
-        }))
-        .await?;
+        Box::pin(announce_when_ready(readiness, out, announcements)).await?;
         std::future::pending::<Result<()>>().await
     };
     let work = async {
@@ -472,16 +431,18 @@ async fn shutdown_when(
 /// The configured values that `serve` builds the server settings from, besides the `[server]`
 /// section.
 struct SettingsSource {
+    /// Shared action scheduling and resource policy.
+    actions: Arc<gang_config::ActionsConfig>,
     /// How often the control loop runs a pass.
     poll_interval: NonZeroDuration,
     /// How long a client action may take before it is timed out.
     client_action_timeout: NonZeroDuration,
+    /// The shutdown backstop also bounds a voluntary handoff.
+    handoff_timeout: std::time::Duration,
     /// The interface standard the server's default isa is.
     default_isa: Isa,
     /// The endpoint clients reach the public listener at.
     endpoint: Url,
-    /// The leader execution endpoint, when it has a dedicated listener.
-    execution_endpoint: Option<Url>,
     /// How accepted connections are handled.
     transport: TransportSettings,
     /// The operator dashboard's configuration.
@@ -497,11 +458,12 @@ struct SettingsSource {
 /// Builds the server settings from the configured values and the `[server]` section.
 fn server_settings(source: SettingsSource, server: ServerConfig) -> Result<ServerSettings> {
     Ok(ServerSettings {
+        actions: source.actions,
+        proxy_protocol: Arc::new(server.proxy_protocol),
         poll_interval: source.poll_interval,
         client_action_timeout: source.client_action_timeout,
         default_isa: source.default_isa,
         endpoint: PublicEndpoint::try_new(source.endpoint)?,
-        execution_endpoint: source.execution_endpoint,
         transport: source.transport,
         roles: server.roles,
         limits: RequestLimits {
@@ -511,6 +473,8 @@ fn server_settings(source: SettingsSource, server: ServerConfig) -> Result<Serve
         rate_limit: server.rate_limit,
         principal_seen_interval: server.principal_seen_interval,
         leadership: server.leadership,
+        standby_routability_delay: server.standby_routability_delay,
+        handoff_timeout: source.handoff_timeout,
         revocation_refresh_interval: server.revocation_refresh_interval,
         max_tracked_principals: server.max_tracked_principals,
         accept_error_backoff: server.accept_error_backoff,
@@ -574,24 +538,18 @@ async fn announce_when_ready(
     readiness: oneshot::Receiver<()>,
     out: &Output,
     announcements: &[Announcement],
-    on_ready: impl Future<Output = Result<()>>,
 ) -> Result<()> {
     if readiness.await.is_ok() {
         for announcement in announcements {
             out.data(announcement.to_string())?;
         }
-        on_ready.await?;
     }
     Ok(())
 }
 
-/// Fills an omitted scheduler worker endpoint with `derived` and returns the resolved endpoint.
-fn resolve_worker_endpoint(scheduler: SchedulerConfig, derived: Url) -> (SchedulerConfig, Url) {
-    let worker_endpoint = scheduler
-        .worker_endpoint()
-        .cloned()
-        .unwrap_or_else(|| derived.clone());
-    (scheduler.with_worker_endpoint(derived), worker_endpoint)
+/// Fills an omitted worker endpoint with the address derived from the bound listener.
+fn resolve_worker_endpoint(configured: Option<Url>, derived: Url) -> Url {
+    configured.unwrap_or(derived)
 }
 
 /// Builds the client and worker authentication plugins.
@@ -651,20 +609,6 @@ fn provider(
     Ok((name, Provider::new(verifier, section)))
 }
 
-/// Resolves a dedicated execution endpoint using the same derivation as the public endpoint.
-fn resolve_execution_endpoint(
-    listen: Option<SocketAddr>,
-    endpoint: Option<Url>,
-    transport: gang_config::ServerTransport,
-) -> Result<Option<Url>> {
-    listen
-        .map(|address| match endpoint {
-            Some(url) => Ok(url),
-            None => transport.public_url(address).map_err(Into::into),
-        })
-        .transpose()
-}
-
 /// Binds the listening socket of `role` at `address`.
 async fn bind(role: ListenerRole, address: SocketAddr) -> Result<TcpListener> {
     TcpListener::bind(address)
@@ -679,7 +623,6 @@ async fn bind(role: ListenerRole, address: SocketAddr) -> Result<TcpListener> {
 #[cfg(test)]
 mod tests {
     use gang_config::ServerTransport;
-    use gang_nativelink::NativeLinkConfig;
     use gang_testkit::TestResult;
 
     use super::*;
@@ -702,6 +645,14 @@ mod tests {
     struct RetryHost(std::sync::atomic::AtomicUsize, HostMilestone);
 
     impl ControllerHostPort for RetryHost {
+        async fn incarnation(
+            &self,
+        ) -> std::result::Result<gang_spi::ControllerHostIdentity, PortError> {
+            Ok(gang_spi::ControllerHostIdentity::Persistent(
+                gang_types::InstanceId::try_new("retry-host").map_err(PortError::config)?,
+            ))
+        }
+
         async fn retiring(&self) -> std::result::Result<(), PortError> {
             std::future::pending().await
         }
@@ -714,33 +665,6 @@ mod tests {
                 Ok(())
             }
         }
-    }
-
-    #[tokio::test]
-    async fn serving_milestone_retries_a_transient_failure() -> TestResult {
-        let host = RetryHost(
-            std::sync::atomic::AtomicUsize::new(0),
-            HostMilestone::Serving,
-        );
-        let clock = gang_clock::TestClock::default();
-        let report = report_milestone(
-            &host,
-            HostMilestone::Serving,
-            &clock,
-            std::time::Duration::from_secs(1),
-            std::time::Duration::from_secs(3),
-        );
-        tokio::pin!(report);
-        let first =
-            std::future::poll_fn(|cx| std::task::Poll::Ready(report.as_mut().poll(cx))).await;
-        assert!(first.is_pending());
-        clock.advance(std::time::Duration::from_secs(1));
-        assert!(matches!(
-            std::future::poll_fn(|cx| std::task::Poll::Ready(report.as_mut().poll(cx))).await,
-            std::task::Poll::Ready(Ok(()))
-        ));
-        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 2);
-        Ok(())
     }
 
     #[tokio::test]
@@ -774,6 +698,14 @@ mod tests {
     struct RefusingHost;
 
     impl ControllerHostPort for RefusingHost {
+        async fn incarnation(
+            &self,
+        ) -> std::result::Result<gang_spi::ControllerHostIdentity, PortError> {
+            Ok(gang_spi::ControllerHostIdentity::Persistent(
+                gang_types::InstanceId::try_new("refusing-host").map_err(PortError::config)?,
+            ))
+        }
+
         async fn retiring(&self) -> std::result::Result<(), PortError> {
             std::future::pending().await
         }
@@ -805,10 +737,12 @@ mod tests {
         let work = async {
             clock.sleep(std::time::Duration::from_secs(1)).await;
             clock.sleep(grace).await;
+            clock.sleep(std::time::Duration::from_secs(61)).await;
             reported.set(true);
         };
         let deadline = shutdown_backstop(
             grace,
+            std::time::Duration::from_secs(61),
             &gang_config::LeadershipConfig::default(),
             std::time::Duration::from_secs(30),
         );
@@ -826,6 +760,18 @@ mod tests {
                 .is_pending()
         );
         clock.advance(std::time::Duration::from_secs(4));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(run.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        clock.advance(std::time::Duration::from_secs(1));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(run.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        clock.advance(std::time::Duration::from_mins(1));
         assert!(
             std::future::poll_fn(|cx| std::task::Poll::Ready(run.as_mut().poll(cx)))
                 .await
@@ -859,6 +805,7 @@ mod tests {
         let clock = gang_clock::TestClock::default();
         let bound = shutdown_backstop(
             std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(61),
             &gang_config::LeadershipConfig::default(),
             std::time::Duration::from_secs(30),
         );
@@ -882,6 +829,12 @@ mod tests {
         };
         assert_eq!(
             shutdown_exit_status(Err(MainError::ShutdownTimedOut(error)))?,
+            ExitCode::from(SHUTDOWN_DEADLINE_EXIT_CODE)
+        );
+        assert_eq!(
+            shutdown_exit_status(Err(MainError::Server(ServerError::HandoffTimedOut(
+                gang_clock::Elapsed,
+            ))))?,
             ExitCode::from(SHUTDOWN_DEADLINE_EXIT_CODE)
         );
         Ok(())
@@ -940,16 +893,11 @@ mod tests {
             ]
         );
         drop(ready);
-        let reported = std::cell::Cell::new(false);
 
-        announce_when_ready(readiness, &out, &announcements, async {
-            reported.set(true);
-            Ok(())
-        })
-        .await
-        .expect("a dropped readiness signal is not an output error");
+        announce_when_ready(readiness, &out, &announcements)
+            .await
+            .expect("a dropped readiness signal is not an output error");
         assert!(stdout.text().is_empty());
-        assert!(!reported.get());
     }
 
     /// A ready controller prints each announcement exactly once and in order.
@@ -973,21 +921,16 @@ mod tests {
             ]
         );
         ready.signal();
-        let reported = std::cell::Cell::new(false);
 
-        announce_when_ready(readiness, &out, &announcements, async {
-            reported.set(true);
-            Ok(())
-        })
-        .await
-        .expect("announcements are written");
+        announce_when_ready(readiness, &out, &announcements)
+            .await
+            .expect("announcements are written");
         let printed: Vec<Announcement> = stdout
             .text()
             .lines()
             .map(|line| line.parse().expect("each line is an announcement"))
             .collect();
         assert_eq!(printed, announcements);
-        assert!(reported.get());
     }
 
     fn bound() -> SocketAddr {
@@ -1002,30 +945,14 @@ mod tests {
         Url::parse("grpcs://workers.example.com:8443").expect("test endpoint is a valid url")
     }
 
-    /// A scheduler section with the given `worker_endpoint`, or none when it is `None`.
-    fn scheduler(worker_endpoint: Option<&str>) -> SchedulerConfig {
-        let endpoint = worker_endpoint
-            .map(|url| format!("worker_endpoint = \"{url}\"\n"))
-            .unwrap_or_default();
-        let config: NativeLinkConfig =
-            toml::from_str(&format!("{endpoint}scheduler_name = \"MAIN_SCHEDULER\"\n"))
-                .expect("the minimal scheduler section parses");
-        SchedulerConfig::Nativelink(config)
-    }
-
-    fn worker_endpoint_of(scheduler: &SchedulerConfig) -> Option<Url> {
-        scheduler.worker_endpoint().cloned()
-    }
-
     #[test]
     fn loopback_listen_derives_the_worker_endpoint_from_the_bound_address() {
         let expected = ServerTransport::Plaintext
             .worker_url(bound())
             .expect("the bound address forms a url");
-        let (scheduler, url) = resolve_worker_endpoint(scheduler(None), expected.clone());
+        let url = resolve_worker_endpoint(None, expected.clone());
         assert_eq!(url, expected);
         assert_eq!(url.as_str(), "grpc://127.0.0.1:41000/");
-        assert_eq!(worker_endpoint_of(&scheduler), Some(expected));
     }
 
     #[test]
@@ -1033,10 +960,8 @@ mod tests {
         let derived = ServerTransport::Plaintext
             .worker_url(bound())
             .expect("the bound address forms a url");
-        let (scheduler, url) =
-            resolve_worker_endpoint(scheduler(Some("grpcs://workers.example.com:8443")), derived);
+        let url = resolve_worker_endpoint(Some(workers_endpoint()), derived);
         assert_eq!(url, workers_endpoint());
-        assert_eq!(worker_endpoint_of(&scheduler), Some(workers_endpoint()));
     }
 
     #[test]
@@ -1051,51 +976,24 @@ mod tests {
     }
 
     #[test]
-    fn execution_endpoint_is_derived_or_configured_only_for_a_dedicated_listener() -> TestResult {
-        let configured = Url::parse("https://execution.example:443")?;
-        assert_eq!(
-            resolve_execution_endpoint(Some(bound()), None, ServerTransport::Plaintext)?
-                .as_ref()
-                .map(Url::as_str),
-            Some("http://127.0.0.1:41000/")
-        );
-        assert_eq!(
-            resolve_execution_endpoint(Some(bound()), None, ServerTransport::Tls)?
-                .as_ref()
-                .map(Url::as_str),
-            Some("https://127.0.0.1:41000/")
-        );
-        assert_eq!(
-            resolve_execution_endpoint(
-                Some(bound()),
-                Some(configured.clone()),
-                ServerTransport::Tls
-            )?,
-            Some(configured)
-        );
-        assert_eq!(
-            resolve_execution_endpoint(None, None, ServerTransport::Plaintext)?,
-            None
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn server_settings_preserve_leadership_and_execution_endpoint() -> TestResult {
+    fn server_settings_preserve_leadership() -> TestResult {
         let server: ServerConfig = toml::from_str(
-            "transport = 'plaintext'\nrevocation_refresh_interval = '7s'\n[leadership]\nttl = '20s'\nrenew_interval = '4s'\nclock_skew = '1s'\n",
+            "transport = 'plaintext'\nstandby_routability_delay = '10s'\nrevocation_refresh_interval = '7s'\n[leadership]\nttl = '20s'\nrenew_interval = '4s'\nclock_skew = '1s'\n",
         )?;
         let leadership = server.leadership.clone();
         let refresh = server.revocation_refresh_interval;
-        let execution_endpoint =
-            resolve_execution_endpoint(Some(bound()), None, server.transport.kind())?;
+        let actions = Arc::new(gang_config::ActionsConfig {
+            kill_grace: NonZeroDuration::from_secs(7),
+            ..gang_config::ActionsConfig::default()
+        });
         let settings = server_settings(
             SettingsSource {
+                actions: Arc::clone(&actions),
                 poll_interval: NonZeroDuration::from_secs(1),
                 client_action_timeout: NonZeroDuration::from_secs(1),
+                handoff_timeout: std::time::Duration::from_secs(47),
                 default_isa: Isa::X86_64,
                 endpoint: Url::parse("http://127.0.0.1:8080")?,
-                execution_endpoint: execution_endpoint.clone(),
                 transport: transport_settings(&server),
                 dashboard: DashboardConfig::default(),
                 builds: gang_config::BuildsConfig::default(),
@@ -1104,34 +1002,24 @@ mod tests {
             },
             server,
         )?;
-        assert_eq!(settings.execution_endpoint, execution_endpoint);
+        assert!(Arc::ptr_eq(&settings.actions, &actions));
         assert_eq!(settings.leadership, leadership);
         assert_eq!(settings.revocation_refresh_interval, refresh);
+        assert_eq!(
+            settings.standby_routability_delay,
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(settings.handoff_timeout, std::time::Duration::from_secs(47));
         Ok(())
     }
 
     #[tokio::test]
     async fn public_and_worker_listeners_report_os_chosen_ports() -> TestResult {
         let address = SocketAddr::from(([127, 0, 0, 1], 0));
-        let public = bind(ListenerRole::Public, address).await?;
-        let worker = bind(ListenerRole::Worker, address).await?;
-        let public_address = public.local_addr()?;
-        let worker_address = worker.local_addr()?;
+        let (_listeners, public_address, worker_address) = bind_listeners(address, address).await?;
         assert_ne!(public_address.port(), 0);
         assert_ne!(worker_address.port(), 0);
         assert_ne!(public_address, worker_address);
         Ok(())
-    }
-
-    #[test]
-    fn dedicated_listeners_are_not_announced_before_binding() {
-        let startup = Announcement::CaPin(gang_types::CaPin::new([7; 32]));
-        assert_eq!(
-            announcements(bound(), None, None, startup.clone()),
-            vec![
-                Announcement::Listening(ListenerRole::Public, bound()),
-                startup
-            ]
-        );
     }
 }

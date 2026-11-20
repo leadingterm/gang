@@ -1,6 +1,7 @@
 //! The `gang.toml` template of a run: the base configuration, adapted to one placement, one
 //! variant, and one transport. Every key a scenario does not name is carried over unchanged.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -13,13 +14,11 @@ use gang_config::{
 use gang_local::LoopbackAddr;
 use gang_main::plugins::{
     CacheConfig, ClientAuthenticationConfig, DatabaseConfig, IdentityProviderConfig, LimitsConfig,
-    Plugins, ProvisionerConfig, SandboxKey, SchedulerConfig, SignerConfig,
-    WorkerAuthenticationConfig,
+    Plugins, ProvisionerConfig, SandboxKey, SignerConfig, WorkerAuthenticationConfig,
 };
 use gang_types::{
-    AbsolutePathBuf, Bytes, CaPin, ClientSecret, DeviceCodeTtl, HeadroomPercent, Isa, NonZeroBytes,
-    NonZeroDuration, Percent, Permission, PermissionSet, ProviderName, SchedulerSettings,
-    SessionMaxAge, TokenTtl, Url,
+    AbsolutePathBuf, Bytes, CaPin, ClientSecret, DeviceCodeTtl, Isa, NonZeroBytes, NonZeroDuration,
+    Percent, Permission, PermissionSet, ProviderName, SessionMaxAge, TokenTtl, Url,
 };
 
 use crate::access::{IdentityKnobs, Sessions, SignIn, StandingWorker};
@@ -44,8 +43,8 @@ use crate::server::{
 };
 use crate::settings::ActionTools;
 use crate::system::{
-    ActionLimits, FleetLayout, LARGE_FLEET, LIMIT_CPU_PERIOD_MICROS, LIMIT_HEADROOM_PERCENT,
-    LIMIT_MAX_PIDS, NOOP_FLEET, PermitNetwork, SMALL_FLEET, Sandbox, SoftMemory, Variant,
+    ActionLimits, FleetLayout, LARGE_FLEET, LIMIT_CPU_PERIOD_MICROS, LIMIT_MAX_PIDS, NOOP_FLEET,
+    PermitNetwork, SMALL_FLEET, Sandbox, SoftMemory, Variant,
 };
 
 /// The paths inside the sandbox at which the worker image binds its action tools
@@ -89,8 +88,34 @@ fn bind_roots(tools: &ActionTools) -> Result<Vec<PathBuf>> {
     Ok(roots)
 }
 
-/// Three unreserved cold lifecycle actions must fit one 8 GiB worker instead of scaling to two.
-const COLD_START_MEMORY: &str = "2GiB";
+fn action_tool_mounts(tools: &ActionTools) -> Result<BTreeMap<AbsolutePathBuf, AbsolutePathBuf>> {
+    let tools_directory = absolute(tools.action_bin.clone(), "the action tools directory")?;
+    let mut mounts = ACTION_TOOL_PATHS
+        .iter()
+        .copied()
+        .map(|path| {
+            absolute(PathBuf::from(path), "an action tool path")
+                .map(|path| (path, tools_directory.clone()))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    if let Some(bundle) = &tools.ca_bundle {
+        let source = absolute(bundle.clone(), "the public CA bundle")?;
+        for path in [
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/ssl/cert.pem",
+            "/etc/pki/tls/certs/ca-bundle.crt",
+        ] {
+            mounts.insert(
+                absolute(PathBuf::from(path), "a system CA bundle path")?,
+                source.clone(),
+            );
+        }
+    }
+    Ok(mounts)
+}
+
+/// Four unreserved cold actions fit one 6 GiB worker instead of scaling out.
+const COLD_START_MEMORY: &str = "1536MiB";
 
 /// Three unreserved cold lifecycle actions must fit one worker's [`FLEET_DISK`] too.
 const COLD_START_DISK: &str = "2GiB";
@@ -152,14 +177,16 @@ pub(crate) fn place(
     document.listen = SocketAddr::from((Ipv4Addr::LOCALHOST, placement.public_port()));
     document.worker_listen = SocketAddr::from((Ipv4Addr::LOCALHOST, placement.worker_port()));
     document.endpoint = None;
-    document.scheduler.set_worker_endpoint(None);
-    let SchedulerConfig::Nativelink(scheduler) = &mut document.scheduler;
-    scheduler.cold_start.memory = COLD_START_MEMORY.parse().map_err(template_error)?;
-    scheduler.cold_start.disk = COLD_START_DISK.parse().map_err(template_error)?;
+    document.worker_endpoint = None;
+    document.actions.cold_start.memory = COLD_START_MEMORY.parse().map_err(template_error)?;
+    document.actions.cold_start.disk = COLD_START_DISK.parse().map_err(template_error)?;
     if let ProvisionerConfig::Local(local) = &mut document.provisioner {
         let disk = FLEET_DISK.parse::<NonZeroBytes>().map_err(template_error)?;
+        document.actions.memory.reserve = NonZeroBytes::mib(32);
+        let memory = NonZeroBytes::gib(6);
         for fleet in &mut document.fleets {
             fleet.disk_per_instance = disk;
+            fleet.memory_per_instance = memory;
         }
         let old = format!("http://{}", local.mock_imds_listen.get());
         local.state_dir = absolute(placement.state_dir(), "the placement's state directory")?;
@@ -226,6 +253,35 @@ fn absolute(path: PathBuf, what: &'static str) -> Result<AbsolutePathBuf> {
 #[derive(Debug)]
 pub struct ConfigTemplate {
     document: Document<Plugins>,
+}
+
+fn render_resource_policy(
+    document: &mut Document<Plugins>,
+    policy: &crate::execution::ResourcePolicy,
+) {
+    document.actions.memory = policy.memory;
+    document.actions.reservation_headroom_percent = policy.reservation_headroom_percent;
+    document.actions.max_job_retries = policy.max_job_retries;
+    if let Some(memory) = policy.fleet_memory {
+        if document.actions.cold_start.memory.get().get() > memory.as_u64() {
+            document.actions.cold_start.memory =
+                gang_config::WholeKib::from_units(policy.memory.min_reservation.as_units());
+        }
+        for fleet in &mut document.fleets {
+            fleet.memory_per_instance = memory;
+        }
+    }
+    if let Some(vcpus) = policy.fleet_vcpus {
+        for fleet in &mut document.fleets {
+            fleet.vcpus_per_instance = vcpus;
+            fleet.target_actions_per_instance = fleet
+                .target_actions_per_instance
+                .max(NonZeroU32::MIN.saturating_add(1));
+        }
+    }
+    if let Some(cold_start) = policy.cold_start {
+        document.actions.cold_start = cold_start;
+    }
 }
 
 impl ConfigTemplate {
@@ -327,16 +383,7 @@ impl ConfigTemplate {
                     .into_iter()
                     .map(|root| absolute(root, "the action tool bind root"))
                     .collect::<Result<_>>()?;
-                let tools_directory =
-                    absolute(tools.action_bin.clone(), "the action tools directory")?;
-                bwrap.readonly_bind_mounts = ACTION_TOOL_PATHS
-                    .iter()
-                    .copied()
-                    .map(|path| {
-                        absolute(PathBuf::from(path), "an action tool path")
-                            .map(|path| (path, tools_directory.clone()))
-                    })
-                    .collect::<Result<_>>()?;
+                bwrap.readonly_bind_mounts = action_tool_mounts(tools)?;
                 bwrap.permit_network_property = variant.permit_network == PermitNetwork::Permitted;
             }
             Sandbox::Noop => {
@@ -362,9 +409,6 @@ impl ConfigTemplate {
             ActionLimits::Cgroup => {
                 let config = gang_cgroup::CgroupConfig {
                     delegation: gang_cgroup::Delegation::Trusted,
-                    memory_headroom_percent: HeadroomPercent::from_percent(
-                        u16::try_from(LIMIT_HEADROOM_PERCENT).map_err(template_error)?,
-                    ),
                     max_pids: NonZeroU32::new(LIMIT_MAX_PIDS)
                         .ok_or_else(|| template_error("max pids must be nonzero"))?,
                     cpu_period: gang_cgroup::CpuPeriod::try_new(Duration::from_micros(
@@ -377,24 +421,37 @@ impl ConfigTemplate {
                 let ProvisionerConfig::Local(local) = &mut document.provisioner else {
                     return Err(template_error("missing [provisioner.local]"));
                 };
-                local.worker_launcher = worker_launcher
-                    .to_vec()
-                    .try_into()
-                    .map_err(template_error)?;
+                let mut launcher = worker_launcher.to_vec();
+                if let Some(policy) = &variant.execution.resource_policy
+                    && let Some(bound) = policy.worker_memory_max
+                {
+                    let separator =
+                        launcher
+                            .iter()
+                            .position(|word| word == "--")
+                            .ok_or_else(|| {
+                                template_error("worker launcher must contain -- for MemoryMax")
+                            })?;
+                    launcher.insert(separator, format!("--property=MemoryMax={}", bound.get()));
+                }
+                local.worker_launcher = launcher.try_into().map_err(template_error)?;
             }
         }
-        let SchedulerConfig::Nativelink(scheduler) = &mut document.scheduler;
-        if variant.soft_memory == SoftMemory::Off {
-            scheduler.memory.enforcement = gang_nativelink::MemoryEnforcement::None;
+        if variant.soft_memory == SoftMemory::Enforced {
+            document.actions.memory.enforcement = gang_config::MemoryEnforcement::Soft;
         }
         if variant.soft_disk {
-            scheduler.disk.enforcement = gang_nativelink::DiskEnforcement::Soft;
+            document.actions.disk.enforcement = gang_config::DiskEnforcement::Soft;
             // Keep the disk-hog probe's 4 MiB reservation below its 64 MiB output.
-            scheduler.disk.min_reservation = gang_nativelink::DiskMinReservation::from_units(1024);
+            document.actions.disk.min_reservation =
+                gang_config::DiskMinReservation::from_units(1024);
         }
         render_control(document, &variant.control)?;
         render_server(document, variant.server)?;
         render_execution(document, variant.execution)?;
+        if let Some(policy) = &variant.execution.resource_policy {
+            render_resource_policy(document, policy);
+        }
         constrain_shutdown_grace(document);
         Ok(self)
     }
@@ -582,19 +639,20 @@ fn placement_fleets(fleets: &mut Vec<RawFleet<SandboxKey>>) -> Result<()> {
 
 /// Applies execution scenario tuning.
 fn render_execution(document: &mut Document<Plugins>, knobs: ExecutionKnobs) -> Result<()> {
-    let SchedulerConfig::Nativelink(scheduler) = &mut document.scheduler;
     if knobs.action_timeout == ActionTimeout::Short {
-        scheduler.worker.action_timeout = Duration::from_secs(u64::from(SHORT_ACTION_TIMEOUT_SECS))
+        document.actions.timeout = Duration::from_secs(u64::from(SHORT_ACTION_TIMEOUT_SECS))
             .try_into()
             .map_err(template_error)?;
     }
     if knobs.memory_escalation == MemoryEscalation::OneStep {
-        scheduler.memory.escalation_max_steps = ESCALATION_MAX_STEPS;
-        scheduler.memory.escalation_percent =
+        document.actions.memory.max_steps = NonZeroU32::new(ESCALATION_MAX_STEPS)
+            .ok_or_else(|| template_error("escalation steps must be nonzero"))?;
+        document.actions.memory.escalation_percent =
             ESCALATION_PERCENT.try_into().map_err(template_error)?;
     }
     if knobs.cold_start == ColdStart::Misfit {
-        scheduler.cold_start.memory = MISFIT_COLD_START_MEMORY.parse().map_err(template_error)?;
+        document.actions.cold_start.memory =
+            MISFIT_COLD_START_MEMORY.parse().map_err(template_error)?;
     }
     if knobs.fleet_disk == FleetDisk::Oversized {
         document
@@ -701,8 +759,7 @@ fn render_control(document: &mut Document<Plugins>, knobs: &ControlKnobs) -> Res
             NonZeroDuration::try_new(timeout).map_err(template_error)?;
     }
     if let Some(max) = knobs.max_concurrent_streams {
-        let SchedulerConfig::Nativelink(scheduler) = &mut document.scheduler;
-        scheduler.http2.max_concurrent_streams = NonZeroU32::new(max)
+        document.server.http2.max_concurrent_streams = NonZeroU32::new(max)
             .ok_or_else(|| template_error("max concurrent streams must be nonzero"))?;
     }
     if knobs.broken_launcher {
@@ -719,6 +776,9 @@ fn render_control(document: &mut Document<Plugins>, knobs: &ControlKnobs) -> Res
         }
         if let Some(timeout) = knobs.idle_timeout {
             fleet.idle_timeout = timeout;
+        }
+        if let Some(wait) = knobs.max_drain_wait {
+            fleet.max_drain_wait = wait;
         }
         if let Some(min) = knobs.min_instances {
             fleet.min_instances = min;
@@ -768,11 +828,10 @@ fn render_control(document: &mut Document<Plugins>, knobs: &ControlKnobs) -> Res
 /// Keeps scheduler drain below every fleet's boot grace. When it does not fit, use half the
 /// smallest boot grace; otherwise preserve the configured drain bound.
 fn constrain_shutdown_grace(document: &mut Document<Plugins>) {
-    if let Some(boot_grace) = document.fleets.iter().map(|fleet| fleet.boot_grace).min() {
-        let SchedulerConfig::Nativelink(scheduler) = &mut document.scheduler;
-        if scheduler.http2.shutdown_grace >= boot_grace {
-            scheduler.http2.shutdown_grace = boot_grace / 2;
-        }
+    if let Some(boot_grace) = document.fleets.iter().map(|fleet| fleet.boot_grace).min()
+        && document.server.http2.shutdown_grace >= boot_grace
+    {
+        document.server.http2.shutdown_grace = boot_grace / 2;
     }
 }
 

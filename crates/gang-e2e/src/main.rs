@@ -15,8 +15,8 @@ use std::str::FromStr;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 use gang_e2e::{
-    ActionTools, DeploymentInputs, Gate, Invocation, Scenario, Settings, anchored, run,
-    unknown_scenarios,
+    ActionTools, DeploymentInputs, Gate, Invocation, ReleaseInput, Scenario, Settings,
+    UpgradeInputs, UpgradeProcedure, anchored, run, unknown_scenarios,
 };
 
 /// Relative to the workspace: the base `gang.toml` the variants are applied to.
@@ -44,6 +44,32 @@ struct Cli {
     /// The pinned `PostgreSQL` archive. Defaults to the one Bazel provides.
     #[arg(long, value_name = "PATH")]
     postgres: Option<PathBuf>,
+
+    /// Previous release executable.
+    #[arg(long, value_name = "PATH")]
+    previous_gang: Option<PathBuf>,
+    /// Previous release deployment fixture.
+    #[arg(long, value_name = "PATH")]
+    previous_fixture: Option<PathBuf>,
+    /// Historical release executable for the negative control.
+    #[arg(long, value_name = "PATH")]
+    historical_gang: Option<PathBuf>,
+    /// Historical release deployment fixture.
+    #[arg(long, value_name = "PATH")]
+    historical_fixture: Option<PathBuf>,
+    /// Fixed candidate release executable for the negative control.
+    #[arg(long, value_name = "PATH")]
+    calibration_gang: Option<PathBuf>,
+    /// Fixed candidate release deployment fixture.
+    #[arg(long, value_name = "PATH")]
+    calibration_fixture: Option<PathBuf>,
+    /// Candidate deployment fixture.
+    #[arg(long, value_name = "PATH")]
+    candidate_fixture: Option<PathBuf>,
+
+    /// Upgrade procedure; overrides settings (default: pre-stop).
+    #[arg(long, value_enum)]
+    upgrade_procedure: Option<UpgradeProcedure>,
 
     /// The gate to run: `1` or `one`, or `2` or `two`, which includes the earlier gate.
     #[arg(long, value_name = "GATE", default_value = "1")]
@@ -94,6 +120,12 @@ impl Cli {
         let directory = invocation_directory()?;
         let current = env::current_dir()
             .map_err(|error| format!("cannot read the current directory: {error}"))?;
+        let upgrade = self.resolve_upgrade(&scenarios, &directory, &current)?;
+        let mut settings = match &self.settings {
+            Some(path) => read_settings(&anchored(path, &directory))?,
+            None => Settings::default(),
+        };
+        self.apply_settings_overrides(&mut settings);
         let gang = resolve_binary(self.gang, &directory, &current, "GANG_E2E_GANG", "--gang")?;
         let bazel = resolve_binary(
             self.bazel,
@@ -129,13 +161,6 @@ impl Cli {
             DEFAULT_CONFIGS,
             "--configs",
         )?;
-        let mut settings = match &self.settings {
-            Some(path) => read_settings(&anchored(path, &directory))?,
-            None => Settings::default(),
-        };
-        if let Some(parallel) = self.parallel {
-            settings.parallel_scenarios = parallel;
-        }
         let action_tools = ActionTools {
             shell: settings
                 .shell
@@ -152,6 +177,8 @@ impl Cli {
                 .clone()
                 .or_else(|| env::var_os("GANG_E2E_ACTION_BIN").map(PathBuf::from))
                 .ok_or_else(|| "the sample's action tools directory is unset: run the harness inside `nix develop`, or set `action_bin` in the settings".to_owned())?,
+            ca_bundle: settings.ca_bundle.clone()
+                .or_else(|| env::var_os("GANG_E2E_CA_BUNDLE").map(PathBuf::from)),
             bwrap: settings
                 .bwrap
                 .clone()
@@ -172,10 +199,86 @@ impl Cli {
                 configs,
                 settings,
                 action_tools,
+                upgrade,
             },
             scenarios,
         };
         Ok((self.gate, invocation))
+    }
+
+    fn apply_settings_overrides(&self, settings: &mut Settings) {
+        if let Some(parallel) = self.parallel {
+            settings.parallel_scenarios = parallel;
+        }
+        if let Some(procedure) = self.upgrade_procedure {
+            settings.upgrade_procedure = procedure;
+        }
+    }
+
+    fn resolve_upgrade(
+        &self,
+        scenarios: &[Scenario],
+        directory: &Path,
+        current: &Path,
+    ) -> Result<Option<UpgradeInputs>, String> {
+        if !cfg!(target_os = "linux")
+            || !scenarios.iter().any(|scenario| {
+                matches!(
+                    scenario,
+                    Scenario::RollingUpgrade
+                        | Scenario::ConfigRefetchRestart
+                        | Scenario::UpgradeNegativeControl
+                )
+            })
+        {
+            return Ok(None);
+        }
+        let resolve = |path: &Option<PathBuf>, variable, flag| {
+            resolve_binary(path.clone(), directory, current, variable, flag)
+        };
+        Ok(Some(UpgradeInputs {
+            previous: ReleaseInput {
+                binary: resolve(
+                    &self.previous_gang,
+                    "GANG_E2E_PREVIOUS_GANG",
+                    "--previous-gang",
+                )?,
+                fixture: resolve(
+                    &self.previous_fixture,
+                    "GANG_E2E_PREVIOUS_FIXTURE",
+                    "--previous-fixture",
+                )?,
+            },
+            historical: ReleaseInput {
+                binary: resolve(
+                    &self.historical_gang,
+                    "GANG_E2E_HISTORICAL_GANG",
+                    "--historical-gang",
+                )?,
+                fixture: resolve(
+                    &self.historical_fixture,
+                    "GANG_E2E_HISTORICAL_FIXTURE",
+                    "--historical-fixture",
+                )?,
+            },
+            calibration: ReleaseInput {
+                binary: resolve(
+                    &self.calibration_gang,
+                    "GANG_E2E_CALIBRATION_GANG",
+                    "--calibration-gang",
+                )?,
+                fixture: resolve(
+                    &self.calibration_fixture,
+                    "GANG_E2E_CALIBRATION_FIXTURE",
+                    "--calibration-fixture",
+                )?,
+            },
+            candidate_fixture: resolve(
+                &self.candidate_fixture,
+                "GANG_E2E_CANDIDATE_FIXTURE",
+                "--candidate-fixture",
+            )?,
+        }))
     }
 
     fn selected_scenarios(&self) -> Result<Vec<Scenario>, String> {
@@ -250,6 +353,12 @@ fn partition(scenarios: &[Scenario], shard: Shard) -> Vec<Scenario> {
 fn main() -> ExitCode {
     // `gang login --token-command` re-executes this binary to print a workload proof.
     let arguments: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if arguments
+        .get(1)
+        .is_some_and(|argument| argument == "--gang-e2e-action-environment-probe")
+    {
+        return gang_e2e::action_environment_probe(&arguments[2..]);
+    }
     if arguments
         .get(1)
         .is_some_and(|argument| argument == "--gang-e2e-launch-gate")
@@ -376,11 +485,100 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
 
-    use super::{Gate, Shard, non_empty_path, partition};
+    use clap::Parser;
+    use gang_e2e::{Scenario, Settings, UpgradeProcedure};
+
+    use super::{Cli, Gate, Shard, non_empty_path, partition};
+
+    #[test]
+    fn upgrade_procedure_cli_overrides_settings_only_when_present() {
+        let plain = Cli::try_parse_from(["local"]).expect("default CLI");
+        let mut settings: Settings =
+            toml::from_str("upgrade_procedure = 'instance-refresh'").expect("settings");
+        plain.apply_settings_overrides(&mut settings);
+        assert_eq!(
+            settings.upgrade_procedure,
+            UpgradeProcedure::InstanceRefresh
+        );
+
+        let cli = Cli::try_parse_from(["local", "--upgrade-procedure", "pre-stop"])
+            .expect("pre-stop CLI");
+        cli.apply_settings_overrides(&mut settings);
+        assert_eq!(settings.upgrade_procedure, UpgradeProcedure::PreStop);
+
+        let cli = Cli::try_parse_from(["local", "--upgrade-procedure", "instance-refresh"])
+            .expect("instance-refresh CLI");
+        cli.apply_settings_overrides(&mut settings);
+        assert_eq!(
+            settings.upgrade_procedure,
+            UpgradeProcedure::InstanceRefresh
+        );
+        assert!(Cli::try_parse_from(["local", "--upgrade-procedure", "invalid"]).is_err());
+    }
+
+    #[test]
+    fn upgrade_selection_and_release_flags_are_explicit() {
+        let cli = Cli::try_parse_from([
+            "local",
+            "--gate",
+            "2",
+            "--scenario",
+            "config-refetch-restart",
+            "--previous-gang",
+            "previous",
+            "--previous-fixture",
+            "previous.json",
+            "--historical-gang",
+            "historical",
+            "--historical-fixture",
+            "historical.json",
+            "--calibration-gang",
+            "calibration",
+            "--calibration-fixture",
+            "calibration.json",
+            "--candidate-fixture",
+            "candidate.json",
+        ])
+        .expect("upgrade arguments parse");
+        assert_eq!(
+            cli.selected_scenarios().unwrap(),
+            vec![Scenario::ConfigRefetchRestart]
+        );
+        assert_eq!(cli.previous_gang, Some(PathBuf::from("previous")));
+        assert_eq!(cli.previous_fixture, Some(PathBuf::from("previous.json")));
+        assert_eq!(cli.historical_gang, Some(PathBuf::from("historical")));
+        assert_eq!(
+            cli.historical_fixture,
+            Some(PathBuf::from("historical.json"))
+        );
+        assert_eq!(cli.calibration_gang, Some(PathBuf::from("calibration")));
+        assert_eq!(
+            cli.calibration_fixture,
+            Some(PathBuf::from("calibration.json"))
+        );
+        assert_eq!(cli.candidate_fixture, Some(PathBuf::from("candidate.json")));
+        let selected = [
+            Scenario::RollingUpgrade,
+            Scenario::ConfigRefetchRestart,
+            Scenario::UpgradeNegativeControl,
+        ];
+        let shards: Vec<_> = (1..=2)
+            .map(|index| partition(&selected, format!("{index}/2").parse().unwrap()))
+            .collect();
+        for scenario in selected {
+            assert_eq!(
+                shards
+                    .iter()
+                    .filter(|shard| shard.contains(&scenario))
+                    .count(),
+                1
+            );
+        }
+    }
 
     #[test]
     fn shards_are_valid_deterministic_and_cover_the_selection() {
-        for invalid in ["", "0/1", "2/1", "1/0", "1", "1/2/3", "-1/2"] {
+        for invalid in ["", "0/1", "2/1", "1/0", "0/0", "1", "1/2/3", "-1/2"] {
             assert!(invalid.parse::<Shard>().is_err(), "{invalid}");
         }
         for selected in [
@@ -388,10 +586,12 @@ mod tests {
             Gate::Two.scenarios().collect(),
             Gate::Two.additions().collect(),
         ] {
-            for count in [1, 2] {
+            for count in [1, 2, 8] {
                 let shards: Vec<_> = (1..=count)
                     .map(|index| partition(&selected, format!("{index}/{count}").parse().unwrap()))
                     .collect();
+                assert!(shards.iter().all(|shard| !shard.is_empty()));
+                assert_eq!(shards.iter().map(Vec::len).sum::<usize>(), selected.len());
                 for scenario in &selected {
                     assert_eq!(
                         shards
@@ -402,6 +602,13 @@ mod tests {
                     );
                 }
                 for (index, shard) in shards.iter().enumerate() {
+                    assert!(shard.iter().all(|scenario| selected.contains(scenario)));
+                    let execution_order: Vec<_> = selected
+                        .iter()
+                        .copied()
+                        .filter(|scenario| shard.contains(scenario))
+                        .collect();
+                    assert_eq!(*shard, execution_order);
                     assert_eq!(
                         *shard,
                         partition(&selected, format!("{}/{count}", index + 1).parse().unwrap())
@@ -412,7 +619,112 @@ mod tests {
     }
 
     #[test]
-    fn gate_two_shards_fit_the_measured_budget() {
+    fn ci_gate_selections_retain_the_complete_suite_exactly_once() {
+        use std::collections::BTreeSet;
+
+        use gang_e2e::Scenario;
+
+        let complete: BTreeSet<_> = Scenario::ALL.into_iter().collect();
+        let matrices: [(Gate, &[&str]); 2] = [
+            (Gate::One, &["local", "--gate", "1"]),
+            (Gate::Two, &["local", "--gate", "2", "--additions"]),
+        ];
+        let mut matrix_selections = Vec::new();
+        for (gate, arguments) in matrices {
+            let expected: BTreeSet<_> = Scenario::ALL
+                .into_iter()
+                .filter(|scenario| scenario.gate() == gate)
+                .collect();
+            let selected: Vec<_> = (1..=8)
+                .flat_map(|index| {
+                    let shard = format!("{index}/8");
+                    Cli::try_parse_from(
+                        arguments.iter().copied().chain(["--shard", shard.as_str()]),
+                    )
+                    .unwrap()
+                    .selected_scenarios()
+                    .unwrap()
+                })
+                .collect();
+            let unique: BTreeSet<_> = selected.iter().copied().collect();
+            assert_eq!(
+                selected.len(),
+                unique.len(),
+                "{gate:?} matrix repeats a scenario"
+            );
+            assert_eq!(unique, expected, "{gate:?} matrix coverage");
+            matrix_selections.push(unique);
+        }
+        assert!(matrix_selections[0].is_disjoint(&matrix_selections[1]));
+        assert_eq!(
+            matrix_selections
+                .into_iter()
+                .flatten()
+                .collect::<BTreeSet<_>>(),
+            complete
+        );
+        let all: Vec<_> = Gate::Two.scenarios().collect();
+        assert_eq!(all.len(), complete.len());
+        assert_eq!(all.into_iter().collect::<BTreeSet<_>>(), complete);
+    }
+
+    #[test]
+    fn excess_shards_are_empty_and_rejected_at_selection() {
+        for selected in [
+            Gate::One.scenarios().collect::<Vec<_>>(),
+            Gate::Two.additions().collect(),
+        ] {
+            let count = selected.len() + 1;
+            let populated: Vec<_> = (1..count)
+                .flat_map(|index| {
+                    partition(
+                        &selected,
+                        Shard {
+                            index: index - 1,
+                            count,
+                        },
+                    )
+                })
+                .collect();
+            assert_eq!(populated.len(), selected.len());
+            for scenario in &selected {
+                assert_eq!(populated.iter().filter(|item| *item == scenario).count(), 1);
+            }
+            let empty = Shard {
+                index: count - 1,
+                count,
+            };
+            assert!(partition(&selected, empty).is_empty());
+        }
+        let populated = Cli::try_parse_from([
+            "local",
+            "--gate",
+            "1",
+            "--scenario",
+            "lifecycle",
+            "--shard",
+            "1/2",
+        ])
+        .unwrap();
+        assert_eq!(populated.selected_scenarios().unwrap().len(), 1);
+        let empty = Cli::try_parse_from([
+            "local",
+            "--gate",
+            "1",
+            "--scenario",
+            "lifecycle",
+            "--shard",
+            "2/2",
+        ])
+        .unwrap();
+        assert_eq!(
+            empty.selected_scenarios().unwrap_err(),
+            "the selected shard has no scenarios"
+        );
+    }
+
+    #[test]
+    fn gate_two_ci_shards_fit_the_weighted_launcher_budget() {
         let path = std::env::var_os("GANG_E2E_GATE_SCRIPT")
             .map_or_else(|| PathBuf::from("../../tools/e2e-gate.sh"), PathBuf::from);
         let script = std::fs::read_to_string(path).expect("gate script is available");
@@ -423,8 +735,8 @@ mod tests {
             .parse()
             .expect("numeric budget");
         let selected: Vec<_> = Gate::Two.additions().collect();
-        for index in 1..=2 {
-            let shard = partition(&selected, format!("{index}/2").parse().unwrap());
+        for index in 1..=8 {
+            let shard = partition(&selected, format!("{index}/8").parse().unwrap());
             // run_bounded starts scenarios in selected order on the next available slot.
             let mut slots = vec![0_u64; gang_e2e::Settings::default().parallel_scenarios.get()];
             for scenario in shard {

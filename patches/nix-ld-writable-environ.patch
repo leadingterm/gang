@@ -1,24 +1,34 @@
-The default LD_LIBRARY_PATH trampoline restores a read-only environment string,
-which causes programs that modify their environment, such as gawk, to abort.
+Preserve the exact writable environment across loader handoff. Restoring an
+absent LD_LIBRARY_PATH as an empty string both adds an undeclared variable and,
+with upstream's read-only literal, causes environment-writing programs to fault.
 
-Upstream issue/PR draft (not filed): Default LD_LIBRARY_PATH trampoline restores
-a read-only environment string (gawk aborts). Remove this patch when pinned
-upstream supplies a writable replacement environment string.
+The temporary entry is appended: restore its null terminator instead. Existing
+entries retain their original writable strings. No allocation or stack copying
+is added, and loader-time library-profile lookup is unchanged.
+
+Upstream issue/PR draft (not filed): Preserve the exact writable environment
+across loader handoff. Remove when pinned upstream includes both fixes.
 
 diff --git a/src/main.rs b/src/main.rs
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -42,3 +42,4 @@
+@@ -42,3 +42,2 @@
  const DEFAULT_NIX_LD_LIBRARY_PATH: &[u8] = b"/run/current-system/sw/share/nix-ld/lib";
 -const EMPTY_LD_LIBRARY_PATH_ENV: &CStr = c"LD_LIBRARY_PATH=";
-+// execve environment strings must be writable by the program.
-+static mut EMPTY_LD_LIBRARY_PATH_ENV: [u8; 17] = *b"LD_LIBRARY_PATH=\0";
  
-@@ -173,7 +174,7 @@
+@@ -167,13 +166,9 @@
+-        // If the entry trampoline is available on the platform, LD_LIBRARY_PATH
+-        // will be replaced with an empty LD_LIBRARY_PATH when ld.so launches
+-        // the actual program.
+-        //
+-        // We cannot replace it with NIX_LD_LIBRARY_PATH as it would take
+-        // precedence over config files.
++        // The temporary variable was appended to the environment vector.
++        // Restore its terminating null instead of exposing a new variable.
          EnvEdit {
              entry: ptr::null(),
 -            old_string: EMPTY_LD_LIBRARY_PATH_ENV.as_ptr().cast(),
-+            old_string: (&raw mut EMPTY_LD_LIBRARY_PATH_ENV).cast_const().cast(),
++            old_string: ptr::null(),
          }
      };
  

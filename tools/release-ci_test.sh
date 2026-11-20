@@ -11,10 +11,61 @@ yq -er '.jobs.publish.steps[] | select(.name == "Select available CI binaries") 
 [[ $(yq -er '.jobs.publish.steps[] | select(.id == "binaries") | .env.RUN_ID' "$script_dir/../.github/workflows/release.yml") == "\${{ needs.locate.outputs.run-id }}" ]]
 [[ $(yq -er '.jobs.publish.steps[] | select(.with["artifact-ids"]) | .with["artifact-ids"]' "$script_dir/../.github/workflows/release.yml") == "\${{ steps.binaries.outputs.artifact-ids }}" ]]
 [[ $(yq -er '.jobs.publish.steps[] | select(.with["artifact-ids"]) | .with["run-id"]' "$script_dir/../.github/workflows/release.yml") == "\${{ needs.locate.outputs.run-id }}" ]]
+workflow="$script_dir/../.github/workflows/release.yml"
+yq -o=json '.jobs' "$workflow" | jq -e '
+  . as $jobs
+  | ($jobs.publish.needs == ["locate", "images", "amis"])
+    and ($jobs.amiscopies.needs == ["locate", "amis"])
+    and ($jobs.amiscopies["if"] == "${{ github.event_name == '\''push'\'' }}")
+    and ($jobs.amiscopies["runs-on"] == "ubuntu-24.04-arm")
+    and ($jobs.amiscopies["timeout-minutes"] == 180)
+    and ($jobs.amiscopies.permissions == {"contents":"read", "actions":"read", "id-token":"write"})
+    and ([$jobs.amiscopies.steps[] | select((.uses // "") | startswith("actions/checkout@")) | .with["persist-credentials"]] == [false])
+    and ([$jobs.amiscopies.steps[] | select(.uses == "./.github/actions/setup-nix") | .with["cache-save"] // "false"] == ["false"])
+    and ([$jobs.amiscopies.steps[] | select((.uses // "") | startswith("actions/download-artifact@")) | .with | [.name, .["run-id"]]] == [["gang-aarch64-unknown-linux-musl", "${{ needs.locate.outputs.run-id }}"]])
+    and ([$jobs.amiscopies.steps[] | select(.run == "chmod +x staged/gang-aarch64-unknown-linux-musl")] | length == 1)
+    and ([$jobs.amiscopies.steps[] | select((.uses // "") | startswith("aws-actions/configure-aws-credentials@")) | .with] == [$jobs.amis.steps[] | select((.uses // "") | startswith("aws-actions/configure-aws-credentials@")) | .with])
+    and ([$jobs.amiscopies.steps[] | select((.uses // "") | startswith("actions/upload-artifact@"))] == [])
+    and ([$jobs.amiscopies.steps[] | select(.name == "Converge the public AMI catalog") | [.run, .env.PUBLICATION_SCOPE, .env.RELEASE, .env.IMAGE_HOME_REGION, .env.IMAGE_REGIONS]] == [["infra/scripts/publish-amis.sh", "catalog", "", "${{ needs.amis.outputs.home-region }}", "${{ needs.amis.outputs.image-regions }}"]])
+    and ([$jobs.amis.steps[] | select(.name == "Converge public AMIs") | [.env.PUBLICATION_SCOPE, .env.AMI_DEPLOY_REGIONS, .env.RELEASE, .env.IMAGES_DIR]] == [["${{ github.event_name == '\''push'\'' && '\''release'\'' || '\''catalog'\'' }}", "${{ vars.AMI_DEPLOY_REGIONS }}", "${{ github.event_name == '\''push'\'' && github.ref_name || '\'''\'' }}", "${{ github.event_name == '\''push'\'' && '\''images'\'' || '\'''\'' }}"]])
+    and ($jobs.amis.outputs == {"home-region":"${{ steps.config.outputs.home-region }}", "image-regions":"${{ steps.config.outputs.image-regions }}"})
+    and ($jobs.images.needs == "locate")
+    and ($jobs.images["if"] == "${{ !(github.event_name == '\''workflow_dispatch'\'' && startsWith(github.ref, '\''refs/tags/v'\'')) }}")
+    and ($jobs.images.strategy.matrix.include | length == 2)
+    and ($jobs.amis["if"] == "${{ !cancelled() && ((github.event_name == '\''push'\'' && needs.locate.result == '\''success'\'' && needs.images.result == '\''success'\'') || (github.event_name == '\''workflow_dispatch'\'' && startsWith(github.ref, '\''refs/tags/v'\''))) }}")
+    and ([$jobs.images.steps[] | select((.uses // "") | startswith("aws-actions/configure-aws-credentials@"))] == [])
+    and ([$jobs.locate.steps[] | select(.id == "dry-run") | .run | contains("if [[ \"$imaged\" == 2 ]]")] == [true])
+    and ($jobs.publish["if"] | contains("github.event_name == '\''push'\''"))
+    and ([$jobs.images.steps[] | select(.name == "Match the dry run'\''s images") | .["if"]] == ["env.PUBLISH == '\''true'\''"])
+' >/dev/null
+config_step="$scratch/config.sh"
+yq -er '.jobs.amis.steps[] | select(.id == "config") | .run' "$workflow" >"$config_step"
+export AMI_CONFIG_REGION=fixture-region GITHUB_ENV="$scratch/env"
+aws() {
+  [[ "$*" == "ssm get-parameter --region fixture-region --name /leadingterm/public-artifacts/gang --query Parameter.Value --output text" ]] || return 1
+  printf '%s\n' "$CONFIG_VALUE"
+}
+export -f aws
+export CONFIG_VALUE
+for CONFIG_VALUE in \
+  '{"home_region":"home-1","image_regions":["home-1","copy-2"]}' \
+  '{"home_region":"bad region","image_regions":["home-1"]}' \
+  '{"home_region":"home-1","image_regions":[]}' \
+  '{"home_region":"home-1","image_regions":["copy-2\nbad"]}'; do
+  : >"$GITHUB_ENV"
+  : >"$scratch/config-output"
+  status=0
+  GITHUB_OUTPUT="$scratch/config-output" bash --noprofile --norc -euo pipefail "$config_step" >"$scratch/case.log" 2>&1 || status=$?
+  if [[ $CONFIG_VALUE == '{"home_region":"home-1","image_regions":["home-1","copy-2"]}' ]]; then
+    (( status == 0 ))
+    [[ $(<"$GITHUB_ENV") == $'IMAGE_HOME_REGION=home-1\nIMAGE_REGIONS=home-1 copy-2' ]]
+    [[ $(<"$scratch/config-output") == $'home-region=home-1\nimage-regions=home-1 copy-2' ]]
+  else
+    (( status != 0 ))
+    [[ ! -s $GITHUB_ENV && ! -s $scratch/config-output ]]
+  fi
+done
 export GH_REPO=example-org/gang SHA=0123456789012345678901234567890123456789
-export HEAD_SHA=1111111111111111111111111111111111111111
-export BASE_SHA=2222222222222222222222222222222222222222
-export TREE_SHA=3333333333333333333333333333333333333333
 export OTHER_SHA=4444444444444444444444444444444444444444
 export GITHUB_OUTPUT="$scratch/output"
 gh() {
@@ -27,51 +78,57 @@ gh() {
   case "$endpoint" in
     "repos/$GH_REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=100")
       if [[ $CASE == api_failure ]]; then return 23; fi
-      if [[ $CASE == direct* ]]; then
-        local event=push direct_sha=$SHA branch=main
-        if [[ $CASE == direct_dispatch ]]; then event=workflow_dispatch; fi
-        if [[ $CASE == direct_wrong_sha ]]; then direct_sha=$OTHER_SHA; fi
-        if [[ $CASE == direct_wrong_branch ]]; then branch=other; fi
-        printf '{"workflow_runs":[{"id":101,"event":"%s","head_branch":"%s","head_sha":"%s","status":"in_progress","conclusion":null,"created_at":"2026-01-01"}]}\n' "$event" "$branch" "$direct_sha"
-      else
-        printf '{"workflow_runs":[]}\n'
+      if [[ $CASE == invalid_runs ]]; then printf '{"workflow_runs":null}\n'; return; fi
+      if [[ $CASE == malformed_json ]]; then printf '{\n'; return; fi
+      local event=push run_sha=$SHA branch=main head_repo=",\"head_repository\":{\"full_name\":\"$GH_REPO\"}"
+      if [[ $CASE == ci_dispatch ]]; then event=workflow_dispatch; fi
+      if [[ $CASE == same_repo_pr ]]; then event=pull_request; fi
+      if [[ $CASE == fork_pr ]]; then event=pull_request; head_repo=',"head_repository":{"full_name":"fork/gang"}'; fi
+      if [[ $CASE == wrong_sha ]]; then run_sha=$OTHER_SHA; fi
+      if [[ $CASE == wrong_branch ]]; then branch=other; fi
+      if [[ $CASE == wrong_repo ]]; then head_repo=',"head_repository":{"full_name":"fork/gang"}'; fi
+      if [[ $CASE == missing_repo ]]; then head_repo=''; fi
+      if [[ $CASE == null_repo ]]; then head_repo=',"head_repository":null'; fi
+      printf '{"workflow_runs":[{"id":101,"event":"%s","head_branch":"%s","head_sha":"%s","created_at":"2026-01-01","head_commit":{"tree":{"sha":"same-tree"}}%s}]}\n' "$event" "$branch" "$run_sha" "$head_repo"
+      if [[ $CASE == latest || $CASE == fallback_required || $CASE == fallback_validation || $CASE == fallback_artifact || $CASE == fallback_api_failure ]]; then
+        printf '{"workflow_runs":[{"id":202,"event":"push","head_branch":"main","head_sha":"%s","created_at":"2026-01-02","head_repository":{"full_name":"%s"}}]}\n' "$SHA" "$GH_REPO"
+      fi
+      if [[ $CASE == newer_tag_push ]]; then
+        printf '{"workflow_runs":[{"id":202,"event":"push","head_branch":"v1.2.3","head_sha":"%s","created_at":"2026-01-02","head_repository":{"full_name":"%s"}}]}\n' "$SHA" "$GH_REPO"
       fi ;;
-    "repos/$GH_REPO/commits/$SHA")
-      local parents="{\"sha\":\"$BASE_SHA\"}"
-      if [[ $CASE == merge_parent ]]; then parents="$parents,$parents"; fi
-      if [[ $CASE == root_commit ]]; then parents=''; fi
-      printf '{"commit":{"tree":{"sha":"%s"}},"parents":[%s]}\n' "$TREE_SHA" "$parents" ;;
-    "repos/$GH_REPO/commits/$SHA/pulls?per_page=100")
-      if [[ $CASE == no_pr || $CASE == direct_wrong_sha || $CASE == direct_wrong_branch ]]; then printf '[]\n'; return; fi
-      local base=$BASE_SHA
-      if [[ $CASE == wrong_base ]]; then base=$OTHER_SHA; fi
-      printf '[{"base":{"sha":"%s"},"head":{"sha":"%s"}}]\n' "$base" "$HEAD_SHA" ;;
-    "repos/$GH_REPO/commits/$HEAD_SHA")
-      local tree=$TREE_SHA
-      if [[ $CASE == wrong_tree ]]; then tree=$OTHER_SHA; fi
-      printf '{"commit":{"tree":{"sha":"%s"}}}\n' "$tree" ;;
-    "repos/$GH_REPO/actions/workflows/ci.yml/runs?head_sha=$HEAD_SHA&event=pull_request&per_page=100")
-      local pr_sha=$HEAD_SHA pr_event=pull_request
-      if [[ $CASE == wrong_pr_sha ]]; then pr_sha=$OTHER_SHA; fi
-      if [[ $CASE == wrong_pr_event ]]; then pr_event=push; fi
-      printf '{"workflow_runs":[{"id":202,"event":"%s","head_sha":"%s","conclusion":"failure","created_at":"2026-01-01","pull_requests":[]}]}\n' "$pr_event" "$pr_sha" ;;
     "repos/$GH_REPO/actions/runs/101/jobs?filter=latest&per_page=100" | "repos/$GH_REPO/actions/runs/202/jobs?filter=latest&per_page=100")
-      if [[ $CASE == jobs_api_failure ]]; then return 23; fi
+      if [[ $CASE == jobs_api_failure || ( $CASE == fallback_api_failure && $endpoint == *"/202/"* ) ]]; then return 23; fi
       if [[ $CASE == invalid_jobs ]]; then printf '{"jobs":null}\n'; return; fi
-      if [[ $CASE == missing_required ]]; then printf '{"jobs":[]}\n'; return; fi
-      local conclusion='"success"'
-      if [[ $CASE == failed_pr ]]; then conclusion='"failure"'; fi
-      if [[ $CASE == pending_required ]]; then conclusion=null; fi
-      if [[ $CASE == duplicate_required ]]; then
-        printf '{"jobs":[{"name":"required","conclusion":"success"},{"name":"required","conclusion":"success"}]}\n'
+      if [[ $CASE == malformed_job ]]; then printf '{"jobs":[{"name":42,"conclusion":"success"}]}\n'; return; fi
+      local conclusion='"success"' validation='"success"'
+      if [[ $CASE == missing_required ]]; then
+        printf '{"jobs":[{"name":"release-validation","conclusion":"success"}]}\n'
         return
       fi
-      printf '{"jobs":[{"name":"required","conclusion":%s}]}\n' "$conclusion" ;;
+      if [[ $CASE == failed_required || ( $CASE == fallback_required && $endpoint == *"/202/"* ) ]]; then conclusion='"failure"'; fi
+      if [[ $CASE == pending_required ]]; then conclusion=null; fi
+      if [[ $CASE == duplicate_required ]]; then
+        printf '{"jobs":[{"name":"required","conclusion":"success"},{"name":"required","conclusion":"success"},{"name":"release-validation","conclusion":"success"}]}\n'
+        return
+      fi
+      if [[ $CASE == missing_validation ]]; then
+        printf '{"jobs":[{"name":"required","conclusion":"success"}]}\n'
+        return
+      fi
+      if [[ $CASE == failed_validation || ( $CASE == fallback_validation && $endpoint == *"/202/"* ) ]]; then validation='"failure"'; fi
+      if [[ $CASE == cancelled_validation ]]; then validation='"cancelled"'; fi
+      if [[ $CASE == skipped_validation ]]; then validation='"skipped"'; fi
+      if [[ $CASE == latest_validation_failure ]]; then
+        printf '{"jobs":[{"name":"required","conclusion":"success"},{"name":"release-validation","conclusion":"success"},{"name":"release-validation","conclusion":"failure"}]}\n'
+        return
+      fi
+      printf '{"jobs":[{"name":"required","conclusion":%s},{"name":"release-validation","conclusion":%s}]}\n' "$conclusion" "$validation" ;;
     "repos/$GH_REPO/actions/runs/101/artifacts?per_page=100" | "repos/$GH_REPO/actions/runs/202/artifacts?per_page=100")
       if [[ $CASE == artifact_api_failure ]]; then return 23; fi
       if [[ $CASE == invalid_artifacts ]]; then printf '{"artifacts":null}\n'; return; fi
+      if [[ $CASE == malformed_artifact ]]; then printf '{"artifacts":[{"name":"gang-x86_64-unknown-linux-musl","expired":"false"}]}\n'; return; fi
       local expired=false linux=',{"id":2,"name":"gang-aarch64-unknown-linux-musl","expired":false}' darwin=',{"id":3,"name":"gang-aarch64-apple-darwin","expired":false}'
-      if [[ $CASE == missing_artifact ]]; then linux=''; fi
+      if [[ $CASE == missing_artifact || ( $CASE == fallback_artifact && $endpoint == *"/202/"* ) ]]; then linux=''; fi
       if [[ $CASE == no_darwin ]]; then darwin=''; fi
       if [[ $CASE == expired_darwin ]]; then darwin=',{"id":3,"name":"gang-aarch64-apple-darwin","expired":true}'; fi
       if [[ $CASE == expired_artifact ]]; then expired=true; fi
@@ -81,10 +138,10 @@ gh() {
 }
 export -f gh
 cases=0
-for scenario in direct:101 direct_dispatch:101 squash:202 dispatch:202 no_darwin:202 expired_darwin:202 direct_wrong_sha:fail direct_wrong_branch:fail wrong_tree:fail wrong_base:fail wrong_pr_sha:fail wrong_pr_event:fail failed_pr:fail pending_required:fail missing_required:fail duplicate_required:fail jobs_api_failure:fail invalid_jobs:fail missing_artifact:fail expired_artifact:fail no_pr:fail merge_parent:fail root_commit:fail api_failure:fail; do
+for scenario in direct:101 release_dispatch:101 newer_tag_push:101 same_repo_pr:fail fork_pr:fail ci_dispatch:fail wrong_sha:fail wrong_branch:fail wrong_repo:fail missing_repo:fail null_repo:fail api_failure:fail invalid_runs:fail malformed_json:fail failed_required:fail pending_required:fail missing_required:fail duplicate_required:fail missing_validation:fail failed_validation:fail cancelled_validation:fail skipped_validation:fail latest_validation_failure:fail jobs_api_failure:fail invalid_jobs:fail malformed_job:fail missing_artifact:fail expired_artifact:fail artifact_api_failure:fail invalid_artifacts:fail malformed_artifact:fail no_darwin:101 expired_darwin:101 latest:202 fallback_required:101 fallback_validation:101 fallback_artifact:101 fallback_api_failure:fail; do
   export CASE=${scenario%:*} EVENT=push
   expected=${scenario#*:}
-  if [[ $CASE == dispatch ]]; then EVENT=workflow_dispatch; fi
+  if [[ $CASE == release_dispatch ]]; then EVENT=workflow_dispatch; fi
   : >"$GITHUB_OUTPUT"
   status=0
   bash --noprofile --norc -euo pipefail "$body" >"$scratch/case.log" 2>&1 || status=$?
@@ -102,7 +159,7 @@ for scenario in direct:101 direct_dispatch:101 squash:202 dispatch:202 no_darwin
   ((cases += 1))
 done
 export RUN_ID=202
-for scenario in squash:1,2,3 no_darwin:1,2 expired_darwin:1,2 missing_artifact:fail expired_artifact:fail artifact_api_failure:fail invalid_artifacts:fail; do
+for scenario in direct:1,2,3 no_darwin:1,2 expired_darwin:1,2 missing_artifact:fail expired_artifact:fail artifact_api_failure:fail invalid_artifacts:fail; do
   export CASE=${scenario%:*}
   expected=${scenario#*:}
   : >"$GITHUB_OUTPUT"

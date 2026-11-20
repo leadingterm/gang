@@ -4,10 +4,12 @@
 use std::future::{Future, poll_fn};
 use std::path::Path;
 use std::pin::pin;
+use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
 use gang_client::{ClientError, ProofSource, WorkloadLogin};
+use gang_clock::{Clock, Sleep, TestClock, Tick, Timestamp};
 use gang_os::FileLock;
 use tempfile::TempDir;
 
@@ -86,6 +88,7 @@ async fn unchanged_token_gives_the_same_reply_without_a_new_mint() {
         .get(&request)
         .await
         .expect("first credential reply");
+    let requests_after_first = harness.server.requests().len();
     let second = harness
         .client()
         .get(&request)
@@ -94,6 +97,7 @@ async fn unchanged_token_gives_the_same_reply_without_a_new_mint() {
 
     assert_eq!(parsed(&first), parsed(&second));
     assert_eq!(harness.server.token_requests().len(), 1);
+    assert_eq!(harness.server.requests().len(), requests_after_first);
 }
 
 #[tokio::test]
@@ -173,4 +177,68 @@ async fn reply_without_a_session_is_not_logged_in() {
         .expect_err("no session is stored");
 
     assert!(matches!(error, ClientError::NotLoggedIn));
+}
+
+struct RetryClock {
+    clock: Arc<TestClock>,
+    sleeping: tokio::sync::Notify,
+}
+
+impl Clock for RetryClock {
+    fn wall(&self) -> Timestamp {
+        self.clock.wall()
+    }
+    fn monotonic(&self) -> Tick {
+        self.clock.monotonic()
+    }
+    fn sleep_until(&self, deadline: Tick) -> Sleep {
+        if deadline.saturating_duration_since(self.clock.monotonic()) == Duration::from_millis(100)
+        {
+            self.sleeping.notify_one();
+        }
+        self.clock.sleep_until(deadline)
+    }
+}
+
+#[tokio::test]
+async fn get_mints_after_marked_refusal_for_missing_or_expired_token() {
+    for missing in [true, false] {
+        let harness = Harness::start_plain(ConsoleMode::Silent, google()).await;
+        harness.server.accept_proof("google", "workload-proof");
+        let dir = TempDir::new().expect("proof directory");
+        let source = dir.path().join("proof");
+        std::fs::write(&source, "workload-proof").expect("proof file");
+        login_workload(&harness, &source).await;
+        if missing {
+            std::fs::remove_file(harness.home.token_file()).expect("remove cached token");
+        } else {
+            harness.clock.advance(Duration::from_mins(10));
+        }
+        let before = harness.server.requests().len();
+        harness.server.script_responses(&[(
+            503,
+            &[("gang-request-not-started", "true")],
+            b"warming",
+        )]);
+        let clock = Arc::new(RetryClock {
+            clock: harness.clock.clone(),
+            sleeping: tokio::sync::Notify::new(),
+        });
+        let client = gang_client::Client::new(
+            harness.home.clone(),
+            gang_client::ClientOptions::default(),
+            harness.providers.clone(),
+            harness.console().clone(),
+            clock.clone(),
+        );
+        let request = request_for(&harness, "/cache/blob");
+        let (result, ()) = tokio::join!(client.get(&request), async {
+            clock.sleeping.notified().await;
+            clock.clock.advance(Duration::from_millis(100));
+        });
+        assert!(result.is_ok());
+        let requests = harness.server.requests();
+        assert_eq!(requests.len(), before + 2);
+        assert_eq!(requests[before], requests[before + 1]);
+    }
 }

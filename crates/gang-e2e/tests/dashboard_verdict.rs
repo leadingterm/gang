@@ -91,6 +91,7 @@ fn worker(phase: Phase) -> Worker {
         paused: false,
         launch_time: at(0),
         phases: Vec::new(),
+        infrastructure: None,
     }
 }
 
@@ -120,6 +121,7 @@ fn state(seq: u64, in_service: u32, workers: Vec<Worker>, completed: u64) -> Sta
         instances: Vec::new(),
         actions: None,
         events: Vec::new(),
+        status_events: Vec::new(),
         events_limit: 100,
         completed,
         recent: Recent::default(),
@@ -178,6 +180,7 @@ fn delta(base: u64, seq: u64, events: Vec<Event>) -> Delta {
         instances: None,
         actions: None,
         events,
+        status_events: None,
         completed: None,
         recent: None,
         cache: None,
@@ -293,6 +296,7 @@ fn an_instance_without_a_worker_keeps_the_fleet_from_being_empty() {
         lifecycle: Lifecycle::Terminating,
         launch_time: at(0),
         past_boot_grace: false,
+        infrastructure: None,
     });
     assert!(!verdict::fleet_is_empty(&lingering));
     assert!(verdict::state_drained(&lingering).is_failure());

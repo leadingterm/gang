@@ -3,7 +3,7 @@
 import { Fragment } from "preact";
 import { useState } from "preact/hooks";
 import { earlierMore } from "../client.ts";
-import { EVENT_KINDS, eventKind, idOf, ms, type EventKind, type UnixMs } from "../wire-parse.ts";
+import { EVENT_KINDS, eventKind, idOf, ms, scalingLog, type EventKind, type UnixMs } from "../wire-parse.ts";
 import type { ScalingEvent } from "../wire.ts";
 import { clock, day } from "../format.ts";
 import { Empty, EVENT_VIEW, FleetFilter, Glyph, Ident, Section, useClient, useNowStep } from "../ui.tsx";
@@ -59,7 +59,7 @@ export const Activity = () => {
   if (!state) return null;
   const now = Math.max(stepped, ms(state.updateTime));
   const start = now - LANES_MS;
-  const all = [...(earlier.kind === "loaded" ? earlier.events : []), ...state.events];
+  const all = scalingLog(earlier.kind === "loaded" ? earlier.events : [], state.events, state.statusEvents ?? []);
   if (all.length === 0) {
     return (
       <>
@@ -94,7 +94,8 @@ export const Activity = () => {
         </div>
         <FleetFilter id="afleet" fleets={state.fleets} value={fleet} onChange={setFleet} />
       </div>
-      <section aria-label={`Events by fleet over the last ${HOURS} hours`}>
+      <Section id="fleet-activity-h" title="Fleet activity">
+        <p class="visually-hidden">Events by fleet over the last {HOURS} hours</p>
         <div class="lanes">
           {state.fleets.map((f) => (
             <button
@@ -130,7 +131,7 @@ export const Activity = () => {
             ))}
           </div>
         </div>
-      </section>
+      </Section>
       <Section id="log-h" title="Log" count={shown.length}>
         {byHour(shown, now).map(([hour, label, entries]) => (
           <Fragment key={hour}>

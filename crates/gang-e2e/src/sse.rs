@@ -214,6 +214,7 @@ mod tests {
             instances: None,
             actions: None,
             events: Vec::new(),
+            status_events: None,
             completed: Some(completed),
             recent: None,
             builds: None,

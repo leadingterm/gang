@@ -42,10 +42,6 @@ impl PortSpec {
 /// which identity providers it names. The trait carries `#[settings]`, which records its methods.
 pub const AUTHENTICATION_SETTINGS: &str = "AuthenticationSettings";
 
-/// The worker endpoint a scheduler's configuration names or derives. The trait carries
-/// `#[settings]`, which records its methods.
-pub const SCHEDULER_SETTINGS: &str = "SchedulerSettings";
-
 /// One plugin domain.
 pub struct Domain {
     /// The key in the `compose!` invocation.
@@ -76,7 +72,7 @@ pub const LIMITS_SCOPE: &str = "Scope";
 pub const ACTION_SCOPE: &str = "ActionScope";
 
 /// Every domain, in the order of `gang_config::PluginSet`.
-pub const DOMAINS: [Domain; 10] = [
+pub const DOMAINS: [Domain; 9] = [
     Domain {
         key: "provisioner",
         associated_type: "Provisioner",
@@ -112,14 +108,6 @@ pub const DOMAINS: [Domain; 10] = [
         sandbox_selection: false,
         ports: &[PortSpec::plain("CertificateSignerPort")],
         config_traits: &[],
-    },
-    Domain {
-        key: "scheduler",
-        associated_type: "Scheduler",
-        cardinality: Cardinality::ExactlyOne,
-        sandbox_selection: false,
-        ports: &[PortSpec::plain("SchedulerPort")],
-        config_traits: &[SCHEDULER_SETTINGS],
     },
     Domain {
         key: "database",
@@ -274,15 +262,5 @@ mod tests {
             .map(|domain| domain.key)
             .collect();
         assert_eq!(keys, ["client_authentication", "worker_authentication"]);
-    }
-
-    #[test]
-    fn scheduler_settings_are_on_the_scheduler_domain_only() {
-        let keys: Vec<&str> = DOMAINS
-            .iter()
-            .filter(|domain| domain.config_traits.contains(&SCHEDULER_SETTINGS))
-            .map(|domain| domain.key)
-            .collect();
-        assert_eq!(keys, ["scheduler"]);
     }
 }

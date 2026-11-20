@@ -100,6 +100,7 @@ fn inputs(world: &World) -> Inputs<'_> {
         catalog: &world.catalog,
         actions: world.actions.as_ref(),
         events: &world.events,
+        infrastructure: &[],
         builds: &world.builds,
         traffic: Traffic {
             lookups: 12,
@@ -149,6 +150,8 @@ fn supplies() -> Result<Vec<FleetSupply>, Box<dyn Error>> {
     let mut supplies = Vec::new();
     for instances in fleets {
         supplies.push(FleetSupply {
+            requested: None,
+            events: Vec::new(),
             abandoned: 0,
             desired: u32::try_from(instances.len())?,
             instances,
@@ -394,6 +397,55 @@ fn steady_skipped_pass_allocates_nothing() -> TestResult {
         info.bytes_total, 0,
         "steady-state skipped pass allocated {} bytes",
         info.bytes_total
+    );
+    Ok(())
+}
+
+#[test]
+fn steady_replacement_projection_allocates_nothing() -> TestResult {
+    use gang_spi::{FleetInfrastructureEvent, InfrastructureEvent, InfrastructureEventKind};
+    use gang_types::FleetName;
+    let mut world = world()?;
+    let old = instance_id(0)?;
+    let new = instance_id(3)?;
+    let pass = &mut world.passes[0];
+    pass.supply.requested =
+        Some(u32::try_from(pass.supply.instances.len() - 1).expect("fixture count fits u32"));
+    let observations = [FleetInfrastructureEvent {
+        fleet: FleetName::try_new("alpha")?,
+        event: InfrastructureEvent {
+            id: "rebalance".into(),
+            at: ts(5_000),
+            kind: InfrastructureEventKind::ReplacementLaunched {
+                instance: new,
+                replacing: Some(old),
+            },
+        },
+    }];
+    let mut view = inputs(&world);
+    view.infrastructure = &observations;
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let mut cur = blank();
+    let mut prev = blank();
+    for seq in 1..=WARM_UP_PASSES as u64 {
+        builder.fill(&mut cur, &prev, seq, &view);
+        std::mem::swap(&mut cur, &mut prev);
+    }
+    assert_eq!(prev.status_events.len(), 1);
+    assert_eq!(
+        prev.workers
+            .iter()
+            .filter(|worker| worker.infrastructure.is_some())
+            .count(),
+        2
+    );
+    let info = allocation_counter::measure(|| {
+        builder.fill(&mut cur, &prev, WARM_UP_PASSES as u64 + 1, &view);
+    });
+    assert_eq!(info.count_total, 0, "steady replacement pass allocated");
+    assert_eq!(
+        info.bytes_total, 0,
+        "steady replacement pass allocated bytes"
     );
     Ok(())
 }

@@ -15,7 +15,7 @@ pub struct ExecutionConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum InputLinks {
-    /// Inputs stay hard links to the cached files, as `NativeLink` provides them.
+    /// Inputs stay hard links to the cached files from the worker cache.
     #[default]
     Keep,
     /// Every hard-linked input is replaced by a reflink or copy before the action runs.

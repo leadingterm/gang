@@ -9,8 +9,7 @@ pub mod __private {
     pub use gang_types;
     pub use gang_types::{
         AuthenticationSettings, CertSerial, Fleet, Identity, InstanceId, LoginSession, Principal,
-        Proof, ProviderName, RefreshToken, SchedulerSettings, Url, WorkerId, WorkerLifetime,
-        string_enum,
+        Proof, ProviderName, RefreshToken, Url, WorkerId, WorkerLifetime, string_enum,
     };
     pub use serde;
 }

@@ -8,7 +8,8 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use gang_types::{
-    FleetName, MachineClass, NonZeroBytes, NonZeroDuration, Percent, Url, WorkloadTokenSettings,
+    Audience, BoundedDuration, FleetName, MachineClass, NANOS_PER_SECOND, NonZeroBytes,
+    NonZeroDuration, Percent, Url,
 };
 use serde::{Deserialize, Serialize};
 
@@ -32,7 +33,7 @@ pub struct AwsConfig {
     /// 15 minutes. The audience must be 1 to 1000 characters. The lifetime must be a whole
     /// number of seconds within `1m` to `1h`.
     #[serde(default)]
-    pub workload_token: WorkloadTokenSettings,
+    pub workload_token: WorkloadTokenConfig,
     /// Signing algorithm requested for workload tokens. Default `rs256`; `es384` is the other
     /// choice.
     #[serde(default)]
@@ -58,6 +59,106 @@ pub struct AwsConfig {
     /// `ignore`, which applies the capacity change at once; `honor` waits for the cooldown.
     #[serde(default)]
     pub set_capacity_cooldown: CooldownPolicy,
+    /// Optional SQS queue carrying `EventBridge` infrastructure observations.
+    #[serde(default)]
+    pub events_queue_url: Option<Url>,
+    /// Maximum number of messages received at once, from 1 to 10.
+    #[serde(
+        default = "default_event_batch_limit",
+        deserialize_with = "deserialize_event_batch_limit"
+    )]
+    pub event_batch_limit: u8,
+    /// How long received messages remain invisible, in whole seconds up to 12 hours.
+    #[serde(
+        default = "default_event_visibility_timeout",
+        deserialize_with = "deserialize_event_visibility_timeout"
+    )]
+    pub event_visibility_timeout: NonZeroDuration,
+    /// Age of scaling activities considered for infrastructure observations.
+    #[serde(default = "default_activity_history_window")]
+    pub activity_history_window: NonZeroDuration,
+    /// Maximum scaling activities inspected per group, from 1 to 1000.
+    #[serde(
+        default = "default_activity_limit",
+        deserialize_with = "deserialize_activity_limit"
+    )]
+    pub activity_limit: u32,
+}
+
+const fn default_event_batch_limit() -> u8 {
+    10
+}
+const fn default_activity_limit() -> u32 {
+    100
+}
+const fn default_event_visibility_timeout() -> NonZeroDuration {
+    NonZeroDuration::from_secs(30)
+}
+const fn default_activity_history_window() -> NonZeroDuration {
+    NonZeroDuration::from_mins(15)
+}
+
+fn deserialize_event_batch_limit<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u8, D::Error> {
+    let value = u8::deserialize(deserializer)?;
+    if (1..=10).contains(&value) {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom(
+            "event_batch_limit must be between 1 and 10",
+        ))
+    }
+}
+
+fn deserialize_activity_limit<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u32, D::Error> {
+    let value = u32::deserialize(deserializer)?;
+    if (1..=1000).contains(&value) {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom(
+            "activity_limit must be between 1 and 1000",
+        ))
+    }
+}
+
+fn deserialize_event_visibility_timeout<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<NonZeroDuration, D::Error> {
+    let value = NonZeroDuration::deserialize(deserializer)?;
+    if value.get().subsec_nanos() == 0 && value.get().as_secs() <= 43_200 {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom(
+            "event_visibility_timeout must be whole seconds up to 12 hours",
+        ))
+    }
+}
+
+/// An STS workload token lifetime: whole seconds from one minute to one hour inclusive.
+///
+/// `GetWebIdentityToken` requires at least 60 seconds, independently of Gang's client-token bounds.
+pub type WorkloadTokenTtl = BoundedDuration<NANOS_PER_SECOND, 60, 3600>;
+
+/// Audience and lifetime requested from STS for a worker's workload token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkloadTokenConfig {
+    /// The audience the token is issued for.
+    pub audience: Audience,
+    /// The lifetime accepted by STS: whole seconds from one minute to one hour inclusive.
+    pub ttl: WorkloadTokenTtl,
+}
+
+impl Default for WorkloadTokenConfig {
+    fn default() -> Self {
+        Self {
+            audience: Audience::DEFAULT,
+            ttl: WorkloadTokenTtl::from_units(900),
+        }
+    }
 }
 
 gang_types::string_enum! {
@@ -310,8 +411,8 @@ impl Default for S3Tuning {
     }
 }
 
-/// Age of a cached object after which it is treated as expired, in whole seconds. `NativeLink`
-/// reads it as a `u32`, so it is at most `u32::MAX` seconds.
+/// Age of a cached object after which it is treated as expired, in whole seconds.
+/// The maximum supported age is `u32::MAX` seconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "NonZeroDuration", into = "NonZeroDuration")]
 pub struct ExpiryAge(NonZeroU32);

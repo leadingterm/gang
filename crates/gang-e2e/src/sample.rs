@@ -135,6 +135,24 @@ pub fn stage(source: &Path, destination: &Path, parameters: &SampleParameters) -
         .map_err(E2eError::io(format!("writing {}", config_path.display())))
 }
 
+/// Stages the actual harness and pinned `PostgreSQL` archive for the sandbox contract action.
+pub(crate) fn stage_action_environment(destination: &Path, archive: &Path) -> Result<()> {
+    let executable =
+        std::env::current_exe().map_err(E2eError::io("locating the action environment probe"))?;
+    for (source, name) in [
+        (executable.as_path(), "action-environment-probe"),
+        (archive, "action-environment-postgresql.tar.gz"),
+    ] {
+        let target = destination.join(name);
+        fs::copy(source, &target).map_err(E2eError::io(format!(
+            "copying {} to {}",
+            source.display(),
+            target.display()
+        )))?;
+    }
+    Ok(())
+}
+
 /// Returns the first probe whose name attribute is absent from the build file.
 fn missing_probe(build_file: &str) -> Option<Probe> {
     Probe::ALL.into_iter().find(|probe| {

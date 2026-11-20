@@ -21,6 +21,7 @@ use gang_types::{Fleet, InstanceId, InstanceLifecycle};
 
 use crate::config::{AwsFleetOptions, CooldownPolicy, ON_DEMAND_SUFFIX, SpotFallback};
 use crate::errors::AwsError;
+use crate::events::Events;
 use crate::fallback::{self, Counts, Tier};
 use crate::group::{DESCRIBE_GROUPS, Group, Member};
 
@@ -50,19 +51,30 @@ pub(crate) struct Fleets {
     clock: Arc<dyn Clock>,
     /// Applied to every desired-capacity write: raises, spot withdrawals and release lowerings.
     cooldown: CooldownPolicy,
+    events: Events,
 }
 
 impl Fleets {
     /// Creates the fleet adapter from the shared SDK config; `clock` stamps instances EC2 does
     /// not know about, and `cooldown` decides whether every desired-capacity write (raises, spot
     /// withdrawals and release lowerings alike) honors the group's cooldown.
-    pub(crate) fn new(sdk: &SdkConfig, clock: Arc<dyn Clock>, cooldown: CooldownPolicy) -> Self {
+    pub(crate) fn new(
+        sdk: &SdkConfig,
+        clock: Arc<dyn Clock>,
+        cooldown: CooldownPolicy,
+        events: Events,
+    ) -> Self {
         Self {
             autoscaling: aws_sdk_autoscaling::Client::new(sdk),
             ec2: aws_sdk_ec2::Client::new(sdk),
             clock,
             cooldown,
+            events,
         }
+    }
+
+    pub(crate) fn events(&self) -> &Events {
+        &self.events
     }
 
     /// Purely reads the fleet's desired capacity and instances. An opted-in fleet merges its
@@ -107,6 +119,23 @@ impl Fleets {
         };
         let now = self.clock.wall();
         into.desired = desired;
+        into.requested = Some(
+            groups
+                .groups()
+                .fold(0_u32, |sum, group| sum.saturating_add(group.desired))
+                .saturating_sub(abandoned),
+        );
+        if let Err(error) = self
+            .events
+            .supply(fleet.name.as_str(), names.iter(), &mut into.events)
+            .await
+        {
+            tracing::warn!(
+                fleet = fleet.name.as_str(),
+                %error,
+                "AWS infrastructure activity history unavailable; continuing fleet supply"
+            );
+        }
         into.abandoned = abandoned;
         into.launch_failure = launch_failure;
         into.warm = groups
@@ -629,7 +658,7 @@ mod tests {
             .supply(fleet(FLEET)?.view(), &mut supply)
             .await?;
         assert_eq!(supply.launch_failure, None);
-        assert_eq!(harness.requests("DescribeScalingActivities"), 0);
+        assert_eq!(harness.activity_probes(), 0);
         Ok(())
     }
 
@@ -704,6 +733,8 @@ mod tests {
             FleetSupply {
                 abandoned: 0,
                 desired: 3,
+                requested: Some(3),
+                events: Vec::new(),
                 instances: vec![
                     FleetInstance {
                         id: InstanceId::try_new("i-pending")?,
@@ -794,6 +825,8 @@ mod tests {
         let mut into = FleetSupply {
             abandoned: 0,
             desired: 99,
+            requested: None,
+            events: Vec::new(),
             instances: vec![FleetInstance {
                 id: InstanceId::try_new("i-stale")?,
                 lifecycle: InstanceLifecycle::Terminating,
@@ -820,6 +853,8 @@ mod tests {
                 exits: Vec::new(),
                 launch_failure: None,
                 desired: 1,
+                requested: Some(1),
+                events: Vec::new(),
                 instances: vec![FleetInstance {
                     id: InstanceId::try_new("i-new")?,
                     lifecycle: InstanceLifecycle::InService,

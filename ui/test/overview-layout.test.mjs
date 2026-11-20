@@ -149,6 +149,52 @@ const probe = async (scenario) => {
     const svgs = row.flatMap((tile) => tile.svgs.map((svg) => ({ name: tile.name, top: svg.top })));
     if (svgs.length && svgs.some((svg) => !equal(svg.top, svgs[0].top))) add(`row SVG tops differ: ${svgs.map((svg) => `${svg.name}=${svg.top}`).join(", ")}`);
   }
+  const charts = ["Transferred per step", "Evicted per step"].map((label) => {
+    const svg = document.querySelector(`svg[aria-label="${label}"]`);
+    if (!svg) { add(`Cache: missing ${label} SVG`); return null; }
+    const frame = svg.closest(".chart-frame");
+    const plot = frame?.querySelector(".chart-frame__plot") ?? svg;
+    const svgBox = rect(svg), plotBox = rect(plot);
+    const ctm = svg.getScreenCTM();
+    if (!ctm) { add(`Cache: ${label} has no SVG screen CTM`); return null; }
+    const point = (x, y) => new DOMPoint(x, y).matrixTransform(ctm);
+    const start = point(2, 2), end = point(298, 42);
+    return { label, svg: svgBox, plot: plotBox, frame: rect(frame ?? svg.parentElement), baseline: end.y,
+      padding: [(start.x - plotBox.left) / plotBox.width, (plotBox.right - end.x) / plotBox.width,
+        (start.y - plotBox.top) / plotBox.height, (plotBox.bottom - end.y) / plotBox.height] };
+  });
+  if (charts.every(Boolean)) {
+    const [a, b] = charts;
+    const stacked = equal(a.svg.left, b.svg.left);
+    if (!equal(a.plot.width, b.plot.width) || !equal(a.plot.height, b.plot.height) ||
+        !equal(a.svg.width, b.svg.width) || !equal(a.svg.height, b.svg.height)) add(`Cache plot dimensions differ: ${JSON.stringify(charts)}`);
+    if (a.padding.some((value, index) => Math.abs(value - b.padding[index]) > 0.001)) add(`Cache normalized inner padding differs: ${JSON.stringify(charts)}`);
+    if (!stacked && !equal(a.baseline, b.baseline)) add(`Cache SVG baselines differ: ${a.baseline} vs ${b.baseline}`);
+    const sections = ["pass-h", "recent-h"].map((id) => document.getElementById(id)?.closest("section"));
+    if (sections.every(Boolean)) {
+      for (let i = 0; i < 2; i++) {
+        const edge = rect(sections[i]);
+        if (!equal(charts[i].frame.left, edge.left) || !equal(charts[i].frame.right, edge.right)) add(`Cache ${charts[i].label} edges do not match ${sections[i].textContent.trim().slice(0, 20)} section`);
+      }
+    } else add("Cache: missing Control pass or Scaling section");
+  }
+  const pageGrid = document.querySelector(".page-grid");
+  let referenceEdges;
+  for (const group of document.querySelectorAll(".layout-columns")) {
+    const children = [...group.children];
+    if (!pageGrid || children.length !== 2) { add("columns require a page grid and two children"); continue; }
+    const page = rect(pageGrid), outer = rect(group), boxes = children.map(rect);
+    if (!equal(outer.left, page.left) || !equal(outer.right, page.right)) add("columns do not span page grid");
+    if (equal(boxes[0].left, boxes[1].left)) {
+      if (boxes.some((box) => !equal(box.left, page.left) || !equal(box.right, page.right))) add("stacked column edges differ from page grid");
+    } else {
+      if (!equal(boxes[0].width, boxes[1].width)) add(`column widths differ: ${boxes[0].width} vs ${boxes[1].width}`);
+      const edges = [boxes[0].left, boxes[0].right, boxes[1].left, boxes[1].right];
+      if (!equal(edges[0], page.left) || !equal(edges[3], page.right)) add("column outer edges differ from page grid");
+      if (referenceEdges && edges.some((edge, i) => !equal(edge, referenceEdges[i]))) add(`column edges differ: ${edges} vs ${referenceEdges}`);
+      referenceEdges ??= edges;
+    }
+  }
   return { violations, tiles, clip: rect(container) };
 };
 
@@ -195,7 +241,8 @@ test("overview tile geometry", { timeout: 120000 }, async () => {
         const { violations: found, tiles, clip } = result.result.value;
         for (const violation of found) violations.push(`${scenario}@${width}: ${violation}`);
         if (width === 1516) console.log(`overview ${scenario}@1516: ${JSON.stringify(tiles.map(({ name, tile, label, value, meter, caption, chart, svgs }) => ({ name, tileTop: tile.top, insets: label && [label.left - tile.left, tile.right - label.right], tops: [label?.top, value?.top, meter?.top, caption?.top, chart?.top, ...svgs.map((svg) => svg.top)], chartWidth: chart?.width })))}`);
-        if (process.env.GANG_LAYOUT_SCREENSHOTS && process.env.TEST_UNDECLARED_OUTPUTS_DIR) {
+        if (process.env.GANG_LAYOUT_SCREENSHOTS && process.env.TEST_UNDECLARED_OUTPUTS_DIR &&
+            (!process.env.GANG_LAYOUT_SCREENSHOT_WIDTH || Number(process.env.GANG_LAYOUT_SCREENSHOT_WIDTH) === width)) {
           const screenshot = await page.send("Page.captureScreenshot", { format: "png" });
           writeFileSync(join(process.env.TEST_UNDECLARED_OUTPUTS_DIR, `overview-${scenario}-${width}.png`), Buffer.from(screenshot.data, "base64"));
           const shot = await page.send("Page.captureScreenshot", { format: "png", captureBeyondViewport: true, clip: { x: clip.left, y: clip.top, width: clip.width, height: clip.height, scale: 1 } });

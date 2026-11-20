@@ -4,16 +4,19 @@
 
 use std::future::Future;
 use std::io;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::StreamExt;
 use futures::future::BoxFuture;
+use gang_clock::Timestamp;
 use gang_spi::{
     ActionsView, Admitted, ApiRequestBody, ApiResponseBody, ApiService, BoxedConnection,
-    ControllerConnections, ControllerEndpoints, ControllerReady, ControllerSpec, Listening,
-    ListingLimits, Peer, PortError, Rejection, RequestGate, SchedulerPort, SchedulerSnapshot,
-    Slots, Subject, WorkerSpec, WorkerTls, full_body,
+    ControllerConnections, ControllerEndpoints, ControllerReady, ControllerSpec, GateDecision,
+    LeaderUnavailable, LearnedHistory, Listening, ListingLimits, Peer, PortError, RecordKind,
+    Rejection, RequestGate, RequestScope, SchedulerPort, SchedulerSnapshot, Slots, Subject,
+    WorkerSpec, WorkerTls, full_body,
 };
 use gang_types::{Bytes, FleetProperties, InstanceId, WorkerId};
 use parking_lot::Mutex;
@@ -25,8 +28,6 @@ use url::Url;
 pub enum Side {
     /// The public listener: Bazel and `gang` clients.
     Public,
-    /// The execution listener: execution clients and leader API routes.
-    Execution,
     /// The worker listener: workers.
     Worker,
 }
@@ -47,77 +48,61 @@ trait Services: Send + Sync {
     /// Applies the public listener's gate to a request.
     fn admit_public<'a>(
         &'a self,
+        scope: RequestScope,
         peer: &'a Peer,
         parts: &'a mut http::request::Parts,
-    ) -> BoxFuture<'a, Result<Admitted, PortError>>;
-
-    /// Applies the execution listener's gate, if that listener exists.
-    fn admit_execution<'a>(
-        &'a self,
-        peer: &'a Peer,
-        parts: &'a mut http::request::Parts,
-    ) -> BoxFuture<'a, Option<Result<Admitted, PortError>>>;
+    ) -> BoxFuture<'a, Result<GateDecision, PortError>>;
 
     /// Applies the worker listener's gate to a request.
     fn admit_worker<'a>(
         &'a self,
+        scope: RequestScope,
         peer: &'a Peer,
         parts: &'a mut http::request::Parts,
-    ) -> BoxFuture<'a, Result<Admitted, PortError>>;
+    ) -> BoxFuture<'a, Result<GateDecision, PortError>>;
 
     /// Answers a request with the Gang API.
     fn call_api(
         &self,
         request: http::Request<ApiRequestBody>,
     ) -> BoxFuture<'static, http::Response<ApiResponseBody>>;
-
-    /// Answers a request on the execution listener, if present.
-    fn call_execution_api(
-        &self,
-        request: http::Request<ApiRequestBody>,
-    ) -> BoxFuture<'static, Option<http::Response<ApiResponseBody>>>;
 }
 
 /// The listener gates and the Gang API of one controller.
 struct Gates<P, W, A> {
     /// The public listener's gate.
     public: P,
-    /// The execution listener's gate, if present.
-    execution: Option<P>,
     /// The worker listener's gate.
     worker: W,
     /// The Gang API.
     api: A,
+    /// Whether leader requests are permanently refused by this transport.
+    standby: bool,
 }
 
 impl<P: RequestGate, W: RequestGate, A: ApiService> Services for Gates<P, W, A> {
     fn admit_public<'a>(
         &'a self,
+        scope: RequestScope,
         peer: &'a Peer,
         parts: &'a mut http::request::Parts,
-    ) -> BoxFuture<'a, Result<Admitted, PortError>> {
-        Box::pin(self.public.admit(peer, parts))
-    }
-
-    fn admit_execution<'a>(
-        &'a self,
-        peer: &'a Peer,
-        parts: &'a mut http::request::Parts,
-    ) -> BoxFuture<'a, Option<Result<Admitted, PortError>>> {
-        Box::pin(async move {
-            match &self.execution {
-                Some(gate) => Some(gate.admit(peer, parts).await),
-                None => None,
-            }
-        })
+    ) -> BoxFuture<'a, Result<GateDecision, PortError>> {
+        if self.standby && matches!(scope, RequestScope::Leader) {
+            return Box::pin(async { Ok(GateDecision::NotLeading) });
+        }
+        Box::pin(self.public.admit(scope, peer, parts))
     }
 
     fn admit_worker<'a>(
         &'a self,
+        scope: RequestScope,
         peer: &'a Peer,
         parts: &'a mut http::request::Parts,
-    ) -> BoxFuture<'a, Result<Admitted, PortError>> {
-        Box::pin(self.worker.admit(peer, parts))
+    ) -> BoxFuture<'a, Result<GateDecision, PortError>> {
+        if self.standby && matches!(scope, RequestScope::Leader) {
+            return Box::pin(async { Ok(GateDecision::NotLeading) });
+        }
+        Box::pin(self.worker.admit(scope, peer, parts))
     }
 
     fn call_api(
@@ -130,15 +115,6 @@ impl<P: RequestGate, W: RequestGate, A: ApiService> Services for Gates<P, W, A> 
             request,
         ))
     }
-
-    fn call_execution_api(
-        &self,
-        request: http::Request<ApiRequestBody>,
-    ) -> BoxFuture<'static, Option<http::Response<ApiResponseBody>>> {
-        let gate = self.execution.clone();
-        let api = self.api.clone();
-        Box::pin(async move { Some(admit_and_call(gate?, api, request).await) })
-    }
 }
 
 async fn admit_and_call<P: RequestGate, A: ApiService>(
@@ -147,12 +123,25 @@ async fn admit_and_call<P: RequestGate, A: ApiService>(
     request: http::Request<ApiRequestBody>,
 ) -> http::Response<ApiResponseBody> {
     let (mut parts, body) = request.into_parts();
-    match gate.admit(&Peer::default(), &mut parts).await {
-        Ok(admitted) => {
+    match gate
+        .admit(RequestScope::Shared, &Peer::default(), &mut parts)
+        .await
+    {
+        Ok(GateDecision::Admit(admitted)) => {
             if let Admitted::Authenticated(authenticated) = admitted {
                 parts.extensions.insert(authenticated);
             }
             api.call(http::Request::from_parts(parts, body)).await
+        }
+        Ok(GateDecision::NotLeading) => {
+            let mut response = http::Response::new(full_body(bytes::Bytes::new()));
+            *response.status_mut() = http::StatusCode::SERVICE_UNAVAILABLE;
+            response.headers_mut().insert(
+                gang_types::handover::REQUEST_NOT_STARTED_HEADER,
+                http::HeaderValue::from_static("true"),
+            );
+            response.extensions_mut().insert(LeaderUnavailable);
+            response
         }
         Err(error) => refusal(&error),
     }
@@ -180,6 +169,8 @@ fn refusal(error: &PortError) -> http::Response<ApiResponseBody> {
 /// The controller a [`FakeScheduler`] runs: the gates and the Gang API it was started with.
 #[derive(Clone)]
 pub struct Controller {
+    /// Action policy passed to the controller.
+    pub actions: Arc<gang_config::ActionsConfig>,
     /// The gates and the Gang API.
     services: Arc<dyn Services>,
     observations: gang_spi::ObservationSink,
@@ -204,23 +195,11 @@ impl Controller {
     /// Whatever the public gate rejects the request with.
     pub async fn admit_public(
         &self,
+        scope: RequestScope,
         peer: &Peer,
         parts: &mut http::request::Parts,
-    ) -> Result<Admitted, PortError> {
-        self.services.admit_public(peer, parts).await
-    }
-
-    /// Applies the execution listener's gate, or returns `None` without that listener.
-    ///
-    /// # Errors
-    ///
-    /// Whatever the execution gate rejects the request with.
-    pub async fn admit_execution(
-        &self,
-        peer: &Peer,
-        parts: &mut http::request::Parts,
-    ) -> Option<Result<Admitted, PortError>> {
-        self.services.admit_execution(peer, parts).await
+    ) -> Result<GateDecision, PortError> {
+        self.services.admit_public(scope, peer, parts).await
     }
 
     /// Applies the worker listener's gate to a request, as the controller does before any worker
@@ -231,10 +210,11 @@ impl Controller {
     /// Whatever the worker gate rejects the request with.
     pub async fn admit_worker(
         &self,
+        scope: RequestScope,
         peer: &Peer,
         parts: &mut http::request::Parts,
-    ) -> Result<Admitted, PortError> {
-        self.services.admit_worker(peer, parts).await
+    ) -> Result<GateDecision, PortError> {
+        self.services.admit_worker(scope, peer, parts).await
     }
 
     /// Answers a request admitted by the public gate, passing its authenticated caller to the
@@ -245,13 +225,49 @@ impl Controller {
     ) -> http::Response<ApiResponseBody> {
         self.services.call_api(request).await
     }
+}
 
-    /// Answers through the Gang API and execution gate, or returns `None` without that listener.
-    pub async fn call_execution_api(
+/// The real services retained by a standby transport, with leader requests always refused.
+#[derive(Clone)]
+pub struct StandbyServices {
+    services: Arc<dyn Services>,
+}
+
+impl StandbyServices {
+    /// Applies the public gate, refusing leader scope independently of that gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error from the public gate for a shared request.
+    pub async fn admit_public(
+        &self,
+        scope: RequestScope,
+        peer: &Peer,
+        parts: &mut http::request::Parts,
+    ) -> Result<GateDecision, PortError> {
+        self.services.admit_public(scope, peer, parts).await
+    }
+
+    /// Applies the worker gate, refusing leader scope independently of that gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error from the worker gate for a shared request.
+    pub async fn admit_worker(
+        &self,
+        scope: RequestScope,
+        peer: &Peer,
+        parts: &mut http::request::Parts,
+    ) -> Result<GateDecision, PortError> {
+        self.services.admit_worker(scope, peer, parts).await
+    }
+
+    /// Runs the supplied API after shared public admission.
+    pub async fn call_api(
         &self,
         request: http::Request<ApiRequestBody>,
-    ) -> Option<http::Response<ApiResponseBody>> {
-        self.services.call_execution_api(request).await
+    ) -> http::Response<ApiResponseBody> {
+        self.services.call_api(request).await
     }
 }
 
@@ -287,6 +303,10 @@ pub enum RecordedTls {
 /// The fields of a [`WorkerSpec`] the scheduler received, owned so they outlive the call.
 #[derive(Debug, Clone)]
 pub struct RecordedSpec {
+    /// Action policy passed to the worker.
+    pub actions: Arc<gang_config::ActionsConfig>,
+    /// Prepared action memory pool.
+    pub memory_pool: Option<gang_spi::ActionMemoryPool>,
     /// The instance the worker runs on.
     pub instance: InstanceId,
     /// The properties the worker registers with the scheduler.
@@ -309,6 +329,14 @@ pub struct RecordedSpec {
     pub entrypoint: PathBuf,
 }
 
+/// The scripted result of a refusal run after its intake and response drain finish.
+#[derive(Default)]
+enum RefusalOutcome {
+    #[default]
+    Success,
+    Failure,
+}
+
 /// Which operations of a [`FakeScheduler`] fail.
 #[derive(Default)]
 struct Failing {
@@ -318,6 +346,8 @@ struct Failing {
     actions: bool,
     /// `run_controller`, which fails at once.
     controller: bool,
+    /// `serve_standby`, checked after intake and any held response drain finish.
+    refusals: RefusalOutcome,
 }
 
 /// The state a [`FakeScheduler`] shares between its clones.
@@ -330,6 +360,8 @@ struct SchedulerState {
     snapshot_hold: Option<oneshot::Receiver<()>>,
     /// The actions `actions` reports.
     actions: ActionsView,
+    /// Live learned histories in recency order.
+    history: Vec<LearnedHistory>,
     /// Workers that are no longer connected; drain requests for them report not found.
     vanished: Vec<WorkerId>,
     /// The operations that fail.
@@ -338,6 +370,8 @@ struct SchedulerState {
     finish_controller: bool,
     /// Where `run_controller` forwards every connection it receives.
     connections: Option<mpsc::UnboundedSender<Received>>,
+    /// Where `serve_standby` forwards every connection it receives.
+    refusal_connections: Option<mpsc::UnboundedSender<Received>>,
     /// How the next worker behaves.
     behaviour: Behaviour,
     /// Every spec `run_worker` has been asked to run.
@@ -346,6 +380,10 @@ struct SchedulerState {
     draining_calls: Vec<(WorkerId, bool)>,
     /// Released by the test; while held, `run_controller` waits on it after its connections end.
     drain_hold: Option<oneshot::Receiver<()>>,
+    /// Released by the test after the next refusal run's two connection streams end.
+    refusal_drain_hold: Option<oneshot::Receiver<()>>,
+    /// Released by the test before the next controller signals readiness.
+    ready_hold: Option<oneshot::Receiver<()>>,
 }
 
 /// Counts calls made to a fake, so that a test can wait until a number of them has been made.
@@ -386,6 +424,88 @@ impl CallCount {
     }
 }
 
+/// Buffers preparation-time connections, forwards them after readiness, and drains on EOF.
+async fn serve_controller_connections(
+    mut merged: impl futures::Stream<Item = Received> + Unpin,
+    sender: Option<mpsc::UnboundedSender<Received>>,
+    ready: ControllerReady,
+    ready_hold: Option<oneshot::Receiver<()>>,
+    drain_hold: Option<oneshot::Receiver<()>>,
+    drains: &CallCount,
+) {
+    let mut pending = Vec::new();
+    if let Some(mut hold) = ready_hold {
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut hold => break,
+                received = merged.next() => {
+                    if let Some(received) = received {
+                        pending.push(received);
+                    } else {
+                        drop(ready);
+                        drop(hold);
+                        drop(merged);
+                        drop(pending);
+                        if let Some(hold) = drain_hold {
+                            drains.bump();
+                            let _ = hold.await;
+                        }
+                        return;
+                    }
+                },
+            }
+        }
+    }
+    ready.signal();
+    if let Some(sender) = &sender {
+        for received in pending {
+            let _ = sender.send(received);
+        }
+    }
+    while let Some(received) = merged.next().await {
+        if let Some(sender) = &sender {
+            let _ = sender.send(received);
+        }
+    }
+    drop(merged);
+    if let Some(hold) = drain_hold {
+        drains.bump();
+        let _ = hold.await;
+    }
+}
+
+/// Removes the published controller on normal return and cancellation.
+struct PublishedController<'a>(&'a watch::Sender<Option<Controller>>);
+
+impl Drop for PublishedController<'_> {
+    fn drop(&mut self) {
+        self.0.send_replace(None);
+    }
+}
+
+/// Removes only this run's standby services, including on cancellation.
+struct PublishedStandby<'a> {
+    sender: &'a watch::Sender<Option<StandbyServices>>,
+    services: Arc<dyn Services>,
+}
+
+impl Drop for PublishedStandby<'_> {
+    fn drop(&mut self) {
+        self.sender.send_if_modified(|slot| {
+            if slot
+                .as_ref()
+                .is_some_and(|standby| Arc::ptr_eq(&standby.services, &self.services))
+            {
+                *slot = None;
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
 /// A scheduler that serves as both sides of the scheduler port. Its controller reports a
 /// configured snapshot, forwards the connections it receives, and refuses drain requests for
 /// vanished workers. Its worker records every spec it is asked to run and behaves as scripted.
@@ -397,6 +517,10 @@ pub struct FakeScheduler {
     state: Arc<Mutex<SchedulerState>>,
     /// The controller `run_controller` publishes; `controller` waits for it.
     published: Arc<watch::Sender<Option<Controller>>>,
+    /// The services of the independently running standby transport.
+    standby: Arc<watch::Sender<Option<StandbyServices>>>,
+    /// Successfully published controller terms.
+    controller_runs: CallCount,
     /// Calls to `run_worker`, counted once each call's spec is recorded.
     worker_starts: CallCount,
     /// Pending workers that returned after their stop signal completed.
@@ -407,6 +531,8 @@ pub struct FakeScheduler {
     snapshots: CallCount,
     /// Controller runs that finished their connections and wait on a drain hold.
     drains: CallCount,
+    /// Refusal transports started independently of normal controller publication.
+    refusal_runs: CallCount,
 }
 
 impl FakeScheduler {
@@ -438,21 +564,28 @@ impl FakeScheduler {
                 snapshot: SchedulerSnapshot::default(),
                 snapshot_hold: None,
                 actions: ActionsView::default(),
+                history: Vec::new(),
                 vanished: Vec::new(),
                 failing: Failing::default(),
                 finish_controller: false,
                 connections: None,
+                refusal_connections: None,
                 behaviour: Behaviour::Pending,
                 specs: Vec::new(),
                 draining_calls: Vec::new(),
                 drain_hold: None,
+                refusal_drain_hold: None,
+                ready_hold: None,
             })),
             published: Arc::new(watch::channel::<Option<Controller>>(None).0),
+            standby: Arc::new(watch::channel::<Option<StandbyServices>>(None).0),
+            controller_runs: CallCount::new(),
             worker_starts: CallCount::new(),
             worker_stops: CallCount::new(),
             actions_calls: CallCount::new(),
             snapshots: CallCount::new(),
             drains: CallCount::new(),
+            refusal_runs: CallCount::new(),
         })
     }
 
@@ -547,12 +680,58 @@ impl FakeScheduler {
         self.drains.clone()
     }
 
+    /// Counts controller terms at their atomic publication.
+    #[must_use]
+    pub fn controller_runs(&self) -> CallCount {
+        self.controller_runs.clone()
+    }
+
     /// Holds the next controller run open after its connections end, as a controller draining
     /// its connections, until the returned sender is used or dropped.
     #[must_use]
     pub fn hold_drain(&self) -> oneshot::Sender<()> {
         let (release, hold) = oneshot::channel();
         self.state.lock().drain_hold = Some(hold);
+        release
+    }
+
+    /// Counts refusal transports when they start consuming connections.
+    #[must_use]
+    pub fn refusal_runs(&self) -> CallCount {
+        self.refusal_runs.clone()
+    }
+
+    /// Holds the next refusal run after both intake streams end until released or dropped.
+    #[must_use]
+    pub fn hold_refusal_drain(&self) -> oneshot::Sender<()> {
+        let (release, hold) = oneshot::channel();
+        self.state.lock().refusal_drain_hold = Some(hold);
+        release
+    }
+
+    /// Makes refusal runs fail at completion while `fail` is true, including runs already held.
+    pub fn fail_refusals(&self, fail: bool) {
+        self.state.lock().failing.refusals = if fail {
+            RefusalOutcome::Failure
+        } else {
+            RefusalOutcome::Success
+        };
+    }
+
+    /// The channel the next refusal run forwards connections to, separate from the controller.
+    /// Call before that refusal run; the channel closes when the run returns.
+    #[must_use]
+    pub fn refusal_connections(&self) -> mpsc::UnboundedReceiver<Received> {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        self.state.lock().refusal_connections = Some(sender);
+        receiver
+    }
+
+    /// Holds the next controller before it signals readiness until released or dropped.
+    #[must_use]
+    pub fn hold_ready(&self) -> oneshot::Sender<()> {
+        let (release, hold) = oneshot::channel();
+        self.state.lock().ready_hold = Some(hold);
         release
     }
 
@@ -572,6 +751,15 @@ impl FakeScheduler {
     pub async fn controller(&self) -> Option<Controller> {
         let mut published = self.published.subscribe();
         let ready = published.wait_for(Option::is_some).await.ok()?;
+        (*ready).clone()
+    }
+
+    /// Waits for a standby transport and returns its supplied services.
+    ///
+    /// Returns `None` only if the scheduler's sender is dropped while waiting.
+    pub async fn standby_services(&self) -> Option<StandbyServices> {
+        let mut standby = self.standby.subscribe();
+        let ready = standby.wait_for(Option::is_some).await.ok()?;
         (*ready).clone()
     }
 
@@ -608,6 +796,49 @@ impl FakeScheduler {
 }
 
 impl SchedulerPort for FakeScheduler {
+    fn learned_history_byte_limit(&self) -> Result<NonZeroUsize, PortError> {
+        Ok(NonZeroUsize::MAX)
+    }
+
+    async fn learned_history(
+        &self,
+        now: Timestamp,
+        into: &mut Vec<LearnedHistory>,
+    ) -> Result<(), PortError> {
+        into.clear();
+        into.extend(
+            self.state
+                .lock()
+                .history
+                .iter()
+                .filter(|record| record.expires_at > now)
+                .cloned(),
+        );
+        Ok(())
+    }
+
+    async fn restore_learned_history(
+        &self,
+        now: Timestamp,
+        records: &[LearnedHistory],
+    ) -> Result<(), PortError> {
+        let mut state = self.state.lock();
+        state.history.clear();
+        state.history.extend(
+            records
+                .iter()
+                .filter(|record| {
+                    record.expires_at > now
+                        && matches!(
+                            record.key.kind,
+                            RecordKind::ResourceHistory | RecordKind::DurationHistory
+                        )
+                })
+                .cloned(),
+        );
+        Ok(())
+    }
+
     async fn snapshot(&self, into: &mut SchedulerSnapshot) -> Result<(), PortError> {
         let hold = self.state.lock().snapshot_hold.take();
         self.snapshots.bump();
@@ -661,13 +892,19 @@ impl SchedulerPort for FakeScheduler {
         connections: ControllerConnections<P, W, A>,
         ready: ControllerReady,
     ) -> Result<(), PortError> {
-        let (fail, finish, sender, drain_hold) = {
+        if self.published.borrow().is_some() {
+            return Err(PortError::config(io::Error::other(
+                "controller is already serving",
+            )));
+        }
+        let (fail, finish, sender, drain_hold, ready_hold) = {
             let mut state = self.state.lock();
             (
                 state.failing.controller,
                 state.finish_controller,
                 state.connections.take(),
                 state.drain_hold.take(),
+                state.ready_hold.take(),
             )
         };
         if fail {
@@ -679,7 +916,6 @@ impl SchedulerPort for FakeScheduler {
         }
         let ControllerConnections {
             public,
-            execution,
             worker,
             api,
         } = connections;
@@ -687,33 +923,36 @@ impl SchedulerPort for FakeScheduler {
             connections: public_connections,
             gate: public_gate,
         } = public;
-        let (execution_connections, execution_gate) = match execution {
-            Some(Listening { connections, gate }) => (connections, Some(gate)),
-            None => (futures::stream::empty().boxed(), None),
-        };
         let Listening {
             connections: worker_connections,
             gate: worker_gate,
         } = worker;
         let controller = Controller {
+            actions: Arc::clone(&spec.actions),
             services: Arc::new(Gates {
                 public: public_gate,
-                execution: execution_gate,
                 worker: worker_gate,
                 api,
+                standby: false,
             }),
             observations: spec.observations.clone(),
         };
-        self.published.send_replace(Some(controller));
-        ready.signal();
-
+        let claimed = self.published.send_if_modified(|slot| {
+            if slot.is_some() {
+                return false;
+            }
+            *slot = Some(controller);
+            self.controller_runs.bump();
+            true
+        });
+        if !claimed {
+            return Err(PortError::config(io::Error::other(
+                "controller is already serving",
+            )));
+        }
+        let _published = PublishedController(&self.published);
         let public_side = public_connections.map(|accepted| Received {
             side: Side::Public,
-            connection: accepted.connection,
-            peer: accepted.peer,
-        });
-        let execution_side = execution_connections.map(|accepted| Received {
-            side: Side::Execution,
             connection: accepted.connection,
             peer: accepted.peer,
         });
@@ -722,18 +961,74 @@ impl SchedulerPort for FakeScheduler {
             connection: accepted.connection,
             peer: accepted.peer,
         });
-        let mut merged = futures::stream::select(
-            futures::stream::select(public_side, execution_side),
-            worker_side,
-        );
+        let merged = futures::stream::select(public_side, worker_side);
+        serve_controller_connections(merged, sender, ready, ready_hold, drain_hold, &self.drains)
+            .await;
+        Ok(())
+    }
+
+    async fn serve_standby<P: RequestGate, W: RequestGate, A: ApiService>(
+        &self,
+        connections: ControllerConnections<P, W, A>,
+    ) -> Result<(), PortError> {
+        let (sender, drain_hold) = {
+            let mut state = self.state.lock();
+            (
+                state.refusal_connections.take(),
+                state.refusal_drain_hold.take(),
+            )
+        };
+        let ControllerConnections {
+            public,
+            worker,
+            api,
+        } = connections;
+        let Listening {
+            connections: public_connections,
+            gate: public_gate,
+        } = public;
+        let Listening {
+            connections: worker_connections,
+            gate: worker_gate,
+        } = worker;
+        let services: Arc<dyn Services> = Arc::new(Gates {
+            public: public_gate,
+            worker: worker_gate,
+            api,
+            standby: true,
+        });
+        self.standby.send_replace(Some(StandbyServices {
+            services: Arc::clone(&services),
+        }));
+        let _standby = PublishedStandby {
+            sender: &self.standby,
+            services,
+        };
+        self.refusal_runs.bump();
+        let public_side = public_connections.map(|accepted| Received {
+            side: Side::Public,
+            connection: accepted.connection,
+            peer: accepted.peer,
+        });
+        let worker_side = worker_connections.map(|accepted| Received {
+            side: Side::Worker,
+            connection: accepted.connection,
+            peer: accepted.peer,
+        });
+        let mut merged = futures::stream::select(public_side, worker_side);
         while let Some(received) = merged.next().await {
             if let Some(sender) = &sender {
                 let _ = sender.send(received);
             }
         }
+        drop(merged);
         if let Some(hold) = drain_hold {
-            self.drains.bump();
             let _ = hold.await;
+        }
+        if matches!(self.state.lock().failing.refusals, RefusalOutcome::Failure) {
+            return Err(PortError::backend(io::Error::other(
+                "refusal transport failed",
+            )));
         }
         Ok(())
     }
@@ -752,6 +1047,8 @@ impl SchedulerPort for FakeScheduler {
                 )));
             }
             state.specs.push(RecordedSpec {
+                actions: Arc::clone(&spec.actions),
+                memory_pool: spec.memory_pool.clone(),
                 instance: spec.instance.clone(),
                 properties: spec.properties.clone(),
                 slots: spec.slots,
@@ -802,6 +1099,50 @@ mod tests {
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
+    #[tokio::test]
+    async fn learned_history_roundtrip_preserves_order_and_expiry() -> TestResult {
+        let scheduler = FakeScheduler::new()?;
+        let now = Timestamp::from_unix_millis(10);
+        let records = vec![
+            LearnedHistory {
+                key: gang_spi::RecordKey {
+                    kind: RecordKind::ResourceHistory,
+                    id: gang_spi::RecordId::new([1; 32]),
+                },
+                body: vec![1],
+                expires_at: Timestamp::from_unix_millis(20),
+            },
+            LearnedHistory {
+                key: gang_spi::RecordKey {
+                    kind: RecordKind::DurationHistory,
+                    id: gang_spi::RecordId::new([2; 32]),
+                },
+                body: vec![2],
+                expires_at: Timestamp::from_unix_millis(30),
+            },
+            LearnedHistory {
+                key: gang_spi::RecordKey {
+                    kind: RecordKind::ResourceHistory,
+                    id: gang_spi::RecordId::new([3; 32]),
+                },
+                body: vec![3],
+                expires_at: now,
+            },
+        ];
+        scheduler.restore_learned_history(now, &records).await?;
+        let mut out = vec![records[2].clone()];
+        scheduler.learned_history(now, &mut out).await?;
+        assert_eq!(out, records[..2]);
+        scheduler
+            .learned_history(Timestamp::from_unix_millis(20), &mut out)
+            .await?;
+        assert_eq!(out, records[1..2]);
+        scheduler.restore_learned_history(now, &[]).await?;
+        scheduler.learned_history(now, &mut out).await?;
+        assert!(out.is_empty());
+        Ok(())
+    }
+
     /// The owned inputs of a [`WorkerSpec`], so a test can borrow one.
     struct WorkerFixture {
         instance: InstanceId,
@@ -831,6 +1172,8 @@ mod tests {
 
         fn spec(&self) -> WorkerSpec {
             WorkerSpec {
+                actions: Arc::new(gang_config::ActionsConfig::default()),
+                memory_pool: None,
                 instance: self.instance.clone(),
                 properties: self.properties.clone(),
                 slots: Slots::LongLived(NonZeroU32::MIN.saturating_add(3)),
@@ -1270,16 +1613,19 @@ mod tests {
     impl RequestGate for AdmitAll {
         async fn admit(
             &self,
+            _scope: RequestScope,
             _peer: &Peer,
             _parts: &mut http::request::Parts,
-        ) -> Result<Admitted, PortError> {
-            Ok(Admitted::Authenticated(Authenticated {
-                identity: Arc::new(Identity::new(
-                    ProviderName::try_new("test").expect("valid provider"),
-                    Principal::try_new("tester").expect("valid principal"),
-                )),
-                valid_until: None,
-            }))
+        ) -> Result<GateDecision, PortError> {
+            Ok(GateDecision::Admit(Admitted::Authenticated(
+                Authenticated {
+                    identity: Arc::new(Identity::new(
+                        ProviderName::try_new("test").expect("valid provider"),
+                        Principal::try_new("tester").expect("valid principal"),
+                    )),
+                    valid_until: None,
+                },
+            )))
         }
     }
 
@@ -1304,13 +1650,37 @@ mod tests {
     impl RequestGate for SwitchGate {
         async fn admit(
             &self,
+            scope: RequestScope,
             peer: &Peer,
             parts: &mut http::request::Parts,
-        ) -> Result<Admitted, PortError> {
+        ) -> Result<GateDecision, PortError> {
             if self.0 {
-                AdmitAll.admit(peer, parts).await
+                AdmitAll.admit(scope, peer, parts).await
             } else {
                 Err(PortError::unavailable("gate is closed"))
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct CountingGate {
+        calls: CallCount,
+        not_leading: bool,
+    }
+
+    impl RequestGate for CountingGate {
+        async fn admit(
+            &self,
+            scope: RequestScope,
+            peer: &Peer,
+            parts: &mut http::request::Parts,
+        ) -> Result<GateDecision, PortError> {
+            assert!(matches!(scope, RequestScope::Shared));
+            self.calls.bump();
+            if self.not_leading {
+                Ok(GateDecision::NotLeading)
+            } else {
+                AdmitAll.admit(scope, peer, parts).await
             }
         }
     }
@@ -1337,54 +1707,219 @@ mod tests {
         }
     }
 
-    async fn assert_controller_gates(
-        controller: &Controller,
-        observations: &gang_spi::ObservationSink,
-    ) -> TestResult {
+    async fn assert_controller_gates(controller: &Controller) -> TestResult {
         let public = controller.call_api(http::Request::new(full_body(""))).await;
         assert_eq!(public.status(), http::StatusCode::SERVICE_UNAVAILABLE);
-        let execution = controller
-            .call_execution_api(http::Request::new(full_body("")))
-            .await
-            .ok_or("execution listener missing")?;
-        assert_eq!(execution.status(), http::StatusCode::OK);
         let (mut parts, ()) = http::Request::new(()).into_parts();
-        assert!(matches!(
+        assert!(
             controller
-                .admit_execution(&Peer::default(), &mut parts)
-                .await,
-            Some(Ok(Admitted::Authenticated(_)))
-        ));
-        let rejecting = Controller {
-            services: Arc::new(Gates {
-                public: SwitchGate(true),
-                execution: Some(SwitchGate(false)),
-                worker: AdmitAll,
+                .admit_public(RequestScope::Shared, &Peer::default(), &mut parts)
+                .await
+                .is_err()
+        );
+        assert!(
+            controller
+                .admit_worker(RequestScope::Shared, &Peer::default(), &mut parts)
+                .await
+                .is_ok()
+        );
+        Ok(())
+    }
+
+    fn assert_cancellation_unpublishes(scheduler: &FakeScheduler, spec: &ControllerSpec<'_>) {
+        {
+            let connections = ControllerConnections {
+                public: Listening {
+                    connections: futures::stream::pending().boxed(),
+                    gate: AdmitAll,
+                },
+                worker: Listening {
+                    connections: futures::stream::pending().boxed(),
+                    gate: AdmitAll,
+                },
                 api: EmptyApi,
-            }),
-            observations: observations.clone(),
-        };
-        let denied = rejecting
-            .call_execution_api(http::Request::new(full_body("")))
-            .await
-            .ok_or("execution listener missing")?;
-        assert_eq!(denied.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+            };
+            let (ready, _) = ControllerReady::channel();
+            let mut run = Box::pin(scheduler.run_controller(spec, connections, ready));
+            assert!(run.as_mut().now_or_never().is_none());
+            assert!(scheduler.published.borrow().is_some());
+        }
+        assert!(scheduler.published.borrow().is_none());
+    }
+
+    #[tokio::test]
+    async fn refusals_consume_both_intakes_before_drain_and_read_failure_at_completion()
+    -> TestResult {
+        let scheduler = FakeScheduler::new()?;
+        scheduler.fail_controller(true);
+        scheduler.finish_controller(true);
+        for last in 0..2 {
+            scheduler.fail_refusals(last == 0);
+            let release = scheduler.hold_refusal_drain();
+            let mut received = scheduler.refusal_connections();
+            let (public_tx, public_rx) = futures::channel::mpsc::unbounded();
+            let (worker_tx, worker_rx) = futures::channel::mpsc::unbounded();
+            let mut senders = [Some(public_tx), Some(worker_tx)];
+            let connections = ControllerConnections {
+                public: Listening {
+                    connections: public_rx.boxed(),
+                    gate: AdmitAll,
+                },
+                worker: Listening {
+                    connections: worker_rx.boxed(),
+                    gate: AdmitAll,
+                },
+                api: EmptyApi,
+            };
+            let run = scheduler.serve_standby(connections);
+            futures::pin_mut!(run);
+            assert!(run.as_mut().now_or_never().is_none());
+            assert_eq!(scheduler.refusal_runs().get(), last + 1);
+            for (index, side) in [Side::Public, Side::Worker].into_iter().enumerate() {
+                let (connection, _peer) = tokio::io::duplex(64);
+                senders[index]
+                    .as_ref()
+                    .ok_or("sender missing")?
+                    .unbounded_send(gang_spi::Accepted {
+                        connection: Box::new(connection),
+                        peer: Peer::default(),
+                    })?;
+                assert!(run.as_mut().now_or_never().is_none());
+                assert_eq!(received.try_recv()?.side, side);
+            }
+            drop(senders[1 - last].take());
+            assert!(run.as_mut().now_or_never().is_none());
+            let (connection, _peer) = tokio::io::duplex(64);
+            senders[last]
+                .as_ref()
+                .ok_or("last sender missing")?
+                .unbounded_send(gang_spi::Accepted {
+                    connection: Box::new(connection),
+                    peer: Peer::default(),
+                })?;
+            assert!(run.as_mut().now_or_never().is_none());
+            assert_eq!(
+                received.try_recv()?.side,
+                [Side::Public, Side::Worker][last]
+            );
+            drop(senders[last].take());
+            assert!(run.as_mut().now_or_never().is_none());
+            assert!(scheduler.published.borrow().is_none());
+            assert_eq!(scheduler.controller_runs().get(), 0);
+            assert_eq!(scheduler.drains().get(), 0);
+            assert_eq!(scheduler.snapshots().get(), 0);
+            scheduler.fail_refusals(last == 1);
+            drop(release);
+            let outcome = run.as_mut().now_or_never();
+            if last == 0 {
+                assert!(matches!(outcome, Some(Ok(()))));
+            } else {
+                assert!(matches!(outcome, Some(Err(PortError::Backend(_)))));
+            }
+            assert!(matches!(received.recv().now_or_never(), Some(None)));
+        }
         Ok(())
     }
 
     #[tokio::test]
-    async fn execution_api_receives_the_admitted_identity() -> TestResult {
-        let gates = Gates {
-            public: AdmitAll,
-            execution: Some(AdmitAll),
-            worker: AdmitAll,
+    async fn refusals_do_not_publish_or_replace_a_draining_controller() -> TestResult {
+        let fixture = WorkerFixture::new()?;
+        let stores = gang_spi::RenderedStoreSpec(serde_json::Value::Null);
+        let catalog = gang_types::FleetCatalog::try_new(vec![fixture.properties.clone()])?;
+        let (observations, _receiver) = gang_spi::ObservationSink::channel(
+            std::num::NonZeroUsize::MIN,
+            std::num::NonZeroUsize::MIN,
+        );
+        let spec = ControllerSpec {
+            actions: Arc::new(gang_config::ActionsConfig::default()),
+            content_store: &stores,
+            action_store: &stores,
+            fleets: &catalog,
+            max_workers: 8,
+            client_action_timeout: std::time::Duration::from_mins(1),
+            observations: &observations,
+        };
+        let scheduler = FakeScheduler::new()?;
+        let release = scheduler.hold_drain();
+        let empty = || ControllerConnections {
+            public: Listening {
+                connections: futures::stream::empty().boxed(),
+                gate: AdmitAll,
+            },
+            worker: Listening {
+                connections: futures::stream::empty().boxed(),
+                gate: AdmitAll,
+            },
+            api: EmptyApi,
+        };
+        let (ready, mut readiness) = ControllerReady::channel();
+        let controller = scheduler.run_controller(&spec, empty(), ready);
+        futures::pin_mut!(controller);
+        assert!(controller.as_mut().now_or_never().is_none());
+        assert!(readiness.try_recv().is_ok());
+        assert_eq!(scheduler.drains().get(), 1);
+        let public_calls = CallCount::new();
+        let worker_calls = CallCount::new();
+        let standby_connections = ControllerConnections {
+            public: Listening {
+                connections: futures::stream::pending().boxed(),
+                gate: CountingGate {
+                    calls: public_calls.clone(),
+                    not_leading: false,
+                },
+            },
+            worker: Listening {
+                connections: futures::stream::pending().boxed(),
+                gate: CountingGate {
+                    calls: worker_calls.clone(),
+                    not_leading: false,
+                },
+            },
             api: CallerApi,
         };
-        let response = gates
-            .call_execution_api(http::Request::new(full_body("")))
+        let standby = scheduler.serve_standby(standby_connections);
+        futures::pin_mut!(standby);
+        assert!(standby.as_mut().now_or_never().is_none());
+        let services = scheduler
+            .standby_services()
             .await
-            .ok_or("execution listener missing")?;
+            .ok_or("standby missing")?;
+        let response = services.call_api(http::Request::new(full_body(""))).await;
         assert_eq!(response.headers()["x-caller"], "test:tester");
+        let (mut parts, ()) = http::Request::new(()).into_parts();
+        assert!(matches!(
+            services
+                .admit_public(RequestScope::Shared, &Peer::default(), &mut parts)
+                .await?,
+            GateDecision::Admit(_)
+        ));
+        assert!(matches!(
+            services
+                .admit_worker(RequestScope::Shared, &Peer::default(), &mut parts)
+                .await?,
+            GateDecision::Admit(_)
+        ));
+        assert!(matches!(
+            services
+                .admit_public(RequestScope::Leader, &Peer::default(), &mut parts)
+                .await?,
+            GateDecision::NotLeading
+        ));
+        assert!(matches!(
+            services
+                .admit_worker(RequestScope::Leader, &Peer::default(), &mut parts)
+                .await?,
+            GateDecision::NotLeading
+        ));
+        assert_eq!(public_calls.get(), 2);
+        assert_eq!(worker_calls.get(), 1);
+        assert!(scheduler.published.borrow().is_some());
+        assert_eq!(scheduler.controller_runs().get(), 1);
+        assert_eq!(scheduler.refusal_runs().get(), 1);
+        assert!(controller.as_mut().now_or_never().is_none());
+        drop(release);
+        controller.await?;
+        assert!(scheduler.published.borrow().is_none());
         Ok(())
     }
 
@@ -1398,6 +1933,7 @@ mod tests {
             std::num::NonZeroUsize::MIN,
         );
         let spec = ControllerSpec {
+            actions: Arc::new(gang_config::ActionsConfig::default()),
             content_store: &stores,
             action_store: &stores,
             fleets: &catalog,
@@ -1405,22 +1941,17 @@ mod tests {
             client_action_timeout: std::time::Duration::from_mins(1),
             observations: &observations,
         };
-        for last in 0..3 {
-            let scheduler = FakeScheduler::new()?;
+        let scheduler = FakeScheduler::new()?;
+        for last in 0..2 {
             let mut received = scheduler.connections();
             let (public_tx, public_rx) = futures::channel::mpsc::unbounded();
-            let (execution_tx, execution_rx) = futures::channel::mpsc::unbounded();
             let (worker_tx, worker_rx) = futures::channel::mpsc::unbounded();
-            let mut senders = [Some(public_tx), Some(execution_tx), Some(worker_tx)];
+            let mut senders = [Some(public_tx), Some(worker_tx)];
             let connections = ControllerConnections {
                 public: Listening {
                     connections: public_rx.boxed(),
                     gate: SwitchGate(false),
                 },
-                execution: Some(Listening {
-                    connections: execution_rx.boxed(),
-                    gate: SwitchGate(true),
-                }),
                 worker: Listening {
                     connections: worker_rx.boxed(),
                     gate: AdmitAll,
@@ -1432,17 +1963,31 @@ mod tests {
             futures::pin_mut!(run);
             assert!(run.as_mut().now_or_never().is_none());
             assert!(readiness.try_recv().is_ok());
+            assert_eq!(scheduler.controller_runs().get(), last + 1);
+            let (other_ready, _) = ControllerReady::channel();
+            let other = ControllerConnections {
+                public: Listening {
+                    connections: futures::stream::pending().boxed(),
+                    gate: AdmitAll,
+                },
+                worker: Listening {
+                    connections: futures::stream::pending().boxed(),
+                    gate: AdmitAll,
+                },
+                api: EmptyApi,
+            };
+            assert!(matches!(
+                scheduler.run_controller(&spec, other, other_ready).await,
+                Err(PortError::Config(_))
+            ));
 
             let controller = scheduler
                 .controller()
                 .await
                 .ok_or("controller not published")?;
-            assert_controller_gates(&controller, &observations).await?;
+            assert_controller_gates(&controller).await?;
 
-            for (sender, side) in senders
-                .iter()
-                .zip([Side::Public, Side::Execution, Side::Worker])
-            {
+            for (sender, side) in senders.iter().zip([Side::Public, Side::Worker]) {
                 let (connection, _other) = tokio::io::duplex(64);
                 let accepted = gang_spi::Accepted {
                     connection: Box::new(connection),
@@ -1469,74 +2014,137 @@ mod tests {
             }
             drop(senders[last].take());
             assert!(matches!(run.as_mut().now_or_never(), Some(Ok(()))));
+            assert!(scheduler.published.borrow().is_none());
             assert!(received.recv().await.is_none());
+        }
+        assert_readiness_hold_cases(&scheduler, &spec).await?;
+        assert_readiness_cancellation_drain(&scheduler, &spec).await;
+        assert_cancellation_unpublishes(&scheduler, &spec);
+        Ok(())
+    }
+
+    async fn assert_readiness_hold_cases(
+        scheduler: &FakeScheduler,
+        spec: &ControllerSpec<'_>,
+    ) -> TestResult {
+        for (cancel, simultaneous) in [(true, false), (false, false), (false, true)] {
+            let release = scheduler.hold_ready();
+            let mut received = scheduler.connections();
+            let (public_tx, public_rx) = futures::channel::mpsc::unbounded();
+            let (worker_tx, worker_rx) = futures::channel::mpsc::unbounded();
+            let connections = ControllerConnections {
+                public: Listening {
+                    connections: public_rx.boxed(),
+                    gate: AdmitAll,
+                },
+                worker: Listening {
+                    connections: worker_rx.boxed(),
+                    gate: AdmitAll,
+                },
+                api: EmptyApi,
+            };
+            let (ready, mut readiness) = ControllerReady::channel();
+            let run = scheduler.run_controller(spec, connections, ready);
+            futures::pin_mut!(run);
+            assert!(run.as_mut().now_or_never().is_none());
+            let (connection, _other) = tokio::io::duplex(64);
+            public_tx.unbounded_send(gang_spi::Accepted {
+                connection: Box::new(connection),
+                peer: Peer::default(),
+            })?;
+            assert!(run.as_mut().now_or_never().is_none());
+            assert!(received.try_recv().is_err());
+            if cancel {
+                drop(public_tx);
+                assert!(run.as_mut().now_or_never().is_none());
+                drop(worker_tx);
+                assert!(matches!(run.as_mut().now_or_never(), Some(Ok(()))));
+                assert!(readiness.await.is_err());
+                assert!(release.send(()).is_err());
+                assert!(scheduler.published.borrow().is_none());
+            } else {
+                release.send(()).expect("readiness hold is active");
+                if simultaneous {
+                    drop(public_tx);
+                    drop(worker_tx);
+                    assert!(matches!(run.as_mut().now_or_never(), Some(Ok(()))));
+                } else {
+                    assert!(run.as_mut().now_or_never().is_none());
+                    drop(public_tx);
+                    drop(worker_tx);
+                    assert!(matches!(run.as_mut().now_or_never(), Some(Ok(()))));
+                }
+                assert!(readiness.try_recv().is_ok());
+                assert_eq!(received.try_recv()?.side, Side::Public);
+            }
         }
         Ok(())
     }
 
-    #[tokio::test]
-    async fn controller_without_execution_listener_waits_for_public_and_worker() -> TestResult {
-        let fixture = WorkerFixture::new()?;
-        let stores = gang_spi::RenderedStoreSpec(serde_json::Value::Null);
-        let catalog = gang_types::FleetCatalog::try_new(vec![fixture.properties.clone()])?;
-        let (observations, _receiver) = gang_spi::ObservationSink::channel(
-            std::num::NonZeroUsize::MIN,
-            std::num::NonZeroUsize::MIN,
-        );
-        let spec = ControllerSpec {
-            content_store: &stores,
-            action_store: &stores,
-            fleets: &catalog,
-            max_workers: 8,
-            client_action_timeout: std::time::Duration::from_mins(1),
-            observations: &observations,
-        };
-        let scheduler = FakeScheduler::new()?;
-        let (public_tx, public_rx) = futures::channel::mpsc::unbounded();
-        let (worker_tx, worker_rx) = futures::channel::mpsc::unbounded();
+    async fn assert_readiness_cancellation_drain(
+        scheduler: &FakeScheduler,
+        spec: &ControllerSpec<'_>,
+    ) {
+        let ready_release = scheduler.hold_ready();
+        let drain_release = scheduler.hold_drain();
         let connections = ControllerConnections {
             public: Listening {
-                connections: public_rx.boxed(),
+                connections: futures::stream::empty().boxed(),
                 gate: AdmitAll,
             },
-            execution: None,
             worker: Listening {
-                connections: worker_rx.boxed(),
+                connections: futures::stream::empty().boxed(),
                 gate: AdmitAll,
             },
             api: EmptyApi,
         };
-        let (ready, _) = ControllerReady::channel();
-        let run = scheduler.run_controller(&spec, connections, ready);
+        let (ready, readiness) = ControllerReady::channel();
+        let run = scheduler.run_controller(spec, connections, ready);
         futures::pin_mut!(run);
+        let previous_drains = scheduler.drains().get();
         assert!(run.as_mut().now_or_never().is_none());
-        let controller = scheduler
-            .controller()
-            .await
-            .ok_or("controller not published")?;
-        assert!(
-            controller
-                .call_execution_api(http::Request::new(full_body("")))
-                .await
-                .is_none()
-        );
-        drop(public_tx);
-        assert!(run.as_mut().now_or_never().is_none());
-        drop(worker_tx);
+        assert_eq!(scheduler.drains().get(), previous_drains + 1);
+        assert!(readiness.await.is_err());
+        assert!(ready_release.send(()).is_err());
+        assert!(scheduler.published.borrow().is_some());
+        drop(drain_release);
         assert!(matches!(run.as_mut().now_or_never(), Some(Ok(()))));
-        Ok(())
+        assert!(scheduler.published.borrow().is_none());
     }
 
     #[tokio::test]
     async fn the_api_receives_the_caller_its_gate_admitted() {
         let gates = Gates {
             public: AdmitAll,
-            execution: None,
             worker: AdmitAll,
             api: CallerApi,
+            standby: false,
         };
         let response = gates.call_api(http::Request::new(full_body(""))).await;
         assert_eq!(response.headers()["x-caller"], "test:tester");
+    }
+
+    #[tokio::test]
+    async fn api_not_leading_refuses_before_calling_api() {
+        let calls = CallCount::new();
+        let gates = Gates {
+            public: CountingGate {
+                calls: calls.clone(),
+                not_leading: true,
+            },
+            worker: AdmitAll,
+            api: CallerApi,
+            standby: false,
+        };
+        let response = gates.call_api(http::Request::new(full_body(""))).await;
+        assert_eq!(calls.get(), 1);
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers()[gang_types::handover::REQUEST_NOT_STARTED_HEADER],
+            "true"
+        );
+        assert!(!response.headers().contains_key("x-caller"));
+        assert!(response.extensions().get::<LeaderUnavailable>().is_some());
     }
 
     #[test]
@@ -1549,6 +2157,7 @@ mod tests {
             std::num::NonZeroUsize::MIN,
         );
         let spec = ControllerSpec {
+            actions: Arc::new(gang_config::ActionsConfig::default()),
             content_store: &stores,
             action_store: &stores,
             fleets: &catalog,
@@ -1565,7 +2174,6 @@ mod tests {
                 connections: futures::stream::empty().boxed(),
                 gate: AdmitAll,
             },
-            execution: None,
             worker: Listening {
                 connections: futures::stream::empty().boxed(),
                 gate: AdmitAll,
@@ -1593,6 +2201,7 @@ mod tests {
             std::num::NonZeroUsize::MIN,
         );
         let spec = ControllerSpec {
+            actions: Arc::new(gang_config::ActionsConfig::default()),
             content_store: &stores,
             action_store: &stores,
             fleets: &catalog,
@@ -1607,7 +2216,6 @@ mod tests {
                 connections: futures::stream::empty().boxed(),
                 gate: AdmitAll,
             },
-            execution: None,
             worker: Listening {
                 connections: futures::stream::empty().boxed(),
                 gate: AdmitAll,

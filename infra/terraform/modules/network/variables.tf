@@ -66,6 +66,13 @@ variable "controller_eip" {
   nullable    = false
 }
 
+variable "shared_database" {
+  description = "Route controller traffic through load balancers for shared-database deployments."
+  type        = bool
+  default     = false
+  nullable    = false
+}
+
 variable "tags" {
   description = "Tags merged into every taggable resource of the module."
   type        = map(string)

@@ -1,12 +1,12 @@
-//! The real [`ServerApi`]: the public listener of a [`Stack`], reached over server-TLS that
-//! trusts only the deployment's CA pin.
+//! The real [`ServerApi`]: the public listener of a [`Stack`], reached over plaintext or
+//! server-TLS that trusts only the deployment's CA pin.
 
 use std::os::unix::process::ExitStatusExt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use gang_clock::SystemClock;
-use gang_tls::{HttpProtocol, HttpRequest, HttpTransport, RequestBody, ServerTrust};
+use gang_tls::{HttpRequest, RequestBody, ServerTrust};
 use gang_types::{CaPin, Url};
 use gang_wire::routes::WATCH_STATE;
 use http::header::{AUTHORIZATION, COOKIE, HeaderName, HeaderValue};
@@ -101,24 +101,6 @@ fn with_request<T>(
     })
 }
 
-/// Returns the pinned client of the running server, building it on first use after each start.
-fn client(stack: &Stack<'_>) -> Result<Arc<Http>> {
-    let mut slot = stack.server_http.lock();
-    if let Some(client) = slot.as_ref() {
-        return Ok(Arc::clone(client));
-    }
-    let pin = stack.ca_pin()?;
-    let http = Arc::new(Http::try_new(
-        HttpTransport::Tls {
-            trust: ServerTrust::Pin(&pin),
-        },
-        HttpProtocol::Http2,
-        stack.settings().command_timeout,
-    )?);
-    *slot = Some(Arc::clone(&http));
-    Ok(http)
-}
-
 /// Sends a request and reads its entire response.
 fn exchange(api: &Http, endpoint: &Url, request: &Request) -> Result<Answer> {
     let response = with_request(endpoint, request, |request| api.send(request))?;
@@ -151,13 +133,13 @@ impl ServerApi for Stack<'_> {
     }
 
     fn send(&self, request: &Request) -> Result<Answer> {
-        let api = client(self)?;
+        let api = self.server_client()?;
         exchange(&api, &self.endpoint()?, request)
     }
 
     fn watch(&self, cookie: &SessionCookie) -> Result<Self::Stream> {
         let endpoint = self.endpoint()?;
-        let api = client(self)?;
+        let api = self.server_client()?;
         let request = Request::get(WATCH_STATE.template)
             .presenting(Presented::Cookie(cookie.clone()))
             .header("accept", "text/event-stream");

@@ -3,7 +3,7 @@
 use std::fmt::{Debug, Display};
 use std::path::PathBuf;
 
-use gang_types::{AuthenticationSettings, FleetName, SchedulerSettings};
+use gang_types::{AuthenticationSettings, FleetName};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -22,9 +22,6 @@ pub trait PluginSet {
     type Cache: DeserializeOwned + Serialize + Debug + Clone;
     /// The `[signer.<plugin>]` section: exactly one plugin.
     type Signer: DeserializeOwned + Serialize + Debug + Clone;
-    /// The `[scheduler.<plugin>]` section: exactly one plugin; the host reads the worker endpoint
-    /// through `SchedulerSettings`.
-    type Scheduler: DeserializeOwned + Serialize + Debug + Clone + SchedulerSettings;
     /// The `[database.<plugin>]` section: exactly one plugin.
     type Database: DeserializeOwned + Serialize + Debug + Clone;
     /// Names one sandbox plugin by its section key; `Display` prints the key.

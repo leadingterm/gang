@@ -4,10 +4,10 @@
 use std::net::SocketAddr;
 
 use gang_config::{Document, ServerTransport};
-use gang_types::{CaPin, SchedulerSettings, Url, is_loopback_url};
+use gang_types::{CaPin, Url, is_loopback_url};
 
 use crate::errors::LocalCommandError;
-use crate::plugins::{Plugins, SchedulerConfig, anonymous_authentication, worker_endpoint_key};
+use crate::plugins::{Plugins, anonymous_authentication};
 
 /// Returns the configuration copy of `document` with the server's CA pinned to `pin`, keeping
 /// every other setting.
@@ -44,16 +44,9 @@ pub(crate) fn with_plaintext(
     let worker_endpoint = worker_endpoint
         .map(|url| with_scheme(url, transport.worker_scheme()))
         .transpose()?;
-    document
-        .scheduler
-        .set_worker_endpoint(worker_endpoint.clone());
+    document.worker_endpoint.clone_from(&worker_endpoint);
     let authentication = anonymous_authentication();
     let endpoint = endpoint
-        .map(|url| with_scheme(url, transport.public_scheme()))
-        .transpose()?;
-    document.execution_endpoint = document
-        .execution_endpoint
-        .as_ref()
         .map(|url| with_scheme(url, transport.public_scheme()))
         .transpose()?;
     let rendered = document
@@ -74,9 +67,7 @@ pub(crate) fn require_insecure_loopback(
     listen: SocketAddr,
     worker_listen: SocketAddr,
     endpoint: Option<&Url>,
-    scheduler: &SchedulerConfig,
-    execution_listen: Option<SocketAddr>,
-    execution_endpoint: Option<&Url>,
+    worker_endpoint: Option<&Url>,
 ) -> Result<(), LocalCommandError> {
     if !listen.ip().is_loopback() {
         return Err(not_loopback("listen", &listen));
@@ -84,20 +75,11 @@ pub(crate) fn require_insecure_loopback(
     if !worker_listen.ip().is_loopback() {
         return Err(not_loopback("worker_listen", &worker_listen));
     }
-    if let Some(address) = execution_listen.filter(|address| !address.ip().is_loopback()) {
-        return Err(not_loopback("execution_listen", &address));
-    }
-    if let Some(url) = execution_endpoint.filter(|url| !is_loopback_url(url)) {
-        return Err(not_loopback("execution_endpoint", url));
-    }
     if let Some(url) = endpoint.filter(|url| !is_loopback_url(url)) {
         return Err(not_loopback("endpoint", url));
     }
-    if let Some(url) = scheduler
-        .worker_endpoint()
-        .filter(|url| !is_loopback_url(url))
-    {
-        return Err(not_loopback(worker_endpoint_key(scheduler), url));
+    if let Some(url) = worker_endpoint.filter(|url| !is_loopback_url(url)) {
+        return Err(not_loopback("worker_endpoint", url));
     }
     Ok(())
 }
@@ -182,6 +164,7 @@ mod tests {
         assert_eq!(after.server.ca_pin, Some(CaPinSetting::Pinned(pin())));
         assert_eq!(after.server.transport, before.server.transport);
         assert_eq!(after.listen, before.listen);
+        assert_eq!(after.actions, before.actions);
         assert_eq!(after.fleets.len(), before.fleets.len());
         assert_eq!(state_dir(&after), state_dir(&before));
     }
@@ -205,22 +188,6 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_rewrites_the_execution_endpoint() -> gang_testkit::TestResult {
-        let mut input = document(VALID_LOCAL_CONFIG);
-        input.execution_listen = Some("127.0.0.1:8443".parse()?);
-        input.execution_endpoint = Some("https://127.0.0.1:8443".parse()?);
-        let (output, _, _) = with_plaintext(input, None, None)?;
-        assert_eq!(
-            validated(&output)
-                .execution_endpoint
-                .as_ref()
-                .map(Url::scheme),
-            Some("http")
-        );
-        Ok(())
-    }
-
-    #[test]
     fn plaintext_sets_transport_endpoints_and_the_anonymous_administrator() {
         let endpoint: Url = "https://127.0.0.1:9443".parse().expect("url");
         let worker: Url = "grpcs://127.0.0.1:9090".parse().expect("url");
@@ -234,7 +201,7 @@ mod tests {
         assert_eq!(config.server.ca_pin, None);
         assert_eq!(config.endpoint.as_ref().map(Url::scheme), Some("http"));
         assert_eq!(
-            config.scheduler.worker_endpoint().map(Url::scheme),
+            config.worker_endpoint.as_ref().map(Url::scheme),
             Some("grpc")
         );
         assert!(matches!(
@@ -294,7 +261,7 @@ mod tests {
         let config = validated(&output);
 
         assert_eq!(config.endpoint, None);
-        assert_eq!(config.scheduler.worker_endpoint(), None);
+        assert_eq!(config.worker_endpoint, None);
     }
 
     #[test]
@@ -341,13 +308,6 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
     }
 
-    /// The scheduler section of the valid local configuration, with the given worker endpoint.
-    fn scheduler(worker_endpoint: Option<&Url>) -> SchedulerConfig {
-        let mut scheduler = validated(VALID_LOCAL_CONFIG).scheduler;
-        scheduler.set_worker_endpoint(worker_endpoint.cloned());
-        scheduler
-    }
-
     #[test]
     fn insecure_accepts_loopback_listeners_and_endpoints() {
         let endpoint: Url = "https://localhost:9443".parse().expect("url");
@@ -358,9 +318,7 @@ mod tests {
             loopback(9443),
             worker_listen,
             Some(&endpoint),
-            &scheduler(Some(&worker)),
-            Some(loopback(8443)),
-            Some(&endpoint),
+            Some(&worker),
         );
 
         assert!(result.is_ok());
@@ -368,8 +326,7 @@ mod tests {
 
     #[test]
     fn insecure_accepts_omitted_endpoints_for_port_zero_listeners() {
-        let result =
-            require_insecure_loopback(loopback(0), loopback(0), None, &scheduler(None), None, None);
+        let result = require_insecure_loopback(loopback(0), loopback(0), None, None);
 
         assert!(result.is_ok());
     }
@@ -378,8 +335,7 @@ mod tests {
     fn insecure_refuses_a_public_listen_address() {
         let listen: SocketAddr = "0.0.0.0:9443".parse().expect("address");
 
-        let result =
-            require_insecure_loopback(listen, loopback(9090), None, &scheduler(None), None, None);
+        let result = require_insecure_loopback(listen, loopback(9090), None, None);
 
         assert_eq!(
             refusal(result),
@@ -391,14 +347,7 @@ mod tests {
     fn insecure_refuses_a_public_worker_listen_address() {
         let worker_listen: SocketAddr = "10.0.0.5:9090".parse().expect("address");
 
-        let result = require_insecure_loopback(
-            loopback(9443),
-            worker_listen,
-            None,
-            &scheduler(None),
-            None,
-            None,
-        );
+        let result = require_insecure_loopback(loopback(9443), worker_listen, None, None);
 
         assert_eq!(
             refusal(result),
@@ -410,14 +359,8 @@ mod tests {
     fn insecure_refuses_a_public_endpoint() {
         let endpoint: Url = "https://gang.example.com:9443".parse().expect("url");
 
-        let result = require_insecure_loopback(
-            loopback(9443),
-            loopback(9090),
-            Some(&endpoint),
-            &scheduler(None),
-            None,
-            None,
-        );
+        let result =
+            require_insecure_loopback(loopback(9443), loopback(9090), Some(&endpoint), None);
 
         assert_eq!(
             refusal(result),
@@ -432,19 +375,12 @@ mod tests {
     fn insecure_refuses_a_public_worker_endpoint() {
         let worker: Url = "grpcs://192.168.1.2:9090".parse().expect("url");
 
-        let result = require_insecure_loopback(
-            loopback(9443),
-            loopback(9090),
-            None,
-            &scheduler(Some(&worker)),
-            None,
-            None,
-        );
+        let result = require_insecure_loopback(loopback(9443), loopback(9090), None, Some(&worker));
 
         assert_eq!(
             refusal(result),
             (
-                "scheduler.nativelink.worker_endpoint".to_owned(),
+                "worker_endpoint".to_owned(),
                 "grpcs://192.168.1.2:9090".to_owned()
             )
         );
@@ -454,14 +390,8 @@ mod tests {
     fn insecure_refuses_an_endpoint_without_a_host() {
         let endpoint: Url = "mailto:gang@localhost".parse().expect("url");
 
-        let result = require_insecure_loopback(
-            loopback(9443),
-            loopback(9090),
-            Some(&endpoint),
-            &scheduler(None),
-            None,
-            None,
-        );
+        let result =
+            require_insecure_loopback(loopback(9443), loopback(9090), Some(&endpoint), None);
 
         assert_eq!(refusal(result).0, "endpoint");
     }

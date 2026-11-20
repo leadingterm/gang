@@ -18,7 +18,6 @@ gang_spi::compose! {
     provisioner: Provisioner { alpha: Alpha, beta: Beta },
     cache: Cache { disk: CacheDisk, cloud: CacheCloud },
     signer: Signer { kms: SignerKms, file: SignerFile },
-    scheduler: Scheduler { stub: Stub },
     database: Database { memory: Memory },
     sandbox: Sandbox { direct: Direct, boxed: Boxed },
     identity_provider: IdentityProvider { token: Token },
@@ -36,6 +35,9 @@ endpoint = "http://127.0.0.1:9443"
 
 [server]
 transport = "plaintext"
+
+[server.http2]
+shutdown_grace = "0s"
 
 [authentication.clients.none]
 number = 12
@@ -66,9 +68,6 @@ number = 10
 [signer.kms]
 number = 11
 
-[scheduler.stub]
-number = 3
-
 [database.memory]
 number = 4
 
@@ -87,6 +86,7 @@ fn parse(text: &str) -> Result<GangConfig<Plugins>, Box<dyn Error>> {
 }
 
 fn assert_limits_port<T: gang_spi::ActionLimitsPort>() {}
+fn assert_scheduler_port<T: gang_spi::SchedulerPort>() {}
 
 #[test]
 fn config_without_limits_parses_and_has_no_limits_section() -> Result<(), Box<dyn Error>> {
@@ -104,4 +104,5 @@ fn config_with_a_limits_section_is_rejected() {
 #[test]
 fn limits_type_still_implements_the_port() {
     assert_limits_port::<Limits>();
+    assert_scheduler_port::<Stub>();
 }

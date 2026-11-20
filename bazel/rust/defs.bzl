@@ -171,11 +171,11 @@ def _workspace_rust_integration_tests(
         for src in integration_srcs
     ]
 
-def _workspace_rust_lint_tests(name, targets):
+def _workspace_rust_lint_tests(name, targets, clippy_extra_targets = None):
     rust_clippy_test(
         name = name + "_clippy_test",
         size = "small",
-        targets = targets,
+        targets = targets + (clippy_extra_targets or []),
         tags = ["clippy", "lint", "rust"],
     )
     rustfmt_test(
@@ -194,7 +194,9 @@ def workspace_rust_library(
         compile_data = None,
         test_data = None,
         test_env = None,
-        test_runtime_data = None):
+        test_runtime_data = None,
+        test_support = False,
+        test_support_deps = None):
     """Declares a workspace library using Cargo-derived external metadata."""
     _package_sources()
     deps = _unique(deps or [])
@@ -204,17 +206,28 @@ def workspace_rust_library(
     test_env = test_env or {}
 
     external = _external(normal = True, dev = False)
-    _rust_library(
-        name = name,
+    library_attrs = dict(
         srcs = _rust_library_sources(srcs),
         aliases = external.aliases,
         compile_data = compile_data or [],
         crate_name = name,
         proc_macro_deps = _unique(proc_macro_deps or []) + external.proc_macro_deps,
         visibility = ["//visibility:public"],
-        deps = deps + external.deps,
         **_common()
     )
+    _rust_library(
+        name = name,
+        deps = deps + external.deps,
+        **library_attrs
+    )
+    if test_support:
+        _rust_library(
+            name = name + "_test_support",
+            crate_features = ["test-support"],
+            testonly = True,
+            deps = _unique(deps + (test_support_deps or [])) + external.deps,
+            **library_attrs
+        )
 
     _workspace_rust_unit_test(
         name = name,
@@ -235,6 +248,7 @@ def workspace_rust_library(
     _workspace_rust_lint_tests(
         name,
         [":" + name, ":" + name + "_unit_test"] + integration_targets,
+        clippy_extra_targets = [":" + name + "_test_support"] if test_support else [],
     )
 
 def workspace_rust_binary(

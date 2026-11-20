@@ -93,8 +93,8 @@ impl<const UNIT_NANOS: u64, const MIN_UNITS: u64, const MAX_UNITS: u64>
     }
 }
 
-/// A workload token lifetime in whole seconds from one minute to one hour inclusive.
-pub type TokenTtl = BoundedDuration<NANOS_PER_SECOND, 60, 3600>;
+/// A token lifetime in whole seconds from twenty seconds to one hour inclusive.
+pub type TokenTtl = BoundedDuration<NANOS_PER_SECOND, 20, 3600>;
 
 /// The absolute lifetime of a browser session: whole seconds from 1 minute to 30 days.
 pub type SessionMaxAge = BoundedDuration<NANOS_PER_SECOND, 60, 2_592_000>;
@@ -174,11 +174,18 @@ mod tests {
         type MillisBound = BoundedDuration<NANOS_PER_MILLI, 1, 1000>;
 
         assert!(matches!(
-            TokenTtl::try_new(Duration::from_secs(59)),
+            TokenTtl::try_new(Duration::from_secs(19)),
             Err(BoundedDurationError::TooShort { .. })
         ));
-        assert_eq!(TokenTtl::from_units(60), TokenTtl::MIN);
-        assert_eq!(TokenTtl::try_new(Duration::from_mins(1)), Ok(TokenTtl::MIN));
+        assert_eq!(TokenTtl::from_units(20), TokenTtl::MIN);
+        assert_eq!(
+            TokenTtl::try_new(Duration::from_secs(20)),
+            Ok(TokenTtl::MIN)
+        );
+        assert_eq!(
+            TokenTtl::try_new(Duration::from_secs(59)),
+            Ok(TokenTtl::from_units(59))
+        );
         assert_eq!(TokenTtl::from_units(3600), TokenTtl::MAX);
         assert_eq!(
             TokenTtl::try_new(Duration::from_hours(1)),
@@ -193,16 +200,16 @@ mod tests {
             Err(BoundedDurationError::TooLong { .. })
         ));
         assert!(matches!(
-            TokenTtl::try_new(Duration::from_millis(60_001)),
+            TokenTtl::try_new(Duration::from_millis(20_001)),
             Err(BoundedDurationError::NotWhole { .. })
         ));
-        assert_eq!(TokenTtl::MIN.as_units(), 60);
+        assert_eq!(TokenTtl::MIN.as_units(), 20);
     }
 
     #[test]
     #[should_panic(expected = "duration outside bounds")]
     fn from_units_rejects_below_minimum() {
-        let _ = TokenTtl::from_units(59);
+        let _ = TokenTtl::from_units(19);
     }
 
     #[test]
@@ -218,7 +225,20 @@ mod tests {
         assert_eq!(value.to_string(), "10m");
         let json = serde_json::to_string(&value)?;
         assert_eq!(serde_json::from_str::<TokenTtl>(&json)?, value);
-        assert!(serde_json::from_str::<TokenTtl>("\"30s\"").is_err());
+        for (text, seconds) in [("20s", 20), ("30s", 30), ("59s", 59), ("1h", 3600)] {
+            let expected = TokenTtl::from_units(seconds);
+            assert_eq!(text.parse::<TokenTtl>()?, expected);
+            let json = format!("\"{text}\"");
+            assert_eq!(serde_json::from_str::<TokenTtl>(&json)?, expected);
+        }
+        for text in ["19s", "20001ms", "3601s"] {
+            assert!(text.parse::<TokenTtl>().is_err(), "{text} must be rejected");
+            let json = format!("\"{text}\"");
+            assert!(
+                serde_json::from_str::<TokenTtl>(&json).is_err(),
+                "{text} must be rejected"
+            );
+        }
         assert!(serde_json::from_str::<TokenTtl>("\"invalid\"").is_err());
         Ok(())
     }

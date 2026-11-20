@@ -3,7 +3,7 @@
 use std::convert::Infallible;
 use std::error::Error;
 use std::ffi::OsString;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,14 +13,16 @@ use gang_clock::Timestamp;
 use gang_config::{ConfigError, GangConfig, SandboxSelection};
 use gang_spi::{
     ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, ActionLimits,
-    ActionLimitsPort, ActionScope, ActionUsage, Admitted, ApiRequestBody, ApiResponseBody,
-    ApiService, Authenticated, AuthenticationPort, BuildError, CacheStorePort,
+    ActionLimitsPort, ActionMemoryPool, ActionScope, ActionUsage, Admitted, ApiRequestBody,
+    ApiResponseBody, ApiService, Authenticated, AuthenticationPort, BuildError, CacheStorePort,
     CertificateSignerPort, ControllerConnections, ControllerEndpoints, ControllerReady,
-    ControllerSpec, FleetInstance, FleetSupply, Listening, LoginPort, LoginRequest, LoginSupport,
-    NetworkRequest, NodeLifecyclePort, Peer, Plugin, PluginContext, PortError, PreemptionNotice,
-    ProofVerifierPort, ProvisionerPort, Rejection, RenderedStoreSpec, RequestGate, SchedulerPort,
-    SchedulerSnapshot, Scheme, ScratchVolumePort, SignatureAlgorithm, Slots, StateRepositoryPort,
-    StoreAccess, Subject, WorkerSpec, WorkerTls, WorkloadCredentialPort, full_body,
+    ControllerSpec, ExpiringRecordPort, FleetInstance, FleetSupply, GateDecision, Listening,
+    LoginPort, LoginRequest, LoginSupport, NetworkRequest, NodeLifecyclePort, Peer, Plugin,
+    PluginContext, PortError, PreemptionNotice, ProofVerifierPort, ProvisionerPort, RecordId,
+    RecordKey, RecordKind, RecordVersion, Rejection, RenderedStoreSpec, RequestGate, RequestScope,
+    SchedulerPort, SchedulerSnapshot, Scheme, ScratchVolumePort, SignatureAlgorithm, Slots,
+    StateRepositoryPort, StoreAccess, Subject, WorkerSpec, WorkerTls, WorkloadCredentialPort,
+    full_body,
 };
 use gang_testkit::must_ready as ready;
 use gang_types::{
@@ -85,13 +87,17 @@ impl ActionScope for FakeScope {
     fn launcher(&self) -> &[OsString] {
         &self.launcher
     }
+
+    fn memory_cgroup(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 impl ActionLimitsPort for Fake {
     type Scope = FakeScope;
 
-    async fn prepare(&self) -> Result<(), PortError> {
-        Ok(())
+    async fn prepare(&self, _reserve: Bytes) -> Result<Option<ActionMemoryPool>, PortError> {
+        Ok(None)
     }
 
     async fn enter(&self, _limits: &ActionLimits) -> Result<FakeScope, PortError> {
@@ -106,8 +112,9 @@ impl ActionLimitsPort for Fake {
 
     async fn leave(&self, scope: FakeScope) -> Result<ActionUsage, PortError> {
         Ok(ActionUsage {
-            peak_memory: Bytes::new(u64::from(scope.number)),
+            peak_memory: Some(Bytes::new(u64::from(scope.number))),
             cpu_time: Duration::from_secs(u64::from(scope.number)),
+            oom_kills: 0,
         })
     }
 
@@ -120,7 +127,6 @@ gang_spi::compose! {
     provisioner: Provisioner { alpha: Alpha, beta: Beta },
     cache: Cache { disk: CacheDisk, cloud: CacheCloud },
     signer: Signer { kms: SignerKms, file: SignerFile },
-    scheduler: Scheduler { stub: Stub },
     database: Database { memory: Memory },
     sandbox: Sandbox { direct: Direct, boxed: Boxed },
     identity_provider: IdentityProvider { token: Token },
@@ -139,6 +145,9 @@ endpoint = "http://127.0.0.1:9443"
 
 [server]
 transport = "plaintext"
+
+[server.http2]
+shutdown_grace = "0s"
 
 [authentication.clients.none]
 number = 12
@@ -168,9 +177,6 @@ number = 10
 
 [signer.kms]
 number = 11
-
-[scheduler.stub]
-number = 3
 
 [database.memory]
 number = 4
@@ -471,9 +477,7 @@ fn unknown_signer_plugin_is_rejected_with_the_accepted_keys() -> Result<(), Box<
 
 #[test]
 fn scheduler_ports_reach_their_plugin() -> Result<(), Box<dyn Error>> {
-    let config = parse(CONFIG)?;
-    let plugin_context = context();
-    let scheduler = Scheduler::build(config.scheduler, &plugin_context)?;
+    let scheduler = Stub::build(NumberConfig { number: 3 }, &context())?;
 
     assert_eq!(
         scheduler.endpoints(),
@@ -508,16 +512,19 @@ struct TestGate;
 impl RequestGate for TestGate {
     async fn admit(
         &self,
+        _scope: RequestScope,
         _peer: &Peer,
         _parts: &mut http::request::Parts,
-    ) -> Result<Admitted, PortError> {
-        Ok(Admitted::Authenticated(Authenticated {
-            identity: Arc::new(Identity::new(
-                ProviderName::try_new("test").map_err(PortError::unavailable)?,
-                Principal::try_new("tester").map_err(PortError::unavailable)?,
-            )),
-            valid_until: None,
-        }))
+    ) -> Result<GateDecision, PortError> {
+        Ok(GateDecision::Admit(Admitted::Authenticated(
+            Authenticated {
+                identity: Arc::new(Identity::new(
+                    ProviderName::try_new("test").map_err(PortError::unavailable)?,
+                    Principal::try_new("tester").map_err(PortError::unavailable)?,
+                )),
+                valid_until: None,
+            },
+        )))
     }
 }
 
@@ -535,10 +542,8 @@ impl ApiService for TestApi {
 }
 
 #[test]
-fn scheduler_runs_the_selected_controller_and_worker() -> Result<(), Box<dyn Error>> {
-    let config = parse(CONFIG)?;
-    let plugin_context = context();
-    let scheduler = Scheduler::build(config.scheduler, &plugin_context)?;
+fn scheduler_runs_controller_and_worker() -> Result<(), Box<dyn Error>> {
+    let scheduler = Stub::build(NumberConfig { number: 3 }, &context())?;
 
     let stores = RenderedStoreSpec(serde_json::Value::Null);
     let name = FleetName::try_new("workers")?;
@@ -559,6 +564,7 @@ fn scheduler_runs_the_selected_controller_and_worker() -> Result<(), Box<dyn Err
         std::num::NonZeroUsize::MIN,
     );
     let controller = ControllerSpec {
+        actions: Arc::new(gang_config::ActionsConfig::default()),
         content_store: &stores,
         action_store: &stores,
         fleets: &catalog,
@@ -571,7 +577,6 @@ fn scheduler_runs_the_selected_controller_and_worker() -> Result<(), Box<dyn Err
             connections: futures::stream::empty().boxed(),
             gate: TestGate,
         },
-        execution: None,
         worker: Listening {
             connections: futures::stream::empty().boxed(),
             gate: TestGate,
@@ -582,11 +587,13 @@ fn scheduler_runs_the_selected_controller_and_worker() -> Result<(), Box<dyn Err
     ready(scheduler.run_controller(&controller, connections, ready_signal))?;
     assert!(
         readiness.try_recv().is_ok(),
-        "the composed scheduler passes the readiness signal to its plugin"
+        "the scheduler passes the readiness signal to its plugin"
     );
 
     let worker_instance = instance(3)?;
     let worker_spec = WorkerSpec {
+        actions: Arc::new(gang_config::ActionsConfig::default()),
+        memory_pool: None,
         instance: worker_instance,
         properties,
         slots: Slots::LongLived(NonZeroU32::MIN.saturating_add(3)),
@@ -619,6 +626,38 @@ fn database_ports_reach_their_plugin() -> Result<(), Box<dyn Error>> {
         return Err("expected exactly one revoked record".into());
     };
     assert_eq!(record.identity.principal, Principal::try_new("db-4")?);
+    Ok(())
+}
+
+#[test]
+fn composed_database_forwards_expiring_record_pages() -> Result<(), Box<dyn Error>> {
+    let config = parse(CONFIG)?;
+    let database = Database::build(config.database, &context())?;
+    let kind = RecordKind::InfrastructureEvent;
+    let first = RecordId::new([1; 32]);
+    let second = RecordId::new([2; 32]);
+    let now = Timestamp::from_unix_millis(1);
+    let expires = Timestamp::from_unix_millis(10);
+    for id in [first, second] {
+        let key = RecordKey { kind, id };
+        ready(database.insert(&[(key, b"event")], RecordVersion::new(1), now, expires))?;
+    }
+    let limit = NonZeroUsize::new(1).ok_or("nonzero limit")?;
+    let mut page = Vec::new();
+    assert!(ready(database.records(kind, None, limit, now, &mut page))?);
+    assert_eq!(page[0].0, first);
+    assert!(!ready(database.records(
+        kind,
+        Some(first),
+        limit,
+        now,
+        &mut page
+    ))?);
+    assert_eq!(page[0].0, second);
+    assert!(!ready(
+        database.records(kind, None, limit, expires, &mut page)
+    )?);
+    assert!(page.is_empty());
     Ok(())
 }
 
@@ -719,7 +758,7 @@ fn limits_port_reaches_the_selected_plugin() -> Result<(), Box<dyn Error>> {
     let limits = Limits::build(config.limits.ok_or("limits section")?, &context())?;
     assert!(matches!(limits, Limits::Fake(_)));
 
-    ready(limits.prepare())?;
+    ready(limits.prepare(Bytes::new(12345)))?;
     let requested = ActionLimits {
         cpu_count: NonZeroU32::new(2),
         memory: Some(NonZeroBytes::kib(1)),
@@ -730,8 +769,9 @@ fn limits_port_reaches_the_selected_plugin() -> Result<(), Box<dyn Error>> {
     assert_eq!(
         ready(limits.leave(scope))?,
         ActionUsage {
-            peak_memory: Bytes::new(8),
+            peak_memory: Some(Bytes::new(8)),
             cpu_time: Duration::from_secs(8),
+            oom_kills: 0,
         }
     );
     Ok(())
@@ -774,12 +814,19 @@ fn two_provisioner_backends_are_rejected() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn scheduler_plugin_configuration_is_rejected() -> Result<(), Box<dyn Error>> {
+    let message = rejection(&format!("{CONFIG}\n[scheduler.stub]\nnumber = 3\n"))?;
+    assert!(message.contains("scheduler"), "{message}");
+    Ok(())
+}
+
+#[test]
 fn unknown_sandbox_and_unknown_plugin_fields_are_rejected() -> Result<(), Box<dyn Error>> {
     let default = rejection(&CONFIG.replace("sandbox = \"boxed\"", "sandbox = \"firejail\""))?;
     let section = rejection(&format!("{CONFIG}\n[sandbox.firejail]\nnumber = 1\n"))?;
     let field = rejection(&CONFIG.replace(
-        "[scheduler.stub]\nnumber = 3",
-        "[scheduler.stub]\nnumber = 3\ncolour = 1",
+        "[signer.kms]\nnumber = 11",
+        "[signer.kms]\nnumber = 11\ncolour = 1",
     ))?;
 
     assert!(
@@ -810,16 +857,11 @@ fn selected_configuration_serializes_and_reparses_to_the_same_plugin() -> Result
 {
     let config = parse(CONFIG)?;
     let provisioner = toml::to_string(&config.provisioner)?;
-    let scheduler = toml::to_string(&config.scheduler)?;
     let sandbox = toml::to_string(&config.sandbox)?;
 
     assert!(matches!(
         toml::from_str::<ProvisionerConfig>(&provisioner)?,
         ProvisionerConfig::Beta(inner) if inner.number == 2
-    ));
-    assert!(matches!(
-        toml::from_str::<SchedulerConfig>(&scheduler)?,
-        SchedulerConfig::Stub(inner) if inner.number == 3
     ));
     let reparsed = toml::from_str::<SandboxConfig>(&sandbox)?;
     assert!(reparsed.is_configured(SandboxKey::Boxed));
@@ -928,6 +970,35 @@ fn network_request_round_trips_through_text() -> Result<(), Box<dyn Error>> {
 
 fn seen_values(seen: &Mutex<Vec<String>>) -> Vec<String> {
     seen.lock().clone()
+}
+
+#[test]
+fn composed_provisioner_registers_each_fleet_with_typed_options() -> Result<(), Box<dyn Error>> {
+    let text = CONFIG.replace(BETA_SECTION, ALPHA_SECTION);
+    let provisioner = Provisioner::build(parse(&text)?.provisioner, &context())?;
+    let Provisioner::Alpha(alpha) = &provisioner else {
+        return Err("expected the alpha provisioner".into());
+    };
+    let first = test_fleet(ProvisionerFleetOptions::Alpha(FakeFleetOptions {
+        capacity: "spot".to_owned(),
+        machine_class: None,
+    }))?;
+    let second = test_fleet(ProvisionerFleetOptions::Alpha(FakeFleetOptions {
+        capacity: "on-demand".to_owned(),
+        machine_class: None,
+    }))?;
+    provisioner.configure_fleet(first.view())?;
+    provisioner.configure_fleet(second.view())?;
+    assert_eq!(seen_values(&alpha.seen), ["spot", "on-demand"]);
+    provisioner.reset_configured_fleets();
+    assert!(seen_values(&alpha.seen).is_empty());
+    let foreign = test_fleet(ProvisionerFleetOptions::Beta(OtherFleetOptions {}))?;
+    assert!(matches!(
+        provisioner.configure_fleet(foreign.view()),
+        Err(PortError::Config(_))
+    ));
+    assert!(seen_values(&alpha.seen).is_empty());
+    Ok(())
 }
 
 #[test]

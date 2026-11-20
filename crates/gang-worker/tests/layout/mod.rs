@@ -37,6 +37,9 @@ fn prepare_creates_the_directories() {
         .prepare(SANDBOX, &executable)
         .expect("layout prepares");
     assert!(layout.work_directory().is_dir());
+    let side_channels = layout.work_directory().join(".side_channels");
+    assert!(side_channels.is_dir());
+    assert_eq!(mode(&side_channels), DIRECTORY_MODE);
     assert!(layout.fast_cas_directory().is_dir());
     assert!(root.path().join("bin").is_dir());
     assert!(root.path().join("identity").is_dir());

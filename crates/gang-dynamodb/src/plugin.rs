@@ -55,8 +55,9 @@ impl Plugin for DynamoDb {
 }
 
 impl DynamoDb {
-    #[cfg(test)]
-    pub(crate) fn with_client(
+    /// Constructs a test database using an explicit SDK client and clock.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_client(
         config: DynamoDbConfig,
         client: aws_sdk_dynamodb::Client,
         clock: Arc<dyn Clock>,

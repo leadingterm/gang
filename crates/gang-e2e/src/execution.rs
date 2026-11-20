@@ -7,21 +7,25 @@
 //! which the harness creates to release them. [`Execution`] reads the journal, sets the flag, and
 //! observes the processes and cgroups of the deployment.
 
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+
+use gang_config::{ColdStartTuning, EscalationPercent, MemoryTuning};
+use gang_types::{Bytes, HeadroomPercent, NonZeroBytes, NonZeroDuration, Percent};
 
 use crate::build_output::BuildOutcome;
 use crate::errors::{E2eError, Result};
 use crate::system::{Probe, System};
 
-/// `[scheduler.nativelink.worker] action_timeout` under [`ActionTimeout::Short`], in seconds.
+/// `[actions] timeout` under [`ActionTimeout::Short`], in seconds.
 /// `kill_grace` keeps its default of five seconds.
 pub const SHORT_ACTION_TIMEOUT_SECS: u32 = 5;
 
-/// `[scheduler.nativelink.memory] escalation_max_steps` under [`MemoryEscalation::OneStep`].
+/// `[actions.memory] max_steps` under [`MemoryEscalation::OneStep`].
 pub const ESCALATION_MAX_STEPS: u32 = 1;
 
-/// `[scheduler.nativelink.memory] escalation_percent` under [`MemoryEscalation::OneStep`].
+/// `[actions.memory] escalation_percent` under [`MemoryEscalation::OneStep`].
 pub const ESCALATION_PERCENT: u32 = 200;
 
 /// The oversized fleet disk, far above the scratch volume of any host.
@@ -31,20 +35,18 @@ pub const OVERSIZED_FLEET_DISK: &str = "1024TiB";
 /// other quickly.
 pub const REFUSAL_RELAUNCH_BACKOFF: &str = "1s";
 
-/// The refusal reported by `gang-nativelink/src/placeable.rs` when no fleet accepts an action.
+/// The refusal reported when no fleet accepts an action.
 pub const NO_FLEET_ACCEPTS: &str = "no fleet accepts this action";
 
 /// The platform property the disk-guarded probe asks too much of; the refusal names it.
 pub const REFUSED_DISK_KEY: &str = "disk_kb";
 
-/// `[scheduler.nativelink.cold_start] memory` under [`ColdStart::Misfit`]: above the base fleet's
+/// `[actions.cold_start] memory` under [`ColdStart::Misfit`]: above the base fleet's
 /// `memory_per_instance`, so no fleet accepts the cold start.
 pub const MISFIT_COLD_START_MEMORY: &str = "64GiB";
 
-/// The part of `gang server`'s message for a cold start no fleet accepts that names the remedy
-/// (`NativeLinkConfigError::ColdStartFitsNoFleet`).
-pub const COLD_START_MISFIT_MESSAGE: &str =
-    "which no fleet accepts: lower [scheduler.nativelink.cold_start] or enlarge a fleet";
+/// The configuration key named by a cold start that fits no fleet.
+pub const COLD_START_MISFIT_MESSAGE: &str = "actions.cold_start";
 
 /// `[authentication.workers.mtls] certificate_ttl` under [`WorkerCertificates::ShortLived`], in
 /// seconds.
@@ -56,7 +58,7 @@ pub const CERTIFICATE_REFRESH_PERCENT: u8 = 50;
 /// The line [`Execution::end_lines`] writes to the journal; no probe writes it.
 pub const JOURNAL_END: &str = "e2e-journal-end";
 
-/// `[scheduler.nativelink.worker] action_timeout`.
+/// `[actions] timeout`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionTimeout {
     /// The default timeout.
@@ -65,7 +67,7 @@ pub enum ActionTimeout {
     Short,
 }
 
-/// `[scheduler.nativelink.memory] escalation_max_steps` and `escalation_percent`.
+/// `[actions.memory] max_steps` and `escalation_percent`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryEscalation {
     /// The default escalation.
@@ -83,7 +85,7 @@ pub enum FleetDisk {
     Oversized,
 }
 
-/// `[scheduler.nativelink.cold_start]`.
+/// `[actions.cold_start]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColdStart {
     /// The base configuration's cold start.
@@ -101,19 +103,101 @@ pub enum WorkerCertificates {
     ShortLived,
 }
 
+/// Explicit resource policy and worker bound for a resource scenario.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourcePolicy {
+    /// Memory enforcement and pressure tuning.
+    pub memory: MemoryTuning,
+    /// Headroom applied to measured peaks when escalating or learning.
+    pub reservation_headroom_percent: HeadroomPercent,
+    /// Generic retry budget, independent of resource requeues.
+    pub max_job_retries: NonZeroU32,
+    /// Declared fleet memory, when different from the base fleet.
+    pub fleet_memory: Option<NonZeroBytes>,
+    /// Launcher memory bound for each worker, when required by the scenario.
+    pub worker_memory_max: Option<Bytes>,
+    /// Cold-start policy override for the fixture.
+    pub cold_start: Option<ColdStartTuning>,
+    /// Declared CPUs per fleet instance, when overridden.
+    pub fleet_vcpus: Option<NonZeroU32>,
+}
+
+impl Default for ResourcePolicy {
+    fn default() -> Self {
+        let actions = gang_config::ActionsConfig::default();
+        Self {
+            memory: actions.memory,
+            reservation_headroom_percent: actions.reservation_headroom_percent,
+            max_job_retries: actions.max_job_retries,
+            fleet_memory: None,
+            worker_memory_max: None,
+            cold_start: None,
+            fleet_vcpus: None,
+        }
+    }
+}
+
+impl ResourcePolicy {
+    /// The bounded, non-default policy used by the neighbour-pressure scenario.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the fixture's escalation percentage is invalid.
+    pub fn pressure_scenario() -> Result<Self> {
+        let memory = MemoryTuning {
+            reserve: NonZeroBytes::mib(32),
+            pressure_stall_percent: Percent::from_percent(7),
+            pressure_poll_interval: NonZeroDuration::from_millis(50),
+            pressure_kill_after: NonZeroDuration::from_millis(1000),
+            sample_interval: NonZeroDuration::from_millis(20),
+            escalation_percent: EscalationPercent::try_new(250)
+                .map_err(E2eError::system_from("the pressure escalation percentage"))?,
+            max_steps: NonZeroU32::MIN.saturating_add(2),
+            ..MemoryTuning::default()
+        };
+        Ok(Self {
+            memory,
+            reservation_headroom_percent: HeadroomPercent::from_percent(25),
+            max_job_retries: NonZeroU32::MIN,
+            fleet_memory: Some(NonZeroBytes::mib(512)),
+            worker_memory_max: Some(NonZeroBytes::mib(768).get()),
+            cold_start: Some(ColdStartTuning {
+                enabled: false,
+                ..ColdStartTuning::default()
+            }),
+            fleet_vcpus: Some(NonZeroU32::MIN.saturating_add(1)),
+        })
+    }
+
+    /// A 480 MiB kernel pool in which both held pressure fixtures cannot coexist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the fixture's escalation percentage is invalid.
+    pub fn pool_oom_scenario() -> Result<Self> {
+        let mut policy = Self::pressure_scenario()?;
+        policy.memory.enforcement = gang_config::MemoryEnforcement::None;
+        policy.worker_memory_max = Some(NonZeroBytes::mib(512).get());
+        policy.fleet_memory = Some(NonZeroBytes::mib(448));
+        Ok(policy)
+    }
+}
+
 /// The configuration knobs of the execution scenarios.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecutionKnobs {
-    /// `[scheduler.nativelink.worker] action_timeout`.
+    /// `[actions] timeout`.
     pub action_timeout: ActionTimeout,
-    /// `[scheduler.nativelink.memory]` escalation.
+    /// `[actions.memory]` escalation.
     pub memory_escalation: MemoryEscalation,
     /// The fleet's disk per instance.
     pub fleet_disk: FleetDisk,
-    /// `[scheduler.nativelink.cold_start]`.
+    /// `[actions.cold_start]`.
     pub cold_start: ColdStart,
     /// The workers' certificate lifetime and refresh point.
     pub worker_certificates: WorkerCertificates,
+    /// Resource policy override for a scenario.
+    pub resource_policy: Option<ResourcePolicy>,
 }
 
 impl ExecutionKnobs {
@@ -124,6 +208,7 @@ impl ExecutionKnobs {
         fleet_disk: FleetDisk::Default,
         cold_start: ColdStart::Default,
         worker_certificates: WorkerCertificates::Default,
+        resource_policy: None,
     };
 
     /// The knobs of the action timeout scenarios: [`ActionTimeout::Short`].

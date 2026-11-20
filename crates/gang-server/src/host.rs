@@ -20,6 +20,8 @@ use crate::security::Security;
 
 /// The authentication host: lends the server's collaborators to plugins for one call.
 pub(crate) struct Host<K: Stack> {
+    /// Shared trusted PROXY protocol listener settings.
+    pub(crate) proxy_protocol: Arc<gang_config::ProxyProtocolConfig>,
     /// The ledger of certificates and principals.
     pub(crate) repository: K::Repository,
     /// The signer that holds the authority's key.
@@ -39,6 +41,20 @@ pub(crate) struct Host<K: Stack> {
 }
 
 impl<K: Stack> Host<K> {
+    /// Refuses a principal revoked locally or in the durable registry.
+    pub(crate) async fn admit_principal(&self, identity: &Identity) -> Result<(), PortError> {
+        if self.revoked_principals.contains(identity)
+            || self
+                .repository
+                .principal(identity)
+                .await?
+                .is_some_and(|record| record.revoked_at.is_some())
+        {
+            return Err(PortError::refused(Rejection::PrincipalRevoked));
+        }
+        Ok(())
+    }
+
     /// Records that `identity` was seen, when its last written sighting is due. A ledger failure
     /// is logged and swallowed: a sighting never fails the request that caused it.
     pub(crate) async fn observe(&self, identity: &Identity) {
@@ -82,9 +98,7 @@ impl<K: Stack> AuthenticationHost for Host<K> {
             .ok_or_else(|| PortError::NotFound(Subject::Provider(provider.clone())))?;
         let principal = entry.verifier.verify(proof).await?;
         let identity = Identity::new(provider.clone(), principal.clone());
-        if self.revoked_principals.contains(&identity) {
-            return Err(PortError::refused(Rejection::PrincipalRevoked));
-        }
+        self.admit_principal(&identity).await?;
         self.observe(&identity).await;
         Ok(principal)
     }

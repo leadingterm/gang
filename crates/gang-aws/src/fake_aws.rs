@@ -105,6 +105,8 @@ const GRANTED_ACTIONS: &[&str] = &[
     "DescribeScalingActivities",
     "DescribeLifecycleHooks",
     "CompleteLifecycleAction",
+    "ReceiveMessage",
+    "DeleteMessage",
 ];
 const UNKNOWN_KEY: &str = "key does not exist";
 const UNAUTHORIZED: &str = "missing or invalid session token";
@@ -168,6 +170,10 @@ impl FakeAws {
             state,
             server,
         })
+    }
+
+    pub(crate) fn queue_url(&self) -> &str {
+        &self.endpoint
     }
 
     /// Returns an SDK configuration whose clients talk to this fake with static credentials, one
@@ -243,6 +249,8 @@ pub(crate) struct FakeState {
     pub(crate) lifecycle_completions: Vec<(String, String, String)>,
     /// EC2 instance id to RFC 3339 launch time; EC2 knows only these instances.
     pub(crate) launch_times: HashMap<String, String>,
+    /// EC2 state-reason code by instance, including recently terminated instances.
+    pub(crate) state_reasons: HashMap<String, String>,
     /// The KMS key answered for `GetPublicKey` and `Sign`.
     pub(crate) kms: Option<FakeKey>,
     /// Token returned by `GetWebIdentityToken`.
@@ -273,6 +281,10 @@ pub(crate) struct FakeState {
     pub(crate) launched: u32,
     /// Instances per `DescribeInstances` page; `None` answers every matching instance in one page.
     pub(crate) page_size: Option<usize>,
+    /// Messages available to the fake SQS queue.
+    pub(crate) messages: Vec<FakeMessage>,
+    /// Additional activity identity and description, indexed by activity position.
+    pub(crate) activity_details: HashMap<usize, (String, String, String)>,
 }
 
 impl Default for FakeState {
@@ -282,6 +294,7 @@ impl Default for FakeState {
             lifecycle_hooks: HashMap::new(),
             lifecycle_completions: Vec::new(),
             launch_times: HashMap::new(),
+            state_reasons: HashMap::new(),
             kms: None,
             web_identity_token: DEFAULT_WEB_IDENTITY_TOKEN.to_owned(),
             identity_document: None,
@@ -297,6 +310,8 @@ impl Default for FakeState {
             target_lifecycle_state: None,
             launched: 0,
             page_size: None,
+            messages: Vec::new(),
+            activity_details: HashMap::new(),
         }
     }
 }
@@ -390,6 +405,15 @@ pub(crate) struct FakeActivity {
     /// RFC 3339 UTC start time; `StartTimeLowerBound` compares it as an instant.
     pub(crate) start_time: String,
     pub(crate) message: Option<String>,
+}
+
+/// One SQS message; tests control visibility without wall-clock sleeps.
+#[derive(Debug, Clone)]
+pub(crate) struct FakeMessage {
+    pub(crate) id: String,
+    pub(crate) body: String,
+    pub(crate) receipt: String,
+    pub(crate) visible: bool,
 }
 
 /// A KMS key, addressable by its ARN or alias.
@@ -520,11 +544,66 @@ fn access_denied(code: &'static str) -> FakeFailure {
 /// `POST /`: KMS when the target header is present, awsQuery otherwise.
 async fn post_root(State(state): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
     match headers.get(KMS_TARGET_HEADER) {
+        Some(target)
+            if target
+                .to_str()
+                .is_ok_and(|text| text.starts_with("AmazonSQS.")) =>
+        {
+            sqs(&state, target.to_str().unwrap_or_default(), &body)
+        }
         Some(target) => kms(&state, target, &body),
         None => query(&state, &body),
     }
 }
 
+fn sqs(state: &Shared, target: &str, body: &[u8]) -> Response {
+    let operation = target.strip_prefix("AmazonSQS.").unwrap_or_default();
+    let value: Value = serde_json::from_slice(body).unwrap_or_default();
+    let mut parameters = json_parameters(body);
+    for name in [
+        "MaxNumberOfMessages",
+        "VisibilityTimeout",
+        "WaitTimeSeconds",
+    ] {
+        if let Some(number) = value.get(name).and_then(Value::as_i64) {
+            parameters.insert(name.to_owned(), number.to_string());
+        }
+    }
+    let outcome = dispatch(
+        state,
+        operation,
+        &parameters,
+        Some(access_denied(ACCESS_DENIED)),
+        |fake, params| match operation {
+            "ReceiveMessage" => {
+                let count = params
+                    .get("MaxNumberOfMessages")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(1);
+                let messages: Vec<Value> = fake.messages.iter_mut().filter(|message| message.visible).take(count).map(|message| {
+                    message.visible = false;
+                    json!({"MessageId": message.id, "ReceiptHandle": message.receipt, "Body": message.body})
+                }).collect();
+                Ok(json!({"Messages": messages}).to_string())
+            }
+            "DeleteMessage" => {
+                let receipt = required(params, "ReceiptHandle")?;
+                fake.messages.retain(|message| message.receipt != receipt);
+                Ok("{}".to_owned())
+            }
+            _ => Err(invalid(UNKNOWN_OPERATION)),
+        },
+    );
+    match outcome {
+        Ok(body) => ([(header::CONTENT_TYPE, "application/x-amz-json-1.0")], body).into_response(),
+        Err(error) => (
+            status_of(error.status),
+            [(header::CONTENT_TYPE, "application/x-amz-json-1.0")],
+            json!({"__type": error.code, "message": error.message}).to_string(),
+        )
+            .into_response(),
+    }
+}
 fn query(state: &Shared, body: &[u8]) -> Response {
     let parameters = parse_form(body);
     let action = parameters.get("Action").cloned().unwrap_or_default();
@@ -821,7 +900,15 @@ fn describe_activities(state: &FakeState, params: &Parameters) -> Result<String,
         None => DEFAULT_MAX_RECORDS,
     };
     let mut matching: Vec<(Timestamp, usize, &FakeActivity)> = Vec::new();
+    let ids = members(params, "ActivityIds.member.");
     for (index, activity) in state.activities.iter().enumerate() {
+        let activity_id = state.activity_details.get(&index).map_or_else(
+            || format!("{ACTIVITY_ID_PREFIX}{index:012}"),
+            |details| details.0.clone(),
+        );
+        if !ids.is_empty() && !ids.contains(&activity_id.as_str()) {
+            continue;
+        }
         if named_group.is_some_and(|name| activity.group != name) {
             continue;
         }
@@ -835,16 +922,27 @@ fn describe_activities(state: &FakeState, params: &Parameters) -> Result<String,
         matching.push((start, index, activity));
     }
     matching.sort_by(|(left, _, _), (right, _, _)| right.cmp(left));
-    matching.truncate(limit);
+    let start = params.get(NEXT_TOKEN).map_or(Ok(0), |raw| {
+        raw.parse::<usize>().map_err(|_| invalid(MALFORMED_NUMBER))
+    })?;
+    let end = start.saturating_add(limit).min(matching.len());
+    let next = if end < matching.len() {
+        format!("<NextToken>{end}</NextToken>")
+    } else {
+        String::new()
+    };
     let items: String = matching
-        .into_iter()
+        .into_iter().skip(start).take(limit)
         .map(|(_, index, activity)| {
             let status_message = activity.message.as_ref()
                 .map(|message| format!("<StatusMessage>{message}</StatusMessage>"))
                 .unwrap_or_default();
             let message = activity.message.as_deref().unwrap_or_default();
+            let fallback_id = format!("{ACTIVITY_ID_PREFIX}{index:012}");
+            let (id, cause, description) = state.activity_details.get(&index)
+                .map_or((fallback_id.as_str(), message, message), |details| (details.0.as_str(), details.1.as_str(), details.2.as_str()));
             format!(
-                "<member><ActivityId>{ACTIVITY_ID_PREFIX}{index:012}</ActivityId><AutoScalingGroupName>{group}</AutoScalingGroupName><Cause>{message}</Cause><Description>{message}</Description><StartTime>{start}</StartTime><StatusCode>{status}</StatusCode>{status_message}<Progress>0</Progress></member>",
+                "<member><ActivityId>{id}</ActivityId><AutoScalingGroupName>{group}</AutoScalingGroupName><Cause>{cause}</Cause><Description>{description}</Description><StartTime>{start}</StartTime><StatusCode>{status}</StatusCode>{status_message}<Progress>0</Progress></member>",
                 group = activity.group,
                 start = activity.start_time,
                 status = activity.status_code,
@@ -852,7 +950,7 @@ fn describe_activities(state: &FakeState, params: &Parameters) -> Result<String,
         })
         .collect::<Vec<_>>()
         .concat();
-    Ok(format!("<Activities>{items}</Activities>"))
+    Ok(format!("<Activities>{items}</Activities>{next}"))
 }
 
 /// Values of every `Filters` entry named `name`, in request order.
@@ -922,6 +1020,7 @@ fn describe_ec2(state: &FakeState, params: &Parameters) -> Result<String, FakeFa
             .flat_map(|group| group.instances.iter().map(|instance| instance.id.as_str()))
             .collect()
     });
+    let requested_ids = members(params, "InstanceId.");
     let mut launches: Vec<(&String, &String)> = state
         .launch_times
         .iter()
@@ -929,6 +1028,7 @@ fn describe_ec2(state: &FakeState, params: &Parameters) -> Result<String, FakeFa
             scoped_ids
                 .as_ref()
                 .is_none_or(|ids| ids.contains(&id.as_str()))
+                && (requested_ids.is_empty() || requested_ids.contains(&id.as_str()))
         })
         .collect();
     launches.sort();
@@ -941,8 +1041,12 @@ fn describe_ec2(state: &FakeState, params: &Parameters) -> Result<String, FakeFa
     let items: String = page
         .iter()
         .map(|(id, launched)| {
+            let group = state.groups.iter().find(|group| group.instances.iter().any(|instance| instance.id == **id));
+            let tags = group.map_or_else(String::new, |group| format!("<tagSet><item><key>aws:autoscaling:groupName</key><value>{}</value></item></tagSet>", group.name));
+            let reason = state.state_reasons.get(id.as_str())
+                .map_or_else(String::new, |code| format!("<stateReason><code>{code}</code></stateReason>"));
             format!(
-                "<item><instanceId>{id}</instanceId><instanceType>{INSTANCE_TYPE}</instanceType><instanceState><code>16</code><name>running</name></instanceState><launchTime>{launched}</launchTime><placement><availabilityZone>{ZONE}</availabilityZone></placement></item>"
+                "<item><instanceId>{id}</instanceId><instanceType>{INSTANCE_TYPE}</instanceType><instanceState><code>16</code><name>running</name></instanceState><launchTime>{launched}</launchTime><placement><availabilityZone>{ZONE}</availabilityZone></placement>{tags}{reason}</item>"
             )
         })
         .collect::<Vec<_>>()

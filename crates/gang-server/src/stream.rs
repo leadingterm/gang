@@ -136,7 +136,7 @@ struct Ending {
     /// The live revoked principals; revoking `identity` ends the stream.
     revoked: watch::Receiver<Revoked>,
     expires_at: Option<gang_clock::Tick>,
-    shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<()>,
     retry: Duration,
 }
 
@@ -169,8 +169,8 @@ impl Ending {
 }
 
 /// Resolves once the server has begun shutting down.
-async fn stopping(signal: &mut watch::Receiver<bool>) {
-    let stopped = signal.wait_for(|stopping| *stopping).await.is_ok();
+async fn stopping(signal: &mut watch::Receiver<()>) {
+    let stopped = signal.changed().await.is_ok();
     if !stopped {
         pending::<()>().await;
     }

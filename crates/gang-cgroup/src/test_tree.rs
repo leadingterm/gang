@@ -18,8 +18,9 @@ use parking_lot::Mutex;
 use tempfile::TempDir;
 
 use crate::fs::{
-    CONTROLLERS, CPU_MAX, CPU_STAT, Cgroupfs, EVENTS, KILL, MEMORY_MAX, MEMORY_OOM_GROUP,
-    MEMORY_PEAK, MEMORY_SWAP_MAX, PIDS_MAX, PROCS, SUBTREE_CONTROL, child_directories,
+    CONTROLLERS, CPU_MAX, CPU_STAT, Cgroupfs, EVENTS, KILL, MEMORY_EVENTS, MEMORY_MAX,
+    MEMORY_OOM_GROUP, MEMORY_PEAK, MEMORY_SWAP_MAX, PIDS_MAX, PROCS, SUBTREE_CONTROL,
+    child_directories,
 };
 
 const MEMORY: &str = "memory";
@@ -42,10 +43,18 @@ const GATED_FILES: [(&str, &str); 5] = [
 struct State {
     /// The cgroup the modelled process lives in.
     member: PathBuf,
+    /// Physical memory in KiB, or the default test-machine size.
+    memtotal_kib: Option<u64>,
+    /// Page size used to emulate kernel memory.max rounding.
+    page_size: Option<u64>,
+    /// Writes before kernel page rounding.
+    memory_max_writes: Vec<(PathBuf, String)>,
     /// Value seeded into `memory.peak` of newly created cgroups.
     peak_memory: u64,
     /// Value seeded into `cpu.stat` `usage_usec` of newly created cgroups.
     cpu_micros: u64,
+    /// Text seeded into `memory.events`.
+    memory_events: String,
     /// Failed removals a cgroup is charged with after `cgroup.kill`.
     deaths_after_kill: u32,
     /// Files whose every write fails with `PermissionDenied`.
@@ -103,12 +112,42 @@ impl TestTree {
         fs::create_dir_all(&dir).expect("create delegated subtree");
         fs::write(dir.join(CONTROLLERS), controllers.join(" ")).expect("seed controllers");
         fs::write(dir.join(SUBTREE_CONTROL), "").expect("seed subtree_control");
+        for ancestor in Path::new(subtree)
+            .ancestors()
+            .filter(|path| !path.as_os_str().is_empty())
+        {
+            fs::write(tree.absolute(ancestor).join(MEMORY_MAX), "max\n")
+                .expect("seed ancestor memory.max");
+        }
         tree.state.lock().member = PathBuf::from(subtree);
         tree.state
             .lock()
             .starts
             .insert(std::process::id(), OWN_START);
         tree
+    }
+
+    /// Configures the physical RAM returned by the procfs seam, in KiB.
+    pub(crate) fn with_memtotal_kib(self, kib: u64) -> Self {
+        self.state.lock().memtotal_kib = Some(kib);
+        self
+    }
+
+    /// Configures the page size used for `memory.max` read-back.
+    pub(crate) fn with_page_size(self, bytes: u64) -> Self {
+        assert!(bytes > 0, "page size must be nonzero");
+        self.state.lock().page_size = Some(bytes);
+        self
+    }
+
+    /// Sets an ancestor's memory limit text.
+    pub(crate) fn set_memory_max(&self, cgroup: &Path, value: &str) {
+        fs::write(self.absolute(cgroup).join(MEMORY_MAX), value).expect("seed memory.max");
+    }
+
+    /// Returns writes to `memory.max` before page rounding.
+    pub(crate) fn memory_max_writes(&self) -> Vec<(PathBuf, String)> {
+        self.state.lock().memory_max_writes.clone()
     }
 
     /// Sets the `memory.peak` value of cgroups created afterwards.
@@ -120,6 +159,11 @@ impl TestTree {
     /// Sets the `cpu.stat` `usage_usec` value of cgroups created afterwards.
     pub(crate) fn with_cpu_micros(self, micros: u64) -> Self {
         self.state.lock().cpu_micros = micros;
+        self
+    }
+    /// Sets the `memory.events` text of cgroups created afterwards.
+    pub(crate) fn with_memory_events(self, text: &str) -> Self {
+        self.state.lock().memory_events = text.to_owned();
         self
     }
 
@@ -245,6 +289,13 @@ impl Cgroupfs for TestTree {
         Ok(self.state.lock().member.clone())
     }
 
+    fn meminfo(&self) -> io::Result<String> {
+        Ok(format!(
+            "MemTotal: {} kB\n",
+            self.state.lock().memtotal_kib.unwrap_or(8_388_608)
+        ))
+    }
+
     fn absolute(&self, cgroup: &Path) -> PathBuf {
         self.root.path().join(cgroup)
     }
@@ -326,7 +377,23 @@ impl Cgroupfs for TestTree {
                 {
                     return Err(io::ErrorKind::NotFound.into());
                 }
-                fs::write(dir.join(file), value)?;
+                if file == MEMORY_MAX {
+                    state
+                        .memory_max_writes
+                        .push((cgroup.to_path_buf(), value.to_owned()));
+                    let page = state.page_size.unwrap_or(1);
+                    let parsed = value
+                        .parse::<u64>()
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                    let rounded = parsed
+                        .checked_add(page - 1)
+                        .ok_or(io::ErrorKind::InvalidData)?
+                        / page
+                        * page;
+                    fs::write(dir.join(file), rounded.to_string())?;
+                } else {
+                    fs::write(dir.join(file), value)?;
+                }
             }
         }
         Ok(())
@@ -381,7 +448,9 @@ fn seed(dir: &Path, state: &State, controllers: &BTreeSet<String>) -> io::Result
         (KILL, String::new()),
         (SUBTREE_CONTROL, String::new()),
         (CONTROLLERS, join(controllers)),
+        (MEMORY_MAX, "max\n".to_owned()),
         (MEMORY_PEAK, format!("{}\n", state.peak_memory)),
+        (MEMORY_EVENTS, state.memory_events.clone()),
         (
             CPU_STAT,
             format!(

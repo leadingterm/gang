@@ -25,10 +25,20 @@ const PROBES: [Probe; 8] = [
     Probe::ControllerLoss7,
 ];
 
-// A retiring leader drains held work, so wait for its replacement without joining it yet.
+// A retiring leader retains its lease until executing work and the final history flush finish.
 fn replacement(cluster: &Cluster<'_>, retired: usize) -> Result<usize> {
     cluster.wait_for_leader_except(Some(retired))
 }
+
+fn complete_retirements<T>(
+    release: impl FnOnce() -> Result<()>,
+    handles: [T; 2],
+    mut finish: impl FnMut(T) -> Result<ExitStatus>,
+) -> Result<Vec<ExitStatus>> {
+    release()?;
+    handles.into_iter().map(&mut finish).collect()
+}
+
 fn verdicts(
     cluster: &Cluster<'_>,
     outcome: &BuildOutcome,
@@ -124,40 +134,26 @@ pub fn rolling_deploy(cluster: &Cluster<'_>) -> Result<Vec<Check>> {
                 })?;
             let initial_leader = cluster.wait_for_leader()?;
             cluster.start_controller()?;
-            let mut retired_leader = initial_leader == 0;
-            let mut statuses = Vec::new();
-            let first = if initial_leader == 0 {
-                Some(cluster.begin_retire(0)?)
-            } else {
-                statuses.push(cluster.retire(0)?);
-                None
-            };
-            if first.is_some() {
+            let retired_leader = initial_leader == 0 || initial_leader == 1;
+            let first = cluster.begin_retire(0)?;
+            if initial_leader == 0 {
+                pending.release()?;
                 replacement(cluster, 0)?;
             }
             cluster.start_controller()?;
             let leader = cluster.wait_for_leader()?;
-            retired_leader |= leader == 1;
-            let second = if leader == 1 {
-                Some(cluster.begin_retire(1)?)
-            } else {
-                statuses.push(cluster.retire(1)?);
-                None
-            };
-            let second_replacement = if second.is_some() {
-                replacement(cluster, 1).map(|_| ())
-            } else {
-                Ok(())
-            };
-            // Executing actions must be allowed to finish before a retiring leader can exit.
-            pending.release()?;
-            if let Some(retiring) = first {
-                statuses.push(cluster.finish_retire(retiring)?);
-            }
-            if let Some(retiring) = second {
-                statuses.push(cluster.finish_retire(retiring)?);
-            }
-            second_replacement?;
+            let second = cluster.begin_retire(1)?;
+            let statuses = complete_retirements(
+                || {
+                    pending.release()?;
+                    if leader == 1 {
+                        replacement(cluster, 1)?;
+                    }
+                    Ok(())
+                },
+                [first, second],
+                |retiring| cluster.finish_retire(retiring),
+            )?;
             Ok((held, retired_leader, statuses))
         })();
         let settled = pending.settle(observation, || {
@@ -176,4 +172,41 @@ pub fn rolling_deploy(cluster: &Cluster<'_>) -> Result<Vec<Check>> {
             &statuses,
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::os::unix::process::ExitStatusExt;
+
+    use parking_lot::Mutex;
+
+    use super::*;
+
+    #[test]
+    fn release_precedes_retirement_completion_for_former_leaders() {
+        for former_leader in [0, 1] {
+            let released = Cell::new(false);
+            let events = Mutex::new(Vec::new());
+            let result = complete_retirements(
+                || {
+                    events.lock().push("release");
+                    released.set(true);
+                    Ok(())
+                },
+                [0, 1],
+                |index| {
+                    events
+                        .lock()
+                        .push(if index == 0 { "finish 0" } else { "finish 1" });
+                    if index == former_leader && !released.get() {
+                        return Err(E2eError::system("former leader is still draining"));
+                    }
+                    Ok(ExitStatus::from_raw(0))
+                },
+            );
+            assert!(result.is_ok(), "former leader {former_leader}: {result:?}");
+            assert_eq!(*events.lock(), ["release", "finish 0", "finish 1"]);
+        }
+    }
 }

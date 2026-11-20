@@ -47,6 +47,7 @@ use tokio::sync::OnceCell;
 use crate::config::{AwsConfig, AwsFleetOptions};
 use crate::credential::WebIdentity;
 use crate::errors::AwsError;
+use crate::events::{Events, Managed};
 use crate::fleet::Fleets;
 use crate::lifecycle::{Metadata, imds_client};
 use crate::scratch::{Scratch, SystemMachine};
@@ -58,6 +59,7 @@ pub struct Aws {
     pub(crate) config: AwsConfig,
     pub(crate) clock: Arc<dyn Clock>,
     scratch: Arc<Scratch<SystemMachine>>,
+    managed: Arc<Managed>,
     runtime: OnceCell<Runtime>,
 }
 
@@ -67,21 +69,31 @@ pub(crate) struct Runtime {
     pub(crate) autoscaling: aws_sdk_autoscaling::Client,
     pub(crate) metadata: Metadata,
     web_identity: WebIdentity,
+    #[cfg(test)]
+    managed: Arc<Managed>,
 }
 
 impl Runtime {
-    /// Builds the runtime from an SDK configuration and an IMDS client.
+    /// Builds the runtime from a validated configuration, SDK configuration and IMDS client.
     pub(crate) fn from_sdk(
         sdk: &SdkConfig,
         imds: aws_config::imds::Client,
         config: &AwsConfig,
         clock: Arc<dyn Clock>,
+        managed: &Arc<Managed>,
     ) -> Self {
         Self {
-            fleets: Fleets::new(sdk, clock, config.set_capacity_cooldown),
+            fleets: Fleets::new(
+                sdk,
+                Arc::clone(&clock),
+                config.set_capacity_cooldown,
+                Events::new(sdk, config, clock, Arc::clone(managed)),
+            ),
             autoscaling: aws_sdk_autoscaling::Client::new(sdk),
             metadata: Metadata::new(imds, config.fleet_tag_key.as_str()),
             web_identity: WebIdentity::new(sdk, config),
+            #[cfg(test)]
+            managed: Arc::clone(managed),
         }
     }
 }
@@ -101,6 +113,7 @@ impl Aws {
             imds,
             &self.config,
             Arc::clone(&self.clock),
+            &self.managed,
         ))
     }
 
@@ -114,6 +127,7 @@ impl Aws {
         );
         Self {
             clock: Arc::new(SystemClock::new()),
+            managed: Arc::clone(&runtime.managed),
             scratch: Arc::new(scratch),
             runtime: OnceCell::new_with(Some(runtime)),
             config,
@@ -125,6 +139,28 @@ impl Plugin for Aws {
     type Config = AwsConfig;
 
     fn build(config: AwsConfig, _context: &PluginContext<'_>) -> Result<Self, PortError> {
+        if !(1..=10).contains(&config.event_batch_limit) {
+            return Err(AwsError::Config {
+                field: "event_batch_limit",
+                reason: "must be between 1 and 10".to_owned(),
+            }
+            .into());
+        }
+        let visibility = config.event_visibility_timeout.get();
+        if visibility.subsec_nanos() != 0 || visibility.as_secs() > 43_200 {
+            return Err(AwsError::Config {
+                field: "event_visibility_timeout",
+                reason: "must be whole seconds up to 12 hours".to_owned(),
+            }
+            .into());
+        }
+        if !(1..=1000).contains(&config.activity_limit) {
+            return Err(AwsError::Config {
+                field: "activity_limit",
+                reason: "must be between 1 and 1000".to_owned(),
+            }
+            .into());
+        }
         let scratch = Scratch::new(
             config.scratch_mount_point.as_path().to_path_buf(),
             SystemMachine,
@@ -132,6 +168,7 @@ impl Plugin for Aws {
         Ok(Self {
             config,
             clock: Arc::new(SystemClock::new()),
+            managed: Arc::new(Managed::default()),
             scratch: Arc::new(scratch),
             runtime: OnceCell::new(),
         })
@@ -140,6 +177,43 @@ impl Plugin for Aws {
 
 impl ProvisionerPort for Aws {
     type FleetOptions = AwsFleetOptions;
+
+    fn reset_configured_fleets(&self) {
+        self.managed.clear();
+    }
+
+    fn configure_fleet(&self, fleet: Fleet<'_, AwsFleetOptions>) -> Result<(), PortError> {
+        self.managed.add(fleet);
+        Ok(())
+    }
+
+    async fn converge(
+        &self,
+        held: &Held,
+        _fleet: Fleet<'_, AwsFleetOptions>,
+    ) -> Result<(), PortError> {
+        let runtime = self.runtime().await?;
+        if let Err(error) = runtime.fleets.events().receive(held).await {
+            held.check()?;
+            tracing::warn!(%error, "AWS event queue poll failed");
+        }
+        Ok(())
+    }
+
+    async fn acknowledge_event(
+        &self,
+        held: &Held,
+        fleet: Fleet<'_, AwsFleetOptions>,
+        event_id: &str,
+    ) -> Result<(), PortError> {
+        let runtime = self.runtime().await?;
+        runtime
+            .fleets
+            .events()
+            .acknowledge(held, fleet.name.as_str(), event_id)
+            .await?;
+        Ok(())
+    }
 
     async fn supply(
         &self,
@@ -253,6 +327,7 @@ mod tests {
             fake.imds_client()?,
             &config,
             Arc::new(TestClock::new(Timestamp::from_unix_millis(NOW_MILLIS))),
+            &Arc::new(Managed::default()),
         );
         Ok(Aws::with_runtime(config, runtime))
     }
@@ -261,6 +336,82 @@ mod tests {
     fn building_an_aws_plugin_makes_no_aws_call() -> TestResult {
         let aws = Aws::build(config(SCRATCH)?, &context())?;
         assert!(!aws.runtime.initialized());
+        Ok(())
+    }
+
+    #[test]
+    fn building_rejects_programmatic_invalid_event_batch_limit() -> TestResult {
+        let mut invalid = config(SCRATCH)?;
+        invalid.event_batch_limit = 11;
+        assert!(matches!(
+            Aws::build(invalid, &context()),
+            Err(PortError::Config(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn building_rejects_programmatic_invalid_event_settings() -> TestResult {
+        for duration in [
+            gang_types::NonZeroDuration::from_millis(500),
+            gang_types::NonZeroDuration::from_hours(13),
+        ] {
+            let mut invalid = config(SCRATCH)?;
+            invalid.event_visibility_timeout = duration;
+            assert!(matches!(
+                Aws::build(invalid, &context()),
+                Err(PortError::Config(_))
+            ));
+        }
+        for limit in [0, 1001] {
+            let mut invalid = config(SCRATCH)?;
+            invalid.activity_limit = limit;
+            assert!(matches!(
+                Aws::build(invalid, &context()),
+                Err(PortError::Config(_))
+            ));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queue_failure_does_not_block_supply_and_expired_fence_does_not_poll() -> TestResult {
+        let harness = Harness::start().await?;
+        harness.add_group(GROUP, 1, &[(INSTANCE, IN_SERVICE)]);
+        harness.add_launch(INSTANCE, LAUNCH_TIME);
+        harness.fail(
+            "ReceiveMessage",
+            FakeFailure {
+                status: 503,
+                code: "ServiceUnavailable",
+                message: "queue unavailable",
+            },
+        );
+        let mut settings = config(SCRATCH)?;
+        settings.events_queue_url = Some(harness.fake.queue_url().parse()?);
+        let runtime = Runtime::from_sdk(
+            &harness.fake.sdk_config().await,
+            harness.fake.imds_client()?,
+            &settings,
+            Arc::new(TestClock::new(Timestamp::from_unix_millis(NOW_MILLIS))),
+            &Arc::new(Managed::default()),
+        );
+        let aws = Aws::with_runtime(settings, runtime);
+        let test_fleet = fleet(GROUP)?;
+        gang_testkit::fence::with_held(async |held| aws.converge(held, test_fleet.view()).await)
+            .await?;
+        assert_eq!(harness.requests("ReceiveMessage"), 1);
+        let mut supply = FleetSupply::default();
+        aws.supply(test_fleet.view(), &mut supply).await?;
+        assert_eq!(supply.desired, 1);
+        assert_eq!(supply.instances.len(), 1);
+        assert_eq!(supply.instances[0].id, InstanceId::try_new(INSTANCE)?);
+        let expired = gang_testkit::fence::with_expired_held(async |held| {
+            aws.converge(held, test_fleet.view()).await
+        })
+        .await;
+        assert!(expired.is_err());
+        assert_eq!(harness.requests("ReceiveMessage"), 1);
         Ok(())
     }
 

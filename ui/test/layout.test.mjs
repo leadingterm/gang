@@ -178,6 +178,103 @@ const probe = async (ready, pageName) => {
   for (const [index, family] of families.entries()) {
     if (!loadedFonts[index].length || !document.fonts.check(`16px "${family}"`, sample)) add(`font ${family} is not loaded`);
   }
+  const equal = (a, b) => Math.abs(a - b) <= EPS;
+  const pageGrid = document.querySelector(".page-grid");
+  const columns = [...document.querySelectorAll(".layout-columns")].filter((el) => !hidden(el));
+  if (pageGrid) {
+    const children = [...pageGrid.children].filter((child) => !hidden(child));
+    const gap = parseFloat(styleOf(pageGrid).getPropertyValue("--page-section-gap"));
+    if (!Number.isFinite(gap)) add("page grid has no measurable --page-section-gap");
+    if (children.length && !equal(bounds(children[0]).top, bounds(pageGrid).top)) add("first page child does not start at page-grid top");
+    for (let i = 1; i < children.length; i++) {
+      const actual = bounds(children[i]).top - bounds(children[i - 1]).bottom;
+      if (!equal(actual, gap)) add(`page child gap ${actual} differs from --page-section-gap ${gap}`);
+    }
+  }
+  for (const stack of document.querySelectorAll(".stack")) {
+    if (hidden(stack)) continue;
+    const children = [...stack.children].filter((child) => !hidden(child));
+    const gap = parseFloat(styleOf(stack).rowGap);
+    for (let i = 1; i < children.length; i++) {
+      const actual = bounds(children[i]).top - bounds(children[i - 1]).bottom;
+      if (!equal(actual, gap)) add(`${describe(stack)} child gap ${actual} differs from row gap ${gap}`);
+    }
+  }
+  if (pageName === "build") {
+    const bar = document.querySelector(".build-time")?.closest(".chart-frame");
+    const summary = bar?.nextElementSibling;
+    const timeline = document.querySelector(".build-chart")?.closest(".chart-frame");
+    const cache = document.querySelector(".build-cache-strip")?.closest(".chart-frame");
+    const axis = document.querySelector("#build-timeline")?.closest("section")?.querySelector(".passbar__axis");
+    for (const [label, a, b, expected] of [["bar to summary", bar, summary, 16], ["timeline to cache", timeline, cache, 4], ["cache to axis", cache, axis, 8]]) {
+      if (!a || !b) add(`build: missing ${label}`);
+      else {
+        const actual = bounds(b).top - bounds(a).bottom;
+        if (!equal(actual, expected)) add(`build: ${label} gap ${actual}, expected ${expected}`);
+      }
+    }
+  }
+  let referenceColumns;
+  for (const group of columns) {
+    const children = [...group.children].filter((el) => !hidden(el));
+    if (!pageGrid || !children.length || children.length > 2) {
+      add(`${describe(group)} requires a page grid and one or two columns`);
+      continue;
+    }
+    const grid = bounds(pageGrid), outer = bounds(group);
+    const boxes = children.map(bounds);
+    if (!equal(outer.left, grid.left) || !equal(outer.right, grid.right)) add(`${describe(group)} does not span the page grid`);
+    if (children.length === 1) {
+      if (!equal(boxes[0].left, grid.left) && !equal(boxes[0].right, grid.right)) add(`${describe(group)} column is not aligned to a page edge`);
+      continue;
+    }
+    const stacked = equal(boxes[0].left, boxes[1].left);
+    if (stacked) {
+      for (const box of boxes) if (!equal(box.left, grid.left) || !equal(box.right, grid.right)) add(`${describe(group)} stacked column does not span the page grid`);
+    } else {
+      if (!equal(boxes[0].left, grid.left) || !equal(boxes[1].right, grid.right)) add(`${describe(group)} outer column edges do not match the page grid`);
+      if (!equal(boxes[0].width, boxes[1].width)) add(`${describe(group)} column widths differ: ${boxes[0].width} vs ${boxes[1].width}`);
+      const edges = [boxes[0].left, boxes[0].right, boxes[1].left, boxes[1].right];
+      if (referenceColumns && edges.some((edge, i) => !equal(edge, referenceColumns[i]))) add(`${describe(group)} column edges differ from other page columns`);
+      referenceColumns ??= edges;
+    }
+    const sections = children.filter((child) => child.matches("section[aria-labelledby]"));
+    if (sections.length === 2 && equal(bounds(sections[0]).top, bounds(sections[1]).top)) {
+      const tools = sections.map((section) => section.querySelector(":scope > .section__legend"));
+      if (tools.every(Boolean)) {
+        const [a, b] = tools.map(bounds);
+        if (!equal(a.top, b.top) || !equal(a.height, b.height)) add(`${describe(group)} section tools rows differ`);
+      }
+    }
+    const frames = children.map((child) => child.matches(".chart-frame") ? child : child.querySelector(":scope > .chart-frame"));
+    if (frames.every(Boolean) && frames.every((frame) => frame.classList.contains("chart-frame--titled"))) {
+      for (const selector of [".chart-frame__title", ".chart-frame__legend", ".chart-frame__plot"]) {
+        const slots = frames.map((frame) => frame.querySelector(`:scope > ${selector}`));
+        if (slots.some((slot) => !slot)) { add(`${describe(group)} is missing ${selector}`); continue; }
+        const [a, b] = slots.map(bounds);
+        if (!equal(a.height, b.height) || (!stacked && !equal(a.top, b.top))) add(`${describe(group)} ${selector} rows differ`);
+      }
+    }
+  }
+  for (const section of document.querySelectorAll("section[aria-labelledby]")) {
+    if (hidden(section)) continue;
+    const head = section.querySelector(":scope > .shead");
+    if (!head) continue;
+    for (const selector of [".shead__aside", ".section__legend", ".section__body"]) {
+      const slot = selector === ".shead__aside" ? head.querySelector(`:scope > ${selector}`) : section.querySelector(`:scope > ${selector}`);
+      if (!slot) add(`${describe(section)} is missing reserved ${selector}`);
+      else if (selector === ".section__legend" && bounds(slot).height <= EPS) add(`${describe(section)} reserved tools slot has no measurable height`);
+    }
+  }
+  for (const frame of document.querySelectorAll(".chart-frame")) {
+    if (hidden(frame)) continue;
+    const plot = frame.querySelector(":scope > .chart-frame__plot");
+    if (!plot || bounds(plot).width <= EPS || bounds(plot).height <= EPS) add(`${describe(frame)} has no measurable plot`);
+    const sizes = { "chart-frame--spark": 40, "chart-frame--timeline": 120, "chart-frame--bar": 20, "chart-frame--cache": 24 };
+    const size = Object.entries(sizes).find(([name]) => frame.classList.contains(name));
+    if (!size || (plot && !equal(bounds(plot).height, size[1]))) add(`${describe(frame)} has incorrect plot height`);
+    if (frame.classList.contains("chart-frame--titled") && !frame.querySelector(":scope > .chart-frame__legend")) add(`${describe(frame)} has no reserved legend`);
+  }
   const template = document.querySelector(".ident--split");
   if (template) {
     for (const [headText, tailText] of [["//", ":gang"], ["a", ":b"], ["ui", ":dist"]]) {
@@ -287,7 +384,8 @@ const probe = async (ready, pageName) => {
     if (value.lastIndexOf(":") > 0) add(`${describe(el)} truncates "${value}" at its end, hiding the part after its last ":"`);
   }
   for (const shead of document.querySelectorAll(".shead")) {
-    const next = shead.nextElementSibling;
+    let next = shead.nextElementSibling;
+    while (next && (hidden(next) || !next.textContent.trim())) next = next.nextElementSibling;
     if (hidden(shead) || !next || hidden(next) || !next.textContent.trim()) continue;
     const nextInk = ink(next);
     if (!nextInk) continue;
@@ -368,8 +466,27 @@ const probe = async (ready, pageName) => {
       add(`text "${text.textContent.trim().slice(0, 40)}" in ${describe(text.parentElement)} spans x=${rect.left}..${rect.right}, outside the document's 0..${W}`);
     }
   }
+  const pairedSections = columns.map((group) => [...group.children].filter((child) => child.matches("section[aria-labelledby]") && !hidden(child)))
+    .find((sections) => sections.length === 2 && equal(bounds(sections[0]).top, bounds(sections[1]).top));
+  if (pairedSections) {
+    const [first, second] = pairedSections;
+    const legend = first.querySelector(":scope > .section__legend");
+    const bodies = pairedSections.map((section) => section.querySelector(":scope > .section__body"));
+    if (legend && bodies.every(Boolean)) {
+      const original = [...legend.childNodes];
+      const initialHeight = legend.getBoundingClientRect().height;
+      legend.textContent = "Layout legend wrapping ".repeat(30);
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const legendHeight = legend.getBoundingClientRect().height;
+      if (legendHeight <= initialHeight + EPS) add(`${describe(first)} legend did not wrap for the section-row probe`);
+      const [a, b] = bodies.map((body) => body.getBoundingClientRect());
+      if (!equal(a.top, b.top)) add(`${describe(first)} and ${describe(second)} body tops differ with a wrapped legend: ${a.top} vs ${b.top}`);
+      legend.replaceChildren(...original);
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    }
+  }
   if (count > 50) violations.push(`… ${count - 50} more`);
-  const seen = Object.fromEntries([".line__prose", ".ident--split", ".ident__head", ".clause", ".cols", ".shead", ".table", ".line", ".seg__opt > svg"].map((selector) => [selector, [...document.querySelectorAll(selector)].filter((el) => !hidden(el)).length]));
+  const seen = Object.fromEntries([".line__prose", ".ident--split", ".ident__head", ".clause", ".layout-columns", ".shead", ".table", ".line", ".seg__opt > svg"].map((selector) => [selector, [...document.querySelectorAll(selector)].filter((el) => !hidden(el)).length]));
   const elements = [...document.querySelectorAll("*")];
   const sansIndex = elements.findIndex((el) => !el.children.length && !skipped(el) && getComputedStyle(el).fontFamily.includes("Atkinson Hyperlegible Next") && [...el.childNodes].some((node) => node.nodeType === Node.TEXT_NODE && textVisible(node)));
   // clientWidth can include a stable reserved gutter when no scrollbar is present.
@@ -377,7 +494,7 @@ const probe = async (ready, pageName) => {
     visibleHeads: [...document.querySelectorAll(".ident__head")].map((el, index) => !skipped(el) ? index : -1).filter((index) => index >= 0), sansIndex };
 };
 
-test("dashboard layouts", { timeout: 120000 }, async () => {
+test("dashboard layouts", { timeout: 240000 }, async () => {
   const server = previewServer({ dist: "dist", replay: "instant" });
   const profile = mkdtempSync(join(process.env.TEST_TMPDIR ?? tmpdir(), "layout-chromium-"));
   let browser;
@@ -405,7 +522,7 @@ test("dashboard layouts", { timeout: 120000 }, async () => {
       const focused = !FULL_WIDTHS.includes(width);
       const widths = [];
       for (const screen of pages) {
-        if (focused && screen.name !== "activity" && screen.name !== "access") continue;
+        if (focused && !["overview", "actions", "builds", "build", "workers", "activity", "access"].includes(screen.name)) continue;
         await page.send("Network.clearBrowserCookies");
         await page.send("Emulation.setDeviceMetricsOverride", { width, height: 1000, deviceScaleFactor: 1, mobile: false });
         let frames;
@@ -501,12 +618,13 @@ test("dashboard layouts", { timeout: 120000 }, async () => {
           if (banner.result.value) violations.push(`${screen.name}@${width}: a banner appeared: "${banner.result.value}"`);
         }
         // Opt in so plain runs leave no outputs for Bazel to post-process.
-        if (process.env.GANG_LAYOUT_SCREENSHOTS && process.env.TEST_UNDECLARED_OUTPUTS_DIR) {
-          const { cssContentSize } = await page.send("Page.getLayoutMetrics");
-          // Beyond-viewport capture mis-renders tall pages; 3000px bounds the long Actions list.
-          await page.send("Emulation.setDeviceMetricsOverride", { width, height: Math.min(cssContentSize.height, 3000), deviceScaleFactor: 1, mobile: false });
-          await page.send("Runtime.evaluate", { expression: "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))", awaitPromise: true });
-          const screenshot = await page.send("Page.captureScreenshot", { format: "png" });
+        if (process.env.GANG_LAYOUT_SCREENSHOTS && process.env.TEST_UNDECLARED_OUTPUTS_DIR &&
+            (!process.env.GANG_LAYOUT_SCREENSHOT_WIDTH || Number(process.env.GANG_LAYOUT_SCREENSHOT_WIDTH) === width)) {
+          const main = await page.send("Runtime.evaluate", { expression: `(() => {
+            const box = (document.querySelector("main") ?? document.body).getBoundingClientRect();
+            return { x: Math.max(0, box.left + scrollX), y: Math.max(0, box.top + scrollY), width: box.width, height: box.height, scale: 1 };
+          })()`, returnByValue: true });
+          const screenshot = await page.send("Page.captureScreenshot", { format: "png", captureBeyondViewport: true, clip: main.result.value });
           writeFileSync(join(process.env.TEST_UNDECLARED_OUTPUTS_DIR, `${screen.name}-${width}.png`), Buffer.from(screenshot.data, "base64"));
         }
       }

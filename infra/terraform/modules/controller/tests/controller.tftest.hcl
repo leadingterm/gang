@@ -43,17 +43,17 @@ mock_provider "aws" {
 }
 
 variables {
-  name                  = "gang-controller"
-  ami_id                = "ami-0123456789abcdef0"
-  instance_type         = "m7i.large"
-  subnet_id             = "subnet-0123456789abcdef0"
-  private_ip            = "10.20.0.10"
-  security_group_id     = "sg-0123456789abcdef0"
-  eip_allocation_id     = "eipalloc-0123456789abcdef0"
-  config_parameter_name = "/gang-controller/gang.toml"
-  config_parameter_arn  = "arn:aws:ssm:eu-north-1:000000000000:parameter/gang-controller/gang.toml"
-  cache_bucket_arn      = "arn:aws:s3:::example-gang-cache"
-  ca_key_arn            = "arn:aws:kms:eu-north-1:000000000000:key/00000000-0000-0000-0000-000000000000"
+  name                       = "gang-controller"
+  ami_id                     = "ami-0123456789abcdef0"
+  instance_type              = "m7i.large"
+  subnet_id                  = "subnet-0123456789abcdef0"
+  private_ip                 = "10.20.0.10"
+  security_group_id          = "sg-0123456789abcdef0"
+  eip_allocation_id          = "eipalloc-0123456789abcdef0"
+  config_parameter_reference = "/gang-controller/gang.toml/generations/example:1"
+  config_parameter_arns      = ["arn:aws:ssm:eu-north-1:000000000000:parameter/gang-controller/gang.toml", "arn:aws:ssm:eu-north-1:000000000000:parameter/gang-controller/gang.toml/generations/*"]
+  cache_bucket_arn           = "arn:aws:s3:::example-gang-cache"
+  ca_key_arn                 = "arn:aws:kms:eu-north-1:000000000000:key/00000000-0000-0000-0000-000000000000"
   worker_fleet_names = [
     "gang-x86-64",
   ]
@@ -124,16 +124,16 @@ run "instance_requires_imdsv2_with_hop_limit_one" {
   }
 }
 
-run "user_data_is_role_and_config_parameter_name" {
+run "user_data_is_role_and_config_parameter_reference" {
   command = plan
 
   assert {
-    condition     = aws_instance.this[0].user_data == "controller ${var.config_parameter_name} state=/dev/sdg"
+    condition     = aws_instance.this[0].user_data == "controller ${var.config_parameter_reference} state=/dev/sdg"
     error_message = "EC2 user-data must identify the controller, configuration parameter and state device."
   }
 }
 
-run "user_data_lists_each_secret_after_config_name" {
+run "user_data_lists_each_secret_after_config_reference" {
   command = plan
 
   variables {
@@ -145,11 +145,11 @@ run "user_data_lists_each_secret_after_config_name" {
 
   assert {
     condition = aws_instance.this[0].user_data == join("\n", [
-      "controller ${var.config_parameter_name} state=/dev/sdg",
+      "controller ${var.config_parameter_reference} state=/dev/sdg",
       "ca-password=/gang-controller/secrets/ca-password",
       "dashboard-client-secret=/gang-controller/secrets/dashboard-client-secret",
     ])
-    error_message = "EC2 user-data must start with the role line `controller <config parameter name> state=/dev/sdg` followed by one file=parameter line per secret, in file-name order."
+    error_message = "EC2 user-data must start with the role line `controller <config parameter reference> state=/dev/sdg` followed by one file=parameter line per secret, in file-name order."
   }
 }
 
@@ -223,27 +223,27 @@ run "root_volume_below_minimum_is_rejected" {
   ]
 }
 
-run "empty_config_parameter_name_is_rejected" {
+run "empty_config_parameter_reference_is_rejected" {
   command = plan
 
   variables {
-    config_parameter_name = ""
+    config_parameter_reference = ""
   }
 
   expect_failures = [
-    var.config_parameter_name,
+    var.config_parameter_reference,
   ]
 }
 
-run "config_parameter_name_cannot_inject_user_data_lines" {
+run "config_parameter_reference_cannot_inject_user_data_lines" {
   command = plan
 
   variables {
-    config_parameter_name = "/gang/config\n/gang/other"
+    config_parameter_reference = "/gang/config\n/gang/other:1"
   }
 
   expect_failures = [
-    var.config_parameter_name,
+    var.config_parameter_reference,
   ]
 }
 
@@ -624,4 +624,111 @@ run "instance_requires_eip" {
   command = plan
   variables { eip_allocation_id = null }
   expect_failures = [var.eip_allocation_id]
+}
+
+run "group_uses_ec2_health_for_refresh" {
+  command = plan
+  variables {
+    shape                  = "group"
+    controller_count       = 2
+    subnet_ids             = ["subnet-0123456789abcdef0", "subnet-0123456789abcdef1"]
+    target_group_arns      = ["arn:aws:elasticloadbalancing:eu-north-1:000000000000:targetgroup/serve/0123456789abcdef"]
+    config_digest          = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    dynamodb_table_arn     = "arn:aws:dynamodb:eu-north-1:000000000000:table/gang"
+    shutdown_grace_seconds = 300
+  }
+  assert {
+    condition     = aws_autoscaling_group.controller[0].health_check_type == "EC2"
+    error_message = "Standby controllers must not fail ASG health during refresh."
+  }
+}
+run "aws_events_queue_permissions" {
+  command = plan
+
+  variables {
+    events_queue_arn = "arn:aws:sqs:eu-north-1:000000000000:gang-events"
+  }
+
+  assert {
+    condition = length([
+      for statement in data.aws_iam_policy_document.this.statement : statement
+      if statement.effect == "Allow" && statement.sid == "ObserveAwsEvents"
+      && toset(statement.actions) == toset(["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"])
+      && toset(statement.resources) == toset([var.events_queue_arn])
+    ]) == 1
+    error_message = "The controller must receive only the three required SQS actions on its exact queue."
+  }
+
+  assert {
+    condition = alltrue(flatten([
+      for statement in data.aws_iam_policy_document.this.statement : [
+        for action in statement.actions : statement.sid == "ObserveAwsEvents"
+        if statement.effect == "Allow" && (lower(action) == "*" || startswith(lower(action), "sqs:"))
+      ]
+    ]))
+    error_message = "No other controller IAM statement may grant SQS actions."
+  }
+}
+
+run "aws_events_queue_disabled" {
+  command = plan
+
+  assert {
+    condition = !anytrue(flatten([
+      for statement in data.aws_iam_policy_document.this.statement : [
+        for action in statement.actions : lower(action) == "*" || startswith(lower(action), "sqs:")
+        if statement.effect == "Allow"
+      ]
+    ]))
+    error_message = "Without an events queue, the controller must not receive SQS permissions."
+  }
+}
+
+run "rejects_wildcard_events_queue" {
+  command = plan
+
+  variables {
+    events_queue_arn = "arn:aws:sqs:eu-north-1:000000000000:*"
+  }
+
+  expect_failures = [var.events_queue_arn]
+}
+
+run "rejects_unversioned_config_reference" {
+  command = plan
+  variables { config_parameter_reference = "/gang/config" }
+  expect_failures = [var.config_parameter_reference]
+}
+
+run "rejects_zero_config_version" {
+  command = plan
+  variables { config_parameter_reference = "/gang/config:0" }
+  expect_failures = [var.config_parameter_reference]
+}
+
+run "rejects_empty_config_arns" {
+  command = plan
+  variables { config_parameter_arns = [] }
+  expect_failures = [var.config_parameter_arns]
+}
+
+run "rejects_oversized_config_path" {
+  command = plan
+  variables { config_parameter_reference = "/${join("", [for i in range(1011) : "a"])}:1" }
+  expect_failures = [var.config_parameter_reference]
+}
+
+run "rejects_non_numeric_config_version" {
+  command = plan
+  variables { config_parameter_reference = "/gang/config:latest" }
+  expect_failures = [var.config_parameter_reference]
+}
+
+run "accepts_positive_config_version" {
+  command = plan
+  variables { config_parameter_reference = "/gang/config:2" }
+  assert {
+    condition     = aws_instance.this[0].user_data == "controller /gang/config:2 state=/dev/sdg"
+    error_message = "The controller must preserve a positive version selector in user data."
+  }
 }

@@ -153,17 +153,17 @@ run "controller_worker_port_only_from_worker_sg" {
   command = plan
 
   assert {
-    condition     = aws_vpc_security_group_ingress_rule.controller_worker.from_port == output.worker_port && aws_vpc_security_group_ingress_rule.controller_worker.to_port == output.worker_port && aws_vpc_security_group_ingress_rule.controller_worker.ip_protocol == "tcp"
+    condition     = aws_vpc_security_group_ingress_rule.controller_worker[0].from_port == output.worker_port && aws_vpc_security_group_ingress_rule.controller_worker[0].to_port == output.worker_port && aws_vpc_security_group_ingress_rule.controller_worker[0].ip_protocol == "tcp"
     error_message = "The worker listener rule must open TCP worker_port only."
   }
 
   assert {
-    condition     = aws_vpc_security_group_ingress_rule.controller_worker.referenced_security_group_id == aws_security_group.worker.id && aws_vpc_security_group_ingress_rule.controller_worker.cidr_ipv4 == null
+    condition     = aws_vpc_security_group_ingress_rule.controller_worker[0].referenced_security_group_id == aws_security_group.worker.id && aws_vpc_security_group_ingress_rule.controller_worker[0].cidr_ipv4 == null
     error_message = "TCP worker_port must be granted to the worker security group, never to a CIDR."
   }
 
   assert {
-    condition     = alltrue([for rule in values(aws_vpc_security_group_ingress_rule.controller_public) : rule.from_port != output.worker_port && rule.to_port != output.worker_port]) && aws_vpc_security_group_ingress_rule.controller_worker_public.from_port != output.worker_port && aws_vpc_security_group_ingress_rule.controller_worker_public.to_port != output.worker_port
+    condition     = alltrue([for rule in values(aws_vpc_security_group_ingress_rule.controller_public) : rule.from_port != output.worker_port && rule.to_port != output.worker_port]) && aws_vpc_security_group_ingress_rule.controller_worker_public[0].from_port != output.worker_port && aws_vpc_security_group_ingress_rule.controller_worker_public[0].to_port != output.worker_port
     error_message = "The worker_port must not be opened by any ingress rule other than the worker listener rule."
   }
 }
@@ -176,12 +176,12 @@ run "public_port_from_worker_sg_and_client_cidrs_only" {
   }
 
   assert {
-    condition     = aws_vpc_security_group_ingress_rule.controller_worker_public.from_port == output.public_port && aws_vpc_security_group_ingress_rule.controller_worker_public.to_port == output.public_port && aws_vpc_security_group_ingress_rule.controller_worker_public.ip_protocol == "tcp"
+    condition     = aws_vpc_security_group_ingress_rule.controller_worker_public[0].from_port == output.public_port && aws_vpc_security_group_ingress_rule.controller_worker_public[0].to_port == output.public_port && aws_vpc_security_group_ingress_rule.controller_worker_public[0].ip_protocol == "tcp"
     error_message = "The worker public rule must open TCP public_port only."
   }
 
   assert {
-    condition     = aws_vpc_security_group_ingress_rule.controller_worker_public.referenced_security_group_id == aws_security_group.worker.id && aws_vpc_security_group_ingress_rule.controller_worker_public.cidr_ipv4 == null
+    condition     = aws_vpc_security_group_ingress_rule.controller_worker_public[0].referenced_security_group_id == aws_security_group.worker.id && aws_vpc_security_group_ingress_rule.controller_worker_public[0].cidr_ipv4 == null
     error_message = "The public_port listener for workers must be granted to the worker security group, never to a CIDR."
   }
 
@@ -222,7 +222,7 @@ run "no_client_ingress_without_client_cidrs" {
   }
 
   assert {
-    condition     = aws_vpc_security_group_ingress_rule.controller_worker_public.from_port == 443
+    condition     = aws_vpc_security_group_ingress_rule.controller_worker_public[0].from_port == 443
     error_message = "Workers must retain access to the public listener on port 443 without client CIDRs."
   }
 }
@@ -374,5 +374,17 @@ run "default_omits_dynamodb_endpoint" {
   assert {
     condition     = length(aws_vpc_endpoint.dynamodb) == 0 && length(aws_eip.controller) == 1
     error_message = "The default shape retains its EIP and does not create a DynamoDB endpoint."
+  }
+}
+
+run "shared_database_has_no_direct_controller_ingress" {
+  command = plan
+  variables {
+    shared_database      = true
+    client_ingress_cidrs = ["198.51.100.0/24"]
+  }
+  assert {
+    condition     = length(aws_vpc_security_group_ingress_rule.controller_public) == 0 && length(aws_vpc_security_group_ingress_rule.controller_worker) == 0 && length(aws_vpc_security_group_ingress_rule.controller_worker_public) == 0
+    error_message = "Shared controllers must not accept direct client or worker ingress."
   }
 }

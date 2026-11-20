@@ -58,9 +58,9 @@ variables {
     "eu-north-1a" = "subnet-0000000000000001"
     "eu-north-1b" = "subnet-0000000000000002"
   }
-  config_parameter_name = "/gang/gang.toml"
-  config_parameter_arn  = "arn:aws:ssm:eu-north-1:000000000000:parameter/gang/gang.toml"
-  fleet_tag_key         = "gang-fleet"
+  config_parameter_reference = "/gang/gang.toml/generations/example:1"
+  config_parameter_arns      = ["arn:aws:ssm:eu-north-1:000000000000:parameter/gang/gang.toml", "arn:aws:ssm:eu-north-1:000000000000:parameter/gang/gang.toml/generations/*"]
+  fleet_tag_key              = "gang-fleet"
 
   fleets = [
     {
@@ -183,9 +183,9 @@ run "one_spot_asg_per_fleet" {
   assert {
     condition = alltrue([
       for fleet in var.fleets :
-      base64decode(aws_launch_template.this[fleet.name].user_data) == "worker ${var.config_parameter_name}"
+      base64decode(aws_launch_template.this[fleet.name].user_data) == "worker ${var.config_parameter_reference}"
     ])
-    error_message = "Worker user data must be `worker <config parameter name>`, so workers read the current gang.toml at boot."
+    error_message = "Worker user data must carry the pinned configuration reference for the launch generation."
   }
 
   assert {
@@ -416,6 +416,52 @@ run "on_demand_fleet_buys_only_on_demand_capacity" {
 }
 
 
+run "rejects_twenty_second_token_lifetime" {
+  command = plan
+
+  variables {
+    workload_token_max_seconds = 20
+  }
+
+  expect_failures = [var.workload_token_max_seconds]
+}
+
+run "rejects_fifty_nine_second_token_lifetime" {
+  command = plan
+
+  variables {
+    workload_token_max_seconds = 59
+  }
+
+  expect_failures = [var.workload_token_max_seconds]
+}
+
+run "accepts_sixty_second_token_lifetime" {
+  command = plan
+
+  variables {
+    workload_token_max_seconds = 60
+  }
+}
+
+run "accepts_one_hour_token_lifetime" {
+  command = plan
+
+  variables {
+    workload_token_max_seconds = 3600
+  }
+}
+
+run "rejects_token_lifetime_above_maximum" {
+  command = plan
+
+  variables {
+    workload_token_max_seconds = 3601
+  }
+
+  expect_failures = [var.workload_token_max_seconds]
+}
+
 run "rejects_token_lifetime_above_one_hour" {
   command = plan
 
@@ -426,14 +472,14 @@ run "rejects_token_lifetime_above_one_hour" {
   expect_failures = [var.workload_token_max_seconds]
 }
 
-run "rejects_empty_config_parameter_name" {
+run "rejects_empty_config_parameter_reference" {
   command = plan
 
   variables {
-    config_parameter_name = ""
+    config_parameter_reference = ""
   }
 
-  expect_failures = [var.config_parameter_name]
+  expect_failures = [var.config_parameter_reference]
 }
 
 run "rejects_malformed_ca_key_arn" {
@@ -845,14 +891,14 @@ run "rejects_fleet_name_with_trailing_dash" {
   expect_failures = [var.fleets]
 }
 
-run "rejects_newline_in_config_parameter_name" {
+run "rejects_newline_in_config_parameter_reference" {
   command = plan
 
   variables {
-    config_parameter_name = "/gang/gang.toml\nextra"
+    config_parameter_reference = "/gang/gang.toml\nextra:1"
   }
 
-  expect_failures = [var.config_parameter_name]
+  expect_failures = [var.config_parameter_reference]
 }
 
 run "groups_span_every_subnet_when_every_zone_offers_their_types" {
@@ -999,4 +1045,58 @@ run "rejects_empty_fleets" {
   }
 
   expect_failures = [var.fleets]
+}
+
+run "worker_policy_never_grants_sqs" {
+  command = plan
+
+  assert {
+    condition = !anytrue(flatten([
+      for statement in data.aws_iam_policy_document.worker.statement : [
+        for action in statement.actions :
+        strcontains(action, "*") || startswith(lower(action), "sqs:")
+        if statement.effect == "Allow"
+      ]
+    ]))
+    error_message = "The worker role policy must not grant SQS or wildcard actions."
+  }
+}
+
+run "rejects_unversioned_config_reference" {
+  command = plan
+  variables { config_parameter_reference = "/gang/config" }
+  expect_failures = [var.config_parameter_reference]
+}
+
+run "rejects_zero_config_version" {
+  command = plan
+  variables { config_parameter_reference = "/gang/config:0" }
+  expect_failures = [var.config_parameter_reference]
+}
+
+run "rejects_empty_config_arns" {
+  command = plan
+  variables { config_parameter_arns = [] }
+  expect_failures = [var.config_parameter_arns]
+}
+
+run "rejects_oversized_config_path" {
+  command = plan
+  variables { config_parameter_reference = "/${join("", [for i in range(1011) : "a"])}:1" }
+  expect_failures = [var.config_parameter_reference]
+}
+
+run "rejects_non_numeric_config_version" {
+  command = plan
+  variables { config_parameter_reference = "/gang/config:latest" }
+  expect_failures = [var.config_parameter_reference]
+}
+
+run "accepts_positive_config_version" {
+  command = plan
+  variables { config_parameter_reference = "/gang/config:2" }
+  assert {
+    condition     = alltrue([for fleet in var.fleets : base64decode(aws_launch_template.this[fleet.name].user_data) == "worker /gang/config:2"])
+    error_message = "Every worker launch template must preserve the positive version selector."
+  }
 }

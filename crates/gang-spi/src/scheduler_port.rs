@@ -2,6 +2,7 @@
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ::bytes::Bytes as BodyBytes;
@@ -16,13 +17,43 @@ use gang_types::{
     InstanceId, Refusal, Url, WorkerId,
 };
 
-use crate::{Authenticated, BoxedError, ObservationSink, Peer, PortError, RenderedStoreSpec, port};
+use crate::{
+    ActionMemoryPool, Authenticated, BoxedError, ObservationSink, Peer, PortError, RecordKey,
+    RenderedStoreSpec, port,
+};
 
 /// The remote execution scheduler Gang scales workers for. The scheduler runs inside the `gang`
 /// process: `gang server` runs the controller and `gang worker` runs a worker, each through the
 /// future a method returns.
 #[port]
 pub trait SchedulerPort: Send + Sync {
+    /// Upper bound on the encoded body of one learned history from this scheduler.
+    /// Available from controller readiness through drain.
+    ///
+    /// # Errors
+    /// Returns a port error if the scheduler cannot determine the bound.
+    fn learned_history_byte_limit(&self) -> Result<std::num::NonZeroUsize, PortError>;
+
+    /// Reuses `into` for the current live learned histories, oldest first.
+    ///
+    /// # Errors
+    /// Returns a port error when the scheduler cannot provide its learned state.
+    async fn learned_history(
+        &self,
+        now: Timestamp,
+        into: &mut Vec<LearnedHistory>,
+    ) -> Result<(), PortError>;
+
+    /// Replaces learned state with compatible live records in supplied recency order.
+    ///
+    /// # Errors
+    /// Returns a port error if the scheduler cannot restore its learned state.
+    async fn restore_learned_history(
+        &self,
+        now: Timestamp,
+        records: &[LearnedHistory],
+    ) -> Result<(), PortError>;
+
     /// Overwrites `into` with the connected workers and the queued actions. A worker Gang does
     /// not manage is left out. Workers have unique ids and are sorted by `WorkerId` ascending.
     /// The buffers of `into` are reused. On `Err`, `into` is unspecified; callers skip the pass.
@@ -56,14 +87,12 @@ pub trait SchedulerPort: Send + Sync {
     /// The URL the controller's worker listener is dialed on.
     fn endpoints(&self) -> ControllerEndpoints;
 
-    /// Builds the controller's stores, scheduler, and services, and serves the connections it is
-    /// handed on `connections`: the cache services (CAS, action cache, `ByteStream`, Capabilities)
-    /// and `api` on every public connection, which may speak HTTP/1.1 or HTTP/2 (auto-detected);
-    /// the execution services, Capabilities and `api` on every execution connection; and the
-    /// worker services on every worker connection, which speak HTTP/2 only. Without an execution
-    /// listener, the public connections carry the execution services too. Each request first
-    /// passes its listener's gate. Listening, TLS, and authentication belong to the caller; a
-    /// caller that does not lead yet feeds the execution and worker streams later.
+    /// Prepares the process-owned shared stores and services once, builds the term's scheduler
+    /// and leader services, and serves the supplied connections. Public connections carry client
+    /// services and `api` over HTTP/1.1 or HTTP/2; worker connections carry worker services over
+    /// HTTP/2. The caller may supply both streams before promotion. Each request passes its
+    /// listener's gate with its service scope, and leader-scoped dispatch requires admission.
+    /// Listening, TLS, and authentication belong to the caller.
     /// It sends `ready` once the controller is built and before it serves the first connection;
     /// a run that fails before that drops `ready` unsent.
     ///
@@ -85,6 +114,23 @@ pub trait SchedulerPort: Send + Sync {
         spec: &ControllerSpec<'_>,
         connections: ControllerConnections<P, W, A>,
         ready: ControllerReady,
+    ) -> Result<(), PortError>;
+
+    /// Serves the prepared shared services using the supplied gates and API while deliberately
+    /// refusing leader-scoped requests before dispatch. This can run while an existing controller
+    /// drains: it must not build or publish another controller, signal readiness, schedule work,
+    /// or access learned history.
+    ///
+    /// Once both streams end, finishes pending responses within the backend's configured
+    /// shutdown bounds. Dropping the future closes its remaining connections.
+    ///
+    /// # Errors
+    ///
+    /// [`PortError::Unavailable`] if shared services have not been prepared; a port error if
+    /// the standby transport cannot be configured or fails.
+    async fn serve_standby<P: RequestGate, W: RequestGate, A: ApiService>(
+        &self,
+        connections: ControllerConnections<P, W, A>,
     ) -> Result<(), PortError>;
 
     /// Builds one worker, connects it to the controller's worker listener, and runs it until
@@ -111,6 +157,17 @@ pub trait SchedulerPort: Send + Sync {
         tls: WorkerTls<'_>,
         stop: impl Future<Output = ()> + Send,
     ) -> Result<(), PortError>;
+}
+
+/// One versioned learned history and its original expiration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LearnedHistory {
+    /// Resource or duration history key.
+    pub key: RecordKey,
+    /// Opaque engine-versioned payload.
+    pub body: Vec<u8>,
+    /// The original expiration, never extended by persistence.
+    pub expires_at: Timestamp,
 }
 
 /// What the scheduler holds at one moment.
@@ -290,13 +347,38 @@ pub enum Admitted {
     Anonymous,
 }
 
+/// The service plane a request needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestScope {
+    /// Services available independently of leadership after preparation.
+    Shared,
+    /// Services that require the controller to admit leader work.
+    Leader,
+}
+
+/// The gate's decision before a request reaches a service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateDecision {
+    /// The request may proceed with the given caller identity.
+    Admit(Admitted),
+    /// Leader-scoped work is unavailable on this controller.
+    NotLeading,
+}
+
+/// Response extension marking a leadership refusal made before handler dispatch.
+///
+/// This is in-process transport metadata, not an HTTP header or wire error reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaderUnavailable;
+
 /// The authentication gate of a listener. The controller applies it to every request before any
 /// service sees it, so the scheduler stays free of TLS, tokens and revocation.
 pub trait RequestGate: Clone + Send + Sync + 'static {
-    /// Decides whether a request may proceed, and as whom. The gate may add values to
-    /// `parts.extensions` for the services behind it.
-    /// An admitted request is [`Admitted::Authenticated`] when its caller proved who it is, and
-    /// [`Admitted::Anonymous`] otherwise.
+    /// Decides whether a request in `scope` may proceed, and as whom. The gate may add values
+    /// to `parts.extensions` for the services behind it. An admitted request carries
+    /// [`Admitted::Authenticated`] when its caller proved who it is, and
+    /// [`Admitted::Anonymous`] otherwise. [`GateDecision::NotLeading`] refuses leader work
+    /// before dispatch.
     ///
     /// # Errors
     ///
@@ -308,9 +390,10 @@ pub trait RequestGate: Clone + Send + Sync + 'static {
     /// [`PortError::Unavailable`] when a dependency of the gate is down.
     fn admit(
         &self,
+        scope: RequestScope,
         peer: &Peer,
         parts: &mut http::request::Parts,
-    ) -> impl Future<Output = Result<Admitted, PortError>> + Send;
+    ) -> impl Future<Output = Result<GateDecision, PortError>> + Send;
 }
 
 /// The request body of an [`ApiService`].
@@ -346,17 +429,12 @@ pub struct Listening<G> {
     pub gate: G,
 }
 
-/// What the controller serves: the public listener, which carries the cache services and the
-/// Gang API, the execution listener of the leading controller, and the private worker listener.
-/// The public and execution listeners admit clients through gates of one type; the worker
-/// listener's gate may differ.
+/// What the controller serves: the public listener, which carries all client services and the
+/// Gang API, and the private worker listener. Their gates may differ.
 pub struct ControllerConnections<P, W, A> {
     /// The public listener: Bazel and `gang` clients. Requests no client service handles go to
     /// `api`.
     pub public: Listening<P>,
-    /// The execution listener: Bazel's `--remote_executor` and the leader routes of the Gang API.
-    /// `None` serves the execution services on `public` instead.
-    pub execution: Option<Listening<P>>,
     /// The worker listener: workers.
     pub worker: Listening<W>,
     /// The Gang API.
@@ -424,8 +502,10 @@ pub struct ClientTls<'a> {
 }
 
 /// Inputs of the controller.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ControllerSpec<'a> {
+    /// Shared action scheduling and enforcement policy.
+    pub actions: Arc<gang_config::ActionsConfig>,
     /// The content-addressable store.
     pub content_store: &'a RenderedStoreSpec,
     /// The action store.
@@ -492,6 +572,10 @@ impl Slots {
 /// Inputs of one worker.
 #[derive(Debug, Clone)]
 pub struct WorkerSpec {
+    /// Shared action scheduling and enforcement policy.
+    pub actions: Arc<gang_config::ActionsConfig>,
+    /// The worker's action cgroup pool, if supported.
+    pub memory_pool: Option<ActionMemoryPool>,
     /// The instance the worker runs on; the plugin names the worker with
     /// [`InstanceId::worker_name`].
     pub instance: InstanceId,

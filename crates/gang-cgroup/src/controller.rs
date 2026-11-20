@@ -15,13 +15,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use gang_clock::{Clock, Poll};
-use gang_spi::{ActionLimits, ActionScope, ActionUsage};
+use gang_spi::{ActionLimits, ActionMemoryPool, ActionScope, ActionUsage};
+use gang_types::{Bytes, NonZeroBytes};
 
 use crate::config::{CgroupConfig, Delegation};
 use crate::errors::CgroupError;
 use crate::fs::{
-    CONTROLLERS, CPU_MAX, CPU_STAT, Cgroupfs, EVENTS, KILL, MEMBERSHIP_FILE, MEMORY_MAX,
-    MEMORY_OOM_GROUP, MEMORY_PEAK, MEMORY_SWAP_MAX, PIDS_MAX, PROCS, SUBTREE_CONTROL,
+    CONTROLLERS, CPU_MAX, CPU_STAT, Cgroupfs, EVENTS, KILL, MEMBERSHIP_FILE, MEMINFO_FILE,
+    MEMORY_EVENTS, MEMORY_MAX, MEMORY_OOM_GROUP, MEMORY_PEAK, MEMORY_SWAP_MAX, PIDS_MAX, PROCS,
+    SUBTREE_CONTROL,
 };
 use crate::limits::KernelLimits;
 use crate::parse;
@@ -50,11 +52,17 @@ pub struct CgroupScope {
     /// The `gang-join` link followed by the scope's absolute directory: starts a process inside
     /// `cgroup`.
     launcher: Box<[OsString]>,
+    /// Absolute path used for memory accounting by the worker.
+    memory_cgroup: PathBuf,
 }
 
 impl ActionScope for CgroupScope {
     fn launcher(&self) -> &[OsString] {
         &self.launcher
+    }
+
+    fn memory_cgroup(&self) -> Option<PathBuf> {
+        Some(self.memory_cgroup.clone())
     }
 }
 
@@ -95,7 +103,7 @@ impl<F: Cgroupfs, C: Clock> Controller<F, C> {
     /// controllers and kernel features the limits need, moves the worker into its leaf, enables
     /// the controllers for the actions, and disposes of the scopes a previous worker left behind.
     /// Safe to repeat from the worker's leaf.
-    pub(crate) async fn prepare(&self) -> Result<(), CgroupError> {
+    pub(crate) async fn prepare(&self, reserve: Bytes) -> Result<ActionMemoryPool, CgroupError> {
         let own = self.own_cgroup()?;
         let subtree = worker_subtree(&own).unwrap_or(&own);
         delegated(subtree)?;
@@ -111,6 +119,13 @@ impl<F: Cgroupfs, C: Clock> Controller<F, C> {
             }
         }
         self.require_controllers(subtree)?;
+        let effective = self.effective_memory(subtree)?;
+        if reserve.get() >= effective {
+            return Err(CgroupError::ReserveTooLarge {
+                reserve: reserve.get(),
+                effective,
+            });
+        }
 
         let worker = subtree.join(WORKER_LEAF);
         let actions = subtree.join(ACTIONS_DIR);
@@ -120,16 +135,84 @@ impl<F: Cgroupfs, C: Clock> Controller<F, C> {
         self.write(subtree, SUBTREE_CONTROL, ENABLE_CONTROLLERS)?;
         self.write(&actions, SUBTREE_CONTROL, ENABLE_CONTROLLERS)?;
 
-        for file in [KILL, MEMORY_PEAK] {
-            if !self.fs.has_file(&actions, file) {
-                return Err(CgroupError::MissingKernelFeature { file });
-            }
+        if !self.fs.has_file(&actions, KILL) {
+            return Err(CgroupError::MissingKernelFeature { file: KILL });
         }
+        self.write(
+            &actions,
+            MEMORY_MAX,
+            &(effective - reserve.get()).to_string(),
+        )?;
+        self.write(&actions, MEMORY_OOM_GROUP, "0")?;
+        if self.fs.has_file(&actions, MEMORY_SWAP_MAX) {
+            self.write(
+                &actions,
+                MEMORY_SWAP_MAX,
+                &self.config.swap_max.get().to_string(),
+            )?;
+        }
+        let capacity_text = self.read(&actions, MEMORY_MAX)?;
+        let capacity = capacity_text
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .and_then(|value| NonZeroBytes::new(Bytes::new(value)))
+            .ok_or(CgroupError::Malformed {
+                what: MEMORY_MAX,
+                content: capacity_text,
+            })?;
 
         for stale in self.children(&actions)? {
             self.dispose(&stale).await?;
         }
-        Ok(())
+        Ok(ActionMemoryPool {
+            cgroup: self.fs.absolute(&actions),
+            capacity,
+        })
+    }
+
+    fn effective_memory(&self, subtree: &Path) -> Result<u64, CgroupError> {
+        let meminfo = self
+            .fs
+            .meminfo()
+            .map_err(CgroupError::io(Path::new(MEMINFO_FILE)))?;
+        let mut effective = meminfo
+            .lines()
+            .find_map(|line| {
+                let mut fields = line.split_whitespace();
+                match (fields.next(), fields.next(), fields.next(), fields.next()) {
+                    (Some("MemTotal:"), Some(value), Some("kB"), None) => {
+                        value.parse::<u64>().ok()?.checked_mul(1024)
+                    }
+                    _ => None,
+                }
+            })
+            .ok_or(CgroupError::Malformed {
+                what: MEMINFO_FILE,
+                content: meminfo,
+            })?;
+        for ancestor in subtree.ancestors() {
+            let text = match self.fs.read(ancestor, MEMORY_MAX) {
+                Ok(text) => text,
+                Err(error)
+                    if ancestor.as_os_str().is_empty() && error.kind() == ErrorKind::NotFound =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(CgroupError::io(&ancestor.join(MEMORY_MAX))(error)),
+            };
+            if text.trim() != "max" {
+                let limit = text
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|_| CgroupError::Malformed {
+                        what: MEMORY_MAX,
+                        content: text,
+                    })?;
+                effective = effective.min(limit);
+            }
+        }
+        Ok(effective)
     }
 
     /// Sweeps abandoned scopes, creates the action's scope and applies `requested` to it. The
@@ -159,12 +242,17 @@ impl<F: Cgroupfs, C: Clock> Controller<F, C> {
             self.fs.remove(&cgroup).ok();
             return Err(error);
         }
+        let memory_cgroup = self.fs.absolute(&cgroup);
         let launcher: Box<[OsString]> = [
             self.join.clone().into_os_string(),
-            self.fs.absolute(&cgroup).into_os_string(),
+            memory_cgroup.clone().into_os_string(),
         ]
         .into();
-        Ok(CgroupScope { cgroup, launcher })
+        Ok(CgroupScope {
+            cgroup,
+            launcher,
+            memory_cgroup,
+        })
     }
 
     /// Reads the action's usage, kills every process left in the scope, waits until the scope is
@@ -223,14 +311,7 @@ impl<F: Cgroupfs, C: Clock> Controller<F, C> {
     }
 
     fn apply(&self, cgroup: &Path, limits: &KernelLimits) -> Result<(), CgroupError> {
-        if let Some(memory) = limits.memory {
-            self.write(cgroup, MEMORY_MAX, &memory.to_string())?;
-            // Absent when the kernel has no swap accounting; the write is then skipped.
-            if self.fs.has_file(cgroup, MEMORY_SWAP_MAX) {
-                self.write(cgroup, MEMORY_SWAP_MAX, &limits.swap.to_string())?;
-            }
-        }
-        self.write(cgroup, MEMORY_OOM_GROUP, limits.oom_group.value())?;
+        self.write(cgroup, MEMORY_OOM_GROUP, "1")?;
         if let Some(cpu) = limits.cpu {
             self.write(cgroup, CPU_MAX, &cpu.to_string())?;
         }
@@ -239,8 +320,17 @@ impl<F: Cgroupfs, C: Clock> Controller<F, C> {
 
     fn usage(&self, cgroup: &Path) -> Result<ActionUsage, CgroupError> {
         Ok(ActionUsage {
-            peak_memory: parse::peak_memory(&self.read(cgroup, MEMORY_PEAK)?)?,
+            peak_memory: match self.fs.read(cgroup, MEMORY_PEAK) {
+                Ok(text) => Some(parse::peak_memory(&text)?),
+                Err(error) if error.kind() == ErrorKind::NotFound => None,
+                Err(error) => return Err(CgroupError::io(&cgroup.join(MEMORY_PEAK))(error)),
+            },
             cpu_time: parse::cpu_time(&self.read(cgroup, CPU_STAT)?)?,
+            oom_kills: match self.fs.read(cgroup, MEMORY_EVENTS) {
+                Ok(text) => parse::oom_kills(&text)?,
+                Err(error) if error.kind() == ErrorKind::NotFound => 0,
+                Err(error) => return Err(CgroupError::io(&cgroup.join(MEMORY_EVENTS))(error)),
+            },
         })
     }
 

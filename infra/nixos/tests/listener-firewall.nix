@@ -1,6 +1,6 @@
 {pkgs}: let
   ports = builtins.fromJSON (builtins.readFile ../../terraform/modules/network/ports.json);
-  content = pkgs.writeTextDir "serve" "healthy\n";
+  content = pkgs.writeTextDir "ready" "healthy\n";
 in
   pkgs.testers.runNixOSTest {
     name = "listener-firewall";
@@ -34,6 +34,6 @@ in
       start_all()
       machine.wait_for_unit("health-test-server.service")
       machine.wait_for_open_port(${toString ports.health})
-      client.wait_until_succeeds("${pkgs.curl}/bin/curl --fail --silent --max-time 2 http://machine:${toString ports.health}/serve", timeout=timedelta(seconds=10))
+      client.wait_until_succeeds("${pkgs.curl}/bin/curl --fail --silent --max-time 2 http://machine:${toString ports.health}/ready", timeout=timedelta(seconds=10))
     '';
   }

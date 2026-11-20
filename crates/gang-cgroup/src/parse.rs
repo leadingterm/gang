@@ -6,7 +6,7 @@ use std::time::Duration;
 use gang_types::Bytes;
 
 use crate::errors::CgroupError;
-use crate::fs::{CPU_STAT, EVENTS, MEMORY_PEAK};
+use crate::fs::{CPU_STAT, EVENTS, MEMORY_EVENTS, MEMORY_PEAK};
 
 /// Prefix of the cgroup v2 entry in `/proc/self/cgroup`; v1 and hybrid lines have a nonzero id.
 const CGROUP_V2_PREFIX: &str = "0::";
@@ -63,6 +63,25 @@ pub(crate) fn cpu_time(text: &str) -> Result<Duration, CgroupError> {
         .map(Duration::from_micros)
         .ok_or_else(|| CgroupError::Malformed {
             what: CPU_STAT,
+            content: text.to_owned(),
+        })
+}
+
+/// Parses the hierarchical count of processes killed by an OOM killer.
+pub(crate) fn oom_kills(text: &str) -> Result<u64, CgroupError> {
+    let Some(line) = text
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some("oom_kill"))
+    else {
+        return Ok(0);
+    };
+    let mut fields = line.split_whitespace();
+    let _ = fields.next();
+    fields
+        .next()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| CgroupError::Malformed {
+            what: MEMORY_EVENTS,
             content: text.to_owned(),
         })
 }

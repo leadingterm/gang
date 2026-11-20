@@ -1,3 +1,5 @@
+data "aws_partition" "this" {}
+
 resource "terraform_data" "input_checks" {
   lifecycle {
     precondition {
@@ -11,6 +13,19 @@ resource "terraform_data" "input_checks" {
         false
       )])
       error_message = "Each fleet boot_grace must be a valid duration strictly above the controller group shutdown grace."
+    }
+    precondition {
+      # The 1011-character SSM limit includes the partition, region, and account ARN prefix.
+      condition     = length("arn:${data.aws_partition.this.partition}:ssm:${var.region}:000000000000:parameter${local.config_parameter_name}/generations/00000000-0000-0000-0000-000000000000") <= 1011 && length(split("/", trimprefix(local.config_parameter_name, "/"))) <= 13 && can(regex("^/([A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+$", local.config_parameter_name)) && !can(regex("(?i)^/(aws|ssm)", local.config_parameter_name))
+      error_message = "The effective config parameter name must be an absolute SSM path of at most 13 segments, without an aws or ssm prefix, and leave room for the generation ARN within the 1011-character limit for the selected partition and region."
+    }
+    precondition {
+      condition = alltrue([for secret in concat(values(var.controller_secret_parameters), compact([
+        var.database.engine == "postgres" && try(var.database.postgres.rds, null) != null ? "/${var.name}/database-password" : null,
+        var.database.engine == "postgres" ? try(var.database.postgres.external.password_parameter, null) : null,
+        var.database.engine == "postgres" ? try(var.database.postgres.external.ca_parameter, null) : null,
+      ])) : secret != local.config_parameter_name && !startswith(secret, "${local.config_parameter_name}/generations/")])
+      error_message = "Controller secret parameters must not overlap the legacy config parameter or its generations subtree."
     }
   }
 }
@@ -34,6 +49,7 @@ module "network" {
   availability_zone_count   = var.network.availability_zone_count
   dynamodb_gateway_endpoint = var.database.engine == "dynamodb"
   controller_eip            = !local.group
+  shared_database           = local.group
   tags                      = var.tags
 }
 
@@ -60,15 +76,19 @@ module "storage" {
 }
 
 locals {
-  group                  = var.database.engine != "sqlite"
-  controller_shape       = local.group ? "group" : "instance"
-  public_port            = module.network.public_port
-  worker_port            = module.network.worker_port
-  shutdown_grace_seconds = 300
-  public_host            = var.hostname != null ? var.hostname : module.network.controller_public_dns
-  worker_host            = local.group ? var.hostname : module.network.controller_private_dns
-  endpoint               = local.group && var.hostname == null ? null : (local.public_port == 443 ? "https://${local.public_host}" : "https://${local.public_host}:${local.public_port}")
-  worker_endpoint        = local.group && var.hostname == null ? null : "grpcs://${local.worker_host}:${local.worker_port}"
+  config_parameter_name             = coalesce(var.config_parameter_name, "/${var.name}/gang.toml")
+  group                             = var.database.engine != "sqlite"
+  controller_shape                  = local.group ? "group" : "instance"
+  public_port                       = module.network.public_port
+  worker_port                       = module.network.worker_port
+  shutdown_grace_seconds            = 300
+  public_host                       = var.hostname != null ? var.hostname : module.network.controller_public_dns
+  worker_host                       = local.group ? var.hostname : module.network.controller_private_dns
+  endpoint                          = local.group && var.hostname == null ? null : (local.public_port == 443 ? "https://${local.public_host}" : "https://${local.public_host}:${local.public_port}")
+  worker_endpoint                   = local.group && var.hostname == null ? null : "grpcs://${local.worker_host}:${local.worker_port}"
+  proxy_protocol_mode               = !local.group || var.load_balancer == null ? "off" : (var.load_balancer.proxy_protocol_stage == "proxied" ? "accept" : var.load_balancer.proxy_protocol_stage)
+  health                            = jsondecode(file("${path.module}/../load-balancer/health-check.json"))
+  standby_routability_delay_seconds = local.group && var.load_balancer != null ? local.health.interval_seconds * local.health.threshold : 0
 
   database_secret_parameters = var.database.engine != "postgres" ? {} : merge(
     try(var.database.postgres.rds, null) != null ? {
@@ -96,30 +116,36 @@ locals {
   }
 
   gang_toml = templatefile("${path.module}/gang.toml.tftpl", {
-    default_isa             = var.default_isa
-    gang_settings           = var.gang_settings
-    fleets                  = var.fleets
-    region                  = var.region
-    public_port             = local.public_port
-    worker_port             = local.worker_port
-    health_port             = var.load_balancer == null ? null : module.network.health_port
-    endpoint                = local.endpoint
-    endpoint_trust          = var.load_balancer == null ? null : "system"
-    worker_endpoint         = local.worker_endpoint
-    database_engine         = var.database.engine
-    database_table_name     = module.storage.dynamodb_table_name
-    database_postgres       = local.database_postgres
-    shutdown_grace_seconds  = local.shutdown_grace_seconds
-    scratch_mount_point     = var.scratch_mount_point
-    workload_token_audience = var.workload_token_audience
-    client_token_providers  = var.client_token_providers
-    fleet_tag_key           = var.fleet_tag_key
-    cache_bucket_name       = module.storage.cache_bucket_name
-    ca_key_alias            = module.storage.ca_key_alias
-    trust_domain            = var.trust_domain
-    issuer_url              = module.worker_fleet.issuer_url
-    worker_role_arn         = module.worker_fleet.role_arn
-    extra_config_toml       = var.extra_config_toml
+    default_isa                       = var.default_isa
+    gang_settings                     = var.gang_settings
+    fleets                            = var.fleets
+    region                            = var.region
+    events_queue_url                  = var.aws_events_enabled ? aws_sqs_queue.events[0].url : null
+    public_port                       = local.public_port
+    worker_port                       = local.worker_port
+    health_port                       = var.load_balancer == null ? null : module.network.health_port
+    proxy_protocol_mode               = local.proxy_protocol_mode
+    proxy_trusted_cidrs               = local.group && var.load_balancer != null ? module.load_balancer[0].proxy_protocol_trusted_cidrs : []
+    endpoint                          = local.endpoint
+    endpoint_trust                    = var.load_balancer == null ? null : "system"
+    worker_endpoint                   = local.worker_endpoint
+    database_engine                   = var.database.engine
+    database_table_name               = module.storage.dynamodb_table_name
+    database_postgres                 = local.database_postgres
+    standby_routability_delay_seconds = local.standby_routability_delay_seconds
+    leadership_renew_interval_seconds = local.group ? local.health.renew_interval_seconds : null
+    leadership_call_timeout_seconds   = local.group ? local.health.call_timeout_seconds : null
+    shutdown_grace_seconds            = local.shutdown_grace_seconds
+    scratch_mount_point               = var.scratch_mount_point
+    workload_token_audience           = var.workload_token_audience
+    client_token_providers            = var.client_token_providers
+    fleet_tag_key                     = var.fleet_tag_key
+    cache_bucket_name                 = module.storage.cache_bucket_name
+    ca_key_alias                      = module.storage.ca_key_alias
+    trust_domain                      = var.trust_domain
+    issuer_url                        = module.worker_fleet.issuer_url
+    worker_role_arn                   = module.worker_fleet.role_arn
+    extra_config_toml                 = var.extra_config_toml
   })
 
   # Controllers read the password file only at boot, so rotation must refresh the group.
@@ -130,12 +156,44 @@ locals {
 }
 
 resource "aws_ssm_parameter" "config" {
-  name        = coalesce(var.config_parameter_name, "/${var.name}/gang.toml")
+  name        = local.config_parameter_name
   description = "Rendered gang.toml read by gang-config.service at boot. Contains no secrets: confidential values live in the SecureString parameters named by controller_secret_parameters and are referenced by file path."
   type        = "String"
   tier        = "Intelligent-Tiering"
   value       = local.gang_toml
   tags        = merge(var.tags, { Name = "${var.name}-config" })
+  lifecycle {
+    ignore_changes = [name, value]
+    destroy        = false
+
+    postcondition {
+      condition     = self.name == local.config_parameter_name
+      error_message = "The legacy configuration namespace is immutable."
+    }
+  }
+}
+
+resource "terraform_data" "config_generation" {
+  triggers_replace = sha256(local.gang_toml)
+}
+
+resource "aws_ssm_parameter" "config_generation" {
+  name      = "${aws_ssm_parameter.config.name}/generations/${terraform_data.config_generation.id}"
+  type      = "String"
+  tier      = "Intelligent-Tiering"
+  value     = local.gang_toml
+  overwrite = false
+  tags      = merge(var.tags, { Name = "${var.name}-config-generation" })
+
+  lifecycle {
+    # Each publication identity requires a new immutable parameter.
+    replace_triggered_by = [terraform_data.config_generation]
+    destroy              = false
+  }
+}
+
+locals {
+  config_parameter_arns = [aws_ssm_parameter.config.arn, "${aws_ssm_parameter.config.arn}/generations/*"]
 }
 
 module "controller" {
@@ -161,10 +219,11 @@ module "controller" {
   private_ip                    = local.group ? null : module.network.controller_private_ip
   security_group_id             = module.network.controller_security_group_id
   eip_allocation_id             = local.group ? null : module.network.controller_eip_allocation_id
-  config_parameter_name         = aws_ssm_parameter.config.name
-  config_parameter_arn          = aws_ssm_parameter.config.arn
+  config_parameter_reference    = "${aws_ssm_parameter.config_generation.name}:1"
+  config_parameter_arns         = local.config_parameter_arns
   cache_bucket_arn              = module.storage.cache_bucket_arn
   ca_key_arn                    = module.storage.ca_key_arn
+  events_queue_arn              = var.aws_events_enabled ? aws_sqs_queue.events[0].arn : null
   worker_fleet_names            = module.worker_fleet.asg_names
   secret_parameters             = merge(var.controller_secret_parameters, local.database_secret_parameters)
   secret_parameters_kms_key_arn = var.controller_secret_parameters_kms_key_arn
@@ -185,6 +244,7 @@ module "load_balancer" {
   name                           = var.name
   vpc_id                         = module.network.vpc_id
   shared_database                = local.group
+  proxy_protocol_stage           = var.load_balancer.proxy_protocol_stage
   public_subnet_ids              = module.network.public_subnet_ids
   private_subnet_ids             = values(module.network.private_subnet_ids)
   worker_security_group_id       = module.network.worker_security_group_id
@@ -214,8 +274,8 @@ module "worker_fleet" {
   ca_key_arn                              = module.storage.ca_key_arn
   workload_token_audience                 = var.workload_token_audience
   fleet_tag_key                           = var.fleet_tag_key
-  config_parameter_name                   = aws_ssm_parameter.config.name
-  config_parameter_arn                    = aws_ssm_parameter.config.arn
+  config_parameter_reference              = "${aws_ssm_parameter.config_generation.name}:1"
+  config_parameter_arns                   = local.config_parameter_arns
   tags                                    = var.tags
   iam_name_prefix                         = var.iam_name_prefix
   iam_permissions_boundary_arn            = var.iam_permissions_boundary_arn

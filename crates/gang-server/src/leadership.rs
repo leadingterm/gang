@@ -2,21 +2,22 @@
 //! validity of the fence that controls what the leader may still change.
 
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use gang_clock::{Clock, Tick, Timestamp};
 use gang_config::LeadershipConfig;
 use gang_spi::{
-    Acquisition, ControllerId, Fence, Keeper, LeaderLeasePort, Lease, PortError, Renewal,
+    Acquisition, ControllerHostIdentity, ControllerId, Fence, Keeper, LeaderLeasePort, Lease,
+    LeaseCandidate, PortError, Renewal, Takeover,
 };
+
+use crate::health::Readiness;
 
 /// The `stale_before` under which no lease counts as stale, so only a released lease is free.
 const ONLY_RELEASED: Timestamp = Timestamp::from_unix_millis(0);
 
-/// Whether this controller leads, and since when: set once when its term starts, after it takes
-/// the lease and its cache baseline, and never cleared, since a leader that loses the lease hands
-/// off and exits. Requests read it to serve a leader route locally or forward it to the leader;
-/// ingest reads the start to tell a follower's traffic of this term from traffic it counted
-/// before.
+/// Whether this controller leads, and since when: set once when its term starts after its cache
+/// baseline, and never cleared, since a leader that loses the lease hands off and exits.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Leading(Arc<LeadingState>);
 
@@ -33,6 +34,7 @@ impl Leading {
     }
 
     /// The wall time this controller began leading, once it leads.
+    #[cfg(test)]
     pub(crate) fn start(&self) -> Option<Timestamp> {
         self.0.start.get().copied()
     }
@@ -53,6 +55,12 @@ impl Leading {
             notified.await;
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeaseEnd {
+    Lost,
+    YieldRequested,
 }
 
 /// One controller's hold on the leader lease.
@@ -90,6 +98,47 @@ impl<'a, L: LeaderLeasePort, C: Clock + 'static> Leadership<'a, L, C> {
         &self.fence
     }
 
+    /// The existing retry interval for lease-related database operations.
+    pub(crate) fn renew_interval(&self) -> std::time::Duration {
+        self.config.renew_interval.get()
+    }
+
+    /// The shared bound for the snapshot taken before a voluntary yield.
+    pub(crate) fn snapshot_timeout(&self) -> Duration {
+        gang_types::handover::snapshot_timeout(
+            self.config.renew_interval.get(),
+            self.config.call_timeout.get(),
+        )
+    }
+
+    /// Registers this host's durable priority, retrying transient failures until cancelled.
+    pub(crate) async fn register_candidate(
+        &self,
+        host: &ControllerHostIdentity,
+    ) -> Result<LeaseCandidate, PortError> {
+        loop {
+            let started = self.clock.monotonic();
+            match self
+                .clock
+                .timeout(
+                    self.config.renew_interval.get(),
+                    self.lease.register_candidate(self.controller, host),
+                )
+                .await
+            {
+                Ok(Ok(candidate)) => return Ok(candidate),
+                Ok(Err(error @ PortError::Unavailable(_))) => {
+                    tracing::warn!(%error, "cannot register leader candidate");
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(error) => tracing::warn!(%error, "timed out registering leader candidate"),
+            }
+            self.clock
+                .sleep_until(started + self.config.renew_interval.get())
+                .await;
+        }
+    }
+
     /// Resolves with the lease once this controller takes it. It tries at once, then every
     /// `renew_interval`; a lease counts as free once it was released, or once it expired more than
     /// `clock_skew` ago by this controller's clock. A failed attempt is logged and retried.
@@ -98,8 +147,14 @@ impl<'a, L: LeaderLeasePort, C: Clock + 'static> Leadership<'a, L, C> {
     /// `ttl`: a leader that could not renew while the database was down renews within
     /// `renew_interval` of it answering again, so it keeps its lease instead of losing it to
     /// whichever controller reaches the database first. Until then only a released lease is free.
-    pub(crate) async fn acquire(&self) -> Lease {
+    pub(crate) async fn acquire(
+        &self,
+        candidate: &LeaseCandidate,
+        readiness: &Readiness,
+        routability_delay: Duration,
+    ) -> Lease {
         let mut reachable_since = None;
+        let mut warm_since = None;
         loop {
             let started = self.clock.monotonic();
             let wall = self.clock.wall();
@@ -110,53 +165,91 @@ impl<'a, L: LeaderLeasePort, C: Clock + 'static> Leadership<'a, L, C> {
             } else {
                 ONLY_RELEASED
             };
+            let takeover = if warm_since
+                .is_some_and(|since| started.saturating_duration_since(since) >= routability_delay)
+            {
+                Takeover::Request
+            } else {
+                Takeover::Observe
+            };
             let attempt = self
                 .clock
                 .timeout(
                     self.config.renew_interval.get(),
-                    self.lease
-                        .acquire(self.controller, stale_before, wall + self.config.ttl.get()),
+                    self.lease.acquire(
+                        candidate,
+                        wall,
+                        stale_before,
+                        wall + self.config.ttl.get(),
+                        takeover,
+                    ),
                 )
                 .await;
             match attempt {
                 Ok(Ok(Acquisition::Acquired(lease))) => {
+                    readiness.stop_contending();
                     self.confirm(started);
                     return lease;
                 }
-                Ok(Ok(Acquisition::Held(_))) => {
+                Ok(Ok(Acquisition::Contending(_))) => {
                     reachable_since.get_or_insert_with(|| self.clock.monotonic());
+                    readiness.contend();
+                    let first = warm_since.is_none();
+                    warm_since.get_or_insert_with(|| self.clock.monotonic());
+                    if first && routability_delay.is_zero() {
+                        continue;
+                    }
+                }
+                Ok(Ok(Acquisition::Held(_) | Acquisition::Reserved)) => {
+                    reachable_since.get_or_insert_with(|| self.clock.monotonic());
+                    readiness.stop_contending();
+                    warm_since = None;
                 }
                 Ok(Err(error)) => {
                     reachable_since = None;
+                    readiness.stop_contending();
+                    warm_since = None;
                     tracing::warn!(%error, "cannot acquire the leader lease");
                 }
                 Err(error) => {
                     reachable_since = None;
+                    readiness.stop_contending();
+                    warm_since = None;
                     tracing::warn!(%error, "timed out acquiring the leader lease");
                 }
             }
-            self.clock
-                .sleep_until(started + self.config.renew_interval.get())
-                .await;
+            let mut wake = started + self.config.renew_interval.get();
+            if takeover == Takeover::Observe
+                && let Some(since) = warm_since
+            {
+                wake = wake.min(since + routability_delay);
+            }
+            self.clock.sleep_until(wake).await;
         }
     }
 
-    /// Renews `lease` every `renew_interval` and returns once it is lost. Each renewal extends the
-    /// validity. A renewal that fails, or does not answer within `renew_interval`, keeps the
-    /// lease held: the leader keeps scheduling while its validity lapses, and renews again.
-    pub(crate) async fn hold(&self, lease: &mut Lease) {
+    /// Renews `lease` every `renew_interval` and returns once it is lost. A failed or timed-out
+    /// renewal is retried, but once validity lapses `/ready` returns 503 and fleet mutations are
+    /// fenced until renewal succeeds. Promoted public and worker admission remains enabled.
+    pub(crate) async fn hold(&self, lease: &mut Lease) -> LeaseEnd {
         loop {
             self.clock.sleep(self.config.renew_interval.get()).await;
             let started = self.clock.monotonic();
-            let expires_at = self.clock.wall() + self.config.ttl.get();
-            match self.renew(lease, expires_at).await {
+            let now = self.clock.wall();
+            let expires_at = now + self.config.ttl.get();
+            match self.renew(lease, now, expires_at).await {
                 Ok(Renewal::Renewed(renewed)) => {
                     *lease = renewed;
                     self.confirm(started);
                 }
+                Ok(Renewal::YieldRequested(renewed)) => {
+                    *lease = renewed;
+                    self.confirm(started);
+                    return LeaseEnd::YieldRequested;
+                }
                 Ok(Renewal::Lost) => {
                     self.keeper.revoke();
-                    return;
+                    return LeaseEnd::Lost;
                 }
                 Err(error) => tracing::warn!(
                     %error,
@@ -184,11 +277,16 @@ impl<'a, L: LeaderLeasePort, C: Clock + 'static> Leadership<'a, L, C> {
     }
 
     /// One renewal, bounded by `renew_interval`.
-    async fn renew(&self, lease: &Lease, expires_at: Timestamp) -> Result<Renewal, PortError> {
+    async fn renew(
+        &self,
+        lease: &Lease,
+        now: Timestamp,
+        expires_at: Timestamp,
+    ) -> Result<Renewal, PortError> {
         self.clock
             .timeout(
                 self.config.renew_interval.get(),
-                self.lease.renew(lease, expires_at),
+                self.lease.renew(lease, now, expires_at),
             )
             .await
             .map_err(PortError::unavailable)?

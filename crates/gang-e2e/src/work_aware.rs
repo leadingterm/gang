@@ -287,6 +287,25 @@ pub fn burst_from_zero<S: Control, E: Execution>(system: &S, exec: &E) -> Result
     if !warm.succeeded() {
         return Ok(checks);
     }
+    let probes = (0..160)
+        .map(|i| {
+            format!("burst_{i:03}")
+                .parse::<Probe>()
+                .map_err(E2eError::system_from("parsing burst probe"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // Train the actual targets on serving capacity: the first cold action's mnemonic
+    // fallback includes CAS setup and need not describe the short burst.
+    let training_run = Run::fresh()?;
+    system.hold_supply()?;
+    let trained = system.build_run(&probes, &training_run);
+    let released = system.release_supply();
+    let trained = trained?;
+    released?;
+    checks.push(build_check("burst duration training succeeds", &trained));
+    if !trained.succeeded() {
+        return Ok(checks);
+    }
     let value = serde_json::to_value(&state)
         .map_err(E2eError::system_from("serializing readiness state"))?;
     let readiness = value
@@ -311,13 +330,6 @@ pub fn burst_from_zero<S: Control, E: Execution>(system: &S, exec: &E) -> Result
     if checks.last().is_some_and(Check::is_failure) {
         return Ok(checks);
     }
-    let probes = (0..160)
-        .map(|i| {
-            format!("burst_{i:03}")
-                .parse::<Probe>()
-                .map_err(E2eError::system_from("parsing burst probe"))
-        })
-        .collect::<Result<Vec<_>>>()?;
     system.hold_launches()?;
     let since = match boundary(system) {
         Ok(value) => value,

@@ -7,7 +7,7 @@ Status: Accepted. Replaces the earlier model in which every caller, clients incl
 - Interactive sessions already have an identity provider that can re-approve the user (ADR-04).
 
 ## Decision
-- **Credential.** A client presents an ES256 JWT in `Authorization: Bearer`. Gang issues it in exchange for an identity-provider proof. Claims, lifetime bounds (`token_ttl`, 1 minute to 1 hour) and the issuance route are in SPEC §4.1 and docs/API.md.
+- **Credential.** A client presents an ES256 JWT in `Authorization: Bearer`. Gang issues it in exchange for an identity-provider proof. Claims, lifetime bounds (`token_ttl`, 20 seconds to 1 hour) and the issuance route are in SPEC §4.1 and docs/API.md.
 - **Signing and verification.** The token is signed through `CertificateSignerPort` with the authority key and verified locally against the public key, which the plugin loads from the signer on first verification and caches. Verification never calls the signer. Verified tokens are memoized until `exp` plus `clock_skew`, bounded by `max_cached_tokens`.
 - **No server-side session.** An interactive CLI session is the OIDC refresh token the client holds, and the provider re-approves the user at every ID-token cycle. CI supplies a short-lived job token through a token command.
 - **No per-token revocation.** A stolen token is usable for at most `token_ttl`; principal revocation (ADR-08) cuts it off earlier.

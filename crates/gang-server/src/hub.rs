@@ -74,7 +74,7 @@ struct Shared {
     config: HubConfig,
     inner: Mutex<Inner>,
     frames: broadcast::Sender<Frame>,
-    shutdown: watch::Sender<bool>,
+    shutdown: watch::Sender<()>,
 }
 
 struct Inner {
@@ -143,7 +143,7 @@ impl StateHub {
                 snapshot: None,
             }),
             frames,
-            shutdown: watch::channel(false).0,
+            shutdown: watch::channel(()).0,
         }))
     }
 
@@ -216,6 +216,7 @@ impl StateHub {
             instances: None,
             actions: None,
             events: Vec::new(),
+            status_events: None,
             completed: None,
             recent: None,
             builds: None,
@@ -271,12 +272,12 @@ impl StateHub {
 
     /// Signals every watcher of [`Self::shutdown_signal`] that the hub is shutting down.
     pub(crate) fn shutdown(&self) {
-        self.0.shutdown.send_replace(true);
+        self.0.shutdown.send_replace(());
     }
 
-    /// A receiver that turns `true` once [`Self::shutdown`] has been called.
+    /// A receiver notified by the next call to [`Self::shutdown`].
     #[must_use]
-    pub(crate) fn shutdown_signal(&self) -> watch::Receiver<bool> {
+    pub(crate) fn shutdown_signal(&self) -> watch::Receiver<()> {
         self.0.shutdown.subscribe()
     }
 

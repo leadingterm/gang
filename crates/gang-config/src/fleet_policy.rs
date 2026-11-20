@@ -107,7 +107,9 @@ pub struct FleetPolicy {
     pub vcpus_per_instance: NonZeroU32,
     /// Memory of one worker. Non-zero.
     pub memory_per_instance: NonZeroBytes,
-    /// A lower bound of the disk the actions of one worker may hold in total, valid for every instance type the fleet may launch: the scratch volume's capacity less the fast content store's budget less a reserve for overshoot. The reserve is at least `disk_per_instance × [scheduler.nativelink.disk] headroom_percent / 100 + write_rate × (10 s + one directory walk)`: `NativeLink` kills an action only above its reservation plus headroom, so a worker packed to this value may legitimately hold that headroom before any fast writer.
+    /// A lower bound of the disk the actions of one worker may hold in total, valid for every
+    /// instance type the fleet may launch: scratch capacity less the fast content store's budget
+    /// and a reserve for pressure protection and fast-writer overshoot.
     /// A worker whose scratch volume leaves its actions less than this (its free space at mount
     /// plus its own fast content store, less the fast content store's budget) stops before it
     /// enrolls.

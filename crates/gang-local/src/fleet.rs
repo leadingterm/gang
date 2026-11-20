@@ -102,6 +102,8 @@ impl<P: Processes, C: Clock> LocalFleet<P, C> {
     ) -> Result<(), LocalError> {
         into.warm = 0;
         into.abandoned = 0;
+        into.requested = None;
+        into.events.clear();
         into.instances.clear();
         into.exits.clear();
         for record in self.records.records()? {
@@ -1064,6 +1066,8 @@ mod tests {
                 exits: Vec::new(),
                 desired: 2,
                 launch_failure: None,
+                requested: None,
+                events: Vec::new(),
                 instances: vec![
                     in_service("local-1", launched_at),
                     in_service("local-2", launched_at),
@@ -2213,6 +2217,8 @@ mod tests {
                 exits: Vec::new(),
                 desired: 1,
                 launch_failure: None,
+                requested: None,
+                events: Vec::new(),
                 instances: vec![
                     FleetInstance {
                         id: target.clone(),
@@ -2236,6 +2242,8 @@ mod tests {
                 exits: Vec::new(),
                 desired: 1,
                 launch_failure: None,
+                requested: None,
+                events: Vec::new(),
                 instances: vec![in_service("local-2", launched_at)],
             }
         );
@@ -2384,23 +2392,25 @@ mod tests {
                 exits: Vec::new(),
                 desired: 1,
                 launch_failure: None,
+                requested: None,
+                events: Vec::new(),
                 instances: vec![in_service("local-1", launched_at)],
             }
         );
-        assert_eq!(
-            supply_of(&manager, big),
-            FleetSupply {
-                abandoned: 0,
-                warm: 0,
-                exits: Vec::new(),
-                desired: 2,
-                launch_failure: None,
-                instances: vec![
-                    in_service("local-2", launched_at),
-                    in_service("local-3", launched_at),
-                ],
-            }
-        );
+        let big_expected = FleetSupply {
+            abandoned: 0,
+            warm: 0,
+            exits: Vec::new(),
+            desired: 2,
+            launch_failure: None,
+            requested: None,
+            events: Vec::new(),
+            instances: vec![
+                in_service("local-2", launched_at),
+                in_service("local-3", launched_at),
+            ],
+        };
+        assert_eq!(supply_of(&manager, big), big_expected);
 
         let small_before = supply_of(&manager, small);
         let big_before = supply_of(&manager, big);
@@ -2432,6 +2442,8 @@ mod tests {
                 exits: Vec::new(),
                 desired: 0,
                 launch_failure: None,
+                requested: None,
+                events: Vec::new(),
                 instances: vec![FleetInstance {
                     id: id("local-1"),
                     lifecycle: InstanceLifecycle::Terminating,
@@ -2440,20 +2452,7 @@ mod tests {
                 }],
             }
         );
-        assert_eq!(
-            supply_of(&manager, big),
-            FleetSupply {
-                abandoned: 0,
-                warm: 0,
-                exits: Vec::new(),
-                desired: 2,
-                launch_failure: None,
-                instances: vec![
-                    in_service("local-2", launched_at),
-                    in_service("local-3", launched_at),
-                ],
-            }
-        );
+        assert_eq!(supply_of(&manager, big), big_expected);
     }
 
     #[test]
@@ -2487,6 +2486,8 @@ mod tests {
                 exits: Vec::new(),
                 desired: 1,
                 launch_failure: None,
+                requested: None,
+                events: Vec::new(),
                 instances: vec![in_service("local-1", launched_at)],
             }
         );
@@ -2498,6 +2499,8 @@ mod tests {
                 exits: Vec::new(),
                 desired: 2,
                 launch_failure: None,
+                requested: None,
+                events: Vec::new(),
                 instances: vec![
                     in_service("local-2", launched_at),
                     in_service("local-3", launched_at),
@@ -2687,6 +2690,8 @@ mod tests {
                 exits: Vec::new(),
                 desired: 1,
                 launch_failure: None,
+                requested: None,
+                events: Vec::new(),
                 instances: vec![
                     FleetInstance {
                         id: target.clone(),
@@ -2711,6 +2716,8 @@ mod tests {
                 exits: Vec::new(),
                 desired: 1,
                 launch_failure: None,
+                requested: None,
+                events: Vec::new(),
                 instances: vec![in_service("local-2", launched_at)],
             }
         );

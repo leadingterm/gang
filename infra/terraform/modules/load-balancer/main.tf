@@ -113,8 +113,10 @@ resource "aws_lb_target_group" "this" {
   target_type = "instance"
   vpc_id      = var.vpc_id
 
-  # Gang's per-address rate limits see the client's address.
-  preserve_client_ip     = "true"
+  # PROXY preserves effective client identity while disabling source preservation
+  # avoids NLB target connection tuple collisions.
+  preserve_client_ip     = var.shared_database && local.proxy_protocol_enabled ? "false" : "true"
+  proxy_protocol_v2      = var.shared_database && local.proxy_protocol_enabled
   deregistration_delay   = var.shared_database ? var.deregistration_delay : null
   connection_termination = var.shared_database ? false : null
 
@@ -125,12 +127,12 @@ resource "aws_lb_target_group" "this" {
     }
   }
 
-  # Plaintext HTTP answers only from a live controller; /leader only from the leader.
+  # Readiness requires the controller to serve, hold the lease, and accept workers.
   # HTTPS health checks fail against Gang's TLS-1.3-only targets.
   health_check {
     protocol            = "HTTP"
     port                = var.health_port
-    path                = var.shared_database ? local.health.leader_path : local.health.serve_path
+    path                = local.health.ready_path
     matcher             = "200"
     interval            = local.health.interval_seconds
     timeout             = local.health.timeout_seconds
@@ -232,7 +234,8 @@ moved {
 }
 
 locals {
-  health = jsondecode(file("${path.module}/health-check.json"))
+  health                 = jsondecode(file("${path.module}/health-check.json"))
+  proxy_protocol_enabled = contains(["proxied", "require"], var.proxy_protocol_stage)
 
   internal_listeners = var.shared_database ? {
     serve   = var.port
@@ -326,6 +329,40 @@ resource "aws_lb" "internal" {
   tags                             = merge(var.tags, { Name = "${var.name}-internal" })
 }
 
+data "aws_network_interface" "public" {
+  for_each = var.shared_database ? { for index, subnet in var.public_subnet_ids : tostring(index) => subnet } : {}
+
+  filter {
+    name   = "vpc-id"
+    values = [var.vpc_id]
+  }
+  filter {
+    name   = "subnet-id"
+    values = [each.value]
+  }
+  filter {
+    name   = "description"
+    values = ["ELB ${aws_lb.this.arn_suffix}"]
+  }
+}
+
+data "aws_network_interface" "internal" {
+  for_each = var.shared_database ? { for index, subnet in var.private_subnet_ids : tostring(index) => subnet } : {}
+
+  filter {
+    name   = "vpc-id"
+    values = [var.vpc_id]
+  }
+  filter {
+    name   = "subnet-id"
+    values = [each.value]
+  }
+  filter {
+    name   = "description"
+    values = ["ELB ${aws_lb.internal[0].arn_suffix}"]
+  }
+}
+
 resource "aws_lb_target_group" "internal" {
   for_each = local.internal_listeners
 
@@ -334,7 +371,8 @@ resource "aws_lb_target_group" "internal" {
   protocol               = "TCP"
   target_type            = "instance"
   vpc_id                 = var.vpc_id
-  preserve_client_ip     = "true"
+  preserve_client_ip     = local.proxy_protocol_enabled ? "false" : "true"
+  proxy_protocol_v2      = local.proxy_protocol_enabled
   deregistration_delay   = var.deregistration_delay
   connection_termination = false
 
@@ -345,7 +383,7 @@ resource "aws_lb_target_group" "internal" {
   health_check {
     protocol            = "HTTP"
     port                = var.health_port
-    path                = local.health.leader_path
+    path                = local.health.ready_path
     matcher             = "200"
     interval            = local.health.interval_seconds
     timeout             = local.health.timeout_seconds

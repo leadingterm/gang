@@ -43,17 +43,17 @@ mock_provider "aws" {
 }
 
 variables {
-  name                  = "gang-controller"
-  ami_id                = "ami-0123456789abcdef0"
-  instance_type         = "m7i.large"
-  subnet_id             = "subnet-0123456789abcdef0"
-  private_ip            = "10.20.0.10"
-  security_group_id     = "sg-0123456789abcdef0"
-  eip_allocation_id     = "eipalloc-0123456789abcdef0"
-  config_parameter_name = "/gang-controller/gang.toml"
-  config_parameter_arn  = "arn:aws:ssm:eu-north-1:000000000000:parameter/gang-controller/gang.toml"
-  cache_bucket_arn      = "arn:aws:s3:::example-gang-cache"
-  ca_key_arn            = "arn:aws:kms:eu-north-1:000000000000:key/00000000-0000-0000-0000-000000000000"
+  name                       = "gang-controller"
+  ami_id                     = "ami-0123456789abcdef0"
+  instance_type              = "m7i.large"
+  subnet_id                  = "subnet-0123456789abcdef0"
+  private_ip                 = "10.20.0.10"
+  security_group_id          = "sg-0123456789abcdef0"
+  eip_allocation_id          = "eipalloc-0123456789abcdef0"
+  config_parameter_reference = "/gang-controller/gang.toml/generations/example:1"
+  config_parameter_arns      = ["arn:aws:ssm:eu-north-1:000000000000:parameter/gang-controller/gang.toml", "arn:aws:ssm:eu-north-1:000000000000:parameter/gang-controller/gang.toml/generations/*"]
+  cache_bucket_arn           = "arn:aws:s3:::example-gang-cache"
+  ca_key_arn                 = "arn:aws:kms:eu-north-1:000000000000:key/00000000-0000-0000-0000-000000000000"
   worker_fleet_names = [
     "gang-x86-64",
   ]
@@ -91,7 +91,7 @@ run "group_resources_and_permissions" {
   }
 
   assert {
-    condition     = base64decode(aws_launch_template.controller[0].user_data) == join("\n", ["controller ${var.config_parameter_name}", "token=/gang/token", "# config-digest ${var.config_digest}"])
+    condition     = base64decode(aws_launch_template.controller[0].user_data) == join("\n", ["controller ${var.config_parameter_reference}", "token=/gang/token", "# config-digest ${var.config_digest}"])
     error_message = "Group user data must carry the controller configuration, secrets and digest without a state device."
   }
 
@@ -118,6 +118,17 @@ run "group_resources_and_permissions" {
   assert {
     condition     = aws_autoscaling_group.controller[0].instance_refresh[0].strategy == "Rolling" && aws_autoscaling_group.controller[0].instance_refresh[0].preferences[0].min_healthy_percentage == 100 && aws_autoscaling_group.controller[0].instance_refresh[0].preferences[0].max_healthy_percentage == 200
     error_message = "Group refresh must roll with 100 to 200 percent healthy capacity."
+  }
+
+  assert {
+    condition = (
+      tonumber(aws_autoscaling_group.controller[0].instance_refresh[0].preferences[0].instance_warmup) == (
+        local.health.interval_seconds * local.health.threshold + local.health.renew_interval_seconds + local.health.promotion_seconds + local.health.handover_margin_seconds + min(local.health.call_timeout_seconds, local.health.renew_interval_seconds)
+      ) &&
+      tonumber(aws_autoscaling_group.controller[0].instance_refresh[0].preferences[0].instance_warmup) == 21 &&
+      tonumber(aws_autoscaling_group.controller[0].instance_refresh[0].preferences[0].instance_warmup) >= local.health.interval_seconds * local.health.threshold + 2 * local.health.renew_interval_seconds + local.health.promotion_seconds + local.health.timeout_seconds + min(local.health.call_timeout_seconds, local.health.renew_interval_seconds)
+    )
+    error_message = "Refresh warmup must cover routability, two renewals, promotion, a health-call timeout and the snapshot bound."
   }
 
   assert {

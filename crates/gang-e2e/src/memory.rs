@@ -10,10 +10,10 @@ use crate::verdict;
 
 /// Runs the soft memory scenario against `system` and returns its checks.
 ///
-/// [`Probe::MemoryGrower`] plateaus above the soft limit of its reservation and below the kernel's
-/// ceiling, and holds the plateau on its first attempt, so only `NativeLink`'s soft kill can end
-/// that attempt. The scheduler requeues it on a doubled reservation, on which it completes at
-/// once: the build must succeed and the host-side counter must hold exactly two attempts. The
+/// [`Probe::MemoryGrower`] plateaus above the explicitly enabled soft limit and holds the plateau
+/// on its first attempt, so the soft kill ends that attempt. The scheduler requeues it on a larger
+/// reservation, on which it completes: the build must succeed and the host-side counter must hold
+/// exactly two attempts. The
 /// next action must still succeed.
 ///
 /// The suite runs this under [`Sandbox::Noop`](crate::system::Sandbox::Noop) with the workers'
@@ -30,7 +30,10 @@ pub fn memory<S: Limits>(system: &S, stderr_tail_lines: usize) -> Result<Vec<Che
     let mut checks = Vec::new();
 
     let grower = system.build(&[Probe::MemoryGrower])?;
-    checks.push(verdict::soft_memory_requeue(&grower, system.attempts()?));
+    checks.push(verdict::soft_memory_requeue(
+        &grower,
+        system.attempt_records()?.len(),
+    ));
 
     let after = system.build(&[Probe::Pinned])?;
     checks.push(Check::expect(

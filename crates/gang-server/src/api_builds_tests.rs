@@ -57,6 +57,7 @@ fn fixture(permission: Permission) -> (Api<TlsDeployment>, BuildsCell) {
     .expect("server info");
     let builds = BuildsCell::new(&BuildsConfig::default());
     let api = Api::new(ApiParts {
+        readiness: crate::health::Readiness::for_test(),
         core: Arc::clone(&harness.core),
         revocations: Revocations::new(
             Arc::clone(&harness.core),
@@ -74,8 +75,6 @@ fn fixture(permission: Permission) -> (Api<TlsDeployment>, BuildsCell) {
             Arc::clone(&harness.clock),
         )),
         dashboard: None,
-        leader_routes: None,
-        ingest: None,
         builds: builds.clone(),
         login_provider: None,
         device: None,

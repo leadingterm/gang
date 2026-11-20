@@ -89,7 +89,7 @@ A deployment on a trusted network with no authentication:
 
 ### Notes
 
-- `remoteExecutor` and `remoteCache` are the endpoints for Bazel's `--remote_executor` and `--remote_cache`. `remoteExecutor` uses the execution endpoint when configured, otherwise the public endpoint; `remoteCache` uses the public endpoint.
+- `remoteExecutor` and `remoteCache` are the endpoints for Bazel's `--remote_executor` and `--remote_cache`; both always use the same public endpoint.
 - `caCertificate` is the certificate authority the client should trust for those endpoints; it is omitted when the server has none, and when `[server] endpoint_trust = "system"`, where a publicly trusted terminator presents the endpoint and clients use their system roots.
 - `defaultIsa` is the instruction set a build gets when it does not name one. `gang bazelrc` writes it as `--remote_default_exec_properties=ISA=<defaultIsa>`.
 - `version` is the server's Gang version, for display; a server that predates it omits it.
@@ -214,7 +214,7 @@ The same route without a credential answers `200` with an anonymous session:
 
 - `GET /v1/session` is always `200`, also for a caller with no credential, an expired cookie, or no valid proof: the caller's session always exists, and an anonymous session simply has no `principal`. This is deliberate and is not an error case. A caller with a revoked principal or a malformed `Authorization` header is still refused with the envelope (`PRINCIPAL_REVOKED`, `CREDENTIALS_INVALID`). A bearer token works on this route, so a CLI gets `whoami` from it, and the browser classifies a failed `state:watch` connect by calling it.
 - `GET /v1/session` accepts the session cookie. `permissions` is the set the caller holds, with `*` expanded to the permission names, in canonical order. `expireTime` is when the caller's credential stops being valid and is omitted when it does not expire. `login` is present exactly when the browser login routes are mounted; its `provider` is the provider the dashboard signs in with.
-- `POST /v1/session:authenticate` is mounted only if the client authentication plugin issues tokens (`authentication` is `token` in `GET /v1/server`); otherwise it is `404 ROUTE_NOT_FOUND`. It verifies the proof with the named provider, applies the provider's required claims, and signs an access token for `provider:principal`. A token is accepted until its `lifetime` has elapsed; there is no per-token revocation, but revoking the principal makes the gate refuse its tokens at the next request.
+- `POST /v1/session:authenticate` is mounted only if the client authentication plugin issues tokens (`authentication` is `token` in `GET /v1/server`); otherwise it is `404 ROUTE_NOT_FOUND`. It verifies the proof with the named provider, applies the provider's required claims, and signs an access token for `provider:principal`. A token is accepted until its `lifetime` has elapsed; there is no per-token revocation, but a controller refuses its tokens on the next request after applying a principal revocation.
 - The request contains exactly one of `proof` and `refreshToken`. A refresh token is accepted only for the mounted device-login provider; the server renews it with the dashboard web client, then verifies and issues as for a proof. `refreshToken` in the response is optional and carries a rotated provider refresh token when returned; store it before the bearer token.
 - The token is opaque to clients. Present it as `Authorization: Bearer <token>`.
 
@@ -541,29 +541,48 @@ data: {"reason":"VIEWER_CAP","retryDelay":"5s"}
 | `PRINCIPAL_REVOKED` | the caller's principal is revoked |
 | `MISSING_PERMISSION` | the caller lacks `state.read`; the metadata key is `permission` |
 | `ROUTE_NOT_FOUND` | the dashboard is disabled (`[dashboard] enabled = false`), so the state is not served |
-| `DEPENDENCY_UNAVAILABLE` | a follower cannot reach the leader; the error envelope has HTTP `503` and status `UNAVAILABLE` |
+| `DEPENDENCY_UNAVAILABLE` | the controller is not the leader; the error envelope has HTTP `503` and status `UNAVAILABLE` |
 
 ### Notes
 
-- **Leader.** The leader serves both routes; a follower relays the request and streaming response to it, preserving the caller's credentials.
+- **Admission.** State operations require leader admission. A nonadmitting controller returns HTTP 503 before the handler with `gang-request-not-started: true`; it does not forward requests or streaming responses. Leader-only gRPC requests similarly return `UNAVAILABLE` (code 14) with the marker. Leadership refusal gracefully retires HTTP/2 connections with GOAWAY, even after an earlier shared request; admitted streams and concurrent accepted shared requests are not blanket-refused. After promotion leader admission remains enabled through a lease lapse, even when `/ready` returns 503. Prepared controllers serve shared authentication, API, browser and cache services independently of promotion; see [listener admission](SPECIFICATION.md#61-gang-server-listeners).
 - **Fleet demand estimates.** `demand.readiness` and `demand.expectedWait` are independently optional Google Duration strings, for example `"42.5s"` and `"0s"`. `readiness` is the measured launch-to-first-worker latency; it is omitted until measured, even while the planner uses `bootGrace` as its prior. `expectedWait` is the latest simulated start delay among the fleet's attributed queued actions at the final planned capacity; it is omitted when there is no attributed queue. Zero is a valid estimate, not an absent value.
 - **Frames.** `Frame` is the type of each stream message, defined once in `gang-wire`:
 
   | Event | Data | Sent |
   |---|---|---|
   | `snapshot` | `State` | first on every connect, and again when a viewer fell behind the broadcast |
-  | `delta` | `{seq, base, updateTime, pass?, queue?, cache?, fleets?, workers?, instances?, actions?, events?, completed?, recent?, builds?, principalsEpoch?}` | when a pass changed something and a viewer is connected |
+  | `delta` | `{seq, base, updateTime, pass?, queue?, cache?, fleets?, workers?, instances?, actions?, events?, statusEvents?, completed?, recent?, builds?, principalsEpoch?}` | when a pass changed something and a viewer is connected |
   | `tick` | `{seq, time}` | every heartbeat interval, with the current `seq` |
   | `closed` | `{reason, retryDelay?}` | last, when the server ends the stream deliberately |
 
   The SSE event names `snapshot`, `delta`, `tick` and `closed` are protocol identifiers and stay lowercase. `id:` is the frame's `seq`. The server may also write comment lines starting with `:` between frames; a reader ignores them.
-- **Applying a delta.** A delta moves the state from `base` to `seq`. A part that is present replaces the whole part (`pass`, `queue`, `cache`, `completed`, `principalsEpoch`); `fleets`, `workers` and `instances` are `{upsert[], remove[]}` keyed by `name`, and a name is in at most one of the two lists (empty lists are omitted); `events` are appended, newest last; `recent` carries `window`, `step` and the samples from the first one that changed: drop your samples from that sample's `start` on, append these, then drop samples that start a whole `window` or more before the last. The `actions` patch is `{sampleTime?, staleAfter?, running?, queued?, truncated?}`: `running` is keyed by `name`, `queued` replaces the whole list. When `actions` first appears, the patch carries every field and all rows in `running.upsert`.
+- **Applying a delta.** A delta moves the state from `base` to `seq`. A part that is present replaces the whole part (`pass`, `queue`, `cache`, `completed`, `principalsEpoch`); `fleets`, `workers` and `instances` are `{upsert[], remove[]}` keyed by `name`, and a name is in at most one of the two lists (empty lists are omitted); `events` are appended, newest last; `statusEvents` replaces the whole status list when present, including an empty list to remove expired statuses. `recent` carries `window`, `step` and the samples from the first one that changed: drop your samples from that sample's `start` on, append these, then drop samples that start a whole `window` or more before the last. The `actions` patch is `{sampleTime?, staleAfter?, running?, queued?, truncated?}`: `running` is keyed by `name`, `queued` replaces the whole list. When `actions` first appears, the patch carries every field and all rows in `running.upsert`.
 - **Resynchronizing.** `seq` advances only when a delta is sent, and only while a viewer is connected. A client reconnects when a delta's `base` differs from its own `seq`, or when a tick's `seq` is behind its own state. A tick whose `seq` equals or runs ahead of the client's is normal (a delta may still be queued for that viewer). There is no replay and no `Last-Event-ID` handling: every connect begins with a snapshot, and a second `snapshot` on an open stream replaces the client's state.
 - **Recent window.** `recent` is what the server observed over its last `window` (`[dashboard] history_window`), one sample per `step` (`history_step`), oldest first and without holes; the last sample is the step in progress. A sample counts `completed` actions in its step, the `running` and `queued` actions at its latest completed pass, and its completed and `skipped` passes. A worker's `phases` are its phase spans within the window, the last being its current phase. The window lives in the server's memory: after a restart the steps before the first sample were not recorded and must not be read as zero.
 - **Cache.** `cache.stores` lists the leader engine's bounded stores, read at the latest completed pass. `store` is `CAS` or `AC`; readers tolerate future values. `usedBytes` is on-disk occupancy rounded to filesystem blocks, and `budgetBytes` is the eviction budget. `cache.bucket` is the provider's latest whole-bucket measurement, irrespective of key prefix; `measureTime` is when it was measured, not read, and can be more than a day old. S3 objects expire by bucket lifecycle, which Gang does not observe. Empty `stores` and absent `bucket` are omitted; the `cache` object is always present. For example: `{"bucket":{"bytes":912680550400,"objects":4210336,"measureTime":"2026-01-14T00:00:00.000Z"}}`.
-- **Cache traffic.** Each sample's `lookups`, `hits`, `uploadedBytes` and `downloadedBytes` count calls served by every controller, including calls without attributable metadata. Traffic snapshots are coherent: hits never exceed lookups. Followers forward their totals in the next batch, so counts are lower bounds. Bytes are gRPC message bytes on ActionCache, ContentAddressableStorage and ByteStream calls between clients and Gang, including partial streams, compressed when sent compressed and counting every attempt, without HTTP/2 or TLS framing. Worker-to-store traffic is excluded. `evictedBytes` counts bounded-store evictions in the step.
+- **Cache traffic.** Each sample's `lookups`, `hits`, `uploadedBytes` and `downloadedBytes` count calls served by the leader, including calls without attributable metadata. Traffic snapshots are coherent: hits never exceed lookups. Counts can be lost on restart or leadership change. Bytes are gRPC message bytes on ActionCache, ContentAddressableStorage and ByteStream calls between clients and Gang, including partial streams, compressed when sent compressed and counting every attempt, without HTTP/2 or TLS framing. Worker-to-store traffic is excluded. `evictedBytes` counts bounded-store evictions in the step.
 - **Builds in the state.** `State.builds` contains the basic build view for records observed within the recent window, ordered by name and bounded by `max_live`; `Delta.builds` applies `{upsert[], remove[]}` keyed by name. RunningAction and QueuedAction `build` references the first submitter's build, and is absent when unattributable. See [builds](#builds) for the build view.
 - **Events in the state.** `State.events` holds the newest `eventsLimit` scaling events, newest last (ascending). The same events are on `GET /v1/events`, which pages the whole history newest first.
+- **Infrastructure status.** Fleet `desired` is the requested marker, not the planner's possibly larger capacity during replacement. Worker and instance rows can have `infrastructure: {phase, reason, otherInstance?}`. `phase` is `REPLACING` or `REPLACEMENT`; `reason` is `SPOT_REBALANCE` or `SPOT_INTERRUPTION`; `otherInstance`, when known, is an `instances/{instance}` reference. These annotations do not change the physical counts or scheduler phase.
+- **Operational status events.** `State.statusEvents`, omitted when empty, contains bounded, expiring AWS observations independently of `State.events` and `/v1/events`. Each has `name: "awsEvents/{AWS-id}"`, `createTime` equal to the source time, a `fleet` reference, no `cause`, and this change member:
+
+  ```json
+  {"aws":{"event":{"id":"example-aws-event-id","at":"2026-01-14T09:20:00.000Z","kind":{"type":"spotInterruption","instance":"instances/i-0e1000000000000a","action":"TERMINATE"}}}}
+  ```
+
+  `id` is the stable AWS event ID; `at` is an RFC 3339 source timestamp. The `kind` tagged union is:
+
+  | `type` | Additional fields |
+  |---|---|
+  | `rebalanceRecommendation` | `instance` |
+  | `spotInterruption` | `instance`, `action`: `TERMINATE`, `STOP` or `HIBERNATE` |
+  | `instanceLaunched` | `instance` |
+  | `replacementLaunched` | `instance`, optional `replacing` |
+  | `instanceTerminated` | `instance`, `reason`: `REBALANCE`, `SPOT_RECLAIMED` or `OTHER`; optional `reasonDetail` |
+  | `capacityUnavailable` | `reason`: provider message |
+
+  Instance fields are `instances/{instance}` references. A warning has no exact interruption deadline. Clients should tolerate unknown kinds and enum values.
 - **Closing.** `closed.reason` is one of the values below. `retryDelay` is a `Duration` and the SSE `retry:` line repeats it in milliseconds. A client treats a reason it does not know as terminal and reconnects only after the delay, if there is one.
 
   | `reason` | When | `retryDelay` |
@@ -591,25 +610,8 @@ data: {"reason":"VIEWER_CAP","retryDelay":"5s"}
 |---|---|---|
 | `GET` | `/v1/builds` | `builds.read` |
 | `GET` | `/v1/builds/{build}` | `builds.read` |
-| `POST` | `/v1/builds:ingest` | `open` |
 
 ### Examples
-
-Submit controller observations:
-
-```json request IngestBuildsRequest
-{
-  "origins": [{"principal": "example-idp:alice", "invocationId": "invocation-1"}],
-  "calls": [{"origin": 0, "rpc": "CAS", "outcome": "OK", "uploadedBytes": 128, "downloadedBytes": 4096}],
-  "lost": [],
-  "unattributed": 0,
-  "traffic": {"startTime": "2026-01-14T09:00:00.000Z", "lookups": 5, "hits": 4, "uploadedBytes": 128, "downloadedBytes": 4096}
-}
-```
-
-```json response IngestBuildsResponse
-{}
-```
 
 Get the full view:
 
@@ -703,14 +705,12 @@ Pass the returned `nextPageToken` as `pageToken` with the same filter to request
 
 ### Notes
 
-- **Leader and observations.** The leader serves both GET routes; a follower relays the request to it, preserving the caller's credentials. Followers forward bounded batches of cache-call observations to the leader. Cache counters are observed lower bounds, not completeness guarantees.
-- **Controller ingestion.** The ingest route runs only on the execution listener for controllers; public and worker routes return 404, even for administrators. It requires a unique `x-gang-controller` domain-separated CA-signed proof; an ordinary bearer token or session cookie is insufficient. The receiving controller must be the leader. The whole bounded batch is validated before application: an empty 200 response means it was accepted, and a non-2xx response means it was not applied. After an ambiguous send, the sender never retries delivered calls or carried loss counts. Observations are lower bounds, not a completeness guarantee.
-- **Ingest traffic.** `calls[].rpc` accepts `GET_ACTION_RESULT`, `UPDATE_ACTION_RESULT`, `EXECUTE` and `CAS`; unknown RPCs are rejected. Call `uploadedBytes` and `downloadedBytes` default to zero and are omitted when zero; an `EXECUTE` call with nonzero bytes is malformed. Optional `traffic` carries cumulative totals since `startTime`; hits exceeding lookups are malformed. Malformed batches are rejected before effects. The leader keys series by authenticated controller and start time, adds coherent increases for a known series, and counts a new series in full only when it started at or after leadership began. For the same incarnation, any total regression or an increase in hits exceeding the increase in lookups causes the entire traffic update to be ignored with a warning, not partially clamped; valid calls and losses in that batch are still processed. A new `startTime` denotes a restart. The leader captures its own counter baseline before leadership begins, so only subsequent growth is counted, following the same rule as a pre-existing follower series. Watermarks are retained for the whole leadership term, independently of the chart's `history_window`, and cleared on a term change. A follower resuming after an idle period or partition longer than `history_window` therefore contributes only its increase, without extra traffic or a heartbeat. `[builds] max_traffic_series` bounds retained controllers (default 1024, minimum 1); at capacity, an unknown controller evicts the least recently updated watermark and logs a warning. Eviction is the only case where old totals may be counted again. Ambiguous sends do not acknowledge traffic; a subsequent batch carries current totals. During a rolling upgrade an older leader rejects a newer follower's request fields, losing those observations.
+- **Leader and observations.** The leader serves both GET routes and records its observations locally. A nonadmitting controller refuses these routes before the handler with HTTP 503 and `gang-request-not-started: true` and does not forward observations. After promotion leader admission remains enabled through a lease lapse, even when `/ready` returns 503. The former controller ingestion route is not served. Cache counters are observed lower bounds, not completeness guarantees.
 - **Scope and visibility.** A `builds.read` holder sees all held builds. Records are bounded in memory; at capacity the least recently active is dropped, and a restart clears them. Calls with no principal, no invocation id or an over-cap metadata field are not attributed to a build. Invocation ids, target labels and mnemonics are client-asserted; target labels can reveal repository structure.
 - **Filter and order.** `filter` is a conjunction of `field = "value"` terms joined by ` AND `, each field at most once: `principal`, `invocationId` and `correlatedInvocationsId`. Empty matches all. The list orders newest `lastActiveTime` first, ties by name; the opaque cursor resumes strictly after the last row.
 - **Views.** List and `State.builds` use the basic view; Get returns the full view, adding `mnemonics`, `otherMnemonics`, `missedTargets`, `slowest` and `timeline` when present. Optional empty fields are omitted.
 - **State and loss.** `ACTIVE` means an observation arrived within `[builds] idle_after`; `IDLE` means none did. Neither says the command finished or succeeded. `unrecorded` counts observations lost to the bounded channel; further losses that cannot be attributed to a held loss counter are logged, not assigned to a build.
-- **Cache and execution.** `usage.cache` counts remote lookup hits, misses and errors and successful result uploads; a successful upload is a locally executed result uploaded by the client. `usage.executions` counts successful execute calls, rejected calls and own completed and failed worker executions. NativeLink deduplicates in-flight work: a later submitter joins the first submitter's execution. Clients derive joined as `max(0, executeCalls - completed - failed)`; joined wait is not timed. `usage.actionTime` sums worker-reported phase durations, not elapsed build time; phases the worker did not report are left out of the sums and slowest actions.
+- **Cache and execution.** `usage.cache` counts remote lookup hits, misses and errors and successful result uploads; a successful upload is a locally executed result uploaded by the client. `usage.executions` counts successful execute calls, rejected calls and own completed and failed worker executions. Gang deduplicates in-flight work: a later submitter joins the first submitter's execution. Clients derive joined as `max(0, executeCalls - completed - failed)`; joined wait is not timed. `usage.actionTime` sums worker-reported phase durations, not elapsed build time; phases the worker did not report are left out of the sums and slowest actions.
 - **Transferred bytes.** `usage.cache.uploadedBytes` and `downloadedBytes` are client-sent and client-received cache-service message bytes attributed to the build; each mnemonic and `otherMnemonics` use the same shape. Calls lacking build metadata still count farm-wide but cannot be assigned to a build.
 - **Breakdowns.** Each `mnemonics` row holds the same usage shape; missing or excess mnemonics go into `otherMnemonics`. `missedTargets` uses Space-Saving: the true misses lie between `misses - overestimate` and `misses`. `slowest` is ordered by largest `span`, from `queueTime` to worker completion; its phase durations are action times.
 - **Timeline.** Buckets hold hit and miss counts and queued and executing action-time durations. Divide a duration by `step` for mean concurrency. As the timeline grows, adjacent buckets merge and `step` doubles, preserving totals.
@@ -860,7 +860,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 
 - **Order.** Principals are listed by provider, then principal, ascending. `nextPageToken` resumes after the last principal of the page.
 - **Filter.** `filter` accepts one AIP-160 expression, `revokeTime:*`, which matches principals that have a `revokeTime`. Any other expression is `400 MALFORMED_REQUEST`. A page token belongs to the `filter` it was issued for.
-- **Revoking is idempotent.** Repeating a revoke answers `200` and keeps the original `revokeTime`; `certificates` is then empty because this call revoked none. The revocation is recorded before the live sets are updated, so every surface refuses the principal at its next request, an open stream for it ends with `closed REVOKED`, and its bearer tokens stop working. Revoking a principal the registry has not seen creates its row, so a principal can be revoked before it first authenticates.
+- **Revoking is idempotent.** Repeating a revoke answers `200` and keeps the original `revokeTime`; `certificates` is then empty because this call revoked none. The revocation is recorded before the executing controller updates its live sets: it immediately cuts off affected local connections and streams and refuses the principal's next local request, including bearer tokens. Other controllers apply the change after observing the durable revocation epoch; failed database reads delay propagation, so the default refresh interval is not a bound during an outage. An affected open state stream ends with `closed REVOKED` when its controller applies the revocation. Revoking a principal the registry has not seen creates its row, so a principal can be revoked before it first authenticates.
 - **Restoring** clears `revokeTime` and puts the principal back into service. Certificates revoked with it stay revoked.
 - `principal` is the principal as its provider names it; `name` is the resource name derived from `provider` and `principal`. `createTime` is when the registry first saw it, and `lastSeenTime` when it last authenticated.
 - `GET /v1/principals` accepts the session cookie.
@@ -1085,6 +1085,8 @@ Every non-2xx answer on `/v1/**` is the same envelope, `google.rpc.Status` as in
 - A caller that is revoked, or whose credential is refused, gets the envelope on every `/v1/**` route, including the open ones.
 - The server never answers `405`; a wrong method is `404 ROUTE_NOT_FOUND`.
 - `Retry-After` and a `RetryInfo` detail are sent only with `RATE_LIMITED`.
+- A pre-handler gate refusal with HTTP `503` / `UNAVAILABLE` carries `gang-request-not-started: true`. This guarantees that the request was refused before its handler ran; a handler-generated error never carries the marker. The equivalent gRPC refusal is `UNAVAILABLE` (code 14).
+- Gang's client retries generic 503 responses for `GET` and `HEAD`; for other methods, including `POST`, it retries only a 503 with this marker. An unmarked POST 503 does not establish that the operation had no effect and is not retried. Transport failures and timeouts are ambiguous and are not replayed. See [client options](SPECIFICATION.md#45-client-gang-client) for retry bounds.
 
 | reason | HTTP | status | metadata keys |
 |---|---|---|---|

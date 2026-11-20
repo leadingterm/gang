@@ -86,7 +86,7 @@ const IPV4_MAPPED_PREFIX_LENGTH: u8 = 96;
 /// `network` as a canonical peer address is compared with it: an IPv4-mapped IPv6 network of
 /// prefix length `IPV4_MAPPED_PREFIX_LENGTH` or more becomes the IPv4 network it names. Shorter
 /// prefixes span more than IPv4 and stay IPv6.
-fn canonical_network(network: IpNet) -> IpNet {
+pub(crate) fn canonical_network(network: IpNet) -> IpNet {
     let IpNet::V6(net) = network else {
         return network;
     };

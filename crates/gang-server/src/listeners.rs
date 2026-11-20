@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use futures::{FutureExt, Stream, StreamExt, stream::BoxStream};
 use gang_clock::{Clock, Tick};
+use gang_config::{ProxyProtocol, ProxyProtocolConfig};
 use gang_mtls::{CertificateAuthority, KeyPair, ServerCertificateRequest, SubjectName};
 use gang_spi::{Accepted, CertificateSignerPort, Peer};
 use gang_tls::{
@@ -23,6 +24,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, oneshot, watch};
 
 use crate::errors::ServerError;
+use crate::proxy_protocol::ProxyListener;
 use crate::settings::HandshakeSettings;
 
 /// How a TLS endpoint names its certificate and authenticates its clients.
@@ -43,14 +45,24 @@ pub(crate) struct TlsPolicy {
     pub(crate) accept_error_backoff: NonZeroDuration,
     /// The application protocols the listener offers during the handshake.
     pub(crate) alpn: Alpn,
+    pub(crate) proxy_mode: ProxyProtocol,
+    pub(crate) proxy_protocol: Arc<ProxyProtocolConfig>,
 }
 
 /// A listener that accepts connections: plain TCP, or TLS under the certificate authority.
-pub(crate) enum Accepting<L: Listener, S, C> {
+pub(crate) struct Accepting<L: Listener, S, C>(Arc<Mutex<Endpoint<L, S, C>>>);
+
+impl<L: Listener, S, C> Clone for Accepting<L, S, C> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+enum Endpoint<L: Listener, S, C> {
     /// Connections are served as received, with no verified peer.
     Plain {
         /// The raw listener.
-        listener: L,
+        listener: ProxyListener<L, C>,
         /// Pause after a failed accept before the next attempt.
         backoff: NonZeroDuration,
         /// Clock used for accept-error backoff.
@@ -63,12 +75,18 @@ pub(crate) enum Accepting<L: Listener, S, C> {
 impl<L: Listener, S: CertificateSignerPort, C: Clock + 'static> Accepting<L, S, C> {
     /// A plain endpoint on `listener`; failed accepts pause for `accept_error_backoff`.
     #[must_use]
-    pub(crate) fn plain(listener: L, accept_error_backoff: NonZeroDuration, clock: Arc<C>) -> Self {
-        Self::Plain {
-            listener,
+    pub(crate) fn plain(
+        listener: L,
+        accept_error_backoff: NonZeroDuration,
+        clock: Arc<C>,
+        mode: ProxyProtocol,
+        config: Arc<ProxyProtocolConfig>,
+    ) -> Self {
+        Self(Arc::new(Mutex::new(Endpoint::Plain {
+            listener: ProxyListener::new(listener, Arc::clone(&clock), mode, config),
             backoff: accept_error_backoff,
             clock,
-        }
+        })))
     }
 
     /// A TLS endpoint on `listener`, presenting a certificate `authority` issues for `policy`.
@@ -83,27 +101,40 @@ impl<L: Listener, S: CertificateSignerPort, C: Clock + 'static> Accepting<L, S, 
         policy: TlsPolicy,
         clock: Arc<C>,
     ) -> Result<Self, ServerError> {
-        let listener = Arc::new(Mutex::new(listener));
+        let listener = Arc::new(Mutex::new(ProxyListener::new(
+            listener,
+            Arc::clone(&clock),
+            policy.proxy_mode,
+            Arc::clone(&policy.proxy_protocol),
+        )));
         let reissue_after = policy
             .reissue_at_percent
             .of_duration(policy.certificate_ttl.get());
         let (incoming, rotate_at) =
             issue(&listener, &authority, &policy, reissue_after, &clock).await?;
-        Ok(Self::Tls(Box::new(TlsEndpoint {
-            listener,
-            authority,
-            policy,
-            clock,
-            reissue_after,
-            incoming,
-            rotate_at,
-            retiring: Vec::new(),
-            drained: VecDeque::new(),
-        })))
+        Ok(Self(Arc::new(Mutex::new(Endpoint::Tls(Box::new(
+            TlsEndpoint {
+                listener,
+                authority,
+                policy,
+                clock,
+                reissue_after,
+                incoming,
+                rotate_at,
+                retiring: Vec::new(),
+                drained: VecDeque::new(),
+            },
+        ))))))
     }
 
     /// Waits for the next accepted connection; `None` only when the listener can accept no more.
     pub(crate) async fn accept(&mut self) -> Option<Accepted> {
+        self.0.lock().await.accept().await
+    }
+}
+
+impl<L: Listener, S: CertificateSignerPort, C: Clock + 'static> Endpoint<L, S, C> {
+    async fn accept(&mut self) -> Option<Accepted> {
         match self {
             Self::Plain {
                 listener,
@@ -118,7 +149,7 @@ impl<L: Listener, S: CertificateSignerPort, C: Clock + 'static> Accepting<L, S, 
                     connection: Box::new(io),
                     peer: Peer {
                         certificate: None,
-                        address: L::peer_ip(&addr),
+                        address: ProxyListener::<L, C>::peer_ip(&addr),
                     },
                 })
             }
@@ -170,7 +201,7 @@ struct Retiring {
 /// A TLS endpoint: its acceptor completes handshakes, and its certificate is reissued at
 /// `rotate_at`.
 pub(crate) struct TlsEndpoint<L: Listener, S, C> {
-    listener: Arc<Mutex<L>>,
+    listener: Arc<Mutex<ProxyListener<L, C>>>,
     authority: Arc<CertificateAuthority<S, Arc<C>>>,
     policy: TlsPolicy,
     clock: Arc<C>,
@@ -282,7 +313,7 @@ async fn sleep_until_or_forever(clock: &impl Clock, deadline: Option<Tick>) {
 /// Issues a server certificate for `policy` and builds an acceptor over the shared `listener`.
 /// Returns the acceptor and the instant the certificate is due for reissue.
 async fn issue<L, S, C>(
-    listener: &Arc<Mutex<L>>,
+    listener: &Arc<Mutex<ProxyListener<L, C>>>,
     authority: &CertificateAuthority<S, Arc<C>>,
     policy: &TlsPolicy,
     reissue_after: Duration,
@@ -381,6 +412,7 @@ impl<L: Listener> Listener for SharedListener<L> {
 mod tests {
     use std::num::NonZeroUsize;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use futures::StreamExt;
     use gang_clock::TestClock;
@@ -392,7 +424,9 @@ mod tests {
 
     use super::{Accepting, TlsPolicy};
     use crate::settings::HandshakeSettings;
-    use crate::test_support::{MemoryListener, authority, memory_listener, start_clock};
+    use crate::test_support::{
+        MemoryListener, authority, memory_listener, start_clock, tls_client,
+    };
 
     /// An endpoint whose acceptor has ended yields no connections, and its stream ends and
     /// reports that it ended.
@@ -414,8 +448,10 @@ mod tests {
                 refusal_linger: NonZeroDuration::from_secs(2),
             },
             accept_error_backoff: NonZeroDuration::from_millis(100),
+            proxy_mode: gang_config::ProxyProtocol::Off,
+            proxy_protocol: Arc::default(),
         };
-        let mut accepting = Accepting::<MemoryListener, TestSigner, TestClock>::secured(
+        let accepting = Accepting::<MemoryListener, TestSigner, TestClock>::secured(
             listener,
             authority,
             policy,
@@ -423,10 +459,13 @@ mod tests {
         )
         .await
         .expect("endpoint is secured");
-        let Accepting::Tls(endpoint) = &mut accepting else {
-            panic!("a secured endpoint is TLS")
-        };
-        endpoint.incoming.incoming = Box::pin(futures::stream::empty());
+        {
+            let mut endpoint = accepting.0.lock().await;
+            let super::Endpoint::Tls(endpoint) = &mut *endpoint else {
+                panic!("a secured endpoint is TLS")
+            };
+            endpoint.incoming.incoming = Box::pin(futures::stream::empty());
+        }
 
         let (ended, signal) = oneshot::channel();
         let mut stream = accepting.into_stream(ended);
@@ -435,5 +474,99 @@ mod tests {
             "an endpoint that can accept no more ends its stream"
         );
         assert_eq!(signal.await, Ok(()), "the end is reported");
+    }
+
+    #[tokio::test]
+    async fn plain_listener_survives_sequential_streams() {
+        let (listener, dialer) = memory_listener();
+        let accepting = Accepting::<MemoryListener, TestSigner, TestClock>::plain(
+            listener,
+            NonZeroDuration::from_millis(100),
+            start_clock(),
+            gang_config::ProxyProtocol::Off,
+            Arc::default(),
+        );
+        let (ended, _) = oneshot::channel();
+        let mut first = accepting.clone().into_stream(ended);
+        let _client = dialer.dial();
+        assert!(first.next().await.is_some());
+        drop(first);
+        let (ended, _) = oneshot::channel();
+        let mut second = accepting.into_stream(ended);
+        let _client = dialer.dial();
+        assert!(second.next().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn tls_listener_rotates_across_sequential_streams() {
+        let clock = start_clock();
+        let authority = Arc::new(authority(&clock).await);
+        let (listener, dialer) = memory_listener();
+        let policy = TlsPolicy {
+            names: vec![SubjectName::Dns("api.example.test".to_owned())],
+            alpn: Alpn::H2,
+            client_auth: ClientAuth::Optional,
+            revoked_certificates: RevocationSet::from_serials(Vec::new()),
+            certificate_ttl: NonZeroDuration::from_hours(1),
+            reissue_at_percent: Percent::from_percent(50),
+            handshake: HandshakeSettings {
+                handshake_timeout: NonZeroDuration::from_secs(10),
+                max_pending_handshakes: NonZeroUsize::new(256).expect("256 is non-zero"),
+                refusal_linger: NonZeroDuration::from_secs(2),
+            },
+            accept_error_backoff: NonZeroDuration::from_millis(100),
+            proxy_mode: gang_config::ProxyProtocol::Off,
+            proxy_protocol: Arc::default(),
+        };
+        let accepting = Accepting::<MemoryListener, TestSigner, TestClock>::secured(
+            listener,
+            Arc::clone(&authority),
+            policy,
+            Arc::clone(&clock),
+        )
+        .await
+        .expect("endpoint is secured");
+        let (ended, _) = oneshot::channel();
+        let mut first = accepting.clone().into_stream(ended);
+        let (client, connection) = tokio::join!(
+            tls_client(
+                &dialer,
+                "api.example.test",
+                authority.certificate(),
+                None,
+                &clock,
+            ),
+            first.next()
+        );
+        let client = client.expect("first handshake");
+        assert!(connection.is_some());
+        let leaf = client
+            .get_ref()
+            .1
+            .peer_certificates()
+            .expect("server certificate")[0]
+            .clone();
+        drop(first);
+        clock.advance(Duration::from_mins(31));
+        let (ended, _) = oneshot::channel();
+        let mut second = accepting.into_stream(ended);
+        let (client, connection) = tokio::join!(
+            tls_client(
+                &dialer,
+                "api.example.test",
+                authority.certificate(),
+                None,
+                &clock,
+            ),
+            second.next()
+        );
+        let client = client.expect("second handshake");
+        assert!(connection.is_some());
+        let rotated = &client
+            .get_ref()
+            .1
+            .peer_certificates()
+            .expect("server certificate")[0];
+        assert_ne!(&leaf, rotated);
     }
 }

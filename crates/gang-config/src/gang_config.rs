@@ -4,11 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::str::FromStr;
 
-use gang_types::{
-    AuthenticationSettings, CaPin, Isa, NonZeroDuration, ProviderName, SchedulerSettings, Url,
-};
+use gang_types::{AuthenticationSettings, CaPin, Isa, NonZeroDuration, ProviderName, Url};
 use serde::{Deserialize, Serialize};
 
+use crate::actions::ActionsConfig;
 use crate::authentication_config::AuthenticationConfig;
 use crate::builds_config::BuildsConfig;
 use crate::ca_pin_setting::CaPinSetting;
@@ -18,6 +17,7 @@ use crate::execution_config::ExecutionConfig;
 use crate::fleets::{Fleets, RawFleet};
 use crate::identity_config::IdentityConfig;
 use crate::plugin_set::PluginSet;
+use crate::proxy_protocol_config::ProxyProtocol;
 use crate::role_config::RoleConfig;
 use crate::server_config::{EndpointTrust, ServerConfig, Transport};
 use crate::worker_config::WorkerConfig;
@@ -49,25 +49,22 @@ pub struct GangConfig<P: PluginSet, F = Fleets<P>> {
     /// takes the server certificate's host name from it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<Url>,
-    /// Where `gang server` accepts worker connections. A non-loopback listener requires a
-    /// configured scheduler worker endpoint when the scheduler supports one.
+    /// Where `gang server` accepts worker connections. A non-loopback listener requires
+    /// `worker_endpoint`.
     pub worker_listen: SocketAddr,
-    /// Where the leading controller accepts Execution, Capabilities, and leader routes. Omitted,
-    /// Execution is served on `listen`, which is bound only while leading (single-controller
-    /// shape).
+    /// URL workers dial to reach `worker_listen`. Omitted only for a loopback listener.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_listen: Option<SocketAddr>,
-    /// Plaintext HTTP health listener for load balancers (ADR-51): `GET /serve` answers 200
-    /// while this controller serves, `GET /leader` only on the leader. Unset: no health listener.
+    pub worker_endpoint: Option<Url>,
+    /// Plaintext HTTP health listener for load balancers. `GET /ready` answers 200 only while
+    /// this controller is serving, holds the lease, and has public and worker listeners ready.
+    /// Unset: no health listener.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_listen: Option<SocketAddr>,
-    /// URL clients dial to reach `execution_listen`, written into `--remote_executor`. It follows
-    /// the same scheme rules as `endpoint`. Omitted, it is derived from `execution_listen` and
-    /// only allowed when that listener is loopback.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_endpoint: Option<Url>,
     /// The worker fleets in preference order.
     pub fleets: F,
+    /// Scheduling and enforcement policy for actions.
+    #[serde(default)]
+    pub actions: ActionsConfig,
     /// The identity providers that prove identity before a certificate or token is issued. The
     /// section may be omitted, which means no providers: the `none` plugins need none, and a
     /// plugin that names a provider is rejected by validation.
@@ -99,8 +96,6 @@ pub struct GangConfig<P: PluginSet, F = Fleets<P>> {
     pub cache: P::Cache,
     /// The signer plugin: the certificate signing key.
     pub signer: P::Signer,
-    /// The scheduler plugin.
-    pub scheduler: P::Scheduler,
     /// The database plugin.
     pub database: P::Database,
     /// The sandbox plugins.
@@ -120,9 +115,30 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
     ///
     /// # Errors
     ///
-    /// [`ConfigError::Gang`] for malformed TOML, unknown or missing fields and unknown, missing or repeated plugin sections.
+    /// [`ConfigError::Gang`] for malformed TOML, unknown or missing fields and unknown, missing
+    /// or repeated plugin sections; [`ConfigError::RemovedScheduler`] for the removed scheduler table.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        toml::from_str(text).map_err(ConfigError::Gang)
+        toml::from_str(text).map_err(|source: toml::de::Error| {
+            let message = source.message();
+            if message.starts_with("unknown field `scheduler`, expected ")
+                && message.contains("`poll_interval`")
+                && message.contains("`worker_endpoint`")
+            {
+                return ConfigError::RemovedScheduler(source);
+            }
+            let message = source.to_string();
+            for (old, replacement) in [
+                ("execution_endpoint", "endpoint"),
+                ("execution_listen", "listen"),
+            ] {
+                if message.contains(&format!("unknown field `{old}`")) {
+                    return ConfigError::Gang(serde::de::Error::custom(format!(
+                        "{message}\n`{old}` was removed; use `{replacement}` instead"
+                    )));
+                }
+            }
+            ConfigError::Gang(source)
+        })
     }
 
     /// Resolves the fleets and checks the references between sections that serde cannot
@@ -139,10 +155,10 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
             listen,
             endpoint,
             worker_listen,
-            execution_listen,
+            worker_endpoint,
             health_listen,
-            execution_endpoint,
             fleets,
+            actions,
             identity,
             authentication,
             execution,
@@ -153,21 +169,24 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
             provisioner,
             cache,
             signer,
-            scheduler,
             database,
             sandbox,
             limits,
         } = self;
-        Self::check_listeners(
-            listen,
-            worker_listen,
-            execution_listen,
-            health_listen,
-            execution_endpoint.as_ref(),
-        )?;
+        Self::check_listener_collisions(listen, worker_listen, health_listen)?;
+        if server.proxy_protocol.health != ProxyProtocol::Off && health_listen.is_none() {
+            return Err(ConfigError::ProxyProtocolWithoutListener { listener: "health" });
+        }
         Self::check_leadership(&server)?;
         let fleets = Fleets::resolve(fleets, &provisioner, &sandbox)?;
-        Self::check_fleet_settings(&fleets, &scheduler, default_isa)?;
+        Self::check_fleet_settings(&fleets, &server, default_isa)?;
+        Self::check_actions(&fleets, &actions)?;
+        if worker.connect_timeout.get() / 2 >= server.worker_timeout.get() {
+            return Err(ConfigError::WorkerConnectTimeoutTooLong {
+                connect_timeout: worker.connect_timeout.get(),
+                worker_timeout: server.worker_timeout.get(),
+            });
+        }
         if let Some(name) = identity.providers.keys().find(|name| name.is_anonymous()) {
             return Err(ConfigError::ReservedProviderName(name.clone()));
         }
@@ -175,15 +194,7 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
             return Err(ConfigError::EndpointRequired { listen });
         }
         Self::check_transport(&server, endpoint.as_ref(), &authentication)?;
-        Self::check_execution_endpoint(&server.transport, execution_endpoint.as_ref())?;
-        Self::check_execution_host(
-            endpoint.as_ref(),
-            execution_endpoint.as_ref(),
-            listen,
-            execution_listen,
-            server.transport.kind(),
-        )?;
-        Self::check_worker_endpoint(&server, worker_listen, &scheduler)?;
+        Self::check_worker_endpoint(&server, worker_listen, worker_endpoint.as_ref())?;
         Self::check_authentication_providers(&identity.providers, &authentication.clients)?;
         Self::check_authentication_providers(&identity.providers, &authentication.workers)?;
         Self::check_roles(&server.roles, &identity.providers)?;
@@ -195,10 +206,10 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
             listen,
             endpoint,
             worker_listen,
-            execution_listen,
+            worker_endpoint,
             health_listen,
-            execution_endpoint,
             fleets,
+            actions,
             identity,
             authentication,
             execution,
@@ -209,27 +220,83 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
             provisioner,
             cache,
             signer,
-            scheduler,
             database,
             sandbox,
             limits,
         })
     }
 
-    /// Checks scheduler shutdown timing and default ISA against resolved fleets.
+    fn check_actions(fleets: &Fleets<P>, actions: &ActionsConfig) -> Result<(), ConfigError> {
+        for fleet in fleets.policies() {
+            for (key, value, capacity, strict) in [
+                (
+                    "actions.memory.min_reservation",
+                    actions.memory.min_reservation.as_units() * 1024,
+                    fleet.memory_per_instance.as_u64(),
+                    false,
+                ),
+                (
+                    "actions.memory.reserve",
+                    actions.memory.reserve.as_u64(),
+                    fleet.memory_per_instance.as_u64(),
+                    true,
+                ),
+                (
+                    "actions.disk.min_reservation",
+                    actions.disk.min_reservation.as_units() * 1024,
+                    fleet.disk_per_instance.as_u64(),
+                    false,
+                ),
+            ] {
+                if value > capacity || (strict && value == capacity) {
+                    return Err(ConfigError::ActionResourceDoesNotFit {
+                        key,
+                        value,
+                        capacity,
+                        fleet: fleet.name.clone(),
+                        relation: if strict { "less than" } else { "at most" },
+                    });
+                }
+            }
+        }
+        let cold = &actions.cold_start;
+        let cpu = cold.cpu_count.to_string();
+        let millicores = (u64::from(cold.cpu_count.get())
+            * gang_types::property::MILLICORES_PER_CORE)
+            .to_string();
+        let memory = cold.memory.as_units().to_string();
+        let disk = cold.disk.as_units().to_string();
+        let accepting = fleets.catalog().accepting(|key| match key {
+            gang_types::property::CPU_COUNT => Some(cpu.as_str()),
+            gang_types::property::CPU_MILLICORES => Some(millicores.as_str()),
+            gang_types::property::MEMORY_KB => Some(memory.as_str()),
+            gang_types::property::DISK_KB => Some(disk.as_str()),
+            _ => None,
+        });
+        if cold.enabled && accepting.is_empty() {
+            return Err(ConfigError::ColdStartFitsNoFleet {
+                cpu_count: cold.cpu_count.get(),
+                memory_kb: cold.memory.as_units(),
+                disk_kb: cold.disk.as_units(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Checks shutdown timing and default ISA against resolved fleets.
     fn check_fleet_settings(
         fleets: &Fleets<P>,
-        scheduler: &P::Scheduler,
+        server: &ServerConfig,
         default_isa: Isa,
     ) -> Result<(), ConfigError> {
-        if let Some((key, shutdown_grace)) = scheduler.shutdown_grace()
-            && let Some(fleet) = fleets
-                .policies()
-                .iter()
-                .find(|fleet| shutdown_grace >= fleet.boot_grace)
+        let shutdown_grace = server.http2.shutdown_grace;
+        if let Some(fleet) = fleets
+            .policies()
+            .iter()
+            .find(|fleet| shutdown_grace >= fleet.boot_grace)
         {
             return Err(ConfigError::ShutdownGraceNotBelowBootGrace {
-                key,
+                key: "server.http2.shutdown_grace",
                 shutdown_grace,
                 fleet: fleet.name.clone(),
                 boot_grace: fleet.boot_grace,
@@ -245,71 +312,15 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
         Ok(())
     }
 
-    fn check_listeners(
-        listen: SocketAddr,
-        worker_listen: SocketAddr,
-        execution_listen: Option<SocketAddr>,
-        health_listen: Option<SocketAddr>,
-        execution_endpoint: Option<&Url>,
-    ) -> Result<(), ConfigError> {
-        Self::check_execution_listener(execution_listen, execution_endpoint, worker_listen)?;
-        Self::check_listener_collisions(listen, worker_listen, execution_listen, health_listen)
-    }
-
-    fn check_execution_host(
-        endpoint: Option<&Url>,
-        execution: Option<&Url>,
-        listen: SocketAddr,
-        execution_listen: Option<SocketAddr>,
-        transport: crate::ServerTransport,
-    ) -> Result<(), ConfigError> {
-        let public_host = endpoint.and_then(Url::host_str);
-        let execution_host = execution.and_then(Url::host_str);
-        let parse_ip = |host: &str| {
-            host.trim_matches(['[', ']'])
-                .parse::<std::net::IpAddr>()
-                .ok()
-        };
-        let same_host = match (endpoint, execution, execution_listen) {
-            (_, None, None) => true,
-            (Some(_), Some(_), _) => public_host == execution_host,
-            (None, Some(_), _) => execution_host.and_then(parse_ip) == Some(listen.ip()),
-            (Some(_), None, Some(address)) => public_host.and_then(parse_ip) == Some(address.ip()),
-            (None, None, Some(address)) => listen.ip() == address.ip(),
-        };
-        if !same_host {
-            return Err(ConfigError::ExecutionEndpointHostMismatch {
-                endpoint: endpoint.map_or_else(|| listen.to_string(), ToString::to_string),
-                execution_endpoint: execution.map_or_else(
-                    || execution_listen.map_or_else(String::new, |address| address.to_string()),
-                    ToString::to_string,
-                ),
-            });
-        }
-        if let Some(address) = execution_listen {
-            let scheme = transport.public_scheme();
-            let public_scheme = endpoint.map_or(scheme, Url::scheme);
-            let execution_scheme = execution.map_or(scheme, Url::scheme);
-            let public_port = endpoint.map_or(Some(listen.port()), Url::port_or_known_default);
-            let execution_port = execution.map_or(Some(address.port()), Url::port_or_known_default);
-            if public_scheme == execution_scheme && public_port == execution_port {
-                return Err(ConfigError::ExecutionEndpointSelfRelay);
-            }
-        }
-        Ok(())
-    }
-
     /// Rejects non-ephemeral listeners whose bind addresses overlap.
     fn check_listener_collisions(
         listen: SocketAddr,
         worker_listen: SocketAddr,
-        execution_listen: Option<SocketAddr>,
         health_listen: Option<SocketAddr>,
     ) -> Result<(), ConfigError> {
         let listeners = [
             ("listen", Some(listen)),
             ("worker_listen", Some(worker_listen)),
-            ("execution_listen", execution_listen),
             ("health_listen", health_listen),
         ];
         for (index, (first, address)) in listeners.iter().enumerate() {
@@ -330,53 +341,6 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
                         });
                     }
                 }
-            }
-        }
-        Ok(())
-    }
-
-    /// Checks that the advertised execution endpoint's scheme matches the transport.
-    fn check_execution_endpoint(
-        transport: &Transport,
-        execution_endpoint: Option<&Url>,
-    ) -> Result<(), ConfigError> {
-        let Some(endpoint) = execution_endpoint else {
-            return Ok(());
-        };
-        match transport {
-            Transport::Tls { .. } if endpoint.scheme() != transport.kind().public_scheme() => {
-                Err(ConfigError::ExecutionEndpointNotHttps(endpoint.clone()))
-            }
-            Transport::Plaintext if !matches!(endpoint.scheme(), "http" | "https") => {
-                Err(ConfigError::ExecutionEndpointNotHttp(endpoint.clone()))
-            }
-            _ => Ok(()),
-        }
-    }
-
-    /// Checks the leader-only listeners and the advertised execution endpoint.
-    fn check_execution_listener(
-        execution_listen: Option<SocketAddr>,
-        execution_endpoint: Option<&Url>,
-        worker_listen: SocketAddr,
-    ) -> Result<(), ConfigError> {
-        if execution_endpoint.is_some() && execution_listen.is_none() {
-            return Err(ConfigError::ExecutionEndpointWithoutListen);
-        }
-        if let Some(listen) = execution_listen {
-            for (key, address) in [
-                ("execution_listen", listen),
-                ("worker_listen", worker_listen),
-            ] {
-                if address.port() == 0 {
-                    return Err(ConfigError::LeaderListenerPortUnset {
-                        key,
-                        listen: address,
-                    });
-                }
-            }
-            if execution_endpoint.is_none() && !listen.ip().is_loopback() {
-                return Err(ConfigError::ExecutionEndpointRequired { listen });
             }
         }
         Ok(())
@@ -410,7 +374,14 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
             .ttl
             .get()
             .saturating_add(leadership.clock_skew)
-            .saturating_add(leadership.renew_interval.get());
+            .saturating_add(leadership.renew_interval.get())
+            .max(
+                gang_types::handover::handover_window(
+                    leadership.renew_interval.get(),
+                    leadership.call_timeout.get(),
+                )
+                .saturating_sub(gang_types::health::health_check().healthy_window()),
+            );
         let healthy_window = gang_types::health::health_check().healthy_window();
         let keepalive_timeout = gang_types::health::CLIENT_KEEPALIVE_TIMEOUT;
         if takeover.saturating_add(healthy_window) >= keepalive_timeout {
@@ -423,17 +394,18 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
         Ok(())
     }
 
-    /// Checks the scheduler's advertised worker endpoint against its listener and transport.
+    /// Checks the advertised worker endpoint against its listener and transport.
     fn check_worker_endpoint(
         server: &ServerConfig,
         listen: SocketAddr,
-        scheduler: &P::Scheduler,
+        endpoint: Option<&Url>,
     ) -> Result<(), ConfigError> {
-        let Some(endpoint) = scheduler.worker_endpoint() else {
-            if let Some(key) = scheduler.worker_endpoint_key()
-                && !listen.ip().is_loopback()
-            {
-                return Err(ConfigError::WorkerEndpointRequired { key, listen });
+        let Some(endpoint) = endpoint else {
+            if !listen.ip().is_loopback() {
+                return Err(ConfigError::WorkerEndpointRequired {
+                    key: "worker_endpoint",
+                    listen,
+                });
             }
             return Ok(());
         };
@@ -607,7 +579,8 @@ impl<P: PluginSet> FromStr for GangConfig<P> {
     ///
     /// [`ConfigError::Gang`] for malformed TOML, unknown or missing fields (a `[[fleets]]` entry
     /// included) and unknown, missing or repeated plugin sections; the message lists the
-    /// accepted keys. Then the fleet and cross-section errors of [`ConfigError`].
+    /// accepted keys. [`ConfigError::RemovedScheduler`] identifies the removed top-level table.
+    /// Then the fleet and cross-section errors of [`ConfigError`].
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         Document::<P>::parse(text)?.resolve()
     }

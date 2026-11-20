@@ -16,7 +16,6 @@ use nativelink_config::cas_server::LocalWorkerConfig;
 use nativelink_error::{Code, Error, ResultExt};
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::worker_api_client::WorkerApiClient;
 use nativelink_store::fast_slow_store::FastSlowStore;
-use nativelink_util::common::fs;
 use nativelink_util::shutdown_guard::ShutdownGuard;
 use nativelink_worker::local_worker::LocalWorker;
 #[cfg(target_os = "linux")]
@@ -29,7 +28,7 @@ use nativelink_worker::worker_api_client_wrapper::WorkerApiClientWrapper;
 use tokio::sync::broadcast;
 use tonic::transport::Endpoint;
 
-use crate::config::{NativeLinkConfig, WorkerTuning};
+use crate::config::NativeLinkConfig;
 use crate::errors::{NativeLinkConfigError, NativeLinkEmbedError};
 use crate::globals;
 use crate::properties::{WORKER_ACTION_STORE, WORKER_CONTENT_STORE};
@@ -150,13 +149,13 @@ async fn build(
     let manager = Arc::new(
         RunningActionsManagerImpl::new(RunningActionsManagerArgs {
             root_action_directory: worker.work_directory.clone(),
-            execution_configuration: execution(&worker, &config.worker),
+            execution_configuration: execution(&worker, spec.actions.kill_grace),
             cas_store: fast_slow,
             ac_store: Some(action_cache),
             // Settings never name a historical results store, so it is the content store.
             historical_store: content,
             upload_action_result_config: &worker.upload_action_result,
-            max_action_timeout: config.worker.action_timeout.get(),
+            max_action_timeout: spec.actions.timeout.get(),
             max_upload_timeout: config.worker.upload_timeout.get(),
             max_download_timeout: config.worker.download_timeout.get(),
             max_cleanup_wait: config.worker.cleanup_wait.get(),
@@ -188,13 +187,16 @@ async fn build(
 
 /// How the worker executes actions: Gang's entrypoint, environment, enforcement and one-shot
 /// execution, with other settings left at `NativeLink` defaults.
-fn execution(worker: &LocalWorkerConfig, tuning: &WorkerTuning) -> ExecutionConfiguration {
+fn execution(
+    worker: &LocalWorkerConfig,
+    kill_grace: gang_types::NonZeroDuration,
+) -> ExecutionConfiguration {
     ExecutionConfiguration {
         resource_enforcement: worker
             .resource_enforcement
             .as_ref()
             .and_then(ResourceEnforcement::from_config),
-        kill_grace: tuning.kill_grace.get(),
+        kill_grace: kill_grace.get(),
         set_tmpdir: worker.set_tmpdir,
         entrypoint: Some(worker.entrypoint.clone()),
         additional_environment: worker.additional_environment.clone(),
@@ -334,16 +336,41 @@ fn connect(
     })
 }
 
-/// Empties `directory`, which a previous worker may have left populated, and creates it.
+/// Empties the work directory while preserving the side-channel root prepared by the worker.
 async fn fresh_directory(directory: &str) -> Result<(), Error> {
-    if let Ok(path) = fs::canonicalize(directory).await {
-        fs::remove_dir_all(&path)
-            .await
-            .err_tip(|| format!("removing {}", path.display()))?;
-    }
-    fs::create_dir_all(directory)
+    let root = Path::new(directory);
+    let side_channels = root.join(".side_channels");
+    clear_directory(&side_channels, false)
         .await
-        .err_tip(|| format!("creating {directory}"))
+        .map_err(|error| Error::from_std_err(Code::Internal, &error))
+        .err_tip(|| format!("cleaning {}", side_channels.display()))?;
+    clear_directory(root, true)
+        .await
+        .map_err(|error| Error::from_std_err(Code::Internal, &error))
+        .err_tip(|| format!("cleaning {}", root.display()))
+}
+
+/// Removes directory contents without following symbolic links.
+async fn clear_directory(directory: &Path, preserve_side_channels: bool) -> std::io::Result<()> {
+    let metadata = tokio::fs::symlink_metadata(directory).await?;
+    if !metadata.file_type().is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "expected a directory",
+        ));
+    }
+    let mut entries = tokio::fs::read_dir(directory).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if preserve_side_channels && entry.file_name() == ".side_channels" {
+            continue;
+        }
+        if entry.file_type().await?.is_dir() {
+            tokio::fs::remove_dir_all(entry.path()).await?;
+        } else {
+            tokio::fs::remove_file(entry.path()).await?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -359,6 +386,40 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fresh_directory_preserves_private_side_channel_root() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("temporary directory");
+        let work = root.path().join("work");
+        std::fs::create_dir_all(work.join(".side_channels")).expect("old side-channel root");
+        std::fs::set_permissions(
+            work.join(".side_channels"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("private side-channel root");
+        std::fs::write(work.join(".side_channels/stale"), b"stale").expect("stale report");
+        std::fs::write(work.join("stale"), b"stale").expect("stale action data");
+        fresh_directory(work.to_str().expect("UTF-8 temporary path"))
+            .await
+            .expect("prepare worker directory");
+        assert!(!work.join("stale").exists());
+        let side_channels = work.join(".side_channels");
+        assert_eq!(
+            std::fs::metadata(&side_channels)
+                .expect("side-channel root")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::read_dir(side_channels).expect("directory").count(),
+            0
+        );
+    }
 
     #[tokio::test]
     async fn a_ready_revocation_wins_a_simultaneously_ready_stop() {
@@ -439,11 +500,14 @@ mod tests {
 
     #[test]
     fn execution_uses_configured_kill_grace() {
-        let mut config: NativeLinkConfig =
-            serde_json::from_value(json!({ "scheduler_name": "MAIN_SCHEDULER" }))
-                .expect("valid config");
-        config.worker.kill_grace = NonZeroDuration::from_millis(1500);
+        let config = NativeLinkConfig::default();
+        let actions = gang_config::ActionsConfig {
+            kill_grace: NonZeroDuration::from_millis(1500),
+            ..gang_config::ActionsConfig::default()
+        };
         let spec = WorkerSpec {
+            actions: Arc::new(actions),
+            memory_pool: None,
             instance: InstanceId::try_new("local-1").expect("instance"),
             properties: FleetProperties::new(
                 &FleetName::try_new("fleet-a").expect("fleet name"),
@@ -470,8 +534,8 @@ mod tests {
             .expect("worker settings")
             .worker;
         assert_eq!(
-            execution(&worker_config, &config.worker).kill_grace,
-            config.worker.kill_grace.get()
+            execution(&worker_config, spec.actions.kill_grace).kill_grace,
+            spec.actions.kill_grace.get()
         );
     }
 }

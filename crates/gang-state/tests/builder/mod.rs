@@ -44,6 +44,7 @@ struct World {
     builds: Option<gang_insight::Builds>,
     traffic: Traffic,
     measured: Option<MeasuredUsage>,
+    infrastructure: Vec<gang_spi::FleetInfrastructureEvent>,
 }
 
 impl World {
@@ -161,6 +162,7 @@ fn fill_into(
         catalog: &catalog,
         actions: world.actions.as_ref(),
         events: &[],
+        infrastructure: &world.infrastructure,
         builds: world.builds.as_ref().unwrap_or(&empty_builds),
         traffic: world.traffic,
         measured: world.measured.as_ref(),
@@ -248,6 +250,8 @@ fn fleets_follow_declaration_order_and_units() -> TestResult {
         .collect();
     world.supplies = vec![
         FleetSupply {
+            requested: None,
+            events: Vec::new(),
             abandoned: 0,
             desired: 2,
             instances: Vec::new(),
@@ -256,6 +260,8 @@ fn fleets_follow_declaration_order_and_units() -> TestResult {
             launch_failure: None,
         },
         FleetSupply {
+            requested: None,
+            events: Vec::new(),
             abandoned: 0,
             desired: 1,
             instances: Vec::new(),
@@ -357,6 +363,8 @@ fn provisioner_properties_exclude_reserved_keys() -> TestResult {
     world.properties = vec![properties(&alpha, vec![("custom.option", "v".to_owned())])];
     world.policies = vec![alpha];
     world.supplies = vec![FleetSupply {
+        requested: None,
+        events: Vec::new(),
         abandoned: 0,
         desired: 0,
         instances: Vec::new(),
@@ -394,6 +402,8 @@ fn counts_workers_by_phase_and_instances_by_lifecycle() -> TestResult {
     let other = instance_id(9)?;
     world.supplies = vec![
         FleetSupply {
+            requested: None,
+            events: Vec::new(),
             abandoned: 0,
             desired: 4,
             warm: 3,
@@ -408,6 +418,8 @@ fn counts_workers_by_phase_and_instances_by_lifecycle() -> TestResult {
             ],
         },
         FleetSupply {
+            requested: None,
+            events: Vec::new(),
             abandoned: 0,
             desired: 0,
             warm: 0,
@@ -446,6 +458,11 @@ fn counts_workers_by_phase_and_instances_by_lifecycle() -> TestResult {
 
     let cur = fill(&mut builder, &blank(), 1, &world, 1_000, ok(0))?;
 
+    assert_fleet_counts(&cur, &pending, &unhosted);
+    Ok(())
+}
+
+fn assert_fleet_counts(cur: &State, pending: &InstanceId, unhosted: &InstanceId) {
     let alpha = &cur.fleets[0];
     assert_eq!(
         alpha.workers,
@@ -479,8 +496,7 @@ fn counts_workers_by_phase_and_instances_by_lifecycle() -> TestResult {
     );
     assert_eq!(beta.demand.running, 5);
     let listed: Vec<&str> = cur.instances.iter().map(|i| i.name.as_str()).collect();
-    assert_eq!(listed, [instance_name(&pending), instance_name(&unhosted)]);
-    Ok(())
+    assert_eq!(listed, [instance_name(pending), instance_name(unhosted)]);
 }
 
 #[test]
@@ -492,6 +508,8 @@ fn worker_phase_and_phase_time_copy_or_reset_across_frames() -> TestResult {
     let instance = instance_id(1)?;
     let worker = worker_on(&instance)?;
     world.supplies = vec![FleetSupply {
+        requested: None,
+        events: Vec::new(),
         abandoned: 0,
         desired: 1,
         instances: vec![fleet_instance(&instance, InstanceLifecycle::InService, 0)],
@@ -552,6 +570,8 @@ fn launch_time_of_a_worker_without_instance_is_carried_over() -> TestResult {
     world.properties = vec![properties(&alpha, Vec::new())];
     world.policies = vec![alpha];
     world.supplies = vec![FleetSupply {
+        requested: None,
+        events: Vec::new(),
         abandoned: 0,
         desired: 0,
         instances: Vec::new(),
@@ -606,6 +626,8 @@ fn merge_pairs_workers_and_instances_with_interleaving_ids() -> TestResult {
     };
     world.supplies = vec![
         FleetSupply {
+            requested: None,
+            events: Vec::new(),
             abandoned: 0,
             desired: 3,
             instances: vec![
@@ -618,6 +640,8 @@ fn merge_pairs_workers_and_instances_with_interleaving_ids() -> TestResult {
             launch_failure: None,
         },
         FleetSupply {
+            requested: None,
+            events: Vec::new(),
             abandoned: 0,
             desired: 2,
             instances: vec![in_service("local-20", 40)?, in_service("local-3", 50)?],
@@ -696,6 +720,8 @@ fn every_worker_on_an_instance_gets_its_launch_time() -> TestResult {
     world.policies = vec![alpha];
     let instance = instance_id(1)?;
     world.supplies = vec![FleetSupply {
+        requested: None,
+        events: Vec::new(),
         abandoned: 0,
         desired: 1,
         instances: vec![fleet_instance(&instance, InstanceLifecycle::InService, 10)],
@@ -734,6 +760,8 @@ fn slots_are_none_for_unbounded_workers() -> TestResult {
     world.properties = vec![properties(&alpha, Vec::new())];
     world.policies = vec![alpha];
     world.supplies = vec![FleetSupply {
+        requested: None,
+        events: Vec::new(),
         abandoned: 0,
         desired: 0,
         instances: Vec::new(),
@@ -771,6 +799,8 @@ fn instances_without_worker_are_listed_with_boot_grace() -> TestResult {
     let pending = instance_id(4)?;
     let young = instance_id(5)?;
     world.supplies = vec![FleetSupply {
+        requested: None,
+        events: Vec::new(),
         abandoned: 0,
         desired: 2,
         instances: vec![
@@ -812,6 +842,8 @@ fn old_unserved_instance_uses_the_pass_boot_grace_verdict() -> TestResult {
     world.policies = vec![alpha];
     let instance = instance_id(5)?;
     world.supplies = vec![FleetSupply {
+        requested: None,
+        events: Vec::new(),
         abandoned: 0,
         desired: 1,
         instances: vec![fleet_instance(&instance, InstanceLifecycle::InService, 0)],
@@ -840,6 +872,8 @@ fn unplaceable_plus_charged_equals_queue_total() -> TestResult {
         .collect();
     world.supplies = vec![
         FleetSupply {
+            requested: None,
+            events: Vec::new(),
             abandoned: 0,
             desired: 0,
             instances: Vec::new(),
@@ -848,6 +882,8 @@ fn unplaceable_plus_charged_equals_queue_total() -> TestResult {
             launch_failure: None,
         },
         FleetSupply {
+            requested: None,
+            events: Vec::new(),
             abandoned: 0,
             desired: 0,
             instances: Vec::new(),
@@ -896,6 +932,8 @@ fn oldest_queue_time_is_the_earliest_queued_since_whatever_the_order() -> TestRe
     world.properties = vec![properties(&alpha, Vec::new())];
     world.policies = vec![alpha];
     world.supplies = vec![FleetSupply {
+        requested: None,
+        events: Vec::new(),
         abandoned: 0,
         desired: 0,
         instances: Vec::new(),
@@ -1003,6 +1041,8 @@ fn skipped_pass_keeps_rows_and_counts_skips() -> TestResult {
     let instance = instance_id(1)?;
     let worker = worker_on(&instance)?;
     world.supplies = vec![FleetSupply {
+        requested: None,
+        events: Vec::new(),
         abandoned: 0,
         desired: 2,
         instances: vec![
@@ -1083,6 +1123,8 @@ fn skipped_pass_refreshes_the_actions_part() -> TestResult {
     world.properties = vec![properties(&alpha, Vec::new())];
     world.policies = vec![alpha];
     world.supplies = vec![FleetSupply {
+        requested: None,
+        events: Vec::new(),
         abandoned: 0,
         desired: 0,
         instances: Vec::new(),
@@ -1146,6 +1188,8 @@ fn a_pass_without_a_sample_keeps_the_previous_actions() -> TestResult {
     world.properties = vec![properties(&alpha, Vec::new())];
     world.policies = vec![alpha];
     world.supplies = vec![FleetSupply {
+        requested: None,
+        events: Vec::new(),
         abandoned: 0,
         desired: 0,
         instances: Vec::new(),
@@ -1205,6 +1249,8 @@ fn scale_sweep_matches_a_naive_reference() -> TestResult {
         ));
     }
     world.supplies = vec![FleetSupply {
+        requested: None,
+        events: Vec::new(),
         abandoned: 0,
         desired: 2_000,
         instances,
@@ -1310,6 +1356,8 @@ fn a_worker_of_another_fleet_does_not_host_the_instance() -> TestResult {
     let instance = instance_id(1)?;
     world.supplies = vec![
         FleetSupply {
+            requested: None,
+            events: Vec::new(),
             abandoned: 0,
             desired: 1,
             warm: 0,
@@ -1389,6 +1437,8 @@ fn larger_world() -> Result<World, Box<dyn Error>> {
     world.policies = vec![alpha, beta];
     world.supplies = vec![
         FleetSupply {
+            requested: None,
+            events: Vec::new(),
             abandoned: 0,
             desired: 2,
             instances: vec![
@@ -1400,6 +1450,8 @@ fn larger_world() -> Result<World, Box<dyn Error>> {
             launch_failure: None,
         },
         FleetSupply {
+            requested: None,
+            events: Vec::new(),
             abandoned: 0,
             desired: 1,
             instances: vec![
@@ -1468,6 +1520,8 @@ fn smaller_world() -> Result<World, Box<dyn Error>> {
     world.properties = vec![properties(&alpha, Vec::new())];
     world.policies = vec![alpha];
     world.supplies = vec![FleetSupply {
+        requested: None,
+        events: Vec::new(),
         abandoned: 0,
         desired: 1,
         instances: vec![fleet_instance(
@@ -1625,6 +1679,7 @@ fn events_keep_only_the_newest_configured_window() -> TestResult {
         catalog: &catalog,
         actions: None,
         events: &[],
+        infrastructure: &[],
         builds: &builds,
         traffic: Traffic::default(),
         measured: None,
@@ -1639,6 +1694,7 @@ fn events_keep_only_the_newest_configured_window() -> TestResult {
         catalog: &catalog,
         actions: None,
         events: &events,
+        infrastructure: &[],
         builds: &builds,
         traffic: Traffic::default(),
         measured: None,
@@ -2337,4 +2393,783 @@ fn cache_counters_bridge_skips_and_reset_sources_separately() -> TestResult {
         .ok_or("missing sample")?;
     assert_eq!(cache_counts(sample), (3, 1, 10, 5, 2));
     Ok(())
+}
+
+#[test]
+fn infrastructure_projection_tracks_connected_overlap_and_clears_completed_pair() -> TestResult {
+    use gang_spi::{FleetInfrastructureEvent, InfrastructureEvent, InfrastructureEventKind};
+    use gang_wire::{AwsEventKind, EventChange, InfrastructurePhase};
+    let old = instance_id(1)?;
+    let new = instance_id(2)?;
+    let policy = policy("alpha", 0, 4)?;
+    let mut world = World::default();
+    world.properties.push(properties(&policy, vec![]));
+    world.policies.push(policy);
+    world.supplies.push(FleetSupply {
+        desired: 2,
+        requested: Some(1),
+        instances: vec![
+            fleet_instance(&old, InstanceLifecycle::InService, 1),
+            fleet_instance(&new, InstanceLifecycle::InService, 2),
+        ],
+        ..FleetSupply::default()
+    });
+    world.snapshot.workers = vec![
+        worker_state(&worker_on(&old)?, "alpha", 1, false, None)?,
+        worker_state(&worker_on(&new)?, "alpha", 0, false, None)?,
+    ];
+    world.infrastructure.push(FleetInfrastructureEvent {
+        fleet: FleetName::try_new("alpha")?,
+        event: InfrastructureEvent {
+            id: "launch".into(),
+            at: ts(2),
+            kind: InfrastructureEventKind::ReplacementLaunched {
+                instance: new.clone(),
+                replacing: None,
+            },
+        },
+    });
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let frame = fill(&mut builder, &blank(), 1, &world, 3, ok(0))?;
+    assert_eq!(frame.fleets[0].desired, 1);
+    assert_eq!(
+        find_worker(&frame, &worker_on(&old)?)
+            .and_then(|w| w.infrastructure.as_ref())
+            .map(|s| &s.phase),
+        Some(&InfrastructurePhase::Replacing)
+    );
+    assert_eq!(
+        find_worker(&frame, &worker_on(&new)?)
+            .and_then(|w| w.infrastructure.as_ref())
+            .map(|s| &s.phase),
+        Some(&InfrastructurePhase::Replacement)
+    );
+    assert_eq!(frame.fleets[0].instances.in_service, 2);
+    assert_eq!(frame.workers.len(), 2);
+    assert!(
+        matches!(&frame.status_events[0].change, EventChange::Aws { event } if matches!(&event.kind, AwsEventKind::ReplacementLaunched { replacing: Some(peer), .. } if peer == &instance_name(&old)))
+    );
+    world.supplies[0].instances[0].lifecycle = InstanceLifecycle::Terminating;
+    let terminating = fill(&mut builder, &frame, 2, &world, 3, ok(0))?;
+    assert_eq!(
+        terminating
+            .workers
+            .iter()
+            .filter(|worker| worker.infrastructure.is_some())
+            .count(),
+        2
+    );
+    assert_eq!(terminating.fleets[0].instances.terminating, 1);
+    assert_eq!(terminating.fleets[0].instances.in_service, 1);
+    assert_eq!(terminating.workers.len(), 2);
+    world.supplies[0]
+        .instances
+        .retain(|instance| instance.id != old);
+    world
+        .snapshot
+        .workers
+        .retain(|worker| worker.id == worker_on(&new).expect("valid worker"));
+    world.infrastructure.push(FleetInfrastructureEvent {
+        fleet: FleetName::try_new("alpha")?,
+        event: InfrastructureEvent {
+            id: "termination".into(),
+            at: ts(3),
+            kind: InfrastructureEventKind::InstanceTerminated {
+                instance: old.clone(),
+                reason: gang_spi::InfrastructureTerminationReason::Rebalance,
+            },
+        },
+    });
+    let completed = fill(&mut builder, &terminating, 3, &world, 4, ok(0))?;
+    assert_eq!(completed.fleets[0].instances.in_service, 1);
+    assert!(completed.workers[0].infrastructure.is_none());
+    assert!(
+        matches!(&completed.status_events[0].change, EventChange::Aws { event } if matches!(&event.kind, AwsEventKind::ReplacementLaunched { replacing: Some(peer), .. } if peer == &instance_name(&old)))
+    );
+    let mut restarted = Builder::new(config(), gang_state::CacheBaseline::default());
+    let replayed = fill(&mut restarted, &blank(), 1, &world, 4, ok(0))?;
+    assert!(replayed.workers[0].infrastructure.is_none());
+    assert!(
+        matches!(&replayed.status_events[0].change, EventChange::Aws { event } if matches!(&event.kind, AwsEventKind::ReplacementLaunched { replacing: Some(peer), .. } if peer == &instance_name(&old)))
+    );
+    Ok(())
+}
+
+#[test]
+fn ambiguous_replacement_does_not_invent_a_pair() -> TestResult {
+    use gang_spi::{FleetInfrastructureEvent, InfrastructureEvent, InfrastructureEventKind};
+    let old = instance_id(1)?;
+    let other = instance_id(2)?;
+    let new = instance_id(3)?;
+    let policy = policy("alpha", 0, 4)?;
+    let mut pass = FleetPass::new(policy);
+    pass.supply.requested = Some(1);
+    pass.supply.instances = vec![
+        fleet_instance(&old, InstanceLifecycle::InService, 1),
+        fleet_instance(&other, InstanceLifecycle::InService, 1),
+        fleet_instance(&new, InstanceLifecycle::InService, 2),
+    ];
+    let records = vec![FleetInfrastructureEvent {
+        fleet: FleetName::try_new("alpha")?,
+        event: InfrastructureEvent {
+            id: "launch".into(),
+            at: ts(2),
+            kind: InfrastructureEventKind::ReplacementLaunched {
+                instance: new.clone(),
+                replacing: None,
+            },
+        },
+    }];
+    let mut world = World::default();
+    world.properties.push(properties(&pass.policy, vec![]));
+    world.passes.push(pass);
+    world.infrastructure = records;
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let frame = fill(&mut builder, &blank(), 1, &world, 3, ok(0))?;
+    let old_row = frame
+        .instances
+        .iter()
+        .find(|row| row.name == instance_name(&old))
+        .ok_or("missing old instance")?;
+    let new_row = frame
+        .instances
+        .iter()
+        .find(|row| row.name == instance_name(&new))
+        .ok_or("missing replacement")?;
+    assert!(old_row.infrastructure.is_none());
+    assert_eq!(
+        new_row.infrastructure.as_ref().map(|status| &status.phase),
+        Some(&gang_wire::InfrastructurePhase::Replacement)
+    );
+    assert!(
+        matches!(&frame.status_events[0].change, gang_wire::EventChange::Aws { event } if matches!(&event.kind, gang_wire::AwsEventKind::ReplacementLaunched { replacing: None, .. }))
+    );
+    Ok(())
+}
+
+#[test]
+fn ordinary_instance_launch_has_no_rebalance_phase() -> TestResult {
+    use gang_spi::{FleetInfrastructureEvent, InfrastructureEvent, InfrastructureEventKind};
+    use gang_wire::{AwsEventKind, EventChange};
+    let instance = instance_id(1)?;
+    let policy = policy("alpha", 0, 4)?;
+    let mut pass = FleetPass::new(policy);
+    pass.supply
+        .instances
+        .push(fleet_instance(&instance, InstanceLifecycle::InService, 1));
+    let records = vec![FleetInfrastructureEvent {
+        fleet: FleetName::try_new("alpha")?,
+        event: InfrastructureEvent {
+            id: "ordinary".into(),
+            at: ts(1),
+            kind: InfrastructureEventKind::InstanceLaunched {
+                instance: instance.clone(),
+            },
+        },
+    }];
+    let mut world = World::default();
+    world.properties.push(properties(&pass.policy, vec![]));
+    world.passes.push(pass);
+    world.infrastructure = records;
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let frame = fill(&mut builder, &blank(), 1, &world, 2, ok(0))?;
+    assert!(frame.instances[0].infrastructure.is_none());
+    assert!(
+        matches!(&frame.status_events[0].change, EventChange::Aws { event } if matches!(&event.kind, AwsEventKind::InstanceLaunched { .. }))
+    );
+    Ok(())
+}
+
+#[test]
+fn newest_risk_notice_wins_independent_of_record_order() -> TestResult {
+    use gang_spi::{
+        FleetInfrastructureEvent, InfrastructureEvent, InfrastructureEventKind,
+        InfrastructureInterruptionAction,
+    };
+    let instance = instance_id(1)?;
+    let mut pass = FleetPass::new(policy("alpha", 0, 4)?);
+    pass.supply
+        .instances
+        .push(fleet_instance(&instance, InstanceLifecycle::InService, 1));
+    let fleet = FleetName::try_new("alpha")?;
+    let notice = |id: &str, at, kind| FleetInfrastructureEvent {
+        fleet: fleet.clone(),
+        event: InfrastructureEvent {
+            id: id.into(),
+            at: ts(at),
+            kind,
+        },
+    };
+    let mut world = World::default();
+    world.properties.push(properties(&pass.policy, vec![]));
+    world.passes.push(pass);
+    world.infrastructure = vec![
+        notice(
+            "new",
+            3,
+            InfrastructureEventKind::SpotInterruption {
+                instance: instance.clone(),
+                action: InfrastructureInterruptionAction::Terminate,
+            },
+        ),
+        notice(
+            "old",
+            2,
+            InfrastructureEventKind::RebalanceRecommendation {
+                instance: instance.clone(),
+            },
+        ),
+    ];
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    for _ in 0..2 {
+        let frame = fill(&mut builder, &blank(), 1, &world, 4, ok(0))?;
+        let status = frame.instances[0]
+            .infrastructure
+            .as_ref()
+            .ok_or("missing risk")?;
+        assert_eq!(
+            status.reason,
+            gang_wire::InfrastructureReason::SpotInterruption
+        );
+        world.infrastructure.reverse();
+    }
+    Ok(())
+}
+
+#[test]
+fn terminating_members_do_not_create_an_unpaired_overshoot() -> TestResult {
+    use gang_spi::{FleetInfrastructureEvent, InfrastructureEvent, InfrastructureEventKind};
+    let old = instance_id(1)?;
+    let new = instance_id(2)?;
+    let mut pass = FleetPass::new(policy("alpha", 0, 4)?);
+    pass.supply.requested = Some(1);
+    pass.supply.instances = vec![
+        fleet_instance(&old, InstanceLifecycle::Terminating, 3),
+        fleet_instance(&new, InstanceLifecycle::InService, 2),
+    ];
+    let mut world = World::default();
+    world.properties.push(properties(&pass.policy, vec![]));
+    world.passes.push(pass);
+    world.infrastructure = vec![FleetInfrastructureEvent {
+        fleet: FleetName::try_new("alpha")?,
+        event: InfrastructureEvent {
+            id: "launch".into(),
+            at: ts(2),
+            kind: InfrastructureEventKind::ReplacementLaunched {
+                instance: new.clone(),
+                replacing: None,
+            },
+        },
+    }];
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let frame = fill(&mut builder, &blank(), 1, &world, 4, ok(0))?;
+    let replacement = frame
+        .instances
+        .iter()
+        .find(|row| row.name == instance_name(&new))
+        .ok_or("missing replacement")?;
+    assert!(replacement.infrastructure.is_none());
+    Ok(())
+}
+
+mod repeated_rebalance {
+    use std::error::Error;
+
+    use gang_reconciler::FleetPass;
+    use gang_spi::{
+        FleetInfrastructureEvent, FleetSupply, InfrastructureEvent, InfrastructureEventKind,
+        InfrastructureInterruptionAction, InfrastructureTerminationReason,
+    };
+    use gang_state::Builder;
+    use gang_testkit::{TestResult, worker_on};
+    use gang_types::{FleetName, InstanceId, InstanceLifecycle};
+    use gang_wire::{AwsEventKind, EventChange, InfrastructurePhase, InfrastructureReason, State};
+
+    use super::{World, fill, find_worker, instance_name, ok};
+    use crate::support::{
+        blank, config, fleet_instance, instance_id, policy, properties, ts, worker_state,
+    };
+
+    fn observation(
+        id: &str,
+        at: u64,
+        kind: InfrastructureEventKind,
+    ) -> Result<FleetInfrastructureEvent, Box<dyn Error>> {
+        Ok(FleetInfrastructureEvent {
+            fleet: FleetName::try_new("alpha")?,
+            event: InfrastructureEvent {
+                id: id.into(),
+                at: ts(at),
+                kind,
+            },
+        })
+    }
+
+    fn launch(
+        id: &str,
+        at: u64,
+        instance: &InstanceId,
+        replacing: Option<InstanceId>,
+    ) -> Result<FleetInfrastructureEvent, Box<dyn Error>> {
+        observation(
+            id,
+            at,
+            InfrastructureEventKind::ReplacementLaunched {
+                instance: instance.clone(),
+                replacing,
+            },
+        )
+    }
+
+    fn termination(
+        id: &str,
+        at: u64,
+        instance: &InstanceId,
+        reason: InfrastructureTerminationReason,
+    ) -> Result<FleetInfrastructureEvent, Box<dyn Error>> {
+        observation(
+            id,
+            at,
+            InfrastructureEventKind::InstanceTerminated {
+                instance: instance.clone(),
+                reason,
+            },
+        )
+    }
+
+    fn assert_pair(frame: &State, id: &str, old: &InstanceId, new: &InstanceId) -> TestResult {
+        let event = frame
+            .status_events
+            .iter()
+            .find_map(|row| match &row.change {
+                EventChange::Aws { event } if event.id == id => Some(event),
+                _ => None,
+            })
+            .ok_or("replacement launch missing from status history")?;
+        assert!(
+            matches!(&event.kind, AwsEventKind::ReplacementLaunched { instance, replacing: Some(peer) }
+                if instance == &instance_name(new) && peer == &instance_name(old))
+        );
+        Ok(())
+    }
+
+    fn sequential_world(
+        first: &InstanceId,
+        second: &InstanceId,
+        with_risk: bool,
+        reason: InfrastructureTerminationReason,
+    ) -> Result<World, Box<dyn Error>> {
+        let policy = policy("alpha", 0, 4)?;
+        let mut world = World::default();
+        world.properties.push(properties(&policy, vec![]));
+        world.policies.push(policy);
+        world.supplies.push(FleetSupply {
+            desired: 1,
+            requested: Some(1),
+            instances: vec![fleet_instance(second, InstanceLifecycle::InService, 2)],
+            ..FleetSupply::default()
+        });
+        world.snapshot.workers = vec![worker_state(&worker_on(second)?, "alpha", 0, false, None)?];
+        world.infrastructure = vec![
+            launch("first-launch", 2, second, None)?,
+            termination("first-termination", 3, first, reason)?,
+        ];
+        if with_risk {
+            world.infrastructure.push(observation(
+                "first-risk",
+                1,
+                InfrastructureEventKind::RebalanceRecommendation {
+                    instance: first.clone(),
+                },
+            )?);
+        }
+        Ok(world)
+    }
+
+    fn begin_second_rebalance(
+        world: &mut World,
+        second: &InstanceId,
+        third: &InstanceId,
+        with_risk: bool,
+    ) -> TestResult {
+        if with_risk {
+            world.infrastructure.extend([
+                observation(
+                    "second-risk",
+                    5,
+                    InfrastructureEventKind::RebalanceRecommendation {
+                        instance: second.clone(),
+                    },
+                )?,
+                observation(
+                    "second-interruption",
+                    6,
+                    InfrastructureEventKind::SpotInterruption {
+                        instance: second.clone(),
+                        action: InfrastructureInterruptionAction::Terminate,
+                    },
+                )?,
+            ]);
+        }
+        world
+            .infrastructure
+            .push(launch("second-launch", 7, third, None)?);
+        world.supplies[0].desired = 2;
+        world.supplies[0]
+            .instances
+            .push(fleet_instance(third, InstanceLifecycle::InService, 7));
+        world
+            .snapshot
+            .workers
+            .push(worker_state(&worker_on(third)?, "alpha", 0, false, None)?);
+        Ok(())
+    }
+
+    fn assert_sequential_overlap(
+        overlap: &State,
+        second: &InstanceId,
+        third: &InstanceId,
+        with_risk: bool,
+    ) -> TestResult {
+        let old = find_worker(overlap, &worker_on(second)?)
+            .and_then(|worker| worker.infrastructure.as_ref())
+            .ok_or("missing replacing worker")?;
+        assert_eq!(old.phase, InfrastructurePhase::Replacing);
+        assert_eq!(
+            old.reason,
+            if with_risk {
+                InfrastructureReason::SpotInterruption
+            } else {
+                InfrastructureReason::SpotRebalance
+            }
+        );
+        assert_eq!(
+            find_worker(overlap, &worker_on(third)?)
+                .and_then(|worker| worker.infrastructure.as_ref())
+                .map(|status| &status.phase),
+            Some(&InfrastructurePhase::Replacement)
+        );
+        Ok(())
+    }
+
+    fn assert_restarted_overlap(
+        world: &World,
+        overlap: &State,
+        second: &InstanceId,
+        third: &InstanceId,
+    ) -> TestResult {
+        let mut restarted = Builder::new(config(), gang_state::CacheBaseline::default());
+        let replayed = fill(&mut restarted, &blank(), 1, world, 8, ok(0))?;
+        assert_eq!(replayed.status_events, overlap.status_events);
+        for member in [second, third] {
+            assert_eq!(
+                find_worker(&replayed, &worker_on(member)?)
+                    .and_then(|worker| worker.infrastructure.as_ref()),
+                find_worker(overlap, &worker_on(member)?)
+                    .and_then(|worker| worker.infrastructure.as_ref())
+            );
+        }
+        Ok(())
+    }
+
+    fn assert_completed_history(
+        finished: &State,
+        world: &World,
+        first: &InstanceId,
+        second: &InstanceId,
+        third: &InstanceId,
+    ) -> TestResult {
+        assert_pair(finished, "first-launch", first, second)?;
+        assert_pair(finished, "second-launch", second, third)?;
+        assert!(
+            finished
+                .workers
+                .iter()
+                .all(|worker| worker.infrastructure.is_none())
+        );
+        assert!(
+            finished
+                .instances
+                .iter()
+                .all(|row| row.infrastructure.is_none())
+        );
+        assert!(world.infrastructure.iter().all(|record| {
+            !matches!(
+                &record.event.kind,
+                InfrastructureEventKind::ReplacementLaunched {
+                    replacing: Some(_),
+                    ..
+                }
+            )
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn sequential_rebalances_preserve_pairs_and_current_roles_in_either_record_order() -> TestResult
+    {
+        let first = instance_id(1)?;
+        let second = instance_id(2)?;
+        let third = instance_id(3)?;
+        for reverse in [false, true] {
+            for with_risk in [false, true] {
+                let reason = if with_risk {
+                    InfrastructureTerminationReason::SpotReclaimed
+                } else {
+                    InfrastructureTerminationReason::Rebalance
+                };
+                let mut world = sequential_world(&first, &second, with_risk, reason.clone())?;
+                if reverse {
+                    world.infrastructure.reverse();
+                }
+                let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+                let completed = fill(&mut builder, &blank(), 1, &world, 4, ok(0))?;
+                assert_pair(&completed, "first-launch", &first, &second)?;
+                assert!(completed.workers[0].infrastructure.is_none());
+                if reverse {
+                    world.infrastructure.reverse();
+                }
+                begin_second_rebalance(&mut world, &second, &third, with_risk)?;
+                if reverse {
+                    world.infrastructure.reverse();
+                }
+                let overlap = fill(&mut builder, &completed, 2, &world, 8, ok(0))?;
+                assert_pair(&overlap, "first-launch", &first, &second)?;
+                assert_pair(&overlap, "second-launch", &second, &third)?;
+                assert_sequential_overlap(&overlap, &second, &third, with_risk)?;
+                assert_restarted_overlap(&world, &overlap, &second, &third)?;
+                if reverse {
+                    world.infrastructure.reverse();
+                }
+                world
+                    .infrastructure
+                    .push(termination("second-termination", 9, &second, reason)?);
+                world.supplies[0].desired = 1;
+                world.supplies[0].instances.remove(0);
+                world.snapshot.workers.remove(0);
+                if reverse {
+                    world.infrastructure.reverse();
+                }
+                let finished = fill(&mut builder, &overlap, 3, &world, 10, ok(0))?;
+                assert_completed_history(&finished, &world, &first, &second, &third)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn ambiguous_world() -> Result<World, Box<dyn Error>> {
+        let mut pass = FleetPass::new(policy("alpha", 0, 8)?);
+        pass.supply.desired = 5;
+        pass.supply.requested = Some(4);
+        pass.supply.instances = vec![
+            fleet_instance(&instance_id(2)?, InstanceLifecycle::InService, 2),
+            fleet_instance(&instance_id(3)?, InstanceLifecycle::InService, 2),
+            fleet_instance(&instance_id(4)?, InstanceLifecycle::InService, 1),
+            fleet_instance(&instance_id(5)?, InstanceLifecycle::InService, 1),
+            fleet_instance(&instance_id(6)?, InstanceLifecycle::InService, 7),
+        ];
+        let mut world = World::default();
+        world.properties.push(properties(&pass.policy, vec![]));
+        world.passes.push(pass);
+        world.infrastructure = vec![
+            launch("prior-launch", 2, &instance_id(2)?, None)?,
+            launch("other-prior-launch", 2, &instance_id(3)?, None)?,
+            termination(
+                "prior-termination",
+                3,
+                &instance_id(1)?,
+                InfrastructureTerminationReason::Rebalance,
+            )?,
+            termination(
+                "other-prior-termination",
+                4,
+                &instance_id(8)?,
+                InfrastructureTerminationReason::Rebalance,
+            )?,
+            observation(
+                "current-risk",
+                6,
+                InfrastructureEventKind::RebalanceRecommendation {
+                    instance: instance_id(5)?,
+                },
+            )?,
+            launch("current-launch", 7, &instance_id(6)?, None)?,
+        ];
+        Ok(world)
+    }
+
+    fn assert_uninvolved_members(frame: &State) -> TestResult {
+        for member in [instance_id(2)?, instance_id(3)?, instance_id(4)?] {
+            let row = frame
+                .instances
+                .iter()
+                .find(|row| row.name == instance_name(&member))
+                .ok_or("missing uninvolved member")?;
+            assert!(row.infrastructure.is_none());
+        }
+        Ok(())
+    }
+
+    fn assert_initial_ambiguous_history(frame: &State) -> TestResult {
+        assert_uninvolved_members(frame)?;
+        for (member, phase) in [
+            (instance_id(5)?, InfrastructurePhase::Replacing),
+            (instance_id(6)?, InfrastructurePhase::Replacement),
+        ] {
+            let row = frame
+                .instances
+                .iter()
+                .find(|row| row.name == instance_name(&member))
+                .ok_or("missing current rebalance member")?;
+            assert_eq!(
+                row.infrastructure.as_ref().map(|status| &status.phase),
+                Some(&phase)
+            );
+        }
+        let current_old = instance_id(5)?;
+        for row in &frame.status_events {
+            if let EventChange::Aws { event } = &row.change {
+                match event.id.as_str() {
+                    "prior-launch" | "other-prior-launch" => assert!(matches!(
+                        &event.kind,
+                        AwsEventKind::ReplacementLaunched {
+                            replacing: None,
+                            ..
+                        }
+                    )),
+                    "current-launch" => assert!(matches!(
+                        &event.kind,
+                        AwsEventKind::ReplacementLaunched { replacing: Some(peer), .. }
+                            if peer == &instance_name(&current_old)
+                    )),
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn add_ambiguous_launch(world: &mut World) -> TestResult {
+        let ambiguous_new = instance_id(7)?;
+        world.passes[0].supply.instances.push(fleet_instance(
+            &ambiguous_new,
+            InstanceLifecycle::InService,
+            7,
+        ));
+        world
+            .infrastructure
+            .push(launch("ambiguous-launch", 7, &ambiguous_new, None)?);
+        Ok(())
+    }
+
+    fn extend_ambiguous_overlap(world: &mut World) -> TestResult {
+        let current_old = instance_id(5)?;
+        let later_new = instance_id(9)?;
+        world.passes[0]
+            .supply
+            .instances
+            .retain(|member| member.id != current_old);
+        world.passes[0].supply.instances.push(fleet_instance(
+            &later_new,
+            InstanceLifecycle::InService,
+            10,
+        ));
+        world.infrastructure.extend([
+            observation(
+                "later-risk",
+                8,
+                InfrastructureEventKind::RebalanceRecommendation {
+                    instance: instance_id(4)?,
+                },
+            )?,
+            termination(
+                "current-termination",
+                9,
+                &current_old,
+                InfrastructureTerminationReason::Rebalance,
+            )?,
+            launch("later-launch", 10, &later_new, None)?,
+        ]);
+        Ok(())
+    }
+
+    fn add_source_pair(world: &mut World) -> TestResult {
+        let known_new = instance_id(10)?;
+        world.passes[0].supply.instances.push(fleet_instance(
+            &known_new,
+            InstanceLifecycle::InService,
+            11,
+        ));
+        world.infrastructure.push(launch(
+            "known-launch",
+            11,
+            &known_new,
+            Some(instance_id(4)?),
+        )?);
+        Ok(())
+    }
+
+    fn assert_unpaired_except(frame: &State, except: Option<&str>) {
+        assert!(frame.status_events.iter().all(|row| {
+            !matches!(&row.change, EventChange::Aws { event }
+                if Some(event.id.as_str()) != except
+                    && matches!(&event.kind, AwsEventKind::ReplacementLaunched { replacing: Some(_), .. }))
+        }));
+    }
+
+    #[test]
+    fn ambiguous_completed_launches_and_bystanders_do_not_inherit_later_overlap() -> TestResult {
+        let current_old = instance_id(5)?;
+        for reverse in [false, true] {
+            let mut world = ambiguous_world()?;
+            if reverse {
+                world.infrastructure.reverse();
+            }
+            let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+            let frame = fill(&mut builder, &blank(), 1, &world, 8, ok(0))?;
+            assert_initial_ambiguous_history(&frame)?;
+            if reverse {
+                world.infrastructure.reverse();
+            }
+            // A second contemporaneous launch removes the inferred pair, not the risk notice.
+            add_ambiguous_launch(&mut world)?;
+            if reverse {
+                world.infrastructure.reverse();
+            }
+            let ambiguous = fill(&mut builder, &frame, 2, &world, 8, ok(0))?;
+            assert_unpaired_except(&ambiguous, None);
+            assert_uninvolved_members(&ambiguous)?;
+            assert_eq!(
+                ambiguous
+                    .instances
+                    .iter()
+                    .find(|row| row.name == instance_name(&current_old))
+                    .and_then(|row| row.infrastructure.as_ref())
+                    .map(|status| &status.phase),
+                Some(&InfrastructurePhase::Replacing)
+            );
+            if reverse {
+                world.infrastructure.reverse();
+            }
+            // One termination cannot finish two launches or let a third steal an old member.
+            extend_ambiguous_overlap(&mut world)?;
+            if reverse {
+                world.infrastructure.reverse();
+            }
+            let overlapping = fill(&mut builder, &ambiguous, 3, &world, 11, ok(0))?;
+            assert_unpaired_except(&overlapping, None);
+            if reverse {
+                world.infrastructure.reverse();
+            }
+            // Source-provided pairing remains authoritative even in an ambiguous episode.
+            add_source_pair(&mut world)?;
+            if reverse {
+                world.infrastructure.reverse();
+            }
+            let known = fill(&mut builder, &overlapping, 4, &world, 12, ok(0))?;
+            assert_pair(&known, "known-launch", &instance_id(4)?, &instance_id(10)?)?;
+            assert_unpaired_except(&known, Some("known-launch"));
+        }
+        Ok(())
+    }
 }

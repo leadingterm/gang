@@ -11,12 +11,12 @@ use std::time::Duration;
 
 use gang_clock::Timestamp;
 use gang_e2e::{
-    AUDIENCE, Admission, BuildOutcome, Channel, ChannelEvent, Control, Credentials,
-    DiskNeighbourReport, E2eError, EventStream, FleetLayout, HOLD_CPU_COUNT, HOLD_MEMORY_KB, Host,
-    Identity, InputLinks, IsolationReport, Issuance, LARGE_FLEET, LIMIT_CPU_PERIOD_MICROS,
-    LIMIT_HEADROOM_PERCENT, LIMIT_MAX_PIDS, NOOP_FLEET, Namespaces, ORGANIZATION, PermitNetwork,
-    PoisonReport, Presenting, Probe, ProbeReport, Reply, Result, Run, SMALL_FLEET, Sandbox,
-    ScopeFacts, SessionCookie, Settings, Signalled, System, TokenSpec, Variant, VictimReport,
+    AUDIENCE, Admission, AttemptRecord, BuildOutcome, Channel, ChannelEvent, Control, Credentials,
+    DiskNeighbourReport, E2eError, EventStream, FleetLayout, HOLD_CPU_COUNT, Host, Identity,
+    InputLinks, IsolationReport, Issuance, LARGE_FLEET, LIMIT_CPU_PERIOD_MICROS, LIMIT_MAX_PIDS,
+    NOOP_FLEET, Namespaces, ORGANIZATION, PermitNetwork, PoisonReport, Presenting,
+    PressureObservation, Probe, ProbeReport, Reply, Result, Run, SMALL_FLEET, Sandbox, ScopeFacts,
+    SessionCookie, Settings, Signalled, System, TokenSpec, Variant, VictimReport,
 };
 use gang_types::{FleetName, InstanceId, WorkerId};
 use gang_wire::routes::{GET_STATE, WATCH_STATE};
@@ -70,8 +70,6 @@ const SIM_SESSION_PREFIX: &str = "sim-session-";
 /// The cgroup directory and the working directory of the hold action.
 const SCOPE_DIRECTORY: &str = "/sim/actions/1";
 const SCOPE_WORKING_DIRECTORY: &str = "/sim/work";
-/// The base of the percentages the memory headroom is taken in.
-const PERCENT: u64 = 100;
 
 behaviour! {
     /// The flaws a [`Simulation`] can have; [`Behaviour::COMPLIANT`] has none.
@@ -213,6 +211,13 @@ behaviour! {
             Finishes,
             /// It fails before it reports.
             Fails,
+        },
+        /// Whether a healthy spike completes on its first attempt.
+        hog: Hog {
+            /// The healthy spike completes without a kill.
+            Uncapped,
+            /// The first attempt is killed and the retry completes.
+            Requeued,
         },
         /// How the memory grower fares under the soft memory layer.
         grower: Grower {
@@ -432,7 +437,7 @@ impl SimFleet {
 }
 
 /// The fleets a deployment of `variant` declares, in preference order.
-fn fleets_of(variant: Variant) -> Vec<SimFleet> {
+fn fleets_of(variant: &Variant) -> Vec<SimFleet> {
     match variant.fleets {
         FleetLayout::Single => vec![SimFleet::new(
             SINGLE_FLEET,
@@ -526,8 +531,10 @@ struct SimState {
     building: u32,
     /// The number of builds begun so far, so an await knows whether one is yet to come.
     builds_started: u32,
-    /// How many attempts the memory grower made in the last build of it.
+    /// How many attempts the most recent memory probe made.
     attempts: usize,
+    /// Probe that made those attempts.
+    attempt_probe: Option<Probe>,
     /// The actions that ran remotely, which the live state counts as completed.
     completed: u64,
     /// Whether the provisioner's supply is held, so that no pass places a queued action.
@@ -545,11 +552,11 @@ struct SimState {
 impl Simulation {
     /// A deployment that is not yet started, under `variant`, behaving as `behaviour` says.
     #[must_use]
-    pub fn new(variant: Variant, behaviour: Behaviour) -> Self {
+    pub fn new(variant: &Variant, behaviour: Behaviour) -> Self {
         let fleets = fleets_of(variant);
         let instances = fleets.iter().map(|_| Vec::new()).collect();
         Self {
-            variant,
+            variant: *variant,
             behaviour,
             fleets,
             state: Mutex::new(SimState {
@@ -569,6 +576,7 @@ impl Simulation {
                 building: 0,
                 builds_started: 0,
                 attempts: 0,
+                attempt_probe: None,
                 completed: 0,
                 supply_held: false,
                 launches_held: false,
@@ -775,7 +783,9 @@ impl Simulation {
             | Probe::ExitThree
             | Probe::Hold
             | Probe::MemoryHog
-            | Probe::MemoryGrower => None,
+            | Probe::MemoryGrower
+            | Probe::PressureVictim
+            | Probe::PressureNeighbour => None,
             Probe::DiskHog => {
                 (self.behaviour.disk == Disk::Ignored).then(|| "hogged=yes\n".to_owned())
             }
@@ -1054,6 +1064,7 @@ pub(crate) fn state_frame(
         instances: Vec::new(),
         actions: None,
         events,
+        status_events: Vec::new(),
         events_limit: EVENTS_LIMIT,
         completed,
         recent: Recent::default(),
@@ -1190,6 +1201,7 @@ impl Simulation {
             paused: false,
             launch_time: at(0),
             phases: Vec::new(),
+            infrastructure: None,
         })
     }
 
@@ -1276,6 +1288,7 @@ impl Simulation {
                 instances: None,
                 actions: None,
                 events,
+                status_events: None,
                 completed: None,
                 recent: None,
                 cache: None,
@@ -1713,19 +1726,15 @@ impl Simulation {
         Ok(BuildOutcome::new(Some(0), Self::summary(1, 0)))
     }
 
-    /// Runs the memory hog: the kernel kills it under [`Limits::Enforced`], and it succeeds
-    /// otherwise.
+    /// Runs the healthy spike once, or simulates an unexpected retry.
     fn memory_hog(&self) -> BuildOutcome {
-        match self.behaviour.limits {
-            Limits::Enforced => BuildOutcome::new(
-                Some(137),
-                format!(
-                    "ERROR: //:memory_hog failed: (Exit 137)\n{}",
-                    Self::summary(1, 0)
-                ),
-            ),
-            Limits::Unlimited => BuildOutcome::new(Some(0), Self::summary(1, 0)),
-        }
+        let mut state = self.state.lock();
+        state.attempts = match self.behaviour.hog {
+            Hog::Requeued => 2,
+            Hog::Uncapped => 1,
+        };
+        state.attempt_probe = Some(Probe::MemoryHog);
+        BuildOutcome::new(Some(0), Self::summary(1, 0))
     }
 
     /// Runs the memory grower: the soft layer kills its first attempt and the scheduler requeues
@@ -1739,6 +1748,7 @@ impl Simulation {
         };
         let mut state = self.state.lock();
         state.attempts = attempts;
+        state.attempt_probe = Some(Probe::MemoryGrower);
         if !completes {
             return BuildOutcome::new(
                 Some(1),
@@ -1755,8 +1765,7 @@ impl Simulation {
     fn scope_facts(&self) -> ScopeFacts {
         let (memory_max, oom_group, cpu_max, pids_max) = match self.behaviour.limits {
             Limits::Enforced => (
-                (HOLD_MEMORY_KB * 1024 * (PERCENT + u64::from(LIMIT_HEADROOM_PERCENT)) / PERCENT)
-                    .to_string(),
+                "max".to_owned(),
                 "1".to_owned(),
                 format!(
                     "{} {}",
@@ -1829,8 +1838,38 @@ impl gang_e2e::Limits for Simulation {
         }
     }
 
-    fn attempts(&self) -> Result<usize> {
-        Ok(self.state.lock().attempts)
+    fn attempt_records(&self) -> Result<Vec<AttemptRecord>> {
+        let state = self.state.lock();
+        let Some(probe) = state.attempt_probe else {
+            return Ok(Vec::new());
+        };
+        let mut memory_kb: u64 = 65_536;
+        Ok((0..state.attempts)
+            .map(|_| {
+                let record = AttemptRecord {
+                    action: probe.as_str().to_owned(),
+                    memory_kb,
+                };
+                memory_kb = memory_kb.saturating_mul(2);
+                record
+            })
+            .collect())
+    }
+
+    fn induce_pressure(
+        &self,
+        _victim_pid: u32,
+        _neighbour_pid: u32,
+    ) -> Result<PressureObservation> {
+        Ok(PressureObservation {
+            victim_peak_kb: 192 * 1024,
+            victim_killed: true,
+            neighbour_alive: true,
+        })
+    }
+
+    fn await_pool_oom(&self, _victim_pid: u32, _neighbour_pid: u32) -> Result<u64> {
+        Ok(1)
     }
 
     fn orphan_alive(&self) -> Result<bool> {

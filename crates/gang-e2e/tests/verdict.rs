@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use gang_clock::Timestamp;
 use gang_e2e::verdict;
 use gang_e2e::{
-    BuildOutcome, Check, HOLD_CPU_COUNT, HOLD_MEMORY_KB, Host, InputLinks, InputRootReport,
-    IsolationReport, LIMIT_CPU_PERIOD_MICROS, LIMIT_HEADROOM_PERCENT, LIMIT_MAX_PIDS, Namespaces,
-    Outcome, PermitNetwork, PoisonReport, Sandbox, ScopeFacts, VictimReport, names,
+    BuildOutcome, Check, HOLD_CPU_COUNT, Host, InputLinks, InputRootReport, IsolationReport,
+    LIMIT_CPU_PERIOD_MICROS, LIMIT_MAX_PIDS, Namespaces, Outcome, PermitNetwork, PoisonReport,
+    Sandbox, ScopeFacts, VictimReport, names,
 };
 use gang_types::{FleetName, InstanceId, WorkerId};
 use gang_wire::{Event, EventChange, name};
@@ -732,8 +732,7 @@ fn limited_scope() -> ScopeFacts {
     ScopeFacts {
         directory: PathBuf::from("/sys/fs/cgroup/action"),
         working_directory: PathBuf::from("/sim/work"),
-        memory_max: (HOLD_MEMORY_KB * 1024 * u64::from(100 + LIMIT_HEADROOM_PERCENT) / 100)
-            .to_string(),
+        memory_max: "max".to_owned(),
         oom_group: "1".to_owned(),
         cpu_max: format!(
             "{} {}",
@@ -758,13 +757,13 @@ fn scope_limits_pass_for_the_configured_limits() {
 }
 
 #[test]
-fn scope_limits_fail_an_unlimited_memory_max() {
+fn scope_limits_fail_a_reservation_derived_memory_max() {
     let facts = ScopeFacts {
-        memory_max: "max".to_owned(),
+        memory_max: "134217728".to_owned(),
         ..limited_scope()
     };
     let checks = verdict::scope_limits(&facts);
-    assert!(failure(named(&checks, names::limits::MEMORY_MAX)).contains("found `max`"));
+    assert!(failure(named(&checks, names::limits::MEMORY_MAX)).contains("found `134217728`"));
     assert!(named(&checks, names::limits::OOM_GROUP).is_passed());
     assert!(named(&checks, names::limits::CPU_MAX).is_passed());
     assert!(named(&checks, names::limits::PIDS_MAX).is_passed());
@@ -801,56 +800,6 @@ fn scope_limits_fail_an_unlimited_pids_max() {
     let checks = verdict::scope_limits(&facts);
     assert!(failure(named(&checks, names::limits::PIDS_MAX)).contains("found `max`"));
     assert!(named(&checks, names::limits::CPU_MAX).is_passed());
-}
-
-#[test]
-fn hard_ceiling_passes_when_the_action_is_killed_with_137() {
-    let check = verdict::hard_ceiling(&build(Some(1), "ERROR: action failed: (Exit 137)"), TAIL);
-    assert!(check.is_passed());
-}
-
-#[test]
-fn hard_ceiling_passes_when_bazel_reports_killed() {
-    let check = verdict::hard_ceiling(
-        &build(
-            Some(1),
-            "ERROR: /tmp/x/workspace/BUILD.bazel:99:6: Probing //:memory_hog failed: (Killed): sh failed: error executing E2eProbe command (from target //:memory_hog)",
-        ),
-        TAIL,
-    );
-    assert!(check.is_passed());
-}
-
-#[test]
-fn hard_ceiling_fails_when_the_build_succeeded() {
-    let check = verdict::hard_ceiling(&build(Some(0), "(Exit 137)"), TAIL);
-    assert!(failure(&check).contains("the build succeeded"));
-}
-
-#[test]
-fn hard_ceiling_fails_for_another_exit_code() {
-    let check = verdict::hard_ceiling(&build(Some(1), "ERROR: action failed: (Exit 1)"), TAIL);
-    assert!(failure(&check).contains("no action was reported killed"));
-}
-
-#[test]
-fn hard_ceiling_failure_detail_includes_the_build_output() {
-    let check = verdict::hard_ceiling(
-        &build(
-            Some(1),
-            "ERROR: Build failed\nERROR: no space left on device\n",
-        ),
-        TAIL,
-    );
-    let detail = failure(&check);
-    assert!(detail.contains("the build said:"));
-    assert!(detail.contains("ERROR: no space left on device"));
-}
-
-#[test]
-fn hard_ceiling_does_not_match_a_longer_code() {
-    let check = verdict::hard_ceiling(&build(Some(1), "ERROR: action failed: (Exit 1370)"), TAIL);
-    assert!(failure(&check).contains("no action was reported killed"));
 }
 
 const DISK_KILL: &str = "ERROR: /tmp/x/BUILD.bazel:20:6: Probing //:disk_hog failed: action exceeded its disk reservation: reserved 4096 KiB (disk_kb), limit 4915 KiB with 20% headroom, its own files came to 65536 KiB. Raise the reservation or write less.";
@@ -1226,4 +1175,50 @@ fn noop_fleet_isolation_is_skipped_when_the_host_is_unreadable() {
     let observed = namespaces(HOST_NET, HOST_MNT);
     let check = verdict::noop_fleet_unisolated(Sandbox::Bwrap, &unreadable, &observed);
     assert!(check.is_skipped());
+}
+
+#[test]
+fn pool_oom_requires_kernel_evidence_and_one_escalated_retry() {
+    use gang_e2e::{AttemptRecord, pool_oom_verdicts};
+    let records = [
+        AttemptRecord {
+            action: "pressure_victim".to_owned(),
+            memory_kb: 65_536,
+        },
+        AttemptRecord {
+            action: "pressure_neighbour".to_owned(),
+            memory_kb: 327_680,
+        },
+        AttemptRecord {
+            action: "pressure_victim".to_owned(),
+            memory_kb: 245_760,
+        },
+    ];
+    let checks = pool_oom_verdicts(1, true, &records, 250, 458_752);
+    assert!(checks.iter().all(Check::is_passed));
+    assert!(pool_oom_verdicts(0, true, &records, 250, 458_752)[0].is_failure());
+    assert!(pool_oom_verdicts(1, false, &records, 250, 458_752)[1].is_failure());
+    assert!(pool_oom_verdicts(1, true, &records[..2], 250, 458_752)[1].is_failure());
+    let mut wrong = records.clone();
+    wrong[2].memory_kb = 70_000;
+    assert!(pool_oom_verdicts(1, true, &wrong, 250, 458_752)[1].is_failure());
+    let neighbour_retry = [
+        AttemptRecord {
+            action: "pressure_victim".to_owned(),
+            memory_kb: 65_536,
+        },
+        AttemptRecord {
+            action: "pressure_neighbour".to_owned(),
+            memory_kb: 327_680,
+        },
+        AttemptRecord {
+            action: "pressure_neighbour".to_owned(),
+            memory_kb: 458_752,
+        },
+    ];
+    assert!(
+        pool_oom_verdicts(1, true, &neighbour_retry, 250, 458_752)
+            .iter()
+            .all(Check::is_passed)
+    );
 }

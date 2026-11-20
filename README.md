@@ -1,6 +1,6 @@
 # Gang
 
-Gang runs Bazel remote execution on workers that exist only while there is work. One `gang` binary embeds the NativeLink scheduler as a library, authenticates callers with the plugins chosen in `gang.toml` (a short-lived bearer token for people and CI, mutual TLS for workers), reconciles named worker fleets from queued demand, and runs every action in a sandbox. Every backend (provisioner, cache, signer, scheduler, database, sandbox, identity provider, client and worker authentication, action limits) is a plugin composed at compile time and chosen by writing its section in `gang.toml`.
+Gang runs Bazel remote execution on workers that exist only while there is work. One `gang` binary includes the Gang scheduler, authenticates callers with the plugins chosen in `gang.toml` (a short-lived bearer token for people and CI, mutual TLS for workers), reconciles named worker fleets from queued demand, and runs every action in a sandbox. Provisioner, cache, signer, database, sandbox, identity provider, client and worker authentication, and action limits backends are composed at compile time and chosen by writing their sections in `gang.toml`; the scheduler is built in and has no backend choice.
 
 ## Commands
 
@@ -38,9 +38,11 @@ nix develop -c bazel build //...
 nix develop -c bazel test //...
 ```
 
-CI is the merge gate: `ci.yml` runs on every pull request, including drafts and updates, pushes to `main` and `master`, and manual dispatch. Only documentation-only pull requests skip heavy jobs; pushes to `main` or `master` and manual runs get full validation. Ordinary docs and notes Markdown is allowlisted, but `docs/API.md` and `docs/PLAN.md` are live test inputs and run heavy jobs. Superseded PR and branch runs are cancelled. Public CI uses GitHub's free standard runners; private CI uses ephemeral RunsOn Linux runners with 4 CPUs and 16 GB RAM and skips unsupported macOS, which public CI validates before release. x86 runs the full Linux suite; native ARM and macOS run targeted tests, with real end-to-end gates on ARM and Darwin Clippy covering every Cargo target on Linux. For work-in-progress branches without an open PR, use focused local checks; open a draft PR for CI feedback. Require a successful `required` check on the latest PR revision before merging. The workflow tests a synthetic merge checkout, uses read-only contents permission, no secrets and no OIDC. See [specification §7.1](docs/SPECIFICATION.md#71-continuous-integration) for the exact checks, skip policy, runners and caches.
+CI is the merge gate: `ci.yml` runs on every pull request, including drafts and updates, pushes to `main` and `master` and `v*` tags, and manual dispatch. Only documentation-only pull requests skip heavy jobs; `docs/API.md` and `docs/PLAN.md` are live test inputs and do not qualify. The PR critical path is exclusively x86-64: portable lint, Nix VM checks, the complete partitioned Linux test suite, a parallel binary and harness bundle build, and parallel end-to-end gates. ARM, cross and macOS validation run only on default-branch pushes and version tags and gate release artifact reuse through `release-validation`; private RunsOn repositories retain the unsupported-macOS exception. Superseded PR and branch runs are cancelled. Public CI uses GitHub's free standard runners; private CI uses ephemeral RunsOn Linux runners with 4 CPUs and 16 GB RAM. Require a successful `required` check on the latest PR revision before merging. CI uses read-only contents permission, no secrets, no OIDC and no Gang farm. See [specification §7.1](docs/SPECIFICATION.md#71-continuous-integration) for exact checks, skip policy, runners and cache budgets.
 
-Portable lint runs `tools/check-required-jobs_test.sh` once; its first case runs the structural guard on the actual workflow, and subsequent cases exercise added and dropped jobs, status gating and conditional aggregator rejection. The guard checks unconditional `always()` and complete dependencies for each aggregator, protecting the public seven-check policy through `lint`; the docs-only allowlist cannot change CI or its scripts. Run the test locally with `nix develop -c tools/check-required-jobs_test.sh`. `tools/lint.sh --portable` and `tools/lint.sh --nix-vm` select the two lint partitions; on x86, `tools/lint.sh` runs both. Remote ARM execution and cross-target toolchains are described in [specification §8.4](docs/SPECIFICATION.md#84-nixos-images).
+The complete x86 test suite uses four shards. Each end-to-end gate uses eight deterministic, warm-timing-balanced shards with four parallel scenarios per harness: all 28 Gate 1 scenarios and the 21 Gate 2 additions run without reduced checks or repeated Gate 1 coverage. The binary and harness still build from source and upload separately; only their redundant cache working-set export is removed, with build BEP/profile artifacts retained even on failure. The nonrequired cache fan-in merges the four test-shard exports plus lint. Five-minute warm CI and two-minute whole E2E jobs remain targets pending real workflow measurements.
+
+Portable lint runs `bazel run //:gazelle.check`, infrastructure and workflow validation, and the behavioral guards, including `tools/check-required-jobs_test.sh`. Rustfmt and Clippy for every x86 Rust target, tests included, run in the full test shards rather than recompiling the workspace in lint; portable lint has a three-minute budget. Darwin all-target Clippy belongs to macOS release validation, not the PR gate. `tools/lint.sh --portable` and `tools/lint.sh --nix-vm` select the two local lint partitions; on x86 Linux, `tools/lint.sh` runs both. The required-jobs guard checks fail-closed status aggregation and dependency coverage. Run it locally with `nix develop -c tools/check-required-jobs_test.sh`. Cross-target toolchains are described in [specification §8.4](docs/SPECIFICATION.md#84-nixos-images).
 
 OpenTofu provider ZIPs are checksum-pinned in `MODULE.bazel` and fetched through
 Bazel's repository cache, so separate output bases can reuse the downloads. When
@@ -70,11 +72,15 @@ gang setup --server https://gang.example.com
 
 Setup writes Gang-owned files under `.gang/` and one `try-import` line in `.bazelrc`, safe to commit; it shows every change first (`--dry-run` only previews, `--yes` applies for scripts). `gang bazelrc` remains the printing primitive for scripts and isolated rc files.
 
-TLS Local Mode (`gang local up` without `--insecure`) accepts client tokens only from the providers in `[authentication.clients.token] providers`. Add an interactive provider (specification section 1.3) before you `gang login` to it. Run the end-to-end harness from this checkout with `nix develop -c bazel run //crates/gang-e2e:local -- --gate 1` (specification section 6.5). The `gang` binary and pinned Bazel come from the harness's runfiles; `--gang` and `--bazel` override them. `nix develop -c tools/gate.sh` is an equivalent local diagnostic, not a mandatory duplicate of the CI merge gate: it runs both CI lint partitions (`tools/lint.sh`, Clippy of every Cargo target for macOS included), the full workspace and the end-to-end gates on one x86 Linux host (specification section 7). Every Rust target, tests included, is linted with the one lint policy in `[workspace.lints]` of `Cargo.toml`.
+Generated rc files use `--remote_download_outputs=toplevel`: requested build artifacts and test outputs remain local, while unused intermediate outputs stay in the remote cache. `bazel run` still downloads what it needs to run locally. Pass Bazel's own `--remote_download_outputs=all` flag when you need every intermediate output.
+
+TLS Local Mode (`gang local up` without `--insecure`) accepts client tokens only from the providers in `[authentication.clients.token] providers`. Add an interactive provider (specification section 1.3) before you `gang login` to it. Run the end-to-end harness from this checkout with `nix develop -c bazel run //crates/gang-e2e:local -- --gate 1` (specification section 6.5). The `gang` binary and pinned Bazel come from the harness's runfiles; `--gang` and `--bazel` override them. `nix develop -c tools/gate.sh` mirrors the x86 PR coverage on one x86 Linux host: both local lint partitions, the full workspace, the binary and harness bundle, and every end-to-end gate scenario (specification section 7). It is an optional local diagnostic, not a mandatory duplicate of CI, and does not run Darwin Clippy. Every Rust target, tests included, uses the lint policy in `[workspace.lints]` of `Cargo.toml`.
 
 The harness settings `startup_timeout` and `command_timeout` default to `2m`; `build_timeout`
 defaults to `30m` for each Bazel invocation, including shutdown. `handshake_timeout` defaults to
 `5s` and bounds connection setup.
+
+Gang-issued client tokens and local workload proofs accept a minimum TTL of `20s`; AWS STS workload proofs retain their `60s` minimum. Defaults remain `10m` for client tokens and `15m` for workload proofs. The browser sessions E2E fixture uses `25s` tokens and a `60s` absolute session age; this changes neither production defaults nor expiry/renewal coverage. Its 60-second shard weight is provisional until a new workflow measures it.
 
 ## Deploying
 
@@ -82,9 +88,20 @@ Gang is deployed from a separate repository that calls its modules and reusable 
 
 The deployment module defaults to `database.engine = "sqlite"` for one controller. Choose `postgres` or `dynamodb` for one or several controllers behind load balancers; shared engines require a shared S3 cache. See the [configuration reference](docs/SPECIFICATION.md) for the settings.
 
+Action scheduling and resource policy are configured under `[actions]`,
+`[actions.memory]`, `[actions.disk]`, and `[actions.cold_start]`. Memory
+pressure enforcement uses a worker-wide action pool; `reserve` keeps memory
+outside that pool and sets its shortage watermark. By default, a kill requires
+10% PSI stalls and available pool memory below the configured reserve together
+for 5 seconds. After a pressure kill, the worker waits for the victim's cleanup,
+rechecks available space, and requires a fresh continuous pressure window.
+Each fleet must fit the configured minimum reservations and must have more
+memory than the reserve. See specification §3.2 for the full field reference and
+defaults.
+
 ```hcl
 module "gang" {
-  source = "git::https://github.com/example-org/gang//infra/terraform/modules/deployment?ref=v0.3.2"
+  source = "git::https://github.com/example-org/gang//infra/terraform/modules/deployment?ref=v0.3.3"
   # variables as in the example root
 }
 ```
@@ -93,7 +110,7 @@ Call `.github/workflows/deploy.yml` as its header comment shows, pinned to the s
 
 The apply job uses the `production` GitHub environment by default. Set `apply_environment` to a different name to use that environment, or explicitly to `''` to run without one. Without an environment there are no environment protection rules or environment secrets; the apply role's OIDC trust must instead match the `main` branch subject. See the deployment contract for the trust policy.
 
-Every `v*` tag has a GitHub release with `gang-x86_64-unknown-linux-musl`, `gang-aarch64-unknown-linux-musl`, `gang-aarch64-apple-darwin`, disk images for x86_64 and aarch64, and `SHA256SUMS`. Public AMIs of each architecture in every image region are listed in `gang-amis.json` (specification section 7.2). Check downloaded assets with `sha256sum --check --ignore-missing SHA256SUMS`, and pin the binary checksum where you deploy it.
+Every `v*` tag has a GitHub release with Linux binaries, disk images for x86_64 and aarch64, and `SHA256SUMS`; the macOS binary is included when available. Release dry runs and tags require successful `required` and `release-validation` checks from a same-repository push to `main` for the exact commit, never PR artifacts or caches. `gang-amis.json` lists the primary publication regions only; remaining public AMI copies and lifecycle work run independently (specification section 7.2). Deployment uses verified checksums and a provider-region AMI lookup, not the manifest. Check downloaded assets with `sha256sum --check --ignore-missing SHA256SUMS`, and pin the binary checksum where you deploy it.
 
 See section 8 of [`docs/SPECIFICATION.md`](docs/SPECIFICATION.md) for the deployment contract, and the example root [`infra/terraform/environments/example`](infra/terraform/environments/example).
 
@@ -122,6 +139,5 @@ The usual cause is a `~/.bazelrc`, an imported rc file, or a `--config` that set
 
 ## License
 
-Gang's source is licensed under the [Apache License 2.0](LICENSE); see [NOTICE](NOTICE).
+Gang's source is licensed under the [Apache License 2.0](LICENSE). Distributed binaries include third-party code under additional licenses with use restrictions; see [NOTICE](NOTICE) for terms and attribution.
 
-The `gang` binary links the NativeLink crates, which are licensed under the Functional Source License, Version 1.1, Apache 2.0 Future License (FSL-1.1-ALv2). That license permits any use except a Competing Use (making NativeLink available to others in a commercial product or service that substitutes for it), and it converts each release to Apache 2.0 two years after the release ships; for v1.8.3, the version Gang embeds, that is 2028-10-28. [NOTICE](NOTICE) names the license text and every third-party component. Gang carries a NativeLink fork whose changes are listed in the [specification](docs/SPECIFICATION.md#32-scheduler-gang-nativelink).

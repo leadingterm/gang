@@ -33,7 +33,7 @@ fn knob(execution: ExecutionKnobs) -> Variant {
 /// Runs the action-timeout scenario using bwrap.
 fn bwrap_timeout(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
     let sim = ExecSim::new(
-        scoped(
+        &scoped(
             Sandbox::Bwrap,
             SoftMemory::Enforced,
             ExecutionKnobs::SHORT_TIMEOUT,
@@ -46,7 +46,7 @@ fn bwrap_timeout(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
 /// Runs the action-timeout scenario using noop and checks exit signals.
 fn noop_timeout(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
     let sim = ExecSim::new(
-        scoped(
+        &scoped(
             Sandbox::Noop,
             SoftMemory::Enforced,
             ExecutionKnobs::SHORT_TIMEOUT,
@@ -61,7 +61,7 @@ fn noop_timeout(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
 /// Runs the sandbox contract scenario.
 fn contract(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
     let sim = ExecSim::new(
-        scoped(Sandbox::Bwrap, SoftMemory::Off, ExecutionKnobs::NONE),
+        &scoped(Sandbox::Bwrap, SoftMemory::Off, ExecutionKnobs::NONE),
         behaviour,
     );
     sandbox_contract(&sim, &sim, sim.stderr_tail_lines())
@@ -70,7 +70,7 @@ fn contract(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
 /// Runs the stale-scope scenario.
 fn stale(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
     let sim = ExecSim::new(
-        scoped(Sandbox::Noop, SoftMemory::Off, ExecutionKnobs::NONE),
+        &scoped(Sandbox::Noop, SoftMemory::Off, ExecutionKnobs::NONE),
         behaviour,
     );
     stale_scope(
@@ -84,7 +84,7 @@ fn stale(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
 /// Runs the memory-escalation scenario.
 fn escalation(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
     let sim = ExecSim::new(
-        scoped(
+        &scoped(
             Sandbox::Noop,
             SoftMemory::Enforced,
             ExecutionKnobs::ONE_STEP_ESCALATION,
@@ -96,31 +96,31 @@ fn escalation(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
 
 /// Runs the unplaceable disk scenario.
 fn unplaceable(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
-    let sim = ExecSim::new(Variant::baseline(Sandbox::Bwrap), behaviour);
+    let sim = ExecSim::new(&Variant::baseline(Sandbox::Bwrap), behaviour);
     unplaceable_disk(&sim, &sim, sim.stderr_tail_lines())
 }
 
 /// Runs the oversized fleet disk scenario.
 fn oversized(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
-    let sim = ExecSim::new(knob(ExecutionKnobs::OVERSIZED_FLEET), behaviour);
+    let sim = ExecSim::new(&knob(ExecutionKnobs::OVERSIZED_FLEET), behaviour);
     oversized_fleet(&sim, &sim)
 }
 
 /// Runs the cold-start misfit scenario.
 fn cold(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
-    let sim = ExecSim::new(knob(ExecutionKnobs::COLD_START_MISFIT), behaviour);
+    let sim = ExecSim::new(&knob(ExecutionKnobs::COLD_START_MISFIT), behaviour);
     cold_start_misfit(&sim)
 }
 
 /// Runs the preemption scenario.
 fn preempted(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
-    let sim = ExecSim::new(Variant::baseline(Sandbox::Bwrap), behaviour);
+    let sim = ExecSim::new(&Variant::baseline(Sandbox::Bwrap), behaviour);
     preemption(&sim, &sim)
 }
 
 /// Runs the worker-renewal scenario.
 fn renewal_run(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
-    let sim = ExecSim::new(knob(ExecutionKnobs::SHORT_LIVED_CERTIFICATES), behaviour);
+    let sim = ExecSim::new(&knob(ExecutionKnobs::SHORT_LIVED_CERTIFICATES), behaviour);
     worker_renewal(&sim, &sim)
 }
 
@@ -222,11 +222,17 @@ flaw! { contract_worker_env_leaked: contract(worker_env = WorkerEnv::Leaked) => 
 flaw! { contract_tmp_shared: contract(tmp = Tmp::Shared) => only [names::sandbox_contract::TMP_FRESH] }
 flaw! { contract_binds_writable: contract(binds = Binds::Writable) => only [names::sandbox_contract::READONLY_BINDS] }
 flaw! { contract_workdir_read_only: contract(workdir = Workdir::ReadOnly) => only [names::sandbox_contract::WORKDIR_WRITABLE] }
+flaw! { contract_identity_missing: contract(action_environment = ActionEnvironment::Identity) => only [names::sandbox_contract::IDENTITY] }
+flaw! { contract_nss_wrong: contract(action_environment = ActionEnvironment::Nss) => only [names::sandbox_contract::NSS] }
+flaw! { contract_etc_exposed: contract(action_environment = ActionEnvironment::Etc) => only [names::sandbox_contract::ETC_CONTENTS] }
+flaw! { contract_identity_writable: contract(action_environment = ActionEnvironment::Writable) => only [names::sandbox_contract::IDENTITY_ROOTS_READONLY] }
+flaw! { contract_roots_missing: contract(action_environment = ActionEnvironment::Roots) => only [names::sandbox_contract::ROOTS] }
+flaw! { contract_overrides_ignored: contract(action_environment = ActionEnvironment::Override) => only [names::sandbox_contract::ROOTS_OVERRIDE] }
+flaw! { contract_postgres_fails: contract(action_environment = ActionEnvironment::Postgres) => only [names::sandbox_contract::POSTGRES] }
 flaw! { contract_hold_scope_missing: contract(hold_scope = ScopeReport::Missing) => only [names::sandbox_contract::HOLD_HAS_SCOPE] }
 flaw! { contract_bwrap_scope_outside: contract(bwrap_scope = BwrapScope::Outside) => only [names::sandbox_contract::BWRAP_IN_SCOPE] }
 flaw! { contract_exec_scope_in_scope: contract(exec_scope = ExecScope::InScope) => only [names::sandbox_contract::EXEC_OUTSIDE_SCOPE] }
 flaw! { contract_held_fails: contract(held = Held::Fails) => only [names::sandbox_contract::HOLD_COMPLETES] }
-flaw! { contract_oom_kill_spared: contract(oom_kill = OomKill::Spared) => only [names::oom::KILLED] }
 flaw! { contract_oom_scope_left: contract(oom_scope = OomScope::Left) => only [names::oom::SCOPE_REMOVED] }
 flaw! { contract_oom_scope_unobserved: contract(oom_scope = OomScope::Unobserved) => only [names::oom::KILLED, names::oom::SCOPE_REMOVED] }
 flaw! { contract_after_oom_fails: contract(after_oom = AfterOom::Fails) => only [names::oom::SERVING] }
@@ -281,7 +287,7 @@ fn contract_with(fault: Fault) -> gang_e2e::Result<Vec<Check>> {
 /// A started deployment whose operation `fault` fails, for [`held_build`].
 fn started(fault: Fault) -> gang_e2e::Result<ExecSim> {
     let sim = ExecSim::new(
-        knob(ExecutionKnobs::NONE),
+        &knob(ExecutionKnobs::NONE),
         Behaviour {
             fault,
             ..Behaviour::COMPLIANT

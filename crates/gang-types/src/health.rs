@@ -7,24 +7,23 @@ use std::time::Duration;
 /// The health check every load-balancer target group runs against a controller's health listener.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealthCheck {
-    serve_path: &'static str,
-    leader_path: &'static str,
+    ready_path: &'static str,
     interval: Duration,
     timeout: Duration,
     threshold: NonZeroU32,
 }
 
 impl HealthCheck {
-    /// The path the serve frontend checks: 200 while the controller serves.
+    /// The readiness path: 200 only when the controller can serve client and worker traffic.
     #[must_use]
-    pub const fn serve_path(&self) -> &'static str {
-        self.serve_path
+    pub const fn ready_path(&self) -> &'static str {
+        self.ready_path
     }
 
-    /// The path the execute and workers frontends check: 200 only on the leader.
+    /// Deployment health path during the transition from `/leader` to `/ready`.
     #[must_use]
-    pub const fn leader_path(&self) -> &'static str {
-        self.leader_path
+    pub const fn deployment_path(&self) -> &'static str {
+        "/leader"
     }
 
     /// Time between checks of one target.
@@ -54,8 +53,7 @@ impl HealthCheck {
 
 /// The only definition: Terraform reads its JSON rendering, kept equal by a test.
 const HEALTH_CHECK: HealthCheck = HealthCheck {
-    serve_path: "/serve",
-    leader_path: "/leader",
+    ready_path: "/ready",
     interval: Duration::from_secs(5),
     timeout: Duration::from_secs(2),
     threshold: NonZeroU32::MIN.saturating_add(1),
@@ -66,6 +64,9 @@ const HEALTH_CHECK: HealthCheck = HealthCheck {
 pub const fn health_check() -> &'static HealthCheck {
     &HEALTH_CHECK
 }
+
+/// Health response header reporting whether this controller holds the active leadership fence.
+pub const LEADING_HEADER: &str = "gang-leading";
 
 /// Bazel's `--grpc_keepalive_time`: a ping after this much read silence while a call is pending
 /// (gRPC Java's minimum is 10 s).
@@ -94,8 +95,8 @@ mod tests {
     #[test]
     fn embedded_health_check_values() {
         let check = health_check();
-        assert_eq!(check.serve_path(), "/serve");
-        assert_eq!(check.leader_path(), "/leader");
+        assert_eq!(check.ready_path(), "/ready");
+        assert_eq!(check.deployment_path(), "/leader");
         assert_eq!(check.interval(), Duration::from_secs(5));
         assert_eq!(check.timeout(), Duration::from_secs(2));
         assert_eq!(check.threshold().get(), 2);
@@ -106,7 +107,7 @@ mod tests {
     fn keepalive_timeout_outlasts_default_takeover_and_healthy_window() {
         let ttl = Duration::from_secs(10);
         let skew = Duration::from_secs(2);
-        let renew = Duration::from_secs(3);
+        let renew = crate::handover::DEFAULT_RENEW_INTERVAL;
         assert!(CLIENT_KEEPALIVE_TIMEOUT > ttl + skew + renew + health_check().healthy_window());
     }
 
@@ -123,11 +124,14 @@ mod tests {
         .expect("health-check.json is valid JSON");
         let check = health_check();
         let expected = serde_json::json!({
-            "serve_path": check.serve_path(),
-            "leader_path": check.leader_path(),
+            "ready_path": check.deployment_path(),
             "interval_seconds": check.interval().as_secs(),
             "timeout_seconds": check.timeout().as_secs(),
             "threshold": check.threshold().get(),
+            "renew_interval_seconds": crate::handover::DEFAULT_RENEW_INTERVAL.as_secs(),
+            "call_timeout_seconds": crate::handover::DEFAULT_CALL_TIMEOUT.as_secs(),
+            "promotion_seconds": crate::handover::PROMOTION_ALLOWANCE.as_secs(),
+            "handover_margin_seconds": crate::handover::RETRY_MARGIN.as_secs(),
         });
         assert_eq!(
             actual,

@@ -148,6 +148,13 @@ const RELEASE_AMI_STEPS_EXAMPLES: &str = examples! {
         "gang release ami-steps --home-region us-east-1 --now \"$(date -u +%s)\" < regions.json",
     ];
 };
+/// The `after_help` of `gang release ami-release-steps`.
+const RELEASE_AMI_RELEASE_STEPS_EXAMPLES: &str = examples! {
+    "a release job: decide the current release publication steps" => [
+        "gang release ami-release-steps --home-region us-east-1 --now \"$(date -u +%s)\" \\",
+        "  --release v1 --image x86_64=<sha256> --image aarch64=<sha256> < regions.json",
+    ];
+};
 /// The `after_help` of `gang release ami-manifest`.
 const RELEASE_AMI_MANIFEST_EXAMPLES: &str = examples! {
     "a release job: write the converged AMI manifest" => [
@@ -674,7 +681,7 @@ pub struct WorkerArgs {
     /// configuration file.
     #[arg(long, value_name = "URL")]
     pub endpoint: Option<Url>,
-    /// Worker endpoint of the scheduler that workers dial; overrides the scheduler's
+    /// Worker endpoint of the scheduler that workers dial; overrides the top-level
     /// `worker_endpoint` in the configuration file.
     #[arg(long, value_name = "URL")]
     pub worker_endpoint: Option<Url>,
@@ -750,6 +757,9 @@ pub enum ReleaseCommand {
     /// Print the next public AMI publication steps from regions on standard input.
     #[command(after_help = RELEASE_AMI_STEPS_EXAMPLES)]
     AmiSteps(AmiStepsArgs),
+    /// Print only the current release AMI publication steps from regions on standard input.
+    #[command(hide = true, after_help = RELEASE_AMI_RELEASE_STEPS_EXAMPLES)]
+    AmiReleaseSteps(AmiManifestArgs),
     /// Print the converged release AMI manifest from regions on standard input.
     #[command(after_help = RELEASE_AMI_MANIFEST_EXAMPLES)]
     AmiManifest(AmiManifestArgs),
@@ -760,6 +770,7 @@ impl ReleaseCommand {
     pub(crate) fn subject(&self) -> &'static str {
         match self {
             Self::AmiSteps(_) => "gang release ami-steps",
+            Self::AmiReleaseSteps(_) => "gang release ami-release-steps",
             Self::AmiManifest(_) => "gang release ami-manifest",
         }
     }
@@ -790,7 +801,7 @@ pub struct AmiStepsArgs {
     pub image: Vec<(Architecture, ImageSha256)>,
 }
 
-/// Arguments of `gang release ami-manifest`.
+/// Arguments shared by `gang release ami-release-steps` and `gang release ami-manifest`.
 #[derive(Debug, Args)]
 pub struct AmiManifestArgs {
     /// Publication region and time.
@@ -1863,6 +1874,29 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn release_steps_require_release_and_image_arguments() {
+        let base = [
+            "gang",
+            "release",
+            "ami-release-steps",
+            "--home-region",
+            "us-east-1",
+            "--now",
+            "0",
+        ];
+        assert!(try_parse(&base).is_err());
+        let mut with_release = base.to_vec();
+        with_release.extend(["--release", "v1"]);
+        assert!(try_parse(&with_release).is_err());
+        let mut with_image = base.to_vec();
+        with_image.extend([
+            "--image",
+            "x86_64=0000000000000000000000000000000000000000000000000000000000000000",
+        ]);
+        assert!(try_parse(&with_image).is_err());
     }
 
     #[test]

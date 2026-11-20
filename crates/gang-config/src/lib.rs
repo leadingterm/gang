@@ -57,8 +57,6 @@
 //!
 //! impl AuthenticationSettings for Backend {}
 //!
-//! impl gang_types::SchedulerSettings for Backend {}
-//!
 //! #[derive(Debug)]
 //! struct Plugins;
 //!
@@ -66,7 +64,6 @@
 //!     type Provisioner = Backend;
 //!     type Cache = Backend;
 //!     type Signer = Backend;
-//!     type Scheduler = Backend;
 //!     type Database = Backend;
 //!     type SandboxKey = SandboxKey;
 //!     type Sandbox = Sandboxes;
@@ -87,8 +84,16 @@
 //!
 //! let rejected = "poll_interval = \"1s\"".parse::<GangConfig<Plugins>>();
 //! assert!(matches!(rejected, Err(ConfigError::Gang(_))));
+//! let old = "[scheduler.nativelink]\n".parse::<GangConfig<Plugins>>();
+//! assert!(matches!(old, Err(ConfigError::RemovedScheduler(_))));
+//! let unrelated = "[not_scheduler]\n".parse::<GangConfig<Plugins>>();
+//! assert!(matches!(unrelated, Err(ConfigError::Gang(_))));
+//! let nested = "[server]\nscheduler = 1\n".parse::<GangConfig<Plugins>>();
+//! assert!(matches!(nested, Err(ConfigError::Gang(_))));
 //! ```
 
+mod action_resources;
+mod actions;
 mod authentication_config;
 mod builds_config;
 mod ca_pin_setting;
@@ -100,8 +105,11 @@ mod execution_config;
 mod fleet_policy;
 mod fleets;
 mod gang_config;
+mod http2_config;
 mod identity_config;
+mod open_file_limit;
 mod plugin_set;
+mod proxy_protocol_config;
 mod rate_limit_config;
 mod role_config;
 mod sandbox_file;
@@ -109,6 +117,11 @@ mod scheduled_minimum;
 mod server_config;
 mod worker_config;
 
+pub use action_resources::{
+    ColdStartTuning, DiskEnforcement, DiskMinReservation, DiskTuning, EscalationError,
+    EscalationPercent, MemoryEnforcement, MemoryTuning, MinReservation, WholeKib,
+};
+pub use actions::{ActionsConfig, HistoryWindow, WholeSeconds};
 pub use authentication_config::AuthenticationConfig;
 pub use builds_config::BuildsConfig;
 pub use ca_pin_setting::CaPinSetting;
@@ -120,10 +133,13 @@ pub use execution_config::{ExecutionConfig, InputLinks};
 pub use fleet_policy::{FleetPolicy, InstanceBounds, InstanceBoundsError, ScheduledMinimumError};
 pub use fleets::{FleetConfig, FleetMember, Fleets, RawFleet};
 pub use gang_config::{Document, GangConfig};
+pub use http2_config::{Http2Config, ReceiveWindow};
 pub use identity_config::IdentityConfig;
+pub use open_file_limit::{OpenFileLimit, OpenFileLimitError};
 pub use plugin_set::{
     FleetOptionsError, FleetOptionsTable, PluginSet, SandboxSelection, validated_fleet_options,
 };
+pub use proxy_protocol_config::{ProxyProtocol, ProxyProtocolConfig};
 pub use rate_limit_config::{
     BucketConfig, Ipv6PrefixLength, Ipv6PrefixLengthError, RateLimitConfig,
 };
@@ -134,6 +150,7 @@ pub use scheduled_minimum::{
     WeekdaysError, WindowError,
 };
 pub use server_config::{
-    EndpointTrust, LeadershipConfig, ServerConfig, ServerTransport, Transport,
+    DEFAULT_WORKER_TIMEOUT, EndpointTrust, LeadershipConfig, ServerConfig, ServerTransport,
+    Transport,
 };
 pub use worker_config::WorkerConfig;

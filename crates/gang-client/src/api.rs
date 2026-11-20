@@ -32,13 +32,18 @@ use crate::options::ClientOptions;
 /// Only `http` and `https` base URLs are accepted. Over `https`, TLS verifies the server
 /// according to the [`ServerTrust`] given to [`ServerApi::try_new`]. Over `http` there is no TLS
 /// and no certificate store is read. The client holds no bearer token: each request takes the
-/// bearer token to present, if any. Redirects are not followed, each request is bounded by the
-/// HTTP timeout, and every response body is capped at the configured size.
+/// bearer token to present, if any. Redirects are not followed. Each attempt is bounded by the
+/// HTTP timeout, while attempts and retry delays share the API retry budget. Every response body
+/// is capped at the configured size.
 pub struct ServerApi {
     http: HttpClient,
     base: Url,
     /// The longest server error text quoted in a message, in characters.
     max_error_chars: NonZeroUsize,
+    clock: Arc<dyn Clock>,
+    retry_initial: Duration,
+    retry_max: Duration,
+    retry_budget: Duration,
 }
 
 impl ServerApi {
@@ -73,13 +78,17 @@ impl ServerApi {
             protocol,
             timeout: options.http_timeout,
             max_body: options.max_response_size,
-            clock,
+            clock: clock.clone(),
         })
         .map_err(|error| client_error(base, error))?;
         Ok(Self {
             http,
             base: base.clone(),
             max_error_chars: options.max_error_message_chars,
+            clock,
+            retry_initial: options.api_retry_initial_backoff.get(),
+            retry_max: options.api_retry_max_backoff.get(),
+            retry_budget: options.api_retry_budget.get(),
         })
     }
 
@@ -321,16 +330,18 @@ impl ServerApi {
         path: &str,
         json: Option<Bytes>,
     ) -> Result<(T, Option<Timestamp>), ClientError> {
-        let reply = self.send(bearer, route, path, json).await?;
+        let (reply, envelope) = self.send(bearer, route, path, json).await?;
         let server_time = server_time(&reply.headers);
         if reply.status == StatusCode::TOO_MANY_REQUESTS {
             return Err(ClientError::RateLimited {
-                retry_after: retry_after_header(&reply.headers)
-                    .or_else(|| envelope_retry_delay(&reply.body)),
+                retry_after: retry_after_header(&reply.headers, self.clock.wall()).or_else(|| {
+                    envelope
+                        .as_ref()
+                        .and_then(|value| value.error.retry_delay())
+                }),
             });
         }
-        if !reply.status.is_success() {
-            let envelope = serde_json::from_slice::<ErrorResponse>(&reply.body).ok();
+        if !reply.status.is_success() || grpc_unavailable(&reply.headers) {
             if let Some(envelope) = &envelope {
                 match (reply.status, envelope.error.reason()) {
                     (StatusCode::BAD_REQUEST, Some(ErrorReason::AuthorizationPending)) => {
@@ -348,8 +359,10 @@ impl ServerApi {
                 }
             }
             // A 503 asks for a wait like a 429: its header first, else the envelope parsed above.
-            let retry_after = if reply.status == StatusCode::SERVICE_UNAVAILABLE {
-                retry_after_header(&reply.headers).or_else(|| {
+            let retry_after = if reply.status == StatusCode::SERVICE_UNAVAILABLE
+                || grpc_unavailable(&reply.headers)
+            {
+                retry_after_header(&reply.headers, self.clock.wall()).or_else(|| {
                     envelope
                         .as_ref()
                         .and_then(|envelope| envelope.error.retry_delay())
@@ -357,9 +370,14 @@ impl ServerApi {
             } else {
                 None
             };
+            let status = if grpc_unavailable(&reply.headers) {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                reply.status
+            };
             return Err(ClientError::Server {
-                status: reply.status.as_u16(),
-                message: server_message(envelope, reply.status, &reply.body, self.max_error_chars),
+                status: status.as_u16(),
+                message: server_message(envelope, status, &reply.body, self.max_error_chars),
                 retry_after,
             });
         }
@@ -367,33 +385,80 @@ impl ServerApi {
         Ok((value, server_time))
     }
 
-    /// Sends one request to the server, presenting `bearer`, and reads the whole answer.
+    /// Sends only explicitly safe refusals again, within one monotonic budget.
     async fn send(
         &self,
         bearer: Option<&AccessToken>,
         route: &Route,
         path: &str,
         json: Option<Bytes>,
-    ) -> Result<HttpReply, ClientError> {
+    ) -> Result<(HttpReply, Option<ErrorResponse>), ClientError> {
         let url = self.base.join(path)?;
         let method = match route.method {
             Method::Get => http::Method::GET,
             Method::Post => http::Method::POST,
         };
-        let body = json.map(|bytes| RequestBody {
-            content_type: "application/json",
-            bytes,
-        });
-        self.http
-            .send(HttpRequest {
-                method,
+        let started = self.clock.monotonic();
+        let mut backoff = self.retry_initial.min(self.retry_max);
+        loop {
+            let remaining = self
+                .retry_budget
+                .saturating_sub(self.clock.monotonic().saturating_duration_since(started));
+            if remaining.is_zero() {
+                return Err(client_error(&self.base, HttpError::TimedOut));
+            }
+            let body = json.clone().map(|bytes| RequestBody {
+                content_type: "application/json",
+                bytes,
+            });
+            let request = self.http.send(HttpRequest {
+                method: method.clone(),
                 url: &url,
                 bearer,
                 headers: &[],
                 body,
-            })
-            .await
-            .map_err(|error| client_error(&self.base, error))
+            });
+            let reply = Clock::timeout(&self.clock, remaining, request)
+                .await
+                .map_err(|_| client_error(&self.base, HttpError::TimedOut))?
+                .map_err(|error| client_error(&self.base, error))?;
+            let envelope = if !reply.status.is_success() || grpc_unavailable(&reply.headers) {
+                serde_json::from_slice::<ErrorResponse>(&reply.body).ok()
+            } else {
+                None
+            };
+            let unavailable = reply.status != StatusCode::TOO_MANY_REQUESTS
+                && (reply.status == StatusCode::SERVICE_UNAVAILABLE
+                    || grpc_unavailable(&reply.headers));
+            let safe = method == http::Method::GET
+                || method == http::Method::HEAD
+                || reply
+                    .headers
+                    .get(gang_types::handover::REQUEST_NOT_STARTED_HEADER)
+                    .is_some_and(|value| value == "true");
+            if !unavailable || !safe {
+                return Ok((reply, envelope));
+            }
+            let requested = retry_after_header(&reply.headers, self.clock.wall())
+                .or_else(|| {
+                    envelope
+                        .as_ref()
+                        .and_then(|value| value.error.retry_delay())
+                })
+                .unwrap_or_default();
+            let delay = backoff.max(requested);
+            let remaining = self
+                .retry_budget
+                .saturating_sub(self.clock.monotonic().saturating_duration_since(started));
+            if delay >= remaining {
+                return Ok((reply, envelope));
+            }
+            self.clock.sleep(delay).await;
+            if self.clock.monotonic().saturating_duration_since(started) >= self.retry_budget {
+                return Ok((reply, envelope));
+            }
+            backoff = backoff.saturating_mul(2).min(self.retry_max);
+        }
     }
 }
 
@@ -423,17 +488,19 @@ pub(crate) fn parse_http_date(text: &str) -> Option<Timestamp> {
     u64::try_from(millis).ok().map(Timestamp::from_unix_millis)
 }
 
-/// The wait a `Retry-After` header asks for, in whole seconds; `None` when the header is absent
-/// or is not a number.
-fn retry_after_header(headers: &HeaderMap) -> Option<Duration> {
+/// The minimum wait requested by a numeric or HTTP-date Retry-After header.
+fn retry_after_header(headers: &HeaderMap, now: Timestamp) -> Option<Duration> {
+    let text = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    if let Ok(seconds) = text.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    Some(parse_http_date(text)?.saturating_duration_since(now))
+}
+
+fn grpc_unavailable(headers: &HeaderMap) -> bool {
     headers
-        .get(RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .map(Duration::from_secs)
+        .get("grpc-status")
+        .is_some_and(|value| value == "14")
 }
 
 /// Encodes a request body as JSON.
@@ -441,14 +508,6 @@ fn encode(request: &impl Serialize) -> Result<Bytes, ClientError> {
     serde_json::to_vec(request)
         .map(Bytes::from)
         .map_err(ClientError::Request)
-}
-
-/// The wait in the `RetryInfo` detail of the error envelope in `body`, if there is one.
-fn envelope_retry_delay(body: &[u8]) -> Option<Duration> {
-    serde_json::from_slice::<ErrorResponse>(body)
-        .ok()?
-        .error
-        .retry_delay()
 }
 
 /// The human-readable reason of a non-2xx answer: the `message` of its parsed error `envelope`
@@ -599,28 +658,32 @@ mod tests {
 
     #[test]
     fn retry_after_seconds_are_the_wait() {
-        let wait = retry_after_header(&headers_with_retry_after("7"));
+        let wait = retry_after_header(&headers_with_retry_after("7"), Timestamp::UNIX_EPOCH);
 
         assert_eq!(wait, Some(std::time::Duration::from_secs(7)));
     }
 
     #[test]
     fn retry_after_seconds_are_trimmed() {
-        let wait = retry_after_header(&headers_with_retry_after("  12 "));
+        let wait = retry_after_header(&headers_with_retry_after("  12 "), Timestamp::UNIX_EPOCH);
 
         assert_eq!(wait, Some(std::time::Duration::from_secs(12)));
     }
 
     #[test]
-    fn retry_after_http_date_is_not_a_wait() {
-        let wait = retry_after_header(&headers_with_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"));
-
-        assert_eq!(wait, None);
+    fn retry_after_http_date_is_a_wait() {
+        let date = "Wed, 21 Oct 2015 07:28:00 GMT";
+        let now = Timestamp::from_unix_millis(1_445_412_479_000);
+        let wait = retry_after_header(&headers_with_retry_after(date), now);
+        assert_eq!(wait, Some(std::time::Duration::from_secs(1)));
     }
 
     #[test]
     fn absent_retry_after_is_no_wait() {
-        assert_eq!(retry_after_header(&HeaderMap::new()), None);
+        assert_eq!(
+            retry_after_header(&HeaderMap::new(), Timestamp::UNIX_EPOCH),
+            None
+        );
     }
 
     fn pin() -> CaPin {

@@ -84,6 +84,42 @@ fn assert_round_trip<T: Serialize + DeserializeOwned>(value: &T) -> TestResult {
     Ok(())
 }
 
+#[test]
+fn event_settings_enforce_sqs_limits() -> TestResult {
+    let defaults = aws(json!({}))?;
+    assert!(defaults.events_queue_url.is_none());
+    assert_eq!(defaults.event_batch_limit, 10);
+    assert_eq!(
+        defaults.event_visibility_timeout.get(),
+        Duration::from_secs(30)
+    );
+    assert_eq!(
+        defaults.activity_history_window.get(),
+        Duration::from_mins(15)
+    );
+    assert_eq!(defaults.activity_limit, 100);
+    assert_all_rejected(
+        [
+            json!({"event_batch_limit": 0}),
+            json!({"event_batch_limit": 11}),
+            json!({"activity_limit": 0}),
+            json!({"activity_limit": 1001}),
+            json!({"event_visibility_timeout": "0s"}),
+            json!({"event_visibility_timeout": "500ms"}),
+            json!({"event_visibility_timeout": "13h"}),
+        ],
+        aws,
+    );
+    assert_all_accepted(
+        [
+            json!({"event_batch_limit": 1, "activity_limit": 1, "event_visibility_timeout": "1s"}),
+            json!({"event_batch_limit": 10, "activity_limit": 1000, "event_visibility_timeout": "12h"}),
+        ],
+        aws,
+    );
+    Ok(())
+}
+
 /// Every `[provisioner.aws]` key defaults when absent.
 #[test]
 fn provisioner_defaults_apply_when_optional_keys_are_absent() -> TestResult {
@@ -201,12 +237,16 @@ fn workload_token_audience_bounds() {
     );
 }
 
-/// Workload token lifetimes are whole seconds from one minute to one hour.
+/// STS workload token lifetimes are whole seconds from one minute to one hour.
 #[test]
 fn workload_token_ttl_bounds() {
     assert_all_rejected(
         [
+            json!({"workload_token": {"ttl": "19s"}}),
+            json!({"workload_token": {"ttl": "20s"}}),
             json!({"workload_token": {"ttl": "30s"}}),
+            json!({"workload_token": {"ttl": "59s"}}),
+            json!({"workload_token": {"ttl": "3601s"}}),
             json!({"workload_token": {"ttl": "2h"}}),
             json!({"workload_token": {"ttl": "1500ms"}}),
             json!({"workload_token": {"ttl": "90500ms"}}),
@@ -216,6 +256,8 @@ fn workload_token_ttl_bounds() {
     assert_all_accepted(
         [
             json!({"workload_token": {"ttl": "1m"}}),
+            json!({"workload_token": {"ttl": "60s"}}),
+            json!({"workload_token": {"ttl": "3600s"}}),
             json!({"workload_token": {"ttl": "1h"}}),
         ],
         aws,

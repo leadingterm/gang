@@ -463,6 +463,17 @@ mod tests {
     }
 
     #[test]
+    fn action_environment_does_not_constrain_matching() {
+        let catalog = catalog();
+        for revision in ["identity-roots-v1", "another-revision"] {
+            assert_eq!(
+                catalog.accepting(request(&[(property::ACTION_ENVIRONMENT, revision)])),
+                set(&[0, 1, 2])
+            );
+        }
+    }
+
+    #[test]
     fn disk_is_a_minimum() {
         let catalog = FleetCatalog::try_new(vec![
             fleet("small-x86", Isa::X86_64, 8, 16, 100, &[]),
@@ -523,6 +534,7 @@ mod tests {
                 ("disk_kb", MatchKind::Minimum),
                 ("capacity", MatchKind::Exact),
                 ("network", MatchKind::Ignored),
+                ("gang_action_environment", MatchKind::Ignored),
             ]
         );
     }
@@ -555,6 +567,7 @@ mod tests {
                 "capacity",
                 "zone",
                 "network",
+                "gang_action_environment",
             ]
         );
     }

@@ -9,7 +9,17 @@ output "gang_toml" {
 }
 
 output "config_parameter_name" {
-  description = "Name of the SSM parameter that holds the rendered gang.toml. Instances read it at boot from their user data."
+  description = "Name of the active immutable configuration generation."
+  value       = aws_ssm_parameter.config_generation.name
+}
+
+output "config_parameter_reference" {
+  description = "Version-pinned active configuration reference used by instances."
+  value       = "${aws_ssm_parameter.config_generation.name}:1"
+}
+
+output "legacy_config_parameter_name" {
+  description = "Frozen legacy configuration parameter name."
   value       = aws_ssm_parameter.config.name
 }
 
@@ -51,6 +61,16 @@ output "issuer_url" {
 output "asg_names" {
   description = "Names of the worker Auto Scaling groups, in fleet order."
   value       = module.worker_fleet.asg_names
+}
+
+output "events_queue_url" {
+  description = "URL of the AWS events queue, or null when AWS event observation is disabled."
+  value       = var.aws_events_enabled ? aws_sqs_queue.events[0].url : null
+}
+
+output "events_dead_letter_queue_url" {
+  description = "URL of the AWS events dead-letter queue, or null when AWS event observation is disabled."
+  value       = var.aws_events_enabled ? aws_sqs_queue.events_dlq[0].url : null
 }
 
 output "controller_instance_id" {

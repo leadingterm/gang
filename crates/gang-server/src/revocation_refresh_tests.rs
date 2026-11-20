@@ -31,6 +31,7 @@ const INTERVAL: NonZeroDuration = NonZeroDuration::from_secs(1);
 fn fixture() -> Arc<Core<PlainDeployment>> {
     let (parts, _, _) = plain_parts();
     let host = Host {
+        proxy_protocol: Arc::default(),
         repository: parts.repository,
         signer: Arc::new(parts.signer),
         security: Security::Plaintext,
@@ -49,6 +50,7 @@ fn fixture() -> Arc<Core<PlainDeployment>> {
 fn tls_fixture() -> Arc<Core<TlsDeployment>> {
     let (parts, _, _) = tls_parts();
     let host = Host {
+        proxy_protocol: Arc::default(),
         repository: parts.repository,
         signer: Arc::new(parts.signer),
         security: Security::Plaintext,
@@ -251,6 +253,7 @@ async fn issuance_crossing_revocation_cannot_revive_after_restore() -> TestResul
     .await
     .unwrap_or_else(|error| panic!("the test security establishes: {error}"));
     let host = Host {
+        proxy_protocol: Arc::default(),
         repository: parts.repository,
         signer,
         security,
@@ -343,6 +346,7 @@ async fn issuing_core() -> Arc<Core<TlsDeployment>> {
     .await
     .unwrap_or_else(|error| panic!("the test security establishes: {error}"));
     let host = Host {
+        proxy_protocol: Arc::default(),
         repository: parts.repository,
         signer,
         security,

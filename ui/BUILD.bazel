@@ -214,6 +214,14 @@ js_test(
 )
 
 js_test(
+    name = "layout_policy_test",
+    size = "small",
+    chdir = package_name(),
+    data = glob(["src/**/*.css"]),
+    entry_point = "test/layout-policy.test.mjs",
+)
+
+js_test(
     name = "overview_layout_test",
     size = "medium",
     chdir = package_name(),
