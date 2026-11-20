@@ -35,6 +35,7 @@ impl Cancel {
 struct State<'a> {
     cancels: Vec<(Arc<Cancel>, Option<&'a str>)>,
     cancelled: bool,
+    released: bool,
     armed: bool,
 }
 
@@ -53,6 +54,7 @@ impl<'a, K: Fn(Option<&str>) -> Result<()>> Hold<'a, K> {
             state: Mutex::new(State {
                 cancels: Vec::new(),
                 cancelled: false,
+                released: false,
                 armed: true,
             }),
         }
@@ -87,11 +89,23 @@ impl<'a, K: Fn(Option<&str>) -> Result<()>> Hold<'a, K> {
         let result = fs::write(self.go, b"").map_err(E2eError::io("releasing held probes"));
         if result.is_err() {
             self.cancel("release failed");
+        } else {
+            self.state.lock().released = true;
         }
         result
     }
 
-    fn cancel(&self, reason: &str) {
+    pub(crate) fn is_held(&self) -> Result<bool> {
+        let state = self.state.lock();
+        let released = self
+            .go
+            .try_exists()
+            .map_err(E2eError::io("observing held probe release"))?;
+        Ok(!state.released && !state.cancelled && !released)
+    }
+
+    /// Cancels owned builds and their Bazel servers.
+    pub(crate) fn cancel(&self, reason: &str) {
         let cancels = {
             let mut state = self.state.lock();
             if state.cancelled {
@@ -362,5 +376,31 @@ mod tests {
         cancel.fire("first");
         cancel.fire("second");
         assert_eq!(receiver.try_recv().expect("cancellation"), "first");
+    }
+
+    #[test]
+    fn held_observation_rejects_release_even_if_the_release_file_is_removed() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let go = dir.path().join("go");
+        let hold = Hold::new(&go, |_| Ok(()));
+        assert!(hold.is_held().expect("held state"));
+        hold.release().expect("release");
+        fs::remove_file(&go).expect("remove release file");
+        assert!(!hold.is_held().expect("released state"));
+        hold.disarm();
+    }
+
+    #[test]
+    fn held_observation_rejects_cancellation_and_external_release() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let go = dir.path().join("go");
+        let hold = Hold::new(&go, |_| Ok(()));
+        hold.cancel("observation interrupted");
+        assert!(!hold.is_held().expect("cancelled state"));
+        hold.disarm();
+        let hold = Hold::new(&go, |_| Ok(()));
+        fs::write(&go, b"").expect("external release");
+        assert!(!hold.is_held().expect("external release state"));
+        hold.disarm();
     }
 }

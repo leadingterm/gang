@@ -7,12 +7,13 @@ use aws_credential_types::Credentials;
 use aws_sdk_dynamodb::config::{BehaviorVersion, Region};
 use gang_clock::{Clock, Sleep, TestClock, Tick, Timestamp};
 use gang_spi::{
-    ControllerId, ExpiringRecordPort, LeaderLeasePort, Plugin, PluginContext, PortError, RecordId,
-    RecordKey, RecordKind, RecordVersion, ScalingAuditEvent, ScalingEventKind, SchemaVersion,
-    StateRepositoryPort,
+    Acquisition, CandidateGeneration, CandidatePriority, ControllerHostIdentity, ControllerId,
+    ExpiringRecordPort, LeaderLeasePort, Plugin, PluginContext, PortError, RecordId, RecordKey,
+    RecordKind, RecordVersion, Renewal, ScalingAuditEvent, ScalingEventKind, SchemaVersion,
+    StateRepositoryPort, Takeover,
 };
 use gang_testkit::{FakeDynamoDb, Fixture, TestResult};
-use gang_types::{FleetName, Identity, Principal, ProviderName, WorkerId};
+use gang_types::{FleetName, Identity, InstanceId, Principal, ProviderName, WorkerId};
 
 use crate::{DynamoDb, DynamoDbConfig, TableName};
 
@@ -438,6 +439,12 @@ async fn lease_and_expiring_timestamps_fit_shared_range() -> TestResult {
         kind: RecordKind::LoginAttempt,
         id: RecordId::new([9; 32]),
     };
+    let candidate = database
+        .register_candidate(
+            &ControllerId::new("a"),
+            &ControllerHostIdentity::Persistent(InstanceId::try_new("host-a")?),
+        )
+        .await?;
     assert!(
         database
             .insert(&[(key, b"body")], RecordVersion::new(1), now, too_large)
@@ -446,7 +453,272 @@ async fn lease_and_expiring_timestamps_fit_shared_range() -> TestResult {
     );
     assert!(
         database
-            .acquire(&ControllerId::new("a"), now, too_large)
+            .acquire(&candidate, now, now, too_large, Takeover::Observe)
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_take_invalidates_priority_binding() -> TestResult {
+    let (database, _fake) = setup().await?;
+    let candidate = database
+        .register_candidate(
+            &ControllerId::new("candidate"),
+            &ControllerHostIdentity::Persistent(InstanceId::try_new("host-candidate")?),
+        )
+        .await?;
+    let now = Timestamp::from_unix_millis(1);
+    let expiry = Timestamp::from_unix_millis(100);
+    let Acquisition::Acquired(old) = database
+        .acquire(&candidate, now, now, expiry, Takeover::Observe)
+        .await?
+    else {
+        return Err("candidate did not acquire lease".into());
+    };
+    let stored = database
+        .get("lease", "leader")
+        .await?
+        .ok_or("acquired lease missing")?;
+    assert_eq!(
+        crate::items::string(&stored, "holder_priority")?,
+        candidate.priority.as_str()
+    );
+    assert_eq!(
+        crate::items::number(&stored, "holder_priority_epoch")?,
+        old.epoch.get()
+    );
+    assert!(!stored.contains_key("holder_generation"));
+    assert!(!stored.contains_key("holder_generation_epoch"));
+    database
+        .client()
+        .await
+        .update_item()
+        .table_name(database.table())
+        .set_key(Some(crate::items::key("lease", "leader")))
+        .update_expression(
+            "SET #holder = :holder, #expires = :expires, #priority = :priority ADD #epoch :one",
+        )
+        .expression_attribute_names("#holder", "holder")
+        .expression_attribute_names("#expires", "expires_at")
+        .expression_attribute_names("#epoch", "epoch")
+        .expression_attribute_names("#priority", "holder_priority")
+        .expression_attribute_values(":holder", crate::items::s("legacy"))
+        .expression_attribute_values(":expires", crate::items::n(100))
+        .expression_attribute_values(":one", crate::items::n(1))
+        .expression_attribute_values(":priority", crate::items::s("unbound-invalid-priority"))
+        .send()
+        .await?;
+    let Acquisition::Contending(legacy) = database
+        .acquire(&candidate, now, now, expiry, Takeover::Request)
+        .await?
+    else {
+        return Err("legacy holder was not recognized as lower priority".into());
+    };
+    assert_ne!(legacy.epoch, old.epoch);
+    assert_eq!(legacy.holder, ControllerId::new("legacy"));
+    let stored = database
+        .get("lease", "leader")
+        .await?
+        .ok_or("requested lease missing")?;
+    assert_eq!(
+        crate::items::string(&stored, "successor_priority")?,
+        candidate.priority.as_str()
+    );
+    assert!(!stored.contains_key("successor_generation"));
+    assert!(matches!(
+        database.renew(&legacy, now, Timestamp::from_unix_millis(150)).await?,
+        Renewal::YieldRequested(updated) if updated.expires_at == Timestamp::from_unix_millis(150)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn handoff_resets_record_sequence_only_when_a_new_epoch_is_acquired() -> TestResult {
+    let (database, _fake) = setup().await?;
+    let owner = database
+        .register_candidate(
+            &ControllerId::new("owner"),
+            &ControllerHostIdentity::Persistent(InstanceId::try_new("owner-host")?),
+        )
+        .await?;
+    let replacement = database
+        .register_candidate(
+            &ControllerId::new("replacement"),
+            &ControllerHostIdentity::Persistent(InstanceId::try_new("replacement-host")?),
+        )
+        .await?;
+    let now = Timestamp::from_unix_millis(1);
+    let expiry = Timestamp::from_unix_millis(100);
+    let Acquisition::Acquired(lease) = database
+        .acquire(&owner, now, now, expiry, Takeover::Observe)
+        .await?
+    else {
+        return Err("owner did not acquire lease".into());
+    };
+    database
+        .client()
+        .await
+        .update_item()
+        .table_name(database.table())
+        .set_key(Some(crate::items::key("lease", "leader")))
+        .update_expression("SET #sequence = :sequence")
+        .expression_attribute_names("#sequence", "record_sequence")
+        .expression_attribute_values(":sequence", crate::items::n(7))
+        .send()
+        .await?;
+    assert!(matches!(
+        database
+            .acquire(&replacement, now, now, expiry, Takeover::Request)
+            .await?,
+        Acquisition::Contending(_)
+    ));
+    assert!(matches!(
+        database.renew(&lease, now, expiry).await?,
+        Renewal::YieldRequested(_)
+    ));
+    let pending = database
+        .get("lease", "leader")
+        .await?
+        .ok_or("pending lease missing")?;
+    assert_eq!(crate::items::number(&pending, "record_sequence")?, 7);
+    database.release(&lease).await?;
+    let Acquisition::Acquired(next) = database
+        .acquire(&replacement, now, now, expiry, Takeover::Observe)
+        .await?
+    else {
+        return Err("replacement did not acquire reserved lease".into());
+    };
+    assert!(next.epoch > lease.epoch);
+    let stored = database
+        .get("lease", "leader")
+        .await?
+        .ok_or("replacement lease missing")?;
+    assert_eq!(crate::items::number(&stored, "record_sequence")?, 0);
+    assert_eq!(
+        crate::items::string(&stored, "holder_priority")?,
+        replacement.priority.as_str()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn candidate_counter_and_lease_epoch_do_not_wrap() -> TestResult {
+    let (database, _fake) = setup().await?;
+    database.ensure_schema().await?;
+    database
+        .client()
+        .await
+        .put_item()
+        .table_name(database.table())
+        .set_item(Some(crate::items::key("counter", "lease_candidate")))
+        .item("value", crate::items::n(u64::MAX))
+        .send()
+        .await?;
+    assert!(matches!(
+        database
+            .register_candidate(
+                &ControllerId::new("overflow"),
+                &ControllerHostIdentity::Persistent(InstanceId::try_new("host-overflow")?),
+            )
+            .await,
+        Err(PortError::Backend(error))
+            if matches!(
+                error.downcast_ref::<crate::DynamoError>(),
+                Some(crate::DynamoError::CounterExhausted { counter: "candidate generation" })
+            )
+    ));
+    database
+        .client()
+        .await
+        .put_item()
+        .table_name(database.table())
+        .set_item(Some(crate::items::key("lease", "leader")))
+        .item("epoch", crate::items::n(u64::MAX))
+        .send()
+        .await?;
+    let candidate = gang_spi::LeaseCandidate {
+        holder: ControllerId::new("candidate"),
+        priority: CandidatePriority::registered(CandidateGeneration::new(1)),
+    };
+    let now = Timestamp::from_unix_millis(1);
+    assert!(matches!(
+        database
+            .acquire(&candidate, now, now, now, Takeover::Observe)
+            .await,
+        Err(PortError::Backend(error))
+            if matches!(
+                error.downcast_ref::<crate::DynamoError>(),
+                Some(crate::DynamoError::CounterExhausted { counter: "lease epoch" })
+            )
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn mapped_host_registration_survives_an_exhausted_counter() -> TestResult {
+    let (database, _fake) = setup().await?;
+    let host = InstanceId::try_new("stable-host")?;
+    database.ensure_schema().await?;
+    database
+        .client()
+        .await
+        .put_item()
+        .table_name(database.table())
+        .set_item(Some(crate::items::key("controller_host", host.as_str())))
+        .item("generation", crate::items::n(7))
+        .send()
+        .await?;
+    database
+        .client()
+        .await
+        .put_item()
+        .table_name(database.table())
+        .set_item(Some(crate::items::key("counter", "lease_candidate")))
+        .item("value", crate::items::n(u64::MAX))
+        .send()
+        .await?;
+    let identity = ControllerHostIdentity::Persistent(host);
+    let first = database
+        .register_candidate(&ControllerId::new("first"), &identity)
+        .await?;
+    let retry = database
+        .register_candidate(&ControllerId::new("retry"), &identity)
+        .await?;
+    assert_eq!(
+        first.priority,
+        CandidatePriority::registered(CandidateGeneration::new(7))
+    );
+    assert_eq!(retry.priority, first.priority);
+    Ok(())
+}
+
+#[tokio::test]
+async fn launched_registration_reads_database_without_allocating_a_counter() -> TestResult {
+    let (database, fake) = setup().await?;
+    database.ensure_schema().await?;
+    let host = ControllerHostIdentity::Launched {
+        at: Timestamp::from_unix_millis(42),
+        instance: InstanceId::try_new("instance-a")?,
+    };
+    let before = fake.requests();
+    let candidate = database
+        .register_candidate(&ControllerId::new("first"), &host)
+        .await?;
+    assert_eq!(fake.requests() - before, 1);
+    assert_eq!(
+        candidate.priority,
+        CandidatePriority::launched(
+            Timestamp::from_unix_millis(42),
+            &InstanceId::try_new("instance-a")?,
+        )
+    );
+    assert!(database.get("counter", "lease_candidate").await?.is_none());
+    fake.set_unavailable(true);
+    assert!(
+        database
+            .register_candidate(&ControllerId::new("restart"), &host)
             .await
             .is_err()
     );

@@ -163,6 +163,7 @@ fn worker(slot: usize, phase: Phase, running: u32) -> Result<Worker, Box<dyn Err
         paused: false,
         launch_time: timestamped(1),
         phases: Vec::new(),
+        infrastructure: None,
     })
 }
 
@@ -173,6 +174,7 @@ fn instance(slot: usize, lifecycle: Lifecycle) -> Result<Instance, Box<dyn Error
         lifecycle,
         launch_time: timestamped(1),
         past_boot_grace: false,
+        infrastructure: None,
     })
 }
 
@@ -584,6 +586,7 @@ fn snapshot(world: &World) -> State {
             truncated: world.truncated,
         }),
         events,
+        status_events: Vec::new(),
         events_limit: world.events_limit,
         completed: world.completed,
         recent: Recent::default(),
@@ -836,5 +839,33 @@ fn vanished_fleet_is_removed_and_dropped() -> Result<(), Box<dyn Error>> {
     let mut state = prev.clone();
     apply(&mut state, &delta)?;
     assert_eq!(state, cur);
+    Ok(())
+}
+
+#[test]
+fn status_event_expiration_is_a_replacement_delta() -> Result<(), Box<dyn Error>> {
+    let mut previous = State::default();
+    previous.status_events.push(Event {
+        name: "awsEvents/notice".into(),
+        create_time: timestamped(1),
+        fleet: "fleets/alpha".into(),
+        cause: None,
+        change: EventChange::Aws {
+            event: gang_wire::AwsEvent {
+                id: "notice".into(),
+                at: timestamped(1),
+                kind: gang_wire::AwsEventKind::CapacityUnavailable {
+                    reason: "capacity".into(),
+                },
+            },
+        },
+    });
+    let mut current = previous.clone();
+    current.seq = 1;
+    current.status_events.clear();
+    let delta = diff(&previous, &current).ok_or("missing status removal")?;
+    assert_eq!(delta.status_events, Some(Vec::new()));
+    apply(&mut previous, &delta)?;
+    assert_eq!(previous, current);
     Ok(())
 }

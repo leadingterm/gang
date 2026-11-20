@@ -15,7 +15,7 @@ Status: Accepted. Replaces the HTTP/2-only public listener. Its consequence on p
 
 ## Consequences
 - Public infrastructure is one port (443) plus the private worker port.
-- An HTTP/1.1 request head must arrive within `[scheduler.nativelink.http2] header_read_timeout`.
+- An HTTP/1.1 request head must arrive within `[server.http2] header_read_timeout`.
 - A browser reaching Gang-terminated TLS must trust the Gang CA. Behind a publicly trusted terminator that re-encrypts, `[server] endpoint_trust = "system"` (ADR-36); behind one that forwards plaintext, `transport = "plaintext"` (ADR-03).
 
 ## Rejected alternatives

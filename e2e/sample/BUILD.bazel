@@ -1,6 +1,8 @@
 load(":config.bzl", "CPU_COUNT", "ISA", "LARGE_FLEET", "LARGE_MEMORY_KB", "MEMORY_KB", "REQUESTED_SANDBOX", "SIGNAL_COMMAND")
 load(":rules.bzl", "input_root_probe", "probe")
 
+IDENTITY_ROOTS = "identity-roots-v1"
+
 # Namespaces of the action, as `readlink` prints them (`net:[4026531992]`); `unavailable` without /proc.
 NAMESPACES = """
 echo "net=$(readlink /proc/self/ns/net 2>/dev/null || echo unavailable)"
@@ -33,6 +35,7 @@ probe(
     script = NAMESPACES,
     exec_properties = {
         "ISA": ISA,
+        "gang_action_environment": IDENTITY_ROOTS,
         "network": "requested",
     },
 )
@@ -40,14 +43,14 @@ probe(
 probe(
     name = "pinned",
     script = "echo ran=yes",
-    exec_properties = {"ISA": ISA},
+    exec_properties = {"ISA": ISA, "gang_action_environment": IDENTITY_ROOTS},
 )
 
 probe(
     name = "cache_visibility",
     srcs = ["cache-visibility-input"],
     script = "printf 'cache-visibility-output\\n'; cat cache-visibility-input",
-    exec_properties = {"ISA": ISA},
+    exec_properties = {"ISA": ISA, "gang_action_environment": IDENTITY_ROOTS},
 )
 
 # The placement probes: which fleet runs an action follows from its exec properties alone. Each
@@ -55,7 +58,7 @@ probe(
 probe(
     name = "fleet_unconstrained",
     script = NAMESPACES,
-    exec_properties = {"ISA": ISA},
+    exec_properties = {"ISA": ISA, "gang_action_environment": IDENTITY_ROOTS},
 )
 
 probe(
@@ -63,6 +66,7 @@ probe(
     script = NAMESPACES,
     exec_properties = {
         "ISA": ISA,
+        "gang_action_environment": IDENTITY_ROOTS,
         "fleet": LARGE_FLEET,
     },
 )
@@ -72,6 +76,7 @@ probe(
     script = NAMESPACES,
     exec_properties = {
         "ISA": ISA,
+        "gang_action_environment": IDENTITY_ROOTS,
         "memory_kb": str(LARGE_MEMORY_KB),
     },
 )
@@ -81,6 +86,7 @@ probe(
     script = NAMESPACES,
     exec_properties = {
         "ISA": ISA,
+        "gang_action_environment": IDENTITY_ROOTS,
         "sandbox": REQUESTED_SANDBOX,
     },
 )
@@ -90,13 +96,13 @@ probe(
 probe(
     name = "overflow_first",
     script = "echo ran=first",
-    exec_properties = {"ISA": ISA},
+    exec_properties = {"ISA": ISA, "gang_action_environment": IDENTITY_ROOTS},
 )
 
 probe(
     name = "overflow_second",
     script = "echo ran=second",
-    exec_properties = {"ISA": ISA},
+    exec_properties = {"ISA": ISA, "gang_action_environment": IDENTITY_ROOTS},
 )
 
 probe(
@@ -148,6 +154,7 @@ echo "sibling_links=$(stat -L -c %h "$E2E_SHARED" 2>/dev/null || echo unreadable
 
 LIMITS = {
     "ISA": ISA,
+    "gang_action_environment": IDENTITY_ROOTS,
     "cpu_count": str(CPU_COUNT),
     "memory_kb": str(MEMORY_KB),
 }
@@ -172,33 +179,30 @@ echo released=yes
 # than in config.bzl, which the harness overwrites in each staged copy.
 MEMORY_HOG = {
     "ISA": ISA,
+    "gang_action_environment": IDENTITY_ROOTS,
     "cpu_count": str(CPU_COUNT),
     "memory_kb": "65536",
 }
 
-# Allocates one 1 GiB buffer at once against a hard ceiling of twice its 64 MiB reservation. The
-# allocation outruns NativeLink's 250 ms sampling window, so this check proves the cgroup backstop:
-# the kernel kills it at `memory.max` before NativeLink's two-sample soft rule can act.
+# Touches a 192 MiB buffer against a 64 MiB reservation on a healthy worker. A reservation is not
+# an action memory ceiling, so the first attempt must complete. Each attempt records itself first.
 probe(
     name = "memory_hog",
     exec_properties = MEMORY_HOG,
     script = """
-dd if=/dev/zero of=/dev/null bs=1G count=1 2>/dev/null
+echo "$E2E_ACTION ${GANG_MEMORY_KB:-0}" >> "$E2E_ATTEMPTS"
+dd if=/dev/zero of=/dev/null bs=192M count=1 2>/dev/null
 echo hogged=yes
 """,
 )
 
-# Holds 96 MiB, above the 76.8 MiB soft limit of its 64 MiB reservation and below the 128 MiB cgroup
-# ceiling, so only NativeLink can end the first attempt, which holds it until it is killed. The
-# requeued attempt, with the reservation doubled to 128 MiB, completes at once. `dd` reads the whole
-# size into one buffer and blocks writing it to `sleep`, which never reads, so the footprint is that
-# buffer however the processes are scheduled. Each attempt appends a line to $E2E_ATTEMPTS, a host
-# path, before it grows.
+# Holds 96 MiB above the soft limit of its 64 MiB reservation until the first attempt is killed.
+# The requeued attempt completes at once. `dd` holds the buffer while its pipe reader sleeps.
 probe(
     name = "memory_grower",
     exec_properties = MEMORY_HOG,
     script = """
-echo attempt >> "$E2E_ATTEMPTS"
+echo "$E2E_ACTION ${GANG_MEMORY_KB:-0}" >> "$E2E_ATTEMPTS"
 attempts=$(wc -l < "$E2E_ATTEMPTS")
 if [ "$attempts" -eq 1 ]; then hold=300; else hold=0; fi
 dd if=/dev/zero bs=100663296 count=1 2>/dev/null | sleep "$hold"
@@ -212,6 +216,7 @@ probe(
     name = "disk_hog",
     exec_properties = {
         "ISA": ISA,
+        "gang_action_environment": IDENTITY_ROOTS,
         "disk_kb": "4096",
     },
     script = """
@@ -227,6 +232,7 @@ probe(
     name = "disk_neighbour",
     exec_properties = {
         "ISA": ISA,
+        "gang_action_environment": IDENTITY_ROOTS,
         "disk_kb": "65536",
     },
     script = """
@@ -303,6 +309,7 @@ probe(
 # read-only), and whether its working directory is writable.
 probe(
     name = "sandbox_contract",
+    srcs = ["action-environment-probe", "action-environment-postgresql.tar.gz"],
     script = """
 echo "env_names=$(env -0 | tr '\\n\\0' ' \\n' | cut -d= -f1 | tr '\\n' ',')"
 entries=""
@@ -312,12 +319,29 @@ done
 echo "tmp_entries=$entries"
 echo "tmp_fs=$(stat -f -c %T /tmp)"
 cut -d' ' -f5 /proc/self/mountinfo | sort -u | while read -r point; do
-  if out=$(touch -c "$point" 2>&1); then state=ok
-  else case "$out" in *"Read-only file system"*) state=erofs ;; *) state=other ;; esac
-  fi
+  options=$(awk -v p="$point" '$5 == p { print $6 }' /proc/self/mountinfo)
+  case ",$options," in *,ro,*) state=erofs ;; *) state=other ;; esac
   echo "mount:$point=$state"
 done
 if touch ./writable-probe 2>/dev/null; then echo cwd_writable=yes; else echo cwd_writable=no; fi
+uid=$(id -u)
+gid=$(id -g)
+if [ "$(id -un 2>/dev/null)" = builder ] && [ "$(id -gn 2>/dev/null)" = builder ] &&
+   [ "$(awk -F: -v uid="$uid" '$3 == uid && $1 == "builder" { ok++ } END { print NR ":" ok }' /etc/passwd)" = "1:1" ] &&
+   [ "$(awk -F: -v gid="$gid" '$3 == gid && $1 == "builder" { ok++ } END { print NR ":" ok }' /etc/group)" = "1:1" ]; then
+  echo identity=yes
+else echo identity=no; fi
+if [ "$(cat /etc/nsswitch.conf 2>/dev/null | tr -s ' ')" = "$(printf 'passwd: files\\ngroup: files')" ]; then echo nss=yes; else echo nss=no; fi
+if [ "$(find /etc -mindepth 1 | sort | tr '\\n' ',')" = "/etc/group,/etc/nsswitch.conf,/etc/passwd,/etc/pki,/etc/pki/tls,/etc/pki/tls/certs,/etc/pki/tls/certs/ca-bundle.crt,/etc/ssl,/etc/ssl/cert.pem,/etc/ssl/certs,/etc/ssl/certs/ca-certificates.crt," ]; then echo etc_contents=yes; else echo etc_contents=no; fi
+readonly=yes
+for file in /etc/passwd /etc/group /etc/nsswitch.conf /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem /etc/pki/tls/certs/ca-bundle.crt; do
+  options=$(awk -v p="$file" '$5 == p { print $6 }' /proc/self/mountinfo)
+  case ",$options," in *,ro,*) [ -f "$file" ] || readonly=no ;; *) readonly=no ;; esac
+done
+echo "identity_roots_readonly=$readonly"
+if out=$(./action-environment-probe --gang-e2e-action-environment-probe roots 2>&1); then echo roots=yes; else echo "roots=failed: $(printf '%s' "$out" | tr '\\n' ' ')"; fi
+if out=$(SSL_CERT_FILE=/missing-ca-file SSL_CERT_DIR=/missing-ca-dir ./action-environment-probe --gang-e2e-action-environment-probe roots 2>&1); then echo roots_override=no; else echo roots_override=yes; fi
+if out=$(./action-environment-probe --gang-e2e-action-environment-probe postgres action-environment-postgresql.tar.gz 2>&1); then echo postgres=yes; else echo "postgres=failed: $(printf '%s' "$out" | tr '\\n' ' ')"; fi
 """,
 )
 
@@ -413,7 +437,7 @@ probe(name = "controller_loss_6", script = CONTROLLER_LOSS, exec_properties = LI
 probe(name = "controller_loss_7", script = CONTROLLER_LOSS, exec_properties = LIMITS)
 
 
-WORK_PROPERTIES = {"ISA": ISA, "cpu_count": "1", "memory_kb": "65536", "disk_kb": "65536"}
+WORK_PROPERTIES = {"ISA": ISA, "gang_action_environment": IDENTITY_ROOTS, "cpu_count": "1", "memory_kb": "65536", "disk_kb": "65536"}
 
 # Distinct short actions for a scale-out burst.
 probe(name = "burst_000", script = "echo ran=yes", exec_properties = WORK_PROPERTIES)
@@ -607,7 +631,7 @@ probe(
     name = "memory_escalation",
     exec_properties = MEMORY_HOG,
     script = """
-echo attempt >> "$E2E_ATTEMPTS"
+echo "$E2E_ACTION ${GANG_MEMORY_KB:-0}" >> "$E2E_ATTEMPTS"
 attempts=$(wc -l < "$E2E_ATTEMPTS")
 size=100663296
 i=1
@@ -622,10 +646,95 @@ probe(
     name = "disk_guarded",
     exec_properties = {
         "ISA": ISA,
+        "gang_action_environment": IDENTITY_ROOTS,
         "disk_kb": "549755813888",
     },
     script = """
-echo attempt >> "$E2E_ATTEMPTS"
+echo "$E2E_ACTION ${GANG_MEMORY_KB:-0}" >> "$E2E_ATTEMPTS"
 echo ran=yes
 """,
 )
+
+# --- Neighbour-pressure probes ---
+# Named independently so pool-OOM scenarios can reuse the same fixtures.
+PRESSURE_VICTIM_BYTES = 201326592
+PRESSURE_NEIGHBOUR_BYTES = 402653184
+PRESSURE_CHURN_BYTES = 8388608
+
+# The first reservation holds a dd buffer in a blocked FIFO write; the escalated
+# and learned reservations run to completion without requiring another kill.
+probe(
+    name = "pressure_victim",
+    exec_properties = {
+        "ISA": ISA,
+        "gang_action_environment": IDENTITY_ROOTS,
+        "cpu_count": str(CPU_COUNT),
+        "memory_kb": "65536",
+    },
+    script = JOURNAL + """
+echo "$E2E_ACTION ${{GANG_MEMORY_KB:-0}}" >> "$E2E_ATTEMPTS" || exit 1
+if [ "${{GANG_MEMORY_KB:-0}}" -lt 196608 ]; then
+  mkfifo pressure-buffer pressure-wait || exit 1
+  exec 4<> pressure-wait || exit 1
+  sleep 300 < pressure-buffer &
+  reader=$!
+  dd if=/dev/zero of=pressure-buffer bs={size} count=1 2>/dev/null &
+  writer=$!
+  (
+    C="$(dirname "$E2E_SIGNAL")/churn"
+    while [ ! -e "$C" ] && [ ! -e "$G" ]; do read -r -t 0.05 <&4 || :; done
+    while [ -e "$C" ] && [ ! -e "$G" ]; do dd if=/dev/zero of=/dev/null bs={churn} count=1 2>/dev/null || exit 1; done
+  ) &
+  churn=$!
+  echo "$E2E_RUN pressure victim $$" > "$J" || exit 1
+  while [ ! -e "$G" ]; do read -r -t 0.05 <&4 || :; done
+  wait "$churn" || exit 1
+  exec 4>&-
+  exec 3< pressure-buffer || exit 1
+  cat <&3 > /dev/null &
+  drain=$!
+  kill "$reader" 2>/dev/null || :
+  exec 3<&-
+  wait "$writer" || exit 1
+  wait "$drain" || exit 1
+else
+  echo "$E2E_RUN pressure victim_retry $$" > "$J" || exit 1
+  dd if=/dev/zero of=/dev/null bs={size} count=1 2>/dev/null || exit 1
+fi
+echo pressure=complete
+""".format(size = PRESSURE_VICTIM_BYTES, churn = PRESSURE_CHURN_BYTES),
+)
+
+# The largest resident action is not the furthest above its reservation.
+# The harness releases it only after observing the pressure kill.
+probe(
+    name = "pressure_neighbour",
+    exec_properties = {
+        "ISA": ISA,
+        "gang_action_environment": IDENTITY_ROOTS,
+        "cpu_count": str(CPU_COUNT),
+        "memory_kb": "327680",
+    },
+    script = JOURNAL + """
+echo "$E2E_ACTION ${{GANG_MEMORY_KB:-0}}" >> "$E2E_ATTEMPTS" || exit 1
+mkfifo pressure-buffer pressure-wait || exit 1
+exec 4<> pressure-wait || exit 1
+sleep 300 < pressure-buffer &
+reader=$!
+dd if=/dev/zero of=pressure-buffer bs={size} count=1 2>/dev/null &
+writer=$!
+echo "$E2E_RUN pressure neighbour $$" > "$J" || exit 1
+while [ ! -e "$G" ]; do read -r -t 0.05 <&4 || :; done
+exec 4>&-
+exec 3< pressure-buffer || exit 1
+cat <&3 > /dev/null &
+drain=$!
+kill "$reader" 2>/dev/null || :
+exec 3<&-
+wait "$writer" || exit 1
+wait "$drain" || exit 1
+echo "$E2E_RUN pressure neighbour_done $$" > "$J" || exit 1
+echo pressure=complete
+""".format(size = PRESSURE_NEIGHBOUR_BYTES),
+)
+# --- End neighbour-pressure probes ---

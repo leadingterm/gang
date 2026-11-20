@@ -148,6 +148,7 @@ fn controller_spec<'a>(
     fleets: &'a FleetCatalog,
 ) -> ControllerSpec<'a> {
     ControllerSpec {
+        actions: std::sync::Arc::new(gang_config::ActionsConfig::default()),
         content_store: content,
         action_store: action,
         fleets,
@@ -159,10 +160,10 @@ fn controller_spec<'a>(
 
 /// The `NativeLink` configuration the controller runs with.
 fn config() -> Result<NativeLinkConfig, Box<dyn Error>> {
-    Ok(serde_json::from_value(json!({
-        "worker_endpoint": "grpc://127.0.0.1:9100",
-        "scheduler_name": "MAIN_SCHEDULER",
-    }))?)
+    Ok(NativeLinkConfig {
+        worker_endpoint: Some("grpc://127.0.0.1:9100".parse()?),
+        ..NativeLinkConfig::default()
+    })
 }
 
 /// The matcher `NativeLink` uses, built from the scheduler the controller declares.
@@ -223,14 +224,16 @@ fn catalog_accepts_exactly_the_fleets_native_matches_for_normalized_requests() -
     let content = RenderedStoreSpec(json!({ "memory": {} }));
     let action = RenderedStoreSpec(json!({ "memory": {} }));
     let spec = controller_spec(&content, &action, &catalog);
-    let config = config()?;
-    let endpoint = config.resolved_worker_endpoint()?.clone();
+    let mut config = config()?;
+    let endpoint = config.take_worker_endpoint()?;
     let manager = native_manager(&config, &spec)?;
 
     let instance = InstanceId::try_new("local-1")?;
     let mut workers = Vec::with_capacity(fleets.len());
     for fleet in &fleets {
         let worker_spec = WorkerSpec {
+            actions: std::sync::Arc::clone(&spec.actions),
+            memory_pool: None,
             instance: instance.clone(),
             properties: fleet.clone(),
             slots: Slots::LongLived(NonZeroU32::MIN),

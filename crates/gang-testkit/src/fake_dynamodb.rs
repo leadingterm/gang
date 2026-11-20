@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     routing::post,
 };
@@ -45,6 +45,7 @@ impl FakeDynamoDb {
         let state = Arc::new(Mutex::new(StateData::default()));
         let app = Router::new()
             .route("/", post(serve))
+            .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
             .with_state(Arc::clone(&state));
         let task = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -71,6 +72,21 @@ impl FakeDynamoDb {
     #[must_use]
     pub fn requests(&self) -> u64 {
         self.state.lock().requests
+    }
+
+    /// Clones one stored item without issuing a request or changing database state.
+    ///
+    /// Missing tables and keys return `None`, including while requests are unavailable.
+    #[must_use]
+    pub fn item(&self, table: &str, pk: &str, sk: &str) -> Option<Map<String, Value>> {
+        self.state
+            .lock()
+            .db
+            .tables
+            .get(table)?
+            .items
+            .get(&(pk.to_owned(), sk.to_owned()))
+            .cloned()
     }
 
     /// Returns the number of Query requests received.
@@ -1270,6 +1286,45 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn item_snapshot_is_independent_and_never_mutates_state() -> TestResult {
+        let mut db = Database::default();
+        put(&mut db, "one", "1");
+        put(&mut db, "two", "2");
+        let fake = FakeDynamoDb {
+            endpoint: Url::parse("http://127.0.0.1:1")?,
+            state: Arc::new(Mutex::new(StateData {
+                db,
+                unavailable: true,
+                requests: 7,
+                queries: 3,
+                ..StateData::default()
+            })),
+            task: tokio::spawn(std::future::pending()),
+        };
+        assert!(fake.item("missing", "p", "one").is_none());
+        assert!(fake.item("t", "missing", "one").is_none());
+        assert!(fake.item("t", "p", "missing").is_none());
+        let mut snapshot = fake.item("t", "p", "one").ok_or("missing snapshot")?;
+        assert_eq!(snapshot["n"], json!({"N": "1"}));
+        snapshot.insert("n".into(), json!({"N": "99"}));
+        assert_eq!(
+            fake.item("t", "p", "one").ok_or("missing item")?["n"],
+            json!({"N": "1"})
+        );
+        assert_eq!(
+            fake.item("t", "p", "two").ok_or("missing item")?["n"],
+            json!({"N": "2"})
+        );
+        let state = fake.state.lock();
+        assert!(state.unavailable);
+        assert_eq!(state.requests, 7);
+        assert_eq!(state.queries, 3);
+        assert_eq!(state.db.tables.len(), 1);
+        assert_eq!(state.db.tables["t"].items.len(), 2);
+        Ok(())
+    }
+
     #[test]
     fn conditions_handle_precedence_types_and_missing_values() -> TestResult {
         let request = json!({
@@ -1384,6 +1439,39 @@ mod tests {
         assert_eq!(result["Items"][1]["sk"]["S"], "b");
         assert_eq!(result["LastEvaluatedKey"]["sk"]["S"], "b");
         Ok(())
+    }
+
+    #[test]
+    fn nested_handoff_condition_and_atomic_update() {
+        let mut db = Database::default();
+        put(&mut db, "leader", "1");
+        let request = json!({
+            "TableName": "t",
+            "Key": {"pk": {"S": "p"}, "sk": {"S": "leader"}},
+            "ConditionExpression": "(attribute_not_exists(priority) OR (n = :one AND n < :two)) AND NOT (n >= :two)",
+            "UpdateExpression": "SET priority = :two REMOVE n ADD epoch :one",
+            "ExpressionAttributeValues": {":one": {"N": "1"}, ":two": {"N": "2"}},
+            "ReturnValues": "ALL_NEW"
+        });
+        let first = call(&mut db, UPDATE_ITEM, &request);
+        assert_eq!(first["Attributes"]["priority"]["N"], "2");
+        assert_eq!(first["Attributes"]["epoch"]["N"], "1");
+        assert!(first["Attributes"].get("n").is_none());
+        let (status, response) = db.handle(UPDATE_ITEM, &request);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response["__type"],
+            format!("{ERROR_PREFIX}{CONDITION_ERROR}")
+        );
+        let current = call(
+            &mut db,
+            GET_ITEM,
+            &json!({
+                "TableName": "t",
+                "Key": {"pk": {"S": "p"}, "sk": {"S": "leader"}}
+            }),
+        );
+        assert_eq!(current["Item"]["epoch"]["N"], "1");
     }
 
     #[test]

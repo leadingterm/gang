@@ -24,6 +24,7 @@ impl ActionDirectory {
     /// symbolic link cannot move the working directory out of the work directory. The result is the
     /// canonical `<root>/<id>`. Both results are canonical, so a sandbox can bind `path` at its own
     /// path and still enter the working directory.
+    /// The reserved `.side_channels` directory cannot be an action directory.
     ///
     /// # Errors
     ///
@@ -41,7 +42,7 @@ impl ActionDirectory {
             .strip_prefix(&root)
             .ok()
             .and_then(|rest| match rest.components().next() {
-                Some(Component::Normal(id)) => Some(id),
+                Some(Component::Normal(id)) if id != ".side_channels" => Some(id),
                 _ => None,
             });
         match id {

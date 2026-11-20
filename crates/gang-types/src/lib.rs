@@ -49,13 +49,13 @@ mod refusal;
 mod resources;
 mod saturating;
 mod scaling_cause;
-mod scheduler_settings;
 mod secret;
 mod string_enum;
 mod workload_token_settings;
 
 pub mod announcement;
 pub mod duration;
+pub mod handover;
 pub mod health;
 pub mod property;
 
@@ -94,8 +94,7 @@ pub use jws::{Es256Key, Jwk};
 pub use loopback::is_loopback_url;
 pub use names::{
     Audience, CertSerial, CertSerialError, FleetName, InstanceId, InvocationId, MachineClass,
-    Mnemonic, Principal, ProviderName, RoleName, SchedulerName, TargetLabel, ToolDetails,
-    TrustDomain, WorkerId,
+    Mnemonic, Principal, ProviderName, RoleName, TargetLabel, ToolDetails, TrustDomain, WorkerId,
 };
 pub use nonzero::nonzero_u32;
 pub use nonzero_bytes::{NonZeroBytes, NonZeroBytesError};
@@ -107,7 +106,6 @@ pub use refusal::Refusal;
 pub use resources::{ActionResources, Resources};
 pub use saturating::SaturatingInto;
 pub use scaling_cause::ScalingCause;
-pub use scheduler_settings::SchedulerSettings;
 pub use secret::{AccessToken, ClientSecret, DeviceSecret, LoginSession, Proof, RefreshToken};
 pub use string_enum::UnknownVariantError;
 pub use url::Url;

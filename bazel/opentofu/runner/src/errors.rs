@@ -53,6 +53,84 @@ pub enum RunError {
         /// The checked step that wrote to stderr.
         step: Step,
     },
+    /// A JSON-mode test emitted a warning or error diagnostic.
+    #[error("opentofu test emitted a {severity} diagnostic")]
+    Diagnostic {
+        /// Diagnostic severity.
+        severity: String,
+    },
+    /// The explicit test expectations file could not be read.
+    #[error("cannot read test expectations {}", path.display())]
+    ReadExpectations {
+        /// The requested file.
+        path: PathBuf,
+        /// The read failure.
+        #[source]
+        source: io::Error,
+    },
+    /// The expectations JSON has the wrong format.
+    #[error("invalid test expectations JSON")]
+    ParseExpectations {
+        /// The parse failure.
+        #[source]
+        source: serde_json::Error,
+    },
+    /// The expectations must identify at least one run and resource.
+    #[error("empty plan expectations for {run}")]
+    EmptyExpectations {
+        /// The run with no resources, or a marker for the entire file.
+        run: String,
+    },
+    /// The machine-readable test output is malformed.
+    #[error("invalid OpenTofu test JSON at line {line}: {reason}")]
+    InvalidPlanOutput {
+        /// One-based output line number.
+        line: usize,
+        /// Description without plan values.
+        reason: &'static str,
+    },
+    /// A required run or resource did not appear exactly once.
+    #[error("expected exactly one plan for run {run}, address {address}; found {count}")]
+    PlanCount {
+        /// The requested test run.
+        run: String,
+        /// The requested resource, or a marker for the run itself.
+        address: String,
+        /// Number found.
+        count: usize,
+    },
+    /// A resource's actions differed from the contract.
+    #[error(
+        "unexpected actions for run {run}, address {address}: expected {expected:?}, got {actual:?}"
+    )]
+    PlanActions {
+        /// The test run.
+        run: String,
+        /// The resource address.
+        address: String,
+        /// Expected action sequence.
+        expected: Vec<String>,
+        /// Observed action sequence.
+        actual: Vec<String>,
+    },
+    /// An SSM parameter deletion would violate the immutable configuration contract.
+    #[error(
+        "forbidden SSM parameter deletion in run {run}, address {address}, actions {actions:?}"
+    )]
+    ParameterDelete {
+        /// The test run.
+        run: String,
+        /// The resource address.
+        address: String,
+        /// Observed action sequence.
+        actions: Vec<String>,
+    },
+    /// An expectation or machine-readable test result violated the contract.
+    #[error("invalid test evidence: {reason}")]
+    Evidence {
+        /// A value-free description of the violated evidence requirement.
+        reason: String,
+    },
     /// A required environment variable is not set.
     #[error("missing environment variable {name}")]
     Environment {

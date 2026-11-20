@@ -10,19 +10,16 @@ use gang_config::{
 };
 use gang_e2e::{
     AUDIENCE, ActionLimits, ActionTools, ConfigTemplate, ControlKnobs, E2eError, ExecutionKnobs,
-    FleetLayout, IdentityKnobs, LARGE_FLEET, LIMIT_CPU_PERIOD_MICROS, LIMIT_HEADROOM_PERCENT,
-    LIMIT_MAX_PIDS, NOOP_FLEET, ORGANIZATION, ORGANIZATION_CLAIM, PermitNetwork, Placement,
-    SMALL_FLEET, Sandbox, ServerKnobs, SoftMemory, Transport, Variant,
+    FleetLayout, IdentityKnobs, LARGE_FLEET, LIMIT_CPU_PERIOD_MICROS, LIMIT_MAX_PIDS, NOOP_FLEET,
+    ORGANIZATION, ORGANIZATION_CLAIM, PermitNetwork, Placement, SMALL_FLEET, Sandbox, ServerKnobs,
+    SoftMemory, Transport, Variant,
 };
 use gang_main::plugins::{
     CacheConfig, ClientAuthenticationConfig, DatabaseConfig, IdentityProviderConfig, LimitsConfig,
-    Plugins, ProvisionerConfig, SandboxKey, SchedulerConfig, SignerConfig,
-    WorkerAuthenticationConfig,
+    Plugins, ProvisionerConfig, SandboxKey, SignerConfig, WorkerAuthenticationConfig,
 };
-use gang_nativelink::NativeLinkConfig;
 use gang_types::{
-    AbsolutePathBuf, AuthenticationSettings, Bytes, CaPin, PermissionSet, ProviderName,
-    SchedulerSettings, Url,
+    AbsolutePathBuf, AuthenticationSettings, Bytes, CaPin, PermissionSet, ProviderName, Url,
 };
 use toml::Table;
 
@@ -79,6 +76,7 @@ fn tools() -> ActionTools {
         bwrap: Some(PathBuf::from("/nix/store/ccc-bubblewrap/bin/bwrap")),
         path: "/nix/store/aaa-bash/bin:/nix/store/bbb-coreutils/bin".to_owned(),
         action_bin: PathBuf::from("/nix/store/ddd-action-tools/bin"),
+        ca_bundle: None,
         glibc_tool: None,
         glibc_loader: Vec::new(),
     }
@@ -90,7 +88,7 @@ fn placed_base_omits_announced_endpoints_and_parses_as_toml() -> gang_e2e::Resul
         let (_, template) = placed(transport)?;
         let doc = typed_rendered(&template)?;
         assert!(doc.endpoint.is_none());
-        assert!(doc.scheduler.worker_endpoint().is_none());
+        assert!(doc.worker_endpoint.is_none());
     }
     Ok(())
 }
@@ -173,7 +171,7 @@ fn place_points_listeners_paths_and_endpoints_at_the_placement() -> gang_e2e::Re
         doc.endpoint.is_none(),
         "the server announces its public endpoint"
     );
-    assert!(doc.scheduler.worker_endpoint().is_none());
+    assert!(doc.worker_endpoint.is_none());
     assert!(!template.render()?.contains("grpc://"));
     assert_eq!(doc.fleets[0].name.as_str(), "local-worker-x86-64");
     assert_eq!(doc.fleets[0].max_instances.get(), 4);
@@ -213,7 +211,7 @@ fn place_plain_drops_identity_and_announces_its_endpoints() -> gang_e2e::Result<
         doc.endpoint.is_none(),
         "the server announces its public endpoint"
     );
-    assert!(doc.scheduler.worker_endpoint().is_none());
+    assert!(doc.worker_endpoint.is_none());
     Ok(())
 }
 
@@ -267,32 +265,31 @@ fn place_tls_keeps_identity_and_announces_its_worker_endpoint() -> gang_e2e::Res
     let (_placement, template) = placed(Transport::Tls)?;
     let doc = typed_rendered(&template)?;
     assert!(!doc.identity.providers.is_empty());
-    assert!(doc.scheduler.worker_endpoint().is_none());
+    assert!(doc.worker_endpoint.is_none());
     Ok(())
 }
 
 #[test]
-fn place_nativelink_table_parses_with_the_scheduler_config() -> gang_e2e::Result<()> {
+fn place_action_settings_parse_as_domain_config() -> gang_e2e::Result<()> {
     for transport in [Transport::Plain, Transport::Tls] {
         let (_placement, template) = placed(transport)?;
         let doc = typed_rendered(&template)?;
-        let SchedulerConfig::Nativelink(_config) = doc.scheduler;
+        assert!(doc.actions.cold_start.memory.get().get() > 0);
     }
     Ok(())
 }
 
 #[test]
-fn three_cold_actions_fit_one_placed_worker() -> gang_e2e::Result<()> {
+fn cold_actions_fit_one_placed_worker() -> gang_e2e::Result<()> {
     let (_, template) = placed(Transport::Tls)?;
     let template = template.vary(&placement_variant(Sandbox::Bwrap), &launcher(), &tools())?;
     let doc = typed_rendered(&template)?;
-    let SchedulerConfig::Nativelink(nativelink) = &doc.scheduler;
-    let cold_memory = nativelink.cold_start.memory.get().get();
-    let cold_disk = nativelink.cold_start.disk.get().get();
+    let cold_memory = doc.actions.cold_start.memory.get().get();
+    let cold_disk = doc.actions.cold_start.disk.get().get();
     let fleet = &doc.fleets[0];
     assert!(
-        cold_memory.saturating_mul(3) <= fleet.memory_per_instance.as_u64(),
-        "three cold actions of {cold_memory} bytes of memory do not fit one worker of {}",
+        cold_memory.saturating_mul(4) <= fleet.memory_per_instance.as_u64(),
+        "four cold actions of {cold_memory} bytes of memory do not fit one worker of {}",
         fleet.memory_per_instance
     );
     assert!(
@@ -303,15 +300,14 @@ fn three_cold_actions_fit_one_placed_worker() -> gang_e2e::Result<()> {
     Ok(())
 }
 
-/// The scheduler configuration of the fixture varied by `variant`.
-fn varied_nativelink(variant: Variant) -> gang_e2e::Result<NativeLinkConfig> {
-    let doc = typed_rendered(&ConfigTemplate::parse(&base_config()?)?.vary(
-        &variant,
-        &launcher(),
-        &tools(),
-    )?)?;
-    let SchedulerConfig::Nativelink(nativelink) = doc.scheduler;
-    Ok(nativelink)
+/// The document of the fixture varied by `variant`.
+fn varied_document(variant: &Variant) -> gang_e2e::Result<Document<Plugins>> {
+    typed_rendered(&ConfigTemplate::parse(&base_config()?)?.vary(variant, &launcher(), &tools())?)
+}
+
+/// The action policy of the fixture varied by `variant`.
+fn varied_actions(variant: &Variant) -> gang_e2e::Result<gang_config::ActionsConfig> {
+    Ok(varied_document(variant)?.actions)
 }
 
 #[test]
@@ -325,8 +321,8 @@ fn burst_queue_fits_one_http2_connection() -> gang_e2e::Result<()> {
             control,
             ..Variant::baseline(Sandbox::Noop)
         };
-        let nativelink = varied_nativelink(variant)?;
-        assert_eq!(nativelink.http2.max_concurrent_streams.get(), expected);
+        let doc = varied_document(&variant)?;
+        assert_eq!(doc.server.http2.max_concurrent_streams.get(), expected);
     }
     Ok(())
 }
@@ -340,7 +336,7 @@ fn short_boot_grace_bounds_shutdown_and_preserves_shorter_setting() -> gang_e2e:
     for (suffix, expected) in [
         ("", std::time::Duration::from_secs(5)),
         (
-            "\n[scheduler.nativelink.http2]\nshutdown_grace = \"3s\"\n",
+            "\n[server.http2]\nshutdown_grace = \"3s\"\n",
             std::time::Duration::from_secs(3),
         ),
     ] {
@@ -351,59 +347,62 @@ fn short_boot_grace_bounds_shutdown_and_preserves_shorter_setting() -> gang_e2e:
         let config = text
             .parse::<GangConfig<Plugins>>()
             .map_err(|error| E2eError::Template(error.to_string()))?;
-        let SchedulerConfig::Nativelink(scheduler) = config.scheduler;
-        assert_eq!(scheduler.http2.shutdown_grace, expected);
+        assert_eq!(config.server.http2.shutdown_grace, expected);
         assert!(
             config
                 .fleets
                 .policies()
                 .iter()
-                .all(|fleet| scheduler.http2.shutdown_grace < fleet.boot_grace)
+                .all(|fleet| config.server.http2.shutdown_grace < fleet.boot_grace)
         );
     }
     Ok(())
 }
 
 #[test]
-fn vary_soft_memory_off_disables_the_nativelink_memory_enforcement() -> gang_e2e::Result<()> {
+fn vary_soft_memory_off_disables_soft_memory_enforcement() -> gang_e2e::Result<()> {
     let variant = Variant {
         soft_memory: SoftMemory::Off,
         ..Variant::baseline(Sandbox::Noop)
     };
-    let nativelink = varied_nativelink(variant)?;
-    assert_eq!(
-        nativelink.memory.enforcement,
-        gang_nativelink::MemoryEnforcement::None
+    let actions = varied_actions(&variant)?;
+    assert_ne!(
+        actions.memory.enforcement,
+        gang_config::MemoryEnforcement::Soft
     );
     Ok(())
 }
 
 #[test]
-fn vary_soft_memory_enforced_uses_default_memory_tuning() -> gang_e2e::Result<()> {
-    let nativelink = varied_nativelink(Variant::baseline(Sandbox::Noop))?;
-    assert_eq!(nativelink.memory, gang_nativelink::MemoryTuning::default());
+fn vary_soft_memory_enforced_opts_into_soft_memory() -> gang_e2e::Result<()> {
+    let variant = Variant {
+        soft_memory: SoftMemory::Enforced,
+        ..Variant::baseline(Sandbox::Noop)
+    };
+    let actions = varied_actions(&variant)?;
+    assert_eq!(
+        actions.memory.enforcement,
+        gang_config::MemoryEnforcement::Soft
+    );
     Ok(())
 }
 
 #[test]
 fn disk_soft_enforcement_is_opted_into_for_the_disk_scenario() -> gang_e2e::Result<()> {
     let baseline = Variant::baseline(Sandbox::Noop);
-    let nativelink = varied_nativelink(baseline)?;
+    let actions = varied_actions(&baseline)?;
     assert_eq!(
-        nativelink.disk.enforcement,
-        gang_nativelink::DiskEnforcement::Pressure
+        actions.disk.enforcement,
+        gang_config::DiskEnforcement::Pressure
     );
 
     let variant = Variant {
         soft_disk: true,
         ..baseline
     };
-    let nativelink = varied_nativelink(variant)?;
-    assert_eq!(
-        nativelink.disk.enforcement,
-        gang_nativelink::DiskEnforcement::Soft
-    );
-    assert_eq!(nativelink.disk.min_reservation.as_units(), 1024);
+    let actions = varied_actions(&variant)?;
+    assert_eq!(actions.disk.enforcement, gang_config::DiskEnforcement::Soft);
+    assert_eq!(actions.disk.min_reservation.as_units(), 1024);
     Ok(())
 }
 
@@ -459,6 +458,34 @@ fn bwrap_binds_action_tools_at_standard_paths() -> gang_e2e::Result<()> {
             (std::path::Path::new("/bin"), tools.action_bin.as_path()),
             (std::path::Path::new("/usr/bin"), tools.action_bin.as_path()),
         ]
+    );
+    Ok(())
+}
+
+#[test]
+fn bwrap_mounts_the_public_bundle_at_each_system_path() -> gang_e2e::Result<()> {
+    let (_, template) = placed(Transport::Plain)?;
+    let mut tools = tools();
+    let bundle = PathBuf::from("/nix/store/example-cacert/ca-bundle.crt");
+    tools.ca_bundle = Some(bundle.clone());
+    let template = template.vary(&Variant::baseline(Sandbox::Bwrap), &launcher(), &tools)?;
+    let doc = typed_rendered(&template)?;
+    let bwrap = doc.sandbox.bwrap.as_ref().expect("bwrap sandbox");
+    for path in [
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/ssl/cert.pem",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+    ] {
+        assert!(bwrap.readonly_bind_mounts.iter().any(
+            |(destination, source)| destination.as_path() == std::path::Path::new(path)
+                && source.as_path() == bundle.as_path()
+        ));
+    }
+    assert!(
+        !bwrap
+            .readonly_bind_paths
+            .iter()
+            .any(|path| path.as_path() == std::path::Path::new("/etc"))
     );
     Ok(())
 }
@@ -541,6 +568,7 @@ fn bwrap_rejects_host_action_tools_but_noop_does_not() -> gang_e2e::Result<()> {
                 bwrap: Some(PathBuf::from("/nix/store/ccc-bubblewrap/bin/bwrap")),
                 path: "/usr/bin:/bin".to_owned(),
                 action_bin: PathBuf::from("/nix/store/ddd-action-tools/bin"),
+                ca_bundle: None,
                 glibc_tool: None,
                 glibc_loader: Vec::new(),
             },
@@ -552,6 +580,7 @@ fn bwrap_rejects_host_action_tools_but_noop_does_not() -> gang_e2e::Result<()> {
                 bwrap: Some(PathBuf::from("/nix/store/ccc-bubblewrap/bin/bwrap")),
                 path: "/usr/bin:/bin".to_owned(),
                 action_bin: PathBuf::from("/nix/store/ddd-action-tools/bin"),
+                ca_bundle: None,
                 glibc_tool: None,
                 glibc_loader: Vec::new(),
             },
@@ -677,10 +706,6 @@ fn vary_cgroup_adds_the_action_limits() -> gang_e2e::Result<()> {
         panic!("cgroup limits expected");
     };
     assert_eq!(cgroup.delegation, gang_cgroup::Delegation::Trusted);
-    assert_eq!(
-        u32::from(cgroup.memory_headroom_percent.get()),
-        LIMIT_HEADROOM_PERCENT
-    );
     assert_eq!(cgroup.max_pids.get(), LIMIT_MAX_PIDS);
     assert_eq!(
         cgroup.cpu_period.get(),
@@ -1020,6 +1045,97 @@ fn launch_failure_preset_sets_missing_launcher_and_short_timeout() -> gang_e2e::
 }
 
 #[test]
+fn fleets_preset_shortens_cleanup_without_changing_placement_or_polling() -> gang_e2e::Result<()> {
+    let base = base_config()?;
+    for sandbox in [Sandbox::Noop, Sandbox::Bwrap] {
+        let variant = placement_variant(sandbox);
+        let untuned = typed_rendered(&ConfigTemplate::parse(&base)?.vary(
+            &variant,
+            &launcher(),
+            &tools(),
+        )?)?;
+        let tuned = typed_rendered(&ConfigTemplate::parse(&base)?.vary(
+            &Variant {
+                control: ControlKnobs::FLEETS,
+                ..variant
+            },
+            &launcher(),
+            &tools(),
+        )?)?;
+        assert_eq!(tuned.poll_interval, untuned.poll_interval);
+        assert_eq!(
+            tuned.poll_interval.get(),
+            std::time::Duration::from_millis(500)
+        );
+        assert_eq!(tuned.client_action_timeout, untuned.client_action_timeout);
+        assert_eq!(tuned.fleets.len(), 3);
+        for (fleet, before) in tuned.fleets.iter().zip(&untuned.fleets) {
+            assert_eq!(fleet.name, before.name);
+            assert_eq!(fleet.sandbox, before.sandbox);
+            assert_eq!(fleet.min_instances, before.min_instances);
+            assert_eq!(fleet.max_instances, before.max_instances);
+            assert_eq!(fleet.idle_timeout, std::time::Duration::from_secs(2));
+            assert_eq!(fleet.max_drain_wait, before.max_drain_wait);
+            assert_eq!(fleet.boot_grace, before.boot_grace);
+        }
+        let ProvisionerConfig::Local(local) = tuned.provisioner else {
+            panic!("local provisioner expected");
+        };
+        assert_eq!(
+            local.terminate_grace.get(),
+            std::time::Duration::from_secs(1)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn drain_cancel_bounds_only_its_drain_and_termination_waits() -> gang_e2e::Result<()> {
+    let base = base_config()?;
+    let variant = placement_variant(Sandbox::Noop);
+    let tuned = typed_rendered(&ConfigTemplate::parse(&base)?.vary(
+        &Variant {
+            control: ControlKnobs::DRAIN_CANCEL,
+            ..variant
+        },
+        &launcher(),
+        &tools(),
+    )?)?;
+    assert_eq!(tuned.poll_interval.get(), std::time::Duration::from_secs(2));
+    assert_eq!(
+        tuned.dashboard.detail_interval.get(),
+        std::time::Duration::from_secs(1)
+    );
+    for fleet in &tuned.fleets {
+        assert_eq!(fleet.idle_timeout, std::time::Duration::from_secs(5));
+        assert_eq!(fleet.max_drain_wait, std::time::Duration::from_secs(10));
+        assert_eq!(fleet.min_instances, 0);
+        assert_eq!(fleet.max_instances.get(), 1);
+    }
+    let untuned =
+        typed_rendered(&ConfigTemplate::parse(&base)?.vary(&variant, &launcher(), &tools())?)?;
+    assert_eq!(tuned.client_action_timeout, untuned.client_action_timeout);
+    for fleet in &untuned.fleets {
+        assert_eq!(fleet.max_drain_wait, std::time::Duration::from_mins(1));
+    }
+    let ProvisionerConfig::Local(local) = tuned.provisioner else {
+        panic!("local provisioner expected");
+    };
+    assert_eq!(
+        local.terminate_grace.get(),
+        std::time::Duration::from_secs(1)
+    );
+    let ProvisionerConfig::Local(local) = untuned.provisioner else {
+        panic!("local provisioner expected");
+    };
+    assert_eq!(
+        local.terminate_grace.get(),
+        std::time::Duration::from_secs(10)
+    );
+    Ok(())
+}
+
+#[test]
 fn scheduled_minimum_preset_applies_to_every_fleet() -> gang_e2e::Result<()> {
     let variant = Variant {
         control: ControlKnobs::SCHEDULED_MINIMUM,
@@ -1340,18 +1456,10 @@ impl AuthenticationSettings for OpaqueAuthentication {
     }
 }
 
-/// The scheduler plugin section: an opaque table the tests never read.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(transparent)]
-struct OpaqueScheduler(Table);
-
-impl SchedulerSettings for OpaqueScheduler {}
-
 impl PluginSet for OpaquePlugins {
     type Provisioner = Table;
     type Cache = Table;
     type Signer = Table;
-    type Scheduler = OpaqueScheduler;
     type Database = Table;
     type SandboxKey = OpaqueSandboxKey;
     type Sandbox = OpaqueSandboxes;
@@ -1386,36 +1494,24 @@ fn rendered_tls_and_plaintext_configs_parse_as_gang_configs() -> gang_e2e::Resul
     Ok(())
 }
 
-#[test]
-fn every_rendered_variant_parses_with_the_real_plugins() -> gang_e2e::Result<()> {
-    let base = base_config()?;
-    let placement = Placement::create(None)?;
-    let issuer = Url::parse("https://issuer.example.test/").expect("a valid issuer URL");
-    let worker_launcher = launcher();
+fn check_real_plugin_parse(text: &str, cold_start: gang_e2e::ColdStart) -> gang_e2e::Result<()> {
+    let parsed = text.parse::<GangConfig<gang_main::plugins::Plugins>>();
+    if cold_start == gang_e2e::ColdStart::Misfit {
+        let Err(error) = parsed else {
+            return Err(E2eError::Template(
+                "misfit cold start was accepted".to_owned(),
+            ));
+        };
+        assert!(error.to_string().contains("actions.cold_start"), "{error}");
+    } else {
+        parsed.map_err(|error| E2eError::Template(error.to_string()))?;
+    }
+    Ok(())
+}
 
-    let check = |variant: Variant, transport: Transport, preset: &str| -> gang_e2e::Result<()> {
-        let result: gang_e2e::Result<()> = (|| {
-            let template = ConfigTemplate::parse(&base)?
-                .place(&placement, transport)?
-                .vary(&variant, &worker_launcher, &tools())?;
-            let template = if transport == Transport::Tls {
-                template.with_identity(&issuer, variant.identity)?
-            } else {
-                template
-            };
-            let text = template.render()?;
-            text.parse::<GangConfig<gang_main::plugins::Plugins>>()
-                .map_err(|error| E2eError::Template(error.to_string()))?;
-            Ok(())
-        })();
-        result.map_err(|error| {
-            E2eError::Template(format!(
-                "rendering or parsing {variant:?}, {preset}, over {transport:?}: {}",
-                gang_types::error_chain(&error)
-            ))
-        })
-    };
-
+fn check_base_variants(
+    check: &dyn Fn(Variant, Transport, &str) -> gang_e2e::Result<()>,
+) -> gang_e2e::Result<()> {
     for sandbox in [Sandbox::Noop, Sandbox::Bwrap] {
         for permit_network in [PermitNetwork::Denied, PermitNetwork::Permitted] {
             for input_links in [InputLinks::Keep, InputLinks::Break] {
@@ -1440,6 +1536,38 @@ fn every_rendered_variant_parses_with_the_real_plugins() -> gang_e2e::Result<()>
             }
         }
     }
+    Ok(())
+}
+
+#[test]
+fn every_rendered_variant_parses_with_the_real_plugins() -> gang_e2e::Result<()> {
+    let base = base_config()?;
+    let placement = Placement::create(None)?;
+    let issuer = Url::parse("https://issuer.example.test/").expect("a valid issuer URL");
+    let worker_launcher = launcher();
+
+    let check = |variant: Variant, transport: Transport, preset: &str| -> gang_e2e::Result<()> {
+        let result: gang_e2e::Result<()> = (|| {
+            let template = ConfigTemplate::parse(&base)?
+                .place(&placement, transport)?
+                .vary(&variant, &worker_launcher, &tools())?;
+            let template = if transport == Transport::Tls {
+                template.with_identity(&issuer, variant.identity)?
+            } else {
+                template
+            };
+            let text = template.render()?;
+            check_real_plugin_parse(&text, variant.execution.cold_start)
+        })();
+        result.map_err(|error| {
+            E2eError::Template(format!(
+                "rendering or parsing {variant:?}, {preset}, over {transport:?}: {}",
+                gang_types::error_chain(&error)
+            ))
+        })
+    };
+
+    check_base_variants(&check)?;
     // Exercise each family independently for each sandbox and transport, in addition to the
     // complete base product above, without multiplying the family presets by every base knob.
     for sandbox in [Sandbox::Noop, Sandbox::Bwrap] {
@@ -1469,6 +1597,11 @@ fn every_rendered_variant_parses_with_the_real_plugins() -> gang_e2e::Result<()>
                 check(
                     Variant {
                         control: preset,
+                        fleets: if preset == ControlKnobs::FLEETS {
+                            FleetLayout::Placement
+                        } else {
+                            baseline.fleets
+                        },
                         ..baseline
                     },
                     transport,

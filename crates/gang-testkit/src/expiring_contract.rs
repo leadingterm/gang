@@ -1,9 +1,14 @@
 //! Contract cases for expiring records, shared by database implementations.
 
+use std::num::NonZeroUsize;
+
 use gang_clock::Timestamp;
 use gang_spi::{
-    ExpiringRecordPort, Insert, Record, RecordId, RecordKey, RecordKind, RecordVersion, Remove,
-    Replace,
+    Acquisition, ApplyRecords, CandidateGeneration, CandidatePriority, ControllerId,
+    ExpiringRecordPort, Insert, LeaderLeasePort, Lease, LeaseCandidate, LeaseEpoch,
+    MAX_RECORD_BODY_BYTES, MAX_RECORD_BODY_BYTES_PER_BATCH, MAX_RECORD_CHANGES, Record,
+    RecordBatchSeq, RecordChange, RecordId, RecordKey, RecordKind, RecordVersion, Remove, Renewal,
+    Replace, Takeover,
 };
 
 use crate::TestResult;
@@ -45,6 +50,73 @@ pub async fn record_insert_and_expiry<D: ExpiringRecordPort>(database: &D) -> Te
     assert_eq!(database.get(&k, ts(9)).await?, Some(record(b"body", 1, 10)));
     assert_eq!(database.get(&k, ts(10)).await?, None);
     assert_eq!(database.get(&k, ts(11)).await?, None);
+    Ok(())
+}
+
+/// Listing is ordered, excludes expired and other-kind records, and reports only live overflow.
+///
+/// # Errors
+/// Returns a database error.
+///
+/// # Panics
+/// Panics if pagination, filtering, or buffer replacement violates the contract.
+pub async fn record_list_pages_live_records<D: ExpiringRecordPort>(database: &D) -> TestResult {
+    let kind = RecordKind::InfrastructureEvent;
+    for (id, expiry) in [(1, 10), (2, 20), (3, 10), (4, 20), (5, 10)] {
+        database
+            .insert(
+                &[(key(kind, id), &[id])],
+                RecordVersion::new(1),
+                ts(1),
+                ts(expiry),
+            )
+            .await?;
+    }
+    database
+        .insert(
+            &[(key(RecordKind::LoginAttempt, 3), b"other")],
+            RecordVersion::new(1),
+            ts(1),
+            ts(20),
+        )
+        .await?;
+    let mut page = vec![(key(kind, 99).id, record(b"stale", 1, 99))];
+    assert!(
+        database
+            .records(kind, None, NonZeroUsize::MIN, ts(10), &mut page)
+            .await?
+    );
+    assert_eq!(page, vec![(key(kind, 2).id, record(&[2], 1, 20))]);
+    assert!(
+        !database
+            .records(
+                kind,
+                Some(key(kind, 2).id),
+                NonZeroUsize::MIN,
+                ts(10),
+                &mut page
+            )
+            .await?
+    );
+    assert_eq!(page, vec![(key(kind, 4).id, record(&[4], 1, 20))]);
+    assert!(
+        !database
+            .records(
+                kind,
+                Some(key(kind, 4).id),
+                NonZeroUsize::MIN,
+                ts(10),
+                &mut page
+            )
+            .await?
+    );
+    assert!(page.is_empty());
+    assert!(
+        !database
+            .records(kind, None, NonZeroUsize::MIN, ts(20), &mut page)
+            .await?
+    );
+    assert!(page.is_empty());
     Ok(())
 }
 
@@ -355,6 +427,677 @@ pub async fn record_purge<D: ExpiringRecordPort>(database: &D) -> TestResult {
     assert_eq!(
         database.get(&live, ts(10)).await?,
         Some(record(b"live", 3, 20))
+    );
+    Ok(())
+}
+
+fn candidate(holder: &str) -> LeaseCandidate {
+    LeaseCandidate {
+        holder: ControllerId::new(holder),
+        priority: CandidatePriority::registered(CandidateGeneration::default()),
+    }
+}
+
+async fn acquired<D: LeaderLeasePort>(database: &D) -> Result<Lease, Box<dyn std::error::Error>> {
+    match database
+        .acquire(
+            &candidate("history-contract"),
+            ts(1),
+            ts(1),
+            ts(10_000),
+            Takeover::Observe,
+        )
+        .await?
+    {
+        Acquisition::Acquired(lease) => Ok(lease),
+        outcome => Err(format!("fresh fixture did not acquire a lease: {outcome:?}").into()),
+    }
+}
+
+/// Lists only live records in byte order with exclusive cursors and an exact more flag.
+///
+/// # Errors
+/// Returns a database error.
+///
+/// # Panics
+/// Panics when paging or expiration differs from the contract.
+pub async fn records_page_live_in_order<D: ExpiringRecordPort + LeaderLeasePort>(
+    database: &D,
+) -> TestResult {
+    let lease = acquired(database).await?;
+    let kind = RecordKind::ResourceHistory;
+    let body = vec![7; 60_000];
+    // More than one DynamoDB query page of expired records precedes the live entries.
+    for start in [0_u8, 10, 20] {
+        let changes: Vec<_> = (start..start + 10)
+            .map(|id| RecordChange::Put {
+                key: key(kind, id),
+                body: &body,
+                expires_at: ts(10),
+            })
+            .collect();
+        assert_eq!(
+            database
+                .apply(
+                    &lease,
+                    RecordBatchSeq::new(u64::from(start / 10) + 1),
+                    RecordVersion::new(u64::from(start / 10) + 101),
+                    ts(2),
+                    &changes
+                )
+                .await?,
+            ApplyRecords::Applied
+        );
+    }
+    let changes: Vec<_> = [32, 31, 33]
+        .into_iter()
+        .map(|id| RecordChange::Put {
+            key: key(kind, id),
+            body: b"live",
+            expires_at: ts(30),
+        })
+        .collect();
+    assert_eq!(
+        database
+            .apply(
+                &lease,
+                RecordBatchSeq::new(4),
+                RecordVersion::new(104),
+                ts(2),
+                &changes
+            )
+            .await?,
+        ApplyRecords::Applied
+    );
+    let mut page = vec![(key(kind, 99).id, record(b"stale", 1, 99))];
+    let limit = NonZeroUsize::MIN.saturating_add(1);
+    assert!(
+        database
+            .records(kind, None, limit, ts(10), &mut page)
+            .await?
+    );
+    assert_eq!(
+        page,
+        vec![
+            (key(kind, 31).id, record(b"live", 104, 30)),
+            (key(kind, 32).id, record(b"live", 104, 30))
+        ]
+    );
+    assert!(
+        !database
+            .records(kind, Some(key(kind, 32).id), limit, ts(10), &mut page)
+            .await?
+    );
+    assert_eq!(page, vec![(key(kind, 33).id, record(b"live", 104, 30))]);
+    assert!(
+        !database
+            .records(kind, Some(key(kind, 33).id), limit, ts(10), &mut page)
+            .await?
+    );
+    assert!(page.is_empty());
+    assert!(
+        !database
+            .records(kind, None, limit, ts(30), &mut page)
+            .await?
+    );
+    assert!(page.is_empty());
+    Ok(())
+}
+
+/// Applies upserts and idempotent deletes with the supplied per-record expiry.
+///
+/// # Errors
+/// Returns a database error.
+///
+/// # Panics
+/// Panics if a mutation or its expiry is incorrect.
+pub async fn apply_upserts_and_deletes<D: ExpiringRecordPort + LeaderLeasePort>(
+    database: &D,
+) -> TestResult {
+    let lease = acquired(database).await?;
+    let a = key(RecordKind::ResourceHistory, 1);
+    let b = key(RecordKind::DurationHistory, 2);
+    let absent = key(RecordKind::HistoryChunk, 3);
+    let changes = [
+        RecordChange::Put {
+            key: a,
+            body: b"old",
+            expires_at: ts(50),
+        },
+        RecordChange::Put {
+            key: b,
+            body: b"remove",
+            expires_at: ts(5),
+        },
+    ];
+    assert_eq!(
+        database
+            .apply(
+                &lease,
+                RecordBatchSeq::new(1),
+                RecordVersion::new(101),
+                ts(2),
+                &changes
+            )
+            .await?,
+        ApplyRecords::Applied
+    );
+    let changes = [
+        RecordChange::Put {
+            key: a,
+            body: b"new",
+            expires_at: ts(20),
+        },
+        RecordChange::Delete { key: b },
+        RecordChange::Delete { key: absent },
+    ];
+    assert_eq!(
+        database
+            .apply(
+                &lease,
+                RecordBatchSeq::new(2),
+                RecordVersion::new(102),
+                ts(6),
+                &changes
+            )
+            .await?,
+        ApplyRecords::Applied
+    );
+    assert_eq!(
+        database.get(&a, ts(19)).await?,
+        Some(record(b"new", 102, 20))
+    );
+    assert_eq!(database.get(&a, ts(20)).await?, None);
+    assert_eq!(database.get(&b, ts(2)).await?, None);
+    Ok(())
+}
+
+/// Rejects duplicate keys and portable transaction limits without partial writes.
+///
+/// # Errors
+/// Returns a database error for fixture setup or reads.
+///
+/// # Panics
+/// Panics if a limit is not enforced atomically.
+pub async fn apply_enforces_batch_limits<D: ExpiringRecordPort + LeaderLeasePort>(
+    database: &D,
+) -> TestResult {
+    let lease = acquired(database).await?;
+    batch_operation_limit(database, &lease).await?;
+    batch_duplicate_keys(database, &lease).await?;
+    batch_body_limits(database, &lease).await
+}
+
+async fn batch_operation_limit<D: ExpiringRecordPort>(database: &D, lease: &Lease) -> TestResult {
+    let kind = RecordKind::HistoryChunk;
+    let limit = u8::try_from(MAX_RECORD_CHANGES)?;
+    let changes: Vec<_> = (0..limit)
+        .map(|id| RecordChange::Delete { key: key(kind, id) })
+        .collect();
+    assert_eq!(
+        database
+            .apply(
+                lease,
+                RecordBatchSeq::new(1),
+                RecordVersion::new(101),
+                ts(2),
+                &changes
+            )
+            .await?,
+        ApplyRecords::Applied
+    );
+    let mut too_many = changes.clone();
+    too_many.push(RecordChange::Put {
+        key: key(kind, 100),
+        body: b"x",
+        expires_at: ts(100),
+    });
+    assert!(
+        database
+            .apply(
+                lease,
+                RecordBatchSeq::new(2),
+                RecordVersion::new(102),
+                ts(2),
+                &too_many
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(database.get(&key(kind, 100), ts(2)).await?, None);
+    Ok(())
+}
+
+async fn batch_duplicate_keys<D: ExpiringRecordPort>(database: &D, lease: &Lease) -> TestResult {
+    let kind = RecordKind::HistoryChunk;
+    let duplicate = [
+        RecordChange::Put {
+            key: key(kind, 101),
+            body: b"x",
+            expires_at: ts(100),
+        },
+        RecordChange::Delete {
+            key: key(kind, 101),
+        },
+    ];
+    assert!(
+        database
+            .apply(
+                lease,
+                RecordBatchSeq::new(2),
+                RecordVersion::new(103),
+                ts(2),
+                &duplicate
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(database.get(&key(kind, 101), ts(2)).await?, None);
+    Ok(())
+}
+
+async fn batch_body_limits<D: ExpiringRecordPort>(database: &D, lease: &Lease) -> TestResult {
+    let kind = RecordKind::HistoryChunk;
+    let body = vec![9; MAX_RECORD_BODY_BYTES_PER_BATCH / 6];
+    let mut changes: Vec<_> = (110..116)
+        .map(|id| RecordChange::Put {
+            key: key(kind, id),
+            body: &body,
+            expires_at: ts(100),
+        })
+        .collect();
+    assert_eq!(
+        database
+            .apply(
+                lease,
+                RecordBatchSeq::new(2),
+                RecordVersion::new(104),
+                ts(2),
+                &changes
+            )
+            .await?,
+        ApplyRecords::Applied
+    );
+    let oversize = vec![8; MAX_RECORD_BODY_BYTES + 1];
+    let too_large = [
+        RecordChange::Delete {
+            key: key(kind, 110),
+        },
+        RecordChange::Put {
+            key: key(kind, 117),
+            body: &oversize,
+            expires_at: ts(100),
+        },
+    ];
+    assert!(
+        database
+            .apply(
+                lease,
+                RecordBatchSeq::new(3),
+                RecordVersion::new(105),
+                ts(2),
+                &too_large
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        database.get(&key(kind, 110), ts(2)).await?,
+        Some(record(&body, 104, 100))
+    );
+    assert_eq!(database.get(&key(kind, 117), ts(2)).await?, None);
+    changes.push(RecordChange::Put {
+        key: key(kind, 116),
+        body: b"x",
+        expires_at: ts(100),
+    });
+    assert!(
+        database
+            .apply(
+                lease,
+                RecordBatchSeq::new(3),
+                RecordVersion::new(106),
+                ts(2),
+                &changes
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(database.get(&key(kind, 116), ts(2)).await?, None);
+    assert_eq!(
+        database.get(&key(kind, 110), ts(2)).await?,
+        Some(record(&body, 104, 100))
+    );
+    assert_eq!(
+        database
+            .apply(
+                lease,
+                RecordBatchSeq::new(3),
+                RecordVersion::new(107),
+                ts(2),
+                &[]
+            )
+            .await?,
+        ApplyRecords::Applied
+    );
+    Ok(())
+}
+
+async fn reject_wrong_lease_identity<D: ExpiringRecordPort>(
+    database: &D,
+    lease: &Lease,
+    changes: &[RecordChange<'_>],
+) -> TestResult {
+    let wrong_holder = Lease {
+        holder: ControllerId::new("other"),
+        ..lease.clone()
+    };
+    let wrong_epoch = Lease {
+        epoch: LeaseEpoch::new(lease.epoch.get() + 1),
+        ..lease.clone()
+    };
+    for invalid in [&wrong_holder, &wrong_epoch] {
+        assert_eq!(
+            database
+                .apply(
+                    invalid,
+                    RecordBatchSeq::new(2),
+                    RecordVersion::new(102),
+                    ts(3),
+                    changes
+                )
+                .await?,
+            ApplyRecords::Fenced
+        );
+        assert_eq!(
+            database
+                .apply(
+                    invalid,
+                    RecordBatchSeq::new(2),
+                    RecordVersion::new(103),
+                    ts(3),
+                    &[]
+                )
+                .await?,
+            ApplyRecords::Fenced
+        );
+    }
+    Ok(())
+}
+
+/// Fences stale holders, epochs, expired and released leases, including empty batches.
+///
+/// # Errors
+/// Returns a database error.
+///
+/// # Panics
+/// Panics if a stale writer changes any record.
+pub async fn apply_rejects_invalid_leases<D: ExpiringRecordPort + LeaderLeasePort>(
+    database: &D,
+) -> TestResult {
+    let lease = acquired(database).await?;
+    let a = key(RecordKind::ResourceHistory, 1);
+    let b = key(RecordKind::ResourceHistory, 2);
+    let initial = [RecordChange::Put {
+        key: a,
+        body: b"old",
+        expires_at: ts(30_000),
+    }];
+    database
+        .apply(
+            &lease,
+            RecordBatchSeq::new(1),
+            RecordVersion::new(101),
+            ts(2),
+            &initial,
+        )
+        .await?;
+    let changes = [
+        RecordChange::Delete { key: a },
+        RecordChange::Put {
+            key: b,
+            body: b"new",
+            expires_at: ts(30_000),
+        },
+    ];
+    reject_wrong_lease_identity(database, &lease, &changes).await?;
+    assert_eq!(
+        database
+            .apply(
+                &lease,
+                RecordBatchSeq::new(2),
+                RecordVersion::new(104),
+                ts(10_000),
+                &changes
+            )
+            .await?,
+        ApplyRecords::Fenced
+    );
+    let successor = match database
+        .acquire(
+            &candidate("successor"),
+            ts(10_001),
+            ts(10_001),
+            ts(20_000),
+            Takeover::Observe,
+        )
+        .await?
+    {
+        Acquisition::Acquired(lease) => lease,
+        outcome => return Err(format!("expired lease was not acquired: {outcome:?}").into()),
+    };
+    assert_eq!(
+        database
+            .apply(
+                &lease,
+                RecordBatchSeq::new(2),
+                RecordVersion::new(105),
+                ts(10_002),
+                &changes
+            )
+            .await?,
+        ApplyRecords::Fenced
+    );
+    database.release(&successor).await?;
+    assert_eq!(
+        database
+            .apply(
+                &successor,
+                RecordBatchSeq::new(2),
+                RecordVersion::new(106),
+                ts(10_003),
+                &changes
+            )
+            .await?,
+        ApplyRecords::Fenced
+    );
+    assert_eq!(
+        database.get(&a, ts(10_003)).await?,
+        Some(record(b"old", 101, 30_000))
+    );
+    assert_eq!(database.get(&b, ts(10_003)).await?, None);
+    Ok(())
+}
+
+/// Sequences fence out-of-order batches across renewal and reset on a new epoch.
+///
+/// # Errors
+/// Returns a database error.
+///
+/// # Panics
+/// Panics if an older batch mutates records or renewal resets its fence.
+pub async fn apply_sequences_are_fenced<D: ExpiringRecordPort + LeaderLeasePort>(
+    database: &D,
+) -> TestResult {
+    let lease = acquired(database).await?;
+    let a = key(RecordKind::ResourceHistory, 1);
+    let b = key(RecordKind::ResourceHistory, 2);
+    let initial = [RecordChange::Put {
+        key: a,
+        body: b"new",
+        expires_at: ts(30_000),
+    }];
+    assert_eq!(
+        database
+            .apply(
+                &lease,
+                RecordBatchSeq::new(2),
+                RecordVersion::new(101),
+                ts(2),
+                &initial
+            )
+            .await?,
+        ApplyRecords::Applied
+    );
+    let stale = [
+        RecordChange::Delete { key: a },
+        RecordChange::Put {
+            key: b,
+            body: b"stale",
+            expires_at: ts(30_000),
+        },
+    ];
+    assert_eq!(
+        database
+            .apply(
+                &lease,
+                RecordBatchSeq::new(1),
+                RecordVersion::new(102),
+                ts(3),
+                &stale
+            )
+            .await?,
+        ApplyRecords::Fenced
+    );
+    let Renewal::Renewed(renewed) = database.renew(&lease, ts(3), ts(20_000)).await? else {
+        return Err("lease renewal failed".into());
+    };
+    assert_eq!(
+        database
+            .apply(
+                &renewed,
+                RecordBatchSeq::new(1),
+                RecordVersion::new(103),
+                ts(4),
+                &stale
+            )
+            .await?,
+        ApplyRecords::Fenced
+    );
+    assert_eq!(
+        database.get(&a, ts(4)).await?,
+        Some(record(b"new", 101, 30_000))
+    );
+    assert_eq!(database.get(&b, ts(4)).await?, None);
+    database.release(&renewed).await?;
+    let next = match database
+        .acquire(
+            &candidate("next"),
+            ts(5),
+            ts(5),
+            ts(25_000),
+            Takeover::Observe,
+        )
+        .await?
+    {
+        Acquisition::Acquired(lease) => lease,
+        outcome => return Err(format!("released lease was not acquired: {outcome:?}").into()),
+    };
+    assert_eq!(
+        database
+            .apply(
+                &next,
+                RecordBatchSeq::new(1),
+                RecordVersion::new(104),
+                ts(6),
+                &stale
+            )
+            .await?,
+        ApplyRecords::Applied
+    );
+    assert_eq!(database.get(&a, ts(6)).await?, None);
+    assert_eq!(
+        database.get(&b, ts(6)).await?,
+        Some(record(b"stale", 104, 30_000))
+    );
+    Ok(())
+}
+
+/// A reset batch sequence never reuses the previous record incarnation.
+///
+/// # Errors
+/// Returns a database error.
+///
+/// # Panics
+/// Panics if a stale incarnation can mutate the successor's record.
+pub async fn apply_new_epoch_preserves_record_incarnations<
+    D: ExpiringRecordPort + LeaderLeasePort,
+>(
+    database: &D,
+) -> TestResult {
+    let first = acquired(database).await?;
+    let key = key(RecordKind::ResourceHistory, 42);
+    let old = [RecordChange::Put {
+        key,
+        body: b"old",
+        expires_at: ts(30_000),
+    }];
+    assert_eq!(
+        database
+            .apply(
+                &first,
+                RecordBatchSeq::new(1),
+                RecordVersion::new(41),
+                ts(2),
+                &old
+            )
+            .await?,
+        ApplyRecords::Applied
+    );
+    database.release(&first).await?;
+    let next = match database
+        .acquire(
+            &candidate("successor"),
+            ts(3),
+            ts(3),
+            ts(20_000),
+            Takeover::Observe,
+        )
+        .await?
+    {
+        Acquisition::Acquired(lease) => lease,
+        outcome => return Err(format!("released lease was not acquired: {outcome:?}").into()),
+    };
+    let new = [RecordChange::Put {
+        key,
+        body: b"new",
+        expires_at: ts(30_000),
+    }];
+    assert_eq!(
+        database
+            .apply(
+                &next,
+                RecordBatchSeq::new(1),
+                RecordVersion::new(42),
+                ts(4),
+                &new
+            )
+            .await?,
+        ApplyRecords::Applied
+    );
+    assert_eq!(
+        database
+            .replace(&key, RecordVersion::new(41), b"stale", ts(5), ts(30_000))
+            .await?,
+        Replace::Stale
+    );
+    assert_eq!(
+        database.remove(&key, RecordVersion::new(41), ts(5)).await?,
+        Remove::Stale
+    );
+    assert_eq!(
+        database.get(&key, ts(5)).await?,
+        Some(record(b"new", 42, 30_000))
     );
     Ok(())
 }

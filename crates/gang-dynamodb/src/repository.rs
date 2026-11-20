@@ -222,7 +222,7 @@ impl DynamoDb {
             .build())
     }
 
-    async fn page_items(
+    pub(crate) async fn page_items(
         &self,
         pk: &str,
         after: Option<&str>,

@@ -12,7 +12,7 @@ use gang_types::{AccessToken, FleetName, Proof, ProviderName, ScalingCause};
 use gang_wire::routes::{
     AUTHENTICATE_SESSION, CREATE_CERTIFICATE, GET_BUILD, GET_SERVER, GET_SESSION, GET_STATE,
     LIST_BUILDS, LIST_EVENTS, LIST_PRINCIPALS, LIST_ROLES, RESTORE_PRINCIPAL, REVOKE_CERTIFICATE,
-    REVOKE_PRINCIPAL, ROUTES, Route, RouteId, WATCH_STATE,
+    REVOKE_PRINCIPAL, ROUTES, Route, WATCH_STATE,
 };
 use gang_wire::{AuthenticateRequest, CreateCertificateRequest, Credential, ErrorReason};
 use http::StatusCode;
@@ -205,14 +205,10 @@ async fn every_route_is_served_and_every_json_key_is_lower_camel_case() -> TestR
             let probes = probes();
             let covered: Vec<Route> = probes.iter().map(|probe| probe.route).collect();
             // Device routes need a mounted login and are covered by the device API tests.
-            // Ingress is execution-listener-only and is separately exercised by ingest_tests.
             let non_device: Vec<Route> = ROUTES
                 .iter()
                 .copied()
-                .filter(|route| {
-                    !route.template.starts_with("/v1/deviceAuthorizations")
-                        && route.id != RouteId::IngestBuilds
-                })
+                .filter(|route| !route.template.starts_with("/v1/deviceAuthorizations"))
                 .collect();
             assert_eq!(covered, non_device, "the sweep covers the other routes");
 

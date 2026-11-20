@@ -1,456 +1,112 @@
-//! Builds through follower-only public frontends and reads their accounting through each controller.
+//! Followers serve shared requests and refuse leader-only requests while builds use the leader.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use gang_clock::{SystemClock, Timestamp};
+use gang_clock::SystemClock;
 use gang_tls::{HttpProtocol, HttpTransport, ServerTrust};
-use gang_wire::name;
 use nativelink_proto::build::bazel::remote::execution::v2::{
-    Digest, GetActionResultRequest, RequestMetadata, digest_function,
+    GetActionResultRequest, RequestMetadata,
 };
-use nativelink_proto::google::bytestream::{ReadRequest, WriteRequest};
-use serde_json::Value;
-use sha2::{Digest as _, Sha256};
 
-use crate::builds::{build_checks, listed_name, observe};
 use crate::check::{Check, prefix_checks};
 use crate::cluster::Cluster;
 use crate::errors::{E2eError, Result};
 use crate::h2_frames::H2Channel;
 use crate::http::Http;
 use crate::identity::Admission;
-use crate::names::follower_builds::{
-    CONTROLLED_BLOB, CONTROLLED_DOWNLOADED, CONTROLLED_FOLLOWER, CONTROLLED_LEADER,
-    CONTROLLED_LOOKUPS, CONTROLLED_MISS, FOLLOWER_ONLY_SERVE, KILLED_BUILD_ABSENT,
-    SURVIVOR_ONLY_SERVE, WARM_ZERO_USAGE,
-};
-use crate::server::{Presented, Request, ServerApi};
+use crate::server::{Answer, Presented, Request, ServerApi};
 use crate::system::Probe;
 use crate::verdict;
 
 const CONTROLLERS: usize = 3;
-const PROBES: &[Probe] = &[Probe::Pinned];
-const A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-const B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-const C: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
-const CONTROLLED: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
-const FIXTURE: &[u8] = b"gang-e2e follower observation controlled miss";
-const ZERO_USAGE: &[&str] = &[
-    "/usage/cache/misses",
-    "/usage/cache/errors",
-    "/usage/executions/executeCalls",
-    "/usage/executions/completed",
-    "/usage/executions/rejected",
-    "/unrecorded",
-];
 
-fn zeros(value: &Value, pointers: &[&str]) -> bool {
-    pointers
-        .iter()
-        .all(|pointer| value.pointer(pointer).and_then(Value::as_u64) == Some(0))
+fn discovery_body(answer: &Answer) -> std::result::Result<serde_json::Value, String> {
+    let mut body: serde_json::Value =
+        serde_json::from_slice(&answer.body).map_err(|error| error.to_string())?;
+    let certificate = body
+        .get_mut("caCertificate")
+        .ok_or("missing caCertificate")?;
+    let pem = certificate
+        .as_str()
+        .ok_or("caCertificate is not a string")?;
+    let pem =
+        gang_types::CertificatePem::try_new(pem.to_owned()).map_err(|error| error.to_string())?;
+    let pin = gang_tls::ca_pin_of_certificate(&pem).map_err(|error| error.to_string())?;
+    // Controllers independently self-sign certificates; their serials and signatures
+    // differ even when the pinned public key identifies the same CA.
+    *certificate = serde_json::Value::String(pin.to_string());
+    Ok(body)
 }
 
-fn controlled_valid(value: &Value, principal: &str) -> bool {
-    let time = |field: &str| {
-        value
-            .get(field)
-            .and_then(Value::as_str)
-            .and_then(|text| Timestamp::from_rfc3339(text).ok())
-    };
-    value.get("principal").and_then(Value::as_str) == Some(principal)
-        && value.get("invocationId").and_then(Value::as_str) == Some(CONTROLLED)
-        && time("startTime")
-            .zip(time("lastActiveTime"))
-            .is_some_and(|(start, end)| start <= end)
-        && value.pointer("/usage/cache/misses").and_then(Value::as_u64) == Some(1)
-        && zeros(
-            value,
-            &[
-                "/usage/cache/hits",
-                "/usage/cache/errors",
-                "/usage/cache/uploadedResults",
-                "/usage/executions/executeCalls",
-                "/usage/executions/completed",
-                "/usage/executions/rejected",
-                "/unrecorded",
-            ],
-        )
-}
-
-fn controlled_read(
-    read: &dyn Fn(&Request) -> Result<crate::server::Answer>,
-    token: &str,
-) -> Result<Option<(String, Value)>> {
-    let list = read(
-        &Request::get(format!(
-            "/v1/builds?filter=invocationId%3D%22{CONTROLLED}%22"
-        ))
-        .presenting(Presented::Bearer(token.to_owned())),
-    )?;
-    if list.status != 200 {
-        return Err(E2eError::system(format!(
-            "controlled build list status {}: {}",
-            list.status,
-            list.text()
-        )));
-    }
-    let _: Value = serde_json::from_slice(&list.body)
-        .map_err(E2eError::system_from("parsing controlled build list"))?;
-    let Some(name) = listed_name(&list) else {
-        return Ok(None);
-    };
-    let detail =
-        read(&Request::get(format!("/v1/{name}")).presenting(Presented::Bearer(token.to_owned())))?;
-    if detail.status != 200 {
-        return Err(E2eError::system(format!(
-            "controlled build detail status {}: {}",
-            detail.status,
-            detail.text()
-        )));
-    }
-    let value = serde_json::from_slice(&detail.body)
-        .map_err(E2eError::system_from("parsing controlled build detail"))?;
-    Ok(Some((name, value)))
-}
-
-fn controlled_observe(
-    stack: &crate::stack::Stack<'_>,
-    read: &dyn Fn(&Request) -> Result<crate::server::Answer>,
-    token: &str,
-) -> Result<(String, Value)> {
-    let mut previous = None;
-    let mut latest = None;
-    let mut failure = None;
-    let waited = stack.wait_live_state(
-        stack.settings().history_timeout,
-        |_| match controlled_read(read, token) {
-            Ok(Some((name, value))) => {
-                let usage = value
-                    .get("usage")
-                    .filter(|usage| usage.is_object())
-                    .cloned();
-                let ready = value.pointer("/usage/cache/misses").and_then(Value::as_u64) == Some(1);
-                let stable = usage.is_some() && previous == usage;
-                previous = usage;
-                latest = Some((name, value));
-                ready && stable
-            }
-            Ok(None) => {
-                previous = None;
-                false
-            }
-            Err(error) => {
-                failure = Some(error);
-                true
-            }
-        },
-    );
-    if let Some(error) = failure {
-        return Err(error);
-    }
-    waited?;
-    latest.ok_or_else(|| E2eError::system("no controlled build observation"))
-}
-
-fn recent_traffic(
-    read: &dyn Fn(&Request) -> Result<crate::server::Answer>,
-    token: &str,
-) -> Result<(u64, u64)> {
-    let answer = read(&Request::get("/v1/state").presenting(Presented::Bearer(token.to_owned())))?;
-    if answer.status != 200 {
-        return Err(E2eError::system(format!(
-            "leader state status {}: {}",
-            answer.status,
-            answer.text()
-        )));
-    }
-    let value: Value = serde_json::from_slice(&answer.body)
-        .map_err(E2eError::system_from("parsing leader state"))?;
-    let recent = value
-        .get("recent")
-        .and_then(Value::as_object)
-        .ok_or_else(|| E2eError::system("leader state has no recent object"))?;
-    let Some(samples) = recent.get("samples") else {
-        return Ok((0, 0));
-    };
-    let samples = samples
-        .as_array()
-        .ok_or_else(|| E2eError::system("leader state samples is not an array"))?;
-    let mut totals = (0u64, 0u64);
-    for sample in samples {
-        let object = sample
-            .as_object()
-            .ok_or_else(|| E2eError::system("leader state sample is not an object"))?;
-        let count = |field| -> Result<u64> {
-            match object.get(field) {
-                None => Ok(0),
-                Some(value) => value.as_u64().ok_or_else(|| {
-                    E2eError::system(format!("leader state sample {field} is not a number"))
-                }),
-            }
-        };
-        totals.0 = totals.0.saturating_add(count("lookups")?);
-        totals.1 = totals.1.saturating_add(count("downloadedBytes")?);
-    }
-    Ok(totals)
-}
-
-fn traffic_checks(
-    stack: &crate::stack::Stack<'_>,
-    read: &dyn Fn(&Request) -> Result<crate::server::Answer>,
-    token: &str,
-    baseline: (u64, u64),
-) -> Result<Vec<Check>> {
-    let mut latest = baseline;
-    let mut failure = None;
-    let waited =
-        stack.wait_live_state(stack.settings().history_timeout, |_| {
-            match recent_traffic(read, token) {
-                Ok(totals) => {
-                    latest = totals;
-                    totals.0.saturating_sub(baseline.0) >= 1
-                        && totals.1.saturating_sub(baseline.1) >= FIXTURE.len() as u64
-                }
-                Err(error) => {
-                    failure = Some(error);
-                    true
-                }
-            }
-        });
-    if let Some(error) = failure {
-        return Err(error);
-    }
-    if let Err(error) = waited
-        && !matches!(error, E2eError::Timeout { .. })
-    {
-        return Err(error);
-    }
-    let detail = || {
-        format!(
-            "baseline lookups {}, downloadedBytes {}; final lookups {}, downloadedBytes {}; expected increases of at least 1 and {}",
-            baseline.0,
-            baseline.1,
-            latest.0,
-            latest.1,
-            FIXTURE.len()
-        )
-    };
-    Ok(vec![
-        Check::expect(
-            CONTROLLED_LOOKUPS,
-            latest.0.saturating_sub(baseline.0) >= 1,
-            detail,
-        ),
-        Check::expect(
-            CONTROLLED_DOWNLOADED,
-            latest.1.saturating_sub(baseline.1) >= FIXTURE.len() as u64,
-            detail,
-        ),
-    ])
-}
-
-fn controlled_checks(
-    cluster: &Cluster<'_>,
-    client: &Http,
-    token: &str,
-    principal: &str,
-    pin: &gang_types::CaPin,
-    controllers: (usize, usize),
-) -> Result<Vec<Check>> {
-    let stack = cluster.stack();
-    let (leader, follower) = controllers;
-    let mut checks = Vec::with_capacity(6);
-    let leader_endpoint = cluster.direct_endpoint(leader);
-    let leader_read =
-        |request: &Request| crate::login_across::exchange(client, &leader_endpoint, request);
-    let baseline = recent_traffic(&leader_read, token)?;
-    let controlled_rpc = controlled_rpc(cluster, token, pin, follower);
-    checks.push(Check::expect(
-        CONTROLLED_MISS,
-        matches!(controlled_rpc.as_ref(), Ok((Some(5), _))),
-        || format!("expected gRPC status 5, got {controlled_rpc:?}"),
-    ));
-    checks.push(Check::expect(
-        CONTROLLED_BLOB,
-        controlled_rpc.as_ref().is_ok_and(|(_, blob)| blob.is_ok()),
-        || format!("controlled blob round trip failed: {controlled_rpc:?}"),
-    ));
-    checks.extend(traffic_checks(stack, &leader_read, token, baseline)?);
-    let controlled = controlled_observe(stack, &leader_read, token);
-    checks.push(Check::expect(
-        CONTROLLED_LEADER,
-        controlled
-            .as_ref()
-            .is_ok_and(|(_, value)| controlled_valid(value, principal)),
-        || format!("unexpected controlled leader observation: {controlled:?}"),
-    ));
-    let follower_endpoint = cluster.direct_endpoint(follower);
-    let follower_read =
-        |request: &Request| crate::login_across::exchange(client, &follower_endpoint, request);
-    let relayed = controlled_read(&follower_read, token);
-    checks.push(Check::expect(
-        CONTROLLED_FOLLOWER,
-        controlled
-            .as_ref()
-            .ok()
-            .zip(relayed.as_ref().ok().and_then(Option::as_ref))
-            .is_some_and(|((leader_name, _), (follower_name, value))| {
-                leader_name == follower_name && controlled_valid(value, principal)
-            }),
-        || format!("unexpected controlled follower observation: {relayed:?}"),
-    ));
-    Ok(checks)
-}
-
-fn controlled_rpc(
-    cluster: &Cluster<'_>,
-    token: &str,
-    pin: &gang_types::CaPin,
-    follower: usize,
-) -> Result<(Option<u32>, Result<()>)> {
-    let stack = cluster.stack();
-    let config = gang_tls::client_config(
-        ServerTrust::Pin(pin),
-        None,
-        &[b"h2"],
-        Arc::new(SystemClock::new()),
-    )
-    .map_err(E2eError::system_from("configuring controlled request TLS"))?;
-    let endpoint = cluster.direct_endpoint(follower);
-    let mut channel = match H2Channel::connect(
-        Arc::new(config),
-        &endpoint,
-        Some(token),
-        stack.settings().handshake_timeout,
-    )? {
-        Admission::Accepted(channel) => channel,
-        Admission::Refused => {
-            return Err(E2eError::system("follower refused controlled connection"));
-        }
-    };
-    let request = GetActionResultRequest {
-        instance_name: String::new(),
-        action_digest: Some(Digest {
-            hash: hex::encode(Sha256::digest(FIXTURE)),
-            size_bytes: i64::try_from(FIXTURE.len())
-                .map_err(E2eError::system_from("converting controlled fixture size"))?,
-        }),
-        digest_function: digest_function::Value::Sha256 as i32,
-        ..Default::default()
-    };
-    let metadata = RequestMetadata {
-        tool_invocation_id: CONTROLLED.to_owned(),
-        ..Default::default()
-    };
-    let status =
-        channel.get_action_result(&request, &metadata, stack.settings().command_timeout)?;
-    let blob = (|| -> Result<()> {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(E2eError::system_from("generating upload identifier"))?
-            .as_nanos();
-        let hash = hex::encode(Sha256::digest(FIXTURE));
-        let blob = format!("blobs/{hash}/{}", FIXTURE.len());
-        let write = WriteRequest {
-            resource_name: format!("uploads/{unique:x}-{:x}/{blob}", std::process::id()),
-            write_offset: 0,
-            finish_write: true,
-            data: bytes::Bytes::from_static(FIXTURE),
-        };
-        let committed = channel.write_blob(&write, &metadata, stack.settings().command_timeout)?;
-        if committed
-            != i64::try_from(FIXTURE.len())
-                .map_err(E2eError::system_from("converting controlled fixture size"))?
-        {
-            return Err(E2eError::system(format!(
-                "ByteStream committed {committed} bytes"
-            )));
-        }
-        let read = ReadRequest {
-            resource_name: blob,
-            read_offset: 0,
-            read_limit: 0,
-        };
-        let data = channel.read_blob(&read, &metadata, stack.settings().command_timeout)?;
-        if data != FIXTURE {
-            return Err(E2eError::system(format!(
-                "ByteStream returned {} unexpected bytes",
-                data.len()
-            )));
-        }
-        Ok(())
-    })();
-    Ok((status, blob))
-}
-
-fn observed_checks(
-    stack: &crate::stack::Stack<'_>,
-    read: &dyn Fn(&Request) -> Result<crate::server::Answer>,
-    token: &str,
-    id: &str,
-    cold: bool,
-    principal: &str,
-    prefix: &str,
-) -> Result<Vec<Check>> {
-    let observed = observe(
-        stack,
-        read,
-        token,
-        id,
-        cold,
-        stack.settings().history_timeout,
-    )?;
-    let mut result = build_checks(&observed, cold, principal);
-    if !cold {
-        let detail = observed.detail.as_ref();
-        let value = detail
-            .filter(|answer| answer.status == 200)
-            .and_then(|answer| serde_json::from_slice::<Value>(&answer.body).ok());
-        let zero = value.as_ref().is_some_and(|value| zeros(value, ZERO_USAGE));
-        result[2] = Check::expect(WARM_ZERO_USAGE, zero, || {
-            detail.map_or_else(
-                || "no build detail".to_owned(),
-                |answer| format!("status {}, JSON: {}", answer.status, answer.text()),
-            )
-        });
-    }
-    Ok(prefix_checks(result, prefix))
-}
-
-fn absent_build(client: &Http, endpoint: &gang_types::Url, token: &str, id: &str) -> Result<Check> {
-    let answer = crate::login_across::exchange(
-        client,
-        endpoint,
-        &Request::get(format!("/v1/builds?filter=invocationId%3D%22{id}%22"))
-            .presenting(Presented::Bearer(token.to_owned())),
-    )?;
-    let empty = serde_json::from_slice::<Value>(&answer.body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("builds")
-                .and_then(Value::as_array)
-                .map(Vec::is_empty)
-        })
-        .unwrap_or(false);
-    Ok(Check::expect(
-        KILLED_BUILD_ABSENT,
-        answer.status == 200 && empty,
+fn shared_check(follower: usize, leader: &Answer, response: &Answer) -> Check {
+    let marker = gang_types::handover::REQUEST_NOT_STARTED_HEADER;
+    let leader_body = discovery_body(leader);
+    let follower_body = discovery_body(response);
+    Check::expect(
+        format!("follower {follower}: shared HTTP response matches leader"),
+        response.status == leader.status
+            && matches!((&leader_body, &follower_body), (Ok(left), Ok(right)) if left == right)
+            && response.header("content-type") == leader.header("content-type")
+            && response.header(marker) != Some("true")
+            && leader.header(marker) != Some("true"),
         || {
             format!(
-                "new leader returned status {} and body {}",
-                answer.status,
-                answer.text()
+                "leader {leader:?}, follower {response:?}, normalized bodies: {leader_body:?}, {follower_body:?}"
             )
         },
-    ))
+    )
 }
 
+fn refusal_check(follower: usize, path: &str, response: &Answer, grpc: bool) -> Check {
+    let marker = response.header(gang_types::handover::REQUEST_NOT_STARTED_HEADER);
+    let expected_status = if grpc { 200 } else { 503 };
+    Check::expect(
+        format!("follower {follower}: {path} is refused before starting"),
+        response.status == expected_status
+            && marker == Some("true")
+            && (!grpc || response.header("grpc-status") == Some("14")),
+        || {
+            format!(
+                "expected HTTP {expected_status}, not-started true{}; got {response:?}",
+                if grpc { ", grpc-status 14" } else { "" }
+            )
+        },
+    )
+}
+
+fn check_leader_only(
+    client: &Http,
+    endpoint: &gang_types::Url,
+    token: &str,
+    follower: usize,
+    checks: &mut Vec<Check>,
+) -> Result<()> {
+    for path in ["/v1/builds", "/v1/state"] {
+        let request = Request::get(path).presenting(Presented::Bearer(token.to_owned()));
+        let response = crate::login_across::exchange(client, endpoint, &request)?;
+        checks.push(refusal_check(follower, path, &response, false));
+    }
+    for path in [
+        "/build.bazel.remote.execution.v2.Execution/Execute",
+        "/build.bazel.remote.execution.v2.Execution/WaitExecution",
+        "/google.longrunning.Operations/GetOperation",
+    ] {
+        let request = Request::new(http::Method::POST, path)
+            .body("application/grpc", vec![0; 5])
+            .presenting(Presented::Bearer(token.to_owned()));
+        let response = crate::login_across::exchange(client, endpoint, &request)?;
+        checks.push(refusal_check(follower, path, &response, true));
+    }
+    Ok(())
+}
+
+/// Checks shared and leader-only follower routes and cold and warm leader builds.
+///
+/// # Errors
+/// Returns an error if the cluster, clients, or builds cannot be operated.
 pub fn follower_builds(cluster: &Cluster<'_>) -> Result<Vec<Check>> {
     let stack = cluster.stack();
     let credentials = ServerApi::administrator_credentials(stack)?;
-    let principal = name::of::<name::Principals>(&credentials.identity()?);
     let remote = stack.administrator_remote(&credentials)?;
     let pin = stack.ca_pin()?;
     let client = Http::try_new(
@@ -460,50 +116,85 @@ pub fn follower_builds(cluster: &Cluster<'_>) -> Result<Vec<Check>> {
         HttpProtocol::Http2,
         stack.settings().command_timeout,
     )?;
-    let build = |id: &str| {
-        let driver = stack.bazel().with_flag(format!("--invocation_id={id}"));
-        let (_sender, receiver) = tokio::sync::oneshot::channel();
-        driver.build_until(&remote, PROBES, None, receiver)
-    };
-    let read = |controller: usize, id: &str, cold: bool, prefix: &str| {
-        let endpoint = cluster.direct_endpoint(controller);
-        observed_checks(
-            stack,
-            &|request| crate::login_across::exchange(&client, &endpoint, request),
-            &credentials.token,
-            id,
-            cold,
-            &principal,
-            prefix,
+    let config = Arc::new(
+        gang_tls::client_config(
+            ServerTrust::Pin(&pin),
+            None,
+            &[b"h2"],
+            Arc::new(SystemClock::new()),
         )
-    };
-
+        .map_err(E2eError::system_from("configuring follower request TLS"))?,
+    );
     let leader = cluster.wait_for_leader()?;
     cluster.wait_for_single_leader(leader)?;
-    let followers: Vec<_> = (0..CONTROLLERS).filter(|&i| i != leader).collect();
-    cluster.unroute_public(leader);
-    cluster.wait_for_serving(&followers)?;
-    let mut checks = vec![Check::passed(FOLLOWER_ONLY_SERVE)];
-
-    checks.extend(controlled_checks(
-        cluster,
-        &client,
-        &credentials.token,
-        &principal,
-        &pin,
-        (leader, followers[0]),
-    )?);
-
-    let cold = build(A)?;
+    cluster.wait_for_serving(&[leader])?;
+    let shared_request =
+        Request::get("/v1/server").presenting(Presented::Bearer(credentials.token.clone()));
+    let leader_endpoint = cluster.direct_endpoint(leader);
+    let leader_response =
+        crate::login_across::exchange(&client, &leader_endpoint, &shared_request)?;
+    let mut leader_channel = match H2Channel::connect(
+        Arc::clone(&config),
+        &leader_endpoint,
+        Some(&credentials.token),
+        stack.settings().handshake_timeout,
+    )? {
+        Admission::Accepted(channel) => channel,
+        Admission::Refused => return Err(E2eError::system("leader refused TLS connection")),
+    };
+    let leader_grpc = leader_channel.get_action_result(
+        &GetActionResultRequest::default(),
+        &RequestMetadata::default(),
+        stack.settings().command_timeout,
+    )?;
+    let mut checks = Vec::new();
+    for follower in (0..CONTROLLERS).filter(|&index| index != leader) {
+        let endpoint = cluster.direct_endpoint(follower);
+        let response = crate::login_across::exchange(&client, &endpoint, &shared_request)?;
+        checks.push(shared_check(follower, &leader_response, &response));
+        let mut channel = match H2Channel::connect(
+            Arc::clone(&config),
+            &endpoint,
+            Some(&credentials.token),
+            stack.settings().handshake_timeout,
+        )? {
+            Admission::Accepted(channel) => channel,
+            Admission::Refused => return Err(E2eError::system("follower refused TLS connection")),
+        };
+        let grpc = channel.get_action_result(
+            &GetActionResultRequest::default(),
+            &RequestMetadata::default(),
+            stack.settings().command_timeout,
+        )?;
+        checks.push(Check::expect(
+            format!("follower {follower}: malformed ActionCache baseline matches leader code {leader_grpc:?}"),
+            leader_grpc.is_some() && grpc == leader_grpc,
+            || format!("follower grpc-status {grpc:?}, leader {leader_grpc:?}"),
+        ));
+        check_leader_only(
+            &client,
+            &endpoint,
+            &credentials.token,
+            follower,
+            &mut checks,
+        )?;
+    }
+    let build = || {
+        let (_sender, receiver) = tokio::sync::oneshot::channel();
+        stack
+            .bazel()
+            .build_until(&remote, &[Probe::Pinned], None, receiver)
+    };
+    let cold = build()?;
     stack.bazel().clean(&remote)?;
-    let warm = build(B)?;
+    let warm = build()?;
     checks.extend(prefix_checks(
         vec![verdict::remote_execution(
             &cold,
             1,
             stack.settings().stderr_tail_lines,
         )],
-        "cold build",
+        "leader cold build",
     ));
     checks.extend(prefix_checks(
         vec![verdict::cache_hit(
@@ -511,111 +202,131 @@ pub fn follower_builds(cluster: &Cluster<'_>) -> Result<Vec<Check>> {
             1,
             stack.settings().stderr_tail_lines,
         )],
-        "warm build",
+        "leader warm build",
     ));
-    checks.extend(read(leader, A, true, "leader direct, cold")?);
-    checks.extend(read(leader, B, false, "leader direct, warm")?);
-    checks.extend(read(followers[0], A, true, "follower relay, cold")?);
-    checks.extend(read(followers[0], B, false, "follower relay, warm")?);
-
-    stack.bazel().clean(&remote)?;
-    stack.kill_bazel()?;
-    cluster.kill(leader)?;
-    let new_leader = cluster.wait_for_leader_except(Some(leader))?;
-    cluster.wait_for_single_leader(new_leader)?;
-    let survivor = (0..CONTROLLERS)
-        .find(|&i| i != leader && i != new_leader)
-        .ok_or_else(|| E2eError::system("no surviving follower"))?;
-    cluster.unroute_public(new_leader);
-    cluster.wait_for_serving(&[survivor])?;
-    checks.push(Check::passed(SURVIVOR_ONLY_SERVE));
-
-    let warm = build(C)?;
-    checks.extend(prefix_checks(
-        vec![verdict::cache_hit(
-            &warm,
-            1,
-            stack.settings().stderr_tail_lines,
-        )],
-        "after transition",
-    ));
-    checks.extend(read(new_leader, C, false, "new leader direct, warm")?);
-    checks.extend(read(survivor, C, false, "survivor relay, warm")?);
-
-    checks.push(absent_build(
-        &client,
-        &cluster.direct_endpoint(new_leader),
-        &credentials.token,
-        A,
-    )?);
     Ok(checks)
 }
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use super::{refusal_check, shared_check};
+    use crate::server::Answer;
 
-    use super::*;
+    async fn certificate(seed: u8) -> gang_types::CertificatePem {
+        gang_mtls::CertificateAuthority::establish(
+            gang_testkit::TestSigner::new(seed).expect("valid signer seed"),
+            gang_clock::TestClock::new(gang_clock::Timestamp::from_unix_millis(1_000_000)),
+            gang_types::TrustDomain::try_new("example.test").expect("valid trust domain"),
+            std::time::Duration::from_mins(1),
+        )
+        .await
+        .expect("test authority establishes")
+        .certificate()
+        .clone()
+    }
 
-    #[test]
-    fn controlled_accounting_requires_identity_times_and_every_counter() {
-        let value = json!({
-            "principal": "principals/example",
-            "invocationId": CONTROLLED,
-            "startTime": "2026-01-14T09:00:00Z",
-            "lastActiveTime": "2026-01-14T09:00:01Z",
-            "usage": {
-                "cache": {"misses": 1, "hits": 0, "errors": 0, "uploadedResults": 0},
-                "executions": {"executeCalls": 0, "completed": 0, "rejected": 0}
-            },
-            "unrecorded": 0
-        });
-        assert!(controlled_valid(&value, "principals/example"));
-        assert!(!controlled_valid(&value, "principals/other"));
-        for pointer in [
-            "/usage/cache/misses",
-            "/usage/cache/hits",
-            "/usage/cache/errors",
-            "/usage/cache/uploadedResults",
-            "/usage/executions/executeCalls",
-            "/usage/executions/completed",
-            "/usage/executions/rejected",
-            "/unrecorded",
-        ] {
-            let mut missing = value.clone();
-            *missing
-                .pointer_mut(pointer)
-                .expect("fixture contains counter") = Value::Null;
-            assert!(
-                !controlled_valid(&missing, "principals/example"),
-                "{pointer}"
-            );
-        }
-        let mut reversed = value;
-        reversed["lastActiveTime"] = json!("2026-01-14T08:59:59Z");
-        assert!(!controlled_valid(&reversed, "principals/example"));
+    fn discovery(pem: &str, field: &str) -> Answer {
+        Answer::json(
+            200,
+            &serde_json::json!({
+                "caCertificate": pem,
+                "name": field,
+            }),
+        )
+        .expect("discovery serializes")
+    }
+
+    #[tokio::test]
+    async fn shared_response_matches_only_contract_fields() {
+        let first = certificate(1).await;
+        let second = certificate(1).await;
+        let other = certificate(2).await;
+        assert_ne!(first.as_str(), second.as_str());
+        let leader = discovery(first.as_str(), "server").with_header("date", "leader");
+        let follower = discovery(second.as_str(), "server").with_header("date", "follower");
+        assert!(shared_check(1, &leader, &follower).is_passed());
+        assert!(shared_check(1, &leader, &discovery(other.as_str(), "server")).is_failure());
+        assert!(shared_check(1, &leader, &discovery(second.as_str(), "other")).is_failure());
+        let mut different = follower.clone();
+        different.status = 503;
+        assert!(shared_check(1, &leader, &different).is_failure());
+        different = follower.clone();
+        different.body = b"not json".to_vec();
+        assert!(shared_check(1, &leader, &different).is_failure());
+        assert!(shared_check(1, &different, &different).is_failure());
+        assert!(shared_check(1, &leader, &discovery("not a certificate", "server")).is_failure());
+        let missing = Answer::json(200, &serde_json::json!({"name": "server"}))
+            .expect("discovery serializes");
+        assert!(shared_check(1, &leader, &missing).is_failure());
+        different = follower.clone();
+        different.headers.retain(|(name, _)| name != "content-type");
+        different = different.with_header("content-type", "text/plain");
+        assert!(shared_check(1, &leader, &different).is_failure());
+        different = follower
+            .clone()
+            .with_header(gang_types::handover::REQUEST_NOT_STARTED_HEADER, "true");
+        assert!(shared_check(1, &leader, &different).is_failure());
+        assert!(shared_check(1, &different, &different).is_failure());
     }
 
     #[test]
-    fn warm_zero_usage_requires_present_zero_counters() {
-        let value = json!({
-            "usage": {
-                "cache": {"misses": 0, "errors": 0},
-                "executions": {"executeCalls": 0, "completed": 0, "rejected": 0}
-            },
-            "unrecorded": 0
-        });
-        assert!(zeros(&value, ZERO_USAGE));
-        for pointer in ZERO_USAGE {
-            let mut changed = value.clone();
-            *changed
-                .pointer_mut(pointer)
-                .expect("fixture contains counter") = json!(1);
-            assert!(!zeros(&changed, ZERO_USAGE), "{pointer}");
-            *changed
-                .pointer_mut(pointer)
-                .expect("fixture contains counter") = Value::Null;
-            assert!(!zeros(&changed, ZERO_USAGE), "{pointer}");
-        }
+    fn refusal_requires_status_marker_and_grpc_status() {
+        let marker = gang_types::handover::REQUEST_NOT_STARTED_HEADER;
+        let http = Answer::empty(503).with_header(marker, "true");
+        assert!(refusal_check(1, "/v1/state", &http, false).is_passed());
+        assert!(refusal_check(1, "/v1/state", &Answer::empty(503), false).is_failure());
+        assert!(
+            refusal_check(
+                1,
+                "/v1/state",
+                &Answer::empty(200).with_header(marker, "true"),
+                false
+            )
+            .is_failure()
+        );
+        let grpc = Answer::empty(200)
+            .with_header(marker, "true")
+            .with_header("grpc-status", "14");
+        assert!(refusal_check(1, "/grpc", &grpc, true).is_passed());
+        assert!(
+            refusal_check(
+                1,
+                "/grpc",
+                &Answer::empty(200).with_header(marker, "true"),
+                true
+            )
+            .is_failure()
+        );
+        assert!(
+            refusal_check(
+                1,
+                "/grpc",
+                &Answer::empty(200)
+                    .with_header(marker, "true")
+                    .with_header("grpc-status", "13"),
+                true
+            )
+            .is_failure()
+        );
+        assert!(
+            refusal_check(
+                1,
+                "/grpc",
+                &Answer::empty(200).with_header("grpc-status", "14"),
+                true
+            )
+            .is_failure()
+        );
+        assert!(
+            refusal_check(
+                1,
+                "/grpc",
+                &Answer::empty(503)
+                    .with_header(marker, "true")
+                    .with_header("grpc-status", "14"),
+                true
+            )
+            .is_failure()
+        );
     }
 }

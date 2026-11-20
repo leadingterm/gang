@@ -18,35 +18,27 @@
   envProbe = pkgs.runCommandCC "environment-writable-probe" {nativeBuildInputs = [pkgs.patchelf];} ''
     cat > env-probe.c <<'EOF'
     #include <stdio.h>
-    #include <stdlib.h>
+    #include <sys/auxv.h>
+    #include <unistd.h>
     #include <string.h>
 
     extern char **environ;
 
     int main(void) {
-      const char *library_path = getenv("LD_LIBRARY_PATH");
-      if (!library_path || *library_path != '\0') {
-        fprintf(stderr, "LD_LIBRARY_PATH must be present and empty\n");
+      if (getauxval(AT_PAGESZ) != (unsigned long) sysconf(_SC_PAGESIZE)
+          || getauxval(AT_EXECFN) == 0) {
+        fprintf(stderr, "loader auxiliary vector was not preserved\n");
         return 1;
       }
-      int wrote_library_path = 0;
       for (char **entry = environ; *entry; ++entry) {
-        int is_library_path = strcmp(*entry, "LD_LIBRARY_PATH=") == 0;
+        puts(*entry);
         volatile char *separator = strchr(*entry, '=');
         if (separator) {
           char saved = *separator;
           *separator = '\0';
           *separator = saved;
         }
-        if (is_library_path) {
-          wrote_library_path = 1;
-        }
       }
-      if (!wrote_library_path) {
-        fprintf(stderr, "LD_LIBRARY_PATH entry was not written\n");
-        return 1;
-      }
-      puts("environment writable");
       return 0;
     }
     EOF
@@ -84,8 +76,17 @@ in
       with subtest("a hermetic action tool runs under the shipped binds"):
           assert machine.succeed("${sandbox shipped "${hermeticGawk}/bin/gawk 'BEGIN { print 6 * 7 }'"}").strip() == "42"
 
-      with subtest("the action environment is writable under the shipped binds"):
-          assert "environment writable" in machine.succeed("${sandbox shipped "${envProbe}/bin/env-probe"}")
+      probe_command = "${sandbox shipped ""}"
+      for name, declared, expected in [
+          ("absent library path", "ORIGINAL_MARKER=declared", ["ORIGINAL_MARKER=declared"]),
+          ("empty environment", "", []),
+          ("empty library path", "ORIGINAL_MARKER=declared LD_LIBRARY_PATH=", ["ORIGINAL_MARKER=declared", "LD_LIBRARY_PATH="]),
+          ("declared library path", "ORIGINAL_MARKER=declared LD_LIBRARY_PATH='::/declared path::tail:'", ["ORIGINAL_MARKER=declared", "LD_LIBRARY_PATH=::/declared path::tail:"]),
+          ("declared nix library path", "ORIGINAL_MARKER=declared NIX_LD_LIBRARY_PATH=", ["ORIGINAL_MARKER=declared", "NIX_LD_LIBRARY_PATH="]),
+      ]:
+          with subtest(f"the exact declared environment stays writable: {name}"):
+              actual = machine.succeed(probe_command + declared + " ${envProbe}/bin/env-probe").splitlines()
+              assert actual == expected, actual
 
       with subtest("a program resolves non-glibc libraries under the shipped binds"):
           assert "Zstandard" in machine.succeed("${sandbox shipped "${fhsZstd}/bin/zstd --version"}")

@@ -185,6 +185,8 @@ struct ForcedResponse {
     body: Vec<u8>,
 }
 
+type ScriptedResponse<'a> = (u16, &'a [(&'a str, &'a str)], &'a [u8]);
+
 struct ServerState {
     info: Server<serde_json::Value>,
     clock: Arc<TestClock>,
@@ -204,6 +206,8 @@ struct ServerState {
     revoked_principals: Vec<Identity>,
     restored_principals: Vec<Identity>,
     forced: Option<ForcedResponse>,
+    scripted: VecDeque<ForcedResponse>,
+    requests: Vec<(String, String, Option<String>, String)>,
     device_answers: VecDeque<(u16, Option<u64>)>,
     device_calls: Vec<(String, Timestamp)>,
     device_notify: Arc<Notify>,
@@ -402,6 +406,26 @@ impl FakeServer {
         self.state.lock().certificate_requests.clone()
     }
 
+    /// Scripts responses before normal endpoint handling.
+    pub fn script_responses(&self, responses: &[ScriptedResponse<'_>]) {
+        self.state.lock().scripted = responses
+            .iter()
+            .map(|(status, headers, body)| ForcedResponse {
+                status: *status,
+                headers: headers
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect(),
+                body: body.to_vec(),
+            })
+            .collect();
+    }
+
+    /// Every received request, including requests answered by a scripted refusal.
+    pub fn requests(&self) -> Vec<(String, String, Option<String>, String)> {
+        self.state.lock().requests.clone()
+    }
+
     /// Answers every later request of every endpoint with `status` and `body`.
     pub fn force_response(&self, status: u16, body: Vec<u8>) {
         self.force_response_with_headers(status, &[], body);
@@ -459,6 +483,8 @@ fn new_state(info: Server<serde_json::Value>, clock: Arc<TestClock>) -> SharedSe
         revoked_principals: Vec::new(),
         restored_principals: Vec::new(),
         forced: None,
+        scripted: VecDeque::new(),
+        requests: Vec::new(),
         device_answers: VecDeque::new(),
         device_calls: Vec::new(),
         device_notify: Arc::new(Notify::new()),
@@ -523,6 +549,15 @@ async fn dispatch(
     let id = id.as_deref();
     let mut state = shared.lock();
     let bearer = bearer_token(&headers);
+    state.requests.push((
+        method_name.clone(),
+        uri.path().to_owned(),
+        bearer.clone(),
+        body.clone(),
+    ));
+    if let Some(answer) = state.scripted.pop_front() {
+        return forced_response(&answer);
+    }
     let bearer_route = route.permission.is_some();
     if *route == routes::GET_SESSION {
         state.calls.push((uri.path().to_owned(), bearer.clone()));

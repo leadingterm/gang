@@ -5,8 +5,10 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::proxy_protocol::{HeaderKind, prepare};
 use bytes::Bytes;
 use gang_clock::Clock;
+use gang_config::ProxyProtocolConfig;
 use gang_spi::Fence;
 use gang_tls::Listener;
 use gang_types::{NonZeroDuration, health::health_check};
@@ -15,22 +17,52 @@ use http_body_util::Empty;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
+use parking_lot::Mutex;
 use tokio::task::JoinSet;
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct Flags {
     serving: AtomicBool,
     leading: AtomicBool,
     promoted: AtomicBool,
+    contending: AtomicBool,
+    fence: Mutex<Option<Fence>>,
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct Readiness(Arc<Flags>, Option<Fence>);
+pub(crate) struct Readiness(Arc<Flags>);
 
 impl Readiness {
-    pub(crate) fn with_fence(mut self, fence: Fence) -> Self {
-        self.1 = Some(fence);
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        let clock = crate::test_support_clock::start();
+        let (fence, keeper) = Fence::lease(clock.clone(), NonZeroDuration::from_secs(1));
+        keeper.extend_to(clock.monotonic() + std::time::Duration::from_mins(1));
+        let readiness = Self::default().with_fence(fence);
+        readiness.serve();
+        readiness.lead();
+        readiness
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_fence(self, fence: Fence) -> Self {
+        *self.0.fence.lock() = Some(fence);
         self
+    }
+
+    pub(crate) fn begin_term(&self, fence: Fence) {
+        self.stop();
+        self.0.promoted.store(false, Ordering::Release);
+        self.stop_contending();
+        *self.0.fence.lock() = Some(fence);
+    }
+
+    pub(crate) fn contend(&self) {
+        self.0.contending.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn stop_contending(&self) {
+        self.0.contending.store(false, Ordering::Release);
     }
 
     pub(crate) fn serve(&self) {
@@ -47,27 +79,30 @@ impl Readiness {
         self.0.serving.store(false, Ordering::Release);
     }
 
-    pub(crate) fn ready(&self) -> bool {
+    pub(crate) fn is_leading(&self) -> bool {
         self.0.serving.load(Ordering::Acquire)
             && self.0.leading.load(Ordering::Acquire)
-            && self.1.as_ref().is_some_and(Fence::holds)
+            && self.0.fence.lock().as_ref().is_some_and(Fence::holds)
     }
 
-    /// Promotion is sticky so admitted connections can drain and survive lease outages.
-    pub(crate) fn promoted(&self) -> bool {
-        self.0.promoted.load(Ordering::Acquire)
+    pub(crate) fn ready(&self) -> bool {
+        if self.0.promoted.load(Ordering::Acquire) {
+            self.is_leading()
+        } else {
+            self.0.serving.load(Ordering::Acquire) && self.0.contending.load(Ordering::Acquire)
+        }
+    }
+
+    /// Admits leader requests while serving a promoted term, independently of lease health.
+    pub(crate) fn admitting(&self) -> bool {
+        self.0.promoted.load(Ordering::Acquire) && self.0.serving.load(Ordering::Acquire)
     }
 
     pub(crate) fn status(&self, path: &str) -> StatusCode {
-        let check = health_check();
-        let ready = if path == check.serve_path() {
-            self.0.serving.load(Ordering::Acquire)
-        } else if path == check.leader_path() {
-            self.ready()
-        } else {
+        if path != health_check().ready_path() && path != health_check().deployment_path() {
             return StatusCode::NOT_FOUND;
-        };
-        if ready {
+        }
+        if self.ready() {
             StatusCode::OK
         } else {
             StatusCode::SERVICE_UNAVAILABLE
@@ -77,7 +112,7 @@ impl Readiness {
 
 /// The bounds of the health listener. Each exchange must finish within the load balancer's check
 /// timeout, a protocol fact rather than a setting: an answer after it is never read.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct HealthLimits {
     /// How many connections may be open at once; further connections wait in the OS backlog.
     pub(crate) max_connections: NonZeroUsize,
@@ -85,6 +120,7 @@ pub(crate) struct HealthLimits {
     pub(crate) max_header_size: usize,
     /// Pause after a failed `accept` before accepting again.
     pub(crate) accept_error_backoff: NonZeroDuration,
+    pub(crate) proxy_protocol: Arc<ProxyProtocolConfig>,
 }
 
 /// Runs on the same runtime as the other listeners: a frozen or hung process cannot answer,
@@ -101,21 +137,53 @@ pub(crate) async fn serve_health<L: Listener, C: Clock>(
     loop {
         tokio::select! {
             accepted = listener.accept(), if connections.len() < limits.max_connections.get() => match accepted {
-                Ok((io, _)) => {
+                Ok((io, addr)) => {
+                    let raw = L::peer_ip(&addr);
+                    let config = Arc::clone(&limits.proxy_protocol);
+                    let header_clock = (config.health != gang_config::ProxyProtocol::Off
+                        && config.header_timeout.get() < health_check().timeout())
+                        .then(|| clock.sleep(config.header_timeout.get()));
+                    let http = http.clone();
                     let readiness = readiness.clone();
                     let service = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
                         let status = readiness.status(request.uri().path());
+                        let leading = readiness.is_leading();
                         async move {
                             let mut response = Response::new(Empty::<Bytes>::new());
                             *response.status_mut() = status;
+                            if status != StatusCode::NOT_FOUND {
+                                response.headers_mut().insert(
+                                    gang_types::health::LEADING_HEADER,
+                                    if leading {
+                                        http::HeaderValue::from_static("true")
+                                    } else {
+                                        http::HeaderValue::from_static("false")
+                                    },
+                                );
+                            }
                             Ok::<_, Infallible>(response)
                         }
                     });
                     // The deadline starts at accept, before the connection task first runs.
-                    let exchange = clock.timeout(
-                        health_check().timeout(),
-                        http.serve_connection(TokioIo::new(io), service),
-                    );
+                    let exchange = clock.timeout(health_check().timeout(), async move {
+                        let preface = prepare(io, raw, config.health, &config, HeaderKind::Health);
+                        let io = tokio::select! {
+                            result = preface => match result {
+                                Ok((io, _)) => io,
+                                Err(error) => {
+                                    tracing::debug!(%error, "health proxy preface rejected");
+                                    return;
+                                }
+                            },
+                            () = async {
+                                match header_clock {
+                                    Some(sleep) => sleep.await,
+                                    None => std::future::pending().await,
+                                }
+                            } => return,
+                        };
+                        let _ = http.serve_connection(TokioIo::new(io), service).await;
+                    });
                     connections.spawn(async move {
                         let _ = exchange.await;
                     });
@@ -147,7 +215,7 @@ mod tests {
     use http::{Request, StatusCode};
     use http_body_util::Empty;
     use hyper_util::rt::TokioIo;
-    use tokio::io::{AsyncReadExt, DuplexStream};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     use super::{HealthLimits, Readiness, serve_health};
     use crate::test_support_memory::{MemoryDialer, MemoryListener, memory_listener};
@@ -166,6 +234,7 @@ mod tests {
                 .expect("a test admits a connection"),
             max_header_size: 8 * 1024,
             accept_error_backoff: NonZeroDuration::from_secs(1),
+            proxy_protocol: Arc::default(),
         }
     }
 
@@ -186,36 +255,91 @@ mod tests {
         }
     }
 
-    fn assert_statuses(readiness: &Readiness, serve: StatusCode, leader: StatusCode) {
-        let check = health_check();
-        assert_eq!(readiness.status(check.serve_path()), serve);
-        assert_eq!(readiness.status(check.leader_path()), leader);
+    struct Trusted(MemoryListener);
+
+    impl Listener for Trusted {
+        type Io = DuplexStream;
+        type Addr = u32;
+
+        async fn accept(&mut self) -> io::Result<(Self::Io, Self::Addr)> {
+            self.0.accept().await
+        }
+
+        fn peer_ip(_: &u32) -> Option<std::net::IpAddr> {
+            Some(std::net::Ipv4Addr::new(10, 0, 1, 4).into())
+        }
+    }
+
+    fn assert_statuses(readiness: &Readiness, ready: StatusCode) {
+        assert_eq!(readiness.status(health_check().ready_path()), ready);
+        assert_eq!(readiness.status("/serve"), StatusCode::NOT_FOUND);
+        assert_eq!(readiness.status(health_check().deployment_path()), ready);
         assert_eq!(readiness.status("/other"), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn contender_is_ready_without_promotion_and_term_reset_clears_it() {
+        let readiness = Readiness::default();
+        let (fence, _keeper) = valid_fence();
+        readiness.begin_term(fence);
+        readiness.serve();
+        assert_statuses(&readiness, StatusCode::SERVICE_UNAVAILABLE);
+        readiness.contend();
+        assert_statuses(&readiness, StatusCode::OK);
+        assert!(!readiness.admitting());
+        readiness.stop_contending();
+        assert_statuses(&readiness, StatusCode::SERVICE_UNAVAILABLE);
+        readiness.lead();
+        assert_statuses(&readiness, StatusCode::OK);
+        assert!(readiness.admitting());
+        readiness.stop();
+        assert!(!readiness.admitting());
+        assert_statuses(&readiness, StatusCode::SERVICE_UNAVAILABLE);
+        let (next_fence, _next_keeper) = valid_fence();
+        readiness.begin_term(next_fence);
+        readiness.serve();
+        assert!(!readiness.admitting());
+        assert_statuses(&readiness, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
     fn status_tracks_lifecycle() {
         let mut readiness = Readiness::default();
-        assert_statuses(
-            &readiness,
-            StatusCode::SERVICE_UNAVAILABLE,
-            StatusCode::SERVICE_UNAVAILABLE,
-        );
+        assert!(!readiness.admitting());
+        assert_statuses(&readiness, StatusCode::SERVICE_UNAVAILABLE);
         readiness.serve();
-        assert_statuses(&readiness, StatusCode::OK, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!readiness.admitting());
+        assert_statuses(&readiness, StatusCode::SERVICE_UNAVAILABLE);
         readiness.lead();
-        assert_statuses(&readiness, StatusCode::OK, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(readiness.admitting());
+        assert_statuses(&readiness, StatusCode::SERVICE_UNAVAILABLE);
         let (fence, keeper) = valid_fence();
         readiness = readiness.with_fence(fence);
-        assert_statuses(&readiness, StatusCode::OK, StatusCode::OK);
+        assert_statuses(&readiness, StatusCode::OK);
         keeper.revoke();
-        assert_statuses(&readiness, StatusCode::OK, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(readiness.admitting());
+        assert_statuses(&readiness, StatusCode::SERVICE_UNAVAILABLE);
         readiness.stop();
-        assert_statuses(
-            &readiness,
-            StatusCode::SERVICE_UNAVAILABLE,
-            StatusCode::SERVICE_UNAVAILABLE,
-        );
+        assert!(!readiness.admitting());
+        assert_statuses(&readiness, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn readiness_tracks_lease_validity() {
+        use gang_clock::Clock;
+
+        let clock = crate::test_support_clock::start();
+        let (fence, keeper) = Fence::lease(clock.clone(), NonZeroDuration::from_secs(1));
+        let readiness = Readiness::default().with_fence(fence);
+        readiness.serve();
+        readiness.lead();
+        assert_statuses(&readiness, StatusCode::SERVICE_UNAVAILABLE);
+        keeper.extend_to(clock.monotonic() + std::time::Duration::from_secs(2));
+        assert_statuses(&readiness, StatusCode::OK);
+        clock.advance(std::time::Duration::from_secs(3));
+        assert_statuses(&readiness, StatusCode::SERVICE_UNAVAILABLE);
+        keeper.extend_to(clock.monotonic() + std::time::Duration::from_secs(2));
+        assert_statuses(&readiness, StatusCode::OK);
     }
 
     async fn request(dialer: &MemoryDialer, path: &str) -> gang_testkit::TestResult<StatusCode> {
@@ -223,26 +347,36 @@ mod tests {
     }
 
     async fn request_on(io: DuplexStream, path: &str) -> gang_testkit::TestResult<StatusCode> {
+        Ok(request_with_leading(io, path).await?.0)
+    }
+
+    async fn request_with_leading(
+        io: DuplexStream,
+        path: &str,
+    ) -> gang_testkit::TestResult<(StatusCode, Option<http::HeaderValue>)> {
         let (mut sender, connection) =
             hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
         let driver = tokio::spawn(connection);
         let request = Request::builder().uri(path).body(Empty::<Bytes>::new())?;
         let response = sender.send_request(request).await?;
         let status = response.status();
+        let leading = response
+            .headers()
+            .get(gang_types::health::LEADING_HEADER)
+            .cloned();
         drop(response);
         drop(sender);
         driver.await??;
-        Ok(status)
+        Ok((status, leading))
     }
 
-    async fn assert_http(
-        dialer: &MemoryDialer,
-        serve: StatusCode,
-        leader: StatusCode,
-    ) -> gang_testkit::TestResult {
-        let check = health_check();
-        assert_eq!(request(dialer, check.serve_path()).await?, serve);
-        assert_eq!(request(dialer, check.leader_path()).await?, leader);
+    async fn assert_http(dialer: &MemoryDialer, ready: StatusCode) -> gang_testkit::TestResult {
+        assert_eq!(request(dialer, health_check().ready_path()).await?, ready);
+        assert_eq!(request(dialer, "/serve").await?, StatusCode::NOT_FOUND);
+        assert_eq!(
+            request(dialer, health_check().deployment_path()).await?,
+            ready
+        );
         assert_eq!(request(dialer, "/other").await?, StatusCode::NOT_FOUND);
         Ok(())
     }
@@ -257,24 +391,170 @@ mod tests {
         let task = tokio::spawn(async move {
             serve_health(listener, server_readiness, &*clock, limits(4)).await
         });
-        assert_http(
-            &dialer,
-            StatusCode::SERVICE_UNAVAILABLE,
-            StatusCode::SERVICE_UNAVAILABLE,
-        )
-        .await?;
+        assert_http(&dialer, StatusCode::SERVICE_UNAVAILABLE).await?;
         readiness.serve();
-        assert_http(&dialer, StatusCode::OK, StatusCode::SERVICE_UNAVAILABLE).await?;
+        assert_http(&dialer, StatusCode::SERVICE_UNAVAILABLE).await?;
         readiness.lead();
-        assert_http(&dialer, StatusCode::OK, StatusCode::OK).await?;
+        assert_http(&dialer, StatusCode::OK).await?;
 
         readiness.stop();
-        assert_http(
-            &dialer,
-            StatusCode::SERVICE_UNAVAILABLE,
-            StatusCode::SERVICE_UNAVAILABLE,
-        )
-        .await?;
+        assert_http(&dialer, StatusCode::SERVICE_UNAVAILABLE).await?;
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn health_header_reports_fenced_leadership_not_warm_readiness() -> gang_testkit::TestResult
+    {
+        let (listener, dialer) = memory_listener();
+        let (fence, keeper) = valid_fence();
+        let readiness = Readiness::default().with_fence(fence);
+        let clock = crate::test_support_clock::start();
+        let server_readiness = readiness.clone();
+        let task = tokio::spawn(async move {
+            serve_health(listener, server_readiness, &*clock, limits(4)).await
+        });
+        for (step, (status, leading)) in [
+            (StatusCode::SERVICE_UNAVAILABLE, "false"),
+            (StatusCode::OK, "false"),
+            (StatusCode::OK, "true"),
+            (StatusCode::SERVICE_UNAVAILABLE, "false"),
+            (StatusCode::SERVICE_UNAVAILABLE, "false"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for path in [
+                health_check().ready_path(),
+                health_check().deployment_path(),
+            ] {
+                let (actual_status, actual_leading) =
+                    request_with_leading(dialer.dial(), path).await?;
+                assert_eq!(actual_status, status);
+                assert_eq!(
+                    actual_leading
+                        .as_ref()
+                        .and_then(|value| value.to_str().ok()),
+                    Some(leading)
+                );
+            }
+            match step {
+                0 => {
+                    readiness.serve();
+                    readiness.contend();
+                }
+                1 => readiness.lead(),
+                2 => keeper.revoke(),
+                _ => readiness.stop(),
+            }
+        }
+        let (status, leading) = request_with_leading(dialer.dial(), "/other").await?;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(leading.is_none());
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn proxy_health_modes_preserve_readiness_and_reject_missing_headers()
+    -> gang_testkit::TestResult {
+        for mode in [
+            gang_config::ProxyProtocol::Accept,
+            gang_config::ProxyProtocol::Require,
+        ] {
+            let (listener, dialer) = memory_listener();
+            let clock = crate::test_support_clock::start();
+            let (fence, _keeper) = valid_fence();
+            let readiness = Readiness::default().with_fence(fence);
+            let server_readiness = readiness.clone();
+            let mut limits = limits(4);
+            limits.proxy_protocol = Arc::new(gang_config::ProxyProtocolConfig {
+                health: mode,
+                trusted_cidrs: vec!["10.0.1.4/32".parse()?],
+                ..gang_config::ProxyProtocolConfig::default()
+            });
+            let task = tokio::spawn(async move {
+                serve_health(Trusted(listener), server_readiness, &*clock, limits).await
+            });
+            for (step, status) in [
+                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::OK,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut io = dialer.dial();
+                io.write_all(b"\r\n\r\n\0\r\nQUIT\n\x20\0\0\0").await?;
+                assert_eq!(request_on(io, health_check().ready_path()).await?, status);
+                if step == 0 {
+                    readiness.serve();
+                } else if step == 1 {
+                    readiness.lead();
+                }
+            }
+            let mut framed = dialer.dial();
+            framed
+                .write_all(
+                    b"\r\n\r\n\0\r\nQUIT\n\x21\x11\0\x0c\xc0\0\x02\x01\xc0\0\x02\x02\0\x01\0\x02",
+                )
+                .await?;
+            assert_eq!(
+                request_on(framed, health_check().ready_path()).await?,
+                StatusCode::OK
+            );
+            if mode == gang_config::ProxyProtocol::Accept {
+                assert_eq!(
+                    request(&dialer, health_check().ready_path()).await?,
+                    StatusCode::OK
+                );
+            } else {
+                let mut io = dialer.dial();
+                io.write_all(b"GET / HTTP/1.1\r\n\r\n").await?;
+                let mut byte = [0; 1];
+                assert_eq!(io.read(&mut byte).await?, 0);
+            }
+            let mut invalid = dialer.dial();
+            invalid
+                .write_all(b"\r\n\r\n\0\r\nQUIT\n\x31\x11\0\x64")
+                .await?;
+            let mut byte = [0; 1];
+            assert_eq!(invalid.read(&mut byte).await?, 0);
+            task.abort();
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn health_proxy_header_uses_its_shorter_deadline() -> gang_testkit::TestResult {
+        let (listener, dialer) = memory_listener();
+        let clock = crate::test_support_clock::start();
+        let server_clock = Arc::clone(&clock);
+        let mut limits = limits(2);
+        limits.proxy_protocol = Arc::new(gang_config::ProxyProtocolConfig {
+            health: gang_config::ProxyProtocol::Accept,
+            trusted_cidrs: vec!["10.0.1.4/32".parse()?],
+            header_timeout: NonZeroDuration::from_secs(1),
+            ..gang_config::ProxyProtocolConfig::default()
+        });
+        let task = tokio::spawn(async move {
+            serve_health(
+                Trusted(listener),
+                Readiness::default(),
+                &*server_clock,
+                limits,
+            )
+            .await
+        });
+        let mut stalled = dialer.dial();
+        stalled.write_all(b"\r\n").await?;
+        assert_eq!(
+            request(&dialer, health_check().ready_path()).await?,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        clock.advance(Duration::from_secs(1));
+        let mut byte = [0; 1];
+        assert_eq!(stalled.read(&mut byte).await?, 0);
         task.abort();
         Ok(())
     }
@@ -291,7 +571,7 @@ mod tests {
         // Dials are accepted in order: an answer on a later connection means the silent one was
         // accepted first, so its deadline is already running.
         assert_eq!(
-            request(&dialer, health_check().serve_path()).await?,
+            request(&dialer, health_check().ready_path()).await?,
             StatusCode::SERVICE_UNAVAILABLE
         );
         clock.advance(health_check().timeout());
@@ -317,7 +597,7 @@ mod tests {
         ));
         let status = tokio::select! {
             never = &mut server => match never {},
-            status = request_on(dialer.dial(), health_check().serve_path()) => status?,
+            status = request_on(dialer.dial(), health_check().ready_path()) => status?,
         };
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         Ok(())
@@ -352,7 +632,7 @@ mod tests {
         clock.advance(health_check().timeout());
         let status = tokio::select! {
             never = &mut server => match never {},
-            status = request_on(waiting, health_check().serve_path()) => status?,
+            status = request_on(waiting, health_check().ready_path()) => status?,
         };
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         let mut unread = [0; 1];
@@ -386,15 +666,10 @@ mod tests {
         );
         let exercise = async {
             snapshots.reached(1).await;
-            assert_http(&dialer, StatusCode::OK, StatusCode::OK).await?;
+            assert_http(&dialer, StatusCode::OK).await?;
             stop.send(()).expect("server is running");
             drains.reached(1).await;
-            assert_http(
-                &dialer,
-                StatusCode::SERVICE_UNAVAILABLE,
-                StatusCode::SERVICE_UNAVAILABLE,
-            )
-            .await?;
+            assert_http(&dialer, StatusCode::SERVICE_UNAVAILABLE).await?;
             release.send(()).expect("controller is draining");
             gang_testkit::TestResult::Ok(())
         };
@@ -407,26 +682,30 @@ mod tests {
     #[tokio::test]
     async fn follower_is_not_leader_while_lease_is_held() -> gang_testkit::TestResult {
         use gang_clock::Clock;
-        use gang_spi::{ControllerId, ControllerReady, LeaderLeasePort};
+        use gang_spi::{
+            CandidateGeneration, ControllerId, ControllerReady, LeaderLeasePort, LeaseCandidate,
+            Takeover,
+        };
         use tokio::sync::oneshot;
 
-        let (mut parts, _, handles) = crate::test_support::plain_parts();
+        let (parts, _, handles) = crate::test_support::plain_parts();
         let now = handles.clock.wall();
         handles
             .repository
             .acquire(
-                &ControllerId::new("other"),
+                &LeaseCandidate {
+                    holder: ControllerId::new("other"),
+                    priority: gang_spi::CandidatePriority::registered(CandidateGeneration::new(
+                        u64::MAX,
+                    )),
+                },
+                now,
                 now,
                 now + std::time::Duration::from_mins(1),
+                Takeover::Observe,
             )
             .await?;
-        parts.listeners.leader = crate::LeaderListeners::Dedicated {
-            execution: "127.0.0.1:31001".parse()?,
-            worker: "127.0.0.1:31002".parse()?,
-            binder: crate::test_support_deployment::MemoryBinder::default(),
-        };
-        let mut settings = crate::test_support::plain_settings();
-        settings.execution_endpoint = Some(gang_types::Url::parse("http://127.0.0.1:31001/")?);
+        let settings = crate::test_support::plain_settings();
         let (health, dialer) = memory_listener();
         let server = crate::Server::prepare(parts, settings)
             .await?
@@ -441,7 +720,7 @@ mod tests {
         );
         let exercise = async {
             readiness.await?;
-            assert_http(&dialer, StatusCode::OK, StatusCode::SERVICE_UNAVAILABLE).await?;
+            assert_http(&dialer, StatusCode::SERVICE_UNAVAILABLE).await?;
             stop.send(()).expect("server is running");
             gang_testkit::TestResult::Ok(())
         };

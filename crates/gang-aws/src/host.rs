@@ -2,7 +2,7 @@
 
 use aws_sdk_autoscaling::types::LifecycleState;
 use gang_aws_sdk::{CallError, call_error};
-use gang_spi::{ControllerHostPort, HostMilestone, PortError};
+use gang_spi::{ControllerHostIdentity, ControllerHostPort, HostMilestone, PortError};
 
 use crate::errors::AwsError;
 use crate::group::DESCRIBE_GROUPS;
@@ -15,6 +15,10 @@ const TERMINATE_TRANSITION: &str = "autoscaling:EC2_INSTANCE_TERMINATING";
 const CONTINUE: &str = "CONTINUE";
 
 impl ControllerHostPort for Aws {
+    async fn incarnation(&self) -> Result<ControllerHostIdentity, PortError> {
+        Ok(self.runtime().await?.metadata.incarnation().await?)
+    }
+
     async fn retiring(&self) -> Result<(), PortError> {
         let runtime = self.runtime().await?;
         loop {
@@ -107,7 +111,9 @@ mod tests {
     use std::time::Duration;
 
     use gang_clock::{TestClock, Timestamp};
+    use gang_spi::CandidatePriority;
     use gang_testkit::TestResult;
+    use gang_types::InstanceId;
     use serde_json::json;
 
     use super::*;
@@ -137,6 +143,7 @@ mod tests {
             fake.imds_client()?,
             &config,
             clock.clone(),
+            &Arc::new(crate::events::Managed::default()),
         );
         let mut aws = Aws::with_runtime(config, runtime);
         aws.clock = clock.clone();
@@ -159,6 +166,104 @@ mod tests {
                 ("terminate".to_owned(), TERMINATE_TRANSITION.to_owned()),
             ],
         );
+    }
+
+    #[tokio::test]
+    async fn incarnation_is_cached_restart_stable_and_needs_no_worker_fleet_tag() -> TestResult {
+        let (fake, aws, clock) = setup().await?;
+        let launched = "2026-01-01T00:00:00Z";
+        fake.state().identity_document =
+            Some(json!({"instanceId": INSTANCE, "pendingTime": launched}).to_string());
+        let expected = ControllerHostIdentity::Launched {
+            at: Timestamp::from_rfc3339(launched)?,
+            instance: InstanceId::try_new(INSTANCE)?,
+        };
+        assert_eq!(aws.incarnation().await?, expected);
+        assert_eq!(aws.incarnation().await?, expected);
+        let document_reads = || {
+            fake.state()
+                .requests
+                .iter()
+                .filter(|request| {
+                    request.operation == "ImdsGet"
+                        && request.parameters.get("path").map(String::as_str)
+                            == Some("/latest/dynamic/instance-identity/document")
+                })
+                .count()
+        };
+        assert_eq!(document_reads(), 1);
+        let restarted = aws_for(&fake, clock).await?;
+        assert_eq!(restarted.incarnation().await?, expected);
+        assert_eq!(document_reads(), 2);
+        assert!(!fake.state().requests.iter().any(|request| {
+            request.operation == "ImdsGet"
+                && request
+                    .parameters
+                    .get("path")
+                    .is_some_and(|path| path.starts_with("/latest/meta-data/tags/instance/"))
+        }));
+        fake.state().identity_document = None;
+        assert_eq!(aws.incarnation().await?, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_or_malformed_controller_launch_time_is_permanent() -> TestResult {
+        let (fake, aws, _) = setup().await?;
+        for document in [
+            json!({"instanceId": INSTANCE}),
+            json!({"instanceId": INSTANCE, "pendingTime": "not-a-time"}),
+            json!({"instanceId": INSTANCE, "pendingTime": "1969-12-31T23:59:59Z"}),
+            json!({"instanceId": INSTANCE, "pendingTime": 42}),
+        ] {
+            fake.state().identity_document = Some(document.to_string());
+            assert!(matches!(
+                aws.incarnation().await,
+                Err(PortError::Backend(_))
+            ));
+        }
+        fake.state().identity_document = Some(
+            json!({"instanceId": INSTANCE, "pendingTime": "2026-01-01T00:00:00Z"}).to_string(),
+        );
+        assert_eq!(
+            aws.incarnation().await?,
+            ControllerHostIdentity::Launched {
+                at: Timestamp::from_rfc3339("2026-01-01T00:00:00Z")?,
+                instance: InstanceId::try_new(INSTANCE)?,
+            }
+        );
+        Ok(())
+    }
+
+    async fn host_priority(aws: &Aws) -> Result<CandidatePriority, Box<dyn std::error::Error>> {
+        match aws.incarnation().await? {
+            ControllerHostIdentity::Launched { at, instance } => {
+                Ok(CandidatePriority::launched(at, &instance))
+            }
+            ControllerHostIdentity::Persistent(_) => {
+                Err("AWS returned a persistent identity".into())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn immutable_launch_time_then_instance_id_totally_order_controller_hosts() -> TestResult {
+        let (fake, aws, clock) = setup().await?;
+        fake.state().identity_document =
+            Some(json!({"instanceId": "i-z", "pendingTime": "2026-01-01T00:00:00Z"}).to_string());
+        let old = host_priority(&aws).await?;
+        fake.state().identity_document =
+            Some(json!({"instanceId": "i-a", "pendingTime": "2026-01-01T00:00:01Z"}).to_string());
+        let newer = host_priority(&aws_for(&fake, clock.clone()).await?).await?;
+        fake.state().identity_document =
+            Some(json!({"instanceId": "i-b", "pendingTime": "2026-01-01T00:00:01Z"}).to_string());
+        let tied = host_priority(&aws_for(&fake, clock.clone()).await?).await?;
+        assert!(old < newer);
+        assert!(newer < tied);
+        fake.state().identity_document =
+            Some(json!({"instanceId": "i-z", "pendingTime": "2026-01-01T00:00:00Z"}).to_string());
+        assert_eq!(host_priority(&aws_for(&fake, clock).await?).await?, old);
+        Ok(())
     }
 
     #[tokio::test]

@@ -222,3 +222,20 @@ test("a tick at the current seq or ahead of it continues the stream, one behind 
   assert.equal(tickContinues(snapshot, tick(snapshot.seq + 1)), true);
   assert.equal(tickContinues(snapshot, tick(snapshot.seq - 1)), false);
 });
+
+test("status replacement and expiry do not alter audit events or unknown payloads", () => {
+  const unknown = { name: "events/9999", createTime: snapshot.updateTime, fleet: "fleets/a", futureKind: { value: 1 } } as unknown as ScalingEvent;
+  const status: ScalingEvent = { name: "awsEvents/a", createTime: snapshot.updateTime, fleet: "fleets/a", aws: { event: {
+    id: "a", at: snapshot.updateTime, kind: { type: "capacityUnavailable", reason: "capacity" },
+  } } };
+  const withAudit = apply(snapshot, after(snapshot, { events: [unknown] }));
+  const withStatus = apply(withAudit, after(withAudit, { statusEvents: [status] }));
+  assert.equal(withStatus.events, withAudit.events);
+  assert.deepEqual(withStatus.events.at(-1), unknown);
+  assert.deepEqual(withStatus.statusEvents, [status]);
+  const unchanged = apply(withStatus, after(withStatus));
+  assert.equal(unchanged.statusEvents, withStatus.statusEvents);
+  const expired = apply(unchanged, after(unchanged, { statusEvents: [] }));
+  assert.deepEqual(expired.statusEvents, []);
+  assert.equal(expired.events, withAudit.events);
+});

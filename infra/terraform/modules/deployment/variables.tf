@@ -19,6 +19,49 @@ variable "name" {
   }
 }
 
+variable "aws_events_enabled" {
+  type        = bool
+  description = "Enable AWS event observation. Set only after all controller and worker images support events_queue_url."
+  default     = false
+  nullable    = false
+}
+
+variable "aws_events_retention_seconds" {
+  type        = number
+  description = "Retention in seconds for the AWS events queue."
+  default     = 86400
+  nullable    = false
+
+  validation {
+    condition     = var.aws_events_retention_seconds >= 60 && var.aws_events_retention_seconds <= 1209600 && floor(var.aws_events_retention_seconds) == var.aws_events_retention_seconds
+    error_message = "aws_events_retention_seconds must be an integer from 60 to 1209600."
+  }
+}
+
+variable "aws_events_dead_letter_retention_seconds" {
+  type        = number
+  description = "Retention in seconds for the AWS events dead-letter queue; at least the main queue retention."
+  default     = 345600
+  nullable    = false
+
+  validation {
+    condition     = var.aws_events_dead_letter_retention_seconds >= 60 && var.aws_events_dead_letter_retention_seconds <= 1209600 && floor(var.aws_events_dead_letter_retention_seconds) == var.aws_events_dead_letter_retention_seconds && var.aws_events_dead_letter_retention_seconds >= var.aws_events_retention_seconds
+    error_message = "aws_events_dead_letter_retention_seconds must be an integer from 60 to 1209600 and at least aws_events_retention_seconds."
+  }
+}
+
+variable "aws_events_max_receive_count" {
+  type        = number
+  description = "Number of unsuccessful receives before an AWS event is moved to the dead-letter queue."
+  default     = 5
+  nullable    = false
+
+  validation {
+    condition     = var.aws_events_max_receive_count >= 1 && var.aws_events_max_receive_count <= 1000 && floor(var.aws_events_max_receive_count) == var.aws_events_max_receive_count
+    error_message = "aws_events_max_receive_count must be an integer from 1 to 1000."
+  }
+}
+
 variable "iam_name_prefix" {
   type        = string
   description = "Prefix of the name of every IAM role and instance profile of the controller and the workers, including any separator (for example `example-`). Empty keeps the default names."
@@ -167,13 +210,19 @@ variable "load_balancer" {
   type = object({
     ssl_policy                     = optional(string, "ELBSecurityPolicy-TLS13-1-2-2021-06")
     certificate_validation_timeout = optional(string, "2h")
+    proxy_protocol_stage           = optional(string, "accept")
   })
-  description = "Public TLS load balancer using an ACM certificate for hostname; required for shared database engines (postgres and dynamodb). SQLite keeps its controller Elastic IP and private DNS. Shared database engines use public and internal load balancers, with the hostname resolving privately to the internal load balancer. ssl_policy must be an ELBSecurityPolicy-TLS13-* policy. The first apply waits up to certificate_validation_timeout for DNS validation."
+  description = "Public TLS load balancer using an ACM certificate for hostname; required for shared database engines (postgres and dynamodb). SQLite keeps its controller Elastic IP and private DNS. Shared database engines use public and internal load balancers, with the hostname resolving privately to the internal load balancer. proxy_protocol_stage applies only to shared databases and defaults to accept; advance one adjacent step per apply through off, accept, proxied, require (or reverse), waiting for all controller refreshes before the next step. ssl_policy must be an ELBSecurityPolicy-TLS13-* policy. The first apply waits up to certificate_validation_timeout for DNS validation."
   default     = null
 
   validation {
     condition     = var.load_balancer == null || var.hostname != null
     error_message = "load_balancer requires hostname: it is the certificate's domain."
+  }
+
+  validation {
+    condition     = var.load_balancer == null ? true : contains(["off", "accept", "proxied", "require"], var.load_balancer.proxy_protocol_stage)
+    error_message = "load_balancer.proxy_protocol_stage must be off, accept, proxied, or require."
   }
 }
 
@@ -352,7 +401,7 @@ variable "fleets" {
         false
       )
     ])
-    error_message = "Each fleet memory_per_instance must be at least 64MiB, the default [scheduler.nativelink.memory] min_reservation, which the controller refuses to exceed."
+    error_message = "Each fleet memory_per_instance must be at least 64MiB, the default [actions.memory] min_reservation, which the controller refuses to exceed."
   }
 
   validation {
@@ -478,10 +527,12 @@ variable "extra_config_toml" {
     and CI identity providers, tunables), never bare top-level keys: a key there would join the last table. TOML tables
     already opened by this module cannot be reopened here, even for settings omitted from the template such as
     [database.sqlite].busy_timeout and [authentication.workers.mtls].certificate_ttl. With database.engine "postgres" or
-    "dynamodb", the module opens [scheduler.nativelink.http2] and owns shutdown_grace, so all other keys in that table,
+    "dynamodb", the module opens [server.http2] and owns shutdown_grace, so all other keys in that table,
     including max_connections and receive_window, retain their defaults. With "sqlite", the module does not open that
-    table, so it can be appended here. Its first non-blank, non-comment line must start with "[". Content is public: it
-    lands in the SSM parameter (gang.toml), not
+    table, so it can be appended here. For shared databases when load_balancer.proxy_protocol_stage is not "off", the
+    module also opens [server.proxy_protocol], so it cannot be reopened here; header_timeout, max_pending_headers, and
+    max_header_size are not exposed and retain their runtime defaults. Its first non-blank, non-comment line must start
+    with "[". Content is public: it lands in the SSM parameter (gang.toml), not
     in EC2 user data. Put confidential values in controller_secret_parameters, never here, and reference them by their
     absolute path under /etc/gang/secrets.
   EOT
@@ -495,8 +546,13 @@ variable "extra_config_toml" {
 
 variable "config_parameter_name" {
   type        = string
-  description = "Name of the SSM parameter that holds gang.toml. Null uses /<name>/gang.toml. Instances read it at boot. Configuration changes restart the SQLite instance or refresh the controller group for shared database engines (postgres and dynamodb)."
+  description = "Legacy SSM parameter name. Null uses /<name>/gang.toml. New instances read an immutable generation beneath this name. The partition and region determine the available ARN length budget."
   default     = null
+
+  validation {
+    condition     = var.config_parameter_name == null ? true : length(var.config_parameter_name) <= 962 && length(split("/", trimprefix(var.config_parameter_name, "/"))) <= 13 && can(regex("^/([A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+$", var.config_parameter_name)) && !can(regex("(?i)^/(aws|ssm)", var.config_parameter_name))
+    error_message = "config_parameter_name must be an absolute SSM path of at most 962 characters and 13 segments, without an aws or ssm prefix. The partition and region may impose a smaller generation ARN budget."
+  }
 }
 
 variable "tags" {

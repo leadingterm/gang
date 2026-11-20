@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use gang_clock::{Clock, TestClock};
 use gang_spi::{ActionLimits, ActionScope};
-use gang_types::{Bytes, HeadroomPercent, NonZeroBytes, NonZeroDuration};
+use gang_types::{Bytes, NonZeroBytes, NonZeroDuration};
 
-use crate::config::{CgroupConfig, CpuPeriod, Delegation, OomGroup};
+use crate::config::{CgroupConfig, CpuPeriod, Delegation};
 use crate::controller::{CgroupScope, Controller};
 use crate::errors::CgroupError;
 use crate::fs::{Cgroupfs, PROCS};
@@ -29,6 +29,8 @@ const DELEGATED: [&str; 4] = ["cpu", "memory", "pids", "io"];
 const ENABLED: [&str; 3] = ["cpu", "memory", "pids"];
 /// The `gang-join` link the controllers are built with.
 const JOIN: &str = "/work/bin/gang-join";
+/// Non-default memory reserved outside the action pool.
+const RESERVE: u64 = 512 * 1024 * 1024;
 
 /// Polls `future` to completion, advancing `clock` by `step` each time it is pending, and returns
 /// its output with the number of advances. The wakers are never used: the future is polled again
@@ -101,20 +103,115 @@ fn scope_path(scope: &CgroupScope) -> PathBuf {
 async fn prepare_moves_process_into_worker_leaf_and_enables_controllers() {
     let controller = controller(delegated());
 
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
 
     assert_eq!(controller.fs.member(), worker());
     assert!(controller.fs.exists(&actions()));
     assert_eq!(controller.fs.enabled(&subtree()), ENABLED);
     assert_eq!(controller.fs.enabled(&actions()), ENABLED);
 }
+#[tokio::test]
+async fn prepare_configures_pool_and_returns_page_rounded_capacity() {
+    let tree = delegated().with_memtotal_kib(10_000).with_page_size(8_192);
+    tree.set_memory_max(&subtree(), "9000000");
+    tree.set_memory_max(Path::new("system"), "7000000");
+    let config = CgroupConfig {
+        swap_max: Bytes::new(234_567),
+        ..CgroupConfig::default()
+    };
+    let controller = controller_with(tree, config);
+    let pool = controller
+        .prepare(Bytes::new(12_345))
+        .await
+        .expect("prepare");
+    let requested = 7_000_000_u64 - 12_345;
+    let rounded = requested.div_ceil(8_192) * 8_192;
+
+    assert_eq!(
+        controller.fs.memory_max_writes(),
+        vec![(actions(), requested.to_string())]
+    );
+    assert_eq!(
+        trimmed(&controller.fs, &actions(), "memory.max"),
+        Some(rounded.to_string())
+    );
+    assert_eq!(
+        trimmed(&controller.fs, &actions(), "memory.swap.max").as_deref(),
+        Some("234567")
+    );
+    assert_eq!(
+        trimmed(&controller.fs, &actions(), "memory.oom.group").as_deref(),
+        Some("0")
+    );
+    assert_eq!(pool.cgroup, controller.fs.absolute(&actions()));
+    assert_eq!(Some(pool.capacity), NonZeroBytes::new(Bytes::new(rounded)));
+}
+
+#[tokio::test]
+async fn prepare_uses_smallest_of_physical_memory_and_all_visible_ancestors() {
+    for (ram_kib, root, parent, subtree_limit, effective) in [
+        (5_000, None, "max", "max", 5_120_000),
+        (10_000, None, "6000000", "8000000", 6_000_000),
+        (10_000, None, "8000000", "6000000", 6_000_000),
+        (10_000, Some("4000000"), "8000000", "6000000", 4_000_000),
+    ] {
+        let tree = delegated().with_memtotal_kib(ram_kib);
+        if let Some(root) = root {
+            tree.set_memory_max(Path::new(""), root);
+        }
+        tree.set_memory_max(Path::new("system"), parent);
+        tree.set_memory_max(&subtree(), subtree_limit);
+        let controller = controller(tree);
+        let pool = controller
+            .prepare(Bytes::new(123_456))
+            .await
+            .expect("prepare");
+        assert_eq!(
+            controller.fs.memory_max_writes(),
+            vec![(actions(), (effective - 123_456_u64).to_string())]
+        );
+        assert_eq!(
+            Some(pool.capacity),
+            NonZeroBytes::new(Bytes::new(effective - 123_456))
+        );
+    }
+}
+
+#[tokio::test]
+async fn prepare_rejects_reserve_equal_to_or_above_effective_memory() {
+    for reserve in [6_000_000, 6_000_001] {
+        let tree = delegated().with_memtotal_kib(10_000);
+        tree.set_memory_max(Path::new("system"), "6000000");
+        let controller = controller(tree);
+        let error = controller.prepare(Bytes::new(reserve)).await.unwrap_err();
+        assert!(
+            matches!(error, CgroupError::ReserveTooLarge { reserve: actual, effective: 6_000_000 } if actual == reserve),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "memory reserve {reserve} bytes must be less than effective memory 6000000 bytes"
+            )
+        );
+    }
+}
 
 #[tokio::test]
 async fn prepare_is_repeatable_from_worker_leaf() {
     let controller = controller(delegated());
-    controller.prepare().await.expect("first prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("first prepare");
 
-    controller.prepare().await.expect("second prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("second prepare");
 
     assert_eq!(controller.fs.member(), worker());
     assert_eq!(controller.fs.enabled(&subtree()), ENABLED);
@@ -125,7 +222,7 @@ async fn prepare_is_repeatable_from_worker_leaf() {
 async fn prepare_fails_without_moving_when_subtree_lacks_a_controller() {
     let controller = controller(TestTree::new(SUBTREE, &["cpu", "memory", "io"]));
 
-    let error = controller.prepare().await.unwrap_err();
+    let error = controller.prepare(Bytes::new(RESERVE)).await.unwrap_err();
 
     assert!(
         matches!(
@@ -144,7 +241,7 @@ async fn prepare_fails_without_moving_when_subtree_lacks_a_controller() {
 async fn prepare_in_root_cgroup_fails_without_delegated_subtree() {
     let controller = controller(TestTree::new("", &DELEGATED));
 
-    let error = controller.prepare().await.unwrap_err();
+    let error = controller.prepare(Bytes::new(RESERVE)).await.unwrap_err();
 
     assert!(
         matches!(error, CgroupError::NoDelegatedSubtree),
@@ -157,7 +254,7 @@ async fn prepare_in_root_cgroup_fails_without_delegated_subtree() {
 async fn prepare_fails_without_moving_when_subtree_is_not_delegated() {
     let controller = controller(delegated().undelegated());
 
-    let error = controller.prepare().await.unwrap_err();
+    let error = controller.prepare(Bytes::new(RESERVE)).await.unwrap_err();
 
     assert!(
         matches!(error, CgroupError::NotDelegated { .. }),
@@ -176,7 +273,10 @@ async fn prepare_trusts_an_undelegated_subtree_when_configured() {
     };
     let controller = controller_with(delegated().undelegated(), config);
 
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
 
     assert_eq!(controller.fs.member(), worker());
     assert!(controller.fs.exists(&actions()));
@@ -186,7 +286,7 @@ async fn prepare_trusts_an_undelegated_subtree_when_configured() {
 async fn prepare_fails_when_kernel_lacks_cgroup_kill() {
     let controller = controller(delegated().without_kernel_file("cgroup.kill"));
 
-    let error = controller.prepare().await.unwrap_err();
+    let error = controller.prepare(Bytes::new(RESERVE)).await.unwrap_err();
 
     assert!(
         matches!(error, CgroupError::MissingKernelFeature { .. }),
@@ -195,15 +295,19 @@ async fn prepare_fails_when_kernel_lacks_cgroup_kill() {
 }
 
 #[tokio::test]
-async fn prepare_fails_when_kernel_lacks_memory_peak() {
+async fn missing_memory_peak_does_not_prevent_prepare_or_usage() {
     let controller = controller(delegated().without_kernel_file("memory.peak"));
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
+    let scope = controller
+        .enter(&limits(Some(3), Some(123_456)))
+        .expect("enter");
 
-    let error = controller.prepare().await.unwrap_err();
+    let usage = controller.leave(scope).await.expect("leave");
 
-    assert!(
-        matches!(error, CgroupError::MissingKernelFeature { .. }),
-        "{error:?}"
-    );
+    assert_eq!(usage.peak_memory, None);
 }
 
 #[test]
@@ -217,7 +321,7 @@ fn prepare_removes_scopes_left_by_previous_worker() {
     let (result, pauses) = settled(
         &controller.clock,
         default_poll_interval(),
-        controller.prepare(),
+        controller.prepare(Bytes::new(RESERVE)),
     );
 
     result.expect("prepare");
@@ -240,7 +344,11 @@ fn prepare_fails_when_a_stale_scope_never_empties() {
     tree.populate(&stale, u32::MAX);
     let controller = controller_with(tree, config);
 
-    let (result, _pauses) = settled(&controller.clock, step, controller.prepare());
+    let (result, _pauses) = settled(
+        &controller.clock,
+        step,
+        controller.prepare(Bytes::new(RESERVE)),
+    );
 
     let error = result.unwrap_err();
     assert!(
@@ -252,7 +360,10 @@ fn prepare_fails_when_a_stale_scope_never_empties() {
 #[tokio::test]
 async fn enter_creates_scope_with_requested_limits() {
     let controller = controller(delegated());
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
 
     let scope = controller
         .enter(&limits(Some(2), Some(1 << 30)))
@@ -261,10 +372,7 @@ async fn enter_creates_scope_with_requested_limits() {
     let cgroup = scope_path(&scope);
     let tree = &controller.fs;
     assert_eq!(cgroup.parent(), Some(actions().as_path()));
-    assert_eq!(
-        trimmed(tree, &cgroup, "memory.max").as_deref(),
-        Some("2147483648")
-    );
+    assert_eq!(trimmed(tree, &cgroup, "memory.max").as_deref(), Some("max"));
     assert_eq!(
         trimmed(tree, &cgroup, "memory.oom.group").as_deref(),
         Some("1")
@@ -277,15 +385,17 @@ async fn enter_creates_scope_with_requested_limits() {
 }
 
 #[tokio::test]
-async fn enter_honours_configured_headroom_pids_and_period() {
+async fn enter_honours_configured_pids_and_period() {
     let config = CgroupConfig {
-        memory_headroom_percent: HeadroomPercent::from_percent(50),
         max_pids: NonZeroU32::new(8).expect("non-zero pids"),
         cpu_period: CpuPeriod::try_new(Duration::from_millis(10)).expect("valid cpu period"),
         ..CgroupConfig::default()
     };
     let controller = controller_with(delegated(), config);
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
 
     let scope = controller
         .enter(&limits(Some(2), Some(1 << 30)))
@@ -293,10 +403,7 @@ async fn enter_honours_configured_headroom_pids_and_period() {
 
     let cgroup = scope_path(&scope);
     let tree = &controller.fs;
-    assert_eq!(
-        trimmed(tree, &cgroup, "memory.max").as_deref(),
-        Some("1610612736")
-    );
+    assert_eq!(trimmed(tree, &cgroup, "memory.max").as_deref(), Some("max"));
     assert_eq!(trimmed(tree, &cgroup, "pids.max").as_deref(), Some("8"));
     assert_eq!(
         trimmed(tree, &cgroup, "cpu.max").as_deref(),
@@ -305,34 +412,35 @@ async fn enter_honours_configured_headroom_pids_and_period() {
 }
 
 #[tokio::test]
-async fn enter_writes_the_configured_oom_group() {
-    let config = CgroupConfig {
-        oom_group: OomGroup::Process,
-        ..CgroupConfig::default()
-    };
-    let controller = controller_with(delegated(), config);
-    controller.prepare().await.expect("prepare");
+async fn enter_always_sets_oom_group_for_a_scope() {
+    let controller = controller(delegated());
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
+    let scope = controller
+        .enter(&limits(Some(3), Some(123_456)))
+        .expect("enter");
 
-    let scope = controller.enter(&limits(None, None)).expect("enter");
-
-    let cgroup = scope_path(&scope);
-    let tree = &controller.fs;
     assert_eq!(
-        trimmed(tree, &cgroup, "memory.oom.group").as_deref(),
-        Some("0")
+        trimmed(&controller.fs, &scope_path(&scope), "memory.oom.group").as_deref(),
+        Some("1")
     );
 }
 
 #[tokio::test]
 async fn enter_without_requested_limits_writes_no_memory_or_cpu_maximum() {
     let controller = controller(delegated());
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
 
     let scope = controller.enter(&limits(None, None)).expect("enter");
 
     let cgroup = scope_path(&scope);
     let tree = &controller.fs;
-    assert_eq!(trimmed(tree, &cgroup, "memory.max"), None);
+    assert_eq!(trimmed(tree, &cgroup, "memory.max").as_deref(), Some("max"));
     assert_eq!(trimmed(tree, &cgroup, "cpu.max"), None);
     assert_eq!(
         trimmed(tree, &cgroup, "memory.oom.group").as_deref(),
@@ -342,68 +450,46 @@ async fn enter_without_requested_limits_writes_no_memory_or_cpu_maximum() {
 }
 
 #[tokio::test]
-async fn enter_forbids_swap_by_default() {
-    let controller = controller(delegated());
-    controller.prepare().await.expect("prepare");
-
-    let scope = controller
-        .enter(&limits(Some(2), Some(1 << 30)))
-        .expect("enter");
-
-    let cgroup = scope_path(&scope);
-    assert_eq!(
-        trimmed(&controller.fs, &cgroup, "memory.swap.max").as_deref(),
-        Some("0")
-    );
-}
-
-#[tokio::test]
-async fn enter_writes_the_configured_swap_maximum() {
+async fn prepare_applies_swap_to_the_pool_not_the_action_scope() {
     let config = CgroupConfig {
         swap_max: Bytes::new(1 << 20),
         ..CgroupConfig::default()
     };
     let controller = controller_with(delegated(), config);
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
 
-    let scope = controller
-        .enter(&limits(Some(2), Some(1 << 30)))
-        .expect("enter");
-
-    let cgroup = scope_path(&scope);
     assert_eq!(
-        trimmed(&controller.fs, &cgroup, "memory.swap.max").as_deref(),
+        trimmed(&controller.fs, &actions(), "memory.swap.max").as_deref(),
         Some("1048576")
     );
-}
-
-#[tokio::test]
-async fn enter_without_swap_accounting_still_applies_the_other_limits() {
-    let controller = controller(delegated().without_kernel_file("memory.swap.max"));
-    controller.prepare().await.expect("prepare");
-
     let scope = controller
         .enter(&limits(Some(2), Some(1 << 30)))
         .expect("enter");
-
-    let cgroup = scope_path(&scope);
-    let tree = &controller.fs;
-    assert_eq!(trimmed(tree, &cgroup, "memory.swap.max"), None);
-    assert_eq!(
-        trimmed(tree, &cgroup, "memory.max").as_deref(),
-        Some("2147483648")
+    assert!(
+        controller
+            .fs
+            .memory_max_writes()
+            .iter()
+            .all(|(path, _)| path != &scope_path(&scope))
     );
 }
 
 #[tokio::test]
-async fn enter_without_a_memory_reservation_writes_no_swap_maximum() {
-    let controller = controller(delegated());
-    controller.prepare().await.expect("prepare");
+async fn prepare_without_swap_accounting_still_applies_the_pool_limit() {
+    let controller = controller(delegated().without_kernel_file("memory.swap.max"));
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
 
-    let scope = controller.enter(&limits(None, None)).expect("enter");
-
-    let cgroup = scope_path(&scope);
-    assert_eq!(trimmed(&controller.fs, &cgroup, "memory.swap.max"), None);
+    assert_eq!(trimmed(&controller.fs, &actions(), "memory.swap.max"), None);
+    assert_ne!(
+        trimmed(&controller.fs, &actions(), "memory.max").as_deref(),
+        Some("max")
+    );
 }
 
 #[tokio::test]
@@ -423,7 +509,10 @@ async fn enter_before_prepare_fails_and_creates_nothing() {
 #[tokio::test]
 async fn enter_failing_to_apply_limits_leaves_process_and_no_scope() {
     let controller = controller(delegated().reject_writes_of("pids.max"));
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
 
     let error = controller
         .enter(&limits(Some(2), Some(1 << 30)))
@@ -444,7 +533,10 @@ async fn enter_failing_to_apply_limits_leaves_process_and_no_scope() {
 async fn a_scope_name_collision_is_an_error_not_a_takeover() {
     static SERIAL: AtomicU64 = AtomicU64::new(0);
     let controller = controller(delegated()).with_serial(&SERIAL);
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
     let existing = actions().join(format!("{}-{OWN_START}-0", std::process::id()));
     controller.fs.mkdir_all(&existing);
 
@@ -459,7 +551,10 @@ async fn a_scope_name_collision_is_an_error_not_a_takeover() {
 #[tokio::test]
 async fn enter_sweeps_scopes_of_dead_creators_only() {
     let controller = controller(delegated());
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
     let dead = actions().join("99999-1-1");
     let populated = actions().join("99998-1-1");
     let live = actions().join("99996-2000-1");
@@ -492,7 +587,10 @@ async fn a_dead_creators_scope_that_never_empties_does_not_block_enter() {
         ..CgroupConfig::default()
     };
     let controller = controller_with(delegated(), config);
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
     let stale = actions().join("99993-1-0");
     controller.fs.mkdir_all(&stale);
     controller.fs.populate(&stale, u32::MAX);
@@ -515,7 +613,10 @@ async fn a_stale_scope_that_never_empties_does_not_delay_enter_or_leave() {
     };
     let step = config.removal_poll_interval.get();
     let controller = controller_with(delegated(), config);
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
     let stale = actions().join("99992-1-0");
     controller.fs.mkdir_all(&stale);
     controller.fs.populate(&stale, u32::MAX);
@@ -535,7 +636,10 @@ async fn a_stale_scope_that_never_empties_does_not_delay_enter_or_leave() {
 #[tokio::test]
 async fn a_stale_scope_that_empties_later_is_removed_by_the_next_sweep() {
     let controller = controller(delegated());
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
     let stale = actions().join("99991-1-0");
     controller.fs.mkdir_all(&stale);
     controller.fs.populate(&stale, u32::MAX);
@@ -555,25 +659,68 @@ async fn leave_reports_usage_and_removes_the_scope() {
     let controller = controller(
         delegated()
             .with_peak_memory(123_456)
-            .with_cpu_micros(2_500_000),
+            .with_cpu_micros(2_500_000)
+            .with_memory_events("low 0\noom_kill 3\n"),
     );
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
     let scope = controller.enter(&limits(None, None)).expect("enter");
     let cgroup = scope_path(&scope);
 
     let usage = controller.leave(scope).await.expect("leave");
 
-    assert_eq!(usage.peak_memory, Bytes::new(123_456));
+    assert_eq!(usage.peak_memory, Some(Bytes::new(123_456)));
     assert_eq!(usage.cpu_time, Duration::from_millis(2500));
+    assert_eq!(usage.oom_kills, 3);
     assert_eq!(controller.fs.member(), worker());
     assert!(!controller.fs.exists(&cgroup));
     assert!(controller.fs.killed().contains(&cgroup));
 }
 
 #[tokio::test]
+async fn leave_handles_missing_and_malformed_oom_counts() {
+    for text in ["oom_kill 0\n", "low 1\n"] {
+        let controller = controller(delegated().with_memory_events(text));
+        controller
+            .prepare(Bytes::new(RESERVE))
+            .await
+            .expect("prepare");
+        let scope = controller.enter(&limits(None, None)).expect("enter");
+        assert_eq!(controller.leave(scope).await.expect("leave").oom_kills, 0);
+    }
+    let missing = controller(delegated().without_kernel_file("memory.events"));
+    missing.prepare(Bytes::new(RESERVE)).await.expect("prepare");
+    let scope = missing.enter(&limits(None, None)).expect("enter");
+    assert_eq!(missing.leave(scope).await.expect("leave").oom_kills, 0);
+
+    for text in ["oom_kill invalid\n", "oom_kill\n"] {
+        let controller = controller(delegated().with_memory_events(text));
+        controller
+            .prepare(Bytes::new(RESERVE))
+            .await
+            .expect("prepare");
+        let scope = controller.enter(&limits(None, None)).expect("enter");
+        let path = scope_path(&scope);
+        assert!(matches!(
+            controller.leave(scope).await,
+            Err(CgroupError::Malformed {
+                what: "memory.events",
+                ..
+            })
+        ));
+        assert!(!controller.fs.exists(&path));
+    }
+}
+
+#[tokio::test]
 async fn leave_waits_for_processes_to_exit() {
     let controller = controller(delegated().with_deaths_after_kill(3));
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
     let scope = controller.enter(&limits(None, None)).expect("enter");
     let cgroup = scope_path(&scope);
 
@@ -598,7 +745,10 @@ async fn leave_gives_up_when_processes_never_exit_but_still_returns_process() {
     };
     let step = config.removal_poll_interval.get();
     let controller = controller_with(delegated().with_deaths_after_kill(1_000_000), config);
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
     let scope = controller.enter(&limits(None, None)).expect("enter");
     let cgroup = scope_path(&scope);
 
@@ -623,7 +773,10 @@ async fn a_populated_scope_that_never_empties_waits_the_whole_removal_timeout() 
     };
     let step = config.removal_poll_interval.get();
     let controller = controller_with(delegated().with_deaths_after_kill(1_000_000), config);
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
     let scope = controller.enter(&limits(None, None)).expect("enter");
     let cgroup = scope_path(&scope);
 
@@ -642,7 +795,10 @@ async fn a_populated_scope_that_never_empties_waits_the_whole_removal_timeout() 
 #[tokio::test]
 async fn leave_removes_cgroups_the_action_created_inside_its_scope() {
     let controller = controller(delegated());
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
     let scope = controller.enter(&limits(None, None)).expect("enter");
     let cgroup = scope_path(&scope);
     let grandchild = cgroup.join("child").join("grandchild");
@@ -658,7 +814,10 @@ async fn leave_removes_cgroups_the_action_created_inside_its_scope() {
 #[tokio::test]
 async fn leave_cleans_up_when_usage_cannot_be_read() {
     let controller = controller(delegated());
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
     let scope = controller.enter(&limits(None, None)).expect("enter");
     let cgroup = scope_path(&scope);
     controller
@@ -678,7 +837,10 @@ async fn leave_cleans_up_when_usage_cannot_be_read() {
 async fn successive_enter_leave_cycles_use_distinct_scope_names() {
     static SERIAL: AtomicU64 = AtomicU64::new(0);
     let controller = controller(delegated()).with_serial(&SERIAL);
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
 
     let first = controller.enter(&limits(None, None)).expect("first enter");
     let first_cgroup = scope_path(&first);
@@ -700,8 +862,14 @@ async fn successive_enter_leave_cycles_use_distinct_scope_names() {
 async fn controllers_on_separate_trees_draw_scope_names_from_one_serial() {
     let first = controller(delegated());
     let second = controller(delegated());
-    first.prepare().await.expect("first prepare");
-    second.prepare().await.expect("second prepare");
+    first
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("first prepare");
+    second
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("second prepare");
 
     let first_scope = first.enter(&limits(None, None)).expect("first enter");
     let first_cgroup = scope_path(&first_scope);
@@ -714,7 +882,10 @@ async fn controllers_on_separate_trees_draw_scope_names_from_one_serial() {
 #[tokio::test]
 async fn reap_waits_for_abandoned_populated_scope_and_removes_descendants() {
     let controller = controller(delegated());
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
     let abandoned = actions().join("99997-1-1");
     let descendant = abandoned.join("child").join("grandchild");
     controller.fs.mkdir_all(&descendant);
@@ -736,7 +907,10 @@ async fn reap_waits_for_abandoned_populated_scope_and_removes_descendants() {
 #[tokio::test]
 async fn reap_leaves_live_creators_scopes_untouched() {
     let controller = controller(delegated());
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
     let live = actions().join("99994-7-0");
     controller.fs.mkdir_all(&live);
     controller.fs.set_process_start(99_994, Some(7));
@@ -755,7 +929,10 @@ async fn reap_leaves_live_creators_scopes_untouched() {
 async fn reap_counts_a_scope_a_racing_reaper_removed_as_removed() {
     let stale = actions().join("99998-1-0");
     let controller = controller(delegated().removed_by_a_racing_reaper(&stale));
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
     controller.fs.mkdir_all(&stale);
     controller.fs.populate(&stale, 2);
 
@@ -776,7 +953,10 @@ async fn reap_fails_after_timeout_when_abandoned_scope_never_empties() {
     };
     let step = config.removal_poll_interval.get();
     let controller = controller_with(delegated(), config);
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
     let abandoned = actions().join("99992-1-0");
     controller.fs.mkdir_all(&abandoned);
     controller.fs.populate(&abandoned, u32::MAX);
@@ -792,7 +972,10 @@ async fn reap_fails_after_timeout_when_abandoned_scope_never_empties() {
 #[tokio::test]
 async fn reap_treats_zombie_creator_as_gone() {
     let controller = controller(delegated());
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
     let abandoned = actions().join("99993-7-0");
     controller.fs.mkdir_all(&abandoned);
     controller.fs.set_process_start(99_993, Some(7));
@@ -810,7 +993,10 @@ async fn reap_treats_zombie_creator_as_gone() {
 #[tokio::test]
 async fn reap_leaves_other_gone_creators_scopes_untouched() {
     let controller = controller(delegated());
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
     let target = actions().join("99996-1-0");
     let other = actions().join("99995-1-0");
     controller.fs.mkdir_all(&target);
@@ -830,7 +1016,10 @@ async fn reap_leaves_other_gone_creators_scopes_untouched() {
 #[tokio::test]
 async fn reap_removes_scopes_whose_creator_pid_was_reused() {
     let controller = controller(delegated());
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
     let abandoned = actions().join("99991-7-0");
     controller.fs.mkdir_all(&abandoned);
     controller.fs.set_process_start(99_991, Some(8));
@@ -847,7 +1036,10 @@ async fn reap_removes_scopes_whose_creator_pid_was_reused() {
 #[tokio::test]
 async fn leave_sweeps_scopes_of_dead_creators() {
     let controller = controller(delegated());
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
     let scope = controller.enter(&limits(None, None)).expect("enter");
     let vanished = actions().join("99997-1-1");
     controller.fs.mkdir_all(&vanished);
@@ -868,7 +1060,10 @@ async fn leave_sweeps_scopes_of_dead_creators() {
 #[tokio::test]
 async fn a_scope_whose_creator_pid_was_reused_by_another_process_is_swept() {
     let controller = controller(delegated());
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
     let stale = actions().join("99995-1-0");
     controller.fs.mkdir_all(&stale);
     controller.fs.set_process_start(99_995, Some(2));
@@ -882,7 +1077,10 @@ async fn a_scope_whose_creator_pid_was_reused_by_another_process_is_swept() {
 #[tokio::test]
 async fn a_scope_of_a_live_creator_is_never_swept() {
     let controller = controller(delegated());
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
     let live = actions().join("99994-7-0");
     controller.fs.mkdir_all(&live);
     controller.fs.set_process_start(99_994, Some(7));
@@ -896,7 +1094,10 @@ async fn a_scope_of_a_live_creator_is_never_swept() {
 #[tokio::test]
 async fn enter_fails_when_the_process_start_time_is_unknown() {
     let controller = controller(delegated());
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
     controller.fs.set_process_start(std::process::id(), None);
 
     let error = controller.enter(&limits(None, None)).unwrap_err();
@@ -919,7 +1120,10 @@ async fn enter_fails_when_the_process_start_time_is_unknown() {
 async fn scope_names_carry_the_creator_start_time() {
     static SERIAL: AtomicU64 = AtomicU64::new(0);
     let controller = controller(delegated()).with_serial(&SERIAL);
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
     controller
         .fs
         .set_process_start(std::process::id(), Some(4_242));
@@ -935,7 +1139,10 @@ async fn scope_names_carry_the_creator_start_time() {
 #[tokio::test]
 async fn enter_never_moves_the_caller() {
     let controller = controller(delegated());
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
 
     let _scope = controller.enter(&limits(None, None)).expect("enter");
 
@@ -947,7 +1154,10 @@ async fn enter_never_moves_the_caller() {
 #[tokio::test]
 async fn the_launcher_joins_the_scope_enter_created() {
     let controller = controller(delegated());
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
     let scope = controller.enter(&limits(None, None)).expect("enter");
 
     let [join, directory] = scope.launcher() else {
@@ -968,7 +1178,10 @@ async fn the_launcher_joins_the_scope_enter_created() {
 #[tokio::test]
 async fn leave_right_after_enter_removes_the_scope() {
     let controller = controller(delegated());
-    controller.prepare().await.expect("prepare");
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
     let scope = controller.enter(&limits(None, None)).expect("enter");
     let cgroup = scope_path(&scope);
 

@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 
@@ -42,6 +42,8 @@ pub struct Bwrap {
     pub(crate) prefix: Box<[OsString]>,
     /// Whether the configuration permits the action to share the host network.
     pub(crate) permit_network: bool,
+    /// Identity files supplied explicitly by the operator.
+    pub(crate) identity_overrides: [bool; 3],
 }
 
 impl Plugin for Bwrap {
@@ -60,6 +62,11 @@ impl Plugin for Bwrap {
             return Err(BwrapError::RelativeProgram(program).into());
         }
 
+        let identity_overrides = ["/etc/passwd", "/etc/group", "/etc/nsswitch.conf"].map(|path| {
+            readonly_bind_mounts
+                .keys()
+                .any(|destination| destination.as_path() == std::path::Path::new(path))
+        });
         let mut prefix = Vec::with_capacity(
             FIXED_ARGUMENTS.len()
                 + 3
@@ -87,6 +94,7 @@ impl Plugin for Bwrap {
             executable: std::env::current_exe().map_err(BwrapError::Executable)?,
             prefix: prefix.into_boxed_slice(),
             permit_network: permit_network_property,
+            identity_overrides,
         })
     }
 }
@@ -109,17 +117,42 @@ impl Plugin for Bwrap {
 /// in it run inside the scope.
 impl ActionIsolationPort for Bwrap {
     async fn start(&self, spec: &ActionExecutionSpec<'_>) -> Result<SandboxedAction, PortError> {
+        let uid = rustix::process::getuid().as_raw();
+        let gid = rustix::process::getgid().as_raw();
+        let identity = [
+            (!self.identity_overrides[0])
+                .then(|| {
+                    identity_pipe(format_args!(
+                        "builder:x:{uid}:{gid}:Sandbox user:/:/bin/sh\n"
+                    ))
+                })
+                .transpose()?,
+            (!self.identity_overrides[1])
+                .then(|| identity_pipe(format_args!("builder:x:{gid}:\n")))
+                .transpose()?,
+            (!self.identity_overrides[2])
+                .then(|| identity_pipe(format_args!("passwd: files\ngroup: files\n")))
+                .transpose()?,
+        ];
         let (reader, writer) = std::io::pipe().map_err(BwrapError::InfoPipe)?;
-        // bwrap inherits the write end under the same number, so it must not be close-on-exec.
-        // `gang exec` spawns nothing else while the descriptor is open; tests serialise spawns.
-        rustix::io::fcntl_setfd(&writer, rustix::io::FdFlags::empty())
-            .map_err(|errno| BwrapError::InfoPipe(io::Error::from(errno)))?;
-        let mut command = tokio::process::Command::from(self.command(spec, writer.as_raw_fd()));
+        let descriptors = identity
+            .each_ref()
+            .map(|pipe| pipe.as_ref().map(AsRawFd::as_raw_fd));
+        let mut command =
+            tokio::process::Command::from(self.command(spec, writer.as_raw_fd(), &descriptors));
         command.kill_on_drop(true);
         // NativeLink signals every member group. Bubblewrap has no termination handler, so
         // block these signals across spawn; gang-reset clears the inherited mask for the action.
         let blocked = gang_os::block_terminations().map_err(BwrapError::SignalMask)?;
+        // These descriptors are inherited by bwrap (and by gang-join when a launcher is used).
+        rustix::io::fcntl_setfd(&writer, rustix::io::FdFlags::empty())
+            .map_err(|errno| BwrapError::InfoPipe(io::Error::from(errno)))?;
+        for pipe in identity.iter().flatten() {
+            rustix::io::fcntl_setfd(pipe, rustix::io::FdFlags::empty())
+                .map_err(|errno| BwrapError::Identity(io::Error::from(errno)))?;
+        }
         let spawned = command.spawn();
+        drop(identity);
         drop(blocked);
         let mut child = spawned.map_err(BwrapError::Run)?;
         drop(writer);
@@ -139,6 +172,14 @@ impl ActionIsolationPort for Bwrap {
             _ => Ok(SandboxedAction::new(wait)),
         }
     }
+}
+
+/// Supplies immutable, bounded data to one `--ro-bind-data` mount.
+fn identity_pipe(data: std::fmt::Arguments<'_>) -> Result<std::io::PipeReader, BwrapError> {
+    let (reader, mut writer) = std::io::pipe().map_err(BwrapError::Identity)?;
+    writer.write_fmt(data).map_err(BwrapError::Identity)?;
+    drop(writer);
+    Ok(reader)
 }
 
 /// The report `bwrap` writes on its `--info-fd`; fields it does not name are ignored.
@@ -388,6 +429,42 @@ pub(super) mod tests {
         let outcome = bwrap.start(&spec).await?.wait().await?;
 
         assert_eq!(outcome, ActionExecutionOutcome::Exited(3));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn identity_pipes_are_fresh_for_repeated_and_concurrent_starts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _spawn = SPAWN.lock().await;
+        let directory = tempfile::tempdir()?;
+        let bwrap = Bwrap::build(
+            BwrapConfig {
+                program: fake_bwrap()?,
+                ..config()
+            },
+            &context(),
+        )?;
+        let argv = [OsString::from("exit"), OsString::from("0")];
+        let spec = ActionExecutionSpec {
+            command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
+            launcher: &[],
+            environment: &[],
+            action_directory: directory.path(),
+            working_directory: directory.path(),
+            network: NetworkRequest::NotRequested,
+        };
+        for _ in 0..2 {
+            let (first, second) = timeout(LIMIT, async {
+                tokio::join!(bwrap.start(&spec), bwrap.start(&spec))
+            })
+            .await?;
+            let (mut first, mut second) = (first?, second?);
+            let (first, second) =
+                timeout(LIMIT, async { tokio::join!(first.wait(), second.wait()) }).await?;
+            assert_eq!(first?, ActionExecutionOutcome::Exited(0));
+            assert_eq!(second?, ActionExecutionOutcome::Exited(0));
+        }
         Ok(())
     }
 

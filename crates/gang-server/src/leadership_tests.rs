@@ -7,13 +7,14 @@ use futures::{pin_mut, poll};
 use gang_clock::{Clock, TestClock, Timestamp};
 use gang_config::LeadershipConfig;
 use gang_spi::{
-    Acquisition, ControllerId, FleetSupply, Held, LeaderLeasePort, PortError, ProvisionerPort,
-    RunError,
+    Acquisition, ControllerHostIdentity, ControllerId, FleetSupply, Held, LeaderLeasePort, Lease,
+    LeaseCandidate, PortError, ProvisionerPort, RunError, Takeover,
 };
 use gang_testkit::{FakeProvisioner, FakeRepository, Opaque, TestResult};
 use gang_types::{Fleet, FleetName, InstanceId, Isa, Resources};
 
-use crate::leadership::{Leadership, Leading};
+use crate::health::Readiness;
+use crate::leadership::{Leadership, Leading, LeaseEnd};
 
 const RENEW: Duration = Duration::from_secs(3);
 const VALID_FOR: Duration = Duration::from_secs(8);
@@ -57,8 +58,7 @@ async fn leading_set_notifies_all_registered_waiters() {
     assert!(poll!(second.as_mut()).is_ready());
 }
 
-// Catches a repeated set moving the term start, which would let ingest count a follower's
-// pre-term traffic in full.
+// A repeated set must not move the term start.
 #[tokio::test]
 async fn leading_repeated_set_keeps_the_first_start() {
     let leading = Leading::default();
@@ -80,17 +80,47 @@ fn clock() -> Arc<TestClock> {
     Arc::new(TestClock::new(Timestamp::from_unix_millis(100_000)))
 }
 
+fn candidate(id: &ControllerId) -> LeaseCandidate {
+    LeaseCandidate {
+        holder: id.clone(),
+        priority: gang_spi::CandidatePriority::registered(gang_spi::CandidateGeneration::default()),
+    }
+}
+
+fn host(id: &str) -> TestResult<ControllerHostIdentity> {
+    Ok(ControllerHostIdentity::Persistent(InstanceId::try_new(id)?))
+}
+
+async fn acquire<L: LeaderLeasePort>(
+    leader: &Leadership<'_, L, TestClock>,
+    id: &ControllerId,
+) -> Lease {
+    leader
+        .acquire(&candidate(id), &Readiness::default(), Duration::ZERO)
+        .await
+}
+
 struct StalledLease {
     calls: AtomicUsize,
     repository: FakeRepository,
 }
 
 impl LeaderLeasePort for StalledLease {
+    async fn register_candidate(
+        &self,
+        holder: &ControllerId,
+        host: &ControllerHostIdentity,
+    ) -> Result<LeaseCandidate, PortError> {
+        self.repository.register_candidate(holder, host).await
+    }
+
     async fn acquire(
         &self,
-        _holder: &ControllerId,
+        _candidate: &LeaseCandidate,
+        _now: Timestamp,
         _stale_before: Timestamp,
         _expires_at: Timestamp,
+        _takeover: Takeover,
     ) -> Result<Acquisition, PortError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         std::future::pending().await
@@ -99,9 +129,10 @@ impl LeaderLeasePort for StalledLease {
     async fn renew(
         &self,
         lease: &gang_spi::Lease,
+        now: Timestamp,
         expires_at: Timestamp,
     ) -> Result<gang_spi::Renewal, PortError> {
-        self.repository.renew(lease, expires_at).await
+        self.repository.renew(lease, now, expires_at).await
     }
 
     async fn release(&self, lease: &gang_spi::Lease) -> Result<(), PortError> {
@@ -118,7 +149,7 @@ async fn stalled_acquisition_retries_at_the_renewal_interval() {
     let clock = clock();
     let id = ControllerId::new("first");
     let leader = Leadership::new(&lease, &clock, &id, LeadershipConfig::default());
-    let acquire = leader.acquire();
+    let acquire = acquire(&leader, &id);
     pin_mut!(acquire);
     assert!(poll!(acquire.as_mut()).is_pending());
     assert_eq!(lease.calls.load(Ordering::SeqCst), 1);
@@ -130,21 +161,34 @@ async fn stalled_acquisition_retries_at_the_renewal_interval() {
 struct HungRelease(FakeRepository);
 
 impl LeaderLeasePort for HungRelease {
-    async fn acquire(
+    async fn register_candidate(
         &self,
         holder: &ControllerId,
+        host: &ControllerHostIdentity,
+    ) -> Result<LeaseCandidate, PortError> {
+        self.0.register_candidate(holder, host).await
+    }
+
+    async fn acquire(
+        &self,
+        candidate: &LeaseCandidate,
+        now: Timestamp,
         stale_before: Timestamp,
         expires_at: Timestamp,
+        takeover: Takeover,
     ) -> Result<Acquisition, PortError> {
-        self.0.acquire(holder, stale_before, expires_at).await
+        self.0
+            .acquire(candidate, now, stale_before, expires_at, takeover)
+            .await
     }
 
     async fn renew(
         &self,
         lease: &gang_spi::Lease,
+        now: Timestamp,
         expires_at: Timestamp,
     ) -> Result<gang_spi::Renewal, PortError> {
-        self.0.renew(lease, expires_at).await
+        self.0.renew(lease, now, expires_at).await
     }
 
     async fn release(&self, _lease: &gang_spi::Lease) -> Result<(), PortError> {
@@ -158,7 +202,7 @@ async fn hung_release_is_cancelled_at_renewal_interval() {
     let clock = clock();
     let id = ControllerId::new("first");
     let leadership = Leadership::new(&repository, &clock, &id, LeadershipConfig::default());
-    let lease = leadership.acquire().await;
+    let lease = acquire(&leadership, &id).await;
     let release = leadership.release(&lease);
     pin_mut!(release);
     assert!(poll!(release.as_mut()).is_pending());
@@ -172,7 +216,7 @@ async fn release_revokes_outstanding_call_before_rpc_completes() {
     let clock = clock();
     let id = ControllerId::new("first");
     let leader = Leadership::new(&repository, &clock, &id, LeadershipConfig::default());
-    let lease = leader.acquire().await;
+    let lease = acquire(&leader, &id).await;
 
     let (tx, rx) = std::sync::mpsc::channel();
     let mut call = Box::pin(leader.fence().run(async |held| {
@@ -196,20 +240,31 @@ struct LostLease {
 }
 
 impl LeaderLeasePort for LostLease {
-    async fn acquire(
+    async fn register_candidate(
         &self,
         holder: &ControllerId,
+        host: &ControllerHostIdentity,
+    ) -> Result<LeaseCandidate, PortError> {
+        self.repository.register_candidate(holder, host).await
+    }
+
+    async fn acquire(
+        &self,
+        candidate: &LeaseCandidate,
+        now: Timestamp,
         stale_before: Timestamp,
         expires_at: Timestamp,
+        takeover: Takeover,
     ) -> Result<Acquisition, PortError> {
         self.repository
-            .acquire(holder, stale_before, expires_at)
+            .acquire(candidate, now, stale_before, expires_at, takeover)
             .await
     }
 
     async fn renew(
         &self,
         _lease: &gang_spi::Lease,
+        _now: Timestamp,
         _expires_at: Timestamp,
     ) -> Result<gang_spi::Renewal, PortError> {
         Ok(gang_spi::Renewal::Lost)
@@ -230,7 +285,7 @@ async fn release_waits_for_registered_work_before_releasing_repository_lease() {
     let clock = clock();
     let id = ControllerId::new("first");
     let leader = Leadership::new(&repository, &clock, &id, LeadershipConfig::default());
-    let lease = leader.acquire().await;
+    let lease = acquire(&leader, &id).await;
     let (tx, rx) = std::sync::mpsc::channel();
     let mut call = Box::pin(leader.fence().run(async |held| {
         tx.send(held.deadline()).expect("receiver exists");
@@ -266,7 +321,7 @@ async fn renewal_loss_revokes_immediately_and_cannot_be_resurrected() {
         ..LeadershipConfig::default()
     };
     let leader = Leadership::new(&repository, &clock, &id, config);
-    let mut lease = leader.acquire().await;
+    let mut lease = acquire(&leader, &id).await;
     let (tx, rx) = std::sync::mpsc::channel();
     let mut call = Box::pin(leader.fence().run(async |held| {
         tx.send(held.deadline()).expect("receiver exists");
@@ -290,7 +345,7 @@ async fn renewal_loss_revokes_immediately_and_cannot_be_resurrected() {
         .release(&lease)
         .await
         .expect("release succeeds");
-    let _reacquired = leader.acquire().await;
+    let _reacquired = acquire(&leader, &id).await;
     assert!(!leader.fence().holds());
     assert!(deadline.check().is_err());
 }
@@ -400,7 +455,7 @@ async fn fence_cancels_multi_rpc_mutation_at_call_timeout() -> TestResult {
     let id = ControllerId::new("first");
     let leader = Leadership::new(&repository, &clock, &id, LeadershipConfig::default());
     let fence = leader.fence();
-    let _lease = leader.acquire().await;
+    let _lease = acquire(&leader, &id).await;
     let provisioner = SlowReadProvisioner {
         inner: FakeProvisioner::default(),
         clock: Arc::clone(&clock),
@@ -435,7 +490,7 @@ async fn hung_provisioner_is_cancelled_at_validity_deadline() -> TestResult {
     let id = ControllerId::new("first");
     let leader = Leadership::new(&repository, &clock, &id, LeadershipConfig::default());
     let fence = leader.fence();
-    let _lease = leader.acquire().await;
+    let _lease = acquire(&leader, &id).await;
     let provisioner = HungProvisioner(FakeProvisioner::default());
     let name = FleetName::try_new("workers")?;
     let options = Opaque::default();
@@ -464,7 +519,7 @@ async fn acquire_is_immediate_and_validity_excludes_the_deadline() -> TestResult
     let leader = Leadership::new(&repository, &clock, &id, LeadershipConfig::default());
     let validity = leader.fence();
     assert!(!validity.holds());
-    let acquire = leader.acquire();
+    let acquire = acquire(&leader, &id);
     pin_mut!(acquire);
     let Poll::Ready(lease) = poll!(acquire.as_mut()) else {
         panic!("free lease must be acquired immediately");
@@ -491,8 +546,8 @@ async fn acquire_waits_until_expiry_is_strictly_older_than_skew() -> TestResult 
     let second_id = ControllerId::new("second");
     let first = Leadership::new(&repository, &clock, &first_id, LeadershipConfig::default());
     let second = Leadership::new(&repository, &clock, &second_id, LeadershipConfig::default());
-    let lease = first.acquire().await;
-    let acquire = second.acquire();
+    let lease = acquire(&first, &first_id).await;
+    let acquire = acquire(&second, &second_id);
     pin_mut!(acquire);
     assert!(poll!(acquire.as_mut()).is_pending());
     for _ in 0..4 {
@@ -517,9 +572,9 @@ async fn fresh_follower_waits_a_full_ttl_before_taking_an_expired_lease() -> Tes
     let second_id = ControllerId::new("second");
     let first = Leadership::new(&repository, &clock, &first_id, LeadershipConfig::default());
     let second = Leadership::new(&repository, &clock, &second_id, LeadershipConfig::default());
-    let lease = first.acquire().await;
+    let lease = acquire(&first, &first_id).await;
     clock.advance(Duration::from_secs(15));
-    let acquire = second.acquire();
+    let acquire = acquire(&second, &second_id);
     pin_mut!(acquire);
     assert!(poll!(acquire.as_mut()).is_pending());
     for _ in 0..3 {
@@ -542,7 +597,7 @@ async fn hold_renews_on_every_interval_and_extends_validity() -> TestResult {
     let id = ControllerId::new("first");
     let leader = Leadership::new(&repository, &clock, &id, LeadershipConfig::default());
     let validity = leader.fence();
-    let mut lease = leader.acquire().await;
+    let mut lease = acquire(&leader, &id).await;
     let initial_expiry = lease.expires_at;
     {
         let hold = leader.hold(&mut lease);
@@ -573,7 +628,7 @@ async fn failed_renewals_keep_holding_but_validity_lapses() -> TestResult {
     let id = ControllerId::new("first");
     let leader = Leadership::new(&repository, &clock, &id, LeadershipConfig::default());
     let validity = leader.fence();
-    let mut lease = leader.acquire().await;
+    let mut lease = acquire(&leader, &id).await;
     let hold = leader.hold(&mut lease);
     pin_mut!(hold);
     assert!(poll!(hold.as_mut()).is_pending());
@@ -605,7 +660,7 @@ async fn hold_returns_when_another_controller_takes_the_lease() -> TestResult {
     let second_id = ControllerId::new("second");
     let first = Leadership::new(&repository, &clock, &first_id, LeadershipConfig::default());
     let second = Leadership::new(&repository, &clock, &second_id, LeadershipConfig::default());
-    let mut lease = first.acquire().await;
+    let mut lease = acquire(&first, &first_id).await;
     let epoch = lease.epoch.get();
     let hold = first.hold(&mut lease);
     pin_mut!(hold);
@@ -616,7 +671,7 @@ async fn hold_returns_when_another_controller_takes_the_lease() -> TestResult {
         assert!(poll!(hold.as_mut()).is_pending());
     }
     repository.fail_lease(false);
-    let acquire = second.acquire();
+    let acquire = acquire(&second, &second_id);
     pin_mut!(acquire);
     assert!(poll!(acquire.as_mut()).is_pending());
     for _ in 0..3 {
@@ -642,10 +697,10 @@ async fn outage_does_not_let_a_follower_steal_a_recovering_leaders_lease() -> Te
     let second_id = ControllerId::new("second");
     let first = Leadership::new(&repository, &clock, &first_id, LeadershipConfig::default());
     let second = Leadership::new(&repository, &clock, &second_id, LeadershipConfig::default());
-    let mut lease = first.acquire().await;
+    let mut lease = acquire(&first, &first_id).await;
     let epoch = lease.epoch;
     let hold = first.hold(&mut lease);
-    let acquire = second.acquire();
+    let acquire = acquire(&second, &second_id);
     pin_mut!(hold, acquire);
     assert!(poll!(hold.as_mut()).is_pending());
     assert!(poll!(acquire.as_mut()).is_pending());
@@ -665,9 +720,11 @@ async fn outage_does_not_let_a_follower_steal_a_recovering_leaders_lease() -> Te
         let now = clock.wall();
         let observed = repository
             .acquire(
-                &second_id,
+                &candidate(&second_id),
+                now,
                 now - Duration::from_secs(2),
                 now + Duration::from_secs(10),
+                Takeover::Observe,
             )
             .await?;
         let Acquisition::Held(current) = observed else {
@@ -688,9 +745,9 @@ async fn release_allows_immediate_acquisition_at_the_next_epoch() -> TestResult 
     let second_id = ControllerId::new("second");
     let first = Leadership::new(&repository, &clock, &first_id, LeadershipConfig::default());
     let second = Leadership::new(&repository, &clock, &second_id, LeadershipConfig::default());
-    let lease = first.acquire().await;
+    let lease = acquire(&first, &first_id).await;
     first.release(&lease).await;
-    let acquire = second.acquire();
+    let acquire = acquire(&second, &second_id);
     pin_mut!(acquire);
     let Poll::Ready(next) = poll!(acquire.as_mut()) else {
         panic!("released lease must be acquired immediately");
@@ -734,7 +791,7 @@ async fn fence_admits_changes_only_inside_validity() -> TestResult {
     assert!(provisioner.desired_requests().is_empty());
     assert!(provisioner.terminations().is_empty());
 
-    let _lease = leader.acquire().await;
+    let _lease = acquire(&leader, &id).await;
     fence
         .run(async |held| provisioner_ref.set_desired_capacity(held, fleet, 3).await)
         .await?;
@@ -767,5 +824,298 @@ async fn fence_admits_changes_only_inside_validity() -> TestResult {
     ));
     assert_eq!(provisioner.desired_requests(), vec![(name.clone(), 3)]);
     assert_eq!(provisioner.terminations(), vec![instance]);
+    Ok(())
+}
+
+struct ObservedLease {
+    repository: FakeRepository,
+    attempts: parking_lot::Mutex<Vec<(Timestamp, Takeover)>>,
+    reserved: std::sync::atomic::AtomicBool,
+}
+
+impl LeaderLeasePort for ObservedLease {
+    async fn register_candidate(
+        &self,
+        holder: &ControllerId,
+        host: &ControllerHostIdentity,
+    ) -> Result<LeaseCandidate, PortError> {
+        self.repository.register_candidate(holder, host).await
+    }
+
+    async fn acquire(
+        &self,
+        candidate: &LeaseCandidate,
+        now: Timestamp,
+        stale_before: Timestamp,
+        expires_at: Timestamp,
+        takeover: Takeover,
+    ) -> Result<Acquisition, PortError> {
+        self.attempts.lock().push((now, takeover));
+        if self.reserved.load(Ordering::SeqCst) {
+            return Ok(Acquisition::Reserved);
+        }
+        self.repository
+            .acquire(candidate, now, stale_before, expires_at, takeover)
+            .await
+    }
+
+    async fn renew(
+        &self,
+        lease: &Lease,
+        now: Timestamp,
+        expires_at: Timestamp,
+    ) -> Result<gang_spi::Renewal, PortError> {
+        self.repository.renew(lease, now, expires_at).await
+    }
+
+    async fn release(&self, lease: &Lease) -> Result<(), PortError> {
+        self.repository.release(lease).await
+    }
+}
+
+fn observed_lease() -> ObservedLease {
+    ObservedLease {
+        repository: FakeRepository::default(),
+        attempts: parking_lot::Mutex::new(Vec::new()),
+        reserved: std::sync::atomic::AtomicBool::new(false),
+    }
+}
+
+#[tokio::test]
+async fn contender_requests_at_exact_routability_deadline_and_yields_on_next_renewal() -> TestResult
+{
+    let repository = observed_lease();
+    let clock = clock();
+    let old_id = ControllerId::new("old");
+    let new_id = ControllerId::new("new");
+    let old = Leadership::new(&repository, &clock, &old_id, LeadershipConfig::default());
+    let new = Leadership::new(&repository, &clock, &new_id, LeadershipConfig::default());
+    let old_candidate = old.register_candidate(&host("old")?).await?;
+    let new_candidate = new.register_candidate(&host("new")?).await?;
+    let old_ready = Readiness::default();
+    old_ready.serve();
+    let new_ready = Readiness::default();
+    new_ready.serve();
+    let mut lease = old
+        .acquire(&old_candidate, &old_ready, Duration::ZERO)
+        .await;
+    let expiry = lease.expires_at;
+    let start = clock.wall();
+    {
+        let hold = old.hold(&mut lease);
+        pin_mut!(hold);
+        assert!(poll!(hold.as_mut()).is_pending());
+        let acquire = new.acquire(&new_candidate, &new_ready, Duration::from_secs(10));
+        pin_mut!(acquire);
+        assert!(poll!(acquire.as_mut()).is_pending());
+        assert!(new_ready.ready());
+        for _ in 0..3 {
+            clock.advance(RENEW);
+            assert!(poll!(hold.as_mut()).is_pending());
+            assert!(poll!(acquire.as_mut()).is_pending());
+        }
+        assert!(
+            repository
+                .attempts
+                .lock()
+                .iter()
+                .all(|(_, mode)| *mode == Takeover::Observe)
+        );
+        clock.advance(Duration::from_secs(1));
+        assert!(poll!(acquire.as_mut()).is_pending());
+        assert_eq!(
+            repository.attempts.lock().last(),
+            Some(&(start + Duration::from_secs(10), Takeover::Request))
+        );
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(poll!(hold.as_mut()), Poll::Ready(LeaseEnd::YieldRequested));
+    }
+    assert_eq!(
+        lease.expires_at,
+        clock.wall() + LeadershipConfig::default().ttl.get()
+    );
+    assert!(lease.expires_at > expiry);
+    assert!(old.fence().holds());
+    old.release(&lease).await;
+    let acquire = new.acquire(&new_candidate, &new_ready, Duration::ZERO);
+    pin_mut!(acquire);
+    clock.advance(RENEW);
+    let Poll::Ready(next) = poll!(acquire.as_mut()) else {
+        panic!("reserved successor should acquire");
+    };
+    assert_eq!(next.holder, new_id);
+    let old_again = old.acquire(&old_candidate, &old_ready, Duration::ZERO);
+    pin_mut!(old_again);
+    assert!(poll!(old_again.as_mut()).is_pending());
+    assert!(!old_ready.ready());
+    assert_eq!(
+        repository.attempts.lock().last().map(|(_, mode)| *mode),
+        Some(Takeover::Observe)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn zero_delay_requests_immediately_and_database_blind_contender_is_unhealthy() -> TestResult {
+    let repository = observed_lease();
+    let clock = clock();
+    let old_id = ControllerId::new("old");
+    let new_id = ControllerId::new("new");
+    let old = Leadership::new(&repository, &clock, &old_id, LeadershipConfig::default());
+    let new = Leadership::new(&repository, &clock, &new_id, LeadershipConfig::default());
+    let old_candidate = old.register_candidate(&host("old")?).await?;
+    let new_candidate = new.register_candidate(&host("new")?).await?;
+    let ready = Readiness::default();
+    ready.serve();
+    let _lease = old
+        .acquire(&old_candidate, &Readiness::default(), Duration::ZERO)
+        .await;
+    let acquire = new.acquire(&new_candidate, &ready, Duration::ZERO);
+    pin_mut!(acquire);
+    assert!(poll!(acquire.as_mut()).is_pending());
+    assert!(ready.ready());
+    let modes: Vec<_> = repository
+        .attempts
+        .lock()
+        .iter()
+        .map(|(_, mode)| *mode)
+        .collect();
+    assert_eq!(
+        modes,
+        [Takeover::Observe, Takeover::Observe, Takeover::Request]
+    );
+    repository.repository.fail_lease(true);
+    clock.advance(RENEW);
+    assert!(poll!(acquire.as_mut()).is_pending());
+    assert!(!ready.ready());
+    Ok(())
+}
+
+#[tokio::test]
+async fn reserved_counts_as_database_reachable_without_warm_health() -> TestResult {
+    let repository = observed_lease();
+    let clock = clock();
+    let old_id = ControllerId::new("old");
+    let new_id = ControllerId::new("new");
+    let old = Leadership::new(&repository, &clock, &old_id, LeadershipConfig::default());
+    let new = Leadership::new(&repository, &clock, &new_id, LeadershipConfig::default());
+    let old_candidate = old.register_candidate(&host("old")?).await?;
+    let new_candidate = new.register_candidate(&host("new")?).await?;
+    let _lease = old
+        .acquire(&old_candidate, &Readiness::default(), Duration::ZERO)
+        .await;
+    repository.reserved.store(true, Ordering::SeqCst);
+    let ready = Readiness::default();
+    ready.serve();
+    let acquire = new.acquire(&new_candidate, &ready, Duration::ZERO);
+    pin_mut!(acquire);
+    assert!(poll!(acquire.as_mut()).is_pending());
+    assert!(!ready.ready());
+    for _ in 0..4 {
+        clock.advance(RENEW);
+        assert!(poll!(acquire.as_mut()).is_pending());
+    }
+    repository.reserved.store(false, Ordering::SeqCst);
+    clock.advance(RENEW);
+    assert!(matches!(poll!(acquire.as_mut()), Poll::Ready(_)));
+    Ok(())
+}
+
+struct RegistrationLease {
+    calls: AtomicUsize,
+    mode: u8,
+}
+
+impl LeaderLeasePort for RegistrationLease {
+    async fn register_candidate(
+        &self,
+        holder: &ControllerId,
+        _host: &ControllerHostIdentity,
+    ) -> Result<LeaseCandidate, PortError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        match self.mode {
+            0 if call == 0 => Err(PortError::unavailable("temporary")),
+            1 => Err(PortError::backend("permanent")),
+            2 => std::future::pending().await,
+            _ => Ok(candidate(holder)),
+        }
+    }
+
+    async fn acquire(
+        &self,
+        _: &LeaseCandidate,
+        _: Timestamp,
+        _: Timestamp,
+        _: Timestamp,
+        _: Takeover,
+    ) -> Result<Acquisition, PortError> {
+        std::future::pending().await
+    }
+
+    async fn renew(
+        &self,
+        _: &Lease,
+        _: Timestamp,
+        _: Timestamp,
+    ) -> Result<gang_spi::Renewal, PortError> {
+        std::future::pending().await
+    }
+
+    async fn release(&self, _: &Lease) -> Result<(), PortError> {
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn registration_retries_transient_failure_and_propagates_permanent_failure() -> TestResult {
+    let clock = clock();
+    let id = ControllerId::new("candidate");
+    let lease = RegistrationLease {
+        calls: AtomicUsize::new(0),
+        mode: 0,
+    };
+    let leader = Leadership::new(&lease, &clock, &id, LeadershipConfig::default());
+    let identity = host("candidate")?;
+    let registration = leader.register_candidate(&identity);
+    pin_mut!(registration);
+    assert!(poll!(registration.as_mut()).is_pending());
+    assert_eq!(lease.calls.load(Ordering::SeqCst), 1);
+    clock.advance(RENEW);
+    assert!(matches!(poll!(registration.as_mut()), Poll::Ready(Ok(_))));
+    assert_eq!(lease.calls.load(Ordering::SeqCst), 2);
+
+    let permanent = RegistrationLease {
+        calls: AtomicUsize::new(0),
+        mode: 1,
+    };
+    let leader = Leadership::new(&permanent, &clock, &id, LeadershipConfig::default());
+    assert!(matches!(
+        leader.register_candidate(&identity).await,
+        Err(PortError::Backend(_))
+    ));
+    assert_eq!(permanent.calls.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn registration_timeout_retries_and_caller_can_cancel() -> TestResult {
+    let clock = clock();
+    let id = ControllerId::new("candidate");
+    let lease = RegistrationLease {
+        calls: AtomicUsize::new(0),
+        mode: 2,
+    };
+    let leader = Leadership::new(&lease, &clock, &id, LeadershipConfig::default());
+    let identity = host("candidate")?;
+    {
+        let registration = leader.register_candidate(&identity);
+        pin_mut!(registration);
+        assert!(poll!(registration.as_mut()).is_pending());
+        clock.advance(RENEW);
+        assert!(poll!(registration.as_mut()).is_pending());
+        assert_eq!(lease.calls.load(Ordering::SeqCst), 2);
+    }
+    clock.advance(RENEW);
+    assert_eq!(lease.calls.load(Ordering::SeqCst), 2);
     Ok(())
 }

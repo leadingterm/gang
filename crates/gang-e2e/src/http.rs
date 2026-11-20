@@ -7,13 +7,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use gang_clock::SystemClock;
+use gang_clock::{Clock, SystemClock};
 use gang_tls::{
     HttpClient, HttpError, HttpProtocol, HttpReply, HttpRequest, HttpSettings, HttpStream,
     HttpTransport, TransportError,
 };
 use gang_types::NonZeroDuration;
-use http::{HeaderMap, StatusCode};
+use gang_wire::routes::GET_SERVER;
+use http::{HeaderMap, Method, StatusCode};
 use tokio::runtime::{Builder, Runtime};
 
 use crate::errors::{E2eError, Result};
@@ -70,6 +71,34 @@ impl Http {
             .map_err(|error| self.request_error(error, url))
     }
 
+    /// Waits for the announced server to admit client traffic, within one overall deadline.
+    pub(crate) fn wait_for_client_traffic(
+        &self,
+        endpoint: &gang_types::Url,
+        timeout: Duration,
+    ) -> Result<()> {
+        let url = endpoint
+            .join(GET_SERVER.template)
+            .map_err(E2eError::parse("the server information url"))?;
+        self.runtime.block_on(wait_for_client_traffic(
+            &SystemClock::new(),
+            timeout,
+            || async {
+                self.client
+                    .send(HttpRequest {
+                        method: Method::GET,
+                        url: &url,
+                        bearer: None,
+                        headers: &[],
+                        body: None,
+                    })
+                    .await
+                    .map(|reply| reply.status)
+                    .map_err(|error| self.request_error(error, &url))
+            },
+        ))
+    }
+
     /// Opens a response whose body is read chunk by chunk.
     pub(crate) fn open(&self, request: HttpRequest<'_>) -> Result<Chunks> {
         let url = request.url;
@@ -91,6 +120,36 @@ impl Http {
             E2eError::system_from(format!("requesting {url}"))(error)
         }
     }
+}
+
+/// Retries only pre-promotion responses; the deadline also bounds each in-flight probe.
+async fn wait_for_client_traffic<C, F, P>(clock: &C, timeout: Duration, mut probe: F) -> Result<()>
+where
+    C: Clock,
+    F: FnMut() -> P,
+    P: Future<Output = Result<StatusCode>>,
+{
+    clock
+        .timeout(timeout, async {
+            loop {
+                match probe().await? {
+                    StatusCode::OK => return Ok(()),
+                    StatusCode::SERVICE_UNAVAILABLE => {
+                        clock
+                            .sleep(gang_types::health::health_check().interval())
+                            .await;
+                    }
+                    status => {
+                        return Err(E2eError::system(format!(
+                            "waiting for client traffic: GET {} returned {status}",
+                            GET_SERVER.template
+                        )));
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| E2eError::timeout("the server to admit client traffic", timeout))?
 }
 
 /// Finds a TLS handshake timeout through the HTTP connector's wrapped errors.
@@ -185,16 +244,159 @@ impl Chunks {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::error::Error;
+    use std::future::{pending, ready};
     use std::io;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
+    use gang_clock::TestClock;
     use gang_tls::{HttpError, HttpProtocol, HttpRequest, HttpTransport, TransportError};
     use gang_types::Url;
-    use http::Method;
+    use http::{Method, StatusCode};
 
-    use super::{Http, is_handshake_timeout};
+    use super::{Http, is_handshake_timeout, wait_for_client_traffic};
     use crate::errors::E2eError;
+
+    #[test]
+    fn client_traffic_wait_retries_503_only_after_the_health_interval() {
+        let clock = TestClock::default();
+        let interval = gang_types::health::health_check().interval();
+        let attempts = Cell::new(0);
+        let mut wait = pin!(wait_for_client_traffic(&clock, interval * 2, || {
+            attempts.set(attempts.get() + 1);
+            ready(Ok(if attempts.get() == 1 {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::OK
+            }))
+        }));
+        let mut cx = Context::from_waker(Waker::noop());
+
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(attempts.get(), 1);
+        clock.advance(interval.saturating_sub(Duration::from_nanos(1)));
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(attempts.get(), 1);
+        clock.advance(Duration::from_nanos(1));
+        assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[test]
+    fn client_traffic_wait_persistent_503_reaches_the_overall_deadline() {
+        let clock = TestClock::default();
+        let interval = gang_types::health::health_check().interval();
+        let timeout = interval + interval / 2;
+        let attempts = Cell::new(0);
+        let mut wait = pin!(wait_for_client_traffic(&clock, timeout, || {
+            attempts.set(attempts.get() + 1);
+            ready(Ok(StatusCode::SERVICE_UNAVAILABLE))
+        }));
+        let mut cx = Context::from_waker(Waker::noop());
+
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        clock.advance(interval);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(attempts.get(), 2);
+        clock.advance((interval / 2).saturating_sub(Duration::from_nanos(1)));
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        clock.advance(Duration::from_nanos(1));
+        assert!(matches!(
+            wait.as_mut().poll(&mut cx),
+            Poll::Ready(Err(E2eError::Timeout { waited, .. })) if waited == timeout
+        ));
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[test]
+    fn client_traffic_wait_deadline_includes_an_in_flight_retry() {
+        let clock = TestClock::default();
+        let interval = gang_types::health::health_check().interval();
+        let timeout = interval * 2;
+        let attempts = Cell::new(0);
+        let mut wait = pin!(wait_for_client_traffic(&clock, timeout, || {
+            attempts.set(attempts.get() + 1);
+            let attempt = attempts.get();
+            async move {
+                if attempt == 1 {
+                    Ok(StatusCode::SERVICE_UNAVAILABLE)
+                } else {
+                    pending().await
+                }
+            }
+        }));
+        let mut cx = Context::from_waker(Waker::noop());
+
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        clock.advance(interval);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(attempts.get(), 2);
+        clock.advance(interval.saturating_sub(Duration::from_nanos(1)));
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        clock.advance(Duration::from_nanos(1));
+        assert!(matches!(
+            wait.as_mut().poll(&mut cx),
+            Poll::Ready(Err(E2eError::Timeout { waited, .. })) if waited == timeout
+        ));
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[test]
+    fn client_traffic_wait_unexpected_status_fails_without_retrying() {
+        for status in [
+            StatusCode::FOUND,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let clock = TestClock::default();
+            let attempts = Cell::new(0);
+            let mut wait = pin!(wait_for_client_traffic(
+                &clock,
+                Duration::from_secs(30),
+                || {
+                    attempts.set(attempts.get() + 1);
+                    ready(Ok(status))
+                }
+            ));
+            let mut cx = Context::from_waker(Waker::noop());
+
+            assert!(matches!(
+                wait.as_mut().poll(&mut cx),
+                Poll::Ready(Err(E2eError::System { context, .. }))
+                    if context.contains(&status.to_string())
+            ));
+            assert_eq!(attempts.get(), 1);
+        }
+    }
+
+    #[test]
+    fn client_traffic_wait_transport_error_fails_without_retrying() {
+        let clock = TestClock::default();
+        let attempts = Cell::new(0);
+        let mut wait = pin!(wait_for_client_traffic(
+            &clock,
+            Duration::from_secs(30),
+            || {
+                attempts.set(attempts.get() + 1);
+                ready(Err(E2eError::system_from("probing client traffic")(
+                    io::Error::new(io::ErrorKind::ConnectionReset, "connection reset"),
+                )))
+            }
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+
+        assert!(matches!(
+            wait.as_mut().poll(&mut cx),
+            Poll::Ready(Err(E2eError::System { source: Some(source), .. }))
+                if source.downcast_ref::<io::Error>().is_some_and(|error| {
+                    error.kind() == io::ErrorKind::ConnectionReset
+                })
+        ));
+        assert_eq!(attempts.get(), 1);
+    }
 
     #[test]
     fn handshake_timeout_is_found_through_io_wrappers() {

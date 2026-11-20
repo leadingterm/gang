@@ -48,6 +48,97 @@ wire_enum! {
     }
 }
 
+wire_enum! {
+    /// The action announced by a spot interruption notice.
+    pub enum AwsInterruptionAction {
+        /// The instance will terminate.
+        Terminate = "TERMINATE",
+        /// The instance will stop.
+        Stop = "STOP",
+        /// The instance will hibernate.
+        Hibernate = "HIBERNATE",
+    }
+}
+
+wire_enum! {
+    /// The reason AWS terminated an instance.
+    pub enum AwsTerminationReason {
+        /// The instance was rebalanced.
+        Rebalance = "REBALANCE",
+        /// Spot capacity was reclaimed.
+        SpotReclaimed = "SPOT_RECLAIMED",
+        /// Another provider-supplied reason.
+        Other = "OTHER",
+    }
+}
+
+/// An AWS infrastructure observation, including its source time.
+#[derive(gang_macros::Known, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct AwsEvent {
+    /// The provider's stable event identifier.
+    pub id: String,
+    /// When AWS observed the event.
+    #[serde(with = "crate::time")]
+    #[ts(type = "Timestamp")]
+    pub at: Timestamp,
+    /// The observation itself.
+    pub kind: AwsEventKind,
+}
+
+/// An AWS infrastructure observation.
+#[derive(gang_macros::Known, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum AwsEventKind {
+    /// AWS recommended rebalancing an instance.
+    RebalanceRecommendation {
+        /// Reference `instances/{instance}` of the instance at risk.
+        instance: String,
+    },
+    /// AWS warned of a spot interruption.
+    SpotInterruption {
+        /// Reference `instances/{instance}` of the instance at risk.
+        instance: String,
+        /// The action AWS intends to take.
+        action: AwsInterruptionAction,
+    },
+    /// An instance launched without a documented rebalance cause.
+    InstanceLaunched {
+        /// Reference `instances/{instance}` of the new instance.
+        instance: String,
+    },
+    /// A rebalance replacement launched.
+    ReplacementLaunched {
+        /// Reference `instances/{instance}` of the new instance.
+        instance: String,
+        /// Reference `instances/{instance}` of the old instance, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        replacing: Option<String>,
+    },
+    /// An instance terminated.
+    InstanceTerminated {
+        /// Reference `instances/{instance}` of the terminated instance.
+        instance: String,
+        /// The termination reason.
+        reason: AwsTerminationReason,
+        /// Provider text for another termination reason.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        #[ts(rename = "reasonDetail")]
+        reason_detail: Option<String>,
+    },
+    /// AWS could not supply capacity.
+    CapacityUnavailable {
+        /// The provider's reason.
+        reason: String,
+    },
+}
+
 /// What an [`Event`] changed: exactly one member key is present.
 ///
 /// A member this version does not know deserializes to [`EventChange::Unrecognized`] and
@@ -112,6 +203,11 @@ pub enum EventChange {
         /// Reference `workers/{worker}` of the worker that disconnected.
         worker: String,
     },
+    /// A short-lived AWS infrastructure observation, never a scaling audit entry.
+    Aws {
+        /// The provider observation.
+        event: AwsEvent,
+    },
     /// A change this version does not know, kept so it round-trips.
     #[serde(untagged)]
     #[ts(skip)]
@@ -143,6 +239,56 @@ mod tests {
             value
         );
         event
+    }
+
+    #[test]
+    fn aws_status_preserves_source_time_and_interruption_action() {
+        let value = json!({
+            "name": "awsEvents/notice-1",
+            "createTime": "2026-01-14T09:19:30.000Z",
+            "fleet": "fleets/spot",
+            "aws": {"event": {
+                "id": "notice-1",
+                "at": "2026-01-14T09:19:29.000Z",
+                "kind": {"type": "spotInterruption", "instance": "instances/i-1", "action": "HIBERNATE"}
+            }}
+        });
+        let event = round_trip(&value);
+        assert!(matches!(
+            event.change,
+            EventChange::Aws {
+                event: AwsEvent {
+                    kind: AwsEventKind::SpotInterruption {
+                        action: AwsInterruptionAction::Hibernate,
+                        ..
+                    },
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn aws_optional_fields_are_omitted() {
+        let kind = AwsEventKind::InstanceTerminated {
+            instance: "instances/i-1".into(),
+            reason: AwsTerminationReason::Rebalance,
+            reason_detail: None,
+        };
+        let value = json!({"type": "instanceTerminated", "instance": "instances/i-1", "reason": "REBALANCE"});
+        assert_eq!(serde_json::to_value(&kind).expect("serializes"), value);
+        assert_eq!(
+            serde_json::from_value::<AwsEventKind>(value).expect("parses"),
+            kind
+        );
+    }
+
+    #[test]
+    fn ordinary_aws_launch_round_trips_as_its_own_kind() {
+        let value = json!({"type": "instanceLaunched", "instance": "instances/i-1"});
+        let kind: AwsEventKind = serde_json::from_value(value.clone()).expect("launch parses");
+        assert!(matches!(kind, AwsEventKind::InstanceLaunched { .. }));
+        assert_eq!(serde_json::to_value(kind).expect("serializes"), value);
     }
 
     #[test]

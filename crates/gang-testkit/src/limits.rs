@@ -1,10 +1,13 @@
 //! A recording action-limits double: it logs every call, fails one chosen step, and reports what it was asked.
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gang_spi::{ActionLimits, ActionLimitsPort, ActionScope, ActionUsage, PortError};
+use gang_spi::{
+    ActionLimits, ActionLimitsPort, ActionMemoryPool, ActionScope, ActionUsage, PortError,
+};
 use gang_types::Bytes;
 use parking_lot::Mutex;
 
@@ -35,6 +38,7 @@ struct Record {
     entered: Vec<ActionLimits>,
     observed: Vec<usize>,
     reaped: Vec<u32>,
+    reserve: Option<Bytes>,
 }
 
 /// The scope a [`RecordingLimits`] creates: it holds the launcher the double hands out.
@@ -48,6 +52,10 @@ impl ActionScope for RecordedScope {
     fn launcher(&self) -> &[OsString] {
         &self.launcher
     }
+
+    fn memory_cgroup(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// An action-limits double that logs each call to a [`CallLog`], reports a fixed usage, and can
@@ -60,6 +68,8 @@ pub struct RecordingLimits {
     observe: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
     record: Arc<Mutex<Record>>,
     launcher: Box<[OsString]>,
+    oom_kills: u64,
+    memory_pool: Option<ActionMemoryPool>,
 }
 
 impl RecordingLimits {
@@ -72,12 +82,34 @@ impl RecordingLimits {
             failing: None,
             observe: None,
             record: Arc::default(),
+            oom_kills: 0,
+            memory_pool: None,
             launcher: [
                 OsString::from(DEFAULT_JOIN_LINK),
                 OsString::from(DEFAULT_SCOPE_DIR),
             ]
             .into(),
         }
+    }
+
+    /// Reports `count` kernel OOM kills when leaving the scope.
+    #[must_use]
+    pub fn with_oom_kills(mut self, count: u64) -> Self {
+        self.oom_kills = count;
+        self
+    }
+
+    /// Returns the configured pool from preparation.
+    #[must_use]
+    pub fn with_memory_pool(mut self, pool: ActionMemoryPool) -> Self {
+        self.memory_pool = Some(pool);
+        self
+    }
+
+    /// The reserve passed to the most recent preparation.
+    #[must_use]
+    pub fn prepared_reserve(&self) -> Option<Bytes> {
+        self.record.lock().reserve
     }
 
     /// Makes `step` return an error after it is logged. Every other step still succeeds.
@@ -127,13 +159,15 @@ impl RecordingLimits {
 impl ActionLimitsPort for RecordingLimits {
     type Scope = RecordedScope;
 
-    async fn prepare(&self) -> Result<(), PortError> {
+    async fn prepare(&self, reserve: Bytes) -> Result<Option<ActionMemoryPool>, PortError> {
         self.log.record("limits.prepare");
+        self.record.lock().reserve = Some(reserve);
         if let Some(observe) = &self.observe {
             let value = observe();
             self.record.lock().observed.push(value);
         }
-        self.outcome(LimitsStep::Prepare)
+        self.outcome(LimitsStep::Prepare)?;
+        Ok(self.memory_pool.clone())
     }
 
     async fn enter(&self, limits: &ActionLimits) -> Result<RecordedScope, PortError> {
@@ -149,8 +183,9 @@ impl ActionLimitsPort for RecordingLimits {
         self.log.record("limits.leave");
         self.outcome(LimitsStep::Leave)?;
         Ok(ActionUsage {
-            peak_memory: Bytes::new(4096),
+            peak_memory: Some(Bytes::new(4096)),
             cpu_time: Duration::from_millis(7),
+            oom_kills: self.oom_kills,
         })
     }
 
@@ -169,7 +204,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use gang_spi::{ActionLimits, ActionLimitsPort, ActionScope, ActionUsage};
+    use gang_spi::{ActionLimits, ActionLimitsPort, ActionMemoryPool, ActionScope, ActionUsage};
     use gang_types::{Bytes, NonZeroBytes};
 
     use super::{DEFAULT_JOIN_LINK, DEFAULT_SCOPE_DIR, LimitsStep, RecordedScope, RecordingLimits};
@@ -186,7 +221,7 @@ mod tests {
 
     /// Runs the three steps in lifecycle order and reports which of them succeeded.
     async fn run_lifecycle(limits: &RecordingLimits) -> Vec<bool> {
-        let mut outcomes = vec![limits.prepare().await.is_ok()];
+        let mut outcomes = vec![limits.prepare(Bytes::new(12345)).await.is_ok()];
         outcomes.push(limits.enter(&sample_limits(2, 1024)).await.is_ok());
         outcomes.push(limits.leave(RecordedScope::default()).await.is_ok());
         outcomes
@@ -200,6 +235,18 @@ mod tests {
         let outcomes = ready(run_lifecycle(&limits));
 
         assert_eq!((outcomes, log.calls()), (vec![true; 3], CALLS.to_vec()));
+    }
+
+    #[test]
+    fn prepare_records_reserve_and_returns_configured_pool() -> TestResult {
+        let pool = ActionMemoryPool {
+            cgroup: "/test/actions".into(),
+            capacity: NonZeroBytes::new(Bytes::new(7_654_321)).expect("nonzero capacity"),
+        };
+        let limits = RecordingLimits::new(&CallLog::default()).with_memory_pool(pool.clone());
+        assert_eq!(ready(limits.prepare(Bytes::new(12345)))?, Some(pool));
+        assert_eq!(limits.prepared_reserve(), Some(Bytes::new(12345)));
+        Ok(())
     }
 
     #[test]
@@ -275,9 +322,9 @@ mod tests {
         let limits =
             RecordingLimits::new(&log).observing_prepare(move || reading.load(Ordering::Relaxed));
 
-        ready(limits.prepare())?;
+        ready(limits.prepare(Bytes::new(12345)))?;
         probe.store(2, Ordering::Relaxed);
-        ready(limits.prepare())?;
+        ready(limits.prepare(Bytes::new(12345)))?;
 
         assert_eq!(limits.observed_at_prepare(), [1, 2]);
         Ok(())
@@ -291,8 +338,9 @@ mod tests {
         assert_eq!(
             usage,
             ActionUsage {
-                peak_memory: Bytes::new(4096),
+                peak_memory: Some(Bytes::new(4096)),
                 cpu_time: Duration::from_millis(7),
+                oom_kills: 0,
             }
         );
         Ok(())

@@ -9,15 +9,9 @@
 //! ```
 
 mod builds;
-mod errors;
 mod filter;
-mod forward;
-mod ingest;
 mod record;
 mod timeline;
 
 pub use builds::Builds;
-pub use errors::{IngestError, OutboxError};
 pub use filter::{BuildFilter, BuildFilterError};
-pub use forward::{Dispatch, Outbox, Outcome};
-pub use ingest::{Ingested, decode};

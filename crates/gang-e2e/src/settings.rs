@@ -8,6 +8,39 @@ use serde::Deserialize;
 
 use crate::errors::{E2eError, Result};
 
+/// Procedure used to retire the old controller during a mixed-version upgrade.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum UpgradeProcedure {
+    /// Stop the old server before deregistering its targets.
+    #[default]
+    PreStop,
+    /// Deregister and drain the instance before signalling the old server.
+    InstanceRefresh,
+}
+
+/// Binary and rendered deployment fixture for one release.
+#[derive(Debug, Clone)]
+pub struct ReleaseInput {
+    /// Release executable.
+    pub binary: PathBuf,
+    /// Rendered deployment fixture.
+    pub fixture: PathBuf,
+}
+
+/// Inputs needed by the mixed-version upgrade scenarios.
+#[derive(Debug, Clone)]
+pub struct UpgradeInputs {
+    /// Release upgraded or restarted by the positive mixed-version scenarios.
+    pub previous: ReleaseInput,
+    /// Historical release used by the negative control.
+    pub historical: ReleaseInput,
+    /// Fixed candidate release used by the negative control.
+    pub calibration: ReleaseInput,
+    /// Rendered fixture for the candidate executable.
+    pub candidate_fixture: PathBuf,
+}
+
 /// The resolved inputs used to create harness deployments.
 #[derive(Debug, Clone)]
 pub struct DeploymentInputs {
@@ -27,6 +60,8 @@ pub struct DeploymentInputs {
     pub settings: Settings,
     /// The resolved tools used by the sample's actions.
     pub action_tools: ActionTools,
+    /// Release artifacts needed by mixed-version scenarios, when selected.
+    pub upgrade: Option<UpgradeInputs>,
 }
 
 /// Default for [`Settings::handshake_timeout`].
@@ -46,6 +81,17 @@ pub const DEFAULT_HISTORY_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// Default for [`Settings::hold_timeout`]: three minutes.
 pub const DEFAULT_HOLD_TIMEOUT: Duration = Duration::from_mins(3);
+
+/// Default maximum gap: 3s successor polling plus 1s for promotion and a fresh probe.
+pub const DEFAULT_UPGRADE_GAP_LIMIT: Duration = Duration::from_secs(4);
+/// Default scaled instance-refresh drain window, longer than the availability limit.
+pub const DEFAULT_UPGRADE_DRAIN_WINDOW: Duration = Duration::from_secs(8);
+/// Default harness budget cap on deployment instance-refresh warmup: thirty seconds.
+pub const DEFAULT_UPGRADE_WARMUP_WINDOW: Duration = Duration::from_secs(30);
+/// Default interval between upgrade availability probes.
+pub const DEFAULT_UPGRADE_PROBE_INTERVAL: Duration = Duration::from_millis(100);
+/// Default timeout of an individual upgrade availability probe.
+pub const DEFAULT_UPGRADE_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Default for [`Settings::token_lifetime`]: ten minutes.
 pub const DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_mins(10);
@@ -98,10 +144,14 @@ pub struct Settings {
     /// which the flake's devShell sets.
     #[serde(default)]
     pub action_bin: Option<PathBuf>,
+    /// Public CA bundle mounted at conventional system trust paths in bwrap actions.
+    /// Defaults to `GANG_E2E_CA_BUNDLE` from the devShell.
+    #[serde(default)]
+    pub ca_bundle: Option<PathBuf>,
     /// How long connection setup, TLS, and the first HTTP/2 frame may take.
     #[serde(with = "gang_types::duration")]
     pub handshake_timeout: Duration,
-    /// How long the gang server may take to announce its listeners.
+    /// How long servers may take to start, or provider-owned workers to restart and enroll.
     #[serde(with = "gang_types::duration")]
     pub startup_timeout: Duration,
     /// How long one gang command may run.
@@ -117,6 +167,23 @@ pub struct Settings {
     /// How long the harness waits for the hold action to signal that its orphan runs.
     #[serde(with = "gang_types::duration")]
     pub hold_timeout: Duration,
+    /// The procedure used for the normal rolling upgrade; defaults to pre-stop.
+    pub upgrade_procedure: UpgradeProcedure,
+    /// Time to keep a deregistered instance alive before signalling it during refresh.
+    #[serde(with = "gang_types::duration")]
+    pub upgrade_drain_window: Duration,
+    /// Harness cap on instance-refresh warmup; defaults to 30s, and configured zero remains zero.
+    #[serde(with = "gang_types::duration")]
+    pub upgrade_warmup_window: Duration,
+    /// Maximum permitted availability gap during an upgrade.
+    #[serde(with = "gang_types::duration")]
+    pub upgrade_gap_limit: Duration,
+    /// Interval between upgrade availability probes.
+    #[serde(with = "gang_types::duration")]
+    pub upgrade_probe_interval: Duration,
+    /// Timeout for one upgrade availability probe.
+    #[serde(with = "gang_types::duration")]
+    pub upgrade_probe_timeout: Duration,
     /// The lifetime of the tokens the in-process issuer mints.
     #[serde(with = "gang_types::duration")]
     pub token_lifetime: Duration,
@@ -135,6 +202,13 @@ pub struct Settings {
     pub log_tail_bytes: usize,
     /// How many independent scenarios run at once.
     pub parallel_scenarios: NonZeroUsize,
+    /// Minimum resident victim bytes before inducing pressure. Defaults to 160 MiB.
+    pub pressure_victim_minimum: gang_types::NonZeroBytes,
+    /// Minimum resident neighbour bytes before inducing pressure. Defaults to 352 MiB.
+    pub pressure_neighbour_minimum: gang_types::NonZeroBytes,
+    /// Delay between pressure observations. Defaults to 50 ms.
+    #[serde(with = "gang_types::duration")]
+    pub pressure_observe_interval: Duration,
 }
 
 impl Default for Settings {
@@ -147,12 +221,19 @@ impl Default for Settings {
             chromium: None,
             action_path: None,
             action_bin: None,
+            ca_bundle: None,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             command_timeout: DEFAULT_COMMAND_TIMEOUT,
             build_timeout: DEFAULT_BUILD_TIMEOUT,
             history_timeout: DEFAULT_HISTORY_TIMEOUT,
             hold_timeout: DEFAULT_HOLD_TIMEOUT,
+            upgrade_procedure: UpgradeProcedure::default(),
+            upgrade_drain_window: DEFAULT_UPGRADE_DRAIN_WINDOW,
+            upgrade_warmup_window: DEFAULT_UPGRADE_WARMUP_WINDOW,
+            upgrade_gap_limit: DEFAULT_UPGRADE_GAP_LIMIT,
+            upgrade_probe_interval: DEFAULT_UPGRADE_PROBE_INTERVAL,
+            upgrade_probe_timeout: DEFAULT_UPGRADE_PROBE_TIMEOUT,
             token_lifetime: DEFAULT_TOKEN_LIFETIME,
             scratch_root: None,
             worker_launcher: DEFAULT_WORKER_LAUNCHER
@@ -163,6 +244,9 @@ impl Default for Settings {
             stderr_tail_lines: DEFAULT_STDERR_TAIL_LINES,
             log_tail_bytes: DEFAULT_LOG_TAIL_BYTES,
             parallel_scenarios: DEFAULT_PARALLEL_SCENARIOS,
+            pressure_victim_minimum: gang_types::NonZeroBytes::mib(160),
+            pressure_neighbour_minimum: gang_types::NonZeroBytes::mib(352),
+            pressure_observe_interval: Duration::from_millis(50),
         }
     }
 }
@@ -196,6 +280,8 @@ pub struct ActionTools {
     pub path: String,
     /// The directory of the action tools, bound at `/bin` and `/usr/bin` in bwrap sandboxes.
     pub action_bin: PathBuf,
+    /// Public CA bundle to mount in the action, if available.
+    pub ca_bundle: Option<PathBuf>,
     /// The bubblewrap binary a bwrap-sandboxed worker runs (`[sandbox.bwrap] program`);
     /// `None` where the platform has no bwrap.
     pub bwrap: Option<PathBuf>,
@@ -269,6 +355,31 @@ mod tests {
         let settings: Settings =
             toml::from_str("cgroup_root = '/tmp/cgroup'").expect("cgroup root override parses");
         assert_eq!(settings.cgroup_root, PathBuf::from("/tmp/cgroup"));
+    }
+
+    #[test]
+    fn upgrade_durations_default_and_accept_overrides() {
+        let defaults: Settings = toml::from_str("").expect("default settings parse");
+        assert_eq!(defaults.upgrade_procedure, UpgradeProcedure::PreStop);
+        assert_eq!(defaults.upgrade_drain_window, Duration::from_secs(8));
+        assert_eq!(defaults.upgrade_warmup_window, Duration::from_secs(30));
+        assert_eq!(defaults.upgrade_gap_limit, Duration::from_secs(4));
+        assert_eq!(defaults.upgrade_probe_interval, Duration::from_millis(100));
+        assert_eq!(defaults.upgrade_probe_timeout, Duration::from_secs(1));
+
+        let settings: Settings = toml::from_str(
+            "upgrade_procedure = 'instance-refresh'\nupgrade_drain_window = '12s'\nupgrade_warmup_window = '25s'\nupgrade_gap_limit = '20s'\nupgrade_probe_interval = '200ms'\nupgrade_probe_timeout = '2s'",
+        )
+        .expect("upgrade duration overrides parse");
+        assert_eq!(
+            settings.upgrade_procedure,
+            UpgradeProcedure::InstanceRefresh
+        );
+        assert_eq!(settings.upgrade_drain_window, Duration::from_secs(12));
+        assert_eq!(settings.upgrade_warmup_window, Duration::from_secs(25));
+        assert_eq!(settings.upgrade_gap_limit, Duration::from_secs(20));
+        assert_eq!(settings.upgrade_probe_interval, Duration::from_millis(200));
+        assert_eq!(settings.upgrade_probe_timeout, Duration::from_secs(2));
     }
 
     #[test]

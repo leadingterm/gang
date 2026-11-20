@@ -22,7 +22,8 @@ use crate::{CertificateSignerPort, IssuedCertRecord, PortError, StateRepositoryP
 pub struct Peer {
     /// The serial of the client certificate the TLS layer verified, when the client presented one.
     pub certificate: Option<CertSerial>,
-    /// The IP address of the connection's remote end, when the transport knows it. It is the address of the directly connected peer: a connection through a proxy shows the proxy's address.
+    /// The effective source IP: supplied by a configured trusted PROXY peer, or the direct socket
+    /// peer when no trusted header applies, if the transport knows it.
     pub address: Option<std::net::IpAddr>,
 }
 

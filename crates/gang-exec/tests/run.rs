@@ -15,12 +15,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use gang_config::{ExecutionConfig, InputLinks, SandboxFile};
 use gang_exec::{ExecError, Invocation, run_with};
-use gang_spi::{ActionExecutionOutcome, ActionLimits, CPU_COUNT_ENV, MEMORY_KB_ENV};
-use gang_testkit::{
-    CallLog, Opaque, RecordingLimits, SandboxConfig, SandboxKey, ScriptedSandbox, TestLimits,
-    TestPlugins,
+use gang_spi::{
+    ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, ActionLimits,
+    ActionLimitsPort, ActionMemoryPool, ActionScope, ActionUsage, CPU_COUNT_ENV, MEMORY_KB_ENV,
+    PortError, SIDE_CHANNEL_FILE_ENV, SandboxedAction,
 };
-use gang_types::NonZeroBytes;
+use gang_testkit::{
+    CallLog, Opaque, RecordedScope, RecordingLimits, SandboxConfig, SandboxKey, ScriptedSandbox,
+    TestLimits, TestPlugins,
+};
+use gang_types::{Bytes, NonZeroBytes};
 use parking_lot::Mutex;
 use tempfile::TempDir;
 
@@ -432,6 +436,112 @@ fn limits_section_builds_the_limits_plugin_and_enter_receives_the_requested_limi
     assert_eq!(started_markers(&started), ["trusted"]);
     Ok(())
 }
+#[test]
+fn reports_oom_without_exposing_path_or_changing_status() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new(InputLinks::Keep)?;
+    let text = sandbox_file(
+        &fixture.root,
+        "trusted",
+        InputLinks::Keep,
+        Some(TestLimits { max_pids: 1 }),
+    )?;
+    fs::write(fixture.entrypoint.with_file_name("sandbox.toml"), text)?;
+    let alias = fixture.base.join("work-alias");
+    std::os::unix::fs::symlink(&fixture.root, &alias)?;
+    fs::write(
+        fixture.entrypoint.with_file_name("sandbox.toml"),
+        sandbox_file(
+            &alias,
+            "trusted",
+            InputLinks::Keep,
+            Some(TestLimits { max_pids: 1 }),
+        )?,
+    )?;
+    let path = alias.join(".side_channels/a1/report");
+    fs::create_dir_all(path.parent().ok_or("missing parent")?)?;
+    let environment = [
+        (
+            OsString::from(SIDE_CHANNEL_FILE_ENV),
+            path.clone().into_os_string(),
+        ),
+        (OsString::from("VISIBLE"), OsString::from("yes")),
+    ];
+    let calls = Calls {
+        limits: RecordingLimits::new(&CallLog::default()).with_oom_kills(1),
+        ..Calls::default()
+    };
+    let started = Events::default();
+    let status = run_action_counting(
+        &argv(),
+        &fixture.entrypoint,
+        &fixture.working_directory,
+        &environment,
+        &started,
+        &calls,
+    )?;
+    assert_eq!(status, ExitCode::SUCCESS);
+    assert_eq!(
+        fs::read(&path)?,
+        br#"{"failure":"memory","peak_memory_kb":4}"#
+    );
+    let sandbox = started.lock()[0].1.clone();
+    assert_eq!(
+        sandbox.started()[0].environment,
+        vec![(OsString::from("VISIBLE"), OsString::from("yes"))]
+    );
+    // A second report cannot replace the first and must not alter the action's status.
+    let status = run_action_counting(
+        &argv(),
+        &fixture.entrypoint,
+        &fixture.working_directory,
+        &environment,
+        &started,
+        &calls,
+    )?;
+    assert_eq!(status, ExitCode::SUCCESS);
+    Ok(())
+}
+#[test]
+fn oom_report_preserves_nonzero_action_status() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new(InputLinks::Keep)?;
+    let text = sandbox_file(
+        &fixture.root,
+        "trusted",
+        InputLinks::Keep,
+        Some(TestLimits { max_pids: 1 }),
+    )?;
+    fs::write(fixture.entrypoint.with_file_name("sandbox.toml"), text)?;
+    let path = fixture.root.join(".side_channels/a1/report");
+    fs::create_dir_all(path.parent().ok_or("missing parent")?)?;
+    let environment = [(
+        OsString::from(SIDE_CHANNEL_FILE_ENV),
+        path.clone().into_os_string(),
+    )];
+    let arguments = argv();
+    let invocation = Invocation {
+        entrypoint: &fixture.entrypoint,
+        argv: &arguments,
+        environment: &environment,
+        working_directory: &fixture.working_directory,
+    };
+    let status = run_with::<TestPlugins, ScriptedSandbox, RecordingLimits>(
+        &invocation,
+        |_, _, _| {
+            Ok(ScriptedSandbox::exiting(
+                &CallLog::default(),
+                ActionExecutionOutcome::Signaled(9),
+            ))
+        },
+        |_, _| Ok(RecordingLimits::new(&CallLog::default()).with_oom_kills(1)),
+        || Ok(()),
+    )?;
+    assert_eq!(status, ExitCode::from(137));
+    assert_eq!(
+        fs::read(path)?,
+        br#"{"failure":"memory","peak_memory_kb":4}"#
+    );
+    Ok(())
+}
 
 #[test]
 fn no_limits_section_never_builds_the_limits_plugin() -> Result<(), Box<dyn Error>> {
@@ -476,5 +586,133 @@ fn a_malformed_sandbox_file_is_an_error_and_the_sandbox_never_starts() -> Result
     assert!(matches!(error, ExecError::SandboxFile { .. }));
     assert_eq!(calls.sandbox_builds.load(Ordering::SeqCst), 0);
     assert!(started_markers(&started).is_empty());
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ScopeWithCgroup(RecordedScope);
+
+impl ActionScope for ScopeWithCgroup {
+    fn launcher(&self) -> &[OsString] {
+        self.0.launcher()
+    }
+
+    fn memory_cgroup(&self) -> Option<PathBuf> {
+        Some(PathBuf::from("/sys/fs/cgroup/actions/123-456-7"))
+    }
+}
+
+struct LimitsWithCgroup(RecordingLimits);
+
+impl ActionLimitsPort for LimitsWithCgroup {
+    type Scope = ScopeWithCgroup;
+
+    async fn prepare(&self, reserve: Bytes) -> Result<Option<ActionMemoryPool>, PortError> {
+        self.0.prepare(reserve).await
+    }
+
+    async fn enter(&self, limits: &ActionLimits) -> Result<Self::Scope, PortError> {
+        self.0.enter(limits).await.map(ScopeWithCgroup)
+    }
+
+    async fn leave(&self, scope: Self::Scope) -> Result<ActionUsage, PortError> {
+        self.0.leave(scope.0).await
+    }
+
+    async fn reap_abandoned(&self, creator: u32) -> Result<(), PortError> {
+        self.0.reap_abandoned(creator).await
+    }
+}
+
+struct MetadataCheckingSandbox(PathBuf);
+
+impl ActionIsolationPort for MetadataCheckingSandbox {
+    async fn start(&self, _: &ActionExecutionSpec<'_>) -> Result<SandboxedAction, PortError> {
+        let metadata = fs::read(&self.0).map_err(PortError::backend)?;
+        if metadata != b"/sys/fs/cgroup/actions/123-456-7" {
+            return Err(PortError::backend(io::Error::other(
+                "incorrect cgroup metadata",
+            )));
+        }
+        Ok(SandboxedAction::new(async {
+            Ok(ActionExecutionOutcome::Exited(0))
+        }))
+    }
+}
+
+#[test]
+fn publishes_scope_metadata_before_start_with_aliased_work_root() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new(InputLinks::Keep)?;
+    let alias = fixture.base.join("work-alias");
+    std::os::unix::fs::symlink(&fixture.root, &alias)?;
+    fs::write(
+        fixture.entrypoint.with_file_name("sandbox.toml"),
+        sandbox_file(
+            &alias,
+            "trusted",
+            InputLinks::Keep,
+            Some(TestLimits { max_pids: 9 }),
+        )?,
+    )?;
+    let path = alias.join(".side_channels/a1/report");
+    fs::create_dir_all(path.parent().ok_or("missing parent")?)?;
+    let env = [(
+        OsString::from(SIDE_CHANNEL_FILE_ENV),
+        path.clone().into_os_string(),
+    )];
+    let arguments = argv();
+    let invocation = Invocation {
+        entrypoint: &fixture.entrypoint,
+        argv: &arguments,
+        environment: &env,
+        working_directory: &fixture.working_directory,
+    };
+    let metadata = path.with_file_name("report.cgroup");
+    let status = run_with::<TestPlugins, MetadataCheckingSandbox, LimitsWithCgroup>(
+        &invocation,
+        |_, _, _| Ok(MetadataCheckingSandbox(metadata.clone())),
+        |_, _| Ok(LimitsWithCgroup(RecordingLimits::new(&CallLog::default()))),
+        || Ok(()),
+    )?;
+    assert_eq!(status, ExitCode::SUCCESS);
+    assert_eq!(fs::read(&path)?, br#"{"peak_memory_kb":4}"#);
+    Ok(())
+}
+
+#[test]
+fn refuses_planted_report_symlink_under_aliased_root() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new(InputLinks::Keep)?;
+    let alias = fixture.base.join("work-alias");
+    std::os::unix::fs::symlink(&fixture.root, &alias)?;
+    fs::write(
+        fixture.entrypoint.with_file_name("sandbox.toml"),
+        sandbox_file(
+            &alias,
+            "trusted",
+            InputLinks::Keep,
+            Some(TestLimits { max_pids: 9 }),
+        )?,
+    )?;
+    let path = alias.join(".side_channels/a1/report");
+    fs::create_dir_all(path.parent().ok_or("missing parent")?)?;
+    let target = fixture.base.join("victim");
+    std::os::unix::fs::symlink(&target, &path)?;
+    let env = [(OsString::from(SIDE_CHANNEL_FILE_ENV), path.into_os_string())];
+    let calls = Calls {
+        limits: RecordingLimits::new(&CallLog::default()).with_oom_kills(2),
+        ..Calls::default()
+    };
+    assert_eq!(
+        run_action_counting(
+            &argv(),
+            &fixture.entrypoint,
+            &fixture.working_directory,
+            &env,
+            &Events::default(),
+            &calls
+        )?,
+        ExitCode::SUCCESS
+    );
+    assert!(!target.exists());
     Ok(())
 }

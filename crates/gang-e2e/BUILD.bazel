@@ -1,4 +1,6 @@
+load("//bazel/opentofu:defs.bzl", "upgrade_fixture")
 load("//bazel/rust:defs.bzl", "workspace_rust_binary", "workspace_rust_library")
+load(":bundle.bzl", "e2e_bundle")
 
 # The Bazel the harness drives: pinned in MODULE.bazel, one binary per host platform.
 alias(
@@ -20,27 +22,107 @@ alias(
     }),
 )
 
+alias(
+    name = "previous_gang",
+    actual = select({
+        "//bazel/platforms:linux_x86_64": "@gang_v032_linux_x86_64//file:gang",
+        "//bazel/platforms:linux_arm64": "@gang_v032_linux_arm64//file:gang",
+    }),
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+alias(
+    name = "calibration_gang",
+    actual = select({
+        "//bazel/platforms:linux_x86_64": "@gang_v032_linux_x86_64//file:gang",
+        "//bazel/platforms:linux_arm64": "@gang_v032_linux_arm64//file:gang",
+    }),
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+alias(
+    name = "historical_gang",
+    actual = select({
+        "//bazel/platforms:linux_x86_64": "@gang_v031_linux_x86_64//file:gang",
+        "//bazel/platforms:linux_arm64": "@gang_v031_linux_arm64//file:gang",
+    }),
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+upgrade_fixture(
+    name = "v032_fixture",
+    srcs = ["@gang_v032_source//:sources"],
+    source_root = "@gang_v032_source//:Cargo.toml",
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+alias(
+    name = "calibration_fixture",
+    actual = ":v032_fixture",
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+alias(
+    name = "previous_fixture",
+    actual = ":v032_fixture",
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+upgrade_fixture(
+    name = "historical_fixture",
+    srcs = ["@gang_v031_source//:sources"],
+    source_root = "@gang_v031_source//:Cargo.toml",
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+upgrade_fixture(
+    name = "candidate_fixture",
+    srcs = [
+        "//:Cargo.toml",
+        "//configs:gang.local.toml",
+        "//infra/terraform/modules/controller:sources",
+        "//infra/terraform/modules/deployment:sources",
+        "//infra/terraform/modules/instance-role:sources",
+        "//infra/terraform/modules/load-balancer:sources",
+        "//infra/terraform/modules/network:sources",
+        "//infra/terraform/modules/storage:sources",
+        "//infra/terraform/modules/worker-fleet:sources",
+    ],
+    source_root = "//:Cargo.toml",
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
 workspace_rust_library(
     name = "gang_e2e",
-    dev_deps = ["//crates/gang-spi:gang_spi"],
+    dev_deps = [
+        "//crates/gang-spi:gang_spi",
+        "//crates/gang-aws-sdk:gang_aws_sdk",
+        "//crates/gang-dynamodb:gang_dynamodb_test_support",
+        "//crates/gang-nativelink:gang_nativelink_test_support",
+        "//crates/gang-postgres:gang_postgres",
+        "//crates/gang-server:gang_server",
+        "//crates/gang-sqlite:gang_sqlite",
+    ],
     test_env = {
         "GANG_E2E_BASE_CONFIG": "$(rootpath //configs:gang.local.toml)",
         "GANG_E2E_TEST_BASH": "$(rootpath :test_bash)",
+        "GANG_TEST_POSTGRES": "$(rootpath //crates/gang-testkit:postgresql_archive)",
     },
     test_runtime_data = [
         ":test_bash",
         "//configs:gang.local.toml",
+        "//crates/gang-testkit:postgresql_archive",
     ],
     deps = [
         "//crates/gang-authn:gang_authn",
         "//crates/gang-bwrap:gang_bwrap",
         "//crates/gang-cgroup:gang_cgroup",
+        "//crates/gang-client:gang_client",
         "//crates/gang-clock:gang_clock",
         "//crates/gang-config:gang_config",
         "//crates/gang-local:gang_local",
         "//crates/gang-main:gang_main",
         "//crates/gang-mtls:gang_mtls",
-        "//crates/gang-nativelink:gang_nativelink",
         "//crates/gang-oidc:gang_oidc",
         "//crates/gang-os:gang_os",
         "//crates/gang-state:gang_state",
@@ -62,12 +144,28 @@ workspace_rust_binary(
         "//crates/gang-main:gang",
         "//crates/gang-testkit:postgresql_archive",
     ] + select({
-        "@platforms//os:linux": ["//crates/gang-main/tests/preload:loaded_probe"],
+        "@platforms//os:linux": [
+            ":calibration_fixture",
+            ":calibration_gang",
+            ":candidate_fixture",
+            ":historical_fixture",
+            ":historical_gang",
+            ":previous_fixture",
+            ":previous_gang",
+            "//crates/gang-main/tests/preload:loaded_probe",
+        ],
         "//conditions:default": [],
     }),
     env = select({
         "@platforms//os:linux": {
             "GANG_E2E_BAZEL": "$(rootpath :bazel)",
+            "GANG_E2E_CALIBRATION_FIXTURE": "$(rootpath :calibration_fixture)",
+            "GANG_E2E_CALIBRATION_GANG": "$(rootpath :calibration_gang)",
+            "GANG_E2E_CANDIDATE_FIXTURE": "$(rootpath :candidate_fixture)",
+            "GANG_E2E_HISTORICAL_FIXTURE": "$(rootpath :historical_fixture)",
+            "GANG_E2E_HISTORICAL_GANG": "$(rootpath :historical_gang)",
+            "GANG_E2E_PREVIOUS_FIXTURE": "$(rootpath :previous_fixture)",
+            "GANG_E2E_PREVIOUS_GANG": "$(rootpath :previous_gang)",
             "GANG_E2E_GANG": "$(rootpath //crates/gang-main:gang)",
             "GANG_E2E_GATE_SCRIPT": "$(rootpath //:tools/e2e-gate.sh)",
             "GANG_E2E_GLIBC_TOOL": "$(rootpath //crates/gang-main/tests/preload:loaded_probe)",
@@ -85,27 +183,21 @@ workspace_rust_binary(
     ],
 )
 
-# The harness with pinned Bazel, PostgreSQL archive and glibc probe as plain files,
+# The harness with Gang, pinned Bazel, PostgreSQL archive and glibc probe as plain files,
 # for a job that runs the harness without Bazel (CI's e2e gates pass them by flag).
-genrule(
+e2e_bundle(
     name = "bundle",
-    srcs = [
-        ":bazel",
-        ":local",
-        "//crates/gang-main/tests/preload:loaded_probe",
-        "//crates/gang-testkit:postgresql_archive",
-    ],
-    outs = [
-        "bundle/bazel",
-        "bundle/local",
-        "bundle/loaded_probe",
-        "bundle/postgresql.tar.gz",
-    ],
-    cmd = " && ".join([
-        "cp $(execpath :bazel) $(execpath bundle/bazel)",
-        "cp $(execpath :local) $(execpath bundle/local)",
-        "cp $(execpath //crates/gang-main/tests/preload:loaded_probe) $(execpath bundle/loaded_probe)",
-        "cp $(execpath //crates/gang-testkit:postgresql_archive) $(execpath bundle/postgresql.tar.gz)",
-    ]),
+    bazel = ":bazel",
+    calibration_fixture = ":calibration_fixture",
+    calibration_gang = ":calibration_gang",
+    candidate_fixture = ":candidate_fixture",
+    gang = "//crates/gang-main:gang",
+    harness = ":local",
+    historical_fixture = ":historical_fixture",
+    historical_gang = ":historical_gang",
+    loaded_probe = "//crates/gang-main/tests/preload:loaded_probe",
+    postgres = "//crates/gang-testkit:postgresql_archive",
+    previous_fixture = ":previous_fixture",
+    previous_gang = ":previous_gang",
     target_compatible_with = ["@platforms//os:linux"],
 )

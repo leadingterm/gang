@@ -85,6 +85,66 @@ export type ApproveDeviceAuthorizationResponse = {
  */
 authorizationUrl: string, };
 
+export type AwsEvent = { 
+/**
+ * The provider's stable event identifier.
+ */
+id: string, 
+/**
+ * When AWS observed the event.
+ */
+at: Timestamp, 
+/**
+ * The observation itself.
+ */
+kind: AwsEventKind, };
+
+export type AwsEventKind = { "type": "rebalanceRecommendation", 
+/**
+ * Reference `instances/{instance}` of the instance at risk.
+ */
+instance: string, } | { "type": "spotInterruption", 
+/**
+ * Reference `instances/{instance}` of the instance at risk.
+ */
+instance: string, 
+/**
+ * The action AWS intends to take.
+ */
+action: AwsInterruptionAction, } | { "type": "instanceLaunched", 
+/**
+ * Reference `instances/{instance}` of the new instance.
+ */
+instance: string, } | { "type": "replacementLaunched", 
+/**
+ * Reference `instances/{instance}` of the new instance.
+ */
+instance: string, 
+/**
+ * Reference `instances/{instance}` of the old instance, when known.
+ */
+replacing?: string, } | { "type": "instanceTerminated", 
+/**
+ * Reference `instances/{instance}` of the terminated instance.
+ */
+instance: string, 
+/**
+ * The termination reason.
+ */
+reason: AwsTerminationReason, 
+/**
+ * Provider text for another termination reason.
+ */
+reasonDetail?: string, } | { "type": "capacityUnavailable", 
+/**
+ * The provider's reason.
+ */
+reason: string, };
+
+export type AwsInterruptionAction = "TERMINATE" | "STOP" | "HIBERNATE";
+
+export type AwsTerminationReason = "REBALANCE" | "SPOT_RECLAIMED" | "OTHER";
+
 export type BucketUsage = { 
 /**
  * Bytes held in the bucket.
@@ -261,6 +321,10 @@ actions?: ActionsDelta,
  */
 events?: Array<ScalingEvent>, 
 /**
+ * A whole replacement of the live infrastructure observations; an empty list clears them.
+ */
+statusEvents?: Array<ScalingEvent>, 
+/**
  * A new count of completed actions.
  */
 completed?: number, 
@@ -404,7 +468,11 @@ worker: string, } } | { "workerDeregistered": {
 /**
  * Reference `workers/{worker}` of the worker that disconnected.
  */
-worker: string, } };
+worker: string, } } | { "aws": { 
+/**
+ * The provider observation.
+ */
+event: AwsEvent, } };
 
 export type Executions = { 
 /**
@@ -474,6 +542,24 @@ demand: Demand, };
 
 export type Frame = { "event": "snapshot", "data": State } | { "event": "delta", "data": Delta } | { "event": "tick", "data": Tick } | { "event": "closed", "data": Closed };
 
+export type InfrastructurePhase = "REPLACING" | "REPLACEMENT";
+
+export type InfrastructureReason = "SPOT_REBALANCE" | "SPOT_INTERRUPTION";
+
+export type InfrastructureStatus = { 
+/**
+ * Whether this instance is being replaced or is the replacement.
+ */
+phase: InfrastructurePhase, 
+/**
+ * The observation behind the status.
+ */
+reason: InfrastructureReason, 
+/**
+ * Reference `instances/{instance}` of the paired instance, when known.
+ */
+otherInstance?: string, };
+
 export type Instance = { 
 /**
  * Resource name, `instances/{instance}`.
@@ -487,6 +573,10 @@ fleet: string,
  * The instance's lifecycle.
  */
 lifecycle: Lifecycle, 
+/**
+ * Derived infrastructure status, when present.
+ */
+infrastructure?: InfrastructureStatus, 
 /**
  * When the instance launched.
  */
@@ -949,7 +1039,11 @@ worker: string, } } | { "workerDeregistered": {
 /**
  * Reference `workers/{worker}` of the worker that disconnected.
  */
-worker: string, } });
+worker: string, } } | { "aws": { 
+/**
+ * The provider observation.
+ */
+event: AwsEvent, } });
 
 export type Session = { 
 /**
@@ -1074,6 +1168,10 @@ actions?: Actions,
  */
 events: Array<ScalingEvent>, 
 /**
+ * Live provider observations; separate from the durable scaling audit.
+ */
+statusEvents?: Array<ScalingEvent>, 
+/**
  * How many streamed events a client keeps; constant for the process.
  */
 eventsLimit: number, 
@@ -1197,6 +1295,10 @@ instance: string,
  */
 phase: Phase, 
 /**
+ * Derived infrastructure status of the worker's instance, when present.
+ */
+infrastructure?: InfrastructureStatus, 
+/**
  * When the worker entered its phase.
  */
 phaseTime: Timestamp, 
@@ -1255,7 +1357,6 @@ export const PATHS = {
   listEvents: "/v1/events",
   listBuilds: "/v1/builds",
   getBuild: "/v1/builds/{build}",
-  ingestBuilds: "/v1/builds:ingest",
   getState: "/v1/state",
   watchState: "/v1/state:watch",
   getSession: "/v1/session",

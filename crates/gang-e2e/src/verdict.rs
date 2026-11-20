@@ -18,8 +18,7 @@ use crate::mirror::follow;
 use crate::names;
 use crate::report::{InputRootReport, IsolationReport, Namespaces, PoisonReport, VictimReport};
 use crate::system::{
-    HOLD_CPU_COUNT, HOLD_MEMORY_KB, LIMIT_CPU_PERIOD_MICROS, LIMIT_HEADROOM_PERCENT,
-    LIMIT_MAX_PIDS, PermitNetwork, Sandbox, ScopeFacts,
+    HOLD_CPU_COUNT, LIMIT_CPU_PERIOD_MICROS, LIMIT_MAX_PIDS, PermitNetwork, Sandbox, ScopeFacts,
 };
 
 /// Whether the workers' net and mnt namespaces differ from the host's.
@@ -543,15 +542,13 @@ fn worker_instance(reference: &str) -> Option<InstanceId> {
 /// Each check compares one of the scope's limit files with the value the configured limits imply.
 #[must_use]
 pub fn scope_limits(facts: &ScopeFacts) -> Vec<Check> {
-    let memory =
-        (HOLD_MEMORY_KB * 1024 * u64::from(100 + LIMIT_HEADROOM_PERCENT) / 100).to_string();
     let cpu = format!(
         "{} {}",
         u64::from(HOLD_CPU_COUNT) * LIMIT_CPU_PERIOD_MICROS,
         LIMIT_CPU_PERIOD_MICROS
     );
     vec![
-        expect_setting(names::limits::MEMORY_MAX, &memory, &facts.memory_max),
+        expect_setting(names::limits::MEMORY_MAX, "max", &facts.memory_max),
         expect_setting(names::limits::OOM_GROUP, "1", &facts.oom_group),
         expect_setting(names::limits::CPU_MAX, &cpu, &facts.cpu_max),
         expect_setting(
@@ -567,26 +564,6 @@ fn expect_setting(name: &'static str, expected: &str, found: &str) -> Check {
     Check::expect(name, expected == found, || {
         format!("expected `{expected}`, found `{found}`")
     })
-}
-
-/// Whether an action exceeding the hard memory ceiling was killed, as Bazel reports it: `(Killed)`
-/// or `(Exit 137)`. A failure quotes the last `stderr_tail_lines` lines of the build's stderr.
-pub fn hard_ceiling(outcome: &BuildOutcome, stderr_tail_lines: usize) -> Check {
-    Check::expect(
-        names::limits::HARD_CEILING,
-        !outcome.succeeded() && outcome.action_killed(),
-        || {
-            if outcome.succeeded() {
-                "the build succeeded".to_owned()
-            } else {
-                format!(
-                    "exit {:?}, no action was reported killed (`(Killed)` or `(Exit 137)`){}",
-                    outcome.exit_code,
-                    build_said(outcome, stderr_tail_lines)
-                )
-            }
-        },
-    )
 }
 
 /// The message the worker writes into a build's output when an action exceeds its disk
@@ -841,10 +818,46 @@ fn describe(event: &Event) -> String {
         EventChange::ExitedEarly { .. } => "exited_early",
         EventChange::WorkerRegistered { .. } => "worker_registered",
         EventChange::WorkerDeregistered { .. } => "worker_deregistered",
+        EventChange::Aws { .. } => "aws",
         EventChange::Unrecognized(_) => "unrecognized",
     };
     let cause = event.cause.as_ref().map_or("no cause", Cause::as_str);
     match &event.change {
+        EventChange::Aws { event } => match &event.kind {
+            gang_wire::AwsEventKind::RebalanceRecommendation { instance } => {
+                format!("AWS rebalance recommendation for {instance}")
+            }
+            gang_wire::AwsEventKind::SpotInterruption { instance, action } => {
+                format!(
+                    "AWS spot interruption notice for {instance}: {}",
+                    action.as_str()
+                )
+            }
+            gang_wire::AwsEventKind::InstanceLaunched { instance } => {
+                format!("AWS {instance} launched")
+            }
+            gang_wire::AwsEventKind::ReplacementLaunched {
+                instance,
+                replacing: Some(old),
+            } => format!("AWS replacement {instance} launched for {old}"),
+            gang_wire::AwsEventKind::ReplacementLaunched {
+                instance,
+                replacing: None,
+            } => format!("AWS replacement {instance} launched"),
+            gang_wire::AwsEventKind::InstanceTerminated {
+                instance,
+                reason,
+                reason_detail,
+            } => match reason_detail {
+                Some(detail) => {
+                    format!("AWS terminated {instance}: {} ({detail})", reason.as_str())
+                }
+                None => format!("AWS terminated {instance}: {}", reason.as_str()),
+            },
+            gang_wire::AwsEventKind::CapacityUnavailable { reason } => {
+                format!("AWS capacity unavailable: {reason}")
+            }
+        },
         EventChange::ExitedEarly { instance, failure } => {
             format!("{kind} {instance}: {failure} ({cause})")
         }

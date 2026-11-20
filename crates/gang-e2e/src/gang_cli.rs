@@ -108,6 +108,15 @@ impl GangCli {
         &self.home
     }
 
+    /// Reuses this exact binary and configuration with an isolated client home.
+    pub(crate) fn with_home(&self, home: PathBuf) -> Self {
+        Self {
+            binary: self.binary.clone(),
+            config: self.config.clone(),
+            home,
+        }
+    }
+
     /// A command for the binary with the home directory of this identity.
     fn command(&self) -> Command {
         let mut command = Command::new(&self.binary);

@@ -10,12 +10,12 @@ import { Actions } from "../src/views/actions.tsx";
 import { Activity } from "../src/views/activity.tsx";
 import { Build, BuildView } from "../src/views/build.tsx";
 import { autoLoadBuilds, Builds, filterBuilds } from "../src/views/builds.tsx";
-import { fleetCounts, fleetTotals, Tape, TapeKey } from "../src/views/fleet.tsx";
+import { cellStates, fleetCounts, fleetTotals, Legend, Tape, TapeKey } from "../src/views/fleet.tsx";
 import { Forbidden, SignIn, SignInError } from "../src/views/gate.tsx";
 import { EventRow, Overview } from "../src/views/overview.tsx";
 import { WorkerDetail, Workers } from "../src/views/workers.tsx";
 import { ms } from "../src/wire-parse.ts";
-import type { ScalingEvent } from "../src/wire.ts";
+import type { AwsEventKind, ScalingEvent } from "../src/wire.ts";
 import { build, clientFor, session, signedOut, type Scenario } from "./scenario.ts";
 import { iso, load, snapshotOf } from "./sse.ts";
 
@@ -231,6 +231,14 @@ test("build detail shows its observed work", (t) => {
   for (const expected of [/3f2b8c1e-7a4d-4e9b-9c2f-5d6e7f8a9b0c/, /bazel 8.4.2/, /Remote work Gang saw; local actions, disk-cache hits and analysis are not included\./, /Remote cache/, /80%/, /Slowest actions/, /parser/, /Joined\s+3/]) t.assert.match(visibleText(markup), expected);
 });
 
+test("idle build and missing observations retain their separate warnings", (t) => {
+  const idle = visibleText(html({}, <BuildView build={{ ...build, state: "IDLE", unrecorded: 3 }} />));
+  t.assert.match(idle, /No observation for a while; Gang cannot know if it finished\./);
+  t.assert.match(idle, /3 observations not recorded/);
+  const active = visibleText(html({}, <BuildView build={{ ...build, state: "ACTIVE", unrecorded: 0 }} />));
+  t.assert.doesNotMatch(active, /No observation for a while|observations not recorded/);
+});
+
 test("a missing build says it is not held", (t) => {
   const client = clientFor({});
   client.build.value = { kind: "missing", id: "missing" };
@@ -306,22 +314,33 @@ test("an event of an unknown kind renders without a glyph or a detail", (t) => {
 
 test("a fleet's counts are totalled across fleets and name every state with the legend's words", (t) => {
   const [spot, onDemand] = live.fleets;
-  if (!spot || !onDemand) throw new Error("the live recording has two fleets");
-  t.assert.deepEqual(fleetCounts(spot), [
+  const worker = live.workers[0];
+  const instance = live.instances[0];
+  if (!spot || !onDemand || !worker || !instance) throw new Error("fixture has two fleets, a worker and an instance");
+  const rows = (fleet: string, phase: "BUSY" | "IDLE" | "DRAINING", n: number) =>
+    Array.from({ length: n }, (_, i) => ({ ...worker, fleet, phase, running: phase === "BUSY" ? 1 : 0, name: `workers/${fleet}-${phase}-${i}`, instance: `instances/${fleet}-${phase}-${i}` }));
+  const census = {
+    workers: [...rows(spot.name, "BUSY", 9), ...rows(spot.name, "IDLE", 1), ...rows(spot.name, "DRAINING", 1), ...rows(onDemand.name, "BUSY", 2), ...rows(onDemand.name, "IDLE", 1)],
+    instances: (["IN_SERVICE", "PENDING", "PENDING", "TERMINATING"] as const).map((lifecycle, i) => ({ ...instance, name: `instances/test-${i}`, fleet: spot.name, lifecycle })),
+  };
+  t.assert.deepEqual(fleetCounts(spot, census), [
     ["busy", 9],
     ["idle", 1],
     ["draining", 1],
     ["unconnected", 1],
     ["pending", 2],
     ["terminating", 1],
+    ["replacing", 0],
+    ["replacement", 0],
+    ["unknown", 0],
     ["warm", 4],
   ]);
-  t.assert.deepEqual(fleetTotals([spot, onDemand]).slice(0, 3), [
+  t.assert.deepEqual(fleetTotals([spot, onDemand], census).slice(0, 3), [
     ["busy", 11],
     ["idle", 2],
     ["draining", 1],
   ]);
-  t.assert.match(html({}, <Tape f={spot} />), /9 busy, 1 idle, 1 draining, 1 no worker, 2 pending, 1 terminating, of 24 maximum/);
+  t.assert.match(html({}, <Tape f={spot} census={census} />), /9 busy, 1 idle, 1 draining, 1 no worker, 2 pending, 1 terminating, 0 replacing, 0 replacement, 0 unknown, of 24 maximum/);
 });
 
 test("fleet details show measured readiness and expected wait independently, including zero", (t) => {
@@ -329,7 +348,7 @@ test("fleet details show measured readiness and expected wait independently, inc
   if (!fleet) throw new Error("the live recording has a fleet");
   const { running, queued, candidates, needed, vcpus, memory } = fleet.demand;
   const details = (readiness?: string, expectedWait?: string) =>
-    render(<TapeKey f={{ ...fleet, demand: {
+    render(<TapeKey census={live} f={{ ...fleet, demand: {
       running, queued, candidates, needed, vcpus, memory,
       ...(readiness !== undefined ? { readiness } : {}),
       ...(expectedWait !== undefined ? { expectedWait } : {}),
@@ -471,7 +490,7 @@ test("cache chart connects recorded zero-lookup steps and shows lookup area", (t
 
 test("a page opened once renders Done/min and the full charts from the first frame", (t) => {
   const markup = html({ state: recentState(90) }, <Overview />);
-  t.assert.match(markup, /Done \/ min<\/h2><p class="readout__big"><span[^>]*>60<\/span><\/p>/);
+  t.assert.match(markup, /Done \/ min<\/h2><div class="readout__big"><span[^>]*>60<\/span><\/div>/);
   t.assert.doesNotMatch(markup, /over \d+s/);
   for (const label of ["Done per minute", "Executing", "Queued"]) {
     const svg = chart(markup, label);
@@ -545,7 +564,7 @@ test("isolated chart markers stay entirely inside their viewBox", (t: TestContex
 test("cache readout, bounded meter and bucket measurement retain their meaning", (t) => {
   const noSamples = { ...recentState(0), cache: {} };
   const pending = html({ state: noSamples }, <Overview />);
-  t.assert.match(pending, /<h2 class="label">Action cache<\/h2>(?:(?!<div class="readout">)[\s\S])*?<p class="readout__sub"><span>hit rate · [\s\S]*?<\/span><span>—<\/span><\/p>/);
+  t.assert.match(pending, /<h2 class="label">Action cache<\/h2>(?:(?!<div class="readout">)[\s\S])*?<div class="readout__sub"><span>hit rate · [\s\S]*?<\/span><span>—<\/span><\/div>/);
   t.assert.match(pending, /Bucket size not measured yet; S3 reports once a day\./);
   const state = { ...recentState(1), cache: { stores: [{ store: "CAS" as const, usedBytes: 25, budgetBytes: 100 }] } };
   const bounded = html({ state }, <Overview />);
@@ -705,4 +724,106 @@ test("launch failure and withdrawal events show their details", (t) => {
   t.assert.match(failure, /event__cause caution[^>]*>spot quota exceeded/);
   const withdrawn = render(<EventRow withCause e={{ ...common, withdrawn: { from: 4, to: 2 } }} />);
   t.assert.match(visibleText(withdrawn), /4 → 2/);
+});
+
+test("terminating hosted old member and replacement occupy two cells at desired one", (t) => {
+  const fleet = live.fleets[0];
+  const worker = live.workers[0];
+  const instance = live.instances[0];
+  if (!fleet || !worker || !instance) throw new Error("fixture has fleet, worker and instance");
+  const f = { ...fleet, desired: 1, policy: { ...fleet.policy, max: 2 }, instances: { ...fleet.instances, terminating: 1, warm: 0 } };
+  const old = { ...worker, fleet: f.name, name: "workers/old", instance: "instances/old", phase: "BUSY" as const, infrastructure: { phase: "REPLACING" as const, reason: "SPOT_REBALANCE" as const } };
+  const replacement = { ...worker, fleet: f.name, name: "workers/new", instance: "instances/new", phase: "IDLE" as const, running: 0, infrastructure: { phase: "REPLACEMENT" as const, reason: "SPOT_REBALANCE" as const } };
+  const census = { workers: [old, replacement], instances: [{ ...instance, fleet: f.name, name: old.instance, lifecycle: "TERMINATING" as const }] };
+  t.assert.deepEqual(cellStates(f, census), ["replacing", "replacement"]);
+  t.assert.equal(fleetCounts(f, census).reduce((n, [, count]) => n + count, 0), 2);
+  const tape = html({}, <Tape f={f} census={census} />);
+  t.assert.match(tape, /1 replacing, 1 replacement/);
+  t.assert.match(tape, /Desired 1/);
+  t.assert.match(tape, /--d:\s*1/);
+  t.assert.match(tape, /c-replacing/);
+  t.assert.match(tape, /c-replacement/);
+  const legend = render(<Legend />);
+  t.assert.match(legend, /c-replacing[^]*replacing/);
+  t.assert.match(legend, /c-replacement[^]*replacement/);
+});
+
+test("census groups generations, isolates fleets, and preserves unknown states", (t) => {
+  const fleet = live.fleets[0];
+  const worker = live.workers[0];
+  const instance = live.instances[0];
+  if (!fleet || !worker || !instance) throw new Error("fixture has fleet, worker and instance");
+  const f = { ...fleet, instances: { ...fleet.instances, warm: 0 } };
+  const row = { ...worker, fleet: f.name, name: "workers/a", instance: "instances/a", phase: "DRAINING" as const, running: 1 };
+  const second = { ...row, name: "workers/b", phase: "IDLE" as const, running: 0 };
+  const pending = { ...instance, fleet: f.name, name: "instances/a", lifecycle: "PENDING" as const };
+  const count = (workers: typeof live.workers, instances: typeof live.instances = []) => new Map(fleetCounts(f, { workers, instances }));
+  t.assert.equal(count([row, second], [pending]).get("busy"), 1);
+  t.assert.equal(count([row, { ...second, phase: "DRAINING" }], [pending]).get("draining"), 1);
+  const replacing = { ...row, infrastructure: { phase: "REPLACING" as const, reason: "SPOT_REBALANCE" as const } };
+  const replacement = { ...second, infrastructure: { phase: "REPLACEMENT" as const, reason: "SPOT_REBALANCE" as const } };
+  t.assert.equal(count([replacing, replacement]).get("replacing"), 1);
+  t.assert.equal(count([replacing, replacement]).get("replacement"), 0);
+  t.assert.equal(count([second]).get("replacement"), 0);
+  const future = "FUTURE" as unknown as typeof worker.phase;
+  t.assert.equal(count([{ ...row, running: 0 }, { ...second, phase: future }]).get("unknown"), 1);
+  t.assert.equal(count([{ ...row, running: 0 }, { ...second, phase: future }]).get("draining"), 0);
+  t.assert.equal(count([{ ...row, phase: future, running: 1 }]).get("busy"), 1);
+  const unattached = [{ ...row, name: "workers/x", instance: "" }, { ...row, name: "workers/y", instance: "" }];
+  t.assert.equal(count(unattached).get("draining"), 2);
+  const foreign = { ...row, fleet: "fleets/other" };
+  t.assert.equal(count([foreign], [pending]).get("pending"), 1);
+  const unknown = { ...instance, fleet: f.name, name: "instances/unknown", lifecycle: "FUTURE" as unknown as typeof instance.lifecycle };
+  t.assert.equal(count([], [unknown, unknown]).get("unknown"), 1);
+  t.assert.equal(count([], [unknown]).get("unconnected"), 0);
+  t.assert.equal(cellStates(f, { workers: [], instances: [unknown] })[0], "unknown");
+});
+
+test("worker and unconnected instance show infrastructure without changing workload phase", (t) => {
+  const worker = live.workers[0];
+  const fleet = live.fleets.find((f) => f.name === worker?.fleet);
+  const instance = live.instances[0];
+  if (!worker || !fleet || !instance) throw new Error("fixture has worker, fleet and instance");
+  const status = { phase: "REPLACING" as const, reason: "SPOT_REBALANCE" as const, otherInstance: "instances/i-new" };
+  const w = { ...worker, phase: "BUSY" as const, infrastructure: status };
+  const orphan = { ...instance, name: "instances/i-old", fleet: fleet.name, lifecycle: "IN_SERVICE" as const, infrastructure: status };
+  const f = { ...fleet, workers: { busy: 1, idle: 0, draining: 0, unconnected: 1 }, instances: { ...fleet.instances, pending: 0, terminating: 0 } };
+  const state = { ...live, fleets: [f], workers: [w], instances: [orphan] };
+  const text = visibleText(html({ state }, <Workers />));
+  t.assert.match(text, /busy/);
+  t.assert.match(text, /replacing · spot rebalance · replacement i-new/);
+  t.assert.match(text, /i-old · in service/);
+  t.assert.match(visibleText(html({ state }, <WorkerDetail w={w} state={state} />)), /replacing · spot rebalance/);
+  t.assert.doesNotMatch(text, /1 no worker/);
+});
+
+test("AWS status messages and the single Activity filter are visible", (t) => {
+  const at = "2026-01-15T10:00:00Z";
+  const event = (kind: AwsEventKind): ScalingEvent =>
+    ({ ...common, name: "awsEvents/a", aws: { event: { id: "a", at, kind } } });
+  const cases: [ScalingEvent, RegExp][] = [
+    [event({ type: "rebalanceRecommendation", instance: "instances/i-old" }), /AWS: spot rebalance recommendation for i-old/],
+    [event({ type: "spotInterruption", instance: "instances/i-old", action: "TERMINATE" }), /AWS: spot interruption notice for i-old \(2 min warning\)/],
+    [event({ type: "spotInterruption", instance: "instances/i-old", action: "STOP" }), /AWS: spot interruption notice for i-old \(stop; 2 min warning\)/],
+    [event({ type: "spotInterruption", instance: "instances/i-old", action: "HIBERNATE" }), /AWS: spot hibernation notice for i-old$/],
+    [event({ type: "spotInterruption", instance: "instances/i-old", action: "FUTURE" } as unknown as AwsEventKind), /AWS: spot interruption notice for i-old$/],
+    [event({ type: "instanceLaunched", instance: "instances/i-new" }), /AWS: i-new launched$/],
+    [event({ type: "replacementLaunched", instance: "instances/i-new" }), /AWS: replacement i-new launched/],
+    [event({ type: "replacementLaunched", instance: "instances/i-new", replacing: "instances/i-old" }), /AWS: spot rebalance: replacing i-old with i-new/],
+    [event({ type: "instanceTerminated", instance: "instances/i-old", reason: "SPOT_RECLAIMED" }), /terminated: spot reclaimed/],
+    [event({ type: "instanceTerminated", instance: "instances/i-old", reason: "REBALANCE" }), /terminated: rebalance/],
+    [event({ type: "instanceTerminated", instance: "instances/i-old", reason: "OTHER", reasonDetail: "user request" }), /terminated: user request/],
+    [event({ type: "capacityUnavailable", reason: "insufficient capacity" }), /capacity unavailable: insufficient capacity/],
+  ];
+  for (const [e, expected] of cases) t.assert.match(visibleText(render(<EventRow e={e} withCause={false} />)), expected);
+  const state = { ...live, statusEvents: [cases[0]![0]] };
+  const activity = html({ state }, <Activity />);
+  t.assert.equal((activity.match(/>AWS <span class="num">/g) ?? []).length, 1);
+  t.assert.match(visibleText(activity), /spot rebalance recommendation/);
+  t.assert.match(visibleText(html({ state }, <Overview />)), /spot rebalance recommendation/);
+});
+
+test("unknown AWS observation renders a safe generic message", (t) => {
+  const unknown = { ...common, aws: { event: { id: "a", at: common.createTime, kind: { type: "futureNotice" } } } } as unknown as ScalingEvent;
+  t.assert.match(visibleText(render(<EventRow e={unknown} withCause={false} />)), /AWS: infrastructure event/);
 });

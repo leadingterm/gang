@@ -18,9 +18,11 @@ pub const MEMORY_KB: &str = "memory_kb";
 pub const DISK_KB: &str = "disk_kb";
 /// The network. Imposes nothing on matching.
 pub const NETWORK: &str = "network";
+/// Cache identity for the action environment; does not affect fleet matching.
+pub const ACTION_ENVIRONMENT: &str = "gang_action_environment";
 
 /// Every reserved property key.
-pub const RESERVED: [&str; 8] = [
+pub const RESERVED: [&str; 9] = [
     FLEET,
     ISA,
     SANDBOX,
@@ -29,10 +31,11 @@ pub const RESERVED: [&str; 8] = [
     MEMORY_KB,
     DISK_KB,
     NETWORK,
+    ACTION_ENVIRONMENT,
 ];
 
 /// Keys that impose nothing on matching.
-pub const IGNORED: [&str; 1] = [NETWORK];
+pub const IGNORED: [&str; 2] = [NETWORK, ACTION_ENVIRONMENT];
 
 /// Returns whether `key` is one of the [`RESERVED`] keys.
 ///
@@ -73,6 +76,7 @@ mod tests {
             "memory_kb",
             "disk_kb",
             "network",
+            "gang_action_environment",
         ] {
             assert!(is_reserved(key), "{key}");
         }

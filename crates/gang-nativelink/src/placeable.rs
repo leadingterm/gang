@@ -175,8 +175,8 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::*;
-    use crate::enforcement::{MemoryTuning, MinReservation};
     use crate::fitted::FittedActions;
+    use gang_config::{DiskMinReservation, MinReservation};
 
     #[derive(Default)]
     struct Fake {
@@ -332,8 +332,8 @@ mod tests {
             fake.clone(),
             fleets.clone(),
             admitted.clone(),
-            MemoryTuning::default().min_reservation,
-            crate::enforcement::DiskTuning::default().min_reservation,
+            MinReservation::from_units(8192),
+            DiskMinReservation::from_units(2048),
         );
         for (value, expected) in [("871000", "15000"), ("12000", "12000")] {
             let _admission = admitted.insert(operation(), fleets.accepting(|_| None));
@@ -392,8 +392,8 @@ mod tests {
             fake.clone(),
             fleets.clone(),
             admitted.clone(),
-            MemoryTuning::default().min_reservation,
-            crate::enforcement::DiskTuning::default().min_reservation,
+            MinReservation::from_units(8192),
+            DiskMinReservation::from_units(2048),
         );
         let _admission = admitted.insert(operation(), fleets.accepting(|_| None));
         fitted
@@ -426,14 +426,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn learned_peak_with_headroom_clamps_to_eight_gib_and_reserves_whole_cpu() {
+        let fake = Arc::new(Fake::default());
+        let fleets = FleetCatalog::try_new(vec![FleetProperties::new(
+            &FleetName::try_new("eight-gib").expect("fleet name"),
+            Isa::X86_64,
+            &"docker",
+            Resources {
+                vcpus: 6,
+                memory: Bytes::gib(8),
+                disk: Bytes::gib(20),
+            },
+            Vec::<(&'static str, String)>::new(),
+        )])
+        .expect("catalog");
+        let admitted = AdmittedFleets::default();
+        let fitted = FittedActions::new(
+            fake.clone(),
+            fleets.clone(),
+            admitted.clone(),
+            MinReservation::from_units(8192),
+            gang_config::DiskMinReservation::from_units(2048),
+        );
+        let _admission = admitted.insert(operation(), fleets.accepting(|_| None));
+        // ceil(7 GiB in KiB * 120 / 100), as supplied by historical learning.
+        fitted
+            .add_action(operation(), info(property::MEMORY_KB, "8808039"))
+            .await
+            .expect("accepted");
+        let calls = fake.calls.lock();
+        let properties = &calls[0].platform_properties;
+        assert_eq!(properties[property::MEMORY_KB], "8388608");
+        assert_eq!(properties[property::CPU_MILLICORES], "6000");
+    }
+
+    #[tokio::test]
+    async fn stale_seventy_gib_floor_clamps_to_sixty_four_gib_and_runs() {
+        let fake = Arc::new(Fake::default());
+        let fleets = large_memory_catalog();
+        let admitted = AdmittedFleets::default();
+        let fitted = FittedActions::new(
+            fake.clone(),
+            fleets.clone(),
+            admitted.clone(),
+            MinReservation::from_units(8192),
+            gang_config::DiskMinReservation::from_units(2048),
+        );
+        let _admission = admitted.insert(operation(), fleets.accepting(|_| None));
+        fitted
+            .add_action(operation(), info(property::MEMORY_KB, "73400320"))
+            .await
+            .expect("accepted");
+        let calls = fake.calls.lock();
+        let properties = &calls[0].platform_properties;
+        assert_eq!(properties[property::MEMORY_KB], "67108864");
+        assert_eq!(properties[property::CPU_MILLICORES], "15000");
+    }
+
+    #[tokio::test]
+    async fn memory_clamp_uses_largest_fleet_eligible_for_other_properties() {
+        let fake = Arc::new(Fake::default());
+        let fleets = FleetCatalog::try_new(
+            [("large", 8, 32, 10), ("eligible", 4, 8, 30)]
+                .into_iter()
+                .map(|(name, vcpus, memory, disk)| {
+                    FleetProperties::new(
+                        &FleetName::try_new(name).expect("fleet name"),
+                        Isa::X86_64,
+                        &"docker",
+                        Resources {
+                            vcpus,
+                            memory: Bytes::gib(memory),
+                            disk: Bytes::gib(disk),
+                        },
+                        Vec::<(&'static str, String)>::new(),
+                    )
+                })
+                .collect(),
+        )
+        .expect("catalog");
+        let admitted = AdmittedFleets::default();
+        let fitted = FittedActions::new(
+            fake.clone(),
+            fleets.clone(),
+            admitted.clone(),
+            MinReservation::from_units(8192),
+            DiskMinReservation::from_units(2048),
+        );
+        let _admission = admitted.insert(operation(), fleets.accepting(|_| None));
+        let mut action = info(property::MEMORY_KB, "40000000");
+        Arc::make_mut(&mut action).platform_properties.insert(
+            property::DISK_KB.to_owned(),
+            (20_u64 * 1024 * 1024).to_string(),
+        );
+        fitted
+            .add_action(operation(), action)
+            .await
+            .expect("accepted");
+        let calls = fake.calls.lock();
+        let properties = &calls[0].platform_properties;
+        assert_eq!(properties[property::MEMORY_KB], "8388608");
+        assert_eq!(properties[property::CPU_MILLICORES], "4000");
+        assert_eq!(properties[property::DISK_KB], "20971520");
+    }
+
+    #[tokio::test]
     async fn fitted_raises_a_tiny_learned_reservation_to_the_minimum() {
         let fake = Arc::new(Fake::default());
         let fitted = FittedActions::new(
             fake.clone(),
             large_memory_catalog(),
             AdmittedFleets::default(),
-            MemoryTuning::default().min_reservation,
-            crate::enforcement::DiskTuning::default().min_reservation,
+            MinReservation::from_units(8192),
+            DiskMinReservation::from_units(2048),
         );
         fitted
             .add_action(operation(), info(property::MEMORY_KB, "252"))
@@ -441,7 +546,7 @@ mod tests {
             .expect("fitted");
         assert_eq!(
             fake.calls.lock()[0].platform_properties[property::MEMORY_KB],
-            "65536"
+            "8192"
         );
     }
 
@@ -453,7 +558,7 @@ mod tests {
             large_memory_catalog(),
             AdmittedFleets::default(),
             MinReservation::from_units(4096),
-            crate::enforcement::DiskTuning::default().min_reservation,
+            DiskMinReservation::from_units(2048),
         );
         for (value, expected) in [("252", "4096"), ("26864", "26864")] {
             fitted
@@ -478,8 +583,8 @@ mod tests {
             fake.clone(),
             large_memory_catalog(),
             AdmittedFleets::default(),
-            MemoryTuning::default().min_reservation,
-            crate::enforcement::DiskTuning::default().min_reservation,
+            MinReservation::from_units(8192),
+            DiskMinReservation::from_units(2048),
         );
         fitted
             .add_action(operation(), info(property::MEMORY_KB, "35232154"))
@@ -498,8 +603,8 @@ mod tests {
             fake.clone(),
             large_memory_catalog(),
             AdmittedFleets::default(),
-            MemoryTuning::default().min_reservation,
-            crate::enforcement::DiskTuning::default().min_reservation,
+            MinReservation::from_units(8192),
+            DiskMinReservation::from_units(2048),
         );
         fitted
             .add_action(operation(), info(property::CPU_COUNT, "1"))
@@ -519,8 +624,8 @@ mod tests {
             fake.clone(),
             large_memory_catalog(),
             AdmittedFleets::default(),
-            MemoryTuning::default().min_reservation,
-            crate::enforcement::DiskTuning::default().min_reservation,
+            MinReservation::from_units(8192),
+            DiskMinReservation::from_units(2048),
         );
         fitted
             .add_action(operation(), info(property::MEMORY_KB, "0"))
@@ -540,10 +645,10 @@ mod tests {
             fake.clone(),
             fleets,
             AdmittedFleets::default(),
-            MemoryTuning::default().min_reservation,
-            crate::enforcement::DiskTuning::default().min_reservation,
+            MinReservation::from_units(8192),
+            DiskMinReservation::from_units(2048),
         );
-        for (value, expected) in [("1627", "1048576"), ("0", "0"), ("2097152", "2097152")] {
+        for (value, expected) in [("1627", "2048"), ("0", "0"), ("2097152", "2097152")] {
             let mut action = info(property::DISK_KB, value);
             Arc::make_mut(&mut action)
                 .platform_properties
@@ -555,7 +660,7 @@ mod tests {
             let calls = fake.calls.lock();
             let properties = &calls.last().expect("recorded").platform_properties;
             assert_eq!(properties[property::DISK_KB], expected);
-            assert_eq!(properties[property::MEMORY_KB], "65536");
+            assert_eq!(properties[property::MEMORY_KB], "8192");
         }
     }
 

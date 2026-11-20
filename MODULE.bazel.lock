@@ -3151,7 +3151,7 @@
     "@@rules_tf+//tf:extensions.bzl%tf_repositories": {
       "os:linux,arch:aarch64": {
         "bzlTransitiveDigest": "rhMBZ1XsTYpPYTjjQiG1anqV1rx+OensWN4Zk1cgZHs=",
-        "usagesDigest": "NxsTPm9Hf8okxnP6tcF5MjKGrhVt8H8R/8SwGTdk3+c=",
+        "usagesDigest": "i9Yi2VJiJ57KSaIci99Pq67hN39IVgFQ41mlf6WX0YA=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
         "envVariables": {},
@@ -3175,7 +3175,7 @@
           "gang__download_tf_0_linux_arm64": {
             "repoRuleId": "@@rules_tf+//tf/toolchains/tofu:toolchain.bzl%tofu_download",
             "attributes": {
-              "version": "1.11.9",
+              "version": "1.13.9",
               "os": "linux",
               "arch": "arm64",
               "mirror": {
@@ -3222,7 +3222,7 @@
       },
       "os:linux,arch:amd64": {
         "bzlTransitiveDigest": "rhMBZ1XsTYpPYTjjQiG1anqV1rx+OensWN4Zk1cgZHs=",
-        "usagesDigest": "NxsTPm9Hf8okxnP6tcF5MjKGrhVt8H8R/8SwGTdk3+c=",
+        "usagesDigest": "i9Yi2VJiJ57KSaIci99Pq67hN39IVgFQ41mlf6WX0YA=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
         "envVariables": {},
@@ -3246,7 +3246,7 @@
           "gang__download_tf_0_linux_amd64": {
             "repoRuleId": "@@rules_tf+//tf/toolchains/tofu:toolchain.bzl%tofu_download",
             "attributes": {
-              "version": "1.11.9",
+              "version": "1.13.9",
               "os": "linux",
               "arch": "amd64",
               "mirror": {
@@ -3293,7 +3293,7 @@
       },
       "os:osx,arch:aarch64": {
         "bzlTransitiveDigest": "rhMBZ1XsTYpPYTjjQiG1anqV1rx+OensWN4Zk1cgZHs=",
-        "usagesDigest": "NxsTPm9Hf8okxnP6tcF5MjKGrhVt8H8R/8SwGTdk3+c=",
+        "usagesDigest": "i9Yi2VJiJ57KSaIci99Pq67hN39IVgFQ41mlf6WX0YA=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
         "envVariables": {},
@@ -3317,7 +3317,7 @@
           "gang__download_tf_0_darwin_arm64": {
             "repoRuleId": "@@rules_tf+//tf/toolchains/tofu:toolchain.bzl%tofu_download",
             "attributes": {
-              "version": "1.11.9",
+              "version": "1.13.9",
               "os": "darwin",
               "arch": "arm64",
               "mirror": {

@@ -126,7 +126,7 @@ pub(crate) mod tests {
     use crate::errors::MainError;
 
     /// A minimal valid local configuration: every section the schema requires, with the
-    /// local provisioner, cache, signer, scheduler, database and sandboxes, placeholder paths.
+    /// local provisioner, cache, signer, database and sandboxes, placeholder paths.
     pub(crate) const VALID_LOCAL_CONFIG: &str = r#"
 poll_interval = "500ms"
 client_action_timeout = "1m"
@@ -134,6 +134,20 @@ default_isa = "x86-64"
 listen = "127.0.0.1:9443"
 worker_listen = "127.0.0.1:9090"
 endpoint = "https://127.0.0.1:9443"
+worker_endpoint = "grpcs://127.0.0.1:9090"
+
+[actions]
+kill_grace = "7s"
+
+[actions.memory]
+reserve = "512MiB"
+
+[actions.disk]
+sample_interval = "3s"
+
+[actions.cold_start]
+memory = "2GiB"
+disk = "3GiB"
 
 [[fleets]]
 name = "local-worker-x86-64"
@@ -158,10 +172,6 @@ path = "/tmp/gang-local/cache"
 
 [signer.file]
 key_file = "/tmp/gang-local/ca.key"
-
-[scheduler.nativelink]
-worker_endpoint = "grpcs://127.0.0.1:9090"
-scheduler_name = "MAIN_SCHEDULER"
 
 [database.sqlite]
 path = "/tmp/gang-local/gang.db"

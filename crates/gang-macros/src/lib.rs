@@ -75,7 +75,7 @@ pub fn settings(
 /// - one enum per associated type of the domain's ports, named `<Name><Assoc>`, with `as_<key>`
 ///   and `into_<key>` accessors; an associated type that delegates a `#[settings]` trait, such as the limits scope's `ActionScope`, has that trait implemented through its delegate macro.
 /// - for `AnyOf` domains, a `<Name>Key` string enum made by `gang_types::string_enum!`.
-/// - for authentication and scheduler domains, the configuration enum implements the domain's settings trait (`AuthenticationSettings` for authentication domains, `SchedulerSettings` for the scheduler domain) through the delegate macro of [`macro@settings`].
+/// - for authentication domains, the configuration enum implements `AuthenticationSettings` through the delegate macro of [`macro@settings`].
 ///
 /// Finally `Plugins`, the `gang_config::PluginSet` of the composition.
 #[proc_macro]

@@ -1,9 +1,10 @@
 //! Loopback NLB model: HTTP health checks on the health port, fail-open routing, and
-//! connection termination off. Frozen processes still complete TCP handshakes, so an
-//! application response is needed to establish liveness.
+//! connection termination off. Optional PROXY v2 framing follows each selected flow's
+//! policy snapshot, including health probes. Frozen processes still complete TCP
+//! handshakes, so an application response is needed to establish liveness.
 
 use std::collections::BTreeMap;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,6 +14,7 @@ use gang_clock::Clock;
 use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use parking_lot::{Condvar, Mutex};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -21,10 +23,8 @@ use crate::errors::E2eError;
 /// The independent listeners of the controller load balancer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Frontend {
-    /// Public traffic, served by every controller.
+    /// Client cache, execution, API and dashboard traffic, served by the leader.
     Serve,
-    /// Execution traffic, served by the leader.
-    Execute,
     /// Worker traffic, served by the leader.
     Workers,
 }
@@ -33,11 +33,7 @@ impl Frontend {
     /// The controller health path checked for this frontend.
     #[must_use]
     pub fn path(self) -> &'static str {
-        let health = gang_types::health::health_check();
-        match self {
-            Self::Serve => health.serve_path(),
-            Self::Execute | Self::Workers => health.leader_path(),
-        }
+        gang_types::health::health_check().ready_path()
     }
 }
 
@@ -72,6 +68,34 @@ impl Default for Probe {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct Policy {
+    pub(crate) path: String,
+    pub(crate) interval: Duration,
+    pub(crate) timeout: Duration,
+    pub(crate) healthy_threshold: u32,
+    pub(crate) unhealthy_threshold: u32,
+    pub(crate) proxy_protocol_v2: bool,
+}
+
+struct PolicyState {
+    policy: Policy,
+    generation: u64,
+}
+
+impl Policy {
+    fn initial(frontend: Frontend, probe: Probe) -> Self {
+        Self {
+            path: frontend.path().to_owned(),
+            interval: probe.interval,
+            timeout: probe.timeout,
+            healthy_threshold: probe.threshold.get(),
+            unhealthy_threshold: probe.threshold.get(),
+            proxy_protocol_v2: false,
+        }
+    }
+}
+
 struct TargetHealth {
     health: SocketAddr,
     healthy: bool,
@@ -85,10 +109,10 @@ struct TargetHealth {
     completed: Arc<tokio::sync::Notify>,
 }
 
-#[derive(Default)]
 struct Targets {
     entries: BTreeMap<SocketAddr, Arc<Mutex<TargetHealth>>>,
     next: usize,
+    policy: PolicyState,
 }
 
 #[derive(Default)]
@@ -106,6 +130,17 @@ impl Changes {
 }
 
 impl Targets {
+    fn new(policy: Policy) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            next: 0,
+            policy: PolicyState {
+                policy,
+                generation: 0,
+            },
+        }
+    }
+
     fn choose(&mut self) -> Option<SocketAddr> {
         let healthy = self.entries.values().any(|target| target.lock().healthy);
         let candidates = || {
@@ -124,11 +159,15 @@ impl Targets {
     }
 }
 
-struct Listener {
+pub(crate) struct Listener {
     address: SocketAddr,
     targets: Arc<Mutex<Targets>>,
     accept: JoinHandle<()>,
     health: JoinHandle<()>,
+    policy_changed: Arc<tokio::sync::Notify>,
+    changes: Arc<Changes>,
+    #[cfg(test)]
+    policy_applied: Arc<tokio::sync::Notify>,
 }
 
 impl Drop for Listener {
@@ -145,13 +184,13 @@ impl Drop for Listener {
 /// health changes do not affect flows that have already selected a target.
 pub struct Balancer {
     serve: Listener,
-    execute: Listener,
     workers: Listener,
+    legacy_execution: Option<Listener>,
     changes: Arc<Changes>,
 }
 
 impl Balancer {
-    /// Binds the three listeners and starts their accept and health-check tasks.
+    /// Binds the client and worker listeners and starts their accept and health-check tasks.
     ///
     /// # Errors
     /// Returns [`E2eError::Io`] if a loopback listener cannot be bound or inspected.
@@ -165,22 +204,34 @@ impl Balancer {
                 Arc::clone(&changes),
             )
             .await?,
-            execute: Listener::start(
-                Arc::clone(&clock),
-                probe,
-                Frontend::Execute,
-                Arc::clone(&changes),
-            )
-            .await?,
             workers: Listener::start(clock, probe, Frontend::Workers, Arc::clone(&changes)).await?,
+            legacy_execution: None,
             changes,
         })
+    }
+
+    pub(crate) async fn start_release<C: Clock + 'static>(
+        clock: Arc<C>,
+        probe: Probe,
+        split_execution: bool,
+    ) -> Result<Self, E2eError> {
+        let mut balancer = Self::start(Arc::clone(&clock), probe).await?;
+        if split_execution {
+            balancer.legacy_execution = Some(
+                Listener::start(clock, probe, Frontend::Serve, Arc::clone(&balancer.changes))
+                    .await?,
+            );
+        }
+        Ok(balancer)
+    }
+
+    pub(crate) fn legacy_execution(&self) -> Option<&Listener> {
+        self.legacy_execution.as_ref()
     }
 
     fn listener(&self, frontend: Frontend) -> &Listener {
         match frontend {
             Frontend::Serve => &self.serve,
-            Frontend::Execute => &self.execute,
             Frontend::Workers => &self.workers,
         }
     }
@@ -214,8 +265,32 @@ impl Balancer {
 
     /// Registers a target as initially unhealthy; registering it again has no effect.
     pub fn register(&self, frontend: Frontend, target: Target) {
-        self.listener(frontend)
-            .targets
+        self.listener(frontend).register(target);
+    }
+
+    /// Removes a target from future health checks and connection selection.
+    pub fn deregister(&self, frontend: Frontend, address: SocketAddr) {
+        self.listener(frontend).deregister(address);
+    }
+
+    /// Returns the healthy registered targets in ascending address order.
+    #[must_use]
+    pub fn healthy(&self, frontend: Frontend) -> Vec<SocketAddr> {
+        self.listener(frontend).healthy()
+    }
+
+    pub(crate) fn set_policy(&self, frontend: Frontend, policy: Policy) {
+        self.listener(frontend).set_policy(policy);
+    }
+}
+
+impl Listener {
+    pub(crate) fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    pub(crate) fn register(&self, target: Target) {
+        self.targets
             .lock()
             .entries
             .entry(target.traffic)
@@ -236,21 +311,13 @@ impl Balancer {
         self.changes.notify();
     }
 
-    /// Removes a target from future health checks and connection selection.
-    pub fn deregister(&self, frontend: Frontend, address: SocketAddr) {
-        self.listener(frontend)
-            .targets
-            .lock()
-            .entries
-            .remove(&address);
+    pub(crate) fn deregister(&self, address: SocketAddr) {
+        self.targets.lock().entries.remove(&address);
         self.changes.notify();
     }
 
-    /// Returns the healthy registered targets in ascending address order.
-    #[must_use]
-    pub fn healthy(&self, frontend: Frontend) -> Vec<SocketAddr> {
-        self.listener(frontend)
-            .targets
+    pub(crate) fn healthy(&self) -> Vec<SocketAddr> {
+        self.targets
             .lock()
             .entries
             .iter()
@@ -258,9 +325,28 @@ impl Balancer {
             .map(|(address, _)| *address)
             .collect()
     }
-}
 
-impl Listener {
+    pub(crate) fn set_policy(&self, policy: Policy) {
+        let mut targets = self.targets.lock();
+        let generation = targets.policy.generation.wrapping_add(1);
+        for target in targets.entries.values() {
+            let mut target = target.lock();
+            target.successes = 0;
+            target.failures = 0;
+        }
+        targets.policy = PolicyState { policy, generation };
+        drop(targets);
+        self.policy_changed.notify_one();
+        self.changes.notify();
+    }
+
+    pub(crate) fn remove(&self) {
+        self.accept.abort();
+        self.health.abort();
+        self.targets.lock().entries.clear();
+        self.changes.notify();
+    }
+
     async fn start<C: Clock + 'static>(
         clock: Arc<C>,
         probe: Probe,
@@ -273,25 +359,45 @@ impl Listener {
         let address = listener
             .local_addr()
             .map_err(E2eError::io("reading balancer address"))?;
-        let targets = Arc::new(Mutex::new(Targets::default()));
+        let targets = Arc::new(Mutex::new(Targets::new(Policy::initial(frontend, probe))));
+        let policy_changed = Arc::new(tokio::sync::Notify::new());
+        #[cfg(test)]
+        let policy_applied = Arc::new(tokio::sync::Notify::new());
         let accept = tokio::spawn(accept_connections(listener, Arc::clone(&targets)));
         // Construct the first sleep before spawning so an immediate test-clock advance is observed.
         let sleep = clock.sleep(probe.interval);
         let health = tokio::spawn(check_health(
             clock,
-            probe,
-            frontend,
+            Arc::clone(&policy_changed),
+            #[cfg(test)]
+            Arc::clone(&policy_applied),
             Arc::clone(&targets),
             sleep,
-            changes,
+            Arc::clone(&changes),
         ));
         Ok(Self {
             address,
             targets,
             accept,
             health,
+            policy_changed,
+            changes,
+            #[cfg(test)]
+            policy_applied,
         })
     }
+}
+
+const PROXY_V2_HEALTH_HEADER: &[u8; 16] = b"\r\n\r\n\0\r\nQUIT\n\x20\0\0\0";
+
+pub(crate) fn proxy_v2_tcp_header(source: SocketAddrV4, destination: SocketAddrV4) -> [u8; 28] {
+    let mut header = [0; 28];
+    header[..16].copy_from_slice(b"\r\n\r\n\0\r\nQUIT\n\x21\x11\0\x0c");
+    header[16..20].copy_from_slice(&source.ip().octets());
+    header[20..24].copy_from_slice(&destination.ip().octets());
+    header[24..26].copy_from_slice(&source.port().to_be_bytes());
+    header[26..28].copy_from_slice(&destination.port().to_be_bytes());
+    header
 }
 
 async fn accept_connections(listener: TcpListener, targets: Arc<Mutex<Targets>>) {
@@ -299,11 +405,22 @@ async fn accept_connections(listener: TcpListener, targets: Arc<Mutex<Targets>>)
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let Ok((mut incoming, _)) = accepted else { break };
-                let target = targets.lock().choose();
-                if let Some(target) = target {
+                let Ok((mut incoming, source)) = accepted else { break };
+                let selected = {
+                    let mut guard = targets.lock();
+                    guard.choose().map(|target| (target, guard.policy.policy.proxy_protocol_v2))
+                };
+                if let Some((target, proxy_protocol_v2)) = selected {
                     flows.spawn(async move {
                         if let Ok(mut outgoing) = TcpStream::connect(target).await {
+                            if proxy_protocol_v2 {
+                                let Ok(destination) = incoming.local_addr() else { return };
+                                // Every frontend binds IPv4 loopback; never substitute backend addresses.
+                                let (SocketAddr::V4(source), SocketAddr::V4(destination)) = (source, destination) else { return };
+                                if outgoing.write_all(&proxy_v2_tcp_header(source, destination)).await.is_err() {
+                                    return;
+                                }
+                            }
                             let _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await;
                         }
                     });
@@ -316,32 +433,48 @@ async fn accept_connections(listener: TcpListener, targets: Arc<Mutex<Targets>>)
 
 async fn check_health<C: Clock + 'static>(
     clock: Arc<C>,
-    probe: Probe,
-    frontend: Frontend,
+    policy_changed: Arc<tokio::sync::Notify>,
+    #[cfg(test)] policy_applied: Arc<tokio::sync::Notify>,
     targets: Arc<Mutex<Targets>>,
     mut sleep: gang_clock::Sleep,
     changes: Arc<Changes>,
 ) {
     loop {
-        sleep.await;
-        // Start the next interval now, not after a slow probe finishes.
-        sleep = clock.sleep(probe.interval);
-        let snapshot: Vec<_> = targets
-            .lock()
-            .entries
-            .values()
-            .map(|target| (target.lock().health, Arc::clone(target)))
-            .collect();
+        tokio::select! {
+            () = sleep => {}
+            () = policy_changed.notified() => {
+                let interval = targets.lock().policy.policy.interval;
+                sleep = clock.sleep(interval);
+                #[cfg(test)]
+                policy_applied.notify_one();
+                continue;
+            }
+        }
+        let (policy, generation, snapshot) = {
+            let guard = targets.lock();
+            let state = &guard.policy;
+            let snapshot: Vec<_> = guard
+                .entries
+                .values()
+                .map(|target| (target.lock().health, Arc::clone(target)))
+                .collect();
+            (state.policy.clone(), state.generation, snapshot)
+        };
+        sleep = clock.sleep(policy.interval);
         let mut checks = JoinSet::new();
         for (address, target) in snapshot {
             let clock = Arc::clone(&clock);
+            let policy = policy.clone();
             checks.spawn(async move {
-                let timeout = clock.timeout(probe.timeout, async {
-                    let Ok(stream) = TcpStream::connect(address).await else { return false };
+                let timeout = clock.timeout(policy.timeout, async {
+                    let Ok(mut stream) = TcpStream::connect(address).await else { return false };
+                    if policy.proxy_protocol_v2 && stream.write_all(PROXY_V2_HEALTH_HEADER).await.is_err() {
+                        return false;
+                    }
                     let Ok((mut sender, connection)) = hyper::client::conn::http1::handshake::<_, Body>(TokioIo::new(stream)).await else { return false };
                     let mut connections = JoinSet::new();
                     connections.spawn(connection);
-                    let Ok(request) = Request::get(frontend.path())
+                    let Ok(request) = Request::get(policy.path.as_str())
                         .header(hyper::header::HOST, address.to_string())
                         .body(Body::empty()) else { return false };
                     #[cfg(test)]
@@ -362,6 +495,9 @@ async fn check_health<C: Clock + 'static>(
         }
         // Serialize publication with routing, so its candidate set cannot change mid-selection.
         let guard = targets.lock();
+        if guard.policy.generation != generation {
+            continue;
+        }
         let mut transitioned = false;
         for (target, success) in results {
             let mut target = target.lock();
@@ -369,13 +505,13 @@ async fn check_health<C: Clock + 'static>(
             if success {
                 target.failures = 0;
                 target.successes = target.successes.saturating_add(1);
-                if target.successes >= probe.threshold.get() {
+                if target.successes >= policy.healthy_threshold {
                     target.healthy = true;
                 }
             } else {
                 target.successes = 0;
                 target.failures = target.failures.saturating_add(1);
-                if target.failures >= probe.threshold.get() {
+                if target.failures >= policy.unhealthy_threshold {
                     target.healthy = false;
                 }
             }
@@ -462,11 +598,7 @@ mod tests {
             let status = Arc::new(AtomicU16::new(status.as_u16()));
             let app = Router::new()
                 .route(
-                    gang_types::health::health_check().serve_path(),
-                    get(Self::respond),
-                )
-                .route(
-                    gang_types::health::health_check().leader_path(),
+                    gang_types::health::health_check().ready_path(),
                     get(Self::respond),
                 )
                 .with_state(Arc::clone(&status));
@@ -535,11 +667,138 @@ mod tests {
     }
 
     #[test]
+    fn proxy_v2_tcp_frame_encodes_original_addresses_and_network_order_ports() {
+        let source = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 17), 0x1234);
+        let destination = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 29), 0xabcd);
+        assert_eq!(
+            &proxy_v2_tcp_header(source, destination),
+            b"\r\n\r\n\0\r\nQUIT\n\x21\x11\0\x0c\xc0\0\x02\x11\xc6\x33\x64\x1d\x12\x34\xab\xcd"
+        );
+    }
+
+    async fn expect_bytes(stream: &mut TcpStream, expected: &[u8]) -> TestResult {
+        let mut actual = vec![0; expected.len()];
+        stream.read_exact(&mut actual).await?;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn proxy_policy_changes_only_new_flows_and_preserves_deregistered_flows() -> TestResult {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let balancer =
+                Balancer::start(Arc::new(TestClock::default()), Probe::default()).await?;
+            let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+            let address = backend.local_addr()?;
+            let frontend = balancer.address(Frontend::Workers);
+            balancer.register(
+                Frontend::Workers,
+                Target {
+                    traffic: address,
+                    health: address,
+                },
+            );
+            let mut direct = TcpStream::connect(frontend).await?;
+            let (mut direct_backend, _) = backend.accept().await?;
+            direct.write_all(b"direct").await?;
+            expect_bytes(&mut direct_backend, b"direct").await?;
+
+            let mut policy = Policy::initial(Frontend::Workers, Probe::default());
+            policy.proxy_protocol_v2 = true;
+            balancer.set_policy(Frontend::Workers, policy.clone());
+            let mut framed = TcpStream::connect(frontend).await?;
+            let (mut framed_backend, _) = backend.accept().await?;
+            framed.write_all(b"framed").await?;
+            let mut header = [0; 28];
+            framed_backend.read_exact(&mut header).await?;
+            assert_eq!(&header[..16], b"\r\n\r\n\0\r\nQUIT\n\x21\x11\0\x0c");
+            assert_eq!(&header[16..20], &[127, 0, 0, 1]);
+            assert_eq!(&header[20..24], &[127, 0, 0, 1]);
+            assert_eq!(&header[24..26], &framed.local_addr()?.port().to_be_bytes());
+            assert_eq!(&header[26..28], &frontend.port().to_be_bytes());
+            expect_bytes(&mut framed_backend, b"framed").await?;
+            framed_backend.write_all(b"reply").await?;
+            expect_bytes(&mut framed, b"reply").await?;
+            direct.write_all(b"still-direct").await?;
+            expect_bytes(&mut direct_backend, b"still-direct").await?;
+
+            policy.proxy_protocol_v2 = false;
+            balancer.set_policy(Frontend::Workers, policy);
+            let mut replacement = TcpStream::connect(frontend).await?;
+            let (mut replacement_backend, _) = backend.accept().await?;
+            replacement.write_all(b"raw-again").await?;
+            expect_bytes(&mut replacement_backend, b"raw-again").await?;
+            framed.write_all(b"still-framed").await?;
+            expect_bytes(&mut framed_backend, b"still-framed").await?;
+
+            balancer.deregister(Frontend::Workers, address);
+            direct.write_all(b"draining-direct").await?;
+            expect_bytes(&mut direct_backend, b"draining-direct").await?;
+            framed.write_all(b"draining-framed").await?;
+            expect_bytes(&mut framed_backend, b"draining-framed").await?;
+            balancer.listener(Frontend::Workers).remove();
+            let mut byte = [0];
+            assert_eq!(direct.read(&mut byte).await?, 0);
+            assert_eq!(framed.read(&mut byte).await?, 0);
+            Ok(())
+        })
+        .await?
+    }
+
+    #[tokio::test]
+    async fn health_policy_frames_http_only_when_enabled() -> TestResult {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for proxy_protocol_v2 in [false, true] {
+                let clock = Arc::new(TestClock::default());
+                let balancer = Balancer::start(Arc::clone(&clock), Probe::default()).await?;
+                let health = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+                let address = health.local_addr()?;
+                let signal = register(&balancer, Frontend::Serve, address, address);
+                let mut policy = Policy::initial(Frontend::Serve, Probe::default());
+                policy.path = "/fixture-ready".into();
+                policy.healthy_threshold = 1;
+                policy.proxy_protocol_v2 = proxy_protocol_v2;
+                balancer.set_policy(Frontend::Serve, policy);
+                balancer
+                    .listener(Frontend::Serve)
+                    .policy_applied
+                    .notified()
+                    .await;
+                clock.advance(Probe::default().interval);
+                let (mut stream, _) = health.accept().await?;
+                if proxy_protocol_v2 {
+                    // The health parser accepts LOCAL v2, with no claimed client address.
+                    expect_bytes(&mut stream, b"\r\n\r\n\0\r\nQUIT\n\x20\0\0\0").await?;
+                }
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).await?;
+                    request.push(byte[0]);
+                }
+                let request = std::str::from_utf8(&request)?;
+                assert!(request.starts_with("GET /fixture-ready HTTP/1.1\r\n"));
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains(&format!("\r\nhost: {address}\r\n"))
+                );
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await?;
+                signal.2.notified().await;
+                assert_eq!(balancer.healthy(Frontend::Serve), vec![address]);
+            }
+            Ok(())
+        })
+        .await?
+    }
+
+    #[test]
     fn frontend_paths_follow_deployment_health_check() {
         let health = gang_types::health::health_check();
-        assert_eq!(Frontend::Serve.path(), health.serve_path());
-        assert_eq!(Frontend::Execute.path(), health.leader_path());
-        assert_eq!(Frontend::Workers.path(), health.leader_path());
+        assert_eq!(Frontend::Serve.path(), health.ready_path());
+        assert_eq!(Frontend::Workers.path(), health.ready_path());
     }
 
     #[tokio::test]
@@ -548,7 +807,7 @@ mod tests {
         let address = SocketAddr::from(([127, 0, 0, 1], 12345));
         let revision = balancer.revision();
         balancer.register(
-            Frontend::Execute,
+            Frontend::Serve,
             Target {
                 traffic: address,
                 health: address,
@@ -622,20 +881,20 @@ mod tests {
         let live = HttpTarget::start(StatusCode::OK).await?;
         let first_signal = register(
             &balancer,
-            Frontend::Execute,
+            Frontend::Serve,
             first.address,
             frozen.local_addr()?,
         );
-        let mut established = TcpStream::connect(balancer.address(Frontend::Execute)).await?;
+        let mut established = TcpStream::connect(balancer.address(Frontend::Serve)).await?;
         assert_eq!(exchange(&mut established, 1).await?, 1);
-        let second_signal = register(&balancer, Frontend::Execute, second.address, live.address);
+        let second_signal = register(&balancer, Frontend::Serve, second.address, live.address);
         let targets = [first_signal, second_signal];
         for _ in 0..Probe::default().threshold.get() {
             round(&clock, &targets, true).await;
         }
-        assert_eq!(balancer.healthy(Frontend::Execute), vec![second.address]);
+        assert_eq!(balancer.healthy(Frontend::Serve), vec![second.address]);
         for _ in 0..4 {
-            assert_eq!(request(&balancer, Frontend::Execute).await?, 2);
+            assert_eq!(request(&balancer, Frontend::Serve).await?, 2);
         }
         assert_eq!(exchange(&mut established, 2).await?, 1);
         Ok(())
@@ -659,6 +918,158 @@ mod tests {
         let mut rejected = TcpStream::connect(balancer.address(Frontend::Workers)).await?;
         let mut byte = [0];
         assert_eq!(rejected.read(&mut byte).await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn controller_deregistration_preserves_all_frontend_flows() -> TestResult {
+        let balancer =
+            Balancer::start_release(Arc::new(TestClock::default()), Probe::default(), true).await?;
+        let old = Echo::start(1).await?;
+        let new = Echo::start(2).await?;
+        let frontends = [Frontend::Serve, Frontend::Workers];
+        let mut flows = Vec::new();
+        for frontend in frontends {
+            balancer.register(
+                frontend,
+                Target {
+                    traffic: old.address,
+                    health: old.address,
+                },
+            );
+            let mut flow = TcpStream::connect(balancer.address(frontend)).await?;
+            assert_eq!(exchange(&mut flow, 1).await?, 1);
+            flows.push(flow);
+            balancer.register(
+                frontend,
+                Target {
+                    traffic: new.address,
+                    health: new.address,
+                },
+            );
+        }
+        let legacy = balancer
+            .legacy_execution()
+            .ok_or("missing legacy listener")?;
+        legacy.register(Target {
+            traffic: old.address,
+            health: old.address,
+        });
+        let mut legacy_flow = TcpStream::connect(legacy.address()).await?;
+        assert_eq!(exchange(&mut legacy_flow, 1).await?, 1);
+        legacy.register(Target {
+            traffic: new.address,
+            health: new.address,
+        });
+        for frontend in frontends {
+            balancer.deregister(frontend, old.address);
+        }
+        legacy.deregister(old.address);
+        for (frontend, mut flow) in frontends.into_iter().zip(flows) {
+            assert_eq!(exchange(&mut flow, 2).await?, 1);
+            assert_eq!(request(&balancer, frontend).await?, 2);
+        }
+        assert_eq!(exchange(&mut legacy_flow, 2).await?, 1);
+        let mut replacement = TcpStream::connect(legacy.address()).await?;
+        assert_eq!(exchange(&mut replacement, 3).await?, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_listener_removal_closes_existing_flows() -> TestResult {
+        let balancer =
+            Balancer::start_release(Arc::new(TestClock::default()), Probe::default(), true).await?;
+        let echo = Echo::start(9).await?;
+        let legacy = balancer
+            .legacy_execution()
+            .ok_or("missing legacy listener")?;
+        legacy.register(Target {
+            traffic: echo.address,
+            health: echo.address,
+        });
+        let mut stream = TcpStream::connect(legacy.address()).await?;
+        assert_eq!(exchange(&mut stream, 1).await?, 9);
+        legacy.remove();
+        let mut byte = [0];
+        assert_eq!(stream.read(&mut byte).await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn policy_change_applies_to_all_targets_without_closing_flows() -> TestResult {
+        let clock = Arc::new(TestClock::default());
+        let balancer = Balancer::start(Arc::clone(&clock), Probe::default()).await?;
+        let old = Echo::start(1).await?;
+        let new = Echo::start(2).await?;
+        let health = HttpTarget::start(StatusCode::OK).await?;
+        let old_signal = register(&balancer, Frontend::Serve, old.address, health.address);
+        let mut flow = TcpStream::connect(balancer.address(Frontend::Serve)).await?;
+        assert_eq!(exchange(&mut flow, 1).await?, 1);
+        for _ in 0..Probe::default().threshold.get() {
+            round(&clock, std::slice::from_ref(&old_signal), false).await;
+        }
+        let new_signal = register(&balancer, Frontend::Serve, new.address, health.address);
+        balancer.set_policy(
+            Frontend::Serve,
+            Policy {
+                path: "/not-present".into(),
+                interval: Probe::default().interval,
+                timeout: Probe::default().timeout,
+                healthy_threshold: 1,
+                unhealthy_threshold: 2,
+                proxy_protocol_v2: false,
+            },
+        );
+        balancer
+            .listener(Frontend::Serve)
+            .policy_applied
+            .notified()
+            .await;
+        assert_eq!(balancer.healthy(Frontend::Serve), vec![old.address]);
+        let signals = [old_signal, new_signal];
+        round(&clock, &signals, false).await;
+        assert_eq!(balancer.healthy(Frontend::Serve), vec![old.address]);
+        round(&clock, &signals, false).await;
+        assert!(balancer.healthy(Frontend::Serve).is_empty());
+        assert_eq!(exchange(&mut flow, 2).await?, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_probe_does_not_apply_after_policy_change() -> TestResult {
+        let clock = Arc::new(TestClock::default());
+        let balancer = Balancer::start(Arc::clone(&clock), Probe::default()).await?;
+        let frozen = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let address = frozen.local_addr()?;
+        let signal = register(&balancer, Frontend::Serve, address, address);
+        clock.advance(Probe::default().interval);
+        signal.0.notified().await;
+        balancer.set_policy(
+            Frontend::Serve,
+            Policy {
+                path: "/new".into(),
+                interval: Probe::default().interval,
+                timeout: Probe::default().timeout,
+                healthy_threshold: 1,
+                unhealthy_threshold: 1,
+                proxy_protocol_v2: false,
+            },
+        );
+        clock.advance(Probe::default().timeout);
+        signal.1.notified().await;
+        balancer
+            .listener(Frontend::Serve)
+            .policy_applied
+            .notified()
+            .await;
+        let targets = balancer.listener(Frontend::Serve).targets.lock();
+        let target = targets
+            .entries
+            .get(&address)
+            .expect("registered target")
+            .lock();
+        assert_eq!(target.failures, 0);
+        assert!(!target.healthy);
         Ok(())
     }
 

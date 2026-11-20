@@ -10,13 +10,14 @@ use std::process::{Command, ExitCode, Stdio};
 use gang_config::{PluginSet, SandboxFile};
 use gang_spi::{
     ActionCommand, ActionExecutionSpec, ActionIsolationPort, ActionLimitsPort, GUARD_LINK_NAME,
-    PluginContext, PortError,
+    PluginContext, PortError, SIDE_CHANNEL_FILE_ENV,
 };
 
 use crate::action_directory::ActionDirectory;
 use crate::errors::ExecError;
 use crate::execute::{Action, execute, exit_status};
 use crate::properties::ActionProperties;
+use crate::side_channel;
 use crate::terminations;
 
 /// The process `gang exec` was started with: what it runs and where.
@@ -26,7 +27,7 @@ pub struct Invocation<'a> {
     pub entrypoint: &'a Path,
     /// The command and its arguments; the first is the program.
     pub argv: &'a [OsString],
-    /// The environment the process was started with. The action runs with it unchanged.
+    /// The environment the process was started with; the side-channel path is withheld.
     pub environment: &'a [(OsString, OsString)],
     /// The working directory the process was started in.
     pub working_directory: &'a Path,
@@ -106,8 +107,8 @@ where
 /// action's signalled process groups. An action in its own process group leaves `gang exec` in the
 /// original group, where it receives each termination and relays it.
 ///
-/// Nothing the worker controls is read from the environment, because the action can override
-/// the environment it is given.
+/// The side-channel path is withheld from the sandbox and validated against the protected
+/// per-action directory beneath the canonical work root before creating a new report.
 ///
 /// # Errors
 ///
@@ -169,10 +170,17 @@ where
         start_guardian()?;
     }
 
+    let environment: Vec<_> = invocation
+        .environment
+        .iter()
+        .filter(|(name, _)| name != SIDE_CHANNEL_FILE_ENV)
+        .cloned()
+        .collect();
+
     let action = Action {
         spec: ActionExecutionSpec {
             command,
-            environment: invocation.environment,
+            environment: &environment,
             action_directory: &directory.path,
             working_directory: &directory.working_directory,
             network: properties.network,
@@ -184,7 +192,7 @@ where
         .enable_all()
         .build()
         .map_err(ExecError::Runtime)?;
-    let outcome = runtime.block_on(async {
+    let execution = runtime.block_on(async {
         let mut terminations = terminations::listen().map_err(ExecError::Signals)?;
         execute(
             &sandbox,
@@ -192,11 +200,13 @@ where
             file.execution.input_links,
             &action,
             &mut terminations,
+            |cgroup| side_channel::publish_cgroup(invocation.environment, &directory.path, cgroup),
             leave_action_group,
         )
         .await
     })?;
-    Ok(ExitCode::from(exit_status(outcome)))
+    side_channel::report(invocation.environment, &directory.path, execution.usage);
+    Ok(ExitCode::from(exit_status(execution.outcome)))
 }
 
 /// Reads and parses the sandbox file at `path`.

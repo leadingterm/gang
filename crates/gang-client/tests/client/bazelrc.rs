@@ -34,9 +34,11 @@ async fn renders_the_executor_cache_and_helper_with_the_server_ca() {
              build --remote_retry_max_delay=5s\n\
              build --grpc_keepalive_time=10s\n\
              build --grpc_keepalive_timeout=30s\n\
+             build --remote_download_outputs=toplevel\n\
              # The gang that Bazel runs for credentials; run `gang bazelrc` again if it moves.\n\
              build --credential_helper={host}={HELPER}\n\
              build --remote_default_exec_properties=ISA=x86-64\n\
+             build --remote_default_exec_properties=gang_action_environment=identity-roots-v1\n\
              build --tls_certificate=gang-ca.pem\n"
         )
     );
@@ -91,13 +93,18 @@ async fn non_http_server_url_is_unsupported_without_a_request() {
 #[tokio::test]
 async fn server_error_status_is_a_server_error() {
     let harness = Harness::start_plain(ConsoleMode::Silent, google()).await;
-    harness
-        .server
-        .force_response(503, b"maintenance window".to_vec());
+    harness.server.force_response_with_headers(
+        503,
+        &[("retry-after", "20")],
+        b"maintenance window".to_vec(),
+    );
     let server = harness.server.url();
 
     let error = harness
-        .client()
+        .client_with(gang_client::ClientOptions {
+            api_retry_budget: gang_types::NonZeroDuration::from_secs(1),
+            ..gang_client::ClientOptions::default()
+        })
         .bazelrc(&BazelrcRequest {
             server: &server,
             ca_pin: None,

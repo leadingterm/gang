@@ -29,6 +29,7 @@
 
 mod authentication_port;
 mod cache_port;
+mod candidate_priority;
 mod counter;
 mod credential_port;
 mod errors;
@@ -37,6 +38,7 @@ mod fence;
 mod fleet_options;
 mod host_port;
 mod identity_port;
+mod infrastructure;
 mod isolation_port;
 mod lease_port;
 mod lifecycle_port;
@@ -58,29 +60,39 @@ pub use authentication_port::{
     IssuedCertificate, IssuedToken, Peer, Scheme, TokenIssue,
 };
 pub use cache_port::{CacheStorePort, MeasuredUsage, RenderedStoreSpec};
+pub use candidate_priority::{CandidatePriority, CandidatePriorityRef};
 pub use credential_port::WorkloadCredentialPort;
-pub use errors::{BoxedError, BuildError, PortError, Rejection, Subject};
+pub use errors::{BoxedError, BuildError, CandidatePriorityError, PortError, Rejection, Subject};
 pub use expiring_port::{
-    ExpiringRecordPort, Insert, Record, RecordId, RecordKey, RecordKind, RecordVersion, Remove,
-    Replace,
+    ApplyRecords, ExpiringRecordPort, Insert, MAX_RECORD_BODY_BYTES,
+    MAX_RECORD_BODY_BYTES_PER_BATCH, MAX_RECORD_CHANGES, Record, RecordBatchError, RecordBatchSeq,
+    RecordChange, RecordId, RecordKey, RecordKind, RecordVersion, Remove, Replace,
+    validate_record_changes,
 };
 pub use fence::{Deadline, Fence, Held, Keeper, LeaseLapsed, RunError, Work};
 pub use fleet_options::{FleetOptions, OptionSpec};
 pub use gang_macros::{FleetOptions, PortFailure, compose, port};
-pub use host_port::{ControllerHostPort, HostMilestone};
+pub use host_port::{ControllerHostIdentity, ControllerHostPort, HostMilestone};
 pub use identity_port::{
     LoginChallenge, LoginClient, LoginGrant, LoginPort, LoginRequest, LoginSupport,
     ProofVerifierPort,
+};
+pub use infrastructure::{
+    FleetInfrastructureEvent, InfrastructureEvent, InfrastructureEventKind,
+    InfrastructureInterruptionAction, InfrastructureTerminationReason,
 };
 pub use isolation_port::{
     ActionCommand, ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort,
     EXEC_LINK_NAME, NETWORK_ENV, NetworkRequest, RESET_LINK_NAME, SandboxedAction, Termination,
 };
-pub use lease_port::{Acquisition, ControllerId, LeaderLeasePort, Lease, LeaseEpoch, Renewal};
+pub use lease_port::{
+    Acquisition, CandidateGeneration, ControllerId, LeaderLeasePort, Lease, LeaseCandidate,
+    LeaseEpoch, Renewal, Takeover,
+};
 pub use lifecycle_port::{InstanceIdentity, NodeLifecyclePort, PreemptionNotice};
 pub use limits_port::{
-    ActionLimits, ActionLimitsPort, ActionScope, ActionUsage, CPU_COUNT_ENV, GUARD_LINK_NAME,
-    JOIN_LINK_NAME, MEMORY_KB_ENV,
+    ActionLimits, ActionLimitsPort, ActionMemoryPool, ActionScope, ActionUsage, CPU_COUNT_ENV,
+    GUARD_LINK_NAME, JOIN_LINK_NAME, MEMORY_KB_ENV, SIDE_CHANNEL_FILE_ENV,
 };
 pub use observation_port::{
     Call, CallOutcome, Delivery, Executed, ExecutionTimes, Observation, ObservationSink,
@@ -99,10 +111,10 @@ pub use repository_port::{
 pub use scheduler_port::{
     Accepted, ActionInfo, ActionsView, Admitted, ApiRequestBody, ApiResponseBody, ApiService,
     BoxedConnection, ClientTls, Connection, ControllerConnections, ControllerEndpoints,
-    ControllerReady, ControllerSpec, EngineStore, ExecutingDemand, Listening, ListingLimits,
-    QueuedActionView, QueuedDemand, RequestGate, RunningActionView, SchedulerPort,
-    SchedulerSnapshot, Slots, StoreAccess, StoreKind, WorkerSpec, WorkerState, WorkerTls,
-    full_body,
+    ControllerReady, ControllerSpec, EngineStore, ExecutingDemand, GateDecision, LeaderUnavailable,
+    LearnedHistory, Listening, ListingLimits, QueuedActionView, QueuedDemand, RequestGate,
+    RequestScope, RunningActionView, SchedulerPort, SchedulerSnapshot, Slots, StoreAccess,
+    StoreKind, WorkerSpec, WorkerState, WorkerTls, full_body,
 };
 pub use schema::{SchemaPlan, SchemaTooNew, SchemaVersion};
 pub use scratch_port::{MountedScratchVolume, ScratchVolumePort};

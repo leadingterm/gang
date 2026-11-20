@@ -1,19 +1,15 @@
-//! Validated process open-file limit for `NativeLink`.
+//! Validated process open-file limit for Gang.
 
 use serde::{Deserialize, Serialize};
 
-/// Keeps a margin above the zero-permit range: `NativeLink` reserves 20% and rounds,
-/// leaving its file semaphore with no permits below five.
+/// Minimum limit, leaving a margin above the zero-permit range after reservation and rounding.
 const MIN_OPEN_FILES: usize = 8;
 /// Maximum supported process open-file limit.
 const MAX_OPEN_FILES: usize = 1 << 30;
-/// `NativeLink`'s own default process open-file limit.
+/// Default process open-file limit.
 const DEFAULT_OPEN_FILES: usize = 24_576;
 
-/// An open-file limit that leaves permits for `NativeLink`'s file semaphore.
-///
-/// `NativeLink` reserves 20% of the limit; at least eight provides a margin above
-/// the point where rounding leaves its semaphore with no permits.
+/// An open-file limit that leaves permits after the file semaphore's reservation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "usize", into = "usize")]
 pub struct OpenFileLimit(usize);
@@ -59,5 +55,19 @@ impl TryFrom<usize> for OpenFileLimit {
 impl From<OpenFileLimit> for usize {
     fn from(value: OpenFileLimit) -> Self {
         value.get()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OpenFileLimit;
+
+    #[test]
+    fn validates_inclusive_bounds() {
+        assert!(OpenFileLimit::try_from(7).is_err());
+        assert_eq!(OpenFileLimit::try_from(8).unwrap().get(), 8);
+        assert_eq!(OpenFileLimit::try_from(1 << 30).unwrap().get(), 1 << 30);
+        assert!(OpenFileLimit::try_from((1 << 30) + 1).is_err());
+        assert_eq!(OpenFileLimit::default().get(), 24_576);
     }
 }

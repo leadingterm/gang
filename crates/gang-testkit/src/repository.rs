@@ -14,6 +14,7 @@
 //! - `revoked` lists records by revocation time and then serial, and `certificates_of` lists
 //!   active records by issue time and then serial.
 //! - The principal registry is keyed by identity, so it lists principals in identity order.
+//! - Persistent controller hosts keep their first registration priority across process restarts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
@@ -22,13 +23,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use gang_clock::Timestamp;
 use gang_spi::{
-    Acquisition, CertStatus, ControllerId, ExpiringRecordPort, Insert, IssuedCertRecord,
-    LeaderLeasePort, Lease, LeaseEpoch, PortError, PrincipalRecord, Record, RecordKey,
-    RecordVersion, RecordedScalingEvent, Remove, Renewal, Replace, RevocationEpoch,
-    ScalingAuditEvent, ScalingEventSeq, StateRepositoryPort, Subject,
+    Acquisition, ApplyRecords, CandidateGeneration, CandidatePriority, CertStatus,
+    ControllerHostIdentity, ControllerId, ExpiringRecordPort, Insert, IssuedCertRecord,
+    LeaderLeasePort, Lease, LeaseCandidate, LeaseEpoch, PortError, PrincipalRecord, Record,
+    RecordBatchSeq, RecordChange, RecordId, RecordKey, RecordKind, RecordVersion,
+    RecordedScalingEvent, Remove, Renewal, Replace, RevocationEpoch, ScalingAuditEvent,
+    ScalingEventSeq, StateRepositoryPort, Subject, Takeover, validate_record_changes,
 };
-use gang_types::{CertSerial, Identity};
+use gang_types::{CertSerial, Identity, InstanceId};
 use parking_lot::Mutex;
+use tokio::sync::oneshot;
 
 /// A write or read that [`FakeRepository`] can be told to fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -51,7 +55,10 @@ struct State {
     principals: BTreeMap<Identity, PrincipalRecord>,
     revocation_epoch: RevocationEpoch,
     lease: Option<LeaseRow>,
+    candidate_counter: u64,
+    controller_hosts: BTreeMap<InstanceId, CandidateGeneration>,
     records: BTreeMap<RecordKey, Record>,
+    record_apply_hold: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
     failures: BTreeSet<Failure>,
     fail_revoke_serial: Option<CertSerial>,
     forget_certificates: bool,
@@ -65,6 +72,10 @@ struct LeaseRow {
     holder: Option<ControllerId>,
     epoch: LeaseEpoch,
     expires_at: Timestamp,
+    record_sequence: u64,
+    holder_priority: Option<CandidatePriority>,
+    holder_priority_epoch: LeaseEpoch,
+    request: Option<(LeaseCandidate, LeaseEpoch, Timestamp)>,
 }
 
 impl State {
@@ -91,6 +102,17 @@ pub struct FakeRepository {
 }
 
 impl FakeRepository {
+    /// Holds the next successfully committed record batch before its response is returned.
+    /// The first receiver signals that the batch committed; send or drop the second value to
+    /// release the response. Cancelling the call while held does not undo its commit.
+    #[must_use]
+    pub fn hold_next_record_apply(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered, committed) = oneshot::channel();
+        let (release, hold) = oneshot::channel();
+        self.state.lock().record_apply_hold = Some((entered, hold));
+        (committed, release)
+    }
+
     /// Pauses a successful restore after its durable mutation until `gate` is notified.
     pub fn gate_restore(&self, gate: Arc<tokio::sync::Notify>) {
         *self.restore_gate.lock() = Some(gate);
@@ -520,48 +542,121 @@ impl StateRepositoryPort for FakeRepository {
 }
 
 impl LeaderLeasePort for FakeRepository {
-    async fn acquire(
+    async fn register_candidate(
         &self,
         holder: &ControllerId,
+        host: &ControllerHostIdentity,
+    ) -> Result<LeaseCandidate, PortError> {
+        let mut state = self.state.lock();
+        if state.fails(Failure::Lease) {
+            return Err(PortError::unavailable("controller lease is unavailable"));
+        }
+        let priority = match host {
+            ControllerHostIdentity::Persistent(instance) => {
+                let generation = if let Some(generation) = state.controller_hosts.get(instance) {
+                    *generation
+                } else {
+                    state.candidate_counter = state
+                        .candidate_counter
+                        .checked_add(1)
+                        .ok_or_else(|| PortError::backend("candidate generation overflow"))?;
+                    let generation = CandidateGeneration::new(state.candidate_counter);
+                    state.controller_hosts.insert(instance.clone(), generation);
+                    generation
+                };
+                CandidatePriority::registered(generation)
+            }
+            ControllerHostIdentity::Launched { at, instance } => {
+                CandidatePriority::launched(*at, instance)
+            }
+        };
+        Ok(LeaseCandidate {
+            holder: holder.clone(),
+            priority,
+        })
+    }
+
+    async fn acquire(
+        &self,
+        candidate: &LeaseCandidate,
+        now: Timestamp,
         stale_before: Timestamp,
         expires_at: Timestamp,
+        takeover: Takeover,
     ) -> Result<Acquisition, PortError> {
         let mut state = self.state.lock();
         if state.fails(Failure::Lease) {
             return Err(PortError::unavailable("controller lease is unavailable"));
         }
-        if let Some(row) = &state.lease
-            && let Some(current) = &row.holder
-            && row.expires_at >= stale_before
-        {
-            return Ok(Acquisition::Held(Lease {
-                holder: current.clone(),
-                epoch: row.epoch,
-                expires_at: row.expires_at,
-            }));
+        if let Some(row) = state.lease.as_mut() {
+            let effective = row
+                .holder_priority
+                .as_ref()
+                .filter(|_| row.holder_priority_epoch == row.epoch);
+            let live_request = row
+                .request
+                .as_ref()
+                .filter(|(_, epoch, expiry)| *epoch == row.epoch && *expiry > now);
+            if let Some(holder) = row.holder.as_ref()
+                && row.expires_at >= stale_before
+            {
+                let eligible = candidate.holder != *holder
+                    && effective.is_none_or(|priority| candidate.priority > *priority);
+                let held = Lease {
+                    holder: holder.clone(),
+                    epoch: row.epoch,
+                    expires_at: row.expires_at,
+                };
+                if eligible
+                    && takeover == Takeover::Request
+                    && live_request.is_none_or(|(pending, _, _)| {
+                        pending == candidate || candidate.priority > pending.priority
+                    })
+                {
+                    row.request = Some((candidate.clone(), row.epoch, expires_at));
+                }
+                return Ok(if eligible && row.expires_at > now {
+                    Acquisition::Contending(held)
+                } else {
+                    Acquisition::Held(held)
+                });
+            }
+            if let Some((pending, _, _)) = live_request
+                && pending != candidate
+                && !(takeover == Takeover::Request && candidate.priority > pending.priority)
+            {
+                return Ok(Acquisition::Reserved);
+            }
         }
-        let epoch = match &state.lease {
-            Some(row) => row
-                .epoch
-                .get()
-                .checked_add(1)
-                .ok_or_else(|| PortError::backend("controller lease epoch overflow"))?,
-            None => 1,
-        };
+        let epoch = state
+            .lease
+            .as_ref()
+            .map_or(0, |row| row.epoch.get())
+            .checked_add(1)
+            .ok_or_else(|| PortError::backend("controller lease epoch overflow"))?;
         let lease = Lease {
-            holder: holder.clone(),
+            holder: candidate.holder.clone(),
             epoch: LeaseEpoch::new(epoch),
             expires_at,
         };
         state.lease = Some(LeaseRow {
-            holder: Some(holder.clone()),
+            holder: Some(candidate.holder.clone()),
             epoch: lease.epoch,
             expires_at,
+            record_sequence: 0,
+            holder_priority: Some(candidate.priority.clone()),
+            holder_priority_epoch: lease.epoch,
+            request: None,
         });
         Ok(Acquisition::Acquired(lease))
     }
 
-    async fn renew(&self, lease: &Lease, expires_at: Timestamp) -> Result<Renewal, PortError> {
+    async fn renew(
+        &self,
+        lease: &Lease,
+        now: Timestamp,
+        expires_at: Timestamp,
+    ) -> Result<Renewal, PortError> {
         let mut state = self.state.lock();
         if state.fails(Failure::Lease) {
             return Err(PortError::unavailable("controller lease is unavailable"));
@@ -569,11 +664,29 @@ impl LeaderLeasePort for FakeRepository {
         match state.lease.as_mut() {
             Some(row) if row.holder.as_ref() == Some(&lease.holder) && row.epoch == lease.epoch => {
                 row.expires_at = expires_at;
-                Ok(Renewal::Renewed(Lease {
+                let renewed = Lease {
                     holder: lease.holder.clone(),
                     epoch: row.epoch,
                     expires_at,
-                }))
+                };
+                let yielding = row
+                    .request
+                    .as_ref()
+                    .is_some_and(|(candidate, epoch, expiry)| {
+                        *epoch == row.epoch
+                            && *expiry > now
+                            && candidate.holder != lease.holder
+                            && row
+                                .holder_priority
+                                .as_ref()
+                                .filter(|_| row.holder_priority_epoch == row.epoch)
+                                .is_none_or(|priority| candidate.priority > *priority)
+                    });
+                Ok(if yielding {
+                    Renewal::YieldRequested(renewed)
+                } else {
+                    Renewal::Renewed(renewed)
+                })
             }
             _ => Ok(Renewal::Lost),
         }
@@ -595,6 +708,94 @@ impl LeaderLeasePort for FakeRepository {
 }
 
 impl ExpiringRecordPort for FakeRepository {
+    async fn records(
+        &self,
+        kind: RecordKind,
+        after: Option<RecordId>,
+        limit: NonZeroUsize,
+        now: Timestamp,
+        into: &mut Vec<(RecordId, Record)>,
+    ) -> Result<bool, PortError> {
+        let state = self.state.lock();
+        if state.fails(Failure::Records) {
+            return Err(PortError::unavailable("expiring records are unavailable"));
+        }
+        into.clear();
+        let start = after.map_or(
+            std::ops::Bound::Included(RecordKey {
+                kind,
+                id: RecordId::new([0; 32]),
+            }),
+            |id| std::ops::Bound::Excluded(RecordKey { kind, id }),
+        );
+        for (key, record) in state.records.range((start, std::ops::Bound::Unbounded)) {
+            if key.kind != kind {
+                break;
+            }
+            if record.expires_at <= now {
+                continue;
+            }
+            if into.len() == limit.get() {
+                return Ok(true);
+            }
+            into.push((key.id, record.clone()));
+        }
+        Ok(false)
+    }
+
+    async fn apply(
+        &self,
+        lease: &Lease,
+        sequence: RecordBatchSeq,
+        version: RecordVersion,
+        now: Timestamp,
+        changes: &[RecordChange<'_>],
+    ) -> Result<ApplyRecords, PortError> {
+        validate_record_changes(changes).map_err(PortError::backend)?;
+        let hold = {
+            let mut state = self.state.lock();
+            if state.fails(Failure::Records) {
+                return Err(PortError::unavailable("expiring records are unavailable"));
+            }
+            let Some(row) = state.lease.as_mut().filter(|row| {
+                row.holder.as_ref() == Some(&lease.holder)
+                    && row.epoch == lease.epoch
+                    && row.expires_at > now
+                    && row.record_sequence < sequence.get()
+            }) else {
+                return Ok(ApplyRecords::Fenced);
+            };
+            row.record_sequence = sequence.get();
+            for change in changes {
+                match *change {
+                    RecordChange::Put {
+                        key,
+                        body,
+                        expires_at,
+                    } => {
+                        state.records.insert(
+                            key,
+                            Record {
+                                body: body.to_vec(),
+                                version,
+                                expires_at,
+                            },
+                        );
+                    }
+                    RecordChange::Delete { key } => {
+                        state.records.remove(&key);
+                    }
+                }
+            }
+            state.record_apply_hold.take()
+        };
+        if let Some((entered, hold)) = hold {
+            let _ = entered.send(());
+            let _ = hold.await;
+        }
+        Ok(ApplyRecords::Applied)
+    }
+
     async fn insert(
         &self,
         records: &[(RecordKey, &[u8])],
@@ -727,14 +928,17 @@ mod tests {
 
     use gang_clock::Timestamp;
     use gang_spi::{
-        Acquisition, CertStatus, ControllerId, ExpiringRecordPort, Insert, IssuedCertRecord,
-        LeaderLeasePort, PortError, RecordId, RecordKey, RecordKind, RecordVersion, Remove,
-        Renewal, Replace, ScalingAuditEvent, ScalingEventKind, ScalingEventSeq,
-        StateRepositoryPort,
+        Acquisition, CandidateGeneration, CandidatePriority, CertStatus, ControllerHostIdentity,
+        ControllerId, ExpiringRecordPort, Insert, IssuedCertRecord, LeaderLeasePort, Lease,
+        LeaseCandidate, LeaseEpoch, PortError, RecordId, RecordKey, RecordKind, RecordVersion,
+        Remove, Renewal, Replace, ScalingAuditEvent, ScalingEventKind, ScalingEventSeq,
+        StateRepositoryPort, Takeover,
     };
-    use gang_types::{CertSerial, FleetName, Identity, Principal, ProviderName, WorkerId};
+    use gang_types::{
+        CertSerial, FleetName, Identity, InstanceId, Principal, ProviderName, WorkerId,
+    };
 
-    use super::FakeRepository;
+    use super::{FakeRepository, LeaseRow};
     use crate::TestResult;
 
     /// A certificate record for serial `serial`, issued to `principal` under `provider`.
@@ -780,6 +984,542 @@ mod tests {
     crate::database_contract!(|| async {
         Ok::<_, Box<dyn std::error::Error>>(crate::Fixture::new(FakeRepository::default()))
     });
+
+    #[tokio::test]
+    async fn malformed_history_batches_do_not_write() -> TestResult {
+        use gang_spi::{MAX_RECORD_BODY_BYTES, MAX_RECORD_CHANGES, RecordBatchError, RecordChange};
+        let repository = FakeRepository::default();
+        let now = Timestamp::from_unix_millis(1);
+        let expires_at = Timestamp::from_unix_millis(100);
+        let host = ControllerHostIdentity::Persistent(InstanceId::try_new("history-host")?);
+        let candidate = repository
+            .register_candidate(&ControllerId::new("history"), &host)
+            .await?;
+        let Acquisition::Acquired(lease) = repository
+            .acquire(&candidate, now, now, expires_at, Takeover::Observe)
+            .await?
+        else {
+            return Err("new lease was not acquired".into());
+        };
+        let key = RecordKey {
+            kind: RecordKind::ResourceHistory,
+            id: RecordId::new([1; 32]),
+        };
+        let put = RecordChange::Put {
+            key,
+            body: b"body",
+            expires_at,
+        };
+        let large = vec![0; MAX_RECORD_BODY_BYTES + 1];
+        let oversized_batch: Vec<_> = (1..=7)
+            .map(|id| RecordChange::Put {
+                key: RecordKey {
+                    kind: RecordKind::ResourceHistory,
+                    id: RecordId::new([id; 32]),
+                },
+                body: &large[..MAX_RECORD_BODY_BYTES],
+                expires_at,
+            })
+            .collect();
+        let cases = [
+            (
+                vec![put; MAX_RECORD_CHANGES + 1],
+                RecordBatchError::TooManyChanges,
+            ),
+            (
+                vec![put, RecordChange::Delete { key }],
+                RecordBatchError::DuplicateKey,
+            ),
+            (
+                vec![RecordChange::Put {
+                    key,
+                    body: &large,
+                    expires_at,
+                }],
+                RecordBatchError::BodyTooLarge,
+            ),
+            (oversized_batch, RecordBatchError::BodyBudgetExceeded),
+        ];
+        for (changes, expected) in cases {
+            let error = repository
+                .apply(
+                    &lease,
+                    gang_spi::RecordBatchSeq::new(2),
+                    RecordVersion::new(42),
+                    now,
+                    &changes,
+                )
+                .await
+                .expect_err("invalid batch");
+            match error {
+                PortError::Backend(cause) => {
+                    assert_eq!(cause.downcast_ref::<RecordBatchError>(), Some(&expected));
+                }
+                other => return Err(format!("unexpected error: {other}").into()),
+            }
+            assert_eq!(repository.get(&key, now).await?, None);
+        }
+        assert_eq!(
+            repository
+                .apply(
+                    &lease,
+                    gang_spi::RecordBatchSeq::new(1),
+                    RecordVersion::new(41),
+                    now,
+                    &[put]
+                )
+                .await?,
+            gang_spi::ApplyRecords::Applied
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_host_priority_is_minimum_when_missing_or_bound_to_an_old_epoch() -> TestResult {
+        for priority in [
+            None,
+            Some(CandidatePriority::registered(CandidateGeneration::new(100))),
+        ] {
+            let repository = FakeRepository::default();
+            let leader = Lease {
+                holder: ControllerId::new("legacy"),
+                epoch: LeaseEpoch::new(1),
+                expires_at: Timestamp::from_unix_millis(100),
+            };
+            repository.state.lock().lease = Some(LeaseRow {
+                holder: Some(leader.holder.clone()),
+                epoch: leader.epoch,
+                expires_at: leader.expires_at,
+                record_sequence: 0,
+                holder_priority_epoch: if priority.is_none() {
+                    leader.epoch
+                } else {
+                    LeaseEpoch::new(0)
+                },
+                holder_priority: priority,
+                request: None,
+            });
+            let candidate = LeaseCandidate {
+                holder: ControllerId::new("successor"),
+                priority: CandidatePriority::registered(CandidateGeneration::default()),
+            };
+            let now = Timestamp::from_unix_millis(1);
+            assert_eq!(
+                repository
+                    .acquire(&candidate, now, now, leader.expires_at, Takeover::Request)
+                    .await?,
+                Acquisition::Contending(leader.clone())
+            );
+            assert_eq!(
+                repository.renew(&leader, now, leader.expires_at).await?,
+                Renewal::YieldRequested(leader)
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn history_sequence_fences_delayed_batches_across_renewal_and_resets_on_new_epoch()
+    -> TestResult {
+        use gang_spi::{ApplyRecords, RecordChange};
+        let repository = FakeRepository::default();
+        let now = Timestamp::from_unix_millis(1);
+        let expiry = Timestamp::from_unix_millis(100);
+        let host = ControllerHostIdentity::Persistent(InstanceId::try_new("first-host")?);
+        let candidate = repository
+            .register_candidate(&ControllerId::new("first"), &host)
+            .await?;
+        let Acquisition::Acquired(lease) = repository
+            .acquire(&candidate, now, now, expiry, Takeover::Observe)
+            .await?
+        else {
+            return Err("new lease was not acquired".into());
+        };
+        let key = RecordKey {
+            kind: RecordKind::ResourceHistory,
+            id: RecordId::new([4; 32]),
+        };
+        let put = RecordChange::Put {
+            key,
+            body: b"new",
+            expires_at: expiry,
+        };
+        let delete = RecordChange::Delete { key };
+        assert_eq!(
+            repository
+                .apply(
+                    &lease,
+                    gang_spi::RecordBatchSeq::new(2),
+                    RecordVersion::new(42),
+                    now,
+                    &[put]
+                )
+                .await?,
+            ApplyRecords::Applied
+        );
+        assert_eq!(
+            repository
+                .apply(
+                    &lease,
+                    gang_spi::RecordBatchSeq::new(1),
+                    RecordVersion::new(41),
+                    now,
+                    &[delete]
+                )
+                .await?,
+            ApplyRecords::Fenced
+        );
+        assert_eq!(
+            repository.get(&key, now).await?.map(|record| record.body),
+            Some(b"new".to_vec())
+        );
+        let Renewal::Renewed(renewed) = repository
+            .renew(&lease, now, Timestamp::from_unix_millis(200))
+            .await?
+        else {
+            return Err("lease renewal failed".into());
+        };
+        assert_eq!(
+            repository
+                .apply(
+                    &renewed,
+                    gang_spi::RecordBatchSeq::new(2),
+                    RecordVersion::new(42),
+                    now,
+                    &[]
+                )
+                .await?,
+            ApplyRecords::Fenced
+        );
+        assert_eq!(
+            repository
+                .apply(
+                    &renewed,
+                    gang_spi::RecordBatchSeq::new(3),
+                    RecordVersion::new(43),
+                    now,
+                    &[]
+                )
+                .await?,
+            ApplyRecords::Applied
+        );
+        assert_eq!(
+            repository
+                .apply(
+                    &renewed,
+                    gang_spi::RecordBatchSeq::new(3),
+                    RecordVersion::new(43),
+                    now,
+                    &[delete]
+                )
+                .await?,
+            ApplyRecords::Fenced
+        );
+        repository.release(&renewed).await?;
+        assert_successor_epoch(&repository, now, expiry, key).await
+    }
+
+    async fn assert_successor_epoch(
+        repository: &FakeRepository,
+        now: Timestamp,
+        expiry: Timestamp,
+        key: RecordKey,
+    ) -> TestResult {
+        use gang_spi::{ApplyRecords, RecordChange};
+        let delete = RecordChange::Delete { key };
+        let host = ControllerHostIdentity::Persistent(InstanceId::try_new("second-host")?);
+        let candidate = repository
+            .register_candidate(&ControllerId::new("second"), &host)
+            .await?;
+        let Acquisition::Acquired(next) = repository
+            .acquire(&candidate, now, now, expiry, Takeover::Observe)
+            .await?
+        else {
+            return Err("successor did not acquire lease".into());
+        };
+        assert_eq!(
+            repository
+                .apply(
+                    &next,
+                    gang_spi::RecordBatchSeq::new(1),
+                    RecordVersion::new(41),
+                    now,
+                    &[delete]
+                )
+                .await?,
+            ApplyRecords::Applied
+        );
+        assert_eq!(repository.get(&key, now).await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn new_epoch_sequence_does_not_reuse_record_incarnation() -> TestResult {
+        use gang_spi::{ApplyRecords, RecordBatchSeq, RecordChange};
+        let repository = FakeRepository::default();
+        let now = Timestamp::from_unix_millis(1);
+        let expires_at = Timestamp::from_unix_millis(100);
+        let first_host = ControllerHostIdentity::Persistent(InstanceId::try_new("first-host")?);
+        let first_candidate = repository
+            .register_candidate(&ControllerId::new("first"), &first_host)
+            .await?;
+        let Acquisition::Acquired(first) = repository
+            .acquire(&first_candidate, now, now, expires_at, Takeover::Observe)
+            .await?
+        else {
+            return Err("first lease not acquired".into());
+        };
+        let key = RecordKey {
+            kind: RecordKind::ResourceHistory,
+            id: RecordId::new([9; 32]),
+        };
+        let put = RecordChange::Put {
+            key,
+            body: b"history",
+            expires_at,
+        };
+        assert_eq!(
+            repository
+                .apply(
+                    &first,
+                    RecordBatchSeq::new(1),
+                    RecordVersion::new(41),
+                    now,
+                    &[put]
+                )
+                .await?,
+            ApplyRecords::Applied
+        );
+        repository.release(&first).await?;
+        let second_host = ControllerHostIdentity::Persistent(InstanceId::try_new("second-host")?);
+        let second_candidate = repository
+            .register_candidate(&ControllerId::new("second"), &second_host)
+            .await?;
+        let Acquisition::Acquired(second) = repository
+            .acquire(&second_candidate, now, now, expires_at, Takeover::Observe)
+            .await?
+        else {
+            return Err("second lease not acquired".into());
+        };
+        assert_eq!(
+            repository
+                .apply(
+                    &second,
+                    RecordBatchSeq::new(1),
+                    RecordVersion::new(42),
+                    now,
+                    &[put]
+                )
+                .await?,
+            ApplyRecords::Applied
+        );
+        assert_eq!(
+            repository
+                .replace(&key, RecordVersion::new(41), b"stale", now, expires_at)
+                .await?,
+            Replace::Stale
+        );
+        assert_eq!(
+            repository.remove(&key, RecordVersion::new(41), now).await?,
+            Remove::Stale
+        );
+        assert_eq!(
+            repository
+                .get(&key, now)
+                .await?
+                .map(|record| record.version),
+            Some(RecordVersion::new(42))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn held_apply_commits_before_response_and_survives_cancellation() -> TestResult {
+        use gang_spi::{ApplyRecords, RecordChange};
+        let repository = FakeRepository::default();
+        let now = Timestamp::from_unix_millis(1);
+        let expires_at = Timestamp::from_unix_millis(100);
+        let host = ControllerHostIdentity::Persistent(InstanceId::try_new("holder-host")?);
+        let candidate = repository
+            .register_candidate(&ControllerId::new("holder"), &host)
+            .await?;
+        let Acquisition::Acquired(lease) = repository
+            .acquire(&candidate, now, now, expires_at, Takeover::Observe)
+            .await?
+        else {
+            return Err("new lease was not acquired".into());
+        };
+        let key = RecordKey {
+            kind: RecordKind::ResourceHistory,
+            id: RecordId::new([8; 32]),
+        };
+        let (committed, _release) = repository.hold_next_record_apply();
+        let runner = repository.clone();
+        let running_lease = lease.clone();
+        let task = tokio::spawn(async move {
+            runner
+                .apply(
+                    &running_lease,
+                    gang_spi::RecordBatchSeq::new(1),
+                    RecordVersion::new(41),
+                    now,
+                    &[RecordChange::Put {
+                        key,
+                        body: b"committed",
+                        expires_at,
+                    }],
+                )
+                .await
+        });
+        committed.await?;
+        assert_eq!(
+            repository.get(&key, now).await?.map(|record| record.body),
+            Some(b"committed".to_vec())
+        );
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            repository
+                .apply(
+                    &lease,
+                    gang_spi::RecordBatchSeq::new(1),
+                    RecordVersion::new(41),
+                    now,
+                    &[]
+                )
+                .await?,
+            ApplyRecords::Fenced
+        );
+        assert_eq!(
+            repository
+                .apply(
+                    &lease,
+                    gang_spi::RecordBatchSeq::new(2),
+                    RecordVersion::new(42),
+                    now,
+                    &[]
+                )
+                .await?,
+            ApplyRecords::Applied
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_request_bound_to_an_old_epoch_neither_yields_nor_reserves() -> TestResult {
+        let repository = FakeRepository::default();
+        let leader = Lease {
+            holder: ControllerId::new("leader"),
+            epoch: LeaseEpoch::new(2),
+            expires_at: Timestamp::from_unix_millis(100),
+        };
+        let priority = CandidatePriority::registered(CandidateGeneration::new(1));
+        repository.state.lock().lease = Some(LeaseRow {
+            holder: Some(leader.holder.clone()),
+            epoch: leader.epoch,
+            expires_at: leader.expires_at,
+            record_sequence: 0,
+            holder_priority: Some(priority.clone()),
+            holder_priority_epoch: leader.epoch,
+            request: Some((
+                LeaseCandidate {
+                    holder: ControllerId::new("stale-successor"),
+                    priority: CandidatePriority::registered(CandidateGeneration::new(3)),
+                },
+                LeaseEpoch::new(1),
+                leader.expires_at,
+            )),
+        });
+        let now = Timestamp::from_unix_millis(1);
+        assert_eq!(
+            repository.renew(&leader, now, leader.expires_at).await?,
+            Renewal::Renewed(leader.clone())
+        );
+        repository.release(&leader).await?;
+        assert!(matches!(
+            repository
+                .acquire(
+                    &LeaseCandidate {
+                        holder: ControllerId::new("next"),
+                        priority,
+                    },
+                    now,
+                    now,
+                    leader.expires_at,
+                    Takeover::Observe,
+                )
+                .await?,
+            Acquisition::Acquired(_)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lease_failures_leave_request_and_host_priority_unchanged() -> TestResult {
+        let repository = FakeRepository::default();
+        let host_a = ControllerHostIdentity::Persistent(InstanceId::try_new("host-a")?);
+        let host_b = ControllerHostIdentity::Persistent(InstanceId::try_new("host-b")?);
+        let host_c = ControllerHostIdentity::Persistent(InstanceId::try_new("host-c")?);
+        let a = repository
+            .register_candidate(&ControllerId::new("a"), &host_a)
+            .await?;
+        let b = repository
+            .register_candidate(&ControllerId::new("b"), &host_b)
+            .await?;
+        let now = Timestamp::from_unix_millis(1);
+        let expires = Timestamp::from_unix_millis(100);
+        let Acquisition::Acquired(lease) = repository
+            .acquire(&a, now, now, expires, Takeover::Observe)
+            .await?
+        else {
+            return Err("new lease was not acquired".into());
+        };
+        repository.fail_lease(true);
+        assert!(
+            repository
+                .register_candidate(&ControllerId::new("c"), &host_c)
+                .await
+                .is_err()
+        );
+        for host in [
+            host_a.clone(),
+            ControllerHostIdentity::Launched {
+                at: now,
+                instance: InstanceId::try_new("launched-host")?,
+            },
+        ] {
+            assert!(
+                repository
+                    .register_candidate(&ControllerId::new("restarted"), &host)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            repository
+                .acquire(&b, now, now, expires, Takeover::Request)
+                .await
+                .is_err()
+        );
+        assert!(repository.release(&lease).await.is_err());
+        repository.fail_lease(false);
+        let c = repository
+            .register_candidate(&ControllerId::new("c"), &host_c)
+            .await?;
+        assert_eq!(
+            c.priority,
+            CandidatePriority::registered(CandidateGeneration::new(3))
+        );
+        let restarted = repository
+            .register_candidate(&ControllerId::new("a-restarted"), &host_a)
+            .await?;
+        assert_eq!(restarted.priority, a.priority);
+        assert!(matches!(
+            repository.renew(&lease, now, expires).await?,
+            Renewal::Renewed(_)
+        ));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn each_failure_toggle_fails_exactly_its_operations() -> TestResult {
@@ -891,16 +1631,27 @@ mod tests {
         let now = Timestamp::from_unix_millis(1);
         let expires = Timestamp::from_unix_millis(10);
         let holder = ControllerId::new("controller");
-        let Acquisition::Acquired(lease) = repository.acquire(&holder, now, expires).await? else {
+        let host = ControllerHostIdentity::Persistent(InstanceId::try_new("controller-host")?);
+        let candidate = repository.register_candidate(&holder, &host).await?;
+        let Acquisition::Acquired(lease) = repository
+            .acquire(&candidate, now, now, expires, Takeover::Observe)
+            .await?
+        else {
             return Err("new lease was not acquired".into());
         };
         repository.fail_lease(true);
         assert!(matches!(
-            repository.acquire(&holder, now, expires).await,
+            repository.register_candidate(&holder, &host).await,
             Err(PortError::Unavailable(_))
         ));
         assert!(matches!(
-            repository.renew(&lease, expires).await,
+            repository
+                .acquire(&candidate, now, now, expires, Takeover::Observe)
+                .await,
+            Err(PortError::Unavailable(_))
+        ));
+        assert!(matches!(
+            repository.renew(&lease, now, expires).await,
             Err(PortError::Unavailable(_))
         ));
         assert!(matches!(
@@ -909,7 +1660,7 @@ mod tests {
         ));
         repository.fail_lease(false);
         assert!(matches!(
-            repository.renew(&lease, expires).await?,
+            repository.renew(&lease, now, expires).await?,
             Renewal::Renewed(_)
         ));
         repository.release(&lease).await?;

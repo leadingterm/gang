@@ -4,6 +4,7 @@
 //! revocation.
 
 use std::future::pending;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::gate::Caller;
@@ -152,6 +153,29 @@ async fn assert_error(
     ErrorResponse {
         error: read(response).await.refused(reason),
     }
+}
+
+#[tokio::test]
+async fn controller_receives_shared_action_policy() {
+    let (parts, _dials, handles) = plain_parts();
+    let settings = plain_settings();
+    let actions = Arc::clone(&settings.actions);
+    let server = Server::prepare(parts, settings)
+        .await
+        .expect("server prepares");
+    Box::pin(run_until(server, async {
+        let controller = handles
+            .scheduler
+            .controller()
+            .await
+            .expect("controller is published");
+        assert!(Arc::ptr_eq(&controller.actions, &actions));
+        assert_eq!(
+            controller.actions.kill_grace,
+            gang_types::NonZeroDuration::from_secs(7)
+        );
+    }))
+    .await;
 }
 
 #[tokio::test]
@@ -380,7 +404,9 @@ async fn worker_gate_refuses_certificates_issued_to_other_providers() {
                 ..Peer::default()
             };
             let mut parts = request_parts(GET_SERVER.template, None);
-            let refused = controller.admit_worker(&peer, &mut parts).await;
+            let refused = controller
+                .admit_worker(gang_spi::RequestScope::Shared, &peer, &mut parts)
+                .await;
             assert!(
                 matches!(
                     refused,
@@ -413,7 +439,9 @@ async fn worker_gate_refuses_a_certificate_missing_from_the_ledger() {
             ..Peer::default()
         };
         let mut parts = request_parts(GET_SERVER.template, None);
-        let refused = controller.admit_worker(&peer, &mut parts).await;
+        let refused = controller
+            .admit_worker(gang_spi::RequestScope::Shared, &peer, &mut parts)
+            .await;
         assert!(
             matches!(
                 refused,
@@ -680,8 +708,7 @@ async fn public_listener_refuses_a_revoked_principal() {
             "a revoked principal authenticates no caller"
         );
         let mut after = request_parts(GET_SERVER.template, Some(&alice));
-        controller
-            .admit_public(&Peer::default(), &mut after)
+        controller.admit_public(gang_spi::RequestScope::Shared, &Peer::default(), &mut after)
             .await
             .expect("the public gate admits open paths and records the refusal");
         let caller = Caller::of(&after.extensions);
@@ -931,7 +958,7 @@ async fn worker_gate_admits_a_ledgered_certificate_and_refuses_an_unknown_one() 
         };
         let mut known_parts = request_parts(GET_SERVER.template, None);
         controller
-            .admit_worker(&known, &mut known_parts)
+            .admit_worker(gang_spi::RequestScope::Shared, &known, &mut known_parts)
             .await
             .expect("a worker certificate in the ledger is admitted");
         let stranger = Peer {
@@ -940,7 +967,11 @@ async fn worker_gate_admits_a_ledgered_certificate_and_refuses_an_unknown_one() 
         };
         let mut stranger_parts = request_parts(GET_SERVER.template, None);
         let refused = controller
-            .admit_worker(&stranger, &mut stranger_parts)
+            .admit_worker(
+                gang_spi::RequestScope::Shared,
+                &stranger,
+                &mut stranger_parts,
+            )
             .await;
         assert!(
             matches!(refused, Err(PortError::Rejected { .. })),
@@ -948,6 +979,129 @@ async fn worker_gate_admits_a_ledgered_certificate_and_refuses_an_unknown_one() 
         );
     }))
     .await;
+}
+
+#[tokio::test]
+async fn promotion_reloads_principals_revoked_after_prepare() {
+    let (parts, _dials, handles) = tls_parts();
+    handles.verifier.accept(ALICE_PROOF, ALICE);
+    let server = prepare_tls(parts).await;
+    let mut alice_token = None;
+    Box::pin(run_until(server, async {
+        let controller = handles
+            .scheduler
+            .controller()
+            .await
+            .expect("controller is published");
+        alice_token = Some(mint_token(&controller, PROVIDER, ALICE_PROOF).await);
+    }))
+    .await;
+    let alice_token = alice_token.expect("the first server mints alice's token");
+
+    let (parts, _dials, handles) = tls_parts();
+    let release_ready = handles.scheduler.hold_ready();
+    let mut settings = tls_settings();
+    // Without a dashboard baseline, the first scheduler snapshot is leader work,
+    // after the leader gate has opened.
+    settings.dashboard.enabled = false;
+    let server = Server::prepare(parts, settings)
+        .await
+        .expect("server prepares with an empty revocation snapshot");
+    let cookie = session_token(&handles.clock, &identity(ALICE)).await;
+    handles
+        .repository
+        .revoke_principal(&identity(ALICE), handles.clock.wall())
+        .await
+        .expect("the revocation is recorded after preparation");
+
+    Box::pin(run_until(server, async {
+        let controller = handles
+            .scheduler
+            .controller()
+            .await
+            .expect("controller is published");
+        release_ready.send(()).expect("controller is waiting");
+        handles.scheduler.snapshots().reached(1).await;
+        let mut leader = request_parts(GET_SERVER.template, None);
+        assert!(
+            matches!(
+                controller
+                    .admit_public(
+                        gang_spi::RequestScope::Leader,
+                        &Peer::default(),
+                        &mut leader,
+                    )
+                    .await,
+                Ok(gang_spi::GateDecision::Admit(_))
+            ),
+            "controller has opened leader admission"
+        );
+        let bearer = controller
+            .call_api(api_request(
+                "GET",
+                GET_SESSION.template,
+                Some(&alice_token),
+                None,
+            ))
+            .await;
+        assert_error(bearer, ErrorReason::PrincipalRevoked).await;
+        let session = controller
+            .call_api(request(
+                "GET",
+                GET_SESSION.template,
+                &[(SESSION_COOKIE, cookie.expose())],
+            ))
+            .await;
+        assert_error(session, ErrorReason::PrincipalRevoked).await;
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn promotion_fails_closed_when_revocations_cannot_be_reloaded() {
+    for fail_principals in [true, false] {
+        let (parts, _dials, handles) = tls_parts();
+        let release_ready = handles.scheduler.hold_ready();
+        let mut settings = tls_settings();
+        settings.dashboard.enabled = false;
+        let server = Server::prepare(parts, settings)
+            .await
+            .expect("server prepares before the repository outage");
+        if fail_principals {
+            handles.repository.fail_principals(true);
+        } else {
+            handles.repository.fail_revoked_reads(true);
+        }
+        let (result, ()) =
+            tokio::join!(server.run(pending(), ControllerReady::channel().0), async {
+                let controller = handles
+                    .scheduler
+                    .controller()
+                    .await
+                    .expect("controller is published");
+                let mut leader = request_parts(GET_SERVER.template, None);
+                assert!(matches!(
+                    controller
+                        .admit_public(
+                            gang_spi::RequestScope::Leader,
+                            &Peer::default(),
+                            &mut leader,
+                        )
+                        .await,
+                    Ok(gang_spi::GateDecision::NotLeading)
+                ));
+                release_ready.send(()).expect("controller is waiting");
+            });
+        assert!(
+            matches!(result, Err(ServerError::Revocations(_))),
+            "promotion fails on the revocation read: {result:?}"
+        );
+        assert_eq!(
+            handles.scheduler.snapshots().get(),
+            0,
+            "leader work never starts with an incomplete revocation snapshot"
+        );
+    }
 }
 
 /// A principal revoked before startup is refused as `PRINCIPAL_REVOKED` on authenticate and on gated requests.

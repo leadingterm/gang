@@ -68,6 +68,40 @@ wire_enum! {
     }
 }
 
+wire_enum! {
+    /// The role of an instance in an infrastructure replacement.
+    pub enum InfrastructurePhase {
+        /// The instance is being replaced.
+        Replacing = "REPLACING",
+        /// The instance is a replacement.
+        Replacement = "REPLACEMENT",
+    }
+}
+
+wire_enum! {
+    /// The observation behind an infrastructure replacement.
+    pub enum InfrastructureReason {
+        /// A spot rebalance recommendation or replacement.
+        SpotRebalance = "SPOT_REBALANCE",
+        /// A spot interruption notice.
+        SpotInterruption = "SPOT_INTERRUPTION",
+    }
+}
+
+/// A derived infrastructure status for one instance.
+#[derive(gang_macros::Known, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(optional_fields)]
+pub struct InfrastructureStatus {
+    /// Whether this instance is being replaced or is the replacement.
+    pub phase: InfrastructurePhase,
+    /// The observation behind the status.
+    pub reason: InfrastructureReason,
+    /// Reference `instances/{instance}` of the paired instance, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other_instance: Option<String>,
+}
+
 /// The live state, the body of `GET /v1/state` and the payload of a `snapshot` frame.
 ///
 /// The default is an empty frame; served frames are built by the state builder.
@@ -103,6 +137,10 @@ pub struct State {
     pub actions: Option<Actions>,
     /// The most recent scaling events, oldest first; at most `events_limit`.
     pub events: Vec<Event>,
+    /// Live provider observations; separate from the durable scaling audit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<Event>>", optional)]
+    pub status_events: Vec<Event>,
     /// How many streamed events a client keeps; constant for the process.
     pub events_limit: u32,
     /// Actions that reached a terminal result since the controller started; a decrease is a
@@ -664,6 +702,9 @@ pub struct Worker {
     pub instance: String,
     /// The worker's phase.
     pub phase: Phase,
+    /// Derived infrastructure status of the worker's instance, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub infrastructure: Option<InfrastructureStatus>,
     /// When the worker entered its phase.
     #[serde(with = "crate::time")]
     #[ts(type = "Timestamp")]
@@ -698,6 +739,10 @@ pub struct Instance {
     pub fleet: String,
     /// The instance's lifecycle.
     pub lifecycle: Lifecycle,
+    /// Derived infrastructure status, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub infrastructure: Option<InfrastructureStatus>,
     /// When the instance launched.
     #[serde(with = "crate::time")]
     #[ts(type = "Timestamp")]
@@ -850,6 +895,22 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+
+    #[test]
+    fn infrastructure_status_round_trips_without_optional_pair() {
+        let value = json!({"phase": "REPLACING", "reason": "SPOT_INTERRUPTION"});
+        let status: InfrastructureStatus =
+            serde_json::from_value(value.clone()).expect("status parses");
+        assert_eq!(status.other_instance, None);
+        assert_eq!(
+            serde_json::to_value(status).expect("status serializes"),
+            value
+        );
+        let state = serde_json::to_value(State::default()).expect("state serializes");
+        assert!(state.get("statusEvents").is_none());
+        let decoded: State = serde_json::from_value(state).expect("old state parses");
+        assert!(decoded.status_events.is_empty());
+    }
 
     #[test]
     fn cache_and_old_sample_wire_contract() {

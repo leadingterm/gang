@@ -201,9 +201,9 @@ async fn mixed_group_failure_does_not_mark_in_flight_fleet_failed() -> TestResul
     Ok(())
 }
 
-/// A met plain spot fleet reads no activities and never touches the on-demand twin.
+/// A met plain spot fleet needs no capacity probe and never touches the on-demand twin.
 #[tokio::test]
-async fn met_plain_spot_fleet_reads_neither_activities_nor_twin() -> TestResult {
+async fn met_plain_spot_fleet_skips_capacity_probes_and_twin() -> TestResult {
     let harness = harness_with(vec![FakeGroup::new(
         FLEET,
         6,
@@ -229,7 +229,7 @@ async fn met_plain_spot_fleet_reads_neither_activities_nor_twin() -> TestResult 
     })
     .await?;
 
-    assert_eq!(harness.requests("DescribeScalingActivities"), 0);
+    assert_eq!(harness.activity_probes(), 0);
     assert!(harness.request_log().iter().all(|(_, parameters)| {
         parameters
             .values()
@@ -271,13 +271,10 @@ async fn healthy_spot_raise_goes_to_spot_only() -> TestResult {
     assert_eq!(writes(&harness), vec![write(FLEET, "10")]);
     assert_eq!(harness.desired(TWIN), Some(0));
 
-    let activities_before = harness.requests("DescribeScalingActivities");
+    let activities_before = harness.activity_probes();
     harness.fleets.supply(fleet.view(), &mut into).await?;
     assert_eq!(into.desired, 10);
-    assert_eq!(
-        harness.requests("DescribeScalingActivities") - activities_before,
-        2
-    );
+    assert_eq!(harness.activity_probes() - activities_before, 2);
     Ok(())
 }
 
@@ -447,13 +444,10 @@ async fn first_failure_withdraws_spot_then_raises_on_demand() -> TestResult {
     .await?;
     assert_eq!(writes(&harness), vec![write(FLEET, "6"), write(TWIN, "4")]);
 
-    let activities_before = harness.requests("DescribeScalingActivities");
+    let activities_before = harness.activity_probes();
     harness.fleets.supply(fleet.view(), &mut into).await?;
     assert_eq!(into.desired, 10);
-    assert_eq!(
-        harness.requests("DescribeScalingActivities") - activities_before,
-        1
-    );
+    assert_eq!(harness.activity_probes() - activities_before, 1);
     Ok(())
 }
 

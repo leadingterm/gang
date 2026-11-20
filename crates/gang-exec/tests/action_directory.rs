@@ -134,3 +134,15 @@ fn parent_components_that_leave_the_root_are_rejected() -> Result<(), Box<dyn Er
     assert!(matches!(error, ExecError::OutsideWorkDirectory { .. }));
     Ok(())
 }
+
+#[test]
+fn reserved_side_channels_directory_is_not_an_action() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let working = temp.path().join(".side_channels/work");
+    fs::create_dir_all(&working)?;
+    assert!(matches!(
+        ActionDirectory::try_new(temp.path(), &working),
+        Err(ExecError::OutsideWorkDirectory { .. })
+    ));
+    Ok(())
+}

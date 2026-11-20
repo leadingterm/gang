@@ -11,10 +11,11 @@ use aws_sdk_sts::Client;
 use gang_aws_sdk::call_error;
 use gang_types::{Audience, Proof};
 
-use crate::config::{AwsConfig, WorkloadTokenAlgorithm};
+use crate::config::{AwsConfig, WorkloadTokenAlgorithm, WorkloadTokenTtl};
 use crate::errors::AwsError;
 
 const OPERATION: &str = "GetWebIdentityToken";
+const _: () = assert!(WorkloadTokenTtl::MAX.as_units() <= 2_147_483_647_u64);
 
 /// Issues workload web identity tokens through STS.
 pub(crate) struct WebIdentity {
@@ -28,9 +29,9 @@ impl WebIdentity {
     /// Builds an issuer for the audience, algorithm and lifetime in `config`, using `sdk`'s region
     /// and credentials.
     pub(crate) fn new(sdk: &SdkConfig, config: &AwsConfig) -> Self {
-        // The token lifetime is bounded by an hour, so this never saturates.
-        let duration_seconds =
-            i32::try_from(config.workload_token.ttl.as_units()).unwrap_or(i32::MAX);
+        // WorkloadTokenTtl guarantees 60..=3600 seconds, so its low four bytes fit i32 exactly.
+        let [first, second, third, fourth, ..] = config.workload_token.ttl.as_units().to_le_bytes();
+        let duration_seconds = i32::from_le_bytes([first, second, third, fourth]);
         Self {
             sts: Client::new(sdk),
             audience: config.workload_token.audience.clone(),
@@ -165,6 +166,22 @@ mod tests {
             parameters.get("DurationSeconds").map(String::as_str),
             Some("1800")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn requests_the_supported_lifetime_bounds() -> Result<(), Box<dyn Error>> {
+        let fake = FakeAws::start().await?;
+        for (ttl, seconds) in [("60s", "60"), ("3600s", "3600")] {
+            let config = config(json!({"workload_token": {"ttl": ttl}}))?;
+            let webidentity = issuer(&fake, &config).await;
+            webidentity.token().await?;
+            let parameters = last_request(&fake)?;
+            assert_eq!(
+                parameters.get("DurationSeconds").map(String::as_str),
+                Some(seconds)
+            );
+        }
         Ok(())
     }
 

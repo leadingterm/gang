@@ -268,14 +268,18 @@ fn principals_change_without_viewers_updates_state_without_encoding_a_frame() {
 }
 
 #[tokio::test]
-async fn shutdown_signal_turns_true() {
+async fn shutdown_notifies_current_subscribers_without_latching() {
     let hub = hub();
-    let mut signal = hub.shutdown_signal();
-    assert!(!*signal.borrow());
-
+    let mut first = hub.shutdown_signal();
     hub.shutdown();
-    signal.changed().await.expect("hub is alive");
-    assert!(*signal.borrow());
+    let mut second = hub.shutdown_signal();
+    assert!(!second.has_changed().expect("hub is alive"));
+    first.changed().await.expect("first subscriber is notified");
+    hub.shutdown();
+    second
+        .changed()
+        .await
+        .expect("second subscriber is notified");
 }
 
 #[tokio::test]

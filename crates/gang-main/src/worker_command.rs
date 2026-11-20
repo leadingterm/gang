@@ -6,8 +6,9 @@ use std::sync::Arc;
 use gang_client::ClientOptions;
 use gang_clock::{Clock, SystemClock};
 use gang_config::{GangConfig, WorkerConfig};
+use gang_nativelink::{NativeLink, NativeLinkConfig};
 use gang_spi::{PluginContext, SchedulerPort};
-use gang_types::{AuthenticationSettings, ProviderName, SchedulerSettings, Url};
+use gang_types::{AuthenticationSettings, ProviderName, Url};
 use gang_worker::{Transport, WorkerDeployment, WorkerParts, WorkerSettings};
 
 use crate::cli::WorkerArgs;
@@ -16,9 +17,7 @@ use crate::enroller::WorkloadEnroller;
 use crate::errors::{MainError, Result};
 use crate::logging;
 use crate::output::Output;
-use crate::plugins::{
-    Cache, Limits, Plugins, Provisioner, Scheduler, SchedulerConfig, WorkerAuthenticationConfig,
-};
+use crate::plugins::{Cache, Limits, Plugins, Provisioner, WorkerAuthenticationConfig};
 use crate::runtime;
 use crate::worker_server::{AdvertisedCa, ServerPin, WorkerServer};
 
@@ -28,7 +27,7 @@ struct GangWorker;
 impl WorkerDeployment for GangWorker {
     type Provisioner = Provisioner;
     type Cache = Cache;
-    type Scheduler = Scheduler;
+    type Scheduler = NativeLink;
     type Limits = Limits;
     type Clock = SystemClock;
     type Enroller = WorkloadEnroller;
@@ -43,7 +42,7 @@ pub(crate) fn run(args: WorkerArgs, out: &Output) -> Result<ExitCode> {
 }
 
 /// Builds the worker from `loaded` and runs it until shutdown, preemption, or a scheduler stop.
-/// The endpoint flags override the configured `endpoint` and scheduler `worker_endpoint`.
+/// The endpoint flags override the configured `endpoint` and `worker_endpoint`.
 async fn serve(
     loaded: LoadedConfig,
     endpoint_flag: Option<Url>,
@@ -53,6 +52,7 @@ async fn serve(
     let LoadedConfig { path, config, .. } = loaded;
     let GangConfig {
         fleets,
+        actions,
         worker,
         sandbox,
         execution,
@@ -63,17 +63,18 @@ async fn serve(
         provisioner,
         cache,
         signer,
-        scheduler,
+        worker_endpoint,
         ..
     } = config;
     let context = PluginContext { config_path: &path };
     let endpoint = effective_endpoint(endpoint_flag, configured_endpoint);
     let access = server_access(&authentication.workers, endpoint)?;
     let pin = ServerPin::try_new(server.ca_pin, signer, &context)?;
-    let scheduler = scheduler_with_worker_endpoint(scheduler, worker_endpoint_flag);
+    let worker_endpoint = effective_endpoint(worker_endpoint_flag, worker_endpoint);
     let provisioner = Provisioner::build(provisioner, &context)?;
     let cache = Cache::build(cache, &context)?;
-    let scheduler = Scheduler::build(scheduler, &context)?;
+    let scheduler = NativeLink::try_new(NativeLinkConfig::for_worker(worker_endpoint, &worker))
+        .map_err(MainError::Scheduler)?;
     let transport = worker_transport(
         access,
         &SchedulerPort::endpoints(&scheduler).worker,
@@ -83,6 +84,7 @@ async fn serve(
     )?;
 
     let settings = WorkerSettings {
+        actions: Arc::new(actions),
         fleets,
         worker,
         sandbox,
@@ -184,18 +186,6 @@ fn effective_endpoint(flag: Option<Url>, configured: Option<Url>) -> Option<Url>
     flag.or(configured)
 }
 
-/// Applies `--worker-endpoint` to the scheduler, replacing any configured worker endpoint.
-/// Without the flag the scheduler is returned unchanged.
-fn scheduler_with_worker_endpoint(
-    mut scheduler: SchedulerConfig,
-    flag: Option<Url>,
-) -> SchedulerConfig {
-    if let Some(url) = flag {
-        scheduler.set_worker_endpoint(Some(url));
-    }
-    scheduler
-}
-
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
@@ -203,7 +193,6 @@ mod tests {
     use gang_authn::{MtlsConfig, NoneConfig};
     use gang_clock::{TestClock, Timestamp};
     use gang_config::CaPinSetting;
-    use gang_nativelink::NativeLinkConfig;
     use gang_types::{CaPin, NonZeroBytes, NonZeroDuration, Url};
 
     use super::*;
@@ -404,54 +393,27 @@ mod tests {
         Url::parse(text).expect("test endpoint is a valid url")
     }
 
-    fn native_config(worker_endpoint: Option<&str>) -> NativeLinkConfig {
-        let worker_line = worker_endpoint
-            .map(|endpoint| format!("worker_endpoint = \"{endpoint}\"\n"))
-            .unwrap_or_default();
-        let text = format!("scheduler_name = \"MAIN_SCHEDULER\"\n{worker_line}");
-        toml::from_str(&text).expect("the minimal scheduler section parses")
-    }
-
     #[test]
     fn worker_endpoint_flag_replaces_the_configured_endpoint() {
-        let configured = native_config(Some("grpcs://a.example.com:8443"));
-        let result = scheduler_with_worker_endpoint(
-            SchedulerConfig::Nativelink(configured),
-            Some(url("grpcs://b.example.com:8443")),
-        );
-        assert_eq!(
-            result.worker_endpoint(),
-            Some(&url("grpcs://b.example.com:8443"))
-        );
+        let configured = Some(url("grpcs://a.example.com:8443"));
+        let result = effective_endpoint(Some(url("grpcs://b.example.com:8443")), configured);
+        assert_eq!(result, Some(url("grpcs://b.example.com:8443")));
     }
 
     #[test]
     fn no_worker_endpoint_flag_keeps_the_configured_endpoint() {
-        let result = scheduler_with_worker_endpoint(
-            SchedulerConfig::Nativelink(native_config(Some("grpcs://a.example.com:8443"))),
-            None,
-        );
-        assert_eq!(
-            result.worker_endpoint(),
-            Some(&url("grpcs://a.example.com:8443"))
-        );
+        let result = effective_endpoint(None, Some(url("grpcs://a.example.com:8443")));
+        assert_eq!(result, Some(url("grpcs://a.example.com:8443")));
     }
 
     #[test]
     fn no_worker_endpoint_flag_keeps_an_absent_endpoint_absent() {
-        let absent = SchedulerConfig::Nativelink(native_config(None));
-        let result = scheduler_with_worker_endpoint(absent, None);
-        assert_eq!(result.worker_endpoint(), None);
+        assert_eq!(effective_endpoint(None, None), None);
     }
 
     #[test]
     fn worker_endpoint_flag_fills_an_absent_endpoint() {
-        let absent = SchedulerConfig::Nativelink(native_config(None));
-        let result =
-            scheduler_with_worker_endpoint(absent, Some(url("grpcs://b.example.com:8443")));
-        assert_eq!(
-            result.worker_endpoint(),
-            Some(&url("grpcs://b.example.com:8443"))
-        );
+        let result = effective_endpoint(Some(url("grpcs://b.example.com:8443")), None);
+        assert_eq!(result, Some(url("grpcs://b.example.com:8443")));
     }
 }

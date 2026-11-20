@@ -15,9 +15,45 @@ pub enum ConfigError {
     /// unknown backends and unknown fields are reported here with the accepted keys.
     #[error("invalid gang.toml")]
     Gang(#[source] toml::de::Error),
+    /// The removed top-level scheduler table must be migrated to the current configuration.
+    #[error(
+        "the top-level scheduler table is replaced by top-level worker_endpoint and [actions], [server], and [worker]"
+    )]
+    #[fix(
+        "move worker_endpoint to the top level; memory, disk and cold-start settings to [actions.memory], [actions.disk] and [actions.cold_start]; policy, retries, timeout and kill_grace to [actions] (actions.timeout and actions.kill_grace); HTTP limits to [server.http2]; worker liveness to server.worker_timeout; file limits to server.max_open_files and worker.max_open_files; transfer, connect, cleanup and keepalive settings to [worker]; remove scheduler_name"
+    )]
+    RemovedScheduler(#[source] toml::de::Error),
     /// A configuration could not be rendered as TOML.
     #[error("cannot render configuration")]
     Render(#[from] toml::ser::Error),
+    /// A configured action resource setting does not fit a fleet.
+    #[error("{key} {value} bytes must be {relation} fleet `{fleet}` capacity {capacity} bytes")]
+    #[fix("adjust the action setting or the named fleet's capacity")]
+    ActionResourceDoesNotFit {
+        /// The action configuration key.
+        key: &'static str,
+        /// The configured value in bytes.
+        value: u64,
+        /// Required relationship to capacity.
+        relation: &'static str,
+        /// The affected fleet.
+        fleet: FleetName,
+        /// The declared capacity in bytes.
+        capacity: u64,
+    },
+    /// No fleet can fit the configured cold-start reservation.
+    #[error(
+        "actions.cold_start cpu_count {cpu_count}, memory {memory_kb} KiB and disk {disk_kb} KiB fit no fleet"
+    )]
+    #[fix("lower the cold-start reservation or configure a fleet that fits it")]
+    ColdStartFitsNoFleet {
+        /// Reserved CPUs.
+        cpu_count: u32,
+        /// Reserved memory in KiB.
+        memory_kb: u64,
+        /// Reserved disk in KiB.
+        disk_kb: u64,
+    },
     /// `default_isa` matches no fleet's instruction set.
     #[error("default_isa `{0}` matches no fleet")]
     #[fix("set default_isa to the instruction set of a declared fleet")]
@@ -107,19 +143,17 @@ pub enum ConfigError {
         "set server.endpoint_trust = \"ca\", or enroll workers through an authentication plugin that issues certificates"
     )]
     PinnedWorkersNeedAdvertisedCa,
-    /// A scheduler worker endpoint has no host.
-    #[error("worker endpoint `{0}` has no host")]
-    #[fix(
-        "set the scheduler worker endpoint to a URL with a host, such as grpcs://gang.example.com:9090"
-    )]
+    /// A worker endpoint has no host.
+    #[error("worker_endpoint `{0}` has no host")]
+    #[fix("set worker_endpoint to a URL with a host, such as grpcs://gang.example.com:9090")]
     WorkerEndpointWithoutHost(Url),
-    /// `transport = "tls"` with a scheduler worker endpoint that is not a `grpcs` URL.
-    #[error("worker endpoint `{0}` must use grpcs when server.transport is \"tls\"")]
-    #[fix("set the scheduler worker endpoint to a grpcs URL")]
+    /// `transport = "tls"` with a worker endpoint that is not a `grpcs` URL.
+    #[error("worker_endpoint `{0}` must use grpcs when server.transport is \"tls\"")]
+    #[fix("set worker_endpoint to a grpcs URL")]
     WorkerEndpointNotGrpcs(Url),
     /// `transport = "plaintext"` with a worker endpoint that is not a `grpc` or `grpcs` URL.
-    #[error("worker endpoint `{0}` must use grpc or grpcs when server.transport is \"plaintext\"")]
-    #[fix("set the scheduler worker endpoint to a grpc or grpcs URL")]
+    #[error("worker_endpoint `{0}` must use grpc or grpcs when server.transport is \"plaintext\"")]
+    #[fix("set worker_endpoint to a grpc or grpcs URL")]
     WorkerEndpointNotGrpc(Url),
     /// `transport = "tls"` with an `endpoint` that is not an https URL.
     #[error("endpoint `{0}` must be an https URL when server.transport is \"tls\"")]
@@ -137,52 +171,12 @@ pub enum ConfigError {
         /// The configured public listen address.
         listen: SocketAddr,
     },
-    /// `execution_endpoint` requires a separate execution listener.
-    #[error("execution_endpoint requires execution_listen")]
-    #[fix("set execution_listen or remove execution_endpoint")]
-    ExecutionEndpointWithoutListen,
-    /// A non-loopback execution listener needs an explicit endpoint.
-    #[error(
-        "execution_endpoint is required when execution_listen `{listen}` is not a loopback address"
-    )]
-    #[fix("set execution_endpoint to the address clients dial")]
-    ExecutionEndpointRequired {
-        /// Configured execution listener.
-        listen: SocketAddr,
-    },
-    /// The execution endpoint has the wrong scheme for TLS.
-    #[error("execution_endpoint `{0}` must be an https url when server.transport is \"tls\"")]
-    #[fix("set execution_endpoint to an https url")]
-    ExecutionEndpointNotHttps(Url),
-    /// The execution endpoint has the wrong scheme for plaintext.
-    #[error(
-        "execution_endpoint `{0}` must be an http or https url when server.transport is \"plaintext\""
-    )]
-    #[fix("set execution_endpoint to an http or https url")]
-    ExecutionEndpointNotHttp(Url),
-    /// The execution endpoint must use the public endpoint's host.
-    #[error(
-        "execution_endpoint `{execution_endpoint}` must use the same host as endpoint `{endpoint}`"
-    )]
-    #[fix("set execution_endpoint to the same host as endpoint")]
-    ExecutionEndpointHostMismatch {
-        /// The public endpoint.
-        endpoint: String,
-        /// The execution endpoint.
-        execution_endpoint: String,
-    },
-    /// A dedicated execution endpoint must not route back through the public frontend.
-    #[error("execution_endpoint resolves to the same scheme, host and port as endpoint")]
-    #[fix("set execution_endpoint to a different scheme or port")]
-    ExecutionEndpointSelfRelay,
-    /// A leader-only listener uses an ephemeral port.
-    #[error("{key} `{listen}` must name a non-zero port")]
-    #[fix("set {key} to an address with a non-zero port")]
-    LeaderListenerPortUnset {
-        /// Listener TOML key.
-        key: &'static str,
-        /// Configured listener.
-        listen: SocketAddr,
+    /// PROXY is enabled for an optional listener that is not configured.
+    #[error("server.proxy_protocol.{listener} requires {listener}_listen")]
+    #[fix("configure {listener}_listen or set server.proxy_protocol.{listener} to off")]
+    ProxyProtocolWithoutListener {
+        /// Optional listener name.
+        listener: &'static str,
     },
     /// Two listeners cannot bind overlapping non-ephemeral addresses.
     #[error("{first} and {second} have conflicting listen addresses at `{listen}`")]
@@ -226,24 +220,35 @@ pub enum ConfigError {
         /// Client keepalive timeout.
         keepalive_timeout: Duration,
     },
+    /// The worker keepalive interval cannot reach the controller before worker eviction.
+    #[error(
+        "worker.connect_timeout {connect_timeout:?} must be shorter than twice server.worker_timeout {worker_timeout:?}, or the scheduler evicts workers between keepalives"
+    )]
+    #[fix("set worker.connect_timeout below twice server.worker_timeout")]
+    WorkerConnectTimeoutTooLong {
+        /// Worker connection timeout.
+        connect_timeout: Duration,
+        /// Controller worker eviction timeout.
+        worker_timeout: Duration,
+    },
     /// Scheduler hand-off is not strictly below a fleet's boot grace.
     #[error("{key} {shutdown_grace:?} must be below fleets `{fleet}` boot_grace {boot_grace:?}")]
     #[fix("set {key} below fleets boot_grace")]
     ShutdownGraceNotBelowBootGrace {
-        /// Scheduler setting's full TOML key.
+        /// Full TOML key.
         key: &'static str,
-        /// Scheduler hand-off duration.
+        /// Controller hand-off duration.
         shutdown_grace: Duration,
         /// Fleet whose boot grace is too short.
         fleet: FleetName,
         /// Fleet boot grace.
         boot_grace: Duration,
     },
-    /// The scheduler worker endpoint is omitted but `worker_listen` is not loopback.
+    /// The worker endpoint is omitted but `worker_listen` is not loopback.
     #[error("{key} is required when worker_listen `{listen}` is not a loopback address")]
     #[fix("set {key} to the address workers dial")]
     WorkerEndpointRequired {
-        /// The worker endpoint field within the scheduler plugin section.
+        /// The worker endpoint TOML key.
         key: &'static str,
         /// The configured worker listen address.
         listen: SocketAddr,
@@ -341,6 +346,7 @@ mod tests {
     fn every_variant() -> Vec<ConfigError> {
         vec![
             ConfigError::Gang(syntax_error()),
+            ConfigError::RemovedScheduler(syntax_error()),
             ConfigError::Render(
                 toml::to_string(&Unserializable).expect_err("the value cannot be serialized"),
             ),
@@ -381,21 +387,6 @@ mod tests {
             ConfigError::EndpointRequired {
                 listen: "0.0.0.0:443".parse().expect("the address is valid"),
             },
-            ConfigError::ExecutionEndpointWithoutListen,
-            ConfigError::ExecutionEndpointRequired {
-                listen: "0.0.0.0:443".parse().expect("the address is valid"),
-            },
-            ConfigError::ExecutionEndpointNotHttps(endpoint()),
-            ConfigError::ExecutionEndpointNotHttp(endpoint()),
-            ConfigError::ExecutionEndpointHostMismatch {
-                endpoint: endpoint().to_string(),
-                execution_endpoint: endpoint().to_string(),
-            },
-            ConfigError::ExecutionEndpointSelfRelay,
-            ConfigError::LeaderListenerPortUnset {
-                key: "execution_listen",
-                listen: "127.0.0.1:0".parse().expect("the address is valid"),
-            },
             ConfigError::ListenerCollision {
                 first: "listen",
                 second: "worker_listen",
@@ -412,8 +403,12 @@ mod tests {
                 healthy_window: Duration::from_secs(10),
                 keepalive_timeout: Duration::from_secs(30),
             },
+            ConfigError::WorkerConnectTimeoutTooLong {
+                connect_timeout: Duration::from_secs(20),
+                worker_timeout: Duration::from_secs(10),
+            },
             ConfigError::ShutdownGraceNotBelowBootGrace {
-                key: "scheduler.nativelink.http2.shutdown_grace",
+                key: "server.http2.shutdown_grace",
                 shutdown_grace: Duration::from_secs(30),
                 fleet: fleet(),
                 boot_grace: Duration::from_secs(30),

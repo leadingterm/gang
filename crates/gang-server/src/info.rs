@@ -2,7 +2,7 @@
 
 use gang_config::EndpointTrust;
 use gang_spi::{LoginPort, Scheme};
-use gang_types::{CertificatePem, Isa, ProviderName, Url};
+use gang_types::{CertificatePem, Isa, ProviderName};
 use gang_wire::name::SERVER;
 use gang_wire::{Authentication, DeviceLogin, NoAuthentication, Server, TokenAuthentication};
 
@@ -49,10 +49,6 @@ pub(crate) fn wire_server<V: LoginPort>(
         authentication,
     })
 }
-/// Advertises the dedicated execution gRPC URL while leaving the cache on the public endpoint.
-pub(crate) fn advertise_execution(server: &mut Server<serde_json::Value>, endpoint: &Url) {
-    server.remote_executor = endpoint.clone();
-}
 
 /// Advertises device login on token authentication when its routes are mounted.
 pub(crate) fn advertise_device_login(
@@ -75,8 +71,8 @@ mod tests {
     use gang_types::{CertificatePem, Isa, ProviderName, Url};
     use gang_wire::{Authentication, NoAuthentication, TokenAuthentication};
 
-    use super::{advertise_execution, wire_server};
-    use crate::endpoint::{ExecutionEndpoint, PublicEndpoint};
+    use super::wire_server;
+    use crate::endpoint::PublicEndpoint;
     use crate::errors::ServerError;
     use crate::identity::{Provider, Providers};
     use crate::test_support::FakeVerifier;
@@ -187,41 +183,6 @@ mod tests {
             "grpcs://gang.example.test:8443/base"
         );
         assert_eq!(secure.remote_cache, secure.remote_executor);
-    }
-
-    #[test]
-    fn dedicated_execution_does_not_change_the_cache_endpoint() {
-        let mut info = wire_server(
-            &endpoint("https://gang.example.test/"),
-            Isa::X86_64,
-            EndpointTrust::System,
-            None,
-            Scheme::None,
-            &providers(),
-        )
-        .expect("server info builds");
-        let execution = ExecutionEndpoint::try_new(
-            Url::parse("https://execution.example.test:8443/base").expect("url parses"),
-            true,
-        )
-        .expect("execution endpoint is valid");
-        advertise_execution(&mut info, execution.remote());
-        assert_eq!(
-            info.remote_executor.as_str(),
-            "grpcs://execution.example.test:8443/base"
-        );
-        assert_eq!(info.remote_cache.as_str(), "grpcs://gang.example.test/");
-        let plaintext = ExecutionEndpoint::try_new(
-            Url::parse("http://execution.example.test:8080/").expect("url parses"),
-            false,
-        )
-        .expect("execution endpoint is valid");
-        advertise_execution(&mut info, plaintext.remote());
-        assert_eq!(
-            info.remote_executor.as_str(),
-            "grpc://execution.example.test:8080/"
-        );
-        assert_eq!(info.remote_cache.as_str(), "grpcs://gang.example.test/");
     }
 
     #[test]

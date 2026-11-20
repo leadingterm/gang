@@ -297,6 +297,7 @@ mod tests {
             ObservationSink::channel(NonZeroUsize::MIN, NonZeroUsize::MIN);
         let (content, action) = (RenderedStoreSpec(content), RenderedStoreSpec(action));
         let spec = ControllerSpec {
+            actions: Arc::new(gang_config::ActionsConfig::default()),
             content_store: &content,
             action_store: &action,
             fleets: &fleets,

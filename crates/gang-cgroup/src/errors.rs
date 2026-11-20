@@ -69,6 +69,14 @@ pub enum CgroupError {
         /// The interface file that is absent.
         file: &'static str,
     },
+    /// The reserved memory leaves no capacity for actions.
+    #[error("memory reserve {reserve} bytes must be less than effective memory {effective} bytes")]
+    ReserveTooLarge {
+        /// Requested reserve in bytes.
+        reserve: u64,
+        /// Physical memory limited by the cgroup ancestors.
+        effective: u64,
+    },
     /// The command could not join its action scope, so it was not started.
     #[error("cannot join the action scope {}", scope.display())]
     Join {

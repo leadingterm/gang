@@ -44,6 +44,9 @@ pub fn apply(state: &mut State, delta: &Delta) -> Result<(), ApplyError> {
     let limit: usize = state.events_limit.saturating_into();
     let excess = state.events.len().saturating_sub(limit);
     state.events.drain(..excess);
+    if let Some(events) = &delta.status_events {
+        state.status_events.clone_from(events);
+    }
     if let Some(completed) = delta.completed {
         state.completed = completed;
     }

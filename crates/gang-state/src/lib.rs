@@ -20,6 +20,7 @@ mod builder;
 mod diff;
 mod errors;
 mod events;
+mod infrastructure;
 mod inputs;
 pub mod sse;
 

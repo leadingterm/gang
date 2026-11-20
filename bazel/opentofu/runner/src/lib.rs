@@ -7,6 +7,8 @@
 
 mod contract;
 mod errors;
+mod upgrade;
 
 pub use contract::{Contract, Step};
 pub use errors::RunError;
+pub use upgrade::upgrade_fixture;

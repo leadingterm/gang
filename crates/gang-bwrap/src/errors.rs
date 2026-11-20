@@ -29,6 +29,9 @@ pub(crate) enum BwrapError {
     /// The pipe `bwrap` reports the sandbox on could not be created or prepared.
     #[error("cannot create the pipe bwrap reports the sandbox on")]
     InfoPipe(#[source] io::Error),
+    /// The synthetic identity pipes could not be created or prepared.
+    #[error("cannot prepare the sandbox identity")]
+    Identity(#[source] io::Error),
     /// The sandbox report could not be read from the pipe.
     #[error("cannot read the sandbox bwrap reported")]
     Info(#[source] io::Error),

@@ -129,6 +129,9 @@ pub struct Delta {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[ts(as = "Option<Vec<Event>>", optional)]
     pub events: Vec<Event>,
+    /// A whole replacement of the live infrastructure observations; an empty list clears them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_events: Option<Vec<Event>>,
     /// A new count of completed actions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "number")]
@@ -161,6 +164,7 @@ impl Delta {
             && keyed_is_empty(self.instances.as_ref())
             && self.actions.as_ref().is_none_or(ActionsDelta::is_empty)
             && self.events.is_empty()
+            && self.status_events.is_none()
             && self.completed.is_none()
             && self.recent.is_none()
             && keyed_is_empty(self.builds.as_ref())
@@ -414,6 +418,18 @@ mod tests {
         };
         assert!(delta.events.is_empty());
         assert_eq!(frame.id(), Some(48_112));
+    }
+
+    #[test]
+    fn empty_status_replacement_clears_status_and_is_not_an_empty_delta() {
+        let value = json!({
+            "seq": 2, "base": 1, "updateTime": "1970-01-01T00:00:00.000Z",
+            "statusEvents": []
+        });
+        let delta: Delta = serde_json::from_value(value.clone()).expect("delta parses");
+        assert_eq!(delta.status_events, Some(Vec::new()));
+        assert!(!delta.is_empty());
+        assert_eq!(serde_json::to_value(delta).expect("serializes"), value);
     }
 
     #[test]

@@ -70,6 +70,7 @@ pub fn render(
         "build --grpc_keepalive_timeout={}s",
         gang_types::health::CLIENT_KEEPALIVE_TIMEOUT.as_secs()
     ));
+    lines.push("build --remote_download_outputs=toplevel".to_owned());
     if matches!(info.authentication, Authentication::Token(_)) {
         lines.push(format!(
             "# The gang that Bazel runs for credentials; run `{writer}` again if it moves."
@@ -82,6 +83,10 @@ pub fn render(
     lines.push(format!(
         "build --remote_default_exec_properties={}",
         quote(&format!("{}={}", property::ISA, info.default_isa))
+    ));
+    lines.push(format!(
+        "build --remote_default_exec_properties={}=identity-roots-v1",
+        property::ACTION_ENVIRONMENT
     ));
     if info.ca_certificate.is_some() {
         lines.push(format!("build --tls_certificate={}", quote(certificate)));
@@ -191,11 +196,26 @@ mod tests {
             "build --remote_cache=grpcs://cache.example.test:443",
             "build --credential_helper=gang.example.test=/usr/local/bin/gang",
             "build --remote_default_exec_properties=ISA=x86-64",
+            "build --remote_default_exec_properties=gang_action_environment=identity-roots-v1",
             "build --tls_certificate=gang-ca.pem",
         ] {
             assert!(
                 rendered.lines().any(|actual| actual == line),
                 "missing {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_writers_download_only_toplevel_outputs_by_default() {
+        for writer in [BazelrcWriter::Bazelrc, BazelrcWriter::Setup] {
+            let rendered = render(&info(token(), None), "host", "gang", CA_FILE_NAME, writer);
+            assert_eq!(
+                rendered
+                    .lines()
+                    .filter(|line| line.starts_with("build --remote_download_outputs="))
+                    .collect::<Vec<_>>(),
+                ["build --remote_download_outputs=toplevel"]
             );
         }
     }
@@ -277,6 +297,9 @@ mod tests {
         assert!(rendered.contains("build --remote_executor=grpcs://exec.example.test:443\n"));
         assert!(rendered.contains("build --remote_cache=grpcs://cache.example.test:443\n"));
         assert!(rendered.contains("build --remote_default_exec_properties=ISA=x86-64\n"));
+        assert!(rendered.contains(
+            "build --remote_default_exec_properties=gang_action_environment=identity-roots-v1\n"
+        ));
         assert!(!rendered.contains("--credential_helper"));
         assert!(!rendered.contains("--tls_certificate"));
     }

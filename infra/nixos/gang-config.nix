@@ -43,7 +43,7 @@
       }
 
       user_data=$(imds_get user-data)
-      # The first line names the role, parameter, and optionally the controller state device.
+      # The first line names the role, configuration parameter reference, and optionally the controller state device.
       first_line=$(printf '%s\n' "$user_data" | head -n 1)
       read -r role name state rest <<<"$first_line"
       case "$role" in
@@ -58,7 +58,7 @@
         expected+=" $state"
       fi
       if [ -z "$name" ] || [ -n "$rest" ] || [ "$first_line" != "$expected" ]; then
-        echo "gang-config: the first line of EC2 user-data must be '<role> <parameter>' or 'controller <parameter> state=<stateDevice>'" >&2
+        echo "gang-config: the first line of EC2 user-data must be '<role> <config-parameter-reference>' or 'controller <config-parameter-reference> state=<stateDevice>'" >&2
         exit 1
       fi
       if [ -n "$state" ] && { [ "$role" != controller ] || [ "$state" != ${lib.escapeShellArg "state=${config.gang.stateDevice}"} ]; }; then
@@ -82,7 +82,7 @@
           sleep 2
         done
         if [ -z "$value" ]; then
-          echo "gang-config: SSM parameter $1 is empty or unreadable" >&2
+          echo "gang-config: SSM parameter reference $1 is empty or unreadable" >&2
           exit 1
         fi
         printf '%s' "$value"
@@ -205,7 +205,7 @@ in {
     };
 
     systemd.services.gang-config = {
-      description = "Write gang.toml from the SSM parameter named in EC2 user-data and start the role it names";
+      description = "Write gang.toml from the SSM configuration parameter reference in EC2 user-data and start the role it names";
       wantedBy = ["multi-user.target"];
       wants = ["network-online.target"];
       after = ["network-online.target"];

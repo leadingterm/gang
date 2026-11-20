@@ -9,25 +9,27 @@ use std::path::PathBuf;
 use gang_clock::Timestamp;
 use gang_spi::{
     Acquisition, ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, ActionsView,
-    ApiService, Authenticated, AuthenticationHost, AuthenticationPort, CacheStorePort,
-    Capabilities, CertStatus, CertificateIssue, CertificateSignerPort, CertificateTarget,
-    ClientCertificates, ControllerConnections, ControllerEndpoints, ControllerHostPort,
+    ApiService, ApplyRecords, Authenticated, AuthenticationHost, AuthenticationPort,
+    CacheStorePort, CandidateGeneration, CandidatePriority, Capabilities, CertStatus,
+    CertificateIssue, CertificateSignerPort, CertificateTarget, ClientCertificates,
+    ControllerConnections, ControllerEndpoints, ControllerHostIdentity, ControllerHostPort,
     ControllerId, ControllerReady, ControllerSpec, CredentialLifecyclePort, Evidence,
     ExpiringRecordPort, FleetInstance, FleetOptions, FleetSupply, Held, HostMilestone, Insert,
-    InstanceIdentity, IssuedCertRecord, IssuedCertificate, IssuedToken, LeaderLeasePort, Lease,
-    LeaseEpoch, ListingLimits, LoginChallenge, LoginClient, LoginGrant, LoginPort, LoginRequest,
-    LoginSupport, MeasuredUsage, MountedScratchVolume, NodeLifecyclePort, Plugin, PluginContext,
-    PortError, PreemptionNotice, PrincipalRecord, ProofVerifierPort, ProvisionerPort, QueuedDemand,
-    Record, RecordKey, RecordVersion, RecordedScalingEvent, Rejection, Remove, RenderedStoreSpec,
-    Renewal, Replace, RequestGate, RevocationEpoch, SandboxPrograms, SandboxedAction,
-    ScalingAuditEvent, ScalingEventSeq, SchedulerPort, SchedulerSnapshot, Scheme,
-    ScratchVolumePort, SignatureAlgorithm, StateRepositoryPort, StoreAccess, Subject, TokenIssue,
-    WorkerSpec, WorkerTls, WorkloadCredentialPort,
+    InstanceIdentity, IssuedCertRecord, IssuedCertificate, IssuedToken, LeaderLeasePort,
+    LearnedHistory, Lease, LeaseCandidate, LeaseEpoch, ListingLimits, LoginChallenge, LoginClient,
+    LoginGrant, LoginPort, LoginRequest, LoginSupport, MeasuredUsage, MountedScratchVolume,
+    NodeLifecyclePort, Plugin, PluginContext, PortError, PreemptionNotice, PrincipalRecord,
+    ProofVerifierPort, ProvisionerPort, QueuedDemand, Record, RecordBatchSeq, RecordChange,
+    RecordId, RecordKey, RecordKind, RecordVersion, RecordedScalingEvent, Rejection, Remove,
+    RenderedStoreSpec, Renewal, Replace, RequestGate, RevocationEpoch, SandboxPrograms,
+    SandboxedAction, ScalingAuditEvent, ScalingEventSeq, SchedulerPort, SchedulerSnapshot, Scheme,
+    ScratchVolumePort, SignatureAlgorithm, StateRepositoryPort, StoreAccess, Subject, Takeover,
+    TokenIssue, WorkerSpec, WorkerTls, WorkloadCredentialPort, validate_record_changes,
 };
 use gang_types::{
     ActionResources, AuthenticationSettings, Bytes, CertSerial, Fleet, FleetName, FleetSet,
     Identity, InstanceId, InstanceLifecycle, Isa, LoginSession, Principal, Proof, ProviderName,
-    RefreshToken, SchedulerSettings, Url, WorkerId, WorkerLifetime,
+    RefreshToken, Url, WorkerId, WorkerLifetime,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -48,8 +50,6 @@ impl SandboxPrograms for NumberConfig {
         Ok(())
     }
 }
-
-impl SchedulerSettings for NumberConfig {}
 
 /// Declares a plugin built from `number = N`. Test crates reuse it through `#[macro_use] mod support;`.
 macro_rules! numbered_plugin {
@@ -167,6 +167,18 @@ macro_rules! provisioner_plugin {
         impl ProvisionerPort for $plugin {
             type FleetOptions = $options;
 
+            fn reset_configured_fleets(&self) {
+                self.seen.lock().clear();
+            }
+
+            fn configure_fleet(
+                &self,
+                fleet: Fleet<'_, Self::FleetOptions>,
+            ) -> Result<(), PortError> {
+                self.record(fleet.options);
+                Ok(())
+            }
+
             async fn supply(
                 &self,
                 fleet: Fleet<'_, Self::FleetOptions>,
@@ -174,6 +186,8 @@ macro_rules! provisioner_plugin {
             ) -> Result<(), PortError> {
                 self.record(fleet.options);
                 into.desired = *self.desired.lock();
+                into.requested = None;
+                into.events.clear();
                 into.instances.clear();
                 into.exits.clear();
                 into.warm = 0;
@@ -233,6 +247,10 @@ macro_rules! provisioner_plugin {
         }
 
         impl ControllerHostPort for $plugin {
+            async fn incarnation(&self) -> Result<ControllerHostIdentity, PortError> {
+                Ok(ControllerHostIdentity::Persistent(instance(self.number)?))
+            }
+
             async fn retiring(&self) -> Result<(), PortError> {
                 std::future::pending().await
             }
@@ -338,6 +356,7 @@ signer_plugin!(SignerFile);
 pub struct Stub {
     number: u32,
     endpoints: ControllerEndpoints,
+    history: Mutex<Vec<LearnedHistory>>,
 }
 
 impl Plugin for Stub {
@@ -347,6 +366,7 @@ impl Plugin for Stub {
         Ok(Self {
             number: config.number,
             endpoints: controller_endpoints(config.number)?,
+            history: Mutex::new(Vec::new()),
         })
     }
 }
@@ -359,6 +379,48 @@ fn controller_endpoints(number: u32) -> Result<ControllerEndpoints, PortError> {
 }
 
 impl SchedulerPort for Stub {
+    fn learned_history_byte_limit(&self) -> Result<NonZeroUsize, PortError> {
+        Ok(NonZeroUsize::MAX)
+    }
+
+    async fn learned_history(
+        &self,
+        now: Timestamp,
+        into: &mut Vec<LearnedHistory>,
+    ) -> Result<(), PortError> {
+        into.clear();
+        into.extend(
+            self.history
+                .lock()
+                .iter()
+                .filter(|record| record.expires_at > now)
+                .cloned(),
+        );
+        Ok(())
+    }
+
+    async fn restore_learned_history(
+        &self,
+        now: Timestamp,
+        records: &[LearnedHistory],
+    ) -> Result<(), PortError> {
+        let mut history = self.history.lock();
+        history.clear();
+        history.extend(
+            records
+                .iter()
+                .filter(|record| {
+                    record.expires_at > now
+                        && matches!(
+                            record.key.kind,
+                            RecordKind::ResourceHistory | RecordKind::DurationHistory
+                        )
+                })
+                .cloned(),
+        );
+        Ok(())
+    }
+
     async fn snapshot(&self, into: &mut SchedulerSnapshot) -> Result<(), PortError> {
         into.workers.clear();
         // An empty worker list is sorted by id.
@@ -405,6 +467,15 @@ impl SchedulerPort for Stub {
         Ok(())
     }
 
+    async fn serve_standby<P: RequestGate, W: RequestGate, A: ApiService>(
+        &self,
+        _connections: ControllerConnections<P, W, A>,
+    ) -> Result<(), PortError> {
+        Err(PortError::unavailable(
+            "scheduler stub does not prepare shared services",
+        ))
+    }
+
     async fn run_worker(
         &self,
         _spec: &WorkerSpec,
@@ -426,6 +497,8 @@ struct MemoryState {
     principals: BTreeMap<Identity, PrincipalRecord>,
     revocation_epoch: u64,
     lease: Option<MemoryLease>,
+    candidate_counter: u64,
+    controller_hosts: BTreeMap<InstanceId, CandidateGeneration>,
     records: BTreeMap<RecordKey, Record>,
 }
 
@@ -433,6 +506,10 @@ struct MemoryLease {
     holder: Option<ControllerId>,
     epoch: LeaseEpoch,
     expires_at: Timestamp,
+    record_sequence: u64,
+    holder_priority: Option<CandidatePriority>,
+    holder_priority_epoch: LeaseEpoch,
+    request: Option<(LeaseCandidate, LeaseEpoch, Timestamp)>,
 }
 
 impl Plugin for Memory {
@@ -663,54 +740,145 @@ impl StateRepositoryPort for Memory {
 }
 
 impl LeaderLeasePort for Memory {
-    async fn acquire(
+    async fn register_candidate(
         &self,
         holder: &ControllerId,
+        host: &ControllerHostIdentity,
+    ) -> Result<LeaseCandidate, PortError> {
+        let mut state = self.state.lock();
+        let priority = match host {
+            ControllerHostIdentity::Persistent(instance) => {
+                let generation = if let Some(generation) = state.controller_hosts.get(instance) {
+                    *generation
+                } else {
+                    state.candidate_counter = state
+                        .candidate_counter
+                        .checked_add(1)
+                        .ok_or_else(|| PortError::backend("candidate generation overflow"))?;
+                    let generation = CandidateGeneration::new(state.candidate_counter);
+                    state.controller_hosts.insert(instance.clone(), generation);
+                    generation
+                };
+                CandidatePriority::registered(generation)
+            }
+            ControllerHostIdentity::Launched { at, instance } => {
+                CandidatePriority::launched(*at, instance)
+            }
+        };
+        Ok(LeaseCandidate {
+            holder: holder.clone(),
+            priority,
+        })
+    }
+
+    async fn acquire(
+        &self,
+        candidate: &LeaseCandidate,
+        now: Timestamp,
         stale_before: Timestamp,
         expires_at: Timestamp,
+        takeover: Takeover,
     ) -> Result<Acquisition, PortError> {
         let mut state = self.state.lock();
-        if let Some(current) = &state.lease
-            && let Some(current_holder) = &current.holder
-            && current.expires_at >= stale_before
-        {
-            return Ok(Acquisition::Held(Lease {
-                holder: current_holder.clone(),
-                epoch: current.epoch,
-                expires_at: current.expires_at,
-            }));
+        if let Some(row) = state.lease.as_mut() {
+            let effective = row
+                .holder_priority
+                .as_ref()
+                .filter(|_| row.holder_priority_epoch == row.epoch);
+            let live_request = row
+                .request
+                .as_ref()
+                .filter(|(_, epoch, expiry)| *epoch == row.epoch && *expiry > now);
+            let blocked = row.holder.is_some() && row.expires_at >= stale_before;
+            if blocked {
+                let holder = row.holder.as_ref().expect("blocked requires holder");
+                let eligible = candidate.holder != *holder
+                    && effective.is_none_or(|priority| candidate.priority > *priority);
+                let held = Lease {
+                    holder: holder.clone(),
+                    epoch: row.epoch,
+                    expires_at: row.expires_at,
+                };
+                if eligible
+                    && takeover == Takeover::Request
+                    && live_request.is_none_or(|(pending, _, _)| {
+                        pending == candidate || candidate.priority > pending.priority
+                    })
+                {
+                    row.request = Some((candidate.clone(), row.epoch, expires_at));
+                }
+                return Ok(if eligible && row.expires_at > now {
+                    Acquisition::Contending(held)
+                } else {
+                    Acquisition::Held(held)
+                });
+            }
+            if let Some((pending, _, _)) = live_request
+                && pending != candidate
+                && !(takeover == Takeover::Request && candidate.priority > pending.priority)
+            {
+                return Ok(Acquisition::Reserved);
+            }
         }
-        let previous = state.lease.as_ref().map_or(0, |lease| lease.epoch.get());
-        let epoch = previous
+        let epoch = state
+            .lease
+            .as_ref()
+            .map_or(0, |row| row.epoch.get())
             .checked_add(1)
-            .ok_or_else(|| PortError::backend(std::io::Error::other("lease epoch overflow")))?;
+            .ok_or_else(|| PortError::backend("controller lease epoch overflow"))?;
         let lease = Lease {
-            holder: holder.clone(),
+            holder: candidate.holder.clone(),
             epoch: LeaseEpoch::new(epoch),
             expires_at,
         };
         state.lease = Some(MemoryLease {
-            holder: Some(holder.clone()),
+            holder: Some(candidate.holder.clone()),
             epoch: lease.epoch,
             expires_at,
+            record_sequence: 0,
+            holder_priority: Some(candidate.priority.clone()),
+            holder_priority_epoch: lease.epoch,
+            request: None,
         });
         Ok(Acquisition::Acquired(lease))
     }
 
-    async fn renew(&self, lease: &Lease, expires_at: Timestamp) -> Result<Renewal, PortError> {
+    async fn renew(
+        &self,
+        lease: &Lease,
+        now: Timestamp,
+        expires_at: Timestamp,
+    ) -> Result<Renewal, PortError> {
         let mut state = self.state.lock();
-        if let Some(current) = state.lease.as_mut()
-            && current.holder.as_ref() == Some(&lease.holder)
-            && current.epoch == lease.epoch
-        {
-            current.expires_at = expires_at;
-            return Ok(Renewal::Renewed(Lease {
-                holder: lease.holder.clone(),
-                epoch: lease.epoch,
-                expires_at,
-            }));
+        match state.lease.as_mut() {
+            Some(row) if row.holder.as_ref() == Some(&lease.holder) && row.epoch == lease.epoch => {
+                row.expires_at = expires_at;
+                let renewed = Lease {
+                    holder: lease.holder.clone(),
+                    epoch: row.epoch,
+                    expires_at,
+                };
+                let yielding = row
+                    .request
+                    .as_ref()
+                    .is_some_and(|(candidate, epoch, expiry)| {
+                        *epoch == row.epoch
+                            && *expiry > now
+                            && candidate.holder != lease.holder
+                            && row
+                                .holder_priority
+                                .as_ref()
+                                .filter(|_| row.holder_priority_epoch == row.epoch)
+                                .is_none_or(|priority| candidate.priority > *priority)
+                    });
+                Ok(if yielding {
+                    Renewal::YieldRequested(renewed)
+                } else {
+                    Renewal::Renewed(renewed)
+                })
+            }
+            _ => Ok(Renewal::Lost),
         }
-        Ok(Renewal::Lost)
     }
 
     async fn release(&self, lease: &Lease) -> Result<(), PortError> {
@@ -726,6 +894,81 @@ impl LeaderLeasePort for Memory {
 }
 
 impl ExpiringRecordPort for Memory {
+    async fn records(
+        &self,
+        kind: RecordKind,
+        after: Option<RecordId>,
+        limit: NonZeroUsize,
+        now: Timestamp,
+        into: &mut Vec<(RecordId, Record)>,
+    ) -> Result<bool, PortError> {
+        let state = self.state.lock();
+        into.clear();
+        let start = after.map_or(
+            std::ops::Bound::Included(RecordKey {
+                kind,
+                id: RecordId::new([0; 32]),
+            }),
+            |id| std::ops::Bound::Excluded(RecordKey { kind, id }),
+        );
+        for (key, record) in state.records.range((start, std::ops::Bound::Unbounded)) {
+            if key.kind != kind {
+                break;
+            }
+            if record.expires_at <= now {
+                continue;
+            }
+            if into.len() == limit.get() {
+                return Ok(true);
+            }
+            into.push((key.id, record.clone()));
+        }
+        Ok(false)
+    }
+
+    async fn apply(
+        &self,
+        lease: &Lease,
+        sequence: RecordBatchSeq,
+        version: RecordVersion,
+        now: Timestamp,
+        changes: &[RecordChange<'_>],
+    ) -> Result<ApplyRecords, PortError> {
+        validate_record_changes(changes).map_err(PortError::backend)?;
+        let mut state = self.state.lock();
+        let Some(row) = state.lease.as_mut().filter(|row| {
+            row.holder.as_ref() == Some(&lease.holder)
+                && row.epoch == lease.epoch
+                && row.expires_at > now
+                && row.record_sequence < sequence.get()
+        }) else {
+            return Ok(ApplyRecords::Fenced);
+        };
+        row.record_sequence = sequence.get();
+        for change in changes {
+            match *change {
+                RecordChange::Put {
+                    key,
+                    body,
+                    expires_at,
+                } => {
+                    state.records.insert(
+                        key,
+                        Record {
+                            body: body.to_vec(),
+                            version,
+                            expires_at,
+                        },
+                    );
+                }
+                RecordChange::Delete { key } => {
+                    state.records.remove(&key);
+                }
+            }
+        }
+        Ok(ApplyRecords::Applied)
+    }
+
     async fn insert(
         &self,
         records: &[(RecordKey, &[u8])],
@@ -734,6 +977,13 @@ impl ExpiringRecordPort for Memory {
         expires_at: Timestamp,
     ) -> Result<Insert, PortError> {
         let mut state = self.state.lock();
+        if records
+            .iter()
+            .enumerate()
+            .any(|(index, (key, _))| records[..index].iter().any(|(previous, _)| previous == key))
+        {
+            return Ok(Insert::Exists);
+        }
         if records.iter().any(|(key, _)| {
             state
                 .records

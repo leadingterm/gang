@@ -55,6 +55,7 @@ impl Fixture {
             advertise_device_login(&mut info, &device.provider);
         }
         let api = Api::new(ApiParts {
+            readiness: crate::health::Readiness::for_test(),
             core: Arc::clone(&harness.core),
             revocations: Revocations::new(
                 Arc::clone(&harness.core),
@@ -68,8 +69,6 @@ impl Fixture {
                 Arc::clone(&harness.clock),
             )),
             dashboard: None,
-            leader_routes: None,
-            ingest: None,
             builds: crate::builds::BuildsCell::new(&gang_config::BuildsConfig::default()),
             login_provider: harness.routes.login_provider().cloned(),
             device: mounted,
@@ -412,7 +411,7 @@ async fn authenticate_reuses_rotated_grant_after_signer_failure() {
     fixture
         .harness
         .gate
-        .admit(&Peer::default(), &mut parts)
+        .admit(gang_spi::RequestScope::Shared, &Peer::default(), &mut parts)
         .await
         .expect("the gate admits the open API route");
     let authenticated = Caller::of(&parts.extensions)
@@ -515,6 +514,7 @@ async fn a_second_core_continues_a_device_login() -> gang_testkit::TestResult {
     let original = &fixture.harness.core;
     let core: Arc<Core<TlsDeployment>> = Core::new(
         Host {
+            proxy_protocol: Arc::clone(&original.host.proxy_protocol),
             repository: original.host.repository.clone(),
             signer: Arc::clone(&original.host.signer),
             security: Security::Plaintext,

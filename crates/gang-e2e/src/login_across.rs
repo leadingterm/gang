@@ -153,17 +153,18 @@ fn judged(name: &'static str, verdict: std::result::Result<(), String>) -> Check
     }
 }
 
-/// Creates, approves and redeems a device authorization across the two listeners.
+/// Creates and starts approving a device authorization before leadership changes.
 fn device_checks(
+    cluster: &Cluster<'_>,
     client: &Http,
     issuer: &Http,
-    a: &Url,
-    b: &Url,
+    leader: usize,
     public: &Url,
-) -> Result<(Check, Check)> {
+) -> Result<(Check, Check, usize, Option<String>)> {
+    let a = cluster.direct_endpoint(leader);
     let created = exchange(
         client,
-        a,
+        &a,
         &Request::new(Method::POST, DEVICES).body("application/json", b"{}".to_vec()),
     )?;
     let value: serde_json::Value = serde_json::from_slice(&created.body)
@@ -183,32 +184,36 @@ fn device_checks(
         .get("secret")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| E2eError::system("device creation returned no secret"))?;
-    let pending = exchange(client, b, &Request::get(format!("{DEVICES}/{code}")))?;
+    let pending = exchange(client, &a, &Request::get(format!("{DEVICES}/{code}")))?;
     let body = serde_json::to_vec(&gang_wire::ApproveDeviceAuthorizationRequest {
         user_code: code.to_owned(),
     })
     .map_err(E2eError::system_from("serializing device approval"))?;
     let started = exchange(
         client,
-        a,
+        &a,
         &Request::new(Method::POST, DEVICE_PATH)
             .header("origin", public.origin().ascii_serialization())
             .header("sec-fetch-site", "same-origin")
             .body("application/json", body),
     )?;
-    let during_approval = exchange(client, b, &Request::get(format!("{DEVICES}/{code}")))?;
+    let during_approval = exchange(client, &a, &Request::get(format!("{DEVICES}/{code}")))?;
     let approval: gang_wire::ApproveDeviceAuthorizationResponse =
         serde_json::from_slice(&started.body)
             .map_err(E2eError::system_from("parsing device approval"))?;
+    cluster.retire(leader)?;
+    let next = cluster.wait_for_leader_except(Some(leader))?;
+    cluster.wait_for_single_leader(next)?;
+    let b = cluster.direct_endpoint(next);
     let (provider_location, done) = callback(
         client,
         issuer,
-        a,
+        &b,
         public,
         &started,
         &approval.authorization_url,
     )?;
-    let redeemed = redeem(client, b, code, secret)?;
+    let redeemed = redeem(client, &b, code, secret)?;
     let token = serde_json::from_slice::<serde_json::Value>(&redeemed.body)
         .ok()
         .and_then(|value| {
@@ -217,33 +222,31 @@ fn device_checks(
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         });
-    let mut statuses = Vec::new();
-    if let Some(token) = &token {
-        for endpoint in [a, b] {
-            statuses.push(
-                exchange(
-                    client,
-                    endpoint,
-                    &Request::get(SESSION).presenting(Presented::Bearer(token.clone())),
-                )?
-                .status,
-            );
-        }
-    }
+    let status = token
+        .as_ref()
+        .map(|token| {
+            exchange(
+                client,
+                &b,
+                &Request::get(SESSION).presenting(Presented::Bearer(token.clone())),
+            )
+        })
+        .transpose()?
+        .map(|answer| answer.status);
     let device = device_resource(&pending, code, "127.0.0.1")
         .and_then(|()| device_resource(&during_approval, code, "127.0.0.1"))
         .and_then(|()| device_approved(&started, &provider_location, &done, cookie_name(public)))
         .and_then(|()| {
-            if redeemed.status == 200 && statuses == [200, 200] {
+            if redeemed.status == 200 && status == Some(200) {
                 Ok(())
             } else {
                 Err(format!(
-                    "redeem status {}; bearer session statuses {statuses:?}",
+                    "redeem status {}; bearer session status {status:?}",
                     redeemed.status
                 ))
             }
         });
-    let replay = redeem(client, a, code, secret)?;
+    let replay = redeem(client, &b, code, secret)?;
     let replay_verdict = if redeemed.status == 200 {
         refused_with(&replay, 404, "DEVICE_AUTHORIZATION_NOT_FOUND")
     } else {
@@ -252,7 +255,12 @@ fn device_checks(
             redeemed.status
         ))
     };
-    Ok((judged(DEVICE, device), judged(REPLAY, replay_verdict)))
+    Ok((
+        judged(DEVICE, device),
+        judged(REPLAY, replay_verdict),
+        next,
+        token,
+    ))
 }
 
 /// A 200 session may be anonymous; both controllers must identify the same principal.
@@ -280,9 +288,21 @@ fn browser_sessions_match(a: &Answer, b: &Answer) -> std::result::Result<(), Str
     }
 }
 
-/// Starts browser sign-in on A and completes its issuer callback on B.
-fn browser_check(client: &Http, issuer: &Http, a: &Url, b: &Url, public: &Url) -> Result<Check> {
-    let browser_start = exchange(client, a, &Request::get(format!("{LOGIN_PATH}?next=%2Fui")))?;
+/// Preserves a browser session across a second leadership change.
+fn browser_check(
+    cluster: &Cluster<'_>,
+    client: &Http,
+    issuer: &Http,
+    leader: usize,
+    public: &Url,
+    token: Option<&str>,
+) -> Result<(Check, Check)> {
+    let a = cluster.direct_endpoint(leader);
+    let browser_start = exchange(
+        client,
+        &a,
+        &Request::get(format!("{LOGIN_PATH}?next=%2Fui")),
+    )?;
     let location = browser_start
         .header("location")
         .filter(|_| browser_start.status == 302)
@@ -293,7 +313,7 @@ fn browser_check(client: &Http, issuer: &Http, a: &Url, b: &Url, public: &Url) -
             ))
         })?;
     let authorization = Url::parse(location).map_err(E2eError::parse("the authorization url"))?;
-    let (_, browser_done) = callback(client, issuer, b, public, &browser_start, &authorization)?;
+    let (_, browser_done) = callback(client, issuer, &a, public, &browser_start, &authorization)?;
     let browser = redirected_to(&browser_done, "/ui").and_then(|()| {
         if set_cookies(&browser_done)
             .iter()
@@ -304,31 +324,68 @@ fn browser_check(client: &Http, issuer: &Http, a: &Url, b: &Url, public: &Url) -
             Err("browser callback did not set a session cookie".to_owned())
         }
     });
-    let start_on_b = exchange(client, b, &Request::get(format!("{LOGIN_PATH}?next=%2Fui")))?;
-    let location = start_on_b
-        .header("location")
-        .filter(|_| start_on_b.status == 302)
-        .ok_or_else(|| E2eError::system("browser login on B did not redirect"))?;
-    let authorization = Url::parse(location).map_err(E2eError::parse("the authorization url"))?;
-    let (_, done_on_a) = callback(client, issuer, a, public, &start_on_b, &authorization)?;
-    let session = set_cookies(&done_on_a)
-        .into_iter()
-        .find(|cookie| cookie.name == cookie_name(public) && !cookie.value.is_empty());
+    let mut bearer_survived = false;
     let browser = browser.and_then(|()| {
-        let cookie = session
-            .ok_or_else(|| "browser callback on A did not set a session cookie".to_owned())?;
+        let cookie = set_cookies(&browser_done)
+            .into_iter()
+            .find(|cookie| cookie.name == cookie_name(public) && !cookie.value.is_empty())
+            .ok_or_else(|| "browser callback did not set a session cookie".to_owned())?;
         let request = Request::get(SESSION).presenting(Presented::Cookie(SessionCookie {
             name: cookie.name,
             value: cookie.value,
         }));
-        let on_a = exchange(client, a, &request).map_err(|error| error.to_string())?;
-        let on_b = exchange(client, b, &request).map_err(|error| error.to_string())?;
-        browser_sessions_match(&on_a, &on_b)
+        let before = exchange(client, &a, &request).map_err(|error| error.to_string())?;
+        let bearer_before = token
+            .map(|token| {
+                exchange(
+                    client,
+                    &a,
+                    &Request::get(SESSION).presenting(Presented::Bearer(token.to_owned())),
+                )
+            })
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        cluster
+            .start_controller()
+            .map_err(|error| error.to_string())?;
+        cluster.retire(leader).map_err(|error| error.to_string())?;
+        let next = cluster
+            .wait_for_leader_except(Some(leader))
+            .map_err(|error| error.to_string())?;
+        cluster
+            .wait_for_single_leader(next)
+            .map_err(|error| error.to_string())?;
+        let after = exchange(client, &cluster.direct_endpoint(next), &request)
+            .map_err(|error| error.to_string())?;
+        let bearer_after = token
+            .map(|token| {
+                exchange(
+                    client,
+                    &cluster.direct_endpoint(next),
+                    &Request::get(SESSION).presenting(Presented::Bearer(token.to_owned())),
+                )
+            })
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        bearer_survived = bearer_before
+            .as_ref()
+            .is_some_and(|answer| answer.status == 200)
+            && bearer_after
+                .as_ref()
+                .is_some_and(|answer| answer.status == 200);
+        browser_sessions_match(&before, &after)
     });
-    Ok(judged(BROWSER, browser))
+    Ok((
+        judged(BROWSER, browser),
+        Check::expect(
+            "login across: bearer token survives leader handoff",
+            bearer_survived,
+            || "bearer session did not succeed before and after handoff".to_owned(),
+        ),
+    ))
 }
 
-/// Exercises device and browser login against two direct public listeners.
+/// Exercises device and browser login across successive leader handoffs.
 ///
 /// # Errors
 /// Returns an error if an HTTP exchange fails or a prerequisite response cannot be parsed.
@@ -344,12 +401,12 @@ pub fn login_across(cluster: &Cluster<'_>) -> Result<Vec<Check>> {
         timeout,
     )?;
     let issuer = Http::try_new(HttpTransport::Plain, HttpProtocol::Negotiated, timeout)?;
-    let a = cluster.direct_endpoint(0);
-    let b = cluster.direct_endpoint(1);
+    let leader = cluster.wait_for_leader()?;
     let public = stack.endpoint()?;
-    let (device, replay) = device_checks(&client, &issuer, &a, &b, &public)?;
-    let browser = browser_check(&client, &issuer, &a, &b, &public)?;
-    Ok(vec![device, browser, replay])
+    let (device, replay, next, token) = device_checks(cluster, &client, &issuer, leader, &public)?;
+    let (browser, bearer) =
+        browser_check(cluster, &client, &issuer, next, &public, token.as_deref())?;
+    Ok(vec![device, browser, bearer, replay])
 }
 
 #[cfg(test)]

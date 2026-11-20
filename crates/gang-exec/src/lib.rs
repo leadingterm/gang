@@ -20,6 +20,8 @@
 //! assert_eq!(gang_exec::exit_status(ActionExecutionOutcome::Signaled(9)), 137);
 //! ```
 
+#![forbid(unsafe_code)]
+
 mod action_directory;
 mod errors;
 mod execute;
@@ -28,11 +30,12 @@ mod input_links;
 mod private_copy;
 mod properties;
 mod run;
+mod side_channel;
 mod terminations;
 
 pub use action_directory::ActionDirectory;
 pub use errors::{ExecError, LinkBreakError, PropertyError};
-pub use execute::{Action, execute, exit_status};
+pub use execute::{Action, Execution, execute, exit_status};
 pub use guard::guard;
 pub use input_links::break_hard_links;
 pub use properties::ActionProperties;

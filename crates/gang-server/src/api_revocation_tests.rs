@@ -192,6 +192,203 @@ async fn revoking_again_returns_the_original_revocation_time() {
 }
 
 #[tokio::test]
+async fn leader_api_refuses_before_handlers_and_preserves_decision_precedence() {
+    use crate::api::{Api, ApiParts};
+    use crate::authorizer::Authorizer;
+    use crate::gate::Caller;
+    use crate::rate_limit::RateLimiter;
+    use crate::revocation::Revocations;
+    use crate::test_support::{Harness, HarnessOptions, role_for};
+    use gang_spi::{ApiService, Authenticated, StateRepositoryPort};
+    use gang_tls::RevocationSet;
+    use gang_types::PermissionSet;
+    use std::sync::Arc;
+
+    let harness = Harness::token(HarnessOptions::default());
+    let core = harness.core.clone();
+    let settings = tls_settings();
+    let dashboard = crate::dashboard::Dashboard::start(
+        gang_config::DashboardConfig::default(),
+        "test".to_owned(),
+        std::time::Duration::from_secs(1),
+        0,
+        &*core.host.clock,
+        &core.host.repository,
+    )
+    .await
+    .expect("dashboard starts");
+    let info: gang_wire::Server<serde_json::Value> = serde_json::from_value(json!({
+        "name": "server",
+        "remoteExecutor": "grpcs://gang.example.com:443",
+        "remoteCache": "grpcs://gang.example.com:443",
+        "defaultIsa": "x86-64",
+        "authentication": {"none": {}},
+    }))
+    .expect("server info is valid");
+    let unmounted = Api::new(ApiParts {
+        readiness: crate::health::Readiness::default(),
+        core: core.clone(),
+        revocations: Revocations::new(core.clone(), RevocationSet::from_serials(Vec::new())),
+        info: info.clone(),
+        authorizer: Authorizer::new(vec![role_for("administrator", PermissionSet::all(), ADMIN)]),
+        limits: settings.limits,
+        dashboard: None,
+        builds: crate::builds::BuildsCell::new(&gang_config::BuildsConfig::default()),
+        limiter: Arc::new(RateLimiter::new(
+            &settings.rate_limit,
+            core.host.clock.clone(),
+        )),
+        login_provider: None,
+        device: None,
+    });
+    let rate_limit = serde_json::from_value(json!({
+        "client": { "burst": 1, "refill_interval": "10s" },
+        "global": { "burst": 1, "refill_interval": "10s" }
+    }))
+    .expect("rate limit config");
+    let api = Api::new(ApiParts {
+        readiness: crate::health::Readiness::default(),
+        core: core.clone(),
+        revocations: Revocations::new(core.clone(), RevocationSet::from_serials(Vec::new())),
+        info,
+        authorizer: Authorizer::new(vec![role_for("administrator", PermissionSet::all(), ADMIN)]),
+        limits: settings.limits,
+        dashboard: Some(dashboard.api()),
+        builds: crate::builds::BuildsCell::new(&gang_config::BuildsConfig::default()),
+        limiter: Arc::new(RateLimiter::new(&rate_limit, core.host.clock.clone())),
+        login_provider: None,
+        device: None,
+    });
+    let caller = Caller::Authenticated(Authenticated {
+        identity: Arc::new(identity(ADMIN)),
+        valid_until: None,
+    });
+    let mut missing = crate::test_support::api_request("GET", "/v1/state", None, None);
+    missing.extensions_mut().insert(caller.clone());
+    let missing = crate::test_support::read(unmounted.call(missing).await).await;
+    assert_eq!(missing.status, http::StatusCode::NOT_FOUND);
+    assert!(!missing.leader_unavailable);
+    let epoch = core
+        .host
+        .repository
+        .revocation_epoch()
+        .await
+        .expect("epoch");
+    assert_leader_routes_refused(&api, &caller).await;
+    assert_eq!(
+        core.host
+            .repository
+            .revocation_epoch()
+            .await
+            .expect("epoch"),
+        epoch
+    );
+    assert_decision_precedence_and_shared_routes(&api, caller).await;
+}
+
+async fn assert_leader_routes_refused<K: crate::deployment::Stack>(
+    api: &crate::api::Api<K>,
+    caller: &crate::gate::Caller,
+) {
+    use gang_spi::ApiService;
+    for (method, path) in [
+        ("GET", "/v1/builds"),
+        ("GET", "/v1/builds/0000000000000000"),
+        ("GET", "/v1/state"),
+        ("GET", "/v1/state:watch"),
+        ("POST", "/v1/certificates/3fa9:revoke"),
+        ("POST", "/v1/principals/alice:revoke"),
+        ("POST", "/v1/principals/alice:restore"),
+    ] {
+        let mut request = crate::test_support::api_request(method, path, None, None);
+        request.extensions_mut().insert(caller.clone());
+        let reply = crate::test_support::read(api.call(request).await).await;
+        assert_eq!(
+            reply.status,
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            "{path}"
+        );
+        assert!(reply.leader_unavailable, "{path}");
+        assert_eq!(
+            reply
+                .headers
+                .get(gang_types::handover::REQUEST_NOT_STARTED_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("true")
+        );
+        reply.refused(gang_wire::ErrorReason::DependencyUnavailable);
+    }
+}
+
+async fn assert_decision_precedence_and_shared_routes<K: crate::deployment::Stack>(
+    api: &crate::api::Api<K>,
+    caller: crate::gate::Caller,
+) {
+    use crate::gate::Caller;
+    use gang_spi::{ApiService, Authenticated};
+    use std::sync::Arc;
+    let anonymous = crate::test_support::read(
+        api.call(crate::test_support::api_request(
+            "GET",
+            "/v1/builds",
+            None,
+            None,
+        ))
+        .await,
+    )
+    .await;
+    assert_eq!(anonymous.status, http::StatusCode::UNAUTHORIZED);
+    assert!(!anonymous.leader_unavailable);
+    let mut forbidden = crate::test_support::api_request("GET", "/v1/builds", None, None);
+    forbidden
+        .extensions_mut()
+        .insert(Caller::Authenticated(Authenticated {
+            identity: Arc::new(identity(BOB)),
+            valid_until: None,
+        }));
+    let forbidden = crate::test_support::read(api.call(forbidden).await).await;
+    assert_eq!(forbidden.status, http::StatusCode::FORBIDDEN);
+    assert!(!forbidden.leader_unavailable);
+    let mut refused = crate::test_support::api_request("GET", "/v1/builds", None, None);
+    refused
+        .extensions_mut()
+        .insert(Caller::Refused(Arc::new(gang_spi::PortError::refused(
+            gang_spi::Rejection::InvalidProof,
+        ))));
+    let refused = crate::test_support::read(api.call(refused).await).await;
+    assert_eq!(refused.status, http::StatusCode::UNAUTHORIZED);
+    assert!(!refused.leader_unavailable);
+    let shared = crate::test_support::read(
+        api.call(crate::test_support::api_request(
+            "GET",
+            "/v1/server",
+            None,
+            None,
+        ))
+        .await,
+    )
+    .await;
+    assert_eq!(shared.status, http::StatusCode::OK);
+    let limited = crate::test_support::read(
+        api.call(crate::test_support::api_request(
+            "GET",
+            "/v1/server",
+            None,
+            None,
+        ))
+        .await,
+    )
+    .await;
+    assert_eq!(limited.status, http::StatusCode::TOO_MANY_REQUESTS);
+    assert!(!limited.leader_unavailable);
+    let mut unknown = crate::test_support::api_request("GET", "/v1/unknown", None, None);
+    unknown.extensions_mut().insert(caller);
+    let unknown = crate::test_support::read(api.call(unknown).await).await;
+    assert_eq!(unknown.status, http::StatusCode::NOT_FOUND);
+    assert!(!unknown.leader_unavailable);
+}
+
+#[tokio::test]
 async fn idempotent_principal_operations_leave_the_live_epoch_unchanged() {
     use std::sync::Arc;
 
@@ -221,15 +418,20 @@ async fn idempotent_principal_operations_leave_the_live_epoch_unchanged() {
         "authentication": {"none": {}},
     }))
     .expect("server info is valid");
+    let (fence, keeper) = gang_spi::Fence::lease(
+        harness.clock.clone(),
+        gang_types::NonZeroDuration::from_secs(1),
+    );
+    keeper.extend_to(harness.clock.monotonic() + Duration::from_secs(10));
+    let readiness = crate::health::Readiness::for_test().with_fence(fence);
     let api = Api::new(ApiParts {
+        readiness: readiness.clone(),
         core: core.clone(),
         revocations: Revocations::new(core.clone(), RevocationSet::from_serials(Vec::new())),
         info,
         authorizer: Authorizer::new(vec![role_for("administrator", PermissionSet::all(), ADMIN)]),
         limits: tls_settings().limits,
         dashboard: None,
-        leader_routes: None,
-        ingest: None,
         builds: crate::builds::BuildsCell::new(&gang_config::BuildsConfig::default()),
         limiter: Arc::new(RateLimiter::new(
             &tls_settings().rate_limit,
@@ -253,6 +455,54 @@ async fn idempotent_principal_operations_leave_the_live_epoch_unchanged() {
         let response = api.call(request).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(core.host.revoked_principals.epoch(), expected_epoch);
+    }
+    let epoch = core
+        .host
+        .repository
+        .revocation_epoch()
+        .await
+        .expect("epoch");
+    harness.clock.advance(Duration::from_secs(11));
+    assert!(readiness.admitting());
+    assert!(!readiness.is_leading());
+    assert_revocation_writes_refused(&api, &caller).await;
+    assert_eq!(
+        core.host
+            .repository
+            .revocation_epoch()
+            .await
+            .expect("epoch"),
+        epoch
+    );
+    assert!(core.host.revoked_principals.contains(&identity(ALICE)));
+}
+
+async fn assert_revocation_writes_refused<K: crate::deployment::Stack>(
+    api: &crate::api::Api<K>,
+    caller: &crate::gate::Caller,
+) {
+    use gang_spi::ApiService;
+    use http::StatusCode;
+
+    for path in [
+        "/v1/certificates/3fa9:revoke".to_owned(),
+        principal_path(&REVOKE_PRINCIPAL, ALICE),
+        principal_path(&RESTORE_PRINCIPAL, ALICE),
+    ] {
+        let mut request = api_request("POST", &path, None, None);
+        request.extensions_mut().insert(caller.clone());
+        let reply = crate::test_support::read(api.call(request).await).await;
+        assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert!(reply.leader_unavailable, "{path}");
+        assert_eq!(
+            reply
+                .headers
+                .get(gang_types::handover::REQUEST_NOT_STARTED_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("true"),
+            "{path}"
+        );
+        reply.refused(gang_wire::ErrorReason::DependencyUnavailable);
     }
 }
 

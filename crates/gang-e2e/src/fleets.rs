@@ -22,7 +22,7 @@ use crate::verdict;
 enum Arrival {
     /// As the build sends them.
     AsSent,
-    /// With a fresh controller and unknown action durations, all at once: every pass is skipped
+    /// With initially empty history and unknown action durations, all at once: every pass is skipped
     /// until the live state shows each action queued, so the first pass that places them sees
     /// them together, before any worker could run one of them.
     Together,
@@ -66,8 +66,8 @@ impl Step {
     }
 }
 
-/// The steps in the order they run. Each starts from a drained deployment.
-const STEPS: [Step; 5] = [
+/// The serial builds, each starting from a drained deployment.
+const DRAINED_STARTS: [Step; 4] = [
     Step {
         request: names::fleets::UNCONSTRAINED,
         probes: &[Probe::Unconstrained],
@@ -100,35 +100,36 @@ const STEPS: [Step; 5] = [
         observed: Observed::Noop(Probe::SandboxRequested),
         arrival: Arrival::AsSent,
     },
-    // With unknown durations, one pass sees both actions queued: the first fills the small
-    // fleet's one instance, so the second overflows. Sent as they come, the second can reach a
-    // small worker that already serves and packs both before any pass sees it queued.
-    Step {
-        request: names::fleets::OVERFLOW,
-        probes: &[Probe::OverflowFirst, Probe::OverflowSecond],
-        fleets: &[SMALL_FLEET, LARGE_FLEET],
-        native_noop: None,
-        observed: Observed::Ran,
-        arrival: Arrival::Together,
-    },
 ];
 
-/// Runs the fleets scenario against `system` under `variant`, and returns its verdicts in the
-/// order reached.
+// With unknown durations, one pass sees both actions queued: the first fills the small
+// fleet's one instance, so the second overflows. Sent as they come, the second can reach a
+// small worker that already serves and packs both before any pass sees it queued.
+const COLD_PAIR: Step = Step {
+    request: names::fleets::OVERFLOW,
+    probes: &[Probe::OverflowFirst, Probe::OverflowSecond],
+    fleets: &[SMALL_FLEET, LARGE_FLEET],
+    native_noop: None,
+    observed: Observed::Ran,
+    arrival: Arrival::Together,
+};
+
+/// Runs the initial zero-worker check and the four serial drained-start builds.
 ///
 /// `system` declares three fleets, in preference order: a small one of one instance, a large one
 /// of two instances, and one under the noop sandbox. Every step builds its probes from a drained
 /// deployment, and the scale-outs it caused are the ones recorded between the history read before
 /// the build and the history read after it. The scale-outs must be exactly those of the fleets
 /// the step's exec properties select. Where the variant's own sandbox is noop, the first two
-/// fleets run under it too, so a request for the noop sandbox fits the first fleet. A step whose
-/// actions must be placed together starts with a fresh controller and holds the provisioner's
-/// supply while it builds, so no pass runs until the live state shows all of them queued.
+/// fleets run under it too, so a request for the noop sandbox fits the first fleet.
+///
+/// The caller combines these verdicts with [`run_cold_pair`], in that order, using separate
+/// deployments. This function starts its server and leaves it running for caller-owned cleanup.
 ///
 /// # Errors
 ///
 /// When the system cannot be driven or observed; a system that misbehaves is a failed [`Check`].
-pub fn fleets<S: Control>(system: &S, variant: &Variant) -> Result<Vec<Check>> {
+pub fn run_drained_starts<S: Control>(system: &S, variant: &Variant) -> Result<Vec<Check>> {
     let mut checks = Vec::new();
 
     system.start_server()?;
@@ -139,46 +140,67 @@ pub fn fleets<S: Control>(system: &S, variant: &Variant) -> Result<Vec<Check>> {
         || format!("{workers} workers were running before the first build"),
     ));
 
-    for step in &STEPS {
-        if step.arrival == Arrival::Together {
-            // Clear process-local duration history: this is a cold, unknown-duration routing
-            // test, not an assertion of coarse overflow for learned short work.
-            system.kill_server()?;
-            system.start_server()?;
-        }
-        let before = system.scaling_events()?;
-        let since = before.last().map_or(Ok(0), sequence)?;
-        let outcome = match step.arrival {
-            Arrival::AsSent => system.build(step.probes)?,
-            Arrival::Together => build_together(system, step.probes)?,
-        };
-        let actions = u32::try_from(step.probes.len()).unwrap_or(u32::MAX);
-        checks.push(labelled(
-            step.request,
-            verdict::remote_execution(&outcome, actions, system.stderr_tail_lines()),
-        ));
-        let after = system.scaling_events()?;
-        let expected = step.expected(variant.sandbox);
-        checks.push(verdict::placed_on(
-            names::fleets::placed(step.request, expected),
-            &before,
-            &after,
-            expected,
-        ));
-        if outcome.succeeded() {
-            observe(system, *variant, step, &mut checks)?;
-        }
-        settle(
-            system,
-            since,
-            DrainChecks {
-                drained: names::fleets::drained(step.request).into(),
-                terminated: names::fleets::terminated(step.request).into(),
-            },
-            &mut checks,
-        )?;
+    for step in &DRAINED_STARTS {
+        run_step(system, variant, step, &mut checks)?;
     }
     Ok(checks)
+}
+
+/// Runs only the cold overflow pair and its drain checks on a fresh deployment.
+///
+/// The caller must supply a separate, never-used controller and history namespace, so action
+/// durations are unknown without restarting a server. The provisioner's supply is held while
+/// building until the live state shows both actions queued, so the first placing pass sees them
+/// together. This function starts its server and leaves it running for caller-owned cleanup.
+///
+/// # Errors
+///
+/// When the system cannot be driven or observed; a system that misbehaves is a failed [`Check`].
+pub fn run_cold_pair<S: Control>(system: &S, variant: &Variant) -> Result<Vec<Check>> {
+    system.start_server()?;
+    let mut checks = Vec::new();
+    run_step(system, variant, &COLD_PAIR, &mut checks)?;
+    Ok(checks)
+}
+
+/// Builds one request, judges its placement and report, then waits for its workers to drain.
+fn run_step<S: Control>(
+    system: &S,
+    variant: &Variant,
+    step: &Step,
+    checks: &mut Vec<Check>,
+) -> Result<()> {
+    let before = system.scaling_events()?;
+    let since = before.last().map_or(Ok(0), sequence)?;
+    let outcome = match step.arrival {
+        Arrival::AsSent => system.build(step.probes)?,
+        Arrival::Together => build_together(system, step.probes)?,
+    };
+    let actions = u32::try_from(step.probes.len()).unwrap_or(u32::MAX);
+    checks.push(labelled(
+        step.request,
+        verdict::remote_execution(&outcome, actions, system.stderr_tail_lines()),
+    ));
+    let after = system.scaling_events()?;
+    let expected = step.expected(variant.sandbox);
+    checks.push(verdict::placed_on(
+        names::fleets::placed(step.request, expected),
+        &before,
+        &after,
+        expected,
+    ));
+    if outcome.succeeded() {
+        observe(system, variant, step, checks)?;
+    }
+    settle(
+        system,
+        since,
+        DrainChecks {
+            drained: names::fleets::drained(step.request).into(),
+            terminated: names::fleets::terminated(step.request).into(),
+        },
+        checks,
+    )
 }
 
 /// Builds `probes` while every pass is skipped, and lets the passes run again once the live state
@@ -226,7 +248,7 @@ fn queued(state: &State) -> usize {
 /// Judges what the probes of `step` reported.
 fn observe<S: System>(
     system: &S,
-    variant: Variant,
+    variant: &Variant,
     step: &Step,
     checks: &mut Vec<Check>,
 ) -> Result<()> {

@@ -6,6 +6,7 @@ default_isa = "x86-64"  # the ISA clients put in their platform properties
 listen = "127.0.0.1:50051"
 endpoint = "http://127.0.0.1:50051"
 worker_listen = "127.0.0.1:9090"
+worker_endpoint = "grpc://127.0.0.1:9090"  # dialed by workers; gang-server listens on worker_listen
 
 [[fleets]]
 name = "local-worker-x86-64"
@@ -32,9 +33,6 @@ path = "/tmp/gang-local/cache"           # filesystem CAS and AC
 [signer.file]
 key_file = "/tmp/gang-local/ca.key"  # the local CA key, generated on first start; its directory is checked for owner and mode 0700
 
-[scheduler.nativelink]
-worker_endpoint = "grpc://127.0.0.1:9090"  # dialed by workers; gang-server listens on worker_listen
-scheduler_name = "MAIN_SCHEDULER"
 
 [database.sqlite]
 path = "/tmp/gang-local/gang.db"

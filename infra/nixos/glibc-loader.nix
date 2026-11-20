@@ -14,10 +14,10 @@
   # read-only.
   programs.nix-ld.enable = true;
 
-  # Upstream draft (not filed): "Default LD_LIBRARY_PATH trampoline restores a read-only
-  # environment string (gawk aborts)". Remove when pinned upstream supplies a writable
-  # replacement environment string:
-  # https://github.com/nix-community/nix-ld/blob/af1a6c38d6a9889f7acfd14cece8ea1834ee8035/src/main.rs#L43
+  # Upstream draft (not filed): "Preserve the exact writable environment across loader handoff".
+  # Remove when pinned upstream preserves absent and present variables without exposing
+  # read-only replacement strings:
+  # https://github.com/nix-community/nix-ld/blob/af1a6c38d6a9889f7acfd14cece8ea1834ee8035/src/main.rs#L155-L176
   programs.nix-ld.package = pkgs.nix-ld.overrideAttrs (old: {
     patches = (old.patches or []) ++ [../../patches/nix-ld-writable-environ.patch];
   });

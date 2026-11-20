@@ -2,7 +2,7 @@
 import { useEffect, useState } from "preact/hooks";
 import { identityOf, idOf, ms, splitIdentity } from "../wire-parse.ts";
 import type { Principal, Session } from "../wire.ts";
-import { Cell, Clock, Day, Ident, Row, Section, Since, Table, Tags, Until, useClient } from "../ui.tsx";
+import { Cell, Clock, Columns, Day, Ident, Row, Section, Since, Stack, Table, Tags, Until, useClient } from "../ui.tsx";
 
 const DAY_MS = 24 * 3600 * 1000;
 
@@ -68,9 +68,9 @@ export const Access = () => {
   );
   const now = client.now.peek();
   return (
-    <div class="cols">
+    <Columns>
       {allowed && resource.kind !== "loaded" && (
-        <div class="cols__wide">
+        <div>
           {(resource.kind === "unloaded" || resource.kind === "loading") && (
             <p role="status">Loading access observations…</p>
           )}
@@ -82,7 +82,7 @@ export const Access = () => {
         </div>
       )}
       {allowed && resource.kind === "loaded" && (
-        <Section id="pr-h" title="Principals" variant="plain" count={principals.length} cls="cols__wide">
+        <Section id="pr-h" title="Principals" variant="plain" count={principals.length}>
           {!resource.failing && <p>As of <Clock t={resource.asOf} /></p>}
           {resource.loading && <p role="status">Refreshing access observations…</p>}
           {resource.failing && (
@@ -143,7 +143,7 @@ export const Access = () => {
           )}
         </Section>
       )}
-      <aside>
+      <Stack as="aside">
         <You session={session} />
         {allowed && access && (
           <Section id="ro-h" title="Roles" variant="panel">
@@ -165,7 +165,7 @@ export const Access = () => {
             ))}
           </Section>
         )}
-      </aside>
-    </div>
+      </Stack>
+    </Columns>
   );
 };

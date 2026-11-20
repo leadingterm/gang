@@ -1,7 +1,10 @@
 //! The public `[limits.cgroup]` plugin.
 
 use gang_clock::SystemClock;
-use gang_spi::{ActionLimits, ActionLimitsPort, ActionUsage, Plugin, PluginContext, PortError};
+use gang_spi::{
+    ActionLimits, ActionLimitsPort, ActionMemoryPool, ActionUsage, Plugin, PluginContext, PortError,
+};
+use gang_types::Bytes;
 
 use crate::config::CgroupConfig;
 use crate::controller::{CgroupScope, Controller};
@@ -35,8 +38,8 @@ impl Plugin for Cgroup {
 impl ActionLimitsPort for Cgroup {
     type Scope = CgroupScope;
 
-    async fn prepare(&self) -> Result<(), PortError> {
-        Ok(self.controller.prepare().await?)
+    async fn prepare(&self, reserve: Bytes) -> Result<Option<ActionMemoryPool>, PortError> {
+        Ok(Some(self.controller.prepare(reserve).await?))
     }
 
     async fn enter(&self, limits: &ActionLimits) -> Result<CgroupScope, PortError> {
@@ -79,7 +82,7 @@ mod tests {
         };
         let cgroup = Cgroup::build(config, &context()).expect("the plugin builds");
 
-        let prepared = ActionLimitsPort::prepare(&cgroup).await;
+        let prepared = ActionLimitsPort::prepare(&cgroup, gang_types::Bytes::new(1_048_576)).await;
         assert!(matches!(prepared, Err(PortError::Backend(_))));
 
         let entered = ActionLimitsPort::enter(

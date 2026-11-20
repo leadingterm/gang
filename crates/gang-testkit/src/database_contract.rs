@@ -52,6 +52,23 @@ impl<D> Fixture<D> {
 /// `exclusive`: `database_contract!($fresh, exclusive, schema: $supported, $stamped)`.
 #[macro_export]
 macro_rules! database_contract {
+    (@history $fresh:expr, $module:path) => {
+        $crate::database_contract!(@history_cases $fresh, $module;
+            history_restart, history_expiry, history_eviction, history_resource_eviction,
+            history_new_leader, history_incompatible
+        );
+    };
+    (@history_cases $fresh:expr, $module:path; $($case:ident),+ $(,)?) => {
+        $(
+            #[tokio::test]
+            async fn $case() -> $crate::TestResult {
+                let fixture = ($fresh)().await
+                    .map_err(Into::<Box<dyn std::error::Error>>::into)?;
+                use $module as history_cases;
+                history_cases::$case(fixture.database()).await
+            }
+        )+
+    };
     (@cases $fresh:expr, $module:ident: $($case:ident),+ $(,)?) => {
         $(
             #[tokio::test]
@@ -103,6 +120,7 @@ macro_rules! database_contract {
         );
         $crate::database_contract!(@cases $fresh, expiring_contract:
             record_insert_and_expiry,
+            record_list_pages_live_records,
             record_insert_is_atomic,
             record_insert_over_expired,
             a_reinserted_record_refuses_the_previous_version,
@@ -114,10 +132,18 @@ macro_rules! database_contract {
             record_remove_stale,
             record_kinds_are_separate,
             record_purge,
+            records_page_live_in_order,
+            apply_upserts_and_deletes,
+            apply_enforces_batch_limits,
+            apply_new_epoch_preserves_record_incarnations,
         );
     };
     ($fresh:expr) => {
         $crate::database_contract!($fresh, exclusive);
+        $crate::database_contract!(@cases $fresh, expiring_contract:
+            apply_rejects_invalid_leases,
+            apply_sequences_are_fenced,
+        );
         $crate::database_contract!(@cases $fresh, lease_contract:
             lease_first_acquire,
             lease_live_then_stale,
@@ -128,6 +154,10 @@ macro_rules! database_contract {
             lease_release,
             lease_invalid_release,
             lease_concurrent_acquire,
+            candidate_registration_order,
+            lease_handoff_requests,
+            lease_handoff_reservations,
+            lease_concurrent_requests,
         );
     };
 }

@@ -120,6 +120,16 @@ data "aws_iam_policy_document" "this" {
     resources = ["*"]
   }
 
+  dynamic "statement" {
+    for_each = var.events_queue_arn == null ? [] : [var.events_queue_arn]
+    content {
+      sid       = "ObserveAwsEvents"
+      effect    = "Allow"
+      actions   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
+      resources = [statement.value]
+    }
+  }
+
   # Decrypt the customer managed key of the secret parameters, and only for calls made through SSM. Present only when secret_parameters_kms_key_arn is set; the AWS-managed key needs no grant.
   dynamic "statement" {
     for_each = length(var.secret_parameters) > 0 && var.secret_parameters_kms_key_arn != null ? [1] : []
@@ -146,6 +156,6 @@ module "instance_role" {
   iam_name_prefix              = var.iam_name_prefix
   iam_permissions_boundary_arn = var.iam_permissions_boundary_arn
   tags                         = var.tags
-  readable_parameter_arns      = concat([var.config_parameter_arn], local.secret_parameter_arns)
+  readable_parameter_arns      = concat(var.config_parameter_arns, local.secret_parameter_arns)
   policy_json                  = data.aws_iam_policy_document.this.json
 }

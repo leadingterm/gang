@@ -35,6 +35,7 @@ const KNOWN_KINDS: { readonly [K in EventKind]: true } = {
   exitedEarly: true,
   workerRegistered: true,
   workerDeregistered: true,
+  aws: true,
 };
 
 /** The oneof members this client knows, in display order. */
@@ -42,3 +43,16 @@ export const EVENT_KINDS: readonly EventKind[] = Object.keys(KNOWN_KINDS) as Eve
 
 /** The oneof member an event carries, or `undefined` for one this client does not know. */
 export const eventKind = (e: ScalingEvent): EventKind | undefined => EVENT_KINDS.find((kind) => kind in e);
+
+/** Merge operational status into the scaling log without changing the audit ledger. */
+export const scalingLog = (...groups: readonly (readonly ScalingEvent[])[]): ScalingEvent[] => {
+  const byName = new Map<string, ScalingEvent>();
+  for (const group of groups) for (const event of group) byName.set(event.name, event);
+  return [...byName.values()].sort((a, b) => {
+    const time = ms(a.createTime) - ms(b.createTime);
+    if (time) return time;
+    // Audit resource IDs are canonical decimal integers; length preserves their full u64 order.
+    const length = a.name.startsWith("events/") && b.name.startsWith("events/") ? a.name.length - b.name.length : 0;
+    return length || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+  });
+};

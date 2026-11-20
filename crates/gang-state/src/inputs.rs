@@ -66,6 +66,8 @@ pub struct Inputs<'a> {
     pub actions: Option<&'a ActionsSample>,
     /// The newest scaling events, oldest first.
     pub events: &'a [gang_wire::Event],
+    /// All live infrastructure observations from the operational record store.
+    pub infrastructure: &'a [gang_spi::FleetInfrastructureEvent],
     /// The builds the recorder holds.
     pub builds: &'a gang_insight::Builds,
     /// Cumulative farm-wide cache traffic.

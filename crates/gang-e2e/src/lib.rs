@@ -18,6 +18,7 @@
 mod access;
 mod access_secured;
 mod access_verdict;
+mod action_environment_probe;
 mod administrator;
 mod admission;
 mod balancer;
@@ -84,6 +85,7 @@ mod report;
 mod restart;
 mod revocation;
 mod rolling_deploy;
+mod rolling_upgrade;
 mod sandbox_contract;
 mod scheduled_minimum;
 mod secured;
@@ -104,11 +106,17 @@ mod system;
 mod template;
 mod timeout;
 mod tls_client;
+mod upgrade_config_restart;
+mod upgrade_credentials;
+mod upgrade_evidence;
+mod upgrade_fixture;
+mod upgrade_probe;
 mod work_aware;
 
 pub mod flags;
 pub mod launch_failure;
 pub mod names;
+pub mod pressure;
 pub mod process;
 pub mod sample;
 pub mod server_verdict;
@@ -125,6 +133,7 @@ pub use access_verdict::{
     failure_reported, has_line, login_cookie_name, query_value, redirected_to, set_cookies,
     status_is,
 };
+pub use action_environment_probe::action_environment_probe;
 pub use administrator::{ADMINISTRATOR, Administrator};
 pub use admission::{cold_start_misfit, memory_escalation, oversized_fleet, unplaceable_disk};
 pub use balancer::{Balancer, Frontend, Probe as BalancerProbe};
@@ -158,13 +167,13 @@ pub use event_log::EventFollower;
 pub use execution::{
     ACTIONS_DIR, ActionTimeout, COLD_START_MISFIT_MESSAGE, ColdStart, ESCALATION_MAX_STEPS,
     Execution, ExecutionKnobs, FleetDisk, Generations, JOURNAL_END, MemoryEscalation,
-    NO_FLEET_ACCEPTS, Proc, REFUSAL_RELAUNCH_BACKOFF, Role, Run, ServerExit, WORKER_LEAF,
-    WorkerCertificates, held_build, renewal_deadline, scope_of,
+    NO_FLEET_ACCEPTS, Proc, REFUSAL_RELAUNCH_BACKOFF, ResourcePolicy, Role, Run, ServerExit,
+    WORKER_LEAF, WorkerCertificates, held_build, renewal_deadline, scope_of,
 };
 pub use fake_bazel::{FAKE_BAZEL_ENV, command_line_event, fake_bazel, fake_bazel_requested};
 pub use fake_s3::FakeS3;
 pub use fhs_tools::fhs_tools;
-pub use fleets::fleets;
+pub use fleets::{run_cold_pair, run_drained_starts};
 pub use gang_cli::GangCli;
 pub use gang_config::InputLinks;
 pub use glibc_toolchain::glibc_toolchain;
@@ -187,7 +196,7 @@ pub use limits::limits;
 pub use memory::memory;
 pub use mirror::{Mirror, follow};
 pub use network::network;
-pub use oom::oom;
+pub use oom::{oom, pool_oom_verdicts};
 pub use orphan::orphan;
 pub use paths::anchored;
 pub use placement::Placement;
@@ -213,7 +222,10 @@ pub use server::{
 pub use server_scenarios::{api, certificate_rotation, event_paging, request_limits, viewer_cap};
 pub use server_stack::ServerStream;
 pub use session::{SessionCookie, TokenUsage, cookie_name, session_cookie, signed_token};
-pub use settings::{ActionTools, DeploymentInputs, GLIBC_LOADER_PATHS, Settings};
+pub use settings::{
+    ActionTools, DeploymentInputs, GLIBC_LOADER_PATHS, ReleaseInput, Settings, UpgradeInputs,
+    UpgradeProcedure,
+};
 pub use skipped_pass::skipped_pass;
 pub use sse::EventStream;
 pub use stack::Stack;
@@ -221,9 +233,9 @@ pub use stale_scope::stale_scope;
 pub use state_api::{StateApi, StateStream};
 pub use suite::{Gate, Invocation, Scenario, UnknownGate, run, unknown_scenarios};
 pub use system::{
-    ActionLimits, FleetLayout, HOLD_CPU_COUNT, HOLD_MEMORY_KB, LARGE_FLEET,
-    LIMIT_CPU_PERIOD_MICROS, LIMIT_HEADROOM_PERCENT, LIMIT_MAX_PIDS, Limits, NOOP_FLEET,
-    PermitNetwork, Probe, SMALL_FLEET, Sandbox, ScopeFacts, SoftMemory, System, Variant,
+    ActionLimits, AttemptRecord, FleetLayout, HOLD_CPU_COUNT, HOLD_MEMORY_KB, LARGE_FLEET,
+    LIMIT_CPU_PERIOD_MICROS, LIMIT_MAX_PIDS, Limits, NOOP_FLEET, PermitNetwork,
+    PressureObservation, Probe, SMALL_FLEET, Sandbox, ScopeFacts, SoftMemory, System, Variant,
 };
 pub use template::{ConfigTemplate, Transport};
 pub use timeout::{action_timeout, exit_signals};

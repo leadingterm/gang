@@ -37,6 +37,8 @@ fn push_fleet(
     world.properties.push(properties(&spec, options));
     world.policies.push(spec);
     world.supplies.push(FleetSupply {
+        requested: None,
+        events: Vec::new(),
         abandoned: 0,
         desired,
         instances,
@@ -399,6 +401,7 @@ fn fill_window(
         catalog: &catalog,
         actions: world.actions.as_ref(),
         events,
+        infrastructure: &[],
         builds: world.builds.as_ref().unwrap_or(&empty_builds),
         traffic: world.traffic,
         measured: world.measured.as_ref(),

@@ -18,6 +18,21 @@ bundle=$(realpath "$1")
 gang=$(realpath "$2")
 shift 2
 cd "$(dirname "$0")/.."
+bundle_file() {
+  local name
+  name=$(jq -er --arg key "$1" \
+    'getpath($key | split(".")) | select(if type == "string" then test("^[A-Za-z0-9][A-Za-z0-9._-]*$") else false end)' \
+    "$bundle/upgrade-inputs.json") || return 1
+  test -f "$bundle/$name" || return 1
+  printf '%s/%s\n' "$bundle" "$name"
+}
+previous_gang=$(bundle_file previous.binary)
+previous_fixture=$(bundle_file previous.fixture)
+historical_gang=$(bundle_file historical.binary)
+historical_fixture=$(bundle_file historical.fixture)
+calibration_gang=$(bundle_file calibration.binary)
+calibration_fixture=$(bundle_file calibration.fixture)
+candidate_fixture=$(bundle_file candidate_fixture)
 XDG_RUNTIME_DIR="/run/user/$(id -u)"
 export XDG_RUNTIME_DIR
 unit=gang-e2e-$$
@@ -28,7 +43,11 @@ trap 'systemctl --user stop "$unit.service" 2>/dev/null || true; chmod -R u+w "$
 status=0
 start=$SECONDS
 systemd-run --user --unit="$unit" --collect --pipe --wait --same-dir --slice=gang.slice -p Type=oneshot -p Delegate=yes -p TimeoutStartSec="$budget" -p TimeoutStopSec=10 \
-  --setenv=PATH="$PATH" --setenv=GANG_E2E_GLIBC_TOOL="$bundle/loaded_probe" -- \
+  --setenv=PATH="$PATH" --setenv=GANG_E2E_GLIBC_TOOL="$bundle/loaded_probe" \
+  --setenv=GANG_E2E_PREVIOUS_GANG="$previous_gang" --setenv=GANG_E2E_PREVIOUS_FIXTURE="$previous_fixture" \
+  --setenv=GANG_E2E_HISTORICAL_GANG="$historical_gang" --setenv=GANG_E2E_HISTORICAL_FIXTURE="$historical_fixture" \
+  --setenv=GANG_E2E_CALIBRATION_GANG="$calibration_gang" --setenv=GANG_E2E_CALIBRATION_FIXTURE="$calibration_fixture" \
+  --setenv=GANG_E2E_CANDIDATE_FIXTURE="$candidate_fixture" -- \
   nix develop -c env -u XDG_CONFIG_HOME -u XDG_CACHE_HOME HOME="$home" \
   "$bundle/local" --gang "$gang" --bazel "$bundle/bazel" --postgres "$bundle/postgresql.tar.gz" \
   --config configs/gang.local.toml --sample e2e/sample --configs configs "$@" | tee "$report" || status=$?

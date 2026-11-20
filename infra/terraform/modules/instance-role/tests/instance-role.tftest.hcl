@@ -10,6 +10,7 @@ variables {
   name = "gang-instance"
   readable_parameter_arns = [
     "arn:aws:ssm:eu-north-1:000000000000:parameter/gang-instance/gang.toml",
+    "arn:aws:ssm:eu-north-1:000000000000:parameter/gang-instance/gang.toml/generations/*",
     "arn:aws:ssm:eu-north-1:000000000000:parameter/gang-instance/secrets/ca-password",
   ]
   policy_json = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"CallerOnly\",\"Effect\":\"Allow\",\"Action\":\"s3:ListBucket\",\"Resource\":\"arn:aws:s3:::example-cache\"}]}"
@@ -110,7 +111,7 @@ run "read_parameters_grants_only_the_readable_arns" {
   assert {
     condition = alltrue([
       for s in data.aws_iam_policy_document.base.statement :
-      s.effect == "Allow" && toset(s.actions) == toset(["ssm:GetParameter"]) && toset(s.resources) == toset(var.readable_parameter_arns) && length(s.resources) == 2
+      s.effect == "Allow" && toset(s.actions) == toset(["ssm:GetParameter"]) && toset(s.resources) == toset(var.readable_parameter_arns) && length(s.resources) == 3
       if s.sid == "ReadParameters"
     ])
     error_message = "ReadParameters must allow ssm:GetParameter on exactly the readable_parameter_arns."
@@ -135,7 +136,7 @@ run "other_parameters_denied_except_readable_arns" {
   assert {
     condition = alltrue([
       for s in data.aws_iam_policy_document.base.statement :
-      toset(s.not_resources) == toset(var.readable_parameter_arns) && length(s.not_resources) == 2
+      toset(s.not_resources) == toset(var.readable_parameter_arns) && length(s.not_resources) == 3
       if s.sid == "DenyOtherParameters"
     ])
     error_message = "DenyOtherParameters must exempt exactly the readable_parameter_arns and nothing else."

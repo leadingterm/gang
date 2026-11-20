@@ -51,6 +51,13 @@ fn collect(cfg: &Config) -> BTreeMap<String, String> {
     walk::<gang_wire::ListPrincipalsResponse>(cfg, &mut out, &mut seen);
     walk::<gang_wire::ListRolesResponse>(cfg, &mut out, &mut seen);
     walk::<gang_wire::ListEventsResponse>(cfg, &mut out, &mut seen);
+    walk::<gang_wire::AwsEvent>(cfg, &mut out, &mut seen);
+    walk::<gang_wire::AwsEventKind>(cfg, &mut out, &mut seen);
+    walk::<gang_wire::AwsInterruptionAction>(cfg, &mut out, &mut seen);
+    walk::<gang_wire::AwsTerminationReason>(cfg, &mut out, &mut seen);
+    walk::<gang_wire::InfrastructureStatus>(cfg, &mut out, &mut seen);
+    walk::<gang_wire::InfrastructurePhase>(cfg, &mut out, &mut seen);
+    walk::<gang_wire::InfrastructureReason>(cfg, &mut out, &mut seen);
     walk::<gang_wire::ListBuildsResponse>(cfg, &mut out, &mut seen);
     walk::<gang_wire::BuildState>(cfg, &mut out, &mut seen);
     walk::<gang_wire::Build>(cfg, &mut out, &mut seen);

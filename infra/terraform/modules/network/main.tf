@@ -208,7 +208,7 @@ resource "aws_security_group" "worker" {
 }
 
 resource "aws_vpc_security_group_ingress_rule" "controller_public" {
-  for_each = toset(var.client_ingress_cidrs)
+  for_each = toset(var.shared_database ? [] : var.client_ingress_cidrs)
 
   security_group_id = aws_security_group.controller.id
   cidr_ipv4         = each.value
@@ -223,6 +223,8 @@ resource "aws_vpc_security_group_ingress_rule" "controller_public" {
 }
 
 resource "aws_vpc_security_group_ingress_rule" "controller_worker" {
+  count = var.shared_database ? 0 : 1
+
   security_group_id            = aws_security_group.controller.id
   referenced_security_group_id = aws_security_group.worker.id
   from_port                    = local.worker_port
@@ -236,6 +238,8 @@ resource "aws_vpc_security_group_ingress_rule" "controller_worker" {
 }
 
 resource "aws_vpc_security_group_ingress_rule" "controller_worker_public" {
+  count = var.shared_database ? 0 : 1
+
   security_group_id            = aws_security_group.controller.id
   referenced_security_group_id = aws_security_group.worker.id
   from_port                    = local.public_port
@@ -246,6 +250,16 @@ resource "aws_vpc_security_group_ingress_rule" "controller_worker_public" {
   tags = merge(var.tags, {
     Name = "${var.name}-controller-worker-public"
   })
+}
+
+moved {
+  from = aws_vpc_security_group_ingress_rule.controller_worker
+  to   = aws_vpc_security_group_ingress_rule.controller_worker[0]
+}
+
+moved {
+  from = aws_vpc_security_group_ingress_rule.controller_worker_public
+  to   = aws_vpc_security_group_ingress_rule.controller_worker_public[0]
 }
 
 resource "aws_vpc_security_group_egress_rule" "controller" {

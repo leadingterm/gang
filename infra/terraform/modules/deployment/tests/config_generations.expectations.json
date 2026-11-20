@@ -1,0 +1,63 @@
+{
+  "plans": {
+    "planUnchanged": {
+      "aws_ssm_parameter.config": ["no-op"],
+      "aws_ssm_parameter.config_generation": ["no-op"]
+    },
+    "planLegacyRetention": {
+      "aws_ssm_parameter.config": ["forget", "create"]
+    },
+    "planB": {
+      "aws_ssm_parameter.config": ["no-op"],
+      "aws_ssm_parameter.config_generation": ["forget", "create"]
+    },
+    "planRollbackA": {
+      "aws_ssm_parameter.config": ["no-op"],
+      "aws_ssm_parameter.config_generation": ["forget", "create"]
+    }
+  },
+  "state_checks": [
+    {
+      "relation": "equal",
+      "left": {"kind": "output", "run": "applyA", "name": "gang_toml"},
+      "right": {"kind": "resource", "run": "applyB", "address": "aws_ssm_parameter.config", "attribute": "value"}
+    },
+    {
+      "relation": "equal",
+      "left": {"kind": "output", "run": "applyA", "name": "gang_toml"},
+      "right": {"kind": "resource", "run": "applyRollbackA", "address": "aws_ssm_parameter.config", "attribute": "value"}
+    },
+    {
+      "relation": "equal",
+      "left": {"kind": "output", "run": "applyA", "name": "gang_toml"},
+      "right": {"kind": "output", "run": "applyRollbackA", "name": "gang_toml"}
+    },
+    {
+      "relation": "not_equal",
+      "left": {"kind": "output", "run": "applyA", "name": "gang_toml"},
+      "right": {"kind": "output", "run": "applyB", "name": "gang_toml"}
+    },
+    {
+      "relation": "not_equal",
+      "left": {"kind": "output", "run": "applyA", "name": "config_parameter_name"},
+      "right": {"kind": "output", "run": "applyB", "name": "config_parameter_name"}
+    },
+    {
+      "relation": "not_equal",
+      "left": {"kind": "output", "run": "applyA", "name": "config_parameter_name"},
+      "right": {"kind": "output", "run": "applyRollbackA", "name": "config_parameter_name"}
+    },
+    {
+      "relation": "not_equal",
+      "left": {"kind": "output", "run": "applyB", "name": "config_parameter_name"},
+      "right": {"kind": "output", "run": "applyRollbackA", "name": "config_parameter_name"}
+    }
+  ],
+  "retention": {
+    "run": "applyRollbackA",
+    "resources": {
+      "aws_ssm_parameter.config": "planLegacyRetention",
+      "aws_ssm_parameter.config_generation": "planB"
+    }
+  }
+}

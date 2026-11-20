@@ -8,15 +8,17 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 use crate::client_address::ClientAddress;
-use crate::gate::{Caller, ExecutionListener, Gate};
+use crate::gate::Caller;
 use gang_authn::anonymous;
 use gang_clock::Clock;
-use gang_spi::{Admitted, CertStatus, IssuedCertRecord, Peer, PortError, Rejection, RequestGate};
+use gang_spi::{
+    Admitted, CertStatus, GateDecision, IssuedCertRecord, Peer, PortError, Rejection, RequestGate,
+    RequestScope, StateRepositoryPort,
+};
 use gang_testkit::Controller;
 use gang_types::{AccessToken, Identity, Principal, ProviderName};
 use gang_wire::routes::{
-    AUTHENTICATE_SESSION, GET_SERVER, GET_SESSION, INGEST_BUILDS, LIST_BUILDS, LIST_EVENTS,
-    REVOKE_PRINCIPAL,
+    AUTHENTICATE_SESSION, GET_SERVER, GET_SESSION, LIST_EVENTS, REVOKE_PRINCIPAL,
 };
 use http::StatusCode;
 
@@ -27,75 +29,69 @@ use crate::test_support::{
 use crate::test_support_session_harness::{Harness, HarnessOptions};
 
 #[tokio::test]
-async fn execution_listener_marks_only_open_public_requests() {
+async fn gates_admit_through_lease_lapse_but_reject_stop_and_new_terms() {
     let harness = Harness::anonymous(HarnessOptions::default());
-    let gate = harness.gate.clone().executing();
-    let mut open = cookie_parts("POST", "/v1/builds:ingest", None, None);
-    gate.admit(&Peer::default(), &mut open)
-        .await
-        .expect("the public gate admits open paths");
-    assert!(open.extensions.get::<ExecutionListener>().is_some());
+    let clock = crate::test_support_clock::start();
+    let (fence, keeper) =
+        gang_spi::Fence::lease(clock.clone(), gang_types::NonZeroDuration::from_secs(1));
+    keeper.extend_to(clock.monotonic() + Duration::from_secs(10));
+    let readiness = crate::health::Readiness::default().with_fence(fence);
+    let gates = [
+        harness.gate.clone().with_readiness(readiness.clone()),
+        crate::gate::Gate::worker(harness.core.clone()).with_readiness(readiness.clone()),
+    ];
+    assert_readiness_admission(&gates, false).await;
+    readiness.serve();
+    readiness.contend();
+    assert_readiness_admission(&gates, false).await;
+    readiness.lead();
+    assert_readiness_admission(&gates, true).await;
+    clock.advance(Duration::from_secs(11));
+    assert!(!readiness.ready());
+    assert_readiness_admission(&gates, true).await;
+    keeper.revoke();
+    assert_readiness_admission(&gates, true).await;
+    readiness.stop();
+    assert_readiness_admission(&gates, false).await;
+    let (next_fence, next_keeper) =
+        gang_spi::Fence::lease(clock.clone(), gang_types::NonZeroDuration::from_secs(1));
+    next_keeper.extend_to(clock.monotonic() + Duration::from_secs(10));
+    readiness.begin_term(next_fence);
+    readiness.serve();
+    readiness.contend();
+    assert!(readiness.ready());
+    assert_readiness_admission(&gates, false).await;
+    readiness.lead();
+    assert_readiness_admission(&gates, true).await;
+    readiness.stop();
+    assert_readiness_admission(&gates, false).await;
+}
 
-    for path in [
-        "/build.bazel.remote.execution.v2.Execution/Execute",
-        EXECUTE_PATH,
-    ] {
-        let mut execute = cookie_parts("POST", path, None, None);
-        let _ = gate.admit(&Peer::default(), &mut execute).await;
-        assert!(execute.extensions.get::<ExecutionListener>().is_none());
+async fn assert_readiness_admission(gates: &[impl RequestGate], admitting: bool) {
+    for gate in gates {
+        for path in [
+            "/v1/server",
+            "/ui/",
+            EXECUTE_PATH,
+            "/build.bazel.remote.execution.v2.Capabilities/GetCapabilities",
+            "/worker",
+        ] {
+            let mut shared = cookie_parts("POST", path, None, None);
+            let shared = gate
+                .admit(RequestScope::Shared, &Peer::default(), &mut shared)
+                .await;
+            let mut leader = cookie_parts("POST", path, None, None);
+            let leader = gate
+                .admit(RequestScope::Leader, &Peer::default(), &mut leader)
+                .await;
+            if admitting {
+                assert_eq!(format!("{shared:?}"), format!("{leader:?}"));
+            } else {
+                assert!(matches!(leader, Ok(GateDecision::NotLeading)));
+                assert!(!matches!(shared, Ok(GateDecision::NotLeading)));
+            }
+        }
     }
-}
-
-#[tokio::test]
-async fn non_execution_public_and_worker_gates_never_mark_requests() {
-    let harness = Harness::anonymous(HarnessOptions::default());
-    let mut public = cookie_parts("POST", "/v1/builds:ingest", None, None);
-    harness
-        .gate
-        .admit(&Peer::default(), &mut public)
-        .await
-        .expect("the public gate admits open paths");
-    assert!(public.extensions.get::<ExecutionListener>().is_none());
-
-    let worker = Gate::worker(harness.core.clone()).executing();
-    let mut request = cookie_parts("POST", "/v1/builds:ingest", None, None);
-    let _ = worker.admit(&Peer::default(), &mut request).await;
-    assert!(request.extensions.get::<ExecutionListener>().is_none());
-}
-
-/// A follower's ingest on the execution listener is the controller's own traffic: the gate leaves
-/// it to the controller proof and never asks the client plugin, whose key it would otherwise load
-/// from the signer, while every other open path there still authenticates.
-#[tokio::test]
-async fn execution_gate_admits_ingest_without_the_client_plugin() {
-    let harness = Harness::token(HarnessOptions::default());
-    let gate = harness.gate.clone().executing();
-    let junk = AccessToken::new("junk".to_owned());
-    let key_reads = harness.core.host.signer.public_key_reads();
-
-    let mut ingest = cookie_parts("POST", INGEST_BUILDS.template, None, Some(&junk));
-    let admitted = gate
-        .admit(&Peer::default(), &mut ingest)
-        .await
-        .expect("the execution gate admits the ingest");
-    assert_eq!(admitted, Admitted::Anonymous);
-    assert!(ingest.extensions.get::<ExecutionListener>().is_some());
-    assert_anonymous(&ingest, "a bearer token on the execution listener's ingest");
-    assert_eq!(
-        harness.core.host.signer.public_key_reads(),
-        key_reads,
-        "the ingest never loads the client plugin's key"
-    );
-
-    let mut builds = cookie_parts("GET", LIST_BUILDS.template, None, Some(&junk));
-    gate.admit(&Peer::default(), &mut builds)
-        .await
-        .expect("the execution gate admits open paths");
-    assert_refused(
-        &builds,
-        Rejection::InvalidProof,
-        "a malformed bearer token on another open path of the execution listener",
-    );
 }
 
 const PROVIDER: &str = "example-idp";
@@ -199,14 +195,17 @@ async fn get_with_session_cookie_authenticates_the_cookie_identity() {
             let token = session_token(&clock, &identity(ALICE)).await;
             let mut parts = cookie_parts("GET", EVENTS_PATH, Some((SESSION_COOKIE, &token)), None);
             let admitted = controller
-                .admit_public(&Peer::default(), &mut parts)
+                .admit_public(gang_spi::RequestScope::Shared, &Peer::default(), &mut parts)
                 .await
                 .expect("the public gate admits a session cookie");
             let caller = caller_of(&parts);
             let authenticated = caller
                 .as_authenticated()
                 .expect("the session cookie authenticates the caller");
-            assert_eq!(admitted, Admitted::Authenticated(authenticated.clone()));
+            assert_eq!(
+                admitted,
+                GateDecision::Admit(Admitted::Authenticated(authenticated.clone()))
+            );
             assert_eq!(authenticated.identity.as_ref(), &identity(ALICE));
             assert_eq!(authenticated.valid_until, Some(clock.wall() + SESSION_TTL));
             assert!(!matches!(caller, Caller::Refused(_)), "nothing is refused");
@@ -227,7 +226,7 @@ async fn head_with_session_cookie_authenticates_the_cookie_identity() {
             let token = session_token(&clock, &identity(ALICE)).await;
             let mut parts = cookie_parts("HEAD", EVENTS_PATH, Some((SESSION_COOKIE, &token)), None);
             controller
-                .admit_public(&Peer::default(), &mut parts)
+                .admit_public(gang_spi::RequestScope::Shared, &Peer::default(), &mut parts)
                 .await
                 .expect("the public gate admits a session cookie");
             let caller = caller_of(&parts);
@@ -256,7 +255,7 @@ async fn build_item_accepts_session_cookie_only_for_reads() {
             for method in ["GET", "HEAD", "POST"] {
                 let mut parts = cookie_parts(method, path, Some((SESSION_COOKIE, &token)), None);
                 controller
-                    .admit_public(&Peer::default(), &mut parts)
+                    .admit_public(gang_spi::RequestScope::Shared, &Peer::default(), &mut parts)
                     .await
                     .expect("the public gate admits an open path");
                 if method == "POST" {
@@ -286,10 +285,10 @@ async fn post_ignores_session_cookie_on_listed_and_token_paths() {
             for path in [EVENTS_PATH, AUTHENTICATE_PATH] {
                 let mut parts = cookie_parts("POST", path, Some((SESSION_COOKIE, &token)), None);
                 let admitted = controller
-                    .admit_public(&Peer::default(), &mut parts)
+                    .admit_public(gang_spi::RequestScope::Shared, &Peer::default(), &mut parts)
                     .await
                     .expect("the public gate admits an open path");
-                assert_eq!(admitted, Admitted::Anonymous);
+                assert_eq!(admitted, GateDecision::Admit(Admitted::Anonymous));
                 assert_anonymous(
                     &parts,
                     &format!("a POST to {path} does not read the cookie"),
@@ -312,7 +311,7 @@ async fn get_of_unlisted_path_ignores_session_cookie() {
             let token = session_token(&clock, &identity(ALICE)).await;
             let mut parts = cookie_parts("GET", SERVER_PATH, Some((SESSION_COOKIE, &token)), None);
             controller
-                .admit_public(&Peer::default(), &mut parts)
+                .admit_public(gang_spi::RequestScope::Shared, &Peer::default(), &mut parts)
                 .await
                 .expect("the public gate admits an open path");
             assert_anonymous(&parts, "a GET of an unlisted path does not read the cookie");
@@ -335,10 +334,18 @@ async fn worker_gate_ignores_session_cookie() {
                 cookie_parts("GET", EVENTS_PATH, Some((SESSION_COOKIE, &token)), None);
             let mut without_cookie = cookie_parts("GET", EVENTS_PATH, None, None);
             let outcome = controller
-                .admit_worker(&Peer::default(), &mut with_cookie)
+                .admit_worker(
+                    gang_spi::RequestScope::Shared,
+                    &Peer::default(),
+                    &mut with_cookie,
+                )
                 .await;
             let baseline = controller
-                .admit_worker(&Peer::default(), &mut without_cookie)
+                .admit_worker(
+                    gang_spi::RequestScope::Shared,
+                    &Peer::default(),
+                    &mut without_cookie,
+                )
                 .await;
             assert!(
                 matches!(
@@ -385,7 +392,7 @@ async fn bearer_client_token_wins_over_session_cookie() {
                 Some(&alice),
             );
             controller
-                .admit_public(&Peer::default(), &mut parts)
+                .admit_public(gang_spi::RequestScope::Shared, &Peer::default(), &mut parts)
                 .await
                 .expect("the public gate admits the bearer token");
             let authenticated = caller_of(&parts)
@@ -408,14 +415,20 @@ async fn request_without_credentials_is_anonymous_on_open_paths_and_refused_else
             for path in [EVENTS_PATH, SESSION_PATH, SERVER_PATH, UI_PATH] {
                 let mut parts = cookie_parts("GET", path, None, None);
                 controller
-                    .admit_public(&Peer::default(), &mut parts)
+                    .admit_public(gang_spi::RequestScope::Shared, &Peer::default(), &mut parts)
                     .await
                     .expect("the public gate admits an open path");
                 assert_anonymous(&parts, &format!("a request for {path} without credentials"));
             }
 
             let mut closed = cookie_parts("GET", EXECUTE_PATH, None, None);
-            let outcome = controller.admit_public(&Peer::default(), &mut closed).await;
+            let outcome = controller
+                .admit_public(
+                    gang_spi::RequestScope::Shared,
+                    &Peer::default(),
+                    &mut closed,
+                )
+                .await;
             assert!(
                 matches!(
                     outcome,
@@ -444,10 +457,14 @@ async fn session_token_as_bearer_is_recorded_as_refused_on_open_paths() {
             for path in [EVENTS_PATH, SESSION_PATH, UI_PATH] {
                 let mut as_bearer = cookie_parts("GET", path, None, Some(&session));
                 let admitted = controller
-                    .admit_public(&Peer::default(), &mut as_bearer)
+                    .admit_public(
+                        gang_spi::RequestScope::Shared,
+                        &Peer::default(),
+                        &mut as_bearer,
+                    )
                     .await
                     .expect("the public gate admits an open path");
-                assert_eq!(admitted, Admitted::Anonymous);
+                assert_eq!(admitted, GateDecision::Admit(Admitted::Anonymous));
                 assert_refused(
                     &as_bearer,
                     Rejection::InvalidProof,
@@ -456,7 +473,13 @@ async fn session_token_as_bearer_is_recorded_as_refused_on_open_paths() {
             }
 
             let mut closed = cookie_parts("GET", EXECUTE_PATH, None, Some(&session));
-            let outcome = controller.admit_public(&Peer::default(), &mut closed).await;
+            let outcome = controller
+                .admit_public(
+                    gang_spi::RequestScope::Shared,
+                    &Peer::default(),
+                    &mut closed,
+                )
+                .await;
             assert!(
                 matches!(
                     outcome,
@@ -485,7 +508,11 @@ async fn client_token_as_session_cookie_is_admitted_as_anonymous() {
             let mut as_cookie =
                 cookie_parts("GET", EVENTS_PATH, Some((SESSION_COOKIE, &client)), None);
             controller
-                .admit_public(&Peer::default(), &mut as_cookie)
+                .admit_public(
+                    gang_spi::RequestScope::Shared,
+                    &Peer::default(),
+                    &mut as_cookie,
+                )
                 .await
                 .expect("the public gate admits a listed path");
             assert_anonymous(&as_cookie, "a client token presented as the session cookie");
@@ -507,7 +534,7 @@ async fn tampered_session_cookie_is_admitted_as_anonymous_on_open_paths() {
             for path in [EVENTS_PATH, SESSION_PATH] {
                 let mut parts = cookie_parts("GET", path, Some((SESSION_COOKIE, &token)), None);
                 controller
-                    .admit_public(&Peer::default(), &mut parts)
+                    .admit_public(gang_spi::RequestScope::Shared, &Peer::default(), &mut parts)
                     .await
                     .expect("the public gate admits an open path");
                 assert_anonymous(&parts, &format!("a tampered session cookie on {path}"));
@@ -531,7 +558,7 @@ async fn expired_session_cookie_is_admitted_as_anonymous_on_open_paths() {
             for path in [EVENTS_PATH, SESSION_PATH] {
                 let mut parts = cookie_parts("GET", path, Some((SESSION_COOKIE, &token)), None);
                 controller
-                    .admit_public(&Peer::default(), &mut parts)
+                    .admit_public(gang_spi::RequestScope::Shared, &Peer::default(), &mut parts)
                     .await
                     .expect("the public gate admits an open path");
                 assert_anonymous(&parts, &format!("an expired session cookie on {path}"));
@@ -557,7 +584,7 @@ async fn tampered_session_cookie_with_bearer_garbage_is_recorded_as_refused() {
                     let mut parts =
                         cookie_parts("GET", path, Some((SESSION_COOKIE, &token)), Some(&bearer));
                     controller
-                        .admit_public(&Peer::default(), &mut parts)
+                        .admit_public(gang_spi::RequestScope::Shared, &Peer::default(), &mut parts)
                         .await
                         .expect("the public gate admits an open path");
                     assert_refused(
@@ -589,7 +616,9 @@ async fn refused_session_cookie_on_non_open_path_stays_refused() {
             for token in [&tampered_session, &client] {
                 let mut parts =
                     cookie_parts("GET", EXECUTE_PATH, Some((SESSION_COOKIE, token)), None);
-                let outcome = controller.admit_public(&Peer::default(), &mut parts).await;
+                let outcome = controller
+                    .admit_public(gang_spi::RequestScope::Shared, &Peer::default(), &mut parts)
+                    .await;
                 assert!(
                     matches!(
                         outcome,
@@ -608,7 +637,13 @@ async fn refused_session_cookie_on_non_open_path_stays_refused() {
                 Some((SESSION_COOKIE, &tampered_session)),
                 None,
             );
-            let outcome = controller.admit_worker(&Peer::default(), &mut worker).await;
+            let outcome = controller
+                .admit_worker(
+                    gang_spi::RequestScope::Shared,
+                    &Peer::default(),
+                    &mut worker,
+                )
+                .await;
             assert!(
                 matches!(
                     outcome,
@@ -624,7 +659,11 @@ async fn refused_session_cookie_on_non_open_path_stays_refused() {
             let mut expired =
                 cookie_parts("GET", EXECUTE_PATH, Some((SESSION_COOKIE, &session)), None);
             let outcome = controller
-                .admit_public(&Peer::default(), &mut expired)
+                .admit_public(
+                    gang_spi::RequestScope::Shared,
+                    &Peer::default(),
+                    &mut expired,
+                )
                 .await;
             assert!(
                 matches!(
@@ -659,7 +698,11 @@ async fn revoked_principal_is_recorded_as_refused_on_open_paths() {
             let mut before =
                 cookie_parts("GET", EVENTS_PATH, Some((SESSION_COOKIE, &session)), None);
             controller
-                .admit_public(&Peer::default(), &mut before)
+                .admit_public(
+                    gang_spi::RequestScope::Shared,
+                    &Peer::default(),
+                    &mut before,
+                )
                 .await
                 .expect("the public gate admits alice's session before revocation");
             assert!(
@@ -674,10 +717,14 @@ async fn revoked_principal_is_recorded_as_refused_on_open_paths() {
                 let mut by_cookie =
                     cookie_parts("GET", path, Some((SESSION_COOKIE, &session)), None);
                 let admitted = controller
-                    .admit_public(&Peer::default(), &mut by_cookie)
+                    .admit_public(
+                        gang_spi::RequestScope::Shared,
+                        &Peer::default(),
+                        &mut by_cookie,
+                    )
                     .await
                     .expect("the public gate admits an open path");
-                assert_eq!(admitted, Admitted::Anonymous);
+                assert_eq!(admitted, GateDecision::Admit(Admitted::Anonymous));
                 assert_refused(
                     &by_cookie,
                     Rejection::PrincipalRevoked,
@@ -688,10 +735,14 @@ async fn revoked_principal_is_recorded_as_refused_on_open_paths() {
             for path in [EVENTS_PATH, SESSION_PATH, UI_PATH] {
                 let mut by_bearer = cookie_parts("GET", path, None, Some(&alice));
                 let admitted = controller
-                    .admit_public(&Peer::default(), &mut by_bearer)
+                    .admit_public(
+                        gang_spi::RequestScope::Shared,
+                        &Peer::default(),
+                        &mut by_bearer,
+                    )
                     .await
                     .expect("the public gate admits an open path");
-                assert_eq!(admitted, Admitted::Anonymous);
+                assert_eq!(admitted, GateDecision::Admit(Admitted::Anonymous));
                 assert_refused(
                     &by_bearer,
                     Rejection::PrincipalRevoked,
@@ -700,7 +751,13 @@ async fn revoked_principal_is_recorded_as_refused_on_open_paths() {
             }
 
             let mut closed = cookie_parts("GET", EXECUTE_PATH, None, Some(&alice));
-            let outcome = controller.admit_public(&Peer::default(), &mut closed).await;
+            let outcome = controller
+                .admit_public(
+                    gang_spi::RequestScope::Shared,
+                    &Peer::default(),
+                    &mut closed,
+                )
+                .await;
             assert!(
                 matches!(
                     outcome,
@@ -714,6 +771,104 @@ async fn revoked_principal_is_recorded_as_refused_on_open_paths() {
         },
     )
     .await;
+}
+
+#[tokio::test]
+async fn durable_revocation_refuses_bearer_and_cookie_before_refresh() {
+    let harness = Harness::token(HarnessOptions::default());
+    let alice = client_token(&harness).await;
+    let session = session_token(&harness.clock, &identity(ALICE)).await;
+    harness
+        .core
+        .host
+        .repository
+        .revoke_principal(&identity(ALICE), harness.clock.wall())
+        .await
+        .expect("durable revocation succeeds");
+
+    for cookie in [false, true] {
+        let mut parts = if cookie {
+            cookie_parts("GET", EVENTS_PATH, Some((SESSION_COOKIE, &session)), None)
+        } else {
+            cookie_parts("GET", EVENTS_PATH, None, Some(&alice))
+        };
+        let admitted = harness
+            .gate
+            .admit(RequestScope::Shared, &Peer::default(), &mut parts)
+            .await
+            .expect("open path records refusal");
+        assert_eq!(admitted, GateDecision::Admit(Admitted::Anonymous));
+        assert_refused(&parts, Rejection::PrincipalRevoked, "durable revocation");
+    }
+}
+
+#[tokio::test]
+async fn principal_lookup_failure_refuses_gate_admission() {
+    let harness = Harness::token(HarnessOptions::default());
+    let alice = client_token(&harness).await;
+    harness.core.host.repository.fail_principals(true);
+    let mut parts = cookie_parts("GET", EXECUTE_PATH, None, Some(&alice));
+    let result = harness
+        .gate
+        .admit(RequestScope::Shared, &Peer::default(), &mut parts)
+        .await;
+    assert!(matches!(result, Err(PortError::Unavailable(_))));
+}
+
+#[tokio::test]
+async fn promoted_gate_admits_cached_identity_during_database_failure() {
+    let harness = Harness::token(HarnessOptions::default());
+    let alice = client_token(&harness).await;
+    let readiness = crate::health::Readiness::default();
+    readiness.serve();
+    readiness.contend();
+    readiness.lead();
+    let gate = harness.gate.clone().with_readiness(readiness);
+    let mut parts = cookie_parts("GET", EXECUTE_PATH, None, Some(&alice));
+    assert!(matches!(
+        gate.admit(RequestScope::Shared, &Peer::default(), &mut parts)
+            .await,
+        Ok(GateDecision::Admit(Admitted::Authenticated(_)))
+    ));
+    harness.core.host.repository.fail_principals(true);
+    let mut parts = cookie_parts("GET", EXECUTE_PATH, None, Some(&alice));
+    assert!(matches!(
+        gate.admit(RequestScope::Shared, &Peer::default(), &mut parts)
+            .await,
+        Ok(GateDecision::Admit(Admitted::Authenticated(_)))
+    ));
+    harness.core.host.revoked_principals.revoke(identity(ALICE));
+    let mut parts = cookie_parts("GET", EXECUTE_PATH, None, Some(&alice));
+    assert!(matches!(
+        gate.admit(RequestScope::Shared, &Peer::default(), &mut parts)
+            .await,
+        Err(PortError::Rejected {
+            reason: Rejection::PrincipalRevoked,
+            ..
+        })
+    ));
+}
+
+async fn client_token(
+    harness: &Harness<crate::test_support_deployment::TlsDeployment>,
+) -> AccessToken {
+    use gang_spi::CertificateSignerPort;
+    let signer = &harness.core.host.signer;
+    let der = signer.public_key().await.expect("test public key encodes");
+    let key = gang_authn::TokenKey::from_spki(&der).expect("test public key loads");
+    let endpoint = gang_types::Url::parse("https://gang.example.test").expect("valid test URL");
+    gang_authn::mint(
+        &**signer,
+        &key,
+        &gang_authn::issuer_of(&endpoint),
+        &identity(ALICE),
+        harness.clock.wall(),
+        SESSION_TTL,
+        gang_authn::TokenUse::Client,
+    )
+    .await
+    .expect("client token mints")
+    .token
 }
 
 #[tokio::test]
@@ -733,7 +888,7 @@ async fn plaintext_deployment_ignores_session_cookie() {
                 None,
             );
             controller
-                .admit_public(&Peer::default(), &mut parts)
+                .admit_public(gang_spi::RequestScope::Shared, &Peer::default(), &mut parts)
                 .await
                 .expect("the plaintext gate admits every caller");
             let caller = caller_of(&parts);
@@ -766,7 +921,7 @@ async fn http_cookie_name_is_ignored_under_https() {
                 None,
             );
             controller
-                .admit_public(&Peer::default(), &mut parts)
+                .admit_public(gang_spi::RequestScope::Shared, &Peer::default(), &mut parts)
                 .await
                 .expect("the public gate admits an open path");
             assert_anonymous(&parts, "the http cookie name under https");
@@ -791,12 +946,12 @@ async fn an_authenticated_request_on_a_grpc_path_stores_no_caller() {
             };
             let mut parts = cookie_parts("GET", EXECUTE_PATH, None, Some(&alice));
             let admitted = controller
-                .admit_public(&peer, &mut parts)
+                .admit_public(gang_spi::RequestScope::Shared, &peer, &mut parts)
                 .await
                 .expect("the public gate admits a client token on a grpc path");
             assert!(matches!(
                 &admitted,
-                Admitted::Authenticated(authenticated)
+                GateDecision::Admit(Admitted::Authenticated(authenticated))
                     if authenticated.identity.as_ref() == &identity(ALICE)
             ));
             assert!(parts.extensions.get::<gang_spi::Authenticated>().is_none());
@@ -829,7 +984,7 @@ async fn an_authenticated_request_on_an_open_path_stores_its_caller_and_address(
             };
             let mut parts = cookie_parts("GET", SESSION_PATH, None, Some(&alice));
             controller
-                .admit_public(&peer, &mut parts)
+                .admit_public(gang_spi::RequestScope::Shared, &peer, &mut parts)
                 .await
                 .expect("the public gate admits a client token on an open path");
             let authenticated = caller_of(&parts)
@@ -873,7 +1028,7 @@ async fn the_worker_gate_stores_no_caller() {
             };
             let mut parts = cookie_parts("GET", EXECUTE_PATH, None, None);
             controller
-                .admit_worker(&worker, &mut parts)
+                .admit_worker(gang_spi::RequestScope::Shared, &worker, &mut parts)
                 .await
                 .expect("a ledgered worker certificate is admitted");
             assert!(

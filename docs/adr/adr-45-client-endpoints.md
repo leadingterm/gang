@@ -1,19 +1,19 @@
-# ADR-45: Clients use separate cache and execution endpoints
+# ADR-45: Clients use one cache and execution endpoint
 
 Status: Accepted. Amends ADR-36 (endpoint routing in the multi-controller shape). Partly superseded by ADR-51: health is an HTTP check of the health listener, not the port accepting.
 
 ## Context
-- Cache requests may go to any controller, but execution and worker streams must reach the process holding the scheduler.
+- Cache, execution, API and dashboard traffic must reach the process holding the scheduler.
 - A stable endpoint must survive replacement of a controller without requiring the leader to update DNS.
 
 ## Decision
-- Advertise the public endpoint for cache and the execution endpoint for execution; `gang bazelrc` writes both. Without a dedicated execution listener, both are the same endpoint.
-- Execution and worker listeners bind only on the leader, so the load balancers' health checks (ADR-51) route execution and worker traffic to it.
+- Advertise one public endpoint for cache and execution; `gang bazelrc` writes it as both `remote_cache` and `remote_executor`.
+- The leader serves the public and worker listeners. All load-balancer target groups use `/ready` health checks to route client and worker traffic to it.
 
 ## Consequences
-- Clients need access to the execution port as well as the serving port and must regenerate their bazelrc to use the separate endpoint.
-- Followers serve cache traffic while execution and worker streams reach the leader.
+- Clients need only the public port, 443 in the deployment.
+- Before first promotion, a controller returns gRPC `UNAVAILABLE` or HTTP 503 rather than forwarding. After promotion admission remains enabled through a lease lapse even when `/ready` is 503; hand-off drains admitted connections.
 
 ## Rejected alternatives
 - **Leader rewrites DNS:** needs cloud API calls and depends on resolver TTLs.
-- **Forward execution through a follower:** adds a hop and complicates principal propagation.
+- **Forward through a follower:** adds a hop and complicates principal propagation; it is not implemented.

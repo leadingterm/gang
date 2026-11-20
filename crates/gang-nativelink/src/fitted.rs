@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use gang_config::{DiskMinReservation, MinReservation};
 use gang_types::{FleetCatalog, property};
 use nativelink_error::Error;
 use nativelink_metric::{
@@ -15,8 +16,7 @@ use nativelink_util::operation_state_manager::{
     ActionStateResult, ActionStateResultStream, ClientStateManager, OperationFilter,
 };
 
-use crate::enforcement::{DiskMinReservation, MinReservation};
-use crate::placeable::{AdmittedFleets, refused};
+use crate::placeable::AdmittedFleets;
 
 /// Fits reservations after historical learning and before the simple scheduler.
 pub(crate) struct FittedActions {
@@ -95,19 +95,64 @@ impl ClientStateManager for FittedActions {
                     .insert(key.to_owned(), min_kb.to_string());
             }
         }
+        // Match the other requested properties before choosing the largest eligible capacity.
+        // This avoids selecting a smaller fleet merely because it is earlier in preference order.
+        for key in [property::MEMORY_KB, property::DISK_KB] {
+            let Some(reserved) = action_info
+                .platform_properties
+                .get(key)
+                .and_then(|value| value.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let eligible = admitted
+                & self.fleets.accepting(|other| {
+                    if other == key {
+                        None
+                    } else {
+                        action_info
+                            .platform_properties
+                            .get(other)
+                            .map(String::as_str)
+                    }
+                });
+            let largest = eligible
+                .iter()
+                .filter_map(|index| self.fleets.fleets().get(index))
+                .filter_map(|fleet| fleet.limit(key).map(|capacity| (capacity, fleet)))
+                .max_by_key(|(capacity, _)| *capacity);
+            if let Some((capacity, fleet)) = largest
+                && reserved > capacity
+            {
+                let whole_cpu = (key == property::MEMORY_KB)
+                    .then(|| fleet.limit(property::CPU_MILLICORES))
+                    .flatten();
+                let properties = &mut Arc::make_mut(&mut action_info).platform_properties;
+                properties.insert(key.to_owned(), capacity.to_string());
+                if let Some(whole_cpu) = whole_cpu {
+                    properties.insert(property::CPU_MILLICORES.to_owned(), whole_cpu.to_string());
+                }
+            }
+        }
         let properties = |key: &str| action_info.platform_properties.get(key).map(String::as_str);
-        let Some(fit) = self.fleets.fit(admitted, properties) else {
-            return Err(refused(&self.fleets, properties));
-        };
-        if !fit.lowered.is_empty() {
-            // A learned reservation comes from an action that already ran on a worker of a
-            // fleet, so the largest admitted fleet's size is enough. Only a client value above
-            // every fleet is an error, and the outer layer refuses it. Memory escalation happens
-            // below this layer, inside NativeLink, bounded by the largest connected worker.
+        if let Some(fit) = self.fleets.fit(admitted, properties)
+            && !fit.lowered.is_empty()
+        {
             tracing::info!(operation_id = %operation, fleet = fit.fleet, keys = ?fit.lowered, "fitting action reservation to fleet");
+            let memory_lowered = fit
+                .lowered
+                .iter()
+                .any(|(key, _)| *key == property::MEMORY_KB);
+            let whole_cpu = memory_lowered
+                .then(|| self.fleets.fleets().get(fit.fleet))
+                .flatten()
+                .and_then(|fleet| fleet.limit(property::CPU_MILLICORES));
             let properties = &mut Arc::make_mut(&mut action_info).platform_properties;
             for (key, limit) in fit.lowered {
                 properties.insert(key.to_owned(), limit.to_string());
+            }
+            if let Some(whole_cpu) = whole_cpu {
+                properties.insert(property::CPU_MILLICORES.to_owned(), whole_cpu.to_string());
             }
         }
         self.inner.add_action(operation, action_info).await

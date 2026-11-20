@@ -1,14 +1,18 @@
 //! Rate limiting of the routes that are open to anyone, and the client address the public gate
 //! records for them, driven through a running server on the injected clock.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::ServerSettings;
 use crate::client_address::ClientAddress;
-use gang_config::DashboardConfig;
+use crate::listeners::Accepting;
+use gang_clock::TestClock;
+use gang_config::{DashboardConfig, ProxyProtocol, ProxyProtocolConfig};
 use gang_spi::{ApiRequestBody, LoginClient, Peer};
-use gang_testkit::Controller;
+use gang_testkit::{Controller, TestSigner};
+use gang_tls::Listener;
 use gang_types::{
     AccessToken, ClientSecret, NonZeroDuration, PermissionSet, ProviderName, SessionMaxAge,
 };
@@ -18,10 +22,12 @@ use http::header::{CACHE_CONTROL, RETRY_AFTER};
 use http::request::Parts;
 use http::{Request, StatusCode};
 use serde_json::{Value, json};
+use tokio::io::{AsyncWriteExt, DuplexStream};
 
 use crate::test_support::{
-    ApiReply, api_request, mint_token, plain_parts, plain_settings, read, request_with_header,
-    role_for, serve, tls_parts, tls_settings,
+    ApiReply, MemoryDialer, MemoryListener, api_request, memory_listener, mint_token, plain_parts,
+    plain_settings, read, request_with_header, role_for, serve, start_clock, tls_parts,
+    tls_settings,
 };
 
 const PROVIDER: &str = "example-idp";
@@ -176,7 +182,7 @@ async fn send(controller: &Controller, request: Request<ApiRequestBody>) -> ApiR
         ..Peer::default()
     };
     controller
-        .admit_public(&peer, &mut parts)
+        .admit_public(gang_spi::RequestScope::Shared, &peer, &mut parts)
         .await
         .expect("the public gate admits the request");
     read(controller.call_api(Request::from_parts(parts, body)).await).await
@@ -212,13 +218,126 @@ async fn recorded_address(controller: &Controller, peer: &Peer, forwarded: &str)
             .into_parts()
             .0;
     controller
-        .admit_public(peer, &mut parts)
+        .admit_public(gang_spi::RequestScope::Shared, peer, &mut parts)
         .await
         .expect("the public gate admits the open server description");
     parts
         .extensions
         .get::<ClientAddress>()
         .map(|address| address.0)
+}
+
+/// Gives the in-memory listener the raw socket address of the trusted NLB.
+struct NlbListener(MemoryListener);
+
+impl Listener for NlbListener {
+    type Io = DuplexStream;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> std::io::Result<(Self::Io, Self::Addr)> {
+        let (stream, _) = self.0.accept().await?;
+        Ok((stream, SocketAddr::from(([10, 0, 1, 4], 12345))))
+    }
+
+    fn peer_ip(address: &Self::Addr) -> Option<IpAddr> {
+        Some(address.ip())
+    }
+}
+
+/// Accepts the same IPv4 v2 test frame as the proxy protocol tests, with its source changed.
+async fn proxied_peer(
+    endpoint: &mut Accepting<NlbListener, TestSigner, TestClock>,
+    dialer: &MemoryDialer,
+    source: Ipv4Addr,
+) -> Peer {
+    // The fixed frame is the IPv4 PROXY v2 fixture from proxy_protocol_tests::frame.
+    let mut frame = [
+        0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a, 0x21, 0x11, 0, 12,
+        192, 0, 2, 1, 192, 0, 2, 2, 0, 1, 0, 2,
+    ];
+    frame[16..20].copy_from_slice(&source.octets());
+    let mut client = dialer.dial();
+    client.write_all(&frame).await.expect("write proxy frame");
+    endpoint
+        .accept()
+        .await
+        .expect("accept framed connection")
+        .peer
+}
+
+/// Runs an open route through the real gate and API with a spoofed forwarding header.
+async fn get_from(controller: &Controller, peer: &Peer, forwarded: &str) -> ApiReply {
+    let request = request_with_header("GET", GET_SERVER.template, &[], FORWARDED_FOR, forwarded);
+    let (mut parts, body) = request.into_parts();
+    controller
+        .admit_public(gang_spi::RequestScope::Shared, peer, &mut parts)
+        .await
+        .expect("the public gate admits the request");
+    assert_eq!(
+        parts
+            .extensions
+            .get::<ClientAddress>()
+            .map(|address| address.0),
+        peer.address,
+        "the carried client, not the spoofed forwarding header, is recorded"
+    );
+    read(controller.call_api(Request::from_parts(parts, body)).await).await
+}
+
+#[tokio::test]
+async fn proxy_listener_sources_select_independent_rate_limit_buckets() {
+    let (listener, dialer) = memory_listener();
+    let config = ProxyProtocolConfig {
+        trusted_cidrs: vec!["10.0.1.4/32".parse().expect("valid NLB network")],
+        ..ProxyProtocolConfig::default()
+    };
+    let mut endpoint = Accepting::<NlbListener, TestSigner, TestClock>::plain(
+        NlbListener(listener),
+        NonZeroDuration::from_millis(100),
+        start_clock(),
+        ProxyProtocol::Require,
+        Arc::new(config),
+    );
+    let first_ip = Ipv4Addr::new(192, 0, 2, 1);
+    let second_ip = Ipv4Addr::new(192, 0, 2, 3);
+    let first = proxied_peer(&mut endpoint, &dialer, first_ip).await;
+    let second = proxied_peer(&mut endpoint, &dialer, second_ip).await;
+    assert_eq!(first.address, Some(first_ip.into()));
+    assert_eq!(second.address, Some(second_ip.into()));
+
+    let (parts, _dials, handles) = plain_parts();
+    let settings = with_rate_limit(
+        plain_settings(),
+        json!({
+            "trusted_proxies": ["10.0.1.4/32"],
+            "client": { "burst": 1, "refill_interval": "10s" },
+            "global": { "burst": 100, "refill_interval": "10s" }
+        }),
+    );
+    serve(
+        parts,
+        settings,
+        handles.scheduler,
+        |controller| async move {
+            assert_eq!(
+                recorded_address(&controller, &first, SPOOFED_CLIENT).await,
+                Some(first_ip.into())
+            );
+            assert_eq!(
+                get_from(&controller, &first, SPOOFED_CLIENT).await.status,
+                StatusCode::OK
+            );
+            assert_eq!(
+                get_from(&controller, &second, SPOOFED_CLIENT).await.status,
+                StatusCode::OK
+            );
+            assert_eq!(
+                get_from(&controller, &first, FORWARDED_CLIENT).await.status,
+                StatusCode::TOO_MANY_REQUESTS
+            );
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -460,7 +579,9 @@ async fn worker_gate_records_no_client_address() {
             )
             .into_parts()
             .0;
-            let _outcome = controller.admit_worker(&peer, &mut parts).await;
+            let _outcome = controller
+                .admit_worker(gang_spi::RequestScope::Shared, &peer, &mut parts)
+                .await;
             assert!(
                 parts.extensions.get::<ClientAddress>().is_none(),
                 "the worker surface records no client address"

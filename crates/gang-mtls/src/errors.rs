@@ -55,41 +55,6 @@ pub enum MtlsError {
     RequestBuild(#[from] x509_cert::builder::Error),
 }
 
-/// Errors from minting or verifying a controller proof.
-#[derive(Debug, Error)]
-pub enum ProofError {
-    /// The wire value is not a canonical controller proof.
-    #[error("controller proof is malformed")]
-    Malformed,
-    /// The proof has reached its exclusive expiry.
-    #[error("controller proof is expired")]
-    Expired,
-    /// The proof expires beyond the verifier's horizon.
-    #[error("controller proof outlives the allowed lifetime")]
-    TooLong,
-    /// The signature is not valid for this proof.
-    #[error("controller proof signature is invalid")]
-    Signature,
-    /// The controller identifier cannot be represented in the wire format.
-    #[error("controller id cannot be carried in a controller proof")]
-    Controller,
-    /// A NUL byte would make the message encoding ambiguous.
-    #[error("controller proof issuer cannot contain a nul byte")]
-    Issuer,
-    /// A timestamp or duration cannot be represented in milliseconds.
-    #[error("controller proof time arithmetic overflows")]
-    Overflow,
-    /// The signer does not use P-256 ECDSA.
-    #[error("controller proofs require an ecdsa p-256 signer")]
-    Algorithm,
-    /// The verification key is not a usable P-256 public key.
-    #[error("controller proof key is unusable")]
-    Key(#[source] MtlsError),
-    /// The signer failed.
-    #[error("controller proof could not be signed")]
-    Sign(#[source] PortError),
-}
-
 /// Errors from verifying a PKCS#10 certificate signing request.
 #[derive(Debug, Error)]
 pub enum CsrError {

@@ -16,8 +16,8 @@ use gang_clock::{Clock, Timestamp};
 use gang_insight::BuildFilter;
 use gang_spi::{
     ApiRequestBody, ApiResponseBody, ApiService, Authenticated, AuthenticationPort,
-    CertificateIssue, CredentialLifecyclePort, ExpiringRecordPort, LoginPort, PortError,
-    ScalingEventSeq, StateRepositoryPort, TokenIssue,
+    CertificateIssue, CredentialLifecyclePort, ExpiringRecordPort, LeaderUnavailable, LoginPort,
+    PortError, ScalingEventSeq, StateRepositoryPort, TokenIssue,
 };
 use gang_types::{Identity, NonZeroDuration, Proof, ProviderName, RefreshToken};
 use gang_wire::name::{self, SESSION};
@@ -25,12 +25,12 @@ use gang_wire::page::{PageToken, page_size};
 use gang_wire::routes::{self, Method as RouteMethod, RouteId};
 use gang_wire::{
     AuthenticateRequest, AuthenticateResponse, Certificate, CreateCertificateRequest, Credential,
-    DeviceAuthorization, ErrorReason, ErrorResponse, IngestBuildsRequest, IngestBuildsResponse,
-    ListEventsResponse, ListPrincipalsResponse, ListRolesResponse, Principal,
-    RedeemDeviceAuthorizationRequest, RevokePrincipalResponse, Role, Session, SessionLogin, Status,
+    DeviceAuthorization, ErrorReason, ErrorResponse, ListEventsResponse, ListPrincipalsResponse,
+    ListRolesResponse, Principal, RedeemDeviceAuthorizationRequest, RevokePrincipalResponse, Role,
+    Session, SessionLogin, Status,
 };
-use http::header::{CONTENT_LENGTH, HeaderValue, RETRY_AFTER, WWW_AUTHENTICATE};
-use http::{HeaderMap, Method, Request, Response, StatusCode};
+use http::header::{HeaderValue, RETRY_AFTER, WWW_AUTHENTICATE};
+use http::{Method, Request, Response, StatusCode};
 use http_body_util::BodyExt;
 use serde::{
     Deserialize, Serialize,
@@ -48,10 +48,9 @@ use crate::core::Core;
 use crate::deployment::Stack;
 use crate::device_logins::{MountedDevice, Redeem};
 use crate::events::wire_event;
-use crate::gate::{Caller, ExecutionListener, is_open_path};
+use crate::gate::{Caller, is_open_path};
+use crate::health::Readiness;
 use crate::hub::StateHub;
-use crate::ingest::Ingest;
-use crate::leader_routes::LeaderRoutes;
 use crate::query::query_param;
 use crate::rate_limit::RateLimiter;
 use crate::renewal_flights::RenewalFailure;
@@ -75,6 +74,8 @@ pub(crate) struct ApiDashboard {
 
 /// The collaborators an [`Api`] serves requests with.
 pub(crate) struct ApiParts<K: Stack> {
+    /// Leader admission state shared with the listener gates.
+    pub(crate) readiness: Readiness,
     /// The host, the plugins and the cookies the API serves with.
     pub(crate) core: Arc<Core<K>>,
     /// The revocation service the routes that change principals and certificates go through.
@@ -90,8 +91,6 @@ pub(crate) struct ApiParts<K: Stack> {
     /// The dashboard served at `GET /v1/state` and `GET /v1/state:watch`; `None` when the server
     /// does not mount it.
     pub(crate) dashboard: Option<ApiDashboard>,
-    /// Forward leader-owned routes when this controller is a follower.
-    pub(crate) leader_routes: Option<LeaderRoutes>,
     /// The live builds served independently of the dashboard.
     pub(crate) builds: BuildsCell,
     /// The identity provider the browser signs in with, which `GET /v1/session` reports; `None`
@@ -99,8 +98,6 @@ pub(crate) struct ApiParts<K: Stack> {
     pub(crate) login_provider: Option<ProviderName>,
     /// The shared device-login routes, present only when mounted by the dashboard.
     pub(crate) device: Option<Arc<MountedDevice<K::Clock, K::Identity>>>,
-    /// The leader's observation ingest, mounted only with a dedicated execution listener.
-    pub(crate) ingest: Option<Ingest>,
 }
 
 /// The Gang API. Cloning it shares the same state.
@@ -130,14 +127,13 @@ impl<K: Stack> Api<K> {
         path: &'a str,
         caller: &'a Caller,
         client: Option<IpAddr>,
-        execution: Option<ExecutionListener>,
-    ) -> Result<Operation<'a, K>, Status> {
+    ) -> Result<Operation<'a, K>, DecisionError> {
         if let Caller::Refused(refusal) = caller {
-            return Err(gate_status(refusal));
+            return Err(gate_status(refusal).into());
         }
         // The API serves only its open paths; anything else names no route of the API.
         if !is_open_path(path) {
-            return Err(route_not_found(method.as_str(), path));
+            return Err(route_not_found(method.as_str(), path).into());
         }
         let authenticated = caller.as_authenticated();
         let found = method
@@ -146,17 +142,18 @@ impl<K: Stack> Api<K> {
             .ok()
             .and_then(|method| routes::lookup(method, path));
         let Some((route, raw)) = found else {
-            return Err(if authenticated.is_some() {
+            let status = if authenticated.is_some() {
                 route_not_found(method.as_str(), path)
             } else {
                 ErrorReason::CredentialsMissing.into()
-            });
+            };
+            return Err(status.into());
         };
         if route.permission.is_some() && authenticated.is_none() {
-            return Err(ErrorReason::CredentialsMissing.into());
+            return Err(Status::from(ErrorReason::CredentialsMissing).into());
         }
-        let Some(operation) = self.mount(route.id, raw, authenticated, execution) else {
-            return Err(route_not_found(method.as_str(), path));
+        let Some(operation) = self.mount(route.id, raw, authenticated) else {
+            return Err(route_not_found(method.as_str(), path).into());
         };
         if route.rate_limited {
             self.0
@@ -171,21 +168,39 @@ impl<K: Stack> Api<K> {
                     .allows(&authenticated.identity, permission)
             });
             if !granted {
-                return Err(missing_permission(permission));
+                return Err(missing_permission(permission).into());
             }
+        }
+        if matches!(
+            route.id,
+            RouteId::ListBuilds
+                | RouteId::GetBuild
+                | RouteId::GetState
+                | RouteId::WatchState
+                | RouteId::RevokeCertificate
+                | RouteId::RevokePrincipal
+                | RouteId::RestorePrincipal
+        ) && !self.0.readiness.admitting()
+        {
+            return Err(DecisionError::NotLeading);
+        }
+        if matches!(
+            route.id,
+            RouteId::RevokeCertificate | RouteId::RevokePrincipal | RouteId::RestorePrincipal
+        ) && !self.0.readiness.is_leading()
+        {
+            return Err(DecisionError::NotLeading);
         }
         Ok(operation)
     }
 
     /// The operation that serves route `id` when the credential it needs is mounted, `None`
-    /// otherwise. A route with a permission is only mounted for an authenticated caller, and the
-    /// observation ingest only on the execution listener.
+    /// otherwise. A route with a permission is only mounted for an authenticated caller.
     fn mount<'a>(
         &'a self,
         id: RouteId,
         raw: Option<&'a str>,
         authenticated: Option<&'a Authenticated>,
-        execution: Option<ExecutionListener>,
     ) -> Option<Operation<'a, K>> {
         let shared = &*self.0;
         Some(match id {
@@ -221,10 +236,6 @@ impl<K: Stack> Api<K> {
             RouteId::ListEvents => Operation::ListEvents,
             RouteId::ListBuilds => Operation::ListBuilds,
             RouteId::GetBuild => Operation::GetBuild(raw?),
-            RouteId::IngestBuilds => {
-                execution?;
-                Operation::IngestBuilds(shared.ingest.as_ref()?)
-            }
             RouteId::GetState => Operation::GetState(shared.dashboard.as_ref()?),
             RouteId::WatchState => Operation::WatchState {
                 dashboard: shared.dashboard.as_ref()?,
@@ -238,7 +249,6 @@ impl<K: Stack> Api<K> {
         &self,
         operation: Operation<'_, K>,
         query: Option<&str>,
-        headers: &HeaderMap,
         body: ApiRequestBody,
         caller: &Caller,
         client: Option<IpAddr>,
@@ -265,9 +275,6 @@ impl<K: Stack> Api<K> {
             Operation::ListEvents => outcome(self.list_events(query).await),
             Operation::ListBuilds => outcome(self.list_builds(query)),
             Operation::GetBuild(raw) => outcome(self.get_build(raw)),
-            Operation::IngestBuilds(ingest) => {
-                outcome(self.ingest_builds(ingest, headers, body).await)
-            }
             Operation::GetState(dashboard) => state(dashboard),
             Operation::WatchState { dashboard, caller } => self.watch_state(dashboard, caller),
             Operation::GetSession => json(StatusCode::OK, &self.session(caller)),
@@ -649,39 +656,6 @@ impl<K: Stack> Api<K> {
         })
     }
 
-    /// Authenticates before reading and applies only fully validated batches.
-    async fn ingest_builds(
-        &self,
-        ingest: &Ingest,
-        headers: &HeaderMap,
-        body: ApiRequestBody,
-    ) -> Result<IngestBuildsResponse, Status> {
-        if !ingest.leads() {
-            return Err(ErrorReason::DependencyUnavailable.into());
-        }
-        let host = &self.0.core.host;
-        let controller = ingest.admit(host.clock.wall(), headers)?;
-        let declared_too_large = headers
-            .get(CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
-            .is_some_and(|value| {
-                value
-                    .parse::<usize>()
-                    .map_or(true, |length| length > self.0.limits.max_request_size)
-            });
-        if declared_too_large {
-            return Err(ErrorReason::RequestTooLarge.into());
-        }
-        let request: IngestBuildsRequest = self.read_json(body).await?;
-        let ingested = gang_insight::decode(request, ingest.max_lost).map_err(|error| {
-            tracing::debug!(%error, %controller, "rejected build observations");
-            malformed_body()
-        })?;
-        ingest.apply(&controller, host.clock.wall(), ingested);
-        Ok(IngestBuildsResponse {})
-    }
-
     /// Reads the request body, which may not exceed the size limit.
     async fn read_bytes(&self, body: ApiRequestBody) -> Result<Bytes, Status> {
         read_body(body, self.0.limits.max_request_size).await
@@ -749,22 +723,6 @@ impl<K: Stack> ApiService for Api<K> {
     ) -> impl Future<Output = Response<ApiResponseBody>> + Send {
         let this = self.clone();
         async move {
-            let found = request
-                .method()
-                .as_str()
-                .parse::<RouteMethod>()
-                .ok()
-                .and_then(|method| routes::lookup(method, request.uri().path()))
-                .map(|(route, _)| route.id);
-            let leader_route = matches!(
-                found,
-                Some(
-                    RouteId::GetState
-                        | RouteId::WatchState
-                        | RouteId::ListBuilds
-                        | RouteId::GetBuild
-                )
-            );
             let (parts, body) = request.into_parts();
             let caller = Caller::of(&parts.extensions);
             let path = parts.uri.path();
@@ -772,36 +730,28 @@ impl<K: Stack> ApiService for Api<K> {
                 .extensions
                 .get::<ClientAddress>()
                 .map(|address| address.0);
-            let execution = parts.extensions.get::<ExecutionListener>().copied();
-            let decision = this.decide(&parts.method, path, caller, client, execution);
+            let decision = this.decide(&parts.method, path, caller, client);
             tracing::debug!(
                 authenticated = caller.as_authenticated().is_some(),
                 method = %parts.method,
                 path,
-                refusal = ?decision.as_ref().err().and_then(Status::reason),
+                refusal = ?decision.as_ref().err().and_then(DecisionError::reason),
                 "api request"
             );
             let operation = match decision {
                 Ok(served) => served,
-                Err(status) => return failure(status),
+                Err(DecisionError::Status(status)) => return failure(status),
+                Err(DecisionError::NotLeading) => {
+                    let mut response = failure(ErrorReason::DependencyUnavailable.into());
+                    response.headers_mut().insert(
+                        gang_types::handover::REQUEST_NOT_STARTED_HEADER,
+                        HeaderValue::from_static("true"),
+                    );
+                    response.extensions_mut().insert(LeaderUnavailable);
+                    return response;
+                }
             };
-            if leader_route
-                && let Some(routes) = this
-                    .0
-                    .leader_routes
-                    .as_ref()
-                    .filter(|routes| routes.should_forward())
-            {
-                return routes.forward(Request::from_parts(parts, body)).await;
-            }
-            let answer = this.serve(
-                operation,
-                parts.uri.query(),
-                &parts.headers,
-                body,
-                caller,
-                client,
-            );
+            let answer = this.serve(operation, parts.uri.query(), body, caller, client);
             let deadline = this
                 .0
                 .core
@@ -814,6 +764,27 @@ impl<K: Stack> ApiService for Api<K> {
                 () = deadline => failure(ErrorReason::RequestTimedOut.into()),
             }
         }
+    }
+}
+
+#[derive(Debug)]
+enum DecisionError {
+    Status(Status),
+    NotLeading,
+}
+
+impl DecisionError {
+    fn reason(&self) -> Option<ErrorReason> {
+        match self {
+            Self::Status(status) => status.reason(),
+            Self::NotLeading => Some(ErrorReason::DependencyUnavailable),
+        }
+    }
+}
+
+impl From<Status> for DecisionError {
+    fn from(status: Status) -> Self {
+        Self::Status(status)
     }
 }
 
@@ -864,8 +835,6 @@ enum Operation<'a, K: Stack> {
         /// The authenticated caller the stream is opened for.
         caller: &'a Authenticated,
     },
-    /// `POST /v1/builds:ingest`: a follower's batch of observations.
-    IngestBuilds(&'a Ingest),
     /// `GET /v1/session`: the caller's session.
     GetSession,
 }
@@ -1149,6 +1118,18 @@ pub(crate) fn failure(error: Status) -> Response<ApiResponseBody> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_dependency_failure_is_not_a_leadership_refusal() {
+        let response = failure(ErrorReason::DependencyUnavailable.into());
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.extensions().get::<LeaderUnavailable>().is_none());
+        assert!(
+            !response
+                .headers()
+                .contains_key(gang_types::handover::REQUEST_NOT_STARTED_HEADER)
+        );
+    }
 
     fn paging(limit: usize, cursor: Option<&str>) -> Paging {
         Paging {

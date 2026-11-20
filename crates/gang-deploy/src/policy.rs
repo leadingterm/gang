@@ -19,6 +19,8 @@ pub const PROTECTED_TYPES: [&str; 7] = [
 
 /// Address of the configuration parameter below a deployment module, after `module.<name>.`.
 const CONFIG_PARAMETER: &str = "aws_ssm_parameter.config";
+/// Address of the immutable configuration generation below a deployment module.
+const CONFIG_GENERATION_PARAMETER: &str = "aws_ssm_parameter.config_generation";
 /// Address of the controller instance below a deployment module, after `module.<name>.`.
 const CONTROLLER_INSTANCE: &str = "module.controller.aws_instance.this[0]";
 
@@ -47,14 +49,20 @@ impl fmt::Display for ProtectedChange<'_> {
 }
 
 impl Plan {
-    /// The changes that delete or replace a resource of a [`PROTECTED_TYPES`] type, in plan order.
+    /// The protected resource deletions or replacements, in plan order.
     #[must_use]
     pub fn protected_changes(&self) -> Vec<ProtectedChange<'_>> {
         self.resource_changes()
             .iter()
             .filter(|resource| {
                 resource.change.actions.contains(&Action::Delete)
-                    && PROTECTED_TYPES.contains(&resource.resource_type.as_str())
+                    && (PROTECTED_TYPES.contains(&resource.resource_type.as_str())
+                        || (resource.resource_type == "aws_ssm_parameter"
+                            && (is_module_resource(&resource.address, CONFIG_PARAMETER)
+                                || is_module_resource(
+                                    &resource.address,
+                                    CONFIG_GENERATION_PARAMETER,
+                                ))))
             })
             .map(|resource| ProtectedChange {
                 address: &resource.address,
@@ -165,6 +173,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn deleting_or_replacing_deployment_configuration_is_blocked() {
+        for name in ["config", "config_generation"] {
+            let address = format!("module.gang.aws_ssm_parameter.{name}");
+            for actions in [
+                &["delete"][..],
+                &["delete", "create"],
+                &["create", "delete"],
+            ] {
+                let plan = plan(&[resource("aws_ssm_parameter", &address, actions)]);
+                let protected = plan.protected_changes();
+                assert_eq!(protected.len(), 1, "{address} {actions:?}");
+                assert_eq!(
+                    protected[0].to_string(),
+                    format!("{address}\taws_ssm_parameter\t{}", actions.join(","))
+                );
+            }
+            for actions in [
+                &["no-op"][..],
+                &["update"],
+                &["create"],
+                &["forget"],
+                &["forget", "create"],
+            ] {
+                assert!(
+                    !plan(&[resource("aws_ssm_parameter", &address, actions)]).is_blocked(),
+                    "{address} {actions:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deleting_other_parameter_addresses_is_allowed() {
+        for address in [
+            "aws_ssm_parameter.config",
+            "aws_ssm_parameter.config_generation",
+            "module.gang.module.inner.aws_ssm_parameter.config",
+            "module.gang.module.inner.aws_ssm_parameter.config_generation",
+            "module.gang.aws_ssm_parameter.other",
+            "module.gang.aws_ssm_parameter.config_extra",
+            "module.gang.aws_ssm_parameter.config_generation[0]",
+            "module..aws_ssm_parameter.config",
+        ] {
+            assert!(
+                !plan(&[resource("aws_ssm_parameter", address, &["delete"])]).is_blocked(),
+                "{address}"
+            );
+        }
+        assert!(
+            !plan(&[resource(
+                "other_type",
+                "module.gang.aws_ssm_parameter.config",
+                &["delete"],
+            )])
+            .is_blocked()
+        );
     }
 
     #[test]
@@ -299,6 +366,25 @@ mod tests {
             }
         }
         assert!(!fixture("controller-replaced").restart_needed());
+    }
+
+    #[test]
+    fn generation_rollout_and_rollback_do_not_restart_the_controller() {
+        for actions in [&["create"][..], &["forget", "create"]] {
+            let generation = resource(
+                "aws_ssm_parameter",
+                "module.gang.aws_ssm_parameter.config_generation",
+                actions,
+            );
+            let controller = resource(
+                "aws_instance",
+                "module.gang.module.controller.aws_instance.this[0]",
+                &["delete", "create"],
+            );
+            let plan = plan(&[generation, controller]);
+            assert!(!plan.is_blocked(), "{actions:?}");
+            assert!(!plan.restart_needed(), "{actions:?}");
+        }
     }
 
     #[test]

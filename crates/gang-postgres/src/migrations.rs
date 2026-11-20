@@ -6,7 +6,7 @@ use crate::errors::PostgresError;
 
 /// The schema version produced by this binary and the oldest binary it remains compatible with.
 pub const SCHEMA_VERSION: SchemaVersion = SchemaVersion {
-    current: 2,
+    current: 4,
     oldest_compatible: 2,
 };
 
@@ -66,6 +66,21 @@ CREATE TABLE expiring_records (
 CREATE INDEX expiring_records_expiry ON expiring_records (expires_at);
 "#,
     "ALTER TABLE scaling_audit ALTER COLUMN detail TYPE bytea USING convert_to(detail, 'UTF8');",
+    "ALTER TABLE leases ADD COLUMN record_sequence bigint NOT NULL DEFAULT 0;",
+    r#"
+INSERT INTO counters (name, value) VALUES ('candidate', 0);
+CREATE TABLE controller_hosts (
+    host       text COLLATE "C" PRIMARY KEY,
+    generation bigint NOT NULL
+);
+ALTER TABLE leases
+    ADD COLUMN holder_priority text,
+    ADD COLUMN holder_priority_epoch bigint NOT NULL DEFAULT 0,
+    ADD COLUMN pending_holder text,
+    ADD COLUMN pending_priority text,
+    ADD COLUMN pending_epoch bigint,
+    ADD COLUMN pending_expires_at timestamptz;
+"#,
 ];
 
 /// Key of the transaction-scoped advisory lock serialising schema changes across controllers.

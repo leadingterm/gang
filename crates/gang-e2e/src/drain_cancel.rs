@@ -168,6 +168,7 @@ fn concerns(event: &Event, worker: &str, instance: &str) -> bool {
         | EventChange::LaunchFailed { .. }
         | EventChange::Withdrawn { .. }
         | EventChange::ExitedEarly { .. }
+        | EventChange::Aws { .. }
         | EventChange::Unrecognized(_) => false,
     }
 }

@@ -42,6 +42,9 @@ platform(
         "@platforms//os:linux",
         "@platforms//cpu:aarch64",
     ],
-    exec_properties = {"ISA": "aarch64"},
+    exec_properties = {
+        "ISA": "aarch64",
+        "gang_action_environment": "identity-roots-v1",
+    },
     visibility = ["//visibility:public"],
 )

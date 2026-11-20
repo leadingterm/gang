@@ -7,7 +7,7 @@
 
 use gang_clock::Timestamp;
 use gang_reconciler::FleetPass;
-use gang_spi::{ObservationSink, RecordedScalingEvent};
+use gang_spi::{FleetInfrastructureEvent, ObservationSink, RecordedScalingEvent};
 use gang_state::{Builder, BuilderConfig, CacheBaseline, Inputs, PassStatus};
 use gang_types::FleetCatalog;
 
@@ -65,6 +65,7 @@ impl StatePublisher {
         pass: PassStatus<'_>,
         fleets: &[FleetPass],
         catalog: &FleetCatalog,
+        infrastructure: &[FleetInfrastructureEvent],
     ) {
         let builder = &mut self.builder;
         let cache = &self.cache;
@@ -86,6 +87,7 @@ impl StatePublisher {
                             actions,
                             builds,
                             events,
+                            infrastructure,
                             traffic,
                             measured: measured.as_ref(),
                             principals_epoch: prev.principals_epoch,

@@ -5,7 +5,7 @@ use std::marker::PhantomData;
 use std::path::PathBuf;
 
 use gang_config::{FleetOptionsError, FleetOptionsTable, PluginSet, SandboxSelection};
-use gang_types::{AuthenticationSettings, SchedulerSettings};
+use gang_types::AuthenticationSettings;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -16,8 +16,6 @@ use serde::{Deserialize, Serialize};
 pub struct Opaque(pub toml::Table);
 
 impl AuthenticationSettings for Opaque {}
-
-impl SchedulerSettings for Opaque {}
 
 gang_types::string_enum! {
     /// Names one sandbox plugin by its section key.
@@ -102,7 +100,6 @@ impl<L: DeserializeOwned + Serialize + Debug + Clone> PluginSet for TestPluginSe
     type Provisioner = Opaque;
     type Cache = Opaque;
     type Signer = Opaque;
-    type Scheduler = Opaque;
     type Database = Opaque;
     type SandboxKey = SandboxKey;
     type Sandbox = SandboxConfig;
@@ -160,8 +157,6 @@ boot_grace = "30s"
 
 [signer.test]
 
-[scheduler.test]
-
 [database.test]
 
 [sandbox.noop]
@@ -172,6 +167,9 @@ boot_grace = "30s"
 
 [server]
 transport = "plaintext"
+
+[server.http2]
+shutdown_grace = "0s"
 "#;
 
 #[cfg(test)]

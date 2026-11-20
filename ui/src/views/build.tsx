@@ -3,7 +3,7 @@ import { useEffect } from "preact/hooks";
 import { bytes, duration, percent } from "../format.ts";
 import { identityOf, ms, seconds } from "../wire-parse.ts";
 import type { Build as BuildData, ScalingEvent, State } from "../wire.ts";
-import { Cell, Clock, Duration, Empty, Ident, Num, Row, Section, Table, Target, useClient } from "../ui.tsx";
+import { Cell, ChartFrame, Clock, Duration, Empty, Ident, Num, Row, Section, Stack, Table, Target, Tile, Tiles, useClient } from "../ui.tsx";
 import { actionSeconds } from "./builds.tsx";
 import { Forbidden } from "./gate.tsx";
 
@@ -26,6 +26,8 @@ const TimeBar = ({ build }: { build: BuildData }) => {
   let offset = 0;
   return (
     <Section id="build-time" title="Where the time went">
+      <Stack gap="md">
+      <ChartFrame size="bar">
       <svg class="build-time" viewBox={`0 0 ${WIDTH} ${BAR_HEIGHT}`} preserveAspectRatio="none" role="img" aria-label="Action time by phase">
         {parts.map(([label, value], i) => {
           const x = offset;
@@ -38,8 +40,12 @@ const TimeBar = ({ build }: { build: BuildData }) => {
           );
         })}
       </svg>
+      </ChartFrame>
+      <div>
       <p>{parts.map(([label, value], i) => <span key={label}>{i > 0 && " · "}{label} <Duration ms={value * 1000} /></span>)}</p>
       <p class="dim">Remote work Gang saw; local actions, disk-cache hits and analysis are not included.</p>
+      </div>
+      </Stack>
     </Section>
   );
 };
@@ -59,7 +65,9 @@ const BuildTimeline = ({ build, events }: { build: BuildData; events: ScalingEve
   const span = buckets.length * step * 1000;
   const marks = events.filter((e) => ms(e.createTime) >= ms(build.startTime) && ms(e.createTime) <= ms(build.lastActiveTime));
   return (
-    <>
+    <Stack gap="xs">
+      <Stack gap="2xs">
+      <ChartFrame size="timeline">
       <svg class="build-chart" viewBox={`0 0 ${WIDTH} ${HEIGHT}`} preserveAspectRatio="none" role="img" aria-label="Mean executing and queued actions per timeline bucket">
         <polyline class="build-chart__executing" points={[point(seconds(first.executing), -0.5), ...buckets.map((b, i) => point(seconds(b.executing), i)), point(seconds(last.executing), buckets.length - 0.5)].join(" ")} />
         <polyline class="build-chart__queued" points={[point(seconds(first.queued), -0.5), ...buckets.map((b, i) => point(seconds(b.queued), i)), point(seconds(last.queued), buckets.length - 0.5)].join(" ")} />
@@ -69,6 +77,8 @@ const BuildTimeline = ({ build, events }: { build: BuildData; events: ScalingEve
           </line>
         ))}
       </svg>
+      </ChartFrame>
+      <ChartFrame size="cache">
       <svg class="build-cache-strip" viewBox={`0 0 ${WIDTH} ${CACHE_HEIGHT}`} preserveAspectRatio="none" role="img" aria-label="Cache hits and misses per timeline bucket">
         {buckets.map((b, i) => {
           const hitHeight = b.hits / countPeak * CACHE_HEIGHT;
@@ -87,15 +97,10 @@ const BuildTimeline = ({ build, events }: { build: BuildData; events: ScalingEve
           );
         })}
       </svg>
+      </ChartFrame>
+      </Stack>
       <div class="passbar__axis"><span><Clock t={start} /> UTC</span><span><Clock t={start + span} /> UTC</span></div>
-      <div class="legend" aria-label="Timeline legend">
-        <span class="legend__item"><i class="build-swatch build-swatch--executing" /> executing</span>
-        <span class="legend__item"><i class="build-swatch build-swatch--queued" /> queued</span>
-        <span class="legend__item"><i class="build-swatch build-swatch--hit" /> hits</span>
-        <span class="legend__item"><i class="build-swatch build-swatch--miss" /> misses</span>
-        <span class="legend__item"><i class="build-swatch build-swatch--event" /> scaling event</span>
-      </div>
-    </>
+    </Stack>
   );
 };
 
@@ -133,7 +138,7 @@ const ExecutionsCard = ({ build }: { build: BuildData }) => {
   const execution = build.usage.executions;
   return (
     <Section id="build-executions" title="Executions">
-      <div class="readouts">
+      <Tiles>
         {([
           ["Execute calls", execution.executeCalls],
           ["Completed", execution.completed],
@@ -141,12 +146,9 @@ const ExecutionsCard = ({ build }: { build: BuildData }) => {
           ["Joined", Math.max(0, execution.executeCalls - execution.completed - execution.failed)],
           ["Rejected", execution.rejected],
         ] as const).map(([label, value]) => (
-          <div class="readout" key={label}>
-            <h3 class="label">{label}</h3>
-            <p class="readout__big"><Num value={value} /></p>
-          </div>
+          <Tile key={label} heading={3} label={label} value={<Num value={value} />} />
         ))}
-      </div>
+      </Tiles>
     </Section>
   );
 };
@@ -187,20 +189,29 @@ export const BuildView = ({ build }: { build: BuildData }) => {
   return (
     <>
       <Section id="build-header" title={identityOf(build.principal)} mono>
-        <div class="readouts build-header">
-          <div class="readout">
-            <h3 class="label">Invocation</h3>
-            <p class="line"><Ident text={build.invocationId} />{" "}<button class="btn btn--quiet" type="button" onClick={() => void navigator.clipboard.writeText(build.invocationId)}>Copy</button></p>
-          </div>
-          <div class="readout"><h3 class="label">Tool</h3><p><Ident text={build.tool || "Unknown tool"} /></p></div>
-          <div class="readout"><h3 class="label">Span</h3><p><Duration ms={ms(build.lastActiveTime) - ms(build.startTime)} /></p></div>
-          <div class="readout"><h3 class="label">State</h3><p><span class={build.state === "IDLE" ? "tag" : "tag tag--spot"}>{build.state}</span></p></div>
-        </div>
+        <Stack gap="2xl">
+        <Tiles columns={4}>
+          <Tile heading={3} valueStyle="text" label="Invocation" value={<span class="line"><Ident text={build.invocationId} />{" "}<button class="btn btn--quiet" type="button" onClick={() => void navigator.clipboard.writeText(build.invocationId)}>Copy</button></span>} />
+          <Tile heading={3} valueStyle="text" label="Tool" value={<Ident text={build.tool || "Unknown tool"} />} />
+          <Tile heading={3} valueStyle="text" label="Span" value={<Duration ms={ms(build.lastActiveTime) - ms(build.startTime)} />} />
+          <Tile heading={3} valueStyle="text" label="State" value={<span class={build.state === "IDLE" ? "tag" : "tag tag--spot"}>{build.state}</span>} />
+        </Tiles>
+        {(build.state === "IDLE" || build.unrecorded > 0) && <div>
         {build.state === "IDLE" && <p class="dim">No observation for a while; Gang cannot know if it finished.</p>}
         {build.unrecorded > 0 && <p class="caution">{build.unrecorded} observations not recorded</p>}
+        </div>}
+        </Stack>
       </Section>
       <TimeBar build={build} />
-      <Section id="build-timeline" title="Timeline">
+      <Section id="build-timeline" title="Timeline" legend={build.timeline?.buckets?.length ? (
+        <div class="legend" aria-label="Timeline legend">
+          <span class="legend__item"><i class="build-swatch build-swatch--executing" /> executing</span>
+          <span class="legend__item"><i class="build-swatch build-swatch--queued" /> queued</span>
+          <span class="legend__item"><i class="build-swatch build-swatch--hit" /> hits</span>
+          <span class="legend__item"><i class="build-swatch build-swatch--miss" /> misses</span>
+          <span class="legend__item"><i class="build-swatch build-swatch--event" /> scaling event</span>
+        </div>
+      ) : undefined}>
         <BuildTimeline build={build} events={state?.events ?? []} />
       </Section>
       <CacheCard build={build} />

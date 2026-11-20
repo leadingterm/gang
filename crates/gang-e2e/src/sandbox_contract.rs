@@ -1,6 +1,6 @@
 //! The sandbox contract under bwrap: an action sees none of the worker's own environment, a fresh empty
 //! tmpfs on /tmp, every read-only bind read-only and its working directory writable; it runs with bwrap inside its
-//! own scope while `gang exec` stays in the worker's leaf; and an out-of-memory kill is cleaned up.
+//! own scope while `gang exec` stays in the worker's leaf; and the held action's scope is cleaned up.
 
 use std::collections::BTreeSet;
 
@@ -11,9 +11,10 @@ use crate::hold::Signalled;
 use crate::limits::{end_held_build, join_build};
 use crate::names::sandbox_contract;
 use crate::oom::oom;
+use crate::report::ProbeReport;
 use crate::system::{Limits, Probe, ScopeFacts, System};
 
-/// Proves the bwrap sandbox contract, held-action cgroup placement, OOM cleanup, and continued service.
+/// Proves the bwrap sandbox contract, held-action cgroup placement, cleanup, and continued service.
 ///
 /// # Errors
 ///
@@ -46,7 +47,14 @@ fn environment<S: System, E: Execution>(
             Check::failed(sandbox_contract::WORKER_ENV_HIDDEN, reason.clone()),
             Check::failed(sandbox_contract::TMP_FRESH, reason.clone()),
             Check::failed(sandbox_contract::READONLY_BINDS, reason.clone()),
-            Check::failed(sandbox_contract::WORKDIR_WRITABLE, reason),
+            Check::failed(sandbox_contract::WORKDIR_WRITABLE, reason.clone()),
+            Check::failed(sandbox_contract::IDENTITY, reason.clone()),
+            Check::failed(sandbox_contract::NSS, reason.clone()),
+            Check::failed(sandbox_contract::ETC_CONTENTS, reason.clone()),
+            Check::failed(sandbox_contract::IDENTITY_ROOTS_READONLY, reason.clone()),
+            Check::failed(sandbox_contract::ROOTS, reason.clone()),
+            Check::failed(sandbox_contract::ROOTS_OVERRIDE, reason.clone()),
+            Check::failed(sandbox_contract::POSTGRES, reason),
         ]);
     }
     let report = system.report(Probe::SandboxContract)?;
@@ -119,7 +127,29 @@ fn environment<S: System, E: Execution>(
         cwd == "yes",
         || "the working directory is not writable".to_owned(),
     ));
+    action_environment_checks(&report, &mut checks)?;
     Ok(checks)
+}
+
+fn action_environment_checks(report: &ProbeReport, checks: &mut Vec<Check>) -> Result<()> {
+    for (key, name) in [
+        ("identity", sandbox_contract::IDENTITY),
+        ("nss", sandbox_contract::NSS),
+        ("etc_contents", sandbox_contract::ETC_CONTENTS),
+        (
+            "identity_roots_readonly",
+            sandbox_contract::IDENTITY_ROOTS_READONLY,
+        ),
+        ("roots", sandbox_contract::ROOTS),
+        ("roots_override", sandbox_contract::ROOTS_OVERRIDE),
+        ("postgres", sandbox_contract::POSTGRES),
+    ] {
+        let value = report.get(key)?;
+        checks.push(Check::expect(name, value == "yes", || {
+            format!("{key}: {value}")
+        }));
+    }
+    Ok(())
 }
 
 /// How the hold of the sandbox contract ended before its build is joined.

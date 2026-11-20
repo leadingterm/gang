@@ -139,10 +139,14 @@ mod tests {
                         InputLinks::Break,
                         &action,
                         &mut terminations,
+                        |_| {},
                         || Ok(()),
                     )
                     .await?;
-                    assert_eq!(outcome, ActionExecutionOutcome::Signaled(expected.signal()));
+                    assert_eq!(
+                        outcome.outcome,
+                        ActionExecutionOutcome::Signaled(expected.signal())
+                    );
                     if with_limits {
                         assert_eq!(log.calls(), ["limits.enter", "limits.leave"]);
                     } else {

@@ -51,3 +51,11 @@ output "health_port" {
   description = "Health listener port checked by the public serve target group."
   value       = tonumber(aws_lb_target_group.this.health_check[0].port)
 }
+
+output "proxy_protocol_trusted_cidrs" {
+  description = "Exact public and internal NLB interface addresses trusted to send PROXY headers."
+  value = sort(distinct(flatten([
+    for eni in concat(values(data.aws_network_interface.public), values(data.aws_network_interface.internal)) :
+    [for ip in eni.private_ips : "${ip}/32"]
+  ])))
+}

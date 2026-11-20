@@ -170,7 +170,7 @@ pub(crate) async fn fill(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::num::{NonZeroU32, NonZeroUsize};
+    use std::num::NonZeroUsize;
     use std::sync::Arc;
 
     use crate::actions::tests::{Fake, bazel, info, row};
@@ -216,7 +216,7 @@ pub(crate) mod tests {
     pub(crate) fn history() -> Mutex<ActionDurations> {
         Mutex::new(ActionDurations::new(
             NonZeroUsize::new(32).expect("nonzero"),
-            NonZeroU32::new(7).expect("nonzero"),
+            gang_config::HistoryWindow::from_units(7),
         ))
     }
 

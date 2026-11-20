@@ -1,4 +1,4 @@
-//! `NativeLink` scheduler plugin for Gang.
+//! Embedded `NativeLink` scheduler adapter for Gang.
 //!
 //! `NativeLink` runs inside the `gang` process as a library. `gang server` runs the controller
 //! (scheduler, content and action stores, and gRPC services over the connections it is handed)
@@ -6,16 +6,23 @@
 //!
 //! # Limits
 //!
-//! One controller and one worker at a time per process; `run_worker` may be called again after it
-//! returns. The controller's resource sketch snapshot task outlives its call. On Linux the worker
-//! makes the process a child subreaper with one zombie reaper for the process's lifetime.
+//! One controller and one worker at a time per adapter; either may run again after returning.
+//! Learned resource reservations and durations survive controller terms and remain available
+//! after drain for the final persistence flush. One resource sketch maintenance task outlives
+//! each term. On Linux the worker makes the process a child subreaper with one zombie reaper
+//! for the process's lifetime.
 //! `globals::init` is process-wide: the first call decides the digest hash function and raises the
 //! open-file soft limit for the whole process.
+//! During controller drain, a separate refusal transport can finish retryable HTTP/gRPC
+//! responses without publishing another controller or invoking authentication or API handlers.
 //!
 //! ```
-//! use gang_types::SchedulerName;
+//! use gang_config::WorkerConfig;
+//! use gang_nativelink::NativeLinkConfig;
 //!
-//! assert!(SchedulerName::try_new("MAIN_SCHEDULER").is_ok());
+//! let endpoint = "grpc://localhost:9002".parse().expect("valid URL");
+//! let settings = NativeLinkConfig::for_worker(Some(endpoint), &WorkerConfig::default());
+//! assert!(settings.worker_endpoint.is_some());
 //! ```
 
 #![recursion_limit = "256"]
@@ -24,7 +31,6 @@ mod actions;
 mod config;
 mod controller;
 mod durations;
-mod enforcement;
 #[cfg(test)]
 mod equivalence;
 mod errors;
@@ -34,9 +40,11 @@ mod globals;
 mod handoff;
 #[cfg(test)]
 mod handoff_tests;
+mod history;
+#[cfg(feature = "test-support")]
+pub mod history_fixture;
 mod observer;
 mod observing;
-mod open_file_limit;
 mod placeable;
 mod plugin;
 mod properties;
@@ -49,10 +57,5 @@ mod store_usage;
 mod stores;
 mod worker;
 
-pub use config::{Http2Tuning, NativeLinkConfig, ReceiveWindow, SchedulerTuning, WorkerTuning};
-pub use enforcement::{
-    ColdStartTuning, DiskEnforcement, DiskMinReservation, DiskTuning, EscalationError,
-    EscalationPercent, MemoryEnforcement, MemoryTuning, MinReservation, WholeKib,
-};
-pub use open_file_limit::{OpenFileLimit, OpenFileLimitError};
+pub use config::NativeLinkConfig;
 pub use plugin::NativeLink;

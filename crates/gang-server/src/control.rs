@@ -2,17 +2,20 @@
 //! and applies the resulting plan through the ports.
 
 use std::convert::Infallible;
+use std::num::NonZeroUsize;
+use std::time::Duration;
 
 use gang_clock::{Clock, Interval, Timestamp};
-use gang_config::{FleetConfig, Fleets, PluginSet};
+use gang_config::{DashboardConfig, FleetConfig, Fleets, PluginSet};
 use gang_reconciler::{Action, FleetPass, HostedSnapshot, PassTime, Plan, PlanStep, Reconciler};
 use gang_spi::{
-    Fence, LeaseLapsed, PortError, ProvisionerPort, RecordedScalingEvent, RunError,
-    ScalingAuditEvent, ScalingEventKind, SchedulerPort, SchedulerSnapshot, StateRepositoryPort,
-    Subject, WorkerState,
+    ExpiringRecordPort, Fence, FleetInfrastructureEvent, InfrastructureEventKind, Insert,
+    LeaseLapsed, PortError, ProvisionerPort, Record, RecordId, RecordKey, RecordKind,
+    RecordVersion, RecordedScalingEvent, RunError, ScalingAuditEvent, ScalingEventKind,
+    SchedulerPort, SchedulerSnapshot, StateRepositoryPort, Subject, WorkerState,
 };
 use gang_state::PassStatus;
-use gang_types::{FleetName, InstanceLifecycle, NonZeroDuration, WorkerId};
+use gang_types::{FleetName, InstanceId, InstanceLifecycle, NonZeroDuration, WorkerId};
 use gang_wire::SkipReason;
 
 use crate::publish::StatePublisher;
@@ -30,6 +33,24 @@ pub(crate) enum PassOutcome {
         /// Steps that failed and will be planned again by a later pass.
         failed: u32,
     },
+}
+
+/// Control-loop timing and infrastructure observation retention.
+#[derive(Clone, Copy)]
+pub(crate) struct ControlSettings {
+    pub(crate) poll_interval: NonZeroDuration,
+    infrastructure_window: Duration,
+    infrastructure_limit: NonZeroUsize,
+}
+
+impl ControlSettings {
+    pub(crate) fn new(poll_interval: NonZeroDuration, dashboard: &DashboardConfig) -> Self {
+        Self {
+            poll_interval,
+            infrastructure_window: dashboard.history_window.get(),
+            infrastructure_limit: dashboard.recent_events,
+        }
+    }
 }
 
 /// Runs reconcile passes against borrowed ports.
@@ -52,7 +73,15 @@ pub(crate) struct ControlLoop<'a, P: PluginSet, F, S, R, C> {
     worker_changes: Vec<ScalingAuditEvent>,
     /// Last recorded launch failure reason for each fleet.
     launch_failures: Vec<Option<String>>,
+    configured_fleets: bool,
+    infrastructure_window: Duration,
+    infrastructure_limit: NonZeroUsize,
+    infrastructure: Vec<FleetInfrastructureEvent>,
+    infrastructure_pending: Vec<FleetInfrastructureEvent>,
+    infrastructure_page: Vec<(RecordId, Record)>,
     plan: Plan,
+    /// Failed termination calls awaiting reconciliation with a fresh supply.
+    pending_terminations: Vec<PlanStep>,
     reconciler: Reconciler,
     poll_interval: NonZeroDuration,
     provisioner: &'a F,
@@ -69,7 +98,7 @@ where
     P: PluginSet<FleetOptions = F::FleetOptions>,
     F: ProvisionerPort,
     S: SchedulerPort,
-    R: StateRepositoryPort,
+    R: StateRepositoryPort + ExpiringRecordPort,
     C: Clock,
 {
     /// Creates a control loop for the worker fleets, reading and writing through the given ports.
@@ -78,7 +107,7 @@ where
     #[must_use]
     pub(crate) fn new(
         fleets: &'a Fleets<P>,
-        poll_interval: NonZeroDuration,
+        settings: ControlSettings,
         provisioner: &'a F,
         scheduler: &'a S,
         repository: &'a R,
@@ -102,9 +131,16 @@ where
             roster_pending: WorkerRoster::default(),
             worker_changes: Vec::new(),
             launch_failures,
+            configured_fleets: false,
+            infrastructure_window: settings.infrastructure_window,
+            infrastructure_limit: settings.infrastructure_limit,
+            infrastructure: Vec::new(),
+            infrastructure_pending: Vec::new(),
+            infrastructure_page: Vec::new(),
             plan: Plan::new(),
+            pending_terminations: Vec::new(),
             reconciler,
-            poll_interval,
+            poll_interval: settings.poll_interval,
             provisioner,
             scheduler,
             repository,
@@ -153,11 +189,38 @@ where
         }
         let time = PassTime::read(self.clock);
         self.hosted.replace(&mut self.incoming);
-        self.record_worker_changes(time.wall).await;
+        if self.record_infrastructure(time.wall).await {
+            self.record_worker_changes(time.wall).await;
+        }
         self.record_exits(time.wall).await;
         self.record_launch_failures(time.wall).await;
         self.reconciler
             .reconcile(&mut self.passes, &self.hosted, time, &mut self.plan);
+        self.pending_terminations.retain(|pending| {
+            let Action::Terminate { instance, .. } = &pending.action else {
+                return false;
+            };
+            if let Some(planned) = self
+                .plan
+                .steps
+                .iter_mut()
+                .find(|step| termination_matches(step, pending.fleet, instance))
+            {
+                planned.clone_from(pending);
+                return true;
+            }
+            let live = self.passes[pending.fleet]
+                .supply
+                .instances
+                .iter()
+                .any(|member| {
+                    member.id == *instance && member.lifecycle != InstanceLifecycle::Terminating
+                });
+            if !live {
+                self.plan.steps.insert(0, pending.clone());
+            }
+            !live
+        });
         Ok(time)
     }
 
@@ -179,6 +242,7 @@ where
                     },
                     &self.passes,
                     self.fleets.catalog(),
+                    &self.infrastructure,
                 );
             }
             PassOutcome::Skipped(reason) => {
@@ -187,6 +251,7 @@ where
                     PassStatus::Skipped(reason.clone()),
                     &self.passes,
                     self.fleets.catalog(),
+                    &self.infrastructure,
                 );
             }
         }
@@ -217,6 +282,135 @@ where
         }
     }
 
+    /// Persists provider observations before acknowledging delivery, then reloads canonical live status.
+    async fn record_infrastructure(&mut self, now: Timestamp) -> bool {
+        let mut complete = true;
+        for (config, pass) in self.configs.iter().zip(&mut self.passes) {
+            for observed in pass.supply.events.drain(..) {
+                if !self.fence.holds() {
+                    return false;
+                }
+                let record = FleetInfrastructureEvent {
+                    fleet: config.policy.name.clone(),
+                    event: observed,
+                };
+                let expires = record.event.at + self.infrastructure_window;
+                if expires > now {
+                    let key = infrastructure_key(&record.event.id);
+                    let body = match serde_json::to_vec(&record) {
+                        Ok(body) => body,
+                        Err(error) => {
+                            tracing::error!(%error, "cannot encode infrastructure observation");
+                            complete = false;
+                            continue;
+                        }
+                    };
+                    let version = match RecordVersion::fresh() {
+                        Ok(version) => version,
+                        Err(error) => {
+                            tracing::error!(%error, "cannot create infrastructure record version");
+                            complete = false;
+                            continue;
+                        }
+                    };
+                    match self
+                        .repository
+                        .insert(&[(key, &body)], version, now, expires)
+                        .await
+                    {
+                        Ok(Insert::Inserted) => {}
+                        Ok(Insert::Exists) => match self.repository.get(&key, now).await {
+                            Ok(Some(stored)) => match serde_json::from_slice::<
+                                FleetInfrastructureEvent,
+                            >(&stored.body)
+                            {
+                                Ok(_) => {}
+                                Err(error) => {
+                                    tracing::error!(%error, "invalid canonical infrastructure observation");
+                                    complete = false;
+                                    continue;
+                                }
+                            },
+                            Ok(None) => {
+                                complete = false;
+                                continue;
+                            }
+                            Err(error) => {
+                                tracing::error!(%error, "cannot read canonical infrastructure observation");
+                                complete = false;
+                                continue;
+                            }
+                        },
+                        Err(error) => {
+                            tracing::error!(%error, "cannot store infrastructure observation");
+                            complete = false;
+                            continue;
+                        }
+                    }
+                }
+                if let Err(error) = self
+                    .fence
+                    .run(async |held| {
+                        self.provisioner
+                            .acknowledge_event(held, config.fleet(), &record.event.id)
+                            .await
+                    })
+                    .await
+                {
+                    tracing::warn!(%error, "cannot acknowledge infrastructure observation");
+                    complete = false;
+                }
+            }
+        }
+        let loaded = self.load_infrastructure(now).await;
+        complete && loaded
+    }
+
+    async fn load_infrastructure(&mut self, now: Timestamp) -> bool {
+        self.infrastructure.clear();
+        let mut complete = true;
+        self.infrastructure_pending.clear();
+        let mut after = None;
+        loop {
+            let more = match self
+                .repository
+                .records(
+                    RecordKind::InfrastructureEvent,
+                    after,
+                    self.infrastructure_limit,
+                    now,
+                    &mut self.infrastructure_page,
+                )
+                .await
+            {
+                Ok(more) => more,
+                Err(error) => {
+                    tracing::error!(%error, "cannot read infrastructure observations");
+                    return false;
+                }
+            };
+            for (_, record) in &self.infrastructure_page {
+                match serde_json::from_slice(&record.body) {
+                    Ok(record) => self.infrastructure_pending.push(record),
+                    Err(error) => {
+                        tracing::warn!(%error, "invalid stored infrastructure observation");
+                        complete = false;
+                    }
+                }
+            }
+            if !more {
+                break;
+            }
+            let Some((id, _)) = self.infrastructure_page.last() else {
+                tracing::error!("infrastructure record pagination returned an empty page");
+                return false;
+            };
+            after = Some(*id);
+        }
+        std::mem::swap(&mut self.infrastructure, &mut self.infrastructure_pending);
+        complete
+    }
+
     /// Records workers registered or deregistered since the previous pass, then remembers the
     /// workers of this snapshot. Every event is stamped with the wall clock of this pass.
     async fn record_worker_changes(&mut self, at: Timestamp) {
@@ -227,6 +421,17 @@ where
             at,
             &mut self.worker_changes,
         );
+        self.worker_changes.retain(|event| {
+            let ScalingEventKind::WorkerRegistered { worker } = &event.kind else {
+                return true;
+            };
+            !self.infrastructure.iter().any(|record| {
+                record.fleet == event.fleet
+                    && matches!(&record.event.kind,
+                    InfrastructureEventKind::ReplacementLaunched { instance, .. }
+                    if worker.instance_name() == Some(instance.as_str()))
+            })
+        });
         let mut recorded = true;
         for event in self.worker_changes.drain(..) {
             recorded &=
@@ -241,6 +446,12 @@ where
 
     /// Records and acknowledges early exits, stopping at the first failure.
     async fn record_exits(&mut self, at: Timestamp) {
+        for (fleet, pass) in self.passes.iter().enumerate() {
+            for exit in &pass.supply.exits {
+                self.pending_terminations
+                    .retain(|step| !termination_matches(step, fleet, &exit.instance));
+            }
+        }
         for (config, pass) in self.configs.iter().zip(self.passes.iter_mut()) {
             for exit in pass.supply.exits.drain(..) {
                 let instance = exit.instance;
@@ -281,6 +492,7 @@ where
     }
 
     /// Records new launch failure causes until the fleet's request is met.
+    /// Expiring provider capacity observations do not replace this durable audit.
     async fn record_launch_failures(&mut self, at: Timestamp) {
         for ((config, pass), last_reason) in self
             .configs
@@ -321,6 +533,16 @@ where
 
     /// Converges then reads each fleet's supply, or returns why the pass must be skipped.
     async fn refresh_supplies(&mut self) -> Result<(), SkipReason> {
+        if !self.configured_fleets {
+            self.provisioner.reset_configured_fleets();
+            for config in &self.configs {
+                if let Err(error) = self.provisioner.configure_fleet(config.fleet()) {
+                    tracing::warn!(fleet = %config.policy.name, %error, "provisioner fleet configuration failed");
+                    return Err(SkipReason::ProvisionerUnavailable);
+                }
+            }
+            self.configured_fleets = true;
+        }
         for (config, pass) in self.configs.iter().zip(self.passes.iter_mut()) {
             let provisioner = self.provisioner;
             let fleet = config.fleet();
@@ -370,6 +592,10 @@ where
             .await
             {
                 Ok(()) => {
+                    if let Action::Terminate { instance, .. } = &step.action {
+                        self.pending_terminations
+                            .retain(|pending| !termination_matches(pending, step.fleet, instance));
+                    }
                     applied += 1;
                     let event =
                         step.audit_event(self.plan.at, &self.passes[step.fleet].policy.name);
@@ -386,6 +612,13 @@ where
                 }
                 Err(error) => {
                     if let Action::Terminate { instance, .. } = &step.action {
+                        if !self
+                            .pending_terminations
+                            .iter()
+                            .any(|pending| termination_matches(pending, step.fleet, instance))
+                        {
+                            self.pending_terminations.push(step.clone());
+                        }
                         self.reconciler.forget_order(step.fleet, instance);
                     }
                     tracing::warn!(?step, %error, "control step failed");
@@ -454,6 +687,21 @@ where
                 Err(event)
             }
         }
+    }
+}
+
+fn termination_matches(step: &PlanStep, fleet: usize, instance: &InstanceId) -> bool {
+    step.fleet == fleet
+        && matches!(&step.action, Action::Terminate { instance: id, .. } if id == instance)
+}
+
+fn infrastructure_key(id: &str) -> RecordKey {
+    let digest = ring::digest::digest(&ring::digest::SHA256, id.as_bytes());
+    let mut bytes = [0_u8; 32];
+    bytes.copy_from_slice(digest.as_ref());
+    RecordKey {
+        kind: RecordKind::InfrastructureEvent,
+        id: RecordId::new(bytes),
     }
 }
 

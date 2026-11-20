@@ -76,6 +76,15 @@ impl Collection for Events {
     type Id = u64;
 }
 
+/// Collection of short-lived AWS infrastructure observations, named by provider event ID.
+#[derive(Debug, Clone, Copy)]
+pub enum AwsEvents {}
+
+impl Collection for AwsEvents {
+    const NAME: &'static str = "awsEvents";
+    type Id = String;
+}
+
 /// Collection of builds, named by build identifier.
 #[derive(Debug, Clone, Copy)]
 pub enum Builds {}
@@ -353,6 +362,14 @@ mod tests {
     fn event_name_round_trips_sequence() {
         assert_eq!(of::<Events>(&995_u64), "events/995");
         assert_eq!(parse::<Events>("events/995"), Ok(995));
+    }
+
+    #[test]
+    fn aws_event_name_encodes_provider_id() {
+        let id = "source/id:1".to_owned();
+        let name = of::<AwsEvents>(&id);
+        assert_eq!(name, "awsEvents/source%2Fid%3A1");
+        assert_eq!(parse::<AwsEvents>(&name), Ok(id));
     }
 
     #[test]

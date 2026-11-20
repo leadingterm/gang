@@ -16,12 +16,12 @@ clap = { workspace = true }
 gang-authn = { workspace = true }
 gang-bwrap = { workspace = true }
 gang-cgroup = { workspace = true }
+gang-client = { workspace = true }
 gang-clock = { workspace = true }
 gang-config = { workspace = true }
 gang-local = { workspace = true }
 gang-main = { workspace = true }
 gang-mtls = { workspace = true }
-gang-nativelink = { workspace = true }
 gang-oidc = { workspace = true }
 gang-os = { workspace = true }
 gang-state = { workspace = true }
@@ -56,6 +56,20 @@ tungstenite = { workspace = true }
 x509-cert = { workspace = true }
 
 [dev-dependencies]
+aws-credential-types = { workspace = true }
+aws-sdk-dynamodb = { workspace = true }
+futures = { workspace = true }
+gang-aws-sdk = { workspace = true }
+gang-dynamodb = { workspace = true, features = ["test-support"] }
+gang-nativelink = { workspace = true, features = ["test-support"] }
+gang-postgres = { workspace = true }
+gang-server = { workspace = true }
+gang-sqlite = { workspace = true }
+nativelink-scheduler = { workspace = true }
+nativelink-util = { workspace = true }
+nativelink-worker = { workspace = true }
+tonic = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 http-body-util = { workspace = true }
 gang-spi = { workspace = true }
 

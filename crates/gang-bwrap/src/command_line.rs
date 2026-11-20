@@ -33,7 +33,12 @@ impl Bwrap {
     /// With limits, the launcher starts `bwrap` itself, so the whole sandbox, `bwrap` included,
     /// starts inside the limits scope.
     #[must_use]
-    pub(crate) fn command(&self, spec: &ActionExecutionSpec<'_>, info_fd: RawFd) -> Command {
+    pub(crate) fn command(
+        &self,
+        spec: &ActionExecutionSpec<'_>,
+        info_fd: RawFd,
+        identity: &[Option<RawFd>; 3],
+    ) -> Command {
         let action_directory = spec.action_directory.as_os_str();
         let mut command = match spec.launcher.split_first() {
             Some((launcher, launcher_arguments)) => {
@@ -45,6 +50,17 @@ impl Bwrap {
         };
         command.env_clear();
         command.args(self.prefix.iter());
+        for (destination, fd) in ["/etc/passwd", "/etc/group", "/etc/nsswitch.conf"]
+            .into_iter()
+            .zip(identity)
+        {
+            if let Some(fd) = fd {
+                command
+                    .arg("--ro-bind-data")
+                    .arg(fd.to_string())
+                    .arg(destination);
+            }
+        }
         command.arg("--info-fd").arg(info_fd.to_string());
         command.args([
             OsStr::new("--bind"),
@@ -79,6 +95,8 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
+    #[cfg(target_os = "linux")]
+    use gang_spi::ActionIsolationPort;
     use gang_spi::{ActionCommand, ActionExecutionSpec, NetworkRequest, Plugin, PluginContext};
     use gang_types::AbsolutePathBuf;
 
@@ -132,7 +150,15 @@ mod tests {
             working_directory,
             network,
         };
-        Ok(bwrap.command(&spec, INFO_FD))
+        let identity = [8, 9, 10].map(Some);
+        let identity = std::array::from_fn(|index| {
+            if bwrap.identity_overrides[index] {
+                None
+            } else {
+                identity[index]
+            }
+        });
+        Ok(bwrap.command(&spec, INFO_FD, &identity))
     }
 
     fn args(command: &Command) -> Vec<String> {
@@ -187,6 +213,15 @@ mod tests {
                 "--ro-bind",
                 "/usr",
                 "/usr",
+                "--ro-bind-data",
+                "8",
+                "/etc/passwd",
+                "--ro-bind-data",
+                "9",
+                "/etc/group",
+                "--ro-bind-data",
+                "10",
+                "/etc/nsswitch.conf",
                 "--info-fd",
                 "7",
                 "--bind",
@@ -251,9 +286,50 @@ mod tests {
                 "--ro-bind",
                 "/opt/tools/bin",
                 "/usr/bin",
-                "--info-fd",
+                "--ro-bind-data",
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_identity_mounts_replace_only_their_generated_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for destination in ["/etc/passwd", "/etc/group", "/etc/nsswitch.conf"] {
+            let bwrap = Bwrap::build(
+                BwrapConfig {
+                    readonly_bind_paths: vec![abs("/etc")],
+                    readonly_bind_mounts: BTreeMap::from([(
+                        abs(destination),
+                        abs("/custom/identity"),
+                    )]),
+                    permit_network_property: false,
+                    program: PathBuf::from("/usr/bin/bwrap"),
+                    tmp_path: abs("/tmp"),
+                },
+                &PluginContext {
+                    config_path: Path::new("sandbox.toml"),
+                },
+            )?;
+            let arguments = args(&command(
+                &bwrap,
+                Path::new("/work"),
+                Path::new("/work"),
+                NetworkRequest::NotRequested,
+            )?);
+            let generated: Vec<_> = arguments
+                .windows(3)
+                .filter(|window| window[0] == "--ro-bind-data")
+                .map(|window| window[2].as_str())
+                .collect();
+            assert_eq!(generated.len(), 2);
+            assert!(!generated.contains(&destination));
+            assert!(
+                arguments
+                    .windows(3)
+                    .any(|window| window == ["--ro-bind", "/custom/identity", destination])
+            );
+        }
         Ok(())
     }
 
@@ -355,7 +431,7 @@ mod tests {
             network: NetworkRequest::NotRequested,
         };
 
-        let command = bwrap.command(&spec, INFO_FD);
+        let command = bwrap.command(&spec, INFO_FD, &[Some(8), Some(9), Some(10)]);
 
         assert_eq!(command.get_program(), launcher[0].as_os_str());
         let arguments: Vec<&OsStr> = command.get_args().collect();
@@ -406,11 +482,8 @@ mod tests {
             network: NetworkRequest::NotRequested,
         };
         // The bwrap stand-in is a Bazel-built binary: no host program runs.
-        let status = bwrap
-            .command(&spec, INFO_FD)
-            .status()
-            .expect("the bwrap stand-in runs");
-        assert!(status.success(), "the bwrap stand-in exits successfully");
+        let outcome = bwrap.start(&spec).await?.wait().await?;
+        assert_eq!(outcome, gang_spi::ActionExecutionOutcome::Exited(0));
 
         let recorded =
             std::fs::read_to_string(&output).expect("the stand-in wrote its environment");

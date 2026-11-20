@@ -1,12 +1,12 @@
-//! Expiring records: short-lived state that any controller may create and any other may read or
-//! finish, such as a pending browser login or a device code. The database stores opaque bodies;
-//! their encoding belongs to the caller. The port has no clock: callers pass every time it
+//! Expiring records: opaque caller-encoded state such as pending authentication and learned
+//! scheduler histories. Authentication records may be created and finished by any controller;
+//! history batches require leader authority. The port has no clock: callers pass every time it
 //! compares.
 
 use gang_clock::Timestamp;
 
 use crate::counter::counter;
-use crate::{PortError, port};
+use crate::{Lease, PortError, port};
 
 /// A store of versioned blobs that expire.
 #[port]
@@ -33,6 +33,22 @@ pub trait ExpiringRecordPort: Send + Sync {
     ///
     /// [`PortError`] when the record cannot be read.
     async fn get(&self, key: &RecordKey, now: Timestamp) -> Result<Option<Record>, PortError>;
+
+    /// Lists live records of `kind` in ascending ID order, strictly after `after`.
+    /// Overwrites and reuses `into`, returning at most `limit` records. Returns `true` exactly
+    /// when another matching live record follows the returned page.
+    ///
+    /// # Errors
+    ///
+    /// [`PortError`] when the records cannot be read.
+    async fn records(
+        &self,
+        kind: RecordKind,
+        after: Option<RecordId>,
+        limit: std::num::NonZeroUsize,
+        now: Timestamp,
+        into: &mut Vec<(RecordId, Record)>,
+    ) -> Result<bool, PortError>;
 
     /// Overwrites the record at `key` with `body` until `expires_at` while it is stored at
     /// `version` and live at `now`; the stored version advances by one.
@@ -62,6 +78,27 @@ pub trait ExpiringRecordPort: Send + Sync {
         now: Timestamp,
     ) -> Result<Remove, PortError>;
 
+    /// Atomically applies a validated batch while the stored lease is held and live at `now`.
+    /// `sequence` is strictly increasing within the lease epoch, starting above zero; shared
+    /// stores reject stale or repeated sequences as [`ApplyRecords::Fenced`]. `version` is a
+    /// fresh record incarnation for this request, stored on every put for subsequent CAS.
+    /// Renewal preserves the sequence and a newly acquired epoch resets it. Even an empty batch
+    /// checks authority and advances the sequence. Invalid batches fail before any write or
+    /// sequence advancement. An exclusive store may instead serialize requests under its
+    /// process-wide authority.
+    ///
+    /// # Errors
+    /// Returns a backend error containing [`RecordBatchError`] for an invalid batch, or a
+    /// port error if the batch cannot be applied.
+    async fn apply(
+        &self,
+        lease: &Lease,
+        sequence: RecordBatchSeq,
+        version: RecordVersion,
+        now: Timestamp,
+        changes: &[RecordChange<'_>],
+    ) -> Result<ApplyRecords, PortError>;
+
     /// Deletes every record expired at `now`. A backend whose storage deletes expired records by
     /// itself may leave them to it: no read returns them either way.
     ///
@@ -82,15 +119,27 @@ pub enum RecordKind {
     UserCode,
     /// A token renewal in flight, which a repeated renewal joins.
     RenewalFlight,
+    /// Learned resource measurements.
+    ResourceHistory,
+    /// Learned action duration measurements.
+    DurationHistory,
+    /// A chunk of a learned history payload.
+    HistoryChunk,
+    /// A provider infrastructure observation retained for the dashboard history window.
+    InfrastructureEvent,
 }
 
 impl RecordKind {
     /// Every kind, in declaration order.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 8] = [
         Self::LoginAttempt,
         Self::DeviceCode,
         Self::UserCode,
         Self::RenewalFlight,
+        Self::ResourceHistory,
+        Self::DurationHistory,
+        Self::HistoryChunk,
+        Self::InfrastructureEvent,
     ];
 
     /// The kind's stable name in storage.
@@ -101,12 +150,16 @@ impl RecordKind {
             Self::DeviceCode => "device-code",
             Self::UserCode => "user-code",
             Self::RenewalFlight => "renewal-flight",
+            Self::ResourceHistory => "resource-history",
+            Self::DurationHistory => "duration-history",
+            Self::HistoryChunk => "history-chunk",
+            Self::InfrastructureEvent => "infrastructure-event",
         }
     }
 }
 
-/// A record's id within its kind: a SHA-256 digest of the secret or token it stands for, so the
-/// database never holds the secret itself.
+/// A record's SHA-256 domain identifier within its kind. Authentication kinds hash secrets or
+/// tokens rather than storing those secrets as identifiers; learned kinds hash canonical keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RecordId([u8; 32]);
 
@@ -138,6 +191,11 @@ counter!(
     RecordVersion
 );
 
+counter!(
+    /// A fenced batch sequence, increasing within a single lease epoch.
+    RecordBatchSeq
+);
+
 impl RecordVersion {
     /// Draws a starting version from the operating system's random source.
     ///
@@ -161,6 +219,100 @@ pub struct Record {
     pub version: RecordVersion,
     /// When the record stops being returned.
     pub expires_at: Timestamp,
+}
+
+/// Maximum number of record mutations in one fenced batch.
+pub const MAX_RECORD_CHANGES: usize = 99;
+/// Maximum raw body size of one record in a fenced batch.
+pub const MAX_RECORD_BODY_BYTES: usize = 256 * 1024;
+/// Maximum sum of raw body bytes in one fenced batch.
+pub const MAX_RECORD_BODY_BYTES_PER_BATCH: usize = 1_572_864;
+
+/// One upsert or idempotent deletion in a fenced batch.
+#[derive(Debug, Clone, Copy)]
+pub enum RecordChange<'a> {
+    /// Store an opaque body with its own expiration.
+    Put {
+        /// The destination record.
+        key: RecordKey,
+        /// Its opaque encoded payload.
+        body: &'a [u8],
+        /// Its original expiry.
+        expires_at: Timestamp,
+    },
+    /// Remove the record, whether live or expired.
+    Delete {
+        /// The destination record.
+        key: RecordKey,
+    },
+}
+
+impl RecordChange<'_> {
+    /// The record affected by this change.
+    #[must_use]
+    pub const fn key(self) -> RecordKey {
+        match self {
+            Self::Put { key, .. } | Self::Delete { key } => key,
+        }
+    }
+}
+
+/// Why a fenced batch cannot be submitted.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RecordBatchError {
+    /// The number of changes exceeds the portable transaction limit.
+    #[error("too many record changes")]
+    TooManyChanges,
+    /// A record body exceeds the portable item limit.
+    #[error("record body too large")]
+    BodyTooLarge,
+    /// The sum of body bytes exceeds the portable transaction limit.
+    #[error("record batch body budget exceeded")]
+    BodyBudgetExceeded,
+    /// A batch cannot modify the same key twice.
+    #[error("duplicate record key")]
+    DuplicateKey,
+}
+
+/// Validates portable transaction limits and key uniqueness before any write.
+///
+/// # Errors
+/// Returns the first violated batch constraint.
+pub fn validate_record_changes(changes: &[RecordChange<'_>]) -> Result<(), RecordBatchError> {
+    if changes.len() > MAX_RECORD_CHANGES {
+        return Err(RecordBatchError::TooManyChanges);
+    }
+    let mut bytes = 0_usize;
+    for (index, change) in changes.iter().enumerate() {
+        if let RecordChange::Put { body, .. } = change {
+            if body.len() > MAX_RECORD_BODY_BYTES {
+                return Err(RecordBatchError::BodyTooLarge);
+            }
+            bytes = bytes
+                .checked_add(body.len())
+                .ok_or(RecordBatchError::BodyBudgetExceeded)?;
+            if bytes > MAX_RECORD_BODY_BYTES_PER_BATCH {
+                return Err(RecordBatchError::BodyBudgetExceeded);
+            }
+        }
+        if changes[..index]
+            .iter()
+            .any(|previous| previous.key() == change.key())
+        {
+            return Err(RecordBatchError::DuplicateKey);
+        }
+    }
+    Ok(())
+}
+
+/// Outcome of a fenced record batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyRecords {
+    /// All changes were applied atomically.
+    Applied,
+    /// Authority was not live or the batch sequence was stale; nothing was written. This does
+    /// not establish that another leader holds the lease.
+    Fenced,
 }
 
 /// The outcome of [`ExpiringRecordPort::insert`].
@@ -188,4 +340,51 @@ pub enum Remove {
     Removed,
     /// The record is gone, expired, or at another version; nothing was removed.
     Stale,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_validation_rejects_all_portable_limits() {
+        let key = RecordKey {
+            kind: RecordKind::ResourceHistory,
+            id: RecordId::new([0; 32]),
+        };
+        let delete = RecordChange::Delete { key };
+        assert_eq!(
+            validate_record_changes(&vec![delete; MAX_RECORD_CHANGES + 1]),
+            Err(RecordBatchError::TooManyChanges)
+        );
+        assert_eq!(
+            validate_record_changes(&[delete, delete]),
+            Err(RecordBatchError::DuplicateKey)
+        );
+        let body = vec![0; MAX_RECORD_BODY_BYTES + 1];
+        let put = RecordChange::Put {
+            key,
+            body: &body,
+            expires_at: Timestamp::UNIX_EPOCH,
+        };
+        assert_eq!(
+            validate_record_changes(&[put]),
+            Err(RecordBatchError::BodyTooLarge)
+        );
+        let changes: Vec<_> = (0..7)
+            .map(|id| RecordChange::Put {
+                key: RecordKey {
+                    kind: RecordKind::ResourceHistory,
+                    id: RecordId::new([id; 32]),
+                },
+                body: &body[..MAX_RECORD_BODY_BYTES],
+                expires_at: Timestamp::UNIX_EPOCH,
+            })
+            .collect();
+        assert_eq!(validate_record_changes(&changes[..6]), Ok(()));
+        assert_eq!(
+            validate_record_changes(&changes),
+            Err(RecordBatchError::BodyBudgetExceeded)
+        );
+    }
 }

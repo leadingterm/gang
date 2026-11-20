@@ -340,6 +340,28 @@ async fn shutdown_closes_the_stream_with_a_retry_hint() {
 }
 
 #[tokio::test]
+async fn shutdown_only_closes_streams_subscribed_to_that_notification() {
+    let hub = hub(FOUR, EIGHT);
+    let clock = start_clock();
+    let revoked = RevokedPrincipals::new();
+    let who = identity("ada@example.com");
+    let mut first = open(&hub, &clock, QUIET, None, &revoked, &who);
+    frame_text(&mut first).await.expect("first snapshot");
+    hub.shutdown();
+    let mut second = open(&hub, &clock, QUIET, None, &revoked, &who);
+    frame_text(&mut second).await.expect("second snapshot");
+    assert!(frame_text(&mut second).now_or_never().is_none());
+    let closed = frame_text(&mut first).await.expect("first shutdown");
+    assert_eq!(payload(&closed)["reason"], "SHUTDOWN");
+    assert!(frame_text(&mut first).await.is_none());
+    hub.shutdown();
+    let closed = frame_text(&mut second).await.expect("second shutdown");
+    assert_eq!(payload(&closed)["reason"], "SHUTDOWN");
+    assert_eq!(payload(&closed)["retryDelay"], "5s");
+    assert!(frame_text(&mut second).await.is_none());
+}
+
+#[tokio::test]
 async fn a_lagging_viewer_is_resynced_not_closed() {
     let hub = hub(FOUR, TWO);
     let clock = start_clock();

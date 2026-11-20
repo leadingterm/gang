@@ -15,8 +15,6 @@ use crate::errors::ServerError;
 pub enum EndpointRole {
     /// The endpoint reached by clients.
     Public,
-    /// The dedicated endpoint reached by execution clients.
-    Execution,
     /// The endpoint reached by workers.
     Worker,
 }
@@ -25,7 +23,6 @@ impl fmt::Display for EndpointRole {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Public => "public",
-            Self::Execution => "execution",
             Self::Worker => "worker",
         })
     }
@@ -90,47 +87,6 @@ impl PublicEndpoint {
     /// Returns [`ServerError::EndpointHost`] when the URL has no host.
     pub(crate) fn server_name(&self) -> Result<SubjectName, ServerError> {
         server_name(EndpointRole::Public, &self.url)
-    }
-}
-/// The dedicated endpoint used for execution and leader routes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExecutionEndpoint {
-    url: Url,
-    remote: Url,
-}
-
-impl ExecutionEndpoint {
-    /// Validates the scheme against the listener transport.
-    pub(crate) fn try_new(url: Url, tls: bool) -> Result<Self, ServerError> {
-        let expected: &'static [&'static str] = if tls { &["https"] } else { &["http", "https"] };
-        let remote = if expected.contains(&url.scheme()) {
-            remote_url(&url)
-        } else {
-            None
-        };
-        let Some(remote) = remote else {
-            return Err(ServerError::EndpointScheme {
-                role: EndpointRole::Execution,
-                url,
-                expected,
-            });
-        };
-        Ok(Self { url, remote })
-    }
-
-    /// The endpoint URL.
-    pub(crate) fn url(&self) -> &Url {
-        &self.url
-    }
-
-    /// The gRPC URL advertised to execution clients.
-    pub(crate) fn remote(&self) -> &Url {
-        &self.remote
-    }
-
-    /// The name presented by the execution listener.
-    pub(crate) fn server_name(&self) -> Result<SubjectName, ServerError> {
-        server_name(EndpointRole::Execution, &self.url)
     }
 }
 
@@ -219,24 +175,11 @@ mod tests {
     use gang_mtls::SubjectName;
     use gang_types::Url;
 
-    use super::{EndpointRole, ExecutionEndpoint, PublicEndpoint, WorkerEndpoint};
+    use super::{EndpointRole, PublicEndpoint, WorkerEndpoint};
     use crate::errors::ServerError;
 
     fn url(text: &str) -> Url {
         Url::parse(text).expect("test url parses")
-    }
-
-    #[test]
-    fn execution_endpoint_validates_transport_and_names_its_host() {
-        let secure = ExecutionEndpoint::try_new(url("https://execution.example.test"), true)
-            .expect("https is accepted under tls");
-        assert_eq!(
-            secure.server_name().ok(),
-            Some(SubjectName::Dns("execution.example.test".to_owned()))
-        );
-        assert!(ExecutionEndpoint::try_new(url("http://execution.example.test"), true).is_err());
-        assert!(ExecutionEndpoint::try_new(url("http://execution.example.test"), false).is_ok());
-        assert!(ExecutionEndpoint::try_new(url("ftp://execution.example.test"), false).is_err());
     }
 
     fn public(text: &str) -> PublicEndpoint {

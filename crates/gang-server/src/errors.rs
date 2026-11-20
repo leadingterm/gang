@@ -2,12 +2,28 @@
 
 use std::fmt;
 
-use gang_mtls::{MtlsError, ProofError};
-use gang_spi::{BoxedError, PortError};
+use gang_mtls::MtlsError;
+use gang_spi::PortError;
 use gang_tls::TransportError;
 use gang_types::Url;
 
 use crate::endpoint::EndpointRole;
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ProxyProtocolError {
+    #[error("proxy header io failed")]
+    Io(#[from] std::io::Error),
+    #[error("invalid proxy header")]
+    Invalid,
+    #[error("proxy header has no supported source")]
+    Source,
+    #[error("proxy header exceeds the configured limit")]
+    TooLarge,
+    #[error("proxy header timed out")]
+    Timeout,
+    #[error("untrusted proxy peer")]
+    Untrusted,
+}
 
 /// Formats the schemes accepted by an endpoint without allocating.
 struct ExpectedSchemes<'a>(&'a [&'static str]);
@@ -34,31 +50,21 @@ pub enum ServerError {
     #[error("another controller took the leader lease; this controller handed off")]
     LeadershipLost,
 
-    /// A leader-only listener could not be bound.
-    #[error("cannot bind the {endpoint} listener")]
-    Bind {
-        /// The listener's role.
-        endpoint: &'static str,
-        /// The binding failure.
-        #[source]
-        source: BoxedError,
-    },
+    /// The controller's immutable host identity could not be obtained.
+    #[error("cannot identify the controller host")]
+    HostIdentity(#[source] PortError),
 
-    /// Listener configuration and the execution endpoint disagree.
-    #[error("the execution endpoint must be set exactly when the execution listener is dedicated")]
-    ExecutionEndpoint,
+    /// The controller's candidate could not be registered.
+    #[error("cannot register the controller candidate")]
+    CandidateRegistration(#[source] PortError),
 
-    /// The client for forwarding leader routes could not be built.
-    #[error("cannot build the leader route client")]
-    LeaderClient(#[source] gang_tls::HttpError),
+    /// The host could not be marked serving before its deadline.
+    #[error("cannot report the serving milestone")]
+    ServingMilestone(#[source] PortError),
 
-    /// The request size limit cannot hold a forwarded observation.
-    #[error("build observations cannot be forwarded within the request size limit")]
-    Forwarding(#[source] gang_insight::OutboxError),
-
-    /// The controller proof verification key could not be prepared.
-    #[error("cannot prepare the controller proof key")]
-    ControllerProofKey(#[source] ProofError),
+    /// A voluntary handoff could not complete within its deadline.
+    #[error("the controller handoff timed out")]
+    HandoffTimedOut(#[source] gang_clock::Elapsed),
 
     /// The certificate authority could not be established from the signer.
     #[error("cannot establish the certificate authority")]

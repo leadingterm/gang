@@ -199,18 +199,6 @@ pub(crate) struct Observed {
     pub(crate) detail: Option<Answer>,
 }
 
-/// Observes build accounting on state-stream events until usage stabilizes or the deadline expires.
-pub(crate) fn observe(
-    stack: &crate::stack::Stack<'_>,
-    read: &dyn Fn(&Request) -> Result<Answer>,
-    token: &str,
-    id: &str,
-    cold: bool,
-    timeout: Duration,
-) -> Result<Observed> {
-    observe_with_transfer(stack, read, token, id, cold, timeout, None)
-}
-
 fn observe_transfers(
     stack: &crate::stack::Stack<'_>,
     read: &dyn Fn(&Request) -> Result<Answer>,

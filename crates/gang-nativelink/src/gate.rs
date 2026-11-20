@@ -8,12 +8,22 @@ use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use gang_spi::{Admitted, Peer, PortError, Rejection, RequestGate};
+use gang_spi::{
+    Admitted, GateDecision, LeaderUnavailable, Peer, PortError, Rejection, RequestGate,
+    RequestScope,
+};
 use http::{StatusCode, header};
 use http_body_util::Empty;
 use tonic::{Code, Status};
 
 use crate::standing::{Standing, hold};
+
+#[derive(Clone)]
+pub(crate) struct GateState<G> {
+    pub(crate) gate: G,
+    pub(crate) scope: RequestScope,
+    pub(crate) force_not_leading: bool,
+}
 
 /// Runs `gate` on a request and passes the request on when the gate admits it. The request's
 /// [`Peer`] comes from the request extensions; a request without one has the default peer. When the
@@ -23,7 +33,7 @@ use crate::standing::{Standing, hold};
 /// services behind the gate the caller's [`Authenticated`](gang_spi::Authenticated) identity in
 /// the request extensions.
 pub(crate) async fn admit<G: RequestGate>(
-    State(gate): State<G>,
+    State(state): State<GateState<G>>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -33,24 +43,52 @@ pub(crate) async fn admit<G: RequestGate>(
         .cloned()
         .unwrap_or_default();
     let grpc = is_grpc(&request);
-    let standing = request
-        .extensions()
-        .get::<Arc<Standing>>()
-        .filter(|standing| !standing.is_proven())
-        .cloned();
-    let busy = standing.as_ref().map(Standing::begin);
+    let standing = request.extensions().get::<Arc<Standing>>().cloned();
+    let unproven = standing.as_ref().filter(|standing| !standing.is_proven());
+    let busy = unproven.map(Standing::begin);
     let (mut parts, body) = request.into_parts();
-    let response = match gate.admit(&peer, &mut parts).await {
-        Ok(admitted) => {
-            if let Admitted::Authenticated(authenticated) = admitted {
-                if let Some(standing) = &standing {
-                    standing.prove();
+    let decision = if state.force_not_leading {
+        Ok(GateDecision::NotLeading)
+    } else {
+        state.gate.admit(state.scope, &peer, &mut parts).await
+    };
+    let response = match decision {
+        Ok(GateDecision::Admit(admitted)) => {
+            if unproven.is_some_and(|standing| !standing.admit()) {
+                denial(&PortError::unavailable("connection is retiring"), grpc)
+            } else {
+                if let Admitted::Authenticated(authenticated) = admitted {
+                    if let Some(standing) = unproven {
+                        standing.prove();
+                    }
+                    parts.extensions.insert(authenticated);
                 }
-                parts.extensions.insert(authenticated);
+                let mut response = next.run(Request::from_parts(parts, body)).await;
+                if response
+                    .extensions_mut()
+                    .remove::<LeaderUnavailable>()
+                    .is_some()
+                    && let Some(standing) = &standing
+                {
+                    standing.retire_leadership();
+                }
+                response
             }
-            next.run(Request::from_parts(parts, body)).await
         }
-        Err(error) => denial(&error, grpc),
+        Ok(GateDecision::NotLeading) => {
+            if let Some(standing) = &standing {
+                standing.retire_leadership();
+            }
+            denial(&PortError::unavailable("controller is not leading"), grpc)
+        }
+        Err(error) => {
+            if matches!(&error, PortError::Unavailable(_))
+                && let Some(standing) = unproven
+            {
+                standing.request_retry();
+            }
+            denial(&error, grpc)
+        }
     };
     match busy {
         Some(busy) => hold(response, busy),
@@ -98,13 +136,21 @@ pub(crate) fn denial(error: &PortError, grpc: bool) -> Response {
             "internal error",
         ),
     };
-    if grpc {
+    let mut response = if grpc {
         let (parts, _) = Status::new(code, message)
             .into_http::<Empty<Bytes>>()
             .into_parts();
-        return Response::from_parts(parts, Body::empty());
+        Response::from_parts(parts, Body::empty())
+    } else {
+        (status, message).into_response()
+    };
+    if matches!(error, PortError::Unavailable(_)) {
+        response.headers_mut().insert(
+            gang_types::handover::REQUEST_NOT_STARTED_HEADER,
+            header::HeaderValue::from_static("true"),
+        );
     }
-    (status, message).into_response()
+    response
 }
 
 #[cfg(test)]
@@ -138,9 +184,10 @@ mod tests {
     impl RequestGate for Deny {
         fn admit(
             &self,
+            _scope: RequestScope,
             _peer: &Peer,
             _parts: &mut http::request::Parts,
-        ) -> impl Future<Output = Result<Admitted, PortError>> + Send {
+        ) -> impl Future<Output = Result<GateDecision, PortError>> + Send {
             std::future::ready(Err((self.0)()))
         }
     }
@@ -152,10 +199,11 @@ mod tests {
     impl RequestGate for Allow {
         fn admit(
             &self,
+            _scope: RequestScope,
             _peer: &Peer,
             _parts: &mut http::request::Parts,
-        ) -> impl Future<Output = Result<Admitted, PortError>> + Send {
-            std::future::ready(Ok(Admitted::Authenticated(caller())))
+        ) -> impl Future<Output = Result<GateDecision, PortError>> + Send {
+            std::future::ready(Ok(GateDecision::Admit(Admitted::Authenticated(caller()))))
         }
     }
 
@@ -179,11 +227,19 @@ mod tests {
         PortError::backend("the ledger is corrupt")
     }
 
+    fn state<G>(gate: G) -> GateState<G> {
+        GateState {
+            gate,
+            scope: RequestScope::Shared,
+            force_not_leading: false,
+        }
+    }
+
     /// A router with one POST route behind `gate`.
     fn gated<G: RequestGate>(gate: G) -> Router {
         Router::new()
             .route("/grpc.Service/Method", post(|| async { "ok" }))
-            .layer(from_fn_with_state(gate, admit::<G>))
+            .layer(from_fn_with_state(state(gate), admit::<G>))
     }
 
     /// Sends a POST to the route, with `content_type` when given, and returns the response.
@@ -213,6 +269,12 @@ mod tests {
             let response = send(Deny(make), Some("application/grpc+proto")).await;
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(response.headers()["grpc-status"], status);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(gang_types::handover::REQUEST_NOT_STARTED_HEADER),
+                (status == "14").then_some(&header::HeaderValue::from_static("true"))
+            );
         }
     }
 
@@ -229,9 +291,82 @@ mod tests {
             let response = send(Deny(make), Some("application/json")).await;
             assert_eq!(response.status(), status);
             assert!(response.headers().get("grpc-status").is_none());
+            assert_eq!(
+                response
+                    .headers()
+                    .get(gang_types::handover::REQUEST_NOT_STARTED_HEADER),
+                (status == StatusCode::SERVICE_UNAVAILABLE)
+                    .then_some(&header::HeaderValue::from_static("true"))
+            );
         }
         let response = send(Deny(invalid_proof), None).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn unavailable_refusals_never_invoke_the_handler() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = Arc::clone(&calls);
+        let router = Router::new()
+            .route(
+                "/grpc.Service/Method",
+                post(move || {
+                    let calls = Arc::clone(&handler_calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::OK
+                    }
+                }),
+            )
+            .layer(from_fn_with_state(state(Deny(unavailable)), admit::<Deny>));
+        for content_type in ["application/json", "application/grpc"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::post("/grpc.Service/Method")
+                        .header(header::CONTENT_TYPE, content_type)
+                        .body(Body::empty())
+                        .expect("valid request"),
+                )
+                .await
+                .expect("infallible router");
+            assert_eq!(
+                response.headers()[gang_types::handover::REQUEST_NOT_STARTED_HEADER],
+                "true"
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn handler_unavailable_has_no_refusal_marker() {
+        let standing = Arc::new(Standing::default());
+        let router = Router::new()
+            .route(
+                "/grpc.Service/Method",
+                post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+            )
+            .layer(from_fn_with_state(state(Allow), admit::<Allow>))
+            .layer(Extension(Arc::clone(&standing)));
+        let response = router
+            .oneshot(
+                Request::post("/grpc.Service/Method")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("infallible router");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            !response
+                .headers()
+                .contains_key(gang_types::handover::REQUEST_NOT_STARTED_HEADER)
+        );
+        let retry = standing.retry_requested();
+        tokio::pin!(retry);
+        assert!(futures::poll!(&mut retry).is_pending());
     }
 
     #[tokio::test]
@@ -250,10 +385,11 @@ mod tests {
     impl RequestGate for Admit {
         fn admit(
             &self,
+            _scope: RequestScope,
             _peer: &Peer,
             _parts: &mut http::request::Parts,
-        ) -> impl Future<Output = Result<Admitted, PortError>> + Send {
-            std::future::ready(Ok(self.0.clone()))
+        ) -> impl Future<Output = Result<GateDecision, PortError>> + Send {
+            std::future::ready(Ok(GateDecision::Admit(self.0.clone())))
         }
     }
 
@@ -270,7 +406,7 @@ mod tests {
                 }),
             )
             .layer(from_fn_with_state(
-                Admit(Admitted::Authenticated(caller)),
+                state(Admit(Admitted::Authenticated(caller))),
                 admit::<Admit>,
             ));
         let request = Request::post("/grpc.Service/Method")
@@ -291,7 +427,7 @@ mod tests {
                 }),
             )
             .layer(from_fn_with_state(
-                Admit(Admitted::Anonymous),
+                state(Admit(Admitted::Anonymous)),
                 admit::<Admit>,
             ));
         let request = Request::post("/grpc.Service/Method")
@@ -301,6 +437,134 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn retrying_connection_denies_later_admissions_without_proving() {
+        for admitted in [Admitted::Anonymous, Admitted::Authenticated(caller())] {
+            let standing = Arc::new(Standing::default());
+            standing.request_retry();
+            let request = Request::post("/grpc.Service/Method")
+                .body(Body::empty())
+                .expect("valid request");
+            let response = gated(Admit(admitted))
+                .layer(Extension(Arc::clone(&standing)))
+                .oneshot(request)
+                .await
+                .expect("infallible router");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!standing.is_proven());
+            assert!(standing.is_busy());
+            drop(response);
+            assert!(!standing.is_busy());
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_retires_only_a_connection_without_prior_admission() {
+        for previously_admitted in [false, true] {
+            let standing = Arc::new(Standing::default());
+            if previously_admitted {
+                let request = Request::post("/grpc.Service/Method")
+                    .body(Body::empty())
+                    .expect("valid request");
+                let response = gated(Admit(Admitted::Anonymous))
+                    .layer(Extension(Arc::clone(&standing)))
+                    .oneshot(request)
+                    .await
+                    .expect("infallible router");
+                assert_eq!(response.status(), StatusCode::OK);
+                assert!(!standing.is_proven());
+            }
+            let request = Request::post("/grpc.Service/Method")
+                .body(Body::empty())
+                .expect("valid request");
+            let response = gated(Deny(unavailable))
+                .layer(Extension(Arc::clone(&standing)))
+                .oneshot(request)
+                .await
+                .expect("infallible router");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let retry = standing.retry_requested();
+            tokio::pin!(retry);
+            assert_eq!(futures::poll!(&mut retry).is_ready(), !previously_admitted);
+        }
+    }
+
+    #[tokio::test]
+    async fn other_denials_do_not_request_retry() {
+        for make in [invalid_proof as fn() -> PortError, internal] {
+            let standing = Arc::new(Standing::default());
+            let request = Request::post("/grpc.Service/Method")
+                .body(Body::empty())
+                .expect("valid request");
+            let _response = gated(Deny(make))
+                .layer(Extension(Arc::clone(&standing)))
+                .oneshot(request)
+                .await
+                .expect("infallible router");
+            let retry = standing.retry_requested();
+            tokio::pin!(retry);
+            assert!(futures::poll!(&mut retry).is_pending());
+            assert!(standing.admit());
+        }
+    }
+
+    #[tokio::test]
+    async fn leadership_refusal_and_api_marker_retire_proven_and_anonymous_connections() {
+        for proven in [false, true] {
+            for api_marker in [false, true] {
+                let standing = Arc::new(Standing::default());
+                assert!(standing.admit());
+                if proven {
+                    standing.prove();
+                }
+                let router = if api_marker {
+                    Router::new().route(
+                        "/grpc.Service/Method",
+                        post(|| async {
+                            let mut response = StatusCode::SERVICE_UNAVAILABLE.into_response();
+                            response.extensions_mut().insert(LeaderUnavailable);
+                            response
+                        }),
+                    )
+                } else {
+                    Router::new().route(
+                        "/grpc.Service/Method",
+                        post(|| async { StatusCode::IM_A_TEAPOT }),
+                    )
+                };
+                let router = router
+                    .layer(from_fn_with_state(
+                        GateState {
+                            gate: Allow,
+                            scope: RequestScope::Leader,
+                            force_not_leading: !api_marker,
+                        },
+                        admit::<Allow>,
+                    ))
+                    .layer(Extension(Arc::clone(&standing)));
+                let request = Request::post("/grpc.Service/Method")
+                    .header(header::CONTENT_TYPE, "application/grpc")
+                    .body(Body::empty())
+                    .expect("valid request");
+                let response = router.oneshot(request).await.expect("infallible router");
+                if api_marker {
+                    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                    assert!(response.extensions().get::<LeaderUnavailable>().is_none());
+                } else {
+                    assert_eq!(response.headers()["grpc-status"], "14");
+                    assert_eq!(
+                        response.headers()[gang_types::handover::REQUEST_NOT_STARTED_HEADER],
+                        "true"
+                    );
+                }
+                let retry = standing.retry_requested();
+                tokio::pin!(retry);
+                assert!(futures::poll!(&mut retry).is_ready());
+                assert!(standing.admit());
+            }
+        }
+    }
+
     /// Admits only requests from a peer that presented a client certificate.
     #[derive(Clone)]
     struct RequireCertificate;
@@ -308,11 +572,12 @@ mod tests {
     impl RequestGate for RequireCertificate {
         fn admit(
             &self,
+            _scope: RequestScope,
             peer: &Peer,
             _parts: &mut http::request::Parts,
-        ) -> impl Future<Output = Result<Admitted, PortError>> + Send {
+        ) -> impl Future<Output = Result<GateDecision, PortError>> + Send {
             std::future::ready(match peer.certificate {
-                Some(_) => Ok(Admitted::Authenticated(caller())),
+                Some(_) => Ok(GateDecision::Admit(Admitted::Authenticated(caller()))),
                 None => Err(invalid_proof()),
             })
         }

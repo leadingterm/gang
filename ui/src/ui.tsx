@@ -185,6 +185,29 @@ export const EVENT_VIEW = {
     label: "Leave",
     what: (c) => <span class="line mono"><Ident text={workerLabel(c.worker)} />{" "}<span>left</span></span>,
   },
+  aws: {
+    glyph: <path class="g-out" d="M7 1 13 12H1z" />,
+    label: "AWS",
+    what: ({ event }) => {
+      const k = event.kind;
+      switch (k.type) {
+        case "rebalanceRecommendation":
+          return <span>AWS: spot rebalance recommendation for {idOf(k.instance)}</span>;
+        case "spotInterruption":
+          return <span>AWS: spot {k.action === "HIBERNATE" ? "hibernation" : "interruption"} notice for {idOf(k.instance)}{k.action === "STOP" ? " (stop; 2 min warning)" : k.action === "TERMINATE" ? " (2 min warning)" : ""}</span>;
+        case "instanceLaunched":
+          return <span>AWS: {idOf(k.instance)} launched</span>;
+        case "replacementLaunched":
+          return <span>{k.replacing ? `AWS: spot rebalance: replacing ${idOf(k.replacing)} with ${idOf(k.instance)}` : `AWS: replacement ${idOf(k.instance)} launched`}</span>;
+        case "instanceTerminated":
+          return <span>AWS: {idOf(k.instance)} terminated: {k.reason === "OTHER" ? (k.reasonDetail ?? "other") : k.reason.toLowerCase().replaceAll("_", " ")}</span>;
+        case "capacityUnavailable":
+          return <span>AWS: capacity unavailable: {k.reason}</span>;
+        default:
+          return <span>AWS: infrastructure event</span>;
+      }
+    },
+  },
 } satisfies { [K in EventKind]: { glyph: preact.JSX.Element; label: string; what: (change: ChangeOf<K>) => preact.JSX.Element } };
 
 /** The glyph of an event's oneof member; an event of an unknown member has none. */
@@ -268,10 +291,64 @@ export const SectionHead = ({ id, title, count, aside, mono = false }: {
   <div class="shead">
     <h2 id={id} class={mono ? "shead__title shead__title--mono" : "shead__title"} title={mono ? undefined : title}>{mono ? <Ident text={title} /> : title}</h2>
     {count !== undefined && <span class="shead__count">{count}</span>}
-    {aside !== undefined && <span class="shead__aside">{aside}</span>}
+    <span class="shead__aside">{aside}</span>
   </div>
 );
 
+
+/** A page-wide named grid shared by sections and column groups. */
+export const PageGrid = ({ children }: { children: ComponentChildren }) => <div class="page-grid">{children}</div>;
+
+/** Equal columns that inherit the page tracks. */
+export const Columns = ({ children }: { children: ComponentChildren }) => <div class="layout-columns">{children}</div>;
+
+/** A vertically spaced group of content. */
+export const Stack = ({ children, as = "div", gap = "xl" }: {
+  children: ComponentChildren;
+  as?: "div" | "aside";
+  gap?: "2xs" | "xs" | "sm" | "md" | "lg" | "xl" | "2xl";
+}) => {
+  const style = { "--stack-gap": `var(--space-${gap})` };
+  return as === "aside" ? <aside class="stack" style={style}>{children}</aside> : <div class="stack" style={style}>{children}</div>;
+};
+
+/** A group of aligned readouts. */
+export const Tiles = ({ children, columns = 5 }: { children: ComponentChildren; columns?: number }) => (
+  <div class="readouts" style={{ "--tile-columns": columns }}>{children}</div>
+);
+
+/** A readout reserves the same five slots as its siblings. */
+export const Tile = ({ label, value, meter, caption, chart, heading = 2, valueStyle = "metric" }: {
+  label: string;
+  value: ComponentChildren;
+  meter?: ComponentChildren;
+  caption?: ComponentChildren;
+  chart?: ComponentChildren;
+  heading?: 2 | 3;
+  valueStyle?: "metric" | "text";
+}) => (
+  <div class="readout">
+    {heading === 2 ? <h2 class="label">{label}</h2> : <h3 class="label">{label}</h3>}
+    <div class={valueStyle === "text" ? "readout__big readout__big--text" : "readout__big"}>{value}</div>
+    <div class="readout__meter" aria-hidden={meter == null ? "true" : undefined}>{meter}</div>
+    <div class="readout__sub">{caption}</div>
+    <div class="readout__chart" aria-hidden={chart == null ? "true" : undefined}>{chart}</div>
+  </div>
+);
+
+/** A chart with a shared title, legend and plot geometry. */
+export const ChartFrame = ({ children, title, legend, size = "spark", cls }: {
+  children: ComponentChildren;
+  title?: string;
+  legend?: ComponentChildren;
+  size?: "spark" | "timeline" | "bar" | "cache";
+  cls?: string;
+}) => (
+  <div class={["chart-frame", `chart-frame--${size}`, title !== undefined && "chart-frame--titled", cls].filter(Boolean).join(" ")}>
+    {title !== undefined && <><h3 class="label chart-frame__title">{title}</h3><div class="chart-frame__legend">{legend}</div></>}
+    <div class="chart-frame__plot">{children}</div>
+  </div>
+);
 
 /** A titled block: `aside` sits at the end of the head, after the optional `count`. */
 export const Section = ({
@@ -281,6 +358,8 @@ export const Section = ({
   cls,
   count,
   aside,
+  legend,
+  hidden,
   mono = false,
   children,
 }: {
@@ -290,12 +369,15 @@ export const Section = ({
   cls?: string;
   count?: ComponentChildren;
   aside?: ComponentChildren;
+  legend?: ComponentChildren;
+  hidden?: boolean;
   mono?: boolean;
   children?: ComponentChildren;
 }) => (
-  <section class={[FRAME[variant], cls].filter(Boolean).join(" ") || undefined} aria-labelledby={id}>
+  <section class={["section-frame", FRAME[variant], cls].filter(Boolean).join(" ")} aria-labelledby={id} hidden={hidden}>
     <SectionHead id={id} title={title} count={count} aside={aside} mono={mono} />
-    {children}
+    <div class="section__legend">{legend}</div>
+    <div class="section__body">{children}</div>
   </section>
 );
 

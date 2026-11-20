@@ -19,7 +19,6 @@
 
 mod authority;
 mod certificate;
-mod controller_proof;
 mod csr;
 mod errors;
 mod key_pair;
@@ -33,11 +32,8 @@ mod time;
 pub use authority::{
     CertificateAuthority, ClientCertificateRequest, IssuedCertificate, ServerCertificateRequest,
 };
-pub use controller_proof::{
-    ControllerKey, ControllerProof, MAX_PROOF_BYTES, PROOF_HEADER, mint, verify,
-};
 pub use csr::{VerifiedCsr, verify_csr};
-pub use errors::{CsrError, MtlsError, ProofError};
+pub use errors::{CsrError, MtlsError};
 pub use key_pair::KeyPair;
 pub use spiffe::spiffe_id;
 pub use subject_name::SubjectName;

@@ -8,6 +8,9 @@ version.workspace = true
 [lints]
 workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 aws-sdk-dynamodb.workspace = true
 gang-aws-sdk.workspace = true

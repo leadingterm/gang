@@ -122,7 +122,7 @@ async fn plain_group_supply_reports_the_larger_of_desired_and_live() -> TestResu
     assert_eq!(supply.desired, 3);
     assert_eq!(supply.instances.len(), 3);
     assert_eq!(harness.requests(SET_PROTECTION), 0);
-    assert_eq!(harness.requests(DESCRIBE_ACTIVITIES), 0);
+    assert_eq!(harness.activity_probes(), 0);
     Ok(())
 }
 

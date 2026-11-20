@@ -83,6 +83,7 @@ export const applyDelta = (state: State, delta: Delta): Applied => {
       workers: mergeKeyed(state.workers, delta.workers, byName, "sorted"),
       instances: mergeKeyed(state.instances, delta.instances, byName, "sorted"),
       events: delta.events?.length ? [...state.events, ...delta.events].slice(-state.eventsLimit) : state.events,
+      ...(delta.statusEvents !== undefined ? { statusEvents: delta.statusEvents } : {}),
       completed: delta.completed ?? state.completed,
       recent: applyRecent(state.recent, delta.recent),
       builds: mergeKeyed(state.builds, delta.builds, byName, "sorted"),

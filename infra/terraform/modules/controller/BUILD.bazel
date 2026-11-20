@@ -2,11 +2,17 @@ load("//bazel/opentofu:defs.bzl", "opentofu_contract_test")
 
 opentofu_contract_test(
     name = "controller_contract",
-    deps = ["//infra/terraform/modules/instance-role:sources"],
+    deps = [
+        "//infra/terraform/modules/instance-role:sources",
+        "//infra/terraform/modules/load-balancer:sources",
+    ],
 )
 
 opentofu_contract_test(
     name = "controller_group_contract",
     test_file = "tests/controller_group.tftest.hcl",
-    deps = ["//infra/terraform/modules/instance-role:sources"],
+    deps = [
+        "//infra/terraform/modules/instance-role:sources",
+        "//infra/terraform/modules/load-balancer:sources",
+    ],
 )

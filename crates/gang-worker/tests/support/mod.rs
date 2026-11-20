@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 
 use gang_clock::{Clock, TestClock, Tick, Timestamp};
 use gang_config::{
-    ExecutionConfig, FleetMember, FleetPolicy, Fleets, InstanceBounds, WorkerConfig,
+    ActionsConfig, ExecutionConfig, FleetMember, FleetPolicy, Fleets, InstanceBounds, WorkerConfig,
 };
 use gang_spi::{InstanceIdentity, PortError};
 use gang_types::{
@@ -514,8 +514,11 @@ impl Harness {
     /// The settings of a worker with the default `[worker]` section and the test fleets.
     #[must_use]
     pub fn settings(&self) -> WorkerSettings<TestPlugins> {
+        let mut actions = ActionsConfig::default();
+        actions.memory.reserve = NonZeroBytes::gib(2);
         WorkerSettings {
             fleets: fleets(),
+            actions: Arc::new(actions),
             worker: WorkerConfig::default(),
             sandbox: SandboxConfig {
                 noop: Some(Opaque::default()),

@@ -1,7 +1,5 @@
-//! The per-action limits scenario: an action runs in its own cgroup scope with the memory, CPU,
-//! and process limits its worker applies; a process it leaves behind, and its scope, are gone
-//! once it ends; an action that exceeds its hard memory ceiling is killed by the kernel alone,
-//! with `NativeLink`'s memory enforcement off, and the worker keeps serving.
+//! The per-action limits scenario: scope enforcement, cleanup, healthy memory spikes, and continued
+//! worker service.
 
 use std::thread::ScopedJoinHandle;
 
@@ -15,13 +13,9 @@ use crate::verdict;
 
 /// Runs the per-action limits scenario against `system` and returns its checks.
 ///
-/// The held action's scope is checked while the action is held, then the action is released,
-/// and its orphan process and scope must be gone afterwards. The hard-ceiling check then proves
-/// the cgroup `memory.max` backstop: [`Probe::MemoryHog`] allocates one 1 GiB buffer at once,
-/// past its ceiling. The deployment runs with `NativeLink`'s memory enforcement off
-/// (`[scheduler.nativelink.memory] enforcement = "none"`), so only the kernel's `memory.max` can
-/// end the hog: it dies with exit 137 and `(Killed)` every time, whatever the sampler would have
-/// done. The next action must still succeed.
+/// The held action's scope and orphan cleanup are checked first. The memory hog allocates 192 MiB
+/// against an initial 64 MiB reservation on a healthy worker. Its first attempt must succeed;
+/// reservations are scheduling estimates, not per-action memory ceilings.
 ///
 /// The suite runs this under [`Sandbox::Noop`](crate::system::Sandbox::Noop): under bwrap the PID
 /// namespace teardown kills the orphan anyway, so the scenario would not observe the cgroup kill
@@ -41,10 +35,25 @@ pub fn limits<S: Limits>(system: &S, stderr_tail_lines: usize) -> Result<Vec<Che
         return Ok(checks);
     }
 
-    // The kernel kills the hog at `memory.max`: NativeLink's memory enforcement is off, so
-    // nothing else can end it.
+    // A healthy worker must not kill an action for exceeding its reservation.
     let hog = system.build(&[Probe::MemoryHog])?;
-    checks.push(verdict::hard_ceiling(&hog, stderr_tail_lines));
+    let attempts = system.attempt_records()?;
+    checks.push(Check::expect(
+        names::limits::HARD_CEILING,
+        hog.succeeded()
+            && attempts.len() == 1
+            && attempts.first().is_some_and(|attempt| {
+                attempt.action == Probe::MemoryHog.as_str()
+                    && attempt.memory_kb == crate::system::HOLD_MEMORY_KB
+            }),
+        || {
+            format!(
+                "the probe recorded {attempts:?}, expected one 64 MiB start; exit {:?}\n{}",
+                hog.exit_code,
+                hog.stderr_tail(stderr_tail_lines)
+            )
+        },
+    ));
 
     let after = system.build(&[Probe::Pinned])?;
     checks.push(Check::expect(

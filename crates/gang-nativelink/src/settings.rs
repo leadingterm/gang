@@ -3,8 +3,10 @@
 
 use std::path::Path;
 
+use gang_config::{ActionsConfig, ColdStartTuning, DiskEnforcement, Http2Config, WholeSeconds};
 use gang_spi::{
-    CPU_COUNT_ENV, ControllerSpec, MEMORY_KB_ENV, NETWORK_ENV, StoreAccess, WorkerSpec, WorkerTls,
+    CPU_COUNT_ENV, ControllerSpec, MEMORY_KB_ENV, NETWORK_ENV, SIDE_CHANNEL_FILE_ENV, StoreAccess,
+    WorkerSpec, WorkerTls,
 };
 use gang_types::{FleetCatalog, MatchKind, Url, property};
 use nativelink_config::cas_server::{
@@ -16,10 +18,11 @@ use nativelink_scheduler::awaited_action_db::CLIENT_KEEPALIVE_DURATION;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
-use crate::config::{Http2Tuning, NativeLinkConfig, WholeSeconds};
-use crate::enforcement::{ColdStartTuning, DiskEnforcement, MemoryEnforcement};
+use crate::config::NativeLinkConfig;
 use crate::errors::NativeLinkConfigError;
 use crate::properties::{ACTION_STORE, CONTENT_STORE, WORKER_ACTION_STORE, WORKER_CONTENT_STORE};
+
+const SCHEDULER_NAME: &str = "MAIN_SCHEDULER";
 
 /// The stores the controller serves: the content and action stores of the [`ControllerSpec`].
 pub(crate) fn controller_stores(
@@ -37,55 +40,6 @@ pub(crate) fn scheduler(
     config: &NativeLinkConfig,
     spec: &ControllerSpec<'_>,
 ) -> Result<SchedulerConfig, NativeLinkConfigError> {
-    let min_kb = config.memory.min_reservation.as_units();
-    for fleet in spec.fleets.fleets() {
-        if let Some(memory_kb) = fleet.limit(property::MEMORY_KB)
-            && min_kb > memory_kb
-        {
-            return Err(NativeLinkConfigError::MinReservationAboveFleet {
-                fleet: fleet.name().to_owned(),
-                min_kb,
-                memory_kb,
-            });
-        }
-        let min_kb = config.disk.min_reservation.as_units();
-        if let Some(disk_kb) = fleet.limit(property::DISK_KB)
-            && min_kb > disk_kb
-        {
-            return Err(NativeLinkConfigError::DiskMinReservationAboveFleet {
-                fleet: fleet.name().to_owned(),
-                min_kb,
-                disk_kb,
-            });
-        }
-    }
-    if config.cold_start.enabled {
-        let cold = &config.cold_start;
-        let memory_kb = cold.memory.as_units();
-        let disk_kb = cold.disk.as_units();
-        let millicores_text =
-            (u64::from(cold.cpu_count.get()) * property::MILLICORES_PER_CORE).to_string();
-        let (cpu_text, memory_text, disk_text) = (
-            cold.cpu_count.to_string(),
-            memory_kb.to_string(),
-            disk_kb.to_string(),
-        );
-        let accepting = spec.fleets.accepting(|key| match key {
-            property::CPU_COUNT => Some(cpu_text.as_str()),
-            property::CPU_MILLICORES => Some(millicores_text.as_str()),
-            property::MEMORY_KB => Some(memory_text.as_str()),
-            property::DISK_KB => Some(disk_text.as_str()),
-            _ => None,
-        });
-        if accepting.is_empty() {
-            return Err(NativeLinkConfigError::ColdStartFitsNoFleet {
-                cpu_count: cold.cpu_count.get(),
-                memory_kb,
-                disk_kb,
-            });
-        }
-    }
-    let tuning = &config.scheduler;
     let client_action_timeout = WholeSeconds::try_new(spec.client_action_timeout)
         .map_err(|_| NativeLinkConfigError::Duration {
             field: "client_action_timeout",
@@ -101,45 +55,74 @@ pub(crate) fn scheduler(
     let mut simple = json!({
         "supported_platform_properties": supported_platform_properties(spec.fleets),
         "client_action_timeout_s": client_action_timeout,
-        "worker_timeout_s": tuning.worker_timeout.as_units(),
-        "retain_completed_for_s": tuning.retain_completed_for.as_units(),
-        "max_job_retries": tuning.max_job_retries,
-        "max_worker_loss_retries": tuning.max_worker_loss_retries,
+        "worker_timeout_s": config.worker_timeout.as_units(),
+        "retain_completed_for_s": spec.actions.retain_completed_for.as_units(),
+        "max_job_retries": spec.actions.max_job_retries,
+        "max_worker_loss_retries": spec.actions.max_worker_loss_retries,
     });
-    if let Some(escalation) = memory_escalation(config) {
-        simple["memory_escalation"] = escalation;
-    }
+    simple["resource_escalation"] = resource_escalation(&spec.actions, spec.fleets);
     let mut historical = json!({
         "learn_from_workers": true,
         "cpu_property_name": property::CPU_MILLICORES,
-        "headroom_percent": tuning.headroom_percent,
-        "window_days": tuning.window_days,
+        "headroom_percent": spec.actions.reservation_headroom_percent,
+        "window_days": spec.actions.history_window.as_units(),
+        "memory_budget_bytes": spec.actions.history_memory_budget.get().get(),
         "scheduler": { "simple": simple },
     });
-    if let Some(cold) = cold_start(&config.cold_start) {
+    if let Some(cold) = cold_start(&spec.actions.cold_start) {
         historical["cold_start"] = cold;
     }
     deserialize(json!({
-        "name": config.scheduler_name.as_str(),
+        "name": SCHEDULER_NAME,
         "historical_resource": historical,
     }))
 }
 
-/// Requeue memory kills and pressure disk kills with a shared escalation budget.
-fn memory_escalation(config: &NativeLinkConfig) -> Option<Value> {
-    let memory = &config.memory;
-    let pressure = config.disk.enforcement == DiskEnforcement::Pressure;
-    (memory.enforcement == MemoryEnforcement::Soft || pressure).then(|| {
-        let mut escalation = json!({
-            "percent": memory.escalation_percent.get(),
-            "max_steps": memory.escalation_max_steps,
-            "cpu_property": property::CPU_MILLICORES,
+/// Requeue resource kills against the declared capacities of each fleet.
+fn resource_escalation(actions: &ActionsConfig, fleets: &FleetCatalog) -> Value {
+    let capacities: Vec<Value> = fleets
+        .fleets()
+        .iter()
+        .map(|fleet| {
+            let minimum: Map<String, Value> = fleets
+                .declared()
+                .iter()
+                .filter_map(|&(key, kind)| {
+                    (kind == MatchKind::Minimum)
+                        .then(|| fleet.limit(key).map(|limit| (key.to_owned(), json!(limit))))
+                        .flatten()
+                })
+                .collect();
+            let exact: Map<String, Value> = fleets
+                .declared()
+                .iter()
+                .filter_map(|&(key, kind)| {
+                    (kind == MatchKind::Exact)
+                        .then(|| fleet.get(key).map(|value| (key.to_owned(), json!(value))))
+                        .flatten()
+                })
+                .collect();
+            json!({ "minimum": minimum, "exact": exact })
+        })
+        .collect();
+    let mut escalation = json!({
+        "memory": {
+            "property": property::MEMORY_KB,
+            "percent": actions.memory.escalation_percent.get(),
+            "max_steps": actions.memory.max_steps,
+        },
+        "headroom_percent": actions.reservation_headroom_percent,
+        "cpu_property": property::CPU_MILLICORES,
+        "capacities": capacities,
+    });
+    if actions.disk.enforcement == DiskEnforcement::Pressure {
+        escalation["disk"] = json!({
+            "property": property::DISK_KB,
+            "percent": actions.disk.escalation_percent.get(),
+            "max_steps": actions.disk.max_steps,
         });
-        if pressure {
-            escalation["disk_property"] = json!(property::DISK_KB);
-        }
-        escalation
-    })
+    }
+    escalation
 }
 
 /// The scheduler's cold start: the reservation of an action no hint matches and the client left
@@ -208,7 +191,7 @@ pub(crate) struct WorkerServices {
 
 /// The services of the client listener: `CAS`, `AC`, `ByteStream`, capabilities and execution.
 pub(crate) fn client_services(config: &NativeLinkConfig) -> ClientServices {
-    let name = config.scheduler_name.as_str();
+    let name = SCHEDULER_NAME;
     ClientServices {
         cas: vec![cas()],
         ac: vec![ac()],
@@ -237,7 +220,7 @@ pub(crate) fn client_services(config: &NativeLinkConfig) -> ClientServices {
 pub(crate) fn worker_services(config: &NativeLinkConfig) -> WorkerServices {
     WorkerServices {
         worker_api: WorkerApiConfig {
-            scheduler: config.scheduler_name.as_str().to_owned(),
+            scheduler: SCHEDULER_NAME.to_owned(),
             disable_kill_revoked_operations: false,
             kill_revoked_operations_interval_s: 0,
         },
@@ -364,7 +347,7 @@ fn local_worker(
         .worker_properties()
         .map(|(key, value)| (key.to_owned(), json!({ "values": [value] })))
         .collect();
-    let mut worker = json!({
+    let worker = json!({
         "name": spec.instance.worker_name(),
         "worker_api_endpoint": api_endpoint,
         "max_inflight_tasks": spec.slots.count().get(),
@@ -377,63 +360,49 @@ fn local_worker(
             (NETWORK_ENV): { "property": property::NETWORK },
             (CPU_COUNT_ENV): { "property": property::CPU_COUNT },
             (MEMORY_KB_ENV): { "property": property::MEMORY_KB },
+            (SIDE_CHANNEL_FILE_ENV): "side_channel_file",
         },
         "platform_properties": platform_properties,
-        "max_action_timeout_s": tuning.action_timeout.as_units(),
+        "max_action_timeout_s": spec.actions.timeout.as_units(),
+        "resource_enforcement": resource_enforcement(spec)?,
     });
-    if let Some(enforcement) = resource_enforcement(config) {
-        worker["resource_enforcement"] = enforcement;
-    }
     Ok(worker)
 }
 
-/// The worker's resource enforcement, or `None` when neither axis is enforced. An axis that is not
-/// enforced is written as `none` rather than omitted, because `NativeLink` enables memory by
-/// default: omitting it would enable it.
-fn resource_enforcement(config: &NativeLinkConfig) -> Option<Value> {
-    let memory = config.memory.enforcement == MemoryEnforcement::Soft;
-    let disk = config.disk.enforcement;
-    if !memory && disk == DiskEnforcement::None {
-        return None;
-    }
-    let mut enforcement = Map::new();
-    if memory {
-        enforcement.insert("memory".to_owned(), json!("soft"));
-        enforcement.insert(
-            "memory_headroom_percent".to_owned(),
-            json!(config.memory.headroom_percent),
-        );
-    } else {
-        enforcement.insert("memory".to_owned(), json!("none"));
-    }
-    let disk_name = match disk {
-        DiskEnforcement::None => "none",
-        DiskEnforcement::Guard => "guard",
-        DiskEnforcement::Pressure => "pressure",
-        DiskEnforcement::Soft => "soft",
-    };
-    enforcement.insert("disk".to_owned(), json!(disk_name));
-    if disk == DiskEnforcement::Soft {
-        enforcement.insert(
-            "disk_headroom_percent".to_owned(),
-            json!(config.disk.headroom_percent),
-        );
-    }
-    if disk == DiskEnforcement::Pressure {
-        enforcement.insert(
-            "disk_pressure_free_percent".to_owned(),
-            json!(config.disk.pressure_free_percent),
-        );
-        enforcement.insert(
-            "disk_pressure_kill_after_s".to_owned(),
-            json!(config.disk.pressure_kill_after.as_units()),
-        );
-    }
-    Some(Value::Object(enforcement))
+/// The worker's resource policy, including settings for inactive enforcement modes.
+fn resource_enforcement(spec: &WorkerSpec) -> Result<Value, NativeLinkConfigError> {
+    let memory = &spec.actions.memory;
+    let disk = &spec.actions.disk;
+    let pool = spec
+        .memory_pool
+        .as_ref()
+        .map(|pool| path_str(&pool.cgroup))
+        .transpose()?;
+    Ok(json!({
+        "memory": memory.enforcement,
+        "memory_property_name": property::MEMORY_KB,
+        "memory_headroom_percent": memory.headroom_percent,
+        "memory_soft_samples": memory.soft_samples,
+        "memory_soft_spike_percent": memory.soft_spike_percent.get(),
+        "memory_sample_interval_ms": memory.sample_interval.as_millis(),
+        "memory_pressure_stall_percent": memory.pressure_stall_percent,
+        "memory_pressure_poll_interval_ms": memory.pressure_poll_interval.as_millis(),
+        "memory_pressure_kill_after_ms": memory.pressure_kill_after.as_millis(),
+        "memory_pressure_reserve_bytes": memory.reserve.get().get(),
+        "memory_pool_path": pool,
+        "disk": disk.enforcement,
+        "disk_property_name": property::DISK_KB,
+        "disk_headroom_percent": disk.headroom_percent,
+        "disk_soft_samples": disk.soft_samples,
+        "disk_sample_interval_ms": disk.sample_interval.as_millis(),
+        "disk_pressure_free_percent": disk.pressure_free_percent,
+        "disk_pressure_poll_interval_ms": disk.pressure_poll_interval.as_millis(),
+        "disk_pressure_kill_after_ms": disk.pressure_kill_after.as_millis(),
+    }))
 }
 
 /// The `ByteStream` service entry, with how long a write survives a client disconnect.
-fn bytestream(http2: &Http2Tuning) -> WithInstanceName<ByteStreamConfig> {
+fn bytestream(http2: &Http2Config) -> WithInstanceName<ByteStreamConfig> {
     WithInstanceName {
         instance_name: String::new(),
         config: ByteStreamConfig {
@@ -496,29 +465,17 @@ mod tests {
     use std::time::Duration;
 
     use gang_spi::{ClientTls, ControllerSpec, RenderedStoreSpec, Slots, StoreAccess, WorkerSpec};
-    use gang_types::{
-        Bytes, FleetCatalog, FleetName, FleetProperties, HeadroomPercent, InstanceId, Isa,
-        Resources,
-    };
-    use nativelink_config::cas_server::{
-        DiskEnforcement as NativeDiskEnforcement, MemoryEnforcement as NativeMemoryEnforcement,
-        ResourceEnforcementConfig,
-    };
+    use gang_types::{Bytes, FleetCatalog, FleetName, FleetProperties, InstanceId, Isa, Resources};
+    use nativelink_config::cas_server::ResourceEnforcementConfig;
     use nativelink_config::schedulers::{HistoricalResourceSpec, SchedulerSpec, SimpleSpec};
     use nativelink_config::stores::{ClientTlsConfig, StoreSpec};
     use serde_json::json;
 
     use super::*;
     use crate::config::NativeLinkConfig;
-    use crate::enforcement::{
-        DiskMinReservation, DiskTuning, EscalationPercent, MemoryTuning, MinReservation, WholeKib,
-    };
 
     fn config() -> NativeLinkConfig {
-        serde_json::from_value(json!({
-            "scheduler_name": "MAIN_SCHEDULER",
-        }))
-        .expect("valid config")
+        NativeLinkConfig::default()
     }
 
     /// The worker endpoint the plugin resolves: plain gRPC on loopback.
@@ -566,6 +523,7 @@ mod tests {
         fleets: &'a FleetCatalog,
     ) -> ControllerSpec<'a> {
         ControllerSpec {
+            actions: std::sync::Arc::new(ActionsConfig::default()),
             content_store: content,
             action_store: action,
             fleets,
@@ -583,6 +541,8 @@ mod tests {
         store_access: StoreAccess,
     ) -> WorkerSpec {
         WorkerSpec {
+            actions: std::sync::Arc::new(ActionsConfig::default()),
+            memory_pool: None,
             instance: instance.clone(),
             properties: properties.clone(),
             slots: Slots::LongLived(NonZeroU32::new(4).expect("non-zero slots")),
@@ -630,63 +590,6 @@ mod tests {
         };
         assert_eq!(simple.client_action_timeout_s, 600);
         assert!(simple.supported_platform_properties.is_some());
-    }
-
-    /// A config whose `cold_start` section is `cold`, with every other setting defaulted.
-    fn config_with_cold_start(cold: &Value) -> NativeLinkConfig {
-        serde_json::from_value(json!({
-            "worker_endpoint": "grpc://127.0.0.1:9100",
-            "scheduler_name": "MAIN_SCHEDULER",
-            "cold_start": cold,
-        }))
-        .expect("valid config")
-    }
-
-    #[test]
-    fn default_cold_start_fits_the_catalog() {
-        let content = memory_store();
-        let action = memory_store();
-        let fleets = catalog();
-        assert!(scheduler(&config(), &controller_spec(&content, &action, &fleets)).is_ok());
-    }
-
-    #[test]
-    fn cold_start_no_fleet_fits_is_rejected() {
-        let content = memory_store();
-        let action = memory_store();
-        let fleets = catalog();
-        let spec = controller_spec(&content, &action, &fleets);
-        let memory = config_with_cold_start(&json!({ "memory": "64GiB" }));
-        assert!(matches!(
-            scheduler(&memory, &spec),
-            Err(NativeLinkConfigError::ColdStartFitsNoFleet {
-                cpu_count: 1,
-                memory_kb: 67_108_864,
-                disk_kb: 4_194_304,
-            })
-        ));
-        let disk = config_with_cold_start(&json!({ "disk": "1TiB" }));
-        assert!(matches!(
-            scheduler(&disk, &spec),
-            Err(NativeLinkConfigError::ColdStartFitsNoFleet {
-                cpu_count: 1,
-                memory_kb: 4_194_304,
-                disk_kb: 1_073_741_824,
-            })
-        ));
-    }
-
-    #[test]
-    fn oversized_cold_start_builds_when_disabled() {
-        let content = memory_store();
-        let action = memory_store();
-        let fleets = catalog();
-        let disabled = config_with_cold_start(&json!({
-            "enabled": false,
-            "memory": "64GiB",
-            "disk": "1TiB",
-        }));
-        assert!(scheduler(&disabled, &controller_spec(&content, &action, &fleets)).is_ok());
     }
 
     #[test]
@@ -816,6 +719,26 @@ mod tests {
                 .config
                 .persist_stream_on_disconnect_timeout_s,
             10
+        );
+    }
+
+    #[test]
+    fn worker_renders_side_channel_environment_source() {
+        let instance = InstanceId::try_new("local-1").expect("instance");
+        let content = memory_store();
+        let action = memory_store();
+        let properties = fleet("fleet-a", Isa::X86_64, "2");
+        let spec = worker_spec(
+            &instance,
+            &properties,
+            &content,
+            &action,
+            StoreAccess::ViaController,
+        );
+        let rendered = local_worker(&config(), &spec, "grpc://127.0.0.1:9100").expect("worker");
+        assert_eq!(
+            rendered["additional_environment"][SIDE_CHANNEL_FILE_ENV],
+            "side_channel_file"
         );
     }
 
@@ -1153,467 +1076,278 @@ mod tests {
         simple
     }
 
-    /// The config with its memory enforcement replaced.
-    fn config_with_memory(memory: MemoryTuning) -> NativeLinkConfig {
-        let mut config = config();
-        config.memory = memory;
-        config
-    }
-
-    /// The config with its disk enforcement replaced.
-    fn config_with_disk(disk: DiskTuning) -> NativeLinkConfig {
-        let mut config = config();
-        config.disk = disk;
-        config
-    }
-
-    /// The scheduler the controller renders for `config`.
-    fn rendered_scheduler(config: &NativeLinkConfig) -> SchedulerConfig {
-        let content = memory_store();
-        let action = memory_store();
-        let fleets = catalog();
-        scheduler(config, &controller_spec(&content, &action, &fleets)).expect("scheduler")
-    }
-
-    /// The worker's `resource_enforcement` as `NativeLink` renders it.
-    fn resource_enforcement_of(config: &NativeLinkConfig) -> Option<ResourceEnforcementConfig> {
-        let instance = InstanceId::try_new("local-1").expect("instance");
-        let content = memory_store();
-        let action = memory_store();
-        let properties = fleet("fleet-a", Isa::X86_64, "2");
-        let settings = worker(
-            config,
-            &endpoint(),
-            &worker_spec(
-                &instance,
-                &properties,
-                &content,
-                &action,
-                StoreAccess::Direct,
-            ),
-            WorkerTls::Plain,
-        )
-        .expect("worker");
-        settings.worker.resource_enforcement
-    }
-
-    #[test]
-    fn scheduler_renders_memory_escalation_by_default() {
-        let content = memory_store();
-        let action = memory_store();
-        let fleets = catalog();
-        let scheduler =
-            scheduler(&config(), &controller_spec(&content, &action, &fleets)).expect("scheduler");
-        let escalation = simple_of(&scheduler)
-            .memory_escalation
-            .as_ref()
-            .expect("memory_escalation");
-        assert_eq!(escalation.percent, 200);
-        assert_eq!(escalation.max_steps, 8);
-        assert_eq!(escalation.cpu_property, property::CPU_MILLICORES);
-        assert_eq!(escalation.disk_property, property::DISK_KB);
-    }
-
-    #[test]
-    fn scheduler_omits_memory_escalation_when_memory_is_not_enforced() {
-        let content = memory_store();
-        let action = memory_store();
-        let fleets = catalog();
-        let mut config = config_with_memory(MemoryTuning {
-            enforcement: MemoryEnforcement::None,
-            ..MemoryTuning::default()
-        });
-        config.disk.enforcement = DiskEnforcement::Guard;
-        let scheduler =
-            scheduler(&config, &controller_spec(&content, &action, &fleets)).expect("scheduler");
-        assert!(simple_of(&scheduler).memory_escalation.is_none());
-    }
-
-    #[test]
-    fn worker_renders_memory_soft_enforcement_by_default() {
-        let enforcement = resource_enforcement_of(&config()).expect("resource_enforcement");
-        assert_eq!(enforcement.memory, NativeMemoryEnforcement::Soft);
-        assert_eq!(enforcement.memory_headroom_percent, 20);
-    }
-
-    #[test]
-    fn custom_memory_tuning_reaches_worker_and_scheduler() {
-        let config = config_with_memory(MemoryTuning {
-            enforcement: MemoryEnforcement::Soft,
-            headroom_percent: HeadroomPercent::from_percent(35),
-            escalation_percent: EscalationPercent::try_new(300).expect("valid percent"),
-            escalation_max_steps: 2,
-            min_reservation: MemoryTuning::default().min_reservation,
-        });
-        let enforcement = resource_enforcement_of(&config).expect("resource_enforcement");
-        assert_eq!(enforcement.memory, NativeMemoryEnforcement::Soft);
-        assert_eq!(enforcement.memory_headroom_percent, 35);
-
-        let content = memory_store();
-        let action = memory_store();
-        let fleets = catalog();
-        let scheduler =
-            scheduler(&config, &controller_spec(&content, &action, &fleets)).expect("scheduler");
-        let escalation = simple_of(&scheduler)
-            .memory_escalation
-            .as_ref()
-            .expect("memory_escalation");
-        assert_eq!(escalation.percent, 300);
-        assert_eq!(escalation.max_steps, 2);
-    }
-
-    #[test]
-    fn no_memory_enforcement_keeps_disk_and_writes_memory_none() {
-        let config = config_with_memory(MemoryTuning {
-            enforcement: MemoryEnforcement::None,
-            ..MemoryTuning::default()
-        });
-        let enforcement = resource_enforcement_of(&config).expect("resource_enforcement");
-        assert_eq!(enforcement.memory, NativeMemoryEnforcement::None);
-        assert_eq!(enforcement.disk, NativeDiskEnforcement::Pressure);
-    }
-
-    #[test]
-    fn no_enforcement_on_either_axis_omits_resource_enforcement() {
-        let mut config = config_with_memory(MemoryTuning {
-            enforcement: MemoryEnforcement::None,
-            ..MemoryTuning::default()
-        });
-        config.disk = DiskTuning {
-            enforcement: DiskEnforcement::None,
-            ..DiskTuning::default()
-        };
-        assert!(resource_enforcement_of(&config).is_none());
-    }
-
-    #[test]
-    fn worker_renders_disk_pressure_enforcement_by_default() {
-        let config = config();
-        let enforcement = resource_enforcement_of(&config).expect("resource_enforcement");
-        assert_eq!(enforcement.disk, NativeDiskEnforcement::Pressure);
-        let rendered = resource_enforcement(&config).expect("resource_enforcement");
-        assert_eq!(rendered["disk"], "pressure");
-        assert_eq!(rendered["disk_pressure_free_percent"], 5);
-        assert_eq!(rendered["disk_pressure_kill_after_s"], 5);
-        assert!(rendered.get("disk_headroom_percent").is_none());
-    }
-
-    #[test]
-    fn custom_disk_pressure_settings_reach_the_worker() {
-        let config: NativeLinkConfig = serde_json::from_value(json!({
-            "scheduler_name": "MAIN_SCHEDULER",
-            "disk": { "pressure_free_percent": 12, "pressure_kill_after": "9s" }
-        }))
-        .expect("valid config");
-        let rendered = resource_enforcement(&config).expect("resource_enforcement");
-        assert_eq!(rendered["disk_pressure_free_percent"], 12);
-        assert_eq!(rendered["disk_pressure_kill_after_s"], 9);
-        let native = resource_enforcement_of(&config).expect("native resource enforcement");
-        assert_eq!(native.disk_pressure_free_percent, 12);
-        assert_eq!(native.disk_pressure_kill_after_s, 9);
-    }
-
-    #[test]
-    fn explicit_soft_disk_config_reaches_worker_with_headroom() {
-        let config: NativeLinkConfig = serde_json::from_value(json!({
-            "scheduler_name": "MAIN_SCHEDULER",
-            "disk": { "enforcement": "soft", "headroom_percent": 35 }
-        }))
-        .expect("valid config");
-        let enforcement = resource_enforcement_of(&config).expect("resource_enforcement");
-        assert_eq!(enforcement.disk, NativeDiskEnforcement::Soft);
-        assert_eq!(enforcement.disk_headroom_percent, 35);
-        let rendered = resource_enforcement(&config).expect("resource_enforcement");
-        assert_eq!(rendered["disk"], "soft");
-        assert_eq!(rendered["disk_headroom_percent"], 35);
-    }
-
-    #[test]
-    fn disk_modes_render_their_names_beside_memory() {
-        for (mode, expected) in [
-            (DiskEnforcement::None, NativeDiskEnforcement::None),
-            (DiskEnforcement::Guard, NativeDiskEnforcement::Guard),
-            (DiskEnforcement::Pressure, NativeDiskEnforcement::Pressure),
-            (DiskEnforcement::Soft, NativeDiskEnforcement::Soft),
-        ] {
-            let config = config_with_disk(DiskTuning {
-                enforcement: mode,
-                ..DiskTuning::default()
-            });
-            let enforcement = resource_enforcement_of(&config).expect("resource_enforcement");
-            assert_eq!(enforcement.memory, NativeMemoryEnforcement::Soft);
-            assert_eq!(enforcement.disk, expected);
-        }
-    }
-
-    #[test]
-    fn custom_disk_headroom_reaches_the_worker() {
-        let config = config_with_disk(DiskTuning {
-            enforcement: DiskEnforcement::Soft,
-            headroom_percent: HeadroomPercent::from_percent(35),
-            ..DiskTuning::default()
-        });
-        let enforcement = resource_enforcement_of(&config).expect("resource_enforcement");
-        assert_eq!(enforcement.disk, NativeDiskEnforcement::Soft);
-        assert_eq!(enforcement.disk_headroom_percent, 35);
-    }
-
-    #[test]
-    fn scheduler_renders_cold_start_by_default() {
-        let scheduler = rendered_scheduler(&config());
-        let cold = historical_of(&scheduler)
-            .cold_start
-            .as_ref()
-            .expect("cold_start");
-        assert_eq!(cold.cpu_count, 1_000);
-        assert_eq!(cold.memory_kb, 4_194_304);
-        assert_eq!(cold.disk_kb, 4_194_304);
-    }
-
-    #[test]
-    fn custom_cold_start_reaches_the_scheduler() {
-        let mut config = config();
-        config.cold_start = ColdStartTuning {
-            enabled: true,
-            cpu_count: NonZeroU32::new(4).expect("non-zero cpu count"),
-            memory: WholeKib::from_units(2 * 1024 * 1024),
-            disk: WholeKib::from_units(8 * 1024 * 1024),
-        };
-        let scheduler = rendered_scheduler(&config);
-        let cold = historical_of(&scheduler)
-            .cold_start
-            .as_ref()
-            .expect("cold_start");
-        assert_eq!(cold.cpu_count, 4_000);
-        assert_eq!(cold.memory_kb, 2_097_152);
-        assert_eq!(cold.disk_kb, 8_388_608);
-    }
-
-    #[test]
-    fn disabled_cold_start_is_not_rendered() {
-        let mut config = config();
-        config.cold_start = ColdStartTuning {
-            enabled: false,
-            ..ColdStartTuning::default()
-        };
-        let scheduler = rendered_scheduler(&config);
-        assert!(historical_of(&scheduler).cold_start.is_none());
-    }
-
-    /// A catalog of one fleet with one CPU, `memory` bytes of memory and `disk` bytes of disk.
-    fn one_cpu_catalog(memory: u64, disk: u64) -> FleetCatalog {
-        let fleet = FleetProperties::new(
-            &FleetName::try_new("fleet-a").expect("valid fleet name"),
-            Isa::X86_64,
-            &"docker",
-            Resources {
-                vcpus: 1,
-                memory: Bytes::new(memory),
-                disk: Bytes::new(disk),
+    fn custom_actions() -> ActionsConfig {
+        serde_json::from_value(json!({
+            "reservation_headroom_percent": 37,
+            "history_window": "9d",
+            "history_memory_budget": "320MiB",
+            "retain_completed_for": "83s",
+            "max_job_retries": 5,
+            "max_worker_loss_retries": 13,
+            "timeout": "23m",
+            "kill_grace": "1700ms",
+            "memory": {
+                "reserve": "2GiB",
+                "enforcement": "soft",
+                "headroom_percent": 31,
+                "soft_samples": 4,
+                "soft_spike_percent": 240,
+                "sample_interval": "310ms",
+                "pressure_stall_percent": 7,
+                "pressure_poll_interval": "430ms",
+                "pressure_kill_after": "1700ms",
+                "escalation_percent": 230,
+                "max_steps": 6
             },
-            [("capacity", "2".to_owned())],
+            "disk": {
+                "enforcement": "soft",
+                "headroom_percent": 41,
+                "soft_samples": 3,
+                "sample_interval": "13s",
+                "pressure_free_percent": 12,
+                "pressure_poll_interval": "2300ms",
+                "pressure_kill_after": "7500ms",
+                "escalation_percent": 270,
+                "max_steps": 5
+            },
+            "cold_start": { "enabled": true, "cpu_count": 2, "memory": "2GiB", "disk": "3GiB" }
+        }))
+        .expect("valid actions")
+    }
+
+    #[test]
+    fn default_memory_pressure_renders_to_native_worker_config() {
+        let instance = InstanceId::try_new("local-1").expect("instance");
+        let properties = fleet("fleet-a", Isa::X86_64, "2");
+        let content = memory_store();
+        let action = memory_store();
+        let spec = worker_spec(
+            &instance,
+            &properties,
+            &content,
+            &action,
+            StoreAccess::Direct,
         );
-        FleetCatalog::try_new(vec![fleet]).expect("valid catalog")
+        let rendered =
+            local_worker(&config(), &spec, "grpc://127.0.0.1:9100").expect("worker json");
+        let enforcement = &rendered["resource_enforcement"];
+        assert_eq!(enforcement["memory_pressure_stall_percent"], 10);
+        assert_eq!(enforcement["memory_pressure_poll_interval_ms"], 250);
+        assert_eq!(enforcement["memory_pressure_kill_after_ms"], 5000);
+        assert_eq!(
+            enforcement["memory_pressure_reserve_bytes"],
+            1_073_741_824_u64
+        );
+        let native: ResourceEnforcementConfig =
+            serde_json::from_value(enforcement.clone()).expect("fork accepts enforcement");
+        assert_eq!(native.memory_pressure_reserve_bytes, 1_073_741_824);
     }
-
-    /// A config whose cold start is one CPU with `memory_kib` of memory and `disk_kib` of disk.
-    fn config_with_cold_start_kib(memory_kib: u64, disk_kib: u64) -> NativeLinkConfig {
-        let mut config = config();
-        config.cold_start = ColdStartTuning {
-            enabled: true,
-            cpu_count: NonZeroU32::new(1).expect("non-zero cpu count"),
-            memory: WholeKib::from_units(memory_kib),
-            disk: WholeKib::from_units(disk_kib),
-        };
-        config
-    }
-
-    /// Four GiB in KiB: the default cold start's memory and disk.
-    const FOUR_GIB_KIB: u64 = 4_194_304;
 
     #[test]
-    fn cold_start_exactly_matching_the_only_fleet_fits() {
+    fn custom_actions_render_to_native_worker_config() {
+        let instance = InstanceId::try_new("local-1").expect("instance");
+        let properties = fleet("fleet-a", Isa::X86_64, "2");
         let content = memory_store();
         let action = memory_store();
-        let fleets = one_cpu_catalog(FOUR_GIB_KIB * 1024, FOUR_GIB_KIB * 1024);
-        let config = config_with_cold_start_kib(FOUR_GIB_KIB, FOUR_GIB_KIB);
-        assert!(scheduler(&config, &controller_spec(&content, &action, &fleets)).is_ok());
-    }
-
-    #[test]
-    fn minimum_reservation_above_the_only_fleet_is_rejected() {
-        let content = memory_store();
-        let action = memory_store();
-        let fleets = catalog();
-        let mut config = config();
-        config.memory.min_reservation = MinReservation::from_units(9 * 1024 * 1024);
-        assert!(matches!(
-            scheduler(&config, &controller_spec(&content, &action, &fleets)),
-            Err(NativeLinkConfigError::MinReservationAboveFleet {
-                fleet, min_kb: 9_437_184, memory_kb: 8_388_608
-            }) if fleet == "fleet-a"
-        ));
-    }
-
-    #[test]
-    fn minimum_reservation_equal_to_the_only_fleet_fits() {
-        let content = memory_store();
-        let action = memory_store();
-        let fleets = catalog();
-        let mut config = config();
-        config.memory.min_reservation = MinReservation::from_units(8_388_608);
-        assert!(scheduler(&config, &controller_spec(&content, &action, &fleets)).is_ok());
-    }
-
-    #[test]
-    fn minimum_reservation_one_kib_over_the_only_fleet_is_rejected() {
-        let content = memory_store();
-        let action = memory_store();
-        let fleets = catalog();
-        let mut config = config();
-        config.memory.min_reservation = MinReservation::from_units(8_388_609);
-        assert!(matches!(
-            scheduler(&config, &controller_spec(&content, &action, &fleets)),
-            Err(NativeLinkConfigError::MinReservationAboveFleet {
-                fleet, min_kb: 8_388_609, memory_kb: 8_388_608
-            }) if fleet == "fleet-a"
-        ));
-    }
-
-    #[test]
-    fn minimum_reservation_above_any_fleet_is_rejected_naming_it() {
-        let content = memory_store();
-        let action = memory_store();
-        let fleets = FleetCatalog::try_new(
-            [("fleet-big", 32_u64), ("fleet-small", 8)]
-                .into_iter()
-                .map(|(name, gib)| {
-                    FleetProperties::new(
-                        &FleetName::try_new(name).expect("valid fleet name"),
-                        Isa::X86_64,
-                        &"docker",
-                        Resources {
-                            vcpus: 4,
-                            memory: Bytes::gib(gib),
-                            disk: Bytes::gib(100),
-                        },
-                        [("capacity", "2".to_owned())],
-                    )
-                })
-                .collect(),
-        )
-        .expect("valid catalog");
-        let mut config = config();
-        config.memory.min_reservation = MinReservation::from_units(16_777_216);
-        assert!(matches!(
-            scheduler(&config, &controller_spec(&content, &action, &fleets)),
-            Err(NativeLinkConfigError::MinReservationAboveFleet {
-                fleet, min_kb: 16_777_216, memory_kb: 8_388_608
-            }) if fleet == "fleet-small"
-        ));
-    }
-
-    #[test]
-    fn disk_minimum_above_a_fleet_is_rejected() {
-        let content = memory_store();
-        let action = memory_store();
-        let fleets = catalog();
-        let mut config = config();
-        config.disk.min_reservation = DiskMinReservation::from_units(100 * 1024 * 1024 + 1);
-        assert!(matches!(
-            scheduler(&config, &controller_spec(&content, &action, &fleets)),
-            Err(NativeLinkConfigError::DiskMinReservationAboveFleet { fleet, .. }) if fleet == "fleet-a"
-        ));
-    }
-
-    #[test]
-    fn disk_escalation_is_only_enabled_for_pressure() {
-        let mut config = config();
-        for mode in [
-            DiskEnforcement::None,
-            DiskEnforcement::Guard,
-            DiskEnforcement::Soft,
-            DiskEnforcement::Pressure,
+        let mut spec = worker_spec(
+            &instance,
+            &properties,
+            &content,
+            &action,
+            StoreAccess::Direct,
+        );
+        spec.actions = std::sync::Arc::new(custom_actions());
+        spec.memory_pool = Some(gang_spi::ActionMemoryPool {
+            cgroup: Path::new("/sys/fs/cgroup/gang/actions").to_path_buf(),
+            capacity: gang_types::NonZeroBytes::gib(6),
+        });
+        let rendered =
+            local_worker(&config(), &spec, "grpc://127.0.0.1:9100").expect("worker json");
+        let enforcement = &rendered["resource_enforcement"];
+        assert_eq!(
+            *enforcement,
+            json!({
+                "memory": "soft",
+                "memory_property_name": "memory_kb",
+                "memory_headroom_percent": 31,
+                "memory_soft_samples": 4,
+                "memory_soft_spike_percent": 240,
+                "memory_sample_interval_ms": 310,
+                "memory_pressure_stall_percent": 7,
+                "memory_pressure_poll_interval_ms": 430,
+                "memory_pressure_kill_after_ms": 1700,
+                "memory_pressure_reserve_bytes": 2_147_483_648_u64,
+                "memory_pool_path": "/sys/fs/cgroup/gang/actions",
+                "disk": "soft",
+                "disk_property_name": "disk_kb",
+                "disk_headroom_percent": 41,
+                "disk_soft_samples": 3,
+                "disk_sample_interval_ms": 13000,
+                "disk_pressure_free_percent": 12,
+                "disk_pressure_poll_interval_ms": 2300,
+                "disk_pressure_kill_after_ms": 7500
+            })
+        );
+        for removed in [
+            "disk_pressure_kill_after_s",
+            "memory_pressure_kill_percent",
+            "memory_pressure_kill_after_s",
         ] {
-            config.disk.enforcement = mode;
-            let escalation = memory_escalation(&config).expect("memory escalation");
-            assert_eq!(
-                escalation.get("disk_property").is_some(),
-                mode == DiskEnforcement::Pressure
-            );
+            assert!(enforcement.get(removed).is_none());
         }
-        config.memory.enforcement = MemoryEnforcement::None;
-        config.disk.enforcement = DiskEnforcement::Pressure;
-        assert_eq!(
-            memory_escalation(&config).expect("disk escalation")["disk_property"],
-            property::DISK_KB
-        );
-        assert_eq!(
-            resource_enforcement(&config).expect("disk enforcement")["memory"],
-            "none"
-        );
+        let native: ResourceEnforcementConfig =
+            serde_json::from_value(enforcement.clone()).expect("fork accepts enforcement");
+        assert_eq!(native.memory_pressure_reserve_bytes, 2_147_483_648);
+        let native: LocalWorkerConfig =
+            serde_json::from_value(rendered).expect("fork accepts worker");
+        assert_eq!(native.max_action_timeout_s, 1380);
+        assert!(native.resource_enforcement.is_some());
     }
 
     #[test]
-    fn cold_start_one_kib_of_memory_over_the_only_fleet_is_rejected() {
+    fn custom_actions_render_to_native_scheduler_config() {
         let content = memory_store();
         let action = memory_store();
-        let fleets = one_cpu_catalog(FOUR_GIB_KIB * 1024, FOUR_GIB_KIB * 1024);
-        let config = config_with_cold_start_kib(FOUR_GIB_KIB + 1, FOUR_GIB_KIB);
-        assert!(matches!(
-            scheduler(&config, &controller_spec(&content, &action, &fleets)),
-            Err(NativeLinkConfigError::ColdStartFitsNoFleet { .. })
-        ));
-    }
-
-    #[test]
-    fn disk_headroom_renders_when_memory_is_not_enforced() {
-        let mut config = config_with_memory(MemoryTuning {
-            enforcement: MemoryEnforcement::None,
-            ..MemoryTuning::default()
-        });
-        config.disk = DiskTuning {
-            enforcement: DiskEnforcement::Soft,
-            headroom_percent: HeadroomPercent::from_percent(35),
-            ..DiskTuning::default()
-        };
-        let enforcement = resource_enforcement_of(&config).expect("resource_enforcement");
-        assert_eq!(enforcement.memory, NativeMemoryEnforcement::None);
-        assert_eq!(enforcement.disk, NativeDiskEnforcement::Soft);
-        assert_eq!(enforcement.disk_headroom_percent, 35);
-    }
-
-    #[test]
-    fn memory_headroom_renders_beside_guarded_disk() {
-        let mut config = config_with_memory(MemoryTuning {
-            enforcement: MemoryEnforcement::Soft,
-            headroom_percent: HeadroomPercent::from_percent(40),
-            ..MemoryTuning::default()
-        });
-        config.disk = DiskTuning {
-            enforcement: DiskEnforcement::Guard,
-            ..DiskTuning::default()
-        };
-        let enforcement = resource_enforcement_of(&config).expect("resource_enforcement");
-        assert_eq!(enforcement.memory, NativeMemoryEnforcement::Soft);
-        assert_eq!(enforcement.memory_headroom_percent, 40);
-        assert_eq!(enforcement.disk, NativeDiskEnforcement::Guard);
-    }
-
-    #[test]
-    fn escalation_renders_a_percent_with_zero_steps() {
-        let config = config_with_memory(MemoryTuning {
-            enforcement: MemoryEnforcement::Soft,
-            escalation_percent: EscalationPercent::try_new(150).expect("valid percent"),
-            escalation_max_steps: 0,
-            ..MemoryTuning::default()
-        });
-        let scheduler = rendered_scheduler(&config);
-        let escalation = simple_of(&scheduler)
-            .memory_escalation
+        let fleets = FleetCatalog::try_new(vec![
+            fleet("fleet-a", Isa::X86_64, "2"),
+            FleetProperties::new(
+                &FleetName::try_new("fleet-b").expect("fleet name"),
+                Isa::Aarch64,
+                &"bwrap",
+                Resources {
+                    vcpus: 6,
+                    memory: Bytes::gib(16),
+                    disk: Bytes::gib(80),
+                },
+                [
+                    ("capacity", "3".to_owned()),
+                    ("machine_class", "arm".to_owned()),
+                ],
+            ),
+        ])
+        .expect("catalog");
+        let mut spec = controller_spec(&content, &action, &fleets);
+        let mut actions = custom_actions();
+        actions.disk.enforcement = DiskEnforcement::Pressure;
+        spec.actions = std::sync::Arc::new(actions);
+        let mut config = config();
+        config.worker_timeout = WholeSeconds::from_units(17);
+        let scheduler = scheduler(&config, &spec).expect("fork accepts scheduler");
+        let historical = historical_of(&scheduler);
+        assert_eq!(historical.headroom_percent, 37);
+        assert_eq!(historical.window_days, 9);
+        assert_eq!(historical.memory_budget_bytes, 320 * 1024 * 1024);
+        let cold = historical.cold_start.as_ref().expect("cold start");
+        assert_eq!(
+            (cold.cpu_count, cold.memory_kb, cold.disk_kb),
+            (2000, 2_097_152, 3_145_728)
+        );
+        let simple = simple_of(&scheduler);
+        assert_eq!(simple.worker_timeout_s, 17);
+        assert_eq!(simple.retain_completed_for_s, 83);
+        assert_eq!(simple.max_job_retries, 5);
+        assert_eq!(simple.max_worker_loss_retries, 13);
+        let escalation = simple
+            .resource_escalation
             .as_ref()
-            .expect("memory_escalation");
-        assert_eq!(escalation.percent, 150);
-        assert_eq!(escalation.max_steps, 0);
+            .expect("resource escalation");
+        assert_eq!(
+            (
+                escalation.memory.property.as_str(),
+                escalation.memory.percent,
+                escalation.memory.max_steps
+            ),
+            ("memory_kb", 230, 6)
+        );
+        let disk = escalation.disk.as_ref().expect("disk escalation");
+        assert_eq!(
+            (disk.property.as_str(), disk.percent, disk.max_steps),
+            ("disk_kb", 270, 5)
+        );
+        assert_eq!(escalation.headroom_percent, 37);
+        assert_eq!(escalation.cpu_property, "cpu_millicores");
+        assert_eq!(
+            serde_json::to_value(&escalation.capacities).expect("capacities"),
+            json!([
+                {
+                    "minimum": { "cpu_count": 4, "cpu_millicores": 4000, "memory_kb": 8_388_608, "disk_kb": 104_857_600 },
+                    "exact": { "fleet": "fleet-a", "ISA": "x86-64", "sandbox": "docker", "capacity": "2" }
+                },
+                {
+                    "minimum": { "cpu_count": 6, "cpu_millicores": 6000, "memory_kb": 16_777_216, "disk_kb": 83_886_080 },
+                    "exact": { "fleet": "fleet-b", "ISA": "aarch64", "sandbox": "bwrap", "capacity": "3", "machine_class": "arm" }
+                }
+            ])
+        );
+        let json = serde_json::to_value(simple).expect("simple json");
+        assert!(json.get("memory_escalation").is_none());
+        let escalation_json = &json["resource_escalation"];
+        for removed in ["ladder_kb", "max_kb", "max_steps", "disk_property"] {
+            assert!(escalation_json.get(removed).is_none());
+        }
+    }
+
+    #[test]
+    fn worker_modes_and_missing_pool_reach_native_config() {
+        let instance = InstanceId::try_new("local-1").expect("instance");
+        let properties = fleet("fleet-a", Isa::X86_64, "2");
+        let content = memory_store();
+        let action = memory_store();
+        let mut spec = worker_spec(
+            &instance,
+            &properties,
+            &content,
+            &action,
+            StoreAccess::Direct,
+        );
+        let mut actions = custom_actions();
+        for memory in [
+            gang_config::MemoryEnforcement::None,
+            gang_config::MemoryEnforcement::Pressure,
+            gang_config::MemoryEnforcement::Soft,
+        ] {
+            for disk in [
+                DiskEnforcement::None,
+                DiskEnforcement::Guard,
+                DiskEnforcement::Pressure,
+                DiskEnforcement::Soft,
+            ] {
+                actions.memory.enforcement = memory;
+                actions.disk.enforcement = disk;
+                spec.actions = std::sync::Arc::new(actions.clone());
+                let rendered = resource_enforcement(&spec).expect("resource enforcement");
+                assert!(rendered["memory_pool_path"].is_null());
+                let native: ResourceEnforcementConfig =
+                    serde_json::from_value(rendered.clone()).expect("fork accepts modes");
+                assert_eq!(
+                    serde_json::to_value(native.memory).expect("memory mode"),
+                    rendered["memory"]
+                );
+                assert_eq!(
+                    serde_json::to_value(native.disk).expect("disk mode"),
+                    rendered["disk"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn modes_and_disabled_cold_start_are_rendered() {
+        let mut actions = custom_actions();
+        for (mode, expected) in [
+            (DiskEnforcement::None, false),
+            (DiskEnforcement::Guard, false),
+            (DiskEnforcement::Pressure, true),
+            (DiskEnforcement::Soft, false),
+        ] {
+            actions.disk.enforcement = mode;
+            let json = resource_escalation(&actions, &catalog());
+            assert_eq!(json.get("disk").is_some(), expected);
+            let native: nativelink_config::schedulers::ResourceEscalationSpec =
+                serde_json::from_value(json).expect("fork accepts escalation");
+            assert_eq!(native.disk.is_some(), expected);
+        }
+        actions.cold_start.enabled = false;
+        assert!(cold_start(&actions.cold_start).is_none());
     }
 }

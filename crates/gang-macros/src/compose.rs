@@ -814,7 +814,6 @@ mod tests {
             provisioner: Provisioner { #provisioner },
             cache: Cache { store: CacheStore },
             signer: Signer { signer: SignerImpl },
-            scheduler: Scheduler { scheduler: SchedulerImpl },
             database: Database { database: DatabaseImpl },
             sandbox: Sandbox { sandbox: SandboxImpl },
             identity_provider: IdentityProvider { idp: IdpImpl },
@@ -841,6 +840,7 @@ mod tests {
             );
         }
         assert!(!output.contains("__private :: gang_config"), "{output}");
+        assert!(!output.contains("type Scheduler ="), "{output}");
     }
 
     #[test]
@@ -878,12 +878,18 @@ mod tests {
     }
 
     #[test]
+    fn rejects_scheduler_domain() {
+        let mut input = invocation(&quote! { a: P });
+        input.extend(quote! { scheduler: Scheduler { stub: Stub } });
+        assert!(rejection(input).contains("unknown domain `scheduler`"));
+    }
+
+    #[test]
     fn config_traits_delegate_to_the_selected_plugin() {
         let output = expand(invocation(&quote! { a: P }))
             .expect("the invocation expands")
             .to_string();
         for (config_trait, config, variant) in [
-            ("SchedulerSettings", "SchedulerConfig", "Scheduler"),
             (
                 "AuthenticationSettings",
                 "ClientAuthenticationConfig",
@@ -904,10 +910,6 @@ mod tests {
                 "{config_trait} for {config}: {output}"
             );
         }
-        assert_eq!(
-            output.matches("__gang_delegate_SchedulerSettings").count(),
-            1
-        );
         assert_eq!(
             output
                 .matches("__gang_delegate_AuthenticationSettings")

@@ -3,6 +3,7 @@ load("//bazel/rust:defs.bzl", "workspace_rust_library")
 workspace_rust_library(
     name = "gang_dynamodb",
     dev_deps = ["//crates/gang-testkit:gang_testkit"],
+    test_support = True,
     deps = [
         "//crates/gang-aws-sdk:gang_aws_sdk",
         "//crates/gang-clock:gang_clock",

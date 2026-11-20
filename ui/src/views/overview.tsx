@@ -1,11 +1,10 @@
 // Overview: five readouts, the fleets in preference order, the control pass and recent scaling.
-import type { ComponentChildren } from "preact";
-import { eventKind, idOf, ms } from "../wire-parse.ts";
+import { eventKind, idOf, ms, scalingLog } from "../wire-parse.ts";
 import type { Cause, Fleet, Recent, ScalingEvent, State } from "../wire.ts";
 import { bytesSeries, cacheWindow, donePerMinute, doneSeries, evictedSeries, passBars, queuedSeries, runningSeries, transferred, unrecordedSlots, windowMs } from "../recent.ts";
 import { bytes, humanize, percent, sum } from "../format.ts";
-import { Cell, Clock, Duration, Empty, EVENT_VIEW, EventWhat, Glyph, Ident, Num, Row, Section, Since, Table, useClient, useEnter } from "../ui.tsx";
-import { Legend, Tape } from "./fleet.tsx";
+import { Cell, ChartFrame, Clock, Columns, Duration, Empty, EVENT_VIEW, EventWhat, Glyph, Ident, Num, Row, Section, Since, Table, Tile, Tiles, useClient, useEnter } from "../ui.tsx";
+import { Legend, Tape, type FleetCensus } from "./fleet.tsx";
 
 /** Scaling events the Overview shows, however old. */
 const RECENT_EVENTS = 6;
@@ -88,21 +87,6 @@ const Meter = ({ f, g, label }: { f?: number; g: number; label?: string }) => (
   </div>
 );
 
-const Readout = ({ label, value, meter, caption, chart }: {
-  label: string;
-  value: ComponentChildren;
-  meter?: ComponentChildren;
-  caption?: ComponentChildren;
-  chart?: ComponentChildren;
-}) => (
-  <div class="readout">
-    <h2 class="label">{label}</h2>
-    <p class="readout__big">{value}</p>
-    <div class="readout__meter" aria-hidden={meter == null ? "true" : undefined}>{meter}</div>
-    <p class="readout__sub">{caption}</p>
-    <div class="readout__chart" aria-hidden={chart == null ? "true" : undefined}>{chart}</div>
-  </div>
-);
 
 const Readouts = ({ state }: { state: State }) => {
   const running = sum(state.fleets, (f) => f.demand.running);
@@ -119,8 +103,9 @@ const Readouts = ({ state }: { state: State }) => {
   const traffic = transferred(state.recent);
   const cas = state.cache.stores?.find((store) => store.store === "CAS");
   return (
-    <section class="readouts" aria-label="Farm readouts">
-      <Readout
+    <section aria-label="Farm readouts">
+      <Tiles>
+      <Tile
         label="Queue"
         value={<Num value={queue.total} />}
         caption={
@@ -131,33 +116,34 @@ const Readouts = ({ state }: { state: State }) => {
             {queue.unplaceable > 0 && <span class="caution">{queue.unplaceable} unplaceable</span>}
           </>
         }
-        chart={<Spark values={queuedSeries(state.recent)} label="Queued" recent={state.recent} />}
+        chart={<ChartFrame size="spark"><Spark values={queuedSeries(state.recent)} label="Queued" recent={state.recent} /></ChartFrame>}
       />
-      <Readout
+      <Tile
         label="Executing"
         value={<><Num value={running} /><span class="readout__of">/{slots}</span></>}
         meter={<Meter g={slots ? running / slots : 0} />}
-        chart={<Spark values={runningSeries(state.recent)} label="Executing" recent={state.recent} />}
+        chart={<ChartFrame size="spark"><Spark values={runningSeries(state.recent)} label="Executing" recent={state.recent} /></ChartFrame>}
       />
-      <Readout
+      <Tile
         label="Instances"
         value={<><Num value={inService} /><span class="readout__of">/{max}</span></>}
         meter={<Meter f={max ? inService / max : 0} g={max ? spot / max : 0} label={`${spot} spot, ${inService - spot} on-demand`} />}
         caption={<span class="fern">{spot} spot</span>}
       />
-      <Readout
+      <Tile
         label="Done / min"
         value={done === null ? <span class="num live">–</span> : <Num value={done.perMinute} />}
         caption={done === null ? "not recorded yet" : done.spanMs < 60 * 1000 && <>over <Duration ms={Math.round(done.spanMs / 1000) * 1000} /></>}
-        chart={<Spark values={doneSeries(state.recent)} label="Done per minute" recent={state.recent} />}
+        chart={<ChartFrame size="spark"><Spark values={doneSeries(state.recent)} label="Done per minute" recent={state.recent} /></ChartFrame>}
       />
-      <Readout
+      <Tile
         label="Action cache"
         value={cache.rate === null ? <span class="cache-rate__empty">no lookups</span> : <span class="cache-rate">{Math.round(cache.rate * 100)}%{" "}<span class="cache-rate__of">of {cache.lookups} lookups</span></span>}
         meter={cas && <Meter g={cas.budgetBytes > 0 ? cas.usedBytes / cas.budgetBytes : 0} label={`CAS ${percent(cas.usedBytes, cas.budgetBytes)} of budget`} />}
         caption={<><span>hit rate · <Duration ms={windowMs(state.recent)} /></span><span>{traffic ? `↓ ${bytes(traffic.downloaded)} · ↑ ${bytes(traffic.uploaded)}` : "—"}</span></>}
-        chart={<Spark values={cache.hitsPerStep} areaValues={cache.lookupsPerStep} label="Action-cache lookups as area and hits as line per step" recent={state.recent} />}
+        chart={<ChartFrame size="spark"><Spark values={cache.hitsPerStep} areaValues={cache.lookupsPerStep} label="Action-cache lookups as area and hits as line per step" recent={state.recent} /></ChartFrame>}
       />
+      </Tiles>
     </section>
   );
 };
@@ -186,15 +172,19 @@ const Cache = ({ state }: { state: State }) => {
         </Table>
       )}
       {!stores.length && !bucket && <p>Bucket size not measured yet; S3 reports once a day.</p>}
-      <div class="cache-sparks">
-        <div><h3 class="label">Transferred per step</h3><p class="cache-sparks__legend"><span>↓ Downloaded</span><span>↑ Uploaded</span></p><Spark values={bytesSeries(state.recent, "downloadedBytes")} secondary={bytesSeries(state.recent, "uploadedBytes")} label="Transferred per step" recent={state.recent} /></div>
-        <div><h3 class="label">Evicted per step</h3><Spark values={evictedSeries(state.recent)} label="Evicted per step" recent={state.recent} /></div>
-      </div>
+      <Columns>
+        <ChartFrame size="spark" title="Transferred per step" legend={<p class="cache-sparks__legend"><span>↓ Downloaded</span><span>↑ Uploaded</span></p>}>
+          <Spark values={bytesSeries(state.recent, "downloadedBytes")} secondary={bytesSeries(state.recent, "uploadedBytes")} label="Transferred per step" recent={state.recent} />
+        </ChartFrame>
+        <ChartFrame size="spark" title="Evicted per step">
+          <Spark values={evictedSeries(state.recent)} label="Evicted per step" recent={state.recent} />
+        </ChartFrame>
+      </Columns>
     </Section>
   );
 };
 
-const FleetRow = ({ f, ordinal, events }: { f: Fleet; ordinal: number; events: readonly ScalingEvent[] }) => {
+const FleetRow = ({ f, ordinal, events, census }: { f: Fleet; ordinal: number; events: readonly ScalingEvent[]; census: FleetCensus }) => {
   const capacity = f.properties["capacity"];
   const idle = f.instances.inService === 0 && f.instances.pending === 0;
   const cold =
@@ -221,7 +211,7 @@ const FleetRow = ({ f, ordinal, events }: { f: Fleet; ordinal: number; events: r
         {f.launchFailure && <p class="fleet__failure caution">{f.instances.inService} of {f.desired} · {f.launchFailure.reason}</p>}
       </div>
       <div class="fleet__gauge">
-        <Tape f={f} />
+        <Tape f={f} census={census} />
       </div>
       <dl class="fleet__nums">
         <div>
@@ -290,7 +280,7 @@ export const Overview = () => {
   const client = useClient();
   const state = client.state.value;
   if (!state) return null;
-  const recent = state.events.slice(-RECENT_EVENTS).reverse();
+  const recent = scalingLog(state.events, state.statusEvents ?? []).slice(-RECENT_EVENTS).reverse();
   const idle = state.workers.length === 0 && state.queue.total === 0;
   return (
     <>
@@ -300,23 +290,21 @@ export const Overview = () => {
           <h2>Idle · no workers, nothing queued</h2>
         </Empty>
       )}
-      <Section id="fleets-h" title="Fleets">
-        <div class="legend-row"><Legend /></div>
+      <Section id="fleets-h" title="Fleets" legend={<Legend />}>
         <ol class="fleets">
           {state.fleets.map((f, i) => (
-            <FleetRow key={f.name} f={f} ordinal={i + 1} events={state.events} />
+            <FleetRow key={f.name} f={f} ordinal={i + 1} events={state.events} census={state} />
           ))}
         </ol>
       </Section>
       <Cache state={state} />
-      <div class="cols">
+      <Columns>
         <Section id="pass-h" title="Control pass">
           <PassBar state={state} />
         </Section>
         <Section
           id="recent-h"
           title="Scaling"
-          cls="cols__wide"
           aside={
             <a class="more" href="/ui/activity">
               All
@@ -329,7 +317,7 @@ export const Overview = () => {
             ))}
           </ol>
         </Section>
-      </div>
+      </Columns>
     </>
   );
 };

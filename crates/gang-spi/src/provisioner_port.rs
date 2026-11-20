@@ -7,7 +7,7 @@ use futures::future::BoxFuture;
 use gang_clock::Timestamp;
 use gang_types::{Fleet, InstanceId, InstanceLifecycle, Url, WorkerLifetime};
 
-use crate::{Held, PortError, port};
+use crate::{Held, InfrastructureEvent, PortError, port};
 
 /// The worker fleets, on the compute backend that runs the instances.
 ///
@@ -19,6 +19,19 @@ pub trait ProvisionerPort: Send + Sync {
     /// The typed `[fleets.options]` table of the provisioner. `compose!` requires the types of
     /// the composed provisioners to implement [`FleetOptions`](crate::FleetOptions).
     type FleetOptions: std::fmt::Debug + Send + Sync + 'static;
+
+    /// Clears the configured fleet set before registering all fleets for a refresh.
+    fn reset_configured_fleets(&self) {}
+
+    /// Registers a configured fleet before any fleet is converged.
+    ///
+    /// # Errors
+    ///
+    /// [`PortError`] when the fleet cannot be configured.
+    fn configure_fleet(&self, fleet: Fleet<'_, Self::FleetOptions>) -> Result<(), PortError> {
+        let _ = fleet;
+        Ok(())
+    }
 
     /// Overwrites `into` with the fleet's current size, instances, and observed early exits. It
     /// only reads: it never changes the fleet or the backend. Its buffers are reused so callers
@@ -53,6 +66,22 @@ pub trait ProvisionerPort: Send + Sync {
         instance: &InstanceId,
     ) -> Result<(), PortError> {
         let _ = (fleet, instance);
+        held.check()?;
+        Ok(())
+    }
+
+    /// Acknowledges an infrastructure observation after it has been durably recorded.
+    ///
+    /// # Errors
+    ///
+    /// [`PortError`] when the permission has expired or the observation cannot be acknowledged.
+    async fn acknowledge_event(
+        &self,
+        held: &Held,
+        fleet: Fleet<'_, Self::FleetOptions>,
+        event_id: &str,
+    ) -> Result<(), PortError> {
+        let _ = (fleet, event_id);
         held.check()?;
         Ok(())
     }
@@ -137,6 +166,8 @@ pub struct FleetSupply {
     /// when an instance exits and is not replaced (a finished pod or job); an autoscaling
     /// group keeps its stored value.
     pub desired: u32,
+    /// The actual request, when different from the planner's capacity; `None` means `desired`.
+    pub requested: Option<u32>,
     /// Instances still requested from the backend but excluded from `desired` because the
     /// provisioner gave up launching them (for example, a down Spot group's unmet request).
     /// A `set_desired_capacity` call at the current `desired` withdraws them; zero if requests
@@ -149,6 +180,8 @@ pub struct FleetSupply {
     /// The instances whose worker failed soon after launch and whose exits have not yet been
     /// acknowledged; empty for a provisioner that cannot tell.
     pub exits: Vec<InstanceExit>,
+    /// Provider infrastructure observations awaiting acknowledgement or still in history.
+    pub events: Vec<InfrastructureEvent>,
     /// Why the provisioner cannot launch the instances `desired` asks for beyond those that
     /// exist: the newest launch attempt for the fleet failed and no launch is in flight.
     /// `None` while the request is met, while a launch is in flight, or when the provisioner

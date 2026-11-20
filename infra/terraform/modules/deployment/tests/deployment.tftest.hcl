@@ -1,4 +1,8 @@
 mock_provider "aws" {
+  mock_data "aws_network_interface" {
+    defaults = { private_ips = ["10.20.1.10"] }
+  }
+
   mock_data "aws_partition" {
     defaults = {
       partition = "aws"
@@ -8,6 +12,12 @@ mock_provider "aws" {
   mock_data "aws_region" {
     defaults = {
       region = "eu-north-1"
+    }
+  }
+
+  mock_data "aws_caller_identity" {
+    defaults = {
+      account_id = "000000000000"
     }
   }
 
@@ -66,8 +76,9 @@ mock_provider "aws" {
 
   mock_resource "aws_lb" {
     defaults = {
-      arn      = "arn:aws:elasticloadbalancing:eu-north-1:000000000000:loadbalancer/net/gang/0000000000000000"
-      dns_name = "gang-0000000000.elb.eu-north-1.amazonaws.com"
+      arn        = "arn:aws:elasticloadbalancing:eu-north-1:000000000000:loadbalancer/net/gang/0000000000000000"
+      arn_suffix = "net/gang/0000000000000000"
+      dns_name   = "gang-0000000000.elb.eu-north-1.amazonaws.com"
     }
   }
 
@@ -106,6 +117,38 @@ override_data {
     boot_mode        = "uefi"
     tags             = { "ec2:SharedTag/ImageSha256" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
     deprecation_time = ""
+  }
+}
+
+override_resource {
+  target = aws_sqs_queue.events
+  values = {
+    arn = "arn:aws:sqs:eu-north-1:000000000000:gang-events"
+    url = "https://sqs.eu-north-1.amazonaws.com/000000000000/gang-events"
+    id  = "https://sqs.eu-north-1.amazonaws.com/000000000000/gang-events"
+  }
+}
+
+override_resource {
+  target = aws_sqs_queue.events_dlq
+  values = {
+    arn = "arn:aws:sqs:eu-north-1:000000000000:gang-events-dlq"
+    url = "https://sqs.eu-north-1.amazonaws.com/000000000000/gang-events-dlq"
+    id  = "https://sqs.eu-north-1.amazonaws.com/000000000000/gang-events-dlq"
+  }
+}
+
+override_resource {
+  target = aws_cloudwatch_event_rule.spot
+  values = {
+    arn = "arn:aws:events:eu-north-1:000000000000:rule/gang-spot-events"
+  }
+}
+
+override_resource {
+  target = aws_cloudwatch_event_rule.fleet
+  values = {
+    arn = "arn:aws:events:eu-north-1:000000000000:rule/gang-fleet-events"
   }
 }
 
@@ -200,6 +243,15 @@ run "direct_endpoint_without_load_balancer" {
     condition     = !strcontains(output.gang_toml, "health_listen")
     error_message = "The direct endpoint must not enable the load balancer health listener."
   }
+  assert {
+    condition     = !strcontains(output.gang_toml, "standby_routability_delay") && !strcontains(output.gang_toml, "[server.leadership]")
+    error_message = "A direct SQLite deployment must use the default zero standby delay."
+  }
+
+  assert {
+    condition     = !strcontains(output.gang_toml, "[server.proxy_protocol]")
+    error_message = "SQLite direct deployments must not enable PROXY."
+  }
 }
 
 run "load_balancer_fronts_the_public_listener" {
@@ -230,6 +282,24 @@ run "load_balancer_fronts_the_public_listener" {
     condition     = strcontains(output.gang_toml, "health_listen = \"0.0.0.0:${module.network.health_port}\"") && module.load_balancer[0].health_port == module.network.health_port
     error_message = "The network health port must reach the server listener and load balancer."
   }
+  assert {
+    condition     = !strcontains(output.gang_toml, "standby_routability_delay") && !strcontains(output.gang_toml, "[server.leadership]")
+    error_message = "A load-balanced SQLite deployment must use the default zero standby delay."
+  }
+
+  assert {
+    condition     = !strcontains(output.gang_toml, "[server.proxy_protocol]")
+    error_message = "SQLite load-balanced deployments must not enable PROXY."
+  }
+}
+
+run "rejects_invalid_proxy_stage" {
+  command = plan
+  variables {
+    hostname      = "gang.example.com"
+    load_balancer = { proxy_protocol_stage = "invalid" }
+  }
+  expect_failures = [var.load_balancer]
 }
 
 run "load_balancer_requires_hostname" {
@@ -473,8 +543,8 @@ run "pins_ca_to_signer_and_wires_endpoints" {
   }
 
   assert {
-    condition     = can(regex("(?m)^endpoint = \"${output.endpoint}\"$", output.gang_toml)) && can(regex("(?s)\\[scheduler\\.nativelink\\][^\\[]*worker_endpoint = \"${output.worker_endpoint}\"", output.gang_toml))
-    error_message = "gang.toml must carry the public endpoint at the top level and the worker endpoint in [scheduler.nativelink]."
+    condition     = can(regex("(?s)\\A[^\\[]*\\nendpoint = \"${output.endpoint}\"", output.gang_toml)) && can(regex("(?s)\\A[^\\[]*\\nworker_endpoint = \"${output.worker_endpoint}\"", output.gang_toml))
+    error_message = "gang.toml must carry the public and worker endpoints at the top level."
   }
 
   assert {
@@ -592,13 +662,13 @@ run "publishes_config_parameter" {
   command = apply
 
   assert {
-    condition     = aws_ssm_parameter.config.name == "/gang/gang.toml" && output.config_parameter_name == "/gang/gang.toml"
-    error_message = "The config parameter must default to /<name>/gang.toml."
+    condition     = aws_ssm_parameter.config.name == "/gang/gang.toml" && output.legacy_config_parameter_name == "/gang/gang.toml" && output.config_parameter_name == aws_ssm_parameter.config_generation.name
+    error_message = "The legacy config parameter must default to /<name>/gang.toml and the active output must name its generation."
   }
 
   assert {
-    condition     = aws_ssm_parameter.config.value == output.gang_toml
-    error_message = "The config parameter value must equal the rendered gang.toml."
+    condition     = aws_ssm_parameter.config_generation.value == output.gang_toml
+    error_message = "The active generation value must equal the rendered gang.toml."
   }
 
   assert {
@@ -678,6 +748,7 @@ run "fallback_fleet_gets_an_on_demand_twin" {
   command = apply
 
   variables {
+    aws_events_enabled = true
     fleets = [
       {
         name                        = "gang-worker-x86-64"
@@ -709,6 +780,41 @@ run "fallback_fleet_gets_an_on_demand_twin" {
   assert {
     condition     = output.asg_names == ["gang-worker-x86-64", "gang-worker-x86-64-on-demand", "gang-worker-aarch64"]
     error_message = "A fallback fleet's on-demand twin must follow its spot group in asg_names, which the controller receives as its worker fleet names."
+  }
+
+  assert {
+    condition     = toset(jsondecode(aws_cloudwatch_event_rule.fleet[0].event_pattern).detail.AutoScalingGroupName) == toset(output.asg_names)
+    error_message = "The fleet rule must include exactly the managed primary and fallback ASGs."
+  }
+
+  assert {
+    condition     = aws_sqs_queue.events[0].sqs_managed_sse_enabled && aws_sqs_queue.events_dlq[0].sqs_managed_sse_enabled && aws_sqs_queue.events[0].message_retention_seconds == 86400 && aws_sqs_queue.events_dlq[0].message_retention_seconds == 345600 && jsondecode(aws_sqs_queue.events[0].redrive_policy).deadLetterTargetArn == aws_sqs_queue.events_dlq[0].arn && jsondecode(aws_sqs_queue.events[0].redrive_policy).maxReceiveCount == 5
+    error_message = "Event queues must use SQS-managed encryption, bounded retention and a five-receive dead-letter policy."
+  }
+
+  assert {
+    condition     = toset(jsondecode(aws_cloudwatch_event_rule.spot[0].event_pattern).source) == toset(["aws.ec2"]) && toset(jsondecode(aws_cloudwatch_event_rule.spot[0].event_pattern)["detail-type"]) == toset(["EC2 Instance Rebalance Recommendation", "EC2 Spot Instance Interruption Warning"]) && toset(jsondecode(aws_cloudwatch_event_rule.spot[0].event_pattern).account) == toset(["000000000000"]) && toset(jsondecode(aws_cloudwatch_event_rule.spot[0].event_pattern).region) == toset(["eu-north-1"])
+    error_message = "The spot rule must select only the two account and region scoped EC2 notices."
+  }
+
+  assert {
+    condition     = toset(jsondecode(aws_cloudwatch_event_rule.fleet[0].event_pattern).source) == toset(["aws.autoscaling"]) && toset(jsondecode(aws_cloudwatch_event_rule.fleet[0].event_pattern)["detail-type"]) == toset(["EC2 Instance Launch Successful", "EC2 Instance Launch Unsuccessful", "EC2 Instance Terminate Successful"]) && toset(jsondecode(aws_cloudwatch_event_rule.fleet[0].event_pattern).account) == toset(["000000000000"]) && toset(jsondecode(aws_cloudwatch_event_rule.fleet[0].event_pattern).region) == toset(["eu-north-1"])
+    error_message = "The fleet rule must select only the specified account and region scoped ASG events."
+  }
+
+  assert {
+    condition     = jsondecode(aws_sqs_queue_policy.events[0].policy).Statement[0].Principal.Service == "events.amazonaws.com" && jsondecode(aws_sqs_queue_policy.events[0].policy).Statement[0].Action == "sqs:SendMessage" && toset(jsondecode(aws_sqs_queue_policy.events[0].policy).Statement[0].Condition.ArnEquals["aws:SourceArn"]) == toset([aws_cloudwatch_event_rule.spot[0].arn, aws_cloudwatch_event_rule.fleet[0].arn]) && jsondecode(aws_sqs_queue_policy.events[0].policy).Statement[0].Condition.StringEquals["aws:SourceAccount"] == "000000000000"
+    error_message = "Only the two deployment rules in this account may send events to the queue."
+  }
+
+  assert {
+    condition     = jsondecode(aws_sqs_queue_policy.events[0].policy).Statement[1].Effect == "Deny" && jsondecode(aws_sqs_queue_policy.events[0].policy).Statement[1].Condition.Bool["aws:SecureTransport"] == "false" && jsondecode(aws_sqs_queue_policy.events_dlq[0].policy).Statement[0].Effect == "Deny" && jsondecode(aws_sqs_queue_policy.events_dlq[0].policy).Statement[0].Condition.Bool["aws:SecureTransport"] == "false"
+    error_message = "Both queues must reject insecure transport."
+  }
+
+  assert {
+    condition     = aws_cloudwatch_event_target.spot[0].arn == aws_sqs_queue.events[0].arn && aws_cloudwatch_event_target.fleet[0].arn == aws_sqs_queue.events[0].arn && strcontains(output.gang_toml, "events_queue_url = \"${output.events_queue_url}\"")
+    error_message = "Both rules must target the queue and the shared configuration must expose its URL."
   }
 
   assert {
@@ -1481,4 +1587,139 @@ run "images_invalid_owner_rejected" {
   }
 
   expect_failures = [var.images]
+}
+
+run "aws_events_disabled_by_default" {
+  command = apply
+
+  assert {
+    condition     = length(aws_sqs_queue.events) == 0 && length(aws_sqs_queue.events_dlq) == 0 && length(aws_cloudwatch_event_rule.spot) == 0 && length(aws_cloudwatch_event_rule.fleet) == 0 && output.events_queue_url == null && output.events_dead_letter_queue_url == null && !strcontains(output.gang_toml, "events_queue_url")
+    error_message = "AWS event resources and configuration must be absent until explicitly enabled after upgrading images."
+  }
+}
+
+run "aws_events_custom_retention_and_redrive" {
+  command = apply
+
+  variables {
+    aws_events_enabled                       = true
+    aws_events_retention_seconds             = 7200
+    aws_events_dead_letter_retention_seconds = 172800
+    aws_events_max_receive_count             = 9
+  }
+
+  assert {
+    condition     = aws_sqs_queue.events[0].message_retention_seconds == 7200 && aws_sqs_queue.events_dlq[0].message_retention_seconds == 172800 && jsondecode(aws_sqs_queue.events[0].redrive_policy).maxReceiveCount == 9
+    error_message = "Configured retention and receive limits must reach the queues."
+  }
+}
+
+run "aws_events_rejects_short_retention" {
+  command = plan
+
+  variables {
+    aws_events_retention_seconds = 59
+  }
+
+  expect_failures = [var.aws_events_retention_seconds]
+}
+
+run "aws_events_rejects_excessive_dead_letter_retention" {
+  command = plan
+
+  variables {
+    aws_events_dead_letter_retention_seconds = 1209601
+  }
+
+  expect_failures = [var.aws_events_dead_letter_retention_seconds]
+}
+
+run "aws_events_rejects_shorter_dead_letter_retention" {
+  command = plan
+
+  variables {
+    aws_events_retention_seconds             = 86400
+    aws_events_dead_letter_retention_seconds = 3600
+  }
+
+  expect_failures = [var.aws_events_dead_letter_retention_seconds]
+}
+
+run "aws_events_rejects_invalid_receive_count" {
+  command = plan
+
+  variables {
+    aws_events_max_receive_count = 1001
+  }
+
+  expect_failures = [var.aws_events_max_receive_count]
+}
+
+run "aws_events_rejects_fractional_retention" {
+  command = plan
+
+  variables {
+    aws_events_retention_seconds = 60.5
+  }
+
+  expect_failures = [var.aws_events_retention_seconds]
+}
+
+run "aws_events_rejects_fractional_dead_letter_retention" {
+  command = plan
+
+  variables {
+    aws_events_dead_letter_retention_seconds = 86400.5
+  }
+
+  expect_failures = [var.aws_events_dead_letter_retention_seconds]
+}
+
+run "aws_events_rejects_fractional_receive_count" {
+  command = plan
+
+  variables {
+    aws_events_max_receive_count = 1.5
+  }
+
+  expect_failures = [var.aws_events_max_receive_count]
+}
+
+run "rejects_config_name_with_empty_segment" {
+  command = plan
+  variables { config_parameter_name = "/gang//config" }
+  expect_failures = [var.config_parameter_name]
+}
+
+run "rejects_reserved_config_name" {
+  command = plan
+  variables { config_parameter_name = "/SSM/config" }
+  expect_failures = [var.config_parameter_name]
+}
+
+run "rejects_config_name_too_deep" {
+  command = plan
+  variables { config_parameter_name = "/a/a/a/a/a/a/a/a/a/a/a/a/a/a" }
+  expect_failures = [var.config_parameter_name]
+}
+
+run "rejects_legacy_secret_overlap" {
+  command = plan
+  variables { controller_secret_parameters = { token = "/gang/gang.toml" } }
+  expect_failures = [terraform_data.input_checks]
+}
+
+run "rejects_generation_secret_overlap" {
+  command = plan
+  variables { controller_secret_parameters = { token = "/gang/gang.toml/generations/secret" } }
+  expect_failures = [terraform_data.input_checks]
+}
+
+run "accepts_unrelated_secret" {
+  command = plan
+  variables { controller_secret_parameters = { token = "/gang/secrets/token" } }
+  assert {
+    condition     = contains(module.controller.secret_parameter_arns, "arn:aws:ssm:eu-north-1:000000000000:parameter/gang/secrets/token")
+    error_message = "An unrelated controller secret remains accessible to the controller."
+  }
 }

@@ -14,7 +14,7 @@ use gang_spi::PluginContext;
 use gang_types::announcement::{
     CA_PIN, ListenerRole, PLAINTEXT, last_ca_pin, last_listening, last_plaintext,
 };
-use gang_types::{CaPin, SchedulerSettings, Url};
+use gang_types::{CaPin, Url};
 
 use crate::cli::LocalUpArgs;
 use crate::config_file::LoadedConfig;
@@ -349,9 +349,7 @@ fn check_security(insecure: bool, config: &GangConfig<Plugins>) -> Result<(), Lo
             config.listen,
             config.worker_listen,
             config.endpoint.as_ref(),
-            &config.scheduler,
-            config.execution_listen,
-            config.execution_endpoint.as_ref(),
+            config.worker_endpoint.as_ref(),
         );
     }
     match config.server.transport.kind() {
@@ -373,7 +371,7 @@ pub(crate) fn run(args: LocalUpArgs, out: &Output) -> errors::Result<ExitCode> {
         &loaded.path,
         &Endpoints {
             public: loaded.config.endpoint.as_ref(),
-            worker: loaded.config.scheduler.worker_endpoint(),
+            worker: loaded.config.worker_endpoint.as_ref(),
         },
         document,
     )?;
@@ -1412,28 +1410,6 @@ mod tests {
     }
 
     #[test]
-    fn insecure_refuses_a_public_execution_listener() -> gang_testkit::TestResult {
-        let mut config = plaintext_configuration();
-        config.execution_listen = Some("0.0.0.0:8443".parse()?);
-        assert!(matches!(
-            check_security(true, &config),
-            Err(LocalCommandError::InsecureNeedsLoopback { what, .. }) if what == "execution_listen"
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn insecure_refuses_a_public_execution_endpoint() -> gang_testkit::TestResult {
-        let mut config = plaintext_configuration();
-        config.execution_endpoint = Some("https://example.com:8443".parse()?);
-        assert!(matches!(
-            check_security(true, &config),
-            Err(LocalCommandError::InsecureNeedsLoopback { what, .. }) if what == "execution_endpoint"
-        ));
-        Ok(())
-    }
-
-    #[test]
     fn tls_configuration_without_insecure_is_accepted() {
         let config = VALID_LOCAL_CONFIG
             .parse::<GangConfig<Plugins>>()
@@ -1517,7 +1493,7 @@ mod tests {
             public.as_ref().map(Url::as_str),
             Some("http://127.0.0.1:443/")
         );
-        assert_eq!(worker.as_ref(), config.scheduler.worker_endpoint());
+        assert_eq!(worker.as_ref(), config.worker_endpoint.as_ref());
         assert_eq!(
             worker.as_ref().map(Url::as_str),
             Some("grpc://127.0.0.1:9444/")

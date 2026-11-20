@@ -2,11 +2,11 @@
 import { Fragment, type ComponentChildren } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { idOf, seconds } from "../wire-parse.ts";
-import type { Fleet } from "../wire.ts";
+import type { Fleet, Instance, State, Worker } from "../wire.ts";
 import { gib } from "../format.ts";
 import { Disclosure, Duration, Ident } from "../ui.tsx";
 
-export type CellState = "busy" | "idle" | "draining" | "unconnected" | "pending" | "terminating" | "warm" | "empty";
+export type CellState = "busy" | "idle" | "draining" | "unconnected" | "pending" | "terminating" | "replacing" | "replacement" | "unknown" | "warm" | "empty";
 
 export const STATE_NAME: Record<Counted, string> = {
   busy: "busy",
@@ -15,6 +15,9 @@ export const STATE_NAME: Record<Counted, string> = {
   unconnected: "no worker",
   pending: "pending",
   terminating: "terminating",
+  replacing: "replacing",
+  replacement: "replacement",
+  unknown: "unknown",
   warm: "warm",
 };
 
@@ -23,30 +26,66 @@ export type Counted = Exclude<CellState, "empty">;
 
 export type Counts = readonly (readonly [Counted, number])[];
 
-/** Busy, idle, draining, no worker, pending, terminating, then warm spares: every state a fleet counts. */
-export const fleetCounts = (f: Fleet): Counts => [
-  ["busy", f.workers.busy],
-  ["idle", f.workers.idle],
-  ["draining", f.workers.draining],
-  ["unconnected", f.workers.unconnected],
-  ["pending", f.instances.pending],
-  ["terminating", f.instances.terminating],
-  ["warm", f.instances.warm],
-];
+export type FleetCensus = Pick<State, "workers" | "instances">;
 
-/** The states of `fleetCounts` that fill a tape cell; warm spares sit beside the tape. */
-const tapeCounts = (f: Fleet): Counts => fleetCounts(f).filter(([state]) => state !== "warm");
+/** Unhosted physical instances in this fleet, once per resource name. */
+export const unhostedInstances = (f: Fleet, census: FleetCensus): Instance[] => {
+  const hosted = new Set(census.workers.filter((w) => w.fleet === f.name && w.instance).map((w) => w.instance));
+  const seen = new Set<string>();
+  return census.instances.filter((instance) => {
+    if (instance.fleet !== f.name || (instance.name && (hosted.has(instance.name) || seen.has(instance.name)))) return false;
+    if (instance.name) seen.add(instance.name);
+    return true;
+  });
+};
+
+/** Count physical identities, not overlapping worker generations or provider lifecycles. */
+export const fleetCounts = (f: Fleet, census: FleetCensus): Counts => {
+  const counts: Record<Counted, number> = {
+    busy: 0, idle: 0, draining: 0, unconnected: 0, pending: 0, terminating: 0,
+    replacing: 0, replacement: 0, unknown: 0, warm: f.instances.warm,
+  };
+  const groups = new Map<string, Worker[]>();
+  for (const worker of census.workers) {
+    if (worker.fleet !== f.name) continue;
+    const key = worker.instance ? `instance:${worker.instance}` : `worker:${worker.name}`;
+    const group = groups.get(key);
+    if (group) group.push(worker);
+    else groups.set(key, [worker]);
+  }
+  for (const group of groups.values()) {
+    const phases = group.map((w) => w.infrastructure?.phase);
+    const state: Counted = phases.includes("REPLACING") ? "replacing"
+      : phases.includes("REPLACEMENT") ? "replacement"
+      : group.every((w) => w.phase === "DRAINING") ? "draining"
+      : group.some((w) => w.running > 0 || w.phase === "BUSY") ? "busy"
+      : group.some((w) => w.phase === "IDLE") ? "idle" : "unknown";
+    counts[state]++;
+  }
+  for (const instance of unhostedInstances(f, census)) {
+    const state: Counted = instance.infrastructure?.phase === "REPLACING" ? "replacing"
+      : instance.infrastructure?.phase === "REPLACEMENT" ? "replacement"
+      : instance.lifecycle === "PENDING" ? "pending"
+      : instance.lifecycle === "IN_SERVICE" ? "unconnected"
+      : instance.lifecycle === "TERMINATING" ? "terminating" : "unknown";
+    counts[state]++;
+  }
+  return Object.entries(counts) as [Counted, number][];
+};
+
+/** Warm spares sit beside the tape. */
+const tapeCounts = (f: Fleet, census: FleetCensus): Counts => fleetCounts(f, census).filter(([state]) => state !== "warm");
 
 /** The counts of several fleets added up, state by state. */
-export const fleetTotals = (fleets: readonly Fleet[]): Counts => {
+export const fleetTotals = (fleets: readonly Fleet[], census: FleetCensus): Counts => {
   const totals = new Map<Counted, number>();
-  for (const [state, n] of fleets.flatMap(fleetCounts)) totals.set(state, (totals.get(state) ?? 0) + n);
+  for (const f of fleets) for (const [state, n] of fleetCounts(f, census)) totals.set(state, (totals.get(state) ?? 0) + n);
   return [...totals];
 };
 
 /** The tape's cells: its states in order, then empty slots up to max. */
-export const cellStates = (f: Fleet): readonly CellState[] => {
-  const cells = tapeCounts(f).flatMap(([state, n]) => Array<CellState>(n).fill(state));
+export const cellStates = (f: Fleet, census: FleetCensus): readonly CellState[] => {
+  const cells = tapeCounts(f, census).flatMap(([state, n]) => Array<CellState>(n).fill(state));
   return cells.length < f.policy.max ? [...cells, ...Array<CellState>(f.policy.max - cells.length).fill("empty")] : cells;
 };
 
@@ -83,8 +122,8 @@ export const StaticCell = ({ state }: { state: CellState }) => (
   </span>
 );
 
-const stripLabel = (f: Fleet): string => {
-  const counts = tapeCounts(f).map(([state, n]) => `${n} ${STATE_NAME[state]}`);
+const stripLabel = (f: Fleet, census: FleetCensus): string => {
+  const counts = tapeCounts(f, census).map(([state, n]) => `${n} ${STATE_NAME[state]}`);
   return `${idOf(f.name)}: ${counts.join(", ")}, of ${f.policy.max} maximum. Desired ${f.desired}, minimum ${f.policy.min}.`;
 };
 
@@ -102,7 +141,7 @@ export const Tally = ({ items }: { items: Counts }) => (
   </span>
 );
 
-export const TapeKey = ({ f }: { f: Fleet }) => {
+export const TapeKey = ({ f, census }: { f: Fleet; census: FleetCensus }) => {
   const size = f.instanceSize ? [`${f.instanceSize.vcpus} vCPU`, gib(f.instanceSize.memory)] : [];
   const machine = [f.isa, f.sandbox, f.properties["machine_class"], ...size];
   const rows: [string, ComponentChildren][] = [
@@ -118,7 +157,7 @@ export const TapeKey = ({ f }: { f: Fleet }) => {
   if (f.demand.expectedWait !== undefined) rows.push(["expected wait", <Duration ms={seconds(f.demand.expectedWait) * 1000} />]);
   return (
     <>
-      <Tally items={fleetCounts(f)} />
+      <Tally items={fleetCounts(f, census)} />
       <dl class="kv kv--tight">
         {rows.map(([k, v]) => (
           <Fragment key={k}>
@@ -132,8 +171,8 @@ export const TapeKey = ({ f }: { f: Fleet }) => {
 };
 
 /** The tape is a button: a tap or Enter opens the fleet's details, so nothing depends on hover. */
-export const Tape = ({ f }: { f: Fleet }) => {
-  const cells = cellStates(f);
+export const Tape = ({ f, census }: { f: Fleet; census: FleetCensus }) => {
+  const cells = cellStates(f, census);
   return (
     <Disclosure
       id={`tk-${idOf(f.name)}`}
@@ -141,7 +180,7 @@ export const Tape = ({ f }: { f: Fleet }) => {
       panelCls="tape__key"
       summary={
         <>
-          <span class="visually-hidden">{stripLabel(f)}</span>
+          <span class="visually-hidden">{stripLabel(f, census)}</span>
           <span
             class="strip"
             aria-hidden="true"
@@ -164,7 +203,7 @@ export const Tape = ({ f }: { f: Fleet }) => {
         </>
       }
     >
-      <TapeKey f={f} />
+      <TapeKey f={f} census={census} />
     </Disclosure>
   );
 };

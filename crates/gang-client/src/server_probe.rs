@@ -145,7 +145,11 @@ impl ClientProbe {
         let mut command = Command::new(helper);
         command.arg("get");
         let request = serde_json::json!({ "uri": uri.as_str() }).to_string();
-        let timeout = self.options.http_timeout.get();
+        let timeout = self
+            .options
+            .http_timeout
+            .get()
+            .saturating_add(self.options.api_retry_budget.get());
         let output = self
             .clock
             .timeout(
@@ -772,8 +776,14 @@ mod tests {
         })
         .await;
         assert!(pending);
-        clock.advance(options.http_timeout.get());
-        assert_eq!(future.await, Err(CredentialFault::TimedOut { seconds: 1 }));
+        let timeout = options.http_timeout.get() + options.api_retry_budget.get();
+        clock.advance(timeout);
+        assert_eq!(
+            future.await,
+            Err(CredentialFault::TimedOut {
+                seconds: timeout.as_secs()
+            })
+        );
     }
 
     #[tokio::test]

@@ -76,12 +76,13 @@ data "aws_ec2_instance_type" "this" {
 }
 
 resource "aws_launch_template" "this" {
-  for_each = local.fleets
+  depends_on = [module.instance_role]
+  for_each   = local.fleets
 
   name_prefix = "${var.name_prefix}-${each.key}-"
   image_id    = each.value.ami_id
   # Line 1 is "<role> <parameter>" (infra/nixos/gang-config.nix): the role this instance runs and the SSM parameter of gang.toml.
-  user_data = base64encode("worker ${var.config_parameter_name}")
+  user_data = base64encode("worker ${var.config_parameter_reference}")
   tags      = merge(var.tags, { Name = each.value.name })
 
   update_default_version = true

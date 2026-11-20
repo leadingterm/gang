@@ -27,7 +27,7 @@ use crate::drain_cancel::drain_cancel;
 use crate::errors::Result;
 use crate::execution::ExecutionKnobs;
 use crate::fhs_tools::fhs_tools;
-use crate::fleets::fleets;
+use crate::fleets::{run_cold_pair, run_drained_starts};
 use crate::glibc_toolchain::glibc_toolchain;
 use crate::input_root::input_root;
 use crate::integrity::input_integrity;
@@ -232,6 +232,12 @@ gang_types::string_enum! {
         ControllerLoss = "controller-loss",
         /// Controllers are replaced while a build is in progress.
         RollingDeploy = "rolling-deploy",
+        /// A previous release is replaced by the candidate while work is held.
+        RollingUpgrade = "rolling-upgrade",
+        /// Published old controllers and workers refetch preserved configuration after publication.
+        ConfigRefetchRestart = "config-refetch-restart",
+        /// A known historical upgrade regression must be detected.
+        UpgradeNegativeControl = "upgrade-negative-control",
         /// Revocations propagate between controllers.
         CrossRevocation = "cross-revocation",
         /// Queued demand survives loss or suspension of the leader.
@@ -243,9 +249,12 @@ gang_types::string_enum! {
         /// Two authenticated builds, cold then warm, are attributed separately with their cache
         /// and execution usage and timestamps visible to the administrator. Gate two only.
         Builds = "builds",
-        /// Followers alone serve the public frontend of three controllers; their cache lookups
-        /// reach the leader's build view cold, warm and after a leader change. Gate two only.
+        /// Followers serve shared requests, refuse leader-only requests, and builds use the leader.
         FollowerBuilds = "follower-builds",
+        /// A kernel action-pool OOM is classified and requeued without a generic retry.
+        PoolOom = "pool-oom",
+        /// Sustained pool pressure kills and requeues only the furthest-over-reservation action.
+        Pressure = "pressure",
         /// A fleet with `min_instances = 0` keeps one worker with no build while a scheduled
         /// minimum is in force, and the scale-out carries cause `MINIMUM`. Gate two only.
         ScheduledMinimum = "scheduled-minimum",
@@ -259,48 +268,54 @@ gang_types::string_enum! {
 }
 
 impl Scenario {
-    /// Estimated seconds for balancing shards, rounded up from CI scenario timings; where CI
-    /// failed, and for gate one, timings are from a four-CPU run. Follower builds uses a
-    /// provisional estimate combining builds and rolling deploy.
+    /// Seconds for LPT balancing, rounded up (minimum one) from warm x86 CI timings.
+    /// Provisional estimates after fixture changes: sessions 60s (was 181.1s), fleets 75s
+    /// (169.4s), leader failover 75s (120.4s), and database outage 100s (164.5s).
     #[must_use]
     pub const fn weight(self) -> u64 {
         match self {
-            Self::Lifecycle => 44,
-            Self::Network => 19,
-            Self::InputIntegrity => 36,
-            Self::Restart => 51,
-            Self::Limits | Self::SandboxContract => 18,
-            Self::Memory | Self::UnplaceableDisk => 16,
-            Self::Disk => 46,
-            Self::Fleets => 109,
-            Self::ActionTimeout => 37,
-            Self::ActionTimeoutNoop | Self::WorkerRenewal => 38,
-            Self::InputRoot | Self::GlibcToolchain | Self::FhsTools => 15,
-            Self::StaleScope => 50,
-            Self::MemoryEscalation | Self::OversizedFleet => 17,
+            Self::Lifecycle | Self::StaleScope => 56,
+            Self::Network | Self::Restart => 24,
+            Self::InputIntegrity => 33,
+            Self::Limits => 28,
+            Self::SandboxContract | Self::QueuedBehindShortWork => 32,
+            Self::Memory | Self::Revocation | Self::Builds => 23,
+            Self::UnplaceableDisk | Self::InputRoot => 27,
+            Self::Disk => 57,
+            Self::Fleets | Self::LeaderFailover => 75,
+            Self::ActionTimeout => 49,
+            Self::ActionTimeoutNoop => 43,
+            Self::WorkerRenewal | Self::LaunchFailure => 34,
+            Self::GlibcToolchain => 26,
+            Self::FhsTools => 20,
+            Self::MemoryEscalation => 13,
+            Self::OversizedFleet => 12,
+            Self::Pressure | Self::PoolOom => 16,
             Self::ColdStartMisfit | Self::CheckedInConfigs | Self::Api => 1,
             Self::Preemption => 52,
-            Self::Orphan => 27,
-            Self::DrainCancel => 47,
-            Self::SkippedPass => 6,
-            Self::Cli => 2,
-            Self::Plaintext => 32,
-            Self::Setup => 92,
-            Self::Revocation => 20,
-            Self::Dashboard | Self::CrossRevocation => 14,
-            Self::LaunchFailure => 30,
-            Self::RequestLimits | Self::Builds => 9,
-            Self::ViewerCap => 3,
-            Self::CertificateRotation => 12,
-            Self::Identity => 78,
-            Self::Sessions => 184,
-            Self::ControllerLoss => 62,
-            Self::RollingDeploy => 25,
-            Self::FollowerBuilds => 34,
-            Self::LeaderFailover => 120,
-            Self::LoginAcross | Self::ScheduledMinimum => 4,
-            Self::BurstFromZero | Self::QueuedBehindShortWork | Self::BacklogGrowsFleet => 60,
-            Self::DatabaseOutage => 161,
+            Self::Orphan => 29,
+            Self::DrainCancel => 126,
+            Self::SkippedPass | Self::RequestLimits => 6,
+            Self::Cli => 3,
+            Self::Plaintext => 54,
+            Self::Setup => 88,
+            Self::Dashboard => 18,
+            Self::CrossRevocation => 22,
+            Self::ViewerCap => 2,
+            Self::CertificateRotation => 14,
+            Self::Identity => 80,
+            Self::Sessions => 60,
+            Self::ControllerLoss => 84,
+            Self::RollingDeploy
+            | Self::BurstFromZero
+            | Self::RollingUpgrade
+            | Self::UpgradeNegativeControl => 62,
+            Self::FollowerBuilds => 66,
+            Self::LoginAcross => 15,
+            Self::ScheduledMinimum => 5,
+            Self::BacklogGrowsFleet => 10,
+            Self::DatabaseOutage => 100,
+            Self::ConfigRefetchRestart => 120,
         }
     }
 
@@ -353,10 +368,15 @@ impl Scenario {
             | Self::BacklogGrowsFleet
             | Self::ControllerLoss
             | Self::RollingDeploy
+            | Self::RollingUpgrade
+            | Self::ConfigRefetchRestart
+            | Self::UpgradeNegativeControl
             | Self::CrossRevocation
             | Self::LeaderFailover
             | Self::LoginAcross
-            | Self::DatabaseOutage => Gate::Two,
+            | Self::DatabaseOutage
+            | Self::Pressure
+            | Self::PoolOom => Gate::Two,
         }
     }
 }
@@ -430,14 +450,13 @@ impl Scenario {
     /// scenario to its behaviour.
     fn run(self, ctx: &RunContext<'_>) -> Vec<Check> {
         match self {
-            Self::Lifecycle => attempt(self, || {
-                let stack = Stack::create(ctx.inputs, &ctx.baseline, Transport::Tls, ctx.issuer)?;
-                lifecycle(&stack, &ctx.baseline).map(|checks| with_event_paging(checks, &stack))
-            }),
+            Self::Lifecycle => lifecycle_checks(ctx),
             Self::Network => network_checks(ctx),
             Self::InputIntegrity => input_integrity_checks(ctx),
             Self::InputRoot => input_root_checks(ctx),
             Self::Restart => restart_checks(ctx),
+            Self::RollingUpgrade | Self::UpgradeNegativeControl => upgrade_checks(self, ctx),
+            Self::ConfigRefetchRestart => config_restart_checks(ctx),
             Self::ControllerLoss
             | Self::RollingDeploy
             | Self::CrossRevocation
@@ -447,6 +466,8 @@ impl Scenario {
             | Self::DatabaseOutage => cluster_scenario_checks(self, ctx),
             Self::Limits => limits_checks(ctx),
             Self::Memory => memory_checks(ctx),
+            Self::Pressure => pressure_checks(ctx),
+            Self::PoolOom => pool_oom_checks(ctx),
             Self::Disk => disk_checks(ctx),
             Self::Fleets => fleets_checks(ctx),
             Self::ActionTimeout => execution_checks(ctx, ExecutionScenario::ActionTimeout),
@@ -518,29 +539,80 @@ impl Scenario {
                     IdentityKnobs::NONE,
                 )?)
             }),
-            Self::Identity => attempt(self, || {
-                let variant = Variant {
-                    identity: IdentityKnobs::IDENTITY,
-                    ..ctx.baseline
-                };
-                let secured = Secured::create(ctx.inputs, &variant, ctx.issuer)?;
-                identity(&secured)
-            }),
+            Self::Identity => identity_checks(ctx),
             Self::Sessions => sessions_checks(ctx),
             Self::Builds => attempt(self, || builds(ctx.inputs, &ctx.baseline, ctx.issuer)),
         }
     }
 }
 
-/// The verdicts of the fleets scenario on a fresh placement deployment.
+fn identity_checks(ctx: &RunContext<'_>) -> Vec<Check> {
+    attempt(Scenario::Identity, || {
+        let variant = Variant {
+            identity: IdentityKnobs::IDENTITY,
+            ..ctx.baseline
+        };
+        let secured = Secured::create(ctx.inputs, &variant, ctx.issuer)?;
+        identity(&secured)
+    })
+}
+
+fn lifecycle_checks(ctx: &RunContext<'_>) -> Vec<Check> {
+    attempt(Scenario::Lifecycle, || {
+        let stack = Stack::create(ctx.inputs, &ctx.baseline, Transport::Tls, ctx.issuer)?;
+        lifecycle(&stack, &ctx.baseline).map(|checks| with_event_paging(checks, &stack))
+    })
+}
+
+fn upgrade_checks(scenario: Scenario, ctx: &RunContext<'_>) -> Vec<Check> {
+    if cfg!(target_os = "linux") {
+        attempt(scenario, || {
+            let variant = required_cluster_variant(scenario, &ctx.baseline)?;
+            crate::rolling_upgrade::rolling_upgrade(
+                ctx.inputs,
+                &variant,
+                ctx.issuer,
+                scenario == Scenario::UpgradeNegativeControl,
+            )
+        })
+    } else {
+        vec![Check::skipped(
+            scenario.as_str(),
+            "mixed-version held probes require Linux",
+        )]
+    }
+}
+
+fn config_restart_checks(ctx: &RunContext<'_>) -> Vec<Check> {
+    let scenario = Scenario::ConfigRefetchRestart;
+    if !cfg!(target_os = "linux") {
+        return vec![Check::skipped(
+            scenario.as_str(),
+            "release restart probes require Linux",
+        )];
+    }
+    attempt(scenario, || {
+        let variant = required_cluster_variant(scenario, &ctx.baseline)?;
+        crate::upgrade_config_restart::config_refetch_restart(ctx.inputs, &variant, ctx.issuer)
+    })
+}
+
+/// The drained-start and cold-pair verdicts on independent, fresh placement deployments.
 fn fleets_checks(ctx: &RunContext<'_>) -> Vec<Check> {
     let variant = Variant {
         fleets: FleetLayout::Placement,
+        control: ControlKnobs::FLEETS,
         ..ctx.baseline
     };
-    attempt(Scenario::Fleets, || {
-        let stack = Stack::create(ctx.inputs, &variant, Transport::Tls, ctx.issuer)?;
-        fleets(&stack, &variant)
+    parallel_variant_checks([false, true], |cold_pair| {
+        attempt(Scenario::Fleets, || {
+            let stack = Stack::create(ctx.inputs, &variant, Transport::Tls, ctx.issuer)?;
+            if cold_pair {
+                run_cold_pair(&stack, &variant)
+            } else {
+                run_drained_starts(&stack, &variant)
+            }
+        })
     })
 }
 
@@ -728,8 +800,7 @@ fn limits_checks(ctx: &RunContext<'_>) -> Vec<Check> {
     attempt(Scenario::Limits, || {
         // Under the noop sandbox nothing but `cgroup.kill` ends the orphaned process; under
         // bwrap the PID namespace teardown would kill it and the scenario would not test the
-        // cgroup. `NativeLink`'s soft memory enforcement is off, so only the kernel's
-        // `memory.max` can end the memory hog.
+        // cgroup. A healthy allocation above the reservation must finish on its first attempt.
         let variant = Variant {
             sandbox: Sandbox::Noop,
             limits: ActionLimits::Cgroup,
@@ -767,10 +838,13 @@ const DATABASE_OUTAGE_SUBJECT: &str = "database-outage";
 
 /// Every cluster deployment selects its identity here so concurrent scenarios cannot share
 /// a subject whose issuer policy is changed by another scenario.
-fn cluster_variant(scenario: Scenario, baseline: Variant) -> Option<Variant> {
+fn cluster_variant(scenario: Scenario, baseline: &Variant) -> Option<Variant> {
     let mut variant = match scenario {
         Scenario::ControllerLoss
         | Scenario::RollingDeploy
+        | Scenario::RollingUpgrade
+        | Scenario::ConfigRefetchRestart
+        | Scenario::UpgradeNegativeControl
         | Scenario::LeaderFailover
         | Scenario::FollowerBuilds => Variant::baseline(Sandbox::Noop),
         Scenario::CrossRevocation => Variant {
@@ -778,11 +852,11 @@ fn cluster_variant(scenario: Scenario, baseline: Variant) -> Option<Variant> {
                 standing_worker: crate::access::StandingWorker::One,
                 ..IdentityKnobs::SESSIONS
             },
-            ..baseline
+            ..*baseline
         },
         Scenario::LoginAcross => Variant {
             identity: IdentityKnobs::IDENTITY,
-            ..baseline
+            ..*baseline
         },
         Scenario::DatabaseOutage => Variant {
             identity: IdentityKnobs::SIGN_IN,
@@ -804,9 +878,37 @@ fn cluster_variant(scenario: Scenario, baseline: Variant) -> Option<Variant> {
     Some(variant)
 }
 
-fn required_cluster_variant(scenario: Scenario, baseline: Variant) -> Result<Variant> {
+fn required_cluster_variant(scenario: Scenario, baseline: &Variant) -> Result<Variant> {
     cluster_variant(scenario, baseline)
         .ok_or_else(|| crate::errors::E2eError::system("not a cluster scenario"))
+}
+
+fn controller_loss_inputs(inputs: &DeploymentInputs) -> Result<DeploymentInputs> {
+    let mut invocation = inputs.clone();
+    let mut document: toml::Value =
+        toml::from_str(&invocation.base_config).map_err(crate::template::template_error)?;
+    let fleet = document
+        .get_mut("fleets")
+        .and_then(toml::Value::as_array_mut)
+        .and_then(|fleets| fleets.first_mut())
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| crate::errors::E2eError::system("missing first fleet"))?;
+    fleet.insert("max_instances".into(), toml::Value::Integer(2));
+    fleet.insert("vcpus_per_instance".into(), toml::Value::Integer(1));
+    fleet.insert(
+        "target_actions_per_instance".into(),
+        toml::Value::Integer(1),
+    );
+    let server = document
+        .get_mut("server")
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| crate::errors::E2eError::system("missing server configuration"))?;
+    let leadership =
+        toml::from_str("ttl = \"10s\"\nrenew_interval = \"3s\"\nclock_skew = \"2s\"\n")
+            .map_err(crate::template::template_error)?;
+    server.insert("leadership".into(), leadership);
+    invocation.base_config = toml::to_string(&document).map_err(crate::template::template_error)?;
+    Ok(invocation)
 }
 
 /// Runs the leader and follower variants in independent deployments.
@@ -818,28 +920,8 @@ fn controller_loss_checks(ctx: &RunContext<'_>, engine: Engine) -> Vec<Check> {
         )];
     }
     attempt(Scenario::ControllerLoss, || {
-        let mut invocation = ctx.inputs.clone();
-        let mut document: toml::Value =
-            toml::from_str(&invocation.base_config).map_err(crate::template::template_error)?;
-        let fleet = document
-            .get_mut("fleets")
-            .and_then(toml::Value::as_array_mut)
-            .and_then(|fleets| fleets.first_mut())
-            .and_then(toml::Value::as_table_mut)
-            .ok_or_else(|| crate::errors::E2eError::system("missing first fleet"))?;
-        fleet.insert("max_instances".into(), toml::Value::Integer(2));
-        fleet.insert("vcpus_per_instance".into(), toml::Value::Integer(2));
-        let server = document
-            .get_mut("server")
-            .and_then(toml::Value::as_table_mut)
-            .ok_or_else(|| crate::errors::E2eError::system("missing server configuration"))?;
-        let leadership =
-            toml::from_str("ttl = \"10s\"\nrenew_interval = \"3s\"\nclock_skew = \"2s\"\n")
-                .map_err(crate::template::template_error)?;
-        server.insert("leadership".into(), leadership);
-        invocation.base_config =
-            toml::to_string(&document).map_err(crate::template::template_error)?;
-        let variant = required_cluster_variant(Scenario::ControllerLoss, ctx.baseline)?;
+        let invocation = controller_loss_inputs(ctx.inputs)?;
+        let variant = required_cluster_variant(Scenario::ControllerLoss, &ctx.baseline)?;
         let mut checks = Vec::new();
         for follower in [false, true] {
             let cluster =
@@ -876,17 +958,17 @@ fn cluster_inputs(ctx: &RunContext<'_>, min: i64, max: i64) -> Result<Deployment
 /// Runs the leader-loss and zombie variants on separate deployments.
 fn leader_failover_checks(ctx: &RunContext<'_>, engine: Engine) -> Result<Vec<Check>> {
     let invocation = cluster_inputs(ctx, 1, 2)?;
-    let variant = required_cluster_variant(Scenario::LeaderFailover, ctx.baseline)?;
-    let mut checks = Vec::new();
-    for zombie in [false, true] {
-        let cluster = crate::cluster::Cluster::start(&invocation, &variant, ctx.issuer, 2, engine)?;
-        let result = cluster.diagnose(crate::leader_failover::leader_failover(&cluster, zombie))?;
-        checks.extend(prefix_checks(
-            result,
+    let variant = required_cluster_variant(Scenario::LeaderFailover, &ctx.baseline)?;
+    Ok(parallel_variant_checks([false, true], |zombie| {
+        prefix_checks(
+            attempt(Scenario::LeaderFailover, || {
+                let cluster =
+                    crate::cluster::Cluster::start(&invocation, &variant, ctx.issuer, 2, engine)?;
+                cluster.diagnose(crate::leader_failover::leader_failover(&cluster, zombie))
+            }),
             if zombie { "zombie" } else { "killed" },
-        ));
-    }
-    Ok(checks)
+        )
+    }))
 }
 
 /// Runs the outage scenario with one and two controllers on separate deployments.
@@ -905,35 +987,50 @@ fn database_outage_checks(ctx: &RunContext<'_>, engine: Engine) -> Result<Vec<Ch
         toml::Value::Integer(2),
     );
     invocation.base_config = toml::to_string(&document).map_err(crate::template::template_error)?;
-    let variant = required_cluster_variant(Scenario::DatabaseOutage, ctx.baseline)?;
-    let mut checks = Vec::new();
-    for count in [1, 2] {
-        let cluster =
-            crate::cluster::Cluster::start(&invocation, &variant, ctx.issuer, count, engine)?;
-        let result = cluster.diagnose(crate::database_outage::database_outage(&cluster, count))?;
-        checks.extend(prefix_checks(result, &format!("{count} controllers")));
-    }
-    Ok(checks)
+    let variant = required_cluster_variant(Scenario::DatabaseOutage, &ctx.baseline)?;
+    Ok(parallel_variant_checks([1, 2], |count| {
+        prefix_checks(
+            attempt(Scenario::DatabaseOutage, || {
+                let cluster = crate::cluster::Cluster::start(
+                    &invocation,
+                    &variant,
+                    ctx.issuer,
+                    count,
+                    engine,
+                )?;
+                cluster.diagnose(crate::database_outage::database_outage(&cluster, count))
+            }),
+            &format!("{count} controllers"),
+        )
+    }))
 }
 
 /// Runs each cluster scenario on its own appropriately configured deployment.
 fn cluster_scenario_checks(scenario: Scenario, ctx: &RunContext<'_>) -> Vec<Check> {
-    cluster_engine_checks(|engine| {
-        crate::stack::with_failure_evidence(|| {
-            cluster_scenario_engine_checks(scenario, ctx, engine)
-        })
-    })
+    cluster_engine_checks(|engine| cluster_scenario_engine_checks(scenario, ctx, engine))
 }
 
 fn cluster_engine_checks(run: impl Fn(Engine) -> Vec<Check> + Sync) -> Vec<Check> {
+    parallel_variant_checks([Engine::DynamoDb, Engine::Postgres], |engine| {
+        prefix_checks(run(engine), engine.as_str())
+    })
+}
+
+/// Runs isolated variants concurrently, retaining evidence and verdict order on each worker.
+/// Join every worker before propagating a panic so no deployment outlives the variant group.
+fn parallel_variant_checks<T: Send, const N: usize>(
+    variants: [T; N],
+    run: impl Fn(T) -> Vec<Check> + Sync,
+) -> Vec<Check> {
     thread::scope(|scope| {
-        let handles = [Engine::DynamoDb, Engine::Postgres].map(|engine| {
+        let handles = variants.map(|variant| {
             let run = &run;
-            scope.spawn(move || prefix_checks(run(engine), engine.as_str()))
+            scope.spawn(move || crate::stack::with_failure_evidence(|| run(variant)))
         });
-        handles
+        let results = handles.map(std::thread::ScopedJoinHandle::join);
+        results
             .into_iter()
-            .flat_map(|handle| match handle.join() {
+            .flat_map(|result| match result {
                 Ok(checks) => checks,
                 Err(panic) => std::panic::resume_unwind(panic),
             })
@@ -963,27 +1060,27 @@ fn cluster_scenario_engine_checks(
     attempt(scenario, || match scenario {
         Scenario::RollingDeploy => {
             let invocation = cluster_inputs(ctx, 0, 1)?;
-            let variant = required_cluster_variant(scenario, ctx.baseline)?;
+            let variant = required_cluster_variant(scenario, &ctx.baseline)?;
             let cluster =
                 crate::cluster::Cluster::start(&invocation, &variant, ctx.issuer, 2, engine)?;
             cluster.diagnose(crate::rolling_deploy::rolling_deploy(&cluster))
         }
         Scenario::FollowerBuilds => {
             let invocation = cluster_inputs(ctx, 0, 1)?;
-            let variant = required_cluster_variant(scenario, ctx.baseline)?;
+            let variant = required_cluster_variant(scenario, &ctx.baseline)?;
             let cluster =
                 crate::cluster::Cluster::start(&invocation, &variant, ctx.issuer, 3, engine)?;
             cluster.diagnose(crate::follower_builds::follower_builds(&cluster))
         }
         Scenario::CrossRevocation => {
-            let variant = required_cluster_variant(scenario, ctx.baseline)?;
+            let variant = required_cluster_variant(scenario, &ctx.baseline)?;
             let cluster =
                 crate::cluster::Cluster::start(ctx.inputs, &variant, ctx.issuer, 2, engine)?;
             cluster.diagnose(cross_revocation(&cluster, ctx.issuer))
         }
         Scenario::LeaderFailover => leader_failover_checks(ctx, engine),
         Scenario::LoginAcross => {
-            let variant = required_cluster_variant(scenario, ctx.baseline)?;
+            let variant = required_cluster_variant(scenario, &ctx.baseline)?;
             let cluster =
                 crate::cluster::Cluster::start(ctx.inputs, &variant, ctx.issuer, 2, engine)?;
             cluster.diagnose(crate::login_across::login_across(&cluster))
@@ -1002,15 +1099,70 @@ fn memory_checks(ctx: &RunContext<'_>) -> Vec<Check> {
         )];
     }
     attempt(Scenario::Memory, || {
-        // `NativeLink`'s soft enforcement stays on: the grower's first attempt ends only by
-        // its kill.
+        // Soft memory enforcement is explicitly selected for this regression.
         let variant = Variant {
             sandbox: Sandbox::Noop,
             limits: ActionLimits::Cgroup,
+            soft_memory: SoftMemory::Enforced,
             ..Variant::baseline(Sandbox::Noop)
         };
         let stack = Stack::create(ctx.inputs, &variant, Transport::Tls, ctx.issuer)?;
         memory(&stack, stack.stderr_tail_lines())
+    })
+}
+
+/// Runs a kernel OOM against a bounded pool with userspace memory enforcement disabled.
+fn pool_oom_checks(ctx: &RunContext<'_>) -> Vec<Check> {
+    if !cfg!(target_os = "linux") {
+        return vec![Check::skipped(
+            names::suite::scenario_completes(Scenario::PoolOom),
+            "pool OOM observation requires Linux cgroups",
+        )];
+    }
+    attempt(Scenario::PoolOom, || {
+        let policy = crate::execution::ResourcePolicy::pool_oom_scenario()?;
+        let capacity = policy
+            .fleet_memory
+            .ok_or_else(|| crate::E2eError::system("pool OOM fixture has no fleet capacity"))?;
+        let escalation_percent = policy.memory.escalation_percent.get();
+        let execution = ExecutionKnobs {
+            resource_policy: Some(policy),
+            ..ExecutionKnobs::NONE
+        };
+        let variant = Variant {
+            limits: ActionLimits::Cgroup,
+            soft_memory: SoftMemory::Off,
+            execution,
+            ..Variant::baseline(Sandbox::Noop)
+        };
+        let stack = Stack::create(ctx.inputs, &variant, Transport::Tls, ctx.issuer)?;
+        let exec = Observer::new(&stack, &ctx.inputs.settings)?;
+        crate::oom::pool_oom(&stack, &exec, escalation_percent, capacity.as_u64() / 1024)
+    })
+}
+
+/// Runs the bounded genuine-PSI scenario on Linux.
+fn pressure_checks(ctx: &RunContext<'_>) -> Vec<Check> {
+    if !cfg!(target_os = "linux") {
+        return vec![Check::skipped(
+            names::suite::scenario_completes(Scenario::Pressure),
+            "memory pressure requires Linux cgroups",
+        )];
+    }
+    attempt(Scenario::Pressure, || {
+        let execution = ExecutionKnobs {
+            resource_policy: Some(crate::execution::ResourcePolicy::pressure_scenario()?),
+            ..ExecutionKnobs::NONE
+        };
+        let variant = Variant {
+            limits: ActionLimits::Cgroup,
+            soft_memory: SoftMemory::Off,
+            execution,
+            ..Variant::baseline(Sandbox::Noop)
+        };
+        let stack = Stack::create(ctx.inputs, &variant, Transport::Tls, ctx.issuer)?;
+        let exec = Observer::new(&stack, &ctx.inputs.settings)?;
+        crate::pressure::pressure(&stack, &exec)
     })
 }
 
@@ -1074,7 +1226,7 @@ impl ExecutionScenario {
 /// Every variant but the knob it tests is the baseline; the scenarios that observe action scopes
 /// add per-action cgroups, with `NativeLink`'s memory enforcement off where an out-of-memory kill
 /// is checked.
-fn execution_variant(scenario: ExecutionScenario, baseline: Variant) -> (Variant, bool) {
+fn execution_variant(scenario: ExecutionScenario, baseline: &Variant) -> (Variant, bool) {
     let scoped = |sandbox: Sandbox, execution: ExecutionKnobs, soft_memory: SoftMemory| Variant {
         sandbox,
         limits: ActionLimits::Cgroup,
@@ -1084,7 +1236,7 @@ fn execution_variant(scenario: ExecutionScenario, baseline: Variant) -> (Variant
     };
     let knob = |execution: ExecutionKnobs| Variant {
         execution,
-        ..baseline
+        ..*baseline
     };
     let short = ExecutionKnobs::SHORT_TIMEOUT;
     match scenario {
@@ -1113,14 +1265,14 @@ fn execution_variant(scenario: ExecutionScenario, baseline: Variant) -> (Variant
         ExecutionScenario::OversizedFleet => (knob(ExecutionKnobs::OVERSIZED_FLEET), false),
         ExecutionScenario::ColdStartMisfit => (knob(ExecutionKnobs::COLD_START_MISFIT), false),
         ExecutionScenario::WorkerRenewal => (knob(ExecutionKnobs::SHORT_LIVED_CERTIFICATES), false),
-        ExecutionScenario::UnplaceableDisk | ExecutionScenario::Preemption => (baseline, false),
+        ExecutionScenario::UnplaceableDisk | ExecutionScenario::Preemption => (*baseline, false),
     }
 }
 
 /// The verdicts of an execution scenario on its own deployment, or one skipped check where the
 /// scenario needs Linux and the platform is another.
 fn execution_checks(ctx: &RunContext<'_>, scenario: ExecutionScenario) -> Vec<Check> {
-    let (variant, linux_only) = execution_variant(scenario, ctx.baseline);
+    let (variant, linux_only) = execution_variant(scenario, &ctx.baseline);
     if linux_only && !cfg!(target_os = "linux") {
         return vec![Check::skipped(
             names::suite::scenario_completes(scenario.scenario()),
@@ -1128,7 +1280,20 @@ fn execution_checks(ctx: &RunContext<'_>, scenario: ExecutionScenario) -> Vec<Ch
         )];
     }
     attempt(scenario.scenario(), || {
+        if matches!(scenario, ExecutionScenario::SandboxContract)
+            && ctx.inputs.action_tools.ca_bundle.is_none()
+        {
+            return Err(crate::errors::E2eError::system(
+                "the sandbox contract requires a public CA bundle",
+            ));
+        }
         let stack = Stack::create(ctx.inputs, &variant, Transport::Tls, ctx.issuer)?;
+        if matches!(scenario, ExecutionScenario::SandboxContract) {
+            crate::sample::stage_action_environment(
+                &stack.placement().workspace(),
+                &ctx.inputs.postgres,
+            )?;
+        }
         let exec = Observer::new(&stack, &ctx.inputs.settings)?;
         let tail = stack.stderr_tail_lines();
         match scenario {
@@ -1275,7 +1440,45 @@ fn run_bounded<T: Sync, R: Send>(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use crate::settings::Settings;
+
     use super::*;
+
+    #[test]
+    fn controller_loss_fixture_has_two_held_action_slots_and_two_cpus() {
+        let inputs = DeploymentInputs {
+            gang: PathBuf::default(),
+            bazel: PathBuf::default(),
+            postgres: PathBuf::default(),
+            base_config: "[server]\n[[fleets]]\nmax_instances = 4\nvcpus_per_instance = 4\ntarget_actions_per_instance = 4\n".into(),
+            sample: PathBuf::default(),
+            configs: PathBuf::default(),
+            settings: Settings::default(),
+            action_tools: crate::settings::ActionTools {
+                shell: PathBuf::default(),
+                path: String::default(),
+                action_bin: PathBuf::default(),
+                ca_bundle: None,
+                bwrap: None,
+                glibc_tool: None,
+                glibc_loader: Vec::new(),
+            },
+            upgrade: None,
+        };
+        let invocation = controller_loss_inputs(&inputs).expect("fixture renders");
+        let document: toml::Value = toml::from_str(&invocation.base_config).expect("valid TOML");
+        let fleet = &document["fleets"][0];
+        let workers = fleet["max_instances"].as_integer().expect("max instances");
+        let cpus = fleet["vcpus_per_instance"].as_integer().expect("vCPUs");
+        let slots = fleet["target_actions_per_instance"]
+            .as_integer()
+            .expect("target actions");
+        assert_eq!(workers, 2);
+        assert_eq!(workers * slots, 2);
+        assert_eq!(workers * cpus, 2);
+    }
 
     #[test]
     fn cluster_engines_run_on_separate_threads_in_verdict_order() {
@@ -1295,6 +1498,50 @@ mod tests {
     }
 
     #[test]
+    fn independent_variants_overlap_and_keep_complete_verdict_order() {
+        let both_started = std::sync::Barrier::new(2);
+        for variants in [[false, true], [true, false]] {
+            let checks = parallel_variant_checks(variants, |variant| {
+                both_started.wait();
+                if variant {
+                    vec![Check::passed("second")]
+                } else {
+                    vec![
+                        Check::failed("first", "variant failure"),
+                        Check::passed("first end"),
+                    ]
+                }
+            });
+            let names: Vec<_> = checks.iter().map(|check| check.name.as_ref()).collect();
+            assert_eq!(
+                names,
+                if variants[0] {
+                    vec!["second", "first", "first end"]
+                } else {
+                    vec!["first", "first end", "second"]
+                }
+            );
+            assert_eq!(checks.iter().filter(|check| check.is_failure()).count(), 1);
+        }
+    }
+
+    #[test]
+    fn independent_variant_panics_join_every_worker_before_propagating() {
+        let both_started = std::sync::Barrier::new(2);
+        let completed = AtomicUsize::new(0);
+        let result = std::panic::catch_unwind(|| {
+            parallel_variant_checks([true, false], |panic| {
+                both_started.wait();
+                assert!(!panic, "variant panic");
+                completed.fetch_add(1, Ordering::SeqCst);
+                vec![Check::passed("completed")]
+            })
+        });
+        assert!(result.is_err());
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn cluster_sign_in_subjects_are_isolated_from_mutated_issuer_policies() {
         let mutated = [
             crate::access::SIGN_IN_SUBJECT,
@@ -1303,13 +1550,16 @@ mod tests {
         for scenario in [
             Scenario::ControllerLoss,
             Scenario::RollingDeploy,
+            Scenario::RollingUpgrade,
+            Scenario::ConfigRefetchRestart,
+            Scenario::UpgradeNegativeControl,
             Scenario::FollowerBuilds,
             Scenario::CrossRevocation,
             Scenario::LeaderFailover,
             Scenario::DatabaseOutage,
             Scenario::LoginAcross,
         ] {
-            let variant = cluster_variant(scenario, Variant::baseline(Sandbox::Noop))
+            let variant = cluster_variant(scenario, &Variant::baseline(Sandbox::Noop))
                 .expect("listed scenarios are cluster scenarios");
             if let Some(subject) = variant.identity.sign_in.subject(variant.identity.sessions) {
                 assert!(!mutated.contains(&subject), "{scenario}: {subject}");
@@ -1356,6 +1606,20 @@ mod tests {
     }
 
     #[test]
+    fn upgrades_are_gate_two_only_and_selectable_by_name() {
+        for (name, scenario) in [
+            ("rolling-upgrade", Scenario::RollingUpgrade),
+            ("config-refetch-restart", Scenario::ConfigRefetchRestart),
+            ("upgrade-negative-control", Scenario::UpgradeNegativeControl),
+        ] {
+            assert_eq!(name.parse::<Scenario>().ok(), Some(scenario));
+            assert!(!Gate::One.scenarios().any(|item| item == scenario));
+            assert!(Gate::Two.additions().any(|item| item == scenario));
+            assert!(scenario.weight() > 0);
+        }
+    }
+
+    #[test]
     fn unknown_scenario_names_are_rejected() {
         assert!("input_integrity".parse::<Scenario>().is_err());
         assert!("Lifecycle".parse::<Scenario>().is_err());
@@ -1391,6 +1655,8 @@ mod tests {
     fn gate_one_runs_every_scenario_but_the_gate_two_ones() {
         let runs: Vec<Scenario> = Gate::One.scenarios().collect();
         let gate_two_only = [
+            Scenario::Pressure,
+            Scenario::PoolOom,
             Scenario::Revocation,
             Scenario::Dashboard,
             Scenario::LaunchFailure,
@@ -1402,6 +1668,9 @@ mod tests {
             Scenario::Sessions,
             Scenario::ControllerLoss,
             Scenario::RollingDeploy,
+            Scenario::RollingUpgrade,
+            Scenario::ConfigRefetchRestart,
+            Scenario::UpgradeNegativeControl,
             Scenario::CrossRevocation,
             Scenario::LeaderFailover,
             Scenario::LoginAcross,

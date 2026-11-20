@@ -56,20 +56,20 @@ mod support;
 use gang_e2e::Limits as _;
 use gang_e2e::System as _;
 use gang_e2e::{
-    ActionLimits, Check, FleetLayout, Identity, InputLinks, LARGE_FLEET, NOOP_FLEET, Outcome,
-    Probe, SMALL_FLEET, Sandbox, Settings, Signalled, SoftMemory, Variant, names,
+    ActionLimits, Check, ControlKnobs, FleetLayout, Identity, InputLinks, LARGE_FLEET, NOOP_FLEET,
+    Outcome, Probe, SMALL_FLEET, Sandbox, Settings, Signalled, SoftMemory, Variant, names,
 };
 use gang_e2e::{
-    disk, fhs_tools, fleets, glibc_toolchain, input_integrity, lifecycle, limits, memory, network,
-    plaintext, restart, revocation,
+    disk, fhs_tools, glibc_toolchain, input_integrity, lifecycle, limits, memory, network,
+    plaintext, restart, revocation, run_cold_pair, run_drained_starts,
 };
 use gang_wire::routes::{GET_STATE, WATCH_STATE};
 use support::{
     AdminRoutes, Anonymous, Arrival, Behaviour, BuildFailure, Cache, Completed, Convergence,
-    Dashboard, Disk, Drain, Fhs, Grower, Handshake, HoldBuild, HoldSignal, Integrity, Isolation,
-    Limits, Loader, Neighbour, OrphanProcess, PidReuse, Requests, Restart, Revocation, Routing,
-    ScopeReport, Serving, SimulatedIdentity, Simulation, StateView, StreamCauses, Termination,
-    TokenIssue, Warm,
+    Dashboard, Disk, Drain, Fhs, Grower, Handshake, Hog, HoldBuild, HoldSignal, Integrity,
+    Isolation, Limits, Loader, Neighbour, OrphanProcess, PidReuse, Requests, Restart, Revocation,
+    Routing, ScopeReport, Serving, SimulatedIdentity, Simulation, StateView, StreamCauses,
+    Termination, TokenIssue, Warm,
 };
 
 /// The name of the check that a request for the state without a session cookie is refused.
@@ -210,31 +210,31 @@ fn limited() -> Variant {
 /// The verdicts of the lifecycle scenario against a simulation that behaves as `behaviour` says.
 fn lifecycle_checks(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
     let variant = baseline(Sandbox::Bwrap);
-    lifecycle(&Simulation::new(variant, behaviour), &variant)
+    lifecycle(&Simulation::new(&variant, behaviour), &variant)
 }
 
 /// The verdicts of the glibc toolchain scenario against a simulated sandbox.
 fn glibc_toolchain_checks(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
-    glibc_toolchain(&Simulation::new(baseline(Sandbox::Bwrap), behaviour))
+    glibc_toolchain(&Simulation::new(&baseline(Sandbox::Bwrap), behaviour))
 }
 
 /// The verdicts of the FHS tools scenario against a simulated sandbox.
 fn fhs_tools_checks(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
-    fhs_tools(&Simulation::new(baseline(Sandbox::Bwrap), behaviour))
+    fhs_tools(&Simulation::new(&baseline(Sandbox::Bwrap), behaviour))
 }
 
 /// The verdicts of the input integrity scenario against a simulation that behaves as `behaviour`
 /// says.
 fn integrity_checks(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
     let variant = baseline(Sandbox::Bwrap);
-    input_integrity(&Simulation::new(variant, behaviour), &variant)
+    input_integrity(&Simulation::new(&variant, behaviour), &variant)
 }
 
 /// The verdicts of the restart scenario against a simulation that behaves as `behaviour` says and
 /// boots slowly.
 fn restart_checks(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
     let variant = baseline(Sandbox::Bwrap);
-    restart(&Simulation::new(variant, behaviour).with_slow_boot())
+    restart(&Simulation::new(&variant, behaviour).with_slow_boot())
 }
 
 /// The verdicts of the revocation scenario against an identity provider that revokes as
@@ -252,7 +252,7 @@ fn identity_checks(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
 /// The verdicts of the limits scenario against a simulation that behaves as `behaviour` says.
 fn limits_checks(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
     let variant = limited();
-    let system = Simulation::new(variant, behaviour);
+    let system = Simulation::new(&variant, behaviour);
     limits(&system, system.stderr_tail_lines())
 }
 
@@ -305,7 +305,7 @@ fn failed_builds_report_stderr_instead_of_missing_reports() -> gang_e2e::Result<
         ..Behaviour::COMPLIANT
     };
     for scenario in [lifecycle, network, input_integrity] {
-        let system = Simulation::new(variant, behaviour);
+        let system = Simulation::new(&variant, behaviour);
         let checks = scenario(&system, &variant)?;
         assert!(
             checks.iter().any(|check| matches!(&check.outcome, Outcome::Failed(reason) if reason.contains("UNAVAILABLE"))),
@@ -331,21 +331,21 @@ fn restart_reports_a_build_that_finished_before_scale_out() -> gang_e2e::Result<
 #[test]
 fn lifecycle_is_compliant_under_bwrap() {
     let variant = baseline(Sandbox::Bwrap);
-    let system = Simulation::new(variant, Behaviour::COMPLIANT);
+    let system = Simulation::new(&variant, Behaviour::COMPLIANT);
     assert_compliant(&lifecycle(&system, &variant).expect("the lifecycle runs"));
 }
 
 #[test]
 fn lifecycle_is_compliant_under_noop() {
     let variant = baseline(Sandbox::Noop);
-    let system = Simulation::new(variant, Behaviour::COMPLIANT);
+    let system = Simulation::new(&variant, Behaviour::COMPLIANT);
     assert_compliant(&lifecycle(&system, &variant).expect("the lifecycle runs"));
 }
 
 #[test]
 fn noop_probe_lists_the_parent_directories() {
     let variant = baseline(Sandbox::Noop);
-    let system = Simulation::new(variant, Behaviour::COMPLIANT);
+    let system = Simulation::new(&variant, Behaviour::COMPLIANT);
     let checks = lifecycle(&system, &variant).expect("the lifecycle runs");
     let listed = names::isolation::SIBLINGS_LISTED;
     assert!(
@@ -358,7 +358,7 @@ fn noop_probe_lists_the_parent_directories() {
 #[test]
 fn lifecycle_with_an_early_scale_out_is_compliant() {
     let variant = baseline(Sandbox::Bwrap);
-    let system = Simulation::new(variant, Behaviour::COMPLIANT).with_early_scale_out();
+    let system = Simulation::new(&variant, Behaviour::COMPLIANT).with_early_scale_out();
     assert_compliant(&lifecycle(&system, &variant).expect("the lifecycle runs"));
 }
 
@@ -389,7 +389,7 @@ flaw! {
 #[test]
 fn network_is_compliant_when_isolated() {
     let variant = baseline(Sandbox::Bwrap);
-    let system = Simulation::new(variant, Behaviour::COMPLIANT);
+    let system = Simulation::new(&variant, Behaviour::COMPLIANT);
     assert_compliant(&network(&system, &variant).expect("the network scenario runs"));
 }
 
@@ -454,7 +454,7 @@ fn integrity_is_compliant_under_break_and_keep() {
             input_links: links,
             ..baseline(Sandbox::Bwrap)
         };
-        let system = Simulation::new(variant, Behaviour::COMPLIANT);
+        let system = Simulation::new(&variant, Behaviour::COMPLIANT);
         assert_compliant(&input_integrity(&system, &variant).expect("the integrity scenario runs"));
     }
 }
@@ -480,7 +480,7 @@ flaw! {
 #[test]
 fn restart_converges_when_the_server_does_not_repeat_the_scale_out() {
     let variant = baseline(Sandbox::Bwrap);
-    let system = Simulation::new(variant, Behaviour::COMPLIANT).with_slow_boot();
+    let system = Simulation::new(&variant, Behaviour::COMPLIANT).with_slow_boot();
     assert_compliant(&restart(&system).expect("the restart scenario runs"));
 }
 
@@ -581,7 +581,7 @@ flaw! {
 
 /// The verdicts of the plaintext scenario against a simulation that behaves as `behaviour` says.
 fn plaintext_checks(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
-    let system = Simulation::new(baseline(Sandbox::Noop), behaviour);
+    let system = Simulation::new(&baseline(Sandbox::Noop), behaviour);
     plaintext(&system)
 }
 
@@ -744,11 +744,17 @@ fn a_stream_that_ends_without_closed_fails_the_closed_check() -> gang_e2e::Resul
 }
 
 #[test]
-fn limits_are_compliant_when_enforced() {
+fn limits_pass_when_the_healthy_spike_succeeds_on_its_first_attempt() {
     let variant = limited();
-    let system = Simulation::new(variant, Behaviour::COMPLIANT);
+    let system = Simulation::new(&variant, Behaviour::COMPLIANT);
     let checks = limits(&system, system.stderr_tail_lines());
     assert_compliant(&checks.expect("the limits scenario runs"));
+}
+
+flaw! {
+    a_healthy_spike_that_is_retried_fails_the_first_attempt_check:
+        limits_checks(hog = Hog::Requeued)
+        => only [names::limits::HARD_CEILING]
 }
 
 flaw! {
@@ -761,12 +767,6 @@ flaw! {
     unlimited_actions_leave_their_orphan_alive:
         limits_checks(limits = Limits::Unlimited)
         => fails [names::limits::ORPHAN_KILLED]
-}
-
-flaw! {
-    a_hog_that_the_kernel_does_not_kill_fails_the_hard_ceiling_check:
-        limits_checks(limits = Limits::Unlimited)
-        => fails [names::limits::HARD_CEILING]
 }
 
 flaw! {
@@ -798,7 +798,7 @@ fn an_early_hold_failure_reports_abandonment() {
 #[test]
 fn abandoning_a_wait_does_not_end_the_held_build() -> gang_e2e::Result<()> {
     let variant = limited();
-    let system = Simulation::new(variant, Behaviour::COMPLIANT);
+    let system = Simulation::new(&variant, Behaviour::COMPLIANT);
     system.start_server()?;
     std::thread::scope(|scope| -> gang_e2e::Result<()> {
         let build = scope.spawn(|| system.build(&[Probe::Hold]));
@@ -820,7 +820,7 @@ fn abandoning_a_wait_does_not_end_the_held_build() -> gang_e2e::Result<()> {
 
 #[test]
 fn cancelling_ends_a_scoped_held_build_without_its_release() -> gang_e2e::Result<()> {
-    let system = Simulation::new(limited(), Behaviour::COMPLIANT);
+    let system = Simulation::new(&limited(), Behaviour::COMPLIANT);
     system.start_server()?;
     std::thread::scope(|scope| -> gang_e2e::Result<()> {
         let build = scope.spawn(|| system.build(&[Probe::Hold]));
@@ -842,7 +842,7 @@ fn held_build_releases_go_after_during_returns() -> gang_e2e::Result<()> {
     use execution::sim::{Behaviour as ExecBehaviour, ExecSim};
     use gang_e2e::{Execution as _, held_build};
 
-    let system = ExecSim::new(baseline(Sandbox::Noop), ExecBehaviour::COMPLIANT);
+    let system = ExecSim::new(&baseline(Sandbox::Noop), ExecBehaviour::COMPLIANT);
     system.start_server()?;
     system.set_go(false)?;
     held_build(&system, &system, &[Probe::TimeoutChild], |_| Ok(()))?;
@@ -859,7 +859,7 @@ flaw! {
 /// The verdicts of the disk scenario against a simulation that behaves as `behaviour` says.
 fn disk_checks(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
     let variant = baseline(Sandbox::Noop);
-    let system = Simulation::new(variant, behaviour);
+    let system = Simulation::new(&variant, behaviour);
     disk(&system, system.stderr_tail_lines(), true)
 }
 
@@ -886,7 +886,7 @@ flaw! {
 #[test]
 fn two_scale_outs_fail_the_shared_worker_check() -> gang_e2e::Result<()> {
     let variant = baseline(Sandbox::Noop);
-    let system = Simulation::new(variant, Behaviour::COMPLIANT).with_early_scale_out();
+    let system = Simulation::new(&variant, Behaviour::COMPLIANT).with_early_scale_out();
     let checks = disk(&system, system.stderr_tail_lines(), true)?;
     assert_fails(&checks, names::disk::ONE_WORKER);
     Ok(())
@@ -901,7 +901,7 @@ flaw! {
 #[test]
 fn disk_without_the_sampler_skips_the_kill_checks() -> gang_e2e::Result<()> {
     let variant = baseline(Sandbox::Noop);
-    let system = Simulation::new(variant, Behaviour::COMPLIANT);
+    let system = Simulation::new(&variant, Behaviour::COMPLIANT);
     let checks = disk(&system, system.stderr_tail_lines(), false)?;
     assert_compliant(&checks);
     Ok(())
@@ -919,7 +919,7 @@ fn soft_limited() -> Variant {
 
 /// The verdicts of the memory scenario against a simulation that behaves as `behaviour` says.
 fn memory_checks(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
-    let system = Simulation::new(soft_limited(), behaviour);
+    let system = Simulation::new(&soft_limited(), behaviour);
     memory(&system, system.stderr_tail_lines())
 }
 
@@ -957,6 +957,7 @@ flaw! {
 fn placement(sandbox: Sandbox) -> Variant {
     Variant {
         fleets: FleetLayout::Placement,
+        control: ControlKnobs::FLEETS,
         ..Variant::baseline(sandbox)
     }
 }
@@ -964,8 +965,11 @@ fn placement(sandbox: Sandbox) -> Variant {
 /// The verdicts of the fleets scenario against a simulation that behaves as `behaviour` says.
 fn fleets_checks(sandbox: Sandbox, behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
     let variant = placement(sandbox);
-    let system = Simulation::new(variant, behaviour);
-    fleets(&system, &variant)
+    let drained_starts = Simulation::new(&variant, behaviour);
+    let cold_pair = Simulation::new(&variant, behaviour);
+    let mut checks = run_drained_starts(&drained_starts, &variant)?;
+    checks.extend(run_cold_pair(&cold_pair, &variant)?);
+    Ok(checks)
 }
 
 /// The verdicts of the fleets scenario under bwrap against a simulation that behaves as
@@ -985,6 +989,83 @@ fn outcome_of(checks: &[Check], name: impl AsRef<str>) -> Option<&Outcome> {
 #[test]
 fn fleets_is_compliant_under_noop() -> gang_e2e::Result<()> {
     assert_compliant(&fleets_checks(Sandbox::Noop, Behaviour::COMPLIANT)?);
+    Ok(())
+}
+
+#[test]
+fn fresh_fleet_fixtures_keep_all_checks_in_order_without_restarting() -> gang_e2e::Result<()> {
+    let variant = placement(Sandbox::Bwrap);
+    let drained_starts = Simulation::new(&variant, Behaviour::COMPLIANT);
+    let cold_pair = Simulation::new(&variant, Behaviour::COMPLIANT);
+    let mut checks = run_drained_starts(&drained_starts, &variant)?;
+    assert_eq!(checks.len(), 24);
+    assert!(cold_pair.scaling_events()?.is_empty());
+    let pair_checks = run_cold_pair(&cold_pair, &variant)?;
+    assert_eq!(pair_checks.len(), 4);
+    checks.extend(pair_checks);
+    assert_compliant(&checks);
+    assert_eq!(drained_starts.server_pid(), Some(1));
+    assert_eq!(cold_pair.server_pid(), Some(1));
+    assert_eq!(drained_starts.worker_count()?, 0);
+    assert_eq!(cold_pair.worker_count()?, 0);
+
+    let mut expected = vec![names::fleets::START_AT_ZERO.to_owned()];
+    for (request, fleets, isolation) in [
+        (
+            names::fleets::UNCONSTRAINED,
+            &[SMALL_FLEET][..],
+            &[
+                names::isolation::NET_NAMESPACE,
+                names::isolation::MNT_NAMESPACE,
+            ][..],
+        ),
+        (
+            names::fleets::PINNED,
+            &[LARGE_FLEET][..],
+            &[
+                names::isolation::NET_NAMESPACE,
+                names::isolation::MNT_NAMESPACE,
+            ][..],
+        ),
+        (
+            names::fleets::MEMORY,
+            &[LARGE_FLEET][..],
+            &[
+                names::isolation::NET_NAMESPACE,
+                names::isolation::MNT_NAMESPACE,
+            ][..],
+        ),
+        (
+            names::fleets::NOOP_SANDBOX,
+            &[NOOP_FLEET][..],
+            &[names::isolation::NOOP_FLEET_UNISOLATED][..],
+        ),
+        (
+            names::fleets::OVERFLOW,
+            &[SMALL_FLEET, LARGE_FLEET][..],
+            &[][..],
+        ),
+    ] {
+        expected.push(names::fleets::labelled(
+            request,
+            names::build::REMOTE_EXECUTION,
+        ));
+        expected.push(names::fleets::placed(request, fleets));
+        expected.extend(
+            isolation
+                .iter()
+                .map(|name| names::fleets::labelled(request, name)),
+        );
+        expected.push(names::fleets::drained(request));
+        expected.push(names::fleets::terminated(request));
+    }
+    assert_eq!(
+        checks
+            .iter()
+            .map(|check| check.name.as_ref())
+            .collect::<Vec<_>>(),
+        expected.iter().map(String::as_str).collect::<Vec<_>>()
+    );
     Ok(())
 }
 

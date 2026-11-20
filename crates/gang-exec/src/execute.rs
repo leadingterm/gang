@@ -1,6 +1,7 @@
 //! Runs one action in its sandbox, inside its limits scope, and maps the outcome to an exit status.
 
 use std::io;
+use std::path::PathBuf;
 
 use futures::{FutureExt, Stream, StreamExt};
 use gang_config::InputLinks;
@@ -20,6 +21,15 @@ pub struct Action<'a> {
     pub limits: ActionLimits,
 }
 
+/// The action's outcome and the limits scope's usage, when limits were configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Execution {
+    /// The real outcome of the action.
+    pub outcome: ActionExecutionOutcome,
+    /// Usage measured before leaving the scope.
+    pub usage: Option<ActionUsage>,
+}
+
 /// Runs `action` in `sandbox`.
 ///
 /// The steps, in order, are: break the hard links under the action directory when `input_links` is
@@ -29,6 +39,7 @@ pub struct Action<'a> {
 /// group of `gang exec` exists (the caller moves `gang exec` out of that group; an action in its
 /// own group, which the sandbox relays to, leaves `gang exec` where it is); wait for the action,
 /// while each termination is relayed to the action (`SandboxedAction::relay`); leave the scope.
+/// After entering a scope, `publish_cgroup` receives its memory cgroup before the sandbox starts.
 /// A termination pending before the action starts prevents it from being started.
 ///
 /// `gang exec` never enters the scope, so an out-of-memory kill of the scope never reaches it.
@@ -49,8 +60,9 @@ pub async fn execute<S: ActionIsolationPort, L: ActionLimitsPort>(
     input_links: InputLinks,
     action: &Action<'_>,
     terminations: &mut (impl Stream<Item = io::Result<Termination>> + Unpin),
+    publish_cgroup: impl FnOnce(Option<PathBuf>),
     leave_action_group: impl FnOnce() -> io::Result<()>,
-) -> Result<ActionExecutionOutcome, ExecError> {
+) -> Result<Execution, ExecError> {
     if matches!(input_links, InputLinks::Break) {
         break_hard_links(action.spec.action_directory)?;
     }
@@ -62,19 +74,26 @@ pub async fn execute<S: ActionIsolationPort, L: ActionLimitsPort>(
             .transpose()
             .map_err(ExecError::Signals)?
         {
-            return Ok(ActionExecutionOutcome::Signaled(termination.signal()));
+            return Ok(Execution {
+                outcome: ActionExecutionOutcome::Signaled(termination.signal()),
+                usage: None,
+            });
         }
         let mut running = sandbox
             .start(&action.spec)
             .await
             .map_err(ExecError::Sandbox)?;
         leave_if_shared(&running, leave_action_group)?;
-        return wait_relaying(&mut running, terminations).await;
+        return Ok(Execution {
+            outcome: wait_relaying(&mut running, terminations).await?,
+            usage: None,
+        });
     };
     let scope = port
         .enter(&action.limits)
         .await
         .map_err(ExecError::Limits)?;
+    publish_cgroup(scope.memory_cgroup());
     let spec = ActionExecutionSpec {
         launcher: scope.launcher(),
         ..action.spec
@@ -98,7 +117,10 @@ pub async fn execute<S: ActionIsolationPort, L: ActionLimitsPort>(
     match (outcome, usage) {
         (Ok(outcome), Ok(usage)) => {
             log_usage(&usage);
-            Ok(outcome)
+            Ok(Execution {
+                outcome,
+                usage: Some(usage),
+            })
         }
         (Ok(_), Err(error)) => Err(ExecError::Limits(error)),
         (Err(error), Ok(usage)) => {
@@ -164,6 +186,7 @@ fn log_usage(usage: &ActionUsage) {
     tracing::info!(
         peak_memory = ?usage.peak_memory,
         cpu_time = ?usage.cpu_time,
+        oom_kills = usage.oom_kills,
         "action finished"
     );
 }

@@ -7,7 +7,7 @@ use gang_mtls::{CertificateAuthority, SubjectName};
 use gang_types::{CaPin, CertificatePem};
 
 use crate::deployment::Stack;
-use crate::endpoint::{ExecutionEndpoint, PublicEndpoint, WorkerEndpoint};
+use crate::endpoint::{PublicEndpoint, WorkerEndpoint};
 use crate::errors::ServerError;
 use crate::settings::{TlsSettings, TransportSettings};
 
@@ -39,8 +39,6 @@ pub(crate) struct TlsIdentity<K: Stack> {
 pub(crate) struct Names {
     /// The name the public listener's certificate is issued for.
     pub(crate) public: SubjectName,
-    /// The dedicated execution listener's additional name.
-    pub(crate) execution: Option<SubjectName>,
     /// The name the worker listener's certificate is issued for.
     pub(crate) worker: SubjectName,
 }
@@ -65,7 +63,6 @@ impl<K: Stack> Security<K> {
         };
         let names = Names {
             public: public.server_name()?,
-            execution: None,
             worker: worker.server_name()?,
         };
         let authority = CertificateAuthority::establish(
@@ -83,17 +80,6 @@ impl<K: Stack> Security<K> {
             authority: Arc::new(authority),
             pin,
         })))
-    }
-
-    /// Adds the dedicated execution listener's name under TLS.
-    pub(crate) fn set_execution(
-        &mut self,
-        execution: Option<&ExecutionEndpoint>,
-    ) -> Result<(), ServerError> {
-        if let Self::Tls(tls) = self {
-            tls.names.execution = execution.map(ExecutionEndpoint::server_name).transpose()?;
-        }
-        Ok(())
     }
 
     /// The certificate authority; `None` under plaintext.

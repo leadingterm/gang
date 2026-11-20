@@ -1,13 +1,14 @@
 use std::ffi::OsString;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use gang_clock::SystemClock;
 use gang_os::fs::ensure_private_dir;
 use gang_spi::{
-    ControllerHostPort, FleetSupply, Held, HostMilestone, InstanceIdentity, MountedScratchVolume,
-    NodeLifecyclePort, Plugin, PluginContext, PortError, PreemptionNotice, ProvisionerPort,
-    ScratchVolumePort, ServerEndpoints, Sidecar, WorkloadCredentialPort,
+    ControllerHostIdentity, ControllerHostPort, FleetSupply, Held, HostMilestone, InstanceIdentity,
+    MountedScratchVolume, NodeLifecyclePort, Plugin, PluginContext, PortError, PreemptionNotice,
+    ProvisionerPort, ScratchVolumePort, ServerEndpoints, Sidecar, WorkloadCredentialPort,
 };
 use gang_types::{
     Audience, Fleet, FleetName, InstanceId, Isa, Proof, Resources, TokenTtl, WorkerLifetime,
@@ -16,6 +17,7 @@ use gang_types::{
 use crate::config::{LocalConfig, LocalFleetOptions};
 use crate::errors::LocalError;
 use crate::fleet::{LaunchSpec, LocalFleet};
+use crate::host_identity;
 use crate::imds::{ImdsState, MockImds};
 use crate::imds_client::ImdsClient;
 use crate::jwt::JwtMinter;
@@ -33,19 +35,20 @@ use crate::worker_identity::WorkerIdentity;
 /// filesystem-touching port call, and the mock IMDS state when the provisioner attaches.
 ///
 /// It changes a fleet only through its [`ProvisionerPort`] methods, each under the fence's
-/// permission; it has no other way to write the state directory, such as recording a Spot
-/// interruption:
+/// permission. Controller incarnation may also persist private host identity metadata; it never
+/// changes the fleet. There is no unfenced fleet mutation such as recording a Spot interruption:
 ///
 /// ```compile_fail
 /// fn interrupt(local: &gang_local::Local, instance: &gang_types::InstanceId) {
 ///     let _ = local.request_preemption(&instance, gang_clock::Timestamp::from_unix_millis(0));
 /// }
 /// ```
+#[derive(Clone)]
 pub struct Local {
     /// Shared filesystem-backed provisioner state.
     state: Arc<LocalState>,
     /// Metadata client used by worker-facing ports.
-    imds_client: ImdsClient,
+    imds_client: Arc<ImdsClient>,
 }
 
 /// Filesystem-backed state shared with blocking port operations.
@@ -54,6 +57,10 @@ struct LocalState {
     layout: StateLayout,
     /// Records whether the state directories have been prepared.
     prepared: OnceLock<()>,
+    /// Persistent identity location for this configuration's logical controller host.
+    controller_host_path: PathBuf,
+    /// Identity shared by clones after its first successful disk read or creation.
+    controller_host_identity: OnceLock<InstanceId>,
     /// Worker fleet and its process operations.
     fleet: LocalFleet<WorkerProcesses, SystemClock>,
     /// Lazily initialized mock metadata service state.
@@ -114,6 +121,14 @@ impl Plugin for Local {
                 .collect(),
         };
         let layout = StateLayout::new(config.state_dir.into_path_buf());
+        let config_path = std::path::absolute(context.config_path).map_err(|source| {
+            LocalError::Io(gang_os::PathIo::new(
+                "resolve controller configuration path",
+                context.config_path,
+                source,
+            ))
+        })?;
+        let controller_host_path = layout.controller_host_path(&config_path);
         let fleet = LocalFleet::new(
             layout.clone(),
             launch,
@@ -126,17 +141,19 @@ impl Plugin for Local {
             state: Arc::new(LocalState {
                 layout,
                 prepared: OnceLock::new(),
+                controller_host_path,
+                controller_host_identity: OnceLock::new(),
                 fleet,
                 imds: OnceLock::new(),
                 imds_listen: config.mock_imds_listen.get(),
                 workload_token_audience: config.workload_token.audience,
                 workload_token_ttl: config.workload_token.ttl,
             }),
-            imds_client: ImdsClient::new(
+            imds_client: Arc::new(ImdsClient::new(
                 config.mock_imds_listen.get(),
                 config.imds_request_timeout,
                 Arc::new(SystemClock::new()),
-            )?,
+            )?),
         })
     }
 }
@@ -332,6 +349,19 @@ impl ProvisionerPort for Local {
 }
 
 impl ControllerHostPort for Local {
+    async fn incarnation(&self) -> Result<ControllerHostIdentity, PortError> {
+        self.blocking(|state| {
+            if let Some(instance) = state.controller_host_identity.get() {
+                return Ok(ControllerHostIdentity::Persistent(instance.clone()));
+            }
+            state.layout()?;
+            let instance = host_identity::load_or_create(&state.controller_host_path)?;
+            let _ = state.controller_host_identity.set(instance.clone());
+            Ok(ControllerHostIdentity::Persistent(instance))
+        })
+        .await
+    }
+
     /// Nothing retires a local host; `gang server` hands off on SIGTERM instead.
     async fn retiring(&self) -> Result<(), PortError> {
         std::future::pending().await
@@ -421,6 +451,125 @@ mod tests {
             },
         }))
         .expect("valid local config")
+    }
+
+    #[tokio::test]
+    async fn controller_identity_survives_clones_and_rebuilding() -> gang_testkit::TestResult {
+        let dir = tempfile::tempdir()?;
+        let listen: SocketAddr = "127.0.0.1:9".parse()?;
+        let state = dir.path().join("state");
+        let config_path = dir.path().join("controller.toml");
+        let context = PluginContext {
+            config_path: &config_path,
+        };
+        let local = Local::build(config(&state, listen), &context)?;
+        let clone = local.clone();
+        assert!(!state.exists());
+        let first = local.incarnation().await?;
+        assert!(matches!(first, ControllerHostIdentity::Persistent(_)));
+        assert_eq!(clone.incarnation().await?, first);
+        drop(local);
+        drop(clone);
+        let restarted = Local::build(config(&state, listen), &context)?;
+        assert_eq!(restarted.incarnation().await?, first);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn distinct_configs_sharing_state_have_distinct_controller_identities()
+    -> gang_testkit::TestResult {
+        let dir = tempfile::tempdir()?;
+        let listen: SocketAddr = "127.0.0.1:9".parse()?;
+        let state = dir.path().join("state");
+        let first_path = dir.path().join("controller-a.toml");
+        let second_path = dir.path().join("controller-b.toml");
+        let first = Local::build(
+            config(&state, listen),
+            &PluginContext {
+                config_path: &first_path,
+            },
+        )?;
+        let second = Local::build(
+            config(&state, listen),
+            &PluginContext {
+                config_path: &second_path,
+            },
+        )?;
+        let (first, second) = tokio::join!(first.incarnation(), second.incarnation());
+        assert_ne!(first?, second?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn independent_state_roots_do_not_derive_identity_from_the_config_path()
+    -> gang_testkit::TestResult {
+        let first_root = tempfile::tempdir()?;
+        let second_root = tempfile::tempdir()?;
+        ensure_private_dir(first_root.path())?;
+        ensure_private_dir(second_root.path())?;
+        let listen: SocketAddr = "127.0.0.1:9".parse()?;
+        let context = PluginContext {
+            config_path: Path::new("/installation/controller.toml"),
+        };
+        let first = Local::build(config(first_root.path(), listen), &context)?;
+        let second = Local::build(config(second_root.path(), listen), &context)?;
+        assert_ne!(first.incarnation().await?, second.incarnation().await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn controller_identity_rejects_insecure_root_before_creating_metadata()
+    -> gang_testkit::TestResult {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir()?;
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state)?;
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755))?;
+        let local = Local::build(config(&state, "127.0.0.1:9".parse()?), &plugin_context())?;
+        assert!(matches!(
+            local.incarnation().await,
+            Err(PortError::Config(_))
+        ));
+        assert!(!state.join("controller-hosts").exists());
+        assert_eq!(
+            std::fs::metadata(&state)?.permissions().mode() & 0o777,
+            0o755
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn controller_identity_uses_installation_symlink_not_its_target()
+    -> gang_testkit::TestResult {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir()?;
+        let state = dir.path().join("state");
+        let config_path = dir.path().join("controller.toml");
+        let target = dir.path().join("revision-a.toml");
+        std::fs::write(&target, "")?;
+        symlink(&target, &config_path)?;
+        let context = PluginContext {
+            config_path: &config_path,
+        };
+        let listen = "127.0.0.1:9".parse()?;
+        let local = Local::build(config(&state, listen), &context)?;
+        let first = local.incarnation().await?;
+        let target_host = Local::build(
+            config(&state, listen),
+            &PluginContext {
+                config_path: &target,
+            },
+        )?;
+        assert_ne!(target_host.incarnation().await?, first);
+        std::fs::remove_file(&config_path)?;
+        let replacement = dir.path().join("revision-b.toml");
+        std::fs::write(&replacement, "")?;
+        symlink(&replacement, &config_path)?;
+        let rebuilt = Local::build(config(&state, listen), &context)?;
+        assert_eq!(rebuilt.incarnation().await?, first);
+        Ok(())
     }
 
     #[test]

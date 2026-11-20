@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gang_client::{ClientError, ClientOptions, ServerApi};
-use gang_clock::TestClock;
+use gang_clock::{Clock, Sleep, TestClock, Tick, Timestamp};
 use gang_mtls::KeyPair;
 use gang_tls::ServerTrust;
 use gang_types::{
@@ -158,7 +158,10 @@ async fn error_answer_with_a_plain_text_body_carries_the_text() {
     let api = api(
         &harness.server.url(),
         ServerTrust::System,
-        &ClientOptions::default(),
+        &ClientOptions {
+            api_retry_budget: gang_types::NonZeroDuration::from_millis(1),
+            ..ClientOptions::default()
+        },
     );
 
     let error = api
@@ -405,7 +408,10 @@ async fn retry_info_of_the_envelope_is_the_wait_of_an_unavailable_answer() {
     let api = api(
         &harness.server.url(),
         ServerTrust::System,
-        &ClientOptions::default(),
+        &ClientOptions {
+            api_retry_budget: gang_types::NonZeroDuration::from_secs(1),
+            ..ClientOptions::default()
+        },
     );
 
     let error = api
@@ -498,4 +504,321 @@ async fn create_certificate_posts_the_signing_request_and_returns_the_certificat
     }
     assert_eq!(received[0].2, None);
     assert_eq!(received[1].2.as_deref(), Some("bearer-token"));
+}
+
+struct RetryClock {
+    clock: Arc<TestClock>,
+    delay: Duration,
+    sleeping: tokio::sync::Notify,
+}
+
+impl Clock for RetryClock {
+    fn wall(&self) -> Timestamp {
+        self.clock.wall()
+    }
+
+    fn monotonic(&self) -> Tick {
+        self.clock.monotonic()
+    }
+
+    fn sleep_until(&self, deadline: Tick) -> Sleep {
+        if deadline.saturating_duration_since(self.clock.monotonic()) == self.delay {
+            self.sleeping.notify_one();
+        }
+        self.clock.sleep_until(deadline)
+    }
+}
+
+fn retry_clock(clock: Arc<TestClock>, delay: Duration) -> Arc<RetryClock> {
+    Arc::new(RetryClock {
+        clock,
+        delay,
+        sleeping: tokio::sync::Notify::new(),
+    })
+}
+
+#[tokio::test]
+async fn marked_post_retries_identical_body_and_bearer() {
+    let harness = Harness::start_plain(ConsoleMode::Silent, no_auth_info()).await;
+    harness
+        .server
+        .script_responses(&[(503, &[("gang-request-not-started", "true")], b"warming")]);
+    let clock = retry_clock(harness.clock.clone(), Duration::from_millis(100));
+    let api = ServerApi::try_new(
+        &harness.server.url(),
+        ServerTrust::System,
+        &ClientOptions::default(),
+        clock.clone(),
+    )
+    .expect("client binds");
+    let request = CreateCertificateRequest {
+        provider: ProviderName::try_new("corp-ci").expect("valid provider"),
+        proof: Proof::new("worker-proof"),
+        pem_csr: KeyPair::generate()
+            .expect("key")
+            .certificate_request()
+            .expect("csr"),
+    };
+    let bearer = AccessToken::new("bearer-token");
+    let (result, ()) = tokio::join!(api.create_certificate(Some(&bearer), &request), async {
+        clock.sleeping.notified().await;
+        clock.clock.advance(clock.delay);
+    });
+    assert!(result.is_ok());
+    let requests = harness.server.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+    assert_eq!(requests[0].2.as_deref(), Some("bearer-token"));
+}
+
+#[tokio::test]
+async fn generic_get_refusal_retries() {
+    let harness = Harness::start_plain(ConsoleMode::Silent, no_auth_info()).await;
+    harness.server.script_responses(&[(503, &[], b"warming")]);
+    let clock = retry_clock(harness.clock.clone(), Duration::from_millis(100));
+    let api = ServerApi::try_new(
+        &harness.server.url(),
+        ServerTrust::System,
+        &ClientOptions::default(),
+        clock.clone(),
+    )
+    .expect("client binds");
+    let (result, ()) = tokio::join!(api.server(None), async {
+        clock.sleeping.notified().await;
+        clock.clock.advance(clock.delay);
+    });
+    assert!(result.is_ok());
+    assert_eq!(harness.server.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn unmarked_post_and_rate_limit_are_not_replayed() {
+    for status in [503, 429] {
+        let harness = Harness::start_plain(ConsoleMode::Silent, no_auth_info()).await;
+        harness
+            .server
+            .script_responses(&[(status, &[], b"refused")]);
+        let api = api(
+            &harness.server.url(),
+            ServerTrust::System,
+            &ClientOptions::default(),
+        );
+        assert!(api.create_device_authorization().await.is_err());
+        assert_eq!(harness.server.requests().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn retry_after_is_a_minimum_and_survives_budget_exhaustion() {
+    let harness = Harness::start_plain(ConsoleMode::Silent, no_auth_info()).await;
+    harness
+        .server
+        .script_responses(&[(503, &[("retry-after", "20")], b"warming")]);
+    let api = api(
+        &harness.server.url(),
+        ServerTrust::System,
+        &ClientOptions {
+            api_retry_budget: gang_types::NonZeroDuration::from_secs(1),
+            ..ClientOptions::default()
+        },
+    );
+    let error = api.server(None).await.expect_err("delay exceeds budget");
+    assert!(
+        matches!(error, ClientError::Server { status: 503, retry_after: Some(wait), .. } if wait == Duration::from_secs(20))
+    );
+    assert_eq!(harness.server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn retry_after_seconds_and_http_date_delay_retry() {
+    for value in ["2", "Mon, 01 Jan 2024 00:00:02 GMT"] {
+        let harness = Harness::start_plain(ConsoleMode::Silent, no_auth_info()).await;
+        harness
+            .server
+            .script_responses(&[(503, &[("retry-after", value)], b"warming")]);
+        let clock = retry_clock(harness.clock.clone(), Duration::from_secs(2));
+        let api = ServerApi::try_new(
+            &harness.server.url(),
+            ServerTrust::System,
+            &ClientOptions::default(),
+            clock.clone(),
+        )
+        .expect("client binds");
+        let (result, ()) = tokio::join!(api.server(None), async {
+            clock.sleeping.notified().await;
+            assert_eq!(harness.server.requests().len(), 1);
+            clock.clock.advance(clock.delay);
+        });
+        assert!(result.is_ok());
+        assert_eq!(harness.server.requests().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn grpc_unavailable_requires_marker_for_post() {
+    let harness = Harness::start_plain(ConsoleMode::Silent, no_auth_info()).await;
+    harness
+        .server
+        .script_responses(&[(200, &[("grpc-status", "14")], b"")]);
+    let api = api(
+        &harness.server.url(),
+        ServerTrust::System,
+        &ClientOptions::default(),
+    );
+    let error = api
+        .create_device_authorization()
+        .await
+        .expect_err("unmarked refusal");
+    assert!(
+        matches!(error, ClientError::Server { status: 503, ref message, .. } if message == "Service Unavailable")
+    );
+    assert_eq!(harness.server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn cancelling_during_retry_delay_does_not_send_again() {
+    let harness = Harness::start_plain(ConsoleMode::Silent, no_auth_info()).await;
+    harness.server.script_responses(&[(503, &[], b"warming")]);
+    let clock = retry_clock(harness.clock.clone(), Duration::from_millis(100));
+    let api = ServerApi::try_new(
+        &harness.server.url(),
+        ServerTrust::System,
+        &ClientOptions::default(),
+        clock.clone(),
+    )
+    .expect("client binds");
+    let mut request = Box::pin(api.server(None));
+    tokio::select! {
+        result = &mut request => panic!("unexpected completion: {result:?}"),
+        () = clock.sleeping.notified() => {}
+    }
+    drop(request);
+    clock.clock.advance(Duration::from_secs(1));
+    assert_eq!(harness.server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn unmarked_device_redemption_refusal_not_retried() {
+    let harness = Harness::start_plain(ConsoleMode::Silent, no_auth_info()).await;
+    harness
+        .server
+        .script_responses(&[(503, &[], b"issuer unavailable after consumption")]);
+    let api = api(
+        &harness.server.url(),
+        ServerTrust::System,
+        &ClientOptions::default(),
+    );
+    let secret = gang_types::DeviceSecret::new("device-secret");
+    let error = api
+        .redeem_device_authorization("code", &secret)
+        .await
+        .expect_err("issuer failed");
+    assert!(matches!(error, ClientError::Server { status: 503, .. }));
+    assert_eq!(harness.server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn retry_header_takes_precedence_over_envelope() {
+    let harness = Harness::start_plain(ConsoleMode::Silent, no_auth_info()).await;
+    let body = error_envelope(
+        Status::new(ErrorReason::DependencyUnavailable, "warming", [])
+            .with_retry_delay(Duration::from_secs(7)),
+    );
+    harness
+        .server
+        .script_responses(&[(503, &[("retry-after", "2")], &body)]);
+    let clock = retry_clock(harness.clock.clone(), Duration::from_secs(2));
+    let api = ServerApi::try_new(
+        &harness.server.url(),
+        ServerTrust::System,
+        &ClientOptions::default(),
+        clock.clone(),
+    )
+    .expect("client binds");
+    let (result, ()) = tokio::join!(api.server(None), async {
+        clock.sleeping.notified().await;
+        clock.clock.advance(clock.delay);
+    });
+    assert!(result.is_ok());
+    assert_eq!(harness.server.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn advancing_past_budget_during_backoff_returns_last_refusal() {
+    let harness = Harness::start_plain(ConsoleMode::Silent, no_auth_info()).await;
+    harness.server.script_responses(&[(503, &[], b"warming")]);
+    let clock = retry_clock(harness.clock.clone(), Duration::from_millis(100));
+    let options = ClientOptions::default();
+    let api = ServerApi::try_new(
+        &harness.server.url(),
+        ServerTrust::System,
+        &options,
+        clock.clone(),
+    )
+    .expect("client binds");
+    let (result, ()) = tokio::join!(api.server(None), async {
+        clock.sleeping.notified().await;
+        clock.clock.advance(options.api_retry_budget.get());
+    });
+    assert!(matches!(
+        result,
+        Err(ClientError::Server { status: 503, .. })
+    ));
+    assert_eq!(harness.server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn overall_budget_cancels_an_inflight_attempt_without_retry() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("address");
+    let url = Url::parse(&format!("http://{address}/")).expect("url");
+    let clock = Arc::new(TestClock::new(START));
+    let options = ClientOptions {
+        http_timeout: gang_types::NonZeroDuration::from_secs(30),
+        ..ClientOptions::default()
+    };
+    let api =
+        ServerApi::try_new(&url, ServerTrust::System, &options, clock.clone()).expect("client");
+    let (result, stream) = tokio::join!(api.server(None), async {
+        let (stream, _) = listener.accept().await.expect("connection");
+        clock.advance(options.api_retry_budget.get());
+        stream
+    });
+    assert!(matches!(result, Err(ClientError::Transport { .. })));
+    drop(stream);
+}
+
+#[tokio::test]
+async fn connection_failure_is_not_retried() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = Url::parse(&format!(
+        "http://{}/",
+        listener.local_addr().expect("address")
+    ))
+    .expect("url");
+    let clock = retry_clock(Arc::new(TestClock::new(START)), Duration::from_millis(100));
+    let api = ServerApi::try_new(
+        &url,
+        ServerTrust::System,
+        &ClientOptions::default(),
+        clock.clone(),
+    )
+    .expect("client");
+    let (result, ()) = tokio::join!(
+        async {
+            tokio::select! {
+                result = api.server(None) => result,
+                () = clock.sleeping.notified() => panic!("transport failure was retried"),
+            }
+        },
+        async {
+            let (stream, _) = listener.accept().await.expect("connection");
+            drop(stream);
+        }
+    );
+    assert!(matches!(result, Err(ClientError::Transport { .. })));
 }
