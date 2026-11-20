@@ -68,36 +68,39 @@ pub fn pool_oom_verdicts(
     escalation_percent: u32,
     capacity_kb: u64,
 ) -> Vec<Check> {
-    let victim: Vec<_> = attempts
-        .iter()
-        .filter(|a| a.action == Probe::PressureVictim.as_str())
-        .collect();
-    let neighbour: Vec<_> = attempts
-        .iter()
-        .filter(|a| a.action == Probe::PressureNeighbour.as_str())
-        .collect();
-    let retried = if victim.len() == 2 && neighbour.len() == 1 {
-        Some(&victim)
-    } else if victim.len() == 1 && neighbour.len() == 2 {
-        Some(&neighbour)
-    } else {
-        None
-    };
-    let escalated = retried.is_some_and(|records| {
-        let first = u128::from(records[0].memory_kb);
-        let required = (first * u128::from(escalation_percent))
-            .div_ceil(100)
-            .max(first + 1)
-            .min(u128::from(capacity_kb));
-        u128::from(records[1].memory_kb) >= required
-    });
+    let mut victim = None;
+    let mut neighbour = None;
+    let mut valid = true;
+    let mut retried = false;
+    for attempt in attempts {
+        let last = if attempt.action == Probe::PressureVictim.as_str() {
+            &mut victim
+        } else if attempt.action == Probe::PressureNeighbour.as_str() {
+            &mut neighbour
+        } else {
+            valid = false;
+            continue;
+        };
+        let memory = attempt.memory_kb;
+        valid &= memory > 0 && memory <= capacity_kb;
+        if let Some(previous) = *last {
+            retried = true;
+            let previous = u128::from(previous);
+            let required = (previous * u128::from(escalation_percent))
+                .div_ceil(100)
+                .max(previous + 1)
+                .min(u128::from(capacity_kb));
+            valid &= u128::from(memory) > previous && u128::from(memory) >= required;
+        }
+        *last = Some(memory);
+    }
     vec![
         Check::expect("kernel pool OOM is observed", events > 0, || {
             format!("pool oom_kill count: {events}")
         }),
         Check::expect(
             "kernel pool OOM is requeued with a larger reservation",
-            succeeded && attempts.len() == 3 && escalated,
+            succeeded && valid && retried && victim.is_some() && neighbour.is_some(),
             || format!("build succeeded={succeeded}, attempts={attempts:?}"),
         ),
     ]
