@@ -7,7 +7,8 @@ use std::process::ExitCode;
 use clap::Parser;
 use gang_spi::{EXEC_LINK_NAME, GUARD_LINK_NAME, JOIN_LINK_NAME, RESET_LINK_NAME};
 
-use crate::cli::{Cli, Command, DatabaseCommand, LocalCommand};
+use crate::cli::{Cli, Command, ConfigCommand, DatabaseCommand, LocalCommand};
+use crate::config_file::LoadedConfig;
 use crate::errors::{MainError, Result};
 use crate::output::{Output, Record};
 use crate::{
@@ -168,6 +169,10 @@ fn execute(command: Command, entrypoint: &Path, out: &Output) -> Result<ExitCode
         Command::Revoke(args) => client_command::revoke(args, out),
         Command::Restore(args) => client_command::restore(&args, out),
         Command::Server(args) => server_command::run(&args.config, out),
+        Command::Config(ConfigCommand::Check(args)) => {
+            LoadedConfig::load(&args.file)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Database(DatabaseCommand::Copy(args)) => database_command::run(args, out),
         Command::Worker(args) => worker_command::run(args, out),
         Command::LocalWorker(args) => {
@@ -222,6 +227,78 @@ mod tests {
             panic!("expected the exec multicall");
         };
         (entrypoint, argv)
+    }
+
+    fn check_config(path: PathBuf) -> Result<ExitCode> {
+        let (out, _stdout, _stderr) = Output::captured();
+        execute(
+            Command::Config(ConfigCommand::Check(crate::cli::ConfigCheckArgs {
+                file: path,
+            })),
+            Path::new("gang"),
+            &out,
+        )
+    }
+
+    #[test]
+    fn config_check_validates_local_without_creating_state() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let state = dir.path().join("state");
+        let path = dir.path().join("gang.toml");
+        let text = crate::config_file::tests::VALID_LOCAL_CONFIG.replace(
+            "state_dir = \"/tmp/gang-local\"",
+            &format!("state_dir = {:?}", state.to_str().expect("UTF-8 path")),
+        );
+        std::fs::write(&path, text).expect("write configuration");
+        assert_eq!(
+            check_config(path).expect("valid local config"),
+            ExitCode::SUCCESS
+        );
+        assert!(!state.exists());
+    }
+
+    #[test]
+    fn config_check_validates_aws_without_reading_secret() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let configs = std::env::var("GANG_CHECKED_IN_CONFIGS").expect("checked-in configurations");
+        let aws = configs
+            .split_whitespace()
+            .map(Path::new)
+            .find(|path| path.file_name().is_some_and(|name| name == "gang.aws.toml"))
+            .expect("AWS configuration");
+        let secret = dir.path().join("missing-secret");
+        let original = std::fs::read_to_string(aws).expect("read AWS configuration");
+        assert!(original.contains("/etc/gang/secrets/dashboard-client-secret"));
+        let text = original.replace(
+            "/etc/gang/secrets/dashboard-client-secret",
+            secret.to_str().expect("UTF-8 path"),
+        );
+        let path = dir.path().join("gang.toml");
+        std::fs::write(&path, text).expect("write configuration");
+        assert_eq!(
+            check_config(path).expect("valid AWS config"),
+            ExitCode::SUCCESS
+        );
+        assert!(!secret.exists());
+    }
+
+    #[test]
+    fn config_check_reports_parse_and_read_errors() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("gang.toml");
+        assert!(matches!(
+            check_config(path.clone()),
+            Err(MainError::ReadConfig { .. })
+        ));
+        let text = format!(
+            "bogus_setting = 1\n{}",
+            crate::config_file::tests::VALID_LOCAL_CONFIG
+        );
+        std::fs::write(&path, text).expect("write configuration");
+        assert!(matches!(
+            check_config(path),
+            Err(MainError::ParseConfig { .. })
+        ));
     }
 
     #[test]
@@ -471,7 +548,7 @@ mod tests {
 
     #[test]
     fn every_command_has_a_subject_named_after_its_command_line() {
-        let cases: [(&[&str], &str); 15] = [
+        let cases: [(&[&str], &str); 16] = [
             (
                 &["gang", "login", "--server", "https://example.com"],
                 "gang login",
@@ -487,6 +564,7 @@ mod tests {
                 "gang restore",
             ),
             (&["gang", "server", "--config", "x.toml"], "gang server"),
+            (&["gang", "config", "check", "x.toml"], "gang config check"),
             (&["gang", "worker", "--config", "x.toml"], "gang worker"),
             (&["gang", "exec", "true"], "gang exec"),
             (&["gang", "local", "up"], "gang local up"),
