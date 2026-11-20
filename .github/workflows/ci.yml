@@ -307,7 +307,8 @@ jobs:
         run: bazel run //:gazelle.check
       # Native ELF, shell/signal and PostgreSQL boundaries complement the full x86 suite (docs/SPECIFICATION.md §7).
       - name: Test
-        timeout-minutes: 10
+        # Allow 1.5x the observed cold ARM bundle build for compilation.
+        timeout-minutes: 40
         run: >-
           bazel test --build_event_json_file="$RUNNER_TEMP/bazel-test.bep.json" --profile="$RUNNER_TEMP/bazel-test.profile.gz"
           //crates/gang-main:gang_main_integration_tests_tests/static_binary_test
