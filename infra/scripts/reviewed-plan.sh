@@ -64,7 +64,8 @@ cmd_plan() {
   require RUNNER_TEMP GITHUB_OUTPUT
   local plan_file="$RUNNER_TEMP/infra.tfplan"
   local json_file="$RUNNER_TEMP/infra-plan.json"
-  local rc=0 policy_rc=0
+  local config_file="$RUNNER_TEMP/planned-gang.toml"
+  local rc=0 policy_rc=0 policy_output
 
   tofu -chdir="$ROOT" plan -detailed-exitcode -input=false -lock=false -out="$plan_file" || rc=$?
   case "$rc" in
@@ -73,15 +74,23 @@ cmd_plan() {
   esac
 
   tofu -chdir="$ROOT" show -json "$plan_file" >"$json_file"
-  "$GANG" deploy policy <"$json_file" >>"$GITHUB_OUTPUT" || policy_rc=$?
+  policy_output="$("$GANG" deploy policy <"$json_file")" || policy_rc=$?
   case "$policy_rc" in
     0) ;;
     3)
+      printf '%s\n' "$policy_output" >>"$GITHUB_OUTPUT"
       log "this revision must not merge"
       exit 3
       ;;
     *) die "policy check could not read $json_file" ;;
   esac
+
+  # A configuration that does not parse leaves no plan JSON, so no plan is stored or described.
+  if ! { "$GANG" deploy configuration <"$json_file" >"$config_file" && "$GANG" config check "$config_file"; }; then
+    rm -f "$json_file"
+    die "the planned configuration is not valid"
+  fi
+  printf '%s\n' "$policy_output" >>"$GITHUB_OUTPUT"
 }
 
 cmd_store() {
