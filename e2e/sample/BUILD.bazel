@@ -312,10 +312,13 @@ if [ "$uid" = 1000 ] && [ "$gid" = 1000 ] &&
    [ "$(awk -F: -v gid="$gid" '$3 == gid && $1 == "builder" { ok++ } END { print ok }' /etc/group)" = 1 ]; then
   echo identity=yes
 else echo identity=no; fi
-if [ "$(cat /etc/nsswitch.conf 2>/dev/null | tr -s ' ')" = "$(printf 'passwd: files\\ngroup: files\\nhosts: files')" ]; then echo nss=yes; else echo nss=no; fi
-if [ "$(find /etc -mindepth 1 | sort | tr '\\n' ',')" = "/etc/group,/etc/hosts,/etc/nsswitch.conf,/etc/passwd,/etc/pki,/etc/pki/tls,/etc/pki/tls/certs,/etc/pki/tls/certs/ca-bundle.crt,/etc/ssl,/etc/ssl/cert.pem,/etc/ssl/certs,/etc/ssl/certs/ca-certificates.crt," ]; then echo etc_contents=yes; else echo etc_contents=no; fi
+if [ "$(cat /etc/nsswitch.conf 2>/dev/null | tr -s ' ')" = "$(printf 'passwd: files\\ngroup: files\\nhosts: files dns')" ]; then echo nss=yes; else echo nss=no; fi
+if [ "$(find /etc -mindepth 1 | sort | tr '\\n' ',')" = "/etc/group,/etc/hosts,/etc/nsswitch.conf,/etc/passwd,/etc/pki,/etc/pki/tls,/etc/pki/tls/certs,/etc/pki/tls/certs/ca-bundle.crt,/etc/resolv.conf,/etc/ssl,/etc/ssl/cert.pem,/etc/ssl/certs,/etc/ssl/certs/ca-certificates.crt," ]; then echo etc_contents=yes; else echo etc_contents=no; fi
 readonly=yes
-for file in /etc/passwd /etc/group /etc/hosts /etc/nsswitch.conf /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem /etc/pki/tls/certs/ca-bundle.crt; do
+[ ! -s /etc/resolv.conf ] || readonly=no
+[ ! -L /etc/resolv.conf ] || readonly=no
+if (: >> /etc/resolv.conf) 2>/dev/null; then readonly=no; fi
+for file in /etc/passwd /etc/group /etc/hosts /etc/nsswitch.conf /etc/resolv.conf /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem /etc/pki/tls/certs/ca-bundle.crt; do
   [ -f "$file" ] || readonly=no
 done
 for point in / /etc /usr; do

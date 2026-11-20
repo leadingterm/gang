@@ -702,12 +702,14 @@ pub mod sandbox_contract {
     pub const WORKDIR_WRITABLE: &str = "the working directory of a bwrap action is writable";
     /// The numeric action identity resolves uniquely to builder.
     pub const IDENTITY: &str = "the action identity resolves uniquely to builder";
-    /// The action uses only files for user and group lookup.
-    pub const NSS: &str = "the action uses files-only identity lookup";
+    /// User and group lookup use files; host lookup uses files then DNS.
+    pub const NSS: &str = "the action uses files for identity and files then DNS for hosts";
     /// No other host configuration is visible under /etc.
-    pub const ETC_CONTENTS: &str = "the action sees only identity and public roots under /etc";
-    /// Identity and public root files are read-only.
-    pub const IDENTITY_ROOTS_READONLY: &str = "identity and public root files are read-only";
+    pub const ETC_CONTENTS: &str =
+        "the action sees only identity, resolver and public roots under /etc";
+    /// Identity, resolver and public root files are read-only.
+    pub const IDENTITY_ROOTS_READONLY: &str =
+        "identity, resolver and public root files are read-only";
     /// Native TLS loads the public system roots.
     pub const ROOTS: &str = "native TLS loads public system roots";
     /// Native TLS respects explicit missing certificate overrides.
