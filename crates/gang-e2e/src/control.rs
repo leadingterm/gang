@@ -39,6 +39,8 @@ pub struct ControlKnobs {
     pub vcpus_per_instance: Option<u32>,
     /// `[actions]` CPU reservation capacity multiplier.
     pub cpu_oversubscription: Option<NonZeroU32>,
+    /// Reserve the first fleet's physical CPU for each cold action.
+    pub cold_start_full_fleet_cpu: bool,
     /// A `[[fleets.scheduled_minimum]]` window in force at every instant (all seven `days`,
     /// `00:00` to `24:00`, `time_zone = "Asia/Kathmandu"`) with this many `instances`, on every
     /// `[[fleets]]` entry.
@@ -84,6 +86,7 @@ impl ControlKnobs {
         max_instances: None,
         vcpus_per_instance: None,
         cpu_oversubscription: None,
+        cold_start_full_fleet_cpu: false,
         scheduled_minimum: None,
         terminate_grace: None,
         detail_interval: None,
@@ -100,16 +103,19 @@ impl ControlKnobs {
         holdable_launches: false,
     };
 
-    /// Fleet placement builds: retain polling, use a ten-minute unknown-action prior to
-    /// justify cold overflow, and drain idle workers after two seconds.
+    /// Fleet placement builds: saturate the first worker with one cold action and drain
+    /// idle workers after two seconds.
     pub const FLEETS: Self = Self {
         idle_timeout: Some(Duration::from_secs(2)),
         terminate_grace: Some(Duration::from_secs(1)),
-        // Checked-in cold B=min(90s prior,60s boot_grace)=60s, idle=2s and
-        // default payback=50% give H=31s. Each one-slot action contributes
-        // 600/31>19 slots of transient work, so the second action still buys
-        // the next declared fleet after crediting the first planned worker.
-        unknown_action_duration: Some(Duration::from_mins(10)),
+        cpu_oversubscription: Some(NonZeroU32::MIN),
+        cold_start_full_fleet_cpu: true,
+        ..Self::NONE
+    };
+
+    /// Keep pressure and its retry on one worker's memory ledger.
+    pub const PRESSURE: Self = Self {
+        max_instances: Some(1),
         ..Self::NONE
     };
 
@@ -209,6 +215,7 @@ impl ControlKnobs {
         min_instances: Some(0),
         max_instances: Some(3),
         vcpus_per_instance: Some(1),
+        cpu_oversubscription: Some(NonZeroU32::MIN),
         holdable_launches: true,
         unknown_action_duration: Some(Duration::from_mins(10)),
         ..Self::NONE

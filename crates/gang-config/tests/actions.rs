@@ -303,7 +303,10 @@ fn cold_start_must_fit_one_fleet_unless_disabled() {
     );
     assert!(matches!(
         text.parse::<gang_config::GangConfig<Plugins>>(),
-        Err(gang_config::ConfigError::ColdStartFitsNoFleet { cpu_millicores: 3000, .. })
+        Err(gang_config::ConfigError::ColdStartFitsNoFleet {
+            cpu_millicores: 3000,
+            ..
+        })
     ));
     let disabled = format!("{text}enabled = false\n");
     assert!(disabled.parse::<gang_config::GangConfig<Plugins>>().is_ok());

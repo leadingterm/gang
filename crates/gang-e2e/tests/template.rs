@@ -457,6 +457,15 @@ fn rate_scaling_presets_render_typed_knobs() -> gang_e2e::Result<()> {
         backlog.scaling.unknown_action_duration.get(),
         std::time::Duration::from_mins(10),
     );
+    let fleet = &backlog.fleets[0];
+    assert_eq!(fleet.vcpus_per_instance.get(), 1);
+    assert_eq!(backlog.actions.cpu_oversubscription.get(), 1);
+    assert_eq!(fleet.max_instances.get(), 3);
+    let millicores_per_core = gang_types::property::MILLICORES_PER_CORE;
+    let held_cpu = 3 * u64::from(gang_e2e::HOLD_CPU_COUNT) * millicores_per_core;
+    let physical_cpu = u64::from(fleet.vcpus_per_instance.get()) * millicores_per_core;
+    let worker_cpu = physical_cpu * u64::from(backlog.actions.cpu_oversubscription.get());
+    assert_eq!(held_cpu.div_ceil(worker_cpu), 3);
     for (control, idle) in [
         (
             ControlKnobs::BURST_FROM_ZERO,
@@ -1139,8 +1148,7 @@ fn launch_failure_preset_sets_missing_launcher_and_short_timeout() -> gang_e2e::
 }
 
 #[test]
-fn fleets_preset_justifies_overflow_without_changing_placement_or_polling() -> gang_e2e::Result<()>
-{
+fn fleets_preset_saturates_first_fleet() -> gang_e2e::Result<()> {
     let base = base_config()?;
     for sandbox in [Sandbox::Noop, Sandbox::Bwrap] {
         let variant = placement_variant(sandbox);
@@ -1164,10 +1172,23 @@ fn fleets_preset_justifies_overflow_without_changing_placement_or_polling() -> g
         );
         assert_eq!(tuned.client_action_timeout, untuned.client_action_timeout);
         assert_eq!(tuned.fleets.len(), 3);
+        assert!(tuned.actions.cold_start.enabled);
+        assert_eq!(tuned.actions.cpu_oversubscription.get(), 1);
+        assert_eq!(tuned.fleets[0].vcpus_per_instance.get(), 4);
+        assert_eq!(tuned.actions.cold_start.cpu_millicores.get(), 4000);
+        assert_eq!(
+            u64::from(tuned.actions.cold_start.cpu_millicores.get()),
+            u64::from(tuned.fleets[0].vcpus_per_instance.get())
+                * gang_types::property::MILLICORES_PER_CORE
+        );
         assert_eq!(tuned.scaling.payback_percent.get(), 50);
         assert_eq!(
+            tuned.scaling.unknown_action_duration,
+            untuned.scaling.unknown_action_duration
+        );
+        assert_eq!(
             tuned.scaling.unknown_action_duration.get(),
-            std::time::Duration::from_mins(10),
+            std::time::Duration::from_secs(10)
         );
         for (fleet, before) in tuned.fleets.iter().zip(&untuned.fleets) {
             assert_eq!(fleet.name, before.name);
@@ -1186,6 +1207,32 @@ fn fleets_preset_justifies_overflow_without_changing_placement_or_polling() -> g
             std::time::Duration::from_secs(1)
         );
     }
+    Ok(())
+}
+
+#[test]
+fn pressure_preset_keeps_the_memory_ledger_on_one_worker() -> gang_e2e::Result<()> {
+    let variant = Variant {
+        limits: ActionLimits::Cgroup,
+        soft_memory: SoftMemory::Off,
+        control: ControlKnobs::PRESSURE,
+        execution: ExecutionKnobs {
+            resource_policy: Some(gang_e2e::ResourcePolicy::pressure_scenario()?),
+            ..ExecutionKnobs::NONE
+        },
+        ..Variant::baseline(Sandbox::Noop)
+    };
+    let tuned = typed_rendered(&ConfigTemplate::parse(&base_config()?)?.vary(
+        &variant,
+        &launcher(),
+        &*(tools()?),
+    )?)?;
+    assert_eq!(tuned.fleets.len(), 1);
+    assert_eq!(tuned.fleets[0].max_instances.get(), 1);
+    assert_eq!(
+        tuned.fleets[0].memory_per_instance,
+        gang_types::NonZeroBytes::mib(512)
+    );
     Ok(())
 }
 

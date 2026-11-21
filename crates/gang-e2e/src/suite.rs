@@ -1242,6 +1242,7 @@ fn pressure_checks(ctx: &RunContext<'_>) -> Vec<Check> {
         let variant = Variant {
             limits: ActionLimits::Cgroup,
             soft_memory: SoftMemory::Off,
+            control: ControlKnobs::PRESSURE,
             execution,
             ..Variant::baseline(Sandbox::Noop)
         };

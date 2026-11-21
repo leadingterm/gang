@@ -197,24 +197,24 @@ variables {
   trust_domain             = "example.com"
   fleets = [
     {
-      name                        = "gang-worker-x86-64"
-      isa                         = "x86-64"
-      capacity                    = "spot"
-      instance_types              = ["c6id.4xlarge"]
-      max_instances               = 4
-      vcpus_per_instance          = 15
-      memory_per_instance         = "29GiB"
-      disk_per_instance           = "200GiB"
+      name                = "gang-worker-x86-64"
+      isa                 = "x86-64"
+      capacity            = "spot"
+      instance_types      = ["c6id.4xlarge"]
+      max_instances       = 4
+      vcpus_per_instance  = 15
+      memory_per_instance = "29GiB"
+      disk_per_instance   = "200GiB"
     },
     {
-      name                        = "gang-worker-aarch64"
-      isa                         = "aarch64"
-      capacity                    = "on-demand"
-      instance_types              = ["c7gd.4xlarge"]
-      max_instances               = 4
-      vcpus_per_instance          = 15
-      memory_per_instance         = "29GiB"
-      disk_per_instance           = "200GiB"
+      name                = "gang-worker-aarch64"
+      isa                 = "aarch64"
+      capacity            = "on-demand"
+      instance_types      = ["c7gd.4xlarge"]
+      max_instances       = 4
+      vcpus_per_instance  = 15
+      memory_per_instance = "29GiB"
+      disk_per_instance   = "200GiB"
     },
   ]
 }
@@ -504,15 +504,15 @@ run "renders_scheduled_minimum" {
   variables {
     fleets = [
       {
-        name                        = "gang-worker-x86-64"
-        isa                         = "x86-64"
-        capacity                    = "spot"
-        instance_types              = ["c6id.4xlarge"]
-        max_instances               = 4
-        min_instances               = 0
-        vcpus_per_instance          = 15
-        memory_per_instance         = "29GiB"
-        disk_per_instance           = "200GiB"
+        name                = "gang-worker-x86-64"
+        isa                 = "x86-64"
+        capacity            = "spot"
+        instance_types      = ["c6id.4xlarge"]
+        max_instances       = 4
+        min_instances       = 0
+        vcpus_per_instance  = 15
+        memory_per_instance = "29GiB"
+        disk_per_instance   = "200GiB"
         scheduled_minimum = [{
           instances = 1
           days      = ["mon", "tue", "wed", "thu", "fri"]
@@ -522,14 +522,14 @@ run "renders_scheduled_minimum" {
         }]
       },
       {
-        name                        = "gang-worker-aarch64"
-        isa                         = "aarch64"
-        capacity                    = "on-demand"
-        instance_types              = ["c7gd.4xlarge"]
-        max_instances               = 4
-        vcpus_per_instance          = 15
-        memory_per_instance         = "29GiB"
-        disk_per_instance           = "200GiB"
+        name                = "gang-worker-aarch64"
+        isa                 = "aarch64"
+        capacity            = "on-demand"
+        instance_types      = ["c7gd.4xlarge"]
+        max_instances       = 4
+        vcpus_per_instance  = 15
+        memory_per_instance = "29GiB"
+        disk_per_instance   = "200GiB"
       },
     ]
   }
@@ -743,14 +743,14 @@ run "rejects_fleet_isa_outside_pattern" {
     default_isa = "X86"
     fleets = [
       {
-        name                        = "gang-worker-x86"
-        isa                         = "X86"
-        capacity                    = "spot"
-        instance_types              = ["c6id.4xlarge"]
-        max_instances               = 4
-        vcpus_per_instance          = 15
-        memory_per_instance         = "29GiB"
-        disk_per_instance           = "200GiB"
+        name                = "gang-worker-x86"
+        isa                 = "X86"
+        capacity            = "spot"
+        instance_types      = ["c6id.4xlarge"]
+        max_instances       = 4
+        vcpus_per_instance  = 15
+        memory_per_instance = "29GiB"
+        disk_per_instance   = "200GiB"
       },
     ]
   }
@@ -766,14 +766,14 @@ run "rejects_disk_per_instance_without_unit" {
   variables {
     fleets = [
       {
-        name                        = "gang-worker-x86-64"
-        isa                         = "x86-64"
-        capacity                    = "spot"
-        instance_types              = ["c6id.4xlarge"]
-        max_instances               = 4
-        vcpus_per_instance          = 15
-        memory_per_instance         = "29GiB"
-        disk_per_instance           = "200"
+        name                = "gang-worker-x86-64"
+        isa                 = "x86-64"
+        capacity            = "spot"
+        instance_types      = ["c6id.4xlarge"]
+        max_instances       = 4
+        vcpus_per_instance  = 15
+        memory_per_instance = "29GiB"
+        disk_per_instance   = "200"
       },
     ]
   }
@@ -876,26 +876,26 @@ run "fallback_fleet_gets_an_on_demand_twin" {
     aws_events_enabled = true
     fleets = [
       {
-        name                        = "gang-worker-x86-64"
-        isa                         = "x86-64"
-        capacity                    = "spot"
-        instance_types              = ["c6id.4xlarge"]
-        max_instances               = 4
-        vcpus_per_instance          = 15
-        memory_per_instance         = "29GiB"
-        disk_per_instance           = "200GiB"
-        fallback                    = {}
+        name                = "gang-worker-x86-64"
+        isa                 = "x86-64"
+        capacity            = "spot"
+        instance_types      = ["c6id.4xlarge"]
+        max_instances       = 4
+        vcpus_per_instance  = 15
+        memory_per_instance = "29GiB"
+        disk_per_instance   = "200GiB"
+        fallback            = {}
       },
       {
-        name                        = "gang-worker-aarch64"
-        isa                         = "aarch64"
-        capacity                    = "on-demand"
-        instance_types              = ["c7gd.4xlarge"]
-        max_instances               = 4
-        vcpus_per_instance          = 15
-        memory_per_instance         = "29GiB"
-        disk_per_instance           = "200GiB"
-        warm_pool_size              = 2
+        name                = "gang-worker-aarch64"
+        isa                 = "aarch64"
+        capacity            = "on-demand"
+        instance_types      = ["c7gd.4xlarge"]
+        max_instances       = 4
+        vcpus_per_instance  = 15
+        memory_per_instance = "29GiB"
+        disk_per_instance   = "200GiB"
+        warm_pool_size      = 2
       },
     ]
   }
@@ -957,15 +957,15 @@ run "rejects_fallback_on_on_demand_fleet" {
   variables {
     fleets = [
       {
-        name                        = "gang-worker-x86-64"
-        isa                         = "x86-64"
-        capacity                    = "on-demand"
-        instance_types              = ["c6id.4xlarge"]
-        max_instances               = 4
-        vcpus_per_instance          = 15
-        memory_per_instance         = "29GiB"
-        disk_per_instance           = "200GiB"
-        fallback                    = {}
+        name                = "gang-worker-x86-64"
+        isa                 = "x86-64"
+        capacity            = "on-demand"
+        instance_types      = ["c6id.4xlarge"]
+        max_instances       = 4
+        vcpus_per_instance  = 15
+        memory_per_instance = "29GiB"
+        disk_per_instance   = "200GiB"
+        fallback            = {}
       },
     ]
   }
@@ -981,15 +981,15 @@ run "rejects_warm_pool_without_on_demand_group" {
   variables {
     fleets = [
       {
-        name                        = "gang-worker-x86-64"
-        isa                         = "x86-64"
-        capacity                    = "spot"
-        instance_types              = ["c6id.4xlarge"]
-        max_instances               = 4
-        vcpus_per_instance          = 15
-        memory_per_instance         = "29GiB"
-        disk_per_instance           = "200GiB"
-        warm_pool_size              = 2
+        name                = "gang-worker-x86-64"
+        isa                 = "x86-64"
+        capacity            = "spot"
+        instance_types      = ["c6id.4xlarge"]
+        max_instances       = 4
+        vcpus_per_instance  = 15
+        memory_per_instance = "29GiB"
+        disk_per_instance   = "200GiB"
+        warm_pool_size      = 2
       },
     ]
   }
@@ -1091,14 +1091,14 @@ run "rejects_unknown_fleet_isa" {
   variables {
     default_isa = "riscv"
     fleets = [{
-      name                        = "worker"
-      isa                         = "riscv"
-      capacity                    = "spot"
-      instance_types              = ["c6id.4xlarge"]
-      max_instances               = 4
-      vcpus_per_instance          = 15
-      memory_per_instance         = "29GiB"
-      disk_per_instance           = "200GiB"
+      name                = "worker"
+      isa                 = "riscv"
+      capacity            = "spot"
+      instance_types      = ["c6id.4xlarge"]
+      max_instances       = 4
+      vcpus_per_instance  = 15
+      memory_per_instance = "29GiB"
+      disk_per_instance   = "200GiB"
     }]
   }
 
@@ -1110,14 +1110,14 @@ run "rejects_zero_fleet_disk" {
 
   variables {
     fleets = [{
-      name                        = "worker"
-      isa                         = "x86-64"
-      capacity                    = "spot"
-      instance_types              = ["c6id.4xlarge"]
-      max_instances               = 4
-      vcpus_per_instance          = 15
-      memory_per_instance         = "29GiB"
-      disk_per_instance           = "0B"
+      name                = "worker"
+      isa                 = "x86-64"
+      capacity            = "spot"
+      instance_types      = ["c6id.4xlarge"]
+      max_instances       = 4
+      vcpus_per_instance  = 15
+      memory_per_instance = "29GiB"
+      disk_per_instance   = "0B"
     }]
   }
 
@@ -1129,14 +1129,14 @@ run "rejects_zero_fleet_memory" {
 
   variables {
     fleets = [{
-      name                        = "worker"
-      isa                         = "x86-64"
-      capacity                    = "spot"
-      instance_types              = ["c6id.4xlarge"]
-      max_instances               = 4
-      vcpus_per_instance          = 15
-      memory_per_instance         = "0B"
-      disk_per_instance           = "200GiB"
+      name                = "worker"
+      isa                 = "x86-64"
+      capacity            = "spot"
+      instance_types      = ["c6id.4xlarge"]
+      max_instances       = 4
+      vcpus_per_instance  = 15
+      memory_per_instance = "0B"
+      disk_per_instance   = "200GiB"
     }]
   }
 
@@ -1148,14 +1148,14 @@ run "rejects_fleet_memory_below_min_reservation" {
 
   variables {
     fleets = [{
-      name                        = "worker"
-      isa                         = "x86-64"
-      capacity                    = "spot"
-      instance_types              = ["c6id.4xlarge"]
-      max_instances               = 4
-      vcpus_per_instance          = 15
-      memory_per_instance         = "67108863B"
-      disk_per_instance           = "200GiB"
+      name                = "worker"
+      isa                 = "x86-64"
+      capacity            = "spot"
+      instance_types      = ["c6id.4xlarge"]
+      max_instances       = 4
+      vcpus_per_instance  = 15
+      memory_per_instance = "67108863B"
+      disk_per_instance   = "200GiB"
     }]
   }
 
@@ -1167,14 +1167,14 @@ run "accepts_fleet_memory_equal_to_min_reservation" {
 
   variables {
     fleets = [{
-      name                        = "worker"
-      isa                         = "x86-64"
-      capacity                    = "spot"
-      instance_types              = ["c6id.4xlarge"]
-      max_instances               = 4
-      vcpus_per_instance          = 15
-      memory_per_instance         = "64MiB"
-      disk_per_instance           = "200GiB"
+      name                = "worker"
+      isa                 = "x86-64"
+      capacity            = "spot"
+      instance_types      = ["c6id.4xlarge"]
+      max_instances       = 4
+      vcpus_per_instance  = 15
+      memory_per_instance = "64MiB"
+      disk_per_instance   = "200GiB"
     }]
   }
 }
@@ -1184,14 +1184,14 @@ run "rejects_overflowing_fleet_size" {
 
   variables {
     fleets = [{
-      name                        = "worker"
-      isa                         = "x86-64"
-      capacity                    = "spot"
-      instance_types              = ["c6id.4xlarge"]
-      max_instances               = 4
-      vcpus_per_instance          = 15
-      memory_per_instance         = "29GiB"
-      disk_per_instance           = "16777216TiB"
+      name                = "worker"
+      isa                 = "x86-64"
+      capacity            = "spot"
+      instance_types      = ["c6id.4xlarge"]
+      max_instances       = 4
+      vcpus_per_instance  = 15
+      memory_per_instance = "29GiB"
+      disk_per_instance   = "16777216TiB"
     }]
   }
 
@@ -1203,14 +1203,14 @@ run "accepts_nonzero_sizes_with_leading_zeroes" {
 
   variables {
     fleets = [{
-      name                        = "worker"
-      isa                         = "x86-64"
-      capacity                    = "spot"
-      instance_types              = ["c6id.4xlarge"]
-      max_instances               = 4
-      vcpus_per_instance          = 15
-      memory_per_instance         = "0001GiB"
-      disk_per_instance           = "0001B"
+      name                = "worker"
+      isa                 = "x86-64"
+      capacity            = "spot"
+      instance_types      = ["c6id.4xlarge"]
+      max_instances       = 4
+      vcpus_per_instance  = 15
+      memory_per_instance = "0001GiB"
+      disk_per_instance   = "0001B"
     }]
   }
 }
@@ -1221,15 +1221,15 @@ run "rejects_min_instances_above_max_instances" {
   variables {
     fleets = [
       {
-        name                        = "gang-worker-x86-64"
-        isa                         = "x86-64"
-        capacity                    = "spot"
-        instance_types              = ["c6id.4xlarge"]
-        max_instances               = 4
-        min_instances               = 5
-        vcpus_per_instance          = 15
-        memory_per_instance         = "29GiB"
-        disk_per_instance           = "200GiB"
+        name                = "gang-worker-x86-64"
+        isa                 = "x86-64"
+        capacity            = "spot"
+        instance_types      = ["c6id.4xlarge"]
+        max_instances       = 4
+        min_instances       = 5
+        vcpus_per_instance  = 15
+        memory_per_instance = "29GiB"
+        disk_per_instance   = "200GiB"
       },
     ]
   }
@@ -1245,14 +1245,14 @@ run "rejects_zero_vcpus_per_instance" {
   variables {
     fleets = [
       {
-        name                        = "gang-worker-x86-64"
-        isa                         = "x86-64"
-        capacity                    = "spot"
-        instance_types              = ["c6id.4xlarge"]
-        max_instances               = 4
-        vcpus_per_instance          = 0
-        memory_per_instance         = "29GiB"
-        disk_per_instance           = "200GiB"
+        name                = "gang-worker-x86-64"
+        isa                 = "x86-64"
+        capacity            = "spot"
+        instance_types      = ["c6id.4xlarge"]
+        max_instances       = 4
+        vcpus_per_instance  = 0
+        memory_per_instance = "29GiB"
+        disk_per_instance   = "200GiB"
       },
     ]
   }
@@ -1268,14 +1268,14 @@ run "rejects_vcpus_per_instance_above_u32" {
   variables {
     fleets = [
       {
-        name                        = "gang-worker-x86-64"
-        isa                         = "x86-64"
-        capacity                    = "spot"
-        instance_types              = ["c6id.4xlarge"]
-        max_instances               = 4
-        vcpus_per_instance          = 4294967296
-        memory_per_instance         = "29GiB"
-        disk_per_instance           = "200GiB"
+        name                = "gang-worker-x86-64"
+        isa                 = "x86-64"
+        capacity            = "spot"
+        instance_types      = ["c6id.4xlarge"]
+        max_instances       = 4
+        vcpus_per_instance  = 4294967296
+        memory_per_instance = "29GiB"
+        disk_per_instance   = "200GiB"
       },
     ]
   }
@@ -1291,14 +1291,14 @@ run "rejects_zero_max_instances" {
   variables {
     fleets = [
       {
-        name                        = "gang-worker-x86-64"
-        isa                         = "x86-64"
-        capacity                    = "spot"
-        instance_types              = ["c6id.4xlarge"]
-        max_instances               = 0
-        vcpus_per_instance          = 15
-        memory_per_instance         = "29GiB"
-        disk_per_instance           = "200GiB"
+        name                = "gang-worker-x86-64"
+        isa                 = "x86-64"
+        capacity            = "spot"
+        instance_types      = ["c6id.4xlarge"]
+        max_instances       = 0
+        vcpus_per_instance  = 15
+        memory_per_instance = "29GiB"
+        disk_per_instance   = "200GiB"
       },
     ]
   }
@@ -1418,14 +1418,14 @@ run "single_architecture_uses_matching_digest" {
 
   variables {
     fleets = [{
-      name                        = "worker"
-      isa                         = "x86-64"
-      capacity                    = "spot"
-      instance_types              = ["c6id.4xlarge"]
-      max_instances               = 4
-      vcpus_per_instance          = 15
-      memory_per_instance         = "29GiB"
-      disk_per_instance           = "200GiB"
+      name                = "worker"
+      isa                 = "x86-64"
+      capacity            = "spot"
+      instance_types      = ["c6id.4xlarge"]
+      max_instances       = 4
+      vcpus_per_instance  = 15
+      memory_per_instance = "29GiB"
+      disk_per_instance   = "200GiB"
     }]
   }
 
@@ -1581,15 +1581,15 @@ run "fleet_image_override" {
       x86_64 = { owner = "self", sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
     }
     fleets = [{
-      name                        = "worker"
-      isa                         = "x86-64"
-      capacity                    = "spot"
-      image                       = { owner = "000000000000", sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
-      instance_types              = ["c6id.4xlarge"]
-      max_instances               = 4
-      vcpus_per_instance          = 15
-      memory_per_instance         = "29GiB"
-      disk_per_instance           = "200GiB"
+      name                = "worker"
+      isa                 = "x86-64"
+      capacity            = "spot"
+      image               = { owner = "000000000000", sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
+      instance_types      = ["c6id.4xlarge"]
+      max_instances       = 4
+      vcpus_per_instance  = 15
+      memory_per_instance = "29GiB"
+      disk_per_instance   = "200GiB"
     }]
   }
 
@@ -1676,14 +1676,14 @@ run "fleet_named_controller_rejected" {
 
   variables {
     fleets = [{
-      name                        = "controller"
-      isa                         = "x86-64"
-      capacity                    = "spot"
-      instance_types              = ["c6id.4xlarge"]
-      max_instances               = 4
-      vcpus_per_instance          = 15
-      memory_per_instance         = "29GiB"
-      disk_per_instance           = "200GiB"
+      name                = "controller"
+      isa                 = "x86-64"
+      capacity            = "spot"
+      instance_types      = ["c6id.4xlarge"]
+      max_instances       = 4
+      vcpus_per_instance  = 15
+      memory_per_instance = "29GiB"
+      disk_per_instance   = "200GiB"
     }]
   }
 

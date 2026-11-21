@@ -195,24 +195,24 @@ variables {
   trust_domain             = "example.com"
   fleets = [
     {
-      name                        = "gang-worker-x86-64"
-      isa                         = "x86-64"
-      capacity                    = "spot"
-      instance_types              = ["c6id.4xlarge"]
-      max_instances               = 4
-      vcpus_per_instance          = 15
-      memory_per_instance         = "29GiB"
-      disk_per_instance           = "200GiB"
+      name                = "gang-worker-x86-64"
+      isa                 = "x86-64"
+      capacity            = "spot"
+      instance_types      = ["c6id.4xlarge"]
+      max_instances       = 4
+      vcpus_per_instance  = 15
+      memory_per_instance = "29GiB"
+      disk_per_instance   = "200GiB"
     },
     {
-      name                        = "gang-worker-aarch64"
-      isa                         = "aarch64"
-      capacity                    = "on-demand"
-      instance_types              = ["c7gd.4xlarge"]
-      max_instances               = 4
-      vcpus_per_instance          = 15
-      memory_per_instance         = "29GiB"
-      disk_per_instance           = "200GiB"
+      name                = "gang-worker-aarch64"
+      isa                 = "aarch64"
+      capacity            = "on-demand"
+      instance_types      = ["c7gd.4xlarge"]
+      max_instances       = 4
+      vcpus_per_instance  = 15
+      memory_per_instance = "29GiB"
+      disk_per_instance   = "200GiB"
     },
   ]
 }

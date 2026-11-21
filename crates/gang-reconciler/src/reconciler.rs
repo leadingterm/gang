@@ -192,12 +192,7 @@ impl Reconciler {
             repair_workers: Vec::with_capacity(capacity),
             first_pass: None,
             first_wall: None,
-            planner: WorkPlanner::new(
-                fleets,
-                Arc::clone(&scaling),
-                profiles,
-                cpu_oversubscription,
-            ),
+            planner: WorkPlanner::new(fleets, Arc::clone(&scaling), profiles, cpu_oversubscription),
             cpu_oversubscription,
             running_reservations: Vec::with_capacity(capacity),
             scaling,
@@ -295,7 +290,10 @@ impl Reconciler {
                 supply: &fleet.supply,
                 needed: fleet.outlook.needed,
                 minimum: fleet.outlook.minimum,
-                ceiling: fleet.outlook.demand.instances(&fleet.policy, self.cpu_oversubscription),
+                ceiling: fleet
+                    .outlook
+                    .demand
+                    .instances(&fleet.policy, self.cpu_oversubscription),
                 need: if self.planner.work(index) < fleet.outlook.needed {
                     NeedCause::Minimum
                 } else {
@@ -349,9 +347,8 @@ impl Reconciler {
                             .saturating_mul(gang_types::property::MILLICORES_PER_CORE)
                             .saturating_mul(u64::from(self.cpu_oversubscription.get()));
                         resources.cpu_millicores = resources.cpu_millicores.max(cpu);
-                        resources.memory = resources
-                            .memory
-                            .max(fleet.policy.memory_per_instance.get());
+                        resources.memory =
+                            resources.memory.max(fleet.policy.memory_per_instance.get());
                         resources.disk = resources.disk.max(fleet.policy.disk_per_instance.get());
                     }
                     fleet.outlook.demand.add_running_resources(resources);

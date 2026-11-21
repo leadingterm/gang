@@ -293,23 +293,23 @@ variable "fleets" {
         disk      = optional(string)
       }), {})
     }), {})
-    capacity                    = string
-    machine_class               = optional(string, null)
-    image                       = optional(object({ owner = string, sha256 = string }), null)
-    instance_types              = list(string)
-    max_instances               = number
-    min_instances               = optional(number, 0)
-    vcpus_per_instance          = number
-    memory_per_instance         = string
-    disk_per_instance           = string
-    idle_timeout                = optional(string, "10m")
-    max_drain_wait              = optional(string, "25m")
-    boot_grace                  = optional(string, "10m")
-    scratch_volume_gib          = optional(number, null)
-    root_volume_gib             = optional(number)
-    warm_pool_size              = optional(number, 0)
-    fallback                    = optional(object({ retry_spot_after = optional(string, "5m"), drain_on_demand_first = optional(bool, true) }), null)
-    scheduled_minimum           = optional(list(object({ instances = number, days = list(string), start = string, end = string, time_zone = string })), [])
+    capacity            = string
+    machine_class       = optional(string, null)
+    image               = optional(object({ owner = string, sha256 = string }), null)
+    instance_types      = list(string)
+    max_instances       = number
+    min_instances       = optional(number, 0)
+    vcpus_per_instance  = number
+    memory_per_instance = string
+    disk_per_instance   = string
+    idle_timeout        = optional(string, "10m")
+    max_drain_wait      = optional(string, "25m")
+    boot_grace          = optional(string, "10m")
+    scratch_volume_gib  = optional(number, null)
+    root_volume_gib     = optional(number)
+    warm_pool_size      = optional(number, 0)
+    fallback            = optional(object({ retry_spot_after = optional(string, "5m"), drain_on_demand_first = optional(bool, true) }), null)
+    scheduled_minimum   = optional(list(object({ instances = number, days = list(string), start = string, end = string, time_zone = string })), [])
   }))
   description = <<-EOT
     Worker fleets in preference order: the scheduler tries them in list order. Each fleet is one Auto Scaling group; a fleet with `fallback` also has an on-demand twin group `<name>-on-demand`.

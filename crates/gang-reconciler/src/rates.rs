@@ -12,7 +12,7 @@ use gang_spi::{CompletionRates, SchedulerSnapshot};
 use gang_types::{SourceId, property::MILLICORES_PER_CORE};
 
 use crate::profile::{ActivityForecast, SourceProfiles};
-use crate::vectors::{CapacityVector, Horizon, ResourceVector, product, u128_to_u64, u64_to_f64};
+use crate::vectors::{CapacityVector, Horizon, ResourceVector, product, u64_to_f64, u128_to_u64};
 use crate::{FleetPass, HostedSnapshot, PassTime};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -972,7 +972,10 @@ mod tests {
     }
 
     fn test_resources() -> ActionResources {
-        ActionResources { cpu_millicores: 16_000, ..ActionResources::default() }
+        ActionResources {
+            cpu_millicores: 16_000,
+            ..ActionResources::default()
+        }
     }
 
     fn queued(source: Option<SourceId>, preferred: usize, expected: Option<u64>) -> QueuedDemand {
@@ -1322,7 +1325,10 @@ mod tests {
         world.queue(23, Some(20));
         world.observe(41);
         assert_eq!(world.rates.fleet(0).arrival_load, CapacityVector::default());
-        assert_eq!(world.rates.fleet(0).completion_load, CapacityVector::default());
+        assert_eq!(
+            world.rates.fleet(0).completion_load,
+            CapacityVector::default()
+        );
     }
 
     #[test]
@@ -1367,7 +1373,10 @@ mod tests {
                 let arrivals = (world.rates.kappa * (cell.n - cell.nbar) + completion).max(0.0);
                 near(arrivals, 0.0, 1e-12);
                 assert!(!cell.persistent);
-                assert_eq!(world.rates.fleet(0).persistent_queue, CapacityVector::default());
+                assert_eq!(
+                    world.rates.fleet(0).persistent_queue,
+                    CapacityVector::default()
+                );
             }
         }
     }
@@ -1463,7 +1472,10 @@ mod tests {
         assert!(world.rates.fleet(0).total_load.cpu > 0.0);
         world.observe(71);
         assert_eq!(world.rates.fleet(0).total_load, CapacityVector::default());
-        assert_eq!(world.rates.fleet(0).persistent_load, CapacityVector::default());
+        assert_eq!(
+            world.rates.fleet(0).persistent_load,
+            CapacityVector::default()
+        );
         exact(world.cell(source(1), 0).nbar, 0.0);
         assert_eq!(world.cell(source(1), 0).rbar, ResourceVector::default());
         assert_eq!(world.rates.previous_rows.len(), 1);
@@ -1712,11 +1724,7 @@ mod tests {
         world.complete(source(1), 0, 10, 100, Some(10), test_resources());
         world.observe(10);
         let rho = 1000.0 * world.rates.kappa;
-        near(
-            world.rates.fleet(0).persistent_load.cpu,
-            rho - 3.0,
-            1e-12,
-        );
+        near(world.rates.fleet(0).persistent_load.cpu, rho - 3.0, 1e-12);
         exact(world.rates.fleet(1).persistent_load.cpu, 3.0);
         exact(world.rates.fleet(1).total_load.cpu, 3.0);
         exact(world.rates.fleet(1).serving_load.cpu, 0.0);
@@ -1801,7 +1809,10 @@ mod tests {
     #[test]
     fn missing_rows_preserve_known_reservations_above_worker_budget() {
         let mut world = World::new(1, 2);
-        world.snapshot.workers.push(worker(&world.fleets[0].policy, "local-1", 2, false));
+        world
+            .snapshot
+            .workers
+            .push(worker(&world.fleets[0].policy, "local-1", 2, false));
         let mut row = executing(source(1), 0, 0, Some(10));
         row.resources.cpu_millicores = 32_000;
         world.snapshot.executing.push(row);
@@ -1817,7 +1828,10 @@ mod tests {
     fn cpu_oversubscription_normalizes_running_load_but_not_memory() {
         let mut world = World::new(1, 2);
         world.rates.cpu_oversubscription = nonzero_u32(2);
-        world.snapshot.workers.push(worker(&world.fleets[0].policy, "local-1", 1, false));
+        world
+            .snapshot
+            .workers
+            .push(worker(&world.fleets[0].policy, "local-1", 1, false));
         let mut row = executing(source(1), 0, 0, Some(10));
         row.resources.memory = world.fleets[0].policy.memory_per_instance.get();
         world.snapshot.executing.push(row);
@@ -1825,9 +1839,11 @@ mod tests {
         let load = world.rates.fleet(0).serving_load;
         exact(load.cpu, 0.5);
         exact(load.memory, 1.0);
-        exact(load.utilization(CapacityVector::ONE.scaled(2.0)).unwrap(), 0.5);
+        exact(
+            load.utilization(CapacityVector::ONE.scaled(2.0)).unwrap(),
+            0.5,
+        );
     }
-
 
     fn trace(cadence: u64) -> (Moments, f64) {
         let mut world = World::configured(
@@ -2078,11 +2094,7 @@ mod tests {
             world.cell(source(1), 0).moments.work,
             ResourceVector::default()
         );
-        near(
-            world.rates.fleet(0).total_load.cpu,
-            0.0,
-            1e-14,
-        );
+        near(world.rates.fleet(0).total_load.cpu, 0.0, 1e-14);
         exact(world.rates.fleet(0).total_load.cpu, 0.0);
         exact(world.rates.fleet(0).total_load.memory, 0.0);
         exact(world.rates.fleet(0).total_load.disk, 0.0);

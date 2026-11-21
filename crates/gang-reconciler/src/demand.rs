@@ -98,7 +98,9 @@ impl Demand {
     /// plays no part: the pass raises the need to the minimum in force.
     #[must_use]
     pub fn instances(&self, policy: &FleetPolicy, cpu_oversubscription: NonZeroU32) -> u32 {
-        let need: u32 = self.uncapped_need(policy, cpu_oversubscription).saturating_into();
+        let need: u32 = self
+            .uncapped_need(policy, cpu_oversubscription)
+            .saturating_into();
         need.min(policy.instances.max().get())
     }
 

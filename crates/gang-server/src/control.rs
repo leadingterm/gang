@@ -144,12 +144,8 @@ where
             .map(|policy| policy.boot_grace)
             .max()
             .unwrap_or_default();
-        let reconciler = Reconciler::new(
-            fleets.policies(),
-            scaling,
-            profiles,
-            cpu_oversubscription,
-        );
+        let reconciler =
+            Reconciler::new(fleets.policies(), scaling, profiles, cpu_oversubscription);
         Self {
             fleets,
             configs,

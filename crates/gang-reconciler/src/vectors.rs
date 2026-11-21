@@ -176,9 +176,7 @@ impl CapacityVector {
 
     pub fn within(self, cap: Self, fraction: f64) -> bool {
         let cap = cap.scaled(fraction);
-        self.cpu <= cap.cpu
-            && self.memory <= cap.memory
-            && self.disk <= cap.disk
+        self.cpu <= cap.cpu && self.memory <= cap.memory && self.disk <= cap.disk
     }
 
     pub fn utilization(self, cap: Self) -> Option<f64> {
@@ -255,7 +253,9 @@ mod tests {
             ..ResourceVector::default()
         };
         exact(
-            (cpu + memory).normalized(&policy, NonZeroU32::MIN).max_component(),
+            (cpu + memory)
+                .normalized(&policy, NonZeroU32::MIN)
+                .max_component(),
             1.0,
         );
         exact(
