@@ -24,6 +24,7 @@ mod linux {
         let mut command = Command::new(root.join("gang-exec"));
         command
             .current_dir(&work)
+            .process_group(0)
             .arg("./probe")
             .arg(mode)
             .arg(address)
@@ -55,6 +56,23 @@ mod linux {
             Ok::<(), std::io::Error>(())
         })
         .await??;
+        Ok(())
+    }
+
+    async fn check_granted_termination(root: &Path) -> Result<()> {
+        let work = root.join("work/granted-termination/work");
+        fs::create_dir_all(&work)?;
+        let listener = UnixListener::bind(work.join("control.sock"))?;
+        let mut child = start(root, "granted-termination", true, "termination", "127.0.0.1")?;
+        let group = gang_os::ProcessGroup::of(&child).ok_or("action has no process group")?;
+        signal(&listener).await?;
+        // Signal NativeLink's original gang-exec group, not the payload's guest group.
+        group.terminate()?;
+        let status = tokio::time::timeout(Duration::from_secs(30), child.wait()).await??;
+        group.disarm();
+        if status.code() != Some(42) {
+            return Err(format!("terminated action exited {status}, expected code 42").into());
+        }
         Ok(())
     }
 
@@ -138,6 +156,7 @@ mod linux {
         .await??;
         wait(a, true).await?;
         wait(b, true).await?;
+        check_granted_termination(&root).await?;
         check_prerequisites(&root, &config_path, &text).await?;
         fs::write(root.join("all-done"), b"done")?;
         Ok(())

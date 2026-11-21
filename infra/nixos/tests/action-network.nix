@@ -20,9 +20,23 @@
       if (fd < 0) return -1;
       return close(fd);
     }
+    static int termination(void) {
+      sigset_t signals;
+      if (sigemptyset(&signals) || sigaddset(&signals, SIGTERM) ||
+          sigprocmask(SIG_BLOCK, &signals, NULL)) return 2;
+      int control = socket(AF_UNIX, SOCK_STREAM, 0);
+      struct sockaddr_un un = {.sun_family = AF_UNIX, .sun_path = "control.sock"};
+      char byte = 'x';
+      if (control < 0 || connect(control, (void *)&un, sizeof(un)) ||
+          write(control, &byte, 1) != 1) return 2;
+      int received;
+      if (sigwait(&signals, &received) || received != SIGTERM) return 2;
+      return 42;
+    }
     int main(int argc, char **argv) {
       if (argc != 3 || marker("started")) return 2;
       alarm(20);
+      if (!strcmp(argv[1], "termination")) return termination();
       int fd = socket(AF_INET, SOCK_STREAM, 0);
       if (fd < 0) return 2;
       struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(18080)};

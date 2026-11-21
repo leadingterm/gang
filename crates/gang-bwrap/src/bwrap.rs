@@ -181,11 +181,11 @@ fn validate_egress_paths(egress: Option<&EgressPrograms>) -> Result<(), PortErro
 /// as an error from this port. `Signaled(n)` means `bwrap` itself was killed: a termination
 /// relayed before the action exists ends `bwrap` with `SIGKILL`, reported as `Signaled(9)`.
 ///
-/// `bwrap` remains in the action's original process group with termination signals blocked, and
-/// the action runs in a process group of its own, so the returned action is relayed: its caller
-/// stays in the original group, receives the terminations sent to it, and relays them to the
-/// action's group once the action exists, or kills `bwrap` before. The sandbox's action resets its
-/// mask.
+/// For offline actions, `bwrap` remains in the action's original process group with termination
+/// signals blocked. With public egress, the launcher, pasta, and outer `bwrap` instead run in the
+/// worker's process group: pasta resets its signal mask and handles termination signals itself.
+/// The caller stays in the original group and relays terminations to the action's own group once
+/// it exists, or kills the launcher before. The sandbox's action resets its mask.
 ///
 /// With limits, `bwrap` is started through the scope's launcher, so the sandbox and every process
 /// in it run inside the scope.
@@ -203,6 +203,9 @@ impl Bwrap {
         let mut command =
             tokio::process::Command::from(self.command(spec, writer.as_raw_fd(), network));
         command.kill_on_drop(true);
+        if network.is_some() {
+            command.process_group(gang_os::parent_process_group().map_err(BwrapError::NetworkSetup)?);
+        }
         let blocked = gang_os::block_terminations().map_err(BwrapError::SignalMask)?;
         // These descriptors are inherited by bwrap (and by gang-join when a launcher is used).
         rustix::io::fcntl_setfd(&writer, rustix::io::FdFlags::empty())
@@ -278,6 +281,7 @@ impl ActionIsolationPort for Bwrap {
             }
         };
         let mut started = self.spawn(spec, resolver.as_ref().map(AsFd::as_fd))?;
+        drop(resolver);
         match spec.network {
             NetworkAccess::PublicEgress { policy, .. } => {
                 tokio::time::timeout(policy.setup_timeout.get(), started.read_info())
