@@ -293,23 +293,24 @@ variable "fleets" {
         disk      = optional(string)
       }), {})
     }), {})
-    capacity            = string
-    machine_class       = optional(string, null)
-    image               = optional(object({ owner = string, sha256 = string }), null)
-    instance_types      = list(string)
-    max_instances       = number
-    min_instances       = optional(number, 0)
-    vcpus_per_instance  = number
-    memory_per_instance = string
-    disk_per_instance   = string
-    idle_timeout        = optional(string, "10m")
-    max_drain_wait      = optional(string, "25m")
-    boot_grace          = optional(string, "10m")
-    scratch_volume_gib  = optional(number, null)
-    root_volume_gib     = optional(number)
-    warm_pool_size      = optional(number, 0)
-    fallback            = optional(object({ retry_spot_after = optional(string, "5m"), drain_on_demand_first = optional(bool, true) }), null)
-    scheduled_minimum   = optional(list(object({ instances = number, days = list(string), start = string, end = string, time_zone = string })), [])
+    capacity                 = string
+    machine_class            = optional(string, null)
+    image                    = optional(object({ owner = string, sha256 = string }), null)
+    instance_types           = list(string)
+    spot_allocation_strategy = optional(string, "price-capacity-optimized")
+    max_instances            = number
+    min_instances            = optional(number, 0)
+    vcpus_per_instance       = number
+    memory_per_instance      = string
+    disk_per_instance        = string
+    idle_timeout             = optional(string, "10m")
+    max_drain_wait           = optional(string, "25m")
+    boot_grace               = optional(string, "10m")
+    scratch_volume_gib       = optional(number, null)
+    root_volume_gib          = optional(number)
+    warm_pool_size           = optional(number, 0)
+    fallback                 = optional(object({ retry_spot_after = optional(string, "5m"), drain_on_demand_first = optional(bool, true) }), null)
+    scheduled_minimum        = optional(list(object({ instances = number, days = list(string), start = string, end = string, time_zone = string })), [])
   }))
   description = <<-EOT
     Worker fleets in preference order: the scheduler tries them in list order. Each fleet is one Auto Scaling group; a fleet with `fallback` also has an on-demand twin group `<name>-on-demand`.
@@ -319,7 +320,8 @@ variable "fleets" {
     capacity: spot or on-demand. Selects the Auto Scaling group purchase option and is written to [fleets.options].capacity.
     machine_class: optional qualitative machine class (for example gpu), written to [fleets.options].machine_class when set.
     image: optional image of this fleet (for example a GPU image), {owner, sha256} as in images; null uses images[<the isa's architecture>]. The selected AMI supplies this fleet's action environment.
-    instance_types: EC2 instance types. For on-demand fleets the order is the launch priority (the first type is tried first); spot fleets ignore the order. Every type needs instance-store NVMe unless scratch_volume_gib is set. The fleet's groups span only the private subnets whose availability zone offers at least one of these types; the plan fails when no zone offers any.
+    instance_types: EC2 instance types. Order is the on-demand launch priority (the first type is tried first); capacity-optimized-prioritized Spot uses it on a best-effort basis after capacity considerations. Every type needs Nitro instance-store SSD (NVMe) unless scratch_volume_gib is set. The fleet's groups span only the private subnets whose availability zone offers at least one of these types; the plan fails when no zone offers any.
+    spot_allocation_strategy: Spot allocation strategy, default price-capacity-optimized. Set to capacity-optimized-prioritized to prefer instance type order after capacity considerations.
     max_instances: upper bound of the Auto Scaling group.
     min_instances, vcpus_per_instance, idle_timeout,
     max_drain_wait, boot_grace: scheduling policy written to gang.toml.
