@@ -1009,7 +1009,7 @@ mod tests {
                 capacity: Capacity::Spot,
                 machine_class: None,
                 fallback: Some(SpotFallback {
-                    retry_spot_after: RetrySpotAfter::try_new(Duration::from_secs(300))?,
+                    retry_spot_after: RetrySpotAfter::try_new(Duration::from_mins(5))?,
                     drain_on_demand_first: true,
                 }),
             },
@@ -1042,7 +1042,7 @@ mod tests {
                     capacity: Capacity::Spot,
                     machine_class: None,
                     fallback: Some(SpotFallback {
-                        retry_spot_after: RetrySpotAfter::try_new(Duration::from_secs(300))?,
+                        retry_spot_after: RetrySpotAfter::try_new(Duration::from_mins(5))?,
                         drain_on_demand_first: true,
                     }),
                 },
@@ -1054,7 +1054,7 @@ mod tests {
             gang_testkit::fence::with_held(async |held| {
                 harness
                     .fleets
-                    .set_desired_capacity(&held, fleet.view(), 2)
+                    .set_desired_capacity(held, fleet.view(), 2)
                     .await
             })
             .await?;
@@ -1081,7 +1081,7 @@ mod tests {
                 capacity: Capacity::Spot,
                 machine_class: None,
                 fallback: Some(SpotFallback {
-                    retry_spot_after: RetrySpotAfter::try_new(Duration::from_secs(300))?,
+                    retry_spot_after: RetrySpotAfter::try_new(Duration::from_mins(5))?,
                     drain_on_demand_first: true,
                 }),
             },
@@ -1099,7 +1099,7 @@ mod tests {
         gang_testkit::fence::with_held(async |held| {
             harness
                 .fleets
-                .set_desired_capacity(&held, fleet.view(), 18)
+                .set_desired_capacity(held, fleet.view(), 18)
                 .await
         })
         .await?;
@@ -1126,7 +1126,7 @@ mod tests {
                     capacity: Capacity::Spot,
                     machine_class: None,
                     fallback: Some(SpotFallback {
-                        retry_spot_after: RetrySpotAfter::try_new(Duration::from_secs(300))?,
+                        retry_spot_after: RetrySpotAfter::try_new(Duration::from_mins(5))?,
                         drain_on_demand_first: true,
                     }),
                 },
@@ -1138,7 +1138,7 @@ mod tests {
             gang_testkit::fence::with_held(async |held| {
                 harness
                     .fleets
-                    .set_desired_capacity(&held, fleet.view(), 2)
+                    .set_desired_capacity(held, fleet.view(), 2)
                     .await
             })
             .await?;

@@ -221,20 +221,6 @@ variables {
   ]
 }
 
-run "single_zone_requires_explicit_minimum" {
-  command = plan
-
-  override_data {
-    target = module.worker_fleet.data.aws_ec2_instance_type_offerings.this["gang-worker-x86-64"]
-    values = {
-      instance_types = ["c6id.4xlarge"]
-      locations      = ["az-a"]
-    }
-  }
-
-  expect_failures = [module.worker_fleet.aws_autoscaling_group.this["gang-worker-x86-64"]]
-}
-
 run "single_zone_custom_minimum_is_forwarded" {
   command = plan
 

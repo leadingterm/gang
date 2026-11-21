@@ -878,11 +878,14 @@ fn group_xml(group: &FakeGroup) -> String {
         })
         .collect::<Vec<_>>()
         .concat();
-    let availability_zones: String = group
-        .availability_zones
-        .iter()
-        .map(|zone| format!("<member>{zone}</member>"))
-        .collect();
+    let availability_zones =
+        group
+            .availability_zones
+            .iter()
+            .fold(String::new(), |mut xml, zone| {
+                write!(xml, "<member>{zone}</member>").expect("writing to a String cannot fail");
+                xml
+            });
     let warm_pool = match group.reuse_on_scale_in {
         Some(reuse) => format!(
             "<WarmPoolConfiguration><PoolState>Stopped</PoolState><InstanceReusePolicy><ReuseOnScaleIn>{reuse}</ReuseOnScaleIn></InstanceReusePolicy></WarmPoolConfiguration><WarmPoolSize>{size}</WarmPoolSize>",
@@ -892,11 +895,14 @@ fn group_xml(group: &FakeGroup) -> String {
     };
     let template = match group.template_kind {
         FakeTemplateKind::Mixed => {
-            let overrides: String = group
+            let overrides = group
                 .instance_types
                 .iter()
-                .map(|instance_type| format!("<member><InstanceType>{instance_type}</InstanceType></member>"))
-                .collect();
+                .fold(String::new(), |mut xml, instance_type| {
+                    write!(xml, "<member><InstanceType>{instance_type}</InstanceType></member>")
+                        .expect("writing to a String cannot fail");
+                    xml
+                });
             format!(
                 "<MixedInstancesPolicy><LaunchTemplate><LaunchTemplateSpecification><LaunchTemplateId>lt-test</LaunchTemplateId><Version>2</Version></LaunchTemplateSpecification><Overrides>{overrides}</Overrides></LaunchTemplate></MixedInstancesPolicy>"
             )
