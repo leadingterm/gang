@@ -311,6 +311,7 @@ impl Builder {
             &mut self.scratch,
         );
         let Some(hosted) = hosted else {
+            copy_if_changed(&mut cur.workers, &prev.workers);
             self.last_completed = None;
             self.last_evicted = None;
             return (0, 0, false);
@@ -630,11 +631,11 @@ fn increase(total: u64, previous: u64) -> u64 {
 fn copy_skipped_state(cur: &mut State, prev: &State) {
     copy_observed_state(cur, prev);
     copy_if_changed(&mut cur.instances, &prev.instances);
+    copy_if_changed(&mut cur.workers, &prev.workers);
 }
 
 fn copy_observed_state(cur: &mut State, prev: &State) {
     copy_if_changed(&mut cur.fleets, &prev.fleets);
-    copy_if_changed(&mut cur.workers, &prev.workers);
     copy_if_changed(&mut cur.status_events, &prev.status_events);
     copy_if_changed(&mut cur.queue, &prev.queue);
     cur.cache.stores.clone_from(&prev.cache.stores);
@@ -679,6 +680,7 @@ fn write_text_of<C: name::Collection>(into: &mut String, id: &str) {
 /// Fills the worker rows, ordered by name. A worker whose instance is not in its fleet's supply
 /// keeps the launch time of its earlier row, which is the wall time the first time the worker is
 /// seen. A worker whose id names no instance is left out.
+/// Successful observations reuse the existing worker row buffers.
 fn fill_workers(
     cur: &mut State,
     prev: &State,
