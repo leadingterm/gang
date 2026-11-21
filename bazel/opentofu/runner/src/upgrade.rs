@@ -311,6 +311,54 @@ fn record_payload(
 }
 
 fn extract(stdout: &[u8], local_config: String) -> Result<Fixture> {
+    extract_inner(stdout, local_config).map_err(|error| cleanup_context(stdout, error))
+}
+
+fn cleanup_context(stdout: &[u8], error: Box<dyn Error>) -> Box<dyn Error> {
+    let mut cleanup_seen = false;
+    let mut context = Vec::new();
+    for line in stdout.split(|byte| *byte == b'\n') {
+        let Ok(event) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        let scope = (event["@testfile"].as_str(), event["@testrun"].as_str());
+        match event["type"].as_str() {
+            Some("test_cleanup") => {
+                cleanup_seen = true;
+                context.push(serde_json::json!({
+                    "type": "test_cleanup",
+                    "@testfile": scope.0,
+                    "@testrun": scope.1,
+                    "failed_resources": event["test_cleanup"]["failed_resources"],
+                }));
+            }
+            Some("diagnostic") if !crate::contract::is_successful_forget_notice(&event) => {
+                let diagnostic = &event["diagnostic"];
+                context.push(serde_json::json!({
+                    "type": "diagnostic",
+                    "@testfile": scope.0,
+                    "@testrun": scope.1,
+                    "severity": diagnostic["severity"].as_str(),
+                    "summary": diagnostic["summary"].as_str(),
+                    "detail": diagnostic["detail"].as_str(),
+                    "scope": diagnostic["scope"].as_str(),
+                }));
+            }
+            _ => {}
+        }
+    }
+    if cleanup_seen {
+        format!(
+            "{error}\nOpenTofu cleanup context: {}",
+            Value::Array(context)
+        )
+        .into()
+    } else {
+        error
+    }
+}
+
+fn extract_inner(stdout: &[u8], local_config: String) -> Result<Fixture> {
     let evidence = selected_evidence(stdout)?;
     let plan = &evidence.upgrade;
     let gang = plan
@@ -1602,6 +1650,73 @@ mod tests {
                 assert!(selected_evidence(&encode_events(&events)).is_err());
             }
         }
+    }
+
+    #[test]
+    fn reports_cleanup_inventory_and_diagnostics_in_either_order() {
+        let cleanup = json!({
+            "type":"test_cleanup", "@testfile":TEST, "@testrun":"promote",
+            "test_cleanup":{"failed_resources":[
+                {"instance":"first.resource"}, {"instance":"second.resource"}
+            ]},
+            "test_plan":{"secret":"SENTINEL"}
+        });
+        let diagnostic = json!({
+            "type":"diagnostic", "@testfile":TEST, "@testrun":"promote",
+            "diagnostic":{"severity":"error", "summary":"cleanup failed",
+                "detail":"provider deletion failed", "scope":"module.worker"},
+            "test_plan":{"secret":"SENTINEL"}
+        });
+        for diagnostic_first in [false, true] {
+            let mut events = synthetic_events(&plan(GANG), false);
+            if diagnostic_first {
+                events.extend([diagnostic.clone(), cleanup.clone()]);
+            } else {
+                events.extend([cleanup.clone(), diagnostic.clone()]);
+            }
+            let stdout = encode_events(&events);
+            let original = selected_evidence(&stdout)
+                .err()
+                .expect("rejected")
+                .to_string();
+            let message = extract(&stdout, "local".into())
+                .err()
+                .expect("rejected")
+                .to_string();
+            assert!(message.starts_with(&original));
+            for expected in [
+                TEST,
+                "promote",
+                "first.resource",
+                "second.resource",
+                "error",
+                "cleanup failed",
+                "provider deletion failed",
+                "module.worker",
+            ] {
+                assert!(message.contains(expected), "missing {expected}: {message}");
+            }
+            assert!(!message.contains("SENTINEL"));
+            assert!(!message.contains(FORGOTTEN_SUMMARY));
+        }
+    }
+
+    #[test]
+    fn leaves_errors_without_cleanup_unchanged_and_accepts_forget_notice() {
+        let mut events = synthetic_events(&plan(GANG), false);
+        assert!(extract(&encode_events(&events), "local".into()).is_ok());
+        events.push(json!({"type":"diagnostic", "@level":"error",
+            "diagnostic":{"severity":"error", "summary":"unexpected"}}));
+        let stdout = encode_events(&events);
+        let original = selected_evidence(&stdout)
+            .err()
+            .expect("rejected")
+            .to_string();
+        let message = extract(&stdout, "local".into())
+            .err()
+            .expect("rejected")
+            .to_string();
+        assert_eq!(message, original);
     }
 
     #[test]
