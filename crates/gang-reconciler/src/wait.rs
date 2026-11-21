@@ -222,7 +222,7 @@ impl Dispatch {
             let duration = rates.queued_duration(index);
             let mut best = None;
             for (instance, worker) in self.instances[..self.active].iter().enumerate() {
-                if !worker.enabled || !candidates.iter().any(|fleet| fleet == worker.fleet) {
+                if !worker.enabled || !candidates.contains(worker.fleet) {
                     continue;
                 }
                 if let Some(at) = worker.earliest(demand, duration)

@@ -1560,7 +1560,10 @@ mod tests {
         assert_eq!(factor, 1);
         assert_eq!(workers * cpus * factor, 2);
         assert_eq!(document["actions"]["history_keys"].as_integer(), Some(42));
-        assert_eq!(document["actions"]["cold_start"]["cpu_millicores"].as_integer(), Some(250));
+        assert_eq!(
+            document["actions"]["cold_start"]["cpu_millicores"].as_integer(),
+            Some(250)
+        );
     }
 
     #[test]

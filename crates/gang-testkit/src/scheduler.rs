@@ -16,8 +16,8 @@ use gang_spi::{
     ActionsView, Admitted, ApiRequestBody, ApiResponseBody, ApiService, BoxedConnection,
     ControllerConnections, ControllerEndpoints, ControllerReady, ControllerSpec, FleetSupply,
     GateDecision, LeaderUnavailable, LearnedHistory, Listening, ListingLimits, Peer, PortError,
-    RecordKind, Rejection, RequestGate, RequestScope, SchedulerPort, SchedulerSnapshot,
-    WorkerSpec, WorkerTls, full_body,
+    RecordKind, Rejection, RequestGate, RequestScope, SchedulerPort, SchedulerSnapshot, WorkerSpec,
+    WorkerTls, full_body,
 };
 use gang_types::{Bytes, FleetName, FleetProperties, InstanceId, WorkerLifetime};
 use parking_lot::Mutex;

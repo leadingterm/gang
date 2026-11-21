@@ -42,7 +42,6 @@ pub(crate) enum PassOutcome {
 #[derive(Clone, Copy)]
 pub(crate) struct ControlSettings {
     pub(crate) poll_interval: NonZeroDuration,
-    pub(crate) cpu_oversubscription: NonZeroU32,
     infrastructure_window: Duration,
     infrastructure_limit: NonZeroUsize,
 }
@@ -51,7 +50,6 @@ impl ControlSettings {
     pub(crate) fn new(poll_interval: NonZeroDuration, dashboard: &DashboardConfig) -> Self {
         Self {
             poll_interval,
-            cpu_oversubscription: gang_config::ActionsConfig::default().cpu_oversubscription,
             infrastructure_window: dashboard.history_window.get(),
             infrastructure_limit: dashboard.recent_events,
         }
@@ -124,6 +122,7 @@ where
         settings: ControlSettings,
         scaling: Arc<ScalingConfig>,
         profiles: SourceProfiles,
+        cpu_oversubscription: NonZeroU32,
         ports: &ControlPorts<'a, F, S, R, C>,
         fence: Fence,
     ) -> Self {
@@ -149,7 +148,7 @@ where
             fleets.policies(),
             scaling,
             profiles,
-            settings.cpu_oversubscription,
+            cpu_oversubscription,
         );
         Self {
             fleets,
@@ -888,6 +887,7 @@ mod tests {
             ControlSettings::new(NonZeroDuration::from_secs(1), &DashboardConfig::default()),
             scaling,
             profiles,
+            gang_types::nonzero_u32(2),
             &crate::control::ControlPorts {
                 provisioner,
                 scheduler,

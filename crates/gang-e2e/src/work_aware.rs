@@ -231,8 +231,12 @@ fn burst_purchase_checks(events: &[Event], outcome: &crate::BuildOutcome) -> Vec
     vec![
         Check::expect(
             names::BURST_SCALE_OUT,
-            events.iter().any(|e| matches!(e.change, EventChange::ScaledOut { to: 6, .. }))
-                && events.iter().all(|e| !matches!(e.change, EventChange::ScaledOut { to: 7.., .. })),
+            events
+                .iter()
+                .any(|e| matches!(e.change, EventChange::ScaledOut { to: 6, .. }))
+                && events
+                    .iter()
+                    .all(|e| !matches!(e.change, EventChange::ScaledOut { to: 7.., .. })),
             || format!("burst scale-outs: {events:?}"),
         ),
         build_check(names::BURST_BUILD, outcome),
@@ -241,9 +245,11 @@ fn burst_purchase_checks(events: &[Event], outcome: &crate::BuildOutcome) -> Vec
 
 /// Judges the largest desired fleet capacity observed during the burst.
 pub fn burst_capacity_check(max_desired: u32) -> Check {
-    Check::expect("burst reaches bounded resource capacity", max_desired == 6, || {
-        format!("the burst reached desired capacity {max_desired}, expected 6")
-    })
+    Check::expect(
+        "burst reaches bounded resource capacity",
+        max_desired == 6,
+        || format!("the burst reached desired capacity {max_desired}, expected 6"),
+    )
 }
 
 /// Judges a held short-work build and its scaling history.
@@ -251,8 +257,7 @@ pub fn burst_capacity_check(max_desired: u32) -> Check {
 pub fn short_checks(events: &[Event], observed: bool, outcome: &crate::BuildOutcome) -> Vec<Check> {
     vec![
         Check::expect(names::QUEUED, observed, || {
-            "queued work or its resource-driven scale-out was not observed"
-                .to_owned()
+            "queued work or its resource-driven scale-out was not observed".to_owned()
         }),
         Check::expect(
             names::QUEUED_SCALE_OUT,

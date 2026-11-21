@@ -824,13 +824,12 @@ async fn lead_work<D: Deployment>(
     context.readiness.lead();
     let sidecar = retry_sidecar(context);
     let clock = &context.core.host.clock;
-    let mut control_settings = context.control_settings;
-    control_settings.cpu_oversubscription = context.actions.cpu_oversubscription;
     let control = ControlLoop::new(
         context.fleets,
-        control_settings,
+        context.control_settings,
         Arc::clone(context.scaling),
         profiles.clone(),
+        context.actions.cpu_oversubscription,
         &crate::control::ControlPorts {
             provisioner: context.provisioner,
             scheduler: context.scheduler,

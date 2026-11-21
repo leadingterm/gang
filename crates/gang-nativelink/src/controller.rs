@@ -1395,12 +1395,7 @@ mod tests {
                     });
                 }
                 let client = OperationId::from(format!("packing-client-{index}").as_str());
-                subscriptions.push(
-                    stack
-                        .actions
-                        .add_action(client.clone(), info)
-                        .await?,
-                );
+                subscriptions.push(stack.actions.add_action(client.clone(), info).await?);
                 stack.simple.do_try_match_for_test().await?;
                 if index == dispatched {
                     assert_eq!(

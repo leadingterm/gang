@@ -279,14 +279,21 @@ fn catalog_accepts_exactly_the_fleets_native_matches_for_normalized_requests() -
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect();
-        let normalized_cpu = crate::placeable::normalized_cpu_reservation(&request_map)
-            .or_else(|| request_map.get(property::CPU_MILLICORES)?.parse::<u64>().ok());
+        let normalized_cpu =
+            crate::placeable::normalized_cpu_reservation(&request_map).or_else(|| {
+                request_map
+                    .get(property::CPU_MILLICORES)?
+                    .parse::<u64>()
+                    .ok()
+            });
         for (index, (worker, ceilings)) in workers.iter().enumerate() {
             let within_ceiling = ceilings.iter().all(|(key, limit)| {
                 let value = if key == property::CPU_MILLICORES {
                     normalized_cpu
                 } else {
-                    request_map.get(key).and_then(|value| value.parse::<u64>().ok())
+                    request_map
+                        .get(key)
+                        .and_then(|value| value.parse::<u64>().ok())
                 };
                 value.is_none_or(|value| value <= *limit)
             });

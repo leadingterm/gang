@@ -842,13 +842,7 @@ fn oversubscribed_serving_fleet_scales_to_live_max_regardless_of_payback() -> Te
         (1000, 12_000, 12_000),
     ] {
         let mut w = Workload::new(10, 15, payback)?;
-        let policy = w.h.passes[X86].policy.clone();
-        w.h.reconciler = gang_reconciler::Reconciler::new(
-            &[policy],
-            std::sync::Arc::clone(&w.h.scaling),
-            w.h.profiles.clone(),
-            NonZeroU32::new(2).ok_or("nonzero factor")?,
-        );
+        w.h.set_cpu_oversubscription(NonZeroU32::new(2).ok_or("nonzero factor")?);
         for index in 0..6 {
             let name = format!("local-{index}");
             w.serve(X86, &name)?;
@@ -865,5 +859,18 @@ fn oversubscribed_serving_fleet_scales_to_live_max_regardless_of_payback() -> Te
         assert_eq!(w.h.outlook(X86)?.needed, 10);
         assert_eq!(purchases(&steps), vec![(X86, 6, 10, NeedCause::Demand)]);
     }
+    Ok(())
+}
+
+#[test]
+fn cpu_oversubscription_survives_reconciler_restart() -> TestResult {
+    let mut w = Workload::new(10, 15, 50)?;
+    w.h.set_cpu_oversubscription(NonZeroU32::new(2).ok_or("nonzero factor")?);
+    w.queue(None, X86, 20, None)?;
+    w.pass();
+    assert_eq!(w.h.outlook(X86)?.needed, 1);
+    w.h.restart();
+    w.pass();
+    assert_eq!(w.h.outlook(X86)?.needed, 1);
     Ok(())
 }

@@ -212,19 +212,23 @@ pub fn sustained_stream(stack: &Stack<'_>) -> Result<Vec<Check>> {
         let mut started = None;
         let mut completed = None;
         let mut ceiling = true;
-        let observation = wait(stack, "sustained stream remains resource bounded", |state| {
-            refill(directory, state)?;
-            ceiling &= desired(state) <= 2;
-            if running(state) > 0 {
-                started.get_or_insert(state.update_time.as_unix_millis());
-                completed.get_or_insert(state.completed);
-            }
-            Ok(started.is_some_and(|start| {
-                elapsed(state, start) > horizon(state)
-                    && elapsed(state, start) >= Duration::from_secs(30)
-            }) && completed.is_some_and(|count| state.completed >= count.saturating_add(16))
-                && (1..=2).contains(&desired(state)))
-        });
+        let observation = wait(
+            stack,
+            "sustained stream remains resource bounded",
+            |state| {
+                refill(directory, state)?;
+                ceiling &= desired(state) <= 2;
+                if running(state) > 0 {
+                    started.get_or_insert(state.update_time.as_unix_millis());
+                    completed.get_or_insert(state.completed);
+                }
+                Ok(started.is_some_and(|start| {
+                    elapsed(state, start) > horizon(state)
+                        && elapsed(state, start) >= Duration::from_secs(30)
+                }) && completed.is_some_and(|count| state.completed >= count.saturating_add(16))
+                    && (1..=2).contains(&desired(state)))
+            },
+        );
         let observed = hold.settle(observation, || Ok(()));
         let outcome = joined(build);
         hold.disarm();

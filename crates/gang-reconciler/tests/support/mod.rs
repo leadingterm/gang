@@ -91,6 +91,8 @@ pub struct Harness {
     pub scaling: Arc<ScalingConfig>,
     /// Durable term profile handle, retained across model replacement.
     pub profiles: SourceProfiles,
+    /// CPU reservation multiplier used by every reconciler term in this world.
+    pub cpu_oversubscription: NonZeroU32,
 }
 
 impl Harness {
@@ -134,6 +136,7 @@ impl Harness {
             reconciler,
             scaling,
             profiles,
+            cpu_oversubscription: NonZeroU32::MIN,
         }
     }
 
@@ -419,8 +422,14 @@ impl Harness {
             &policies,
             Arc::clone(&self.scaling),
             self.profiles.clone(),
-            NonZeroU32::MIN,
+            self.cpu_oversubscription,
         );
+    }
+
+    /// Changes the CPU reservation multiplier and starts a new reconciler term.
+    pub fn set_cpu_oversubscription(&mut self, factor: NonZeroU32) {
+        self.cpu_oversubscription = factor;
+        self.restart();
     }
 
     /// Runs the first pass of the reconciler's leadership term, then moves the clock past

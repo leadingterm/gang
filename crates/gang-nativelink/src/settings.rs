@@ -91,7 +91,10 @@ fn resource_escalation(actions: &ActionsConfig, fleets: &FleetCatalog) -> Value 
                     (kind == MatchKind::Minimum)
                         .then(|| {
                             fleet.capacity(key).map(|limit| {
-                                (key.to_owned(), json!(scheduler_capacity(key, limit, actions)))
+                                (
+                                    key.to_owned(),
+                                    json!(scheduler_capacity(key, limit, actions)),
+                                )
                             })
                         })
                         .flatten()
@@ -386,7 +389,7 @@ fn local_worker(
     let worker = json!({
         "name": spec.instance.worker_name(),
         "worker_api_endpoint": api_endpoint,
-        "max_inflight_tasks": if matches!(spec.lifetime, WorkerLifetime::SingleUse) { 1 } else { 0 },
+        "max_inflight_tasks": u64::from(matches!(spec.lifetime, WorkerLifetime::SingleUse)),
         "single_use": matches!(spec.lifetime, WorkerLifetime::SingleUse),
         "cas_fast_slow_store": WORKER_CONTENT_STORE,
         "upload_action_result": { "ac_store": WORKER_ACTION_STORE },
@@ -624,7 +627,11 @@ mod tests {
         assert_eq!(historical.window_days, 7);
         assert_eq!(historical.cpu_property_name, property::CPU_MILLICORES);
         assert_eq!(
-            historical.cold_start.as_ref().expect("cold start").cpu_count,
+            historical
+                .cold_start
+                .as_ref()
+                .expect("cold start")
+                .cpu_count,
             250
         );
         let SchedulerSpec::Simple(simple) = historical.scheduler.as_ref() else {
