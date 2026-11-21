@@ -11,6 +11,7 @@
 
 - Fix startup on nominal 64 GiB workers whose measured memory, less reserve, is smaller than the fleet estimate; workers advertise their actual available action-pool capacity.
 - Use the same current memory guarantees for learned reservations, queued work, OOM retries and scaling, while preserving explicit client minimums and per-action ceilings.
+- Expose the public listener connection limit in the deployment module, defaulting to 4096. The module now owns `[server.http2]` for all backends; SQLite callers must remove any appended `[server.http2]` table and move their `max_connections` override to `http2_max_connections`.
 
 ### Upgrade notes
 

@@ -65,6 +65,8 @@ bucket = "example-gang-cache"
 region = "eu-north-1"
 key_id = "alias/gang-ca"
 
+[server.http2]
+max_connections = 4096
 
 [database.sqlite]
 # The controller keeps its state under this path.
