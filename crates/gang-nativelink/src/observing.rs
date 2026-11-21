@@ -471,6 +471,10 @@ impl WorkerScheduler for ObservingWorkerScheduler {
         result
     }
 
+    async fn expire_attempts(&self, now: std::time::SystemTime) -> Result<(), Error> {
+        self.inner.expire_attempts(now).await
+    }
+
     async fn set_drain_worker(&self, worker_id: &WorkerId, is_draining: bool) -> Result<(), Error> {
         let retiring = self.retiring.read().await;
         if *retiring && !is_draining {
@@ -1248,6 +1252,11 @@ mod tests {
             &self,
             _now_timestamp: WorkerTimestamp,
         ) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn expire_attempts(&self, _: SystemTime) -> Result<(), Error> {
+            // This fixture records worker updates but owns no attempt deadlines.
             Ok(())
         }
 

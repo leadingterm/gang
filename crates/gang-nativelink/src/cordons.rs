@@ -544,6 +544,11 @@ mod tests {
             Ok(())
         }
 
+        async fn expire_attempts(&self, _: std::time::SystemTime) -> Result<(), Error> {
+            // The cordon fixture owns worker connections, not action attempts.
+            Ok(())
+        }
+
         async fn kill_revoked_operations(&self) -> Result<(), Error> {
             Err(make_err!(
                 Code::Unimplemented,
