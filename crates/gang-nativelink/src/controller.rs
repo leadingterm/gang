@@ -204,13 +204,7 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         workers: worker_scheduler,
         resource,
         cordons,
-    } = scheduler_stack(
-        &scheduler,
-        spec.fleets,
-        &spec.actions,
-        resources,
-        Arc::clone(&spec.clock),
-    )?;
+    } = scheduler_stack(&scheduler, spec.fleets, &spec.actions, resources)?;
     let handoff = HandOff::new();
     let action_scheduler: Arc<dyn KnownPlatformPropertyProvider> =
         Arc::new(HandOffActions::new(action_scheduler, handoff.clone()));
@@ -450,7 +444,6 @@ fn scheduler_stack(
     fleets: &FleetCatalog,
     actions: &gang_config::ActionsConfig,
     resources: &OnceLock<Arc<ResourceSketch>>,
-    clock: Arc<dyn Clock>,
 ) -> Result<SchedulerStack, NativeLinkEmbedError> {
     let mut resource = None;
     let cordons = Arc::new(InstanceCordons::new(Arc::new(fleets.clone())));
@@ -459,7 +452,6 @@ fn scheduler_stack(
         fleets,
         actions,
         resources,
-        clock,
         Arc::clone(&cordons),
         |simple, notify, sketch| {
             resource = Some(Arc::clone(&sketch));
@@ -495,7 +487,6 @@ fn action_stack(
     fleets: &FleetCatalog,
     actions: &gang_config::ActionsConfig,
     resources: &OnceLock<Arc<ResourceSketch>>,
-    clock: Arc<dyn Clock>,
     cordons: Arc<InstanceCordons>,
     simple_scheduler: impl FnOnce(
         &SimpleSpec,
@@ -553,12 +544,8 @@ fn action_stack(
         Arc::clone(sketch),
     ));
     let action_scheduler: Arc<dyn KnownPlatformPropertyProvider> = Arc::new(
-        PlaceableActions::new(historical, fleets.clone(), admitted).with_workers(
-            Arc::clone(&worker_scheduler),
-            cordons,
-            clock,
-            std::time::Duration::from_secs(simple.worker_timeout_s),
-        ),
+        PlaceableActions::new(historical, fleets.clone(), admitted)
+            .with_workers(Arc::clone(&worker_scheduler), cordons),
     );
     Ok((action_scheduler, worker_scheduler))
 }
@@ -766,9 +753,7 @@ mod tests {
     use nativelink_util::common::DigestInfo;
     use nativelink_util::digest_hasher::DigestHasherFunc;
     use nativelink_util::instant_wrapper::InstantWrapper;
-    use nativelink_util::operation_state_manager::{
-        ClientStateManager, OperationFilter, UpdateOperationType,
-    };
+    use nativelink_util::operation_state_manager::{OperationFilter, UpdateOperationType};
     use nativelink_util::origin_event::{BAZEL_METADATA_KEY, request_metadata_from_baggage};
     use nativelink_util::platform_properties::{PlatformProperties, PlatformPropertyValue};
     use opentelemetry::baggage::BaggageExt;
@@ -955,7 +940,6 @@ mod tests {
             fleets,
             actions,
             resources,
-            Arc::new(SystemClock::new()),
             Arc::clone(&cordons),
             |simple, notify, sketch| {
                 notify_slot = Some(Arc::clone(&notify));
@@ -1521,22 +1505,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_old_environment_and_promotion_window() -> TestResult {
+    async fn noncurrent_and_unscoped_identities_require_registered_workers() -> TestResult {
         let fleets = x86_and_arm_fleets();
         let stack = stack_on_test_clock(&fleets, &default_config())?;
-        let clock = Arc::new(gang_clock::TestClock::default());
-        let timeout = Duration::from_secs(30);
-        let wrapper = PlaceableActions::new(
-            stack.actions.clone(),
-            fleets.clone(),
-            AdmittedFleets::default(),
-        )
-        .with_workers(
-            stack.workers.clone(),
-            Arc::new(InstanceCordons::new(Arc::new(fleets))),
-            clock.clone(),
-            timeout,
-        );
         let mut old_action = action(Isa::Aarch64, Some("252"));
         Arc::make_mut(&mut old_action).platform_properties.insert(
             property::ACTION_ENVIRONMENT.to_owned(),
@@ -1546,29 +1517,33 @@ mod tests {
         Arc::make_mut(&mut missing)
             .platform_properties
             .remove(property::ACTION_ENVIRONMENT);
-        let error = wrapper
+        let error = stack
+            .actions
             .add_action(OperationId::from("missing"), missing)
             .await
             .err()
             .expect("missing identity rejected");
         assert_eq!(error.code, Code::InvalidArgument);
         assert!(error.to_string().contains("gang setup"));
-        let error = wrapper
-            .add_action(OperationId::from("reconnect"), old_action.clone())
+        let error = stack
+            .actions
+            .add_action(OperationId::from("unsupported"), old_action.clone())
             .await
             .err()
-            .expect("old worker has not reconnected");
-        assert_eq!(error.code, Code::Unavailable);
+            .expect("unsupported identity rejected without registered workers");
+        assert_eq!(error.code, Code::InvalidArgument);
+        assert!(error.to_string().contains("gang setup"));
         let id = WorkerId("old-worker".to_owned());
         let _rx =
             connect_arm_worker_with_environment(stack.workers.as_ref(), &id, 1, Some("host:old"))
                 .await?;
-        let _subscription = wrapper
+        let _subscription = stack
+            .actions
             .add_action(OperationId::from("live"), old_action.clone())
             .await?;
-        clock.advance(timeout);
         stack.workers.remove_worker(&id).await?;
-        let error = wrapper
+        let error = stack
+            .actions
             .add_action(OperationId::from("gone"), old_action)
             .await
             .err()
@@ -2243,14 +2218,9 @@ mod tests {
             panic!("expected historical scheduler");
         };
         historical.learn_from_workers = false;
-        let SchedulerStack { actions, .. } = scheduler_stack(
-            &scheduler,
-            &fleets,
-            &actions,
-            &OnceLock::new(),
-            Arc::clone(&spec.clock),
-        )
-        .expect("scheduler stack");
+        let SchedulerStack { actions, .. } =
+            scheduler_stack(&scheduler, &fleets, &actions, &OnceLock::new())
+                .expect("scheduler stack");
         let operation = OperationId::String("stack-wiring".to_owned());
         let digest = DigestInfo::new([1; 32], 1);
         let info = Arc::new(ActionInfo {
@@ -2350,14 +2320,8 @@ mod tests {
             panic!("historical scheduler")
         };
         historical.learn_from_workers = false;
-        let SchedulerStack { actions, .. } = scheduler_stack(
-            &scheduler,
-            &fleets,
-            &spec.actions,
-            &OnceLock::new(),
-            Arc::clone(&spec.clock),
-        )
-        .expect("stack");
+        let SchedulerStack { actions, .. } =
+            scheduler_stack(&scheduler, &fleets, &spec.actions, &OnceLock::new()).expect("stack");
         let info = origin_test_action();
         let metadata = RequestMetadata {
             tool_invocation_id: "invocation".to_owned(),

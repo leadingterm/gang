@@ -5,15 +5,13 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
-use gang_clock::{Clock, Tick};
 use gang_types::{
     ActionEnvironment, Bytes, FleetCatalog, FleetName, FleetProperties, FleetSet, Isa, MatchKind,
     Refusal, Resources, property,
 };
-use nativelink_error::{Code, Error, make_err, make_input_err};
+use nativelink_error::{Error, make_input_err};
 use nativelink_metric::{
     MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent, RootMetricsComponent,
 };
@@ -98,7 +96,6 @@ pub(crate) struct PlaceableActions {
     fleets: FleetCatalog,
     admitted: AdmittedFleets,
     workers: Option<(Arc<dyn WorkerScheduler>, Arc<InstanceCordons>)>,
-    reconnect: Option<(Arc<dyn Clock>, Tick)>,
 }
 
 impl PlaceableActions {
@@ -113,7 +110,6 @@ impl PlaceableActions {
             fleets,
             admitted,
             workers: None,
-            reconnect: None,
         }
     }
 
@@ -121,12 +117,8 @@ impl PlaceableActions {
         mut self,
         workers: Arc<dyn WorkerScheduler>,
         cordons: Arc<InstanceCordons>,
-        clock: Arc<dyn Clock>,
-        timeout: Duration,
     ) -> Self {
-        let deadline = clock.monotonic() + timeout;
         self.workers = Some((workers, cordons));
-        self.reconnect = Some((clock, deadline));
         self
     }
 
@@ -459,15 +451,6 @@ impl ClientStateManager for PlaceableActions {
                 });
             }
             if live.is_none() {
-                if self.reconnect.as_ref().is_some_and(|(clock, deadline)| {
-                    environment.is_some() && clock.monotonic() < *deadline
-                }) {
-                    return Err(make_err!(
-                        Code::Unavailable,
-                        "action environment not yet served while workers reconnect; retry; served identities: {}",
-                        served()
-                    ));
-                }
                 return Err(make_input_err!(
                     "action environment is not served; run gang setup; served identities: {}",
                     served()
