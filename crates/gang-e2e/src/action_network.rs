@@ -171,7 +171,18 @@ mod linux {
     async fn check_prerequisites(root: &Path, config_path: &Path, text: &str) -> Result<()> {
         fs::write(
             config_path,
-            text.replace("127.0.0.1:50051", "127.0.0.1:50052"),
+            text.replace("127.0.0.1:50051", "deadline.invalid:50051"),
+        )?;
+        let child = start(root, "stalled-host-dns", true, "connect", "11.0.0.2")?;
+        // Reap gang-exec itself, including runtime shutdown with a blocked DNS lookup.
+        tokio::time::timeout(Duration::from_secs(15), wait(child, false)).await??;
+        if root.join("work/stalled-host-dns/work/started").exists() {
+            return Err("stalled-host-dns payload executed".into());
+        }
+        fs::write(config_path, text)?;
+        fs::write(
+            config_path,
+            text.replace("127.0.0.1:50051", "localhost:50052"),
         )?;
         wait(
             start(root, "protected-override", true, "connect", "11.0.0.2")?,

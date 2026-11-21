@@ -249,48 +249,53 @@ impl ActionIsolationPort for Bwrap {
         {
             return Err(BwrapError::ActionDirectory(action.to_path_buf()).into());
         }
-        let resolver: Option<std::fs::File> = match spec.network {
-            NetworkAccess::Offline => None,
-            NetworkAccess::PublicEgress {
-                policy,
-                controller_endpoints,
-            } => {
-                if self.egress.is_none() {
-                    return Err(BwrapError::NetworkNotConfigured.into());
-                }
-                #[cfg(target_os = "linux")]
-                {
-                    let cgroup = spec.memory_cgroup.ok_or_else(|| {
-                        BwrapError::NetworkSetup(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "public egress requires an action memory cgroup",
+        let setup = async {
+            let resolver: Option<std::fs::File> = match spec.network {
+                NetworkAccess::Offline => None,
+                NetworkAccess::PublicEgress {
+                    policy,
+                    controller_endpoints,
+                } => {
+                    if self.egress.is_none() {
+                        return Err(BwrapError::NetworkNotConfigured.into());
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        let cgroup = spec.memory_cgroup.ok_or_else(|| {
+                            BwrapError::NetworkSetup(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "public egress requires an action memory cgroup",
+                            ))
+                        })?;
+                        crate::host_egress::verify_host_egress(policy, controller_endpoints, cgroup)
+                            .await
+                            .map_err(BwrapError::NetworkSetup)?;
+                        Some(resolver_file(policy).map_err(BwrapError::NetworkSetup)?)
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        let _ = (policy, controller_endpoints);
+                        return Err(BwrapError::NetworkSetup(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "public egress requires Linux",
                         ))
-                    })?;
-                    crate::host_egress::verify_host_egress(policy, controller_endpoints, cgroup)
-                        .map_err(BwrapError::NetworkSetup)?;
-                    Some(resolver_file(policy).map_err(BwrapError::NetworkSetup)?)
+                        .into());
+                    }
                 }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    let _ = (policy, controller_endpoints);
-                    return Err(BwrapError::NetworkSetup(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "public egress requires Linux",
-                    ))
-                    .into());
-                }
-            }
+            };
+            let mut started = self.spawn(spec, resolver.as_ref().map(AsFd::as_fd))?;
+            drop(resolver);
+            started.read_info().await?;
+            Ok::<_, PortError>(started)
         };
-        let mut started = self.spawn(spec, resolver.as_ref().map(AsFd::as_fd))?;
-        drop(resolver);
-        match spec.network {
+        let started = match spec.network {
             NetworkAccess::PublicEgress { policy, .. } => {
-                tokio::time::timeout(policy.setup_timeout.get(), started.read_info())
+                tokio::time::timeout(policy.setup_timeout.get(), setup)
                     .await
-                    .map_err(|_| BwrapError::NetworkTimeout(policy.setup_timeout))??;
+                    .map_err(|_| BwrapError::NetworkTimeout(policy.setup_timeout))??
             }
-            NetworkAccess::Offline => started.read_info().await?,
-        }
+            NetworkAccess::Offline => setup.await?,
+        };
         let StartedBwrap {
             mut child,
             launcher,

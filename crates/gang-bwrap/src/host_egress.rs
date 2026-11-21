@@ -45,32 +45,46 @@ fn trusted(path: &Path, directory: bool) -> io::Result<()> {
     Ok(())
 }
 
+fn endpoint_host(endpoint: &Url) -> io::Result<&str> {
+    let host = endpoint
+        .host_str()
+        .ok_or_else(|| invalid("endpoint has no host"))?;
+    Ok(host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host))
+}
+
+fn addresses_protected(
+    policy: &PublicEgressPolicy,
+    addresses: impl Iterator<Item = IpAddr>,
+) -> io::Result<()> {
+    let mut addresses = addresses.peekable();
+    if addresses.peek().is_none() {
+        return Err(invalid("endpoint resolved to no addresses"));
+    }
+    for address in addresses {
+        if is_public_destination(address)
+            && !policy
+                .protected_networks
+                .iter()
+                .any(|net| net.contains(&address))
+        {
+            return Err(invalid(format!(
+                "endpoint address {address} is not protected"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn endpoints_protected(policy: &PublicEgressPolicy, endpoints: &[Url]) -> io::Result<()> {
     for endpoint in endpoints {
-        let host = endpoint
-            .host_str()
-            .ok_or_else(|| invalid("endpoint has no host"))?;
-        let host = host
-            .strip_prefix('[')
-            .and_then(|s| s.strip_suffix(']'))
-            .unwrap_or(host);
-        let addresses: Vec<IpAddr> = match host.parse() {
-            Ok(address) => vec![address],
-            Err(_) => (host, 0).to_socket_addrs()?.map(|addr| addr.ip()).collect(),
-        };
-        if addresses.is_empty() {
-            return Err(invalid("endpoint resolved to no addresses"));
-        }
-        for address in addresses {
-            if is_public_destination(address)
-                && !policy
-                    .protected_networks
-                    .iter()
-                    .any(|net| net.contains(&address))
-            {
-                return Err(invalid(format!(
-                    "endpoint address {address} is not protected"
-                )));
+        let host = endpoint_host(endpoint)?;
+        match host.parse() {
+            Ok(address) => addresses_protected(policy, std::iter::once(address))?,
+            Err(_) => {
+                addresses_protected(policy, (host, 0).to_socket_addrs()?.map(|addr| addr.ip()))?;
             }
         }
     }
@@ -208,10 +222,11 @@ pub fn install_host_egress(
 }
 
 /// Verifies the static policy and the action's direct membership before starting pasta.
+/// Changed controller endpoints are resolved asynchronously before their addresses are checked.
 ///
 /// # Errors
-/// Returns an error when the trusted record or action cgroup does not match.
-pub fn verify_host_egress(
+/// Returns an error when the trusted record, action cgroup or endpoint protection does not match.
+pub async fn verify_host_egress(
     policy: &PublicEgressPolicy,
     controller_endpoints: &[Url],
     action_cgroup: &Path,
@@ -237,7 +252,18 @@ pub fn verify_host_egress(
         return Err(invalid("action cgroup does not match host egress policy"));
     }
     if state.controller_endpoints != controller_endpoints {
-        endpoints_protected(policy, controller_endpoints)?;
+        for endpoint in controller_endpoints {
+            let host = endpoint_host(endpoint)?;
+            match host.parse() {
+                Ok(address) => addresses_protected(policy, std::iter::once(address))?,
+                Err(_) => addresses_protected(
+                    policy,
+                    tokio::net::lookup_host((host, 0))
+                        .await?
+                        .map(|addr| addr.ip()),
+                )?,
+            }
+        }
     }
     Ok(())
 }
@@ -245,6 +271,31 @@ pub fn verify_host_egress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_addresses_require_complete_protection() {
+        let policy: PublicEgressPolicy =
+            toml::from_str("protected_networks = [\"8.8.4.0/24\"]\ndns_servers = [\"1.1.1.1\"]")
+                .unwrap();
+        let protected = ["127.0.0.1", "::1", "8.8.4.4"]
+            .map(|address| address.parse::<IpAddr>().unwrap());
+        assert!(addresses_protected(&policy, protected.into_iter()).is_ok());
+        let mixed = ["8.8.4.4", "8.8.8.8"].map(|address| address.parse::<IpAddr>().unwrap());
+        assert!(addresses_protected(&policy, mixed.into_iter()).is_err());
+        assert!(addresses_protected(&policy, std::iter::empty()).is_err());
+    }
+
+    #[test]
+    fn literal_endpoint_hosts_preserve_ipv4_and_ipv6() {
+        let policy: PublicEgressPolicy =
+            toml::from_str("protected_networks = [\"8.8.4.0/24\"]\ndns_servers = [\"1.1.1.1\"]")
+                .unwrap();
+        let endpoints = ["https://127.0.0.1", "https://[::1]", "https://8.8.4.4"]
+            .map(|endpoint| Url::parse(endpoint).unwrap());
+        assert_eq!(endpoint_host(&endpoints[1]).unwrap(), "::1");
+        assert!(endpoints_protected(&policy, &endpoints).is_ok());
+        assert!(endpoints_protected(&policy, &[Url::parse("https://8.8.8.8").unwrap()]).is_err());
+    }
 
     #[test]
     fn rejects_protected_before_allowing_transport() {

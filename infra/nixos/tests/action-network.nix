@@ -82,6 +82,14 @@ in
           prefixLength = 24;
         }
       ];
+      systemd.sockets.dns-blackhole = {
+        wantedBy = ["sockets.target"];
+        socketConfig.ListenDatagram = "0.0.0.0:53";
+      };
+      systemd.services.dns-blackhole.serviceConfig = {
+        Type = "simple";
+        ExecStart = "${pkgs.coreutils}/bin/sleep infinity";
+      };
       systemd.services.fixture = {
         after = ["network-online.target"];
         wants = ["network-online.target"];
@@ -94,6 +102,11 @@ in
       _module.args.gang = gang;
       networking.firewall.enable = true;
       networking.dhcpcd.enable = lib.mkForce false;
+      networking.resolvconf.enable = false;
+      environment.etc."resolv.conf".text = ''
+        nameserver 11.0.0.2
+        options timeout:30 attempts:1
+      '';
       networking.interfaces.eth0.useDHCP = lib.mkForce false;
       networking.defaultGateway = lib.mkForce {
         address = "11.0.0.2";
@@ -154,6 +167,7 @@ in
     testScript = ''
       peer.start()
       peer.wait_for_unit("fixture.service")
+      peer.wait_for_unit("dns-blackhole.socket")
       worker.start()
       worker.wait_for_unit("fixture.service")
       worker.succeed("nc -z -w 3 11.0.0.2 18080")

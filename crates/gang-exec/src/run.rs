@@ -227,6 +227,8 @@ where
         )
         .await
     });
+    // Cancelled DNS lookups may still occupy the blocking pool; do not wait for them on exit.
+    runtime.shutdown_background();
     match execution {
         Ok(execution) => {
             side_channel::report(invocation.environment, &directory.path, execution.usage);
