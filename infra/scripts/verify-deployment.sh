@@ -30,19 +30,24 @@ if [[ -n $asg ]]; then
         echo "::error::controller instance refresh $status: $reason" >&2; exit 1 ;;
     esac
   done
-  if ! groups=$(aws --region "$region" autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$asg" --output json); then
-    echo "::error::failed to describe controller Auto Scaling group $asg" >&2; exit 1
-  fi
-  if ! controller_ids=$(jq -ec --arg name "$asg" '
+  while :; do
+    if ! groups=$(aws --region "$region" autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$asg" --output json); then
+      echo "::error::failed to describe controller Auto Scaling group $asg" >&2; exit 1
+    fi
+    if controller_ids=$(jq -ec --arg name "$asg" '
     .AutoScalingGroups | select(type == "array" and length == 1 and .[0].AutoScalingGroupName == $name) | .[0]
     | select((.DesiredCapacity | type == "number" and . > 0) and (.Instances | type == "array") and .DesiredCapacity == (.Instances | length))
     | .LaunchTemplate as $template
     | select(($template.LaunchTemplateId | type == "string" and length > 0) and ($template.Version | type == "string" and test("^[0-9]+$")))
     | select(all(.Instances[]; .HealthStatus == "Healthy" and .LifecycleState == "InService" and .LaunchTemplate.LaunchTemplateId == $template.LaunchTemplateId and (.LaunchTemplate.Version | tostring) == $template.Version and (.InstanceId | type == "string" and length > 0)))
     | [.Instances[].InstanceId] | sort | select(length == (unique | length))
-  ' <<<"$groups"); then
-    echo "::error::controller Auto Scaling group $asg is not healthy on its current launch template" >&2; exit 1
-  fi
+    ' <<<"$groups"); then break; fi
+    if (( SECONDS >= deadline )); then
+      jq -c '[.AutoScalingGroups[]? | {AutoScalingGroupName, DesiredCapacity, LaunchTemplate, Instances: [.Instances[]? | {InstanceId, HealthStatus, LifecycleState, LaunchTemplate}]}]' <<<"$groups" >&2
+      echo "::error::controller Auto Scaling group $asg is not healthy on its current launch template" >&2; exit 1
+    fi
+    sleep 5
+  done
 elif [[ -n $targets ]]; then
   controller_ids=$(jq -ec '[.controller_instance_id | select(type == "string" and length > 0)] | select(length == 1)' <<<"$gang")
 fi
@@ -57,7 +62,7 @@ if [[ -n $targets ]]; then
         .TargetHealthDescriptions | select(type == "array")
         | ([.[].Target.Id] | sort) == $ids
           and ([.[] | select(.TargetHealth.State == "healthy")] | length == 1)
-          and all(.[]; .TargetHealth.State == "healthy" or (.TargetHealth.State == "unhealthy" and .TargetHealth.Reason == "Target.ResponseCodeMismatch" and (.TargetHealth.Description | type == "string" and contains("[503]"))))
+          and all(.[]; .TargetHealth.State == "healthy" or (.TargetHealth.State == "unhealthy" and .TargetHealth.Reason == "Target.FailedHealthChecks"))
       ' <<<"$health" >/dev/null; then break; fi
       if (( SECONDS >= deadline )); then
         printf '%s\n' "$health" >&2

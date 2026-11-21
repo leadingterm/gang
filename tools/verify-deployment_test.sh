@@ -28,9 +28,10 @@ aws() {
       if [[ $CASE == aws_failure ]]; then return 1; fi
       if [[ $CASE == refresh_failed ]]; then echo '{"InstanceRefreshes":[{"Status":"Failed","StatusReason":"fixture failure"}]}'; else echo '{"InstanceRefreshes":[{"Status":"Successful"}]}'; fi ;;
     '--region region-1 autoscaling describe-auto-scaling-groups --auto-scaling-group-names controller --output json')
-      local version=7
+      local version=7 lifecycle=InService
       if [[ $CASE == old_template ]]; then version=6; fi
-      printf '{"AutoScalingGroups":[{"AutoScalingGroupName":"controller","DesiredCapacity":2,"LaunchTemplate":{"LaunchTemplateId":"lt-one","Version":"7"},"Instances":[{"InstanceId":"i-one","HealthStatus":"Healthy","LifecycleState":"InService","LaunchTemplate":{"LaunchTemplateId":"lt-one","Version":"7"}},{"InstanceId":"i-two","HealthStatus":"Healthy","LifecycleState":"InService","LaunchTemplate":{"LaunchTemplateId":"lt-one","Version":"%s"}}]}]}\n' "$version" ;;
+      if [[ $CASE == controller_terminating && ! -e $PENDING_MARKER-controller ]]; then lifecycle=Terminating; : >"$PENDING_MARKER-controller"; fi
+      printf '{"AutoScalingGroups":[{"AutoScalingGroupName":"controller","DesiredCapacity":2,"LaunchTemplate":{"LaunchTemplateId":"lt-one","Version":"7"},"Instances":[{"InstanceId":"i-one","HealthStatus":"Healthy","LifecycleState":"InService","LaunchTemplate":{"LaunchTemplateId":"lt-one","Version":"7"}},{"InstanceId":"i-two","HealthStatus":"Healthy","LifecycleState":"%s","LaunchTemplate":{"LaunchTemplateId":"lt-one","Version":"%s"}}]}]}\n' "$lifecycle" "$version" ;;
     '--region region-1 autoscaling describe-auto-scaling-groups --auto-scaling-group-names worker-one --output json'|'--region region-1 autoscaling describe-auto-scaling-groups --auto-scaling-group-names worker-two --output json')
       if [[ $CASE == worker_missing ]]; then echo '{"AutoScalingGroups":[]}'; return; fi
       local name=${6} state=Healthy desired=1 lifecycle=InService
@@ -43,7 +44,7 @@ aws() {
       local leader=healthy
       if [[ $CASE == unhealthy ]]; then leader=unhealthy; fi
       if [[ $CASE == sqlite_lb ]]; then echo '{"TargetHealthDescriptions":[{"Target":{"Id":"i-one"},"TargetHealth":{"State":"healthy"}}]}'; return; fi
-      printf '{"TargetHealthDescriptions":[{"Target":{"Id":"i-one"},"TargetHealth":{"State":"%s"}},{"Target":{"Id":"i-two"},"TargetHealth":{"State":"unhealthy","Reason":"Target.ResponseCodeMismatch","Description":"Health checks failed with these codes: [503]"}}]}\n' "$leader" ;;
+      printf '{"TargetHealthDescriptions":[{"Target":{"Id":"i-one"},"TargetHealth":{"State":"%s"}},{"Target":{"Id":"i-two"},"TargetHealth":{"State":"unhealthy","Reason":"Target.FailedHealthChecks","Description":"Health checks failed"}}]}\n' "$leader" ;;
     *) return 1 ;;
   esac
 }
@@ -78,15 +79,15 @@ curl() {
   case $CASE in wrong) echo '{"version":"0.0.0"}' ;; no_version) echo '{}' ;; http_failure) return 1 ;; *) echo '{"version":"1.2.3"}' ;; esac
 }
 sleep() {
-  case $CASE in unhealthy) SECONDS=$((SECONDS + 2401)) ;; worker_short) SECONDS=$((SECONDS + 181)) ;; *) SECONDS=$((SECONDS + 1)) ;; esac
+  case $CASE in unhealthy|old_template) SECONDS=$((SECONDS + 2401)) ;; worker_short) SECONDS=$((SECONDS + 181)) ;; *) SECONDS=$((SECONDS + 1)) ;; esac
 }
 export -f tofu aws gang openssl curl sleep
-for CASE in healthy sqlite sqlite_lb wrong_pin wrong no_version http_failure unhealthy old_template missing aws_failure refresh_failed worker_missing worker_unhealthy worker_short worker_pending worker_terminating; do
+for CASE in healthy sqlite sqlite_lb wrong_pin wrong no_version http_failure unhealthy old_template controller_terminating missing aws_failure refresh_failed worker_missing worker_unhealthy worker_short worker_pending worker_terminating; do
   : >"$CALLS"
   : >"$CURL_CALLS"
   status=0
   (cd "$scratch" && bash --noprofile --norc -euo pipefail "$scratch/step") >"$scratch/out" 2>&1 || status=$?
-  case $CASE in healthy|sqlite|sqlite_lb|worker_pending|worker_terminating) [[ $status == 0 ]] ;; *) [[ $status != 0 ]] ;; esac
+  case $CASE in healthy|sqlite|sqlite_lb|controller_terminating|worker_pending|worker_terminating) [[ $status == 0 ]] ;; *) [[ $status != 0 ]] ;; esac
   case $CASE in
     healthy) [[ $(wc -l <"$CALLS") -eq 6 ]] && grep -Fx -- '--region region-1 elbv2 describe-target-health --target-group-arn arn:one --output json' "$CALLS" >/dev/null && grep -Fx -- '--region region-1 elbv2 describe-target-health --target-group-arn arn:two --output json' "$CALLS" >/dev/null && grep -Fx -- '--region region-1 autoscaling describe-auto-scaling-groups --auto-scaling-group-names worker-two --output json' "$CALLS" >/dev/null ;;
     sqlite) [[ ! -s $CALLS ]] ;;
@@ -100,6 +101,7 @@ for CASE in healthy sqlite sqlite_lb wrong_pin wrong no_version http_failure unh
     http_failure) grep -F 'failed to query server version' "$scratch/out" >/dev/null ;;
     worker_missing) grep -F 'worker Auto Scaling group worker-one is missing' "$scratch/out" >/dev/null ;;
     worker_unhealthy) grep -F 'worker Auto Scaling group worker-one is unhealthy' "$scratch/out" >/dev/null ;;
+    controller_terminating) [[ -e $PENDING_MARKER-controller ]] ;;
     worker_short) grep -F 'worker Auto Scaling group worker-one did not reach desired healthy capacity' "$scratch/out" >/dev/null ;;
     worker_pending) [[ -e $PENDING_MARKER-worker-one && -e $PENDING_MARKER-worker-two ]] ;;
   esac
