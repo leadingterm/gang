@@ -295,7 +295,6 @@ impl ObservationSink {
     }
 
     /// Counts an admitted public connection until the returned guard is dropped.
-    #[must_use]
     pub fn connection_opened(&self) -> PublicConnectionCount {
         self.connections.active.fetch_add(1, Ordering::Relaxed);
         PublicConnectionCount(Arc::clone(&self.connections))

@@ -16,7 +16,6 @@ in
       useNixStoreImage = true;
       mountHostNixStore = false;
       sharedDirectories = pkgs.lib.mkForce {};
-      assignIPAddresses = false;
       vlans = [1];
     };
 
@@ -25,7 +24,8 @@ in
         networking = {
           useDHCP = false;
           firewall.enable = false;
-          interfaces.eth1.ipv4.addresses = [
+          # Replace the test driver's generated static address.
+          interfaces.eth1.ipv4.addresses = pkgs.lib.mkForce [
             {
               address = upstreamIP;
               prefixLength = 24;
@@ -64,6 +64,8 @@ in
       client = {
         imports = [../dns.nix];
         networking.useDHCP = false;
+        # Leave eth1 without the test driver's generated static address.
+        networking.interfaces.eth1.ipv4.addresses = pkgs.lib.mkForce [];
         networking.interfaces.eth1.useDHCP = true;
         services.nscd.enable = false;
       };
