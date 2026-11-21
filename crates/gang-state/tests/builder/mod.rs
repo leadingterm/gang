@@ -1738,6 +1738,7 @@ fn a_worker_of_another_fleet_does_not_host_the_instance() -> TestResult {
             action: Action::Terminate {
                 instance: instance.clone(),
                 cause: TerminationCause::Orphan,
+                mode: gang_spi::TerminationMode::ScaleIn,
             },
         }]
     );
