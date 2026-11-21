@@ -21,9 +21,11 @@ const matches = (text: string, query: string): boolean => query === "" || text.t
 
 /** Admitted resources and, when clamped, the learned pre-fit sizing. */
 export const ReservationAmounts = ({ reservation, learned }: { reservation: Reservation | undefined; learned: Reservation | undefined }) => (
-  <div class="more line">
-    Reservation: {reservation ? `${reservation.cpuMillicores} millicores CPU · ${bytes(reservation.memory)} memory` : "—"}
-    {learned && <> · Learned: {learned.cpuMillicores} millicores CPU · {bytes(learned.memory)} memory</>}
+  <div class="line">
+    <span class="line__prose">
+      Reservation: {reservation ? `${reservation.cpuMillicores} millicores CPU · ${bytes(reservation.memory)} memory` : "—"}
+      {learned && <> · Learned: {learned.cpuMillicores} millicores CPU · {bytes(learned.memory)} memory</>}
+    </span>
   </div>
 );
 
