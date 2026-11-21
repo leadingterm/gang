@@ -10,8 +10,8 @@ fi
 script_dir=$(cd "$(dirname "$0")" && pwd)
 workflow=${1-"$script_dir/../.github/workflows/ci.yml"}
 
-yq -o=json '.jobs' "$workflow" | jq -e '
-  . as $jobs
+yq -o=json '.' "$workflow" | jq -e '
+  .jobs as $jobs
   | def needs($id; $expected):
       if ($jobs[$id].needs | if type == "string" then [.] else . end | sort)
          == ($expected | sort) then .
@@ -35,14 +35,25 @@ yq -o=json '.jobs' "$workflow" | jq -e '
            and ($condition | contains("refs/tags/v")) then .
         else error($id + " must run only for main/master pushes and v* tags") end;
     def release_scope:
-      "(github.event_name == '\''push'\'' && (github.ref == '\''refs/heads/main'\'' || github.ref == '\''refs/heads/master'\'' || startsWith(github.ref, '\''refs/tags/v'\'')) || github.event_name == '\''pull_request'\'' && startsWith(github.event.pull_request.head.ref, '\''release/'\'') && github.event.pull_request.head.repo.full_name == github.repository)";
+      "(github.event_name == '\''merge_group'\'' || github.event_name == '\''push'\'' && (github.ref == '\''refs/heads/main'\'' || github.ref == '\''refs/heads/master'\'' || startsWith(github.ref, '\''refs/tags/v'\'')) || github.event_name == '\''pull_request'\'' && startsWith(github.event.pull_request.head.ref, '\''release/'\'') && github.event.pull_request.head.repo.full_name == github.repository)";
     def release_checkout:
       "${{ github.event_name == '\''pull_request'\'' && startsWith(github.event.pull_request.head.ref, '\''release/'\'') && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.sha || github.sha }}";
-  if type != "object" or (.required | type) != "object" then
+  if .on.merge_group.types != ["checks_requested"] then
+    error("merge_group must trigger exactly on checks_requested")
+  elif ($jobs | type) != "object" or ($jobs.required | type) != "object" then
     error("workflow must contain a required job")
-  elif (.changes | type) != "object" then
+  elif ($jobs.changes | type) != "object" then
     error("workflow must contain a changes job")
   else . end
+  | if ([$jobs.changes.steps[]? | select(.id == "filter") | .env.BASE]
+        == ["${{ github.event_name == '\''pull_request'\'' && github.event.pull_request.base.sha || '\''0000000000000000000000000000000000000000'\'' }}"]) then .
+    else error("change classification must use the PR base or zero fallback") end
+  | if ([$jobs.changes.steps[]? | select(.id == "filter") | .env.EVENT] == ["${{ github.event_name }}"])
+       and ([$jobs.changes.steps[]? | select(.id == "filter") | .env.REF] == ["${{ github.ref }}"]) then .
+    else error("change classification must use the event name and queue ref") end
+  | if ([$jobs.changes.steps[]? | select(.id == "filter") | .run]
+        == ["if [[ \"$EVENT\" == merge_group ]]; then\n  tools/ci-changes.sh --merge-group \"$REF\" \"$HEAD\"\nelse\n  tools/ci-changes.sh \"$BASE\" \"$HEAD\"\nfi >> \"$GITHUB_OUTPUT\"\n"]) then .
+    else error("change classification must dispatch merge groups and ordinary events correctly") end
   | if ([$jobs[].steps[]? | select((.uses // "") | startswith("actions/checkout@"))
          | select(.with.ref != release_checkout)] | length) == 0
        and ([$jobs.changes.steps[]? | select(.id == "filter") | .env.HEAD] == [release_checkout]) then .
@@ -106,6 +117,9 @@ yq -o=json '.jobs' "$workflow" | jq -e '
   | needs("linux-arm64-checks"; ["changes", "linux-arm64-bundle"])
   | needs("release-validation"; ["changes", "required", "linux-arm64", "cross"])
   | results("release-validation")
+  | if ([$jobs["release-validation"].steps[]? | select(.env.REQUIRED_RESULT != null) | .env.HEAVY]
+        == ["${{ needs.changes.outputs.heavy }}"]) then .
+    else error("release-validation must use the changes heavy output") end
   | reduce ["e2e-gate-1", "e2e-gate-2"][] as $id (.;
       needs($id + "-shards"; ["changes", "linux-x86_64-bundle"])
       | needs($id; ["changes", $id + "-shards"])
@@ -122,7 +136,7 @@ yq -o=json '.jobs' "$workflow" | jq -e '
   | push_only("macos")
   | reduce ["linux-arm64-bundle", "linux-arm64-checks", "cross"][] as $id (.;
       if $jobs[$id].if == (release_scope + " && needs.changes.outputs.heavy == '\''true'\''") then .
-      else error($id + " must run only on heavy main/master/tag pushes and trusted release PRs") end)
+      else error($id + " must run only on heavy merge groups, main/master/tag pushes and trusted release PRs") end)
   | reduce ["linux-arm64", "release-validation"][] as $id (.;
       if $jobs[$id].if == ("always() && " + release_scope) then .
       else error($id + " must always aggregate on trusted release events") end)
