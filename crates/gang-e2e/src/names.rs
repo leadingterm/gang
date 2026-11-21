@@ -465,8 +465,8 @@ pub mod fleets {
     pub const MEMORY: &str = "an action requesting more memory than the first fleet has";
     /// A step whose action asks for the noop sandbox.
     pub const NOOP_SANDBOX: &str = "an action requesting the noop sandbox";
-    /// A cold pair whose configured unknown-duration work justifies overflow capacity.
-    pub const OVERFLOW: &str = "a cost-justified cold pair of unconstrained actions";
+    /// A cold pair whose CPU reservations require overflow capacity.
+    pub const OVERFLOW: &str = "a resource-overflow cold pair of unconstrained actions";
 
     /// The scale-outs of `request` are exactly those of `fleets`, in order.
     #[must_use]

@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted, partly superseded by [ADR-60](adr-60-rate-based-scaling.md) for v0.3.4: candidate-count payback simulation, the 2B stream rule, readiness-based unknown durations and the `boot_grace` readiness prior are historical, not current policy. ADR-60 keeps readiness measurement, reachability and one display-only final dispatch. Learned reservation and duration histories are persisted as described in SPECIFICATION §5; the original memory-only history and rejection of database persistence no longer apply. Readiness remains term-local.
+Superseded for scale-out. The payback, concurrency ceiling and slot claims below are historical; current resource-only scaling and expected-wait simulation are specified in [SPECIFICATION §5](../SPECIFICATION.md#51-the-pass-gang-reconciler). Learned reservation and duration histories persist as described there; readiness remains term-local.
 
 ## Context
 
@@ -10,7 +10,7 @@ Concurrency-only sizing can repeatedly buy booting instances for a short burst t
 
 ## Decision
 
-Within the existing concurrency ceiling, simulate queued work and buy the largest set of new instances that repays readiness in work served or completion time saved, with a reachability floor. Evaluate every candidate count: payback is not monotone across overlapping fleets. The detailed rules are in SPECIFICATION §5.1.
+Historically, within the concurrency ceiling, simulate queued work and buy instances that repay readiness. This purchase rule is superseded by resource demand in SPECIFICATION §5.1.
 
 Use Gang's learned execution slot durations and measured fleet readiness, with readiness as the unknown-duration prior and `boot_grace` as the readiness prior. Learned durations persist through the state database; readiness samples and backlog age remain local to the leadership term.
 

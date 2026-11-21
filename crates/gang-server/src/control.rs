@@ -2,7 +2,7 @@
 //! and applies the resulting plan through the ports.
 
 use std::convert::Infallible;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -122,6 +122,7 @@ where
         settings: ControlSettings,
         scaling: Arc<ScalingConfig>,
         profiles: SourceProfiles,
+        cpu_oversubscription: NonZeroU32,
         ports: &ControlPorts<'a, F, S, R, C>,
         fence: Fence,
     ) -> Self {
@@ -143,7 +144,8 @@ where
             .map(|policy| policy.boot_grace)
             .max()
             .unwrap_or_default();
-        let reconciler = Reconciler::new(fleets.policies(), scaling, profiles);
+        let reconciler =
+            Reconciler::new(fleets.policies(), scaling, profiles, cpu_oversubscription);
         Self {
             fleets,
             configs,
@@ -881,6 +883,7 @@ mod tests {
             ControlSettings::new(NonZeroDuration::from_secs(1), &DashboardConfig::default()),
             scaling,
             profiles,
+            gang_types::nonzero_u32(2),
             &crate::control::ControlPorts {
                 provisioner,
                 scheduler,
@@ -995,7 +998,7 @@ mod tests {
                     to: 1,
                     need: NeedCause::Demand,
                     summary: ScaleDecision {
-                        slots: 4,
+                        needed: 1,
                         reliable: 0,
                         ..ScaleDecision::default()
                     },
@@ -1031,7 +1034,7 @@ mod tests {
             } => detail,
             kind => panic!("missing purchase detail: {kind:?}"),
         };
-        assert!(detail.contains("slots=4"));
+        assert!(detail.contains("needed=1"));
         assert!(detail.contains("reliable=0"));
         let purchase = crate::events::wire_event(RecordedScalingEvent {
             seq: gang_spi::ScalingEventSeq::new(1),

@@ -3,6 +3,7 @@
 //! Capacity is counted per physical instance. Controller cordon intent is authoritative;
 //! connection-local self drains never grant the controller permission to resume a worker.
 
+use std::num::NonZeroU32;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,7 +22,7 @@ use crate::observations::{Observations, Seen};
 use crate::pass_time::PassTime;
 use crate::plan::{Action, DrainReason, NeedCause, Plan, PlanStep, TerminationCause};
 use crate::profile::SourceProfiles;
-use crate::vectors::SlotVector;
+use crate::vectors::CapacityVector;
 use crate::wait::{Capacity, WorkPlanner};
 
 #[derive(Debug, Clone, Copy)]
@@ -159,6 +160,8 @@ pub struct Reconciler {
     first_pass: Option<Tick>,
     first_wall: Option<Timestamp>,
     scaling: Arc<ScalingConfig>,
+    cpu_oversubscription: NonZeroU32,
+    running_reservations: Vec<crate::Demand>,
     planner: WorkPlanner,
     capacities: Vec<Capacity>,
     census: Vec<FleetCensus>,
@@ -173,6 +176,7 @@ impl Reconciler {
         fleets: &[FleetPolicy],
         scaling: Arc<ScalingConfig>,
         profiles: SourceProfiles,
+        cpu_oversubscription: NonZeroU32,
     ) -> Self {
         let capacity = fleets
             .iter()
@@ -188,7 +192,9 @@ impl Reconciler {
             repair_workers: Vec::with_capacity(capacity),
             first_pass: None,
             first_wall: None,
-            planner: WorkPlanner::new(fleets, Arc::clone(&scaling), profiles),
+            planner: WorkPlanner::new(fleets, Arc::clone(&scaling), profiles, cpu_oversubscription),
+            cpu_oversubscription,
+            running_reservations: Vec::with_capacity(capacity),
             scaling,
             capacities: fleets
                 .iter()
@@ -253,16 +259,19 @@ impl Reconciler {
                 .past_boot_grace
                 .resize(fleet.supply.instances.len(), false);
         }
-        Self::charge_running(fleets, hosted);
+        self.charge_running(fleets, hosted);
         for action in &snapshot.queued {
             for index in action.candidates {
                 if let Some(fleet) = fleets.get_mut(index) {
                     fleet.outlook.candidates = fleet.outlook.candidates.saturating_add(1);
                 }
             }
-            let chosen = place(action.candidates, action.resources, |index| {
-                fleets.get(index).map(|f| (&f.policy, f.outlook.demand))
-            });
+            let chosen = place(
+                action.candidates,
+                action.resources,
+                self.cpu_oversubscription,
+                |index| fleets.get(index).map(|f| (&f.policy, f.outlook.demand)),
+            );
             self.planner.attribute(chosen, action.candidates);
             if let Some(fleet) = chosen.and_then(|index| fleets.get_mut(index)) {
                 fleet.outlook.demand.add_queued(action.resources);
@@ -281,7 +290,10 @@ impl Reconciler {
                 supply: &fleet.supply,
                 needed: fleet.outlook.needed,
                 minimum: fleet.outlook.minimum,
-                ceiling: fleet.outlook.demand.instances(&fleet.policy),
+                ceiling: fleet
+                    .outlook
+                    .demand
+                    .instances(&fleet.policy, self.cpu_oversubscription),
                 need: if self.planner.work(index) < fleet.outlook.needed {
                     NeedCause::Minimum
                 } else {
@@ -298,9 +310,17 @@ impl Reconciler {
         self.observations.finish_pass();
     }
 
-    fn charge_running(fleets: &mut [FleetPass], hosted: &HostedSnapshot) {
+    fn charge_running(&mut self, fleets: &mut [FleetPass], hosted: &HostedSnapshot) {
         let snapshot = hosted.snapshot();
-        for worker in &snapshot.workers {
+        self.running_reservations.clear();
+        self.running_reservations
+            .resize(snapshot.workers.len(), crate::Demand::default());
+        for execution in &snapshot.executing {
+            if let Some(reservations) = self.running_reservations.get_mut(execution.worker) {
+                reservations.add_queued(execution.resources);
+            }
+        }
+        for (worker_index, worker) in snapshot.workers.iter().enumerate() {
             if let Some((index, fleet)) = fleets
                 .iter_mut()
                 .enumerate()
@@ -320,30 +340,19 @@ impl Reconciler {
                     .is_some_and(|id| hosted.is_cordoned(index, id));
                 if !worker.draining && !owned {
                     fleet.outlook.demand.add_running(worker.running_actions);
+                    let known = self.running_reservations[worker_index];
+                    let mut resources = known.resources();
+                    if known.actions() < u64::from(worker.running_actions) {
+                        let cpu = u64::from(fleet.policy.vcpus_per_instance.get())
+                            .saturating_mul(gang_types::property::MILLICORES_PER_CORE)
+                            .saturating_mul(u64::from(self.cpu_oversubscription.get()));
+                        resources.cpu_millicores = resources.cpu_millicores.max(cpu);
+                        resources.memory =
+                            resources.memory.max(fleet.policy.memory_per_instance.get());
+                        resources.disk = resources.disk.max(fleet.policy.disk_per_instance.get());
+                    }
+                    fleet.outlook.demand.add_running_resources(resources);
                 }
-            }
-        }
-        // The worker already supplied the action count, not its resource reservations.
-        for execution in &snapshot.executing {
-            let Some(worker) = snapshot.workers.get(execution.worker) else {
-                continue;
-            };
-            if worker.draining {
-                continue;
-            }
-            if let Some((index, fleet)) = fleets
-                .iter_mut()
-                .enumerate()
-                .find(|(_, f)| f.policy.name == worker.fleet)
-                && !worker
-                    .id
-                    .instance_name()
-                    .is_some_and(|id| hosted.is_cordoned(index, id))
-            {
-                fleet
-                    .outlook
-                    .demand
-                    .add_running_resources(execution.resources);
             }
         }
     }
@@ -682,7 +691,7 @@ impl Reconciler {
                 .saturating_add(census.transient),
         );
         let mut resumed = 0u32;
-        let mut extra = SlotVector::default();
+        let mut extra = CapacityVector::default();
         for position in range.clone() {
             let drain = self.draining[position];
             if !drain.owned {
@@ -903,7 +912,12 @@ mod tests {
         policy.idle_timeout = Duration::from_hours(1);
         let scaling = Arc::new(ScalingConfig::default());
         let profiles = SourceProfiles::new(&scaling, gang_config::HistoryWindow::from_units(1));
-        let reconciler = Reconciler::new(std::slice::from_ref(&policy), scaling, profiles);
+        let reconciler = Reconciler::new(
+            std::slice::from_ref(&policy),
+            scaling,
+            profiles,
+            gang_types::nonzero_u32(2),
+        );
         let instance = InstanceId::try_new("i-0abc123")?;
         let mut fleet = FleetPass::new(policy.clone());
         fleet.supply.desired = 1;
@@ -942,6 +956,38 @@ mod tests {
             now: Tick::from_elapsed(Duration::from_secs(seconds)),
             wall: Timestamp::from_unix_millis(100_000 + seconds * 1_000),
         }
+    }
+
+    #[test]
+    fn missing_running_metadata_occupies_one_worker_without_double_charging_known_work()
+    -> TestResult {
+        let (mut reconciler, mut fleets, mut hosted) = fixture(0, false, false)?;
+        let mut snapshot = hosted.snapshot().clone();
+        snapshot.workers[0].running_actions = 2;
+        snapshot.executing.push(gang_spi::ExecutingDemand {
+            source: None,
+            candidates: gang_types::FleetSet::prefix(1)?,
+            resources: gang_types::ActionResources {
+                cpu_millicores: 1_000,
+                ..Default::default()
+            },
+            worker: 0,
+            started: Timestamp::default(),
+            expected: None,
+        });
+        hosted.replace(&mut snapshot);
+        reconciler.charge_running(&mut fleets, &hosted);
+        let resources = fleets[0].outlook.demand.resources();
+        assert_eq!(
+            resources.cpu_millicores,
+            u64::from(fleets[0].policy.vcpus_per_instance.get())
+                * gang_types::property::MILLICORES_PER_CORE
+                * 2
+        );
+        assert_eq!(resources.memory, fleets[0].policy.memory_per_instance.get());
+        assert_eq!(resources.disk, fleets[0].policy.disk_per_instance.get());
+        assert_eq!(fleets[0].outlook.demand.actions(), 2);
+        Ok(())
     }
 
     #[test]

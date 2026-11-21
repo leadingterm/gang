@@ -353,7 +353,6 @@ max_instances = 4
 vcpus_per_instance = 4
 memory_per_instance = "8GiB"
 disk_per_instance = "100GiB"
-target_actions_per_instance = 4
 idle_timeout = "15s"
 max_drain_wait = "1m"
 boot_grace = "1m"
@@ -379,7 +378,6 @@ max_instances = 4
 vcpus_per_instance = 8
 memory_per_instance = "29GiB"
 disk_per_instance = "100GiB"
-target_actions_per_instance = 2
 idle_timeout = "5m"
 max_drain_wait = "1h"
 boot_grace = "10m"
@@ -397,7 +395,6 @@ max_instances = 2
 vcpus_per_instance = 4
 memory_per_instance = "8GiB"
 disk_per_instance = "100GiB"
-target_actions_per_instance = 1
 idle_timeout = "15s"
 max_drain_wait = "1m"
 boot_grace = "1m"
@@ -718,11 +715,15 @@ fn fleet_ceilings_constrain_root_reservations_and_cold_start() {
         "sandbox = \"bwrap\"",
         "sandbox = \"bwrap\"\nactions = { resources = { cpu_count = 1 } }",
     );
-    let larger_cold_start = format!("{small_cpu}\n[actions.cold_start]\ncpu_count = 2\n");
+    let larger_cold_start = format!("{small_cpu}\n[actions.cold_start]\ncpu_millicores = 2000\n");
     assert!(matches!(
         larger_cold_start.parse::<GangConfig<Plugins>>(),
         Err(ConfigError::ColdStartFitsNoFleet { .. })
     ));
+    let at_ceiling = format!("{small_cpu}\n[actions.cold_start]\ncpu_millicores = 1000\n");
+    assert!(at_ceiling.parse::<GangConfig<Plugins>>().is_ok());
+    let fractional = format!("{small_cpu}\n[actions.cold_start]\ncpu_millicores = 125\n");
+    assert!(fractional.parse::<GangConfig<Plugins>>().is_ok());
 }
 
 #[test]
@@ -1152,7 +1153,7 @@ fn toml_rejection(sections: &Sections) -> Result<String, Box<dyn Error>> {
 /// A `[[fleets]]` entry on the local provisioner with the given name and no options.
 fn fleet_block(name: &str) -> String {
     format!(
-        "[[fleets]]\nname = \"{name}\"\nisa = \"x86-64\"\naction_environment = \"host:test\"\nsandbox = \"bwrap\"\nmin_instances = 0\nmax_instances = 1\nvcpus_per_instance = 1\nmemory_per_instance = \"8GiB\"\ndisk_per_instance = \"100GiB\"\ntarget_actions_per_instance = 1\nidle_timeout = \"15s\"\nmax_drain_wait = \"1m\"\nboot_grace = \"1m\"\n"
+        "[[fleets]]\nname = \"{name}\"\nisa = \"x86-64\"\naction_environment = \"host:test\"\nsandbox = \"bwrap\"\nmin_instances = 0\nmax_instances = 1\nvcpus_per_instance = 1\nmemory_per_instance = \"8GiB\"\ndisk_per_instance = \"100GiB\"\nidle_timeout = \"15s\"\nmax_drain_wait = \"1m\"\nboot_grace = \"1m\"\n"
     )
 }
 
@@ -2246,14 +2247,11 @@ fn rejects_a_zero_vcpus_per_instance() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn rejects_a_zero_target_actions_per_instance() -> Result<(), Box<dyn Error>> {
-    let zero = FLEET.replace(
-        "target_actions_per_instance = 4",
-        "target_actions_per_instance = 0",
-    );
+fn rejects_the_removed_target_actions_per_instance() -> Result<(), Box<dyn Error>> {
+    let obsolete = format!("{FLEET}\ntarget_actions_per_instance = 4\n");
 
     let error = Sections {
-        fleet: zero.leak(),
+        fleet: obsolete.leak(),
         ..Sections::VALID
     }
     .parse()
@@ -3635,7 +3633,6 @@ fn hand_member(
         vcpus_per_instance: NonZeroU32::MIN,
         memory_per_instance: NonZeroBytes::gib(8),
         disk_per_instance: NonZeroBytes::gib(100),
-        target_actions_per_instance: NonZeroU32::MIN,
         idle_timeout: Duration::from_secs(15),
         max_drain_wait: Duration::from_mins(1),
         boot_grace: Duration::from_secs(30),

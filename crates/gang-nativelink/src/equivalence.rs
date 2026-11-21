@@ -2,14 +2,14 @@
 
 use std::collections::HashMap;
 use std::error::Error;
-use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use gang_spi::{ControllerSpec, RenderedStoreSpec, Slots, StoreAccess, WorkerSpec, WorkerTls};
+use gang_spi::{ControllerSpec, RenderedStoreSpec, StoreAccess, WorkerSpec, WorkerTls};
 use gang_testkit::TestResult;
 use gang_types::{
-    Bytes, FleetCatalog, FleetName, FleetProperties, InstanceId, Isa, Resources, property,
+    Bytes, FleetCatalog, FleetName, FleetProperties, InstanceId, Isa, Resources, WorkerLifetime,
+    property,
 };
 use nativelink_config::cas_server::WorkerProperty;
 use nativelink_config::schedulers::SchedulerSpec;
@@ -250,7 +250,7 @@ fn catalog_accepts_exactly_the_fleets_native_matches_for_normalized_requests() -
             memory_pool: None,
             instance: instance.clone(),
             properties: fleet.clone(),
-            slots: Slots::LongLived(NonZeroU32::MIN),
+            lifetime: WorkerLifetime::LongLived,
             work_directory: PathBuf::from("/var/gang/work"),
             fast_cas_directory: PathBuf::from("/var/gang/cas"),
             fast_cas_budget: Bytes::new(1024),
@@ -259,27 +259,43 @@ fn catalog_accepts_exactly_the_fleets_native_matches_for_normalized_requests() -
             store_access: StoreAccess::Direct,
             entrypoint: PathBuf::from("/usr/bin/gang"),
         };
-        let registered = worker(&config, &endpoint, &worker_spec, WorkerTls::Plain)?
-            .worker
-            .platform_properties;
-        let pairs = registered
+        let rendered = worker(&config, &endpoint, &worker_spec, WorkerTls::Plain)?.worker;
+        let pairs = rendered
+            .platform_properties
             .iter()
             .map(|(key, property)| worker_value(key, property))
             .collect::<Result<Vec<_>, _>>()?;
-        workers.push(native_properties(&manager, pairs, false)?);
+        workers.push((
+            native_properties(&manager, pairs, false)?,
+            rendered.action_ceilings,
+        ));
     }
 
     let mut any_accepted = false;
     for request in requests(&request_groups()) {
         let accepting = catalog.admit(request.iter().copied()).unwrap_or_default();
         let native = native_properties(&manager, request.iter().copied(), true)?;
-        for (index, worker) in workers.iter().enumerate() {
-            let within_ceiling = fleets[index].action_ceilings().all(|(key, limit)| {
-                request
-                    .iter()
-                    .find(|(name, _)| *name == key)
-                    .and_then(|(_, value)| value.parse::<u64>().ok())
-                    .is_none_or(|value| value <= limit)
+        let request_map: HashMap<String, String> = request
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect();
+        let normalized_cpu =
+            crate::placeable::normalized_cpu_reservation(&request_map).or_else(|| {
+                request_map
+                    .get(property::CPU_MILLICORES)?
+                    .parse::<u64>()
+                    .ok()
+            });
+        for (index, (worker, ceilings)) in workers.iter().enumerate() {
+            let within_ceiling = ceilings.iter().all(|(key, limit)| {
+                let value = if key == property::CPU_MILLICORES {
+                    normalized_cpu
+                } else {
+                    request_map
+                        .get(key)
+                        .and_then(|value| value.parse::<u64>().ok())
+                };
+                value.is_none_or(|value| value <= *limit)
             });
             let expected = native.is_satisfied_by(worker, false) && within_ceiling;
             assert_eq!(

@@ -428,16 +428,12 @@ fn failed_unborn_surplus_is_withdrawn_even_when_usable_is_below_needed() -> Test
     w.h.supply_mut(X86)?.launch_failure = Some(gang_spi::LaunchFailure {
         reason: "Spot capacity".into(),
     });
-    // B=45s, H=(45+600)*50%=322.5s. No completion or net arrival has
-    // been observed, so future load F=0 even though 16 jobs are running.
-    // They finish at 30s, leaving 16*(45-30)=240 pre-ready slot-seconds.
-    // The 32 queued 330s jobs fund (10_560-240)/322.5-16 = 16 extra slots:
-    // one usable host + one funded host = need 2, still above usable 1.
-    // The five failed unborn hosts provide no capacity or booting credit.
+    // Forty-eight CPU reservations require three 16-vCPU workers; failed unborn hosts
+    // provide no usable capacity or booting credit.
     w.queue(Some(source(1)?), X86, 32, Some(secs(330)))?;
     assert_eq!(w.h.supply(X86)?.desired, 6);
-    assert_eq!(changes(&w.pass()), vec![Change::Withdraw(X86, 6, 2)]);
-    assert_eq!(w.h.outlook(X86)?.needed, 2);
+    assert_eq!(changes(&w.pass()), vec![Change::Withdraw(X86, 6, 3)]);
+    assert_eq!(w.h.outlook(X86)?.needed, 3);
     Ok(())
 }
 

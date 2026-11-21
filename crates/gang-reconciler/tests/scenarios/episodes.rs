@@ -123,7 +123,6 @@ struct Outcome {
     late_instances: u32,
     utilization_cordons: u32,
     completed: u64,
-    persistent_refill_completions: u64,
 }
 
 fn register_ready(h: &mut Harness, boots: &mut Vec<Boot>, now: u64, delay: u64) -> TestResult {
@@ -135,17 +134,19 @@ fn register_ready(h: &mut Harness, boots: &mut Vec<Boot>, now: u64, delay: u64) 
             Duration::from_millis(delay),
         )?;
         h.connect(X86, &boot.instance)?;
-        h.snapshot
-            .workers
-            .last_mut()
-            .ok_or("missing booted worker")?
-            .max_inflight_actions = NonZeroU32::new(16);
     }
     boots.retain(|boot| boot.ready > now);
     Ok(())
 }
 
-fn dispatch(h: &Harness, jobs: &mut Vec<Job>, mut queued: usize, now: u64, duration: u64) -> usize {
+fn dispatch(
+    h: &Harness,
+    jobs: &mut Vec<Job>,
+    mut queued: usize,
+    now: u64,
+    duration: u64,
+    resources: ActionResources,
+) -> usize {
     // Spread dispatch. Draining workers finish existing jobs and receive no new ones.
     while queued > 0 {
         let candidate = h
@@ -156,7 +157,15 @@ fn dispatch(h: &Harness, jobs: &mut Vec<Job>, mut queued: usize, now: u64, durat
             .filter_map(|worker| {
                 let name = worker.id.instance_name()?;
                 let running = jobs.iter().filter(|job| job.instance == name).count();
-                (running < 16).then_some((running, worker.id.as_str(), name))
+                let count = running as u128 + 1;
+                let policy = &h.passes[X86].policy;
+                (count * u128::from(resources.cpu_millicores)
+                    <= u128::from(policy.vcpus_per_instance.get()) * 1000
+                    && count * u128::from(resources.memory.get())
+                        <= u128::from(policy.memory_per_instance.get().get())
+                    && count * u128::from(resources.disk.get())
+                        <= u128::from(policy.disk_per_instance.get().get()))
+                .then_some((running, worker.id.as_str(), name))
             })
             .min_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
         let Some((_, _, name)) = candidate else {
@@ -288,7 +297,6 @@ fn simulate(episode: &Episode) -> TestResult<Outcome> {
         late_instances: 0,
         utilization_cordons: 0,
         completed: 0,
-        persistent_refill_completions: 0,
     };
     // Fixed iteration count is a deterministic hard deadline; no wall clock or sleeps.
     for step in 0..=episode.observed.window_ms / STEP_MS {
@@ -313,12 +321,10 @@ fn simulate(episode: &Episode) -> TestResult<Outcome> {
             usize::try_from(pending_work)?,
             now,
             model.duration_ms,
+            resources,
         );
         publish_workload(&mut w, &jobs, queued, now, model, resources)?;
         let decisions = w.run();
-        if queued > 0 && w.h.outlook(X86)?.load.is_some_and(|load| load > 0) {
-            outcome.persistent_refill_completions += u64::try_from(completed)?;
-        }
         outcome.utilization_cordons += u32::try_from(
             decisions
                 .iter()
@@ -377,9 +383,13 @@ fn modeled_episode(name: &str) -> TestResult {
             assert_eq!(after.completed, u64::from(episode.modeled.concurrency));
         }
         "spread" => {
-            let slots = f64::from(episode.modeled.concurrency);
-            let cpu_slots = slots * episode.modeled.cpu_millicores as f64 / 1000.0;
-            let kept = (slots.max(cpu_slots) / (16.0 * 0.7)).ceil() as u32;
+            let cpu = f64::from(episode.modeled.concurrency)
+                * episode.modeled.cpu_millicores as f64
+                / 1000.0;
+            let memory = f64::from(episode.modeled.concurrency)
+                * episode.modeled.memory_bytes as f64
+                / (32.0 * 1024.0 * 1024.0 * 1024.0);
+            let kept = (cpu.max(memory * 16.0) / (16.0 * 0.7)).ceil() as u32;
             assert!(
                 after.utilization_cordons > 0,
                 "spread load must exercise busy scale-in"
@@ -392,18 +402,17 @@ fn modeled_episode(name: &str) -> TestResult {
         "sustained" => {
             assert_eq!(episode.modeled.concurrency, 96);
             assert_eq!(episode.modeled.duration_ms, 30_000);
-            // Even all 96 queued jobs supply only 2_880 slot-seconds. Once
-            // B=45s is measured, H=(45+600)*50%=322.5s: work/H < 9 slots,
-            // below the 16 needed to buy one extra instance. Persistent refill
-            // does not turn that short queued work into a raw-count purchase.
-            assert_eq!(after.peak, 1, "short queued work cannot repay another host");
             assert_eq!(
-                after.late_instances, 1,
-                "sustained work keeps its serving host"
+                after.peak, 6,
+                "queued CPU reservations reach the fleet maximum"
+            );
+            assert_eq!(
+                after.late_instances, 6,
+                "sustained resource demand keeps capacity"
             );
             assert!(
-                after.persistent_refill_completions > u64::from(episode.modeled.concurrency),
-                "multiple closed-loop waves must finish with persistent load and work still queued"
+                after.completed > u64::from(episode.modeled.concurrency),
+                "multiple closed-loop waves must finish"
             );
         }
         _ => return Err("unknown modeled workload".into()),

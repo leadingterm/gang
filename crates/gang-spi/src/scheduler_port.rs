@@ -14,7 +14,7 @@ use tokio::sync::oneshot;
 use gang_clock::{Clock, Tick, Timestamp};
 use gang_types::{
     ActionEnvironment, ActionResources, BuildId, Bytes, FleetCatalog, FleetName, FleetProperties,
-    FleetSet, InstanceId, Refusal, SourceId, Url, WorkerId,
+    FleetSet, InstanceId, Refusal, SourceId, Url, WorkerId, WorkerLifetime,
 };
 
 use crate::{
@@ -156,8 +156,8 @@ pub trait SchedulerPort: Send + Sync {
     ) -> Result<(), PortError>;
 
     /// Builds one worker, connects it to the controller's worker listener, and runs it until
-    /// `stop` completes, the worker fails, or a [`Slots::SingleUse`] worker has finished its one
-    /// action and uploaded the result.
+    /// `stop` completes, the worker fails, or a [`WorkerLifetime::SingleUse`] worker has
+    /// finished its one action and uploaded the result.
     ///
     /// Once `stop` completes the worker takes no new action, ends every action it runs (the
     /// action's whole process group) and removes their directories, then returns `Ok(())`, so
@@ -624,32 +624,6 @@ pub enum StoreAccess {
     ViaController,
 }
 
-/// How many actions a worker takes at once, and whether it serves one action only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Slots {
-    /// The worker serves one action, then finishes.
-    SingleUse,
-    /// The worker serves this many actions at once.
-    LongLived(NonZeroU32),
-}
-
-impl Slots {
-    /// The number of actions the worker takes at once: one for [`Slots::SingleUse`].
-    #[must_use]
-    pub const fn count(self) -> NonZeroU32 {
-        match self {
-            Self::SingleUse => NonZeroU32::MIN,
-            Self::LongLived(count) => count,
-        }
-    }
-
-    /// Whether the worker serves one action and then finishes.
-    #[must_use]
-    pub const fn is_single_use(self) -> bool {
-        matches!(self, Self::SingleUse)
-    }
-}
-
 /// Inputs of one worker.
 #[derive(Debug, Clone)]
 pub struct WorkerSpec {
@@ -662,8 +636,8 @@ pub struct WorkerSpec {
     pub instance: InstanceId,
     /// The properties the worker registers: its fleet's.
     pub properties: FleetProperties,
-    /// Whether it serves many actions or exactly one, and how many at once.
-    pub slots: Slots,
+    /// Whether the worker serves one action or remains available for more.
+    pub lifetime: WorkerLifetime,
     /// Where actions are built: one directory per worker. The worker empties it at start.
     pub work_directory: PathBuf,
     /// The worker-local fast content-addressable cache directory, under the mounted scratch
@@ -687,13 +661,12 @@ pub struct WorkerSpec {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
     use std::pin::pin;
     use std::task::{Context, Poll, Waker};
 
     use http_body_util::BodyExt;
 
-    use super::{BoxedError, InstanceCordon, Slots, full_body};
+    use super::{BoxedError, InstanceCordon, full_body};
 
     #[test]
     fn instance_cordon_clone_from_shares_the_immutable_identity() -> Result<(), BoxedError> {
@@ -722,27 +695,6 @@ mod tests {
             return Err("a full body is ready on its first poll".into());
         };
         assert_eq!(collected?.to_bytes(), "answer");
-        Ok(())
-    }
-
-    #[test]
-    fn slots_count_is_one_for_single_use() {
-        assert_eq!(Slots::SingleUse.count(), NonZeroU32::MIN);
-    }
-
-    #[test]
-    fn slots_count_is_the_long_lived_slot_count() -> Result<(), BoxedError> {
-        let four = NonZeroU32::new(4).ok_or("four is non-zero")?;
-        assert_eq!(Slots::LongLived(four).count(), four);
-        Ok(())
-    }
-
-    #[test]
-    fn only_single_use_is_single_use() -> Result<(), BoxedError> {
-        let four = NonZeroU32::new(4).ok_or("four is non-zero")?;
-        assert!(Slots::SingleUse.is_single_use());
-        assert!(!Slots::LongLived(NonZeroU32::MIN).is_single_use());
-        assert!(!Slots::LongLived(four).is_single_use());
         Ok(())
     }
 }

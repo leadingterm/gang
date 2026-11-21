@@ -1,6 +1,6 @@
 # ADR-13: Worker lifetime belongs to the provisioner
 
-Status: Accepted
+Status: Accepted for worker lifetime. Scaling and slot-count claims below are historical; current resource-only scaling is specified in [SPECIFICATION §5](../SPECIFICATION.md#51-the-pass-gang-reconciler).
 
 ## Context
 - Kubernetes pods are cheap per action; Slurm jobs queue. The EC2 model assumes many actions per worker, and a single-use EC2 worker would reuse volumes, which NativeLink forbids.
@@ -15,7 +15,7 @@ Status: Accepted
 ## Consequences
 - Each single-use action starts with a cold fast CAS and a fresh certificate: one KMS signature and one ledger row per action; S3 reads stand in for a local cache.
 - `input_links = "break"` is pointless for single-use workers.
-- Deriving one slot per instance from the lifetime (making `target_actions_per_instance` optional) waits for the first single-use provisioner.
+- Worker lifetime does not set a nominal autoscaling capacity; see [SPECIFICATION §5](../SPECIFICATION.md#51-the-pass-gang-reconciler).
 
 ## Rejected alternatives
 - **Per-action pod creation or a push model:** NativeLink assigns actions only to registered workers; demand-driven `set_desired_capacity` is the smallest model and keeps restart and audit intact.

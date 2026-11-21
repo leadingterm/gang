@@ -119,8 +119,6 @@ pub struct FleetPolicy {
     /// enrolls.
     /// Non-zero.
     pub disk_per_instance: NonZeroBytes,
-    /// Concurrent actions one worker is sized for.
-    pub target_actions_per_instance: NonZeroU32,
     /// How long a worker may sit idle before it is drained.
     pub idle_timeout: Duration,
     /// How long a draining worker may keep running actions before it is terminated.

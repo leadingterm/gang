@@ -37,8 +37,6 @@ pub struct RawFleet<K> {
     pub memory_per_instance: NonZeroBytes,
     /// Disk space per instance.
     pub disk_per_instance: NonZeroBytes,
-    /// Target concurrent actions per instance.
-    pub target_actions_per_instance: NonZeroU32,
     /// Idle time before an instance can be removed.
     #[serde(with = "gang_types::duration")]
     pub idle_timeout: Duration,
@@ -73,7 +71,6 @@ impl<K> RawFleet<K> {
             vcpus_per_instance,
             memory_per_instance,
             disk_per_instance,
-            target_actions_per_instance,
             idle_timeout,
             max_drain_wait,
             boot_grace,
@@ -103,7 +100,6 @@ impl<K> RawFleet<K> {
             vcpus_per_instance,
             memory_per_instance,
             disk_per_instance,
-            target_actions_per_instance,
             idle_timeout,
             max_drain_wait,
             boot_grace,
@@ -350,7 +346,6 @@ max_instances = 4
 vcpus_per_instance = 8
 memory_per_instance = "29GiB"
 disk_per_instance = "100GiB"
-target_actions_per_instance = 2
 idle_timeout = "5m"
 max_drain_wait = "1h"
 boot_grace = "10m"

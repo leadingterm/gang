@@ -307,7 +307,6 @@ fn random_fleet(rng: &mut Rng, fleet: &str) -> Result<Fleet, Box<dyn Error>> {
         policy: Policy {
             min: 0,
             max: 8,
-            target_actions: 4,
             idle_timeout: Duration::from_mins(1),
             max_drain_wait: Duration::from_mins(5),
             boot_grace: Duration::from_mins(2),

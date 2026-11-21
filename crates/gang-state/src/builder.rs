@@ -600,7 +600,6 @@ fn fill_fleet(row: &mut Fleet, pass: &FleetPass, properties: &FleetProperties) {
     row.policy = Policy {
         min: pass.outlook.minimum,
         max: policy.instances.max().get(),
-        target_actions: policy.target_actions_per_instance.get(),
         idle_timeout: policy.idle_timeout,
         max_drain_wait: policy.max_drain_wait,
         boot_grace: policy.boot_grace,
