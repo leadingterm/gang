@@ -51,7 +51,7 @@ use crate::server::ServerKnobs;
 use crate::server_scenarios::{
     api, certificate_rotation, event_paging, request_limits, viewer_cap,
 };
-use crate::settings::{DeploymentInputs, UpgradeProcedure};
+use crate::settings::DeploymentInputs;
 use crate::setup::setup;
 use crate::skipped_pass::skipped_pass;
 use crate::stack::Stack;
@@ -587,11 +587,8 @@ fn upgrade_checks(scenario: Scenario, ctx: &RunContext<'_>) -> Vec<Check> {
     if cfg!(target_os = "linux") {
         attempt(scenario, || {
             let variant = required_cluster_variant(scenario, &ctx.baseline)?;
-            let automatic_inputs = (scenario == Scenario::RollingUpgradeAutomatic).then(|| {
-                let mut inputs = ctx.inputs.clone();
-                inputs.settings.upgrade_procedure = UpgradeProcedure::InstanceRefresh;
-                inputs
-            });
+            let automatic_inputs =
+                (scenario == Scenario::RollingUpgradeAutomatic).then(|| ctx.inputs.clone());
             let inputs = automatic_inputs.as_ref().unwrap_or(ctx.inputs);
             crate::rolling_upgrade::rolling_upgrade(inputs, &variant, ctx.issuer)
         })

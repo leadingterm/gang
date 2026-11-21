@@ -166,9 +166,8 @@ impl<'a, L: LeaderLeasePort, C: Clock + 'static> Leadership<'a, L, C> {
             let attempt = self
                 .clock
                 .timeout(self.call_timeout(), async {
-                    let state = host.state().await.map_err(|error| {
+                    let state = host.state().await.inspect_err(|_| {
                         host_failed = true;
-                        error
                     })?;
                     checking_host = false;
                     if state == ControllerHostState::Retiring {

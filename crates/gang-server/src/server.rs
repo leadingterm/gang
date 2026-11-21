@@ -425,10 +425,10 @@ async fn freeze_and_release<D: Deployment>(
             {
                 Ok(Ok(())) => return,
                 Ok(Err(error)) => {
-                    tracing::warn!(%error, "handoff protection unavailable; retaining authority and retrying")
+                    tracing::warn!(%error, "handoff protection unavailable; retaining authority and retrying");
                 }
                 Err(error) => {
-                    tracing::warn!(%error, "handoff preparation timed out; retaining authority and retrying")
+                    tracing::warn!(%error, "handoff preparation timed out; retaining authority and retrying");
                 }
             }
             context
@@ -841,7 +841,7 @@ async fn drain_original<D: Deployment>(
                 std::mem::swap(&mut drain, &mut incoming);
             }
             Ok(Err(error)) => {
-                tracing::warn!(%error, "cannot observe original drain; retaining confirmed worker protection")
+                tracing::warn!(%error, "cannot observe original drain; retaining confirmed worker protection");
             }
             Err(error) => tracing::warn!(%error, "original drain observation timed out"),
         }
@@ -871,10 +871,10 @@ async fn drain_original<D: Deployment>(
                 {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
-                        tracing::warn!(%error, "cannot remove completed old-worker protection")
+                        tracing::warn!(%error, "cannot remove completed old-worker protection");
                     }
                     Err(error) => {
-                        tracing::warn!(%error, "completed old-worker protection removal timed out")
+                        tracing::warn!(%error, "completed old-worker protection removal timed out");
                     }
                 }
             }

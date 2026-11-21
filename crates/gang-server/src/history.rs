@@ -17,6 +17,8 @@ const BATCH_BYTES: usize = MAX_RECORD_BODY_BYTES_PER_BATCH;
 const HEADER: usize = 56;
 const MAGIC: &[u8; 4] = b"GH01";
 
+type DesiredHistory<'a> = BTreeMap<RecordKey, Option<(&'a LearnedHistory, [u8; 32])>>;
+
 #[derive(Debug, Clone)]
 struct Head {
     generation: u64,
@@ -506,7 +508,7 @@ impl LearnedHistoryStore {
         &self,
         now: Timestamp,
         records: &'a [LearnedHistory],
-    ) -> Result<BTreeMap<RecordKey, Option<(&'a LearnedHistory, [u8; 32])>>, HistoryError> {
+    ) -> Result<DesiredHistory<'a>, HistoryError> {
         let mut desired = BTreeMap::new();
         for record in records {
             if !matches!(

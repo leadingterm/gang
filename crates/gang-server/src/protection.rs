@@ -252,7 +252,31 @@ impl Incoming {
         snapshot: &SchedulerSnapshot,
         fleets: &mut [FleetPass],
     ) -> Result<(), PortError> {
-        if !self.loaded {
+        if self.loaded {
+            for (id, record, workers) in &mut self.records {
+                if let Some(current) = repository
+                    .get(
+                        &RecordKey {
+                            kind: RecordKind::ControllerDrain,
+                            id: *id,
+                        },
+                        now,
+                    )
+                    .await?
+                {
+                    if record.body != current.body {
+                        Vec::<Worker>::deserialize_in_place(
+                            &mut serde_json::Deserializer::from_slice(&current.body),
+                            workers,
+                        )
+                        .map_err(PortError::backend)?;
+                    }
+                    *record = current;
+                } else {
+                    record.expires_at = now;
+                }
+            }
+        } else {
             self.records.clear();
             let mut after = None;
             loop {
@@ -280,30 +304,6 @@ impl Incoming {
                 }
             }
             self.loaded = true;
-        } else {
-            for (id, record, workers) in &mut self.records {
-                if let Some(current) = repository
-                    .get(
-                        &RecordKey {
-                            kind: RecordKind::ControllerDrain,
-                            id: *id,
-                        },
-                        now,
-                    )
-                    .await?
-                {
-                    if record.body != current.body {
-                        Vec::<Worker>::deserialize_in_place(
-                            &mut serde_json::Deserializer::from_slice(&current.body),
-                            workers,
-                        )
-                        .map_err(PortError::backend)?;
-                    }
-                    *record = current;
-                } else {
-                    record.expires_at = now;
-                }
-            }
         }
         self.records
             .retain(|(_, record, _)| record.expires_at > now);

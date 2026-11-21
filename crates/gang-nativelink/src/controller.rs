@@ -634,7 +634,7 @@ mod tests {
     use axum::routing::get;
     use base64::Engine;
     use base64::prelude::BASE64_STANDARD_NO_PAD;
-    use futures::StreamExt;
+    use futures::{FutureExt, StreamExt};
     use gang_spi::{
         Admitted, ApiResponseBody, Authenticated, GateDecision, Peer, PortError, RenderedStoreSpec,
         RequestScope, full_body,

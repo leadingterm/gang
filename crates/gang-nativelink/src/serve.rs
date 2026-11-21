@@ -1096,12 +1096,12 @@ mod tests {
         let (mut sender, connection) = open(connect(&feed)?).await?;
         sender.ready().await?;
         let request = Request::get("http://localhost/hang").body(Body::empty())?;
-        let request_task = tokio::spawn(async move { sender.send_request(request).await });
+        let mut request_task = tokio::spawn(async move { sender.send_request(request).await });
         entries.recv().await.ok_or("the handler never started")?;
         drop(feed);
         assert!(!task.is_finished(), "no timer may cut a live response");
         release.notify_one();
-        request_task.await??;
+        (&mut request_task).await??;
         finished(task).await?;
         let _outcome: Result<(), hyper::Error> = connection.await?;
         request_task.abort();
