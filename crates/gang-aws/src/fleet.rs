@@ -12,7 +12,6 @@ use std::time::Duration;
 use aws_config::SdkConfig;
 use aws_sdk_autoscaling::operation::describe_auto_scaling_groups::DescribeAutoScalingGroupsOutput;
 use aws_sdk_autoscaling::types::Filter as ScalingFilter;
-use aws_sdk_autoscaling::types::ScalingActivityStatusCode;
 use aws_sdk_ec2::types::Filter;
 use aws_sdk_ec2::types::builders::FilterBuilder;
 use gang_aws_sdk::call_error;
@@ -28,6 +27,7 @@ use crate::errors::AwsError;
 use crate::events::Events;
 use crate::fallback::{self, Counts, Tier};
 use crate::group::{DESCRIBE_GROUPS, Group, Member};
+use crate::launch_failure::blocks_growth;
 
 const SET_DESIRED_CAPACITY: &str = "SetDesiredCapacity";
 const UPDATE_AUTO_SCALING_GROUP: &str = "UpdateAutoScalingGroup";
@@ -38,13 +38,9 @@ const DESCRIBE_SCALING_ACTIVITIES: &str = "DescribeScalingActivities";
 
 /// EC2 tag that auto scaling sets to the name of the group an instance belongs to.
 const GROUP_TAG_FILTER: &str = "tag:aws:autoscaling:groupName";
-/// Activity filter that selects activities by status.
-const STATUS_FILTER: &str = "Status";
 /// Activity filter that selects activities that started at or after a time.
 const START_TIME_FILTER: &str = "StartTimeLowerBound";
-/// Status of a scaling activity whose launch failed.
-const FAILED_STATUS: &str = "Failed";
-/// One record answers whether any failed activity exists.
+/// Probe only the latest activity; an unrelated activity is not evidence of failure.
 const ACTIVITY_PROBE_LIMIT: i32 = 1;
 
 /// A complete batch, shared without copying its AWS group payload between supply calls.
@@ -122,15 +118,17 @@ impl Fleets {
             }
         };
         let mut launch_failure = None;
-        for (index, group) in groups.groups().enumerate() {
-            if (index == 0 && spot_down) || group.desired <= group.live() {
-                continue;
-            }
-            if let Some(failure) = self.latest_launch_failure(&group.name).await? {
-                launch_failure.get_or_insert(failure);
-            } else {
-                launch_failure = None;
-                break;
+        if !groups.groups().any(Group::launching) {
+            for (index, group) in groups.groups().enumerate() {
+                if (index == 0 && spot_down) || group.desired <= group.live() {
+                    continue;
+                }
+                if let Some(failure) = self.latest_launch_failure(group).await? {
+                    launch_failure.get_or_insert(failure);
+                } else {
+                    launch_failure = None;
+                    break;
+                }
             }
         }
         let member_count: usize = groups.groups().map(|group| group.members.len()).sum();
@@ -355,34 +353,31 @@ impl Fleets {
             .map_err(|e| call_error(SET_INSTANCE_PROTECTION, e).into())
     }
 
-    /// The failed scaling activity that marks the spot group down, if any: a failed activity
-    /// inside its retry window.
+    /// The newest activity marks Spot down only when it proves growth is blocked inside
+    /// the retry window and no instance is already launching.
     async fn spot_down(
         &self,
         spot: &Group,
         policy: SpotFallback,
     ) -> Result<Option<FailedActivity>, AwsError> {
+        if spot.launching() {
+            return Ok(None);
+        }
         let since = self.clock.wall() - policy.retry_spot_after.get();
-        self.scaling_down(&spot.name, since).await
+        self.scaling_down(spot, since).await
     }
 
-    /// The newest failed scaling activity of the named group that started at or after `since`.
+    /// Checks the newest activity of the group that started at or after `since`.
     async fn scaling_down(
         &self,
-        group: &str,
+        group: &Group,
         since: Timestamp,
     ) -> Result<Option<FailedActivity>, AwsError> {
         let start = since.to_rfc3339();
         let output = self
             .autoscaling
             .describe_scaling_activities()
-            .auto_scaling_group_name(group)
-            .filters(
-                ScalingFilter::builder()
-                    .name(STATUS_FILTER)
-                    .values(FAILED_STATUS)
-                    .build(),
-            )
+            .auto_scaling_group_name(&group.name)
             .filters(
                 ScalingFilter::builder()
                     .name(START_TIME_FILTER)
@@ -393,36 +388,37 @@ impl Fleets {
             .send()
             .await
             .map_err(|e| call_error(DESCRIBE_SCALING_ACTIVITIES, e))?;
-        Ok(output.activities().first().map(|activity| FailedActivity {
-            status_message: activity.status_message().map(str::to_owned),
+        Ok(output.activities().first().and_then(|activity| {
+            blocks_growth(activity, group.candidate_count).then(|| FailedActivity {
+                status_message: activity.status_message().map(str::to_owned),
+            })
         }))
     }
 
     /// Reads the newest activity without filtering its status.
-    async fn latest_launch_failure(&self, group: &str) -> Result<Option<LaunchFailure>, AwsError> {
+    async fn latest_launch_failure(
+        &self,
+        group: &Group,
+    ) -> Result<Option<LaunchFailure>, AwsError> {
+        if group.launching() {
+            return Ok(None);
+        }
         let output = self
             .autoscaling
             .describe_scaling_activities()
-            .auto_scaling_group_name(group)
+            .auto_scaling_group_name(&group.name)
             .max_records(ACTIVITY_PROBE_LIMIT)
             .send()
             .await
             .map_err(|e| call_error(DESCRIBE_SCALING_ACTIVITIES, e))?;
-        let Some(activity) = output.activities().first() else {
-            return Ok(None);
-        };
-        if activity
-            .status_code()
-            .map(ScalingActivityStatusCode::as_str)
-            != Some(FAILED_STATUS)
-        {
-            return Ok(None);
-        }
-        Ok(Some(LaunchFailure {
-            reason: activity
-                .status_message()
-                .unwrap_or(FAILED_STATUS)
-                .to_owned(),
+        Ok(output.activities().first().and_then(|activity| {
+            if blocks_growth(activity, group.candidate_count) {
+                activity.status_message().map(|reason| LaunchFailure {
+                    reason: reason.to_owned(),
+                })
+            } else {
+                None
+            }
         }))
     }
 
@@ -651,8 +647,8 @@ struct FailedActivity {
 mod tests {
     use super::*;
     use crate::config::{Capacity, CooldownPolicy, RetrySpotAfter};
-    use crate::fake_aws::{FakeFailure, FakeGroup};
-    use crate::fleet_harness::{FLEET, Harness, NOW_MILLIS, fleet, fleet_with};
+    use crate::fake_aws::{FakeActivity, FakeFailure, FakeGroup, FakeTemplateKind};
+    use crate::fleet_harness::{FLEET, Harness, NOW_MILLIS, fleet, fleet_with, rfc3339_ago};
     use std::error::Error;
     use std::future::{Future, poll_fn};
     use std::task::Poll;
@@ -912,55 +908,74 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn supply_uses_failed_status_when_activity_has_no_message() -> TestResult {
-        let harness = Harness::start().await?;
-        harness.add_group(FLEET, 1, &[]);
-        harness
-            .fake
-            .state()
-            .activities
-            .push(crate::fake_aws::FakeActivity {
-                group: FLEET.to_owned(),
-                status_code: "Failed".to_owned(),
-                start_time: "2026-01-01T00:00:00Z".to_owned(),
-                message: None,
-            });
-        let mut supply = FleetSupply::default();
-        harness
-            .fleets
-            .supply(fleet(FLEET)?.view(), &mut supply)
-            .await?;
-        assert_eq!(
-            supply
-                .launch_failure
-                .as_ref()
-                .map(|failure| failure.reason.as_str()),
-            Some("Failed")
+    const LAUNCH: &str = "Launching a new EC2 instance";
+    const QUOTA: &str = "MaxSpotInstanceCountExceeded: spot quota exhausted";
+    const UNSUPPORTED: &str = "The instance type 'r8id.4xlarge' is not supported in your requested Availability Zone 'us-east-1b'. Launching EC2 instance failed. Status Reason: InvalidFleetConfiguration";
+
+    fn candidates(name: &str, desired: i32, members: &[(&str, &str)], multiple: bool) -> FakeGroup {
+        let mut group = FakeGroup::new(name, desired, members);
+        group.template_kind = FakeTemplateKind::Mixed;
+        group.instance_types = if multiple {
+            vec!["r8id.4xlarge".to_owned(), "r7i.4xlarge".to_owned()]
+        } else {
+            vec!["r8id.4xlarge".to_owned()]
+        };
+        if multiple {
+            group.availability_zones = vec!["us-east-1a".to_owned(), "us-east-1b".to_owned()];
+        }
+        group
+    }
+
+    fn activity(
+        harness: &Harness,
+        status: &str,
+        age: u64,
+        description: &str,
+        message: Option<&str>,
+    ) {
+        let mut state = harness.fake.state();
+        let index = state.activities.len();
+        state.activities.push(FakeActivity {
+            group: FLEET.to_owned(),
+            status_code: status.to_owned(),
+            start_time: rfc3339_ago(age),
+            message: message.map(str::to_owned),
+        });
+        state.activity_details.insert(
+            index,
+            (
+                format!("activity-{index}"),
+                "capacity change".to_owned(),
+                description.to_owned(),
+            ),
         );
-        Ok(())
     }
 
     #[tokio::test]
-    async fn supply_reports_only_the_newest_failed_activity_for_unmet_requests() -> TestResult {
-        for (newest, expected) in [
-            ("Failed", Some("launch refused")),
-            ("InProgress", None),
-            ("Successful", None),
+    async fn launch_failure_requires_proven_blocking_failure() -> TestResult {
+        for (multiple, pending, description, message, expected) in [
+            (false, false, LAUNCH, Some(UNSUPPORTED), Some(UNSUPPORTED)),
+            (true, false, LAUNCH, Some(UNSUPPORTED), None),
+            (true, false, LAUNCH, Some(QUOTA), Some(QUOTA)),
+            (true, true, LAUNCH, Some(QUOTA), None),
+            (
+                false,
+                false,
+                "Terminating EC2 instance: i-old",
+                Some(QUOTA),
+                None,
+            ),
+            (false, false, LAUNCH, None, None),
+            (false, false, LAUNCH, Some(""), None),
         ] {
             let harness = Harness::start().await?;
-            harness.add_group(FLEET, 2, &[("i-live", "InService")]);
-            harness.add_activity(FLEET, "Failed", "2026-01-01T00:00:00Z");
-            harness
-                .fake
-                .state()
-                .activities
-                .push(crate::fake_aws::FakeActivity {
-                    group: FLEET.to_owned(),
-                    status_code: newest.to_owned(),
-                    start_time: "2026-01-02T00:00:00Z".to_owned(),
-                    message: Some("launch refused".to_owned()),
-                });
+            let members = if pending {
+                vec![("i-pending", "Pending")]
+            } else {
+                vec![]
+            };
+            harness.add_group_with(candidates(FLEET, 2, &members, multiple));
+            activity(&harness, "Failed", 30, description, message);
             let mut supply = FleetSupply::default();
             harness
                 .fleets
@@ -973,13 +988,182 @@ mod tests {
                     .map(|failure| failure.reason.as_str()),
                 expected
             );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_in_one_group_prevents_other_group_failure() -> TestResult {
+        let harness = Harness::start().await?;
+        let mut spot = candidates(FLEET, 1, &[("i-pending", "Pending")], true);
+        spot.new_instances_protected = true;
+        harness.add_group_with(spot);
+        let mut twin = candidates("gang-fleet-on-demand", 1, &[], true);
+        twin.new_instances_protected = true;
+        harness.add_group_with(twin);
+        activity(&harness, "Failed", 30, LAUNCH, Some(QUOTA));
+        harness.fake.state().activities[0].group = "gang-fleet-on-demand".to_owned();
+        let fleet = fleet_with(
+            FLEET,
+            AwsFleetOptions {
+                capacity: Capacity::Spot,
+                machine_class: None,
+                fallback: Some(SpotFallback {
+                    retry_spot_after: RetrySpotAfter::try_new(Duration::from_secs(300))?,
+                    drain_on_demand_first: true,
+                }),
+            },
+        )?;
+        let mut supply = FleetSupply::default();
+        harness.fleets.supply(fleet.view(), &mut supply).await?;
+        assert_eq!(supply.launch_failure, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_launch_or_failed_termination_does_not_trigger_fallback() -> TestResult {
+        for (pending, description) in [(true, LAUNCH), (false, "Terminating EC2 instance: i-old")] {
+            let harness = Harness::start().await?;
+            let members = if pending {
+                vec![("i-pending", "Pending")]
+            } else {
+                vec![]
+            };
+            let mut spot = candidates(FLEET, 2, &members, true);
+            spot.new_instances_protected = true;
+            harness.add_group_with(spot);
+            let mut twin = FakeGroup::new("gang-fleet-on-demand", 0, &[]);
+            twin.new_instances_protected = true;
+            harness.add_group_with(twin);
+            activity(&harness, "Failed", 30, description, Some(QUOTA));
+            let fleet = fleet_with(
+                FLEET,
+                AwsFleetOptions {
+                    capacity: Capacity::Spot,
+                    machine_class: None,
+                    fallback: Some(SpotFallback {
+                        retry_spot_after: RetrySpotAfter::try_new(Duration::from_secs(300))?,
+                        drain_on_demand_first: true,
+                    }),
+                },
+            )?;
+            let mut supply = FleetSupply::default();
+            harness.fleets.supply(fleet.view(), &mut supply).await?;
+            assert_eq!(supply.launch_failure, None);
+            assert_eq!(supply.abandoned, 0);
+            gang_testkit::fence::with_held(async |held| {
+                harness
+                    .fleets
+                    .set_desired_capacity(&held, fleet.view(), 2)
+                    .await
+            })
+            .await?;
+            assert_eq!(harness.desired("gang-fleet-on-demand"), Some(0));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_unavailable_candidate_keeps_fleet_growing_and_warns() -> TestResult {
+        let harness = Harness::start().await?;
+        let ids: Vec<String> = (0..17).map(|index| format!("i-{index:08x}")).collect();
+        let members: Vec<(&str, &str)> = ids.iter().map(|id| (id.as_str(), "InService")).collect();
+        let mut spot = candidates(FLEET, 18, &members, true);
+        spot.new_instances_protected = true;
+        harness.add_group_with(spot);
+        let mut twin = FakeGroup::new("gang-fleet-on-demand", 0, &[]);
+        twin.new_instances_protected = true;
+        harness.add_group_with(twin);
+        activity(&harness, "Failed", 30, LAUNCH, Some(UNSUPPORTED));
+        let fleet = fleet_with(
+            FLEET,
+            AwsFleetOptions {
+                capacity: Capacity::Spot,
+                machine_class: None,
+                fallback: Some(SpotFallback {
+                    retry_spot_after: RetrySpotAfter::try_new(Duration::from_secs(300))?,
+                    drain_on_demand_first: true,
+                }),
+            },
+        )?;
+        let mut supply = FleetSupply::default();
+        harness.fleets.supply(fleet.view(), &mut supply).await?;
+        assert_eq!(supply.desired, 18);
+        assert_eq!(supply.requested, Some(18));
+        assert_eq!(supply.abandoned, 0);
+        assert_eq!(supply.launch_failure, None);
+        assert!(supply.events.iter().any(|event| matches!(
+            &event.kind,
+            gang_spi::InfrastructureEventKind::CapacityUnavailable { reason } if reason == UNSUPPORTED
+        )));
+        gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .set_desired_capacity(&held, fleet.view(), 18)
+                .await
+        })
+        .await?;
+        assert_eq!(harness.desired(FLEET), Some(18));
+        assert_eq!(harness.desired("gang-fleet-on-demand"), Some(0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn newest_progress_clears_failure_and_spot_fallback() -> TestResult {
+        for newest in ["InProgress", "Successful"] {
+            let harness = Harness::start().await?;
+            let mut spot = candidates(FLEET, 2, &[("i-live", "InService")], true);
+            spot.new_instances_protected = true;
+            harness.add_group_with(spot);
+            let mut twin = FakeGroup::new("gang-fleet-on-demand", 0, &[]);
+            twin.new_instances_protected = true;
+            harness.add_group_with(twin);
+            activity(&harness, "Failed", 60, LAUNCH, Some(QUOTA));
+            activity(&harness, newest, 30, LAUNCH, None);
+            let fleet = fleet_with(
+                FLEET,
+                AwsFleetOptions {
+                    capacity: Capacity::Spot,
+                    machine_class: None,
+                    fallback: Some(SpotFallback {
+                        retry_spot_after: RetrySpotAfter::try_new(Duration::from_secs(300))?,
+                        drain_on_demand_first: true,
+                    }),
+                },
+            )?;
+            let mut supply = FleetSupply::default();
+            harness.fleets.supply(fleet.view(), &mut supply).await?;
+            assert_eq!(supply.launch_failure, None);
+            assert_eq!(supply.abandoned, 0);
+            gang_testkit::fence::with_held(async |held| {
+                harness
+                    .fleets
+                    .set_desired_capacity(&held, fleet.view(), 2)
+                    .await
+            })
+            .await?;
+            assert_eq!(harness.desired("gang-fleet-on-demand"), Some(0));
             let requests = harness.request_log();
             let (_, parameters) = requests
                 .iter()
-                .find(|(operation, _)| operation == "DescribeScalingActivities")
-                .ok_or("missing activity request")?;
-            assert_eq!(parameters.get("MaxRecords").map(String::as_str), Some("1"));
-            assert!(!parameters.keys().any(|key| key.starts_with("Filters.")));
+                .find(|(operation, parameters)| {
+                    operation == "DescribeScalingActivities"
+                        && parameters
+                            .get("MaxRecords")
+                            .is_some_and(|value| value == "1")
+                        && parameters.keys().any(|key| key.starts_with("Filters."))
+                })
+                .ok_or("missing fallback activity probe")?;
+            assert!(
+                !parameters
+                    .values()
+                    .any(|value| value == "Status" || value == "Failed")
+            );
+            assert!(
+                parameters
+                    .values()
+                    .any(|value| value == "StartTimeLowerBound")
+            );
         }
         Ok(())
     }

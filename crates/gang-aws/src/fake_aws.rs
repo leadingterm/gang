@@ -364,6 +364,9 @@ pub(crate) struct FakeGroup {
     /// Whether a scaling activity is in progress; `SetDesiredCapacity` with `HonorCooldown` is refused meanwhile.
     pub(crate) in_cooldown: bool,
     pub(crate) instances: Vec<FakeInstance>,
+    pub(crate) availability_zones: Vec<String>,
+    /// Explicit instance types in the mixed instances policy overrides.
+    pub(crate) instance_types: Vec<String>,
     /// Members launched with an older launch-template version.
     pub(crate) stale_instances: Vec<String>,
     /// The ASG field that declares the current launch template.
@@ -396,6 +399,8 @@ impl FakeGroup {
                     protected: false,
                 })
                 .collect(),
+            availability_zones: vec![ZONE.to_owned()],
+            instance_types: Vec::new(),
             stale_instances: Vec::new(),
             template_kind: FakeTemplateKind::Direct,
             new_instances_protected: false,
@@ -873,6 +878,11 @@ fn group_xml(group: &FakeGroup) -> String {
         })
         .collect::<Vec<_>>()
         .concat();
+    let availability_zones: String = group
+        .availability_zones
+        .iter()
+        .map(|zone| format!("<member>{zone}</member>"))
+        .collect();
     let warm_pool = match group.reuse_on_scale_in {
         Some(reuse) => format!(
             "<WarmPoolConfiguration><PoolState>Stopped</PoolState><InstanceReusePolicy><ReuseOnScaleIn>{reuse}</ReuseOnScaleIn></InstanceReusePolicy></WarmPoolConfiguration><WarmPoolSize>{size}</WarmPoolSize>",
@@ -882,14 +892,21 @@ fn group_xml(group: &FakeGroup) -> String {
     };
     let template = match group.template_kind {
         FakeTemplateKind::Mixed => {
-            "<MixedInstancesPolicy><LaunchTemplate><LaunchTemplateSpecification><LaunchTemplateId>lt-test</LaunchTemplateId><Version>2</Version></LaunchTemplateSpecification></LaunchTemplate></MixedInstancesPolicy>"
+            let overrides: String = group
+                .instance_types
+                .iter()
+                .map(|instance_type| format!("<member><InstanceType>{instance_type}</InstanceType></member>"))
+                .collect();
+            format!(
+                "<MixedInstancesPolicy><LaunchTemplate><LaunchTemplateSpecification><LaunchTemplateId>lt-test</LaunchTemplateId><Version>2</Version></LaunchTemplateSpecification><Overrides>{overrides}</Overrides></LaunchTemplate></MixedInstancesPolicy>"
+            )
         }
         FakeTemplateKind::Direct => {
-            "<LaunchTemplate><LaunchTemplateId>lt-test</LaunchTemplateId><Version>2</Version></LaunchTemplate>"
+            "<LaunchTemplate><LaunchTemplateId>lt-test</LaunchTemplateId><Version>2</Version></LaunchTemplate>".to_owned()
         }
     };
     format!(
-        "<member><AutoScalingGroupName>{name}</AutoScalingGroupName><AvailabilityZones><member>{ZONE}</member></AvailabilityZones><CreatedTime>{CREATED_TIME}</CreatedTime><DefaultCooldown>{DEFAULT_COOLDOWN}</DefaultCooldown><DesiredCapacity>{desired}</DesiredCapacity><MinSize>{min_size}</MinSize><MaxSize>{max_size}</MaxSize><HealthCheckType>EC2</HealthCheckType><Instances>{instances}</Instances><NewInstancesProtectedFromScaleIn>{protected}</NewInstancesProtectedFromScaleIn>{warm_pool}{template}</member>",
+        "<member><AutoScalingGroupName>{name}</AutoScalingGroupName><AvailabilityZones>{availability_zones}</AvailabilityZones><CreatedTime>{CREATED_TIME}</CreatedTime><DefaultCooldown>{DEFAULT_COOLDOWN}</DefaultCooldown><DesiredCapacity>{desired}</DesiredCapacity><MinSize>{min_size}</MinSize><MaxSize>{max_size}</MaxSize><HealthCheckType>EC2</HealthCheckType><Instances>{instances}</Instances><NewInstancesProtectedFromScaleIn>{protected}</NewInstancesProtectedFromScaleIn>{warm_pool}{template}</member>",
         name = group.name,
         desired = group.desired,
         min_size = group.min_size,

@@ -294,16 +294,17 @@ module "worker_fleet" {
 
   fleets = [
     for fleet in var.fleets : {
-      name                     = fleet.name
-      capacity                 = fleet.capacity
-      ami_id                   = local.node_ami_ids[fleet.name]
-      instance_types           = fleet.instance_types
-      spot_allocation_strategy = fleet.spot_allocation_strategy
-      max_instances            = fleet.max_instances
-      root_volume_gib          = fleet.root_volume_gib
-      scratch_volume_gib       = fleet.scratch_volume_gib
-      warm_pool_size           = fleet.warm_pool_size
-      fallback                 = fleet.fallback == null ? null : {}
+      name                       = fleet.name
+      capacity                   = fleet.capacity
+      ami_id                     = local.node_ami_ids[fleet.name]
+      instance_types             = fleet.instance_types
+      minimum_availability_zones = fleet.minimum_availability_zones
+      spot_allocation_strategy   = fleet.spot_allocation_strategy
+      max_instances              = fleet.max_instances
+      root_volume_gib            = fleet.root_volume_gib
+      scratch_volume_gib         = fleet.scratch_volume_gib
+      warm_pool_size             = fleet.warm_pool_size
+      fallback                   = fleet.fallback == null ? null : {}
     }
   ]
 }

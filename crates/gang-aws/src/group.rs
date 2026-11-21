@@ -3,7 +3,7 @@
 
 use aws_sdk_autoscaling::operation::describe_auto_scaling_groups::DescribeAutoScalingGroupsOutput;
 use aws_sdk_autoscaling::types::{
-    Instance as AutoScalingInstance, InstanceReusePolicy, LifecycleState,
+    AutoScalingGroup, Instance as AutoScalingInstance, InstanceReusePolicy, LifecycleState,
 };
 use gang_types::{FleetName, InstanceId, InstanceLifecycle};
 
@@ -43,6 +43,9 @@ pub(crate) struct Group {
     pub protects_new_instances: bool,
     /// The instances parked in the group's warm pool; `0` without one.
     pub warm: u32,
+    /// Distinct explicit instance-type and availability-zone pairs, if fully known.
+    /// Unknown candidates cannot establish that failures exhaust the fleet's launch options.
+    pub(crate) candidate_count: Option<usize>,
 }
 
 impl Group {
@@ -105,6 +108,7 @@ impl Group {
             members,
             reuse_on_scale_in,
             protects_new_instances,
+            candidate_count: candidate_count(group),
             warm: group.warm_pool_size().map_or(0, capacity_of),
         })
     }
@@ -114,6 +118,14 @@ impl Group {
     pub(crate) fn live(&self) -> u32 {
         let count = self.members.iter().filter(|member| is_live(member)).count();
         u32::try_from(count).unwrap_or(u32::MAX)
+    }
+
+    /// Whether any group member is still launching.
+    #[must_use]
+    pub(crate) fn launching(&self) -> bool {
+        self.members
+            .iter()
+            .any(|member| member.lifecycle == InstanceLifecycle::Pending)
     }
 
     /// The capacity the group reports: its desired capacity, or its live instances if those
@@ -179,6 +191,40 @@ impl From<&Group> for Counts {
             live: group.live(),
         }
     }
+}
+
+/// Counts distinct launch candidates only when the group describes the entire candidate set.
+fn candidate_count(group: &AutoScalingGroup) -> Option<usize> {
+    let zones = group.availability_zones();
+    if zones.is_empty() || zones.iter().any(String::is_empty) {
+        return None;
+    }
+    let overrides = group
+        .mixed_instances_policy()?
+        .launch_template()?
+        .overrides();
+    if overrides.is_empty()
+        || overrides.iter().any(|item| {
+            item.instance_requirements().is_some() || item.instance_type().is_none_or(str::is_empty)
+        })
+    {
+        return None;
+    }
+    let zone_count = zones
+        .iter()
+        .enumerate()
+        .filter(|(index, zone)| !zones[..*index].contains(zone))
+        .count();
+    let type_count = overrides
+        .iter()
+        .enumerate()
+        .filter(|(index, item)| {
+            !overrides[..*index]
+                .iter()
+                .any(|previous| previous.instance_type() == item.instance_type())
+        })
+        .count();
+    zone_count.checked_mul(type_count)
 }
 
 /// Converts one listed instance of a group to a member.
@@ -267,7 +313,9 @@ pub(crate) fn lifecycle_of(state: &LifecycleState) -> InstanceLifecycle {
 mod tests {
     use aws_sdk_autoscaling::operation::describe_auto_scaling_groups::DescribeAutoScalingGroupsOutput;
     use aws_sdk_autoscaling::types::{
-        AutoScalingGroup, Instance, InstanceReusePolicy, LifecycleState, WarmPoolConfiguration,
+        AutoScalingGroup, Instance, InstanceRequirements, InstanceReusePolicy, LaunchTemplate,
+        LaunchTemplateOverrides, LaunchTemplateSpecification, LifecycleState, MixedInstancesPolicy,
+        WarmPoolConfiguration,
     };
     use gang_types::InstanceId;
 
@@ -309,6 +357,126 @@ mod tests {
             .auto_scaling_groups(group)
             .build();
         Group::read(&output, GROUP)
+    }
+
+    fn candidates(zones: &[&str], overrides: Vec<LaunchTemplateOverrides>) -> AutoScalingGroup {
+        AutoScalingGroup::builder()
+            .auto_scaling_group_name(GROUP)
+            .desired_capacity(1)
+            .set_availability_zones(Some(zones.iter().map(|zone| (*zone).to_owned()).collect()))
+            .mixed_instances_policy(
+                MixedInstancesPolicy::builder()
+                    .launch_template(
+                        LaunchTemplate::builder()
+                            .set_overrides(Some(overrides))
+                            .build(),
+                    )
+                    .build(),
+            )
+            .build()
+    }
+
+    fn explicit(instance_type: &str) -> LaunchTemplateOverrides {
+        LaunchTemplateOverrides::builder()
+            .instance_type(instance_type)
+            .build()
+    }
+
+    #[test]
+    fn counts_distinct_explicit_candidates() -> TestResult {
+        assert_eq!(
+            read(candidates(&["us-east-1a"], vec![explicit("c7g.large")]))?.candidate_count,
+            Some(1)
+        );
+        assert_eq!(
+            read(candidates(
+                &["us-east-1a", "us-east-1b", "us-east-1a"],
+                vec![
+                    explicit("c7g.large"),
+                    explicit("m7g.large"),
+                    explicit("c7g.large")
+                ],
+            ))?
+            .candidate_count,
+            Some(4)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_candidate_metadata_cannot_prove_exhaustion() -> TestResult {
+        let no_policy = AutoScalingGroup::builder()
+            .auto_scaling_group_name(GROUP)
+            .desired_capacity(1)
+            .availability_zones("us-east-1a")
+            .launch_template(LaunchTemplateSpecification::builder().build())
+            .build();
+        let no_launch_template = AutoScalingGroup::builder()
+            .auto_scaling_group_name(GROUP)
+            .desired_capacity(1)
+            .availability_zones("us-east-1a")
+            .mixed_instances_policy(MixedInstancesPolicy::builder().build())
+            .build();
+        let cases = [
+            no_policy,
+            no_launch_template,
+            candidates(&[], vec![explicit("c7g.large")]),
+            candidates(&[""], vec![explicit("c7g.large")]),
+            candidates(&["us-east-1a"], vec![]),
+            candidates(
+                &["us-east-1a"],
+                vec![LaunchTemplateOverrides::builder().build()],
+            ),
+            candidates(&["us-east-1a"], vec![explicit("")]),
+            candidates(
+                &["us-east-1a"],
+                vec![
+                    explicit("c7g.large"),
+                    LaunchTemplateOverrides::builder()
+                        .instance_requirements(InstanceRequirements::builder().build())
+                        .build(),
+                ],
+            ),
+            candidates(
+                &["us-east-1a"],
+                vec![
+                    LaunchTemplateOverrides::builder()
+                        .instance_type("c7g.large")
+                        .instance_requirements(InstanceRequirements::builder().build())
+                        .build(),
+                ],
+            ),
+        ];
+        for group in cases {
+            assert_eq!(read(group)?.candidate_count, None);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn launching_detects_each_pending_state() -> TestResult {
+        for state in ["Pending", "Pending:Wait", "Pending:Proceed"] {
+            let group = read(reuse_group(
+                2,
+                vec![
+                    instance("i-a", "InService", true),
+                    instance("i-b", state, false),
+                ],
+                true,
+            ))?;
+            assert!(group.launching(), "state {state}");
+        }
+        let group = read(reuse_group(
+            2,
+            vec![
+                instance("i-a", "InService", true),
+                instance("i-b", "Terminating", false),
+            ],
+            true,
+        ))?;
+        assert!(!group.launching());
+        assert!(!read(reuse_group(1, vec![], true))?.launching());
+        Ok(())
     }
 
     #[test]

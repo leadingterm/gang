@@ -221,6 +221,88 @@ variables {
   ]
 }
 
+run "single_zone_requires_explicit_minimum" {
+  command = plan
+
+  override_data {
+    target = module.worker_fleet.data.aws_ec2_instance_type_offerings.this["gang-worker-x86-64"]
+    values = {
+      instance_types = ["c6id.4xlarge"]
+      locations      = ["az-a"]
+    }
+  }
+
+  expect_failures = [module.worker_fleet.aws_autoscaling_group.this["gang-worker-x86-64"]]
+}
+
+run "single_zone_custom_minimum_is_forwarded" {
+  command = plan
+
+  override_data {
+    target = module.worker_fleet.data.aws_ec2_instance_type_offerings.this["gang-worker-x86-64"]
+    values = {
+      instance_types = ["c6id.4xlarge"]
+      locations      = ["az-a"]
+    }
+  }
+
+  variables {
+    fleets = [{
+      name                       = "gang-worker-x86-64"
+      isa                        = "x86-64"
+      capacity                   = "spot"
+      instance_types             = ["c6id.4xlarge"]
+      minimum_availability_zones = 1
+      max_instances              = 4
+      vcpus_per_instance         = 15
+      disk_per_instance          = "200GiB"
+    }]
+  }
+
+  assert {
+    condition     = output.asg_names == ["gang-worker-x86-64"]
+    error_message = "A fleet explicitly allowing one zone must plan with its ASG intact."
+  }
+}
+
+run "rejects_nonpositive_minimum_availability_zones" {
+  command = plan
+
+  variables {
+    fleets = [{
+      name                       = "gang-worker-x86-64"
+      isa                        = "x86-64"
+      capacity                   = "spot"
+      instance_types             = ["c6id.4xlarge"]
+      minimum_availability_zones = 0
+      max_instances              = 4
+      vcpus_per_instance         = 15
+      disk_per_instance          = "200GiB"
+    }]
+  }
+
+  expect_failures = [var.fleets]
+}
+
+run "rejects_fractional_minimum_availability_zones" {
+  command = plan
+
+  variables {
+    fleets = [{
+      name                       = "gang-worker-x86-64"
+      isa                        = "x86-64"
+      capacity                   = "spot"
+      instance_types             = ["c6id.4xlarge"]
+      minimum_availability_zones = 1.5
+      max_instances              = 4
+      vcpus_per_instance         = 15
+      disk_per_instance          = "200GiB"
+    }]
+  }
+
+  expect_failures = [var.fleets]
+}
+
 run "mixed_instance_fleets_use_smallest_nominal_memory" {
   command = plan
 

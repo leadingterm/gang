@@ -103,12 +103,26 @@ impl Harness {
 
     /// Records a scaling activity of a group, so scale-out failure history can be queried.
     pub(crate) fn add_activity(&self, group: &str, status: &str, start_time: &str) {
-        self.fake.state().activities.push(FakeActivity {
+        let mut state = self.fake.state();
+        let index = state.activities.len();
+        state.activities.push(FakeActivity {
             group: group.to_owned(),
             status_code: status.to_owned(),
             start_time: start_time.to_owned(),
-            message: Some(String::new()),
+            message: Some(if status == "Failed" {
+                "MaxSpotInstanceCountExceeded: no Spot capacity available".to_owned()
+            } else {
+                String::new()
+            }),
         });
+        state.activity_details.insert(
+            index,
+            (
+                format!("00000000-0000-0000-0002-{index:012}"),
+                String::new(),
+                "Launching a new EC2 instance".to_owned(),
+            ),
+        );
     }
 
     /// Answers every call to `operation` with `failure` until it is cleared.

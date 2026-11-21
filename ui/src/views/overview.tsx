@@ -236,6 +236,9 @@ const FleetRow = ({ f, ordinal, events, census, known, recent }: { f: Fleet; ord
   const series = fields.map((field) => ({ ...field, values: samples.map((sample) => sample ? field.value(sample) : null) }));
   const latest = samples.at(-1);
   const historyLabel = `Instance history for ${f.name}; latest sample: ${latest ? fields.map((field) => `${field.label} ${field.value(latest)}`).join(", ") : "not recorded"}`;
+  const warning = f.launchFailure ? undefined : events.findLast(
+    (e) => e.fleet === f.name && "aws" in e && e.aws.event.kind.type === "capacityUnavailable",
+  );
   return (
     <li class={idle ? "fleet is-idle" : "fleet"}>
       <div class="fleet__id">
@@ -247,6 +250,7 @@ const FleetRow = ({ f, ordinal, events, census, known, recent }: { f: Fleet; ord
         <span class="fleet__tags">
           {capacity && <span class={capacity === "spot" ? "tag tag--spot" : "tag"}>{capacity}</span>}
           {f.launchFailure && <span class="tag tag--caution">can't launch</span>}
+          {warning && <span class="tag tag--caution">launch warning</span>}
           {cold && (
             <span class="tag tag--note">
               starting <Since t={ms(cold.createTime)} />
@@ -254,6 +258,9 @@ const FleetRow = ({ f, ordinal, events, census, known, recent }: { f: Fleet; ord
           )}
         </span>
         {f.launchFailure && <p class="fleet__failure caution">{f.instances.inService} of {f.desired} · {f.launchFailure.reason}</p>}
+        {warning && "aws" in warning && warning.aws.event.kind.type === "capacityUnavailable" && (
+          <p class="fleet__failure caution">Observed <time dateTime={warning.createTime}>{warning.createTime}</time> · {warning.aws.event.kind.reason}</p>
+        )}
       </div>
       <div class="fleet__gauge">
         {known ? <Tape f={f} census={census} /> : <span>Scheduler unknown</span>}
@@ -336,7 +343,8 @@ export const Overview = () => {
   const client = useClient();
   const state = client.state.value;
   if (!state) return null;
-  const recent = scalingLog(state.events, state.statusEvents ?? []).slice(-RECENT_EVENTS).reverse();
+  const events = scalingLog(state.events, state.statusEvents ?? []);
+  const recent = events.slice(-RECENT_EVENTS).reverse();
   const known = schedulerCurrent(state);
   const idle = known && state.workers.length === 0 && state.queue.total === 0;
   return (
@@ -350,7 +358,7 @@ export const Overview = () => {
       <Section id="fleets-h" title="Fleets" legend={<Legend />}>
         <ol class="fleets">
           {state.fleets.map((f, i) => (
-            <FleetRow key={f.name} f={f} ordinal={i + 1} events={state.events} census={state} known={known} recent={state.recent} />
+            <FleetRow key={f.name} f={f} ordinal={i + 1} events={events} census={state} known={known} recent={state.recent} />
           ))}
         </ol>
       </Section>

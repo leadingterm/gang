@@ -42,6 +42,7 @@ mod fallback;
 mod fleet;
 mod group;
 mod host;
+mod launch_failure;
 mod lifecycle;
 mod names;
 mod plugin;
