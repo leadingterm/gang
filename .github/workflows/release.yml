@@ -1,13 +1,13 @@
 # Publishes every pushed v* tag as a GitHub release: CI's binaries, each architecture's disk image,
 # and its deployment-ready public AMIs (gang-amis.json). Catalog copies converge independently.
-# Dispatch on a branch or main is a dry run without AWS; dispatch on a v* tag backfills retained AMIs.
+# Dispatch on main or an eligible merged release is a dry run without AWS; dispatch on a v* tag backfills retained AMIs.
 
 name: Release
 
 on:
   push:
     tags: ["v*"]
-  # A pushed tag releases only a commit whose dry run passed.
+  # Dispatches do not publish a release.
   workflow_dispatch:
 
 permissions:
@@ -35,33 +35,7 @@ jobs:
       contents: read
     outputs:
       run-id: ${{ steps.ci.outputs.run-id }}
-      dry-run-id: ${{ steps.dry-run.outputs.run-id }}
     steps:
-      - name: Require a passed dry run of the tagged commit
-        id: dry-run
-        if: github.event_name == 'push'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          SHA: ${{ github.sha }}
-        run: |
-          runs="$(gh api --paginate "repos/$GH_REPO/actions/workflows/release.yml/runs?head_sha=$SHA&event=workflow_dispatch" \
-            | jq -rs '[.[].workflow_runs[] | select(.conclusion == "success") | .id] | .[]')"
-          dry_run=""
-          for candidate in $runs; do
-            imaged="$(gh api --paginate "repos/$GH_REPO/actions/runs/$candidate/jobs" \
-              | jq -s '[.[].jobs[] | select((.name | startswith("images (")) and .conclusion == "success")] | length')"
-            if [[ "$imaged" == 2 ]]; then
-              dry_run="$candidate"
-              break
-            fi
-          done
-          if [[ -z "$dry_run" ]]; then
-            echo "::error::no passed dry run of $SHA built both images: dispatch this workflow on the commit (gh workflow run release.yml --ref main) and tag once it has passed" >&2
-            exit 1
-          fi
-          echo "dry run $dry_run of $SHA passed"
-          echo "run-id=$dry_run" >> "$GITHUB_OUTPUT"
       - name: Find the CI run to release
         id: ci
         env:
@@ -69,12 +43,57 @@ jobs:
           GH_REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
         run: |
-          runs="$(gh api --paginate "repos/$GH_REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=100" \
-            | jq -rs --arg sha "$SHA" --arg repo "$GH_REPO" 'if length == 0 or any(.[]; (.workflow_runs | type) != "array") or any(.[].workflow_runs[]; type != "object" or (.id | type) != "number" or (.created_at | type) != "string" or (.head_sha | type) != "string" or (.event | type) != "string" or (.head_branch | type) != "string" or (.head_repository.full_name | type) != "string") then error("invalid runs") else [.[].workflow_runs[] | select(.head_sha == $sha and .head_repository.full_name == $repo and .event == "push" and .head_branch == "main")] | sort_by(.created_at) | reverse | .[].id end')"
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::invalid release SHA" >&2; exit 1; }
+          gh api "repos/$GH_REPO/compare/$SHA...main" \
+            | jq -se 'length == 1 and (.[0] | type == "object" and (.status == "identical" or .status == "ahead"))' >/dev/null
+          release_tree="$(gh api "repos/$GH_REPO/git/commits/$SHA" \
+            | jq -ser 'if length == 1 then .[0].tree.sha | select(type == "string" and test("^[0-9a-f]{40}$")) else error("invalid commit") end')"
+          pr_heads="$(gh api --paginate "repos/$GH_REPO/commits/$SHA/pulls?per_page=100" \
+            | jq -rs --arg sha "$SHA" --arg repo "$GH_REPO" '
+              if length == 0 or any(.[]; type != "array") or
+                any(.[][]; type != "object" or
+                  (has("merged_at") | not) or (has("merge_commit_sha") | not) or
+                  (.head | type) != "object" or (.head | has("repo") | not) or
+                  ((.merged_at | type) != "string" and .merged_at != null) or
+                  (.base.ref | type) != "string" or
+                  ((.head.repo.full_name | type) != "string" and .head.repo != null) or
+                  (.head.sha | type) != "string" or
+                  ((.merge_commit_sha | type) != "string" and .merge_commit_sha != null))
+              then error("invalid pull requests")
+              else [ .[][] | select(.merged_at != null and .base.ref == "main"
+                and .head.repo.full_name == $repo and .merge_commit_sha == $sha)
+                | .head.sha | if test("^[0-9a-f]{40}$") then "pr:" + . else error("invalid pull request head SHA") end ] | unique | .[] end')"
+          candidates=""
+          for source in $pr_heads "push:$SHA"; do
+            head="${source#*:}"
+            kind="${source%%:*}"
+            runs="$(gh api --paginate "repos/$GH_REPO/actions/workflows/ci.yml/runs?head_sha=$head&per_page=100" \
+              | jq -rs --arg head "$head" --arg kind "$kind" --arg repo "$GH_REPO" '
+                if length == 0 or any(.[]; (.workflow_runs | type) != "array") or
+                  any(.[].workflow_runs[]; type != "object" or (.id | type) != "number" or (.id <= 0) or (.id != (.id | floor)) or
+                    (.created_at | type) != "string" or (.head_sha | type) != "string" or
+                    (.event | type) != "string" or (.head_branch | type) != "string" or
+                    (.head_repository.full_name | type) != "string" or
+                    (.status | type) != "string" or (has("conclusion") | not) or
+                    ((.conclusion | type) != "string" and .conclusion != null))
+                then error("invalid runs")
+                else [.[].workflow_runs[] | select(.head_sha == $head and
+                  .head_repository.full_name == $repo and .status == "completed" and
+                  (if $kind == "push" then .event == "push" and .head_branch == "main"
+                   else .event == "pull_request" end))]
+                  | sort_by(.created_at) | reverse | .[].id end')"
+            if [[ -n "$runs" ]]; then
+              head_tree="$(gh api "repos/$GH_REPO/git/commits/$head" \
+                | jq -ser 'if length == 1 then .[0].tree.sha | select(type == "string" and test("^[0-9a-f]{40}$")) else error("invalid commit") end')"
+              if [[ "$head_tree" == "$release_tree" ]]; then
+                candidates+="$runs"$'\n'
+              fi
+            fi
+          done
           run_id=""
-          for candidate in $runs; do
+          for candidate in $candidates; do
             gates="$(gh api --paginate "repos/$GH_REPO/actions/runs/$candidate/jobs?filter=latest&per_page=100" \
-              | jq -s 'if length == 0 or any(.[]; (.jobs | type) != "array") or any(.[].jobs[]; type != "object" or (.name | type) != "string" or ((.conclusion | type) != "string" and .conclusion != null)) then error("invalid jobs") else [.[].jobs[] | select(.name == "required" or .name == "release-validation")] end')"
+              | jq -s 'if length == 0 or any(.[]; (.jobs | type) != "array") or any(.[].jobs[]; type != "object" or (.name | type) != "string" or (has("conclusion") | not) or ((.conclusion | type) != "string" and .conclusion != null)) then error("invalid jobs") else [.[].jobs[] | select(.name == "required" or .name == "release-validation")] end')"
             if ! jq -e 'length == 2 and ([.[] | select(.name == "required" and .conclusion == "success")] | length == 1) and ([.[] | select(.name == "release-validation" and .conclusion == "success")] | length == 1)' <<< "$gates" >/dev/null; then
               continue
             fi
@@ -86,7 +105,7 @@ jobs:
             fi
           done
           if [[ -z "$run_id" ]]; then
-            echo "::error::no main push CI run on exact commit $SHA has successful latest required and release-validation jobs and both required unexpired Linux artifacts" >&2
+            echo "::error::no trusted CI run on the release tree has successful latest required and release-validation jobs and both required unexpired Linux artifacts" >&2
             exit 1
           fi
           echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
@@ -142,23 +161,6 @@ jobs:
           jq -e '.action_environment | strings | test("^[0-9a-f]{64}\\z")' "dist/gang-image-${{ matrix.arch }}.json" >/dev/null
           (cd dist && sha256sum gang-*) >"images-${{ matrix.arch }}.sha256"
           (cd dist && wc -c gang-* && cat ../"images-${{ matrix.arch }}.sha256") >>"$GITHUB_STEP_SUMMARY"
-      # A release stores only images that its dry run, built on another runner, reproduced byte for byte.
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        if: env.PUBLISH == 'true'
-        with:
-          name: images-${{ matrix.arch }}
-          path: dry-run
-          run-id: ${{ needs.locate.outputs.dry-run-id }}
-          github-token: ${{ github.token }}
-      - name: Match the dry run's images
-        if: env.PUBLISH == 'true'
-        env:
-          DRY_RUN: ${{ needs.locate.outputs.dry-run-id }}
-        run: |
-          if ! diff "dry-run/images-${{ matrix.arch }}.sha256" "images-${{ matrix.arch }}.sha256"; then
-            echo "::error::the images differ from those of dry run $DRY_RUN: the image build is not reproducible" >&2
-            exit 1
-          fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: env.PUBLISH == 'true'
         with:

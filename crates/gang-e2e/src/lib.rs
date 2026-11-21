@@ -241,8 +241,9 @@ pub use state_api::{StateApi, StateStream};
 pub use suite::{Gate, Invocation, Scenario, UnknownGate, run, unknown_scenarios};
 pub use system::{
     ActionLimits, AttemptRecord, FleetLayout, HOLD_CPU_COUNT, HOLD_MEMORY_KB, LARGE_FLEET,
-    LIMIT_CPU_PERIOD_MICROS, LIMIT_MAX_PIDS, Limits, NOOP_FLEET, PermitNetwork,
-    PressureObservation, Probe, SMALL_FLEET, Sandbox, ScopeFacts, SoftMemory, System, Variant,
+    LIMIT_CPU_PERIOD_MICROS, LIMIT_MAX_PIDS, Limits, NOOP_FLEET, PLACEMENT_LARGE_MEMORY,
+    PLACEMENT_SMALL_MEMORY, PermitNetwork, PressureObservation, Probe, SMALL_FLEET, Sandbox,
+    ScopeFacts, SoftMemory, System, Variant,
 };
 pub use template::{ConfigTemplate, Transport};
 pub use timeout::{action_timeout, exit_signals};

@@ -32,6 +32,7 @@ mock_provider "aws" {
   mock_data "aws_ec2_instance_type" {
     defaults = {
       boot_modes                 = ["legacy-bios", "uefi"]
+      memory_size                = 65536
       supported_architectures    = ["x86_64"]
       instance_storage_supported = true
       hypervisor                 = "nitro"
@@ -140,6 +141,7 @@ variables {
     min_instances               = 1
     max_instances               = 1
     vcpus_per_instance          = 2
+    # Baseline releases require this input; the current deployment derives memory.
     memory_per_instance         = "4GiB"
     disk_per_instance           = "20GiB"
     # Required by the historical release used as the upgrade fixture.

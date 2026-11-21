@@ -91,10 +91,12 @@ impl KnownPlatformPropertyProvider for Fake {
 fn info() -> Arc<ActionInfo> {
     let digest = DigestInfo::new([1; 32], 1);
     Arc::new(ActionInfo {
+        memory_reservation: None,
         command_digest: digest,
         input_root_digest: digest,
         timeout: Duration::from_secs(1),
         platform_properties: std::collections::HashMap::default(),
+        pre_fit_reservation: None,
         priority: 0,
         load_timestamp: UNIX_EPOCH,
         insert_timestamp: UNIX_EPOCH,
@@ -307,6 +309,7 @@ async fn public_listener_serves_execution_and_waits_for_worker_stream() -> gang_
             actions: std::sync::Arc::new(gang_config::ActionsConfig::default()),
             scaling: std::sync::Arc::new(gang_config::ScalingConfig::default()),
             clock: std::sync::Arc::new(gang_clock::SystemClock::new()),
+            control_acquire_timeout: gang_types::NonZeroDuration::from_secs(1),
             content_store: &store,
             action_store: &store,
             fleets: &fleets,
@@ -478,6 +481,7 @@ async fn run_held_controller(
         actions: Arc::new(gang_config::ActionsConfig::default()),
         scaling: Arc::new(gang_config::ScalingConfig::default()),
         clock: Arc::new(gang_clock::SystemClock::new()),
+        control_acquire_timeout: gang_types::NonZeroDuration::from_secs(1),
         content_store: &store,
         action_store: &store,
         fleets: &fleets,

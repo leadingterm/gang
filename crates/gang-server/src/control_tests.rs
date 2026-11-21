@@ -12,8 +12,8 @@ use futures::poll;
 use gang_clock::{Clock, Timestamp};
 use gang_spi::{
     ExecutingDemand, Fence, FleetInstance, FleetSupply, Held, InstanceExit, PortError,
-    ProvisionerPort, ScalingAuditEvent, ScalingEventKind, ScalingEventSeq, SchedulerSnapshot,
-    WorkerState,
+    ProvisionerPort, ScalingAuditEvent, ScalingEventKind, ScalingEventSeq, SchedulerPort,
+    SchedulerSnapshot, WorkerState,
 };
 use gang_state::BuilderConfig;
 use gang_types::{
@@ -26,6 +26,62 @@ use crate::test_support::{clock_at, fleets, fleets_of, queued_demand};
 use gang_testkit::{
     FakeProvisioner, FakeRepository, FakeScheduler, FleetCall, Opaque, TestResult, worker_on,
 };
+
+struct PartialFailureProvisioner {
+    inner: FakeProvisioner,
+    fail: AtomicBool,
+}
+
+impl ProvisionerPort for PartialFailureProvisioner {
+    type FleetOptions = Opaque;
+
+    async fn supply(
+        &self,
+        fleet: Fleet<'_, Opaque>,
+        into: &mut FleetSupply,
+    ) -> Result<(), PortError> {
+        if self.fail.load(Ordering::SeqCst) {
+            *into = FleetSupply::default();
+            return Err(PortError::unavailable("partial supply read"));
+        }
+        self.inner.supply(fleet, into).await
+    }
+
+    async fn converge(&self, _held: &Held, _fleet: Fleet<'_, Opaque>) -> Result<(), PortError> {
+        Err(PortError::unavailable("control pass disabled"))
+    }
+
+    async fn acknowledge_exit(
+        &self,
+        held: &Held,
+        fleet: Fleet<'_, Opaque>,
+        instance: &InstanceId,
+    ) -> Result<(), PortError> {
+        self.inner.acknowledge_exit(held, fleet, instance).await
+    }
+
+    async fn set_desired_capacity(
+        &self,
+        held: &Held,
+        fleet: Fleet<'_, Opaque>,
+        desired: u32,
+    ) -> Result<(), PortError> {
+        self.inner.set_desired_capacity(held, fleet, desired).await
+    }
+
+    async fn terminate(
+        &self,
+        held: &Held,
+        fleet: Fleet<'_, Opaque>,
+        instance: &InstanceId,
+    ) -> Result<(), PortError> {
+        self.inner.terminate(held, fleet, instance).await
+    }
+
+    fn worker_lifetime(&self) -> gang_types::WorkerLifetime {
+        self.inner.worker_lifetime()
+    }
+}
 
 struct LapsingProvisioner {
     inner: FakeProvisioner,
@@ -299,6 +355,8 @@ fn idle_worker(instance: &InstanceId, last_seen: Timestamp) -> TestResult<Worker
         environment: Some("host:test".parse().expect("valid test environment")),
         running_actions: 0,
         max_inflight_actions: NonZeroU32::new(4),
+        capacity: None,
+        reserved: None,
         draining: false,
         last_seen,
         paused: false,
@@ -1206,6 +1264,68 @@ async fn failed_snapshot_skips_the_pass_without_touching_the_fleet() -> Result<(
     );
     assert!(fleet.desired_requests().is_empty());
     assert!(repository.scaling_events().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn held_scheduler_acquisition_skips_and_next_pass_retries() -> TestResult {
+    let clock = clock_at(1_000_000);
+    let fleets = fleets();
+    let fleet = FakeProvisioner::default();
+    let scheduler = FakeScheduler::with_control_acquire_timeout(clock.clone(), POLL_INTERVAL)?;
+    let repository = FakeRepository::default();
+    let hub = hub();
+    scheduler.set_snapshot(queued_snapshot()?);
+    let guard = scheduler.hold_control_acquisition().await?;
+    let mut control = ControlLoop::new(
+        &fleets,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        gang_types::nonzero_u32(2),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
+        gang_testkit::fence::valid_fence(),
+    )
+    .with_publisher(publisher(&hub));
+    {
+        let pass = control.pass();
+        futures::pin_mut!(pass);
+        assert!(poll!(pass.as_mut()).is_pending());
+        clock.advance(BEFORE_POLL);
+        assert!(poll!(pass.as_mut()).is_pending());
+        clock.advance(TICK);
+        assert_eq!(
+            pass.await,
+            PassOutcome::Skipped(SkipReason::SchedulerUnavailable)
+        );
+    }
+    let state = served(&hub);
+    assert_eq!(state.pass.state, PassState::Skipped);
+    assert_eq!(
+        state.pass.skip_reason,
+        Some(SkipReason::SchedulerUnavailable)
+    );
+    assert!(fleet.desired_requests().is_empty());
+    assert!(scheduler.draining_calls().is_empty());
+    assert!(scheduler.retain_drains_calls().is_empty());
+    assert!(repository.scaling_events().is_empty());
+    drop(guard);
+    assert_eq!(
+        control.pass().await,
+        PassOutcome::Completed {
+            applied: 1,
+            failed: 0
+        }
+    );
+    assert_eq!(fleet.desired_requests().len(), 1);
     Ok(())
 }
 
@@ -2625,6 +2745,32 @@ fn served(hub: &StateHub) -> State {
     serde_json::from_slice(&bytes).expect("served state parses")
 }
 
+#[test]
+fn late_pass_publication_does_not_rewind_observation_time() {
+    let hub = hub();
+    let mut publisher = publisher(&hub);
+    let fleets = fleets();
+    let later = Timestamp::from_unix_millis(1_020_000);
+    publisher.publish(
+        later,
+        gang_state::PassStatus::Observed {
+            hosted: None,
+            supplies: &[],
+        },
+        &[],
+        fleets.catalog(),
+        &[],
+    );
+    publisher.publish(
+        Timestamp::from_unix_millis(1_010_000),
+        gang_state::PassStatus::Skipped(SkipReason::SchedulerUnavailable),
+        &[],
+        fleets.catalog(),
+        &[],
+    );
+    assert_eq!(served(&hub).update_time, later);
+}
+
 #[tokio::test]
 async fn completed_pass_publishes_an_ok_pass_with_the_fleet_rows() -> Result<(), PortError> {
     let clock = clock_at(1_000_000);
@@ -2840,6 +2986,323 @@ async fn worker_joins_recorded_in_a_pass_are_in_that_pass_state() -> TestResult 
     Ok(())
 }
 
+#[tokio::test]
+async fn healthy_observation_is_published_before_the_first_pass() -> TestResult {
+    let clock = clock_at(1_000_000);
+    let fleets = fleets();
+    let fleet = FakeProvisioner::default();
+    let scheduler = FakeScheduler::new()?;
+    let repository = FakeRepository::default();
+    let hub = StateHub::new(
+        HubConfig {
+            max_viewers: NonZeroUsize::MIN,
+            retry_after: Duration::from_secs(5),
+            lag_frames: NonZeroUsize::new(8).expect("eight is nonzero"),
+            recent_events: NonZeroUsize::MIN,
+        },
+        initial_state(),
+    );
+    let mut viewer = hub.join().expect("viewer joins");
+    let control = ControlLoop::new(
+        &fleets,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        gang_types::nonzero_u32(2),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
+        gang_testkit::fence::valid_fence(),
+    )
+    .with_publisher(publisher(&hub));
+    let mut run = pin!(control.run());
+    assert!(poll!(run.as_mut()).is_pending());
+
+    let crate::hub::Next::Frame(bytes) = viewer.next().await else {
+        panic!("first publication is delivered to the viewer");
+    };
+    let gang_wire::Frame::Delta(delta) = crate::test_support::decode_sse(&bytes) else {
+        panic!("first publication is a delta");
+    };
+    let recent = delta
+        .recent
+        .expect("first publication includes observation");
+    assert_eq!(recent.samples.last().unwrap().scheduler_known, Some(true));
+    assert_eq!(recent.samples.last().unwrap().passes, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn observation_retains_last_good_supply_when_worker_disconnects() -> TestResult {
+    let clock = clock_at(1_000_000);
+    let fleets = fleets();
+    let fleet = PartialFailureProvisioner {
+        inner: FakeProvisioner::default(),
+        fail: AtomicBool::new(false),
+    };
+    let scheduler = FakeScheduler::new()?;
+    let repository = FakeRepository::default();
+    let hub = hub();
+    let mut viewer = hub.join().expect("dashboard viewer joins");
+    let instance = instance_id("local-1");
+    let launched_at = Timestamp::from_unix_millis(123_000);
+    fleet
+        .inner
+        .set_supply(&fleet_name(), supply_with("local-1", launched_at, 1));
+    scheduler.set_snapshot(snapshot_with(vec![idle_worker(&instance, clock.wall())?]));
+    let control = ControlLoop::new(
+        &fleets,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        gang_types::nonzero_u32(2),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
+        gang_testkit::fence::valid_fence(),
+    )
+    .with_publisher(publisher(&hub));
+    let mut run = pin!(control.run());
+    assert!(poll!(run.as_mut()).is_pending());
+    assert!(matches!(
+        viewer.next().await,
+        crate::hub::Next::Frame(_) | crate::hub::Next::Resync(_)
+    ));
+    let initial = served(&hub);
+    assert_eq!(initial.workers.len(), 1);
+    assert!(initial.instances.is_empty());
+    assert_eq!(initial.fleets[0].instances.in_service, 1);
+
+    fleet.fail.store(true, Ordering::SeqCst);
+    scheduler.set_snapshot(SchedulerSnapshot::default());
+    clock.advance(POLL_INTERVAL.get());
+    assert!(poll!(run.as_mut()).is_pending());
+    assert!(matches!(
+        viewer.next().await,
+        crate::hub::Next::Frame(_) | crate::hub::Next::Resync(_)
+    ));
+    let disconnected = served(&hub);
+    assert!(disconnected.workers.is_empty());
+    assert_eq!(disconnected.instances.len(), 1);
+    let row = &disconnected.instances[0];
+    assert_eq!(row.name, name::of::<name::Instances>(&instance));
+    assert_eq!(row.fleet, name::of::<name::Fleets>(&fleet_name()));
+    assert_eq!(row.lifecycle, gang_wire::Lifecycle::InService);
+    assert_eq!(row.launch_time, launched_at);
+    assert_eq!(disconnected.fleets[0].instances.in_service, 1);
+    assert_eq!(disconnected.fleets[0].workers.unconnected, 1);
+
+    fleet
+        .inner
+        .set_supply(&fleet_name(), FleetSupply::default());
+    fleet.fail.store(false, Ordering::SeqCst);
+    clock.advance(POLL_INTERVAL.get());
+    assert!(poll!(run.as_mut()).is_pending());
+    let recovered = served(&hub);
+    assert!(recovered.workers.is_empty());
+    assert!(recovered.instances.is_empty());
+    assert_eq!(recovered.fleets[0].instances.in_service, 0);
+    assert_eq!(recovered.fleets[0].workers.unconnected, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn slow_pass_does_not_publish_a_known_zero_before_the_first_observation() -> TestResult {
+    let clock = clock_at(1_000_000);
+    let fleets = fleets();
+    let fleet = FakeProvisioner::default();
+    let scheduler = FakeScheduler::new()?;
+    let repository = FakeRepository::default();
+    let hub = hub();
+    let mut viewer = hub.join().expect("dashboard viewer joins");
+    let gang_wire::Frame::Snapshot(_) = crate::test_support::decode_sse(viewer.snapshot()) else {
+        panic!("viewer starts with a snapshot");
+    };
+    // The observer's first read is held while a real control pass crosses a history step.
+    let held_observer = scheduler.hold_snapshot();
+    let hook_clock = Arc::clone(&clock);
+    let delayed = AtomicBool::new(false);
+    fleet.on_converge(move || {
+        if !delayed.swap(true, Ordering::SeqCst) {
+            hook_clock.advance(Duration::from_secs(11));
+        }
+        Ok(())
+    });
+    let control = ControlLoop::new(
+        &fleets,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        gang_types::nonzero_u32(2),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
+        gang_testkit::fence::valid_fence(),
+    )
+    .with_publisher(publisher(&hub));
+    let mut run = pin!(control.run());
+    assert!(poll!(run.as_mut()).is_pending());
+    let bytes = match viewer.next().await {
+        crate::hub::Next::Frame(bytes) | crate::hub::Next::Resync(bytes) => bytes,
+        crate::hub::Next::Closed => panic!("pass metadata reaches the open viewer"),
+    };
+    let recent = match crate::test_support::decode_sse(&bytes) {
+        gang_wire::Frame::Delta(delta) => delta.recent.expect("pass publishes history"),
+        gang_wire::Frame::Snapshot(state) => state.recent,
+        _ => panic!("pass publication is state"),
+    };
+    let sample = recent.samples.last().expect("pass sample");
+    assert_eq!(sample.scheduler_known, Some(false));
+    assert!(sample.passes >= 1);
+    let first_start = sample.start;
+
+    // The timed-out observer publishes unavailable data, then continues advancing history.
+    scheduler.fail_snapshot(true);
+    assert!(poll!(run.as_mut()).is_pending());
+    let _ = viewer.next().await;
+    clock.advance(Duration::from_secs(10));
+    assert!(poll!(run.as_mut()).is_pending());
+    let next = viewer.next().await;
+    let bytes = match next {
+        crate::hub::Next::Frame(bytes) | crate::hub::Next::Resync(bytes) => bytes,
+        crate::hub::Next::Closed => panic!("viewer stays connected"),
+    };
+    let recent = match crate::test_support::decode_sse(&bytes) {
+        gang_wire::Frame::Delta(delta) => delta.recent.expect("timeline advances"),
+        gang_wire::Frame::Snapshot(state) => state.recent,
+        _ => panic!("viewer receives state"),
+    };
+    let sample = recent.samples.last().expect("later sample");
+    assert!(sample.start > first_start);
+    assert_eq!(sample.scheduler_known, Some(false));
+    drop(held_observer);
+    Ok(())
+}
+
+#[tokio::test]
+async fn observation_recovers_after_scheduler_reads_time_out() -> TestResult {
+    let clock = clock_at(1_000_000);
+    let fleets = fleets();
+    let fleet = FakeProvisioner::default();
+    let scheduler = FakeScheduler::new()?;
+    let repository = FakeRepository::default();
+    let hub = hub();
+    scheduler.set_snapshot(SchedulerSnapshot {
+        completed: 10,
+        ..SchedulerSnapshot::default()
+    });
+    let (builds, sink, _observations) =
+        crate::builds::BuildsCell::channel(&gang_config::BuildsConfig::default());
+    let publisher = StatePublisher::new(
+        hub.clone(),
+        BuilderConfig {
+            events_limit: 100,
+            history_window: Duration::from_mins(15),
+            history_step: Duration::from_secs(10),
+            stale_after: Duration::from_mins(1),
+            interval: POLL_INTERVAL.get(),
+            provisioner: "local".to_owned(),
+        },
+        ActionsCache::default(),
+        builds,
+        sink.clone(),
+        crate::cache_usage::CacheUsage::default(),
+        gang_state::CacheBaseline::default(),
+    );
+    let control = ControlLoop::new(
+        &fleets,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        gang_types::nonzero_u32(2),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
+        gang_testkit::fence::valid_fence(),
+    )
+    .with_publisher(publisher);
+    let mut run = pin!(control.run());
+    assert!(poll!(run.as_mut()).is_pending());
+    let initial = served(&hub);
+    assert_eq!(initial.pass.state, PassState::Ok);
+    assert_eq!(initial.recent.samples[0].scheduler_known, Some(true));
+
+    let release = scheduler.hold_snapshot();
+    clock.advance(POLL_INTERVAL.get());
+    assert!(poll!(run.as_mut()).is_pending());
+    let held_observation = scheduler.hold_snapshot();
+    fleet.set_supply(&fleet_name(), supply_with("observed", clock.wall(), 3));
+    sink.count(gang_spi::Traffic {
+        lookups: 4,
+        hits: 3,
+        uploaded: 20,
+        downloaded: 10,
+    });
+    clock.advance(Duration::from_secs(9));
+    assert!(poll!(run.as_mut()).is_pending());
+    scheduler.fail_snapshot(true);
+    clock.advance(POLL_INTERVAL.get());
+    assert!(poll!(run.as_mut()).is_pending());
+    let during = served(&hub);
+    assert_eq!(during.fleets[0].desired, 3);
+    let sample = during.recent.samples.last().expect("observation sample");
+    assert_eq!(sample.scheduler_known, Some(false));
+    assert_eq!(sample.lookups, 4);
+    assert_eq!(sample.hits, 3);
+    assert!(sample.passes > 0);
+    assert_eq!(during.recent.samples.len(), 2);
+
+    scheduler.set_snapshot(SchedulerSnapshot {
+        completed: 100,
+        ..SchedulerSnapshot::default()
+    });
+    scheduler.fail_snapshot(false);
+    drop(held_observation);
+    drop(release);
+    clock.advance(Duration::from_secs(9));
+    assert!(poll!(run.as_mut()).is_pending());
+    let recovered = served(&hub);
+    assert_eq!(recovered.recent.samples.len(), 3);
+    assert_eq!(recovered.recent.samples[1].scheduler_known, Some(false));
+    assert_eq!(recovered.recent.samples[2].scheduler_known, Some(false));
+    assert_eq!(recovered.recent.samples[2].completed, 0);
+    scheduler.set_snapshot(SchedulerSnapshot {
+        completed: 107,
+        ..SchedulerSnapshot::default()
+    });
+    clock.advance(Duration::from_secs(10));
+    assert!(poll!(run.as_mut()).is_pending());
+    let next = served(&hub);
+    assert_eq!(next.recent.samples.len(), 4);
+    assert_eq!(next.recent.samples[3].scheduler_known, Some(true));
+    assert_eq!(next.recent.samples[3].completed, 7);
+    Ok(())
+}
+
 /// The loop runs a pass at once, then one per poll interval of the injected clock, and none
 /// in between.
 #[tokio::test]
@@ -2890,6 +3353,7 @@ async fn run_passes_at_once_then_once_per_poll_interval() -> Result<(), PortErro
     Ok(())
 }
 
+#[derive(Default)]
 struct EventProvisioner {
     inner: FakeProvisioner,
     acknowledgements: std::sync::atomic::AtomicUsize,
@@ -2940,6 +3404,48 @@ impl ProvisionerPort for EventProvisioner {
     }
 }
 
+async fn publish_observation<F: ProvisionerPort<FleetOptions = Opaque>>(
+    publisher: &mut StatePublisher,
+    fleets: &gang_config::Fleets<gang_testkit::TestPlugins>,
+    provisioner: &F,
+    scheduler: &FakeScheduler,
+    wall: Timestamp,
+) -> TestResult {
+    let mut passes = Vec::new();
+    for config in fleets.iter() {
+        let mut pass = gang_reconciler::FleetPass::new(config.policy.clone());
+        provisioner.supply(config.fleet(), &mut pass.supply).await?;
+        passes.push(pass);
+    }
+    let mut snapshot = SchedulerSnapshot::default();
+    scheduler.snapshot(&mut snapshot).await?;
+    let mut hosted = gang_reconciler::HostedSnapshot::default();
+    hosted.replace(&mut snapshot);
+    let supplies = vec![true; passes.len()];
+    publisher.publish(
+        wall,
+        gang_state::PassStatus::Observed {
+            hosted: Some(&hosted),
+            supplies: &supplies,
+        },
+        &passes,
+        fleets.catalog(),
+        &[],
+    );
+    Ok(())
+}
+async fn observed_publisher<F: ProvisionerPort<FleetOptions = Opaque>>(
+    hub: &StateHub,
+    fleets: &gang_config::Fleets<gang_testkit::TestPlugins>,
+    provisioner: &F,
+    scheduler: &FakeScheduler,
+    wall: Timestamp,
+) -> TestResult<StatePublisher> {
+    let mut publisher = publisher(hub);
+    publish_observation(&mut publisher, fleets, provisioner, scheduler, wall).await?;
+    Ok(publisher)
+}
+
 fn assert_replacement_visible(hub: &StateHub) {
     let state = served(hub);
     assert_eq!(state.status_events.len(), 1);
@@ -2958,10 +3464,7 @@ async fn infrastructure_delivery_retries_and_replays_without_audit_duplicates() 
     use gang_spi::{InfrastructureEvent, InfrastructureEventKind};
     let clock = clock_at(1_000_000);
     let fleets = fleets();
-    let fleet = EventProvisioner {
-        inner: FakeProvisioner::default(),
-        acknowledgements: std::sync::atomic::AtomicUsize::new(0),
-    };
+    let fleet = EventProvisioner::default();
     let scheduler = FakeScheduler::new()?;
     let repository = FakeRepository::default();
     let old = instance_id("local-1");
@@ -2983,6 +3486,8 @@ async fn infrastructure_delivery_retries_and_replays_without_audit_duplicates() 
         idle_worker(&new, clock.wall())?,
     ]));
     let initial_hub = hub();
+    let state_publisher =
+        observed_publisher(&initial_hub, &fleets, &fleet, &scheduler, clock.wall()).await?;
     let dashboard = gang_config::DashboardConfig::default();
     let mut control = ControlLoop::new(
         &fleets,
@@ -2998,7 +3503,7 @@ async fn infrastructure_delivery_retries_and_replays_without_audit_duplicates() 
         },
         gang_testkit::fence::valid_fence(),
     )
-    .with_publisher(publisher(&initial_hub));
+    .with_publisher(state_publisher);
     repository.fail_records(true);
     control.pass().await;
     assert_eq!(fleet.acknowledgements.load(Ordering::SeqCst), 0);
@@ -3035,6 +3540,8 @@ async fn infrastructure_delivery_retries_and_replays_without_audit_duplicates() 
     after_ack.events.clear();
     fleet.inner.set_supply(&fleet_name(), after_ack);
     let restarted = hub();
+    let state_publisher =
+        observed_publisher(&restarted, &fleets, &fleet, &scheduler, clock.wall()).await?;
     let mut control = ControlLoop::new(
         &fleets,
         crate::control::ControlSettings::new(POLL_INTERVAL, &dashboard),
@@ -3049,7 +3556,7 @@ async fn infrastructure_delivery_retries_and_replays_without_audit_duplicates() 
         },
         gang_testkit::fence::valid_fence(),
     )
-    .with_publisher(publisher(&restarted));
+    .with_publisher(state_publisher);
     control.pass().await;
     assert_replacement_visible(&restarted);
     Ok(())
@@ -3060,10 +3567,7 @@ async fn capacity_status_preserves_launch_audit_through_redelivery_and_expiry() 
     use gang_spi::{InfrastructureEvent, InfrastructureEventKind};
     let clock = clock_at(1_000_000);
     let fleets = fleets();
-    let fleet = EventProvisioner {
-        inner: FakeProvisioner::default(),
-        acknowledgements: std::sync::atomic::AtomicUsize::new(0),
-    };
+    let fleet = EventProvisioner::default();
     let scheduler = FakeScheduler::new()?;
     let repository = FakeRepository::default();
     let mut supply = supply_with("local-1", clock.wall(), 3);
@@ -3185,6 +3689,15 @@ async fn ordinary_provider_launch_does_not_suppress_worker_registration() -> Tes
     scheduler.set_snapshot(snapshot_with(vec![idle_worker(&instance, clock.wall())?]));
     let dashboard = gang_config::DashboardConfig::default();
     let hub = hub();
+    let mut state_publisher = publisher(&hub);
+    publish_observation(
+        &mut state_publisher,
+        &fleets,
+        &fleet,
+        &scheduler,
+        clock.wall(),
+    )
+    .await?;
     let mut control = ControlLoop::new(
         &fleets,
         crate::control::ControlSettings::new(POLL_INTERVAL, &dashboard),
@@ -3199,7 +3712,7 @@ async fn ordinary_provider_launch_does_not_suppress_worker_registration() -> Tes
         },
         gang_testkit::fence::valid_fence(),
     )
-    .with_publisher(publisher(&hub));
+    .with_publisher(state_publisher);
     control.pass().await;
     assert!(matches!(
         &repository.scaling_events()[0].kind,
@@ -3230,6 +3743,15 @@ async fn failed_status_reload_clears_expired_risk_without_stopping_reconciliatio
     fleet.set_supply(&fleet_name(), supply.clone());
     let dashboard = gang_config::DashboardConfig::default();
     let hub = hub();
+    let mut state_publisher = publisher(&hub);
+    publish_observation(
+        &mut state_publisher,
+        &fleets,
+        &fleet,
+        &scheduler,
+        clock.wall(),
+    )
+    .await?;
     let mut control = ControlLoop::new(
         &fleets,
         crate::control::ControlSettings::new(POLL_INTERVAL, &dashboard),
@@ -3244,7 +3766,7 @@ async fn failed_status_reload_clears_expired_risk_without_stopping_reconciliatio
         },
         gang_testkit::fence::valid_fence(),
     )
-    .with_publisher(publisher(&hub));
+    .with_publisher(state_publisher);
     control.pass().await;
     let before = served(&hub);
     assert_eq!(before.status_events.len(), 1);

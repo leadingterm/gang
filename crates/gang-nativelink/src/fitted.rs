@@ -1,36 +1,49 @@
 //! Fits learned reservations to a fleet that accepted the original client request.
 //! Positive memory and disk reservations are raised to their configured minima; zero stays zero.
+//! Original admission floors remain immutable. Desired memory is captured before static clamps;
+//! ordinary CPU fitting finishes before `NativeLink` performs authoritative physical-memory fitting.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use gang_config::{DiskMinReservation, MinReservation};
-use gang_types::{FleetCatalog, property};
-use nativelink_error::Error;
+use gang_types::{Bytes, FleetCatalog, property};
+use nativelink_error::{Error, make_input_err};
 use nativelink_metric::{
     MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent, RootMetricsComponent,
 };
 use nativelink_scheduler::known_platform_property_provider::KnownPlatformPropertyProvider;
-use nativelink_util::action_messages::{ActionInfo, OperationId};
+use nativelink_util::action_messages::{
+    ActionInfo, ActionReservation, MemoryReservation, OperationId,
+};
 use nativelink_util::operation_state_manager::{
     ActionStateResult, ActionStateResultStream, ClientStateManager, OperationFilter,
 };
 
-use crate::placeable::AdmittedFleets;
+use crate::capacity::RuntimeCatalog;
+use crate::placeable::{AdmittedAction, AdmittedFleets, normalized_cpu_reservation};
 
 /// Fits reservations after historical learning and before the simple scheduler.
 pub(crate) struct FittedActions {
     inner: Arc<dyn KnownPlatformPropertyProvider>,
-    fleets: FleetCatalog,
+    fleets: Arc<RuntimeCatalog>,
     admitted: AdmittedFleets,
     min_reservation: MinReservation,
     disk_min_reservation: DiskMinReservation,
 }
 
+fn cpu_reservation(info: &ActionInfo) -> Option<u64> {
+    normalized_cpu_reservation(&info.platform_properties).or_else(|| {
+        info.platform_properties
+            .get(property::CPU_MILLICORES)
+            .and_then(|value| value.parse().ok())
+    })
+}
+
 impl FittedActions {
     pub(crate) fn new(
         inner: Arc<dyn KnownPlatformPropertyProvider>,
-        fleets: FleetCatalog,
+        fleets: Arc<RuntimeCatalog>,
         admitted: AdmittedFleets,
         min_reservation: MinReservation,
         disk_min_reservation: DiskMinReservation,
@@ -42,6 +55,40 @@ impl FittedActions {
             min_reservation,
             disk_min_reservation,
         }
+    }
+
+    fn current_admission(
+        &self,
+        operation: &OperationId,
+        fleets: &FleetCatalog,
+    ) -> Result<AdmittedAction, Error> {
+        let mut admission = self
+            .admitted
+            .take(operation)
+            .unwrap_or_else(|| AdmittedAction {
+                fleets: fleets.accepting(|_| None),
+                minimum_kb: None,
+            });
+        // Observations can shrink a fleet between admission and historical learning.
+        // The explicit client floor is immutable, not another learned value to clamp.
+        if let Some(minimum) = admission.minimum_kb {
+            for index in admission.fleets {
+                if fleets
+                    .fleets()
+                    .get(index)
+                    .and_then(|fleet| fleet.limit(property::MEMORY_KB))
+                    .is_none_or(|limit| limit < minimum)
+                {
+                    admission.fleets.remove(index);
+                }
+            }
+            if admission.fleets.is_empty() {
+                return Err(make_input_err!(
+                    "no fleet accepts original memory floor {minimum} KiB"
+                ));
+            }
+        }
+        Ok(admission)
     }
 }
 
@@ -75,11 +122,11 @@ impl ClientStateManager for FittedActions {
         operation: OperationId,
         mut action_info: Arc<ActionInfo>,
     ) -> Result<Box<dyn ActionStateResult>, Error> {
-        let admitted = self
-            .admitted
-            .take(&operation)
-            .unwrap_or_else(|| self.fleets.accepting(|_| None));
-        let fleets = &self.fleets;
+        let fleets = self.fleets.current()?;
+        let AdmittedAction {
+            fleets: admitted,
+            minimum_kb,
+        } = self.current_admission(&operation, &fleets)?;
         for (key, min_kb) in [
             (property::MEMORY_KB, self.min_reservation.as_units()),
             (property::DISK_KB, self.disk_min_reservation.as_units()),
@@ -96,6 +143,16 @@ impl ClientStateManager for FittedActions {
                     .insert(key.to_owned(), min_kb.to_string());
             }
         }
+        let desired_kb = action_info
+            .platform_properties
+            .get(property::MEMORY_KB)
+            .and_then(|value| value.parse::<u64>().ok());
+        let pre_fit_reservation = ActionReservation {
+            cpu_millicores: cpu_reservation(&action_info).unwrap_or_default(),
+            memory_bytes: desired_kb
+                .unwrap_or_default()
+                .saturating_mul(Bytes::kib(1).get()),
+        };
         // Match the other requested properties before choosing the largest eligible capacity.
         // This avoids selecting a smaller fleet merely because it is earlier in preference order.
         for key in [property::MEMORY_KB, property::DISK_KB] {
@@ -119,20 +176,14 @@ impl ClientStateManager for FittedActions {
             let largest = eligible
                 .iter()
                 .filter_map(|index| fleets.fleets().get(index))
-                .filter_map(|fleet| fleet.limit(key).map(|capacity| (capacity, fleet)))
-                .max_by_key(|(capacity, _)| *capacity);
-            if let Some((capacity, fleet)) = largest
+                .filter_map(|fleet| fleet.limit(key))
+                .max();
+            if let Some(capacity) = largest
                 && reserved > capacity
             {
-                let whole_cpu = (key == property::MEMORY_KB
-                    && fleet.capacity(key) == Some(capacity))
-                .then(|| fleet.limit(property::CPU_MILLICORES))
-                .flatten();
-                let properties = &mut Arc::make_mut(&mut action_info).platform_properties;
-                properties.insert(key.to_owned(), capacity.to_string());
-                if let Some(whole_cpu) = whole_cpu {
-                    properties.insert(property::CPU_MILLICORES.to_owned(), whole_cpu.to_string());
-                }
+                Arc::make_mut(&mut action_info)
+                    .platform_properties
+                    .insert(key.to_owned(), capacity.to_string());
             }
         }
         let properties = |key: &str| action_info.platform_properties.get(key).map(String::as_str);
@@ -140,23 +191,23 @@ impl ClientStateManager for FittedActions {
             && !fit.lowered.is_empty()
         {
             tracing::info!(operation_id = %operation, fleet = fit.fleet, keys = ?fit.lowered, "fitting action reservation to fleet");
-            let whole_cpu = fleets.fleets().get(fit.fleet).and_then(|fleet| {
-                fit.lowered
-                    .iter()
-                    .any(|(key, limit)| {
-                        *key == property::MEMORY_KB && fleet.capacity(key) == Some(*limit)
-                    })
-                    .then(|| fleet.limit(property::CPU_MILLICORES))
-                    .flatten()
-            });
             let properties = &mut Arc::make_mut(&mut action_info).platform_properties;
             for (key, limit) in fit.lowered {
                 properties.insert(key.to_owned(), limit.to_string());
             }
-            if let Some(whole_cpu) = whole_cpu {
-                properties.insert(property::CPU_MILLICORES.to_owned(), whole_cpu.to_string());
-            }
         }
+        let cpu_before_memory_fit = cpu_reservation(&action_info);
+        // Keep ordinary CPU learning/fitting, but let NativeLink alone promote CPU when
+        // fitted memory fills the observed physical worker (including exact equality).
+        // Gang owns this metadata; never borrow client-shaped metadata as original intent.
+        let info = Arc::make_mut(&mut action_info);
+        info.pre_fit_reservation = Some(pre_fit_reservation);
+        info.memory_reservation = Some(MemoryReservation {
+            minimum_kb,
+            desired_kb,
+            cpu_before_memory_fit,
+            fitted_revision: None,
+        });
         self.inner.add_action(operation, action_info).await
     }
 

@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.3.5 — 2026-11-21
+
+### Added
+
+- Expose scheduler-owned action reservations and worker reserved capacity in live state and the dashboard, including pre-fit sizing when clamped.
+- Preserve learned scheduler history across transitions when a scheduler is temporarily unknown.
+- Prioritize Spot capacity in fleet allocation and verify deployments automatically.
 
 ### Changed
 
@@ -17,8 +23,15 @@
 ### Fixed
 
 - Cache DNS locally on controller and worker images, including for static binaries.
+- Fix startup on nominal 64 GiB workers whose measured memory, less reserve, is smaller than the fleet estimate; workers advertise their actual available action-pool capacity.
+- Use the same current memory guarantees for learned reservations, queued work, OOM retries and scaling, while preserving explicit client minimums and per-action ceilings.
 - Expose the public listener connection limit in the deployment module, defaulting to 4096. The module now owns `[server.http2]` for all backends; SQLite callers must remove any appended `[server.http2]` table and move their `max_connections` override to `http2_max_connections`.
 - Exclude concurrent child spawns while testing owned pipe-reader cancellation, so fork-inherited readers cannot make the close assertion nondeterministic.
+- Fix OpenTofu retained-generation cleanup racing AMI-data removal by patching forget-node references. Bazel and the deployment shell share the same pinned, source-built runtime; strict fixture diagnostics remain unchanged.
+
+### Upgrade notes
+
+- `memory_per_instance` is now the machine's nominal RAM; Gang subtracts `actions.memory.reserve` to obtain the prelaunch usable-memory estimate. AWS deployments derive nominal RAM automatically from the smallest EC2 instance memory in each fleet. Remove `memory_per_instance` from every AWS deployment-module `fleets` entry; the generated internal `gang.toml` field is not an operator input to the AWS module.
 
 ## 0.3.4
 

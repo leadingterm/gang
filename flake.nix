@@ -176,6 +176,21 @@
           tag = "v${opentofuVersion}";
           hash = "sha256-FC2CQO7WnHRy02CHypa2a5grZ32ulobNUyg5VG3rWQI=";
         };
+        patches = (previous.patches or []) ++ [./patches/opentofu-forget-references.patch];
+        env = (previous.env or {}) // {CGO_ENABLED = "0";};
+        doCheck = true;
+        checkPhase = ''
+          runHook preCheck
+          go test ./internal/tofu -run '^(TestNodeForgetResourceInstanceReferences|TestSkipDestroy_)' -count=1
+          runHook postCheck
+        '';
+        postFixup =
+          (previous.postFixup or "")
+          + ''
+            mkdir -p "$out/share/opentofu"
+            printf '%s\n' '${opentofuVersion}' > "$out/share/opentofu/version"
+            sha256sum "$out/bin/tofu" | cut -d ' ' -f 1 > "$out/share/opentofu/sha256"
+          '';
         meta =
           previous.meta
           // {
@@ -217,6 +232,7 @@
           # The e2e harness uses pinned action tools without the host toolchain.
           GANG_E2E_ACTION_SHELL = "${pkgs.bash}/bin/bash";
           GANG_E2E_ACTION_PATH = lib.makeBinPath actionTools;
+          GANG_OPENTOFU = "${opentofu}";
           GANG_IMPORT_TEST_TOOLS = "${pkgs.buildEnv {
             name = "gang-import-test-tools";
             paths = [pkgs.jq pkgs.zstd];

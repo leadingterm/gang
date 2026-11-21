@@ -308,6 +308,8 @@ impl Harness {
             fleet,
             running_actions: 0,
             max_inflight_actions: None,
+            capacity: None,
+            reserved: None,
             paused: false,
             draining,
             last_seen,

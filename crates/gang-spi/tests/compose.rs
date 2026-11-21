@@ -580,6 +580,7 @@ fn scheduler_runs_controller_and_worker() -> Result<(), Box<dyn Error>> {
     let controller = ControllerSpec {
         actions: Arc::new(gang_config::ActionsConfig::default()),
         scaling: Arc::new(gang_config::ScalingConfig::default()),
+        control_acquire_timeout: gang_types::NonZeroDuration::from_secs(1),
         clock: Arc::new(gang_clock::TestClock::new(
             gang_clock::Timestamp::UNIX_EPOCH,
         )),

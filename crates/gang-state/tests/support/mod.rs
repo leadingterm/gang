@@ -108,6 +108,8 @@ pub fn worker_state(
         environment: Some("host:test".parse()?),
         running_actions: running,
         max_inflight_actions: max_inflight,
+        capacity: None,
+        reserved: None,
         draining,
         paused: false,
         last_seen: ts(0),

@@ -19,7 +19,7 @@ use nativelink_util::operation_state_manager::{
 use nativelink_util::origin_event::OriginMetadata;
 
 use crate::observer::origin as build_origin;
-use crate::snapshot::managed_worker;
+use crate::snapshot::{admitted_resources, learned_reservation, managed_worker};
 
 /// Formats an action digest for the scheduler views and execution observations.
 pub(crate) fn digest_text(digest: DigestInfo) -> String {
@@ -111,6 +111,7 @@ async fn running(
             continue;
         };
         let row = display(row);
+        let reservation = admitted_resources(&row.info.platform_properties);
         into.running.push(RunningActionView {
             info: ActionInfo {
                 op: row.op,
@@ -119,6 +120,8 @@ async fn running(
                 mnemonic: row.mnemonic,
                 priority: row.info.priority,
                 build: row.build,
+                reservation,
+                learned_reservation: learned_reservation(&row.info, reservation),
             },
             worker,
             started: row.started,
@@ -144,12 +147,8 @@ async fn queued(
             continue;
         };
         let row = display(row);
-        let properties = &row.info.platform_properties;
-        let (candidates, refusal) = match fleets.admit(
-            properties
-                .iter()
-                .map(|(key, value)| (key.as_str(), value.as_str())),
-        ) {
+        let reservation = admitted_resources(&row.info.platform_properties);
+        let (candidates, refusal) = match crate::snapshot::candidates(&row.info, fleets) {
             Ok(candidates) => (candidates, None),
             Err(refusal) => (gang_types::FleetSet::EMPTY, Some(refusal)),
         };
@@ -161,6 +160,8 @@ async fn queued(
                 mnemonic: row.mnemonic,
                 build: row.build,
                 priority: row.info.priority,
+                reservation,
+                learned_reservation: learned_reservation(&row.info, reservation),
             },
             queued_since: Timestamp::from(row.info.insert_timestamp),
             candidates,
@@ -441,6 +442,8 @@ pub(crate) mod tests {
         platform: &[(&str, &str)],
     ) -> Arc<NativeActionInfo> {
         Arc::new(NativeActionInfo {
+            memory_reservation: None,
+            pre_fit_reservation: None,
             command_digest: digest(1, 10),
             input_root_digest: digest(2, 20),
             timeout: Duration::from_mins(1),
@@ -542,6 +545,148 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn listings_report_fitted_and_original_reservations()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use gang_types::ActionResources;
+        use nativelink_util::action_messages::ActionReservation;
+
+        let mut fitted = info(
+            0,
+            0,
+            &[
+                (property::CPU_MILLICORES, "2000"),
+                (property::CPU_COUNT, "8"),
+                (property::MEMORY_KB, "4000"),
+                (property::DISK_KB, "7"),
+            ],
+        );
+        let native = Arc::make_mut(&mut fitted);
+        native.pre_fit_reservation = Some(ActionReservation {
+            cpu_millicores: 6000,
+            memory_bytes: Bytes::kib(8000).get(),
+        });
+        let fake = Fake {
+            by_worker: HashMap::from([(
+                WORKER_A.to_owned(),
+                vec![row(
+                    "running",
+                    ActionStage::Executing,
+                    0,
+                    Arc::clone(&fitted),
+                    None,
+                )],
+            )]),
+            queued: vec![row("queued", ActionStage::Queued, 0, fitted, None)],
+            ..Default::default()
+        };
+        let view = run(&fake, &[summary(WORKER_A, 1)], &catalog()?, ALL).await?;
+        let expected = ActionResources {
+            cpu_millicores: 2000,
+            memory: Bytes::kib(4000),
+            disk: Bytes::kib(7),
+        };
+        let original = Some(ActionResources {
+            cpu_millicores: 6000,
+            memory: Bytes::kib(8000),
+            disk: Bytes::new(0),
+        });
+        for action in [&view.running[0].info, &view.queued[0].info] {
+            assert_eq!(action.reservation, expected);
+            assert_eq!(action.learned_reservation, original);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn learned_reservation_requires_a_reduced_dimension() {
+        use gang_types::ActionResources;
+        use nativelink_util::action_messages::ActionReservation;
+
+        let mut action = info(
+            0,
+            0,
+            &[
+                (property::CPU_MILLICORES, "2000"),
+                (property::MEMORY_KB, "4000"),
+            ],
+        );
+        let fitted = admitted_resources(&action.platform_properties);
+        assert_eq!(learned_reservation(&action, fitted), None);
+        let native = Arc::make_mut(&mut action);
+        native.pre_fit_reservation = Some(ActionReservation {
+            cpu_millicores: 3000,
+            memory_bytes: Bytes::kib(4000).get(),
+        });
+        assert_eq!(
+            learned_reservation(&action, fitted),
+            Some(ActionResources {
+                cpu_millicores: 3000,
+                memory: Bytes::kib(4000),
+                disk: Bytes::new(0),
+            })
+        );
+        let native = Arc::make_mut(&mut action);
+        let reservation = native.pre_fit_reservation.as_mut().expect("metadata");
+        reservation.cpu_millicores = 2000;
+        assert_eq!(learned_reservation(&action, fitted), None);
+        let native = Arc::make_mut(&mut action);
+        let reservation = native.pre_fit_reservation.as_mut().expect("metadata");
+        reservation.cpu_millicores = 3000;
+        reservation.memory_bytes = 0;
+        assert_eq!(
+            learned_reservation(&action, fitted),
+            Some(ActionResources {
+                cpu_millicores: 3000,
+                memory: Bytes::new(0),
+                disk: Bytes::new(0),
+            })
+        );
+        let native = Arc::make_mut(&mut action);
+        let reservation = native.pre_fit_reservation.as_mut().expect("metadata");
+        reservation.cpu_millicores = 0;
+        reservation.memory_bytes = Bytes::kib(4000).get() + 1;
+        assert_eq!(
+            learned_reservation(&action, fitted),
+            Some(ActionResources {
+                cpu_millicores: 0,
+                memory: Bytes::new(Bytes::kib(4000).get() + 1),
+                disk: Bytes::new(0),
+            })
+        );
+        let native = Arc::make_mut(&mut action);
+        native
+            .pre_fit_reservation
+            .as_mut()
+            .expect("metadata")
+            .memory_bytes = Bytes::kib(4000).get();
+        let native = Arc::make_mut(&mut action);
+        native
+            .pre_fit_reservation
+            .as_mut()
+            .expect("metadata")
+            .cpu_millicores = 1000;
+        assert_eq!(learned_reservation(&action, fitted), None);
+        let native = Arc::make_mut(&mut action);
+        let reservation = native.pre_fit_reservation.as_mut().expect("metadata");
+        reservation.cpu_millicores = 0;
+        reservation.memory_bytes = Bytes::kib(5000).get();
+        assert_eq!(
+            learned_reservation(&action, fitted),
+            Some(ActionResources {
+                cpu_millicores: 0,
+                memory: Bytes::kib(5000),
+                disk: Bytes::new(0),
+            })
+        );
+        let zero = info(0, 0, &[]);
+        assert_eq!(
+            admitted_resources(&zero.platform_properties),
+            ActionResources::default()
+        );
+        assert_eq!(learned_reservation(&zero, ActionResources::default()), None);
+    }
+
+    #[tokio::test]
     async fn queued_action_reports_the_first_submitters_build()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut action = row(
@@ -608,6 +753,8 @@ pub(crate) mod tests {
                         mnemonic: "CppCompile".to_owned(),
                         priority: 5,
                         build: None,
+                        reservation: gang_types::ActionResources::default(),
+                        learned_reservation: None,
                     },
                     worker: WorkerId::try_new(WORKER_A)?,
                     started: Timestamp::from_unix_millis(1_000),
@@ -620,6 +767,8 @@ pub(crate) mod tests {
                         mnemonic: "Javac".to_owned(),
                         priority: 3,
                         build: None,
+                        reservation: gang_types::ActionResources::default(),
+                        learned_reservation: None,
                     },
                     worker: WorkerId::try_new(WORKER_B)?,
                     started: Timestamp::from_unix_millis(2_000),
@@ -660,6 +809,8 @@ pub(crate) mod tests {
                         mnemonic: "Genrule".to_owned(),
                         priority: 7,
                         build: None,
+                        reservation: gang_types::ActionResources::default(),
+                        learned_reservation: None,
                     },
                     queued_since: Timestamp::from_unix_millis(4_000),
                     candidates: fleets.admit([("cpu_count", "2")]).expect("admitted"),
@@ -673,6 +824,8 @@ pub(crate) mod tests {
                         mnemonic: String::new(),
                         priority: 2,
                         build: None,
+                        reservation: gang_types::ActionResources::default(),
+                        learned_reservation: None,
                     },
                     queued_since: Timestamp::from_unix_millis(5_000),
                     candidates: fleets.admit(std::iter::empty()).expect("admitted"),

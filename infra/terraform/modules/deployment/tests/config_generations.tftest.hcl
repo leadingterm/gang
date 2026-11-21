@@ -43,6 +43,7 @@ mock_provider "aws" {
   mock_data "aws_ec2_instance_type" {
     defaults = {
       boot_modes                 = ["legacy-bios", "uefi"]
+      memory_size                = 65536
       supported_architectures    = ["x86_64"]
       instance_storage_supported = true
       hypervisor                 = "nitro"
@@ -224,24 +225,22 @@ variables {
   tags                     = { Environment = "test" }
   fleets = [
     {
-      name                = "gang-worker-x86-64"
-      isa                 = "x86-64"
-      capacity            = "spot"
-      instance_types      = ["c6id.4xlarge"]
-      max_instances       = 4
-      vcpus_per_instance  = 15
-      memory_per_instance = "29GiB"
-      disk_per_instance   = "200GiB"
+      name               = "gang-worker-x86-64"
+      isa                = "x86-64"
+      capacity           = "spot"
+      instance_types     = ["c6id.4xlarge"]
+      max_instances      = 4
+      vcpus_per_instance = 15
+      disk_per_instance  = "200GiB"
     },
     {
-      name                = "gang-worker-aarch64"
-      isa                 = "aarch64"
-      capacity            = "on-demand"
-      instance_types      = ["c7gd.4xlarge"]
-      max_instances       = 4
-      vcpus_per_instance  = 15
-      memory_per_instance = "29GiB"
-      disk_per_instance   = "200GiB"
+      name               = "gang-worker-aarch64"
+      isa                = "aarch64"
+      capacity           = "on-demand"
+      instance_types     = ["c7gd.4xlarge"]
+      max_instances      = 4
+      vcpus_per_instance = 15
+      disk_per_instance  = "200GiB"
     },
   ]
 }

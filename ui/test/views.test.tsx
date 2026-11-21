@@ -508,6 +508,64 @@ test("workers with observed caps retain pips and slot details", (t) => {
   }
 });
 
+test("worker ledger totals show admission capacity independently of slots and sampled actions", (t) => {
+  const worker = live.workers[0];
+  if (!worker) throw new Error("the live recording has a worker");
+  const reserved = { cpuMillicores: 6000, memory: 2 * 1024 ** 3 };
+  const capacity = { cpuMillicores: 8000, memory: 4 * 1024 ** 3 };
+  const measured = { ...worker, reserved, capacity };
+  const state = { ...live, workers: [measured] };
+  const expected = /CPU admission 6000 millicores \/ 8000 millicores · memory 2 GiB \/ 4 GiB reserved \/ capacity/;
+  const row = html({ state }, <Workers />);
+  t.assert.match(visibleText(row), /CPU 6000 \/ 8000 mCPU/);
+  t.assert.match(visibleText(row), /Memory 2 GiB \/ 4 GiB/);
+  t.assert.match(row, /title="Reserved \/ admission capacity"/);
+  t.assert.match(row, /aria-label="CPU admission 6000 millicores \/ 8000 millicores/);
+  t.assert.match(visibleText(html({ state }, <WorkerDetail w={measured} state={state} />)), expected);
+
+  const { reserved: _reserved, capacity: _capacity, ...unknown } = measured;
+  const missing = { ...live, workers: [unknown] };
+  const unknownTotals = /CPU admission — \/ — · memory — \/ — reserved \/ capacity/;
+  const unknownRow = visibleText(html({ state: missing }, <Workers />));
+  t.assert.match(unknownRow, /CPU — \/ — mCPU/);
+  t.assert.match(unknownRow, /Memory — \/ —/);
+  t.assert.match(visibleText(html({ state: missing }, <WorkerDetail w={unknown} state={missing} />)), unknownTotals);
+
+  const zero = { ...unknown, reserved: { cpuMillicores: 0, memory: 0 } };
+  const partial = { ...live, workers: [zero] };
+  const partialRow = visibleText(html({ state: partial }, <Workers />));
+  t.assert.match(partialRow, /CPU 0 \/ — mCPU/);
+  t.assert.match(partialRow, /Memory 0 B \/ —/);
+  t.assert.match(visibleText(html({ state: partial }, <WorkerDetail w={zero} state={partial} />)), /CPU admission 0 millicores \/ — · memory 0 B \/ —/);
+});
+
+test("action lists and worker detail show admitted and learned reservations", (t) => {
+  const worker = live.workers[0];
+  const running = live.actions?.running[0];
+  const queued = cold.actions?.queued[0];
+  if (!worker || !running || !queued || !live.actions) throw new Error("the recordings have a worker and actions");
+  const { reservation: _reservation, learnedReservation: _learnedReservation, ...unknownAction } = running;
+  const state = {
+    ...live,
+    actions: {
+      ...live.actions,
+      running: [
+        { ...running, worker: worker.name, reservation: { cpuMillicores: 2000, memory: 1024 ** 3 }, learnedReservation: { cpuMillicores: 4000, memory: 2 * 1024 ** 3 } },
+        { ...unknownAction, name: "actions/unknown", worker: worker.name },
+      ],
+      queued: [{ ...queued, reservation: { cpuMillicores: 0, memory: 0 }, learnedReservation: { cpuMillicores: 3000, memory: 1024 ** 3 } }],
+    },
+  };
+  const list = visibleText(html({ state }, <Actions />));
+  const detail = visibleText(html({ state }, <WorkerDetail w={worker} state={state} />));
+  const fitted = /Reservation: 2000 millicores CPU · 1 GiB memory · Learned: 4000 millicores CPU · 2 GiB memory/;
+  t.assert.match(list, fitted);
+  t.assert.match(detail, fitted);
+  t.assert.match(list, /Reservation: 0 millicores CPU · 0 B memory · Learned: 3000 millicores CPU · 1 GiB memory/);
+  t.assert.match(list, /Reservation: —/);
+  t.assert.match(detail, /Reservation: —/);
+});
+
 test("open worker detail names running actions and falls back to the digest", (t) => {
   const worker = live.workers[0];
   const action = live.actions?.running[0];
@@ -646,6 +704,78 @@ test("a restarted server shows the time before its first sample as not recorded,
   for (const label of ["Done per minute", "Executing", "Queued"]) {
     t.assert.match(chart(markup, label), /spark__unrecorded/, label);
   }
+});
+
+test("startup distinguishes an unrecorded first step from an incomplete outage", (t) => {
+  const base = recentState(1);
+  const pending = { ...base, recent: { ...base.recent, samples: base.recent.samples.map((s) => ({ ...s, schedulerKnown: false })) } };
+  t.assert.match(visibleText(html({ state: pending }, <Overview />)), /not recorded yet/);
+  const outage = { ...pending, schedulerKnown: false };
+  t.assert.match(visibleText(html({ state: outage }, <Overview />)), /not available/);
+  const recovered = { ...pending, schedulerKnown: true };
+  t.assert.match(visibleText(html({ state: recovered }, <Overview />)), /not available/);
+});
+
+test("live scheduler readouts recover without resetting incomplete charts", (t) => {
+  const base = recentState(4);
+  const samples = base.recent.samples.map((s, i) => ({ ...s, schedulerKnown: i !== 3 }));
+  const outage = { ...base, schedulerKnown: false, queue: { ...base.queue, total: 17 }, recent: { ...base.recent, window: "40s", samples } };
+  const recovered = { ...outage, schedulerKnown: true };
+  const before = html({ state: outage }, <Overview />);
+  const after = html({ state: recovered }, <Overview />);
+  t.assert.match(visibleText(before), /Queue\s+unknown/);
+  t.assert.match(visibleText(after), /Queue\s+17/);
+  t.assert.doesNotMatch(visibleText(after), /Executing\s+unknown/);
+  for (const label of ["Queued", "Executing", "Done per minute", "Evicted per step"]) {
+    t.assert.equal(chart(after, label), chart(before, label), label);
+    t.assert.match(chart(after, label), /spark__unknown/, label);
+  }
+  t.assert.match(visibleText(before), /Used unknown/);
+  t.assert.doesNotMatch(visibleText(after), /Used unknown/);
+  const workersBefore = visibleText(html({ state: outage }, <Workers />));
+  const workersAfter = visibleText(html({ state: recovered }, <Workers />));
+  t.assert.match(workersBefore, /Scheduler unknown/);
+  t.assert.doesNotMatch(workersAfter, /Scheduler unknown/);
+});
+
+test("an interior scheduler outage is hatched without interrupting local cache or changing the chart timeline", (t) => {
+  const base = recentState(4);
+  const samples = base.recent.samples.map((sample, i) => ({
+    ...sample, schedulerKnown: i !== 1, lookups: 10, hits: 5, evictedBytes: 10,
+  }));
+  const state = { ...base, recent: { ...base.recent, window: "40s", samples } };
+  const markup = html({ state }, <Overview />);
+  for (const label of ["Queued", "Executing", "Done per minute", "Evicted per step"]) {
+    const svg = chart(markup, label);
+    t.assert.match(svg, /viewBox="0 0 300 44"/, label);
+    t.assert.match(svg, /class="spark__unknown"[^>]*><title>scheduler unknown<\/title>/, label);
+    t.assert.match(svg, /class="spark__run" d="[^"]*M[^"]*M/, label);
+  }
+  const cache = chart(markup, "Action-cache lookups as area and hits as line per step");
+  t.assert.doesNotMatch(cache, /spark__unknown/);
+  t.assert.equal((/<path class="spark__run" d="([^"]*)"/.exec(cache)?.[1]?.match(/[ML]/g) ?? []).length, 4);
+  t.assert.match(markup, /Done \/ min<\/h2><div class="readout__big"><span class="num live">–<\/span>/);
+  t.assert.match(visibleText(markup), /Evicted \(window, all stores\) unknown/);
+  const outage = { ...state, recent: { ...state.recent, samples: samples.map((s, i) => ({ ...s, schedulerKnown: i !== 3 })) } };
+  const outageText = visibleText(html({ state: outage }, <Overview />));
+  t.assert.match(outageText, /Queue\s+unknown/);
+  t.assert.match(outageText, /Executing\s+unknown/);
+});
+
+test("worker lanes mark an interior scheduler outage and resume the original phase", (t) => {
+  const base = recentState(4);
+  const worker = base.workers[0];
+  if (!worker) throw new Error("the live recording has a worker");
+  const first = base.recent.samples[0]!;
+  const state = {
+    ...base,
+    workers: [{ ...worker, launchTime: first.start, phaseTime: first.start, phases: [{ phase: "BUSY" as const, start: first.start }] }],
+    recent: { ...base.recent, window: "40s", samples: base.recent.samples.map((s, i) => ({ ...s, schedulerKnown: i !== 1 })) },
+  };
+  const markup = html({ state }, <Workers />);
+  t.assert.match(markup, /lane__seg--busy/);
+  t.assert.match(markup, /lane__seg--unrecorded" title="scheduler unknown"/);
+  t.assert.match(markup, /Phase history: (?:off, )?busy, scheduler unknown/);
 });
 
 test("isolated chart markers stay entirely inside their viewBox", (t: TestContext) => {

@@ -251,8 +251,8 @@ flaw! { unplaceable_hangs: unplaceable(unplaceable = Unplaceable::Hangs) => only
 flaw! { unplaceable_serving_stops: unplaceable(guard_serving = GuardServing::Stops) => only [names::disk_guard::SERVING] }
 flaw! { oversized_enrolls: oversized(fleet_disk = FleetDiskCheck::Enrolls) => only [names::oversized_fleet::WORKER_REFUSES, names::oversized_fleet::NO_WORKER_ENROLLS] }
 flaw! { oversized_unexplained: oversized(fleet_disk = FleetDiskCheck::Unexplained) => only [names::oversized_fleet::WORKER_REFUSES] }
-flaw! { oversized_exit_missing: oversized(fleet_exit = FleetExit::Missing) => only [names::oversized_fleet::WORKER_REFUSES] }
-flaw! { oversized_exit_wrong_failure: oversized(fleet_exit = FleetExit::WrongFailure) => only [names::oversized_fleet::WORKER_REFUSES] }
+flaw! { oversized_exit_missing: oversized(fleet_exit = FleetExit::Missing) => only [names::oversized_fleet::WORKER_REFUSES, names::oversized_fleet::NO_WORKER_ENROLLS] }
+flaw! { oversized_exit_wrong_failure: oversized(fleet_exit = FleetExit::WrongFailure) => only [names::oversized_fleet::WORKER_REFUSES, names::oversized_fleet::NO_WORKER_ENROLLS] }
 flaw! { cold_cold_start_listens: cold(cold_start = ColdStartExit::Listens) => only [names::cold_start::REFUSED, names::cold_start::EXIT_CODE, names::cold_start::MESSAGE] }
 flaw! { cold_cold_start_wrong_code: cold(cold_start = ColdStartExit::WrongCode) => only [names::cold_start::EXIT_CODE] }
 flaw! { cold_cold_start_unnamed: cold(cold_start = ColdStartExit::Unnamed) => only [names::cold_start::MESSAGE] }

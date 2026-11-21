@@ -76,6 +76,7 @@ export const applyDelta = (state: State, delta: Delta): Applied => {
       ...(actions === undefined ? {} : { actions }),
       seq: delta.seq,
       updateTime: delta.updateTime,
+      ...(delta.schedulerKnown !== undefined ? { schedulerKnown: delta.schedulerKnown } : {}),
       pass: delta.pass ?? state.pass,
       queue: delta.queue ?? state.queue,
       cache: delta.cache ?? state.cache,

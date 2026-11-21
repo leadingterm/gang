@@ -15,6 +15,14 @@ const apply = (state: State, delta: Delta): State => {
   return applied.kind === "applied" ? applied.state : state;
 };
 
+test("scheduler availability deltas replace both true and false and preserve omitted values", () => {
+  const failed = apply(snapshot, after(snapshot, { schedulerKnown: false }));
+  assert.equal(failed.schedulerKnown, false);
+  const recovered = apply(failed, after(failed, { schedulerKnown: true }));
+  assert.equal(recovered.schedulerKnown, true);
+  assert.equal(apply(recovered, after(recovered)).schedulerKnown, true);
+});
+
 const ascending = (keys: readonly string[]): boolean => keys.every((k, i) => i === 0 || (keys[i - 1] ?? "") < k);
 
 const seqOf = (e: ScalingEvent): number => Number(idOf(e.name));

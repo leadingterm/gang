@@ -1,6 +1,14 @@
 //! Resource-based scaling and projected reservation timelines.
 //!
 //! `Capacity::instances` is the census's authoritative usable set.
+//!
+//! Expected wait is an optional, exact reservation simulation, not scaling input.
+//! Its work is capped at 128 units per actual queued action, executing action and
+//! projected instance (never the configured instance maximum). Units include
+//! instance probes, event visits, insertion comparisons and shifted events,
+//! including insertion of running reservations. Exhaustion omits every fleet's
+//! estimate for the pass; demand, rescue, N-1 and running completion stay exact.
+//! Scratch storage is retained and the allowance resets on the next pass.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -113,6 +121,46 @@ struct Event {
     resources: Reservation,
 }
 
+/// A deterministic ceiling on display-only work, not a scheduling policy knob.
+const PROJECTION_WORK_PER_INPUT: usize = 128;
+
+#[derive(Debug, Default)]
+struct ProjectionWork {
+    remaining: usize,
+    exhausted: bool,
+    #[cfg(test)]
+    event_visits: usize,
+    #[cfg(test)]
+    insertion_comparisons: usize,
+    #[cfg(test)]
+    shifted_events: usize,
+    #[cfg(test)]
+    instance_probes: usize,
+}
+
+impl ProjectionWork {
+    fn new(inputs: usize) -> Self {
+        Self {
+            remaining: inputs.saturating_mul(PROJECTION_WORK_PER_INPUT),
+            ..Self::default()
+        }
+    }
+
+    fn add_instance(&mut self) {
+        // Never revive a partially built timeline after exhaustion.
+        self.remaining = self.remaining.saturating_add(PROJECTION_WORK_PER_INPUT);
+    }
+
+    fn charge(&mut self, units: usize) -> bool {
+        if self.exhausted || units > self.remaining {
+            self.exhausted = true;
+            return false;
+        }
+        self.remaining -= units;
+        true
+    }
+}
+
 #[derive(Debug)]
 struct DispatchInstance {
     fleet: usize,
@@ -123,39 +171,100 @@ struct DispatchInstance {
 }
 
 impl DispatchInstance {
-    fn event(&mut self, event: Event) {
+    fn event(&mut self, event: Event, work: &mut ProjectionWork) {
         let key = (event.at, event.reserve);
-        let index = self
-            .events
-            .partition_point(|entry| (entry.at, entry.reserve) <= key);
-        if let Some(existing) = index
-            .checked_sub(1)
-            .and_then(|previous| self.events.get_mut(previous))
-            && (existing.at, existing.reserve) == key
-        {
-            existing.resources = existing.resources.add(event.resources);
+        let mut low = 0;
+        let mut high = self.events.len();
+        while low < high {
+            if !work.charge(1) {
+                return;
+            }
+            let middle = low + (high - low) / 2;
+            #[cfg(test)]
+            {
+                work.event_visits += 1;
+                work.insertion_comparisons += 1;
+            }
+            if (self.events[middle].at, self.events[middle].reserve) <= key {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        let index = low;
+        if index > 0 {
+            if !work.charge(1) {
+                return;
+            }
+            #[cfg(test)]
+            {
+                work.event_visits += 1;
+            }
+            let existing = &mut self.events[index - 1];
+            if (existing.at, existing.reserve) == key {
+                existing.resources = existing.resources.add(event.resources);
+                return;
+            }
+        }
+        let shifted = self.events.len() - index;
+        if !work.charge(shifted.saturating_add(1)) {
             return;
+        }
+        #[cfg(test)]
+        {
+            work.shifted_events += shifted;
         }
         self.events.insert(index, event);
     }
 
-    fn reserve(&mut self, start: Duration, end: Duration, resources: Reservation) {
-        if resources == Reservation::default() || start == end {
+    fn reserve_bounded(
+        &mut self,
+        start: Duration,
+        end: Duration,
+        resources: Reservation,
+        work: &mut ProjectionWork,
+    ) {
+        if !work.charge(1) || resources == Reservation::default() || start == end {
             return;
         }
-        self.event(Event {
-            at: start,
-            reserve: true,
-            resources,
-        });
-        self.event(Event {
-            at: end,
-            reserve: false,
-            resources,
-        });
+        self.event(
+            Event {
+                at: start,
+                reserve: true,
+                resources,
+            },
+            work,
+        );
+        if !work.exhausted {
+            self.event(
+                Event {
+                    at: end,
+                    reserve: false,
+                    resources,
+                },
+                work,
+            );
+        }
     }
 
-    fn earliest(&self, demand: Reservation, duration: Duration) -> Option<Duration> {
+    fn event_at(&self, index: usize, work: &mut ProjectionWork) -> Option<&Event> {
+        if !work.charge(1) {
+            return None;
+        }
+        let event = self.events.get(index);
+        #[cfg(test)]
+        if event.is_some() {
+            work.event_visits += 1;
+        }
+        event
+    }
+
+    fn earliest_bounded(
+        &self,
+        demand: Reservation,
+        duration: Duration,
+        work: &mut ProjectionWork,
+    ) -> Option<Duration> {
         if !demand.fits(Reservation::default(), self.capacity) {
             return None;
         }
@@ -167,25 +276,44 @@ impl DispatchInstance {
         let mut candidate = None;
         let mut now = self.ready_after;
         loop {
-            while let Some(event) = self.events.get(index).filter(|event| event.at <= now) {
-                occupied = if event.reserve {
-                    occupied.add(event.resources)
-                } else {
-                    occupied.sub(event.resources)
-                };
-                index += 1;
-            }
+            let next = loop {
+                let next = self.event_at(index, work);
+                if work.exhausted {
+                    return None;
+                }
+                match next {
+                    Some(event) if event.at <= now => {
+                        occupied = if event.reserve {
+                            occupied.add(event.resources)
+                        } else {
+                            occupied.sub(event.resources)
+                        };
+                        index += 1;
+                    }
+                    _ => break next,
+                }
+            };
             if demand.fits(occupied, self.capacity) {
                 let start = *candidate.get_or_insert(now);
-                match self.events.get(index) {
+                match next {
                     Some(event) if event.at.saturating_sub(start) < duration => {}
                     _ => return Some(start),
                 }
             } else {
                 candidate = None;
             }
-            now = self.events.get(index)?.at;
+            now = next?.at;
         }
+    }
+
+    #[cfg(test)]
+    fn reserve(&mut self, start: Duration, end: Duration, resources: Reservation) {
+        self.reserve_bounded(start, end, resources, &mut ProjectionWork::new(10_000));
+    }
+
+    #[cfg(test)]
+    fn earliest(&self, demand: Reservation, duration: Duration) -> Option<Duration> {
+        self.earliest_bounded(demand, duration, &mut ProjectionWork::new(10_000))
     }
 }
 
@@ -194,6 +322,7 @@ struct Dispatch {
     instances: Vec<DispatchInstance>,
     active: usize,
     waits: Vec<Option<Duration>>,
+    work: ProjectionWork,
 }
 
 impl Dispatch {
@@ -206,12 +335,19 @@ impl Dispatch {
             instances: Vec::with_capacity(capacity),
             active: 0,
             waits: vec![None; fleets.len()],
+            work: ProjectionWork::default(),
         }
     }
 
-    fn clear(&mut self) {
+    fn clear(&mut self, snapshot: &SchedulerSnapshot) {
         self.active = 0;
         self.waits.fill(None);
+        self.work = ProjectionWork::new(
+            snapshot
+                .queued
+                .len()
+                .saturating_add(snapshot.executing.len()),
+        );
     }
 
     fn add_instance(
@@ -221,6 +357,7 @@ impl Dispatch {
         capacity: Reservation,
     ) -> usize {
         let index = self.active;
+        self.work.add_instance();
         self.active += 1;
         if let Some(instance) = self.instances.get_mut(index) {
             instance.fleet = fleet;
@@ -248,6 +385,9 @@ impl Dispatch {
         rates: &SourceRates,
     ) {
         for (index, action) in snapshot.queued.iter().enumerate() {
+            if !self.work.charge(1) {
+                break;
+            }
             let Some(attributed) = attribution.get(index).copied().flatten() else {
                 continue;
             };
@@ -258,21 +398,42 @@ impl Dispatch {
             let duration = rates.queued_duration(index);
             let mut best = None;
             for (instance, worker) in self.instances[..self.active].iter().enumerate() {
+                if !self.work.charge(1) {
+                    break;
+                }
+                #[cfg(test)]
+                {
+                    self.work.instance_probes += 1;
+                }
                 if !worker.enabled || !candidates.contains(worker.fleet) {
                     continue;
                 }
-                if let Some(at) = worker.earliest(demand, duration)
+                if let Some(at) = worker.earliest_bounded(demand, duration, &mut self.work)
                     && best.as_ref().is_none_or(|(earliest, _)| at < *earliest)
                 {
                     best = Some((at, instance));
                 }
+                if self.work.exhausted {
+                    break;
+                }
+            }
+            if self.work.exhausted {
+                break;
             }
             if let Some((at, instance)) = best {
                 if let Some(wait) = self.waits.get_mut(attributed) {
                     *wait = Some(wait.unwrap_or(Duration::ZERO).max(at));
                 }
-                self.instances[instance].reserve(at, at.saturating_add(duration), demand);
+                self.instances[instance].reserve_bounded(
+                    at,
+                    at.saturating_add(duration),
+                    demand,
+                    &mut self.work,
+                );
             }
+        }
+        if self.work.exhausted {
+            self.waits.fill(None);
         }
     }
 }
@@ -400,7 +561,7 @@ impl WorkPlanner {
     }
 
     fn reset(&mut self, snapshot: &SchedulerSnapshot) {
-        self.dispatch.clear();
+        self.dispatch.clear(snapshot);
         self.capacities.fill(CapacityVector::default());
         self.serving_capacities.fill(CapacityVector::default());
         self.serving.fill(0);
@@ -573,11 +734,15 @@ impl WorkPlanner {
                         physical_booting = physical_booting.saturating_add(1);
                     }
                     for release in &self.releases {
-                        self.dispatch.instances[dispatch_instance].reserve(
+                        self.dispatch.instances[dispatch_instance].reserve_bounded(
                             Duration::ZERO,
                             release.after,
                             release.occupied,
+                            &mut self.dispatch.work,
                         );
+                        if self.dispatch.work.exhausted {
+                            break;
+                        }
                     }
                 }
             }
@@ -787,6 +952,8 @@ mod tests {
             environment: Some(policy.action_environment.clone()),
             running_actions: running,
             max_inflight_actions: Some(nonzero_u32(cap)),
+            capacity: None,
+            reserved: None,
             draining: false,
             paused: false,
             last_seen: Timestamp::from_unix_millis(1_000_000),
@@ -1627,6 +1794,185 @@ mod tests {
             );
             assert!(scene.planner.removal(0, 0).is_none());
         }
+    }
+
+    fn large_resource_queue_omits_only_wait(dimension: ScalingDimension) {
+        const QUEUED: usize = 100_000;
+        const MEMBERS: usize = 4;
+        let p = policy("workers");
+        let prefix = policy("prefix");
+        let mut scene = Scene::new(vec![p.clone(), prefix.clone()], ScalingConfig::default());
+        let mut workers = Vec::new();
+        for name in ["first", "second", "third", "fourth"] {
+            scene.member(0, name, InstanceLifecycle::InService, true);
+            workers.push(worker(&p, name, 0, 16));
+        }
+        scene.member(1, "prefix", InstanceLifecycle::InService, true);
+        workers.push(worker(&prefix, "prefix", 0, 16));
+        // Failed launches leave several compatible workers and a long serial
+        // backlog, rather than masking event scans with new empty instances.
+        scene.fleets[0].supply.launch_failure = Some(LaunchFailure {
+            reason: "unavailable".into(),
+        });
+        let mut waiting: Vec<_> = (0..QUEUED)
+            .map(|index| {
+                let mut action = queued(
+                    &[0],
+                    Some(Duration::from_secs(1 + u64::try_from(index % 17).unwrap())),
+                );
+                match dimension {
+                    ScalingDimension::Memory => {
+                        action.resources.memory = p.memory_per_instance.get();
+                    }
+                    ScalingDimension::Disk => action.resources.disk = p.disk_per_instance.get(),
+                    ScalingDimension::Cpu => panic!("test requires a physical resource"),
+                }
+                action
+            })
+            .collect();
+        waiting.insert(0, queued(&[1], Some(Duration::from_secs(1))));
+        let attribution: Vec<_> = std::iter::once(Some(1))
+            .chain(std::iter::repeat_n(Some(0), QUEUED))
+            .collect();
+        scene.snapshot(
+            SchedulerSnapshot {
+                workers: workers.clone(),
+                queued: waiting,
+                ..SchedulerSnapshot::default()
+            },
+            &attribution,
+        );
+        scene.run(&[Some(Duration::from_secs(45)); 2]);
+        let dispatch = &scene.planner.dispatch;
+        let measured = &dispatch.work;
+        let bound = PROJECTION_WORK_PER_INPUT * (QUEUED + 1 + MEMBERS + 1);
+        assert!(measured.exhausted);
+        // These counters observe actual event reads, comparisons and Vec shifts
+        // at their sites, independently of the allowance's remaining value.
+        assert!(measured.event_visits > QUEUED);
+        assert!(
+            measured.event_visits + measured.shifted_events + measured.instance_probes <= bound
+        );
+        assert!(
+            dispatch.instances[..MEMBERS]
+                .iter()
+                .all(|instance| !instance.events.is_empty())
+        );
+        assert!(dispatch.waits.iter().all(Option::is_none));
+        assert!(
+            scene
+                .fleets
+                .iter()
+                .all(|fleet| fleet.outlook.expected_wait.is_none())
+        );
+        assert_eq!(scene.fleets[0].outlook.needed, 20);
+        assert_eq!(scene.planner.work(0), 20);
+        let decision = scene.planner.scale_decision(0);
+        assert_eq!(decision.dimension, dimension);
+        assert_eq!(decision.demand.get().to_bits(), 100_000.0_f64.to_bits());
+        assert_eq!(decision.capacity.get().to_bits(), 4.0_f64.to_bits());
+        assert_eq!(decision.extra_instances, 16);
+        assert!(scene.planner.removal(0, 0).is_none());
+
+        let mut action = queued(&[0], Some(Duration::from_secs(3)));
+        action.resources.memory = p.memory_per_instance.get();
+        scene.snapshot(
+            SchedulerSnapshot {
+                workers,
+                queued: vec![action],
+                ..SchedulerSnapshot::default()
+            },
+            &[Some(0)],
+        );
+        scene.run(&[Some(Duration::from_secs(45)); 2]);
+        assert!(!scene.planner.dispatch.work.exhausted);
+        assert!(scene.planner.dispatch.work.event_visits < PROJECTION_WORK_PER_INPUT);
+        assert_eq!(scene.fleets[0].outlook.expected_wait, Some(Duration::ZERO));
+        assert_eq!(scene.fleets[0].outlook.needed, 1);
+    }
+
+    #[test]
+    fn large_full_memory_queue_has_linear_display_work() {
+        large_resource_queue_omits_only_wait(ScalingDimension::Memory);
+    }
+
+    #[test]
+    fn large_full_disk_queue_has_linear_display_work() {
+        large_resource_queue_omits_only_wait(ScalingDimension::Disk);
+    }
+
+    #[test]
+    fn running_backfill_shifts_are_bounded_without_losing_completion() {
+        const EXECUTING: usize = 4096;
+        let p = policy("workers");
+        let mut scene = Scene::new(vec![p.clone()], ScalingConfig::default());
+        for name in ["busy", "later", "last"] {
+            scene.member(0, name, InstanceLifecycle::InService, true);
+        }
+        scene.fleets[0].supply.launch_failure = Some(LaunchFailure {
+            reason: "unavailable".into(),
+        });
+        // Execution links are traversed in reverse. Distinct descending ends
+        // repeatedly backfill the release vector, requiring real Vec shifts.
+        let mut running: Vec<_> = (0..EXECUTING)
+            .map(|index| {
+                let mut action = executing(
+                    0,
+                    Some(Duration::from_secs(u64::try_from(index + 1).unwrap())),
+                );
+                action.resources.cpu_millicores = 1 + u64::try_from(index % 3).unwrap();
+                action.resources.memory =
+                    gang_types::Bytes::new(1 + u64::try_from(index % 5).unwrap());
+                action.resources.disk =
+                    gang_types::Bytes::new(1 + u64::try_from(index % 7).unwrap());
+                action
+            })
+            .collect();
+        running.push(executing(2, Some(Duration::from_secs(99_999))));
+        let waiting: Vec<_> = (0..8)
+            .map(|index| {
+                let mut action = queued(&[0], Some(Duration::from_secs(index + 1)));
+                action.resources.memory = p.memory_per_instance.get();
+                action
+            })
+            .collect();
+        scene.snapshot(
+            SchedulerSnapshot {
+                workers: vec![
+                    worker(&p, "busy", u32::try_from(EXECUTING).unwrap(), 16),
+                    worker(&p, "later", 0, 16),
+                    worker(&p, "last", 1, 16),
+                ],
+                executing: running,
+                queued: waiting,
+                ..SchedulerSnapshot::default()
+            },
+            &[Some(0); 8],
+        );
+        scene.run(&[Some(Duration::from_secs(45))]);
+        let work = &scene.planner.dispatch.work;
+        assert!(work.exhausted);
+        assert!(work.shifted_events > EXECUTING);
+        assert!(work.insertion_comparisons > 0);
+        assert!(
+            work.event_visits + work.shifted_events + work.instance_probes
+                <= PROJECTION_WORK_PER_INPUT * (EXECUTING + 1 + 8 + 3)
+        );
+        assert!(scene.planner.dispatch.waits.iter().all(Option::is_none));
+        assert_eq!(scene.fleets[0].outlook.expected_wait, None);
+        assert_eq!(
+            scene.planner.instance_view(0, 0).unwrap().empty_after,
+            Duration::from_secs(u64::try_from(EXECUTING).unwrap())
+        );
+        assert_eq!(
+            scene.planner.instance_view(0, 2).unwrap().empty_after,
+            Duration::from_secs(99_999)
+        );
+        assert_eq!(
+            scene.planner.scale_decision(0).needed,
+            scene.planner.work(0)
+        );
+        assert!(scene.planner.removal(0, 2).is_none());
     }
 
     #[test]

@@ -1156,9 +1156,12 @@ fn pool_oom_checks(ctx: &RunContext<'_>) -> Vec<Check> {
     }
     attempt(Scenario::PoolOom, || {
         let policy = crate::execution::ResourcePolicy::pool_oom_scenario()?;
+        // Fleet reservations are capped at the configured memory after its reserve.
         let capacity = policy
             .fleet_memory
-            .ok_or_else(|| crate::E2eError::system("pool OOM fixture has no fleet capacity"))?;
+            .ok_or_else(|| crate::E2eError::system("pool OOM fixture has no fleet capacity"))?
+            .get()
+            .saturating_sub(policy.memory.reserve.get());
         let escalation_percent = policy.memory.escalation_percent.get();
         let execution = ExecutionKnobs {
             resource_policy: Some(policy),
@@ -1172,7 +1175,7 @@ fn pool_oom_checks(ctx: &RunContext<'_>) -> Vec<Check> {
         };
         let stack = Stack::create(ctx.inputs, &variant, Transport::Tls, ctx.issuer)?;
         let exec = Observer::new(&stack, &ctx.inputs.settings)?;
-        crate::oom::pool_oom(&stack, &exec, escalation_percent, capacity.as_u64() / 1024)
+        crate::oom::pool_oom(&stack, &exec, escalation_percent, capacity.get() / 1024)
     })
 }
 

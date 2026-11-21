@@ -2150,6 +2150,13 @@ impl System for Cluster<'_> {
     fn build(&self, probes: &[Probe]) -> Result<BuildOutcome> {
         self.stack.build(probes)
     }
+    fn build_until_stopped(
+        &self,
+        probes: &[Probe],
+        stop: tokio::sync::oneshot::Receiver<String>,
+    ) -> Result<BuildOutcome> {
+        self.stack.build_until_stopped(probes, stop)
+    }
     fn build_run(&self, probes: &[Probe], run: &Run) -> Result<BuildOutcome> {
         self.stack.build_run(probes, run)
     }

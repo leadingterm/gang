@@ -109,7 +109,7 @@ pub struct FleetPolicy {
     pub instances: InstanceBounds,
     /// CPU cores of one worker.
     pub vcpus_per_instance: NonZeroU32,
-    /// Memory of one worker. Non-zero.
+    /// Estimated action memory available per worker after the configured reserve. Non-zero.
     pub memory_per_instance: NonZeroBytes,
     /// A lower bound of the disk the actions of one worker may hold in total, valid for every
     /// instance type the fleet may launch: scratch capacity less the fast content store's budget

@@ -3150,7 +3150,7 @@
     },
     "@@rules_tf+//tf:extensions.bzl%tf_repositories": {
       "os:linux,arch:aarch64": {
-        "bzlTransitiveDigest": "rhMBZ1XsTYpPYTjjQiG1anqV1rx+OensWN4Zk1cgZHs=",
+        "bzlTransitiveDigest": "B4d+kUSiV11ayHLPhjCOSSFRM8/OTHH/82U0SpKVWSE=",
         "usagesDigest": "i9Yi2VJiJ57KSaIci99Pq67hN39IVgFQ41mlf6WX0YA=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
@@ -3221,7 +3221,7 @@
         ]
       },
       "os:linux,arch:amd64": {
-        "bzlTransitiveDigest": "rhMBZ1XsTYpPYTjjQiG1anqV1rx+OensWN4Zk1cgZHs=",
+        "bzlTransitiveDigest": "B4d+kUSiV11ayHLPhjCOSSFRM8/OTHH/82U0SpKVWSE=",
         "usagesDigest": "i9Yi2VJiJ57KSaIci99Pq67hN39IVgFQ41mlf6WX0YA=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
@@ -3292,7 +3292,7 @@
         ]
       },
       "os:osx,arch:aarch64": {
-        "bzlTransitiveDigest": "rhMBZ1XsTYpPYTjjQiG1anqV1rx+OensWN4Zk1cgZHs=",
+        "bzlTransitiveDigest": "B4d+kUSiV11ayHLPhjCOSSFRM8/OTHH/82U0SpKVWSE=",
         "usagesDigest": "i9Yi2VJiJ57KSaIci99Pq67hN39IVgFQ41mlf6WX0YA=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},

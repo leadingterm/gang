@@ -1180,7 +1180,7 @@ fn parses_a_complete_file_into_typed_values() -> Result<(), Box<dyn Error>> {
     assert_eq!(fleet.policy.name.as_str(), "local-worker-x86-64");
     assert_eq!(fleet.policy.isa, Isa::X86_64);
     assert_eq!(fleet.sandbox, SandboxKey::Bwrap);
-    assert_eq!(fleet.policy.memory_per_instance, NonZeroBytes::gib(8));
+    assert_eq!(fleet.policy.memory_per_instance, NonZeroBytes::gib(7));
     assert_eq!(fleet.policy.disk_per_instance, NonZeroBytes::gib(100));
     assert_eq!(fleet.policy.idle_timeout, Duration::from_secs(15));
     assert!(
@@ -2304,7 +2304,7 @@ fn fleet_config_builds_the_fleet() -> Result<(), Box<dyn Error>> {
     assert_eq!(fleet.name.as_str(), "local-worker-x86-64");
     assert_eq!(fleet.isa, Isa::X86_64);
     assert_eq!(fleet.instance.vcpus, 4);
-    assert_eq!(fleet.instance.memory, Bytes::new(8 * 1024 * 1024 * 1024));
+    assert_eq!(fleet.instance.memory, Bytes::new(7 * 1024 * 1024 * 1024));
     assert!(matches!(fleet.options, FleetOptions::Local(_)));
     Ok(())
 }
@@ -2351,7 +2351,7 @@ fn parses_fleets_in_preference_order() -> Result<(), Box<dyn Error>> {
     assert_eq!(catalog.fleets()[0].get("ISA"), Some("x86-64"));
     assert_eq!(catalog.fleets()[0].get("sandbox"), Some("bwrap"));
     assert_eq!(catalog.fleets()[0].get("cpu_count"), Some("8"));
-    assert_eq!(catalog.fleets()[0].get("memory_kb"), Some("30408704"));
+    assert_eq!(catalog.fleets()[0].get("memory_kb"), Some("29360128"));
     assert_eq!(catalog.fleets()[0].get("capacity"), Some("spot"));
     assert_eq!(catalog.fleets()[1].get("fleet"), Some("arm64-on-demand"));
     assert_eq!(catalog.fleets()[1].get("sandbox"), Some("noop"));

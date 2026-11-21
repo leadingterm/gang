@@ -34,11 +34,17 @@ pub enum PassStatus<'a> {
         applied: u32,
         /// The number of fleet changes that failed.
         failed: u32,
-        /// The indexed scheduler snapshot the pass was reconciled with.
-        hosted: &'a HostedSnapshot,
     },
     /// The pass was skipped for the given reason.
     Skipped(SkipReason),
+    /// An independent observation, without a completed or skipped control pass.
+    Observed {
+        /// Fresh scheduler snapshot, or `None` when unavailable.
+        hosted: Option<&'a HostedSnapshot>,
+        /// Whether a complete supply has been read successfully for each fleet, in fleet order.
+        /// A later failed read retains the last successful supply.
+        supplies: &'a [bool],
+    },
 }
 
 /// A sample of the scheduler's actions, taken at a known time.
