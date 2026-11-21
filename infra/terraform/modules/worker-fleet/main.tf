@@ -234,7 +234,7 @@ resource "aws_autoscaling_group" "this" {
 
     precondition {
       condition     = length(local.fleet_subnet_ids[each.value.fleet]) >= local.fleets[each.value.fleet].minimum_availability_zones
-      error_message = "Fleet ${each.value.fleet}: minimum ${local.fleets[each.value.fleet].minimum_availability_zones} availability zones required, selected ${length(local.fleet_subnet_ids[each.value.fleet])}; missing type/AZ offerings: ${join(", ", local.fleet_missing_offerings[each.value.fleet])}."
+      error_message = "Fleet ${each.value.fleet}: minimum ${local.fleets[each.value.fleet].minimum_availability_zones} availability zones required, selected ${length(local.fleet_subnet_ids[each.value.fleet])}; ${length(local.fleet_missing_offerings[each.value.fleet]) > 0 ? "missing type/AZ offerings: ${join(", ", local.fleet_missing_offerings[each.value.fleet])}." : "all supplied zones offer all instance types, but only ${length(var.subnet_ids)} allowed AZs were supplied; add subnets or lower the minimum."}"
     }
   }
 }

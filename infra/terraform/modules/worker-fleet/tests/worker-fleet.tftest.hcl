@@ -1213,6 +1213,39 @@ run "default_minimum_rejects_one_common_zone" {
   expect_failures = [aws_autoscaling_group.this]
 }
 
+run "rejects_too_few_supplied_zones_without_offering_gaps" {
+  command = plan
+
+  variables {
+    subnet_ids = {
+      "eu-north-1a" = "subnet-a"
+    }
+    fleets = [{
+      name                       = "arm"
+      capacity                   = "spot"
+      ami_id                     = "ami-0000000000000002"
+      instance_types             = ["c7gd.4xlarge", "m7g.2xlarge"]
+      max_instances              = 4
+      minimum_availability_zones = 2
+    }]
+  }
+
+  override_data {
+    target = data.aws_ec2_instance_type_offerings.this
+    values = {
+      instance_types = ["c7gd.4xlarge", "m7g.2xlarge"]
+      locations      = ["eu-north-1a", "eu-north-1a"]
+    }
+  }
+
+  expect_failures = [aws_autoscaling_group.this]
+
+  assert {
+    condition     = length(local.fleet_missing_offerings["arm"]) == 0
+    error_message = "Every fleet type must be offered in the supplied zone."
+  }
+}
+
 run "rejects_zero_minimum_availability_zones" {
   command = plan
   variables {

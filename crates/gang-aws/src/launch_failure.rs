@@ -4,71 +4,60 @@
 //! candidates are exhausted. Multiple failures can establish exhaustion only when
 //! they cover every configured candidate since the latest launch progress.
 
+use std::borrow::Cow;
+
 use aws_sdk_autoscaling::types::{Activity, ScalingActivityStatusCode};
 
-/// Returns whether this activity provides positive evidence that growth is blocked.
-pub(crate) fn blocks_growth(activity: &Activity, candidate_count: Option<usize>) -> bool {
-    if activity.status_code() != Some(&ScalingActivityStatusCode::Failed)
-        || !activity
-            .description()
-            .is_some_and(|description| description.starts_with("Launching a new EC2 instance"))
-    {
-        return false;
-    }
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Assessment<'a> {
+    Blocked(&'a str),
+    NotBlocked,
+    Incomplete,
+}
 
-    let Some(message) = activity
+/// Assesses newest-first activities in the caller's evidence window.
+///
+/// A block requires complete history, since an older launch may still be in flight.
+pub(crate) fn assess<'a>(
+    activities: &'a [Activity],
+    candidates: Option<&crate::group::LaunchCandidates>,
+    history_complete: bool,
+) -> Assessment<'a> {
+    if has_launch_in_flight(activities) {
+        return Assessment::NotBlocked;
+    }
+    let mut launches = launch_activities(activities);
+    let Some(newest) = launches.next() else {
+        return if history_complete {
+            Assessment::NotBlocked
+        } else {
+            Assessment::Incomplete
+        };
+    };
+    if newest.status_code() != Some(&ScalingActivityStatusCode::Failed) {
+        return Assessment::NotBlocked;
+    }
+    let Some(reason) = newest
         .status_message()
         .filter(|message| !message.is_empty())
     else {
-        return false;
+        return Assessment::NotBlocked;
     };
-
-    candidate_count == Some(1)
-        || message
-            .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '.')
-            .map(|token| token.trim_end_matches('.'))
-            .any(|token| {
-                matches!(
-                    token,
-                    "MaxSpotInstanceCountExceeded"
-                        | "SpotMaxInstanceCountLimitExceeded"
-                        | "VcpuLimitExceeded"
-                        | "InstanceLimitExceeded"
-                        | "UnauthorizedOperation"
-                        | "AccessDenied"
-                        | "AccessDeniedException"
-                        | "InvalidIamInstanceProfile"
-                        | "InvalidLaunchTemplateId.NotFound"
-                        | "InvalidLaunchTemplateId.VersionNotFound"
-                        | "InvalidAMIID.NotFound"
-                        | "InvalidAMIID.Unavailable"
-                )
-            })
-}
-
-/// Returns the newest failure message only when current launch options are exhausted.
-///
-/// Activities are newest first and already restricted to the caller's evidence window.
-pub(crate) fn blocked_reason<'a>(
-    activities: &'a [Activity],
-    candidates: Option<&crate::group::LaunchCandidates>,
-    candidate_count: Option<usize>,
-) -> Option<&'a str> {
-    let mut launches = launch_activities(activities);
-    let newest = launches.next()?;
-    if newest.status_code() != Some(&ScalingActivityStatusCode::Failed) {
-        return None;
+    if is_global_failure(reason) {
+        return if history_complete {
+            Assessment::Blocked(reason)
+        } else {
+            Assessment::Incomplete
+        };
     }
-    let reason = newest
-        .status_message()
-        .filter(|message| !message.is_empty())?;
-    if blocks_growth(newest, candidate_count) {
-        return Some(reason);
-    }
-    let candidates = candidates?;
+    let Some(candidates) = candidates else {
+        return Assessment::NotBlocked;
+    };
     let mut attempts = Vec::new();
+    let mut progress_boundary = false;
     for activity in std::iter::once(newest).chain(launches) {
         if activity.status_code() != Some(&ScalingActivityStatusCode::Failed) {
+            progress_boundary = true;
             break;
         }
         if let Some(attempt) = classify_attempt(activity, candidates) {
@@ -76,22 +65,79 @@ pub(crate) fn blocked_reason<'a>(
         }
     }
     let mut pairs = candidates.pairs().peekable();
-    pairs.peek()?;
-    pairs
-        .all(|(instance_type, zone)| {
-            attempts.iter().any(|attempt| {
-                attempt.zone == zone
-                    && attempt
-                        .instance_type
-                        .is_none_or(|actual| actual == instance_type)
-            })
+    if pairs.peek().is_none() {
+        return Assessment::NotBlocked;
+    }
+    let Some(newest_attempt) = attempts.first() else {
+        return if history_complete || progress_boundary {
+            Assessment::NotBlocked
+        } else {
+            Assessment::Incomplete
+        };
+    };
+    let covered = pairs.all(|(instance_type, zone)| {
+        attempts.iter().any(|attempt| {
+            attempt.zone == zone
+                && attempt
+                    .instance_type
+                    .as_deref()
+                    .is_none_or(|actual| actual == instance_type)
         })
-        .then_some(reason)
+    });
+    if covered {
+        if history_complete {
+            // Every classified attempt matches at least one current candidate.
+            Assessment::Blocked(newest_attempt.message)
+        } else {
+            Assessment::Incomplete
+        }
+    } else if history_complete || progress_boundary {
+        Assessment::NotBlocked
+    } else {
+        Assessment::Incomplete
+    }
+}
+
+fn is_global_failure(message: &str) -> bool {
+    message
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '.')
+        .map(|token| token.trim_end_matches('.'))
+        .any(|token| {
+            matches!(
+                token,
+                "MaxSpotInstanceCountExceeded"
+                    | "SpotMaxInstanceCountLimitExceeded"
+                    | "VcpuLimitExceeded"
+                    | "InstanceLimitExceeded"
+                    | "UnauthorizedOperation"
+                    | "AccessDenied"
+                    | "AccessDeniedException"
+                    | "InvalidIamInstanceProfile"
+                    | "InvalidLaunchTemplateId.NotFound"
+                    | "InvalidLaunchTemplateId.VersionNotFound"
+                    | "InvalidAMIID.NotFound"
+                    | "InvalidAMIID.Unavailable"
+            )
+        })
 }
 
 /// Iterates over launch activities in their original order.
-pub(crate) fn launch_activities(activities: &[Activity]) -> impl Iterator<Item = &Activity> {
+fn launch_activities(activities: &[Activity]) -> impl Iterator<Item = &Activity> {
     activities.iter().filter(|activity| is_launch(activity))
+}
+
+/// An active launch, or an active activity of unknown kind, can still grow the fleet.
+fn has_launch_in_flight(activities: &[Activity]) -> bool {
+    activities.iter().any(|activity| {
+        let terminal = matches!(
+            activity.status_code().map(|status| status.as_str()),
+            Some("Failed" | "Successful" | "Cancelled")
+        );
+        let termination = activity
+            .description()
+            .is_some_and(|description| description.starts_with("Terminating EC2 instance"));
+        !terminal && !termination
+    })
 }
 
 fn is_launch(activity: &Activity) -> bool {
@@ -101,16 +147,17 @@ fn is_launch(activity: &Activity) -> bool {
 }
 
 struct Attempt<'a> {
-    zone: &'a str,
-    instance_type: Option<&'a str>,
+    zone: Cow<'a, str>,
+    instance_type: Option<Cow<'a, str>>,
+    message: &'a str,
 }
 
 #[derive(serde::Deserialize)]
 struct Details<'a> {
     #[serde(rename = "Availability Zone", borrow)]
-    zone: Option<&'a str>,
+    zone: Option<Cow<'a, str>>,
     #[serde(rename = "Instance Type", borrow)]
-    instance_type: Option<&'a str>,
+    instance_type: Option<Cow<'a, str>>,
 }
 
 fn tokens(message: &str) -> impl Iterator<Item = &str> {
@@ -143,28 +190,38 @@ fn classify_attempt<'a>(
         let first = matching.next()?;
         matching.all(|token| token == first).then_some(first)
     };
-    let zone = match details.as_ref().and_then(|details| details.zone) {
+    let (detail_zone, detail_type) = details
+        .map(|details| (details.zone, details.instance_type))
+        .unwrap_or_default();
+    let zone = match detail_zone.filter(|zone| !zone.trim().is_empty()) {
         Some(zone) => zone,
-        None => unique_match(&|token| candidates.pairs().any(|(_, zone)| zone == token))?,
+        None => Cow::Borrowed(unique_match(&|token| {
+            candidates.pairs().any(|(_, zone)| zone == token)
+        })?),
     };
     if !candidates
         .pairs()
-        .any(|(_, candidate_zone)| candidate_zone == zone)
+        .any(|(_, candidate_zone)| candidate_zone == zone.as_ref())
     {
         return None;
     }
-    let instance_type = match details.as_ref().and_then(|details| details.instance_type) {
+    let instance_type = match detail_type.filter(|kind| !kind.trim().is_empty()) {
         Some(instance_type) => Some(instance_type),
-        None => unique_match(&|token| candidates.pairs().any(|(kind, _)| kind == token)),
+        None => unique_match(&|token| candidates.pairs().any(|(kind, _)| kind == token))
+            .map(Cow::Borrowed),
     };
-    if let Some(instance_type) = instance_type {
-        if !candidates.pairs().any(|(kind, _)| kind == instance_type) {
+    if let Some(instance_type) = &instance_type {
+        if !candidates
+            .pairs()
+            .any(|(kind, _)| kind == instance_type.as_ref())
+        {
             return None;
         }
     } else if invalid || tokens(message).any(looks_like_instance_type) {
         return None;
     }
     Some(Attempt {
+        message,
         zone,
         instance_type,
     })
@@ -191,7 +248,7 @@ mod tests {
     };
     use aws_smithy_types::DateTime;
 
-    use super::{blocked_reason, blocks_growth};
+    use super::{Assessment, assess};
     use crate::group::{Group, LaunchCandidates};
 
     const LAUNCH: &str = "Launching a new EC2 instance";
@@ -222,28 +279,30 @@ mod tests {
         )
     }
 
-    fn candidates() -> LaunchCandidates {
-        let group = AutoScalingGroup::builder()
+    fn candidates(single: bool) -> LaunchCandidates {
+        let mut template = LaunchTemplate::builder().overrides(
+            LaunchTemplateOverrides::builder()
+                .instance_type("c7g.large")
+                .build(),
+        );
+        if !single {
+            template = template.overrides(
+                LaunchTemplateOverrides::builder()
+                    .instance_type("m7g.large")
+                    .build(),
+            );
+        }
+        let mut group = AutoScalingGroup::builder()
             .auto_scaling_group_name("workers")
             .desired_capacity(1)
-            .availability_zones("us-east-1a")
-            .availability_zones("us-east-1b")
+            .availability_zones("us-east-1a");
+        if !single {
+            group = group.availability_zones("us-east-1b");
+        }
+        let group = group
             .mixed_instances_policy(
                 MixedInstancesPolicy::builder()
-                    .launch_template(
-                        LaunchTemplate::builder()
-                            .overrides(
-                                LaunchTemplateOverrides::builder()
-                                    .instance_type("c7g.large")
-                                    .build(),
-                            )
-                            .overrides(
-                                LaunchTemplateOverrides::builder()
-                                    .instance_type("m7g.large")
-                                    .build(),
-                            )
-                            .build(),
-                    )
+                    .launch_template(template.build())
                     .build(),
             )
             .build();
@@ -270,149 +329,107 @@ mod tests {
     }
 
     #[test]
-    fn proves_full_candidate_coverage_since_progress() {
-        let candidates = candidates();
-        let reason = "InsufficientInstanceCapacity: capacity unavailable; exact reason.";
-        let zone_a = || with_details(reason, r#"{"Availability Zone":"us-east-1a"}"#);
-        let zone_b = || {
-            with_details(
-                "UnfulfillableCapacity",
-                r#"{"Availability Zone":"us-east-1b"}"#,
-            )
-        };
-        assert_eq!(
-            blocked_reason(&[zone_a()], Some(&candidates), Some(4)),
-            None
-        );
-        assert_eq!(
-            blocked_reason(&[zone_a(), zone_b()], Some(&candidates), Some(4)),
-            Some(reason)
-        );
-        assert_eq!(blocked_reason(&[zone_a(), zone_b()], None, Some(4)), None);
-
-        let pair = |kind: &str, zone: &str| {
-            with_details(
-                "InvalidFleetConfiguration: unsupported",
-                &format!(r#"{{"Availability Zone":"{zone}","Instance Type":"{kind}"}}"#),
-            )
-        };
-        assert_eq!(
-            blocked_reason(
-                &[pair("c7g.large", "us-east-1a")],
-                Some(&candidates),
-                Some(4)
-            ),
-            None
-        );
-        let all = [
-            pair("c7g.large", "us-east-1a"),
-            pair("m7g.large", "us-east-1a"),
-            pair("c7g.large", "us-east-1b"),
-            pair("m7g.large", "us-east-1b"),
-        ];
-        assert_eq!(
-            blocked_reason(&all, Some(&candidates), Some(4)),
-            Some("InvalidFleetConfiguration: unsupported")
-        );
-        let progress = activity(
-            Some(ScalingActivityStatusCode::InProgress),
-            Some(LAUNCH),
-            None,
-        );
-        assert_eq!(
-            blocked_reason(
-                &[progress.clone(), zone_a(), zone_b()],
-                Some(&candidates),
-                Some(4)
-            ),
-            None
-        );
-        assert_eq!(
-            blocked_reason(
-                &[zone_a(), progress, zone_a(), zone_b()],
-                Some(&candidates),
-                Some(4)
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn unattributed_or_unknown_failures_do_not_cover_candidates() {
-        let candidates = candidates();
-        let other_zone = with_details(
-            "InsufficientInstanceCapacity",
-            r#"{"Availability Zone":"us-east-1z"}"#,
-        );
-        let other_type = with_details(
-            "InsufficientInstanceCapacity",
-            r#"{"Availability Zone":"us-east-1a","Instance Type":"x9.large"}"#,
-        );
-        let no_zone = failed("InsufficientInstanceCapacity");
-        let zone_b = with_details(
-            "InsufficientInstanceCapacity",
-            r#"{"Availability Zone":"us-east-1b"}"#,
-        );
+    fn single_candidate_requires_current_attributed_evidence() {
+        let candidates = candidates(true);
         for failure in [
-            other_zone,
-            other_type,
-            no_zone,
+            with_details(
+                "InsufficientInstanceCapacity",
+                r#"{"Availability Zone":"us-east-1z"}"#,
+            ),
+            with_details(
+                "InsufficientInstanceCapacity",
+                r#"{"Availability Zone":"us-east-1a","Instance Type":"x9.large"}"#,
+            ),
+            failed("InsufficientInstanceCapacity"),
             failed("InsufficientInstanceCapacity us-east-1a x9.large"),
             failed("InsufficientInstanceCapacity us-east-1a m8i.metal-24xl"),
             failed("InsufficientInstanceCapacity us-east-1a m8i.metal-48xl"),
+            failed("InsufficientInstanceCapacity us-east-1a-extra"),
+            failed(UNSUPPORTED),
+            failed("An unknown launch failure occurred"),
         ] {
             assert_eq!(
-                blocked_reason(&[failure, zone_b.clone()], Some(&candidates), Some(4)),
-                None
+                assess(&[failure], Some(&candidates), true),
+                Assessment::NotBlocked
             );
         }
+        let message = "InsufficientInstanceCapacity c7g.large us-east-1a; exact reason.";
         assert_eq!(
-            blocked_reason(
-                &[
-                    failed("InsufficientInstanceCapacity us-east-1a-extra"),
-                    zone_b
-                ],
-                Some(&candidates),
-                Some(4)
-            ),
-            None
+            assess(&[failed(message)], Some(&candidates), true),
+            Assessment::Blocked(message)
+        );
+        assert_eq!(
+            assess(&[failed(message)], Some(&candidates), false),
+            Assessment::Incomplete
         );
     }
 
     #[test]
-    fn ignores_nonlaunch_activities_and_preserves_newest_reason() {
-        let candidates = candidates();
-        let terminate = activity(
-            Some(ScalingActivityStatusCode::Failed),
-            Some("Terminating EC2 instance"),
-            Some("AccessDenied"),
-        );
-        let a = failed("InsufficientInstanceCapacity us-east-1a");
-        let b = failed("UnfulfillableCapacity us-east-1b");
+    fn coverage_uses_newest_contributing_message_and_respects_history() {
+        let candidates = candidates(false);
+        let reason = "InsufficientInstanceCapacity us-east-1a; exact reason.";
+        let failures = [
+            failed("InsufficientInstanceCapacity us-east-1z"),
+            failed(reason),
+            failed("UnfulfillableCapacity us-east-1b"),
+        ];
         assert_eq!(
-            blocked_reason(&[terminate, a, b], Some(&candidates), Some(4)),
-            Some("InsufficientInstanceCapacity us-east-1a")
-        );
-        assert_eq!(
-            blocked_reason(&[failed("AccessDenied")], None, None),
-            Some("AccessDenied")
+            assess(&failures, Some(&candidates), true),
+            Assessment::Blocked(reason)
         );
         assert_eq!(
-            blocked_reason(
-                &[
-                    failed("InvalidFleetConfiguration c7g.large us-east-1a"),
-                    failed("VcpuLimitExceeded")
-                ],
-                Some(&candidates),
-                Some(4),
-            ),
-            None
+            assess(&failures, Some(&candidates), false),
+            Assessment::Incomplete
+        );
+        assert_eq!(
+            assess(&failures[..2], Some(&candidates), true),
+            Assessment::NotBlocked
+        );
+        assert_eq!(
+            assess(&failures[..2], Some(&candidates), false),
+            Assessment::Incomplete
+        );
+        assert_eq!(assess(&failures, None, false), Assessment::NotBlocked);
+        let stale_quota = [
+            failed("InvalidFleetConfiguration c7g.large us-east-1a"),
+            failed("VcpuLimitExceeded"),
+        ];
+        assert_eq!(
+            assess(&stale_quota, Some(&candidates), true),
+            Assessment::NotBlocked
         );
     }
 
     #[test]
-    fn uses_exact_message_tokens_and_prefers_structured_details() {
-        let candidates = candidates();
+    fn structured_details_support_empty_and_escaped_fields() {
+        let candidates = candidates(true);
+        let fallback = "InvalidFleetConfiguration c7g.large us-east-1a";
+        let empty = with_details(fallback, r#"{"Availability Zone":"","Instance Type":"  "}"#);
+        assert_eq!(
+            assess(&[empty], Some(&candidates), true),
+            Assessment::Blocked(fallback)
+        );
+        let escaped = with_details(
+            "InvalidFleetConfiguration: exact original message",
+            r#"{"Availability Zone":"us-east-1\u0061","Instance Type":"c7g.\u006carge"}"#,
+        );
+        assert_eq!(
+            assess(&[escaped], Some(&candidates), true),
+            Assessment::Blocked("InvalidFleetConfiguration: exact original message")
+        );
+        let preferred = with_details(
+            "InvalidFleetConfiguration c7g.large us-east-1a us-east-1b",
+            r#"{"Availability Zone":"us-east-1a","Instance Type":"c7g.large"}"#,
+        );
+        assert_eq!(
+            assess(&[preferred], Some(&candidates), true),
+            Assessment::Blocked("InvalidFleetConfiguration c7g.large us-east-1a us-east-1b")
+        );
+    }
+
+    #[test]
+    fn exact_pair_coverage_and_ambiguity() {
+        let candidates = candidates(false);
         let failures = [
             failed("InvalidFleetConfiguration c7g.large us-east-1a"),
             failed("InvalidFleetConfiguration m7g.large us-east-1a"),
@@ -420,74 +437,98 @@ mod tests {
             failed("InvalidFleetConfiguration m7g.large us-east-1b"),
         ];
         assert_eq!(
-            blocked_reason(&failures, Some(&candidates), Some(4)),
-            failures[0].status_message()
+            assess(&failures, Some(&candidates), true),
+            Assessment::Blocked("InvalidFleetConfiguration c7g.large us-east-1a")
         );
-        let ambiguous = failed("InvalidFleetConfiguration c7g.large us-east-1a us-east-1b");
-        assert_eq!(
-            blocked_reason(
-                &[
-                    ambiguous,
-                    failures[1].clone(),
-                    failures[2].clone(),
-                    failures[3].clone()
-                ],
-                Some(&candidates),
-                Some(4)
-            ),
-            None
-        );
-        let preferred = with_details(
-            "InvalidFleetConfiguration c7g.large us-east-1a us-east-1b",
-            r#"{"Availability Zone":"us-east-1a","Instance Type":"c7g.large"}"#,
-        );
-        assert_eq!(
-            blocked_reason(
-                &[
-                    preferred,
-                    failures[1].clone(),
-                    failures[2].clone(),
-                    failures[3].clone()
-                ],
-                Some(&candidates),
-                Some(4)
-            ),
-            Some("InvalidFleetConfiguration c7g.large us-east-1a us-east-1b")
-        );
-        let wrong_type = failed("InvalidFleetConfiguration c7g.large-extra us-east-1a");
-        assert_eq!(
-            blocked_reason(
-                &[
-                    wrong_type,
-                    failures[1].clone(),
-                    failures[2].clone(),
-                    failures[3].clone()
-                ],
-                Some(&candidates),
-                Some(4)
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn candidate_failure_does_not_prove_multiple_candidates_exhausted() {
         for message in [
-            UNSUPPORTED,
-            "InsufficientInstanceCapacity: no capacity available",
-            "An unknown launch failure occurred",
+            "InvalidFleetConfiguration c7g.large us-east-1a us-east-1b",
+            "InvalidFleetConfiguration c7g.large-extra us-east-1a",
         ] {
-            let activity = failed(message);
-            assert!(!blocks_growth(&activity, Some(2)), "{message}");
-            assert!(!blocks_growth(&activity, Some(0)), "{message}");
-            assert!(!blocks_growth(&activity, None), "{message}");
-            assert!(blocks_growth(&activity, Some(1)), "{message}");
-            assert_eq!(activity.status_message(), Some(message));
+            let partial = [
+                failed(message),
+                failures[1].clone(),
+                failures[2].clone(),
+                failures[3].clone(),
+            ];
+            assert_eq!(
+                assess(&partial, Some(&candidates), true),
+                Assessment::NotBlocked
+            );
         }
     }
 
     #[test]
-    fn explicit_fleetwide_codes_block_even_with_multiple_or_unknown_candidates() {
+    fn progress_boundaries_and_in_flight_launches() {
+        let candidates = candidates(false);
+        let a = || failed("InsufficientInstanceCapacity us-east-1a");
+        let b = || failed("InsufficientInstanceCapacity us-east-1b");
+        for status in ["Successful", "Cancelled"] {
+            let boundary = activity(
+                Some(ScalingActivityStatusCode::from(status)),
+                Some(LAUNCH),
+                None,
+            );
+            assert_eq!(
+                assess(&[a(), boundary.clone(), b()], Some(&candidates), false),
+                Assessment::NotBlocked
+            );
+            assert_eq!(
+                assess(
+                    &[failed("VcpuLimitExceeded"), boundary],
+                    Some(&candidates),
+                    true
+                ),
+                Assessment::Blocked("VcpuLimitExceeded")
+            );
+        }
+        for active in [
+            activity(
+                Some(ScalingActivityStatusCode::InProgress),
+                Some(LAUNCH),
+                None,
+            ),
+            activity(
+                Some(ScalingActivityStatusCode::from("WaitingForSpotInstanceId")),
+                Some(LAUNCH),
+                None,
+            ),
+            activity(None, None, None),
+            activity(
+                Some(ScalingActivityStatusCode::InProgress),
+                Some("unknown"),
+                None,
+            ),
+        ] {
+            assert_eq!(
+                assess(
+                    &[failed("VcpuLimitExceeded"), active.clone()],
+                    Some(&candidates),
+                    true
+                ),
+                Assessment::NotBlocked
+            );
+            assert_eq!(
+                assess(&[a(), b(), active], Some(&candidates), true),
+                Assessment::NotBlocked
+            );
+        }
+        let termination = activity(
+            Some(ScalingActivityStatusCode::InProgress),
+            Some("Terminating EC2 instance: i-123"),
+            None,
+        );
+        assert_eq!(
+            assess(
+                &[failed("VcpuLimitExceeded"), termination],
+                Some(&candidates),
+                true
+            ),
+            Assessment::Blocked("VcpuLimitExceeded")
+        );
+    }
+
+    #[test]
+    fn global_codes_only_apply_to_newest_launch() {
         for code in [
             "MaxSpotInstanceCountExceeded",
             "SpotMaxInstanceCountLimitExceeded",
@@ -503,49 +544,13 @@ mod tests {
             "InvalidAMIID.Unavailable",
         ] {
             let message = format!("Launch failed: {code}. Please retry.");
-            let activity = failed(&message);
-            assert!(blocks_growth(&activity, Some(5)), "{code}");
-            assert!(blocks_growth(&activity, None), "{code}");
-            assert_eq!(activity.status_message(), Some(message.as_str()));
+            let activities = [failed(&message)];
+            assert_eq!(
+                assess(&activities, None, true),
+                Assessment::Blocked(message.as_str())
+            );
+            assert_eq!(assess(&activities, None, false), Assessment::Incomplete);
         }
-    }
-
-    #[test]
-    fn requires_failed_launch_with_nonempty_message() {
-        for status in [
-            Some(ScalingActivityStatusCode::Successful),
-            Some(ScalingActivityStatusCode::InProgress),
-            None,
-        ] {
-            assert!(!blocks_growth(
-                &activity(status, Some(LAUNCH), Some("AccessDenied")),
-                Some(1)
-            ));
-        }
-        for description in [None, Some("Terminating EC2 instance: i-123"), Some("")] {
-            assert!(!blocks_growth(
-                &activity(
-                    Some(ScalingActivityStatusCode::Failed),
-                    description,
-                    Some("AccessDenied")
-                ),
-                Some(1)
-            ));
-        }
-        for message in [None, Some("")] {
-            assert!(!blocks_growth(
-                &activity(
-                    Some(ScalingActivityStatusCode::Failed),
-                    Some(LAUNCH),
-                    message
-                ),
-                Some(1)
-            ));
-        }
-    }
-
-    #[test]
-    fn does_not_match_a_code_inside_another_code() {
         for message in [
             "NotAccessDenied",
             "AccessDeniedExtra",
@@ -555,12 +560,64 @@ mod tests {
             "Other.InvalidAMIID.NotFound",
             "InstanceLimitExceeded2",
         ] {
-            assert!(!blocks_growth(&failed(message), Some(3)), "{message}");
+            assert_eq!(
+                assess(&[failed(message)], None, true),
+                Assessment::NotBlocked
+            );
         }
-        assert!(blocks_growth(
-            &failed("(AccessDeniedException): denied"),
-            Some(3)
-        ));
-        assert!(blocks_growth(&failed("InvalidAMIID.NotFound."), Some(3)));
+        for message in ["(AccessDeniedException): denied", "InvalidAMIID.NotFound."] {
+            assert_eq!(
+                assess(&[failed(message)], None, true),
+                Assessment::Blocked(message)
+            );
+        }
+    }
+
+    #[test]
+    fn requires_launch_and_nonempty_failed_message() {
+        assert_eq!(assess(&[], None, true), Assessment::NotBlocked);
+        assert_eq!(assess(&[], None, false), Assessment::Incomplete);
+        for status in [
+            Some(ScalingActivityStatusCode::Successful),
+            Some(ScalingActivityStatusCode::InProgress),
+            None,
+        ] {
+            assert_eq!(
+                assess(
+                    &[activity(status, Some(LAUNCH), Some("AccessDenied"))],
+                    None,
+                    true
+                ),
+                Assessment::NotBlocked
+            );
+        }
+        for description in [None, Some("Terminating EC2 instance: i-123"), Some("")] {
+            assert_eq!(
+                assess(
+                    &[activity(
+                        Some(ScalingActivityStatusCode::Failed),
+                        description,
+                        Some("AccessDenied")
+                    )],
+                    None,
+                    true
+                ),
+                Assessment::NotBlocked
+            );
+        }
+        for message in [None, Some("")] {
+            assert_eq!(
+                assess(
+                    &[activity(
+                        Some(ScalingActivityStatusCode::Failed),
+                        Some(LAUNCH),
+                        message
+                    )],
+                    None,
+                    false
+                ),
+                Assessment::NotBlocked
+            );
+        }
     }
 }

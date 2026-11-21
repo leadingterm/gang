@@ -68,9 +68,6 @@ pub(crate) struct Group {
     pub protects_new_instances: bool,
     /// The instances parked in the group's warm pool; `0` without one.
     pub warm: u32,
-    /// Distinct explicit instance-type and availability-zone pairs, if fully known.
-    /// Unknown candidates cannot establish that failures exhaust the fleet's launch options.
-    pub(crate) candidate_count: Option<usize>,
     /// Complete configured candidate metadata, or `None` when it is not fully known.
     pub(crate) launch_candidates: Option<LaunchCandidates>,
 }
@@ -133,18 +130,7 @@ impl Group {
             .map(|instance| member(instance, template))
             .collect::<Result<Vec<_>, _>>()?;
         let warm = group.warm_pool_size().map_or(0, capacity_of);
-        let candidate_count = candidate_count(group);
-        let launch_candidates = candidate_count.and_then(|_| {
-            let overrides = group
-                .mixed_instances_policy
-                .as_mut()?
-                .launch_template
-                .as_mut()?
-                .overrides
-                .take()?;
-            let zones = group.availability_zones.take()?;
-            Some(LaunchCandidates { overrides, zones })
-        });
+        let launch_candidates = launch_candidates(group);
         Ok(Self {
             name: name.to_owned(),
             desired: capacity_of(desired),
@@ -152,7 +138,6 @@ impl Group {
             members,
             reuse_on_scale_in,
             protects_new_instances,
-            candidate_count,
             launch_candidates,
             warm,
         })
@@ -238,8 +223,8 @@ impl From<&Group> for Counts {
     }
 }
 
-/// Counts distinct launch candidates only when the group describes the entire candidate set.
-fn candidate_count(group: &AutoScalingGroup) -> Option<usize> {
+/// Moves candidate metadata only when the entire configured set is known.
+fn launch_candidates(group: &mut AutoScalingGroup) -> Option<LaunchCandidates> {
     let zones = group.availability_zones();
     if zones.is_empty() || zones.iter().any(String::is_empty) {
         return None;
@@ -255,21 +240,15 @@ fn candidate_count(group: &AutoScalingGroup) -> Option<usize> {
     {
         return None;
     }
-    let zone_count = zones
-        .iter()
-        .enumerate()
-        .filter(|(index, zone)| !zones[..*index].contains(zone))
-        .count();
-    let type_count = overrides
-        .iter()
-        .enumerate()
-        .filter(|(index, item)| {
-            !overrides[..*index]
-                .iter()
-                .any(|previous| previous.instance_type() == item.instance_type())
-        })
-        .count();
-    zone_count.checked_mul(type_count)
+    let overrides = group
+        .mixed_instances_policy
+        .as_mut()?
+        .launch_template
+        .as_mut()?
+        .overrides
+        .take()?;
+    let zones = group.availability_zones.take()?;
+    Some(LaunchCandidates { overrides, zones })
 }
 
 /// Converts one listed instance of a group to a member.
@@ -428,31 +407,14 @@ mod tests {
     }
 
     #[test]
-    fn counts_distinct_explicit_candidates() -> TestResult {
-        assert_eq!(
-            read(candidates(&["us-east-1a"], vec![explicit("c7g.large")]))?.candidate_count,
-            Some(1)
-        );
-        assert_eq!(
-            read(candidates(
-                &["us-east-1a", "us-east-1b", "us-east-1a"],
-                vec![
-                    explicit("c7g.large"),
-                    explicit("m7g.large"),
-                    explicit("c7g.large")
-                ],
-            ))?
-            .candidate_count,
-            Some(4)
-        );
-        Ok(())
-    }
-
-    #[test]
     fn moves_original_candidate_vectors_and_iterates_all_pairs() -> TestResult {
         let raw = candidates(
             &["us-east-1a", "us-east-1b", "us-east-1a"],
-            vec![explicit("c7g.large"), explicit("m7g.large")],
+            vec![
+                explicit("c7g.large"),
+                explicit("m7g.large"),
+                explicit("c7g.large"),
+            ],
         );
         let zones_ptr = raw
             .availability_zones
@@ -470,7 +432,6 @@ mod tests {
             .auto_scaling_groups(raw)
             .build();
         let group = Group::read(&mut output, GROUP)?;
-        assert_eq!(group.candidate_count, Some(4));
         let launch = group.launch_candidates.ok_or("missing candidates")?;
         assert_eq!(launch.zones.as_ptr(), zones_ptr);
         assert_eq!(launch.overrides.as_ptr(), overrides_ptr);
@@ -483,6 +444,9 @@ mod tests {
                 ("m7g.large", "us-east-1a"),
                 ("m7g.large", "us-east-1b"),
                 ("m7g.large", "us-east-1a"),
+                ("c7g.large", "us-east-1a"),
+                ("c7g.large", "us-east-1b"),
+                ("c7g.large", "us-east-1a"),
             ]
         );
         Ok(())
@@ -551,17 +515,33 @@ mod tests {
             .availability_zones("us-east-1a")
             .mixed_instances_policy(MixedInstancesPolicy::builder().build())
             .build();
+        let mut no_zones = candidates(&["us-east-1a"], vec![explicit("c7g.large")]);
+        no_zones.availability_zones = None;
+        let no_overrides = AutoScalingGroup::builder()
+            .auto_scaling_group_name(GROUP)
+            .desired_capacity(1)
+            .availability_zones("us-east-1a")
+            .mixed_instances_policy(
+                MixedInstancesPolicy::builder()
+                    .launch_template(LaunchTemplate::builder().build())
+                    .build(),
+            )
+            .build();
         let cases = [
             no_policy,
             no_launch_template,
+            no_zones,
+            no_overrides,
             candidates(&[], vec![explicit("c7g.large")]),
             candidates(&[""], vec![explicit("c7g.large")]),
+            candidates(&["us-east-1a", ""], vec![explicit("c7g.large")]),
             candidates(&["us-east-1a"], vec![]),
             candidates(
                 &["us-east-1a"],
                 vec![LaunchTemplateOverrides::builder().build()],
             ),
             candidates(&["us-east-1a"], vec![explicit("")]),
+            candidates(&["us-east-1a"], vec![explicit("c7g.large"), explicit("")]),
             candidates(
                 &["us-east-1a"],
                 vec![
@@ -581,10 +561,25 @@ mod tests {
                 ],
             ),
         ];
-        for group in cases {
-            let group = read(group)?;
-            assert_eq!(group.candidate_count, None);
+        for raw in cases {
+            let metadata = |group: &AutoScalingGroup| {
+                (
+                    group.availability_zones.as_ref().map(Vec::as_ptr),
+                    group
+                        .mixed_instances_policy
+                        .as_ref()
+                        .and_then(|policy| policy.launch_template.as_ref())
+                        .and_then(|launch| launch.overrides.as_ref())
+                        .map(Vec::as_ptr),
+                )
+            };
+            let original = metadata(&raw);
+            let mut output = DescribeAutoScalingGroupsOutput::builder()
+                .auto_scaling_groups(raw)
+                .build();
+            let group = Group::read(&mut output, GROUP)?;
             assert!(group.launch_candidates.is_none());
+            assert_eq!(metadata(&output.auto_scaling_groups()[0]), original);
         }
         Ok(())
     }

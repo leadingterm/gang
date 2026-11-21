@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use aws_config::SdkConfig;
 use aws_sdk_autoscaling::operation::describe_auto_scaling_groups::DescribeAutoScalingGroupsOutput;
-use aws_sdk_autoscaling::types::{Filter as ScalingFilter, ScalingActivityStatusCode};
+use aws_sdk_autoscaling::types::Filter as ScalingFilter;
 use aws_sdk_ec2::types::Filter;
 use aws_sdk_ec2::types::builders::FilterBuilder;
 use gang_aws_sdk::call_error;
@@ -27,7 +27,7 @@ use crate::errors::AwsError;
 use crate::events::Events;
 use crate::fallback::{self, Counts, Tier};
 use crate::group::{DESCRIBE_GROUPS, Group, Member};
-use crate::launch_failure::{blocked_reason, launch_activities};
+use crate::launch_failure::{Assessment, assess};
 
 const SET_DESIRED_CAPACITY: &str = "SetDesiredCapacity";
 const UPDATE_AUTO_SCALING_GROUP: &str = "UpdateAutoScalingGroup";
@@ -378,8 +378,9 @@ impl Fleets {
         let mut token = None;
         while activities.len() < limit {
             let remaining = limit - activities.len();
-            let page_size = i32::try_from(remaining.min(ACTIVITY_PAGE_LIMIT))
-                .expect("the activity page limit fits in i32");
+            let page_size = i32::try_from(remaining.min(ACTIVITY_PAGE_LIMIT)).map_err(|_| {
+                AwsError::malformed(DESCRIBE_SCALING_ACTIVITIES, "activity page size")
+            })?;
             let mut output = self
                 .autoscaling
                 .describe_scaling_activities()
@@ -397,33 +398,31 @@ impl Fleets {
                 .map_err(|e| call_error(DESCRIBE_SCALING_ACTIVITIES, e))?;
             let mut page = output.activities.take().unwrap_or_default();
             let empty = page.is_empty();
+            let truncated = page.len() > remaining;
             page.truncate(remaining);
             if activities.is_empty() {
                 activities = page;
             } else {
                 activities.append(&mut page);
             }
-            if let Some(newest) = launch_activities(&activities).next() {
-                if newest.status_code() != Some(&ScalingActivityStatusCode::Failed)
-                    || newest.status_message().is_none_or(str::is_empty)
-                {
-                    return Ok(None);
-                }
-            }
-            if let Some(reason) = blocked_reason(
+            token = output.next_token.take().filter(|token| !token.is_empty());
+            let history_complete = !truncated && token.is_none();
+            match assess(
                 &activities,
                 group.launch_candidates.as_ref(),
-                group.candidate_count,
+                history_complete,
             ) {
-                return Ok(Some(LaunchFailure {
-                    reason: reason.to_owned(),
-                }));
-            }
-            token = output.next_token.take().filter(|token| !token.is_empty());
-            if token.is_none() || empty {
-                break;
+                Assessment::Blocked(reason) => {
+                    return Ok(Some(LaunchFailure {
+                        reason: reason.to_owned(),
+                    }));
+                }
+                Assessment::NotBlocked => return Ok(None),
+                Assessment::Incomplete if truncated || empty || token.is_none() => return Ok(None),
+                Assessment::Incomplete => {}
             }
         }
+        // More history exists beyond the configured bound, so exhaustion is not proven.
         Ok(None)
     }
 
@@ -921,6 +920,7 @@ mod tests {
     const LAUNCH: &str = "Launching a new EC2 instance";
     const QUOTA: &str = "MaxSpotInstanceCountExceeded: spot quota exhausted";
     const UNSUPPORTED: &str = "The instance type 'r8id.4xlarge' is not supported in your requested Availability Zone 'us-east-1b'. Launching EC2 instance failed. Status Reason: InvalidFleetConfiguration";
+    const UNSUPPORTED_CURRENT: &str = "The instance type 'r8id.4xlarge' is not supported in your requested Availability Zone 'us-east-1a'. Launching EC2 instance failed. Status Reason: InvalidFleetConfiguration";
     const STOCKOUT: &str = "InsufficientInstanceCapacity: insufficient capacity";
     const UNFULFILLABLE: &str = "UnfulfillableCapacity: capacity unavailable";
 
@@ -1108,6 +1108,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unread_or_older_active_launch_prevents_failure_and_fallback() -> TestResult {
+        for global in [false, true] {
+            let harness = Harness::start().await?;
+            let mut spot = two_zone_group(FLEET, 2, &[]);
+            spot.new_instances_protected = true;
+            harness.add_group_with(spot);
+            let mut twin = FakeGroup::new("gang-fleet-on-demand", 0, &[]);
+            twin.new_instances_protected = true;
+            harness.add_group_with(twin);
+            zoned_activity(
+                &harness,
+                1,
+                "us-east-1a",
+                if global { QUOTA } else { STOCKOUT },
+            );
+            zoned_activity(&harness, 2, "us-east-1b", UNFULFILLABLE);
+            for age in 3..=100 {
+                activity(
+                    &harness,
+                    "Failed",
+                    age,
+                    "Terminating EC2 instance: i-old",
+                    None,
+                );
+            }
+            activity(&harness, "InProgress", 120, LAUNCH, None);
+            let fleet = fleet_with(
+                FLEET,
+                AwsFleetOptions {
+                    capacity: Capacity::Spot,
+                    machine_class: None,
+                    fallback: Some(SpotFallback {
+                        retry_spot_after: RetrySpotAfter::try_new(Duration::from_mins(5))?,
+                        drain_on_demand_first: true,
+                    }),
+                },
+            )?;
+            let mut supply = FleetSupply::default();
+            harness.fleets.supply(fleet.view(), &mut supply).await?;
+            assert_eq!(supply.launch_failure, None);
+            assert_eq!(supply.abandoned, 0);
+
+            let sdk = harness.fake.sdk_config().await;
+            let config: crate::config::AwsConfig = serde_json::from_value(serde_json::json!({
+                "region": "us-east-1",
+                "scratch_mount_point": "/mnt/scratch",
+                "activity_limit": 101
+            }))?;
+            let events = Events::new(
+                &sdk,
+                &config,
+                harness.clock.clone(),
+                Arc::new(crate::events::Managed::default()),
+            );
+            let fleets = Fleets::new(&sdk, harness.clock.clone(), CooldownPolicy::Ignore, events);
+            fleets.supply(fleet.view(), &mut supply).await?;
+            assert_eq!(supply.launch_failure, None);
+            assert_eq!(supply.abandoned, 0);
+            gang_testkit::fence::with_held(async |held| {
+                fleets.set_desired_capacity(held, fleet.view(), 2).await
+            })
+            .await?;
+            assert_eq!(harness.desired("gang-fleet-on-demand"), Some(0));
+            assert!(harness.request_log().iter().any(|(operation, parameters)| {
+                operation == "DescribeScalingActivities"
+                    && parameters
+                        .get("NextToken")
+                        .is_some_and(|value| value == "100")
+            }));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn assessment_paginates_within_the_configured_activity_limit() -> TestResult {
         let harness = Harness::start().await?;
         harness.add_group_with(two_zone_group(FLEET, 2, &[]));
@@ -1167,9 +1241,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn assessment_stops_only_when_the_classifier_has_enough_evidence() -> TestResult {
+        for scenario in ["progress", "unknown", "older-active", "bounded-coverage"] {
+            let harness = Harness::start().await?;
+            if scenario == "unknown" {
+                harness.add_group_with(FakeGroup::new(FLEET, 2, &[]));
+            } else {
+                harness.add_group_with(two_zone_group(FLEET, 2, &[]));
+            }
+            zoned_activity(&harness, 1, "us-east-1a", STOCKOUT);
+            if scenario == "progress" {
+                activity(&harness, "Successful", 2, LAUNCH, None);
+            } else if scenario == "bounded-coverage" {
+                zoned_activity(&harness, 2, "us-east-1b", UNFULFILLABLE);
+            } else {
+                activity(
+                    &harness,
+                    "Failed",
+                    2,
+                    "Terminating EC2 instance: i-old",
+                    None,
+                );
+            }
+            for age in 3..=100 {
+                activity(
+                    &harness,
+                    "Failed",
+                    age,
+                    "Terminating EC2 instance: i-old",
+                    None,
+                );
+            }
+            activity(
+                &harness,
+                if scenario == "older-active" {
+                    "InProgress"
+                } else {
+                    "Failed"
+                },
+                120,
+                if scenario == "older-active" {
+                    LAUNCH
+                } else {
+                    "Terminating EC2 instance: i-old"
+                },
+                None,
+            );
+
+            let sdk = harness.fake.sdk_config().await;
+            let config: crate::config::AwsConfig = serde_json::from_value(serde_json::json!({
+                "region": "us-east-1",
+                "scratch_mount_point": "/mnt/scratch",
+                "activity_limit": if scenario == "bounded-coverage" { 100 } else { 101 }
+            }))?;
+            let events = Events::new(
+                &sdk,
+                &config,
+                harness.clock.clone(),
+                Arc::new(crate::events::Managed::default()),
+            );
+            let fleets = Fleets::new(&sdk, harness.clock.clone(), CooldownPolicy::Ignore, events);
+            let mut output = fleets.describe_groups(std::iter::once(FLEET)).await?;
+            let group = Group::read(&mut output, FLEET)?;
+            let since = harness.clock.wall() - Duration::from_mins(5);
+            assert!(
+                fleets.launch_assessment(&group, since).await?.is_none(),
+                "{scenario}"
+            );
+            assert_eq!(
+                harness.requests(DESCRIBE_SCALING_ACTIVITIES),
+                if scenario == "older-active" { 2 } else { 1 },
+                "{scenario}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn launch_failure_requires_proven_blocking_failure() -> TestResult {
         for (multiple, pending, description, message, expected) in [
-            (false, false, LAUNCH, Some(UNSUPPORTED), Some(UNSUPPORTED)),
+            (false, false, LAUNCH, Some(UNSUPPORTED), None),
+            (
+                false,
+                false,
+                LAUNCH,
+                Some(UNSUPPORTED_CURRENT),
+                Some(UNSUPPORTED_CURRENT),
+            ),
             (true, false, LAUNCH, Some(UNSUPPORTED), None),
             (true, false, LAUNCH, Some(QUOTA), Some(QUOTA)),
             (true, true, LAUNCH, Some(QUOTA), None),
@@ -1203,6 +1361,13 @@ mod tests {
                     .map(|failure| failure.reason.as_str()),
                 expected
             );
+            if message == Some(UNSUPPORTED) {
+                assert!(supply.events.iter().any(|event| matches!(
+                    &event.kind,
+                    gang_spi::InfrastructureEventKind::CapacityUnavailable { reason }
+                        if reason == UNSUPPORTED
+                )));
+            }
         }
         Ok(())
     }
