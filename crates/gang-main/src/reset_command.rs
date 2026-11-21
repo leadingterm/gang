@@ -10,7 +10,7 @@ use crate::errors::{MainError, Result};
 
 /// Clears the mask and replaces this process with the action; returns only on failure.
 pub(crate) fn run(arguments: &[OsString]) -> Result<ExitCode> {
-    if !arguments.first().is_some_and(|arg| arg == "--") {
+    if arguments.first().is_none_or(|arg| arg != "--") {
         return Err(MainError::ResetUsage);
     }
     let action = &arguments[1..];

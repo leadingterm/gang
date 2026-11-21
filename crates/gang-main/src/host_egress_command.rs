@@ -12,7 +12,7 @@ use crate::cli::PrepareActionEgressArgs;
 use crate::config_file::LoadedConfig;
 use crate::errors::{MainError, Result};
 
-pub(crate) fn run(args: PrepareActionEgressArgs) -> Result<ExitCode> {
+pub(crate) fn run(args: &PrepareActionEgressArgs) -> Result<ExitCode> {
     // Invalidate any previous grant before inventory or configuration checks can fail.
     gang_bwrap::host_egress::install_host_egress(None, &[], &args.cgroup, &args.nft)
         .map_err(MainError::HostEgress)?;

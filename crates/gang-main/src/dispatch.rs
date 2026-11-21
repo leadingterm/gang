@@ -176,7 +176,7 @@ fn execute(command: Command, entrypoint: &Path, out: &Output) -> Result<ExitCode
         }
         Command::Database(DatabaseCommand::Copy(args)) => database_command::run(args, out),
         Command::Worker(args) => worker_command::run(args, out),
-        Command::PrepareActionEgress(args) => host_egress_command::run(args),
+        Command::PrepareActionEgress(args) => host_egress_command::run(&args),
         Command::LocalWorker(args) => {
             let (program, arguments) = args
                 .command

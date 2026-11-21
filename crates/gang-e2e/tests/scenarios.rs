@@ -306,10 +306,9 @@ fn failed_builds_report_stderr_instead_of_missing_reports() -> gang_e2e::Result<
         build: BuildFailure::BeforeScaleOut,
         ..Behaviour::COMPLIANT
     };
-    let targets = network_targets()?;
     let scenarios: [Scenario<'_>; 3] = [
         &lifecycle,
-        &|system, variant| network(system, variant, &targets),
+        &|system, _variant| network(system),
         &input_integrity,
     ];
     for scenario in scenarios {

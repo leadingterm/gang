@@ -35,9 +35,8 @@ impl Bwrap {
     ) -> Command {
         let action_directory = spec.action_directory.as_os_str();
         let outer = network
-            .and_then(|_| self.egress.as_ref())
-            .map(|egress| &egress.program)
-            .unwrap_or(&self.program);
+            .and(self.egress.as_ref())
+            .map_or(&self.program, |egress| &egress.program);
         let mut command = match spec.launcher.split_first() {
             Some((launcher, launcher_arguments)) => {
                 let mut command = Command::new(launcher);

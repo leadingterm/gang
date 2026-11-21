@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 
 use gang_spi::{
@@ -277,7 +277,6 @@ impl ActionIsolationPort for Bwrap {
                 }
             }
         };
-        use std::os::fd::AsFd;
         let mut started = self.spawn(spec, resolver.as_ref().map(AsFd::as_fd))?;
         match spec.network {
             NetworkAccess::PublicEgress { policy, .. } => {
