@@ -5,7 +5,6 @@
 //! misbehaviour is a value of one of the enums below, so a test names the flaw it injects.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fmt::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -719,22 +718,7 @@ impl Simulation {
         let namespaces = self.namespaces(sandbox);
         Ok(match probe {
             Probe::Isolated => Some(self.isolation_report(namespaces).to_string()),
-            Probe::NetworkIsolated | Probe::NetworkRequested => {
-                let online = probe == Probe::NetworkRequested;
-                let access = if online { "ok" } else { "network_unreachable" };
-                let mut report = format!(
-                    "uid=1000\ngid=1000\nnet={}\nloopback4=ok\nloopback6=ok\nfd_leak=ok\nnft_mutation=permission_denied\npublic4={access}\npublic6={access}\nudp4={access}\nudp6={access}\ndns_public={access}\ndns_private=network_unreachable\n",
-                    namespaces.net,
-                );
-                for label in ["imds4", "alias4", "dns_alias4", "alias6"] {
-                    for protocol in ["tcp", "udp"] {
-                        writeln!(report, "blocked_{label}_{protocol}=network_unreachable").map_err(
-                            |error| E2eError::system(format!("formatting network report: {error}")),
-                        )?;
-                    }
-                }
-                Some(report)
-            }
+            Probe::NetworkRequested => Some("ran=yes\n".to_owned()),
             Probe::Pinned => {
                 (self.behaviour.serving == Serving::Keeps).then(|| "ran=yes\n".to_owned())
             }

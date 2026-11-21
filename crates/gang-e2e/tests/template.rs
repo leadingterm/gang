@@ -9,18 +9,18 @@ use gang_config::{
     SandboxSelection,
 };
 use gang_e2e::{
-    AUDIENCE, ActionLimits, ActionTools, ConfigTemplate, ControlKnobs, E2eError, EgressTools,
-    ExecutionKnobs, FleetLayout, IdentityKnobs, LARGE_FLEET, LIMIT_CPU_PERIOD_MICROS,
-    LIMIT_MAX_PIDS, NOOP_FLEET, ORGANIZATION, ORGANIZATION_CLAIM, PermitNetwork, Placement,
-    SMALL_FLEET, Sandbox, ServerKnobs, SoftMemory, Transport, Variant,
+    AUDIENCE, ActionLimits, ActionTools, ConfigTemplate, ControlKnobs, E2eError, ExecutionKnobs,
+    FleetLayout, IdentityKnobs, LARGE_FLEET, LIMIT_CPU_PERIOD_MICROS, LIMIT_MAX_PIDS, NOOP_FLEET,
+    ORGANIZATION, ORGANIZATION_CLAIM, PermitNetwork, Placement, SMALL_FLEET, Sandbox, ServerKnobs,
+    SoftMemory, Transport, Variant,
 };
 use gang_main::plugins::{
     CacheConfig, ClientAuthenticationConfig, DatabaseConfig, IdentityProviderConfig, LimitsConfig,
     Plugins, ProvisionerConfig, SandboxKey, SignerConfig, WorkerAuthenticationConfig,
 };
 use gang_types::{
-    AbsolutePathBuf, AuthenticationSettings, Bytes, CaPin, Capability, NonZeroDuration,
-    PermissionSet, ProviderName, PublicEgressPolicy, Url,
+    AbsolutePathBuf, AuthenticationSettings, Bytes, CaPin, Capability, PermissionSet, ProviderName,
+    Url,
 };
 use toml::Table;
 
@@ -30,6 +30,13 @@ fn base_config() -> gang_e2e::Result<String> {
         .map_err(|error| E2eError::system(format!("reading GANG_E2E_BASE_CONFIG: {error}")))?;
     std::fs::read_to_string(&path)
         .map_err(E2eError::io(format!("reading the base config at {path}")))
+}
+
+fn base_with_egress() -> gang_e2e::Result<String> {
+    Ok(format!(
+        "{}\n[execution.egress]\nprotected_networks = [\"10.0.0.0/8\"]\ndns_servers = [\"1.1.1.1\"]\n",
+        base_config()?
+    ))
 }
 
 /// The loopback listen address of `port`.
@@ -119,32 +126,6 @@ fn tools() -> gang_e2e::Result<TestTools> {
             path: "/nix/store/aaa-bash/bin:/nix/store/bbb-coreutils/bin".to_owned(),
             glibc_tool: None,
             action_rootfs: Some(rootfs.path().to_path_buf()),
-            egress: Some(EgressTools {
-                slirp4netns: "/nix/store/egress/bin/slirp4netns".into(),
-                nft: "/nix/store/egress/bin/nft".into(),
-                nsenter: "/nix/store/egress/bin/nsenter".into(),
-                ip: "/nix/store/egress/bin/ip".into(),
-                unshare: "/nix/store/egress/bin/unshare".into(),
-                probe: "/nix/store/egress/bin/egress_probe".into(),
-                peer: "/nix/store/egress/bin/egress_peer".into(),
-                policy: Some(PublicEgressPolicy {
-                    protected_networks: vec![
-                        "10.0.0.0/8"
-                            .parse()
-                            .map_err(|error| E2eError::system(format!("{error}")))?,
-                    ]
-                    .into_boxed_slice(),
-                    dns_servers: vec![
-                        "1.1.1.1"
-                            .parse()
-                            .map_err(|error| E2eError::system(format!("{error}")))?,
-                    ]
-                    .into_boxed_slice(),
-                    setup_timeout: NonZeroDuration::from_secs(10),
-                }),
-                targets: None,
-                repository_cache: None,
-            }),
         },
         rootfs,
     })
@@ -747,7 +728,6 @@ fn vary_bwrap_denied_breaks_input_links() -> gang_e2e::Result<()> {
     assert_eq!(doc.fleets[0].sandbox, SandboxKey::Bwrap);
     assert!(!doc.fleets[0].actions.grants.contains(&Capability::Network));
     assert!(doc.execution.egress.is_none());
-    assert!(doc.sandbox.bwrap.expect("bwrap sandbox").egress.is_none());
     assert_eq!(doc.execution.input_links, InputLinks::Break);
     Ok(())
 }
@@ -759,49 +739,26 @@ fn vary_bwrap_permitted_keeps_input_links() -> gang_e2e::Result<()> {
         input_links: InputLinks::Keep,
         ..Variant::baseline(Sandbox::Bwrap)
     };
-    let doc = typed_rendered(&ConfigTemplate::parse(&base_config()?)?.vary(
+    let doc = typed_rendered(&ConfigTemplate::parse(&base_with_egress()?)?.vary(
         &variant,
         &launcher(),
         &*(tools()?),
     )?)?;
     assert!(doc.fleets[0].actions.grants.contains(&Capability::Network));
     assert!(doc.execution.egress.is_some());
-    let egress = doc
-        .sandbox
-        .bwrap
-        .expect("bwrap sandbox")
-        .egress
-        .expect("egress helpers");
-    assert_eq!(egress.nft, PathBuf::from("/nix/store/egress/bin/nft"));
     assert_eq!(doc.execution.input_links, InputLinks::Keep);
     Ok(())
 }
 
 #[test]
-fn network_grant_requires_tools_and_policy() -> gang_e2e::Result<()> {
+fn network_grant_requires_bwrap() -> gang_e2e::Result<()> {
     let variant = Variant {
         permit_network: PermitNetwork::Permitted,
-        ..Variant::baseline(Sandbox::Bwrap)
+        ..Variant::baseline(Sandbox::Noop)
     };
-    let mut missing_tools = tools()?;
-    missing_tools.egress = None;
     assert!(
         ConfigTemplate::parse(&base_config()?)?
-            .vary(&variant, &launcher(), &missing_tools)
-            .is_err()
-    );
-    let mut missing_policy = tools()?;
-    missing_policy.egress.as_mut().expect("egress tools").policy = None;
-    assert!(
-        ConfigTemplate::parse(&base_config()?)?
-            .vary(&variant, &launcher(), &missing_policy)
-            .is_err()
-    );
-    let mut relative_tool = tools()?;
-    relative_tool.egress.as_mut().expect("egress tools").nft = "nft".into();
-    assert!(
-        ConfigTemplate::parse(&base_config()?)?
-            .vary(&variant, &launcher(), &relative_tool)
+            .vary(&variant, &launcher(), &*(tools()?))
             .is_err()
     );
     Ok(())
@@ -1705,7 +1662,12 @@ fn every_rendered_variant_parses_with_the_real_plugins() -> gang_e2e::Result<()>
 
     let check = |variant: Variant, transport: Transport, preset: &str| -> gang_e2e::Result<()> {
         let result: gang_e2e::Result<()> = (|| {
-            let template = ConfigTemplate::parse(&base)?
+            let configured = if variant.permit_network == PermitNetwork::Permitted {
+                base_with_egress()?
+            } else {
+                base.clone()
+            };
+            let template = ConfigTemplate::parse(&configured)?
                 .place(&placement, transport)?
                 .vary(&variant, &worker_launcher, &*(tools()?))?;
             let template = if transport == Transport::Tls {

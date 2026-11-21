@@ -242,6 +242,7 @@ fn execute(sandbox: &Sandbox) -> Result<ActionExecutionOutcome, Box<dyn Error>> 
         action_directory: Path::new("/work"),
         working_directory: Path::new("/work"),
         network: NetworkAccess::Offline,
+        memory_cgroup: None,
     };
     Ok(ready(async { sandbox.start(&spec).await?.wait().await })?)
 }

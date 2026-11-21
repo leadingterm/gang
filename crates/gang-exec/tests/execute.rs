@@ -86,6 +86,7 @@ fn action<'a>(
             action_directory,
             working_directory,
             network: NetworkAccess::Offline,
+            memory_cgroup: None,
             launcher: &[],
         },
         limits: limits(),

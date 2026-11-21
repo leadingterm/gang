@@ -40,13 +40,6 @@ pub struct Bwrap {
     pub(crate) egress: Option<EgressPrograms>,
 }
 
-/// Descriptors inherited only by the initial bubblewrap spawn.
-#[cfg(target_os = "linux")]
-pub(crate) struct NetworkSetup {
-    pub gate: gang_os::ExecutionGateChild,
-    pub resolver: std::fs::File,
-}
-
 /// A spawned bubblewrap and the process identifiers used for signal relay.
 pub(crate) struct StartedBwrap {
     pub child: tokio::process::Child,
@@ -165,21 +158,17 @@ impl Plugin for Bwrap {
 }
 
 fn validate_egress_paths(egress: Option<&EgressPrograms>) -> Result<(), PortError> {
-    if let Some(helpers) = egress {
-        for path in [
-            &helpers.slirp4netns,
-            &helpers.nft,
-            &helpers.nsenter,
-            &helpers.ip,
-        ] {
-            if !path.is_absolute() {
-                return Err(BwrapError::NetworkSetup(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("egress helper path {} is not absolute", path.display()),
-                ))
-                .into());
-            }
-        }
+    if let Some(helpers) = egress
+        && !helpers.program.is_absolute()
+    {
+        return Err(BwrapError::NetworkSetup(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "egress helper path {} is not absolute",
+                helpers.program.display()
+            ),
+        ))
+        .into());
     }
     Ok(())
 }
@@ -204,12 +193,10 @@ impl Bwrap {
     pub(crate) fn spawn(
         &self,
         spec: &ActionExecutionSpec<'_>,
-        network: Option<(BorrowedFd<'_>, BorrowedFd<'_>)>,
+        network: Option<BorrowedFd<'_>>,
     ) -> Result<StartedBwrap, BwrapError> {
         let (reader, writer) = std::io::pipe().map_err(BwrapError::InfoPipe)?;
-        if let Some((gate, resolver)) = network {
-            rustix::io::fcntl_setfd(gate, rustix::io::FdFlags::empty())
-                .map_err(|errno| BwrapError::NetworkSetup(io::Error::from(errno)))?;
+        if let Some(resolver) = network {
             rustix::io::fcntl_setfd(resolver, rustix::io::FdFlags::empty())
                 .map_err(|errno| BwrapError::NetworkSetup(io::Error::from(errno)))?;
         }
@@ -258,53 +245,88 @@ impl ActionIsolationPort for Bwrap {
         {
             return Err(BwrapError::ActionDirectory(action.to_path_buf()).into());
         }
-        match spec.network {
-            NetworkAccess::Offline => {
-                let mut started = self.spawn(spec, None)?;
-                started.read_info().await?;
-                let StartedBwrap {
-                    mut child,
-                    launcher,
-                    sandbox,
-                    ..
-                } = started;
-                let wait = async move {
-                    let status = child.wait().await.map_err(BwrapError::Wait)?;
-                    ActionExecutionOutcome::try_from(status)
-                };
-                match (launcher, sandbox) {
-                    (Some(launcher), Some(sandbox)) => {
-                        let relay = Relay::new(launcher, sandbox);
-                        Ok(SandboxedAction::relayed(wait, move |termination| {
-                            relay.relay(termination).map_err(PortError::from)
-                        }))
-                    }
-                    _ => Ok(SandboxedAction::new(wait)),
-                }
-            }
+        let resolver: Option<std::fs::File> = match spec.network {
+            NetworkAccess::Offline => None,
             NetworkAccess::PublicEgress {
                 policy,
                 controller_endpoints,
             } => {
+                if self.egress.is_none() {
+                    return Err(BwrapError::NetworkNotConfigured.into());
+                }
                 #[cfg(target_os = "linux")]
                 {
-                    crate::egress::start(self, spec, policy, controller_endpoints).await
+                    let cgroup = spec.memory_cgroup.ok_or_else(|| {
+                        BwrapError::NetworkSetup(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "public egress requires an action memory cgroup",
+                        ))
+                    })?;
+                    crate::host_egress::verify_host_egress(policy, controller_endpoints, cgroup)
+                        .map_err(BwrapError::NetworkSetup)?;
+                    Some(resolver_file(policy).map_err(BwrapError::NetworkSetup)?)
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
                     let _ = (policy, controller_endpoints);
-                    if self.egress.is_none() {
-                        return Err(BwrapError::NetworkNotConfigured.into());
-                    }
-                    Err(BwrapError::NetworkSetup(io::Error::new(
+                    return Err(BwrapError::NetworkSetup(io::Error::new(
                         io::ErrorKind::Unsupported,
                         "public egress requires Linux",
                     ))
-                    .into())
+                    .into());
                 }
             }
+        };
+        use std::os::fd::AsFd;
+        let mut started = self.spawn(spec, resolver.as_ref().map(AsFd::as_fd))?;
+        match spec.network {
+            NetworkAccess::PublicEgress { policy, .. } => {
+                tokio::time::timeout(policy.setup_timeout.get(), started.read_info())
+                    .await
+                    .map_err(|_| BwrapError::NetworkTimeout(policy.setup_timeout))??;
+            }
+            NetworkAccess::Offline => started.read_info().await?,
+        }
+        let StartedBwrap {
+            mut child,
+            launcher,
+            sandbox,
+            ..
+        } = started;
+        let wait = async move {
+            let status = child.wait().await.map_err(BwrapError::Wait)?;
+            ActionExecutionOutcome::try_from(status)
+        };
+        match (launcher, sandbox) {
+            (Some(launcher), Some(sandbox)) => {
+                let relay = Relay::new(launcher, sandbox);
+                Ok(SandboxedAction::relayed(wait, move |termination| {
+                    relay.relay(termination).map_err(PortError::from)
+                }))
+            }
+            _ => Ok(SandboxedAction::new(wait)),
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn resolver_file(policy: &gang_types::PublicEgressPolicy) -> io::Result<std::fs::File> {
+    use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals, memfd_create};
+    use std::io::{Seek, SeekFrom, Write};
+    let fd = memfd_create(
+        "gang-resolver",
+        MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+    )?;
+    let mut file = std::fs::File::from(fd);
+    for address in &policy.dns_servers {
+        writeln!(file, "nameserver {address}")?;
+    }
+    file.seek(SeekFrom::Start(0))?;
+    fcntl_add_seals(
+        &file,
+        SealFlags::WRITE | SealFlags::GROW | SealFlags::SHRINK | SealFlags::SEAL,
+    )?;
+    Ok(file)
 }
 
 /// The report `bwrap` writes on its `--info-fd`; fields it does not name are ignored.
@@ -477,6 +499,7 @@ pub(super) mod tests {
                 action_directory: Path::new(path),
                 working_directory: Path::new(path),
                 network: NetworkAccess::Offline,
+                memory_cgroup: None,
                 launcher: &[],
             };
             assert!(sandbox.start(&spec).await.is_err(), "{path}");
@@ -487,6 +510,7 @@ pub(super) mod tests {
             action_directory: Path::new("/tmp/action"),
             working_directory: Path::new("/tmp/action"),
             network: NetworkAccess::Offline,
+            memory_cgroup: None,
             launcher: &[],
         };
         assert_eq!(
@@ -563,34 +587,75 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn rejects_each_relative_egress_helper() {
+    fn rejects_relative_egress_program() {
         let directory = tempfile::tempdir().expect("fixture");
-        let absolute = || crate::EgressPrograms {
-            slirp4netns: "/usr/bin/slirp4netns".into(),
-            nft: "/usr/bin/nft".into(),
-            nsenter: "/usr/bin/nsenter".into(),
-            ip: "/usr/bin/ip".into(),
-        };
-        for index in 0..4 {
-            let mut helpers = absolute();
-            match index {
-                0 => helpers.slirp4netns = "slirp4netns".into(),
-                1 => helpers.nft = "nft".into(),
-                2 => helpers.nsenter = "nsenter".into(),
-                _ => helpers.ip = "ip".into(),
-            }
-            let config = BwrapConfig {
-                egress: Some(helpers),
-                ..config(directory.path())
-            };
-            let error = Bwrap::build(config, &context()).expect_err("relative helper rejected");
-            assert!(error.to_string().contains("egress"), "{error}");
-        }
         let config = BwrapConfig {
-            egress: Some(absolute()),
+            egress: Some(crate::EgressPrograms {
+                program: "pasta".into(),
+            }),
             ..config(directory.path())
         };
-        assert!(Bwrap::build(config, &context()).is_ok());
+        let error = Bwrap::build(config, &context()).expect_err("relative helper rejected");
+        assert!(error.to_string().contains("egress"), "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolver_contains_only_configured_servers_and_is_sealed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use rustix::fs::{SealFlags, fcntl_get_seals};
+        use std::io::{Read, Write};
+        let policy: gang_types::PublicEgressPolicy = toml::from_str(
+            "protected_networks = ['10.0.0.0/8']\ndns_servers = ['1.1.1.1', '2606:4700:4700::1111']",
+        )?;
+        let mut file = super::resolver_file(&policy)?;
+        assert!(
+            fcntl_get_seals(&file)?
+                .contains(SealFlags::WRITE | SealFlags::GROW | SealFlags::SHRINK | SealFlags::SEAL)
+        );
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+        assert_eq!(
+            contents,
+            "nameserver 1.1.1.1\nnameserver 2606:4700:4700::1111\n"
+        );
+        assert!(file.write_all(b"unexpected").is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn granted_action_requires_cgroup_before_spawn() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let config = BwrapConfig {
+            egress: Some(crate::EgressPrograms {
+                program: "/no/such/pasta".into(),
+            }),
+            ..config(directory.path())
+        };
+        let sandbox = Bwrap::build(config, &context())?;
+        let argv = [OsString::from("/bin/true")];
+        let policy: gang_types::PublicEgressPolicy =
+            toml::from_str("protected_networks = ['10.0.0.0/8']\ndns_servers = ['1.1.1.1']")?;
+        let spec = ActionExecutionSpec {
+            command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
+            environment: &[],
+            action_directory: directory.path(),
+            working_directory: directory.path(),
+            network: NetworkAccess::PublicEgress {
+                policy: &policy,
+                controller_endpoints: &[],
+            },
+            memory_cgroup: None,
+            launcher: &[],
+        };
+        let error = match sandbox.start(&spec).await {
+            Ok(_) => return Err("granted action without cgroup unexpectedly started".into()),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("public egress"));
+        Ok(())
     }
 
     /// The launcher inherits blocked signals and stays in the caller's group.
@@ -615,6 +680,7 @@ pub(super) mod tests {
             action_directory: directory.path(),
             working_directory: directory.path(),
             network: NetworkAccess::Offline,
+            memory_cgroup: None,
         };
         let mut action = bwrap.start(&spec).await?;
         assert!(matches!(
@@ -664,6 +730,7 @@ pub(super) mod tests {
             action_directory: directory.path(),
             working_directory: directory.path(),
             network: NetworkAccess::Offline,
+            memory_cgroup: None,
         };
 
         let outcome = bwrap.start(&spec).await?.wait().await?;
@@ -692,6 +759,7 @@ pub(super) mod tests {
             action_directory: directory.path(),
             working_directory: directory.path(),
             network: NetworkAccess::Offline,
+            memory_cgroup: None,
         };
         for _ in 0..2 {
             let (first, second) = timeout(LIMIT, async {
@@ -726,6 +794,7 @@ pub(super) mod tests {
             action_directory: directory.path(),
             working_directory: directory.path(),
             network: NetworkAccess::Offline,
+            memory_cgroup: None,
         };
         let result = bwrap.start(&spec).await;
         assert!(matches!(
@@ -771,6 +840,7 @@ pub(super) mod tests {
             action_directory: directory.path(),
             working_directory: directory.path(),
             network: NetworkAccess::Offline,
+            memory_cgroup: None,
         };
 
         let result = bwrap.start(&spec).await;
@@ -803,6 +873,7 @@ pub(super) mod tests {
             action_directory: directory.path(),
             working_directory: directory.path(),
             network: NetworkAccess::Offline,
+            memory_cgroup: None,
         };
 
         let running = bwrap.start(&spec).await?;
@@ -851,6 +922,7 @@ pub(super) mod tests {
             action_directory: directory.path(),
             working_directory: directory.path(),
             network: NetworkAccess::Offline,
+            memory_cgroup: None,
         };
 
         let mut running = bwrap.start(&spec).await?;
@@ -889,6 +961,7 @@ pub(super) mod tests {
             action_directory: directory.path(),
             working_directory: directory.path(),
             network: NetworkAccess::Offline,
+            memory_cgroup: None,
         };
 
         let mut running = bwrap.start(&spec).await?;

@@ -329,7 +329,7 @@ impl ConfigTemplate {
     fn project_egress(
         document: &mut Document<Plugins>,
         variant: &Variant,
-        tools: &ActionTools,
+        _tools: &ActionTools,
     ) -> Result<()> {
         let fleet = document
             .fleets
@@ -340,52 +340,11 @@ impl ConfigTemplate {
             Sandbox::Noop => SandboxKey::Noop,
         };
         fleet.actions.grants.remove(&Capability::Network);
-        document.execution.egress = None;
-        if let Some(bwrap) = document.sandbox.bwrap.as_mut() {
-            bwrap.egress = None;
-        }
         if variant.permit_network == PermitNetwork::Permitted {
             if variant.sandbox != Sandbox::Bwrap {
                 return Err(template_error("network grants require the bwrap sandbox"));
             }
-            let egress = tools
-                .egress
-                .as_ref()
-                .ok_or_else(|| template_error("missing egress tools"))?;
-            for path in [
-                &egress.slirp4netns,
-                &egress.nft,
-                &egress.nsenter,
-                &egress.ip,
-                &egress.unshare,
-                &egress.probe,
-                &egress.peer,
-            ] {
-                if !path.is_absolute() {
-                    return Err(template_error(format!(
-                        "egress tool path is not absolute: {}",
-                        path.display()
-                    )));
-                }
-            }
-            document.execution.egress = Some(
-                egress
-                    .policy
-                    .clone()
-                    .ok_or_else(|| template_error("missing egress policy"))?,
-            );
             fleet.actions.grants.insert(Capability::Network);
-            let bwrap = document
-                .sandbox
-                .bwrap
-                .as_mut()
-                .ok_or_else(|| template_error("missing [sandbox.bwrap]"))?;
-            bwrap.egress = Some(gang_bwrap::EgressPrograms {
-                slirp4netns: egress.slirp4netns.clone(),
-                nft: egress.nft.clone(),
-                nsenter: egress.nsenter.clone(),
-                ip: egress.ip.clone(),
-            });
         }
         Ok(())
     }

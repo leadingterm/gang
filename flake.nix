@@ -138,7 +138,13 @@
       testsDir = ./infra/nixos/tests;
       tests = lib.filterAttrs (file: type: type == "regular" && lib.hasSuffix ".nix" file) (builtins.readDir testsDir);
     in
-      lib.mapAttrs' (file: _: lib.nameValuePair (lib.removeSuffix ".nix" file) (import (testsDir + "/${file}") {inherit pkgs;})) tests);
+      lib.mapAttrs' (file: _:
+        lib.nameValuePair (lib.removeSuffix ".nix" file) (import (testsDir + "/${file}") ({inherit pkgs;}
+          // lib.optionalAttrs (file == "action-network.nix") {
+            gang = gangPackage pkgs "${gang-binaries}/${system}/gang";
+            helper = "${gang-binaries}/${system}/action_network";
+          })))
+      tests);
 
     packages =
       forLinuxSystems (system: let
@@ -228,16 +234,11 @@
               pkgs.zstd
             ]
             ++ deployTools
-            ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.bubblewrap pkgs.slirp4netns pkgs.nftables pkgs.util-linux pkgs.iproute2];
+            ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.bubblewrap (import ./infra/nixos/pasta.nix {inherit pkgs;}) pkgs.nftables];
         }
         // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           GANG_E2E_ACTION_ROOTFS = "${self.packages.${system}.action-rootfs-e2e}";
           GANG_E2E_BWRAP = "${pkgs.bubblewrap}/bin/bwrap";
-          GANG_E2E_SLIRP4NETNS = "${pkgs.slirp4netns}/bin/slirp4netns";
-          GANG_E2E_NFT = "${pkgs.nftables}/bin/nft";
-          GANG_E2E_NSENTER = "${pkgs.util-linux}/bin/nsenter";
-          GANG_E2E_IP = "${pkgs.iproute2}/bin/ip";
-          GANG_E2E_UNSHARE = "${pkgs.util-linux}/bin/unshare";
           # The browser of the identity scenario's device approval, which observes what only a browser enforces: the dashboard's Content-Security-Policy.
           # Pinned by flake.lock's nixpkgs, like bubblewrap; never taken from the host PATH.
           GANG_E2E_CHROMIUM = "${e2eChromium}/bin/chromium";

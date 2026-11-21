@@ -205,6 +205,7 @@ where
             action_directory: &directory.path,
             working_directory: &directory.working_directory,
             network,
+            memory_cgroup: None,
             launcher: &[],
         },
         limits: properties.limits,

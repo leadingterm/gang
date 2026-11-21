@@ -404,80 +404,11 @@ flaw! {
         => only [names::lifecycle::IDLE_DRAIN]
 }
 
-fn network_targets() -> gang_e2e::Result<gang_e2e::EgressTargets> {
-    Ok(gang_e2e::EgressTargets {
-        public_ipv4: "93.184.216.34:1234"
-            .parse()
-            .map_err(|error| gang_e2e::E2eError::system(format!("{error}")))?,
-        public_ipv6: "[2001:4860:1234::34]:1234"
-            .parse()
-            .map_err(|error| gang_e2e::E2eError::system(format!("{error}")))?,
-        blocked: [(
-            "imds4".to_owned(),
-            "169.254.169.254:1234"
-                .parse()
-                .map_err(|error| gang_e2e::E2eError::system(format!("{error}")))?,
-        )]
-        .into(),
-        dns: "93.184.216.34"
-            .parse()
-            .map_err(|error| gang_e2e::E2eError::system(format!("{error}")))?,
-        nonce: "fixture".to_owned(),
-        uid: 1000,
-        gid: 1000,
-        timeout: std::time::Duration::from_secs(1),
-        policy: gang_types::PublicEgressPolicy {
-            protected_networks: vec![
-                "10.0.0.0/8"
-                    .parse()
-                    .map_err(|error| gang_e2e::E2eError::system(format!("{error}")))?,
-            ]
-            .into_boxed_slice(),
-            dns_servers: vec![
-                "93.184.216.34"
-                    .parse()
-                    .map_err(|error| gang_e2e::E2eError::system(format!("{error}")))?,
-            ]
-            .into_boxed_slice(),
-            setup_timeout: gang_types::NonZeroDuration::from_secs(1),
-        },
-    })
-}
-
 #[test]
-fn network_admission_and_egress_are_compliant() -> gang_e2e::Result<()> {
-    for permit_network in [
-        gang_e2e::PermitNetwork::Denied,
-        gang_e2e::PermitNetwork::Permitted,
-    ] {
-        let variant = Variant {
-            permit_network,
-            ..baseline(Sandbox::Bwrap)
-        };
-        let system = Simulation::new(&variant, Behaviour::COMPLIANT);
-        assert_compliant(&network(&system, &variant, &network_targets()?)?);
-    }
-    Ok(())
-}
-
-#[test]
-fn network_rejects_unisolated_granted_actions() -> gang_e2e::Result<()> {
-    let variant = Variant {
-        permit_network: gang_e2e::PermitNetwork::Permitted,
-        ..baseline(Sandbox::Bwrap)
-    };
-    let system = Simulation::new(
-        &variant,
-        Behaviour {
-            isolation: Isolation::Leaky,
-            ..Behaviour::COMPLIANT
-        },
-    );
-    assert!(
-        network(&system, &variant, &network_targets()?)?
-            .iter()
-            .any(Check::is_failure)
-    );
+fn network_admission_is_compliant() -> gang_e2e::Result<()> {
+    let variant = baseline(Sandbox::Bwrap);
+    let system = Simulation::new(&variant, Behaviour::COMPLIANT);
+    assert_compliant(&network(&system)?);
     Ok(())
 }
 
@@ -491,11 +422,7 @@ fn network_rejects_missing_admission() -> gang_e2e::Result<()> {
             ..Behaviour::COMPLIANT
         },
     );
-    assert!(
-        network(&system, &variant, &network_targets()?)?
-            .iter()
-            .any(Check::is_failure)
-    );
+    assert!(network(&system)?.iter().any(Check::is_failure));
     Ok(())
 }
 

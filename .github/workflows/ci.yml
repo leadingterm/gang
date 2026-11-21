@@ -43,7 +43,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/family=m8i/image=ubuntu24-full-x64/nested-virt', github.run_id) || 'ubuntu-24.04' }}
-    timeout-minutes: 25
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -52,10 +52,20 @@ jobs:
         with:
           kvm: 'true'
           cache-save: 'true'
+      - uses: ./.github/actions/setup-bazel
+        with:
+          cache-job: linux-x86_64
+          restore-only: 'true'
+      - name: Stage VM binaries
+        run: |
+          bazel build //:gang //crates/gang-e2e:action_network
+          mkdir -p "$RUNNER_TEMP/gang-binaries/x86_64-linux"
+          cp "$(bazel cquery --output=files //:gang)" "$RUNNER_TEMP/gang-binaries/x86_64-linux/gang"
+          cp "$(bazel cquery --output=files //crates/gang-e2e:action_network)" "$RUNNER_TEMP/gang-binaries/x86_64-linux/action_network"
       - name: Run NixOS VM checks
-        env:
-          NIX_CHECK_RESULTS: ${{ runner.temp }}/nix-check-results
-        run: tools/lint.sh --nix-vm
+        run: |
+          nix build --no-link --print-build-logs --override-input gang-binaries "path:$RUNNER_TEMP/gang-binaries" \
+            $(nix eval --json .#checks.x86_64-linux --apply builtins.attrNames | jq -r '.[] | ".#checks.x86_64-linux.\(.)"')
 
   lint:
     needs: changes

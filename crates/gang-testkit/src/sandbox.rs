@@ -182,6 +182,7 @@ mod tests {
             action_directory: Path::new("/work"),
             working_directory: Path::new("/work"),
             network: NetworkAccess::Offline,
+            memory_cgroup: None,
             launcher: &[],
         }))?)
     }
@@ -258,6 +259,7 @@ mod tests {
                 policy: &policy,
                 controller_endpoints: &endpoints,
             },
+            memory_cgroup: None,
             launcher: &[],
         };
         let _action = ready(sandbox.start(&action))?;

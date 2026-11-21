@@ -20,7 +20,6 @@ pub(crate) enum BwrapError {
     /// Public egress setup failed.
     #[error("cannot set up public egress")]
     NetworkSetup(#[source] io::Error),
-    #[cfg(target_os = "linux")]
     /// Public egress setup did not finish before its deadline.
     #[error("public egress setup exceeded {0}")]
     NetworkTimeout(gang_types::NonZeroDuration),
