@@ -1353,6 +1353,7 @@ mod tests {
             "desired": 6,
             "instances": {"pending": 1, "inService": 5, "terminating": 0, "warm": 2},
             "workers": {"busy": 3, "idle": 1, "draining": 1, "unconnected": 0},
+            "workerCache": FleetWorkerCache::default(),
             "demand": {
                 "running": 3,
                 "queued": 7,
@@ -1362,6 +1363,21 @@ mod tests {
                 "memory": 103_079_215_104_u64,
             },
         })
+    }
+
+    #[test]
+    fn fleet_without_worker_cache_defaults_and_reserializes_it() {
+        let mut legacy = fleet_value();
+        legacy.as_object_mut().expect("fleet is an object").remove("workerCache");
+
+        let fleet: Fleet = serde_json::from_value(legacy).expect("legacy fleet parses");
+        assert_eq!(fleet.worker_cache.reporting, 0);
+        assert_eq!(fleet.worker_cache.workers, 0);
+        assert_eq!(fleet.worker_cache.totals, WorkerCache::default());
+        assert_eq!(
+            serde_json::to_value(&fleet).expect("fleet serializes"),
+            fleet_value()
+        );
     }
 
     #[test]

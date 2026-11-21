@@ -565,7 +565,7 @@ test("worker cache distinguishes measured, zero, missing and stale reports", (t)
   const staleDetail = html({ state: staleState }, <WorkerDetail w={measured} state={staleState} />);
   for (const markup of [unknown, staleDetail]) {
     for (const label of ["local reads", "slow-store fetches", "evictions", "used / budget"]) {
-      t.assert.ok(markup.includes(`<dt>${label}</dt><dd class="mono">unknown</dd>`), label);
+      t.assert.equal(markup.includes(`<dt>${label}</dt><dd class="mono">unknown</dd>`), true, label);
     }
   }
 });

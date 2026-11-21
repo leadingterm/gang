@@ -658,12 +658,12 @@ fn worker_cache_snapshot_and_delta_round_trip_over_sse() -> TestResult {
     let delta_bytes = gang_state::sse::encode(FrameRef::Delta(&delta))?;
     let mut decoder = gang_state::sse::Decoder::new();
     let frames = decoder.push(&[snapshot_bytes, delta_bytes].concat())?;
-    let [Frame::Snapshot(mut rebuilt), Frame::Delta(decoded)] =
+    let [Frame::Snapshot(mut rebuilt), Frame::Delta(change)] =
         <[Frame; 2]>::try_from(frames).map_err(|_| "expected snapshot and delta")?
     else {
         return Err("wrong frame types".into());
     };
-    gang_state::apply(&mut rebuilt, &decoded)?;
+    gang_state::apply(&mut rebuilt, &change)?;
     assert_eq!(rebuilt, second);
     Ok(())
 }
@@ -695,9 +695,9 @@ fn worker_cache_fleet_sums_saturate_each_measurement() -> TestResult {
         world.snapshot.workers.push(worker);
     }
     let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
-    let state = fill(&mut builder, &blank(), 1, &world, 1_000, ok(0))?;
+    let snapshot = fill(&mut builder, &blank(), 1, &world, 1_000, ok(0))?;
     assert_eq!(
-        state.fleets[0].worker_cache.totals,
+        snapshot.fleets[0].worker_cache.totals,
         WorkerCache {
             local: CacheReads {
                 requests: u64::MAX,
