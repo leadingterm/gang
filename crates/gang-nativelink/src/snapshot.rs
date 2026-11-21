@@ -159,18 +159,12 @@ pub(crate) fn learned_reservation(
     info: &NativeActionInfo,
     fitted: ActionResources,
 ) -> Option<ActionResources> {
-    let memory = info.memory_reservation.as_ref();
-    let cpu_millicores = info.pre_fit_cpu_millicores
-        .or_else(|| memory.and_then(|reservation| reservation.cpu_before_memory_fit))
-        .unwrap_or(fitted.cpu_millicores);
-    let learned_memory = memory.and_then(|reservation| reservation.desired_kb).map_or(
-        fitted.memory,
-        |kb| Bytes::new(kb.saturating_mul(Bytes::kib(1).get())),
-    );
-    (cpu_millicores > fitted.cpu_millicores || learned_memory > fitted.memory).then_some(
+    let reservation = info.pre_fit_reservation.as_ref()?;
+    let memory = Bytes::new(reservation.memory_bytes);
+    (reservation.cpu_millicores > fitted.cpu_millicores || memory > fitted.memory).then_some(
         ActionResources {
-            cpu_millicores,
-            memory: learned_memory,
+            cpu_millicores: reservation.cpu_millicores,
+            memory,
             disk: Bytes::new(0),
         },
     )

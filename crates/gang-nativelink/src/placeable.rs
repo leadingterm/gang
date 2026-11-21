@@ -179,7 +179,9 @@ mod tests {
 
     use gang_types::{Bytes, FleetName, FleetProperties, Isa, Resources, property};
     use nativelink_error::Code;
-    use nativelink_util::action_messages::{ActionState, ActionUniqueKey, ActionUniqueQualifier};
+    use nativelink_util::action_messages::{
+        ActionReservation, ActionState, ActionUniqueKey, ActionUniqueQualifier,
+    };
     use nativelink_util::common::DigestInfo;
     use nativelink_util::digest_hasher::DigestHasherFunc;
     use nativelink_util::origin_event::OriginMetadata;
@@ -298,8 +300,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-            memory_reservation: None,
-            pre_fit_cpu_millicores: None,
+            pre_fit_reservation: None,
             priority: 0,
             load_timestamp: UNIX_EPOCH,
             insert_timestamp: UNIX_EPOCH,
@@ -412,8 +413,11 @@ mod tests {
                 expected
             );
             assert_eq!(
-                fake.calls.lock().last().expect("recorded").pre_fit_cpu_millicores,
-                pre_fit_cpu
+                fake.calls.lock().last().expect("recorded").pre_fit_reservation,
+                pre_fit_cpu.map(|cpu_millicores| ActionReservation {
+                    cpu_millicores,
+                    memory_bytes: 0,
+                })
             );
         }
         let outer = PlaceableActions::new(Arc::new(fitted), fleets, admitted);
@@ -540,6 +544,13 @@ mod tests {
         let properties = &calls[0].platform_properties;
         assert_eq!(properties[property::MEMORY_KB], "8388608");
         assert_eq!(properties[property::CPU_MILLICORES], "6000");
+        assert_eq!(
+            calls[0].pre_fit_reservation,
+            Some(ActionReservation {
+                cpu_millicores: 0,
+                memory_bytes: 8_808_039 * 1024,
+            })
+        );
     }
 
     #[tokio::test]
@@ -663,7 +674,38 @@ mod tests {
         let fitted = &calls[0];
         assert_eq!(fitted.platform_properties[property::CPU_MILLICORES], "15000");
         assert_eq!(fitted.platform_properties[property::MEMORY_KB], "67108864");
-        assert_eq!(fitted.pre_fit_cpu_millicores, Some(871000));
+        assert_eq!(
+            fitted.pre_fit_reservation,
+            Some(ActionReservation {
+                cpu_millicores: 871000,
+                memory_bytes: 73_400_320 * 1024,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_fit_reservation_includes_configured_memory_minimum() {
+        let fake = Arc::new(Fake::default());
+        let fitted = FittedActions::new(
+            fake.clone(),
+            large_memory_catalog(),
+            AdmittedFleets::default(),
+            MinReservation::from_units(73_400_320),
+            DiskMinReservation::from_units(2048),
+        );
+        fitted
+            .add_action(operation(), info(property::MEMORY_KB, "1"))
+            .await
+            .expect("fitted");
+        let calls = fake.calls.lock();
+        assert_eq!(calls[0].platform_properties[property::MEMORY_KB], "67108864");
+        assert_eq!(
+            calls[0].pre_fit_reservation,
+            Some(ActionReservation {
+                cpu_millicores: 0,
+                memory_bytes: 73_400_320 * 1024,
+            })
+        );
     }
 
     #[tokio::test]

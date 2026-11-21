@@ -11,13 +11,13 @@ use nativelink_metric::{
     MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent, RootMetricsComponent,
 };
 use nativelink_scheduler::known_platform_property_provider::KnownPlatformPropertyProvider;
-use nativelink_util::action_messages::{ActionInfo, OperationId};
+use nativelink_util::action_messages::{ActionInfo, ActionReservation, OperationId};
 use nativelink_util::operation_state_manager::{
     ActionStateResult, ActionStateResultStream, ClientStateManager, OperationFilter,
 };
 
 use crate::placeable::AdmittedFleets;
-use crate::snapshot::resources;
+use crate::snapshot::{admitted_resources, resources};
 
 /// Fits reservations after historical learning and before the simple scheduler.
 pub(crate) struct FittedActions {
@@ -76,14 +76,6 @@ impl ClientStateManager for FittedActions {
         operation: OperationId,
         mut action_info: Arc<ActionInfo>,
     ) -> Result<Box<dyn ActionStateResult>, Error> {
-        let pre_fit_cpu = resources(&action_info.platform_properties).cpu_millicores;
-        let fitted_cpu = |info: &ActionInfo| {
-            info.platform_properties
-                .get(property::CPU_MILLICORES)
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or_else(|| resources(&info.platform_properties).cpu_millicores)
-        };
-        let mut cpu_clamped_before_promotion = false;
         let admitted = self
             .admitted
             .take(&operation)
@@ -105,6 +97,11 @@ impl ClientStateManager for FittedActions {
                     .insert(key.to_owned(), min_kb.to_string());
             }
         }
+        let original = resources(&action_info.platform_properties);
+        let original = ActionReservation {
+            cpu_millicores: original.cpu_millicores,
+            memory_bytes: original.memory.get(),
+        };
         // Match the other requested properties before choosing the largest eligible capacity.
         // This avoids selecting a smaller fleet merely because it is earlier in preference order.
         for key in [property::MEMORY_KB, property::DISK_KB] {
@@ -162,17 +159,16 @@ impl ClientStateManager for FittedActions {
             for (key, limit) in fit.lowered {
                 properties.insert(key.to_owned(), limit.to_string());
             }
-            cpu_clamped_before_promotion = fitted_cpu(&action_info) < pre_fit_cpu;
-            let properties = &mut Arc::make_mut(&mut action_info).platform_properties;
             if let Some(whole_cpu) = whole_cpu {
                 properties.insert(property::CPU_MILLICORES.to_owned(), whole_cpu.to_string());
             }
         }
-        let pre_fit_cpu_millicores =
-            (cpu_clamped_before_promotion || fitted_cpu(&action_info) < pre_fit_cpu)
-                .then_some(pre_fit_cpu);
-        if action_info.pre_fit_cpu_millicores != pre_fit_cpu_millicores {
-            Arc::make_mut(&mut action_info).pre_fit_cpu_millicores = pre_fit_cpu_millicores;
+        let fitted = admitted_resources(&action_info.platform_properties);
+        let pre_fit_reservation = (fitted.cpu_millicores < original.cpu_millicores
+            || fitted.memory.get() < original.memory_bytes)
+            .then_some(original);
+        if action_info.pre_fit_reservation != pre_fit_reservation {
+            Arc::make_mut(&mut action_info).pre_fit_reservation = pre_fit_reservation;
         }
         self.inner.add_action(operation, action_info).await
     }

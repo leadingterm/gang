@@ -511,16 +511,16 @@ test("workers with observed caps retain pips and slot details", (t) => {
 test("worker ledger totals show admission capacity independently of slots and sampled actions", (t) => {
   const worker = live.workers[0];
   if (!worker) throw new Error("the live recording has a worker");
-  const reserved = { cpuMillicores: 12000, memory: 2 * 1024 ** 3 };
+  const reserved = { cpuMillicores: 6000, memory: 2 * 1024 ** 3 };
   const capacity = { cpuMillicores: 8000, memory: 4 * 1024 ** 3 };
   const measured = { ...worker, reserved, capacity };
   const state = { ...live, workers: [measured] };
-  const expected = /CPU admission 12000 millicores \/ 8000 millicores · memory 2 GiB \/ 4 GiB reserved \/ capacity/;
+  const expected = /CPU admission 6000 millicores \/ 8000 millicores · memory 2 GiB \/ 4 GiB reserved \/ capacity/;
   const row = html({ state }, <Workers />);
-  t.assert.match(visibleText(row), /CPU 12000 \/ 8000 mCPU/);
+  t.assert.match(visibleText(row), /CPU 6000 \/ 8000 mCPU/);
   t.assert.match(visibleText(row), /Memory 2 GiB \/ 4 GiB/);
   t.assert.match(row, /title="Reserved \/ admission capacity"/);
-  t.assert.match(row, /aria-label="CPU admission 12000 millicores \/ 8000 millicores/);
+  t.assert.match(row, /aria-label="CPU admission 6000 millicores \/ 8000 millicores/);
   t.assert.match(visibleText(html({ state }, <WorkerDetail w={measured} state={state} />)), expected);
 
   const { reserved: _reserved, capacity: _capacity, ...unknown } = measured;

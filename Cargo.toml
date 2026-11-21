@@ -210,15 +210,15 @@ mimalloc = { version = "0.1" }
 # Carried fork of TraceMachina/nativelink v1.8.3: branch gang is the upstream
 # tag plus fix commits listed in docs/SPECIFICATION.md §3.2. Remove when a
 # pinned upstream release contains them.
-nativelink-config = { git = "https://github.com/leadingterm/nativelink", rev = "77b715f20665c8cd3af5ff376400b83bc52fa20a" }
-nativelink-error = { git = "https://github.com/leadingterm/nativelink", rev = "77b715f20665c8cd3af5ff376400b83bc52fa20a" }
-nativelink-metric = { git = "https://github.com/leadingterm/nativelink", rev = "77b715f20665c8cd3af5ff376400b83bc52fa20a" }
-nativelink-proto = { git = "https://github.com/leadingterm/nativelink", rev = "77b715f20665c8cd3af5ff376400b83bc52fa20a" }
-nativelink-scheduler = { git = "https://github.com/leadingterm/nativelink", rev = "77b715f20665c8cd3af5ff376400b83bc52fa20a" }
-nativelink-service = { git = "https://github.com/leadingterm/nativelink", rev = "77b715f20665c8cd3af5ff376400b83bc52fa20a" }
-nativelink-store = { git = "https://github.com/leadingterm/nativelink", rev = "77b715f20665c8cd3af5ff376400b83bc52fa20a" }
-nativelink-util = { git = "https://github.com/leadingterm/nativelink", rev = "77b715f20665c8cd3af5ff376400b83bc52fa20a" }
-nativelink-worker = { git = "https://github.com/leadingterm/nativelink", rev = "77b715f20665c8cd3af5ff376400b83bc52fa20a" }
+nativelink-config = { git = "https://github.com/leadingterm/nativelink", rev = "c5c5076980bb02fc685ac35882ffe93f0b783461" }
+nativelink-error = { git = "https://github.com/leadingterm/nativelink", rev = "c5c5076980bb02fc685ac35882ffe93f0b783461" }
+nativelink-metric = { git = "https://github.com/leadingterm/nativelink", rev = "c5c5076980bb02fc685ac35882ffe93f0b783461" }
+nativelink-proto = { git = "https://github.com/leadingterm/nativelink", rev = "c5c5076980bb02fc685ac35882ffe93f0b783461" }
+nativelink-scheduler = { git = "https://github.com/leadingterm/nativelink", rev = "c5c5076980bb02fc685ac35882ffe93f0b783461" }
+nativelink-service = { git = "https://github.com/leadingterm/nativelink", rev = "c5c5076980bb02fc685ac35882ffe93f0b783461" }
+nativelink-store = { git = "https://github.com/leadingterm/nativelink", rev = "c5c5076980bb02fc685ac35882ffe93f0b783461" }
+nativelink-util = { git = "https://github.com/leadingterm/nativelink", rev = "c5c5076980bb02fc685ac35882ffe93f0b783461" }
+nativelink-worker = { git = "https://github.com/leadingterm/nativelink", rev = "c5c5076980bb02fc685ac35882ffe93f0b783461" }
 num-traits = { default-features = false, version = "0.2.19" }
 object = { default-features = false, features = [
     "elf",
