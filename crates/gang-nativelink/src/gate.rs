@@ -22,16 +22,14 @@ use crate::standing::{Standing, hold};
 pub(crate) struct GateState<G> {
     pub(crate) gate: G,
     pub(crate) scope: RequestScope,
-    pub(crate) force_not_leading: bool,
 }
 
 /// Runs `gate` on a request and passes the request on when the gate admits it. The request's
 /// [`Peer`] comes from the request extensions; a request without one has the default peer. When the
-/// request carries its unproven connection's [`Standing`], it counts as in flight until its
-/// response body is done. An authenticated admission is the one source of both what follows from
-/// it: it proves the connection, after which its requests are no longer tracked, and it gives the
-/// services behind the gate the caller's [`Authenticated`](gang_spi::Authenticated) identity in
-/// the request extensions.
+/// request carries its connection's [`Standing`], it counts as in flight until its response body
+/// is done, including after authentication. An authenticated admission proves the connection
+/// and gives the services behind the gate the caller's
+/// [`Authenticated`](gang_spi::Authenticated) identity in the request extensions.
 pub(crate) async fn admit<G: RequestGate>(
     State(state): State<GateState<G>>,
     request: Request,
@@ -45,16 +43,12 @@ pub(crate) async fn admit<G: RequestGate>(
     let grpc = is_grpc(&request);
     let standing = request.extensions().get::<Arc<Standing>>().cloned();
     let unproven = standing.as_ref().filter(|standing| !standing.is_proven());
-    let busy = unproven.map(Standing::begin);
+    let busy = standing.as_ref().map(Standing::begin);
     let (mut parts, body) = request.into_parts();
-    let decision = if state.force_not_leading {
-        Ok(GateDecision::NotLeading)
-    } else {
-        state.gate.admit(state.scope, &peer, &mut parts).await
-    };
+    let decision = state.gate.admit(state.scope, &peer, &mut parts).await;
     let response = match decision {
         Ok(GateDecision::Admit(admitted)) => {
-            if unproven.is_some_and(|standing| !standing.admit()) {
+            if standing.as_ref().is_some_and(|standing| !standing.admit()) {
                 denial(&PortError::unavailable("connection is retiring"), grpc)
             } else {
                 if let Admitted::Authenticated(authenticated) = admitted {
@@ -230,8 +224,7 @@ mod tests {
     fn state<G>(gate: G) -> GateState<G> {
         GateState {
             gate,
-            scope: RequestScope::Shared,
-            force_not_leading: false,
+            scope: RequestScope::Controller,
         }
     }
 
@@ -508,6 +501,24 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct LifecycleGate(bool);
+
+    impl RequestGate for LifecycleGate {
+        async fn admit(
+            &self,
+            scope: RequestScope,
+            peer: &Peer,
+            parts: &mut http::request::Parts,
+        ) -> Result<GateDecision, PortError> {
+            if self.0 {
+                Allow.admit(scope, peer, parts).await
+            } else {
+                Ok(GateDecision::NotLeading)
+            }
+        }
+    }
+
     #[tokio::test]
     async fn leadership_refusal_and_api_marker_retire_proven_and_anonymous_connections() {
         for proven in [false, true] {
@@ -535,11 +546,10 @@ mod tests {
                 let router = router
                     .layer(from_fn_with_state(
                         GateState {
-                            gate: Allow,
-                            scope: RequestScope::Leader,
-                            force_not_leading: !api_marker,
+                            gate: LifecycleGate(api_marker),
+                            scope: RequestScope::Controller,
                         },
-                        admit::<Allow>,
+                        admit::<LifecycleGate>,
                     ))
                     .layer(Extension(Arc::clone(&standing)));
                 let request = Request::post("/grpc.Service/Method")

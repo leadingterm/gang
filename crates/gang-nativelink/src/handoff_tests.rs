@@ -183,16 +183,43 @@ async fn requeued_executing_action_is_unavailable_after_handoff() -> gang_testki
 }
 
 #[derive(Clone)]
-struct Allow;
+struct Allow {
+    leading: Arc<std::sync::atomic::AtomicBool>,
+    worker_store: Arc<std::sync::atomic::AtomicBool>,
+    scopes: Arc<parking_lot::Mutex<Vec<gang_spi::RequestScope>>>,
+}
+
+impl Default for Allow {
+    fn default() -> Self {
+        Self {
+            leading: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            worker_store: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            scopes: Arc::default(),
+        }
+    }
+}
 
 impl gang_spi::RequestGate for Allow {
-    fn admit(
+    async fn admit(
         &self,
-        _: gang_spi::RequestScope,
+        scope: gang_spi::RequestScope,
         _: &gang_spi::Peer,
-        _: &mut http::request::Parts,
-    ) -> impl Future<Output = Result<gang_spi::GateDecision, gang_spi::PortError>> + Send {
-        std::future::ready(Ok(gang_spi::GateDecision::Admit(
+        parts: &mut http::request::Parts,
+    ) -> Result<gang_spi::GateDecision, gang_spi::PortError> {
+        self.scopes.lock().push(scope);
+        if parts.headers.contains_key("x-revoked") {
+            return Err(gang_spi::PortError::refused(
+                gang_spi::Rejection::PrincipalRevoked,
+            ));
+        }
+        let permitted = match scope {
+            gang_spi::RequestScope::Controller => &self.leading,
+            gang_spi::RequestScope::WorkerStore => &self.worker_store,
+        };
+        if !permitted.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(gang_spi::GateDecision::NotLeading);
+        }
+        Ok(gang_spi::GateDecision::Admit(
             gang_spi::Admitted::Authenticated(gang_spi::Authenticated {
                 identity: Arc::new(gang_types::Identity::new(
                     gang_types::ProviderName::try_new("test").expect("valid provider"),
@@ -200,7 +227,7 @@ impl gang_spi::RequestGate for Allow {
                 )),
                 valid_until: None,
             }),
-        )))
+        ))
     }
 }
 
@@ -230,7 +257,7 @@ fn listener() -> (
         sender,
         gang_spi::Listening {
             connections,
-            gate: Allow,
+            gate: Allow::default(),
         },
     )
 }
@@ -276,64 +303,22 @@ async fn grpc_route(
 #[tokio::test]
 async fn public_listener_serves_execution_and_waits_for_worker_stream() -> gang_testkit::TestResult
 {
-    use gang_spi::{ControllerConnections, ControllerReady, ControllerSpec, RenderedStoreSpec};
-    use gang_types::{Bytes, FleetCatalog, FleetName, FleetProperties, Isa, Resources};
+    use gang_spi::{ControllerConnections, ControllerDrain, ControllerReady, SchedulerPort};
 
     let (public_feed, public) = listener();
+    let gate = public.gate.clone();
     let (worker_feed, worker) = listener();
+    let plugin = Arc::new(test_plugin(serde_json::json!({"transport": "plaintext"}))?);
     let (ready, waiting) = ControllerReady::channel();
-    let task = tokio::spawn(async move {
-        let config = crate::config::NativeLinkConfig::default();
-        let fleets = FleetCatalog::try_new(vec![FleetProperties::new(
-            &FleetName::try_new("test").expect("valid fleet name"),
-            Isa::X86_64,
-            &"docker",
-            &"host:test".parse().expect("valid environment"),
-            Resources {
-                vcpus: 4,
-                memory: Bytes::new(8 << 30),
-                disk: Bytes::new(16 << 30),
-            },
-            &gang_types::FleetActionPolicy::default(),
-            Vec::<(&'static str, String)>::new(),
-        )])
-        .expect("valid fleet");
-        let store = RenderedStoreSpec(serde_json::json!({"memory": {}}));
-        let (observations, _receiver) = gang_spi::ObservationSink::channel(
-            std::num::NonZeroUsize::MIN,
-            std::num::NonZeroUsize::MIN,
-        );
-        let spec = ControllerSpec {
-            actions: std::sync::Arc::new(gang_config::ActionsConfig::default()),
-            scaling: std::sync::Arc::new(gang_config::ScalingConfig::default()),
-            clock: std::sync::Arc::new(gang_clock::SystemClock::new()),
-            content_store: &store,
-            action_store: &store,
-            fleets: &fleets,
-            max_workers: 8,
-            client_action_timeout: Duration::from_mins(10),
-            observations: &observations,
-        };
-        let (handles, _) = tokio::sync::watch::channel(None);
-        let histories = parking_lot::Mutex::new(None);
-        crate::controller::run(
-            &config,
-            &spec,
-            ControllerConnections {
-                public,
-                worker,
-                api: Api,
-            },
-            ready,
-            crate::controller::ControllerState {
-                handles: &handles,
-                histories: &histories,
-                resources: &std::sync::OnceLock::new(),
-                shared: &crate::controller::SharedServices::default(),
-            },
-        )
-        .await
-    });
+    let task = tokio::spawn(run_held_controller(
+        Arc::clone(&plugin),
+        ControllerConnections {
+            public,
+            worker,
+            api: Api,
+        },
+        ready,
+    ));
     waiting.await?;
     let mut public_client = client(&public_feed).await?;
     for path in [
@@ -359,6 +344,15 @@ async fn public_listener_serves_execution_and_waits_for_worker_stream() -> gang_
             .get(http::header::CONTENT_TYPE)
             .is_none()
     );
+    {
+        let scopes = gate.scopes.lock();
+        assert_eq!(scopes.len(), 7);
+        assert!(
+            scopes
+                .iter()
+                .all(|scope| *scope == gang_spi::RequestScope::Controller)
+        );
+    }
     drop(api_response);
     drop(worker_feed);
     // Ending the worker stream must not retire the public listener.
@@ -367,6 +361,7 @@ async fn public_listener_serves_execution_and_waits_for_worker_stream() -> gang_
         "build.bazel.remote.execution.v2.Execution/Execute",
     )
     .await?;
+    plugin.hand_off(&mut ControllerDrain::default()).await?;
     drop(public_feed);
     drop(public_client);
     task.await??;
@@ -391,56 +386,6 @@ impl gang_spi::ApiService for HeldApi {
     }
 }
 
-/// A supplied gate and handler that the refusal transport must never invoke.
-#[derive(Clone, Default)]
-struct Untouched(Arc<std::sync::atomic::AtomicUsize>);
-
-impl gang_spi::RequestGate for Untouched {
-    async fn admit(
-        &self,
-        _: gang_spi::RequestScope,
-        _: &gang_spi::Peer,
-        _: &mut http::request::Parts,
-    ) -> Result<gang_spi::GateDecision, gang_spi::PortError> {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Err(gang_spi::PortError::backend("unexpected authentication"))
-    }
-}
-
-impl gang_spi::ApiService for Untouched {
-    async fn call(
-        &self,
-        _: http::Request<gang_spi::ApiRequestBody>,
-    ) -> http::Response<gang_spi::ApiResponseBody> {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        http::Response::new(gang_spi::full_body("unexpected handler"))
-    }
-}
-
-fn refusal_inputs(
-    untouched: &Untouched,
-) -> (
-    [tokio::sync::mpsc::UnboundedSender<gang_spi::Accepted>; 2],
-    gang_spi::ControllerConnections<Untouched, Untouched, Untouched>,
-) {
-    let (public_feed, public) = listener();
-    let (worker_feed, worker) = listener();
-    (
-        [public_feed, worker_feed],
-        gang_spi::ControllerConnections {
-            public: gang_spi::Listening {
-                connections: public.connections,
-                gate: untouched.clone(),
-            },
-            worker: gang_spi::Listening {
-                connections: worker.connections,
-                gate: untouched.clone(),
-            },
-            api: untouched.clone(),
-        },
-    )
-}
-
 fn test_plugin(server: serde_json::Value) -> gang_testkit::TestResult<crate::NativeLink> {
     let server = serde_json::from_value(server)?;
     Ok(crate::NativeLink::try_new(
@@ -448,9 +393,9 @@ fn test_plugin(server: serde_json::Value) -> gang_testkit::TestResult<crate::Nat
     )?)
 }
 
-async fn run_held_controller(
+async fn run_held_controller<A: gang_spi::ApiService>(
     plugin: Arc<crate::NativeLink>,
-    connections: gang_spi::ControllerConnections<Allow, Allow, HeldApi>,
+    connections: gang_spi::ControllerConnections<Allow, Allow, A>,
     ready: gang_spi::ControllerReady,
 ) -> Result<(), gang_spi::PortError> {
     use gang_spi::SchedulerPort;
@@ -477,36 +422,17 @@ async fn run_held_controller(
     let spec = gang_spi::ControllerSpec {
         actions: Arc::new(gang_config::ActionsConfig::default()),
         scaling: Arc::new(gang_config::ScalingConfig::default()),
-        clock: Arc::new(gang_clock::SystemClock::new()),
+        clock: Arc::new(gang_clock::TestClock::default()),
         content_store: &store,
         action_store: &store,
         fleets: &fleets,
         max_workers: 8,
         client_action_timeout: Duration::from_mins(10),
+        attempt_budget: gang_config::WorkerConfig::default()
+            .attempt_budget(gang_config::ActionsConfig::default().timeout),
         observations: &observations,
     };
     plugin.run_controller(&spec, connections, ready).await
-}
-
-fn observe_intake_end(
-    mut listening: gang_spi::Listening<Allow>,
-) -> (
-    gang_spi::Listening<Allow>,
-    tokio::sync::oneshot::Receiver<()>,
-) {
-    use futures::StreamExt;
-    let (ended, waiting) = tokio::sync::oneshot::channel();
-    listening.connections = listening
-        .connections
-        .chain(
-            futures::stream::once(async move {
-                let _ = ended.send(());
-                None
-            })
-            .filter_map(std::future::ready),
-        )
-        .boxed();
-    (listening, waiting)
 }
 
 async fn assert_wire_refusal(
@@ -539,6 +465,25 @@ async fn assert_wire_refusal(
     Ok(())
 }
 
+async fn assert_http_refusal(
+    feed: &tokio::sync::mpsc::UnboundedSender<gang_spi::Accepted>,
+) -> gang_testkit::TestResult {
+    let mut client = client(feed).await?;
+    let response = client
+        .send_request(
+            http::Request::get("http://localhost/v1/info").body(axum::body::Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response.headers()[gang_types::handover::REQUEST_NOT_STARTED_HEADER],
+        "true"
+    );
+    let body = axum::body::to_bytes(axum::body::Body::new(response.into_body()), 1024).await?;
+    assert!(!body.is_empty());
+    Ok(())
+}
+
 async fn assert_leader_refusals(
     public: &tokio::sync::mpsc::UnboundedSender<gang_spi::Accepted>,
     worker: &tokio::sync::mpsc::UnboundedSender<gang_spi::Accepted>,
@@ -553,181 +498,101 @@ async fn assert_leader_refusals(
     Ok(())
 }
 
-async fn assert_shared_api_and_capabilities(
-    public_feed: &tokio::sync::mpsc::UnboundedSender<gang_spi::Accepted>,
-) -> gang_testkit::TestResult {
-    use nativelink_proto::build::bazel::remote::execution::v2::{
-        GetCapabilitiesRequest, ServerCapabilities,
-    };
-    use prost::Message;
-
-    let mut shared_client = client(public_feed).await?;
-    let response = shared_client
-        .send_request(
-            http::Request::get("http://localhost/v1/info").body(axum::body::Body::empty())?,
-        )
-        .await?;
-    assert_eq!(response.status(), http::StatusCode::OK);
-    let body = axum::body::to_bytes(axum::body::Body::new(response.into_body()), 1024).await?;
-    assert_eq!(body.as_ref(), b"api");
-    let body = grpc_message(
-        &mut shared_client,
-        "build.bazel.remote.execution.v2.Capabilities/GetCapabilities",
-        GetCapabilitiesRequest::default(),
-    )
-    .await?;
-    let capabilities = ServerCapabilities::decode(&body[5..])?;
-    assert!(capabilities.cache_capabilities.is_some());
-    Ok(())
-}
-
 #[tokio::test]
 async fn fresh_wire_refusals_coexist_with_a_held_controller_drain() -> gang_testkit::TestResult {
-    use gang_spi::{ControllerConnections, ControllerReady, SchedulerPort, SchedulerSnapshot};
-    tokio::time::timeout(Duration::from_secs(10), async {
-        let plugin = Arc::new(test_plugin(serde_json::json!({"transport": "plaintext"}))?);
-        let (public_feed, public) = listener();
-        let (worker_feed, worker) = listener();
-        let (public, public_ended) = observe_intake_end(public);
-        let (worker, worker_ended) = observe_intake_end(worker);
-        let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
-        let release = Arc::new(tokio::sync::Notify::new());
-        let (ready, waiting) = ControllerReady::channel();
-        let controller = tokio::spawn(run_held_controller(
-            Arc::clone(&plugin),
-            ControllerConnections {
-                public,
-                worker,
-                api: HeldApi {
-                    entered,
-                    release: Arc::clone(&release),
-                },
-            },
-            ready,
-        ));
-        waiting.await?;
-        let mut old_client = client(&public_feed).await?;
-        let admitted = tokio::spawn(async move {
-            old_client
-                .send_request(
-                    http::Request::post("http://localhost/held")
-                        .body(axum::body::Body::empty())
-                        .expect("valid request"),
-                )
-                .await
-        });
-        entered_rx
-            .recv()
-            .await
-            .ok_or("old API request did not enter")?;
-        drop((public_feed, worker_feed));
-        public_ended.await?;
-        worker_ended.await?;
-        assert!(
-            !controller.is_finished(),
-            "the admitted request holds the old drain"
-        );
-        let (public_feed, public) = listener();
-        let (worker_feed, worker) = listener();
-        let connections = ControllerConnections {
-            public,
-            worker,
-            api: Api,
-        };
-        let refusing = {
-            let plugin = Arc::clone(&plugin);
-            tokio::spawn(async move { plugin.serve_standby(connections).await })
-        };
-        assert_wire_refusal(
-            &public_feed,
-            "build.bazel.remote.execution.v2.Execution/Execute",
-        )
-        .await?;
-        assert_wire_refusal(&public_feed, "google.longrunning.Operations/GetOperation").await?;
-        assert_wire_refusal(
-            &worker_feed,
-            "com.github.trace_machina.nativelink.remote_execution.WorkerApi/ConnectWorker",
-        )
-        .await?;
-        assert_shared_api_and_capabilities(&public_feed).await?;
-        assert!(
-            !controller.is_finished(),
-            "refusals must not cancel the admitted request"
-        );
-        plugin.snapshot(&mut SchedulerSnapshot::default()).await?;
-        drop((public_feed, worker_feed));
-        refusing.await??;
-        assert!(
-            !controller.is_finished(),
-            "the refusal transport does not own the controller"
-        );
-        release.notify_one();
-        let response = admitted.await??;
-        assert_eq!(response.status(), http::StatusCode::OK);
-        let body = axum::body::to_bytes(axum::body::Body::new(response.into_body()), 1024).await?;
-        assert_eq!(body.as_ref(), b"completed");
-        controller.await??;
-        assert!(matches!(
-            plugin.snapshot(&mut SchedulerSnapshot::default()).await,
-            Err(gang_spi::PortError::Unavailable(_)),
-        ));
-        Ok::<(), Box<dyn std::error::Error>>(())
-    })
-    .await?
-}
+    use gang_spi::{ControllerConnections, ControllerDrain, ControllerReady, SchedulerPort};
+    use std::sync::atomic::Ordering;
 
-#[tokio::test]
-async fn refusal_serving_requires_controller_settings() -> gang_testkit::TestResult {
-    use gang_spi::SchedulerPort;
-    let config = crate::NativeLinkConfig::for_worker(
-        Some("grpc://127.0.0.1:9100".parse()?),
-        &gang_config::WorkerConfig::default(),
-    );
-    let plugin = crate::NativeLink::try_new(config)?;
-    let untouched = Untouched::default();
-    let (_feeds, connections) = refusal_inputs(&untouched);
-    assert!(matches!(
-        plugin.serve_standby(connections).await,
-        Err(gang_spi::PortError::Config(_))
-    ));
-    assert_eq!(untouched.0.load(std::sync::atomic::Ordering::Relaxed), 0);
-    Ok(())
-}
-
-#[tokio::test]
-async fn standby_before_initial_preparation_is_unavailable() -> gang_testkit::TestResult {
-    use gang_spi::SchedulerPort;
-    let plugin = test_plugin(serde_json::json!({"transport": "plaintext"}))?;
-    let untouched = Untouched::default();
-    let (_feeds, connections) = refusal_inputs(&untouched);
-    assert!(matches!(
-        plugin.serve_standby(connections).await,
-        Err(gang_spi::PortError::Unavailable(_))
-    ));
-    assert_eq!(untouched.0.load(std::sync::atomic::Ordering::Relaxed), 0);
-    Ok(())
-}
-
-async fn prepare(plugin: Arc<crate::NativeLink>) -> gang_testkit::TestResult {
-    let (public_feed, public) = listener();
-    let (worker_feed, worker) = listener();
-    let (entered, _) = tokio::sync::mpsc::unbounded_channel();
-    let (ready, waiting) = gang_spi::ControllerReady::channel();
-    let task = tokio::spawn(run_held_controller(
-        plugin,
-        gang_spi::ControllerConnections {
+    let plugin = Arc::new(test_plugin(serde_json::json!({"transport": "plaintext"}))?);
+    let (public_feed, mut public) = listener();
+    let (worker_feed, mut worker) = listener();
+    let gate = Allow::default();
+    gate.leading.store(false, Ordering::SeqCst);
+    gate.worker_store.store(false, Ordering::SeqCst);
+    public.gate = gate.clone();
+    worker.gate = gate.clone();
+    let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (ready, waiting) = ControllerReady::channel();
+    let controller = tokio::spawn(run_held_controller(
+        Arc::clone(&plugin),
+        ControllerConnections {
             public,
             worker,
             api: HeldApi {
                 entered,
-                release: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::clone(&release),
             },
         },
         ready,
     ));
     waiting.await?;
+    assert_leader_refusals(&public_feed, &worker_feed).await?;
+    assert_http_refusal(&public_feed).await?;
+    assert_wire_refusal(
+        &public_feed,
+        "build.bazel.remote.execution.v2.ContentAddressableStorage/FindMissingBlobs",
+    )
+    .await?;
+    assert_wire_refusal(&worker_feed, "google.bytestream.ByteStream/Write").await?;
+    gate.leading.store(true, Ordering::SeqCst);
+    gate.worker_store.store(true, Ordering::SeqCst);
+    let mut old_client = client(&public_feed).await?;
+    let admitted = tokio::spawn(async move {
+        old_client
+            .send_request(
+                http::Request::post("http://localhost/held")
+                    .body(axum::body::Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+    });
+    entered_rx
+        .recv()
+        .await
+        .ok_or("old API request did not enter")?;
+    gate.leading.store(false, Ordering::SeqCst);
+    let mut drain = ControllerDrain::default();
+    plugin.hand_off(&mut drain).await?;
+    assert!(!drain.complete, "the admitted response is still held");
+    assert_leader_refusals(&public_feed, &worker_feed).await?;
+    assert_wire_refusal(
+        &public_feed,
+        "build.bazel.remote.execution.v2.Capabilities/GetCapabilities",
+    )
+    .await?;
+    assert_http_refusal(&public_feed).await?;
+    assert_wire_refusal(
+        &public_feed,
+        "build.bazel.remote.execution.v2.ActionCache/GetActionResult",
+    )
+    .await?;
+    assert_wire_refusal(&public_feed, "google.bytestream.ByteStream/Read").await?;
+    release.notify_one();
+    let response = admitted.await??;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = axum::body::to_bytes(axum::body::Body::new(response.into_body()), 1024).await?;
+    assert_eq!(body.as_ref(), b"completed");
+    plugin.hand_off(&mut drain).await?;
+    assert!(drain.complete);
+    assert_leader_refusals(&public_feed, &worker_feed).await?;
+    assert!(
+        !controller.is_finished(),
+        "completed drain retains the original listeners"
+    );
     drop((public_feed, worker_feed));
-    task.await??;
+    controller.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn handoff_before_initial_preparation_is_unavailable() -> gang_testkit::TestResult {
+    use gang_spi::{ControllerDrain, SchedulerPort};
+    let plugin = test_plugin(serde_json::json!({"transport": "plaintext"}))?;
+    assert!(matches!(
+        plugin.hand_off(&mut ControllerDrain::default()).await,
+        Err(gang_spi::PortError::Unavailable(_))
+    ));
     Ok(())
 }
 
@@ -817,92 +682,78 @@ async fn assert_cache_roundtrip(
 }
 
 #[tokio::test]
-async fn standby_serves_real_public_action_and_content_cache() -> gang_testkit::TestResult {
-    use gang_spi::{ControllerConnections, SchedulerPort};
-
-    tokio::time::timeout(Duration::from_secs(10), async {
-        let plugin = Arc::new(test_plugin(serde_json::json!({"transport": "plaintext"}))?);
-        prepare(Arc::clone(&plugin)).await?;
-        let (public_feed, public) = listener();
-        let (worker_feed, worker) = listener();
-        let serving = {
-            let plugin = Arc::clone(&plugin);
-            tokio::spawn(async move {
-                plugin
-                    .serve_standby(ControllerConnections {
-                        public,
-                        worker,
-                        api: Api,
-                    })
-                    .await
-            })
-        };
-        let mut client = client(&public_feed).await?;
-        assert_cache_roundtrip(&mut client).await?;
-        drop((client, public_feed, worker_feed));
-        serving.await??;
-        Ok::<(), Box<dyn std::error::Error>>(())
-    })
-    .await?
-}
-
-#[tokio::test]
-async fn standby_worker_connections_use_worker_capacity() -> gang_testkit::TestResult {
-    use gang_spi::{ControllerConnections, SchedulerPort};
-    use nativelink_proto::build::bazel::remote::execution::v2::{
-        Digest, FindMissingBlobsRequest, FindMissingBlobsResponse,
+async fn worker_store_remains_authenticated_during_controller_drain() -> gang_testkit::TestResult {
+    use gang_spi::{
+        ControllerConnections, ControllerDrain, ControllerReady, RequestScope, SchedulerPort,
     };
-    use prost::Message;
+    use std::sync::atomic::Ordering;
+
     let plugin = Arc::new(test_plugin(serde_json::json!({
         "transport": "plaintext",
         "http2": { "max_connections": 1 }
     }))?);
-    prepare(Arc::clone(&plugin)).await?;
-    let (public_feed, public) = listener();
-    let (worker_feed, worker) = listener();
-    let serving = {
-        let plugin = Arc::clone(&plugin);
-        tokio::spawn(async move {
-            plugin
-                .serve_standby(ControllerConnections {
-                    public,
-                    worker,
-                    api: Api,
-                })
-                .await
-        })
-    };
-    let missing = Digest {
-        hash: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_owned(),
-        size_bytes: 5,
-    };
-    let request = || FindMissingBlobsRequest {
-        instance_name: String::new(),
-        blob_digests: vec![missing.clone()],
-        ..Default::default()
-    };
-    let mut first = client(&worker_feed).await?;
-    let body = grpc_message(
-        &mut first,
-        "build.bazel.remote.execution.v2.ContentAddressableStorage/FindMissingBlobs",
-        request(),
+    let (public_feed, mut public) = listener();
+    let (worker_feed, mut worker) = listener();
+    let gate = Allow::default();
+    public.gate = gate.clone();
+    worker.gate = gate.clone();
+    let (entered, _) = tokio::sync::mpsc::unbounded_channel();
+    let (ready, waiting) = ControllerReady::channel();
+    let serving = tokio::spawn(run_held_controller(
+        Arc::clone(&plugin),
+        ControllerConnections {
+            public,
+            worker,
+            api: HeldApi {
+                entered,
+                release: Arc::new(tokio::sync::Notify::new()),
+            },
+        },
+        ready,
+    ));
+    waiting.await?;
+    let mut public_client = client(&public_feed).await?;
+    assert_cache_roundtrip(&mut public_client).await?;
+    drop(public_client);
+    let mut worker_client = client(&worker_feed).await?;
+    assert_cache_roundtrip(&mut worker_client).await?;
+    gate.leading.store(false, Ordering::SeqCst);
+    let mut drain = ControllerDrain::default();
+    plugin.hand_off(&mut drain).await?;
+    assert_cache_roundtrip(&mut worker_client).await?;
+    let mut second_worker_client = client(&worker_feed).await?;
+    assert_cache_roundtrip(&mut second_worker_client).await?;
+    let response = worker_client
+        .send_request(
+            http::Request::post(
+                "http://localhost/build.bazel.remote.execution.v2.ActionCache/GetActionResult",
+            )
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .header("x-revoked", "true")
+            .body(axum::body::Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.headers()["grpc-status"], "7");
+    assert!(
+        !response
+            .headers()
+            .contains_key(gang_types::handover::REQUEST_NOT_STARTED_HEADER)
+    );
+    assert_wire_refusal(
+        &worker_feed,
+        "com.github.trace_machina.nativelink.remote_execution.WorkerApi/ConnectWorker",
     )
     .await?;
-    let response = FindMissingBlobsResponse::decode(&body[5..])?;
-    assert_eq!(response.missing_blob_digests, vec![missing.clone()]);
-    let mut second = tokio::time::timeout(Duration::from_secs(10), client(&worker_feed)).await??;
-    let body = tokio::time::timeout(
-        Duration::from_secs(10),
-        grpc_message(
-            &mut second,
-            "build.bazel.remote.execution.v2.ContentAddressableStorage/FindMissingBlobs",
-            request(),
-        ),
-    )
-    .await??;
-    let response = FindMissingBlobsResponse::decode(&body[5..])?;
-    assert_eq!(response.missing_blob_digests, vec![missing]);
-    drop((first, second, public_feed, worker_feed));
+    let scopes = gate.scopes.lock();
+    assert!(scopes.contains(&RequestScope::Controller));
+    assert!(scopes.contains(&RequestScope::WorkerStore));
+    drop(scopes);
+    drop((
+        worker_client,
+        second_worker_client,
+        public_feed,
+        worker_feed,
+    ));
     serving.await??;
     Ok(())
 }
@@ -952,7 +803,7 @@ async fn grpc_exchange<M: prost::Message>(
 }
 
 async fn resume_upload(
-    standby_client: &mut hyper::client::conn::http2::SendRequest<axum::body::Body>,
+    worker_client: &mut hyper::client::conn::http2::SendRequest<axum::body::Body>,
     resource: &str,
 ) -> gang_testkit::TestResult {
     use nativelink_proto::google::bytestream::{
@@ -964,7 +815,7 @@ async fn resume_upload(
         resource_name: resource.to_owned(),
     };
     let body = grpc_message(
-        standby_client,
+        worker_client,
         "google.bytestream.ByteStream/QueryWriteStatus",
         query(),
     )
@@ -973,7 +824,7 @@ async fn resume_upload(
     assert_eq!(status.committed_size, 2);
     assert!(!status.complete);
     let body = grpc_message(
-        standby_client,
+        worker_client,
         "google.bytestream.ByteStream/Write",
         WriteRequest {
             resource_name: resource.to_owned(),
@@ -986,7 +837,7 @@ async fn resume_upload(
     let result = nativelink_proto::google::bytestream::WriteResponse::decode(&body[5..])?;
     assert_eq!(result.committed_size, 5);
     let body = grpc_message(
-        standby_client,
+        worker_client,
         "google.bytestream.ByteStream/Read",
         nativelink_proto::google::bytestream::ReadRequest {
             resource_name:
@@ -1003,19 +854,20 @@ async fn resume_upload(
 }
 
 #[tokio::test]
-async fn upload_resumes_across_standby_and_later_controller_term() -> gang_testkit::TestResult {
-    use gang_spi::{ControllerConnections, ControllerReady, SchedulerPort};
-    use nativelink_proto::google::bytestream::{
-        QueryWriteStatusRequest, QueryWriteStatusResponse, WriteRequest,
-    };
-    use prost::Message;
+async fn worker_upload_resumes_on_original_controller_after_handoff() -> gang_testkit::TestResult {
+    use gang_spi::{ControllerConnections, ControllerDrain, ControllerReady, SchedulerPort};
+    use nativelink_proto::google::bytestream::WriteRequest;
+    use std::sync::atomic::Ordering;
 
     let plugin = Arc::new(test_plugin(serde_json::json!({"transport": "plaintext"}))?);
-    let (public_feed, public) = listener();
-    let (worker_feed, worker) = listener();
+    let (public_feed, mut public) = listener();
+    let (worker_feed, mut worker) = listener();
+    let gate = Allow::default();
+    public.gate = gate.clone();
+    worker.gate = gate.clone();
     let (entered, _) = tokio::sync::mpsc::unbounded_channel();
     let (ready, waiting) = ControllerReady::channel();
-    let first = tokio::spawn(run_held_controller(
+    let controller = tokio::spawn(run_held_controller(
         Arc::clone(&plugin),
         ControllerConnections {
             public,
@@ -1029,9 +881,9 @@ async fn upload_resumes_across_standby_and_later_controller_term() -> gang_testk
     ));
     waiting.await?;
     let resource = "uploads/0123456789abcdef0123456789abcdef/blobs/2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824/5";
-    let mut first_client = client(&public_feed).await?;
+    let mut worker_client = client(&worker_feed).await?;
     let _ = grpc_exchange(
-        &mut first_client,
+        &mut worker_client,
         "google.bytestream.ByteStream/Write",
         WriteRequest {
             resource_name: resource.to_owned(),
@@ -1041,111 +893,19 @@ async fn upload_resumes_across_standby_and_later_controller_term() -> gang_testk
         },
     )
     .await?;
-    drop((first_client, public_feed, worker_feed));
-    first.await??;
-
-    let (public_feed, public) = listener();
-    let (worker_feed, worker) = listener();
-    let standby = {
-        let plugin = Arc::clone(&plugin);
-        tokio::spawn(async move {
-            plugin
-                .serve_standby(ControllerConnections {
-                    public,
-                    worker,
-                    api: Api,
-                })
-                .await
-        })
-    };
-    let mut standby_client = client(&public_feed).await?;
-    resume_upload(&mut standby_client, resource).await?;
-    drop(standby_client);
-    let standby_public_feed = public_feed;
-    let standby_worker_feed = worker_feed;
-
-    let (public_feed, public) = listener();
-    let (worker_feed, worker) = listener();
-    let (entered, _) = tokio::sync::mpsc::unbounded_channel();
-    let (ready, waiting) = ControllerReady::channel();
-    let second = tokio::spawn(run_held_controller(
-        Arc::clone(&plugin),
-        ControllerConnections {
-            public,
-            worker,
-            api: HeldApi {
-                entered,
-                release: Arc::new(tokio::sync::Notify::new()),
-            },
-        },
-        ready,
-    ));
-    waiting.await?;
-    assert_leader_refusals(&standby_public_feed, &standby_worker_feed).await?;
-    drop((standby_public_feed, standby_worker_feed));
-    standby.await??;
-    let mut second_client = client(&public_feed).await?;
-    let body = grpc_message(
-        &mut second_client,
-        "google.bytestream.ByteStream/QueryWriteStatus",
-        QueryWriteStatusRequest {
-            resource_name: resource.to_owned(),
-        },
+    gate.leading.store(false, Ordering::SeqCst);
+    let mut drain = ControllerDrain::default();
+    plugin.hand_off(&mut drain).await?;
+    assert_wire_refusal(&public_feed, "google.bytestream.ByteStream/Write").await?;
+    assert_wire_refusal(
+        &worker_feed,
+        "com.github.trace_machina.nativelink.remote_execution.WorkerApi/ConnectWorker",
     )
     .await?;
-    let status = QueryWriteStatusResponse::decode(&body[5..])?;
-    assert_eq!(status.committed_size, 5);
-    assert!(status.complete);
-    drop((second_client, public_feed, worker_feed));
-    second.await??;
-    Ok(())
-}
-
-#[tokio::test(start_paused = true)]
-async fn both_refusal_flushes_share_the_original_bounded_deadline() -> gang_testkit::TestResult {
-    use gang_spi::{SchedulerPort, SchedulerSnapshot};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let plugin = Arc::new(test_plugin(serde_json::json!({
-        "transport": "plaintext",
-        "request_timeout": "5s",
-        "http2": { "shutdown_grace": "30s", "unproven_idle_timeout": "60s" }
-    }))?);
-    prepare(Arc::clone(&plugin)).await?;
-    let untouched = Untouched::default();
-    let (feeds, connections) = refusal_inputs(&untouched);
-    let mut peers = Vec::new();
-    for feed in &feeds {
-        let (server, mut peer) = tokio::io::duplex(64 * 1024);
-        peer.write_all(b"PRI * HTTP/2.0\r\n").await?;
-        feed.send(gang_spi::Accepted {
-            connection: Box::new(server),
-            peer: gang_spi::Peer::default(),
-        })
-        .map_err(|_| "refusal listener closed")?;
-        peers.push(peer);
-    }
-    let refusing = plugin.serve_standby(connections);
-    tokio::pin!(refusing);
-    assert!(futures::poll!(&mut refusing).is_pending());
-    let stopped_at = tokio::time::Instant::now();
-    drop(feeds);
-    match futures::poll!(&mut refusing) {
-        std::task::Poll::Ready(result) => result?,
-        std::task::Poll::Pending => {
-            tokio::time::timeout(Duration::from_secs(30), refusing).await??;
-        }
-    }
-    assert!(
-        stopped_at.elapsed() <= Duration::from_secs(5),
-        "flushes must run concurrently"
-    );
-    for mut peer in peers {
-        peer.read_to_end(&mut Vec::new()).await?;
-    }
-    assert!(matches!(
-        plugin.snapshot(&mut SchedulerSnapshot::default()).await,
-        Err(gang_spi::PortError::Unavailable(_)),
-    ));
-    assert_eq!(untouched.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+    resume_upload(&mut worker_client, resource).await?;
+    plugin.hand_off(&mut drain).await?;
+    assert!(drain.complete);
+    drop((worker_client, public_feed, worker_feed));
+    controller.await??;
     Ok(())
 }

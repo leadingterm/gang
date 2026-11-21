@@ -162,6 +162,8 @@ fn controller_spec<'a>(
         max_workers: 8,
         observations: observations(),
         client_action_timeout: Duration::from_mins(10),
+        attempt_budget: gang_config::WorkerConfig::default()
+            .attempt_budget(gang_config::ActionsConfig::default().timeout),
     }
 }
 

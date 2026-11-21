@@ -411,7 +411,11 @@ async fn authenticate_reuses_rotated_grant_after_signer_failure() {
     fixture
         .harness
         .gate
-        .admit(gang_spi::RequestScope::Shared, &Peer::default(), &mut parts)
+        .admit(
+            gang_spi::RequestScope::Controller,
+            &Peer::default(),
+            &mut parts,
+        )
         .await
         .expect("the gate admits the open API route");
     let authenticated = Caller::of(&parts.extensions)

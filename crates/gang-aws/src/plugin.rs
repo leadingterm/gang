@@ -26,6 +26,9 @@
 //! - `autoscaling:DescribeScalingActivities`
 //! - `autoscaling:DescribeLifecycleHooks`
 //! - `autoscaling:CompleteLifecycleAction`
+//! - `autoscaling:RecordLifecycleActionHeartbeat`
+//! - `elasticloadbalancing:DescribeTargetHealth`
+//! - `elasticloadbalancing:RegisterTargets`
 //! - `autoscaling:SetDesiredCapacity`
 //! - `autoscaling:SetInstanceProtection`
 //! - `autoscaling:TerminateInstanceInAutoScalingGroup`
@@ -33,6 +36,7 @@
 //! - `sts:GetWebIdentityToken`
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use aws_config::SdkConfig;
 use gang_clock::{Clock, SystemClock};
@@ -58,6 +62,7 @@ use gang_aws_sdk as sdk;
 pub struct Aws {
     pub(crate) config: AwsConfig,
     pub(crate) clock: Arc<dyn Clock>,
+    pub(crate) retirement_seen: AtomicBool,
     scratch: Arc<Scratch<SystemMachine>>,
     managed: Arc<Managed>,
     runtime: OnceCell<Runtime>,
@@ -67,6 +72,7 @@ pub struct Aws {
 pub(crate) struct Runtime {
     fleets: Fleets,
     pub(crate) autoscaling: aws_sdk_autoscaling::Client,
+    pub(crate) elbv2: aws_sdk_elasticloadbalancingv2::Client,
     pub(crate) metadata: Metadata,
     web_identity: WebIdentity,
     #[cfg(test)]
@@ -90,6 +96,7 @@ impl Runtime {
                 Events::new(sdk, config, clock, Arc::clone(managed)),
             ),
             autoscaling: aws_sdk_autoscaling::Client::new(sdk),
+            elbv2: aws_sdk_elasticloadbalancingv2::Client::new(sdk),
             metadata: Metadata::new(imds, config.fleet_tag_key.as_str()),
             web_identity: WebIdentity::new(sdk, config),
             #[cfg(test)]
@@ -127,6 +134,7 @@ impl Aws {
         );
         Self {
             clock: Arc::new(SystemClock::new()),
+            retirement_seen: AtomicBool::new(false),
             managed: Arc::clone(&runtime.managed),
             scratch: Arc::new(scratch),
             runtime: OnceCell::new_with(Some(runtime)),
@@ -167,6 +175,7 @@ impl Plugin for Aws {
         );
         Ok(Self {
             config,
+            retirement_seen: AtomicBool::new(false),
             clock: Arc::new(SystemClock::new()),
             managed: Arc::new(Managed::default()),
             scratch: Arc::new(scratch),

@@ -3,7 +3,7 @@
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::ExitStatus;
+use std::process::{Command, ExitStatus};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -31,7 +31,7 @@ use crate::gang_cli::GangCli;
 use crate::host::Host;
 use crate::issuer::TestIssuer;
 use crate::ports;
-use crate::process::{self, Supervised};
+use crate::process::{self, ControllerHost, Supervised};
 use crate::report::ProbeReport;
 use crate::settings::DeploymentInputs;
 use crate::stack::{Stack, is_announcement, local_evidence};
@@ -314,7 +314,7 @@ struct Controller {
     health_policy: Arc<Policy>,
     identity: Arc<str>,
     config: PathBuf,
-    child: Option<Supervised>,
+    child: Option<ControllerHost>,
     exit_status: Option<ExitStatus>,
     database_link: DatabaseLink,
     paused: bool,
@@ -322,7 +322,7 @@ struct Controller {
 
 pub(crate) struct Retiring {
     index: usize,
-    child: Supervised,
+    child: ControllerHost,
 }
 
 /// Controllers with shared database, S3, local provisioner state and signing key.
@@ -570,7 +570,12 @@ impl<'a> Cluster<'a> {
         self.controllers
             .lock()
             .get(index)
-            .map(|controller| Arc::clone(&controller.identity))
+            .map(|controller| {
+                controller.child.as_ref().map_or_else(
+                    || Arc::clone(&controller.identity),
+                    ControllerHost::identity,
+                )
+            })
             .ok_or_else(|| E2eError::system("unknown controller"))
     }
 
@@ -688,7 +693,7 @@ impl<'a> Cluster<'a> {
         let probes: Vec<_> = controllers
             .iter()
             .enumerate()
-            .filter(|(_, controller)| !controller.paused && controller.exit_status.is_none())
+            .filter(|(_, controller)| !controller.paused && controller.child.is_some())
             .map(|(index, controller)| {
                 (
                     index,
@@ -872,7 +877,6 @@ impl<'a> Cluster<'a> {
             self.write_controller_config(&config, public, worker, health, &database_link)?;
         }
         let public_proxy_protocol_v2 = controller_public_proxy_protocol(&config)?;
-        let (mut child, log_start) = self.spawn_controller(index, binary, &config)?;
         let log = self.controller_log_path(index);
         for (frontend, address) in [(Frontend::Serve, public), (Frontend::Workers, worker)] {
             self.balancer.register(
@@ -883,6 +887,25 @@ impl<'a> Cluster<'a> {
                 },
             );
         }
+        for (frontend, address) in [(Frontend::Serve, public), (Frontend::Workers, worker)] {
+            if !self.balancer.registered(frontend, address)
+                || self.balancer.healthy(frontend).contains(&address)
+            {
+                return Err(E2eError::system(
+                    "new target must be registered and unhealthy before launch",
+                ));
+            }
+        }
+        self.release_evidence.lock().push(format!(
+            "controller {index}: targets registered and initially unhealthy before process launch; health path={}",
+            health_policy.path,
+        ));
+        let (mut child, log_start) =
+            self.spawn_controller(index, binary, &config)
+                .inspect_err(|_| {
+                    self.balancer.deregister(Frontend::Serve, public);
+                    self.balancer.deregister(Frontend::Workers, worker);
+                })?;
         let startup = await_controller_start(&mut child, &log, log_start, timeout);
         let identity = match startup {
             Ok(identity) => identity,
@@ -901,6 +924,14 @@ impl<'a> Cluster<'a> {
                 ));
             }
         };
+        let child = ControllerHost::start(
+            child,
+            Arc::clone(&identity),
+            self.controller_command(binary, &config),
+            log,
+            timeout,
+            await_controller_start,
+        )?;
         controllers.push(Controller {
             public,
             public_proxy_protocol_v2,
@@ -971,6 +1002,11 @@ impl<'a> Cluster<'a> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
             Err(error) => return Err(E2eError::io("measuring controller startup log")(error)),
         };
+        let mut command = self.controller_command(binary, config);
+        Ok((Supervised::spawn(&mut command, &log)?, log_start))
+    }
+
+    fn controller_command(&self, binary: &Path, config: &Path) -> Command {
         let cli = GangCli::new(
             binary.to_path_buf(),
             config.to_path_buf(),
@@ -979,7 +1015,7 @@ impl<'a> Cluster<'a> {
         let mut command = cli.server();
         configure_fake_aws(&mut command);
         command.env("GANG_LOG", "info");
-        Ok((Supervised::spawn(&mut command, &log)?, log_start))
+        command
     }
 
     fn write_release_config(
@@ -1073,7 +1109,7 @@ impl<'a> Cluster<'a> {
     ) -> Result<()> {
         let timeout = self.stack.settings().startup_timeout;
         let start = Instant::now();
-        let startup = {
+        let startup = (|| {
             let mut controllers = self.controllers.lock();
             let controller = controllers
                 .get_mut(index)
@@ -1082,26 +1118,41 @@ impl<'a> Cluster<'a> {
                 .child
                 .as_mut()
                 .ok_or_else(|| E2eError::system("controller is not running"))?;
-            install_fetched_config(&controller.config, fetched)?;
             let status = child.terminate(timeout.saturating_sub(start.elapsed()))?;
             controller.exit_status = Some(status);
             controller.child = None;
-            let (child, log_start) = self.spawn_controller(index, binary, &controller.config)?;
-            controller.child = Some(child);
-            controller.exit_status = None;
-            controller.paused = false;
-            let child = controller
-                .child
-                .as_mut()
-                .ok_or_else(|| E2eError::system("restarted controller has no process"))?;
-            await_controller_start(
-                child,
+            install_fetched_config(&controller.config, fetched)?;
+            let (mut child, log_start) =
+                self.spawn_controller(index, binary, &controller.config)?;
+            let identity = match await_controller_start(
+                &mut child,
                 &self.controller_log_path(index),
                 log_start,
                 timeout.saturating_sub(start.elapsed()),
-            )
-            .map(|identity| controller.identity = identity)
-        };
+            ) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    // An explicit configuration restart begins a new observation. Preserve that
+                    // attempted child's rejection, not the successful stop of the prior child.
+                    child.kill()?;
+                    controller.exit_status =
+                        Some(child.wait_within(Duration::ZERO, "failed configuration restart")?);
+                    return Err(error);
+                }
+            };
+            controller.child = Some(ControllerHost::start(
+                child,
+                Arc::clone(&identity),
+                self.controller_command(binary, &controller.config),
+                self.controller_log_path(index),
+                timeout.saturating_sub(start.elapsed()),
+                await_controller_start,
+            )?);
+            controller.identity = identity;
+            controller.exit_status = None;
+            controller.paused = false;
+            Ok::<(), E2eError>(())
+        })();
         startup.map_err(|error| {
             let log = self.log(index).map_or_else(
                 |error| format!("unreadable: {error}"),
@@ -1187,7 +1238,7 @@ impl<'a> Cluster<'a> {
     }
 
     /// Transfers a controller's process handle without bypassing balancer health checks.
-    fn take_controller(&self, index: usize) -> Result<Supervised> {
+    fn take_controller(&self, index: usize) -> Result<ControllerHost> {
         let mut controllers = self.controllers.lock();
         let controller = controllers
             .get_mut(index)
@@ -1218,10 +1269,7 @@ impl<'a> Cluster<'a> {
     pub(crate) fn finish_retire(&self, mut retiring: Retiring) -> Result<ExitStatus> {
         let status = retiring
             .child
-            .wait_within(
-                self.stack.settings().startup_timeout,
-                "the process to exit after SIGTERM",
-            )
+            .wait_stopped(self.stack.settings().startup_timeout)
             .map_err(|error| self.timeout_evidence(error))?;
         self.remember_exit(retiring.index, status);
         Ok(status)
@@ -1234,29 +1282,54 @@ impl<'a> Cluster<'a> {
     pub fn retire(&self, index: usize) -> Result<ExitStatus> {
         self.finish_retire(self.begin_retire(index)?)
     }
-    /// Waits for a controller to exit on its own, within the startup deadline.
+    /// Waits for the original controller child to exit, without stopping its host supervisor.
     ///
-    /// A controller that does not exit before the deadline is killed when its handle is dropped.
+    /// A successful drain may already have produced a fresh passive process when this returns.
     ///
     /// # Errors
-    /// Returns an error for an unknown controller, a failed process observation, or a timeout.
+    /// Returns an error for an unknown controller, failed observation, or timeout.
     pub fn wait_exit(&self, index: usize) -> Result<ExitStatus> {
-        if let Some(status) = self
-            .controllers
-            .lock()
-            .get(index)
-            .and_then(|controller| controller.exit_status)
-        {
+        let timeout = self.stack.settings().startup_timeout;
+        let mut controllers = self.controllers.lock();
+        let controller = controllers
+            .get_mut(index)
+            .ok_or_else(|| E2eError::system("unknown controller"))?;
+        if let Some(status) = controller.exit_status {
             return Ok(status);
         }
-        let mut child = self.take_controller(index)?;
-        let timeout = self.stack.settings().startup_timeout;
-        let condition = format!("controller {index} (pid {}) to exit", child.pid());
-        let status = child
-            .wait_within(timeout, &condition)
-            .map_err(|error| self.timeout_evidence(error))?;
-        self.remember_exit(index, status);
-        Ok(status)
+        let child = controller
+            .child
+            .as_mut()
+            .ok_or_else(|| E2eError::system("controller is not running"))?;
+        child.wait_within(timeout, &format!("original controller {index} to exit"))
+    }
+
+    /// Proves a natural drain caused a fresh passive child on the same local host.
+    pub(crate) fn wait_for_host_restart(
+        &self,
+        index: usize,
+        original_pid: u32,
+        original_holder: &str,
+    ) -> Result<u32> {
+        let (pid, identity) = {
+            let controllers = self.controllers.lock();
+            let child = controllers
+                .get(index)
+                .and_then(|controller| controller.child.as_ref())
+                .ok_or_else(|| E2eError::system("controller host is not running"))?;
+            child.wait_restarted(self.stack.settings().startup_timeout)?
+        };
+        if pid == original_pid || identity.as_ref() == original_holder {
+            return Err(E2eError::system(
+                "host restart retained original PID or holder",
+            ));
+        }
+        if self.controller_is_leader(index)? {
+            return Err(E2eError::system(
+                "older restarted host reacquired leadership",
+            ));
+        }
+        Ok(pid)
     }
 
     /// Reads the captured standard output and standard error of a controller.
@@ -1287,7 +1360,7 @@ impl<'a> Cluster<'a> {
         let pid = controller
             .child
             .as_ref()
-            .map(Supervised::pid)
+            .map(ControllerHost::pid)
             .ok_or_else(|| E2eError::system("controller is not running"))?;
         let raw = i32::try_from(pid).map_err(E2eError::system_from("converting controller pid"))?;
         let target =
@@ -1305,6 +1378,16 @@ impl<'a> Cluster<'a> {
     /// # Errors
     /// Returns an error if the controller cannot be signalled.
     pub fn pause(&self, index: usize) -> Result<()> {
+        if let Some(child) = self
+            .controllers
+            .lock()
+            .get_mut(index)
+            .and_then(|c| c.child.as_mut())
+        {
+            // This deliberate zombie fault observes the original process after resumption,
+            // not a fresh, legitimately contending host process.
+            child.suppress_restart();
+        }
         self.signal(index, Signal::STOP, true)
     }
 
@@ -1331,9 +1414,6 @@ impl<'a> Cluster<'a> {
         let controller = controllers
             .get_mut(index)
             .ok_or_else(|| E2eError::system("unknown controller public target"))?;
-        if controller.exit_status.is_some() {
-            return Err(E2eError::system("controller public target has exited"));
-        }
         let child = controller
             .child
             .as_mut()
@@ -1396,7 +1476,14 @@ impl<'a> Cluster<'a> {
     /// # Panics
     /// Panics if `index` does not identify a controller started by this cluster.
     pub fn cut_database(&self, index: usize, cut: bool) {
-        self.controllers.lock()[index].database_link.set_cut(cut);
+        let mut controllers = self.controllers.lock();
+        let controller = &mut controllers[index];
+        if cut && let Some(child) = controller.child.as_mut() {
+            // Preserve the original fenced process's exit and mutation witnesses during this
+            // deliberate partition. Healing does not silently introduce a fresh contender.
+            child.suppress_restart();
+        }
+        controller.database_link.set_cut(cut);
     }
 
     /// The shared database, including its outage controls.
@@ -1591,13 +1678,7 @@ impl<'a> Cluster<'a> {
                     let pid = child.pid();
                     match child.has_exited() {
                         Ok(false) => format!("alive pid={pid}, paused={}", controller.paused),
-                        Ok(true) => match child.terminate(Duration::ZERO) {
-                            Ok(status) => {
-                                controller.exit_status = Some(status);
-                                format!("exited pid={pid}, status={status}")
-                            }
-                            Err(error) => format!("exited pid={pid}, status unavailable: {error}"),
-                        },
+                        Ok(true) => format!("current child exited pid={pid}"),
                         Err(error) => format!("pid={pid}, status unavailable: {error}"),
                     }
                 } else if let Some(status) = controller.exit_status {
@@ -2175,10 +2256,20 @@ impl System for Cluster<'_> {
 
 impl Drop for Cluster<'_> {
     fn drop(&mut self) {
-        for controller in self.controllers.get_mut().iter_mut() {
+        let controllers = self.controllers.get_mut();
+        // Stop every supervisor before stopping any child or worker. Otherwise another active
+        // controller could replace workers while cleanup is walking the shared local topology.
+        for controller in controllers.iter_mut() {
+            if let Some(child) = controller.child.as_mut() {
+                child.suppress_restart();
+            }
+        }
+        for controller in controllers.iter_mut() {
             if let Some(mut child) = controller.child.take() {
                 let _ = child.kill();
             }
+        }
+        for controller in controllers.iter() {
             if let Err(error) = process::terminate_workers(&controller.config) {
                 eprintln!(
                     "worker cleanup for {}: {error}",

@@ -62,6 +62,7 @@ impl World {
                 supply: self.supplies.get(index).cloned().unwrap_or_default(),
                 outlook: self.outlook.get(index).copied().unwrap_or_default(),
                 past_boot_grace: self.past_boot_grace.get(index).cloned().unwrap_or_default(),
+                handover_protected: Vec::new(),
             })
             .collect()
     }

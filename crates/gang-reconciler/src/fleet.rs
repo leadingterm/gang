@@ -66,6 +66,9 @@ pub struct FleetPass {
     /// For each instance of `supply`, in order, whether it has been in service without a worker
     /// for at least `boot_grace` by both clocks; written by the pass.
     pub past_boot_grace: Vec<bool>,
+    /// Sorted physical instances owned by a draining previous engine. They count as live,
+    /// but provide no usable or booting capacity and may not be selected for termination.
+    pub handover_protected: Vec<gang_types::InstanceId>,
 }
 
 impl FleetPass {
@@ -77,6 +80,7 @@ impl FleetPass {
             supply: FleetSupply::default(),
             outlook: FleetOutlook::default(),
             past_boot_grace: Vec::new(),
+            handover_protected: Vec::new(),
         }
     }
 }

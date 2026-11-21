@@ -333,6 +333,7 @@ fn spawn_controller(
     plugin: Arc<NativeLink>,
     fleets: FleetCatalog,
     actions: Arc<gang_config::ActionsConfig>,
+    attempt_budget: Duration,
     listeners: (TcpListener, TcpListener),
     public_gate: TestGate,
     public_peers: Vec<Peer>,
@@ -358,6 +359,7 @@ fn spawn_controller(
             max_workers: 8,
             observations: &observations,
             client_action_timeout: CLIENT_ACTION_TIMEOUT,
+            attempt_budget,
         };
         let connections = ControllerConnections {
             public: Listening {
@@ -501,6 +503,7 @@ impl Harness {
         let public_port = public.local_addr()?.port();
         let worker_port = worker.local_addr()?.port();
         let actions = Arc::new(actions);
+        let attempt_budget = worker_config.attempt_budget(actions.timeout);
         let mut config = config(worker_port)?;
         config.worker = worker_config;
         let plugin = Arc::new(build_plugin(config)?);
@@ -511,6 +514,7 @@ impl Harness {
             Arc::clone(&plugin),
             fleets,
             Arc::clone(&actions),
+            attempt_budget,
             (public, worker),
             public_gate,
             public_peers,
@@ -830,6 +834,8 @@ async fn a_second_controller_is_refused() -> TestResult {
         max_workers: 8,
         observations: &observations,
         client_action_timeout: CLIENT_ACTION_TIMEOUT,
+        attempt_budget: gang_config::WorkerConfig::default()
+            .attempt_budget(gang_config::ActionsConfig::default().timeout),
     };
     let (ready, readiness) = ControllerReady::channel();
     let result = harness
@@ -858,6 +864,8 @@ async fn sequential_controller_terms_drain_and_republish() -> TestResult {
         max_workers: 8,
         observations: &observations,
         client_action_timeout: CLIENT_ACTION_TIMEOUT,
+        attempt_budget: gang_config::WorkerConfig::default()
+            .attempt_budget(gang_config::ActionsConfig::default().timeout),
     };
     for _ in 0..2 {
         let (public_tx, public_rx) = futures::channel::mpsc::unbounded::<Accepted>();
@@ -2371,17 +2379,21 @@ impl gang_spi::AuthenticationPort for WorkerAnonymous {
 
 impl gang_spi::CredentialLifecyclePort for WorkerAnonymous {}
 
-fn worker_server_settings(port: u16) -> Result<gang_server::ServerSettings, Box<dyn Error>> {
+fn worker_server_settings(
+    port: u16,
+    worker: &gang_config::WorkerConfig,
+) -> Result<gang_server::ServerSettings, Box<dyn Error>> {
+    let actions = Arc::new(gang_config::ActionsConfig {
+        kill_grace: NonZeroDuration::from_secs(7),
+        ..gang_config::ActionsConfig::default()
+    });
+    let attempt_budget = worker.attempt_budget(actions.timeout);
     Ok(gang_server::ServerSettings {
-        actions: Arc::new(gang_config::ActionsConfig {
-            kill_grace: NonZeroDuration::from_secs(7),
-            ..gang_config::ActionsConfig::default()
-        }),
+        actions,
         scaling: Arc::new(gang_config::ScalingConfig::default()),
         proxy_protocol: None,
         leadership: gang_config::LeadershipConfig::default(),
-        standby_routability_delay: Duration::ZERO,
-        handoff_timeout: Duration::from_mins(1),
+        attempt_budget,
         revocation_refresh_interval: NonZeroDuration::from_secs(1),
         poll_interval: NonZeroDuration::from_secs(1),
         client_action_timeout: NonZeroDuration::from_mins(1),
@@ -2452,6 +2464,7 @@ struct WorkerServer {
     repository: gang_testkit::FakeRepository,
     clock: Arc<gang_clock::TestClock>,
     properties: FleetProperties,
+    worker_config: gang_config::WorkerConfig,
     public: WorkerMemoryDialer,
     worker: WorkerMemoryDialer,
     stop: Option<oneshot::Sender<()>>,
@@ -2491,6 +2504,7 @@ impl WorkerServer {
         let properties = fleets.catalog().fleets()[0].clone();
         let mut native_config = config(9001)?;
         native_config.worker.connect_timeout = gang_config::WholeSeconds::from_units(2);
+        let worker_config = native_config.worker.clone();
         let plugin = Arc::new(build_plugin(native_config)?);
         let provisioner = gang_testkit::FakeProvisioner::default();
         let convergences = gang_testkit::CallCount::new();
@@ -2521,7 +2535,9 @@ impl WorkerServer {
             clients: WorkerAnonymous(Arc::clone(&identity)),
             workers: WorkerAnonymous(identity),
         };
-        let server = gang_server::Server::prepare(parts, worker_server_settings(9000)?).await?;
+        let server =
+            gang_server::Server::prepare(parts, worker_server_settings(9000, &worker_config)?)
+                .await?;
         let (stop, stopped) = oneshot::channel();
         let (ready, prepared) = ControllerReady::channel();
         let task = tokio::spawn(server.run(
@@ -2535,6 +2551,7 @@ impl WorkerServer {
             repository,
             clock,
             properties,
+            worker_config,
             public,
             worker,
             stop: Some(stop),
@@ -3041,7 +3058,7 @@ async fn trigger_worker_drain(server: &mut WorkerServer, cause: DrainCause) -> T
                     )?),
                 )
                 .await?;
-            let settings = worker_server_settings(9000)?;
+            let settings = worker_server_settings(9000, &server.worker_config)?;
             let now = server.clock.wall();
             let outcome = server
                 .repository

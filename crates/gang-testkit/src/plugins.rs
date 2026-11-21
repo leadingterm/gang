@@ -200,8 +200,6 @@ environment = "host:test"
 [server]
 transport = "plaintext"
 
-[server.http2]
-shutdown_grace = "0s"
 "#;
 
 #[cfg(test)]

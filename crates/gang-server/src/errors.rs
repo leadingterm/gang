@@ -58,12 +58,16 @@ pub enum ServerError {
     #[error("cannot register the controller candidate")]
     CandidateRegistration(#[source] PortError),
 
+    /// The passive host could not finish preparing its routing registration.
+    #[error("cannot prepare the controller host")]
+    PreparedMilestone(#[source] PortError),
+
     /// The host could not be marked serving before its deadline.
     #[error("cannot report the serving milestone")]
     ServingMilestone(#[source] PortError),
 
-    /// A voluntary handoff could not complete within its deadline.
-    #[error("the controller handoff timed out")]
+    /// A bounded preparation or promotion phase exceeded its lease-call budget.
+    #[error("the controller handoff phase timed out")]
     HandoffTimedOut(#[source] gang_clock::Elapsed),
 
     /// The certificate authority could not be established from the signer.

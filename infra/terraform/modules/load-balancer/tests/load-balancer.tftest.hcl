@@ -231,7 +231,6 @@ run "shared_database_load_balancers" {
     private_subnet_ids       = ["subnet-private"]
     worker_security_group_id = "sg-workers"
     private_zone_id          = "ZPRIVATE"
-    shutdown_grace           = 100
     deregistration_delay     = 120
   }
 
@@ -246,6 +245,10 @@ run "shared_database_load_balancers" {
   assert {
     condition     = aws_lb_target_group.this.protocol == "TLS" && alltrue([for tg in values(aws_lb_target_group.internal) : tg.protocol == "TCP"]) && alltrue([for tg in concat([aws_lb_target_group.this], values(aws_lb_target_group.internal)) : tonumber(tg.deregistration_delay) == 120 && !tg.connection_termination && tg.health_check[0].protocol == "HTTP" && tg.health_check[0].port == tostring(var.health_port) && tg.health_check[0].path == jsondecode(file("${path.module}/health-check.json")).ready_path && tg.health_check[0].path == "/ready" && tg.health_check[0].matcher == "200" && tg.health_check[0].interval == jsondecode(file("${path.module}/health-check.json")).interval_seconds && tg.health_check[0].timeout == jsondecode(file("${path.module}/health-check.json")).timeout_seconds && tg.health_check[0].healthy_threshold == jsondecode(file("${path.module}/health-check.json")).threshold && tg.health_check[0].unhealthy_threshold == jsondecode(file("${path.module}/health-check.json")).threshold])
     error_message = "Every shared-database target group must drain gracefully and check readiness."
+  }
+  assert {
+    condition     = alltrue([for tg in concat([aws_lb_target_group.this], values(aws_lb_target_group.internal)) : !tg.target_health_state[0].enable_unhealthy_connection_termination && tg.target_health_state[0].unhealthy_draining_interval == 0])
+    error_message = "Unhealthy targets must stop new routing immediately without terminating established connections, independently of the configured deregistration delay."
   }
   assert {
     condition     = aws_vpc_security_group_egress_rule.health.security_group_id == aws_security_group.this.id && aws_vpc_security_group_egress_rule.health.referenced_security_group_id == var.controller_security_group_id && aws_vpc_security_group_egress_rule.health.from_port == var.health_port && aws_vpc_security_group_egress_rule.health.to_port == var.health_port && aws_vpc_security_group_egress_rule.health.ip_protocol == "tcp" && aws_vpc_security_group_ingress_rule.controller_health.security_group_id == var.controller_security_group_id && aws_vpc_security_group_ingress_rule.controller_health.referenced_security_group_id == aws_security_group.this.id && aws_vpc_security_group_ingress_rule.controller_health.from_port == var.health_port && aws_vpc_security_group_ingress_rule.controller_health.to_port == var.health_port && aws_vpc_security_group_ingress_rule.controller_health.ip_protocol == "tcp"
@@ -367,19 +370,30 @@ run "rejects_missing_worker_security_group" {
   expect_failures = [var.worker_security_group_id]
 }
 
-run "rejects_short_deregistration_delay" {
+run "shared_database_defaults_preserve_connections_without_routing_delay" {
   command = plan
   variables {
-    shutdown_grace       = 301
-    deregistration_delay = 300
+    shared_database          = true
+    public_subnet_ids        = ["subnet-public"]
+    private_subnet_ids       = ["subnet-private"]
+    worker_security_group_id = "sg-workers"
+    private_zone_id          = "ZPRIVATE"
   }
-  expect_failures = [var.deregistration_delay]
+  assert {
+    condition     = var.deregistration_delay == 0 && alltrue([for tg in concat([aws_lb_target_group.this], values(aws_lb_target_group.internal)) : tonumber(tg.deregistration_delay) == 0 && !tg.connection_termination && !tg.target_health_state[0].enable_unhealthy_connection_termination && tg.target_health_state[0].unhealthy_draining_interval == 0])
+    error_message = "All shared-database target groups must default to zero deregistration and unhealthy draining delays with both connection-termination flags disabled."
+  }
 }
 
-run "rejects_negative_shutdown_grace" {
+run "accepts_zero_deregistration_delay" {
   command = plan
-  variables { shutdown_grace = -1 }
-  expect_failures = [var.shutdown_grace]
+  variables { deregistration_delay = 0 }
+}
+
+run "rejects_negative_deregistration_delay" {
+  command = plan
+  variables { deregistration_delay = -1 }
+  expect_failures = [var.deregistration_delay]
 }
 
 run "rejects_invalid_workers_port" {

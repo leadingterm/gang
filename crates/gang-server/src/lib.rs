@@ -2,10 +2,11 @@
 //!
 //! The crate composes a Gang server from its ports. One public listener carries the client
 //! services and the Gang API, which the controller serves as its fallback; one private listener
-//! carries workers. Both listeners open on every controller, but reject requests until the
-//! controller's first promotion; public and worker admission then remains enabled. `/ready`
-//! instead reports live serving and lease validity, stopping readiness at handoff. Each listener
-//! is guarded by a plugin that authenticates its callers. The crate also provides the autoscaler
+//! carries workers. Both listeners open on every controller and refuse new public requests until
+//! promotion and after handoff. Only the current promoted holder is healthy and admitting.
+//! The original engine keeps its admitted response streams and authenticated worker store I/O
+//! while draining to controller-stamped attempt deadlines, then waits for actual routing-away.
+//! Each listener is guarded by a plugin that authenticates its callers. The crate also provides the
 //! control loop that reconciles fleet capacity against the scheduler's snapshot.
 //!
 //! A server endpoint is an http or https URL:
@@ -49,6 +50,7 @@ mod leadership;
 mod listeners;
 mod login;
 mod principals;
+mod protection;
 mod proxy_protocol;
 mod publish;
 mod query;

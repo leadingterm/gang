@@ -36,8 +36,6 @@ endpoint = "http://127.0.0.1:9443"
 [server]
 transport = "plaintext"
 
-[server.http2]
-shutdown_grace = "0s"
 
 [authentication.clients.none]
 number = 12

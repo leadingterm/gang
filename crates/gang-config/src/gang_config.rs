@@ -160,7 +160,7 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
         Self::check_listener_collisions(listen, worker_listen, health_listen)?;
         Self::check_leadership(&server)?;
         let fleets = Fleets::resolve(fleets, &provisioner, &sandbox)?;
-        Self::check_fleet_settings(&fleets, &server, default_isa)?;
+        Self::check_fleet_settings(&fleets, default_isa)?;
         if let Some(policy) = &execution.egress {
             policy.validate().map_err(ConfigError::InvalidEgress)?;
         }
@@ -278,25 +278,8 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
         Ok(())
     }
 
-    /// Checks shutdown timing and default ISA against resolved fleets.
-    fn check_fleet_settings(
-        fleets: &Fleets<P>,
-        server: &ServerConfig,
-        default_isa: Isa,
-    ) -> Result<(), ConfigError> {
-        let shutdown_grace = server.http2.shutdown_grace;
-        if let Some(fleet) = fleets
-            .policies()
-            .iter()
-            .find(|fleet| shutdown_grace >= fleet.boot_grace)
-        {
-            return Err(ConfigError::ShutdownGraceNotBelowBootGrace {
-                key: "server.http2.shutdown_grace",
-                shutdown_grace,
-                fleet: fleet.name.clone(),
-                boot_grace: fleet.boot_grace,
-            });
-        }
+    /// Checks the default ISA against resolved fleets.
+    fn check_fleet_settings(fleets: &Fleets<P>, default_isa: Isa) -> Result<(), ConfigError> {
         if !fleets
             .policies()
             .iter()
@@ -359,6 +342,19 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
                 clock_skew: leadership.clock_skew,
             });
         }
+        let window = gang_types::handover::handover_window(
+            leadership.renew_interval.get(),
+            leadership.call_timeout.get(),
+        );
+        let call_timeout = leadership.call_timeout.get();
+        let last_attempt = gang_types::handover::minimum_cli_last_attempt();
+        if window.saturating_add(call_timeout) >= last_attempt {
+            return Err(ConfigError::HandoverOutlastsCli {
+                window,
+                call_timeout,
+                last_attempt,
+            });
+        }
         Self::check_leadership_keepalive(server)
     }
 
@@ -369,14 +365,7 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
             .ttl
             .get()
             .saturating_add(leadership.clock_skew)
-            .saturating_add(leadership.renew_interval.get())
-            .max(
-                gang_types::handover::handover_window(
-                    leadership.renew_interval.get(),
-                    leadership.call_timeout.get(),
-                )
-                .saturating_sub(gang_types::health::health_check().healthy_window()),
-            );
+            .saturating_add(leadership.renew_interval.get());
         let healthy_window = gang_types::health::health_check().healthy_window();
         let keepalive_timeout = gang_types::health::CLIENT_KEEPALIVE_TIMEOUT;
         if takeover.saturating_add(healthy_window) >= keepalive_timeout {

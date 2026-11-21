@@ -1,5 +1,10 @@
 load("//bazel/opentofu:defs.bzl", "opentofu_contract_test")
 
+exports_files(
+    ["lifecycle-hook.json"],
+    visibility = ["//crates/gang-aws:__pkg__"],
+)
+
 opentofu_contract_test(
     name = "controller_contract",
     deps = [

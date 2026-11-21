@@ -502,6 +502,7 @@ pub(crate) mod tests {
             ]),
             available_platform_properties: HashMap::new(),
             free_memory_kb: None,
+            latest_attempt_deadline: None,
         }
     }
 

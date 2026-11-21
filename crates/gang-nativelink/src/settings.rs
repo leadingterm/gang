@@ -52,9 +52,15 @@ pub(crate) fn scheduler(
             requirement: "must be strictly greater than the native client keepalive duration",
         });
     }
+    let attempt_timeout = WholeSeconds::try_new(spec.attempt_budget)
+        .map_err(|_| NativeLinkConfigError::Duration {
+            field: "attempt_budget",
+            requirement: "must be a whole number of seconds, at least 1s and at most about 584 years",
+        })?.as_units();
     let mut simple = json!({
         "supported_platform_properties": supported_platform_properties(spec.fleets),
         "client_action_timeout_s": client_action_timeout,
+        "attempt_timeout_s": attempt_timeout,
         "worker_timeout_s": config.worker_timeout.as_units(),
         "retain_completed_for_s": spec.actions.retain_completed_for.as_units(),
         "max_job_retries": spec.actions.max_job_retries,
@@ -549,6 +555,8 @@ mod tests {
             max_workers: 8,
             observations: observations(),
             client_action_timeout: Duration::from_mins(10),
+            attempt_budget: gang_config::WorkerConfig::default()
+                .attempt_budget(gang_config::ActionsConfig::default().timeout),
         }
     }
 

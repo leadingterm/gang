@@ -230,9 +230,7 @@ pub use server::{
 pub use server_scenarios::{api, certificate_rotation, event_paging, request_limits, viewer_cap};
 pub use server_stack::ServerStream;
 pub use session::{SessionCookie, TokenUsage, cookie_name, session_cookie, signed_token};
-pub use settings::{
-    ActionTools, DeploymentInputs, ReleaseInput, Settings, UpgradeInputs, UpgradeProcedure,
-};
+pub use settings::{ActionTools, DeploymentInputs, ReleaseInput, Settings, UpgradeInputs};
 pub use skipped_pass::skipped_pass;
 pub use sse::EventStream;
 pub use stack::Stack;

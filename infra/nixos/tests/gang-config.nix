@@ -210,8 +210,8 @@
     };
   };
 in
-  assert lib.assertMsg (controllerService.Restart == "on-failure") "gang-server must restart only on failure";
-  assert lib.assertMsg (controllerService.RestartPreventExitStatus == 4) "gang-server must not restart after a shutdown deadline";
+  assert lib.assertMsg (controllerService.Restart == "always") "gang-server must restart after handover";
+  assert lib.assertMsg (!(controllerService ? RestartPreventExitStatus)) "gang-server must not suppress restart by exit status";
   assert lib.assertMsg (controllerService.TimeoutStopSec == "infinity") "gang-server shutdown must not have a systemd deadline";
     pkgs.testers.runNixOSTest {
       name = "gang-config";

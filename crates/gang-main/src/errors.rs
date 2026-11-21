@@ -298,10 +298,6 @@ pub(crate) enum MainError {
     #[error(transparent)]
     Server(#[from] gang_server::ServerError),
 
-    /// The controller exceeded its shutdown grace.
-    #[error("controller shutdown exceeded its configured grace")]
-    ShutdownTimedOut(#[source] gang_clock::Elapsed),
-
     /// The gang worker command failed.
     #[error(transparent)]
     #[fix(source)]

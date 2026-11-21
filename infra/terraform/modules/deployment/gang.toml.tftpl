@@ -90,11 +90,6 @@ bucket = ${jsonencode(cache_bucket_name)}
 region = ${jsonencode(region)}
 key_id = ${jsonencode(ca_key_alias)}
 
-%{ if database_engine != "sqlite" ~}
-
-[server.http2]
-shutdown_grace = ${jsonencode("${shutdown_grace_seconds}s")}
-%{ endif ~}
 
 %{ if database_engine == "dynamodb" ~}
 [database.dynamodb]
@@ -134,9 +129,6 @@ ca_pin = "signer"
 # A load balancer presents a publicly trusted certificate for endpoint, so clients use their system roots.
 endpoint_trust = ${jsonencode(endpoint_trust)}
 %{ endif ~}
-%{ if standby_routability_delay_seconds > 0 ~}
-standby_routability_delay = ${jsonencode("${standby_routability_delay_seconds}s")}
-%{ endif }
 %{ if leadership_renew_interval_seconds != null ~}
 [server.leadership]
 renew_interval = ${jsonencode("${leadership_renew_interval_seconds}s")}
@@ -147,7 +139,7 @@ call_timeout = ${jsonencode("${leadership_call_timeout_seconds}s")}
 [server.proxy_protocol]
 trusted_cidrs = ${jsonencode(proxy_trusted_cidrs)}
 
-%{ endif ~}
+%{ endif }
 [authentication.clients.token]
 providers = ${jsonencode(client_token_providers)}
 
