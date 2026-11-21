@@ -39,6 +39,7 @@ mock_provider "aws" {
   mock_data "aws_ec2_instance_type" {
     defaults = {
       boot_modes              = ["legacy-bios", "uefi"]
+      memory_size             = 65536
       supported_architectures = ["x86_64"]
     }
   }
@@ -203,7 +204,6 @@ variables {
       instance_types              = ["c6id.4xlarge"]
       max_instances               = 4
       vcpus_per_instance          = 15
-      memory_per_instance         = "29GiB"
       disk_per_instance           = "200GiB"
       target_actions_per_instance = 16
     },
@@ -214,11 +214,54 @@ variables {
       instance_types              = ["c7gd.4xlarge"]
       max_instances               = 4
       vcpus_per_instance          = 15
-      memory_per_instance         = "29GiB"
       disk_per_instance           = "200GiB"
       target_actions_per_instance = 16
     },
   ]
+}
+
+run "mixed_instance_fleets_use_smallest_nominal_memory" {
+  command = plan
+
+  override_data {
+    target = module.worker_fleet.data.aws_ec2_instance_type.this["c6id.4xlarge"]
+    values = { boot_modes = ["uefi"], memory_size = 65536 }
+  }
+
+  override_data {
+    target = module.worker_fleet.data.aws_ec2_instance_type.this["c7gd.4xlarge"]
+    values = { boot_modes = ["uefi"], memory_size = 131072 }
+  }
+
+  variables {
+    fleets = [
+      {
+        name                        = "small-first"
+        isa                         = "x86-64"
+        capacity                    = "spot"
+        instance_types              = ["c6id.4xlarge", "c7gd.4xlarge"]
+        max_instances               = 4
+        vcpus_per_instance          = 15
+        disk_per_instance           = "200GiB"
+        target_actions_per_instance = 16
+      },
+      {
+        name                        = "large-first"
+        isa                         = "x86-64"
+        capacity                    = "on-demand"
+        instance_types              = ["c7gd.4xlarge", "c6id.4xlarge"]
+        max_instances               = 4
+        vcpus_per_instance          = 15
+        disk_per_instance           = "200GiB"
+        target_actions_per_instance = 16
+      },
+    ]
+  }
+
+  assert {
+    condition     = length(regexall("memory_per_instance = \"65536MiB\"", output.gang_toml)) == 2
+    error_message = "Both fleets must render the smallest nominal EC2 memory regardless of instance type order."
+  }
 }
 
 run "direct_endpoint_without_load_balancer" {
@@ -264,7 +307,7 @@ run "network_grant_requires_egress" {
     fleets = [{
       name              = "worker", isa = "x86-64", capacity = "spot"
       instance_types    = ["c6id.4xlarge"]
-      max_instances     = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
+      max_instances     = 4, vcpus_per_instance = 15
       disk_per_instance = "200GiB", target_actions_per_instance = 16
       actions           = { grants = ["network"] }
     }]
@@ -278,7 +321,7 @@ run "rejects_unknown_capability" {
     fleets = [{
       name              = "worker", isa = "x86-64", capacity = "spot"
       instance_types    = ["c6id.4xlarge"]
-      max_instances     = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
+      max_instances     = 4, vcpus_per_instance = 15
       disk_per_instance = "200GiB", target_actions_per_instance = 16
       actions           = { grants = ["unknown"] }
     }]
@@ -292,7 +335,7 @@ run "rejects_invalid_action_cpu" {
     fleets = [{
       name              = "worker", isa = "x86-64", capacity = "spot"
       instance_types    = ["c6id.4xlarge"]
-      max_instances     = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
+      max_instances     = 4, vcpus_per_instance = 15
       disk_per_instance = "200GiB", target_actions_per_instance = 16
       actions           = { resources = { cpu_count = 0 } }
     }]
@@ -321,7 +364,7 @@ run "protects_assigned_addresses_with_empty_additional_networks" {
     fleets = [{
       name              = "worker", isa = "x86-64", capacity = "spot"
       instance_types    = ["c6id.4xlarge"]
-      max_instances     = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
+      max_instances     = 4, vcpus_per_instance = 15
       disk_per_instance = "200GiB", target_actions_per_instance = 16
       actions           = { grants = ["network"], resources = { cpu_count = 2, memory = "1GiB", disk = "2GiB" } }
     }]
@@ -358,7 +401,7 @@ run "network_grant_defaults_additional_networks_to_empty" {
     fleets = [{
       name              = "worker", isa = "x86-64", capacity = "spot"
       instance_types    = ["c6id.4xlarge"]
-      max_instances     = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
+      max_instances     = 4, vcpus_per_instance = 15
       disk_per_instance = "200GiB", target_actions_per_instance = 16
       actions           = { grants = ["network"] }
     }]
@@ -383,7 +426,7 @@ run "resource_ceilings_without_grants_omit_grants_table" {
     fleets = [{
       name              = "worker", isa = "x86-64", capacity = "spot"
       instance_types    = ["c6id.4xlarge"]
-      max_instances     = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
+      max_instances     = 4, vcpus_per_instance = 15
       disk_per_instance = "200GiB", target_actions_per_instance = 16
       actions           = { resources = { cpu_count = 2 } }
     }]
@@ -521,7 +564,6 @@ run "renders_scheduled_minimum" {
         max_instances               = 4
         min_instances               = 0
         vcpus_per_instance          = 15
-        memory_per_instance         = "29GiB"
         disk_per_instance           = "200GiB"
         target_actions_per_instance = 16
         scheduled_minimum = [{
@@ -539,7 +581,6 @@ run "renders_scheduled_minimum" {
         instance_types              = ["c7gd.4xlarge"]
         max_instances               = 4
         vcpus_per_instance          = 15
-        memory_per_instance         = "29GiB"
         disk_per_instance           = "200GiB"
         target_actions_per_instance = 16
       },
@@ -561,11 +602,11 @@ run "rejects_scheduled_minimum_at_min_instances" {
   command = plan
   variables {
     fleets = [{
-      name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
-      instance_types      = ["c6id.4xlarge"]
-      max_instances       = 4, min_instances = 1, vcpus_per_instance = 15
-      memory_per_instance = "29GiB", disk_per_instance = "200GiB", target_actions_per_instance = 16
-      scheduled_minimum   = [{ instances = 1, days = ["mon"], start = "07:55", end = "19:00", time_zone = "Europe/Paris" }]
+      name              = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
+      instance_types    = ["c6id.4xlarge"]
+      max_instances     = 4, min_instances = 1, vcpus_per_instance = 15
+      disk_per_instance = "200GiB", target_actions_per_instance = 16
+      scheduled_minimum = [{ instances = 1, days = ["mon"], start = "07:55", end = "19:00", time_zone = "Europe/Paris" }]
     }]
   }
   expect_failures = [var.fleets]
@@ -575,11 +616,11 @@ run "rejects_scheduled_minimum_bad_day" {
   command = plan
   variables {
     fleets = [{
-      name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
-      instance_types      = ["c6id.4xlarge"]
-      max_instances       = 4, min_instances = 0, vcpus_per_instance = 15
-      memory_per_instance = "29GiB", disk_per_instance = "200GiB", target_actions_per_instance = 16
-      scheduled_minimum   = [{ instances = 1, days = ["monday"], start = "07:55", end = "19:00", time_zone = "Europe/Paris" }]
+      name              = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
+      instance_types    = ["c6id.4xlarge"]
+      max_instances     = 4, min_instances = 0, vcpus_per_instance = 15
+      disk_per_instance = "200GiB", target_actions_per_instance = 16
+      scheduled_minimum = [{ instances = 1, days = ["monday"], start = "07:55", end = "19:00", time_zone = "Europe/Paris" }]
     }]
   }
   expect_failures = [var.fleets]
@@ -589,11 +630,11 @@ run "rejects_scheduled_minimum_end_before_start" {
   command = plan
   variables {
     fleets = [{
-      name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
-      instance_types      = ["c6id.4xlarge"]
-      max_instances       = 4, min_instances = 0, vcpus_per_instance = 15
-      memory_per_instance = "29GiB", disk_per_instance = "200GiB", target_actions_per_instance = 16
-      scheduled_minimum   = [{ instances = 1, days = ["mon"], start = "19:00", end = "08:00", time_zone = "Europe/Paris" }]
+      name              = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
+      instance_types    = ["c6id.4xlarge"]
+      max_instances     = 4, min_instances = 0, vcpus_per_instance = 15
+      disk_per_instance = "200GiB", target_actions_per_instance = 16
+      scheduled_minimum = [{ instances = 1, days = ["mon"], start = "19:00", end = "08:00", time_zone = "Europe/Paris" }]
     }]
   }
   expect_failures = [var.fleets]
@@ -603,11 +644,11 @@ run "accepts_scheduled_minimum_until_midnight" {
   command = apply
   variables {
     fleets = [{
-      name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
-      instance_types      = ["c6id.4xlarge"]
-      max_instances       = 4, min_instances = 0, vcpus_per_instance = 15
-      memory_per_instance = "29GiB", disk_per_instance = "200GiB", target_actions_per_instance = 16
-      scheduled_minimum   = [{ instances = 4, days = ["sat", "sun"], start = "22:00", end = "24:00", time_zone = "UTC" }]
+      name              = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
+      instance_types    = ["c6id.4xlarge"]
+      max_instances     = 4, min_instances = 0, vcpus_per_instance = 15
+      disk_per_instance = "200GiB", target_actions_per_instance = 16
+      scheduled_minimum = [{ instances = 4, days = ["sat", "sun"], start = "22:00", end = "24:00", time_zone = "UTC" }]
     }]
   }
   assert {
@@ -620,11 +661,11 @@ run "rejects_scheduled_minimum_above_max_instances" {
   command = plan
   variables {
     fleets = [{
-      name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
-      instance_types      = ["c6id.4xlarge"]
-      max_instances       = 4, min_instances = 0, vcpus_per_instance = 15
-      memory_per_instance = "29GiB", disk_per_instance = "200GiB", target_actions_per_instance = 16
-      scheduled_minimum   = [{ instances = 5, days = ["mon"], start = "07:55", end = "19:00", time_zone = "UTC" }]
+      name              = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
+      instance_types    = ["c6id.4xlarge"]
+      max_instances     = 4, min_instances = 0, vcpus_per_instance = 15
+      disk_per_instance = "200GiB", target_actions_per_instance = 16
+      scheduled_minimum = [{ instances = 5, days = ["mon"], start = "07:55", end = "19:00", time_zone = "UTC" }]
     }]
   }
   expect_failures = [var.fleets]
@@ -634,11 +675,11 @@ run "rejects_scheduled_minimum_without_days" {
   command = plan
   variables {
     fleets = [{
-      name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
-      instance_types      = ["c6id.4xlarge"]
-      max_instances       = 4, min_instances = 0, vcpus_per_instance = 15
-      memory_per_instance = "29GiB", disk_per_instance = "200GiB", target_actions_per_instance = 16
-      scheduled_minimum   = [{ instances = 1, days = [], start = "07:55", end = "19:00", time_zone = "UTC" }]
+      name              = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
+      instance_types    = ["c6id.4xlarge"]
+      max_instances     = 4, min_instances = 0, vcpus_per_instance = 15
+      disk_per_instance = "200GiB", target_actions_per_instance = 16
+      scheduled_minimum = [{ instances = 1, days = [], start = "07:55", end = "19:00", time_zone = "UTC" }]
     }]
   }
   expect_failures = [var.fleets]
@@ -648,11 +689,11 @@ run "rejects_scheduled_minimum_with_a_repeated_day" {
   command = plan
   variables {
     fleets = [{
-      name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
-      instance_types      = ["c6id.4xlarge"]
-      max_instances       = 4, min_instances = 0, vcpus_per_instance = 15
-      memory_per_instance = "29GiB", disk_per_instance = "200GiB", target_actions_per_instance = 16
-      scheduled_minimum   = [{ instances = 1, days = ["mon", "mon"], start = "07:55", end = "19:00", time_zone = "UTC" }]
+      name              = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
+      instance_types    = ["c6id.4xlarge"]
+      max_instances     = 4, min_instances = 0, vcpus_per_instance = 15
+      disk_per_instance = "200GiB", target_actions_per_instance = 16
+      scheduled_minimum = [{ instances = 1, days = ["mon", "mon"], start = "07:55", end = "19:00", time_zone = "UTC" }]
     }]
   }
   expect_failures = [var.fleets]
@@ -761,7 +802,6 @@ run "rejects_fleet_isa_outside_pattern" {
         instance_types              = ["c6id.4xlarge"]
         max_instances               = 4
         vcpus_per_instance          = 15
-        memory_per_instance         = "29GiB"
         disk_per_instance           = "200GiB"
         target_actions_per_instance = 16
       },
@@ -785,7 +825,6 @@ run "rejects_disk_per_instance_without_unit" {
         instance_types              = ["c6id.4xlarge"]
         max_instances               = 4
         vcpus_per_instance          = 15
-        memory_per_instance         = "29GiB"
         disk_per_instance           = "200"
         target_actions_per_instance = 16
       },
@@ -896,7 +935,6 @@ run "fallback_fleet_gets_an_on_demand_twin" {
         instance_types              = ["c6id.4xlarge"]
         max_instances               = 4
         vcpus_per_instance          = 15
-        memory_per_instance         = "29GiB"
         disk_per_instance           = "200GiB"
         target_actions_per_instance = 16
         fallback                    = {}
@@ -908,7 +946,6 @@ run "fallback_fleet_gets_an_on_demand_twin" {
         instance_types              = ["c7gd.4xlarge"]
         max_instances               = 4
         vcpus_per_instance          = 15
-        memory_per_instance         = "29GiB"
         disk_per_instance           = "200GiB"
         target_actions_per_instance = 16
         warm_pool_size              = 2
@@ -979,7 +1016,6 @@ run "rejects_fallback_on_on_demand_fleet" {
         instance_types              = ["c6id.4xlarge"]
         max_instances               = 4
         vcpus_per_instance          = 15
-        memory_per_instance         = "29GiB"
         disk_per_instance           = "200GiB"
         target_actions_per_instance = 16
         fallback                    = {}
@@ -1004,7 +1040,6 @@ run "rejects_warm_pool_without_on_demand_group" {
         instance_types              = ["c6id.4xlarge"]
         max_instances               = 4
         vcpus_per_instance          = 15
-        memory_per_instance         = "29GiB"
         disk_per_instance           = "200GiB"
         target_actions_per_instance = 16
         warm_pool_size              = 2
@@ -1115,7 +1150,6 @@ run "rejects_unknown_fleet_isa" {
       instance_types              = ["c6id.4xlarge"]
       max_instances               = 4
       vcpus_per_instance          = 15
-      memory_per_instance         = "29GiB"
       disk_per_instance           = "200GiB"
       target_actions_per_instance = 16
     }]
@@ -1135,7 +1169,6 @@ run "rejects_zero_fleet_disk" {
       instance_types              = ["c6id.4xlarge"]
       max_instances               = 4
       vcpus_per_instance          = 15
-      memory_per_instance         = "29GiB"
       disk_per_instance           = "0B"
       target_actions_per_instance = 16
     }]
@@ -1144,7 +1177,7 @@ run "rejects_zero_fleet_disk" {
   expect_failures = [var.fleets]
 }
 
-run "rejects_zero_fleet_memory" {
+run "rejects_overflowing_fleet_disk" {
   command = plan
 
   variables {
@@ -1155,65 +1188,6 @@ run "rejects_zero_fleet_memory" {
       instance_types              = ["c6id.4xlarge"]
       max_instances               = 4
       vcpus_per_instance          = 15
-      memory_per_instance         = "0B"
-      disk_per_instance           = "200GiB"
-      target_actions_per_instance = 16
-    }]
-  }
-
-  expect_failures = [var.fleets]
-}
-
-run "rejects_fleet_memory_below_min_reservation" {
-  command = plan
-
-  variables {
-    fleets = [{
-      name                        = "worker"
-      isa                         = "x86-64"
-      capacity                    = "spot"
-      instance_types              = ["c6id.4xlarge"]
-      max_instances               = 4
-      vcpus_per_instance          = 15
-      memory_per_instance         = "67108863B"
-      disk_per_instance           = "200GiB"
-      target_actions_per_instance = 16
-    }]
-  }
-
-  expect_failures = [var.fleets]
-}
-
-run "accepts_fleet_memory_equal_to_min_reservation" {
-  command = plan
-
-  variables {
-    fleets = [{
-      name                        = "worker"
-      isa                         = "x86-64"
-      capacity                    = "spot"
-      instance_types              = ["c6id.4xlarge"]
-      max_instances               = 4
-      vcpus_per_instance          = 15
-      memory_per_instance         = "64MiB"
-      disk_per_instance           = "200GiB"
-      target_actions_per_instance = 16
-    }]
-  }
-}
-
-run "rejects_overflowing_fleet_size" {
-  command = plan
-
-  variables {
-    fleets = [{
-      name                        = "worker"
-      isa                         = "x86-64"
-      capacity                    = "spot"
-      instance_types              = ["c6id.4xlarge"]
-      max_instances               = 4
-      vcpus_per_instance          = 15
-      memory_per_instance         = "29GiB"
       disk_per_instance           = "16777216TiB"
       target_actions_per_instance = 16
     }]
@@ -1222,7 +1196,7 @@ run "rejects_overflowing_fleet_size" {
   expect_failures = [var.fleets]
 }
 
-run "accepts_nonzero_sizes_with_leading_zeroes" {
+run "accepts_nonzero_fleet_disk_with_leading_zeroes" {
   command = plan
 
   variables {
@@ -1233,7 +1207,6 @@ run "accepts_nonzero_sizes_with_leading_zeroes" {
       instance_types              = ["c6id.4xlarge"]
       max_instances               = 4
       vcpus_per_instance          = 15
-      memory_per_instance         = "0001GiB"
       disk_per_instance           = "0001B"
       target_actions_per_instance = 16
     }]
@@ -1253,7 +1226,6 @@ run "rejects_min_instances_above_max_instances" {
         max_instances               = 4
         min_instances               = 5
         vcpus_per_instance          = 15
-        memory_per_instance         = "29GiB"
         disk_per_instance           = "200GiB"
         target_actions_per_instance = 16
       },
@@ -1277,7 +1249,6 @@ run "rejects_zero_vcpus_per_instance" {
         instance_types              = ["c6id.4xlarge"]
         max_instances               = 4
         vcpus_per_instance          = 0
-        memory_per_instance         = "29GiB"
         disk_per_instance           = "200GiB"
         target_actions_per_instance = 16
       },
@@ -1301,7 +1272,6 @@ run "rejects_zero_target_actions_per_instance" {
         instance_types              = ["c6id.4xlarge"]
         max_instances               = 4
         vcpus_per_instance          = 15
-        memory_per_instance         = "29GiB"
         disk_per_instance           = "200GiB"
         target_actions_per_instance = 0
       },
@@ -1325,7 +1295,6 @@ run "rejects_zero_max_instances" {
         instance_types              = ["c6id.4xlarge"]
         max_instances               = 0
         vcpus_per_instance          = 15
-        memory_per_instance         = "29GiB"
         disk_per_instance           = "200GiB"
         target_actions_per_instance = 16
       },
@@ -1453,7 +1422,6 @@ run "single_architecture_uses_matching_digest" {
       instance_types              = ["c6id.4xlarge"]
       max_instances               = 4
       vcpus_per_instance          = 15
-      memory_per_instance         = "29GiB"
       disk_per_instance           = "200GiB"
       target_actions_per_instance = 16
     }]
@@ -1618,7 +1586,6 @@ run "fleet_image_override" {
       instance_types              = ["c6id.4xlarge"]
       max_instances               = 4
       vcpus_per_instance          = 15
-      memory_per_instance         = "29GiB"
       disk_per_instance           = "200GiB"
       target_actions_per_instance = 16
     }]
@@ -1713,7 +1680,6 @@ run "fleet_named_controller_rejected" {
       instance_types              = ["c6id.4xlarge"]
       max_instances               = 4
       vcpus_per_instance          = 15
-      memory_per_instance         = "29GiB"
       disk_per_instance           = "200GiB"
       target_actions_per_instance = 16
     }]

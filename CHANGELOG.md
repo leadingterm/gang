@@ -22,6 +22,7 @@
 
 ### Fixed
 
+- Fix startup on nominal 64 GiB workers whose measured memory, less reserve, is smaller than the fleet estimate; workers advertise their actual available action-pool capacity.
 - **v0.3.4:** Bound persistent-queue scale-out by payback on queued work and qualified genuine arrivals, avoiding overscaling cheap static batches and closed-loop completion waves.
 - **v0.3.4:** Require completion-backed refill in the current cohort before forecasting future arrivals, so finite uploads do not create a sustained-load forecast.
 - **v0.3.4:** Fund the held leader-failover fixture's additional worker with a scenario-local unknown-action duration, without changing its jobs or production defaults.
@@ -31,6 +32,10 @@
 - **v0.3.4:** Declare rate probes explicitly so the checked-in sample passes harness validation.
 - **v0.3.4:** Credit pending and reliable requested capacity without repeatedly raising desired size; keep transient credential-refresh gaps separate from serving surplus and preserve failed-request withdrawal.
 - **v0.3.4:** Keep controller cordons across reconnects and overlapping worker generations within the live engine; do not adopt worker self-drain flags as controller intent. Reset N−1 dwell after skipped passes and keep repeated cordon reinforcement out of audit history.
+
+### Upgrade notes
+
+- Remove `memory_per_instance` from every AWS deployment-module `fleets` entry. Prelaunch values are derived from the smallest nominal EC2 instance memory in each fleet. The generated internal `gang.toml` field remains a scheduler estimate, not an operator input to the AWS module.
 
 ## 0.3.3
 

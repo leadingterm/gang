@@ -40,6 +40,7 @@ use crate::transport::{ServerCaSource, Transport};
 /// [`WorkerError::IsaMismatch`] when that fleet is configured for another instruction set;
 /// [`WorkerError::FleetDiskUnavailable`] when the scratch volume leaves the actions less disk
 /// than the fleet declares;
+/// [`WorkerError::MemoryReserveExhausted`] when the memory reserve leaves no physical memory;
 /// [`WorkerError::Config`] when the sandbox file cannot be rendered;
 /// [`WorkerError::SandboxProgram`] when a sandbox program does not resolve to an executable
 /// file;
@@ -263,15 +264,10 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
     )?;
     let limits = file.limits.map(build_limits).transpose()?;
     let reserve = actions.memory.reserve.get();
-    let memory_pool = prepare_memory_pool(
-        limits.as_ref(),
-        reserve,
-        fleet.policy.memory_per_instance.get(),
-        &identity.fleet,
-    )
-    .await?;
+    let (memory_pool, capacity) = prepare_memory_pool(limits.as_ref(), reserve).await?;
     let mut properties = fleet.properties.clone();
     properties.set_action_environment(&environment);
+    properties.set_memory_capacity(capacity);
     let spec = WorkerSpec {
         actions,
         memory_pool,
@@ -364,25 +360,19 @@ fn fast_cas_budget(
 async fn prepare_memory_pool<L: ActionLimitsPort>(
     limits: Option<&L>,
     reserve: gang_types::Bytes,
-    declared: gang_types::Bytes,
-    fleet: &gang_types::FleetName,
-) -> Result<Option<gang_spi::ActionMemoryPool>, WorkerError> {
+) -> Result<(Option<gang_spi::ActionMemoryPool>, gang_types::NonZeroBytes), WorkerError> {
     let memory_pool = match limits {
         Some(limits) => limits.prepare(reserve).await?,
         None => None,
     };
-    if let Some(pool) = &memory_pool {
-        let capacity = pool.capacity.get();
-        if declared > capacity {
-            return Err(WorkerError::FleetMemoryUnavailable {
-                fleet: fleet.clone(),
-                declared,
-                capacity,
-                reserve,
-            });
-        }
-    }
-    Ok(memory_pool)
+    let capacity = if let Some(pool) = &memory_pool {
+        pool.capacity
+    } else {
+        let physical = gang_os::physical_memory().map_err(PortError::backend)?;
+        gang_types::NonZeroBytes::new(physical.saturating_sub(reserve))
+            .ok_or(WorkerError::MemoryReserveExhausted { physical, reserve })?
+    };
+    Ok((memory_pool, capacity))
 }
 
 /// The TLS material of one generation: the files the worker reads, when to refresh them, and

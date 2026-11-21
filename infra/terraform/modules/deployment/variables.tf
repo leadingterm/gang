@@ -306,7 +306,6 @@ variable "fleets" {
     max_instances               = number
     min_instances               = optional(number, 0)
     vcpus_per_instance          = number
-    memory_per_instance         = string
     disk_per_instance           = string
     target_actions_per_instance = number
     idle_timeout                = optional(string, "10m")
@@ -330,7 +329,7 @@ variable "fleets" {
     max_instances: upper bound of the Auto Scaling group.
     min_instances, vcpus_per_instance, target_actions_per_instance, idle_timeout,
     max_drain_wait, boot_grace: scheduling policy written to gang.toml.
-    memory_per_instance: memory size at least 64MiB in B, KiB, MiB, GiB or TiB, written to gang.toml.
+    Fleet memory_per_instance in gang.toml is a prelaunch estimate derived from the smallest nominal EC2 memory size among the configured instance types. Live workers register their actual available memory instead.
     disk_per_instance: non-zero disk size in B, KiB, MiB, GiB or TiB; lower bound of the disk the fleet's actions may fill in total, valid for every instance type of the fleet (scratch capacity minus the fast CAS budget minus an overshoot reserve); written to gang.toml.
     scratch_volume_gib: EBS scratch volume on /dev/sdf for EBS-only instance types. Null uses instance-store NVMe.
     root_volume_gib: size of the encrypted gp3 root volume in GiB. Unset uses the worker-fleet module's default.
@@ -401,28 +400,6 @@ variable "fleets" {
       )
     ])
     error_message = "Each fleet disk_per_instance must be a non-zero size in B, KiB, MiB, GiB or TiB that fits in 64 bits."
-  }
-
-  validation {
-    condition = alltrue([
-      for fleet in var.fleets : try(
-        tonumber(regex("^(0*[1-9][0-9]*)(B|KiB|MiB|GiB|TiB)$", fleet.memory_per_instance)[0]) *
-        { B = 1, KiB = 1024, MiB = 1048576, GiB = 1073741824, TiB = 1099511627776 }[regex("^(0*[1-9][0-9]*)(B|KiB|MiB|GiB|TiB)$", fleet.memory_per_instance)[1]] <= 18446744073709551615,
-        false
-      )
-    ])
-    error_message = "Each fleet memory_per_instance must be a non-zero size in B, KiB, MiB, GiB or TiB that fits in 64 bits."
-  }
-
-  validation {
-    condition = alltrue([
-      for fleet in var.fleets : try(
-        tonumber(regex("^(0*[1-9][0-9]*)(B|KiB|MiB|GiB|TiB)$", fleet.memory_per_instance)[0]) *
-        { B = 1, KiB = 1024, MiB = 1048576, GiB = 1073741824, TiB = 1099511627776 }[regex("^(0*[1-9][0-9]*)(B|KiB|MiB|GiB|TiB)$", fleet.memory_per_instance)[1]] >= 67108864,
-        false
-      )
-    ])
-    error_message = "Each fleet memory_per_instance must be at least 64MiB, the default [actions.memory] min_reservation, which the controller refuses to exceed."
   }
 
   validation {

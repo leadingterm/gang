@@ -129,9 +129,12 @@ locals {
   }
 
   gang_toml = templatefile("${path.module}/gang.toml.tftpl", {
-    default_isa                       = var.default_isa
-    gang_settings                     = var.gang_settings
-    fleets                            = [for fleet in var.fleets : merge(fleet, { action_environment = local.node_action_environments[fleet.name] })]
+    default_isa   = var.default_isa
+    gang_settings = var.gang_settings
+    fleets = [for fleet in var.fleets : merge(fleet, {
+      action_environment  = local.node_action_environments[fleet.name]
+      memory_per_instance = "${module.worker_fleet.memory_mib_by_fleet[fleet.name]}MiB"
+    })]
     network_granted                   = local.network_granted && var.execution_egress != null
     execution_egress                  = var.execution_egress
     protected_networks                = local.protected_networks
