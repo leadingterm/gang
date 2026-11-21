@@ -105,6 +105,9 @@ pub(crate) enum NativeLinkEmbedError {
     #[error("the controller is already serving")]
     #[failure(config)]
     AlreadyServing,
+    /// The original scheduler could not freeze or observe its owned work.
+    #[error("cannot hand off the original controller")]
+    Drain(#[source] gang_spi::PortError),
 }
 
 impl NativeLinkEmbedError {

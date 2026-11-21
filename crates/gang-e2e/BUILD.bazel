@@ -25,8 +25,8 @@ alias(
 alias(
     name = "previous_gang",
     actual = select({
-        "//bazel/platforms:linux_x86_64": "@gang_v033_linux_x86_64//file:gang",
-        "//bazel/platforms:linux_arm64": "@gang_v033_linux_arm64//file:gang",
+        "//bazel/platforms:linux_x86_64": "@gang_v034_linux_x86_64//file:gang",
+        "//bazel/platforms:linux_arm64": "@gang_v034_linux_arm64//file:gang",
     }),
     target_compatible_with = ["@platforms//os:linux"],
 )
@@ -38,9 +38,16 @@ upgrade_fixture(
     target_compatible_with = ["@platforms//os:linux"],
 )
 
+upgrade_fixture(
+    name = "v034_fixture",
+    srcs = ["@gang_v034_source//:sources"],
+    source_root = "@gang_v034_source//:Cargo.toml",
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
 alias(
     name = "previous_fixture",
-    actual = ":v033_fixture",
+    actual = ":v034_fixture",
     target_compatible_with = ["@platforms//os:linux"],
 )
 

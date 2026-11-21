@@ -74,7 +74,7 @@ pub use expiring_port::{
 pub use fence::{Deadline, Fence, Held, Keeper, LeaseLapsed, RunError, Work};
 pub use fleet_options::{FleetOptions, OptionSpec};
 pub use gang_macros::{FleetOptions, PortFailure, compose, port};
-pub use host_port::{ControllerHostIdentity, ControllerHostPort, HostMilestone};
+pub use host_port::{ControllerHostIdentity, ControllerHostPort, ControllerHostState, HostMilestone};
 pub use identity_port::{
     LoginChallenge, LoginClient, LoginGrant, LoginPort, LoginRequest, LoginSupport,
     ProofVerifierPort,
@@ -112,10 +112,11 @@ pub use repository_port::{
 };
 pub use scheduler_port::{
     Accepted, ActionInfo, ActionsView, Admitted, ApiRequestBody, ApiResponseBody, ApiService,
-    BoxedConnection, ClientTls, Connection, ControllerConnections, ControllerEndpoints,
-    ControllerReady, ControllerSpec, EngineStore, ExecutingDemand, GateDecision, InstanceCordon,
-    LeaderUnavailable, LearnedHistory, Listening, ListingLimits, QueuedActionView, QueuedDemand,
-    RequestGate, RequestScope, RunningActionView, SchedulerPort, SchedulerSnapshot, Slots,
+    BoxedConnection, ClientTls, Connection, ControllerConnections, ControllerDrain,
+    ControllerEndpoints, ControllerReady, ControllerSpec, DrainingWorker, EngineStore,
+    ExecutingDemand, GateDecision, InstanceCordon, LeaderUnavailable, LearnedHistory, Listening,
+    ListingLimits, QueuedActionView, QueuedDemand, RequestGate, RequestScope, RunningActionView,
+    SchedulerPort, SchedulerSnapshot, Slots,
     StoreAccess, StoreKind, WorkerSpec, WorkerState, WorkerTls, full_body,
 };
 pub use schema::SchemaMismatch;

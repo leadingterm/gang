@@ -116,6 +116,7 @@ struct Census {
     release_first: u32,
     busy_cordons: u32,
     unconnected_cordon: bool,
+    handover_retained: u32,
 }
 
 #[derive(Debug, Default)]
@@ -372,18 +373,26 @@ impl Reconciler {
             let orphans = plan.steps.len();
             let mut census = Census::default();
             for (position, instance) in fleet.supply.instances.iter().enumerate() {
-                if instance.lifecycle == InstanceLifecycle::Terminating {
+                let protected = fleet.handover_protected.binary_search(&instance.id).is_ok()
+                    && pass.hosted.workers_on(&fleet.policy.name, &instance.id).next().is_none();
+                if instance.lifecycle == InstanceLifecycle::Terminating && !protected {
                     continue;
                 }
                 census.live = census.live.saturating_add(1);
-                let class = self.classify_instance(
-                    pass,
-                    &view,
-                    (position, instance),
-                    (&mut fleet.past_boot_grace, &mut fleet.outlook.workers),
-                    &mut census,
-                    plan,
-                );
+                let class = if protected {
+                    census.handover_retained = census.handover_retained.saturating_add(1);
+                    fleet.past_boot_grace[position] = false;
+                    Standing::Retained
+                } else {
+                    self.classify_instance(
+                        pass,
+                        &view,
+                        (position, instance),
+                        (&mut fleet.past_boot_grace, &mut fleet.outlook.workers),
+                        &mut census,
+                        plan,
+                    )
+                };
                 match class {
                     Standing::Usable => {
                         census.usable = census.usable.saturating_add(1);
@@ -602,7 +611,16 @@ impl Reconciler {
             .saturating_into();
         let from = view.supply.desired.saturating_sub(terminated);
         let max = view.policy.instances.max().get();
-        let to = purchase_target(view.needed, retaining, max);
+        let to = purchase_target(
+            view.needed,
+            retaining.saturating_add(census.handover_retained),
+            max,
+        );
+        let to = if census.handover_retained > 0 {
+            to.min(from.saturating_add(max.saturating_sub(census.live)))
+        } else {
+            to
+        };
         if view.supply.abandoned > 0 && resumed == 0 {
             plan.steps.push(PlanStep {
                 fleet: index,

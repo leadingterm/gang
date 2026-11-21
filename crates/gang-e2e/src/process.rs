@@ -14,6 +14,8 @@ use gang_clock::{Clock, SystemClock};
 use gang_types::NonZeroBytes;
 use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
 
+use parking_lot::{Condvar, Mutex};
+use std::sync::Arc;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use crate::errors::{E2eError, Result};
@@ -330,6 +332,254 @@ impl Supervised {
 impl Drop for Supervised {
     fn drop(&mut self) {
         let _ = self.kill();
+    }
+}
+
+/// A stable local host running a controller with systemd's `Restart=always` policy.
+///
+/// The monitor owns restarts, independently of observations. Explicit stop/kill/drop suppresses
+/// restart before signalling. The original PID and its status are never replaced by a new child.
+pub(crate) struct ControllerHost {
+    state: Arc<Mutex<HostState>>,
+    changed: Arc<Condvar>,
+    monitor: Option<thread::JoinHandle<()>>,
+}
+
+struct HostState {
+    child: Supervised,
+    identity: Arc<str>,
+    original_pid: u32,
+    original_status: Option<ExitStatus>,
+    enabled: bool,
+    error: Option<String>,
+}
+
+impl ControllerHost {
+    pub(crate) fn start(
+        child: Supervised,
+        identity: Arc<str>,
+        mut command: Command,
+        log: std::path::PathBuf,
+        timeout: Duration,
+        ready: fn(&mut Supervised, &Path, usize, Duration) -> Result<Arc<str>>,
+    ) -> Result<Self> {
+        let original_pid = child.pid();
+        let state = Arc::new(Mutex::new(HostState {
+            child,
+            identity,
+            original_pid,
+            original_status: None,
+            enabled: true,
+            error: None,
+        }));
+        let changed = Arc::new(Condvar::new());
+        let shared = Arc::clone(&state);
+        let wake = Arc::clone(&changed);
+        let monitor = thread::Builder::new()
+            .name("e2e-controller-host".into())
+            .spawn(move || {
+                loop {
+                    let pid = {
+                        let state = shared.lock();
+                        if !state.enabled {
+                            break;
+                        }
+                        state.child.pid()
+                    };
+                    // Observe the OS exit event without reaping. Explicit stop disables restart
+                    // before signalling/reaping; it joins this monitor only after the child stops.
+                    let observed = (|| -> Result<()> {
+                        let pid = i32::try_from(pid).ok().and_then(Pid::from_raw)
+                            .ok_or_else(|| E2eError::system("invalid supervised controller PID"))?;
+                        loop {
+                            match waitid(WaitId::Pid(pid), WaitIdOptions::EXITED | WaitIdOptions::NOWAIT) {
+                                Err(rustix::io::Errno::INTR) => {}
+                                result => return result.map(|_| ()).map_err(|error| {
+                                    E2eError::io("observing controller exit")(std::io::Error::from(error))
+                                }),
+                            }
+                        }
+                    })();
+                    let mut state = shared.lock();
+                    if !state.enabled {
+                        break;
+                    }
+                    let outcome = (|| -> Result<()> {
+                        if let Err(error) = observed {
+                            // A concurrent observation may have reaped through Child::try_wait;
+                            // std retains that exact status. It must not suppress host restart.
+                            if !state.child.has_exited()? {
+                                return Err(error);
+                            }
+                        }
+                        let status = state.child.wait_within(Duration::ZERO, "exited controller")?;
+                        if state.original_status.is_none() {
+                            state.original_status = Some(status);
+                        }
+                        wake.notify_all();
+                        let offset = std::fs::metadata(&log)
+                            .map_err(E2eError::io("measuring restarted controller log"))?
+                            .len();
+                        let offset = usize::try_from(offset)
+                            .map_err(E2eError::system_from("measuring restarted controller log"))?;
+                        state.child = Supervised::spawn(&mut command, &log)?;
+                        match ready(&mut state.child, &log, offset, timeout) {
+                            Ok(identity) => {
+                                state.identity = identity;
+                                state.error = None;
+                            }
+                            Err(error) => {
+                                if !state.child.has_exited()? {
+                                    return Err(error);
+                                }
+                                // A rejected/repeatedly failing child still has Restart=always.
+                                // Keep its startup error visible until a replacement prepares.
+                                state.error = Some(gang_types::error_chain(&error).to_string());
+                            }
+                        }
+                        wake.notify_all();
+                        Ok(())
+                    })();
+                    if let Err(error) = outcome {
+                        state.error = Some(gang_types::error_chain(&error).to_string());
+                        state.enabled = false;
+                        wake.notify_all();
+                        break;
+                    }
+                }
+            })
+            .map_err(E2eError::io("starting controller host supervisor"))?;
+        Ok(Self {
+            state,
+            changed,
+            monitor: Some(monitor),
+        })
+    }
+
+    pub(crate) fn pid(&self) -> u32 {
+        self.state.lock().child.pid()
+    }
+
+    pub(crate) fn identity(&self) -> Arc<str> {
+        Arc::clone(&self.state.lock().identity)
+    }
+
+    pub(crate) fn wait_restarted(&self, timeout: Duration) -> Result<(u32, Arc<str>)> {
+        let start = Instant::now();
+        let mut state = self.state.lock();
+        loop {
+            if let Some(error) = &state.error {
+                return Err(E2eError::system(format!("controller host supervisor: {error}")));
+            }
+            if state.child.pid() != state.original_pid && !state.child.has_exited()? {
+                return Ok((state.child.pid(), Arc::clone(&state.identity)));
+            }
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return Err(E2eError::timeout("host to restart its original controller", timeout));
+            }
+            self.changed.wait_for(&mut state, remaining);
+        }
+    }
+
+    pub(crate) fn has_exited(&mut self) -> Result<bool> {
+        let mut state = self.state.lock();
+        if let Some(error) = &state.error {
+            return Err(E2eError::system(format!("controller host supervisor: {error}")));
+        }
+        state.child.has_exited()
+    }
+
+    /// Suppresses restart before explicit stop or a fault aimed at the original process.
+    pub(crate) fn suppress_restart(&mut self) {
+        self.state.lock().enabled = false;
+        self.changed.notify_all();
+    }
+
+    fn join_monitor(&mut self) -> Result<()> {
+        if let Some(monitor) = self.monitor.take() {
+            monitor
+                .join()
+                .map_err(|_| E2eError::system("controller host supervisor panicked"))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn request_exit(&mut self) -> Result<()> {
+        self.suppress_restart();
+        let mut state = self.state.lock();
+        if state.child.has_exited()? {
+            return Ok(());
+        }
+        state.child.request_exit()
+    }
+
+    pub(crate) fn kill(&mut self) -> Result<()> {
+        self.suppress_restart();
+        let mut state = self.state.lock();
+        state.child.kill()?;
+        let status = state.child.wait_within(Duration::ZERO, "killed controller")?;
+        state.original_status.get_or_insert(status);
+        drop(state);
+        self.join_monitor()
+    }
+
+    pub(crate) fn terminate(&mut self, timeout: Duration) -> Result<ExitStatus> {
+        self.request_exit()?;
+        self.wait_stopped(timeout)
+    }
+
+    pub(crate) fn wait_stopped(&mut self, timeout: Duration) -> Result<ExitStatus> {
+        self.suppress_restart();
+        let mut state = self.state.lock();
+        if state.child.child.is_some() {
+            let status = state.child.wait_within(timeout, "stopped host controller")?;
+            state.original_status.get_or_insert(status);
+        }
+        let status = state.original_status
+            .ok_or_else(|| E2eError::system("host has no original exit status"))?;
+        drop(state);
+        self.join_monitor()?;
+        Ok(status)
+    }
+
+    /// Waits for the original child, not the replacement that the monitor may already have started.
+    pub(crate) fn wait_within(
+        &mut self,
+        timeout: Duration,
+        condition: &str,
+    ) -> Result<ExitStatus> {
+        let start = Instant::now();
+        let mut state = self.state.lock();
+        loop {
+            if let Some(status) = state.original_status {
+                return Ok(status);
+            }
+            if !state.enabled {
+                let status = state.child.wait_within(timeout, condition)?;
+                state.original_status = Some(status);
+                return Ok(status);
+            }
+            if let Some(error) = &state.error {
+                return Err(E2eError::system(error.clone()));
+            }
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return Err(E2eError::timeout(
+                    format!("{condition} (original pid {})", state.original_pid),
+                    timeout,
+                ));
+            }
+            self.changed.wait_for(&mut state, remaining);
+        }
+    }
+}
+
+impl Drop for ControllerHost {
+    fn drop(&mut self) {
+        self.suppress_restart();
+        let _ = self.state.lock().child.kill();
+        let _ = self.join_monitor();
     }
 }
 
@@ -745,6 +995,18 @@ mod tests {
                 println!("captured output");
                 CHILD_HELPER.complete();
             }
+            Ok("host") => {
+                let path = std::env::var_os("GANG_E2E_HOST_SOCKET").expect("host control socket");
+                let mut control = std::os::unix::net::UnixStream::connect(path)
+                    .expect("connecting host control");
+                println!("ready");
+                let mut exit = [0];
+                control.read_exact(&mut exit).expect("host exit instruction");
+                if exit[0] != 0 {
+                    std::process::exit(i32::from(exit[0]));
+                }
+                CHILD_HELPER.complete();
+            }
             Ok("stdin") => {
                 println!("ready");
                 let mut bytes = Vec::new();
@@ -760,6 +1022,77 @@ mod tests {
             }
             _ => {}
         }
+    }
+
+    fn host_ready(
+        child: &mut Supervised,
+        _log: &Path,
+        _offset: usize,
+        timeout: Duration,
+    ) -> Result<Arc<str>> {
+        child.await_announcements(timeout, |line| line.ends_with("ready"))?
+            .ok_or_else(|| E2eError::system("host child exited before ready"))?;
+        Ok(Arc::from(child.pid().to_string()))
+    }
+
+    #[test]
+    fn host_restarts_without_observation_and_keeps_original_exit_evidence()
+    -> gang_testkit::TestResult {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        for code in [0, 17] {
+            let root = tempfile::tempdir()?;
+            let path = root.path().join("control.sock");
+            let listener = runtime.block_on(async { tokio::net::UnixListener::bind(&path) })?;
+            let log = root.path().join("log");
+            let mut command = helper("host");
+            command.env("GANG_E2E_HOST_SOCKET", &path);
+            let mut child = Supervised::spawn(&mut command, &log)?;
+            let identity = host_ready(&mut child, &log, 0, Duration::from_secs(30))?;
+            let original_pid = child.pid();
+            let mut host = ControllerHost::start(
+                child, Arc::clone(&identity), command, log, Duration::from_secs(30), host_ready,
+            )?;
+            let accept = || runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(30), listener.accept()).await
+            });
+            let (mut first, _) = accept()??;
+            runtime.block_on(async { tokio::io::AsyncWriteExt::write_all(&mut first, &[code]).await })?;
+            // No host observation has run since the exit instruction: this accept can only be
+            // satisfied by the independent monitor spawning the replacement.
+            let (_replacement, _) = accept()??;
+            let (pid, holder) = host.wait_restarted(Duration::from_secs(30))?;
+            assert_ne!(pid, original_pid);
+            assert_ne!(holder, identity);
+            let original = host.wait_within(Duration::from_secs(30), "original exit")?;
+            assert_eq!(original.code(), Some(i32::from(code)));
+            host.kill()?;
+            assert!(!host.state.lock().enabled);
+            assert!(host.monitor.is_none());
+            assert_eq!(host.wait_within(Duration::ZERO, "original evidence")?, original);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_host_stop_suppresses_restart_and_preserves_kill_status()
+    -> gang_testkit::TestResult {
+        let root = tempfile::tempdir()?;
+        let log = root.path().join("log");
+        let mut command = helper("park");
+        let mut child = Supervised::spawn(&mut command, &log)?;
+        let identity = host_ready(&mut child, &log, 0, Duration::from_secs(30))?;
+        let mut host = ControllerHost::start(
+            child, identity, command, log, Duration::from_secs(30), host_ready,
+        )?;
+        let pid = host.pid();
+        host.kill()?;
+        assert_eq!(host.pid(), pid);
+        assert!(host.monitor.is_none());
+        assert_eq!(
+            host.wait_within(Duration::ZERO, "killed original")?.signal(),
+            Some(rustix::process::Signal::KILL.as_raw()),
+        );
+        Ok(())
     }
 
     #[test]

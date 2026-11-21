@@ -551,28 +551,14 @@ fn controller_workers(cluster: &Cluster<'_>, controller: usize) -> BTreeSet<u32>
         .collect()
 }
 
-/// The harness must allow the former leader to detect loss and finish its configured drain.
+/// Allows the former leader to detect fencing before waiting for released attempts to finish.
 fn check_exit_deadline(cluster: &Cluster<'_>) -> Result<()> {
     let stack = cluster.stack();
-    let text = fs::read_to_string(stack.placement().config_file()).map_err(E2eError::io(
-        "reading the partition controller configuration",
-    ))?;
-    let config: toml::Value = toml::from_str(&text).map_err(crate::template::template_error)?;
-    let grace = config
-        .get("server")
-        .and_then(|value| value.get("http2"))
-        .and_then(|value| value.get("shutdown_grace"))
-        .and_then(toml::Value::as_str)
-        .ok_or_else(|| E2eError::system("missing configured server.http2.shutdown_grace"))?;
-    let shutdown_grace = gang_types::duration::parse(grace)
-        .map_err(E2eError::system_from("parsing server.http2.shutdown_grace"))?;
-    let required = TTL
-        .saturating_add(RENEW_INTERVAL)
-        .saturating_add(shutdown_grace);
+    let required = TTL.saturating_add(RENEW_INTERVAL);
     let timeout = stack.settings().startup_timeout;
     if timeout < required {
         return Err(E2eError::system(format!(
-            "controller exit timeout {timeout:?} is below ttl + renewal interval + shutdown grace ({required:?})"
+            "controller exit timeout {timeout:?} is below ttl + renewal interval ({required:?})"
         )));
     }
     Ok(())

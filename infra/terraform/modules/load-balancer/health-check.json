@@ -3,8 +3,6 @@
   "interval_seconds": 5,
   "timeout_seconds": 2,
   "threshold": 2,
-  "renew_interval_seconds": 3,
-  "call_timeout_seconds": 2,
-  "promotion_seconds": 1,
-  "handover_margin_seconds": 5
+  "renew_interval_seconds": 1,
+  "call_timeout_seconds": 1
 }

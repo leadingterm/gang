@@ -12,8 +12,8 @@ use gang_spi::{
     ApiService, ApplyRecords, Authenticated, AuthenticationHost, AuthenticationPort,
     CacheStorePort, CandidateGeneration, CandidatePriority, Capabilities, CertStatus,
     CertificateIssue, CertificateSignerPort, CertificateTarget, ClientCertificates,
-    ControllerConnections, ControllerEndpoints, ControllerHostIdentity, ControllerHostPort,
-    ControllerId, ControllerReady, ControllerSpec, CredentialLifecyclePort, Evidence,
+    ControllerConnections, ControllerDrain, ControllerEndpoints, ControllerHostIdentity, ControllerHostPort,
+    ControllerHostState, ControllerId, ControllerReady, ControllerSpec, CredentialLifecyclePort, Evidence,
     ExpiringRecordPort, FleetInstance, FleetOptions, FleetSupply, Held, HostMilestone, Insert,
     InstanceIdentity, IssuedCertRecord, IssuedCertificate, IssuedToken, LeaderLeasePort,
     LearnedHistory, Lease, LeaseCandidate, LeaseEpoch, ListingLimits, LoginChallenge, LoginClient,
@@ -258,6 +258,18 @@ macro_rules! provisioner_plugin {
         }
 
         impl ControllerHostPort for $plugin {
+            async fn state(&self) -> Result<ControllerHostState, PortError> {
+                Ok(ControllerHostState::Active)
+            }
+
+            async fn drain_limit(&self) -> Result<Option<std::time::Duration>, PortError> {
+                Ok(None)
+            }
+
+            async fn heartbeat(&self) -> Result<(), PortError> {
+                Ok(())
+            }
+
             async fn incarnation(&self) -> Result<ControllerHostIdentity, PortError> {
                 Ok(ControllerHostIdentity::Persistent(instance(self.number)?))
             }
@@ -498,13 +510,8 @@ impl SchedulerPort for Stub {
         Ok(())
     }
 
-    async fn serve_standby<P: RequestGate, W: RequestGate, A: ApiService>(
-        &self,
-        _connections: ControllerConnections<P, W, A>,
-    ) -> Result<(), PortError> {
-        Err(PortError::unavailable(
-            "scheduler stub does not prepare shared services",
-        ))
+    async fn hand_off(&self, _into: &mut ControllerDrain) -> Result<(), PortError> {
+        Err(PortError::unavailable("scheduler stub is not serving"))
     }
 
     async fn run_worker(

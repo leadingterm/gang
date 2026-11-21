@@ -1,6 +1,6 @@
 //! Stops admission and releases queued client streams during a controller hand-off.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
@@ -16,12 +16,16 @@ use nativelink_util::operation_state_manager::{
 };
 use nativelink_util::origin_event::OriginMetadata;
 use tokio::sync::watch;
+use parking_lot::Mutex;
+
+use crate::standing::Standing;
 
 /// Persistent, cloneable hand-off notifications.
 #[derive(Clone)]
 pub(crate) struct HandOff {
     begun: watch::Sender<bool>,
     workers_released: watch::Sender<bool>,
+    public: Arc<Mutex<Vec<Weak<Standing>>>>,
 }
 
 impl HandOff {
@@ -29,11 +33,36 @@ impl HandOff {
         Self {
             begun: watch::channel(false).0,
             workers_released: watch::channel(false).0,
+            public: Arc::default(),
         }
     }
 
     pub(crate) fn begin(&self) {
+        let public = self.public.lock();
+        if self.is_begun() {
+            return;
+        }
         self.begun.send_replace(true);
+        for standing in public.iter().filter_map(Weak::upgrade) {
+            standing.hand_off();
+        }
+    }
+
+    /// Registers only pre-handoff connections; fresh refusal connections must first send 503.
+    pub(crate) fn public_connection(&self, standing: &Arc<Standing>) {
+        let mut public = self.public.lock();
+        if !self.is_begun() {
+            public.retain(|entry| entry.strong_count() != 0);
+            public.push(Arc::downgrade(standing));
+        }
+    }
+
+    pub(crate) fn public_complete(&self) -> bool {
+        self.public
+            .lock()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .all(|standing| !standing.is_busy())
     }
 
     pub(crate) fn is_begun(&self) -> bool {

@@ -16,7 +16,7 @@ use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 use gang_e2e::{
     ActionTools, DeploymentInputs, Gate, Invocation, ReleaseInput, Scenario, Settings,
-    UpgradeInputs, UpgradeProcedure, anchored, run, unknown_scenarios,
+    UpgradeInputs, anchored, run, unknown_scenarios,
 };
 
 /// Relative to the workspace: the base `gang.toml` the variants are applied to.
@@ -55,11 +55,7 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     candidate_fixture: Option<PathBuf>,
 
-    /// Upgrade procedure; overrides settings (default: pre-stop).
-    #[arg(long, value_enum)]
-    upgrade_procedure: Option<UpgradeProcedure>,
-
-    /// The gate to run: `1` or `2`, which includes the earlier gate.
+    /// The gate to run: `1` or `one`, or `2` or `two`, which includes the earlier gate.
     #[arg(long, value_name = "GATE", default_value = "1")]
     gate: Gate,
 
@@ -193,9 +189,6 @@ impl Cli {
     fn apply_settings_overrides(&self, settings: &mut Settings) {
         if let Some(parallel) = self.parallel {
             settings.parallel_scenarios = parallel;
-        }
-        if let Some(procedure) = self.upgrade_procedure {
-            settings.upgrade_procedure = procedure;
         }
     }
 
@@ -446,34 +439,15 @@ mod tests {
     use std::path::PathBuf;
 
     use clap::Parser;
-    use gang_e2e::{Scenario, Settings, UpgradeProcedure};
+    use gang_e2e::Scenario;
 
     use super::{Cli, Gate, Shard, non_empty_path, partition};
 
     #[test]
-    fn upgrade_procedure_cli_overrides_settings_only_when_present() {
-        let plain = Cli::try_parse_from(["local"]).expect("default CLI");
-        let mut settings: Settings =
-            toml::from_str("upgrade_procedure = 'instance-refresh'").expect("settings");
-        plain.apply_settings_overrides(&mut settings);
-        assert_eq!(
-            settings.upgrade_procedure,
-            UpgradeProcedure::InstanceRefresh
-        );
-
-        let cli = Cli::try_parse_from(["local", "--upgrade-procedure", "pre-stop"])
-            .expect("pre-stop CLI");
-        cli.apply_settings_overrides(&mut settings);
-        assert_eq!(settings.upgrade_procedure, UpgradeProcedure::PreStop);
-
-        let cli = Cli::try_parse_from(["local", "--upgrade-procedure", "instance-refresh"])
-            .expect("instance-refresh CLI");
-        cli.apply_settings_overrides(&mut settings);
-        assert_eq!(
-            settings.upgrade_procedure,
-            UpgradeProcedure::InstanceRefresh
-        );
-        assert!(Cli::try_parse_from(["local", "--upgrade-procedure", "invalid"]).is_err());
+    fn obsolete_upgrade_procedure_flag_is_rejected() {
+        for value in ["pre-stop", "instance-refresh", "invalid"] {
+            assert!(Cli::try_parse_from(["local", "--upgrade-procedure", value]).is_err());
+        }
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 use gang_clock::SystemClock;
 use gang_os::fs::ensure_private_dir;
 use gang_spi::{
-    ControllerHostIdentity, ControllerHostPort, FleetSupply, Held, HostMilestone, InstanceIdentity,
+    ControllerHostIdentity, ControllerHostPort, ControllerHostState, FleetSupply, Held, HostMilestone, InstanceIdentity,
     MountedScratchVolume, NodeLifecyclePort, Plugin, PluginContext, PortError, PreemptionNotice,
     ProvisionerPort, ScratchVolumePort, ServerEndpoints, Sidecar, WorkloadCredentialPort,
 };
@@ -360,6 +360,18 @@ impl ControllerHostPort for Local {
             Ok(ControllerHostIdentity::Persistent(instance))
         })
         .await
+    }
+
+    async fn state(&self) -> Result<ControllerHostState, PortError> {
+        Ok(ControllerHostState::Active)
+    }
+
+    async fn drain_limit(&self) -> Result<Option<std::time::Duration>, PortError> {
+        Ok(None)
+    }
+
+    async fn heartbeat(&self) -> Result<(), PortError> {
+        Ok(())
     }
 
     /// Nothing retires a local host; `gang server` hands off on SIGTERM instead.

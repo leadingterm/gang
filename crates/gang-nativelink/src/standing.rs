@@ -35,6 +35,8 @@ pub(crate) struct Standing {
     admission: AtomicU8,
     /// Explicit leadership retirement is independent of the first admission decision.
     leadership_retired: AtomicBool,
+    /// Marks a pre-handoff connection for retirement if its pending admission later succeeds.
+    handoff_pending: AtomicBool,
     /// Wakes the connection's sole retry waiter.
     retry: Notify,
 }
@@ -42,7 +44,7 @@ pub(crate) struct Standing {
 impl Standing {
     /// Permits a request unless retirement won before any request was admitted.
     pub(crate) fn admit(&self) -> bool {
-        match self.admission.compare_exchange(
+        let admitted = match self.admission.compare_exchange(
             Admission::Fresh as u8,
             Admission::Admitted as u8,
             Ordering::AcqRel,
@@ -50,7 +52,11 @@ impl Standing {
         ) {
             Ok(_) => true,
             Err(state) => state == Admission::Admitted as u8,
+        };
+        if admitted && self.handoff_pending.load(Ordering::Acquire) {
+            self.retire_leadership();
         }
+        admitted
     }
 
     /// Requests graceful retirement only if no request has yet been admitted.
@@ -86,6 +92,17 @@ impl Standing {
             }
             notified.await;
         }
+    }
+
+    pub(crate) fn hand_off(&self) {
+        self.handoff_pending.store(true, Ordering::Release);
+        if self.is_admitted() {
+            self.retire_leadership();
+        }
+    }
+
+    pub(crate) fn is_admitted(&self) -> bool {
+        self.admission.load(Ordering::Acquire) == Admission::Admitted as u8
     }
 
     /// Whether the gate has admitted an authenticated request on the connection.

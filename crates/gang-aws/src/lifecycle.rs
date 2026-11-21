@@ -155,11 +155,13 @@ impl Metadata {
         }
     }
 
-    /// Whether Auto Scaling is retiring this instance; a missing state is not retiring.
-    pub(crate) async fn retiring(&self) -> Result<bool, AwsError> {
+    /// The Auto Scaling target state, absent outside a group; unknown values fail closed.
+    pub(crate) async fn retiring(&self) -> Result<Option<bool>, AwsError> {
         match self.imds.get(TARGET_LIFECYCLE_PATH).await {
-            Ok(body) => Ok(body.as_ref() == TERMINATED_STATE),
-            Err(error) if is_not_found(&error) => Ok(false),
+            Ok(body) if body.as_ref() == TERMINATED_STATE => Ok(Some(true)),
+            Ok(body) if body.as_ref() == "InService" => Ok(Some(false)),
+            Ok(_) => Err(AwsError::malformed(IMDS_OPERATION, "target lifecycle state")),
+            Err(error) if is_not_found(&error) => Ok(None),
             Err(error) => Err(imds_error(error)),
         }
     }

@@ -532,34 +532,23 @@ fn database_outage_preset_justifies_follower_work_before_partition_heals() -> ga
 }
 
 #[test]
-fn short_boot_grace_bounds_shutdown_and_preserves_shorter_setting() -> gang_e2e::Result<()> {
+fn short_boot_grace_preserves_orphan_detection_policy() -> gang_e2e::Result<()> {
     let variant = Variant {
         control: ControlKnobs::ORPHAN,
         ..Variant::baseline(Sandbox::Noop)
     };
-    for (suffix, expected) in [
-        ("", std::time::Duration::from_secs(5)),
-        (
-            "\n[server.http2]\nshutdown_grace = \"3s\"\n",
-            std::time::Duration::from_secs(3),
-        ),
-    ] {
-        let base = format!("{}{suffix}", base_config()?);
-        let text = ConfigTemplate::parse(&base)?
-            .vary(&variant, &launcher(), &*(tools()?))?
-            .render()?;
-        let config = text
-            .parse::<GangConfig<Plugins>>()
-            .map_err(|error| E2eError::Template(error.to_string()))?;
-        assert_eq!(config.server.http2.shutdown_grace, expected);
-        assert!(
-            config
-                .fleets
-                .policies()
-                .iter()
-                .all(|fleet| config.server.http2.shutdown_grace < fleet.boot_grace)
-        );
+    let document = varied_document(&variant)?;
+    assert!(!document.fleets.is_empty());
+    for fleet in &document.fleets {
+        assert_eq!(fleet.boot_grace, std::time::Duration::from_secs(10));
     }
+    let rendered = ConfigTemplate::parse(&base_config()?)?
+        .vary(&variant, &launcher(), &*(tools()?))?
+        .render()?;
+    rendered
+        .parse::<GangConfig<Plugins>>()
+        .map_err(|error| E2eError::Template(error.to_string()))?;
+    assert!(!rendered.contains("shutdown_grace"));
     Ok(())
 }
 

@@ -230,7 +230,7 @@ gang_types::string_enum! {
         ControllerLoss = "controller-loss",
         /// Controllers are replaced while a build is in progress.
         RollingDeploy = "rolling-deploy",
-        /// A previous release is replaced by the candidate while work is held.
+        /// Previous-release and candidate-to-candidate ordinary refreshes while work is held.
         RollingUpgrade = "rolling-upgrade",
         /// A previous release is replaced by instance refresh while work is held.
         RollingUpgradeAutomatic = "rolling-upgrade-automatic",

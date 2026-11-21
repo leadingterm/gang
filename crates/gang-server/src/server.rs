@@ -7,8 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use futures::future::{BoxFuture, Map, Shared};
-use futures::stream::FuturesUnordered;
+use futures::future::{Map, Shared};
 use futures::{FutureExt, StreamExt};
 use gang_clock::Clock;
 use gang_config::{DashboardConfig, EndpointTrust, Fleets, LeadershipConfig};
@@ -16,10 +15,10 @@ use gang_mtls::SubjectName;
 use gang_reconciler::{PassTime, SourceProfiles};
 use gang_spi::{
     AuthenticationPort, CacheStorePort, ClientCertificates, ControllerConnections,
-    ControllerHostIdentity, ControllerHostPort, ControllerId, ControllerReady, ControllerSpec,
-    CredentialLifecyclePort, HostMilestone, Lease, LeaseCandidate, Listening, ObservationSink,
-    Observations, PortError, ProvisionerPort, RevocationEpoch, SchedulerPort, SchedulerSnapshot,
-    Scheme, ServerEndpoints, StateRepositoryPort,
+    ControllerDrain, ControllerHostIdentity, ControllerHostPort, ControllerHostState,
+    ControllerId, ControllerReady, ControllerSpec, CredentialLifecyclePort, HostMilestone,
+    Lease, Listening, ObservationSink, Observations, PortError, ProvisionerPort, RevocationEpoch,
+    SchedulerPort, SchedulerSnapshot, Scheme, ServerEndpoints, StateRepositoryPort,
 };
 use gang_state::CacheBaseline;
 use gang_tls::{Alpn, ClientAuth, RevocationSet};
@@ -140,16 +139,6 @@ type ControllerListening<D> = ControllerConnections<
     PublicService<D>,
 >;
 
-type StandbyServices<D> = (
-    Gate<D, <D as Stack>::Clients>,
-    Gate<D, <D as Stack>::Workers>,
-    PublicService<D>,
-);
-type StandbyServiceRefs<'a, D> = (
-    &'a Gate<D, <D as Stack>::Clients>,
-    &'a Gate<D, <D as Stack>::Workers>,
-    &'a PublicService<D>,
-);
 
 /// Treat a sent or dropped stop signal alike.
 fn stop_fired(_: Result<(), oneshot::error::RecvError>) {}
@@ -168,105 +157,10 @@ struct ListenerEnds {
     worker: Option<oneshot::Receiver<()>>,
 }
 
-/// Signals used to coordinate listener failure, drain and leader handoff.
-struct ControllerSignals<R> {
-    listeners: ListenerEnds,
-    drained: oneshot::Sender<()>,
-    failed: oneshot::Receiver<ServerError>,
-    standby: R,
-}
-
-/// Signals shared by one leader term and its controller driver.
-struct LeaderSignals<'a> {
-    prepared: Shared<BoxFuture<'static, bool>>,
-    yielded: oneshot::Sender<()>,
-    drained: oneshot::Receiver<()>,
-    failed: oneshot::Sender<ServerError>,
-    voluntary: &'a AtomicBool,
-}
-
-type StandbyCompletion<'a> = BoxFuture<'a, Result<(), ServerError>>;
-type PendingStandbys<'a> = FuturesUnordered<StandbyCompletion<'a>>;
-
-struct ActiveStandby<'a> {
-    stop: Option<oneshot::Sender<()>>,
-    listeners: ListenerEnds,
-    completion: StandbyCompletion<'a>,
-}
-
-enum StandbyEvent {
-    Complete(Result<(), ServerError>),
-    ListenerEnded(ServerError),
-}
-
-impl ActiveStandby<'_> {
-    async fn event(&mut self) -> StandbyEvent {
-        tokio::select! {
-            biased;
-            error = listener_stopped("public", &mut self.listeners.public), if self.stop.is_some() =>
-                StandbyEvent::ListenerEnded(error),
-            error = listener_stopped("worker", &mut self.listeners.worker), if self.stop.is_some() =>
-                StandbyEvent::ListenerEnded(error),
-            result = &mut self.completion => StandbyEvent::Complete(match result {
-                Ok(()) if self.stop.is_some() =>
-                    Err(self.listeners.ended().unwrap_or(ServerError::ControllerEnded)),
-                result => result,
-            }),
-        }
+impl ListenerEnds {
+    fn new(public: oneshot::Receiver<()>, worker: oneshot::Receiver<()>) -> Self {
+        Self { public: Some(public), worker: Some(worker) }
     }
-}
-
-struct Maintenance<'p, 's, B> {
-    background: Pin<&'p mut B>,
-    pending: &'p mut PendingStandbys<'s>,
-}
-
-impl<B: Future<Output = Infallible>> Maintenance<'_, '_, B> {
-    async fn event(&mut self) -> Option<ServerError> {
-        tokio::select! {
-            result = self.pending.next(), if !self.pending.is_empty() =>
-                result.and_then(Result::err),
-            never = self.background.as_mut() => match never {},
-        }
-    }
-
-    async fn failure(&mut self) -> ServerError {
-        loop {
-            if let Some(error) = self.event().await {
-                return error;
-            }
-        }
-    }
-
-    async fn finish(&mut self) -> Result<(), ServerError> {
-        let mut result = Ok(());
-        while !self.pending.is_empty() {
-            if let Some(error) = self.event().await {
-                result = result.and(Err(error));
-            }
-        }
-        result
-    }
-}
-
-struct TermExit<'a> {
-    end: TermEnd,
-    standby: Option<StandbyCompletion<'a>>,
-}
-
-impl<'a> TermExit<'a> {
-    fn queue_standby(self, pending: &mut PendingStandbys<'a>) -> TermEnd {
-        if let Some(completion) = self.standby {
-            pending.push(completion);
-        }
-        self.end
-    }
-}
-
-struct TermConnections<D: Deployment, R> {
-    controller: ControllerListening<D>,
-    listeners: ListenerEnds,
-    standby: R,
 }
 
 /// The secured public and worker listeners.
@@ -351,304 +245,165 @@ fn controller_leadership<'a, D: Deployment>(
     )
 }
 
-fn start_standby<D: Deployment>(
-    scheduler: &D::Scheduler,
-    listeners: OpenListeners<D>,
-    (public_gate, worker_gate, api): StandbyServices<D>,
-) -> ActiveStandby<'_> {
-    let (stop_sender, stop) = stop_channel();
-    let (connections, ends) = controller_connections::<D>(
-        listeners.public,
-        listeners.worker,
-        public_gate,
-        worker_gate,
-        api,
-        stop,
-    );
-    ActiveStandby {
-        stop: Some(stop_sender),
-        listeners: ends,
-        completion: async move {
-            scheduler
-                .serve_standby(connections)
-                .await
-                .map_err(ServerError::Controller)
-        }
-        .boxed(),
-    }
-}
 
-fn term_connections<'s, D: Deployment>(
-    scheduler: &'s D::Scheduler,
-    OpenListeners { public, worker }: &'s OpenListeners<D>,
-    (public_gate, worker_gate, api): StandbyServiceRefs<'s, D>,
-    stop: Stop,
-) -> TermConnections<D, impl FnOnce() -> Option<ActiveStandby<'s>>> {
-    let (controller, listeners) = controller_connections::<D>(
-        public.clone(),
-        worker.clone(),
-        public_gate.clone(),
-        worker_gate.clone(),
-        api.clone(),
-        stop,
-    );
-    TermConnections {
-        controller,
-        listeners,
-        standby: move || {
-            Some(start_standby::<D>(
-                scheduler,
-                OpenListeners {
-                    public: public.clone(),
-                    worker: worker.clone(),
-                },
-                (public_gate.clone(), worker_gate.clone(), api.clone()),
-            ))
-        },
-    }
-}
-
-/// Waits for the controller to serve, then holds leadership through restoration and drain.
+/// Prepares once, promotes at most once, then freezes and releases authority before long drain.
 async fn run_leader<D: Deployment>(
-    context: LeadContext<'_, D>,
-    signals: LeaderSignals<'_>,
-    ready: &mut Option<ControllerReady>,
-    candidate: &mut Option<LeaseCandidate>,
-    routability_delay: Duration,
-    (retiring, stop): (impl Future<Output = ()> + Clone, Stop),
+    context: &LeadContext<'_, D>,
+    prepared: impl Future<Output = bool>,
+    ready: ControllerReady,
+    shutdown: impl Future<Output = ()> + Clone,
+    outgoing: &mut Option<crate::protection::Outgoing>,
 ) -> Result<(), ServerError> {
-    let LeaderSignals {
-        prepared,
-        yielded,
-        drained,
-        failed,
-        voluntary,
-    } = signals;
-    tokio::pin!(retiring);
     tokio::select! {
         biased;
-        () = &mut retiring => return Ok(()),
-        () = stop.clone() => return Ok(()),
+        () = shutdown.clone() => return Ok(()),
         prepared = prepared => if !prepared { return Err(ServerError::ControllerEnded); },
     }
-    let candidate = match candidate {
-        Some(candidate) => candidate,
-        vacant @ None => {
-            let host = tokio::select! {
-                biased;
-                () = &mut retiring => return Ok(()),
-                () = stop.clone() => return Ok(()),
-                result = host_identity(
-                    context.provisioner,
-                    &*context.core.host.clock,
-                    context.sidecar_retry_interval.get(),
-                ) => result.map_err(ServerError::HostIdentity)?,
-            };
-            let registered = tokio::select! {
-                biased;
-                () = &mut retiring => return Ok(()),
-                () = stop.clone() => return Ok(()),
-                result = context.leadership.register_candidate(&host) => {
-                    result.map_err(ServerError::CandidateRegistration)?
-                }
-            };
-            vacant.insert(registered)
-        }
-    };
     context.readiness.serve();
-    if ready.is_some() {
-        tokio::select! {
-            biased;
-            () = &mut retiring => return Ok(()),
-            () = stop.clone() => return Ok(()),
-            result = report_serving(
-                context.provisioner,
-                &*context.core.host.clock,
-                context.sidecar_retry_interval.get(),
-                context.milestone_timeout,
-            ) => result.map_err(ServerError::ServingMilestone)?,
-        }
-        if let Some(ready) = ready.take() {
-            ready.signal();
-        }
+    let profiles = SourceProfiles::new(context.scaling, context.actions.history_window);
+    let mut history = tokio::select! {
+        biased;
+        () = shutdown.clone() => return Ok(()),
+        result = prepare_history(context, &profiles) => result?,
+    };
+    let host = tokio::select! {
+        biased;
+        () = shutdown.clone() => return Ok(()),
+        result = host_identity(context.provisioner, &*context.core.host.clock, context.sidecar_retry_interval.get()) => result.map_err(ServerError::HostIdentity)?,
+    };
+    let state = tokio::select! {
+        biased;
+        () = shutdown.clone() => return Ok(()),
+        result = report_prepared(context.provisioner, &*context.core.host.clock,
+            context.sidecar_retry_interval.get()) => result.map_err(ServerError::PreparedMilestone)?,
+    };
+    if state == ControllerHostState::Retiring {
+        return Ok(());
     }
+    let candidate = tokio::select! {
+        biased;
+        () = shutdown.clone() => return Ok(()),
+        result = context.leadership.register_candidate(&host) => result.map_err(ServerError::CandidateRegistration)?,
+    };
+    ready.signal();
     let lease = tokio::select! {
         biased;
-        () = &mut retiring => return Ok(()),
-        () = stop.clone() => return Ok(()),
-        lease = context.leadership.acquire(candidate, context.readiness, routability_delay) => lease,
+        () = shutdown.clone() => return Ok(()),
+        result = context.leadership.acquire(&candidate, context.provisioner) => match result.map_err(ServerError::HostIdentity)? {
+            Some(lease) => lease,
+            None => return Ok(()),
+        },
     };
-    hold_leader(context, (yielded, drained, failed, voluntary), lease, stop).await
-}
-
-async fn hold_leader<D: Deployment>(
-    context: LeadContext<'_, D>,
-    (yielded, drained, failed, voluntary): (
-        oneshot::Sender<()>,
-        oneshot::Receiver<()>,
-        oneshot::Sender<ServerError>,
-        &AtomicBool,
-    ),
-    mut lease: Lease,
-    stop: Stop,
-) -> Result<(), ServerError> {
-    let mut yielded = Some(yielded);
-    // The identity is stable across renewals; the repository checks its stored expiry.
-    let authority = lease.clone();
-    let profiles = SourceProfiles::new(context.scaling, context.actions.history_window);
-    let result = {
-        let (requested, mut request) = oneshot::channel();
-        let hold = hold_leader_lease(&context, &mut lease, requested);
-        tokio::pin!(hold);
-        let restored = tokio::select! {
-            biased;
-            () = &mut hold => return Err(ServerError::LeadershipLost),
-            () = stop.clone() => None,
-            Ok(()) = &mut request => {
-                finish_yield(context.readiness, &mut yielded, stop.clone()).await;
-                None
-            }
-            result = restore_history(&context, &authority, &profiles) => Some(result?),
-        };
-        if let Some((mut store, mut records)) = restored {
-            let mut requested = {
-                let work = lead_work(&context, &profiles, stop.clone());
-                let periodic = flush_history_periodically(
-                    &context,
-                    &authority,
-                    &profiles,
-                    &mut store,
-                    &mut records,
-                );
-                tokio::pin!(work, periodic);
-                tokio::select! {
-                    biased;
-                    () = &mut hold => return Err(ServerError::LeadershipLost),
-                    () = stop.clone() => false,
-                    Ok(()) = &mut request => true,
-                    never = &mut periodic => match never {},
-                    result = &mut work => {
-                        if let Err(error) = result {
-                            let _ = failed.send(error);
-                        }
-                        false
-                    }
-                }
-            };
-            if !requested && !voluntary.load(Ordering::Acquire) {
-                requested = drain_and_flush(
-                    &context,
-                    &authority,
-                    &profiles,
-                    (&mut store, &mut records),
-                    hold.as_mut(),
-                    &mut request,
-                    drained,
-                )
-                .await?;
-            }
-            if requested {
-                let snapshot = context.core.host.clock.timeout(
-                    context.leadership.snapshot_timeout(),
-                    flush_history(&context, &authority, &profiles, &mut store, &mut records),
-                );
-                tokio::select! {
-                    biased;
-                    () = &mut hold => return Err(ServerError::LeadershipLost),
-                    result = snapshot => match result {
-                        Ok(Err(error)) => tracing::warn!(%error, "voluntary learned history snapshot failed"),
-                        Err(error) => tracing::warn!(%error, "voluntary learned history snapshot timed out"),
-                        Ok(Ok(())) => {}
-                    }
-                }
-                finish_yield(context.readiness, &mut yielded, stop.clone()).await;
-            }
-        } else if !voluntary.load(Ordering::Acquire) {
-            tokio::select! {
-                biased;
-                () = &mut hold => return Err(ServerError::LeadershipLost),
-                Ok(()) = &mut request => {
-                    finish_yield(context.readiness, &mut yielded, stop.clone()).await;
-                }
-                _ = drained => {}
-            }
-        }
-        Ok(())
-    };
-    context.leadership.release(&lease).await;
+    let mut renewing = lease.clone();
+    let result = activate_and_serve(context, &lease, &mut renewing, &profiles, &mut history, shutdown).await;
+    if matches!(&result, Err(ServerError::LeadershipLost)) {
+        context.readiness.stop();
+    }
+    freeze_and_release(context, &lease, &mut renewing, &profiles, Some(&mut history), outgoing).await?;
     result
 }
 
-/// Keeps shutdown durability unless a successor requests the lease before completion.
-async fn drain_and_flush<D: Deployment>(
-    context: &LeadContext<'_, D>,
-    authority: &Lease,
-    profiles: &SourceProfiles,
-    (store, records): (&mut LearnedHistoryStore, &mut Vec<gang_spi::LearnedHistory>),
-    mut hold: Pin<&mut impl Future<Output = ()>>,
-    request: &mut oneshot::Receiver<()>,
-    drained: oneshot::Receiver<()>,
-) -> Result<bool, ServerError> {
-    tokio::select! {
-        biased;
-        () = &mut hold => return Err(ServerError::LeadershipLost),
-        Ok(()) = &mut *request => return Ok(true),
-        _ = drained => {}
-    }
-    let final_flush = context.core.host.clock.timeout(
-        context.actions.history_flush_interval.get(),
-        flush_history(context, authority, profiles, store, records),
-    );
-    tokio::select! {
-        biased;
-        () = &mut hold => Err(ServerError::LeadershipLost),
-        Ok(()) = request => Ok(true),
-        result = final_flush => {
-            match result {
-                Ok(Err(HistoryError::Fenced)) => tracing::warn!("final learned history flush was fenced"),
-                Ok(Err(error)) => tracing::warn!(%error, "final learned history flush failed"),
-                Err(error) => tracing::warn!(%error, "final learned history flush timed out"),
-                Ok(Ok(())) => {}
-            }
-            Ok(false)
-        }
-    }
-}
-
-async fn hold_leader_lease<D: Deployment>(
-    context: &LeadContext<'_, D>,
-    lease: &mut Lease,
-    requested: oneshot::Sender<()>,
-) {
-    let mut requested = Some(requested);
-    loop {
-        match context.leadership.hold(lease).await {
-            LeaseEnd::Lost => return,
-            LeaseEnd::YieldRequested => {
-                if let Some(requested) = requested.take() {
-                    let _ = requested.send(());
-                }
-            }
-        }
-    }
-}
-
-async fn finish_yield(
-    readiness: &Readiness,
-    yielded: &mut Option<oneshot::Sender<()>>,
-    stop: Stop,
-) {
-    readiness.stop();
-    if let Some(yielded) = yielded.take() {
-        let _ = yielded.send(());
-    }
-    stop.await;
-}
-
-/// Retries restoration without admitting work, including while the engine starts.
-async fn restore_history<D: Deployment>(
+/// Applies prepared state under authority and shares one deadline with final promotion.
+async fn activate_and_serve<D: Deployment>(
     context: &LeadContext<'_, D>,
     lease: &Lease,
+    renewing: &mut Lease,
+    profiles: &SourceProfiles,
+    history: &mut (LearnedHistoryStore, Vec<gang_spi::LearnedHistory>),
+    shutdown: impl Future<Output = ()> + Clone,
+) -> Result<(), ServerError> {
+    let (store, records) = history;
+    let hold = context.leadership.hold(renewing);
+    tokio::pin!(hold);
+    let promotion_deadline = context.core.host.clock.monotonic() + context.leadership.call_timeout();
+    let activated = tokio::select! {
+        biased;
+        end = &mut hold => match end { LeaseEnd::Lost => Err(ServerError::LeadershipLost), LeaseEnd::YieldRequested => Ok(false) },
+        () = shutdown.clone() => Ok(false),
+        result = context.core.host.clock.timeout_at(promotion_deadline, store.activate(
+            &context.core.host.repository, lease, context.core.host.clock.wall())) =>
+            result.map_err(ServerError::HandoffTimedOut).and_then(|result| result.map(|()| true)
+                .map_err(|error| match error {
+                    HistoryError::Fenced => ServerError::LeadershipLost,
+                    error => ServerError::Controller(PortError::backend(error)),
+                })),
+    };
+    match activated {
+        Ok(true) => {
+            let work = lead_work(context, profiles, shutdown.clone(), promotion_deadline);
+            let periodic = flush_history_periodically(context, lease, profiles, store, records);
+            tokio::pin!(work, periodic);
+            tokio::select! {
+                biased;
+                end = &mut hold => match end { LeaseEnd::Lost => Err(ServerError::LeadershipLost), LeaseEnd::YieldRequested => Ok(()) },
+                () = shutdown.clone() => Ok(()),
+                never = &mut periodic => match never {},
+                result = &mut work => result,
+            }
+        }
+        Ok(false) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Stops mutation producers before publishing the frozen worker set and freeing authority.
+async fn freeze_and_release<D: Deployment>(
+    context: &LeadContext<'_, D>,
+    lease: &Lease,
+    renewing: &mut Lease,
+    profiles: &SourceProfiles,
+    history: Option<&mut (LearnedHistoryStore, Vec<gang_spi::LearnedHistory>)>,
+    outgoing: &mut Option<crate::protection::Outgoing>,
+) -> Result<(), ServerError> {
+    let keep_authority = async {
+        loop {
+            if context.leadership.hold(renewing).await == LeaseEnd::Lost { return; }
+        }
+    };
+    let preparation = async {
+        // History preparation is still on the prepared old host, before visible freeze.
+        if let Some((store, records)) = history {
+            match context.core.host.clock.timeout(context.leadership.call_timeout(),
+                flush_history(context, lease, profiles, store, records)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "handoff learned history snapshot failed"),
+                Err(error) => tracing::warn!(%error, "handoff learned history snapshot timed out"),
+            }
+        }
+        context.readiness.stop();
+        let mut drain = ControllerDrain::default();
+        loop {
+            let prepare = async {
+                context.scheduler.hand_off(&mut drain).await?;
+                if outgoing.is_none() {
+                    *outgoing = Some(crate::protection::Outgoing::new(&lease.holder, &drain)?);
+                }
+                if let Some(protection) = outgoing {
+                    protection.install(&context.core.host.repository, context.core.host.clock.wall(),
+                        context.leadership.protection_ttl()).await?;
+                }
+                Ok::<(), PortError>(())
+            };
+            match context.core.host.clock.timeout(context.leadership.call_timeout(), prepare).await {
+                Ok(Ok(())) => return,
+                Ok(Err(error)) => tracing::warn!(%error, "handoff protection unavailable; retaining authority and retrying"),
+                Err(error) => tracing::warn!(%error, "handoff preparation timed out; retaining authority and retrying"),
+            }
+            context.core.host.clock.sleep(context.leadership.renew_interval()).await;
+        }
+    };
+    tokio::pin!(keep_authority, preparation);
+    tokio::select! {
+        () = &mut keep_authority => return Err(ServerError::LeadershipLost),
+        () = &mut preparation => {}
+    }
+    context.leadership.release(lease).await;
+    Ok(())
+}
+
+/// Completes read-only import before launch completion or a visible takeover request.
+async fn prepare_history<D: Deployment>(
+    context: &LeadContext<'_, D>,
     profiles: &SourceProfiles,
 ) -> Result<(LearnedHistoryStore, Vec<gang_spi::LearnedHistory>), ServerError> {
     let clock = &context.core.host.clock;
@@ -661,19 +416,14 @@ async fn restore_history<D: Deployment>(
         }
         clock.sleep(context.sidecar_retry_interval.get()).await;
     };
-    // The store's batch sequence belongs to the whole lease term, including failed loads.
+    // No authority or body baseline is retained: only per-key imported fingerprints.
     let mut store = LearnedHistoryStore::new(limit);
     let mut records = Vec::new();
     loop {
-        if !context.leadership.fence().holds() {
-            clock.sleep(context.leadership.renew_interval()).await;
-            continue;
-        }
         let attempt = async {
             store
-                .load(
+                .prepare(
                     &context.core.host.repository,
-                    lease,
                     clock.wall(),
                     &mut records,
                 )
@@ -685,20 +435,29 @@ async fn restore_history<D: Deployment>(
                 .await
                 .map_err(HistoryError::Storage)?;
             profiles.restore(time, &records);
+            context.scheduler.learned_history(time.wall, &mut records).await
+                .map_err(HistoryError::Storage)?;
+            profiles.snapshot(time, &mut records).map_err(HistoryError::Storage)?;
+            store.prepared(&records);
+            records.clear();
             Ok::<(), HistoryError>(())
         }
         .await;
         match attempt {
-            Ok(()) => return Ok((store, records)),
-            Err(HistoryError::Fenced) => {
-                tracing::warn!("learned history restore was fenced; retrying before admission");
-            }
+            Ok(()) => break,
             Err(error) => {
                 tracing::warn!(%error, "learned history restore failed; retrying before admission");
             }
         }
         clock.sleep(context.leadership.renew_interval()).await;
     }
+    synchronize_revocations(context.core, context.revoked_certificates)
+        .await.map_err(ServerError::Revocations)?;
+    if let Some(dashboard) = context.dashboard
+        && let Err(error) = dashboard.reload_from(&context.core.host.repository).await {
+        tracing::warn!(%error, "dashboard history reload failed during preparation");
+    }
+    Ok((store, records))
 }
 
 fn history_byte_limit(scheduler: std::num::NonZeroUsize) -> std::num::NonZeroUsize {
@@ -778,6 +537,31 @@ async fn host_identity<H: ControllerHostPort, C: Clock>(
     }
 }
 
+/// Passive registration can take longer than the handover window. No takeover is
+/// requested until it completes; shutdown/retirement cancels the caller's future.
+async fn report_prepared<H: ControllerHostPort, C: Clock>(
+    host: &H,
+    clock: &C,
+    interval: Duration,
+) -> Result<ControllerHostState, PortError> {
+    loop {
+        let attempt = async {
+            let state = host.state().await?;
+            if state == ControllerHostState::Retiring { return Ok(state); }
+            host.reached(HostMilestone::Prepared).await?;
+            Ok(ControllerHostState::Active)
+        }.await;
+        match attempt {
+            Ok(state) => return Ok(state),
+            Err(error @ PortError::Unavailable(_)) => {
+                tracing::warn!(%error, "cannot prepare controller host; retrying before takeover");
+            }
+            Err(error) => return Err(error),
+        }
+        clock.sleep(interval).await;
+    }
+}
+
 async fn report_serving<H: ControllerHostPort, C: Clock>(
     host: &H,
     clock: &C,
@@ -805,23 +589,26 @@ async fn report_serving<H: ControllerHostPort, C: Clock>(
 async fn lead_work<D: Deployment>(
     context: &LeadContext<'_, D>,
     profiles: &SourceProfiles,
-    stop: Stop,
+    stop: impl Future<Output = ()>,
+    promotion_deadline: gang_clock::Tick,
 ) -> Result<(), ServerError> {
-    let baseline = match context.dashboard {
-        Some(_) => Some(term_baseline(context).await),
-        None => None,
-    };
-    synchronize_revocations(context.core, context.revoked_certificates)
-        .await
-        .map_err(ServerError::Revocations)?;
-    context.leading.set(context.core.host.clock.wall());
-    if let Some(dashboard) = context.dashboard
-        && let Err(error) = dashboard.reload_from(&context.core.host.repository).await
-    {
-        tracing::warn!(%error, "dashboard history reload failed during promotion");
-    }
-
-    context.readiness.lead();
+    let baseline = context.core.host.clock.timeout(
+        promotion_deadline.saturating_duration_since(context.core.host.clock.monotonic()), async {
+        if context.provisioner.state().await.map_err(ServerError::HostIdentity)? == ControllerHostState::Retiring {
+            return Err(ServerError::HostIdentity(PortError::unavailable("controller host is retiring")));
+        }
+        let baseline = match context.dashboard {
+            Some(_) => Some(term_baseline(context).await),
+            None => None,
+        };
+        context.leading.set(context.core.host.clock.wall());
+        context.readiness.lead();
+        report_serving(context.provisioner, &*context.core.host.clock,
+            context.sidecar_retry_interval.get(),
+            promotion_deadline.saturating_duration_since(context.core.host.clock.monotonic()))
+            .await.map_err(ServerError::ServingMilestone)?;
+        Ok::<_, ServerError>(baseline)
+    }).await.map_err(ServerError::HandoffTimedOut)??;
     let sidecar = retry_sidecar(context);
     let clock = &context.core.host.clock;
     let control = ControlLoop::new(
@@ -932,330 +719,149 @@ async fn initial_revocations<K: Stack>(
     Ok((epoch, principals))
 }
 
-/// Whether the process stopped or should begin another controller term.
-enum TermEnd {
-    Stopped,
-    Yielded,
-}
 
-/// Drives the controller until shutdown or failure, then hands off and drains, running
-/// `background` throughout.
-async fn drive_controller<'s, C: Clock>(
-    (shutdown, yielded): (impl Future<Output = ()>, oneshot::Receiver<()>),
-    stop: impl FnOnce(bool),
-    dashboard: Option<&Dashboard>,
-    (mut controller, mut leader): (
-        Pin<&mut impl Future<Output = Result<(), PortError>>>,
-        Pin<&mut impl Future<Output = Result<(), ServerError>>>,
-    ),
-    signals: ControllerSignals<impl FnOnce() -> Option<ActiveStandby<'s>>>,
-    mut maintenance: Maintenance<'_, 's, impl Future<Output = Infallible>>,
-    (clock, handoff_timeout): (&C, Duration),
-) -> Result<TermExit<'s>, ServerError> {
-    let ControllerSignals {
-        listeners: mut ends,
-        drained,
-        failed,
-        standby,
-    } = signals;
-    let mut public_stopped = Box::pin(listener_stopped("public", &mut ends.public));
-    let mut worker_stopped = Box::pin(listener_stopped("worker", &mut ends.worker));
-    let failure = async {
-        match failed.await {
-            Ok(error) => error,
-            Err(_) => std::future::pending().await,
-        }
-    };
-    tokio::pin!(failure, shutdown);
-    let mut handoff = Handoff {
-        controller_finished: false,
-        leader_finished: false,
-        drained: Some(drained),
-        standby: None,
-        voluntary: false,
-        result: Ok(()),
-    };
-    handoff.result = tokio::select! {
-        biased;
-        () = &mut shutdown => Ok(()),
-        Ok(()) = yielded => { handoff.voluntary = true; Ok(()) },
-        error = &mut public_stopped => Err(error),
-        error = &mut worker_stopped => Err(error),
-        result = &mut controller => {
-            handoff.controller_finished = true;
-            result.map_err(ServerError::Controller).and(Err(ServerError::ControllerEnded))
-        },
-        result = &mut leader => { handoff.leader_finished = true; result },
-        error = &mut failure => Err(error),
-        error = maintenance.failure() => Err(error),
-    };
-    let deadline = handoff
-        .voluntary
-        .then(|| clock.monotonic() + handoff_timeout);
-    stop(handoff.voluntary);
-    if let Some(dashboard) = dashboard {
-        dashboard.shutdown();
-    }
-    if !handoff.controller_finished {
-        let polled =
-            std::future::poll_fn(|cx| std::task::Poll::Ready(controller.as_mut().poll(cx))).await;
-        if let std::task::Poll::Ready(result) = polled {
-            handoff.controller_done(result).await;
-        } else {
-            handoff.standby = standby();
-        }
-    }
-    if handoff.controller_finished {
-        handoff.signal_drained();
-    }
-    let drain = drain_controller(
-        (controller, leader),
-        handoff,
-        &mut maintenance,
-        shutdown.as_mut(),
-    );
-    if let Some(deadline) = deadline {
-        clock
-            .timeout(deadline.saturating_duration_since(clock.monotonic()), drain)
-            .await
-            .map_err(ServerError::HandoffTimedOut)?
-    } else {
-        drain.await
-    }
-}
-
-struct Handoff<'a> {
-    controller_finished: bool,
-    leader_finished: bool,
-    drained: Option<oneshot::Sender<()>>,
-    standby: Option<ActiveStandby<'a>>,
-    voluntary: bool,
-    result: Result<(), ServerError>,
-}
-
-impl Handoff<'_> {
-    fn record(&mut self, result: Result<(), ServerError>) {
-        if self.result.is_ok() {
-            self.result = result;
-        }
-    }
-
-    fn signal_drained(&mut self) {
-        if let Some(drained) = self.drained.take() {
-            let _ = drained.send(());
-        }
-    }
-
-    async fn controller_done(&mut self, result: Result<(), PortError>) {
-        self.controller_finished = true;
-        self.record(result.map_err(ServerError::Controller));
-        if let Some(result) = stop_standby(&mut self.standby).await {
-            self.record(result);
-        }
-        self.signal_drained();
-    }
-}
-
-async fn stop_standby(active: &mut Option<ActiveStandby<'_>>) -> Option<Result<(), ServerError>> {
-    let standby = active.as_mut()?;
-    let ended = if standby.stop.is_some() {
-        standby.listeners.ended()
-    } else {
-        None
-    };
-    if let Some(stop) = standby.stop.take() {
-        let _ = stop.send(());
-    }
-    let polled =
-        std::future::poll_fn(|cx| std::task::Poll::Ready(standby.completion.as_mut().poll(cx)))
-            .await;
-    match polled {
-        std::task::Poll::Ready(result) => {
-            active.take();
-            Some(ended.map_or(result, Err))
-        }
-        std::task::Poll::Pending => ended.map(Err),
-    }
-}
-
-impl ListenerEnds {
-    fn new(public: oneshot::Receiver<()>, worker: oneshot::Receiver<()>) -> Self {
-        Self {
-            public: Some(public),
-            worker: Some(worker),
-        }
-    }
-
-    fn ended(&mut self) -> Option<ServerError> {
-        for (endpoint, ended) in [("public", &mut self.public), ("worker", &mut self.worker)] {
-            let Some(receiver) = ended.as_mut() else {
-                continue;
-            };
-            match receiver.try_recv() {
-                Ok(()) => {
-                    *ended = None;
-                    return Some(ServerError::ListenerEnded { endpoint });
-                }
-                Err(oneshot::error::TryRecvError::Closed) => *ended = None,
-                Err(oneshot::error::TryRecvError::Empty) => {}
-            }
-        }
-        None
-    }
-}
-
-async fn standby_event(active: &mut Option<ActiveStandby<'_>>) -> StandbyEvent {
-    match active {
-        Some(standby) => standby.event().await,
-        None => std::future::pending().await,
-    }
-}
-
-async fn drain_controller<'s>(
-    (mut controller, mut leader): (
-        Pin<&mut impl Future<Output = Result<(), PortError>>>,
-        Pin<&mut impl Future<Output = Result<(), ServerError>>>,
-    ),
-    mut handoff: Handoff<'s>,
-    maintenance: &mut Maintenance<'_, 's, impl Future<Output = Infallible>>,
-    mut shutdown: Pin<&mut impl Future<Output = ()>>,
-) -> Result<TermExit<'s>, ServerError> {
-    loop {
-        if handoff.controller_finished && handoff.leader_finished {
-            if handoff.voluntary && handoff.result.is_ok() {
-                return Ok(TermExit {
-                    end: TermEnd::Yielded,
-                    standby: handoff.standby.take().map(|standby| standby.completion),
-                });
-            }
-            if handoff.standby.is_none() && maintenance.pending.is_empty() {
-                return handoff.result.map(|()| TermExit {
-                    end: TermEnd::Stopped,
-                    standby: None,
-                });
-            }
-        }
-        tokio::select! {
-            biased;
-            () = &mut shutdown, if handoff.voluntary => handoff.voluntary = false,
-            result = &mut controller, if !handoff.controller_finished =>
-                handoff.controller_done(result).await,
-            result = &mut leader, if !handoff.leader_finished => {
-                handoff.leader_finished = true;
-                handoff.record(result);
-            },
-            event = standby_event(&mut handoff.standby) => match event {
-                StandbyEvent::Complete(result) => {
-                    handoff.standby.take();
-                    handoff.record(result);
-                }
-                StandbyEvent::ListenerEnded(error) => {
-                    handoff.record(Err(error));
-                    if let Some(result) = stop_standby(&mut handoff.standby).await {
-                        handoff.record(result);
-                    }
-                }
-            },
-            error = maintenance.event() => {
-                if let Some(error) = error { handoff.record(Err(error)); }
-            }
-        }
-    }
-}
-
-fn observe_prepared(
+async fn observe_prepared(
     prepared: oneshot::Receiver<()>,
     observed: Arc<AtomicBool>,
-) -> Shared<BoxFuture<'static, bool>> {
-    async move {
-        let ready = prepared.await.is_ok();
-        if ready {
-            observed.store(true, Ordering::Release);
-        }
-        ready
+) -> bool {
+    let ready = prepared.await.is_ok();
+    if ready {
+        observed.store(true, Ordering::Release);
     }
-    .boxed()
-    .shared()
+    ready
 }
 
-async fn drive_term<'s, D: Deployment>(
-    context: LeadContext<'_, D>,
+async fn drain_original<D: Deployment>(
+    context: &LeadContext<'_, D>,
+    outgoing: &mut Option<crate::protection::Outgoing>,
+) -> Result<(), ServerError> {
+    let clock = &context.core.host.clock;
+    let mut drain = ControllerDrain::default();
+    let mut incoming = ControllerDrain::default();
+    if let Some(protection) = outgoing.as_ref() { protection.snapshot(&mut drain); }
+    loop {
+        // Poll the engine and renew the last confirmed frozen set concurrently. A failed or
+        // cancelled snapshot must never erase protection for an attempt still owned by the old engine.
+        let observation = clock.timeout(context.leadership.call_timeout(), context.scheduler.hand_off(&mut incoming));
+        let protection = clock.timeout(context.leadership.call_timeout(), async {
+            if let Some(protection) = outgoing.as_mut() {
+                protection.refresh(&context.core.host.repository, &drain, clock.wall(), context.leadership.protection_ttl()).await?;
+            }
+            Ok::<(), PortError>(())
+        });
+        let heartbeat = clock.timeout(context.leadership.call_timeout(), context.provisioner.heartbeat());
+        let (observed, protected, heartbeat) = tokio::join!(observation, protection, heartbeat);
+        match observed {
+            Ok(Ok(())) => {
+                std::mem::swap(&mut drain, &mut incoming);
+            }
+            Ok(Err(error)) => tracing::warn!(%error, "cannot observe original drain; retaining confirmed worker protection"),
+            Err(error) => tracing::warn!(%error, "original drain observation timed out"),
+        }
+        match protected {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "cannot renew old-worker protection"),
+            Err(error) => tracing::warn!(%error, "old-worker protection renewal timed out"),
+        }
+        match heartbeat {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "cannot heartbeat controller retirement"),
+            Err(error) => tracing::warn!(%error, "controller heartbeat timed out"),
+        }
+        if drain.complete {
+            if let Some(protection) = outgoing.as_mut() {
+                match clock.timeout(context.leadership.call_timeout(), protection.refresh(
+                    &context.core.host.repository, &drain, clock.wall(), context.leadership.protection_ttl(),
+                )).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => tracing::warn!(%error, "cannot remove completed old-worker protection"),
+                    Err(error) => tracing::warn!(%error, "completed old-worker protection removal timed out"),
+                }
+            }
+            return Ok(());
+        }
+        clock.sleep(context.leadership.renew_interval()).await;
+    }
+}
+
+/// Routing queries and completion may span lifecycle transitions; heartbeat while awaiting
+/// the platform and retry an unavailable response without pretending that it succeeded.
+async fn finish_host<D: Deployment>(
+    context: &LeadContext<'_, D>,
+    milestone: HostMilestone,
+) -> Result<(), ServerError> {
+    loop {
+        let reached = context.provisioner.reached(milestone);
+        tokio::pin!(reached);
+        let outcome = loop {
+            tokio::select! {
+                outcome = &mut reached => break outcome,
+                () = context.core.host.clock.sleep(context.leadership.renew_interval()) => {
+                    if let Err(error) = context.provisioner.heartbeat().await {
+                        tracing::warn!(%error, "cannot heartbeat controller retirement");
+                    }
+                }
+            }
+        };
+        match outcome {
+            Ok(()) => return Ok(()),
+            Err(error @ PortError::Unavailable(_)) => {
+                tracing::warn!(%error, ?milestone, "controller milestone unavailable; retrying");
+                context.core.host.clock.sleep(context.leadership.renew_interval()).await;
+            }
+            Err(error) => return Err(ServerError::HostIdentity(error)),
+        }
+    }
+}
+
+/// Drives one original engine for the full process lifetime, including passive refusal,
+/// authority transfer, old work completion and actual platform routing-away.
+async fn drive_original<D: Deployment>(
+    context: &LeadContext<'_, D>,
     spec: &ControllerSpec<'_>,
-    connections: TermConnections<D, impl FnOnce() -> Option<ActiveStandby<'s>>>,
-    (ready, candidate, observed_prepared): (
-        &mut Option<ControllerReady>,
-        &mut Option<LeaseCandidate>,
-        &Arc<AtomicBool>,
-    ),
-    (shutdown, stop, stop_sender): (impl Future<Output = ()> + Clone, Stop, oneshot::Sender<()>),
-    maintenance: Maintenance<'_, 's, impl Future<Output = Infallible>>,
-    (routability_delay, handoff_timeout): (Duration, Duration),
-) -> Result<TermExit<'s>, ServerError> {
-    context
-        .readiness
-        .begin_term(context.leadership.fence().clone());
-    let TermConnections {
-        controller: connections,
-        listeners: ends,
-        standby,
-    } = connections;
-    let readiness = context.readiness;
-    let dashboard = context.dashboard;
-    let clock = &*context.core.host.clock;
+    (connections, mut ends, stop_sender): (ControllerListening<D>, ListenerEnds, oneshot::Sender<()>),
+    ready: ControllerReady,
+    shutdown: impl Future<Output = ()> + Clone,
+    mut background: Pin<&mut impl Future<Output = Infallible>>,
+) -> Result<(), ServerError> {
     let (controller_ready, prepared) = ControllerReady::channel();
-    let prepared = observe_prepared(prepared, Arc::clone(observed_prepared));
-    let preparation = prepared.clone();
-    let readiness_seen = Arc::clone(observed_prepared);
-    let standby = move || {
-        let _ = preparation.now_or_never();
-        if readiness_seen.load(Ordering::Acquire) {
-            standby()
-        } else {
-            None
+    let observed = Arc::new(AtomicBool::new(false));
+    let prepared = observe_prepared(prepared, Arc::clone(&observed));
+    let mut controller = Box::pin(context.scheduler.run_controller(spec, connections, controller_ready));
+    let mut outgoing = None;
+    let result = {
+        let leader = run_leader(context, prepared, ready, shutdown, &mut outgoing);
+        tokio::pin!(leader);
+        tokio::select! {
+            biased;
+            result = &mut controller => return result.map_err(ServerError::Controller).and(Err(ServerError::ControllerEnded)),
+            error = listener_stopped("public", &mut ends.public) => return Err(error),
+            error = listener_stopped("worker", &mut ends.worker) => return Err(error),
+            result = &mut leader => result,
+            never = &mut background => match never {},
         }
     };
-    let mut controller = Box::pin(context.scheduler.run_controller(
-        spec,
-        connections,
-        controller_ready,
-    ));
-    let (yielded, yielding) = oneshot::channel();
-    let (drained_tx, drained_rx) = oneshot::channel();
-    let (failed_tx, failed_rx) = oneshot::channel();
-    let voluntary = AtomicBool::new(false);
-    let mut leader = Box::pin(run_leader(
-        context,
-        LeaderSignals {
-            prepared,
-            yielded,
-            drained: drained_rx,
-            failed: failed_tx,
-            voluntary: &voluntary,
-        },
-        ready,
-        candidate,
-        routability_delay,
-        (shutdown.clone(), stop),
-    ));
-    drive_controller(
-        (shutdown, yielding),
-        |yielding| {
-            voluntary.store(yielding, Ordering::Release);
-            readiness.stop();
-            let _ = stop_sender.send(());
-        },
-        dashboard,
-        (controller.as_mut(), leader.as_mut()),
-        ControllerSignals {
-            listeners: ends,
-            drained: drained_tx,
-            failed: failed_rx,
-            standby,
-        },
-        maintenance,
-        (clock, handoff_timeout),
-    )
-    .await
+    context.readiness.stop();
+    if let Some(dashboard) = context.dashboard { dashboard.shutdown(); }
+    if observed.load(Ordering::Acquire) {
+        let drain = async {
+            drain_original(context, &mut outgoing).await?;
+            finish_host(context, HostMilestone::Unrouted).await
+        };
+        tokio::pin!(drain);
+        tokio::select! {
+            result = &mut controller => return result.map_err(ServerError::Controller).and(Err(ServerError::ControllerEnded)),
+            result = &mut drain => result?,
+            never = &mut background => match never {},
+        }
+        let _ = stop_sender.send(());
+        tokio::select! {
+            result = &mut controller => result.map_err(ServerError::Controller)?,
+            never = &mut background => match never {},
+        }
+    }
+    finish_host(context, HostMilestone::HandedOff).await?;
+    result
 }
 
 /// The composed server: the controller's scheduler and provisioner, the control loop, the gates that
@@ -1283,8 +889,7 @@ pub struct Server<D: Deployment> {
     actions: Arc<gang_config::ActionsConfig>,
     scaling: Arc<gang_config::ScalingConfig>,
     accept_error_backoff: NonZeroDuration,
-    standby_routability_delay: Duration,
-    handoff_timeout: Duration,
+    attempt_budget: Duration,
     health_limits: HealthLimits,
     dashboard: Option<Dashboard>,
     builds: BuildsCell,
@@ -1376,8 +981,7 @@ impl<D: Deployment> Server<D> {
             actions: settings.actions,
             scaling: settings.scaling,
             accept_error_backoff: settings.accept_error_backoff,
-            standby_routability_delay: settings.standby_routability_delay,
-            handoff_timeout: settings.handoff_timeout,
+            attempt_budget: settings.attempt_budget,
             health_limits,
             dashboard,
             builds,
@@ -1451,12 +1055,22 @@ impl<D: Deployment> Server<D> {
             fleets: self.fleets.catalog(),
             max_workers: self.fleets.max_instances(),
             client_action_timeout: self.client_action_timeout.get(),
+            attempt_budget: self.attempt_budget,
             actions: Arc::clone(&self.actions),
             scaling: Arc::clone(&self.scaling),
             clock: core.host.clock.clone(),
             observations: &self.observation_sink,
         };
-        let shutdown = shutdown.shared();
+        let retirement_error = parking_lot::Mutex::new(None);
+        let provisioner = &self.provisioner;
+        let shutdown = async {
+            tokio::select! {
+                () = shutdown => {}
+                result = provisioner.retiring() => if let Err(error) = result {
+                    *retirement_error.lock() = Some(error);
+                }
+            }
+        }.shared();
         let readiness = self.readiness;
         // Every controller refreshes revocations and drains its admitted observations.
         let mut background = Box::pin(run_background(
@@ -1478,66 +1092,36 @@ impl<D: Deployment> Server<D> {
             self.accept_error_backoff,
         )
         .await?;
-        let mut candidate = None;
-        let mut ready = Some(ready);
-        let observed_prepared = Arc::new(AtomicBool::new(false));
-        let mut pending = PendingStandbys::new();
-        loop {
-            if shutdown.clone().now_or_never().is_some() {
-                Maintenance {
-                    background: background.as_mut(),
-                    pending: &mut pending,
-                }
-                .finish()
-                .await?;
-                return Ok(());
-            }
-            let leadership = controller_leadership(core, &self.controller, self.leadership.clone());
-            let leading = Leading::default();
-            let (stop_sender, stop) = stop_channel();
-            let connections = term_connections::<D>(
-                &self.scheduler,
-                &listeners,
-                (&self.public_gate, &self.worker_gate, &self.public),
-                stop.clone(),
-            );
-            let context = LeadContext {
-                core,
-                revoked_certificates: &self.revoked_certificates,
-                provisioner: &self.provisioner,
-                fleets: &self.fleets,
-                scheduler: &self.scheduler,
-                worker_endpoint: &self.worker_endpoint,
-                dashboard: self.dashboard.as_ref(),
-                builds: &self.builds,
-                sink: &self.observation_sink,
-                cache: &self.cache,
-                leading: &leading,
-                readiness: &readiness,
-                leadership: &leadership,
-                control_settings: self.control_settings,
-                actions: &self.actions,
-                scaling: &self.scaling,
-                sidecar_retry_interval: self.leadership.renew_interval,
-                milestone_timeout: self.leadership.ttl.get(),
-            };
-            let term_end = drive_term(
-                context,
-                &spec,
-                connections,
-                (&mut ready, &mut candidate, &observed_prepared),
-                (shutdown.clone(), stop, stop_sender),
-                Maintenance {
-                    background: background.as_mut(),
-                    pending: &mut pending,
-                },
-                (self.standby_routability_delay, self.handoff_timeout),
-            )
-            .await?;
-            if matches!(term_end.queue_standby(&mut pending), TermEnd::Stopped) {
-                return Ok(());
-            }
-        }
+        let leadership = controller_leadership(core, &self.controller, self.leadership.clone());
+        readiness.begin_term(leadership.fence().clone());
+        let leading = Leading::default();
+        let (stop_sender, stop) = stop_channel();
+        let (connections, ends) = controller_connections::<D>(
+            listeners.public, listeners.worker, self.public_gate, self.worker_gate, self.public, stop,
+        );
+        let context = LeadContext {
+            core,
+            revoked_certificates: &self.revoked_certificates,
+            provisioner: &self.provisioner,
+            fleets: &self.fleets,
+            scheduler: &self.scheduler,
+            worker_endpoint: &self.worker_endpoint,
+            dashboard: self.dashboard.as_ref(),
+            builds: &self.builds,
+            sink: &self.observation_sink,
+            cache: &self.cache,
+            leading: &leading,
+            readiness: &readiness,
+            leadership: &leadership,
+            control_settings: self.control_settings,
+            actions: &self.actions,
+            scaling: &self.scaling,
+            sidecar_retry_interval: self.leadership.renew_interval,
+            milestone_timeout: self.leadership.ttl.get(),
+        };
+        let result = drive_original(&context, &spec, (connections, ends, stop_sender), ready, shutdown, background.as_mut()).await;
+        if let Some(error) = retirement_error.lock().take() { return Err(ServerError::HostIdentity(error)); }
+        result
     }
 }
 
@@ -1853,489 +1437,6 @@ mod tests {
     use super::{UnauthenticatedListeners, unauthenticated_listeners};
     use crate::endpoint::EndpointRole;
 
-    fn standby_driver_signals<R>(
-        standby: R,
-    ) -> (
-        super::ControllerSignals<R>,
-        [tokio::sync::oneshot::Sender<()>; 2],
-    ) {
-        let (public, public_end) = tokio::sync::oneshot::channel();
-        let (worker, worker_end) = tokio::sync::oneshot::channel();
-        let (drained, _drained) = tokio::sync::oneshot::channel();
-        let (_failed, failed) = tokio::sync::oneshot::channel();
-        (
-            super::ControllerSignals {
-                listeners: super::ListenerEnds::new(public_end, worker_end),
-                drained,
-                failed,
-                standby,
-            },
-            [public, worker],
-        )
-    }
-
-    #[tokio::test]
-    async fn ready_on_final_controller_poll_is_observed_before_standby() {
-        use futures::FutureExt;
-        use std::sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        };
-        let readiness_seen = Arc::new(AtomicBool::new(false));
-        let (ready, receiver) = tokio::sync::oneshot::channel();
-        let preparation = super::observe_prepared(receiver, Arc::clone(&readiness_seen));
-        let mut ready = Some(ready);
-        let mut controller = Box::pin(std::future::poll_fn(move |_| {
-            if let Some(ready) = ready.take() {
-                let _ = ready.send(());
-            }
-            std::task::Poll::Pending::<Result<(), gang_spi::PortError>>
-        }));
-        let mut leader = Box::pin(std::future::pending());
-        let mut background = Box::pin(std::future::pending());
-        let mut pending = super::PendingStandbys::new();
-        let started = std::cell::Cell::new(false);
-        let (signals, _ends) = standby_driver_signals(|| {
-            let _ = preparation.now_or_never();
-            started.set(readiness_seen.load(Ordering::Acquire));
-            None
-        });
-        let (_yielded, yielding) = tokio::sync::oneshot::channel();
-        let clock = crate::test_support_clock::start();
-        let mut drive = Box::pin(super::drive_controller(
-            (std::future::ready(()), yielding),
-            |_| {},
-            None,
-            (controller.as_mut(), leader.as_mut()),
-            signals,
-            super::Maintenance {
-                background: background.as_mut(),
-                pending: &mut pending,
-            },
-            (&*clock, std::time::Duration::from_secs(10)),
-        ));
-        assert!(futures::poll!(drive.as_mut()).is_pending());
-        assert!(started.get());
-    }
-
-    #[tokio::test]
-    async fn observed_preparation_remains_sticky_after_unsent_later_term() {
-        use futures::FutureExt;
-        use std::sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        };
-        let observed = Arc::new(AtomicBool::new(false));
-        let (ready, receiver) = tokio::sync::oneshot::channel();
-        ready.send(()).expect("receiver retained");
-        assert_eq!(
-            super::observe_prepared(receiver, Arc::clone(&observed)).now_or_never(),
-            Some(true)
-        );
-        let (ready, receiver) = tokio::sync::oneshot::channel();
-        drop(ready);
-        assert_eq!(
-            super::observe_prepared(receiver, Arc::clone(&observed)).now_or_never(),
-            Some(false)
-        );
-        assert!(observed.load(Ordering::Acquire));
-    }
-
-    #[tokio::test]
-    async fn controller_first_post_stop_poll_skips_unneeded_refuser() -> gang_testkit::TestResult {
-        let polls = std::cell::Cell::new(0);
-        let refusals = std::cell::Cell::new(0);
-        let mut controller = Box::pin(std::future::poll_fn(|_| {
-            polls.set(polls.get() + 1);
-            std::task::Poll::Ready(Ok(()))
-        }));
-        let mut leader = Box::pin(std::future::ready(Ok(())));
-        let mut background = Box::pin(std::future::pending());
-        let mut pending = super::PendingStandbys::new();
-        let (signals, _ends) = standby_driver_signals(|| {
-            refusals.set(refusals.get() + 1);
-            None
-        });
-        let (_yielded, yielding) = tokio::sync::oneshot::channel();
-        let clock = crate::test_support_clock::start();
-        let exit = super::drive_controller(
-            (std::future::ready(()), yielding),
-            |_| {},
-            None,
-            (controller.as_mut(), leader.as_mut()),
-            signals,
-            super::Maintenance {
-                background: background.as_mut(),
-                pending: &mut pending,
-            },
-            (&*clock, std::time::Duration::from_secs(10)),
-        )
-        .await?;
-        assert!(matches!(exit.end, super::TermEnd::Stopped));
-        assert!(exit.standby.is_none());
-        assert_eq!(polls.get(), 1);
-        assert_eq!(refusals.get(), 0);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn late_queued_refusal_failure_stops_the_current_term() -> gang_testkit::TestResult {
-        let (stop, stopped) = super::stop_channel();
-        let controller_stop = stopped.clone();
-        let mut controller = Box::pin(async {
-            controller_stop.await;
-            Ok(())
-        });
-        let mut leader = Box::pin(async {
-            stopped.await;
-            Ok(())
-        });
-        let mut background = Box::pin(std::future::pending());
-        let mut pending = super::PendingStandbys::new();
-        let (fail, failed) = tokio::sync::oneshot::channel::<()>();
-        pending.push(Box::pin(async {
-            let _ = failed.await;
-            Err(super::ServerError::Controller(
-                gang_spi::PortError::backend("late refusal"),
-            ))
-        }));
-        let (signals, _ends) = standby_driver_signals(|| None);
-        let (_yielded, yielding) = tokio::sync::oneshot::channel();
-        let clock = crate::test_support_clock::start();
-        let mut drive = Box::pin(super::drive_controller(
-            (std::future::pending(), yielding),
-            |_| {
-                let _ = stop.send(());
-            },
-            None,
-            (controller.as_mut(), leader.as_mut()),
-            signals,
-            super::Maintenance {
-                background: background.as_mut(),
-                pending: &mut pending,
-            },
-            (&*clock, std::time::Duration::from_secs(10)),
-        ));
-        assert!(futures::poll!(drive.as_mut()).is_pending());
-        fail.send(()).map_err(|()| "queued refusal was cancelled")?;
-        assert!(matches!(
-            drive.await,
-            Err(super::ServerError::Controller(_))
-        ));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn refusal_listener_end_is_fatal_for_both_roles() -> gang_testkit::TestResult {
-        for public in [true, false] {
-            assert_refusal_listener_end(public).await?;
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn ready_refusal_preserves_listener_end_classification() -> gang_testkit::TestResult {
-        for public in [true, false] {
-            let (public_end, public_stopped) = tokio::sync::oneshot::channel();
-            let (worker_end, worker_stopped) = tokio::sync::oneshot::channel();
-            let (stop, _stopped) = tokio::sync::oneshot::channel();
-            let mut active = super::ActiveStandby {
-                stop: Some(stop),
-                listeners: super::ListenerEnds::new(public_stopped, worker_stopped),
-                completion: Box::pin(std::future::ready(Ok(()))),
-            };
-            let retained = if public {
-                public_end
-                    .send(())
-                    .map_err(|()| "public listener monitor missing")?;
-                worker_end
-            } else {
-                worker_end
-                    .send(())
-                    .map_err(|()| "worker listener monitor missing")?;
-                public_end
-            };
-            let expected = if public { "public" } else { "worker" };
-            assert!(matches!(
-                active.event().await,
-                super::StandbyEvent::ListenerEnded(super::ServerError::ListenerEnded { endpoint })
-                    if endpoint == expected
-            ));
-            let mut active = Some(active);
-            assert!(matches!(
-                super::stop_standby(&mut active).await,
-                Some(Ok(()))
-            ));
-            assert!(active.is_none());
-            drop(retained);
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn completion_poll_preserves_listener_end_and_backend_error() -> gang_testkit::TestResult
-    {
-        for public in [true, false] {
-            for backend_error in [false, true] {
-                assert_completion_poll_notification(public, backend_error).await?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn assert_completion_poll_notification(
-        public: bool,
-        backend_error: bool,
-    ) -> gang_testkit::TestResult {
-        let (public_end, public_stopped) = tokio::sync::oneshot::channel();
-        let (worker_end, worker_stopped) = tokio::sync::oneshot::channel();
-        let (notify, retained) = if public {
-            (public_end, worker_end)
-        } else {
-            (worker_end, public_end)
-        };
-        let (stop, _stopped) = tokio::sync::oneshot::channel();
-        let active = super::ActiveStandby {
-            stop: Some(stop),
-            listeners: super::ListenerEnds::new(public_stopped, worker_stopped),
-            completion: Box::pin(async move {
-                let _ = notify.send(());
-                if backend_error {
-                    Err(super::ServerError::Controller(
-                        gang_spi::PortError::backend("same-poll refusal failure"),
-                    ))
-                } else {
-                    Ok(())
-                }
-            }),
-        };
-        let handoff = super::Handoff {
-            controller_finished: false,
-            leader_finished: true,
-            drained: None,
-            standby: Some(active),
-            voluntary: false,
-            result: Ok(()),
-        };
-        let (finish, finished) = tokio::sync::oneshot::channel();
-        let mut controller = std::pin::pin!(async {
-            let _ = finished.await;
-            Ok(())
-        });
-        let mut leader = std::pin::pin!(std::future::pending());
-        let mut background = std::pin::pin!(std::future::pending());
-        let mut pending = super::PendingStandbys::new();
-        let mut maintenance = super::Maintenance {
-            background: background.as_mut(),
-            pending: &mut pending,
-        };
-        let mut shutdown = std::pin::pin!(std::future::pending());
-        let mut drain = std::pin::pin!(super::drain_controller(
-            (controller.as_mut(), leader.as_mut()),
-            handoff,
-            &mut maintenance,
-            shutdown.as_mut(),
-        ));
-        assert!(futures::poll!(drain.as_mut()).is_pending());
-        finish.send(()).map_err(|()| "old drain was cancelled")?;
-        let expected = if public { "public" } else { "worker" };
-        let Err(error) = drain.await else {
-            return Err("refusal completion did not fail the drain".into());
-        };
-        if backend_error {
-            assert!(matches!(
-                error,
-                super::ServerError::Controller(gang_spi::PortError::Backend(cause))
-                    if cause.to_string() == "same-poll refusal failure"
-            ));
-        } else {
-            assert!(
-                matches!(error, super::ServerError::ListenerEnded { endpoint } if endpoint == expected)
-            );
-        }
-        drop(retained);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn dropped_refusal_senders_preserve_async_backend_error() -> gang_testkit::TestResult {
-        for dropped in [[true, false], [false, true], [true, true]] {
-            assert_dropped_refusal_senders(dropped).await?;
-        }
-        Ok(())
-    }
-
-    async fn assert_dropped_refusal_senders(dropped: [bool; 2]) -> gang_testkit::TestResult {
-        let (public_end, public_stopped) = tokio::sync::oneshot::channel();
-        let (worker_end, worker_stopped) = tokio::sync::oneshot::channel();
-        let (public_end, retained_public) = if dropped[0] {
-            (Some(public_end), None)
-        } else {
-            (None, Some(public_end))
-        };
-        let (worker_end, retained_worker) = if dropped[1] {
-            (Some(worker_end), None)
-        } else {
-            (None, Some(worker_end))
-        };
-        let (fail, failed) = tokio::sync::oneshot::channel::<()>();
-        let (stop, _stopped) = tokio::sync::oneshot::channel();
-        let mut active = Some(super::ActiveStandby {
-            stop: Some(stop),
-            listeners: super::ListenerEnds::new(public_stopped, worker_stopped),
-            completion: Box::pin(async move {
-                drop((public_end, worker_end));
-                let _ = failed.await;
-                Err(super::ServerError::Controller(
-                    gang_spi::PortError::backend("asynchronous refusal failure"),
-                ))
-            }),
-        });
-        // Each cancelled event must retain the retired-receiver state for the next selection.
-        assert!(futures::poll!(std::pin::pin!(super::standby_event(&mut active))).is_pending());
-        assert!(
-            active
-                .as_mut()
-                .is_some_and(|active| active.listeners.ended().is_none())
-        );
-        assert!(futures::poll!(std::pin::pin!(super::standby_event(&mut active))).is_pending());
-        assert!(futures::poll!(std::pin::pin!(super::standby_event(&mut active))).is_pending());
-        assert!(super::stop_standby(&mut active).await.is_none());
-        fail.send(())
-            .map_err(|()| "refusal failure was cancelled")?;
-        let super::StandbyEvent::Complete(Err(error)) = super::standby_event(&mut active).await
-        else {
-            return Err("dropped senders masked the refusal backend error".into());
-        };
-        assert!(matches!(
-            error,
-            super::ServerError::Controller(gang_spi::PortError::Backend(cause))
-                if cause.to_string() == "asynchronous refusal failure"
-        ));
-        drop((retained_public, retained_worker));
-        Ok(())
-    }
-
-    async fn assert_refusal_listener_end(public: bool) -> gang_testkit::TestResult {
-        let (finish, finished) = tokio::sync::oneshot::channel();
-        let mut controller = Box::pin(async {
-            let _ = finished.await;
-            Ok(())
-        });
-        let mut leader = Box::pin(std::future::ready(Ok(())));
-        let mut background = Box::pin(std::future::pending());
-        let mut pending = super::PendingStandbys::new();
-        let (public_end, public_stopped) = tokio::sync::oneshot::channel();
-        let (worker_end, worker_stopped) = tokio::sync::oneshot::channel();
-        let (stop, stopped) = tokio::sync::oneshot::channel();
-        let active = super::ActiveStandby {
-            stop: Some(stop),
-            listeners: super::ListenerEnds::new(public_stopped, worker_stopped),
-            completion: Box::pin(async {
-                let _ = stopped.await;
-                Ok(())
-            }),
-        };
-        let (signals, _ends) = standby_driver_signals(|| Some(active));
-        let (yielded, yielding) = tokio::sync::oneshot::channel();
-        yielded.send(()).map_err(|()| "yield receiver missing")?;
-        let clock = crate::test_support_clock::start();
-        let mut drive = Box::pin(super::drive_controller(
-            (std::future::pending(), yielding),
-            |_| {},
-            None,
-            (controller.as_mut(), leader.as_mut()),
-            signals,
-            super::Maintenance {
-                background: background.as_mut(),
-                pending: &mut pending,
-            },
-            (&*clock, std::time::Duration::from_secs(10)),
-        ));
-        assert!(futures::poll!(drive.as_mut()).is_pending());
-        let retained = if public {
-            public_end
-                .send(())
-                .map_err(|()| "public listener monitor missing")?;
-            worker_end
-        } else {
-            worker_end
-                .send(())
-                .map_err(|()| "worker listener monitor missing")?;
-            public_end
-        };
-        assert!(
-            futures::poll!(drive.as_mut()).is_pending(),
-            "fatal refusal still drains old streams"
-        );
-        finish.send(()).map_err(|()| "old drain was cancelled")?;
-        let expected = if public { "public" } else { "worker" };
-        assert!(
-            matches!(drive.await, Err(super::ServerError::ListenerEnded { endpoint }) if endpoint == expected)
-        );
-        drop(retained);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn queued_refusal_deadline_is_anchored_before_next_term() -> gang_testkit::TestResult {
-        use gang_clock::Clock;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        let clock = crate::test_support_clock::start();
-        let anchored = AtomicU64::new(0);
-        let (finish, finished) = tokio::sync::oneshot::channel();
-        let mut controller = Box::pin(async {
-            let _ = finished.await;
-            Ok(())
-        });
-        let mut leader = Box::pin(std::future::ready(Ok(())));
-        let mut background = Box::pin(std::future::pending());
-        let mut pending = super::PendingStandbys::new();
-        let (public, public_end) = tokio::sync::oneshot::channel();
-        let (worker, worker_end) = tokio::sync::oneshot::channel();
-        let (stop, stopped) = tokio::sync::oneshot::channel();
-        let active = super::ActiveStandby {
-            stop: Some(stop),
-            listeners: super::ListenerEnds::new(public_end, worker_end),
-            completion: Box::pin(async {
-                let _ = stopped.await;
-                anchored.store(clock.wall().as_unix_millis(), Ordering::SeqCst);
-                clock.sleep(std::time::Duration::from_secs(2)).await;
-                Ok(())
-            }),
-        };
-        let (signals, _ends) = standby_driver_signals(|| Some(active));
-        let (yielded, yielding) = tokio::sync::oneshot::channel();
-        yielded.send(()).map_err(|()| "yield receiver missing")?;
-        let mut drive = Box::pin(super::drive_controller(
-            (std::future::pending(), yielding),
-            |_| {},
-            None,
-            (controller.as_mut(), leader.as_mut()),
-            signals,
-            super::Maintenance {
-                background: background.as_mut(),
-                pending: &mut pending,
-            },
-            (&*clock, std::time::Duration::from_secs(10)),
-        ));
-        assert!(futures::poll!(drive.as_mut()).is_pending());
-        finish.send(()).map_err(|()| "old drain was cancelled")?;
-        let exit = drive.await?;
-        assert!(matches!(exit.end, super::TermEnd::Yielded));
-        assert_eq!(
-            anchored.load(Ordering::SeqCst),
-            clock.wall().as_unix_millis()
-        );
-        let mut completion = exit.standby.ok_or("pending denial was not retained")?;
-        clock.advance(std::time::Duration::from_secs(2));
-        assert!(matches!(
-            futures::poll!(completion.as_mut()),
-            std::task::Poll::Ready(Ok(()))
-        ));
-        drop((public, worker));
-        Ok(())
-    }
 
     fn passive_candidate(holder: &gang_spi::ControllerId) -> gang_spi::LeaseCandidate {
         gang_spi::LeaseCandidate {
@@ -2352,6 +1453,10 @@ mod tests {
     }
 
     impl gang_spi::ControllerHostPort for IdentityHost {
+        async fn state(&self) -> Result<gang_spi::ControllerHostState, gang_spi::PortError> { Ok(gang_spi::ControllerHostState::Active) }
+        async fn drain_limit(&self) -> Result<Option<std::time::Duration>, gang_spi::PortError> { Ok(None) }
+        async fn heartbeat(&self) -> Result<(), gang_spi::PortError> { Ok(()) }
+
         async fn incarnation(
             &self,
         ) -> Result<gang_spi::ControllerHostIdentity, gang_spi::PortError> {
@@ -2489,24 +1594,15 @@ mod tests {
         ));
         assert!(futures::poll!(second.as_mut()).is_pending());
         second_ready.try_recv()?;
-        assert!(second_state.ready());
+        assert!(!second_state.ready());
         assert!(!second_state.is_leading());
         old.clock.advance(interval);
-        let terms = old.scheduler.controller_runs();
-        tokio::select! {
-            result = first.as_mut() => {
-                result?;
-                return Err("old process exited instead of yielding".into());
-            }
-            () = terms.reached(2) => {}
-        }
+        first.await?;
+        drop(stop_first);
+        assert_eq!(old.scheduler.controller_runs().get(), 1);
         assert!(!first_state.ready());
         assert!(futures::poll!(second.as_mut()).is_pending());
         assert!(second_state.is_leading());
-        stop_first
-            .send(())
-            .map_err(|()| "old process stopped early")?;
-        first.await?;
 
         assert_restarted_host_stays_passive(
             old_host,
@@ -2578,113 +1674,184 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_polls_controller_while_release_is_hung() -> gang_testkit::TestResult {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let address = listener.local_addr()?;
-        let (stop, stopped) = tokio::sync::oneshot::channel();
-        let readiness = super::Readiness::default();
-        readiness.serve();
-        readiness.lead();
-        let (public, public_end) = tokio::sync::oneshot::channel();
-        let (worker, worker_end) = tokio::sync::oneshot::channel();
-        let mut controller = Box::pin(async move {
-            let _ = stopped.await;
-            drop(listener);
-            Ok(())
+    async fn slow_large_preparation_precedes_launch_completion_and_takeover()
+    -> gang_testkit::TestResult {
+        use gang_clock::Clock;
+        use gang_spi::{ControllerHostIdentity, ControllerId, ControllerReady, RecordKind};
+        use std::time::Duration;
+        let (mut first, _dials, old) = crate::test_support::plain_parts();
+        let (mut second, _dials, replacement) = crate::test_support::plain_parts();
+        first.provisioner = first.provisioner.with_host_identity(ControllerHostIdentity::Launched {
+            at: old.clock.wall(), instance: gang_types::InstanceId::try_from("local-old")?,
         });
-        let mut leader = Box::pin(std::future::pending());
-        let mut background = Box::pin(std::future::pending());
-        let mut pending = super::PendingStandbys::new();
-        let ends = super::ListenerEnds::new(public_end, worker_end);
-        let (drained, _drained_rx) = tokio::sync::oneshot::channel();
-        let (_failed_tx, failed) = tokio::sync::oneshot::channel();
-        let (_yielded, yielding) = tokio::sync::oneshot::channel();
-        let clock = crate::test_support_clock::start();
-        let mut drive = Box::pin(super::drive_controller(
-            (std::future::ready(()), yielding),
-            |_| {
-                let _ = stop.send(());
-                readiness.stop();
-            },
-            None,
-            (controller.as_mut(), leader.as_mut()),
-            super::ControllerSignals {
-                listeners: ends,
-                drained,
-                failed,
-                standby: || None,
-            },
-            super::Maintenance {
-                background: background.as_mut(),
-                pending: &mut pending,
-            },
-            (&*clock, std::time::Duration::from_secs(10)),
-        ));
-        assert!(futures::poll!(drive.as_mut()).is_pending());
-        assert_eq!(
-            readiness.status(gang_types::health::health_check().ready_path()),
-            http::StatusCode::SERVICE_UNAVAILABLE
-        );
-        assert!(
-            std::net::TcpStream::connect(address).is_err(),
-            "listener remains open during release"
-        );
-        drop((public, worker));
+        second.provisioner = second.provisioner.with_host_identity(ControllerHostIdentity::Launched {
+            at: old.clock.wall() + Duration::from_secs(1),
+            instance: gang_types::InstanceId::try_from("local-new")?,
+        });
+        let host = second.provisioner.clone();
+        second.repository = first.repository.clone();
+        second.clock = first.clock.clone();
+        second.controller = ControllerId::new("prepared-successor");
+        let release_drain = old.scheduler.hold_drain();
+        let mut settings = crate::test_support::plain_settings();
+        settings.actions = Arc::new(gang_config::ActionsConfig {
+            history_flush_interval: gang_types::NonZeroDuration::from_secs(1),
+            ..gang_config::ActionsConfig::default()
+        });
+        let renew = settings.leadership.renew_interval.get();
+        let bound = gang_types::handover::handover_window(renew, settings.leadership.call_timeout.get());
+        let first = super::Server::prepare(first, settings.clone()).await?;
+        let second = super::Server::prepare(second, settings).await?;
+        let old_state = first.readiness.clone();
+        let new_state = second.readiness.clone();
+        let mut first = Box::pin(first.run(std::future::pending(), ControllerReady::channel().0));
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        let expected = seed_large_live_history(&old, first.as_mut()).await?;
+        let (mut entered, release) = old.repository.hold_next_record_page(RecordKind::ResourceHistory);
+        let (stop, stopped) = super::stop_channel();
+        let (ready, mut fully_prepared) = ControllerReady::channel();
+        let mut second = Box::pin(second.run(stopped, ready));
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        entered.try_recv()?;
+        // Even a successful read delayed beyond the entire planned-switch budget is
+        // preparation, not a reason to deregister the still-serving original controller.
+        assert_passive_preparation((&old, &host), (&old_state, &new_state),
+            (first.as_mut(), second.as_mut()), bound).await;
+        assert_eq!(host.prepared_attempts().get(), 0, "history import precedes routing preparation");
+        assert!(matches!(fully_prepared.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        let release_prepared = host.hold_prepared();
+        release.send(()).map_err(|()| "preparation read was cancelled")?;
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        assert_eq!(host.prepared_attempts().get(), 1);
+        assert_passive_preparation((&old, &host), (&old_state, &new_state),
+            (first.as_mut(), second.as_mut()), bound).await;
+        assert!(matches!(fully_prepared.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        release_prepared.send(()).map_err(|()| "routing preparation was cancelled")?;
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        fully_prepared.try_recv()?;
+        assert_eq!(host.milestones(), vec![gang_spi::HostMilestone::Prepared]);
+        assert_prepared_activation((&old, &replacement.scheduler, &host), &new_state,
+            (first.as_mut(), second.as_mut()), &expected, (stop, release_drain), renew).await?;
+        assert_eq!(old.scheduler.controller_runs().get(), 1);
+        assert_eq!(replacement.scheduler.controller_runs().get(), 1);
         Ok(())
     }
 
-    #[tokio::test]
-    async fn handoff_waits_for_drain_and_reports_lost_lease() {
-        let (public, public_end) = tokio::sync::oneshot::channel();
-        let (worker, worker_end) = tokio::sync::oneshot::channel();
-        let (drained, drained_rx) = tokio::sync::oneshot::channel();
-        let (_failed_tx, failed) = tokio::sync::oneshot::channel();
-        let (finish, finished) = tokio::sync::oneshot::channel();
-        let mut controller = Box::pin(async move {
-            let _ = finished.await;
-            Ok(())
-        });
-        let mut leader = Box::pin(async move {
-            let _ = drained_rx.await;
-            Err(super::ServerError::LeadershipLost)
-        });
-        let mut background = Box::pin(std::future::pending());
-        let mut pending = super::PendingStandbys::new();
-        let ends = super::ListenerEnds::new(public_end, worker_end);
-        let (_yielded, yielding) = tokio::sync::oneshot::channel();
-        let clock = crate::test_support_clock::start();
-        let mut drive = Box::pin(super::drive_controller(
-            (std::future::ready(()), yielding),
-            |_| {},
-            None,
-            (controller.as_mut(), leader.as_mut()),
-            super::ControllerSignals {
-                listeners: ends,
-                drained,
-                failed,
-                standby: || None,
-            },
-            super::Maintenance {
-                background: background.as_mut(),
-                pending: &mut pending,
-            },
-            (&*clock, std::time::Duration::from_secs(10)),
-        ));
-        assert!(futures::poll!(drive.as_mut()).is_pending());
-        let _ = finish.send(());
-        assert!(matches!(
-            drive.await,
-            Err(super::ServerError::LeadershipLost)
-        ));
-        drop((public, worker));
+    async fn assert_passive_preparation(
+        handles: (&crate::test_support_deployment::Handles, &gang_testkit::FakeProvisioner),
+        states: (&crate::health::Readiness, &crate::health::Readiness),
+        runs: (Pin<&mut impl Future<Output = Result<(), super::ServerError>>>,
+            Pin<&mut impl Future<Output = Result<(), super::ServerError>>>),
+        bound: std::time::Duration,
+    ) {
+        let (old, host) = handles;
+        let (old_state, new_state) = states;
+        let (mut first, mut second) = runs;
+        for _ in 0..=bound.as_secs() {
+            old.clock.advance(std::time::Duration::from_secs(1));
+            assert!(futures::poll!(first.as_mut()).is_pending());
+            assert!(futures::poll!(second.as_mut()).is_pending());
+            assert!(old_state.ready());
+            assert!(!new_state.ready());
+            assert_eq!(host.serving_attempts().get(), 0);
+            assert!(host.milestones().is_empty());
+            assert_eq!(old.scheduler.drains().get(), 0, "no early takeover request");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn passive_host_preparation_cancels_on_shutdown_or_retirement() -> gang_testkit::TestResult {
+        for retiring in [false, true] {
+            let (parts, _dials, handles) = crate::test_support::plain_parts();
+            let host = parts.provisioner.clone();
+            let release = host.hold_prepared();
+            let server = super::Server::prepare(parts, crate::test_support::plain_settings()).await?;
+            let readiness = server.readiness.clone();
+            let (ready, prepared) = gang_spi::ControllerReady::channel();
+            let (stop, stopped) = super::stop_channel();
+            let mut run = Box::pin(server.run(stopped, ready));
+            assert!(futures::poll!(run.as_mut()).is_pending());
+            assert_eq!(host.prepared_attempts().get(), 1);
+            assert!(!readiness.ready());
+            if retiring { host.retire(); } else { stop.send(()).map_err(|()| "server stopped early")?; }
+            tokio::time::timeout(std::time::Duration::from_secs(1), run).await??;
+            assert!(prepared.await.is_err(), "an incomplete Prepared stage never signals readiness");
+            assert!(release.send(()).is_err(), "the host registration future must be cancelled");
+            assert!(!host.milestones().iter().any(|milestone| matches!(milestone,
+                gang_spi::HostMilestone::Prepared | gang_spi::HostMilestone::Serving)));
+            assert_eq!(handles.scheduler.snapshots().get(), 0, "leader work never starts");
+        }
+        Ok(())
+    }
+
+    async fn assert_prepared_activation(
+        handles: (&crate::test_support_deployment::Handles, &gang_testkit::FakeScheduler, &gang_testkit::FakeProvisioner),
+        readiness: &crate::health::Readiness,
+        runs: (Pin<&mut impl Future<Output = Result<(), super::ServerError>>>,
+            Pin<&mut impl Future<Output = Result<(), super::ServerError>>>),
+        expected: &[gang_spi::LearnedHistory],
+        stops: (tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Sender<()>),
+        renew: std::time::Duration,
+    ) -> gang_testkit::TestResult {
+        use gang_clock::Clock;
+        use gang_spi::{RecordKind, SchedulerPort};
+        let (old, replacement, host) = handles;
+        let (mut first, mut second) = runs;
+        let (stop, release_drain) = stops;
+        let (mut reread, release_reread) = old.repository.hold_next_record_page(RecordKind::ResourceHistory);
+        old.clock.advance(renew);
+        let release_serving = host.hold_serving();
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        assert!(readiness.ready(), "post-acquire activation must not reload the full history");
+        assert!(matches!(reread.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        assert_eq!(host.serving_attempts().get(), 1);
+        assert_eq!(host.milestones(), vec![gang_spi::HostMilestone::Prepared],
+            "the launch hook is held after leader health becomes ready");
+        release_serving.send(()).map_err(|()| "launch completion hold disappeared")?;
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        assert_eq!(host.milestones(), vec![gang_spi::HostMilestone::Prepared, gang_spi::HostMilestone::Serving]);
+        let mut restored = Vec::new();
+        replacement.learned_history(old.clock.wall(), &mut restored).await?;
+        assert_eq!(restored.as_slice(), expected, "preparation restores every chunk and page");
+        release_reread.send(()).map_err(|()| "canonical refresh gate was cancelled")?;
+        stop.send(()).map_err(|()| "successor stopped early")?;
+        second.await?;
+        release_drain.send(()).map_err(|()| "old response hold disappeared")?;
+        old.clock.advance(renew);
+        first.await?;
+        Ok(())
+    }
+
+    async fn seed_large_live_history(
+        handles: &crate::test_support_deployment::Handles,
+        mut run: Pin<&mut impl Future<Output = Result<(), super::ServerError>>>,
+    ) -> gang_testkit::TestResult<Vec<gang_spi::LearnedHistory>> {
+        use gang_clock::Clock;
+        use gang_spi::{LearnedHistory, RecordId, RecordKey, RecordKind, SchedulerPort};
+        use std::time::Duration;
+        let mut records = Vec::with_capacity(gang_spi::MAX_RECORD_CHANGES + 1);
+        for id in 0..=gang_spi::MAX_RECORD_CHANGES {
+            let id = u8::try_from(id)?;
+            records.push(LearnedHistory {
+                key: RecordKey { kind: RecordKind::ResourceHistory, id: RecordId::new([id; 32]) },
+                body: vec![id; if id == 0 { 410 * 1024 } else { 8192 }],
+                expires_at: handles.clock.wall() + Duration::from_hours(1),
+            });
+        }
+        handles.scheduler.restore_learned_history(handles.clock.wall(), &records).await?;
+        handles.clock.advance(Duration::from_secs(1));
+        assert!(futures::poll!(run.as_mut()).is_pending());
+        assert!(handles.repository.stored_records() > gang_spi::MAX_RECORD_CHANGES);
+        Ok(records)
     }
 
     #[tokio::test]
-    async fn learned_history_interval_and_final_drain_flush() -> gang_testkit::TestResult {
+    async fn learned_history_interval_and_pre_release_snapshot() -> gang_testkit::TestResult {
         use gang_clock::Clock;
         use gang_spi::{
-            ControllerId, ControllerReady, ExpiringRecordPort, LearnedHistory, RecordId, RecordKey,
-            RecordKind, SchedulerPort,
+            Acquisition, ControllerId, ControllerReady, ExpiringRecordPort, LeaderLeasePort,
+            LearnedHistory, RecordId, RecordKey, RecordKind, SchedulerPort, Takeover,
         };
         use std::time::Duration;
 
@@ -2749,23 +1916,28 @@ mod tests {
             "unchanged history must not be rewritten"
         );
 
+        history.body = vec![2];
+        handles.scheduler.restore_learned_history(handles.clock.wall(), &[history.clone()]).await?;
         let _ = stop.send(());
         assert!(futures::poll!(run.as_mut()).is_pending());
         assert_eq!(drains.get(), 1);
-        history.body = vec![2];
-        handles
-            .scheduler
-            .restore_learned_history(handles.clock.wall(), &[history.clone()])
-            .await?;
-        let contender = ControllerId::new("history-contender");
-        assert_history_held_during_drain(&handles, key, first.version, &contender).await?;
-
+        let now = handles.clock.wall();
+        let snapshot = handles.repository.get(&key, now).await?.ok_or("handoff snapshot missing")?;
+        let Acquisition::Acquired(lease) = handles.repository.acquire(
+            &passive_candidate(&ControllerId::new("history-successor")), now, now,
+            now + Duration::from_mins(1), Takeover::Observe,
+        ).await? else { return Err("shutdown kept the lease during response drain".into()); };
+        let mut store = super::LearnedHistoryStore::new(super::history_byte_limit(std::num::NonZeroUsize::MIN));
+        let mut loaded = Vec::new();
+        store.load(&handles.repository, &lease, now, &mut loaded).await?;
+        assert_eq!(loaded, vec![history.clone()]);
+        history.body = vec![3];
+        handles.scheduler.restore_learned_history(now, &[history]).await?;
         let _ = release_drain.send(());
-        assert!(matches!(
-            futures::poll!(run.as_mut()),
-            std::task::Poll::Ready(Ok(()))
-        ));
-        assert_released_history(&handles, history, first.version, &contender).await?;
+        handles.clock.advance(Duration::from_secs(1));
+        run.await?;
+        assert_eq!(handles.repository.get(&key, now).await?.ok_or("snapshot disappeared")?.version, snapshot.version,
+            "late measurements cannot write after authority release");
         Ok(())
     }
 
@@ -2924,8 +2096,7 @@ mod tests {
         let settings = crate::test_support::plain_settings();
         let renew = settings.leadership.renew_interval.get();
         let ttl = settings.leadership.ttl.get();
-        let snapshot_bound =
-            gang_types::handover::snapshot_timeout(renew, settings.leadership.call_timeout.get());
+        let snapshot_bound = settings.leadership.call_timeout.get();
         let server = super::Server::prepare(parts, settings).await?;
         let readiness = server.readiness.clone();
         let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -3003,8 +2174,7 @@ mod tests {
             run.as_mut(),
         )
         .await?;
-        stop.send(()).map_err(|()| "old process stopped early")?;
-        run.await?;
+        drop(stop);
         Ok(())
     }
 
@@ -3014,12 +2184,12 @@ mod tests {
         use crate::test_support::{plain_parts, plain_settings};
         use gang_clock::Clock;
         use gang_spi::{
-            Acquisition, ControllerId, ControllerReady, LeaderLeasePort, LearnedHistory, RecordId,
-            RecordKey, RecordKind, SchedulerPort, Takeover,
+            ControllerId, ControllerReady, LearnedHistory, RecordId, RecordKey, RecordKind,
+            SchedulerPort,
         };
 
         let (first, dials, old) = plain_parts();
-        let mut refused = old.scheduler.refusal_connections();
+        let mut refused = old.scheduler.connections();
         let (mut second, _dials, replacement) = plain_parts();
         second.repository = first.repository.clone();
         second.clock = first.clock.clone();
@@ -3027,7 +2197,6 @@ mod tests {
         let release_drain = old.scheduler.hold_drain();
         let settings = plain_settings();
         let renew = settings.leadership.renew_interval.get();
-        let ttl = settings.leadership.ttl.get();
         let bound =
             gang_types::handover::handover_window(renew, settings.leadership.call_timeout.get());
         let first = super::Server::prepare(first, settings).await?;
@@ -3054,22 +2223,9 @@ mod tests {
             .map_err(|()| "old process stopped early")?;
         assert!(futures::poll!(first.as_mut()).is_pending());
         assert_eq!(old.scheduler.drains().get(), 1);
-        assert!(matches!(
-            old.repository
-                .acquire(
-                    &passive_candidate(&ControllerId::new("drain-observer")),
-                    now,
-                    now,
-                    now + ttl,
-                    Takeover::Observe,
-                )
-                .await?,
-            Acquisition::Held(_)
-        ));
         let mut second = Box::pin(second.run(stopped_second, ControllerReady::channel().0));
         assert!(futures::poll!(second.as_mut()).is_pending());
-        assert!(second_state.ready());
-        assert!(!second_state.is_leading());
+        assert!(second_state.is_leading());
         let started = old.clock.wall();
         old.clock.advance(renew);
         assert!(futures::poll!(first.as_mut()).is_pending());
@@ -3097,7 +2253,6 @@ mod tests {
         refused: &mut tokio::sync::mpsc::UnboundedReceiver<gang_testkit::Received>,
         mut run: Pin<&mut impl Future<Output = Result<(), super::ServerError>>>,
     ) -> gang_testkit::TestResult {
-        assert_eq!(scheduler.refusal_runs().get(), 1);
         let _public = dials.public.dial();
         let _worker = dials.worker.dial();
         assert!(futures::poll!(run.as_mut()).is_pending());
@@ -3112,162 +2267,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn prepared_first_term_keeps_standby_available_during_later_preparation()
-    -> gang_testkit::TestResult {
-        use crate::test_support::{plain_parts, plain_settings};
-        use gang_spi::{ControllerId, ControllerReady};
-        let (first, _dials, old) = plain_parts();
-        let (mut second, _dials, new) = plain_parts();
-        second.repository = first.repository.clone();
-        second.clock = first.clock.clone();
-        second.controller = ControllerId::new("sticky-successor");
-        let release_first_drain = old.scheduler.hold_drain();
-        let renew = plain_settings().leadership.renew_interval.get();
-        let first = super::Server::prepare(first, plain_settings()).await?;
-        let second = super::Server::prepare(second, plain_settings()).await?;
-        let (stop_first, stopped_first) = super::stop_channel();
-        let (stop_second, stopped_second) = super::stop_channel();
-        let mut first = Box::pin(first.run(stopped_first, ControllerReady::channel().0));
-        assert!(futures::poll!(first.as_mut()).is_pending());
-        let mut second = Box::pin(second.run(stopped_second, ControllerReady::channel().0));
-        assert!(futures::poll!(second.as_mut()).is_pending());
-        old.clock.advance(renew);
-        let drains = old.scheduler.drains();
-        tokio::select! {
-            result = first.as_mut() => { result?; return Err("first term exited before drain".into()); },
-            () = drains.reached(1) => {}
-        }
-        assert!(futures::poll!(second.as_mut()).is_pending());
-        assert_eq!(new.scheduler.controller_runs().get(), 1);
-        let _release_second_ready = old.scheduler.hold_ready();
-        let release_second_drain = old.scheduler.hold_drain();
-        release_first_drain
-            .send(())
-            .map_err(|()| "first drain missing")?;
-        assert!(futures::poll!(first.as_mut()).is_pending());
-        assert_eq!(old.scheduler.controller_runs().get(), 2);
-        stop_first
-            .send(())
-            .map_err(|()| "old process stopped early")?;
-        assert!(futures::poll!(first.as_mut()).is_pending());
-        assert_eq!(old.scheduler.drains().get(), 2);
-        assert_eq!(old.scheduler.refusal_runs().get(), 2);
-        assert!(old.scheduler.standby_services().await.is_some());
-        release_second_drain
-            .send(())
-            .map_err(|()| "second drain missing")?;
-        first.await?;
-        stop_second
-            .send(())
-            .map_err(|()| "successor stopped early")?;
-        second.await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn stopped_refusal_flush_does_not_block_next_term_and_retirement_waits()
-    -> gang_testkit::TestResult {
-        assert_pending_refusal_continuity(false).await
-    }
-
-    #[tokio::test]
-    async fn late_queued_refusal_failure_after_new_term_is_fatal() -> gang_testkit::TestResult {
-        assert_pending_refusal_continuity(true).await
-    }
-
-    async fn assert_pending_refusal_continuity(fail: bool) -> gang_testkit::TestResult {
-        use crate::test_support::{plain_parts, plain_settings};
-        use gang_spi::{ControllerId, ControllerReady};
-        let (first, dials, old) = plain_parts();
-        let (mut second, _dials, new) = plain_parts();
-        second.repository = first.repository.clone();
-        second.clock = first.clock.clone();
-        second.controller = ControllerId::new("queued-successor");
-        let release_drain = old.scheduler.hold_drain();
-        let release_refusal = old.scheduler.hold_refusal_drain();
-        let renew = plain_settings().leadership.renew_interval.get();
-        let first = super::Server::prepare(first, plain_settings()).await?;
-        let second = super::Server::prepare(second, plain_settings()).await?;
-        let second_state = second.readiness.clone();
-        let (stop_first, stopped_first) = super::stop_channel();
-        let (stop_second, stopped_second) = super::stop_channel();
-        let mut first = Box::pin(first.run(stopped_first, ControllerReady::channel().0));
-        assert!(futures::poll!(first.as_mut()).is_pending());
-        let mut second = Box::pin(second.run(stopped_second, ControllerReady::channel().0));
-        assert!(futures::poll!(second.as_mut()).is_pending());
-        old.clock.advance(renew);
-        let drains = old.scheduler.drains();
-        tokio::select! {
-            result = first.as_mut() => { result?; return Err("old process exited before drain".into()); },
-            () = drains.reached(1) => {}
-        }
-        assert!(futures::poll!(second.as_mut()).is_pending());
-        assert!(second_state.is_leading());
-        assert_eq!(new.scheduler.controller_runs().get(), 1);
-        assert_eq!(old.scheduler.refusal_runs().get(), 1);
-        assert_next_term_intake(&old.scheduler, &dials, release_drain, first.as_mut()).await?;
-        finish_pending_refusal(&old, stop_first, release_refusal, first.as_mut(), fail).await?;
-        stop_second
-            .send(())
-            .map_err(|()| "successor stopped early")?;
-        second.await?;
-        Ok(())
-    }
-
-    async fn finish_pending_refusal(
-        old: &crate::test_support_deployment::Handles,
-        stop: tokio::sync::oneshot::Sender<()>,
-        release: tokio::sync::oneshot::Sender<()>,
-        mut run: Pin<&mut impl Future<Output = Result<(), super::ServerError>>>,
-        fail: bool,
-    ) -> gang_testkit::TestResult {
-        if fail {
-            old.scheduler.fail_refusals(true);
-            release
-                .send(())
-                .map_err(|()| "queued denial was cancelled")?;
-            assert!(matches!(run.await, Err(super::ServerError::Controller(_))));
-        } else {
-            stop.send(()).map_err(|()| "old process stopped early")?;
-            assert!(
-                futures::poll!(run.as_mut()).is_pending(),
-                "retirement must finish queued denials"
-            );
-            assert_eq!(old.scheduler.controller_runs().get(), 2);
-            release
-                .send(())
-                .map_err(|()| "queued denial was cancelled")?;
-            run.await?;
-        }
-        Ok(())
-    }
-
-    async fn assert_next_term_intake(
-        scheduler: &gang_testkit::FakeScheduler,
-        dials: &crate::test_support_deployment::Dials,
-        release_drain: tokio::sync::oneshot::Sender<()>,
-        mut run: Pin<&mut impl Future<Output = Result<(), super::ServerError>>>,
-    ) -> gang_testkit::TestResult {
-        let mut received = scheduler.connections();
-        release_drain
-            .send(())
-            .map_err(|()| "old controller was not draining")?;
-        assert!(futures::poll!(run.as_mut()).is_pending());
-        assert_eq!(scheduler.controller_runs().get(), 2);
-        assert_eq!(scheduler.refusal_runs().get(), 1);
-        let _public = dials.public.dial();
-        let _worker = dials.worker.dial();
-        assert!(futures::poll!(run.as_mut()).is_pending());
-        let first = received.try_recv()?;
-        let second = received.try_recv()?;
-        assert!(matches!(
-            (first.side, second.side),
-            (gang_testkit::Side::Public, gang_testkit::Side::Worker)
-                | (gang_testkit::Side::Worker, gang_testkit::Side::Public)
-        ));
-        Ok(())
-    }
 
     async fn assert_sigterm_snapshot_durable(
         old: &crate::test_support_deployment::Handles,
@@ -3311,6 +2310,7 @@ mod tests {
         release_drain
             .send(())
             .map_err(|()| "old controller stopped before drain release")?;
+        old.clock.advance(std::time::Duration::from_secs(1));
         assert!(matches!(
             futures::poll!(first.as_mut()),
             std::task::Poll::Ready(Ok(()))
@@ -3379,7 +2379,8 @@ mod tests {
         release_drain
             .send(())
             .map_err(|()| "old controller stopped before drain release")?;
-        assert!(futures::poll!(run.as_mut()).is_pending());
+        handles.clock.advance(std::time::Duration::from_secs(1));
+        run.await?;
         assert_eq!(
             handles
                 .repository
@@ -3393,82 +2394,6 @@ mod tests {
         Ok(())
     }
 
-    async fn assert_history_held_during_drain(
-        handles: &crate::test_support_deployment::Handles,
-        key: gang_spi::RecordKey,
-        first_version: gang_spi::RecordVersion,
-        contender: &gang_spi::ControllerId,
-    ) -> gang_testkit::TestResult {
-        use gang_clock::Clock;
-        use gang_spi::{Acquisition, ExpiringRecordPort, LeaderLeasePort};
-        use std::time::Duration;
-
-        let now = handles.clock.wall();
-        assert!(matches!(
-            handles
-                .repository
-                .acquire(
-                    &passive_candidate(contender),
-                    now,
-                    gang_clock::Timestamp::from_unix_millis(0),
-                    now + Duration::from_mins(1),
-                    gang_spi::Takeover::Observe,
-                )
-                .await?,
-            Acquisition::Held(_)
-        ));
-        assert_eq!(
-            handles
-                .repository
-                .get(&key, now)
-                .await?
-                .expect("pre-drain snapshot")
-                .version,
-            first_version
-        );
-        Ok(())
-    }
-
-    async fn assert_released_history(
-        handles: &crate::test_support_deployment::Handles,
-        history: gang_spi::LearnedHistory,
-        first_version: gang_spi::RecordVersion,
-        contender: &gang_spi::ControllerId,
-    ) -> gang_testkit::TestResult {
-        use gang_clock::Clock;
-        use gang_spi::{Acquisition, ExpiringRecordPort, LeaderLeasePort};
-        use std::num::NonZeroUsize;
-        use std::time::Duration;
-
-        let now = handles.clock.wall();
-        let final_head = handles
-            .repository
-            .get(&history.key, now)
-            .await?
-            .expect("final history head");
-        assert_ne!(final_head.version, first_version);
-        let Acquisition::Acquired(lease) = handles
-            .repository
-            .acquire(
-                &passive_candidate(contender),
-                now,
-                gang_clock::Timestamp::from_unix_millis(0),
-                now + Duration::from_mins(1),
-                gang_spi::Takeover::Observe,
-            )
-            .await?
-        else {
-            panic!("lease was not released after final flush");
-        };
-        let mut store =
-            super::LearnedHistoryStore::new(NonZeroUsize::new(1024).expect("nonzero bound"));
-        let mut loaded = Vec::new();
-        store
-            .load(&handles.repository, &lease, now, &mut loaded)
-            .await?;
-        assert_eq!(loaded, vec![history]);
-        Ok(())
-    }
 
     #[tokio::test]
     async fn slow_flush_does_not_extend_the_next_interval() -> gang_testkit::TestResult {
@@ -3545,7 +2470,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restoration_retry_keeps_the_term_batch_sequence() -> gang_testkit::TestResult {
+    async fn readonly_preparation_retry_preserves_activation_and_flush_sequences() -> gang_testkit::TestResult {
         use gang_clock::Clock;
         use gang_spi::{
             Acquisition, ApplyRecords, ControllerId, ControllerReady, ExpiringRecordPort,
@@ -3615,7 +2540,7 @@ mod tests {
                 )
                 .await?,
             ApplyRecords::Fenced,
-            "failed load must consume a sequence number",
+            "activation, reconciliation and flush must use distinct ordered batches",
         );
         Ok(())
     }

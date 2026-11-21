@@ -22,12 +22,10 @@ in {
       User = "gang";
       Group = "gang";
       ExecStart = "${gang}/bin/gang server --config /etc/gang/gang.toml";
-      Restart = "on-failure";
-      # 4: gang's shutdown deadline elapsed (crates/gang-main/src/server_command.rs); a retiring controller stays stopped.
-      RestartPreventExitStatus = 4;
+      Restart = "always";
       RestartSec = 5;
       LimitNOFILE = 1048576;
-      # Gang bounds the whole post-signal path; the unit cannot know runtime shutdown_grace.
+      # Gang controls the complete handover; systemd must not interrupt it.
       TimeoutStopSec = "infinity";
 
       # Hardening. The controller needs no bubblewrap; it only needs the

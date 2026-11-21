@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use gang_clock::{Clock, SystemClock};
+use gang_clock::SystemClock;
 use gang_config::{
     AuthenticationConfig, DashboardConfig, GangConfig, IdentityConfig, PluginSet, ServerConfig,
     Transport,
@@ -14,12 +14,11 @@ use gang_config::{
 use gang_nativelink::{NativeLink, NativeLinkConfig};
 use gang_server::{
     DeviceSettings, HandshakeSettings, Listeners, LoginSettings, Parts, Provider, Providers,
-    PublicEndpoint, RequestLimits, Server, ServerError, ServerSettings, TlsSettings,
+    PublicEndpoint, RequestLimits, Server, ServerSettings, TlsSettings,
     TransportSettings,
 };
 use gang_spi::{
-    ControllerHostPort, ControllerId, ControllerReady, HostMilestone, LoginClient, PluginContext,
-    PortError,
+    ControllerHostPort, ControllerId, ControllerReady, LoginClient, PluginContext, PortError,
 };
 use gang_types::announcement::{Announcement, ListenerRole};
 use gang_types::{Isa, NonZeroDuration, ProviderName, Url};
@@ -34,9 +33,6 @@ use crate::plugins::{
     Cache, ClientAuthentication, Database, IdentityProvider, Plugins, Provisioner, Signer,
     WorkerAuthentication,
 };
-/// The shutdown deadline elapsed; service managers must not restart a retiring controller. Distinct
-/// from every other exit status (2 is usage, 3 a blocked deploy), so the unit can single it out.
-const SHUTDOWN_DEADLINE_EXIT_CODE: u8 = 4;
 
 /// The configuration section of one identity provider plugin.
 type ProviderConfig = <Plugins as PluginSet>::IdentityProvider;
@@ -86,22 +82,9 @@ pub(crate) fn run(config: &Path, out: &Output) -> Result<ExitCode> {
         .map_err(MainError::Runtime)?;
     let result = runtime.block_on(serve(loaded, out));
     runtime.shutdown_timeout(std::time::Duration::ZERO);
-    shutdown_exit_status(result)
+    result
 }
 
-fn shutdown_exit_status(result: Result<ExitCode>) -> Result<ExitCode> {
-    match result {
-        Err(MainError::ShutdownTimedOut(error)) => {
-            tracing::error!(%error, "shutdown deadline elapsed");
-            Ok(ExitCode::from(SHUTDOWN_DEADLINE_EXIT_CODE))
-        }
-        Err(MainError::Server(ServerError::HandoffTimedOut(error))) => {
-            tracing::error!(%error, "handoff deadline elapsed");
-            Ok(ExitCode::from(SHUTDOWN_DEADLINE_EXIT_CODE))
-        }
-        other => other,
-    }
-}
 
 /// Builds the server from `loaded`, announces how it is reached once ready, and runs it until
 /// shutdown.
@@ -172,6 +155,7 @@ async fn serve_prepared(
         database,
         dashboard,
         builds,
+        worker,
         ..
     } = config;
     let context = PluginContext { config_path: &path };
@@ -183,7 +167,6 @@ async fn serve_prepared(
     let endpoint = resolve_public_endpoint(endpoint, server.transport.kind(), public_address)?;
     let derived_worker_endpoint = server.transport.kind().worker_url(worker_address)?;
     let worker_endpoint = resolve_worker_endpoint(worker_endpoint, derived_worker_endpoint);
-    let grace = server.http2.shutdown_grace;
 
     let provisioner_name = provisioner.key();
     let fleet = Arc::new(Provisioner::build(provisioner, &context)?);
@@ -194,13 +177,13 @@ async fn serve_prepared(
     let repository = Database::build(database, &context)?;
     let (clients, workers) = build_authentication(authentication, &context)?;
     let providers = identity_providers(identity, &context)?;
-    let lead = server.leadership.clone();
-    let backstop = shutdown_backstop(
-        grace,
-        actions.history_flush_interval.get(),
-        &lead,
-        server.request_timeout.get(),
-    );
+    let attempt_budget = worker.attempt_budget(actions.timeout);
+    if let Some(limit) = fleet.drain_limit().await.map_err(MainError::Scheduler)?
+        && attempt_budget > limit {
+        return Err(MainError::Scheduler(PortError::config(format!(
+            "configured whole-attempt budget {attempt_budget:?} exceeds the controller lifecycle hook limit {limit:?}"
+        ))));
+    }
     let clock = Arc::new(SystemClock::new());
 
     let settings = server_settings(
@@ -208,7 +191,7 @@ async fn serve_prepared(
             actions: Arc::new(actions),
             scaling: Arc::new(scaling),
             poll_interval,
-            handoff_timeout: backstop,
+            attempt_budget,
             client_action_timeout,
             default_isa,
             endpoint: endpoint.clone(),
@@ -246,9 +229,8 @@ async fn serve_prepared(
         endpoint,
         (public_address, Some(worker_address), health_address),
     );
-    let args = (fleet, out, &notes[..], (&*clock, &lead, backstop));
     let _ = prepared.send(());
-    Box::pin(run_announced(server, shutdown, args)).await?;
+    Box::pin(run_announced(server, shutdown, out, &notes)).await?;
 
     Ok(ExitCode::SUCCESS)
 }
@@ -280,20 +262,6 @@ async fn bind_health(
     Ok((listener, bound))
 }
 
-fn shutdown_backstop(
-    grace: std::time::Duration,
-    history_flush_interval: std::time::Duration,
-    leadership: &gang_config::LeadershipConfig,
-    request_timeout: std::time::Duration,
-) -> std::time::Duration {
-    // Deployment defaults: 30s history + 3s release + 10s milestone + 30s request = 73s,
-    // below the lifecycle hook's 120s margin above shutdown_grace.
-    grace
-        .saturating_add(history_flush_interval)
-        .saturating_add(leadership.renew_interval.get())
-        .saturating_add(leadership.ttl.get())
-        .saturating_add(request_timeout)
-}
 
 fn server_announcements(
     server: &Server<GangDeployment>,
@@ -323,110 +291,18 @@ async fn bind_listeners(
 async fn run_announced(
     server: Server<GangDeployment>,
     shutdown: impl Future<Output = ()> + Send + 'static,
-    (fleet, out, announcements, (clock, leadership, shutdown_grace)): (
-        Arc<Provisioner>,
-        &Output,
-        &[Announcement],
-        (
-            &impl Clock,
-            &gang_config::LeadershipConfig,
-            std::time::Duration,
-        ),
-    ),
+    out: &Output,
+    announcements: &[Announcement],
 ) -> Result<()> {
     let (ready, readiness) = ControllerReady::channel();
-    let retiring_fleet = Arc::clone(&fleet);
-    let (stop, stopped) = oneshot::channel::<()>();
-    let shutdown = async move {
-        shutdown_when(shutdown, retiring_fleet.retiring()).await;
-        let _ = stop.send(());
-    };
     let announced = async {
         Box::pin(announce_when_ready(readiness, out, announcements)).await?;
         std::future::pending::<Result<()>>().await
     };
-    let work = async {
-        let result = tokio::select! {
-            biased;
-            result = announced => return result,
-            result = Box::pin(server.run(async { let _ = stopped.await; }, ready)) => result,
-        };
-        if matches!(&result, Ok(()) | Err(ServerError::LeadershipLost))
-            && let Err(error) = report_milestone(
-                fleet.as_ref(),
-                HostMilestone::HandedOff,
-                clock,
-                leadership.renew_interval.get(),
-                leadership.ttl.get(),
-            )
-            .await
-        {
-            tracing::warn!(%error, "failed to report handoff milestone");
-        }
-        result.map_err(Into::into)
-    };
-    bound_after_shutdown(clock, shutdown, work, shutdown_grace)
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, "controller shutdown deadline elapsed");
-            MainError::ShutdownTimedOut(error)
-        })?
-}
-
-/// Runs the shutdown sequence under one deadline measured from the stop signal.
-async fn bound_after_shutdown<C: Clock, T>(
-    clock: &C,
-    shutdown: impl Future<Output = ()>,
-    work: impl Future<Output = T>,
-    grace: std::time::Duration,
-) -> std::result::Result<T, gang_clock::Elapsed> {
-    tokio::pin!(shutdown, work);
     tokio::select! {
         biased;
-        () = &mut shutdown => clock.timeout(grace, work).await,
-        result = &mut work => Ok(result),
-    }
-}
-
-/// Reports a milestone within one lease lifetime, retrying transient failures.
-async fn report_milestone<H: ControllerHostPort, C: Clock>(
-    host: &H,
-    milestone: HostMilestone,
-    clock: &C,
-    interval: std::time::Duration,
-    bound: std::time::Duration,
-) -> std::result::Result<(), PortError> {
-    clock
-        .timeout(bound, async {
-            loop {
-                match host.reached(milestone).await {
-                    Ok(()) => return Ok(()),
-                    Err(error @ PortError::Unavailable(_)) => {
-                        tracing::warn!(%error, ?milestone, "failed to report milestone; retrying");
-                    }
-                    Err(error) => return Err(error),
-                }
-                clock.sleep(interval).await;
-            }
-        })
-        .await
-        .map_err(PortError::unavailable)?
-}
-
-/// Stops for a signal or retirement, but keeps waiting for a signal if retirement fails.
-async fn shutdown_when(
-    signal: impl Future<Output = ()>,
-    retiring: impl Future<Output = std::result::Result<(), PortError>>,
-) {
-    let retirement = async {
-        if let Err(error) = retiring.await {
-            tracing::warn!(%error, "failed to query host retirement");
-            std::future::pending::<()>().await;
-        }
-    };
-    tokio::select! {
-        () = signal => {}
-        () = retirement => {}
+        result = announced => result,
+        result = Box::pin(server.run(shutdown, ready)) => result.map_err(Into::into),
     }
 }
 
@@ -441,8 +317,8 @@ struct SettingsSource {
     poll_interval: NonZeroDuration,
     /// How long a client action may take before it is timed out.
     client_action_timeout: NonZeroDuration,
-    /// The shutdown backstop also bounds a voluntary handoff.
-    handoff_timeout: std::time::Duration,
+    /// Budget computed from the configured worker, not adapter defaults.
+    attempt_budget: std::time::Duration,
     /// The interface standard the server's default isa is.
     default_isa: Isa,
     /// The endpoint clients reach the public listener at.
@@ -478,8 +354,7 @@ fn server_settings(source: SettingsSource, server: ServerConfig) -> Result<Serve
         rate_limit: server.rate_limit,
         principal_seen_interval: server.principal_seen_interval,
         leadership: server.leadership,
-        standby_routability_delay: server.standby_routability_delay,
-        handoff_timeout: source.handoff_timeout,
+        attempt_budget: source.attempt_budget,
         revocation_refresh_interval: server.revocation_refresh_interval,
         max_tracked_principals: server.max_tracked_principals,
         accept_error_backoff: server.accept_error_backoff,
@@ -647,148 +522,6 @@ mod tests {
         Ok(())
     }
 
-    struct RetryHost(std::sync::atomic::AtomicUsize, HostMilestone);
-
-    impl ControllerHostPort for RetryHost {
-        async fn incarnation(
-            &self,
-        ) -> std::result::Result<gang_spi::ControllerHostIdentity, PortError> {
-            Ok(gang_spi::ControllerHostIdentity::Persistent(
-                gang_types::InstanceId::try_new("retry-host").map_err(PortError::config)?,
-            ))
-        }
-
-        async fn retiring(&self) -> std::result::Result<(), PortError> {
-            std::future::pending().await
-        }
-
-        async fn reached(&self, milestone: HostMilestone) -> std::result::Result<(), PortError> {
-            assert_eq!(milestone, self.1);
-            if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                Err(PortError::unavailable("temporary"))
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn handoff_milestone_retries_a_transient_failure() {
-        let host = RetryHost(
-            std::sync::atomic::AtomicUsize::new(0),
-            HostMilestone::HandedOff,
-        );
-        let clock = gang_clock::TestClock::default();
-        let report = report_milestone(
-            &host,
-            HostMilestone::HandedOff,
-            &clock,
-            std::time::Duration::from_secs(1),
-            std::time::Duration::from_secs(3),
-        );
-        tokio::pin!(report);
-        assert!(
-            std::future::poll_fn(|cx| std::task::Poll::Ready(report.as_mut().poll(cx)))
-                .await
-                .is_pending()
-        );
-        clock.advance(std::time::Duration::from_secs(1));
-        assert!(matches!(
-            std::future::poll_fn(|cx| std::task::Poll::Ready(report.as_mut().poll(cx))).await,
-            std::task::Poll::Ready(Ok(()))
-        ));
-        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 2);
-    }
-
-    struct RefusingHost;
-
-    impl ControllerHostPort for RefusingHost {
-        async fn incarnation(
-            &self,
-        ) -> std::result::Result<gang_spi::ControllerHostIdentity, PortError> {
-            Ok(gang_spi::ControllerHostIdentity::Persistent(
-                gang_types::InstanceId::try_new("refusing-host").map_err(PortError::config)?,
-            ))
-        }
-
-        async fn retiring(&self) -> std::result::Result<(), PortError> {
-            std::future::pending().await
-        }
-
-        async fn reached(&self, _milestone: HostMilestone) -> std::result::Result<(), PortError> {
-            Err(PortError::backend("permanent"))
-        }
-    }
-
-    #[tokio::test]
-    async fn permanent_milestone_failure_is_not_retried() {
-        let clock = gang_clock::TestClock::default();
-        let result = report_milestone(
-            &RefusingHost,
-            HostMilestone::HandedOff,
-            &clock,
-            std::time::Duration::from_secs(1),
-            std::time::Duration::from_secs(3),
-        )
-        .await;
-        assert!(matches!(result, Err(PortError::Backend(_))));
-    }
-
-    #[tokio::test]
-    async fn full_drain_still_reports_handoff() {
-        let clock = gang_clock::TestClock::default();
-        let grace = std::time::Duration::from_secs(5);
-        let reported = std::cell::Cell::new(false);
-        let work = async {
-            clock.sleep(std::time::Duration::from_secs(1)).await;
-            clock.sleep(grace).await;
-            clock.sleep(std::time::Duration::from_secs(61)).await;
-            reported.set(true);
-        };
-        let deadline = shutdown_backstop(
-            grace,
-            std::time::Duration::from_secs(61),
-            &gang_config::LeadershipConfig::default(),
-            std::time::Duration::from_secs(30),
-        );
-        let run = bound_after_shutdown(&clock, std::future::ready(()), work, deadline);
-        tokio::pin!(run);
-        assert!(
-            std::future::poll_fn(|cx| std::task::Poll::Ready(run.as_mut().poll(cx)))
-                .await
-                .is_pending()
-        );
-        clock.advance(std::time::Duration::from_secs(1));
-        assert!(
-            std::future::poll_fn(|cx| std::task::Poll::Ready(run.as_mut().poll(cx)))
-                .await
-                .is_pending()
-        );
-        clock.advance(std::time::Duration::from_secs(4));
-        assert!(
-            std::future::poll_fn(|cx| std::task::Poll::Ready(run.as_mut().poll(cx)))
-                .await
-                .is_pending()
-        );
-        clock.advance(std::time::Duration::from_secs(1));
-        assert!(
-            std::future::poll_fn(|cx| std::task::Poll::Ready(run.as_mut().poll(cx)))
-                .await
-                .is_pending()
-        );
-        clock.advance(std::time::Duration::from_mins(1));
-        assert!(
-            std::future::poll_fn(|cx| std::task::Poll::Ready(run.as_mut().poll(cx)))
-                .await
-                .is_pending()
-        );
-        clock.advance(std::time::Duration::from_secs(1));
-        assert!(matches!(
-            std::future::poll_fn(|cx| std::task::Poll::Ready(run.as_mut().poll(cx))).await,
-            std::task::Poll::Ready(Ok(()))
-        ));
-        assert!(reported.get());
-    }
 
     #[tokio::test]
     async fn signal_during_preparation_exits_successfully() {
@@ -805,77 +538,6 @@ mod tests {
         drop(prepared);
     }
 
-    #[tokio::test]
-    async fn shutdown_deadline_cuts_off_a_hung_handoff() -> TestResult {
-        let clock = gang_clock::TestClock::default();
-        let bound = shutdown_backstop(
-            std::time::Duration::from_secs(5),
-            std::time::Duration::from_secs(61),
-            &gang_config::LeadershipConfig::default(),
-            std::time::Duration::from_secs(30),
-        );
-        let run = bound_after_shutdown(
-            &clock,
-            std::future::ready(()),
-            std::future::pending::<()>(),
-            bound,
-        );
-        tokio::pin!(run);
-        assert!(
-            std::future::poll_fn(|cx| std::task::Poll::Ready(run.as_mut().poll(cx)))
-                .await
-                .is_pending()
-        );
-        clock.advance(bound);
-        let std::task::Poll::Ready(Err(error)) =
-            std::future::poll_fn(|cx| std::task::Poll::Ready(run.as_mut().poll(cx))).await
-        else {
-            panic!("hung handoff did not reach its deadline");
-        };
-        assert_eq!(
-            shutdown_exit_status(Err(MainError::ShutdownTimedOut(error)))?,
-            ExitCode::from(SHUTDOWN_DEADLINE_EXIT_CODE)
-        );
-        assert_eq!(
-            shutdown_exit_status(Err(MainError::Server(ServerError::HandoffTimedOut(
-                gang_clock::Elapsed,
-            ))))?,
-            ExitCode::from(SHUTDOWN_DEADLINE_EXIT_CODE)
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn shutdown_completes_on_a_signal() -> TestResult {
-        shutdown_when(std::future::ready(()), std::future::pending()).await;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn shutdown_completes_on_retirement() -> TestResult {
-        shutdown_when(std::future::pending(), std::future::ready(Ok(()))).await;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn failed_retirement_waits_for_a_signal() -> TestResult {
-        let (send, receive) = oneshot::channel();
-        let shutdown = shutdown_when(
-            async {
-                let _ = receive.await;
-            },
-            std::future::ready(Err(PortError::unavailable("retirement failed"))),
-        );
-        tokio::pin!(shutdown);
-        let pending = std::future::poll_fn(|cx| {
-            std::task::Poll::Ready(shutdown.as_mut().poll(cx).is_pending())
-        })
-        .await;
-        assert!(pending);
-        assert!(send.send(()).is_ok());
-        shutdown.await;
-        Ok(())
-    }
 
     /// A controller that fails before readiness produces no startup announcements.
     #[tokio::test]
@@ -983,7 +645,7 @@ mod tests {
     #[test]
     fn server_settings_preserve_leadership() -> TestResult {
         let server: ServerConfig = toml::from_str(
-            "transport = 'plaintext'\nstandby_routability_delay = '10s'\nrevocation_refresh_interval = '7s'\n[leadership]\nttl = '20s'\nrenew_interval = '4s'\nclock_skew = '1s'\n",
+            "transport = 'plaintext'\nrevocation_refresh_interval = '7s'\n[leadership]\nttl = '20s'\nrenew_interval = '1s'\nclock_skew = '1s'\n",
         )?;
         let leadership = server.leadership.clone();
         let refresh = server.revocation_refresh_interval;
@@ -998,7 +660,7 @@ mod tests {
                 scaling: Arc::clone(&scaling),
                 poll_interval: NonZeroDuration::from_secs(1),
                 client_action_timeout: NonZeroDuration::from_secs(1),
-                handoff_timeout: std::time::Duration::from_secs(47),
+                attempt_budget: std::time::Duration::from_secs(47),
                 default_isa: Isa::X86_64,
                 endpoint: Url::parse("http://127.0.0.1:8080")?,
                 transport: transport_settings(&server),
@@ -1013,11 +675,7 @@ mod tests {
         assert!(Arc::ptr_eq(&settings.scaling, &scaling));
         assert_eq!(settings.leadership, leadership);
         assert_eq!(settings.revocation_refresh_interval, refresh);
-        assert_eq!(
-            settings.standby_routability_delay,
-            std::time::Duration::from_secs(10)
-        );
-        assert_eq!(settings.handoff_timeout, std::time::Duration::from_secs(47));
+        assert_eq!(settings.attempt_budget, std::time::Duration::from_secs(47));
         Ok(())
     }
 

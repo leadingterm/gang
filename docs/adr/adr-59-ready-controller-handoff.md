@@ -1,24 +1,29 @@
-# ADR-59: Cooperatively hand leadership to a routable newer controller
+# ADR-59: Cooperatively hand leadership to a prepared newer controller
 
 ## Status
 
-Accepted. Builds on ADR-44 and ADR-52: voluntary handoff no longer requires the leader process to exit, and lease rows coordinate successor priority as well as the existing epoch fence.
+Accepted, amended: restart-stable host priority and cooperative yield remain; routability warmup, healthy contenders, standby shared services and same-process return to standby are superseded. Builds on ADR-44 and ADR-52.
 
 ## Context
 
-A replacement must be reachable before the current leader stops admitting work. Terminating the leader first leaves a gap while the replacement becomes healthy, but allowing a newer controller to seize a live lease risks overlapping authority. Process registration order is not host age: if replacement B registers after host A, then A crashes and restarts, a fresh process counter would rank A above B and reverse the handoff.
+A replacement must take authority without overlapping provisioner mutations or waiting for a termination notification that can arrive after deregistration. Process registration order is not host age: restarting an older host must not rank it above its replacement.
 
 ## Decision
 
-A prepared newer contender requests a cooperative handoff only after it has become routable. Priority belongs to the host, not the process: AWS uses immutable launch time and instance ID, while other hosts retain their first durable registration order. The holder identity is fresh per process and remains fenced by the lease. The existing leader yields safely, and the same process returns to standby for a later term. The protocol and deployment timing are specified in [the specification](../SPECIFICATION.md#5-autoscaler-state--restart).
+A prepared newer contender requests cooperative yield without waiting for load-balancer routability. Priority belongs to the host, not the process: AWS uses immutable launch time and instance ID, while other hosts retain their first durable registration order. A fresh holder identity and lease epoch fence authority; no contender steals a live lease. The outgoing process drains its own admitted work, then exits. The protocol is specified in [the specification](../SPECIFICATION.md#5-autoscaler-state--restart).
+
+NativeLink transport readiness alone is not takeover readiness. Complete readonly history loading and import, post-import fingerprints, and revocation/dashboard reload precede `Prepared`, which registers this instance in its ASG target groups and observes registration complete while the launch hook is pending and health is 503. Only then may it request yield and acquire; `Serving` completes the launch hook after fenced activation and promotion in the final call budget. Preregistration removes registration propagation from the switch window, which still includes subsequent health detection. The engine starts from that pre-request snapshot and its own learning; late old-engine learning may wait until the next import. Periodic persistence reconciles canonical metadata without overwriting newer or deleted heads with unchanged prepared values or resetting the live engine.
 
 ## Consequences
 
-Rolling replacement can transfer leadership before the old instance retires. A prepared controller serves real shared services before promotion and through drain and yield; readiness can identify a routable contender that still refuses leader-only work. Leadership refusals retire HTTP/2 connections gracefully, including previously used connections, while admitted streams drain; see [the specification](../SPECIFICATION.md#61-gang-server-listeners). Voluntary yield, including a takeover request during shutdown drain, snapshots learned history before release rather than waiting for stream drain; measurements arriving after release are dropped, so the last moments before handover may be lost. Without such a request, shutdown retains the lease through drain and the final flush. A blocked mutation can delay handoff rather than compromise fencing.
+Only the active lease holder is healthy and admits fresh services. GOAWAY and marked refusals move never-started requests, not executing attempts, to the successor. Old workers and admitted streams remain with the old scheduler until terminal or their dispatch-stamped deadlines; expiring protection prevents the successor from treating old busy workers as free or terminating them. Crashes retain retry and possible re-execution, not scheduler reattachment. systemd restarts a drained process as a fresh passive process on the old host; a retiring host cannot reacquire.
+
+The ASG's `OldestInstance` policy aligns ordinary scale-in with newest-host leadership. Refresh cannot retire the old holder before dispatch freezes, preserving the lifecycle-hook budget for drain. The outgoing listener refuses fresh requests until actual nonrouting in every target group, not merely successor health.
+
+AWS keeps established flows alive with both [deregistration](https://docs.aws.amazon.com/elasticloadbalancing/latest/network/edit-target-group-attributes.html#deregistration-delay) and [unhealthy-target](https://docs.aws.amazon.com/elasticloadbalancing/latest/network/edit-target-group-attributes.html#unhealthy-target-connection-termination) connection termination disabled, not by sizing deregistration delay to an action. Lifecycle heartbeats are subject to the [global limit](https://docs.aws.amazon.com/autoscaling/ec2/userguide/lifecycle-hooks.html#lifecycle-hook-considerations), the lesser of 48 hours and 100 times the hook heartbeat timeout.
 
 ## Rejected alternatives
 
-- **Terminate the leader before promoting the replacement:** creates an avoidable routing gap.
+- **Wait for a healthy contender:** routes fresh traffic to a controller that cannot admit it and delays yield.
 - **Steal a live lease:** risks overlapping provisioner authority.
-- **Keep every prepared standby healthy:** routes traffic to passive controllers without a pending takeover.
 - **Rank each process by registration order:** a restarted old host would outrank its replacement.

@@ -596,12 +596,6 @@ run "invalid_controller_count" {
   expect_failures = [var.controller_count]
 }
 
-run "invalid_shutdown_grace" {
-  command = plan
-  variables { shutdown_grace_seconds = 3481 }
-  expect_failures = [var.shutdown_grace_seconds]
-}
-
 run "invalid_table_arn" {
   command = plan
   variables { dynamodb_table_arn = "not-an-arn" }
@@ -635,7 +629,6 @@ run "group_uses_ec2_health_for_refresh" {
     target_group_arns      = ["arn:aws:elasticloadbalancing:eu-north-1:000000000000:targetgroup/serve/0123456789abcdef"]
     config_digest          = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     dynamodb_table_arn     = "arn:aws:dynamodb:eu-north-1:000000000000:table/gang"
-    shutdown_grace_seconds = 300
   }
   assert {
     condition     = aws_autoscaling_group.controller[0].health_check_type == "EC2"

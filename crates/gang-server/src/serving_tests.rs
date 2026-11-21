@@ -405,7 +405,7 @@ async fn worker_gate_refuses_certificates_issued_to_other_providers() {
             };
             let mut parts = request_parts(GET_SERVER.template, None);
             let refused = controller
-                .admit_worker(gang_spi::RequestScope::Shared, &peer, &mut parts)
+                .admit_worker(gang_spi::RequestScope::Controller, &peer, &mut parts)
                 .await;
             assert!(
                 matches!(
@@ -440,7 +440,7 @@ async fn worker_gate_refuses_a_certificate_missing_from_the_ledger() {
         };
         let mut parts = request_parts(GET_SERVER.template, None);
         let refused = controller
-            .admit_worker(gang_spi::RequestScope::Shared, &peer, &mut parts)
+            .admit_worker(gang_spi::RequestScope::Controller, &peer, &mut parts)
             .await;
         assert!(
             matches!(
@@ -708,7 +708,7 @@ async fn public_listener_refuses_a_revoked_principal() {
             "a revoked principal authenticates no caller"
         );
         let mut after = request_parts(GET_SERVER.template, Some(&alice));
-        controller.admit_public(gang_spi::RequestScope::Shared, &Peer::default(), &mut after)
+        controller.admit_public(gang_spi::RequestScope::Controller, &Peer::default(), &mut after)
             .await
             .expect("the public gate admits open paths and records the refusal");
         let caller = Caller::of(&after.extensions);
@@ -958,7 +958,7 @@ async fn worker_gate_admits_a_ledgered_certificate_and_refuses_an_unknown_one() 
         };
         let mut known_parts = request_parts(GET_SERVER.template, None);
         controller
-            .admit_worker(gang_spi::RequestScope::Shared, &known, &mut known_parts)
+            .admit_worker(gang_spi::RequestScope::Controller, &known, &mut known_parts)
             .await
             .expect("a worker certificate in the ledger is admitted");
         let stranger = Peer {
@@ -968,7 +968,7 @@ async fn worker_gate_admits_a_ledgered_certificate_and_refuses_an_unknown_one() 
         let mut stranger_parts = request_parts(GET_SERVER.template, None);
         let refused = controller
             .admit_worker(
-                gang_spi::RequestScope::Shared,
+                gang_spi::RequestScope::Controller,
                 &stranger,
                 &mut stranger_parts,
             )
@@ -1027,7 +1027,7 @@ async fn promotion_reloads_principals_revoked_after_prepare() {
             matches!(
                 controller
                     .admit_public(
-                        gang_spi::RequestScope::Leader,
+                        gang_spi::RequestScope::Controller,
                         &Peer::default(),
                         &mut leader,
                     )
@@ -1061,6 +1061,7 @@ async fn promotion_reloads_principals_revoked_after_prepare() {
 async fn promotion_fails_closed_when_revocations_cannot_be_reloaded() {
     for fail_principals in [true, false] {
         let (parts, _dials, handles) = tls_parts();
+        let host = parts.provisioner.clone();
         let release_ready = handles.scheduler.hold_ready();
         let mut settings = tls_settings();
         settings.dashboard.enabled = false;
@@ -1083,7 +1084,7 @@ async fn promotion_fails_closed_when_revocations_cannot_be_reloaded() {
                 assert!(matches!(
                     controller
                         .admit_public(
-                            gang_spi::RequestScope::Leader,
+                            gang_spi::RequestScope::Controller,
                             &Peer::default(),
                             &mut leader,
                         )
@@ -1094,8 +1095,11 @@ async fn promotion_fails_closed_when_revocations_cannot_be_reloaded() {
             });
         assert!(
             matches!(result, Err(ServerError::Revocations(_))),
-            "promotion fails on the revocation read: {result:?}"
+            "takeover preparation fails on the revocation read: {result:?}"
         );
+        assert!(!host.milestones().iter().any(|milestone| matches!(milestone,
+            gang_spi::HostMilestone::Prepared | gang_spi::HostMilestone::Serving)),
+            "authorization preparation must finish before routing registration or launch completion");
         assert_eq!(
             handles.scheduler.snapshots().get(),
             0,

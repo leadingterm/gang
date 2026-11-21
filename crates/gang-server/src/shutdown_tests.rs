@@ -108,6 +108,7 @@ async fn no_control_pass_starts_while_the_controller_drains() {
     );
 
     release.send(()).expect("the controller waits on the hold");
+    handles.clock.advance(plain_settings().leadership.renew_interval.get());
     let result = run.await;
     assert!(result.is_ok(), "run returns Ok after shutdown: {result:?}");
 }

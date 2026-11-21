@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use gang_clock::Clock;
 use gang_spi::{
-    Acquisition, CandidateGeneration, ControllerHostPort, ControllerId, ControllerReady,
+    Acquisition, CandidateGeneration, ControllerId, ControllerReady,
     HostMilestone, LeaderLeasePort, LeaseCandidate, Peer, SchedulerSnapshot, Takeover,
 };
 use gang_testkit::{Side, TestResult};
@@ -76,93 +76,40 @@ async fn shutdown_during_initial_preparation_skips_standby() -> TestResult {
         .ok_or("controller missing")?;
     stop.send(()).map_err(|()| "server stopped early")?;
     run.await??;
-    assert_eq!(handles.scheduler.refusal_runs().get(), 0);
+    assert_eq!(handles.scheduler.controller_runs().get(), 1);
     Ok(())
 }
 
+
 #[tokio::test]
-async fn same_turn_ready_and_shutdown_starts_standby_while_draining() -> TestResult {
+async fn unpromoted_controller_refuses_public_and_worker_store_requests() -> TestResult {
     let (parts, _dials, handles) = plain_parts();
-    let release_ready = handles.scheduler.hold_ready();
-    let release_drain = handles.scheduler.hold_drain();
-    let server = Server::prepare(parts, plain_settings()).await?;
-    let (stop, stopped) = oneshot::channel::<()>();
-    let (ready, _prepared) = ControllerReady::channel();
-    let run = tokio::spawn(server.run(
-        async {
-            let _ = stopped.await;
-        },
-        ready,
-    ));
-    handles
-        .scheduler
-        .controller()
-        .await
-        .ok_or("controller missing")?;
-    release_ready
-        .send(())
-        .map_err(|()| "ready hold was dropped")?;
-    stop.send(()).map_err(|()| "server stopped early")?;
-    handles.scheduler.drains().reached(1).await;
-    handles.scheduler.refusal_runs().reached(1).await;
-    assert!(handles.scheduler.standby_services().await.is_some());
-    assert!(!run.is_finished());
-    release_drain
-        .send(())
-        .map_err(|()| "drain hold was dropped")?;
-    run.await??;
-    Ok(())
-}
-
-#[tokio::test]
-async fn unpromoted_controller_mints_and_authenticates_real_bearer() -> TestResult {
-    let (parts, _dials, handles) = crate::test_support::tls_parts();
-    handles.verifier.accept("alice-proof", "alice");
     let now = handles.clock.wall();
-    let Acquisition::Acquired(old_lease) = handles
-        .repository
-        .acquire(
-            &LeaseCandidate {
-                holder: ControllerId::new("old-controller"),
-                priority: gang_spi::CandidatePriority::registered(CandidateGeneration::new(0)),
-            },
-            now,
-            now,
-            now + Duration::from_mins(1),
-            Takeover::Observe,
-        )
-        .await?
-    else {
+    let Acquisition::Acquired(old_lease) = handles.repository.acquire(
+        &LeaseCandidate {
+            holder: ControllerId::new("old-controller"),
+            priority: gang_spi::CandidatePriority::registered(CandidateGeneration::new(0)),
+        },
+        now, now, now + Duration::from_mins(1), Takeover::Observe,
+    ).await? else {
         return Err("old lease was not acquired".into());
     };
-    let server = Server::prepare(parts, crate::test_support::tls_settings()).await?;
+    let server = Server::prepare(parts, plain_settings()).await?;
     let (stop, stopped) = oneshot::channel::<()>();
     let (ready, prepared) = ControllerReady::channel();
-    let run = tokio::spawn(server.run(
-        async {
-            let _ = stopped.await;
-        },
-        ready,
-    ));
+    let run = tokio::spawn(server.run(async { let _ = stopped.await; }, ready));
     prepared.await?;
-    let controller = handles
-        .scheduler
-        .controller()
-        .await
-        .ok_or("controller missing")?;
-    let mut leader = api_request("POST", "/execute", None, None).into_parts().0;
+    let controller = handles.scheduler.controller().await.ok_or("controller missing")?;
+    let mut public = api_request("POST", "/execute", None, None).into_parts().0;
     assert!(matches!(
-        controller
-            .admit_public(
-                gang_spi::RequestScope::Leader,
-                &Peer::default(),
-                &mut leader
-            )
-            .await,
+        controller.admit_public(gang_spi::RequestScope::Controller, &Peer::default(), &mut public).await,
         Ok(gang_spi::GateDecision::NotLeading)
     ));
-    let token = crate::test_support::mint_token(&controller, "example-idp", "alice-proof").await;
-    assert!(crate::test_support::admits(&controller, &token).await);
+    let mut store = api_request("POST", "/store", None, None).into_parts().0;
+    assert!(matches!(
+        controller.admit_worker(gang_spi::RequestScope::WorkerStore, &Peer::default(), &mut store).await,
+        Ok(gang_spi::GateDecision::NotLeading)
+    ));
     stop.send(()).map_err(|()| "server stopped early")?;
     run.await??;
     handles.repository.release(&old_lease).await?;
@@ -170,10 +117,57 @@ async fn unpromoted_controller_mints_and_authenticates_real_bearer() -> TestResu
 }
 
 #[tokio::test]
-async fn replacement_serves_before_legacy_leader_hands_off() -> TestResult {
+async fn prepared_milestone_precedes_takeover_and_serving() -> TestResult {
+    let (first, _, old) = plain_parts();
+    let (mut second, _, new) = plain_parts();
+    second.repository = first.repository.clone();
+    second.clock = first.clock.clone();
+    second.controller = ControllerId::new("prepared-successor");
+    let host = second.provisioner.clone();
+    let release_prepared = host.hold_prepared();
+    let interval = plain_settings().leadership.renew_interval.get();
+    let (old_health, old_dial) = crate::test_support_memory::memory_listener();
+    let (new_health, new_dial) = crate::test_support_memory::memory_listener();
+    let first = Server::prepare(first, plain_settings()).await?.with_health(Some(old_health));
+    let second = Server::prepare(second, plain_settings()).await?.with_health(Some(new_health));
+    let (stop_old, stopped_old) = oneshot::channel::<()>();
+    let (stop_new, stopped_new) = oneshot::channel::<()>();
+    let (ready_old, old_ready) = ControllerReady::channel();
+    let (ready_new, new_ready) = ControllerReady::channel();
+    let first = tokio::spawn(first.run(async { let _ = stopped_old.await; }, ready_old));
+    old_ready.await?;
+    old.scheduler.snapshots().reached(1).await;
+    let second = tokio::spawn(second.run(async { let _ = stopped_new.await; }, ready_new));
+    host.prepared_attempts().reached(1).await;
+    assert!(host.milestones().is_empty());
+    assert_eq!(new.scheduler.snapshots().get(), 0);
+    assert_eq!(health_status(&new_dial).await?, http::StatusCode::SERVICE_UNAVAILABLE);
+    old.clock.advance(interval);
+    tokio::task::yield_now().await;
+    assert!(!first.is_finished(), "unprepared successor caused a handoff");
+    assert_eq!(health_status(&old_dial).await?, http::StatusCode::OK);
+    assert_eq!(new.scheduler.snapshots().get(), 0);
+    release_prepared.send(()).map_err(|()| "prepared milestone stopped early")?;
+    new_ready.await?;
+    for _ in 0..20 {
+        if new.scheduler.snapshots().get() > 0 { break; }
+        tokio::task::yield_now().await;
+        old.clock.advance(interval);
+    }
+    assert!(new.scheduler.snapshots().get() > 0, "prepared successor did not promote");
+    assert_eq!(health_status(&new_dial).await?, http::StatusCode::OK);
+    assert_eq!(host.milestones(), vec![HostMilestone::Prepared, HostMilestone::Serving]);
+    first.await??;
+    drop(stop_old);
+    stop_new.send(()).map_err(|()| "successor stopped early")?;
+    second.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn replacement_refuses_requests_until_legacy_leader_releases() -> TestResult {
     let (parts, dials, handles) = plain_parts();
     let host = parts.provisioner.clone();
-    let old_host = gang_testkit::FakeProvisioner::default();
     let mut connections = handles.scheduler.connections();
     let now = handles.clock.wall();
     let Acquisition::Acquired(old_lease) = handles
@@ -209,7 +203,7 @@ async fn replacement_serves_before_legacy_leader_hands_off() -> TestResult {
         ready,
     ));
     scheduler_ready.await?;
-    assert_eq!(host.milestones(), vec![HostMilestone::Serving]);
+    assert_eq!(host.milestones(), vec![HostMilestone::Prepared]);
     let controller = handles
         .scheduler
         .controller()
@@ -230,12 +224,11 @@ async fn replacement_serves_before_legacy_leader_hands_off() -> TestResult {
         (Side::Public, Side::Worker) | (Side::Worker, Side::Public)
     ));
     assert_follower(&controller, &health_dial).await?;
-    old_host.reached(HostMilestone::HandedOff).await?;
-    assert_eq!(old_host.milestones(), vec![HostMilestone::HandedOff]);
     handles.repository.release(&old_lease).await?;
     handles.clock.advance(renew_interval);
     handles.scheduler.snapshots().reached(1).await;
     assert_promoted(&controller, &health_dial).await?;
+    assert_eq!(host.milestones(), vec![HostMilestone::Prepared, HostMilestone::Serving]);
     stop.send(()).map_err(|()| "server stopped early")?;
     run.await??;
     Ok(())
@@ -245,18 +238,18 @@ async fn assert_gates(controller: &gang_testkit::Controller, ready: bool) {
     for (path, scope) in [
         (
             "/build.bazel.remote.execution.v2.Execution/Execute",
-            gang_spi::RequestScope::Leader,
+            gang_spi::RequestScope::Controller,
         ),
         (
             "/build.bazel.remote.execution.v2.ContentAddressableStorage/FindMissingBlobs",
-            gang_spi::RequestScope::Shared,
+            gang_spi::RequestScope::Controller,
         ),
     ] {
         let mut parts = api_request("POST", path, None, None).into_parts().0;
         let result = controller
             .admit_public(scope, &Peer::default(), &mut parts)
             .await;
-        if ready || scope == gang_spi::RequestScope::Shared {
+        if ready {
             assert!(matches!(result, Ok(gang_spi::GateDecision::Admit(_))));
         } else {
             assert!(matches!(result, Ok(gang_spi::GateDecision::NotLeading)));
@@ -265,7 +258,7 @@ async fn assert_gates(controller: &gang_testkit::Controller, ready: bool) {
     let mut worker = api_request("POST", "/worker", None, None).into_parts().0;
     let result = controller
         .admit_worker(
-            gang_spi::RequestScope::Leader,
+            gang_spi::RequestScope::Controller,
             &Peer::default(),
             &mut worker,
         )
@@ -281,13 +274,13 @@ async fn assert_follower(
     controller: &gang_testkit::Controller,
     health_dial: &crate::test_support_memory::MemoryDialer,
 ) -> TestResult {
-    assert_eq!(health_status(health_dial).await?, http::StatusCode::OK);
+    assert_eq!(health_status(health_dial).await?, http::StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         controller
             .call_api(api_request("GET", "/v1/server", None, None))
             .await
             .status(),
-        http::StatusCode::OK
+        http::StatusCode::SERVICE_UNAVAILABLE
     );
     assert_gates(controller, false).await;
     Ok(())
@@ -331,348 +324,113 @@ async fn health_status(
 }
 
 #[tokio::test]
-async fn shutdown_rejects_new_requests_on_existing_connections_during_drain() -> TestResult {
-    let (parts, dials, handles) = plain_parts();
-    let mut connections = handles.scheduler.connections();
-    let drains = handles.scheduler.drains();
-    let release_drain = handles.scheduler.hold_drain();
-    let (health, health_dial) = crate::test_support_memory::memory_listener();
-    let server = Server::prepare(parts, plain_settings())
-        .await?
-        .with_health(Some(health));
-    let (stop, stopped) = oneshot::channel::<()>();
-    let run = tokio::spawn(server.run(
-        async {
-            let _ = stopped.await;
-        },
-        ControllerReady::channel().0,
-    ));
-    handles.scheduler.snapshots().reached(1).await;
-    let controller = handles
-        .scheduler
-        .controller()
-        .await
-        .ok_or("controller missing")?;
-    let _public = dials.public.dial();
-    let _worker = dials.worker.dial();
-    let first = connections.recv().await.ok_or("first connection missing")?;
-    let second = connections
-        .recv()
-        .await
-        .ok_or("second connection missing")?;
-    let worker_peer = match (first.side, second.side) {
-        (Side::Public, Side::Worker) => second.peer,
-        (Side::Worker, Side::Public) => first.peer,
-        _ => return Err("expected public and worker connections".into()),
-    };
-    let mut worker = api_request("POST", "/worker", None, None).into_parts().0;
-    assert!(matches!(
-        controller
-            .admit_worker(gang_spi::RequestScope::Leader, &worker_peer, &mut worker)
-            .await,
-        Ok(gang_spi::GateDecision::Admit(_))
-    ));
-    assert_eq!(health_status(&health_dial).await?, http::StatusCode::OK);
-    stop.send(()).map_err(|()| "server stopped early")?;
-    drains.reached(1).await;
-    assert_eq!(
-        health_status(&health_dial).await?,
-        http::StatusCode::SERVICE_UNAVAILABLE
-    );
-    let mut public = api_request("POST", "/execute", None, None).into_parts().0;
-    assert!(matches!(
-        controller
-            .admit_public(
-                gang_spi::RequestScope::Leader,
-                &Peer::default(),
-                &mut public
-            )
-            .await,
-        Ok(gang_spi::GateDecision::NotLeading)
-    ));
-    assert!(matches!(
-        controller
-            .admit_worker(gang_spi::RequestScope::Leader, &worker_peer, &mut worker)
-            .await,
-        Ok(gang_spi::GateDecision::NotLeading)
-    ));
-    let standby = handles
-        .scheduler
-        .standby_services()
-        .await
-        .ok_or("standby missing")?;
-    let shared = standby
-        .call_api(api_request("GET", "/v1/server", None, None))
-        .await;
-    assert_eq!(shared.status(), http::StatusCode::OK);
-    let mut leader = api_request("POST", "/execute", None, None).into_parts().0;
-    assert!(matches!(
-        standby
-            .admit_public(
-                gang_spi::RequestScope::Leader,
-                &Peer::default(),
-                &mut leader
-            )
-            .await,
-        Ok(gang_spi::GateDecision::NotLeading)
-    ));
-    release_drain
-        .send(())
-        .map_err(|()| "controller was not draining")?;
-    run.await??;
-    Ok(())
-}
-
-#[tokio::test]
-async fn one_leads_and_the_follower_takes_over_after_release() -> TestResult {
-    let (first, _dials, handles) = plain_parts();
-    let (mut second, second_dials, other) = plain_parts();
-    second.repository = first.repository.clone();
-    second.clock = first.clock.clone();
-    second.controller = ControllerId::new("second");
-    let mut follower_connections = other.scheduler.connections();
-    let first = Server::prepare(first, plain_settings()).await?;
-    let second = Server::prepare(second, plain_settings()).await?;
-    let (stop_first, stopped_first) = oneshot::channel::<()>();
-    let (stop_second, stopped_second) = oneshot::channel::<()>();
-    let (ready_first, first_ready) = ControllerReady::channel();
-    let (ready_second, second_ready) = ControllerReady::channel();
-    let first = tokio::spawn(first.run(
-        async {
-            let _ = stopped_first.await;
-        },
-        ready_first,
-    ));
-    first_ready.await?;
-    handles.scheduler.snapshots().reached(1).await;
-    let second = tokio::spawn(second.run(
-        async {
-            let _ = stopped_second.await;
-        },
-        ready_second,
-    ));
-    second_ready.await?;
-    let _public_connection = second_dials.public.dial();
-    let _worker_connection = second_dials.worker.dial();
-    let first_connection = follower_connections
-        .recv()
-        .await
-        .ok_or("first connection missing")?;
-    let second_connection = follower_connections
-        .recv()
-        .await
-        .ok_or("second connection missing")?;
-    assert!(matches!(
-        (first_connection.side, second_connection.side),
-        (Side::Public, Side::Worker) | (Side::Worker, Side::Public)
-    ));
-    assert!(handles.scheduler.snapshots().get() > 0);
-    assert_eq!(other.scheduler.snapshots().get(), 0);
-    stop_first
-        .send(())
-        .map_err(|()| "first server stopped early")?;
-    first.await??;
-    handles.clock.advance(Duration::from_secs(3));
-    other.scheduler.snapshots().reached(1).await;
-    stop_second
-        .send(())
-        .map_err(|()| "second server stopped early")?;
-    second.await??;
-    Ok(())
-}
-
-#[tokio::test]
-async fn standby_warms_only_after_serving_milestone_completes() -> TestResult {
+async fn newer_controller_promotes_while_original_attempt_drains_without_reacquisition() -> TestResult {
     let (first, _dials, handles) = plain_parts();
     let (mut second, _dials, other) = plain_parts();
     second.repository = first.repository.clone();
     second.clock = first.clock.clone();
     second.controller = ControllerId::new("second");
-    let host = second.provisioner.clone();
-    let release_serving = host.hold_serving();
+    let interval = plain_settings().leadership.renew_interval.get();
+    let old_host = first.provisioner.clone();
     let (first_health, first_dial) = crate::test_support_memory::memory_listener();
     let (second_health, second_dial) = crate::test_support_memory::memory_listener();
-    let first = Server::prepare(first, plain_settings())
-        .await?
-        .with_health(Some(first_health));
-    let mut settings = plain_settings();
-    settings.standby_routability_delay = Duration::from_secs(3);
-    let second = Server::prepare(second, settings)
-        .await?
-        .with_health(Some(second_health));
+    let first = Server::prepare(first, plain_settings()).await?.with_health(Some(first_health));
+    let second = Server::prepare(second, plain_settings()).await?.with_health(Some(second_health));
     let (stop_first, stopped_first) = oneshot::channel::<()>();
     let (stop_second, stopped_second) = oneshot::channel::<()>();
     let (ready_first, first_ready) = ControllerReady::channel();
-    let (ready_second, mut second_ready) = ControllerReady::channel();
-    let first = tokio::spawn(first.run(
-        async {
-            let _ = stopped_first.await;
-        },
-        ready_first,
-    ));
+    let (ready_second, second_ready) = ControllerReady::channel();
+    let first = tokio::spawn(first.run(async { let _ = stopped_first.await; }, ready_first));
     first_ready.await?;
     handles.scheduler.snapshots().reached(1).await;
-    let second = tokio::spawn(second.run(
-        async {
-            let _ = stopped_second.await;
-        },
-        ready_second,
-    ));
-    host.serving_attempts().reached(1).await;
-    handles.clock.advance(Duration::from_secs(4));
+    let original = handles.scheduler.controller().await.ok_or("original controller missing")?;
+    assert_eq!(health_status(&first_dial).await?, http::StatusCode::OK);
+
+    let instance = gang_types::InstanceId::try_new("old-worker")?;
+    let fleet = gang_types::FleetName::try_new("example-fleet")?;
+    let deadline = handles.clock.wall() + Duration::from_secs(120);
+    handles.scheduler.set_clock(handles.clock.clone());
+    handles.scheduler.set_attempt_deadlines(vec![gang_spi::DrainingWorker {
+        fleet: fleet.clone(), instance: instance.clone(), deadline,
+    }]);
+    handles.scheduler.set_snapshot(SchedulerSnapshot {
+        workers: vec![gang_spi::WorkerState {
+            id: gang_testkit::worker_id(instance.as_str())?,
+            fleet,
+            environment: Some("host:test".parse()?),
+            running_actions: 1,
+            max_inflight_actions: None,
+            draining: false,
+            paused: false,
+            last_seen: handles.clock.wall(),
+        }],
+        executing: vec![gang_spi::ExecutingDemand {
+            source: None,
+            candidates: FleetSet::prefix(1)?,
+            resources: gang_types::ActionResources::default(),
+            worker: 0,
+            started: handles.clock.wall(),
+            expected: None,
+        }],
+        ..SchedulerSnapshot::default()
+    });
+
+    let second = tokio::spawn(second.run(async { let _ = stopped_second.await; }, ready_second));
+    second_ready.await?;
+    for _ in 0..20 {
+        if other.scheduler.snapshots().get() != 0 { break; }
+        tokio::task::yield_now().await;
+        handles.clock.advance(interval);
+    }
+    assert!(other.scheduler.snapshots().get() > 0, "new controller did not promote");
+    assert!(!first.is_finished(), "original exited with an outstanding stamped attempt");
+    assert_eq!(handles.scheduler.controller_runs().get(), 1);
+    assert_eq!(health_status(&first_dial).await?, http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(health_status(&second_dial).await?, http::StatusCode::OK);
+    let response = original.call_api(api_request("GET", "/v1/server", None, None)).await;
+    assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers().get(gang_types::handover::REQUEST_NOT_STARTED_HEADER).and_then(|v| v.to_str().ok()), Some("true"));
+    let mut registration = api_request("POST", "/worker", None, None).into_parts().0;
     assert!(matches!(
-        second_ready.try_recv(),
-        Err(oneshot::error::TryRecvError::Empty)
+        original.admit_worker(gang_spi::RequestScope::Controller, &Peer::default(), &mut registration).await,
+        Ok(gang_spi::GateDecision::NotLeading)
     ));
-    assert!(host.milestones().is_empty());
-    assert_eq!(
-        health_status(&second_dial).await?,
-        http::StatusCode::SERVICE_UNAVAILABLE
-    );
-    assert_eq!(health_status(&first_dial).await?, http::StatusCode::OK);
-    assert_eq!(handles.scheduler.drains().get(), 0);
-    release_serving
-        .send(())
-        .map_err(|()| "serving milestone stopped early")?;
-    second_ready.await?;
-    assert_eq!(host.milestones(), vec![HostMilestone::Serving]);
-    assert_eq!(health_status(&second_dial).await?, http::StatusCode::OK);
-    handles.clock.advance(Duration::from_secs(2));
-    assert_eq!(health_status(&first_dial).await?, http::StatusCode::OK);
-    assert_eq!(handles.scheduler.drains().get(), 0);
-    handles.clock.advance(Duration::from_secs(1));
-    assert_eq!(health_status(&second_dial).await?, http::StatusCode::OK);
-    handles.clock.advance(Duration::from_secs(3));
-    assert_eq!(
-        health_status(&first_dial).await?,
-        http::StatusCode::SERVICE_UNAVAILABLE
-    );
-    stop_first
-        .send(())
-        .map_err(|()| "first server stopped early")?;
-    stop_second
-        .send(())
-        .map_err(|()| "second server stopped early")?;
-    first.await??;
+    let mut store = api_request("POST", "/store", None, None).into_parts().0;
+    assert!(matches!(
+        original.admit_worker(gang_spi::RequestScope::WorkerStore, &Peer::default(), &mut store).await,
+        Ok(gang_spi::GateDecision::Admit(_))
+    ));
+    let mut records = Vec::new();
+    gang_spi::ExpiringRecordPort::records(
+        &handles.repository, gang_spi::RecordKind::ControllerDrain, None,
+        std::num::NonZeroUsize::new(10).ok_or("nonzero page")?,
+        handles.clock.wall(), &mut records,
+    ).await?;
+    assert!(!records.is_empty(), "old worker protection was not installed");
+    let protected: serde_json::Value = serde_json::from_slice(&records[0].1.body)?;
+    assert_eq!(protected[0]["fleet"], "example-fleet");
+    assert_eq!(protected[0]["instance"], "old-worker");
+    assert!(!old_host.milestones().contains(&HostMilestone::Unrouted));
+    stop_second.send(()).map_err(|()| "new server stopped early")?;
     second.await??;
-    assert_eq!(other.scheduler.controller_runs().get(), 1);
-    Ok(())
-}
+    stop_first.send(()).map_err(|()| "original exited while still draining")?;
+    handles.clock.advance(interval);
+    tokio::task::yield_now().await;
+    assert!(!first.is_finished());
+    assert_eq!(handles.scheduler.controller_runs().get(), 1);
+    assert_eq!(health_status(&first_dial).await?, http::StatusCode::SERVICE_UNAVAILABLE);
 
-#[tokio::test]
-async fn newer_ready_controller_requests_handoff_without_retirement() -> TestResult {
-    let (first, _dials, handles) = plain_parts();
-    let release_drain = handles.scheduler.hold_drain();
-    let (mut second, _dials, other) = plain_parts();
-    second.repository = first.repository.clone();
-    second.clock = first.clock.clone();
-    second.controller = ControllerId::new("second");
-    let (first_health, first_health_dial) = crate::test_support_memory::memory_listener();
-    let (second_health, second_health_dial) = crate::test_support_memory::memory_listener();
-    let first = Server::prepare(first, plain_settings())
-        .await?
-        .with_health(Some(first_health));
-    let second = Server::prepare(second, plain_settings())
-        .await?
-        .with_health(Some(second_health));
-    let (stop_first, stopped_first) = oneshot::channel::<()>();
-    let (stop_second, stopped_second) = oneshot::channel::<()>();
-    let (ready_first, first_ready) = ControllerReady::channel();
-    let (ready_second, second_ready) = ControllerReady::channel();
-    let first = tokio::spawn(first.run(
-        async {
-            let _ = stopped_first.await;
-        },
-        ready_first,
-    ));
-    first_ready.await?;
-    handles.scheduler.snapshots().reached(1).await;
-    let second = tokio::spawn(second.run(
-        async {
-            let _ = stopped_second.await;
-        },
-        ready_second,
-    ));
-    second_ready.await?;
-    let follower = other
-        .scheduler
-        .controller()
-        .await
-        .ok_or("controller missing")?;
-    assert_follower(&follower, &second_health_dial).await?;
-    handles.clock.advance(Duration::from_secs(3));
-    assert_eq!(
-        health_status(&first_health_dial).await?,
-        http::StatusCode::SERVICE_UNAVAILABLE
-    );
-    handles.scheduler.drains().reached(1).await;
-    handles.clock.advance(Duration::from_secs(3));
-    other.scheduler.snapshots().reached(1).await;
-    release_drain
-        .send(())
-        .map_err(|()| "first controller was not draining")?;
-    handles.scheduler.controller_runs().reached(2).await;
-    assert_eq!(
-        health_status(&first_health_dial).await?,
-        http::StatusCode::SERVICE_UNAVAILABLE
-    );
-    handles.clock.advance(Duration::from_secs(3));
-    assert_eq!(
-        health_status(&first_health_dial).await?,
-        http::StatusCode::SERVICE_UNAVAILABLE
-    );
-    let next_snapshot = handles.scheduler.snapshots().get() + 1;
-    stop_second
-        .send(())
-        .map_err(|()| "second server stopped early")?;
-    second.await??;
-    handles.clock.advance(Duration::from_secs(3));
-    handles.scheduler.snapshots().reached(next_snapshot).await;
-    assert_eq!(
-        health_status(&first_health_dial).await?,
-        http::StatusCode::OK
-    );
-    stop_first
-        .send(())
-        .map_err(|()| "first server stopped early")?;
-    first.await??;
-    Ok(())
-}
 
-#[tokio::test]
-async fn voluntary_handoff_times_out_when_controller_does_not_drain() -> TestResult {
-    let (first, _dials, handles) = plain_parts();
-    let (mut second, _dials, other) = plain_parts();
-    second.repository = first.repository.clone();
-    second.clock = first.clock.clone();
-    second.controller = ControllerId::new("second");
-    let _hold_drain = handles.scheduler.hold_drain();
-    let settings = plain_settings();
-    let timeout = settings.handoff_timeout;
-    let first = Server::prepare(first, settings).await?;
-    let second = Server::prepare(second, plain_settings()).await?;
-    let (ready_first, first_ready) = ControllerReady::channel();
-    let (ready_second, second_ready) = ControllerReady::channel();
-    let first = tokio::spawn(first.run(pending(), ready_first));
-    first_ready.await?;
-    handles.scheduler.snapshots().reached(1).await;
-    let (stop_second, stopped_second) = oneshot::channel::<()>();
-    let second = tokio::spawn(second.run(
-        async {
-            let _ = stopped_second.await;
-        },
-        ready_second,
-    ));
-    second_ready.await?;
-    other.scheduler.controller_runs().reached(1).await;
-    handles.clock.advance(Duration::from_secs(3));
-    handles.scheduler.drains().reached(1).await;
-    handles.clock.advance(timeout);
-    assert!(matches!(first.await?, Err(ServerError::HandoffTimedOut(_))));
-    stop_second
-        .send(())
-        .map_err(|()| "second server stopped early")?;
-    second.await??;
+    handles.scheduler.set_snapshot(SchedulerSnapshot::default());
+    for _ in 0..20 {
+        if first.is_finished() { break; }
+        tokio::task::yield_now().await;
+        handles.clock.advance(interval);
+    }
+    assert!(first.is_finished(), "original did not exit after its attempt completed");
+    first.await??;
+    assert_eq!(handles.scheduler.controller_runs().get(), 1);
+    assert!(old_host.milestones().contains(&HostMilestone::Unrouted));
     Ok(())
 }
 
@@ -699,52 +457,6 @@ async fn shutdown_cancels_candidate_registration() -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
-async fn shutdown_during_voluntary_drain_does_not_start_another_term() -> TestResult {
-    let (first, _dials, handles) = plain_parts();
-    let (mut second, _dials, other) = plain_parts();
-    second.repository = first.repository.clone();
-    second.clock = first.clock.clone();
-    second.controller = ControllerId::new("second");
-    let release_drain = handles.scheduler.hold_drain();
-    let first = Server::prepare(first, plain_settings()).await?;
-    let second = Server::prepare(second, plain_settings()).await?;
-    let (ready_first, first_ready) = ControllerReady::channel();
-    let (ready_second, second_ready) = ControllerReady::channel();
-    let (stop_first, stopped_first) = oneshot::channel::<()>();
-    let first = tokio::spawn(first.run(
-        async {
-            let _ = stopped_first.await;
-        },
-        ready_first,
-    ));
-    first_ready.await?;
-    handles.scheduler.snapshots().reached(1).await;
-    let (stop_second, stopped_second) = oneshot::channel::<()>();
-    let second = tokio::spawn(second.run(
-        async {
-            let _ = stopped_second.await;
-        },
-        ready_second,
-    ));
-    second_ready.await?;
-    other.scheduler.controller_runs().reached(1).await;
-    handles.clock.advance(Duration::from_secs(3));
-    handles.scheduler.drains().reached(1).await;
-    stop_first
-        .send(())
-        .map_err(|()| "first server stopped early")?;
-    release_drain
-        .send(())
-        .map_err(|()| "first controller was not draining")?;
-    first.await??;
-    assert_eq!(handles.scheduler.controller_runs().get(), 1);
-    stop_second
-        .send(())
-        .map_err(|()| "second server stopped early")?;
-    second.await??;
-    Ok(())
-}
 
 #[tokio::test]
 async fn promotion_survives_dashboard_history_read_failure() -> TestResult {
@@ -859,7 +571,6 @@ async fn renewal_failures_do_not_end_the_server() -> TestResult {
 #[tokio::test]
 async fn replaced_lease_ends_the_server_after_drain() -> TestResult {
     let (parts, _dials, handles) = plain_parts();
-    let release_drain = handles.scheduler.hold_drain();
     let server = Server::prepare(parts, plain_settings()).await?;
     let run = tokio::spawn(server.run(pending(), ControllerReady::channel().0));
     handles.scheduler.snapshots().reached(1).await;
@@ -879,10 +590,6 @@ async fn replaced_lease_ends_the_server_after_drain() -> TestResult {
         )
         .await?;
     assert!(matches!(acquired, Acquisition::Acquired(_)));
-    handles.scheduler.drains().reached(1).await;
-    release_drain
-        .send(())
-        .map_err(|()| "controller was not draining")?;
     assert!(matches!(run.await?, Err(ServerError::LeadershipLost)));
     Ok(())
 }

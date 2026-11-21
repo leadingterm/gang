@@ -168,11 +168,10 @@ impl<K: Stack, P: AuthenticationPort + 'static> RequestGate for Gate<K, P> {
         peer: &Peer,
         parts: &mut Parts,
     ) -> Result<GateDecision, PortError> {
-        if scope == RequestScope::Leader
-            && self
-                .readiness
-                .as_ref()
-                .is_some_and(|ready| !ready.admitting())
+        if self.readiness.as_ref().is_some_and(|ready| match scope {
+            RequestScope::Controller => !ready.admitting(),
+            RequestScope::WorkerStore => self.public.is_some() || !ready.worker_store_admitting(),
+        })
         {
             return Ok(GateDecision::NotLeading);
         }

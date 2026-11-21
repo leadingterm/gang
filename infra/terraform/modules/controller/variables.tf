@@ -53,18 +53,6 @@ variable "target_group_arns" {
   }
 }
 
-variable "shutdown_grace_seconds" {
-  description = "Controller shutdown grace in seconds; lifecycle hook timeouts include a 120-second margin."
-  type        = number
-  default     = 300
-  nullable    = false
-
-  validation {
-    condition     = var.shutdown_grace_seconds >= 1 && var.shutdown_grace_seconds <= 3480 && floor(var.shutdown_grace_seconds) == var.shutdown_grace_seconds
-    error_message = "shutdown_grace_seconds must be an integer between 1 and 3480."
-  }
-}
-
 variable "config_digest" {
   description = "SHA-256 digest of rendered gang.toml, required for group instance refresh on configuration changes."
   type        = string

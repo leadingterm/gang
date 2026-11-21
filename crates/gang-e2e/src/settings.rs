@@ -8,17 +8,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::errors::{E2eError, Result};
 
-/// Procedure used to retire the old controller during a mixed-version upgrade.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-pub enum UpgradeProcedure {
-    /// Stop the old server before deregistering its targets.
-    #[default]
-    PreStop,
-    /// Deregister and drain the instance before signalling the old server.
-    InstanceRefresh,
-}
-
 /// Binary and rendered deployment fixture for one release.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseInput {
@@ -78,12 +67,11 @@ pub const DEFAULT_HISTORY_TIMEOUT: Duration = Duration::from_mins(3);
 /// Default for [`Settings::hold_timeout`]: three minutes.
 pub const DEFAULT_HOLD_TIMEOUT: Duration = Duration::from_mins(3);
 
-/// Default maximum gap: 3s successor polling plus 1s for promotion and a fresh probe.
-pub const DEFAULT_UPGRADE_GAP_LIMIT: Duration = Duration::from_secs(4);
-/// Default scaled instance-refresh drain window, longer than the availability limit.
-pub const DEFAULT_UPGRADE_DRAIN_WINDOW: Duration = Duration::from_secs(8);
-/// Default harness budget cap on deployment instance-refresh warmup: thirty seconds.
-pub const DEFAULT_UPGRADE_WARMUP_WINDOW: Duration = Duration::from_secs(30);
+/// Default gap bound, derived from the production NLB/lease handover protocol.
+pub const DEFAULT_UPGRADE_GAP_LIMIT: Duration = gang_types::handover::handover_window(
+    gang_types::handover::DEFAULT_RENEW_INTERVAL,
+    gang_types::handover::DEFAULT_CALL_TIMEOUT,
+);
 /// Default interval between upgrade availability probes.
 pub const DEFAULT_UPGRADE_PROBE_INTERVAL: Duration = Duration::from_millis(100);
 /// Default timeout of an individual upgrade availability probe.
@@ -157,14 +145,6 @@ pub struct Settings {
     /// How long the harness waits for the hold action to signal that its orphan runs.
     #[serde(with = "gang_types::duration")]
     pub hold_timeout: Duration,
-    /// The procedure used for the normal rolling upgrade; defaults to pre-stop.
-    pub upgrade_procedure: UpgradeProcedure,
-    /// Time to keep a deregistered instance alive before signalling it during refresh.
-    #[serde(with = "gang_types::duration")]
-    pub upgrade_drain_window: Duration,
-    /// Harness cap on instance-refresh warmup; defaults to 30s, and configured zero remains zero.
-    #[serde(with = "gang_types::duration")]
-    pub upgrade_warmup_window: Duration,
     /// Maximum permitted availability gap during an upgrade.
     #[serde(with = "gang_types::duration")]
     pub upgrade_gap_limit: Duration,
@@ -217,9 +197,6 @@ impl Default for Settings {
             build_timeout: DEFAULT_BUILD_TIMEOUT,
             history_timeout: DEFAULT_HISTORY_TIMEOUT,
             hold_timeout: DEFAULT_HOLD_TIMEOUT,
-            upgrade_procedure: UpgradeProcedure::default(),
-            upgrade_drain_window: DEFAULT_UPGRADE_DRAIN_WINDOW,
-            upgrade_warmup_window: DEFAULT_UPGRADE_WARMUP_WINDOW,
             upgrade_gap_limit: DEFAULT_UPGRADE_GAP_LIMIT,
             upgrade_probe_interval: DEFAULT_UPGRADE_PROBE_INTERVAL,
             upgrade_probe_timeout: DEFAULT_UPGRADE_PROBE_TIMEOUT,
@@ -308,43 +285,38 @@ mod tests {
             binary: format!("{name}-binary").into(),
             fixture: format!("{name}-fixture").into(),
         };
-        for procedure in [UpgradeProcedure::PreStop, UpgradeProcedure::InstanceRefresh] {
-            let inputs = DeploymentInputs {
-                gang: "gang".into(),
-                bazel: "bazel".into(),
-                postgres: "postgres".into(),
-                base_config: "base config".to_owned(),
-                sample: "sample".into(),
-                configs: "configs".into(),
-                settings: Settings {
-                    upgrade_procedure: procedure,
-                    ..Settings::default()
-                },
-                action_tools: ActionTools {
-                    shell: "shell".into(),
-                    path: "action-path".to_owned(),
-                    bwrap: Some("bwrap".into()),
-                    glibc_tool: Some("glibc".into()),
-                    action_rootfs: Some("rootfs".into()),
-                },
-                upgrade: Some(UpgradeInputs {
-                    previous: release("previous"),
-                    candidate_fixture: "candidate-fixture".into(),
-                }),
-            };
-            let bytes = serde_json::to_vec(&inputs).expect("deployment inputs serialize");
-            let decoded: DeploymentInputs =
-                serde_json::from_slice(&bytes).expect("deployment inputs deserialize");
-            assert_eq!(decoded.settings, inputs.settings);
-            assert_eq!(decoded.action_tools, inputs.action_tools);
-            let upgrade = decoded.upgrade.expect("upgrade inputs survive transport");
-            assert_eq!(upgrade.previous.binary, PathBuf::from("previous-binary"));
-            assert_eq!(upgrade.previous.fixture, PathBuf::from("previous-fixture"));
-            assert_eq!(
-                upgrade.candidate_fixture,
-                PathBuf::from("candidate-fixture")
-            );
-        }
+        let inputs = DeploymentInputs {
+            gang: "gang".into(),
+            bazel: "bazel".into(),
+            postgres: "postgres".into(),
+            base_config: "base config".to_owned(),
+            sample: "sample".into(),
+            configs: "configs".into(),
+            settings: Settings::default(),
+            action_tools: ActionTools {
+                shell: "shell".into(),
+                path: "action-path".to_owned(),
+                bwrap: Some("bwrap".into()),
+                glibc_tool: Some("glibc".into()),
+                action_rootfs: Some("rootfs".into()),
+            },
+            upgrade: Some(UpgradeInputs {
+                previous: release("previous"),
+                candidate_fixture: "candidate-fixture".into(),
+            }),
+        };
+        let bytes = serde_json::to_vec(&inputs).expect("deployment inputs serialize");
+        let decoded: DeploymentInputs =
+            serde_json::from_slice(&bytes).expect("deployment inputs deserialize");
+        assert_eq!(decoded.settings, inputs.settings);
+        assert_eq!(decoded.action_tools, inputs.action_tools);
+        let upgrade = decoded.upgrade.expect("upgrade inputs survive transport");
+        assert_eq!(upgrade.previous.binary, PathBuf::from("previous-binary"));
+        assert_eq!(upgrade.previous.fixture, PathBuf::from("previous-fixture"));
+        assert_eq!(
+            upgrade.candidate_fixture,
+            PathBuf::from("candidate-fixture")
+        );
     }
 
     #[test]
@@ -372,23 +344,17 @@ mod tests {
     #[test]
     fn upgrade_durations_default_and_accept_overrides() {
         let defaults: Settings = toml::from_str("").expect("default settings parse");
-        assert_eq!(defaults.upgrade_procedure, UpgradeProcedure::PreStop);
-        assert_eq!(defaults.upgrade_drain_window, Duration::from_secs(8));
-        assert_eq!(defaults.upgrade_warmup_window, Duration::from_secs(30));
-        assert_eq!(defaults.upgrade_gap_limit, Duration::from_secs(4));
+        assert!(toml::from_str::<Settings>("upgrade_procedure = 'instance-refresh'").is_err());
+        assert!(toml::from_str::<Settings>("upgrade_warmup_window = '25s'").is_err());
+        assert!(toml::from_str::<Settings>("upgrade_drain_window = '12s'").is_err());
+        assert_eq!(defaults.upgrade_gap_limit, Duration::from_secs(15));
         assert_eq!(defaults.upgrade_probe_interval, Duration::from_millis(100));
         assert_eq!(defaults.upgrade_probe_timeout, Duration::from_secs(1));
 
         let settings: Settings = toml::from_str(
-            "upgrade_procedure = 'instance-refresh'\nupgrade_drain_window = '12s'\nupgrade_warmup_window = '25s'\nupgrade_gap_limit = '20s'\nupgrade_probe_interval = '200ms'\nupgrade_probe_timeout = '2s'",
+            "upgrade_gap_limit = '20s'\nupgrade_probe_interval = '200ms'\nupgrade_probe_timeout = '2s'",
         )
         .expect("upgrade duration overrides parse");
-        assert_eq!(
-            settings.upgrade_procedure,
-            UpgradeProcedure::InstanceRefresh
-        );
-        assert_eq!(settings.upgrade_drain_window, Duration::from_secs(12));
-        assert_eq!(settings.upgrade_warmup_window, Duration::from_secs(25));
         assert_eq!(settings.upgrade_gap_limit, Duration::from_secs(20));
         assert_eq!(settings.upgrade_probe_interval, Duration::from_millis(200));
         assert_eq!(settings.upgrade_probe_timeout, Duration::from_secs(2));

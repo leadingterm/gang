@@ -450,10 +450,10 @@ impl ServerApi {
             let remaining = self
                 .retry_budget
                 .saturating_sub(self.clock.monotonic().saturating_duration_since(started));
-            if delay >= remaining {
+            if remaining.is_zero() {
                 return Ok((reply, envelope));
             }
-            self.clock.sleep(delay).await;
+            self.clock.sleep(delay.min(remaining)).await;
             if self.clock.monotonic().saturating_duration_since(started) >= self.retry_budget {
                 return Ok((reply, envelope));
             }

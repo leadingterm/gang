@@ -19,6 +19,9 @@
 
 ### Changed
 
+- **Planned handover:** shared-database replacement, rolling refresh and scale-in preserve valid executing attempts on their original scheduler and worker; crashes retain existing retry and possible re-execution behavior. No operator pre-stop or client configuration regeneration is required.
+- **Upgrade:** `/leader` has been removed; migrate custom health checks to `/ready`. Remove `server.http2.shutdown_grace` and `server.standby_routability_delay` from custom configuration, and remove explicit `shutdown_grace_seconds` arguments from external Terraform module calls; there is no compatibility shim. The deployment module migrates its generated configuration.
+- Attempts now share a dispatch-stamped whole-attempt deadline derived from existing action, download and upload timeouts. AWS rejects budgets beyond its lifecycle-hook limit; no new grace setting is required. SQLite's exclusive fixed instance does not provide replacement HA.
 - Reject unknown platform properties, ungranted network requests and over-ceiling requests at admission instead of silently accepting them.
 - Namespace the action cache with the server-owned `[actions] environment` version. Image security and patch updates do not change cache keys or require client action.
 - Credit pending and reliable requested capacity without repeatedly raising desired size; keep transient credential-refresh gaps separate from serving surplus and preserve failed-request withdrawal.

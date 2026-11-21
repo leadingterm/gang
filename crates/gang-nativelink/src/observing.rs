@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use gang_clock::{Clock, Tick, Timestamp};
 use gang_spi::{
-    Executed, ExecutionTimes, FleetSupply, InstanceCordon, Observation, ObservationSink, Phase,
-    PortError,
+    ControllerDrain, DrainingWorker, Executed, ExecutionTimes, FleetSupply, InstanceCordon,
+    Observation, ObservationSink, Phase, PortError,
 };
 use gang_types::{FleetCatalog, FleetName, Identity, InstanceId};
 use nativelink_error::{Code, Error, make_err};
@@ -134,33 +134,64 @@ impl ObservingWorkerScheduler {
         }
     }
 
-    /// Stops dispatch before notifying action streams, then disconnects idle workers.
-    pub(crate) async fn begin_hand_off(&self) {
+    /// Stops worker admission, freezes every worker, then announces the irreversible handoff.
+    pub(crate) async fn begin_hand_off(&self) -> Result<(), PortError> {
         let mut retiring = self.retiring.write().await;
-        if *retiring {
-            return;
-        }
         *retiring = true;
-        let workers = self.inner.worker_snapshot().await;
-        drop(retiring);
-        for worker in &workers {
-            let id = WorkerId::from(worker.id.clone());
-            if let Err(error) = self.inner.set_drain_worker(&id, true).await {
-                tracing::warn!(?error, worker = %worker.id, "could not drain worker during hand-off");
+        if !self.handoff.is_begun() {
+            for worker in self.inner.worker_snapshot().await {
+                self.inner
+                    .set_drain_worker(&WorkerId::from(worker.id), true)
+                    .await
+                    .map_err(PortError::backend)?;
             }
+            self.handoff.begin();
         }
-        self.handoff.begin();
+        drop(retiring);
+        Ok(())
+    }
+
+    pub(crate) async fn refresh_drain(&self, into: &mut ControllerDrain) -> Result<(), PortError> {
+        let now = self.clock.wall();
+        self.inner
+            .expire_attempts(std::time::UNIX_EPOCH + Duration::from_millis(now.as_unix_millis()))
+            .await
+            .map_err(PortError::backend)?;
+        into.workers.clear();
+        let mut attempts = false;
         for worker in self.inner.worker_snapshot().await {
             if worker.running_actions == 0 {
-                let id = WorkerId::from(worker.id.clone());
-                if let Err(error) = self.inner.remove_worker(&id).await {
-                    tracing::warn!(?error, worker = %worker.id, "could not remove idle worker during hand-off");
-                } else {
-                    self.cordons.disconnected(&id).await;
-                }
+                let id = WorkerId::from(worker.id);
+                self.inner.remove_worker(&id).await.map_err(PortError::backend)?;
+                self.cordons.disconnected(&id).await;
+                continue;
             }
+            let Some(deadline) = worker.latest_attempt_deadline else {
+                return Err(PortError::backend("owned worker attempt has no controller dispatch deadline"));
+            };
+            if Timestamp::from(deadline) <= now {
+                let id = WorkerId::from(worker.id);
+                self.inner.remove_worker(&id).await.map_err(PortError::backend)?;
+                self.cordons.disconnected(&id).await;
+                continue;
+            }
+            attempts = true;
+            let Some(instance) = gang_types::WorkerId::instance_name_from_str(&worker.id)
+                .and_then(|name| InstanceId::try_new(name).ok()) else { continue };
+            let Some(fleet) = worker.platform_properties.get(gang_types::property::FLEET)
+                .and_then(|name| FleetName::try_new(name).ok()) else { continue };
+            let deadline = Timestamp::from(deadline);
+            into.workers.push(DrainingWorker { fleet, instance, deadline });
         }
+        into.workers.sort_unstable_by(|a, b| (&a.fleet, &a.instance).cmp(&(&b.fleet, &b.instance)));
+        into.workers.dedup_by(|later, earlier| {
+            if later.fleet != earlier.fleet || later.instance != earlier.instance { return false; }
+            earlier.deadline = earlier.deadline.max(later.deadline);
+            true
+        });
+        into.complete = !attempts && self.handoff.public_complete();
         self.signal_if_released().await;
+        Ok(())
     }
 
     async fn remove_if_retiring_and_idle(&self, worker_id: &WorkerId) {
@@ -477,6 +508,10 @@ impl WorkerScheduler for ObservingWorkerScheduler {
         self.cordons
             .set_worker_draining(&*self.inner, worker_id, is_draining)
             .await
+    }
+
+    async fn expire_attempts(&self, now: std::time::SystemTime) -> Result<(), Error> {
+        self.inner.expire_attempts(now).await
     }
 
     async fn worker_snapshot(&self) -> Vec<WorkerSummary> {
@@ -1251,6 +1286,22 @@ mod tests {
             }
             Ok(())
         }
+        async fn expire_attempts(&self, now: SystemTime) -> Result<(), Error> {
+            if let Some(workers) = self.workers.lock().as_mut() {
+                for worker in workers {
+                    if worker.running_actions != 0 && worker.latest_attempt_deadline.is_some_and(|stamp| stamp <= now) {
+                        worker.running_actions = 0;
+                        worker.latest_attempt_deadline = None;
+                        *self.stage.lock() = Some(ActionStage::Completed(ActionResult {
+                            error: Some(make_err!(Code::DeadlineExceeded, "attempt reached controller dispatch deadline")),
+                            ..ActionResult::default()
+                        }));
+                    }
+                }
+            }
+            Ok(())
+        }
+
 
         async fn worker_snapshot(&self) -> Vec<WorkerSummary> {
             if let Some(workers) = self.workers.lock().as_ref() {
@@ -1266,6 +1317,7 @@ mod tests {
                 platform_properties: HashMap::new(),
                 available_platform_properties: HashMap::new(),
                 free_memory_kb: None,
+                latest_attempt_deadline: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_060)),
             }]
         }
 
@@ -1412,7 +1464,7 @@ mod tests {
             worker.id = "busy".to_owned();
             worker.running_actions = 1;
             *inner.workers.lock() = Some(vec![worker]);
-            counting.begin_hand_off().await;
+            counting.begin_hand_off().await?;
             let mut released = std::pin::pin!(counting.handoff.workers_released());
             assert!(futures::poll!(released.as_mut()).is_pending());
             let id = WorkerId("busy".into());
@@ -1450,7 +1502,8 @@ mod tests {
         busy.running_actions = 1;
         *inner.workers.lock() = Some(vec![idle, busy]);
 
-        counting.begin_hand_off().await;
+        counting.begin_hand_off().await.expect("handoff freezes dispatch");
+        counting.refresh_drain(&mut ControllerDrain::default()).await.expect("handoff snapshot");
         assert!(counting.handoff.is_begun());
         assert_eq!(
             *inner.events.lock(),
@@ -1563,4 +1616,54 @@ mod tests {
         assert!(result.is_ok());
         assert!(inner.published.load(Ordering::Relaxed));
     }
+
+    #[tokio::test]
+    async fn drain_uses_owned_stamp_and_waits_for_original_response_not_fresh_refusals() -> gang_testkit::TestResult {
+        let (inner, mut counting, _) = wrap(false);
+        let clock = Arc::new(TestClock::new(Timestamp::from_unix_millis(1_000_000_000)));
+        counting.clock = clock.clone();
+        let instance = InstanceId::try_new("old-worker")?;
+        let mut worker = inner.worker_snapshot().await.remove(0);
+        worker.id = gang_testkit::worker_on(&instance)?.to_string();
+        worker.platform_properties.insert(gang_types::property::FLEET.to_owned(), "fleet-a".to_owned());
+        worker.latest_attempt_deadline = Some(SystemTime::UNIX_EPOCH
+            + Duration::from_millis(clock.wall().as_unix_millis()) + Duration::from_secs(360));
+        *inner.workers.lock() = Some(vec![worker]);
+        let old_connection = Arc::new(crate::standing::Standing::default());
+        assert!(old_connection.admit());
+        let old_response = old_connection.begin();
+        counting.handoff.public_connection(&old_connection);
+        counting.begin_hand_off().await?;
+        let retry = old_connection.retry_requested();
+        tokio::pin!(retry);
+        assert!(futures::poll!(retry.as_mut()).is_ready(), "admitted public connection receives GOAWAY");
+        let fresh_refusal = Arc::new(crate::standing::Standing::default());
+        let _fresh_response = fresh_refusal.begin();
+        counting.handoff.public_connection(&fresh_refusal);
+        let mut drain = ControllerDrain { workers: Vec::with_capacity(4), complete: false };
+        counting.refresh_drain(&mut drain).await?;
+        let buffer = drain.workers.as_ptr();
+        assert_eq!(drain.workers.len(), 1);
+        assert_eq!(drain.workers[0].instance, instance);
+        assert_eq!(drain.workers[0].deadline, clock.wall() + Duration::from_secs(360));
+        assert!(!drain.complete);
+        clock.advance(Duration::from_secs(301));
+        counting.begin_hand_off().await?;
+        counting.refresh_drain(&mut drain).await?;
+        assert_eq!(drain.workers.as_ptr(), buffer, "handoff refresh reuses the caller buffer");
+        assert_eq!(drain.workers.len(), 1, "no independent 300-second action kill");
+        assert!(!drain.complete);
+        clock.advance(Duration::from_secs(59));
+        counting.refresh_drain(&mut drain).await?;
+        assert!(drain.workers.is_empty());
+        assert!(!drain.complete, "terminal attempts still wait for the original response body");
+        assert!(matches!(&*inner.stage.lock(), Some(ActionStage::Completed(result))
+            if result.error.as_ref().is_some_and(|error| error.code == Code::DeadlineExceeded)));
+        assert!(!inner.requeue.load(Ordering::Acquire), "stamp expiry is terminal, never a generic-error requeue");
+        drop(old_response);
+        counting.refresh_drain(&mut drain).await?;
+        assert!(drain.complete, "fresh refusal traffic cannot retain the old engine");
+        Ok(())
+    }
 }
+

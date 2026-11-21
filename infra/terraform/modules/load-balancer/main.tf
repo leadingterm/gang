@@ -138,6 +138,7 @@ resource "aws_lb_target_group" "this" {
     for_each = var.shared_database ? [1] : []
     content {
       enable_unhealthy_connection_termination = false
+      unhealthy_draining_interval            = 0
     }
   }
 
@@ -392,6 +393,7 @@ resource "aws_lb_target_group" "internal" {
 
   target_health_state {
     enable_unhealthy_connection_termination = false
+    unhealthy_draining_interval            = 0
   }
 
   health_check {

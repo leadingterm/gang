@@ -2,17 +2,17 @@
 
 use std::future::Future;
 use std::num::NonZeroUsize;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use gang_clock::{SystemClock, Tick, Timestamp};
+use gang_clock::{Tick, Timestamp};
 use parking_lot::Mutex;
 
 use gang_spi::{
-    ActionsView, ApiService, ControllerConnections, ControllerEndpoints, ControllerReady,
-    ControllerSpec, FleetSupply, LearnedHistory, ListingLimits, PortError, RequestGate,
-    SchedulerPort, SchedulerSnapshot, WorkerSpec, WorkerTls,
+    ActionsView, ApiService, ControllerConnections, ControllerDrain, ControllerEndpoints,
+    ControllerReady, ControllerSpec, FleetSupply, LearnedHistory, ListingLimits, PortError,
+    RequestGate, SchedulerPort, SchedulerSnapshot, WorkerSpec, WorkerTls,
 };
 use gang_types::{FleetName, InstanceId, Url};
 use nativelink_scheduler::resource_sketch::ResourceSketch;
@@ -21,10 +21,6 @@ use tokio::sync::watch;
 
 use crate::config::NativeLinkConfig;
 use crate::controller::{self, Handles, SharedServices};
-use crate::errors::NativeLinkConfigError;
-use crate::handoff::HandOff;
-use crate::history::Histories;
-use crate::serve::{Listener, ServeMode, ServeShutdown, serve};
 use crate::snapshot;
 use crate::worker;
 // Hyper 1.12.0's HTTP/1 default read-buffer maximum bounds accepted request headers:
@@ -36,10 +32,10 @@ const DURATION_JSON_OVERHEAD: usize = 1_024;
 
 /// The `NativeLink` scheduler: runs the controller and worker in process and reads their state.
 ///
-/// One controller and one worker at a time per adapter; either may run again after returning.
-/// Learned resource reservations and durations remain available between terms and after drain
-/// for the final persistence flush. One resource sketch maintenance task outlives the controller
-/// call; Gang's learned-history port owns persistence rather than a native store.
+/// Each adapter constructs one original controller engine and retains it and its stores through
+/// handoff instead of rebuilding a standby stack or returning to another term.
+/// Learned reservations and durations remain available through the final persistence snapshot.
+/// Gang's learned-history port owns persistence rather than a native store.
 /// The worker's process-wide zombie reaper outlives its initiating call. The first `globals::init`
 /// call decides the digest hash function and raises the open-file soft limit for the whole process.
 pub struct NativeLink {
@@ -50,12 +46,13 @@ pub struct NativeLink {
     /// The live handles of the serving controller; `None` until the controller starts serving
     /// and again after it stops.
     handles: watch::Sender<Option<Arc<Handles>>>,
-    /// Learned measurements retained between terms and for the final persistence flush.
+    /// Learned measurements retained through the final persistence snapshot.
     histories: Mutex<Option<Arc<Histories>>>,
-    /// Learned resource reservations shared by sequential controller terms.
+    /// The original controller's resource sketch.
     resources: OnceLock<Arc<ResourceSketch>>,
-    /// Stores and shared handlers retained independently of controller terms.
+    /// The original controller's stores.
     shared: SharedServices,
+    started: AtomicBool,
 }
 
 /// The controller is not serving: `run_controller` has not started serving, or has stopped.
@@ -101,6 +98,7 @@ impl NativeLink {
             histories: Mutex::new(None),
             resources: OnceLock::new(),
             shared: SharedServices::default(),
+            started: AtomicBool::new(false),
         })
     }
 }
@@ -237,6 +235,9 @@ impl SchedulerPort for NativeLink {
         connections: ControllerConnections<P, W, A>,
         ready: ControllerReady,
     ) -> Result<(), PortError> {
+        if self.started.swap(true, Ordering::AcqRel) {
+            return Err(crate::errors::NativeLinkEmbedError::AlreadyServing.into());
+        }
         controller::run(
             &self.config,
             spec,
@@ -253,55 +254,10 @@ impl SchedulerPort for NativeLink {
         .map_err(PortError::from)
     }
 
-    async fn serve_standby<P: RequestGate, W: RequestGate, A: ApiService>(
-        &self,
-        connections: ControllerConnections<P, W, A>,
-    ) -> Result<(), PortError> {
-        let request_timeout = self
-            .config
-            .request_timeout
-            .ok_or(NativeLinkConfigError::ControllerRequestTimeoutRequired)?;
-        let ControllerConnections {
-            public,
-            worker,
-            api,
-        } = connections;
-        let (public_router, worker_router, public_limit, worker_limit) =
-            self.shared
-                .standby(api)
-                .ok_or_else(|| PortError::unavailable(NotServing))?;
-        let handoff = HandOff::new();
-        handoff.begin();
-        handoff.release_workers();
-        let (ended, _endings) = tokio::sync::mpsc::unbounded_channel();
-        let shutdown = ServeShutdown {
-            ended,
-            handoff,
-            mode: ServeMode::Standby(request_timeout),
-        };
-        let tuning = &self.config.http2;
-        tokio::try_join!(
-            serve(
-                public,
-                public_router,
-                tuning,
-                Listener::Public,
-                public_limit,
-                SystemClock::new(),
-                shutdown.clone(),
-            ),
-            serve(
-                worker,
-                worker_router,
-                tuning,
-                Listener::Worker,
-                worker_limit,
-                SystemClock::new(),
-                shutdown,
-            ),
-        )
-        .map_err(PortError::from)?;
-        Ok(())
+    async fn hand_off(&self, into: &mut ControllerDrain) -> Result<(), PortError> {
+        let handles = self.current()?;
+        handles.worker_scheduler.begin_hand_off().await?;
+        handles.worker_scheduler.refresh_drain(into).await
     }
 
     /// Runs one worker until stopped, it fails, or its single action finishes.

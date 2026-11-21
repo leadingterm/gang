@@ -558,10 +558,8 @@ variable "extra_config_toml" {
     TOML tables, not a string: JSON-encoding it would quote it. It must consist of complete [table] sections (developer
     and CI identity providers, tunables), never bare top-level keys: a key there would join the last table. TOML tables
     already opened by this module cannot be reopened here, even for settings omitted from the template such as
-    [database.sqlite].busy_timeout and [authentication.workers.mtls].certificate_ttl. With database.engine "postgres" or
-    "dynamodb", the module opens [server.http2] and owns shutdown_grace, so all other keys in that table,
-    including max_connections and receive_window, retain their defaults. With "sqlite", the module does not open that
-    table, so it can be appended here. For load-balanced shared databases, the
+    [database.sqlite].busy_timeout and [authentication.workers.mtls].certificate_ttl. The module does not open
+    [server.http2], so it can be appended here. For load-balanced shared databases, the
     module also opens [server.proxy_protocol], so it cannot be reopened here; header_timeout, max_pending_headers, and
     max_header_size are not exposed and retain their runtime defaults. Its first non-blank, non-comment line must start
     with "[". Content is public: it lands in the SSM parameter (gang.toml), not

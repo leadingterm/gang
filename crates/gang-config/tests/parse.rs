@@ -784,7 +784,7 @@ fn leadership_ttl_defaults_to_ten_seconds() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn leadership_renew_interval_defaults_to_three_seconds() -> Result<(), Box<dyn Error>> {
+fn leadership_renew_interval_defaults_to_one_second() -> Result<(), Box<dyn Error>> {
     assert_eq!(
         Sections::VALID
             .parse()?
@@ -792,7 +792,7 @@ fn leadership_renew_interval_defaults_to_three_seconds() -> Result<(), Box<dyn E
             .leadership
             .renew_interval
             .get(),
-        Duration::from_secs(3)
+        Duration::from_secs(1)
     );
     Ok(())
 }
@@ -936,9 +936,9 @@ fn wildcard_listener_collisions_respect_address_family() {
 
 #[test]
 fn leadership_renewal_and_skew_must_be_strictly_below_ttl() {
-    for (renew, valid) in [("5s", true), ("6s", false), ("7s", false)] {
+    for (renew, valid) in [("1s", true), ("2s", false), ("3s", false)] {
         let server = format!(
-            "{SERVER}\n[server.leadership]\nttl = \"10s\"\nrenew_interval = \"{renew}\"\nclock_skew = \"2s\"\n"
+            "{SERVER}\n[server.leadership]\nttl = \"5s\"\nrenew_interval = \"{renew}\"\nclock_skew = \"2s\"\n"
         );
         let result = Sections {
             server: server.leak(),
@@ -958,7 +958,7 @@ fn leadership_renewal_and_skew_must_be_strictly_below_ttl() {
 #[test]
 fn leadership_takeover_and_health_must_precede_keepalive_timeout() {
     assert!(Sections::VALID.parse().is_ok());
-    for (ttl, valid) in [("14s", true), ("15s", false), ("20s", false)] {
+    for (ttl, valid) in [("16s", true), ("17s", false), ("20s", false)] {
         let server = format!("{SERVER}\n[server.leadership]\nttl = \"{ttl}\"\n");
         let result = Sections {
             server: server.leak(),
@@ -968,7 +968,7 @@ fn leadership_takeover_and_health_must_precede_keepalive_timeout() {
         if valid {
             assert!(result.is_ok());
         } else {
-            let expected_takeover = if ttl == "15s" { 20 } else { 25 };
+            let expected_takeover = if ttl == "17s" { 20 } else { 23 };
             assert!(matches!(
                 result,
                 Err(ConfigError::LeadershipOutlastsKeepalive {
@@ -986,7 +986,7 @@ fn leadership_takeover_and_health_must_precede_keepalive_timeout() {
 #[test]
 fn leadership_call_timeout_must_fit_in_the_lease() {
     let server = format!(
-        "{SERVER}\n[server.leadership]\nttl = \"10s\"\nrenew_interval = \"6s\"\nclock_skew = \"2s\"\n"
+        "{SERVER}\n[server.leadership]\nttl = \"10s\"\nrenew_interval = \"7s\"\nclock_skew = \"2s\"\n"
     );
     let result = Sections {
         server: server.leak(),
@@ -1026,66 +1026,29 @@ fn worker_connect_timeout_must_be_below_twice_worker_timeout() {
 }
 
 #[test]
-fn shutdown_grace_must_be_strictly_below_every_boot_grace() {
-    for (grace, valid) in [("29s", true), ("30s", false), ("31s", false)] {
-        let server = format!("{SERVER}\n[server.http2]\nshutdown_grace = \"{grace}\"\n");
-        let result = Sections {
-            fleet: FLEET
-                .replace("boot_grace = \"1m\"", "boot_grace = \"30s\"")
-                .leak(),
-            server: server.leak(),
-            ..Sections::VALID
-        }
-        .parse();
+fn planned_handover_must_precede_legacy_cli_last_attempt() {
+    for (call, valid) in [("1059ms", true), ("1060ms", false)] {
+        let server = format!(
+            "{SERVER}\n[server.leadership]\ncall_timeout = \"{call}\"\n"
+        );
+        let result = Sections { server: server.leak(), ..Sections::VALID }.parse();
         assert_eq!(result.is_ok(), valid);
         if !valid {
-            assert!(matches!(
-                result,
-                Err(ConfigError::ShutdownGraceNotBelowBootGrace { .. })
-            ));
+            assert!(matches!(result, Err(ConfigError::HandoverOutlastsCli { .. })));
         }
     }
 }
 
 #[test]
-fn shutdown_grace_checks_each_fleet() -> Result<(), Box<dyn Error>> {
-    let server = format!("{SERVER}\n[server.http2]\nshutdown_grace = \"30s\"\n");
-    let error = Sections {
-        fleet: TWO_FLEETS
-            .replace("boot_grace = \"1m\"", "boot_grace = \"30s\"")
-            .leak(),
-        provisioner: AWS_PROVISIONER,
-        server: server.leak(),
-        ..Sections::VALID
-    }
-    .parse()
-    .err()
-    .ok_or("accepted")?;
-    assert!(
-        matches!(error, ConfigError::ShutdownGraceNotBelowBootGrace {
-        shutdown_grace, boot_grace, ..
-    } if shutdown_grace == Duration::from_secs(30) && boot_grace == Duration::from_secs(30))
-    );
-    Ok(())
-}
-
-#[test]
-fn default_shutdown_grace_must_be_below_boot_grace() {
-    let fleet = FLEET.replace("boot_grace = \"1m\"", "boot_grace = \"30s\"");
-    assert!(matches!(
-        Sections {
-            fleet: fleet.leak(),
-            ..Sections::VALID
-        }
-        .parse(),
-        Err(ConfigError::ShutdownGraceNotBelowBootGrace { .. })
-    ));
+fn removed_shutdown_grace_is_rejected() {
+    let server = format!("{SERVER}\n[server.http2]\nshutdown_grace = \"1s\"\n");
+    assert!(Sections { server: server.leak(), ..Sections::VALID }.parse().is_err());
 }
 
 #[test]
 fn leadership_settings_round_trip_and_reject_unknown_fields() -> Result<(), Box<dyn Error>> {
     let server = format!(
-        "{SERVER}\nrevocation_refresh_interval = \"6s\"\n[server.leadership]\nttl = \"12s\"\nrenew_interval = \"4s\"\nclock_skew = \"3s\"\n"
+        "{SERVER}\nrevocation_refresh_interval = \"6s\"\n[server.leadership]\nttl = \"12s\"\nrenew_interval = \"1s\"\nclock_skew = \"3s\"\n"
     );
     let text = Sections {
         server: server.leak(),
@@ -1096,7 +1059,7 @@ fn leadership_settings_round_trip_and_reject_unknown_fields() -> Result<(), Box<
     assert_eq!(config.server.leadership.ttl.get(), Duration::from_secs(12));
     assert_eq!(
         config.server.leadership.renew_interval.get(),
-        Duration::from_secs(4)
+        Duration::from_secs(1)
     );
     assert_eq!(config.server.leadership.clock_skew, Duration::from_secs(3));
     assert_eq!(
@@ -1241,7 +1204,7 @@ fn scheduler_is_not_required_or_serialized() -> Result<(), Box<dyn Error>> {
 fn nondefault_runtime_domains_round_trip() -> Result<(), Box<dyn Error>> {
     let top = format!("{TOP}\nworker_endpoint = \"grpcs://worker.example.com:9445\"\n");
     let server = format!(
-        "{SERVER}\nworker_timeout = \"20s\"\nmax_open_files = 8192\n[server.http2]\nshutdown_grace = \"12s\"\nmax_connections = 64\n"
+        "{SERVER}\nworker_timeout = \"20s\"\nmax_open_files = 8192\n[server.http2]\nmax_connections = 64\n"
     );
     let text = Sections {
         top: top.leak(),
@@ -1268,10 +1231,6 @@ fn nondefault_runtime_domains_round_trip() -> Result<(), Box<dyn Error>> {
         original.server.max_open_files
     );
     assert_eq!(reparsed.worker, original.worker);
-    assert_eq!(
-        reparsed.server.http2.shutdown_grace,
-        Duration::from_secs(12)
-    );
     assert_eq!(
         reparsed.worker.upload_timeout.get(),
         Duration::from_secs(11)
@@ -4799,7 +4758,7 @@ fn cold_readiness_prior_clamps_each_fleet_without_changing_boot_grace() -> Resul
 {
     for seconds in [30, 60, 600] {
         let text = Sections {
-            server: "[server]\ntrust_domain = \"gang.internal\"\n[server.http2]\nshutdown_grace = \"0s\"\n",
+            server: "[server]\ntrust_domain = \"gang.internal\"\n",
             ..Sections::VALID
         }
         .text()

@@ -2,8 +2,8 @@
 //!
 //! The caller accepts and authenticates every connection. Each one is served in a task
 //! owned by the serve future, so dropping that future closes every connection. Once all listener
-//! streams have ended, client connections shut down gracefully; worker connections do so once
-//! all workers are released, or are dropped when `shutdown_grace` expires.
+//! streams have ended, connections close. The runtime ends listeners only after the original
+//! controller has drained and the host is unrouted.
 //! HTTP/1.1 connections are closed if a request head stalls past `header_read_timeout`;
 //! HTTP/2 connections are kept alive by `keepalive_interval` pings.
 //! Each HTTP/2 connection, and each of its streams, may receive `receive_window` bytes before the
@@ -84,26 +84,6 @@ fn http_server(tuning: &Http2Config, listener: Listener) -> auto::Builder<TokioE
     http
 }
 
-/// Admission-serving policy; standby transports never own controller work.
-#[derive(Clone, Copy)]
-pub(crate) enum ServeMode {
-    Controller,
-    Standby(NonZeroDuration),
-}
-
-impl ServeMode {
-    fn idle_timeout(self, listener: Listener, tuning: &Http2Config) -> Option<std::time::Duration> {
-        (matches!(self, Self::Standby(_)) || listener == Listener::Public)
-            .then_some(tuning.unproven_idle_timeout.get())
-    }
-
-    fn shutdown_grace(self, tuning: &Http2Config) -> std::time::Duration {
-        match self {
-            Self::Controller => tuning.shutdown_grace,
-            Self::Standby(request_timeout) => tuning.shutdown_grace.min(request_timeout.get()),
-        }
-    }
-}
 
 /// Routers grouped by their admission scope, with the fallback owned by `shared`.
 pub(crate) struct ScopedRoutes {
@@ -114,20 +94,18 @@ pub(crate) struct ScopedRoutes {
 }
 
 impl ScopedRoutes {
-    fn gated<G: RequestGate>(self, gate: G, mode: ServeMode) -> Router {
+    fn gated<G: RequestGate>(self, gate: G, listener: Listener) -> Router {
         let shared = self.shared.layer(from_fn_with_state(
             GateState {
                 gate: gate.clone(),
-                scope: RequestScope::Shared,
-                force_not_leading: false,
+                scope: if listener == Listener::Worker { RequestScope::WorkerStore } else { RequestScope::Controller },
             },
             admit::<G>,
         ));
         let leader = self.leader.layer(from_fn_with_state(
             GateState {
                 gate,
-                scope: RequestScope::Leader,
-                force_not_leading: matches!(mode, ServeMode::Standby(_)),
+                scope: RequestScope::Controller,
             },
             admit::<G>,
         ));
@@ -140,7 +118,6 @@ impl ScopedRoutes {
 pub(crate) struct ServeShutdown {
     pub(crate) ended: tokio::sync::mpsc::UnboundedSender<()>,
     pub(crate) handoff: HandOff,
-    pub(crate) mode: ServeMode,
 }
 
 /// Serves `router` on the connections of `listening` until the stream ends and the served
@@ -151,8 +128,8 @@ pub(crate) struct ServeShutdown {
 ///
 /// Each connection speaks the HTTP versions of `listener`.
 ///
-/// After hand-off begins, client connections shut down gracefully; worker connections do so
-/// after all workers are released. Connections still open after `tuning.shutdown_grace` are dropped.
+/// Hand-off retires pre-existing admitted public connections without closing fresh refusal
+/// connections before their complete not-started response.
 ///
 /// HTTP/1.1 request heads must arrive within `tuning.header_read_timeout`, or the connection is
 /// closed. HTTP/2 keeps connections alive with pings every `tuning.keepalive_interval`.
@@ -183,13 +160,13 @@ pub(crate) async fn serve<G: RequestGate, C: Clock + Clone + Send + Sync + 'stat
         mut connections,
         gate,
     } = listening;
-    let gated = routes.gated(gate, shutdown.mode);
+    let gated = routes.gated(gate, listener);
     let http = http_server(tuning, listener);
     let (graceful, _) = watch::channel(());
     let mut served = JoinSet::new();
     let mut refusals = Refusals::new(listener, max_connections, tuning.refusal_log_interval);
     let mut open: VecDeque<Open> = VecDeque::new();
-    let idle = shutdown.mode.idle_timeout(listener, tuning);
+    let idle = (listener == Listener::Public).then_some(tuning.unproven_idle_timeout.get());
     loop {
         tokio::select! {
             next = connections.next() => if let Some(accepted) = next {
@@ -206,6 +183,9 @@ pub(crate) async fn serve<G: RequestGate, C: Clock + Clone + Send + Sync + 'stat
                     }
                     // The peer and the standing are outermost, so the gate sees them on every request.
                     let standing = Arc::new(Standing::default());
+                    if listener == Listener::Public {
+                        shutdown.handoff.public_connection(&standing);
+                    }
                     let service = gated
                         .clone()
                         .layer(Extension(accepted.peer))
@@ -231,6 +211,12 @@ pub(crate) async fn serve<G: RequestGate, C: Clock + Clone + Send + Sync + 'stat
                             result = &mut connection => Some(result),
                             () = &mut expired => None,
                             () = graceful_trigger(&mut shutdown, &expiring) => {
+                                // After actual routing-away, an unadmitted peer with no
+                                // request may be dropped even if its HTTP/2 preface stalled.
+                                // A refusal already in flight must send its complete response.
+                                if !expiring.is_admitted() && !expiring.is_busy() {
+                                    return;
+                                }
                                 connection.as_mut().graceful_shutdown();
                                 tokio::select! {
                                     result = &mut connection => Some(result),
@@ -256,16 +242,23 @@ pub(crate) async fn serve<G: RequestGate, C: Clock + Clone + Send + Sync + 'stat
     // Release listening sockets and pending shared accept guards before connection drain.
     drop(connections);
     let _ = shutdown.ended.send(());
-    drain_connections(
-        &clock,
-        tuning,
-        listener,
-        &shutdown,
-        graceful,
-        &mut served,
-        &mut open,
-    )
-    .await;
+    loop {
+        tokio::select! {
+            () = shutdown.handoff.begun() => break,
+            Some(finished) = served.join_next_with_id(), if !served.is_empty() => reap(finished, &mut open),
+        }
+    }
+    if listener == Listener::Worker {
+        loop {
+            if served.is_empty() { return Ok(()); }
+            tokio::select! {
+                () = shutdown.handoff.workers_released() => break,
+                Some(finished) = served.join_next_with_id() => reap(finished, &mut open),
+            }
+        }
+    }
+    let _ = graceful.send(());
+    while let Some(finished) = served.join_next_with_id().await { reap(finished, &mut open); }
     Ok(())
 }
 
@@ -277,48 +270,6 @@ async fn graceful_trigger(shutdown: &mut watch::Receiver<()>, standing: &Standin
     }
 }
 
-/// Waits for the common hand-off, then drains connections within the grace period.
-async fn drain_connections<C: Clock>(
-    clock: &C,
-    tuning: &Http2Config,
-    listener: Listener,
-    shutdown: &ServeShutdown,
-    graceful: watch::Sender<()>,
-    served: &mut JoinSet<()>,
-    open: &mut VecDeque<Open>,
-) {
-    loop {
-        tokio::select! {
-            () = shutdown.handoff.begun() => break,
-            Some(finished) = served.join_next_with_id(), if !served.is_empty() => reap(finished, open),
-        }
-    }
-    let drained = clock
-        .timeout(shutdown.mode.shutdown_grace(tuning), async {
-            if listener == Listener::Worker && matches!(shutdown.mode, ServeMode::Controller) {
-                loop {
-                    if served.is_empty() {
-                        return;
-                    }
-                    tokio::select! {
-                        () = shutdown.handoff.workers_released() => break,
-                        Some(finished) = served.join_next_with_id() => reap(finished, open),
-                    }
-                }
-            }
-            let _ = graceful.send(());
-            while let Some(finished) = served.join_next_with_id().await {
-                reap(finished, open);
-            }
-        })
-        .await;
-    if drained.is_err() {
-        tracing::warn!(
-            open = served.len(),
-            "connections did not close within the shutdown grace"
-        );
-    }
-}
 
 /// A served connection, in the order connections were handed in.
 struct Open {
@@ -468,7 +419,6 @@ mod tests {
                 ServeShutdown {
                     ended,
                     handoff,
-                    mode: ServeMode::Controller,
                 },
             )
             .await
@@ -514,11 +464,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ended_intake_releases_shared_accept_guard_before_either_mode_drains() -> TestResult {
-        for mode in [
-            ServeMode::Controller,
-            ServeMode::Standby(NonZeroDuration::from_secs(5)),
-        ] {
+    async fn ended_intake_releases_shared_accept_guard_before_drain() -> TestResult {
+        {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let address = listener.local_addr()?;
             let listener = Arc::new(tokio::sync::Mutex::new(listener));
@@ -545,15 +492,10 @@ mod tests {
                 }),
             );
             let handoff = HandOff::new();
-            if matches!(mode, ServeMode::Standby(_)) {
-                handoff.begin();
-                handoff.release_workers();
-            }
             let (ended, mut endings) = mpsc::unbounded_channel();
             let shutdown = ServeShutdown {
                 ended,
                 handoff: handoff.clone(),
-                mode,
             };
             let task = tokio::spawn(async move {
                 let tuning = Http2Config::default();
@@ -760,22 +702,9 @@ mod tests {
         mpsc::UnboundedSender<Accepted>,
         JoinHandle<Result<(), NativeLinkEmbedError>>,
     ) {
-        start_in_mode(router, gate, tuning, listener, clock, ServeMode::Controller)
+        start_scoped_in_mode(shared_routes(router), gate, tuning, listener, clock)
     }
 
-    fn start_in_mode<G: RequestGate, C: Clock + Clone + Send + Sync + 'static>(
-        router: Router,
-        gate: G,
-        tuning: Http2Config,
-        listener: Listener,
-        clock: C,
-        mode: ServeMode,
-    ) -> (
-        mpsc::UnboundedSender<Accepted>,
-        JoinHandle<Result<(), NativeLinkEmbedError>>,
-    ) {
-        start_scoped_in_mode(shared_routes(router), gate, tuning, listener, clock, mode)
-    }
 
     fn start_scoped_in_mode<G: RequestGate, C: Clock + Clone + Send + Sync + 'static>(
         routes: ScopedRoutes,
@@ -783,7 +712,6 @@ mod tests {
         tuning: Http2Config,
         listener: Listener,
         clock: C,
-        mode: ServeMode,
     ) -> (
         mpsc::UnboundedSender<Accepted>,
         JoinHandle<Result<(), NativeLinkEmbedError>>,
@@ -796,10 +724,6 @@ mod tests {
         .boxed();
         let listening = Listening { connections, gate };
         let handoff = HandOff::new();
-        if matches!(mode, ServeMode::Standby(_)) {
-            handoff.begin();
-            handoff.release_workers();
-        }
         let (ended, mut endings) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
             let serving = serve(
@@ -812,13 +736,13 @@ mod tests {
                 ServeShutdown {
                     ended,
                     handoff: handoff.clone(),
-                    mode,
                 },
             );
             tokio::pin!(serving);
             tokio::select! {
                 result = &mut serving => result,
                 _ = endings.recv() => {
+                    handoff.release_workers();
                     handoff.begin();
                     serving.await
                 }
@@ -1068,7 +992,6 @@ mod tests {
         let shutdown = ServeShutdown {
             ended,
             handoff: handoff.clone(),
-            mode: ServeMode::Controller,
         };
         let task = tokio::spawn(async move {
             serve(
@@ -1107,7 +1030,6 @@ mod tests {
         let shutdown = ServeShutdown {
             ended,
             handoff: handoff.clone(),
-            mode: ServeMode::Controller,
         };
         let clock = Arc::new(TestClock::new(Timestamp::from_unix_millis(0)));
         let task = tokio::spawn(async move {
@@ -1138,23 +1060,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_open_stream_is_cut_after_the_shutdown_grace() -> TestResult {
+    async fn transport_waits_for_explicit_handoff_before_closing() -> TestResult {
         let (entered, mut entries) = mpsc::unbounded_channel::<()>();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let released = Arc::clone(&release);
         let hanging = Router::new().route(
+            // This explicit response release models completion of the original owned work.
             "/hang",
             get(move || {
                 let entered = entered.clone();
+                let released = Arc::clone(&released);
                 async move {
-                    // The handler never answers, so the request stays open.
+                    // Hold an actual response until its owner permits completion.
                     let _ = entered.send(());
-                    std::future::pending::<&'static str>().await
+                    released.notified().await;
+                    "complete"
                 }
             }),
         );
-        let tuning = Http2Config {
-            shutdown_grace: Duration::ZERO,
-            ..Http2Config::default()
-        };
+        let tuning = Http2Config::default();
         let (feed, task) = start_tuned(hanging, tuning);
         let (mut sender, connection) = open(connect(&feed)?).await?;
         sender.ready().await?;
@@ -1162,7 +1086,9 @@ mod tests {
         let request_task = tokio::spawn(async move { sender.send_request(request).await });
         entries.recv().await.ok_or("the handler never started")?;
         drop(feed);
-        // The grace is zero, so `serve` cuts the open request as soon as the stream has ended.
+        assert!(!task.is_finished(), "no timer may cut a live response");
+        release.notify_one();
+        request_task.await??;
         finished(task).await?;
         let _outcome: Result<(), hyper::Error> = connection.await?;
         request_task.abort();
@@ -1240,17 +1166,16 @@ mod tests {
     struct ScopedTestGate {
         entered: mpsc::UnboundedSender<()>,
         release: Arc<tokio::sync::Notify>,
-        leading: bool,
     }
 
     impl RequestGate for ScopedTestGate {
         async fn admit(
             &self,
-            scope: RequestScope,
+            _scope: RequestScope,
             _peer: &Peer,
             parts: &mut http::request::Parts,
         ) -> Result<GateDecision, PortError> {
-            if scope == RequestScope::Leader && !self.leading {
+            if parts.uri.path() == "/leader" {
                 return Ok(GateDecision::NotLeading);
             }
             if parts.headers.contains_key("x-hold-admission") {
@@ -1332,7 +1257,6 @@ mod tests {
     async fn assert_retirement_preserves_shared_streams(
         authenticated: bool,
         listener: Listener,
-        standby: bool,
         api_marker: bool,
     ) -> TestResult {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1348,16 +1272,10 @@ mod tests {
             ScopedTestGate {
                 entered: gate_entered,
                 release: Arc::clone(&gate_release),
-                leading: standby,
             },
             Http2Config::default(),
             listener,
             SystemClock::new(),
-            if standby {
-                ServeMode::Standby(NonZeroDuration::from_secs(5))
-            } else {
-                ServeMode::Controller
-            },
         );
         let (client, upstream, downstream) = hold_server_eof(connect(&feed)?);
         let (mut sender, connection) = h2::client::handshake(client).await?;
@@ -1431,17 +1349,14 @@ mod tests {
     async fn leadership_retirement_sends_goaway_without_cancelling_accepted_shared_streams()
     -> TestResult {
         for authenticated in [false, true] {
-            for (listener, standby, api_marker) in [
-                (Listener::Public, false, false),
-                (Listener::Public, false, true),
-                (Listener::Public, true, false),
-                (Listener::Worker, false, false),
-                (Listener::Worker, true, false),
+            for (listener, api_marker) in [
+                (Listener::Public, false),
+                (Listener::Public, true),
+                (Listener::Worker, false),
             ] {
                 assert_retirement_preserves_shared_streams(
                     authenticated,
                     listener,
-                    standby,
                     api_marker,
                 )
                 .await?;
@@ -2069,7 +1984,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn refusal_idle_deadlines_survive_graceful_shutdown_on_both_roles() -> TestResult {
+    async fn final_transport_shutdown_closes_unadmitted_stalled_prefaces() -> TestResult {
         for listener in [Listener::Public, Listener::Worker] {
             for prefix in [b"".as_slice(), b"PRI * HTTP/2.0\r\n".as_slice()] {
                 let clock = Arc::new(TestClock::new(Timestamp::UNIX_EPOCH));
@@ -2077,22 +1992,18 @@ mod tests {
                     unproven_idle_timeout: NonZeroDuration::from_secs(5),
                     ..Http2Config::default()
                 };
-                let (feed, task) = start_in_mode(
+                let (feed, task) = start_clocked(
                     Router::new(),
                     Allow,
                     tuning,
                     listener,
                     Arc::clone(&clock),
-                    ServeMode::Standby(NonZeroDuration::from_secs(20)),
                 );
                 let mut peer = connect(&feed)?;
                 peer.write_all(prefix).await?;
                 settle().await;
-                clock.advance(Duration::from_secs(4));
-                settle().await;
                 drop(feed);
                 settle().await;
-                clock.advance(Duration::from_secs(1));
                 tokio::time::timeout(Duration::from_secs(1), finished(task)).await??;
                 peer.read_to_end(&mut Vec::new()).await?;
             }
@@ -2100,37 +2011,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn refusal_drain_cap_and_same_tick_idle_expiry_close_without_fatal_errors() -> TestResult
-    {
-        for listener in [Listener::Public, Listener::Worker] {
-            for (grace_s, request_s, idle_s) in [(5, 20, 60), (30, 5, 60), (5, 5, 5)] {
-                let clock = Arc::new(TestClock::new(Timestamp::UNIX_EPOCH));
-                let tuning = Http2Config {
-                    shutdown_grace: Duration::from_secs(grace_s),
-                    unproven_idle_timeout: NonZeroDuration::from_secs(idle_s),
-                    ..Http2Config::default()
-                };
-                let (feed, task) = start_in_mode(
-                    Router::new(),
-                    Allow,
-                    tuning,
-                    listener,
-                    Arc::clone(&clock),
-                    ServeMode::Standby(NonZeroDuration::from_secs(request_s)),
-                );
-                let mut peer = connect(&feed)?;
-                peer.write_all(b"PRI * HTTP/2.0\r\n").await?;
-                settle().await;
-                drop(feed);
-                settle().await;
-                clock.advance(Duration::from_secs(grace_s.min(request_s)));
-                tokio::time::timeout(Duration::from_secs(1), finished(task)).await??;
-                peer.read_to_end(&mut Vec::new()).await?;
-            }
-        }
-        Ok(())
-    }
 
     #[derive(Clone)]
     struct SignalledRefusal {
@@ -2156,7 +2036,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_pending_marked_503_finishes_after_refusal_intake_stops() -> TestResult {
         let (entered, mut entries) = mpsc::unbounded_channel();
-        let (feed, task) = start_in_mode(
+        let (feed, task) = start_clocked(
             Router::new().fallback(|| async { StatusCode::NOT_FOUND }),
             SignalledRefusal {
                 entered,
@@ -2165,7 +2045,6 @@ mod tests {
             Http2Config::default(),
             Listener::Public,
             SystemClock::new(),
-            ServeMode::Standby(NonZeroDuration::from_secs(5)),
         );
         // One byte of downstream buffering keeps the actual response pending until read.
         let (server, mut peer) = tokio::io::duplex(1);
@@ -2200,7 +2079,7 @@ mod tests {
         for listener in [Listener::Public, Listener::Worker] {
             let (entered, mut entries) = mpsc::unbounded_channel();
             let release = Arc::new(tokio::sync::Notify::new());
-            let (feed, task) = start_in_mode(
+            let (feed, task) = start_clocked(
                 Router::new().fallback(|| async { StatusCode::NOT_FOUND }),
                 SignalledRefusal {
                     entered,
@@ -2209,7 +2088,6 @@ mod tests {
                 Http2Config::default(),
                 listener,
                 SystemClock::new(),
-                ServeMode::Standby(NonZeroDuration::from_secs(5)),
             );
             let (mut sender, connection) = open(connect(&feed)?).await?;
             let response = tokio::spawn(async move {

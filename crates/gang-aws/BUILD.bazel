@@ -3,6 +3,10 @@ load("//bazel/rust:defs.bzl", "workspace_rust_library")
 workspace_rust_library(
     name = "gang_aws",
     dev_deps = ["//crates/gang-testkit:gang_testkit"],
+    test_data = glob(
+        ["Cargo.toml", "src/**/*.rs", "tests/fixtures/**"],
+        allow_empty = True,
+    ) + ["//infra/terraform/modules/controller:lifecycle-hook.json"],  # keep
     deps = [
         "//crates/gang-aws-sdk:gang_aws_sdk",
         "//crates/gang-clock:gang_clock",

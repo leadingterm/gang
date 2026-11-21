@@ -25,7 +25,6 @@ struct Flags {
     serving: AtomicBool,
     leading: AtomicBool,
     promoted: AtomicBool,
-    contending: AtomicBool,
     fence: Mutex<Option<Fence>>,
 }
 
@@ -53,17 +52,9 @@ impl Readiness {
     pub(crate) fn begin_term(&self, fence: Fence) {
         self.stop();
         self.0.promoted.store(false, Ordering::Release);
-        self.stop_contending();
         *self.0.fence.lock() = Some(fence);
     }
 
-    pub(crate) fn contend(&self) {
-        self.0.contending.store(true, Ordering::Release);
-    }
-
-    pub(crate) fn stop_contending(&self) {
-        self.0.contending.store(false, Ordering::Release);
-    }
 
     pub(crate) fn serve(&self) {
         self.0.serving.store(true, Ordering::Release);
@@ -86,16 +77,16 @@ impl Readiness {
     }
 
     pub(crate) fn ready(&self) -> bool {
-        if self.0.promoted.load(Ordering::Acquire) {
-            self.is_leading()
-        } else {
-            self.0.serving.load(Ordering::Acquire) && self.0.contending.load(Ordering::Acquire)
-        }
+        self.is_leading()
     }
 
-    /// Admits leader requests while serving a promoted term, independently of lease health.
+    /// A promoted engine keeps fail-static admission through lease lapse until actual handoff.
     pub(crate) fn admitting(&self) -> bool {
         self.0.promoted.load(Ordering::Acquire) && self.0.serving.load(Ordering::Acquire)
+    }
+    /// Only a previously promoted original engine may keep authenticated worker store I/O.
+    pub(crate) fn worker_store_admitting(&self) -> bool {
+        self.0.promoted.load(Ordering::Acquire)
     }
 
     pub(crate) fn status(&self, path: &str) -> StatusCode {
@@ -148,7 +139,7 @@ pub(crate) async fn serve_health<L: Listener, C: Clock>(
                     let readiness = readiness.clone();
                     let service = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
                         let status = readiness.status(request.uri().path());
-                        let leading = readiness.is_leading();
+                        let leading = status == StatusCode::OK;
                         async move {
                             let mut response = Response::new(Empty::<Bytes>::new());
                             *response.status_mut() = status;
@@ -283,22 +274,19 @@ mod tests {
     }
 
     #[test]
-    fn contender_is_ready_without_promotion_and_term_reset_clears_it() {
+    fn only_the_promoted_holder_is_ready_and_drain_keeps_worker_store_admission() {
         let readiness = Readiness::default();
         let (fence, _keeper) = valid_fence();
         readiness.begin_term(fence);
         readiness.serve();
         assert_statuses(&readiness, StatusCode::SERVICE_UNAVAILABLE);
-        readiness.contend();
-        assert_statuses(&readiness, StatusCode::OK);
         assert!(!readiness.admitting());
-        readiness.stop_contending();
-        assert_statuses(&readiness, StatusCode::SERVICE_UNAVAILABLE);
         readiness.lead();
         assert_statuses(&readiness, StatusCode::OK);
         assert!(readiness.admitting());
         readiness.stop();
         assert!(!readiness.admitting());
+        assert!(readiness.worker_store_admitting());
         assert_statuses(&readiness, StatusCode::SERVICE_UNAVAILABLE);
         let (next_fence, _next_keeper) = valid_fence();
         readiness.begin_term(next_fence);
@@ -320,6 +308,7 @@ mod tests {
         assert_statuses(&readiness, StatusCode::SERVICE_UNAVAILABLE);
         let (fence, keeper) = valid_fence();
         readiness = readiness.with_fence(fence);
+        assert!(readiness.admitting());
         assert_statuses(&readiness, StatusCode::OK);
         keeper.revoke();
         assert!(readiness.admitting());
@@ -418,7 +407,7 @@ mod tests {
         });
         for (step, (status, leading)) in [
             (StatusCode::SERVICE_UNAVAILABLE, "false"),
-            (StatusCode::OK, "false"),
+            (StatusCode::SERVICE_UNAVAILABLE, "false"),
             (StatusCode::OK, "true"),
             (StatusCode::SERVICE_UNAVAILABLE, "false"),
             (StatusCode::SERVICE_UNAVAILABLE, "false"),
@@ -438,7 +427,6 @@ mod tests {
             match step {
                 0 => {
                     readiness.serve();
-                    readiness.contend();
                 }
                 1 => readiness.lead(),
                 2 => keeper.revoke(),

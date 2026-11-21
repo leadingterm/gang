@@ -2,18 +2,39 @@
 
 use std::time::Duration;
 
-use crate::health::{CLIENT_RETRY_MAX_DELAY, health_check};
+use crate::health::health_check;
 
 /// Default interval between leadership renewals.
-pub const DEFAULT_RENEW_INTERVAL: Duration = Duration::from_secs(3);
+pub const DEFAULT_RENEW_INTERVAL: Duration = Duration::from_secs(1);
 /// Default minimum remaining validity before a leadership-authorized mutation.
-pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(2);
-/// Allowance for the successor to promote after a cooperative yield.
-pub const PROMOTION_ALLOWANCE: Duration = Duration::from_secs(1);
-/// Retry allowance included in the handover window.
-pub const RETRY_MARGIN: Duration = CLIENT_RETRY_MAX_DELAY;
+pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(1);
 /// Marks a refusal made before the request reached its handler.
 pub const REQUEST_NOT_STARTED_HEADER: &str = "gang-request-not-started";
+
+/// Retry budget of the minimum-supported CLI, shipped before cooperative handover.
+pub const MINIMUM_CLI_RETRY_BUDGET: Duration = Duration::from_secs(21);
+/// Initial exponential delay of that CLI.
+pub const MINIMUM_CLI_INITIAL_DELAY: Duration = Duration::from_millis(100);
+/// Maximum exponential delay of that CLI.
+pub const MINIMUM_CLI_MAX_DELAY: Duration = Duration::from_secs(5);
+
+/// Latest retry attempt made by the minimum-supported CLI. It stops rather than sleeping
+/// when its next delay is greater than or equal to the remaining retry budget.
+#[must_use]
+pub const fn minimum_cli_last_attempt() -> Duration {
+    let mut elapsed = Duration::ZERO;
+    let mut delay = MINIMUM_CLI_INITIAL_DELAY;
+    while delay.as_nanos() < MINIMUM_CLI_RETRY_BUDGET.saturating_sub(elapsed).as_nanos() {
+        elapsed = elapsed.saturating_add(delay);
+        let doubled = delay.saturating_mul(2);
+        delay = if doubled.as_nanos() < MINIMUM_CLI_MAX_DELAY.as_nanos() {
+            doubled
+        } else {
+            MINIMUM_CLI_MAX_DELAY
+        };
+    }
+    elapsed
+}
 
 /// Bounds the learned-history snapshot taken before releasing leadership.
 #[must_use]
@@ -25,15 +46,12 @@ pub const fn snapshot_timeout(renew_interval: Duration, call_timeout: Duration) 
     }
 }
 
-/// The load-balancer warmup covering readiness, snapshot, yield, promotion and retries.
+/// Bounds healthy observation, candidate observation, and four handover calls.
 #[must_use]
 pub const fn handover_window(renew_interval: Duration, call_timeout: Duration) -> Duration {
-    health_check()
-        .healthy_window()
+    health_check().healthy_window()
         .saturating_add(renew_interval)
-        .saturating_add(snapshot_timeout(renew_interval, call_timeout))
-        .saturating_add(PROMOTION_ALLOWANCE)
-        .saturating_add(RETRY_MARGIN)
+        .saturating_add(call_timeout.saturating_mul(4))
 }
 
 #[cfg(test)]
@@ -41,79 +59,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_window_tracks_policy() {
-        assert_eq!(
-            handover_window(DEFAULT_RENEW_INTERVAL, DEFAULT_CALL_TIMEOUT),
-            Duration::from_secs(21)
-        );
-        assert_eq!(
-            handover_window(Duration::from_secs(7), DEFAULT_CALL_TIMEOUT),
-            health_check().healthy_window()
-                + Duration::from_secs(7)
-                + DEFAULT_CALL_TIMEOUT
-                + PROMOTION_ALLOWANCE
-                + RETRY_MARGIN
-        );
+    fn legacy_retry_and_default_handover_have_a_call_cushion() {
+        assert_eq!(minimum_cli_last_attempt(), Duration::from_millis(16_300));
+        let planned = handover_window(DEFAULT_RENEW_INTERVAL, DEFAULT_CALL_TIMEOUT);
+        assert_eq!(planned, Duration::from_secs(15));
+        assert!(planned + DEFAULT_CALL_TIMEOUT < minimum_cli_last_attempt());
     }
 
     #[test]
-    fn snapshot_selects_the_smaller_bound() {
-        assert_eq!(
-            snapshot_timeout(DEFAULT_RENEW_INTERVAL, DEFAULT_CALL_TIMEOUT),
-            DEFAULT_CALL_TIMEOUT
-        );
-        assert_eq!(
-            snapshot_timeout(Duration::from_secs(1), DEFAULT_CALL_TIMEOUT),
-            Duration::from_secs(1)
-        );
-        assert_eq!(
-            snapshot_timeout(DEFAULT_CALL_TIMEOUT, DEFAULT_CALL_TIMEOUT),
-            DEFAULT_CALL_TIMEOUT
-        );
-        assert_eq!(
-            snapshot_timeout(Duration::ZERO, DEFAULT_CALL_TIMEOUT),
-            Duration::ZERO
-        );
-    }
-
-    #[test]
-    fn custom_window_preserves_subsecond_snapshot_bounds() {
-        let renew_interval = Duration::from_millis(750);
-        let call_timeout = Duration::from_millis(1250);
-        assert_eq!(
-            snapshot_timeout(renew_interval, call_timeout),
-            renew_interval
-        );
-        assert_eq!(
-            snapshot_timeout(call_timeout, renew_interval),
-            renew_interval
-        );
-        assert_eq!(
-            handover_window(renew_interval, call_timeout),
-            health_check().healthy_window()
-                + renew_interval
-                + renew_interval
-                + PROMOTION_ALLOWANCE
-                + RETRY_MARGIN
-        );
-    }
-
-    #[test]
-    fn window_saturates_instead_of_overflowing() {
-        assert_eq!(
-            snapshot_timeout(Duration::MAX, DEFAULT_CALL_TIMEOUT),
-            DEFAULT_CALL_TIMEOUT
-        );
-        assert_eq!(
-            snapshot_timeout(Duration::MAX, Duration::MAX),
-            Duration::MAX
-        );
+    fn window_uses_all_four_calls_and_saturates() {
+        assert_eq!(handover_window(Duration::from_millis(500), Duration::from_millis(250)), Duration::from_millis(11_500));
         assert_eq!(handover_window(Duration::MAX, Duration::MAX), Duration::MAX);
-        let half_max = Duration::MAX / 2;
-        assert_eq!(handover_window(half_max, half_max), Duration::MAX);
-        assert_eq!(
-            handover_window(Duration::MAX, DEFAULT_CALL_TIMEOUT),
-            Duration::MAX
-        );
+        assert_eq!(snapshot_timeout(Duration::from_secs(2), Duration::from_secs(1)), Duration::from_secs(1));
     }
 }

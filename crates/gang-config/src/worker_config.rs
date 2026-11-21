@@ -76,6 +76,16 @@ pub struct WorkerConfig {
     pub keepalive_interval: WholeSeconds,
 }
 
+impl WorkerConfig {
+    /// The maximum time for an attempt, including download, execution and upload.
+    #[must_use]
+    pub fn attempt_budget(&self, action_timeout: WholeSeconds) -> Duration {
+        action_timeout.get()
+            .saturating_add(self.download_timeout.get())
+            .saturating_add(self.upload_timeout.get())
+    }
+}
+
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
@@ -101,6 +111,19 @@ impl Default for WorkerConfig {
 mod tests {
     use super::WorkerConfig;
     use crate::WholeSeconds;
+
+    #[test]
+    fn attempt_budget_includes_both_transfers() {
+        let worker = WorkerConfig {
+            download_timeout: WholeSeconds::from_units(12),
+            upload_timeout: WholeSeconds::from_units(17),
+            ..WorkerConfig::default()
+        };
+        assert_eq!(
+            worker.attempt_budget(WholeSeconds::from_units(31)),
+            std::time::Duration::from_secs(60)
+        );
+    }
 
     #[test]
     fn worker_connection_settings_round_trip() -> Result<(), Box<dyn std::error::Error>> {

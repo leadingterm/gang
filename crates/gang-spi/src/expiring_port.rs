@@ -129,11 +129,13 @@ pub enum RecordKind {
     InfrastructureEvent,
     /// Learned per-source activity periods and an optional active-period checkpoint.
     SourceProfile,
+    /// Protection of an old controller's draining physical worker.
+    ControllerDrain,
 }
 
 impl RecordKind {
     /// Every kind, in declaration order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::LoginAttempt,
         Self::DeviceCode,
         Self::UserCode,
@@ -143,6 +145,7 @@ impl RecordKind {
         Self::HistoryChunk,
         Self::InfrastructureEvent,
         Self::SourceProfile,
+        Self::ControllerDrain,
     ];
 
     /// The kind's stable name in storage.
@@ -158,6 +161,7 @@ impl RecordKind {
             Self::HistoryChunk => "history-chunk",
             Self::InfrastructureEvent => "infrastructure-event",
             Self::SourceProfile => "source-profile",
+            Self::ControllerDrain => "controller-drain",
         }
     }
 }

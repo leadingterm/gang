@@ -6,7 +6,6 @@ use std::convert::Infallible;
 use std::num::NonZeroUsize;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock};
-use std::time::SystemTime;
 
 use axum::Router;
 use axum::body::Body;
@@ -36,7 +35,7 @@ use tokio::sync::{Notify, OnceCell, watch};
 use tonic::service::Routes;
 use tower::{Service, service_fn};
 
-use gang_clock::{Clock, SystemClock};
+use gang_clock::Clock;
 use gang_config::Http2Config;
 use gang_spi::{
     ApiRequestBody, ApiService, BoxedError, ControllerConnections, ControllerReady, ControllerSpec,
@@ -98,23 +97,10 @@ impl Drop for Serving<'_> {
     }
 }
 
-/// Process-lived stores and shared handlers, reused across controller terms and standby.
-/// The first term creates stores before its scheduler, then builds shared routes from copied
-/// capabilities metadata. The cached routes must not retain a term's scheduler.
+/// The original controller's stores, constructed once per adapter.
 #[derive(Default)]
 pub(crate) struct SharedServices {
-    /// Initialized before the first term's scheduler.
     stores: OnceCell<Arc<StoreManager>>,
-    /// Initialized after the first scheduler supplies capabilities metadata.
-    routes: OnceCell<SharedRoutes>,
-}
-
-struct SharedRoutes {
-    public: Router,
-    worker: Router,
-    standby_public: Router,
-    standby_worker: Router,
-    limits: ConnectionLimits,
 }
 
 impl SharedServices {
@@ -125,49 +111,6 @@ impl SharedServices {
         self.stores
             .get_or_try_init(|| async { build_stores(settings::controller_stores(spec)?).await })
             .await
-    }
-
-    async fn prepared_routes(
-        &self,
-        config: &NativeLinkConfig,
-        spec: &ControllerSpec<'_>,
-        shared: &Shared<'_>,
-        services: (&settings::ClientServices, &settings::WorkerServices),
-        standby: (Router, Router),
-    ) -> Result<&SharedRoutes, NativeLinkEmbedError> {
-        self.routes
-            .get_or_try_init(|| async {
-                Ok::<_, NativeLinkEmbedError>(SharedRoutes {
-                    public: with_request_metadata(
-                        client_routes(services.0, shared).await?,
-                        spec.observations.clone(),
-                    ),
-                    worker: worker_routes(services.1, shared)?,
-                    standby_public: with_request_metadata(standby.0, spec.observations.clone()),
-                    standby_worker: standby.1,
-                    limits: connection_limits(&config.http2, spec.max_workers),
-                })
-            })
-            .await
-    }
-
-    pub(crate) fn standby<A: ApiService>(
-        &self,
-        api: A,
-    ) -> Option<(ScopedRoutes, ScopedRoutes, NonZeroUsize, NonZeroUsize)> {
-        let routes = self.routes.get()?;
-        Some((
-            ScopedRoutes {
-                shared: routes.public.clone().fallback_service(api_service(api)),
-                leader: routes.standby_public.clone(),
-            },
-            ScopedRoutes {
-                shared: routes.worker.clone(),
-                leader: routes.standby_worker.clone(),
-            },
-            routes.limits.public,
-            routes.limits.worker,
-        ))
     }
 }
 
@@ -202,7 +145,13 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         actions: action_scheduler,
         workers: worker_scheduler,
         resource,
-    } = scheduler_stack(&scheduler, spec.fleets, &spec.actions, resources)?;
+    } = scheduler_stack(
+        &scheduler,
+        spec.fleets,
+        &spec.actions,
+        resources,
+        Arc::clone(&spec.clock),
+    )?;
     let handoff = HandOff::new();
     let action_scheduler: Arc<dyn KnownPlatformPropertyProvider> =
         Arc::new(HandOffActions::new(action_scheduler, handoff.clone()));
@@ -236,17 +185,11 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         workers: &workers,
         max_decoding_message_size: config.http2.max_message_size.get().as_usize(),
     };
-    let (client_leader, standby_public) = client_leader_routes(&client_services, &shared)?;
-    let (worker_leader, standby_worker) = worker_leader_routes(&worker_services, &shared)?;
-    let routes = shared_services
-        .prepared_routes(
-            config,
-            spec,
-            &shared,
-            (&client_services, &worker_services),
-            (standby_public, standby_worker),
-        )
-        .await?;
+    let client_leader = client_leader_routes(&client_services, &shared)?;
+    let worker_leader = worker_leader_routes(&worker_services, &shared)?;
+    let public_routes = with_request_metadata(client_routes(&client_services, &shared).await?, spec.observations.clone());
+    let worker_routes = worker_routes(&worker_services, &shared)?;
+    let limits = connection_limits(&config.http2, spec.max_workers);
 
     let published = Arc::new(Handles {
         worker_scheduler: draining.clone(),
@@ -268,15 +211,16 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         connections,
         ClientAndWorkerRoutes {
             public: ScopedRoutes {
-                shared: routes.public.clone(),
+                shared: public_routes,
                 leader: with_request_metadata(client_leader, spec.observations.clone()),
             },
             worker: ScopedRoutes {
-                shared: routes.worker.clone(),
+                shared: worker_routes,
                 leader: worker_leader,
             },
         },
-        routes.limits,
+        limits,
+        Arc::clone(&spec.clock),
         &draining,
         handoff,
     )
@@ -330,6 +274,7 @@ async fn serve_connections<P: RequestGate, W: RequestGate, A: ApiService>(
     connections: ControllerConnections<P, W, A>,
     routes: ClientAndWorkerRoutes,
     limits: ConnectionLimits,
+    clock: Arc<dyn Clock>,
     draining: &ObservingWorkerScheduler,
     handoff: HandOff,
 ) -> Result<(), NativeLinkEmbedError> {
@@ -350,9 +295,7 @@ async fn serve_connections<P: RequestGate, W: RequestGate, A: ApiService>(
     let shutdown = ServeShutdown {
         ended,
         handoff,
-        mode: crate::serve::ServeMode::Controller,
     };
-    let clock = SystemClock::new();
     let serving = async {
         tokio::try_join!(
             serve(
@@ -361,7 +304,7 @@ async fn serve_connections<P: RequestGate, W: RequestGate, A: ApiService>(
                 &config.http2,
                 Listener::Public,
                 limits.public,
-                clock,
+                Arc::clone(&clock),
                 shutdown.clone()
             ),
             serve(
@@ -383,18 +326,9 @@ async fn serve_connections<P: RequestGate, W: RequestGate, A: ApiService>(
             _ = endings.recv() => {}
         }
     }
-    let drained = clock
-        .timeout(config.http2.shutdown_grace, async {
-            draining.begin_hand_off().await;
-            serving.await
-        })
-        .await;
-    if let Ok(result) = drained {
-        result?;
-    } else {
-        tracing::warn!("controller hand-off exceeded the shutdown grace");
-    }
-    Ok(())
+    draining.begin_hand_off().await.map_err(NativeLinkEmbedError::Drain)?;
+    draining.refresh_drain(&mut gang_spi::ControllerDrain::default()).await.map_err(NativeLinkEmbedError::Drain)?;
+    serving.await
 }
 
 /// Worker generations that overlap on one instance: the one stopping (certificate renewal,
@@ -441,6 +375,7 @@ fn scheduler_stack(
     fleets: &FleetCatalog,
     actions: &gang_config::ActionsConfig,
     resources: &OnceLock<Arc<ResourceSketch>>,
+    clock: Arc<dyn Clock>,
 ) -> Result<SchedulerStack, NativeLinkEmbedError> {
     let mut resource = None;
     let (actions, workers) = action_stack(
@@ -450,12 +385,15 @@ fn scheduler_stack(
         resources,
         |simple, notify, sketch| {
             resource = Some(Arc::clone(&sketch));
+            let dispatch_clock = Arc::clone(&clock);
+            let now = move || std::time::UNIX_EPOCH
+                + std::time::Duration::from_millis(dispatch_clock.wall().as_unix_millis());
             let db = memory_awaited_action_db_factory(
                 simple.retain_completed_for_s,
                 &notify,
-                SystemTime::now,
+                now.clone(),
             );
-            SimpleScheduler::new_with_resource_sketch(simple, db, notify, None, Some(sketch))
+            SimpleScheduler::new_with_resource_sketch_and_now(simple, db, notify, None, Some(sketch), Arc::new(now))
         },
     )?;
     let resource = resource.ok_or_else(|| {
@@ -641,7 +579,7 @@ fn worker_routes(
 fn client_leader_routes(
     services: &settings::ClientServices,
     shared: &Shared<'_>,
-) -> Result<(Router, Router), NativeLinkEmbedError> {
+) -> Result<Router, NativeLinkEmbedError> {
     let limit = shared.max_decoding_message_size;
     let execution = ExecutionServer::new(&services.execution, shared.actions, shared.store_manager)
         .map_err(NativeLinkEmbedError::native("execution service"))?;
@@ -652,68 +590,32 @@ fn client_leader_routes(
     let ops = execution
         .into_operations_service()
         .max_decoding_message_size(limit);
-    let standby = Routes::from(Router::new())
-        .add_service(unavailable_like(&exec))
-        .add_service(unavailable_like(&ops));
     let live = Routes::from(Router::new())
         .add_service(exec)
         .add_service(ops);
-    Ok((live.into_axum_router(), standby.into_axum_router()))
+    Ok(live.into_axum_router())
 }
 
 fn worker_leader_routes(
     services: &settings::WorkerServices,
     shared: &Shared<'_>,
-) -> Result<(Router, Router), NativeLinkEmbedError> {
+) -> Result<Router, NativeLinkEmbedError> {
     let limit = shared.max_decoding_message_size;
     let worker_api = WorkerApiServer::new(&services.worker_api, shared.workers)
         .map_err(NativeLinkEmbedError::native("worker api service"))?
         .into_service()
         .max_decoding_message_size(limit);
-    let standby = Routes::from(Router::new()).add_service(unavailable_like(&worker_api));
     let live = Routes::from(Router::new()).add_service(worker_api);
-    Ok((live.into_axum_router(), standby.into_axum_router()))
+    Ok(live.into_axum_router())
 }
 
-/// Registers the live service's name without retaining the service or its scheduler.
-struct Unavailable<T>(std::marker::PhantomData<fn() -> T>);
-
-impl<T> Clone for Unavailable<T> {
-    fn clone(&self) -> Self {
-        Self(std::marker::PhantomData)
-    }
-}
-
-impl<T: tonic::server::NamedService> tonic::server::NamedService for Unavailable<T> {
-    const NAME: &'static str = T::NAME;
-}
-
-impl<T> Service<Request<tonic::body::Body>> for Unavailable<T> {
-    type Response = Response<tonic::body::Body>;
-    type Error = Infallible;
-    type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
-
-    fn poll_ready(
-        &mut self,
-        _: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, _: Request<tonic::body::Body>) -> Self::Future {
-        std::future::ready(Ok(tonic::Status::unavailable("not leading").into_http()))
-    }
-}
-
-fn unavailable_like<T: tonic::server::NamedService>(_: &T) -> Unavailable<T> {
-    Unavailable(std::marker::PhantomData)
-}
 
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
     use std::error::Error;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use gang_clock::SystemClock;
 
     use axum::middleware::from_fn_with_state;
     use axum::routing::get;
@@ -920,6 +822,7 @@ mod tests {
                 max_workers: 8,
                 observations: &observations,
                 client_action_timeout: CLIENT_ACTION_TIMEOUT,
+                attempt_budget: gang_config::WorkerConfig::default().attempt_budget(gang_config::ActionsConfig::default().timeout),
             },
         )?;
         let mut simple_slot = None;
@@ -1519,7 +1422,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn controller_terms_retain_resource_and_duration_history() -> TestResult {
+    async fn original_controller_retains_resource_and_duration_history_through_drain() -> TestResult {
         let config = default_config();
         let fleets = x86_and_arm_fleets();
         let histories = Mutex::new(None);
@@ -1539,68 +1442,42 @@ mod tests {
             max_workers: 8,
             observations: &observations,
             client_action_timeout: CLIENT_ACTION_TIMEOUT,
+            attempt_budget: gang_config::WorkerConfig::default().attempt_budget(gang_config::ActionsConfig::default().timeout),
         };
-        let mut previous = None;
+        let now = spec.clock.wall();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let stopped = async { let _ = stopped.await; }.boxed().shared();
+        let connections = ControllerConnections {
+            public: gang_spi::Listening {
+                connections: futures::stream::pending().take_until(stopped.clone()).boxed(),
+                gate: Identify,
+            },
+            worker: gang_spi::Listening {
+                connections: futures::stream::pending().take_until(stopped).boxed(),
+                gate: Identify,
+            },
+            api: Echo,
+        };
+        let (ready, waiting) = ControllerReady::channel();
+        let mut serving = Box::pin(run(&config, &spec, connections, ready, ControllerState {
+            handles: &handles, histories: &histories, resources: &resources, shared: &shared,
+        }));
+        assert!(futures::poll!(serving.as_mut()).is_pending());
+        waiting.await?;
+        let history = histories.lock().clone().ok_or("original history missing")?;
+        seed_controller_history(&history, now);
         let mut expected = Vec::new();
-        let now_s = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let now = gang_clock::Timestamp::from_unix_millis(now_s * 1000);
-        for _ in 0..2 {
-            let connections = ControllerConnections {
-                public: gang_spi::Listening {
-                    connections: futures::stream::empty().boxed(),
-                    gate: Identify,
-                },
-                worker: gang_spi::Listening {
-                    connections: futures::stream::empty().boxed(),
-                    gate: Identify,
-                },
-                api: Echo,
-            };
-            let (ready, waiting) = ControllerReady::channel();
-            run(
-                &config,
-                &spec,
-                connections,
-                ready,
-                ControllerState {
-                    handles: &handles,
-                    histories: &histories,
-                    resources: &resources,
-                    shared: &shared,
-                },
-            )
-            .await?;
-            waiting.await?;
-            assert!(handles.borrow().is_none(), "drain clears serving handles");
-            let history = histories
-                .lock()
-                .clone()
-                .expect("learned history is retained");
-            assert!(Arc::ptr_eq(
-                &history.resource,
-                resources.get().expect("resource sketch was initialized"),
-            ));
-            if let Some(previous) = &previous {
-                assert!(Arc::ptr_eq(previous, &history));
-                let mut actual = Vec::new();
-                history.snapshot(now, &mut actual)?;
-                assert_eq!(actual, expected, "both learned models survive a term");
-            } else {
-                seed_controller_history(&history, now);
-                history.snapshot(now, &mut expected)?;
-                assert!(
-                    expected
-                        .iter()
-                        .any(|record| { record.key.kind == gang_spi::RecordKind::ResourceHistory })
-                );
-                assert!(
-                    expected
-                        .iter()
-                        .any(|record| { record.key.kind == gang_spi::RecordKind::DurationHistory })
-                );
-                previous = Some(history);
-            }
-        }
+        history.snapshot(now, &mut expected)?;
+        assert!(expected.iter().any(|record| record.key.kind == gang_spi::RecordKind::ResourceHistory));
+        assert!(expected.iter().any(|record| record.key.kind == gang_spi::RecordKind::DurationHistory));
+        stop.send(()).map_err(|()| "original controller stopped early")?;
+        serving.await?;
+        assert!(handles.borrow().is_none(), "final transport stop clears serving handles");
+        assert!(Arc::ptr_eq(&history, &histories.lock().clone().ok_or("final history missing")?));
+        assert!(Arc::ptr_eq(&history.resource, resources.get().ok_or("original sketch missing")?));
+        let mut actual = Vec::new();
+        history.snapshot(now, &mut actual)?;
+        assert_eq!(actual, expected, "both learned models survive the original engine's drain");
         Ok(())
     }
 
@@ -1761,8 +1638,7 @@ mod tests {
             .layer(from_fn_with_state(
                 GateState {
                     gate: Identify,
-                    scope: RequestScope::Shared,
-                    force_not_leading: false,
+                    scope: RequestScope::Controller,
                 },
                 admit::<Identify>,
             ));
@@ -1825,6 +1701,7 @@ mod tests {
             max_workers: 8,
             observations: &observations,
             client_action_timeout: Duration::from_mins(10),
+            attempt_budget: gang_config::WorkerConfig::default().attempt_budget(gang_config::ActionsConfig::default().timeout),
         };
         let mut scheduler = settings::scheduler(&config, &spec).expect("valid scheduler config");
         let SchedulerSpec::HistoricalResource(historical) = &mut scheduler.spec else {
@@ -1832,7 +1709,7 @@ mod tests {
         };
         historical.learn_from_workers = false;
         let SchedulerStack { actions, .. } =
-            scheduler_stack(&scheduler, &fleets, &actions, &OnceLock::new())
+            scheduler_stack(&scheduler, &fleets, &actions, &OnceLock::new(), Arc::clone(&spec.clock))
                 .expect("scheduler stack");
         let operation = OperationId::String("stack-wiring".to_owned());
         let digest = DigestInfo::new([1; 32], 1);
@@ -1927,6 +1804,7 @@ mod tests {
             max_workers: 8,
             observations: &sink,
             client_action_timeout: Duration::from_mins(10),
+            attempt_budget: gang_config::WorkerConfig::default().attempt_budget(gang_config::ActionsConfig::default().timeout),
         };
         let mut scheduler = settings::scheduler(&config, &spec).expect("scheduler");
         let SchedulerSpec::HistoricalResource(historical) = &mut scheduler.spec else {
@@ -1934,7 +1812,7 @@ mod tests {
         };
         historical.learn_from_workers = false;
         let SchedulerStack { actions, .. } =
-            scheduler_stack(&scheduler, &fleets, &spec.actions, &OnceLock::new()).expect("stack");
+            scheduler_stack(&scheduler, &fleets, &spec.actions, &OnceLock::new(), Arc::clone(&spec.clock)).expect("stack");
         let info = origin_test_action();
         let metadata = RequestMetadata {
             tool_invocation_id: "invocation".to_owned(),

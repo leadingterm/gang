@@ -7,14 +7,16 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use futures::StreamExt;
-use futures::future::BoxFuture;
-use gang_clock::{Tick, Timestamp};
+use futures::{FutureExt, StreamExt};
+use futures::future::{BoxFuture, Shared};
+use gang_clock::{Clock, Tick, Timestamp};
 use gang_spi::{
     ActionsView, Admitted, ApiRequestBody, ApiResponseBody, ApiService, BoxedConnection,
-    ControllerConnections, ControllerEndpoints, ControllerReady, ControllerSpec, FleetSupply,
+    ControllerConnections, ControllerDrain, ControllerEndpoints, ControllerReady, ControllerSpec,
+    DrainingWorker, FleetSupply,
     GateDecision, LeaderUnavailable, LearnedHistory, Listening, ListingLimits, Peer, PortError,
     RecordKind, Rejection, RequestGate, RequestScope, SchedulerPort, SchedulerSnapshot, Slots,
     WorkerSpec, WorkerTls, full_body,
@@ -77,8 +79,8 @@ struct Gates<P, W, A> {
     worker: W,
     /// The Gang API.
     api: A,
-    /// Whether leader requests are permanently refused by this transport.
-    standby: bool,
+    /// Whether handoff has frozen new controller requests.
+    draining: Arc<AtomicBool>,
 }
 
 impl<P: RequestGate, W: RequestGate, A: ApiService> Services for Gates<P, W, A> {
@@ -88,10 +90,14 @@ impl<P: RequestGate, W: RequestGate, A: ApiService> Services for Gates<P, W, A> 
         peer: &'a Peer,
         parts: &'a mut http::request::Parts,
     ) -> BoxFuture<'a, Result<GateDecision, PortError>> {
-        if self.standby && matches!(scope, RequestScope::Leader) {
-            return Box::pin(async { Ok(GateDecision::NotLeading) });
-        }
-        Box::pin(self.public.admit(scope, peer, parts))
+        Box::pin(async move {
+            let decision = self.public.admit(scope, peer, parts).await?;
+            Ok(if self.draining.load(Ordering::Acquire) && scope == RequestScope::Controller {
+                GateDecision::NotLeading
+            } else {
+                decision
+            })
+        })
     }
 
     fn admit_worker<'a>(
@@ -100,10 +106,14 @@ impl<P: RequestGate, W: RequestGate, A: ApiService> Services for Gates<P, W, A> 
         peer: &'a Peer,
         parts: &'a mut http::request::Parts,
     ) -> BoxFuture<'a, Result<GateDecision, PortError>> {
-        if self.standby && matches!(scope, RequestScope::Leader) {
-            return Box::pin(async { Ok(GateDecision::NotLeading) });
-        }
-        Box::pin(self.worker.admit(scope, peer, parts))
+        Box::pin(async move {
+            let decision = self.worker.admit(scope, peer, parts).await?;
+            Ok(if self.draining.load(Ordering::Acquire) && scope == RequestScope::Controller {
+                GateDecision::NotLeading
+            } else {
+                decision
+            })
+        })
     }
 
     fn call_api(
@@ -113,6 +123,7 @@ impl<P: RequestGate, W: RequestGate, A: ApiService> Services for Gates<P, W, A> 
         Box::pin(admit_and_call(
             self.public.clone(),
             self.api.clone(),
+            Arc::clone(&self.draining),
             request,
         ))
     }
@@ -121,20 +132,21 @@ impl<P: RequestGate, W: RequestGate, A: ApiService> Services for Gates<P, W, A> 
 async fn admit_and_call<P: RequestGate, A: ApiService>(
     gate: P,
     api: A,
+    draining: Arc<AtomicBool>,
     request: http::Request<ApiRequestBody>,
 ) -> http::Response<ApiResponseBody> {
     let (mut parts, body) = request.into_parts();
     match gate
-        .admit(RequestScope::Shared, &Peer::default(), &mut parts)
+        .admit(RequestScope::Controller, &Peer::default(), &mut parts)
         .await
     {
-        Ok(GateDecision::Admit(admitted)) => {
+        Ok(GateDecision::Admit(admitted)) if !draining.load(Ordering::Acquire) => {
             if let Admitted::Authenticated(authenticated) = admitted {
                 parts.extensions.insert(authenticated);
             }
             api.call(http::Request::from_parts(parts, body)).await
         }
-        Ok(GateDecision::NotLeading) => {
+        Ok(GateDecision::NotLeading | GateDecision::Admit(_)) => {
             let mut response = http::Response::new(full_body(bytes::Bytes::new()));
             *response.status_mut() = http::StatusCode::SERVICE_UNAVAILABLE;
             response.headers_mut().insert(
@@ -228,50 +240,6 @@ impl Controller {
     }
 }
 
-/// The real services retained by a standby transport, with leader requests always refused.
-#[derive(Clone)]
-pub struct StandbyServices {
-    services: Arc<dyn Services>,
-}
-
-impl StandbyServices {
-    /// Applies the public gate, refusing leader scope independently of that gate.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error from the public gate for a shared request.
-    pub async fn admit_public(
-        &self,
-        scope: RequestScope,
-        peer: &Peer,
-        parts: &mut http::request::Parts,
-    ) -> Result<GateDecision, PortError> {
-        self.services.admit_public(scope, peer, parts).await
-    }
-
-    /// Applies the worker gate, refusing leader scope independently of that gate.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error from the worker gate for a shared request.
-    pub async fn admit_worker(
-        &self,
-        scope: RequestScope,
-        peer: &Peer,
-        parts: &mut http::request::Parts,
-    ) -> Result<GateDecision, PortError> {
-        self.services.admit_worker(scope, peer, parts).await
-    }
-
-    /// Runs the supplied API after shared public admission.
-    pub async fn call_api(
-        &self,
-        request: http::Request<ApiRequestBody>,
-    ) -> http::Response<ApiResponseBody> {
-        self.services.call_api(request).await
-    }
-}
-
 /// How the fake scheduler's worker behaves once it has been recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Behaviour {
@@ -330,14 +298,6 @@ pub struct RecordedSpec {
     pub entrypoint: PathBuf,
 }
 
-/// The scripted result of a refusal run after its intake and response drain finish.
-#[derive(Default)]
-enum RefusalOutcome {
-    #[default]
-    Success,
-    Failure,
-}
-
 /// Which operations of a [`FakeScheduler`] fail.
 #[derive(Default)]
 struct Failing {
@@ -347,8 +307,6 @@ struct Failing {
     actions: bool,
     /// `run_controller`, which fails at once.
     controller: bool,
-    /// `serve_standby`, checked after intake and any held response drain finish.
-    refusals: RefusalOutcome,
 }
 
 type DrainRetention = (Tick, Duration, Vec<(FleetName, InstanceId)>);
@@ -359,6 +317,10 @@ struct SchedulerState {
     endpoint: Url,
     /// The snapshot `snapshot` reports.
     snapshot: SchedulerSnapshot,
+    /// Explicit dispatch-stamped maximum attempt deadlines by physical worker.
+    attempt_deadlines: Vec<DrainingWorker>,
+    /// Controller clock used to evaluate dispatch-stamped deadlines.
+    clock: Option<Arc<dyn Clock>>,
     /// Release of the next held snapshot.
     snapshot_hold: Option<oneshot::Receiver<()>>,
     /// The actions `actions` reports.
@@ -371,8 +333,6 @@ struct SchedulerState {
     finish_controller: bool,
     /// Where `run_controller` forwards every connection it receives.
     connections: Option<mpsc::UnboundedSender<Received>>,
-    /// Where `serve_standby` forwards every connection it receives.
-    refusal_connections: Option<mpsc::UnboundedSender<Received>>,
     /// How the next worker behaves.
     behaviour: Behaviour,
     /// Every spec `run_worker` has been asked to run.
@@ -381,10 +341,8 @@ struct SchedulerState {
     draining_calls: Vec<(FleetName, InstanceId, bool)>,
     /// Complete provider census requests, in call order.
     retention_calls: Vec<DrainRetention>,
-    /// Released by the test; while held, `run_controller` waits on it after its connections end.
-    drain_hold: Option<oneshot::Receiver<()>>,
-    /// Released by the test after the next refusal run's two connection streams end.
-    refusal_drain_hold: Option<oneshot::Receiver<()>>,
+    /// Scripted response hold, shared between handoff observation and controller shutdown.
+    drain_hold: Option<Shared<BoxFuture<'static, ()>>>,
     /// Released by the test before the next controller signals readiness.
     ready_hold: Option<oneshot::Receiver<()>>,
 }
@@ -433,8 +391,7 @@ async fn serve_controller_connections(
     sender: Option<mpsc::UnboundedSender<Received>>,
     ready: ControllerReady,
     ready_hold: Option<oneshot::Receiver<()>>,
-    drain_hold: Option<oneshot::Receiver<()>>,
-    drains: &CallCount,
+    drain_hold: Option<Shared<BoxFuture<'static, ()>>>,
 ) {
     let mut pending = Vec::new();
     if let Some(mut hold) = ready_hold {
@@ -451,7 +408,6 @@ async fn serve_controller_connections(
                         drop(merged);
                         drop(pending);
                         if let Some(hold) = drain_hold {
-                            drains.bump();
                             let _ = hold.await;
                         }
                         return;
@@ -473,7 +429,6 @@ async fn serve_controller_connections(
     }
     drop(merged);
     if let Some(hold) = drain_hold {
-        drains.bump();
         let _ = hold.await;
     }
 }
@@ -484,28 +439,6 @@ struct PublishedController<'a>(&'a watch::Sender<Option<Controller>>);
 impl Drop for PublishedController<'_> {
     fn drop(&mut self) {
         self.0.send_replace(None);
-    }
-}
-
-/// Removes only this run's standby services, including on cancellation.
-struct PublishedStandby<'a> {
-    sender: &'a watch::Sender<Option<StandbyServices>>,
-    services: Arc<dyn Services>,
-}
-
-impl Drop for PublishedStandby<'_> {
-    fn drop(&mut self) {
-        self.sender.send_if_modified(|slot| {
-            if slot
-                .as_ref()
-                .is_some_and(|standby| Arc::ptr_eq(&standby.services, &self.services))
-            {
-                *slot = None;
-                true
-            } else {
-                false
-            }
-        });
     }
 }
 
@@ -520,8 +453,8 @@ pub struct FakeScheduler {
     state: Arc<Mutex<SchedulerState>>,
     /// The controller `run_controller` publishes; `controller` waits for it.
     published: Arc<watch::Sender<Option<Controller>>>,
-    /// The services of the independently running standby transport.
-    standby: Arc<watch::Sender<Option<StandbyServices>>>,
+    /// Shared admission freeze for the currently published controller.
+    draining: Arc<AtomicBool>,
     /// Successfully published controller terms.
     controller_runs: CallCount,
     /// Calls to `run_worker`, counted once each call's spec is recorded.
@@ -534,8 +467,6 @@ pub struct FakeScheduler {
     snapshots: CallCount,
     /// Controller runs that finished their connections and wait on a drain hold.
     drains: CallCount,
-    /// Refusal transports started independently of normal controller publication.
-    refusal_runs: CallCount,
 }
 
 impl FakeScheduler {
@@ -565,30 +496,29 @@ impl FakeScheduler {
             state: Arc::new(Mutex::new(SchedulerState {
                 endpoint,
                 snapshot: SchedulerSnapshot::default(),
+                attempt_deadlines: Vec::new(),
+                clock: None,
                 snapshot_hold: None,
                 actions: ActionsView::default(),
                 history: Vec::new(),
                 failing: Failing::default(),
                 finish_controller: false,
                 connections: None,
-                refusal_connections: None,
                 behaviour: Behaviour::Pending,
                 specs: Vec::new(),
                 draining_calls: Vec::new(),
                 retention_calls: Vec::new(),
                 drain_hold: None,
-                refusal_drain_hold: None,
                 ready_hold: None,
             })),
             published: Arc::new(watch::channel::<Option<Controller>>(None).0),
-            standby: Arc::new(watch::channel::<Option<StandbyServices>>(None).0),
+            draining: Arc::new(AtomicBool::new(false)),
             controller_runs: CallCount::new(),
             worker_starts: CallCount::new(),
             worker_stops: CallCount::new(),
             actions_calls: CallCount::new(),
             snapshots: CallCount::new(),
             drains: CallCount::new(),
-            refusal_runs: CallCount::new(),
         })
     }
 
@@ -638,6 +568,19 @@ impl FakeScheduler {
         self.state.lock().snapshot = snapshot;
     }
 
+    /// Replaces the authoritative dispatch-stamped maximum deadline of each physical worker.
+    ///
+    /// Tests must supply a stamp for every worker with outstanding attempts. The fake never
+    /// infers dispatch time or a deadline from an action's execution start time.
+    pub fn set_attempt_deadlines(&self, workers: Vec<DrainingWorker>) {
+        self.state.lock().attempt_deadlines = workers;
+    }
+
+    /// Sets the clock for direct port tests; a controller run supplies its own clock.
+    pub fn set_clock(&self, clock: Arc<dyn Clock>) {
+        self.state.lock().clock = Some(clock);
+    }
+
     /// Pauses the next snapshot until the returned sender sends or is dropped.
     #[must_use]
     pub fn hold_snapshot(&self) -> oneshot::Sender<()> {
@@ -684,7 +627,7 @@ impl FakeScheduler {
         self.snapshots.clone()
     }
 
-    /// Counts the controller runs that finished their connections and wait on a drain hold.
+    /// Counts first handoff calls, once per controller term.
     #[must_use]
     pub fn drains(&self) -> CallCount {
         self.drains.clone()
@@ -696,45 +639,13 @@ impl FakeScheduler {
         self.controller_runs.clone()
     }
 
-    /// Holds the next controller run open after its connections end, as a controller draining
-    /// its connections, until the returned sender is used or dropped.
+    /// Holds a controller response until the returned sender is used or dropped. The response
+    /// may finish while the controller's refusal listeners remain open.
     #[must_use]
     pub fn hold_drain(&self) -> oneshot::Sender<()> {
         let (release, hold) = oneshot::channel();
-        self.state.lock().drain_hold = Some(hold);
+        self.state.lock().drain_hold = Some(async move { let _ = hold.await; }.boxed().shared());
         release
-    }
-
-    /// Counts refusal transports when they start consuming connections.
-    #[must_use]
-    pub fn refusal_runs(&self) -> CallCount {
-        self.refusal_runs.clone()
-    }
-
-    /// Holds the next refusal run after both intake streams end until released or dropped.
-    #[must_use]
-    pub fn hold_refusal_drain(&self) -> oneshot::Sender<()> {
-        let (release, hold) = oneshot::channel();
-        self.state.lock().refusal_drain_hold = Some(hold);
-        release
-    }
-
-    /// Makes refusal runs fail at completion while `fail` is true, including runs already held.
-    pub fn fail_refusals(&self, fail: bool) {
-        self.state.lock().failing.refusals = if fail {
-            RefusalOutcome::Failure
-        } else {
-            RefusalOutcome::Success
-        };
-    }
-
-    /// The channel the next refusal run forwards connections to, separate from the controller.
-    /// Call before that refusal run; the channel closes when the run returns.
-    #[must_use]
-    pub fn refusal_connections(&self) -> mpsc::UnboundedReceiver<Received> {
-        let (sender, receiver) = mpsc::unbounded_channel();
-        self.state.lock().refusal_connections = Some(sender);
-        receiver
     }
 
     /// Holds the next controller before it signals readiness until released or dropped.
@@ -761,15 +672,6 @@ impl FakeScheduler {
     pub async fn controller(&self) -> Option<Controller> {
         let mut published = self.published.subscribe();
         let ready = published.wait_for(Option::is_some).await.ok()?;
-        (*ready).clone()
-    }
-
-    /// Waits for a standby transport and returns its supplied services.
-    ///
-    /// Returns `None` only if the scheduler's sender is dropped while waiting.
-    pub async fn standby_services(&self) -> Option<StandbyServices> {
-        let mut standby = self.standby.subscribe();
-        let ready = standby.wait_for(Option::is_some).await.ok()?;
         (*ready).clone()
     }
 
@@ -939,11 +841,13 @@ impl SchedulerPort for FakeScheduler {
         }
         let (fail, finish, sender, drain_hold, ready_hold) = {
             let mut state = self.state.lock();
+            self.draining.store(false, Ordering::Release);
+            state.clock = Some(Arc::clone(&spec.clock));
             (
                 state.failing.controller,
                 state.finish_controller,
                 state.connections.take(),
-                state.drain_hold.take(),
+                state.drain_hold.clone(),
                 state.ready_hold.take(),
             )
         };
@@ -973,7 +877,7 @@ impl SchedulerPort for FakeScheduler {
                 public: public_gate,
                 worker: worker_gate,
                 api,
-                standby: false,
+                draining: Arc::clone(&self.draining),
             }),
             observations: spec.observations.clone(),
         };
@@ -1002,74 +906,85 @@ impl SchedulerPort for FakeScheduler {
             peer: accepted.peer,
         });
         let merged = futures::stream::select(public_side, worker_side);
-        serve_controller_connections(merged, sender, ready, ready_hold, drain_hold, &self.drains)
+        serve_controller_connections(merged, sender, ready, ready_hold, drain_hold)
             .await;
+        self.state.lock().drain_hold = None;
         Ok(())
     }
 
-    async fn serve_standby<P: RequestGate, W: RequestGate, A: ApiService>(
-        &self,
-        connections: ControllerConnections<P, W, A>,
-    ) -> Result<(), PortError> {
-        let (sender, drain_hold) = {
-            let mut state = self.state.lock();
-            (
-                state.refusal_connections.take(),
-                state.refusal_drain_hold.take(),
-            )
+    async fn hand_off(&self, into: &mut ControllerDrain) -> Result<(), PortError> {
+        if !self.draining.swap(true, Ordering::AcqRel) {
+            self.drains.bump();
+        }
+        let mut state = self.state.lock();
+        into.workers.clear();
+        let has_work = !state.snapshot.executing.is_empty()
+            || !state.actions.running.is_empty()
+            || state.snapshot.workers.iter().any(|worker| worker.running_actions != 0);
+        let now = if has_work {
+            state.clock.as_ref().ok_or_else(|| {
+                PortError::config("handoff with attempts requires a controller clock")
+            })?.wall()
+        } else {
+            Timestamp::UNIX_EPOCH
         };
-        let ControllerConnections {
-            public,
-            worker,
-            api,
-        } = connections;
-        let Listening {
-            connections: public_connections,
-            gate: public_gate,
-        } = public;
-        let Listening {
-            connections: worker_connections,
-            gate: worker_gate,
-        } = worker;
-        let services: Arc<dyn Services> = Arc::new(Gates {
-            public: public_gate,
-            worker: worker_gate,
-            api,
-            standby: true,
-        });
-        self.standby.send_replace(Some(StandbyServices {
-            services: Arc::clone(&services),
-        }));
-        let _standby = PublishedStandby {
-            sender: &self.standby,
-            services,
-        };
-        self.refusal_runs.bump();
-        let public_side = public_connections.map(|accepted| Received {
-            side: Side::Public,
-            connection: accepted.connection,
-            peer: accepted.peer,
-        });
-        let worker_side = worker_connections.map(|accepted| Received {
-            side: Side::Worker,
-            connection: accepted.connection,
-            peer: accepted.peer,
-        });
-        let mut merged = futures::stream::select(public_side, worker_side);
-        while let Some(received) = merged.next().await {
-            if let Some(sender) = &sender {
-                let _ = sender.send(received);
+        for action in &state.snapshot.executing {
+            let worker = state.snapshot.workers.get(action.worker).ok_or_else(|| {
+                PortError::config("executing action references an unknown worker")
+            })?;
+            let instance = worker.id.instance().ok_or_else(|| {
+                PortError::config("executing worker has no physical instance identity")
+            })?;
+            let stamp = state.attempt_deadlines.iter().find(|stamp| {
+                stamp.fleet == worker.fleet && stamp.instance == instance
+            }).ok_or_else(|| PortError::config("executing worker has no dispatch-stamped attempt deadline"))?;
+            if stamp.deadline > now && !into.workers.iter().any(|entry| {
+                entry.fleet == stamp.fleet && entry.instance == stamp.instance
+            }) {
+                into.workers.push(stamp.clone());
             }
         }
-        drop(merged);
-        if let Some(hold) = drain_hold {
-            let _ = hold.await;
+        for worker in &state.snapshot.workers {
+            if worker.running_actions == 0 {
+                continue;
+            }
+            let instance = worker.id.instance().ok_or_else(|| {
+                PortError::config("running worker has no physical instance identity")
+            })?;
+            let stamp = state.attempt_deadlines.iter().find(|stamp| {
+                stamp.fleet == worker.fleet && stamp.instance == instance
+            }).ok_or_else(|| PortError::config("running worker has no dispatch-stamped attempt deadline"))?;
+            if stamp.deadline > now && !into.workers.iter().any(|entry| {
+                entry.fleet == stamp.fleet && entry.instance == stamp.instance
+            }) {
+                into.workers.push(stamp.clone());
+            }
         }
-        if matches!(self.state.lock().failing.refusals, RefusalOutcome::Failure) {
-            return Err(PortError::backend(io::Error::other(
-                "refusal transport failed",
-            )));
+        for action in &state.actions.running {
+            let worker = state.snapshot.workers.iter().find(|worker| worker.id == action.worker)
+                .ok_or_else(|| PortError::config("running action references an unknown worker"))?;
+            let instance = worker.id.instance().ok_or_else(|| {
+                PortError::config("running worker has no physical instance identity")
+            })?;
+            let stamp = state.attempt_deadlines.iter().find(|stamp| {
+                stamp.fleet == worker.fleet && stamp.instance == instance
+            }).ok_or_else(|| PortError::config("running worker has no dispatch-stamped attempt deadline"))?;
+            if stamp.deadline > now && !into.workers.iter().any(|entry| {
+                entry.fleet == stamp.fleet && entry.instance == stamp.instance
+            }) {
+                into.workers.push(stamp.clone());
+            }
         }
+        into.workers.sort_unstable_by(|left, right| {
+            (&left.fleet, &left.instance).cmp(&(&right.fleet, &right.instance))
+        });
+        let held = !into.workers.is_empty();
+        for worker in &mut state.snapshot.workers {
+            worker.draining = true;
+        }
+        let response_held = state.drain_hold.as_ref()
+            .is_some_and(|hold| hold.clone().now_or_never().is_none());
+        into.complete = !held && !response_held;
         Ok(())
     }
 
@@ -1349,6 +1264,54 @@ mod tests {
             })
             .collect();
         Ok((queued, executions))
+    }
+
+    #[tokio::test]
+    async fn handoff_uses_dispatch_stamps_even_after_delayed_execution() -> TestResult {
+        let scheduler = FakeScheduler::new()?;
+        let clock = Arc::new(gang_clock::TestClock::new(Timestamp::UNIX_EPOCH));
+        scheduler.set_clock(clock.clone());
+        let (_, mut executions) = snapshot_demand_fixture()?;
+        executions[0].started = Timestamp::from_unix_millis(12_000);
+        executions[1].started = Timestamp::from_unix_millis(14_000);
+        let mut workers = vec![snapshot_worker("b")?, snapshot_worker("a")?];
+        workers[0].fleet = FleetName::try_new("a-fleet")?;
+        workers[1].fleet = FleetName::try_new("z-fleet")?;
+        let stamps = workers.iter().enumerate().rev().map(|(index, worker)| {
+            Ok(DrainingWorker {
+                fleet: worker.fleet.clone(),
+                instance: worker.id.instance().ok_or("worker instance missing")?,
+                deadline: Timestamp::from_unix_millis(15_000 + index as u64),
+            })
+        }).collect::<TestResult<Vec<_>>>()?;
+        scheduler.set_snapshot(SchedulerSnapshot {
+            workers,
+            executing: executions,
+            ..SchedulerSnapshot::default()
+        });
+        let mut drain = ControllerDrain::default();
+        assert!(matches!(
+            scheduler.hand_off(&mut drain).await,
+            Err(PortError::Config(_))
+        ));
+        scheduler.set_attempt_deadlines(stamps);
+        scheduler.hand_off(&mut drain).await?;
+        assert!(!drain.complete);
+        assert_eq!(drain.workers.len(), 2);
+        assert_eq!(drain.workers[0].fleet, FleetName::try_new("a-fleet")?);
+        assert_eq!(drain.workers[1].fleet, FleetName::try_new("z-fleet")?);
+        assert_eq!(drain.workers[0].deadline, Timestamp::from_unix_millis(15_000));
+        assert_eq!(drain.workers[1].deadline, Timestamp::from_unix_millis(15_001));
+        clock.advance(Duration::from_millis(15_000));
+        scheduler.hand_off(&mut drain).await?;
+        assert!(!drain.complete);
+        assert_eq!(drain.workers.len(), 1);
+        assert_eq!(drain.workers[0].deadline, Timestamp::from_unix_millis(15_001));
+        clock.advance(Duration::from_millis(1));
+        scheduler.hand_off(&mut drain).await?;
+        assert!(drain.complete);
+        assert!(drain.workers.is_empty());
+        Ok(())
     }
 
     fn snapshot_capacities(snapshot: &SchedulerSnapshot) -> [usize; 5] {
@@ -1840,7 +1803,7 @@ mod tests {
             peer: &Peer,
             parts: &mut http::request::Parts,
         ) -> Result<GateDecision, PortError> {
-            assert!(matches!(scope, RequestScope::Shared));
+            assert!(matches!(scope, RequestScope::Controller));
             self.calls.bump();
             if self.not_leading {
                 Ok(GateDecision::NotLeading)
@@ -1878,13 +1841,13 @@ mod tests {
         let (mut parts, ()) = http::Request::new(()).into_parts();
         assert!(
             controller
-                .admit_public(RequestScope::Shared, &Peer::default(), &mut parts)
+                .admit_public(RequestScope::Controller, &Peer::default(), &mut parts)
                 .await
                 .is_err()
         );
         assert!(
             controller
-                .admit_worker(RequestScope::Shared, &Peer::default(), &mut parts)
+                .admit_worker(RequestScope::Controller, &Peer::default(), &mut parts)
                 .await
                 .is_ok()
         );
@@ -1913,184 +1876,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refusals_consume_both_intakes_before_drain_and_read_failure_at_completion()
-    -> TestResult {
-        let scheduler = FakeScheduler::new()?;
-        scheduler.fail_controller(true);
-        scheduler.finish_controller(true);
-        for last in 0..2 {
-            scheduler.fail_refusals(last == 0);
-            let release = scheduler.hold_refusal_drain();
-            let mut received = scheduler.refusal_connections();
-            let (public_tx, public_rx) = futures::channel::mpsc::unbounded();
-            let (worker_tx, worker_rx) = futures::channel::mpsc::unbounded();
-            let mut senders = [Some(public_tx), Some(worker_tx)];
-            let connections = ControllerConnections {
-                public: Listening {
-                    connections: public_rx.boxed(),
-                    gate: AdmitAll,
-                },
-                worker: Listening {
-                    connections: worker_rx.boxed(),
-                    gate: AdmitAll,
-                },
-                api: EmptyApi,
-            };
-            let run = scheduler.serve_standby(connections);
-            futures::pin_mut!(run);
-            assert!(run.as_mut().now_or_never().is_none());
-            assert_eq!(scheduler.refusal_runs().get(), last + 1);
-            for (index, side) in [Side::Public, Side::Worker].into_iter().enumerate() {
-                let (connection, _peer) = tokio::io::duplex(64);
-                senders[index]
-                    .as_ref()
-                    .ok_or("sender missing")?
-                    .unbounded_send(gang_spi::Accepted {
-                        connection: Box::new(connection),
-                        peer: Peer::default(),
-                    })?;
-                assert!(run.as_mut().now_or_never().is_none());
-                assert_eq!(received.try_recv()?.side, side);
-            }
-            drop(senders[1 - last].take());
-            assert!(run.as_mut().now_or_never().is_none());
-            let (connection, _peer) = tokio::io::duplex(64);
-            senders[last]
-                .as_ref()
-                .ok_or("last sender missing")?
-                .unbounded_send(gang_spi::Accepted {
-                    connection: Box::new(connection),
-                    peer: Peer::default(),
-                })?;
-            assert!(run.as_mut().now_or_never().is_none());
-            assert_eq!(
-                received.try_recv()?.side,
-                [Side::Public, Side::Worker][last]
-            );
-            drop(senders[last].take());
-            assert!(run.as_mut().now_or_never().is_none());
-            assert!(scheduler.published.borrow().is_none());
-            assert_eq!(scheduler.controller_runs().get(), 0);
-            assert_eq!(scheduler.drains().get(), 0);
-            assert_eq!(scheduler.snapshots().get(), 0);
-            scheduler.fail_refusals(last == 1);
-            drop(release);
-            let outcome = run.as_mut().now_or_never();
-            if last == 0 {
-                assert!(matches!(outcome, Some(Ok(()))));
-            } else {
-                assert!(matches!(outcome, Some(Err(PortError::Backend(_)))));
-            }
-            assert!(matches!(received.recv().now_or_never(), Some(None)));
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn refusals_do_not_publish_or_replace_a_draining_controller() -> TestResult {
-        let fixture = WorkerFixture::new()?;
-        let stores = gang_spi::RenderedStoreSpec(serde_json::Value::Null);
-        let catalog = gang_types::FleetCatalog::try_new(vec![fixture.properties.clone()])?;
-        let (observations, _receiver) = gang_spi::ObservationSink::channel(
-            std::num::NonZeroUsize::MIN,
-            std::num::NonZeroUsize::MIN,
-        );
-        let spec = ControllerSpec {
-            actions: Arc::new(gang_config::ActionsConfig::default()),
-            scaling: Arc::new(gang_config::ScalingConfig::default()),
-            clock: Arc::new(gang_clock::TestClock::new(Timestamp::UNIX_EPOCH)),
-            content_store: &stores,
-            action_store: &stores,
-            fleets: &catalog,
-            max_workers: 8,
-            client_action_timeout: std::time::Duration::from_mins(1),
-            observations: &observations,
-        };
-        let scheduler = FakeScheduler::new()?;
-        let release = scheduler.hold_drain();
-        let empty = || ControllerConnections {
-            public: Listening {
-                connections: futures::stream::empty().boxed(),
-                gate: AdmitAll,
-            },
-            worker: Listening {
-                connections: futures::stream::empty().boxed(),
-                gate: AdmitAll,
-            },
-            api: EmptyApi,
-        };
-        let (ready, mut readiness) = ControllerReady::channel();
-        let controller = scheduler.run_controller(&spec, empty(), ready);
-        futures::pin_mut!(controller);
-        assert!(controller.as_mut().now_or_never().is_none());
-        assert!(readiness.try_recv().is_ok());
-        assert_eq!(scheduler.drains().get(), 1);
-        let public_calls = CallCount::new();
-        let worker_calls = CallCount::new();
-        let standby_connections = ControllerConnections {
-            public: Listening {
-                connections: futures::stream::pending().boxed(),
-                gate: CountingGate {
-                    calls: public_calls.clone(),
-                    not_leading: false,
-                },
-            },
-            worker: Listening {
-                connections: futures::stream::pending().boxed(),
-                gate: CountingGate {
-                    calls: worker_calls.clone(),
-                    not_leading: false,
-                },
-            },
-            api: CallerApi,
-        };
-        let standby = scheduler.serve_standby(standby_connections);
-        futures::pin_mut!(standby);
-        assert!(standby.as_mut().now_or_never().is_none());
-        let services = scheduler
-            .standby_services()
-            .await
-            .ok_or("standby missing")?;
-        let response = services.call_api(http::Request::new(full_body(""))).await;
-        assert_eq!(response.headers()["x-caller"], "test:tester");
-        let (mut parts, ()) = http::Request::new(()).into_parts();
-        assert!(matches!(
-            services
-                .admit_public(RequestScope::Shared, &Peer::default(), &mut parts)
-                .await?,
-            GateDecision::Admit(_)
-        ));
-        assert!(matches!(
-            services
-                .admit_worker(RequestScope::Shared, &Peer::default(), &mut parts)
-                .await?,
-            GateDecision::Admit(_)
-        ));
-        assert!(matches!(
-            services
-                .admit_public(RequestScope::Leader, &Peer::default(), &mut parts)
-                .await?,
-            GateDecision::NotLeading
-        ));
-        assert!(matches!(
-            services
-                .admit_worker(RequestScope::Leader, &Peer::default(), &mut parts)
-                .await?,
-            GateDecision::NotLeading
-        ));
-        assert_eq!(public_calls.get(), 2);
-        assert_eq!(worker_calls.get(), 1);
-        assert!(scheduler.published.borrow().is_some());
-        assert_eq!(scheduler.controller_runs().get(), 1);
-        assert_eq!(scheduler.refusal_runs().get(), 1);
-        assert!(controller.as_mut().now_or_never().is_none());
-        drop(release);
-        controller.await?;
-        assert!(scheduler.published.borrow().is_none());
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn controller_serves_all_listeners_until_each_stream_ends() -> TestResult {
         let fixture = WorkerFixture::new()?;
         let stores = gang_spi::RenderedStoreSpec(serde_json::Value::Null);
@@ -2108,8 +1893,39 @@ mod tests {
             fleets: &catalog,
             max_workers: 8,
             client_action_timeout: std::time::Duration::from_mins(1),
+            attempt_budget: gang_config::WorkerConfig::default().attempt_budget(gang_config::ActionsConfig::default().timeout),
             observations: &observations,
         };
+        {
+            let scheduler = FakeScheduler::new()?;
+            let release = scheduler.hold_drain();
+            let connections = ControllerConnections {
+                public: Listening {
+                    connections: futures::stream::pending().boxed(),
+                    gate: AdmitAll,
+                },
+                worker: Listening {
+                    connections: futures::stream::pending().boxed(),
+                    gate: AdmitAll,
+                },
+                api: EmptyApi,
+            };
+            let (ready, mut readiness) = ControllerReady::channel();
+            let run = scheduler.run_controller(&spec, connections, ready);
+            futures::pin_mut!(run);
+            assert!(run.as_mut().now_or_never().is_none());
+            assert!(readiness.try_recv().is_ok());
+            let mut drain = ControllerDrain::default();
+            scheduler.hand_off(&mut drain).await?;
+            assert_eq!(scheduler.drains().get(), 1);
+            assert!(!drain.complete);
+            release.send(()).map_err(|()| "held response disappeared")?;
+            scheduler.hand_off(&mut drain).await?;
+            assert_eq!(scheduler.drains().get(), 1);
+            assert!(drain.complete);
+            assert!(run.as_mut().now_or_never().is_none());
+            assert!(scheduler.published.borrow().is_some());
+        }
         let scheduler = FakeScheduler::new()?;
         for last in 0..2 {
             let mut received = scheduler.connections();
@@ -2272,12 +2088,17 @@ mod tests {
         futures::pin_mut!(run);
         let previous_drains = scheduler.drains().get();
         assert!(run.as_mut().now_or_never().is_none());
+        let mut drain = ControllerDrain::default();
+        scheduler.hand_off(&mut drain).await.expect("handoff succeeds");
+        assert!(!drain.complete);
         assert_eq!(scheduler.drains().get(), previous_drains + 1);
         assert!(readiness.await.is_err());
         assert!(ready_release.send(()).is_err());
         assert!(scheduler.published.borrow().is_some());
         drop(drain_release);
         assert!(matches!(run.as_mut().now_or_never(), Some(Ok(()))));
+        scheduler.hand_off(&mut drain).await.expect("handoff refresh succeeds");
+        assert!(drain.complete);
         assert!(scheduler.published.borrow().is_none());
     }
 
@@ -2287,7 +2108,7 @@ mod tests {
             public: AdmitAll,
             worker: AdmitAll,
             api: CallerApi,
-            standby: false,
+            draining: Arc::new(AtomicBool::new(false)),
         };
         let response = gates.call_api(http::Request::new(full_body(""))).await;
         assert_eq!(response.headers()["x-caller"], "test:tester");
@@ -2303,7 +2124,7 @@ mod tests {
             },
             worker: AdmitAll,
             api: CallerApi,
-            standby: false,
+            draining: Arc::new(AtomicBool::new(false)),
         };
         let response = gates.call_api(http::Request::new(full_body(""))).await;
         assert_eq!(calls.get(), 1);
@@ -2334,6 +2155,7 @@ mod tests {
             fleets: &catalog,
             max_workers: 8,
             client_action_timeout: std::time::Duration::from_mins(1),
+            attempt_budget: gang_config::WorkerConfig::default().attempt_budget(gang_config::ActionsConfig::default().timeout),
             observations: &observations,
         };
         let scheduler = FakeScheduler::new()?;
@@ -2380,6 +2202,7 @@ mod tests {
             fleets: &catalog,
             max_workers: 8,
             client_action_timeout: std::time::Duration::from_mins(1),
+            attempt_budget: gang_config::WorkerConfig::default().attempt_budget(gang_config::ActionsConfig::default().timeout),
             observations: &observations,
         };
         let scheduler = FakeScheduler::new()?;

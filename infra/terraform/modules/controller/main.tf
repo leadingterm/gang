@@ -5,10 +5,8 @@ locals {
   instance_shape = var.shape == "instance"
   group_shape    = var.shape == "group"
   # The image's gang.stateDevice; the role line names it.
-  state_device             = "/dev/sdg"
-  lifecycle_margin_seconds = 120
-  health                   = jsondecode(file("${path.module}/../load-balancer/health-check.json"))
-  instance_warmup          = local.health.interval_seconds * local.health.threshold + local.health.renew_interval_seconds + local.health.promotion_seconds + local.health.handover_margin_seconds + min(local.health.call_timeout_seconds, local.health.renew_interval_seconds)
+  state_device = "/dev/sdg"
+  hook = jsondecode(file("${path.module}/lifecycle-hook.json"))
 }
 
 moved {
@@ -212,6 +210,8 @@ resource "aws_autoscaling_group" "controller" {
   # serving readiness; systemd restarts a crashed controller.
   health_check_type = "EC2"
   target_group_arns = var.target_group_arns
+  # Newer prepared hosts lead; ordinary scale-in should retire an older passive host.
+  termination_policies = ["OldestInstance"]
 
   launch_template {
     id      = aws_launch_template.controller[0].id
@@ -223,21 +223,22 @@ resource "aws_autoscaling_group" "controller" {
     preferences {
       min_healthy_percentage = 100
       max_healthy_percentage = 200
-      instance_warmup        = local.instance_warmup
+      # Launch lifecycle completion follows promotion; do not add platform warmup.
+      instance_warmup = 0
     }
   }
 
   initial_lifecycle_hook {
     name                 = "launch"
     lifecycle_transition = "autoscaling:EC2_INSTANCE_LAUNCHING"
-    heartbeat_timeout    = var.shutdown_grace_seconds + local.lifecycle_margin_seconds
+    heartbeat_timeout    = local.hook.heartbeat_timeout_seconds
     default_result       = "ABANDON"
   }
 
   initial_lifecycle_hook {
     name                 = "terminate"
     lifecycle_transition = "autoscaling:EC2_INSTANCE_TERMINATING"
-    heartbeat_timeout    = var.shutdown_grace_seconds + local.lifecycle_margin_seconds
+    heartbeat_timeout    = local.hook.heartbeat_timeout_seconds
     default_result       = "CONTINUE"
   }
 
