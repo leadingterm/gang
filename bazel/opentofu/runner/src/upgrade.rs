@@ -2,6 +2,7 @@
 //!
 //! Cleanup retention composes engine replacement actions with the applied SSM
 //! resource set. The expected forgotten-instance diagnostic has no inventory.
+//! Cleanup failures retain resource inventory and diagnostics, never plan or state payloads.
 
 use std::error::Error;
 use std::ffi::OsString;
@@ -152,9 +153,10 @@ fn selected_evidence(stdout: &[u8]) -> Result<Evidence> {
     let mut file = false;
     let mut abstract_seen = false;
     let mut forgotten_notice = false;
-    for line in stdout
+    for (line_index, line) in stdout
         .split(|b| *b == b'\n')
         .filter(|line| !line.is_empty())
+        .enumerate()
     {
         let event: Value = serde_json::from_slice(line)?;
         if forgotten_notice
@@ -165,7 +167,9 @@ fn selected_evidence(stdout: &[u8]) -> Result<Evidence> {
         {
             return Err("run evidence follows the cleanup notice".into());
         }
-        if record_diagnostic(&event, &mut forgotten_notice)? {
+        if record_diagnostic(&event, &mut forgotten_notice)
+            .map_err(|error| cleanup_failure_context(stdout, error.to_string(), line_index))?
+        {
             if !runs.iter().all(|run| *run) || !payloads.iter().all(Option::is_some) {
                 return Err("cleanup notice precedes completed run evidence".into());
             }
@@ -222,6 +226,48 @@ fn selected_evidence(stdout: &[u8]) -> Result<Evidence> {
     };
     validate_retention(&evidence, forgotten_notice)?;
     Ok(evidence)
+}
+
+fn cleanup_failure_context(stdout: &[u8], mut message: String, failed_line: usize) -> String {
+    for (index, line) in stdout
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+        .enumerate()
+    {
+        let Ok(event) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        if event["type"] == "test_cleanup" {
+            if let Some(resources) = event["test_cleanup"]["failed_resources"].as_array() {
+                for resource in resources {
+                    if let Some(instance) = resource["instance"].as_str() {
+                        message.push_str("\ncleanup failed resource: ");
+                        message.push_str(instance);
+                        if let Some(key) = resource["deposed_key"].as_str() {
+                            message.push_str(" (deposed key: ");
+                            message.push_str(key);
+                            message.push(')');
+                        }
+                    }
+                }
+            }
+        } else if index > failed_line
+            && event["type"] == "diagnostic"
+            && event["@testfile"] == TEST
+            && event["@testrun"] == "promote"
+            && event["diagnostic"]["severity"] == "error"
+        {
+            if let Some(summary) = event["diagnostic"]["summary"].as_str() {
+                message.push_str("\ncleanup diagnostic: ");
+                message.push_str(summary);
+            }
+            if let Some(detail) = event["diagnostic"]["detail"].as_str() {
+                message.push('\n');
+                message.push_str(detail);
+            }
+        }
+    }
+    message
 }
 
 fn record_diagnostic(event: &Value, forgotten_notice: &mut bool) -> Result<bool> {
@@ -1614,6 +1660,41 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("(log): provider shutdown failed"));
         assert!(!message.contains("must not appear"));
+    }
+
+    #[test]
+    fn reports_cleanup_inventory_and_later_diagnostic_without_payloads() {
+        let mut events = synthetic_events(&plan(GANG), true);
+        events.push(json!({
+            "type":"test_cleanup", "@level":"warn", "@message":"cleanup failed",
+            "@testfile":TEST, "@testrun":"promote",
+            "test_cleanup":{"failed_resources":[
+                {"instance":"aws_ebs_volume.state", "deposed_key":"deadbeef"}
+            ]},
+            "test_plan":{"secret":"plan-secret-sentinel"},
+            "test_state":{"secret":"state-secret-sentinel"}
+        }));
+        events.push(json!({
+            "type":"diagnostic", "@level":"error", "@testfile":TEST, "@testrun":"promote",
+            "diagnostic":{"severity":"error", "summary":"destroy blocked",
+                "detail":"prevent_destroy retained state volume"}
+        }));
+        let error = selected_evidence(&encode_events(&events))
+            .err()
+            .expect("cleanup warning is rejected");
+        let message = error.to_string();
+        let prefix = "OpenTofu emitted an error or warning (test_cleanup): cleanup failed";
+        assert!(message.starts_with(prefix));
+        for expected in [
+            "aws_ebs_volume.state",
+            "deadbeef",
+            "destroy blocked",
+            "prevent_destroy retained state volume",
+        ] {
+            assert!(message.contains(expected));
+        }
+        assert!(!message.contains("plan-secret-sentinel"));
+        assert!(!message.contains("state-secret-sentinel"));
     }
 
     #[test]
