@@ -8,7 +8,7 @@ set -euo pipefail
 BAZEL=${BAZEL:-bazel}
 
 scratch=$(mktemp -d /tmp/gang-action-shell.XXXXXX)
-startup=(--noworkspace_rc --nohome_rc --output_base="$scratch/bazel-output" --bazelrc="$GANG_BAZELRC")
+startup=(--nosystem_rc --noworkspace_rc --nohome_rc --output_base="$scratch/bazel-output" --bazelrc="$scratch/workspace.bazelrc" --bazelrc="$GANG_BAZELRC")
 cleanup() {
   local status=$?
   if ! "$BAZEL" "${startup[@]}" shutdown; then
@@ -22,6 +22,7 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
+grep -Fvx 'try-import %workspace%/.bazelrc.local' "$(dirname "${BASH_SOURCE[0]}")/../.bazelrc" >"$scratch/workspace.bazelrc"
 
 query_args=()
 if [[ -n ${BAZEL_REPOSITORY_CACHE:-} ]]; then
@@ -29,7 +30,7 @@ if [[ -n ${BAZEL_REPOSITORY_CACHE:-} ]]; then
 fi
 "$BAZEL" "${startup[@]}" \
   aquery 'mnemonic("JsRunBinary|Genrule", deps(//crates/gang-ui:assets))' \
-  --spawn_strategy=remote --incompatible_strict_action_env --output=jsonproto "${query_args[@]}" >"$scratch/actions.json"
+  --spawn_strategy=remote --output=jsonproto "${query_args[@]}" >"$scratch/actions.json"
 
 if ! jq -e '
   [.actions[]? | select(.mnemonic == "JsRunBinary")] | length > 0
@@ -46,7 +47,7 @@ fi
 if ! jq -e '
   [.actions[]? | select(.mnemonic == "JsRunBinary" or .mnemonic == "Genrule") |
     [.environmentVariables[]? | select(.key == "PATH") | .value] |
-    length == 1 and (.[0] | type == "string" and (split(":") | all(. == "/bin" or . == "/usr/bin" or . == "/usr/local/bin")))] | all
+    length == 1 and (.[0] | type == "string" and (split(":") | length > 0 and all(. == "/bin" or . == "/usr/bin" or . == "/usr/local/bin")))] | all
 ' "$scratch/actions.json" >/dev/null; then
   echo 'every JsRunBinary and Genrule action must have exactly one PATH containing only FHS tool directories' >&2
   exit 1

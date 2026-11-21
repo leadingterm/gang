@@ -205,8 +205,10 @@
         build:local --shell_executable=${pkgs.bash}/bin/bash
         build:local --action_env=PATH=${actionPath}
         build:local --host_action_env=PATH=${actionPath}
+        build:local --remote_executor=
+        build:local --remote_cache=
         test:local --test_env=PATH=${actionPath}
-        build:local --spawn_strategy=sandboxed,local
+        build:local --spawn_strategy=worker,sandboxed,local
         test:local --strategy=TestRunner=sandboxed,local
       '';
       bazelWrapper = name:
