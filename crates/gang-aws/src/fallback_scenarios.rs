@@ -148,11 +148,17 @@ async fn rollout_grows_the_selected_spot_or_fallback_group() -> TestResult {
         assert_eq!(mutations[0].0, "UpdateAutoScalingGroup");
         assert_eq!(mutations[1].0, "SetDesiredCapacity");
         assert_eq!(
-            mutations[0].1.get("AutoScalingGroupName").map(String::as_str),
+            mutations[0]
+                .1
+                .get("AutoScalingGroupName")
+                .map(String::as_str),
             Some(expected_group)
         );
         assert_eq!(
-            mutations[1].1.get("AutoScalingGroupName").map(String::as_str),
+            mutations[1]
+                .1
+                .get("AutoScalingGroupName")
+                .map(String::as_str),
             Some(expected_group)
         );
         assert_eq!(

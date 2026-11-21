@@ -356,9 +356,10 @@ impl Reconciler {
                     .id
                     .instance_name()
                     .is_some_and(|id| hosted.is_cordoned(index, id));
-                let replacing = worker.id.instance_name().is_some_and(|id| {
-                    hosted.is_replacing(index, &worker.fleet, id)
-                });
+                let replacing = worker
+                    .id
+                    .instance_name()
+                    .is_some_and(|id| hosted.is_replacing(index, &worker.fleet, id));
                 if replacing || (!worker.draining && !owned) {
                     fleet.outlook.demand.add_running(worker.running_actions);
                     let known = self.running_reservations[worker_index];
@@ -487,7 +488,9 @@ impl Reconciler {
         let (past_boot_grace, counts) = outlook;
         let hosted = self.hosted(pass, view, instance);
         let owned = pass.hosted.is_cordoned(view.index, instance.id.as_str());
-        let replacing = pass.hosted.is_replacing(view.index, &view.policy.name, instance.id.as_str());
+        let replacing =
+            pass.hosted
+                .is_replacing(view.index, &view.policy.name, instance.id.as_str());
         if owned {
             self.observations.observe_cordon(view.index, &instance.id);
         }
@@ -530,11 +533,14 @@ impl Reconciler {
             census.replacing = census.replacing.saturating_add(1);
             if let Some(worker) = hosted.worker {
                 let replacing_cordon = pass.hosted.snapshot().cordons.iter().any(|cordon| {
-                    cordon.fleet == view.index && cordon.instance.as_str() == instance.id.as_str()
+                    cordon.fleet == view.index
+                        && cordon.instance.as_str() == instance.id.as_str()
                         && cordon.replacing
                 });
                 if !replacing_cordon {
-                    let worker = pass.hosted.workers_on(&view.policy.name, &instance.id)
+                    let worker = pass
+                        .hosted
+                        .workers_on(&view.policy.name, &instance.id)
                         .find(|&index| !pass.hosted.snapshot().workers[index].current_build)
                         .unwrap_or(worker);
                     plan.steps.push(PlanStep {
@@ -606,7 +612,10 @@ impl Reconciler {
         hosted: Hosted,
         (worker, owned, replacing, since): (usize, bool, bool, Tick),
     ) -> Standing {
-        if !owned && !replacing && pass.now.saturating_duration_since(since) < view.policy.boot_grace {
+        if !owned
+            && !replacing
+            && pass.now.saturating_duration_since(since) < view.policy.boot_grace
+        {
             return Standing::Transient;
         }
         let end = if !hosted.serving && hosted.running == 0 {
@@ -670,9 +679,10 @@ impl Reconciler {
         let terminated_replacing: u32 = plan.steps[planned..]
             .iter()
             .filter(|step| match &step.action {
-                Action::Terminate { instance, .. } => pass.hosted.is_replacing(
-                    index, &view.policy.name, instance.as_str(),
-                ),
+                Action::Terminate { instance, .. } => {
+                    pass.hosted
+                        .is_replacing(index, &view.policy.name, instance.as_str())
+                }
                 _ => false,
             })
             .count()

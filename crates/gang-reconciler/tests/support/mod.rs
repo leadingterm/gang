@@ -398,11 +398,14 @@ impl Harness {
             .iter()
             .position(|pass| pass.policy.name == fleet_name)
             .ok_or(HarnessError::NoFleet(usize::MAX))?;
-        let replacing = self.snapshot.cordons.iter().any(|cordon| {
-            cordon.fleet == fleet && *cordon.instance == id && cordon.replacing
-        }) || self.snapshot.workers.iter().any(|worker| {
-            worker.fleet == fleet_name && id.hosts(&worker.id) && !worker.current_build
-        });
+        let replacing = self
+            .snapshot
+            .cordons
+            .iter()
+            .any(|cordon| cordon.fleet == fleet && *cordon.instance == id && cordon.replacing)
+            || self.snapshot.workers.iter().any(|worker| {
+                worker.fleet == fleet_name && id.hosts(&worker.id) && !worker.current_build
+            });
         if replacing && !draining {
             return Ok(());
         }

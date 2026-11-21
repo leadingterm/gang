@@ -1267,37 +1267,74 @@ mod tests {
         let (stack, notify) =
             stack_on_test_clock_with_matching_gate(&fleets, &default_config(), Some(ready_tx))?;
         notify.notify_one();
-        ready_rx.recv().await.expect("background matcher reached the gate");
+        ready_rx
+            .recv()
+            .await
+            .expect("background matcher reached the gate");
         let cordons = crate::cordons::InstanceCordons::new(Arc::new(fleets));
         let (tx, mut stale_rx) = mpsc::channel(64);
         let mut stale = Worker::new(
             WorkerId("stale-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b".to_owned()),
             PlatformProperties::new(HashMap::from([
-                (property::FLEET.to_owned(), PlatformPropertyValue::Exact("arm".to_owned())),
-                (property::ISA.to_owned(), PlatformPropertyValue::Exact(Isa::Aarch64.to_string())),
-                (property::SANDBOX.to_owned(), PlatformPropertyValue::Exact("docker".to_owned())),
-                (property::CPU_COUNT.to_owned(), PlatformPropertyValue::Minimum(4)),
-                (property::CPU_MILLICORES.to_owned(), PlatformPropertyValue::Minimum(4_000)),
-                (property::MEMORY_KB.to_owned(), PlatformPropertyValue::Minimum(8 * 1024 * 1024)),
-                (property::DISK_KB.to_owned(), PlatformPropertyValue::Minimum(100 * 1024 * 1024)),
+                (
+                    property::FLEET.to_owned(),
+                    PlatformPropertyValue::Exact("arm".to_owned()),
+                ),
+                (
+                    property::ISA.to_owned(),
+                    PlatformPropertyValue::Exact(Isa::Aarch64.to_string()),
+                ),
+                (
+                    property::SANDBOX.to_owned(),
+                    PlatformPropertyValue::Exact("docker".to_owned()),
+                ),
+                (
+                    property::CPU_COUNT.to_owned(),
+                    PlatformPropertyValue::Minimum(4),
+                ),
+                (
+                    property::CPU_MILLICORES.to_owned(),
+                    PlatformPropertyValue::Minimum(4_000),
+                ),
+                (
+                    property::MEMORY_KB.to_owned(),
+                    PlatformPropertyValue::Minimum(8 * 1024 * 1024),
+                ),
+                (
+                    property::DISK_KB.to_owned(),
+                    PlatformPropertyValue::Minimum(100 * 1024 * 1024),
+                ),
             ])),
-            tx, NOW.get().as_secs(), 1,
+            tx,
+            NOW.get().as_secs(),
+            1,
         );
-        let admission = cordons.admission(stack.workers.as_ref(), &mut stale).await?;
+        let admission = cordons
+            .admission(stack.workers.as_ref(), &mut stale)
+            .await?;
         stack.workers.add_worker(stale).await?;
         drop(admission);
         stale_rx.try_recv().expect("connection acknowledgement");
         let client = OperationId::from("outdated-client");
-        let _subscription = stack.actions.add_action(client.clone(), action(Isa::Aarch64, Some("252"))).await?;
+        let _subscription = stack
+            .actions
+            .add_action(client.clone(), action(Isa::Aarch64, Some("252")))
+            .await?;
         stack.simple.do_try_match_for_test().await?;
-        assert_eq!(stage_of(stack.actions.as_ref(), &client).await?, Some(ActionStage::Queued));
+        assert_eq!(
+            stage_of(stack.actions.as_ref(), &client).await?,
+            Some(ActionStage::Queued)
+        );
         assert!(stale_rx.try_recv().is_err());
         let current_id = WorkerId("current-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6c".to_owned());
         let mut current = connect_arm_worker(stack.workers.as_ref(), &current_id).await?;
         current.try_recv().expect("connection acknowledgement");
         stack.simple.do_try_match_for_test().await?;
         let _ = next_dispatch(&mut current).await;
-        assert_eq!(stage_of(stack.actions.as_ref(), &client).await?, Some(ActionStage::Executing));
+        assert_eq!(
+            stage_of(stack.actions.as_ref(), &client).await?,
+            Some(ActionStage::Executing)
+        );
         Ok(())
     }
 

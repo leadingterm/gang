@@ -54,7 +54,9 @@ impl HostedSnapshot {
         }
         let probe = (Some(instance), name);
         let workers = &self.snapshot.workers;
-        let start = self.by_instance.partition_point(|&i| key(&workers[i]) < probe);
+        let start = self
+            .by_instance
+            .partition_point(|&i| key(&workers[i]) < probe);
         self.by_instance[start..]
             .iter()
             .copied()

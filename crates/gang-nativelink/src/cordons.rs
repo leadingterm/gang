@@ -84,18 +84,30 @@ impl InstanceCordons {
         inner: &dyn WorkerScheduler,
         worker: &mut Worker,
     ) -> Result<Admission<'a>, Error> {
-        let fleet = worker.total_platform_properties.properties.get(property::FLEET)
+        let fleet = worker
+            .total_platform_properties
+            .properties
+            .get(property::FLEET)
             .and_then(|value| match value {
                 PlatformPropertyValue::Exact(fleet) => self.fleet_index(fleet),
                 _ => None,
             });
-        let stale = worker.total_platform_properties.properties.get(property::GANG_VERSION)
+        let stale = worker
+            .total_platform_properties
+            .properties
+            .get(property::GANG_VERSION)
             .is_none_or(|value| value.as_str().as_ref() != env!("CARGO_PKG_VERSION"));
-        let instance = stale.then(|| WorkerId::instance_name_from_str(&worker.id.0)
-            .and_then(|name| InstanceId::try_new(name).ok())).flatten();
+        let instance = stale
+            .then(|| {
+                WorkerId::instance_name_from_str(&worker.id.0)
+                    .and_then(|name| InstanceId::try_new(name).ok())
+            })
+            .flatten();
         let read = self.state.read().await;
-        let state = if read.self_drains.is_empty() && !worker.is_draining
-            && !(stale && fleet.is_some() && instance.is_some()) {
+        let state = if read.self_drains.is_empty()
+            && !worker.is_draining
+            && !(stale && fleet.is_some() && instance.is_some())
+        {
             read
         } else {
             drop(read);
@@ -115,15 +127,27 @@ impl InstanceCordons {
                 let entries = &mut write.fleets[fleet];
                 match entries.binary_search_by(|entry| entry.id.as_str().cmp(instance.as_str())) {
                     Ok(position) => entries[position].replacing = true,
-                    Err(position) => entries.insert(position, Entry {
-                        id: Arc::new(instance.clone()),
-                        present: false,
-                        absent_since: None,
-                        replacing: true,
-                    }),
+                    Err(position) => entries.insert(
+                        position,
+                        Entry {
+                            id: Arc::new(instance.clone()),
+                            present: false,
+                            absent_since: None,
+                            replacing: true,
+                        },
+                    ),
                 }
                 let workers = inner.worker_snapshot().await;
-                Self::apply_drain(inner, &write, fleet, &instance, true, &self.catalog, workers).await?;
+                Self::apply_drain(
+                    inner,
+                    &write,
+                    fleet,
+                    &instance,
+                    true,
+                    &self.catalog,
+                    workers,
+                )
+                .await?;
             }
             RwLockWriteGuard::downgrade(write)
         };
@@ -173,18 +197,35 @@ impl InstanceCordons {
                 position
             }
         };
-        if draining && workers.iter().any(|worker| {
-            worker.platform_properties.get(property::FLEET).map(String::as_str) == Some(fleet.as_str())
-                && WorkerId::instance_name_from_str(&worker.id) == Some(instance.as_str())
-                && worker.platform_properties.get(property::GANG_VERSION).map(String::as_str)
-                    != Some(env!("CARGO_PKG_VERSION"))
-        }) {
+        if draining
+            && workers.iter().any(|worker| {
+                worker
+                    .platform_properties
+                    .get(property::FLEET)
+                    .map(String::as_str)
+                    == Some(fleet.as_str())
+                    && WorkerId::instance_name_from_str(&worker.id) == Some(instance.as_str())
+                    && worker
+                        .platform_properties
+                        .get(property::GANG_VERSION)
+                        .map(String::as_str)
+                        != Some(env!("CARGO_PKG_VERSION"))
+            })
+        {
             state.fleets[fleet_index][position].replacing = true;
         }
         let draining = draining || state.fleets[fleet_index][position].replacing;
-        Self::apply_drain(inner, &state, fleet_index, instance, draining, &self.catalog, workers)
-            .await
-            .map_err(PortError::backend)?;
+        Self::apply_drain(
+            inner,
+            &state,
+            fleet_index,
+            instance,
+            draining,
+            &self.catalog,
+            workers,
+        )
+        .await
+        .map_err(PortError::backend)?;
         if !draining {
             state.fleets[fleet_index].remove(position);
         }
@@ -650,7 +691,10 @@ mod tests {
             id,
             PlatformProperties::new(HashMap::from([
                 (property::FLEET.to_owned(), fleet),
-                (property::GANG_VERSION.to_owned(), PlatformPropertyValue::Exact(env!("CARGO_PKG_VERSION").to_owned())),
+                (
+                    property::GANG_VERSION.to_owned(),
+                    PlatformPropertyValue::Exact(env!("CARGO_PKG_VERSION").to_owned()),
+                ),
             ])),
             sender,
             0,
@@ -669,7 +713,6 @@ mod tests {
         inner.add_worker(worker).await
     }
 
-
     #[tokio::test]
     async fn stale_and_missing_versions_replace_the_whole_instance() -> TestResult {
         for version in [Some("old"), None] {
@@ -681,12 +724,20 @@ mod tests {
             let other = id("host", 4);
             admit(&cordons, &inner, "alpha", other.clone()).await?;
             inner.workers.lock().connected[0].running_actions = 2;
-            let mut stale = worker(PlatformPropertyValue::Exact("alpha".to_owned()), id("host", 2));
+            let mut stale = worker(
+                PlatformPropertyValue::Exact("alpha".to_owned()),
+                id("host", 2),
+            );
             if let Some(version) = version {
                 stale.total_platform_properties.properties.insert(
-                    property::GANG_VERSION.to_owned(), PlatformPropertyValue::Ignore(version.to_owned()));
+                    property::GANG_VERSION.to_owned(),
+                    PlatformPropertyValue::Ignore(version.to_owned()),
+                );
             } else {
-                stale.total_platform_properties.properties.remove(property::GANG_VERSION);
+                stale
+                    .total_platform_properties
+                    .properties
+                    .remove(property::GANG_VERSION);
             }
             let admission = cordons.admission(&inner, &mut stale).await?;
             assert!(stale.is_draining);
@@ -698,7 +749,15 @@ mod tests {
             let fleet = FleetName::try_new("alpha")?;
             let instance = InstanceId::try_new("host")?;
             assert!(snapshot(&cordons).await[0].replacing);
-            cordons.set_draining(&inner, &fleet, &instance, false, crate::acquisition::test_acquisition()).await?;
+            cordons
+                .set_draining(
+                    &inner,
+                    &fleet,
+                    &instance,
+                    false,
+                    crate::acquisition::test_acquisition(),
+                )
+                .await?;
             inner.remove_worker(&first).await?;
             let reconnect = id("host", 3);
             admit(&cordons, &inner, "alpha", reconnect.clone()).await?;
@@ -715,11 +774,25 @@ mod tests {
         let first = id("host", 1);
         admit(&cordons, &inner, "alpha", first.clone()).await?;
         inner.fail(&first, Failure::Connected);
-        let mut stale = worker(PlatformPropertyValue::Exact("alpha".to_owned()), id("host", 2));
-        stale.total_platform_properties.properties.remove(property::GANG_VERSION);
+        let mut stale = worker(
+            PlatformPropertyValue::Exact("alpha".to_owned()),
+            id("host", 2),
+        );
+        stale
+            .total_platform_properties
+            .properties
+            .remove(property::GANG_VERSION);
         assert!(cordons.admission(&inner, &mut stale).await.is_err());
         assert!(snapshot(&cordons).await[0].replacing);
-        cordons.set_draining(&inner, &FleetName::try_new("alpha")?, &InstanceId::try_new("host")?, false, crate::acquisition::test_acquisition()).await?;
+        cordons
+            .set_draining(
+                &inner,
+                &FleetName::try_new("alpha")?,
+                &InstanceId::try_new("host")?,
+                false,
+                crate::acquisition::test_acquisition(),
+            )
+            .await?;
         assert_eq!(inner.draining(&first), Some(true));
         assert!(snapshot(&cordons).await[0].replacing);
         Ok(())
@@ -732,16 +805,37 @@ mod tests {
         let first = id("host", 1);
         let second = id("host", 2);
         admit(&cordons, &inner, "alpha", first.clone()).await?;
-        let mut old = worker(PlatformPropertyValue::Exact("alpha".to_owned()), second.clone());
-        old.total_platform_properties.properties.remove(property::GANG_VERSION);
+        let mut old = worker(
+            PlatformPropertyValue::Exact("alpha".to_owned()),
+            second.clone(),
+        );
+        old.total_platform_properties
+            .properties
+            .remove(property::GANG_VERSION);
         inner.add_worker(old).await?;
         let fleet = FleetName::try_new("alpha")?;
         let instance = InstanceId::try_new("host")?;
-        cordons.set_draining(&inner, &fleet, &instance, true, crate::acquisition::test_acquisition()).await?;
+        cordons
+            .set_draining(
+                &inner,
+                &fleet,
+                &instance,
+                true,
+                crate::acquisition::test_acquisition(),
+            )
+            .await?;
         assert!(snapshot(&cordons).await[0].replacing);
         assert_eq!(inner.draining(&first), Some(true));
         assert_eq!(inner.draining(&second), Some(true));
-        cordons.set_draining(&inner, &fleet, &instance, false, crate::acquisition::test_acquisition()).await?;
+        cordons
+            .set_draining(
+                &inner,
+                &fleet,
+                &instance,
+                false,
+                crate::acquisition::test_acquisition(),
+            )
+            .await?;
         assert_eq!(inner.draining(&first), Some(true));
         assert_eq!(inner.draining(&second), Some(true));
         Ok(())

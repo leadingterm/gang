@@ -62,7 +62,10 @@ fn worker_state(summary: &WorkerSummary) -> Option<WorkerState> {
         id,
         fleet,
         environment,
-        current_build: summary.platform_properties.get(property::GANG_VERSION).map(String::as_str)
+        current_build: summary
+            .platform_properties
+            .get(property::GANG_VERSION)
+            .map(String::as_str)
             == Some(env!("CARGO_PKG_VERSION")),
         running_actions: summary.running_actions,
         max_inflight_actions,
@@ -803,11 +806,28 @@ pub(crate) mod tests {
     fn worker_build_identity_requires_the_current_version() {
         let mut listing = summary(WORKER);
         listing.platform_properties.remove(property::GANG_VERSION);
-        assert!(!worker_state(&listing).expect("managed worker").current_build);
-        listing.platform_properties.insert(property::GANG_VERSION.to_owned(), "old".to_owned());
-        assert!(!worker_state(&listing).expect("managed worker").current_build);
-        listing.platform_properties.insert(property::GANG_VERSION.to_owned(), env!("CARGO_PKG_VERSION").to_owned());
-        assert!(worker_state(&listing).expect("managed worker").current_build);
+        assert!(
+            !worker_state(&listing)
+                .expect("managed worker")
+                .current_build
+        );
+        listing
+            .platform_properties
+            .insert(property::GANG_VERSION.to_owned(), "old".to_owned());
+        assert!(
+            !worker_state(&listing)
+                .expect("managed worker")
+                .current_build
+        );
+        listing.platform_properties.insert(
+            property::GANG_VERSION.to_owned(),
+            env!("CARGO_PKG_VERSION").to_owned(),
+        );
+        assert!(
+            worker_state(&listing)
+                .expect("managed worker")
+                .current_build
+        );
     }
 
     #[test]

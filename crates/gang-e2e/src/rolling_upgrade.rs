@@ -1401,10 +1401,15 @@ impl Upgrade<'_> {
         };
         let (initial, promotion) =
             self.finish_initial(observation.build, observation.attempts, promotion)?;
-        let old_pid = observation.in_flight.values().next()
-            .ok_or_else(|| E2eError::system("original held worker missing"))?.0;
-        let old_exited = process::await_gone(old_pid, self.cluster.stack().settings().startup_timeout)?
-            && !Path::new(&format!("/proc/{old_pid}/exe")).exists();
+        let old_pid = observation
+            .in_flight
+            .values()
+            .next()
+            .ok_or_else(|| E2eError::system("original held worker missing"))?
+            .0;
+        let old_exited =
+            process::await_gone(old_pid, self.cluster.stack().settings().startup_timeout)?
+                && !Path::new(&format!("/proc/{old_pid}/exe")).exists();
         self.client.assert_original_rc()?;
         let old_post = self.post_build(
             scope,
@@ -1419,7 +1424,8 @@ impl Upgrade<'_> {
         let old_binary = fs::canonicalize(&self.releases.old.binary)
             .map_err(E2eError::io("resolving old release executable"))?;
         let entries = process::snapshot();
-        let workers = process::workers_of(&entries, &self.cluster.stack().placement().config_file());
+        let workers =
+            process::workers_of(&entries, &self.cluster.stack().placement().config_file());
         let mut old_fleet_empty = true;
         for worker in workers {
             match fs::canonicalize(format!("/proc/{}/exe", worker.pid)) {
@@ -1432,8 +1438,16 @@ impl Upgrade<'_> {
             stale_draining_held: true,
             old_exited,
             old_fleet_empty,
-            old_client_current: current_executables(&old_post.attempts, &old_post.executables, &candidate),
-            candidate_client_current: current_executables(&post.attempts, &post.executables, &candidate),
+            old_client_current: current_executables(
+                &old_post.attempts,
+                &old_post.executables,
+                &candidate,
+            ),
+            candidate_client_current: current_executables(
+                &post.attempts,
+                &post.executables,
+                &candidate,
+            ),
         };
         let outcome = monitor.finish()?;
         let mut checks = self.report(
@@ -1826,7 +1840,11 @@ mod tests {
         assert!(!current_executables(&post, &executables, candidate));
         executables.insert(43, candidate.to_path_buf());
         assert!(current_executables(&post, &executables, candidate));
-        assert!(!current_executables(&Attempts::new(), &executables, candidate));
+        assert!(!current_executables(
+            &Attempts::new(),
+            &executables,
+            candidate
+        ));
     }
 
     fn reexecuted_attempts() -> Attempts {
@@ -1915,10 +1933,16 @@ mod tests {
         input.drain = &drain;
         input.procedure = UpgradeProcedure::PreStop;
         assert!(final_verdict(&input).iter().all(Check::is_passed));
-        let stale_remains = RolloutWitness { old_fleet_empty: false, ..rollout };
+        let stale_remains = RolloutWitness {
+            old_fleet_empty: false,
+            ..rollout
+        };
         input.rollout = &stale_remains;
         assert!(final_verdict(&input).iter().any(Check::is_failure));
-        let wrong_executable = RolloutWitness { candidate_client_current: false, ..rollout };
+        let wrong_executable = RolloutWitness {
+            candidate_client_current: false,
+            ..rollout
+        };
         input.rollout = &wrong_executable;
         assert!(final_verdict(&input).iter().any(Check::is_failure));
         input.rollout = &rollout;

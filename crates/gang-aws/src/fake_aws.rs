@@ -797,7 +797,10 @@ fn group_xml(group: &FakeGroup) -> String {
 }
 
 /// Updates only the group's maximum, preserving its minimum and desired capacity.
-fn update_auto_scaling_group(state: &mut FakeState, params: &Parameters) -> Result<(), FakeFailure> {
+fn update_auto_scaling_group(
+    state: &mut FakeState,
+    params: &Parameters,
+) -> Result<(), FakeFailure> {
     let name = required(params, "AutoScalingGroupName")?;
     let maximum: i32 = required(params, "MaxSize")?
         .parse()
