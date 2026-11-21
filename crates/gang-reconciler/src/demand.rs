@@ -420,18 +420,26 @@ mod tests {
         let candidates = FleetSet::prefix(2)?;
         for available in [0, 1] {
             let limits = [available, 2];
-            let chosen = place(candidates, ActionResources::default(), nonzero_u32(1), |i| {
-                Some((&policies[i], Demand::default(), limits[i]))
-            });
+            let chosen = place(
+                candidates,
+                ActionResources::default(),
+                nonzero_u32(1),
+                |i| Some((&policies[i], Demand::default(), limits[i])),
+            );
             assert_eq!(chosen, Some(usize::from(available == 0)));
         }
         let mut occupied = Demand::default();
         occupied.add_queued(resources(15_000, Bytes::new(0)));
         assert_eq!(
-            place(candidates, resources(1, Bytes::new(0)), nonzero_u32(1), |i| {
-                let demand = if i == 0 { occupied } else { Demand::default() };
-                Some((&policies[i], demand, 1))
-            }),
+            place(
+                candidates,
+                resources(1, Bytes::new(0)),
+                nonzero_u32(1),
+                |i| {
+                    let demand = if i == 0 { occupied } else { Demand::default() };
+                    Some((&policies[i], demand, 1))
+                }
+            ),
             Some(1)
         );
         assert_eq!(
