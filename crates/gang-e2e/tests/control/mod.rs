@@ -537,6 +537,7 @@ impl World {
             completed: 0,
             recent: Recent::default(),
             cache: gang_wire::Cache::default(),
+            connections: gang_wire::Connections::default(),
             builds: Vec::new(),
             principals_epoch: 0,
         }

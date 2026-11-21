@@ -274,6 +274,7 @@ impl SchedulerPort for NativeLink {
             ended,
             handoff,
             mode: ServeMode::Standby(request_timeout),
+            observations: self.shared.observations(),
         };
         let tuning = &self.config.http2;
         tokio::try_join!(

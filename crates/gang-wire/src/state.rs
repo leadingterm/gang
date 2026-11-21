@@ -153,11 +153,41 @@ pub struct State {
     /// The leader's bounded stores and latest external bucket measurement.
     #[serde(default)]
     pub cache: Cache,
+    /// Public listener connections and cumulative refusals.
+    #[serde(default)]
+    pub connections: Connections,
     /// Builds with an observation within the recent window, basic view, ordered by name; at most `max_live`.
     pub builds: Vec<Build>,
     /// Epoch of the principal set, which advances when principals change.
     #[ts(type = "number")]
     pub principals_epoch: u64,
+}
+
+/// Public listener only: current active and limit gauges, and refusals since server process start.
+/// Defaults to zero when reading snapshots produced before this field existed.
+#[derive(
+    gang_macros::Known,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    Default,
+    ts_rs::TS,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct Connections {
+    /// Currently served public connections.
+    #[ts(type = "number")]
+    pub active: u64,
+    /// Configured public listener limit.
+    #[ts(type = "number")]
+    pub limit: u64,
+    /// Public connections refused since process start.
+    #[ts(type = "number")]
+    pub refused: u64,
 }
 
 /// Cache occupancy at the latest completed pass and provider measurement.
@@ -911,6 +941,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_state_defaults_public_connections() {
+        let mut value = serde_json::to_value(State::default()).expect("state serializes");
+        assert_eq!(
+            value["connections"],
+            json!({"active": 0, "limit": 0, "refused": 0})
+        );
+        value.as_object_mut().expect("object").remove("connections");
+        let old: State = serde_json::from_value(value).expect("old state parses");
+        assert_eq!(old.connections, Connections::default());
+    }
+
+    #[test]
     fn infrastructure_status_round_trips_without_optional_pair() {
         let value = json!({"phase": "REPLACING", "reason": "SPOT_INTERRUPTION"});
         let status: InfrastructureStatus =
@@ -1389,6 +1431,7 @@ mod tests {
             "provisioner": "aws",
             "pass": {"state": "OK", "interval": "2s", "applied": 0, "failed": 0},
             "queue": {"total": 0, "unplaceable": 0},
+            "connections": {"active": 0, "limit": 0, "refused": 0},
             "fleets": [fleet_value()],
             "workers": [],
             "instances": [],

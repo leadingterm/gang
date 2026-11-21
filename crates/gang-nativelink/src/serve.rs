@@ -22,7 +22,7 @@ use axum::middleware::from_fn_with_state;
 use futures::StreamExt;
 use gang_clock::Clock;
 use gang_config::Http2Config;
-use gang_spi::{Listening, RequestGate, RequestScope};
+use gang_spi::{Listening, ObservationSink, RequestGate, RequestScope};
 use gang_types::{NonZeroDuration, SaturatingInto};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
@@ -141,6 +141,7 @@ pub(crate) struct ServeShutdown {
     pub(crate) ended: tokio::sync::mpsc::UnboundedSender<()>,
     pub(crate) handoff: HandOff,
     pub(crate) mode: ServeMode,
+    pub(crate) observations: Option<ObservationSink>,
 }
 
 /// Serves `router` on the connections of `listening` until the stream ends and the served
@@ -190,6 +191,14 @@ pub(crate) async fn serve<G: RequestGate, C: Clock + Clone + Send + Sync + 'stat
     let mut refusals = Refusals::new(listener, max_connections, tuning.refusal_log_interval);
     let mut open: VecDeque<Open> = VecDeque::new();
     let idle = shutdown.mode.idle_timeout(listener, tuning);
+    let observations = if listener == Listener::Public {
+        shutdown.observations.as_ref()
+    } else {
+        None
+    };
+    if let Some(sink) = observations {
+        sink.set_connection_limit(max_connections);
+    }
     loop {
         tokio::select! {
             next = connections.next() => if let Some(accepted) = next {
@@ -198,6 +207,9 @@ pub(crate) async fn serve<G: RequestGate, C: Clock + Clone + Send + Sync + 'stat
                         reap(finished, &mut open);
                     }
                     if !make_room(&mut open, max_connections) {
+                        if let Some(sink) = observations {
+                            sink.connection_refused();
+                        }
                         // Every place is earned: dropping the connection closes it.
                         if let Some(line) = refusals.refuse(clock.monotonic()) {
                             tracing::warn!("{line}");
@@ -214,7 +226,9 @@ pub(crate) async fn serve<G: RequestGate, C: Clock + Clone + Send + Sync + 'stat
                     let http = http.clone();
                     let clock = clock.clone();
                     let expiring = Arc::clone(&standing);
+                    let count = observations.map(ObservationSink::connection_opened);
                     let abort = served.spawn(async move {
+                        let _count = count;
                         let connection = http.serve_connection(
                             TokioIo::new(accepted.connection),
                             TowerToHyperService::new(service),
@@ -469,6 +483,7 @@ mod tests {
                     ended,
                     handoff,
                     mode: ServeMode::Controller,
+                    observations: None,
                 },
             )
             .await
@@ -554,6 +569,7 @@ mod tests {
                 ended,
                 handoff: handoff.clone(),
                 mode,
+                observations: None,
             };
             let task = tokio::spawn(async move {
                 let tuning = Http2Config::default();
@@ -788,6 +804,21 @@ mod tests {
         mpsc::UnboundedSender<Accepted>,
         JoinHandle<Result<(), NativeLinkEmbedError>>,
     ) {
+        start_scoped_observed(routes, gate, tuning, listener, clock, mode, None)
+    }
+
+    fn start_scoped_observed<G: RequestGate, C: Clock + Clone + Send + Sync + 'static>(
+        routes: ScopedRoutes,
+        gate: G,
+        tuning: Http2Config,
+        listener: Listener,
+        clock: C,
+        mode: ServeMode,
+        observations: Option<ObservationSink>,
+    ) -> (
+        mpsc::UnboundedSender<Accepted>,
+        JoinHandle<Result<(), NativeLinkEmbedError>>,
+    ) {
         let (sender, receiver) = mpsc::unbounded_channel::<Accepted>();
         let connections = stream::unfold(receiver, |mut receiver| async move {
             let accepted = receiver.recv().await?;
@@ -813,6 +844,7 @@ mod tests {
                     ended,
                     handoff: handoff.clone(),
                     mode,
+                    observations,
                 },
             );
             tokio::pin!(serving);
@@ -1069,6 +1101,7 @@ mod tests {
             ended,
             handoff: handoff.clone(),
             mode: ServeMode::Controller,
+            observations: None,
         };
         let task = tokio::spawn(async move {
             serve(
@@ -1108,6 +1141,7 @@ mod tests {
             ended,
             handoff: handoff.clone(),
             mode: ServeMode::Controller,
+            observations: None,
         };
         let clock = Arc::new(TestClock::new(Timestamp::from_unix_millis(0)));
         let task = tokio::spawn(async move {
@@ -1764,23 +1798,70 @@ mod tests {
             max_connections: NonZeroUsize::new(2).ok_or("nonzero")?,
             ..Http2Config::default()
         };
-        let (feed, task) = start_gated(router(), ByAuthorization, tuning, Listener::Public);
+        let (sink, _observations) = ObservationSink::channel(NonZeroUsize::MIN, NonZeroUsize::MIN);
+        let (feed, task) = start_scoped_observed(
+            shared_routes(router()),
+            ByAuthorization,
+            tuning,
+            Listener::Public,
+            SystemClock::new(),
+            ServeMode::Controller,
+            Some(sink.clone()),
+        );
         let _first_raw = connect(&feed)?;
         let _second_raw = connect(&feed)?;
         let (mut first, first_connection) = open(connect(&feed)?).await?;
         assert_eq!(get_root_authorized(&mut first).await?, StatusCode::OK);
         let (mut second, second_connection) = open(connect(&feed)?).await?;
         assert_eq!(get_root_authorized(&mut second).await?, StatusCode::OK);
-        let mut raw = connect(&feed)?;
-        let mut received = Vec::new();
-        tokio::time::timeout(Duration::from_secs(1), raw.read_to_end(&mut received))
-            .await
-            .map_err(|_| "the connection beyond the earned places stayed open")??;
-        assert!(received.is_empty());
+        for _ in 0..3 {
+            let mut raw = connect(&feed)?;
+            let mut received = Vec::new();
+            raw.read_to_end(&mut received).await?;
+            assert!(received.is_empty());
+        }
+        assert_eq!(
+            sink.connections(),
+            gang_spi::ConnectionCounts {
+                active: 2,
+                limit: 2,
+                refused: 3
+            }
+        );
         assert_eq!(get_root_authorized(&mut first).await?, StatusCode::OK);
         assert_eq!(get_root_authorized(&mut second).await?, StatusCode::OK);
         first_connection.abort();
         second_connection.abort();
+        drop(feed);
+        finished(task).await?;
+        assert_eq!(sink.connections().active, 0);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn worker_listener_does_not_count_public_connections() -> TestResult {
+        let tuning = Http2Config {
+            max_connections: NonZeroUsize::MIN,
+            ..Http2Config::default()
+        };
+        let (sink, _observations) = ObservationSink::channel(NonZeroUsize::MIN, NonZeroUsize::MIN);
+        let (feed, task) = start_scoped_observed(
+            shared_routes(router()),
+            ByAuthorization,
+            tuning,
+            Listener::Worker,
+            SystemClock::new(),
+            ServeMode::Controller,
+            Some(sink.clone()),
+        );
+        let (mut client, connection) = open(connect(&feed)?).await?;
+        assert_eq!(get_root_authorized(&mut client).await?, StatusCode::OK);
+        let mut refused = connect(&feed)?;
+        let mut received = Vec::new();
+        refused.read_to_end(&mut received).await?;
+        assert!(received.is_empty());
+        assert_eq!(sink.connections(), gang_spi::ConnectionCounts::default());
+        connection.abort();
         drop(feed);
         finished(task).await
     }
