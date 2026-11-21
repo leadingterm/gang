@@ -75,11 +75,11 @@ impl ClientStateManager for FittedActions {
         operation: OperationId,
         mut action_info: Arc<ActionInfo>,
     ) -> Result<Box<dyn ActionStateResult>, Error> {
-        let (admitted, live_catalog) = self
+        let admitted = self
             .admitted
             .take(&operation)
-            .unwrap_or_else(|| (self.fleets.accepting(|_| None), None));
-        let fleets = live_catalog.as_ref().unwrap_or(&self.fleets);
+            .unwrap_or_else(|| self.fleets.accepting(|_| None));
+        let fleets = &self.fleets;
         for (key, min_kb) in [
             (property::MEMORY_KB, self.min_reservation.as_units()),
             (property::DISK_KB, self.disk_min_reservation.as_units()),

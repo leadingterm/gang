@@ -21,13 +21,7 @@ pub enum DynamoError {
     },
     /// The stored schema is incompatible with this binary.
     #[error("database schema cannot be used")]
-    Schema(#[from] gang_spi::SchemaTooNew),
-    /// No data migration is defined for the stored table shape.
-    #[error("no migration from table shape {from}")]
-    NoMigration {
-        /// The stored table shape.
-        from: u32,
-    },
+    Schema(#[from] gang_spi::SchemaMismatch),
     /// The plugin configuration is unusable.
     #[error("invalid dynamodb configuration: {detail}")]
     #[failure(config)]

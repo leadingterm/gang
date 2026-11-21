@@ -9,8 +9,8 @@ use gang_clock::{Clock, Sleep, TestClock, Tick, Timestamp};
 use gang_spi::{
     Acquisition, CandidateGeneration, CandidatePriority, ControllerHostIdentity, ControllerId,
     ExpiringRecordPort, LeaderLeasePort, Plugin, PluginContext, PortError, RecordId, RecordKey,
-    RecordKind, RecordVersion, Renewal, ScalingAuditEvent, ScalingEventKind, SchemaVersion,
-    StateRepositoryPort, Takeover,
+    RecordKind, RecordVersion, Renewal, ScalingAuditEvent, ScalingEventKind, StateRepositoryPort,
+    Takeover,
 };
 use gang_testkit::{FakeDynamoDb, Fixture, TestResult};
 use gang_types::{FleetName, Identity, InstanceId, Principal, ProviderName, WorkerId};
@@ -72,14 +72,11 @@ async fn fresh() -> Result<Fixture<DynamoDb>, Box<dyn std::error::Error>> {
     Ok(Fixture::keeping(database, fake))
 }
 
-async fn stamped(stored: SchemaVersion) -> Result<Fixture<DynamoDb>, Box<dyn std::error::Error>> {
+async fn stamped(stored: u32) -> Result<Fixture<DynamoDb>, Box<dyn std::error::Error>> {
     let (database, fake) = setup().await?;
     let mut item = crate::items::key("meta", "schema");
-    item.insert("shape".into(), crate::items::n(stored.current));
-    item.insert(
-        "oldest_compatible".into(),
-        crate::items::n(stored.oldest_compatible),
-    );
+    item.insert("shape".into(), crate::items::n(stored));
+    item.insert("oldest_compatible".into(), crate::items::n(1));
     database
         .client()
         .await
@@ -121,7 +118,7 @@ async fn legacy_current_schema_is_used() -> TestResult {
 }
 
 #[tokio::test]
-async fn compatible_newer_schema_is_used_without_writing() -> TestResult {
+async fn compatible_newer_schema_is_rejected_without_writing() -> TestResult {
     let (database, _fake) = setup().await?;
     let mut item = crate::items::key("meta", "schema");
     item.insert("shape".into(), crate::items::n(2));
@@ -134,7 +131,13 @@ async fn compatible_newer_schema_is_used_without_writing() -> TestResult {
         .set_item(Some(item.clone()))
         .send()
         .await?;
-    database.ensure_schema().await?;
+    assert!(matches!(
+        database.ensure_schema().await,
+        Err(crate::DynamoError::Schema(gang_spi::SchemaMismatch {
+            stored: 2,
+            supported: 1
+        }))
+    ));
     let stored = database
         .client()
         .await
@@ -163,11 +166,8 @@ async fn legacy_newer_schema_is_rejected() -> TestResult {
         .await?;
     assert!(matches!(
         database.ensure_schema().await,
-        Err(crate::DynamoError::Schema(gang_spi::SchemaTooNew {
-            stored: SchemaVersion {
-                current: 2,
-                oldest_compatible: 2
-            },
+        Err(crate::DynamoError::Schema(gang_spi::SchemaMismatch {
+            stored: 2,
             supported: 1,
         }))
     ));

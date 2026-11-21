@@ -8,7 +8,7 @@ Actions request platform properties, but security capabilities must be granted b
 
 ## Decision
 - Each fleet's `[fleets.actions]` policy has grants defaulting to `[]`; network is the first typed requestable capability.
-- One `FleetCatalog` owns capability grants, existing exact selectors and minimum-resource request ceilings. Unknown platform properties are rejected except the harmless `supports-workers` marker; persistent-worker actions execute one-shot. The required `gang_action_environment` identifies the action environment and must match exactly. Admission precedes historical learning.
+- One `FleetCatalog` owns capability grants, existing exact selectors and minimum-resource request ceilings. Unknown platform properties are rejected except the harmless `supports-workers` marker and legacy request cache label `gang_action_environment`; persistent-worker actions execute one-shot. Workers register their operational `ActionEnvironment` under `gang_action_environment`, ignored by matching. Admission precedes historical learning.
 - Physical worker totals remain distinct from per-action ceilings. Native matching and retries honor the same ceilings and admitted capability constraints, without pinning an action to a single fleet.
 
 ## Consequences

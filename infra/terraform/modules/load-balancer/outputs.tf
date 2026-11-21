@@ -59,6 +59,9 @@ output "health_port" {
 
 output "proxy_protocol_trusted_cidrs" {
   description = "Exact public and internal NLB interface addresses trusted to send PROXY headers."
+  # New controllers require the target groups' framing and health-path updates first.
+  depends_on = [aws_lb_target_group.this, aws_lb_target_group.internal]
+
   value = sort(distinct(flatten([
     for eni in concat(values(data.aws_network_interface.public), values(data.aws_network_interface.internal)) :
     [for ip in eni.private_ips : "${ip}/32"]

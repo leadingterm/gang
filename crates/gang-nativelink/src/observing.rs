@@ -348,11 +348,6 @@ impl WorkerScheduler for ObservingWorkerScheduler {
             self.completed.fetch_add(1, Ordering::Relaxed);
             let action = operation.as_action_info().await.ok();
             if let Some((info, _)) = &action
-                && info
-                    .platform_properties
-                    .get(gang_types::property::ACTION_ENVIRONMENT)
-                    .and_then(|value| value.parse::<gang_types::ActionEnvironment>().ok())
-                    .is_some()
                 && let Some(preferred) = self
                     .fleets
                     .accepting(|key| info.platform_properties.get(key).map(String::as_str))
@@ -985,7 +980,7 @@ mod tests {
             assert_eq!(forwarded.is_err(), case == 7);
             let mut moments = Vec::new();
             scheduler.rates.snapshot_into(&mut moments);
-            let verified = matches!(case, 0..=6 | 11 | 14);
+            let verified = matches!(case, 0..=6 | 11 | 14 | 16);
             assert_eq!(moments.len(), usize::from(verified), "case {case}");
             if verified {
                 let row = moments[0];

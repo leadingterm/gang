@@ -1,5 +1,5 @@
 {
-  "ready_path": "/leader",
+  "ready_path": "/ready",
   "interval_seconds": 5,
   "timeout_seconds": 2,
   "threshold": 2,

@@ -448,10 +448,6 @@ impl WorkPlanner {
                 let mut resume_limit = 0u32;
                 for worker_index in hosted.workers_on(&fleet.policy.name, &instance.id) {
                     let worker = &snapshot.workers[worker_index];
-                    if worker.environment.as_ref() != Some(&fleet.policy.action_environment) {
-                        continue;
-                    }
-
                     connected = true;
                     let limit = worker
                         .max_inflight_actions
@@ -527,9 +523,7 @@ impl WorkPlanner {
         for worker_index in hosted.workers_on(&fleet.policy.name, &instance.id) {
             let worker = &snapshot.workers[worker_index];
             connected = true;
-            if !worker.draining
-                && worker.environment.as_ref() == Some(&fleet.policy.action_environment)
-            {
+            if !worker.draining {
                 display_limit = display_limit.saturating_add(
                     worker
                         .max_inflight_actions
@@ -865,9 +859,6 @@ mod tests {
             source: None,
             candidates: FleetSet::try_from_indices(candidates.iter().copied())
                 .expect("valid fleets"),
-            environment: gang_testkit::fleet_policy("workers")
-                .expect("valid policy")
-                .action_environment,
             resources: ActionResources::default(),
             queued_since: Timestamp::from_unix_millis(1_000_000),
             priority: 0,

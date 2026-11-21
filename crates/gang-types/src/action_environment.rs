@@ -1,9 +1,130 @@
 //! Validated identity of the environment in which an action executes.
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
-use crate::ActionEnvironmentError;
+use crate::{ActionEnvironmentError, EnvironmentNameError};
+
+const INITIAL_ENVIRONMENT: &str = "default/1";
+
+/// A server-owned, deliberately versioned action environment name.
+///
+/// Names have exactly two components, `<name>/<version>`, for example `debian-13/1`.
+/// Each component is 1–64 ASCII letters, digits, `.`, `_` or `-`, but not `.` or `..`.
+/// Security-only image rebuilds preserve the name. The initial `default/1` name
+/// deliberately retains the existing unprefixed action cache.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct EnvironmentName(String);
+
+impl EnvironmentName {
+    /// The action-cache subdirectory, absent for the initial warm-cache environment.
+    #[must_use]
+    pub fn cache_namespace(&self) -> Option<&str> {
+        (self.0 != INITIAL_ENVIRONMENT).then_some(self.0.as_str())
+    }
+
+    /// The configured environment version.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for EnvironmentName {
+    fn default() -> Self {
+        Self(INITIAL_ENVIRONMENT.to_owned())
+    }
+}
+
+impl TryFrom<String> for EnvironmentName {
+    type Error = EnvironmentNameError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let Some((name, version)) = value.split_once('/') else {
+            return Err(EnvironmentNameError);
+        };
+        if ![name, version].into_iter().all(|part| {
+            (1..=64).contains(&part.len())
+                && part != "."
+                && part != ".."
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        }) {
+            return Err(EnvironmentNameError);
+        }
+        Ok(Self(value))
+    }
+}
+
+impl From<EnvironmentName> for String {
+    fn from(value: EnvironmentName) -> Self {
+        value.0
+    }
+}
+
+#[cfg(test)]
+mod environment_name_tests {
+    use super::EnvironmentName;
+
+    #[test]
+    fn initial_environment_is_warm_and_reviewed_bumps_are_isolated() {
+        let initial = EnvironmentName::default();
+        assert_eq!(initial.as_str(), "default/1");
+        assert_eq!(initial.cache_namespace(), None);
+        let bumped = EnvironmentName::try_from("debian-13/2".to_owned()).expect("versioned name");
+        assert_eq!(bumped.cache_namespace(), Some("debian-13/2"));
+        assert_eq!(
+            serde_json::to_string(&bumped).expect("serialize"),
+            "\"debian-13/2\""
+        );
+        assert_eq!(
+            serde_json::from_str::<EnvironmentName>("\"debian-13/2\"").expect("deserialize"),
+            bumped
+        );
+    }
+
+    #[test]
+    fn environment_names_cannot_escape_the_cache_namespace() {
+        for value in [
+            "",
+            "unversioned",
+            "/1",
+            "../1",
+            "./1",
+            "debian/.",
+            "debian/..",
+            "debian/1/ac/content",
+            "debian/1/2",
+            "debian/../1",
+            "debian//1",
+            "debian/1/",
+            "debian/",
+            "debian\\1",
+        ] {
+            assert!(
+                EnvironmentName::try_from(value.to_owned()).is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn environment_components_have_bounded_ascii_lengths() {
+        for value in [
+            format!("{}/1", "a".repeat(65)),
+            format!("debian/{}", "1".repeat(65)),
+            "débian/1".to_owned(),
+            "debian/一".to_owned(),
+        ] {
+            assert!(EnvironmentName::try_from(value.clone()).is_err(), "{value}");
+        }
+        let longest = format!("{}/{}", "A._-".repeat(16), "Z09_".repeat(16));
+        assert!(EnvironmentName::try_from(longest).is_ok());
+    }
+}
 
 /// A rootfs digest or an explicit host environment assertion.
 ///

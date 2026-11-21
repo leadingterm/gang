@@ -99,7 +99,7 @@ impl Readiness {
     }
 
     pub(crate) fn status(&self, path: &str) -> StatusCode {
-        if path != health_check().ready_path() && path != health_check().deployment_path() {
+        if path != health_check().ready_path() {
             return StatusCode::NOT_FOUND;
         }
         if self.ready() {
@@ -120,7 +120,7 @@ pub(crate) struct HealthLimits {
     pub(crate) max_header_size: usize,
     /// Pause after a failed `accept` before accepting again.
     pub(crate) accept_error_backoff: NonZeroDuration,
-    pub(crate) proxy_protocol: Arc<ProxyProtocolConfig>,
+    pub(crate) proxy_protocol: Option<Arc<ProxyProtocolConfig>>,
 }
 
 /// Runs on the same runtime as the other listeners: a frozen or hung process cannot answer,
@@ -139,10 +139,11 @@ pub(crate) async fn serve_health<L: Listener, C: Clock>(
             accepted = listener.accept(), if connections.len() < limits.max_connections.get() => match accepted {
                 Ok((io, addr)) => {
                     let raw = L::peer_ip(&addr);
-                    let config = Arc::clone(&limits.proxy_protocol);
-                    let header_clock = (config.health != gang_config::ProxyProtocol::Off
-                        && config.header_timeout.get() < health_check().timeout())
-                        .then(|| clock.sleep(config.header_timeout.get()));
+                    let config = limits.proxy_protocol.clone();
+                    let header_clock = config
+                        .as_ref()
+                        .filter(|config| config.header_timeout.get() < health_check().timeout())
+                        .map(|config| clock.sleep(config.header_timeout.get()));
                     let http = http.clone();
                     let readiness = readiness.clone();
                     let service = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
@@ -166,21 +167,25 @@ pub(crate) async fn serve_health<L: Listener, C: Clock>(
                     });
                     // The deadline starts at accept, before the connection task first runs.
                     let exchange = clock.timeout(health_check().timeout(), async move {
-                        let preface = prepare(io, raw, config.health, &config, HeaderKind::Health);
-                        let io = tokio::select! {
-                            result = preface => match result {
-                                Ok((io, _)) => io,
-                                Err(error) => {
-                                    tracing::debug!(%error, "health proxy preface rejected");
-                                    return;
-                                }
-                            },
-                            () = async {
-                                match header_clock {
-                                    Some(sleep) => sleep.await,
-                                    None => std::future::pending().await,
-                                }
-                            } => return,
+                        let io = if let Some(config) = config {
+                            let preface = prepare(io, raw, &config, HeaderKind::Health);
+                            tokio::select! {
+                                result = preface => match result {
+                                    Ok((io, _)) => io,
+                                    Err(error) => {
+                                        tracing::debug!(%error, "health proxy preface rejected");
+                                        return;
+                                    }
+                                },
+                                () = async {
+                                    match header_clock {
+                                        Some(sleep) => sleep.await,
+                                        None => std::future::pending().await,
+                                    }
+                                } => return,
+                            }
+                        } else {
+                            io
                         };
                         let _ = http.serve_connection(TokioIo::new(io), service).await;
                     });
@@ -234,7 +239,7 @@ mod tests {
                 .expect("a test admits a connection"),
             max_header_size: 8 * 1024,
             accept_error_backoff: NonZeroDuration::from_secs(1),
-            proxy_protocol: Arc::default(),
+            proxy_protocol: None,
         }
     }
 
@@ -273,7 +278,7 @@ mod tests {
     fn assert_statuses(readiness: &Readiness, ready: StatusCode) {
         assert_eq!(readiness.status(health_check().ready_path()), ready);
         assert_eq!(readiness.status("/serve"), StatusCode::NOT_FOUND);
-        assert_eq!(readiness.status(health_check().deployment_path()), ready);
+        assert_eq!(readiness.status("/leader"), StatusCode::NOT_FOUND);
         assert_eq!(readiness.status("/other"), StatusCode::NOT_FOUND);
     }
 
@@ -373,10 +378,7 @@ mod tests {
     async fn assert_http(dialer: &MemoryDialer, ready: StatusCode) -> gang_testkit::TestResult {
         assert_eq!(request(dialer, health_check().ready_path()).await?, ready);
         assert_eq!(request(dialer, "/serve").await?, StatusCode::NOT_FOUND);
-        assert_eq!(
-            request(dialer, health_check().deployment_path()).await?,
-            ready
-        );
+        assert_eq!(request(dialer, "/leader").await?, StatusCode::NOT_FOUND);
         assert_eq!(request(dialer, "/other").await?, StatusCode::NOT_FOUND);
         Ok(())
     }
@@ -424,20 +426,15 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            for path in [
-                health_check().ready_path(),
-                health_check().deployment_path(),
-            ] {
-                let (actual_status, actual_leading) =
-                    request_with_leading(dialer.dial(), path).await?;
-                assert_eq!(actual_status, status);
-                assert_eq!(
-                    actual_leading
-                        .as_ref()
-                        .and_then(|value| value.to_str().ok()),
-                    Some(leading)
-                );
-            }
+            let (actual_status, actual_leading) =
+                request_with_leading(dialer.dial(), health_check().ready_path()).await?;
+            assert_eq!(actual_status, status);
+            assert_eq!(
+                actual_leading
+                    .as_ref()
+                    .and_then(|value| value.to_str().ok()),
+                Some(leading)
+            );
             match step {
                 0 => {
                     readiness.serve();
@@ -456,72 +453,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxy_health_modes_preserve_readiness_and_reject_missing_headers()
+    async fn proxy_health_preserves_readiness_and_rejects_missing_headers()
     -> gang_testkit::TestResult {
-        for mode in [
-            gang_config::ProxyProtocol::Accept,
-            gang_config::ProxyProtocol::Require,
-        ] {
-            let (listener, dialer) = memory_listener();
-            let clock = crate::test_support_clock::start();
-            let (fence, _keeper) = valid_fence();
-            let readiness = Readiness::default().with_fence(fence);
-            let server_readiness = readiness.clone();
-            let mut limits = limits(4);
-            limits.proxy_protocol = Arc::new(gang_config::ProxyProtocolConfig {
-                health: mode,
-                trusted_cidrs: vec!["10.0.1.4/32".parse()?],
-                ..gang_config::ProxyProtocolConfig::default()
-            });
-            let task = tokio::spawn(async move {
-                serve_health(Trusted(listener), server_readiness, &*clock, limits).await
-            });
-            for (step, status) in [
-                StatusCode::SERVICE_UNAVAILABLE,
-                StatusCode::SERVICE_UNAVAILABLE,
-                StatusCode::OK,
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let mut io = dialer.dial();
-                io.write_all(b"\r\n\r\n\0\r\nQUIT\n\x20\0\0\0").await?;
-                assert_eq!(request_on(io, health_check().ready_path()).await?, status);
-                if step == 0 {
-                    readiness.serve();
-                } else if step == 1 {
-                    readiness.lead();
-                }
+        let (listener, dialer) = memory_listener();
+        let clock = crate::test_support_clock::start();
+        let (fence, _keeper) = valid_fence();
+        let readiness = Readiness::default().with_fence(fence);
+        let server_readiness = readiness.clone();
+        let mut limits = limits(4);
+        limits.proxy_protocol = Some(Arc::new(gang_config::ProxyProtocolConfig {
+            trusted_cidrs: vec!["10.0.1.4/32".parse()?],
+            ..gang_config::ProxyProtocolConfig::default()
+        }));
+        let task = tokio::spawn(async move {
+            serve_health(Trusted(listener), server_readiness, &*clock, limits).await
+        });
+        for (step, status) in [
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::OK,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut io = dialer.dial();
+            io.write_all(b"\r\n\r\n\0\r\nQUIT\n\x20\0\0\0").await?;
+            assert_eq!(request_on(io, health_check().ready_path()).await?, status);
+            if step == 0 {
+                readiness.serve();
+            } else if step == 1 {
+                readiness.lead();
             }
-            let mut framed = dialer.dial();
-            framed
-                .write_all(
-                    b"\r\n\r\n\0\r\nQUIT\n\x21\x11\0\x0c\xc0\0\x02\x01\xc0\0\x02\x02\0\x01\0\x02",
-                )
-                .await?;
-            assert_eq!(
-                request_on(framed, health_check().ready_path()).await?,
-                StatusCode::OK
-            );
-            if mode == gang_config::ProxyProtocol::Accept {
-                assert_eq!(
-                    request(&dialer, health_check().ready_path()).await?,
-                    StatusCode::OK
-                );
-            } else {
-                let mut io = dialer.dial();
-                io.write_all(b"GET / HTTP/1.1\r\n\r\n").await?;
-                let mut byte = [0; 1];
-                assert_eq!(io.read(&mut byte).await?, 0);
-            }
-            let mut invalid = dialer.dial();
-            invalid
-                .write_all(b"\r\n\r\n\0\r\nQUIT\n\x31\x11\0\x64")
-                .await?;
-            let mut byte = [0; 1];
-            assert_eq!(invalid.read(&mut byte).await?, 0);
-            task.abort();
         }
+        let mut framed = dialer.dial();
+        framed
+            .write_all(
+                b"\r\n\r\n\0\r\nQUIT\n\x21\x11\0\x0c\xc0\0\x02\x01\xc0\0\x02\x02\0\x01\0\x02",
+            )
+            .await?;
+        assert_eq!(
+            request_on(framed, health_check().ready_path()).await?,
+            StatusCode::OK
+        );
+        let mut io = dialer.dial();
+        io.write_all(b"GET / HTTP/1.1\r\n\r\n").await?;
+        let mut byte = [0; 1];
+        assert_eq!(io.read(&mut byte).await?, 0);
+        let mut invalid = dialer.dial();
+        invalid
+            .write_all(b"\r\n\r\n\0\r\nQUIT\n\x31\x11\0\x64")
+            .await?;
+        let mut byte = [0; 1];
+        assert_eq!(invalid.read(&mut byte).await?, 0);
+        task.abort();
         Ok(())
     }
 
@@ -531,12 +515,11 @@ mod tests {
         let clock = crate::test_support_clock::start();
         let server_clock = Arc::clone(&clock);
         let mut limits = limits(2);
-        limits.proxy_protocol = Arc::new(gang_config::ProxyProtocolConfig {
-            health: gang_config::ProxyProtocol::Accept,
+        limits.proxy_protocol = Some(Arc::new(gang_config::ProxyProtocolConfig {
             trusted_cidrs: vec!["10.0.1.4/32".parse()?],
             header_timeout: NonZeroDuration::from_secs(1),
             ..gang_config::ProxyProtocolConfig::default()
-        });
+        }));
         let task = tokio::spawn(async move {
             serve_health(
                 Trusted(listener),
@@ -548,8 +531,10 @@ mod tests {
         });
         let mut stalled = dialer.dial();
         stalled.write_all(b"\r\n").await?;
+        let mut framed = dialer.dial();
+        framed.write_all(b"\r\n\r\n\0\r\nQUIT\n\x20\0\0\0").await?;
         assert_eq!(
-            request(&dialer, health_check().ready_path()).await?,
+            request_on(framed, health_check().ready_path()).await?,
             StatusCode::SERVICE_UNAVAILABLE
         );
         clock.advance(Duration::from_secs(1));

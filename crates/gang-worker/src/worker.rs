@@ -272,6 +272,7 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
     .await?;
     let mut properties = fleet.properties.clone();
     properties.set_action_environment(&environment);
+    let action_store = cache.action_store(&actions.environment)?;
     let spec = WorkerSpec {
         actions,
         memory_pool,
@@ -282,7 +283,7 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
         fast_cas_directory: layout.fast_cas_directory(),
         fast_cas_budget,
         content_store: cache.content_store()?,
-        action_store: cache.action_store()?,
+        action_store,
         store_access: cache.worker_access(),
         entrypoint: layout.entrypoint(),
     };

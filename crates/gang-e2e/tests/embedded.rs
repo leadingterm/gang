@@ -1986,6 +1986,49 @@ async fn network_request_runs_on_granted_fleet() -> TestResult {
 }
 
 #[cfg(target_os = "linux")]
+fn spoofed_platform_cases() -> [PlatformCase<'static>; 4] {
+    [
+        (
+            Some(&[
+                ("cpu_count", "2"),
+                ("memory_kb", "16384"),
+                ("network", "requested"),
+            ]),
+            &[("cpu_count", "3")],
+            "2",
+            "requested",
+        ),
+        (
+            None,
+            &[
+                ("cpu_count", "3"),
+                ("memory_kb", "16384"),
+                ("network", "not-requested"),
+            ],
+            "3",
+            "<absent>",
+        ),
+        (
+            Some(&[]),
+            &[("cpu_count", "3"), ("memory_kb", "16384")],
+            "3",
+            "<absent>",
+        ),
+        (
+            Some(&[
+                ("cpu_count", "2"),
+                ("memory_kb", "16384"),
+                ("network", "requested"),
+                ("gang_action_environment", "identity-roots-v1"),
+            ]),
+            &[],
+            "2",
+            "requested",
+        ),
+    ]
+}
+
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reserved_environment_and_platform_authority_survive_client_spoofing() -> TestResult {
     for actions in [
@@ -2031,35 +2074,7 @@ async fn reserved_environment_and_platform_authority_survive_client_spoofing() -
             .min_reservation
             .as_units()
             .to_string();
-        let cases: [PlatformCase<'_>; 3] = [
-            (
-                Some(&[
-                    ("cpu_count", "2"),
-                    ("memory_kb", "16384"),
-                    ("network", "requested"),
-                ]),
-                &[("cpu_count", "3")],
-                "2",
-                "requested",
-            ),
-            (
-                None,
-                &[
-                    ("cpu_count", "3"),
-                    ("memory_kb", "16384"),
-                    ("network", "not-requested"),
-                ],
-                "3",
-                "<absent>",
-            ),
-            (
-                Some(&[]),
-                &[("cpu_count", "3"), ("memory_kb", "16384")],
-                "3",
-                "<absent>",
-            ),
-        ];
-        for (action_platform, command_platform, cpu, network) in cases {
+        for (action_platform, command_platform, cpu, network) in spoofed_platform_cases() {
             let env = [
                 ("GANG_NETWORK", "spoofed"),
                 ("GANG_CPU_COUNT", "spoofed"),
@@ -2363,7 +2378,7 @@ fn worker_server_settings(port: u16) -> Result<gang_server::ServerSettings, Box<
             ..gang_config::ActionsConfig::default()
         }),
         scaling: Arc::new(gang_config::ScalingConfig::default()),
-        proxy_protocol: Arc::new(gang_config::ProxyProtocolConfig::default()),
+        proxy_protocol: None,
         leadership: gang_config::LeadershipConfig::default(),
         standby_routability_delay: Duration::ZERO,
         handoff_timeout: Duration::from_mins(1),
@@ -2371,7 +2386,6 @@ fn worker_server_settings(port: u16) -> Result<gang_server::ServerSettings, Box<
         poll_interval: NonZeroDuration::from_secs(1),
         client_action_timeout: NonZeroDuration::from_mins(1),
         default_isa: Isa::X86_64,
-        action_environment: "host:test".parse()?,
         endpoint: gang_server::PublicEndpoint::try_new(
             format!("http://127.0.0.1:{port}").parse()?,
         )?,

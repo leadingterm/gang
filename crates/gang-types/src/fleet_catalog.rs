@@ -229,19 +229,6 @@ impl FleetCatalog {
         accepting
     }
 
-    /// Returns matching fleets without constraining the action environment.
-    ///
-    /// Used when matching against live worker identities rather than launch identities.
-    pub fn accepting_base<'r>(&self, request: impl Fn(&str) -> Option<&'r str>) -> FleetSet {
-        self.accepting(|key| {
-            if key == property::ACTION_ENVIRONMENT {
-                None
-            } else {
-                request(key)
-            }
-        })
-    }
-
     /// Validates every request property and returns the eligible fleets.
     ///
     /// # Errors
@@ -450,19 +437,18 @@ mod tests {
     }
 
     #[test]
-    fn environment_matches_exactly_except_in_base_admission() {
+    fn old_client_labels_do_not_constrain_fleet_selection() {
         let catalog = catalog();
         let wrong = request(&[
             (property::ACTION_ENVIRONMENT, "host:other"),
             (property::ISA, "x86-64"),
         ]);
-        assert_eq!(catalog.accepting(&wrong), set(&[]));
-        assert_eq!(catalog.accepting_base(&wrong), set(&[0, 1]));
+        assert_eq!(catalog.accepting(&wrong), set(&[0, 1]));
         assert_eq!(
             catalog.accepting(request(&[(property::ACTION_ENVIRONMENT, "host:test")])),
             set(&[0, 1, 2])
         );
-        assert!(catalog.fit(set(&[0, 1, 2]), &wrong).is_none());
+        assert!(catalog.fit(set(&[0, 1, 2]), &wrong).is_some());
     }
 
     #[test]
@@ -584,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn action_environment_constrains_admission() {
+    fn old_environment_labels_are_harmless_metadata() {
         let catalog = catalog();
         assert_eq!(
             catalog.admit([
@@ -598,7 +584,7 @@ mod tests {
             assert!(
                 catalog
                     .admit([(property::ACTION_ENVIRONMENT, value)])
-                    .is_err()
+                    .is_ok()
             );
         }
     }
@@ -643,7 +629,7 @@ mod tests {
                 ("fleet", MatchKind::Exact),
                 ("ISA", MatchKind::Exact),
                 ("sandbox", MatchKind::Exact),
-                ("gang_action_environment", MatchKind::Exact),
+                ("gang_action_environment", MatchKind::Ignored),
                 ("cpu_count", MatchKind::Minimum),
                 ("cpu_millicores", MatchKind::Minimum),
                 ("memory_kb", MatchKind::Minimum),
@@ -780,13 +766,6 @@ mod tests {
         assert_eq!(catalog.accepting(request(&with_environment)), set(&[1]));
         assert_eq!(
             catalog.accepting(request(&[
-                (property::NETWORK, "requested"),
-                (property::ACTION_ENVIRONMENT, "host:other"),
-            ])),
-            set(&[])
-        );
-        assert_eq!(
-            catalog.accepting_base(request(&[
                 (property::NETWORK, "requested"),
                 (property::ACTION_ENVIRONMENT, "host:other"),
             ])),

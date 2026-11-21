@@ -202,13 +202,7 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         actions: action_scheduler,
         workers: worker_scheduler,
         resource,
-    } = scheduler_stack(
-        &scheduler,
-        spec.fleets,
-        &spec.actions,
-        resources,
-        Arc::clone(&spec.clock),
-    )?;
+    } = scheduler_stack(&scheduler, spec.fleets, &spec.actions, resources)?;
     let handoff = HandOff::new();
     let action_scheduler: Arc<dyn KnownPlatformPropertyProvider> =
         Arc::new(HandOffActions::new(action_scheduler, handoff.clone()));
@@ -447,7 +441,6 @@ fn scheduler_stack(
     fleets: &FleetCatalog,
     actions: &gang_config::ActionsConfig,
     resources: &OnceLock<Arc<ResourceSketch>>,
-    clock: Arc<dyn Clock>,
 ) -> Result<SchedulerStack, NativeLinkEmbedError> {
     let mut resource = None;
     let (actions, workers) = action_stack(
@@ -455,7 +448,6 @@ fn scheduler_stack(
         fleets,
         actions,
         resources,
-        clock,
         |simple, notify, sketch| {
             resource = Some(Arc::clone(&sketch));
             let db = memory_awaited_action_db_factory(
@@ -489,7 +481,6 @@ fn action_stack(
     fleets: &FleetCatalog,
     actions: &gang_config::ActionsConfig,
     resources: &OnceLock<Arc<ResourceSketch>>,
-    clock: Arc<dyn Clock>,
     simple_scheduler: impl FnOnce(
         &SimpleSpec,
         Arc<Notify>,
@@ -545,13 +536,8 @@ fn action_stack(
         fitted,
         Arc::clone(sketch),
     ));
-    let action_scheduler: Arc<dyn KnownPlatformPropertyProvider> = Arc::new(
-        PlaceableActions::new(historical, fleets.clone(), admitted).with_workers(
-            Arc::clone(&worker_scheduler),
-            clock,
-            std::time::Duration::from_secs(simple.worker_timeout_s),
-        ),
-    );
+    let action_scheduler: Arc<dyn KnownPlatformPropertyProvider> =
+        Arc::new(PlaceableActions::new(historical, fleets.clone(), admitted));
     Ok((action_scheduler, worker_scheduler))
 }
 
@@ -758,9 +744,7 @@ mod tests {
     use nativelink_util::common::DigestInfo;
     use nativelink_util::digest_hasher::DigestHasherFunc;
     use nativelink_util::instant_wrapper::InstantWrapper;
-    use nativelink_util::operation_state_manager::{
-        ClientStateManager, OperationFilter, UpdateOperationType,
-    };
+    use nativelink_util::operation_state_manager::{OperationFilter, UpdateOperationType};
     use nativelink_util::origin_event::{BAZEL_METADATA_KEY, request_metadata_from_baggage};
     use nativelink_util::platform_properties::{PlatformProperties, PlatformPropertyValue};
     use opentelemetry::baggage::BaggageExt;
@@ -946,7 +930,6 @@ mod tests {
             fleets,
             actions,
             resources,
-            Arc::new(SystemClock::new()),
             |simple, notify, sketch| {
                 notify_slot = Some(Arc::clone(&notify));
                 let db = memory_awaited_action_db_factory(
@@ -1157,7 +1140,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_requires_the_actual_worker_environment() -> TestResult {
+    async fn dispatch_ignores_worker_image_identity() -> TestResult {
         NOW.set(Duration::from_secs(1_000_000));
         let fleets = x86_and_arm_fleets();
         let (ready_tx, mut ready_rx) = mpsc::channel(1);
@@ -1179,72 +1162,11 @@ mod tests {
             .add_action(client.clone(), action(Isa::Aarch64, Some("252")))
             .await?;
         stack.simple.do_try_match_for_test().await?;
+        let _ = next_dispatch(&mut old).await;
         assert_eq!(
             stage_of(stack.actions.as_ref(), &client).await?,
-            Some(ActionStage::Queued)
+            Some(ActionStage::Executing)
         );
-        assert!(matches!(
-            old.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
-        let current_id = WorkerId("current-worker".to_owned());
-        let mut current = connect_arm_worker(stack.workers.as_ref(), &current_id).await?;
-        current.try_recv().expect("connection acknowledgement");
-        stack.simple.do_try_match_for_test().await?;
-        let _ = next_dispatch(&mut current).await;
-        assert!(matches!(
-            old.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn live_old_environment_and_promotion_window() -> TestResult {
-        let fleets = x86_and_arm_fleets();
-        let stack = stack_on_test_clock(&fleets, &default_config())?;
-        let clock = Arc::new(gang_clock::TestClock::default());
-        let timeout = Duration::from_secs(30);
-        let wrapper =
-            PlaceableActions::new(stack.actions.clone(), fleets, AdmittedFleets::default())
-                .with_workers(stack.workers.clone(), clock.clone(), timeout);
-        let mut old_action = action(Isa::Aarch64, Some("252"));
-        Arc::make_mut(&mut old_action).platform_properties.insert(
-            property::ACTION_ENVIRONMENT.to_owned(),
-            "host:old".to_owned(),
-        );
-        let mut missing = old_action.clone();
-        Arc::make_mut(&mut missing)
-            .platform_properties
-            .remove(property::ACTION_ENVIRONMENT);
-        let error = wrapper
-            .add_action(OperationId::from("missing"), missing)
-            .await
-            .err()
-            .expect("missing identity rejected");
-        assert_eq!(error.code, Code::InvalidArgument);
-        assert!(error.to_string().contains("gang setup"));
-        let error = wrapper
-            .add_action(OperationId::from("reconnect"), old_action.clone())
-            .await
-            .err()
-            .expect("old worker has not reconnected");
-        assert_eq!(error.code, Code::Unavailable);
-        let id = WorkerId("old-worker".to_owned());
-        let _rx =
-            connect_arm_worker_with_environment(stack.workers.as_ref(), &id, 1, "host:old").await?;
-        let _subscription = wrapper
-            .add_action(OperationId::from("live"), old_action.clone())
-            .await?;
-        clock.advance(timeout);
-        stack.workers.remove_worker(&id).await?;
-        let error = wrapper
-            .add_action(OperationId::from("gone"), old_action)
-            .await
-            .err()
-            .expect("last old worker departed");
-        assert_eq!(error.code, Code::InvalidArgument);
-        assert!(error.to_string().contains("gang setup"));
         Ok(())
     }
 
@@ -1909,14 +1831,9 @@ mod tests {
             panic!("expected historical scheduler");
         };
         historical.learn_from_workers = false;
-        let SchedulerStack { actions, .. } = scheduler_stack(
-            &scheduler,
-            &fleets,
-            &actions,
-            &OnceLock::new(),
-            Arc::clone(&spec.clock),
-        )
-        .expect("scheduler stack");
+        let SchedulerStack { actions, .. } =
+            scheduler_stack(&scheduler, &fleets, &actions, &OnceLock::new())
+                .expect("scheduler stack");
         let operation = OperationId::String("stack-wiring".to_owned());
         let digest = DigestInfo::new([1; 32], 1);
         let info = Arc::new(ActionInfo {
@@ -2016,14 +1933,8 @@ mod tests {
             panic!("historical scheduler")
         };
         historical.learn_from_workers = false;
-        let SchedulerStack { actions, .. } = scheduler_stack(
-            &scheduler,
-            &fleets,
-            &spec.actions,
-            &OnceLock::new(),
-            Arc::clone(&spec.clock),
-        )
-        .expect("stack");
+        let SchedulerStack { actions, .. } =
+            scheduler_stack(&scheduler, &fleets, &spec.actions, &OnceLock::new()).expect("stack");
         let info = origin_test_action();
         let metadata = RequestMetadata {
             tool_invocation_id: "invocation".to_owned(),

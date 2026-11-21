@@ -1332,7 +1332,6 @@ mod tests {
         let queued = QueuedDemand {
             source: None,
             candidates: FleetSet::prefix(1)?,
-            environment: "host:test".parse()?,
             resources: ActionResources::default(),
             queued_since: Timestamp::UNIX_EPOCH,
             priority: 0,

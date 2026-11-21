@@ -9,6 +9,13 @@ use crate::MAX_FLEETS;
 #[error("action environment must be 64 lowercase hex digits or host:<safe identifier>")]
 pub struct ActionEnvironmentError;
 
+/// An environment name is not a bounded, two-component cache namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error(
+    "environment must be <name>/<version>, each 1-64 ASCII letters, digits, '.', '_' or '-', excluding '.' and '..'"
+)]
+pub struct EnvironmentNameError;
+
 /// A build id is not canonical lowercase Crockford base32.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("build id must be 16 base32 characters")]

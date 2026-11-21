@@ -23,7 +23,7 @@ type TestResult = Result<(), Box<dyn Error>>;
 const CHILD_LIMIT: Duration = Duration::from_mins(1);
 
 /// Server information returned to the Bazel rc command.
-const SERVER_INFO: &str = r#"{"name":"server","remoteExecutor":"grpc://127.0.0.1:8980","remoteCache":"grpc://127.0.0.1:8980","defaultIsa":"x86-64","actionEnvironment":"host:test","authentication":{"token":{"login":{"google":{"issuer_url":"https://accounts.example.com","audience":"gang","principal_claim":"email","login":{"scopes":["openid","email"]}}}}}}"#;
+const SERVER_INFO: &str = r#"{"name":"server","remoteExecutor":"grpc://127.0.0.1:8980","remoteCache":"grpc://127.0.0.1:8980","defaultIsa":"x86-64","authentication":{"token":{"login":{"google":{"issuer_url":"https://accounts.example.com","audience":"gang","principal_claim":"email","login":{"scopes":["openid","email"]}}}}}}"#;
 
 /// Runs `command` to completion within `limit` and returns its exit status.
 fn status_within(command: &mut Command, limit: Duration) -> Result<ExitStatus, Box<dyn Error>> {
@@ -79,6 +79,44 @@ fn assert_server_rejects(rewrite: impl FnOnce(&str) -> String) -> TestResult {
         stderr.trim_start().starts_with("fail"),
         "stderr must start with a fail record; stderr: {stderr}"
     );
+    Ok(())
+}
+
+#[test]
+fn config_check_rejects_invalid_action_environment_names() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let original = std::fs::read_to_string(checked_in_config("gang.local.toml")?)?;
+    let config = dir.path().join("gang.toml");
+    for environment in [
+        "debian/1/ac/content".to_owned(),
+        "debian/1/2".to_owned(),
+        String::new(),
+        "/1".to_owned(),
+        "debian/".to_owned(),
+        "./1".to_owned(),
+        "../1".to_owned(),
+        "debian/.".to_owned(),
+        "debian/..".to_owned(),
+        format!("{}/1", "a".repeat(65)),
+        format!("debian/{}", "1".repeat(65)),
+    ] {
+        std::fs::write(
+            &config,
+            format!("{original}\n[actions]\nenvironment = \"{environment}\"\n"),
+        )?;
+        let out = output_within(
+            gang_command(dir.path())?
+                .args(["config", "check"])
+                .arg(&config),
+            CHILD_LIMIT,
+        )?;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{environment}: {stderr}");
+        assert!(
+            stderr.contains("environment must be"),
+            "{environment}: {stderr}"
+        );
+    }
     Ok(())
 }
 

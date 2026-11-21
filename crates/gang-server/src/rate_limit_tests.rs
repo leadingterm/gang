@@ -9,7 +9,7 @@ use crate::ServerSettings;
 use crate::client_address::ClientAddress;
 use crate::listeners::Accepting;
 use gang_clock::TestClock;
-use gang_config::{DashboardConfig, ProxyProtocol, ProxyProtocolConfig};
+use gang_config::{DashboardConfig, ProxyProtocolConfig};
 use gang_spi::{ApiRequestBody, LoginClient, Peer};
 use gang_testkit::{Controller, TestSigner};
 use gang_tls::Listener;
@@ -295,8 +295,7 @@ async fn proxy_listener_sources_select_independent_rate_limit_buckets() {
         NlbListener(listener),
         NonZeroDuration::from_millis(100),
         start_clock(),
-        ProxyProtocol::Require,
-        Arc::new(config),
+        Some(Arc::new(config)),
     );
     let first_ip = Ipv4Addr::new(192, 0, 2, 1);
     let second_ip = Ipv4Addr::new(192, 0, 2, 3);

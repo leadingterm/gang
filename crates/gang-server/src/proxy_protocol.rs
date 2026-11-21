@@ -1,16 +1,14 @@
 //! Trusted PROXY v2 prefaces, before either HTTP or TLS sees a connection.
 
-use std::io::{self, IoSlice};
+use std::io;
 use std::net::IpAddr;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use gang_clock::Clock;
-use gang_config::{ProxyProtocol, ProxyProtocolConfig};
+use gang_config::ProxyProtocolConfig;
 use gang_tls::Listener;
 use proxy_header::{ParseConfig, Protocol, ProxyHeader};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::task::JoinSet;
 
 use crate::client_address::canonical_network;
@@ -22,66 +20,6 @@ const SIGNATURE: &[u8; 12] = b"\r\n\r\n\0\r\nQUIT\n";
 pub(crate) enum HeaderKind {
     Application,
     Health,
-}
-
-pub(crate) struct ProxyStream<IO> {
-    io: IO,
-    prefix: [u8; 12],
-    offset: usize,
-    len: usize,
-}
-
-impl<IO> ProxyStream<IO> {
-    fn direct(io: IO) -> Self {
-        Self {
-            io,
-            prefix: [0; 12],
-            offset: 0,
-            len: 0,
-        }
-    }
-}
-
-impl<IO: AsyncRead + Unpin> AsyncRead for ProxyStream<IO> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        if self.offset < self.len && buf.remaining() > 0 {
-            let count = (self.len - self.offset).min(buf.remaining());
-            buf.put_slice(&self.prefix[self.offset..self.offset + count]);
-            self.offset += count;
-            return Poll::Ready(Ok(()));
-        }
-        Pin::new(&mut self.io).poll_read(cx, buf)
-    }
-}
-
-impl<IO: AsyncWrite + Unpin> AsyncWrite for ProxyStream<IO> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.io).poll_write(cx, buf)
-    }
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.io).poll_flush(cx)
-    }
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.io).poll_shutdown(cx)
-    }
-    fn is_write_vectored(&self) -> bool {
-        self.io.is_write_vectored()
-    }
-    fn poll_write_vectored(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.io).poll_write_vectored(cx, bufs)
-    }
 }
 
 fn trusted(config: &ProxyProtocolConfig, raw: Option<IpAddr>) -> bool {
@@ -97,53 +35,28 @@ fn trusted(config: &ProxyProtocolConfig, raw: Option<IpAddr>) -> bool {
 pub(crate) async fn prepare<IO: AsyncRead + Unpin>(
     io: IO,
     raw: Option<IpAddr>,
-    mode: ProxyProtocol,
     config: &ProxyProtocolConfig,
     kind: HeaderKind,
-) -> Result<(ProxyStream<IO>, Option<IpAddr>), ProxyProtocolError> {
+) -> Result<(IO, Option<IpAddr>), ProxyProtocolError> {
     let raw = raw.map(|ip| ip.to_canonical());
-    if mode == ProxyProtocol::Off {
-        return Ok((ProxyStream::direct(io), raw));
-    }
     if !trusted(config, raw) {
-        return if mode == ProxyProtocol::Accept {
-            Ok((ProxyStream::direct(io), raw))
-        } else {
-            Err(ProxyProtocolError::Untrusted)
-        };
+        return Err(ProxyProtocolError::Untrusted);
     }
-    prepare_trusted(io, raw, mode, config, kind).await
+    prepare_trusted(io, raw, config, kind).await
 }
 
 async fn prepare_trusted<IO: AsyncRead + Unpin>(
-    io: IO,
+    mut io: IO,
     raw: Option<IpAddr>,
-    mode: ProxyProtocol,
     config: &ProxyProtocolConfig,
     kind: HeaderKind,
-) -> Result<(ProxyStream<IO>, Option<IpAddr>), ProxyProtocolError> {
-    let mut stream = ProxyStream::direct(io);
-    while stream.len < SIGNATURE.len() {
-        let n = stream.io.read(&mut stream.prefix[stream.len..]).await?;
-        if n == 0 {
-            return if mode == ProxyProtocol::Accept {
-                Ok((stream, raw))
-            } else {
-                Err(ProxyProtocolError::Invalid)
-            };
-        }
-        stream.len += n;
-        if stream.prefix[..stream.len] != SIGNATURE[..stream.len] {
-            return if mode == ProxyProtocol::Accept {
-                Ok((stream, raw))
-            } else {
-                Err(ProxyProtocolError::Invalid)
-            };
-        }
-    }
+) -> Result<(IO, Option<IpAddr>), ProxyProtocolError> {
     let mut stack = [0u8; 52];
-    stack[..12].copy_from_slice(SIGNATURE);
-    stream.io.read_exact(&mut stack[12..16]).await?;
+    io.read_exact(&mut stack[..12]).await?;
+    if &stack[..12] != SIGNATURE {
+        return Err(ProxyProtocolError::Invalid);
+    }
+    io.read_exact(&mut stack[12..16]).await?;
     if !matches!(
         (kind, stack[12]),
         (HeaderKind::Application, 0x21) | (HeaderKind::Health, 0x20 | 0x21)
@@ -157,16 +70,15 @@ async fn prepare_trusted<IO: AsyncRead + Unpin>(
         return Err(ProxyProtocolError::TooLarge);
     }
     let source = if length <= stack.len() {
-        stream.io.read_exact(&mut stack[16..length]).await?;
+        io.read_exact(&mut stack[16..length]).await?;
         decode(&stack[..length], kind)?
     } else {
         let mut frame = vec![0; length];
         frame[..16].copy_from_slice(&stack[..16]);
-        stream.io.read_exact(&mut frame[16..]).await?;
+        io.read_exact(&mut frame[16..]).await?;
         decode(&frame, kind)?
     };
-    stream.len = 0;
-    Ok((stream, source.or(raw)))
+    Ok((io, source.or(raw)))
 }
 
 fn decode(frame: &[u8], kind: HeaderKind) -> Result<Option<IpAddr>, ProxyProtocolError> {
@@ -208,13 +120,12 @@ impl<A: std::fmt::Debug> std::fmt::Debug for ProxyAddress<A> {
     }
 }
 
-type PendingConnection<I, A> = Result<(ProxyStream<I>, A, Option<IpAddr>), ProxyProtocolError>;
+type PendingConnection<I, A> = Result<(I, A, Option<IpAddr>), ProxyProtocolError>;
 
 pub(crate) struct ProxyListener<L: Listener, C> {
     listener: L,
     clock: Arc<C>,
-    mode: ProxyProtocol,
-    config: Arc<ProxyProtocolConfig>,
+    config: Option<Arc<ProxyProtocolConfig>>,
     pending: JoinSet<PendingConnection<L::Io, L::Addr>>,
 }
 
@@ -222,13 +133,11 @@ impl<L: Listener, C: Clock> ProxyListener<L, C> {
     pub(crate) fn new(
         listener: L,
         clock: Arc<C>,
-        mode: ProxyProtocol,
-        config: Arc<ProxyProtocolConfig>,
+        config: Option<Arc<ProxyProtocolConfig>>,
     ) -> Self {
         Self {
             listener,
             clock,
-            mode,
             config,
             pending: JoinSet::new(),
         }
@@ -236,7 +145,7 @@ impl<L: Listener, C: Clock> ProxyListener<L, C> {
 }
 
 impl<L: Listener, C: Clock + 'static> Listener for ProxyListener<L, C> {
-    type Io = ProxyStream<L::Io>;
+    type Io = L::Io;
     type Addr = ProxyAddress<L::Addr>;
 
     async fn accept(&mut self) -> io::Result<(Self::Io, Self::Addr)> {
@@ -248,23 +157,19 @@ impl<L: Listener, C: Clock + 'static> Listener for ProxyListener<L, C> {
                     Some(Err(error)) => tracing::debug!(%error, "proxy preface task failed"),
                     None => {},
                 },
-                accepted = self.listener.accept(), if self.pending.len() < self.config.max_pending_headers.get() => {
+                accepted = self.listener.accept(), if self.config.as_ref().is_none_or(|config| self.pending.len() < config.max_pending_headers.get()) => {
                     let (io, raw) = accepted?;
                     let ip = L::peer_ip(&raw).map(|ip| ip.to_canonical());
-                    if self.mode == ProxyProtocol::Off {
-                        return Ok((ProxyStream::direct(io), ProxyAddress { raw, effective: ip }));
-                    }
-                    if !trusted(&self.config, ip) {
-                        if self.mode == ProxyProtocol::Accept {
-                            return Ok((ProxyStream::direct(io), ProxyAddress { raw, effective: ip }));
-                        }
+                    let Some(config) = self.config.as_ref() else {
+                        return Ok((io, ProxyAddress { raw, effective: ip }));
+                    };
+                    if !trusted(config, ip) {
                         tracing::debug!(?raw, "untrusted proxy peer rejected");
                         continue;
                     }
-                    let config = Arc::clone(&self.config);
-                    let mode = self.mode;
+                    let config = Arc::clone(config);
                     let deadline = self.clock.timeout(config.header_timeout.get(), async move {
-                        let (io, effective) = prepare_trusted(io, ip, mode, &config, HeaderKind::Application).await?;
+                        let (io, effective) = prepare_trusted(io, ip, &config, HeaderKind::Application).await?;
                         Ok((io, raw, effective))
                     });
                     self.pending.spawn(async move { deadline.await.map_err(|_| ProxyProtocolError::Timeout)? });
@@ -282,7 +187,7 @@ impl<L: Listener, C: Clock + 'static> Listener for ProxyListener<L, C> {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-    use gang_config::{ProxyProtocol, ProxyProtocolConfig};
+    use gang_config::ProxyProtocolConfig;
     use gang_tls::Listener;
     use std::sync::Arc;
     use std::time::Duration;
@@ -313,56 +218,25 @@ mod tests {
     async fn only_the_exact_proxy_peer_can_claim_a_source() {
         let config = config();
         let bytes = frame();
-        for (mode, raw, expected) in [
-            (ProxyProtocol::Off, Some(ip(4)), Some(ip(4))),
-            (ProxyProtocol::Accept, Some(ip(99)), Some(ip(99))),
-            (
-                ProxyProtocol::Accept,
-                Some(ip(4)),
-                Some(Ipv4Addr::new(192, 0, 2, 1).into()),
-            ),
-            (
-                ProxyProtocol::Require,
-                Some(ip(4)),
-                Some(Ipv4Addr::new(192, 0, 2, 1).into()),
-            ),
-        ] {
-            let (mut client, server) = tokio::io::duplex(128);
-            client.write_all(&bytes).await.expect("write frame");
-            client.write_all(b"GET").await.expect("write request");
-            let (mut stream, actual) = prepare(server, raw, mode, &config, HeaderKind::Application)
-                .await
-                .expect("prepare");
-            assert_eq!(actual, expected);
-            let mut remaining = vec![
-                0;
-                if actual == Some(ip(4)) || actual == Some(ip(99)) {
-                    bytes.len() + 3
-                } else {
-                    3
-                }
-            ];
-            stream
-                .read_exact(&mut remaining)
-                .await
-                .expect("read request");
-            assert!(remaining.ends_with(b"GET"));
-            if remaining.len() > 3 {
-                assert_eq!(&remaining[..bytes.len()], bytes);
-            }
-        }
+        let (mut client, server) = tokio::io::duplex(128);
+        client.write_all(&bytes).await.expect("write frame");
+        client.write_all(b"GET").await.expect("write request");
+        let (mut stream, actual) = prepare(server, Some(ip(4)), &config, HeaderKind::Application)
+            .await
+            .expect("prepare");
+        assert_eq!(actual, Some(Ipv4Addr::new(192, 0, 2, 1).into()));
+        let mut remaining = [0; 3];
+        stream
+            .read_exact(&mut remaining)
+            .await
+            .expect("read request");
+        assert_eq!(&remaining, b"GET");
         for raw in [Some(ip(99)), None] {
             let (_client, server) = tokio::io::duplex(64);
             assert!(
-                prepare(
-                    server,
-                    raw,
-                    ProxyProtocol::Require,
-                    &config,
-                    HeaderKind::Application
-                )
-                .await
-                .is_err()
+                prepare(server, raw, &config, HeaderKind::Application)
+                    .await
+                    .is_err()
             );
         }
     }
@@ -382,50 +256,20 @@ mod tests {
             let (mut client, server) = tokio::io::duplex(128);
             client.write_all(&frame()).await.expect("write frame");
             client.write_all(b"GET").await.expect("write request");
-            let (mut stream, source) = prepare(
-                server,
-                Some(raw),
-                ProxyProtocol::Require,
-                &config,
-                HeaderKind::Application,
-            )
-            .await
-            .expect("trusted peer");
+            let (mut stream, source) = prepare(server, Some(raw), &config, HeaderKind::Application)
+                .await
+                .expect("trusted peer");
             assert_eq!(source, Some(Ipv4Addr::new(192, 0, 2, 1).into()));
             let mut request = [0; 3];
             stream.read_exact(&mut request).await.expect("read request");
             assert_eq!(&request, b"GET");
         }
 
-        for mode in [ProxyProtocol::Off, ProxyProtocol::Accept] {
-            let (mut client, server) = tokio::io::duplex(128);
-            let bytes = frame();
-            client.write_all(&bytes).await.expect("write frame");
-            let (mut stream, source) = prepare(
-                server,
-                Some(mapped(5)),
-                mode,
-                &config(),
-                HeaderKind::Application,
-            )
-            .await
-            .expect("direct peer");
-            assert_eq!(source, Some(ip(5)));
-            let mut remaining = vec![0; bytes.len()];
-            stream.read_exact(&mut remaining).await.expect("read frame");
-            assert_eq!(remaining, bytes);
-        }
         let (_client, server) = tokio::io::duplex(128);
         assert!(
-            prepare(
-                server,
-                Some(mapped(5)),
-                ProxyProtocol::Require,
-                &config(),
-                HeaderKind::Application,
-            )
-            .await
-            .is_err()
+            prepare(server, Some(mapped(5)), &config(), HeaderKind::Application,)
+                .await
+                .is_err()
         );
     }
 
@@ -446,15 +290,10 @@ mod tests {
             let (mut client, server) = tokio::io::duplex(128);
             client.write_all(&bytes).await.expect("write frame");
             client.write_all(b"GET").await.expect("write request");
-            let (mut stream, actual) = prepare(
-                server,
-                Some(ip(4)),
-                ProxyProtocol::Require,
-                &config(),
-                HeaderKind::Application,
-            )
-            .await
-            .expect("trusted peer");
+            let (mut stream, actual) =
+                prepare(server, Some(ip(4)), &config(), HeaderKind::Application)
+                    .await
+                    .expect("trusted peer");
             assert_eq!(actual, Some(expected));
             let mut request = [0; 3];
             stream.read_exact(&mut request).await.expect("read request");
@@ -463,29 +302,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mismatch_replays_and_recognized_bad_headers_fail() {
+    async fn recognized_bad_headers_fail() {
         let config = config();
-        let (mut client, server) = tokio::io::duplex(64);
-        client
-            .write_all(b"\r\nGET / HTTP/1.1\r\n")
-            .await
-            .expect("write request");
-        let (mut stream, source) = prepare(
-            server,
-            Some(ip(4)),
-            ProxyProtocol::Accept,
-            &config,
-            HeaderKind::Application,
-        )
-        .await
-        .expect("direct");
-        let mut request = [0; b"\r\nGET / HTTP/1.1\r\n".len()];
-        stream
-            .read_exact(&mut request)
-            .await
-            .expect("replay request");
-        assert_eq!(&request, b"\r\nGET / HTTP/1.1\r\n");
-        assert_eq!(source, Some(ip(4)));
         for (command, family, length) in [
             (0x20, 0x11, 12),
             (0x31, 0x11, 12),
@@ -503,45 +321,10 @@ mod tests {
                 .await
                 .expect("write malformed frame");
             assert!(
-                prepare(
-                    server,
-                    Some(ip(4)),
-                    ProxyProtocol::Accept,
-                    &config,
-                    HeaderKind::Application
-                )
-                .await
-                .is_err()
+                prepare(server, Some(ip(4)), &config, HeaderKind::Application)
+                    .await
+                    .is_err()
             );
-        }
-    }
-
-    #[tokio::test]
-    async fn fragmented_direct_prefix_and_partial_eof_are_replayed() {
-        for request in [&b"\r\nGET / HTTP/1.1\r\n"[..], &SIGNATURE[..5]] {
-            let (mut client, server) = tokio::io::duplex(1);
-            let writer = async {
-                for byte in request {
-                    client.write_all(&[*byte]).await.expect("write fragment");
-                }
-                client.shutdown().await.expect("finish input");
-            };
-            let reader = async {
-                let (mut stream, source) = prepare(
-                    server,
-                    Some(ip(4)),
-                    ProxyProtocol::Accept,
-                    &config(),
-                    HeaderKind::Application,
-                )
-                .await
-                .expect("direct stream");
-                let mut actual = Vec::new();
-                stream.read_to_end(&mut actual).await.expect("replay bytes");
-                assert_eq!(actual, request);
-                assert_eq!(source, Some(ip(4)));
-            };
-            tokio::join!(writer, reader);
         }
     }
 
@@ -565,15 +348,9 @@ mod tests {
                 .expect("write invalid preface");
             client.shutdown().await.expect("end input");
             assert!(
-                prepare(
-                    server,
-                    Some(ip(4)),
-                    ProxyProtocol::Require,
-                    &config(),
-                    HeaderKind::Application
-                )
-                .await
-                .is_err()
+                prepare(server, Some(ip(4)), &config(), HeaderKind::Application)
+                    .await
+                    .is_err()
             );
         }
     }
@@ -585,15 +362,9 @@ mod tests {
             client.write_all(SIGNATURE).await.expect("write signature");
             client.write_all(&fixed).await.expect("write fixed header");
             assert!(
-                prepare(
-                    server,
-                    Some(ip(4)),
-                    ProxyProtocol::Require,
-                    &config(),
-                    HeaderKind::Application
-                )
-                .await
-                .is_err()
+                prepare(server, Some(ip(4)), &config(), HeaderKind::Application)
+                    .await
+                    .is_err()
             );
         }
     }
@@ -605,19 +376,23 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(64);
         client.write_all(&bytes).await.expect("write local frame");
         client.write_all(b"GET").await.expect("write request");
-        let (mut stream, source) = prepare(
-            server,
-            Some(ip(4)),
-            ProxyProtocol::Require,
-            &config(),
-            HeaderKind::Health,
-        )
-        .await
-        .expect("local health");
+        let (mut stream, source) = prepare(server, Some(ip(4)), &config(), HeaderKind::Health)
+            .await
+            .expect("local health");
         assert_eq!(source, Some(ip(4)));
         let mut request = [0; 3];
         stream.read_exact(&mut request).await.expect("read request");
         assert_eq!(&request, b"GET");
+        let (mut client, server) = tokio::io::duplex(64);
+        bytes[12] = 0x21;
+        client
+            .write_all(&bytes)
+            .await
+            .expect("write sourceless proxy frame");
+        let (_, source) = prepare(server, Some(ip(4)), &config(), HeaderKind::Health)
+            .await
+            .expect("sourceless health proxy");
+        assert_eq!(source, Some(ip(4)));
     }
 
     #[tokio::test]
@@ -638,15 +413,10 @@ mod tests {
                 .expect("write application bytes");
         };
         let reader = async {
-            let (mut stream, source) = prepare(
-                server,
-                Some(ip(4)),
-                ProxyProtocol::Require,
-                &config(),
-                HeaderKind::Application,
-            )
-            .await
-            .expect("parse ipv6");
+            let (mut stream, source) =
+                prepare(server, Some(ip(4)), &config(), HeaderKind::Application)
+                    .await
+                    .expect("parse ipv6");
             assert_eq!(source, Some(Ipv6Addr::LOCALHOST.into()));
             let mut data = [0; 3];
             stream
@@ -671,15 +441,10 @@ mod tests {
             client.write_all(b"HTTP").await.expect("write payload");
         };
         let reader = async {
-            let (mut stream, source) = prepare(
-                server,
-                Some(ip(4)),
-                ProxyProtocol::Require,
-                &config(),
-                HeaderKind::Application,
-            )
-            .await
-            .expect("parse ipv4 with tlvs");
+            let (mut stream, source) =
+                prepare(server, Some(ip(4)), &config(), HeaderKind::Application)
+                    .await
+                    .expect("parse ipv4 with tlvs");
             assert_eq!(source, Some(Ipv4Addr::new(192, 0, 2, 1).into()));
             let mut payload = [0; 4];
             stream.read_exact(&mut payload).await.expect("read payload");
@@ -719,15 +484,9 @@ mod tests {
                 .expect("write malformed header");
             client.shutdown().await.expect("finish malformed header");
             assert!(
-                prepare(
-                    server,
-                    Some(ip(4)),
-                    ProxyProtocol::Require,
-                    &config(),
-                    HeaderKind::Application
-                )
-                .await
-                .is_err(),
+                prepare(server, Some(ip(4)), &config(), HeaderKind::Application)
+                    .await
+                    .is_err(),
                 "accepted malformed frame {bytes:?}"
             );
         }
@@ -784,48 +543,33 @@ mod tests {
 
     #[tokio::test]
     async fn listener_canonicalizes_mapped_direct_and_trusted_peers() {
-        for (mode, last, expected) in [
-            (ProxyProtocol::Off, 4, ip(4)),
-            (ProxyProtocol::Accept, 5, ip(5)),
-            (
-                ProxyProtocol::Require,
-                4,
-                Ipv4Addr::new(192, 0, 2, 1).into(),
-            ),
-        ] {
+        for configured in [false, true] {
             let (mut inner, sender, _) = addressed();
-            inner.peer = IpAddr::V6(Ipv4Addr::new(10, 0, 1, last).to_ipv6_mapped());
-            let mut listener = ProxyListener::new(
-                inner,
-                crate::test_support_clock::start(),
-                mode,
-                Arc::new(config()),
-            );
+            inner.peer = IpAddr::V6(Ipv4Addr::new(10, 0, 1, 4).to_ipv6_mapped());
+            let policy = configured.then(|| Arc::new(config()));
+            let mut listener =
+                ProxyListener::new(inner, crate::test_support_clock::start(), policy);
             let mut client = dial(&sender);
-            let bytes = frame();
-            client.write_all(&bytes).await.expect("write frame");
+            if configured {
+                client.write_all(&frame()).await.expect("write frame");
+            }
             client.write_all(b"GET").await.expect("write request");
             let (mut stream, address) = listener.accept().await.expect("accept connection");
+            let expected = if configured {
+                Ipv4Addr::new(192, 0, 2, 1).into()
+            } else {
+                ip(4)
+            };
             assert_eq!(
                 ProxyListener::<AddressedListener, gang_clock::TestClock>::peer_ip(&address),
                 Some(expected)
             );
-            let mut remaining = vec![
-                0;
-                if mode == ProxyProtocol::Require {
-                    3
-                } else {
-                    bytes.len() + 3
-                }
-            ];
+            let mut remaining = [0; 3];
             stream
                 .read_exact(&mut remaining)
                 .await
                 .expect("read stream");
-            if mode != ProxyProtocol::Require {
-                assert_eq!(&remaining[..bytes.len()], bytes);
-            }
-            assert!(remaining.ends_with(b"GET"));
+            assert_eq!(&remaining, b"GET");
         }
     }
 
@@ -913,8 +657,7 @@ mod tests {
         let mut listener = ProxyListener::new(
             ObservedListener { inner, completed },
             crate::test_support_clock::start(),
-            ProxyProtocol::Require,
-            Arc::new(config),
+            Some(Arc::new(config)),
         );
         let mut first = dial(&sender);
         let mut second = dial(&sender);
@@ -969,8 +712,7 @@ mod tests {
         let mut listener = ProxyListener::new(
             listener,
             crate::test_support_clock::start(),
-            ProxyProtocol::Require,
-            Arc::new(config()),
+            Some(Arc::new(config())),
         );
         let mut stalled = dial(&sender);
         stalled
@@ -994,12 +736,7 @@ mod tests {
         let clock = crate::test_support_clock::start();
         let mut config = config();
         config.max_pending_headers = std::num::NonZeroUsize::new(1).expect("nonzero");
-        let mut listener = ProxyListener::new(
-            listener,
-            Arc::clone(&clock),
-            ProxyProtocol::Require,
-            Arc::new(config),
-        );
+        let mut listener = ProxyListener::new(listener, Arc::clone(&clock), Some(Arc::new(config)));
         let mut first = dial(&sender);
         first
             .write_all(&SIGNATURE[..2])

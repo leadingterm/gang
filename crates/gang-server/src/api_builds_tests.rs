@@ -49,7 +49,6 @@ fn fixture(permission: Permission) -> (Api<TlsDeployment>, BuildsCell) {
     let info = wire_server(
         &harness.core.host.endpoint,
         settings.default_isa,
-        &settings.action_environment,
         EndpointTrust::System,
         None,
         Scheme::Token,

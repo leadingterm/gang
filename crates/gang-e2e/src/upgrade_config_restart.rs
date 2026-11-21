@@ -18,28 +18,23 @@ use crate::upgrade_fixture::{ConfigurationAccess, ConfigurationPlan, ReleaseFixt
 #[derive(Debug, PartialEq, Eq)]
 struct Selector<'a> {
     name: &'a str,
-    version: Option<u64>,
+    version: u64,
 }
 
 impl<'a> Selector<'a> {
     fn parse(reference: &'a str) -> Result<Self> {
-        let (name, version) = match reference.split_once(':') {
-            Some((name, text)) => {
-                let version = text.parse::<u64>().map_err(|_| {
-                    E2eError::system(format!("invalid parameter version in {reference:?}"))
-                })?;
-                if version == 0
-                    || text.starts_with('0')
-                    || text.bytes().any(|byte| !byte.is_ascii_digit())
-                {
-                    return Err(E2eError::system(
-                        "parameter version must be a positive decimal",
-                    ));
-                }
-                (name, Some(version))
-            }
-            None => (reference, None),
-        };
+        let (name, text) = reference
+            .split_once(':')
+            .ok_or_else(|| E2eError::system("parameter reference requires a version"))?;
+        let version = text
+            .parse::<u64>()
+            .map_err(|_| E2eError::system(format!("invalid parameter version in {reference:?}")))?;
+        if version == 0 || text.starts_with('0') || text.bytes().any(|byte| !byte.is_ascii_digit())
+        {
+            return Err(E2eError::system(
+                "parameter version must be a positive decimal",
+            ));
+        }
         if name.is_empty()
             || !name.bytes().all(|byte| {
                 byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'-' | b'.')
@@ -62,44 +57,52 @@ fn resource_matches(pattern: &str, arn: &str) -> bool {
 }
 
 struct Parameters {
-    legacy_name: String,
-    legacy_arn: String,
+    arn_prefix: String,
+    namespace: String,
     values: BTreeMap<String, BTreeMap<u64, Arc<str>>>,
 }
 
 impl Parameters {
     fn seeded(plan: &ConfigurationPlan, bytes: &Arc<str>) -> Result<Self> {
+        let selector = Selector::parse(&plan.controller.reference)?;
+        let namespace = generation_namespace(selector.name)?;
+        let suffix = format!(
+            "parameter/{}/generations/*",
+            namespace.trim_start_matches('/')
+        );
+        let arn_prefix = plan
+            .controller
+            .readable_resources
+            .iter()
+            .find_map(|resource| resource.strip_suffix(&suffix))
+            .filter(|prefix| prefix.starts_with("arn:") && prefix.ends_with(':'))
+            .ok_or_else(|| E2eError::system("controller lacks a generation namespace ARN"))?
+            .to_owned();
         let mut store = Self {
-            legacy_name: plan.legacy_name.clone(),
-            legacy_arn: plan.legacy_arn.clone(),
+            arn_prefix,
+            namespace: namespace.to_owned(),
             values: BTreeMap::new(),
         };
-        store.arn(&plan.legacy_name)?;
         for access in std::iter::once(&plan.controller).chain(&plan.workers) {
             let selector = Selector::parse(&access.reference)?;
             store
                 .values
                 .entry(selector.name.into())
                 .or_default()
-                .insert(selector.version.unwrap_or(1), Arc::clone(bytes));
+                .insert(selector.version, Arc::clone(bytes));
         }
         Ok(store)
     }
 
     fn arn(&self, name: &str) -> Result<String> {
-        let suffix = format!("parameter/{}", self.legacy_name.trim_start_matches('/'));
-        let prefix = self
-            .legacy_arn
-            .strip_suffix(&suffix)
-            .filter(|prefix| prefix.starts_with("arn:") && prefix.ends_with(':'))
-            .ok_or_else(|| E2eError::system("legacy parameter ARN does not match its name"))?;
-        if name != self.legacy_name && !generation_of(&self.legacy_name, name) {
+        if generation_namespace(name)? != self.namespace {
             return Err(E2eError::system(
                 "parameter is outside the configured generation namespace",
             ));
         }
         Ok(format!(
-            "{prefix}parameter/{}",
+            "{}parameter/{}",
+            self.arn_prefix,
             name.trim_start_matches('/')
         ))
     }
@@ -124,40 +127,20 @@ impl Parameters {
             .values
             .get(selector.name)
             .ok_or_else(|| E2eError::system("parameter does not exist"))?;
-        let value = match selector.version {
-            Some(version) => versions.get(&version),
-            None => versions.last_key_value().map(|(_, value)| value),
-        };
+        let value = versions.get(&selector.version);
         value
             .cloned()
             .ok_or_else(|| E2eError::system("parameter version does not exist"))
     }
 
     fn publish(&mut self, plan: &ConfigurationPlan, bytes: &Arc<str>) -> Result<()> {
-        if plan.legacy_name != self.legacy_name || plan.legacy_arn != self.legacy_arn {
-            return Err(E2eError::system(
-                "publication changed the legacy parameter identity",
-            ));
-        }
         if !plan.generations_retained {
-            self.values.retain(|name, _| *name == self.legacy_name);
-        }
-        if !plan.legacy_unchanged {
-            let versions = self.values.entry(self.legacy_name.clone()).or_default();
-            let version = versions.last_key_value().map_or(Ok(1), |(version, _)| {
-                version
-                    .checked_add(1)
-                    .ok_or_else(|| E2eError::system("parameter version overflow"))
-            })?;
-            versions.insert(version, Arc::clone(bytes));
+            self.values.clear();
         }
         for access in std::iter::once(&plan.controller).chain(&plan.workers) {
             let selector = Selector::parse(&access.reference)?;
             self.arn(selector.name)?;
-            if selector.name == self.legacy_name {
-                continue;
-            }
-            if selector.version != Some(1) {
+            if selector.version != 1 {
                 return Err(E2eError::system(
                     "new generation must select immutable version one",
                 ));
@@ -179,21 +162,26 @@ impl Parameters {
     }
 }
 
-fn generation_of(legacy: &str, name: &str) -> bool {
-    name.strip_prefix(legacy)
-        .is_some_and(|tail| tail.starts_with("/generations/") && tail.len() > "/generations/".len())
+fn generation_namespace(name: &str) -> Result<&str> {
+    let (namespace, generation) = name
+        .split_once("/generations/")
+        .ok_or_else(|| E2eError::system("parameter is not a generation"))?;
+    if namespace.is_empty() || generation.is_empty() || generation.contains('/') {
+        return Err(E2eError::system("invalid generation parameter name"));
+    }
+    Ok(namespace)
 }
 
 fn require_modern(plan: &ConfigurationPlan) -> Result<()> {
-    if !plan.legacy_unchanged || !plan.generations_retained || plan.workers.is_empty() {
+    if !plan.generations_retained || plan.workers.is_empty() {
         return Err(E2eError::system(
-            "candidate publication does not preserve legacy and generations",
+            "publication does not preserve generations",
         ));
     }
     for access in std::iter::once(&plan.controller).chain(&plan.workers) {
         let selector = Selector::parse(&access.reference)?;
-        if selector.version != Some(1)
-            || !generation_of(&plan.legacy_name, selector.name)
+        if selector.version != 1
+            || generation_namespace(selector.name).is_err()
             || access.reference != plan.controller.reference
         {
             return Err(E2eError::system(
@@ -332,19 +320,19 @@ pub(crate) fn config_refetch_restart(
     let inputs = published_previous(invocation)?;
     let old = ReleaseFixture::read(&inputs.previous.fixture)?;
     let candidate = ReleaseFixture::read(&inputs.candidate_fixture)?;
-    let calibration = ReleaseFixture::read(&inputs.calibration.fixture)?;
+    require_modern(&old.configuration)?;
     require_modern(&candidate.configuration)?;
+    if old.configuration.controller.reference == candidate.configuration.controller.reference {
+        return Err(E2eError::system(
+            "candidate must publish a separate generation",
+        ));
+    }
     let cluster =
         Cluster::start_release(invocation, variant, issuer, &inputs.previous.binary, &old)?;
     let result = preserved_restarts(&cluster, &old, &candidate, &inputs.previous.binary);
     let mut checks = cluster.diagnose(result)?;
-    drop(cluster);
-    checks.push(mutable_control(
-        invocation,
-        variant,
-        issuer,
-        &calibration,
-        &candidate,
+    checks.extend(crate::rolling_upgrade::upgrade_cluster(
+        cluster, invocation,
     )?);
     Ok(checks)
 }
@@ -367,6 +355,9 @@ fn preserved_restarts(
     require_executable(initial_controller, binary)?;
     require_controller_command(initial_controller, &path)?;
     let mut store = Parameters::seeded(&old.configuration, &old_bytes)?;
+    for role in std::iter::once(&old.configuration.controller).chain(&old.configuration.workers) {
+        require_bytes(&store.fetch(&role.reference, role)?, &old_bytes)?;
+    }
     store.publish(&candidate.configuration, &candidate_bytes)?;
     verify_selections(
         &store,
@@ -425,162 +416,52 @@ fn require_installed(path: &Path, fetched: &str) -> Result<()> {
     require_bytes(&installed, fetched)
 }
 
-fn schema_rejection(log: &str) -> bool {
-    log.contains("invalid configuration")
-        && ["unknown field", "missing field", "unknown variant"]
-            .iter()
-            .any(|marker| log.contains(marker))
-}
-
-fn mutable_control(
-    invocation: &DeploymentInputs,
-    variant: &Variant,
-    issuer: &TestIssuer,
-    old: &ReleaseFixture,
-    candidate: &ReleaseFixture,
-) -> Result<Check> {
-    if old.configuration.legacy_unchanged || old.configuration.generations_retained {
-        return Err(E2eError::system(
-            "negative control requires a genuine mutable calibration publication",
-        ));
-    }
-    let inputs = invocation
-        .upgrade
-        .as_ref()
-        .ok_or_else(|| E2eError::system("missing upgrade inputs"))?;
-    // Calibration stays independently pinned as the positive previous release advances.
-    let mut command = Command::new(&inputs.calibration.binary);
-    command.arg("--version");
-    let version = process::run(command, None, invocation.settings.command_timeout)?;
-    if !version.succeeded()
-        || !version
-            .stdout
-            .split_whitespace()
-            .any(|part| part == "0.3.2")
-    {
-        return Err(E2eError::system(
-            "mutable publication control requires published calibration 0.3.2",
-        ));
-    }
-    let cluster =
-        Cluster::start_release(invocation, variant, issuer, &inputs.calibration.binary, old)?;
-    let path = cluster.release_config_path(0)?;
-    let old_bytes: Arc<str> = fs::read_to_string(&path)
-        .map_err(E2eError::io("reading negative-control calibration bytes"))?
-        .into();
-    let candidate_bytes: Arc<str> = cluster.render_release_config_for(0, candidate)?.into();
-    let original_pid = cluster.controller_pid(0)?;
-    require_executable(original_pid, &inputs.calibration.binary)?;
-    worker_pid(&cluster, &path, &inputs.calibration.binary, None)?;
-    let mut store = Parameters::seeded(&old.configuration, &old_bytes)?;
-    store.publish(&old.configuration, &candidate_bytes)?;
-    let fetched = store.fetch(
-        &old.configuration.controller.reference,
-        &old.configuration.controller,
-    )?;
-    require_bytes(&fetched, &candidate_bytes)?;
-    let prior_log = cluster.log(0)?.len();
-    if cluster
-        .restart_release_controller(0, &inputs.calibration.binary, &fetched)
-        .is_ok()
-    {
-        return Err(E2eError::system(
-            "mutable publication unexpectedly restarted the old controller",
-        ));
-    }
-    let status = cluster.wait_exit(0)?;
-    let log = cluster.log(0)?;
-    let startup = log.get(prior_log..).unwrap_or_default();
-    if status.success() || !schema_rejection(startup) {
-        return Err(E2eError::system(
-            "mutable control did not produce a nonzero old-process schema rejection",
-        ));
-    }
-    require_installed(&path, &fetched)?;
-    Ok(Check::passed(format!(
-        "mutable publication control: selector={:?}, exact candidate bytes={}, previous PID={original_pid}, old controller exits {status} with configuration schema rejection (not a health timeout)",
-        old.configuration.controller.reference,
-        fetched.len()
-    )))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn plan(generation: Option<&str>) -> ConfigurationPlan {
-        let name = "/example/config";
-        let arn = "arn:aws:ssm:eu-west-1:000000000000:parameter/example/config";
-        let reference = generation.map_or_else(
-            || name.into(),
-            |generation| format!("{name}/generations/{generation}:1"),
-        );
+    fn plan(generation: &str) -> ConfigurationPlan {
+        let arn = "arn:aws:ssm:eu-west-1:000000000000:parameter/example/config/generations/*";
         let access = ConfigurationAccess {
-            reference,
-            readable_resources: vec![arn.into(), format!("{arn}/generations/*")],
-            excluded_from_deny: vec![arn.into(), format!("{arn}/generations/*")],
+            reference: format!("/example/config/generations/{generation}:1"),
+            readable_resources: vec![arn.into()],
+            excluded_from_deny: vec![arn.into()],
         };
         ConfigurationPlan {
-            legacy_name: name.into(),
-            legacy_arn: arn.into(),
             controller: access.clone(),
             workers: vec![access],
-            legacy_unchanged: generation.is_some(),
-            generations_retained: generation.is_some(),
+            generations_retained: true,
         }
     }
 
     #[test]
-    fn mutable_publication_exposes_candidate_to_old_bare_selectors() {
-        let mutable = plan(None);
-        let mut store = Parameters::seeded(&mutable, &Arc::from("old-schema")).expect("seed");
+    fn retained_generation_keeps_old_bytes() {
+        let previous = plan("old");
+        let candidate = plan("new");
+        let mut store = Parameters::seeded(&previous, &Arc::from("old")).expect("seed");
         store
-            .publish(&mutable, &Arc::from("candidate-schema"))
+            .publish(&candidate, &Arc::from("candidate"))
             .expect("publish");
-        assert_eq!(
-            &*store
-                .fetch(&mutable.controller.reference, &mutable.controller)
-                .expect("fetch"),
-            "candidate-schema"
-        );
-        assert_eq!(
-            &*store
-                .fetch("/example/config:1", &mutable.controller)
-                .expect("historical"),
-            "old-schema"
-        );
-    }
-
-    #[test]
-    fn frozen_legacy_and_retained_generation_keep_old_bytes() {
-        for previous in [plan(None), plan(Some("old"))] {
-            let candidate = plan(Some("new"));
-            let mut store = Parameters::seeded(&previous, &Arc::from("old")).expect("seed");
-            store
-                .publish(&candidate, &Arc::from("candidate"))
-                .expect("publish");
-            verify_selections(&store, &previous, &candidate, "old", "candidate")
-                .expect("selection invariants");
-            assert!(store.publish(&candidate, &Arc::from("overwrite")).is_err());
-        }
+        verify_selections(&store, &previous, &candidate, "old", "candidate")
+            .expect("selection invariants");
+        assert!(store.publish(&candidate, &Arc::from("overwrite")).is_err());
     }
 
     #[test]
     fn unchanged_configuration_bytes_remain_valid_across_release_publication() {
-        for previous in [plan(None), plan(Some("old"))] {
-            let candidate = plan(Some("new"));
-            let bytes = Arc::from("unchanged-compatible-schema");
-            let mut store = Parameters::seeded(&previous, &bytes).expect("seed");
-            store.publish(&candidate, &bytes).expect("publish");
-            verify_selections(&store, &previous, &candidate, &bytes, &bytes)
-                .expect("unchanged bytes preserve every old and candidate selection");
-        }
+        let previous = plan("old");
+        let candidate = plan("new");
+        let bytes = Arc::from("unchanged-compatible-schema");
+        let mut store = Parameters::seeded(&previous, &bytes).expect("seed");
+        store.publish(&candidate, &bytes).expect("publish");
+        verify_selections(&store, &previous, &candidate, &bytes, &bytes)
+            .expect("unchanged bytes preserve every old and candidate selection");
     }
 
     #[test]
     fn discarded_generations_are_not_readable_and_explicit_versions_never_fall_back() {
-        let previous = plan(Some("old"));
-        let mut candidate = plan(Some("new"));
+        let previous = plan("old");
+        let mut candidate = plan("new");
         candidate.generations_retained = false;
         let mut store = Parameters::seeded(&previous, &Arc::from("old")).expect("seed");
         store
@@ -596,23 +477,17 @@ mod tests {
                 .fetch("/example/config/generations/new:2", &candidate.controller)
                 .is_err()
         );
-        assert_eq!(
-            &*store
-                .fetch("/example/config/generations/new", &candidate.controller)
-                .expect("latest"),
-            "candidate"
-        );
     }
 
     #[test]
     fn allow_and_deny_exception_both_constrain_namespace_access() {
-        let candidate = plan(Some("new"));
+        let candidate = plan("new");
         let store = Parameters::seeded(&candidate, &Arc::from("old")).expect("seed");
         let mut role = candidate.controller.clone();
-        role.excluded_from_deny.truncate(1);
+        role.excluded_from_deny.clear();
         assert!(store.fetch(&role.reference, &role).is_err());
         role = candidate.controller.clone();
-        role.readable_resources.truncate(1);
+        role.readable_resources.clear();
         assert!(store.fetch(&role.reference, &role).is_err());
         assert!(
             store
@@ -622,7 +497,7 @@ mod tests {
                 )
                 .is_err()
         );
-        let arn = &candidate.legacy_arn;
+        let arn = "arn:aws:ssm:eu-west-1:000000000000:parameter/example/config";
         assert!(!resource_matches(
             &format!("{arn}/generations/*"),
             &format!("{arn}/generations-evil/id")
@@ -632,10 +507,10 @@ mod tests {
 
     #[test]
     fn every_candidate_worker_role_must_read_both_selected_and_preserved_bytes() {
-        let previous = plan(None);
-        let mut candidate = plan(Some("new"));
+        let previous = plan("old");
+        let mut candidate = plan("new");
         let mut denied = candidate.controller.clone();
-        denied.excluded_from_deny.truncate(1);
+        denied.excluded_from_deny.clear();
         candidate.workers.push(denied);
         let mut store = Parameters::seeded(&previous, &Arc::from("old")).expect("seed");
         store
@@ -649,9 +524,9 @@ mod tests {
 
     #[test]
     fn modern_instance_selectors_must_match_one_immutable_generation() {
-        let mut candidate = plan(Some("new"));
+        let mut candidate = plan("new");
         require_modern(&candidate).expect("immutable selection");
-        candidate.workers[0].reference = "/example/config".into();
+        candidate.workers[0].reference = "/example/config/generations/new".into();
         assert!(require_modern(&candidate).is_err());
         candidate.workers[0].reference = "/example/config/generations/other:1".into();
         assert!(require_modern(&candidate).is_err());
@@ -664,6 +539,7 @@ mod tests {
         for invalid in [
             "",
             ":1",
+            "/config",
             "/config:",
             "/config:0",
             "/config:01",
@@ -674,25 +550,6 @@ mod tests {
         ] {
             assert!(Selector::parse(invalid).is_err(), "{invalid}");
         }
-        assert_eq!(
-            Selector::parse("/config:2").expect("version").version,
-            Some(2)
-        );
-        assert_eq!(Selector::parse("/config").expect("bare").version, None);
-    }
-
-    #[test]
-    fn only_schema_rejections_calibrate_mutable_publication() {
-        assert!(schema_rejection(
-            "invalid configuration: unknown field `candidate_setting`"
-        ));
-        for unrelated in [
-            "timeout waiting for health",
-            "connection refused",
-            "invalid configuration: cannot read signer",
-            "unknown field without configuration failure",
-        ] {
-            assert!(!schema_rejection(unrelated));
-        }
+        assert_eq!(Selector::parse("/config:2").expect("version").version, 2);
     }
 }

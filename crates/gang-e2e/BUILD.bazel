@@ -25,53 +25,22 @@ alias(
 alias(
     name = "previous_gang",
     actual = select({
-        "//bazel/platforms:linux_x86_64": "@gang_v032_linux_x86_64//file:gang",
-        "//bazel/platforms:linux_arm64": "@gang_v032_linux_arm64//file:gang",
-    }),
-    target_compatible_with = ["@platforms//os:linux"],
-)
-
-alias(
-    name = "calibration_gang",
-    actual = select({
-        "//bazel/platforms:linux_x86_64": "@gang_v032_linux_x86_64//file:gang",
-        "//bazel/platforms:linux_arm64": "@gang_v032_linux_arm64//file:gang",
-    }),
-    target_compatible_with = ["@platforms//os:linux"],
-)
-
-alias(
-    name = "historical_gang",
-    actual = select({
-        "//bazel/platforms:linux_x86_64": "@gang_v031_linux_x86_64//file:gang",
-        "//bazel/platforms:linux_arm64": "@gang_v031_linux_arm64//file:gang",
+        "//bazel/platforms:linux_x86_64": "@gang_v033_linux_x86_64//file:gang",
+        "//bazel/platforms:linux_arm64": "@gang_v033_linux_arm64//file:gang",
     }),
     target_compatible_with = ["@platforms//os:linux"],
 )
 
 upgrade_fixture(
-    name = "v032_fixture",
-    srcs = ["@gang_v032_source//:sources"],
-    source_root = "@gang_v032_source//:Cargo.toml",
-    target_compatible_with = ["@platforms//os:linux"],
-)
-
-alias(
-    name = "calibration_fixture",
-    actual = ":v032_fixture",
+    name = "v033_fixture",
+    srcs = ["@gang_v033_source//:sources"],
+    source_root = "@gang_v033_source//:Cargo.toml",
     target_compatible_with = ["@platforms//os:linux"],
 )
 
 alias(
     name = "previous_fixture",
-    actual = ":v032_fixture",
-    target_compatible_with = ["@platforms//os:linux"],
-)
-
-upgrade_fixture(
-    name = "historical_fixture",
-    srcs = ["@gang_v031_source//:sources"],
-    source_root = "@gang_v031_source//:Cargo.toml",
+    actual = ":v033_fixture",
     target_compatible_with = ["@platforms//os:linux"],
 )
 
@@ -154,13 +123,9 @@ workspace_rust_binary(
         "//crates/gang-testkit:postgresql_archive",
     ] + select({
         "@platforms//os:linux": [
-            ":calibration_fixture",
-            ":calibration_gang",
             ":candidate_fixture",
             ":egress_peer",
             ":egress_probe",
-            ":historical_fixture",
-            ":historical_gang",
             ":previous_fixture",
             ":previous_gang",
             "//crates/gang-main/tests/preload:loaded_probe",
@@ -170,11 +135,7 @@ workspace_rust_binary(
     env = select({
         "@platforms//os:linux": {
             "GANG_E2E_BAZEL": "$(rootpath :bazel)",
-            "GANG_E2E_CALIBRATION_FIXTURE": "$(rootpath :calibration_fixture)",
-            "GANG_E2E_CALIBRATION_GANG": "$(rootpath :calibration_gang)",
             "GANG_E2E_CANDIDATE_FIXTURE": "$(rootpath :candidate_fixture)",
-            "GANG_E2E_HISTORICAL_FIXTURE": "$(rootpath :historical_fixture)",
-            "GANG_E2E_HISTORICAL_GANG": "$(rootpath :historical_gang)",
             "GANG_E2E_PREVIOUS_FIXTURE": "$(rootpath :previous_fixture)",
             "GANG_E2E_PREVIOUS_GANG": "$(rootpath :previous_gang)",
             "GANG_E2E_EGRESS_PEER": "$(rootpath :egress_peer)",
@@ -201,15 +162,11 @@ workspace_rust_binary(
 e2e_bundle(
     name = "bundle",
     bazel = ":bazel",
-    calibration_fixture = ":calibration_fixture",
-    calibration_gang = ":calibration_gang",
     candidate_fixture = ":candidate_fixture",
     egress_peer = ":egress_peer",
     egress_probe = ":egress_probe",
     gang = "//crates/gang-main:gang",
     harness = ":local",
-    historical_fixture = ":historical_fixture",
-    historical_gang = ":historical_gang",
     loaded_probe = "//crates/gang-main/tests/preload:loaded_probe",
     postgres = "//crates/gang-testkit:postgresql_archive",
     previous_fixture = ":previous_fixture",

@@ -937,8 +937,7 @@ mod tests {
             "@testfile": "tests/config.tftest.hcl",
             "@testrun": "transition",
             "test_plan": { "resource_changes": [
-                {"address": "aws_ssm_parameter.legacy", "type": "aws_ssm_parameter", "change": {"actions": ["no-op"]}},
-                {"address": "aws_ssm_parameter.generation", "type": "aws_ssm_parameter", "change": {"actions": ["forget", "create"]}},
+                {"address": "aws_ssm_parameter.config_generation", "type": "aws_ssm_parameter", "change": {"actions": ["forget", "create"]}},
                 {"address": "terraform_data.other", "type": "terraform_data", "change": {"actions": ["delete"]}}
             ]}
         })
@@ -947,8 +946,7 @@ mod tests {
     fn expected() -> Expectations {
         serde_json::from_value(serde_json::json!({
             "plans": {"transition": {
-                "aws_ssm_parameter.legacy": ["no-op"],
-                "aws_ssm_parameter.generation": ["forget", "create"]
+                "aws_ssm_parameter.config_generation": ["forget", "create"]
             }}
         }))
         .expect("valid test expectations")
@@ -978,7 +976,7 @@ mod tests {
     fn rejects_parameter_delete_even_in_unrequested_run() {
         let mut event = plan_event();
         event["@testrun"] = "apply".into();
-        event["test_plan"]["resource_changes"][1]["change"]["actions"] =
+        event["test_plan"]["resource_changes"][0]["change"]["actions"] =
             serde_json::json!(["delete", "create"]);
         assert!(matches!(
             validate_events(&[plan_event(), event]),
@@ -987,7 +985,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_legacy_update() {
+    fn rejects_unexpected_generation_update() {
         let mut event = plan_event();
         event["test_plan"]["resource_changes"][0]["change"]["actions"] =
             serde_json::json!(["update"]);
@@ -1134,20 +1132,19 @@ mod tests {
         serde_json::json!({"type":"test_state","@testfile":"tests/config.tftest.hcl","@testrun":run,
         "test_state":{"format_version":"1.0","values":{"outputs":{"gang_toml":{"value":value},"uuid":{"value":generation}},
         "root_module":{"resources":[
-            {"address":"aws_ssm_parameter.legacy","mode":"managed","type":"aws_ssm_parameter","values":{"value":value}},
-            {"address":"aws_ssm_parameter.generation","mode":"managed","type":"aws_ssm_parameter","values":{"value":value}}
+            {"address":"aws_ssm_parameter.config_generation","mode":"managed","type":"aws_ssm_parameter","values":{"value":value}}
         ]}}}})
     }
 
     fn state_expectations() -> Expectations {
         serde_json::from_value(serde_json::json!({
-            "plans":{"transition":{"aws_ssm_parameter.legacy":["forget","create"],"aws_ssm_parameter.generation":["forget","create"]}},
+            "plans":{"transition":{"aws_ssm_parameter.config_generation":["forget","create"]}},
             "state_checks":[
-                {"relation":"equal","left":{"kind":"output","run":"a","name":"gang_toml"},"right":{"kind":"resource","run":"a","address":"aws_ssm_parameter.legacy","attribute":"value"}},
-                {"relation":"not_equal","left":{"kind":"resource","run":"a","address":"aws_ssm_parameter.legacy","attribute":"value"},"right":{"kind":"resource","run":"b","address":"aws_ssm_parameter.legacy","attribute":"value"}},
+                {"relation":"equal","left":{"kind":"output","run":"a","name":"gang_toml"},"right":{"kind":"resource","run":"a","address":"aws_ssm_parameter.config_generation","attribute":"value"}},
+                {"relation":"not_equal","left":{"kind":"resource","run":"a","address":"aws_ssm_parameter.config_generation","attribute":"value"},"right":{"kind":"resource","run":"b","address":"aws_ssm_parameter.config_generation","attribute":"value"}},
                 {"relation":"not_equal","left":{"kind":"output","run":"a","name":"uuid"},"right":{"kind":"output","run":"b","name":"uuid"}}
             ],
-            "retention":{"run":"b","resources":{"aws_ssm_parameter.legacy":"transition","aws_ssm_parameter.generation":"transition"}}
+            "retention":{"run":"b","resources":{"aws_ssm_parameter.config_generation":"transition"}}
         })).expect("expectations")
     }
 
@@ -1199,16 +1196,10 @@ mod tests {
     #[test]
     fn state_comparisons_and_retention_proof() {
         let expected = state_expectations();
-        let a = state("a", "legacy bytes", "uuid-a");
+        let a = state("a", "old bytes", "uuid-a");
         let b = state("b", "new bytes", "uuid-b");
         assert!(check_states(&[a.clone(), b.clone()], &expected).is_ok());
-        assert!(
-            check_states(
-                &[a.clone(), state("b", "legacy bytes", "uuid-b")],
-                &expected
-            )
-            .is_err()
-        );
+        assert!(check_states(&[a.clone(), state("b", "old bytes", "uuid-b")], &expected).is_err());
         assert!(check_states(&[a.clone(), state("b", "new bytes", "uuid-a")], &expected).is_err());
         assert!(check_states(std::slice::from_ref(&a), &expected).is_err());
         assert!(check_states(&[a.clone(), a.clone(), b.clone()], &expected).is_err());
@@ -1220,7 +1211,7 @@ mod tests {
     #[test]
     fn rejects_invalid_state_resources_and_proofs() {
         let expected = state_expectations();
-        let a = state("a", "legacy bytes", "uuid-a");
+        let a = state("a", "old bytes", "uuid-a");
         let b = state("b", "new bytes", "uuid-b");
         for field in ["address", "mode", "type", "values"] {
             let mut bad = a.clone();
@@ -1253,7 +1244,7 @@ mod tests {
             .plans
             .get_mut("transition")
             .expect("plan")
-            .remove("aws_ssm_parameter.legacy");
+            .remove("aws_ssm_parameter.config_generation");
         assert!(check_states(&[a.clone(), b.clone()], &wrong_proof).is_err());
         wrong_proof.plans.clear();
         assert!(check_states(&[a.clone(), b.clone()], &wrong_proof).is_err());
@@ -1262,7 +1253,10 @@ mod tests {
             .plans
             .get_mut("transition")
             .expect("plan")
-            .insert("aws_ssm_parameter.legacy".into(), vec!["create".into()]);
+            .insert(
+                "aws_ssm_parameter.config_generation".into(),
+                vec!["create".into()],
+            );
         assert!(check_states(&[a, b], &wrong_action).is_err());
     }
 

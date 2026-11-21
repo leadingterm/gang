@@ -13,9 +13,9 @@ use gang_postgres::{Postgres, PostgresConfig, PostgresError, Tls};
 use gang_spi::{
     Acquisition, ApplyRecords, CandidateGeneration, CandidatePriority, CertStatus,
     ControllerHostIdentity, ControllerId, ExpiringRecordPort, Insert, IssuedCertRecord,
-    LeaderLeasePort, LeaseCandidate, PortError, RecordBatchSeq, RecordChange, RecordId, RecordKey,
-    RecordKind, RecordVersion, RecordedScalingEvent, Renewal, ScalingAuditEvent, ScalingEventKind,
-    ScalingEventSeq, StateRepositoryPort, Takeover,
+    LeaderLeasePort, LeaseCandidate, PortError, RecordBatchSeq, RecordId, RecordKey, RecordKind,
+    RecordVersion, Renewal, ScalingAuditEvent, ScalingEventKind, ScalingEventSeq,
+    StateRepositoryPort, Takeover,
 };
 use gang_testkit::{POSTGRES_ARCHIVE_ENV, PostgresServer, SUPERUSER, shared_postgres};
 use gang_types::{
@@ -413,7 +413,7 @@ async fn expiring_records_pages_live_records_by_kind_and_id() -> Result<(), Box<
 }
 
 #[tokio::test]
-async fn concurrent_plugins_migrate_one_database() -> Result<(), Box<dyn Error>> {
+async fn concurrent_plugins_initialize_one_database() -> Result<(), Box<dyn Error>> {
     let server = shared_postgres()?;
     let config = support::database(&server).await?;
     let a = support::build(config.clone())?;
@@ -423,158 +423,7 @@ async fn concurrent_plugins_migrate_one_database() -> Result<(), Box<dyn Error>>
 }
 
 #[tokio::test]
-async fn text_audit_details_migrate_without_loss() -> Result<(), Box<dyn Error>> {
-    let server = shared_postgres()?;
-    let config = support::database(&server).await?;
-    let db = support::build(config.clone())?;
-    let original = ScalingAuditEvent {
-        at: Timestamp::from_unix_millis(10),
-        fleet: FleetName::try_new("workers")?,
-        kind: ScalingEventKind::LaunchFailed {
-            from: 0,
-            to: 1,
-            reason: "quota café\nretry".to_owned(),
-        },
-        cause: None,
-    };
-    let first = db.record_scaling_event(&original).await?;
-    let raw = support::raw(&server, &config.database).await?;
-    raw.batch_execute(
-        "ALTER TABLE scaling_audit ALTER COLUMN detail TYPE text USING convert_from(detail, 'UTF8'); \
-         ALTER TABLE leases DROP COLUMN record_sequence; \
-         ALTER TABLE leases DROP COLUMN holder_priority, DROP COLUMN holder_priority_epoch, \
-             DROP COLUMN pending_holder, DROP COLUMN pending_priority, DROP COLUMN pending_epoch, DROP COLUMN pending_expires_at; \
-         DROP TABLE controller_hosts; \
-         DELETE FROM counters WHERE name = 'candidate'; \
-         UPDATE schema_version SET current = 1, oldest_compatible = 1;",
-    )
-    .await?;
-    drop(db);
-
-    let db = support::build(config)?;
-    let limit = NonZeroUsize::new(10).ok_or("zero limit")?;
-    let mut events = Vec::new();
-    let more = db
-        .scaling_events(ScalingEventSeq::new(0), None, limit, &mut events)
-        .await?;
-    assert!(!more);
-    assert_eq!(
-        events,
-        vec![RecordedScalingEvent {
-            seq: first,
-            event: original.clone(),
-        }]
-    );
-
-    let mut second_event = original.clone();
-    second_event.kind = ScalingEventKind::LaunchFailed {
-        from: 0,
-        to: 1,
-        reason: "quota \0café\nretry".to_owned(),
-    };
-    let second = db.record_scaling_event(&second_event).await?;
-    events.clear();
-    let more = db
-        .scaling_events(ScalingEventSeq::new(0), None, limit, &mut events)
-        .await?;
-    assert!(!more);
-    assert_eq!(
-        events,
-        vec![
-            RecordedScalingEvent {
-                seq: first,
-                event: original,
-            },
-            RecordedScalingEvent {
-                seq: second,
-                event: second_event,
-            },
-        ]
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn lease_and_history_survive_version_two_migration() -> Result<(), Box<dyn Error>> {
-    let server = shared_postgres()?;
-    let config = support::database(&server).await?;
-    let db = support::build(config.clone())?;
-    let now = Timestamp::from_unix_millis(10);
-    let expires = Timestamp::from_unix_millis(100);
-    let Acquisition::Acquired(lease) = db
-        .acquire(&candidate("original"), now, now, expires, Takeover::Observe)
-        .await?
-    else {
-        return Err("lease not acquired".into());
-    };
-    let key = RecordKey {
-        kind: RecordKind::ResourceHistory,
-        id: RecordId::new([42; 32]),
-    };
-    db.insert(&[(key, b"history")], RecordVersion::new(9), now, expires)
-        .await?;
-    let raw = support::raw(&server, &config.database).await?;
-    raw.batch_execute(
-        "ALTER TABLE leases DROP COLUMN record_sequence, DROP COLUMN holder_priority, \
-             DROP COLUMN holder_priority_epoch, DROP COLUMN pending_holder, \
-             DROP COLUMN pending_priority, DROP COLUMN pending_epoch, DROP COLUMN pending_expires_at; \
-         DROP TABLE controller_hosts; \
-         DELETE FROM counters WHERE name = 'candidate'; \
-         UPDATE schema_version SET current = 2, oldest_compatible = 2;",
-    )
-    .await?;
-    drop(db);
-
-    let db = support::build(config)?;
-    let record = db
-        .get(&key, now)
-        .await?
-        .ok_or("history missing after migration")?;
-    assert_eq!(record.body, b"history");
-    assert_eq!(record.version, RecordVersion::new(9));
-    assert_eq!(record.expires_at, expires);
-    let renewed = match db.renew(&lease, now, expires).await? {
-        Renewal::Renewed(renewed) => renewed,
-        Renewal::Lost => return Err("lease lost during migration".into()),
-        Renewal::YieldRequested(_) => return Err("unexpected handoff during migration".into()),
-    };
-    assert_eq!(renewed.holder, lease.holder);
-    assert_eq!(renewed.epoch, lease.epoch);
-    assert_eq!(
-        db.apply(
-            &renewed,
-            RecordBatchSeq::new(1),
-            RecordVersion::new(10),
-            now,
-            &[]
-        )
-        .await?,
-        ApplyRecords::Applied
-    );
-    let delete = [RecordChange::Delete { key }];
-    assert_eq!(
-        db.apply(
-            &renewed,
-            RecordBatchSeq::new(1),
-            RecordVersion::new(11),
-            now,
-            &delete
-        )
-        .await?,
-        ApplyRecords::Fenced
-    );
-    assert_eq!(
-        db.get(&key, now)
-            .await?
-            .ok_or("history deleted by stale batch")?
-            .body,
-        b"history"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn version_three_migration_preserves_record_sequence_fencing() -> Result<(), Box<dyn Error>> {
+async fn current_schema_reopen_preserves_record_sequence_fencing() -> Result<(), Box<dyn Error>> {
     let server = shared_postgres()?;
     let config = support::database(&server).await?;
     let db = support::build(config.clone())?;
@@ -597,18 +446,8 @@ async fn version_three_migration_preserves_record_sequence_fencing() -> Result<(
         .await?,
         ApplyRecords::Applied
     );
-    let raw = support::raw(&server, &config.database).await?;
-    raw.batch_execute(
-        "ALTER TABLE leases DROP COLUMN holder_priority, DROP COLUMN holder_priority_epoch, \
-             DROP COLUMN pending_holder, DROP COLUMN pending_priority, \
-             DROP COLUMN pending_epoch, DROP COLUMN pending_expires_at; \
-         DROP TABLE controller_hosts; \
-         DELETE FROM counters WHERE name = 'candidate'; \
-         UPDATE schema_version SET current = 3, oldest_compatible = 2;",
-    )
-    .await?;
     drop(db);
-    let db = support::build(config)?;
+    let db = support::build(config.clone())?;
     assert_eq!(
         db.renew(&lease, now, expires).await?,
         Renewal::Renewed(lease.clone())
@@ -635,6 +474,7 @@ async fn version_three_migration_preserves_record_sequence_fencing() -> Result<(
         .await?,
         ApplyRecords::Applied
     );
+    let raw = support::raw(&server, &config.database).await?;
     let row = raw
         .query_one("SELECT current, oldest_compatible FROM schema_version", &[])
         .await?;
@@ -709,7 +549,6 @@ async fn incompatible_schema_refuses_all_port_families() -> Result<(), Box<dyn E
     let client = support::raw(&server, &config.database).await?;
     let newer = i32::try_from(
         gang_postgres::SCHEMA_VERSION
-            .current
             .checked_add(1)
             .ok_or("schema version overflow")?,
     )?;
@@ -839,19 +678,19 @@ async fn no_named_prepared_statements() -> Result<(), Box<dyn Error>> {
     let timeout = lines
         .iter()
         .position(|line| line.contains("SET LOCAL statement_timeout"))
-        .ok_or("migration did not set a local statement timeout")?;
+        .ok_or("schema initialization did not set a local statement timeout")?;
     assert!(
         lines[timeout].contains("idle_in_transaction_session_timeout"),
-        "migration timeout lacks idle_in_transaction_session_timeout: {}",
+        "schema initialization timeout lacks idle_in_transaction_session_timeout: {}",
         lines[timeout]
     );
     let lock = lines
         .iter()
         .position(|line| line.contains("pg_advisory_xact_lock"))
-        .ok_or("migration lock was not logged")?;
+        .ok_or("schema lock was not logged")?;
     assert!(
         timeout < lock,
-        "migration lock was taken before its timeout: {lines:?}"
+        "schema lock was taken before its timeout: {lines:?}"
     );
     for line in &lines {
         if line.contains("execute ") || line.contains("statement:") {

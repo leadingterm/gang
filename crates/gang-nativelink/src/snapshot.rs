@@ -69,36 +69,28 @@ fn worker_state(summary: &WorkerSummary) -> Option<WorkerState> {
 
 /// Converts a queued operation into a scheduler demand.
 ///
-/// Candidates ignore environment so an old live worker can satisfy demand; capacity accounting
-/// checks the identity separately before attributing work or launching workers.
-/// Each missing or malformed resource property contributes zero to its dimension. Actions
-/// without a valid environment are omitted.
+/// Candidates reflect fleet selectors and resource policy; old client environment labels
+/// impose no scheduling constraint. Malformed resource values contribute zero.
 fn queued_demand(
     info: &NativeActionInfo,
     fleets: &FleetCatalog,
     expected: Option<Duration>,
     source: Option<SourceId>,
-) -> Option<QueuedDemand> {
-    Some(QueuedDemand {
+) -> QueuedDemand {
+    QueuedDemand {
         source,
         candidates: fleets
             .admit(
                 info.platform_properties
                     .iter()
-                    .filter(|(key, _)| key.as_str() != property::ACTION_ENVIRONMENT)
                     .map(|(key, value)| (key.as_str(), value.as_str())),
             )
             .unwrap_or_default(),
-        environment: info
-            .platform_properties
-            .get(property::ACTION_ENVIRONMENT)?
-            .parse()
-            .ok()?,
         resources: resources(&info.platform_properties),
         queued_since: Timestamp::from(info.insert_timestamp),
         priority: info.priority,
         expected,
-    })
+    }
 }
 
 fn parse<T: std::str::FromStr + Default>(properties: &HashMap<String, String>, key: &str) -> T {
@@ -217,15 +209,14 @@ pub(crate) async fn fill(
         }
         let source = rates.source(operation.origin.as_ref());
         let duration = expected(operation.origin.as_ref(), durations, now);
-        if let Some(demand) = queued_demand(&operation.info, fleets, duration, source) {
-            let index = into.queued.len();
-            into.queued.push(demand);
-            scratch.0.queued_live.push(true);
-            scratch
-                .0
-                .rows
-                .insert(StateKey(operation.state), RowLocation::Queued(index));
-        }
+        let demand = queued_demand(&operation.info, fleets, duration, source);
+        let index = into.queued.len();
+        into.queued.push(demand);
+        scratch.0.queued_live.push(true);
+        scratch
+            .0
+            .rows
+            .insert(StateKey(operation.state), RowLocation::Queued(index));
     }
 
     for (worker, state) in into
@@ -247,7 +238,7 @@ pub(crate) async fn fill(
             let row = ExecutingDemand {
                 worker,
                 source,
-                candidates: fleets.accepting_base(|key| {
+                candidates: fleets.accepting(|key| {
                     operation
                         .info
                         .platform_properties
@@ -332,7 +323,7 @@ pub(crate) mod tests {
     }
 
     fn queued_demand(info: &NativeActionInfo, fleets: &FleetCatalog) -> QueuedDemand {
-        super::queued_demand(info, fleets, None, None).expect("valid environment")
+        super::queued_demand(info, fleets, None, None)
     }
 
     pub(crate) fn history() -> Mutex<ActionDurations> {
@@ -474,7 +465,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn demand_retains_identity_and_base_candidates() {
+    fn demand_ignores_old_environment_label() {
         let entry = demand(
             0,
             &[
@@ -483,7 +474,6 @@ pub(crate) mod tests {
             ],
         );
         let demand = queued_demand(&entry, &catalog());
-        assert_eq!(demand.environment.as_str(), "host:old");
         assert_eq!(demand.candidates.iter().collect::<Vec<_>>(), vec![1]);
     }
 
@@ -491,26 +481,30 @@ pub(crate) mod tests {
     fn old_environment_demand_keeps_authenticated_source() {
         let entry = demand(0, &[(property::ACTION_ENVIRONMENT, "host:old")]);
         let source = SourceId::from_identity_str("local:alice");
-        let demand =
-            super::queued_demand(&entry, &catalog(), None, source).expect("valid environment");
+        let demand = super::queued_demand(&entry, &catalog(), None, source);
         assert_eq!(demand.source, source);
-        assert_eq!(demand.environment.as_str(), "host:old");
         assert_eq!(demand.candidates.iter().collect::<Vec<_>>(), vec![0, 1]);
     }
 
     #[test]
-    fn invalid_environment_is_not_queued_even_with_a_source() {
+    fn missing_or_arbitrary_environment_label_preserves_queue_and_source() {
         let mut entry = demand(0, &[]);
         Arc::make_mut(&mut entry)
             .platform_properties
             .remove(property::ACTION_ENVIRONMENT);
         let source = SourceId::from_identity_str("local:alice");
-        assert!(super::queued_demand(&entry, &catalog(), None, source).is_none());
+        assert_eq!(
+            super::queued_demand(&entry, &catalog(), None, source).source,
+            source
+        );
         Arc::make_mut(&mut entry).platform_properties.insert(
             property::ACTION_ENVIRONMENT.to_owned(),
             "invalid".to_owned(),
         );
-        assert!(super::queued_demand(&entry, &catalog(), None, source).is_none());
+        assert_eq!(
+            super::queued_demand(&entry, &catalog(), None, source).source,
+            source
+        );
     }
 
     #[test]
@@ -608,7 +602,6 @@ pub(crate) mod tests {
             QueuedDemand {
                 source: None,
                 candidates: FleetSet::prefix(1).expect("fleet count in range"),
-                environment: "host:test".parse().expect("valid environment"),
                 resources: ActionResources {
                     cpu_millicores: 4000,
                     memory: Bytes::kib(1024),

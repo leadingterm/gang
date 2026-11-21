@@ -3,7 +3,8 @@
 use std::num::{NonZeroU32, NonZeroUsize};
 
 use gang_types::{
-    BoundedDuration, HeadroomPercent, NANOS_PER_SECOND, NonZeroBytes, NonZeroDuration,
+    BoundedDuration, EnvironmentName, HeadroomPercent, NANOS_PER_SECOND, NonZeroBytes,
+    NonZeroDuration,
 };
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +20,9 @@ pub type WholeSeconds = BoundedDuration<NANOS_PER_SECOND, 1, { u64::MAX / NANOS_
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ActionsConfig {
+    /// Server-owned action-cache environment version. Default: `default/1` (existing warm cache).
+    /// Bump only when action-visible software changes, never for security-only image rebuilds.
+    pub environment: EnvironmentName,
     /// Percentage added to measured peaks for learning and resource escalation. Default: 20.
     pub reservation_headroom_percent: HeadroomPercent,
     /// History retention, in whole days, at least one day. Default: `7d`.
@@ -49,6 +53,7 @@ pub struct ActionsConfig {
 impl Default for ActionsConfig {
     fn default() -> Self {
         Self {
+            environment: EnvironmentName::default(),
             reservation_headroom_percent: HeadroomPercent::from_percent(20),
             history_window: HistoryWindow::from_units(7),
             history_keys: NonZeroUsize::MIN.saturating_add(65_535),

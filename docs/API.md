@@ -44,7 +44,6 @@ curl https://gang.example.com/v1/server
   "remoteCache": "grpcs://gang.example.com:443",
   "caCertificate": "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUdGhpcyBpcyBhbiBleGFtcGxl\n-----END CERTIFICATE-----\n",
   "defaultIsa": "x86-64",
-  "actionEnvironment": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "version": "0.1.5",
   "authentication": {
     "token": {
@@ -74,7 +73,6 @@ A deployment on a trusted network with no authentication:
   "remoteExecutor": "grpc://gang.example.com:8980",
   "remoteCache": "grpc://gang.example.com:8980",
   "defaultIsa": "aarch64",
-  "actionEnvironment": "host:local",
   "version": "0.1.5",
   "authentication": {
     "none": {}
@@ -94,7 +92,6 @@ A deployment on a trusted network with no authentication:
 - `remoteExecutor` and `remoteCache` are the endpoints for Bazel's `--remote_executor` and `--remote_cache`; both always use the same public endpoint.
 - `caCertificate` is the certificate authority the client should trust for those endpoints; it is omitted when the server has none, and when `[server] endpoint_trust = "system"`, where a publicly trusted terminator presents the endpoint and clients use their system roots.
 - `defaultIsa` is the instruction set a build gets when it does not name one. `gang bazelrc` writes it as `--remote_default_exec_properties=ISA=<defaultIsa>`.
-- `actionEnvironment` is the launch identity of the first fleet matching `defaultIsa`, in fleet preference order. `gang setup` and `gang bazelrc` use it for `gang_action_environment` and `GANG_ACTION_ENVIRONMENT`; live workers may temporarily serve other identities. See [the action environment contract](SPECIFICATION.md#84-nixos-images).
 - `version` is the server's Gang version, for display; a server that predates it omits it.
 - `authentication` is a oneof. `token` means the client obtains a bearer token with `POST /v1/session:authenticate`; `none` means no credential is needed. A client that meets a member it does not know must stop and say so.
 - `authentication.token.deviceLogin` names the dashboard sign-in provider when device login is mounted; it is omitted otherwise.

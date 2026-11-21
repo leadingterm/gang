@@ -81,11 +81,18 @@ impl S3Cache {
 
 impl CacheStorePort for S3Cache {
     fn content_store(&self) -> Result<RenderedStoreSpec, PortError> {
-        Ok(store_spec(&self.config, CONTENT_PREFIX))
+        Ok(store_spec(&self.config, CONTENT_PREFIX, None))
     }
 
-    fn action_store(&self) -> Result<RenderedStoreSpec, PortError> {
-        Ok(store_spec(&self.config, ACTION_PREFIX))
+    fn action_store(
+        &self,
+        environment: &gang_types::EnvironmentName,
+    ) -> Result<RenderedStoreSpec, PortError> {
+        Ok(store_spec(
+            &self.config,
+            ACTION_PREFIX,
+            environment.cache_namespace(),
+        ))
     }
 
     /// The workers open the S3 stores with their own credentials.
@@ -104,13 +111,17 @@ impl CacheStorePort for S3Cache {
 }
 
 /// Describes one store under the configured key prefix, namespaced by `prefix`.
-fn store_spec(config: &S3CacheConfig, prefix: &str) -> RenderedStoreSpec {
+fn store_spec(config: &S3CacheConfig, prefix: &str, namespace: Option<&str>) -> RenderedStoreSpec {
+    let key_prefix = match namespace {
+        Some(name) => format!("{}{prefix}{name}/", config.key_prefix.as_str()),
+        None => format!("{}{prefix}", config.key_prefix.as_str()),
+    };
     let mut object = json!({
         "provider": PROVIDER,
         "region": config.region.as_str(),
         "bucket": config.bucket.as_str(),
         "force_path_style": config.force_path_style,
-        "key_prefix": format!("{}{prefix}", config.key_prefix.as_str()),
+        "key_prefix": key_prefix,
         "retry": {
             "max_retries": config.tuning.max_retries,
             "delay": config.tuning.retry_delay.get().as_secs_f64(),
@@ -164,13 +175,41 @@ mod tests {
     fn object(spec: &RenderedStoreSpec) -> &Value {
         &spec.0[STORE_KEY]
     }
+    #[test]
+    fn environment_versions_namespace_only_action_results() -> TestResult {
+        let cache = S3Cache::build(serde_json::from_value(base_config())?, &context())?;
+        let direct_worker = S3Cache::build(serde_json::from_value(base_config())?, &context())?;
+        assert_eq!(direct_worker.worker_access(), StoreAccess::Direct);
+        let initial = gang_types::EnvironmentName::default();
+        let patched = gang_types::EnvironmentName::try_from("default/1".to_owned())?;
+        let bumped = gang_types::EnvironmentName::try_from("debian-13/2".to_owned())?;
+        assert_eq!(object(&cache.action_store(&initial)?)["key_prefix"], "ac/");
+        assert_eq!(cache.action_store(&initial)?, cache.action_store(&patched)?);
+        assert_eq!(
+            object(&cache.action_store(&bumped)?)["key_prefix"],
+            "ac/debian-13/2/"
+        );
+        assert_eq!(object(&cache.content_store()?)["key_prefix"], "cas/");
+        serde_json::from_value::<StoreSpec>(cache.action_store(&bumped)?.0)?;
+        for environment in [&initial, &bumped] {
+            assert_eq!(
+                cache.action_store(environment)?,
+                direct_worker.action_store(environment)?
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn both_stores_deserialize_into_nativelink_store_specs() -> TestResult {
         let cache = S3Cache::build(serde_json::from_value(base_config())?, &context())?;
 
         serde_json::from_value::<StoreSpec>(cache.content_store()?.0)?;
-        serde_json::from_value::<StoreSpec>(cache.action_store()?.0)?;
+        serde_json::from_value::<StoreSpec>(
+            cache
+                .action_store(&gang_types::EnvironmentName::default())?
+                .0,
+        )?;
         Ok(())
     }
 
@@ -190,7 +229,10 @@ mod tests {
             }
             value["force_path_style"] = json!(path_style);
             let cache = S3Cache::build(serde_json::from_value(value)?, &context())?;
-            for spec in [cache.content_store()?, cache.action_store()?] {
+            for spec in [
+                cache.content_store()?,
+                cache.action_store(&gang_types::EnvironmentName::default())?,
+            ] {
                 assert_eq!(
                     object(&spec).get("endpoint").and_then(Value::as_str),
                     endpoint
@@ -225,7 +267,7 @@ mod tests {
         let cache = S3Cache::build(serde_json::from_value(value)?, &context())?;
 
         let content = cache.content_store()?;
-        let action = cache.action_store()?;
+        let action = cache.action_store(&gang_types::EnvironmentName::default())?;
 
         assert_eq!(object(&content)["key_prefix"].as_str(), Some("gang/cas/"));
         assert_eq!(object(&action)["key_prefix"].as_str(), Some("gang/ac/"));
@@ -259,7 +301,7 @@ mod tests {
         value["tuning"]["consider_expired_after"] = json!("6d");
         let expiring = S3Cache::build(serde_json::from_value(value)?, &context())?;
         assert_eq!(
-            object(&expiring.action_store()?)["consider_expired_after_s"].as_u64(),
+            object(&expiring.action_store(&gang_types::EnvironmentName::default())?)["consider_expired_after_s"].as_u64(),
             Some(518_400)
         );
         Ok(())

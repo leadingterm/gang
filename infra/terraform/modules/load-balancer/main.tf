@@ -129,8 +129,8 @@ resource "aws_lb_target_group" "this" {
 
   # PROXY preserves effective client identity while disabling source preservation
   # avoids NLB target connection tuple collisions.
-  preserve_client_ip     = var.shared_database && local.proxy_protocol_enabled ? "false" : "true"
-  proxy_protocol_v2      = var.shared_database && local.proxy_protocol_enabled
+  preserve_client_ip     = var.shared_database ? "false" : "true"
+  proxy_protocol_v2      = var.shared_database
   deregistration_delay   = var.shared_database ? var.deregistration_delay : null
   connection_termination = var.shared_database ? false : null
 
@@ -166,6 +166,7 @@ resource "aws_lb_target_group_attachment" "this" {
   target_id        = var.controller_instance_id
   port             = var.port
 }
+
 
 # The HTTPS default port means the endpoint carries no port. h2 then http/1.1
 # matches the public listener's ALPN; Bazel's gRPC needs h2.
@@ -248,8 +249,7 @@ moved {
 }
 
 locals {
-  health                 = jsondecode(file("${path.module}/health-check.json"))
-  proxy_protocol_enabled = contains(["proxied", "require"], var.proxy_protocol_stage)
+  health = jsondecode(file("${path.module}/health-check.json"))
 
   internal_listeners = var.shared_database ? {
     serve   = var.port
@@ -385,8 +385,8 @@ resource "aws_lb_target_group" "internal" {
   protocol               = "TCP"
   target_type            = "instance"
   vpc_id                 = var.vpc_id
-  preserve_client_ip     = local.proxy_protocol_enabled ? "false" : "true"
-  proxy_protocol_v2      = local.proxy_protocol_enabled
+  preserve_client_ip     = "false"
+  proxy_protocol_v2      = true
   deregistration_delay   = var.deregistration_delay
   connection_termination = false
 

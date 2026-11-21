@@ -77,12 +77,8 @@ fn worker(world: &mut World, index: u64, fleet: &str, running: u32, draining: bo
 }
 
 /// Appends a queued action since `since` milliseconds, with candidate fleets `fleets`.
-fn enqueue(world: &mut World, since: u64, fleets: &[usize]) -> TestResult {
-    world
-        .snapshot
-        .queued
-        .push(queued(since, fleet_set(fleets))?);
-    Ok(())
+fn enqueue(world: &mut World, since: u64, fleets: &[usize]) {
+    world.snapshot.queued.push(queued(since, fleet_set(fleets)));
 }
 
 /// A running action on the worker of instance `index`.
@@ -176,8 +172,8 @@ fn churn_step_0() -> Result<World, Box<dyn Error>> {
     )?;
     worker(&mut world, 1, "alpha", 1, false)?;
     worker(&mut world, 3, "beta", 0, true)?;
-    enqueue(&mut world, 100, &[0, 1])?;
-    enqueue(&mut world, 200, &[1])?;
+    enqueue(&mut world, 100, &[0, 1]);
+    enqueue(&mut world, 200, &[1]);
     world.actions = Some(sample(
         4_000,
         vec![
@@ -224,9 +220,9 @@ fn churn_step_1() -> Result<World, Box<dyn Error>> {
     worker(&mut world, 3, "beta", 0, true)?;
     worker(&mut world, 5, "alpha", 0, false)?;
     worker(&mut world, 9, "gamma", 2, false)?;
-    enqueue(&mut world, 100, &[0, 1])?;
-    enqueue(&mut world, 200, &[1])?;
-    enqueue(&mut world, 250, &[2])?;
+    enqueue(&mut world, 100, &[0, 1]);
+    enqueue(&mut world, 200, &[1]);
+    enqueue(&mut world, 250, &[2]);
     world.actions = Some(sample(
         5_000,
         vec![
@@ -286,7 +282,7 @@ fn churn_step_3() -> Result<World, Box<dyn Error>> {
     worker(&mut world, 1, "beta", 0, false)?;
     worker(&mut world, 3, "alpha", 0, true)?;
     worker(&mut world, 7, "alpha", 2, false)?;
-    enqueue(&mut world, 300, &[0])?;
+    enqueue(&mut world, 300, &[0]);
     world.actions = Some(sample(
         7_000,
         vec![running(7, "op-e", 6_500, 0)?],
@@ -365,8 +361,8 @@ fn churn_step_5() -> Result<World, Box<dyn Error>> {
     worker(&mut world, 5, "alpha", 0, false)?;
     worker(&mut world, 7, "gamma", 0, false)?;
     worker(&mut world, 9, "gamma", 1, false)?;
-    enqueue(&mut world, 100, &[0, 1])?;
-    enqueue(&mut world, 400, &[2])?;
+    enqueue(&mut world, 100, &[0, 1]);
+    enqueue(&mut world, 400, &[2]);
     world.actions = Some(sample(
         9_000,
         vec![

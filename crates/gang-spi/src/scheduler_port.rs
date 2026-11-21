@@ -289,8 +289,6 @@ pub struct QueuedDemand {
     /// The fleets that accept the action, as indices into [`ControllerSpec::fleets`], in
     /// preference order; empty when none accepts it.
     pub candidates: FleetSet,
-    /// The exact action environment required by this action.
-    pub environment: ActionEnvironment,
     /// The resources the action requests, each dimension zero when the action does not request it.
     pub resources: ActionResources,
     /// When it was queued.

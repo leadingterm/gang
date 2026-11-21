@@ -14,7 +14,7 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::config::{PostgresConfig, Tls};
 use crate::errors::PostgresError;
-use crate::migrations::migrate;
+use crate::schema::initialize;
 
 /// `PostgreSQL`-backed state repository, leader lease and expiring records, shared by every
 /// controller of a deployment.
@@ -125,7 +125,7 @@ impl Postgres {
             .get_or_try_init(|| {
                 self.bounded(async |client| {
                     let transaction = self.begin(client).await?;
-                    migrate(&transaction).await?;
+                    initialize(&transaction).await?;
                     Ok(transaction.commit().await?)
                 })
             })

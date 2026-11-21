@@ -181,7 +181,6 @@ pub(crate) struct LocalTerminal {
     placement: Placement,
     pinned: PathBuf,
     insecure: PathBuf,
-    action_environment: gang_types::ActionEnvironment,
     unparsable: PathBuf,
     public_listen: PathBuf,
     deadline: Duration,
@@ -214,15 +213,6 @@ impl LocalTerminal {
             .to_toml()
             .map_err(E2eError::system_from("rendering the pinned configuration"))?;
         let insecure_text = kept_worker(&pinned_text, &invocation.action_tools)?;
-        let insecure_document = Document::<Plugins>::parse(&insecure_text)
-            .map_err(E2eError::parse("the insecure configuration"))?;
-        let action_environment = insecure_document
-            .fleets
-            .iter()
-            .find(|fleet| fleet.isa == insecure_document.default_isa)
-            .ok_or_else(|| E2eError::system("the insecure configuration has no default ISA fleet"))?
-            .action_environment
-            .clone();
         let mut open = retarget(parse()?, &placement)?;
         open.listen = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
         let public_text = open.to_toml().map_err(E2eError::system_from(
@@ -241,7 +231,6 @@ impl LocalTerminal {
             placement,
             pinned,
             insecure,
-            action_environment,
             unparsable,
             public_listen,
             deadline: invocation.settings.history_timeout,
@@ -365,14 +354,6 @@ impl Terminal for LocalTerminal {
                     .arg(bazel)
                     .arg("--")
                     .arg(format!("--remote_executor={executor}"))
-                    .arg(format!(
-                        "--repo_env=GANG_ACTION_ENVIRONMENT={}",
-                        self.action_environment
-                    ))
-                    .arg(format!(
-                        "--remote_default_exec_properties=gang_action_environment={}",
-                        self.action_environment
-                    ))
                     .env(FAKE_BAZEL_ENV, "1");
             }
             Call::Worker {

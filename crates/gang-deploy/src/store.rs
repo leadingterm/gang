@@ -232,12 +232,8 @@ mod tests {
     #[test]
     fn store_records_has_changes_false_for_an_empty_plan() {
         assert!(!request(inputs()).unwrap().facts.has_changes);
-        let changing = StoreRequest::try_new(
-            inputs(),
-            &fixture("parameter-value"),
-            PlanSha256::digest(b""),
-        )
-        .unwrap();
+        let changing =
+            StoreRequest::try_new(inputs(), &fixture("created"), PlanSha256::digest(b"")).unwrap();
         assert!(changing.facts.has_changes);
     }
 

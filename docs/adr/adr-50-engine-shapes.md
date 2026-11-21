@@ -12,7 +12,7 @@ Status: Accepted. Builds on ADR-43 and ADR-45.
 ## Consequences
 - One module supports both shapes. Switching engines is a planned migration using the database copy command, with both databases quiescent.
 - SQLite retains the single-attach volume constraint; the group can replace controllers without tying their state to an instance.
-- Followers are deliberately unhealthy in the leader-only target groups, so the group uses EC2 health rather than ELB health, which would replace them.
+- The group uses EC2 health rather than ELB health; a ready newer contender can serve shared requests before leadership, as described in ADR-59.
 
 ## Rejected alternatives
 - **Separate deployment modules:** duplicates network, identity and fleet wiring.

@@ -143,22 +143,6 @@ async fn stop_during_preparation<T>(
     }
 }
 
-/// Selects the launch environment in fleet preference order.
-fn launch_environment(
-    policies: &[gang_config::FleetPolicy],
-    default_isa: Isa,
-    path: &Path,
-) -> Result<gang_types::ActionEnvironment> {
-    policies
-        .iter()
-        .find(|policy| policy.isa == default_isa)
-        .map(|policy| policy.action_environment.clone())
-        .ok_or_else(|| MainError::ParseConfig {
-            path: path.to_owned(),
-            source: gang_config::ConfigError::DefaultIsaWithoutFleet(default_isa),
-        })
-}
-
 async fn serve_prepared(
     loaded: LoadedConfig,
     out: &Output,
@@ -190,7 +174,6 @@ async fn serve_prepared(
         builds,
         ..
     } = config;
-    let action_environment = launch_environment(fleets.policies(), default_isa, &path)?;
     let context = PluginContext { config_path: &path };
     let login = dashboard_login(&dashboard).await?;
 
@@ -228,7 +211,6 @@ async fn serve_prepared(
             handoff_timeout: backstop,
             client_action_timeout,
             default_isa,
-            action_environment,
             endpoint: endpoint.clone(),
             transport: transport_settings(&server),
             dashboard,
@@ -463,8 +445,6 @@ struct SettingsSource {
     handoff_timeout: std::time::Duration,
     /// The interface standard the server's default isa is.
     default_isa: Isa,
-    /// Launch environment of the preferred fleet for the default ISA.
-    action_environment: gang_types::ActionEnvironment,
     /// The endpoint clients reach the public listener at.
     endpoint: Url,
     /// How accepted connections are handled.
@@ -484,11 +464,10 @@ fn server_settings(source: SettingsSource, server: ServerConfig) -> Result<Serve
     Ok(ServerSettings {
         actions: source.actions,
         scaling: source.scaling,
-        proxy_protocol: Arc::new(server.proxy_protocol),
+        proxy_protocol: server.proxy_protocol.map(Arc::new),
         poll_interval: source.poll_interval,
         client_action_timeout: source.client_action_timeout,
         default_isa: source.default_isa,
-        action_environment: source.action_environment,
         endpoint: PublicEndpoint::try_new(source.endpoint)?,
         transport: source.transport,
         roles: server.roles,
@@ -1002,17 +981,6 @@ mod tests {
     }
 
     #[test]
-    fn launch_environment_reports_a_missing_default_fleet() {
-        assert!(matches!(
-            launch_environment(&[], Isa::X86_64, Path::new("gang.toml")),
-            Err(MainError::ParseConfig {
-                source: gang_config::ConfigError::DefaultIsaWithoutFleet(Isa::X86_64),
-                ..
-            })
-        ));
-    }
-
-    #[test]
     fn server_settings_preserve_leadership() -> TestResult {
         let server: ServerConfig = toml::from_str(
             "transport = 'plaintext'\nstandby_routability_delay = '10s'\nrevocation_refresh_interval = '7s'\n[leadership]\nttl = '20s'\nrenew_interval = '4s'\nclock_skew = '1s'\n",
@@ -1032,7 +1000,6 @@ mod tests {
                 client_action_timeout: NonZeroDuration::from_secs(1),
                 handoff_timeout: std::time::Duration::from_secs(47),
                 default_isa: Isa::X86_64,
-                action_environment: "host:test".parse()?,
                 endpoint: Url::parse("http://127.0.0.1:8080")?,
                 transport: transport_settings(&server),
                 dashboard: DashboardConfig::default(),

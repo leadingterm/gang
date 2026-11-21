@@ -97,15 +97,6 @@ pub struct Harness {
 }
 
 impl Harness {
-    /// A harness with one x86-64 fleet built from [`policy`], an empty scheduler, and a
-    /// provisioner with no instances.
-    ///
-    /// # Errors
-    ///
-    /// Returns the fixture construction error if the fleet policy cannot be created.
-    pub fn new() -> TestResult<Self> {
-        Ok(Self::with_policy(policy()?))
-    }
     /// A harness with one fleet built from `policy`.
     #[must_use]
     pub fn with_policy(policy: FleetPolicy) -> Self {
@@ -181,13 +172,6 @@ impl Harness {
             self.snapshot.queued.push(QueuedDemand {
                 source: None,
                 candidates,
-                environment: candidates
-                    .iter()
-                    .find_map(|index| self.passes.get(index))
-                    .unwrap_or(&self.passes[0])
-                    .policy
-                    .action_environment
-                    .clone(),
                 resources,
                 queued_since,
                 priority: 0,

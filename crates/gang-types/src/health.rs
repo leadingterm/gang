@@ -20,12 +20,6 @@ impl HealthCheck {
         self.ready_path
     }
 
-    /// Deployment health path during the transition from `/leader` to `/ready`.
-    #[must_use]
-    pub const fn deployment_path(&self) -> &'static str {
-        "/leader"
-    }
-
     /// Time between checks of one target.
     #[must_use]
     pub const fn interval(&self) -> Duration {
@@ -96,7 +90,6 @@ mod tests {
     fn embedded_health_check_values() {
         let check = health_check();
         assert_eq!(check.ready_path(), "/ready");
-        assert_eq!(check.deployment_path(), "/leader");
         assert_eq!(check.interval(), Duration::from_secs(5));
         assert_eq!(check.timeout(), Duration::from_secs(2));
         assert_eq!(check.threshold().get(), 2);
@@ -124,7 +117,7 @@ mod tests {
         .expect("health-check.json is valid JSON");
         let check = health_check();
         let expected = serde_json::json!({
-            "ready_path": check.deployment_path(),
+            "ready_path": check.ready_path(),
             "interval_seconds": check.interval().as_secs(),
             "timeout_seconds": check.timeout().as_secs(),
             "threshold": check.threshold().get(),

@@ -60,7 +60,7 @@ impl From<&ServerSettings> for HealthLimits {
             max_connections: settings.health_max_connections,
             max_header_size: settings.health_max_header_size,
             accept_error_backoff: settings.accept_error_backoff,
-            proxy_protocol: Arc::clone(&settings.proxy_protocol),
+            proxy_protocol: settings.proxy_protocol.clone(),
         }
     }
 }
@@ -69,13 +69,11 @@ impl From<&ServerSettings> for HealthLimits {
 fn server_info<K: Stack>(
     core: &Core<K>,
     isa: Isa,
-    action_environment: &gang_types::ActionEnvironment,
     trust: EndpointTrust,
 ) -> Result<gang_wire::Server<serde_json::Value>, ServerError> {
     wire_server(
         &core.host.endpoint,
         isa,
-        action_environment,
         trust,
         core.host.security.certificate(),
         core.clients.scheme(),
@@ -86,10 +84,9 @@ fn server_info<K: Stack>(
 async fn initial_server_info<K: Stack>(
     core: &Core<K>,
     isa: Isa,
-    action_environment: &gang_types::ActionEnvironment,
     trust: EndpointTrust,
 ) -> Result<(gang_wire::Server<serde_json::Value>, RevocationSet), ServerError> {
-    let info = server_info(core, isa, action_environment, trust)?;
+    let info = server_info(core, isa, trust)?;
     let certificates = revoked_certificates(core).await?;
     Ok((info, certificates))
 }
@@ -1337,12 +1334,7 @@ impl<D: Deployment> Server<D> {
             parts.clients,
             parts.workers,
         );
-        let initial = initial_server_info(
-            &core,
-            settings.default_isa,
-            &settings.action_environment,
-            endpoint_trust,
-        );
+        let initial = initial_server_info(&core, settings.default_isa, endpoint_trust);
         let (info, revoked_certificates) = initial.await?;
         let readiness = Readiness::default();
         let (builds, observation_sink, observations) = BuildsCell::channel(&settings.builds);
@@ -1419,6 +1411,17 @@ impl<D: Deployment> Server<D> {
         );
     }
 
+    fn cache_stores(
+        &self,
+    ) -> Result<(gang_spi::RenderedStoreSpec, gang_spi::RenderedStoreSpec), ServerError> {
+        let content = self.cache.content_store().map_err(ServerError::Cache)?;
+        let action = self
+            .cache
+            .action_store(&self.actions.environment)
+            .map_err(ServerError::Cache)?;
+        Ok((content, action))
+    }
+
     /// Runs the server until `shutdown` completes or a component fails. On shutdown, each
     /// viewer is told the server is shutting down, then the connections are drained. Dropping
     /// the returned future stops every connection and task the server started.
@@ -1441,8 +1444,7 @@ impl<D: Deployment> Server<D> {
     ) -> Result<(), ServerError> {
         let core = &*self.core;
         self.warn_startup();
-        let content_store = self.cache.content_store().map_err(ServerError::Cache)?;
-        let action_store = self.cache.action_store().map_err(ServerError::Cache)?;
+        let (content_store, action_store) = self.cache_stores()?;
         let spec = ControllerSpec {
             content_store: &content_store,
             action_store: &action_store,
@@ -1762,16 +1764,6 @@ fn warn_unauthenticated(
     }
 }
 
-fn proxy_mode(
-    config: &gang_config::ProxyProtocolConfig,
-    role: EndpointRole,
-) -> gang_config::ProxyProtocol {
-    match role {
-        EndpointRole::Public => config.public,
-        EndpointRole::Worker => config.worker,
-    }
-}
-
 /// Opens one listener under the policy for its endpoint.
 async fn open_listener<D: Deployment>(
     listener: D::Listener,
@@ -1781,14 +1773,12 @@ async fn open_listener<D: Deployment>(
     accept_error_backoff: NonZeroDuration,
 ) -> Result<Accepting<D::Listener, Arc<D::Signer>, D::Clock>, ServerError> {
     let config = &core.host.proxy_protocol;
-    let mode = proxy_mode(config, role);
     let Security::Tls(tls) = &core.host.security else {
         return Ok(Accepting::plain(
             listener,
             accept_error_backoff,
             Arc::clone(&core.host.clock),
-            mode,
-            Arc::clone(config),
+            config.clone(),
         ));
     };
     let (name, certificates, alpn) = match role {
@@ -1810,7 +1800,7 @@ async fn open_listener<D: Deployment>(
         alpn,
         revoked_certificates,
         accept_error_backoff,
-        (mode, Arc::clone(config)),
+        config.clone(),
     );
     Accepting::secured(
         listener,
@@ -1830,10 +1820,7 @@ fn policy<K: Stack>(
     alpn: Alpn,
     revoked_certificates: &RevocationSet,
     accept_error_backoff: NonZeroDuration,
-    (proxy_mode, proxy_protocol): (
-        gang_config::ProxyProtocol,
-        Arc<gang_config::ProxyProtocolConfig>,
-    ),
+    proxy_protocol: Option<Arc<gang_config::ProxyProtocolConfig>>,
 ) -> TlsPolicy {
     TlsPolicy {
         names: vec![name.clone()],
@@ -1844,7 +1831,6 @@ fn policy<K: Stack>(
         alpn,
         handshake: tls.settings.handshake,
         accept_error_backoff,
-        proxy_mode,
         proxy_protocol,
     }
 }
@@ -2589,25 +2575,6 @@ mod tests {
             .map_err(|()| "restarted process stopped early")?;
         restarted.await?;
         Ok(())
-    }
-
-    #[test]
-    fn proxy_modes_are_selected_per_endpoint_role() {
-        use gang_config::{ProxyProtocol, ProxyProtocolConfig};
-        let config = ProxyProtocolConfig {
-            public: ProxyProtocol::Require,
-            worker: ProxyProtocol::Accept,
-            health: ProxyProtocol::Off,
-            ..ProxyProtocolConfig::default()
-        };
-        assert_eq!(
-            super::proxy_mode(&config, EndpointRole::Public),
-            ProxyProtocol::Require
-        );
-        assert_eq!(
-            super::proxy_mode(&config, EndpointRole::Worker),
-            ProxyProtocol::Accept
-        );
     }
 
     #[tokio::test]

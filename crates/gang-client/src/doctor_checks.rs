@@ -94,33 +94,6 @@ fn endpoint_fix(flag: &str, source: &OptionSource) -> String {
     }
 }
 
-/// Checks the effective repository and default execution properties against the server.
-pub(crate) fn action_environment(gang: &Gang, options: &EffectiveOptions) -> Option<Finding> {
-    let expected = gang.info.action_environment.as_str();
-    for (flag, key) in [
-        ("repo_env", "GANG_ACTION_ENVIRONMENT"),
-        (
-            "remote_default_exec_properties",
-            gang_types::property::ACTION_ENVIRONMENT,
-        ),
-    ] {
-        let actual = options
-            .values(flag)
-            .filter_map(|setting| setting.value.split_once('='))
-            .filter(|(name, _)| *name == key)
-            .map(|(_, value)| value)
-            .last();
-        if actual != Some(expected) {
-            return Some(Finding::fail(
-                Check::RemoteExecutor,
-                format!("--{flag} has a missing or stale {key}"),
-                "run gang setup and remove any conflicting Bazel overrides",
-            ));
-        }
-    }
-    None
-}
-
 /// The host part of a credential helper scope, without a leading `scheme://` or a trailing `:port`.
 fn scope_host(scope: &str) -> &str {
     let without_scheme = scope.split_once("://").map_or(scope, |(_, rest)| rest);
@@ -719,64 +692,12 @@ mod tests {
             "remoteExecutor": "grpcs://exec.example.com:443",
             "remoteCache": "grpcs://cache.example.com:443",
             "defaultIsa": "x86-64",
-            "actionEnvironment": "host:test",
             "authentication": authentication,
         });
         if ca {
             value["caCertificate"] = json!(CERTIFICATE);
         }
         serde_json::from_value(value).expect("server parses")
-    }
-
-    #[test]
-    fn stale_or_missing_action_environment_is_rejected() {
-        let server = server();
-        let info = token_info();
-        let gang = Gang {
-            server: &server,
-            info: &info,
-        };
-        let setting = |flag: &str, value: &str| {
-            (
-                flag.to_owned(),
-                Setting {
-                    value: value.to_owned(),
-                    source: OptionSource::Unknown,
-                },
-            )
-        };
-        let repo = setting("repo_env", "GANG_ACTION_ENVIRONMENT=host:test");
-        let property = setting(
-            "remote_default_exec_properties",
-            "gang_action_environment=host:test",
-        );
-        assert!(
-            action_environment(
-                &gang,
-                &EffectiveOptions::new(vec![repo.clone(), property.clone()])
-            )
-            .is_none()
-        );
-        for options in [
-            vec![repo.clone()],
-            vec![property.clone()],
-            vec![
-                repo.clone(),
-                setting(
-                    "remote_default_exec_properties",
-                    "gang_action_environment=host:old",
-                ),
-            ],
-            vec![
-                property,
-                setting("repo_env", "GANG_ACTION_ENVIRONMENT=host:old"),
-            ],
-        ] {
-            let finding = action_environment(&gang, &EffectiveOptions::new(options))
-                .expect("stale setting fails");
-            assert_eq!(finding.status, Status::Fail);
-            assert!(finding.fix.expect("fix").contains("gang setup"));
-        }
     }
 
     fn token() -> Value {
@@ -1542,7 +1463,6 @@ mod tests {
             "remoteExecutor": "grpcs://gang.example.com:443",
             "remoteCache": "grpcs://gang.example.com:443",
             "defaultIsa": "x86-64",
-            "actionEnvironment": "host:test",
             "authentication": token(),
         }))
         .expect("server parses")
@@ -1946,7 +1866,6 @@ mod tests {
             "remoteExecutor": "grpcs://exec.example.com:443",
             "remoteCache": "grpcs://gang.example.com:443",
             "defaultIsa": "x86-64",
-            "actionEnvironment": "host:test",
             "authentication": token(),
         }))
         .expect("server parses")

@@ -47,7 +47,6 @@ struct Fixture {
     gang_toml: String,
     local_config: String,
     public: Frontend,
-    execution: Option<Frontend>,
     workers: Frontend,
     controller: Controller,
     configuration: Configuration,
@@ -55,11 +54,8 @@ struct Fixture {
 
 #[derive(Serialize)]
 struct Configuration {
-    legacy_name: String,
-    legacy_arn: String,
     controller: Access,
     workers: Vec<Access>,
-    legacy_unchanged: bool,
     generations_retained: bool,
 }
 
@@ -241,35 +237,26 @@ fn record_diagnostic(event: &Value, forgotten_notice: &mut bool) -> Result<bool>
         return Ok(true);
     }
     if matches!(event["@level"].as_str(), Some("error" | "warn" | "warning")) {
-        return Err("OpenTofu emitted an error or warning".into());
+        return Err(format!(
+            "OpenTofu emitted an error or warning ({}): {}",
+            event["type"].as_str().unwrap_or("unknown"),
+            event["@message"].as_str().unwrap_or("no message")
+        )
+        .into());
     }
     Ok(false)
 }
 
 fn validate_retention(evidence: &Evidence, forgotten_notice: bool) -> Result<()> {
     let resources = state_resources(&evidence.promote)?;
-    let mut legacy = false;
-    let mut generation = false;
-    for parameter in resources
-        .iter()
-        .filter(|resource| resource["mode"] == "managed" && resource["type"] == "aws_ssm_parameter")
-    {
-        match string(parameter, "address")? {
-            "aws_ssm_parameter.config" if !legacy => legacy = true,
-            "aws_ssm_parameter.config_generation" if !generation => generation = true,
-            _ => return Err("unexpected or duplicate managed SSM resource".into()),
-        }
-    }
-    if !legacy || forgotten_notice != generation {
-        return Err("cleanup notice does not match the applied SSM resource set".into());
-    }
-    let action = if generation { "forget" } else { "delete" };
-    if !has_actions(
-        &evidence.retention,
-        "aws_ssm_parameter.config",
-        &[action, "create"],
-    )? || generation
-        && !has_actions(
+    resource(&resources, "aws_ssm_parameter.config_generation")?;
+    if !forgotten_notice
+        || !has_actions(
+            &evidence.retention,
+            "aws_ssm_parameter.config_generation",
+            &["forget", "create"],
+        )?
+        || !has_actions(
             &evidence.transition,
             "aws_ssm_parameter.config_generation",
             &["forget", "create"],
@@ -343,14 +330,8 @@ fn extract(stdout: &[u8], local_config: String) -> Result<Fixture> {
         value.as_str()
     };
     let public_port = endpoint_port(endpoint(&["endpoint"]).ok_or("missing endpoint")?)?;
-    let execution_port = endpoint(&["execution_endpoint"])
-        .map(endpoint_port)
-        .transpose()?;
-    let worker_port = endpoint_port(
-        endpoint(&["worker_endpoint"])
-            .or_else(|| endpoint(&["scheduler", "nativelink", "worker_endpoint"]))
-            .ok_or("missing worker endpoint")?,
-    )?;
+    let worker_port =
+        endpoint_port(endpoint(&["worker_endpoint"]).ok_or("missing worker endpoint")?)?;
     let mut resources = Vec::new();
     collect_resources(
         plan.pointer("/planned_values/root_module")
@@ -358,19 +339,12 @@ fn extract(stdout: &[u8], local_config: String) -> Result<Fixture> {
         &mut resources,
     )?;
     let (public, public_delay) = frontend(plan, &resources, public_port, "TLS")?;
-    let (execution, execution_delay) = execution_port
-        .map(|p| frontend(plan, &resources, p, "TLS"))
-        .transpose()?
-        .unzip();
     let (workers, workers_delay) = frontend(plan, &resources, worker_port, "TCP")?;
-    let deregistration_delay_seconds = public_delay
-        .max(workers_delay)
-        .max(execution_delay.unwrap_or(0));
+    let deregistration_delay_seconds = public_delay.max(workers_delay);
     Ok(Fixture {
         gang_toml: gang.into(),
         local_config,
         public,
-        execution,
         workers,
         controller: controller(plan, &resources, deregistration_delay_seconds)?,
         configuration: configuration(&evidence, &config)?,
@@ -438,34 +412,21 @@ fn configuration(evidence: &Evidence, config: &toml::Value) -> Result<Configurat
     if state_output(&evidence.seed, "gang_toml")? == state_output(&evidence.promote, "gang_toml")? {
         return Err("configuration transition did not change rendered bytes".into());
     }
-    let legacy = &resource(&promoted, "aws_ssm_parameter.config")?["values"];
-    let legacy_name = string(legacy, "name")?;
-    let legacy_arn = string(legacy, "arn")?;
-    let modern = promoted
-        .iter()
-        .any(|r| r["address"] == "aws_ssm_parameter.config_generation");
-    if modern
-        != evidence.promote["values"]["outputs"]
-            .get("config_parameter_reference")
-            .is_some()
-    {
-        return Err("incomplete configuration publication outputs".into());
-    }
-    if modern && state_output(&evidence.promote, "legacy_config_parameter_name")? != legacy_name {
-        return Err("legacy output does not identify the preserved parameter".into());
-    }
-    let active = if modern {
-        state_output(&evidence.promote, "config_parameter_reference")?
-    } else {
-        state_output(&evidence.promote, "config_parameter_name")?
-    };
-    let generations_retained =
-        generation_retention(evidence, &seed, &promoted, modern, legacy_name)?;
+    let active = state_output(&evidence.promote, "config_parameter_reference")?;
+    let generation = &resource(&promoted, "aws_ssm_parameter.config_generation")?["values"];
+    let arn = string(generation, "arn")?;
+    let (arn_prefix, _) = arn
+        .split_once(":parameter/")
+        .ok_or("invalid parameter ARN")?;
+    let name = string(generation, "name")?;
+    let (name_prefix, _) = name
+        .rsplit_once("/generations/")
+        .ok_or("invalid generation name")?;
+    let namespace = format!("{arn_prefix}:parameter{name_prefix}/generations/*");
+    let generations_retained = generation_retention(evidence, &seed, &promoted)?;
     validate_reference(
         active,
         &promoted,
-        modern,
-        legacy_name,
         state_output(&evidence.promote, "gang_toml")?,
     )?;
     let controller = role_access(
@@ -473,42 +434,21 @@ fn configuration(evidence: &Evidence, config: &toml::Value) -> Result<Configurat
         "module.controller",
         "controller",
         active,
-        modern,
-        legacy_arn,
+        &namespace,
     )?;
-    let workers = worker_access(&promoted, config, active, modern, legacy_arn)?;
-    let legacy_unchanged = legacy_preserved(evidence, &seed, legacy)?;
+    let workers = worker_access(&promoted, config, active, &namespace)?;
     Ok(Configuration {
-        legacy_name: legacy_name.into(),
-        legacy_arn: legacy_arn.into(),
         controller,
         workers,
-        legacy_unchanged,
         generations_retained,
     })
-}
-
-fn legacy_preserved(evidence: &Evidence, seed: &[&Value], legacy: &Value) -> Result<bool> {
-    let baseline = &resource(seed, "aws_ssm_parameter.config")?["values"];
-    let name = string(legacy, "name")?;
-    let arn = string(legacy, "arn")?;
-    if arn != format!("arn:aws:ssm:eu-north-1:000000000000:parameter{name}")
-        || string(baseline, "name")? != name
-        || string(baseline, "arn")? != arn
-        || string(baseline, "value")? != state_output(&evidence.seed, "gang_toml")?
-    {
-        return Err("legacy publication identity changed".into());
-    }
-    let unchanged = has_actions(&evidence.transition, "aws_ssm_parameter.config", &["no-op"])?;
-    Ok(unchanged && string(baseline, "value")? == string(legacy, "value")?)
 }
 
 fn worker_access(
     resources: &[&Value],
     config: &toml::Value,
     active: &str,
-    modern: bool,
-    legacy_arn: &str,
+    namespace: &str,
 ) -> Result<Vec<Access>> {
     let fleets = config
         .get("fleets")
@@ -528,15 +468,9 @@ fn worker_access(
             serde_json::to_string(name)?
         );
         let template = resource(resources, &address)?;
-        let access = instance_access(
-            template,
-            resources,
-            "module.worker_fleet",
-            "worker",
-            active,
-            legacy_arn,
-        )?;
-        validate_namespace(&access, modern, legacy_arn)?;
+        let mut access =
+            instance_access(template, resources, "module.worker_fleet", "worker", active)?;
+        validate_namespace(&mut access, namespace)?;
         workers.push(access);
     }
     let actual = resources
@@ -554,25 +488,14 @@ fn worker_access(
     Ok(workers)
 }
 
-fn generation_retention(
-    evidence: &Evidence,
-    seed: &[&Value],
-    promoted: &[&Value],
-    modern: bool,
-    legacy: &str,
-) -> Result<bool> {
-    if !modern {
-        if seed
-            .iter()
-            .chain(promoted)
-            .any(|r| r["address"] == "terraform_data.config_generation")
-        {
-            return Err("incomplete generation publication".into());
-        }
-        return Ok(false);
-    }
+fn generation_retention(evidence: &Evidence, seed: &[&Value], promoted: &[&Value]) -> Result<bool> {
     let old = &resource(seed, "aws_ssm_parameter.config_generation")?["values"];
     let new = &resource(promoted, "aws_ssm_parameter.config_generation")?["values"];
+    let old_name = string(old, "name")?;
+    let new_name = string(new, "name")?;
+    let (prefix, _) = old_name
+        .rsplit_once("/generations/")
+        .ok_or("invalid generation name")?;
     for (resources, parameter) in [(seed, old), (promoted, new)] {
         let id = string(
             &resource(resources, "terraform_data.config_generation")?["values"],
@@ -586,7 +509,7 @@ fn generation_retention(
                     b.is_ascii_hexdigit()
                 }
             })
-            || string(parameter, "name")? != format!("{legacy}/generations/{id}")
+            || string(parameter, "name")? != format!("{prefix}/generations/{id}")
         {
             return Err("missing concrete generation UUID".into());
         }
@@ -594,7 +517,7 @@ fn generation_retention(
     if string(old, "value")? != state_output(&evidence.seed, "gang_toml")?
         || string(new, "value")? != state_output(&evidence.promote, "gang_toml")?
         || string(old, "value")? == string(new, "value")?
-        || string(old, "name")? == string(new, "name")?
+        || old_name == new_name
     {
         return Err("generation does not publish changed configuration".into());
     }
@@ -606,24 +529,12 @@ fn generation_retention(
     Ok(retained && old["overwrite"] == false && new["overwrite"] == false)
 }
 
-fn validate_reference(
-    reference: &str,
-    resources: &[&Value],
-    modern: bool,
-    legacy: &str,
-    gang: &str,
-) -> Result<()> {
-    let (name, version) = match reference.rsplit_once(':') {
-        Some((name, version)) => (name, Some(version.parse::<u64>()?)),
-        None => (reference, None),
-    };
-    if modern && (version != Some(1) || !name.starts_with(&format!("{legacy}/generations/")))
-        || !modern && name != legacy
-    {
-        return Err("configuration selector targets the wrong publication".into());
-    }
-    if modern
-        && string(
+fn validate_reference(reference: &str, resources: &[&Value], gang: &str) -> Result<()> {
+    let (name, version) = reference
+        .rsplit_once(':')
+        .ok_or("missing configuration version")?;
+    if version.parse::<u64>()? != 1
+        || string(
             &resource(resources, "aws_ssm_parameter.config_generation")?["values"],
             "name",
         )? != name
@@ -637,7 +548,7 @@ fn validate_reference(
         .next()
         .ok_or("unfetchable configuration selector")?;
     if parameters.next().is_some()
-        || version.is_some_and(|v| parameter["values"]["version"].as_u64() != Some(v))
+        || parameter["values"]["version"].as_u64() != Some(1)
         || string(&parameter["values"], "value")? != gang
     {
         return Err("unfetchable or stale configuration version".into());
@@ -650,8 +561,7 @@ fn role_access(
     module: &str,
     role: &str,
     active: &str,
-    modern: bool,
-    legacy_arn: &str,
+    namespace: &str,
 ) -> Result<Access> {
     let prefix = format!("{module}.");
     let mut instances = resources.iter().filter(|r| {
@@ -666,8 +576,8 @@ fn role_access(
     if instances.next().is_some() {
         return Err("missing or ambiguous controller launch configuration".into());
     }
-    let access = instance_access(instance, resources, module, role, active, legacy_arn)?;
-    validate_namespace(&access, modern, legacy_arn)?;
+    let mut access = instance_access(instance, resources, module, role, active)?;
+    validate_namespace(&mut access, namespace)?;
     Ok(access)
 }
 
@@ -677,7 +587,6 @@ fn instance_access(
     module: &str,
     role: &str,
     active: &str,
-    legacy_arn: &str,
 ) -> Result<Access> {
     let data = string(&instance["values"], "user_data")?;
     let decoded = if instance["type"] == "aws_launch_template" {
@@ -730,11 +639,6 @@ fn instance_access(
             "ssm:GetParameterHistory",
         ],
     )?;
-    if !readable_resources.iter().any(|r| r == legacy_arn)
-        || !excluded_from_deny.iter().any(|r| r == legacy_arn)
-    {
-        return Err("legacy parameter lacks explicit allow and deny exemption".into());
-    }
     Ok(Access {
         reference: reference.into(),
         readable_resources,
@@ -803,14 +707,24 @@ fn policy_resources(
         .collect()
 }
 
-fn validate_namespace(access: &Access, modern: bool, legacy: &str) -> Result<()> {
-    let namespace = format!("{legacy}/generations/*");
-    if modern
-        && (!access.readable_resources.contains(&namespace)
-            || !access.excluded_from_deny.contains(&namespace))
+fn validate_namespace(access: &mut Access, namespace: &str) -> Result<()> {
+    if !access
+        .readable_resources
+        .iter()
+        .any(|resource| resource == namespace)
+        || !access
+            .excluded_from_deny
+            .iter()
+            .any(|resource| resource == namespace)
     {
         return Err("generation namespace lacks explicit allow and deny exemption".into());
     }
+    access
+        .readable_resources
+        .retain(|resource| resource == namespace);
+    access
+        .excluded_from_deny
+        .retain(|resource| resource == namespace);
     Ok(())
 }
 
@@ -1189,7 +1103,7 @@ mod tests {
             "output_changes": {"gang_toml": {"after": format!("poll_interval = \"50ms\"\n{gang}\n[[fleets]]\nname = \"gang-worker-x86-64\"\n")}},
             "planned_values": {"root_module": {"child_modules": [{"resources": [
                 listener("this", 443, "TLS"), target("this", 8443),
-                listener("execute[0]", 9443, "TLS"), target("execute[0]", 9444),
+                listener("unrelated[0]", 9443, "TLS"), target("unrelated[0]", 9444),
                 listener("internal[\"worker\"]", 9090, "TCP"), target("internal[\"worker\"]", 9091),
                 {"address": "module.controller.aws_autoscaling_group.controller[0]", "type": "aws_autoscaling_group",
                  "values": {"min_size": 1, "desired_capacity": 1, "max_size": 2, "health_check_type": "EC2",
@@ -1222,23 +1136,17 @@ mod tests {
             .into_bytes()
     }
 
-    fn synthetic_events(plan: &Value, modern: bool) -> Vec<Value> {
+    fn synthetic_events(plan: &Value, unrelated: bool) -> Vec<Value> {
         let gang = plan["output_changes"]["gang_toml"]["after"]
             .as_str()
             .expect("gang");
-        let seed = state(&gang.replace("50ms", "51ms"), modern, false);
-        let promote = state(gang, modern, true);
-        let mut changes = vec![json!({
-            "address": "aws_ssm_parameter.config",
-            "change": {"actions": [if modern { "no-op" } else { "update" }]}
-        })];
-        if modern {
-            changes.push(json!({"address":"aws_ssm_parameter.config_generation",
-                "change":{"actions":["forget","create"]}}));
-        }
+        let seed = state(&gang.replace("50ms", "51ms"), unrelated, false);
+        let promote = state(gang, unrelated, true);
+        let changes = vec![json!({"address":"aws_ssm_parameter.config_generation",
+            "change":{"actions":["forget","create"]}})];
         let retention = json!({"resource_changes":[{
-            "address":"aws_ssm_parameter.config",
-            "change":{"actions":[if modern { "forget" } else { "delete" }, "create"]}
+            "address":"aws_ssm_parameter.config_generation",
+            "change":{"actions":["forget", "create"]}
         }]});
         let payloads = [
             seed,
@@ -1263,9 +1171,7 @@ mod tests {
             json!({"type":"test_file","@testfile":TEST,"test_file":{"path":TEST,"status":"pass"}}),
         );
         events.push(json!({"type":"test_summary","test_summary":{"status":"pass","passed":5,"failed":0,"errored":0,"skipped":0}}));
-        if modern {
-            events.push(forgotten_event());
-        }
+        events.push(forgotten_event());
         events
     }
 
@@ -1283,32 +1189,23 @@ mod tests {
             .expect("run payload")[kind]
     }
 
-    fn state(gang: &str, modern: bool, promoted: bool) -> Value {
-        let legacy = "/gang/gang.toml";
+    fn state(gang: &str, unrelated: bool, promoted: bool) -> Value {
+        let prefix = "/gang/gang.toml";
         let arn = "arn:aws:ssm:eu-north-1:000000000000:parameter/gang/gang.toml";
         let id = if promoted {
             "22222222-2222-4222-8222-222222222222"
         } else {
             "11111111-1111-4111-8111-111111111111"
         };
-        let active = if modern {
-            format!("{legacy}/generations/{id}:1")
-        } else {
-            legacy.into()
-        };
-        let legacy_value = if modern {
-            gang.replace("50ms", "51ms")
-        } else {
-            gang.into()
-        };
+        let active = format!("{prefix}/generations/{id}:1");
         let mut resources = vec![
-            json!({"address":"aws_ssm_parameter.config","type":"aws_ssm_parameter","mode":"managed",
-            "values":{"name":legacy,"arn":arn,"version":1,"value":legacy_value}}),
+            json!({"address":"aws_ssm_parameter.config_generation","type":"aws_ssm_parameter","mode":"managed",
+                "values":{"name":format!("{prefix}/generations/{id}"),"arn":format!("{arn}/generations/{id}"),"version":1,"value":gang,"overwrite":false}}),
+            json!({"address":"terraform_data.config_generation","type":"terraform_data","values":{"id":id}}),
         ];
-        if modern {
-            resources.push(json!({"address":"aws_ssm_parameter.config_generation","type":"aws_ssm_parameter","mode":"managed",
-                "values":{"name":format!("{legacy}/generations/{id}"),"arn":format!("{arn}/generations/{id}"),"version":1,"value":gang,"overwrite":false}}));
-            resources.push(json!({"address":"terraform_data.config_generation","type":"terraform_data","values":{"id":id}}));
+        if unrelated {
+            resources.push(json!({"address":"aws_ssm_parameter.config","type":"aws_ssm_parameter","mode":"managed",
+                "values":{"name":prefix,"arn":arn,"version":1,"value":"unrelated"}}));
         }
         for (module, role, template) in [
             ("module.controller", "controller", "controller[0]"),
@@ -1326,9 +1223,9 @@ mod tests {
                 }}));
             resources.push(json!({"address":format!("{module}.module.instance_role.aws_iam_instance_profile.this"),
                 "type":"aws_iam_instance_profile","values":{"arn":profile}}));
-            let mut readable = vec![arn.to_owned()];
-            if modern {
-                readable.push(format!("{arn}/generations/*"));
+            let mut readable = vec![format!("{arn}/generations/*")];
+            if unrelated {
+                readable.push(arn.into());
             }
             resources.push(json!({"address":format!("{module}.module.instance_role.data.aws_iam_policy_document.base"),
                 "type":"aws_iam_policy_document","mode":"data","values":{"json":"{}","statement":[
@@ -1336,17 +1233,14 @@ mod tests {
                     {"sid":"DenyOtherParameters","effect":"Deny","actions":["ssm:GetParameter","ssm:GetParameters","ssm:GetParametersByPath","ssm:GetParameterHistory"],"not_resources":readable}
                 ]}}));
         }
-        let mut outputs =
-            json!({"gang_toml":{"value":gang},"config_parameter_name":{"value":legacy}});
-        if modern {
-            outputs["config_parameter_reference"] = json!({"value":active});
-            outputs["legacy_config_parameter_name"] = json!({"value":legacy});
-        }
+        let outputs =
+            json!({"gang_toml":{"value":gang},"config_parameter_reference":{"value":active}});
         json!({"values":{"outputs":outputs,"root_module":{"resources":resources}}})
     }
 
-    fn evidence(modern: bool) -> Evidence {
-        selected_evidence(&encode_events(&synthetic_events(&plan(GANG), modern))).expect("evidence")
+    fn evidence(unrelated: bool) -> Evidence {
+        selected_evidence(&encode_events(&synthetic_events(&plan(GANG), unrelated)))
+            .expect("evidence")
     }
 
     fn configuration_from(evidence: &Evidence) -> Result<Configuration> {
@@ -1368,15 +1262,22 @@ mod tests {
     }
 
     #[test]
-    fn derives_mutable_and_immutable_publication_properties() {
-        for modern in [false, true] {
+    fn derives_generation_properties_with_or_without_unrelated_parameter() {
+        for unrelated in [false, true] {
             let fixture = extract(
-                &encode_events(&synthetic_events(&plan(GANG), modern)),
+                &encode_events(&synthetic_events(&plan(GANG), unrelated)),
                 "local".into(),
             )
             .expect("fixture");
-            assert_eq!(fixture.configuration.legacy_unchanged, modern);
-            assert_eq!(fixture.configuration.generations_retained, modern);
+            assert!(fixture.configuration.generations_retained);
+            for access in std::iter::once(&fixture.configuration.controller)
+                .chain(&fixture.configuration.workers)
+            {
+                assert_eq!(access.readable_resources.len(), 1);
+                assert_eq!(access.excluded_from_deny.len(), 1);
+                assert!(access.readable_resources[0].ends_with("/generations/*"));
+                assert_eq!(access.readable_resources, access.excluded_from_deny);
+            }
             assert_eq!(fixture.configuration.workers.len(), 1);
             assert_eq!(
                 fixture.configuration.controller.reference,
@@ -1386,7 +1287,7 @@ mod tests {
     }
 
     #[test]
-    fn binds_historical_launch_template_profile_names_to_the_actual_role() {
+    fn binds_launch_template_profile_names_to_the_actual_role() {
         for (module, template) in [
             ("module.controller", "controller[0]"),
             ("module.worker_fleet", "this[\"gang-worker-x86-64\"]"),
@@ -1480,7 +1381,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_legacy_pins_and_miswired_first_line_selectors() {
+    fn rejects_bare_pins_and_miswired_first_line_selectors() {
         for (address, role) in [
             (
                 "module.controller.aws_launch_template.controller[0]",
@@ -1561,17 +1462,11 @@ mod tests {
         for module in ["module.controller", "module.worker_fleet"] {
             let mut evidence = evidence(true);
             let state = state_resources(&evidence.promote).expect("promoted resources");
-            let legacy = string(
-                &resource(&state, "aws_ssm_parameter.config").expect("legacy")["values"],
-                "arn",
-            )
-            .expect("legacy ARN")
-            .to_owned();
             let generation = string(
                 &resource(&state, "aws_ssm_parameter.config_generation").expect("generation")["values"],
                 "arn",
             ).expect("current generation ARN").to_owned();
-            let allowed = json!([legacy, generation]);
+            let allowed = json!([generation]);
             let address =
                 format!("{module}.module.instance_role.data.aws_iam_policy_document.base");
             let policy = applied_resource(&mut evidence, &address);
@@ -1582,27 +1477,9 @@ mod tests {
     }
 
     #[test]
-    fn observes_legacy_overwrite_and_generation_delete_instead_of_forget() {
-        let mut overwritten = evidence(true);
-        let gang = state_output(&overwritten.promote, "gang_toml")
-            .expect("gang")
-            .to_owned();
-        overwritten.promote["values"]["root_module"]["resources"][0]["values"]["value"] =
-            json!(gang);
-        assert!(
-            !configuration_from(&overwritten)
-                .expect("overwritten")
-                .legacy_unchanged
-        );
-        let mut changed = evidence(true);
-        changed.transition["resource_changes"][0]["change"]["actions"] = json!(["update"]);
-        assert!(
-            !configuration_from(&changed)
-                .expect("updated")
-                .legacy_unchanged
-        );
+    fn observes_generation_delete_and_overwrite() {
         let mut deleted = evidence(true);
-        deleted.transition["resource_changes"][1]["change"]["actions"] =
+        deleted.transition["resource_changes"][0]["change"]["actions"] =
             json!(["delete", "create"]);
         assert!(
             !configuration_from(&deleted)
@@ -1610,7 +1487,7 @@ mod tests {
                 .generations_retained
         );
         let mut overwrite = evidence(true);
-        overwrite.promote["values"]["root_module"]["resources"][1]["values"]["overwrite"] =
+        applied_resource(&mut overwrite, "aws_ssm_parameter.config_generation")["values"]["overwrite"] =
             json!(true);
         assert!(
             !configuration_from(&overwrite)
@@ -1653,14 +1530,11 @@ mod tests {
             "@testfile":TEST,"@testrun":"promote"
         });
         assert!(selected_evidence(&encode_events(&generic)).is_err());
-        let mut old = synthetic_events(&plan(GANG), false);
-        old.push(forgotten_event());
-        assert!(selected_evidence(&encode_events(&old)).is_err());
     }
 
     #[test]
-    fn requires_both_engine_retention_actions_and_exact_applied_ssm_set() {
-        for (run, index) in [("retention", 0), ("transition", 1)] {
+    fn requires_both_engine_retention_actions_and_generation_resource() {
+        for (run, index) in [("retention", 0), ("transition", 0)] {
             let mut events = synthetic_events(&plan(GANG), true);
             event_payload(&mut events, run, "test_plan")["resource_changes"][index]["change"]["actions"] =
                 json!(["delete", "create"]);
@@ -1669,27 +1543,18 @@ mod tests {
             event_payload(&mut missing, run, "test_plan")["resource_changes"] = json!([]);
             assert!(selected_evidence(&encode_events(&missing)).is_err());
         }
-        let mut extra = synthetic_events(&plan(GANG), true);
-        event_payload(&mut extra, "promote", "test_state")["values"]["root_module"]["resources"]
-            .as_array_mut().expect("applied resources")
-            .push(json!({"address":"aws_ssm_parameter.extra","type":"aws_ssm_parameter","mode":"managed"}));
-        assert!(selected_evidence(&encode_events(&extra)).is_err());
         let mut missing = synthetic_events(&plan(GANG), true);
         event_payload(&mut missing, "promote", "test_state")["values"]["root_module"]["resources"]
             .as_array_mut()
             .expect("applied resources")
             .retain(|resource| resource["address"] != "aws_ssm_parameter.config_generation");
         assert!(selected_evidence(&encode_events(&missing)).is_err());
-        let mut old = synthetic_events(&plan(GANG), false);
-        event_payload(&mut old, "retention", "test_plan")["resource_changes"][0]["change"]["actions"] =
-            json!(["forget", "create"]);
-        assert!(selected_evidence(&encode_events(&old)).is_err());
     }
 
     #[test]
-    fn ignores_ssm_data_lookups_in_the_exact_managed_resource_set() {
-        for modern in [false, true] {
-            let mut events = synthetic_events(&plan(GANG), modern);
+    fn ignores_ssm_data_lookups_in_applied_resources() {
+        for unrelated in [false, true] {
+            let mut events = synthetic_events(&plan(GANG), unrelated);
             event_payload(&mut events, "promote", "test_state")["values"]["root_module"]["resources"]
                 .as_array_mut().expect("applied resources")
                 .push(json!({"address":"data.aws_ssm_parameter.lookup","type":"aws_ssm_parameter","mode":"data"}));
@@ -1731,12 +1596,24 @@ mod tests {
             json!({"type":"log","@level":"warning","@message":"warning"}),
             json!({"type":"diagnostic","@level":"info","diagnostic":{"severity":"warning","summary":"warning"}}),
         ] {
-            for modern in [false, true] {
-                let mut events = synthetic_events(&plan(GANG), modern);
+            for unrelated in [false, true] {
+                let mut events = synthetic_events(&plan(GANG), unrelated);
                 events.push(event.clone());
                 assert!(selected_evidence(&encode_events(&events)).is_err());
             }
         }
+    }
+
+    #[test]
+    fn reports_warning_context_without_dumping_plan_values() {
+        let event = json!({
+            "type":"log", "@level":"warn", "@message":"provider shutdown failed",
+            "test_plan":{"secret":"must not appear"}
+        });
+        let error = record_diagnostic(&event, &mut false).expect_err("warning is rejected");
+        let message = error.to_string();
+        assert!(message.contains("(log): provider shutdown failed"));
+        assert!(!message.contains("must not appear"));
     }
 
     #[test]
@@ -1773,25 +1650,12 @@ mod tests {
     }
 
     #[test]
-    fn extracts_old_and_new_worker_endpoint_and_asymmetric_health() {
-        for gang in [
-            "endpoint = \"https://gang.example.com\"\nworker_endpoint = \"grpcs://gang.example.com:9090\"",
-            "endpoint = \"https://gang.example.com\"\n[scheduler.nativelink]\nworker_endpoint = \"grpcs://gang.example.com:9090\"",
-        ] {
-            let fixture = extract(&stream(gang), "local".into()).expect("fixture");
-            assert_eq!(fixture.public.target_port, 8443);
-            assert_eq!(fixture.workers.target_port, 9091);
-            assert_eq!(fixture.workers.health.unhealthy_threshold, 3);
-            assert_eq!(fixture.workers.health.healthy_threshold, 2);
-            assert!(fixture.execution.is_none());
-        }
-    }
-
-    #[test]
-    fn extracts_split_execution_frontend() {
-        let gang = "endpoint = \"https://gang.example.com\"\nexecution_endpoint = \"grpcs://gang.example.com:9443\"\nworker_endpoint = \"grpcs://gang.example.com:9090\"";
-        let fixture = extract(&stream(gang), "local".into()).expect("fixture");
-        assert_eq!(fixture.execution.expect("execution").target_port, 9444);
+    fn extracts_worker_endpoint_and_asymmetric_health() {
+        let fixture = extract(&stream(GANG), "local".into()).expect("fixture");
+        assert_eq!(fixture.public.target_port, 8443);
+        assert_eq!(fixture.workers.target_port, 9091);
+        assert_eq!(fixture.workers.health.unhealthy_threshold, 3);
+        assert_eq!(fixture.workers.health.healthy_threshold, 2);
     }
 
     #[test]
@@ -1819,24 +1683,17 @@ mod tests {
 
     #[test]
     fn retains_each_rendered_health_path_for_published_and_candidate_shapes() {
-        for (split, public_path, workers_path) in [
-            (true, "/serve", "/leader"),
-            (false, "/serve", "/leader"),
-            (false, "/ready", "/ready"),
-            (false, "/module-selected-path", "/worker-selected-path"),
+        for (public_path, workers_path) in [
+            ("/serve", "/leader"),
+            ("/ready", "/ready"),
+            ("/module-selected-path", "/worker-selected-path"),
         ] {
-            let gang = if split {
-                format!("{GANG}\nexecution_endpoint = \"grpcs://gang.example.com:9443\"")
-            } else {
-                GANG.into()
-            };
-            let mut plan = plan(&gang);
+            let mut plan = plan(GANG);
             resources(&mut plan)[1]["values"]["health_check"][0]["path"] = json!(public_path);
             resources(&mut plan)[5]["values"]["health_check"][0]["path"] = json!(workers_path);
             let fixture = extract(&events(&plan), "local".into()).expect("fixture");
             assert_eq!(fixture.public.health.path, public_path);
             assert_eq!(fixture.workers.health.path, workers_path);
-            assert_eq!(fixture.execution.is_some(), split);
         }
     }
 
@@ -1863,7 +1720,7 @@ mod tests {
         let mut plan = plan(gang);
         let mut changes = Vec::new();
         let mut configured = Vec::new();
-        for (index, name) in [(1, "this"), (3, "execute"), (5, "internal")] {
+        for (index, name) in [(1, "this"), (3, "unrelated"), (5, "internal")] {
             let target = &mut resources(&mut plan)[index];
             target["values"]["proxy_protocol_v2"] = Value::Null;
             changes.push(json!({
@@ -1884,25 +1741,15 @@ mod tests {
 
     #[test]
     fn resolves_only_proven_omitted_proxy_protocol_provider_defaults() {
-        for split in [false, true] {
-            let gang = if split {
-                format!("{GANG}\nexecution_endpoint = \"grpcs://gang.example.com:9443\"")
-            } else {
-                GANG.into()
-            };
-            let mut plan = default_proxy_plan(&gang);
-            let fixture = extract(&events(&plan), "local".into()).expect("omitted defaults");
-            assert!(!fixture.public.proxy_protocol_v2);
-            assert!(!fixture.workers.proxy_protocol_v2);
-            if let Some(execution) = fixture.execution {
-                assert!(!execution.proxy_protocol_v2);
-            }
-            resources(&mut plan)[1]["values"]["proxy_protocol_v2"] = json!(true);
-            plan["configuration"]["root_module"]["module_calls"]["load_balancer"]["module"]["resources"]
-                [0]["expressions"]["proxy_protocol_v2"] = json!({"constant_value":true});
-            let fixture = extract(&events(&plan), "local".into()).expect("explicit true");
-            assert!(fixture.public.proxy_protocol_v2);
-        }
+        let mut plan = default_proxy_plan(GANG);
+        let fixture = extract(&events(&plan), "local".into()).expect("omitted defaults");
+        assert!(!fixture.public.proxy_protocol_v2);
+        assert!(!fixture.workers.proxy_protocol_v2);
+        resources(&mut plan)[1]["values"]["proxy_protocol_v2"] = json!(true);
+        plan["configuration"]["root_module"]["module_calls"]["load_balancer"]["module"]["resources"]
+            [0]["expressions"]["proxy_protocol_v2"] = json!({"constant_value":true});
+        let fixture = extract(&events(&plan), "local".into()).expect("explicit true");
+        assert!(fixture.public.proxy_protocol_v2);
     }
 
     #[test]
@@ -2006,22 +1853,12 @@ mod tests {
 
     #[test]
     fn uses_only_associated_target_groups_for_maximum_drain() {
-        for split in [false, true] {
-            let gang = if split {
-                format!("{GANG}\nexecution_endpoint = \"grpcs://gang.example.com:9443\"")
-            } else {
-                GANG.into()
-            };
-            let mut plan = plan(&gang);
-            for (index, delay) in [(1, json!("0")), (3, json!("900")), (5, json!(120))] {
-                resources(&mut plan)[index]["values"]["deregistration_delay"] = delay;
-            }
-            let fixture = extract(&events(&plan), "local".into()).expect("fixture");
-            assert_eq!(
-                fixture.controller.deregistration_delay_seconds,
-                if split { 900 } else { 120 }
-            );
+        let mut plan = plan(GANG);
+        for (index, delay) in [(1, json!("0")), (3, json!("900")), (5, json!(120))] {
+            resources(&mut plan)[index]["values"]["deregistration_delay"] = delay;
         }
+        let fixture = extract(&events(&plan), "local".into()).expect("fixture");
+        assert_eq!(fixture.controller.deregistration_delay_seconds, 120);
     }
 
     #[test]

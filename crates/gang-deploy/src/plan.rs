@@ -77,7 +77,7 @@ impl FromStr for Plan {
 /// The planned change of one resource instance.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResourceChange {
-    /// The resource instance address, such as `module.gang.aws_ssm_parameter.config`.
+    /// The resource instance address, such as `module.gang.aws_ssm_parameter.config_generation`.
     pub address: String,
     /// The resource type, such as `aws_ssm_parameter`.
     #[serde(rename = "type")]
@@ -91,9 +91,6 @@ pub struct ResourceChange {
 pub struct Change {
     /// The planned actions.
     pub actions: Actions,
-    /// The attributes before the change; `null` for a create.
-    #[serde(default)]
-    pub before: Value,
     /// The attributes after the change, without the values known only after apply.
     #[serde(default)]
     pub after: Value,
@@ -103,12 +100,6 @@ pub struct Change {
 }
 
 impl Change {
-    /// The attribute `name` before the change; `null` when absent.
-    #[must_use]
-    pub fn before_attribute(&self, name: &str) -> &Value {
-        self.before.get(name).unwrap_or(&Value::Null)
-    }
-
     /// The attribute `name` after the change; `null` when absent or known only after apply.
     #[must_use]
     pub fn after_attribute(&self, name: &str) -> &Value {
@@ -268,21 +259,14 @@ pub(crate) mod tests {
     }
 
     /// The checked-in `tofu show -json` fixture `name`: real output of `OpenTofu` 1.13.2 with the
-    /// AWS provider 6.72.0 for a root with a `module.gang` deployment (its
-    /// `aws_ssm_parameter.config` and `module.controller.aws_instance.this`) and the protected
-    /// resources, planned with `-refresh=false` from a state of example values. `created` plans
-    /// that root from no state, `no-op` plans it unchanged, and each other fixture makes the change
-    /// its name says.
+    /// AWS provider 6.72.0 for a root with a deployment module and protected resources,
+    /// planned with `-refresh=false` from a state of example values.
     pub(crate) fn fixture(name: &str) -> Plan {
         let text = match name {
             "blocked" => include_str!("../tests/fixtures/blocked.json"),
             "created" => include_str!("../tests/fixtures/created.json"),
             "no-op" => include_str!("../tests/fixtures/no-op.json"),
             "output-only" => include_str!("../tests/fixtures/output-only.json"),
-            "parameter-value" => include_str!("../tests/fixtures/parameter-value.json"),
-            "parameter-tags" => include_str!("../tests/fixtures/parameter-tags.json"),
-            "parameter-unknown" => include_str!("../tests/fixtures/parameter-unknown.json"),
-            "controller-replaced" => include_str!("../tests/fixtures/controller-replaced.json"),
             _ => panic!("no fixture {name}"),
         };
         text.parse().unwrap()
@@ -301,7 +285,7 @@ pub(crate) mod tests {
     #[test]
     fn has_changes_is_true_for_an_update() {
         assert!(plan(&[resource("aws_instance", "aws_instance.a", &["update"])]).has_changes());
-        assert!(fixture("parameter-tags").has_changes());
+        assert!(fixture("blocked").has_changes());
     }
 
     #[test]

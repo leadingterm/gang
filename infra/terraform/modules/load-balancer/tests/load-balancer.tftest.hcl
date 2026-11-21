@@ -110,13 +110,18 @@ run "forwards_tls_to_the_controller_with_the_client_address" {
   command = apply
 
   assert {
-    condition     = aws_lb_target_group.this.protocol == "TLS" && aws_lb_target_group.this.port == 443 && aws_lb_target_group.this.target_type == "instance" && aws_lb_target_group.this.preserve_client_ip == "true"
-    error_message = "The target group must forward TLS to instance targets on 443 while preserving client addresses."
+    condition     = aws_lb_target_group.this.protocol == "TLS" && aws_lb_target_group.this.port == 443 && aws_lb_target_group.this.target_type == "instance" && aws_lb_target_group.this.preserve_client_ip == "true" && !aws_lb_target_group.this.proxy_protocol_v2
+    error_message = "The SQLite target group must forward TLS without PROXY while preserving client addresses."
   }
 
   assert {
-    condition     = aws_lb_target_group_attachment.this[0].target_id == var.controller_instance_id && aws_lb_target_group.this.health_check[0].protocol == "HTTP" && aws_lb_target_group.this.health_check[0].port == tostring(var.health_port) && aws_lb_target_group.this.health_check[0].path == jsondecode(file("${path.module}/health-check.json")).ready_path && aws_lb_target_group.this.health_check[0].path == "/leader" && aws_lb_target_group.this.health_check[0].matcher == "200" && aws_lb_target_group.this.health_check[0].interval == jsondecode(file("${path.module}/health-check.json")).interval_seconds && aws_lb_target_group.this.health_check[0].timeout == jsondecode(file("${path.module}/health-check.json")).timeout_seconds && aws_lb_target_group.this.health_check[0].healthy_threshold == jsondecode(file("${path.module}/health-check.json")).threshold && aws_lb_target_group.this.health_check[0].unhealthy_threshold == jsondecode(file("${path.module}/health-check.json")).threshold
-    error_message = "The attached controller must receive the configured HTTP readiness check."
+    condition     = aws_lb_target_group_attachment.this[0].target_id == var.controller_instance_id && aws_lb_target_group_attachment.this[0].target_group_arn == aws_lb_target_group.this.arn
+    error_message = "The SQLite controller must be registered with the public target group."
+  }
+
+  assert {
+    condition     = aws_lb_target_group.this.health_check[0].protocol == "HTTP" && aws_lb_target_group.this.health_check[0].port == tostring(var.health_port) && aws_lb_target_group.this.health_check[0].path == jsondecode(file("${path.module}/health-check.json")).ready_path && aws_lb_target_group.this.health_check[0].path == "/ready" && aws_lb_target_group.this.health_check[0].matcher == "200" && aws_lb_target_group.this.health_check[0].interval == jsondecode(file("${path.module}/health-check.json")).interval_seconds && aws_lb_target_group.this.health_check[0].timeout == jsondecode(file("${path.module}/health-check.json")).timeout_seconds && aws_lb_target_group.this.health_check[0].healthy_threshold == jsondecode(file("${path.module}/health-check.json")).threshold && aws_lb_target_group.this.health_check[0].unhealthy_threshold == jsondecode(file("${path.module}/health-check.json")).threshold
+    error_message = "The controller target group must use the configured HTTP readiness check."
   }
 }
 
@@ -239,7 +244,7 @@ run "shared_database_load_balancers" {
     error_message = "The internal NLB must use TCP passthrough on ports 443 and 9090 only."
   }
   assert {
-    condition     = aws_lb_target_group.this.protocol == "TLS" && alltrue([for tg in values(aws_lb_target_group.internal) : tg.protocol == "TCP"]) && alltrue([for tg in concat([aws_lb_target_group.this], values(aws_lb_target_group.internal)) : tonumber(tg.deregistration_delay) == 120 && !tg.connection_termination && tg.health_check[0].protocol == "HTTP" && tg.health_check[0].port == tostring(var.health_port) && tg.health_check[0].path == jsondecode(file("${path.module}/health-check.json")).ready_path && tg.health_check[0].path == "/leader" && tg.health_check[0].matcher == "200" && tg.health_check[0].interval == jsondecode(file("${path.module}/health-check.json")).interval_seconds && tg.health_check[0].timeout == jsondecode(file("${path.module}/health-check.json")).timeout_seconds && tg.health_check[0].healthy_threshold == jsondecode(file("${path.module}/health-check.json")).threshold && tg.health_check[0].unhealthy_threshold == jsondecode(file("${path.module}/health-check.json")).threshold])
+    condition     = aws_lb_target_group.this.protocol == "TLS" && alltrue([for tg in values(aws_lb_target_group.internal) : tg.protocol == "TCP"]) && alltrue([for tg in concat([aws_lb_target_group.this], values(aws_lb_target_group.internal)) : tonumber(tg.deregistration_delay) == 120 && !tg.connection_termination && tg.health_check[0].protocol == "HTTP" && tg.health_check[0].port == tostring(var.health_port) && tg.health_check[0].path == jsondecode(file("${path.module}/health-check.json")).ready_path && tg.health_check[0].path == "/ready" && tg.health_check[0].matcher == "200" && tg.health_check[0].interval == jsondecode(file("${path.module}/health-check.json")).interval_seconds && tg.health_check[0].timeout == jsondecode(file("${path.module}/health-check.json")).timeout_seconds && tg.health_check[0].healthy_threshold == jsondecode(file("${path.module}/health-check.json")).threshold && tg.health_check[0].unhealthy_threshold == jsondecode(file("${path.module}/health-check.json")).threshold])
     error_message = "Every shared-database target group must drain gracefully and check readiness."
   }
   assert {
@@ -251,12 +256,12 @@ run "shared_database_load_balancers" {
     error_message = "The internal load balancer must reach the controller health port."
   }
   assert {
-    condition     = alltrue([for tg in values(aws_lb_target_group.internal) : tg.preserve_client_ip == "true"])
-    error_message = "Internal target groups must preserve client addresses."
+    condition     = alltrue([for tg in concat([aws_lb_target_group.this], values(aws_lb_target_group.internal)) : tg.preserve_client_ip == "false" && tg.proxy_protocol_v2])
+    error_message = "All three target groups must send PROXY v2 and disable source preservation."
   }
   assert {
     condition     = aws_route53_record.controller.zone_id == "ZPRIVATE" && aws_route53_record.controller.name == "gang.example.com" && length(aws_route53_record.controller.alias) == 1 && length(aws_lb_target_group_attachment.this) == 0
-    error_message = "The private hostname must alias the internal NLB and the ASG owns target registration."
+    error_message = "The private hostname must alias the internal NLB."
   }
   assert {
     condition     = length(aws_vpc_security_group_ingress_rule.internal) == 4 && length(aws_vpc_security_group_ingress_rule.controller_internal) == 2 && length(aws_vpc_security_group_egress_rule.internal) == 2
@@ -264,46 +269,6 @@ run "shared_database_load_balancers" {
   }
 }
 
-run "shared_proxy_default_accept" {
-  command = plan
-  variables {
-    shared_database          = true
-    public_subnet_ids        = ["subnet-public"]
-    private_subnet_ids       = ["subnet-private"]
-    worker_security_group_id = "sg-workers"
-  }
-  assert {
-    condition     = var.proxy_protocol_stage == "accept" && alltrue([for tg in concat([aws_lb_target_group.this], values(aws_lb_target_group.internal)) : tg.preserve_client_ip == "true" && !tg.proxy_protocol_v2])
-    error_message = "Default accept must preserve source addresses without PROXY on all target groups."
-  }
-}
-
-run "sqlite_proxy_off" {
-  command = plan
-  variables { proxy_protocol_stage = "off" }
-  assert {
-    condition     = aws_lb_target_group.this.preserve_client_ip == "true" && !aws_lb_target_group.this.proxy_protocol_v2
-    error_message = "SQLite off must retain its target-group behavior."
-  }
-}
-
-run "sqlite_proxy_accept" {
-  command = plan
-  variables { proxy_protocol_stage = "accept" }
-  assert {
-    condition     = aws_lb_target_group.this.preserve_client_ip == "true" && !aws_lb_target_group.this.proxy_protocol_v2
-    error_message = "SQLite accept must retain its target-group behavior."
-  }
-}
-
-run "sqlite_proxy_proxied" {
-  command = plan
-  variables { proxy_protocol_stage = "proxied" }
-  assert {
-    condition     = aws_lb_target_group.this.preserve_client_ip == "true" && !aws_lb_target_group.this.proxy_protocol_v2
-    error_message = "SQLite proxied must retain its target-group behavior."
-  }
-}
 
 run "shared_proxy_interfaces" {
   command = apply
@@ -353,65 +318,6 @@ run "shared_proxy_interfaces" {
   }
 }
 
-run "shared_proxy_off" {
-  command = plan
-  variables {
-    shared_database          = true
-    public_subnet_ids        = ["subnet-public"]
-    private_subnet_ids       = ["subnet-private"]
-    worker_security_group_id = "sg-workers"
-    proxy_protocol_stage     = "off"
-  }
-  assert {
-    condition     = alltrue([for tg in concat([aws_lb_target_group.this], values(aws_lb_target_group.internal)) : tg.preserve_client_ip == "true" && !tg.proxy_protocol_v2])
-    error_message = "Off must preserve source addresses without PROXY on all target groups."
-  }
-}
-
-run "shared_proxy_proxied" {
-  command = plan
-  variables {
-    shared_database          = true
-    public_subnet_ids        = ["subnet-public"]
-    private_subnet_ids       = ["subnet-private"]
-    worker_security_group_id = "sg-workers"
-    proxy_protocol_stage     = "proxied"
-  }
-  assert {
-    condition     = alltrue([for tg in concat([aws_lb_target_group.this], values(aws_lb_target_group.internal)) : tg.preserve_client_ip == "false" && tg.proxy_protocol_v2])
-    error_message = "Proxied must enable PROXY and disable source preservation on all target groups."
-  }
-}
-
-run "shared_proxy_require" {
-  command = plan
-  variables {
-    shared_database          = true
-    public_subnet_ids        = ["subnet-public"]
-    private_subnet_ids       = ["subnet-private"]
-    worker_security_group_id = "sg-workers"
-    proxy_protocol_stage     = "require"
-  }
-  assert {
-    condition     = alltrue([for tg in concat([aws_lb_target_group.this], values(aws_lb_target_group.internal)) : tg.preserve_client_ip == "false" && tg.proxy_protocol_v2])
-    error_message = "Require must keep the proxied target-group wire settings."
-  }
-}
-
-run "rejects_invalid_proxy_stage" {
-  command = plan
-  variables { proxy_protocol_stage = "invalid" }
-  expect_failures = [var.proxy_protocol_stage]
-}
-
-run "sqlite_ignores_proxy_stage" {
-  command = plan
-  variables { proxy_protocol_stage = "require" }
-  assert {
-    condition     = aws_lb_target_group.this.preserve_client_ip == "true" && !aws_lb_target_group.this.proxy_protocol_v2 && length(data.aws_network_interface.public) == 0 && length(data.aws_network_interface.internal) == 0
-    error_message = "SQLite must retain its target-group behavior and discover no NLB interfaces."
-  }
-}
 
 run "rejects_private_zone_outside_hostname" {
   command = plan
@@ -493,6 +399,7 @@ run "rejects_missing_instance" {
   variables { controller_instance_id = null }
   expect_failures = [var.controller_instance_id]
 }
+
 
 run "rejects_missing_private_ip" {
   command = plan

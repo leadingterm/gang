@@ -122,7 +122,6 @@ fn resource_escalation(actions: &ActionsConfig, fleets: &FleetCatalog) -> Value 
         },
         "headroom_percent": actions.reservation_headroom_percent,
         "cpu_property": property::CPU_MILLICORES,
-        "capacity_ignored_properties": [property::ACTION_ENVIRONMENT],
         "capacities": capacities,
     });
     if actions.disk.enforcement == DiskEnforcement::Pressure {
@@ -1352,12 +1351,12 @@ mod tests {
             json!([
                 {
                     "minimum": { "cpu_count": 4, "cpu_millicores": 4000, "memory_kb": 8_388_608, "disk_kb": 104_857_600 },
-                    "exact": { "fleet": "fleet-a", "ISA": "x86-64", "sandbox": "docker", "gang_action_environment": "host:test", "capacity": "2" },
+                    "exact": { "fleet": "fleet-a", "ISA": "x86-64", "sandbox": "docker", "capacity": "2" },
                     "action_ceilings": {}
                 },
                 {
                     "minimum": { "cpu_count": 6, "cpu_millicores": 6000, "memory_kb": 16_777_216, "disk_kb": 83_886_080 },
-                    "exact": { "fleet": "fleet-b", "ISA": "aarch64", "sandbox": "bwrap", "gang_action_environment": "host:test", "capacity": "3", "machine_class": "arm" },
+                    "exact": { "fleet": "fleet-b", "ISA": "aarch64", "sandbox": "bwrap", "capacity": "3", "machine_class": "arm" },
                     "action_ceilings": {}
                 }
             ])
@@ -1365,10 +1364,7 @@ mod tests {
         let json = serde_json::to_value(simple).expect("simple json");
         assert!(json.get("memory_escalation").is_none());
         let escalation_json = &json["resource_escalation"];
-        assert_eq!(
-            escalation_json["capacity_ignored_properties"],
-            json!([property::ACTION_ENVIRONMENT])
-        );
+        assert_eq!(escalation_json["capacity_ignored_properties"], json!([]));
         for removed in ["ladder_kb", "max_kb", "max_steps", "disk_property"] {
             assert!(escalation_json.get(removed).is_none());
         }

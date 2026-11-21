@@ -433,14 +433,6 @@ run "load_balancer_fronts_the_public_listener" {
   }
 }
 
-run "rejects_invalid_proxy_stage" {
-  command = plan
-  variables {
-    hostname      = "gang.example.com"
-    load_balancer = { proxy_protocol_stage = "invalid" }
-  }
-  expect_failures = [var.load_balancer]
-}
 
 run "load_balancer_requires_hostname" {
   command = plan
@@ -801,8 +793,8 @@ run "publishes_config_parameter" {
   command = apply
 
   assert {
-    condition     = aws_ssm_parameter.config.name == "/gang/gang.toml" && output.legacy_config_parameter_name == "/gang/gang.toml" && output.config_parameter_name == aws_ssm_parameter.config_generation.name
-    error_message = "The legacy config parameter must default to /<name>/gang.toml and the active output must name its generation."
+    condition     = startswith(output.config_parameter_name, "/gang/gang.toml/generations/") && output.config_parameter_name == aws_ssm_parameter.config_generation.name
+    error_message = "The active generation must use the default /<name>/gang.toml namespace."
   }
 
   assert {
@@ -811,7 +803,7 @@ run "publishes_config_parameter" {
   }
 
   assert {
-    condition     = aws_ssm_parameter.config.type == "String" && aws_ssm_parameter.config.tier == "Intelligent-Tiering"
+    condition     = aws_ssm_parameter.config_generation.type == "String" && aws_ssm_parameter.config_generation.tier == "Intelligent-Tiering"
     error_message = "The config parameter must be a String in the Intelligent-Tiering tier: it holds no secrets."
   }
 }
@@ -1875,10 +1867,13 @@ run "rejects_config_name_too_deep" {
   expect_failures = [var.config_parameter_name]
 }
 
-run "rejects_legacy_secret_overlap" {
+run "accepts_base_namespace_secret" {
   command = plan
   variables { controller_secret_parameters = { token = "/gang/gang.toml" } }
-  expect_failures = [terraform_data.input_checks]
+  assert {
+    condition     = contains(module.controller.secret_parameter_arns, "arn:aws:ssm:eu-north-1:000000000000:parameter/gang/gang.toml")
+    error_message = "The namespace itself is not a managed configuration parameter."
+  }
 }
 
 run "rejects_generation_secret_overlap" {

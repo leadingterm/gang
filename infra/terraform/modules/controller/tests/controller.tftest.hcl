@@ -51,7 +51,7 @@ variables {
   security_group_id          = "sg-0123456789abcdef0"
   eip_allocation_id          = "eipalloc-0123456789abcdef0"
   config_parameter_reference = "/gang-controller/gang.toml/generations/example:1"
-  config_parameter_arns      = ["arn:aws:ssm:eu-north-1:000000000000:parameter/gang-controller/gang.toml", "arn:aws:ssm:eu-north-1:000000000000:parameter/gang-controller/gang.toml/generations/*"]
+  config_parameter_arns      = ["arn:aws:ssm:eu-north-1:000000000000:parameter/gang-controller/gang.toml/generations/*"]
   cache_bucket_arn           = "arn:aws:s3:::example-gang-cache"
   ca_key_arn                 = "arn:aws:kms:eu-north-1:000000000000:key/00000000-0000-0000-0000-000000000000"
   worker_fleet_names = [

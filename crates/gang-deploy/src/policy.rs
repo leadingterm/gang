@@ -1,10 +1,9 @@
-//! The plan policy: which changes block a merge, and which changes need the controller to
-//! reload its configuration after apply.
+//! The plan policy: which changes block a merge.
 
 use std::fmt;
 
 use crate::errors::{DeployError, Result};
-use crate::plan::{Action, Actions, Change, Plan, ResourceChange};
+use crate::plan::{Action, Actions, Plan};
 
 /// Resource types whose deletion or replacement blocks a merge: they hold state that cannot be
 /// recreated (keys, data, addresses, federation).
@@ -18,12 +17,8 @@ pub const PROTECTED_TYPES: [&str; 7] = [
     "aws_iam_outbound_web_identity_federation",
 ];
 
-/// Address of the configuration parameter below a deployment module, after `module.<name>.`.
-const CONFIG_PARAMETER: &str = "aws_ssm_parameter.config";
 /// Address of the immutable configuration generation below a deployment module.
 const CONFIG_GENERATION_PARAMETER: &str = "aws_ssm_parameter.config_generation";
-/// Address of the controller instance below a deployment module, after `module.<name>.`.
-const CONTROLLER_INSTANCE: &str = "module.controller.aws_instance.this[0]";
 
 /// A planned deletion or replacement of a protected resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,11 +89,7 @@ impl Plan {
                 resource.change.actions.contains(&Action::Delete)
                     && (PROTECTED_TYPES.contains(&resource.resource_type.as_str())
                         || (resource.resource_type == "aws_ssm_parameter"
-                            && (is_module_resource(&resource.address, CONFIG_PARAMETER)
-                                || is_module_resource(
-                                    &resource.address,
-                                    CONFIG_GENERATION_PARAMETER,
-                                ))))
+                            && is_module_resource(&resource.address, CONFIG_GENERATION_PARAMETER)))
             })
             .map(|resource| ProtectedChange {
                 address: &resource.address,
@@ -113,16 +104,6 @@ impl Plan {
     pub fn is_blocked(&self) -> bool {
         !self.protected_changes().is_empty()
     }
-
-    /// Reports whether applying the plan needs the running controller to reload its
-    /// configuration: a deployment's configuration parameter is created, or updated with a new or
-    /// unknown value, and no deployment's controller instance is created. A created controller
-    /// reads the new configuration when it boots.
-    #[must_use]
-    pub fn restart_needed(&self) -> bool {
-        let resources = self.resource_changes();
-        resources.iter().any(changes_configuration) && !resources.iter().any(creates_controller)
-    }
 }
 
 /// Reports whether `address` is `module.<name>.<rest>` for a name without dots.
@@ -131,28 +112,6 @@ fn is_module_resource(address: &str, rest: &str) -> bool {
         .strip_prefix("module.")
         .and_then(|address| address.split_once('.'))
         .is_some_and(|(name, tail)| !name.is_empty() && tail == rest)
-}
-
-/// Reports whether the parameter's value changes: it differs, or it is known only after apply.
-fn value_changed(change: &Change) -> bool {
-    change.before_attribute("value") != change.after_attribute("value")
-        || change.is_unknown_after("value")
-}
-
-/// Reports whether `resource` creates a deployment's configuration parameter or changes its value.
-fn changes_configuration(resource: &ResourceChange) -> bool {
-    let actions = &resource.change.actions;
-    resource.resource_type == "aws_ssm_parameter"
-        && is_module_resource(&resource.address, CONFIG_PARAMETER)
-        && (actions.contains(&Action::Create)
-            || (actions.contains(&Action::Update) && value_changed(&resource.change)))
-}
-
-/// Reports whether `resource` creates a deployment's controller instance.
-fn creates_controller(resource: &ResourceChange) -> bool {
-    resource.resource_type == "aws_instance"
-        && is_module_resource(&resource.address, CONTROLLER_INSTANCE)
-        && resource.change.actions.contains(&Action::Create)
 }
 
 #[cfg(test)]
@@ -213,6 +172,20 @@ mod tests {
             matches!(&error, DeployError::ConfigurationUnknown { address: found } if found == address)
         );
         assert!(error.to_string().contains("after_unknown.value"));
+    }
+
+    #[test]
+    fn configuration_rejects_omitted_after() {
+        let generation = resource(
+            "aws_ssm_parameter",
+            "module.gang.aws_ssm_parameter.config_generation",
+            &["no-op"],
+        );
+        let plan = plan(&[generation]);
+        assert!(matches!(
+            plan.configuration(),
+            Err(DeployError::ConfigurationInvalid { .. })
+        ));
     }
 
     #[test]
@@ -294,48 +267,45 @@ mod tests {
     }
 
     #[test]
-    fn deleting_or_replacing_deployment_configuration_is_blocked() {
-        for name in ["config", "config_generation"] {
-            let address = format!("module.gang.aws_ssm_parameter.{name}");
-            for actions in [
-                &["delete"][..],
-                &["delete", "create"],
-                &["create", "delete"],
-            ] {
-                let plan = plan(&[resource("aws_ssm_parameter", &address, actions)]);
-                let protected = plan.protected_changes();
-                assert_eq!(protected.len(), 1, "{address} {actions:?}");
-                assert_eq!(
-                    protected[0].to_string(),
-                    format!("{address}\taws_ssm_parameter\t{}", actions.join(","))
-                );
-            }
-            for actions in [
-                &["no-op"][..],
-                &["update"],
-                &["create"],
-                &["forget"],
-                &["forget", "create"],
-            ] {
-                assert!(
-                    !plan(&[resource("aws_ssm_parameter", &address, actions)]).is_blocked(),
-                    "{address} {actions:?}"
-                );
-            }
+    fn deleting_or_replacing_deployment_generation_is_blocked() {
+        let address = "module.gang.aws_ssm_parameter.config_generation";
+        for actions in [
+            &["delete"][..],
+            &["delete", "create"],
+            &["create", "delete"],
+        ] {
+            let plan = plan(&[resource("aws_ssm_parameter", address, actions)]);
+            let protected = plan.protected_changes();
+            assert_eq!(protected.len(), 1, "{address} {actions:?}");
+            assert_eq!(
+                protected[0].to_string(),
+                format!("{address}\taws_ssm_parameter\t{}", actions.join(","))
+            );
+        }
+        for actions in [
+            &["no-op"][..],
+            &["update"],
+            &["create"],
+            &["forget"],
+            &["forget", "create"],
+        ] {
+            assert!(
+                !plan(&[resource("aws_ssm_parameter", address, actions)]).is_blocked(),
+                "{address} {actions:?}"
+            );
         }
     }
 
     #[test]
     fn deleting_other_parameter_addresses_is_allowed() {
         for address in [
-            "aws_ssm_parameter.config",
+            "module.gang.aws_ssm_parameter.config",
             "aws_ssm_parameter.config_generation",
-            "module.gang.module.inner.aws_ssm_parameter.config",
             "module.gang.module.inner.aws_ssm_parameter.config_generation",
             "module.gang.aws_ssm_parameter.other",
-            "module.gang.aws_ssm_parameter.config_extra",
+            "module.gang.aws_ssm_parameter.config_generation_extra",
             "module.gang.aws_ssm_parameter.config_generation[0]",
-            "module..aws_ssm_parameter.config",
+            "module..aws_ssm_parameter.config_generation",
         ] {
             assert!(
                 !plan(&[resource("aws_ssm_parameter", address, &["delete"])]).is_blocked(),
@@ -345,7 +315,7 @@ mod tests {
         assert!(
             !plan(&[resource(
                 "other_type",
-                "module.gang.aws_ssm_parameter.config",
+                "module.gang.aws_ssm_parameter.config_generation",
                 &["delete"],
             )])
             .is_blocked()
@@ -416,138 +386,4 @@ mod tests {
         "aws_kms_key.state\taws_kms_key\tdelete,create",
         "aws_s3_bucket.state[0]\taws_s3_bucket\tdelete",
     ];
-
-    #[test]
-    fn parameter_tags_only_update_does_not_restart() {
-        let tags = parameter_update(
-            "module.gang.aws_ssm_parameter.config",
-            &json!({"value": "a", "tags": {"v": "1"}}),
-            &json!({"value": "a", "tags": {"v": "2"}}),
-            &json!({}),
-        );
-        assert!(!plan(&[tags]).restart_needed());
-        assert!(!fixture("parameter-tags").restart_needed());
-    }
-
-    #[test]
-    fn parameter_value_update_restarts_the_controller() {
-        assert!(plan(&[value_update("module.gang.aws_ssm_parameter.config")]).restart_needed());
-        assert!(fixture("parameter-value").restart_needed());
-    }
-
-    #[test]
-    fn parameter_value_unknown_after_apply_restarts_the_controller() {
-        let unknown = parameter_update(
-            "module.gang.aws_ssm_parameter.config",
-            &json!({"value": "a"}),
-            &json!({"value": null}),
-            &json!({"value": true}),
-        );
-        assert!(plan(&[unknown]).restart_needed());
-        assert!(fixture("parameter-unknown").restart_needed());
-    }
-
-    #[test]
-    fn parameter_create_restarts_the_controller() {
-        let create = resource(
-            "aws_ssm_parameter",
-            "module.gang.aws_ssm_parameter.config",
-            &["create"],
-        );
-        assert!(plan(&[create]).restart_needed());
-    }
-
-    #[test]
-    fn parameter_value_update_with_controller_create_does_not_restart() {
-        for actions in [
-            &["create"][..],
-            &["delete", "create"],
-            &["create", "delete"],
-        ] {
-            for parameter in [
-                value_update("module.gang.aws_ssm_parameter.config"),
-                resource(
-                    "aws_ssm_parameter",
-                    "module.gang.aws_ssm_parameter.config",
-                    &["create"],
-                ),
-            ] {
-                let controller = resource(
-                    "aws_instance",
-                    "module.gang.module.controller.aws_instance.this[0]",
-                    actions,
-                );
-                assert!(
-                    !plan(&[parameter, controller]).restart_needed(),
-                    "{actions:?}"
-                );
-            }
-        }
-        assert!(!fixture("controller-replaced").restart_needed());
-    }
-
-    #[test]
-    fn generation_rollout_and_rollback_do_not_restart_the_controller() {
-        for actions in [&["create"][..], &["forget", "create"]] {
-            let generation = resource(
-                "aws_ssm_parameter",
-                "module.gang.aws_ssm_parameter.config_generation",
-                actions,
-            );
-            let controller = resource(
-                "aws_instance",
-                "module.gang.module.controller.aws_instance.this[0]",
-                &["delete", "create"],
-            );
-            let plan = plan(&[generation, controller]);
-            assert!(!plan.is_blocked(), "{actions:?}");
-            assert!(!plan.restart_needed(), "{actions:?}");
-        }
-    }
-
-    #[test]
-    fn no_parameter_change_does_not_restart() {
-        let plan = plan(&[
-            resource(
-                "aws_instance",
-                "module.gang.module.controller.aws_instance.this[0]",
-                &["no-op"],
-            ),
-            resource("aws_kms_key", "aws_kms_key.state", &["no-op"]),
-        ]);
-        assert!(!plan.restart_needed());
-        assert!(!fixture("no-op").restart_needed());
-    }
-
-    #[test]
-    fn parameter_value_update_at_another_address_does_not_restart() {
-        for address in [
-            "module.gang.aws_ssm_parameter.other",
-            "aws_ssm_parameter.config",
-            "module.gang.module.inner.aws_ssm_parameter.config",
-            "module..aws_ssm_parameter.config",
-        ] {
-            assert!(
-                !plan(&[value_update(address)]).restart_needed(),
-                "{address}"
-            );
-        }
-    }
-
-    #[test]
-    fn parameter_value_update_with_another_instance_create_still_restarts() {
-        let worker = resource(
-            "aws_instance",
-            "module.gang.aws_instance.worker",
-            &["create"],
-        );
-        assert!(
-            plan(&[value_update("module.gang.aws_ssm_parameter.config"), worker]).restart_needed()
-        );
-    }
-
-    #[test]
-    fn parameter_value_update_under_another_module_restarts() {
-        assert!(plan(&[value_update("module.build.aws_ssm_parameter.config")]).restart_needed());
-    }
 }

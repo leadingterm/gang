@@ -236,6 +236,9 @@ impl FleetProperties {
     /// Iterates over every entry's key and how it matches, in registration order.
     pub(crate) fn declarations(&self) -> impl Iterator<Item = (&'static str, MatchKind)> + '_ {
         self.entries.iter().map(|entry| {
+            if entry.key == property::ACTION_ENVIRONMENT {
+                return (entry.key, MatchKind::Ignored);
+            }
             let kind = match entry.rule {
                 Rule::Exact => MatchKind::Exact,
                 Rule::Minimum(_) => MatchKind::Minimum,
@@ -374,7 +377,7 @@ mod tests {
                 ("fleet", MatchKind::Exact),
                 ("ISA", MatchKind::Exact),
                 ("sandbox", MatchKind::Exact),
-                ("gang_action_environment", MatchKind::Exact),
+                ("gang_action_environment", MatchKind::Ignored),
                 ("cpu_count", MatchKind::Minimum),
                 ("cpu_millicores", MatchKind::Minimum),
                 ("memory_kb", MatchKind::Minimum),

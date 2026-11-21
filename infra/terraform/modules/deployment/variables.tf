@@ -210,19 +210,13 @@ variable "load_balancer" {
   type = object({
     ssl_policy                     = optional(string, "ELBSecurityPolicy-TLS13-1-2-2021-06")
     certificate_validation_timeout = optional(string, "2h")
-    proxy_protocol_stage           = optional(string, "accept")
   })
-  description = "Public TLS load balancer using an ACM certificate for hostname; required for shared database engines (postgres and dynamodb). SQLite keeps its controller Elastic IP and private DNS. Shared database engines use public and internal load balancers, with the hostname resolving privately to the internal load balancer. proxy_protocol_stage applies only to shared databases and defaults to accept; advance one adjacent step per apply through off, accept, proxied, require (or reverse), waiting for all controller refreshes before the next step. ssl_policy must be an ELBSecurityPolicy-TLS13-* policy. The first apply waits up to certificate_validation_timeout for DNS validation."
+  description = "Public TLS load balancer using an ACM certificate for hostname; required for shared database engines (postgres and dynamodb). SQLite keeps its controller Elastic IP and private DNS. Shared database engines use public and internal load balancers with PROXY v2, with the hostname resolving privately to the internal load balancer. ssl_policy must be an ELBSecurityPolicy-TLS13-* policy. The first apply waits up to certificate_validation_timeout for DNS validation."
   default     = null
 
   validation {
     condition     = var.load_balancer == null || var.hostname != null
     error_message = "load_balancer requires hostname: it is the certificate's domain."
-  }
-
-  validation {
-    condition     = var.load_balancer == null ? true : contains(["off", "accept", "proxied", "require"], var.load_balancer.proxy_protocol_stage)
-    error_message = "load_balancer.proxy_protocol_stage must be off, accept, proxied, or require."
   }
 }
 
@@ -567,7 +561,7 @@ variable "extra_config_toml" {
     [database.sqlite].busy_timeout and [authentication.workers.mtls].certificate_ttl. With database.engine "postgres" or
     "dynamodb", the module opens [server.http2] and owns shutdown_grace, so all other keys in that table,
     including max_connections and receive_window, retain their defaults. With "sqlite", the module does not open that
-    table, so it can be appended here. For shared databases when load_balancer.proxy_protocol_stage is not "off", the
+    table, so it can be appended here. For load-balanced shared databases, the
     module also opens [server.proxy_protocol], so it cannot be reopened here; header_timeout, max_pending_headers, and
     max_header_size are not exposed and retain their runtime defaults. Its first non-blank, non-comment line must start
     with "[". Content is public: it lands in the SSM parameter (gang.toml), not
@@ -584,7 +578,7 @@ variable "extra_config_toml" {
 
 variable "config_parameter_name" {
   type        = string
-  description = "Legacy SSM parameter name. Null uses /<name>/gang.toml. New instances read an immutable generation beneath this name. The partition and region determine the available ARN length budget."
+  description = "SSM configuration generation namespace. Null uses /<name>/gang.toml. Instances read an immutable generation beneath this name. The partition and region determine the available ARN length budget."
   default     = null
 
   validation {

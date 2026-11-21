@@ -286,7 +286,6 @@ mod tests {
                 "remoteExecutor": "grpcs://example.com",
                 "remoteCache": "grpcs://example.com",
                 "defaultIsa": "x86-64",
-                "actionEnvironment": "host:test",
                 "authentication": {"none": {}},
             });
             if let Some(ca_certificate) = &self.ca_certificate {

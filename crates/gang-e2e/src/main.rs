@@ -51,18 +51,6 @@ struct Cli {
     /// Previous release deployment fixture.
     #[arg(long, value_name = "PATH")]
     previous_fixture: Option<PathBuf>,
-    /// Historical release executable for the negative control.
-    #[arg(long, value_name = "PATH")]
-    historical_gang: Option<PathBuf>,
-    /// Historical release deployment fixture.
-    #[arg(long, value_name = "PATH")]
-    historical_fixture: Option<PathBuf>,
-    /// Fixed candidate release executable for the negative control.
-    #[arg(long, value_name = "PATH")]
-    calibration_gang: Option<PathBuf>,
-    /// Fixed candidate release deployment fixture.
-    #[arg(long, value_name = "PATH")]
-    calibration_fixture: Option<PathBuf>,
     /// Candidate deployment fixture.
     #[arg(long, value_name = "PATH")]
     candidate_fixture: Option<PathBuf>,
@@ -71,7 +59,7 @@ struct Cli {
     #[arg(long, value_enum)]
     upgrade_procedure: Option<UpgradeProcedure>,
 
-    /// The gate to run: `1` or `one`, or `2` or `two`, which includes the earlier gate.
+    /// The gate to run: `1` or `2`, which includes the earlier gate.
     #[arg(long, value_name = "GATE", default_value = "1")]
     gate: Gate,
 
@@ -246,8 +234,8 @@ impl Cli {
                 matches!(
                     scenario,
                     Scenario::RollingUpgrade
+                        | Scenario::RollingUpgradeAutomatic
                         | Scenario::ConfigRefetchRestart
-                        | Scenario::UpgradeNegativeControl
                 )
             })
         {
@@ -267,30 +255,6 @@ impl Cli {
                     &self.previous_fixture,
                     "GANG_E2E_PREVIOUS_FIXTURE",
                     "--previous-fixture",
-                )?,
-            },
-            historical: ReleaseInput {
-                binary: resolve(
-                    &self.historical_gang,
-                    "GANG_E2E_HISTORICAL_GANG",
-                    "--historical-gang",
-                )?,
-                fixture: resolve(
-                    &self.historical_fixture,
-                    "GANG_E2E_HISTORICAL_FIXTURE",
-                    "--historical-fixture",
-                )?,
-            },
-            calibration: ReleaseInput {
-                binary: resolve(
-                    &self.calibration_gang,
-                    "GANG_E2E_CALIBRATION_GANG",
-                    "--calibration-gang",
-                )?,
-                fixture: resolve(
-                    &self.calibration_fixture,
-                    "GANG_E2E_CALIBRATION_FIXTURE",
-                    "--calibration-fixture",
                 )?,
             },
             candidate_fixture: resolve(
@@ -593,14 +557,6 @@ mod tests {
             "previous",
             "--previous-fixture",
             "previous.json",
-            "--historical-gang",
-            "historical",
-            "--historical-fixture",
-            "historical.json",
-            "--calibration-gang",
-            "calibration",
-            "--calibration-fixture",
-            "calibration.json",
             "--candidate-fixture",
             "candidate.json",
         ])
@@ -611,21 +567,11 @@ mod tests {
         );
         assert_eq!(cli.previous_gang, Some(PathBuf::from("previous")));
         assert_eq!(cli.previous_fixture, Some(PathBuf::from("previous.json")));
-        assert_eq!(cli.historical_gang, Some(PathBuf::from("historical")));
-        assert_eq!(
-            cli.historical_fixture,
-            Some(PathBuf::from("historical.json"))
-        );
-        assert_eq!(cli.calibration_gang, Some(PathBuf::from("calibration")));
-        assert_eq!(
-            cli.calibration_fixture,
-            Some(PathBuf::from("calibration.json"))
-        );
         assert_eq!(cli.candidate_fixture, Some(PathBuf::from("candidate.json")));
         let selected = [
             Scenario::RollingUpgrade,
+            Scenario::RollingUpgradeAutomatic,
             Scenario::ConfigRefetchRestart,
-            Scenario::UpgradeNegativeControl,
         ];
         let shards: Vec<_> = (1..=2)
             .map(|index| partition(&selected, format!("{index}/2").parse().unwrap()))

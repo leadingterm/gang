@@ -106,7 +106,7 @@ where
         let (providers, verifier) = providers();
         let core = Core::new(
             Host {
-                proxy_protocol: Arc::default(),
+                proxy_protocol: None,
                 repository: FakeRepository::default(),
                 signer: Arc::new(TestSigner::authority().expect("the test signer builds")),
                 security: Security::Plaintext,

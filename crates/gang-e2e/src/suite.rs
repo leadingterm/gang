@@ -51,7 +51,7 @@ use crate::server::ServerKnobs;
 use crate::server_scenarios::{
     api, certificate_rotation, event_paging, request_limits, viewer_cap,
 };
-use crate::settings::DeploymentInputs;
+use crate::settings::{DeploymentInputs, UpgradeProcedure};
 use crate::setup::setup;
 use crate::skipped_pass::skipped_pass;
 use crate::stack::Stack;
@@ -112,8 +112,8 @@ impl FromStr for Gate {
     /// [`UnknownGate`] for any other text.
     fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
         match text {
-            "1" | "one" => Ok(Self::One),
-            "2" | "two" => Ok(Self::Two),
+            "1" => Ok(Self::One),
+            "2" => Ok(Self::Two),
             other => Err(UnknownGate(other.to_owned())),
         }
     }
@@ -121,7 +121,7 @@ impl FromStr for Gate {
 
 /// Text that names no gate.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("unknown gate `{0}`; expected 1, 2, one or two")]
+#[error("unknown gate `{0}`; expected 1 or 2")]
 pub struct UnknownGate(pub String);
 
 gang_types::string_enum! {
@@ -234,10 +234,10 @@ gang_types::string_enum! {
         RollingDeploy = "rolling-deploy",
         /// A previous release is replaced by the candidate while work is held.
         RollingUpgrade = "rolling-upgrade",
+        /// A previous release is replaced by instance refresh while work is held.
+        RollingUpgradeAutomatic = "rolling-upgrade-automatic",
         /// Published old controllers and workers refetch preserved configuration after publication.
         ConfigRefetchRestart = "config-refetch-restart",
-        /// A known historical upgrade regression must be detected.
-        UpgradeNegativeControl = "upgrade-negative-control",
         /// Revocations propagate between controllers.
         CrossRevocation = "cross-revocation",
         /// Queued demand survives loss or suspension of the leader.
@@ -319,7 +319,7 @@ impl Scenario {
             Self::RollingDeploy
             | Self::BurstFromZero
             | Self::RollingUpgrade
-            | Self::UpgradeNegativeControl => 62,
+            | Self::RollingUpgradeAutomatic => 62,
             Self::FollowerBuilds => 66,
             Self::LoginAcross => 15,
             Self::ScheduledMinimum => 5,
@@ -386,8 +386,8 @@ impl Scenario {
             | Self::ControllerLoss
             | Self::RollingDeploy
             | Self::RollingUpgrade
+            | Self::RollingUpgradeAutomatic
             | Self::ConfigRefetchRestart
-            | Self::UpgradeNegativeControl
             | Self::CrossRevocation
             | Self::LeaderFailover
             | Self::LoginAcross
@@ -472,7 +472,7 @@ impl Scenario {
             Self::InputIntegrity => input_integrity_checks(ctx),
             Self::InputRoot => input_root_checks(ctx),
             Self::Restart => restart_checks(ctx),
-            Self::RollingUpgrade | Self::UpgradeNegativeControl => upgrade_checks(self, ctx),
+            Self::RollingUpgrade | Self::RollingUpgradeAutomatic => upgrade_checks(self, ctx),
             Self::ConfigRefetchRestart => config_restart_checks(ctx),
             Self::ControllerLoss
             | Self::RollingDeploy
@@ -589,12 +589,13 @@ fn upgrade_checks(scenario: Scenario, ctx: &RunContext<'_>) -> Vec<Check> {
     if cfg!(target_os = "linux") {
         attempt(scenario, || {
             let variant = required_cluster_variant(scenario, &ctx.baseline)?;
-            crate::rolling_upgrade::rolling_upgrade(
-                ctx.inputs,
-                &variant,
-                ctx.issuer,
-                scenario == Scenario::UpgradeNegativeControl,
-            )
+            let automatic_inputs = (scenario == Scenario::RollingUpgradeAutomatic).then(|| {
+                let mut inputs = ctx.inputs.clone();
+                inputs.settings.upgrade_procedure = UpgradeProcedure::InstanceRefresh;
+                inputs
+            });
+            let inputs = automatic_inputs.as_ref().unwrap_or(ctx.inputs);
+            crate::rolling_upgrade::rolling_upgrade(inputs, &variant, ctx.issuer)
         })
     } else {
         vec![Check::skipped(
@@ -927,8 +928,8 @@ fn cluster_variant(scenario: Scenario, baseline: &Variant) -> Option<Variant> {
         Scenario::ControllerLoss
         | Scenario::RollingDeploy
         | Scenario::RollingUpgrade
+        | Scenario::RollingUpgradeAutomatic
         | Scenario::ConfigRefetchRestart
-        | Scenario::UpgradeNegativeControl
         | Scenario::FollowerBuilds => Variant::baseline(Sandbox::Noop),
         Scenario::LeaderFailover => Variant {
             control: ControlKnobs::LEADER_FAILOVER,
@@ -1618,8 +1619,8 @@ mod tests {
             Scenario::ControllerLoss,
             Scenario::RollingDeploy,
             Scenario::RollingUpgrade,
+            Scenario::RollingUpgradeAutomatic,
             Scenario::ConfigRefetchRestart,
-            Scenario::UpgradeNegativeControl,
             Scenario::FollowerBuilds,
             Scenario::CrossRevocation,
             Scenario::LeaderFailover,
@@ -1640,8 +1641,8 @@ mod tests {
             Scenario::ControllerLoss,
             Scenario::RollingDeploy,
             Scenario::RollingUpgrade,
+            Scenario::RollingUpgradeAutomatic,
             Scenario::ConfigRefetchRestart,
-            Scenario::UpgradeNegativeControl,
             Scenario::FollowerBuilds,
             Scenario::CrossRevocation,
             Scenario::LeaderFailover,
@@ -1701,8 +1702,11 @@ mod tests {
     fn upgrades_are_gate_two_only_and_selectable_by_name() {
         for (name, scenario) in [
             ("rolling-upgrade", Scenario::RollingUpgrade),
+            (
+                "rolling-upgrade-automatic",
+                Scenario::RollingUpgradeAutomatic,
+            ),
             ("config-refetch-restart", Scenario::ConfigRefetchRestart),
-            ("upgrade-negative-control", Scenario::UpgradeNegativeControl),
         ] {
             assert_eq!(name.parse::<Scenario>().ok(), Some(scenario));
             assert!(!Gate::One.scenarios().any(|item| item == scenario));
@@ -1719,11 +1723,9 @@ mod tests {
     }
 
     #[test]
-    fn gates_parse_from_numbers_and_words() {
+    fn gates_parse_from_numbers() {
         assert_eq!("1".parse::<Gate>().ok(), Some(Gate::One));
-        assert_eq!("one".parse::<Gate>().ok(), Some(Gate::One));
         assert_eq!("2".parse::<Gate>().ok(), Some(Gate::Two));
-        assert_eq!("two".parse::<Gate>().ok(), Some(Gate::Two));
         assert!("3".parse::<Gate>().is_err());
     }
 
@@ -1761,8 +1763,8 @@ mod tests {
             Scenario::ControllerLoss,
             Scenario::RollingDeploy,
             Scenario::RollingUpgrade,
+            Scenario::RollingUpgradeAutomatic,
             Scenario::ConfigRefetchRestart,
-            Scenario::UpgradeNegativeControl,
             Scenario::CrossRevocation,
             Scenario::LeaderFailover,
             Scenario::LoginAcross,

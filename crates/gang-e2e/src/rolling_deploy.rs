@@ -12,6 +12,7 @@ use crate::held_build::{Hold, joined};
 use crate::journal::{Attempts, Journal, overlapping_attempts, record_attempt};
 use crate::names::rolling_deploy::{ATTEMPTS, BUILD, HELD, LEADER, LEADER_RETIRED, RETIRED};
 use crate::system::Probe;
+use crate::upgrade_evidence::BuildEvidence;
 
 const EXECUTING: usize = 2;
 const PROBES: [Probe; 8] = [
@@ -117,10 +118,16 @@ pub fn rolling_deploy(cluster: &Cluster<'_>) -> Result<Vec<Check>> {
     let go = signal.with_file_name("go");
     let run = Run::fresh()?;
     journal.prepare_attempts(run.as_ref(), PROBES.iter().map(|probe| probe.as_str()))?;
+    let bep = signal.with_file_name("rolling-deploy.bep");
+    let rpc = signal.with_file_name("rolling-deploy.rpc");
+    let stack = cluster.stack();
+    let driver = stack.bazel().with_build_logs(&bep, &rpc);
+    let credentials = stack.administrator()?.credentials(&stack.ca_pin()?)?;
+    let remote = stack.administrator_remote(&credentials)?;
     std::thread::scope(|scope| -> Result<Vec<Check>> {
         let pending = Hold::new(&go, |root| cluster.stack().kill_bazel_in(root));
-        let build = pending.build(scope, None, |cancel, stop| {
-            let outcome = cluster.stack().build_run_until(&PROBES, &run, cancel, stop);
+        let build = pending.build(scope, None, |_, stop| {
+            let outcome = driver.build_until(&remote, &PROBES, Some(&run), stop);
             journal.write_line(JOURNAL_END)?;
             outcome
         });
@@ -163,14 +170,21 @@ pub fn rolling_deploy(cluster: &Cluster<'_>) -> Result<Vec<Check>> {
         pending.disarm();
         let (held, retired_leader, statuses) = settled?;
         let outcome = completed?;
-        verdicts(
+        let evidence = BuildEvidence::read(&bep, &rpc)?;
+        let mut checks = verdicts(
             cluster,
             &outcome,
             &attempts,
             held,
             retired_leader,
             &statuses,
-        )
+        )?;
+        checks.push(Check::expect(
+            "rolling deploy: zero failed actions",
+            evidence.finished_success && evidence.failed_actions == 0,
+            || format!("build evidence: {evidence:?}"),
+        ));
+        Ok(checks)
     })
 }
 

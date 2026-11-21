@@ -20,7 +20,7 @@ pub const DISK_KB: &str = "disk_kb";
 pub const NETWORK: &str = "network";
 /// Persistent-worker marker; actions still execute one-shot.
 pub const SUPPORTS_WORKERS: &str = "supports-workers";
-/// The action environment identity. Matches exactly.
+/// An old client's cache label, ignored by the scheduler.
 pub const ACTION_ENVIRONMENT: &str = "gang_action_environment";
 
 /// Every reserved property key.
@@ -38,7 +38,7 @@ pub const RESERVED: [&str; 10] = [
 ];
 
 /// Explicitly harmless properties that impose nothing on matching.
-pub const HARMLESS_PROPERTIES: [&str; 1] = [SUPPORTS_WORKERS];
+pub const HARMLESS_PROPERTIES: [&str; 2] = [SUPPORTS_WORKERS, ACTION_ENVIRONMENT];
 
 /// Returns whether `key` is one of the [`RESERVED`] keys.
 ///

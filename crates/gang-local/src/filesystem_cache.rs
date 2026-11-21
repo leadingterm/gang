@@ -130,9 +130,18 @@ impl CacheStorePort for FilesystemCache {
         content_store_spec(&self.path, budget).map_err(PortError::from)
     }
 
-    fn action_store(&self) -> Result<RenderedStoreSpec, PortError> {
+    fn action_store(
+        &self,
+        environment: &gang_types::EnvironmentName,
+    ) -> Result<RenderedStoreSpec, PortError> {
         let (_, budget) = self.prepare().map_err(PortError::from)?;
-        action_store_spec(&self.path, budget).map_err(PortError::from)
+        let root = environment
+            .cache_namespace()
+            .map(|name| self.path.join("environments").join(name));
+        let root = root.as_deref().unwrap_or(&self.path);
+        ensure_private_dir(&action_dir(root)).map_err(LocalError::from)?;
+        ensure_private_dir(&action_temp_dir(root)).map_err(LocalError::from)?;
+        action_store_spec(root, budget).map_err(PortError::from)
     }
 
     /// The `NativeLink` filesystem stores are single-process, so only the controller opens them.
@@ -358,10 +367,40 @@ mod tests {
         let cache =
             FilesystemCache::build(config(&root), &plugin_context()).expect("valid cache config");
 
-        cache.action_store().expect("action store");
+        cache
+            .action_store(&gang_types::EnvironmentName::default())
+            .expect("action store");
 
         assert!(root.join("ac").join("content").is_dir());
         assert!(root.join("ac").join("tmp").is_dir());
+    }
+
+    #[test]
+    fn environment_versions_isolate_actions_but_keep_the_initial_layout() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("cache");
+        let cache = FilesystemCache::build(config(&root), &plugin_context())?;
+        let initial = cache.action_store(&gang_types::EnvironmentName::default())?;
+        assert_eq!(
+            path_at(&initial, "content_path"),
+            Some(root.join("ac/content").to_string_lossy().into_owned())
+        );
+        let bumped = gang_types::EnvironmentName::try_from("debian-13/2".to_owned())?;
+        let spec = cache.action_store(&bumped)?;
+        assert_eq!(
+            path_at(&spec, "content_path"),
+            Some(
+                root.join("environments/debian-13/2/ac/content")
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+        assert!(root.join("environments/debian-13/2/ac/content").is_dir());
+        assert_eq!(
+            path_at(&cache.content_store()?, "content_path"),
+            Some(root.join("cas/content").to_string_lossy().into_owned())
+        );
+        Ok(())
     }
 
     #[test]

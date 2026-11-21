@@ -699,15 +699,10 @@ where
             Action::CancelDrain(worker, _) => {
                 Self::set_draining(scheduler, configs, step.fleet, worker, false).await
             }
-            Action::Terminate { instance, cause } => {
+            Action::Terminate { instance, .. } => {
                 let fleet = configs[step.fleet].fleet();
-                let reason = if *cause == gang_reconciler::TerminationCause::StaleEnvironment {
-                    gang_spi::RetirementReason::StaleEnvironment
-                } else {
-                    gang_spi::RetirementReason::Idle
-                };
                 fence
-                    .run(async |held| provisioner.terminate(held, fleet, instance, reason).await)
+                    .run(async |held| provisioner.terminate(held, fleet, instance).await)
                     .await
                     .map_err(PortError::from)
             }

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use gang_spi::SchemaTooNew;
+use gang_spi::SchemaMismatch;
 use tokio_postgres::error::SqlState;
 
 /// Why a `PostgreSQL` operation failed.
@@ -25,9 +25,9 @@ pub enum PostgresError {
     /// The server rejected a statement in a way that trying again will not fix.
     #[error("postgresql statement failed")]
     Query(#[source] tokio_postgres::Error),
-    /// The stored schema is newer than this binary can use.
+    /// The stored schema differs from the supported version.
     #[error("database schema cannot be used")]
-    Schema(#[from] SchemaTooNew),
+    Schema(#[from] SchemaMismatch),
     /// A stored value is not valid for its column.
     #[error("column {column} holds an invalid value: {detail}")]
     Corrupt {

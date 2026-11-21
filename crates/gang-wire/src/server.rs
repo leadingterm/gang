@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use gang_types::{ActionEnvironment, CertificatePem, ProviderName, Url};
+use gang_types::{CertificatePem, ProviderName, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -42,8 +42,6 @@ pub struct Server<Login> {
     ///
     /// The client writes it into the Bazel default execution properties as `ISA=<default_isa>`.
     pub default_isa: Isa,
-    /// Action environment of the first launchable fleet for the default ISA.
-    pub action_environment: ActionEnvironment,
     /// Version of the Gang server, for display; omitted by servers that predate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
@@ -133,7 +131,6 @@ mod tests {
             "remoteCache": "grpcs://gang.example.com:443",
             "caCertificate": "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----",
             "defaultIsa": "x86-64",
-            "actionEnvironment": "host:test",
             "authentication": authentication,
         })
     }
@@ -257,14 +254,11 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_invalid_action_environment_is_rejected() {
+    fn legacy_action_environment_is_ignored() {
         let mut value = server_value(&json!({"none": {}}));
-        value
-            .as_object_mut()
-            .expect("server is an object")
-            .remove("actionEnvironment");
-        assert!(serde_json::from_value::<Server<Value>>(value.clone()).is_err());
-        value["actionEnvironment"] = json!("identity-roots-v1");
-        assert!(serde_json::from_value::<Server<Value>>(value).is_err());
+        value["actionEnvironment"] = json!("legacy");
+        let server: Server<Value> = serde_json::from_value(value).expect("server parses");
+        let serialized = serde_json::to_value(server).expect("server serializes");
+        assert!(serialized.get("actionEnvironment").is_none());
     }
 }

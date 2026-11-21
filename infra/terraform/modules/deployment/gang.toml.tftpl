@@ -143,11 +143,8 @@ renew_interval = ${jsonencode("${leadership_renew_interval_seconds}s")}
 call_timeout = ${jsonencode("${leadership_call_timeout_seconds}s")}
 
 %{ endif ~}
-%{ if proxy_protocol_mode != "off" ~}
+%{ if proxy_protocol_enabled ~}
 [server.proxy_protocol]
-public = ${jsonencode(proxy_protocol_mode)}
-worker = ${jsonencode(proxy_protocol_mode)}
-health = ${jsonencode(proxy_protocol_mode)}
 trusted_cidrs = ${jsonencode(proxy_trusted_cidrs)}
 
 %{ endif ~}

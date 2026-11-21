@@ -70,30 +70,6 @@ fn write_count(harness: &Harness) -> usize {
 }
 
 #[tokio::test]
-async fn stale_environment_is_terminated_instead_of_parked() -> TestResult {
-    let harness = Harness::start().await?;
-    harness.add_group_with(reuse_group(1, &[("i-1", "InService", true)], true));
-    let test_fleet = fleet(FLEET)?;
-    gang_testkit::fence::with_held(async |held| {
-        harness
-            .fleets
-            .terminate(
-                held,
-                test_fleet.view(),
-                &id("i-1").expect("valid instance"),
-                gang_spi::RetirementReason::StaleEnvironment,
-            )
-            .await
-    })
-    .await?;
-    assert_eq!(harness.requests(TERMINATE), 1);
-    assert_eq!(harness.requests(SET_DESIRED), 0);
-    assert!(harness.warm_ids(FLEET).is_empty());
-    assert!(harness.instance_ids(FLEET).is_empty());
-    Ok(())
-}
-
-#[tokio::test]
 async fn idle_retirement_discards_old_launch_generation_but_parks_current() -> TestResult {
     for kind in [FakeTemplateKind::Direct, FakeTemplateKind::Mixed] {
         for stale in [false, true] {
@@ -108,12 +84,7 @@ async fn idle_retirement_discards_old_launch_generation_but_parks_current() -> T
             gang_testkit::fence::with_held(async |held| {
                 harness
                     .fleets
-                    .terminate(
-                        held,
-                        test_fleet.view(),
-                        &id("i-1").expect("valid instance"),
-                        gang_spi::RetirementReason::Idle,
-                    )
+                    .terminate(held, test_fleet.view(), &id("i-1").expect("valid instance"))
                     .await
             })
             .await?;
@@ -146,7 +117,6 @@ async fn plain_group_terminates_with_one_atomic_decrement() -> TestResult {
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
-                gang_spi::RetirementReason::Idle,
             )
             .await
     })
@@ -229,7 +199,6 @@ async fn supply_reports_max_of_desired_and_live_while_released_member_remains() 
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
-                gang_spi::RetirementReason::Idle,
             )
             .await
     })
@@ -302,7 +271,6 @@ async fn release_unprotects_then_lowers_and_the_fake_moves_the_instance_to_the_p
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
-                gang_spi::RetirementReason::Idle,
             )
             .await
     })
@@ -327,12 +295,7 @@ async fn an_expired_permission_releases_nothing_to_the_warm_pool() -> TestResult
     let result = gang_testkit::fence::with_expired_held(async |held| {
         harness
             .fleets
-            .terminate(
-                held,
-                test_fleet.view(),
-                &instance,
-                gang_spi::RetirementReason::Idle,
-            )
+            .terminate(held, test_fleet.view(), &instance)
             .await
     })
     .await;
@@ -367,12 +330,7 @@ async fn a_permission_lapsing_between_two_writes_stops_the_second() -> TestResul
         .run(async |held| {
             harness
                 .fleets
-                .terminate(
-                    held,
-                    test_fleet.view(),
-                    &instance,
-                    gang_spi::RetirementReason::Idle,
-                )
+                .terminate(held, test_fleet.view(), &instance)
                 .await
         })
         .await;
@@ -408,7 +366,6 @@ async fn releasing_the_same_instance_twice_lowers_capacity_once() -> TestResult 
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
-                gang_spi::RetirementReason::Idle,
             )
             .await
     })
@@ -422,7 +379,6 @@ async fn releasing_the_same_instance_twice_lowers_capacity_once() -> TestResult 
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
-                gang_spi::RetirementReason::Idle,
             )
             .await
     })
@@ -455,7 +411,6 @@ async fn crash_after_unprotect_before_lowering_completes_with_one_lowering() -> 
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
-                gang_spi::RetirementReason::Idle,
             )
             .await
     })
@@ -474,7 +429,6 @@ async fn crash_after_unprotect_before_lowering_completes_with_one_lowering() -> 
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
-                gang_spi::RetirementReason::Idle,
             )
             .await
     })
@@ -507,7 +461,6 @@ async fn crash_after_lowering_before_removal_writes_nothing_on_retry() -> TestRe
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
-                gang_spi::RetirementReason::Idle,
             )
             .await
     })
@@ -539,7 +492,6 @@ async fn second_release_lost_to_a_failed_lowering_completes_on_retry() -> TestRe
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
-                gang_spi::RetirementReason::Idle,
             )
             .await
     })
@@ -553,7 +505,6 @@ async fn second_release_lost_to_a_failed_lowering_completes_on_retry() -> TestRe
                 held,
                 test_fleet.view(),
                 &id("i-2").expect("test value is valid"),
-                gang_spi::RetirementReason::Idle,
             )
             .await
     })
@@ -570,7 +521,6 @@ async fn second_release_lost_to_a_failed_lowering_completes_on_retry() -> TestRe
                 held,
                 test_fleet.view(),
                 &id("i-2").expect("test value is valid"),
-                gang_spi::RetirementReason::Idle,
             )
             .await
     })
@@ -606,7 +556,6 @@ async fn in_flight_scale_out_is_kept_when_releasing_one_member() -> TestResult {
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
-                gang_spi::RetirementReason::Idle,
             )
             .await
     })
@@ -637,7 +586,6 @@ async fn reuse_without_protection_is_a_config_error_with_no_writes() -> TestResu
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
-                gang_spi::RetirementReason::Idle,
             )
             .await
     })
@@ -671,7 +619,6 @@ async fn reuse_flag_false_terminates_atomically() -> TestResult {
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
-                gang_spi::RetirementReason::Idle,
             )
             .await
     })
@@ -705,7 +652,6 @@ async fn pending_member_terminates_atomically_even_in_a_reuse_group() -> TestRes
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
-                gang_spi::RetirementReason::Idle,
             )
             .await
     })
@@ -736,7 +682,6 @@ async fn warmed_member_is_already_leaving_so_terminate_writes_nothing() -> TestR
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
-                gang_spi::RetirementReason::Idle,
             )
             .await
     })
@@ -811,7 +756,6 @@ async fn honored_cooldown_applies_to_raises_and_release_lowerings() -> TestResul
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
-                gang_spi::RetirementReason::Idle,
             )
             .await
     })
@@ -851,7 +795,6 @@ async fn release_is_refused_while_a_pre_existing_unprotected_member_would_enter_
                 held,
                 test_fleet.view(),
                 &id("i-2").expect("test value is valid"),
-                gang_spi::RetirementReason::Idle,
             )
             .await
     })
@@ -891,7 +834,6 @@ async fn release_proceeds_once_desired_is_already_lowered_below_live() -> TestRe
                 held,
                 test_fleet.view(),
                 &id("i-2").expect("test value is valid"),
-                gang_spi::RetirementReason::Idle,
             )
             .await
     })

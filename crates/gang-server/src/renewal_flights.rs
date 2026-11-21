@@ -534,7 +534,7 @@ mod tests {
         let host = &first.core.host;
         let second = crate::core::Core::<crate::test_support_deployment::TlsDeployment>::new(
             crate::host::Host {
-                proxy_protocol: std::sync::Arc::clone(&host.proxy_protocol),
+                proxy_protocol: host.proxy_protocol.clone(),
                 repository: host.repository.clone(),
                 signer: std::sync::Arc::clone(&host.signer),
                 security: crate::security::Security::Plaintext,

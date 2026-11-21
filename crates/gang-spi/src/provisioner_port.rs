@@ -9,15 +9,6 @@ use gang_types::{Fleet, InstanceId, InstanceLifecycle, Url, WorkerLifetime};
 
 use crate::{Held, InfrastructureEvent, PortError, port};
 
-/// Whether a retired instance may be reused by the provisioner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RetirementReason {
-    /// Ordinary idle scale-in may retain an instance in a standby pool.
-    Idle,
-    /// An obsolete action environment must never return to service.
-    StaleEnvironment,
-}
-
 /// The worker fleets, on the compute backend that runs the instances.
 ///
 /// A method that changes anything takes a [`Held`], the fence's permission: reads take none, so
@@ -131,11 +122,9 @@ pub trait ProvisionerPort: Send + Sync {
         desired: u32,
     ) -> Result<(), PortError>;
 
-    /// Removes one instance from the fleet and lowers the desired capacity with it. Only an
-    /// [`RetirementReason::Idle`] instance may be retained in a standby pool; a stale
-    /// environment must be destroyed. `Ok` when the instance is already gone, so a repeated
-    /// call is harmless. A
-    /// [`Pending`](InstanceLifecycle::Pending) instance is cancelled.
+    /// Removes one instance from the fleet and lowers the desired capacity with it. The instance
+    /// may be retained in a standby pool. `Ok` when the instance is already gone, so a repeated
+    /// call is harmless. A [`Pending`](InstanceLifecycle::Pending) instance is cancelled.
     /// Terminating an instance that is not a member of the fleet (it never existed, is already
     /// gone, or belongs to another fleet) is Ok and changes nothing.
     ///
@@ -147,7 +136,6 @@ pub trait ProvisionerPort: Send + Sync {
         held: &Held,
         fleet: Fleet<'_, Self::FleetOptions>,
         instance: &InstanceId,
-        reason: RetirementReason,
     ) -> Result<(), PortError>;
 
     /// Whether the workers it starts serve many actions or exactly one. Does no I/O. A

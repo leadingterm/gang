@@ -84,18 +84,6 @@ pub fn render(
         "build --remote_default_exec_properties={}",
         quote(&format!("{}={}", property::ISA, info.default_isa))
     ));
-    lines.push(format!(
-        "common --repo_env=GANG_ACTION_ENVIRONMENT={}",
-        quote(info.action_environment.as_str())
-    ));
-    lines.push(format!(
-        "build --remote_default_exec_properties={}",
-        quote(&format!(
-            "{}={}",
-            property::ACTION_ENVIRONMENT,
-            info.action_environment
-        ))
-    ));
     if info.ca_certificate.is_some() {
         lines.push(format!("build --tls_certificate={}", quote(certificate)));
     }
@@ -154,7 +142,6 @@ mod tests {
             ca_certificate: ca_certificate
                 .map(|text| CertificatePem::try_new(text).expect("valid certificate")),
             default_isa: Isa::X86_64,
-            action_environment: "host:test".parse().expect("valid test environment"),
             version: None,
             authentication,
         }
@@ -168,15 +155,13 @@ mod tests {
     }
 
     #[test]
-    fn both_writers_use_the_server_environment() {
-        let mut server = info(Authentication::None(NoAuthentication {}), None);
-        server.action_environment = "host:alternate".parse().expect("valid test environment");
+    fn neither_writer_renders_environment_flags() {
+        let server = info(Authentication::None(NoAuthentication {}), None);
         for writer in [BazelrcWriter::Setup, BazelrcWriter::Bazelrc] {
             let rc = render(&server, "gang.example.test", "gang", CA_FILE_NAME, writer);
-            assert!(rc.contains("common --repo_env=GANG_ACTION_ENVIRONMENT=host:alternate\n"));
-            assert!(rc.contains(
-                "build --remote_default_exec_properties=gang_action_environment=host:alternate\n"
-            ));
+            assert!(!rc.contains("--repo_env="));
+            assert!(!rc.contains("gang_action_environment"));
+            assert!(!rc.contains("gang_execution_environment"));
         }
     }
 
@@ -218,8 +203,6 @@ mod tests {
             "build --remote_cache=grpcs://cache.example.test:443",
             "build --credential_helper=gang.example.test=/usr/local/bin/gang",
             "build --remote_default_exec_properties=ISA=x86-64",
-            "common --repo_env=GANG_ACTION_ENVIRONMENT=host:test",
-            "build --remote_default_exec_properties=gang_action_environment=host:test",
             "build --tls_certificate=gang-ca.pem",
         ] {
             assert!(
@@ -320,9 +303,6 @@ mod tests {
         assert!(rendered.contains("build --remote_executor=grpcs://exec.example.test:443\n"));
         assert!(rendered.contains("build --remote_cache=grpcs://cache.example.test:443\n"));
         assert!(rendered.contains("build --remote_default_exec_properties=ISA=x86-64\n"));
-        assert!(rendered.contains(
-            "build --remote_default_exec_properties=gang_action_environment=host:test\n"
-        ));
         assert!(!rendered.contains("--credential_helper"));
         assert!(!rendered.contains("--tls_certificate"));
     }

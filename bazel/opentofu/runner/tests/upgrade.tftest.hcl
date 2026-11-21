@@ -2,6 +2,9 @@ mock_provider "aws" {
   mock_data "aws_partition" {
     defaults = { partition = "aws" }
   }
+  mock_data "aws_caller_identity" {
+    defaults = { account_id = "000000000000" }
+  }
   mock_data "aws_region" {
     defaults = { region = "eu-north-1" }
   }
@@ -46,7 +49,7 @@ mock_provider "aws" {
   }
   mock_resource "aws_ssm_parameter" {
     defaults = {
-      arn     = "arn:aws:ssm:eu-north-1:000000000000:parameter/gang/gang.toml/generations/33333333-3333-4333-8333-333333333333"
+      arn     = "arn:aws:ssm:eu-north-1:000000000000:parameter/gang/gang.toml"
       version = 1
     }
   }
@@ -113,14 +116,6 @@ override_data {
   values = { json = "{}" }
 }
 
-override_resource {
-  target = aws_ssm_parameter.config
-  values = {
-    arn     = "arn:aws:ssm:eu-north-1:000000000000:parameter/gang/gang.toml"
-    version = 1
-  }
-}
-
 variables {
   client_token_providers    = ["google", "github-actions"]
   region                   = "eu-north-1"
@@ -183,6 +178,6 @@ run "retention" {
     gang_settings = { poll_interval = "50ms" }
   }
   plan_options {
-    replace = [aws_ssm_parameter.config]
+    replace = [aws_ssm_parameter.config_generation]
   }
 }

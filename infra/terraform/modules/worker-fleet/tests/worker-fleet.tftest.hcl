@@ -59,7 +59,7 @@ variables {
     "eu-north-1b" = "subnet-0000000000000002"
   }
   config_parameter_reference = "/gang/gang.toml/generations/example:1"
-  config_parameter_arns      = ["arn:aws:ssm:eu-north-1:000000000000:parameter/gang/gang.toml", "arn:aws:ssm:eu-north-1:000000000000:parameter/gang/gang.toml/generations/*"]
+  config_parameter_arns      = ["arn:aws:ssm:eu-north-1:000000000000:parameter/gang/gang.toml/generations/*"]
   fleet_tag_key              = "gang-fleet"
 
   fleets = [
@@ -105,6 +105,11 @@ run "one_spot_asg_per_fleet" {
       && aws_autoscaling_group.this[fleet.name].desired_capacity == 0
     ])
     error_message = "Each fleet must scale from 0 up to max_instances, with desired capacity owned by the controller."
+  }
+
+  assert {
+    condition     = alltrue([for group in aws_autoscaling_group.this : length(group.instance_refresh) == 0])
+    error_message = "Worker launch-template updates must leave retirement to the controller, not start an ASG instance refresh."
   }
 
   assert {
@@ -570,6 +575,11 @@ run "on_demand_fleet_keeps_instance_type_order_as_priority" {
     condition     = aws_autoscaling_group.this["gang-worker-ondemand"].mixed_instances_policy[0].instances_distribution[0].on_demand_allocation_strategy == "prioritized" && aws_autoscaling_group.this["gang-worker-ondemand"].mixed_instances_policy[0].instances_distribution[0].on_demand_percentage_above_base_capacity == 100
     error_message = "instance_types order is the on-demand priority: an on-demand fleet must use the prioritized allocation strategy with 100% on-demand capacity."
   }
+
+  assert {
+    condition     = alltrue([for group in aws_autoscaling_group.this : length(group.instance_refresh) == 0])
+    error_message = "On-demand worker rollouts must leave retirement to the controller, not start an ASG instance refresh."
+  }
 }
 
 run "rejects_duplicate_instance_types" {
@@ -666,6 +676,10 @@ run "fallback_fleet_plans_spot_group_and_on_demand_twin" {
     error_message = "Both groups of a fallback fleet must be protected from scale-in."
   }
   assert {
+    condition     = alltrue([for group in aws_autoscaling_group.this : length(group.instance_refresh) == 0])
+    error_message = "Neither group of a fallback fleet may replace workers through ASG instance refresh."
+  }
+  assert {
     condition     = length(aws_autoscaling_group.this["gang-worker-x86-64"].warm_pool) == 0 && length(aws_autoscaling_group.this["gang-worker-x86-64-on-demand"].warm_pool) == 0
     error_message = "A fallback fleet without warm_pool_size must plan no warm pool."
   }
@@ -697,6 +711,10 @@ run "on_demand_fleet_warm_pool_is_stopped_and_reused" {
     condition     = aws_autoscaling_group.this["gang-worker-x86-64"].force_delete_warm_pool && aws_autoscaling_group.this["gang-worker-x86-64"].protect_from_scale_in
     error_message = "A group with a warm pool must force-delete its pool and be protected from scale-in."
   }
+  assert {
+    condition     = alltrue([for group in aws_autoscaling_group.this : length(group.instance_refresh) == 0])
+    error_message = "Warm-pool worker rollouts must leave retirement to the controller, not start an ASG instance refresh."
+  }
 }
 
 run "fallback_fleet_warm_pool_sits_on_the_on_demand_twin" {
@@ -721,6 +739,10 @@ run "fallback_fleet_warm_pool_sits_on_the_on_demand_twin" {
   assert {
     condition     = length(aws_autoscaling_group.this["gang-worker-x86-64-on-demand"].warm_pool) == 1 && aws_autoscaling_group.this["gang-worker-x86-64-on-demand"].warm_pool[0].min_size == 1 && aws_autoscaling_group.this["gang-worker-x86-64-on-demand"].force_delete_warm_pool
     error_message = "The on-demand twin must carry the fleet's warm pool."
+  }
+  assert {
+    condition     = alltrue([for group in aws_autoscaling_group.this : length(group.instance_refresh) == 0])
+    error_message = "Neither the fallback group nor its warm-pool twin may replace workers through ASG instance refresh."
   }
 }
 

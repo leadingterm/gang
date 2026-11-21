@@ -22,11 +22,11 @@ mod config;
 mod errors;
 mod expiring;
 mod lease;
-mod migrations;
 mod repository;
+mod schema;
 mod store;
 
 pub use config::{JournalMode, SqliteConfig, Synchronous};
 pub use errors::SqliteError;
-pub use migrations::SCHEMA_VERSION;
+pub use schema::SCHEMA_VERSION;
 pub use store::Sqlite;

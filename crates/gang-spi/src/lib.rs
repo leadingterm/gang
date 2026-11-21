@@ -103,8 +103,8 @@ pub use observation_port::{
 pub use plugin::{Plugin, PluginContext, SandboxPrograms};
 pub use private::__private;
 pub use provisioner_port::{
-    FleetInstance, FleetSupply, InstanceExit, LaunchFailure, ProvisionerPort, RetirementReason,
-    ServerEndpoints, Sidecar,
+    FleetInstance, FleetSupply, InstanceExit, LaunchFailure, ProvisionerPort, ServerEndpoints,
+    Sidecar,
 };
 pub use repository_port::{
     CertStatus, IssuedCertRecord, PrincipalRecord, RecordedScalingEvent, RevocationEpoch,
@@ -118,7 +118,7 @@ pub use scheduler_port::{
     RequestGate, RequestScope, RunningActionView, SchedulerPort, SchedulerSnapshot, Slots,
     StoreAccess, StoreKind, WorkerSpec, WorkerState, WorkerTls, full_body,
 };
-pub use schema::{SchemaPlan, SchemaTooNew, SchemaVersion};
+pub use schema::SchemaMismatch;
 pub use scratch_port::{MountedScratchVolume, ScratchVolumePort};
 pub use signer_port::{CertificateSignerPort, SignatureAlgorithm};
 pub use stored_scaling::{StoredScalingKind, StoredScalingKindError};

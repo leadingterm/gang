@@ -162,7 +162,7 @@ mod tests {
 
     #[test]
     fn render_comment_reports_that_merging_applies_the_saved_plan_when_there_are_changes() {
-        let body = render(&fixture("parameter-value"));
+        let body = render(&fixture("created"));
         assert!(body.contains(
             "\n\nPlan has changes. Merging this pull request applies this exact saved plan.\n\n"
         ));
@@ -191,7 +191,7 @@ mod tests {
             kms_create(),
             resource(
                 "aws_ssm_parameter",
-                "module.gang.aws_ssm_parameter.config",
+                "module.gang.aws_ssm_parameter.config_generation",
                 &["update"],
             ),
             resource("aws_instance", "aws_instance.worker", &["delete"]),
@@ -210,7 +210,7 @@ mod tests {
                  Changed resources:\n\n\
                  - `aws_kms_key.state` (create)\n\
                  - `aws_kms_key.state` (create)\n\
-                 - `module.gang.aws_ssm_parameter.config` (update)\n\
+                 - `module.gang.aws_ssm_parameter.config_generation` (update)\n\
                  - `aws_instance.worker` (delete)\n\
                  - `aws_kms_key.state` (delete, create)\n\n"
             )
@@ -223,7 +223,7 @@ mod tests {
             .map(|index| {
                 resource(
                     "aws_ssm_parameter",
-                    &format!("module.gang.aws_ssm_parameter.config[{index}]"),
+                    &format!("module.gang.aws_ssm_parameter.config_generation[{index}]"),
                     &["update"],
                 )
             })
@@ -236,10 +236,10 @@ mod tests {
         assert_eq!(listed.len(), 200);
         assert_eq!(
             listed.last().copied(),
-            Some("- `module.gang.aws_ssm_parameter.config[200]` (update)")
+            Some("- `module.gang.aws_ssm_parameter.config_generation[200]` (update)")
         );
-        assert!(body.contains("config[200]` (update)\n- ... and 5 more\n\n"));
-        assert!(!body.contains("config[201]"));
+        assert!(body.contains("config_generation[200]` (update)\n- ... and 5 more\n\n"));
+        assert!(!body.contains("config_generation[201]"));
         assert!(body.contains("| update | 205 |"));
     }
 
@@ -271,10 +271,6 @@ mod tests {
             (
                 "blocked",
                 include_str!("../tests/fixtures/blocked-comment.md"),
-            ),
-            (
-                "parameter-unknown",
-                include_str!("../tests/fixtures/parameter-unknown-comment.md"),
             ),
             ("no-op", include_str!("../tests/fixtures/no-op-comment.md")),
         ] {
