@@ -82,6 +82,44 @@ fn assert_server_rejects(rewrite: impl FnOnce(&str) -> String) -> TestResult {
     Ok(())
 }
 
+#[test]
+fn config_check_rejects_invalid_action_environment_names() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let original = std::fs::read_to_string(checked_in_config("gang.local.toml")?)?;
+    let config = dir.path().join("gang.toml");
+    for environment in [
+        "debian/1/ac/content".to_owned(),
+        "debian/1/2".to_owned(),
+        String::new(),
+        "/1".to_owned(),
+        "debian/".to_owned(),
+        "./1".to_owned(),
+        "../1".to_owned(),
+        "debian/.".to_owned(),
+        "debian/..".to_owned(),
+        format!("{}/1", "a".repeat(65)),
+        format!("debian/{}", "1".repeat(65)),
+    ] {
+        std::fs::write(
+            &config,
+            format!("{original}\n[actions]\nenvironment = \"{environment}\"\n"),
+        )?;
+        let out = output_within(
+            gang_command(dir.path())?
+                .args(["config", "check"])
+                .arg(&config),
+            CHILD_LIMIT,
+        )?;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{environment}: {stderr}");
+        assert!(
+            stderr.contains("environment must be"),
+            "{environment}: {stderr}"
+        );
+    }
+    Ok(())
+}
+
 /// Turns the loopback listener of `gang.local.toml` into a public one and
 /// drops its endpoint.
 fn public_listen_without_endpoint(text: &str) -> String {

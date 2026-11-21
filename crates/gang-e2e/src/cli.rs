@@ -77,6 +77,7 @@ pub enum Call {
         server: Url,
     },
     /// `gang doctor --server <server> --bazel <fake Bazel> -- --remote_executor=<executor>`.
+    /// Only the executor flag is forwarded; no client action-environment identity is needed.
     Doctor {
         /// The server.
         server: Url,

@@ -136,7 +136,7 @@ time_zone = "Europe/Paris"
 
 ## Action capabilities
 
-Actions have no network grant by default. Unknown platform properties (except the harmless `supports-workers` marker), network requests without an eligible fleet grant, and requests exceeding action ceilings are rejected at admission. To grant public egress, extend an existing `bwrap` fleet in `gang.toml`:
+Actions have no network grant by default. Unknown platform properties (except the harmless `supports-workers` marker and legacy request cache label `gang_action_environment`), network requests without an eligible fleet grant, and requests exceeding action ceilings are rejected at admission. Workers register their operational `ActionEnvironment` as `gang_action_environment`, ignored by matching. To grant public egress, extend an existing `bwrap` fleet in `gang.toml`:
 
 ```toml
 [fleets.actions]
