@@ -12,8 +12,8 @@ use gang_reconciler::{
     Action, FleetPass, HostedSnapshot, PassTime, Plan, PlanStep, Reconciler, SourceProfiles,
 };
 use gang_spi::{
-    ExpiringRecordPort, Fence, FleetInfrastructureEvent, InfrastructureEventKind, Insert,
-    LeaseLapsed, PortError, ProvisionerPort, Record, RecordId, RecordKey, RecordKind,
+    ExpiringRecordPort, Fence, FleetInfrastructureEvent, FleetSupply, InfrastructureEventKind,
+    Insert, LeaseLapsed, PortError, ProvisionerPort, Record, RecordId, RecordKey, RecordKind,
     RecordVersion, RecordedScalingEvent, RunError, ScalingAuditEvent, ScalingEventKind,
     SchedulerPort, SchedulerSnapshot, StateRepositoryPort, Subject, WorkerState,
 };
@@ -263,9 +263,7 @@ where
         Ok(time)
     }
 
-    /// Publishes the state of a finished pass when a publisher is set. A completed pass
-    /// publishes its indexed snapshot and fleets with their supplies and outlooks. A skipped
-    /// pass publishes only the skip.
+    /// Publishes finished pass metadata and outlook, or the skip reason.
     fn publish(&mut self, wall: Timestamp, outcome: &PassOutcome) {
         let Some(publisher) = self.publisher.as_mut() else {
             return;
@@ -277,7 +275,6 @@ where
                     PassStatus::Ok {
                         applied: *applied,
                         failed: *failed,
-                        hosted: &self.hosted,
                     },
                     &self.passes,
                     self.fleets.catalog(),
@@ -296,9 +293,82 @@ where
         }
     }
 
-    /// Runs a pass at once, then one every `poll_interval` on the injected clock, forever. A pass
-    /// that overruns the interval delays the next one rather than running passes back to back.
+    /// Runs passes and, when enabled, independent dashboard observations for this term.
     pub(crate) async fn run(mut self) -> Infallible {
+        let publisher = self.publisher.clone();
+        let fleets = self.fleets;
+        let provisioner = self.provisioner;
+        let scheduler = self.scheduler;
+        let clock = self.clock;
+        let poll_interval = self.poll_interval;
+        if let Some(mut publisher) = publisher {
+            let observations = async move {
+                let configs: Vec<_> = fleets.iter().collect();
+                let mut passes: Vec<_> = configs
+                    .iter()
+                    .map(|config| FleetPass::new(config.policy.clone()))
+                    .collect();
+                let mut incoming_supplies: Vec<_> =
+                    configs.iter().map(|_| FleetSupply::default()).collect();
+                let mut supplies = vec![false; configs.len()];
+                let mut hosted = HostedSnapshot::default();
+                let mut incoming = SchedulerSnapshot::default();
+                let mut ticks = Interval::new(clock, clock.monotonic(), poll_interval);
+                loop {
+                    ticks.tick().await;
+                    let deadline = clock.monotonic() + poll_interval.get();
+                    let read_scheduler =
+                        clock.timeout_at(deadline, scheduler.snapshot(&mut incoming));
+                    let read_supplies = async {
+                        for (((config, pass), scratch), fresh) in configs
+                            .iter()
+                            .zip(&mut passes)
+                            .zip(&mut incoming_supplies)
+                            .zip(&mut supplies)
+                        {
+                            *fresh = matches!(
+                                clock
+                                    .timeout_at(
+                                        deadline,
+                                        provisioner.supply(config.fleet(), &mut *scratch),
+                                    )
+                                    .await,
+                                Ok(Ok(()))
+                            );
+                            if *fresh {
+                                std::mem::swap(&mut pass.supply, scratch);
+                            }
+                        }
+                    };
+                    let (snapshot, ()) = tokio::join!(read_scheduler, read_supplies);
+                    let known = matches!(snapshot, Ok(Ok(())));
+                    if known {
+                        hosted.replace(&mut incoming);
+                    }
+                    publisher.publish(
+                        clock.wall(),
+                        PassStatus::Observed {
+                            hosted: known.then_some(&hosted),
+                            supplies: &supplies,
+                        },
+                        &passes,
+                        fleets.catalog(),
+                        &[],
+                    );
+                }
+            };
+            tokio::select! {
+                biased;
+                never = self.run_passes() => never,
+                never = observations => never,
+            }
+        } else {
+            self.run_passes().await
+        }
+    }
+
+    /// A pass that overruns the interval delays the next one rather than running back to back.
+    async fn run_passes(&mut self) -> Infallible {
         let mut ticks = Interval::new(self.clock, self.clock.monotonic(), self.poll_interval);
         loop {
             ticks.tick().await;

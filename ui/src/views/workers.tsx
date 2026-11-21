@@ -2,8 +2,8 @@
 // instances without a worker sit under their fleet as counts.
 import { useState } from "preact/hooks";
 import { idOf, ms, type UnixMs } from "../wire-parse.ts";
-import type { Fleet, InfrastructureStatus, Instance, Phase, State, Worker } from "../wire.ts";
-import { windowMs } from "../recent.ts";
+import type { Fleet, InfrastructureStatus, Instance, Phase, Recent, State, Worker } from "../wire.ts";
+import { schedulerCurrent, schedulerKnown, stepMs, windowMs } from "../recent.ts";
 import { sum, workerInstance } from "../format.ts";
 import { Cell, Clock, Disclosure, Duration, Empty, FleetFilter, Ident, Row, Section, Since, Table, Target, useClient, useNowStep } from "../ui.tsx";
 import { AsOf } from "./actions.tsx";
@@ -42,11 +42,16 @@ export const laneSegments = (w: Worker, now: UnixMs, window: number): readonly L
     .filter((s) => s.to > s.from);
 };
 
-const Lane = ({ w, now, window }: { w: Worker; now: UnixMs; window: number }) => {
+const Lane = ({ w, now, recent }: { w: Worker; now: UnixMs; recent: Recent }) => {
+  const window = windowMs(recent);
   const start = now - window;
   const segments = laneSegments(w, now, window);
+  const unknown = (recent.samples ?? []).filter((s) => !schedulerKnown(s)).map((s) => ({
+    from: Math.max(start, ms(s.start), ms(w.launchTime)),
+    to: Math.min(now, ms(s.start) + stepMs(recent)),
+  })).filter((s) => s.to > s.from);
   return (
-    <div class="lane" role="img" aria-label={`Phase history: ${segments.map((s) => s.phase.toLowerCase()).join(", ")}`}>
+    <div class="lane" role="img" aria-label={`Phase history: ${segments.map((s) => s.phase.toLowerCase()).join(", ")}${unknown.length ? ", scheduler unknown" : ""}`}>
       {segments.map((s) => (
         <i
           key={`${s.phase}-${s.from}`}
@@ -56,6 +61,12 @@ const Lane = ({ w, now, window }: { w: Worker; now: UnixMs; window: number }) =>
             "--w": String(((s.to - s.from) / window).toFixed(4)),
           }}
         />
+      ))}
+      {unknown.map((s) => (
+        <i key={s.from} class="lane__seg lane__seg--unrecorded" title="scheduler unknown" style={{
+          "--x": String(((s.from - start) / window).toFixed(4)),
+          "--w": String(((s.to - s.from) / window).toFixed(4)),
+        }} />
       ))}
     </div>
   );
@@ -105,7 +116,7 @@ export const WorkerDetail = ({ w, state }: { w: Worker; state: State }) => {
         </dd>
         <dt>slots</dt>
         <dd class="mono">
-          {w.running}/{w.slots ?? "?"}
+          {schedulerCurrent(state.recent) ? `${w.running}/${w.slots ?? "?"}` : "unknown"}
         </dd>
         {w.infrastructure && <><dt>infrastructure</dt><dd><Infrastructure status={w.infrastructure} /></dd></>}
       </dl>
@@ -149,7 +160,8 @@ export const WorkerDetail = ({ w, state }: { w: Worker; state: State }) => {
 const WorkerRow = ({ w, state, now }: { w: Worker; state: State; now: UnixMs }) => {
   const id = idOf(w.name);
   const instance = workerInstance(id);
-  const phase = w.phase.toLowerCase();
+  const known = schedulerCurrent(state.recent);
+  const phase = known ? w.phase.toLowerCase() : "unknown";
   return (
     <div class="wrow">
       <Disclosure
@@ -166,14 +178,14 @@ const WorkerRow = ({ w, state, now }: { w: Worker; state: State; now: UnixMs }) 
             </span>
             <span class={`phase phase--${phase}`}>
               <span class="phase__name">{phase}</span>
-              <span class="phase__since">
+              {known && <span class="phase__since">
                 <Since t={ms(w.phaseTime)} />
-              </span>
+              </span>}
               {w.infrastructure && <> · <Infrastructure status={w.infrastructure} /></>}
               {w.paused && <span class="paused">paused</span>}
             </span>
-            <Pips w={w} />
-            <Lane w={w} now={now} window={windowMs(state.recent)} />
+            {known ? <Pips w={w} /> : <span>unknown</span>}
+            <Lane w={w} now={now} recent={state.recent} />
           </>
         }
       >
@@ -234,7 +246,7 @@ export const Workers = () => {
     <>
       <div class="toolbar">
         <FleetFilter id="wfleet" fleets={state.fleets} value={fleet} onChange={setFleet} count={(f) => ws.filter((w) => w.fleet === f.name).length} />
-        <Tally items={fleetTotals(state.fleets, state).filter(([s]) => TALLIED[s])} />
+        {schedulerCurrent(state.recent) ? <Tally items={fleetTotals(state.fleets, state).filter(([s]) => TALLIED[s])} /> : <span>Scheduler unknown</span>}
       </div>
       <div class="wgrid">
         <div class="wgrid__axis" aria-hidden="true">

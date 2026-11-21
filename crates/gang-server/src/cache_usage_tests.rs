@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use gang_clock::{Clock, Timestamp};
 use gang_config::{BuildsConfig, DashboardConfig};
-use gang_reconciler::HostedSnapshot;
 use gang_spi::{CacheStorePort, MeasuredUsage, PortError, RenderedStoreSpec, StoreAccess, Traffic};
 use gang_state::{CacheBaseline, PassStatus};
 use gang_testkit::{FakeRepository, TestResult};
@@ -176,11 +175,9 @@ async fn published_state_carries_sink_traffic_and_the_sampled_measurement() -> T
     tokio::pin!(measuring);
     assert!(futures::poll!(&mut measuring).is_pending());
     let fleets = fleets();
-    let hosted = HostedSnapshot::default();
     let ok = || PassStatus::Ok {
         applied: 0,
         failed: 0,
-        hosted: &hosted,
     };
     publisher.publish(clock.wall(), ok(), &[], fleets.catalog(), &[]);
     sink.count(Traffic {
@@ -256,11 +253,9 @@ async fn a_promoted_publisher_samples_only_traffic_from_its_term() -> TestResult
     });
     let mut publisher = dashboard.publisher(builds, sink, baseline);
     let fleets = fleets();
-    let hosted = HostedSnapshot::default();
     let ok = || PassStatus::Ok {
         applied: 0,
         failed: 0,
-        hosted: &hosted,
     };
     publisher.publish(clock.wall(), ok(), &[], fleets.catalog(), &[]);
     let state: State = serde_json::from_slice(&dashboard.api().hub.state_json()?)?;

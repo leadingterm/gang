@@ -72,6 +72,7 @@ impl World {
 enum Outcome {
     Ok { applied: u32, failed: u32 },
     Skipped(SkipReason),
+    Observed { known: bool, supplies: Vec<bool> },
 }
 
 fn ok(applied: u32) -> Outcome {
@@ -147,13 +148,41 @@ fn fill_into(
     let catalog = FleetCatalog::try_new(world.properties.clone())?;
     let mut hosted = HostedSnapshot::default();
     hosted.replace(&mut world.snapshot.clone());
-    let pass = match outcome {
-        Outcome::Ok { applied, failed } => PassStatus::Ok {
-            applied,
-            failed,
-            hosted: &hosted,
+    let fresh = vec![true; passes.len()];
+    let empty_builds = gang_insight::Builds::new(&gang_config::BuildsConfig::default());
+    let observed = Inputs {
+        wall: ts(wall),
+        pass: PassStatus::Observed {
+            hosted: Some(&hosted),
+            supplies: &fresh,
         },
+        fleets: &passes,
+        catalog: &catalog,
+        actions: world.actions.as_ref(),
+        events: &[],
+        infrastructure: &world.infrastructure,
+        builds: world.builds.as_ref().unwrap_or(&empty_builds),
+        traffic: world.traffic,
+        measured: world.measured.as_ref(),
+        principals_epoch: 7,
+    };
+    let mut observed_state = blank();
+    let base = if matches!(&outcome, Outcome::Ok { .. }) {
+        builder.fill(&mut observed_state, prev, seq, &observed);
+        &observed_state
+    } else {
+        prev
+    };
+    let pass = match outcome {
+        Outcome::Ok { applied, failed } => PassStatus::Ok { applied, failed },
         Outcome::Skipped(reason) => PassStatus::Skipped(reason),
+        Outcome::Observed {
+            known,
+            ref supplies,
+        } => PassStatus::Observed {
+            hosted: known.then_some(&hosted),
+            supplies,
+        },
     };
     let empty_builds = gang_insight::Builds::new(&gang_config::BuildsConfig::default());
     let inputs = Inputs {
@@ -169,7 +198,7 @@ fn fill_into(
         measured: world.measured.as_ref(),
         principals_epoch: 7,
     };
-    builder.fill(cur, prev, seq, &inputs);
+    builder.fill(cur, base, seq, &inputs);
     Ok(())
 }
 
@@ -293,6 +322,7 @@ fn fleets_follow_declaration_order_and_units() -> TestResult {
         },
         FleetOutlook::default(),
     ];
+    world.snapshot.queued = vec![queued(0, fleet_set(&[0]))];
     let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
 
     let cur = fill(&mut builder, &blank(), 5, &world, 6_000, ok(2))?;
@@ -1820,23 +1850,25 @@ fn recent_samples_follow_completed_passes_and_restarts() -> TestResult {
             gang_wire::Sample {
                 start: ts(0),
                 completed: 12,
-                running: 4,
+                running: 0,
                 queued: 2,
                 passes: 3,
                 skipped: 0,
                 lookups: 0,
                 hits: 0,
+                scheduler_known: Some(true),
                 ..gang_wire::Sample::default()
             },
             gang_wire::Sample {
                 start: ts(10_000),
                 completed: 8,
-                running: 6,
+                running: 0,
                 queued: 4,
                 passes: 2,
                 skipped: 0,
                 lookups: 0,
                 hits: 0,
+                scheduler_known: Some(true),
                 ..gang_wire::Sample::default()
             },
         ]
@@ -1857,7 +1889,7 @@ fn recent_samples_follow_completed_passes_and_restarts() -> TestResult {
         .ok_or("missing skipped sample")?;
     assert_eq!(
         (sample.passes, sample.skipped, sample.running, sample.queued),
-        (2, 1, 6, 4)
+        (2, 1, 0, 4)
     );
     world.snapshot.completed = 3;
     let restarted = fill(&mut builder, &skipped, 7, &world, 24_000, ok(0))?;
@@ -1960,12 +1992,12 @@ fn cache_samples_follow_counter_deltas_skips_and_restarts() -> TestResult {
         Outcome::Skipped(SkipReason::SchedulerUnavailable),
     )?;
     let sample = skipped.recent.samples.last().ok_or("missing sample")?;
-    assert_eq!((sample.lookups, sample.hits), (0, 0));
+    assert_eq!((sample.lookups, sample.hits), (20, 13));
     world.traffic.lookups = 20;
     world.traffic.hits = 14;
     let resumed = fill(&mut builder, &skipped, 3, &world, 21_000, ok(0))?;
     let sample = resumed.recent.samples.last().ok_or("missing sample")?;
-    assert_eq!((sample.lookups, sample.hits), (10, 7));
+    assert_eq!((sample.lookups, sample.hits), (20, 14));
     world.traffic.lookups = 3;
     world.traffic.hits = 2;
     let restarted = fill(&mut builder, &resumed, 4, &world, 31_000, ok(0))?;
@@ -2088,6 +2120,268 @@ fn cache_counts(sample: &gang_wire::Sample) -> (u32, u32, u64, u64, u64) {
         sample.downloaded_bytes,
         sample.evicted_bytes,
     )
+}
+#[test]
+fn observations_sample_traffic_and_reestablish_scheduler_baselines() -> TestResult {
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let mut world = World::default();
+    world.snapshot.completed = 10;
+    world.snapshot.stores.push(EngineStore {
+        store: StoreKind::Content,
+        used: 1,
+        budget: 10,
+        evicted: 20,
+    });
+    let initial = builder.initial(ts(0), 7);
+    let first = fill(
+        &mut builder,
+        &initial,
+        1,
+        &world,
+        1_000,
+        Outcome::Observed {
+            known: true,
+            supplies: vec![],
+        },
+    )?;
+    world.traffic.lookups = 3;
+    let skipped = fill(
+        &mut builder,
+        &first,
+        2,
+        &world,
+        11_000,
+        Outcome::Skipped(SkipReason::SchedulerUnavailable),
+    )?;
+    assert_eq!(
+        skipped
+            .recent
+            .samples
+            .last()
+            .ok_or("missing sample")?
+            .lookups,
+        3
+    );
+    world.traffic.lookups = 5;
+    let unavailable = fill(
+        &mut builder,
+        &skipped,
+        3,
+        &world,
+        21_000,
+        Outcome::Observed {
+            known: false,
+            supplies: vec![],
+        },
+    )?;
+    let sample = unavailable.recent.samples.last().ok_or("missing sample")?;
+    assert_eq!((sample.lookups, sample.scheduler_known), (2, Some(false)));
+    world.snapshot.completed = 30;
+    world.snapshot.stores[0].evicted = 50;
+    let recovered = fill(
+        &mut builder,
+        &unavailable,
+        4,
+        &world,
+        31_000,
+        Outcome::Observed {
+            known: true,
+            supplies: vec![],
+        },
+    )?;
+    let sample = recovered.recent.samples.last().ok_or("missing sample")?;
+    assert_eq!(
+        (
+            sample.completed,
+            sample.evicted_bytes,
+            sample.scheduler_known
+        ),
+        (0, 0, Some(false))
+    );
+    world.snapshot.completed = 32;
+    world.snapshot.stores[0].evicted = 54;
+    let next = fill(
+        &mut builder,
+        &recovered,
+        5,
+        &world,
+        41_000,
+        Outcome::Observed {
+            known: true,
+            supplies: vec![],
+        },
+    )?;
+    let sample = next.recent.samples.last().ok_or("missing sample")?;
+    assert_eq!(
+        (
+            sample.completed,
+            sample.evicted_bytes,
+            sample.scheduler_known
+        ),
+        (2, 4, Some(true))
+    );
+    assert_eq!(next.pass, skipped.pass);
+    Ok(())
+}
+
+#[test]
+fn fresh_supply_is_projected_when_scheduler_is_unavailable() -> TestResult {
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let mut world = World::default();
+    world.policies = vec![policy("alpha", 0, 4)?, policy("beta", 0, 4)?];
+    world.properties = world
+        .policies
+        .iter()
+        .map(|policy| properties(policy, Vec::new()))
+        .collect();
+    world.supplies = vec![FleetSupply::default(), FleetSupply::default()];
+    world.supplies[1].desired = 2;
+    let initial = builder.initial(ts(0), 7);
+    let first = fill(
+        &mut builder,
+        &initial,
+        1,
+        &world,
+        1_000,
+        Outcome::Observed {
+            known: true,
+            supplies: vec![true, true],
+        },
+    )?;
+    world.supplies[0].desired = 3;
+    world.supplies[0].instances.push(fleet_instance(
+        &instance_id(1)?,
+        InstanceLifecycle::Pending,
+        0,
+    ));
+    world.supplies[0].warm = 1;
+    world.supplies[1].desired = 4;
+    let next = fill(
+        &mut builder,
+        &first,
+        2,
+        &world,
+        11_000,
+        Outcome::Observed {
+            known: false,
+            supplies: vec![true, false],
+        },
+    )?;
+    assert_eq!(
+        (next.fleets[0].desired, next.fleets[0].instances.warm),
+        (3, 1)
+    );
+    assert_eq!(next.fleets[0].instances.pending, 1);
+    assert_eq!(next.instances.len(), 1);
+    assert_eq!(next.fleets[1].desired, 2);
+    assert_eq!(
+        next.recent
+            .samples
+            .last()
+            .ok_or("missing sample")?
+            .scheduler_known,
+        Some(false)
+    );
+    Ok(())
+}
+
+#[test]
+fn delayed_control_snapshot_does_not_replace_newer_observations() -> TestResult {
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let mut world = World::default();
+    let policy = policy("alpha", 0, 4)?;
+    world.properties.push(properties(&policy, Vec::new()));
+    world.policies.push(policy);
+    let instance = instance_id(1)?;
+    world.supplies.push(FleetSupply {
+        desired: 2,
+        launch_failure: Some(gang_spi::LaunchFailure {
+            reason: "new".to_owned(),
+        }),
+        instances: vec![fleet_instance(&instance, InstanceLifecycle::InService, 0)],
+        ..FleetSupply::default()
+    });
+    world.snapshot.workers.push(worker_state(
+        &worker_on(&instance)?,
+        "alpha",
+        3,
+        false,
+        None,
+    )?);
+    world.snapshot.queued.push(queued(0, fleet_set(&[0])));
+    world.snapshot.completed = 20;
+    let initial = builder.initial(ts(0), 7);
+    let observed = fill(
+        &mut builder,
+        &initial,
+        1,
+        &world,
+        1_000,
+        Outcome::Observed {
+            known: true,
+            supplies: vec![true],
+        },
+    )?;
+    let catalog = FleetCatalog::try_new(world.properties.clone())?;
+    let mut passes = world.passes();
+    passes[0].supply.desired = 9;
+    passes[0].supply.launch_failure = Some(gang_spi::LaunchFailure {
+        reason: "old".to_owned(),
+    });
+    passes[0].supply.instances.clear();
+    let builds = gang_insight::Builds::new(&gang_config::BuildsConfig::default());
+    let inputs = Inputs {
+        wall: ts(2_000),
+        pass: PassStatus::Ok {
+            applied: 0,
+            failed: 0,
+        },
+        fleets: &passes,
+        catalog: &catalog,
+        actions: None,
+        events: &[],
+        infrastructure: &[],
+        builds: &builds,
+        traffic: Traffic::default(),
+        measured: None,
+        principals_epoch: 7,
+    };
+    let mut control = blank();
+    builder.fill(&mut control, &observed, 2, &inputs);
+    assert_eq!(control.completed, 20);
+    assert_eq!(control.fleets[0].desired, 2);
+    assert_eq!(control.fleets[0].instances.in_service, 1);
+    assert_eq!(
+        control.fleets[0]
+            .launch_failure
+            .as_ref()
+            .map(|failure| failure.reason.as_str()),
+        Some("new")
+    );
+    assert_eq!(control.fleets[0].demand.running, 3);
+    assert_eq!(control.fleets[0].demand.queued, 1);
+    assert_eq!(control.queue.total, 1);
+    world.snapshot.completed = 22;
+    let next = fill(
+        &mut builder,
+        &control,
+        3,
+        &world,
+        11_000,
+        Outcome::Observed {
+            known: true,
+            supplies: vec![true],
+        },
+    )?;
+    assert_eq!(
+        next.recent
+            .samples
+            .last()
+            .ok_or("missing sample")?
+            .completed,
+        2
+    );
+    Ok(())
 }
 
 // Catches mixing counters from different source generations after a partial decrease.
@@ -2355,7 +2649,7 @@ fn cache_skips_preserve_stores_and_latest_measurement() -> TestResult {
             sample.downloaded_bytes,
             sample.evicted_bytes
         ),
-        (0, 0, 0, 0, 0)
+        (2, 1, 20, 20, 0)
     );
     world.traffic = Traffic {
         lookups: 2,
@@ -2435,7 +2729,7 @@ fn cache_counters_bridge_skips_and_reset_sources_separately() -> TestResult {
             sample.downloaded_bytes,
             sample.evicted_bytes
         ),
-        (25, 10, 240, 204, 40)
+        (27, 11, 260, 224, 40)
     );
     world.traffic = Traffic {
         lookups: 18,

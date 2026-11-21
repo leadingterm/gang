@@ -5,11 +5,14 @@
 //! provider's latest measurement; each pass brings the fleets it ran over. Each published frame
 //! reaches the hub's viewers as a delta.
 
+use std::sync::Arc;
+
 use gang_clock::Timestamp;
 use gang_reconciler::FleetPass;
 use gang_spi::{FleetInfrastructureEvent, ObservationSink, RecordedScalingEvent};
 use gang_state::{Builder, BuilderConfig, CacheBaseline, Inputs, PassStatus};
 use gang_types::FleetCatalog;
+use parking_lot::Mutex;
 
 use crate::actions::ActionsCache;
 use crate::builds::BuildsCell;
@@ -18,9 +21,10 @@ use crate::events::wire_event;
 use crate::hub::StateHub;
 
 /// Builds the dashboard state from control passes and publishes it to a [`StateHub`].
+#[derive(Clone)]
 pub(crate) struct StatePublisher {
     hub: StateHub,
-    builder: Builder,
+    builder: Arc<Mutex<Builder>>,
     cache: ActionsCache,
     builds: BuildsCell,
     sink: ObservationSink,
@@ -43,7 +47,7 @@ impl StatePublisher {
     ) -> Self {
         Self {
             hub,
-            builder: Builder::new(config, baseline),
+            builder: Arc::new(Mutex::new(Builder::new(config, baseline))),
             cache,
             builds,
             sink,
@@ -67,7 +71,7 @@ impl StatePublisher {
         catalog: &FleetCatalog,
         infrastructure: &[FleetInfrastructureEvent],
     ) {
-        let builder = &mut self.builder;
+        let mut builder = self.builder.lock();
         let cache = &self.cache;
         let builds = &self.builds;
         let traffic = self.sink.traffic();
@@ -81,7 +85,7 @@ impl StatePublisher {
                         prev,
                         seq,
                         &Inputs {
-                            wall,
+                            wall: wall.max(prev.update_time),
                             pass,
                             fleets,
                             catalog,

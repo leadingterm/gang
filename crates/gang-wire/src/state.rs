@@ -279,6 +279,7 @@ pub struct Recent {
     ts_rs::TS,
 )]
 #[serde(rename_all = "camelCase")]
+#[ts(optional_fields)]
 pub struct Sample {
     /// Start of the step: a whole multiple of the step since the Unix epoch.
     #[serde(with = "crate::time")]
@@ -286,14 +287,18 @@ pub struct Sample {
     pub start: Timestamp,
     /// Actions that reached a terminal result during the step.
     pub completed: u32,
-    /// Actions executing at the step's latest completed pass; 0 when `passes` is 0.
+    /// Actions executing at the step's latest known scheduler observation.
     pub running: u32,
-    /// Actions queued at the step's latest completed pass; 0 when `passes` is 0.
+    /// Actions queued at the step's latest known scheduler observation.
     pub queued: u32,
     /// Control passes that completed during the step.
     pub passes: u32,
     /// Control passes skipped during the step.
     pub skipped: u32,
+    /// Scheduler availability for the step. False is sticky within a step; absent on legacy
+    /// samples, where availability is inferred from `passes > 0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_known: Option<bool>,
     /// `GetActionResult` calls answered during the step.
     pub lookups: u32,
     /// Of `lookups`, remote cache hits.
@@ -1101,6 +1106,29 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_availability_is_optional_on_the_wire() {
+        let sample = Sample::default();
+        let legacy = serde_json::to_value(sample).expect("sample serializes");
+        assert!(legacy.get("schedulerKnown").is_none());
+        assert_eq!(
+            serde_json::from_value::<Sample>(legacy)
+                .expect("legacy sample")
+                .scheduler_known,
+            None
+        );
+        let unknown = Sample {
+            scheduler_known: Some(false),
+            ..sample
+        };
+        let value = serde_json::to_value(unknown).expect("sample serializes");
+        assert_eq!(value["schedulerKnown"], false);
+        assert_eq!(
+            serde_json::from_value::<Sample>(value).expect("sample deserializes"),
+            unknown
+        );
+    }
+
+    #[test]
     fn recent_and_worker_phases_have_wire_json() {
         let start = Timestamp::from_unix_millis(0);
         let mut recent = Recent::new(Duration::from_mins(15), Duration::from_secs(10));
@@ -1117,6 +1145,7 @@ mod tests {
                 uploaded_bytes: 8,
                 downloaded_bytes: 9,
                 evicted_bytes: 10,
+                scheduler_known: None,
             };
         });
         let state = State {
