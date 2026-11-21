@@ -2989,21 +2989,22 @@ async fn healthy_observation_is_published_before_the_first_pass() -> TestResult 
     );
     let mut viewer = hub.join().expect("viewer joins");
     let control = ControlLoop::new(
-        &fleets,
-        crate::control::ControlSettings::new(
-            POLL_INTERVAL,
-            &gang_config::DashboardConfig::default(),
-        ),
-        Arc::new(gang_config::ScalingConfig::default()),
-        source_profiles(),
-        &crate::control::ControlPorts {
-            provisioner: &fleet,
-            scheduler: &scheduler,
-            repository: &repository,
-            clock: &clock,
-        },
-        gang_testkit::fence::valid_fence(),
-    )
+            &fleets,
+            crate::control::ControlSettings::new(
+                POLL_INTERVAL,
+                &gang_config::DashboardConfig::default(),
+            ),
+            Arc::new(gang_config::ScalingConfig::default()),
+            source_profiles(),
+            gang_types::nonzero_u32(2),
+            &crate::control::ControlPorts {
+                provisioner: &fleet,
+                scheduler: &scheduler,
+                repository: &repository,
+                clock: &clock,
+            },
+            gang_testkit::fence::valid_fence(),
+        )
     .with_publisher(publisher(&hub));
     let mut run = pin!(control.run());
     assert!(poll!(run.as_mut()).is_pending());
@@ -3041,21 +3042,22 @@ async fn observation_retains_last_good_supply_when_worker_disconnects() -> TestR
         .set_supply(&fleet_name(), supply_with("local-1", launched_at, 1));
     scheduler.set_snapshot(snapshot_with(vec![idle_worker(&instance, clock.wall())?]));
     let control = ControlLoop::new(
-        &fleets,
-        crate::control::ControlSettings::new(
-            POLL_INTERVAL,
-            &gang_config::DashboardConfig::default(),
-        ),
-        Arc::new(gang_config::ScalingConfig::default()),
-        source_profiles(),
-        &crate::control::ControlPorts {
-            provisioner: &fleet,
-            scheduler: &scheduler,
-            repository: &repository,
-            clock: &clock,
-        },
-        gang_testkit::fence::valid_fence(),
-    )
+            &fleets,
+            crate::control::ControlSettings::new(
+                POLL_INTERVAL,
+                &gang_config::DashboardConfig::default(),
+            ),
+            Arc::new(gang_config::ScalingConfig::default()),
+            source_profiles(),
+            gang_types::nonzero_u32(2),
+            &crate::control::ControlPorts {
+                provisioner: &fleet,
+                scheduler: &scheduler,
+                repository: &repository,
+                clock: &clock,
+            },
+            gang_testkit::fence::valid_fence(),
+        )
     .with_publisher(publisher(&hub));
     let mut run = pin!(control.run());
     assert!(poll!(run.as_mut()).is_pending());
@@ -3122,21 +3124,22 @@ async fn slow_pass_does_not_publish_a_known_zero_before_the_first_observation() 
         Ok(())
     });
     let control = ControlLoop::new(
-        &fleets,
-        crate::control::ControlSettings::new(
-            POLL_INTERVAL,
-            &gang_config::DashboardConfig::default(),
-        ),
-        Arc::new(gang_config::ScalingConfig::default()),
-        source_profiles(),
-        &crate::control::ControlPorts {
-            provisioner: &fleet,
-            scheduler: &scheduler,
-            repository: &repository,
-            clock: &clock,
-        },
-        gang_testkit::fence::valid_fence(),
-    )
+            &fleets,
+            crate::control::ControlSettings::new(
+                POLL_INTERVAL,
+                &gang_config::DashboardConfig::default(),
+            ),
+            Arc::new(gang_config::ScalingConfig::default()),
+            source_profiles(),
+            gang_types::nonzero_u32(2),
+            &crate::control::ControlPorts {
+                provisioner: &fleet,
+                scheduler: &scheduler,
+                repository: &repository,
+                clock: &clock,
+            },
+            gang_testkit::fence::valid_fence(),
+        )
     .with_publisher(publisher(&hub));
     let mut run = pin!(control.run());
     assert!(poll!(run.as_mut()).is_pending());
@@ -3208,21 +3211,22 @@ async fn observation_recovers_after_scheduler_reads_time_out() -> TestResult {
         gang_state::CacheBaseline::default(),
     );
     let control = ControlLoop::new(
-        &fleets,
-        crate::control::ControlSettings::new(
-            POLL_INTERVAL,
-            &gang_config::DashboardConfig::default(),
-        ),
-        Arc::new(gang_config::ScalingConfig::default()),
-        source_profiles(),
-        &crate::control::ControlPorts {
-            provisioner: &fleet,
-            scheduler: &scheduler,
-            repository: &repository,
-            clock: &clock,
-        },
-        gang_testkit::fence::valid_fence(),
-    )
+            &fleets,
+            crate::control::ControlSettings::new(
+                POLL_INTERVAL,
+                &gang_config::DashboardConfig::default(),
+            ),
+            Arc::new(gang_config::ScalingConfig::default()),
+            source_profiles(),
+            gang_types::nonzero_u32(2),
+            &crate::control::ControlPorts {
+                provisioner: &fleet,
+                scheduler: &scheduler,
+                repository: &repository,
+                clock: &clock,
+            },
+            gang_testkit::fence::valid_fence(),
+        )
     .with_publisher(publisher);
     let mut run = pin!(control.run());
     assert!(poll!(run.as_mut()).is_pending());
