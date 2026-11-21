@@ -84,6 +84,11 @@ variable "fleets" {
   }
 
   validation {
+    condition     = alltrue([for fleet in var.fleets : contains(["price-capacity-optimized", "capacity-optimized", "capacity-optimized-prioritized", "lowest-price"], fleet.spot_allocation_strategy)])
+    error_message = "Each fleet's spot_allocation_strategy must be price-capacity-optimized, capacity-optimized, capacity-optimized-prioritized, or lowest-price."
+  }
+
+  validation {
     condition     = alltrue([for fleet in var.fleets : length(fleet.instance_types) > 0])
     error_message = "Each fleet needs at least one instance type."
   }

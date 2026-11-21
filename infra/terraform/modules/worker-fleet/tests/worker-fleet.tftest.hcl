@@ -459,6 +459,16 @@ run "prioritized_spot_preserves_override_order_with_fallback" {
   }
 }
 
+run "rejects_invalid_spot_allocation_strategy" {
+  command = plan
+
+  variables {
+    fleets = [for fleet in var.fleets : merge(fleet, { spot_allocation_strategy = "capacity-optimised-prioritized" })]
+  }
+
+  expect_failures = [var.fleets]
+}
+
 run "rejects_bad_asg_name" {
   command = plan
 
