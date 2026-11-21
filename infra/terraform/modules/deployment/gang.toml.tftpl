@@ -90,9 +90,9 @@ bucket = ${jsonencode(cache_bucket_name)}
 region = ${jsonencode(region)}
 key_id = ${jsonencode(ca_key_alias)}
 
-%{ if database_engine != "sqlite" ~}
-
 [server.http2]
+max_connections = ${http2_max_connections}
+%{ if database_engine != "sqlite" ~}
 shutdown_grace = ${jsonencode("${shutdown_grace_seconds}s")}
 %{ endif ~}
 
