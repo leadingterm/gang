@@ -78,6 +78,7 @@ in
       upstream.wait_for_unit("dhcp-fixture.service")
       upstream.wait_for_unit("dns-fixture.service")
       client.start()
+      client.wait_for_unit("systemd-networkd.service")
       client.wait_for_unit("systemd-resolved.service")
       client.wait_until_succeeds("${pkgs.iproute2}/bin/ip -4 address show dev eth1 | ${grep} -q 'inet 192.168.77.'", timeout=timedelta(seconds=30))
       client.wait_until_succeeds("${resolvectl} dns eth1 | ${grep} -Fq '${upstreamIP}'", timeout=timedelta(seconds=30))
