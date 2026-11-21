@@ -539,6 +539,70 @@ test("worker ledger totals show admission capacity independently of slots and sa
   t.assert.match(visibleText(html({ state: partial }, <WorkerDetail w={zero} state={partial} />)), /CPU admission 0 millicores \/ — · memory 0 B \/ —/);
 });
 
+test("worker cache distinguishes measured, zero, missing and stale reports", (t) => {
+  const worker = live.workers[0];
+  if (!worker) throw new Error("the live recording has a worker");
+  const cache = {
+    local: { requests: 12, bytes: 2048 },
+    remote: { requests: 3, bytes: 4096 },
+    evictions: 2, evicted: 1024, used: 2048, budget: 8192,
+  };
+  const measured = { ...worker, cache };
+  const state = { ...live, schedulerKnown: true, workers: [measured] };
+  const detail = html({ state }, <WorkerDetail w={measured} state={state} />);
+  t.assert.match(detail, /<dt>local reads<\/dt><dd class="mono">12 requests · 2 KiB<\/dd>/);
+  t.assert.match(detail, /<dt>slow-store fetches<\/dt><dd class="mono">3 requests · 4 KiB<\/dd>/);
+  t.assert.match(detail, /<dt>evictions<\/dt><dd class="mono">2 · 1 KiB<\/dd>/);
+  t.assert.match(detail, /<dt>used \/ budget<\/dt><dd class="mono">2 KiB \/ 8 KiB<\/dd>/);
+
+  const zero = { ...measured, cache: { local: { requests: 0, bytes: 0 }, remote: { requests: 0, bytes: 0 }, evictions: 0, evicted: 0, used: 0, budget: 0 } };
+  const zeroDetail = html({ state }, <WorkerDetail w={zero} state={state} />);
+  t.assert.match(zeroDetail, /<dt>local reads<\/dt><dd class="mono">0 requests · 0 B<\/dd>/);
+  t.assert.match(zeroDetail, /<dt>used \/ budget<\/dt><dd class="mono">0 B \/ 0 B<\/dd>/);
+  const { cache: _cache, ...missing } = measured;
+  const unknown = html({ state }, <WorkerDetail w={missing} state={state} />);
+  const staleState = { ...state, schedulerKnown: false };
+  const staleDetail = html({ state: staleState }, <WorkerDetail w={measured} state={staleState} />);
+  for (const markup of [unknown, staleDetail]) {
+    for (const label of ["local reads", "slow-store fetches", "evictions", "used / budget"]) {
+      t.assert.ok(markup.includes(`<dt>${label}</dt><dd class="mono">unknown</dd>`), label);
+    }
+  }
+});
+
+test("worker fleet cache totals show coverage, measured zeros and stale or absent reports", (t) => {
+  const worker = live.workers[0];
+  const fleet = live.fleets.find((f) => f.name === worker?.fleet);
+  if (!worker || !fleet) throw new Error("the live recording has a worker and its fleet");
+  const totals = { local: { requests: 7, bytes: 1024 }, remote: { requests: 2, bytes: 2048 }, evictions: 1, evicted: 4096, used: 8192, budget: 16384 };
+  const measuredFleet = { ...fleet, workerCache: { reporting: 1, workers: 2, totals } };
+  const state = { ...live, schedulerKnown: true, fleets: [measuredFleet], workers: [worker] };
+  const markup = html({ state }, <Workers />);
+  t.assert.match(markup, /1 \/ 2 workers reporting/);
+  t.assert.match(markup, /<dt>local reads<\/dt><dd class="mono">7 requests · 1 KiB<\/dd>/);
+  t.assert.match(markup, /<dt>slow-store fetches<\/dt><dd class="mono">2 requests · 2 KiB<\/dd>/);
+  t.assert.match(markup, /<dt>evictions<\/dt><dd class="mono">1 · 4 KiB<\/dd>/);
+  t.assert.match(markup, /<dt>used \/ budget<\/dt><dd class="mono">8 KiB \/ 16 KiB<\/dd>/);
+
+  const zeroTotals = { local: { requests: 0, bytes: 0 }, remote: { requests: 0, bytes: 0 }, evictions: 0, evicted: 0, used: 0, budget: 0 };
+  const zeroState = { ...state, fleets: [{ ...measuredFleet, workerCache: { reporting: 1, workers: 1, totals: zeroTotals } }] };
+  t.assert.match(html({ state: zeroState }, <Workers />), /<dt>local reads<\/dt><dd class="mono">0 requests · 0 B<\/dd>/);
+  const noneState = { ...state, fleets: [{ ...measuredFleet, workerCache: { reporting: 0, workers: 2, totals: zeroTotals } }] };
+  const none = html({ state: noneState }, <Workers />);
+  t.assert.match(none, /0 \/ 2 workers reporting/);
+  t.assert.match(none, /<dt>local reads<\/dt><dd class="mono">unknown<\/dd>/);
+  const { workerCache: _workerCache, ...legacyFleet } = measuredFleet;
+  const legacyState = { ...state, fleets: [legacyFleet as typeof measuredFleet] };
+  const legacyMarkup = html({ state: legacyState }, <Workers />);
+  t.assert.match(legacyMarkup, /Reporting coverage unknown/);
+  t.assert.match(legacyMarkup, /<dt>local reads<\/dt><dd class="mono">unknown<\/dd>/);
+  const staleState = { ...state, schedulerKnown: false };
+  const staleMarkup = html({ state: staleState }, <Workers />);
+  t.assert.match(staleMarkup, /Reporting coverage unknown/);
+  t.assert.match(staleMarkup, /<dt>local reads<\/dt><dd class="mono">unknown<\/dd>/);
+  t.assert.doesNotMatch(staleMarkup, /1 \/ 2 workers reporting/);
+});
+
 test("action lists and worker detail show admitted and learned reservations", (t) => {
   const worker = live.workers[0];
   const running = live.actions?.running[0];

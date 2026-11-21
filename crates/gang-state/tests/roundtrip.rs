@@ -186,6 +186,7 @@ fn worker(slot: usize, phase: Phase, running: u32) -> Result<Worker, Box<dyn Err
         slots: Some(4),
         capacity: None,
         reserved: None,
+        cache: None,
         paused: false,
         launch_time: timestamped(1),
         phases: Vec::new(),
@@ -353,6 +354,7 @@ fn random_fleet(rng: &mut Rng, fleet: &str) -> Result<Fleet, Box<dyn Error>> {
             draining: rng.small() % 2,
             unconnected: rng.small() % 2,
         },
+        worker_cache: Default::default(),
         demand: Demand {
             running: rng.small() % 6,
             queued: rng.small() % 6,

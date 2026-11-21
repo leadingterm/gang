@@ -274,6 +274,32 @@ pub enum StoreKind {
     Action,
 }
 
+/// Measurements from one worker's fast and slow stores.
+///
+/// Counters cover the lifetime of the worker's stores, and reset when those stores restart.
+/// Reads count requests that return data, including partial reads that fail, plus successful
+/// empty reads. Bytes are actual transferred bytes; direct filesystem materializations report
+/// the blob's logical bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkerCacheStats {
+    /// Counted reads from the local fast store.
+    pub local_read_requests: u64,
+    /// Bytes transferred by reads from the local fast store.
+    pub local_read_bytes: u64,
+    /// Counted reads from the slow store, which may be remote or controller-backed.
+    pub slow_read_requests: u64,
+    /// Bytes transferred by reads from the slow store.
+    pub slow_read_bytes: u64,
+    /// Evicted entries reported by the native fast-store eviction map; replacements are excluded.
+    pub evictions: u64,
+    /// Evicted bytes reported by the native fast-store eviction map; replacements are excluded.
+    pub evicted_bytes: u64,
+    /// Current size in bytes of the fast store.
+    pub size_bytes: u64,
+    /// Fast store eviction budget in bytes.
+    pub budget_bytes: u64,
+}
+
 /// A connected worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerState {
@@ -291,6 +317,8 @@ pub struct WorkerState {
     pub capacity: Option<ActionResources>,
     /// Resources currently reserved in the scheduler ledger, absent when unavailable or malformed.
     pub reserved: Option<ActionResources>,
+    /// Store measurements, absent when the worker does not report them.
+    pub cache: Option<WorkerCacheStats>,
     /// Whether the scheduler has stopped assigning it new actions.
     pub draining: bool,
     /// Whether the scheduler has paused the worker. Not the same as draining, which a drain

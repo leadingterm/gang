@@ -14,14 +14,14 @@ use std::time::Duration;
 
 use gang_clock::Timestamp;
 use gang_reconciler::{Activity, FleetPass, HostedSnapshot};
-use gang_spi::{FleetSupply, QueuedActionView, SchedulerSnapshot, StoreKind, Traffic};
+use gang_spi::{FleetSupply, QueuedActionView, SchedulerSnapshot, StoreKind, Traffic, WorkerCacheStats};
 use gang_types::{
     ActionResources, FleetCatalog, FleetProperties, InstanceLifecycle, SaturatingInto,
 };
 use gang_wire::{
-    Actions, BucketUsage, CacheStore, Demand, Event, Fleet, InstanceCounts, InstanceSize, Isa,
+    Actions, BucketUsage, CacheReads, CacheStore, Demand, Event, Fleet, InstanceCounts, InstanceSize, Isa,
     Lifecycle, Pass, Phase, PhaseSpan, Policy, Queue, QueuedAction, Recent, Reservation,
-    RunningAction, SkipReason, State, StoreUsage, Truncated, Worker, WorkerCounts, name,
+    RunningAction, SkipReason, State, StoreUsage, Truncated, Worker, WorkerCache, WorkerCounts, name,
 };
 
 use crate::events::newer;
@@ -464,6 +464,7 @@ fn observe_fleets(
 fn observe_scheduler(cur: &mut State, fleets: &[FleetPass], snapshot: &SchedulerSnapshot) {
     for row in &mut cur.fleets {
         row.workers = WorkerCounts::default();
+        row.worker_cache = Default::default();
         row.demand.running = 0;
     }
     for worker in &snapshot.workers {
@@ -479,6 +480,20 @@ fn observe_scheduler(cur: &mut State, fleets: &[FleetPass], snapshot: &Scheduler
                 Activity::Draining => &mut row.workers.draining,
             };
             *count = count.saturating_add(1);
+            row.worker_cache.workers = row.worker_cache.workers.saturating_add(1);
+            if let Some(stats) = worker.cache {
+                row.worker_cache.reporting = row.worker_cache.reporting.saturating_add(1);
+                let cache = worker_cache(stats);
+                let totals = &mut row.worker_cache.totals;
+                totals.local.requests = totals.local.requests.saturating_add(cache.local.requests);
+                totals.local.bytes = totals.local.bytes.saturating_add(cache.local.bytes);
+                totals.remote.requests = totals.remote.requests.saturating_add(cache.remote.requests);
+                totals.remote.bytes = totals.remote.bytes.saturating_add(cache.remote.bytes);
+                totals.evictions = totals.evictions.saturating_add(cache.evictions);
+                totals.evicted = totals.evicted.saturating_add(cache.evicted);
+                totals.used = totals.used.saturating_add(cache.used);
+                totals.budget = totals.budget.saturating_add(cache.budget);
+            }
             row.demand.running = row.demand.running.saturating_add(worker.running_actions);
         }
     }
@@ -512,6 +527,23 @@ fn observe_scheduler(cur: &mut State, fleets: &[FleetPass], snapshot: &Scheduler
             .map(|action| action.queued_since)
             .min(),
     };
+}
+
+fn worker_cache(stats: WorkerCacheStats) -> WorkerCache {
+    WorkerCache {
+        local: CacheReads {
+            requests: stats.local_read_requests,
+            bytes: stats.local_read_bytes,
+        },
+        remote: CacheReads {
+            requests: stats.slow_read_requests,
+            bytes: stats.slow_read_bytes,
+        },
+        evictions: stats.evictions,
+        evicted: stats.evicted_bytes,
+        used: stats.size_bytes,
+        budget: stats.budget_bytes,
+    }
 }
 
 fn fill_infrastructure(
@@ -741,6 +773,7 @@ fn fill_workers(
             row.slots = worker.max_inflight_actions.map(NonZeroU32::get);
             row.capacity = worker.capacity.map(reservation);
             row.reserved = worker.reserved.map(reservation);
+            row.cache = worker.cache.map(worker_cache);
             row.paused = worker.paused;
             row.launch_time = scratch
                 .launches

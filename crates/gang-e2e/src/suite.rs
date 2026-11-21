@@ -820,8 +820,71 @@ fn input_integrity_checks(ctx: &RunContext<'_>) -> Vec<Check> {
 fn input_root_checks(ctx: &RunContext<'_>) -> Vec<Check> {
     attempt(Scenario::InputRoot, || {
         let stack = Stack::create(ctx.inputs, &ctx.baseline, Transport::Tls, ctx.issuer)?;
-        input_root(&stack, &ctx.baseline)
+        let mut checks = input_root(&stack, &ctx.baseline)?;
+        if checks.iter().any(Check::is_failure) {
+            return Ok(checks);
+        }
+        const OBSERVED: &str = "input root worker cache reports remote bytes";
+        let observed = stack.wait_live_state(stack.settings().history_timeout, |state| {
+            state.workers.iter().any(|worker| {
+                worker.cache.is_some_and(|cache| cache.remote.bytes > 0)
+                    && state.fleets.iter().any(|fleet| fleet.name == worker.fleet)
+            })
+        });
+        match observed {
+            Ok(state) => {
+                checks.push(crate::check::awaited(OBSERVED, Ok(()))?);
+                let mismatch = fleet_cache_mismatch(&state);
+                checks.push(Check::expect(
+                    "input root fleet worker cache aggregates connected workers",
+                    mismatch.is_none(),
+                    || mismatch.unwrap_or_default(),
+                ));
+            }
+            Err(error) => {
+                let check = crate::check::awaited(OBSERVED, Err::<(), _>(error))
+                    .unwrap_or_else(|error| {
+                        Check::failed(OBSERVED, gang_types::error_chain(&error).to_string())
+                    });
+                checks.push(check);
+            }
+        }
+        Ok(checks)
     })
+}
+
+/// Compares each fleet's published cache census with its connected worker rows.
+fn fleet_cache_mismatch(state: &gang_wire::State) -> Option<String> {
+    for fleet in &state.fleets {
+        let mut expected = gang_wire::FleetWorkerCache::default();
+        for worker in state
+            .workers
+            .iter()
+            .filter(|worker| worker.fleet == fleet.name)
+        {
+            expected.workers = expected.workers.saturating_add(1);
+            if let Some(cache) = worker.cache {
+                expected.reporting = expected.reporting.saturating_add(1);
+                let totals = &mut expected.totals;
+                totals.local.requests = totals.local.requests.saturating_add(cache.local.requests);
+                totals.local.bytes = totals.local.bytes.saturating_add(cache.local.bytes);
+                totals.remote.requests =
+                    totals.remote.requests.saturating_add(cache.remote.requests);
+                totals.remote.bytes = totals.remote.bytes.saturating_add(cache.remote.bytes);
+                totals.evictions = totals.evictions.saturating_add(cache.evictions);
+                totals.evicted = totals.evicted.saturating_add(cache.evicted);
+                totals.used = totals.used.saturating_add(cache.used);
+                totals.budget = totals.budget.saturating_add(cache.budget);
+            }
+        }
+        if fleet.worker_cache != expected {
+            return Some(format!(
+                "{}: expected {expected:?}, got {:?}",
+                fleet.name, fleet.worker_cache
+            ));
+        }
+    }
+    None
 }
 
 /// The verdicts of the limits scenario, or one skipped check where the platform has no cgroups.
@@ -1481,6 +1544,60 @@ mod tests {
     use crate::settings::Settings;
 
     use super::*;
+
+    #[test]
+    fn fleet_cache_comparison_counts_reports_and_saturates_all_metrics() {
+        use gang_wire::{CacheReads, Fleet, FleetWorkerCache, State, Worker, WorkerCache};
+
+        let all = |value| WorkerCache {
+            local: CacheReads {
+                requests: value,
+                bytes: value,
+            },
+            remote: CacheReads {
+                requests: value,
+                bytes: value,
+            },
+            evictions: value,
+            evicted: value,
+            used: value,
+            budget: value,
+        };
+        let mut state = State {
+            fleets: vec![Fleet {
+                name: "fleets/a".into(),
+                worker_cache: FleetWorkerCache {
+                    workers: 3,
+                    reporting: 2,
+                    totals: all(u64::MAX),
+                },
+                ..Fleet::default()
+            }],
+            workers: vec![
+                Worker {
+                    fleet: "fleets/a".into(),
+                    cache: Some(all(u64::MAX)),
+                    ..Worker::default()
+                },
+                Worker {
+                    fleet: "fleets/a".into(),
+                    cache: Some(all(1)),
+                    ..Worker::default()
+                },
+                Worker {
+                    fleet: "fleets/a".into(),
+                    ..Worker::default()
+                },
+            ],
+            ..State::default()
+        };
+        assert!(fleet_cache_mismatch(&state).is_none());
+        state.fleets[0].worker_cache.reporting = 3;
+        assert!(fleet_cache_mismatch(&state).is_some());
+        state.fleets[0].worker_cache.reporting = 2;
+        state.fleets[0].worker_cache.totals.remote.bytes = 0;
+        assert!(fleet_cache_mismatch(&state).is_some());
+    }
 
     #[test]
     fn controller_loss_fixture_has_two_cpu_reservations() {

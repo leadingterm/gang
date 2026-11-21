@@ -267,6 +267,7 @@ mod tests {
     use gang_spi::{ControllerSpec, ObservationSink, RenderedStoreSpec};
     use gang_testkit::TestResult;
     use gang_types::FleetCatalog;
+    use nativelink_store::fast_slow_store::FastSlowStore;
     use nativelink_util::common::DigestInfo;
     use nativelink_util::store_trait::StoreLike;
     use serde_json::{Value, json};
@@ -320,6 +321,89 @@ mod tests {
                 .update_oneshot(DigestInfo::new([index; 32], size), blob)
                 .await?;
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fast_slow_cache_counts_reads_materialization_and_evictions() -> TestResult {
+        let scratch = tempfile::tempdir()?;
+        let content_path = scratch.path().join("content");
+        let temp_path = scratch.path().join("tmp");
+        let content = json!({"fast_slow": {
+            "fast": {"filesystem": {
+                "content_path": content_path.to_str().ok_or("content path is UTF-8")?,
+                "temp_path": temp_path.to_str().ok_or("temporary path is UTF-8")?,
+                "block_size": 1,
+                "eviction_policy": {"max_bytes": 5},
+            }},
+            "slow": {"memory": {}},
+        }});
+        let stores = controller_stores(content, json!({"memory": {}})).await?;
+        let store = stores
+            .get_store(CONTENT_STORE)
+            .ok_or("content store is registered")?;
+        let cache = store
+            .downcast_ref::<FastSlowStore>(None)
+            .ok_or("fast-slow store")?;
+        let first = DigestInfo::new([1; 32], 3);
+        let second = DigestInfo::new([2; 32], 4);
+        cache
+            .slow_store()
+            .update_oneshot(first, Bytes::from_static(b"abc"))
+            .await?;
+        cache
+            .slow_store()
+            .update_oneshot(second, Bytes::from_static(b"defg"))
+            .await?;
+
+        let initial = cache.cache_stats().ok_or("filesystem cache stats")?;
+        assert_eq!((initial.size_bytes, initial.budget_bytes), (0, 5));
+        assert_eq!(
+            (initial.local_read_requests, initial.slow_read_requests),
+            (0, 0)
+        );
+        assert_eq!(
+            store.get_part_unchunked(first, 0, None).await?,
+            Bytes::from_static(b"abc")
+        );
+        let cold = cache.cache_stats().ok_or("filesystem cache stats")?;
+        assert_eq!((cold.slow_read_requests, cold.slow_read_bytes), (1, 3));
+        assert_eq!((cold.local_read_requests, cold.local_read_bytes), (0, 0));
+        assert_eq!(
+            (cold.size_bytes, cold.evictions, cold.evicted_bytes),
+            (3, 0, 0)
+        );
+
+        assert_eq!(
+            store.get_part_unchunked(first, 0, None).await?,
+            Bytes::from_static(b"abc")
+        );
+        let hit = cache.cache_stats().ok_or("filesystem cache stats")?;
+        assert_eq!((hit.local_read_requests, hit.local_read_bytes), (1, 3));
+        assert_eq!((hit.slow_read_requests, hit.slow_read_bytes), (1, 3));
+
+        cache.populate_fast_store(first.into()).await?;
+        cache.get_file_entry_for_digest(&first).await?;
+        assert!(cache.get_file_entry_for_digest(&second).await.is_err());
+        let materialized = cache.cache_stats().ok_or("filesystem cache stats")?;
+        assert_eq!(
+            (materialized.local_read_requests, materialized.local_read_bytes),
+            (3, 9)
+        );
+        assert_eq!(
+            (materialized.slow_read_requests, materialized.slow_read_bytes),
+            (1, 3)
+        );
+
+        assert_eq!(
+            store.get_part_unchunked(second, 0, None).await?,
+            Bytes::from_static(b"defg")
+        );
+        let evicted = cache.cache_stats().ok_or("filesystem cache stats")?;
+        assert_eq!((evicted.slow_read_requests, evicted.slow_read_bytes), (2, 7));
+        assert_eq!((evicted.local_read_requests, evicted.local_read_bytes), (3, 9));
+        assert_eq!((evicted.evictions, evicted.evicted_bytes), (1, 3));
+        assert_eq!((evicted.size_bytes, evicted.budget_bytes), (4, 5));
         Ok(())
     }
 

@@ -1,5 +1,5 @@
 {
-  "checksum": "290be9430e4a950d35479bea874d8f7c0d473e71d717dfed1bd2b11f7b697c4f",
+  "checksum": "b25020cd0ab53ba1a17e4bf6a29c7ac57242cdc219e70406ce4485bed6efc206",
   "crates": {
     "adler2 2.0.1": {
       "name": "adler2",
@@ -23566,7 +23566,7 @@
         "Git": {
           "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "03295fcad4181a7df1fdf3c45809e090014013b3"
+            "Rev": "e52e671b8debeab1c076f53fb048797b05f319c2"
           },
           "strip_prefix": "nativelink-config"
         }
@@ -23646,7 +23646,7 @@
         "Git": {
           "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "03295fcad4181a7df1fdf3c45809e090014013b3"
+            "Rev": "e52e671b8debeab1c076f53fb048797b05f319c2"
           },
           "strip_prefix": "nativelink-error"
         }
@@ -23758,7 +23758,7 @@
         "Git": {
           "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "03295fcad4181a7df1fdf3c45809e090014013b3"
+            "Rev": "e52e671b8debeab1c076f53fb048797b05f319c2"
           },
           "strip_prefix": "nativelink-metric"
         }
@@ -23827,7 +23827,7 @@
         "Git": {
           "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "03295fcad4181a7df1fdf3c45809e090014013b3"
+            "Rev": "e52e671b8debeab1c076f53fb048797b05f319c2"
           },
           "strip_prefix": "nativelink-metric/nativelink-metric-macro-derive"
         }
@@ -23883,7 +23883,7 @@
         "Git": {
           "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "03295fcad4181a7df1fdf3c45809e090014013b3"
+            "Rev": "e52e671b8debeab1c076f53fb048797b05f319c2"
           },
           "strip_prefix": "nativelink-proto"
         }
@@ -23947,7 +23947,7 @@
         "Git": {
           "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "03295fcad4181a7df1fdf3c45809e090014013b3"
+            "Rev": "e52e671b8debeab1c076f53fb048797b05f319c2"
           },
           "strip_prefix": "nativelink-redis-tester"
         }
@@ -24019,7 +24019,7 @@
         "Git": {
           "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "03295fcad4181a7df1fdf3c45809e090014013b3"
+            "Rev": "e52e671b8debeab1c076f53fb048797b05f319c2"
           },
           "strip_prefix": "nativelink-scheduler"
         }
@@ -24176,7 +24176,7 @@
         "Git": {
           "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "03295fcad4181a7df1fdf3c45809e090014013b3"
+            "Rev": "e52e671b8debeab1c076f53fb048797b05f319c2"
           },
           "strip_prefix": "nativelink-service"
         }
@@ -24332,7 +24332,7 @@
         "Git": {
           "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "03295fcad4181a7df1fdf3c45809e090014013b3"
+            "Rev": "e52e671b8debeab1c076f53fb048797b05f319c2"
           },
           "strip_prefix": "nativelink-store"
         }
@@ -24654,7 +24654,7 @@
         "Git": {
           "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "03295fcad4181a7df1fdf3c45809e090014013b3"
+            "Rev": "e52e671b8debeab1c076f53fb048797b05f319c2"
           },
           "strip_prefix": "nativelink-util"
         }
@@ -24895,7 +24895,7 @@
         "Git": {
           "remote": "https://github.com/leadingterm/nativelink",
           "commitish": {
-            "Rev": "03295fcad4181a7df1fdf3c45809e090014013b3"
+            "Rev": "e52e671b8debeab1c076f53fb048797b05f319c2"
           },
           "strip_prefix": "nativelink-worker"
         }

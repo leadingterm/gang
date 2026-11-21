@@ -259,6 +259,16 @@ uploadedBytes: number,
  */
 downloadedBytes: number, };
 
+export type CacheReads = { 
+/**
+ * Counted reads from this store layer.
+ */
+requests: number, 
+/**
+ * Bytes transferred by reads from this store layer.
+ */
+bytes: number, };
+
 export type CacheStore = "CAS" | "AC";
 
 export type Cause = "DEMAND" | "MINIMUM" | "IDLE_TIMEOUT" | "UTILIZATION" | "ORPHAN" | "DRAIN_FINISHED" | "MAX_DRAIN_WAIT";
@@ -578,9 +588,27 @@ instances: InstanceCounts,
  */
 workers: WorkerCounts, 
 /**
+ * Cache totals and reporting coverage for connected workers.
+ */
+workerCache: FleetWorkerCache, 
+/**
  * The fleet's share of demand.
  */
 demand: Demand, };
+
+export type FleetWorkerCache = { 
+/**
+ * Connected workers that report cache measurements.
+ */
+reporting: number, 
+/**
+ * All currently connected workers in the fleet.
+ */
+workers: number, 
+/**
+ * Sum of measurements from connected reporting workers.
+ */
+totals: WorkerCache, };
 
 export type Frame = { "event": "snapshot", "data": State } | { "event": "delta", "data": Delta } | { "event": "tick", "data": Tick } | { "event": "closed", "data": Closed };
 
@@ -1406,6 +1434,10 @@ reserved?: Reservation,
  */
 capacity?: Reservation, 
 /**
+ * Store measurements, absent when the worker does not report them.
+ */
+cache?: WorkerCache, 
+/**
  * Whether the worker is paused.
  */
 paused: boolean, 
@@ -1418,6 +1450,32 @@ launchTime: Timestamp,
  * is the current phase, starting at `phase_time`. Before the first, the phase is not recorded.
  */
 phases?: Array<PhaseSpan>, };
+
+export type WorkerCache = { 
+/**
+ * Reads from the local fast store.
+ */
+local: CacheReads, 
+/**
+ * Reads from the slow store, which may be remote or controller-backed.
+ */
+remote: CacheReads, 
+/**
+ * Evicted entries reported by the native fast-store eviction map; replacements are excluded.
+ */
+evictions: number, 
+/**
+ * Evicted bytes reported by the native fast-store eviction map; replacements are excluded.
+ */
+evicted: number, 
+/**
+ * Current fast store size in bytes.
+ */
+used: number, 
+/**
+ * Fast store eviction budget in bytes.
+ */
+budget: number, };
 
 export type WorkerCounts = { 
 /**

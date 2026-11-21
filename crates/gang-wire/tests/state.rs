@@ -1,7 +1,8 @@
 //! The wire types round trip the recorded UI fixtures. Each frame of the `.sse` streams is decoded
 //! with `Frame::from_parts`, re-encoded with `FrameRef::write_data`, and compared with the fixture
-//! as a JSON value, as is each JSON body, so a field that the Rust types drop, rename or retype fails
-//! here. The files reach the test through the `test_env` that `crates/gang-wire/BUILD.bazel` sets.
+//! as a JSON value (with defaults added for fields absent from older fixtures), as is each JSON
+//! body, so a field that the Rust types drop, rename or retype fails here. The files reach the test
+//! through the `test_env` that `crates/gang-wire/BUILD.bazel` sets.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -105,6 +106,33 @@ where
     Ok(())
 }
 
+/// Older fixtures predate fleet cache totals, which deserialize to an explicit default.
+fn add_default_fleet_cache(event: &str, expected: &mut Value) {
+    let fleets = match event {
+        "snapshot" => expected.get_mut("fleets"),
+        "delta" => expected
+            .get_mut("fleets")
+            .and_then(|fleets| fleets.get_mut("upsert")),
+        _ => None,
+    };
+    if let Some(fleets) = fleets.and_then(Value::as_array_mut) {
+        for fleet in fleets {
+            if let Some(fleet) = fleet.as_object_mut() {
+                fleet.entry("workerCache").or_insert_with(|| {
+                    serde_json::json!({
+                        "reporting": 0, "workers": 0,
+                        "totals": {
+                            "local": {"requests": 0, "bytes": 0},
+                            "remote": {"requests": 0, "bytes": 0},
+                            "evictions": 0, "evicted": 0, "used": 0, "budget": 0
+                        }
+                    })
+                });
+            }
+        }
+    }
+}
+
 #[test]
 fn sse_frames_round_trip() -> Result<(), Box<dyn Error>> {
     let mut checked = 0_usize;
@@ -114,7 +142,8 @@ fn sse_frames_round_trip() -> Result<(), Box<dyn Error>> {
         }
         let text = std::fs::read_to_string(&path)?;
         for message in messages(&text)? {
-            let expected: Value = serde_json::from_str(&message.data)?;
+            let mut expected: Value = serde_json::from_str(&message.data)?;
+            add_default_fleet_cache(&message.event, &mut expected);
             let frame = Frame::from_parts(&message.event, &message.data)
                 .map_err(|error| format!("{name}: {error}"))?;
             check_known(&name, &frame);
@@ -212,6 +241,77 @@ fn queued_refusal_json_round_trips_and_is_omitted_when_absent() -> Result<(), Bo
         serde_json::from_value::<gang_wire::QueuedAction>(expected)?,
         action
     );
+    Ok(())
+}
+
+#[test]
+fn worker_cache_round_trips_absent_zero_and_values() -> Result<(), Box<dyn Error>> {
+    use gang_wire::{CacheReads, Worker, WorkerCache};
+
+    let mut worker = Worker::default();
+    let absent = serde_json::to_value(&worker)?;
+    assert!(absent.get("cache").is_none());
+    assert_eq!(serde_json::from_value::<Worker>(absent)?, worker);
+
+    worker.cache = Some(WorkerCache::default());
+    let zero = serde_json::to_value(&worker)?;
+    assert_eq!(
+        zero["cache"],
+        serde_json::json!({
+            "local": {"requests": 0, "bytes": 0},
+            "remote": {"requests": 0, "bytes": 0},
+            "evictions": 0, "evicted": 0, "used": 0, "budget": 0
+        })
+    );
+    assert_eq!(serde_json::from_value::<Worker>(zero)?, worker);
+
+    worker.cache = Some(WorkerCache {
+        local: CacheReads {
+            requests: 1,
+            bytes: 2,
+        },
+        remote: CacheReads {
+            requests: 3,
+            bytes: 4,
+        },
+        evictions: 5,
+        evicted: 6,
+        used: 7,
+        budget: 8,
+    });
+    let measured = serde_json::to_value(&worker)?;
+    assert_eq!(
+        measured["cache"],
+        serde_json::json!({
+            "local": {"requests": 1, "bytes": 2},
+            "remote": {"requests": 3, "bytes": 4},
+            "evictions": 5, "evicted": 6, "used": 7, "budget": 8
+        })
+    );
+    assert_eq!(serde_json::from_value::<Worker>(measured)?, worker);
+    Ok(())
+}
+
+#[test]
+fn fleet_worker_cache_defaults_when_absent_and_round_trips() -> Result<(), Box<dyn Error>> {
+    use gang_wire::{Fleet, FleetWorkerCache};
+
+    let fleet = Fleet::default();
+    let mut legacy = serde_json::to_value(&fleet)?;
+    legacy.as_object_mut().unwrap().remove("workerCache");
+    assert_eq!(serde_json::from_value::<Fleet>(legacy)?, fleet);
+
+    let mut fleet = fleet;
+    fleet.worker_cache = FleetWorkerCache {
+        reporting: 1,
+        workers: 2,
+        ..FleetWorkerCache::default()
+    };
+    let json = serde_json::to_value(&fleet)?;
+    assert_eq!(json["workerCache"]["reporting"], 1);
+    assert_eq!(json["workerCache"]["workers"], 2);
+    assert_eq!(json["workerCache"]["totals"]["local"]["bytes"], 0);
+    assert_eq!(serde_json::from_value::<Fleet>(json)?, fleet);
     Ok(())
 }
 

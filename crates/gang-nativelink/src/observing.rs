@@ -17,7 +17,7 @@ use nativelink_metric::{
     MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent, RootMetricsComponent,
 };
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    ActionResourceUsage, WorkerLoad,
+    ActionResourceUsage, CacheStats, WorkerLoad,
 };
 use nativelink_scheduler::platform_property_manager::PlatformPropertyManager;
 use nativelink_scheduler::worker::{Worker, WorkerTimestamp};
@@ -419,9 +419,10 @@ impl WorkerScheduler for ObservingWorkerScheduler {
         worker_id: &WorkerId,
         timestamp: WorkerTimestamp,
         load: Option<WorkerLoad>,
+        cache_stats: Option<CacheStats>,
     ) -> Result<(), Error> {
         self.inner
-            .worker_keep_alive_received(worker_id, timestamp, load)
+            .worker_keep_alive_received(worker_id, timestamp, load, cache_stats)
             .await
     }
 
@@ -1205,6 +1206,7 @@ mod tests {
             _worker_id: &WorkerId,
             _timestamp: WorkerTimestamp,
             _load: Option<WorkerLoad>,
+            _cache_stats: Option<CacheStats>,
         ) -> Result<(), Error> {
             Ok(())
         }
@@ -1285,6 +1287,7 @@ mod tests {
                 platform_properties: HashMap::new(),
                 available_platform_properties: HashMap::new(),
                 free_memory_kb: None,
+                cache: None,
             }]
         }
 

@@ -1389,6 +1389,7 @@ mod tests {
             max_inflight_actions: None,
             capacity: None,
             reserved: None,
+            cache: None,
             draining: false,
             paused: false,
             last_seen: Timestamp::UNIX_EPOCH,

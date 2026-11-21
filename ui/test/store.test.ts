@@ -163,6 +163,22 @@ test("keyed deltas remove rows by their names", () => {
   assert.ok(!next.workers.some((w) => w.name === worker.name));
 });
 
+test("keyed worker and fleet deltas retain updated worker cache metrics", () => {
+  const worker = snapshot.workers[0];
+  const fleet = snapshot.fleets.find((f) => f.name === worker?.fleet);
+  assert.ok(worker);
+  assert.ok(fleet);
+  const cache = { local: { requests: 4, bytes: 1024 }, remote: { requests: 2, bytes: 2048 }, evictions: 1, evicted: 512, used: 4096, budget: 8192 };
+  const updatedWorker = { ...worker, cache };
+  const updatedFleet = { ...fleet, workerCache: { reporting: 1, workers: 2, totals: cache } };
+  const next = apply(snapshot, after(snapshot, { workers: { upsert: [updatedWorker] }, fleets: { upsert: [updatedFleet] } }));
+  assert.deepEqual(next.workers.find((w) => w.name === worker.name)?.cache, cache);
+  assert.deepEqual(next.fleets.find((f) => f.name === fleet.name)?.workerCache, updatedFleet.workerCache);
+  const retained = apply(next, after(next));
+  assert.deepEqual(retained.workers.find((w) => w.name === worker.name)?.cache, cache);
+  assert.deepEqual(retained.fleets.find((f) => f.name === fleet.name)?.workerCache, updatedFleet.workerCache);
+});
+
 test("build deltas upsert and remove by name", () => {
   const first = snapshot.builds?.[0];
   assert.ok(first);

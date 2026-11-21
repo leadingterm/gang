@@ -307,7 +307,9 @@ mod tests {
         MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent,
         RootMetricsComponent,
     };
-    use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::WorkerLoad;
+    use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
+        CacheStats, WorkerLoad,
+    };
     use nativelink_scheduler::platform_property_manager::PlatformPropertyManager;
     use nativelink_scheduler::worker::WorkerTimestamp;
     use nativelink_scheduler::worker_scheduler::WorkerSummary;
@@ -426,6 +428,7 @@ mod tests {
                 platform_properties: properties,
                 available_platform_properties: HashMap::new(),
                 free_memory_kb: None,
+                cache: None,
             });
             Ok(())
         }
@@ -525,6 +528,7 @@ mod tests {
             _: &NativeWorkerId,
             _: WorkerTimestamp,
             _: Option<WorkerLoad>,
+            _: Option<CacheStats>,
         ) -> Result<(), Error> {
             Err(make_err!(
                 Code::Unimplemented,

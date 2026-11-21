@@ -194,6 +194,68 @@ pub struct Connections {
     pub refused: u64,
 }
 
+/// Reads and transferred bytes at one store layer.
+///
+/// A read is counted when it returns data, including a partial read that fails, or succeeds
+/// empty. Bytes are actual transferred bytes; direct filesystem materializations report the
+/// blob's logical bytes.
+#[derive(
+    gang_macros::Known, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheReads {
+    /// Counted reads from this store layer.
+    #[ts(type = "number")]
+    pub requests: u64,
+    /// Bytes transferred by reads from this store layer.
+    #[ts(type = "number")]
+    pub bytes: u64,
+}
+
+/// Cache measurements for one worker's stores.
+///
+/// Counters are cumulative for the lifetime of the worker's stores and reset on restart.
+/// Read accounting follows [`CacheReads`].
+#[derive(
+    gang_macros::Known, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerCache {
+    /// Reads from the local fast store.
+    pub local: CacheReads,
+    /// Reads from the slow store, which may be remote or controller-backed.
+    pub remote: CacheReads,
+    /// Evicted entries reported by the native fast-store eviction map; replacements are excluded.
+    #[ts(type = "number")]
+    pub evictions: u64,
+    /// Evicted bytes reported by the native fast-store eviction map; replacements are excluded.
+    #[ts(type = "number")]
+    pub evicted: u64,
+    /// Current fast store size in bytes.
+    #[ts(type = "number")]
+    pub used: u64,
+    /// Fast store eviction budget in bytes.
+    #[ts(type = "number")]
+    pub budget: u64,
+}
+
+/// Cache measurements summed over the fleet's currently connected reporting workers.
+///
+/// Totals can decrease when workers restart or disconnect; non-reporting workers do not
+/// contribute and must not be treated as having measured zero.
+#[derive(
+    gang_macros::Known, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct FleetWorkerCache {
+    /// Connected workers that report cache measurements.
+    pub reporting: u32,
+    /// All currently connected workers in the fleet.
+    pub workers: u32,
+    /// Sum of measurements from connected reporting workers.
+    pub totals: WorkerCache,
+}
+
 /// Cache occupancy at the latest completed pass and provider measurement.
 #[derive(
     gang_macros::Known, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS,
@@ -586,6 +648,9 @@ pub struct Fleet {
     pub instances: InstanceCounts,
     /// Workers by phase.
     pub workers: WorkerCounts,
+    /// Cache totals and reporting coverage for connected workers.
+    #[serde(default)]
+    pub worker_cache: FleetWorkerCache,
     /// The fleet's share of demand.
     pub demand: Demand,
 }
@@ -798,6 +863,9 @@ pub struct Worker {
     /// Worker's resource capacity, when reported by the scheduler.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity: Option<Reservation>,
+    /// Store measurements, absent when the worker does not report them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<WorkerCache>,
     /// Whether the worker is paused.
     pub paused: bool,
     /// When the instance launched.
