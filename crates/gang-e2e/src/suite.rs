@@ -842,8 +842,8 @@ fn input_root_checks(ctx: &RunContext<'_>) -> Vec<Check> {
                 ));
             }
             Err(error) => {
-                let check = crate::check::awaited(OBSERVED, Err::<(), _>(error))
-                    .unwrap_or_else(|error| {
+                let check =
+                    crate::check::awaited(OBSERVED, Err::<(), _>(error)).unwrap_or_else(|error| {
                         Check::failed(OBSERVED, gang_types::error_chain(&error).to_string())
                     });
                 checks.push(check);

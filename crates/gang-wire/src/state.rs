@@ -200,7 +200,16 @@ pub struct Connections {
 /// empty. Bytes are actual transferred bytes; direct filesystem materializations report the
 /// blob's logical bytes.
 #[derive(
-    gang_macros::Known, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS,
+    gang_macros::Known,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    Default,
+    ts_rs::TS,
 )]
 #[serde(rename_all = "camelCase")]
 pub struct CacheReads {
@@ -217,7 +226,16 @@ pub struct CacheReads {
 /// Counters are cumulative for the lifetime of the worker's stores and reset on restart.
 /// Read accounting follows [`CacheReads`].
 #[derive(
-    gang_macros::Known, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS,
+    gang_macros::Known,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    Default,
+    ts_rs::TS,
 )]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerCache {
@@ -244,7 +262,16 @@ pub struct WorkerCache {
 /// Totals can decrease when workers restart or disconnect; non-reporting workers do not
 /// contribute and must not be treated as having measured zero.
 #[derive(
-    gang_macros::Known, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS,
+    gang_macros::Known,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    Default,
+    ts_rs::TS,
 )]
 #[serde(rename_all = "camelCase")]
 pub struct FleetWorkerCache {

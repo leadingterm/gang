@@ -481,14 +481,16 @@ fn provisioner_properties_exclude_reserved_keys() -> TestResult {
     }
     Ok(())
 }
-#[test]
-fn worker_cache_reports_current_store_measurements_and_round_trips() -> TestResult {
-    use gang_spi::WorkerCacheStats;
-    use gang_wire::{CacheReads, FleetWorkerCache, Frame, FrameRef, WorkerCache};
 
+fn worker_cache_world() -> Result<(World, [WorkerId; 4]), Box<dyn Error>> {
+    use gang_spi::WorkerCacheStats;
     let mut world = World::default();
     world.policies = vec![policy("alpha", 100, 4)?, policy("beta", 100, 4)?];
-    world.properties = world.policies.iter().map(|p| properties(p, Vec::new())).collect();
+    world.properties = world
+        .policies
+        .iter()
+        .map(|p| properties(p, Vec::new()))
+        .collect();
     let ids = [
         worker_on(&instance_id(1)?)?,
         worker_on(&instance_id(2)?)?,
@@ -511,69 +513,154 @@ fn worker_cache_reports_current_store_measurements_and_round_trips() -> TestResu
         size_bytes: 7,
         budget_bytes: 8,
     };
+    world.snapshot.workers[0].cache = Some(stats);
+    world.snapshot.workers[1].cache = Some(stats);
+    world.snapshot.workers[3].cache = Some(WorkerCacheStats::default());
+    Ok((world, ids))
+}
+
+#[test]
+fn worker_cache_reports_current_store_measurements() -> TestResult {
+    use gang_wire::{CacheReads, FleetWorkerCache, WorkerCache};
+    let (world, ids) = worker_cache_world()?;
     let expected = WorkerCache {
-        local: CacheReads { requests: 1, bytes: 2 },
-        remote: CacheReads { requests: 3, bytes: 4 },
+        local: CacheReads {
+            requests: 1,
+            bytes: 2,
+        },
+        remote: CacheReads {
+            requests: 3,
+            bytes: 4,
+        },
         evictions: 5,
         evicted: 6,
         used: 7,
         budget: 8,
     };
-    world.snapshot.workers[0].cache = Some(stats);
-    world.snapshot.workers[1].cache = Some(stats);
-    world.snapshot.workers[3].cache = Some(WorkerCacheStats::default());
     let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
     let first = fill(&mut builder, &blank(), 1, &world, 1_000, ok(0))?;
-    assert_eq!(find_worker(&first, &ids[0]).ok_or("worker")?.cache, Some(expected));
-    assert_eq!(find_worker(&first, &ids[1]).ok_or("worker")?.cache, Some(expected));
+    assert_eq!(
+        find_worker(&first, &ids[0]).ok_or("worker")?.cache,
+        Some(expected)
+    );
+    assert_eq!(
+        find_worker(&first, &ids[1]).ok_or("worker")?.cache,
+        Some(expected)
+    );
     assert_eq!(find_worker(&first, &ids[2]).ok_or("worker")?.cache, None);
-    assert_eq!(find_worker(&first, &ids[3]).ok_or("worker")?.cache, Some(WorkerCache::default()));
-    assert_eq!(first.fleets[0].worker_cache, FleetWorkerCache {
-        reporting: 2,
-        workers: 3,
-        totals: WorkerCache {
-            local: CacheReads { requests: 2, bytes: 4 },
-            remote: CacheReads { requests: 6, bytes: 8 },
-            evictions: 10,
-            evicted: 12,
-            used: 14,
-            budget: 16,
-        },
-    });
-    assert_eq!(first.fleets[1].worker_cache, FleetWorkerCache {
-        reporting: 1, workers: 1, totals: WorkerCache::default(),
-    });
+    assert_eq!(
+        find_worker(&first, &ids[3]).ok_or("worker")?.cache,
+        Some(WorkerCache::default())
+    );
+    assert_eq!(
+        first.fleets[0].worker_cache,
+        FleetWorkerCache {
+            reporting: 2,
+            workers: 3,
+            totals: WorkerCache {
+                local: CacheReads {
+                    requests: 2,
+                    bytes: 4
+                },
+                remote: CacheReads {
+                    requests: 6,
+                    bytes: 8
+                },
+                evictions: 10,
+                evicted: 12,
+                used: 14,
+                budget: 16,
+            },
+        }
+    );
+    assert_eq!(
+        first.fleets[1].worker_cache,
+        FleetWorkerCache {
+            reporting: 1,
+            workers: 1,
+            totals: WorkerCache::default(),
+        }
+    );
 
-    let unavailable = fill(&mut builder, &first, 2, &world, 2_000, Outcome::Observed {
-        known: false,
-        supplies: vec![true, true],
-    })?;
-    assert_eq!(unavailable.fleets[0].worker_cache, first.fleets[0].worker_cache);
-    assert_eq!(find_worker(&unavailable, &ids[0]).ok_or("stale worker")?.cache, Some(expected));
+    Ok(())
+}
+
+#[test]
+fn worker_cache_disappearance_and_restart_replace_totals() -> TestResult {
+    use gang_spi::WorkerCacheStats;
+    use gang_wire::{FleetWorkerCache, WorkerCache};
+    let (mut world, ids) = worker_cache_world()?;
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let first = fill(&mut builder, &blank(), 1, &world, 1_000, ok(0))?;
+    let unavailable = fill(
+        &mut builder,
+        &first,
+        2,
+        &world,
+        2_000,
+        Outcome::Observed {
+            known: false,
+            supplies: vec![true, true],
+        },
+    )?;
+    assert_eq!(
+        unavailable.fleets[0].worker_cache,
+        first.fleets[0].worker_cache
+    );
+    assert_eq!(
+        find_worker(&unavailable, &ids[0])
+            .ok_or("stale worker")?
+            .cache,
+        find_worker(&first, &ids[0]).ok_or("worker")?.cache
+    );
 
     // One report vanishes, one worker disconnects, and another store restarts at zero.
     world.snapshot.workers[0].cache = None;
     world.snapshot.workers[1].cache = Some(WorkerCacheStats::default());
     world.snapshot.workers.remove(2);
     let mut second = first.clone();
-    fill_into(&mut builder, &mut second, &unavailable, 3, &world, 3_000, Outcome::Observed {
-        known: true,
-        supplies: vec![true, true],
-    })?;
+    fill_into(
+        &mut builder,
+        &mut second,
+        &unavailable,
+        3,
+        &world,
+        3_000,
+        Outcome::Observed {
+            known: true,
+            supplies: vec![true, true],
+        },
+    )?;
     assert_eq!(find_worker(&second, &ids[0]).ok_or("worker")?.cache, None);
-    assert_eq!(second.fleets[0].worker_cache, FleetWorkerCache {
-        reporting: 1,
-        workers: 2,
-        totals: WorkerCache::default(),
-    });
+    assert_eq!(
+        second.fleets[0].worker_cache,
+        FleetWorkerCache {
+            reporting: 1,
+            workers: 2,
+            totals: WorkerCache::default(),
+        }
+    );
 
+    Ok(())
+}
+
+#[test]
+fn worker_cache_snapshot_and_delta_round_trip_over_sse() -> TestResult {
+    use gang_wire::{Frame, FrameRef};
+    let (mut world, _) = worker_cache_world()?;
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let first = fill(&mut builder, &blank(), 1, &world, 1_000, ok(0))?;
+    world.snapshot.workers[0].cache = None;
+    world.snapshot.workers.remove(2);
+    let second = fill(&mut builder, &first, 2, &world, 2_000, ok(0))?;
     let delta = diff(&first, &second).ok_or("missing cache delta")?;
     let snapshot_bytes = gang_state::sse::encode(FrameRef::Snapshot(&first))?;
     let delta_bytes = gang_state::sse::encode(FrameRef::Delta(&delta))?;
     let mut decoder = gang_state::sse::Decoder::new();
     let frames = decoder.push(&[snapshot_bytes, delta_bytes].concat())?;
-    let [Frame::Snapshot(mut rebuilt), Frame::Delta(decoded)] = <[Frame; 2]>::try_from(frames)
-        .map_err(|_| "expected snapshot and delta")? else {
+    let [Frame::Snapshot(mut rebuilt), Frame::Delta(decoded)] =
+        <[Frame; 2]>::try_from(frames).map_err(|_| "expected snapshot and delta")?
+    else {
         return Err("wrong frame types".into());
     };
     gang_state::apply(&mut rebuilt, &decoded)?;
@@ -587,7 +674,11 @@ fn worker_cache_fleet_sums_saturate_each_measurement() -> TestResult {
     use gang_wire::{CacheReads, WorkerCache};
     let mut world = World::default();
     world.policies = vec![policy("alpha", 100, 4)?];
-    world.properties = world.policies.iter().map(|p| properties(p, Vec::new())).collect();
+    world.properties = world
+        .policies
+        .iter()
+        .map(|p| properties(p, Vec::new()))
+        .collect();
     let stats = WorkerCacheStats {
         local_read_requests: u64::MAX,
         local_read_bytes: u64::MAX,
@@ -605,17 +696,25 @@ fn worker_cache_fleet_sums_saturate_each_measurement() -> TestResult {
     }
     let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
     let state = fill(&mut builder, &blank(), 1, &world, 1_000, ok(0))?;
-    assert_eq!(state.fleets[0].worker_cache.totals, WorkerCache {
-        local: CacheReads { requests: u64::MAX, bytes: u64::MAX },
-        remote: CacheReads { requests: u64::MAX, bytes: u64::MAX },
-        evictions: u64::MAX,
-        evicted: u64::MAX,
-        used: u64::MAX,
-        budget: u64::MAX,
-    });
+    assert_eq!(
+        state.fleets[0].worker_cache.totals,
+        WorkerCache {
+            local: CacheReads {
+                requests: u64::MAX,
+                bytes: u64::MAX
+            },
+            remote: CacheReads {
+                requests: u64::MAX,
+                bytes: u64::MAX
+            },
+            evictions: u64::MAX,
+            evicted: u64::MAX,
+            used: u64::MAX,
+            budget: u64::MAX,
+        }
+    );
     Ok(())
 }
-
 
 #[test]
 fn counts_workers_by_phase_and_instances_by_lifecycle() -> TestResult {

@@ -14,14 +14,17 @@ use std::time::Duration;
 
 use gang_clock::Timestamp;
 use gang_reconciler::{Activity, FleetPass, HostedSnapshot};
-use gang_spi::{FleetSupply, QueuedActionView, SchedulerSnapshot, StoreKind, Traffic, WorkerCacheStats};
+use gang_spi::{
+    FleetSupply, QueuedActionView, SchedulerSnapshot, StoreKind, Traffic, WorkerCacheStats,
+};
 use gang_types::{
     ActionResources, FleetCatalog, FleetProperties, InstanceLifecycle, SaturatingInto,
 };
 use gang_wire::{
-    Actions, BucketUsage, CacheReads, CacheStore, Demand, Event, Fleet, InstanceCounts, InstanceSize, Isa,
-    Lifecycle, Pass, Phase, PhaseSpan, Policy, Queue, QueuedAction, Recent, Reservation,
-    RunningAction, SkipReason, State, StoreUsage, Truncated, Worker, WorkerCache, WorkerCounts, name,
+    Actions, BucketUsage, CacheReads, CacheStore, Demand, Event, Fleet, FleetWorkerCache,
+    InstanceCounts, InstanceSize, Isa, Lifecycle, Pass, Phase, PhaseSpan, Policy, Queue,
+    QueuedAction, Recent, Reservation, RunningAction, SkipReason, State, StoreUsage, Truncated,
+    Worker, WorkerCache, WorkerCounts, name,
 };
 
 use crate::events::newer;
@@ -464,7 +467,7 @@ fn observe_fleets(
 fn observe_scheduler(cur: &mut State, fleets: &[FleetPass], snapshot: &SchedulerSnapshot) {
     for row in &mut cur.fleets {
         row.workers = WorkerCounts::default();
-        row.worker_cache = Default::default();
+        row.worker_cache = FleetWorkerCache::default();
         row.demand.running = 0;
     }
     for worker in &snapshot.workers {
@@ -487,7 +490,8 @@ fn observe_scheduler(cur: &mut State, fleets: &[FleetPass], snapshot: &Scheduler
                 let totals = &mut row.worker_cache.totals;
                 totals.local.requests = totals.local.requests.saturating_add(cache.local.requests);
                 totals.local.bytes = totals.local.bytes.saturating_add(cache.local.bytes);
-                totals.remote.requests = totals.remote.requests.saturating_add(cache.remote.requests);
+                totals.remote.requests =
+                    totals.remote.requests.saturating_add(cache.remote.requests);
                 totals.remote.bytes = totals.remote.bytes.saturating_add(cache.remote.bytes);
                 totals.evictions = totals.evictions.saturating_add(cache.evictions);
                 totals.evicted = totals.evicted.saturating_add(cache.evicted);

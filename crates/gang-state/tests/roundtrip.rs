@@ -9,9 +9,9 @@ use gang_state::{ApplyError, apply, diff};
 use gang_types::{FleetName, InstanceId, WorkerId};
 use gang_wire::name;
 use gang_wire::{
-    Actions, Cache, Demand, Fleet, Instance, InstanceCounts, InstanceSize, Isa, Lifecycle, Pass,
-    Phase, Policy, Queue, QueuedAction, Recent, RunningAction, SkipReason, State, Truncated,
-    Worker, WorkerCounts,
+    Actions, Cache, Demand, Fleet, FleetWorkerCache, Instance, InstanceCounts, InstanceSize, Isa,
+    Lifecycle, Pass, Phase, Policy, Queue, QueuedAction, Recent, RunningAction, SkipReason, State,
+    Truncated, Worker, WorkerCounts,
 };
 use gang_wire::{Cause, Event, EventChange};
 use serde_json::json;
@@ -354,7 +354,7 @@ fn random_fleet(rng: &mut Rng, fleet: &str) -> Result<Fleet, Box<dyn Error>> {
             draining: rng.small() % 2,
             unconnected: rng.small() % 2,
         },
-        worker_cache: Default::default(),
+        worker_cache: FleetWorkerCache::default(),
         demand: Demand {
             running: rng.small() % 6,
             queued: rng.small() % 6,
