@@ -228,12 +228,14 @@ fn observe_refusals<S: System>(system: &S) -> Result<Refusals> {
         let mut build_ended = false;
         let frames = system.await_stream(&mut |frames| {
             observed.observe_workers(frames);
-            if frames.iter().any(|frame| matches!(frame, Frame::Snapshot(_)))
+            if frames
+                .iter()
+                .any(|frame| matches!(frame, Frame::Snapshot(_)))
                 && let Some(receiver) = receiver.take()
             {
-                build = Some(scope.spawn(move || {
-                    system.build_until_stopped(&[Probe::Pinned], receiver)
-                }));
+                build = Some(
+                    scope.spawn(move || system.build_until_stopped(&[Probe::Pinned], receiver)),
+                );
             }
             match system.scaling_events() {
                 Ok(history) => observed.history = history,
@@ -245,7 +247,10 @@ fn observe_refusals<S: System>(system: &S) -> Result<Refusals> {
             if observed.worker.is_some() {
                 return true;
             }
-            if build.as_ref().is_some_and(std::thread::ScopedJoinHandle::is_finished) {
+            if build
+                .as_ref()
+                .is_some_and(std::thread::ScopedJoinHandle::is_finished)
+            {
                 build_ended = true;
                 return true;
             }

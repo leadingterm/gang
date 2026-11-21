@@ -1635,11 +1635,7 @@ impl Control for Simulation {
 
 impl Simulation {
     /// Counts demand until the build completes or its owner cancels it.
-    fn build_cancellable(
-        &self,
-        probes: &[Probe],
-        cancelled: &AtomicBool,
-    ) -> Result<BuildOutcome> {
+    fn build_cancellable(&self, probes: &[Probe], cancelled: &AtomicBool) -> Result<BuildOutcome> {
         {
             let mut state = self.state.lock();
             build_running(cancelled)?;

@@ -606,7 +606,9 @@ impl ControlSim {
                 if world.served < target {
                     world.queued = world.queued.saturating_sub(1);
                 }
-                return Err(E2eError::system("the simulated control build was cancelled"));
+                return Err(E2eError::system(
+                    "the simulated control build was cancelled",
+                ));
             }
             if world.served >= target {
                 let code = i32::from(world.outcome == Served::Failed);
