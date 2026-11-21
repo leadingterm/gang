@@ -534,13 +534,13 @@ impl Events {
                         managed: self.managed.0.read().contains_key(group),
                     },
                 );
-                self.finish_activity_history(group, out, start, result.is_ok());
+                let deferred = self.finish_activity_history(group, out, start, result.is_ok());
                 {
                     let mut errors = self.activity_errors.write();
                     match &result {
                         Ok(()) => {
                             if let Some(observed) = poll.groups.get_mut(group) {
-                                observed.dirty = false;
+                                observed.dirty = deferred;
                             }
                             errors.remove(group);
                         }
@@ -718,10 +718,10 @@ impl Events {
         events: &mut Vec<InfrastructureEvent>,
         start: usize,
         complete: bool,
-    ) {
+    ) -> bool {
         let mut histories = self.history.write();
         let Some(history) = histories.get_mut(group) else {
-            return;
+            return events.len() > start;
         };
         if complete {
             history
@@ -731,6 +731,9 @@ impl Events {
         for event in &events[start..] {
             Self::record_activity(history, event, self.limit);
         }
+        let deferred = events[start..]
+            .iter()
+            .any(|event| !history.deliveries.contains_key(&event.id));
         // An event that did not fit must wait for a later poll rather than be
         // exposed without a replayable payload.
         let mut index = 0;
@@ -743,6 +746,7 @@ impl Events {
             index += 1;
             keep
         });
+        deferred
     }
 
     fn replay_activity_history(
@@ -1866,6 +1870,114 @@ mod tests {
         assert!(left.is_empty());
         assert!(right.is_empty());
         assert!(events.history.read()[FLEET].deliveries[&initial[0].id].acknowledged);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deferred_activity_retries_after_pending_delivery_is_acknowledged()
+    -> Result<(), Box<dyn Error>> {
+        use aws_sdk_autoscaling::operation::describe_auto_scaling_groups::DescribeAutoScalingGroupsOutput;
+        use aws_sdk_autoscaling::types::AutoScalingGroup;
+
+        let fake = FakeAws::start().await?;
+        seed_activity(
+            &fake,
+            "old",
+            "2026-11-19T09:50:00Z",
+            &format!("Launching a new EC2 instance: {OLD}"),
+            "ordinary launch",
+        );
+        let sdk = fake.sdk_config().await;
+        let clock = Arc::new(TestClock::new(Timestamp::from_rfc3339(
+            "2026-11-19T09:52:00Z",
+        )?));
+        let mut config = config(None)?;
+        config.activity_limit = 1;
+        let managed = Arc::new(Managed::default());
+        managed.add(fleet(FLEET)?.view());
+        let events = Events::new(
+            &sdk,
+            &config,
+            clock.clone(),
+            managed,
+            aws_sdk_autoscaling::Client::new(&sdk),
+        );
+        let snapshot = |maximum| {
+            DescribeAutoScalingGroupsOutput::builder()
+                .auto_scaling_groups(
+                    AutoScalingGroup::builder()
+                        .auto_scaling_group_name(FLEET)
+                        .desired_capacity(0)
+                        .min_size(0)
+                        .max_size(maximum)
+                        .build(),
+                )
+                .build()
+        };
+        let calls = || {
+            fake.state().requests.iter()
+                .filter(|request| request.operation == "DescribeScalingActivities")
+                .count()
+        };
+        let mut out = Vec::new();
+        events.observe_groups(&snapshot(1)).await;
+        events.supply(FLEET, std::iter::once(FLEET), &mut out).await?;
+        assert_eq!(out[0].id, "old");
+        assert_eq!(calls(), 1);
+
+        seed_activity(
+            &fake,
+            "new",
+            "2026-11-19T09:51:00Z",
+            &format!("Launching a new EC2 instance: {NEW}"),
+            "ordinary launch",
+        );
+        events.observe_groups(&snapshot(2)).await;
+        events.supply(FLEET, std::iter::once(FLEET), &mut out).await?;
+        assert_eq!(calls(), 1);
+        clock.advance(Duration::from_mins(1));
+        events.supply(FLEET, std::iter::once(FLEET), &mut out).await?;
+        assert_eq!(calls(), 2);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "old");
+        assert!(events.activity_poll.lock().await.groups[FLEET].dirty);
+
+        gang_testkit::fence::with_held(async |held| {
+            events.acknowledge(held, FLEET, "old").await
+        }).await?;
+        events.supply(FLEET, std::iter::once(FLEET), &mut out).await?;
+        assert!(out.is_empty());
+        assert_eq!(calls(), 2);
+        clock.advance(Duration::from_mins(1));
+        events.supply(FLEET, std::iter::once(FLEET), &mut out).await?;
+        assert_eq!(calls(), 3);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "new");
+        assert!(!events.activity_poll.lock().await.groups[FLEET].dirty);
+        gang_testkit::fence::with_held(async |held| {
+            events.acknowledge(held, FLEET, "new").await
+        }).await?;
+        events.supply(FLEET, std::iter::once(FLEET), &mut out).await?;
+        assert!(out.is_empty());
+        clock.advance(Duration::from_mins(1));
+        events.supply(FLEET, std::iter::once(FLEET), &mut out).await?;
+        assert!(out.is_empty());
+        assert_eq!(calls(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_during_poll_is_not_deferred() -> Result<(), Box<dyn Error>> {
+        let (_fake, _clock, fleets) = replay_setup().await?;
+        let events = fleets.events();
+        let mut out = Vec::new();
+        events.supply(FLEET, std::iter::once(FLEET), &mut out).await?;
+        assert_eq!(out.len(), 1);
+        gang_testkit::fence::with_held(async |held| {
+            events.acknowledge(held, FLEET, &out[0].id).await
+        }).await?;
+        assert!(!events.finish_activity_history(FLEET, &mut out, 0, true));
+        assert!(out.is_empty());
         Ok(())
     }
 

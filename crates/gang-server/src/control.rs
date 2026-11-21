@@ -213,7 +213,7 @@ where
     }
 
     fn finish_pass(&mut self, mut wall: Timestamp, outcome: PassOutcome) -> PassOutcome {
-        if self.pass_error.is_none() {
+        if !matches!(outcome, PassOutcome::Skipped(_)) && self.pass_error.is_none() {
             self.pass_error = self.observation_error.take();
         }
         if matches!(outcome, PassOutcome::Skipped(_)) {

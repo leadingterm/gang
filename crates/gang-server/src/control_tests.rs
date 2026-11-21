@@ -135,6 +135,54 @@ impl ProvisionerPort for DiagnosticProvisioner {
     }
 }
 
+struct PausedSupplyProvisioner {
+    inner: DiagnosticProvisioner,
+    resume: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl ProvisionerPort for PausedSupplyProvisioner {
+    type FleetOptions = Opaque;
+
+    async fn supply(
+        &self,
+        fleet: Fleet<'_, Opaque>,
+        into: &mut FleetSupply,
+    ) -> Result<(), PortError> {
+        self.inner.supply(fleet, into).await?;
+        let resume = self.resume.lock().take();
+        if let Some(resume) = resume {
+            resume.await.expect("test resumes the supply read");
+        }
+        Ok(())
+    }
+
+    fn observation_error(&self, fleet: Fleet<'_, Opaque>) -> Result<Option<String>, PortError> {
+        self.inner.observation_error(fleet)
+    }
+
+    async fn set_desired_capacity(
+        &self,
+        held: &Held,
+        fleet: Fleet<'_, Opaque>,
+        desired: u32,
+    ) -> Result<(), PortError> {
+        self.inner.set_desired_capacity(held, fleet, desired).await
+    }
+
+    async fn terminate(
+        &self,
+        held: &Held,
+        fleet: Fleet<'_, Opaque>,
+        instance: &InstanceId,
+    ) -> Result<(), PortError> {
+        self.inner.terminate(held, fleet, instance).await
+    }
+
+    fn worker_lifetime(&self) -> gang_types::WorkerLifetime {
+        self.inner.worker_lifetime()
+    }
+}
+
 #[derive(Default)]
 struct RegistrationProvisioner {
     inner: FakeProvisioner,
@@ -3447,6 +3495,112 @@ async fn later_fatal_supply_error_takes_precedence_over_history_warning() -> Tes
         PassOutcome::Completed { failed: 0, .. }
     ));
     assert_eq!(served(&hub).pass.error, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn post_supply_leadership_lapse_does_not_publish_observation_warning() -> TestResult {
+    let clock = clock_at(1_000_000);
+    let fleets = fleets();
+    let fleet = DiagnosticProvisioner {
+        inner: FakeProvisioner::default(),
+        fail_supply: AtomicBool::new(false),
+        observation_error: AtomicBool::new(true),
+    };
+    fleet.inner.advance_on_supply(Arc::clone(&clock), Duration::from_secs(11));
+    let scheduler = FakeScheduler::new()?;
+    let repository = FakeRepository::default();
+    let hub = hub();
+    let (fence, keeper) = Fence::lease(
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        NonZeroDuration::from_secs(2),
+    );
+    keeper.extend_to(clock.monotonic() + Duration::from_secs(10));
+    let mut control = ControlLoop::new(
+        &fleets,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        gang_types::nonzero_u32(2),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
+        fence,
+    )
+    .with_publisher(publisher(&hub));
+    assert_eq!(
+        control.pass().await,
+        PassOutcome::Skipped(SkipReason::LeadershipLapsed)
+    );
+    assert_eq!(fleet.inner.supply_calls().len(), 1);
+    let state = served(&hub);
+    assert_eq!(state.pass.state, PassState::Skipped);
+    assert_eq!(state.pass.skip_reason, Some(SkipReason::LeadershipLapsed));
+    assert_eq!(state.pass.error, None);
+    assert!(scheduler.retain_drains_calls().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn post_supply_scheduler_unavailable_does_not_publish_observation_warning() -> TestResult {
+    let clock = clock_at(1_000_000);
+    let fleets = fleets();
+    let (resume, paused) = tokio::sync::oneshot::channel();
+    let fleet = PausedSupplyProvisioner {
+        inner: DiagnosticProvisioner {
+            inner: FakeProvisioner::default(),
+            fail_supply: AtomicBool::new(false),
+            observation_error: AtomicBool::new(true),
+        },
+        resume: Mutex::new(Some(paused)),
+    };
+    let scheduler = FakeScheduler::with_control_acquire_timeout(clock.clone(), POLL_INTERVAL)?;
+    let repository = FakeRepository::default();
+    let hub = hub();
+    let mut control = ControlLoop::new(
+        &fleets,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        gang_types::nonzero_u32(2),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
+        gang_testkit::fence::valid_fence(),
+    )
+    .with_publisher(publisher(&hub));
+    let pass = control.pass();
+    futures::pin_mut!(pass);
+    assert!(poll!(pass.as_mut()).is_pending());
+    assert_eq!(fleet.inner.inner.supply_calls().len(), 1);
+    let guard = scheduler.hold_control_acquisition().await?;
+    resume.send(()).expect("supply read is waiting");
+    assert!(poll!(pass.as_mut()).is_pending());
+    clock.advance(BEFORE_POLL);
+    assert!(poll!(pass.as_mut()).is_pending());
+    clock.advance(TICK);
+    assert_eq!(
+        pass.await,
+        PassOutcome::Skipped(SkipReason::SchedulerUnavailable)
+    );
+    let state = served(&hub);
+    assert_eq!(state.pass.state, PassState::Skipped);
+    assert_eq!(state.pass.skip_reason, Some(SkipReason::SchedulerUnavailable));
+    assert_eq!(state.pass.error, None);
+    assert!(scheduler.retain_drains_calls().is_empty());
+    drop(guard);
     Ok(())
 }
 
