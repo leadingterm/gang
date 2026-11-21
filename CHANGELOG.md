@@ -37,7 +37,7 @@
 
 ### Upgrade notes
 
-- Run `gang setup` after upgrading for new scoped actions. Explicit execution platforms and target execution properties must merge `EXEC_PROPERTIES` from `@gang_env//:defs.bzl`; see [client wiring](docs/SPECIFICATION.md#42-client-wiring--github-actions). Expect a cold cache because the action-environment identity changed. Frozen old rendered rc files remain unchanged and genuinely unscoped: their cache labels do not identify execution, and only actual unscoped live workers can serve them. Noncurrent identities likewise require matching live workers. Once matching workers retire, rerun setup for new actions; already queued work can wait until its existing timeout.
+- Run `gang setup` after upgrading for new scoped actions. Explicit execution platforms and target execution properties must merge `EXEC_PROPERTIES` from `@gang_env//:defs.bzl`; see [client wiring](docs/SPECIFICATION.md#42-client-wiring--github-actions). Expect a cold cache because the action-environment identity changed. Frozen old rendered rc files remain unchanged and genuinely unscoped: their cache labels do not identify execution, and only actual unscoped live workers can serve them. Noncurrent identities likewise require matching live workers. The controller retains actual matching workers while queued or running work needs their exact optional identity. After the last matching unscoped worker retires, fresh submissions using the old rc fail fast with `run gang setup` guidance.
 - See [restart and rollback](docs/SPECIFICATION.md#5-autoscaler-state--restart) for scaling configuration and downgrade constraints, and the [specification](docs/SPECIFICATION.md) for the v0.3.3 upgrade prerequisite and compatibility removals.
 
 ## 0.3.3
