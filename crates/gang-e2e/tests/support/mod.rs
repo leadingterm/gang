@@ -714,11 +714,10 @@ impl Simulation {
     }
 
     /// The report `probe` writes when it runs under `sandbox`, or `None` when it writes none.
-    fn report_for(&self, probe: Probe, sandbox: Sandbox) -> Result<Option<String>> {
+    fn report_for(&self, probe: Probe, sandbox: Sandbox) -> Option<String> {
         let namespaces = self.namespaces(sandbox);
-        Ok(match probe {
+        match probe {
             Probe::Isolated => Some(self.isolation_report(namespaces).to_string()),
-            Probe::NetworkRequested => Some("ran=yes\n".to_owned()),
             Probe::Pinned => {
                 (self.behaviour.serving == Serving::Keeps).then(|| "ran=yes\n".to_owned())
             }
@@ -791,7 +790,7 @@ impl Simulation {
                 .to_string(),
             ),
             _ => Some("ran=yes\n".to_owned()),
-        })
+        }
     }
 
     /// Records a scaling change of `fleet` at the next instant of the log.
@@ -1644,7 +1643,7 @@ impl Simulation {
                     .and_then(|index| self.fleets.get(index))
                     .map_or(self.variant.sandbox, |fleet| fleet.sandbox)
             };
-            if let Some(text) = self.report_for(*probe, sandbox)? {
+            if let Some(text) = self.report_for(*probe, sandbox) {
                 state.reports.insert(probe.as_str(), text);
             }
             if !hit && *probe != Probe::ExitThree {

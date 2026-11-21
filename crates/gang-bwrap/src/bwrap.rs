@@ -204,7 +204,8 @@ impl Bwrap {
             tokio::process::Command::from(self.command(spec, writer.as_raw_fd(), network));
         command.kill_on_drop(true);
         if network.is_some() {
-            command.process_group(gang_os::parent_process_group().map_err(BwrapError::NetworkSetup)?);
+            command
+                .process_group(gang_os::parent_process_group().map_err(BwrapError::NetworkSetup)?);
         }
         let blocked = gang_os::block_terminations().map_err(BwrapError::SignalMask)?;
         // These descriptors are inherited by bwrap (and by gang-join when a launcher is used).

@@ -63,7 +63,13 @@ mod linux {
         let work = root.join("work/granted-termination/work");
         fs::create_dir_all(&work)?;
         let listener = UnixListener::bind(work.join("control.sock"))?;
-        let mut child = start(root, "granted-termination", true, "termination", "127.0.0.1")?;
+        let mut child = start(
+            root,
+            "granted-termination",
+            true,
+            "termination",
+            "127.0.0.1",
+        )?;
         let group = gang_os::ProcessGroup::of(&child).ok_or("action has no process group")?;
         signal(&listener).await?;
         // Signal NativeLink's original gang-exec group, not the payload's guest group.
@@ -189,20 +195,12 @@ mod linux {
         }
         fs::write(config_path, text)?;
         fs::write(config_path, text.replace("[limits.cgroup]\n", ""))?;
-        wait(
-            start(root, "no-scope", true, "connect", "11.0.0.2")?,
-            false,
-        )
-        .await?;
+        wait(start(root, "no-scope", true, "connect", "11.0.0.2")?, false).await?;
         if root.join("work/no-scope/work/started").exists() {
             return Err("no-scope payload executed".into());
         }
         fs::write(config_path, text.replace("1.1.1.1", "8.8.8.8"))?;
-        wait(
-            start(root, "mismatch", true, "connect", "11.0.0.2")?,
-            false,
-        )
-        .await?;
+        wait(start(root, "mismatch", true, "connect", "11.0.0.2")?, false).await?;
         if root.join("work/mismatch/work/started").exists() {
             return Err("mismatched-policy payload executed".into());
         }
