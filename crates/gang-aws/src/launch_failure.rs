@@ -171,13 +171,35 @@ fn classify_attempt<'a>(
     candidates: &crate::group::LaunchCandidates,
 ) -> Option<Attempt<'a>> {
     let message = activity.status_message()?;
-    let capacity = tokens(message).any(|token| {
-        matches!(
-            token,
-            "InsufficientInstanceCapacity" | "UnfulfillableCapacity"
-        )
-    });
-    let invalid = tokens(message).any(|token| token == "InvalidFleetConfiguration");
+    // AWS documents these status messages without error codes:
+    // https://docs.aws.amazon.com/autoscaling/ec2/userguide/ts-as-instancelaunchfailure.html#ts-as-capacity-2
+    let specific_capacity = message
+        .split_once("We currently do not have sufficient ")
+        .and_then(|(_, rest)| rest.split_once(" capacity in the Availability Zone you requested"))
+        .map(|(kind, rest)| {
+            let zone = rest
+                .strip_prefix(" (")
+                .and_then(|rest| rest.split_once(')'))
+                .map(|(zone, _)| zone);
+            (kind, zone)
+        });
+    let unsupported = message
+        .split_once("Your requested instance type (")
+        .and_then(|(_, rest)| {
+            rest.split_once(") is not supported in your requested Availability Zone (")
+        })
+        .and_then(|(kind, rest)| rest.split_once(')').map(|(zone, _)| (kind, zone)));
+    let capacity = message
+        .contains("There is no Spot capacity available that matches your request.")
+        || specific_capacity.is_some()
+        || tokens(message).any(|token| {
+            matches!(
+                token,
+                "InsufficientInstanceCapacity" | "UnfulfillableCapacity"
+            )
+        });
+    let invalid =
+        unsupported.is_some() || tokens(message).any(|token| token == "InvalidFleetConfiguration");
     if !capacity && !invalid {
         return None;
     }
@@ -193,11 +215,15 @@ fn classify_attempt<'a>(
     let (detail_zone, detail_type) = details
         .map(|details| (details.zone, details.instance_type))
         .unwrap_or_default();
+    let reported_zone = specific_capacity
+        .and_then(|(_, zone)| zone)
+        .or(unsupported.map(|(_, zone)| zone));
     let zone = match detail_zone.filter(|zone| !zone.trim().is_empty()) {
         Some(zone) => zone,
-        None => Cow::Borrowed(unique_match(&|token| {
-            candidates.pairs().any(|(_, zone)| zone == token)
-        })?),
+        None => Cow::Borrowed(match reported_zone {
+            Some(zone) => zone,
+            None => unique_match(&|token| candidates.pairs().any(|(_, zone)| zone == token))?,
+        }),
     };
     if !candidates
         .pairs()
@@ -205,15 +231,24 @@ fn classify_attempt<'a>(
     {
         return None;
     }
+    if reported_zone.is_some_and(|reported| reported != zone.as_ref()) {
+        return None;
+    }
+    let reported_type = specific_capacity
+        .map(|(kind, _)| kind)
+        .or(unsupported.map(|(kind, _)| kind));
     let instance_type = match detail_type.filter(|kind| !kind.trim().is_empty()) {
         Some(instance_type) => Some(instance_type),
-        None => unique_match(&|token| candidates.pairs().any(|(kind, _)| kind == token))
-            .map(Cow::Borrowed),
+        None => reported_type.map(Cow::Borrowed).or_else(|| {
+            unique_match(&|token| candidates.pairs().any(|(kind, _)| kind == token))
+                .map(Cow::Borrowed)
+        }),
     };
     if let Some(instance_type) = &instance_type {
-        if !candidates
-            .pairs()
-            .any(|(kind, _)| kind == instance_type.as_ref())
+        if reported_type.is_some_and(|reported| reported != instance_type.as_ref())
+            || !candidates
+                .pairs()
+                .any(|(kind, _)| kind == instance_type.as_ref())
         {
             return None;
         }
@@ -326,6 +361,203 @@ mod tests {
             .status_message(message)
             .details(details)
             .build()
+    }
+
+    #[test]
+    fn documented_uncoded_spot_stockouts_require_every_zone() {
+        let candidates = candidates(false);
+        let reason = "There is no Spot capacity available that matches your request. Launching EC2 instance failed.";
+        let a = with_details(reason, r#"{"Availability Zone":"us-east-1a"}"#);
+        let b = with_details(reason, r#"{"Availability Zone":"us-east-1b"}"#);
+        assert_eq!(
+            assess(std::slice::from_ref(&a), Some(&candidates), true),
+            Assessment::NotBlocked
+        );
+        assert_eq!(
+            assess(std::slice::from_ref(&a), Some(&candidates), false),
+            Assessment::Incomplete
+        );
+        assert_eq!(
+            assess(&[a.clone(), b.clone()], Some(&candidates), true),
+            Assessment::Blocked(reason)
+        );
+        assert_eq!(
+            assess(&[a, b], Some(&candidates), false),
+            Assessment::Incomplete
+        );
+        let coded = [
+            with_details(
+                "UnfulfillableCapacity",
+                r#"{"Availability Zone":"us-east-1a"}"#,
+            ),
+            with_details(
+                "InsufficientInstanceCapacity",
+                r#"{"Availability Zone":"us-east-1b"}"#,
+            ),
+        ];
+        assert_eq!(
+            assess(&coded, Some(&candidates), true),
+            Assessment::Blocked("UnfulfillableCapacity")
+        );
+    }
+
+    #[test]
+    fn documented_type_specific_failures_only_cover_the_reported_pair() {
+        let candidates = candidates(false);
+        let reason = "We currently do not have sufficient c7g.large capacity in the Availability Zone you requested. Launching EC2 instance failed.";
+        let first = with_details(reason, r#"{"Availability Zone":"us-east-1a"}"#);
+        let remaining = [
+            failed("InvalidFleetConfiguration m7g.large us-east-1a"),
+            failed("InvalidFleetConfiguration c7g.large us-east-1b"),
+            failed("InvalidFleetConfiguration m7g.large us-east-1b"),
+        ];
+        assert_eq!(
+            assess(std::slice::from_ref(&first), Some(&candidates), true),
+            Assessment::NotBlocked
+        );
+        assert_eq!(
+            assess(
+                &[first.clone(), remaining[1].clone(), remaining[2].clone()],
+                Some(&candidates),
+                true
+            ),
+            Assessment::NotBlocked
+        );
+        assert_eq!(
+            assess(
+                &[
+                    first,
+                    remaining[0].clone(),
+                    remaining[1].clone(),
+                    remaining[2].clone()
+                ],
+                Some(&candidates),
+                true
+            ),
+            Assessment::Blocked(reason)
+        );
+        for foreign in [
+            with_details(
+                "We currently do not have sufficient x9.large capacity in the Availability Zone you requested",
+                r#"{"Availability Zone":"us-east-1a"}"#,
+            ),
+            with_details(reason, r#"{"Availability Zone":"us-east-1z"}"#),
+            with_details(
+                reason,
+                r#"{"Availability Zone":"us-east-1a","Instance Type":"m7g.large"}"#,
+            ),
+            with_details(
+                "An unknown launch failure occurred",
+                r#"{"Availability Zone":"us-east-1a"}"#,
+            ),
+        ] {
+            assert_eq!(
+                assess(
+                    &[
+                        foreign,
+                        remaining[0].clone(),
+                        remaining[1].clone(),
+                        remaining[2].clone()
+                    ],
+                    Some(&candidates),
+                    true
+                ),
+                Assessment::NotBlocked
+            );
+        }
+    }
+
+    #[test]
+    fn requested_zone_takes_precedence_over_capacity_suggestions() {
+        let candidates = candidates(false);
+        let foreign = "We currently do not have sufficient c7g.large capacity in the Availability Zone you requested (us-east-1z). You can currently get c7g.large capacity by choosing us-east-1a.";
+        let current = "We currently do not have sufficient c7g.large capacity in the Availability Zone you requested (us-east-1a). You can currently get c7g.large capacity by choosing us-east-1z.";
+        let remaining = [
+            failed("InvalidFleetConfiguration m7g.large us-east-1a"),
+            failed("InvalidFleetConfiguration c7g.large us-east-1b"),
+            failed("InvalidFleetConfiguration m7g.large us-east-1b"),
+        ];
+        for activity in [
+            failed(foreign),
+            with_details(foreign, r#"{"Availability Zone":"us-east-1a"}"#),
+        ] {
+            assert_eq!(
+                assess(
+                    &[
+                        activity,
+                        remaining[0].clone(),
+                        remaining[1].clone(),
+                        remaining[2].clone()
+                    ],
+                    Some(&candidates),
+                    true
+                ),
+                Assessment::NotBlocked
+            );
+        }
+        assert_eq!(
+            assess(
+                &[failed(current), remaining[1].clone(), remaining[2].clone()],
+                Some(&candidates),
+                true
+            ),
+            Assessment::NotBlocked
+        );
+        assert_eq!(
+            assess(
+                &[
+                    failed(current),
+                    remaining[0].clone(),
+                    remaining[1].clone(),
+                    remaining[2].clone()
+                ],
+                Some(&candidates),
+                true
+            ),
+            Assessment::Blocked(current)
+        );
+    }
+
+    #[test]
+    fn documented_unsupported_type_and_zone_require_exact_current_pair() {
+        let candidates = candidates(false);
+        let reason = "Your requested instance type (c7g.large) is not supported in your requested Availability Zone (us-east-1a).";
+        let remaining = [
+            failed("InvalidFleetConfiguration m7g.large us-east-1a"),
+            failed("InvalidFleetConfiguration c7g.large us-east-1b"),
+            failed("InvalidFleetConfiguration m7g.large us-east-1b"),
+        ];
+        assert_eq!(
+            assess(
+                &[
+                    failed(reason),
+                    remaining[0].clone(),
+                    remaining[1].clone(),
+                    remaining[2].clone()
+                ],
+                Some(&candidates),
+                true
+            ),
+            Assessment::Blocked(reason)
+        );
+        for message in [
+            "Your requested instance type (x9.large) is not supported in your requested Availability Zone (us-east-1a).",
+            "Your requested instance type (c7g.large) is not supported in your requested Availability Zone (us-east-1z).",
+        ] {
+            assert_eq!(
+                assess(
+                    &[
+                        failed(message),
+                        remaining[0].clone(),
+                        remaining[1].clone(),
+                        remaining[2].clone()
+                    ],
+                    Some(&candidates),
+                    true
+                ),
+                Assessment::NotBlocked
+            );
+        }
     }
 
     #[test]

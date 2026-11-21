@@ -25,7 +25,8 @@ const TWIN: &str = "gang-fleet-on-demand";
 const RETRY_SPOT_AFTER: Duration = Duration::from_mins(5);
 /// Launch time seeded for the spot members that have one.
 const SPOT_LAUNCH: &str = "2026-01-01T00:00:00.000Z";
-const SPOT_FAILURE: &str = "InsufficientInstanceCapacity: no Spot capacity available";
+const SPOT_FAILURE: &str =
+    "There is no Spot capacity available that matches your request. Launching EC2 instance failed.";
 const ON_DEMAND_FAILURE: &str = "InsufficientInstanceCapacity: no On-Demand capacity available";
 /// Unix milliseconds of [`SPOT_LAUNCH`].
 const SPOT_LAUNCH_MILLIS: u64 = 1_767_225_600_000;
@@ -397,7 +398,7 @@ async fn unattributed_or_foreign_stockout_warns_without_fallback() -> TestResult
 
 #[tokio::test]
 async fn zonal_stockouts_require_all_zones_before_fallback() -> TestResult {
-    const REASON: &str = "InsufficientInstanceCapacity: no Spot capacity available";
+    const REASON: &str = SPOT_FAILURE;
     let harness = harness_with(vec![two_zone_spot(), protected(TWIN, 0, &[])]).await?;
     let fleet = fleet_with(FLEET, fallback_options(true)?)?;
     let mut supply = FleetSupply::default();

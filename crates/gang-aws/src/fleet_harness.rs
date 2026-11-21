@@ -110,7 +110,7 @@ impl Harness {
             status_code: status.to_owned(),
             start_time: start_time.to_owned(),
             message: Some(if status == "Failed" {
-                "InsufficientInstanceCapacity: no Spot capacity available".to_owned()
+                "There is no Spot capacity available that matches your request. Launching EC2 instance failed.".to_owned()
             } else {
                 String::new()
             }),
