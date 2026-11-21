@@ -391,10 +391,9 @@ fn scheduler_stack(
         resources,
         |simple, notify, sketch| {
             resource = Some(Arc::clone(&sketch));
-            let dispatch_clock = Arc::clone(&clock);
             let now = move || {
                 std::time::UNIX_EPOCH
-                    + std::time::Duration::from_millis(dispatch_clock.wall().as_unix_millis())
+                    + std::time::Duration::from_millis(clock.wall().as_unix_millis())
             };
             let db = memory_awaited_action_db_factory(
                 simple.retain_completed_for_s,

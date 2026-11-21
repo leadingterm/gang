@@ -1350,7 +1350,7 @@ mod tests {
             drain.workers[1].deadline,
             Timestamp::from_unix_millis(15_001)
         );
-        clock.advance(Duration::from_millis(15_000));
+        clock.advance(Duration::from_secs(15));
         scheduler.hand_off(&mut drain).await?;
         assert!(!drain.complete);
         assert_eq!(drain.workers.len(), 1);
@@ -1926,6 +1926,38 @@ mod tests {
         assert!(scheduler.published.borrow().is_none());
     }
 
+    async fn assert_response_release_before_listener_end(spec: &ControllerSpec<'_>) -> TestResult {
+        let scheduler = FakeScheduler::new()?;
+        let release = scheduler.hold_drain();
+        let connections = ControllerConnections {
+            public: Listening {
+                connections: futures::stream::pending().boxed(),
+                gate: AdmitAll,
+            },
+            worker: Listening {
+                connections: futures::stream::pending().boxed(),
+                gate: AdmitAll,
+            },
+            api: EmptyApi,
+        };
+        let (ready, mut readiness) = ControllerReady::channel();
+        let run = scheduler.run_controller(spec, connections, ready);
+        futures::pin_mut!(run);
+        assert!(run.as_mut().now_or_never().is_none());
+        assert!(readiness.try_recv().is_ok());
+        let mut drain = ControllerDrain::default();
+        scheduler.hand_off(&mut drain).await?;
+        assert_eq!(scheduler.drains().get(), 1);
+        assert!(!drain.complete);
+        release.send(()).map_err(|()| "held response disappeared")?;
+        scheduler.hand_off(&mut drain).await?;
+        assert_eq!(scheduler.drains().get(), 1);
+        assert!(drain.complete);
+        assert!(run.as_mut().now_or_never().is_none());
+        assert!(scheduler.published.borrow().is_some());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn controller_serves_all_listeners_until_each_stream_ends() -> TestResult {
         let fixture = WorkerFixture::new()?;
@@ -1948,36 +1980,7 @@ mod tests {
                 .attempt_budget(gang_config::ActionsConfig::default().timeout),
             observations: &observations,
         };
-        {
-            let scheduler = FakeScheduler::new()?;
-            let release = scheduler.hold_drain();
-            let connections = ControllerConnections {
-                public: Listening {
-                    connections: futures::stream::pending().boxed(),
-                    gate: AdmitAll,
-                },
-                worker: Listening {
-                    connections: futures::stream::pending().boxed(),
-                    gate: AdmitAll,
-                },
-                api: EmptyApi,
-            };
-            let (ready, mut readiness) = ControllerReady::channel();
-            let run = scheduler.run_controller(&spec, connections, ready);
-            futures::pin_mut!(run);
-            assert!(run.as_mut().now_or_never().is_none());
-            assert!(readiness.try_recv().is_ok());
-            let mut drain = ControllerDrain::default();
-            scheduler.hand_off(&mut drain).await?;
-            assert_eq!(scheduler.drains().get(), 1);
-            assert!(!drain.complete);
-            release.send(()).map_err(|()| "held response disappeared")?;
-            scheduler.hand_off(&mut drain).await?;
-            assert_eq!(scheduler.drains().get(), 1);
-            assert!(drain.complete);
-            assert!(run.as_mut().now_or_never().is_none());
-            assert!(scheduler.published.borrow().is_some());
-        }
+        assert_response_release_before_listener_end(&spec).await?;
         let scheduler = FakeScheduler::new()?;
         for last in 0..2 {
             let mut received = scheduler.connections();

@@ -511,7 +511,8 @@ mod tests {
             state.target_health.insert("second".into(), Vec::new());
             state.target_health.insert("unattached".into(), Vec::new());
         }
-        let task = tokio::spawn(async move { aws.reached(HostMilestone::Prepared).await });
+        let task =
+            tokio::spawn(async move { Box::pin(aws.reached(HostMilestone::Prepared)).await });
         while fake
             .state()
             .requests
@@ -568,8 +569,8 @@ mod tests {
                 .target_health
                 .insert("tg".into(), vec![(INSTANCE.into(), "unhealthy".into())]);
         }
-        aws.reached(HostMilestone::Prepared).await?;
-        aws.reached(HostMilestone::Prepared).await?;
+        Box::pin(aws.reached(HostMilestone::Prepared)).await?;
+        Box::pin(aws.reached(HostMilestone::Prepared)).await?;
         assert!(
             !fake
                 .state()
@@ -579,7 +580,11 @@ mod tests {
         );
         assert_eq!(fake.state().target_health["tg"][0].1, "unhealthy");
         fake.state().groups[0].instances[0].lifecycle_state = "Terminating:Wait".into();
-        assert!(aws.reached(HostMilestone::Prepared).await.is_err());
+        assert!(
+            Box::pin(aws.reached(HostMilestone::Prepared))
+                .await
+                .is_err()
+        );
         assert!(
             !fake
                 .state()
@@ -692,7 +697,7 @@ mod tests {
     async fn milestones_complete_only_the_matching_hook() -> TestResult {
         let (fake, aws, _) = setup().await?;
         seed(&fake);
-        aws.reached(HostMilestone::Serving).await?;
+        Box::pin(aws.reached(HostMilestone::Serving)).await?;
         assert_eq!(
             fake.state().lifecycle_completions,
             vec![(GROUP.to_owned(), "launch".to_owned(), INSTANCE.to_owned())]
@@ -702,7 +707,7 @@ mod tests {
             state.target_lifecycle_state = Some("Terminated".to_owned());
             state.groups[0].instances[0].lifecycle_state = "Terminating:Wait".to_owned();
         }
-        aws.reached(HostMilestone::HandedOff).await?;
+        Box::pin(aws.reached(HostMilestone::HandedOff)).await?;
         let state = fake.state();
         assert_eq!(
             state.lifecycle_completions,
@@ -732,11 +737,11 @@ mod tests {
     async fn serving_restart_on_in_service_does_not_complete_launch_hook() -> TestResult {
         let (fake, aws, clock) = setup().await?;
         seed(&fake);
-        aws.reached(HostMilestone::Serving).await?;
+        Box::pin(aws.reached(HostMilestone::Serving)).await?;
         fake.state().promote(GROUP, INSTANCE);
 
         let restarted = aws_for(&fake, clock).await?;
-        restarted.reached(HostMilestone::Serving).await?;
+        Box::pin(restarted.reached(HostMilestone::Serving)).await?;
 
         let state = fake.state();
         assert_eq!(
@@ -760,7 +765,7 @@ mod tests {
         seed(&fake);
         fake.state().promote(GROUP, INSTANCE);
 
-        aws.reached(HostMilestone::Serving).await?;
+        Box::pin(aws.reached(HostMilestone::Serving)).await?;
 
         let state = fake.state();
         assert!(
@@ -780,7 +785,7 @@ mod tests {
             seed(&fake);
             fake.state().groups[0].instances[0].lifecycle_state = lifecycle.to_owned();
 
-            aws.reached(HostMilestone::Serving).await?;
+            Box::pin(aws.reached(HostMilestone::Serving)).await?;
 
             let state = fake.state();
             assert!(
@@ -815,7 +820,7 @@ mod tests {
                 ];
             }
 
-            aws.reached(HostMilestone::Serving).await?;
+            Box::pin(aws.reached(HostMilestone::Serving)).await?;
 
             let state = fake.state();
             let describe = state
@@ -862,7 +867,7 @@ mod tests {
         );
 
         assert!(matches!(
-            aws.reached(HostMilestone::Serving).await,
+            Box::pin(aws.reached(HostMilestone::Serving)).await,
             Err(PortError::Unavailable(_))
         ));
         assert!(
@@ -890,7 +895,7 @@ mod tests {
             );
 
             assert!(matches!(
-                aws.reached(HostMilestone::Serving).await,
+                Box::pin(aws.reached(HostMilestone::Serving)).await,
                 Err(PortError::Backend(_))
             ));
             assert!(
@@ -919,7 +924,7 @@ mod tests {
             }
 
             assert!(matches!(
-                aws.reached(HostMilestone::Serving).await,
+                Box::pin(aws.reached(HostMilestone::Serving)).await,
                 Err(PortError::Backend(_))
             ));
             assert!(
@@ -940,7 +945,7 @@ mod tests {
         fake.state().identity_document = None;
 
         assert!(matches!(
-            aws.reached(HostMilestone::Serving).await,
+            Box::pin(aws.reached(HostMilestone::Serving)).await,
             Err(PortError::Backend(_))
         ));
         {
@@ -962,7 +967,7 @@ mod tests {
 
         fake.state().identity_document =
             Some(json!({"instanceId": INSTANCE, "architecture": "x86_64"}).to_string());
-        aws.reached(HostMilestone::Serving).await?;
+        Box::pin(aws.reached(HostMilestone::Serving)).await?;
         let state = fake.state();
         assert_eq!(
             state.lifecycle_completions,
@@ -988,7 +993,7 @@ mod tests {
         let (fake, aws, _) = setup().await?;
         seed(&fake);
         fake.state().target_lifecycle_state = Some("InService".to_owned());
-        aws.reached(HostMilestone::HandedOff).await?;
+        Box::pin(aws.reached(HostMilestone::HandedOff)).await?;
         assert!(fake.state().lifecycle_completions.is_empty());
         Ok(())
     }
@@ -996,7 +1001,7 @@ mod tests {
     #[tokio::test]
     async fn outside_group_does_not_call_autoscaling() -> TestResult {
         let (fake, aws, _) = setup().await?;
-        aws.reached(HostMilestone::Serving).await?;
+        Box::pin(aws.reached(HostMilestone::Serving)).await?;
         assert!(
             !fake
                 .state()
@@ -1016,7 +1021,7 @@ mod tests {
             GROUP.to_owned(),
             vec![("terminate".to_owned(), TERMINATE_TRANSITION.to_owned())],
         );
-        aws.reached(HostMilestone::Serving).await?;
+        Box::pin(aws.reached(HostMilestone::Serving)).await?;
         assert!(
             !fake
                 .state()
@@ -1040,7 +1045,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            aws.reached(HostMilestone::Serving).await,
+            Box::pin(aws.reached(HostMilestone::Serving)).await,
             Err(PortError::Backend(_))
         ));
         Ok(())
@@ -1059,7 +1064,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            aws.reached(HostMilestone::Serving).await,
+            Box::pin(aws.reached(HostMilestone::Serving)).await,
             Err(PortError::Backend(_))
         ));
         Ok(())
@@ -1078,7 +1083,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            aws.reached(HostMilestone::Serving).await,
+            Box::pin(aws.reached(HostMilestone::Serving)).await,
             Err(PortError::Backend(_))
         ));
         Ok(())
@@ -1097,10 +1102,7 @@ mod tests {
     async fn drain_limit_uses_actual_hook_and_global_cap() -> TestResult {
         let (fake, aws, _) = setup().await?;
         seed(&fake);
-        assert_eq!(
-            aws.drain_limit().await?,
-            Some(Duration::from_secs(48 * 3600))
-        );
+        assert_eq!(aws.drain_limit().await?, Some(Duration::from_hours(48)));
         fake.state().hook_heartbeat_seconds = 17;
         assert_eq!(aws.drain_limit().await?, Some(Duration::from_secs(1700)));
         fake.state().hook_heartbeat_seconds = 0;
@@ -1137,25 +1139,26 @@ mod tests {
         );
         fake.state().groups[0].instances[0].lifecycle_state = "Terminating:Wait".into();
         aws.heartbeat().await?;
-        aws.reached(HostMilestone::HandedOff).await?;
-        let state = fake.state();
-        let operations: Vec<_> = state
-            .requests
-            .iter()
-            .map(|request| request.operation.as_str())
-            .collect();
-        let heartbeat = operations
-            .iter()
-            .position(|operation| *operation == HEARTBEAT)
-            .expect("heartbeat sent");
-        let completion = operations
-            .iter()
-            .position(|operation| *operation == COMPLETE_ACTION)
-            .expect("completion sent");
-        assert!(heartbeat < completion);
-        assert_eq!(state.lifecycle_completions.len(), 1);
-        drop(state);
-        aws.reached(HostMilestone::HandedOff).await?;
+        Box::pin(aws.reached(HostMilestone::HandedOff)).await?;
+        {
+            let state = fake.state();
+            let operations: Vec<_> = state
+                .requests
+                .iter()
+                .map(|request| request.operation.as_str())
+                .collect();
+            let heartbeat = operations
+                .iter()
+                .position(|operation| *operation == HEARTBEAT)
+                .expect("heartbeat sent");
+            let completion = operations
+                .iter()
+                .position(|operation| *operation == COMPLETE_ACTION)
+                .expect("completion sent");
+            assert!(heartbeat < completion);
+            assert_eq!(state.lifecycle_completions.len(), 1);
+        }
+        Box::pin(aws.reached(HostMilestone::HandedOff)).await?;
         aws.heartbeat().await?;
         Ok(())
     }
@@ -1170,11 +1173,11 @@ mod tests {
             state.lose_completion_response = true;
         }
         assert!(matches!(
-            aws.reached(HostMilestone::HandedOff).await,
+            Box::pin(aws.reached(HostMilestone::HandedOff)).await,
             Err(PortError::Unavailable(_))
         ));
         assert_eq!(fake.state().lifecycle_completions.len(), 1);
-        aws.reached(HostMilestone::HandedOff).await?;
+        Box::pin(aws.reached(HostMilestone::HandedOff)).await?;
         aws.heartbeat().await?;
         assert_eq!(
             fake.state()
@@ -1185,7 +1188,7 @@ mod tests {
             1
         );
         fake.state().groups[0].instances.clear();
-        aws.reached(HostMilestone::HandedOff).await?;
+        Box::pin(aws.reached(HostMilestone::HandedOff)).await?;
         aws.heartbeat().await?;
         // A fresh process must still fail closed for leadership if its member is absent.
         let restarted = aws_for(&fake, Arc::new(TestClock::new(Timestamp::UNIX_EPOCH))).await?;
@@ -1199,7 +1202,8 @@ mod tests {
         seed(&fake);
         fake.state().groups[0].instances[0].lifecycle_state = "InService".into();
         fake.state().target_lifecycle_state = Some("Terminated".into());
-        let task = tokio::spawn(async move { aws.reached(HostMilestone::HandedOff).await });
+        let task =
+            tokio::spawn(async move { Box::pin(aws.reached(HostMilestone::HandedOff)).await });
         while !fake
             .state()
             .requests
@@ -1248,7 +1252,7 @@ mod tests {
                 .insert("tg".into(), vec![("i-successor".into(), "healthy".into())]);
         }
         let before = clock.wall();
-        aws.reached(HostMilestone::Unrouted).await?;
+        Box::pin(aws.reached(HostMilestone::Unrouted)).await?;
         assert_eq!(clock.wall(), before);
         assert!(
             fake.state()
@@ -1274,7 +1278,7 @@ mod tests {
                 .target_health
                 .insert("second".into(), vec![(INSTANCE.into(), "unused".into())]);
         }
-        aws.reached(HostMilestone::Unrouted).await?;
+        Box::pin(aws.reached(HostMilestone::Unrouted)).await?;
         let requested: Vec<_> = fake
             .state()
             .requests
@@ -1292,7 +1296,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            aws.reached(HostMilestone::Unrouted).await,
+            Box::pin(aws.reached(HostMilestone::Unrouted)).await,
             Err(PortError::Backend(_))
         ));
         Ok(())
@@ -1309,7 +1313,8 @@ mod tests {
                 .target_health
                 .insert("tg".into(), vec![(INSTANCE.into(), "unhealthy".into())]);
         }
-        let task = tokio::spawn(async move { aws.reached(HostMilestone::Unrouted).await });
+        let task =
+            tokio::spawn(async move { Box::pin(aws.reached(HostMilestone::Unrouted)).await });
         while !fake
             .state()
             .requests

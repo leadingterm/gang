@@ -1,8 +1,6 @@
 //! The host a controller runs on, as the provisioner manages it: when the provisioner retires
 //! it, and the milestones the provisioner waits for before it moves the host on.
 
-use std::time::Duration;
-
 use gang_clock::Timestamp;
 use gang_types::InstanceId;
 
@@ -21,7 +19,7 @@ pub trait ControllerHostPort: Send + Sync {
     ///
     /// # Errors
     /// Returns an error when the limit cannot be determined.
-    async fn drain_limit(&self) -> Result<Option<Duration>, PortError>;
+    async fn drain_limit(&self) -> Result<Option<std::time::Duration>, PortError>;
 
     /// Renews an outstanding retirement lifecycle hook.
     ///

@@ -244,29 +244,40 @@ pub(crate) async fn serve<G: RequestGate, C: Clock + Clone + Send + Sync + 'stat
     }
     // Release listening sockets and pending shared accept guards before connection drain.
     drop(connections);
+    drain_connections(listener, &shutdown, &graceful, &mut served, &mut open).await;
+    Ok(())
+}
+
+/// After intake releases its listeners, waits for hand-off and drains the retained connections.
+async fn drain_connections(
+    listener: Listener,
+    shutdown: &ServeShutdown,
+    graceful: &watch::Sender<()>,
+    served: &mut JoinSet<()>,
+    open: &mut VecDeque<Open>,
+) {
     let _ = shutdown.ended.send(());
     loop {
         tokio::select! {
             () = shutdown.handoff.begun() => break,
-            Some(finished) = served.join_next_with_id(), if !served.is_empty() => reap(finished, &mut open),
+            Some(finished) = served.join_next_with_id(), if !served.is_empty() => reap(finished, open),
         }
     }
     if listener == Listener::Worker {
         loop {
             if served.is_empty() {
-                return Ok(());
+                return;
             }
             tokio::select! {
                 () = shutdown.handoff.workers_released() => break,
-                Some(finished) = served.join_next_with_id() => reap(finished, &mut open),
+                Some(finished) = served.join_next_with_id() => reap(finished, open),
             }
         }
     }
     let _ = graceful.send(());
     while let Some(finished) = served.join_next_with_id().await {
-        reap(finished, &mut open);
+        reap(finished, open);
     }
-    Ok(())
 }
 
 /// Waits for listener shutdown or this connection's retry decision.
