@@ -122,7 +122,7 @@ mod tests {
         };
         assert_eq!(
             worker.attempt_budget(WholeSeconds::from_units(31)),
-            std::time::Duration::from_secs(60)
+            std::time::Duration::from_mins(1)
         );
     }
 

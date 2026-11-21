@@ -231,7 +231,6 @@ struct LeadContext<'a, D: Deployment> {
     actions: &'a gang_config::ActionsConfig,
     scaling: &'a Arc<gang_config::ScalingConfig>,
     sidecar_retry_interval: NonZeroDuration,
-    milestone_timeout: Duration,
 }
 
 fn controller_leadership<'a, D: Deployment>(
@@ -1239,7 +1238,6 @@ impl<D: Deployment> Server<D> {
             actions: &self.actions,
             scaling: &self.scaling,
             sidecar_retry_interval: self.leadership.renew_interval,
-            milestone_timeout: self.leadership.ttl.get(),
         };
         let result = drive_original(
             &context,

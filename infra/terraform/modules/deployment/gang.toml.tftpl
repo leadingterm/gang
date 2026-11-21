@@ -139,7 +139,7 @@ call_timeout = ${jsonencode("${leadership_call_timeout_seconds}s")}
 [server.proxy_protocol]
 trusted_cidrs = ${jsonencode(proxy_trusted_cidrs)}
 
-%{ endif ~}
+%{ endif }
 [authentication.clients.token]
 providers = ${jsonencode(client_token_providers)}
 

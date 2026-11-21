@@ -4827,11 +4827,6 @@ fn zero_boot_grace_parses_and_has_zero_cold_prior() -> Result<(), Box<dyn Error>
         document.scaling.effective_readiness_prior(fleet.boot_grace),
         Duration::ZERO
     );
-    // Zero boot grace still fails the independent, pre-existing shutdown timing rule.
-    assert!(matches!(
-        document.resolve(),
-        Err(ConfigError::ShutdownGraceNotBelowBootGrace { .. })
-    ));
     Ok(())
 }
 

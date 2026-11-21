@@ -133,7 +133,8 @@ override_data {
 }
 
 run "plans_the_example_deployment" {
-  command = apply
+  # Rendering and graph assertions need no apply or teardown of protected controller state.
+  command = plan
 
   assert {
     condition     = output.gang.endpoint == "https://gang.example.com"
