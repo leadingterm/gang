@@ -1845,61 +1845,92 @@ mod tests {
         attempts
     }
 
+    struct VerdictFixture {
+        initial_outcome: BuildOutcome,
+        post_outcome: BuildOutcome,
+        initial_evidence: BuildEvidence,
+        post_evidence: BuildEvidence,
+        in_flight: InFlight,
+        initial_attempts: Attempts,
+        post_attempts: Attempts,
+        availability: Availability,
+        drain: DrainWitness,
+        rollout: RolloutWitness,
+    }
+
+    impl VerdictFixture {
+        fn new() -> Self {
+            let (in_flight, initial_attempts, post_attempts) = verdict_attempts();
+            Self {
+                initial_outcome: BuildOutcome::new(
+                    Some(0),
+                    "INFO: 8 processes: 8 remote.".to_owned(),
+                ),
+                post_outcome: BuildOutcome::new(Some(0), "INFO: 1 process: 1 remote.".to_owned()),
+                initial_evidence: BuildEvidence {
+                    successful_actions: 8,
+                    finished_success: true,
+                    rpc_calls: 1,
+                    ..BuildEvidence::default()
+                },
+                post_evidence: BuildEvidence {
+                    successful_actions: 1,
+                    finished_success: true,
+                    rpc_calls: 1,
+                    ..BuildEvidence::default()
+                },
+                in_flight,
+                initial_attempts,
+                post_attempts,
+                availability: Availability::default(),
+                drain: DrainWitness::default(),
+                rollout: RolloutWitness {
+                    old_exited: true,
+                    old_workers_remaining: 0,
+                    old_client_current: true,
+                    candidate_client_current: true,
+                },
+            }
+        }
+
+        fn inputs(&self) -> VerdictInputs<'_> {
+            use std::os::unix::process::ExitStatusExt;
+
+            VerdictInputs {
+                initial_outcome: &self.initial_outcome,
+                initial_evidence: &self.initial_evidence,
+                initial_attempts: &self.initial_attempts,
+                in_flight: &self.in_flight,
+                post_outcome: &self.post_outcome,
+                post_evidence: &self.post_evidence,
+                post_attempts: &self.post_attempts,
+                availability: &self.availability,
+                gap: Duration::ZERO,
+                retries: 0,
+                cold_mints: 2,
+                timing: PromotionTiming {
+                    lease: Duration::ZERO,
+                    client: Duration::ZERO,
+                },
+                procedure: UpgradeProcedure::PreStop,
+                warmup_policy: (Duration::ZERO, Duration::ZERO),
+                drain_policy: (Duration::ZERO, Duration::ZERO),
+                drain: &self.drain,
+                status: std::process::ExitStatus::from_raw(0),
+                leader: true,
+                gap_limit: Duration::from_secs(4),
+                old_version: "0.3.2",
+                candidate_version: "candidate",
+                elapsed: Duration::ZERO,
+                rollout: &self.rollout,
+            }
+        }
+    }
+
     #[test]
     fn final_verdict_requires_exactly_two_cold_mints() {
-        use std::os::unix::process::ExitStatusExt;
-
-        let initial_outcome = BuildOutcome::new(Some(0), "INFO: 8 processes: 8 remote.".to_owned());
-        let post_outcome = BuildOutcome::new(Some(0), "INFO: 1 process: 1 remote.".to_owned());
-        let initial_evidence = BuildEvidence {
-            successful_actions: 8,
-            finished_success: true,
-            rpc_calls: 1,
-            ..BuildEvidence::default()
-        };
-        let post_evidence = BuildEvidence {
-            successful_actions: 1,
-            finished_success: true,
-            rpc_calls: 1,
-            ..BuildEvidence::default()
-        };
-        let (in_flight, initial_attempts, post_attempts) = verdict_attempts();
-        let availability = Availability::default();
-        let drain = DrainWitness::default();
-        let rollout = RolloutWitness {
-            old_exited: true,
-            old_workers_remaining: 0,
-            old_client_current: true,
-            candidate_client_current: true,
-        };
-        let mut input = VerdictInputs {
-            initial_outcome: &initial_outcome,
-            initial_evidence: &initial_evidence,
-            initial_attempts: &initial_attempts,
-            in_flight: &in_flight,
-            post_outcome: &post_outcome,
-            post_evidence: &post_evidence,
-            post_attempts: &post_attempts,
-            availability: &availability,
-            gap: Duration::ZERO,
-            retries: 0,
-            cold_mints: 2,
-            timing: PromotionTiming {
-                lease: Duration::ZERO,
-                client: Duration::ZERO,
-            },
-            procedure: UpgradeProcedure::PreStop,
-            warmup_policy: (Duration::ZERO, Duration::ZERO),
-            drain_policy: (Duration::ZERO, Duration::ZERO),
-            drain: &drain,
-            status: std::process::ExitStatus::from_raw(0),
-            leader: true,
-            gap_limit: Duration::from_secs(4),
-            old_version: "0.3.2",
-            candidate_version: "candidate",
-            elapsed: Duration::ZERO,
-            rollout: &rollout,
-        };
+        let fixture = VerdictFixture::new();
+        let mut input = fixture.inputs();
         input.procedure = UpgradeProcedure::InstanceRefresh;
         assert!(final_verdict(&input).iter().any(Check::is_failure));
         let held_drain = credential_drain();
@@ -1915,49 +1946,49 @@ mod tests {
         input.timing.lease = Duration::from_secs(5);
         assert!(final_verdict(&input).iter().any(Check::is_failure));
         input.timing.lease = Duration::ZERO;
-        input.drain = &drain;
+        input.drain = &fixture.drain;
         input.procedure = UpgradeProcedure::PreStop;
         assert!(final_verdict(&input).iter().all(Check::is_passed));
         let stale_remains = RolloutWitness {
             old_workers_remaining: 1,
-            ..rollout
+            ..fixture.rollout
         };
         input.rollout = &stale_remains;
         assert!(final_verdict(&input).iter().any(Check::is_failure));
         let wrong_executable = RolloutWitness {
             candidate_client_current: false,
-            ..rollout
+            ..fixture.rollout
         };
         input.rollout = &wrong_executable;
         assert!(final_verdict(&input).iter().any(Check::is_failure));
-        input.rollout = &rollout;
+        input.rollout = &fixture.rollout;
         let empty = InFlight::new();
         input.in_flight = &empty;
         assert!(final_verdict(&input).iter().any(Check::is_failure));
-        input.in_flight = &in_flight;
+        input.in_flight = &fixture.in_flight;
         let reexecuted = reexecuted_attempts();
         input.initial_attempts = &reexecuted;
         assert!(final_verdict(&input).iter().any(Check::is_failure));
-        input.initial_attempts = &initial_attempts;
+        input.initial_attempts = &fixture.initial_attempts;
         let interrupted = BuildOutcome::new(Some(1), "build failed".to_owned());
         input.initial_outcome = &interrupted;
         assert!(final_verdict(&input).iter().any(Check::is_failure));
-        input.initial_outcome = &initial_outcome;
+        input.initial_outcome = &fixture.initial_outcome;
         let failures = BuildEvidence {
             failed_actions: 1,
-            ..initial_evidence
+            ..fixture.initial_evidence
         };
         input.initial_evidence = &failures;
         assert!(final_verdict(&input).iter().any(Check::is_failure));
-        input.initial_evidence = &initial_evidence;
+        input.initial_evidence = &fixture.initial_evidence;
         let (_, mut changed, _) = verdict_attempts();
         changed
-            .get_mut(in_flight.keys().next().expect("frozen attempt"))
+            .get_mut(fixture.in_flight.keys().next().expect("frozen attempt"))
             .expect("attempt")
             .worker += 1;
         input.initial_attempts = &changed;
         assert!(final_verdict(&input).iter().any(Check::is_failure));
-        input.initial_attempts = &initial_attempts;
+        input.initial_attempts = &fixture.initial_attempts;
         for count in [0, 1, 3] {
             input.cold_mints = count;
             assert!(final_verdict(&input).iter().any(Check::is_failure));

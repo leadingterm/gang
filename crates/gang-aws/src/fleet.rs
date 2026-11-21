@@ -1665,11 +1665,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raise_above_the_max_size_is_refused() -> TestResult {
+    async fn refused_maximum_growth_leaves_capacity_unchanged() -> TestResult {
         let harness = Harness::start().await?;
         let mut group = FakeGroup::new(FLEET, 2, &[]);
         group.max_size = 4;
         harness.add_group_with(group);
+        harness.fail(
+            UPDATE_AUTO_SCALING_GROUP,
+            FakeFailure {
+                status: 403,
+                code: "AccessDenied",
+                message: "maximum update denied",
+            },
+        );
 
         let result = gang_testkit::fence::with_held(async |held| {
             harness
@@ -1686,6 +1694,19 @@ mod tests {
             )))
         ));
         assert_eq!(harness.desired(FLEET), Some(2));
+        assert_eq!(harness.requests(SET_DESIRED_CAPACITY), 0);
+        assert_eq!(harness.requests(UPDATE_AUTO_SCALING_GROUP), 1);
+        let state = harness.fake.state();
+        assert_eq!(state.groups[0].max_size, 4);
+        let update = state
+            .requests
+            .iter()
+            .find(|request| request.operation == UPDATE_AUTO_SCALING_GROUP)
+            .expect("the maximum update was requested");
+        assert_eq!(
+            update.parameters.get("MaxSize").map(String::as_str),
+            Some("5")
+        );
         Ok(())
     }
 

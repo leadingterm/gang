@@ -222,22 +222,40 @@ fn disconnected_replacement_terminates_after_connection_grace_without_rebuying()
 
 #[test]
 fn one_stale_connection_replaces_the_entire_physical_instance() -> TestResult {
-    let mut policy = policy()?;
-    policy.instances = InstanceBounds::try_new(1, NonZeroU32::MIN)?;
-    let mut h = Harness::with_policy(policy);
-    h.settle_term()?;
-    serve(&mut h, "local-old", secs(60))?;
-    h.set_running("local-old", 1)?;
-    let mut current = renewed(&h.snapshot.workers[0], 1)?;
-    current.running_actions = 0;
-    h.snapshot.workers[0].current_build = false;
-    h.snapshot.workers.push(current);
-    let steps = changes(&h.run());
-    assert!(steps.contains(&Change::Reinforce(X86, "local-old".into())));
-    assert!(steps.contains(&Change::Scale(X86, 1, 2, NeedCause::Minimum)));
-    assert!(h.snapshot.workers.iter().all(|worker| worker.draining));
-    assert!(h.snapshot.cordons[0].replacing);
-    assert_eq!(h.outlook(X86)?.workers.running, 1);
+    for (stale_running, current_running) in [(1, 0), (0, 1), (1, 1)] {
+        let mut policy = policy()?;
+        policy.instances = InstanceBounds::try_new(1, NonZeroU32::MIN)?;
+        let mut h = Harness::with_policy(policy);
+        h.settle_term()?;
+        serve(&mut h, "local-old", secs(60))?;
+        h.set_running("local-old", stale_running)?;
+        let mut current = renewed(&h.snapshot.workers[0], 1)?;
+        current.running_actions = current_running;
+        h.snapshot.workers[0].current_build = false;
+        h.snapshot.workers.push(current);
+        let plan = h.run();
+        let steps = changes(&plan);
+        assert!(steps.contains(&Change::Reinforce(X86, "local-old".into())));
+        assert!(
+            steps.contains(&Change::Scale(X86, 1, 2, NeedCause::Demand)),
+            "expected one replacement for the physical instance: {plan:?}"
+        );
+        assert!(h.snapshot.workers.iter().all(|worker| worker.draining));
+        assert!(h.snapshot.cordons[0].replacing);
+        let outlook = h.outlook(X86)?;
+        assert_eq!(outlook.workers.running, stale_running + current_running);
+        assert_eq!(
+            outlook.demand.actions(),
+            u64::from(stale_running + current_running)
+        );
+        assert_eq!(outlook.needed, 1);
+        assert!(
+            !steps
+                .iter()
+                .any(|change| matches!(change, Change::Cancel(..) | Change::Terminate(..))),
+            "busy replacement must keep draining: {plan:?}"
+        );
+    }
     Ok(())
 }
 
@@ -267,9 +285,13 @@ fn already_draining_stale_instance_gets_replacement_intent() -> TestResult {
     h.snapshot.workers[0].current_build = false;
     h.snapshot.workers[0].draining = true;
 
-    let steps = changes(&h.run());
+    let plan = h.run();
+    let steps = changes(&plan);
     assert!(steps.contains(&Change::Reinforce(X86, "local-old".into())));
-    assert!(steps.contains(&Change::Scale(X86, 1, 2, NeedCause::Minimum)));
+    assert!(
+        steps.contains(&Change::Scale(X86, 1, 2, NeedCause::Demand)),
+        "expected replacement demand from the busy stale drain: {plan:?}"
+    );
     assert!(h.snapshot.cordons[0].replacing);
     assert!(
         !steps
