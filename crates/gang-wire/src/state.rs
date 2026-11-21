@@ -723,7 +723,7 @@ pub struct Worker {
     pub phase_time: Timestamp,
     /// Actions the worker is running.
     pub running: u32,
-    /// How many actions the worker may run at once; absent when unknown.
+    /// Optional observed action cap; absent for unlimited long-lived workers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slots: Option<u32>,
     /// Whether the worker is paused.

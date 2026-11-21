@@ -63,14 +63,20 @@ const Lane = ({ w, now, window }: { w: Worker; now: UnixMs; window: number }) =>
 
 const Pips = ({ w }: { w: Worker }) => (
   <span class="slots">
-    <span class={w.phase === "DRAINING" ? "slots__pips is-draining" : "slots__pips"} aria-hidden="true">
-      {Array.from({ length: w.slots ?? 0 }, (_, i) => (
-        <i key={i} class={i < w.running ? "on" : undefined} />
-      ))}
-    </span>
-    <span class="visually-hidden">
-      {w.running} of {w.slots ?? "unknown"} slots
-    </span>
+    {w.slots === undefined ? (
+      <span>{`${w.running} running`}</span>
+    ) : (
+      <>
+        <span class={w.phase === "DRAINING" ? "slots__pips is-draining" : "slots__pips"} aria-hidden="true">
+          {Array.from({ length: w.slots }, (_, i) => (
+            <i key={i} class={i < w.running ? "on" : undefined} />
+          ))}
+        </span>
+        <span class="visually-hidden">
+          {w.running} of {w.slots} slots
+        </span>
+      </>
+    )}
   </span>
 );
 
@@ -103,9 +109,9 @@ export const WorkerDetail = ({ w, state }: { w: Worker; state: State }) => {
         <dd class="mono">
           <span class="clause"><Since t={launched} /></span>{" · "}<span class="clause">since <Clock t={launched} /></span>
         </dd>
-        <dt>slots</dt>
+        <dt>{w.slots === undefined ? "running" : "slots"}</dt>
         <dd class="mono">
-          {w.running}/{w.slots ?? "?"}
+          {w.slots === undefined ? w.running : `${w.running}/${w.slots}`}
         </dd>
         {w.infrastructure && <><dt>infrastructure</dt><dd><Infrastructure status={w.infrastructure} /></dd></>}
       </dl>

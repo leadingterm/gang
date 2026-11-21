@@ -403,6 +403,33 @@ test("fleet details show rate diagnostics independently, preserving zero and uni
   t.assert.doesNotMatch(details(undefined, undefined, 1), /<dt>load<\/dt>|<dt>backlog<\/dt>/);
 });
 
+test("worker rows and details show running counts without an observed cap", (t) => {
+  const worker = live.workers[0];
+  if (!worker) throw new Error("the live recording has a worker");
+  const unlimited = { ...worker, slots: undefined, running: 3 };
+  const state = { ...live, workers: [unlimited] };
+  const row = html({ state }, <Workers />);
+  const detail = html({ state }, <WorkerDetail w={unlimited} state={state} />);
+  t.assert.match(row, /<span class="slots"><span>3 running<\/span><\/span>/);
+  t.assert.doesNotMatch(row, /unknown slots|slots__pips/);
+  t.assert.match(detail, /<dt>running<\/dt><dd class="mono">3<\/dd>/);
+  t.assert.doesNotMatch(detail, /<dt>slots<\/dt>|3\/\?/);
+});
+
+test("workers with observed caps retain pips and slot details", (t) => {
+  const worker = live.workers[0];
+  if (!worker) throw new Error("the live recording has a worker");
+  for (const slots of [4, 1]) {
+    const bounded = { ...worker, slots, running: 1 };
+    const state = { ...live, workers: [bounded] };
+    const row = html({ state }, <Workers />);
+    const detail = html({ state }, <WorkerDetail w={bounded} state={state} />);
+    t.assert.match(row, new RegExp(`1(?:<!-- -->)? of (?:<!-- -->)?${slots}(?:<!-- -->)? slots`));
+    t.assert.equal((row.match(/<i(?: class="on")?><\/i>/g) ?? []).length, slots);
+    t.assert.match(detail, new RegExp(`<dt>slots</dt><dd class="mono">1/${slots}</dd>`));
+  }
+});
+
 test("open worker detail names running actions and falls back to the digest", (t) => {
   const worker = live.workers[0];
   const action = live.actions?.running[0];
