@@ -41,7 +41,7 @@ mod linux {
 
     async fn wait(mut child: Child, expected: bool) -> Result<()> {
         let status = tokio::time::timeout(Duration::from_secs(30), child.wait()).await??;
-        let code = if expected { 0 } else { 1 };
+        let code = i32::from(!expected);
         if status.code() != Some(code) {
             return Err(format!("action exited {status}, expected code {code}").into());
         }
@@ -49,7 +49,7 @@ mod linux {
     }
 
     async fn signal(listener: &UnixListener) -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::time::timeout(Duration::from_mins(1), async {
             let (mut stream, _) = listener.accept().await?;
             stream.read_exact(&mut [0]).await?;
             Ok::<(), std::io::Error>(())
@@ -138,12 +138,18 @@ mod linux {
         .await??;
         wait(a, true).await?;
         wait(b, true).await?;
+        check_prerequisites(&root, &config_path, &text).await?;
+        fs::write(root.join("all-done"), b"done")?;
+        Ok(())
+    }
+
+    async fn check_prerequisites(root: &Path, config_path: &Path, text: &str) -> Result<()> {
         fs::write(
-            &config_path,
+            config_path,
             text.replace("127.0.0.1:50051", "127.0.0.1:50052"),
         )?;
         wait(
-            start(&root, "protected-override", true, "connect", "11.0.0.2")?,
+            start(root, "protected-override", true, "connect", "11.0.0.2")?,
             true,
         )
         .await?;
@@ -151,42 +157,42 @@ mod linux {
             return Err("protected-override payload did not execute".into());
         }
         fs::write(
-            &config_path,
+            config_path,
             text.replace("127.0.0.1:50051", "1.1.1.2:50051"),
         )?;
         wait(
-            start(&root, "unprotected-override", true, "connect", "11.0.0.2")?,
+            start(root, "unprotected-override", true, "connect", "11.0.0.2")?,
             false,
         )
         .await?;
         if root.join("work/unprotected-override/work/started").exists() {
             return Err("unprotected-override payload executed".into());
         }
-        fs::write(&config_path, &text)?;
-        fs::write(&config_path, text.replace("[limits.cgroup]\n", ""))?;
+        fs::write(config_path, text)?;
+        fs::write(config_path, text.replace("[limits.cgroup]\n", ""))?;
         wait(
-            start(&root, "no-scope", true, "connect", "11.0.0.2")?,
+            start(root, "no-scope", true, "connect", "11.0.0.2")?,
             false,
         )
         .await?;
         if root.join("work/no-scope/work/started").exists() {
             return Err("no-scope payload executed".into());
         }
-        fs::write(&config_path, text.replace("1.1.1.1", "8.8.8.8"))?;
+        fs::write(config_path, text.replace("1.1.1.1", "8.8.8.8"))?;
         wait(
-            start(&root, "mismatch", true, "connect", "11.0.0.2")?,
+            start(root, "mismatch", true, "connect", "11.0.0.2")?,
             false,
         )
         .await?;
         if root.join("work/mismatch/work/started").exists() {
             return Err("mismatched-policy payload executed".into());
         }
-        fs::write(&config_path, &text)?;
+        fs::write(config_path, text)?;
         let listener = UnixListener::bind(root.join("stamp.sock"))?;
         fs::write(root.join("remove-stamp"), b"ready")?;
         signal(&listener).await?;
         wait(
-            start(&root, "missing-stamp", true, "connect", "11.0.0.2")?,
+            start(root, "missing-stamp", true, "connect", "11.0.0.2")?,
             false,
         )
         .await?;
@@ -194,14 +200,13 @@ mod linux {
             return Err("missing-stamp payload executed".into());
         }
         wait(
-            start(&root, "offline-no-stamp", false, "connect", "11.0.0.2")?,
+            start(root, "offline-no-stamp", false, "connect", "11.0.0.2")?,
             false,
         )
         .await?;
         if !root.join("work/offline-no-stamp/work/started").exists() {
             return Err("offline payload did not execute without stamp".into());
         }
-        fs::write(root.join("all-done"), b"done")?;
         Ok(())
     }
 }
