@@ -23,8 +23,15 @@ pub(crate) struct Capacity {
     pub live: u32,
     pub standing: u32,
     pub reliable: u32,
-    pub draining: u32,
+    /// Supply indices of connected owned drains, in canonical rescue order.
+    pub resumable: Vec<usize>,
     pub instances: Vec<usize>,
+}
+
+impl Capacity {
+    pub(crate) fn draining(&self) -> u32 {
+        u32::try_from(self.resumable.len()).unwrap_or(u32::MAX)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -40,6 +47,7 @@ struct InstanceTimeline {
     view: InstanceView,
     ready_after: Duration,
     usable: bool,
+    dispatch: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -329,7 +337,6 @@ pub(crate) struct WorkPlanner {
     booting: Vec<u32>,
     summaries: Vec<ScaleDecision>,
     instances: Vec<Vec<InstanceTimeline>>,
-    resumable: Vec<Vec<usize>>,
     usable: Vec<bool>,
     worker_heads: Vec<usize>,
     execution_next: Vec<usize>,
@@ -366,7 +373,6 @@ impl WorkPlanner {
             booting: vec![0; n],
             summaries: vec![ScaleDecision::default(); n],
             instances: (0..n).map(|_| Vec::new()).collect(),
-            resumable: (0..n).map(|_| Vec::new()).collect(),
             usable: Vec::new(),
             worker_heads: Vec::new(),
             execution_next: Vec::new(),
@@ -457,7 +463,7 @@ impl WorkPlanner {
                     CapacityVector::default()
                 };
                 let resume_cap = if connected {
-                    CapacityVector::ONE
+                    cap
                 } else {
                     CapacityVector::default()
                 };
@@ -475,6 +481,7 @@ impl WorkPlanner {
                     },
                     ready_after,
                     usable,
+                    dispatch: None,
                 });
                 if serving {
                     self.serving[index] = self.serving[index].saturating_add(1);
@@ -483,6 +490,9 @@ impl WorkPlanner {
                     self.booting[index] = self.booting[index].saturating_add(1);
                 }
                 self.capacities[index] += cap;
+            }
+            for &position in &capacities[index].resumable {
+                self.instances[index][position].view.resume_cap = CapacityVector::ONE;
             }
             if fleet.supply.launch_failure.is_none() {
                 let unborn = fleet.supply.desired.saturating_sub(capacities[index].live);
@@ -533,7 +543,6 @@ impl WorkPlanner {
     fn build_timeline(&mut self, fleets: &[FleetPass], hosted: &HostedSnapshot, time: PassTime) {
         for (index, fleet) in fleets.iter().enumerate() {
             let boot = self.horizons[index].readiness;
-            self.resumable[index].clear();
             let mut physical_booting = 0u32;
             for (position, instance) in fleet.supply.instances.iter().enumerate() {
                 self.project_instance(fleet, hosted, instance, time);
@@ -556,9 +565,9 @@ impl WorkPlanner {
                         },
                         Reservation::capacity(&fleet.policy, self.factor),
                     );
+                    record.dispatch = Some(dispatch_instance);
                     if resumable {
                         self.dispatch.instances[dispatch_instance].enabled = false;
-                        self.resumable[index].push(dispatch_instance);
                     }
                     if usable && !record.view.serving {
                         physical_booting = physical_booting.saturating_add(1);
@@ -624,15 +633,17 @@ impl WorkPlanner {
             );
             let additional = fleet.outlook.needed.saturating_sub(base);
             let planned = if fleet.supply.launch_failure.is_some() {
-                additional.min(capacities[index].draining)
+                additional.min(capacities[index].draining())
             } else {
                 additional
             };
-            let rescues = usize::try_from(planned.min(capacities[index].draining))
+            let rescues = usize::try_from(planned)
                 .unwrap_or(usize::MAX)
-                .min(self.resumable[index].len());
-            for &instance in self.resumable[index].iter().take(rescues) {
-                self.dispatch.instances[instance].enabled = true;
+                .min(capacities[index].resumable.len());
+            for &position in capacities[index].resumable.iter().take(rescues) {
+                if let Some(instance) = self.instances[index][position].dispatch {
+                    self.dispatch.instances[instance].enabled = true;
+                }
             }
             let resumed_count = u32::try_from(rescues).unwrap_or(u32::MAX);
             for _ in 0..planned.saturating_sub(resumed_count) {
@@ -668,7 +679,10 @@ impl WorkPlanner {
         let horizon = self.horizons[fleet];
         let rates = self.rates.fleet(fleet);
         if horizon.payback.is_zero() {
-            rates.total_load
+            let pending = CapacityVector::ONE.scaled(f64::from(self.booting[fleet]));
+            rates
+                .total_load
+                .component_max(self.demand[fleet].sub_floor(pending))
         } else {
             rates.total_load
                 + rates
@@ -686,8 +700,8 @@ impl WorkPlanner {
         if self.horizons.get(fleet).is_none() {
             return false;
         }
-        // Ordinary needed-capacity rescue already accounts for static demand and pending
-        // credit. Only returning forecast load independently reopens a busy drain.
+        // Pending credit belongs to requested usable capacity, never projected purchases.
+        // At zero horizon the forecast uses finite concurrent resource demand instead.
         !self.forecast_demand(fleet).within(
             self.serving_capacities[fleet] + extra_capacity,
             f64::from(self.scaling.scale_in_waterline_percent.get()) / 100.0,
@@ -805,7 +819,7 @@ mod tests {
                         live: 0,
                         standing: 0,
                         reliable: 0,
-                        draining: 0,
+                        resumable: Vec::new(),
                         instances: Vec::new(),
                     })
                     .collect(),
@@ -831,7 +845,7 @@ mod tests {
                 self.capacities[fleet].reliable += 1;
                 self.capacities[fleet].standing += 1;
             } else {
-                self.capacities[fleet].draining += 1;
+                self.capacities[fleet].resumable.push(position);
             }
         }
 
@@ -1565,9 +1579,54 @@ mod tests {
         );
         scene.run(&[Some(Duration::ZERO)]);
         assert_eq!(scene.planner.work(0), 3);
+        assert_eq!(scene.planner.scale_decision(0).booting, 0);
+        assert_eq!(scene.planner.scale_decision(0).extra_instances, 2);
         assert!(scene.planner.removal(0, 0).is_none());
         assert!(scene.planner.needs_resume(0, CapacityVector::ONE));
+        let ample_capacity = CapacityVector::ONE.scaled(4.0);
+        assert!(!scene.planner.needs_resume(0, ample_capacity));
         assert_eq!(scene.fleets[0].outlook.readiness, Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn zero_horizon_credits_only_reliable_pending_and_unborn_requests() {
+        for kind in ["pending", "unborn", "failed-unborn"] {
+            let mut p = policy("workers");
+            p.idle_timeout = Duration::ZERO;
+            let mut scene = Scene::new(vec![p.clone()], ScalingConfig::default());
+            scene.member(0, "idle", InstanceLifecycle::InService, true);
+            if kind == "pending" {
+                scene.member(0, "pending", InstanceLifecycle::Pending, true);
+            } else {
+                scene.fleets[0].supply.desired += 1;
+                if kind == "failed-unborn" {
+                    scene.fleets[0].supply.launch_failure = Some(LaunchFailure {
+                        reason: "unavailable".into(),
+                    });
+                }
+            }
+            let mut waiting = queued(&[0], None);
+            waiting.resources.memory =
+                gang_types::Bytes::new(p.memory_per_instance.get().get() * 4 / 5);
+            scene.snapshot(
+                SchedulerSnapshot {
+                    workers: vec![worker(&p, "idle", 0, 16)],
+                    queued: vec![waiting],
+                    ..SchedulerSnapshot::default()
+                },
+                &[Some(0)],
+            );
+            scene.run(&[Some(Duration::ZERO)]);
+            let failed = kind == "failed-unborn";
+            assert_eq!(scene.planner.work(0), 1);
+            assert_eq!(scene.planner.scale_decision(0).booting, u32::from(!failed));
+            assert_eq!(
+                scene.planner.needs_resume(0, CapacityVector::default()),
+                failed,
+                "{kind}",
+            );
+            assert!(scene.planner.removal(0, 0).is_none());
+        }
     }
 
     #[test]

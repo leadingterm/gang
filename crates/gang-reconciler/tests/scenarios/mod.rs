@@ -538,6 +538,124 @@ fn empty_drain_is_rescued_for_ordinary_demand_not_waterline_alone() -> TestResul
 }
 
 #[test]
+fn zero_horizon_fractional_demand_reopens_busy_drain_above_waterline() -> TestResult {
+    let mut w = idle_world(0, 0)?;
+    w.h.passes[X86].policy.vcpus_per_instance = NonZeroU32::new(10).ok_or("zero vcpus")?;
+    for name in ["local-serving", "local-draining"] {
+        serve(&mut w.h, name, Duration::ZERO)?;
+    }
+    w.running("local-draining", 1, None, Duration::ZERO, Some(secs(30)))?;
+    w.h.set_draining("local-draining", true)?;
+    w.h.queue_sized(
+        X86,
+        1,
+        gang_types::ActionResources {
+            cpu_millicores: 8000,
+            ..gang_types::ActionResources::default()
+        },
+    )?;
+    let steps = w.pass();
+    assert_eq!(w.h.outlook(X86)?.readiness, Some(Duration::ZERO));
+    assert_eq!(w.h.outlook(X86)?.needed, 1);
+    assert_eq!(
+        changes(&steps),
+        vec![Change::Cancel(X86, "local-draining".into(), NeedCause::Demand)]
+    );
+    Ok(())
+}
+
+#[test]
+fn projected_wait_resumes_only_owned_unordered_nonterminating_workers() -> TestResult {
+    for excluded in ["unowned", "ordered", "terminating"] {
+        let mut w = idle_world(0, 600)?;
+        w.serve(X86, "local-excluded")?;
+        match excluded {
+            "ordered" => {
+                w.h.set_draining("local-excluded", true)?;
+                assert!(changes(&w.pass()).contains(&Change::Terminate(
+                    X86,
+                    "local-excluded".into(),
+                    TerminationCause::DrainFinished,
+                )));
+            }
+            "terminating" => {
+                w.h.supply_mut(X86)?.instances[0].lifecycle = InstanceLifecycle::Terminating;
+            }
+            _ => w.h.snapshot.workers[0].draining = true,
+        }
+        w.serve(X86, "local-owned")?;
+        w.running("local-owned", 1, None, Duration::ZERO, Some(secs(30)))?;
+        let memory = w.h.passes[X86].policy.memory_per_instance.get();
+        w.h.snapshot.executing[0].resources.memory = memory;
+        w.h.set_draining("local-owned", true)?;
+        w.h.supply_mut(X86)?.launch_failure = Some(gang_spi::LaunchFailure {
+            reason: "capacity".into(),
+        });
+        w.h.queue_sized(
+            X86,
+            1,
+            gang_types::ActionResources {
+                memory,
+                ..gang_types::ActionResources::default()
+            },
+        )?;
+        let steps = w.pass();
+        let resumed: Vec<_> = steps
+            .iter()
+            .filter_map(|step| match &step.action {
+                Action::CancelDrain(worker, _) => worker.instance_name(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(resumed, vec!["local-owned"], "{excluded}");
+        assert_eq!(w.h.outlook(X86)?.expected_wait, Some(secs(30)), "{excluded}");
+    }
+    Ok(())
+}
+
+#[test]
+fn projected_wait_and_rescue_share_busiest_release_and_worker_id_order() -> TestResult {
+    for priority in ["running", "release-first", "worker-id"] {
+        let mut w = idle_world(0, 600)?;
+        for name in ["local-2", "local-1"] {
+            w.serve(X86, name)?;
+        }
+        w.running("local-2", 1, None, Duration::ZERO, Some(secs(5)))?;
+        let busiest = if priority == "running" { 2 } else { 1 };
+        w.running("local-1", busiest, None, Duration::ZERO, Some(secs(30)))?;
+        let memory = w.h.passes[X86].policy.memory_per_instance.get();
+        for execution in &mut w.h.snapshot.executing {
+            execution.resources.memory = gang_types::Bytes::new(memory.get() / 10);
+        }
+        if priority != "worker-id" {
+            // Busiest wins even when it is release-first; release-first breaks equal loads.
+            let release = usize::from(priority == "running");
+            w.h.supply_mut(X86)?.instances[release].release_first = true;
+        }
+        for name in ["local-2", "local-1"] {
+            w.h.set_draining(name, true)?;
+        }
+        w.h.queue_sized(
+            X86,
+            1,
+            gang_types::ActionResources {
+                memory,
+                ..gang_types::ActionResources::default()
+            },
+        )?;
+        let steps = w.pass();
+        assert_eq!(
+            changes(&steps),
+            vec![Change::Cancel(X86, "local-1".into(), NeedCause::Demand)],
+            "{priority}",
+        );
+        assert_eq!(w.h.outlook(X86)?.expected_wait, Some(secs(30)), "{priority}");
+    }
+    Ok(())
+}
+
+
+#[test]
 fn resume_order_prefers_non_release_first_then_running_then_worker_id() -> TestResult {
     let mut w = idle_world(1, 600)?;
     for name in ["local-2", "local-1"] {

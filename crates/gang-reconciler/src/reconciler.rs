@@ -202,7 +202,7 @@ impl Reconciler {
                     live: 0,
                     standing: 0,
                     reliable: 0,
-                    draining: 0,
+                    resumable: Vec::with_capacity(p.instances.max().get() as usize),
                     instances: Vec::with_capacity(p.instances.max().get() as usize),
                 })
                 .collect(),
@@ -251,6 +251,7 @@ impl Reconciler {
         self.serving.clear();
         for capacity in &mut self.capacities {
             capacity.instances.clear();
+            capacity.resumable.clear();
         }
         for fleet in fleets.iter_mut() {
             fleet.outlook = FleetOutlook::default();
@@ -276,7 +277,7 @@ impl Reconciler {
                     fleets.get(index).map(|fleet| {
                         let limit = if fleet.supply.launch_failure.is_some() {
                             let capacity = &self.capacities[index];
-                            capacity.reliable.saturating_add(capacity.draining)
+                            capacity.reliable.saturating_add(capacity.draining())
                         } else {
                             fleet.policy.instances.max().get()
                         };
@@ -424,11 +425,19 @@ impl Reconciler {
             } else {
                 census.usable
             };
-            capacity.draining = self.draining[draining..]
-                .iter()
-                .filter(|d| d.owned)
-                .count()
-                .saturating_into();
+            let workers = &pass.hosted.snapshot().workers;
+            self.draining[draining..].sort_unstable_by(|a, b| {
+                b.running
+                    .cmp(&a.running)
+                    .then_with(|| a.release_first.cmp(&b.release_first))
+                    .then_with(|| workers[a.worker].id.cmp(&workers[b.worker].id))
+            });
+            capacity.resumable.extend(
+                self.draining[draining..]
+                    .iter()
+                    .filter(|drain| drain.owned)
+                    .map(|drain| drain.instance),
+            );
             self.census[index] = FleetCensus {
                 census,
                 candidates: candidates..self.candidates.len(),
@@ -689,12 +698,6 @@ impl Reconciler {
         let census = self.census[index].census;
         let workers = &pass.hosted.snapshot().workers;
         let range = self.census[index].draining.clone();
-        self.draining[range.clone()].sort_unstable_by(|a, b| {
-            b.running
-                .cmp(&a.running)
-                .then_with(|| a.release_first.cmp(&b.release_first))
-                .then_with(|| workers[a.worker].id.cmp(&workers[b.worker].id))
-        });
         let mut remaining_rescues = view.needed.saturating_sub(
             self.capacities[index]
                 .reliable
