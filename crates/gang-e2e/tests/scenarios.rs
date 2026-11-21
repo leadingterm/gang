@@ -1255,13 +1255,13 @@ fn work_aware_scale_out(from: u32, to: u32) -> gang_wire::Event {
 }
 
 #[test]
-fn burst_verdict_rejects_extra_scaleout_missing_readiness_and_failed_build() {
+fn burst_verdict_requires_resource_bound_readiness_and_success() {
     use gang_e2e::{BuildOutcome, burst_checks};
     use std::time::Duration;
 
     let success = BuildOutcome::new(Some(0), String::new());
     let failure = BuildOutcome::new(Some(1), "build failed".to_owned());
-    let first = work_aware_scale_out(0, 1);
+    let first = work_aware_scale_out(0, 6);
     assert_compliant(&burst_checks(
         std::slice::from_ref(&first),
         Some(Duration::from_secs(9)),
@@ -1269,7 +1269,7 @@ fn burst_verdict_rejects_extra_scaleout_missing_readiness_and_failed_build() {
     ));
     assert_fails(
         &burst_checks(
-            &[first.clone(), work_aware_scale_out(1, 3)],
+            &[first.clone(), work_aware_scale_out(6, 7)],
             Some(Duration::from_secs(9)),
             &success,
         ),
@@ -1298,20 +1298,20 @@ fn burst_verdict_rejects_extra_scaleout_missing_readiness_and_failed_build() {
 }
 
 #[test]
-fn burst_capacity_verdict_rejects_excess_desired_capacity() {
-    assert!(gang_e2e::burst_capacity_check(1).is_passed());
-    assert!(gang_e2e::burst_capacity_check(2).is_failure());
+fn burst_capacity_verdict_requires_bounded_capacity() {
+    assert!(gang_e2e::burst_capacity_check(6).is_passed());
+    assert!(gang_e2e::burst_capacity_check(1).is_failure());
 }
 
 #[test]
-fn short_work_verdict_rejects_scaleout_missing_observation_and_failed_build() {
+fn short_work_verdict_requires_scaleout_observation_and_success() {
     use gang_e2e::{BuildOutcome, short_checks};
 
     let success = BuildOutcome::new(Some(0), String::new());
     let failure = BuildOutcome::new(Some(1), "build failed".to_owned());
-    assert_compliant(&short_checks(&[], true, &success));
+    assert_compliant(&short_checks(&[work_aware_scale_out(1, 2)], true, &success));
     assert_fails(
-        &short_checks(&[work_aware_scale_out(1, 2)], true, &success),
+        &short_checks(&[], true, &success),
         names::work_aware::QUEUED_SCALE_OUT,
     );
     assert_fails(

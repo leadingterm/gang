@@ -37,7 +37,7 @@ pub fn scheduled_minimum(
 }
 
 /// A valid sample fleet policy named `name`: up to four x86-64 instances of four vCPUs, 8 GiB of
-/// memory and 100 GiB of disk, each running four concurrent actions.
+/// memory and 100 GiB of disk.
 ///
 /// # Errors
 ///
@@ -51,7 +51,6 @@ pub fn fleet_policy(name: &str) -> TestResult<FleetPolicy> {
         vcpus_per_instance: nonzero_u32(4),
         memory_per_instance: NonZeroBytes::gib(8),
         disk_per_instance: NonZeroBytes::gib(100),
-        target_actions_per_instance: nonzero_u32(4),
         idle_timeout: Duration::from_secs(15),
         max_drain_wait: Duration::from_mins(1),
         boot_grace: Duration::from_secs(30),
@@ -118,7 +117,6 @@ mod tests {
                 vcpus_per_instance: NonZeroU32::new(4).ok_or("four is not zero")?,
                 memory_per_instance: NonZeroBytes::gib(8),
                 disk_per_instance: NonZeroBytes::gib(100),
-                target_actions_per_instance: NonZeroU32::new(4).ok_or("four is not zero")?,
                 idle_timeout: Duration::from_secs(15),
                 max_drain_wait: Duration::from_mins(1),
                 boot_grace: Duration::from_secs(30),

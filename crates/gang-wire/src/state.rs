@@ -604,8 +604,6 @@ pub struct Policy {
     pub min: u32,
     /// The most instances the fleet runs.
     pub max: u32,
-    /// The number of actions one instance is expected to take.
-    pub target_actions: u32,
     /// How long a worker may stay idle before it drains.
     #[serde(with = "crate::duration")]
     #[ts(type = "Duration")]
@@ -715,10 +713,10 @@ pub struct Demand {
     )]
     #[ts(type = "Duration")]
     pub expected_wait: Option<Duration>,
-    /// Persistent load in integer deci-slots, absent until measured; zero is a measurement.
+    /// Persistent load in tenths of a worker-equivalent, absent until measured; zero is a measurement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load: Option<u32>,
-    /// Transient queued slot-time before readiness subtraction, rounded to whole seconds.
+    /// Transient queued worker-equivalent-seconds, rounded to whole seconds.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -755,7 +753,7 @@ pub struct Worker {
     pub phase_time: Timestamp,
     /// Actions the worker is running.
     pub running: u32,
-    /// How many actions the worker may run at once; absent when unknown.
+    /// Optional observed action cap; absent for unlimited long-lived workers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slots: Option<u32>,
     /// Whether the worker is paused.
@@ -1173,7 +1171,6 @@ mod tests {
             "policy": {
                 "min": 0,
                 "max": 20,
-                "targetActions": 4,
                 "idleTimeout": "300s",
                 "maxDrainWait": "1800s",
                 "bootGrace": "0.250s",

@@ -23,7 +23,10 @@ fn needed_follows_each_fleets_demand() -> TestResult {
     let mut h = harness()?;
     h.connect(X86, "local-1")?;
     h.set_running("local-1", 2)?;
-    h.queue(X86, 9)?;
+    for row in &mut h.snapshot.executing {
+        row.resources = x86_resources(1000);
+    }
+    h.queue_sized(X86, 9, x86_resources(1000))?;
     for row in &mut h.snapshot.queued {
         row.expected = Some(Duration::from_hours(1));
     }
@@ -42,12 +45,12 @@ fn needed_is_the_work_raised_to_the_minimum_in_force() -> TestResult {
     let mut fleet = policy()?;
     fleet.instances = InstanceBounds::try_new(0, nonzero_u32(10))?.with_schedule(vec![window])?;
     let mut h = Harness::with_fleets(vec![fleet]);
-    h.queue(X86, 1)?;
+    h.queue_sized(X86, 1, x86_resources(1000))?;
     h.reconcile();
     assert_eq!(h.outlook(X86)?.minimum, 2);
     assert_eq!(h.outlook(X86)?.needed, 2);
 
-    h.queue(X86, 8)?;
+    h.queue_sized(X86, 8, x86_resources(1000))?;
     for row in &mut h.snapshot.queued {
         row.expected = Some(Duration::from_hours(1));
     }
@@ -108,11 +111,14 @@ fn counts_workers_and_unconnected_instances() -> TestResult {
 fn queued_is_exclusive_while_candidates_overlap() -> TestResult {
     let mut h = harness()?;
     h.queue_candidates(FleetSet::prefix(2)?, 20);
+    for row in &mut h.snapshot.queued {
+        row.resources = x86_resources(1000);
+    }
     h.reconcile();
 
     let x86 = h.outlook(X86)?;
     let arm = h.outlook(ARM)?;
-    // The first fleet takes actions until its four instances are full, which is 16 actions.
+    // One vCPU per action fills the first fleet's four 4-vCPU instances with 16 actions.
     assert_eq!(x86.queued, 16);
     assert_eq!(arm.queued, 4);
     assert_eq!(x86.candidates, 20);

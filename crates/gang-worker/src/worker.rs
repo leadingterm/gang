@@ -9,9 +9,9 @@ use gang_clock::{Clock, Timestamp};
 use gang_config::{PluginSet, SandboxFile, SandboxSelection, WorkerConfig};
 use gang_spi::{
     ActionLimitsPort, CacheStorePort, ClientTls, NodeLifecyclePort, PortError, ProvisionerPort,
-    SchedulerPort, ScratchVolumePort, Slots, WorkerSpec, WorkerTls, WorkloadCredentialPort,
+    SchedulerPort, ScratchVolumePort, WorkerSpec, WorkerTls, WorkloadCredentialPort,
 };
-use gang_types::{ActionEnvironment, WorkerLifetime};
+use gang_types::ActionEnvironment;
 
 use crate::credentials::Enroller;
 use crate::deployment::{WorkerDeployment, WorkerParts, WorkerSettings};
@@ -211,10 +211,7 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
         .by_name(&identity.fleet)
         .ok_or_else(|| WorkerError::NoFleet(identity.fleet.clone()))?;
     check_isa(&identity, fleet.policy.isa)?;
-    let slots = match provisioner.worker_lifetime() {
-        WorkerLifetime::SingleUse => Slots::SingleUse,
-        WorkerLifetime::LongLived => Slots::LongLived(fleet.policy.target_actions_per_instance),
-    };
+    let lifetime = provisioner.worker_lifetime();
     let volume = provisioner.mount(&identity.instance).await?;
     let layout = Layout::new(&volume.path);
     let mut sandbox = sandbox;
@@ -278,7 +275,7 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
         memory_pool,
         instance: identity.instance,
         properties,
-        slots,
+        lifetime,
         work_directory: layout.work_directory(),
         fast_cas_directory: layout.fast_cas_directory(),
         fast_cas_budget,

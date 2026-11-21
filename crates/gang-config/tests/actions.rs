@@ -4,6 +4,7 @@ use gang_config::{ActionsConfig, DiskEnforcement, MemoryEnforcement};
 
 const CUSTOM: &str = r#"
 reservation_headroom_percent = 25
+cpu_oversubscription = 3
 history_window = "9d"
 history_keys = 321
 history_memory_budget = "123MiB"
@@ -39,7 +40,7 @@ headroom_percent = 33
 soft_samples = 3
 [cold_start]
 enabled = false
-cpu_count = 3
+cpu_millicores = 3000
 memory = "48MiB"
 disk = "52MiB"
 "#;
@@ -47,6 +48,8 @@ disk = "52MiB"
 #[test]
 fn memory_pressure_defaults_parse() {
     let config: ActionsConfig = toml::from_str("").expect("default action policy");
+    assert_eq!(config.cpu_oversubscription.get(), 2);
+    assert_eq!(config.cold_start.cpu_millicores.get(), 250);
     assert_eq!(config.memory.pressure_stall_percent.get(), 10);
     assert_eq!(config.memory.pressure_poll_interval.as_millis(), 250);
     assert_eq!(config.memory.pressure_kill_after.as_millis(), 5000);
@@ -56,6 +59,7 @@ fn memory_pressure_defaults_parse() {
 fn all_action_fields_parse_with_nondefault_values() {
     let config: ActionsConfig = toml::from_str(CUSTOM).expect("valid action policy");
     assert_eq!(config.reservation_headroom_percent.get(), 25);
+    assert_eq!(config.cpu_oversubscription.get(), 3);
     assert_eq!(config.history_window.as_units(), 9);
     assert_eq!(config.history_keys.get(), 321);
     assert_eq!(config.history_memory_budget.as_u64(), 123 * 1024 * 1024);
@@ -90,7 +94,7 @@ fn all_action_fields_parse_with_nondefault_values() {
     assert_eq!(disk.headroom_percent.get(), 33);
     assert_eq!(disk.soft_samples.get(), 3);
     assert!(!config.cold_start.enabled);
-    assert_eq!(config.cold_start.cpu_count.get(), 3);
+    assert_eq!(config.cold_start.cpu_millicores.get(), 3000);
     assert_eq!(config.cold_start.memory.as_units(), 48 * 1024);
     assert_eq!(config.cold_start.disk.as_units(), 52 * 1024);
 }
@@ -111,6 +115,7 @@ fn all_enforcement_modes_parse_and_memory_guard_is_rejected() {
 #[test]
 fn invalid_values_and_removed_fields_are_rejected() {
     for text in [
+        "cpu_oversubscription = 0",
         "history_window = \"0d\"",
         "history_window = \"25h\"",
         "history_keys = 0",
@@ -146,7 +151,8 @@ fn invalid_values_and_removed_fields_are_rejected() {
         "[disk]\nmax_steps = 0",
         "[disk]\nsoft_samples = 0",
         "[disk]\nunknown = 1",
-        "[cold_start]\ncpu_count = 0",
+        "[cold_start]\ncpu_millicores = 0",
+        "[cold_start]\ncpu_count = 1",
         "[cold_start]\nmemory = \"0B\"",
         "[cold_start]\ndisk = \"1B\"",
         "[cold_start]\nunknown = 1",
@@ -241,7 +247,6 @@ max_instances = 2
 vcpus_per_instance = 2
 memory_per_instance = "6GiB"
 disk_per_instance = "8GiB"
-target_actions_per_instance = 2
 idle_timeout = "15s"
 max_drain_wait = "1m"
 boot_grace = "1m"
@@ -294,11 +299,14 @@ fn fleet_resource_validation_names_the_fleet_setting_and_values() {
 #[test]
 fn cold_start_must_fit_one_fleet_unless_disabled() {
     let text = format!(
-        "{CONFIG}\n[actions.cold_start]\ncpu_count = 3\nmemory = \"5GiB\"\ndisk = \"7GiB\"\n"
+        "{CONFIG}\n[actions.cold_start]\ncpu_millicores = 3000\nmemory = \"5GiB\"\ndisk = \"7GiB\"\n"
     );
     assert!(matches!(
         text.parse::<gang_config::GangConfig<Plugins>>(),
-        Err(gang_config::ConfigError::ColdStartFitsNoFleet { cpu_count: 3, .. })
+        Err(gang_config::ConfigError::ColdStartFitsNoFleet {
+            cpu_millicores: 3000,
+            ..
+        })
     ));
     let disabled = format!("{text}enabled = false\n");
     assert!(disabled.parse::<gang_config::GangConfig<Plugins>>().is_ok());
@@ -317,7 +325,6 @@ max_instances = 2
 vcpus_per_instance = 2
 memory_per_instance = "2GiB"
 disk_per_instance = "3GiB"
-target_actions_per_instance = 2
 idle_timeout = "15s"
 max_drain_wait = "1m"
 boot_grace = "1m"

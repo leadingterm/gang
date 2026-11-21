@@ -42,9 +42,6 @@ pub enum HarnessError {
     UnknownInstance(String),
 }
 
-/// Concurrent actions a connected worker accepts in these tests.
-const MAX_INFLIGHT_ACTIONS: Option<NonZeroU32> = NonZeroU32::new(4);
-
 /// A fleet policy named `name` for `isa`, otherwise as [`gang_testkit::fleet_policy`].
 ///
 /// # Errors
@@ -94,6 +91,8 @@ pub struct Harness {
     pub scaling: Arc<ScalingConfig>,
     /// Durable term profile handle, retained across model replacement.
     pub profiles: SourceProfiles,
+    /// CPU reservation multiplier used by every reconciler term in this world.
+    pub cpu_oversubscription: NonZeroU32,
 }
 
 impl Harness {
@@ -121,7 +120,12 @@ impl Harness {
     pub fn with_scaling(fleets: Vec<FleetPolicy>, scaling: ScalingConfig) -> Self {
         let scaling = Arc::new(scaling);
         let profiles = SourceProfiles::new(&scaling, ActionsConfig::default().history_window);
-        let reconciler = Reconciler::new(&fleets, Arc::clone(&scaling), profiles.clone());
+        let reconciler = Reconciler::new(
+            &fleets,
+            Arc::clone(&scaling),
+            profiles.clone(),
+            NonZeroU32::MIN,
+        );
         let passes = fleets.into_iter().map(FleetPass::new).collect();
         Self {
             passes,
@@ -132,6 +136,7 @@ impl Harness {
             reconciler,
             scaling,
             profiles,
+            cpu_oversubscription: NonZeroU32::MIN,
         }
     }
 
@@ -302,7 +307,7 @@ impl Harness {
             ),
             fleet,
             running_actions: 0,
-            max_inflight_actions: MAX_INFLIGHT_ACTIONS,
+            max_inflight_actions: None,
             paused: false,
             draining,
             last_seen,
@@ -413,8 +418,18 @@ impl Harness {
     /// is kept.
     pub fn restart(&mut self) {
         let policies: Vec<_> = self.passes.iter().map(|pass| pass.policy.clone()).collect();
-        self.reconciler =
-            Reconciler::new(&policies, Arc::clone(&self.scaling), self.profiles.clone());
+        self.reconciler = Reconciler::new(
+            &policies,
+            Arc::clone(&self.scaling),
+            self.profiles.clone(),
+            self.cpu_oversubscription,
+        );
+    }
+
+    /// Changes the CPU reservation multiplier and starts a new reconciler term.
+    pub fn set_cpu_oversubscription(&mut self, factor: NonZeroU32) {
+        self.cpu_oversubscription = factor;
+        self.restart();
     }
 
     /// Runs the first pass of the reconciler's leadership term, then moves the clock past

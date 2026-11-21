@@ -314,7 +314,7 @@ test("a minimum cause is shown without caution styling", (t) => {
 });
 
 test("a utilization cordon explains the dwell without caution styling", (t) => {
-  const row = render(<EventRow withCause e={{ ...common, cause: "UTILIZATION", drainStarted: { worker: `workers/${WORKER}`, detail: "load 0.0 slots" } }} />);
+  const row = render(<EventRow withCause e={{ ...common, cause: "UTILIZATION", drainStarted: { worker: `workers/${WORKER}`, detail: "load 0.0 worker-equivalents" } }} />);
   t.assert.match(row, /<span class="event__cause">measured fleet load stayed below the waterline for the dwell<\/span>/);
   t.assert.doesNotMatch(row, /caution/);
 });
@@ -421,17 +421,91 @@ test("fleet details show rate diagnostics independently, preserving zero and uni
       ...(utilization !== undefined ? { utilization } : {}),
     } }} />);
   const all = details(125, "42s", 735);
-  t.assert.match(all, /<dt>load<\/dt><dd>12\.5 slots<\/dd>/);
-  t.assert.match(all, /<dt>backlog<\/dt><dd><time>42s<\/time><\/dd>/);
+  t.assert.match(all, /<dt>load<\/dt><dd>12\.5 worker-equivalents<\/dd>/);
+  t.assert.match(all, /<dt>backlog<\/dt><dd>42 worker-equivalent-seconds<\/dd>/);
   t.assert.match(all, /<dt>utilization<\/dt><dd>73\.5%<\/dd>/);
   const zero = details(0, "0s", 0);
-  t.assert.match(zero, /<dt>load<\/dt><dd>0\.0 slots<\/dd>/);
-  t.assert.match(zero, /<dt>backlog<\/dt><dd><time>0s<\/time><\/dd>/);
+  t.assert.match(zero, /<dt>load<\/dt><dd>0\.0 worker-equivalents<\/dd>/);
+  t.assert.match(zero, /<dt>backlog<\/dt><dd>0 worker-equivalent-seconds<\/dd>/);
   t.assert.match(zero, /<dt>utilization<\/dt><dd>0%<\/dd>/);
   t.assert.doesNotMatch(details(), /<dt>load<\/dt>|<dt>backlog<\/dt>|<dt>utilization<\/dt>/);
   t.assert.doesNotMatch(details(1), /<dt>backlog<\/dt>|<dt>utilization<\/dt>/);
   t.assert.doesNotMatch(details(undefined, "1s"), /<dt>load<\/dt>|<dt>utilization<\/dt>/);
   t.assert.doesNotMatch(details(undefined, undefined, 1), /<dt>load<\/dt>|<dt>backlog<\/dt>/);
+});
+
+const executingReadout = (state: typeof live): string =>
+  /<h2 class="label">Executing<\/h2>[\s\S]*?(?=<div class="readout">)/.exec(html({ state }, <Overview />))?.[0] ?? "";
+
+for (const [name, caps] of [
+  ["unlimited workers", [undefined]],
+  ["mixed bounded and unlimited workers", [1, undefined]],
+  ["no workers", []],
+] as const) {
+  test(`overview shows only the executing count with ${name}`, (t) => {
+    const fleet = live.fleets[0];
+    const worker = live.workers[0];
+    if (!fleet || !worker) throw new Error("the live recording has a fleet and worker");
+    const { slots: _slots, ...unlimited } = worker;
+    const state = {
+      ...live,
+      fleets: [{ ...fleet, demand: { ...fleet.demand, running: 24 } }],
+      workers: caps.map((slots, i) => ({ ...unlimited, name: `workers/executing-${i}`, ...(slots !== undefined ? { slots } : {}) })),
+    };
+    const readout = executingReadout(state);
+    t.assert.match(readout, /<div class="readout__big"><span[^>]*>24<\/span><\/div>/);
+    t.assert.doesNotMatch(readout, /readout__of|class="meter"/);
+    t.assert.match(readout, /aria-label="Executing"/);
+  });
+}
+
+test("overview retains executing capacity and meters for bounded workers", (t) => {
+  const fleet = live.fleets[0];
+  const worker = live.workers[0];
+  if (!fleet || !worker) throw new Error("the live recording has a fleet and worker");
+  for (const [caps, running, capacity, fraction] of [
+    [[4, 8], 6, 12, 0.5],
+    [[1], 1, 1, 1],
+    [[0], 0, 0, 0],
+  ] as const) {
+    const state = {
+      ...live,
+      fleets: [{ ...fleet, demand: { ...fleet.demand, running } }],
+      workers: caps.map((slots, i) => ({ ...worker, name: `workers/executing-${i}`, slots })),
+    };
+    const readout = executingReadout(state);
+    t.assert.match(readout, new RegExp(`<div class="readout__big"><span[^>]*>${running}</span><span class="readout__of">/${capacity}</span></div>`));
+    t.assert.match(readout, /class="meter"/);
+    t.assert.match(readout, new RegExp(`--g:\\s*${fraction}(?:;|")`));
+  }
+});
+
+test("worker rows and details show running counts without an observed cap", (t) => {
+  const worker = live.workers[0];
+  if (!worker) throw new Error("the live recording has a worker");
+  const { slots: _slots, ...uncapped } = worker;
+  const unlimited = { ...uncapped, running: 3 };
+  const state = { ...live, workers: [unlimited] };
+  const row = html({ state }, <Workers />);
+  const detail = html({ state }, <WorkerDetail w={unlimited} state={state} />);
+  t.assert.match(row, /<span class="slots"><span>3 running<\/span><\/span>/);
+  t.assert.doesNotMatch(row, /unknown slots|slots__pips/);
+  t.assert.match(detail, /<dt>running<\/dt><dd class="mono">3<\/dd>/);
+  t.assert.doesNotMatch(detail, /<dt>slots<\/dt>|3\/\?/);
+});
+
+test("workers with observed caps retain pips and slot details", (t) => {
+  const worker = live.workers[0];
+  if (!worker) throw new Error("the live recording has a worker");
+  for (const slots of [4, 1]) {
+    const bounded = { ...worker, slots, running: 1 };
+    const state = { ...live, workers: [bounded] };
+    const row = html({ state }, <Workers />);
+    const detail = html({ state }, <WorkerDetail w={bounded} state={state} />);
+    t.assert.match(row, new RegExp(`1(?:<!-- -->)? of (?:<!-- -->)?${slots}(?:<!-- -->)? slots`));
+    t.assert.equal((row.match(/<i(?: class="on")?><\/i>/g) ?? []).length, slots);
+    t.assert.match(detail, new RegExp(`<dt>slots</dt><dd class="mono">1/${slots}</dd>`));
+  }
 });
 
 test("open worker detail names running actions and falls back to the digest", (t) => {

@@ -26,47 +26,29 @@ pub fn metric(value: f64) -> Metric {
     Metric::try_new(value.min(f64::MAX)).unwrap_or_default()
 }
 
-/// The inputs behind one purchase of capacity.
+/// The resource inputs behind one scale-out decision.
 ///
-/// The load and capacity fields are in nominal slots of the limiting dimension, so the summary
-/// states the one quantity that set the number of instances without copying four vectors.
+/// Demand and capacity are worker-equivalents in the selected limiting dimension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ScaleDecision {
-    /// The readiness the planner used: the measured median, else the configured prior.
-    pub readiness: Duration,
-    /// The payback horizon `H` the purchase had to repay within.
-    pub horizon: Duration,
-    /// The nominal slots per instance, `target_actions_per_instance`.
-    pub slots: u32,
+    /// The dimension with the largest normalized demand.
+    pub dimension: ScalingDimension,
+    /// Demand in worker-equivalents in the limiting dimension.
+    pub demand: Metric,
+    /// Reliable serving capacity in worker-equivalents in the limiting dimension.
+    pub capacity: Metric,
     /// Instances serving at the pass.
     pub reliable: u32,
-    /// The dimension that limited the purchase.
-    pub dimension: ScalingDimension,
-    /// Reliable serving capacity in the limiting dimension.
-    pub capacity: Metric,
-    /// Capacity booting or requested that is not yet serving, in the limiting dimension.
-    pub pre_ready: Metric,
-    /// Persistent load charged to the fleet.
-    pub persistent_load: Metric,
-    /// Transient backlog work before readiness was subtracted.
-    pub transient_backlog: Metric,
-    /// Extra capacity the transient work still needed after the pre-ready capacity.
-    pub transient_extra: Metric,
-    /// Queued persistent-source work that cannot wait for a boot.
-    pub persistent_queue: Metric,
-    /// Instances bought beyond the reliable ones.
+    /// Instances booting or requested but not serving.
+    pub booting: u32,
+    /// Instances needed for the resource demand and configured minimum.
+    pub needed: u32,
+    /// Instances needed beyond the reliable ones.
     pub extra_instances: u32,
-    /// The instance floor that keeps unreachable queued work from waiting forever, 0 or 1.
-    pub reachability: u32,
-    /// Persistent streams charged to the fleet.
-    pub persistent_streams: u32,
-    /// All streams the fleet saw.
-    pub streams: u32,
-    /// Whether the horizon was zero, the free-overhead limit. Then no quotient was taken.
-    pub zero_overhead: bool,
 }
 
-/// The inputs behind one utilization cordon.
+/// The inputs behind one utilization cordon. Resource values are worker-equivalents
+/// in the selected limiting dimension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CordonDecision {
     /// The readiness the planner used.
@@ -108,6 +90,5 @@ mod tests {
         let decision = ScaleDecision::default();
         assert_eq!(decision.extra_instances, 0);
         assert_eq!(decision.capacity.get().to_bits(), 0.0_f64.to_bits());
-        assert!(!decision.zero_overhead);
     }
 }

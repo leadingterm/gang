@@ -72,8 +72,7 @@ async fn plain_mode_records_the_identity_fleet_and_layout() {
     );
     assert_eq!(spec.properties.get(property::CPU_COUNT), Some("4"));
     assert_eq!(spec.properties.get(property::MEMORY_KB), Some("8388608"));
-    assert_eq!(spec.slots.count().get(), 4);
-    assert!(!spec.slots.is_single_use());
+    assert_eq!(spec.lifetime, WorkerLifetime::LongLived);
     assert_eq!(spec.work_directory, layout.work_directory());
     assert_eq!(spec.fast_cas_directory, layout.fast_cas_directory());
     assert_eq!(spec.fast_cas_budget.get(), 5 * GIB);
@@ -306,8 +305,7 @@ async fn single_use_worker_takes_one_action_and_run_returns_ok() {
     .await;
     result.expect("a finished single-use worker ends the run");
     let spec = only_spec(&harness);
-    assert_eq!(spec.slots.count().get(), 1);
-    assert!(spec.slots.is_single_use());
+    assert_eq!(spec.lifetime, WorkerLifetime::SingleUse);
 }
 
 #[tokio::test]

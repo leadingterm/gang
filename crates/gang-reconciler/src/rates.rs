@@ -2,28 +2,29 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
 use gang_clock::Tick;
 use gang_config::{FleetPolicy, ScalingConfig};
 use gang_spi::{CompletionRates, SchedulerSnapshot};
-use gang_types::SourceId;
+use gang_types::{SourceId, property::MILLICORES_PER_CORE};
 
 use crate::profile::{ActivityForecast, SourceProfiles};
-use crate::vectors::{Horizon, ResourceVector, SlotVector, product, u128_to_u64};
+use crate::vectors::{CapacityVector, Horizon, ResourceVector, product, u64_to_f64, u128_to_u64};
 use crate::{FleetPass, HostedSnapshot, PassTime};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct FleetRates {
-    pub persistent_load: SlotVector,
-    pub arrival_load: SlotVector,
-    pub completion_load: SlotVector,
-    pub total_load: SlotVector,
-    pub transient_work: SlotVector,
-    pub persistent_queue: SlotVector,
-    pub queued_work: SlotVector,
-    pub serving_load: SlotVector,
+    pub persistent_load: CapacityVector,
+    pub arrival_load: CapacityVector,
+    pub completion_load: CapacityVector,
+    pub total_load: CapacityVector,
+    pub transient_work: CapacityVector,
+    pub persistent_queue: CapacityVector,
+    pub queued_work: CapacityVector,
+    pub serving_load: CapacityVector,
     pub persistent_streams: u32,
     pub streams: u32,
 }
@@ -303,8 +304,6 @@ struct FleetScratch {
     overflow_total: ResourceVector,
     actual: ResourceVector,
     serving: ResourceVector,
-    actual_count: f64,
-    serving_count: f64,
     transient: ResourceVector,
     persistent_queue: ResourceVector,
     queued: ResourceVector,
@@ -317,6 +316,7 @@ pub(crate) struct SourceRates {
     profiles: SourceProfiles,
     kappa: f64,
     fleet_count: usize,
+    cpu_oversubscription: NonZeroU32,
     index: HashMap<SourceId, usize>,
     sources: Vec<SourceState>,
     cells: Vec<Cell>,
@@ -326,6 +326,7 @@ pub(crate) struct SourceRates {
     executing_durations: Vec<Duration>,
     worker_fleets: Vec<Option<usize>>,
     worker_serving: Vec<bool>,
+    worker_resources: Vec<ResourceVector>,
     previous_rows: Vec<CompletionRates>,
     deltas: Vec<CompletionDelta>,
     previous_read: Option<Tick>,
@@ -349,6 +350,7 @@ impl SourceRates {
         policies: &[FleetPolicy],
         scaling: Arc<ScalingConfig>,
         profiles: SourceProfiles,
+        cpu_oversubscription: NonZeroU32,
     ) -> Self {
         let source_count = scaling.max_sources.get();
         let fleet_count = policies.len();
@@ -360,6 +362,7 @@ impl SourceRates {
             scaling,
             profiles,
             fleet_count,
+            cpu_oversubscription,
             index: HashMap::with_capacity(source_count),
             sources,
             cells: vec![Cell::default(); slots.saturating_mul(fleet_count)],
@@ -369,6 +372,7 @@ impl SourceRates {
             executing_durations: Vec::new(),
             worker_fleets: Vec::new(),
             worker_serving: Vec::new(),
+            worker_resources: Vec::new(),
             previous_rows: Vec::with_capacity(slots.saturating_mul(fleet_count)),
             deltas: Vec::with_capacity(slots.saturating_mul(fleet_count)),
             previous_read: None,
@@ -399,7 +403,7 @@ impl SourceRates {
         fleets: &[FleetPass],
         hosted: &HostedSnapshot,
         attribution: &[Option<usize>],
-        capacities: &[SlotVector],
+        capacities: &[CapacityVector],
         horizons: &[Horizon],
         time: PassTime,
     ) {
@@ -435,6 +439,7 @@ impl SourceRates {
         self.rates.fill(FleetRates::default());
         self.worker_fleets.clear();
         self.worker_serving.clear();
+        self.worker_resources.clear();
         for worker in &snapshot.workers {
             let fleet = fleets
                 .iter()
@@ -456,12 +461,7 @@ impl SourceRates {
                 });
             self.worker_fleets.push(fleet);
             self.worker_serving.push(serving);
-            if let Some(fleet) = fleet {
-                self.fleet_scratch[fleet].actual_count += f64::from(worker.running_actions);
-                if serving {
-                    self.fleet_scratch[fleet].serving_count += f64::from(worker.running_actions);
-                }
-            }
+            self.worker_resources.push(ResourceVector::default());
         }
     }
 
@@ -529,6 +529,7 @@ impl SourceRates {
                 now,
             );
             if let Some(actual) = actual {
+                self.worker_resources[row.worker] += vector;
                 self.fleet_scratch[actual].actual += vector;
                 if self
                     .worker_serving
@@ -538,6 +539,32 @@ impl SourceRates {
                 {
                     self.fleet_scratch[actual].serving += vector;
                 }
+            }
+        }
+        // Listings can lag a worker's running count. Reserve the missing
+        // worker's resource budget without creating any source attribution.
+        for (index, worker) in snapshot.workers.iter().enumerate() {
+            let Some(fleet) = self.worker_fleets[index] else {
+                continue;
+            };
+            let known = self.worker_resources[index];
+            if f64::from(worker.running_actions) <= known.actions {
+                continue;
+            }
+            let policy = &fleets[fleet].policy;
+            let cpu = u64::from(policy.vcpus_per_instance.get())
+                .saturating_mul(MILLICORES_PER_CORE)
+                .saturating_mul(u64::from(self.cpu_oversubscription.get()));
+            let budget = ResourceVector {
+                cpu_millicores: u64_to_f64(cpu),
+                memory: u64_to_f64(policy.memory_per_instance.get().get()),
+                disk: u64_to_f64(policy.disk_per_instance.get().get()),
+                ..ResourceVector::default()
+            };
+            let missing = budget.sub_floor(known);
+            self.fleet_scratch[fleet].actual += missing;
+            if self.worker_serving[index] {
+                self.fleet_scratch[fleet].serving += missing;
             }
         }
     }
@@ -671,15 +698,12 @@ impl SourceRates {
         }
     }
 
-    fn finish_fleet_rates(&mut self, fleets: &[FleetPass], capacities: &[SlotVector]) {
+    fn finish_fleet_rates(&mut self, fleets: &[FleetPass], capacities: &[CapacityVector]) {
         for (fleet, pass) in fleets.iter().enumerate().take(self.fleet_count) {
             let scratch = &mut self.fleet_scratch[fleet];
-            // Snapshot worker counts can lead individual execution rows. Only a
-            // fleet-level count floor is justified; never fabricate source rows.
-            scratch.actual.actions = scratch.actual.actions.max(scratch.actual_count);
-            scratch.serving.actions = scratch.serving.actions.max(scratch.serving_count);
             let cap = capacities.get(fleet).copied().unwrap_or_default();
-            let normalize = |vector: ResourceVector| vector.normalized(&pass.policy);
+            let normalize =
+                |vector: ResourceVector| vector.normalized(&pass.policy, self.cpu_oversubscription);
             let persistent = normalize(scratch.preferred_persistent)
                 .component_min(cap)
                 .component_max(normalize(scratch.preferred_persistent_actual))
@@ -947,11 +971,18 @@ mod tests {
         }
     }
 
+    fn test_resources() -> ActionResources {
+        ActionResources {
+            cpu_millicores: 16_000,
+            ..ActionResources::default()
+        }
+    }
+
     fn queued(source: Option<SourceId>, preferred: usize, expected: Option<u64>) -> QueuedDemand {
         QueuedDemand {
             source,
             candidates: FleetSet::try_from_indices([preferred]).unwrap(),
-            resources: ActionResources::default(),
+            resources: test_resources(),
             expected: expected.map(Duration::from_secs),
             queued_since: Timestamp::default(),
             priority: 0,
@@ -967,7 +998,7 @@ mod tests {
         ExecutingDemand {
             source,
             candidates: FleetSet::try_from_indices([preferred]).unwrap(),
-            resources: ActionResources::default(),
+            resources: test_resources(),
             expected: expected.map(Duration::from_secs),
             started: Timestamp::default(),
             worker,
@@ -992,7 +1023,7 @@ mod tests {
         rates: SourceRates,
         fleets: Vec<FleetPass>,
         snapshot: SchedulerSnapshot,
-        capacities: Vec<SlotVector>,
+        capacities: Vec<CapacityVector>,
         horizons: Vec<Horizon>,
     }
 
@@ -1009,7 +1040,6 @@ mod tests {
             let policies: Vec<_> = (0..fleet_count)
                 .map(|index| {
                     let mut policy = fleet_policy(&format!("fleet-{index}")).unwrap();
-                    policy.target_actions_per_instance = nonzero_u32(16);
                     policy.vcpus_per_instance = nonzero_u32(16);
                     policy.memory_per_instance = NonZeroBytes::gib(16);
                     policy.disk_per_instance = NonZeroBytes::gib(16);
@@ -1017,18 +1047,17 @@ mod tests {
                 })
                 .collect();
             let profiles = SourceProfiles::new(&scaling, HistoryWindow::from_units(7));
-            let rates = SourceRates::new(&policies, Arc::new(scaling), profiles);
+            let rates = SourceRates::new(&policies, Arc::new(scaling), profiles, nonzero_u32(1));
             Self {
                 clock: TestClock::new(Timestamp::default()),
                 rates,
                 fleets: policies.into_iter().map(FleetPass::new).collect(),
                 snapshot: SchedulerSnapshot::default(),
                 capacities: vec![
-                    SlotVector {
-                        actions: 1600.0,
-                        cpu: 1600.0,
-                        memory: 1600.0,
-                        disk: 1600.0
+                    CapacityVector {
+                        cpu: 100.0,
+                        memory: 100.0,
+                        disk: 100.0
                     };
                     fleet_count
                 ],
@@ -1277,26 +1306,29 @@ mod tests {
     #[test]
     fn qualified_arrival_and_completion_work_remain_unclipped() {
         let mut world = World::new(1, 2);
-        world.capacities[0].actions = 1.0;
+        world.capacities[0].cpu = 1.0;
         world.queue(16, Some(20));
         world.observe(0);
-        world.complete(source(1), 0, 20, 16, Some(20), ActionResources::default());
+        world.complete(source(1), 0, 20, 16, Some(20), test_resources());
         world.queue(20, Some(20));
         world.observe(20);
-        assert_eq!(world.rates.fleet(0).arrival_load, SlotVector::default());
-        world.complete(source(1), 0, 40, 16, Some(20), ActionResources::default());
+        assert_eq!(world.rates.fleet(0).arrival_load, CapacityVector::default());
+        world.complete(source(1), 0, 40, 16, Some(20), test_resources());
         world.queue(24, Some(20));
         world.observe(40);
         let weight = world.rates.kappa * (1.0 + decay(world.rates.kappa, tick(40), tick(20)));
         let rates = world.rates.fleet(0);
-        near(rates.arrival_load.actions, 20.0 * weight * 20.0, 1e-12);
-        near(rates.completion_load.actions, 16.0 * weight * 20.0, 1e-12);
-        exact(rates.persistent_load.actions, 1.0);
-        assert!(rates.arrival_load.actions > rates.persistent_load.actions);
+        near(rates.arrival_load.cpu, 20.0 * weight * 20.0, 1e-12);
+        near(rates.completion_load.cpu, 16.0 * weight * 20.0, 1e-12);
+        exact(rates.persistent_load.cpu, 1.0);
+        assert!(rates.arrival_load.cpu > rates.persistent_load.cpu);
         world.queue(23, Some(20));
         world.observe(41);
-        assert_eq!(world.rates.fleet(0).arrival_load, SlotVector::default());
-        assert_eq!(world.rates.fleet(0).completion_load, SlotVector::default());
+        assert_eq!(world.rates.fleet(0).arrival_load, CapacityVector::default());
+        assert_eq!(
+            world.rates.fleet(0).completion_load,
+            CapacityVector::default()
+        );
     }
 
     #[test]
@@ -1304,7 +1336,7 @@ mod tests {
         let mut world = World::new(1, 2);
         world.queue(10, Some(1));
         world.observe(0);
-        world.complete(source(1), 0, 1, 2, Some(1), ActionResources::default());
+        world.complete(source(1), 0, 1, 2, Some(1), test_resources());
         world.queue(8, Some(1));
         world.observe(1);
         exact(world.cell(source(1), 0).completion_credit, 0.0);
@@ -1316,7 +1348,7 @@ mod tests {
         exact(world.cell(source(1), 0).completion_credit, 0.0);
         world.observe(3);
         exact(world.cell(source(1), 0).completion_credit, 0.0);
-        assert_eq!(world.rates.fleet(0).arrival_load, SlotVector::default());
+        assert_eq!(world.rates.fleet(0).arrival_load, CapacityVector::default());
     }
 
     #[test]
@@ -1333,7 +1365,7 @@ mod tests {
                     batch as u64 * 30,
                     16,
                     Some(30),
-                    ActionResources::default(),
+                    test_resources(),
                 );
                 world.observe(batch as u64 * 30);
                 let cell = world.cell(source(1), 0);
@@ -1341,7 +1373,10 @@ mod tests {
                 let arrivals = (world.rates.kappa * (cell.n - cell.nbar) + completion).max(0.0);
                 near(arrivals, 0.0, 1e-12);
                 assert!(!cell.persistent);
-                assert_eq!(world.rates.fleet(0).persistent_queue, SlotVector::default());
+                assert_eq!(
+                    world.rates.fleet(0).persistent_queue,
+                    CapacityVector::default()
+                );
             }
         }
     }
@@ -1350,13 +1385,13 @@ mod tests {
     fn brand_new_subpass_completion_has_positive_offered_load() {
         let mut world = World::new(1, 2);
         world.observe(0);
-        world.complete(source(1), 0, 5, 3, Some(2), ActionResources::default());
+        world.complete(source(1), 0, 5, 3, Some(2), test_resources());
         world.observe(5);
         let cell = world.cell(source(1), 0);
         near(cell.moments.all, 3.0 * world.rates.kappa, 1e-15);
         exact(cell.nbar, 0.0);
         near(
-            world.rates.fleet(0).total_load.actions,
+            world.rates.fleet(0).total_load.cpu,
             6.0 * world.rates.kappa,
             1e-15,
         );
@@ -1366,10 +1401,10 @@ mod tests {
     fn first_term_discards_preexisting_completion_rows() {
         let mut world = World::new(1, 2);
         world.queue(10, Some(10));
-        world.complete(source(1), 0, 0, 100, Some(30), ActionResources::default());
+        world.complete(source(1), 0, 0, 100, Some(30), test_resources());
         world.observe(10);
         exact(world.cell(source(1), 0).moments.all, 0.0);
-        assert_eq!(world.rates.fleet(0).total_load, SlotVector::default());
+        assert_eq!(world.rates.fleet(0).total_load, CapacityVector::default());
         exact(world.cell(source(1), 0).nbar, 10.0);
     }
 
@@ -1379,11 +1414,11 @@ mod tests {
         world.queue(160, Some(30));
         world.observe(0);
         world.queue(144, Some(30));
-        world.complete(source(1), 0, 30, 16, Some(30), ActionResources::default());
+        world.complete(source(1), 0, 30, 16, Some(30), test_resources());
         world.snapshot.source_rates[0].generation = 9;
         world.observe(30);
         exact(world.cell(source(1), 0).nbar, 160.0);
-        near(world.rates.fleet(0).total_load.actions, 0.0, 1e-12);
+        near(world.rates.fleet(0).total_load.cpu, 0.0, 1e-12);
         world.snapshot.source_rates[0].generation = 10;
         world.snapshot.source_rates[0].created_at = tick(1);
         world.snapshot.source_rates[0].at = tick(31);
@@ -1397,10 +1432,10 @@ mod tests {
     fn row_read_tick_not_later_pass_tick_fences_new_rows() {
         let mut world = World::new(1, 2);
         world.observe_skew(0, 10);
-        world.complete(source(1), 0, 5, 1, Some(4), ActionResources::default());
+        world.complete(source(1), 0, 5, 1, Some(4), test_resources());
         world.observe_skew(11, 20);
         let expected = 4.0 * world.rates.kappa * decay(world.rates.kappa, tick(20), tick(5));
-        near(world.rates.fleet(0).total_load.actions, expected, 1e-14);
+        near(world.rates.fleet(0).total_load.cpu, expected, 1e-14);
     }
 
     #[test]
@@ -1430,14 +1465,17 @@ mod tests {
         world.observe(0);
         world.snapshot.executing.clear();
         world.snapshot.workers[0].running_actions = 0;
-        world.complete(source(1), 0, 10, 1, Some(10), ActionResources::default());
+        world.complete(source(1), 0, 10, 1, Some(10), test_resources());
         world.observe(10);
         world.observe(11); // first GOOD quiet observation
         world.observe(70);
-        assert!(world.rates.fleet(0).total_load.actions > 0.0);
+        assert!(world.rates.fleet(0).total_load.cpu > 0.0);
         world.observe(71);
-        assert_eq!(world.rates.fleet(0).total_load, SlotVector::default());
-        assert_eq!(world.rates.fleet(0).persistent_load, SlotVector::default());
+        assert_eq!(world.rates.fleet(0).total_load, CapacityVector::default());
+        assert_eq!(
+            world.rates.fleet(0).persistent_load,
+            CapacityVector::default()
+        );
         exact(world.cell(source(1), 0).nbar, 0.0);
         assert_eq!(world.cell(source(1), 0).rbar, ResourceVector::default());
         assert_eq!(world.rates.previous_rows.len(), 1);
@@ -1449,7 +1487,7 @@ mod tests {
                 .learned_mean,
             Some(Duration::from_secs(10))
         );
-        world.complete(source(1), 0, 80, 1, Some(2), ActionResources::default());
+        world.complete(source(1), 0, 80, 1, Some(2), test_resources());
         world.observe(80);
         near(
             world.cell(source(1), 0).moments.all,
@@ -1480,7 +1518,7 @@ mod tests {
         assert!(world.cell(source(1), 0).seeded);
         world.observe(220);
         assert!(!world.cell(source(1), 0).seeded);
-        assert_eq!(world.rates.fleet(0).total_load, SlotVector::default());
+        assert_eq!(world.rates.fleet(0).total_load, CapacityVector::default());
     }
 
     #[test]
@@ -1506,7 +1544,7 @@ mod tests {
         exact(world.cell(source(1), 0).nbar, 12.0);
         exact(world.cell(source(1), 0).n_prev, 12.0);
         exact(world.cell(source(1), 0).moments.all, 0.0);
-        assert_eq!(world.rates.fleet(0).total_load, SlotVector::default());
+        assert_eq!(world.rates.fleet(0).total_load, CapacityVector::default());
     }
 
     #[test]
@@ -1517,12 +1555,12 @@ mod tests {
             world.observe(0);
             for at in 1..=300 {
                 world.queue(if at < 100 { 64 } else { concurrency }, Some(10));
-                world.complete(source(1), 0, at, 8, Some(10), ActionResources::default());
+                world.complete(source(1), 0, at, 8, Some(10), test_resources());
                 world.observe(at);
             }
             assert!(world.cell(source(1), 0).persistent);
             exact(
-                world.rates.fleet(0).persistent_queue.actions,
+                world.rates.fleet(0).persistent_queue.cpu,
                 f64::from(u32::try_from(concurrency).unwrap()),
             );
             let cell = world.cell(source(1), 0);
@@ -1538,17 +1576,17 @@ mod tests {
         world.observe(0);
         world.queue(50, Some(10));
         world.observe(10);
-        let excess = world.rates.fleet(0).total_load.actions;
+        let excess = world.rates.fleet(0).total_load.cpu;
         assert!(excess > 0.0);
         assert!(world.cell(source(1), 0).persistent);
         world.queue(0, Some(10));
-        world.complete(source(1), 0, 11, 1, Some(10), ActionResources::default());
+        world.complete(source(1), 0, 11, 1, Some(10), test_resources());
         world.observe(11);
         world.observe(70);
         assert!(world.cell(source(1), 0).persistent);
         world.observe(71);
         assert!(!world.cell(source(1), 0).persistent);
-        assert!(world.rates.fleet(0).total_load.actions < excess);
+        assert!(world.rates.fleet(0).total_load.cpu < excess);
     }
 
     #[test]
@@ -1556,16 +1594,16 @@ mod tests {
         let mut world = World::new(1, 2);
         world.queue(10, Some(30));
         world.observe(0);
-        world.complete(source(1), 0, 1, 1, Some(4), ActionResources::default());
-        world.complete(source(1), 0, 1, 9, None, ActionResources::default());
+        world.complete(source(1), 0, 1, 1, Some(4), test_resources());
+        world.complete(source(1), 0, 1, 9, None, test_resources());
         world.observe(1);
         near(
-            world.rates.fleet(0).total_load.actions,
+            world.rates.fleet(0).total_load.cpu,
             40.0 * world.rates.kappa,
             1e-13,
         );
         exact(world.cell(source(1), 0).moments.timed, world.rates.kappa);
-        world.complete(source(1), 0, 2, 1, Some(0), ActionResources::default());
+        world.complete(source(1), 0, 2, 1, Some(0), test_resources());
         world.observe(2);
         let moments = world.cell(source(1), 0).moments;
         assert!(moments.work.actions / moments.timed < 4.0);
@@ -1622,9 +1660,9 @@ mod tests {
         assert_eq!(world.rates.queued_duration(1), Duration::from_secs(30));
         assert_eq!(world.rates.queued_duration(3), Duration::from_secs(10));
         assert_eq!(world.rates.executing_duration(0), Duration::from_secs(40));
-        exact(world.rates.fleet(1).transient_work.actions, 30.0);
-        exact(world.rates.fleet(1).total_load.actions, 1.0);
-        exact(world.rates.fleet(1).serving_load.actions, 0.0);
+        exact(world.rates.fleet(1).transient_work.cpu, 30.0);
+        exact(world.rates.fleet(1).total_load.cpu, 1.0);
+        exact(world.rates.fleet(1).serving_load.cpu, 0.0);
     }
 
     #[test]
@@ -1642,8 +1680,8 @@ mod tests {
         assert_eq!(world.rates.queued_duration(1), Duration::from_secs(20));
         assert_eq!(world.rates.queued_duration(2), Duration::from_secs(40));
         assert_eq!(world.rates.queued_duration(3), Duration::from_secs(10));
-        exact(world.rates.fleet(1).transient_work.actions, 70.0);
-        exact(world.rates.fleet(1).queued_work.actions, 70.0);
+        exact(world.rates.fleet(1).transient_work.cpu, 70.0);
+        exact(world.rates.fleet(1).queued_work.cpu, 70.0);
         exact(world.cell(source(1), 0).n, 1.0);
         exact(world.cell(source(1), 1).n, 1.0);
     }
@@ -1653,7 +1691,7 @@ mod tests {
         let mut world = World::new(1, 1);
         world.queue(160, Some(30));
         world.observe(0);
-        world.complete(source(1), 0, 1, 1, Some(30), ActionResources::default());
+        world.complete(source(1), 0, 1, 1, Some(30), test_resources());
         world.snapshot.queued = vec![queued(source(2), 0, Some(10)); 8];
         world.observe(1);
         // Fresh completion protects retained active state for this one pass.
@@ -1666,7 +1704,7 @@ mod tests {
         world.observe(4);
         exact(world.cell(source(1), 0).nbar, 160.0);
         exact(world.cell(source(1), 0).moments.all, 0.0);
-        assert_eq!(world.rates.fleet(0).total_load, SlotVector::default());
+        assert_eq!(world.rates.fleet(0).total_load, CapacityVector::default());
     }
 
     #[test]
@@ -1683,23 +1721,19 @@ mod tests {
             .executing
             .extend(vec![executing(source(1), 0, 1, Some(10)); 3]);
         world.observe(0);
-        world.complete(source(1), 0, 10, 100, Some(10), ActionResources::default());
+        world.complete(source(1), 0, 10, 100, Some(10), test_resources());
         world.observe(10);
         let rho = 1000.0 * world.rates.kappa;
-        near(
-            world.rates.fleet(0).persistent_load.actions,
-            rho - 3.0,
-            1e-12,
-        );
-        exact(world.rates.fleet(1).persistent_load.actions, 3.0);
-        exact(world.rates.fleet(1).total_load.actions, 3.0);
-        exact(world.rates.fleet(1).serving_load.actions, 0.0);
-        exact(world.rates.fleet(0).persistent_queue.actions, 4.0);
+        near(world.rates.fleet(0).persistent_load.cpu, rho - 3.0, 1e-12);
+        exact(world.rates.fleet(1).persistent_load.cpu, 3.0);
+        exact(world.rates.fleet(1).total_load.cpu, 3.0);
+        exact(world.rates.fleet(1).serving_load.cpu, 0.0);
+        exact(world.rates.fleet(0).persistent_queue.cpu, 4.0);
         exact(world.cell(source(1), 0).n, 9.0);
         assert!(!world.cell(source(1), 1).seeded);
-        world.capacities[0].actions = 1.0;
+        world.capacities[0].cpu = 1.0;
         world.observe(11);
-        exact(world.rates.fleet(0).persistent_load.actions, 2.0);
+        exact(world.rates.fleet(0).persistent_load.cpu, 2.0);
         assert!(
             world
                 .rates
@@ -1732,9 +1766,11 @@ mod tests {
         exact(world.cell(source(1), 0).n, 2.0);
         exact(world.cell(source(2), 1).n, 2.0);
         exact(world.cell(source(1), 1).n, 0.0);
-        exact(world.rates.fleet(0).total_load.actions, 2.0);
-        exact(world.rates.fleet(1).total_load.actions, 4.0);
-        exact(world.rates.fleet(1).total_load.cpu, 8.0);
+        exact(world.rates.fleet(0).total_load.cpu, 1.0);
+        exact(world.rates.fleet(1).total_load.cpu, 1.5);
+        exact(world.rates.fleet(1).total_load.memory, 1.0);
+        exact(world.rates.fleet(1).serving_load.disk, 1.0);
+        assert!(world.rates.lookup(source(3)).is_none());
     }
 
     #[test]
@@ -1743,14 +1779,70 @@ mod tests {
         let mut cpu = queued(source(1), 0, Some(10));
         cpu.resources.cpu_millicores = 16_000;
         let mut memory = queued(source(2), 0, Some(10));
+        memory.resources.cpu_millicores = 0;
         memory.resources.memory = world.fleets[0].policy.memory_per_instance.get();
         world.snapshot.queued = vec![cpu, memory];
         world.observe(0);
         let work = world.rates.fleet(0).transient_work;
-        exact(work.actions, 20.0);
-        exact(work.cpu, 160.0);
-        exact(work.memory, 160.0);
-        exact(work.max_component(), 160.0);
+        exact(work.cpu, 10.0);
+        exact(work.memory, 10.0);
+        exact(work.max_component(), 10.0);
+    }
+    #[test]
+    fn missing_execution_rows_occupy_only_the_affected_worker() {
+        let mut world = World::new(1, 2);
+        world.capacities[0] = CapacityVector::ONE.scaled(4.0);
+        for index in 0..4 {
+            world.snapshot.workers.push(worker(
+                &world.fleets[0].policy,
+                &format!("local-{index}"),
+                u32::from(index == 0),
+                false,
+            ));
+        }
+        world.observe(0);
+        assert_eq!(world.rates.fleet(0).serving_load, CapacityVector::ONE);
+        assert_eq!(world.rates.fleet(0).total_load, CapacityVector::ONE);
+        assert_eq!(world.rates.index.len(), 0);
+    }
+
+    #[test]
+    fn missing_rows_preserve_known_reservations_above_worker_budget() {
+        let mut world = World::new(1, 2);
+        world
+            .snapshot
+            .workers
+            .push(worker(&world.fleets[0].policy, "local-1", 2, false));
+        let mut row = executing(source(1), 0, 0, Some(10));
+        row.resources.cpu_millicores = 32_000;
+        world.snapshot.executing.push(row);
+        world.observe(0);
+        let load = world.rates.fleet(0).serving_load;
+        exact(load.cpu, 2.0);
+        exact(load.memory, 1.0);
+        exact(load.disk, 1.0);
+        assert_eq!(world.rates.index.len(), 1);
+    }
+
+    #[test]
+    fn cpu_oversubscription_normalizes_running_load_but_not_memory() {
+        let mut world = World::new(1, 2);
+        world.rates.cpu_oversubscription = nonzero_u32(2);
+        world
+            .snapshot
+            .workers
+            .push(worker(&world.fleets[0].policy, "local-1", 1, false));
+        let mut row = executing(source(1), 0, 0, Some(10));
+        row.resources.memory = world.fleets[0].policy.memory_per_instance.get();
+        world.snapshot.executing.push(row);
+        world.observe(0);
+        let load = world.rates.fleet(0).serving_load;
+        exact(load.cpu, 0.5);
+        exact(load.memory, 1.0);
+        exact(
+            load.utilization(CapacityVector::ONE.scaled(2.0)).unwrap(),
+            0.5,
+        );
     }
 
     fn trace(cadence: u64) -> (Moments, f64) {
@@ -1785,7 +1877,7 @@ mod tests {
                 second,
                 10 + u32::try_from(second % 7).unwrap(),
                 Some(2 + second % 11),
-                ActionResources::default(),
+                test_resources(),
             );
             if second % cadence == 0 {
                 world.queue(64 + usize::try_from((second / 31) % 5).unwrap(), Some(7));
@@ -1850,7 +1942,7 @@ mod tests {
             .executing
             .push(executing(source(1), 0, 0, Some(20)));
         world.observe(0);
-        world.complete(source(1), 0, 1, 1, Some(10), ActionResources::default());
+        world.complete(source(1), 0, 1, 1, Some(10), test_resources());
         world.snapshot.source_rates_at = tick(1);
         let mut snapshot = world.snapshot.clone();
         let mut hosted = HostedSnapshot::default();
@@ -1884,16 +1976,16 @@ mod tests {
         let mut world = World::new(1, 2);
         world.queue(10, Some(3));
         world.observe(0);
-        world.complete(source(1), 0, 1, 2, Some(3), ActionResources::default());
+        world.complete(source(1), 0, 1, 2, Some(3), test_resources());
         world.observe(1);
         world.rates.interrupt();
-        world.complete(source(1), 0, 40, 5, Some(3), ActionResources::default());
+        world.complete(source(1), 0, 40, 5, Some(3), test_resources());
         world.observe_skew(50, 60);
         let expected = 2.0 * world.rates.kappa * decay(world.rates.kappa, tick(50), tick(1))
             + 5.0 * world.rates.kappa * decay(world.rates.kappa, tick(50), tick(40));
         near(world.cell(source(1), 0).moments.all, expected, 1e-14);
         near(
-            world.rates.fleet(0).total_load.actions,
+            world.rates.fleet(0).total_load.cpu,
             3.0 * expected * decay(world.rates.kappa, tick(60), tick(50)),
             1e-14,
         );
@@ -1905,16 +1997,16 @@ mod tests {
         let mut world = World::new(1, 2);
         world.queue(10, Some(30));
         world.observe(0);
-        world.complete(source(1), 0, 1, 1, None, ActionResources::default());
+        world.complete(source(1), 0, 1, 1, None, test_resources());
         world.observe(1);
         near(
-            world.rates.fleet(0).total_load.actions,
+            world.rates.fleet(0).total_load.cpu,
             30.0 * world.rates.kappa,
             1e-13,
         );
-        world.complete(source(1), 0, 2, 1, Some(0), ActionResources::default());
+        world.complete(source(1), 0, 2, 1, Some(0), test_resources());
         world.observe(2);
-        exact(world.rates.fleet(0).total_load.actions, 0.0);
+        exact(world.rates.fleet(0).total_load.cpu, 0.0);
         assert!(world.cell(source(1), 0).moments.all > 0.0);
         assert!(world.cell(source(1), 0).moments.timed > 0.0);
     }
@@ -1931,11 +2023,11 @@ mod tests {
             action.started = Timestamp::default() + Duration::from_secs(offset);
             world.snapshot.executing.push(action);
             world.observe(0);
-            world.complete(source(1), 0, 5, 1, Some(10), ActionResources::default());
+            world.complete(source(1), 0, 5, 1, Some(10), test_resources());
             world.observe(5);
             (
                 world.cell(source(1), 0).moments.all,
-                world.rates.fleet(0).total_load.actions,
+                world.rates.fleet(0).total_load.cpu,
             )
         }
         let baseline = with_offset(0);
@@ -1960,8 +2052,8 @@ mod tests {
             instance: Arc::new(gang_types::InstanceId::try_new("local-1").unwrap()),
         });
         world.observe(0);
-        exact(world.rates.fleet(0).total_load.actions, 1.0);
-        exact(world.rates.fleet(0).serving_load.actions, 0.0);
+        exact(world.rates.fleet(0).total_load.cpu, 1.0);
+        exact(world.rates.fleet(0).serving_load.cpu, 0.0);
     }
 
     #[test]
@@ -1974,9 +2066,9 @@ mod tests {
         world.queue(16, None);
         world.observe(0);
         assert!(world.cell(source(1), 0).persistent);
-        exact(world.rates.fleet(0).persistent_queue.actions, 16.0);
-        exact(world.rates.fleet(0).persistent_load.actions, 0.0);
-        assert!(world.rates.fleet(0).queued_work.actions.is_finite());
+        exact(world.rates.fleet(0).persistent_queue.cpu, 16.0);
+        exact(world.rates.fleet(0).persistent_load.cpu, 0.0);
+        assert!(world.rates.fleet(0).queued_work.cpu.is_finite());
     }
 
     #[test]
@@ -2002,11 +2094,7 @@ mod tests {
             world.cell(source(1), 0).moments.work,
             ResourceVector::default()
         );
-        near(
-            world.rates.fleet(0).total_load.actions,
-            30.0 * world.rates.kappa,
-            1e-14,
-        );
+        near(world.rates.fleet(0).total_load.cpu, 0.0, 1e-14);
         exact(world.rates.fleet(0).total_load.cpu, 0.0);
         exact(world.rates.fleet(0).total_load.memory, 0.0);
         exact(world.rates.fleet(0).total_load.disk, 0.0);

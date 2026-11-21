@@ -47,7 +47,6 @@ fn fleet(in_service: u32) -> Fleet {
         policy: Policy {
             min: 0,
             max: 4,
-            target_actions: 4,
             idle_timeout: Duration::from_secs(15),
             max_drain_wait: Duration::from_mins(1),
             boot_grace: Duration::from_secs(30),

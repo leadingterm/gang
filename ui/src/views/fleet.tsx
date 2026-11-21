@@ -150,13 +150,13 @@ export const TapeKey = ({ f, census }: { f: Fleet; census: FleetCensus }) => {
     ["demand", <><span class="clause">{f.demand.candidates} eligible</span>{" · "}<span class="clause">{f.demand.needed} needed</span></>],
     [
       "policy",
-      <><span class="clause">{f.policy.targetActions}/instance</span>{" · "}<span class="clause">idle <Duration ms={seconds(f.policy.idleTimeout) * 1000} /></span>{" · "}<span class="clause">grace <Duration ms={seconds(f.policy.bootGrace) * 1000} /></span></>,
+      <><span class="clause">idle <Duration ms={seconds(f.policy.idleTimeout) * 1000} /></span>{" · "}<span class="clause">grace <Duration ms={seconds(f.policy.bootGrace) * 1000} /></span></>,
     ],
   ];
   if (f.demand.readiness !== undefined) rows.push(["measured readiness", <Duration ms={seconds(f.demand.readiness) * 1000} />]);
   if (f.demand.expectedWait !== undefined) rows.push(["expected wait", <Duration ms={seconds(f.demand.expectedWait) * 1000} />]);
-  if (f.demand.load !== undefined) rows.push(["load", `${(f.demand.load / 10).toFixed(1)} slots`]);
-  if (f.demand.backlog !== undefined) rows.push(["backlog", <Duration ms={seconds(f.demand.backlog) * 1000} />]);
+  if (f.demand.load !== undefined) rows.push(["load", `${(f.demand.load / 10).toFixed(1)} worker-equivalents`]);
+  if (f.demand.backlog !== undefined) rows.push(["backlog", `${seconds(f.demand.backlog)} worker-equivalent-seconds`]);
   if (f.demand.utilization !== undefined) rows.push(["utilization", `${f.demand.utilization / 10}%`]);
   return (
     <>

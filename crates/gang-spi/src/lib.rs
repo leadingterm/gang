@@ -115,8 +115,8 @@ pub use scheduler_port::{
     BoxedConnection, ClientTls, Connection, ControllerConnections, ControllerEndpoints,
     ControllerReady, ControllerSpec, EngineStore, ExecutingDemand, GateDecision, InstanceCordon,
     LeaderUnavailable, LearnedHistory, Listening, ListingLimits, QueuedActionView, QueuedDemand,
-    RequestGate, RequestScope, RunningActionView, SchedulerPort, SchedulerSnapshot, Slots,
-    StoreAccess, StoreKind, WorkerSpec, WorkerState, WorkerTls, full_body,
+    RequestGate, RequestScope, RunningActionView, SchedulerPort, SchedulerSnapshot, StoreAccess,
+    StoreKind, WorkerSpec, WorkerState, WorkerTls, full_body,
 };
 pub use schema::SchemaMismatch;
 pub use scratch_port::{MountedScratchVolume, ScratchVolumePort};

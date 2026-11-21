@@ -8,7 +8,7 @@ use gang_spi::{
     CPU_COUNT_ENV, ControllerSpec, MEMORY_KB_ENV, NETWORK_ENV, SIDE_CHANNEL_FILE_ENV, StoreAccess,
     WorkerSpec, WorkerTls,
 };
-use gang_types::{FleetCatalog, MatchKind, Url, property};
+use gang_types::{FleetCatalog, FleetProperties, MatchKind, Url, WorkerLifetime, property};
 use nativelink_config::cas_server::{
     AcStoreConfig, ByteStreamConfig, CapabilitiesConfig, CapabilitiesRemoteExecutionConfig,
     CasStoreConfig, ExecutionConfig, LocalWorkerConfig, SchedulerConfig, StoreConfig,
@@ -90,9 +90,12 @@ fn resource_escalation(actions: &ActionsConfig, fleets: &FleetCatalog) -> Value 
                 .filter_map(|&(key, kind)| {
                     (kind == MatchKind::Minimum)
                         .then(|| {
-                            fleet
-                                .capacity(key)
-                                .map(|limit| (key.to_owned(), json!(limit)))
+                            fleet.capacity(key).map(|limit| {
+                                (
+                                    key.to_owned(),
+                                    json!(scheduler_capacity(key, limit, actions)),
+                                )
+                            })
                         })
                         .flatten()
                 })
@@ -107,10 +110,7 @@ fn resource_escalation(actions: &ActionsConfig, fleets: &FleetCatalog) -> Value 
                         .flatten()
                 })
                 .collect();
-            let action_ceilings: Map<String, Value> = fleet
-                .action_ceilings()
-                .map(|(key, limit)| (key.to_owned(), json!(limit)))
-                .collect();
+            let action_ceilings = action_ceilings(fleet);
             json!({ "minimum": minimum, "exact": exact, "action_ceilings": action_ceilings })
         })
         .collect();
@@ -134,12 +134,33 @@ fn resource_escalation(actions: &ActionsConfig, fleets: &FleetCatalog) -> Value 
     escalation
 }
 
+/// CPU is an aggregate scheduling budget; other capacities remain physical.
+fn scheduler_capacity(key: &str, capacity: u64, actions: &ActionsConfig) -> u64 {
+    if key == property::CPU_MILLICORES {
+        capacity.saturating_mul(u64::from(actions.cpu_oversubscription.get()))
+    } else {
+        capacity
+    }
+}
+
+/// Keep the effective physical CPU limit per action even when the aggregate budget is larger.
+fn action_ceilings(properties: &FleetProperties) -> Map<String, Value> {
+    let mut ceilings: Map<String, Value> = properties
+        .action_ceilings()
+        .map(|(key, limit)| (key.to_owned(), json!(limit)))
+        .collect();
+    if let Some(limit) = properties.limit(property::CPU_MILLICORES) {
+        ceilings.insert(property::CPU_MILLICORES.to_owned(), json!(limit));
+    }
+    ceilings
+}
+
 /// The scheduler's cold start: the reservation of an action no hint matches and the client left
 /// untagged. Absent when cold start is disabled, so such actions reserve nothing.
 fn cold_start(tuning: &ColdStartTuning) -> Option<Value> {
     tuning.enabled.then(|| {
         json!({
-            "cpu_count": u64::from(tuning.cpu_count.get()) * property::MILLICORES_PER_CORE,
+            "cpu_count": u64::from(tuning.cpu_millicores.get()),
             "memory_kb": tuning.memory.as_units(),
             "disk_kb": tuning.disk.as_units(),
         })
@@ -354,18 +375,22 @@ fn local_worker(
     let platform_properties: Map<String, Value> = spec
         .properties
         .worker_properties()
-        .map(|(key, value)| (key.to_owned(), json!({ "values": [value] })))
+        .map(|(key, value)| {
+            if key == property::CPU_MILLICORES
+                && let Some(capacity) = spec.properties.capacity(key)
+            {
+                let budget = scheduler_capacity(key, capacity, &spec.actions).to_string();
+                return (key.to_owned(), json!({ "values": [budget] }));
+            }
+            (key.to_owned(), json!({ "values": [value] }))
+        })
         .collect();
-    let action_ceilings: Map<String, Value> = spec
-        .properties
-        .action_ceilings()
-        .map(|(key, limit)| (key.to_owned(), json!(limit)))
-        .collect();
+    let action_ceilings = action_ceilings(&spec.properties);
     let worker = json!({
         "name": spec.instance.worker_name(),
         "worker_api_endpoint": api_endpoint,
-        "max_inflight_tasks": spec.slots.count().get(),
-        "single_use": spec.slots.is_single_use(),
+        "max_inflight_tasks": u64::from(matches!(spec.lifetime, WorkerLifetime::SingleUse)),
+        "single_use": matches!(spec.lifetime, WorkerLifetime::SingleUse),
         "cas_fast_slow_store": WORKER_CONTENT_STORE,
         "upload_action_result": { "ac_store": WORKER_ACTION_STORE },
         "work_directory": path_str(&spec.work_directory)?,
@@ -479,7 +504,7 @@ mod tests {
     use std::num::NonZeroU32;
     use std::time::Duration;
 
-    use gang_spi::{ClientTls, ControllerSpec, RenderedStoreSpec, Slots, StoreAccess, WorkerSpec};
+    use gang_spi::{ClientTls, ControllerSpec, RenderedStoreSpec, StoreAccess, WorkerSpec};
     use gang_types::{Bytes, FleetCatalog, FleetName, FleetProperties, InstanceId, Isa, Resources};
     use nativelink_config::cas_server::ResourceEnforcementConfig;
     use nativelink_config::schedulers::{HistoricalResourceSpec, SchedulerSpec, SimpleSpec};
@@ -564,7 +589,7 @@ mod tests {
             memory_pool: None,
             instance: instance.clone(),
             properties: properties.clone(),
-            slots: Slots::LongLived(NonZeroU32::new(4).expect("non-zero slots")),
+            lifetime: WorkerLifetime::LongLived,
             work_directory: Path::new("/var/gang/work").to_path_buf(),
             fast_cas_directory: Path::new("/var/gang/cas").to_path_buf(),
             fast_cas_budget: Bytes::new(1024),
@@ -601,6 +626,14 @@ mod tests {
         assert_eq!(historical.headroom_percent, 20);
         assert_eq!(historical.window_days, 7);
         assert_eq!(historical.cpu_property_name, property::CPU_MILLICORES);
+        assert_eq!(
+            historical
+                .cold_start
+                .as_ref()
+                .expect("cold start")
+                .cpu_count,
+            250
+        );
         let SchedulerSpec::Simple(simple) = historical.scheduler.as_ref() else {
             panic!(
                 "expected nested simple scheduler, got {:?}",
@@ -764,10 +797,98 @@ mod tests {
     }
 
     #[test]
+    fn cpu_budget_and_physical_action_ceiling_render_to_native_configs() {
+        let instance = InstanceId::try_new("local-1").expect("instance");
+        let content = memory_store();
+        let action = memory_store();
+        let properties = fleet("fleet-a", Isa::X86_64, "2");
+        let fleets = FleetCatalog::try_new(vec![properties.clone()]).expect("catalog");
+
+        for factor in [2, 3] {
+            let mut actions = ActionsConfig::default();
+            assert_eq!(actions.cpu_oversubscription.get(), 2);
+            actions.cpu_oversubscription = NonZeroU32::new(factor).expect("nonzero factor");
+            let mut worker_spec = worker_spec(
+                &instance,
+                &properties,
+                &content,
+                &action,
+                StoreAccess::Direct,
+            );
+            worker_spec.actions = std::sync::Arc::new(actions.clone());
+            let native = worker(&config(), &endpoint(), &worker_spec, WorkerTls::Plain)
+                .expect("native worker")
+                .worker;
+            let rendered = serde_json::to_value(&native).expect("serialize native worker");
+            assert_eq!(
+                rendered["platform_properties"][property::CPU_MILLICORES]["values"],
+                json!([(4000 * factor).to_string()])
+            );
+            assert_eq!(
+                rendered["platform_properties"][property::CPU_COUNT]["values"],
+                json!(["4"])
+            );
+            assert_eq!(
+                rendered["platform_properties"][property::MEMORY_KB]["values"],
+                json!(["8388608"])
+            );
+            assert_eq!(
+                rendered["platform_properties"][property::DISK_KB]["values"],
+                json!(["104857600"])
+            );
+            assert_eq!(
+                rendered["action_ceilings"][property::CPU_MILLICORES],
+                json!(4000)
+            );
+            assert_eq!(native.max_inflight_tasks, 0);
+
+            let mut controller = controller_spec(&content, &action, &fleets);
+            controller.actions = std::sync::Arc::new(actions);
+            let scheduler = scheduler(&config(), &controller).expect("native scheduler");
+            let escalation = simple_of(&scheduler)
+                .resource_escalation
+                .as_ref()
+                .expect("escalation");
+            let capacities = serde_json::to_value(&escalation.capacities).expect("capacities");
+            assert_eq!(
+                capacities[0]["minimum"][property::CPU_MILLICORES],
+                json!(4000 * factor)
+            );
+            assert_eq!(capacities[0]["minimum"][property::CPU_COUNT], json!(4));
+            assert_eq!(
+                capacities[0]["minimum"][property::MEMORY_KB],
+                json!(8_388_608)
+            );
+            assert_eq!(
+                capacities[0]["minimum"][property::DISK_KB],
+                json!(104_857_600)
+            );
+            assert_eq!(
+                capacities[0]["action_ceilings"][property::CPU_MILLICORES],
+                json!(4000)
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_budget_saturates_without_affecting_other_capacities() {
+        let actions = ActionsConfig::default();
+        assert_eq!(
+            scheduler_capacity(property::CPU_MILLICORES, u64::MAX, &actions),
+            u64::MAX
+        );
+        assert_eq!(
+            scheduler_capacity(property::MEMORY_KB, u64::MAX / 2, &actions),
+            u64::MAX / 2
+        );
+    }
+
+    #[test]
     fn action_ceiling_does_not_reduce_physical_worker_capacity() {
         let mut policy = gang_types::FleetActionPolicy::default();
         policy.grants.insert(gang_types::Capability::Network);
         policy.resources.memory = Some(gang_types::NonZeroBytes::gib(4));
+        policy.resources.cpu_count = NonZeroU32::new(2);
         let properties = FleetProperties::new(
             &FleetName::try_new("limited").expect("fleet"),
             Isa::X86_64,
@@ -792,6 +913,17 @@ mod tests {
             StoreAccess::Direct,
         );
         let rendered = local_worker(&config(), &spec, "grpc://127.0.0.1:9100").expect("worker");
+        let native: LocalWorkerConfig =
+            serde_json::from_value(rendered.clone()).expect("native worker");
+        let native = serde_json::to_value(native).expect("serialize native worker");
+        assert_eq!(
+            native["action_ceilings"][property::CPU_MILLICORES],
+            json!(2000)
+        );
+        assert_eq!(
+            native["platform_properties"][property::CPU_MILLICORES]["values"],
+            json!(["8000"])
+        );
         assert_eq!(
             rendered["platform_properties"][property::MEMORY_KB]["values"],
             json!(["8388608"])
@@ -806,6 +938,14 @@ mod tests {
         );
         let fleets = FleetCatalog::try_new(vec![properties]).expect("catalog");
         let capacity = resource_escalation(&ActionsConfig::default(), &fleets);
+        assert_eq!(
+            capacity["capacities"][0]["minimum"][property::CPU_MILLICORES],
+            json!(8000)
+        );
+        assert_eq!(
+            capacity["capacities"][0]["action_ceilings"][property::CPU_MILLICORES],
+            json!(2000)
+        );
         assert_eq!(
             capacity["capacities"][0]["minimum"][property::MEMORY_KB],
             json!(8_388_608)
@@ -1061,7 +1201,7 @@ mod tests {
             &action,
             StoreAccess::Direct,
         );
-        spec.slots = Slots::SingleUse;
+        spec.lifetime = WorkerLifetime::SingleUse;
         let settings = worker(&config(), &endpoint(), &spec, WorkerTls::Plain).expect("worker");
         assert_eq!(settings.worker.max_inflight_tasks, 1);
         assert!(settings.worker.single_use);
@@ -1073,19 +1213,15 @@ mod tests {
         let content = memory_store();
         let action = memory_store();
         let properties = fleet("fleet-a", Isa::X86_64, "2");
-        let settings = worker(
-            &config(),
-            &endpoint(),
-            &worker_spec(
-                &instance,
-                &properties,
-                &content,
-                &action,
-                StoreAccess::Direct,
-            ),
-            WorkerTls::Plain,
-        )
-        .expect("worker");
+        let spec = worker_spec(
+            &instance,
+            &properties,
+            &content,
+            &action,
+            StoreAccess::Direct,
+        );
+        let settings = worker(&config(), &endpoint(), &spec, WorkerTls::Plain).expect("worker");
+        assert_eq!(settings.worker.max_inflight_tasks, 0);
         assert!(!settings.worker.single_use);
     }
 
@@ -1188,7 +1324,7 @@ mod tests {
                 "escalation_percent": 270,
                 "max_steps": 5
             },
-            "cold_start": { "enabled": true, "cpu_count": 2, "memory": "2GiB", "disk": "3GiB" }
+            "cold_start": { "enabled": true, "cpu_millicores": 2000, "memory": "2GiB", "disk": "3GiB" }
         }))
         .expect("valid actions")
     }
@@ -1350,14 +1486,14 @@ mod tests {
             serde_json::to_value(&escalation.capacities).expect("capacities"),
             json!([
                 {
-                    "minimum": { "cpu_count": 4, "cpu_millicores": 4000, "memory_kb": 8_388_608, "disk_kb": 104_857_600 },
+                    "minimum": { "cpu_count": 4, "cpu_millicores": 8000, "memory_kb": 8_388_608, "disk_kb": 104_857_600 },
                     "exact": { "fleet": "fleet-a", "ISA": "x86-64", "sandbox": "docker", "capacity": "2" },
-                    "action_ceilings": {}
+                    "action_ceilings": { "cpu_millicores": 4000 }
                 },
                 {
-                    "minimum": { "cpu_count": 6, "cpu_millicores": 6000, "memory_kb": 16_777_216, "disk_kb": 83_886_080 },
+                    "minimum": { "cpu_count": 6, "cpu_millicores": 12000, "memory_kb": 16_777_216, "disk_kb": 83_886_080 },
                     "exact": { "fleet": "fleet-b", "ISA": "aarch64", "sandbox": "bwrap", "capacity": "3", "machine_class": "arm" },
-                    "action_ceilings": {}
+                    "action_ceilings": { "cpu_millicores": 6000 }
                 }
             ])
         );

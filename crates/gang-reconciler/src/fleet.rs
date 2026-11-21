@@ -43,9 +43,9 @@ pub struct FleetOutlook {
     pub readiness: Option<Duration>,
     /// Latest predicted start of an attributed queued action at planned capacity.
     pub expected_wait: Option<Duration>,
-    /// Persistent offered load in deci-slots.
+    /// Persistent offered load in tenths of a worker-equivalent.
     pub load: Option<u32>,
-    /// Transient slot-time, rounded to seconds before readiness subtraction.
+    /// Transient work in worker-equivalent seconds.
     pub backlog: Option<Duration>,
     /// Instantaneous serving resource occupancy in permille; measured zero is retained.
     pub utilization: Option<u16>,

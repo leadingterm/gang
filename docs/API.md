@@ -367,7 +367,6 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
       "policy": {
         "min": 2,
         "max": 20,
-        "targetActions": 4,
         "idleTimeout": "600s",
         "maxDrainWait": "1800s",
         "bootGrace": "300s"
@@ -407,7 +406,6 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
       "phase": "BUSY",
       "phaseTime": "2026-01-14T09:19:58.000Z",
       "running": 1,
-      "slots": 4,
       "paused": false,
       "launchTime": "2026-01-14T09:18:30.000Z",
       "phases": [
@@ -522,7 +520,7 @@ data: {"name":"state","seq":4812,"updateTime":"2026-01-14T09:20:02.000Z","provis
 
 event: delta
 id: 4813
-data: {"seq":4813,"base":4812,"updateTime":"2026-01-14T09:20:04.000Z","queue":{"total":0,"unplaceable":0},"workers":{"upsert":[{"name":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b","fleet":"fleets/x86-64-spot","instance":"instances/i-0e1000000000000a","phase":"IDLE","phaseTime":"2026-01-14T09:20:04.000Z","running":0,"slots":4,"paused":false,"launchTime":"2026-01-14T09:18:30.000Z","phases":[{"phase":"BUSY","start":"2026-01-14T09:19:58.000Z"},{"phase":"IDLE","start":"2026-01-14T09:20:04.000Z"}]}]},"actions":{"sampleTime":"2026-01-14T09:20:04.000Z","running":{"remove":["actions/ac9b1c52-3d0e-4f61-9a27-51c6d7e8f901"]},"queued":[]},"events":[{"name":"events/997","createTime":"2026-01-14T09:20:04.000Z","fleet":"fleets/x86-64-spot","cause":"IDLE_TIMEOUT","drainStarted":{"worker":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b"}}],"completed":981,"recent":{"window":"900s","step":"10s","samples":[{"start":"2026-01-14T09:20:00.000Z","completed":0,"running":0,"queued":0,"passes":2,"skipped":0,"lookups":0,"hits":0,"uploadedBytes":0,"downloadedBytes":0,"evictedBytes":0}]}}
+data: {"seq":4813,"base":4812,"updateTime":"2026-01-14T09:20:04.000Z","queue":{"total":0,"unplaceable":0},"workers":{"upsert":[{"name":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b","fleet":"fleets/x86-64-spot","instance":"instances/i-0e1000000000000a","phase":"IDLE","phaseTime":"2026-01-14T09:20:04.000Z","running":0,"paused":false,"launchTime":"2026-01-14T09:18:30.000Z","phases":[{"phase":"BUSY","start":"2026-01-14T09:19:58.000Z"},{"phase":"IDLE","start":"2026-01-14T09:20:04.000Z"}]}]},"actions":{"sampleTime":"2026-01-14T09:20:04.000Z","running":{"remove":["actions/ac9b1c52-3d0e-4f61-9a27-51c6d7e8f901"]},"queued":[]},"events":[{"name":"events/997","createTime":"2026-01-14T09:20:04.000Z","fleet":"fleets/x86-64-spot","cause":"IDLE_TIMEOUT","drainStarted":{"worker":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b"}}],"completed":981,"recent":{"window":"900s","step":"10s","samples":[{"start":"2026-01-14T09:20:00.000Z","completed":0,"running":0,"queued":0,"passes":2,"skipped":0,"lookups":0,"hits":0,"uploadedBytes":0,"downloadedBytes":0,"evictedBytes":0}]}}
 
 event: tick
 id: 4813
@@ -549,7 +547,8 @@ data: {"reason":"VIEWER_CAP","retryDelay":"5s"}
 - **Admission.** State operations require leader admission. A nonadmitting controller returns HTTP 503 before the handler with `gang-request-not-started: true`; it does not forward requests or streaming responses. Leader-only gRPC requests similarly return `UNAVAILABLE` (code 14) with the marker. Leadership refusal gracefully retires HTTP/2 connections with GOAWAY, even after an earlier shared request; admitted streams and concurrent accepted shared requests are not blanket-refused. After promotion leader admission remains enabled through a lease lapse, even when `/ready` returns 503. Prepared controllers serve shared authentication, API, browser and cache services independently of promotion; see [listener admission](SPECIFICATION.md#61-gang-server-listeners).
 - **Public connections.** `connections.active` and `connections.limit` are current gauges for the public listener's open connections and admission limit. `connections.refused` is the cumulative number of connections refused at that limit since this server process started; it resets on process restart. Older snapshots without `connections` decode to zero for all three fields. Dashboard and REAPI traffic share this listener and its admission limit; worker connections are excluded. Refusal counting is never throttled with logs.
 - **Fleet demand estimates.** `demand.readiness` and `demand.expectedWait` are independently optional Google Duration strings, for example `"42.5s"` and `"0s"`. `readiness` is the measured launch-to-first-worker latency; it is omitted until measured, while the planner uses the configured `scaling.readiness_prior`, clamped to the fleet's `boot_grace`, as its cold prior. `expectedWait` is the latest simulated start delay among the fleet's attributed queued actions at the final planned capacity; it is omitted when there is no attributed queue. Zero is a valid estimate, not an absent value.
-- **Fleet rate diagnostics.** `demand.load` is persistent load in integer deci-slots (`125` means 12.5 slots). `demand.backlog` is transient queued slot-time before readiness subtraction, rounded to whole seconds and encoded as a Google Duration string (`"42s"`). `demand.utilization` is instantaneous serving resource occupancy in integer permille (`735` means 73.5%): the maximum occupancy fraction across resource dimensions, excluding draining workers. The fields are independently optional; unmeasured values are omitted, and `utilization` is omitted without serving capacity. Measured zero is present as `0` or `"0s"`, never treated as absence.
+- **Fleet rate diagnostics.** `demand.load` is the maximum normalized persistent resource load in tenths of a worker equivalent (`125` means 12.5 workers). `demand.backlog` is the maximum normalized transient queued resource-work in worker-equivalent seconds, rounded to whole seconds and encoded as a Google Duration string (`"42s"`). `demand.utilization` is instantaneous serving resource occupancy in integer permille (`735` means 73.5%): the maximum occupancy fraction across resource dimensions, excluding draining workers. The fields are independently optional; unmeasured values are omitted, and `utilization` is omitted without serving capacity. Measured zero is present as `0` or `"0s"`, never treated as absence.
+- **Worker concurrency observation.** `workers[].slots` is optional observed worker metadata, not a scaling or admission input. It is omitted for an unlimited long-lived worker and is `1` for a single-use worker; older workers can report other values during rollout.
 - **Frames.** `Frame` is the type of each stream message, defined once in `gang-wire`:
 
   | Event | Data | Sent |

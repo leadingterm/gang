@@ -17,7 +17,6 @@
 //!     vcpus_per_instance: nonzero_u32(15),
 //!     memory_per_instance: NonZeroBytes::gib(29),
 //!     disk_per_instance: NonZeroBytes::gib(100),
-//!     target_actions_per_instance: nonzero_u32(16),
 //!     idle_timeout: Duration::from_mins(10),
 //!     max_drain_wait: Duration::from_mins(25),
 //!     boot_grace: Duration::from_mins(10),
@@ -28,14 +27,14 @@
 //! for _ in 0..17 {
 //!     demand.add_queued(ActionResources::default());
 //! }
-//! assert_eq!(demand.instances(&policy), 2);
+//! assert_eq!(demand.instances(&policy, nonzero_u32(2)), 1);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use std::num::NonZeroU64;
+use std::num::{NonZeroU32, NonZeroU64};
 
 use gang_config::FleetPolicy;
-use gang_types::{ActionResources, FleetSet, SaturatingInto};
+use gang_types::{ActionResources, Bytes, FleetSet, SaturatingInto, property::MILLICORES_PER_CORE};
 
 /// Work waiting for or occupying one fleet.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -47,7 +46,7 @@ pub struct Demand {
 }
 
 impl Demand {
-    /// Adds a queued action: one action slot and the resources it requests.
+    /// Adds a queued action and the resources it requests.
     pub fn add_queued(&mut self, resources: ActionResources) {
         self.actions = self.actions.saturating_add(1);
         self.millicores = self.millicores.saturating_add(resources.cpu_millicores);
@@ -76,7 +75,7 @@ impl Demand {
     /// Returns the total queued CPU rounded up to whole vCPUs.
     #[must_use]
     pub fn vcpus(&self) -> u64 {
-        self.millicores.div_ceil(1000)
+        self.millicores.div_ceil(MILLICORES_PER_CORE)
     }
 
     /// Returns the memory in bytes of the queued actions whose resources were measured.
@@ -85,13 +84,23 @@ impl Demand {
         self.memory
     }
 
+    pub(crate) fn resources(&self) -> ActionResources {
+        ActionResources {
+            cpu_millicores: self.millicores,
+            memory: Bytes::new(self.memory),
+            disk: Bytes::new(self.disk),
+        }
+    }
+
     /// Returns the instances needed to serve this demand under `policy`.
     ///
     /// The result is saturated to `u32` and capped at the fleet's maximum. The fleet's minimum
     /// plays no part: the pass raises the need to the minimum in force.
     #[must_use]
-    pub fn instances(&self, policy: &FleetPolicy) -> u32 {
-        let need: u32 = self.uncapped_need(policy).saturating_into();
+    pub fn instances(&self, policy: &FleetPolicy, cpu_oversubscription: NonZeroU32) -> u32 {
+        let need: u32 = self
+            .uncapped_need(policy, cpu_oversubscription)
+            .saturating_into();
         need.min(policy.instances.max().get())
     }
 
@@ -99,46 +108,21 @@ impl Demand {
     ///
     /// The minimum plays no part: only the uncapped need is compared.
     #[must_use]
-    pub fn fits(&self, policy: &FleetPolicy) -> bool {
-        self.uncapped_need(policy) <= u64::from(policy.instances.max().get())
+    pub fn fits(&self, policy: &FleetPolicy, cpu_oversubscription: NonZeroU32) -> bool {
+        self.uncapped_need(policy, cpu_oversubscription) <= u64::from(policy.instances.max().get())
     }
 
-    pub(crate) fn slots_per_instance(&self, policy: &FleetPolicy) -> u32 {
-        let target = policy.target_actions_per_instance.get();
-        let slots = div_ceil(
-            self.actions,
-            NonZeroU64::from(policy.target_actions_per_instance),
-        );
-        let resources = self.resource_need(policy);
-        if slots >= resources {
-            target
-        } else {
-            (self.actions / resources)
-                .max(1)
-                .min(u64::from(target))
-                .saturating_into()
-        }
-    }
-
-    /// Returns the uncapped instance need under `policy`.
-    ///
-    /// Action slots, vCPUs, memory and disk are each divided by their non-zero
-    /// per-instance capacity, rounded up. The largest of those bounds wins.
-    fn uncapped_need(&self, policy: &FleetPolicy) -> u64 {
-        let by_actions = div_ceil(
-            self.actions,
-            NonZeroU64::from(policy.target_actions_per_instance),
-        );
-        by_actions.max(self.resource_need(policy))
-    }
-
-    fn resource_need(&self, policy: &FleetPolicy) -> u64 {
-        let capacity = NonZeroU64::from(policy.vcpus_per_instance)
-            .saturating_mul(NonZeroU64::MIN.saturating_add(999));
-        let by_vcpus = div_ceil(self.millicores, capacity);
+    fn uncapped_need(&self, policy: &FleetPolicy, cpu_oversubscription: NonZeroU32) -> u64 {
+        let cpu_capacity = u64::from(policy.vcpus_per_instance.get())
+            .saturating_mul(MILLICORES_PER_CORE)
+            .saturating_mul(u64::from(cpu_oversubscription.get()));
+        let cpu_need = self.millicores.div_ceil(cpu_capacity);
         let by_memory = div_ceil(self.memory, policy.memory_per_instance.as_nonzero_u64());
         let by_disk = div_ceil(self.disk, policy.disk_per_instance.as_nonzero_u64());
-        by_vcpus.max(by_memory).max(by_disk)
+        cpu_need
+            .max(by_memory)
+            .max(by_disk)
+            .max(u64::from(self.actions > 0))
     }
 }
 
@@ -149,25 +133,30 @@ fn div_ceil(total: u64, per: NonZeroU64) -> u64 {
 /// Chooses the fleet that a queued action is charged to.
 ///
 /// Walks `candidates` in ascending index order and returns the first fleet whose demand still
-/// fits after adding the action. When none fits, returns the last candidate that names a fleet
-/// (its capped demand then queues). Returns `None` when no candidate names a fleet.
+/// fits its available instance limit after adding the action. When none fits, returns the last
+/// candidate that names a fleet (its capped demand then queues). Returns `None` when no
+/// candidate names a fleet.
 ///
-/// `fleets` maps a fleet index to its policy and current demand. It returns `None` for an index
-/// that names no fleet, and the walk stops at the first such index. `place` charges nothing: the
-/// caller adds the action to the demand of the chosen fleet.
+/// `fleets` maps a fleet index to its policy, current demand and available instance limit.
+/// The limit is capped by the policy maximum. It returns `None` for an index that names no
+/// fleet, and the walk stops at the first such index. `place` charges nothing: the caller adds
+/// the action to the demand of the chosen fleet.
 pub(crate) fn place<'a>(
     candidates: FleetSet,
     resources: ActionResources,
-    fleets: impl Fn(usize) -> Option<(&'a FleetPolicy, Demand)>,
+    cpu_oversubscription: NonZeroU32,
+    fleets: impl Fn(usize) -> Option<(&'a FleetPolicy, Demand, u32)>,
 ) -> Option<usize> {
     let mut last = None;
     for index in candidates {
-        let Some((policy, demand)) = fleets(index) else {
+        let Some((policy, demand, limit)) = fleets(index) else {
             break;
         };
         let mut trial = demand;
         trial.add_queued(resources);
-        if trial.fits(policy) {
+        if trial.uncapped_need(policy, cpu_oversubscription)
+            <= u64::from(limit.min(policy.instances.max().get()))
+        {
             return Some(index);
         }
         last = Some(index);
@@ -197,7 +186,7 @@ mod tests {
             ..ActionResources::default()
         });
         assert_eq!(demand.actions(), 1);
-        assert_eq!(demand.instances(&policy), 2);
+        assert_eq!(demand.instances(&policy, nonzero_u32(1)), 2);
         Ok(())
     }
 
@@ -216,7 +205,6 @@ mod tests {
             instances: InstanceBounds::up_to(nonzero_u32(100)),
             vcpus_per_instance: nonzero_u32(15),
             memory_per_instance: NonZeroBytes::gib(29),
-            target_actions_per_instance: nonzero_u32(16),
             idle_timeout: Duration::from_mins(10),
             max_drain_wait: Duration::from_mins(25),
             boot_grace: Duration::from_mins(10),
@@ -225,24 +213,39 @@ mod tests {
     }
 
     #[test]
-    fn effective_slots_preserve_slot_rounding_and_reduce_for_resources()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let policy = policy()?;
-        let mut demand = Demand::default();
-        demand.add_running(33);
-        assert_eq!(demand.slots_per_instance(&policy), 16);
-        let mut tie = Demand::default();
-        tie.add_queued(ActionResources {
-            cpu_millicores: 15_000,
+    fn resource_bounds_and_zero_reservation_reachability() -> TestResult<()> {
+        let policy = FleetPolicy {
+            instances: InstanceBounds::up_to(nonzero_u32(2)),
+            ..policy()?
+        };
+        let mut zero = Demand::default();
+        for _ in 0..1000 {
+            zero.add_queued(ActionResources::default());
+        }
+        assert_eq!(zero.instances(&policy, nonzero_u32(1)), 1);
+        assert!(zero.fits(&policy, nonzero_u32(1)));
+        let mut cpu = Demand::default();
+        cpu.add_queued(ActionResources {
+            cpu_millicores: 30_001,
             ..ActionResources::default()
         });
-        assert_eq!(tie.slots_per_instance(&policy), 16);
-        let mut resource_bound = Demand::default();
-        resource_bound.add_queued(ActionResources {
-            cpu_millicores: 30_000,
+        assert_eq!(cpu.instances(&policy, nonzero_u32(1)), 2);
+        assert!(!cpu.fits(&policy, nonzero_u32(1)));
+        assert!(cpu.fits(&policy, nonzero_u32(2)));
+        let mut memory = Demand::default();
+        memory.add_queued(ActionResources {
+            memory: Bytes::new(policy.memory_per_instance.get().get() * 2 + 1),
             ..ActionResources::default()
         });
-        assert_eq!(resource_bound.slots_per_instance(&policy), 1);
+        assert!(!memory.fits(&policy, nonzero_u32(2)));
+        assert_eq!(memory.instances(&policy, nonzero_u32(2)), 2);
+        let mut disk = Demand::default();
+        disk.add_queued(ActionResources {
+            disk: Bytes::new(policy.disk_per_instance.get().get() * 2 + 1),
+            ..ActionResources::default()
+        });
+        assert!(!disk.fits(&policy, nonzero_u32(2)));
+        assert_eq!(disk.instances(&policy, nonzero_u32(2)), 2);
         Ok(())
     }
 
@@ -259,7 +262,6 @@ mod tests {
     ) -> Result<FleetPolicy, Box<dyn std::error::Error>> {
         Ok(FleetPolicy {
             instances: InstanceBounds::up_to(NonZeroU32::new(max_instances).ok_or("zero maximum")?),
-            target_actions_per_instance: nonzero_u32(1),
             ..policy()?
         })
     }
@@ -271,8 +273,11 @@ mod tests {
         candidates: FleetSet,
         resources: ActionResources,
     ) -> Option<usize> {
-        let index = place(candidates, resources, |index| {
-            policies.get(index).zip(demands.get(index).copied())
+        let index = place(candidates, resources, nonzero_u32(1), |index| {
+            policies
+                .get(index)
+                .zip(demands.get(index).copied())
+                .map(|(policy, demand)| (policy, demand, policy.instances.max().get()))
         })?;
         demands[index].add_queued(resources);
         Some(index)
@@ -282,7 +287,6 @@ mod tests {
     fn fractional_cpu_is_summed_before_rounding() -> Result<(), Box<dyn std::error::Error>> {
         let policy = FleetPolicy {
             vcpus_per_instance: nonzero_u32(8),
-            target_actions_per_instance: nonzero_u32(32),
             ..policy()?
         };
         let mut demand = Demand::default();
@@ -293,10 +297,18 @@ mod tests {
             });
         }
         assert_eq!(
-            demand.instances(&policy),
+            demand.instances(&policy, nonzero_u32(1)),
             1,
             "fractional CPU must be summed before rounding"
         );
+        for _ in 0..32 {
+            demand.add_queued(ActionResources {
+                cpu_millicores: 250,
+                ..ActionResources::default()
+            });
+        }
+        assert_eq!(demand.instances(&policy, nonzero_u32(1)), 2);
+        assert_eq!(demand.instances(&policy, nonzero_u32(2)), 1);
         Ok(())
     }
 
@@ -312,7 +324,7 @@ mod tests {
             ..ActionResources::default()
         });
         assert_eq!(
-            four_cores.instances(&policy),
+            four_cores.instances(&policy, nonzero_u32(1)),
             2,
             "4000m requires two 2-vCPU instances"
         );
@@ -322,7 +334,7 @@ mod tests {
             ..ActionResources::default()
         });
         assert_eq!(
-            fractional.instances(&policy),
+            fractional.instances(&policy, nonzero_u32(1)),
             1,
             "250m requires one instance"
         );
@@ -345,7 +357,7 @@ mod tests {
             Some(1)
         );
         assert_eq!(demands[0], Demand::default());
-        assert_eq!(demands[1].instances(&policies[1]), 1);
+        assert_eq!(demands[1].instances(&policies[1], nonzero_u32(1)), 1);
         Ok(())
     }
 
@@ -362,14 +374,84 @@ mod tests {
                     &mut demands,
                     &policies,
                     candidates,
-                    ActionResources::default(),
+                    resources(15_000, Bytes::new(0)),
                 )
             })
             .collect();
 
         assert_eq!(charged, [Some(0), Some(0), Some(1)]);
-        assert_eq!(demands[0].instances(&policies[0]), 2);
-        assert_eq!(demands[1].instances(&policies[1]), 1);
+        assert_eq!(demands[0].instances(&policies[0], nonzero_u32(1)), 2);
+        assert_eq!(demands[1].instances(&policies[1], nonzero_u32(1)), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn placement_trials_use_cpu_oversubscription() -> TestResult<()> {
+        let policies = [one_action_per_instance(1)?, one_action_per_instance(2)?];
+        let mut first = Demand::default();
+        first.add_queued(resources(15_000, Bytes::new(0)));
+        let demands = [first, Demand::default()];
+        let candidates = FleetSet::prefix(2)?;
+        let trial = resources(15_000, Bytes::new(0));
+        assert_eq!(
+            place(candidates, trial, nonzero_u32(1), |i| {
+                policies
+                    .get(i)
+                    .zip(demands.get(i).copied())
+                    .map(|(policy, demand)| (policy, demand, policy.instances.max().get()))
+            }),
+            Some(1)
+        );
+        assert_eq!(
+            place(candidates, trial, nonzero_u32(2), |i| {
+                policies
+                    .get(i)
+                    .zip(demands.get(i).copied())
+                    .map(|(policy, demand)| (policy, demand, policy.instances.max().get()))
+            }),
+            Some(0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn placement_limits_retain_physical_credit_and_reject_failed_requests() -> TestResult<()> {
+        let policies = [one_action_per_instance(2)?, one_action_per_instance(2)?];
+        let candidates = FleetSet::prefix(2)?;
+        for available in [0, 1] {
+            let limits = [available, 2];
+            let chosen = place(
+                candidates,
+                ActionResources::default(),
+                nonzero_u32(1),
+                |i| Some((&policies[i], Demand::default(), limits[i])),
+            );
+            assert_eq!(chosen, Some(usize::from(available == 0)));
+        }
+        let mut occupied = Demand::default();
+        occupied.add_queued(resources(15_000, Bytes::new(0)));
+        assert_eq!(
+            place(
+                candidates,
+                resources(1, Bytes::new(0)),
+                nonzero_u32(1),
+                |i| {
+                    let demand = if i == 0 { occupied } else { Demand::default() };
+                    Some((&policies[i], demand, 1))
+                }
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            place(
+                FleetSet::prefix(1)?,
+                ActionResources::default(),
+                nonzero_u32(1),
+                |_| Some((&policies[0], Demand::default(), 0)),
+            ),
+            Some(0),
+            "a failed sole candidate retains demand until it can launch again"
+        );
         Ok(())
     }
 
@@ -383,7 +465,7 @@ mod tests {
                 &mut demands,
                 &policies,
                 candidates,
-                ActionResources::default(),
+                resources(15_000, Bytes::new(0)),
             );
         }
 
@@ -392,13 +474,13 @@ mod tests {
                 &mut demands,
                 &policies,
                 candidates,
-                ActionResources::default()
+                resources(15_000, Bytes::new(0))
             ),
             Some(1)
         );
-        assert!(!demands[1].fits(&policies[1]));
-        assert_eq!(demands[1].instances(&policies[1]), 10);
-        assert_eq!(demands[0].instances(&policies[0]), 2);
+        assert!(!demands[1].fits(&policies[1], nonzero_u32(1)));
+        assert_eq!(demands[1].instances(&policies[1], nonzero_u32(1)), 10);
+        assert_eq!(demands[0].instances(&policies[0], nonzero_u32(1)), 2);
         Ok(())
     }
 
@@ -479,8 +561,8 @@ mod tests {
             ),
             Some(1)
         );
-        assert_eq!(demands[0].instances(&policies[0]), 2);
-        assert_eq!(demands[1].instances(&policies[1]), 2);
+        assert_eq!(demands[0].instances(&policies[0], nonzero_u32(1)), 2);
+        assert_eq!(demands[1].instances(&policies[1], nonzero_u32(1)), 2);
         Ok(())
     }
 
