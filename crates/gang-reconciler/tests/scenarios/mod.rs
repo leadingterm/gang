@@ -654,7 +654,6 @@ fn projected_wait_and_rescue_share_busiest_release_and_worker_id_order() -> Test
     Ok(())
 }
 
-
 #[test]
 fn resume_order_prefers_non_release_first_then_running_then_worker_id() -> TestResult {
     let mut w = idle_world(1, 600)?;
