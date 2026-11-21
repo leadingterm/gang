@@ -2,7 +2,8 @@
 
 use std::collections::BTreeSet;
 
-use gang_wire::{EventChange, Frame};
+use gang_wire::{Event, EventChange, Frame};
+use tokio::sync::oneshot;
 
 use crate::check::Check;
 use crate::errors::{E2eError, Result};
@@ -111,46 +112,17 @@ pub fn unplaceable_disk<S: Limits, E: Execution>(
 
 /// B26(a): a worker whose scratch cannot hold its fleet's disk refuses to enroll and reports both sizes.
 ///
-/// A build drives a scale-out. After that scale-out is recorded, the scenario waits on the state
-/// stream until it shows a replacement instance or a worker. Local Mode reaps a refusing instance
-/// and launches a replacement. The server is then stopped.
+/// The state stream is attached before a build creates demand. Demand remains active until durable
+/// history records a scale-out and disk refusals from two distinct physical instances, or any worker
+/// enrolls. Refusing instances need never survive until a live-state sample. The build and server
+/// are then stopped; every observed frame must remain free of workers.
 ///
 /// # Errors
 ///
 /// Returns the errors of the system's operations; a system that misbehaves is a failed [`Check`].
 pub fn oversized_fleet<S: System, E: Execution>(system: &S, exec: &E) -> Result<Vec<Check>> {
     system.start_server()?;
-    let (history, seen, live) = std::thread::scope(|scope| {
-        let build = scope.spawn(|| system.build(&[Probe::Pinned]));
-        let history = match system.await_history(&mut |events| {
-            scale_out_recorded(events) && early_exit(events, None).is_some()
-        }) {
-            Ok(events) => Ok(events),
-            Err(E2eError::Timeout { .. }) => system.scaling_events(),
-            Err(error) => Err(error),
-        };
-        let frames = system.await_stream(&mut |frames| {
-            let seen = Seen::of(frames);
-            seen.worker.is_some() || seen.instances.len() > 1
-        });
-        // Evidence for a wait that timed out: what the server lists right now.
-        let live = system
-            .live_state()
-            .ok()
-            .map(|state| Seen::of(&[Frame::Snapshot(state)]));
-        let killed = system.kill_server();
-        let joined = build
-            .join()
-            .map_err(|_| E2eError::system("the build thread panicked"));
-        killed?;
-        let _ = joined?;
-        let history = history?;
-        match frames {
-            Ok(frames) => Ok((history, Some(Seen::of(&frames)), live)),
-            Err(E2eError::Timeout { .. }) => Ok((history, None, live)),
-            Err(error) => Err(error),
-        }
-    })?;
+    let observed = observe_refusals(system)?;
     let logs = exec.worker_logs()?;
     let start = logs.len().saturating_sub(2000);
     let start = logs
@@ -158,13 +130,8 @@ pub fn oversized_fleet<S: System, E: Execution>(system: &S, exec: &E) -> Result<
         .find(|(index, _)| *index >= start)
         .map_or(logs.len(), |(index, _)| index);
     let tail = logs.get(start..).unwrap_or_default();
-    let enrolled = seen.as_ref().and_then(|seen| seen.worker.clone());
-    let refusals = logs.matches("declares disk_per_instance").count();
-    let exit = early_exit(&history, None);
-    let exit_matches = history.iter().any(|event| {
-        matches!(&event.change, EventChange::ExitedEarly { failure, .. }
-            if failure.contains("declares disk_per_instance"))
-    });
+    let exit = early_exit(&observed.history, None);
+    let exit_matches = !observed.refusing_instances().is_empty();
     Ok(vec![
         Check::expect(
             oversized_fleet::WORKER_REFUSES,
@@ -185,17 +152,14 @@ pub fn oversized_fleet<S: System, E: Execution>(system: &S, exec: &E) -> Result<
         ),
         Check::expect(
             oversized_fleet::NO_WORKER_ENROLLS,
-            seen.as_ref()
-                .is_some_and(|seen| seen.worker.is_none() && seen.instances.len() > 1),
+            observed.completed && observed.worker.is_none() && observed.replaced(),
             || {
-                enrolled.map_or_else(
+                observed.worker.as_ref().map_or_else(
                     || {
                         format!(
-                            "no replacement of the refusing instance was seen within the history \
-                             timeout; the server then listed instances {:?} and worker {:?}; the \
-                             worker logs hold {refusals} refusals",
-                            live.as_ref().map(|seen| &seen.instances),
-                            live.as_ref().and_then(|seen| seen.worker.as_ref()),
+                            "no scale-out with two distinct disk-refusing instances was observed \
+                             before the stream ended; recorded disk-refusing instances: {:?}",
+                            observed.refusing_instances(),
                         )
                     },
                     |worker| format!("a worker registered: {worker}"),
@@ -205,53 +169,122 @@ pub fn oversized_fleet<S: System, E: Execution>(system: &S, exec: &E) -> Result<
     ])
 }
 
-/// What the state frames of a stream showed of the instances and the workers.
-struct Seen {
-    /// Every instance any frame listed.
-    instances: BTreeSet<String>,
-    /// The first worker any frame listed.
+/// Evidence retained across the whole monitored demand window.
+#[derive(Default)]
+struct Refusals {
+    history: Vec<Event>,
     worker: Option<String>,
+    completed: bool,
 }
 
-impl Seen {
-    /// Collects the instances and the first worker of `frames`: each snapshot's rows and each
-    /// delta's upserted rows.
-    fn of(frames: &[Frame]) -> Self {
-        let mut instances = BTreeSet::new();
-        let mut worker = None;
-        for frame in frames {
-            let (listed, workers): (Vec<&str>, Vec<&str>) = match frame {
-                Frame::Snapshot(state) => (
-                    state
-                        .instances
-                        .iter()
-                        .map(|row| row.name.as_str())
-                        .collect(),
-                    state.workers.iter().map(|row| row.name.as_str()).collect(),
-                ),
-                Frame::Delta(delta) => (
-                    delta
-                        .instances
-                        .iter()
-                        .flat_map(|keyed| &keyed.upsert)
-                        .map(|row| row.name.as_str())
-                        .collect(),
-                    delta
-                        .workers
-                        .iter()
-                        .flat_map(|keyed| &keyed.upsert)
-                        .map(|row| row.name.as_str())
-                        .collect(),
-                ),
-                Frame::Tick(_) | Frame::Closed(_) => (Vec::new(), Vec::new()),
-            };
-            instances.extend(listed.into_iter().map(str::to_owned));
-            if worker.is_none() {
-                worker = workers.first().map(|name| (*name).to_owned());
+impl Refusals {
+    /// Physical instances whose durable failure explains the disk guard.
+    fn refusing_instances(&self) -> BTreeSet<&str> {
+        self.history
+            .iter()
+            .filter_map(|event| match &event.change {
+                EventChange::ExitedEarly { instance, failure }
+                    if failure.contains("declares disk_per_instance") =>
+                {
+                    Some(instance.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Sustained demand caused at least two physical instances to refuse their fleet.
+    fn replaced(&self) -> bool {
+        scale_out_recorded(&self.history) && self.refusing_instances().len() >= 2
+    }
+
+    /// Retains even a worker that disappears again before the final frame.
+    fn observe_workers(&mut self, frames: &[Frame]) {
+        if self.worker.is_some() {
+            return;
+        }
+        self.worker = frames.iter().find_map(|frame| match frame {
+            Frame::Snapshot(state) => state.workers.first().map(|worker| worker.name.clone()),
+            Frame::Delta(delta) => delta
+                .workers
+                .iter()
+                .flat_map(|keyed| &keyed.upsert)
+                .next()
+                .map(|worker| worker.name.clone()),
+            Frame::Tick(_) | Frame::Closed(_) => None,
+        });
+    }
+}
+
+/// Attaches observation before creating demand and owns its cancellation on every return path.
+fn observe_refusals<S: System>(system: &S) -> Result<Refusals> {
+    const STOP: &str = "the oversized-fleet observation ended";
+    std::thread::scope(|scope| {
+        let (stop, receiver) = oneshot::channel();
+        let mut receiver = Some(receiver);
+        let mut build = None;
+        let mut observed = Refusals::default();
+        let mut operation_error = None;
+        let mut build_ended = false;
+        let frames = system.await_stream(&mut |frames| {
+            observed.observe_workers(frames);
+            if frames.iter().any(|frame| matches!(frame, Frame::Snapshot(_)))
+                && let Some(receiver) = receiver.take()
+            {
+                build = Some(scope.spawn(move || {
+                    system.build_until_stopped(&[Probe::Pinned], receiver)
+                }));
+            }
+            match system.scaling_events() {
+                Ok(history) => observed.history = history,
+                Err(error) => {
+                    operation_error = Some(error);
+                    return true;
+                }
+            }
+            if observed.worker.is_some() {
+                return true;
+            }
+            if build.as_ref().is_some_and(std::thread::ScopedJoinHandle::is_finished) {
+                build_ended = true;
+                return true;
+            }
+            observed.replaced()
+        });
+        let _ = stop.send(STOP.to_owned());
+        let joined = build.map(|build| {
+            build
+                .join()
+                .map_err(|_| E2eError::system("the build thread panicked"))
+        });
+        let killed = system.kill_server();
+        if let Some(error) = operation_error {
+            return Err(error);
+        }
+        killed?;
+        if let Some(joined) = joined {
+            match joined? {
+                Err(E2eError::System { context, .. }) if context == STOP => {}
+                outcome => {
+                    let _ = outcome?;
+                }
             }
         }
-        Self { instances, worker }
-    }
+        if build_ended {
+            return Err(E2eError::system(
+                "the oversized-fleet build ended before two distinct disk refusals were observed",
+            ));
+        }
+        match frames {
+            Ok(frames) => {
+                observed.observe_workers(&frames);
+                observed.completed = true;
+            }
+            Err(E2eError::Timeout { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(observed)
+    })
 }
 
 /// Runs the cold-start misfit scenario.

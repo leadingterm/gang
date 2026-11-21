@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
 use gang_e2e::{
@@ -16,9 +17,10 @@ use gang_e2e::{
     Role, Run, Sandbox, ScopeFacts, ServerExit, Signalled, System, Variant,
 };
 use gang_wire::{
-    Event, EventChange, Frame, Instance, Lifecycle, Phase, State as WireState, Worker,
+    Delta, Event, EventChange, Frame, Phase, State as WireState, Worker,
 };
 use parking_lot::{Condvar, Mutex};
+use tokio::sync::oneshot;
 
 use crate::support::{self, Simulation};
 
@@ -295,6 +297,15 @@ behaviour! {
             /// The event names a different failure.
             WrongFailure,
         },
+        /// Whether sustained demand reaches a second physical disk-refusing instance.
+        fleet_replacement: FleetReplacement {
+            /// Two distinct instances refuse.
+            Distinct,
+            /// Only the first instance refuses.
+            One,
+            /// Two events repeat the same physical instance.
+            Same,
+        },
         /// See [`GuardServing`]. Whether the worker serves after refusing an action for disk.
         guard_serving: GuardServing {
             /// `Serves`.
@@ -491,6 +502,12 @@ struct State {
     /// Whether every later build fails.
     failing: bool,
     report: Option<String>,
+    /// Whether the caller-owned oversized build still supplies demand.
+    fleet_build: bool,
+    /// Whether that build consumed its caller's stop signal.
+    fleet_stopped: bool,
+    /// State-stream observations made while the build supplies demand.
+    fleet_observations: u64,
 }
 
 /// A simulated deployment that behaves as its [`Behaviour`] says.
@@ -549,6 +566,9 @@ impl ExecSim {
                 preempted: false,
                 failing: false,
                 report: None,
+                fleet_build: false,
+                fleet_stopped: false,
+                fleet_observations: 0,
             }),
             changed: Condvar::new(),
         }
@@ -824,6 +844,100 @@ impl ExecSim {
              identity_roots_readonly={readonly}\nroots={roots}\nroots_override={root_override}\npostgres={postgres}\n"
         )
     }
+
+    /// History persists after a refusing process was reaped before any state sample.
+    fn refusal_history(&self) -> Vec<Event> {
+        let state = self.state.lock();
+        if !state.fleet_build && !state.fleet_stopped {
+            return Vec::new();
+        }
+        let mut history = vec![Event {
+            name: "events/1".to_owned(),
+            create_time: gang_clock::Timestamp::from_unix_millis(0),
+            fleet: "fleets/local-worker-x86-64".to_owned(),
+            cause: None,
+            change: EventChange::ScaledOut {
+                from: 0,
+                to: 1,
+                detail: None,
+            },
+        }];
+        if self.behaviour.fleet_disk == FleetDiskCheck::Enrolls
+            || self.behaviour.fleet_exit == FleetExit::Missing
+        {
+            return history;
+        }
+        for observation in 1..=state.fleet_observations {
+            if observation > 1 && self.behaviour.fleet_replacement == FleetReplacement::One {
+                break;
+            }
+            let instance = if self.behaviour.fleet_replacement == FleetReplacement::Same {
+                1
+            } else {
+                observation
+            };
+            history.push(Event {
+                name: format!("events/{}", observation + 1),
+                create_time: gang_clock::Timestamp::from_unix_millis(observation),
+                fleet: "fleets/local-worker-x86-64".to_owned(),
+                cause: None,
+                change: EventChange::ExitedEarly {
+                    instance: format!("instances/local-{instance}"),
+                    failure: if self.behaviour.fleet_exit == FleetExit::WrongFailure {
+                        "another failure"
+                    } else {
+                        "declares disk_per_instance 1024TiB"
+                    }
+                    .to_owned(),
+                },
+            });
+        }
+        history
+    }
+
+    /// A worker visible even if it is removed again before the next frame.
+    fn enrolled_worker() -> Worker {
+        let at = gang_clock::Timestamp::from_unix_millis(0);
+        Worker {
+            name: "workers/local-1".to_owned(),
+            fleet: "fleets/local-worker-x86-64".to_owned(),
+            instance: "instances/local-1".to_owned(),
+            phase: Phase::Idle,
+            phase_time: at,
+            running: 0,
+            slots: None,
+            capacity: None,
+            reserved: None,
+            paused: false,
+            launch_time: at,
+            phases: Vec::new(),
+            infrastructure: None,
+        }
+    }
+
+    /// A stream update with no live instances, including when durable history grew.
+    fn empty_delta(seq: u64) -> Delta {
+        Delta {
+            seq,
+            base: seq - 1,
+            update_time: gang_clock::Timestamp::from_unix_millis(seq),
+            pass: None,
+            scheduler_known: None,
+            queue: None,
+            cache: None,
+            connections: None,
+            fleets: None,
+            workers: None,
+            instances: None,
+            actions: None,
+            events: Vec::new(),
+            status_events: None,
+            completed: None,
+            recent: None,
+            builds: None,
+            principals_epoch: None,
+        }
+    }
 }
 
 impl System for ExecSim {
@@ -847,6 +961,9 @@ impl System for ExecSim {
     }
 
     fn scaling_events(&self) -> Result<Vec<Event>> {
+        if self.execution.fleet_disk == FleetDisk::Oversized {
+            return Ok(self.refusal_history());
+        }
         self.inner.scaling_events()
     }
 
@@ -862,55 +979,38 @@ impl System for ExecSim {
         if self.execution.fleet_disk != FleetDisk::Oversized {
             return self.inner.await_stream(done);
         }
-        // The refusing worker's instance is reaped and replaced; a worker that enrolls instead
-        // shows on the replacement's frame.
-        let base = self.inner.live_state()?;
-        let at = gang_clock::Timestamp::from_unix_millis(0);
-        let instance = |number: u32| Instance {
-            name: format!("instances/local-{number}"),
-            fleet: "fleets/local-worker-x86-64".to_owned(),
-            lifecycle: Lifecycle::InService,
-            launch_time: at,
-            past_boot_grace: false,
-            infrastructure: None,
-        };
         let first = WireState {
-            instances: vec![instance(1)],
+            instances: Vec::new(),
             workers: Vec::new(),
-            ..base.clone()
+            ..self.inner.live_state()?
         };
-        let mut second = WireState {
-            instances: vec![instance(2)],
-            workers: Vec::new(),
-            ..base
-        };
-        if self.behaviour.fleet_disk == FleetDiskCheck::Enrolls {
-            second.instances = vec![instance(1)];
-            second.workers = vec![Worker {
-                name: "workers/local-1".to_owned(),
-                fleet: "fleets/local-worker-x86-64".to_owned(),
-                instance: "instances/local-1".to_owned(),
-                phase: Phase::Idle,
-                phase_time: at,
-                running: 0,
-                slots: None,
-                capacity: None,
-                reserved: None,
-                paused: false,
-                launch_time: at,
-                phases: Vec::new(),
-                infrastructure: None,
-            }];
-        }
-        let frames = vec![Frame::Snapshot(first), Frame::Snapshot(second)];
+        let mut frames = vec![Frame::Snapshot(first.clone())];
         if done(&frames) {
-            Ok(frames)
-        } else {
-            Err(E2eError::timeout(
-                "the state stream to show a replaced instance",
-                std::time::Duration::from_secs(1),
-            ))
+            return Ok(frames);
         }
+        {
+            let mut state = self.state.lock();
+            while !state.fleet_build {
+                self.changed.wait(&mut state);
+            }
+        }
+        for observation in 1..=2 {
+            self.state.lock().fleet_observations = observation;
+            if observation == 1 && self.behaviour.fleet_disk == FleetDiskCheck::Enrolls {
+                let mut enrolled = first.clone();
+                enrolled.workers.push(Self::enrolled_worker());
+                frames.push(Frame::Snapshot(enrolled));
+            } else {
+                frames.push(Frame::Delta(Self::empty_delta(observation)));
+            }
+            if done(&frames) {
+                return Ok(frames);
+            }
+        }
+        Err(E2eError::timeout(
+            "the state stream to show two distinct disk-refusing instances",
+            Duration::ZERO,
+        ))
     }
 
     fn build(&self, probes: &[Probe]) -> Result<BuildOutcome> {
@@ -1003,6 +1103,37 @@ impl System for ExecSim {
         }
     }
 
+    fn build_until_stopped(
+        &self,
+        probes: &[Probe],
+        stop: oneshot::Receiver<String>,
+    ) -> Result<BuildOutcome> {
+        if self.execution.fleet_disk != FleetDisk::Oversized {
+            return self.inner.build_until_stopped(probes, stop);
+        }
+        if probes != [Probe::Pinned] {
+            return Err(E2eError::system("the oversized fleet expects the pinned probe"));
+        }
+        support::until_stopped(
+            stop,
+            |cancelled| {
+                let mut state = self.state.lock();
+                state.fleet_build = true;
+                self.changed.notify_all();
+                while !cancelled.load(Ordering::Acquire) && self.inner.server_pid().is_some() {
+                    self.changed.wait(&mut state);
+                }
+                state.fleet_build = false;
+                state.fleet_stopped = cancelled.load(Ordering::Acquire);
+                Ok(failed(Probe::Pinned, "the owned build stopped"))
+            },
+            || {
+                let _state = self.state.lock();
+                self.changed.notify_all();
+            },
+        )
+    }
+
     fn build_run(&self, probes: &[Probe], run: &Run) -> Result<BuildOutcome> {
         match probes.first() {
             Some(
@@ -1044,37 +1175,7 @@ impl System for ExecSim {
         if self.execution.fleet_disk != FleetDisk::Oversized {
             return self.inner.await_history(done);
         }
-        let mut history = vec![Event {
-            name: "events/1".to_owned(),
-            create_time: gang_clock::Timestamp::from_unix_millis(0),
-            fleet: "fleets/local-worker-x86-64".to_owned(),
-            cause: None,
-            change: EventChange::ScaledOut {
-                from: 0,
-                to: 1,
-                detail: None,
-            },
-        }];
-        if self.behaviour.fleet_disk != FleetDiskCheck::Enrolls
-            && self.behaviour.fleet_exit != FleetExit::Missing
-        {
-            history.push(Event {
-                name: "events/2".to_owned(),
-                create_time: gang_clock::Timestamp::from_unix_millis(1),
-                fleet: "fleets/local-worker-x86-64".to_owned(),
-                cause: None,
-                change: EventChange::ExitedEarly {
-                    instance: "instances/local-1".to_owned(),
-                    failure: match self.behaviour.fleet_exit {
-                        FleetExit::Explained | FleetExit::Missing => {
-                            "declares disk_per_instance 1024TiB"
-                        }
-                        FleetExit::WrongFailure => "another failure",
-                    }
-                    .to_owned(),
-                },
-            });
-        }
+        let history = self.refusal_history();
         if done(&history) {
             Ok(history)
         } else {
@@ -1444,5 +1545,70 @@ impl Execution for ExecSim {
             FleetDiskCheck::Enrolls => "worker generation starting",
             FleetDiskCheck::Unexplained => "worker exited",
         }.to_owned())
+    }
+}
+
+#[cfg(test)]
+mod disk_refusal_tests {
+    use gang_e2e::{Check, ExecutionKnobs, Sandbox, System, Variant, names, oversized_fleet};
+
+    use super::{Behaviour, ExecSim, FleetDiskCheck, FleetReplacement};
+    use crate::{assert_compliant, failures};
+
+    /// Runs with no live instance rows and checks that every outcome stopped its owned demand.
+    fn run(behaviour: Behaviour) -> gang_e2e::Result<Vec<Check>> {
+        let variant = Variant {
+            execution: ExecutionKnobs::OVERSIZED_FLEET,
+            ..Variant::baseline(Sandbox::Bwrap)
+        };
+        let sim = ExecSim::new(&variant, behaviour);
+        let checks = oversized_fleet(&sim, &sim);
+        let state = sim.state.lock();
+        assert!(!state.fleet_build, "the scenario leaked build demand");
+        assert!(state.fleet_stopped, "the build did not consume its owner's stop");
+        assert!(sim.server_pid().is_none(), "the scenario leaked its server");
+        checks
+    }
+
+    #[test]
+    fn two_durable_refusals_pass_with_empty_live_instances() -> gang_e2e::Result<()> {
+        assert_compliant(&run(Behaviour::COMPLIANT)?);
+        Ok(())
+    }
+
+    #[test]
+    fn one_disk_refusing_instance_does_not_prove_replacement() -> gang_e2e::Result<()> {
+        let checks = run(Behaviour {
+            fleet_replacement: FleetReplacement::One,
+            ..Behaviour::COMPLIANT
+        })?;
+        assert_eq!(failures(&checks), [names::oversized_fleet::NO_WORKER_ENROLLS]);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_refusal_of_same_instance_is_not_replacement() -> gang_e2e::Result<()> {
+        let checks = run(Behaviour {
+            fleet_replacement: FleetReplacement::Same,
+            ..Behaviour::COMPLIANT
+        })?;
+        assert_eq!(failures(&checks), [names::oversized_fleet::NO_WORKER_ENROLLS]);
+        Ok(())
+    }
+
+    #[test]
+    fn any_enrolled_worker_fails_the_observed_window() -> gang_e2e::Result<()> {
+        let checks = run(Behaviour {
+            fleet_disk: FleetDiskCheck::Enrolls,
+            ..Behaviour::COMPLIANT
+        })?;
+        assert_eq!(
+            failures(&checks),
+            [
+                names::oversized_fleet::WORKER_REFUSES,
+                names::oversized_fleet::NO_WORKER_ENROLLS,
+            ]
+        );
+        Ok(())
     }
 }

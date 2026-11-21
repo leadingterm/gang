@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use gang_clock::Timestamp;
@@ -26,6 +27,59 @@ use gang_wire::{
     Recent, State, Tick, Truncated, Worker, WorkerCounts, name,
 };
 use parking_lot::{Condvar, Mutex};
+use tokio::sync::oneshot;
+
+/// Owns a stop receiver until the synchronous build completes, waking its waits on cancellation.
+pub(crate) fn until_stopped(
+    stop: oneshot::Receiver<String>,
+    run: impl FnOnce(&AtomicBool) -> Result<BuildOutcome>,
+    wake: impl FnOnce() + Send,
+) -> Result<BuildOutcome> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .map_err(E2eError::io("building the simulated cancellation runtime"))?;
+    let cancelled = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let (finished, completion) = oneshot::channel::<()>();
+        let cancel = &cancelled;
+        let watcher = scope.spawn(move || {
+            runtime.block_on(async {
+                tokio::select! {
+                    biased;
+                    _ = completion => None,
+                    reason = async {
+                        match stop.await {
+                            Ok(reason) => reason,
+                            Err(_) => std::future::pending().await,
+                        }
+                    } => {
+                        cancel.store(true, Ordering::Release);
+                        wake();
+                        Some(reason)
+                    }
+                }
+            })
+        });
+        let outcome = run(&cancelled);
+        let _ = finished.send(());
+        match watcher
+            .join()
+            .map_err(|_| E2eError::system("the simulated cancellation thread panicked"))?
+        {
+            Some(reason) => Err(E2eError::system(reason)),
+            None => outcome,
+        }
+    })
+}
+
+/// Checks cancellation while holding the same mutex as the build's condition-variable wait.
+fn build_running(cancelled: &AtomicBool) -> Result<()> {
+    if cancelled.load(Ordering::Acquire) {
+        Err(E2eError::system("the simulated build was cancelled"))
+    } else {
+        Ok(())
+    }
+}
 
 /// The fleet of a deployment that declares one.
 const SINGLE_FLEET: &str = "local-worker-x86-64";
@@ -1478,19 +1532,22 @@ impl System for Simulation {
     }
 
     fn build(&self, probes: &[Probe]) -> Result<BuildOutcome> {
-        {
-            let mut state = self.state.lock();
-            state.building = state.building.saturating_add(1);
-            state.builds_started = state.builds_started.saturating_add(1);
-        }
-        self.changed.notify_all();
-        let outcome = self.run_build(probes);
-        {
-            let mut state = self.state.lock();
-            state.building = state.building.saturating_sub(1);
-        }
-        self.changed.notify_all();
-        outcome
+        self.build_cancellable(probes, &AtomicBool::new(false))
+    }
+
+    fn build_until_stopped(
+        &self,
+        probes: &[Probe],
+        stop: oneshot::Receiver<String>,
+    ) -> Result<BuildOutcome> {
+        until_stopped(
+            stop,
+            |cancelled| self.build_cancellable(probes, cancelled),
+            || {
+                let _state = self.state.lock();
+                self.changed.notify_all();
+            },
+        )
     }
 
     // Models neither the action cache nor the journal, so a run changes nothing.
@@ -1577,12 +1634,38 @@ impl Control for Simulation {
 }
 
 impl Simulation {
+    /// Counts demand until the build completes or its owner cancels it.
+    fn build_cancellable(
+        &self,
+        probes: &[Probe],
+        cancelled: &AtomicBool,
+    ) -> Result<BuildOutcome> {
+        {
+            let mut state = self.state.lock();
+            build_running(cancelled)?;
+            state.building = state.building.saturating_add(1);
+            state.builds_started = state.builds_started.saturating_add(1);
+        }
+        self.changed.notify_all();
+        let outcome = self.run_build(probes, cancelled);
+        {
+            let mut state = self.state.lock();
+            state.building = state.building.saturating_sub(1);
+            if cancelled.load(Ordering::Acquire) {
+                state.queued = 0;
+            }
+        }
+        self.changed.notify_all();
+        outcome
+    }
+
     /// The body of [`build`](Self::build), run while the build counts as in flight.
-    fn run_build(&self, probes: &[Probe]) -> Result<BuildOutcome> {
-        if let Some(outcome) = self.special_build(probes)? {
+    fn run_build(&self, probes: &[Probe], cancelled: &AtomicBool) -> Result<BuildOutcome> {
+        if let Some(outcome) = self.special_build(probes, cancelled)? {
             return Ok(outcome);
         }
         let mut state = self.state.lock();
+        build_running(cancelled)?;
 
         let plan: Vec<(Probe, bool)> = Self::targets(probes)
             .into_iter()
@@ -1606,9 +1689,11 @@ impl Simulation {
             state.queued = actions.len();
             self.changed.notify_all();
             while state.supply_held {
+                build_running(cancelled)?;
                 self.changed.wait(&mut state);
             }
             state.queued = 0;
+            build_running(cancelled)?;
         }
         let sent: Vec<&[Probe]> = if together {
             vec![actions.as_slice()]
@@ -1628,9 +1713,11 @@ impl Simulation {
                     || state.launches_held
                     || (self.slow_boot && state.starts == scaled_under)
                 {
+                    build_running(cancelled)?;
                     self.changed.wait(&mut state);
                 }
             }
+            build_running(cancelled)?;
             placed.extend(batch_placed);
         }
         if remote > 0 {
@@ -1665,7 +1752,11 @@ impl Simulation {
         Ok(BuildOutcome::new(exit_code, stderr))
     }
 
-    fn special_build(&self, probes: &[Probe]) -> Result<Option<BuildOutcome>> {
+    fn special_build(
+        &self,
+        probes: &[Probe],
+        cancelled: &AtomicBool,
+    ) -> Result<Option<BuildOutcome>> {
         if self.behaviour.build == BuildFailure::BeforeScaleOut {
             return Ok(Some(BuildOutcome::new(Some(34), "UNAVAILABLE".to_owned())));
         }
@@ -1680,7 +1771,7 @@ impl Simulation {
         }
         if probes.contains(&Probe::Hold) {
             return Ok(Some(match self.behaviour.hold {
-                HoldBuild::Starts => self.hold()?,
+                HoldBuild::Starts => self.hold(cancelled)?,
                 HoldBuild::FailsEarly => {
                     BuildOutcome::new(Some(1), "ERROR: //:hold failed: (Exit 1)\n".to_owned())
                 }
@@ -1700,17 +1791,20 @@ impl Simulation {
     /// killed, and fails; a scoped hold survives the kill. A hold that never signals ends when
     /// the server is killed too, and `await_hold` times out on it. Under [`Limits::Enforced`] the
     /// kernel ends both the orphan and the scope with the action; otherwise both stay.
-    fn hold(&self) -> Result<BuildOutcome> {
+    fn hold(&self, cancelled: &AtomicBool) -> Result<BuildOutcome> {
         let mut state = self.state.lock();
+        build_running(cancelled)?;
         if let Some(placed) = self.place(&[Probe::Hold])
             && self.scale_out(&mut state, &placed)?
         {
             self.changed.notify_all();
             let scaled_under = state.starts;
             while state.pid.is_none() || (self.slow_boot && state.starts == scaled_under) {
+                build_running(cancelled)?;
                 self.changed.wait(&mut state);
             }
         }
+        build_running(cancelled)?;
         state.scope =
             (self.behaviour.scope_report == ScopeReport::Published).then(|| self.scope_facts());
         state.orphan = self.behaviour.orphan == OrphanProcess::Spawned;
@@ -1723,6 +1817,10 @@ impl Simulation {
         }
         self.changed.notify_all();
         while state.hold == HoldPhase::Silent || state.hold == HoldPhase::Started {
+            if cancelled.load(Ordering::Acquire) {
+                state.hold = HoldPhase::Ended;
+                break;
+            }
             self.changed.wait(&mut state);
         }
         let killed = state.hold == HoldPhase::Ended;

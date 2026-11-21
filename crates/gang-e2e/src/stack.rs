@@ -1317,6 +1317,14 @@ impl System for Stack<'_> {
         self.run_build(&self.remote()?, probes, None)
     }
 
+    fn build_until_stopped(
+        &self,
+        probes: &[Probe],
+        stop: oneshot::Receiver<String>,
+    ) -> Result<BuildOutcome> {
+        Stack::build_until_stopped(self, probes, stop)
+    }
+
     fn build_run(&self, probes: &[Probe], run: &Run) -> Result<BuildOutcome> {
         self.run_build(&self.remote()?, probes, Some(run))
     }
