@@ -95,9 +95,10 @@ impl World {
 ///
 /// Four instances are in service and connected: `local-1` and `local-3` are busy, `local-2` is
 /// idle, and `local-4` is draining with one action still running. `local-5` is booting. The
-/// desired capacity of five leaves four usable instances once the draining one is excluded. The
-/// queued demand needs exactly four instances, so no pass should change anything. The queued
-/// actions may run on either x86-64 fleet, but the first fleet already covers them all.
+/// desired capacity of five leaves four usable instances once the draining one is excluded.
+/// The two busy workers reserve one worker's CPU in total; three full-worker queued actions
+/// bring the demand to four. Six unreserved actions may run on either x86-64 fleet, but the
+/// first fleet already covers them all.
 fn steady_state() -> TestResult<Harness> {
     steady_state_with(false)
 }
@@ -140,8 +141,13 @@ fn steady_state_with(release_first_idle: bool) -> TestResult<Harness> {
     h.set_running("local-3", 2)?;
     h.set_running("local-4", 1)?;
     h.set_draining("local-4", true)?;
+    for execution in &mut h.snapshot.executing {
+        if !h.snapshot.workers[execution.worker].draining {
+            execution.resources = x86_resources(1000);
+        }
+    }
     h.queue_candidates(FleetSet::try_from_indices([X86, SPARE])?, 6);
-    h.queue_sized(X86, 2, x86_resources(8000))?;
+    h.queue_sized(X86, 3, x86_resources(4000))?;
     h.set_desired_capacity(X86, 5);
     Ok(h)
 }
@@ -249,7 +255,7 @@ fn queued_vector_planning_and_final_dispatch_do_not_allocate_after_warmup() -> T
             .max_inflight_actions = std::num::NonZeroU32::new(16);
     }
     h.set_desired_capacity(X86, 2);
-    h.queue(X86, 1000)?;
+    h.queue_sized(X86, 1000, x86_resources(1000))?;
     for action in &mut h.snapshot.queued {
         action.expected = Some(Duration::from_secs(30));
     }

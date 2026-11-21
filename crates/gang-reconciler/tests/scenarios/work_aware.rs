@@ -554,24 +554,44 @@ fn final_dispatch_fits_two_cpu_reservations_without_scaling() -> TestResult {
 
 #[test]
 fn reachability_floor_respects_other_candidates_pending_and_failure() -> TestResult {
-    for failed in [false, true] {
+    for state in [
+        "pending",
+        "unborn",
+        "failed",
+        "serving-failed",
+        "pending-failed",
+    ] {
         let mut w = Workload {
             h: Harness::with_scaling(
                 vec![fleet("gang-first", 1, 16)?, fleet("gang-second", 2, 16)?],
                 settings(50)?,
             ),
         };
+        match state {
+            "serving-failed" => w.serve(0, "local-1")?,
+            "pending" | "pending-failed" => {
+                w.h.launch(0, "local-1", InstanceLifecycle::Pending, Duration::ZERO)?;
+            }
+            _ => {}
+        }
         w.h.set_desired_capacity(0, 1);
-        if failed {
+        if state.ends_with("failed") {
             w.h.supply_mut(0)?.launch_failure = Some(gang_spi::LaunchFailure {
                 reason: "capacity unavailable".into(),
             });
-        } else {
-            w.h.launch(0, "local-1", InstanceLifecycle::Pending, Duration::ZERO)?;
         }
+        // A physical pending/serving instance or reliable unborn request covers every
+        // unreserved action. A failed request with no physical capacity must fall back.
         w.h.queue_candidates(FleetSet::prefix(2)?, 32);
         let steps = w.pass();
-        assert_eq!(purchases(&steps).iter().any(|step| step.0 == 1), failed);
+        let fallback = state == "failed";
+        assert_eq!(
+            purchases(&steps).iter().any(|step| step.0 == 1),
+            fallback,
+            "{state}"
+        );
+        assert_eq!(w.h.outlook(0)?.needed, u32::from(!fallback), "{state}");
+        assert_eq!(w.h.outlook(1)?.needed, u32::from(fallback), "{state}");
     }
     Ok(())
 }

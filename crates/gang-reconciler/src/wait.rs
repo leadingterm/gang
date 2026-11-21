@@ -664,17 +664,21 @@ impl WorkPlanner {
         self.summaries[fleet]
     }
 
-    fn safety_demand(&self, fleet: usize) -> CapacityVector {
+    fn forecast_demand(&self, fleet: usize) -> CapacityVector {
         let horizon = self.horizons[fleet];
         let rates = self.rates.fleet(fleet);
-        let forecast = if horizon.payback.is_zero() {
+        if horizon.payback.is_zero() {
             rates.total_load
         } else {
             rates.total_load
                 + rates
                     .queued_work
                     .scaled(1.0 / horizon.payback.as_secs_f64())
-        };
+        }
+    }
+
+    fn safety_demand(&self, fleet: usize) -> CapacityVector {
+        let forecast = self.forecast_demand(fleet);
         self.demand[fleet].component_max(forecast)
     }
 
@@ -682,7 +686,9 @@ impl WorkPlanner {
         if self.horizons.get(fleet).is_none() {
             return false;
         }
-        !self.safety_demand(fleet).within(
+        // Ordinary needed-capacity rescue already accounts for static demand and pending
+        // credit. Only returning forecast load independently reopens a busy drain.
+        !self.forecast_demand(fleet).within(
             self.serving_capacities[fleet] + extra_capacity,
             f64::from(self.scaling.scale_in_waterline_percent.get()) / 100.0,
         )
@@ -1332,6 +1338,43 @@ mod tests {
         assert_eq!(view.cap, CapacityVector::default());
         assert_eq!(view.resume_cap, CapacityVector::ONE);
         assert!(!view.serving);
+        assert!(scene.planner.removal(0, 0).is_none());
+    }
+
+    #[test]
+    fn pending_resource_credit_does_not_trigger_waterline_rescue_or_n_minus_one() {
+        let p = policy("workers");
+        let mut scene = Scene::new(vec![p.clone()], ScalingConfig::default());
+        for name in ["first", "second", "third"] {
+            scene.member(0, name, InstanceLifecycle::InService, true);
+        }
+        scene.member(0, "pending", InstanceLifecycle::Pending, true);
+        let mut waiting = queued(&[0], Some(Duration::from_secs(10)));
+        waiting.resources.cpu_millicores = cpu(&p);
+        let mut snapshot = SchedulerSnapshot {
+            workers: vec![
+                worker(&p, "first", 0, 16),
+                worker(&p, "second", 0, 16),
+                worker(&p, "third", 0, 16),
+            ],
+            queued: vec![waiting; 8],
+            ..SchedulerSnapshot::default()
+        };
+        scene.snapshot(snapshot.clone(), &[Some(0); 8]);
+        scene.run(&[Some(Duration::from_secs(45))]);
+        assert_eq!(scene.fleets[0].outlook.needed, 4);
+        assert_eq!(scene.planner.scale_decision(0).booting, 1);
+        assert!(!scene.planner.needs_resume(0, CapacityVector::default()));
+        assert!(scene.planner.removal(0, 0).is_none());
+
+        // When the credited instance connects, static resource demand still protects all
+        // four instances from a cordon followed by an immediate replacement purchase.
+        snapshot.workers.push(worker(&p, "pending", 0, 16));
+        scene.snapshot(snapshot, &[Some(0); 8]);
+        scene.run(&[Some(Duration::from_secs(45))]);
+        assert_eq!(scene.fleets[0].outlook.needed, 4);
+        assert_eq!(scene.planner.scale_decision(0).booting, 0);
+        assert!(!scene.planner.needs_resume(0, CapacityVector::default()));
         assert!(scene.planner.removal(0, 0).is_none());
     }
 

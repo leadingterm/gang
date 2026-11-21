@@ -260,6 +260,8 @@ impl Reconciler {
                 .resize(fleet.supply.instances.len(), false);
         }
         self.charge_running(fleets, hosted);
+        let mut orphan_plan = std::mem::take(&mut self.orphan_plan);
+        self.classify_all(fleets, &pass, &mut orphan_plan);
         for action in &snapshot.queued {
             for index in action.candidates {
                 if let Some(fleet) = fleets.get_mut(index) {
@@ -270,7 +272,17 @@ impl Reconciler {
                 action.candidates,
                 action.resources,
                 self.cpu_oversubscription,
-                |index| fleets.get(index).map(|f| (&f.policy, f.outlook.demand)),
+                |index| {
+                    fleets.get(index).map(|fleet| {
+                        let limit = if fleet.supply.launch_failure.is_some() {
+                            let capacity = &self.capacities[index];
+                            capacity.reliable.saturating_add(capacity.draining)
+                        } else {
+                            fleet.policy.instances.max().get()
+                        };
+                        (&fleet.policy, fleet.outlook.demand, limit)
+                    })
+                },
             );
             self.planner.attribute(chosen, action.candidates);
             if let Some(fleet) = chosen.and_then(|index| fleets.get_mut(index)) {
@@ -278,8 +290,6 @@ impl Reconciler {
                 fleet.outlook.queued = fleet.outlook.queued.saturating_add(1);
             }
         }
-        let mut orphan_plan = std::mem::take(&mut self.orphan_plan);
-        self.classify_all(fleets, &pass, &mut orphan_plan);
         self.planner
             .plan(fleets, hosted, time, &self.capacities, &self.readiness);
         let mut orphans = orphan_plan.steps.drain(..);

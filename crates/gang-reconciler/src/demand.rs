@@ -133,26 +133,30 @@ fn div_ceil(total: u64, per: NonZeroU64) -> u64 {
 /// Chooses the fleet that a queued action is charged to.
 ///
 /// Walks `candidates` in ascending index order and returns the first fleet whose demand still
-/// fits after adding the action. When none fits, returns the last candidate that names a fleet
-/// (its capped demand then queues). Returns `None` when no candidate names a fleet.
+/// fits its available instance limit after adding the action. When none fits, returns the last
+/// candidate that names a fleet (its capped demand then queues). Returns `None` when no
+/// candidate names a fleet.
 ///
-/// `fleets` maps a fleet index to its policy and current demand. It returns `None` for an index
-/// that names no fleet, and the walk stops at the first such index. `place` charges nothing: the
-/// caller adds the action to the demand of the chosen fleet.
+/// `fleets` maps a fleet index to its policy, current demand and available instance limit.
+/// The limit is capped by the policy maximum. It returns `None` for an index that names no
+/// fleet, and the walk stops at the first such index. `place` charges nothing: the caller adds
+/// the action to the demand of the chosen fleet.
 pub(crate) fn place<'a>(
     candidates: FleetSet,
     resources: ActionResources,
     cpu_oversubscription: NonZeroU32,
-    fleets: impl Fn(usize) -> Option<(&'a FleetPolicy, Demand)>,
+    fleets: impl Fn(usize) -> Option<(&'a FleetPolicy, Demand, u32)>,
 ) -> Option<usize> {
     let mut last = None;
     for index in candidates {
-        let Some((policy, demand)) = fleets(index) else {
+        let Some((policy, demand, limit)) = fleets(index) else {
             break;
         };
         let mut trial = demand;
         trial.add_queued(resources);
-        if trial.fits(policy, cpu_oversubscription) {
+        if trial.uncapped_need(policy, cpu_oversubscription)
+            <= u64::from(limit.min(policy.instances.max().get()))
+        {
             return Some(index);
         }
         last = Some(index);
@@ -270,7 +274,10 @@ mod tests {
         resources: ActionResources,
     ) -> Option<usize> {
         let index = place(candidates, resources, nonzero_u32(1), |index| {
-            policies.get(index).zip(demands.get(index).copied())
+            policies
+                .get(index)
+                .zip(demands.get(index).copied())
+                .map(|(policy, demand)| (policy, demand, policy.instances.max().get()))
         })?;
         demands[index].add_queued(resources);
         Some(index)
@@ -388,15 +395,54 @@ mod tests {
         let trial = resources(15_000, Bytes::new(0));
         assert_eq!(
             place(candidates, trial, nonzero_u32(1), |i| {
-                policies.get(i).zip(demands.get(i).copied())
+                policies
+                    .get(i)
+                    .zip(demands.get(i).copied())
+                    .map(|(policy, demand)| (policy, demand, policy.instances.max().get()))
             }),
             Some(1)
         );
         assert_eq!(
             place(candidates, trial, nonzero_u32(2), |i| {
-                policies.get(i).zip(demands.get(i).copied())
+                policies
+                    .get(i)
+                    .zip(demands.get(i).copied())
+                    .map(|(policy, demand)| (policy, demand, policy.instances.max().get()))
             }),
             Some(0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn placement_limits_retain_physical_credit_and_reject_failed_requests() -> TestResult<()> {
+        let policies = [one_action_per_instance(2)?, one_action_per_instance(2)?];
+        let candidates = FleetSet::prefix(2)?;
+        for available in [0, 1] {
+            let limits = [available, 2];
+            let chosen = place(candidates, ActionResources::default(), nonzero_u32(1), |i| {
+                Some((&policies[i], Demand::default(), limits[i]))
+            });
+            assert_eq!(chosen, Some(usize::from(available == 0)));
+        }
+        let mut occupied = Demand::default();
+        occupied.add_queued(resources(15_000, Bytes::new(0)));
+        assert_eq!(
+            place(candidates, resources(1, Bytes::new(0)), nonzero_u32(1), |i| {
+                let demand = if i == 0 { occupied } else { Demand::default() };
+                Some((&policies[i], demand, 1))
+            }),
+            Some(1)
+        );
+        assert_eq!(
+            place(
+                FleetSet::prefix(1)?,
+                ActionResources::default(),
+                nonzero_u32(1),
+                |_| Some((&policies[0], Demand::default(), 0)),
+            ),
+            Some(0),
+            "a failed sole candidate retains demand until it can launch again"
         );
         Ok(())
     }
