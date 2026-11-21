@@ -1179,7 +1179,7 @@ fn parses_a_complete_file_into_typed_values() -> Result<(), Box<dyn Error>> {
     assert_eq!(fleet.policy.name.as_str(), "local-worker-x86-64");
     assert_eq!(fleet.policy.isa, Isa::X86_64);
     assert_eq!(fleet.sandbox, SandboxKey::Bwrap);
-    assert_eq!(fleet.policy.memory_per_instance, NonZeroBytes::gib(8));
+    assert_eq!(fleet.policy.memory_per_instance, NonZeroBytes::gib(7));
     assert_eq!(fleet.policy.disk_per_instance, NonZeroBytes::gib(100));
     assert_eq!(fleet.policy.idle_timeout, Duration::from_secs(15));
     assert!(

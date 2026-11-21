@@ -224,12 +224,12 @@ run "mixed_instance_fleets_use_smallest_nominal_memory" {
   command = plan
 
   override_data {
-    target = module.worker_fleet.data.aws_ec2_instance_type.this["c6id.4xlarge"]
+    target = data.aws_ec2_instance_type.worker["c6id.4xlarge"]
     values = { boot_modes = ["uefi"], memory_size = 65536 }
   }
 
   override_data {
-    target = module.worker_fleet.data.aws_ec2_instance_type.this["c7gd.4xlarge"]
+    target = data.aws_ec2_instance_type.worker["c7gd.4xlarge"]
     values = { boot_modes = ["uefi"], memory_size = 131072 }
   }
 

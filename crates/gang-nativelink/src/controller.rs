@@ -44,6 +44,7 @@ use gang_spi::{
 };
 use gang_types::{FleetCatalog, SaturatingInto};
 
+use crate::capacity::RuntimeCatalog;
 use crate::config::NativeLinkConfig;
 use crate::durations::ActionDurations;
 use crate::errors::NativeLinkEmbedError;
@@ -67,8 +68,8 @@ pub(crate) struct Handles {
     pub worker_scheduler: Arc<ObservingWorkerScheduler>,
     /// Queued actions and the platform properties they require.
     pub action_scheduler: Arc<dyn KnownPlatformPropertyProvider>,
-    /// Every fleet's properties, to match queued actions against.
-    pub fleets: Arc<FleetCatalog>,
+    /// Current conservative fleet properties, shared with admission and fitting.
+    pub fleets: Arc<RuntimeCatalog>,
     /// Actions that reached a terminal result on a worker since the controller started.
     pub completed: Arc<AtomicU64>,
     /// Learned worker slot durations.
@@ -202,6 +203,7 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         actions: action_scheduler,
         workers: worker_scheduler,
         resource,
+        fleets,
     } = scheduler_stack(&scheduler, spec.fleets, &spec.actions, resources)?;
     let handoff = HandOff::new();
     let action_scheduler: Arc<dyn KnownPlatformPropertyProvider> =
@@ -209,9 +211,8 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
     let completed = Arc::new(AtomicU64::new(0));
     let durations = retained_durations(histories, resource, &spec.actions);
     let clock = Arc::clone(&spec.clock);
-    let fleets = Arc::new(spec.fleets.clone());
     let rates = Arc::new(
-        SourceRates::new(&spec.scaling, fleets.len(), Arc::clone(&clock))
+        SourceRates::new(&spec.scaling, spec.fleets.len(), Arc::clone(&clock))
             .map_err(NativeLinkEmbedError::native("source rates"))?,
     );
     let draining = Arc::new(ObservingWorkerScheduler::new(
@@ -223,6 +224,9 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         handoff.clone(),
         Arc::clone(&durations),
         Arc::clone(&clock),
+        fleets
+            .current()
+            .map_err(NativeLinkEmbedError::native("fleet capacity"))?,
         Arc::clone(&fleets),
         Arc::clone(&rates),
     ));
@@ -427,12 +431,14 @@ fn connection_limits(tuning: &Http2Config, max_workers: u64) -> ConnectionLimits
 type SchedulerHandles = (
     Arc<dyn KnownPlatformPropertyProvider>,
     Arc<dyn WorkerScheduler>,
+    Arc<RuntimeCatalog>,
 );
 
 struct SchedulerStack {
     actions: Arc<dyn KnownPlatformPropertyProvider>,
     workers: Arc<dyn WorkerScheduler>,
     resource: Arc<ResourceSketch>,
+    fleets: Arc<RuntimeCatalog>,
 }
 
 /// The action stack over `NativeLink`'s simple scheduler.
@@ -443,7 +449,7 @@ fn scheduler_stack(
     resources: &OnceLock<Arc<ResourceSketch>>,
 ) -> Result<SchedulerStack, NativeLinkEmbedError> {
     let mut resource = None;
-    let (actions, workers) = action_stack(
+    let (actions, workers, fleets) = action_stack(
         scheduler,
         fleets,
         actions,
@@ -468,6 +474,7 @@ fn scheduler_stack(
         actions,
         workers,
         resource,
+        fleets,
     })
 }
 
@@ -523,10 +530,22 @@ fn action_stack(
     });
     let notify = Arc::new(Notify::new());
     let (simple_actions, worker_scheduler) = simple_scheduler(simple, notify, Arc::clone(sketch));
+    let receiver = worker_scheduler
+        .resource_capacity_updates()
+        .ok_or_else(|| {
+            NativeLinkEmbedError::native("scheduler configuration failed")(make_err!(
+                Code::InvalidArgument,
+                "NativeLink worker scheduler must publish resource capacity updates"
+            ))
+        })?;
+    let fleets = Arc::new(RuntimeCatalog::new(fleets.clone(), receiver));
+    fleets
+        .current()
+        .map_err(NativeLinkEmbedError::native("fleet capacity"))?;
     let admitted = AdmittedFleets::default();
     let fitted = Arc::new(FittedActions::new(
         simple_actions,
-        fleets.clone(),
+        Arc::clone(&fleets),
         admitted.clone(),
         actions.memory.min_reservation,
         actions.disk.min_reservation,
@@ -536,9 +555,12 @@ fn action_stack(
         fitted,
         Arc::clone(sketch),
     ));
-    let action_scheduler: Arc<dyn KnownPlatformPropertyProvider> =
-        Arc::new(PlaceableActions::new(historical, fleets.clone(), admitted));
-    Ok((action_scheduler, worker_scheduler))
+    let action_scheduler: Arc<dyn KnownPlatformPropertyProvider> = Arc::new(PlaceableActions::new(
+        historical,
+        Arc::clone(&fleets),
+        admitted,
+    ));
+    Ok((action_scheduler, worker_scheduler, fleets))
 }
 
 /// Observes the router's calls into `sink`, and decodes Bazel's `RequestMetadata` header into the
@@ -925,7 +947,7 @@ mod tests {
         let mut simple_slot = None;
         let mut sketch_slot = None;
         let mut notify_slot = None;
-        let (actions, workers) = action_stack(
+        let (actions, workers, _) = action_stack(
             &rendered,
             fleets,
             actions,
@@ -1056,6 +1078,7 @@ mod tests {
             platform_properties.insert(property::MEMORY_KB.to_owned(), memory_kb.to_owned());
         }
         Arc::new(ActionInfo {
+            memory_reservation: None,
             command_digest: digest,
             input_root_digest: digest,
             timeout: Duration::from_mins(1),
@@ -1137,6 +1160,55 @@ mod tests {
                 .map(String::as_str),
             Some(expected)
         );
+    }
+
+    #[tokio::test]
+    async fn historical_stack_preserves_original_memory_intent_before_native_persistence()
+    -> TestResult {
+        let policies = Arc::new(serde_json::from_value(json!({
+            "cold_start": { "memory": "30GiB" }
+        }))?);
+        for original in [None, Some("0"), Some("2097152")] {
+            let fleets = x86_and_arm_fleets();
+            let (stack, _) = stack_with_actions(&fleets, &default_config(), None, &policies)?;
+            let mut request = action(Isa::Aarch64, original);
+            let info = Arc::make_mut(&mut request);
+            info.platform_properties
+                .insert(property::CPU_MILLICORES.to_owned(), "2000".to_owned());
+            info.memory_reservation = Some(nativelink_util::action_messages::MemoryReservation {
+                minimum_kb: Some(u64::MAX),
+                desired_kb: Some(u64::MAX),
+                cpu_before_memory_fit: Some(u64::MAX),
+                fitted_revision: None,
+            });
+            let subscription = stack
+                .actions
+                .add_action(OperationId::from("original-intent"), request)
+                .await?;
+            let (persisted, _) = subscription.as_action_info().await?;
+            let reservation = persisted
+                .memory_reservation
+                .as_ref()
+                .expect("Gang-owned intent");
+            let minimum = original.map(|value| value.parse::<u64>().unwrap());
+            assert_eq!(reservation.minimum_kb, minimum);
+            assert_eq!(
+                reservation.desired_kb,
+                Some(minimum.unwrap_or(30 * 1024 * 1024))
+            );
+            assert_eq!(reservation.cpu_before_memory_fit, Some(2000));
+            assert!(reservation.fitted_revision.is_some());
+            let physical = 8 * 1024 * 1024;
+            assert_eq!(
+                persisted.platform_properties[property::MEMORY_KB],
+                minimum.unwrap_or(physical).to_string(),
+            );
+            assert_eq!(
+                persisted.platform_properties[property::CPU_MILLICORES],
+                if original.is_none() { "4000" } else { "2000" },
+            );
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -1837,6 +1909,7 @@ mod tests {
         let operation = OperationId::String("stack-wiring".to_owned());
         let digest = DigestInfo::new([1; 32], 1);
         let info = Arc::new(ActionInfo {
+            memory_reservation: None,
             command_digest: digest,
             input_root_digest: digest,
             timeout: Duration::from_mins(1),
@@ -1888,6 +1961,7 @@ mod tests {
     fn origin_test_action() -> Arc<ActionInfo> {
         let digest = DigestInfo::new([2; 32], 2);
         Arc::new(ActionInfo {
+            memory_reservation: None,
             command_digest: digest,
             input_root_digest: digest,
             timeout: Duration::from_mins(1),

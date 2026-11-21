@@ -5,10 +5,11 @@
 ### Fixed
 
 - Fix startup on nominal 64 GiB workers whose measured memory, less reserve, is smaller than the fleet estimate; workers advertise their actual available action-pool capacity.
+- Use the same current memory guarantees for learned reservations, queued work, OOM retries and scaling, while preserving explicit client minimums and per-action ceilings.
 
 ### Upgrade notes
 
-- Remove `memory_per_instance` from every AWS deployment-module `fleets` entry. Prelaunch values are derived from the smallest nominal EC2 instance memory in each fleet. The generated internal `gang.toml` field remains a scheduler estimate, not an operator input to the AWS module.
+- `memory_per_instance` is now the machine's nominal RAM; Gang subtracts `actions.memory.reserve` to obtain the prelaunch usable-memory estimate. AWS deployments derive nominal RAM automatically from the smallest EC2 instance memory in each fleet. Remove `memory_per_instance` from every AWS deployment-module `fleets` entry; the generated internal `gang.toml` field is not an operator input to the AWS module.
 
 ## 0.3.4
 

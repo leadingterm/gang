@@ -28,8 +28,7 @@ mock_provider "aws" {
   # Every instance type the tests use supports UEFI boot unless a run overrides it.
   mock_data "aws_ec2_instance_type" {
     defaults = {
-      boot_modes  = ["legacy-bios", "uefi"]
-      memory_size = 65536
+      boot_modes = ["legacy-bios", "uefi"]
     }
   }
 

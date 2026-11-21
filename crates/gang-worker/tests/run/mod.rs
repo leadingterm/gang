@@ -418,6 +418,125 @@ async fn measured_pool_smaller_than_estimate_enrolls_and_preserves_action_ceilin
 }
 
 #[tokio::test]
+async fn pool_below_configured_minimum_prevents_enrollment_and_registration() {
+    let harness = Harness::new(Isa::X86_64, WorkerLifetime::LongLived);
+    let mut settings = harness.settings();
+    let minimum = gang_config::MinReservation::from_units(8 * 1024);
+    std::sync::Arc::make_mut(&mut settings.actions)
+        .memory
+        .min_reservation = minimum;
+    let pool = ActionMemoryPool {
+        cgroup: PathBuf::from("/test/action-pool"),
+        capacity: NonZeroBytes::mib(4),
+    };
+    let limits = harness.limits.clone().with_memory_pool(pool);
+    let error = gang_worker::run(
+        harness.parts(true),
+        settings,
+        move |_| Ok(limits),
+        harness.build_sandbox(),
+        future::pending(),
+    )
+    .await
+    .expect_err("capacity below the minimum cannot enroll");
+    assert!(matches!(
+        error,
+        WorkerError::MemoryBelowMinimum { capacity, minimum: actual }
+            if capacity == Bytes::mib(4) && actual == minimum.get()
+    ));
+    assert_eq!(harness.enroller.calls(), 0);
+    assert!(harness.scheduler.specs().is_empty());
+}
+
+#[tokio::test]
+async fn pool_at_configured_minimum_enrolls_and_advertises_capacity() {
+    let harness = Harness::new(Isa::X86_64, WorkerLifetime::LongLived);
+    harness.scheduler.set_behaviour(Behaviour::Finish);
+    let mut settings = harness.settings();
+    let minimum = gang_config::MinReservation::from_units(8 * 1024);
+    std::sync::Arc::make_mut(&mut settings.actions)
+        .memory
+        .min_reservation = minimum;
+    let pool = ActionMemoryPool {
+        cgroup: PathBuf::from("/test/action-pool"),
+        capacity: NonZeroBytes::mib(8),
+    };
+    let limits = harness.limits.clone().with_memory_pool(pool);
+    gang_worker::run(
+        harness.parts(true),
+        settings,
+        move |_| Ok(limits),
+        harness.build_sandbox(),
+        future::pending(),
+    )
+    .await
+    .expect("capacity at the minimum can enroll");
+    assert_eq!(harness.enroller.calls(), 1);
+    assert_eq!(
+        only_spec(&harness).properties.capacity(property::MEMORY_KB),
+        Some(8 * 1024)
+    );
+}
+
+#[tokio::test]
+async fn one_byte_pool_prevents_enrollment_and_registration() {
+    let harness = Harness::new(Isa::X86_64, WorkerLifetime::LongLived);
+    let settings = harness.settings();
+    let minimum = settings.actions.memory.min_reservation;
+    let pool = ActionMemoryPool {
+        cgroup: PathBuf::from("/test/action-pool"),
+        capacity: NonZeroBytes::new(Bytes::new(1)).expect("one byte is nonzero"),
+    };
+    let limits = harness.limits.clone().with_memory_pool(pool);
+    let error = gang_worker::run(
+        harness.parts(true),
+        settings,
+        move |_| Ok(limits),
+        harness.build_sandbox(),
+        future::pending(),
+    )
+    .await
+    .expect_err("one byte cannot satisfy the minimum");
+    assert!(matches!(
+        error,
+        WorkerError::MemoryBelowMinimum { capacity, minimum: actual }
+            if capacity == Bytes::new(1) && actual == minimum.get()
+    ));
+    assert_eq!(harness.enroller.calls(), 0);
+    assert!(harness.scheduler.specs().is_empty());
+}
+
+#[tokio::test]
+async fn fallback_capacity_below_minimum_prevents_enrollment_and_registration() {
+    let harness = Harness::new(Isa::X86_64, WorkerLifetime::LongLived);
+    let mut settings = harness.settings();
+    settings.limits = None;
+    let minimum = settings.actions.memory.min_reservation;
+    let physical = gang_os::physical_memory().expect("physical memory is readable");
+    let reserve = NonZeroBytes::new(physical.saturating_sub(Bytes::new(1)))
+        .expect("physical memory exceeds one byte");
+    std::sync::Arc::make_mut(&mut settings.actions)
+        .memory
+        .reserve = reserve;
+    let error = gang_worker::run(
+        harness.parts(true),
+        settings,
+        harness.build_limits(),
+        harness.build_sandbox(),
+        future::pending(),
+    )
+    .await
+    .expect_err("fallback capacity below the minimum cannot enroll");
+    assert!(matches!(
+        error,
+        WorkerError::MemoryBelowMinimum { capacity, minimum: actual }
+            if capacity == Bytes::new(1) && actual == minimum.get()
+    ));
+    assert_eq!(harness.enroller.calls(), 0);
+    assert!(harness.scheduler.specs().is_empty());
+}
+
+#[tokio::test]
 async fn no_limits_plugin_passes_no_pool() {
     let harness = Harness::new(Isa::X86_64, WorkerLifetime::LongLived);
     harness.scheduler.set_behaviour(Behaviour::Finish);

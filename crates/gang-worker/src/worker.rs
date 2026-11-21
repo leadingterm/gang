@@ -41,6 +41,7 @@ use crate::transport::{ServerCaSource, Transport};
 /// [`WorkerError::FleetDiskUnavailable`] when the scratch volume leaves the actions less disk
 /// than the fleet declares;
 /// [`WorkerError::MemoryReserveExhausted`] when the memory reserve leaves no physical memory;
+/// [`WorkerError::MemoryBelowMinimum`] when action memory is below the minimum reservation;
 /// [`WorkerError::Config`] when the sandbox file cannot be rendered;
 /// [`WorkerError::SandboxProgram`] when a sandbox program does not resolve to an executable
 /// file;
@@ -264,7 +265,8 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
     )?;
     let limits = file.limits.map(build_limits).transpose()?;
     let reserve = actions.memory.reserve.get();
-    let (memory_pool, capacity) = prepare_memory_pool(limits.as_ref(), reserve).await?;
+    let (memory_pool, capacity) =
+        prepare_memory_pool(limits.as_ref(), reserve, actions.memory.min_reservation).await?;
     let mut properties = fleet.properties.clone();
     properties.set_action_environment(&environment);
     properties.set_memory_capacity(capacity);
@@ -361,6 +363,7 @@ fn fast_cas_budget(
 async fn prepare_memory_pool<L: ActionLimitsPort>(
     limits: Option<&L>,
     reserve: gang_types::Bytes,
+    minimum: gang_config::MinReservation,
 ) -> Result<(Option<gang_spi::ActionMemoryPool>, gang_types::NonZeroBytes), WorkerError> {
     let memory_pool = match limits {
         Some(limits) => limits.prepare(reserve).await?,
@@ -373,6 +376,12 @@ async fn prepare_memory_pool<L: ActionLimitsPort>(
         gang_types::NonZeroBytes::new(physical.saturating_sub(reserve))
             .ok_or(WorkerError::MemoryReserveExhausted { physical, reserve })?
     };
+    if capacity.get() < minimum.get() {
+        return Err(WorkerError::MemoryBelowMinimum {
+            capacity: capacity.get(),
+            minimum: minimum.get(),
+        });
+    }
     Ok((memory_pool, capacity))
 }
 

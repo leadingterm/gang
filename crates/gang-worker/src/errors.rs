@@ -70,6 +70,17 @@ pub enum WorkerError {
         /// The memory reserved outside the action pool.
         reserve: Bytes,
     },
+    /// The actual action memory capacity cannot satisfy the minimum reservation.
+    #[error("action memory capacity {capacity} is below actions.memory.min_reservation {minimum}")]
+    #[fix(
+        "lower actions.memory.min_reservation or actions.memory.reserve, or give the instance more memory"
+    )]
+    MemoryBelowMinimum {
+        /// Actual memory available for actions.
+        capacity: Bytes,
+        /// Minimum memory reservation for an action.
+        minimum: Bytes,
+    },
     /// A provisioner, cache, sandbox, or limits port failed.
     #[error("a provisioner, cache, sandbox, or limits port failed")]
     Port(#[from] PortError),
@@ -142,6 +153,10 @@ mod tests {
             WorkerError::MemoryReserveExhausted {
                 physical: Bytes::gib(8),
                 reserve: Bytes::gib(8),
+            },
+            WorkerError::MemoryBelowMinimum {
+                capacity: Bytes::mib(4),
+                minimum: Bytes::mib(8),
             },
             WorkerError::Port(PortError::backend(CAUSE)),
             WorkerError::Enroll(EnrollError::new(io::Error::other(CAUSE))),
@@ -228,6 +243,24 @@ mod tests {
         assert_eq!(
             fix_of(&error).as_deref(),
             Some("reduce actions.memory.reserve or give the instance more memory")
+        );
+    }
+
+    #[test]
+    fn below_minimum_memory_names_values_and_operator_fix() {
+        let error = WorkerError::MemoryBelowMinimum {
+            capacity: Bytes::mib(4),
+            minimum: Bytes::mib(8),
+        };
+        let message = error.to_string();
+        assert!(message.contains("actions.memory.min_reservation"));
+        assert!(message.contains(&Bytes::mib(4).to_string()));
+        assert!(message.contains(&Bytes::mib(8).to_string()));
+        assert_eq!(
+            fix_of(&error).as_deref(),
+            Some(
+                "lower actions.memory.min_reservation or actions.memory.reserve, or give the instance more memory"
+            )
         );
     }
 

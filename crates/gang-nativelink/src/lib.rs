@@ -28,6 +28,7 @@
 #![recursion_limit = "256"]
 
 mod actions;
+mod capacity;
 mod config;
 mod controller;
 mod cordons;
@@ -61,3 +62,13 @@ mod worker;
 
 pub use config::NativeLinkConfig;
 pub use plugin::NativeLink;
+
+#[cfg(test)]
+pub(crate) fn test_catalog(
+    fleets: gang_types::FleetCatalog,
+) -> std::sync::Arc<capacity::RuntimeCatalog> {
+    let (_sender, receiver) = tokio::sync::watch::channel(std::sync::Arc::new(
+        nativelink_scheduler::worker_scheduler::ResourceCapacitySnapshot::new(Vec::new()),
+    ));
+    std::sync::Arc::new(capacity::RuntimeCatalog::new(fleets, receiver))
+}

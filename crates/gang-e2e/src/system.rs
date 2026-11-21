@@ -5,6 +5,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use gang_config::InputLinks;
+use gang_types::NonZeroBytes;
 use gang_wire::{Event, Frame, State};
 
 use crate::access::IdentityKnobs;
@@ -97,6 +98,12 @@ pub const SMALL_FLEET: &str = "local-small";
 /// The second fleet of [`FleetLayout::Placement`]: twice the size of [`SMALL_FLEET`], the same
 /// sandbox, two instances at most.
 pub const LARGE_FLEET: &str = "local-large";
+
+/// The per-action memory ceiling of the small and noop placement fleets.
+pub const PLACEMENT_SMALL_MEMORY: NonZeroBytes = NonZeroBytes::gib(1);
+
+/// The per-action memory ceiling of the large placement fleet and its memory probe.
+pub const PLACEMENT_LARGE_MEMORY: NonZeroBytes = NonZeroBytes::gib(2);
 
 /// The third fleet of [`FleetLayout::Placement`]: the size of [`SMALL_FLEET`], the noop sandbox,
 /// one instance at most.

@@ -39,8 +39,11 @@ yq -o=json '.jobs' "$workflow" | jq -e '
   elif (.changes | type) != "object" then
     error("workflow must contain a changes job")
   else . end
-  | needs("required"; ["changes", "nix-vm", "lint", "linux-x86_64-shards", "linux-x86_64", "linux-x86_64-bundle", "e2e-gate-1-shards", "e2e-gate-1", "e2e-gate-2-shards", "e2e-gate-2"])
+  | needs("required"; ["changes", "nativelink-deadline-tests", "nix-vm", "lint", "linux-x86_64-shards", "linux-x86_64", "linux-x86_64-bundle", "e2e-gate-1-shards", "e2e-gate-1", "e2e-gate-2-shards", "e2e-gate-2"])
   | results("required")
+  | needs("nativelink-deadline-tests"; ["changes"])
+  | if $jobs["nativelink-deadline-tests"].if == "needs.changes.outputs.heavy == '\''true'\''" then .
+    else error("nativelink-deadline-tests must run whenever heavy is true") end
   | needs("nix-vm"; ["changes"])
   | needs("linux-x86_64-shards"; ["changes"])
   | needs("lint"; ["changes"])
@@ -116,7 +119,7 @@ yq -o=json '.jobs' "$workflow" | jq -e '
   | reduce ["nix-vm", "lint", "linux-x86_64-shards", "linux-x86_64-bundle", "cache-x86_64", "e2e-gate-1-shards", "e2e-gate-2-shards", "linux-arm64-bundle", "linux-arm64-checks", "cross", "macos"][] as $id (.;
       if ($jobs[$id].if | contains("needs.changes.outputs.heavy == '\''true'\''")) then .
       else error($id + " must skip intentionally when heavy is false") end)
-  | reduce ["nix-vm", "lint", "linux-x86_64-shards", "linux-x86_64", "linux-x86_64-bundle", "e2e-gate-1-shards", "e2e-gate-1", "e2e-gate-2-shards", "e2e-gate-2", "required"][] as $id (.;
+  | reduce ["nativelink-deadline-tests", "nix-vm", "lint", "linux-x86_64-shards", "linux-x86_64", "linux-x86_64-bundle", "e2e-gate-1-shards", "e2e-gate-1", "e2e-gate-2-shards", "e2e-gate-2", "required"][] as $id (.;
       ($jobs[$id]."runs-on" // "") as $runner
       | if ($runner | type) == "string" and ($runner | contains("ubuntu-24.04"))
            and ($runner | contains("linux-x64")) and ($runner | contains("arm64") | not) then .

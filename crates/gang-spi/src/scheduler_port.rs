@@ -14,7 +14,7 @@ use tokio::sync::oneshot;
 use gang_clock::{Clock, Tick, Timestamp};
 use gang_types::{
     ActionEnvironment, ActionResources, BuildId, Bytes, FleetCatalog, FleetName, FleetProperties,
-    FleetSet, InstanceId, Refusal, SourceId, Url, WorkerId,
+    FleetSet, InstanceId, NonZeroBytes, Refusal, SourceId, Url, WorkerId,
 };
 
 use crate::{
@@ -192,6 +192,15 @@ pub struct LearnedHistory {
     pub expires_at: Timestamp,
 }
 
+/// Conservative usable memory for one configured fleet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetMemoryCapacity {
+    /// Index in the configured fleet catalog, matching queued demand candidates.
+    pub fleet: usize,
+    /// Usable memory, initially estimated and lowered by physical observations.
+    pub capacity: NonZeroBytes,
+}
+
 /// What the scheduler holds at one moment.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SchedulerSnapshot {
@@ -203,6 +212,9 @@ pub struct SchedulerSnapshot {
     pub source_rates_at: Tick,
     /// Controller-owned physical intents only, unique and sorted by `(fleet, instance)`.
     pub cordons: Vec<InstanceCordon>,
+    /// Current conservative usable memory per configured fleet, initially estimated until observed.
+    /// This buffer is reused across snapshots.
+    pub fleet_memory: Vec<FleetMemoryCapacity>,
     /// The connected workers, with unique ids sorted by `WorkerId` ascending.
     pub workers: Vec<WorkerState>,
     /// The queued actions, highest priority first, then oldest.

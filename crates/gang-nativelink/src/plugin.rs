@@ -149,10 +149,11 @@ impl SchedulerPort for NativeLink {
             .await;
         let workers = handles.worker_scheduler.worker_snapshot().await;
         let completed = handles.completed.load(Ordering::Relaxed);
+        let fleets = handles.fleets.current().map_err(PortError::backend)?;
         snapshot::fill(
             &*handles.action_scheduler,
             &workers,
-            &handles.fleets,
+            &fleets,
             &handles.durations,
             handles.clock.wall(),
             completed,
@@ -179,15 +180,10 @@ impl SchedulerPort for NativeLink {
     ) -> Result<(), PortError> {
         let handles = self.current()?;
         let workers = handles.worker_scheduler.worker_snapshot().await;
-        crate::actions::list(
-            &*handles.action_scheduler,
-            &workers,
-            &handles.fleets,
-            limits,
-            into,
-        )
-        .await
-        .map_err(PortError::backend)
+        let fleets = handles.fleets.current().map_err(PortError::backend)?;
+        crate::actions::list(&*handles.action_scheduler, &workers, &fleets, limits, into)
+            .await
+            .map_err(PortError::backend)
     }
 
     /// Stops or resumes every connection of a physical instance, including future connections.

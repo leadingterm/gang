@@ -142,7 +142,6 @@ mod linux {
             &salt,
             &root.join("prefetch-signal"),
             template.default_isa()?,
-            template.large_memory_kb()?,
         );
         let workspace = root.join("prefetch-workspace");
         crate::sample::stage(&inputs.sample, &workspace, &parameters)?;

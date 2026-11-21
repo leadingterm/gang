@@ -39,6 +39,50 @@ jobs:
           HEAD: ${{ github.sha }}
         run: tools/ci-changes.sh "$BASE" "$HEAD" >> "$GITHUB_OUTPUT"
 
+  nativelink-deadline-tests:
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Select pinned NativeLink and Rust
+        run: |
+          python3 -c '
+          import os, re, tomllib
+          from pathlib import Path
+          with open("Cargo.toml", "rb") as f:
+              dep = tomllib.load(f)["workspace"]["dependencies"]["nativelink-worker"]
+          url, rev = dep["git"], dep["rev"]
+          if not re.fullmatch(r"https://[A-Za-z0-9._/-]+", url) or not re.fullmatch(r"[0-9a-f]{40}", rev):
+              raise ValueError("NativeLink must use an HTTPS Git URL and immutable commit")
+          module = Path("MODULE.bazel").read_text()
+          version, = re.findall(r"(?m)^RUST_VERSION = \"([0-9]+\.[0-9]+\.[0-9]+)\"$", module)
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"NATIVELINK_URL={url}\nNATIVELINK_REV={rev}\nRUSTUP_TOOLCHAIN={version}\n")
+          '
+      - name: Fetch pinned NativeLink
+        run: |
+          git init "$RUNNER_TEMP/nativelink"
+          git -C "$RUNNER_TEMP/nativelink" remote add origin "$NATIVELINK_URL"
+          GIT_TERMINAL_PROMPT=0 git -c credential.helper= -C "$RUNNER_TEMP/nativelink" fetch --depth 1 origin "$NATIVELINK_REV"
+          git -C "$RUNNER_TEMP/nativelink" checkout --detach "$NATIVELINK_REV"
+      - name: Install pinned Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - name: Run NativeLink deadline tests
+        working-directory: ${{ runner.temp }}/nativelink
+        run: |
+          cargo test -p nativelink-scheduler --lib --test dispatch_ack_test --test worker_running_operations_report_test --test simple_scheduler_test --test observed_memory_test --locked --profile smol
+          cargo test -p nativelink-worker --lib --test local_worker_test --test running_actions_manager_test --test resource_pressure_test --locked --profile smol
+          cargo test -p nativelink-service --test worker_api_server_test --locked --profile smol
+
   nix-vm:
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
@@ -428,7 +472,7 @@ jobs:
           done
 
   required:
-    needs: [changes, nix-vm, lint, linux-x86_64-shards, linux-x86_64, linux-x86_64-bundle, e2e-gate-1-shards, e2e-gate-1, e2e-gate-2-shards, e2e-gate-2]
+    needs: [changes, nativelink-deadline-tests, nix-vm, lint, linux-x86_64-shards, linux-x86_64, linux-x86_64-bundle, e2e-gate-1-shards, e2e-gate-1, e2e-gate-2-shards, e2e-gate-2]
     if: always()
     runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
     timeout-minutes: 5
@@ -440,8 +484,8 @@ jobs:
           HEAVY: ${{ needs.changes.outputs.heavy }}
           # Every blocking job result is mandatory.
           NEEDS_RESULTS: >-
-            ${{ format('{0} {1} {2} {3} {4} {5} {6} {7} {8} {9}',
-                  needs.changes.result, needs.nix-vm.result, needs.lint.result,
+            ${{ format('{0} {1} {2} {3} {4} {5} {6} {7} {8} {9} {10}',
+                  needs.changes.result, needs.nativelink-deadline-tests.result, needs.nix-vm.result, needs.lint.result,
                   needs.linux-x86_64-shards.result, needs.linux-x86_64.result, needs.linux-x86_64-bundle.result,
                   needs.e2e-gate-1-shards.result, needs.e2e-gate-1.result,
                   needs.e2e-gate-2-shards.result, needs.e2e-gate-2.result) }}
@@ -449,7 +493,7 @@ jobs:
           test "$CHANGES_RESULT" = success
           case "$HEAVY" in true|false) ;; *) exit 1 ;; esac
           read -r -a results <<< "$NEEDS_RESULTS"
-          test "${#results[@]}" -eq 10
+          test "${#results[@]}" -eq 11
           for result in "${results[@]}"; do
             case "$result" in
               success) ;;
