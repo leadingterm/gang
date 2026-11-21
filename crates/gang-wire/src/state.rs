@@ -686,7 +686,7 @@ pub struct Demand {
     /// Persistent load in tenths of a worker-equivalent, absent until measured; zero is a measurement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load: Option<u32>,
-    /// Transient queued worker-equivalent-seconds before readiness subtraction, rounded to whole seconds.
+    /// Transient queued worker-equivalent-seconds, rounded to whole seconds.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

@@ -380,7 +380,7 @@ expectedWait?: Duration,
  */
 load?: number, 
 /**
- * Transient queued worker-equivalent-seconds before readiness subtraction, rounded to whole seconds.
+ * Transient queued worker-equivalent-seconds, rounded to whole seconds.
  */
 backlog?: Duration, 
 /**
