@@ -1322,6 +1322,30 @@ mod tests {
         (inner, counting, completed)
     }
     #[tokio::test]
+    async fn retiring_lock_timeout_is_unavailable_and_retryable() {
+        let (_, scheduler, _) = wrap(false);
+        let clock = gang_clock::TestClock::default();
+        let bound = gang_types::NonZeroDuration::from_secs(1);
+        let fleet = FleetName::try_new("fleet-a").expect("fleet");
+        let instance = InstanceId::try_new("local-1").expect("instance");
+        let held = scheduler.retiring.write().await;
+        let acquisition = Acquisition::new(&clock, bound);
+        let command = scheduler.set_draining(&fleet, &instance, true, &acquisition);
+        tokio::pin!(command);
+        assert!(futures::poll!(command.as_mut()).is_pending());
+        clock.advance(bound.get());
+        assert!(matches!(command.await, Err(PortError::Unavailable(_))));
+        drop(held);
+        let mut cordons = Vec::new();
+        scheduler.cordons_into(&mut cordons).await;
+        assert!(cordons.is_empty());
+        let acquisition = Acquisition::new(&clock, bound);
+        scheduler.set_draining(&fleet, &instance, true, &acquisition).await.expect("retry");
+        scheduler.cordons_into(&mut cordons).await;
+        assert_eq!(cordons.len(), 1);
+    }
+
+    #[tokio::test]
     async fn worker_self_drain_and_controller_cordon_keep_separate_owners() {
         let (inner, scheduler, _) = wrap(false);
         let old = WorkerId("local-1-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b".to_owned());

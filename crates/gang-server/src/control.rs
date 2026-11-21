@@ -26,7 +26,7 @@ use crate::publish::StatePublisher;
 /// What one control pass did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PassOutcome {
-    /// The pass was abandoned before any step was planned or applied, for the given reason.
+    /// The pass was abandoned for the given reason; earlier applied steps remain recorded.
     Skipped(SkipReason),
     /// The plan was applied. `applied` steps succeeded and `failed` steps did not. Steps that
     /// found their worker already gone count as neither.
@@ -188,20 +188,20 @@ where
     /// every planned step. Exit events use the current pass time. The pass's state is published
     /// last with the same wall time as its events.
     ///
-    /// A failed snapshot, converge or supply read, or lapsed leadership, skips the pass before
-    /// any step is applied. A skipped pass samples its clock at the skip. A failed step does not
-    /// stop the others.
+    /// A failed snapshot, converge or supply read, lapsed leadership, or unavailable scheduler
+    /// during a drain skips the pass. Other failed steps do not stop the others.
     pub(crate) async fn pass(&mut self) -> PassOutcome {
-        let (wall, outcome) = match self.plan_pass().await {
+        let (mut wall, outcome) = match self.plan_pass().await {
             Ok(time) => (time.wall, self.apply_plan().await),
-            Err(reason) => {
-                self.reconciler.interrupt();
-                (
-                    PassTime::read(self.clock).wall,
-                    PassOutcome::Skipped(reason),
-                )
-            }
+            Err(reason) => (
+                PassTime::read(self.clock).wall,
+                PassOutcome::Skipped(reason),
+            ),
         };
+        if matches!(outcome, PassOutcome::Skipped(_)) {
+            wall = PassTime::read(self.clock).wall;
+            self.reconciler.interrupt();
+        }
         self.publish(wall, &outcome);
         outcome
     }
@@ -692,7 +692,7 @@ where
     async fn apply_plan(&mut self) -> PassOutcome {
         let mut applied = 0;
         let mut failed = 0;
-        for step in &self.plan.steps {
+        for (index, step) in self.plan.steps.iter().enumerate() {
             match Self::apply(
                 self.provisioner,
                 self.scheduler,
@@ -722,6 +722,22 @@ where
                 }
                 Err(PortError::NotFound(Subject::Worker(worker))) => {
                     tracing::debug!(worker = ?worker, "worker not found; skipping drain step");
+                }
+                Err(PortError::Unavailable(error))
+                    if matches!(
+                        &step.action,
+                        Action::StartDrain { .. }
+                            | Action::ReinforceDrain(_)
+                            | Action::CancelDrain(_, _)
+                    ) =>
+                {
+                    tracing::warn!(?step, %error, "scheduler unavailable; skipping remaining steps");
+                    for remaining in &self.plan.steps[index + 1..] {
+                        if let Action::Terminate { instance, .. } = &remaining.action {
+                            self.reconciler.forget_order(remaining.fleet, instance);
+                        }
+                    }
+                    return PassOutcome::Skipped(SkipReason::SchedulerUnavailable);
                 }
                 Err(error) => {
                     if let Action::Terminate { instance, .. } = &step.action {
@@ -1019,6 +1035,84 @@ mod tests {
             events[1].kind,
             ScalingEventKind::DrainCancelled { .. }
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unavailable_drain_stops_plan_and_retries_unexecuted_termination()
+    -> gang_testkit::TestResult {
+        use futures::poll;
+        use gang_reconciler::{NeedCause, ScaleDecision};
+        use gang_spi::{FleetInstance, FleetSupply, InstanceCordon, SchedulerSnapshot, WorkerState};
+
+        let fleets = crate::test_support::fleets();
+        let provisioner = gang_testkit::FakeProvisioner::default();
+        let clock = crate::test_support::clock_at(1_000_000);
+        let scheduler = gang_testkit::FakeScheduler::with_control_acquire_timeout(
+            clock.clone(),
+            NonZeroDuration::from_secs(1),
+        )?;
+        let repository = gang_testkit::FakeRepository::default();
+        let fleet = FleetName::try_new("example-fleet")?;
+        let instance = InstanceId::try_new("local-1")?;
+        let worker = gang_testkit::worker_on(&instance)?;
+        provisioner.set_supply(&fleet, FleetSupply {
+            desired: 1,
+            instances: vec![FleetInstance {
+                id: instance.clone(),
+                lifecycle: InstanceLifecycle::InService,
+                launched_at: clock.wall(),
+                release_first: false,
+            }],
+            ..FleetSupply::default()
+        });
+        scheduler.set_snapshot(SchedulerSnapshot {
+            cordons: vec![InstanceCordon { fleet: 0, instance: Arc::new(instance.clone()) }],
+            workers: vec![WorkerState {
+                id: worker.clone(),
+                fleet,
+                environment: Some("host:test".parse()?),
+                running_actions: 0,
+                max_inflight_actions: NonZeroU32::new(4),
+                capacity: None,
+                reserved: None,
+                draining: true,
+                paused: false,
+                last_seen: clock.wall(),
+            }],
+            ..SchedulerSnapshot::default()
+        });
+        let mut control = control(&fleets, &provisioner, &scheduler, &repository, &clock);
+        assert!(control.plan_pass().await.is_ok());
+        assert!(control.plan.steps.iter().any(|step| matches!(step.action, Action::Terminate { .. })));
+        control.plan.steps.insert(0, PlanStep {
+            fleet: 0,
+            action: Action::ReinforceDrain(worker),
+        });
+        control.plan.steps.insert(0, PlanStep {
+            fleet: 0,
+            action: Action::ScaleOut {
+                from: 1,
+                to: 2,
+                need: NeedCause::Demand,
+                summary: ScaleDecision::default(),
+            },
+        });
+        let guard = scheduler.hold_control_acquisition().await;
+        {
+            let apply = control.apply_plan();
+            futures::pin_mut!(apply);
+            assert!(poll!(apply.as_mut()).is_pending());
+            clock.advance(Duration::from_secs(1));
+            assert_eq!(apply.await, PassOutcome::Skipped(SkipReason::SchedulerUnavailable));
+        }
+        assert_eq!(provisioner.desired_requests().len(), 1);
+        assert!(provisioner.terminations().is_empty());
+        assert!(scheduler.draining_calls().is_empty());
+        assert!(repository.scaling_events().iter().any(|event| matches!(event.kind, ScalingEventKind::ScaledOut { .. })));
+        drop(guard);
+        assert!(matches!(control.pass().await, PassOutcome::Completed { failed: 0, .. }));
+        assert_eq!(provisioner.terminations().len(), 1);
         Ok(())
     }
 

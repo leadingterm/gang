@@ -126,9 +126,12 @@ impl InstanceCordons {
             PortError::config(make_err!(Code::InvalidArgument, "unknown fleet {fleet}"))
         })?;
         let mut state = acquisition.wait(self.state.write()).await?;
-        let workers = acquisition.wait(inner.worker_snapshot()).await?;
         let position = state.fleets[fleet_index]
             .binary_search_by(|entry| entry.id.as_str().cmp(instance.as_str()));
+        if !draining && position.is_err() {
+            return Ok(());
+        }
+        let workers = acquisition.wait(inner.worker_snapshot()).await?;
         let position = match (position, draining) {
             (Ok(position), _) => position,
             (Err(_), false) => return Ok(()),
@@ -611,6 +614,77 @@ mod tests {
         cordons.snapshot_into(&mut result).await;
         result
     }
+    #[tokio::test]
+    async fn acquisition_timeouts_preserve_intent_and_retry() -> TestResult {
+        let clock = gang_clock::TestClock::default();
+        let bound = gang_types::NonZeroDuration::from_secs(1);
+        let cordons = InstanceCordons::new(catalog()?);
+        let inner = Scheduler::new();
+        let fleet = FleetName::try_new("alpha")?;
+        let instance = InstanceId::try_new("host")?;
+        let held = cordons.state.write().await;
+        let acquisition = Acquisition::new(&clock, bound);
+        let command = cordons.set_draining(&inner, &fleet, &instance, true, &acquisition);
+        tokio::pin!(command);
+        assert!(futures::poll!(command.as_mut()).is_pending());
+        clock.advance(bound.get());
+        assert!(matches!(command.await, Err(PortError::Unavailable(_))));
+        drop(held);
+        assert!(snapshot(&cordons).await.is_empty());
+
+        let gate = Arc::new(Gate::default());
+        inner.workers.lock().snapshot_gate = Some(Arc::clone(&gate));
+        let acquisition = Acquisition::new(&clock, bound);
+        let command = cordons.set_draining(&inner, &fleet, &instance, true, &acquisition);
+        tokio::pin!(command);
+        assert!(futures::poll!(command.as_mut()).is_pending());
+        clock.advance(bound.get());
+        assert!(matches!(command.await, Err(PortError::Unavailable(_))));
+        assert!(snapshot(&cordons).await.is_empty());
+        let acquisition = Acquisition::new(&clock, bound);
+        cordons.set_draining(&inner, &fleet, &instance, true, &acquisition).await?;
+        assert_eq!(snapshot(&cordons).await.len(), 1);
+
+        let held = cordons.state.read().await;
+        let acquisition = Acquisition::new(&clock, bound);
+        let retain = cordons.retain(Tick::ORIGIN, Duration::ZERO, &[], &acquisition);
+        tokio::pin!(retain);
+        assert!(futures::poll!(retain.as_mut()).is_pending());
+        clock.advance(bound.get());
+        assert!(matches!(retain.await, Err(PortError::Unavailable(_))));
+        drop(held);
+        assert_eq!(snapshot(&cordons).await.len(), 1);
+        let acquisition = Acquisition::new(&clock, bound);
+        cordons.retain(Tick::ORIGIN, Duration::ZERO, &[], &acquisition).await?;
+        assert!(snapshot(&cordons).await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn started_native_update_is_not_cancelled_at_deadline() -> TestResult {
+        let clock = gang_clock::TestClock::default();
+        let bound = gang_types::NonZeroDuration::from_secs(1);
+        let cordons = InstanceCordons::new(catalog()?);
+        let inner = Scheduler::new();
+        let fleet = FleetName::try_new("alpha")?;
+        let instance = InstanceId::try_new("host")?;
+        let worker = id("host", 1);
+        admit(&cordons, &inner, "alpha", worker.clone()).await?;
+        let gate = Arc::new(Gate::default());
+        inner.workers.lock().update_gate = Some(Arc::clone(&gate));
+        let acquisition = Acquisition::new(&clock, bound);
+        let command = cordons.set_draining(&inner, &fleet, &instance, true, &acquisition);
+        tokio::pin!(command);
+        assert!(futures::poll!(command.as_mut()).is_pending());
+        clock.advance(bound.get());
+        assert!(futures::poll!(command.as_mut()).is_pending());
+        gate.release.notify_one();
+        command.await?;
+        assert_eq!(inner.draining(&worker), Some(true));
+        assert_eq!(snapshot(&cordons).await.len(), 1);
+        Ok(())
+    }
+
 
     #[tokio::test]
     async fn physical_cordon_covers_generations_and_survives_last_disconnect() -> TestResult {
@@ -748,7 +822,7 @@ mod tests {
         admit(&cordons, &inner, "alpha", second.clone()).await?;
         inner.fail(&second, Failure::Connected);
         assert!(matches!(
-            cordons.set_draining(&inner, &fleet, &instance, true).await,
+            cordons.set_draining(&inner, &fleet, &instance, true, crate::acquisition::test_acquisition()).await,
             Err(PortError::Backend(_))
         ));
         assert_eq!(inner.draining(&first), Some(true));
@@ -759,7 +833,7 @@ mod tests {
         inner.fail(&second, Failure::Connected);
         assert!(
             cordons
-                .set_draining(&inner, &fleet, &instance, false)
+                .set_draining(&inner, &fleet, &instance, false, crate::acquisition::test_acquisition())
                 .await
                 .is_err()
         );
@@ -830,9 +904,8 @@ mod tests {
         }
         let beta_supply = supplied(&instance, InstanceLifecycle::Terminating);
         let live = [(&beta, &beta_supply)];
-        cordons.retain(Tick::ORIGIN, grace, &live, crate::acquisition::test_acquisition()).await;
-        cordons.retain(Tick::ORIGIN + Duration::from_secs(9), grace, &live, crate::acquisition::test_acquisition())
-            .await;
+        cordons.retain(Tick::ORIGIN, grace, &live, crate::acquisition::test_acquisition()).await?;
+        cordons.retain(Tick::ORIGIN + Duration::from_secs(9), grace, &live, crate::acquisition::test_acquisition()).await?;
         assert_eq!(snapshot(&cordons).await.len(), 2);
         let alpha_supply = supplied(&instance, InstanceLifecycle::Pending);
         let old_generation = supplied(&instance, InstanceLifecycle::InService);
@@ -841,18 +914,14 @@ mod tests {
             (&beta, &beta_supply),
             (&alpha, &old_generation),
         ];
-        cordons.retain(Tick::ORIGIN + grace, grace, &all_generations, crate::acquisition::test_acquisition())
-            .await;
-        cordons.retain(Tick::ORIGIN + Duration::from_secs(11), grace, &live, crate::acquisition::test_acquisition())
-            .await;
+        cordons.retain(Tick::ORIGIN + grace, grace, &all_generations, crate::acquisition::test_acquisition()).await?;
+        cordons.retain(Tick::ORIGIN + Duration::from_secs(11), grace, &live, crate::acquisition::test_acquisition()).await?;
         // Reissuing an existing physical intent must not restart its absence timer.
         cordons.set_draining(&inner, &alpha, &instance, true, crate::acquisition::test_acquisition())
             .await?;
-        cordons.retain(Tick::ORIGIN + Duration::from_secs(20), grace, &live, crate::acquisition::test_acquisition())
-            .await;
+        cordons.retain(Tick::ORIGIN + Duration::from_secs(20), grace, &live, crate::acquisition::test_acquisition()).await?;
         assert_eq!(snapshot(&cordons).await.len(), 2);
-        cordons.retain(Tick::ORIGIN + Duration::from_secs(21), grace, &live, crate::acquisition::test_acquisition())
-            .await;
+        cordons.retain(Tick::ORIGIN + Duration::from_secs(21), grace, &live, crate::acquisition::test_acquisition()).await?;
         let remaining = snapshot(&cordons).await;
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].fleet, 1);
@@ -879,7 +948,7 @@ mod tests {
             .instances
             .extend(supplied(&terminating, InstanceLifecycle::Terminating).instances);
         let live = [(&fleet, &supply)];
-        cordons.retain(Tick::ORIGIN, Duration::ZERO, &live, crate::acquisition::test_acquisition()).await;
+        cordons.retain(Tick::ORIGIN, Duration::ZERO, &live, crate::acquisition::test_acquisition()).await?;
         let retention = cordons.retain(Tick::from_elapsed(Duration::MAX), Duration::ZERO, &live, crate::acquisition::test_acquisition());
         assert_send(&retention);
         tokio::pin!(retention);
@@ -901,18 +970,17 @@ mod tests {
         cordons.set_draining(&inner, &fleet, &instance, true, crate::acquisition::test_acquisition())
             .await?;
         let maximum = Tick::from_elapsed(Duration::MAX);
-        cordons.retain(maximum, Duration::MAX, &[], crate::acquisition::test_acquisition()).await;
-        cordons.retain(Tick::ORIGIN, Duration::ZERO, &[], crate::acquisition::test_acquisition()).await;
+        cordons.retain(maximum, Duration::MAX, &[], crate::acquisition::test_acquisition()).await?;
+        cordons.retain(Tick::ORIGIN, Duration::ZERO, &[], crate::acquisition::test_acquisition()).await?;
         assert_eq!(snapshot(&cordons).await.len(), 1);
-        cordons.retain(maximum, Duration::ZERO, &[], crate::acquisition::test_acquisition()).await;
+        cordons.retain(maximum, Duration::ZERO, &[], crate::acquisition::test_acquisition()).await?;
         assert!(snapshot(&cordons).await.is_empty());
         cordons.set_draining(&inner, &fleet, &instance, true, crate::acquisition::test_acquisition())
             .await?;
-        cordons.retain(Tick::ORIGIN, Duration::MAX, &[], crate::acquisition::test_acquisition()).await;
-        cordons.retain(Tick::from_elapsed(Duration::MAX.saturating_sub(Duration::from_nanos(1))), Duration::MAX, &[], crate::acquisition::test_acquisition())
-            .await;
+        cordons.retain(Tick::ORIGIN, Duration::MAX, &[], crate::acquisition::test_acquisition()).await?;
+        cordons.retain(Tick::from_elapsed(Duration::MAX.saturating_sub(Duration::from_nanos(1))), Duration::MAX, &[], crate::acquisition::test_acquisition()).await?;
         assert_eq!(snapshot(&cordons).await.len(), 1);
-        cordons.retain(maximum, Duration::MAX, &[], crate::acquisition::test_acquisition()).await;
+        cordons.retain(maximum, Duration::MAX, &[], crate::acquisition::test_acquisition()).await?;
         assert!(snapshot(&cordons).await.is_empty());
         Ok(())
     }

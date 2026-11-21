@@ -300,6 +300,7 @@ mod tests {
             actions: Arc::new(gang_config::ActionsConfig::default()),
             scaling: Arc::new(gang_config::ScalingConfig::default()),
             clock: Arc::new(gang_clock::SystemClock::new()),
+            control_acquire_timeout: gang_types::NonZeroDuration::from_secs(1),
             content_store: &content,
             action_store: &action,
             fleets: &fleets,

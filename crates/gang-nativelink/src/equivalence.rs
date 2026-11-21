@@ -156,6 +156,7 @@ fn controller_spec<'a>(
         actions: std::sync::Arc::new(gang_config::ActionsConfig::default()),
         scaling: std::sync::Arc::new(gang_config::ScalingConfig::default()),
         clock: std::sync::Arc::new(gang_clock::SystemClock::new()),
+        control_acquire_timeout: gang_types::NonZeroDuration::from_secs(1),
         content_store: content,
         action_store: action,
         fleets,

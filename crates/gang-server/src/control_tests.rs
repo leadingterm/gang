@@ -1212,6 +1212,53 @@ async fn failed_snapshot_skips_the_pass_without_touching_the_fleet() -> Result<(
 }
 
 #[tokio::test]
+async fn held_scheduler_acquisition_skips_and_next_pass_retries() -> TestResult {
+    let clock = clock_at(1_000_000);
+    let fleets = fleets();
+    let fleet = FakeProvisioner::default();
+    let scheduler = FakeScheduler::with_control_acquire_timeout(clock.clone(), POLL_INTERVAL)?;
+    let repository = FakeRepository::default();
+    let hub = hub();
+    scheduler.set_snapshot(queued_snapshot()?);
+    let guard = scheduler.hold_control_acquisition().await;
+    let mut control = ControlLoop::new(
+        &fleets,
+        crate::control::ControlSettings::new(POLL_INTERVAL, &gang_config::DashboardConfig::default()),
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        gang_types::nonzero_u32(2),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
+        gang_testkit::fence::valid_fence(),
+    )
+    .with_publisher(publisher(&hub));
+    {
+        let pass = control.pass();
+        futures::pin_mut!(pass);
+        assert!(poll!(pass.as_mut()).is_pending());
+        clock.advance(BEFORE_POLL);
+        assert!(poll!(pass.as_mut()).is_pending());
+        clock.advance(TICK);
+        assert_eq!(pass.await, PassOutcome::Skipped(SkipReason::SchedulerUnavailable));
+    }
+    let state = served(&hub);
+    assert_eq!(state.pass.state, PassState::Skipped);
+    assert_eq!(state.pass.skip_reason, Some(SkipReason::SchedulerUnavailable));
+    assert!(fleet.desired_requests().is_empty());
+    assert!(scheduler.draining_calls().is_empty());
+    assert!(scheduler.retain_drains_calls().is_empty());
+    assert!(repository.scaling_events().is_empty());
+    drop(guard);
+    assert_eq!(control.pass().await, PassOutcome::Completed { applied: 1, failed: 0 });
+    assert_eq!(fleet.desired_requests().len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn failed_supply_skips_the_pass_without_applying_steps() -> Result<(), PortError> {
     let clock = clock_at(1_000_000);
     let fleets = fleets();

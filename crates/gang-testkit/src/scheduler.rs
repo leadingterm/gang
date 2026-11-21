@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use futures::future::BoxFuture;
-use gang_clock::{Tick, Timestamp};
+use gang_clock::{Clock, Tick, Timestamp};
 use gang_spi::{
     ActionsView, Admitted, ApiRequestBody, ApiResponseBody, ApiService, BoxedConnection,
     ControllerConnections, ControllerEndpoints, ControllerReady, ControllerSpec, FleetSupply,
@@ -19,7 +19,7 @@ use gang_spi::{
     RecordKind, Rejection, RequestGate, RequestScope, SchedulerPort, SchedulerSnapshot, WorkerSpec,
     WorkerTls, full_body,
 };
-use gang_types::{Bytes, FleetName, FleetProperties, InstanceId, WorkerLifetime};
+use gang_types::{Bytes, FleetName, FleetProperties, InstanceId, NonZeroDuration, WorkerLifetime};
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot, watch};
 use url::Url;
@@ -518,6 +518,8 @@ impl Drop for PublishedStandby<'_> {
 pub struct FakeScheduler {
     /// The state shared by every clone.
     state: Arc<Mutex<SchedulerState>>,
+    /// Optional contention model for control acquisitions.
+    acquisition: Option<Arc<ControlAcquisition>>,
     /// The controller `run_controller` publishes; `controller` waits for it.
     published: Arc<watch::Sender<Option<Controller>>>,
     /// The services of the independently running standby transport.
@@ -538,6 +540,12 @@ pub struct FakeScheduler {
     refusal_runs: CallCount,
 }
 
+struct ControlAcquisition {
+    clock: Arc<dyn Clock>,
+    timeout: NonZeroDuration,
+    mutex: tokio::sync::Mutex<()>,
+}
+
 impl FakeScheduler {
     /// Creates a scheduler whose worker endpoint uses the `grpcs` scheme, as a worker with TLS
     /// dials.
@@ -547,6 +555,51 @@ impl FakeScheduler {
     /// [`url::ParseError`] if the endpoint cannot be parsed; it always can.
     pub fn new() -> Result<Self, url::ParseError> {
         Self::with_scheme("grpcs")
+    }
+
+    /// Creates a fake whose control calls have a bounded shared lock acquisition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an endpoint parsing error if the built-in endpoint cannot be parsed.
+    pub fn with_control_acquire_timeout(
+        clock: Arc<dyn Clock>,
+        timeout: NonZeroDuration,
+    ) -> Result<Self, url::ParseError> {
+        let mut scheduler = Self::new()?;
+        scheduler.acquisition = Some(Arc::new(ControlAcquisition {
+            clock,
+            timeout,
+            mutex: tokio::sync::Mutex::new(()),
+        }));
+        Ok(scheduler)
+    }
+
+    /// Holds the configured control lock until the returned guard is dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this fake was not created with a control acquisition timeout.
+    pub async fn hold_control_acquisition(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.acquisition
+            .as_ref()
+            .expect("control acquisition must be configured")
+            .mutex
+            .lock()
+            .await
+    }
+
+    async fn acquire_control(&self) -> Result<Option<tokio::sync::MutexGuard<'_, ()>>, PortError> {
+        let Some(acquisition) = &self.acquisition else {
+            return Ok(None);
+        };
+        let deadline = acquisition.clock.monotonic() + acquisition.timeout.get();
+        acquisition
+            .clock
+            .timeout_at(deadline, acquisition.mutex.lock())
+            .await
+            .map(Some)
+            .map_err(|_| PortError::unavailable("scheduler control acquisition timed out"))
     }
 
     /// Creates a scheduler whose worker endpoint uses the plain `grpc` scheme, which is what a
@@ -580,6 +633,7 @@ impl FakeScheduler {
                 refusal_drain_hold: None,
                 ready_hold: None,
             })),
+            acquisition: None,
             published: Arc::new(watch::channel::<Option<Controller>>(None).0),
             standby: Arc::new(watch::channel::<Option<StandbyServices>>(None).0),
             controller_runs: CallCount::new(),
@@ -854,6 +908,7 @@ impl SchedulerPort for FakeScheduler {
     }
 
     async fn snapshot(&self, into: &mut SchedulerSnapshot) -> Result<(), PortError> {
+        let _acquisition = self.acquire_control().await?;
         let hold = self.state.lock().snapshot_hold.take();
         self.snapshots.bump();
         if let Some(hold) = hold {
@@ -895,6 +950,7 @@ impl SchedulerPort for FakeScheduler {
         instance: &InstanceId,
         draining: bool,
     ) -> Result<(), PortError> {
+        let _acquisition = self.acquire_control().await?;
         self.state
             .lock()
             .draining_calls
@@ -908,6 +964,7 @@ impl SchedulerPort for FakeScheduler {
         grace: Duration,
         live: &[(&FleetName, &FleetSupply)],
     ) -> Result<(), PortError> {
+        let _acquisition = self.acquire_control().await?;
         let census = live
             .iter()
             .flat_map(|(fleet, supply)| {
@@ -2013,6 +2070,7 @@ mod tests {
             actions: Arc::new(gang_config::ActionsConfig::default()),
             scaling: Arc::new(gang_config::ScalingConfig::default()),
             clock: Arc::new(gang_clock::TestClock::new(Timestamp::UNIX_EPOCH)),
+            control_acquire_timeout: NonZeroDuration::from_secs(1),
             content_store: &stores,
             action_store: &stores,
             fleets: &catalog,
@@ -2117,6 +2175,7 @@ mod tests {
             actions: Arc::new(gang_config::ActionsConfig::default()),
             scaling: Arc::new(gang_config::ScalingConfig::default()),
             clock: Arc::new(gang_clock::TestClock::new(Timestamp::UNIX_EPOCH)),
+            control_acquire_timeout: NonZeroDuration::from_secs(1),
             content_store: &stores,
             action_store: &stores,
             fleets: &catalog,
@@ -2343,6 +2402,7 @@ mod tests {
             actions: Arc::new(gang_config::ActionsConfig::default()),
             scaling: Arc::new(gang_config::ScalingConfig::default()),
             clock: Arc::new(gang_clock::TestClock::new(Timestamp::UNIX_EPOCH)),
+            control_acquire_timeout: NonZeroDuration::from_secs(1),
             content_store: &stores,
             action_store: &stores,
             fleets: &catalog,
@@ -2389,6 +2449,7 @@ mod tests {
             actions: Arc::new(gang_config::ActionsConfig::default()),
             scaling: Arc::new(gang_config::ScalingConfig::default()),
             clock: Arc::new(gang_clock::TestClock::new(Timestamp::UNIX_EPOCH)),
+            control_acquire_timeout: NonZeroDuration::from_secs(1),
             content_store: &stores,
             action_store: &stores,
             fleets: &catalog,
