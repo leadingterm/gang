@@ -27,7 +27,11 @@ mod tests {
             create_time: Timestamp::from_unix_millis(0),
             fleet: "fleets/alpha".to_owned(),
             cause: None,
-            change: EventChange::ScaledOut { from: 1, to: 2 },
+            change: EventChange::ScaledOut {
+                from: 1,
+                to: 2,
+                detail: None,
+            },
         }
     }
 

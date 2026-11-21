@@ -1,5 +1,5 @@
 {
-  "checksum": "9c011f1726b1088f43dfcaddf6aa6dfb61590b0cab37d4f6e1a7912ab656ec06",
+  "checksum": "d51261014239092de819bcafac22fd325146d842d1efffc9448a9dcabee84db4",
   "crates": {
     "adler2 2.0.1": {
       "name": "adler2",
@@ -15631,6 +15631,31 @@
         "compile_data_glob": [
           "**"
         ],
+        "deps": {
+          "common": [
+            {
+              "id": "lru 0.18.5",
+              "target": "lru"
+            },
+            {
+              "id": "parking_lot 0.12.5",
+              "target": "parking_lot"
+            },
+            {
+              "id": "serde 1.0.229",
+              "target": "serde"
+            },
+            {
+              "id": "serde_json 1.0.154",
+              "target": "serde_json"
+            },
+            {
+              "id": "sha2 0.11.1",
+              "target": "sha2"
+            }
+          ],
+          "selects": {}
+        },
         "deps_dev": {
           "common": [
             {

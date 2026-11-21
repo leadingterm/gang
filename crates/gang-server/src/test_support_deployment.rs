@@ -201,6 +201,7 @@ pub fn tls_settings() -> ServerSettings {
             kill_grace: NonZeroDuration::from_secs(7),
             ..gang_config::ActionsConfig::default()
         }),
+        scaling: Arc::new(gang_config::ScalingConfig::default()),
         proxy_protocol: std::sync::Arc::new(gang_config::ProxyProtocolConfig::default()),
         leadership: gang_config::LeadershipConfig::default(),
         standby_routability_delay: Duration::ZERO,

@@ -157,7 +157,7 @@ pub(crate) struct ScalingRow {
     pub(crate) to_capacity: Option<i64>,
     pub(crate) subject: Option<String>,
     pub(crate) cause: Option<&'static str>,
-    /// The failure record for an early worker exit or a launch failure, when present.
+    /// The decision summary or launch/exit failure detail, when present.
     pub(crate) detail: Option<String>,
 }
 
@@ -165,6 +165,10 @@ impl TryFrom<&ScalingAuditEvent> for ScalingRow {
     type Error = SqliteError;
 
     fn try_from(event: &ScalingAuditEvent) -> Result<Self, Self::Error> {
+        event
+            .kind
+            .validate()
+            .map_err(|error| corrupt(error.field(), &error))?;
         let stored = event.kind.stored();
         Ok(Self {
             at: millis(event.at)?,
@@ -303,7 +307,11 @@ mod tests {
     fn scaled_out_keeps_both_capacities_and_no_subject() {
         let row = ScalingRow::try_from(&event(
             1_700,
-            ScalingEventKind::ScaledOut { from: 2, to: 5 },
+            ScalingEventKind::ScaledOut {
+                from: 2,
+                to: 5,
+                detail: None,
+            },
         ))
         .expect("row maps");
         assert_eq!(
@@ -325,8 +333,14 @@ mod tests {
     fn drain_started_keeps_worker_as_subject() {
         let worker = WorkerId::try_new("i-0abc123-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b")
             .expect("worker id is valid");
-        let row = ScalingRow::try_from(&event(1, ScalingEventKind::DrainStarted { worker }))
-            .expect("row maps");
+        let row = ScalingRow::try_from(&event(
+            1,
+            ScalingEventKind::DrainStarted {
+                worker,
+                detail: None,
+            },
+        ))
+        .expect("row maps");
         assert_eq!(row.kind, "drain_started");
         assert_eq!(row.from_capacity, None);
         assert_eq!(row.to_capacity, None);
@@ -432,7 +446,14 @@ mod tests {
 
     #[test]
     fn cause_is_stored_as_its_canonical_name() -> Result<(), SqliteError> {
-        let mut audit = event(1, ScalingEventKind::ScaledOut { from: 1, to: 2 });
+        let mut audit = event(
+            1,
+            ScalingEventKind::ScaledOut {
+                from: 1,
+                to: 2,
+                detail: None,
+            },
+        );
         audit.cause = Some(ScalingCause::IdleTimeout);
         let row = ScalingRow::try_from(&audit)?;
         assert_eq!(row.cause, Some("idle_timeout"));
@@ -454,7 +475,14 @@ mod tests {
                 detail TEXT
             ) STRICT;",
         );
-        let mut audit = event(1_700, ScalingEventKind::ScaledOut { from: 1, to: 2 });
+        let mut audit = event(
+            1_700,
+            ScalingEventKind::ScaledOut {
+                from: 1,
+                to: 2,
+                detail: None,
+            },
+        );
         audit.cause = Some(ScalingCause::IdleTimeout);
         let row = ScalingRow::try_from(&audit).expect("row maps");
         conn.execute(
@@ -878,7 +906,14 @@ mod tests {
             read_row(&select, scaling_from_row).expect("valid row maps"),
             RecordedScalingEvent {
                 seq: ScalingEventSeq::new(7),
-                event: event(1_700, ScalingEventKind::ScaledOut { from: 2, to: 5 }),
+                event: event(
+                    1_700,
+                    ScalingEventKind::ScaledOut {
+                        from: 2,
+                        to: 5,
+                        detail: None
+                    }
+                ),
             }
         );
     }

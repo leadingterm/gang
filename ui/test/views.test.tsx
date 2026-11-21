@@ -282,6 +282,12 @@ test("a minimum cause is shown without caution styling", (t) => {
   t.assert.doesNotMatch(row, /caution/);
 });
 
+test("a utilization cordon explains the dwell without caution styling", (t) => {
+  const row = render(<EventRow withCause e={{ ...common, cause: "UTILIZATION", drainStarted: { worker: `workers/${WORKER}`, detail: "load 0.0 slots" } }} />);
+  t.assert.match(row, /<span class="event__cause">measured fleet load stayed below the waterline for the dwell<\/span>/);
+  t.assert.doesNotMatch(row, /caution/);
+});
+
 test("an early exit names the instance and shows its failure", (t) => {
   const failure = "fail  gang worker: the scratch volume is too small";
   const row = render(<EventRow withCause e={{ ...common, exitedEarly: { instance: "instances/local-1", failure } }} />);
@@ -370,6 +376,31 @@ test("fleet details show measured readiness and expected wait independently, inc
   const zero = details("0s", "0s");
   t.assert.match(zero, /<dt>measured readiness<\/dt><dd><time>0s<\/time><\/dd>/);
   t.assert.match(zero, /<dt>expected wait<\/dt><dd><time>0s<\/time><\/dd>/);
+});
+
+test("fleet details show rate diagnostics independently, preserving zero and units", (t) => {
+  const fleet = live.fleets[0];
+  if (!fleet) throw new Error("the live recording has a fleet");
+  const { running, queued, candidates, needed, vcpus, memory } = fleet.demand;
+  const details = (load?: number, backlog?: string, utilization?: number) =>
+    render(<TapeKey census={live} f={{ ...fleet, demand: {
+      running, queued, candidates, needed, vcpus, memory,
+      ...(load !== undefined ? { load } : {}),
+      ...(backlog !== undefined ? { backlog } : {}),
+      ...(utilization !== undefined ? { utilization } : {}),
+    } }} />);
+  const all = details(125, "42s", 735);
+  t.assert.match(all, /<dt>load<\/dt><dd>12\.5 slots<\/dd>/);
+  t.assert.match(all, /<dt>backlog<\/dt><dd><time>42s<\/time><\/dd>/);
+  t.assert.match(all, /<dt>utilization<\/dt><dd>73\.5%<\/dd>/);
+  const zero = details(0, "0s", 0);
+  t.assert.match(zero, /<dt>load<\/dt><dd>0\.0 slots<\/dd>/);
+  t.assert.match(zero, /<dt>backlog<\/dt><dd><time>0s<\/time><\/dd>/);
+  t.assert.match(zero, /<dt>utilization<\/dt><dd>0%<\/dd>/);
+  t.assert.doesNotMatch(details(), /<dt>load<\/dt>|<dt>backlog<\/dt>|<dt>utilization<\/dt>/);
+  t.assert.doesNotMatch(details(1), /<dt>backlog<\/dt>|<dt>utilization<\/dt>/);
+  t.assert.doesNotMatch(details(undefined, "1s"), /<dt>load<\/dt>|<dt>utilization<\/dt>/);
+  t.assert.doesNotMatch(details(undefined, undefined, 1), /<dt>load<\/dt>|<dt>backlog<\/dt>/);
 });
 
 test("open worker detail names running actions and falls back to the digest", (t) => {

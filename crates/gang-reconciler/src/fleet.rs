@@ -43,6 +43,12 @@ pub struct FleetOutlook {
     pub readiness: Option<Duration>,
     /// Latest predicted start of an attributed queued action at planned capacity.
     pub expected_wait: Option<Duration>,
+    /// Persistent offered load in deci-slots.
+    pub load: Option<u32>,
+    /// Transient slot-time, rounded to seconds before readiness subtraction.
+    pub backlog: Option<Duration>,
+    /// Instantaneous serving resource occupancy in permille; measured zero is retained.
+    pub utilization: Option<u16>,
     /// The fleet's workers, unconnected instances, and running actions.
     pub workers: WorkerCounts,
 }

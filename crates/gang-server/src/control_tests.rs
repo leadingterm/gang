@@ -166,16 +166,19 @@ async fn mid_pass_lapse_forgets_unapplied_termination() -> TestResult {
         release_first: false,
     });
     fleet.inner.set_supply(&fleet_name(), supply);
-    scheduler.set_snapshot(snapshot_with(vec![
-        WorkerState {
-            draining: true,
-            ..idle_worker(&first, clock.wall())?
-        },
-        WorkerState {
-            draining: true,
-            ..idle_worker(&second, clock.wall())?
-        },
-    ]));
+    scheduler.set_snapshot(SchedulerSnapshot {
+        cordons: vec![owned_cordon(&first), owned_cordon(&second)],
+        ..snapshot_with(vec![
+            WorkerState {
+                draining: true,
+                ..idle_worker(&first, clock.wall())?
+            },
+            WorkerState {
+                draining: true,
+                ..idle_worker(&second, clock.wall())?
+            },
+        ])
+    });
     let id = gang_spi::ControllerId::new("test");
     let leader = crate::leadership::Leadership::new(
         &repository,
@@ -204,10 +207,14 @@ async fn mid_pass_lapse_forgets_unapplied_termination() -> TestResult {
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         leader.fence().clone(),
     );
     assert_eq!(
@@ -249,6 +256,20 @@ fn queued_snapshot() -> Result<SchedulerSnapshot, PortError> {
         )],
         ..SchedulerSnapshot::default()
     })
+}
+
+fn owned_cordon(instance: &InstanceId) -> gang_spi::InstanceCordon {
+    gang_spi::InstanceCordon {
+        fleet: 0,
+        instance: Arc::new(instance.clone()),
+    }
+}
+
+fn source_profiles() -> gang_reconciler::SourceProfiles {
+    gang_reconciler::SourceProfiles::new(
+        &gang_config::ScalingConfig::default(),
+        gang_config::ActionsConfig::default().history_window,
+    )
 }
 
 /// A supply with one in-service instance `name` launched at `launched_at`, and desired capacity
@@ -307,10 +328,14 @@ async fn lapsed_leader_does_not_record_worker_registration() -> TestResult {
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         leader.fence().clone(),
     );
     control.pass().await;
@@ -349,10 +374,14 @@ async fn lapsed_leader_converges_no_fleet() -> TestResult {
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         fence,
     );
     assert_eq!(
@@ -389,10 +418,14 @@ async fn a_lease_lapsing_during_converge_skips_the_pass_as_lapsed() -> TestResul
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         fence,
     );
     assert_eq!(
@@ -426,10 +459,14 @@ async fn a_converge_failure_while_the_lease_holds_skips_as_provisioner_unavailab
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         fence,
     );
     assert_eq!(
@@ -453,10 +490,14 @@ async fn leader_converges_every_fleet_before_reading_it() -> TestResult {
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
     control.pass().await;
@@ -499,10 +540,14 @@ async fn a_supplied_exit_is_recorded_as_an_exited_early_event() -> TestResult {
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
     control.pass().await;
@@ -549,10 +594,14 @@ async fn exit_survives_failed_audit() -> TestResult {
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
 
@@ -568,10 +617,14 @@ async fn exit_survives_failed_audit() -> TestResult {
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
     control.pass().await;
@@ -638,10 +691,14 @@ async fn exit_survives_leadership_lapse() -> TestResult {
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         leader.fence().clone(),
     );
 
@@ -661,10 +718,14 @@ async fn exit_survives_leadership_lapse() -> TestResult {
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         leader.fence().clone(),
     );
     control.pass().await;
@@ -711,10 +772,14 @@ async fn exit_survives_failed_acknowledgement() -> TestResult {
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
     control.pass().await;
@@ -741,10 +806,14 @@ async fn exit_survives_failed_acknowledgement() -> TestResult {
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
     control.pass().await;
@@ -770,10 +839,14 @@ async fn launch_failures_are_recorded_once_per_reason_until_request_is_met() -> 
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
     let mut supply = supply_with("local-1", clock.wall(), 3);
@@ -861,10 +934,14 @@ async fn failed_unneeded_request_is_withdrawn_and_audited() -> TestResult {
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
     control.pass().await;
@@ -897,10 +974,14 @@ async fn an_abandoned_request_is_withdrawn_and_audited_once() -> TestResult {
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
 
@@ -942,6 +1023,7 @@ async fn terminations_and_withdrawal_in_one_pass_never_raise_desired() -> TestRe
     });
     fleet.set_supply(&fleet_name(), supply);
     scheduler.set_snapshot(SchedulerSnapshot {
+        cordons: vec![owned_cordon(&first), owned_cordon(&second)],
         workers: vec![
             WorkerState {
                 draining: true,
@@ -960,10 +1042,14 @@ async fn terminations_and_withdrawal_in_one_pass_never_raise_desired() -> TestRe
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
     control.pass().await;
@@ -1000,10 +1086,14 @@ async fn queued_action_scales_out_from_an_empty_fleet() -> Result<(), PortError>
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
 
@@ -1019,7 +1109,11 @@ async fn queued_action_scales_out_from_an_empty_fleet() -> Result<(), PortError>
     assert_eq!(events.len(), 1);
     assert!(matches!(
         events[0].kind,
-        ScalingEventKind::ScaledOut { from: 0, to: 1 }
+        ScalingEventKind::ScaledOut {
+            from: 0,
+            to: 1,
+            detail: Some(_)
+        }
     ));
     assert_eq!(events[0].cause, Some(ScalingCause::Demand));
     Ok(())
@@ -1040,10 +1134,14 @@ async fn failed_capacity_request_records_no_audit_event() -> Result<(), PortErro
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
 
@@ -1073,10 +1171,14 @@ async fn failed_snapshot_skips_the_pass_without_touching_the_fleet() -> Result<(
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
 
@@ -1104,10 +1206,14 @@ async fn failed_supply_skips_the_pass_without_applying_steps() -> Result<(), Por
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
 
@@ -1137,10 +1243,14 @@ async fn failed_supply_defers_worker_registration_until_a_completed_pass() -> Te
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     )
     .with_publisher(publisher(&hub));
@@ -1193,10 +1303,14 @@ async fn unconfigured_fleet_worker_joins_and_leaves_without_audit_events() -> Te
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     )
     .with_publisher(publisher(&hub));
@@ -1239,10 +1353,14 @@ async fn drain_of_a_worker_that_left_is_neither_applied_nor_audited() -> TestRes
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
 
@@ -1254,7 +1372,6 @@ async fn drain_of_a_worker_that_left_is_neither_applied_nor_audited() -> TestRes
         }
     );
     clock.advance(Duration::from_secs(15));
-    scheduler.vanish(worker_on(&name)?);
     scheduler.set_snapshot(SchedulerSnapshot::default());
 
     assert_eq!(
@@ -1301,10 +1418,14 @@ async fn idle_worker_is_drained_then_terminated_once_empty() -> TestResult {
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
 
@@ -1325,6 +1446,7 @@ async fn idle_worker_is_drained_then_terminated_once_empty() -> TestResult {
         }
     );
     scheduler.set_snapshot(SchedulerSnapshot {
+        cordons: vec![owned_cordon(&name)],
         workers: vec![WorkerState {
             draining: true,
             ..idle_worker(&name, clock.wall())?
@@ -1382,6 +1504,7 @@ async fn a_draining_worker_with_new_demand_is_resumed() -> TestResult {
         supply_with("local-1", Timestamp::from_unix_millis(0), 1),
     );
     scheduler.set_snapshot(SchedulerSnapshot {
+        cordons: vec![owned_cordon(&name)],
         workers: vec![WorkerState {
             draining: true,
             ..idle_worker(&name, clock.wall())?
@@ -1394,10 +1517,14 @@ async fn a_draining_worker_with_new_demand_is_resumed() -> TestResult {
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
 
@@ -1408,7 +1535,10 @@ async fn a_draining_worker_with_new_demand_is_resumed() -> TestResult {
             failed: 0,
         }
     );
-    assert_eq!(scheduler.draining_calls(), vec![(worker_on(&name)?, false)]);
+    assert_eq!(
+        scheduler.draining_calls(),
+        vec![(fleet_name(), name.clone(), false)]
+    );
     assert!(fleet.desired_requests().is_empty());
 
     let events = repository.scaling_events();
@@ -1451,10 +1581,14 @@ async fn an_idle_worker_is_drained() -> TestResult {
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
 
@@ -1475,7 +1609,10 @@ async fn an_idle_worker_is_drained() -> TestResult {
             failed: 0,
         }
     );
-    assert_eq!(scheduler.draining_calls(), vec![(worker_on(&name)?, true)]);
+    assert_eq!(
+        scheduler.draining_calls(),
+        vec![(fleet_name(), name.clone(), true)]
+    );
     assert!(fleet.terminations().is_empty());
 
     let events = repository.scaling_events();
@@ -1519,10 +1656,14 @@ async fn early_exit_clears_only_the_matching_fleet_termination() -> TestResult {
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
     assert_eq!(
@@ -1596,10 +1737,14 @@ async fn early_exit_clears_a_failed_termination_without_a_termination_audit() ->
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
     assert_eq!(
@@ -1679,10 +1824,14 @@ async fn failed_termination_of_live_worker_is_cancelled_when_demand_returns() ->
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
     assert_eq!(
@@ -1701,6 +1850,7 @@ async fn failed_termination_of_live_worker_is_cancelled_when_demand_returns() ->
         }
     );
     scheduler.set_snapshot(SchedulerSnapshot {
+        cordons: vec![owned_cordon(&name)],
         workers: vec![WorkerState {
             draining: true,
             ..idle_worker(&name, clock.wall())?
@@ -1717,6 +1867,7 @@ async fn failed_termination_of_live_worker_is_cancelled_when_demand_returns() ->
     );
     fleet.fail_terminate(false);
     scheduler.set_snapshot(SchedulerSnapshot {
+        cordons: vec![owned_cordon(&name)],
         workers: vec![WorkerState {
             draining: true,
             ..idle_worker(&name, clock.wall())?
@@ -1733,7 +1884,10 @@ async fn failed_termination_of_live_worker_is_cancelled_when_demand_returns() ->
     assert!(fleet.terminations().is_empty());
     assert_eq!(
         scheduler.draining_calls(),
-        vec![(worker_on(&name)?, true), (worker_on(&name)?, false)]
+        vec![
+            (fleet_name(), name.clone(), true),
+            (fleet_name(), name.clone(), false),
+        ]
     );
     assert!(
         !repository
@@ -1783,10 +1937,14 @@ async fn committed_termination_is_retried_after_supply_disappears_or_terminates(
                 POLL_INTERVAL,
                 &gang_config::DashboardConfig::default(),
             ),
-            &fleet,
-            &scheduler,
-            &repository,
-            &clock,
+            Arc::new(gang_config::ScalingConfig::default()),
+            source_profiles(),
+            &crate::control::ControlPorts {
+                provisioner: &fleet,
+                scheduler: &scheduler,
+                repository: &repository,
+                clock: &clock,
+            },
             gang_testkit::fence::valid_fence(),
         );
 
@@ -1806,6 +1964,7 @@ async fn committed_termination_is_retried_after_supply_disappears_or_terminates(
             }
         );
         scheduler.set_snapshot(SchedulerSnapshot {
+            cordons: vec![owned_cordon(&name)],
             workers: vec![WorkerState {
                 draining: true,
                 ..idle_worker(&name, clock.wall())?
@@ -1879,10 +2038,14 @@ async fn failed_terminate_is_planned_again_on_the_next_pass() {
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
 
@@ -1943,10 +2106,14 @@ async fn audit_failure_still_counts_the_step_as_applied() -> Result<(), PortErro
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
 
@@ -1963,8 +2130,17 @@ async fn audit_failure_still_counts_the_step_as_applied() -> Result<(), PortErro
 }
 
 #[tokio::test]
-async fn overflow_from_a_full_fleet_depends_on_running_action_duration() -> TestResult {
-    for (seconds, applied) in [(2, 0), (60, 1)] {
+async fn overflow_purchase_depends_on_queued_work_not_other_fleet_execution_duration() -> TestResult
+{
+    // The first candidate is reachable, so there is no floor purchase on the second fleet.
+    // Its 10s unknown backlog is below s*H = 4 * (30s + 15s) / 2 = 90 action-seconds;
+    // a known 120s queued action exceeds that threshold, regardless of the first fleet's work.
+    for (seconds, queued_duration, applied) in [
+        (2, None, 0),
+        (60, None, 0),
+        (2, Some(Duration::from_mins(2)), 1),
+        (60, Some(Duration::from_mins(2)), 1),
+    ] {
         let clock = clock_at(1_000_000);
         let fleet = FakeProvisioner::default();
         let scheduler = FakeScheduler::new().expect("the scheduler fake builds");
@@ -1973,17 +2149,20 @@ async fn overflow_from_a_full_fleet_depends_on_running_action_duration() -> Test
         let first = FleetName::try_new("first").expect("first is a valid fleet name");
         let second = FleetName::try_new("second").expect("second is a valid fleet name");
         fleet.set_supply(&first, supply_with("first-1", clock.wall(), 1));
+        let mut queued = queued_demand(FleetSet::prefix(2).map_err(PortError::backend)?);
+        queued.expected = queued_duration;
         scheduler.set_snapshot(SchedulerSnapshot {
             workers: vec![WorkerState {
                 fleet: first.clone(),
                 running_actions: 4,
                 ..idle_worker(&instance_id("first-1"), clock.wall())?
             }],
-            queued: vec![queued_demand(
-                FleetSet::prefix(2).map_err(PortError::backend)?,
-            )],
+            queued: vec![queued],
             executing: (0..4)
                 .map(|_| ExecutingDemand {
+                    source: None,
+                    candidates: FleetSet::prefix(1).expect("one fleet is valid"),
+                    resources: gang_types::ActionResources::default(),
                     worker: 0,
                     started: clock.wall(),
                     expected: Some(Duration::from_secs(seconds)),
@@ -1997,19 +2176,23 @@ async fn overflow_from_a_full_fleet_depends_on_running_action_duration() -> Test
                 POLL_INTERVAL,
                 &gang_config::DashboardConfig::default(),
             ),
-            &fleet,
-            &scheduler,
-            &repository,
-            &clock,
+            Arc::new(gang_config::ScalingConfig::default()),
+            source_profiles(),
+            &crate::control::ControlPorts {
+                provisioner: &fleet,
+                scheduler: &scheduler,
+                repository: &repository,
+                clock: &clock,
+            },
             gang_testkit::fence::valid_fence(),
         );
 
         assert_eq!(
             control.pass().await,
             PassOutcome::Completed { applied, failed: 0 },
-            "running action duration: {seconds}s"
+            "running action: {seconds}s; queued action duration: {queued_duration:?}"
         );
-        let expected_requests = if seconds == 60 {
+        let expected_requests = if applied == 1 {
             vec![(second, 1)]
         } else {
             vec![]
@@ -2017,7 +2200,7 @@ async fn overflow_from_a_full_fleet_depends_on_running_action_duration() -> Test
         assert_eq!(
             fleet.desired_requests(),
             expected_requests,
-            "running action duration: {seconds}s"
+            "running action: {seconds}s; queued action duration: {queued_duration:?}"
         );
     }
     Ok(())
@@ -2036,10 +2219,14 @@ async fn each_fleet_supply_is_refreshed_in_declaration_order() {
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
 
@@ -2109,10 +2296,14 @@ async fn registrations_follow_snapshot_worker_id_order() -> TestResult {
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
 
@@ -2173,10 +2364,14 @@ async fn vanished_worker_is_recorded_as_deregistered_from_the_fleet_it_was_in() 
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
 
@@ -2248,10 +2443,14 @@ async fn unchanged_worker_set_records_nothing_on_the_next_pass() -> TestResult {
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
 
@@ -2305,10 +2504,14 @@ async fn failed_worker_event_recording_is_not_published() -> TestResult {
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     )
     .with_publisher(publisher(&hub));
@@ -2392,10 +2595,14 @@ async fn completed_pass_publishes_an_ok_pass_with_the_fleet_rows() -> Result<(),
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     )
     .with_publisher(publisher(&hub));
@@ -2435,10 +2642,14 @@ async fn skipped_pass_publishes_its_reason_with_no_good_pass_before() -> Result<
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     )
     .with_publisher(publisher(&hub));
@@ -2474,10 +2685,14 @@ async fn skipped_pass_reports_the_last_good_pass_and_keeps_the_rows() -> Result<
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     )
     .with_publisher(publisher(&hub));
@@ -2525,10 +2740,14 @@ async fn worker_joins_recorded_in_a_pass_are_in_that_pass_state() -> TestResult 
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     )
     .with_publisher(publisher(&hub));
@@ -2577,10 +2796,14 @@ async fn run_passes_at_once_then_once_per_poll_interval() -> Result<(), PortErro
             POLL_INTERVAL,
             &gang_config::DashboardConfig::default(),
         ),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     );
     let mut run = pin!(control.run());
@@ -2703,10 +2926,14 @@ async fn infrastructure_delivery_retries_and_replays_without_audit_duplicates() 
     let mut control = ControlLoop::new(
         &fleets,
         crate::control::ControlSettings::new(POLL_INTERVAL, &dashboard),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     )
     .with_publisher(publisher(&initial_hub));
@@ -2749,10 +2976,14 @@ async fn infrastructure_delivery_retries_and_replays_without_audit_duplicates() 
     let mut control = ControlLoop::new(
         &fleets,
         crate::control::ControlSettings::new(POLL_INTERVAL, &dashboard),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     )
     .with_publisher(publisher(&restarted));
@@ -2788,10 +3019,14 @@ async fn capacity_status_preserves_launch_audit_through_redelivery_and_expiry() 
     let mut control = ControlLoop::new(
         &fleets,
         crate::control::ControlSettings::new(POLL_INTERVAL, &dashboard),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     )
     .with_publisher(publisher(&hub));
@@ -2889,10 +3124,14 @@ async fn ordinary_provider_launch_does_not_suppress_worker_registration() -> Tes
     let mut control = ControlLoop::new(
         &fleets,
         crate::control::ControlSettings::new(POLL_INTERVAL, &dashboard),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     )
     .with_publisher(publisher(&hub));
@@ -2929,10 +3168,14 @@ async fn failed_status_reload_clears_expired_risk_without_stopping_reconciliatio
     let mut control = ControlLoop::new(
         &fleets,
         crate::control::ControlSettings::new(POLL_INTERVAL, &dashboard),
-        &fleet,
-        &scheduler,
-        &repository,
-        &clock,
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
         gang_testkit::fence::valid_fence(),
     )
     .with_publisher(publisher(&hub));

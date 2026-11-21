@@ -8,10 +8,29 @@
 - Opt in to isolated public network egress with protected networks for enforcing sandboxes.
 - Configure public action DNS resolvers with `dns_servers`; host and slirp DNS are not used.
 - Bound network setup with `setup_timeout` (default `10s`).
+- **v0.3.4:** Rate-based scale-out separates persistent authenticated-source load from transient backlog; N−1 scale-in cordons the physical instance that empties soonest after a waterline dwell, with returning-load rescue before new purchases.
+- Optional `[scaling]` keys: `payback_percent` (default 50), `load_half_life`, `source_idle`, `max_sources`, `unknown_action_duration`, `readiness_prior`, `scale_in_waterline_percent`, `scale_in_dwell` and `max_cordons`. See [configuration and scaling policy](docs/SPECIFICATION.md#12-cratesgang-configsrc).
+- Persist source activity profiles as fenced learned-history `SourceProfile` records without principal strings, including active checkpoints for a first build.
+- Expose quantized persistent `load`, transient `backlog` and serving `utilization` demand estimates; add the `utilization` scaling cause and optional scale-out/drain decision detail.
+- Extend Gate 2 with `cold-burst-from-zero`, `sustained-stream`, `two-sources` and `utilization-scale-in`; retain trained-burst, short-work and backlog scenarios with explicit duration fixtures.
 
 ### Changed
 
 - Reject unknown platform properties, ungranted network requests and over-ceiling requests at admission instead of silently accepting them.
+- **v0.3.4:** Replace candidate-count payback simulation and the 2B queue-age stream override with resource-vector purchase accounting. Unknown action durations no longer use readiness; cold readiness uses `min(scaling.readiness_prior, fleet.boot_grace)`, without rejecting shorter boot-grace configurations.
+- **v0.3.4 upgrade:** Use `max_cordons = 0` for an initial soak; idle-timeout drains remain enabled. Before the first `utilization` audit row, rollback must restore the old configuration as well as the binary. After that row, v0.3.3 database readers reject the new cause: downgrade is unsupported, not transparent. Optional detail inside known wire event members remains backward-readable. See [restart and rollback](docs/SPECIFICATION.md#5-autoscaler-state--restart).
+
+### Fixed
+
+- **v0.3.4:** Bound persistent-queue scale-out by payback on queued work and qualified genuine arrivals, avoiding overscaling cheap static batches and closed-loop completion waves.
+- **v0.3.4:** Require completion-backed refill in the current cohort before forecasting future arrivals, so finite uploads do not create a sustained-load forecast.
+- **v0.3.4:** Fund the held leader-failover fixture's additional worker with a scenario-local unknown-action duration, without changing its jobs or production defaults.
+- **v0.3.4:** Give the cold-burst fixture a payback horizon that accounts for its minimum disk reservation while retaining the default unknown-action prior.
+- **v0.3.4:** Restore the declared action-environment-probe input and controlled action-local IPC for fresh database-partition probes.
+- **v0.3.4:** Report both held and returning-wave build outcomes in utilization scenario failures instead of discarding their captured output.
+- **v0.3.4:** Declare rate probes explicitly so the checked-in sample passes harness validation.
+- **v0.3.4:** Credit pending and reliable requested capacity without repeatedly raising desired size; keep transient credential-refresh gaps separate from serving surplus and preserve failed-request withdrawal.
+- **v0.3.4:** Keep controller cordons across reconnects and overlapping worker generations within the live engine; do not adopt worker self-drain flags as controller intent. Reset N−1 dwell after skipped passes and keep repeated cordon reinforcement out of audit history.
 
 ## 0.3.3
 

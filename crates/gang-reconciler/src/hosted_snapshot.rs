@@ -34,6 +34,16 @@ impl HostedSnapshot {
         &self.snapshot
     }
 
+    /// Whether the scheduler owns this physical cordon. The producer maintains sorted intents.
+    pub(crate) fn is_cordoned(&self, fleet: usize, instance: &str) -> bool {
+        self.snapshot
+            .cordons
+            .binary_search_by(|cordon| {
+                (cordon.fleet, cordon.instance.as_str()).cmp(&(fleet, instance))
+            })
+            .is_ok()
+    }
+
     /// The indices into `snapshot().workers` of the workers of `fleet` that run on the instance
     /// `id`, in worker id order. A worker registered in another fleet does not host the
     /// instance. Allocates nothing.
@@ -205,6 +215,25 @@ mod tests {
                 .next(),
             Some(0)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn physical_intent_is_independent_of_worker_flags_and_scoped_by_fleet()
+    -> Result<(), Box<dyn Error>> {
+        let mut snapshot = SchedulerSnapshot {
+            workers: vec![worker(worker_id("local-1")?, "x86-fleet")?],
+            cordons: vec![gang_spi::InstanceCordon {
+                fleet: 0,
+                instance: std::sync::Arc::new(InstanceId::try_new("local-1")?),
+            }],
+            ..SchedulerSnapshot::default()
+        };
+        let mut hosted = HostedSnapshot::default();
+        hosted.replace(&mut snapshot);
+        assert!(hosted.is_cordoned(0, "local-1"));
+        assert!(!hosted.is_cordoned(1, "local-1"));
+        assert!(!hosted.snapshot().workers[0].draining);
         Ok(())
     }
 }

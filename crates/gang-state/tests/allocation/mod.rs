@@ -2,6 +2,7 @@
 
 use std::error::Error;
 use std::num::NonZeroU32;
+use std::time::Duration;
 
 use gang_config::FleetPolicy;
 use gang_reconciler::{FleetOutlook, FleetPass, HostedSnapshot, WorkerCounts};
@@ -88,6 +89,9 @@ fn outlook() -> FleetOutlook {
         workers: WorkerCounts::default(),
         readiness: None,
         expected_wait: None,
+        load: Some(125),
+        backlog: Some(Duration::from_secs(42)),
+        utilization: Some(735),
     }
 }
 
@@ -205,6 +209,7 @@ fn scheduler_snapshot() -> Result<SchedulerSnapshot, Box<dyn Error>> {
         workers,
         queued: queued_actions,
         executing: Vec::new(),
+        ..SchedulerSnapshot::default()
     })
 }
 
@@ -260,7 +265,11 @@ fn events() -> Result<Vec<Event>, Box<dyn Error>> {
             create_time: ts(1_000),
             fleet: "fleets/alpha".to_owned(),
             cause: Some(Cause::Demand),
-            change: EventChange::ScaledOut { from: 1, to: 2 },
+            change: EventChange::ScaledOut {
+                from: 1,
+                to: 2,
+                detail: Some("backlog requires capacity".to_owned()),
+            },
         },
         Event {
             name: "events/2".to_owned(),
@@ -269,6 +278,7 @@ fn events() -> Result<Vec<Event>, Box<dyn Error>> {
             cause: Some(Cause::IdleTimeout),
             change: EventChange::DrainStarted {
                 worker: name::of::<name::Workers>(&worker_on(&instance_id(0)?)?),
+                detail: Some("idle timeout elapsed".to_owned()),
             },
         },
         Event {

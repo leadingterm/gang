@@ -3,11 +3,14 @@
 
 use std::convert::Infallible;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gang_clock::{Clock, Interval, Timestamp};
-use gang_config::{DashboardConfig, FleetConfig, Fleets, PluginSet};
-use gang_reconciler::{Action, FleetPass, HostedSnapshot, PassTime, Plan, PlanStep, Reconciler};
+use gang_config::{DashboardConfig, FleetConfig, Fleets, PluginSet, ScalingConfig};
+use gang_reconciler::{
+    Action, FleetPass, HostedSnapshot, PassTime, Plan, PlanStep, Reconciler, SourceProfiles,
+};
 use gang_spi::{
     ExpiringRecordPort, Fence, FleetInfrastructureEvent, InfrastructureEventKind, Insert,
     LeaseLapsed, PortError, ProvisionerPort, Record, RecordId, RecordKey, RecordKind,
@@ -53,6 +56,14 @@ impl ControlSettings {
     }
 }
 
+/// Ports borrowed by the control loop for one leadership term.
+pub(crate) struct ControlPorts<'a, F, S, R, C> {
+    pub(crate) provisioner: &'a F,
+    pub(crate) scheduler: &'a S,
+    pub(crate) repository: &'a R,
+    pub(crate) clock: &'a C,
+}
+
 /// Runs reconcile passes against borrowed ports.
 pub(crate) struct ControlLoop<'a, P: PluginSet, F, S, R, C> {
     /// Configured fleet names used to filter workers.
@@ -84,6 +95,7 @@ pub(crate) struct ControlLoop<'a, P: PluginSet, F, S, R, C> {
     pending_terminations: Vec<PlanStep>,
     reconciler: Reconciler,
     poll_interval: NonZeroDuration,
+    max_boot_grace: Duration,
     provisioner: &'a F,
     scheduler: &'a S,
     repository: &'a R,
@@ -108,19 +120,30 @@ where
     pub(crate) fn new(
         fleets: &'a Fleets<P>,
         settings: ControlSettings,
-        provisioner: &'a F,
-        scheduler: &'a S,
-        repository: &'a R,
-        clock: &'a C,
+        scaling: Arc<ScalingConfig>,
+        profiles: SourceProfiles,
+        ports: &ControlPorts<'a, F, S, R, C>,
         fence: Fence,
     ) -> Self {
+        let &ControlPorts {
+            provisioner,
+            scheduler,
+            repository,
+            clock,
+        } = ports;
         let configs: Vec<FleetConfig<'a, P>> = fleets.iter().collect();
         let passes = configs
             .iter()
             .map(|config| FleetPass::new(config.policy.clone()))
             .collect();
         let launch_failures = vec![None; configs.len()];
-        let reconciler = Reconciler::new(fleets.policies());
+        let max_boot_grace = fleets
+            .policies()
+            .iter()
+            .map(|policy| policy.boot_grace)
+            .max()
+            .unwrap_or_default();
+        let reconciler = Reconciler::new(fleets.policies(), scaling, profiles);
         Self {
             fleets,
             configs,
@@ -141,6 +164,7 @@ where
             pending_terminations: Vec::new(),
             reconciler,
             poll_interval: settings.poll_interval,
+            max_boot_grace,
             provisioner,
             scheduler,
             repository,
@@ -168,10 +192,13 @@ where
     pub(crate) async fn pass(&mut self) -> PassOutcome {
         let (wall, outcome) = match self.plan_pass().await {
             Ok(time) => (time.wall, self.apply_plan().await),
-            Err(reason) => (
-                PassTime::read(self.clock).wall,
-                PassOutcome::Skipped(reason),
-            ),
+            Err(reason) => {
+                self.reconciler.interrupt();
+                (
+                    PassTime::read(self.clock).wall,
+                    PassOutcome::Skipped(reason),
+                )
+            }
         };
         self.publish(wall, &outcome);
         outcome
@@ -188,6 +215,18 @@ where
             return Err(SkipReason::LeadershipLapsed);
         }
         let time = PassTime::read(self.clock);
+        let live: Vec<_> = self
+            .passes
+            .iter()
+            .map(|pass| (&pass.policy.name, &pass.supply))
+            .collect();
+        self.scheduler
+            .retain_drains(time.now, self.max_boot_grace, &live)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "cannot retain physical drains; skipping pass");
+                SkipReason::SchedulerUnavailable
+            })?;
         self.hosted.replace(&mut self.incoming);
         if self.record_infrastructure(time.wall).await {
             self.record_worker_changes(time.wall).await;
@@ -597,15 +636,17 @@ where
                             .retain(|pending| !termination_matches(pending, step.fleet, instance));
                     }
                     applied += 1;
-                    let event =
-                        step.audit_event(self.plan.at, &self.passes[step.fleet].policy.name);
-                    let _ = Self::record_event(
-                        self.repository,
-                        self.publisher.as_ref(),
-                        &self.fence,
-                        event,
-                    )
-                    .await;
+                    if let Some(event) =
+                        step.audit_event(self.plan.at, &self.passes[step.fleet].policy.name)
+                    {
+                        let _ = Self::record_event(
+                            self.repository,
+                            self.publisher.as_ref(),
+                            &self.fence,
+                            event,
+                        )
+                        .await;
+                    }
                 }
                 Err(PortError::NotFound(Subject::Worker(worker))) => {
                     tracing::debug!(worker = ?worker, "worker not found; skipping drain step");
@@ -639,7 +680,7 @@ where
     ) -> Result<(), PortError> {
         if matches!(
             &step.action,
-            Action::StartDrain(_) | Action::CancelDrain(_, _)
+            Action::StartDrain { .. } | Action::ReinforceDrain(_) | Action::CancelDrain(_, _)
         ) && !fence.holds()
         {
             return Err(PortError::from(LeaseLapsed));
@@ -652,8 +693,12 @@ where
                     .await
                     .map_err(PortError::from)
             }
-            Action::StartDrain(worker) => scheduler.set_draining(worker, true).await,
-            Action::CancelDrain(worker, _) => scheduler.set_draining(worker, false).await,
+            Action::StartDrain { worker, .. } | Action::ReinforceDrain(worker) => {
+                Self::set_draining(scheduler, configs, step.fleet, worker, true).await
+            }
+            Action::CancelDrain(worker, _) => {
+                Self::set_draining(scheduler, configs, step.fleet, worker, false).await
+            }
             Action::Terminate { instance, cause } => {
                 let fleet = configs[step.fleet].fleet();
                 let reason = if *cause == gang_reconciler::TerminationCause::StaleEnvironment {
@@ -667,6 +712,22 @@ where
                     .map_err(PortError::from)
             }
         }
+    }
+
+    async fn set_draining(
+        scheduler: &S,
+        configs: &[FleetConfig<'_, P>],
+        fleet: usize,
+        worker: &WorkerId,
+        draining: bool,
+    ) -> Result<(), PortError> {
+        let name = worker
+            .instance_name()
+            .ok_or_else(|| PortError::NotFound(Subject::Worker(worker.clone())))?;
+        let instance = InstanceId::try_new(name).map_err(PortError::backend)?;
+        scheduler
+            .set_draining(&configs[fleet].policy.name, &instance, draining)
+            .await
     }
 
     /// Records one audit event and adds it to the published history. A recording failure is
@@ -798,6 +859,413 @@ impl WorkerRoster {
 mod tests {
     use super::*;
     use std::num::NonZeroU32;
+
+    type TestControl<'a> = ControlLoop<
+        'a,
+        gang_testkit::TestPlugins,
+        gang_testkit::FakeProvisioner,
+        gang_testkit::FakeScheduler,
+        gang_testkit::FakeRepository,
+        Arc<gang_clock::TestClock>,
+    >;
+
+    fn control<'a>(
+        fleets: &'a Fleets<gang_testkit::TestPlugins>,
+        provisioner: &'a gang_testkit::FakeProvisioner,
+        scheduler: &'a gang_testkit::FakeScheduler,
+        repository: &'a gang_testkit::FakeRepository,
+        clock: &'a Arc<gang_clock::TestClock>,
+    ) -> TestControl<'a> {
+        let scaling = Arc::new(ScalingConfig::default());
+        let profiles = SourceProfiles::new(
+            &scaling,
+            gang_config::ActionsConfig::default().history_window,
+        );
+        ControlLoop::new(
+            fleets,
+            ControlSettings::new(NonZeroDuration::from_secs(1), &DashboardConfig::default()),
+            scaling,
+            profiles,
+            &crate::control::ControlPorts {
+                provisioner,
+                scheduler,
+                repository,
+                clock,
+            },
+            gang_testkit::fence::valid_fence(),
+        )
+    }
+
+    #[tokio::test]
+    async fn drain_steps_apply_to_the_physical_fleet_and_instance() -> gang_testkit::TestResult {
+        use gang_reconciler::{DrainReason, NeedCause};
+        let fleets = crate::test_support::fleets_of(vec![("first", 4), ("second", 4)]);
+        let provisioner = gang_testkit::FakeProvisioner::default();
+        let scheduler = gang_testkit::FakeScheduler::new()?;
+        let repository = gang_testkit::FakeRepository::default();
+        let clock = crate::test_support::clock_at(1_000_000);
+        let instance = InstanceId::try_new("local-1")?;
+        let worker = gang_testkit::worker_on(&instance)?;
+        let mut control = control(&fleets, &provisioner, &scheduler, &repository, &clock);
+        control.plan.steps = vec![
+            PlanStep {
+                fleet: 1,
+                action: Action::StartDrain {
+                    worker: worker.clone(),
+                    reason: DrainReason::IdleTimeout,
+                    summary: None,
+                },
+            },
+            PlanStep {
+                fleet: 1,
+                action: Action::ReinforceDrain(worker.clone()),
+            },
+            PlanStep {
+                fleet: 1,
+                action: Action::CancelDrain(worker, NeedCause::Demand),
+            },
+        ];
+        assert_eq!(
+            control.apply_plan().await,
+            PassOutcome::Completed {
+                applied: 3,
+                failed: 0
+            }
+        );
+        let fleet = FleetName::try_new("second")?;
+        assert_eq!(
+            scheduler.draining_calls(),
+            vec![
+                (fleet.clone(), instance.clone(), true),
+                (fleet.clone(), instance.clone(), true),
+                (fleet, instance, false),
+            ]
+        );
+        let events = repository.scaling_events();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0].kind,
+            ScalingEventKind::DrainStarted { .. }
+        ));
+        assert!(matches!(
+            events[1].kind,
+            ScalingEventKind::DrainCancelled { .. }
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reinforcing_drain_passes_write_no_audit_rows() -> gang_testkit::TestResult {
+        let fleets = crate::test_support::fleets();
+        let provisioner = gang_testkit::FakeProvisioner::default();
+        let scheduler = gang_testkit::FakeScheduler::new()?;
+        let repository = gang_testkit::FakeRepository::default();
+        let clock = crate::test_support::clock_at(1_000_000);
+        let instance = InstanceId::try_new("local-1")?;
+        let worker = gang_testkit::worker_on(&instance)?;
+        let mut control = control(&fleets, &provisioner, &scheduler, &repository, &clock);
+        control.plan.steps.push(PlanStep {
+            fleet: 0,
+            action: Action::ReinforceDrain(worker),
+        });
+        for _ in 0..8 {
+            assert_eq!(
+                control.apply_plan().await,
+                PassOutcome::Completed {
+                    applied: 1,
+                    failed: 0
+                }
+            );
+        }
+        assert_eq!(scheduler.draining_calls().len(), 8);
+        assert!(repository.scaling_events().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn applied_purchase_and_utilization_cordon_publish_detail() -> gang_testkit::TestResult {
+        use gang_reconciler::{CordonDecision, DrainReason, NeedCause, ScaleDecision};
+        let fleets = crate::test_support::fleets();
+        let provisioner = gang_testkit::FakeProvisioner::default();
+        let scheduler = gang_testkit::FakeScheduler::new()?;
+        let repository = gang_testkit::FakeRepository::default();
+        let clock = crate::test_support::clock_at(1_000_000);
+        let instance = InstanceId::try_new("local-1")?;
+        let mut control = control(&fleets, &provisioner, &scheduler, &repository, &clock);
+        control.plan.steps = vec![
+            PlanStep {
+                fleet: 0,
+                action: Action::ScaleOut {
+                    from: 0,
+                    to: 1,
+                    need: NeedCause::Demand,
+                    summary: ScaleDecision {
+                        slots: 4,
+                        reliable: 0,
+                        ..ScaleDecision::default()
+                    },
+                },
+            },
+            PlanStep {
+                fleet: 0,
+                action: Action::StartDrain {
+                    worker: gang_testkit::worker_on(&instance)?,
+                    reason: DrainReason::Utilization,
+                    summary: Some(CordonDecision {
+                        serving_instances: 2,
+                        waterline_percent: 70,
+                        dwell: Duration::from_mins(5),
+                        ..CordonDecision::default()
+                    }),
+                },
+            },
+        ];
+        assert_eq!(
+            control.apply_plan().await,
+            PassOutcome::Completed {
+                applied: 2,
+                failed: 0
+            }
+        );
+        let events = repository.scaling_events();
+        assert_eq!(events.len(), 2);
+        let detail = match &events[0].kind {
+            ScalingEventKind::ScaledOut {
+                detail: Some(detail),
+                ..
+            } => detail,
+            kind => panic!("missing purchase detail: {kind:?}"),
+        };
+        assert!(detail.contains("slots=4"));
+        assert!(detail.contains("reliable=0"));
+        let purchase = crate::events::wire_event(RecordedScalingEvent {
+            seq: gang_spi::ScalingEventSeq::new(1),
+            event: events[0].clone(),
+        });
+        assert!(
+            matches!(&purchase.change, gang_wire::EventChange::ScaledOut {
+            detail: Some(value), ..
+        } if value == detail)
+        );
+        assert_eq!(events[1].cause, Some(gang_types::ScalingCause::Utilization));
+        let detail = match &events[1].kind {
+            ScalingEventKind::DrainStarted {
+                detail: Some(detail),
+                ..
+            } => detail,
+            kind => panic!("missing cordon detail: {kind:?}"),
+        };
+        assert!(detail.contains("serving_instances=2"));
+        let wire = crate::events::wire_event(RecordedScalingEvent {
+            seq: gang_spi::ScalingEventSeq::new(2),
+            event: events[1].clone(),
+        });
+        assert_eq!(
+            wire.cause,
+            Some(gang_wire::Cause::from(
+                gang_types::ScalingCause::Utilization
+            ))
+        );
+        assert!(
+            matches!(&wire.change, gang_wire::EventChange::DrainStarted { detail: Some(value), .. } if value == detail)
+        );
+        Ok(())
+    }
+
+    fn retention_fleets() -> gang_testkit::TestResult<Fleets<gang_testkit::TestPlugins>> {
+        let base = crate::test_support::fleets_of(vec![("first", 4), ("second", 4)]);
+        Ok(Fleets::<gang_testkit::TestPlugins>::try_new(
+            base.policies()
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, mut policy)| {
+                    policy.boot_grace = Duration::from_secs(if index == 0 { 30 } else { 90 });
+                    gang_config::FleetMember {
+                        policy,
+                        sandbox: gang_testkit::SandboxKey::Noop,
+                        options: gang_testkit::Opaque::default(),
+                    }
+                })
+                .collect(),
+        )?)
+    }
+
+    #[tokio::test]
+    async fn retention_uses_only_complete_censuses_and_includes_every_lifecycle()
+    -> gang_testkit::TestResult {
+        let fleets = retention_fleets()?;
+        let provisioner = gang_testkit::FakeProvisioner::default();
+        let scheduler = gang_testkit::FakeScheduler::new()?;
+        let repository = gang_testkit::FakeRepository::default();
+        let clock = crate::test_support::clock_at(1_000_000);
+        let first = FleetName::try_new("first")?;
+        let second = FleetName::try_new("second")?;
+        let ids = [
+            InstanceId::try_new("local-1")?,
+            InstanceId::try_new("local-2")?,
+            InstanceId::try_new("local-3")?,
+        ];
+        let instances = [
+            InstanceLifecycle::Pending,
+            InstanceLifecycle::InService,
+            InstanceLifecycle::Terminating,
+        ]
+        .into_iter()
+        .zip(&ids)
+        .map(|(lifecycle, id)| gang_spi::FleetInstance {
+            id: id.clone(),
+            lifecycle,
+            launched_at: clock.wall(),
+            release_first: false,
+        })
+        .collect();
+        provisioner.set_supply(
+            &first,
+            gang_spi::FleetSupply {
+                instances,
+                desired: 3,
+                ..Default::default()
+            },
+        );
+        provisioner.set_supply(
+            &second,
+            gang_spi::FleetSupply {
+                instances: vec![gang_spi::FleetInstance {
+                    id: ids[0].clone(),
+                    lifecycle: InstanceLifecycle::Pending,
+                    launched_at: clock.wall(),
+                    release_first: false,
+                }],
+                desired: 1,
+                ..Default::default()
+            },
+        );
+        let mut control = control(&fleets, &provisioner, &scheduler, &repository, &clock);
+        scheduler.fail_snapshot(true);
+        assert_eq!(
+            control.pass().await,
+            PassOutcome::Skipped(SkipReason::SchedulerUnavailable)
+        );
+        scheduler.fail_snapshot(false);
+        provisioner.fail_supply(true);
+        assert_eq!(
+            control.pass().await,
+            PassOutcome::Skipped(SkipReason::ProvisionerUnavailable)
+        );
+        assert!(scheduler.retain_drains_calls().is_empty());
+        provisioner.fail_supply(false);
+        let converges = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        provisioner.on_converge(move || {
+            if converges.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                Err(PortError::unavailable("second fleet census is incomplete"))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(
+            control.pass().await,
+            PassOutcome::Skipped(SkipReason::ProvisionerUnavailable)
+        );
+        assert!(
+            scheduler.retain_drains_calls().is_empty(),
+            "a partial provider census must not sweep intents"
+        );
+        let now = clock.monotonic();
+        assert!(matches!(
+            control.pass().await,
+            PassOutcome::Completed { .. }
+        ));
+        assert_eq!(
+            scheduler.retain_drains_calls(),
+            vec![(
+                now,
+                Duration::from_secs(90),
+                vec![
+                    (first.clone(), ids[0].clone()),
+                    (first.clone(), ids[1].clone()),
+                    (first, ids[2].clone()),
+                    (second, ids[0].clone())
+                ],
+            )]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skipped_pass_restarts_utilization_dwell() -> gang_testkit::TestResult {
+        let base = crate::test_support::fleets();
+        let mut policy = base.policies()[0].clone();
+        policy.idle_timeout = Duration::from_hours(1);
+        let fleets =
+            Fleets::<gang_testkit::TestPlugins>::try_new(vec![gang_config::FleetMember {
+                policy,
+                sandbox: gang_testkit::SandboxKey::Noop,
+                options: gang_testkit::Opaque::default(),
+            }])?;
+        let provisioner = gang_testkit::FakeProvisioner::default();
+        let scheduler = gang_testkit::FakeScheduler::new()?;
+        let repository = gang_testkit::FakeRepository::default();
+        let clock = crate::test_support::clock_at(1_000_000);
+        let instance = InstanceId::try_new("local-1")?;
+        let fleet = fleets.policies()[0].name.clone();
+        provisioner.set_supply(
+            &fleet,
+            gang_spi::FleetSupply {
+                instances: vec![gang_spi::FleetInstance {
+                    id: instance.clone(),
+                    lifecycle: InstanceLifecycle::InService,
+                    launched_at: clock.wall(),
+                    release_first: false,
+                }],
+                desired: 1,
+                ..Default::default()
+            },
+        );
+        scheduler.set_snapshot(SchedulerSnapshot {
+            workers: vec![WorkerState {
+                id: gang_testkit::worker_on(&instance)?,
+                fleet,
+                environment: Some("host:test".parse()?),
+                running_actions: 0,
+                max_inflight_actions: NonZeroU32::new(4),
+                draining: false,
+                paused: false,
+                last_seen: clock.wall(),
+            }],
+            ..Default::default()
+        });
+        let mut control = control(&fleets, &provisioner, &scheduler, &repository, &clock);
+        control.pass().await;
+        clock.advance(gang_types::health::CLIENT_REROUTE_BOUND);
+        control.pass().await;
+        clock.advance(Duration::from_secs(299));
+        scheduler.fail_snapshot(true);
+        assert_eq!(
+            control.pass().await,
+            PassOutcome::Skipped(SkipReason::SchedulerUnavailable)
+        );
+        scheduler.fail_snapshot(false);
+        clock.advance(Duration::from_secs(1));
+        control.pass().await;
+        assert!(
+            scheduler.draining_calls().is_empty(),
+            "the skipped interval cannot satisfy dwell"
+        );
+        clock.advance(Duration::from_secs(299));
+        control.pass().await;
+        assert!(scheduler.draining_calls().is_empty());
+        clock.advance(Duration::from_secs(1));
+        control.pass().await;
+        assert_eq!(scheduler.draining_calls().len(), 1);
+        assert!(
+            repository
+                .scaling_events()
+                .iter()
+                .any(|event| event.cause == Some(gang_types::ScalingCause::Utilization))
+        );
+        Ok(())
+    }
 
     fn at() -> Timestamp {
         Timestamp::from_unix_millis(5_000)

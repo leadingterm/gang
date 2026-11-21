@@ -1,5 +1,6 @@
 //! Steady-state passes must not allocate once the reconciler's scratch buffers have grown.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use gang_clock::{Clock, TestClock};
@@ -48,7 +49,7 @@ impl World {
             snapshot,
             hosted,
             clock: TestClock::new(h.clock.wall()),
-            reconciler: Reconciler::new(&policies),
+            reconciler: Reconciler::new(&policies, Arc::clone(&h.scaling), h.profiles.clone()),
             plan: Plan::new(),
         }
     }
@@ -107,7 +108,14 @@ fn steady_state_with(release_first_idle: bool) -> TestResult<Harness> {
     // warm-up and measured pass, and one more.
     let passes = u64::try_from(WARM_UP_PASSES + MEASURED_PASSES + 1)?;
     primary.max_drain_wait = settle_advance(&primary) + Duration::from_secs(passes);
-    let mut h = Harness::with_fleets(vec![primary, policy_named("gang-spare", Isa::X86_64)?]);
+    let scaling = gang_config::ScalingConfig {
+        payback_percent: gang_config::PaybackPercent::try_new(100)?,
+        ..gang_config::ScalingConfig::default()
+    };
+    let mut h = Harness::with_scaling(
+        vec![primary, policy_named("gang-spare", Isa::X86_64)?],
+        scaling,
+    );
     let long_ago = Duration::from_hours(1);
     for instance in ["local-1", "local-2", "local-3", "local-4"] {
         if release_first_idle && instance == "local-2" {
@@ -215,7 +223,7 @@ fn a_new_worker_allocates_only_when_it_first_appears() -> TestResult {
 }
 
 #[test]
-fn queued_simulation_with_headroom_does_not_allocate_after_warmup() -> TestResult {
+fn queued_vector_planning_and_final_dispatch_do_not_allocate_after_warmup() -> TestResult {
     let mut primary = policy()?;
     primary.instances =
         InstanceBounds::try_new(0, std::num::NonZeroU32::new(20).ok_or("zero maximum")?)?;
@@ -252,6 +260,75 @@ fn queued_simulation_with_headroom_does_not_allocate_after_warmup() -> TestResul
     let allocated: u64 = (0..MEASURED_PASSES)
         .map(|_| world.counted_reconcile())
         .sum();
-    assert_eq!(allocated, 0, "queued simulation allocated after warmup");
+    assert_eq!(
+        allocated, 0,
+        "queued vector planning allocated after warmup"
+    );
+    Ok(())
+}
+
+#[test]
+fn warmed_authenticated_source_rates_profiles_and_dispatch_allocate_zero() -> TestResult {
+    let mut p = policy()?;
+    p.instances = InstanceBounds::try_new(1, p.instances.max())?;
+    p.idle_timeout = Duration::from_mins(10);
+    let scaling = gang_config::ScalingConfig {
+        max_sources: gang_config::SourceLimit::try_new(2)?,
+        ..gang_config::ScalingConfig::default()
+    };
+    let mut h = Harness::with_scaling(vec![p], scaling);
+    h.launch(
+        X86,
+        "local-1",
+        InstanceLifecycle::InService,
+        Duration::from_hours(1),
+    )?;
+    h.connect(X86, "local-1")?;
+    h.set_desired_capacity(X86, 1);
+    h.queue(X86, 2)?;
+    for (index, row) in h.snapshot.queued.iter_mut().enumerate() {
+        row.source = Some(format!("{:016x}", index + 1).parse()?);
+        row.expected = Some(Duration::from_secs(2));
+    }
+    let mut world = World::new(&h);
+    for _ in 0..WARM_UP_PASSES {
+        world.counted_reconcile();
+        world.clock.advance(Duration::from_secs(1));
+    }
+    let allocated = measure_quiet_passes(&mut world, MEASURED_PASSES);
+    assert_eq!(
+        allocated, 0,
+        "warmed source observation/profile/dispatch allocated"
+    );
+    Ok(())
+}
+
+#[test]
+fn warmed_completion_frame_merge_does_not_allocate() -> TestResult {
+    let mut h = steady_state()?;
+    let source: gang_types::SourceId = "0000000000000001".parse()?;
+    for row in &mut h.snapshot.queued {
+        row.source = Some(source);
+    }
+    let kappa = std::f64::consts::LN_2 / 60.0;
+    let count = gang_spi::NonNegativeFinite::try_new(kappa).ok_or("invalid fixture count")?;
+    let actions =
+        gang_spi::NonNegativeFinite::try_new(kappa * 30.0).ok_or("invalid fixture work")?;
+    h.snapshot.source_rates.push(gang_spi::CompletionRates {
+        source: Some(source),
+        preferred_fleet: X86,
+        generation: 1,
+        created_at: gang_clock::Tick::ORIGIN,
+        at: gang_clock::Tick::ORIGIN,
+        completions: count,
+        timed_completions: count,
+        work: gang_spi::ResourceRates {
+            actions,
+            ..gang_spi::ResourceRates::default()
+        },
+    });
+    let mut world = World::new(&h);
+    warm_up(&mut world);
+    assert_eq!(measure_quiet_passes(&mut world, MEASURED_PASSES), 0);
     Ok(())
 }

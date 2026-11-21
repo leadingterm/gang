@@ -50,6 +50,19 @@ const PROBES: [Probe; 8] = [
     Probe::ControllerLoss6,
     Probe::ControllerLoss7,
 ];
+
+// A completed outage teaches target and mnemonic durations. The later partition
+// needs genuinely unknown held work, so these use E2ePartition rather than E2eProbe.
+const PARTITION_PROBES: [Probe; 8] = [
+    Probe::Partition0,
+    Probe::Partition1,
+    Probe::Partition2,
+    Probe::Partition3,
+    Probe::Partition4,
+    Probe::Partition5,
+    Probe::Partition6,
+    Probe::Partition7,
+];
 const LOST_LEADERSHIP: &str = "another controller took the leader lease";
 
 fn device_login(cluster: &Cluster<'_>) -> Result<u16> {
@@ -387,7 +400,7 @@ fn observe_outage(
         .iter()
         .filter(|event| {
             event.create_time >= restored_wall
-                && matches!(event.change, EventChange::ScaledOut { from: 1, to: 2 })
+                && matches!(event.change, EventChange::ScaledOut { from: 1, to: 2, .. })
         })
         .count();
     Ok(vec![
@@ -577,20 +590,23 @@ fn partition(cluster: &Cluster<'_>, journal: &Journal, go: &std::path::Path) -> 
     let run = Run::fresh()?;
     let demand_run = Run::fresh()?;
     let follower_run = Run::fresh()?;
-    journal.prepare_attempts(run.as_ref(), PROBES[..4].iter().map(|probe| probe.as_str()))?;
+    journal.prepare_attempts(
+        run.as_ref(),
+        PARTITION_PROBES[..4].iter().map(|probe| probe.as_str()),
+    )?;
     journal.prepare_attempts(
         demand_run.as_ref(),
-        PROBES[4..].iter().map(|probe| probe.as_str()),
+        PARTITION_PROBES[4..].iter().map(|probe| probe.as_str()),
     )?;
     journal.prepare_attempts(
         follower_run.as_ref(),
-        PROBES.iter().map(|probe| probe.as_str()),
+        PARTITION_PROBES.iter().map(|probe| probe.as_str()),
     )?;
     std::thread::scope(|scope| -> Result<Vec<Check>> {
         let stack = cluster.stack();
         let hold = Hold::new(go, |root| stack.kill_bazel_in(root));
         let build = hold.build(scope, None, |cancel, stop| {
-            let outcome = stack.build_run_until(&PROBES[..4], &run, cancel, stop);
+            let outcome = stack.build_run_until(&PARTITION_PROBES[..4], &run, cancel, stop);
             journal.write_line(JOURNAL_END)?;
             outcome
         });
@@ -616,7 +632,7 @@ fn partition(cluster: &Cluster<'_>, journal: &Journal, go: &std::path::Path) -> 
                         let prepared = preparation.join().map_err(|_| {
                             E2eError::system("demand Bazel preparation thread panicked")
                         })??;
-                        prepared.build_until(&PROBES[4..], &demand_run, stop)
+                        prepared.build_until(&PARTITION_PROBES[4..], &demand_run, stop)
                     }));
                 }
                 Demand::Follower => {
@@ -628,7 +644,7 @@ fn partition(cluster: &Cluster<'_>, journal: &Journal, go: &std::path::Path) -> 
                         let prepared = preparation.join().map_err(|_| {
                             E2eError::system("follower Bazel preparation thread panicked")
                         })??;
-                        prepared.build_until(&PROBES, &follower_run, stop)
+                        prepared.build_until(&PARTITION_PROBES, &follower_run, stop)
                     }));
                 }
             },
@@ -728,6 +744,12 @@ fn observe_partition(
             fenced &= *original == controller_workers(cluster, old);
             follower_acted |= !controller_workers(cluster, follower).is_empty();
         }
+        // Fresh E2ePartition probes use the typed 10m unknown prior, not the outage
+        // build's learned E2eProbe durations. At cold B=60s and idle=15s,
+        // H=50%*(60+15)=37.5s; even four queued probes supply 2400 slot-seconds,
+        // exceeding two instances' capacity credit plus a new worker's payback.
+        // This is immediate transient-work evidence: no completion-rate seed or
+        // persistence age is required. The 50s settle gates drains, not purchases.
         let elapsed = clock.monotonic().saturating_duration_since(started);
         elapsed >= OUTAGE && (follower_acted || elapsed >= OUTAGE.saturating_mul(2))
     };
@@ -791,7 +813,7 @@ fn observe_partition(
 
 #[cfg(test)]
 mod tests {
-    use super::frontends_unready;
+    use super::{PARTITION_PROBES, PROBES, frontends_unready};
 
     #[test]
     fn readiness_loss_waits_for_both_frontends() {
@@ -799,5 +821,12 @@ mod tests {
         assert!(!frontends_unready(&[], &[0]));
         assert!(!frontends_unready(&[0], &[]));
         assert!(!frontends_unready(&[0], &[0]));
+    }
+
+    #[test]
+    fn partition_demand_does_not_reuse_completed_outage_targets() {
+        for probe in PARTITION_PROBES {
+            assert!(!PROBES.contains(&probe));
+        }
     }
 }

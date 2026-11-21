@@ -549,7 +549,8 @@ data: {"reason":"VIEWER_CAP","retryDelay":"5s"}
 ### Notes
 
 - **Admission.** State operations require leader admission. A nonadmitting controller returns HTTP 503 before the handler with `gang-request-not-started: true`; it does not forward requests or streaming responses. Leader-only gRPC requests similarly return `UNAVAILABLE` (code 14) with the marker. Leadership refusal gracefully retires HTTP/2 connections with GOAWAY, even after an earlier shared request; admitted streams and concurrent accepted shared requests are not blanket-refused. After promotion leader admission remains enabled through a lease lapse, even when `/ready` returns 503. Prepared controllers serve shared authentication, API, browser and cache services independently of promotion; see [listener admission](SPECIFICATION.md#61-gang-server-listeners).
-- **Fleet demand estimates.** `demand.readiness` and `demand.expectedWait` are independently optional Google Duration strings, for example `"42.5s"` and `"0s"`. `readiness` is the measured launch-to-first-worker latency; it is omitted until measured, even while the planner uses `bootGrace` as its prior. `expectedWait` is the latest simulated start delay among the fleet's attributed queued actions at the final planned capacity; it is omitted when there is no attributed queue. Zero is a valid estimate, not an absent value.
+- **Fleet demand estimates.** `demand.readiness` and `demand.expectedWait` are independently optional Google Duration strings, for example `"42.5s"` and `"0s"`. `readiness` is the measured launch-to-first-worker latency; it is omitted until measured, while the planner uses the configured `scaling.readiness_prior`, clamped to the fleet's `boot_grace`, as its cold prior. `expectedWait` is the latest simulated start delay among the fleet's attributed queued actions at the final planned capacity; it is omitted when there is no attributed queue. Zero is a valid estimate, not an absent value.
+- **Fleet rate diagnostics.** `demand.load` is persistent load in integer deci-slots (`125` means 12.5 slots). `demand.backlog` is transient queued slot-time before readiness subtraction, rounded to whole seconds and encoded as a Google Duration string (`"42s"`). `demand.utilization` is instantaneous serving resource occupancy in integer permille (`735` means 73.5%): the maximum occupancy fraction across resource dimensions, excluding draining workers. The fields are independently optional; unmeasured values are omitted, and `utilization` is omitted without serving capacity. Measured zero is present as `0` or `"0s"`, never treated as absence.
 - **Frames.** `Frame` is the type of each stream message, defined once in `gang-wire`:
 
   | Event | Data | Sent |
@@ -1057,14 +1058,14 @@ curl -H "Authorization: Bearer $TOKEN" 'https://gang.example.com/v1/events?pageS
 
 - **Order.** Events are listed by sequence number, descending, so a chain of pages walks backward in time. `nextPageToken` resumes after the last event of the page.
 - **Live and history.** The history is this list. Live events come only from `GET /v1/state:watch`: its snapshot `events` and every delta's `events` are full `Event` resources with the same shape. There is no long poll, no `since` and no `before`. A client that holds the newest events of a stream and wants older ones lists from the newest, and stops at the first event it already holds, deduplicating by `name`.
-- **Event.** `createTime` is when the event was recorded and `fleet` is the fleet it concerns. `cause` is present for an autoscaler decision and omitted for worker joins and leaves, early exits, launch failures, and events recorded before causes existed. Its values are `DEMAND`, `MINIMUM`, `IDLE_TIMEOUT`, `ORPHAN`, `DRAIN_FINISHED` and `MAX_DRAIN_WAIT`; a client tolerates a value it does not know. Beside the common fields exactly one member describes the change:
+- **Event.** `createTime` is when the event was recorded and `fleet` is the fleet it concerns. `cause` is present for an autoscaler decision and omitted for worker joins and leaves, early exits, launch failures, and events recorded before causes existed. Its values are `DEMAND`, `MINIMUM`, `IDLE_TIMEOUT`, `UTILIZATION`, `ORPHAN`, `DRAIN_FINISHED` and `MAX_DRAIN_WAIT`; a client tolerates a value it does not know. `UTILIZATION` means a worker was cordoned because measured fleet load stayed below the configured waterline for the full dwell. Beside the common fields exactly one member describes the change:
 
   | Member | Fields |
   |---|---|
-  | `scaledOut` | `from`, `to`: the fleet's desired capacity before and after |
+  | `scaledOut` | `from`, `to`: the fleet's desired capacity before and after; optional `detail`: the decision's explanation |
   | `launchFailed` | `from`: existing instances excluding terminating instances; `to`: requested instances; `reason`: the provider's failure message, verbatim |
   | `withdrawn` | `from`, `to`: the fleet's requested capacity before and after withdrawal |
-  | `drainStarted` | `worker`: the worker that began draining |
+  | `drainStarted` | `worker`: the worker that began draining; optional `detail`: the decision's explanation |
   | `drainCancelled` | `worker`: the worker whose drain was cancelled |
   | `terminated` | `instance`: the instance that was terminated |
   | `exitedEarly` | `instance`, `failure`: a worker failed soon after its launch, before it could serve; `failure` is its own failure record |
@@ -1074,6 +1075,9 @@ curl -H "Authorization: Bearer $TOKEN" 'https://gang.example.com/v1/events?pageS
   Local Mode reports `exitedEarly` when a worker exits within `relaunch_backoff` of its launch and its log has a `fail` record.
 
   A member a client does not know is ignored.
+  Decision `detail` is inside `scaledOut` or `drainStarted`, not a top-level event field. It is omitted when no explanation was recorded; old events remain valid and older readers ignore the new member-body field. Existing `launchFailed.reason` and `exitedEarly.failure` keep their failure semantics.
+
+  **Downgrade boundary.** Soak v0.3.4 with `max_cordons = 0` before enabling utilization cordons; idle-timeout drains continue. Before the first utilization audit row, rollback also requires restoring the old configuration. After the first `utilization` audit row, downgrade to v0.3.3 is unsupported: its database readers reject the new cause.
 - The route accepts the session cookie.
 
 ## Errors

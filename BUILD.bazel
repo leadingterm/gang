@@ -21,6 +21,7 @@ exports_files([
     "Cargo.toml",
     "MODULE.bazel",
     "clippy.toml",
+    "e2e/sample/BUILD.bazel",
     "tools/e2e-gate.sh",
 ])
 

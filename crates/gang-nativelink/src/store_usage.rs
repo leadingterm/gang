@@ -298,6 +298,8 @@ mod tests {
         let (content, action) = (RenderedStoreSpec(content), RenderedStoreSpec(action));
         let spec = ControllerSpec {
             actions: Arc::new(gang_config::ActionsConfig::default()),
+            scaling: Arc::new(gang_config::ScalingConfig::default()),
+            clock: Arc::new(gang_clock::SystemClock::new()),
             content_store: &content,
             action_store: &action,
             fleets: &fleets,

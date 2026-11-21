@@ -7,18 +7,19 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt;
 use futures::future::BoxFuture;
-use gang_clock::Timestamp;
+use gang_clock::{Tick, Timestamp};
 use gang_spi::{
     ActionsView, Admitted, ApiRequestBody, ApiResponseBody, ApiService, BoxedConnection,
-    ControllerConnections, ControllerEndpoints, ControllerReady, ControllerSpec, GateDecision,
-    LeaderUnavailable, LearnedHistory, Listening, ListingLimits, Peer, PortError, RecordKind,
-    Rejection, RequestGate, RequestScope, SchedulerPort, SchedulerSnapshot, Slots, Subject,
+    ControllerConnections, ControllerEndpoints, ControllerReady, ControllerSpec, FleetSupply,
+    GateDecision, LeaderUnavailable, LearnedHistory, Listening, ListingLimits, Peer, PortError,
+    RecordKind, Rejection, RequestGate, RequestScope, SchedulerPort, SchedulerSnapshot, Slots,
     WorkerSpec, WorkerTls, full_body,
 };
-use gang_types::{Bytes, FleetProperties, InstanceId, WorkerId};
+use gang_types::{Bytes, FleetName, FleetProperties, InstanceId};
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot, watch};
 use url::Url;
@@ -350,6 +351,8 @@ struct Failing {
     refusals: RefusalOutcome,
 }
 
+type DrainRetention = (Tick, Duration, Vec<(FleetName, InstanceId)>);
+
 /// The state a [`FakeScheduler`] shares between its clones.
 struct SchedulerState {
     /// The worker endpoint `endpoints` reports.
@@ -362,8 +365,6 @@ struct SchedulerState {
     actions: ActionsView,
     /// Live learned histories in recency order.
     history: Vec<LearnedHistory>,
-    /// Workers that are no longer connected; drain requests for them report not found.
-    vanished: Vec<WorkerId>,
     /// The operations that fail.
     failing: Failing,
     /// Whether `run_controller` returns at once without serving the connections it was handed.
@@ -377,7 +378,9 @@ struct SchedulerState {
     /// Every spec `run_worker` has been asked to run.
     specs: Vec<RecordedSpec>,
     /// The `set_draining` calls that succeeded, in order, with their flags.
-    draining_calls: Vec<(WorkerId, bool)>,
+    draining_calls: Vec<(FleetName, InstanceId, bool)>,
+    /// Complete provider census requests, in call order.
+    retention_calls: Vec<DrainRetention>,
     /// Released by the test; while held, `run_controller` waits on it after its connections end.
     drain_hold: Option<oneshot::Receiver<()>>,
     /// Released by the test after the next refusal run's two connection streams end.
@@ -507,8 +510,8 @@ impl Drop for PublishedStandby<'_> {
 }
 
 /// A scheduler that serves as both sides of the scheduler port. Its controller reports a
-/// configured snapshot, forwards the connections it receives, and refuses drain requests for
-/// vanished workers. Its worker records every spec it is asked to run and behaves as scripted.
+/// configured snapshot, forwards connections, and records physical drain requests without
+/// changing the configured observations. Its worker records specs and behaves as scripted.
 ///
 /// Clones share state.
 #[derive(Clone)]
@@ -565,7 +568,6 @@ impl FakeScheduler {
                 snapshot_hold: None,
                 actions: ActionsView::default(),
                 history: Vec::new(),
-                vanished: Vec::new(),
                 failing: Failing::default(),
                 finish_controller: false,
                 connections: None,
@@ -573,6 +575,7 @@ impl FakeScheduler {
                 behaviour: Behaviour::Pending,
                 specs: Vec::new(),
                 draining_calls: Vec::new(),
+                retention_calls: Vec::new(),
                 drain_hold: None,
                 refusal_drain_hold: None,
                 ready_hold: None,
@@ -602,8 +605,20 @@ impl FakeScheduler {
             .map_err(|()| PortError::config(io::Error::other("invalid worker endpoint scheme")))
     }
 
-    /// Sets the snapshot returned by [`SchedulerPort::snapshot`], sorting workers by id.
+    /// Sets the snapshot, sorting workers, completion cells and physical cordons once.
     pub fn set_snapshot(&self, mut snapshot: SchedulerSnapshot) {
+        snapshot
+            .source_rates
+            .sort_unstable_by_key(|row| (row.source, row.preferred_fleet));
+        snapshot
+            .source_rates
+            .dedup_by_key(|row| (row.source, row.preferred_fleet));
+        snapshot.cordons.sort_unstable_by(|a, b| {
+            (a.fleet, a.instance.as_ref()).cmp(&(b.fleet, b.instance.as_ref()))
+        });
+        snapshot
+            .cordons
+            .dedup_by(|a, b| a.fleet == b.fleet && a.instance == b.instance);
         if snapshot.executing.is_empty() {
             snapshot.workers.sort_unstable_by(|a, b| a.id.cmp(&b.id));
         } else {
@@ -634,11 +649,6 @@ impl FakeScheduler {
     /// Makes snapshot queries fail while `fail` is true.
     pub fn fail_snapshot(&self, fail: bool) {
         self.state.lock().failing.snapshot = fail;
-    }
-
-    /// Removes `worker` from the scheduler: later drain requests for it report not found.
-    pub fn vanish(&self, worker: WorkerId) {
-        self.state.lock().vanished.push(worker);
     }
 
     /// Makes `run_controller` fail at once without signalling readiness while `fail` is true.
@@ -786,12 +796,16 @@ impl FakeScheduler {
         self.worker_stops.clone()
     }
 
-    /// The `set_draining` calls that succeeded, in the order they were made, each with its
-    /// flag: `true` starts draining the worker and `false` cancels the drain. A call the fake
-    /// refuses for a vanished worker is not listed.
+    /// Successful physical drain requests in call order, with their requested flags.
     #[must_use]
-    pub fn draining_calls(&self) -> Vec<(WorkerId, bool)> {
+    pub fn draining_calls(&self) -> Vec<(FleetName, InstanceId, bool)> {
         self.state.lock().draining_calls.clone()
+    }
+
+    /// Complete census retention requests in call order, including the supplied clock and grace.
+    #[must_use]
+    pub fn retain_drains_calls(&self) -> Vec<DrainRetention> {
+        self.state.lock().retention_calls.clone()
     }
 }
 
@@ -850,6 +864,9 @@ impl SchedulerPort for FakeScheduler {
             return Err(PortError::unavailable("scheduler is unavailable"));
         }
         into.completed = state.snapshot.completed;
+        into.source_rates.clone_from(&state.snapshot.source_rates);
+        into.source_rates_at = state.snapshot.source_rates_at;
+        into.cordons.clone_from(&state.snapshot.cordons);
         into.stores.clone_from(&state.snapshot.stores);
         into.workers.clone_from(&state.snapshot.workers);
         into.queued.clone_from(&state.snapshot.queued);
@@ -871,12 +888,35 @@ impl SchedulerPort for FakeScheduler {
         Ok(())
     }
 
-    async fn set_draining(&self, worker: &WorkerId, draining: bool) -> Result<(), PortError> {
-        let mut state = self.state.lock();
-        if state.vanished.contains(worker) {
-            return Err(PortError::NotFound(Subject::Worker(worker.clone())));
-        }
-        state.draining_calls.push((worker.clone(), draining));
+    async fn set_draining(
+        &self,
+        fleet: &FleetName,
+        instance: &InstanceId,
+        draining: bool,
+    ) -> Result<(), PortError> {
+        self.state
+            .lock()
+            .draining_calls
+            .push((fleet.clone(), instance.clone(), draining));
+        Ok(())
+    }
+
+    async fn retain_drains(
+        &self,
+        now: Tick,
+        grace: Duration,
+        live: &[(&FleetName, &FleetSupply)],
+    ) -> Result<(), PortError> {
+        let census = live
+            .iter()
+            .flat_map(|(fleet, supply)| {
+                supply
+                    .instances
+                    .iter()
+                    .map(move |instance| ((*fleet).clone(), instance.id.clone()))
+            })
+            .collect();
+        self.state.lock().retention_calls.push((now, grace, census));
         Ok(())
     }
 
@@ -1234,28 +1274,63 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn snapshot_sorts_workers_remaps_executions_and_reuses_buffers() -> TestResult {
-        use std::time::Duration;
+    fn snapshot_rate_fixture(clock: &gang_clock::TestClock) -> TestResult<SchedulerSnapshot> {
+        use gang_clock::Clock;
+        use gang_spi::{CompletionRates, InstanceCordon, NonNegativeFinite, ResourceRates};
+        use gang_types::SourceId;
 
-        use gang_clock::Timestamp;
-        use gang_spi::{ExecutingDemand, QueuedDemand, WorkerState};
+        let created_at = clock.monotonic();
+        clock.advance(Duration::from_secs(1));
+        let at = clock.monotonic();
+        clock.advance(Duration::from_secs(1));
+        let source = SourceId::from_identity_str("example:alice").expect("valid identity");
+        let row = |source, preferred_fleet| CompletionRates {
+            source,
+            preferred_fleet,
+            generation: 7,
+            created_at,
+            at,
+            completions: NonNegativeFinite::try_new(0.5).expect("finite"),
+            timed_completions: NonNegativeFinite::try_new(0.25).expect("finite"),
+            work: ResourceRates::default(),
+        };
+        let cordons = [(0, "a"), (0, "z"), (1, "a")]
+            .into_iter()
+            .map(|(fleet, name)| {
+                Ok(InstanceCordon {
+                    fleet,
+                    instance: Arc::new(InstanceId::try_new(name)?),
+                })
+            })
+            .collect::<TestResult<Vec<_>>>()?;
+        Ok(SchedulerSnapshot {
+            source_rates: vec![row(None, 0), row(None, 1), row(Some(source), 0)],
+            source_rates_at: clock.monotonic(),
+            cordons,
+            ..SchedulerSnapshot::default()
+        })
+    }
+
+    fn snapshot_worker(name: &str) -> TestResult<gang_spi::WorkerState> {
+        Ok(gang_spi::WorkerState {
+            id: crate::worker_id(name)?,
+            fleet: FleetName::try_new("example-fleet")?,
+            environment: Some("host:test".parse()?),
+            running_actions: 1,
+            max_inflight_actions: None,
+            draining: false,
+            paused: false,
+            last_seen: Timestamp::UNIX_EPOCH,
+        })
+    }
+
+    fn snapshot_demand_fixture()
+    -> TestResult<(gang_spi::QueuedDemand, Vec<gang_spi::ExecutingDemand>)> {
+        use gang_spi::{ExecutingDemand, QueuedDemand};
         use gang_types::{ActionResources, FleetSet};
 
-        let scheduler = FakeScheduler::new()?;
-        let worker = |name| -> TestResult<WorkerState> {
-            Ok(WorkerState {
-                id: crate::worker_id(name)?,
-                fleet: FleetName::try_new("example-fleet")?,
-                environment: Some("host:test".parse()?),
-                running_actions: 1,
-                max_inflight_actions: None,
-                draining: false,
-                paused: false,
-                last_seen: Timestamp::UNIX_EPOCH,
-            })
-        };
         let queued = QueuedDemand {
+            source: None,
             candidates: FleetSet::prefix(1)?,
             environment: "host:test".parse()?,
             resources: ActionResources::default(),
@@ -1263,78 +1338,116 @@ mod tests {
             priority: 0,
             expected: Some(Duration::from_secs(7)),
         };
-        let executions = vec![
-            ExecutingDemand {
-                worker: 0,
-                started: Timestamp::from_unix_millis(10),
-                expected: Some(Duration::from_secs(3)),
-            },
-            ExecutingDemand {
-                worker: 1,
-                started: Timestamp::from_unix_millis(20),
-                expected: None,
-            },
-        ];
+        let executions = [(0, 10, Some(Duration::from_secs(3))), (1, 20, None)]
+            .into_iter()
+            .map(|(worker, started, expected)| ExecutingDemand {
+                source: None,
+                candidates: queued.candidates,
+                resources: queued.resources,
+                worker,
+                started: Timestamp::from_unix_millis(started),
+                expected,
+            })
+            .collect();
+        Ok((queued, executions))
+    }
+
+    fn snapshot_capacities(snapshot: &SchedulerSnapshot) -> [usize; 5] {
+        [
+            snapshot.workers.capacity(),
+            snapshot.queued.capacity(),
+            snapshot.executing.capacity(),
+            snapshot.source_rates.capacity(),
+            snapshot.cordons.capacity(),
+        ]
+    }
+
+    #[tokio::test]
+    async fn snapshot_sorts_workers_remaps_executions_and_reuses_buffers() -> TestResult {
+        use gang_clock::{Clock, TestClock};
+        use gang_spi::InstanceCordon;
+
+        let scheduler = FakeScheduler::new()?;
+        let clock = TestClock::new(Timestamp::UNIX_EPOCH);
+        let frame = snapshot_rate_fixture(&clock)?;
+        let rates = frame.source_rates;
+        let rates_at = frame.source_rates_at;
+        let cordons = frame.cordons;
+        let (queued, executions) = snapshot_demand_fixture()?;
         scheduler.set_snapshot(SchedulerSnapshot {
-            workers: vec![worker("z")?, worker("a")?],
+            workers: vec![snapshot_worker("z")?, snapshot_worker("a")?],
             queued: vec![queued.clone()],
             executing: executions.clone(),
+            source_rates: rates.iter().rev().copied().collect(),
+            source_rates_at: rates_at,
+            cordons: cordons.iter().rev().cloned().collect(),
             ..SchedulerSnapshot::default()
         });
         let mut into = SchedulerSnapshot {
             workers: Vec::with_capacity(8),
             queued: Vec::with_capacity(8),
             executing: Vec::with_capacity(8),
+            source_rates: Vec::with_capacity(8),
+            cordons: Vec::with_capacity(8),
             ..SchedulerSnapshot::default()
         };
-        into.workers.push(worker("stale")?);
+        into.workers.push(snapshot_worker("stale")?);
         into.queued.push(queued.clone());
         into.executing.push(executions[0].clone());
-        let capacities = (
-            into.workers.capacity(),
-            into.queued.capacity(),
-            into.executing.capacity(),
-        );
+        let mut stale = rates[0];
+        stale.preferred_fleet = 9;
+        into.source_rates.push(stale);
+        into.cordons.push(InstanceCordon {
+            fleet: 9,
+            instance: Arc::new(InstanceId::try_new("stale")?),
+        });
+        let capacities = snapshot_capacities(&into);
         scheduler.snapshot(&mut into).await?;
         assert_eq!(into.workers[0].id, crate::worker_id("a")?);
         assert_eq!(into.workers[1].id, crate::worker_id("z")?);
-        assert_eq!(into.executing[0].worker, 1);
-        assert_eq!(into.executing[1].worker, 0);
-        assert_eq!(into.executing[0].started, executions[0].started);
-        assert_eq!(into.executing[0].expected, executions[0].expected);
-        assert_eq!(into.queued, vec![queued.clone()]);
+        let mut expected_executions = executions.clone();
+        expected_executions[0].worker = 1;
+        expected_executions[1].worker = 0;
+        assert_eq!(into.executing, expected_executions);
+        assert_eq!(into.source_rates, rates);
+        assert_eq!(into.source_rates_at, rates_at);
+        assert_eq!(into.cordons, cordons);
+        assert!(Arc::ptr_eq(&into.cordons[0].instance, &cordons[0].instance));
+        scheduler.snapshot(&mut into).await?;
         assert_eq!(
-            (
-                into.workers.capacity(),
-                into.queued.capacity(),
-                into.executing.capacity()
-            ),
-            capacities
+            into.source_rates, rates,
+            "a repeated fill must not append rows"
         );
-
+        assert_eq!(
+            into.cordons, cordons,
+            "a repeated fill must not append intents"
+        );
+        assert_eq!(into.queued, vec![queued.clone()]);
+        assert_eq!(snapshot_capacities(&into), capacities);
         scheduler.set_snapshot(SchedulerSnapshot::default());
         scheduler.snapshot(&mut into).await?;
         assert!(into.workers.is_empty() && into.queued.is_empty() && into.executing.is_empty());
+        assert!(into.source_rates.is_empty() && into.cordons.is_empty());
+        assert_eq!(into.source_rates_at, Tick::ORIGIN);
         let mut expected = executions[1].clone();
         expected.worker = 0;
         scheduler.set_snapshot(SchedulerSnapshot {
-            workers: vec![worker("a")?],
+            workers: vec![snapshot_worker("a")?],
             queued: vec![queued.clone()],
             executing: vec![expected.clone()],
+            source_rates: vec![rates[2]],
+            source_rates_at: clock.monotonic(),
+            cordons: vec![cordons[1].clone()],
             ..SchedulerSnapshot::default()
         });
         scheduler.snapshot(&mut into).await?;
         assert_eq!(into.workers[0].id, crate::worker_id("a")?);
         assert_eq!(into.queued, vec![queued]);
         assert_eq!(into.executing, vec![expected]);
-        assert_eq!(
-            (
-                into.workers.capacity(),
-                into.queued.capacity(),
-                into.executing.capacity()
-            ),
-            capacities
-        );
+        assert_eq!(into.source_rates, vec![rates[2]]);
+        assert_eq!(into.source_rates_at, clock.monotonic());
+        assert_eq!(into.cordons, vec![cordons[1].clone()]);
+        assert_eq!(snapshot_capacities(&into), capacities);
         Ok(())
     }
 
@@ -1387,42 +1500,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_draining_refuses_only_vanished_workers() -> TestResult {
+    async fn physical_drain_requests_succeed_without_connected_workers() -> TestResult {
         let scheduler = FakeScheduler::new()?;
-        let worker = WorkerId::try_new("worker-1")?;
-        scheduler.set_draining(&worker, true).await?;
-
-        scheduler.vanish(worker.clone());
-        let refused = scheduler.set_draining(&worker, true).await;
-        assert!(matches!(
-            refused,
-            Err(PortError::NotFound(Subject::Worker(id))) if id == worker
-        ));
+        let fleet = FleetName::try_new("example")?;
+        let instance = InstanceId::try_new("worker-1")?;
+        scheduler.set_draining(&fleet, &instance, true).await?;
+        let mut snapshot = SchedulerSnapshot::default();
+        scheduler.snapshot(&mut snapshot).await?;
+        assert!(snapshot.workers.is_empty() && snapshot.cordons.is_empty());
+        assert_eq!(scheduler.draining_calls(), vec![(fleet, instance, true)]);
         Ok(())
     }
 
     #[tokio::test]
-    async fn set_draining_records_each_call_with_its_flag() -> TestResult {
+    async fn set_draining_records_each_physical_call_with_its_flag() -> TestResult {
         let scheduler = FakeScheduler::new()?;
-        let first = WorkerId::try_new("worker-1")?;
-        let second = WorkerId::try_new("worker-2")?;
-        scheduler.set_draining(&first, true).await?;
-        scheduler.set_draining(&second, true).await?;
-        scheduler.set_draining(&first, false).await?;
-        let expected = vec![
-            (first.clone(), true),
-            (second.clone(), true),
-            (first.clone(), false),
-        ];
-        assert_eq!(scheduler.draining_calls(), expected);
+        let fleet = FleetName::try_new("example")?;
+        let other_fleet = FleetName::try_new("other")?;
+        let first = InstanceId::try_new("worker-1")?;
+        let second = InstanceId::try_new("worker-2")?;
+        scheduler.set_draining(&fleet, &first, true).await?;
+        scheduler.set_draining(&other_fleet, &second, true).await?;
+        scheduler.set_draining(&fleet, &first, false).await?;
+        assert_eq!(
+            scheduler.draining_calls(),
+            vec![
+                (fleet.clone(), first.clone(), true),
+                (other_fleet, second, true),
+                (fleet, first, false)
+            ]
+        );
+        Ok(())
+    }
 
-        scheduler.vanish(second.clone());
-        let refused = scheduler.set_draining(&second, false).await;
-        assert!(matches!(
-            refused,
-            Err(PortError::NotFound(Subject::Worker(id))) if id == second
-        ));
-        assert_eq!(scheduler.draining_calls(), expected);
+    fn require_send<T: Send>(value: T) -> T {
+        value
+    }
+
+    #[tokio::test]
+    async fn retain_drains_records_the_complete_borrowed_census() -> TestResult {
+        use gang_clock::{Clock, TestClock};
+
+        let scheduler = FakeScheduler::new()?;
+        let clock = TestClock::new(Timestamp::UNIX_EPOCH);
+        let fleet = FleetName::try_new("example")?;
+        let first = InstanceId::try_new("worker-1")?;
+        let second = InstanceId::try_new("worker-2")?;
+        let third = InstanceId::try_new("worker-3")?;
+        let supply = FleetSupply {
+            instances: [
+                (first.clone(), gang_types::InstanceLifecycle::Pending),
+                (second.clone(), gang_types::InstanceLifecycle::InService),
+                (third.clone(), gang_types::InstanceLifecycle::Terminating),
+            ]
+            .into_iter()
+            .map(|(id, lifecycle)| gang_spi::FleetInstance {
+                id,
+                lifecycle,
+                launched_at: clock.wall(),
+                release_first: false,
+            })
+            .collect(),
+            ..FleetSupply::default()
+        };
+        let grace = Duration::from_secs(30);
+        let live = [(&fleet, &supply)];
+        require_send(scheduler.retain_drains(clock.monotonic(), grace, &live)).await?;
+        clock.advance(Duration::from_secs(1));
+        scheduler
+            .retain_drains(clock.monotonic(), grace, &[])
+            .await?;
+        assert_eq!(
+            scheduler.retain_drains_calls(),
+            vec![
+                (
+                    Tick::ORIGIN,
+                    grace,
+                    vec![
+                        (fleet.clone(), first),
+                        (fleet.clone(), second),
+                        (fleet, third)
+                    ]
+                ),
+                (clock.monotonic(), grace, vec![])
+            ]
+        );
         Ok(())
     }
 
@@ -1836,6 +1998,8 @@ mod tests {
         );
         let spec = ControllerSpec {
             actions: Arc::new(gang_config::ActionsConfig::default()),
+            scaling: Arc::new(gang_config::ScalingConfig::default()),
+            clock: Arc::new(gang_clock::TestClock::new(Timestamp::UNIX_EPOCH)),
             content_store: &stores,
             action_store: &stores,
             fleets: &catalog,
@@ -1938,6 +2102,8 @@ mod tests {
         );
         let spec = ControllerSpec {
             actions: Arc::new(gang_config::ActionsConfig::default()),
+            scaling: Arc::new(gang_config::ScalingConfig::default()),
+            clock: Arc::new(gang_clock::TestClock::new(Timestamp::UNIX_EPOCH)),
             content_store: &stores,
             action_store: &stores,
             fleets: &catalog,
@@ -2162,6 +2328,8 @@ mod tests {
         );
         let spec = ControllerSpec {
             actions: Arc::new(gang_config::ActionsConfig::default()),
+            scaling: Arc::new(gang_config::ScalingConfig::default()),
+            clock: Arc::new(gang_clock::TestClock::new(Timestamp::UNIX_EPOCH)),
             content_store: &stores,
             action_store: &stores,
             fleets: &catalog,
@@ -2206,6 +2374,8 @@ mod tests {
         );
         let spec = ControllerSpec {
             actions: Arc::new(gang_config::ActionsConfig::default()),
+            scaling: Arc::new(gang_config::ScalingConfig::default()),
+            clock: Arc::new(gang_clock::TestClock::new(Timestamp::UNIX_EPOCH)),
             content_store: &stores,
             action_store: &stores,
             fleets: &catalog,

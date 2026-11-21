@@ -1,23 +1,20 @@
 //! The steps one reconcile pass decided on, in the order the caller applies them.
 
+use std::fmt;
+use std::time::Duration;
+
 use gang_clock::Timestamp;
 use gang_spi::{ScalingAuditEvent, ScalingEventKind};
 use gang_types::{FleetName, InstanceId, ScalingCause, WorkerId};
 
-/// What one reconcile pass decided. The caller applies the steps in order.
-///
-/// Steps are idempotent for the caller: a [`Action::StartDrain`] or [`Action::CancelDrain`] may
-/// be applied again until the scheduler reflects it. The caller records an audit event only
-/// after its step was applied successfully.
-///
-/// Each step names its fleet by its index in the [`FleetPass`](crate::FleetPass) slice of the pass,
-/// which is the order of the configured fleets. The caller resolves the index to the fleet's
-/// configuration with the same index.
+use crate::{CordonDecision, Metric, ScaleDecision};
+
+/// An idempotent plan. The caller records audit events only after successful application.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Plan {
     /// The wall time of the pass.
     pub at: Timestamp,
-    /// The steps, in the order the caller applies them.
+    /// Steps in application order; fleet indices follow the configured fleet order.
     pub steps: Vec<PlanStep>,
 }
 
@@ -29,36 +26,126 @@ impl Plan {
     }
 }
 
-/// One step of a plan: an [`Action`] on the fleet at `fleet` in the pass's
-/// [`FleetPass`](crate::FleetPass) slice.
+/// One action on the fleet at the corresponding index in the pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanStep {
-    /// The index of the fleet in the [`FleetPass`](crate::FleetPass) slice of the pass.
+    /// Configured fleet index.
     pub fleet: usize,
-    /// The change the step makes.
+    /// The change to apply.
     pub action: Action,
 }
 
-impl PlanStep {
-    /// The audit event that records this step at `at` for `fleet`, the name of the step's fleet.
-    /// Only the caller records it, and only after the step was applied successfully.
-    #[must_use]
-    pub fn audit_event(&self, at: Timestamp, fleet: &FleetName) -> ScalingAuditEvent {
-        ScalingAuditEvent {
-            at,
-            fleet: fleet.clone(),
-            kind: self.action.kind(),
-            cause: Some(self.action.cause()),
+/// At most 14 ASCII bytes: fixed four decimals below 1e9, trimmed, or scientific notation.
+/// Rounding the fixed branch up to 1e9 leaves just ten digits after trimming.
+struct MetricText(Metric);
+
+impl fmt::Display for MetricText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = self.0.get();
+        if value < 1e-6 {
+            return formatter.write_str("0");
+        }
+        if value >= 1e9 {
+            return write!(formatter, "{value:.4e}");
+        }
+        // The intermediate fixed representation is at most 15 bytes before zero trimming.
+        let mut buffer = [0u8; 15];
+        let mut remaining = &mut buffer[..];
+        std::io::Write::write_fmt(&mut remaining, format_args!("{value:.4}"))
+            .map_err(|_| fmt::Error)?;
+        let length = 15 - remaining.len();
+        let text = std::str::from_utf8(&buffer[..length]).map_err(|_| fmt::Error)?;
+        formatter.write_str(text.trim_end_matches('0').trim_end_matches('.'))
+    }
+}
+
+/// At most 25 ASCII bytes: a u64 seconds count, optional three millisecond digits, and `s`.
+/// Sub-millisecond precision is omitted from this diagnostic, never from decision arithmetic.
+struct DurationText(Duration);
+
+impl fmt::Display for DurationText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let seconds = self.0.as_secs();
+        let millis = self.0.subsec_millis();
+        if millis == 0 {
+            write!(formatter, "{seconds}s")
+        } else {
+            write!(formatter, "{seconds}.{millis:03}s")
         }
     }
 }
 
-/// What sets a fleet's need for the capacity a step adds.
+impl PlanStep {
+    /// Records a successfully applied decision. Physical cordon repairs are silent.
+    ///
+    /// Scale-out detail is at most 420 bytes. Its bound is `214 + 7 + 2*25 + 6*14 + 6*10 + 5`:
+    /// literal text, dimension, durations, metrics, u32 values and a boolean, respectively.
+    /// Drain detail is at most 315 bytes, bounded by `148 + 7 + 4*25 + 3*14 + 10 + 3 + 5`;
+    /// its last numeric values are one u32 and one u8. Both fit storage for every summary.
+    #[must_use]
+    pub fn audit_event(&self, at: Timestamp, fleet: &FleetName) -> Option<ScalingAuditEvent> {
+        let mut kind = self.action.kind()?;
+        match (&self.action, &mut kind) {
+            (Action::ScaleOut { summary, .. }, ScalingEventKind::ScaledOut { detail, .. }) => {
+                *detail = Some(format!(
+                    "dimension={} readiness={} horizon={} slots={} reliable={} capacity={} pre_ready={} persistent_load={} transient_backlog={} transient_extra={} persistent_queue={} extra_instances={} reachability={} persistent_streams={} streams={} zero_overhead={}",
+                    summary.dimension.as_str(),
+                    DurationText(summary.readiness),
+                    DurationText(summary.horizon),
+                    summary.slots,
+                    summary.reliable,
+                    MetricText(summary.capacity),
+                    MetricText(summary.pre_ready),
+                    MetricText(summary.persistent_load),
+                    MetricText(summary.transient_backlog),
+                    MetricText(summary.transient_extra),
+                    MetricText(summary.persistent_queue),
+                    summary.extra_instances,
+                    summary.reachability,
+                    summary.persistent_streams,
+                    summary.streams,
+                    summary.zero_overhead,
+                ));
+            }
+            (
+                Action::StartDrain {
+                    summary: Some(summary),
+                    ..
+                },
+                ScalingEventKind::DrainStarted { detail, .. },
+            ) => {
+                *detail = Some(format!(
+                    "dimension={} readiness={} horizon={} serving_instances={} remaining_capacity={} total_load={} queued_work={} waterline_percent={} dwell={} empty_after={} zero_overhead={}",
+                    summary.dimension.as_str(),
+                    DurationText(summary.readiness),
+                    DurationText(summary.horizon),
+                    summary.serving_instances,
+                    MetricText(summary.remaining_capacity),
+                    MetricText(summary.total_load),
+                    MetricText(summary.queued_work),
+                    summary.waterline_percent,
+                    DurationText(summary.dwell),
+                    DurationText(summary.empty_after),
+                    summary.horizon.is_zero(),
+                ));
+            }
+            _ => {}
+        }
+        Some(ScalingAuditEvent {
+            at,
+            fleet: fleet.clone(),
+            kind,
+            cause: self.action.cause(),
+        })
+    }
+}
+
+/// What sets the need for added capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NeedCause {
-    /// The fleet's queued and running work.
+    /// Queued or running work.
     Demand,
-    /// The fleet's minimum in force, which exceeds what its work needs.
+    /// The configured minimum exceeds the work's need.
     Minimum,
 }
 
@@ -71,14 +158,32 @@ impl From<NeedCause> for ScalingCause {
     }
 }
 
+/// Why a new physical-instance drain starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainReason {
+    /// An idle surplus instance reached its timeout.
+    IdleTimeout,
+    /// N−1 capacity held the load waterline for a full dwell.
+    Utilization,
+}
+
+impl From<DrainReason> for ScalingCause {
+    fn from(reason: DrainReason) -> Self {
+        match reason {
+            DrainReason::IdleTimeout => Self::IdleTimeout,
+            DrainReason::Utilization => Self::Utilization,
+        }
+    }
+}
+
 /// Why an instance is terminated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminationCause {
-    /// An in-service instance had no connected worker for its fleet's boot grace.
+    /// An in-service instance had no worker for its boot grace.
     Orphan,
-    /// A draining worker finished its work and was retired.
+    /// Every connection drained and all hosted work finished.
     DrainFinished,
-    /// A draining worker reached the longest allowed wait and was retired anyway.
+    /// The longest allowed drain wait elapsed.
     MaxDrainWait,
     /// An idle worker served an obsolete action environment.
     StaleEnvironment,
@@ -96,80 +201,87 @@ impl From<TerminationCause> for ScalingCause {
     }
 }
 
-/// One change to a fleet or to a worker. Repeating a step before the provisioner or the
-/// scheduler reflects it must be harmless; see [`Plan`].
+/// A change applied through the provisioner or physical-instance scheduler port.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// Raise a fleet's desired capacity. The caller asks the provisioner through
-    /// `ProvisionerPort::set_desired_capacity`.
+    /// Raises desired capacity, recording the inputs without allocating audit text.
     ScaleOut {
-        /// The capacity the pass counted before scaling out.
+        /// Desired capacity after this pass's terminations.
         from: u32,
-        /// The capacity requested.
+        /// Desired capacity to request.
         to: u32,
-        /// What sets the fleet's need for this capacity.
+        /// What sets the capacity need.
         need: NeedCause,
+        /// Captured purchase inputs.
+        summary: ScaleDecision,
     },
-    /// Lower a fleet's request for instances that have not launched. The caller calls
-    /// `ProvisionerPort::set_desired_capacity` with `to`.
+    /// Withdraws requests whose launches have not started.
     Withdraw {
-        /// The desired capacity before withdrawal.
+        /// Previous desired capacity.
         from: u32,
-        /// The desired capacity after withdrawal.
+        /// New desired capacity.
         to: u32,
     },
-    /// Stop a worker taking new actions. The caller calls
-    /// `SchedulerPort::set_draining(worker, true)`.
-    StartDrain(WorkerId),
-    /// Resume a draining worker so it takes new actions again. The caller calls
-    /// `SchedulerPort::set_draining(worker, false)`. Used instead of scaling out; the second
-    /// field records what sets the fleet's need for this capacity.
+    /// Cordons every connection of the representative worker's physical instance.
+    StartDrain {
+        /// A currently hosted representative connection.
+        worker: WorkerId,
+        /// Why the new drain starts.
+        reason: DrainReason,
+        /// N−1 inputs for utilization drains; absent for idle timeout.
+        summary: Option<CordonDecision>,
+    },
+    /// Silently reapplies an existing owned physical cordon to a mismatched connection.
+    ReinforceDrain(WorkerId),
+    /// Resumes an owned physical drain before buying capacity.
     CancelDrain(WorkerId, NeedCause),
-    /// Terminate an instance. The caller calls `ProvisionerPort::terminate`; the provisioner
-    /// lowers the desired capacity itself.
+    /// Terminates an instance; the provisioner lowers desired capacity itself.
     Terminate {
-        /// The instance to terminate.
+        /// Physical instance to terminate.
         instance: InstanceId,
-        /// Why the instance is terminated.
+        /// Why termination is required.
         cause: TerminationCause,
     },
 }
 
 impl Action {
-    /// The audit event kind this action records.
+    /// The event kind without formatted detail; cordon repairs have no event.
     #[must_use]
-    pub fn kind(&self) -> ScalingEventKind {
-        match self {
+    pub fn kind(&self) -> Option<ScalingEventKind> {
+        Some(match self {
             Self::ScaleOut { from, to, .. } => ScalingEventKind::ScaledOut {
                 from: *from,
                 to: *to,
+                detail: None,
             },
             Self::Withdraw { from, to } => ScalingEventKind::Withdrawn {
                 from: *from,
                 to: *to,
             },
-            Self::StartDrain(worker) => ScalingEventKind::DrainStarted {
+            Self::StartDrain { worker, .. } => ScalingEventKind::DrainStarted {
                 worker: worker.clone(),
+                detail: None,
             },
+            Self::ReinforceDrain(_) => return None,
             Self::CancelDrain(worker, _) => ScalingEventKind::DrainCancelled {
                 worker: worker.clone(),
             },
             Self::Terminate { instance, .. } => ScalingEventKind::Terminated {
                 instance: instance.clone(),
             },
-        }
+        })
     }
 
-    /// The autoscaler decision this action carries out. Scale-out and drain cancellation carry
-    /// their need, and termination carries its cause.
+    /// The decision cause; an idempotent repair is not a new decision.
     #[must_use]
-    pub fn cause(&self) -> ScalingCause {
-        match self {
+    pub fn cause(&self) -> Option<ScalingCause> {
+        Some(match self {
             Self::ScaleOut { need, .. } | Self::CancelDrain(_, need) => (*need).into(),
             Self::Withdraw { .. } => ScalingCause::Demand,
-            Self::StartDrain(_) => ScalingCause::IdleTimeout,
+            Self::StartDrain { reason, .. } => (*reason).into(),
+            Self::ReinforceDrain(_) => return None,
             Self::Terminate { cause, .. } => (*cause).into(),
-        }
+        })
     }
 }
 
@@ -178,151 +290,264 @@ mod tests {
     use gang_testkit::{TestResult, worker_id};
 
     use super::*;
+    use crate::ScalingDimension;
+    use crate::decision::metric;
 
-    fn instance() -> TestResult<InstanceId> {
-        Ok(InstanceId::try_new("i-0abc123")?)
+    fn event(action: Action) -> TestResult<ScalingAuditEvent> {
+        PlanStep { fleet: 0, action }
+            .audit_event(
+                Timestamp::from_unix_millis(42),
+                &FleetName::try_new("workers")?,
+            )
+            .ok_or_else(|| "expected an audited decision".into())
     }
 
-    fn fleet(name: &str) -> TestResult<FleetName> {
-        Ok(FleetName::try_new(name)?)
+    #[test]
+    fn decision_scalar_format_is_compact_and_preserves_ordinary_values() {
+        for (value, expected) in [
+            (f64::from_bits(1), "0"),
+            (1e-7, "0"),
+            (0.000_06, "0.0001"),
+            (1.0 / 3.0, "0.3333"),
+            (17.0, "17"),
+            (12.5, "12.5"),
+            (999_999_999.999_9, "999999999.9999"),
+            (999_999_999.999_99, "1000000000"),
+            (1e9, "1.0000e9"),
+            (f64::MAX, "1.7977e308"),
+        ] {
+            let text = MetricText(metric(value)).to_string();
+            assert_eq!(text, expected);
+            assert!(text.len() <= 14);
+        }
+        assert_eq!(DurationText(Duration::ZERO).to_string(), "0s");
+        assert_eq!(DurationText(Duration::from_mins(5)).to_string(), "300s");
+        assert_eq!(
+            DurationText(Duration::from_millis(1_234)).to_string(),
+            "1.234s"
+        );
+        assert_eq!(
+            DurationText(Duration::MAX).to_string(),
+            "18446744073709551615.999s",
+        );
+        assert!(DurationText(Duration::MAX).to_string().len() <= 25);
+    }
+
+    #[test]
+    fn extreme_scale_summaries_always_validate_within_the_proven_bound() -> TestResult {
+        for value in [
+            f64::from_bits(1),
+            1.0 / 3.0,
+            f64::MAX,
+            999_999_999.999_9,
+            999_999_999.999_99,
+        ] {
+            let value = metric(value);
+            let audit = event(Action::ScaleOut {
+                from: 0,
+                to: u32::MAX,
+                need: NeedCause::Demand,
+                summary: ScaleDecision {
+                    readiness: Duration::MAX,
+                    horizon: Duration::MAX,
+                    slots: u32::MAX,
+                    reliable: u32::MAX,
+                    dimension: ScalingDimension::Cpu,
+                    capacity: value,
+                    pre_ready: value,
+                    persistent_load: value,
+                    transient_backlog: value,
+                    transient_extra: value,
+                    persistent_queue: value,
+                    extra_instances: u32::MAX,
+                    reachability: u32::MAX,
+                    persistent_streams: u32::MAX,
+                    streams: u32::MAX,
+                    zero_overhead: true,
+                },
+            })?;
+            assert!(audit.kind.validate().is_ok());
+            let ScalingEventKind::ScaledOut {
+                detail: Some(detail),
+                ..
+            } = audit.kind
+            else {
+                return Err("missing scale summary".into());
+            };
+            assert!(detail.len() <= 420);
+            assert!(detail.len() <= ScalingEventKind::MAX_DECISION_DETAIL_BYTES);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn extreme_cordon_summaries_always_validate_within_the_proven_bound() -> TestResult {
+        for value in [
+            f64::from_bits(1),
+            1.0 / 3.0,
+            f64::MAX,
+            999_999_999.999_9,
+            999_999_999.999_99,
+        ] {
+            let value = metric(value);
+            let audit = event(Action::StartDrain {
+                worker: worker_id("i-0abc123")?,
+                reason: DrainReason::Utilization,
+                summary: Some(CordonDecision {
+                    readiness: Duration::MAX,
+                    horizon: Duration::MAX,
+                    dimension: ScalingDimension::Cpu,
+                    serving_instances: u32::MAX,
+                    remaining_capacity: value,
+                    total_load: value,
+                    queued_work: value,
+                    waterline_percent: u8::MAX,
+                    dwell: Duration::MAX,
+                    empty_after: Duration::MAX,
+                }),
+            })?;
+            assert!(audit.kind.validate().is_ok());
+            let ScalingEventKind::DrainStarted {
+                detail: Some(detail),
+                ..
+            } = audit.kind
+            else {
+                return Err("missing cordon summary".into());
+            };
+            assert!(detail.len() <= 315);
+            assert!(detail.len() <= ScalingEventKind::MAX_DECISION_DETAIL_BYTES);
+        }
+        Ok(())
     }
 
     #[test]
     fn scale_out_audits_as_scaled_out() -> TestResult {
-        let step = PlanStep {
-            fleet: 0,
-            action: Action::ScaleOut {
-                from: 2,
-                to: 5,
-                need: NeedCause::Demand,
-            },
+        let summary = ScaleDecision {
+            dimension: ScalingDimension::Memory,
+            persistent_queue: metric(17.0),
+            zero_overhead: true,
+            ..ScaleDecision::default()
         };
-        let at = Timestamp::from_unix_millis(42);
-
-        assert_eq!(
-            step.audit_event(at, &fleet("x86-64-fleet")?),
-            ScalingAuditEvent {
-                at,
-                fleet: fleet("x86-64-fleet")?,
-                kind: ScalingEventKind::ScaledOut { from: 2, to: 5 },
-                cause: Some(ScalingCause::Demand),
-            }
-        );
+        let audit = event(Action::ScaleOut {
+            from: 2,
+            to: 5,
+            need: NeedCause::Demand,
+            summary,
+        })?;
+        assert_eq!(audit.cause, Some(ScalingCause::Demand));
+        let ScalingEventKind::ScaledOut {
+            from,
+            to,
+            detail: Some(detail),
+        } = audit.kind
+        else {
+            return Err("missing scale inputs".into());
+        };
+        assert_eq!((from, to), (2, 5));
+        assert!(detail.contains("dimension=memory"));
+        assert!(detail.contains("persistent_queue=17"));
+        assert!(detail.contains("zero_overhead=true"));
         Ok(())
     }
 
     #[test]
     fn withdraw_audits_as_withdrawn_for_demand() -> TestResult {
-        let step = PlanStep {
-            fleet: 0,
-            action: Action::Withdraw { from: 4, to: 2 },
-        };
-        let at = Timestamp::from_unix_millis(42);
-        assert_eq!(
-            step.audit_event(at, &fleet("x86-64-fleet")?),
-            ScalingAuditEvent {
-                at,
-                fleet: fleet("x86-64-fleet")?,
-                kind: ScalingEventKind::Withdrawn { from: 4, to: 2 },
-                cause: Some(ScalingCause::Demand),
-            }
-        );
+        let audit = event(Action::Withdraw { from: 4, to: 2 })?;
+        assert_eq!(audit.kind, ScalingEventKind::Withdrawn { from: 4, to: 2 });
+        assert_eq!(audit.cause, Some(ScalingCause::Demand));
         Ok(())
     }
 
     #[test]
     fn start_drain_audits_as_drain_started() -> TestResult {
-        let step = PlanStep {
-            fleet: 1,
-            action: Action::StartDrain(worker_id("i-0abc123")?),
-        };
-        let at = Timestamp::from_unix_millis(7);
-
+        let worker = worker_id("i-0abc123")?;
+        let audit = event(Action::StartDrain {
+            worker: worker.clone(),
+            reason: DrainReason::IdleTimeout,
+            summary: None,
+        })?;
         assert_eq!(
-            step.audit_event(at, &fleet("aarch64-fleet")?),
-            ScalingAuditEvent {
-                at,
-                fleet: fleet("aarch64-fleet")?,
-                kind: ScalingEventKind::DrainStarted {
-                    worker: worker_id("i-0abc123")?,
-                },
-                cause: Some(ScalingCause::IdleTimeout),
+            audit.kind,
+            ScalingEventKind::DrainStarted {
+                worker,
+                detail: None
             }
+        );
+        assert_eq!(audit.cause, Some(ScalingCause::IdleTimeout));
+        Ok(())
+    }
+
+    #[test]
+    fn utilization_drain_records_waterline_and_dwell() -> TestResult {
+        let audit = event(Action::StartDrain {
+            worker: worker_id("i-0abc123")?,
+            reason: DrainReason::Utilization,
+            summary: Some(CordonDecision {
+                waterline_percent: 70,
+                dwell: std::time::Duration::from_mins(5),
+                ..CordonDecision::default()
+            }),
+        })?;
+        assert_eq!(audit.cause, Some(ScalingCause::Utilization));
+        let ScalingEventKind::DrainStarted {
+            detail: Some(detail),
+            ..
+        } = audit.kind
+        else {
+            return Err("missing cordon inputs".into());
+        };
+        assert!(detail.contains("waterline_percent=70"));
+        assert!(detail.contains("dwell=300s"));
+        Ok(())
+    }
+
+    #[test]
+    fn reinforcement_never_audits() -> TestResult {
+        let action = Action::ReinforceDrain(worker_id("i-0abc123")?);
+        assert_eq!(action.kind(), None);
+        assert_eq!(action.cause(), None);
+        assert_eq!(
+            PlanStep { fleet: 0, action }
+                .audit_event(Timestamp::default(), &FleetName::try_new("workers")?),
+            None
         );
         Ok(())
     }
 
     #[test]
     fn cancel_drain_audits_as_drain_cancelled() -> TestResult {
-        let step = PlanStep {
-            fleet: 1,
-            action: Action::CancelDrain(worker_id("i-0abc123")?, NeedCause::Demand),
-        };
-        let at = Timestamp::from_unix_millis(3);
-
-        assert_eq!(
-            step.audit_event(at, &fleet("aarch64-fleet")?),
-            ScalingAuditEvent {
-                at,
-                fleet: fleet("aarch64-fleet")?,
-                kind: ScalingEventKind::DrainCancelled {
-                    worker: worker_id("i-0abc123")?,
-                },
-                cause: Some(ScalingCause::Demand),
-            }
-        );
+        let worker = worker_id("i-0abc123")?;
+        let audit = event(Action::CancelDrain(worker.clone(), NeedCause::Demand))?;
+        assert_eq!(audit.kind, ScalingEventKind::DrainCancelled { worker });
+        assert_eq!(audit.cause, Some(ScalingCause::Demand));
         Ok(())
     }
 
     #[test]
     fn capacity_added_for_minimum_audits_as_minimum() -> TestResult {
-        let at = Timestamp::from_unix_millis(3);
-        let fleet = fleet("x86-64-fleet")?;
-        let scale = PlanStep {
-            fleet: 0,
-            action: Action::ScaleOut {
+        for action in [
+            Action::ScaleOut {
                 from: 0,
                 to: 1,
                 need: NeedCause::Minimum,
+                summary: ScaleDecision::default(),
             },
-        };
-        let cancel = PlanStep {
-            fleet: 0,
-            action: Action::CancelDrain(worker_id("i-0abc123")?, NeedCause::Minimum),
-        };
-        assert_eq!(
-            scale.audit_event(at, &fleet).cause,
-            Some(ScalingCause::Minimum)
-        );
-        assert_eq!(
-            cancel.audit_event(at, &fleet).cause,
-            Some(ScalingCause::Minimum)
-        );
+            Action::CancelDrain(worker_id("i-0abc123")?, NeedCause::Minimum),
+        ] {
+            assert_eq!(event(action)?.cause, Some(ScalingCause::Minimum));
+        }
         Ok(())
     }
 
     #[test]
     fn terminate_audits_as_terminated() -> TestResult {
-        let step = PlanStep {
-            fleet: 0,
-            action: Action::Terminate {
-                instance: instance()?,
-                cause: TerminationCause::DrainFinished,
-            },
-        };
-        let at = Timestamp::from_unix_millis(9);
-
-        assert_eq!(
-            step.audit_event(at, &fleet("x86-64-fleet")?),
-            ScalingAuditEvent {
-                at,
-                fleet: fleet("x86-64-fleet")?,
-                kind: ScalingEventKind::Terminated {
-                    instance: instance()?,
-                },
-                cause: Some(ScalingCause::DrainFinished),
-            }
-        );
+        let instance = InstanceId::try_new("i-0abc123")?;
+        let audit = event(Action::Terminate {
+            instance: instance.clone(),
+            cause: TerminationCause::DrainFinished,
+        })?;
+        assert_eq!(audit.kind, ScalingEventKind::Terminated { instance });
+        assert_eq!(audit.cause, Some(ScalingCause::DrainFinished));
         Ok(())
     }
 }

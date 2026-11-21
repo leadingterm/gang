@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. Builds on ADR-11, ADR-23 and ADR-41. Partly superseded: learned reservation and duration histories are now persisted as described in SPECIFICATION §5; the original memory-only history and rejection of database persistence no longer apply. Readiness and backlog age remain term-local.
+Accepted, partly superseded by [ADR-60](adr-60-rate-based-scaling.md) for v0.3.4: candidate-count payback simulation, the 2B stream rule, readiness-based unknown durations and the `boot_grace` readiness prior are historical, not current policy. ADR-60 keeps readiness measurement, reachability and one display-only final dispatch. Learned reservation and duration histories are persisted as described in SPECIFICATION §5; the original memory-only history and rejection of database persistence no longer apply. Readiness remains term-local.
 
 ## Context
 

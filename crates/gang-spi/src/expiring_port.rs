@@ -127,11 +127,13 @@ pub enum RecordKind {
     HistoryChunk,
     /// A provider infrastructure observation retained for the dashboard history window.
     InfrastructureEvent,
+    /// Learned per-source activity periods and an optional active-period checkpoint.
+    SourceProfile,
 }
 
 impl RecordKind {
     /// Every kind, in declaration order.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::LoginAttempt,
         Self::DeviceCode,
         Self::UserCode,
@@ -140,6 +142,7 @@ impl RecordKind {
         Self::DurationHistory,
         Self::HistoryChunk,
         Self::InfrastructureEvent,
+        Self::SourceProfile,
     ];
 
     /// The kind's stable name in storage.
@@ -154,6 +157,7 @@ impl RecordKind {
             Self::DurationHistory => "duration-history",
             Self::HistoryChunk => "history-chunk",
             Self::InfrastructureEvent => "infrastructure-event",
+            Self::SourceProfile => "source-profile",
         }
     }
 }

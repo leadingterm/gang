@@ -517,10 +517,19 @@ fn input_root_skips_link_check_when_links_are_kept() {
 
 fn fleet_events() -> Result<Vec<Event>, Box<dyn std::error::Error>> {
     Ok(vec![
-        event(EventChange::ScaledOut { from: 0, to: 1 })?,
-        event(EventChange::ScaledOut { from: 1, to: 2 })?,
+        event(EventChange::ScaledOut {
+            from: 0,
+            to: 1,
+            detail: None,
+        })?,
+        event(EventChange::ScaledOut {
+            from: 1,
+            to: 2,
+            detail: None,
+        })?,
         event(EventChange::DrainStarted {
             worker: worker(WORKER)?,
+            detail: None,
         })?,
         event(EventChange::Terminated {
             instance: instance("local-1")?,
@@ -552,7 +561,11 @@ fn first_scale_out_from_zero_passes_when_it_starts_at_zero() -> TestResult {
 
 #[test]
 fn first_scale_out_from_zero_fails_when_the_fleet_is_not_empty() -> TestResult {
-    let events = [event(EventChange::ScaledOut { from: 1, to: 2 })?];
+    let events = [event(EventChange::ScaledOut {
+        from: 1,
+        to: 2,
+        detail: None,
+    })?];
     let check = verdict::first_scale_out_from_zero(&events);
     assert!(check.is_failure());
     Ok(())
@@ -560,7 +573,11 @@ fn first_scale_out_from_zero_fails_when_the_fleet_is_not_empty() -> TestResult {
 
 #[test]
 fn first_scale_out_from_zero_fails_when_it_raises_the_fleet_to_two() -> TestResult {
-    let events = [event(EventChange::ScaledOut { from: 0, to: 2 })?];
+    let events = [event(EventChange::ScaledOut {
+        from: 0,
+        to: 2,
+        detail: None,
+    })?];
     let check = verdict::first_scale_out_from_zero(&events);
     assert_eq!(failure(&check), "the first scale-out went from 0 to 2");
     Ok(())
@@ -595,6 +612,7 @@ fn worker_ids_fails_for_a_worker_id_without_a_uuid() -> TestResult {
     let events = [
         event(EventChange::DrainStarted {
             worker: worker("local-1")?,
+            detail: None,
         })?,
         event(EventChange::Terminated {
             instance: instance("local-1")?,
@@ -610,6 +628,7 @@ fn worker_ids_fails_when_the_instance_was_not_terminated() -> TestResult {
     let events = [
         event(EventChange::DrainStarted {
             worker: worker(WORKER)?,
+            detail: None,
         })?,
         event(EventChange::Terminated {
             instance: instance("local-2")?,
@@ -802,6 +821,7 @@ fn every_drain_terminated_passes_when_the_drained_instance_is_terminated() -> Te
 fn every_drain_terminated_fails_when_the_drained_instance_is_not_terminated() -> TestResult {
     let events = [event(EventChange::DrainStarted {
         worker: worker(WORKER)?,
+        detail: None,
     })?];
     assert!(!verdict::every_drain_terminated(&events));
     Ok(())
@@ -814,7 +834,11 @@ fn an_empty_history_is_not_drained() {
 
 #[test]
 fn every_drain_terminated_is_false_without_a_drain() -> TestResult {
-    let events = [event(EventChange::ScaledOut { from: 0, to: 1 })?];
+    let events = [event(EventChange::ScaledOut {
+        from: 0,
+        to: 1,
+        detail: None,
+    })?];
     assert!(!verdict::every_drain_terminated(&events));
     Ok(())
 }
@@ -893,7 +917,14 @@ const LARGE: &str = "local-large";
 const NOOP: &str = "local-noop";
 
 fn scaled_out(fleet: &str) -> Result<Event, Box<dyn std::error::Error>> {
-    fleet_event(fleet, EventChange::ScaledOut { from: 0, to: 1 })
+    fleet_event(
+        fleet,
+        EventChange::ScaledOut {
+            from: 0,
+            to: 1,
+            detail: None,
+        },
+    )
 }
 
 fn drained(fleet: &str) -> Result<Event, Box<dyn std::error::Error>> {
@@ -901,6 +932,7 @@ fn drained(fleet: &str) -> Result<Event, Box<dyn std::error::Error>> {
         fleet,
         EventChange::DrainStarted {
             worker: worker(WORKER)?,
+            detail: None,
         },
     )
 }

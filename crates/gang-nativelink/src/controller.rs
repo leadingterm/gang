@@ -57,23 +57,26 @@ use crate::placeable::{AdmittedFleets, PlaceableActions};
 use crate::serve::{Listener, ScopedRoutes, ServeShutdown, serve};
 use crate::settings;
 use crate::settings::WORKER_CONNECTIONS;
+use crate::source_rates::SourceRates;
 use crate::store_usage::StoreUsage;
 use crate::stores::build_stores;
 
 /// What the running controller hands to the plugin: the scheduler handles it queries.
 pub(crate) struct Handles {
     /// Connected workers and their assignments.
-    pub worker_scheduler: Arc<dyn WorkerScheduler>,
+    pub worker_scheduler: Arc<ObservingWorkerScheduler>,
     /// Queued actions and the platform properties they require.
     pub action_scheduler: Arc<dyn KnownPlatformPropertyProvider>,
     /// Every fleet's properties, to match queued actions against.
-    pub fleets: FleetCatalog,
+    pub fleets: Arc<FleetCatalog>,
     /// Actions that reached a terminal result on a worker since the controller started.
     pub completed: Arc<AtomicU64>,
     /// Learned worker slot durations.
     pub durations: Arc<Mutex<ActionDurations>>,
-    /// Controller wall clock shared by duration writers and readers.
+    /// Server clock shared by completion receipts, duration writers and snapshot readers.
     pub clock: Arc<dyn Clock>,
+    pub rates: Arc<SourceRates>,
+    pub scratch: tokio::sync::Mutex<crate::snapshot::Scratch>,
     /// The controller stores' usage, read through one reused metrics collector.
     pub stores: StoreUsage,
 }
@@ -199,22 +202,24 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         actions: action_scheduler,
         workers: worker_scheduler,
         resource,
-    } = scheduler_stack(&scheduler, spec.fleets, &spec.actions, resources)?;
+    } = scheduler_stack(
+        &scheduler,
+        spec.fleets,
+        &spec.actions,
+        resources,
+        Arc::clone(&spec.clock),
+    )?;
     let handoff = HandOff::new();
     let action_scheduler: Arc<dyn KnownPlatformPropertyProvider> =
         Arc::new(HandOffActions::new(action_scheduler, handoff.clone()));
     let completed = Arc::new(AtomicU64::new(0));
-    let history = Arc::clone(histories.lock().get_or_insert_with(|| {
-        Arc::new(Histories::new(
-            resource,
-            Arc::new(Mutex::new(ActionDurations::new(
-                spec.actions.history_keys,
-                spec.actions.history_window,
-            ))),
-        ))
-    }));
-    let durations = Arc::clone(&history.durations);
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+    let durations = retained_durations(histories, resource, &spec.actions);
+    let clock = Arc::clone(&spec.clock);
+    let fleets = Arc::new(spec.fleets.clone());
+    let rates = Arc::new(
+        SourceRates::new(&spec.scaling, fleets.len(), Arc::clone(&clock))
+            .map_err(NativeLinkEmbedError::native("source rates"))?,
+    );
     let draining = Arc::new(ObservingWorkerScheduler::new(
         worker_scheduler,
         Arc::clone(&action_scheduler)
@@ -224,6 +229,8 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         handoff.clone(),
         Arc::clone(&durations),
         Arc::clone(&clock),
+        Arc::clone(&fleets),
+        Arc::clone(&rates),
     ));
     let worker_scheduler: Arc<dyn WorkerScheduler> = draining.clone();
     let actions = HashMap::from([(scheduler.name.clone(), Arc::clone(&action_scheduler))]);
@@ -248,24 +255,17 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         .await?;
 
     let published = Arc::new(Handles {
-        worker_scheduler,
+        worker_scheduler: draining.clone(),
         action_scheduler,
-        fleets: spec.fleets.clone(),
+        fleets,
         completed,
         durations,
         clock,
+        rates,
+        scratch: tokio::sync::Mutex::new(crate::snapshot::Scratch::default()),
         stores: StoreUsage::new(Arc::clone(store_manager)),
     });
-    let claimed = handles.send_if_modified(|slot| {
-        if slot.is_some() {
-            return false;
-        }
-        *slot = Some(published);
-        true
-    });
-    if !claimed {
-        return Err(NativeLinkEmbedError::AlreadyServing);
-    }
+    publish(handles, published)?;
     let _serving = Serving(handles);
     ready.signal();
 
@@ -287,6 +287,41 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         handoff,
     )
     .await
+}
+
+fn retained_durations(
+    histories: &Mutex<Option<Arc<Histories>>>,
+    resource: Arc<ResourceSketch>,
+    actions: &gang_config::ActionsConfig,
+) -> Arc<Mutex<ActionDurations>> {
+    let history = Arc::clone(histories.lock().get_or_insert_with(|| {
+        Arc::new(Histories::new(
+            resource,
+            Arc::new(Mutex::new(ActionDurations::new(
+                actions.history_keys,
+                actions.history_window,
+            ))),
+        ))
+    }));
+    Arc::clone(&history.durations)
+}
+
+fn publish(
+    handles: &watch::Sender<Option<Arc<Handles>>>,
+    published: Arc<Handles>,
+) -> Result<(), NativeLinkEmbedError> {
+    let claimed = handles.send_if_modified(|slot| {
+        if slot.is_some() {
+            return false;
+        }
+        *slot = Some(published);
+        true
+    });
+    if claimed {
+        Ok(())
+    } else {
+        Err(NativeLinkEmbedError::AlreadyServing)
+    }
 }
 
 /// Routers built for the client and worker listener roles.
@@ -406,12 +441,13 @@ struct SchedulerStack {
     resource: Arc<ResourceSketch>,
 }
 
-/// The action stack over `NativeLink`'s simple scheduler on the system clock.
+/// The action stack over `NativeLink`'s simple scheduler.
 fn scheduler_stack(
     scheduler: &SchedulerConfig,
     fleets: &FleetCatalog,
     actions: &gang_config::ActionsConfig,
     resources: &OnceLock<Arc<ResourceSketch>>,
+    clock: Arc<dyn Clock>,
 ) -> Result<SchedulerStack, NativeLinkEmbedError> {
     let mut resource = None;
     let (actions, workers) = action_stack(
@@ -419,7 +455,7 @@ fn scheduler_stack(
         fleets,
         actions,
         resources,
-        Arc::new(SystemClock::new()),
+        clock,
         |simple, notify, sketch| {
             resource = Some(Arc::clone(&sketch));
             let db = memory_awaited_action_db_factory(
@@ -892,6 +928,8 @@ mod tests {
             config,
             &ControllerSpec {
                 actions: Arc::clone(actions),
+                scaling: Arc::new(gang_config::ScalingConfig::default()),
+                clock: Arc::new(SystemClock::new()),
                 content_store: &memory,
                 action_store: &memory,
                 fleets,
@@ -1571,6 +1609,8 @@ mod tests {
             gang_spi::ObservationSink::channel(NonZeroUsize::MIN, NonZeroUsize::MIN);
         let spec = ControllerSpec {
             actions: Arc::new(gang_config::ActionsConfig::default()),
+            scaling: Arc::new(gang_config::ScalingConfig::default()),
+            clock: Arc::new(SystemClock::new()),
             content_store: &store,
             action_store: &store,
             fleets: &fleets,
@@ -1812,11 +1852,8 @@ mod tests {
         Ok((status, String::from_utf8(body.to_vec())?))
     }
 
-    /// The cold-start memory exceeds the only fleet eligible for the requested CPU. Fitting
-    /// clamps memory to that fleet and reserves all its CPU.
-    #[tokio::test]
-    async fn scheduler_stack_clamps_to_eligible_capacity_and_reserves_whole_cpu() {
-        let fleets = FleetCatalog::try_new(
+    fn capacity_test_fleets() -> FleetCatalog {
+        FleetCatalog::try_new(
             [("fleet-a", 16, 8_u64), ("fleet-b", 4, 32)]
                 .into_iter()
                 .map(|(name, vcpus, memory_gib)| {
@@ -1836,7 +1873,14 @@ mod tests {
                 })
                 .collect(),
         )
-        .expect("valid fleet catalog");
+        .expect("valid fleet catalog")
+    }
+
+    /// The cold-start memory exceeds the only fleet eligible for the requested CPU. Fitting
+    /// clamps memory to that fleet and reserves all its CPU.
+    #[tokio::test]
+    async fn scheduler_stack_clamps_to_eligible_capacity_and_reserves_whole_cpu() {
+        let fleets = capacity_test_fleets();
         let config = default_config();
         let actions = Arc::new(
             serde_json::from_value(json!({
@@ -1851,6 +1895,8 @@ mod tests {
         );
         let spec = ControllerSpec {
             actions: Arc::clone(&actions),
+            scaling: Arc::new(gang_config::ScalingConfig::default()),
+            clock: Arc::new(SystemClock::new()),
             content_store: &store,
             action_store: &store,
             fleets: &fleets,
@@ -1863,9 +1909,14 @@ mod tests {
             panic!("expected historical scheduler");
         };
         historical.learn_from_workers = false;
-        let SchedulerStack { actions, .. } =
-            scheduler_stack(&scheduler, &fleets, &actions, &OnceLock::new())
-                .expect("scheduler stack");
+        let SchedulerStack { actions, .. } = scheduler_stack(
+            &scheduler,
+            &fleets,
+            &actions,
+            &OnceLock::new(),
+            Arc::clone(&spec.clock),
+        )
+        .expect("scheduler stack");
         let operation = OperationId::String("stack-wiring".to_owned());
         let digest = DigestInfo::new([1; 32], 1);
         let info = Arc::new(ActionInfo {
@@ -1951,6 +2002,8 @@ mod tests {
         );
         let spec = ControllerSpec {
             actions: Arc::new(gang_config::ActionsConfig::default()),
+            scaling: Arc::new(gang_config::ScalingConfig::default()),
+            clock: Arc::new(SystemClock::new()),
             content_store: &store,
             action_store: &store,
             fleets: &fleets,
@@ -1963,8 +2016,14 @@ mod tests {
             panic!("historical scheduler")
         };
         historical.learn_from_workers = false;
-        let SchedulerStack { actions, .. } =
-            scheduler_stack(&scheduler, &fleets, &spec.actions, &OnceLock::new()).expect("stack");
+        let SchedulerStack { actions, .. } = scheduler_stack(
+            &scheduler,
+            &fleets,
+            &spec.actions,
+            &OnceLock::new(),
+            Arc::clone(&spec.clock),
+        )
+        .expect("stack");
         let info = origin_test_action();
         let metadata = RequestMetadata {
             tool_invocation_id: "invocation".to_owned(),
@@ -2031,6 +2090,66 @@ mod tests {
         let origin = origin.expect("origin");
         assert_eq!(origin.identity, alice().to_string());
         assert_eq!(origin.bazel_metadata, Some(metadata));
+    }
+    #[tokio::test]
+    async fn deduplicated_operation_keeps_first_creator_source_after_creator_disconnects()
+    -> TestResult {
+        use opentelemetry::context::FutureExt as _;
+        let fleets = FleetCatalog::try_new(vec![fleet("fleet-a", Isa::X86_64)])?;
+        let stack = stack_on_test_clock(&fleets, &default_config())?;
+        let action = origin_test_action();
+        let context = |identity: &'static str| {
+            opentelemetry::Context::new().with_baggage([opentelemetry::KeyValue::new(
+                crate::observer::ENDUSER_ID,
+                identity,
+            )])
+        };
+        let mut creator = Some(
+            stack
+                .actions
+                .add_action(
+                    OperationId::String("creator-client-id".to_owned()),
+                    Arc::clone(&action),
+                )
+                .with_context(context("local:alice"))
+                .await?,
+        );
+        let joiner = stack
+            .actions
+            .add_action(OperationId::String("joiner-client-id".to_owned()), action)
+            .with_context(context("local:bob"))
+            .await?;
+        let clock = Arc::new(gang_clock::TestClock::new(
+            gang_clock::Timestamp::from_unix_millis(100_000),
+        ));
+        let rates = SourceRates::new(&gang_config::ScalingConfig::default(), fleets.len(), clock)?;
+        for disconnected in [false, true] {
+            let mut listing = stack
+                .actions
+                .filter_operations(OperationFilter::default())
+                .await?;
+            let row = listing.next().await.ok_or("retained operation")?;
+            let (state, origin) = row.as_state().await?;
+            assert_ne!(
+                state.client_operation_id,
+                OperationId::String("joiner-client-id".to_owned())
+            );
+            assert_eq!(
+                rates.source(origin.as_ref()),
+                gang_types::SourceId::from_identity_str("local:alice")
+            );
+            assert!(listing.next().await.is_none(), "joiner adds no operation");
+            if !disconnected {
+                // Dropping the client subscription must not substitute the remaining joiner's identity.
+                let (_, origin) = joiner.as_action_info().await?;
+                assert_eq!(
+                    rates.source(origin.as_ref()),
+                    gang_types::SourceId::from_identity_str("local:alice")
+                );
+                drop(creator.take());
+            }
+        }
+        Ok(())
     }
 
     /// Confirms the client router puts Bazel request metadata in the scheduler's context.

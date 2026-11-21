@@ -261,7 +261,7 @@ downloadedBytes: number, };
 
 export type CacheStore = "CAS" | "AC";
 
-export type Cause = "DEMAND" | "MINIMUM" | "IDLE_TIMEOUT" | "ORPHAN" | "DRAIN_FINISHED" | "MAX_DRAIN_WAIT";
+export type Cause = "DEMAND" | "MINIMUM" | "IDLE_TIMEOUT" | "UTILIZATION" | "ORPHAN" | "DRAIN_FINISHED" | "MAX_DRAIN_WAIT";
 
 export type Closed = { 
 /**
@@ -374,7 +374,19 @@ readiness?: Duration,
 /**
  * Latest expected queued action start at the planned capacity, absent without attributed queue.
  */
-expectedWait?: Duration, };
+expectedWait?: Duration, 
+/**
+ * Persistent load in integer deci-slots, absent until measured; zero is a measurement.
+ */
+load?: number, 
+/**
+ * Transient queued slot-time before readiness subtraction, rounded to whole seconds.
+ */
+backlog?: Duration, 
+/**
+ * Instantaneous serving resource occupancy in permille, absent without serving capacity.
+ */
+utilization?: number, };
 
 export type DeviceAuthorization = { 
 /**
@@ -420,7 +432,11 @@ from: number,
 /**
  * Size after the change.
  */
-to: number, } } | { "launchFailed": { 
+to: number, 
+/**
+ * The scaling decision's explanation, when recorded.
+ */
+detail?: string, } } | { "launchFailed": { 
 /**
  * Instances that exist, excluding terminating instances.
  */
@@ -444,7 +460,11 @@ to: number, } } | { "drainStarted": {
 /**
  * Reference `workers/{worker}` of the worker that started to drain.
  */
-worker: string, } } | { "drainCancelled": { 
+worker: string, 
+/**
+ * The scaling decision's explanation, when recorded.
+ */
+detail?: string, } } | { "drainCancelled": { 
 /**
  * Reference `workers/{worker}` of the worker whose drain was cancelled.
  */
@@ -991,7 +1011,11 @@ from: number,
 /**
  * Size after the change.
  */
-to: number, } } | { "launchFailed": { 
+to: number, 
+/**
+ * The scaling decision's explanation, when recorded.
+ */
+detail?: string, } } | { "launchFailed": { 
 /**
  * Instances that exist, excluding terminating instances.
  */
@@ -1015,7 +1039,11 @@ to: number, } } | { "drainStarted": {
 /**
  * Reference `workers/{worker}` of the worker that started to drain.
  */
-worker: string, } } | { "drainCancelled": { 
+worker: string, 
+/**
+ * The scaling decision's explanation, when recorded.
+ */
+detail?: string, } } | { "drainCancelled": { 
 /**
  * Reference `workers/{worker}` of the worker whose drain was cancelled.
  */

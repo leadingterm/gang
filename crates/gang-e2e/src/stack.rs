@@ -804,6 +804,27 @@ impl<'a> Stack<'a> {
             .build_until(probes, run, stop)
     }
 
+    /// Runs selected probes as a caller-selected authenticated client, in an independent
+    /// output root whose cancellation and cleanup remain owned by the scenario.
+    pub(crate) fn build_selected_until(
+        &self,
+        remote: Remote,
+        probes: &[Probe],
+        run: &Run,
+        output_root: &str,
+        stop: oneshot::Receiver<String>,
+    ) -> Result<BuildOutcome> {
+        AdditionalBuild {
+            remote,
+            driver: self
+                .bazel
+                .with_output_user_root(self.placement.root().join(output_root)),
+            #[cfg(target_os = "linux")]
+            action_ipc: self.action_ipc.clone(),
+        }
+        .build_until(probes, run, stop)
+    }
+
     /// Starts only the stack's Bazel server; the stack retains its cleanup ownership.
     pub(crate) fn prepare_bazel(&self) -> Result<()> {
         self.bazel.prepare(&self.remote()?)

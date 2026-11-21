@@ -9,7 +9,7 @@ use gang_spi::{
     ExpiringRecordPort, PortError, RecordedScalingEvent, ScalingAuditEvent, ScalingEventKind,
     ScalingEventSeq, SchemaTooNew, SchemaVersion, StateRepositoryPort,
 };
-use gang_types::{FleetName, WorkerId};
+use gang_types::{FleetName, ScalingCause};
 
 use crate::{Fixture, TestResult};
 
@@ -47,10 +47,11 @@ where
     let event = ScalingAuditEvent {
         at: Timestamp::from_unix_millis(1),
         fleet: FleetName::try_new("fleet-a")?,
-        kind: ScalingEventKind::WorkerRegistered {
-            worker: WorkerId::try_new("worker")?,
+        kind: ScalingEventKind::DrainStarted {
+            worker: gang_types::WorkerId::try_new("worker")?,
+            detail: Some("waterline held; cordon one instance".into()),
         },
-        cause: None,
+        cause: Some(ScalingCause::Utilization),
     };
     let seq = database.record_scaling_event(&event).await?;
     let mut events = Vec::new();

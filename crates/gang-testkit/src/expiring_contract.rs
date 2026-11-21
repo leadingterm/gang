@@ -544,7 +544,7 @@ pub async fn records_page_live_in_order<D: ExpiringRecordPort + LeaderLeasePort>
     Ok(())
 }
 
-/// Applies upserts and idempotent deletes with the supplied per-record expiry.
+/// Applies upserts/deletes with per-record expiry, including bounded source-profile records.
 ///
 /// # Errors
 /// Returns a database error.
@@ -558,6 +558,7 @@ pub async fn apply_upserts_and_deletes<D: ExpiringRecordPort + LeaderLeasePort>(
     let a = key(RecordKind::ResourceHistory, 1);
     let b = key(RecordKind::DurationHistory, 2);
     let absent = key(RecordKind::HistoryChunk, 3);
+    let profile = key(RecordKind::SourceProfile, 4);
     let changes = [
         RecordChange::Put {
             key: a,
@@ -568,6 +569,11 @@ pub async fn apply_upserts_and_deletes<D: ExpiringRecordPort + LeaderLeasePort>(
             key: b,
             body: b"remove",
             expires_at: ts(5),
+        },
+        RecordChange::Put {
+            key: profile,
+            body: b"profile",
+            expires_at: ts(30),
         },
     ];
     assert_eq!(
@@ -609,6 +615,65 @@ pub async fn apply_upserts_and_deletes<D: ExpiringRecordPort + LeaderLeasePort>(
     );
     assert_eq!(database.get(&a, ts(20)).await?, None);
     assert_eq!(database.get(&b, ts(2)).await?, None);
+    source_profile_round_trip_expiry_and_limit(database, &lease, profile).await
+}
+
+async fn source_profile_round_trip_expiry_and_limit<D: ExpiringRecordPort>(
+    database: &D,
+    lease: &Lease,
+    profile: RecordKey,
+) -> TestResult {
+    assert_eq!(
+        database.get(&profile, ts(29)).await?,
+        Some(record(b"profile", 101, 30))
+    );
+    let mut page = Vec::new();
+    assert!(
+        !database
+            .records(
+                RecordKind::SourceProfile,
+                None,
+                NonZeroUsize::MIN,
+                ts(29),
+                &mut page
+            )
+            .await?
+    );
+    assert_eq!(page, vec![(profile.id, record(b"profile", 101, 30))]);
+    let body = vec![7; MAX_RECORD_BODY_BYTES + 1];
+    assert!(
+        database
+            .apply(
+                lease,
+                RecordBatchSeq::new(3),
+                RecordVersion::new(103),
+                ts(6),
+                &[RecordChange::Put {
+                    key: profile,
+                    body: &body,
+                    expires_at: ts(40)
+                }],
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        database.get(&profile, ts(29)).await?,
+        Some(record(b"profile", 101, 30))
+    );
+    assert_eq!(database.get(&profile, ts(30)).await?, None);
+    assert!(
+        !database
+            .records(
+                RecordKind::SourceProfile,
+                None,
+                NonZeroUsize::MIN,
+                ts(30),
+                &mut page
+            )
+            .await?
+    );
+    assert!(page.is_empty());
     Ok(())
 }
 

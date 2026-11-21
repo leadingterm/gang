@@ -376,6 +376,11 @@ mod linux {
                     return Ok(());
                 }
             }
+            if action.starts_with("rate_")
+                && !self.link(dir, &format!("release-{action}"), false)?
+            {
+                return Ok(());
+            }
             if !self.link(dir, "journal", true)? {
                 return Ok(());
             }
@@ -536,6 +541,66 @@ mod linux {
                     fs::metadata(marker_dir.join(name)).map_err(E2eError::io("inspecting link"))?;
                 assert_eq!((source.dev(), source.ino()), (linked.dev(), linked.ino()));
             }
+            watcher.finish()
+        }
+
+        #[test]
+        fn rate_release_is_linked_before_ack_and_independent() -> Result<()> {
+            use rustix::fs::{CWD, mkfifoat};
+            use std::io::Read;
+
+            let temp = tempfile::tempdir().map_err(E2eError::io("creating test directory"))?;
+            let instances = temp.path().join("instances");
+            let shared = temp.path().join("shared");
+            let marker_dir = instances.join(
+                "local-1/scratch/work/action-id/work/cwd/.gang-ipc-0123456789abcdef-none-rate_a_0_00",
+            );
+            fs::create_dir_all(&marker_dir).map_err(E2eError::io("creating action"))?;
+            fs::create_dir(&shared).map_err(E2eError::io("creating shared directory"))?;
+            for name in [
+                "started",
+                "attempts",
+                "go",
+                "churn",
+                "release-rate_a_0_00",
+                "release-rate_b_0_00",
+            ] {
+                fs::write(shared.join(name), b"").map_err(E2eError::io("creating shared inode"))?;
+            }
+            mkfifoat(CWD, marker_dir.join("ack"), Mode::RUSR | Mode::WUSR)
+                .map_err(|error| E2eError::io("creating acknowledgement FIFO")(error.into()))?;
+            let watcher = ActionIpc::start(&instances, &shared, "0123456789abcdef")?;
+            let mut ack = File::from(
+                open(
+                    marker_dir.join("ack"),
+                    OFlags::RDONLY | OFlags::NONBLOCK,
+                    Mode::empty(),
+                )
+                .map_err(|error| E2eError::io("opening acknowledgement FIFO")(error.into()))?,
+            );
+            let mut ready = [0; 6];
+            ack.read_exact(&mut ready)
+                .map_err(E2eError::io("reading acknowledgement"))?;
+            assert_eq!(&ready, b"ready\n");
+            let linked = marker_dir.join("release-rate_a_0_00");
+            assert_eq!(
+                fs::read(&linked).map_err(E2eError::io("reading release"))?,
+                b""
+            );
+            super::super::super::rate_scaling::release(&shared, "//:rate_a_0_00")?;
+            assert_eq!(
+                fs::read(&linked).map_err(E2eError::io("reading release"))?,
+                b"1"
+            );
+            assert_eq!(
+                fs::read(shared.join("release-rate_b_0_00"))
+                    .map_err(E2eError::io("reading other release"))?,
+                b""
+            );
+            assert_eq!(
+                fs::read(marker_dir.join("go")).map_err(E2eError::io("reading go"))?,
+                b""
+            );
             watcher.finish()
         }
 

@@ -305,6 +305,8 @@ async fn public_listener_serves_execution_and_waits_for_worker_stream() -> gang_
         );
         let spec = ControllerSpec {
             actions: std::sync::Arc::new(gang_config::ActionsConfig::default()),
+            scaling: std::sync::Arc::new(gang_config::ScalingConfig::default()),
+            clock: std::sync::Arc::new(gang_clock::SystemClock::new()),
             content_store: &store,
             action_store: &store,
             fleets: &fleets,
@@ -474,6 +476,8 @@ async fn run_held_controller(
     );
     let spec = gang_spi::ControllerSpec {
         actions: Arc::new(gang_config::ActionsConfig::default()),
+        scaling: Arc::new(gang_config::ScalingConfig::default()),
+        clock: Arc::new(gang_clock::SystemClock::new()),
         content_store: &store,
         action_store: &store,
         fleets: &fleets,

@@ -14,6 +14,11 @@ pub struct ActionEnvironmentError;
 #[error("build id must be 16 base32 characters")]
 pub struct BuildIdError;
 
+/// A source id is not canonical lowercase hexadecimal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("source id must be 16 lowercase hexadecimal characters")]
+pub struct SourceIdError;
+
 /// Why a `<digits><unit>` quantity (a byte size or a configuration duration) did not parse.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum QuantityError {

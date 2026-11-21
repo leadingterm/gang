@@ -632,6 +632,9 @@ fn fill_fleet(row: &mut Fleet, pass: &FleetPass, properties: &FleetProperties) {
         memory: pass.outlook.demand.memory(),
         readiness: pass.outlook.readiness,
         expected_wait: pass.outlook.expected_wait,
+        load: pass.outlook.load,
+        backlog: pass.outlook.backlog,
+        utilization: pass.outlook.utilization,
     };
 }
 

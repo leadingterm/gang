@@ -169,6 +169,7 @@ async fn serve_prepared(
     let LoadedConfig { path, config, .. } = loaded;
     let GangConfig {
         actions,
+        scaling,
         poll_interval,
         client_action_timeout,
         default_isa,
@@ -222,6 +223,7 @@ async fn serve_prepared(
     let settings = server_settings(
         SettingsSource {
             actions: Arc::new(actions),
+            scaling: Arc::new(scaling),
             poll_interval,
             handoff_timeout: backstop,
             client_action_timeout,
@@ -451,6 +453,8 @@ async fn shutdown_when(
 struct SettingsSource {
     /// Shared action scheduling and resource policy.
     actions: Arc<gang_config::ActionsConfig>,
+    /// Shared rate-based scaling policy.
+    scaling: Arc<gang_config::ScalingConfig>,
     /// How often the control loop runs a pass.
     poll_interval: NonZeroDuration,
     /// How long a client action may take before it is timed out.
@@ -479,6 +483,7 @@ struct SettingsSource {
 fn server_settings(source: SettingsSource, server: ServerConfig) -> Result<ServerSettings> {
     Ok(ServerSettings {
         actions: source.actions,
+        scaling: source.scaling,
         proxy_protocol: Arc::new(server.proxy_protocol),
         poll_interval: source.poll_interval,
         client_action_timeout: source.client_action_timeout,
@@ -1018,9 +1023,11 @@ mod tests {
             kill_grace: NonZeroDuration::from_secs(7),
             ..gang_config::ActionsConfig::default()
         });
+        let scaling = Arc::new(gang_config::ScalingConfig::default());
         let settings = server_settings(
             SettingsSource {
                 actions: Arc::clone(&actions),
+                scaling: Arc::clone(&scaling),
                 poll_interval: NonZeroDuration::from_secs(1),
                 client_action_timeout: NonZeroDuration::from_secs(1),
                 handoff_timeout: std::time::Duration::from_secs(47),
@@ -1036,6 +1043,7 @@ mod tests {
             server,
         )?;
         assert!(Arc::ptr_eq(&settings.actions, &actions));
+        assert!(Arc::ptr_eq(&settings.scaling, &scaling));
         assert_eq!(settings.leadership, leadership);
         assert_eq!(settings.revocation_refresh_interval, refresh);
         assert_eq!(

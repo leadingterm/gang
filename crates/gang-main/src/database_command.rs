@@ -239,15 +239,29 @@ mod tests {
             serials.push(record.serial);
         }
         source.revoke(&serials[1], ts(40)).await?;
-        for worker in ["worker-a", "worker-b"] {
+        for (kind, cause) in [
+            (
+                ScalingEventKind::ScaledOut {
+                    from: 1,
+                    to: 2,
+                    detail: Some("modeled backlog exceeds payback horizon".into()),
+                },
+                gang_types::ScalingCause::Demand,
+            ),
+            (
+                ScalingEventKind::DrainStarted {
+                    worker: WorkerId::try_new("worker-a")?,
+                    detail: Some("waterline held; cordon one instance".into()),
+                },
+                gang_types::ScalingCause::Utilization,
+            ),
+        ] {
             source
                 .record_scaling_event(&ScalingAuditEvent {
                     at: ts(50),
                     fleet: FleetName::try_new("fleet-a")?,
-                    kind: ScalingEventKind::WorkerRegistered {
-                        worker: WorkerId::try_new(worker)?,
-                    },
-                    cause: None,
+                    kind,
+                    cause: Some(cause),
                 })
                 .await?;
         }

@@ -5,15 +5,18 @@
 //! scheduler would, so tests can drive several passes in sequence.
 
 use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gang_clock::{Clock, TestClock, Timestamp};
-use gang_config::FleetPolicy;
+use gang_config::{ActionsConfig, FleetPolicy, ScalingConfig};
 use gang_reconciler::{
     Action, FleetOutlook, FleetPass, HostedSnapshot, PassTime, Plan, PlanStep, Reconciler,
+    SourceProfiles,
 };
 use gang_spi::{
-    FleetInstance, FleetSupply, QueuedDemand, ScalingAuditEvent, SchedulerSnapshot, WorkerState,
+    ExecutingDemand, FleetInstance, FleetSupply, InstanceCordon, QueuedDemand, ScalingAuditEvent,
+    SchedulerSnapshot, WorkerState,
 };
 use gang_testkit::{TestResult, worker_id};
 use gang_types::health::CLIENT_REROUTE_BOUND;
@@ -87,6 +90,10 @@ pub struct Harness {
     pub plan: Plan,
     /// The reconciler under test.
     pub reconciler: Reconciler,
+    /// Shared policy used by the adapter and reconciler in this modeled world.
+    pub scaling: Arc<ScalingConfig>,
+    /// Durable term profile handle, retained across model replacement.
+    pub profiles: SourceProfiles,
 }
 
 impl Harness {
@@ -99,7 +106,6 @@ impl Harness {
     pub fn new() -> TestResult<Self> {
         Ok(Self::with_policy(policy()?))
     }
-
     /// A harness with one fleet built from `policy`.
     #[must_use]
     pub fn with_policy(policy: FleetPolicy) -> Self {
@@ -117,7 +123,14 @@ impl Harness {
     /// A harness with the given fleets, each starting with an empty provisioner supply.
     #[must_use]
     pub fn with_fleets(fleets: Vec<FleetPolicy>) -> Self {
-        let reconciler = Reconciler::new(&fleets);
+        Self::with_scaling(fleets, ScalingConfig::default())
+    }
+
+    /// Builds a deterministic world with explicitly configured rate policy.
+    pub fn with_scaling(fleets: Vec<FleetPolicy>, scaling: ScalingConfig) -> Self {
+        let scaling = Arc::new(scaling);
+        let profiles = SourceProfiles::new(&scaling, ActionsConfig::default().history_window);
+        let reconciler = Reconciler::new(&fleets, Arc::clone(&scaling), profiles.clone());
         let passes = fleets.into_iter().map(FleetPass::new).collect();
         Self {
             passes,
@@ -126,6 +139,8 @@ impl Harness {
             clock: TestClock::new(Timestamp::from_unix_millis(1_000_000)),
             plan: Plan::new(),
             reconciler,
+            scaling,
+            profiles,
         }
     }
 
@@ -164,6 +179,7 @@ impl Harness {
         let queued_since = self.clock.wall();
         for _ in 0..count {
             self.snapshot.queued.push(QueuedDemand {
+                source: None,
                 candidates,
                 environment: candidates
                     .iter()
@@ -282,6 +298,13 @@ impl Harness {
     /// fleet named `fleet`, which need not be a configured fleet.
     pub fn connect_as(&mut self, fleet: FleetName, instance: &str) -> TestResult {
         let last_seen = self.clock.wall();
+        let draining = self.snapshot.cordons.iter().any(|cordon| {
+            instance == cordon.instance.as_str()
+                && self
+                    .passes
+                    .get(cordon.fleet)
+                    .is_some_and(|pass| pass.policy.name == fleet)
+        });
         self.snapshot.workers.push(WorkerState {
             id: worker_id(instance)?,
             environment: Some(
@@ -297,7 +320,7 @@ impl Harness {
             running_actions: 0,
             max_inflight_actions: MAX_INFLIGHT_ACTIONS,
             paused: false,
-            draining: false,
+            draining,
             last_seen,
         });
         Ok(())
@@ -337,13 +360,68 @@ impl Harness {
 
     /// Sets how many actions the worker on `instance` is running.
     pub fn set_running(&mut self, instance: &str, running: u32) -> TestResult {
-        self.worker_mut(instance)?.running_actions = running;
+        let id = worker_id(instance)?;
+        let worker = self
+            .snapshot
+            .workers
+            .iter()
+            .position(|worker| worker.id == id)
+            .ok_or_else(|| HarnessError::UnknownWorker(instance.to_owned()))?;
+        let fleet = self
+            .passes
+            .iter()
+            .position(|pass| pass.policy.name == self.snapshot.workers[worker].fleet);
+        self.snapshot.workers[worker].running_actions = running;
+        self.snapshot.executing.retain(|row| row.worker != worker);
+        let candidates = match fleet {
+            Some(fleet) => FleetSet::try_from_indices([fleet])?,
+            None => FleetSet::EMPTY,
+        };
+        self.snapshot
+            .executing
+            .extend((0..running).map(|_| ExecutingDemand {
+                source: None,
+                candidates,
+                resources: ActionResources::default(),
+                worker,
+                started: self.clock.wall(),
+                expected: None,
+            }));
         Ok(())
     }
 
     /// Sets whether the scheduler stops assigning new actions to the worker on `instance`.
     pub fn set_draining(&mut self, instance: &str, draining: bool) -> TestResult {
-        self.worker_mut(instance)?.draining = draining;
+        let id = InstanceId::try_new(instance)?;
+        let fleet_name = self
+            .snapshot
+            .workers
+            .iter()
+            .find(|worker| id.hosts(&worker.id))
+            .map(|worker| worker.fleet.clone())
+            .ok_or_else(|| HarnessError::UnknownWorker(instance.to_owned()))?;
+        let fleet = self
+            .passes
+            .iter()
+            .position(|pass| pass.policy.name == fleet_name)
+            .ok_or(HarnessError::NoFleet(usize::MAX))?;
+        self.snapshot
+            .cordons
+            .retain(|cordon| cordon.fleet != fleet || *cordon.instance != id);
+        if draining {
+            self.snapshot.cordons.push(InstanceCordon {
+                fleet,
+                instance: Arc::new(id.clone()),
+            });
+            self.snapshot
+                .cordons
+                .sort_unstable_by(|a, b| (a.fleet, &a.instance).cmp(&(b.fleet, &b.instance)));
+        }
+        for worker in &mut self.snapshot.workers {
+            if worker.fleet == fleet_name && id.hosts(&worker.id) {
+                worker.draining = draining;
+            }
+        }
         Ok(())
     }
 
@@ -351,7 +429,8 @@ impl Harness {
     /// is kept.
     pub fn restart(&mut self) {
         let policies: Vec<_> = self.passes.iter().map(|pass| pass.policy.clone()).collect();
-        self.reconciler = Reconciler::new(&policies);
+        self.reconciler =
+            Reconciler::new(&policies, Arc::clone(&self.scaling), self.profiles.clone());
     }
 
     /// Runs the first pass of the reconciler's leadership term, then moves the clock past
@@ -411,6 +490,7 @@ impl Harness {
     /// * `CancelDrain` clears the worker's draining flag.
     /// * `Terminate` removes the instance and its worker, removes the instance from the fleet's
     ///   supply, and lowers the fleet's desired capacity by one.
+    #[allow(clippy::expect_used)] // An applied plan can name only a worker in this snapshot.
     pub fn apply(&mut self) {
         let steps = self.plan.steps.clone();
         for step in steps {
@@ -418,18 +498,16 @@ impl Harness {
                 Action::ScaleOut { to, .. } | Action::Withdraw { to, .. } => {
                     self.set_desired_capacity(step.fleet, to);
                 }
-                Action::StartDrain(worker) => {
-                    for state in &mut self.snapshot.workers {
-                        if state.id == worker {
-                            state.draining = true;
-                        }
+                Action::StartDrain { worker, .. } | Action::ReinforceDrain(worker) => {
+                    if let Some(instance) = worker.instance_name() {
+                        self.set_draining(instance, true)
+                            .expect("planned worker is connected");
                     }
                 }
                 Action::CancelDrain(worker, _) => {
-                    for state in &mut self.snapshot.workers {
-                        if state.id == worker {
-                            state.draining = false;
-                        }
+                    if let Some(instance) = worker.instance_name() {
+                        self.set_draining(instance, false)
+                            .expect("planned worker is connected");
                     }
                 }
                 Action::Terminate { instance, .. } => {
@@ -475,17 +553,10 @@ impl Harness {
                 .passes
                 .get(step.fleet)
                 .ok_or(HarnessError::NoFleet(step.fleet))?;
-            events.push(step.audit_event(self.plan.at, &policy.policy.name));
+            if let Some(event) = step.audit_event(self.plan.at, &policy.policy.name) {
+                events.push(event);
+            }
         }
         Ok(events)
-    }
-
-    fn worker_mut(&mut self, instance: &str) -> TestResult<&mut WorkerState> {
-        let id = worker_id(instance)?;
-        self.snapshot
-            .workers
-            .iter_mut()
-            .find(|worker| worker.id == id)
-            .ok_or_else(|| HarnessError::UnknownWorker(instance.to_owned()).into())
     }
 }

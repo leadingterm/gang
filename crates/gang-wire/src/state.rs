@@ -685,6 +685,20 @@ pub struct Demand {
     )]
     #[ts(type = "Duration")]
     pub expected_wait: Option<Duration>,
+    /// Persistent load in integer deci-slots, absent until measured; zero is a measurement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load: Option<u32>,
+    /// Transient queued slot-time before readiness subtraction, rounded to whole seconds.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::duration::option"
+    )]
+    #[ts(type = "Duration")]
+    pub backlog: Option<Duration>,
+    /// Instantaneous serving resource occupancy in permille, absent without serving capacity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub utilization: Option<u16>,
 }
 
 /// A connected worker, named `workers/{worker}`.
@@ -1240,6 +1254,45 @@ mod tests {
         let demand: Demand = round_trip(&wait_only);
         assert_eq!(demand.readiness, None);
         assert_eq!(demand.expected_wait, Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn demand_rate_diagnostics_round_trip_independently_including_zero() {
+        let legacy = json!({
+            "running": 3, "queued": 7, "candidates": 9,
+            "needed": 3, "vcpus": 24, "memory": 1024,
+        });
+        let demand: Demand = round_trip(&legacy);
+        assert_eq!(
+            (demand.load, demand.backlog, demand.utilization),
+            (None, None, None)
+        );
+        for (load, backlog, utilization) in [
+            (Some(125), Some(Duration::from_secs(42)), Some(735)),
+            (Some(0), Some(Duration::ZERO), Some(0)),
+            (Some(1), None, None),
+            (None, Some(Duration::ZERO), None),
+            (None, None, Some(0)),
+        ] {
+            let demand = Demand {
+                load,
+                backlog,
+                utilization,
+                ..demand
+            };
+            let value = serde_json::to_value(demand).expect("demand serializes");
+            assert_eq!(value.get("load"), load.map(|v| json!(v)).as_ref());
+            assert_eq!(
+                value.get("utilization"),
+                utilization.map(|v| json!(v)).as_ref()
+            );
+            let decoded: Demand = round_trip(&value);
+            assert_eq!(decoded, demand);
+            assert_eq!(
+                value.get("backlog"),
+                backlog.map(|v| json!(format!("{}s", v.as_secs()))).as_ref()
+            );
+        }
     }
 
     #[test]

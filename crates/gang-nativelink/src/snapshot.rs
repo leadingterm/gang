@@ -1,23 +1,27 @@
 //! Conversion of `NativeLink`'s typed listings into the scheduler snapshot Gang reads.
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
 
 use gang_clock::Timestamp;
 use gang_spi::{ExecutingDemand, QueuedDemand, SchedulerSnapshot, WorkerState};
-use gang_types::{ActionResources, Bytes, FleetCatalog, FleetName, WorkerId, property};
+use gang_types::{ActionResources, Bytes, FleetCatalog, FleetName, SourceId, WorkerId, property};
 use nativelink_error::Error;
 use nativelink_scheduler::worker_scheduler::WorkerSummary;
-use nativelink_util::action_messages::ActionInfo as NativeActionInfo;
+use nativelink_util::action_messages::{ActionInfo as NativeActionInfo, ActionState, OperationId};
 use nativelink_util::operation_state_manager::{ClientStateManager, OperationStageFlags};
 use nativelink_util::origin_event::OriginMetadata;
 use parking_lot::Mutex;
 
 use crate::actions;
 use crate::durations::ActionDurations;
+use crate::source_rates::SourceRates;
 
 /// Milliseconds in one second, the unit of `last_update_timestamp`.
 const MILLIS_PER_SECOND: u64 = 1000;
@@ -73,8 +77,10 @@ fn queued_demand(
     info: &NativeActionInfo,
     fleets: &FleetCatalog,
     expected: Option<Duration>,
+    source: Option<SourceId>,
 ) -> Option<QueuedDemand> {
     Some(QueuedDemand {
+        source,
         candidates: fleets
             .admit(
                 info.platform_properties
@@ -106,7 +112,7 @@ fn parse<T: std::str::FromStr + Default>(properties: &HashMap<String, String>, k
 ///
 /// Missing or malformed properties request zero. Whole cores are converted to millicores, and
 /// memory and disk KiB values are converted to bytes with saturation.
-fn resources(properties: &HashMap<String, String>) -> ActionResources {
+pub(crate) fn resources(properties: &HashMap<String, String>) -> ActionResources {
     let memory_kb: u64 = parse(properties, property::MEMORY_KB);
     let disk_kb: u64 = parse(properties, property::DISK_KB);
     let millicores: u64 = parse(properties, property::CPU_MILLICORES);
@@ -130,7 +136,52 @@ fn expected(
         .expected(&metadata.target_id, &metadata.action_mnemonic, now)
 }
 
+/// Only snapshots share this scratch. Completions never acquire its async mutex.
+#[derive(Default)]
+pub(crate) struct Scratch {
+    rows: HashMap<StateKey, RowLocation>,
+    queued_live: Vec<bool>,
+}
+
+struct StateKey(Arc<ActionState>);
+
+impl Borrow<OperationId> for StateKey {
+    fn borrow(&self) -> &OperationId {
+        &self.0.client_operation_id
+    }
+}
+
+impl PartialEq for StateKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.client_operation_id == other.0.client_operation_id
+    }
+}
+
+impl Eq for StateKey {}
+
+impl Hash for StateKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.client_operation_id.hash(state);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RowLocation {
+    Queued(usize),
+    Executing(usize),
+}
+
+struct ScratchGuard<'a>(&'a mut Scratch);
+
+impl Drop for ScratchGuard<'_> {
+    fn drop(&mut self) {
+        self.0.rows.clear();
+        self.0.queued_live.clear();
+    }
+}
+
 /// Overwrites the snapshot while retaining the capacity of its buffers.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn fill(
     scheduler: &dyn ClientStateManager,
     workers: &[WorkerSummary],
@@ -138,8 +189,12 @@ pub(crate) async fn fill(
     durations: &Mutex<ActionDurations>,
     now: Timestamp,
     completed: u64,
+    rates: &SourceRates,
+    scratch: &mut Scratch,
     into: &mut SchedulerSnapshot,
 ) -> Result<(), Error> {
+    let scratch = ScratchGuard(scratch);
+    into.source_rates_at = rates.snapshot_into(&mut into.source_rates);
     into.completed = completed;
     into.workers.clear();
     into.workers.extend(workers.iter().filter_map(worker_state));
@@ -156,9 +211,20 @@ pub(crate) async fn fill(
         else {
             continue;
         };
+        let id = &operation.state.client_operation_id;
+        if scratch.0.rows.contains_key(id) {
+            continue;
+        }
+        let source = rates.source(operation.origin.as_ref());
         let duration = expected(operation.origin.as_ref(), durations, now);
-        if let Some(demand) = queued_demand(&operation.info, fleets, duration) {
+        if let Some(demand) = queued_demand(&operation.info, fleets, duration, source) {
+            let index = into.queued.len();
             into.queued.push(demand);
+            scratch.0.queued_live.push(true);
+            scratch
+                .0
+                .rows
+                .insert(StateKey(operation.state), RowLocation::Queued(index));
         }
     }
 
@@ -177,13 +243,47 @@ pub(crate) async fn fill(
             else {
                 continue;
             };
-            into.executing.push(ExecutingDemand {
+            let source = rates.source(operation.origin.as_ref());
+            let row = ExecutingDemand {
                 worker,
+                source,
+                candidates: fleets.accepting_base(|key| {
+                    operation
+                        .info
+                        .platform_properties
+                        .get(key)
+                        .map(String::as_str)
+                }),
+                resources: resources(&operation.info.platform_properties),
                 started: Timestamp::from(operation.state.last_transition_timestamp),
                 expected: expected(operation.origin.as_ref(), durations, now),
-            });
+            };
+            match scratch.0.rows.get_mut(&operation.state.client_operation_id) {
+                Some(location @ RowLocation::Queued(_)) => {
+                    if let RowLocation::Queued(index) = *location {
+                        scratch.0.queued_live[index] = false;
+                    }
+                    *location = RowLocation::Executing(into.executing.len());
+                    into.executing.push(row);
+                }
+                Some(RowLocation::Executing(index)) => into.executing[*index] = row,
+                None => {
+                    let index = into.executing.len();
+                    scratch
+                        .0
+                        .rows
+                        .insert(StateKey(operation.state), RowLocation::Executing(index));
+                    into.executing.push(row);
+                }
+            }
         }
     }
+    let mut index = 0;
+    into.queued.retain(|_| {
+        let live = scratch.0.queued_live[index];
+        index += 1;
+        live
+    });
     Ok(())
 }
 
@@ -232,7 +332,7 @@ pub(crate) mod tests {
     }
 
     fn queued_demand(info: &NativeActionInfo, fleets: &FleetCatalog) -> QueuedDemand {
-        super::queued_demand(info, fleets, None).expect("valid environment")
+        super::queued_demand(info, fleets, None, None).expect("valid environment")
     }
 
     pub(crate) fn history() -> Mutex<ActionDurations> {
@@ -241,9 +341,34 @@ pub(crate) mod tests {
             gang_config::HistoryWindow::from_units(7),
         ))
     }
+    async fn fill(
+        scheduler: &dyn ClientStateManager,
+        workers: &[WorkerSummary],
+        fleets: &FleetCatalog,
+        durations: &Mutex<ActionDurations>,
+        now: Timestamp,
+        completed: u64,
+        into: &mut SchedulerSnapshot,
+    ) -> Result<(), Error> {
+        let clock = Arc::new(gang_clock::TestClock::new(now));
+        let rates = SourceRates::new(&gang_config::ScalingConfig::default(), fleets.len(), clock)
+            .expect("bounded test table");
+        super::fill(
+            scheduler,
+            workers,
+            fleets,
+            durations,
+            now,
+            completed,
+            &rates,
+            &mut Scratch::default(),
+            into,
+        )
+        .await
+    }
 
     /// Two fleets: `fleet-a` on x86-64 and `fleet-b` on aarch64.
-    fn catalog() -> FleetCatalog {
+    pub(crate) fn catalog() -> FleetCatalog {
         let fleet = |name: &str, isa: Isa| {
             FleetProperties::new(
                 &FleetName::try_new(name).expect("valid fleet name"),
@@ -363,6 +488,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn old_environment_demand_keeps_authenticated_source() {
+        let entry = demand(0, &[(property::ACTION_ENVIRONMENT, "host:old")]);
+        let source = SourceId::from_identity_str("local:alice");
+        let demand =
+            super::queued_demand(&entry, &catalog(), None, source).expect("valid environment");
+        assert_eq!(demand.source, source);
+        assert_eq!(demand.environment.as_str(), "host:old");
+        assert_eq!(demand.candidates.iter().collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    #[test]
+    fn invalid_environment_is_not_queued_even_with_a_source() {
+        let mut entry = demand(0, &[]);
+        Arc::make_mut(&mut entry)
+            .platform_properties
+            .remove(property::ACTION_ENVIRONMENT);
+        let source = SourceId::from_identity_str("local:alice");
+        assert!(super::queued_demand(&entry, &catalog(), None, source).is_none());
+        Arc::make_mut(&mut entry).platform_properties.insert(
+            property::ACTION_ENVIRONMENT.to_owned(),
+            "invalid".to_owned(),
+        );
+        assert!(super::queued_demand(&entry, &catalog(), None, source).is_none());
+    }
+
+    #[test]
     fn zero_and_oversized_max_inflight_map_to_no_limit() {
         let cases = [
             (0_u64, None),
@@ -455,6 +606,7 @@ pub(crate) mod tests {
         assert_eq!(
             action,
             QueuedDemand {
+                source: None,
                 candidates: FleetSet::prefix(1).expect("fleet count in range"),
                 environment: "host:test".parse().expect("valid environment"),
                 resources: ActionResources {
@@ -751,11 +903,17 @@ pub(crate) mod tests {
             vec![
                 ExecutingDemand {
                     worker: 0,
+                    source: None,
+                    candidates: FleetSet::prefix(2).expect("two fleets"),
+                    resources: ActionResources::default(),
                     started: Timestamp::from_unix_millis(5_000),
                     expected: Some(Duration::from_secs(2))
                 },
                 ExecutingDemand {
                     worker: 1,
+                    source: None,
+                    candidates: FleetSet::prefix(2).expect("two fleets"),
+                    resources: ActionResources::default(),
                     started: Timestamp::from_unix_millis(4_000),
                     expected: None
                 },
@@ -915,5 +1073,389 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+    #[derive(Clone)]
+    struct Retained {
+        state: Arc<ActionState>,
+        info: Arc<NativeActionInfo>,
+        origin: Option<OriginMetadata>,
+    }
+
+    #[async_trait::async_trait]
+    impl nativelink_util::operation_state_manager::ActionStateResult for Retained {
+        async fn as_state(&self) -> Result<(Arc<ActionState>, Option<OriginMetadata>), Error> {
+            Ok((Arc::clone(&self.state), self.origin.clone()))
+        }
+
+        async fn changed(&mut self) -> Result<(Arc<ActionState>, Option<OriginMetadata>), Error> {
+            self.as_state().await
+        }
+
+        async fn as_action_info(
+            &self,
+        ) -> Result<(Arc<NativeActionInfo>, Option<OriginMetadata>), Error> {
+            Ok((Arc::clone(&self.info), self.origin.clone()))
+        }
+    }
+
+    fn retained(id: &str, stage: ActionStage, identity: Option<&str>, priority: i32) -> Retained {
+        let info = info(
+            priority,
+            0,
+            &[
+                (property::CPU_MILLICORES, "2000"),
+                (property::ACTION_ENVIRONMENT, "host:old"),
+            ],
+        );
+        Retained {
+            state: Arc::new(ActionState {
+                stage,
+                client_operation_id: OperationId::String(id.to_owned()),
+                action_digest: info.digest(),
+                last_transition_timestamp: std::time::UNIX_EPOCH,
+            }),
+            info,
+            origin: identity.map(|identity| OriginMetadata {
+                identity: identity.to_owned(),
+                bazel_metadata: None,
+            }),
+        }
+    }
+
+    #[derive(Default)]
+    struct Listings {
+        queued: Vec<Retained>,
+        executing: HashMap<String, Vec<Retained>>,
+        during_queue: Option<(Arc<SourceRates>, Arc<gang_clock::TestClock>)>,
+        park_queue: bool,
+    }
+
+    impl nativelink_metric::MetricsComponent for Listings {
+        fn publish(
+            &self,
+            _: nativelink_metric::MetricKind,
+            _: nativelink_metric::MetricFieldData<'_>,
+        ) -> Result<nativelink_metric::MetricPublishKnownKindData, nativelink_metric::Error>
+        {
+            Ok(nativelink_metric::MetricPublishKnownKindData::Component)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ClientStateManager for Listings {
+        async fn add_action(
+            &self,
+            _: OperationId,
+            _: Arc<NativeActionInfo>,
+        ) -> Result<Box<dyn nativelink_util::operation_state_manager::ActionStateResult>, Error>
+        {
+            Err(nativelink_error::make_err!(
+                nativelink_error::Code::Unimplemented,
+                "listing only"
+            ))
+        }
+
+        async fn filter_operations(
+            &self,
+            filter: nativelink_util::operation_state_manager::OperationFilter,
+        ) -> Result<nativelink_util::operation_state_manager::ActionStateResultStream<'_>, Error>
+        {
+            let queued = filter.stages == OperationStageFlags::Queued;
+            if queued && let Some((rates, clock)) = &self.during_queue {
+                clock.advance(Duration::from_secs(2));
+                rates.record(
+                    None,
+                    0,
+                    ActionResources::default(),
+                    Some(Duration::from_secs(1)),
+                );
+            }
+            let rows = if queued {
+                self.queued.clone()
+            } else {
+                filter
+                    .worker_id
+                    .as_ref()
+                    .and_then(|worker| self.executing.get(&worker.0))
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            let stream = futures::stream::iter(rows.into_iter().map(|row| {
+                Box::new(row)
+                    as Box<dyn nativelink_util::operation_state_manager::ActionStateResult>
+            }));
+            if queued && self.park_queue {
+                Ok(Box::pin(stream.chain(futures::stream::pending())))
+            } else {
+                Ok(Box::pin(stream))
+            }
+        }
+    }
+
+    fn rate_fixture() -> (Arc<SourceRates>, Arc<gang_clock::TestClock>) {
+        let clock = Arc::new(gang_clock::TestClock::new(Timestamp::from_unix_millis(
+            100_000,
+        )));
+        let rates = Arc::new(
+            SourceRates::new(&gang_config::ScalingConfig::default(), 2, clock.clone())
+                .expect("bounded table"),
+        );
+        (rates, clock)
+    }
+
+    #[tokio::test]
+    async fn retained_sources_do_not_require_bazel_metadata_or_invocations() {
+        let (rates, clock) = rate_fixture();
+        let mut same_a = retained("a", ActionStage::Queued, Some("local:alice"), 5);
+        same_a.origin.as_mut().expect("origin").bazel_metadata = Some(bazel("//a", "Compile"));
+        let mut same_b = same_a.clone();
+        same_b.state = retained("b", ActionStage::Queued, None, 5).state;
+        same_b
+            .origin
+            .as_mut()
+            .expect("origin")
+            .bazel_metadata
+            .as_mut()
+            .expect("metadata")
+            .tool_invocation_id = "different-invocation".to_owned();
+        let listing = Listings {
+            queued: vec![
+                same_a,
+                same_b,
+                retained("no-metadata", ActionStage::Queued, Some("local:alice"), 4),
+                retained("other", ActionStage::Queued, Some("oidc:alice"), 3),
+                retained("missing", ActionStage::Queued, None, 2),
+                retained("empty", ActionStage::Queued, Some(""), 1),
+            ],
+            ..Default::default()
+        };
+        let mut snapshot = SchedulerSnapshot::default();
+        super::fill(
+            &listing,
+            &[],
+            &catalog(),
+            &history(),
+            gang_clock::Clock::wall(&*clock),
+            0,
+            &rates,
+            &mut Scratch::default(),
+            &mut snapshot,
+        )
+        .await
+        .expect("snapshot");
+        let alice = SourceId::from_identity_str("local:alice");
+        assert!(alice.is_some());
+        assert!(snapshot.queued[..3].iter().all(|row| row.source == alice));
+        assert_ne!(snapshot.queued[3].source, alice);
+        assert_eq!(snapshot.queued[4].source, None);
+        assert_eq!(snapshot.queued[5].source, None);
+        assert_eq!(snapshot.queued[2].resources.cpu_millicores, 2000);
+    }
+
+    #[tokio::test]
+    async fn queue_to_execution_and_worker_moves_collapse_to_latest_execution() {
+        let (rates, clock) = rate_fixture();
+        let moving = "same-long-string-prefix-but-distinct-operation-moving";
+        let other = "same-long-string-prefix-but-distinct-operation-other";
+        let listing = Listings {
+            queued: vec![
+                retained("first", ActionStage::Queued, None, 9),
+                retained(moving, ActionStage::Queued, Some("local:alice"), 8),
+                retained(other, ActionStage::Queued, None, 7),
+                retained("last", ActionStage::Queued, None, 6),
+            ],
+            executing: HashMap::from([
+                (
+                    WORKER.to_owned(),
+                    vec![retained(
+                        moving,
+                        ActionStage::Executing,
+                        Some("local:alice"),
+                        0,
+                    )],
+                ),
+                (
+                    OTHER_WORKER.to_owned(),
+                    vec![retained(
+                        moving,
+                        ActionStage::Executing,
+                        Some("local:alice"),
+                        0,
+                    )],
+                ),
+            ]),
+            ..Default::default()
+        };
+        let workers = [
+            WorkerSummary {
+                running_actions: 1,
+                ..summary(WORKER)
+            },
+            WorkerSummary {
+                running_actions: 1,
+                ..summary(OTHER_WORKER)
+            },
+        ];
+        let mut snapshot = SchedulerSnapshot::default();
+        let mut scratch = Scratch::default();
+        super::fill(
+            &listing,
+            &workers,
+            &catalog(),
+            &history(),
+            gang_clock::Clock::wall(&*clock),
+            0,
+            &rates,
+            &mut scratch,
+            &mut snapshot,
+        )
+        .await
+        .expect("snapshot");
+        assert_eq!(
+            snapshot
+                .queued
+                .iter()
+                .map(|row| row.priority)
+                .collect::<Vec<_>>(),
+            [9, 7, 6]
+        );
+        assert_eq!(snapshot.executing.len(), 1);
+        assert_eq!(snapshot.executing[0].worker, 1);
+        assert_eq!(
+            snapshot.executing[0].source,
+            SourceId::from_identity_str("local:alice")
+        );
+        assert_eq!(snapshot.executing[0].resources.cpu_millicores, 2000);
+        assert_eq!(
+            snapshot.executing[0].candidates,
+            FleetSet::prefix(2).expect("two fleets")
+        );
+        assert!(scratch.rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn row_read_precedes_listings_and_uses_already_advanced_shared_clock() {
+        let (rates, clock) = rate_fixture();
+        clock.advance(Duration::from_hours(4));
+        let before = gang_clock::Clock::monotonic(&*clock);
+        let listing = Listings {
+            during_queue: Some((Arc::clone(&rates), Arc::clone(&clock))),
+            ..Default::default()
+        };
+        let mut snapshot = SchedulerSnapshot::default();
+        let mut scratch = Scratch::default();
+        super::fill(
+            &listing,
+            &[],
+            &catalog(),
+            &history(),
+            gang_clock::Clock::wall(&*clock),
+            0,
+            &rates,
+            &mut scratch,
+            &mut snapshot,
+        )
+        .await
+        .expect("first frame");
+        assert_eq!(snapshot.source_rates_at, before);
+        assert!(snapshot.source_rates.is_empty());
+        super::fill(
+            &Listings::default(),
+            &[],
+            &catalog(),
+            &history(),
+            gang_clock::Clock::wall(&*clock),
+            0,
+            &rates,
+            &mut scratch,
+            &mut snapshot,
+        )
+        .await
+        .expect("next frame");
+        assert_eq!(snapshot.source_rates.len(), 1);
+        assert_eq!(
+            snapshot.source_rates[0].created_at,
+            before + Duration::from_secs(2)
+        );
+        assert_eq!(snapshot.source_rates[0].at, snapshot.source_rates_at);
+    }
+
+    #[tokio::test]
+    async fn cancelled_listing_releases_arc_keys_and_next_fill_overwrites_rows() {
+        let (rates, clock) = rate_fixture();
+        let operation = retained("cancelled", ActionStage::Queued, None, 9);
+        let state = Arc::clone(&operation.state);
+        let listing = Listings {
+            queued: vec![operation],
+            park_queue: true,
+            ..Default::default()
+        };
+        let history = history();
+        let fleets = catalog();
+        let mut snapshot = SchedulerSnapshot::default();
+        let mut scratch = Scratch::default();
+        let mut future = Box::pin(super::fill(
+            &listing,
+            &[],
+            &fleets,
+            &history,
+            gang_clock::Clock::wall(&*clock),
+            0,
+            &rates,
+            &mut scratch,
+            &mut snapshot,
+        ));
+        assert!(futures::poll!(future.as_mut()).is_pending());
+        assert!(Arc::strong_count(&state) > 2);
+        drop(future);
+        assert_eq!(Arc::strong_count(&state), 2);
+        assert!(scratch.rows.is_empty());
+        assert!(scratch.queued_live.is_empty());
+        let capacities = (scratch.rows.capacity(), scratch.queued_live.capacity());
+        super::fill(
+            &Listings::default(),
+            &[],
+            &fleets,
+            &history,
+            gang_clock::Clock::wall(&*clock),
+            0,
+            &rates,
+            &mut scratch,
+            &mut snapshot,
+        )
+        .await
+        .expect("clean next frame");
+        assert!(snapshot.queued.is_empty());
+        assert!(snapshot.executing.is_empty());
+        assert_eq!(
+            (scratch.rows.capacity(), scratch.queued_live.capacity()),
+            capacities
+        );
+    }
+
+    #[test]
+    fn full_string_state_keys_reuse_arc_and_map_storage_without_allocating() {
+        let a = retained("full-string-id-A", ActionStage::Queued, None, 0);
+        let b = retained("full-string-id-B", ActionStage::Queued, None, 0);
+        let mut scratch = Scratch::default();
+        scratch.rows.reserve(2);
+        let measured = allocation_counter::measure(|| {
+            scratch
+                .rows
+                .insert(StateKey(Arc::clone(&a.state)), RowLocation::Queued(0));
+            scratch
+                .rows
+                .insert(StateKey(Arc::clone(&b.state)), RowLocation::Queued(1));
+            assert!(matches!(
+                scratch.rows.get(&a.state.client_operation_id),
+                Some(RowLocation::Queued(0))
+            ));
+            assert!(matches!(
+                scratch.rows.get(&b.state.client_operation_id),
+                Some(RowLocation::Queued(1))
+            ));
+            scratch.rows.clear();
+        });
+        assert_eq!(measured.count_total, 0);
     }
 }

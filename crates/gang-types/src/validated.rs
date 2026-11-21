@@ -44,9 +44,13 @@ macro_rules! validated_string {
                 value: impl ::std::convert::Into<::std::string::String>,
             ) -> ::std::result::Result<Self, $error> {
                 let value = value.into();
-                let check: fn(&str) -> ::std::result::Result<(), $error> = $check;
-                check(&value)?;
+                Self::validate(&value)?;
                 ::std::result::Result::Ok(Self(::std::borrow::Cow::Owned(value)))
+            }
+
+            pub(crate) fn validate(value: &str) -> ::std::result::Result<(), $error> {
+                let check: fn(&str) -> ::std::result::Result<(), $error> = $check;
+                check(value)
             }
 
             /// Returns the validated string.

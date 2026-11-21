@@ -97,7 +97,11 @@ fn event(seq: u64) -> Result<Event, Box<dyn Error>> {
         create_time: timestamped(seq),
         fleet: fleet_name("alpha")?,
         cause: Some(Cause::Demand),
-        change: EventChange::ScaledOut { from: 1, to: 2 },
+        change: EventChange::ScaledOut {
+            from: 1,
+            to: 2,
+            detail: None,
+        },
     })
 }
 
@@ -337,6 +341,15 @@ fn random_fleet(rng: &mut Rng, fleet: &str) -> Result<Fleet, Box<dyn Error>> {
             expected_wait: rng
                 .chance(50)
                 .then(|| Duration::from_millis(u64::from(rng.small()))),
+            load: rng.chance(50).then(|| rng.small()),
+            backlog: rng
+                .chance(50)
+                .then(|| Duration::from_secs(u64::from(rng.small()))),
+            utilization: if rng.chance(50) {
+                Some(u16::try_from(rng.small() % 1_001)?)
+            } else {
+                None
+            },
         },
     })
 }
@@ -445,6 +458,9 @@ fn scaling_event(rng: &mut Rng, seq: u64) -> Result<Event, Box<dyn Error>> {
         change: EventChange::ScaledOut {
             from: rng.small() % 4,
             to: rng.small() % 8,
+            detail: rng
+                .chance(50)
+                .then(|| "backlog requires capacity".to_owned()),
         },
     })
 }

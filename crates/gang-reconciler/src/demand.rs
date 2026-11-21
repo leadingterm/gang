@@ -60,6 +60,13 @@ impl Demand {
         self.actions = self.actions.saturating_add(u64::from(actions));
     }
 
+    /// Accounts for a running action's reservations after its worker supplied the count.
+    pub(crate) fn add_running_resources(&mut self, resources: ActionResources) {
+        self.millicores = self.millicores.saturating_add(resources.cpu_millicores);
+        self.memory = self.memory.saturating_add(resources.memory.get());
+        self.disk = self.disk.saturating_add(resources.disk.get());
+    }
+
     /// Returns the actions counted in this demand: every queued action and every running action.
     #[must_use]
     pub const fn actions(&self) -> u64 {
@@ -178,6 +185,21 @@ mod tests {
     use gang_types::{Bytes, NonZeroBytes, nonzero_u32};
 
     use super::*;
+
+    #[test]
+    fn running_reservations_raise_resource_ceiling_without_double_counting_actions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let policy = policy()?;
+        let mut demand = Demand::default();
+        demand.add_running(1);
+        demand.add_running_resources(ActionResources {
+            cpu_millicores: 30_000,
+            ..ActionResources::default()
+        });
+        assert_eq!(demand.actions(), 1);
+        assert_eq!(demand.instances(&policy), 2);
+        Ok(())
+    }
 
     #[test]
     fn division_rounds_up_at_boundaries() {

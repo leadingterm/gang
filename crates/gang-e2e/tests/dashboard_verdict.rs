@@ -75,6 +75,9 @@ fn fleet(in_service: u32) -> Fleet {
             memory: 0,
             readiness: None,
             expected_wait: None,
+            load: None,
+            backlog: None,
+            utilization: None,
         },
     }
 }
@@ -150,12 +153,21 @@ fn event(seq: u64, change: EventChange, cause: Option<Cause>) -> Event {
 }
 
 fn scaled_out(seq: u64, cause: Option<Cause>) -> Event {
-    event(seq, EventChange::ScaledOut { from: 0, to: 1 }, cause)
+    event(
+        seq,
+        EventChange::ScaledOut {
+            from: 0,
+            to: 1,
+            detail: None,
+        },
+        cause,
+    )
 }
 
 fn drain_started(seq: u64, cause: Option<Cause>) -> Event {
     let change = EventChange::DrainStarted {
         worker: worker_name(),
+        detail: None,
     };
     event(seq, change, cause)
 }

@@ -381,6 +381,7 @@ impl StateRepositoryPort for FakeRepository {
         &self,
         event: &ScalingAuditEvent,
     ) -> Result<ScalingEventSeq, PortError> {
+        event.kind.validate().map_err(PortError::backend)?;
         let mut state = self.state.lock();
         if state.fails(Failure::ScalingWrite) {
             return Err(PortError::backend("scaling audit log is unavailable"));

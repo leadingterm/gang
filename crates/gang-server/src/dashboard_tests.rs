@@ -39,7 +39,11 @@ fn scaled_out(millis: u64) -> ScalingAuditEvent {
     ScalingAuditEvent {
         at: Timestamp::from_unix_millis(millis),
         fleet: FleetName::try_new("gang-x86").expect("fixture fleet name is valid"),
-        kind: ScalingEventKind::ScaledOut { from: 0, to: 1 },
+        kind: ScalingEventKind::ScaledOut {
+            from: 0,
+            to: 1,
+            detail: None,
+        },
         cause: None,
     }
 }

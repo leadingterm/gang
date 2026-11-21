@@ -6,7 +6,7 @@ use std::future::Future;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use gang_clock::Timestamp;
+use gang_clock::{Tick, Timestamp};
 use gang_spi::{
     Acquisition, ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, ActionsView,
     ApiService, ApplyRecords, Authenticated, AuthenticationHost, AuthenticationPort,
@@ -29,7 +29,7 @@ use gang_spi::{
 use gang_types::{
     ActionResources, AuthenticationSettings, Bytes, CertSerial, Fleet, FleetName, FleetSet,
     Identity, InstanceId, InstanceLifecycle, Isa, LoginSession, Principal, Proof, ProviderName,
-    RefreshToken, Url, WorkerId, WorkerLifetime,
+    RefreshToken, Url, WorkerLifetime,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -438,8 +438,14 @@ impl SchedulerPort for Stub {
         // An empty worker list is sorted by id.
         into.queued.clear();
         into.executing.clear();
+        into.completed = 0;
+        into.stores.clear();
+        into.source_rates.clear();
+        into.source_rates_at = Tick::ORIGIN;
+        into.cordons.clear();
         let candidates = FleetSet::prefix(1).map_err(PortError::backend)?;
         into.queued.push(QueuedDemand {
+            source: None,
             candidates,
             environment: "host:test".parse().map_err(PortError::backend)?,
             resources: ActionResources::default(),
@@ -462,8 +468,22 @@ impl SchedulerPort for Stub {
         Ok(())
     }
 
-    async fn set_draining(&self, worker: &WorkerId, _draining: bool) -> Result<(), PortError> {
-        Err(PortError::NotFound(Subject::Worker(worker.clone())))
+    async fn set_draining(
+        &self,
+        _fleet: &FleetName,
+        _instance: &InstanceId,
+        _draining: bool,
+    ) -> Result<(), PortError> {
+        Err(PortError::unavailable("scheduler stub is not serving"))
+    }
+
+    async fn retain_drains(
+        &self,
+        _now: Tick,
+        _grace: std::time::Duration,
+        _live: &[(&FleetName, &FleetSupply)],
+    ) -> Result<(), PortError> {
+        Err(PortError::unavailable("scheduler stub is not serving"))
     }
 
     fn endpoints(&self) -> ControllerEndpoints {

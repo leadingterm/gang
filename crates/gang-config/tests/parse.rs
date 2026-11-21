@@ -4636,3 +4636,375 @@ fn a_hostless_worker_endpoint_is_rejected() -> Result<(), Box<dyn Error>> {
     );
     Ok(())
 }
+
+#[test]
+fn omitted_scaling_uses_all_defaults() -> Result<(), Box<dyn Error>> {
+    let config = Sections::VALID.parse()?;
+    let scaling = config.scaling;
+    assert_eq!(scaling.payback_percent.get(), 50);
+    assert_eq!(scaling.load_half_life.get(), Duration::from_mins(1));
+    assert_eq!(scaling.source_idle.get(), Duration::from_mins(1));
+    assert_eq!(scaling.max_sources.get(), 1024);
+    assert_eq!(
+        scaling.unknown_action_duration.get(),
+        Duration::from_secs(10)
+    );
+    assert_eq!(scaling.readiness_prior.get(), Duration::from_secs(90));
+    assert_eq!(scaling.scale_in_waterline_percent.get(), 70);
+    assert_eq!(scaling.scale_in_dwell.get(), Duration::from_mins(5));
+    assert_eq!(scaling.max_cordons, 1);
+    assert_eq!(scaling, gang_config::ScalingConfig::default());
+    Ok(())
+}
+
+#[test]
+fn scaling_values_survive_resolution_and_round_trip() -> Result<(), Box<dyn Error>> {
+    let text = format!(
+        "{}\n[scaling]\npayback_percent = 125\nload_half_life = \"1500ms\"\n\
+         source_idle = \"2500ms\"\nmax_sources = 73\nunknown_action_duration = \"1750ms\"\n\
+         readiness_prior = \"15m\"\nscale_in_waterline_percent = 65\n\
+         scale_in_dwell = \"3500ms\"\nmax_cordons = 7\n",
+        Sections::VALID.text()
+    );
+    let document = Document::<Plugins>::parse(&text)?;
+    let expected = document.scaling;
+    assert_eq!(expected.payback_percent.get(), 125);
+    assert_eq!(expected.load_half_life.get(), Duration::from_millis(1500));
+    assert_eq!(expected.source_idle.get(), Duration::from_millis(2500));
+    assert_eq!(expected.max_sources.get(), 73);
+    assert_eq!(
+        expected.unknown_action_duration.get(),
+        Duration::from_millis(1750)
+    );
+    assert_eq!(expected.readiness_prior.get(), Duration::from_mins(15));
+    assert_eq!(expected.scale_in_waterline_percent.get(), 65);
+    assert_eq!(expected.scale_in_dwell.get(), Duration::from_millis(3500));
+    assert_eq!(expected.max_cordons, 7);
+    let rendered = document.to_toml()?;
+    let resolved = document.resolve()?;
+    assert_eq!(resolved.scaling, expected);
+    let fleet = resolved.fleets.get(0).ok_or("missing fleet")?;
+    assert_eq!(fleet.policy.boot_grace, Duration::from_mins(1));
+    assert_eq!(
+        resolved
+            .scaling
+            .effective_readiness_prior(fleet.policy.boot_grace),
+        Duration::from_mins(1)
+    );
+    let reparsed: GangConfig<Plugins> = rendered.parse()?;
+    assert_eq!(reparsed.scaling, expected);
+    Ok(())
+}
+
+#[test]
+fn scaling_rejects_unknown_and_obsolete_keys() {
+    for key in [
+        "unknown",
+        "target_utilization_percent",
+        "scale_in_utilization_percent",
+    ] {
+        let text = format!("{}\n[scaling]\n{key} = 50\n", Sections::VALID.text());
+        let error = text
+            .parse::<GangConfig<Plugins>>()
+            .expect_err("unknown scaling key");
+        assert!(matches!(error, ConfigError::Gang(_)), "{key}: {error}");
+        assert!(chain(&error).contains(key), "{key}: {error}");
+    }
+}
+
+#[test]
+fn scaling_integer_bounds_are_enforced() -> Result<(), Box<dyn Error>> {
+    for (key, rejected, accepted) in [
+        ("payback_percent", [0, 1001], [1, 1000]),
+        ("scale_in_waterline_percent", [0, 100], [1, 99]),
+        ("max_sources", [0, 65_537], [1, 65_536]),
+    ] {
+        for value in rejected {
+            let text = format!("{}\n[scaling]\n{key} = {value}\n", Sections::VALID.text());
+            let error = text
+                .parse::<GangConfig<Plugins>>()
+                .expect_err("invalid scalar");
+            assert!(
+                matches!(error, ConfigError::Gang(_)),
+                "{key}={value}: {error}"
+            );
+            assert!(chain(&error).contains(key), "{key}={value}: {error}");
+        }
+        for value in accepted {
+            let text = format!("{}\n[scaling]\n{key} = {value}\n", Sections::VALID.text());
+            let config: GangConfig<Plugins> = text.parse()?;
+            let actual = match key {
+                "payback_percent" => usize::from(config.scaling.payback_percent.get()),
+                "scale_in_waterline_percent" => {
+                    usize::from(config.scaling.scale_in_waterline_percent.get())
+                }
+                _ => config.scaling.max_sources.get(),
+            };
+            assert_eq!(actual, value, "{key}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn scaling_interval_millisecond_bounds_are_enforced() -> Result<(), Box<dyn Error>> {
+    for key in ["load_half_life", "source_idle"] {
+        for value in ["0s", "3600001ms", "61m"] {
+            let text = format!(
+                "{}\n[scaling]\n{key} = \"{value}\"\nscale_in_dwell = \"1h\"\n",
+                Sections::VALID.text()
+            );
+            let error = text
+                .parse::<GangConfig<Plugins>>()
+                .expect_err("invalid interval");
+            assert!(
+                matches!(error, ConfigError::Gang(_)),
+                "{key}={value}: {error}"
+            );
+        }
+        for millis in [1, 3_599_999, 3_600_000] {
+            let text = format!(
+                "{}\n[scaling]\n{key} = \"{millis}ms\"\nscale_in_dwell = \"1h\"\n",
+                Sections::VALID.text()
+            );
+            let config: GangConfig<Plugins> = text.parse()?;
+            let interval = if key == "load_half_life" {
+                config.scaling.load_half_life
+            } else {
+                config.scaling.source_idle
+            };
+            assert_eq!(interval.get(), Duration::from_millis(millis));
+        }
+    }
+    assert!(gang_config::ScalingInterval::try_new(Duration::from_micros(1500)).is_err());
+    Ok(())
+}
+
+#[test]
+fn scaling_positive_durations_have_no_extra_upper_bound() -> Result<(), Box<dyn Error>> {
+    for key in [
+        "unknown_action_duration",
+        "readiness_prior",
+        "scale_in_dwell",
+    ] {
+        let minimum = format!(
+            "{}\n[scaling]\nload_half_life = \"1ms\"\n{key} = \"1ms\"\n",
+            Sections::VALID.text()
+        );
+        let config: GangConfig<Plugins> = minimum.parse()?;
+        let actual = match key {
+            "unknown_action_duration" => config.scaling.unknown_action_duration,
+            "readiness_prior" => config.scaling.readiness_prior,
+            _ => config.scaling.scale_in_dwell,
+        };
+        assert_eq!(actual.get(), Duration::from_millis(1));
+        let text = format!("{}\n[scaling]\n{key} = \"0s\"\n", Sections::VALID.text());
+        let error = text
+            .parse::<GangConfig<Plugins>>()
+            .expect_err("zero duration");
+        assert!(matches!(error, ConfigError::Gang(_)), "{key}: {error}");
+        let text = format!(
+            "{}\n[scaling]\n{key} = \"18446744073709551615ms\"\n",
+            Sections::VALID.text()
+        );
+        let config: GangConfig<Plugins> = text.parse()?;
+        let actual = match key {
+            "unknown_action_duration" => config.scaling.unknown_action_duration,
+            "readiness_prior" => config.scaling.readiness_prior,
+            _ => config.scaling.scale_in_dwell,
+        };
+        assert_eq!(actual.get(), Duration::from_millis(u64::MAX));
+    }
+    Ok(())
+}
+
+#[test]
+fn scaling_dwell_must_cover_load_half_life() -> Result<(), Box<dyn Error>> {
+    use gang_types::Fix as _;
+
+    let text = format!(
+        "{}\n[scaling]\nload_half_life = \"60001ms\"\nscale_in_dwell = \"60s\"\n",
+        Sections::VALID.text()
+    );
+    let error = Document::<Plugins>::parse(&text)?
+        .resolve()
+        .expect_err("short dwell");
+    let ConfigError::ScaleInDwellTooShort {
+        scale_in_dwell,
+        load_half_life,
+    } = &error
+    else {
+        return Err("expected a scaling dwell validation error".into());
+    };
+    assert_eq!(*scale_in_dwell, Duration::from_mins(1));
+    assert_eq!(*load_half_life, Duration::from_millis(60_001));
+    let fix = error
+        .fix()
+        .ok_or("scaling dwell error has no operator fix")?;
+    assert!(fix.contains("scaling.scale_in_dwell"), "{fix}");
+    assert!(fix.contains("scaling.load_half_life"), "{fix}");
+    let equal = text.replace("60001ms", "60000ms");
+    let config: GangConfig<Plugins> = equal.parse()?;
+    assert_eq!(
+        config.scaling.scale_in_dwell.get(),
+        config.scaling.load_half_life.get()
+    );
+    Ok(())
+}
+
+#[test]
+fn zero_cordon_budget_is_valid_and_u16_overflow_is_rejected() -> Result<(), Box<dyn Error>> {
+    for value in [0, u16::MAX] {
+        let text = format!(
+            "{}\n[scaling]\nmax_cordons = {value}\n",
+            Sections::VALID.text()
+        );
+        let config: GangConfig<Plugins> = text.parse()?;
+        assert_eq!(config.scaling.max_cordons, value);
+    }
+    let text = format!(
+        "{}\n[scaling]\nmax_cordons = 65536\n",
+        Sections::VALID.text()
+    );
+    assert!(matches!(
+        text.parse::<GangConfig<Plugins>>(),
+        Err(ConfigError::Gang(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn cold_readiness_prior_clamps_each_fleet_without_changing_boot_grace() -> Result<(), Box<dyn Error>>
+{
+    for seconds in [30, 60, 600] {
+        let text = Sections {
+            server: "[server]\ntrust_domain = \"gang.internal\"\n[server.http2]\nshutdown_grace = \"0s\"\n",
+            ..Sections::VALID
+        }
+        .text()
+        .replace("boot_grace = \"1m\"", &format!("boot_grace = \"{seconds}s\""));
+        let config: GangConfig<Plugins> = text.parse()?;
+        let fleet = config.fleets.get(0).ok_or("missing fleet")?;
+        assert_eq!(fleet.policy.boot_grace, Duration::from_secs(seconds));
+        assert_eq!(
+            config
+                .scaling
+                .effective_readiness_prior(fleet.policy.boot_grace),
+            Duration::from_secs(seconds.min(90))
+        );
+    }
+    let config = Sections {
+        fleet: TWO_FLEETS,
+        provisioner: AWS_PROVISIONER,
+        ..Sections::VALID
+    }
+    .parse()?;
+    let priors: Vec<_> = config
+        .fleets
+        .policies()
+        .iter()
+        .map(|fleet| {
+            (
+                fleet.boot_grace,
+                config.scaling.effective_readiness_prior(fleet.boot_grace),
+            )
+        })
+        .collect();
+    assert_eq!(
+        priors,
+        vec![
+            (Duration::from_mins(10), Duration::from_secs(90)),
+            (Duration::from_mins(1), Duration::from_mins(1)),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn zero_boot_grace_parses_and_has_zero_cold_prior() -> Result<(), Box<dyn Error>> {
+    let text = Sections::VALID
+        .text()
+        .replace("boot_grace = \"1m\"", "boot_grace = \"0s\"");
+    let document = Document::<Plugins>::parse(&text)?;
+    let fleet = document.fleets.first().ok_or("missing fleet")?;
+    assert_eq!(fleet.boot_grace, Duration::ZERO);
+    assert_eq!(
+        document.scaling.effective_readiness_prior(fleet.boot_grace),
+        Duration::ZERO
+    );
+    // Zero boot grace still fails the independent, pre-existing shutdown timing rule.
+    assert!(matches!(
+        document.resolve(),
+        Err(ConfigError::ShutdownGraceNotBelowBootGrace { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn scaling_scalar_constructors_preserve_values_and_typed_errors() -> Result<(), Box<dyn Error>> {
+    use gang_config::{
+        PaybackPercent, PaybackPercentError, SourceLimit, SourceLimitError, WaterlinePercent,
+        WaterlinePercentError,
+    };
+    use std::num::NonZeroUsize;
+
+    assert_eq!(
+        PaybackPercent::try_new(0),
+        Err(PaybackPercentError::OutOfRange(0))
+    );
+    assert_eq!(
+        PaybackPercent::try_new(1001),
+        Err(PaybackPercentError::OutOfRange(1001))
+    );
+    assert_eq!(u16::from(PaybackPercent::try_from(1000)?), 1000);
+    assert_eq!(
+        WaterlinePercent::try_new(0),
+        Err(WaterlinePercentError::OutOfRange(0))
+    );
+    assert_eq!(
+        WaterlinePercent::try_new(100),
+        Err(WaterlinePercentError::OutOfRange(100))
+    );
+    assert_eq!(u8::from(WaterlinePercent::try_from(99)?), 99);
+    assert_eq!(
+        SourceLimit::try_new(0),
+        Err(SourceLimitError::OutOfRange(0))
+    );
+    assert_eq!(
+        SourceLimit::try_new(65_537),
+        Err(SourceLimitError::OutOfRange(65_537))
+    );
+    let limit = SourceLimit::try_from(65_536)?;
+    assert_eq!(usize::from(limit), 65_536);
+    assert_eq!(NonZeroUsize::from(limit).get(), 65_536);
+    Ok(())
+}
+
+#[test]
+fn scaling_scalar_errors_provide_operator_fixes() -> Result<(), Box<dyn Error>> {
+    use gang_config::{PaybackPercentError, SourceLimitError, WaterlinePercentError};
+    use gang_types::Fix as _;
+
+    for (fix, key, bounds) in [
+        (
+            PaybackPercentError::OutOfRange(0).fix(),
+            "scaling.payback_percent",
+            "1 and 1000",
+        ),
+        (
+            SourceLimitError::OutOfRange(0).fix(),
+            "scaling.max_sources",
+            "1 and 65536",
+        ),
+        (
+            WaterlinePercentError::OutOfRange(0).fix(),
+            "scaling.scale_in_waterline_percent",
+            "1 and 99",
+        ),
+    ] {
+        let fix = fix.ok_or("scaling scalar error has no operator fix")?;
+        assert!(fix.contains(key), "{fix}");
+        assert!(fix.contains(bounds), "{fix}");
+    }
+    Ok(())
+}

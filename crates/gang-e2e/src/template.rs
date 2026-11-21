@@ -772,6 +772,33 @@ fn render_control(document: &mut Document<Plugins>, knobs: &ControlKnobs) -> Res
         document.server.http2.max_concurrent_streams = NonZeroU32::new(max)
             .ok_or_else(|| template_error("max concurrent streams must be nonzero"))?;
     }
+    if let Some(percent) = knobs.payback_percent {
+        document.scaling.payback_percent =
+            gang_config::PaybackPercent::try_new(percent).map_err(template_error)?;
+    }
+    if let Some(half_life) = knobs.load_half_life {
+        document.scaling.load_half_life =
+            gang_config::ScalingInterval::try_new(half_life).map_err(template_error)?;
+    }
+    if let Some(idle) = knobs.source_idle {
+        document.scaling.source_idle =
+            gang_config::ScalingInterval::try_new(idle).map_err(template_error)?;
+    }
+    if let Some(duration) = knobs.unknown_action_duration {
+        document.scaling.unknown_action_duration =
+            NonZeroDuration::try_new(duration).map_err(template_error)?;
+    }
+    if let Some(prior) = knobs.readiness_prior {
+        document.scaling.readiness_prior =
+            NonZeroDuration::try_new(prior).map_err(template_error)?;
+    }
+    if let Some(dwell) = knobs.scale_in_dwell {
+        document.scaling.scale_in_dwell =
+            NonZeroDuration::try_new(dwell).map_err(template_error)?;
+    }
+    if let Some(max) = knobs.max_cordons {
+        document.scaling.max_cordons = max;
+    }
     if knobs.broken_launcher {
         let ProvisionerConfig::Local(local) = &mut document.provisioner else {
             return Err(template_error("missing [provisioner.local]"));

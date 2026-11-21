@@ -13,6 +13,7 @@ use futures::{FutureExt, StreamExt};
 use gang_clock::Clock;
 use gang_config::{DashboardConfig, EndpointTrust, Fleets, LeadershipConfig};
 use gang_mtls::SubjectName;
+use gang_reconciler::{PassTime, SourceProfiles};
 use gang_spi::{
     AuthenticationPort, CacheStorePort, ClientCertificates, ControllerConnections,
     ControllerHostIdentity, ControllerHostPort, ControllerId, ControllerReady, ControllerSpec,
@@ -335,8 +336,22 @@ struct LeadContext<'a, D: Deployment> {
     readiness: &'a Readiness,
     leadership: &'a Leadership<'a, D::Repository, D::Clock>,
     actions: &'a gang_config::ActionsConfig,
+    scaling: &'a Arc<gang_config::ScalingConfig>,
     sidecar_retry_interval: NonZeroDuration,
     milestone_timeout: Duration,
+}
+
+fn controller_leadership<'a, D: Deployment>(
+    core: &'a Core<D>,
+    controller: &'a ControllerId,
+    settings: LeadershipConfig,
+) -> Leadership<'a, D::Repository, D::Clock> {
+    Leadership::new(
+        &core.host.repository,
+        &core.host.clock,
+        controller,
+        settings,
+    )
 }
 
 fn start_standby<D: Deployment>(
@@ -483,6 +498,7 @@ async fn hold_leader<D: Deployment>(
     let mut yielded = Some(yielded);
     // The identity is stable across renewals; the repository checks its stored expiry.
     let authority = lease.clone();
+    let profiles = SourceProfiles::new(context.scaling, context.actions.history_window);
     let result = {
         let (requested, mut request) = oneshot::channel();
         let hold = hold_leader_lease(&context, &mut lease, requested);
@@ -495,13 +511,18 @@ async fn hold_leader<D: Deployment>(
                 finish_yield(context.readiness, &mut yielded, stop.clone()).await;
                 None
             }
-            result = restore_history(&context, &authority) => Some(result?),
+            result = restore_history(&context, &authority, &profiles) => Some(result?),
         };
         if let Some((mut store, mut records)) = restored {
             let mut requested = {
-                let work = lead_work(&context, stop.clone());
-                let periodic =
-                    flush_history_periodically(&context, &authority, &mut store, &mut records);
+                let work = lead_work(&context, &profiles, stop.clone());
+                let periodic = flush_history_periodically(
+                    &context,
+                    &authority,
+                    &profiles,
+                    &mut store,
+                    &mut records,
+                );
                 tokio::pin!(work, periodic);
                 tokio::select! {
                     biased;
@@ -521,6 +542,7 @@ async fn hold_leader<D: Deployment>(
                 requested = drain_and_flush(
                     &context,
                     &authority,
+                    &profiles,
                     (&mut store, &mut records),
                     hold.as_mut(),
                     &mut request,
@@ -531,7 +553,7 @@ async fn hold_leader<D: Deployment>(
             if requested {
                 let snapshot = context.core.host.clock.timeout(
                     context.leadership.snapshot_timeout(),
-                    flush_history(&context, &authority, &mut store, &mut records),
+                    flush_history(&context, &authority, &profiles, &mut store, &mut records),
                 );
                 tokio::select! {
                     biased;
@@ -564,6 +586,7 @@ async fn hold_leader<D: Deployment>(
 async fn drain_and_flush<D: Deployment>(
     context: &LeadContext<'_, D>,
     authority: &Lease,
+    profiles: &SourceProfiles,
     (store, records): (&mut LearnedHistoryStore, &mut Vec<gang_spi::LearnedHistory>),
     mut hold: Pin<&mut impl Future<Output = ()>>,
     request: &mut oneshot::Receiver<()>,
@@ -577,7 +600,7 @@ async fn drain_and_flush<D: Deployment>(
     }
     let final_flush = context.core.host.clock.timeout(
         context.actions.history_flush_interval.get(),
-        flush_history(context, authority, store, records),
+        flush_history(context, authority, profiles, store, records),
     );
     tokio::select! {
         biased;
@@ -629,11 +652,12 @@ async fn finish_yield(
 async fn restore_history<D: Deployment>(
     context: &LeadContext<'_, D>,
     lease: &Lease,
+    profiles: &SourceProfiles,
 ) -> Result<(LearnedHistoryStore, Vec<gang_spi::LearnedHistory>), ServerError> {
     let clock = &context.core.host.clock;
     let limit = loop {
         match context.scheduler.learned_history_byte_limit() {
-            Ok(limit) => break limit,
+            Ok(limit) => break history_byte_limit(limit),
             Err(error) => {
                 tracing::warn!(%error, "learned history source unavailable; retrying before admission");
             }
@@ -657,11 +681,14 @@ async fn restore_history<D: Deployment>(
                     &mut records,
                 )
                 .await?;
+            let time = PassTime::read(clock);
             context
                 .scheduler
-                .restore_learned_history(clock.wall(), &records)
+                .restore_learned_history(time.wall, &records)
                 .await
-                .map_err(HistoryError::Storage)
+                .map_err(HistoryError::Storage)?;
+            profiles.restore(time, &records);
+            Ok::<(), HistoryError>(())
         }
         .await;
         match attempt {
@@ -677,9 +704,14 @@ async fn restore_history<D: Deployment>(
     }
 }
 
+fn history_byte_limit(scheduler: std::num::NonZeroUsize) -> std::num::NonZeroUsize {
+    scheduler.max(SourceProfiles::record_byte_limit())
+}
+
 async fn flush_history<D: Deployment>(
     context: &LeadContext<'_, D>,
     lease: &Lease,
+    profiles: &SourceProfiles,
     store: &mut LearnedHistoryStore,
     records: &mut Vec<gang_spi::LearnedHistory>,
 ) -> Result<(), HistoryError> {
@@ -690,6 +722,9 @@ async fn flush_history<D: Deployment>(
         .learned_history(now, records)
         .await
         .map_err(HistoryError::Storage)?;
+    profiles
+        .snapshot(PassTime::read(clock), records)
+        .map_err(HistoryError::Storage)?;
     store
         .flush(&context.core.host.repository, lease, now, records)
         .await
@@ -698,6 +733,7 @@ async fn flush_history<D: Deployment>(
 async fn flush_history_periodically<D: Deployment>(
     context: &LeadContext<'_, D>,
     lease: &Lease,
+    profiles: &SourceProfiles,
     store: &mut LearnedHistoryStore,
     records: &mut Vec<gang_spi::LearnedHistory>,
 ) -> Infallible {
@@ -713,7 +749,7 @@ async fn flush_history_periodically<D: Deployment>(
         }
         // Anchor before I/O; an overrun catches up once, then re-anchors at that start.
         due = started + interval;
-        match flush_history(context, lease, store, records).await {
+        match flush_history(context, lease, profiles, store, records).await {
             Ok(()) => {}
             Err(HistoryError::Fenced) => {
                 tracing::warn!("learned history flush was fenced; retrying after renewal");
@@ -771,6 +807,7 @@ async fn report_serving<H: ControllerHostPort, C: Clock>(
 /// Starts the term and runs the leader's work after taking the cache baseline.
 async fn lead_work<D: Deployment>(
     context: &LeadContext<'_, D>,
+    profiles: &SourceProfiles,
     stop: Stop,
 ) -> Result<(), ServerError> {
     let baseline = match context.dashboard {
@@ -793,10 +830,14 @@ async fn lead_work<D: Deployment>(
     let control = ControlLoop::new(
         context.fleets,
         context.control_settings,
-        context.provisioner,
-        context.scheduler,
-        &context.core.host.repository,
-        clock,
+        Arc::clone(context.scaling),
+        profiles.clone(),
+        &crate::control::ControlPorts {
+            provisioner: context.provisioner,
+            scheduler: context.scheduler,
+            repository: &context.core.host.repository,
+            clock,
+        },
         context.leadership.fence().clone(),
     );
     let control = match context.dashboard.zip(baseline) {
@@ -1243,6 +1284,7 @@ pub struct Server<D: Deployment> {
     control_settings: ControlSettings,
     client_action_timeout: NonZeroDuration,
     actions: Arc<gang_config::ActionsConfig>,
+    scaling: Arc<gang_config::ScalingConfig>,
     accept_error_backoff: NonZeroDuration,
     standby_routability_delay: Duration,
     handoff_timeout: Duration,
@@ -1340,6 +1382,7 @@ impl<D: Deployment> Server<D> {
             control_settings,
             client_action_timeout: settings.client_action_timeout,
             actions: settings.actions,
+            scaling: settings.scaling,
             accept_error_backoff: settings.accept_error_backoff,
             standby_routability_delay: settings.standby_routability_delay,
             handoff_timeout: settings.handoff_timeout,
@@ -1407,6 +1450,8 @@ impl<D: Deployment> Server<D> {
             max_workers: self.fleets.max_instances(),
             client_action_timeout: self.client_action_timeout.get(),
             actions: Arc::clone(&self.actions),
+            scaling: Arc::clone(&self.scaling),
+            clock: core.host.clock.clone(),
             observations: &self.observation_sink,
         };
         let shutdown = shutdown.shared();
@@ -1445,12 +1490,7 @@ impl<D: Deployment> Server<D> {
                 .await?;
                 return Ok(());
             }
-            let leadership = Leadership::new(
-                &core.host.repository,
-                &core.host.clock,
-                &self.controller,
-                self.leadership.clone(),
-            );
+            let leadership = controller_leadership(core, &self.controller, self.leadership.clone());
             let leading = Leading::default();
             let (stop_sender, stop) = stop_channel();
             let connections = term_connections::<D>(
@@ -1475,6 +1515,7 @@ impl<D: Deployment> Server<D> {
                 leadership: &leadership,
                 control_settings: self.control_settings,
                 actions: &self.actions,
+                scaling: &self.scaling,
                 sidecar_retry_interval: self.leadership.renew_interval,
                 milestone_timeout: self.leadership.ttl.get(),
             };
@@ -2758,6 +2799,146 @@ mod tests {
             std::task::Poll::Ready(Ok(()))
         ));
         assert_released_history(&handles, history, first.version, &contender).await?;
+        Ok(())
+    }
+
+    #[test]
+    fn learned_history_budget_is_the_largest_record_not_the_sum() {
+        let profiles = gang_reconciler::SourceProfiles::record_byte_limit();
+        assert_eq!(
+            super::history_byte_limit(std::num::NonZeroUsize::MIN),
+            profiles
+        );
+        let scheduler = profiles.saturating_add(1);
+        assert_eq!(super::history_byte_limit(scheduler), scheduler);
+    }
+
+    fn source_profile_checkpoint(
+        policies: &[gang_config::FleetPolicy],
+        settings: &crate::settings::ServerSettings,
+        clock: &std::sync::Arc<gang_clock::TestClock>,
+    ) -> gang_testkit::TestResult<Vec<gang_spi::LearnedHistory>> {
+        use gang_reconciler::{
+            FleetPass, HostedSnapshot, PassTime, Plan, Reconciler, SourceProfiles,
+        };
+        use gang_spi::SchedulerSnapshot;
+        use std::time::Duration;
+
+        let profiles = SourceProfiles::new(&settings.scaling, settings.actions.history_window);
+        let mut model = Reconciler::new(
+            policies,
+            std::sync::Arc::clone(&settings.scaling),
+            profiles.clone(),
+        );
+        let mut fleets: Vec<_> = policies.iter().cloned().map(FleetPass::new).collect();
+        let mut queued = crate::test_support::queued_demand(gang_types::FleetSet::prefix(1)?);
+        queued.source = Some("0123456789abcdef".parse()?);
+        let mut snapshot = SchedulerSnapshot {
+            queued: vec![queued],
+            ..Default::default()
+        };
+        let mut hosted = HostedSnapshot::default();
+        hosted.replace(&mut snapshot);
+        let mut plan = Plan::new();
+        model.reconcile(&mut fleets, &hosted, PassTime::read(clock), &mut plan);
+        clock.advance(Duration::from_secs(30));
+        model.reconcile(&mut fleets, &hosted, PassTime::read(clock), &mut plan);
+        let mut seed = Vec::new();
+        profiles.snapshot(PassTime::read(clock), &mut seed)?;
+        Ok(seed)
+    }
+
+    #[tokio::test]
+    async fn leader_restores_source_profiles_and_keeps_them_through_final_flush()
+    -> gang_testkit::TestResult {
+        use gang_clock::Clock;
+        use gang_reconciler::{PassTime, SourceProfiles};
+        use gang_spi::{Acquisition, ControllerId, ControllerReady, LeaderLeasePort, Takeover};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let (parts, _dials, handles) = crate::test_support::plain_parts();
+        let mut settings = crate::test_support::plain_settings();
+        settings.actions = Arc::new(gang_config::ActionsConfig {
+            history_flush_interval: gang_types::NonZeroDuration::from_hours(1),
+            ..gang_config::ActionsConfig::default()
+        });
+        let seed = source_profile_checkpoint(parts.fleets.policies(), &settings, &handles.clock)?;
+        assert_eq!(
+            seed.len(),
+            1,
+            "first-ever activity must persist its checkpoint"
+        );
+        assert_eq!(seed[0].key.kind, gang_spi::RecordKind::SourceProfile);
+        let now = handles.clock.wall();
+        let Acquisition::Acquired(lease) = handles
+            .repository
+            .acquire(
+                &passive_candidate(&ControllerId::new("profile-seed")),
+                now,
+                now,
+                now + Duration::from_mins(1),
+                Takeover::Observe,
+            )
+            .await?
+        else {
+            panic!("fresh repository grants the seed lease");
+        };
+        let mut store =
+            super::LearnedHistoryStore::new(super::history_byte_limit(std::num::NonZeroUsize::MIN));
+        store.flush(&handles.repository, &lease, now, &seed).await?;
+        handles.repository.release(&lease).await?;
+
+        let expected = SourceProfiles::new(&settings.scaling, settings.actions.history_window);
+        expected.restore(PassTime::read(&handles.clock), &seed);
+        let server = super::Server::prepare(parts, settings).await?;
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let mut run = Box::pin(server.run(
+            async {
+                let _ = stopped.await;
+            },
+            ControllerReady::channel().0,
+        ));
+        assert!(futures::poll!(run.as_mut()).is_pending());
+        handles.clock.advance(Duration::from_mins(1));
+        assert!(futures::poll!(run.as_mut()).is_pending());
+        let mut expected_records = Vec::new();
+        expected.snapshot(PassTime::read(&handles.clock), &mut expected_records)?;
+        assert_ne!(
+            seed[0].body, expected_records[0].body,
+            "the expired checkpoint settles once"
+        );
+        let _ = stop.send(());
+        assert!(matches!(
+            futures::poll!(run.as_mut()),
+            std::task::Poll::Ready(Ok(()))
+        ));
+
+        let now = handles.clock.wall();
+        let Acquisition::Acquired(lease) = handles
+            .repository
+            .acquire(
+                &passive_candidate(&ControllerId::new("profile-inspector")),
+                now,
+                now,
+                now + Duration::from_mins(1),
+                Takeover::Observe,
+            )
+            .await?
+        else {
+            panic!("server releases its lease after the final flush");
+        };
+        let mut store =
+            super::LearnedHistoryStore::new(super::history_byte_limit(std::num::NonZeroUsize::MIN));
+        let mut actual = Vec::new();
+        store
+            .load(&handles.repository, &lease, now, &mut actual)
+            .await?;
+        assert_eq!(
+            actual, expected_records,
+            "final flush appends restored profiles after the scheduler clears its records"
+        );
+        handles.repository.release(&lease).await?;
         Ok(())
     }
 

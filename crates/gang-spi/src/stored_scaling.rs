@@ -30,7 +30,7 @@ pub struct StoredScalingKind<'name, 'value> {
     pub to_capacity: Option<u32>,
     /// Worker or instance identifier, when applicable.
     pub subject: Option<&'value str>,
-    /// Launch or exit failure detail, when applicable.
+    /// Optional decision summary, or required launch/exit failure detail.
     pub detail: Option<&'value str>,
 }
 
@@ -70,13 +70,32 @@ impl StoredScalingKindError {
 }
 
 impl ScalingEventKind {
+    /// Maximum UTF-8 byte length of an optional scale-out or drain decision summary.
+    /// Provider launch/exit failure messages retain their existing unbounded representation.
+    pub const MAX_DECISION_DETAIL_BYTES: usize = 512;
+
+    /// Validates the bounded decision summary without allocating on success.
+    ///
+    /// # Errors
+    /// Returns an invalid `detail` error when a decision summary exceeds the storage limit.
+    pub fn validate(&self) -> Result<(), StoredScalingKindError> {
+        let (Self::ScaledOut { detail, .. } | Self::DrainStarted { detail, .. }) = self else {
+            return Ok(());
+        };
+        validate_decision_detail(detail.as_deref())
+    }
+
     /// Flattens this kind into its borrowed storage representation.
     #[must_use]
     pub fn stored(&self) -> StoredScalingKind<'static, '_> {
         let (tag, from_capacity, to_capacity, subject, detail) = match self {
-            Self::ScaledOut { from, to } => {
-                (KindTag::ScaledOut, Some(*from), Some(*to), None, None)
-            }
+            Self::ScaledOut { from, to, detail } => (
+                KindTag::ScaledOut,
+                Some(*from),
+                Some(*to),
+                None,
+                detail.as_deref(),
+            ),
             Self::LaunchFailed { from, to, reason } => (
                 KindTag::LaunchFailed,
                 Some(*from),
@@ -87,12 +106,12 @@ impl ScalingEventKind {
             Self::Withdrawn { from, to } => {
                 (KindTag::Withdrawn, Some(*from), Some(*to), None, None)
             }
-            Self::DrainStarted { worker } => (
+            Self::DrainStarted { worker, detail } => (
                 KindTag::DrainStarted,
                 None,
                 None,
                 Some(worker.as_str()),
-                None,
+                detail.as_deref(),
             ),
             Self::DrainCancelled { worker } => (
                 KindTag::DrainCancelled,
@@ -140,6 +159,19 @@ impl ScalingEventKind {
     }
 }
 
+fn validate_decision_detail(detail: Option<&str>) -> Result<(), StoredScalingKindError> {
+    if detail.is_some_and(|value| value.len() > ScalingEventKind::MAX_DECISION_DETAIL_BYTES) {
+        return Err(StoredScalingKindError::Invalid {
+            field: "detail",
+            detail: format!(
+                "decision summary exceeds {} bytes",
+                ScalingEventKind::MAX_DECISION_DETAIL_BYTES,
+            ),
+        });
+    }
+    Ok(())
+}
+
 impl TryFrom<StoredScalingKind<'_, '_>> for ScalingEventKind {
     type Error = StoredScalingKindError;
 
@@ -173,10 +205,14 @@ impl TryFrom<StoredScalingKind<'_, '_>> for ScalingEventKind {
                 detail: error.to_string(),
             })
         };
+        if matches!(tag, KindTag::ScaledOut | KindTag::DrainStarted) {
+            validate_decision_detail(stored.detail)?;
+        }
         Ok(match tag {
             KindTag::ScaledOut => Self::ScaledOut {
                 from: from()?,
                 to: to()?,
+                detail: stored.detail.map(str::to_owned),
             },
             KindTag::LaunchFailed => Self::LaunchFailed {
                 from: from()?,
@@ -187,7 +223,10 @@ impl TryFrom<StoredScalingKind<'_, '_>> for ScalingEventKind {
                 from: from()?,
                 to: to()?,
             },
-            KindTag::DrainStarted => Self::DrainStarted { worker: worker()? },
+            KindTag::DrainStarted => Self::DrainStarted {
+                worker: worker()?,
+                detail: stored.detail.map(str::to_owned),
+            },
             KindTag::DrainCancelled => Self::DrainCancelled { worker: worker()? },
             KindTag::Terminated => Self::Terminated {
                 instance: instance()?,
@@ -210,7 +249,11 @@ mod tests {
         let worker = WorkerId::try_new("worker-1").expect("valid worker");
         let instance = InstanceId::try_new("instance-1").expect("valid instance");
         vec![
-            ScalingEventKind::ScaledOut { from: 1, to: 2 },
+            ScalingEventKind::ScaledOut {
+                from: 1,
+                to: 2,
+                detail: None,
+            },
             ScalingEventKind::LaunchFailed {
                 from: 1,
                 to: 2,
@@ -219,6 +262,7 @@ mod tests {
             ScalingEventKind::Withdrawn { from: 2, to: 1 },
             ScalingEventKind::DrainStarted {
                 worker: worker.clone(),
+                detail: None,
             },
             ScalingEventKind::DrainCancelled {
                 worker: worker.clone(),
@@ -241,6 +285,71 @@ mod tests {
     fn every_kind_round_trips() {
         for kind in kinds() {
             assert_eq!(ScalingEventKind::try_from(kind.stored()), Ok(kind.clone()));
+        }
+    }
+
+    #[test]
+    fn decision_detail_round_trips_optional_and_utf8_byte_limit() {
+        for detail in [
+            None,
+            Some(String::new()),
+            Some("é".repeat(256)),
+            Some("é".repeat(257)),
+        ] {
+            for kind in [
+                ScalingEventKind::ScaledOut {
+                    from: 1,
+                    to: 2,
+                    detail: detail.clone(),
+                },
+                ScalingEventKind::DrainStarted {
+                    worker: WorkerId::try_new("worker-1").expect("valid worker"),
+                    detail: detail.clone(),
+                },
+            ] {
+                let valid = detail
+                    .as_ref()
+                    .is_none_or(|value| value.len() <= ScalingEventKind::MAX_DECISION_DETAIL_BYTES);
+                assert_eq!(kind.validate().is_ok(), valid);
+                let decoded = ScalingEventKind::try_from(kind.stored());
+                if valid {
+                    assert_eq!(decoded, Ok(kind));
+                } else {
+                    assert_eq!(
+                        decoded.expect_err("oversized detail rejected").field(),
+                        "detail"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn failure_details_remain_required_and_unbounded() {
+        for kind in [
+            ScalingEventKind::LaunchFailed {
+                from: 1,
+                to: 2,
+                reason: "x".repeat(1024),
+            },
+            ScalingEventKind::ExitedEarly {
+                instance: InstanceId::try_new("instance-1").expect("valid instance"),
+                failure: "x".repeat(1024),
+            },
+        ] {
+            assert_eq!(kind.validate(), Ok(()));
+            assert_eq!(ScalingEventKind::try_from(kind.stored()), Ok(kind.clone()));
+            let stored = StoredScalingKind {
+                detail: None,
+                ..kind.stored()
+            };
+            assert!(matches!(
+                ScalingEventKind::try_from(stored),
+                Err(StoredScalingKindError::Missing {
+                    field: "detail",
+                    ..
+                }),
+            ));
         }
     }
 

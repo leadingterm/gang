@@ -305,7 +305,7 @@ fn instance_of(worker: &str) -> Option<&str> {
         return None;
     }
     let instance = head.strip_suffix(WORKER_NAME_SEPARATOR)?;
-    if instance.is_empty() || !instance.chars().all(is_identifier_char) {
+    if InstanceId::validate(instance).is_err() {
         return None;
     }
     Some(instance)
@@ -331,6 +331,16 @@ impl InstanceId {
 }
 
 impl WorkerId {
+    /// Validates a raw worker id and borrows its full instance-name prefix.
+    ///
+    /// Applies the same worker, UUID suffix and instance-name rules as [`Self::instance_name`],
+    /// without allocating an owned identifier. Returns `None` for any invalid input.
+    #[must_use]
+    pub fn instance_name_from_str(worker: &str) -> Option<&str> {
+        Self::validate(worker).ok()?;
+        instance_of(worker)
+    }
+
     /// Returns the instance-id text that hosts this worker, borrowed from the id.
     ///
     /// Does not allocate. Returns `None` when the id does not name an instance: it must end in
@@ -655,6 +665,51 @@ mod tests {
             }
         });
         assert_eq!(counts.count_total, 0, "instance_name allocated");
+    }
+
+    #[test]
+    fn borrowed_instance_name_matches_owned_validation() {
+        for name in ["local-1", "i-0a.b_c-1", "UPPER_123", "-"] {
+            let raw = format!("{name}-{WORKER_UUID}");
+            let owned = WorkerId::try_new(raw.as_str()).unwrap();
+            assert_eq!(
+                WorkerId::instance_name_from_str(&raw),
+                owned.instance_name()
+            );
+            assert_eq!(WorkerId::instance_name_from_str(&raw), Some(name));
+        }
+        for raw in [
+            String::new(),
+            "local-1".to_owned(),
+            format!("-{WORKER_UUID}"),
+            format!("bad/name-{WORKER_UUID}"),
+            format!("bad\nname-{WORKER_UUID}"),
+            format!("é-{WORKER_UUID}"),
+            format!("local-1{WORKER_UUID}"),
+            "local-1-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6g".to_owned(),
+            format!("local-1-{WORKER_UUID}-suffix"),
+        ] {
+            assert_eq!(WorkerId::instance_name_from_str(&raw), None, "{raw:?}");
+            assert_eq!(
+                WorkerId::instance_name_from_str(&raw),
+                WorkerId::try_new(raw.as_str())
+                    .ok()
+                    .as_ref()
+                    .and_then(WorkerId::instance_name)
+            );
+        }
+    }
+
+    #[test]
+    fn borrowed_instance_name_allocates_nothing() {
+        let raw = format!("local-1-{WORKER_UUID}");
+        assert_eq!(WorkerId::instance_name_from_str(&raw), Some("local-1"));
+        let counts = allocation_counter::measure(|| {
+            for _ in 0..100 {
+                std::hint::black_box(WorkerId::instance_name_from_str(&raw));
+            }
+        });
+        assert_eq!(counts.count_total, 0, "borrowed instance parsing allocated");
     }
 
     #[test]

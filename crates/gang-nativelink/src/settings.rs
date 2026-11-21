@@ -542,6 +542,8 @@ mod tests {
     ) -> ControllerSpec<'a> {
         ControllerSpec {
             actions: std::sync::Arc::new(ActionsConfig::default()),
+            scaling: std::sync::Arc::new(gang_config::ScalingConfig::default()),
+            clock: std::sync::Arc::new(gang_clock::SystemClock::new()),
             content_store: content,
             action_store: action,
             fleets,

@@ -344,7 +344,7 @@ pub fn scale_outs(events: &[Event], name: impl Into<Cow<'static, str>>, expected
 pub fn first_scale_out_from_zero(events: &[Event]) -> Check {
     const NAME: &str = names::scaling::FIRST_SCALE_OUT_FROM_ZERO;
     let first = events.iter().find_map(|event| match event.change {
-        EventChange::ScaledOut { from, to } => Some((from, to)),
+        EventChange::ScaledOut { from, to, .. } => Some((from, to)),
         _ => None,
     });
     match first {
@@ -422,7 +422,7 @@ pub fn worker_ids(events: &[Event]) -> Check {
     let drained: Vec<&str> = events
         .iter()
         .filter_map(|event| match &event.change {
-            EventChange::DrainStarted { worker } => Some(worker.as_str()),
+            EventChange::DrainStarted { worker, .. } => Some(worker.as_str()),
             _ => None,
         })
         .collect();
@@ -460,7 +460,7 @@ pub fn every_drain_terminated(events: &[Event]) -> bool {
     let drained: Vec<&str> = events
         .iter()
         .filter_map(|event| match &event.change {
-            EventChange::DrainStarted { worker } => Some(worker.as_str()),
+            EventChange::DrainStarted { worker, .. } => Some(worker.as_str()),
             _ => None,
         })
         .collect();

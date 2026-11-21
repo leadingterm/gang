@@ -52,7 +52,11 @@ fn event(seq: u64) -> Result<Event, Box<dyn Error>> {
         create_time: Timestamp::from_unix_millis(seq),
         fleet: name::of::<name::Fleets>(&fleet),
         cause: Some(Cause::Demand),
-        change: EventChange::ScaledOut { from: 0, to: 1 },
+        change: EventChange::ScaledOut {
+            from: 0,
+            to: 1,
+            detail: None,
+        },
     })
 }
 

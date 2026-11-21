@@ -52,6 +52,20 @@ pub struct ControlKnobs {
     pub client_action_timeout: Option<Duration>,
     /// HTTP/2 per-connection request limit for the held build.
     pub max_concurrent_streams: Option<u32>,
+    /// `[scaling]` payback percentage, used to derive the forecast horizon.
+    pub payback_percent: Option<u16>,
+    /// `[scaling]` rate smoothing half-life.
+    pub load_half_life: Option<Duration>,
+    /// `[scaling]` observed quiet interval separating source activity periods.
+    pub source_idle: Option<Duration>,
+    /// `[scaling]` fallback service duration for an unknown action.
+    pub unknown_action_duration: Option<Duration>,
+    /// `[scaling]` cold worker-readiness prior.
+    pub readiness_prior: Option<Duration>,
+    /// `[scaling]` continuous N-1 feasibility dwell.
+    pub scale_in_dwell: Option<Duration>,
+    /// `[scaling]` concurrent physical cordon bound.
+    pub max_cordons: Option<u16>,
     /// Use a nonexistent local worker launcher.
     pub broken_launcher: bool,
     /// Install a gate for worker launches.
@@ -74,15 +88,27 @@ impl ControlKnobs {
         detail_interval: None,
         client_action_timeout: None,
         max_concurrent_streams: None,
+        payback_percent: None,
+        load_half_life: None,
+        source_idle: None,
+        unknown_action_duration: None,
+        readiness_prior: None,
+        scale_in_dwell: None,
+        max_cordons: None,
         broken_launcher: false,
         holdable_launches: false,
     };
 
-    /// Fleet placement builds: retain the base poll interval, but drain idle workers after two
-    /// seconds and kill a terminating worker one second after `SIGTERM`.
+    /// Fleet placement builds: retain polling, use a ten-minute unknown-action prior to
+    /// justify cold overflow, and drain idle workers after two seconds.
     pub const FLEETS: Self = Self {
         idle_timeout: Some(Duration::from_secs(2)),
         terminate_grace: Some(Duration::from_secs(1)),
+        // Checked-in cold B=min(90s prior,60s boot_grace)=60s, idle=2s and
+        // default payback=50% give H=31s. Each one-slot action contributes
+        // 600/31>19 slots of transient work, so the second action still buys
+        // the next declared fleet after crediting the first planned worker.
+        unknown_action_duration: Some(Duration::from_mins(10)),
         ..Self::NONE
     };
 
@@ -158,6 +184,18 @@ impl ControlKnobs {
         ..Self::NONE
     };
 
+    /// An untrained burst keeps the default scaling prior and a realistic payback horizon.
+    /// The 64 MiB request is raised to the 1 GiB disk minimum; on an 8 GiB fleet
+    /// with 16 slots it weighs two slots, so 160 unknown 10s actions contribute 3200
+    /// slot-seconds.
+    /// The default 90s readiness prior is clamped by the 60s boot grace; with a 10 minute
+    /// idle timeout, the default 50% payback gives a 330s horizon, so 3200/330 is less
+    /// than the first worker's 16 slots.
+    pub const COLD_BURST_FROM_ZERO: Self = Self {
+        idle_timeout: Some(Duration::from_mins(10)),
+        ..Self::BURST_FROM_ZERO
+    };
+
     /// Short running work can absorb an additional queued action.
     pub const QUEUED_BEHIND_SHORT_WORK: Self = Self {
         poll_interval: Some(Duration::from_secs(1)),
@@ -179,12 +217,72 @@ impl ControlKnobs {
         target_actions_per_instance: Some(1),
         vcpus_per_instance: Some(1),
         holdable_launches: true,
+        unknown_action_duration: Some(Duration::from_mins(10)),
+        ..Self::NONE
+    };
+
+    /// Small, observable rate windows. With cold B=2s and idle=20s,
+    /// H=50%*(B+idle)=11s and B+H=13s. The scenarios observe at least
+    /// 30s of continuous refill after readiness (and use measured B thereafter).
+    pub const SUSTAINED_STREAM: Self = Self {
+        poll_interval: Some(Duration::from_secs(1)),
+        boot_grace: Some(Duration::from_mins(1)),
+        idle_timeout: Some(Duration::from_secs(20)),
+        min_instances: Some(0),
+        max_instances: Some(3),
+        target_actions_per_instance: Some(4),
+        vcpus_per_instance: Some(4),
+        payback_percent: Some(50),
+        load_half_life: Some(Duration::from_secs(2)),
+        source_idle: Some(Duration::from_secs(4)),
+        unknown_action_duration: Some(Duration::from_millis(100)),
+        readiness_prior: Some(Duration::from_secs(2)),
+        scale_in_dwell: Some(Duration::from_secs(4)),
+        max_cordons: Some(1),
+        detail_interval: Some(Duration::from_secs(1)),
+        ..Self::NONE
+    };
+
+    /// Two principals share spare slots, but never activity ages.
+    pub const TWO_SOURCES: Self = Self {
+        ..Self::SUSTAINED_STREAM
+    };
+
+    /// Three distributed actions fit one eight-slot worker below the 70% waterline;
+    /// initially fill three workers with twenty-four held actions, then reduce to three.
+    pub const UTILIZATION_SCALE_IN: Self = Self {
+        idle_timeout: Some(Duration::from_mins(5)),
+        unknown_action_duration: Some(Duration::from_mins(10)),
+        min_instances: Some(1),
+        target_actions_per_instance: Some(8),
+        vcpus_per_instance: Some(8),
+        max_drain_wait: Some(Duration::from_mins(3)),
+        ..Self::SUSTAINED_STREAM
+    };
+
+    /// Held leader-failover probes must justify another worker while the leader is lost.
+    pub const LEADER_FAILOVER: Self = Self {
+        unknown_action_duration: Some(Duration::from_mins(1)),
+        ..Self::NONE
+    };
+
+    /// Database outage/partition builds: cost-justified held demand makes the follower
+    /// demonstrate a real purchase before the bounded partition heals.
+    pub const DATABASE_OUTAGE: Self = Self {
+        // Partition probes use a fresh mnemonic, so the completed outage build cannot
+        // replace this prior through target or mnemonic duration history.
+        // Cold B=min(90s,60s)=60s and idle=15s give H=50%*(60+15)=37.5s.
+        // Each 600s unknown contributes 16 slots of work/H. Even four remaining
+        // queued probes justify another two-slot instance after existing capacity credit.
+        unknown_action_duration: Some(Duration::from_mins(10)),
+        target_actions_per_instance: Some(2),
+        detail_interval: Some(Duration::from_secs(1)),
         ..Self::NONE
     };
 
     /// Every preset a fleet or control scenario runs under; configuration parse tests draw from
     /// this list.
-    pub const PRESETS: [Self; 9] = [
+    pub const PRESETS: [Self; 15] = [
         Self::FLEETS,
         Self::ORPHAN,
         Self::DRAIN_CANCEL,
@@ -192,8 +290,14 @@ impl ControlKnobs {
         Self::LAUNCH_FAILURE,
         Self::SCHEDULED_MINIMUM,
         Self::BURST_FROM_ZERO,
+        Self::COLD_BURST_FROM_ZERO,
         Self::QUEUED_BEHIND_SHORT_WORK,
         Self::BACKLOG_GROWS_FLEET,
+        Self::SUSTAINED_STREAM,
+        Self::TWO_SOURCES,
+        Self::UTILIZATION_SCALE_IN,
+        Self::LEADER_FAILOVER,
+        Self::DATABASE_OUTAGE,
     ];
 }
 
@@ -519,7 +623,7 @@ pub(crate) fn terminates(event: &Event, instance: &str) -> bool {
 /// The worker whose drain `event` records starting, as a reference `workers/{worker}`.
 pub(crate) fn drain_started(event: &Event) -> Option<&str> {
     match &event.change {
-        EventChange::DrainStarted { worker } => Some(worker),
+        EventChange::DrainStarted { worker, .. } => Some(worker),
         _ => None,
     }
 }

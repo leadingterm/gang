@@ -1047,7 +1047,11 @@ impl System for ExecSim {
             create_time: gang_clock::Timestamp::from_unix_millis(0),
             fleet: "fleets/local-worker-x86-64".to_owned(),
             cause: None,
-            change: EventChange::ScaledOut { from: 0, to: 1 },
+            change: EventChange::ScaledOut {
+                from: 0,
+                to: 1,
+                detail: None,
+            },
         }];
         if self.behaviour.fleet_disk != FleetDiskCheck::Enrolls
             && self.behaviour.fleet_exit != FleetExit::Missing

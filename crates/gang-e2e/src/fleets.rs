@@ -22,9 +22,9 @@ use crate::verdict;
 enum Arrival {
     /// As the build sends them.
     AsSent,
-    /// With initially empty history and unknown action durations, all at once: every pass is skipped
-    /// until the live state shows each action queued, so the first pass that places them sees
-    /// them together, before any worker could run one of them.
+    /// With initially empty history and the fixture's cost-justified unknown durations,
+    /// all at once: every pass is skipped until both actions are queued, so the first
+    /// placing pass sees both before either can execute.
     Together,
 }
 
@@ -102,9 +102,11 @@ const DRAINED_STARTS: [Step; 4] = [
     },
 ];
 
-// With unknown durations, one pass sees both actions queued: the first fills the small
-// fleet's one instance, so the second overflows. Sent as they come, the second can reach a
-// small worker that already serves and packs both before any pass sees it queued.
+// The placement fixture's ten-minute unknown-duration prior justifies another worker:
+// with cold B=60s and idle=2s, H=50%*(B+idle)=31s, so 600/H>19 slots/action.
+// One pass sees both queued; the small fleet's one-instance limit forces the second
+// cost-justified purchase onto the next declared fleet. Short/default-prior bursts
+// correctly need not overflow, and arriving after dispatch could reuse the small worker.
 const COLD_PAIR: Step = Step {
     request: names::fleets::OVERFLOW,
     probes: &[Probe::OverflowFirst, Probe::OverflowSecond],
@@ -148,10 +150,10 @@ pub fn run_drained_starts<S: Control>(system: &S, variant: &Variant) -> Result<V
 
 /// Runs only the cold overflow pair and its drain checks on a fresh deployment.
 ///
-/// The caller must supply a separate, never-used controller and history namespace, so action
-/// durations are unknown without restarting a server. The provisioner's supply is held while
-/// building until the live state shows both actions queued, so the first placing pass sees them
-/// together. This function starts its server and leaves it running for caller-owned cleanup.
+/// The caller must supply a separate, never-used controller and history namespace with
+/// [`ControlKnobs::FLEETS`](crate::ControlKnobs::FLEETS), whose ten-minute unknown-action
+/// prior makes the second worker cost-justified. Supply is held until both actions are
+/// queued together. This function starts its server and leaves it running for caller cleanup.
 ///
 /// # Errors
 ///

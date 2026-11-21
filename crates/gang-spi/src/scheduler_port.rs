@@ -11,15 +11,15 @@ use http_body_util::BodyExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::oneshot;
 
-use gang_clock::Timestamp;
+use gang_clock::{Clock, Tick, Timestamp};
 use gang_types::{
     ActionEnvironment, ActionResources, BuildId, Bytes, FleetCatalog, FleetName, FleetProperties,
-    FleetSet, InstanceId, Refusal, Url, WorkerId,
+    FleetSet, InstanceId, Refusal, SourceId, Url, WorkerId,
 };
 
 use crate::{
-    ActionMemoryPool, Authenticated, BoxedError, ObservationSink, Peer, PortError, RecordKey,
-    RenderedStoreSpec, port,
+    ActionMemoryPool, Authenticated, BoxedError, CompletionRates, FleetSupply, ObservationSink,
+    Peer, PortError, RecordKey, RenderedStoreSpec, port,
 };
 
 /// The remote execution scheduler Gang scales workers for. The scheduler runs inside the `gang`
@@ -76,13 +76,35 @@ pub trait SchedulerPort: Send + Sync {
     async fn actions(&self, limits: ListingLimits, into: &mut ActionsView)
     -> Result<(), PortError>;
 
-    /// Stops (`true`) or resumes (`false`) assigning new actions to a worker.
+    /// Stops (`true`) or resumes (`false`) assignments to every current and future connection
+    /// of the physical instance. A valid intent succeeds even with no current connection.
     ///
     /// # Errors
     ///
-    /// [`PortError::NotFound`] with [`Subject::Worker`](crate::Subject::Worker) when the worker
-    /// is not connected; [`PortError::Unavailable`] while the controller is not serving.
-    async fn set_draining(&self, worker: &WorkerId, draining: bool) -> Result<(), PortError>;
+    /// [`PortError::Unavailable`] while the controller is not serving, or a backend error when
+    /// a connected worker could not be updated. A failed update retains the controller intent.
+    async fn set_draining(
+        &self,
+        fleet: &FleetName,
+        instance: &InstanceId,
+        draining: bool,
+    ) -> Result<(), PortError>;
+
+    /// Retains physical intents seen in a complete provider census, allowing `grace` of absence.
+    ///
+    /// `now` uses the injected server clock. Reappearance resets the absence interval. Each
+    /// supply includes every lifecycle and configuration generation. The implementation scans
+    /// the complete borrowed census synchronously after acquiring its asynchronous write lock.
+    ///
+    /// # Errors
+    ///
+    /// [`PortError::Unavailable`] while the controller is not serving.
+    async fn retain_drains(
+        &self,
+        now: Tick,
+        grace: Duration,
+        live: &[(&FleetName, &FleetSupply)],
+    ) -> Result<(), PortError>;
 
     /// The URL the controller's worker listener is dialed on.
     fn endpoints(&self) -> ControllerEndpoints;
@@ -175,6 +197,12 @@ pub struct LearnedHistory {
 pub struct SchedulerSnapshot {
     /// Actions that reached a terminal result on a worker since the controller started. Monotonic.
     pub completed: u64,
+    /// Completion cells, unique and sorted by `(source, preferred_fleet)`.
+    pub source_rates: Vec<CompletionRates>,
+    /// Rate-row read time, sampled under the rate mutex before any listing awaits.
+    pub source_rates_at: Tick,
+    /// Controller-owned physical intents only, unique and sorted by `(fleet, instance)`.
+    pub cordons: Vec<InstanceCordon>,
     /// The connected workers, with unique ids sorted by `WorkerId` ascending.
     pub workers: Vec<WorkerState>,
     /// The queued actions, highest priority first, then oldest.
@@ -183,6 +211,29 @@ pub struct SchedulerSnapshot {
     pub executing: Vec<ExecutingDemand>,
     /// Engine-bounded stores and their cumulative eviction counters.
     pub stores: Vec<EngineStore>,
+}
+
+/// One controller-owned cordon, shared across all connections of a physical instance.
+#[derive(Debug, PartialEq, Eq)]
+pub struct InstanceCordon {
+    /// Fleet's catalog index, matching completion-rate rows.
+    pub fleet: usize,
+    /// Immutable physical instance identity.
+    pub instance: Arc<InstanceId>,
+}
+
+impl Clone for InstanceCordon {
+    fn clone(&self) -> Self {
+        Self {
+            fleet: self.fleet,
+            instance: Arc::clone(&self.instance),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.fleet = source.fleet;
+        self.instance.clone_from(&source.instance);
+    }
 }
 
 /// A bounded engine store's usage and cumulative evictions.
@@ -233,6 +284,8 @@ pub struct WorkerState {
 /// An action waiting for a worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuedDemand {
+    /// Authenticated first-creator source, or unattributed legacy work.
+    pub source: Option<SourceId>,
     /// The fleets that accept the action, as indices into [`ControllerSpec::fleets`], in
     /// preference order; empty when none accepts it.
     pub candidates: FleetSet,
@@ -251,6 +304,12 @@ pub struct QueuedDemand {
 /// An action executing on a connected worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutingDemand {
+    /// Authenticated first-creator source, or unattributed legacy work.
+    pub source: Option<SourceId>,
+    /// Accepting fleets in preference order; the first is preferred, not the actual worker's fleet.
+    pub candidates: FleetSet,
+    /// Action reservations, independent of the worker's fleet.
+    pub resources: ActionResources,
     /// Index into the snapshot's workers, sorted by worker ID.
     pub worker: usize,
     /// When execution started.
@@ -506,10 +565,14 @@ pub struct ClientTls<'a> {
 }
 
 /// Inputs of the controller.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ControllerSpec<'a> {
     /// Shared action scheduling and enforcement policy.
     pub actions: Arc<gang_config::ActionsConfig>,
+    /// Shared rate estimation and scaling policy.
+    pub scaling: Arc<gang_config::ScalingConfig>,
+    /// The server's existing clock, shared with completion producers and reconciliation.
+    pub clock: Arc<dyn Clock>,
     /// The content-addressable store.
     pub content_store: &'a RenderedStoreSpec,
     /// The action store.
@@ -524,6 +587,22 @@ pub struct ControllerSpec<'a> {
     pub client_action_timeout: Duration,
     /// Where the controller's observers send what builds do.
     pub observations: &'a ObservationSink,
+}
+
+impl std::fmt::Debug for ControllerSpec<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControllerSpec")
+            .field("actions", &self.actions)
+            .field("scaling", &self.scaling)
+            .field("content_store", &self.content_store)
+            .field("action_store", &self.action_store)
+            .field("fleets", &self.fleets)
+            .field("max_workers", &self.max_workers)
+            .field("client_action_timeout", &self.client_action_timeout)
+            .field("observations", &self.observations)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The dialable URL of the controller's worker listener, with its host name, as the plugin's
@@ -616,7 +695,26 @@ mod tests {
 
     use http_body_util::BodyExt;
 
-    use super::{BoxedError, Slots, full_body};
+    use super::{BoxedError, InstanceCordon, Slots, full_body};
+
+    #[test]
+    fn instance_cordon_clone_from_shares_the_immutable_identity() -> Result<(), BoxedError> {
+        let source = InstanceCordon {
+            fleet: 3,
+            instance: std::sync::Arc::new(gang_types::InstanceId::try_new("instance-a")?),
+        };
+        let mut target = InstanceCordon {
+            fleet: 1,
+            instance: std::sync::Arc::new(gang_types::InstanceId::try_new("instance-b")?),
+        };
+        target.clone_from(&source);
+        assert_eq!(target, source);
+        assert!(std::sync::Arc::ptr_eq(&target.instance, &source.instance));
+        let cloned = source.clone();
+        assert_eq!(cloned, source);
+        assert!(std::sync::Arc::ptr_eq(&cloned.instance, &source.instance));
+        Ok(())
+    }
 
     #[test]
     fn full_body_collects_to_its_bytes() -> Result<(), BoxedError> {

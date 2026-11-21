@@ -736,7 +736,11 @@ async fn scaling_events_are_appended_in_insertion_order() {
         ScalingAuditEvent {
             at: ts(1_000),
             fleet: fleet.clone(),
-            kind: ScalingEventKind::ScaledOut { from: 1, to: 2 },
+            kind: ScalingEventKind::ScaledOut {
+                from: 1,
+                to: 2,
+                detail: None,
+            },
             cause: None,
         },
         ScalingAuditEvent {
@@ -744,6 +748,7 @@ async fn scaling_events_are_appended_in_insertion_order() {
             fleet: fleet.clone(),
             kind: ScalingEventKind::DrainStarted {
                 worker: WorkerId::try_new("worker-1").expect("test worker id is valid"),
+                detail: None,
             },
             cause: None,
         },
@@ -936,11 +941,19 @@ async fn scaling_events_come_back_in_sequence_order_after_the_cursor() {
     let dir = TempDir::new().expect("temp dir");
     let store = store(&dir);
     // Timestamps are deliberately out of order: the cursor follows the sequence, not the time.
-    let first = scaling(2_000, ScalingEventKind::ScaledOut { from: 0, to: 1 });
+    let first = scaling(
+        2_000,
+        ScalingEventKind::ScaledOut {
+            from: 0,
+            to: 1,
+            detail: None,
+        },
+    );
     let second = scaling(
         1_000,
         ScalingEventKind::DrainStarted {
             worker: worker_id("worker-1"),
+            detail: None,
         },
     );
     let third = scaling(
@@ -995,7 +1008,14 @@ async fn scaling_events_on_an_empty_log_are_empty() {
     let store = store(&dir);
     let mut events = vec![recorded(
         1,
-        &scaling(1_000, ScalingEventKind::ScaledOut { from: 0, to: 1 }),
+        &scaling(
+            1_000,
+            ScalingEventKind::ScaledOut {
+                from: 0,
+                to: 1,
+                detail: None,
+            },
+        ),
     )];
 
     store
@@ -1015,6 +1035,7 @@ async fn scaling_events_with_equal_times_keep_recording_order() {
             5_000,
             ScalingEventKind::DrainStarted {
                 worker: worker_id("worker-1"),
+                detail: None,
             },
         ),
         scaling(
@@ -1023,7 +1044,14 @@ async fn scaling_events_with_equal_times_keep_recording_order() {
                 instance: instance_id("i-0abc123"),
             },
         ),
-        scaling(5_000, ScalingEventKind::ScaledOut { from: 1, to: 2 }),
+        scaling(
+            5_000,
+            ScalingEventKind::ScaledOut {
+                from: 1,
+                to: 2,
+                detail: None,
+            },
+        ),
         scaling(
             5_000,
             ScalingEventKind::DrainCancelled {
@@ -1064,12 +1092,14 @@ async fn every_scaling_kind_round_trips_through_the_store() {
             ScalingEventKind::ScaledOut {
                 from: 2,
                 to: u32::MAX,
+                detail: None,
             },
         ),
         scaling(
             2_000,
             ScalingEventKind::DrainStarted {
                 worker: worker_id("worker-1"),
+                detail: None,
             },
         ),
         scaling(
@@ -1154,7 +1184,14 @@ async fn every_scaling_cause_round_trips_through_the_store() {
 async fn scaling_events_overwrite_the_buffer_instead_of_appending() {
     let dir = TempDir::new().expect("temp dir");
     let store = store(&dir);
-    let recorded_event = scaling(1_000, ScalingEventKind::ScaledOut { from: 0, to: 1 });
+    let recorded_event = scaling(
+        1_000,
+        ScalingEventKind::ScaledOut {
+            from: 0,
+            to: 1,
+            detail: None,
+        },
+    );
     store
         .record_scaling_event(&recorded_event)
         .await
@@ -1195,7 +1232,11 @@ async fn scaling_events_reject_a_corrupt_row() {
     store
         .record_scaling_event(&scaling(
             1_000,
-            ScalingEventKind::ScaledOut { from: 0, to: 1 },
+            ScalingEventKind::ScaledOut {
+                from: 0,
+                to: 1,
+                detail: None,
+            },
         ))
         .await
         .expect("event is appended");
@@ -1231,7 +1272,11 @@ async fn scaling_events_reject_an_unknown_cause() {
     store
         .record_scaling_event(&scaling(
             1_000,
-            ScalingEventKind::ScaledOut { from: 0, to: 1 },
+            ScalingEventKind::ScaledOut {
+                from: 0,
+                to: 1,
+                detail: None,
+            },
         ))
         .await
         .expect("event is appended");
@@ -1280,9 +1325,30 @@ async fn scaling_events_before_bound_excludes_that_sequence() {
     let dir = TempDir::new().expect("temp dir");
     let store = store(&dir);
     let events = [
-        scaling(1_000, ScalingEventKind::ScaledOut { from: 0, to: 1 }),
-        scaling(2_000, ScalingEventKind::ScaledOut { from: 1, to: 2 }),
-        scaling(3_000, ScalingEventKind::ScaledOut { from: 2, to: 3 }),
+        scaling(
+            1_000,
+            ScalingEventKind::ScaledOut {
+                from: 0,
+                to: 1,
+                detail: None,
+            },
+        ),
+        scaling(
+            2_000,
+            ScalingEventKind::ScaledOut {
+                from: 1,
+                to: 2,
+                detail: None,
+            },
+        ),
+        scaling(
+            3_000,
+            ScalingEventKind::ScaledOut {
+                from: 2,
+                to: 3,
+                detail: None,
+            },
+        ),
     ];
     for event in &events {
         store
@@ -1310,11 +1376,46 @@ async fn scaling_events_since_and_before_bound_both_exclusively() {
     let dir = TempDir::new().expect("temp dir");
     let store = store(&dir);
     let events = [
-        scaling(1_000, ScalingEventKind::ScaledOut { from: 0, to: 1 }),
-        scaling(2_000, ScalingEventKind::ScaledOut { from: 1, to: 2 }),
-        scaling(3_000, ScalingEventKind::ScaledOut { from: 2, to: 3 }),
-        scaling(4_000, ScalingEventKind::ScaledOut { from: 3, to: 4 }),
-        scaling(5_000, ScalingEventKind::ScaledOut { from: 4, to: 5 }),
+        scaling(
+            1_000,
+            ScalingEventKind::ScaledOut {
+                from: 0,
+                to: 1,
+                detail: None,
+            },
+        ),
+        scaling(
+            2_000,
+            ScalingEventKind::ScaledOut {
+                from: 1,
+                to: 2,
+                detail: None,
+            },
+        ),
+        scaling(
+            3_000,
+            ScalingEventKind::ScaledOut {
+                from: 2,
+                to: 3,
+                detail: None,
+            },
+        ),
+        scaling(
+            4_000,
+            ScalingEventKind::ScaledOut {
+                from: 3,
+                to: 4,
+                detail: None,
+            },
+        ),
+        scaling(
+            5_000,
+            ScalingEventKind::ScaledOut {
+                from: 4,
+                to: 5,
+                detail: None,
+            },
+        ),
     ];
     for event in &events {
         store
@@ -1342,11 +1443,46 @@ async fn scaling_events_limit_keeps_the_newest_rows_in_ascending_order() {
     let dir = TempDir::new().expect("temp dir");
     let store = store(&dir);
     let events = [
-        scaling(1_000, ScalingEventKind::ScaledOut { from: 0, to: 1 }),
-        scaling(2_000, ScalingEventKind::ScaledOut { from: 1, to: 2 }),
-        scaling(3_000, ScalingEventKind::ScaledOut { from: 2, to: 3 }),
-        scaling(4_000, ScalingEventKind::ScaledOut { from: 3, to: 4 }),
-        scaling(5_000, ScalingEventKind::ScaledOut { from: 4, to: 5 }),
+        scaling(
+            1_000,
+            ScalingEventKind::ScaledOut {
+                from: 0,
+                to: 1,
+                detail: None,
+            },
+        ),
+        scaling(
+            2_000,
+            ScalingEventKind::ScaledOut {
+                from: 1,
+                to: 2,
+                detail: None,
+            },
+        ),
+        scaling(
+            3_000,
+            ScalingEventKind::ScaledOut {
+                from: 2,
+                to: 3,
+                detail: None,
+            },
+        ),
+        scaling(
+            4_000,
+            ScalingEventKind::ScaledOut {
+                from: 3,
+                to: 4,
+                detail: None,
+            },
+        ),
+        scaling(
+            5_000,
+            ScalingEventKind::ScaledOut {
+                from: 4,
+                to: 5,
+                detail: None,
+            },
+        ),
     ];
     for event in &events {
         store
@@ -1388,9 +1524,30 @@ async fn scaling_events_more_is_false_at_the_limit_and_true_one_past_it() {
     let dir = TempDir::new().expect("temp dir");
     let store = store(&dir);
     let events = [
-        scaling(1_000, ScalingEventKind::ScaledOut { from: 0, to: 1 }),
-        scaling(2_000, ScalingEventKind::ScaledOut { from: 1, to: 2 }),
-        scaling(3_000, ScalingEventKind::ScaledOut { from: 2, to: 3 }),
+        scaling(
+            1_000,
+            ScalingEventKind::ScaledOut {
+                from: 0,
+                to: 1,
+                detail: None,
+            },
+        ),
+        scaling(
+            2_000,
+            ScalingEventKind::ScaledOut {
+                from: 1,
+                to: 2,
+                detail: None,
+            },
+        ),
+        scaling(
+            3_000,
+            ScalingEventKind::ScaledOut {
+                from: 2,
+                to: 3,
+                detail: None,
+            },
+        ),
     ];
     for event in &events {
         store
@@ -1424,9 +1581,30 @@ async fn scaling_events_on_an_empty_window_are_empty_and_not_more() {
     let dir = TempDir::new().expect("temp dir");
     let store = store(&dir);
     let events = [
-        scaling(1_000, ScalingEventKind::ScaledOut { from: 0, to: 1 }),
-        scaling(2_000, ScalingEventKind::ScaledOut { from: 1, to: 2 }),
-        scaling(3_000, ScalingEventKind::ScaledOut { from: 2, to: 3 }),
+        scaling(
+            1_000,
+            ScalingEventKind::ScaledOut {
+                from: 0,
+                to: 1,
+                detail: None,
+            },
+        ),
+        scaling(
+            2_000,
+            ScalingEventKind::ScaledOut {
+                from: 1,
+                to: 2,
+                detail: None,
+            },
+        ),
+        scaling(
+            3_000,
+            ScalingEventKind::ScaledOut {
+                from: 2,
+                to: 3,
+                detail: None,
+            },
+        ),
     ];
     for event in &events {
         store
@@ -1464,6 +1642,7 @@ async fn scaling_events_same_millisecond_pages_keep_recording_order() {
         5_000,
         ScalingEventKind::DrainStarted {
             worker: worker_id("worker-1"),
+            detail: None,
         },
     );
     let second = scaling(

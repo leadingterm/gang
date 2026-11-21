@@ -252,6 +252,102 @@ gang_types::string_enum! {
         ControllerLoss6 = "controller_loss_6",
         /// Eighth held controller-loss action.
         ControllerLoss7 = "controller_loss_7",
+        /// First held database-partition action, with independent duration history.
+        Partition0 = "partition_0",
+        /// Second held database-partition action.
+        Partition1 = "partition_1",
+        /// Third held database-partition action.
+        Partition2 = "partition_2",
+        /// Fourth held database-partition action.
+        Partition3 = "partition_3",
+        /// Fifth held database-partition action.
+        Partition4 = "partition_4",
+        /// Sixth held database-partition action.
+        Partition5 = "partition_5",
+        /// Seventh held database-partition action.
+        Partition6 = "partition_6",
+        /// Eighth held database-partition action.
+        Partition7 = "partition_7",
+        /// Source A's first refilling lane.
+        RateA0 = "rate_a_0_63",
+        /// Source A's second refilling lane.
+        RateA1 = "rate_a_1_63",
+        /// Source A's third refilling lane.
+        RateA2 = "rate_a_2_63",
+        /// Source B's first refilling lane.
+        RateB0 = "rate_b_0_63",
+        /// Source B's second refilling lane.
+        RateB1 = "rate_b_1_63",
+        /// Source B's third refilling lane.
+        RateB2 = "rate_b_2_63",
+        /// Source B's fourth refilling lane.
+        RateB3 = "rate_b_3_63",
+        /// Source B's fifth refilling lane.
+        RateB4 = "rate_b_4_63",
+        /// Held utilization probe 00.
+        RateHold00 = "rate_hold_00",
+        /// Held utilization probe 01.
+        RateHold01 = "rate_hold_01",
+        /// Held utilization probe 02.
+        RateHold02 = "rate_hold_02",
+        /// Held utilization probe 03.
+        RateHold03 = "rate_hold_03",
+        /// Held utilization probe 04.
+        RateHold04 = "rate_hold_04",
+        /// Held utilization probe 05.
+        RateHold05 = "rate_hold_05",
+        /// Held utilization probe 06.
+        RateHold06 = "rate_hold_06",
+        /// Held utilization probe 07.
+        RateHold07 = "rate_hold_07",
+        /// Held utilization probe 08.
+        RateHold08 = "rate_hold_08",
+        /// Held utilization probe 09.
+        RateHold09 = "rate_hold_09",
+        /// Held utilization probe 10.
+        RateHold10 = "rate_hold_10",
+        /// Held utilization probe 11.
+        RateHold11 = "rate_hold_11",
+        /// Held utilization probe 12.
+        RateHold12 = "rate_hold_12",
+        /// Held utilization probe 13.
+        RateHold13 = "rate_hold_13",
+        /// Held utilization probe 14.
+        RateHold14 = "rate_hold_14",
+        /// Held utilization probe 15.
+        RateHold15 = "rate_hold_15",
+        /// Held utilization probe 16.
+        RateHold16 = "rate_hold_16",
+        /// Held utilization probe 17.
+        RateHold17 = "rate_hold_17",
+        /// Held utilization probe 18.
+        RateHold18 = "rate_hold_18",
+        /// Held utilization probe 19.
+        RateHold19 = "rate_hold_19",
+        /// Held utilization probe 20.
+        RateHold20 = "rate_hold_20",
+        /// Held utilization probe 21.
+        RateHold21 = "rate_hold_21",
+        /// Held utilization probe 22.
+        RateHold22 = "rate_hold_22",
+        /// Held utilization probe 23.
+        RateHold23 = "rate_hold_23",
+        /// First action of returning load.
+        RateReturn00 = "rate_return_00",
+        /// Second action of returning load.
+        RateReturn01 = "rate_return_01",
+        /// Third action of returning load.
+        RateReturn02 = "rate_return_02",
+        /// Fourth action of returning load.
+        RateReturn03 = "rate_return_03",
+        /// Fifth action of returning load.
+        RateReturn04 = "rate_return_04",
+        /// Sixth action of returning load.
+        RateReturn05 = "rate_return_05",
+        /// Seventh action of returning load.
+        RateReturn06 = "rate_return_06",
+        /// Eighth action of returning load.
+        RateReturn07 = "rate_return_07",
         /// Short burst probe 000.
         Burst000 = "burst_000",
         /// Short burst probe 001.

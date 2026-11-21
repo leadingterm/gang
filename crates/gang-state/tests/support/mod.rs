@@ -118,6 +118,7 @@ pub fn worker_state(
 /// A queued action since `since` milliseconds, with no resource request and priority zero.
 pub fn queued(since: u64, candidates: FleetSet) -> Result<QueuedDemand, Box<dyn Error>> {
     Ok(QueuedDemand {
+        source: None,
         candidates,
         environment: "host:test".parse()?,
         resources: ActionResources::default(),

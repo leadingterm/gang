@@ -97,7 +97,7 @@ fn warm_passes(frames: &[Frame]) -> Result<bool> {
             if state
                 .events
                 .iter()
-                .any(|event| matches!(event.change, EventChange::ScaledOut { from: 0, to: 1 }))
+                .any(|event| matches!(event.change, EventChange::ScaledOut { from: 0, to: 1, .. }))
             {
                 seen = true;
                 last = state
@@ -218,12 +218,17 @@ pub fn burst_checks(
     readiness: Option<Duration>,
     outcome: &crate::BuildOutcome,
 ) -> Vec<Check> {
+    let mut checks = vec![Check::expect(
+        names::READINESS,
+        readiness.is_some_and(|d| d >= Duration::from_secs(9)),
+        || format!("readiness was {readiness:?}, expected at least 9s"),
+    )];
+    checks.extend(burst_purchase_checks(events, outcome));
+    checks
+}
+
+fn burst_purchase_checks(events: &[Event], outcome: &crate::BuildOutcome) -> Vec<Check> {
     vec![
-        Check::expect(
-            names::READINESS,
-            readiness.is_some_and(|d| d >= Duration::from_secs(9)),
-            || format!("readiness was {readiness:?}, expected at least 9s"),
-        ),
         Check::expect(
             names::BURST_SCALE_OUT,
             !events.is_empty()
@@ -330,6 +335,37 @@ pub fn burst_from_zero<S: Control, E: Execution>(system: &S, exec: &E) -> Result
     if checks.last().is_some_and(Check::is_failure) {
         return Ok(checks);
     }
+    checks.extend(run_burst(system, exec, BurstReadiness::Trained(readiness))?);
+    Ok(checks)
+}
+
+/// The same 160-action burst with no training, learned durations or readiness samples.
+///
+/// # Errors
+/// Returns deployment, observation or build errors after releasing and joining the build.
+pub fn cold_burst_from_zero<S: Control, E: Execution>(system: &S, exec: &E) -> Result<Vec<Check>> {
+    system.start_server()?;
+    run_burst(system, exec, BurstReadiness::Cold)
+}
+
+#[derive(Clone, Copy)]
+enum BurstReadiness {
+    Cold,
+    Trained(Option<Duration>),
+}
+
+fn run_burst<S: Control, E: Execution>(
+    system: &S,
+    exec: &E,
+    readiness: BurstReadiness,
+) -> Result<Vec<Check>> {
+    let probes = (0..160)
+        .map(|i| {
+            format!("burst_{i:03}")
+                .parse::<Probe>()
+                .map_err(E2eError::system_from("parsing burst probe"))
+        })
+        .collect::<Result<Vec<_>>>()?;
     system.hold_launches()?;
     let since = match boundary(system) {
         Ok(value) => value,
@@ -374,7 +410,10 @@ pub fn burst_from_zero<S: Control, E: Execution>(system: &S, exec: &E) -> Result
     }
     let (outcome, max_desired) = result?;
     let events = scale_outs_after(system, since)?;
-    checks.extend(burst_checks(&events, readiness, &outcome));
+    let mut checks = match readiness {
+        BurstReadiness::Trained(readiness) => burst_checks(&events, readiness, &outcome),
+        BurstReadiness::Cold => burst_purchase_checks(&events, &outcome),
+    };
     checks.push(burst_capacity_check(max_desired));
     Ok(checks)
 }
@@ -526,6 +565,28 @@ mod tests {
         ];
         assert!(registered(&history));
         assert!(!registered(&history[1..]));
+    }
+
+    #[test]
+    fn cold_burst_verdict_requires_one_worker_and_success_without_training() {
+        let event = |to| Event {
+            name: "events/1".to_owned(),
+            create_time: gang_clock::Timestamp::from_unix_millis(0),
+            fleet: "fleets/local".to_owned(),
+            cause: None,
+            change: EventChange::ScaledOut {
+                from: 0,
+                to,
+                detail: None,
+            },
+        };
+        let success = crate::BuildOutcome::new(Some(0), String::new());
+        let checks = burst_purchase_checks(&[event(1)], &success);
+        assert_eq!(checks.len(), 2);
+        assert!(checks.iter().all(|check| !check.is_failure()));
+        assert!(burst_purchase_checks(&[event(2)], &success)[0].is_failure());
+        let failure = crate::BuildOutcome::new(Some(1), String::new());
+        assert!(burst_purchase_checks(&[event(1)], &failure)[1].is_failure());
     }
 
     #[test]

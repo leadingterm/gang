@@ -32,6 +32,8 @@ pub(crate) struct InstanceObservation {
     pub(crate) ordered_at: Option<Tick>,
     /// Whether a worker has ever been observed on this instance in this term.
     pub(crate) connected: bool,
+    /// First observation of an owned cordon or an all-draining refresh gap.
+    pub(crate) draining_since: Option<Tick>,
 }
 
 /// A table whose values are each tagged with the pass that last touched them; the entries a pass did not touch are swept at its end.
@@ -72,6 +74,10 @@ impl<K: Hash + Eq + Clone, V> Ledger<K, V> {
         self.entries.get_mut(key).map(|entry| &mut entry.0)
     }
 
+    fn get(&self, key: &K) -> Option<&V> {
+        self.entries.get(key).map(|entry| &entry.0)
+    }
+
     /// Drops every entry not tagged with `epoch`.
     fn sweep(&mut self, epoch: u64) {
         self.entries.retain(|_, (_, tag)| *tag == epoch);
@@ -84,7 +90,7 @@ struct Readiness {
     limit: usize,
     next: usize,
     median: Option<Duration>,
-    backlog: Option<Tick>,
+    dwell: Option<Tick>,
 }
 
 impl Readiness {
@@ -121,6 +127,7 @@ pub(crate) struct Observations {
     workers: Ledger<WorkerId, Seen>,
     instances: Vec<Ledger<InstanceId, InstanceObservation>>,
     readiness: Vec<Readiness>,
+    victims: Vec<Ledger<InstanceId, WorkerId>>,
 }
 
 impl Observations {
@@ -131,6 +138,7 @@ impl Observations {
             workers: Ledger::default(),
             instances: (0..fleets).map(|_| Ledger::default()).collect(),
             readiness: (0..fleets).map(|_| Readiness::default()).collect(),
+            victims: (0..fleets).map(|_| Ledger::default()).collect(),
         }
     }
 
@@ -165,14 +173,59 @@ impl Observations {
         self.readiness[fleet].median
     }
 
-    pub(crate) fn stream(&mut self, fleet: usize, active: bool, now: Tick, boot: Duration) -> bool {
-        let backlog = &mut self.readiness[fleet].backlog;
-        if !active {
-            *backlog = None;
-            return false;
+    /// Resets only continuity-dependent state, leaving rate gauges and cordons intact.
+    pub(crate) fn interrupt(&mut self) {
+        for readiness in &mut self.readiness {
+            readiness.dwell = None;
         }
-        let since = *backlog.get_or_insert(now);
-        now.saturating_duration_since(since) >= boot.saturating_mul(2)
+    }
+
+    pub(crate) fn reset_dwell(&mut self, fleet: usize) {
+        self.readiness[fleet].dwell = None;
+    }
+
+    pub(crate) fn dwell(&mut self, fleet: usize, now: Tick) -> Duration {
+        let since = *self.readiness[fleet].dwell.get_or_insert(now);
+        now.saturating_duration_since(since)
+    }
+
+    /// The physical intent, not any one connection generation, owns the drain timer.
+    pub(crate) fn observe_drain(
+        &mut self,
+        fleet: usize,
+        id: &InstanceId,
+        draining: bool,
+        now: Tick,
+    ) -> Option<Tick> {
+        self.instances[fleet].touch(id, self.epoch, InstanceObservation::default, |held| {
+            held.draining_since = if draining {
+                held.draining_since.or(Some(now))
+            } else {
+                None
+            };
+            held.draining_since
+        })
+    }
+
+    pub(crate) fn observe_cordon(&mut self, fleet: usize, id: &InstanceId) {
+        if let Some((_, epoch)) = self.victims[fleet].entries.get_mut(id) {
+            *epoch = self.epoch;
+        }
+    }
+
+    pub(crate) fn remember_victim(&mut self, fleet: usize, id: &InstanceId, worker: &WorkerId) {
+        self.victims[fleet].touch(
+            id,
+            self.epoch,
+            || worker.clone(),
+            |held| {
+                held.clone_from(worker);
+            },
+        );
+    }
+
+    pub(crate) fn victim(&self, fleet: usize, id: &InstanceId) -> Option<&WorkerId> {
+        self.victims[fleet].get(id)
     }
 
     /// Starts a new pass; every worker and instance must be observed again before the pass ends.
@@ -252,6 +305,9 @@ impl Observations {
         self.workers.sweep(self.epoch);
         for instances in &mut self.instances {
             instances.sweep(self.epoch);
+        }
+        for victims in &mut self.victims {
+            victims.sweep(self.epoch);
         }
     }
 }
@@ -509,6 +565,46 @@ mod tests {
         );
         assert_eq!(seen.unserved_since, Some(at(10)));
         assert_eq!(seen.ordered_at, None);
+        Ok(())
+    }
+
+    #[test]
+    fn interrupted_dwell_restarts_without_losing_physical_drain_age() -> TestResult {
+        let mut observations = Observations::new(1);
+        let id = instance()?;
+        observations.begin_pass();
+        assert_eq!(observations.observe_drain(0, &id, true, at(1)), Some(at(1)));
+        assert_eq!(observations.dwell(0, at(1)), Duration::ZERO);
+        assert_eq!(observations.dwell(0, at(10)), Duration::from_secs(9));
+        observations.interrupt();
+        assert_eq!(observations.dwell(0, at(20)), Duration::ZERO);
+        assert_eq!(
+            observations.observe_drain(0, &id, true, at(20)),
+            Some(at(1))
+        );
+        assert_eq!(observations.observe_drain(0, &id, false, at(21)), None);
+        assert_eq!(
+            observations.observe_drain(0, &id, true, at(22)),
+            Some(at(22))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn remembered_victim_is_bounded_by_observed_owned_cordons() -> TestResult {
+        let mut observations = Observations::new(1);
+        let id = instance()?;
+        let worker = worker_id(id.as_str())?;
+        observations.begin_pass();
+        observations.remember_victim(0, &id, &worker);
+        observations.finish_pass();
+        observations.begin_pass();
+        observations.observe_cordon(0, &id);
+        observations.finish_pass();
+        assert_eq!(observations.victim(0, &id), Some(&worker));
+        observations.begin_pass();
+        observations.finish_pass();
+        assert_eq!(observations.victim(0, &id), None);
         Ok(())
     }
 }

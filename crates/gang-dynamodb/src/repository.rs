@@ -438,6 +438,10 @@ impl StateRepositoryPort for DynamoDb {
         &self,
         event: &ScalingAuditEvent,
     ) -> Result<ScalingEventSeq, PortError> {
+        event
+            .kind
+            .validate()
+            .map_err(|error| malformed(error.field()))?;
         checked_timestamp(event.at)?;
         loop {
             let current = self

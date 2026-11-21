@@ -30,6 +30,7 @@
 mod authentication_port;
 mod cache_port;
 mod candidate_priority;
+mod completion_rates;
 mod counter;
 mod credential_port;
 mod errors;
@@ -61,6 +62,7 @@ pub use authentication_port::{
 };
 pub use cache_port::{CacheStorePort, MeasuredUsage, RenderedStoreSpec};
 pub use candidate_priority::{CandidatePriority, CandidatePriorityRef};
+pub use completion_rates::{CompletionRates, NonNegativeFinite, ResourceRates};
 pub use credential_port::WorkloadCredentialPort;
 pub use errors::{BoxedError, BuildError, CandidatePriorityError, PortError, Rejection, Subject};
 pub use expiring_port::{
@@ -111,10 +113,10 @@ pub use repository_port::{
 pub use scheduler_port::{
     Accepted, ActionInfo, ActionsView, Admitted, ApiRequestBody, ApiResponseBody, ApiService,
     BoxedConnection, ClientTls, Connection, ControllerConnections, ControllerEndpoints,
-    ControllerReady, ControllerSpec, EngineStore, ExecutingDemand, GateDecision, LeaderUnavailable,
-    LearnedHistory, Listening, ListingLimits, QueuedActionView, QueuedDemand, RequestGate,
-    RequestScope, RunningActionView, SchedulerPort, SchedulerSnapshot, Slots, StoreAccess,
-    StoreKind, WorkerSpec, WorkerState, WorkerTls, full_body,
+    ControllerReady, ControllerSpec, EngineStore, ExecutingDemand, GateDecision, InstanceCordon,
+    LeaderUnavailable, LearnedHistory, Listening, ListingLimits, QueuedActionView, QueuedDemand,
+    RequestGate, RequestScope, RunningActionView, SchedulerPort, SchedulerSnapshot, Slots,
+    StoreAccess, StoreKind, WorkerSpec, WorkerState, WorkerTls, full_body,
 };
 pub use schema::{SchemaPlan, SchemaTooNew, SchemaVersion};
 pub use scratch_port::{MountedScratchVolume, ScratchVolumePort};
