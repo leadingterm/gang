@@ -44,6 +44,9 @@ boot_grace = "10m"
 capacity = "spot"
 
 
+[actions]
+cpu_oversubscription = 2
+
 [execution]
 input_links = "break"
 

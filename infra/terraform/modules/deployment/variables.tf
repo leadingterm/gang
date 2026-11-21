@@ -466,6 +466,7 @@ variable "scratch_mount_point" {
 variable "gang_settings" {
   type = object({
     poll_interval         = optional(string, "2s")
+    cpu_oversubscription  = optional(number, 2)
     client_action_timeout = optional(string, "2m")
     input_links           = optional(string, "break")
   })
@@ -475,12 +476,19 @@ variable "gang_settings" {
     Gang settings owned by the generated tables. poll_interval controls reconciliation and dashboard
     observation cadence; client_action_timeout bounds client action waits. The deployment supplies
     2s and 2m. input_links defaults to break rather than gang's keep to protect the CAS.
+    cpu_oversubscription renders as [actions] cpu_oversubscription = 2 by default; 1 disables
+    oversubscription.
     Each value must satisfy gang's own rule; the validations repeat it for plan-time feedback.
   EOT
 
   validation {
     condition     = contains(["keep", "break"], var.gang_settings.input_links)
     error_message = "gang_settings.input_links must be keep or break."
+  }
+
+  validation {
+    condition     = var.gang_settings.cpu_oversubscription >= 1 && var.gang_settings.cpu_oversubscription <= 4294967295 && floor(var.gang_settings.cpu_oversubscription) == var.gang_settings.cpu_oversubscription
+    error_message = "gang_settings.cpu_oversubscription must be an integer from 1 to 4294967295."
   }
 
   validation {

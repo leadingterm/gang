@@ -60,6 +60,9 @@ time_zone = ${jsonencode(w.time_zone)}
 %{ endfor ~}
 %{ endfor }
 
+[actions]
+cpu_oversubscription = ${jsonencode(gang_settings.cpu_oversubscription)}
+
 [execution]
 input_links = ${jsonencode(gang_settings.input_links)}
 %{ if network_granted ~}

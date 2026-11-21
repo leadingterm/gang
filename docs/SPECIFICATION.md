@@ -336,7 +336,7 @@ A crate may provide plugins in several domains: each plugin below is selected by
   |---|---|---|
   | `[actions] environment` | `default/1` | Server-owned action-cache namespace `<name>/<version>`: exactly two components, each 1–64 ASCII letters, digits, `.`, `_` or `-`, excluding `.` and `..` (§8.4). |
   | `[actions] reservation_headroom_percent` | 20 | Margin on learned and killed peaks. |
-  | `cpu_oversubscription` | 2 | Positive integer multiplier of the aggregate worker CPU ledger; 1 disables oversubscription. |
+  | `cpu_oversubscription` | 2 | Integer from 1 to 4294967295 multiplying the aggregate worker CPU ledger; 1 disables oversubscription. |
   | `history_window` | `7d` | History retention, positive whole days. |
   | `history_keys` | 65536 | Maximum duration-cache keys, nonzero. |
   | `history_memory_budget` | `512MiB` | Resource sketch byte budget, nonzero. |
@@ -1223,6 +1223,8 @@ Both instance roles attach no AWS-managed policy: an empty `aws_iam_role_policy_
 The `deployment` module exposes generic inputs whose defaults are neutral; `infra/terraform/modules/deployment/variables.tf` owns their defaults, descriptions and validation. `config_parameter_name` (default `/<name>/gang.toml`) is the generation namespace root. The `controller` and `worker-fleet` modules take `iam_name_prefix` and `iam_permissions_boundary_arn`; the CA key's alias is `alias/<name>-ca`, and `controller_secret_parameters` are written to `/etc/gang/secrets/<file>` on the controller (§8.3).
 
 `gang_settings.poll_interval` sets the generated top-level `poll_interval` and defaults to `2s`; operators may override it with a positive duration. After the observation fix, two active fleets share one ASG batch per observation interval, not one per sampler or fleet, and stable settled history causes no activity reads: the `2s` deployment default keeps baseline group requests around 0.5–1/s, while the per-controller pacer limits all Auto Scaling wire attempts to 2/s below the observed roughly 5/s ceiling, without guaranteeing account-wide traffic. The `1s` supply-cache TTL means independently phased `2s` loops can sample up to 1/s, so 0.5/s is not an upper bound.
+
+The deployment module also accepts `gang_settings = { cpu_oversubscription = 3 }` to override the default `2`. It renders one `[actions] cpu_oversubscription` in the shared SSM configuration used by both controllers and workers; `1` disables oversubscription.
 
 AWS event delivery is opt-in: `aws_events_enabled` defaults to `false`. When enabled, deployment creates SSE-SQS-encrypted main and dead-letter queues and EventBridge rules for `EC2 Instance Rebalance Recommendation`, `EC2 Spot Instance Interruption Warning`, and managed ASG `EC2 Instance Launch Successful`, `EC2 Instance Launch Unsuccessful` and `EC2 Instance Terminate Successful`. EC2 rules cover the current account and region; the consumer admits only configured groups. ASG rules name the managed groups and twins. The queue policy requires TLS and permits EventBridge only from the current account and exact rule ARNs. The controller role receives only `sqs:ReceiveMessage`, `sqs:DeleteMessage` and `sqs:GetQueueAttributes` on that queue; workers receive no SQS rights. The shared configuration can contain the non-secret queue URL, but workers never poll it.
 
