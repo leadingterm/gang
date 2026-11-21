@@ -74,7 +74,7 @@ impl ObservingWorkerScheduler {
         handoff: HandOff,
         durations: Arc<Mutex<ActionDurations>>,
         clock: Arc<dyn Clock>,
-        fleets: Arc<FleetCatalog>,
+        fleets: &Arc<FleetCatalog>,
         runtime: Arc<RuntimeCatalog>,
         rates: Arc<SourceRates>,
     ) -> Self {
@@ -86,7 +86,7 @@ impl ObservingWorkerScheduler {
             handoff,
             durations,
             clock,
-            cordons: InstanceCordons::new(Arc::clone(&fleets)),
+            cordons: InstanceCordons::new(Arc::clone(fleets)),
             fleets: runtime,
             rates,
             retiring: RwLock::new(false),
@@ -738,7 +738,7 @@ mod tests {
                 HandOff::new(),
                 test_durations(),
                 test_clock(),
-                test_fleets(),
+                &test_fleets(),
                 crate::capacity::test_catalog((*test_fleets()).clone()),
                 test_rates(),
             );
@@ -864,7 +864,7 @@ mod tests {
                 HandOff::new(),
                 test_durations(),
                 test_clock(),
-                test_fleets(),
+                &test_fleets(),
                 crate::capacity::test_catalog((*test_fleets()).clone()),
                 test_rates(),
             );
@@ -977,7 +977,7 @@ mod tests {
                 HandOff::new(),
                 Arc::clone(&durations),
                 clock.clone(),
-                test_fleets(),
+                &test_fleets(),
                 crate::capacity::test_catalog((*test_fleets()).clone()),
                 Arc::clone(&rates),
             );
@@ -1320,7 +1320,7 @@ mod tests {
             HandOff::new(),
             test_durations(),
             test_clock(),
-            test_fleets(),
+            &test_fleets(),
             crate::capacity::test_catalog((*test_fleets()).clone()),
             test_rates(),
         );

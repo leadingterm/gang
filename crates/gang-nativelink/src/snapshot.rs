@@ -234,6 +234,29 @@ impl Drop for ScratchGuard<'_> {
     }
 }
 
+/// Reuses the snapshot buffer while reporting physical capacity independently of action ceilings.
+fn fill_fleet_memory(
+    fleets: &FleetCatalog,
+    into: &mut Vec<FleetMemoryCapacity>,
+) -> Result<(), Error> {
+    into.clear();
+    for (fleet, properties) in fleets.fleets().iter().enumerate() {
+        let capacity = properties
+            .capacity(property::MEMORY_KB)
+            .and_then(|kb| kb.checked_mul(1024))
+            .and_then(|bytes| NonZeroBytes::new(Bytes::new(bytes)))
+            .ok_or_else(|| {
+                make_err!(
+                    Code::Internal,
+                    "invalid physical memory for fleet {}",
+                    properties.name()
+                )
+            })?;
+        into.push(FleetMemoryCapacity { fleet, capacity });
+    }
+    Ok(())
+}
+
 /// Overwrites the snapshot while retaining the capacity of its buffers.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fill(
@@ -255,22 +278,7 @@ pub(crate) async fn fill(
     into.workers.sort_unstable_by(|a, b| a.id.cmp(&b.id));
     into.queued.clear();
     into.executing.clear();
-    into.fleet_memory.clear();
-    for (fleet, properties) in fleets.fleets().iter().enumerate() {
-        let capacity = properties
-            .capacity(property::MEMORY_KB)
-            .and_then(|kb| kb.checked_mul(1024))
-            .and_then(|bytes| NonZeroBytes::new(Bytes::new(bytes)))
-            .ok_or_else(|| {
-                make_err!(
-                    Code::Internal,
-                    "invalid physical memory for fleet {}",
-                    properties.name()
-                )
-            })?;
-        into.fleet_memory
-            .push(FleetMemoryCapacity { fleet, capacity });
-    }
+    fill_fleet_memory(fleets, &mut into.fleet_memory)?;
 
     let mut listing = scheduler
         .filter_operations(actions::queued_filter())

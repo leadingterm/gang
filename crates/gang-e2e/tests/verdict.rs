@@ -1148,6 +1148,45 @@ fn pool_oom_requires_kernel_evidence_and_escalated_retries() {
 }
 
 #[test]
+fn pool_oom_neighbour_retry_uses_post_reserve_fleet_capacity() {
+    use gang_e2e::{AttemptRecord, ResourcePolicy, pool_oom_verdicts};
+
+    let policy = ResourcePolicy::pool_oom_scenario().expect("valid pool OOM policy");
+    let capacity = policy
+        .fleet_memory
+        .expect("pool OOM policy specifies fleet memory")
+        .get()
+        .saturating_sub(policy.memory.reserve.get())
+        .get()
+        / 1024;
+    let escalation = policy.memory.escalation_percent.get();
+    let mut records = [
+        AttemptRecord {
+            action: "pressure_victim".to_owned(),
+            memory_kb: 65_536,
+        },
+        AttemptRecord {
+            action: "pressure_neighbour".to_owned(),
+            memory_kb: 327_680,
+        },
+        AttemptRecord {
+            action: "pressure_neighbour".to_owned(),
+            memory_kb: capacity,
+        },
+    ];
+    assert_eq!(capacity, 425_984);
+    assert!(
+        pool_oom_verdicts(1, true, &records, escalation, capacity)
+            .iter()
+            .all(Check::is_passed)
+    );
+    records[2].memory_kb = capacity - 1;
+    assert!(pool_oom_verdicts(1, true, &records, escalation, capacity)[1].is_failure());
+    records[2].memory_kb = capacity + 1;
+    assert!(pool_oom_verdicts(1, true, &records, escalation, capacity)[1].is_failure());
+}
+
+#[test]
 fn pool_oom_accepts_retries_of_both_actions() {
     use gang_e2e::{AttemptRecord, pool_oom_verdicts};
     let ci_records = [

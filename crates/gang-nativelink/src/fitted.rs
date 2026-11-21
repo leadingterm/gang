@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use gang_config::{DiskMinReservation, MinReservation};
-use gang_types::property;
+use gang_types::{FleetCatalog, property};
 use nativelink_error::{Error, make_input_err};
 use nativelink_metric::{
     MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent, RootMetricsComponent,
@@ -46,6 +46,40 @@ impl FittedActions {
             disk_min_reservation,
         }
     }
+
+    fn current_admission(
+        &self,
+        operation: &OperationId,
+        fleets: &FleetCatalog,
+    ) -> Result<AdmittedAction, Error> {
+        let mut admission = self
+            .admitted
+            .take(operation)
+            .unwrap_or_else(|| AdmittedAction {
+                fleets: fleets.accepting(|_| None),
+                minimum_kb: None,
+            });
+        // Observations can shrink a fleet between admission and historical learning.
+        // The explicit client floor is immutable, not another learned value to clamp.
+        if let Some(minimum) = admission.minimum_kb {
+            for index in admission.fleets {
+                if fleets
+                    .fleets()
+                    .get(index)
+                    .and_then(|fleet| fleet.limit(property::MEMORY_KB))
+                    .is_none_or(|limit| limit < minimum)
+                {
+                    admission.fleets.remove(index);
+                }
+            }
+            if admission.fleets.is_empty() {
+                return Err(make_input_err!(
+                    "no fleet accepts original memory floor {minimum} KiB"
+                ));
+            }
+        }
+        Ok(admission)
+    }
 }
 
 #[deny(clippy::missing_trait_methods)]
@@ -80,34 +114,9 @@ impl ClientStateManager for FittedActions {
     ) -> Result<Box<dyn ActionStateResult>, Error> {
         let fleets = self.fleets.current()?;
         let AdmittedAction {
-            fleets: mut admitted,
+            fleets: admitted,
             minimum_kb,
-        } = self
-            .admitted
-            .take(&operation)
-            .unwrap_or_else(|| AdmittedAction {
-                fleets: fleets.accepting(|_| None),
-                minimum_kb: None,
-            });
-        // Observations can shrink a fleet between admission and historical learning.
-        // The explicit client floor is immutable, not another learned value to clamp.
-        if let Some(minimum) = minimum_kb {
-            for index in admitted {
-                if fleets
-                    .fleets()
-                    .get(index)
-                    .and_then(|fleet| fleet.limit(property::MEMORY_KB))
-                    .is_none_or(|limit| limit < minimum)
-                {
-                    admitted.remove(index);
-                }
-            }
-            if admitted.is_empty() {
-                return Err(make_input_err!(
-                    "no fleet accepts original memory floor {minimum} KiB"
-                ));
-            }
-        }
+        } = self.current_admission(&operation, &fleets)?;
         for (key, min_kb) in [
             (property::MEMORY_KB, self.min_reservation.as_units()),
             (property::DISK_KB, self.disk_min_reservation.as_units()),

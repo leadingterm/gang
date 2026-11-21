@@ -224,7 +224,7 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         handoff.clone(),
         Arc::clone(&durations),
         Arc::clone(&clock),
-        fleets
+        &fleets
             .current()
             .map_err(NativeLinkEmbedError::native("fleet capacity"))?,
         Arc::clone(&fleets),
