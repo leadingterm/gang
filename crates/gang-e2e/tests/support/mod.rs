@@ -1009,6 +1009,8 @@ fn queued_action(index: usize) -> QueuedAction {
         priority: 0,
         candidates: Vec::new(),
         refusal: None,
+        reservation: None,
+        learned_reservation: None,
     }
 }
 
@@ -1189,6 +1191,8 @@ impl Simulation {
             phase_time: at(0),
             running: 0,
             slots: None,
+            capacity: None,
+            reserved: None,
             paused: false,
             launch_time: at(0),
             phases: Vec::new(),

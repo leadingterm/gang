@@ -787,6 +787,8 @@ mod tests {
             environment: Some(policy.action_environment.clone()),
             running_actions: running,
             max_inflight_actions: Some(nonzero_u32(cap)),
+            capacity: None,
+            reserved: None,
             draining: false,
             paused: false,
             last_seen: Timestamp::from_unix_millis(1_000_000),

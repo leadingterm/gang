@@ -2,8 +2,8 @@
 import { useComputed } from "@preact/signals";
 import { useState } from "preact/hooks";
 import { idOf, ms } from "../wire-parse.ts";
-import type { Actions as ActionsSample, QueuedAction, RunningAction } from "../wire.ts";
-import { workerInstance } from "../format.ts";
+import type { Actions as ActionsSample, QueuedAction, Reservation, RunningAction } from "../wire.ts";
+import { bytes, workerInstance } from "../format.ts";
 import { actionsStale } from "../store.ts";
 import { Cell, Clock, Empty, FleetFilter, Ident, Num, Priority, Row, Section, Since, Table, Target, useClient } from "../ui.tsx";
 
@@ -19,12 +19,21 @@ export const AsOf = ({ actions }: { actions: ActionsSample }) => {
 
 const matches = (text: string, query: string): boolean => query === "" || text.toLowerCase().includes(query);
 
+/** Admitted resources and, when clamped, the learned pre-fit sizing. */
+export const ReservationAmounts = ({ reservation, learned }: { reservation: Reservation | undefined; learned: Reservation | undefined }) => (
+  <div class="more line">
+    Reservation: {reservation ? `${reservation.cpuMillicores} millicores CPU · ${bytes(reservation.memory)} memory` : "—"}
+    {learned && <> · Learned: {learned.cpuMillicores} millicores CPU · {bytes(learned.memory)} memory</>}
+  </div>
+);
+
 const RunningRow = ({ a }: { a: RunningAction }) => {
   return (
     <Row enter>
       <Cell cls="a-main">
         <div class="line"><Target label={a.target} />{" "}<Priority p={a.priority} /></div>
         {a.build && <a class="more line" href={`/ui/builds/${encodeURIComponent(idOf(a.build))}`}><span>Build</span>{" "}<Ident text={idOf(a.build)} /></a>}
+        <ReservationAmounts reservation={a.reservation} learned={a.learnedReservation} />
       </Cell>
       <Cell cls="a-kind"><Ident text={a.mnemonic} /></Cell>
       <Cell cls="a-m1 mono dim"><Ident text={idOf(a.fleet)} /></Cell>
@@ -47,6 +56,7 @@ const QueuedRow = ({ q }: { q: QueuedAction }) => {
       <Cell cls="a-main">
         <div class="line"><Target label={q.target} />{" "}<Priority p={q.priority} /></div>
         {q.build && <a class="more line" href={`/ui/builds/${encodeURIComponent(idOf(q.build))}`}><span>Build</span>{" "}<Ident text={idOf(q.build)} /></a>}
+        <ReservationAmounts reservation={q.reservation} learned={q.learnedReservation} />
         {q.refusal && <div class="action__refusal caution">{q.refusal}</div>}
       </Cell>
       <Cell cls="a-kind"><Ident text={q.mnemonic} /></Cell>

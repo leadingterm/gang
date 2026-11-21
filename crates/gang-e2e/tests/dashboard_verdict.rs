@@ -90,6 +90,8 @@ fn worker(phase: Phase) -> Worker {
         phase_time: at(0),
         running: 0,
         slots: Some(4),
+        capacity: None,
+        reserved: None,
         paused: false,
         launch_time: at(0),
         phases: Vec::new(),

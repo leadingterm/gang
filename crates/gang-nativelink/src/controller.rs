@@ -1069,6 +1069,8 @@ mod tests {
             input_root_digest: digest,
             timeout: Duration::from_mins(1),
             platform_properties,
+            memory_reservation: None,
+            pre_fit_cpu_millicores: None,
             priority: 0,
             load_timestamp: test_now().now(),
             insert_timestamp: test_now().now(),
@@ -2106,6 +2108,8 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            memory_reservation: None,
+            pre_fit_cpu_millicores: None,
             priority: 0,
             load_timestamp: UNIX_EPOCH,
             insert_timestamp: UNIX_EPOCH,
@@ -2152,6 +2156,8 @@ mod tests {
                 property::ACTION_ENVIRONMENT.to_owned(),
                 "host:test".to_owned(),
             )]),
+            memory_reservation: None,
+            pre_fit_cpu_millicores: None,
             priority: 0,
             load_timestamp: UNIX_EPOCH,
             insert_timestamp: UNIX_EPOCH,

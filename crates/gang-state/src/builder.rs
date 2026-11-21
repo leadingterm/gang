@@ -16,11 +16,11 @@ use gang_reconciler::{Activity, FleetPass, HostedSnapshot};
 use gang_spi::{
     FleetInstance, FleetSupply, QueuedActionView, SchedulerSnapshot, StoreKind, Traffic,
 };
-use gang_types::{FleetCatalog, FleetProperties, InstanceLifecycle, SaturatingInto};
+use gang_types::{ActionResources, FleetCatalog, FleetProperties, InstanceLifecycle, SaturatingInto};
 use gang_wire::{
     Actions, BucketUsage, CacheStore, Demand, Event, Fleet, Instance, InstanceCounts, InstanceSize,
     Isa, Lifecycle, Pass, Phase, PhaseSpan, Policy, Queue, QueuedAction, Recent, RunningAction,
-    SkipReason, State, StoreUsage, Truncated, Worker, WorkerCounts, name,
+    Reservation, SkipReason, State, StoreUsage, Truncated, Worker, WorkerCounts, name,
 };
 
 use crate::events::newer;
@@ -474,6 +474,8 @@ fn fill_workers(
             row.phases.drain(..ended);
             row.running = worker.running_actions;
             row.slots = worker.max_inflight_actions.map(NonZeroU32::get);
+            row.capacity = worker.capacity.map(reservation);
+            row.reserved = worker.reserved.map(reservation);
             row.paused = worker.paused;
             row.launch_time = scratch
                 .launches
@@ -755,6 +757,8 @@ fn fill_running(
             }
             row.start_time = action.started;
             row.priority = action.info.priority;
+            row.reservation = Some(reservation(action.info.reservation));
+            row.learned_reservation = action.info.learned_reservation.map(reservation);
             true
         },
     );
@@ -789,6 +793,8 @@ fn fill_queued_row(row: &mut QueuedAction, queued: &QueuedActionView, inputs: &I
     }
     row.queue_time = queued.queued_since;
     row.priority = queued.info.priority;
+    row.reservation = Some(reservation(queued.info.reservation));
+    row.learned_reservation = queued.info.learned_reservation.map(reservation);
     if let Some(refusal) = &queued.refusal {
         let text = row.refusal.get_or_insert_with(String::new);
         text.clear();
@@ -807,4 +813,12 @@ fn fill_queued_row(row: &mut QueuedAction, queued: &QueuedActionView, inputs: &I
             true
         },
     );
+}
+
+/// Projects ledger resources without deriving or aggregating values.
+fn reservation(resources: ActionResources) -> Reservation {
+    Reservation {
+        cpu_millicores: resources.cpu_millicores,
+        memory: resources.memory.get(),
+    }
 }

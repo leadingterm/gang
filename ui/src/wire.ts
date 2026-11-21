@@ -885,7 +885,15 @@ candidates: Array<string>,
 /**
  * Why no fleet accepts this action; absent when a fleet accepts it.
  */
-refusal?: string, };
+refusal?: string, 
+/**
+ * Resources reserved for this action, when reported by the scheduler.
+ */
+reservation?: Reservation, 
+/**
+ * Learned pre-fit resources, when CPU or memory exceeded the fitted reservation.
+ */
+learnedReservation?: Reservation, };
 
 export type Recent = { 
 /**
@@ -901,6 +909,16 @@ step: Duration,
  * most `window / step` samples.
  */
 samples?: Array<Sample>, };
+
+export type Reservation = { 
+/**
+ * CPU in millicores.
+ */
+cpuMillicores: number, 
+/**
+ * Memory in bytes.
+ */
+memory: number, };
 
 export type Role = { 
 /**
@@ -952,7 +970,15 @@ startTime: Timestamp,
 /**
  * The action's priority.
  */
-priority: number, };
+priority: number, 
+/**
+ * Resources reserved for this action, when reported by the scheduler.
+ */
+reservation?: Reservation, 
+/**
+ * Learned pre-fit resources, when CPU or memory exceeded the fitted reservation.
+ */
+learnedReservation?: Reservation, };
 
 export type Sample = { 
 /**
@@ -1356,6 +1382,14 @@ running: number,
  * Optional observed action cap; absent for unlimited long-lived workers.
  */
 slots?: number, 
+/**
+ * Resources currently reserved on this worker, when reported by the scheduler.
+ */
+reserved?: Reservation, 
+/**
+ * Worker's resource capacity, when reported by the scheduler.
+ */
+capacity?: Reservation, 
 /**
  * Whether the worker is paused.
  */

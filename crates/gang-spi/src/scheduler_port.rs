@@ -272,6 +272,10 @@ pub struct WorkerState {
     pub running_actions: u32,
     /// Actions it accepts at once; `None` when the worker accepts any number.
     pub max_inflight_actions: Option<NonZeroU32>,
+    /// Worker resource capacity from the scheduler ledger, absent when unavailable or malformed.
+    pub capacity: Option<ActionResources>,
+    /// Resources currently reserved in the scheduler ledger, absent when unavailable or malformed.
+    pub reserved: Option<ActionResources>,
     /// Whether the scheduler has stopped assigning it new actions.
     pub draining: bool,
     /// Whether the scheduler has paused the worker. Not the same as draining, which a drain
@@ -353,6 +357,10 @@ pub struct ActionInfo {
     pub priority: i32,
     /// The build the action's first submitter belongs to; `None` when unattributable.
     pub build: Option<BuildId>,
+    /// Resources reserved by the scheduler, including zero-valued dimensions.
+    pub reservation: ActionResources,
+    /// Pre-fit learned reservation when CPU or memory exceeded the fitted reservation.
+    pub learned_reservation: Option<ActionResources>,
 }
 
 /// A running action reported by the scheduler.

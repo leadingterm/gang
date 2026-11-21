@@ -43,6 +43,8 @@ mod tests {
             environment: Some("host:test".parse()?),
             running_actions,
             max_inflight_actions: NonZeroU32::new(4),
+            capacity: None,
+            reserved: None,
             paused: false,
             draining,
             last_seen: Timestamp::default(),

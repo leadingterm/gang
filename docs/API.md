@@ -348,7 +348,7 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
   },
   "queue": {
     "total": 1,
-    "unplaceable": 1,
+    "unplaceable": 0,
     "oldestQueueTime": "2026-01-14T09:19:51.250Z"
   },
   "connections": { "active": 24, "limit": 4096, "refused": 3 },
@@ -389,8 +389,8 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
       },
       "demand": {
         "running": 1,
-        "queued": 0,
-        "candidates": 0,
+        "queued": 1,
+        "candidates": 1,
         "needed": 2,
         "vcpus": 2,
         "readiness": "42.500s",
@@ -406,6 +406,8 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
       "phase": "BUSY",
       "phaseTime": "2026-01-14T09:19:58.000Z",
       "running": 1,
+      "reserved": {"cpuMillicores": 2000, "memory": 4294967296},
+      "capacity": {"cpuMillicores": 16000, "memory": 16106127360},
       "paused": false,
       "launchTime": "2026-01-14T09:18:30.000Z",
       "phases": [
@@ -436,7 +438,8 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
         "mnemonic": "TestRunner",
         "build": "builds/k3q9w2m7x1c4v8bz",
         "startTime": "2026-01-14T09:19:58.000Z",
-        "priority": 0
+        "priority": 0,
+        "reservation": {"cpuMillicores": 2000, "memory": 4294967296}
       }
     ],
     "queued": [
@@ -448,8 +451,9 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
         "build": "builds/k3q9w2m7x1c4v8bz",
         "queueTime": "2026-01-14T09:19:51.250Z",
         "priority": 0,
-        "candidates": [],
-        "refusal": "cpu_millicores 871000 is above the largest fleet's 15000"
+        "candidates": ["fleets/x86-64-spot"],
+        "reservation": {"cpuMillicores": 4000, "memory": 4294967296},
+        "learnedReservation": {"cpuMillicores": 6000, "memory": 8589934592}
       }
     ],
     "truncated": {
@@ -549,6 +553,8 @@ data: {"reason":"VIEWER_CAP","retryDelay":"5s"}
 - **Fleet demand estimates.** `demand.readiness` and `demand.expectedWait` are independently optional Google Duration strings, for example `"42.5s"` and `"0s"`. `readiness` is the measured launch-to-first-worker latency; it is omitted until measured, while the planner uses the configured `scaling.readiness_prior`, clamped to the fleet's `boot_grace`, as its cold prior. `expectedWait` is the latest simulated start delay among the fleet's attributed queued actions at the final planned capacity; it is omitted when there is no attributed queue. Zero is a valid estimate, not an absent value.
 - **Fleet rate diagnostics.** `demand.load` is the maximum normalized persistent resource load in tenths of a worker equivalent (`125` means 12.5 workers). `demand.backlog` is the maximum normalized transient queued resource-work in worker-equivalent seconds, rounded to whole seconds and encoded as a Google Duration string (`"42s"`). `demand.utilization` is instantaneous serving resource occupancy in integer permille (`735` means 73.5%): the maximum occupancy fraction across resource dimensions, excluding draining workers. The fields are independently optional; unmeasured values are omitted, and `utilization` is omitted without serving capacity. Measured zero is present as `0` or `"0s"`, never treated as absence.
 - **Worker concurrency observation.** `workers[].slots` is optional observed worker metadata, not a scaling or admission input. It is omitted for an unlimited long-lived worker and is `1` for a single-use worker; older workers can report other values during rollout.
+- **Reservations.** A `Reservation` is `{cpuMillicores, memory}`: CPU is in millicores and memory is in bytes. Running and queued actions may carry `reservation`, their current fitted scheduler reservation; CPU is the debited `cpu_millicores`, not the ignored `cpu_count`, and memory is the current fitted property. They may also carry `learnedReservation` when pre-fit CPU or desired memory exceeds the fitted value. This complete object retains the other dimension as appropriate: CPU is the historical, cold-start or request value normalized before the initial fleet CPU clamp and retained across retries; memory is `MemoryReservation.desired_kb`, converted to bytes, representing current retry sizing intent, which escalation can update, not a raw p95 or peak.
+- **Worker reservations.** `reserved` and `capacity` are optional `Reservation` objects from the scheduler's worker ledger, not sums computed from the bounded action list. CPU capacity is the scheduler's aggregate vCPUs × 1000 × oversubscription; memory capacity is the registered physical ledger amount and can be below the advertised fleet nominal. Missing objects mean unknown or legacy data, not zero; present zero values are real zeros. Worker and action views have separate sampling times and need not agree at an instant. The same optional fields appear in stream snapshots, worker and running-action upserts, and queued-list replacements; no separate endpoint or stream protocol is needed.
 - **Frames.** `Frame` is the type of each stream message, defined once in `gang-wire`:
 
   | Event | Data | Sent |

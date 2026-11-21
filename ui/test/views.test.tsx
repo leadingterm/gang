@@ -508,6 +508,64 @@ test("workers with observed caps retain pips and slot details", (t) => {
   }
 });
 
+test("worker ledger totals show admission capacity independently of slots and sampled actions", (t) => {
+  const worker = live.workers[0];
+  if (!worker) throw new Error("the live recording has a worker");
+  const reserved = { cpuMillicores: 12000, memory: 2 * 1024 ** 3 };
+  const capacity = { cpuMillicores: 8000, memory: 4 * 1024 ** 3 };
+  const measured = { ...worker, reserved, capacity };
+  const state = { ...live, workers: [measured] };
+  const expected = /CPU admission 12000 millicores \/ 8000 millicores · memory 2 GiB \/ 4 GiB reserved \/ capacity/;
+  const row = html({ state }, <Workers />);
+  t.assert.match(visibleText(row), /CPU 12000 \/ 8000 mCPU/);
+  t.assert.match(visibleText(row), /Memory 2 GiB \/ 4 GiB/);
+  t.assert.match(row, /title="Reserved \/ admission capacity"/);
+  t.assert.match(row, /aria-label="CPU admission 12000 millicores \/ 8000 millicores/);
+  t.assert.match(visibleText(html({ state }, <WorkerDetail w={measured} state={state} />)), expected);
+
+  const { reserved: _reserved, capacity: _capacity, ...unknown } = measured;
+  const missing = { ...live, workers: [unknown] };
+  const unknownTotals = /CPU admission — \/ — · memory — \/ — reserved \/ capacity/;
+  const unknownRow = visibleText(html({ state: missing }, <Workers />));
+  t.assert.match(unknownRow, /CPU — \/ — mCPU/);
+  t.assert.match(unknownRow, /Memory — \/ —/);
+  t.assert.match(visibleText(html({ state: missing }, <WorkerDetail w={unknown} state={missing} />)), unknownTotals);
+
+  const zero = { ...unknown, reserved: { cpuMillicores: 0, memory: 0 } };
+  const partial = { ...live, workers: [zero] };
+  const partialRow = visibleText(html({ state: partial }, <Workers />));
+  t.assert.match(partialRow, /CPU 0 \/ — mCPU/);
+  t.assert.match(partialRow, /Memory 0 B \/ —/);
+  t.assert.match(visibleText(html({ state: partial }, <WorkerDetail w={zero} state={partial} />)), /CPU admission 0 millicores \/ — · memory 0 B \/ —/);
+});
+
+test("action lists and worker detail show admitted and learned reservations", (t) => {
+  const worker = live.workers[0];
+  const running = live.actions?.running[0];
+  const queued = cold.actions?.queued[0];
+  if (!worker || !running || !queued || !live.actions) throw new Error("the recordings have a worker and actions");
+  const { reservation: _reservation, learnedReservation: _learnedReservation, ...unknownAction } = running;
+  const state = {
+    ...live,
+    actions: {
+      ...live.actions,
+      running: [
+        { ...running, worker: worker.name, reservation: { cpuMillicores: 2000, memory: 1024 ** 3 }, learnedReservation: { cpuMillicores: 4000, memory: 2 * 1024 ** 3 } },
+        { ...unknownAction, name: "actions/unknown", worker: worker.name },
+      ],
+      queued: [{ ...queued, reservation: { cpuMillicores: 0, memory: 0 }, learnedReservation: { cpuMillicores: 3000, memory: 1024 ** 3 } }],
+    },
+  };
+  const list = visibleText(html({ state }, <Actions />));
+  const detail = visibleText(html({ state }, <WorkerDetail w={worker} state={state} />));
+  const fitted = /Reservation: 2000 millicores CPU · 1 GiB memory · Learned: 4000 millicores CPU · 2 GiB memory/;
+  t.assert.match(list, fitted);
+  t.assert.match(detail, fitted);
+  t.assert.match(list, /Reservation: 0 millicores CPU · 0 B memory · Learned: 3000 millicores CPU · 1 GiB memory/);
+  t.assert.match(list, /Reservation: —/);
+  t.assert.match(detail, /Reservation: —/);
+});
+
 test("open worker detail names running actions and falls back to the digest", (t) => {
   const worker = live.workers[0];
   const action = live.actions?.running[0];

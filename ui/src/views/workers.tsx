@@ -4,9 +4,9 @@ import { useState } from "preact/hooks";
 import { idOf, ms, type UnixMs } from "../wire-parse.ts";
 import type { Fleet, InfrastructureStatus, Instance, Phase, State, Worker } from "../wire.ts";
 import { windowMs } from "../recent.ts";
-import { sum, workerInstance } from "../format.ts";
+import { bytes, sum, workerInstance } from "../format.ts";
 import { Cell, Clock, Disclosure, Duration, Empty, FleetFilter, Ident, Row, Section, Since, Table, Target, useClient, useNowStep } from "../ui.tsx";
-import { AsOf } from "./actions.tsx";
+import { AsOf, ReservationAmounts } from "./actions.tsx";
 import { fleetCounts, fleetTotals, STATE_NAME, StaticCell, Tally, unhostedInstances, type Counted, type FleetCensus } from "./fleet.tsx";
 
 /** The instances without a worker are listed under their fleet. */
@@ -87,6 +87,9 @@ const Infrastructure = ({ status }: { status: InfrastructureStatus }) => (
   </span>
 );
 
+const ledger = (w: Worker): string =>
+  `CPU admission ${w.reserved ? `${w.reserved.cpuMillicores} millicores` : "—"} / ${w.capacity ? `${w.capacity.cpuMillicores} millicores` : "—"} · memory ${w.reserved ? bytes(w.reserved.memory) : "—"} / ${w.capacity ? bytes(w.capacity.memory) : "—"} reserved / capacity`;
+
 export const WorkerDetail = ({ w, state }: { w: Worker; state: State }) => {
   const client = useClient();
   const acts = state.actions?.running.filter((a) => a.worker === w.name) ?? [];
@@ -113,6 +116,8 @@ export const WorkerDetail = ({ w, state }: { w: Worker; state: State }) => {
         <dd class="mono">
           {w.slots === undefined ? w.running : `${w.running}/${w.slots}`}
         </dd>
+        <dt>reservation</dt>
+        <dd class="mono">{ledger(w)}</dd>
         {w.infrastructure && <><dt>infrastructure</dt><dd><Infrastructure status={w.infrastructure} /></dd></>}
       </dl>
       {segments.length > 0 && (
@@ -137,6 +142,7 @@ export const WorkerDetail = ({ w, state }: { w: Worker; state: State }) => {
               <Row key={a.name}>
                 <Cell cls="a-main">
                   {a.target ? <Target label={a.target} /> : <Ident text={a.digest.slice(0, 12)} title={a.digest} cls="quiet" />}
+                  <ReservationAmounts reservation={a.reservation} learned={a.learnedReservation} />
                 </Cell>
                 <Cell cls="a-kind">{a.mnemonic ? <Ident text={a.mnemonic} /> : "—"}</Cell>
                 <Cell cls="a-age r">
@@ -168,7 +174,13 @@ const WorkerRow = ({ w, state, now }: { w: Worker; state: State; now: UnixMs }) 
               <svg class="wrow__chev" viewBox="0 0 10 10" aria-hidden="true">
                 <path d="M3 1.5 6.5 5 3 8.5" />
               </svg>
-              <span class="wrow__inst"><Ident text={instance} /></span>
+              <span class="wrow__inst">
+                <Ident text={instance} />
+                <span class="dim" role="group" title="Reserved / admission capacity" aria-label={ledger(w)}>
+                  <span style={{ display: "block" }}>CPU {w.reserved?.cpuMillicores ?? "—"} / {w.capacity?.cpuMillicores ?? "—"} mCPU</span>
+                  <span style={{ display: "block" }}>Memory {w.reserved ? bytes(w.reserved.memory) : "—"} / {w.capacity ? bytes(w.capacity.memory) : "—"}</span>
+                </span>
+              </span>
             </span>
             <span class={`phase phase--${phase}`}>
               <span class="phase__name">{phase}</span>

@@ -1317,6 +1317,8 @@ mod tests {
             environment: Some("host:test".parse()?),
             running_actions: 1,
             max_inflight_actions: None,
+            capacity: None,
+            reserved: None,
             draining: false,
             paused: false,
             last_seen: Timestamp::UNIX_EPOCH,

@@ -51,6 +51,7 @@ fn worker_state(summary: &WorkerSummary) -> Option<WorkerState> {
     let max_inflight_actions = u32::try_from(summary.max_inflight_tasks)
         .ok()
         .and_then(NonZeroU32::new);
+    let ledger = worker_ledger(summary);
     Some(WorkerState {
         id,
         fleet,
@@ -58,6 +59,8 @@ fn worker_state(summary: &WorkerSummary) -> Option<WorkerState> {
         running_actions: summary.running_actions,
         max_inflight_actions,
         draining: summary.is_draining,
+        capacity: ledger.map(|(capacity, _)| capacity),
+        reserved: ledger.map(|(_, reserved)| reserved),
         paused: summary.is_paused,
         last_seen: Timestamp::from_unix_millis(
             summary
@@ -65,6 +68,34 @@ fn worker_state(summary: &WorkerSummary) -> Option<WorkerState> {
                 .saturating_mul(MILLIS_PER_SECOND),
         ),
     })
+}
+
+/// Projects the scheduler's registered and remaining resource ledger as a pair.
+fn worker_ledger(summary: &WorkerSummary) -> Option<(ActionResources, ActionResources)> {
+    let total = &summary.platform_properties;
+    let available = &summary.available_platform_properties;
+    let read = |properties: &HashMap<String, String>, key: &str| {
+        properties.get(key)?.parse::<u64>().ok()
+    };
+    let cpu = read(total, property::CPU_MILLICORES)?;
+    let memory_kb = read(total, property::MEMORY_KB)?;
+    let available_cpu = read(available, property::CPU_MILLICORES)?;
+    let available_memory_kb = read(available, property::MEMORY_KB)?;
+    let reserved_cpu = cpu.checked_sub(available_cpu)?;
+    let reserved_memory_kb = memory_kb.checked_sub(available_memory_kb)?;
+    let memory = |kb: u64| Bytes::new(kb.saturating_mul(Bytes::kib(1).get()));
+    Some((
+        ActionResources {
+            cpu_millicores: cpu,
+            memory: memory(memory_kb),
+            disk: Bytes::new(0),
+        },
+        ActionResources {
+            cpu_millicores: reserved_cpu,
+            memory: memory(reserved_memory_kb),
+            disk: Bytes::new(0),
+        },
+    ))
 }
 
 /// Converts a queued operation into a scheduler demand.
@@ -105,16 +136,44 @@ fn parse<T: std::str::FromStr + Default>(properties: &HashMap<String, String>, k
 /// Missing or malformed properties request zero. Whole cores are converted to millicores, and
 /// memory and disk KiB values are converted to bytes with saturation.
 pub(crate) fn resources(properties: &HashMap<String, String>) -> ActionResources {
+    let mut result = admitted_resources(properties);
+    let cores: u32 = parse(properties, property::CPU_COUNT);
+    result.cpu_millicores = result.cpu_millicores
+        .max(u64::from(cores).saturating_mul(property::MILLICORES_PER_CORE));
+    result
+}
+
+/// Reads the admitted scheduler reservation, whose CPU ledger uses millicores only.
+pub(crate) fn admitted_resources(properties: &HashMap<String, String>) -> ActionResources {
     let memory_kb: u64 = parse(properties, property::MEMORY_KB);
     let disk_kb: u64 = parse(properties, property::DISK_KB);
-    let millicores: u64 = parse(properties, property::CPU_MILLICORES);
-    let cores: u32 = parse(properties, property::CPU_COUNT);
     ActionResources {
-        cpu_millicores: millicores
-            .max(u64::from(cores).saturating_mul(property::MILLICORES_PER_CORE)),
+        cpu_millicores: parse(properties, property::CPU_MILLICORES),
         memory: Bytes::new(memory_kb.saturating_mul(Bytes::kib(1).get())),
         disk: Bytes::new(disk_kb.saturating_mul(Bytes::kib(1).get())),
     }
+}
+
+/// Returns the original reservation only when fitting reduced at least one dimension.
+pub(crate) fn learned_reservation(
+    info: &NativeActionInfo,
+    fitted: ActionResources,
+) -> Option<ActionResources> {
+    let memory = info.memory_reservation.as_ref();
+    let cpu_millicores = info.pre_fit_cpu_millicores
+        .or_else(|| memory.and_then(|reservation| reservation.cpu_before_memory_fit))
+        .unwrap_or(fitted.cpu_millicores);
+    let learned_memory = memory.and_then(|reservation| reservation.desired_kb).map_or(
+        fitted.memory,
+        |kb| Bytes::new(kb.saturating_mul(Bytes::kib(1).get())),
+    );
+    (cpu_millicores > fitted.cpu_millicores || learned_memory > fitted.memory).then_some(
+        ActionResources {
+            cpu_millicores,
+            memory: learned_memory,
+            disk: Bytes::new(0),
+        },
+    )
 }
 
 fn expected(
@@ -406,9 +465,120 @@ pub(crate) mod tests {
                 max_inflight_actions: NonZeroU32::new(8),
                 draining: true,
                 paused: false,
+                capacity: None,
+                reserved: None,
                 last_seen: Timestamp::from_unix_millis(1_700_000_000_000),
             }
         );
+    }
+
+    #[test]
+    fn worker_ledger_uses_registered_and_remaining_values_not_running_count() {
+        let mut listing = summary(WORKER);
+        listing.platform_properties.extend(props(&[
+            (property::CPU_MILLICORES, "8000"),
+            (property::CPU_COUNT, "99"),
+            (property::MEMORY_KB, "16384"),
+            (property::DISK_KB, "999"),
+        ]));
+        listing.available_platform_properties = props(&[
+            (property::CPU_MILLICORES, "5500"),
+            (property::MEMORY_KB, "10000"),
+        ]);
+        for running in [0, 1, 999] {
+            listing.running_actions = running;
+            let state = worker_state(&listing).expect("managed worker");
+            assert_eq!(state.capacity, Some(ActionResources {
+                cpu_millicores: 8000,
+                memory: Bytes::kib(16384),
+                disk: Bytes::new(0),
+            }));
+            assert_eq!(state.reserved, Some(ActionResources {
+                cpu_millicores: 2500,
+                memory: Bytes::kib(6384),
+                disk: Bytes::new(0),
+            }));
+        }
+    }
+
+    #[test]
+    fn worker_ledger_requires_complete_consistent_unsigned_values() {
+        let mut valid = summary(WORKER);
+        valid.platform_properties.extend(props(&[
+            (property::CPU_MILLICORES, "100"),
+            (property::MEMORY_KB, "200"),
+        ]));
+        valid.available_platform_properties = props(&[
+            (property::CPU_MILLICORES, "50"),
+            (property::MEMORY_KB, "100"),
+        ]);
+        for (registered, key, value) in [
+            (true, property::CPU_MILLICORES, None),
+            (true, property::MEMORY_KB, Some("bad")),
+            (false, property::CPU_MILLICORES, Some("-1")),
+            (false, property::MEMORY_KB, None),
+            (false, property::CPU_MILLICORES, Some("101")),
+            (false, property::MEMORY_KB, Some("201")),
+            (true, property::MEMORY_KB, Some("18446744073709551616")),
+        ] {
+            let mut listing = valid.clone();
+            let properties = if registered {
+                &mut listing.platform_properties
+            } else {
+                &mut listing.available_platform_properties
+            };
+            if let Some(value) = value {
+                properties.insert(key.to_owned(), value.to_owned());
+            } else {
+                properties.remove(key);
+            }
+            let state = worker_state(&listing).expect("managed worker");
+            assert_eq!((state.capacity, state.reserved), (None, None), "{key}");
+        }
+        valid.platform_properties.insert(property::MEMORY_KB.to_owned(), u64::MAX.to_string());
+        valid.available_platform_properties.insert(property::MEMORY_KB.to_owned(), "0".to_owned());
+        let state = worker_state(&valid).expect("managed worker");
+        assert_eq!(state.capacity.expect("capacity").memory, Bytes::new(u64::MAX));
+        assert_eq!(state.reserved.expect("reserved").memory, Bytes::new(u64::MAX));
+    }
+
+    #[tokio::test]
+    async fn worker_ledger_is_independent_of_action_listing_truncation() -> Result<(), Error> {
+        let mut worker = summary(WORKER);
+        worker.running_actions = 1;
+        worker.platform_properties.extend(props(&[
+            (property::CPU_MILLICORES, "4000"),
+            (property::MEMORY_KB, "8000"),
+        ]));
+        worker.available_platform_properties = props(&[
+            (property::CPU_MILLICORES, "3000"),
+            (property::MEMORY_KB, "6000"),
+        ]);
+        let scheduler = Fake {
+            by_worker: HashMap::from([(WORKER.to_owned(), vec![
+                row("running", ActionStage::Executing, 0, info(0, 0, &[]), None),
+            ])]),
+            ..Default::default()
+        };
+        let before = worker_state(&worker).expect("managed worker");
+        let mut view = gang_spi::ActionsView::default();
+        actions::list(
+            &scheduler,
+            std::slice::from_ref(&worker),
+            &catalog(),
+            gang_spi::ListingLimits { running: 0, queued: 0 },
+            &mut view,
+        ).await?;
+        assert_eq!(view.truncated_running, 1);
+        assert!(view.running.is_empty());
+        let after = worker_state(&worker).expect("managed worker");
+        assert_eq!((before.capacity, before.reserved), (after.capacity, after.reserved));
+        assert_eq!(after.reserved, Some(ActionResources {
+            cpu_millicores: 1000,
+            memory: Bytes::kib(2000),
+            disk: Bytes::new(0),
+        }));
+        Ok(())
     }
 
     #[test]

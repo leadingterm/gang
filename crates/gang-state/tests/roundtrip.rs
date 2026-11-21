@@ -184,6 +184,8 @@ fn worker(slot: usize, phase: Phase, running: u32) -> Result<Worker, Box<dyn Err
         phase_time: timestamped(1),
         running,
         slots: Some(4),
+        capacity: None,
+        reserved: None,
         paused: false,
         launch_time: timestamped(1),
         phases: Vec::new(),
@@ -213,6 +215,8 @@ fn running(slot: usize, priority: i32) -> Result<RunningAction, Box<dyn Error>> 
         start_time: timestamped(1),
         priority,
         build: String::new(),
+        reservation: None,
+        learned_reservation: None,
     })
 }
 
@@ -227,6 +231,8 @@ fn queued(op: &str) -> Result<QueuedAction, Box<dyn Error>> {
         candidates: vec![fleet_name("alpha")?],
         refusal: None,
         build: String::new(),
+        reservation: None,
+        learned_reservation: None,
     })
 }
 
@@ -710,6 +716,43 @@ fn interleaved_worker_changes_round_trip() -> Result<(), Box<dyn Error>> {
         .collect::<Result<_, _>>()?;
 
     let delta = diff(&prev, &cur).ok_or("expected worker changes")?;
+    apply(&mut prev, &delta)?;
+    assert_eq!(prev, cur);
+    Ok(())
+}
+
+#[test]
+fn reservation_only_changes_round_trip_through_sse() -> Result<(), Box<dyn Error>> {
+    let mut prev = base_state();
+    prev.workers = vec![worker(0, Phase::Busy, 1)?];
+    prev.actions = Some(actions(vec![running(0, 0)?], vec![queued("q-0")?], 0));
+    let mut cur = prev.clone();
+    cur.seq = 2;
+    let reserved = gang_wire::Reservation {
+        cpu_millicores: 750,
+        memory: 4096,
+    };
+    cur.workers[0].reserved = Some(reserved);
+    let actions = cur.actions.as_mut().ok_or("missing actions")?;
+    actions.running[0].reservation = Some(reserved);
+    actions.queued[0].learned_reservation = Some(reserved);
+
+    let delta = diff(&prev, &cur).ok_or("missing reservation delta")?;
+    let worker_patch = delta.workers.as_ref().ok_or("missing worker patch")?;
+    assert_eq!(worker_patch.upsert, cur.workers);
+    let action_patch = delta.actions.as_ref().ok_or("missing action patch")?;
+    let expected = cur.actions.as_ref().ok_or("missing actions")?;
+    assert_eq!(
+        action_patch.running.as_ref().ok_or("missing running patch")?.upsert,
+        expected.running
+    );
+    assert_eq!(action_patch.queued.as_ref(), Some(&expected.queued));
+    let bytes = gang_state::sse::encode(&gang_wire::Frame::Delta(delta))?;
+    let mut decoded = gang_state::sse::Decoder::new().push(&bytes)?;
+    let gang_wire::Frame::Delta(delta) = decoded.pop().ok_or("missing SSE delta")? else {
+        return Err("unexpected SSE frame".into());
+    };
+    assert!(decoded.is_empty());
     apply(&mut prev, &delta)?;
     assert_eq!(prev, cur);
     Ok(())

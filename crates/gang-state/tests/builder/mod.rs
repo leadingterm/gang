@@ -86,6 +86,8 @@ fn action_info(op: &str, digest: &str, target: &str, mnemonic: &str, priority: i
         mnemonic: mnemonic.to_owned(),
         priority,
         build: None,
+        reservation: ActionResources::default(),
+        learned_reservation: None,
     }
 }
 
@@ -196,6 +198,8 @@ fn running_on(worker: &WorkerId, op: &str, started: u64) -> RunningActionView {
             mnemonic: "Compile".to_owned(),
             priority: 0,
             build: None,
+            reservation: ActionResources::default(),
+            learned_reservation: None,
         },
         worker: worker.clone(),
         started: ts(started),

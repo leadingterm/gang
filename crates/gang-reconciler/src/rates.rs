@@ -1012,6 +1012,8 @@ mod tests {
             environment: Some(fleet.action_environment.clone()),
             running_actions: running,
             max_inflight_actions: Some(nonzero_u32(16)),
+            capacity: None,
+            reserved: None,
             draining,
             paused: false,
             last_seen: Timestamp::default(),

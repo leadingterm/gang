@@ -298,6 +298,8 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            memory_reservation: None,
+            pre_fit_cpu_millicores: None,
             priority: 0,
             load_timestamp: UNIX_EPOCH,
             insert_timestamp: UNIX_EPOCH,
@@ -387,7 +389,10 @@ mod tests {
             MinReservation::from_units(8192),
             DiskMinReservation::from_units(2048),
         );
-        for (value, expected) in [("871000", "15000"), ("12000", "12000")] {
+        for (value, expected, pre_fit_cpu) in [
+            ("871000", "15000", Some(871000)),
+            ("12000", "12000", None),
+        ] {
             let _admission = admitted.insert(
                 operation(),
                 fleets
@@ -405,6 +410,10 @@ mod tests {
                     .expect("recorded")
                     .platform_properties[property::CPU_MILLICORES],
                 expected
+            );
+            assert_eq!(
+                fake.calls.lock().last().expect("recorded").pre_fit_cpu_millicores,
+                pre_fit_cpu
             );
         }
         let outer = PlaceableActions::new(Arc::new(fitted), fleets, admitted);
@@ -633,6 +642,28 @@ mod tests {
         let properties = &calls[0].platform_properties;
         assert_eq!(properties[property::MEMORY_KB], "67108864");
         assert_eq!(properties[property::CPU_MILLICORES], "15000");
+    }
+
+    #[tokio::test]
+    async fn cpu_clamp_metadata_survives_whole_memory_promotion() {
+        let fake = Arc::new(Fake::default());
+        let fitted = FittedActions::new(
+            fake.clone(),
+            large_memory_catalog(),
+            AdmittedFleets::default(),
+            MinReservation::from_units(8192),
+            DiskMinReservation::from_units(2048),
+        );
+        let mut action = info(property::CPU_MILLICORES, "871000");
+        Arc::make_mut(&mut action)
+            .platform_properties
+            .insert(property::MEMORY_KB.to_owned(), "73400320".to_owned());
+        fitted.add_action(operation(), action).await.expect("fitted");
+        let calls = fake.calls.lock();
+        let fitted = &calls[0];
+        assert_eq!(fitted.platform_properties[property::CPU_MILLICORES], "15000");
+        assert_eq!(fitted.platform_properties[property::MEMORY_KB], "67108864");
+        assert_eq!(fitted.pre_fit_cpu_millicores, Some(871000));
     }
 
     #[tokio::test]

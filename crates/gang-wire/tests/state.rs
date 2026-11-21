@@ -216,6 +216,82 @@ fn queued_refusal_json_round_trips_and_is_omitted_when_absent() -> Result<(), Bo
 }
 
 #[test]
+fn reservation_fields_round_trip_absent_zero_and_learned() -> Result<(), Box<dyn Error>> {
+    use gang_wire::{QueuedAction, Reservation, RunningAction, Worker};
+
+    let zero = Reservation::default();
+    let fitted = Reservation {
+        cpu_millicores: 500,
+        memory: 1024,
+    };
+    let learned = Reservation {
+        cpu_millicores: 1000,
+        memory: 2048,
+    };
+
+    let mut worker = Worker::default();
+    let old_worker = serde_json::to_value(&worker)?;
+    assert!(old_worker.get("reserved").is_none());
+    assert!(old_worker.get("capacity").is_none());
+    assert_eq!(serde_json::from_value::<Worker>(old_worker)?, worker);
+    worker.reserved = Some(zero);
+    worker.capacity = Some(fitted);
+    let json = serde_json::to_value(&worker)?;
+    assert_eq!(
+        json["reserved"],
+        serde_json::json!({"cpuMillicores": 0, "memory": 0})
+    );
+    assert_eq!(
+        json["capacity"],
+        serde_json::json!({"cpuMillicores": 500, "memory": 1024})
+    );
+    assert_eq!(serde_json::from_value::<Worker>(json)?, worker);
+
+    let mut running = RunningAction::default();
+    let old_running = serde_json::to_value(&running)?;
+    assert!(old_running.get("reservation").is_none());
+    assert!(old_running.get("learnedReservation").is_none());
+    assert_eq!(
+        serde_json::from_value::<RunningAction>(old_running)?,
+        running
+    );
+    running.reservation = Some(zero);
+    let json = serde_json::to_value(&running)?;
+    assert_eq!(
+        json["reservation"],
+        serde_json::json!({"cpuMillicores": 0, "memory": 0})
+    );
+    assert_eq!(serde_json::from_value::<RunningAction>(json)?, running);
+    running.reservation = Some(fitted);
+    running.learned_reservation = Some(learned);
+    let json = serde_json::to_value(&running)?;
+    assert_eq!(
+        json["learnedReservation"],
+        serde_json::json!({"cpuMillicores": 1000, "memory": 2048})
+    );
+    assert_eq!(serde_json::from_value::<RunningAction>(json)?, running);
+
+    let mut queued = QueuedAction::default();
+    let old_queued = serde_json::to_value(&queued)?;
+    assert!(old_queued.get("reservation").is_none());
+    assert!(old_queued.get("learnedReservation").is_none());
+    assert_eq!(serde_json::from_value::<QueuedAction>(old_queued)?, queued);
+    queued.reservation = Some(fitted);
+    queued.learned_reservation = Some(learned);
+    let json = serde_json::to_value(&queued)?;
+    assert_eq!(
+        json["reservation"],
+        serde_json::json!({"cpuMillicores": 500, "memory": 1024})
+    );
+    assert_eq!(
+        json["learnedReservation"],
+        serde_json::json!({"cpuMillicores": 1000, "memory": 2048})
+    );
+    assert_eq!(serde_json::from_value::<QueuedAction>(json)?, queued);
+    Ok(())
+}
+
+#[test]
 fn launch_failed_and_withdrawn_changes_round_trip_exact_json() -> Result<(), Box<dyn Error>> {
     for (change, expected) in [
         (

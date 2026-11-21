@@ -96,6 +96,8 @@ fn running(
             mnemonic: "Compile".to_owned(),
             priority,
             build: None,
+            reservation: ActionResources::default(),
+            learned_reservation: None,
         },
         worker: worker_on(&instance_id(index)?)?,
         started: ts(started),
@@ -112,6 +114,8 @@ fn waiting(op: &str, queued_since: u64, priority: i32, fleets: &[usize]) -> Queu
             mnemonic: "Link".to_owned(),
             priority,
             build: None,
+            reservation: ActionResources::default(),
+            learned_reservation: None,
         },
         queued_since: ts(queued_since),
         candidates: fleet_set(fleets),
@@ -134,6 +138,87 @@ fn sample(
             truncated_queued: 0,
         },
     }
+}
+
+fn resources(cpu_millicores: u64, memory: u64) -> ActionResources {
+    ActionResources {
+        cpu_millicores,
+        memory: Bytes::new(memory),
+        disk: Bytes::new(999),
+    }
+}
+
+fn wire_reservation(cpu_millicores: u64, memory: u64) -> gang_wire::Reservation {
+    gang_wire::Reservation {
+        cpu_millicores,
+        memory,
+    }
+}
+
+#[test]
+fn reservations_project_ledger_values_and_clear_reused_rows() -> TestResult {
+    let mut world = World::default();
+    push_fleet(&mut world, "alpha", vec![], 1, vec![])?;
+    worker(&mut world, 1, "alpha", 8, false)?;
+    world.snapshot.workers[0].capacity = Some(resources(8_000, 16_000));
+    world.snapshot.workers[0].reserved = Some(resources(6_000, 12_000));
+    let mut run = running(1, "run", 100, 0)?;
+    run.info.reservation = resources(500, 1_000);
+    run.info.learned_reservation = Some(resources(900, 1_500));
+    let mut queue = waiting("queue", 200, 0, &[0]);
+    queue.info.reservation = resources(250, 700);
+    queue.info.learned_reservation = Some(resources(350, 800));
+    let mut sampled = sample(300, vec![run], vec![queue]);
+    sampled.view.truncated_running = 7;
+    world.actions = Some(sampled);
+
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let mut frame = blank();
+    fill_into(&mut builder, &mut frame, &blank(), 1, &world, 1_000, ok(0))?;
+    assert_eq!(
+        frame.workers[0].capacity,
+        Some(wire_reservation(8_000, 16_000))
+    );
+    assert_eq!(
+        frame.workers[0].reserved,
+        Some(wire_reservation(6_000, 12_000))
+    );
+    let actions = frame.actions.as_ref().ok_or("missing actions")?;
+    assert_eq!(actions.truncated.running, 7);
+    assert_eq!(
+        actions.running[0].reservation,
+        Some(wire_reservation(500, 1_000))
+    );
+    assert_eq!(
+        actions.running[0].learned_reservation,
+        Some(wire_reservation(900, 1_500))
+    );
+    assert_eq!(
+        actions.queued[0].reservation,
+        Some(wire_reservation(250, 700))
+    );
+    assert_eq!(
+        actions.queued[0].learned_reservation,
+        Some(wire_reservation(350, 800))
+    );
+
+    let prev = frame.clone();
+    world.snapshot.workers[0].capacity = None;
+    world.snapshot.workers[0].reserved = Some(resources(0, 0));
+    let sample = world.actions.as_mut().ok_or("missing sample")?;
+    sample.view.running[0].info.reservation = resources(0, 0);
+    sample.view.running[0].info.learned_reservation = None;
+    sample.view.queued[0].info.reservation = resources(0, 0);
+    sample.view.queued[0].info.learned_reservation = None;
+    fill_into(&mut builder, &mut frame, &prev, 2, &world, 2_000, ok(0))?;
+    assert_eq!(frame.workers[0].capacity, None);
+    assert_eq!(frame.workers[0].reserved, Some(wire_reservation(0, 0)));
+    let actions = frame.actions.as_ref().ok_or("missing actions")?;
+    assert_eq!(actions.running[0].reservation, Some(wire_reservation(0, 0)));
+    assert_eq!(actions.running[0].learned_reservation, None);
+    assert_eq!(actions.queued[0].reservation, Some(wire_reservation(0, 0)));
+    assert_eq!(actions.queued[0].learned_reservation, None);
+    Ok(())
 }
 
 /// Six worlds that change what a refill must overwrite: fleet property keys, fleets in and out

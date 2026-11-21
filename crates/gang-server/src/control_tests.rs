@@ -299,6 +299,8 @@ fn idle_worker(instance: &InstanceId, last_seen: Timestamp) -> TestResult<Worker
         environment: Some("host:test".parse().expect("valid test environment")),
         running_actions: 0,
         max_inflight_actions: NonZeroU32::new(4),
+        capacity: None,
+        reserved: None,
         draining: false,
         last_seen,
         paused: false,

@@ -95,6 +95,8 @@ fn info() -> Arc<ActionInfo> {
         input_root_digest: digest,
         timeout: Duration::from_secs(1),
         platform_properties: std::collections::HashMap::default(),
+        memory_reservation: None,
+        pre_fit_cpu_millicores: None,
         priority: 0,
         load_timestamp: UNIX_EPOCH,
         insert_timestamp: UNIX_EPOCH,

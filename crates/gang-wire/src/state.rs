@@ -729,6 +729,20 @@ pub struct Demand {
     pub utilization: Option<u16>,
 }
 
+/// CPU and memory resources from the scheduler's reservation ledger.
+#[derive(
+    gang_macros::Known, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct Reservation {
+    /// CPU in millicores.
+    #[ts(type = "number")]
+    pub cpu_millicores: u64,
+    /// Memory in bytes.
+    #[ts(type = "number")]
+    pub memory: u64,
+}
+
 /// A connected worker, named `workers/{worker}`.
 #[derive(
     gang_macros::Known, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS,
@@ -756,6 +770,12 @@ pub struct Worker {
     /// Optional observed action cap; absent for unlimited long-lived workers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slots: Option<u32>,
+    /// Resources currently reserved on this worker, when reported by the scheduler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved: Option<Reservation>,
+    /// Worker's resource capacity, when reported by the scheduler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<Reservation>,
     /// Whether the worker is paused.
     pub paused: bool,
     /// When the instance launched.
@@ -844,6 +864,7 @@ pub struct Truncated {
     gang_macros::Known, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS,
 )]
 #[serde(rename_all = "camelCase")]
+#[ts(optional_fields)]
 pub struct RunningAction {
     /// Resource name, `actions/{op}`.
     pub name: String,
@@ -867,6 +888,12 @@ pub struct RunningAction {
     pub start_time: Timestamp,
     /// The action's priority.
     pub priority: i32,
+    /// Resources reserved for this action, when reported by the scheduler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reservation: Option<Reservation>,
+    /// Learned pre-fit resources, when CPU or memory exceeded the fitted reservation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned_reservation: Option<Reservation>,
 }
 
 /// An action that waits for a worker, named `actions/{op}`.
@@ -900,6 +927,12 @@ pub struct QueuedAction {
     /// Why no fleet accepts this action; absent when a fleet accepts it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
+    /// Resources reserved for this action, when reported by the scheduler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reservation: Option<Reservation>,
+    /// Learned pre-fit resources, when CPU or memory exceeded the fitted reservation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned_reservation: Option<Reservation>,
 }
 
 /// A resource that carries its resource name.
