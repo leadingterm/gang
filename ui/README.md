@@ -25,7 +25,9 @@ hashed, precompressed bundle that the server embeds and serves under `/ui`. It r
 
 `StateClient` owns one session admission at a time. Re-admission retires its previous renewal even
 without a stop; concurrent renewals within the same admission join one flight, and an older response
-cannot change the new admission.
+cannot change the new admission. Hidden tabs suspend the stream while retaining rows and renewing the
+session; returning visible opens a fresh stream and snapshot without a lost banner. Genuine visible
+stream failures still show the lost banner and retry with backoff.
 
 ## Embedding
 
@@ -81,7 +83,8 @@ Dates, clocks, and durations use `<time>` via `Day`, `Clock`, `Duration`, `Since
 Tables are laid out as grids, so `Table`, `Row`, and `Cell` set table roles explicitly; at phone width the column heads are visually hidden, not removed.
 `.cols` lays columns side by side or wraps them with the aside below the main column. `html { scrollbar-gutter: stable }` prevents page shifts.
 The five Overview tiles share label, value, meter, caption, and chart tracks with equal insets.
-Row spacing lives inside each tile so dividers remain contiguous when tiles wrap.
+Row spacing lives inside each tile. Shared `Tiles` encloses the grid with hairlines and makes the last
+tile fill an incomplete row at both desktop and two-column phone widths, so any tile count has clean borders.
 Action cache shows the lookup-weighted hit rate and lookup count over the server's configured recent window, or `no lookups` when there are none.
 Its chart plots lookups as a faint area and hits as a solid line on one shared count scale; recorded zero-lookup steps are zero, and only absent history is hatched.
 Charts fit the content width and contain their markers; Instances keeps an empty history slot.
