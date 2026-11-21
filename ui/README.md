@@ -84,9 +84,8 @@ Tables are laid out as grids, so `Table`, `Row`, and `Cell` set table roles expl
 The five Overview tiles share label, value, meter, caption, and chart tracks with equal insets.
 Row spacing lives inside each tile. Shared `Tiles` encloses the grid with hairlines and makes the last
 tile fill an incomplete row at both desktop and two-column phone widths, so any tile count has clean borders.
-Action cache shows the lookup-weighted hit rate and lookup count over the server's configured recent window, or `no lookups` when there are none.
-Its chart plots lookups as a faint area and hits as a solid line on one shared count scale; recorded zero-lookup steps are zero, and only absent history is hatched.
-Charts fit the content width and contain their markers. Fleet instance charts draw lifecycle counts and historical desired and maximum references from the server's recent samples; see [the dashboard specification](../docs/SPECIFICATION.md#52-live-state-and-dashboard-gang-state-gang-server-gang-ui-gang-embed) and [state API](../docs/API.md#state).
+Action cache shows the lookup-weighted hit rate and lookup count over the server's configured recent window, or `no lookups` when there are none. Its chart plots lookups as a faint area and hits as a solid line on one shared count scale.
+Charts fit the content width and contain their markers. For complete-step plots, live gauges, fleet history and control-pass strip semantics, see [the dashboard specification](../docs/SPECIFICATION.md#52-live-state-and-dashboard-gang-state-gang-server-gang-ui-gang-embed) and [state API](../docs/API.md#state).
 Event icons align with the first line when messages wrap, including when narrow layouts reflow details.
 `//ui:layout_test` enforces the screen layout; `//ui:overview_layout_test` covers the Overview tiles.
 

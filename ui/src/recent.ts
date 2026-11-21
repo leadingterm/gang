@@ -52,13 +52,17 @@ export const doneSeries = (r: Recent): readonly (number | null)[] => {
   return all.map((s, i) => s && schedulerKnown(s) && i < all.length - 1 ? s.completed * 60_000 / stepMs(r) : null);
 };
 
-/** Executing actions at the latest pass in each recorded slot. */
-export const runningSeries = (r: Recent): readonly (number | null)[] =>
-  slots(r).map((s) => s && schedulerKnown(s) ? s.running : null);
+/** Executing actions at the latest observation in each historical slot and the live current value. */
+export const runningSeries = (r: Recent, current: number | null): readonly (number | null)[] => {
+  const all = slots(r);
+  return all.map((s, i) => !s ? null : i === all.length - 1 ? current : schedulerKnown(s) ? s.running : null);
+};
 
-/** Queued actions at the latest pass in each recorded slot. */
-export const queuedSeries = (r: Recent): readonly (number | null)[] =>
-  slots(r).map((s) => s && schedulerKnown(s) ? s.queued : null);
+/** Queued actions at the latest observation in each historical slot and the live current value. */
+export const queuedSeries = (r: Recent, current: number | null): readonly (number | null)[] => {
+  const all = slots(r);
+  return all.map((s, i) => !s ? null : i === all.length - 1 ? current : schedulerKnown(s) ? s.queued : null);
+};
 
 export interface CacheWindow {
   readonly lookups: number;
@@ -75,9 +79,10 @@ export const cacheWindow = (r: Recent): CacheWindow => {
   const hitsPerStep: (number | null)[] = [];
   let lookups = 0;
   let hits = 0;
-  for (const s of all) {
-    lookupsPerStep.push(s === null ? null : s.lookups);
-    hitsPerStep.push(s === null ? null : s.hits);
+  for (let i = 0; i < all.length; i++) {
+    const s = all[i]!;
+    lookupsPerStep.push(s === null || i === all.length - 1 ? null : s.lookups);
+    hitsPerStep.push(s === null || i === all.length - 1 ? null : s.hits);
     if (s !== null) {
       lookups += s.lookups;
       hits += s.hits;
@@ -96,19 +101,25 @@ export const transferred = (r: Recent): { uploaded: number; downloaded: number }
   };
 };
 
-/** Traffic per recorded step; missing steps remain null. */
-export const bytesSeries = (r: Recent, direction: "uploadedBytes" | "downloadedBytes"): readonly (number | null)[] =>
-  slots(r).map((s) => s ? s[direction] : null);
+/** Traffic per complete recorded step; missing and in-progress steps remain null. */
+export const bytesSeries = (r: Recent, direction: "uploadedBytes" | "downloadedBytes"): readonly (number | null)[] => {
+  const all = slots(r);
+  return all.map((s, i) => s && i < all.length - 1 ? s[direction] : null);
+};
 
-/** Evicted bytes per recorded step. */
-export const evictedSeries = (r: Recent): readonly (number | null)[] =>
-  slots(r).map((s) => s && schedulerKnown(s) ? s.evictedBytes : null);
+/** Evicted bytes per complete recorded step. */
+export const evictedSeries = (r: Recent): readonly (number | null)[] => {
+  const all = slots(r);
+  return all.map((s, i) => s && schedulerKnown(s) && i < all.length - 1 ? s.evictedBytes : null);
+};
 
-export type Bar = "ok" | "skipped" | "idle" | "unrecorded";
+export type Bar = "ok" | "skipped" | "idle" | "unrecorded" | "partial";
 
-/** Pass outcome per slot, with skipped passes taking precedence. */
-export const passBars = (r: Recent): readonly Bar[] =>
-  slots(r).map((s) => !s ? "unrecorded" : s.skipped > 0 ? "skipped" : s.passes > 0 ? "ok" : "idle");
+/** Pass outcome per complete slot, with skipped passes taking precedence. */
+export const passBars = (r: Recent): readonly Bar[] => {
+  const all = slots(r);
+  return all.map((s, i) => !s ? "unrecorded" : i === all.length - 1 ? "partial" : s.skipped > 0 ? "skipped" : s.passes > 0 ? "ok" : "idle");
+};
 
 /** How many leading slots are unrecorded. */
 export const unrecordedSlots = (r: Recent): number => Math.max(0, steps(r) - (r.samples ?? []).length);
