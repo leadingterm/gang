@@ -33,4 +33,4 @@ pub use signal::{TerminationsBlocked, block_terminations, clear_mask, shutdown_s
 pub use sys::PipeReader;
 #[cfg(target_os = "macos")]
 pub use sys::ProcessExitQueue;
-pub use sys::{duplicate_inherited_fd, physical_memory};
+pub use sys::physical_memory;
