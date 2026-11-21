@@ -543,6 +543,46 @@ test("a restarted server shows the time before its first sample as not recorded,
   }
 });
 
+test("an interior scheduler outage is hatched without interrupting local cache or changing the chart timeline", (t) => {
+  const base = recentState(4);
+  const samples = base.recent.samples.map((sample, i) => ({
+    ...sample, schedulerKnown: i !== 1, lookups: 10, hits: 5, evictedBytes: 10,
+  }));
+  const state = { ...base, recent: { ...base.recent, window: "40s", samples } };
+  const markup = html({ state }, <Overview />);
+  for (const label of ["Queued", "Executing", "Done per minute", "Evicted per step"]) {
+    const svg = chart(markup, label);
+    t.assert.match(svg, /viewBox="0 0 300 44"/, label);
+    t.assert.match(svg, /class="spark__unknown"[^>]*><title>scheduler unknown<\/title>/, label);
+    t.assert.match(svg, /class="spark__run" d="[^"]*M[^"]*M/, label);
+  }
+  const cache = chart(markup, "Action-cache lookups as area and hits as line per step");
+  t.assert.doesNotMatch(cache, /spark__unknown/);
+  t.assert.equal((/<path class="spark__run" d="([^"]*)"/.exec(cache)?.[1]?.match(/[ML]/g) ?? []).length, 4);
+  t.assert.match(markup, /Done \/ min<\/h2><div class="readout__big"><span class="num live">–<\/span>/);
+  t.assert.match(visibleText(markup), /Evicted \(window, all stores\) unknown/);
+  const outage = { ...state, recent: { ...state.recent, samples: samples.map((s, i) => ({ ...s, schedulerKnown: i !== 3 })) } };
+  const outageText = visibleText(html({ state: outage }, <Overview />));
+  t.assert.match(outageText, /Queue\s+unknown/);
+  t.assert.match(outageText, /Executing\s+unknown/);
+});
+
+test("worker lanes mark an interior scheduler outage and resume the original phase", (t) => {
+  const base = recentState(4);
+  const worker = base.workers[0];
+  if (!worker) throw new Error("the live recording has a worker");
+  const first = base.recent.samples[0]!;
+  const state = {
+    ...base,
+    workers: [{ ...worker, launchTime: first.start, phaseTime: first.start, phases: [{ phase: "BUSY" as const, start: first.start }] }],
+    recent: { ...base.recent, window: "40s", samples: base.recent.samples.map((s, i) => ({ ...s, schedulerKnown: i !== 1 })) },
+  };
+  const markup = html({ state }, <Workers />);
+  t.assert.match(markup, /lane__seg--busy/);
+  t.assert.match(markup, /lane__seg--unrecorded" title="scheduler unknown"/);
+  t.assert.match(markup, /Phase history: (?:off, )?busy, scheduler unknown/);
+});
+
 test("isolated chart markers stay entirely inside their viewBox", (t: TestContext) => {
   const base = recentState(3);
   const state = {

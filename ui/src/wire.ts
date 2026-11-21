@@ -950,11 +950,11 @@ start: Timestamp,
  */
 completed: number, 
 /**
- * Actions executing at the step's latest completed pass; 0 when `passes` is 0.
+ * Actions executing at the step's latest known scheduler observation.
  */
 running: number, 
 /**
- * Actions queued at the step's latest completed pass; 0 when `passes` is 0.
+ * Actions queued at the step's latest known scheduler observation.
  */
 queued: number, 
 /**
@@ -965,6 +965,11 @@ passes: number,
  * Control passes skipped during the step.
  */
 skipped: number, 
+/**
+ * Scheduler availability for the step. False is sticky within a step; absent on legacy
+ * samples, where availability is inferred from `passes > 0`.
+ */
+schedulerKnown?: boolean, 
 /**
  * `GetActionResult` calls answered during the step.
  */

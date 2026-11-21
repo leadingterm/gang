@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { applyRecent, bytesSeries, cacheWindow, donePerMinute, doneSeries, evictedSeries, passBars, slots, transferred, unrecordedSlots } from "../src/recent.ts";
+import { applyRecent, bytesSeries, cacheWindow, donePerMinute, doneSeries, evictedSeries, passBars, queuedSeries, runningSeries, schedulerKnown, slots, transferred, unrecordedSlots } from "../src/recent.ts";
 import type { Recent, Sample } from "../src/wire.ts";
 import { iso } from "./sse.ts";
 
 const sample = (step: number, completed = 0): Sample => ({
-  start: iso(step * 10000), completed, running: 0, queued: 0, passes: 0, skipped: 0, lookups: 0, hits: 0, uploadedBytes: 0, downloadedBytes: 0, evictedBytes: 0,
+  start: iso(step * 10000), completed, running: 0, queued: 0, passes: 1, skipped: 0, lookups: 0, hits: 0, uploadedBytes: 0, downloadedBytes: 0, evictedBytes: 0,
 });
 const recent = (samples: Sample[], window = "60s"): Recent => ({ window, step: "10s", samples });
 
@@ -43,7 +43,7 @@ test("pass bars distinguish skipped, ok, idle and unrecorded", () => {
   const r = recent([
     { ...sample(0), passes: 1, skipped: 1 },
     { ...sample(1), passes: 2 },
-    sample(2),
+    { ...sample(2), passes: 0 },
   ], "40s");
   assert.deepEqual(passBars(r), ["unrecorded", "skipped", "ok", "idle"]);
 });
@@ -90,4 +90,22 @@ test("transfer and eviction series distinguish missing steps from recorded zero"
   assert.deepEqual(bytesSeries(r, "uploadedBytes"), [null, 3, 0]);
   assert.deepEqual(evictedSeries(r), [null, 5, 0]);
   assert.equal(transferred(recent([])), null);
+});
+
+test("scheduler outages preserve the timeline without fabricating scheduler measurements", () => {
+  const r = recent([
+    { ...sample(0, 2), running: 3, queued: 4, evictedBytes: 5, lookups: 10, hits: 8 },
+    { ...sample(1, 999), schedulerKnown: false, running: 999, queued: 999, evictedBytes: 999, lookups: 12, hits: 9 },
+    { ...sample(2, 3), schedulerKnown: true, passes: 0, running: 6, queued: 7, evictedBytes: 8, lookups: 14, hits: 10 },
+    sample(3),
+  ], "40s");
+  assert.equal(schedulerKnown({ ...sample(0), passes: 0 }), false);
+  assert.deepEqual(runningSeries(r), [3, null, 6, 0]);
+  assert.deepEqual(queuedSeries(r), [4, null, 7, 0]);
+  assert.deepEqual(doneSeries(r), [12, null, 18, null]);
+  assert.deepEqual(evictedSeries(r), [5, null, 8, 0]);
+  assert.equal(donePerMinute(r), null);
+  assert.deepEqual(cacheWindow(r).hitsPerStep, [8, 9, 10, 0]);
+  const recovered = recent([...r.samples!, ...[4, 5, 6, 7, 8].map((i) => sample(i, 1))], "90s");
+  assert.deepEqual(donePerMinute(recovered), { perMinute: 7, spanMs: 60000 });
 });

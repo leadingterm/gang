@@ -399,7 +399,6 @@ fn fill_window(
         pass: PassStatus::Ok {
             applied: 0,
             failed: 0,
-            hosted: &hosted,
         },
         fleets: &passes,
         catalog: &catalog,
@@ -411,7 +410,17 @@ fn fill_window(
         measured: world.measured.as_ref(),
         principals_epoch: 7,
     };
-    builder.fill(cur, prev, seq, &inputs);
+    let fresh = vec![true; passes.len()];
+    let observed = Inputs {
+        pass: PassStatus::Observed {
+            hosted: Some(&hosted),
+            supplies: &fresh,
+        },
+        ..inputs.clone()
+    };
+    let mut intermediate = blank();
+    builder.fill(&mut intermediate, prev, seq, &observed);
+    builder.fill(cur, &intermediate, seq, &inputs);
     Ok(())
 }
 
