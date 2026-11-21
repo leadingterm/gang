@@ -1,4 +1,4 @@
-// The fleet tape: one cell per instance up to the fleet's max, in a fixed state order.
+// The fleet tape: one cell per instance, padded to the logical max or desired count.
 import { Fragment, type ComponentChildren } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { idOf, seconds } from "../wire-parse.ts";
@@ -85,10 +85,11 @@ export const fleetTotals = (fleets: readonly Fleet[], census: FleetCensus): Coun
   return [...totals];
 };
 
-/** The tape's cells: its states in order, then empty slots up to max. */
+/** The tape's cells: its states in order, then empty slots up to the logical max or desired count. */
 export const cellStates = (f: Fleet, census: FleetCensus): readonly CellState[] => {
   const cells = tapeCounts(f, census).flatMap(([state, n]) => Array<CellState>(n).fill(state));
-  return cells.length < f.policy.max ? [...cells, ...Array<CellState>(f.policy.max - cells.length).fill("empty")] : cells;
+  const target = Math.max(f.policy.max, f.desired);
+  return cells.length < target ? [...cells, ...Array<CellState>(target - cells.length).fill("empty")] : cells;
 };
 
 const CROSSFADE_MS = 700;

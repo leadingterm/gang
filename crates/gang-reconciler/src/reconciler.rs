@@ -81,6 +81,13 @@ fn newest(a: usize, b: usize, workers: &[WorkerState]) -> usize {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainKind {
+    Worker,
+    Surplus,
+    Replacement,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Draining {
     worker: usize,
@@ -88,8 +95,7 @@ struct Draining {
     running: u32,
     end: Option<TerminationCause>,
     release_first: bool,
-    owned: bool,
-    replacing: bool,
+    kind: DrainKind,
     resumed: bool,
 }
 
@@ -446,7 +452,7 @@ impl Reconciler {
             capacity.resumable.extend(
                 self.draining[draining..]
                     .iter()
-                    .filter(|drain| drain.owned && !drain.replacing)
+                    .filter(|drain| drain.kind == DrainKind::Surplus)
                     .map(|drain| drain.instance),
             );
             self.census[index] = FleetCensus {
@@ -530,29 +536,7 @@ impl Reconciler {
             return Standing::Ordered;
         }
         if replacing {
-            census.replacing = census.replacing.saturating_add(1);
-            if let Some(worker) = hosted.worker {
-                let replacing_cordon = pass.hosted.snapshot().cordons.iter().any(|cordon| {
-                    cordon.fleet == view.index
-                        && cordon.instance.as_str() == instance.id.as_str()
-                        && cordon.replacing
-                });
-                if !replacing_cordon {
-                    let worker = pass
-                        .hosted
-                        .workers_on(&view.policy.name, &instance.id)
-                        .find(|&index| !pass.hosted.snapshot().workers[index].current_build)
-                        .unwrap_or(worker);
-                    plan.steps.push(PlanStep {
-                        fleet: view.index,
-                        action: Action::StartDrain {
-                            worker: pass.hosted.snapshot().workers[worker].id.clone(),
-                            reason: DrainReason::Outdated,
-                            summary: None,
-                        },
-                    });
-                }
-            }
+            Self::classify_replacement(pass, view, instance, hosted, census, plan);
         }
         if owned || hosted.draining_since.is_some() {
             census.busy_cordons = census.busy_cordons.saturating_add(1);
@@ -604,6 +588,40 @@ impl Reconciler {
         Standing::Usable
     }
 
+    fn classify_replacement(
+        pass: &Pass<'_>,
+        view: &FleetView<'_>,
+        instance: &FleetInstance,
+        hosted: Hosted,
+        census: &mut Census,
+        plan: &mut Plan,
+    ) {
+        census.replacing = census.replacing.saturating_add(1);
+        if hosted.serving {
+            return;
+        }
+        if let Some(worker) = hosted.worker {
+            let replacing_cordon = pass.hosted.snapshot().cordons.iter().any(|cordon| {
+                cordon.fleet == view.index
+                    && cordon.instance.as_str() == instance.id.as_str()
+                    && cordon.replacing
+            });
+            if !replacing_cordon {
+                let worker = pass
+                    .hosted
+                    .workers_on(&view.policy.name, &instance.id)
+                    .find(|&index| !pass.hosted.snapshot().workers[index].current_build)
+                    .unwrap_or(worker);
+                plan.steps.push(PlanStep {
+                    fleet: view.index,
+                    action: Action::ReinforceDrain(
+                        pass.hosted.snapshot().workers[worker].id.clone(),
+                    ),
+                });
+            }
+        }
+    }
+
     fn classify_drain(
         &mut self,
         pass: &Pass<'_>,
@@ -612,8 +630,14 @@ impl Reconciler {
         hosted: Hosted,
         (worker, owned, replacing, since): (usize, bool, bool, Tick),
     ) -> Standing {
-        if !owned
-            && !replacing
+        let kind = if replacing {
+            DrainKind::Replacement
+        } else if owned {
+            DrainKind::Surplus
+        } else {
+            DrainKind::Worker
+        };
+        if kind == DrainKind::Worker
             && pass.now.saturating_duration_since(since) < view.policy.boot_grace
         {
             return Standing::Transient;
@@ -621,7 +645,7 @@ impl Reconciler {
         let end = if !hosted.serving && hosted.running == 0 {
             Some(TerminationCause::DrainFinished)
         } else if !hosted.serving
-            && !replacing
+            && kind != DrainKind::Replacement
             && pass.now.saturating_duration_since(since) >= view.policy.max_drain_wait
         {
             Some(TerminationCause::MaxDrainWait)
@@ -644,8 +668,7 @@ impl Reconciler {
             running: hosted.running,
             end,
             release_first: instance.release_first,
-            owned,
-            replacing,
+            kind,
             resumed: false,
         });
         Standing::Retained
@@ -671,7 +694,9 @@ impl Reconciler {
             .saturating_into();
         let retaining: u32 = self.draining[range]
             .iter()
-            .filter(|d| !d.replacing && !d.resumed && d.end.is_none() && d.running > 0)
+            .filter(|d| {
+                d.kind != DrainKind::Replacement && !d.resumed && d.end.is_none() && d.running > 0
+            })
             .count()
             .saturating_into();
         let from = view.supply.desired.saturating_sub(terminated);
@@ -765,7 +790,7 @@ impl Reconciler {
         let mut extra = CapacityVector::default();
         for position in range.clone() {
             let drain = self.draining[position];
-            if !drain.owned || drain.replacing {
+            if drain.kind != DrainKind::Surplus {
                 continue;
             }
             let ordinary = remaining_rescues > 0;
@@ -792,7 +817,7 @@ impl Reconciler {
             let instance = &view.supply.instances[drain.instance].id;
             if let Some(cause) = drain.end {
                 self.terminate(pass, view, instance, cause, plan);
-            } else if drain.owned {
+            } else if drain.kind != DrainKind::Worker {
                 for worker in pass.hosted.workers_on(&view.policy.name, instance) {
                     if !workers[worker].draining {
                         let id = &workers[worker].id;

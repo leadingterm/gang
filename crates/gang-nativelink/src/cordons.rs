@@ -92,12 +92,12 @@ impl InstanceCordons {
                 PlatformPropertyValue::Exact(fleet) => self.fleet_index(fleet),
                 _ => None,
             });
-        let stale = worker
+        let outdated = worker
             .total_platform_properties
             .properties
             .get(property::GANG_VERSION)
             .is_none_or(|value| value.as_str().as_ref() != env!("CARGO_PKG_VERSION"));
-        let instance = stale
+        let instance = outdated
             .then(|| {
                 WorkerId::instance_name_from_str(&worker.id.0)
                     .and_then(|name| InstanceId::try_new(name).ok().map(Arc::new))
@@ -106,7 +106,7 @@ impl InstanceCordons {
         let read = self.state.read().await;
         let state = if read.self_drains.is_empty()
             && !worker.is_draining
-            && !(stale && fleet.is_some() && instance.is_some())
+            && !(outdated && fleet.is_some() && instance.is_some())
         {
             read
         } else {
@@ -123,7 +123,7 @@ impl InstanceCordons {
             if worker.is_draining {
                 write.self_drains.insert(worker.id.0.clone());
             }
-            if let (true, Some(fleet), Some(instance)) = (stale, fleet, instance) {
+            if let (true, Some(fleet), Some(instance)) = (outdated, fleet, instance) {
                 let entries = &mut write.fleets[fleet];
                 match entries.binary_search_by(|entry| entry.id.as_str().cmp(instance.as_str())) {
                     Ok(position) => entries[position].replacing = true,

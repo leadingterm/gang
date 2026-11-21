@@ -56,11 +56,14 @@ fn stale_busy_instance_is_replaced_at_max_without_duplicate_purchase() -> TestRe
         .current_build = false;
 
     let first = changes(&h.run());
-    assert!(first.contains(&Change::Drain(
-        X86,
-        "local-old".into(),
-        DrainReason::Outdated
-    )));
+    assert!(first.contains(&Change::Reinforce(X86, "local-old".into())));
+    assert_eq!(
+        first
+            .iter()
+            .filter(|change| matches!(change, Change::Reinforce(..)))
+            .count(),
+        1
+    );
     assert!(first.contains(&Change::Scale(X86, 2, 3, NeedCause::Minimum)));
     assert_eq!(h.outlook(X86)?.workers.running, 1);
     assert!(h.snapshot.cordons[0].replacing);
@@ -110,6 +113,7 @@ fn busy_stale_work_creates_replacement_demand_without_a_minimum() -> TestResult 
     h.snapshot.workers[0].current_build = false;
 
     let first = changes(&h.run());
+    assert!(first.contains(&Change::Reinforce(X86, "local-old".into())));
     assert!(first.contains(&Change::Scale(X86, 1, 2, NeedCause::Demand)));
     assert_eq!(h.outlook(X86)?.needed, 1);
     assert!(
@@ -216,14 +220,34 @@ fn one_stale_connection_replaces_the_entire_physical_instance() -> TestResult {
     h.snapshot.workers[0].current_build = false;
     h.snapshot.workers.push(current);
     let steps = changes(&h.run());
-    assert!(steps.contains(&Change::Drain(
-        X86,
-        "local-old".into(),
-        DrainReason::Outdated
-    )));
+    assert!(steps.contains(&Change::Reinforce(X86, "local-old".into())));
     assert!(steps.contains(&Change::Scale(X86, 1, 2, NeedCause::Minimum)));
     assert!(h.snapshot.workers.iter().all(|worker| worker.draining));
+    assert!(h.snapshot.cordons[0].replacing);
     assert_eq!(h.outlook(X86)?.workers.running, 1);
+    Ok(())
+}
+
+#[test]
+fn already_draining_stale_instance_gets_replacement_intent() -> TestResult {
+    let mut policy = policy()?;
+    policy.instances = InstanceBounds::try_new(1, NonZeroU32::MIN)?;
+    let mut h = Harness::with_policy(policy);
+    h.settle_term()?;
+    serve(&mut h, "local-old", secs(60))?;
+    h.set_running("local-old", 1)?;
+    h.snapshot.workers[0].current_build = false;
+    h.snapshot.workers[0].draining = true;
+
+    let steps = changes(&h.run());
+    assert!(steps.contains(&Change::Reinforce(X86, "local-old".into())));
+    assert!(steps.contains(&Change::Scale(X86, 1, 2, NeedCause::Minimum)));
+    assert!(h.snapshot.cordons[0].replacing);
+    assert!(
+        !steps
+            .iter()
+            .any(|change| matches!(change, Change::Cancel(..) | Change::Terminate(..)))
+    );
     Ok(())
 }
 

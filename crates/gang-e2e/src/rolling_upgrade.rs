@@ -162,7 +162,7 @@ fn preflight(
     run: &Run,
     old_binary: &Path,
     attempts: &mut Attempts,
-) -> Result<String> {
+) -> Result<()> {
     read_held(journal, run, attempts)?;
     let workers: BTreeSet<_> = attempts.values().map(|attempt| attempt.worker).collect();
     if workers.len() != 1 {
@@ -182,10 +182,10 @@ fn preflight(
         }
     }
     let stack = cluster.stack();
-    let state = stack.wait_live_state(stack.settings().history_timeout, |state| {
+    stack.wait_live_state(stack.settings().history_timeout, |state| {
         state.queue.total > 0 && state.workers.len() == 1
     })?;
-    Ok(state.workers[0].name.clone())
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -671,7 +671,6 @@ fn handoff<K: Fn(Option<&str>) -> Result<()>>(
     context: &mut Handoff<'_>,
     monitor: &RunningMonitor<'_>,
     hold: &Hold<'_, K>,
-    original_worker: &str,
 ) -> Result<(usize, Retiring, PromotionTiming, DrainWitness)> {
     cluster.apply_release(&releases.candidate)?;
     let startup = cluster.stack().settings().startup_timeout;
@@ -702,13 +701,6 @@ fn handoff<K: Fn(Option<&str>) -> Result<()>>(
     };
     let promotion = promotion?;
     context.observe_worker()?;
-    cluster.stack().wait_live_state(startup, |state| {
-        state.workers.iter().any(|worker| {
-            worker.name == original_worker
-                && worker.stale
-                && worker.phase == gang_wire::Phase::Draining
-        })
-    })?;
     context.observe_worker()?;
     context.client.assert_original_rc()?;
     hold.release()?;
@@ -1028,7 +1020,6 @@ struct Promotion {
 
 #[derive(Debug)]
 struct RolloutWitness {
-    stale_draining_held: bool,
     old_exited: bool,
     old_fleet_empty: bool,
     old_client_current: bool,
@@ -1037,8 +1028,7 @@ struct RolloutWitness {
 
 impl RolloutWitness {
     fn valid(&self) -> bool {
-        self.stale_draining_held
-            && self.old_exited
+        self.old_exited
             && self.old_fleet_empty
             && self.old_client_current
             && self.candidate_client_current
@@ -1313,7 +1303,7 @@ impl Upgrade<'_> {
             result
         });
         let mut attempts = Attempts::new();
-        let original_worker = preflight(
+        preflight(
             &self.cluster,
             &self.builds.journal,
             &self.builds.initial.run,
@@ -1341,14 +1331,7 @@ impl Upgrade<'_> {
         }
         let applied = Instant::now();
         context.applied = applied;
-        let promotion = handoff(
-            &self.cluster,
-            &self.releases,
-            &mut context,
-            &monitor,
-            hold,
-            &original_worker,
-        );
+        let promotion = handoff(&self.cluster, &self.releases, &mut context, &monitor, hold);
         let mut continuity_observed = context.continuity_observed;
         let promotion = match promotion {
             Ok((next, retiring, timing, mut witness)) => {
@@ -1435,7 +1418,6 @@ impl Upgrade<'_> {
             }
         }
         let rollout = RolloutWitness {
-            stale_draining_held: true,
             old_exited,
             old_fleet_empty,
             old_client_current: current_executables(
@@ -1881,7 +1863,6 @@ mod tests {
         let availability = Availability::default();
         let drain = DrainWitness::default();
         let rollout = RolloutWitness {
-            stale_draining_held: true,
             old_exited: true,
             old_fleet_empty: true,
             old_client_current: true,

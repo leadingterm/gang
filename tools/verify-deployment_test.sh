@@ -59,28 +59,28 @@ aws() {
       fi
       printf '{"AutoScalingGroups":[{"AutoScalingGroupName":"%s","DesiredCapacity":%s,"Instances":[{"InstanceId":"%s","HealthStatus":"%s","LifecycleState":"%s"}]}]}\n' "$name" "$desired" "$instance" "$state" "$lifecycle" ;;
     '--region region-1 ssm send-command '*)
-      [[ $4 == --instance-ids && $6 == --document-name && $7 == AWS-RunShellScript && $8 == --parameters && ${10} == --output && ${11} == json ]] || return 1
-      jq -e '.commands | length == 1 and (.[0] | contains("systemctl show gang-worker.service -p MainPID --value") and contains("/proc/$pid/exe") and contains("-V") and contains("kill -0"))' <<<"$9" >/dev/null || return 1
+      [[ $5 == --instance-ids && $7 == --document-name && $8 == AWS-RunShellScript && $9 == --parameters && ${11} == --output && ${12} == json ]] || return 1
+      jq -e '.commands | length == 1 and (.[0] | contains("systemctl show gang-worker.service -p MainPID --value") and contains("/proc/$pid/exe") and contains("-V") and contains("kill -0"))' <<<"${10}" >/dev/null || return 1
       if [[ $CASE == worker_send_failure ]]; then return 1; fi
       echo '{"Command":{"CommandId":"12345678-1234-1234-1234-123456789abc"}}' ;;
     '--region region-1 ssm get-command-invocation '*)
-      [[ $4 == --command-id && $5 == 12345678-1234-1234-1234-123456789abc && $6 == --instance-id && $8 == --output && $9 == json ]] || return 1
-      if [[ $CASE == worker_ssm_pending && ! -e $PENDING_MARKER-ssm-$7 ]]; then
-        : >"$PENDING_MARKER-ssm-$7"; echo '{"Status":"Pending"}'; return
+      [[ $5 == --command-id && $6 == 12345678-1234-1234-1234-123456789abc && $7 == --instance-id && $9 == --output && ${10} == json ]] || return 1
+      if [[ $CASE == worker_ssm_pending && ! -e $PENDING_MARKER-ssm-$8 ]]; then
+        : >"$PENDING_MARKER-ssm-$8"; echo '{"Status":"Pending"}'; return
       fi
-      if [[ $CASE == worker_invocation_missing && ! -e $PENDING_MARKER-invocation-$7 ]]; then
-        : >"$PENDING_MARKER-invocation-$7"; echo 'InvocationDoesNotExist' >&2; return 1
+      if [[ $CASE == worker_invocation_missing && ! -e $PENDING_MARKER-invocation-$8 ]]; then
+        : >"$PENDING_MARKER-invocation-$8"; echo 'InvocationDoesNotExist' >&2; return 1
       fi
       if [[ $CASE == worker_ssm_failure || $CASE == worker_missing_pid ]]; then echo '{"Status":"Failed","ResponseCode":1,"StandardOutputContent":""}'; return; fi
       if [[ $CASE == worker_missing_output ]]; then echo '{"Status":"Success","ResponseCode":0,"StandardOutputContent":""}'; return; fi
-      if [[ $CASE == worker_mixed && $7 == i-old ]]; then : >"$PENDING_MARKER-old"; echo '{"Status":"Success","ResponseCode":0,"StandardOutputContent":"gang 0.9.0\n"}'; return; fi
-      if [[ $CASE == worker_replacement && $7 == i-worker-one ]]; then
+      if [[ $CASE == worker_mixed && $8 == i-old ]]; then : >"$PENDING_MARKER-old"; echo '{"Status":"Success","ResponseCode":0,"StandardOutputContent":"gang 0.9.0\n"}'; return; fi
+      if [[ $CASE == worker_replacement && $8 == i-worker-one ]]; then
         : >"$PENDING_MARKER-replace"; echo '{"Status":"Success","ResponseCode":0,"StandardOutputContent":"gang 0.9.0\n"}'; return
       fi
-      if [[ $CASE == worker_delayed_rollover && $7 == i-worker-one ]]; then
+      if [[ $CASE == worker_delayed_rollover && $8 == i-worker-one ]]; then
         : >"$PENDING_MARKER-rollover"; echo '{"Status":"Success","ResponseCode":0,"StandardOutputContent":"gang 0.9.0\n"}'; return
       fi
-      if [[ $CASE == worker_appearing && $7 == i-worker-one ]]; then : >"$PENDING_MARKER-appeared"; fi
+      if [[ $CASE == worker_appearing && $8 == i-worker-one ]]; then : >"$PENDING_MARKER-appeared"; fi
       echo '{"Status":"Success","ResponseCode":0,"StandardOutputContent":"gang 1.2.3\n"}' ;;
     '--region region-1 elbv2 describe-target-health --target-group-arn arn:one --output json'|'--region region-1 elbv2 describe-target-health --target-group-arn arn:two --output json')
       local leader=healthy

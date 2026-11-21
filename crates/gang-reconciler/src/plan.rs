@@ -155,8 +155,6 @@ pub enum DrainReason {
     IdleTimeout,
     /// N−1 capacity held the load waterline for a full dwell.
     Utilization,
-    /// The instance hosts a worker from an outdated release.
-    Outdated,
 }
 
 impl From<DrainReason> for ScalingCause {
@@ -164,7 +162,6 @@ impl From<DrainReason> for ScalingCause {
         match reason {
             DrainReason::IdleTimeout => Self::IdleTimeout,
             DrainReason::Utilization => Self::Utilization,
-            DrainReason::Outdated => Self::Outdated,
         }
     }
 }
@@ -220,7 +217,7 @@ pub enum Action {
         /// N−1 inputs for utilization drains; absent for idle timeout.
         summary: Option<CordonDecision>,
     },
-    /// Silently reapplies an existing owned physical cordon to a mismatched connection.
+    /// Silently applies or repairs physical drain intent for a hosted connection.
     ReinforceDrain(WorkerId),
     /// Resumes an owned physical drain before buying capacity.
     CancelDrain(WorkerId, NeedCause),

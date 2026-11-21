@@ -1128,6 +1128,41 @@ test("terminating hosted old member and replacement occupy two cells at desired 
   t.assert.match(legend, /c-replacement[^]*replacement/);
 });
 
+test("rollout desired beyond the logical maximum fits the tape without inventing workers", (t) => {
+  const fleet = live.fleets[0];
+  const worker = live.workers[0];
+  if (!fleet || !worker) throw new Error("fixture has fleet and worker");
+  const f = { ...fleet, desired: 3, policy: { ...fleet.policy, min: 0, max: 1 }, instances: { ...fleet.instances, warm: 0 } };
+  const { infrastructure: _infrastructure, ...base } = worker;
+  const old = { ...base, fleet: f.name, name: "workers/rollout-old", instance: "instances/rollout-old", stale: true, phase: "DRAINING" as const, running: 0 };
+  const census = { workers: [old], instances: [] };
+  t.assert.deepEqual(cellStates(f, census), ["stale", "empty", "empty"]);
+  const counts = new Map(fleetCounts(f, census));
+  t.assert.equal(counts.get("stale"), 1);
+  t.assert.equal(counts.get("busy"), 0);
+  t.assert.equal(counts.get("pending"), 0);
+  const tape = html({}, <Tape f={f} census={census} />);
+  const max = Number(tape.match(/--max:\s*(\d+)/)?.[1]);
+  const desired = Number(tape.match(/--d:\s*(\d+)/)?.[1]);
+  t.assert.equal(max, 3);
+  t.assert.equal(desired, 3);
+  t.assert.ok(max >= desired);
+  t.assert.equal((tape.match(/class="cell"/g) ?? []).length, 3);
+  t.assert.match(tape, /1 stale, 0 no worker, 0 pending/);
+  t.assert.match(tape, /of 1 maximum\. Desired 3/);
+  t.assert.match(tape, /class="strip__rule">1<\/span>/);
+
+  const extra = Array.from({ length: 3 }, (_, i) => ({
+    ...old, name: `workers/extra-${i}`, instance: `instances/extra-${i}`, stale: false, phase: "IDLE" as const,
+  }));
+  const largerCensus = { workers: [old, ...extra], instances: [] };
+  t.assert.deepEqual(cellStates(f, largerCensus), ["idle", "idle", "idle", "stale"]);
+  const largerTape = html({}, <Tape f={f} census={largerCensus} />);
+  t.assert.match(largerTape, /--max:\s*4/);
+  t.assert.match(largerTape, /--d:\s*3/);
+  t.assert.match(largerTape, /3 idle, 0 draining, 1 stale/);
+});
+
 test("census groups generations, isolates fleets, and preserves unknown states", (t) => {
   const fleet = live.fleets[0];
   const worker = live.workers[0];

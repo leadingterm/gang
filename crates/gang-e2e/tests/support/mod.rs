@@ -1253,6 +1253,7 @@ impl Simulation {
             capacity: None,
             reserved: None,
             paused: false,
+            stale: false,
             launch_time: at(0),
             phases: Vec::new(),
             infrastructure: None,
