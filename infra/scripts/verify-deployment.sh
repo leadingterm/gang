@@ -13,9 +13,9 @@ region=$(jq -er '.region | select(type == "string" and length > 0)' <<<"$gang")
 asg=$(jq -er 'if has("controller_autoscaling_group_name") then .controller_autoscaling_group_name // "" else error("missing controller ASG") end' <<<"$gang")
 targets=$(jq -er '.controller_target_group_arns | select(type == "array" and all(.[]; type == "string" and length > 0)) | join("\n")' <<<"$gang")
 workers=$(jq -er '.asg_names | select(type == "array" and all(.[]; type == "string" and length > 0)) | join("\n")' <<<"$gang")
+deadline=$((SECONDS + 2400))
 
 if [[ -n $asg ]]; then
-  deadline=$((SECONDS + 600))
   while :; do
     if ! refresh=$(aws --region "$region" autoscaling describe-instance-refreshes --auto-scaling-group-name "$asg" --max-records 1 --no-paginate --output json); then
       echo '::error::failed to describe controller instance refreshes' >&2; exit 1
@@ -49,7 +49,6 @@ fi
 
 if [[ -n $targets ]]; then
   while IFS= read -r arn; do
-    deadline=$((SECONDS + 600))
     while :; do
       if ! health=$(aws --region "$region" elbv2 describe-target-health --target-group-arn "$arn" --output json); then
         echo "::error::failed to describe target health in $arn" >&2; exit 1
@@ -71,12 +70,33 @@ fi
 
 if [[ -n $workers ]]; then
   while IFS= read -r worker; do
-    if ! groups=$(aws --region "$region" autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$worker" --output json); then
-      echo "::error::failed to describe worker Auto Scaling group $worker" >&2; exit 1
-    fi
-    if ! jq -e --arg name "$worker" '.AutoScalingGroups | type == "array" and length == 1 and .[0].AutoScalingGroupName == $name and (.[0] | (.DesiredCapacity | type == "number") and (.Instances | type == "array") and (.DesiredCapacity == (.Instances | length)) and all(.Instances[]; .HealthStatus == "Healthy" and .LifecycleState == "InService"))' <<<"$groups" >/dev/null; then
-      echo "::error::worker Auto Scaling group $worker is missing or has unhealthy or insufficient instances" >&2; exit 1
-    fi
+    worker_deadline=$((SECONDS + 180))
+    if (( worker_deadline > deadline )); then worker_deadline=$deadline; fi
+    while :; do
+      if ! groups=$(aws --region "$region" autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$worker" --output json); then
+        echo "::error::failed to describe worker Auto Scaling group $worker" >&2; exit 1
+      fi
+      state=$(jq -r --arg name "$worker" '
+        if (.AutoScalingGroups | type) != "array" or (.AutoScalingGroups | length) != 1 or .AutoScalingGroups[0].AutoScalingGroupName != $name then "missing"
+        else .AutoScalingGroups[0] |
+          if (.Instances | type) != "array" or (.DesiredCapacity | type) != "number" then "missing"
+          else [.Instances[] | select((.LifecycleState // "") | startswith("Terminating") | not)] as $active
+            | if any($active[]; .HealthStatus == "Unhealthy") then "unhealthy"
+              elif ($active | length) == .DesiredCapacity and all($active[]; .HealthStatus == "Healthy" and .LifecycleState == "InService") then "ready"
+              else "pending" end
+          end
+        end' <<<"$groups")
+      case $state in
+        ready) break ;;
+        missing|unhealthy) echo "::error::worker Auto Scaling group $worker is $state" >&2; exit 1 ;;
+        *)
+          if (( SECONDS >= worker_deadline )); then
+            jq -c '.AutoScalingGroups[] | {AutoScalingGroupName, DesiredCapacity, Instances: [.Instances[] | {InstanceId, HealthStatus, LifecycleState}]}' <<<"$groups" >&2
+            echo "::error::worker Auto Scaling group $worker did not reach desired healthy capacity" >&2; exit 1
+          fi
+          sleep 5 ;;
+      esac
+    done
   done <<<"$workers"
 fi
 
@@ -88,7 +108,7 @@ if [[ -z $targets ]]; then
   if ! pin=$("${GANG:-gang}" ca-pin --config "$dir/gang.toml"); then
     echo '::error::failed to derive controller CA pin' >&2; exit 1
   fi
-  if ! bootstrap=$(curl --fail --silent --show-error --connect-timeout 10 --max-time 20 --insecure "${endpoint%/}/v1/server"); then
+  if ! bootstrap=$(curl --fail --silent --show-error --connect-timeout 10 --max-time 20 --retry 12 --retry-delay 5 --retry-all-errors --retry-max-time 120 --insecure "${endpoint%/}/v1/server"); then
     echo '::error::failed to obtain controller CA certificate' >&2; exit 1
   fi
   if ! jq -er '.caCertificate | select(type == "string" and length > 0)' <<<"$bootstrap" >"$dir/ca.pem"; then
@@ -103,7 +123,7 @@ if [[ -z $targets ]]; then
   curl_trust=(--cacert "$dir/ca.pem")
 fi
 
-if ! response=$(curl --fail --silent --show-error --connect-timeout 10 --max-time 20 "${curl_trust[@]}" "${endpoint%/}/v1/server"); then
+if ! response=$(curl --fail --silent --show-error --connect-timeout 10 --max-time 20 --retry 12 --retry-delay 5 --retry-all-errors --retry-max-time 120 "${curl_trust[@]}" "${endpoint%/}/v1/server"); then
   echo "::error::failed to query server version at $endpoint" >&2; exit 1
 fi
 if ! version=$(jq -er '.version | select(type == "string" and length > 0)' <<<"$response"); then

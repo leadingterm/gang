@@ -2,6 +2,10 @@
 set -euo pipefail
 
 REMOTE_BUILD_WORKFLOW=${REMOTE_BUILD_WORKFLOW:-remote-build.yml}
+if [[ ! $REMOTE_BUILD_WORKFLOW =~ ^[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml$ ]]; then
+  echo '::error::invalid remote-build workflow filename' >&2
+  exit 1
+fi
 if ! run_id=$(gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/$REMOTE_BUILD_WORKFLOW/dispatches" \
   -H 'X-GitHub-Api-Version: 2026-03-10' -f ref="$GITHUB_REF_NAME" \
   -f "inputs[salt]=deploy-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \

@@ -12,7 +12,7 @@ yq -o=json 'explode(.) | .jobs' "$workflow" | jq -e '
 ' >/dev/null
 yq -er 'explode(.) | .jobs.apply.steps[] | select(.name == "Verify server version and controller targets") | .run' "$workflow" >"$scratch/step"
 export GANG_WORKFLOW_REF=example-org/gang/.github/workflows/deploy.yml@refs/tags/v1.2.3 ROOT=infra
-export CASE CALLS="$scratch/calls" CURL_CALLS="$scratch/curl-calls"
+export CASE CALLS="$scratch/calls" CURL_CALLS="$scratch/curl-calls" PENDING_MARKER="$scratch/pending"
 tofu() {
   [[ $* == '-chdir=infra output -json gang' ]] || return 1
   if [[ $CASE == missing ]]; then echo '{"endpoint":"https://gang.example.com","region":"region-1","controller_autoscaling_group_name":null}'; return; fi
@@ -33,10 +33,12 @@ aws() {
       printf '{"AutoScalingGroups":[{"AutoScalingGroupName":"controller","DesiredCapacity":2,"LaunchTemplate":{"LaunchTemplateId":"lt-one","Version":"7"},"Instances":[{"InstanceId":"i-one","HealthStatus":"Healthy","LifecycleState":"InService","LaunchTemplate":{"LaunchTemplateId":"lt-one","Version":"7"}},{"InstanceId":"i-two","HealthStatus":"Healthy","LifecycleState":"InService","LaunchTemplate":{"LaunchTemplateId":"lt-one","Version":"%s"}}]}]}\n' "$version" ;;
     '--region region-1 autoscaling describe-auto-scaling-groups --auto-scaling-group-names worker-one --output json'|'--region region-1 autoscaling describe-auto-scaling-groups --auto-scaling-group-names worker-two --output json')
       if [[ $CASE == worker_missing ]]; then echo '{"AutoScalingGroups":[]}'; return; fi
-      local name=${6} state=Healthy desired=1
+      local name=${6} state=Healthy desired=1 lifecycle=InService
       if [[ $CASE == worker_unhealthy ]]; then state=Unhealthy; fi
       if [[ $CASE == worker_short ]]; then desired=2; fi
-      printf '{"AutoScalingGroups":[{"AutoScalingGroupName":"%s","DesiredCapacity":%s,"Instances":[{"HealthStatus":"%s","LifecycleState":"InService"}]}]}\n' "$name" "$desired" "$state" ;;
+      if [[ $CASE == worker_pending && ! -e $PENDING_MARKER-$name ]]; then lifecycle=Pending; : >"$PENDING_MARKER-$name"; fi
+      if [[ $CASE == worker_terminating ]]; then desired=0; lifecycle=Terminating:Wait; state=Unhealthy; fi
+      printf '{"AutoScalingGroups":[{"AutoScalingGroupName":"%s","DesiredCapacity":%s,"Instances":[{"HealthStatus":"%s","LifecycleState":"%s"}]}]}\n' "$name" "$desired" "$state" "$lifecycle" ;;
     '--region region-1 elbv2 describe-target-health --target-group-arn arn:one --output json'|'--region region-1 elbv2 describe-target-health --target-group-arn arn:two --output json')
       local leader=healthy
       if [[ $CASE == unhealthy ]]; then leader=unhealthy; fi
@@ -58,9 +60,9 @@ openssl() {
   esac
 }
 curl() {
-  [[ ${1-} == --fail && ${2-} == --silent && ${3-} == --show-error && ${4-} == --connect-timeout && ${5-} == 10 && ${6-} == --max-time && ${7-} == 20 ]] || return 1
+  [[ ${1-} == --fail && ${2-} == --silent && ${3-} == --show-error && ${4-} == --connect-timeout && ${5-} == 10 && ${6-} == --max-time && ${7-} == 20 && ${8-} == --retry && ${9-} == 12 && ${10-} == --retry-delay && ${11-} == 5 && ${12-} == --retry-all-errors && ${13-} == --retry-max-time && ${14-} == 120 ]] || return 1
   local trusted=0
-  shift 7
+  shift 14
   printf '%s\n' "$*" >>"$CURL_CALLS"
   if [[ ${1-} == --insecure ]]; then
     [[ $# == 2 && $2 == https://gang.example.com/v1/server ]] || return 1
@@ -75,14 +77,16 @@ curl() {
   [[ $# == 1 && $1 == https://gang.example.com/v1/server ]] || return 1
   case $CASE in wrong) echo '{"version":"0.0.0"}' ;; no_version) echo '{}' ;; http_failure) return 1 ;; *) echo '{"version":"1.2.3"}' ;; esac
 }
-sleep() { SECONDS=$((SECONDS + 601)); }
+sleep() {
+  case $CASE in unhealthy) SECONDS=$((SECONDS + 2401)) ;; worker_short) SECONDS=$((SECONDS + 181)) ;; *) SECONDS=$((SECONDS + 1)) ;; esac
+}
 export -f tofu aws gang openssl curl sleep
-for CASE in healthy sqlite sqlite_lb wrong_pin wrong no_version http_failure unhealthy old_template missing aws_failure refresh_failed worker_missing worker_unhealthy worker_short; do
+for CASE in healthy sqlite sqlite_lb wrong_pin wrong no_version http_failure unhealthy old_template missing aws_failure refresh_failed worker_missing worker_unhealthy worker_short worker_pending worker_terminating; do
   : >"$CALLS"
   : >"$CURL_CALLS"
   status=0
   (cd "$scratch" && bash --noprofile --norc -euo pipefail "$scratch/step") >"$scratch/out" 2>&1 || status=$?
-  case $CASE in healthy|sqlite|sqlite_lb) [[ $status == 0 ]] ;; *) [[ $status != 0 ]] ;; esac
+  case $CASE in healthy|sqlite|sqlite_lb|worker_pending|worker_terminating) [[ $status == 0 ]] ;; *) [[ $status != 0 ]] ;; esac
   case $CASE in
     healthy) [[ $(wc -l <"$CALLS") -eq 6 ]] && grep -Fx -- '--region region-1 elbv2 describe-target-health --target-group-arn arn:one --output json' "$CALLS" >/dev/null && grep -Fx -- '--region region-1 elbv2 describe-target-health --target-group-arn arn:two --output json' "$CALLS" >/dev/null && grep -Fx -- '--region region-1 autoscaling describe-auto-scaling-groups --auto-scaling-group-names worker-two --output json' "$CALLS" >/dev/null ;;
     sqlite) [[ ! -s $CALLS ]] ;;
@@ -94,6 +98,9 @@ for CASE in healthy sqlite sqlite_lb wrong_pin wrong no_version http_failure unh
     wrong) grep -F 'server version mismatch: expected 1.2.3, observed 0.0.0' "$scratch/out" >/dev/null ;;
     no_version) grep -F 'server response has no version' "$scratch/out" >/dev/null ;;
     http_failure) grep -F 'failed to query server version' "$scratch/out" >/dev/null ;;
-    worker_missing|worker_unhealthy|worker_short) grep -F 'worker Auto Scaling group worker-one is missing or has unhealthy or insufficient instances' "$scratch/out" >/dev/null ;;
+    worker_missing) grep -F 'worker Auto Scaling group worker-one is missing' "$scratch/out" >/dev/null ;;
+    worker_unhealthy) grep -F 'worker Auto Scaling group worker-one is unhealthy' "$scratch/out" >/dev/null ;;
+    worker_short) grep -F 'worker Auto Scaling group worker-one did not reach desired healthy capacity' "$scratch/out" >/dev/null ;;
+    worker_pending) [[ -e $PENDING_MARKER-worker-one && -e $PENDING_MARKER-worker-two ]] ;;
   esac
 done

@@ -37,8 +37,9 @@ gh() {
   esac
 }
 export -f gh
-for SCENARIO in success dispatch_failure watch_failure wrong_sha missing_id; do
+for SCENARIO in success dispatch_failure watch_failure wrong_sha missing_id invalid_filename; do
   export SCENARIO
+  if [[ $SCENARIO == invalid_filename ]]; then REMOTE_BUILD_WORKFLOW='../bad.yml'; else REMOTE_BUILD_WORKFLOW=remote-build.yml; fi
   : >"$CALLS"
   if (cd "$scratch" && bash "$scratch/step.sh") >"$scratch/output" 2>&1; then
     [[ $SCENARIO == success ]]
@@ -51,7 +52,8 @@ for SCENARIO in success dispatch_failure watch_failure wrong_sha missing_id; do
     watch_failure) expected=$'dispatch\nwatch'; grep -Fq "::error::remote build failed: https://github.com/$GITHUB_REPOSITORY/actions/runs/123" "$scratch/output" ;;
     wrong_sha) expected=$'dispatch\nwatch\nview'; grep -Fq '::error::remote build does not match deployed commit or did not succeed:' "$scratch/output" ;;
     missing_id) expected=dispatch; grep -Fq '::error::cannot dispatch remote build:' "$scratch/output" ;;
+    invalid_filename) expected=; grep -Fq '::error::invalid remote-build workflow filename' "$scratch/output" ;;
   esac
   [[ $(<"$CALLS") == "$expected" ]]
 done
-printf '5 cases, 0 failures\n'
+printf '6 cases, 0 failures\n'
