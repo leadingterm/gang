@@ -118,16 +118,9 @@ fn add_default_fleet_cache(event: &str, expected: &mut Value) {
     if let Some(fleets) = fleets.and_then(Value::as_array_mut) {
         for fleet in fleets {
             if let Some(fleet) = fleet.as_object_mut() {
-                fleet.entry("workerCache").or_insert_with(|| {
-                    serde_json::json!({
-                        "reporting": 0, "workers": 0,
-                        "totals": {
-                            "local": {"requests": 0, "bytes": 0},
-                            "remote": {"requests": 0, "bytes": 0},
-                            "evictions": 0, "evicted": 0, "used": 0, "budget": 0
-                        }
-                    })
-                });
+                fleet
+                    .entry("workerCache")
+                    .or_insert_with(|| serde_json::json!(gang_wire::FleetWorkerCache::default()));
             }
         }
     }
