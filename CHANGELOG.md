@@ -1,11 +1,5 @@
 # Changelog
 
-## Unreleased
-
-### Fixed
-
-- Fix OpenTofu retained-generation cleanup racing AMI-data removal by patching forget-node references. Bazel and the deployment shell share the same pinned, source-built runtime; strict fixture diagnostics remain unchanged.
-
 ## 0.3.5 — 2026-11-21
 
 ### Added
@@ -33,6 +27,7 @@
 - Use the same current memory guarantees for learned reservations, queued work, OOM retries and scaling, while preserving explicit client minimums and per-action ceilings.
 - Expose the public listener connection limit in the deployment module, defaulting to 4096. The module now owns `[server.http2]` for all backends; SQLite callers must remove any appended `[server.http2]` table and move their `max_connections` override to `http2_max_connections`.
 - Exclude concurrent child spawns while testing owned pipe-reader cancellation, so fork-inherited readers cannot make the close assertion nondeterministic.
+- Fix OpenTofu retained-generation cleanup racing AMI-data removal by patching forget-node references. Bazel and the deployment shell share the same pinned, source-built runtime; strict fixture diagnostics remain unchanged.
 
 ### Upgrade notes
 
