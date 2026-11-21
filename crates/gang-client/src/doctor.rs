@@ -13,10 +13,10 @@ use crate::ClientOptions;
 use crate::bazel_options::{BazelProbe, EffectiveOptions};
 use crate::conflicts::find_conflicts;
 use crate::doctor_checks::{
-    Endpoint, Gang, action_environment, bazel_failed, bazel_reported, clock, credential_helper,
-    credentials, credentials_not_needed, credentials_unsupported, helper_for, needs_bazel,
-    needs_helper, needs_server, remote_endpoint, remote_headers, server_failed, server_reached,
-    tls_certificate, tls_trusted,
+    Endpoint, Gang, bazel_failed, bazel_reported, clock, credential_helper, credentials,
+    credentials_not_needed, credentials_unsupported, helper_for, needs_bazel, needs_helper,
+    needs_server, remote_endpoint, remote_headers, server_failed, server_reached, tls_certificate,
+    tls_trusted,
 };
 use crate::doctor_report::{Check, Finding, Report, Status};
 use crate::server_probe::ServerProbe;
@@ -169,11 +169,6 @@ impl<'a, B: BazelProbe, S: ServerProbe, K: Clock> Doctor<'a, B, S, K> {
                 let executor =
                     remote_endpoint(&gang, &options, Endpoint::Executor, false, &conflicts);
                 let executor_is_gang = executor.status == Status::Ok;
-                let executor = if executor_is_gang {
-                    action_environment(&gang, &options).unwrap_or(executor)
-                } else {
-                    executor
-                };
                 let cache = remote_endpoint(
                     &gang,
                     &options,
@@ -325,7 +320,6 @@ mod tests {
             "remoteExecutor": EXECUTOR,
             "remoteCache": "grpcs://cache.example.com:443/",
             "defaultIsa": "x86-64",
-            "actionEnvironment": "host:test",
             "authentication": authentication,
         }))
         .expect("the server parses")
@@ -348,20 +342,6 @@ mod tests {
             (
                 REMOTE_CACHE.to_owned(),
                 setting(CACHE, OptionSource::Unknown),
-            ),
-            (
-                "repo_env".to_owned(),
-                setting(
-                    "GANG_EXECUTION_ENVIRONMENT=host:test",
-                    OptionSource::Unknown,
-                ),
-            ),
-            (
-                "remote_default_exec_properties".to_owned(),
-                setting(
-                    "gang_execution_environment=host:test",
-                    OptionSource::Unknown,
-                ),
             ),
             (
                 CREDENTIAL_HELPER.to_owned(),
@@ -569,20 +549,6 @@ mod tests {
                         path: PathBuf::from("/home/u/.bazelrc"),
                         section: "build:ci".to_owned(),
                     },
-                ),
-            ),
-            (
-                "repo_env".to_owned(),
-                setting(
-                    "GANG_EXECUTION_ENVIRONMENT=host:test",
-                    OptionSource::Unknown,
-                ),
-            ),
-            (
-                "remote_default_exec_properties".to_owned(),
-                setting(
-                    "gang_execution_environment=host:test",
-                    OptionSource::Unknown,
                 ),
             ),
             (
@@ -958,20 +924,6 @@ mod tests {
                 (
                     REMOTE_CACHE.to_owned(),
                     setting(CACHE, OptionSource::Unknown),
-                ),
-                (
-                    "repo_env".to_owned(),
-                    setting(
-                        "GANG_EXECUTION_ENVIRONMENT=host:test",
-                        OptionSource::Unknown,
-                    ),
-                ),
-                (
-                    "remote_default_exec_properties".to_owned(),
-                    setting(
-                        "gang_execution_environment=host:test",
-                        OptionSource::Unknown,
-                    ),
                 ),
             ])),
         };

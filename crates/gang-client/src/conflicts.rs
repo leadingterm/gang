@@ -514,7 +514,7 @@ mod tests {
 
     /// The server whose endpoints are Gang's.
     fn server() -> Server<Value> {
-        serde_json::from_str(r#"{"name":"gang","remoteExecutor":"grpcs://gang","remoteCache":"grpcs://gang","defaultIsa":"x86-64","actionEnvironment":"host:test","authentication":{"none":{}}}"#).expect("server")
+        serde_json::from_str(r#"{"name":"gang","remoteExecutor":"grpcs://gang","remoteCache":"grpcs://gang","defaultIsa":"x86-64","authentication":{"none":{}}}"#).expect("server")
     }
 
     /// Writes `contents` to an rc file and finds the conflicts of `settings`, each

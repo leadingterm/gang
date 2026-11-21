@@ -166,7 +166,7 @@ gang_types::string_enum! {
         Isolated = "isolated",
         /// Probes network access without requesting the network capability.
         NetworkIsolated = "network_isolated",
-        /// Probes network access with `gang_network_access = requested`.
+        /// Probes network access with `network = requested`.
         NetworkRequested = "network_requested",
         /// Records that it ran; sets the `ISA` exec property explicitly.
         Pinned = "pinned",

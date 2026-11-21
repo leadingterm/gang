@@ -32,33 +32,6 @@ struct Candidate {
     release_first: bool,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum EnvironmentClass {
-    #[default]
-    CurrentMatching,
-    Unknown,
-    KnownStale,
-}
-
-impl EnvironmentClass {
-    fn observe(
-        self,
-        environment: Option<&gang_types::ActionEnvironment>,
-        current: &gang_types::ActionEnvironment,
-    ) -> Self {
-        let observed = match environment {
-            Some(environment) if environment == current => Self::CurrentMatching,
-            Some(_) => Self::KnownStale,
-            None => Self::Unknown,
-        };
-        self.min(observed)
-    }
-
-    fn is_stale(self) -> bool {
-        self != Self::CurrentMatching
-    }
-}
-
 /// All connections contribute to physical occupancy, including partially applied cordons.
 #[derive(Debug, Default, Clone, Copy)]
 struct Hosted {
@@ -68,8 +41,6 @@ struct Hosted {
     serving: bool,
     busy: bool,
     running: u32,
-    queued: bool,
-    environment: EnvironmentClass,
 }
 
 impl Hosted {
@@ -118,7 +89,6 @@ struct Draining {
     release_first: bool,
     owned: bool,
     resumed: bool,
-    environment: EnvironmentClass,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -146,7 +116,6 @@ struct Census {
     release_first: u32,
     busy_cordons: u32,
     unconnected_cordon: bool,
-    stale_retained: u32,
 }
 
 #[derive(Debug, Default)]
@@ -286,19 +255,15 @@ impl Reconciler {
         }
         Self::charge_running(fleets, hosted);
         for action in &snapshot.queued {
-            let mut matching = gang_types::FleetSet::EMPTY;
             for index in action.candidates {
                 if let Some(fleet) = fleets.get_mut(index) {
                     fleet.outlook.candidates = fleet.outlook.candidates.saturating_add(1);
-                    if action.environment.as_ref() == Some(&fleet.policy.action_environment) {
-                        matching.insert(index);
-                    }
                 }
             }
-            let chosen = place(matching, action.resources, |index| {
+            let chosen = place(action.candidates, action.resources, |index| {
                 fleets.get(index).map(|f| (&f.policy, f.outlook.demand))
             });
-            self.planner.attribute(chosen, matching);
+            self.planner.attribute(chosen, action.candidates);
             if let Some(fleet) = chosen.and_then(|index| fleets.get_mut(index)) {
                 fleet.outlook.demand.add_queued(action.resources);
                 fleet.outlook.queued = fleet.outlook.queued.saturating_add(1);
@@ -353,10 +318,7 @@ impl Reconciler {
                     .id
                     .instance_name()
                     .is_some_and(|id| hosted.is_cordoned(index, id));
-                if !worker.draining
-                    && !owned
-                    && worker.environment.as_ref() == Some(&fleet.policy.action_environment)
-                {
+                if !worker.draining && !owned {
                     fleet.outlook.demand.add_running(worker.running_actions);
                 }
             }
@@ -373,7 +335,6 @@ impl Reconciler {
                 .iter_mut()
                 .enumerate()
                 .find(|(_, f)| f.policy.name == worker.fleet)
-                && worker.environment.as_ref() == Some(&fleet.policy.action_environment)
                 && !worker
                     .id
                     .instance_name()
@@ -446,7 +407,7 @@ impl Reconciler {
             };
             capacity.draining = self.draining[draining..]
                 .iter()
-                .filter(|d| d.owned && !d.environment.is_stale())
+                .filter(|d| d.owned)
                 .count()
                 .saturating_into();
             self.census[index] = FleetCensus {
@@ -468,27 +429,9 @@ impl Reconciler {
     ) -> Hosted {
         let workers = &pass.hosted.snapshot().workers;
         let mut hosted = Hosted::default();
-        let mut environment = EnvironmentClass::KnownStale;
         for index in pass.hosted.workers_on(&view.policy.name, &instance.id) {
-            environment = environment.observe(
-                workers[index].environment.as_ref(),
-                &view.policy.action_environment,
-            );
             let seen = self.observations.observe_worker(&workers[index], pass.now);
             hosted.add(index, seen, workers);
-            if !hosted.queued
-                && workers[index].environment.as_ref() != Some(&view.policy.action_environment)
-            {
-                hosted.queued = pass
-                    .hosted
-                    .snapshot()
-                    .queued
-                    .iter()
-                    .any(|action| action.environment == workers[index].environment);
-            }
-        }
-        if hosted.worker.is_some() {
-            hosted.environment = environment;
         }
         hosted
     }
@@ -561,17 +504,6 @@ impl Reconciler {
             self.terminate(pass, view, &instance.id, TerminationCause::Orphan, plan);
             return Standing::Ordered;
         };
-        if hosted.environment.is_stale() {
-            census.stale_retained = census.stale_retained.saturating_add(1);
-            return self.classify_stale(
-                pass,
-                view,
-                entry,
-                hosted,
-                (worker, owned, draining_since.unwrap_or(pass.now)),
-                plan,
-            );
-        }
         if owned || !hosted.serving {
             return self.classify_drain(
                 pass,
@@ -603,44 +535,6 @@ impl Reconciler {
         Standing::Usable
     }
 
-    fn classify_stale(
-        &mut self,
-        pass: &Pass<'_>,
-        view: &FleetView<'_>,
-        entry: (usize, &FleetInstance),
-        hosted: Hosted,
-        drain: (usize, bool, Tick),
-        plan: &mut Plan,
-    ) -> Standing {
-        let (worker, owned, _) = drain;
-        if hosted.queued {
-            if owned {
-                plan.steps.push(PlanStep {
-                    fleet: view.index,
-                    action: Action::CancelDrain(
-                        pass.hosted.snapshot().workers[worker].id.clone(),
-                        NeedCause::Demand,
-                    ),
-                });
-            }
-            return Standing::Retained;
-        }
-        if owned || !hosted.serving {
-            return self.classify_drain(pass, view, entry, hosted, drain);
-        }
-        if !hosted.busy && hosted.running == 0 {
-            plan.steps.push(PlanStep {
-                fleet: view.index,
-                action: Action::StartDrain {
-                    worker: pass.hosted.snapshot().workers[worker].id.clone(),
-                    reason: DrainReason::IdleTimeout,
-                    summary: None,
-                },
-            });
-        }
-        Standing::Retained
-    }
-
     fn classify_drain(
         &mut self,
         pass: &Pass<'_>,
@@ -649,20 +543,12 @@ impl Reconciler {
         hosted: Hosted,
         (worker, owned, since): (usize, bool, Tick),
     ) -> Standing {
-        if !hosted.environment.is_stale()
-            && !owned
-            && pass.now.saturating_duration_since(since) < view.policy.boot_grace
-        {
+        if !owned && pass.now.saturating_duration_since(since) < view.policy.boot_grace {
             return Standing::Transient;
         }
         let end = if !hosted.serving && hosted.running == 0 {
-            Some(if hosted.environment.is_stale() {
-                TerminationCause::StaleEnvironment
-            } else {
-                TerminationCause::DrainFinished
-            })
+            Some(TerminationCause::DrainFinished)
         } else if !hosted.serving
-            && hosted.environment != EnvironmentClass::KnownStale
             && pass.now.saturating_duration_since(since) >= view.policy.max_drain_wait
         {
             Some(TerminationCause::MaxDrainWait)
@@ -687,7 +573,6 @@ impl Reconciler {
             release_first: instance.release_first,
             owned,
             resumed: false,
-            environment: hosted.environment,
         });
         Standing::Retained
     }
@@ -712,26 +597,12 @@ impl Reconciler {
             .saturating_into();
         let retaining: u32 = self.draining[range]
             .iter()
-            .filter(|d| !d.environment.is_stale() && !d.resumed && d.end.is_none() && d.running > 0)
+            .filter(|d| !d.resumed && d.end.is_none() && d.running > 0)
             .count()
             .saturating_into();
         let from = view.supply.desired.saturating_sub(terminated);
-        let stale_terminated: u32 = self.draining[self.census[index].draining.clone()]
-            .iter()
-            .filter(|d| d.environment.is_stale() && d.end.is_some())
-            .count()
-            .saturating_into();
         let max = view.policy.instances.max().get();
-        let to = purchase_target(
-            view.needed,
-            retaining.saturating_add(census.stale_retained.saturating_sub(stale_terminated)),
-            max,
-        );
-        let to = if census.stale_retained > 0 {
-            to.min(from.saturating_add(max.saturating_sub(census.live)))
-        } else {
-            to
-        };
+        let to = purchase_target(view.needed, retaining, max);
         if view.supply.abandoned > 0 && resumed == 0 {
             plan.steps.push(PlanStep {
                 fleet: index,
@@ -814,7 +685,7 @@ impl Reconciler {
         let mut extra = SlotVector::default();
         for position in range.clone() {
             let drain = self.draining[position];
-            if !drain.owned || drain.environment.is_stale() {
+            if !drain.owned {
                 continue;
             }
             let ordinary = remaining_rescues > 0;
@@ -1020,31 +891,6 @@ fn victim_order(
 mod tests {
     use super::*;
     use gang_testkit::{TestResult, worker_id};
-
-    #[test]
-    fn environment_class_aggregates_mixed_generations_in_any_order() -> TestResult {
-        let current = "host:current".parse()?;
-        let old = "host:old".parse()?;
-        let classify = |values: &[Option<&gang_types::ActionEnvironment>]| {
-            values
-                .iter()
-                .fold(EnvironmentClass::KnownStale, |class, value| {
-                    class.observe(*value, &current)
-                })
-        };
-        assert_eq!(classify(&[Some(&old)]), EnvironmentClass::KnownStale);
-        assert_eq!(classify(&[Some(&old), None]), EnvironmentClass::Unknown);
-        assert_eq!(classify(&[None, Some(&old)]), EnvironmentClass::Unknown);
-        assert_eq!(
-            classify(&[Some(&old), None, Some(&current)]),
-            EnvironmentClass::CurrentMatching
-        );
-        assert_eq!(
-            classify(&[Some(&current), None, Some(&old)]),
-            EnvironmentClass::CurrentMatching
-        );
-        Ok(())
-    }
 
     fn fixture(
         minimum: u32,

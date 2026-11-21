@@ -9,7 +9,7 @@ use gang_spi::{FleetSupply, InstanceCordon, PortError};
 use gang_types::{FleetCatalog, FleetName, InstanceId, WorkerId, property};
 use nativelink_error::{Code, Error, make_err};
 use nativelink_scheduler::worker::Worker;
-use nativelink_scheduler::worker_scheduler::{WorkerScheduler, WorkerSummary};
+use nativelink_scheduler::worker_scheduler::WorkerScheduler;
 use nativelink_util::action_messages::WorkerId as NativeWorkerId;
 use nativelink_util::platform_properties::PlatformPropertyValue;
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -60,10 +60,6 @@ impl InstanceCordons {
         }
     }
 
-    pub(crate) fn catalog(&self) -> &Arc<FleetCatalog> {
-        &self.catalog
-    }
-
     fn fleet_index(&self, name: &str) -> Option<usize> {
         self.catalog
             .fleets()
@@ -76,23 +72,6 @@ impl InstanceCordons {
             return false;
         };
         WorkerId::instance_name_from_str(worker).is_some_and(|instance| state.owns(fleet, instance))
-    }
-
-    /// Drained connections that can resume through a controller-only cordon cancellation.
-    pub(crate) async fn resumable<'a>(&self, workers: &'a [WorkerSummary]) -> Vec<&'a str> {
-        let state = self.state.read().await;
-        workers
-            .iter()
-            .filter(|worker| {
-                worker.is_draining
-                    && !state.self_drains.contains(worker.id.as_str())
-                    && worker
-                        .platform_properties
-                        .get(property::FLEET)
-                        .is_some_and(|fleet| self.controller_drain(&state, fleet, &worker.id))
-            })
-            .map(|worker| worker.id.as_str())
-            .collect()
     }
 
     /// Applies controller intent before admission, holding it stable across the inner await.
@@ -569,7 +548,7 @@ mod tests {
                 &FleetName::try_new(name)?,
                 Isa::Aarch64,
                 &"bwrap",
-                Some(&"host:test".parse().expect("valid environment")),
+                &"host:test".parse().expect("valid environment"),
                 Resources {
                     vcpus: 4,
                     memory: Bytes::new(1 << 30),

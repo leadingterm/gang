@@ -19,7 +19,7 @@ use support::required_path;
 /// Test timeout for the process and its prompt reader.
 const LIMIT: Duration = Duration::from_mins(1);
 /// An anonymous server does not need login or credentials.
-const SERVER: &str = r#"{"name":"server","remoteExecutor":"grpc://127.0.0.1:8980","remoteCache":"grpc://127.0.0.1:8980","defaultIsa":"x86-64","actionEnvironment":"host:test","authentication":{"none":{}}}"#;
+const SERVER: &str = r#"{"name":"server","remoteExecutor":"grpc://127.0.0.1:8980","remoteCache":"grpc://127.0.0.1:8980","defaultIsa":"x86-64","authentication":{"none":{}}}"#;
 /// Existing workspace contents must be preserved exactly.
 const WORKSPACE_RC: &str = "# workspace settings\nbuild --keep_going\n";
 /// Existing home contents exercise both endpoint and credential conflicts.
@@ -95,8 +95,6 @@ impl Fixture {
         let clean_options = [
             json!({"optionName":"remote_executor", "optionValue":"grpc://127.0.0.1:8980"}),
             json!({"optionName":"remote_cache", "optionValue":"grpc://127.0.0.1:8980"}),
-            json!({"optionName":"repo_env", "optionValue":"GANG_EXECUTION_ENVIRONMENT=host:test"}),
-            json!({"optionName":"remote_default_exec_properties", "optionValue":"gang_execution_environment=host:test"}),
         ];
         let clean_original = [
             json!({"optionName":"rc_source", "optionValue":workspace.join(".gang/bazelrc")}),

@@ -14,12 +14,15 @@ pub trait CacheStorePort: Send + Sync {
     /// The cache's own error when the store cannot be described.
     fn content_store(&self) -> Result<RenderedStoreSpec, PortError>;
 
-    /// The store that holds action results.
+    /// The action-result store for the server-owned environment version.
     ///
     /// # Errors
     ///
     /// The cache's own error when the store cannot be described.
-    fn action_store(&self) -> Result<RenderedStoreSpec, PortError>;
+    fn action_store(
+        &self,
+        environment: &gang_types::EnvironmentName,
+    ) -> Result<RenderedStoreSpec, PortError>;
 
     /// How workers reach the two stores: opened directly, or through the controller when only the controller can open them.
     fn worker_access(&self) -> StoreAccess;

@@ -213,15 +213,14 @@ impl Fleets {
         }
     }
 
-    /// Retires an instance. Warm-pool reuse is allowed only for an ordinary idle retirement
-    /// whose launch-template id and immutable version match the group's current template.
+    /// Retires an instance. Warm-pool reuse is allowed only when its launch-template id and
+    /// immutable version match the group's current template.
     /// Unknown or stale generations are terminated with an atomic desired-capacity decrement.
     pub(crate) async fn terminate(
         &self,
         held: &Held,
         fleet: Fleet<'_, AwsFleetOptions>,
         instance: &InstanceId,
-        reason: gang_spi::RetirementReason,
     ) -> Result<(), AwsError> {
         let names = GroupNames::of(fleet);
         let output = self.describe_groups(names.iter()).await?;
@@ -237,7 +236,6 @@ impl Fleets {
         }
         if member.lifecycle == InstanceLifecycle::InService
             && group.reuse_on_scale_in
-            && reason == gang_spi::RetirementReason::Idle
             && member.current_generation
         {
             return self.release(held, group, member, instance).await;
@@ -1133,12 +1131,7 @@ mod tests {
         let result = gang_testkit::fence::with_expired_held(async |held| {
             harness
                 .fleets
-                .terminate(
-                    held,
-                    test_fleet.view(),
-                    &instance,
-                    gang_spi::RetirementReason::Idle,
-                )
+                .terminate(held, test_fleet.view(), &instance)
                 .await
         })
         .await;
@@ -1164,7 +1157,6 @@ mod tests {
                     held,
                     fleet(FLEET).expect("test value is valid").view(),
                     &InstanceId::try_new("i-a").expect("test value is valid"),
-                    gang_spi::RetirementReason::Idle,
                 )
                 .await
         })
@@ -1200,24 +1192,14 @@ mod tests {
         gang_testkit::fence::with_held(async |held| {
             harness
                 .fleets
-                .terminate(
-                    held,
-                    fleet.view(),
-                    &instance,
-                    gang_spi::RetirementReason::Idle,
-                )
+                .terminate(held, fleet.view(), &instance)
                 .await
         })
         .await?;
         gang_testkit::fence::with_held(async |held| {
             harness
                 .fleets
-                .terminate(
-                    held,
-                    fleet.view(),
-                    &instance,
-                    gang_spi::RetirementReason::Idle,
-                )
+                .terminate(held, fleet.view(), &instance)
                 .await
         })
         .await?;
@@ -1238,7 +1220,6 @@ mod tests {
                     held,
                     fleet(FLEET).expect("test value is valid").view(),
                     &InstanceId::try_new("i-t").expect("test value is valid"),
-                    gang_spi::RetirementReason::Idle,
                 )
                 .await
         })
@@ -1260,7 +1241,6 @@ mod tests {
                     held,
                     fleet(FLEET).expect("test value is valid").view(),
                     &InstanceId::try_new("i-gone").expect("test value is valid"),
-                    gang_spi::RetirementReason::Idle,
                 )
                 .await
         })
@@ -1283,7 +1263,6 @@ mod tests {
                     held,
                     fleet(FLEET).expect("test value is valid").view(),
                     &InstanceId::try_new("i-x").expect("test value is valid"),
-                    gang_spi::RetirementReason::Idle,
                 )
                 .await
         })
@@ -1312,7 +1291,6 @@ mod tests {
                     held,
                     fleet(FLEET).expect("test value is valid").view(),
                     &InstanceId::try_new("i-x").expect("test value is valid"),
-                    gang_spi::RetirementReason::Idle,
                 )
                 .await
         })
@@ -1338,7 +1316,6 @@ mod tests {
                     held,
                     fleet(FLEET).expect("test value is valid").view(),
                     &InstanceId::try_new("i-p").expect("test value is valid"),
-                    gang_spi::RetirementReason::Idle,
                 )
                 .await
         })
@@ -1385,7 +1362,6 @@ mod tests {
                     held,
                     fleet("fleet-a").expect("test value is valid").view(),
                     &InstanceId::try_new("i-b").expect("test value is valid"),
-                    gang_spi::RetirementReason::Idle,
                 )
                 .await
         })
@@ -1600,7 +1576,6 @@ mod tests {
                     held,
                     fleet(FLEET).expect("test value is valid").view(),
                     &InstanceId::try_new("i-r").expect("test value is valid"),
-                    gang_spi::RetirementReason::Idle,
                 )
                 .await
         })

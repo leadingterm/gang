@@ -210,7 +210,6 @@ pub fn tls_settings() -> ServerSettings {
         poll_interval: NonZeroDuration::from_secs(1),
         client_action_timeout: NonZeroDuration::from_mins(1),
         default_isa: Isa::X86_64,
-        action_environment: "host:test".parse().expect("valid test environment"),
         endpoint: endpoint("https://gang.example.test"),
         transport: TransportSettings::Tls(TlsSettings {
             trust_domain: TrustDomain::try_new("example.test").expect("test trust domain is valid"),

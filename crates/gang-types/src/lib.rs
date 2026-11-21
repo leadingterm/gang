@@ -68,7 +68,7 @@ pub mod property;
 pub mod __private;
 
 pub use absolute_path::{AbsolutePathBuf, AbsolutePathError};
-pub use action_environment::ActionEnvironment;
+pub use action_environment::{ActionEnvironment, EnvironmentName};
 pub use action_policy::{
     ActionPolicyError, Capability, EgressPolicyError, FORBIDDEN_IPV4, FORBIDDEN_IPV6,
     FleetActionPolicy, NetworkRequest, PUBLIC_IPV6, PublicEgressPolicy, ResourceCeilings,
@@ -86,8 +86,8 @@ pub use bytes::Bytes;
 pub use ca_pin::CaPin;
 pub use error_chain::{ErrorChain, error_chain};
 pub use errors::{
-    ActionEnvironmentError, BuildIdError, CaPinError, FleetCountError, FleetIndexError,
-    IdentityError, NameError, PemError, QuantityError, SourceIdError,
+    ActionEnvironmentError, BuildIdError, CaPinError, EnvironmentNameError, FleetCountError,
+    FleetIndexError, IdentityError, NameError, PemError, QuantityError, SourceIdError,
 };
 pub use fix::Fix;
 pub use fleet::{Fleet, WorkerLifetime};

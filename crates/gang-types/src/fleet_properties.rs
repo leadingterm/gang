@@ -59,12 +59,11 @@ impl FleetProperties {
     /// The entries are the fleet, ISA, sandbox, action environment, `cpu_count`,
     /// `cpu_millicores`, `memory_kb` and `disk_kb`; resource entries are minimums,
     /// with memory and disk in KiB. Provisioner options follow as exact entries.
-    /// An absent environment is encoded as an empty exact value for internal matching only.
     pub fn new(
         name: &FleetName,
         isa: Isa,
         sandbox: &impl Display,
-        environment: Option<&ActionEnvironment>,
+        environment: &ActionEnvironment,
         instance: Resources,
         actions: &FleetActionPolicy,
         options: impl IntoIterator<Item = (&'static str, String)>,
@@ -91,7 +90,7 @@ impl FleetProperties {
             },
             Entry {
                 key: property::ACTION_ENVIRONMENT,
-                value: environment.map_or_else(String::new, ToString::to_string),
+                value: environment.to_string(),
                 rule: Rule::Exact,
                 capacity: None,
             },
@@ -219,11 +218,9 @@ impl FleetProperties {
     }
 
     /// Iterates over every property in registration order, as the worker registers it.
-    /// An absent execution identity stays absent on the public registration wire.
     pub fn worker_properties(&self) -> impl Iterator<Item = (&'static str, &str)> + '_ {
         self.entries
             .iter()
-            .filter(|entry| entry.key != property::ACTION_ENVIRONMENT || !entry.value.is_empty())
             .map(|entry| (entry.key, entry.value.as_str()))
     }
 
@@ -239,6 +236,9 @@ impl FleetProperties {
     /// Iterates over every entry's key and how it matches, in registration order.
     pub(crate) fn declarations(&self) -> impl Iterator<Item = (&'static str, MatchKind)> + '_ {
         self.entries.iter().map(|entry| {
+            if entry.key == property::ACTION_ENVIRONMENT {
+                return (entry.key, MatchKind::Ignored);
+            }
             let kind = match entry.rule {
                 Rule::Exact => MatchKind::Exact,
                 Rule::Minimum(_) => MatchKind::Minimum,
@@ -277,7 +277,7 @@ mod tests {
             &name,
             Isa::X86_64,
             &"bwrap",
-            Some(&"host:test".parse().unwrap()),
+            &"host:test".parse().unwrap(),
             Resources {
                 vcpus: 15,
                 memory: Bytes::new(29 << 30),
@@ -296,40 +296,6 @@ mod tests {
     #[test]
     fn name_is_the_fleet_name() {
         assert_eq!(gang_x86().name(), "gang-x86");
-    }
-
-    #[test]
-    fn absent_identity_is_not_advertised_but_matches_internal_absence() {
-        let properties = FleetProperties::new(
-            &FleetName::try_new("unscoped").unwrap(),
-            Isa::X86_64,
-            &"bwrap",
-            None,
-            Resources {
-                vcpus: 8,
-                memory: Bytes::new(16 << 30),
-                disk: Bytes::new(100 << 30),
-            },
-            &FleetActionPolicy::default(),
-            [("capacity", "spot".to_owned())],
-        );
-        assert!(
-            properties
-                .worker_properties()
-                .all(|(key, _)| key != property::ACTION_ENVIRONMENT)
-        );
-        assert_eq!(properties.get(property::ACTION_ENVIRONMENT), Some(""));
-        assert_eq!(
-            properties.options().collect::<Vec<_>>(),
-            [("capacity", "spot")]
-        );
-        let catalog = FleetCatalog::try_new(vec![properties]).unwrap();
-        assert!(catalog.accepting(|_| None).contains(0));
-        assert!(
-            catalog
-                .accepting(|key| (key == property::ACTION_ENVIRONMENT).then_some("host:test"))
-                .is_empty()
-        );
     }
 
     #[test]
@@ -352,7 +318,7 @@ mod tests {
             &name,
             Isa::X86_64,
             &"bwrap",
-            Some(&"host:test".parse().unwrap()),
+            &"host:test".parse().unwrap(),
             instance,
             &FleetActionPolicy::default(),
             [("capacity", "spot".to_owned()), ("zone", "west".to_owned())],
@@ -366,7 +332,7 @@ mod tests {
             &name,
             Isa::X86_64,
             &"bwrap",
-            Some(&"host:test".parse().unwrap()),
+            &"host:test".parse().unwrap(),
             instance,
             &FleetActionPolicy::default(),
             [],
@@ -384,7 +350,7 @@ mod tests {
                 ("fleet", "gang-x86"),
                 ("ISA", "x86-64"),
                 ("sandbox", "bwrap"),
-                ("gang_execution_environment", "host:test"),
+                ("gang_action_environment", "host:test"),
                 ("cpu_count", "15"),
                 ("cpu_millicores", "15000"),
                 ("memory_kb", "30408704"),
@@ -411,7 +377,7 @@ mod tests {
                 ("fleet", MatchKind::Exact),
                 ("ISA", MatchKind::Exact),
                 ("sandbox", MatchKind::Exact),
-                ("gang_execution_environment", MatchKind::Exact),
+                ("gang_action_environment", MatchKind::Ignored),
                 ("cpu_count", MatchKind::Minimum),
                 ("cpu_millicores", MatchKind::Minimum),
                 ("memory_kb", MatchKind::Minimum),
@@ -430,7 +396,7 @@ mod tests {
                 ("fleet", "gang-x86", Rule::Exact),
                 ("ISA", "x86-64", Rule::Exact),
                 ("sandbox", "bwrap", Rule::Exact),
-                ("gang_execution_environment", "host:test", Rule::Exact),
+                ("gang_action_environment", "host:test", Rule::Exact),
                 ("cpu_count", "15", Rule::Minimum(15)),
                 ("cpu_millicores", "15000", Rule::Minimum(15000)),
                 ("memory_kb", "30408704", Rule::Minimum(30_408_704)),
@@ -493,7 +459,7 @@ mod tests {
             &name,
             Isa::X86_64,
             &"bwrap",
-            Some(&"host:test".parse().unwrap()),
+            &"host:test".parse().unwrap(),
             instance,
             &actions,
             [("capacity", "spot".into())],

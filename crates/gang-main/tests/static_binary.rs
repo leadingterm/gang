@@ -23,7 +23,7 @@ type TestResult = Result<(), Box<dyn Error>>;
 const CHILD_LIMIT: Duration = Duration::from_mins(1);
 
 /// Server information returned to the Bazel rc command.
-const SERVER_INFO: &str = r#"{"name":"server","remoteExecutor":"grpc://127.0.0.1:8980","remoteCache":"grpc://127.0.0.1:8980","defaultIsa":"x86-64","actionEnvironment":"host:test","authentication":{"token":{"login":{"google":{"issuer_url":"https://accounts.example.com","audience":"gang","principal_claim":"email","login":{"scopes":["openid","email"]}}}}}}"#;
+const SERVER_INFO: &str = r#"{"name":"server","remoteExecutor":"grpc://127.0.0.1:8980","remoteCache":"grpc://127.0.0.1:8980","defaultIsa":"x86-64","authentication":{"token":{"login":{"google":{"issuer_url":"https://accounts.example.com","audience":"gang","principal_claim":"email","login":{"scopes":["openid","email"]}}}}}}"#;
 
 /// Runs `command` to completion within `limit` and returns its exit status.
 fn status_within(command: &mut Command, limit: Duration) -> Result<ExitStatus, Box<dyn Error>> {

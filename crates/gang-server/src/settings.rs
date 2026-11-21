@@ -125,8 +125,6 @@ pub struct ServerSettings {
     /// The instruction set clients use for actions that name none; the server sends it in
     /// `Server`.
     pub default_isa: Isa,
-    /// The launch environment advertised to clients.
-    pub action_environment: gang_types::ActionEnvironment,
     /// The public endpoint the server is reached at; its host is named in the server
     /// certificates.
     pub endpoint: PublicEndpoint,

@@ -1,6 +1,6 @@
 //! Mixed-release controller handoff with an old client and an enrolled old worker.
 //! The held build keeps the old release's rendered rc byte-for-byte; fresh work uses
-//! a separately rendered candidate rc, and the retired old client must require setup.
+//! both the original rc and a separately rendered candidate rc.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -115,9 +115,6 @@ fn capture_in_flight(attempts: &Attempts) -> InFlight {
 
 fn uninterrupted(frozen: &InFlight, final_attempts: &Attempts) -> bool {
     !frozen.is_empty()
-        && final_attempts
-            .values()
-            .all(|attempt| frozen.values().any(|&(worker, _)| worker == attempt.worker))
         && frozen.iter().all(|(key, &(worker, start))| {
             final_attempts.get(key).is_some_and(|attempt| {
                 attempt.worker == worker && attempt.start == start && attempt.end.is_some()
@@ -260,7 +257,7 @@ impl HeldDrainWitness {
     fn receipt(&self) -> String {
         let direct = &self.direct;
         format!(
-            "drain_cold_mints=1, leader-RPC/name witness not measured (known limit), witness apply offsets drain/start/end/deadline={:?}/{:?}/{:?}/{:?}, witness-relative shared start/end={:?}/{:?}, shared status={}, marker absent={}, shared NLB verification start/end={:?}/{:?}, shared token valid={}, NLB mint start/end={:?}/{:?}, new NLB verification start/end={:?}/{:?}, new token valid={}, held before/after={:?}/{:?}, incoming owner rechecked={}",
+            "drain_cold_mints=1, leader-RPC/name witness not measured (known limit), witness apply offsets drain/start/end/deadline={:?}/{:?}/{:?}/{:?}, witness-relative shared start/end={:?}/{:?}, shared status={}, marker absent={}, shared NLB verification start/end={:?}/{:?}, shared token valid={}, NLB mint start/end={:?}/{:?}, new NLB verification start/end={:?}/{:?}, new token valid={}, old build/worker before={:?}, after={:?}, incoming owner rechecked={}",
             self.drain_started,
             self.started,
             self.finished,
@@ -277,8 +274,16 @@ impl HeldDrainWitness {
             direct.verification_started,
             direct.verification_finished,
             direct.token_valid,
-            self.before,
-            self.after,
+            (
+                self.before.build_unfinished,
+                self.before.hold_unreleased,
+                self.before.old_live
+            ),
+            (
+                self.after.build_unfinished,
+                self.after.hold_unreleased,
+                self.after.old_live
+            ),
             self.owner_rechecked,
         )
     }
@@ -345,17 +350,14 @@ impl Handoff<'_> {
             .old_identity
             .as_ref()
             .ok_or_else(|| E2eError::system("original held identity missing"))?;
-        if worker_executable(*worker_pid)? != *executable {
-            return Err(E2eError::system("original held worker process changed"));
-        }
         let state = HeldState {
             build_unfinished,
             hold_unreleased,
-            old_live: true,
+            old_live: worker_executable(*worker_pid).is_ok_and(|actual| actual == *executable),
         };
         if !state.valid() {
             return Err(E2eError::system(
-                "drain witness requires original unfinished held build",
+                "drain witness requires original unfinished held build and worker",
             ));
         }
         Ok(state)
@@ -874,12 +876,12 @@ fn final_verdict(input: &VerdictInputs<'_>) -> Vec<Check> {
         .map(|attempt| attempt.worker)
         .collect();
     let attempts = input.initial_attempts.len() + input.post_attempts.len();
-    let once = exact_attempts(input.initial_attempts, PROBES.len())
-        && exact_attempts(input.post_attempts, 1);
-    let ok = build_ok(input.initial_outcome, input.initial_evidence, 8)
-        && build_ok(input.post_outcome, input.post_evidence, 1)
-        && once
+    let ok = build_ok(input.initial_outcome, input.initial_evidence, PROBES.len())
+        && exact_attempts(input.initial_attempts, PROBES.len())
         && uninterrupted(input.in_flight, input.initial_attempts)
+        && build_ok(input.post_outcome, input.post_evidence, 1)
+        && exact_attempts(input.post_attempts, 1)
+        && input.in_flight.len() == 2
         && input.status.success()
         && input.leader
         && input.cold_mints == 2
@@ -941,15 +943,7 @@ fn final_verdict(input: &VerdictInputs<'_>) -> Vec<Check> {
         input.elapsed,
         input.drain.stop_started,
     );
-    let mut checks = vec![detail("rolling upgrade", ok, metrics)];
-    if !build_ok(input.initial_outcome, input.initial_evidence, 8) {
-        checks.push(detail(
-            "initial held build completion after handoff",
-            false,
-            input.initial_outcome.exit_summary(),
-        ));
-    }
-    checks
+    vec![detail("rolling upgrade", ok, metrics)]
 }
 
 struct Releases<'a> {
@@ -982,10 +976,6 @@ impl OldClient {
     }
 }
 
-fn old_client_rejected(outcome: &BuildOutcome) -> bool {
-    outcome.exit_code.is_some_and(|code| code != 0) && outcome.stderr.contains("run gang setup")
-}
-
 struct LoggedBuild {
     driver: Bazel,
     run: Run,
@@ -998,6 +988,7 @@ struct Builds {
     go: PathBuf,
     initial: LoggedBuild,
     post: LoggedBuild,
+    old_post: LoggedBuild,
 }
 
 struct Upgrade<'a> {
@@ -1142,11 +1133,13 @@ fn prepare_builds(cluster: &Cluster<'_>) -> Result<Builds> {
     )?;
     let initial_run = Run::fresh()?;
     let post_run = Run::fresh()?;
+    let old_post_run = Run::fresh()?;
     journal.prepare_attempts(
         initial_run.as_ref(),
         PROBES.iter().map(|probe| probe.as_str()),
     )?;
     journal.prepare_attempts(post_run.as_ref(), [Probe::ControllerLoss0.as_str()])?;
+    journal.prepare_attempts(old_post_run.as_ref(), [Probe::ControllerLoss0.as_str()])?;
     let make = |name: &str, run| {
         let bep = signal.with_file_name(format!("upgrade-{name}.bep"));
         let rpc = signal.with_file_name(format!("upgrade-{name}.rpc"));
@@ -1163,6 +1156,7 @@ fn prepare_builds(cluster: &Cluster<'_>) -> Result<Builds> {
         go: signal.with_file_name("go"),
         initial: make("initial", initial_run),
         post: make("post", post_run),
+        old_post: make("old-post", old_post_run),
     })
 }
 
@@ -1179,6 +1173,14 @@ pub(crate) fn rolling_upgrade<'a>(
         &releases.old.binary,
         &releases.old_fixture,
     )?;
+    upgrade_cluster(cluster, invocation)
+}
+
+pub(crate) fn upgrade_cluster<'a>(
+    cluster: Cluster<'a>,
+    invocation: &'a DeploymentInputs,
+) -> Result<Vec<Check>> {
+    let releases = select_releases(invocation)?;
     let client = prepare_client(&cluster)?;
     let builds = prepare_builds(&cluster)?;
     Upgrade {
@@ -1347,8 +1349,14 @@ impl Upgrade<'_> {
         let (initial, promotion) =
             self.finish_initial(observation.build, observation.attempts, promotion)?;
         self.client.assert_original_rc()?;
-        let rejected = self.reject_old_client(scope, hold, &initial.attempts)?;
-        let post = self.post_build(scope, hold);
+        let old_post = self.post_build(
+            scope,
+            hold,
+            &self.builds.old_post,
+            self.client.remote.clone(),
+        )?;
+        let candidate_remote = self.candidate_remote()?;
+        let post = self.post_build(scope, hold, &self.builds.post, candidate_remote);
         let outcome = monitor.finish()?;
         let mut checks = self.report(
             &initial,
@@ -1358,7 +1366,18 @@ impl Upgrade<'_> {
             &outcome,
         )?;
         self.client.assert_original_rc()?;
-        checks.push(rejected);
+        checks.push(detail(
+            "fresh old client build",
+            build_ok(&old_post.outcome, &old_post.evidence, 1)
+                && exact_attempts(&old_post.attempts, 1),
+            format!(
+                "{}, failed actions={}, successful actions={}, attempts={}",
+                old_post.outcome.exit_summary(),
+                old_post.evidence.failed_actions,
+                old_post.evidence.successful_actions,
+                old_post.attempts.len(),
+            ),
+        ));
         Ok(checks)
     }
 
@@ -1439,58 +1458,6 @@ impl Upgrade<'_> {
         Err(error)
     }
 
-    fn reject_old_client<'scope, 'env, K>(
-        &'env self,
-        scope: &'scope Scope<'scope, 'env>,
-        hold: &Hold<'env, K>,
-        attempts: &Attempts,
-    ) -> Result<Check>
-    where
-        'env: 'scope,
-        K: Fn(Option<&str>) -> Result<()>,
-    {
-        let stack = self.cluster.stack();
-        let workers: BTreeSet<_> = attempts.values().map(|attempt| attempt.worker).collect();
-        let started = Instant::now();
-        let timeout = stack.settings().startup_timeout;
-        for worker in &workers {
-            if !process::await_gone(*worker, timeout.saturating_sub(started.elapsed()))? {
-                return Err(E2eError::timeout("original old workers to exit", timeout));
-            }
-        }
-        let config = self.cluster.release_config_path(0)?;
-        if !process::workers_of(&process::snapshot(), &config).is_empty() {
-            return Err(E2eError::system(
-                "old release workers remain after retirement",
-            ));
-        }
-        self.client.assert_original_rc()?;
-        // A fresh run changes the action digest, so an old cache hit cannot hide rejection.
-        let run = Run::fresh()?;
-        self.builds
-            .journal
-            .prepare_attempts(run.as_ref(), [Probe::ControllerLoss0.as_str()])?;
-        let build = hold.build(scope, None, move |_, stop| {
-            stack.bazel().build_until(
-                &self.client.remote,
-                &[Probe::ControllerLoss0],
-                Some(&run),
-                stop,
-            )
-        });
-        let outcome = joined(build)?;
-        self.client.assert_original_rc()?;
-        Ok(detail(
-            "retired old client requires setup",
-            old_client_rejected(&outcome),
-            format!(
-                "old workers gone={workers:?}, original rc unchanged={} bytes, {}",
-                self.client.original_rc.len(),
-                outcome.exit_summary()
-            ),
-        ))
-    }
-
     fn candidate_remote(&self) -> Result<Remote> {
         let stack = self.cluster.stack();
         let home = stack.placement().root().join("upgrade-candidate-client");
@@ -1521,31 +1488,32 @@ impl Upgrade<'_> {
         &'env self,
         scope: &'scope Scope<'scope, 'env>,
         hold: &Hold<'env, K>,
+        build: &'env LoggedBuild,
+        remote: Remote,
     ) -> Result<ObservedBuild>
     where
         'env: 'scope,
         K: Fn(Option<&str>) -> Result<()>,
     {
-        let remote = self.candidate_remote()?;
         let mut attempts = Attempts::new();
         let post = hold.build(scope, None, move |_, stop| {
-            let result = self.builds.post.driver.build_until(
+            let result = build.driver.build_until(
                 &remote,
                 &[Probe::ControllerLoss0],
-                Some(&self.builds.post.run),
+                Some(&build.run),
                 stop,
             );
             self.builds.journal.write_line(JOURNAL_END)?;
             result
         });
         let settled = hold.settle(Ok(()), || {
-            drain(&self.builds.journal, &self.builds.post.run, &mut attempts)
+            drain(&self.builds.journal, &build.run, &mut attempts)
         });
         let result = joined(post);
         settled?;
         Ok(ObservedBuild {
             outcome: result?,
-            evidence: BuildEvidence::read(&self.builds.post.bep, &self.builds.post.rpc)?,
+            evidence: BuildEvidence::read(&build.bep, &build.rpc)?,
             attempts,
         })
     }
@@ -1607,7 +1575,8 @@ mod tests {
     fn old_rc_witness_preserves_exact_rendered_bytes() -> gang_testkit::TestResult {
         let root = tempfile::tempdir()?;
         let rc = root.path().join("old-client.bazelrc");
-        let original = b"build --remote_default_exec_properties=gang_action_environment=identity-roots-v1\r\ncommon --repo_env='GANG_ACTION_ENVIRONMENT=identity-roots-v1'";
+        let original =
+            b"build --remote_executor=grpcs://127.0.0.1:1234\r\ncommon --remote_timeout=60";
         fs::write(&rc, original)?;
         let client = OldClient {
             remote: Remote::Plain {
@@ -1629,24 +1598,6 @@ mod tests {
         fs::write(&rc, original)?;
         client.assert_original_rc()?;
         Ok(())
-    }
-
-    #[test]
-    fn retired_old_client_requires_nonzero_exit_and_setup_guidance() {
-        assert!(old_client_rejected(&BuildOutcome::new(
-            Some(1),
-            "unsupported action environment; run gang setup".to_owned(),
-        )));
-        for (code, text) in [
-            (Some(0), "run gang setup"),
-            (None, "run gang setup"),
-            (Some(1), "no fleet accepts this action"),
-        ] {
-            assert!(!old_client_rejected(&BuildOutcome::new(
-                code,
-                text.to_owned()
-            )));
-        }
     }
 
     #[test]
@@ -1687,7 +1638,7 @@ mod tests {
         for (index, probe) in PROBES.iter().enumerate() {
             let pid = index + 100;
             let action = probe.as_str();
-            let worker = 42;
+            let worker = if index < 2 { 42 } else { 43 };
             if index >= 2 {
                 record_attempt(
                     &format!("run loss start {action} {worker} {pid} 10 exclusive"),
@@ -1722,35 +1673,27 @@ mod tests {
 
     #[test]
     fn frozen_attempts_must_finish_unchanged_without_reexecution() {
-        let (frozen, mut initial, post) = verdict_attempts();
+        let (frozen, mut initial, _) = verdict_attempts();
         assert_eq!(frozen.len(), 2);
         assert!(uninterrupted(&frozen, &initial));
         assert!(exact_attempts(&initial, PROBES.len()));
-        assert!(exact_attempts(&post, 1));
         assert!(!uninterrupted(&InFlight::new(), &initial));
-
         let key = frozen.keys().next().expect("frozen attempt").clone();
-        let attempt = initial.get_mut(&key).expect("initial attempt");
+        let attempt = initial.get_mut(&key).expect("attempt");
         attempt.worker += 1;
         assert!(!uninterrupted(&frozen, &initial));
-        let attempt = initial.get_mut(&key).expect("initial attempt");
+        let attempt = initial.get_mut(&key).expect("attempt");
         attempt.worker -= 1;
         attempt.start += 1;
         assert!(!uninterrupted(&frozen, &initial));
-        let attempt = initial.get_mut(&key).expect("initial attempt");
+        let attempt = initial.get_mut(&key).expect("attempt");
         attempt.start -= 1;
         let end = attempt.end.take();
         assert!(!uninterrupted(&frozen, &initial));
-        initial.get_mut(&key).expect("initial attempt").end = end;
-        let removed = initial.remove(&key).expect("initial attempt");
+        initial.get_mut(&key).expect("attempt").end = end;
+        let removed = initial.remove(&key).expect("attempt");
         assert!(!uninterrupted(&frozen, &initial));
         initial.insert(key.clone(), removed);
-        assert!(uninterrupted(&frozen, &initial));
-        let queued = (PROBES[2].as_str().to_owned(), 102);
-        initial.get_mut(&queued).expect("queued action").worker = 43;
-        assert!(!uninterrupted(&frozen, &initial));
-        initial.get_mut(&queued).expect("queued action").worker = 42;
-
         record_attempt(
             &format!("run loss start {} 43 999 30 exclusive", key.0),
             "run",
@@ -1763,8 +1706,28 @@ mod tests {
             &mut initial,
         )
         .expect("reexecution end");
-        assert!(!uninterrupted(&frozen, &initial));
+        assert!(uninterrupted(&frozen, &initial));
         assert!(!exact_attempts(&initial, PROBES.len()));
+    }
+
+    #[test]
+    fn post_upgrade_attempts_must_finish_once() {
+        let (_, _, mut post) = verdict_attempts();
+        assert!(exact_attempts(&post, 1));
+        post.values_mut().next().expect("post attempt").end = None;
+        assert!(!exact_attempts(&post, 1));
+    }
+
+    fn reexecuted_attempts() -> Attempts {
+        let (_, mut attempts, _) = verdict_attempts();
+        let action = PROBES[0].as_str();
+        for line in [
+            format!("run loss start {action} 43 999 30 exclusive"),
+            format!("run loss end {action} 43 999 40"),
+        ] {
+            record_attempt(&line, "run", &mut attempts).expect("reexecution");
+        }
+        attempts
     }
 
     #[test]
@@ -1837,21 +1800,27 @@ mod tests {
         input.in_flight = &empty;
         assert!(final_verdict(&input).iter().any(Check::is_failure));
         input.in_flight = &in_flight;
-        let (_, mut reexecuted, _) = verdict_attempts();
-        let action = PROBES[0].as_str();
-        record_attempt(
-            &format!("run loss start {action} 43 999 30 exclusive"),
-            "run",
-            &mut reexecuted,
-        )
-        .expect("reexecution start");
-        record_attempt(
-            &format!("run loss end {action} 43 999 40"),
-            "run",
-            &mut reexecuted,
-        )
-        .expect("reexecution end");
+        let reexecuted = reexecuted_attempts();
         input.initial_attempts = &reexecuted;
+        assert!(final_verdict(&input).iter().any(Check::is_failure));
+        input.initial_attempts = &initial_attempts;
+        let interrupted = BuildOutcome::new(Some(1), "build failed".to_owned());
+        input.initial_outcome = &interrupted;
+        assert!(final_verdict(&input).iter().any(Check::is_failure));
+        input.initial_outcome = &initial_outcome;
+        let failures = BuildEvidence {
+            failed_actions: 1,
+            ..initial_evidence
+        };
+        input.initial_evidence = &failures;
+        assert!(final_verdict(&input).iter().any(Check::is_failure));
+        input.initial_evidence = &initial_evidence;
+        let (_, mut changed, _) = verdict_attempts();
+        changed
+            .get_mut(in_flight.keys().next().expect("frozen attempt"))
+            .expect("attempt")
+            .worker += 1;
+        input.initial_attempts = &changed;
         assert!(final_verdict(&input).iter().any(Check::is_failure));
         input.initial_attempts = &initial_attempts;
         for count in [0, 1, 3] {
@@ -1950,7 +1919,7 @@ mod tests {
     }
 
     #[test]
-    fn held_drain_rejects_completed_released_cancelled_or_dead_observations() {
+    fn drain_rejects_completed_released_or_dead_observations() {
         let mutations: [fn(&mut HeldDrainWitness); 7] = [
             |w| w.before.build_unfinished = false,
             |w| w.after.build_unfinished = false,

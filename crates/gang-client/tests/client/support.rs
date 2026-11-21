@@ -142,7 +142,6 @@ pub fn token_info(
         remote_cache: Url::parse("grpcs://cache.example:443").expect("cache url parses"),
         ca_certificate: with_ca.then(|| fixture().ca.clone()),
         default_isa: Isa::X86_64,
-        action_environment: "host:test".parse().expect("valid test environment"),
         version: None,
         authentication: Authentication::Token(TokenAuthentication {
             login: providers
@@ -168,7 +167,6 @@ pub fn no_auth_info() -> Server<serde_json::Value> {
         remote_cache: Url::parse("grpcs://cache.example:443").expect("cache url parses"),
         ca_certificate: None,
         default_isa: Isa::X86_64,
-        action_environment: "host:test".parse().expect("valid test environment"),
         version: None,
         authentication: Authentication::None(NoAuthentication {}),
     }

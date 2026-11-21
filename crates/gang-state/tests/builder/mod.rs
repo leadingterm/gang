@@ -952,7 +952,7 @@ fn unplaceable_plus_charged_equals_queue_total() -> TestResult {
         let second = (i * 3) % (total - first + 1);
         world.snapshot.queued = (0..total)
             .map(|k| queued(u64::from(k) * 10, FleetSet::default()))
-            .collect::<Result<_, _>>()?;
+            .collect();
         world.outlook = vec![
             FleetOutlook {
                 queued: first,
@@ -998,7 +998,7 @@ fn oldest_queue_time_is_the_earliest_queued_since_whatever_the_order() -> TestRe
     world.snapshot.queued = [300, 200, 100]
         .into_iter()
         .map(|since| queued(since, FleetSet::default()))
-        .collect::<Result<_, _>>()?;
+        .collect();
     let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
 
     let cur = fill(&mut builder, &blank(), 1, &world, 1_000, ok(0))?;
@@ -1534,8 +1534,8 @@ fn larger_world() -> Result<World, Box<dyn Error>> {
         worker_state(&w9, "alpha", 1, false, NonZeroU32::new(8))?,
     ];
     world.snapshot.queued = vec![
-        queued(100, fleet_set(&[0, 1]))?,
-        queued(200, fleet_set(&[1]))?,
+        queued(100, fleet_set(&[0, 1])),
+        queued(200, fleet_set(&[1])),
     ];
     world.actions = Some(ActionsSample {
         at: ts(4_000),
@@ -1591,7 +1591,7 @@ fn smaller_world() -> Result<World, Box<dyn Error>> {
     world.outlook = vec![FleetOutlook::default()];
     let w1 = worker_on(&instance_id(1)?)?;
     world.snapshot.workers = vec![worker_state(&w1, "alpha", 0, false, NonZeroU32::new(8))?];
-    world.snapshot.queued = vec![queued(300, fleet_set(&[0]))?];
+    world.snapshot.queued = vec![queued(300, fleet_set(&[0]))];
     world.actions = Some(ActionsSample {
         at: ts(4_500),
         view: ActionsView {
@@ -1795,7 +1795,7 @@ fn recent_samples_follow_completed_passes_and_restarts() -> TestResult {
         world.snapshot.completed = completed;
         world.snapshot.queued = (0..index)
             .map(|n| queued(n as u64, FleetSet::default()))
-            .collect::<Result<_, _>>()?;
+            .collect();
         world.outlook = vec![
             running_outlook(u32::try_from(index).expect("test fleets are few")),
             running_outlook(2),

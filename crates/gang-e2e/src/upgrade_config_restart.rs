@@ -330,7 +330,11 @@ pub(crate) fn config_refetch_restart(
     let cluster =
         Cluster::start_release(invocation, variant, issuer, &inputs.previous.binary, &old)?;
     let result = preserved_restarts(&cluster, &old, &candidate, &inputs.previous.binary);
-    cluster.diagnose(result)
+    let mut checks = cluster.diagnose(result)?;
+    checks.extend(crate::rolling_upgrade::upgrade_cluster(
+        cluster, invocation,
+    )?);
+    Ok(checks)
 }
 
 fn preserved_restarts(

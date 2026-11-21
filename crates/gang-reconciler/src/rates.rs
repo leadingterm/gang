@@ -436,10 +436,10 @@ impl SourceRates {
         self.worker_fleets.clear();
         self.worker_serving.clear();
         for worker in &snapshot.workers {
-            let fleet = fleets.iter().take(self.fleet_count).position(|fleet| {
-                fleet.policy.name == worker.fleet
-                    && worker.environment.as_ref() == Some(&fleet.policy.action_environment)
-            });
+            let fleet = fleets
+                .iter()
+                .take(self.fleet_count)
+                .position(|fleet| fleet.policy.name == worker.fleet);
             let serving = !worker.draining
                 && fleet.is_some_and(|fleet| {
                     worker.id.instance_name().is_some_and(|instance| {
@@ -508,11 +508,7 @@ impl SourceRates {
             self.queued_durations.push(duration);
             self.current(
                 row.source,
-                row.candidates.iter().find(|&index| {
-                    fleets.get(index).is_some_and(|fleet| {
-                        row.environment.as_ref() == Some(&fleet.policy.action_environment)
-                    })
-                }),
+                row.candidates.iter().find(|&index| index < fleets.len()),
                 ResourceVector::from_action(row.resources),
                 duration,
                 None,
@@ -526,15 +522,7 @@ impl SourceRates {
             let vector = ResourceVector::from_action(row.resources);
             self.current(
                 row.source,
-                row.candidates.iter().find(|&index| {
-                    let environment = snapshot
-                        .workers
-                        .get(row.worker)
-                        .and_then(|worker| worker.environment.as_ref());
-                    fleets
-                        .get(index)
-                        .is_some_and(|fleet| environment == Some(&fleet.policy.action_environment))
-                }),
+                row.candidates.iter().find(|&index| index < fleets.len()),
                 vector,
                 duration,
                 actual,
@@ -644,15 +632,7 @@ impl SourceRates {
             let Some(actual) = self.worker_fleets.get(row.worker).copied().flatten() else {
                 continue;
             };
-            let preferred = row.candidates.iter().find(|&index| {
-                let environment = snapshot
-                    .workers
-                    .get(row.worker)
-                    .and_then(|worker| worker.environment.as_ref());
-                fleets
-                    .get(index)
-                    .is_some_and(|fleet| environment == Some(&fleet.policy.action_environment))
-            });
+            let preferred = row.candidates.iter().find(|&index| index < fleets.len());
             if preferred == Some(actual) {
                 continue;
             }
@@ -679,11 +659,7 @@ impl SourceRates {
             }
             let vector = ResourceVector::from_action(row.resources);
             let work = vector.scaled(self.queued_durations[i].as_secs_f64());
-            let preferred = row.candidates.iter().find(|&index| {
-                fleets.get(index).is_some_and(|fleet| {
-                    row.environment.as_ref() == Some(&fleet.policy.action_environment)
-                })
-            });
+            let preferred = row.candidates.iter().find(|&index| index < fleets.len());
             let persistent = self.is_persistent(row.source, preferred);
             let scratch = &mut self.fleet_scratch[*fleet];
             scratch.queued += work;
@@ -975,11 +951,6 @@ mod tests {
         QueuedDemand {
             source,
             candidates: FleetSet::try_from_indices([preferred]).unwrap(),
-            environment: Some(
-                gang_testkit::fleet_policy("workers")
-                    .unwrap()
-                    .action_environment,
-            ),
             resources: ActionResources::default(),
             expected: expected.map(Duration::from_secs),
             queued_since: Timestamp::default(),

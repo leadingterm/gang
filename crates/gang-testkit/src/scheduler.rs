@@ -1199,7 +1199,7 @@ mod tests {
                     &name,
                     Isa::Aarch64,
                     &"noop",
-                    Some(&"host:test".parse()?),
+                    &"host:test".parse()?,
                     Resources {
                         vcpus: 1,
                         memory: Bytes::new(GIB),
@@ -1332,7 +1332,6 @@ mod tests {
         let queued = QueuedDemand {
             source: None,
             candidates: FleetSet::prefix(1)?,
-            environment: Some("host:test".parse()?),
             resources: ActionResources::default(),
             queued_since: Timestamp::UNIX_EPOCH,
             priority: 0,

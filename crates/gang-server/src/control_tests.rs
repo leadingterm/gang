@@ -12,8 +12,8 @@ use futures::poll;
 use gang_clock::{Clock, Timestamp};
 use gang_spi::{
     ExecutingDemand, Fence, FleetInstance, FleetSupply, Held, InstanceExit, PortError,
-    ProvisionerPort, RetirementReason, ScalingAuditEvent, ScalingEventKind, ScalingEventSeq,
-    SchedulerSnapshot, WorkerState,
+    ProvisionerPort, ScalingAuditEvent, ScalingEventKind, ScalingEventSeq, SchedulerSnapshot,
+    WorkerState,
 };
 use gang_state::BuilderConfig;
 use gang_types::{
@@ -67,9 +67,8 @@ impl ProvisionerPort for LapsingProvisioner {
         held: &Held,
         fleet: Fleet<'_, Opaque>,
         instance: &InstanceId,
-        reason: gang_spi::RetirementReason,
     ) -> Result<(), PortError> {
-        self.inner.terminate(held, fleet, instance, reason).await?;
+        self.inner.terminate(held, fleet, instance).await?;
         if self.lapse.swap(false, Ordering::SeqCst) {
             self.clock.advance(Duration::from_secs(8));
         }
@@ -130,9 +129,8 @@ impl ProvisionerPort for CommittedTerminationProvisioner {
         held: &Held,
         fleet: Fleet<'_, Opaque>,
         instance: &InstanceId,
-        reason: RetirementReason,
     ) -> Result<(), PortError> {
-        self.inner.terminate(held, fleet, instance, reason).await?;
+        self.inner.terminate(held, fleet, instance).await?;
         if self.fail_after_commit.swap(false, Ordering::SeqCst) {
             self.block_converge.store(true, Ordering::SeqCst);
             return Err(PortError::unavailable("termination deadline elapsed"));
@@ -2869,9 +2867,8 @@ impl ProvisionerPort for EventProvisioner {
         held: &Held,
         fleet: Fleet<'_, Opaque>,
         instance: &InstanceId,
-        reason: gang_spi::RetirementReason,
     ) -> Result<(), PortError> {
-        self.inner.terminate(held, fleet, instance, reason).await
+        self.inner.terminate(held, fleet, instance).await
     }
 
     fn worker_lifetime(&self) -> gang_types::WorkerLifetime {

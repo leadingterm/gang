@@ -178,11 +178,7 @@ async fn terminate_fleet<P: ProvisionerPort>(
         .map_err(LocalCommandError::Provisioner)?;
     for instance in &supply.instances {
         fence
-            .run(async |held| {
-                provisioner
-                    .terminate(held, fleet, &instance.id, gang_spi::RetirementReason::Idle)
-                    .await
-            })
+            .run(async |held| provisioner.terminate(held, fleet, &instance.id).await)
             .await
             .map_err(|error| LocalCommandError::Provisioner(error.into()))?;
     }
@@ -401,7 +397,6 @@ mod tests {
             held: &Held,
             fleet: Fleet<'_, ()>,
             instance: &InstanceId,
-            _reason: gang_spi::RetirementReason,
         ) -> Result<(), PortError> {
             self.record_change(held)?;
             self.record(format!(
@@ -520,7 +515,6 @@ mod tests {
             held: &Held,
             _fleet: Fleet<'_, ()>,
             instance: &InstanceId,
-            _reason: gang_spi::RetirementReason,
         ) -> Result<(), PortError> {
             held.check()?;
             let mut state = self.state.lock();

@@ -45,7 +45,10 @@ impl CacheStorePort for ScriptedCache {
         Err(PortError::unavailable("not used"))
     }
 
-    fn action_store(&self) -> Result<RenderedStoreSpec, PortError> {
+    fn action_store(
+        &self,
+        _environment: &gang_types::EnvironmentName,
+    ) -> Result<RenderedStoreSpec, PortError> {
         Err(PortError::unavailable("not used"))
     }
 

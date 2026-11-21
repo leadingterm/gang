@@ -100,6 +100,8 @@ Each fleet must fit the configured minimum reservations and must have more
 memory than the reserve. See specification §3.2 for the full field reference and
 defaults.
 
+The server-owned `[actions] environment` name (for example, `debian-13/1`) namespaces the action cache. The initial version uses the existing unprefixed cache, keeping it warm at the v0.3.4 deploy. Security and patch image updates keep the name and need no client action; later reviewed identity bumps create a cold action cache.
+
 ```hcl
 module "gang" {
   source = "git::https://github.com/example-org/gang//infra/terraform/modules/deployment?ref=v0.3.4"
@@ -134,7 +136,7 @@ time_zone = "Europe/Paris"
 
 ## Action capabilities
 
-Actions have no network grant by default. Unknown platform properties, network requests without an eligible fleet grant, and requests exceeding action ceilings are rejected at admission. The harmless `supports-workers` marker, `gang_action_environment` cache label and old `network` hint are ignored for matching; neither label nor hint asserts an execution identity or grants network access. When present, `gang_execution_environment` identifies the action environment and must match exactly. Genuine absence matches only genuinely unscoped live workers, never current scoped workers. To grant public egress, extend an existing `bwrap` fleet in `gang.toml`:
+Actions have no network grant by default. Unknown platform properties (except the harmless `supports-workers` marker), network requests without an eligible fleet grant, and requests exceeding action ceilings are rejected at admission. To grant public egress, extend an existing `bwrap` fleet in `gang.toml`:
 
 ```toml
 [fleets.actions]
@@ -156,14 +158,10 @@ setup_timeout = "10s"
 The resource ceilings are optional per-action request ceilings, not total worker capacity. For a hand-written `gang.toml`, replace the example protected networks with the complete operator-specific private, controller, public load-balancer and worker address spaces, including IPv6. The runtime `protected_networks` and `dns_servers` must be nonempty; DNS servers must be public and outside protected networks. In the Terraform/OpenTofu deployment module, `execution_egress.protected_networks` instead adds address spaces to the module-derived VPC IPv4 and assigned IPv6 CIDRs, controller public IP when present, and public load-balancer static IPs; this optional operator list defaults to `[]`. The module omits `[fleets.actions]` when grants are empty and `[fleets.actions.resources]` when no ceilings are set. Actions use only the configured resolvers, not host DNS. `setup_timeout` bounds network setup and defaults to `10s`. A network grant requires an enforcing `bwrap` sandbox; `noop` cannot grant it. Request network explicitly on the relevant Bazel rule or execution platform:
 
 ```starlark
-load("@gang_env//:defs.bzl", "EXEC_PROPERTIES")
-
-exec_properties = dict(EXEC_PROPERTIES, ISA = "x86-64", gang_network_access = "requested")
+exec_properties = {"ISA": "x86-64", "network": "requested"}
 ```
 
-Explicit execution properties may override defaults, so retain both the exact action environment identity from `EXEC_PROPERTIES` and the ISA of your selected execution platform. Bazel may not apply the `gang bazelrc` default ISA when explicit execution properties are present.
-
-Current `gang setup` and `gang bazelrc` use `GANG_EXECUTION_ENVIRONMENT` to supply `EXEC_PROPERTIES`. The old `GANG_ACTION_ENVIRONMENT` repository variable remains cache-only and is never promoted into an execution identity by the current repository rule.
+Explicit execution properties may override defaults, so retain the ISA of your selected execution platform. Bazel may not apply the `gang bazelrc` default ISA when explicit execution properties are present.
 
 The `requires-network` tag alone does not transmit that remote request. See the [specification](docs/SPECIFICATION.md#34-sandboxes-gang-noop-gang-bwrap) for the complete policy, resolver and sandbox contract.
 

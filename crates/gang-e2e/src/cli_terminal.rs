@@ -366,11 +366,11 @@ impl Terminal for LocalTerminal {
                     .arg("--")
                     .arg(format!("--remote_executor={executor}"))
                     .arg(format!(
-                        "--repo_env=GANG_EXECUTION_ENVIRONMENT={}",
+                        "--repo_env=GANG_ACTION_ENVIRONMENT={}",
                         self.action_environment
                     ))
                     .arg(format!(
-                        "--remote_default_exec_properties=gang_execution_environment={}",
+                        "--remote_default_exec_properties=gang_action_environment={}",
                         self.action_environment
                     ))
                     .env(FAKE_BAZEL_ENV, "1");

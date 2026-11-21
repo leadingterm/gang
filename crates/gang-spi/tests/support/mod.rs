@@ -246,7 +246,6 @@ macro_rules! provisioner_plugin {
                 held: &Held,
                 fleet: Fleet<'_, Self::FleetOptions>,
                 instance: &InstanceId,
-                _reason: gang_spi::RetirementReason,
             ) -> Result<(), PortError> {
                 held.check()?;
                 self.record(fleet.options);
@@ -323,7 +322,7 @@ macro_rules! cache_plugin {
                 Ok(RenderedStoreSpec(serde_json::json!({ "content": self.number })))
             }
 
-            fn action_store(&self) -> Result<RenderedStoreSpec, PortError> {
+            fn action_store(&self, _environment: &gang_types::EnvironmentName) -> Result<RenderedStoreSpec, PortError> {
                 Ok(RenderedStoreSpec(serde_json::json!({ "action": self.number })))
             }
 
@@ -447,7 +446,6 @@ impl SchedulerPort for Stub {
         into.queued.push(QueuedDemand {
             source: None,
             candidates,
-            environment: Some("host:test".parse().map_err(PortError::backend)?),
             resources: ActionResources::default(),
             queued_since: Timestamp::UNIX_EPOCH,
             priority: i32::try_from(self.number).map_err(PortError::backend)?,

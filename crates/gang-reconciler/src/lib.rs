@@ -34,7 +34,6 @@
 //! let mut snapshot = SchedulerSnapshot {
 //!     queued: vec![QueuedDemand {
 //!         candidates: FleetSet::prefix(1)?,
-//!         environment: Some(policy.action_environment.clone()),
 //!         source: None,
 //!         resources: ActionResources::default(),
 //!         queued_since: Timestamp::from_unix_millis(0),

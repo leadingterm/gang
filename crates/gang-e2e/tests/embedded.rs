@@ -165,7 +165,7 @@ fn fleet_with_disk(
         &FleetName::try_new(name)?,
         isa,
         &SANDBOX,
-        Some(&"host:test".parse()?),
+        &"host:test".parse()?,
         Resources {
             vcpus,
             memory: Bytes::new(memory),
@@ -1935,10 +1935,7 @@ async fn an_action_no_fleet_accepts_is_refused_when_submitted() -> TestResult {
 async fn network_grant_is_required_and_unknown_properties_are_refused() -> TestResult {
     let harness = Harness::start().await?;
     let channel = public_channel(harness.public_port).await?;
-    for (key, value) in [
-        ("gang_network_access", "requested"),
-        ("unknown-property", "value"),
-    ] {
+    for (key, value) in [("network", "requested"), ("unknown-property", "value")] {
         let action = build_action(&[(key, value)])?;
         upload_blobs(&channel, action.blobs).await?;
         let status = ExecutionClient::new(channel.clone())
@@ -1964,7 +1961,7 @@ async fn network_request_runs_on_granted_fleet() -> TestResult {
         &FleetName::try_new(DEFAULT_FLEET)?,
         Isa::X86_64,
         &SANDBOX,
-        Some(&"host:test".parse()?),
+        &"host:test".parse()?,
         Resources {
             vcpus: WORKER_VCPUS,
             memory: Bytes::new(WORKER_MEMORY),
@@ -1977,7 +1974,7 @@ async fn network_request_runs_on_granted_fleet() -> TestResult {
         Harness::start_with(vec![fleet.clone()], TestGate::allow(), Vec::new()).await?;
     harness.add_worker(WorkerPaths::new(scratch.path(), "worker"), fleet)?;
     let channel = public_channel(harness.public_port).await?;
-    let action = build_action(&[("gang_network_access", "requested")])?;
+    let action = build_action(&[("network", "requested")])?;
     upload_blobs(&channel, action.blobs).await?;
     let response = tokio::time::timeout(
         Duration::from_secs(30),
@@ -1995,7 +1992,7 @@ fn spoofed_platform_cases() -> [PlatformCase<'static>; 4] {
             Some(&[
                 ("cpu_count", "2"),
                 ("memory_kb", "16384"),
-                ("gang_network_access", "requested"),
+                ("network", "requested"),
             ]),
             &[("cpu_count", "3")],
             "2",
@@ -2006,7 +2003,7 @@ fn spoofed_platform_cases() -> [PlatformCase<'static>; 4] {
             &[
                 ("cpu_count", "3"),
                 ("memory_kb", "16384"),
-                ("gang_network_access", "not-requested"),
+                ("network", "not-requested"),
             ],
             "3",
             "<absent>",
@@ -2026,7 +2023,7 @@ fn spoofed_platform_cases() -> [PlatformCase<'static>; 4] {
             ]),
             &[],
             "2",
-            "<absent>",
+            "requested",
         ),
     ]
 }
@@ -2051,7 +2048,7 @@ async fn reserved_environment_and_platform_authority_survive_client_spoofing() -
             &FleetName::try_new(DEFAULT_FLEET)?,
             Isa::X86_64,
             &SANDBOX,
-            Some(&"host:test".parse()?),
+            &"host:test".parse()?,
             Resources {
                 vcpus: WORKER_VCPUS,
                 memory: Bytes::new(WORKER_MEMORY),
@@ -2389,7 +2386,6 @@ fn worker_server_settings(port: u16) -> Result<gang_server::ServerSettings, Box<
         poll_interval: NonZeroDuration::from_secs(1),
         client_action_timeout: NonZeroDuration::from_mins(1),
         default_isa: Isa::X86_64,
-        action_environment: "host:test".parse()?,
         endpoint: gang_server::PublicEndpoint::try_new(
             format!("http://127.0.0.1:{port}").parse()?,
         )?,

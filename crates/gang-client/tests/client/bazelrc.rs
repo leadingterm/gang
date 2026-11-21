@@ -38,8 +38,6 @@ async fn renders_the_executor_cache_and_helper_with_the_server_ca() {
              # The gang that Bazel runs for credentials; run `gang bazelrc` again if it moves.\n\
              build --credential_helper={host}={HELPER}\n\
              build --remote_default_exec_properties=ISA=x86-64\n\
-             common --repo_env=GANG_EXECUTION_ENVIRONMENT=host:test\n\
-             build --remote_default_exec_properties=gang_execution_environment=host:test\n\
              build --tls_certificate=gang-ca.pem\n"
         )
     );

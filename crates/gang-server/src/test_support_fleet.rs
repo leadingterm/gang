@@ -61,7 +61,6 @@ pub fn queued_demand(candidates: FleetSet) -> QueuedDemand {
     QueuedDemand {
         source: None,
         candidates,
-        environment: Some("host:test".parse().expect("valid test environment")),
         resources: ActionResources::default(),
         queued_since: Timestamp::UNIX_EPOCH,
         priority: 0,

@@ -16,7 +16,10 @@ impl CacheStorePort for FakeCache {
         Ok(memory_store())
     }
 
-    fn action_store(&self) -> Result<RenderedStoreSpec, PortError> {
+    fn action_store(
+        &self,
+        _environment: &gang_types::EnvironmentName,
+    ) -> Result<RenderedStoreSpec, PortError> {
         Ok(memory_store())
     }
 

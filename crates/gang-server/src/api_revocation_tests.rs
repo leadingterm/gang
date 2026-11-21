@@ -222,7 +222,6 @@ async fn leader_api_refuses_before_handlers_and_preserves_decision_precedence() 
         "remoteExecutor": "grpcs://gang.example.com:443",
         "remoteCache": "grpcs://gang.example.com:443",
         "defaultIsa": "x86-64",
-        "actionEnvironment": "host:test",
         "authentication": {"none": {}},
     }))
     .expect("server info is valid");
@@ -416,7 +415,6 @@ async fn idempotent_principal_operations_leave_the_live_epoch_unchanged() {
         "remoteExecutor": "grpcs://gang.example.com:443",
         "remoteCache": "grpcs://gang.example.com:443",
         "defaultIsa": "x86-64",
-        "actionEnvironment": "host:test",
         "authentication": {"none": {}},
     }))
     .expect("server info is valid");
