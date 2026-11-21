@@ -347,6 +347,7 @@ mod tests {
     #[tokio::test]
     async fn history_ports_round_trip_metadata_larger_than_grpc_message_limit() {
         use crate::durations::ActionDurations;
+        use nativelink_config::schedulers::CpuReservationPercentile;
         use nativelink_scheduler::resource_sketch::{
             Budget, Observation, Policy, ResourceSketch, SketchKey,
         };
@@ -363,7 +364,7 @@ mod tests {
         let sketch = Arc::new(ResourceSketch::with_shards(
             Policy {
                 headroom_percent: 0,
-                cpu_reservation_percentile: 95,
+                cpu_reservation_percentile: CpuReservationPercentile::P95,
                 classes: Vec::new(),
                 reserve_cpu: true,
                 reserve_memory: true,

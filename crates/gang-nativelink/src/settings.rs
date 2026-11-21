@@ -635,7 +635,7 @@ mod tests {
         };
         assert!(historical.learn_from_workers);
         assert_eq!(historical.headroom_percent, 20);
-        assert_eq!(historical.cpu_reservation_percentile, 75);
+        assert_eq!(historical.cpu_reservation_percentile.get(), 75);
         assert_eq!(historical.window_days, 7);
         assert_eq!(historical.cpu_property_name, property::CPU_MILLICORES);
         assert_eq!(
