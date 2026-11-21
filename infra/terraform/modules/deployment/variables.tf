@@ -465,16 +465,16 @@ variable "scratch_mount_point" {
 
 variable "gang_settings" {
   type = object({
-    poll_interval         = optional(string, "1s")
+    poll_interval         = optional(string, "2s")
     client_action_timeout = optional(string, "2m")
     input_links           = optional(string, "break")
   })
   nullable    = false
   default     = {}
   description = <<-EOT
-    Gang settings owned by the generated tables. poll_interval controls autoscaler reconciliation;
-    client_action_timeout bounds client action waits. Both are required by gang, so the deployment
-    supplies 1s and 2m. input_links defaults to break rather than gang's keep to protect the CAS.
+    Gang settings owned by the generated tables. poll_interval controls reconciliation and dashboard
+    observation cadence; client_action_timeout bounds client action waits. The deployment supplies
+    2s and 2m. input_links defaults to break rather than gang's keep to protect the CAS.
     Each value must satisfy gang's own rule; the validations repeat it for plan-time feedback.
   EOT
 

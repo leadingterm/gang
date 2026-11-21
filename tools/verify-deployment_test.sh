@@ -13,6 +13,7 @@ yq -o=json 'explode(.) | .jobs' "$workflow" | jq -e '
 yq -er 'explode(.) | .jobs.apply.steps[] | select(.name == "Verify server version and controller targets") | .run' "$workflow" >"$scratch/step"
 export GANG_WORKFLOW_REF=example-org/gang/.github/workflows/deploy.yml@refs/tags/v1.2.3 ROOT=infra
 export CASE CALLS="$scratch/calls" CURL_CALLS="$scratch/curl-calls" PENDING_MARKER="$scratch/pending"
+export CLOCK="$scratch/clock" SLEEPS="$scratch/sleeps" ATTEMPTS="$scratch/attempts" TIMEOUTS="$scratch/timeouts"
 tofu() {
   [[ $* == '-chdir=infra output -json gang' ]] || return 1
   if [[ $CASE == missing ]]; then echo '{"endpoint":"https://gang.example.com","region":"region-1","controller_autoscaling_group_name":null}'; return; fi
@@ -21,7 +22,48 @@ tofu() {
   if [[ $CASE == sqlite_lb ]]; then targets='["arn:one"]'; fi
   printf '{"endpoint":"https://gang.example.com","region":"region-1","gang_toml":"fixture config","controller_instance_id":"i-one","controller_autoscaling_group_name":%s,"controller_target_group_arns":%s,"asg_names":%s}\n' "$asg" "$targets" "$workers"
 }
+timeout() {
+  [[ $1 == --signal=KILL && $2 -gt 0 && $3 == aws && $4 == --cli-connect-timeout && $5 == "$2" && $6 == --cli-read-timeout && $7 == "$2" ]] || return 1
+  if [[ $CASE == cli_timeout ]]; then
+    echo 'fixture CLI timed out' >&2
+    return 124
+  fi
+  shift 2
+  "$@"
+}
 aws() {
+  [[ $AWS_RETRY_MODE == standard && $AWS_MAX_ATTEMPTS == 3 ]] || return 1
+  [[ $1 == --cli-connect-timeout && $3 == --cli-read-timeout && $2 == "$4" && $2 -gt 0 ]] || return 1
+  printf '%s\n' "$2" >>"$TIMEOUTS"
+  shift 4
+  local site=
+  case "$*" in
+    *describe-instance-refreshes*) site=refresh ;;
+    *describe-auto-scaling-groups*controller*) site=controller ;;
+    *describe-target-health*arn:one*) site=target ;;
+    *describe-auto-scaling-groups*worker-one*) site=worker ;;
+  esac
+  if [[ $CASE == global_worker && $* == *describe-target-health*arn:two* ]]; then echo 2397 >"$CLOCK"; fi
+  if [[ $CASE == "throttle_$site" || ( $CASE == global_exhaust && $site == refresh ) || ( $CASE == worker_exhaust && $site == worker ) || ( $CASE == global_worker && $site == worker ) || ( $CASE == expired && $site == refresh ) || ( $CASE == worker_expired && $site == worker ) || ( $CASE == permanent && $site == refresh ) || ( $CASE == late && $site == refresh ) ]]; then
+    local count
+    count=$(<"$ATTEMPTS")
+    count=$((count + 1))
+    echo "$count" >"$ATTEMPTS"
+    if [[ $CASE == late ]]; then echo 2400 >"$CLOCK"
+    elif [[ $CASE == expired || $CASE == worker_expired ]]; then
+      if [[ $CASE == expired ]]; then echo 2400 >"$CLOCK"; else echo 180 >"$CLOCK"; fi
+      echo 'An error occurred (Throttling) when calling the operation: expired throttle' >&2
+      return 254
+    elif [[ $CASE == permanent ]]; then
+      echo 'An error occurred (AccessDenied) when calling the operation: fixture denied' >&2
+      return 253
+    elif [[ $CASE != throttle_* || $count -le 7 ]]; then
+      local codes=(Throttling ThrottlingException RequestLimitExceeded TooManyRequestsException RequestThrottled)
+      printf 'partial output from failed AWS request'
+      printf 'An error occurred (%s) when calling the operation: fixture throttle\n' "${codes[$(((count - 1) % 5))]}" >&2
+      return 254
+    fi
+  fi
   printf '%s\n' "$*" >>"$CALLS"
   case "$*" in
     '--region region-1 autoscaling describe-instance-refreshes --auto-scaling-group-name controller --max-records 1 --no-paginate --output json')
@@ -78,21 +120,34 @@ curl() {
   [[ $# == 1 && $1 == https://gang.example.com/v1/server ]] || return 1
   case $CASE in wrong) echo '{"version":"0.0.0"}' ;; no_version) echo '{}' ;; http_failure) return 1 ;; *) echo '{"version":"1.2.3"}' ;; esac
 }
-sleep() {
-  case $CASE in unhealthy|old_template) SECONDS=$((SECONDS + 2401)) ;; worker_short) SECONDS=$((SECONDS + 181)) ;; *) SECONDS=$((SECONDS + 1)) ;; esac
+date() {
+  [[ $* == +%s ]] || return 1
+  cat "$CLOCK"
 }
-export -f tofu aws gang openssl curl sleep
-for CASE in healthy sqlite sqlite_lb wrong_pin wrong no_version http_failure unhealthy old_template controller_terminating missing aws_failure refresh_failed worker_missing worker_unhealthy worker_short worker_pending worker_terminating; do
+sleep() {
+  printf '%s\n' "$1" >>"$SLEEPS"
+  local now
+  now=$(<"$CLOCK")
+  case $CASE in unhealthy|old_template) now=$((now + 2401)) ;; worker_short) now=$((now + 181)) ;; *) now=$((now + $1)) ;; esac
+  echo "$now" >"$CLOCK"
+}
+export -f tofu aws gang openssl curl sleep date timeout
+for CASE in healthy sqlite sqlite_lb wrong_pin wrong no_version http_failure unhealthy old_template controller_terminating missing aws_failure refresh_failed worker_missing worker_unhealthy worker_short worker_pending worker_terminating throttle_refresh throttle_controller throttle_target throttle_worker global_exhaust worker_exhaust global_worker expired worker_expired permanent late cli_timeout; do
   : >"$CALLS"
   : >"$CURL_CALLS"
+  echo 0 >"$CLOCK"
+  echo 0 >"$ATTEMPTS"
+  : >"$SLEEPS"
+  : >"$TIMEOUTS"
+  rm -f "$PENDING_MARKER"-*
   status=0
   (cd "$scratch" && bash --noprofile --norc -euo pipefail "$scratch/step") >"$scratch/out" 2>&1 || status=$?
-  case $CASE in healthy|sqlite|sqlite_lb|controller_terminating|worker_pending|worker_terminating) [[ $status == 0 ]] ;; *) [[ $status != 0 ]] ;; esac
+  case $CASE in healthy|sqlite|sqlite_lb|controller_terminating|worker_pending|worker_terminating|throttle_refresh|throttle_controller|throttle_target|throttle_worker) [[ $status == 0 ]] ;; *) [[ $status != 0 ]] ;; esac
   case $CASE in
     healthy) [[ $(wc -l <"$CALLS") -eq 6 ]] && grep -Fx -- '--region region-1 elbv2 describe-target-health --target-group-arn arn:one --output json' "$CALLS" >/dev/null && grep -Fx -- '--region region-1 elbv2 describe-target-health --target-group-arn arn:two --output json' "$CALLS" >/dev/null && grep -Fx -- '--region region-1 autoscaling describe-auto-scaling-groups --auto-scaling-group-names worker-two --output json' "$CALLS" >/dev/null ;;
     sqlite) [[ ! -s $CALLS ]] ;;
-    unhealthy) grep -F '::error::controller targets did not reach leader/passive readiness in arn:one' "$scratch/out" >/dev/null && grep -F '"State":"unhealthy"' "$scratch/out" >/dev/null ;;
-    old_template) grep -F 'controller Auto Scaling group controller is not healthy on its current launch template' "$scratch/out" >/dev/null ;;
+    unhealthy) grep -F '::error::failed to describe target health in arn:one' "$scratch/out" >/dev/null ;;
+    old_template) grep -F '::error::failed to describe controller Auto Scaling group controller' "$scratch/out" >/dev/null ;;
     wrong_pin) grep -F 'controller CA pin mismatch' "$scratch/out" >/dev/null && [[ $(wc -l <"$CURL_CALLS") -eq 1 ]] ;;
     aws_failure) grep -F '::error::failed to describe controller instance refreshes' "$scratch/out" >/dev/null ;;
     refresh_failed) grep -F 'controller instance refresh Failed: fixture failure' "$scratch/out" >/dev/null ;;
@@ -102,7 +157,37 @@ for CASE in healthy sqlite sqlite_lb wrong_pin wrong no_version http_failure unh
     worker_missing) grep -F 'worker Auto Scaling group worker-one is missing' "$scratch/out" >/dev/null ;;
     worker_unhealthy) grep -F 'worker Auto Scaling group worker-one is unhealthy' "$scratch/out" >/dev/null ;;
     controller_terminating) [[ -e $PENDING_MARKER-controller ]] ;;
-    worker_short) grep -F 'worker Auto Scaling group worker-one did not reach desired healthy capacity' "$scratch/out" >/dev/null ;;
+    worker_short) grep -F '::error::failed to describe worker Auto Scaling group worker-one' "$scratch/out" >/dev/null ;;
     worker_pending) [[ -e $PENDING_MARKER-worker-one && -e $PENDING_MARKER-worker-two ]] ;;
+    throttle_*)
+      [[ $(<"$ATTEMPTS") == 8 ]]
+      if [[ $CASE == throttle_worker ]]; then
+        [[ $(<"$TIMEOUTS") == *$'\n180\n179\n177\n173\n165\n149\n119\n89'* ]]
+      else
+        [[ $(<"$TIMEOUTS") == *$'2400\n2399\n2397\n2393\n2385\n2369\n2339\n2309'* ]]
+      fi
+      [[ $(<"$SLEEPS") == $'1\n2\n4\n8\n16\n30\n30' ]]
+      grep -F 'fixture throttle' "$scratch/out" >/dev/null ;;
+    global_exhaust|worker_exhaust)
+      [[ $(<"$ATTEMPTS") -gt 7 ]]
+      [[ $(<"$SLEEPS") == $'1\n2\n4\n8\n16\n30\n30'* ]]
+      grep -F 'fixture throttle' "$scratch/out" >/dev/null
+      if [[ $CASE == global_exhaust ]]; then [[ $(<"$CLOCK") -lt 2400 ]]; else [[ $(<"$CLOCK") -lt 180 ]]; fi ;;
+    global_worker)
+      [[ $(<"$ATTEMPTS") == 2 && $(<"$SLEEPS") == 1 && $(<"$CLOCK") == 2398 ]]
+      [[ $(<"$TIMEOUTS") == *$'\n3\n2' ]] ;;
+    expired|worker_expired)
+      [[ $(<"$ATTEMPTS") == 1 && ! -s $SLEEPS ]]
+      grep -F 'An error occurred (Throttling) when calling the operation: expired throttle' "$scratch/out" >/dev/null ;;
+    permanent)
+      [[ $(<"$ATTEMPTS") == 1 && ! -s $SLEEPS ]]
+      grep -F 'An error occurred (AccessDenied) when calling the operation: fixture denied' "$scratch/out" >/dev/null ;;
+    cli_timeout)
+      [[ ! -s $SLEEPS ]]
+      grep -F 'fixture CLI timed out' "$scratch/out" >/dev/null
+      grep -F 'AWS read deadline expired' "$scratch/out" >/dev/null ;;
+    late)
+      [[ $(<"$ATTEMPTS") == 1 && ! -s $SLEEPS ]]
+      grep -F 'AWS read deadline expired' "$scratch/out" >/dev/null ;;
   esac
 done

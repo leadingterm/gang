@@ -31,6 +31,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+mod autoscaling;
 mod cache;
 mod cloudwatch;
 mod config;

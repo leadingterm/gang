@@ -82,14 +82,18 @@ impl Runtime {
         clock: Arc<dyn Clock>,
         managed: &Arc<Managed>,
     ) -> Self {
+        let autoscaling = crate::autoscaling::client(
+            sdk,
+            Arc::clone(&clock),
+            config.autoscaling_request_interval.get(),
+        );
+        let events = Events::new(sdk, config, Arc::clone(&clock), Arc::clone(managed))
+            .with_autoscaling(autoscaling.clone());
         Self {
-            fleets: Fleets::new(
-                sdk,
-                Arc::clone(&clock),
-                config.set_capacity_cooldown,
-                Events::new(sdk, config, clock, Arc::clone(managed)),
-            ),
-            autoscaling: aws_sdk_autoscaling::Client::new(sdk),
+            fleets: Fleets::new(sdk, clock, config.set_capacity_cooldown, events)
+                .with_autoscaling(autoscaling.clone())
+                .with_observation_interval(config.supply_poll_interval.get()),
+            autoscaling,
             metadata: Metadata::new(imds, config.fleet_tag_key.as_str()),
             web_identity: WebIdentity::new(sdk, config),
             #[cfg(test)]
@@ -185,6 +189,18 @@ impl ProvisionerPort for Aws {
     fn configure_fleet(&self, fleet: Fleet<'_, AwsFleetOptions>) -> Result<(), PortError> {
         self.managed.add(fleet);
         Ok(())
+    }
+
+    fn observation_error(
+        &self,
+        fleet: Fleet<'_, AwsFleetOptions>,
+    ) -> Result<Option<String>, PortError> {
+        Ok(self.runtime.get().and_then(|runtime| {
+            runtime
+                .fleets
+                .events()
+                .observation_error(fleet.name.as_str())
+        }))
     }
 
     async fn converge(
@@ -298,7 +314,7 @@ mod tests {
     use crate::fake_aws::{FakeAws, FakeFailure, FakeGroup};
     use crate::fleet_harness::{Harness, NOW_MILLIS, fleet, fleet_with, rfc3339_ago};
     use crate::test_support::context;
-    use gang_clock::{TestClock, Timestamp};
+    use gang_clock::{Sleep, TestClock, Tick, Timestamp};
     use gang_types::InstanceLifecycle;
     use serde_json::json;
 
@@ -313,6 +329,33 @@ mod tests {
     const LAUNCH_TIME: &str = "2026-01-01T00:00:00Z";
     const IN_SERVICE: &str = "InService";
 
+    // Pace HTTP requests deterministically without advancing the fixed wall clock.
+    struct AutoAdvanceClock {
+        monotonic: TestClock,
+    }
+
+    impl Clock for AutoAdvanceClock {
+        fn wall(&self) -> Timestamp {
+            Timestamp::from_unix_millis(NOW_MILLIS)
+        }
+
+        fn monotonic(&self) -> Tick {
+            self.monotonic.monotonic()
+        }
+
+        fn sleep_until(&self, deadline: Tick) -> Sleep {
+            self.monotonic
+                .advance(deadline.saturating_duration_since(self.monotonic.monotonic()));
+            self.monotonic.sleep_until(deadline)
+        }
+    }
+
+    fn test_clock() -> Arc<dyn Clock> {
+        Arc::new(AutoAdvanceClock {
+            monotonic: TestClock::default(),
+        })
+    }
+
     fn config(scratch_mount_point: &str) -> Result<AwsConfig, serde_json::Error> {
         serde_json::from_value(json!({
             "region": REGION,
@@ -326,7 +369,7 @@ mod tests {
             &fake.sdk_config().await,
             fake.imds_client()?,
             &config,
-            Arc::new(TestClock::new(Timestamp::from_unix_millis(NOW_MILLIS))),
+            test_clock(),
             &Arc::new(Managed::default()),
         );
         Ok(Aws::with_runtime(config, runtime))
@@ -335,6 +378,7 @@ mod tests {
     #[test]
     fn building_an_aws_plugin_makes_no_aws_call() -> TestResult {
         let aws = Aws::build(config(SCRATCH)?, &context())?;
+        assert_eq!(aws.observation_error(fleet(GROUP)?.view())?, None);
         assert!(!aws.runtime.initialized());
         Ok(())
     }
@@ -393,7 +437,7 @@ mod tests {
             &harness.fake.sdk_config().await,
             harness.fake.imds_client()?,
             &settings,
-            Arc::new(TestClock::new(Timestamp::from_unix_millis(NOW_MILLIS))),
+            test_clock(),
             &Arc::new(Managed::default()),
         );
         let aws = Aws::with_runtime(settings, runtime);
@@ -430,6 +474,29 @@ mod tests {
         let instance = supply.instances.first().ok_or("no instance supplied")?;
         assert_eq!(instance.id, InstanceId::try_new(INSTANCE)?);
         assert_eq!(instance.lifecycle, InstanceLifecycle::InService);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn supply_exposes_best_effort_activity_error_without_failing() -> TestResult {
+        let harness = Harness::start().await?;
+        harness.add_group(GROUP, 0, &[]);
+        harness.fail(
+            "DescribeScalingActivities",
+            FakeFailure {
+                status: 400,
+                code: "Throttling",
+                message: "rate exceeded",
+            },
+        );
+        let aws = with_fake(&harness.fake).await?;
+        let test_fleet = fleet(GROUP)?;
+        let mut supply = FleetSupply::default();
+        aws.supply(test_fleet.view(), &mut supply).await?;
+        let error = aws
+            .observation_error(test_fleet.view())?
+            .ok_or("missing observation error")?;
+        assert!(error.contains("DescribeScalingActivities"));
         Ok(())
     }
 

@@ -55,7 +55,11 @@ struct World {
 }
 
 fn ok(applied: u32) -> PassStatus<'static> {
-    PassStatus::Ok { applied, failed: 0 }
+    PassStatus::Ok {
+        applied,
+        failed: 0,
+        error: None,
+    }
 }
 
 /// The fleet index an instance belongs to; instances rotate across the fleets.
@@ -383,7 +387,10 @@ fn steady_skipped_pass_allocates_nothing() -> TestResult {
     let world = world()?;
     let view = inputs(&world);
     let skipped = Inputs {
-        pass: PassStatus::Skipped(SkipReason::SchedulerUnavailable),
+        pass: PassStatus::Skipped {
+            reason: SkipReason::SchedulerUnavailable,
+            error: None,
+        },
         actions: None,
         ..inputs(&world)
     };

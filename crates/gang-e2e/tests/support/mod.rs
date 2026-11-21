@@ -1093,6 +1093,7 @@ pub(crate) fn state_frame(
             interval: Duration::from_millis(500),
             applied: 0,
             failed: 0,
+            error: None,
             skip_reason: None,
             last_ok_time: None,
             skipped: None,

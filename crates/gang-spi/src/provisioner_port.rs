@@ -50,6 +50,21 @@ pub trait ProvisionerPort: Send + Sync {
         into: &mut FleetSupply,
     ) -> Result<(), PortError>;
 
+    /// Returns the latest best-effort observation failure for this fleet, if any.
+    /// This diagnostic is not a launch failure and does not make a successful supply unsafe.
+    /// The getter performs no I/O.
+    ///
+    /// # Errors
+    ///
+    /// [`PortError`] when the fleet's options cannot be matched to the provisioner.
+    fn observation_error(
+        &self,
+        fleet: Fleet<'_, Self::FleetOptions>,
+    ) -> Result<Option<String>, PortError> {
+        let _ = fleet;
+        Ok(None)
+    }
+
     /// Acknowledges an exit after its audit event has been durably recorded. Unknown instance
     /// IDs are harmless, so repeated acknowledgements succeed. Delivery is at least once: a
     /// crash or an ambiguous audit append or acknowledgement failure may repeat an audit event.

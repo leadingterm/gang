@@ -122,14 +122,19 @@ impl Builder {
         let mut passed = false;
         let mut skipped = false;
         match &inputs.pass {
-            PassStatus::Ok { applied, failed } => {
+            PassStatus::Ok {
+                applied,
+                failed,
+                error,
+            } => {
                 self.last_ok = Some(inputs.wall);
                 self.skipped = 0;
                 cur.pass = Pass::ok(self.config.interval, *applied, *failed);
+                cur.pass.error = error.map(str::to_owned);
                 self.project_control(cur, prev, inputs);
                 passed = true;
             }
-            PassStatus::Skipped(reason) => {
+            PassStatus::Skipped { reason, error } => {
                 self.skipped = self.skipped.saturating_add(1);
                 cur.pass = Pass::skipped(
                     self.config.interval,
@@ -137,6 +142,7 @@ impl Builder {
                     self.last_ok,
                     self.skipped,
                 );
+                cur.pass.error = error.map(str::to_owned);
                 copy_skipped_state(cur, prev);
                 skipped = true;
                 // Only the independent observer establishes scheduler availability.

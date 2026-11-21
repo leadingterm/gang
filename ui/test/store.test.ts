@@ -127,6 +127,15 @@ test("connection deltas replace the whole part and omission preserves it", () =>
   assert.equal(apply(replaced, after(replaced)).connections, connections);
 });
 
+test("pass deltas propagate diagnostics and clear them on recovery", () => {
+  const pass = { ...snapshot.pass, state: "SKIPPED" as const, error: "ThrottlingException: Rate exceeded" };
+  const failed = apply(snapshot, after(snapshot, { pass }));
+  assert.equal(failed.pass.error, "ThrottlingException: Rate exceeded");
+  assert.equal(apply(failed, after(failed)).pass.error, pass.error);
+  const recovered = apply(failed, after(failed, { pass: snapshot.pass }));
+  assert.equal(recovered.pass.error, undefined);
+});
+
 test("a delta on another base asks for a resync", () => {
   assert.deepEqual(applyDelta(snapshot, { ...after(snapshot), base: snapshot.seq + 1 }), { kind: "resync" });
 });

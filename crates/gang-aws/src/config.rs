@@ -19,6 +19,11 @@ use gang_aws_sdk::{ClientSettings, Region};
 /// Suffix that names the on-demand twin of an opted-in fleet's spot group.
 pub(crate) const ON_DEMAND_SUFFIX: &str = "-on-demand";
 
+/// Default interval between shared supply group snapshots.
+pub(crate) const DEFAULT_SUPPLY_POLL_INTERVAL: NonZeroDuration = NonZeroDuration::from_secs(1);
+const DEFAULT_AUTOSCALING_REQUEST_INTERVAL: NonZeroDuration = NonZeroDuration::from_millis(500);
+const DEFAULT_ACTIVITY_POLL_INTERVAL: NonZeroDuration = NonZeroDuration::from_secs(60);
+
 /// Settings for the `Aws` provisioner plugin, read from the `[provisioner.aws]` table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,6 +48,18 @@ pub struct AwsConfig {
     /// connect, and backoff from one to 20 seconds. See [`ClientSettings`] for each field.
     #[serde(default)]
     pub client: ClientSettings,
+    /// Minimum interval between Auto Scaling HTTP attempts, including SDK retries. Default
+    /// `500ms`.
+    #[serde(default = "default_autoscaling_request_interval")]
+    pub autoscaling_request_interval: NonZeroDuration,
+    /// Interval between shared batched supply group snapshots. Mutations read fresh state.
+    /// Default `1s`.
+    #[serde(default = "default_supply_poll_interval")]
+    pub supply_poll_interval: NonZeroDuration,
+    /// Minimum interval between eligible queue-less history polls, including failures. Default
+    /// `60s`. Settled, unchanged groups with acknowledged history need no periodic poll.
+    #[serde(default = "default_activity_poll_interval")]
+    pub activity_poll_interval: NonZeroDuration,
     /// Bound on each instance metadata (IMDS) request. Default `1s`. Must be greater than zero.
     #[serde(default = "default_imds_request_timeout")]
     pub imds_request_timeout: NonZeroDuration,
@@ -83,6 +100,16 @@ pub struct AwsConfig {
         deserialize_with = "deserialize_activity_limit"
     )]
     pub activity_limit: u32,
+}
+
+const fn default_autoscaling_request_interval() -> NonZeroDuration {
+    DEFAULT_AUTOSCALING_REQUEST_INTERVAL
+}
+const fn default_supply_poll_interval() -> NonZeroDuration {
+    DEFAULT_SUPPLY_POLL_INTERVAL
+}
+const fn default_activity_poll_interval() -> NonZeroDuration {
+    DEFAULT_ACTIVITY_POLL_INTERVAL
 }
 
 const fn default_event_batch_limit() -> u8 {
@@ -593,9 +620,48 @@ mod tests {
     use gang_types::FleetName;
     use serde_json::json;
 
-    use super::{AwsFleetOptions, RetrySpotAfter};
+    use super::{AwsConfig, AwsFleetOptions, RetrySpotAfter};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn observation_intervals_default_and_reject_zero() -> TestResult {
+        let config: AwsConfig = serde_json::from_value(json!({
+            "region": "us-east-1",
+            "scratch_mount_point": "/mnt/scratch"
+        }))?;
+        assert_eq!(
+            config.autoscaling_request_interval.get(),
+            Duration::from_millis(500)
+        );
+        assert_eq!(config.supply_poll_interval.get(), Duration::from_secs(1));
+        assert_eq!(config.activity_poll_interval.get(), Duration::from_mins(1));
+
+        for key in [
+            "autoscaling_request_interval",
+            "supply_poll_interval",
+            "activity_poll_interval",
+        ] {
+            let mut value = json!({
+                "region": "us-east-1",
+                "scratch_mount_point": "/mnt/scratch"
+            });
+            value[key] = json!("0s");
+            assert!(
+                serde_json::from_value::<AwsConfig>(value.clone()).is_err(),
+                "{key}"
+            );
+            value[key] = json!("2s");
+            let configured: AwsConfig = serde_json::from_value(value)?;
+            let interval = match key {
+                "autoscaling_request_interval" => configured.autoscaling_request_interval,
+                "supply_poll_interval" => configured.supply_poll_interval,
+                _ => configured.activity_poll_interval,
+            };
+            assert_eq!(interval.get(), Duration::from_secs(2));
+        }
+        Ok(())
+    }
 
     #[test]
     fn rejects_unknown_capacity_with_expected_names() {

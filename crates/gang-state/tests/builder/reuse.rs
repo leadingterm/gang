@@ -484,6 +484,7 @@ fn fill_window(
         pass: PassStatus::Ok {
             applied: 0,
             failed: 0,
+            error: None,
         },
         fleets: &passes,
         catalog: &catalog,

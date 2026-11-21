@@ -207,7 +207,7 @@ A new provisioner is a Ring 3 plugin crate at `tier: 30` and one line in `compos
 | Terminating | terminating states | Succeeded, Failed, `deletionTimestamp` | CG; finished jobs vanish |
 | `terminate` | `TerminateInstanceInAutoScalingGroup` with decrement, or a release to the warm pool (ADR-22) | delete pod (idempotent) | `scancel` |
 
-`supply()` reads platform state every pass, so no fleet state is persisted (SPECIFICATION §5).
+`supply()` observes platform state rather than persisting fleet state (SPECIFICATION §5). AWS shares a short-lived batched supply snapshot between observation and control; mutations bypass and invalidate it and use fresh state. An expired snapshot that cannot be refreshed on throttling is not used for planning or mutation; dashboard staleness follows the normal rules. At the default one-second interval, steady-state group observations take `ceil(groups / 50)` requests per second per controller, not per fleet or dashboard. Auto Scaling wire attempts, including SDK retries, are paced per controller at a default `500ms`; external callers and HA controllers contribute separately. Queue-less activity history is eligible after an initial or changed completed group snapshot, or while capacity is unmet or pending, a poll error is retained, or history is unacknowledged. Eligible polls, including failed attempts, share a minimum default `60s` interval; settled unchanged groups with acknowledged history have no periodic activity reads. Thus two idle settled fleets without fallback twins need one group request per second and no activity reads in steady state. Unacknowledged history remains retryable and canonical events remain intact.
 
 ### Worker identity
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Bound AWS Auto Scaling observation traffic with a shared batched supply snapshot, per-controller pacing of all Auto Scaling HTTP attempts including SDK retries, and change-driven queue-less activity-history polling. The snapshot interval, HTTP attempt interval and minimum eligible history-poll interval default to `1s`, `500ms` and `60s`, respectively, and can be configured under `[provisioner.aws]`. Settled, unchanged groups with acknowledged history need no periodic activity reads; retries remain eligible for unmet or pending capacity, errors and unacknowledged history. The deployment module's `gang_settings.poll_interval` defaults to `2s` and remains operator-configurable.
+- Mutations use fresh authoritative group reads. If a supply snapshot expires and its refresh is throttled, the planner skips the pass rather than using potentially unsafe stale supply; the dashboard retains its last observation only under its normal staleness rules. Unacknowledged activity history is retried on a later poll without changing stored canonical events.
+- Expose optional `Pass.error` state diagnostics, retaining nonfatal activity-history poll errors until the next successful poll while reconciliation continues.
+- Retry throttled AWS deployment-verifier reads with bounded backoff within the existing verification deadlines; permanent errors still fail without retry.
+
 ## 0.3.5 — 2026-11-21
 
 ### Added

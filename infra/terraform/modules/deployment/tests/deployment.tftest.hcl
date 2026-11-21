@@ -693,6 +693,15 @@ run "rejects_scheduled_minimum_with_a_repeated_day" {
   expect_failures = [var.fleets]
 }
 
+run "renders_default_poll_interval" {
+  command = plan
+
+  assert {
+    condition     = startswith(output.gang_toml, "poll_interval = \"2s\"\n")
+    error_message = "The default top-level poll interval must render as 2s."
+  }
+}
+
 run "renders_gang_settings_override" {
   command = plan
 
@@ -1326,6 +1335,20 @@ run "rejects_zero_poll_interval" {
   variables {
     gang_settings = {
       poll_interval = "0s"
+    }
+  }
+
+  expect_failures = [
+    var.gang_settings,
+  ]
+}
+
+run "rejects_malformed_poll_interval" {
+  command = plan
+
+  variables {
+    gang_settings = {
+      poll_interval = "three seconds"
     }
   }
 

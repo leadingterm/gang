@@ -74,6 +74,10 @@ pub(crate) struct ControlLoop<'a, P: PluginSet, F, S, R, C> {
     passes: Vec<FleetPass>,
     /// The indexed scheduler snapshot of the latest completed pass.
     hosted: HostedSnapshot,
+    /// Reusable buffer for supply reads that may fail after partially writing.
+    incoming_supply: FleetSupply,
+    /// First diagnostic observed during the current control pass.
+    pass_error: Option<String>,
     /// Buffer for the next scheduler snapshot.
     incoming: SchedulerSnapshot,
     /// Workers seen in the previous completed pass.
@@ -152,6 +156,8 @@ where
             passes,
             hosted: HostedSnapshot::default(),
             incoming: SchedulerSnapshot::default(),
+            incoming_supply: FleetSupply::default(),
+            pass_error: None,
             roster: WorkerRoster::default(),
             roster_pending: WorkerRoster::default(),
             worker_changes: Vec::new(),
@@ -191,6 +197,7 @@ where
     /// A failed snapshot, converge or supply read, lapsed leadership, or unavailable scheduler
     /// during a drain skips the pass. Other failed steps do not stop the others.
     pub(crate) async fn pass(&mut self) -> PassOutcome {
+        self.pass_error = None;
         let (mut wall, outcome) = match self.plan_pass().await {
             Ok(time) => (time.wall, self.apply_plan().await),
             Err(reason) => (
@@ -277,6 +284,7 @@ where
                     PassStatus::Ok {
                         applied: *applied,
                         failed: *failed,
+                        error: self.pass_error.as_deref(),
                     },
                     &self.passes,
                     self.fleets.catalog(),
@@ -286,7 +294,10 @@ where
             PassOutcome::Skipped(reason) => {
                 publisher.publish(
                     wall,
-                    PassStatus::Skipped(reason.clone()),
+                    PassStatus::Skipped {
+                        reason: reason.clone(),
+                        error: self.pass_error.as_deref(),
+                    },
                     &self.passes,
                     self.fleets.catalog(),
                     &self.infrastructure,
@@ -649,6 +660,9 @@ where
             for config in &self.configs {
                 if let Err(error) = self.provisioner.configure_fleet(config.fleet()) {
                     tracing::warn!(fleet = %config.policy.name, %error, "provisioner fleet configuration failed");
+                    self.pass_error.get_or_insert_with(|| {
+                        format!("fleet {} configure: {error}", config.policy.name)
+                    });
                     return Err(SkipReason::ProvisionerUnavailable);
                 }
             }
@@ -665,16 +679,22 @@ where
                 Ok(()) => {}
                 Err(error @ RunError::Lapsed(_)) => {
                     tracing::debug!(fleet = %config.policy.name, %error, "leadership lapsed; skipping pass");
+                    self.pass_error.get_or_insert_with(|| {
+                        format!("fleet {} converge: {error}", config.policy.name)
+                    });
                     return Err(SkipReason::LeadershipLapsed);
                 }
                 Err(error) => {
                     tracing::warn!(fleet = %config.policy.name, %error, "provisioner converge failed; skipping pass");
+                    self.pass_error.get_or_insert_with(|| {
+                        format!("fleet {} converge: {error}", config.policy.name)
+                    });
                     return Err(SkipReason::ProvisionerUnavailable);
                 }
             }
             if let Err(error) = self
                 .provisioner
-                .supply(config.fleet(), &mut pass.supply)
+                .supply(config.fleet(), &mut self.incoming_supply)
                 .await
             {
                 tracing::warn!(
@@ -682,7 +702,19 @@ where
                     %error,
                     "provisioner supply failed; skipping pass"
                 );
+                self.pass_error
+                    .get_or_insert_with(|| format!("fleet {} supply: {error}", config.policy.name));
                 return Err(SkipReason::ProvisionerUnavailable);
+            }
+            std::mem::swap(&mut pass.supply, &mut self.incoming_supply);
+            let diagnostic = match self.provisioner.observation_error(config.fleet()) {
+                Ok(error) => error,
+                Err(error) => Some(error.to_string()),
+            };
+            if let Some(error) = diagnostic {
+                self.pass_error.get_or_insert_with(|| {
+                    format!("fleet {} observation: {error}", config.policy.name)
+                });
             }
         }
         Ok(())
@@ -732,6 +764,12 @@ where
                     ) =>
                 {
                     tracing::warn!(?step, %error, "scheduler unavailable; skipping remaining steps");
+                    self.pass_error.get_or_insert_with(|| {
+                        format!(
+                            "fleet {} {:?}: {error}",
+                            self.configs[step.fleet].policy.name, step.action
+                        )
+                    });
                     for remaining in &self.plan.steps[index + 1..] {
                         if let Action::Terminate { instance, .. } = &remaining.action {
                             self.reconciler.forget_order(remaining.fleet, instance);
@@ -751,6 +789,12 @@ where
                         self.reconciler.forget_order(step.fleet, instance);
                     }
                     tracing::warn!(?step, %error, "control step failed");
+                    self.pass_error.get_or_insert_with(|| {
+                        format!(
+                            "fleet {} {:?}: {error}",
+                            self.configs[step.fleet].policy.name, step.action
+                        )
+                    });
                     failed += 1;
                 }
             }

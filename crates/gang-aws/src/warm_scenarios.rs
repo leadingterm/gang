@@ -722,6 +722,7 @@ async fn warm_start_is_counted_as_capacity_after_a_raise_draws_the_pool_first() 
     }));
 
     harness.fake.state().promote(FLEET, "i-warm");
+    harness.clock.advance(std::time::Duration::from_secs(1));
 
     assert_eq!(harness.is_protected(FLEET, "i-warm"), Some(true));
     let promoted = supply_of(&harness).await?;

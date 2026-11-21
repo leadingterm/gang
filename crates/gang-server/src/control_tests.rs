@@ -83,6 +83,57 @@ impl ProvisionerPort for PartialFailureProvisioner {
     }
 }
 
+struct DiagnosticProvisioner {
+    inner: FakeProvisioner,
+    fail_supply: AtomicBool,
+    observation_error: AtomicBool,
+}
+
+impl ProvisionerPort for DiagnosticProvisioner {
+    type FleetOptions = Opaque;
+
+    async fn supply(
+        &self,
+        fleet: Fleet<'_, Opaque>,
+        into: &mut FleetSupply,
+    ) -> Result<(), PortError> {
+        if self.fail_supply.load(Ordering::SeqCst) {
+            into.desired = 999;
+            return Err(PortError::unavailable("Throttling: rate exceeded"));
+        }
+        self.inner.supply(fleet, into).await
+    }
+
+    fn observation_error(&self, _fleet: Fleet<'_, Opaque>) -> Result<Option<String>, PortError> {
+        Ok(self
+            .observation_error
+            .load(Ordering::SeqCst)
+            .then(|| "Throttling: activity rate exceeded".to_owned()))
+    }
+
+    async fn set_desired_capacity(
+        &self,
+        held: &Held,
+        fleet: Fleet<'_, Opaque>,
+        desired: u32,
+    ) -> Result<(), PortError> {
+        self.inner.set_desired_capacity(held, fleet, desired).await
+    }
+
+    async fn terminate(
+        &self,
+        held: &Held,
+        fleet: Fleet<'_, Opaque>,
+        instance: &InstanceId,
+    ) -> Result<(), PortError> {
+        self.inner.terminate(held, fleet, instance).await
+    }
+
+    fn worker_lifetime(&self) -> gang_types::WorkerLifetime {
+        self.inner.worker_lifetime()
+    }
+}
+
 struct LapsingProvisioner {
     inner: FakeProvisioner,
     clock: Arc<gang_clock::TestClock>,
@@ -2763,7 +2814,10 @@ fn late_pass_publication_does_not_rewind_observation_time() {
     );
     publisher.publish(
         Timestamp::from_unix_millis(1_010_000),
-        gang_state::PassStatus::Skipped(SkipReason::SchedulerUnavailable),
+        gang_state::PassStatus::Skipped {
+            reason: SkipReason::SchedulerUnavailable,
+            error: None,
+        },
         &[],
         fleets.catalog(),
         &[],
@@ -2815,6 +2869,178 @@ async fn completed_pass_publishes_an_ok_pass_with_the_fleet_rows() -> Result<(),
         state.fleets[0].name,
         name::of::<name::Fleets>(&fleet_name())
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_partial_supply_is_skipped_and_recovery_uses_fresh_supply() -> TestResult {
+    let clock = clock_at(1_000_000);
+    let fleets = fleets();
+    let fleet = DiagnosticProvisioner {
+        inner: FakeProvisioner::default(),
+        fail_supply: AtomicBool::new(false),
+        observation_error: AtomicBool::new(false),
+    };
+    let scheduler = FakeScheduler::new()?;
+    let repository = FakeRepository::default();
+    let hub = hub();
+    scheduler.set_snapshot(SchedulerSnapshot::default());
+    let mut observer = publisher(&hub);
+    let mut control = ControlLoop::new(
+        &fleets,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        gang_types::nonzero_u32(2),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
+        gang_testkit::fence::valid_fence(),
+    )
+    .with_publisher(observer.clone());
+    assert!(matches!(
+        control.pass().await,
+        PassOutcome::Completed { failed: 0, .. }
+    ));
+    let previous = served(&hub);
+    scheduler.set_snapshot(queued_snapshot()?);
+    fleet.fail_supply.store(true, Ordering::SeqCst);
+    assert_eq!(
+        control.pass().await,
+        PassOutcome::Skipped(SkipReason::ProvisionerUnavailable)
+    );
+    let skipped = served(&hub);
+    let error = skipped
+        .pass
+        .error
+        .as_deref()
+        .expect("supply failure is published");
+    assert!(
+        error.contains("supply") && error.contains("Throttling") && error.contains("rate exceeded")
+    );
+    assert_eq!(skipped.fleets, previous.fleets);
+    assert!(fleet.inner.desired_requests().is_empty());
+    assert!(fleet.inner.terminations().is_empty());
+    assert!(scheduler.draining_calls().is_empty());
+    observer.publish(
+        clock.wall(),
+        gang_state::PassStatus::Observed {
+            hosted: None,
+            supplies: &[],
+        },
+        &[],
+        fleets.catalog(),
+        &[],
+    );
+    assert_eq!(served(&hub).pass.error, skipped.pass.error);
+    fleet.fail_supply.store(false, Ordering::SeqCst);
+    assert_eq!(
+        control.pass().await,
+        PassOutcome::Completed {
+            applied: 1,
+            failed: 0
+        }
+    );
+    assert_eq!(served(&hub).pass.error, None);
+    assert_eq!(fleet.inner.desired_requests().len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn observation_and_mutation_diagnostics_clear_on_recovery() -> TestResult {
+    let clock = clock_at(1_000_000);
+    let fleets = fleets();
+    let fleet = DiagnosticProvisioner {
+        inner: FakeProvisioner::default(),
+        fail_supply: AtomicBool::new(false),
+        observation_error: AtomicBool::new(true),
+    };
+    let scheduler = FakeScheduler::new()?;
+    let repository = FakeRepository::default();
+    let hub = hub();
+    scheduler.set_snapshot(queued_snapshot()?);
+    fleet.inner.fail_set_desired_capacity(true);
+    let mut control = ControlLoop::new(
+        &fleets,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        gang_types::nonzero_u32(2),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
+        gang_testkit::fence::valid_fence(),
+    )
+    .with_publisher(publisher(&hub));
+    assert_eq!(
+        control.pass().await,
+        PassOutcome::Completed {
+            applied: 0,
+            failed: 1
+        }
+    );
+    let error = served(&hub)
+        .pass
+        .error
+        .expect("observation error is published");
+    assert!(
+        error.contains("observation")
+            && error.contains("Throttling")
+            && error.contains("activity rate exceeded")
+    );
+    fleet.observation_error.store(false, Ordering::SeqCst);
+    assert_eq!(
+        control.pass().await,
+        PassOutcome::Completed {
+            applied: 0,
+            failed: 1
+        }
+    );
+    let error = served(&hub)
+        .pass
+        .error
+        .expect("mutation failure is published");
+    assert!(error.contains("ScaleOut") && error.contains(&fleet_name().to_string()));
+    fleet.inner.fail_set_desired_capacity(false);
+    assert_eq!(
+        control.pass().await,
+        PassOutcome::Completed {
+            applied: 1,
+            failed: 0
+        }
+    );
+    assert_eq!(served(&hub).pass.error, None);
+    fleet.observation_error.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        control.pass().await,
+        PassOutcome::Completed { failed: 0, .. }
+    ));
+    assert!(
+        served(&hub)
+            .pass
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("activity rate exceeded")
+    );
+    fleet.observation_error.store(false, Ordering::SeqCst);
+    assert!(matches!(
+        control.pass().await,
+        PassOutcome::Completed { failed: 0, .. }
+    ));
+    assert_eq!(served(&hub).pass.error, None);
     Ok(())
 }
 

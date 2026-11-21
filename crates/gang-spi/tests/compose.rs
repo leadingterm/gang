@@ -71,6 +71,26 @@ fn test_fleet(options: ProvisionerFleetOptions) -> Result<TestFleet, Box<dyn Err
     })
 }
 
+#[test]
+fn observation_error_delegates_and_reports_mismatched_options() -> Result<(), Box<dyn Error>> {
+    let text = CONFIG.replace(BETA_SECTION, ALPHA_SECTION);
+    let provisioner = Provisioner::build(parse(&text)?.provisioner, &context())?;
+    let fleet = test_fleet(ProvisionerFleetOptions::Alpha(FakeFleetOptions {
+        capacity: "spot".to_owned(),
+        machine_class: None,
+    }))?;
+    assert_eq!(
+        provisioner.observation_error(fleet.view())?.as_deref(),
+        Some("observation 1: spot")
+    );
+    let foreign = test_fleet(ProvisionerFleetOptions::Beta(OtherFleetOptions {}))?;
+    assert!(matches!(
+        provisioner.observation_error(foreign.view()),
+        Err(PortError::Config(_))
+    ));
+    Ok(())
+}
+
 numbered_plugin!(Fake);
 
 /// The scope the fake limits plugin hands out: the number it was built with and the launcher it
@@ -378,6 +398,7 @@ impl ProvisionerPort for DefaultConverge {
 #[test]
 fn the_default_converge_refuses_an_expired_permission() -> Result<(), Box<dyn Error>> {
     let fleet = test_fleet(ProvisionerFleetOptions::Beta(OtherFleetOptions {}))?;
+    assert!(DefaultConverge.observation_error(fleet.view())?.is_none());
     assert!(
         matches!(
             ready(gang_testkit::fence::with_expired_held(async |held| {

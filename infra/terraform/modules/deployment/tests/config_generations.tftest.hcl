@@ -322,12 +322,12 @@ run "planUnchanged" {
 
 run "planB" {
   command = plan
-  variables { gang_settings = { poll_interval = "2s" } }
+  variables { gang_settings = { poll_interval = "3s" } }
 }
 
 run "applyB" {
   command = apply
-  variables { gang_settings = { poll_interval = "2s" } }
+  variables { gang_settings = { poll_interval = "3s" } }
   assert {
     condition     = aws_ssm_parameter.config_generation.value == output.gang_toml && aws_ssm_parameter.config_generation.name == output.config_parameter_name && startswith(output.config_parameter_name, "${local.config_parameter_name}/generations/") && output.config_parameter_reference == "${output.config_parameter_name}:1" && aws_ssm_parameter.config_generation.overwrite == false
     error_message = "B must publish its rendered bytes at an immutable pinned generation."

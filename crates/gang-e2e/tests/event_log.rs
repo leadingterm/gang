@@ -76,6 +76,7 @@ fn snapshot(seq: u64, held: &[u64], limit: u32) -> Result<Frame, Box<dyn Error>>
             interval: Duration::from_millis(500),
             applied: 0,
             failed: 0,
+            error: None,
             skip_reason: None,
             last_ok_time: None,
             skipped: None,

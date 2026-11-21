@@ -137,6 +137,31 @@ test("stream loss, revocation and skipped passes precede public saturation", (t)
   }
 });
 
+test("pass diagnostics are displayed as text and disappear on recovery", (t) => {
+  const diagnostic = "fleets/spot: ThrottlingException: Rate exceeded <unsafe>";
+  const skippedPass = { ...live.pass, state: "SKIPPED" as const, skipReason: "PROVISIONER_UNAVAILABLE" as const };
+  const old = screen("overview", { state: { ...live, pass: skippedPass } }, <Overview />);
+  t.assert.match(old, /Pass skipped/);
+  t.assert.doesNotMatch(old, /ThrottlingException|Provider diagnostic/);
+
+  const skipped = screen("overview", { state: { ...live, pass: { ...skippedPass, error: diagnostic } } }, <Overview />);
+  t.assert.match(visibleText(skipped), /Pass skipped.*ThrottlingException: Rate exceeded <unsafe>/);
+  t.assert.doesNotMatch(skipped, /<unsafe>/);
+
+  const nonfatal = screen("overview", {
+    state: {
+      ...live,
+      fleets: live.fleets.map((fleet) => ({ ...fleet, launchFailure: undefined })),
+      pass: { ...live.pass, state: "OK", error: diagnostic },
+    },
+  }, <Overview />);
+  t.assert.match(visibleText(nonfatal), /Provider diagnostic.*ThrottlingException: Rate exceeded/);
+  t.assert.doesNotMatch(visibleText(nonfatal), /can't launch/i);
+
+  const recovered = screen("overview", { state: { ...live, pass: { ...live.pass, state: "OK" } } }, <Overview />);
+  t.assert.doesNotMatch(recovered, /ThrottlingException|Provider diagnostic/);
+});
+
 test("build list shows the live build, hit rate and link", (t) => {
   const markup = html({}, <Builds />);
   t.assert.match(markup, /ops@example.org/);

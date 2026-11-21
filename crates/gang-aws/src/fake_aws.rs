@@ -281,6 +281,10 @@ pub(crate) struct FakeState {
     pub(crate) launched: u32,
     /// Instances per `DescribeInstances` page; `None` answers every matching instance in one page.
     pub(crate) page_size: Option<usize>,
+    /// Groups per `DescribeAutoScalingGroups` page; `None` answers all matching groups.
+    pub(crate) group_page_size: Option<usize>,
+    /// Failure returned for a `DescribeAutoScalingGroups` request with the matching `NextToken`.
+    pub(crate) group_page_failure: Option<(String, FakeFailure)>,
     /// Messages available to the fake SQS queue.
     pub(crate) messages: Vec<FakeMessage>,
     /// Additional activity identity and description, indexed by activity position.
@@ -310,6 +314,8 @@ impl Default for FakeState {
             target_lifecycle_state: None,
             launched: 0,
             page_size: None,
+            group_page_size: None,
+            group_page_failure: None,
             messages: Vec::new(),
             activity_details: HashMap::new(),
         }
@@ -702,7 +708,7 @@ fn query_operation(
         "DescribeAutoScalingGroups" => Ok(query_ok(
             QueryService::AutoScaling,
             action,
-            Some(&describe_groups(state, params)),
+            Some(&describe_groups(state, params)?),
         )),
         "SetDesiredCapacity" => {
             set_desired_capacity(state, params)?;
@@ -739,15 +745,109 @@ fn query_operation(
     }
 }
 
-fn describe_groups(state: &FakeState, params: &Parameters) -> String {
+fn describe_groups(state: &FakeState, params: &Parameters) -> Result<String, FakeFailure> {
+    if let Some((token, failure)) = &state.group_page_failure
+        && params.get(NEXT_TOKEN) == Some(token)
+    {
+        return Err(failure.clone());
+    }
     let requested = members(params, "AutoScalingGroupNames.member.");
-    let groups: String = state
+    let start = params.get(NEXT_TOKEN).map_or(Ok(0), |raw| {
+        raw.parse::<usize>().map_err(|_| invalid(MALFORMED_NUMBER))
+    })?;
+    let matching: Vec<_> = state
         .groups
         .iter()
         .filter(|group| requested.is_empty() || requested.contains(&group.name.as_str()))
-        .map(group_xml)
         .collect();
-    format!("<AutoScalingGroups>{groups}</AutoScalingGroups>")
+    let end = state
+        .group_page_size
+        .map_or(matching.len(), |size| start.saturating_add(size.max(1)))
+        .min(matching.len());
+    let groups: String = matching[start.min(end)..end]
+        .iter()
+        .map(|group| group_xml(group))
+        .collect();
+    let next = if end < matching.len() {
+        format!("<NextToken>{end}</NextToken>")
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "<AutoScalingGroups>{groups}</AutoScalingGroups>{next}"
+    ))
+}
+
+#[test]
+fn describe_groups_paginates_after_filtering() {
+    let state = FakeState {
+        groups: vec![
+            FakeGroup::new("first", 0, &[]),
+            FakeGroup::new("excluded", 0, &[]),
+            FakeGroup::new("last", 0, &[]),
+        ],
+        group_page_size: Some(1),
+        ..FakeState::default()
+    };
+    let mut params = Parameters::from([
+        ("AutoScalingGroupNames.member.1".into(), "first".into()),
+        ("AutoScalingGroupNames.member.2".into(), "last".into()),
+    ]);
+    let first = describe_groups(&state, &params).expect("first page is valid");
+    assert!(first.contains("<AutoScalingGroupName>first</AutoScalingGroupName>"));
+    assert!(!first.contains("<AutoScalingGroupName>last</AutoScalingGroupName>"));
+    assert!(first.contains("<NextToken>1</NextToken>"));
+
+    params.insert(NEXT_TOKEN.into(), "1".into());
+    let last = describe_groups(&state, &params).expect("second page is valid");
+    assert!(last.contains("<AutoScalingGroupName>last</AutoScalingGroupName>"));
+    assert!(!last.contains("<NextToken>"));
+    assert!(!last.contains("<AutoScalingGroupName>excluded</AutoScalingGroupName>"));
+
+    params.insert(NEXT_TOKEN.into(), "invalid".into());
+    assert!(describe_groups(&state, &params).is_err());
+}
+
+#[test]
+fn group_page_failure_is_scoped_and_request_is_recorded() {
+    let shared = Arc::new(Mutex::new(FakeState {
+        groups: vec![
+            FakeGroup::new("first", 0, &[]),
+            FakeGroup::new("last", 0, &[]),
+        ],
+        group_page_size: Some(1),
+        group_page_failure: Some((
+            "1".into(),
+            FakeFailure {
+                status: 400,
+                code: "AccessDenied",
+                message: "injected",
+            },
+        )),
+        ..FakeState::default()
+    }));
+    let operation = "DescribeAutoScalingGroups";
+    let mut params = Parameters::new();
+    let first = dispatch(&shared, operation, &params, None, |state, params| {
+        query_operation(state, operation, params)
+    })
+    .expect("first page succeeds");
+    assert!(first.contains("<NextToken>1</NextToken>"));
+    params.insert(NEXT_TOKEN.into(), "1".into());
+    let failure = dispatch(&shared, operation, &params, None, |state, params| {
+        query_operation(state, operation, params)
+    })
+    .expect_err("second page is refused");
+    assert_eq!(failure.code, "AccessDenied");
+    let state = shared.lock();
+    assert_eq!(state.requests.len(), 2);
+    assert_eq!(
+        state.requests[1]
+            .parameters
+            .get(NEXT_TOKEN)
+            .map(String::as_str),
+        Some("1")
+    );
 }
 
 /// Describes one group: its size bounds, its members with their protection, the protection of new instances and, when the group has a warm pool, the reuse flag and pool size.
@@ -1507,5 +1607,81 @@ async fn retries_stop_at_max_attempts() -> Result<(), Box<dyn std::error::Error>
         call_error("DescribeAutoScalingGroups", error),
         CallError::Transient { .. }
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn throttling_backs_off_before_retry_succeeds() -> Result<(), Box<dyn std::error::Error>> {
+    use aws_sdk_autoscaling::config::{AsyncSleep, Sleep};
+    use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
+    use aws_smithy_runtime_api::http::{Request, Response, StatusCode};
+    use aws_smithy_types::body::SdkBody;
+    use std::time::Duration;
+
+    #[derive(Clone, Debug)]
+    struct RecordingSleep {
+        http: StaticReplayClient,
+        sleeps: Arc<Mutex<Vec<(Duration, usize)>>>,
+    }
+
+    impl AsyncSleep for RecordingSleep {
+        fn sleep(&self, duration: Duration) -> Sleep {
+            if duration > Duration::from_secs(1) {
+                // Operation and attempt timeout futures must remain pending.
+                return Sleep::new(std::future::pending());
+            }
+            let sleeps = Arc::clone(&self.sleeps);
+            let http = self.http.clone();
+            Sleep::new(async move {
+                sleeps
+                    .lock()
+                    .push((duration, http.actual_requests().count()));
+            })
+        }
+    }
+
+    let error = format!(
+        "<ErrorResponse xmlns=\"{AUTO_SCALING_NS}\"><Error><Type>Sender</Type><Code>Throttling</Code><Message>Rate exceeded</Message></Error><RequestId>{REQUEST_ID}</RequestId></ErrorResponse>"
+    );
+    let success = format!(
+        "<DescribeAutoScalingGroupsResponse xmlns=\"{AUTO_SCALING_NS}\"><DescribeAutoScalingGroupsResult><AutoScalingGroups/></DescribeAutoScalingGroupsResult><ResponseMetadata><RequestId>{REQUEST_ID}</RequestId></ResponseMetadata></DescribeAutoScalingGroupsResponse>"
+    );
+    let event = |status: u16, body: String| -> Result<ReplayEvent, Box<dyn std::error::Error>> {
+        Ok(ReplayEvent::new(
+            Request::new(SdkBody::empty()),
+            Response::new(StatusCode::try_from(status)?, SdkBody::from(body)),
+        ))
+    };
+    let http = StaticReplayClient::new(vec![event(400, error)?, event(200, success)?]);
+    let sleeps = Arc::new(Mutex::new(Vec::new()));
+    let region = Region::try_new(REGION)?;
+    let sdk = loader(&region, &ClientSettings::default())
+        .credentials_provider(Credentials::new(
+            ACCESS_KEY_ID,
+            SECRET_ACCESS_KEY,
+            None,
+            None,
+            "fake",
+        ))
+        .http_client(http.clone())
+        .sleep_impl(RecordingSleep {
+            http: http.clone(),
+            sleeps: Arc::clone(&sleeps),
+        })
+        .load()
+        .await;
+    aws_sdk_autoscaling::Client::new(&sdk)
+        .describe_auto_scaling_groups()
+        .send()
+        .await?;
+
+    assert_eq!(http.actual_requests().count(), 2);
+    let sleeps = sleeps.lock();
+    assert!(
+        sleeps
+            .iter()
+            .any(|(duration, requests)| *requests == 1 && *duration <= Duration::from_secs(1)),
+        "expected a backoff before the retry; recorded sleeps: {sleeps:?}"
+    );
     Ok(())
 }

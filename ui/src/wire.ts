@@ -762,6 +762,10 @@ applied: number,
  */
 failed: number, 
 /**
+ * First fleet-attributed provider operation or observation diagnostic of this pass, if any.
+ */
+error?: string, 
+/**
  * Why the pass was skipped.
  */
 skipReason?: SkipReason, 

@@ -190,6 +190,17 @@ macro_rules! provisioner_plugin {
                 Ok(())
             }
 
+            fn observation_error(
+                &self,
+                fleet: Fleet<'_, Self::FleetOptions>,
+            ) -> Result<Option<String>, PortError> {
+                Ok(Some(format!(
+                    "observation {}: {}",
+                    self.number,
+                    fleet.options.seen()
+                )))
+            }
+
             async fn supply(
                 &self,
                 fleet: Fleet<'_, Self::FleetOptions>,

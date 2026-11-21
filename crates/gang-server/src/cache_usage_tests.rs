@@ -178,6 +178,7 @@ async fn published_state_carries_sink_traffic_and_the_sampled_measurement() -> T
     let ok = || PassStatus::Ok {
         applied: 0,
         failed: 0,
+        error: None,
     };
     publisher.publish(clock.wall(), ok(), &[], fleets.catalog(), &[]);
     sink.count(Traffic {
@@ -256,6 +257,7 @@ async fn a_promoted_publisher_samples_only_traffic_from_its_term() -> TestResult
     let ok = || PassStatus::Ok {
         applied: 0,
         failed: 0,
+        error: None,
     };
     publisher.publish(clock.wall(), ok(), &[], fleets.catalog(), &[]);
     let state: State = serde_json::from_slice(&dashboard.api().hub.state_json()?)?;
