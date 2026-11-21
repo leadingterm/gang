@@ -646,7 +646,7 @@ mod tests {
                 .is_err()
         );
         assert!(fake.calls.lock().is_empty());
-        let placeable = PlaceableActions::new(fake.clone(), runtime, admitted);
+        let placeable = PlaceableActions::new(fake.clone(), runtime, admitted.clone());
         assert!(
             placeable
                 .add_action(operation(), info(property::MEMORY_KB, &floor.to_string()))
