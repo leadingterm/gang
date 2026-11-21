@@ -189,7 +189,6 @@ export class StateClient {
   #lastFrame: UnixMs | null = null;
   #failures = 0;
   #cancelRetry: (() => void) | null = null;
-  #retryIsStream = false;
   #cancelRenewal: (() => void) | null = null;
   /** The renewal in flight, which every renewal requested meanwhile joins; `stop` drops it. */
   #renewal: Promise<void> | null = null;
@@ -221,11 +220,15 @@ export class StateClient {
 
   async start(): Promise<void> {
     this.#running = true;
+    await this.#loadSession("stream");
+  }
+
+  async #loadSession(owner: "stream" | "renewal"): Promise<void> {
     const generation = this.#sessionGeneration;
     const session = await this.#probe();
     if (generation !== this.#sessionGeneration) return;
     if (!session) {
-      if (this.link.value.kind !== "revoked") this.#retry(null);
+      if (this.link.value.kind !== "revoked") this.#retry(null, () => this.#loadSession(owner), owner);
       return;
     }
     this.#admit(session);
@@ -237,11 +240,8 @@ export class StateClient {
     this.#visible = visible;
     if (!visible) {
       this.#closeSource();
-      if (this.#retryIsStream) {
-        this.#cancelRetry?.();
-        this.#cancelRetry = null;
-        this.#retryIsStream = false;
-      }
+      this.#cancelRetry?.();
+      this.#cancelRetry = null;
       return;
     }
     if (!this.#running || this.link.value.kind === "revoked") return;
@@ -750,12 +750,12 @@ export class StateClient {
     }
     if (generation !== this.#sessionGeneration) return;
     if (status === 204) {
-      await this.start();
+      await this.#loadSession("renewal");
     } else if (status === 401 || status === 403) {
       this.#freeze(this.serverNow());
       this.#env.navigate(loginUrl(this.#env.here()));
     } else {
-      this.#retry(null, () => this.#renew(), false);
+      this.#retry(null, () => this.#renew(), "renewal");
     }
   }
 
@@ -773,22 +773,23 @@ export class StateClient {
   }
 
   /** Runs `attempt` again after `retryMs`, or after the next backoff step when it is null. */
-  #retry(retryMs: number | null, attempt: () => Promise<void> = () => this.start(), streamRetry = true): void {
+  #retry(retryMs: number | null, attempt: () => Promise<void> = () => this.start(), owner: "stream" | "renewal" = "stream"): void {
     const delay = retryMs ?? Math.min(BACKOFF_MAX_MS, BACKOFF_FIRST_MS * 2 ** this.#failures);
     this.#failures += 1;
     this.#freeze(this.serverNow() + delay);
-    this.#cancelRetry?.();
-    this.#retryIsStream = streamRetry;
-    if (streamRetry && !this.#visible) {
-      this.#cancelRetry = null;
-      this.#retryIsStream = false;
-      return;
+    if (owner === "renewal") {
+      this.#cancelRenewal?.();
+      this.#cancelRenewal = this.#env.schedule(() => {
+        this.#cancelRenewal = null;
+        void attempt();
+      }, delay);
+    } else {
+      this.#cancelRetry?.();
+      this.#cancelRetry = this.#visible ? this.#env.schedule(() => {
+        this.#cancelRetry = null;
+        void attempt();
+      }, delay) : null;
     }
-    this.#cancelRetry = this.#env.schedule(() => {
-      this.#cancelRetry = null;
-      this.#retryIsStream = false;
-      void attempt();
-    }, delay);
   }
 
   /** Freezes streamed rows without replacing a build-only or revoked link. */

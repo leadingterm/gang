@@ -675,6 +675,60 @@ test("hiding retains session renewal and its retry", async () => {
   assert.deepEqual(pendingDelays(env), [1000]);
 });
 
+test("a resumed stream failure cannot cancel a hidden renewal retry", async () => {
+  const env = new FakeEnvironment();
+  env.responses.set(PATHS.getSession, { ...defaultSession, ...EXPIRING });
+  const client = new StateClient(env);
+  await client.start();
+  env.source.emit("snapshot", snapshot);
+  client.setVisible(false);
+  env.postResults.push(503);
+  env.clock += RENEWAL_MS;
+  env.scheduled.find((entry) => entry.delay === RENEWAL_MS)?.run();
+  await flush();
+  assert.deepEqual(pendingDelays(env), [1000]);
+  client.setVisible(true);
+  env.source.fail();
+  await flush();
+  assert.equal(client.link.value.kind, "lost");
+  assert.deepEqual(pendingDelays(env), [1000, 2000]);
+  client.setVisible(false);
+  assert.deepEqual(pendingDelays(env), [1000]);
+  const fresh = { ...defaultSession, expireTime: iso(client.serverNow() + 600_000) };
+  env.responses.set(PATHS.getSession, fresh);
+  env.scheduled.find((entry) => !entry.fired && entry.delay === 1000)?.run();
+  await flush();
+  assert.deepEqual(env.posts, [PATHS.renew, PATHS.renew]);
+  assert.equal(client.session.value?.expireTime, fresh.expireTime);
+  assert.deepEqual(pendingDelays(env), [RENEWAL_MS]);
+  assert.equal(env.sources.length, 2);
+});
+
+test("a failed session probe after hidden renewal retries admission without another POST", async () => {
+  const env = new FakeEnvironment();
+  env.responses.set(PATHS.getSession, { ...defaultSession, ...EXPIRING });
+  const client = new StateClient(env);
+  await client.start();
+  env.source.emit("snapshot", snapshot);
+  client.setVisible(false);
+  env.clock += RENEWAL_MS;
+  env.responses.set(PATHS.getSession, new Error("offline"));
+  env.scheduled.find((entry) => entry.delay === RENEWAL_MS)?.run();
+  await flush();
+  assert.deepEqual(env.posts, [PATHS.renew]);
+  assert.deepEqual(pendingDelays(env), [1000]);
+  const fresh = { ...defaultSession, expireTime: iso(client.serverNow() + 600_000) };
+  env.responses.set(PATHS.getSession, fresh);
+  env.scheduled.find((entry) => !entry.fired && entry.delay === 1000)?.run();
+  await flush();
+  assert.deepEqual(env.posts, [PATHS.renew]);
+  assert.equal(client.session.value?.expireTime, fresh.expireTime);
+  assert.deepEqual(pendingDelays(env), [RENEWAL_MS]);
+  assert.equal(env.sources.length, 1);
+  client.setVisible(true);
+  assert.equal(env.sources.length, 2);
+});
+
 test("a failed stream without a principal renews before signing in", async () => {
   const { env } = await live();
   env.responses.set(PATHS.getSession, { ...anonymous, login: session.login });
