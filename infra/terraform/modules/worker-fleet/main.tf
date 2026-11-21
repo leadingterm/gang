@@ -68,7 +68,7 @@ data "aws_ec2_instance_type_offerings" "this" {
   }
 }
 
-# Gang's images boot UEFI only, so every fleet instance type must support it. Read at plan time.
+# Gang's images require UEFI and instance-store fleets need Nitro local SSDs. Read type metadata at plan time.
 data "aws_ec2_instance_type" "this" {
   for_each = toset(flatten(var.fleets[*].instance_types))
 
@@ -141,6 +141,16 @@ resource "aws_launch_template" "this" {
       condition     = alltrue([for type in each.value.instance_types : contains(data.aws_ec2_instance_type.this[type].boot_modes, "uefi")])
       error_message = "Fleet ${each.key}: Gang's images boot UEFI, and these instance types do not support it: ${join(", ", [for type in each.value.instance_types : type if !contains(data.aws_ec2_instance_type.this[type].boot_modes, "uefi")])}."
     }
+    precondition {
+      condition = each.value.scratch_volume_gib != null || alltrue([
+        for type in each.value.instance_types :
+        data.aws_ec2_instance_type.this[type].instance_storage_supported &&
+        data.aws_ec2_instance_type.this[type].hypervisor == "nitro" &&
+        length(data.aws_ec2_instance_type.this[type].instance_disks) > 0 &&
+        alltrue([for disk in data.aws_ec2_instance_type.this[type].instance_disks : disk.type == "ssd"])
+      ])
+      error_message = "Fleet ${each.key}: without scratch_volume_gib every instance type must have Nitro instance-store SSD (NVMe)."
+    }
   }
 }
 
@@ -174,10 +184,10 @@ resource "aws_autoscaling_group" "this" {
     instances_distribution {
       on_demand_base_capacity                  = 0
       on_demand_percentage_above_base_capacity = each.value.capacity == "spot" ? 0 : 100
-      # The order of instance_types is the on-demand priority; spot allocation ignores it.
+      # Instance type order is on-demand priority; capacity-optimized-prioritized Spot uses it after capacity considerations.
       on_demand_allocation_strategy = "prioritized"
       # Set explicitly so the planned value is known; lowest-price is AWS's default and has no effect for 100% on-demand.
-      spot_allocation_strategy = each.value.capacity == "spot" ? "price-capacity-optimized" : "lowest-price"
+      spot_allocation_strategy = each.value.capacity == "spot" ? local.fleets[each.value.fleet].spot_allocation_strategy : "lowest-price"
     }
 
     launch_template {

@@ -25,10 +25,13 @@ mock_provider "aws" {
     }
   }
 
-  # Every instance type the tests use supports UEFI boot unless a run overrides it.
+  # Every instance type supports UEFI and Nitro local SSD unless a run overrides it.
   mock_data "aws_ec2_instance_type" {
     defaults = {
-      boot_modes = ["legacy-bios", "uefi"]
+      boot_modes                 = ["legacy-bios", "uefi"]
+      instance_storage_supported = true
+      hypervisor                 = "nitro"
+      instance_disks             = [{ count = 1, size = 950, type = "ssd" }]
     }
   }
 
@@ -292,6 +295,182 @@ run "rejects_ebs_only_type_without_scratch_volume" {
         max_instances  = 4
       },
     ]
+  }
+
+  override_data {
+    target = data.aws_ec2_instance_type.this
+    values = {
+      boot_modes                 = ["uefi"]
+      instance_storage_supported = false
+      hypervisor                 = "nitro"
+      instance_disks             = []
+    }
+  }
+
+  expect_failures = [aws_launch_template.this]
+}
+
+run "accepts_i8g_local_nvme" {
+  command = plan
+
+  variables {
+    fleets = [{
+      name           = "gang-worker-aarch64"
+      capacity       = "spot"
+      ami_id         = "ami-0000000000000002"
+      instance_types = ["i8g.4xlarge"]
+      max_instances  = 4
+    }]
+  }
+
+  override_data {
+    target = data.aws_ec2_instance_type_offerings.this
+    values = {
+      instance_types = ["i8g.4xlarge"]
+      locations      = ["eu-north-1a"]
+    }
+  }
+
+  override_data {
+    target = data.aws_ec2_instance_type.this
+    values = {
+      boot_modes                 = ["uefi"]
+      instance_storage_supported = true
+      hypervisor                 = "nitro"
+      instance_disks             = [{ count = 1, size = 950, type = "ssd" }]
+    }
+  }
+
+  assert {
+    condition     = aws_autoscaling_group.this["gang-worker-aarch64"].mixed_instances_policy[0].launch_template[0].override[0].instance_type == "i8g.4xlarge"
+    error_message = "i8g with Nitro local SSD must be accepted without an EBS scratch volume."
+  }
+}
+
+run "accepts_ebs_scratch_without_instance_storage" {
+  command = plan
+
+  variables {
+    fleets = [{
+      name               = "gang-worker-aarch64"
+      capacity           = "spot"
+      ami_id             = "ami-0000000000000002"
+      instance_types     = ["m7g.2xlarge"]
+      max_instances      = 4
+      scratch_volume_gib = 200
+    }]
+  }
+
+  override_data {
+    target = data.aws_ec2_instance_type.this
+    values = {
+      boot_modes                 = ["uefi"]
+      instance_storage_supported = false
+      hypervisor                 = "xen"
+      instance_disks             = []
+    }
+  }
+
+  assert {
+    condition     = length([for mapping in aws_launch_template.this["gang-worker-aarch64"].block_device_mappings : mapping if mapping.device_name == "/dev/sdf"]) == 1
+    error_message = "EBS scratch must bypass local storage requirements."
+  }
+}
+
+run "rejects_non_nitro_local_storage" {
+  command = plan
+
+  override_data {
+    target = data.aws_ec2_instance_type.this
+    values = {
+      boot_modes                 = ["uefi"]
+      instance_storage_supported = true
+      hypervisor                 = "xen"
+      instance_disks             = [{ count = 1, size = 950, type = "ssd" }]
+    }
+  }
+
+  expect_failures = [aws_launch_template.this]
+}
+
+run "rejects_hdd_local_storage" {
+  command = plan
+
+  override_data {
+    target = data.aws_ec2_instance_type.this
+    values = {
+      boot_modes                 = ["uefi"]
+      instance_storage_supported = true
+      hypervisor                 = "nitro"
+      instance_disks             = [{ count = 1, size = 950, type = "ssd" }, { count = 1, size = 950, type = "hdd" }]
+    }
+  }
+
+  expect_failures = [aws_launch_template.this]
+}
+
+run "rejects_empty_local_disk_metadata" {
+  command = plan
+
+  override_data {
+    target = data.aws_ec2_instance_type.this
+    values = {
+      boot_modes                 = ["uefi"]
+      instance_storage_supported = true
+      hypervisor                 = "nitro"
+      instance_disks             = []
+    }
+  }
+
+  expect_failures = [aws_launch_template.this]
+}
+
+run "prioritized_spot_preserves_override_order_with_fallback" {
+  command = plan
+
+  variables {
+    fleets = [{
+      name                     = "gang-worker-x86-64"
+      capacity                 = "spot"
+      ami_id                   = "ami-0000000000000001"
+      instance_types           = ["c7gd.4xlarge", "c6id.4xlarge"]
+      spot_allocation_strategy = "capacity-optimized-prioritized"
+      max_instances            = 4
+      fallback                 = {}
+    }]
+  }
+
+  assert {
+    condition     = aws_autoscaling_group.this["gang-worker-x86-64"].mixed_instances_policy[0].instances_distribution[0].spot_allocation_strategy == "capacity-optimized-prioritized"
+    error_message = "The Spot group must use the configured prioritized strategy."
+  }
+
+  assert {
+    condition = alltrue([
+      for name in ["gang-worker-x86-64", "gang-worker-x86-64-on-demand"] :
+      [for override in aws_autoscaling_group.this[name].mixed_instances_policy[0].launch_template[0].override : override.instance_type] == ["c7gd.4xlarge", "c6id.4xlarge"]
+    ])
+    error_message = "The Spot group and on-demand twin must preserve exact instance type order."
+  }
+
+  assert {
+    condition     = aws_autoscaling_group.this["gang-worker-x86-64-on-demand"].mixed_instances_policy[0].instances_distribution[0].on_demand_percentage_above_base_capacity == 100 && aws_autoscaling_group.this["gang-worker-x86-64-on-demand"].mixed_instances_policy[0].instances_distribution[0].on_demand_allocation_strategy == "prioritized" && aws_autoscaling_group.this["gang-worker-x86-64-on-demand"].mixed_instances_policy[0].instances_distribution[0].spot_allocation_strategy == "lowest-price"
+    error_message = "The twin must remain prioritized 100% on-demand with lowest-price Spot strategy."
+  }
+}
+
+run "rejects_invalid_spot_allocation_strategy" {
+  command = plan
+
+  variables {
+    fleets = [{
+      name                     = "gang-worker-x86-64"
+      capacity                 = "spot"
+      ami_id                   = "ami-0000000000000001"
+      instance_types           = ["c6id.4xlarge"]
+      max_instances            = 4
+      spot_allocation_strategy = "capacity-optimised-prioritized"
+    }]
   }
 
   expect_failures = [var.fleets]
@@ -1042,7 +1221,10 @@ run "rejects_fleet_instance_type_without_uefi" {
   override_data {
     target = data.aws_ec2_instance_type.this
     values = {
-      boot_modes = ["legacy-bios"]
+      boot_modes                 = ["legacy-bios"]
+      instance_storage_supported = true
+      hypervisor                 = "nitro"
+      instance_disks             = [{ count = 1, size = 950, type = "ssd" }]
     }
   }
 

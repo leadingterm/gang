@@ -2,6 +2,7 @@
 //!
 //! Cleanup retention composes engine replacement actions with the applied SSM
 //! resource set. The expected forgotten-instance diagnostic has no inventory.
+//! Cleanup failures retain resource inventory and diagnostics, never plan or state payloads.
 
 use std::error::Error;
 use std::ffi::OsString;
@@ -152,9 +153,10 @@ fn selected_evidence(stdout: &[u8]) -> Result<Evidence> {
     let mut file = false;
     let mut abstract_seen = false;
     let mut forgotten_notice = false;
-    for line in stdout
+    for (line_index, line) in stdout
         .split(|b| *b == b'\n')
         .filter(|line| !line.is_empty())
+        .enumerate()
     {
         let event: Value = serde_json::from_slice(line)?;
         if forgotten_notice
@@ -165,7 +167,9 @@ fn selected_evidence(stdout: &[u8]) -> Result<Evidence> {
         {
             return Err("run evidence follows the cleanup notice".into());
         }
-        if record_diagnostic(&event, &mut forgotten_notice)? {
+        if record_diagnostic(&event, &mut forgotten_notice)
+            .map_err(|error| cleanup_failure_context(stdout, error.to_string(), line_index))?
+        {
             if !runs.iter().all(|run| *run) || !payloads.iter().all(Option::is_some) {
                 return Err("cleanup notice precedes completed run evidence".into());
             }
@@ -222,6 +226,48 @@ fn selected_evidence(stdout: &[u8]) -> Result<Evidence> {
     };
     validate_retention(&evidence, forgotten_notice)?;
     Ok(evidence)
+}
+
+fn cleanup_failure_context(stdout: &[u8], mut message: String, failed_line: usize) -> String {
+    for (index, line) in stdout
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+        .enumerate()
+    {
+        let Ok(event) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        if event["type"] == "test_cleanup" {
+            if let Some(resources) = event["test_cleanup"]["failed_resources"].as_array() {
+                for resource in resources {
+                    if let Some(instance) = resource["instance"].as_str() {
+                        message.push_str("\ncleanup failed resource: ");
+                        message.push_str(instance);
+                        if let Some(key) = resource["deposed_key"].as_str() {
+                            message.push_str(" (deposed key: ");
+                            message.push_str(key);
+                            message.push(')');
+                        }
+                    }
+                }
+            }
+        } else if index > failed_line
+            && event["type"] == "diagnostic"
+            && event["@testfile"] == TEST
+            && event["@testrun"] == "promote"
+            && event["diagnostic"]["severity"] == "error"
+        {
+            if let Some(summary) = event["diagnostic"]["summary"].as_str() {
+                message.push_str("\ncleanup diagnostic: ");
+                message.push_str(summary);
+            }
+            if let Some(detail) = event["diagnostic"]["detail"].as_str() {
+                message.push('\n');
+                message.push_str(detail);
+            }
+        }
+    }
+    message
 }
 
 fn record_diagnostic(event: &Value, forgotten_notice: &mut bool) -> Result<bool> {
@@ -311,54 +357,6 @@ fn record_payload(
 }
 
 fn extract(stdout: &[u8], local_config: String) -> Result<Fixture> {
-    extract_inner(stdout, local_config).map_err(|error| cleanup_context(stdout, error))
-}
-
-fn cleanup_context(stdout: &[u8], error: Box<dyn Error>) -> Box<dyn Error> {
-    let mut cleanup_seen = false;
-    let mut context = Vec::new();
-    for line in stdout.split(|byte| *byte == b'\n') {
-        let Ok(event) = serde_json::from_slice::<Value>(line) else {
-            continue;
-        };
-        let scope = (event["@testfile"].as_str(), event["@testrun"].as_str());
-        match event["type"].as_str() {
-            Some("test_cleanup") => {
-                cleanup_seen = true;
-                context.push(serde_json::json!({
-                    "type": "test_cleanup",
-                    "@testfile": scope.0,
-                    "@testrun": scope.1,
-                    "failed_resources": event["test_cleanup"]["failed_resources"],
-                }));
-            }
-            Some("diagnostic") if !crate::contract::is_successful_forget_notice(&event) => {
-                let diagnostic = &event["diagnostic"];
-                context.push(serde_json::json!({
-                    "type": "diagnostic",
-                    "@testfile": scope.0,
-                    "@testrun": scope.1,
-                    "severity": diagnostic["severity"].as_str(),
-                    "summary": diagnostic["summary"].as_str(),
-                    "detail": diagnostic["detail"].as_str(),
-                    "scope": diagnostic["scope"].as_str(),
-                }));
-            }
-            _ => {}
-        }
-    }
-    if cleanup_seen {
-        format!(
-            "{error}\nOpenTofu cleanup context: {}",
-            Value::Array(context)
-        )
-        .into()
-    } else {
-        error
-    }
-}
-
-fn extract_inner(stdout: &[u8], local_config: String) -> Result<Fixture> {
     let evidence = selected_evidence(stdout)?;
     let plan = &evidence.upgrade;
     let gang = plan
@@ -1653,73 +1651,6 @@ mod tests {
     }
 
     #[test]
-    fn reports_cleanup_inventory_and_diagnostics_in_either_order() {
-        let cleanup = json!({
-            "type":"test_cleanup", "@testfile":TEST, "@testrun":"promote",
-            "test_cleanup":{"failed_resources":[
-                {"instance":"first.resource"}, {"instance":"second.resource"}
-            ]},
-            "test_plan":{"secret":"SENTINEL"}
-        });
-        let diagnostic = json!({
-            "type":"diagnostic", "@testfile":TEST, "@testrun":"promote",
-            "diagnostic":{"severity":"error", "summary":"cleanup failed",
-                "detail":"provider deletion failed", "scope":"module.worker"},
-            "test_plan":{"secret":"SENTINEL"}
-        });
-        for diagnostic_first in [false, true] {
-            let mut events = synthetic_events(&plan(GANG), false);
-            if diagnostic_first {
-                events.extend([diagnostic.clone(), cleanup.clone()]);
-            } else {
-                events.extend([cleanup.clone(), diagnostic.clone()]);
-            }
-            let stdout = encode_events(&events);
-            let original = selected_evidence(&stdout)
-                .err()
-                .expect("rejected")
-                .to_string();
-            let message = extract(&stdout, "local".into())
-                .err()
-                .expect("rejected")
-                .to_string();
-            assert!(message.starts_with(&original));
-            for expected in [
-                TEST,
-                "promote",
-                "first.resource",
-                "second.resource",
-                "error",
-                "cleanup failed",
-                "provider deletion failed",
-                "module.worker",
-            ] {
-                assert!(message.contains(expected), "missing {expected}: {message}");
-            }
-            assert!(!message.contains("SENTINEL"));
-            assert!(!message.contains(FORGOTTEN_SUMMARY));
-        }
-    }
-
-    #[test]
-    fn leaves_errors_without_cleanup_unchanged_and_accepts_forget_notice() {
-        let mut events = synthetic_events(&plan(GANG), false);
-        assert!(extract(&encode_events(&events), "local".into()).is_ok());
-        events.push(json!({"type":"diagnostic", "@level":"error",
-            "diagnostic":{"severity":"error", "summary":"unexpected"}}));
-        let stdout = encode_events(&events);
-        let original = selected_evidence(&stdout)
-            .err()
-            .expect("rejected")
-            .to_string();
-        let message = extract(&stdout, "local".into())
-            .err()
-            .expect("rejected")
-            .to_string();
-        assert_eq!(message, original);
-    }
-
-    #[test]
     fn reports_warning_context_without_dumping_plan_values() {
         let event = json!({
             "type":"log", "@level":"warn", "@message":"provider shutdown failed",
@@ -1729,6 +1660,41 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("(log): provider shutdown failed"));
         assert!(!message.contains("must not appear"));
+    }
+
+    #[test]
+    fn reports_cleanup_inventory_and_later_diagnostic_without_payloads() {
+        let mut events = synthetic_events(&plan(GANG), true);
+        events.push(json!({
+            "type":"test_cleanup", "@level":"warn", "@message":"cleanup failed",
+            "@testfile":TEST, "@testrun":"promote",
+            "test_cleanup":{"failed_resources":[
+                {"instance":"aws_ebs_volume.state", "deposed_key":"deadbeef"}
+            ]},
+            "test_plan":{"secret":"plan-secret-sentinel"},
+            "test_state":{"secret":"state-secret-sentinel"}
+        }));
+        events.push(json!({
+            "type":"diagnostic", "@level":"error", "@testfile":TEST, "@testrun":"promote",
+            "diagnostic":{"severity":"error", "summary":"destroy blocked",
+                "detail":"prevent_destroy retained state volume"}
+        }));
+        let error = selected_evidence(&encode_events(&events))
+            .err()
+            .expect("cleanup warning is rejected");
+        let message = error.to_string();
+        let prefix = "OpenTofu emitted an error or warning (test_cleanup): cleanup failed";
+        assert!(message.starts_with(prefix));
+        for expected in [
+            "aws_ebs_volume.state",
+            "deadbeef",
+            "destroy blocked",
+            "prevent_destroy retained state volume",
+        ] {
+            assert!(message.contains(expected));
+        }
+        assert!(!message.contains("plan-secret-sentinel"));
+        assert!(!message.contains("state-secret-sentinel"));
     }
 
     #[test]

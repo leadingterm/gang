@@ -39,9 +39,10 @@ variable "fleets" {
   description = <<-EOT
     Worker fleets in preference order. Each fleet has one Auto Scaling group; a fleet with `fallback` also has an on-demand twin group named `<name>-on-demand`. Names must be unique.
     - `name`: the ASG name, which is also the fleet name the controller uses. 1 to 40 lowercase letters, digits and hyphens; starts and ends with a letter or digit.
-    - `capacity`: `spot` or `on-demand`. Spot fleets buy interruptible capacity with price-capacity-optimized allocation; on-demand fleets buy only on-demand capacity.
+    - `capacity`: `spot` or `on-demand`. Spot fleets buy interruptible capacity; on-demand fleets buy only on-demand capacity.
+    - `spot_allocation_strategy`: Spot allocation strategy, default `price-capacity-optimized`. With `capacity-optimized-prioritized`, Spot prioritizes capacity first and uses instance type order on a best-effort basis.
     - `ami_id`: the worker AMI for this fleet.
-    - `instance_types`: instance types, one mixed-instances override each. The list order is the priority for on-demand fleets: the first type is tried first. Spot fleets ignore the order. Types must be distinct. Unless `scratch_volume_gib` is set, every type must have instance-store NVMe (a `d` family such as `m8id.4xlarge` or `m7gd.4xlarge`). Each of the fleet's groups spans only the subnets whose availability zone offers at least one of these types; the plan fails when no zone offers any.
+    - `instance_types`: instance types, one mixed-instances override each. List order is the on-demand priority: the first type is tried first. Spot uses the order only with `capacity-optimized-prioritized`, after capacity considerations. Types must be distinct. Unless `scratch_volume_gib` is set, every type must have Nitro instance-store SSD (NVMe). Each of the fleet's groups spans only the subnets whose availability zone offers at least one of these types; the plan fails when no zone offers any.
     - `max_instances`: the ASG maximum size.
     - `scratch_volume_gib`: size of an encrypted gp3 EBS data volume at `/dev/sdf`, for EBS-only instance types. `null` attaches no scratch volume.
     - `root_volume_gib`: size of the encrypted gp3 root volume. Defaults to 30 GiB.
@@ -49,15 +50,16 @@ variable "fleets" {
     - `fallback`: opts a spot fleet in to on-demand fallback. The fleet keeps its spot group and gains the on-demand twin, which takes capacity while Spot is unavailable. Presence opts in; `null` keeps Spot only. Requires `capacity` `spot`.
   EOT
   type = list(object({
-    name               = string
-    capacity           = string
-    ami_id             = string
-    instance_types     = list(string)
-    max_instances      = number
-    scratch_volume_gib = optional(number, null)
-    root_volume_gib    = optional(number, 30)
-    warm_pool_size     = optional(number, 0)
-    fallback           = optional(object({}), null)
+    name                     = string
+    capacity                 = string
+    ami_id                   = string
+    instance_types           = list(string)
+    spot_allocation_strategy = optional(string, "price-capacity-optimized")
+    max_instances            = number
+    scratch_volume_gib       = optional(number, null)
+    root_volume_gib          = optional(number, 30)
+    warm_pool_size           = optional(number, 0)
+    fallback                 = optional(object({}), null)
   }))
   nullable = false
 
@@ -82,6 +84,11 @@ variable "fleets" {
   }
 
   validation {
+    condition     = alltrue([for fleet in var.fleets : contains(["price-capacity-optimized", "capacity-optimized", "capacity-optimized-prioritized", "lowest-price"], fleet.spot_allocation_strategy)])
+    error_message = "Each fleet's spot_allocation_strategy must be price-capacity-optimized, capacity-optimized, capacity-optimized-prioritized, or lowest-price."
+  }
+
+  validation {
     condition     = alltrue([for fleet in var.fleets : length(fleet.instance_types) > 0])
     error_message = "Each fleet needs at least one instance type."
   }
@@ -94,17 +101,6 @@ variable "fleets" {
   validation {
     condition     = alltrue([for fleet in var.fleets : fleet.max_instances >= 1])
     error_message = "Each fleet needs max_instances >= 1."
-  }
-
-  validation {
-    condition = alltrue([
-      for fleet in var.fleets :
-      fleet.scratch_volume_gib != null || alltrue([
-        for instance_type in fleet.instance_types :
-        can(regex("^[a-z]+[0-9]+[a-z]*d[a-z]*\\.[a-z0-9]+$", instance_type))
-      ])
-    ])
-    error_message = "Without scratch_volume_gib every instance type must have instance-store NVMe (a 'd' family such as m8id.4xlarge). Set scratch_volume_gib for EBS-only types."
   }
 
   validation {
