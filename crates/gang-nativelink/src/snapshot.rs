@@ -79,9 +79,8 @@ fn worker_state(summary: &WorkerSummary) -> Option<WorkerState> {
 fn worker_ledger(summary: &WorkerSummary) -> Option<(ActionResources, ActionResources)> {
     let total = &summary.platform_properties;
     let available = &summary.available_platform_properties;
-    let read = |properties: &HashMap<String, String>, key: &str| {
-        properties.get(key)?.parse::<u64>().ok()
-    };
+    let read =
+        |properties: &HashMap<String, String>, key: &str| properties.get(key)?.parse::<u64>().ok();
     let cpu = read(total, property::CPU_MILLICORES)?;
     let memory_kb = read(total, property::MEMORY_KB)?;
     let available_cpu = read(available, property::CPU_MILLICORES)?;
@@ -200,7 +199,8 @@ fn parse<T: std::str::FromStr + Default>(properties: &HashMap<String, String>, k
 pub(crate) fn resources(properties: &HashMap<String, String>) -> ActionResources {
     let mut result = admitted_resources(properties);
     let cores: u32 = parse(properties, property::CPU_COUNT);
-    result.cpu_millicores = result.cpu_millicores
+    result.cpu_millicores = result
+        .cpu_millicores
         .max(u64::from(cores).saturating_mul(property::MILLICORES_PER_CORE));
     result
 }
@@ -602,16 +602,22 @@ pub(crate) mod tests {
         for running in [0, 1, 999] {
             listing.running_actions = running;
             let state = worker_state(&listing).expect("managed worker");
-            assert_eq!(state.capacity, Some(ActionResources {
-                cpu_millicores: 8000,
-                memory: Bytes::kib(16384),
-                disk: Bytes::new(0),
-            }));
-            assert_eq!(state.reserved, Some(ActionResources {
-                cpu_millicores: 2500,
-                memory: Bytes::kib(6384),
-                disk: Bytes::new(0),
-            }));
+            assert_eq!(
+                state.capacity,
+                Some(ActionResources {
+                    cpu_millicores: 8000,
+                    memory: Bytes::kib(16384),
+                    disk: Bytes::new(0),
+                })
+            );
+            assert_eq!(
+                state.reserved,
+                Some(ActionResources {
+                    cpu_millicores: 2500,
+                    memory: Bytes::kib(6384),
+                    disk: Bytes::new(0),
+                })
+            );
         }
     }
 
@@ -649,11 +655,21 @@ pub(crate) mod tests {
             let state = worker_state(&listing).expect("managed worker");
             assert_eq!((state.capacity, state.reserved), (None, None), "{key}");
         }
-        valid.platform_properties.insert(property::MEMORY_KB.to_owned(), u64::MAX.to_string());
-        valid.available_platform_properties.insert(property::MEMORY_KB.to_owned(), "0".to_owned());
+        valid
+            .platform_properties
+            .insert(property::MEMORY_KB.to_owned(), u64::MAX.to_string());
+        valid
+            .available_platform_properties
+            .insert(property::MEMORY_KB.to_owned(), "0".to_owned());
         let state = worker_state(&valid).expect("managed worker");
-        assert_eq!(state.capacity.expect("capacity").memory, Bytes::new(u64::MAX));
-        assert_eq!(state.reserved.expect("reserved").memory, Bytes::new(u64::MAX));
+        assert_eq!(
+            state.capacity.expect("capacity").memory,
+            Bytes::new(u64::MAX)
+        );
+        assert_eq!(
+            state.reserved.expect("reserved").memory,
+            Bytes::new(u64::MAX)
+        );
     }
 
     #[tokio::test]
@@ -669,9 +685,16 @@ pub(crate) mod tests {
             (property::MEMORY_KB, "6000"),
         ]);
         let scheduler = Fake {
-            by_worker: HashMap::from([(WORKER.to_owned(), vec![
-                row("running", ActionStage::Executing, 0, info(0, 0, &[]), None),
-            ])]),
+            by_worker: HashMap::from([(
+                WORKER.to_owned(),
+                vec![row(
+                    "running",
+                    ActionStage::Executing,
+                    0,
+                    info(0, 0, &[]),
+                    None,
+                )],
+            )]),
             ..Default::default()
         };
         let before = worker_state(&worker).expect("managed worker");
@@ -680,18 +703,28 @@ pub(crate) mod tests {
             &scheduler,
             std::slice::from_ref(&worker),
             &catalog(),
-            gang_spi::ListingLimits { running: 0, queued: 0 },
+            gang_spi::ListingLimits {
+                running: 0,
+                queued: 0,
+            },
             &mut view,
-        ).await?;
+        )
+        .await?;
         assert_eq!(view.truncated_running, 1);
         assert!(view.running.is_empty());
         let after = worker_state(&worker).expect("managed worker");
-        assert_eq!((before.capacity, before.reserved), (after.capacity, after.reserved));
-        assert_eq!(after.reserved, Some(ActionResources {
-            cpu_millicores: 1000,
-            memory: Bytes::kib(2000),
-            disk: Bytes::new(0),
-        }));
+        assert_eq!(
+            (before.capacity, before.reserved),
+            (after.capacity, after.reserved)
+        );
+        assert_eq!(
+            after.reserved,
+            Some(ActionResources {
+                cpu_millicores: 1000,
+                memory: Bytes::kib(2000),
+                disk: Bytes::new(0),
+            })
+        );
         Ok(())
     }
 

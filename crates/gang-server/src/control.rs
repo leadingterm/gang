@@ -1043,7 +1043,9 @@ mod tests {
     -> gang_testkit::TestResult {
         use futures::poll;
         use gang_reconciler::{NeedCause, ScaleDecision};
-        use gang_spi::{FleetInstance, FleetSupply, InstanceCordon, SchedulerSnapshot, WorkerState};
+        use gang_spi::{
+            FleetInstance, FleetSupply, InstanceCordon, SchedulerSnapshot, WorkerState,
+        };
 
         let fleets = crate::test_support::fleets();
         let provisioner = gang_testkit::FakeProvisioner::default();
@@ -1056,18 +1058,24 @@ mod tests {
         let fleet = FleetName::try_new("example-fleet")?;
         let instance = InstanceId::try_new("local-1")?;
         let worker = gang_testkit::worker_on(&instance)?;
-        provisioner.set_supply(&fleet, FleetSupply {
-            desired: 1,
-            instances: vec![FleetInstance {
-                id: instance.clone(),
-                lifecycle: InstanceLifecycle::InService,
-                launched_at: clock.wall(),
-                release_first: false,
-            }],
-            ..FleetSupply::default()
-        });
+        provisioner.set_supply(
+            &fleet,
+            FleetSupply {
+                desired: 1,
+                instances: vec![FleetInstance {
+                    id: instance.clone(),
+                    lifecycle: InstanceLifecycle::InService,
+                    launched_at: clock.wall(),
+                    release_first: false,
+                }],
+                ..FleetSupply::default()
+            },
+        );
         scheduler.set_snapshot(SchedulerSnapshot {
-            cordons: vec![InstanceCordon { fleet: 0, instance: Arc::new(instance.clone()) }],
+            cordons: vec![InstanceCordon {
+                fleet: 0,
+                instance: Arc::new(instance.clone()),
+            }],
             workers: vec![WorkerState {
                 id: worker.clone(),
                 fleet,
@@ -1084,34 +1092,57 @@ mod tests {
         });
         let mut control = control(&fleets, &provisioner, &scheduler, &repository, &clock);
         assert!(control.plan_pass().await.is_ok());
-        assert!(control.plan.steps.iter().any(|step| matches!(step.action, Action::Terminate { .. })));
-        control.plan.steps.insert(0, PlanStep {
-            fleet: 0,
-            action: Action::ReinforceDrain(worker),
-        });
-        control.plan.steps.insert(0, PlanStep {
-            fleet: 0,
-            action: Action::ScaleOut {
-                from: 1,
-                to: 2,
-                need: NeedCause::Demand,
-                summary: ScaleDecision::default(),
+        assert!(
+            control
+                .plan
+                .steps
+                .iter()
+                .any(|step| matches!(step.action, Action::Terminate { .. }))
+        );
+        control.plan.steps.insert(
+            0,
+            PlanStep {
+                fleet: 0,
+                action: Action::ReinforceDrain(worker),
             },
-        });
+        );
+        control.plan.steps.insert(
+            0,
+            PlanStep {
+                fleet: 0,
+                action: Action::ScaleOut {
+                    from: 1,
+                    to: 2,
+                    need: NeedCause::Demand,
+                    summary: ScaleDecision::default(),
+                },
+            },
+        );
         let guard = scheduler.hold_control_acquisition().await;
         {
             let apply = control.apply_plan();
             futures::pin_mut!(apply);
             assert!(poll!(apply.as_mut()).is_pending());
             clock.advance(Duration::from_secs(1));
-            assert_eq!(apply.await, PassOutcome::Skipped(SkipReason::SchedulerUnavailable));
+            assert_eq!(
+                apply.await,
+                PassOutcome::Skipped(SkipReason::SchedulerUnavailable)
+            );
         }
         assert_eq!(provisioner.desired_requests().len(), 1);
         assert!(provisioner.terminations().is_empty());
         assert!(scheduler.draining_calls().is_empty());
-        assert!(repository.scaling_events().iter().any(|event| matches!(event.kind, ScalingEventKind::ScaledOut { .. })));
+        assert!(
+            repository
+                .scaling_events()
+                .iter()
+                .any(|event| matches!(event.kind, ScalingEventKind::ScaledOut { .. }))
+        );
         drop(guard);
-        assert!(matches!(control.pass().await, PassOutcome::Completed { failed: 0, .. }));
+        assert!(matches!(
+            control.pass().await,
+            PassOutcome::Completed { failed: 0, .. }
+        ));
         assert_eq!(provisioner.terminations().len(), 1);
         Ok(())
     }

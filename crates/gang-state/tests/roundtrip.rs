@@ -744,7 +744,11 @@ fn reservation_only_changes_round_trip_through_sse() -> Result<(), Box<dyn Error
     let action_patch = delta.actions.as_ref().ok_or("missing action patch")?;
     let expected = cur.actions.as_ref().ok_or("missing actions")?;
     assert_eq!(
-        action_patch.running.as_ref().ok_or("missing running patch")?.upsert,
+        action_patch
+            .running
+            .as_ref()
+            .ok_or("missing running patch")?
+            .upsert,
         expected.running
     );
     assert_eq!(action_patch.queued.as_ref(), Some(&expected.queued));

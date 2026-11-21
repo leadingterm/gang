@@ -744,7 +744,16 @@ pub struct Demand {
 
 /// CPU and memory resources from the scheduler's reservation ledger.
 #[derive(
-    gang_macros::Known, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS,
+    gang_macros::Known,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    Default,
+    ts_rs::TS,
 )]
 #[serde(rename_all = "camelCase")]
 pub struct Reservation {

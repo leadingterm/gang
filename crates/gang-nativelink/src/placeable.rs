@@ -422,10 +422,9 @@ mod tests {
             MinReservation::from_units(8192),
             DiskMinReservation::from_units(2048),
         );
-        for (value, expected, pre_fit_cpu) in [
-            ("871000", "15000", 871000),
-            ("12000", "12000", 12000),
-        ] {
+        for (value, expected, pre_fit_cpu) in
+            [("871000", "15000", 871000), ("12000", "12000", 12000)]
+        {
             let _admission = admitted.insert(
                 operation(),
                 fleets
@@ -446,7 +445,11 @@ mod tests {
                 expected
             );
             assert_eq!(
-                fake.calls.lock().last().expect("recorded").pre_fit_reservation,
+                fake.calls
+                    .lock()
+                    .last()
+                    .expect("recorded")
+                    .pre_fit_reservation,
                 Some(ActionReservation {
                     cpu_millicores: pre_fit_cpu,
                     memory_bytes: 0,
@@ -891,13 +894,23 @@ mod tests {
         Arc::make_mut(&mut action)
             .platform_properties
             .insert(property::MEMORY_KB.to_owned(), "73400320".to_owned());
-        fitted.add_action(operation(), action).await.expect("fitted");
+        fitted
+            .add_action(operation(), action)
+            .await
+            .expect("fitted");
         let calls = fake.calls.lock();
         let fitted = &calls[0];
-        assert_eq!(fitted.platform_properties[property::CPU_MILLICORES], "15000");
+        assert_eq!(
+            fitted.platform_properties[property::CPU_MILLICORES],
+            "15000"
+        );
         assert_eq!(fitted.platform_properties[property::MEMORY_KB], "67108864");
         assert_eq!(
-            fitted.memory_reservation.as_ref().unwrap().cpu_before_memory_fit,
+            fitted
+                .memory_reservation
+                .as_ref()
+                .unwrap()
+                .cpu_before_memory_fit,
             Some(15000)
         );
         assert_eq!(
@@ -924,7 +937,10 @@ mod tests {
             .await
             .expect("fitted");
         let calls = fake.calls.lock();
-        assert_eq!(calls[0].platform_properties[property::MEMORY_KB], "67108864");
+        assert_eq!(
+            calls[0].platform_properties[property::MEMORY_KB],
+            "67108864"
+        );
         assert_eq!(
             calls[0].pre_fit_reservation,
             Some(ActionReservation {

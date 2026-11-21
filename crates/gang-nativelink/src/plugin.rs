@@ -144,28 +144,33 @@ impl SchedulerPort for NativeLink {
     async fn snapshot(&self, into: &mut SchedulerSnapshot) -> Result<(), PortError> {
         let handles = self.current()?;
         let acquisition = Acquisition::new(&*handles.clock, handles.control_acquire_timeout);
-        acquisition.wait(async {
-            let mut scratch = handles.scratch.lock().await;
-            handles.worker_scheduler.cordons_into(&mut into.cordons).await;
-            let workers = handles.worker_scheduler.worker_snapshot().await;
-            let completed = handles.completed.load(Ordering::Relaxed);
-            let fleets = handles.fleets.current().map_err(PortError::backend)?;
-            snapshot::fill(
-                &*handles.action_scheduler,
-                &workers,
-                &fleets,
-                &handles.durations,
-                handles.clock.wall(),
-                completed,
-                &handles.rates,
-                &mut scratch,
-                into,
-            )
-            .await
-            .map_err(PortError::backend)?;
-            handles.stores.fill(&mut into.stores);
-            Ok(())
-        }).await?
+        acquisition
+            .wait(async {
+                let mut scratch = handles.scratch.lock().await;
+                handles
+                    .worker_scheduler
+                    .cordons_into(&mut into.cordons)
+                    .await;
+                let workers = handles.worker_scheduler.worker_snapshot().await;
+                let completed = handles.completed.load(Ordering::Relaxed);
+                let fleets = handles.fleets.current().map_err(PortError::backend)?;
+                snapshot::fill(
+                    &*handles.action_scheduler,
+                    &workers,
+                    &fleets,
+                    &handles.durations,
+                    handles.clock.wall(),
+                    completed,
+                    &handles.rates,
+                    &mut scratch,
+                    into,
+                )
+                .await
+                .map_err(PortError::backend)?;
+                handles.stores.fill(&mut into.stores);
+                Ok(())
+            })
+            .await?
     }
 
     /// Lists the running and queued actions of the serving controller, bounded by `limits`.
@@ -196,7 +201,10 @@ impl SchedulerPort for NativeLink {
     ) -> Result<(), PortError> {
         let handles = self.current()?;
         let acquisition = Acquisition::new(&*handles.clock, handles.control_acquire_timeout);
-        handles.worker_scheduler.set_draining(fleet, instance, draining, &acquisition).await
+        handles
+            .worker_scheduler
+            .set_draining(fleet, instance, draining, &acquisition)
+            .await
     }
 
     async fn retain_drains(
@@ -207,7 +215,10 @@ impl SchedulerPort for NativeLink {
     ) -> Result<(), PortError> {
         let handles = self.current()?;
         let acquisition = Acquisition::new(&*handles.clock, handles.control_acquire_timeout);
-        handles.worker_scheduler.retain_drains(now, grace, live, &acquisition).await
+        handles
+            .worker_scheduler
+            .retain_drains(now, grace, live, &acquisition)
+            .await
     }
 
     fn endpoints(&self) -> ControllerEndpoints {

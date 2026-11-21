@@ -1340,7 +1340,10 @@ mod tests {
         scheduler.cordons_into(&mut cordons).await;
         assert!(cordons.is_empty());
         let acquisition = Acquisition::new(&clock, bound);
-        scheduler.set_draining(&fleet, &instance, true, &acquisition).await.expect("retry");
+        scheduler
+            .set_draining(&fleet, &instance, true, &acquisition)
+            .await
+            .expect("retry");
         scheduler.cordons_into(&mut cordons).await;
         assert_eq!(cordons.len(), 1);
     }
@@ -1367,7 +1370,13 @@ mod tests {
             .expect("self drain");
         scheduler.cordons_into(&mut cordons).await;
         assert!(cordons.is_empty());
-        scheduler.set_draining(&fleet, &instance, true, crate::acquisition::test_acquisition())
+        scheduler
+            .set_draining(
+                &fleet,
+                &instance,
+                true,
+                crate::acquisition::test_acquisition(),
+            )
             .await
             .expect("controller cordon");
         scheduler.cordons_into(&mut cordons).await;
@@ -1383,7 +1392,13 @@ mod tests {
                 .iter()
                 .all(|worker| worker.is_draining)
         );
-        scheduler.set_draining(&fleet, &instance, false, crate::acquisition::test_acquisition())
+        scheduler
+            .set_draining(
+                &fleet,
+                &instance,
+                false,
+                crate::acquisition::test_acquisition(),
+            )
             .await
             .expect("controller cancel");
         let workers = inner.worker_snapshot().await;
@@ -1399,7 +1414,13 @@ mod tests {
         *inner.workers.lock() = Some(Vec::new());
         let fleet = FleetName::try_new("fleet-a").expect("fleet");
         let instance = InstanceId::try_new("local-1").expect("instance");
-        scheduler.set_draining(&fleet, &instance, true, crate::acquisition::test_acquisition())
+        scheduler
+            .set_draining(
+                &fleet,
+                &instance,
+                true,
+                crate::acquisition::test_acquisition(),
+            )
             .await
             .expect("unconnected cordon");
         let (sender, _receiver) = tokio::sync::mpsc::channel(1);

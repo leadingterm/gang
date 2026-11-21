@@ -15,7 +15,9 @@ use std::time::Duration;
 use gang_clock::Timestamp;
 use gang_reconciler::{Activity, FleetPass, HostedSnapshot};
 use gang_spi::{FleetSupply, QueuedActionView, SchedulerSnapshot, StoreKind, Traffic};
-use gang_types::{ActionResources, FleetCatalog, FleetProperties, InstanceLifecycle, SaturatingInto};
+use gang_types::{
+    ActionResources, FleetCatalog, FleetProperties, InstanceLifecycle, SaturatingInto,
+};
 use gang_wire::{
     Actions, BucketUsage, CacheStore, Demand, Event, Fleet, InstanceCounts, InstanceSize, Isa,
     Lifecycle, Pass, Phase, PhaseSpan, Policy, Queue, QueuedAction, Recent, Reservation,
@@ -270,15 +272,18 @@ impl Builder {
         self.scratch.physical_order.clear();
         self.scratch.physical_order.extend(0..prev.workers.len());
         self.scratch.physical_order.sort_unstable_by(|&a, &b| {
-            (&prev.workers[a].fleet, &prev.workers[a].instance, a)
-                .cmp(&(&prev.workers[b].fleet, &prev.workers[b].instance, b))
+            (&prev.workers[a].fleet, &prev.workers[a].instance, a).cmp(&(
+                &prev.workers[b].fleet,
+                &prev.workers[b].instance,
+                b,
+            ))
         });
         self.scratch.hosted_order.clear();
         if let Some(hosted) = hosted {
             let workers = &hosted.snapshot().workers;
-            self.scratch.hosted_order.extend(
-                (0..workers.len()).filter(|&i| workers[i].id.instance_name().is_some()),
-            );
+            self.scratch
+                .hosted_order
+                .extend((0..workers.len()).filter(|&i| workers[i].id.instance_name().is_some()));
             self.scratch.hosted_order.sort_unstable_by(|&a, &b| {
                 name::cmp_of::<name::Actions>(workers[a].fleet.as_str(), workers[b].fleet.as_str())
                     .then_with(|| {
@@ -329,7 +334,8 @@ impl Builder {
             let status = if let Some(old) = same {
                 old.infrastructure.as_ref()
             } else {
-                let instance = prev.instances
+                let instance = prev
+                    .instances
                     .binary_search_by(|old| old.name.cmp(&worker.instance))
                     .ok()
                     .map(|index| &prev.instances[index])
@@ -337,8 +343,13 @@ impl Builder {
                 if let Some(old) = instance {
                     old.infrastructure.as_ref()
                 } else {
-                    physical_worker(prev, &self.scratch.physical_order, &worker.fleet, &worker.instance)
-                        .and_then(|old| old.infrastructure.as_ref())
+                    physical_worker(
+                        prev,
+                        &self.scratch.physical_order,
+                        &worker.fleet,
+                        &worker.instance,
+                    )
+                    .and_then(|old| old.infrastructure.as_ref())
                 }
             };
             if worker.infrastructure.as_ref() != status {
@@ -860,7 +871,8 @@ fn fill_instances(
             row.launch_time = old.launch_time;
             row.past_boot_grace = old.past_boot_grace;
         }
-        let old = prev.instances
+        let old = prev
+            .instances
             .binary_search_by(|old| old.name.cmp(&row.name))
             .ok()
             .map(|index| &prev.instances[index])

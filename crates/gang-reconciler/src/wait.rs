@@ -343,7 +343,10 @@ impl Dispatch {
         self.active = 0;
         self.waits.fill(None);
         self.work = ProjectionWork::new(
-            snapshot.queued.len().saturating_add(snapshot.executing.len()),
+            snapshot
+                .queued
+                .len()
+                .saturating_add(snapshot.executing.len()),
         );
     }
 
@@ -1965,7 +1968,10 @@ mod tests {
             scene.planner.instance_view(0, 2).unwrap().empty_after,
             Duration::from_secs(99_999)
         );
-        assert_eq!(scene.planner.scale_decision(0).needed, scene.planner.work(0));
+        assert_eq!(
+            scene.planner.scale_decision(0).needed,
+            scene.planner.work(0)
+        );
         assert!(scene.planner.removal(0, 2).is_none());
     }
 

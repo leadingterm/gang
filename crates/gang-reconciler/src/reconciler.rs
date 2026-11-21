@@ -1023,8 +1023,7 @@ mod tests {
         let scaling = Arc::new(ScalingConfig::default());
         let profiles = SourceProfiles::new(&scaling, gang_config::HistoryWindow::from_units(1));
         let cpu_oversubscription = gang_types::nonzero_u32(2);
-        let mut reconciler =
-            Reconciler::new(&policies, scaling, profiles, cpu_oversubscription);
+        let mut reconciler = Reconciler::new(&policies, scaling, profiles, cpu_oversubscription);
         let mut plan = Plan::new();
         let observed = NonZeroBytes::mib(62_229);
         let mut snapshot = gang_spi::SchedulerSnapshot {

@@ -551,21 +551,32 @@ pub(crate) mod tests {
         use gang_types::ActionResources;
         use nativelink_util::action_messages::ActionReservation;
 
-        let mut fitted = info(0, 0, &[
-            (property::CPU_MILLICORES, "2000"),
-            (property::CPU_COUNT, "8"),
-            (property::MEMORY_KB, "4000"),
-            (property::DISK_KB, "7"),
-        ]);
+        let mut fitted = info(
+            0,
+            0,
+            &[
+                (property::CPU_MILLICORES, "2000"),
+                (property::CPU_COUNT, "8"),
+                (property::MEMORY_KB, "4000"),
+                (property::DISK_KB, "7"),
+            ],
+        );
         let native = Arc::make_mut(&mut fitted);
         native.pre_fit_reservation = Some(ActionReservation {
             cpu_millicores: 6000,
             memory_bytes: Bytes::kib(8000).get(),
         });
         let fake = Fake {
-            by_worker: HashMap::from([(WORKER_A.to_owned(), vec![
-                row("running", ActionStage::Executing, 0, Arc::clone(&fitted), None),
-            ])]),
+            by_worker: HashMap::from([(
+                WORKER_A.to_owned(),
+                vec![row(
+                    "running",
+                    ActionStage::Executing,
+                    0,
+                    Arc::clone(&fitted),
+                    None,
+                )],
+            )]),
             queued: vec![row("queued", ActionStage::Queued, 0, fitted, None)],
             ..Default::default()
         };
@@ -592,10 +603,14 @@ pub(crate) mod tests {
         use gang_types::ActionResources;
         use nativelink_util::action_messages::ActionReservation;
 
-        let mut action = info(0, 0, &[
-            (property::CPU_MILLICORES, "2000"),
-            (property::MEMORY_KB, "4000"),
-        ]);
+        let mut action = info(
+            0,
+            0,
+            &[
+                (property::CPU_MILLICORES, "2000"),
+                (property::MEMORY_KB, "4000"),
+            ],
+        );
         let fitted = admitted_resources(&action.platform_properties);
         assert_eq!(learned_reservation(&action, fitted), None);
         let native = Arc::make_mut(&mut action);
@@ -603,11 +618,14 @@ pub(crate) mod tests {
             cpu_millicores: 3000,
             memory_bytes: Bytes::kib(4000).get(),
         });
-        assert_eq!(learned_reservation(&action, fitted), Some(ActionResources {
-            cpu_millicores: 3000,
-            memory: Bytes::kib(4000),
-            disk: Bytes::new(0),
-        }));
+        assert_eq!(
+            learned_reservation(&action, fitted),
+            Some(ActionResources {
+                cpu_millicores: 3000,
+                memory: Bytes::kib(4000),
+                disk: Bytes::new(0),
+            })
+        );
         let native = Arc::make_mut(&mut action);
         let reservation = native.pre_fit_reservation.as_mut().expect("metadata");
         reservation.cpu_millicores = 2000;
@@ -616,36 +634,56 @@ pub(crate) mod tests {
         let reservation = native.pre_fit_reservation.as_mut().expect("metadata");
         reservation.cpu_millicores = 3000;
         reservation.memory_bytes = 0;
-        assert_eq!(learned_reservation(&action, fitted), Some(ActionResources {
-            cpu_millicores: 3000,
-            memory: Bytes::new(0),
-            disk: Bytes::new(0),
-        }));
+        assert_eq!(
+            learned_reservation(&action, fitted),
+            Some(ActionResources {
+                cpu_millicores: 3000,
+                memory: Bytes::new(0),
+                disk: Bytes::new(0),
+            })
+        );
         let native = Arc::make_mut(&mut action);
         let reservation = native.pre_fit_reservation.as_mut().expect("metadata");
         reservation.cpu_millicores = 0;
         reservation.memory_bytes = Bytes::kib(4000).get() + 1;
-        assert_eq!(learned_reservation(&action, fitted), Some(ActionResources {
-            cpu_millicores: 0,
-            memory: Bytes::new(Bytes::kib(4000).get() + 1),
-            disk: Bytes::new(0),
-        }));
+        assert_eq!(
+            learned_reservation(&action, fitted),
+            Some(ActionResources {
+                cpu_millicores: 0,
+                memory: Bytes::new(Bytes::kib(4000).get() + 1),
+                disk: Bytes::new(0),
+            })
+        );
         let native = Arc::make_mut(&mut action);
-        native.pre_fit_reservation.as_mut().expect("metadata").memory_bytes = Bytes::kib(4000).get();
+        native
+            .pre_fit_reservation
+            .as_mut()
+            .expect("metadata")
+            .memory_bytes = Bytes::kib(4000).get();
         let native = Arc::make_mut(&mut action);
-        native.pre_fit_reservation.as_mut().expect("metadata").cpu_millicores = 1000;
+        native
+            .pre_fit_reservation
+            .as_mut()
+            .expect("metadata")
+            .cpu_millicores = 1000;
         assert_eq!(learned_reservation(&action, fitted), None);
         let native = Arc::make_mut(&mut action);
         let reservation = native.pre_fit_reservation.as_mut().expect("metadata");
         reservation.cpu_millicores = 0;
         reservation.memory_bytes = Bytes::kib(5000).get();
-        assert_eq!(learned_reservation(&action, fitted), Some(ActionResources {
-            cpu_millicores: 0,
-            memory: Bytes::kib(5000),
-            disk: Bytes::new(0),
-        }));
+        assert_eq!(
+            learned_reservation(&action, fitted),
+            Some(ActionResources {
+                cpu_millicores: 0,
+                memory: Bytes::kib(5000),
+                disk: Bytes::new(0),
+            })
+        );
         let zero = info(0, 0, &[]);
-        assert_eq!(admitted_resources(&zero.platform_properties), ActionResources::default());
+        assert_eq!(
+            admitted_resources(&zero.platform_properties),
+            ActionResources::default()
+        );
         assert_eq!(learned_reservation(&zero, ActionResources::default()), None);
     }
 

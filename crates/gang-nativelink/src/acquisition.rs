@@ -38,11 +38,12 @@ impl<'a> Acquisition<'a> {
 
 #[cfg(test)]
 pub(crate) fn test_acquisition() -> &'static Acquisition<'static> {
-    static ACQUISITION: std::sync::LazyLock<Acquisition<'static>> = std::sync::LazyLock::new(|| {
-        static CLOCK: std::sync::LazyLock<gang_clock::TestClock> =
-            std::sync::LazyLock::new(gang_clock::TestClock::default);
-        Acquisition::new(&*CLOCK, NonZeroDuration::from_secs(1))
-    });
+    static ACQUISITION: std::sync::LazyLock<Acquisition<'static>> =
+        std::sync::LazyLock::new(|| {
+            static CLOCK: std::sync::LazyLock<gang_clock::TestClock> =
+                std::sync::LazyLock::new(gang_clock::TestClock::default);
+            Acquisition::new(&*CLOCK, NonZeroDuration::from_secs(1))
+        });
     &ACQUISITION
 }
 
