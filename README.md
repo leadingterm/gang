@@ -44,6 +44,14 @@ The complete x86 test suite uses four shards. Each end-to-end gate uses eight de
 
 Portable lint runs `bazel run //:gazelle.check`, infrastructure and workflow validation, and the behavioral guards, including `tools/check-required-jobs_test.sh`. Rustfmt and Clippy for every x86 Rust target, tests included, run in the full test shards rather than recompiling the workspace in lint; portable lint has a three-minute budget. Darwin all-target Clippy belongs to macOS release validation, not the PR gate. `tools/lint.sh --portable` and `tools/lint.sh --nix-vm` select the two local lint partitions; on x86 Linux, `tools/lint.sh` runs both. The required-jobs guard checks fail-closed status aggregation and dependency coverage. Run it locally with `nix develop -c tools/check-required-jobs_test.sh`. Cross-target toolchains are described in [specification §8.4](docs/SPECIFICATION.md#84-nixos-images).
 
+The devShell supplies the same source-built, patched OpenTofu to both the shell and
+Bazel through `GANG_OPENTOFU`. Bazel verifies the package version and executable
+checksum, then copies the executable into its toolchain; it does not use a host
+`tofu` or an unpatched release binary. The patch fixes an
+[upstream forget-node defect](https://github.com/opentofu/opentofu/issues/4869)
+that affects ordinary destroy applies as well as test cleanup: retained-resource
+cleanup must not evaluate configuration against already-removed dependencies.
+
 OpenTofu provider ZIPs are checksum-pinned in `MODULE.bazel` and fetched through
 Bazel's repository cache, so separate output bases can reuse the downloads. When
 updating a provider, regenerate the Terraform lockfiles and update its platform
