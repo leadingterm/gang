@@ -364,6 +364,7 @@ test("a fleet's counts are totalled across fleets and name every state with the 
     ["busy", 9],
     ["idle", 1],
     ["draining", 1],
+    ["stale", 0],
     ["unconnected", 1],
     ["pending", 2],
     ["terminating", 1],
@@ -377,7 +378,7 @@ test("a fleet's counts are totalled across fleets and name every state with the 
     ["idle", 2],
     ["draining", 1],
   ]);
-  t.assert.match(html({}, <Tape f={spot} census={census} />), /9 busy, 1 idle, 1 draining, 1 no worker, 2 pending, 1 terminating, 0 replacing, 0 replacement, 0 unknown, of 24 maximum/);
+  t.assert.match(html({}, <Tape f={spot} census={census} />), /9 busy, 1 idle, 1 draining, 0 stale, 1 no worker, 2 pending, 1 terminating, 0 replacing, 0 replacement, 0 unknown, of 24 maximum/);
 });
 
 test("fleet details show measured readiness and expected wait independently, including zero", (t) => {
@@ -1180,6 +1181,41 @@ test("terminating hosted old member and replacement occupy two cells at desired 
   t.assert.match(legend, /c-replacement[^]*replacement/);
 });
 
+test("rollout desired beyond the logical maximum fits the tape without inventing workers", (t) => {
+  const fleet = live.fleets[0];
+  const worker = live.workers[0];
+  if (!fleet || !worker) throw new Error("fixture has fleet and worker");
+  const f = { ...fleet, desired: 3, policy: { ...fleet.policy, min: 0, max: 1 }, instances: { ...fleet.instances, warm: 0 } };
+  const { infrastructure: _infrastructure, ...base } = worker;
+  const old = { ...base, fleet: f.name, name: "workers/rollout-old", instance: "instances/rollout-old", stale: true, phase: "DRAINING" as const, running: 0 };
+  const census = { workers: [old], instances: [] };
+  t.assert.deepEqual(cellStates(f, census), ["stale", "empty", "empty"]);
+  const counts = new Map(fleetCounts(f, census));
+  t.assert.equal(counts.get("stale"), 1);
+  t.assert.equal(counts.get("busy"), 0);
+  t.assert.equal(counts.get("pending"), 0);
+  const tape = html({}, <Tape f={f} census={census} />);
+  const max = Number(tape.match(/--max:\s*(\d+)/)?.[1]);
+  const desired = Number(tape.match(/--d:\s*(\d+)/)?.[1]);
+  t.assert.equal(max, 3);
+  t.assert.equal(desired, 3);
+  t.assert.equal(max >= desired, true);
+  t.assert.equal((tape.match(/class="cell"/g) ?? []).length, 3);
+  t.assert.match(tape, /1 stale, 0 no worker, 0 pending/);
+  t.assert.match(tape, /of 1 maximum\. Desired 3/);
+  t.assert.match(tape, /class="strip__rule">1<\/span>/);
+
+  const extra = Array.from({ length: 3 }, (_, i) => ({
+    ...old, name: `workers/extra-${i}`, instance: `instances/extra-${i}`, stale: false, phase: "IDLE" as const,
+  }));
+  const largerCensus = { workers: [old, ...extra], instances: [] };
+  t.assert.deepEqual(cellStates(f, largerCensus), ["idle", "idle", "idle", "stale"]);
+  const largerTape = html({}, <Tape f={f} census={largerCensus} />);
+  t.assert.match(largerTape, /--max:\s*4/);
+  t.assert.match(largerTape, /--d:\s*3/);
+  t.assert.match(largerTape, /3 idle, 0 draining, 1 stale/);
+});
+
 test("census groups generations, isolates fleets, and preserves unknown states", (t) => {
   const fleet = live.fleets[0];
   const worker = live.workers[0];
@@ -1209,6 +1245,24 @@ test("census groups generations, isolates fleets, and preserves unknown states",
   t.assert.equal(count([], [unknown, unknown]).get("unknown"), 1);
   t.assert.equal(count([], [unknown]).get("unconnected"), 0);
   t.assert.equal(cellStates(f, { workers: [], instances: [unknown] })[0], "unknown");
+});
+
+test("stale draining workers remain visible in detail and grouped fleet status", (t) => {
+  const worker = live.workers[0];
+  const fleet = live.fleets.find((f) => f.name === worker?.fleet);
+  if (!worker || !fleet) throw new Error("fixture has worker and fleet");
+  const stale = { ...worker, stale: true, phase: "DRAINING" as const, running: 1 };
+  const ordinary = { ...stale, name: "workers/ordinary", instance: "instances/ordinary", stale: false };
+  const state = { ...live, fleets: [fleet], workers: [stale, ordinary], instances: [] };
+  const text = visibleText(html({ state }, <Workers />));
+  t.assert.match(text, /draining/);
+  t.assert.match(text, /stale/);
+  t.assert.match(visibleText(html({ state }, <WorkerDetail w={stale} state={state} />)), /stale or unknown worker version/);
+  const counts = new Map(fleetCounts(fleet, state));
+  t.assert.equal(counts.get("stale"), 1);
+  t.assert.equal(counts.get("draining"), 1);
+  const sameInstance = { ...ordinary, instance: stale.instance };
+  t.assert.equal(new Map(fleetCounts(fleet, { workers: [stale, sameInstance], instances: [] })).get("stale"), 1);
 });
 
 test("worker and unconnected instance show infrastructure without changing workload phase", (t) => {

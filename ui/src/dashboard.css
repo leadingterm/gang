@@ -572,6 +572,7 @@ time { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .c-unconnected { box-shadow: inset 0 0 0 var(--size-pixel) var(--color-ink-2); background: var(--hatch-unknown); }
 .c-pending { background: var(--hatch-pending); box-shadow: inset 0 0 0 var(--size-pixel) var(--color-rule-2); }
 .c-draining { background: var(--color-bark); }
+.c-stale { background: var(--color-bark); box-shadow: inset 0 0 0 var(--size-fine) var(--color-accent); }
 .c-terminating { box-shadow: inset 0 0 0 var(--size-pixel) var(--color-bark); }
 .c-replacing { background: var(--hatch-pending); box-shadow: inset 0 0 0 var(--size-fine) var(--color-bark); }
 .c-replacement { background: var(--hatch-unknown); box-shadow: inset 0 0 0 var(--size-fine) var(--color-accent); }

@@ -1434,6 +1434,10 @@ instance: string,
  */
 phase: Phase, 
 /**
+ * Whether the worker's release differs from the controller's or is unknown.
+ */
+stale: boolean, 
+/**
  * Derived infrastructure status of the worker's instance, when present.
  */
 infrastructure?: InfrastructureStatus, 

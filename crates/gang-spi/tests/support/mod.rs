@@ -246,6 +246,7 @@ macro_rules! provisioner_plugin {
                 held: &Held,
                 fleet: Fleet<'_, Self::FleetOptions>,
                 instance: &InstanceId,
+                _mode: gang_spi::TerminationMode,
             ) -> Result<(), PortError> {
                 held.check()?;
                 self.record(fleet.options);

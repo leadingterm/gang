@@ -408,7 +408,7 @@ impl SourceRates {
         time: PassTime,
     ) {
         let snapshot = hosted.snapshot();
-        self.reset_pass(fleets, snapshot);
+        self.reset_pass(fleets, hosted);
         self.compute_deltas(snapshot);
         self.select_sources(snapshot);
         self.observe_actions(snapshot, fleets, time.now);
@@ -425,7 +425,8 @@ impl SourceRates {
         self.previous_pass = Some(time.now);
     }
 
-    fn reset_pass(&mut self, fleets: &[FleetPass], snapshot: &SchedulerSnapshot) {
+    fn reset_pass(&mut self, fleets: &[FleetPass], hosted: &HostedSnapshot) {
+        let snapshot = hosted.snapshot();
         for source in &mut self.sources {
             source.selected = false;
             source.active_at = None;
@@ -448,15 +449,8 @@ impl SourceRates {
             let serving = !worker.draining
                 && fleet.is_some_and(|fleet| {
                     worker.id.instance_name().is_some_and(|instance| {
-                        snapshot
-                            .cordons
-                            .binary_search_by(|cordon| {
-                                cordon
-                                    .fleet
-                                    .cmp(&fleet)
-                                    .then_with(|| cordon.instance.as_str().cmp(instance))
-                            })
-                            .is_err()
+                        !hosted.is_cordoned(fleet, instance)
+                            && !hosted.is_replacing(fleet, &worker.fleet, instance)
                     })
                 });
             self.worker_fleets.push(fleet);
@@ -1016,6 +1010,7 @@ mod tests {
             reserved: None,
             cache: None,
             draining,
+            current_build: true,
             paused: false,
             last_seen: Timestamp::default(),
         }
@@ -2053,6 +2048,7 @@ mod tests {
         world.snapshot.cordons.push(gang_spi::InstanceCordon {
             fleet: 0,
             instance: Arc::new(gang_types::InstanceId::try_new("local-1").unwrap()),
+            replacing: false,
         });
         world.observe(0);
         exact(world.rates.fleet(0).total_load.cpu, 1.0);

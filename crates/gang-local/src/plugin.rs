@@ -299,6 +299,7 @@ impl ProvisionerPort for Local {
         held: &Held,
         fleet: Fleet<'_, LocalFleetOptions>,
         instance: &InstanceId,
+        _mode: gang_spi::TerminationMode,
     ) -> impl Future<Output = Result<(), PortError>> + Send {
         let fleet = OwnedFleet::of(fleet);
         let deadline = held.deadline();

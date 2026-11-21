@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use gang_clock::{Tick, Timestamp};
 use gang_config::{FleetPolicy, ScalingConfig};
-use gang_spi::{FleetInstance, FleetSupply, WorkerState};
+use gang_spi::{FleetInstance, FleetSupply, TerminationMode, WorkerState};
 use gang_types::health::CLIENT_REROUTE_BOUND;
 use gang_types::{InstanceId, InstanceLifecycle, SaturatingInto};
 
@@ -81,6 +81,13 @@ fn newest(a: usize, b: usize, workers: &[WorkerState]) -> usize {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainKind {
+    Worker,
+    Surplus,
+    Replacement,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Draining {
     worker: usize,
@@ -88,7 +95,7 @@ struct Draining {
     running: u32,
     end: Option<TerminationCause>,
     release_first: bool,
-    owned: bool,
+    kind: DrainKind,
     resumed: bool,
 }
 
@@ -116,6 +123,7 @@ struct Census {
     serving: u32,
     release_first: u32,
     busy_cordons: u32,
+    replacing: u32,
     unconnected_cordon: bool,
 }
 
@@ -354,7 +362,11 @@ impl Reconciler {
                     .id
                     .instance_name()
                     .is_some_and(|id| hosted.is_cordoned(index, id));
-                if !worker.draining && !owned {
+                let replacing = worker
+                    .id
+                    .instance_name()
+                    .is_some_and(|id| hosted.is_replacing(index, &worker.fleet, id));
+                if replacing || (!worker.draining && !owned) {
                     fleet.outlook.demand.add_running(worker.running_actions);
                     let known = self.running_reservations[worker_index];
                     let mut resources = known.resources();
@@ -440,7 +452,7 @@ impl Reconciler {
             capacity.resumable.extend(
                 self.draining[draining..]
                     .iter()
-                    .filter(|drain| drain.owned)
+                    .filter(|drain| drain.kind == DrainKind::Surplus)
                     .map(|drain| drain.instance),
             );
             self.census[index] = FleetCensus {
@@ -482,6 +494,9 @@ impl Reconciler {
         let (past_boot_grace, counts) = outlook;
         let hosted = self.hosted(pass, view, instance);
         let owned = pass.hosted.is_cordoned(view.index, instance.id.as_str());
+        let replacing =
+            pass.hosted
+                .is_replacing(view.index, &view.policy.name, instance.id.as_str());
         if owned {
             self.observations.observe_cordon(view.index, &instance.id);
         }
@@ -496,7 +511,7 @@ impl Reconciler {
         let draining_since = self.observations.observe_drain(
             view.index,
             &instance.id,
-            owned || (hosted.worker.is_some() && !hosted.serving),
+            owned || replacing || (hosted.worker.is_some() && !hosted.serving),
             pass.now,
         );
         let launched_for = pass.wall.saturating_duration_since(instance.launched_at);
@@ -520,6 +535,9 @@ impl Reconciler {
         {
             return Standing::Ordered;
         }
+        if replacing {
+            Self::classify_replacement(pass, view, instance, hosted, census, plan);
+        }
         if owned || hosted.draining_since.is_some() {
             census.busy_cordons = census.busy_cordons.saturating_add(1);
         }
@@ -528,7 +546,9 @@ impl Reconciler {
         }
         let Some(worker) = hosted.worker else {
             if !past_grace {
-                return if owned {
+                return if replacing {
+                    Standing::Retained
+                } else if owned {
                     Standing::Transient
                 } else {
                     Standing::Usable
@@ -537,13 +557,13 @@ impl Reconciler {
             self.terminate(pass, view, &instance.id, TerminationCause::Orphan, plan);
             return Standing::Ordered;
         };
-        if owned || !hosted.serving {
+        if owned || replacing || !hosted.serving {
             return self.classify_drain(
                 pass,
                 view,
                 entry,
                 hosted,
-                (worker, owned, draining_since.unwrap_or(pass.now)),
+                (worker, owned, replacing, draining_since.unwrap_or(pass.now)),
             );
         }
         census.serving = census.serving.saturating_add(1);
@@ -568,20 +588,64 @@ impl Reconciler {
         Standing::Usable
     }
 
+    fn classify_replacement(
+        pass: &Pass<'_>,
+        view: &FleetView<'_>,
+        instance: &FleetInstance,
+        hosted: Hosted,
+        census: &mut Census,
+        plan: &mut Plan,
+    ) {
+        census.replacing = census.replacing.saturating_add(1);
+        if hosted.serving {
+            return;
+        }
+        if let Some(worker) = hosted.worker {
+            let replacing_cordon = pass.hosted.snapshot().cordons.iter().any(|cordon| {
+                cordon.fleet == view.index
+                    && cordon.instance.as_str() == instance.id.as_str()
+                    && cordon.replacing
+            });
+            if !replacing_cordon {
+                let worker = pass
+                    .hosted
+                    .workers_on(&view.policy.name, &instance.id)
+                    .find(|&index| !pass.hosted.snapshot().workers[index].current_build)
+                    .unwrap_or(worker);
+                plan.steps.push(PlanStep {
+                    fleet: view.index,
+                    action: Action::ReinforceDrain(
+                        pass.hosted.snapshot().workers[worker].id.clone(),
+                    ),
+                });
+            }
+        }
+    }
+
     fn classify_drain(
         &mut self,
         pass: &Pass<'_>,
         view: &FleetView<'_>,
         (position, instance): (usize, &FleetInstance),
         hosted: Hosted,
-        (worker, owned, since): (usize, bool, Tick),
+        (worker, owned, replacing, since): (usize, bool, bool, Tick),
     ) -> Standing {
-        if !owned && pass.now.saturating_duration_since(since) < view.policy.boot_grace {
+        let kind = if replacing {
+            DrainKind::Replacement
+        } else if owned {
+            DrainKind::Surplus
+        } else {
+            DrainKind::Worker
+        };
+        if kind == DrainKind::Worker
+            && pass.now.saturating_duration_since(since) < view.policy.boot_grace
+        {
             return Standing::Transient;
         }
         let end = if !hosted.serving && hosted.running == 0 {
             Some(TerminationCause::DrainFinished)
         } else if !hosted.serving
+            && kind != DrainKind::Replacement
             && pass.now.saturating_duration_since(since) >= view.policy.max_drain_wait
         {
             Some(TerminationCause::MaxDrainWait)
@@ -604,7 +668,7 @@ impl Reconciler {
             running: hosted.running,
             end,
             release_first: instance.release_first,
-            owned,
+            kind,
             resumed: false,
         });
         Standing::Retained
@@ -630,12 +694,26 @@ impl Reconciler {
             .saturating_into();
         let retaining: u32 = self.draining[range]
             .iter()
-            .filter(|d| !d.resumed && d.end.is_none() && d.running > 0)
+            .filter(|d| {
+                d.kind != DrainKind::Replacement && !d.resumed && d.end.is_none() && d.running > 0
+            })
             .count()
             .saturating_into();
         let from = view.supply.desired.saturating_sub(terminated);
         let max = view.policy.instances.max().get();
-        let to = purchase_target(view.needed, retaining, max);
+        let terminated_replacing: u32 = plan.steps[planned..]
+            .iter()
+            .filter(|step| match &step.action {
+                Action::Terminate { instance, .. } => {
+                    pass.hosted
+                        .is_replacing(index, &view.policy.name, instance.as_str())
+                }
+                _ => false,
+            })
+            .count()
+            .saturating_into();
+        let to = purchase_target(view.needed, retaining, max)
+            .saturating_add(census.replacing.saturating_sub(terminated_replacing));
         if view.supply.abandoned > 0 && resumed == 0 {
             plan.steps.push(PlanStep {
                 fleet: index,
@@ -712,7 +790,7 @@ impl Reconciler {
         let mut extra = CapacityVector::default();
         for position in range.clone() {
             let drain = self.draining[position];
-            if !drain.owned {
+            if drain.kind != DrainKind::Surplus {
                 continue;
             }
             let ordinary = remaining_rescues > 0;
@@ -739,7 +817,7 @@ impl Reconciler {
             let instance = &view.supply.instances[drain.instance].id;
             if let Some(cause) = drain.end {
                 self.terminate(pass, view, instance, cause, plan);
-            } else if drain.owned {
+            } else if drain.kind != DrainKind::Worker {
                 for worker in pass.hosted.workers_on(&view.policy.name, instance) {
                     if !workers[worker].draining {
                         let id = &workers[worker].id;
@@ -772,6 +850,14 @@ impl Reconciler {
             action: Action::Terminate {
                 instance: instance.clone(),
                 cause,
+                mode: if pass
+                    .hosted
+                    .is_replacing(view.index, &view.policy.name, instance.as_str())
+                {
+                    TerminationMode::Replace
+                } else {
+                    TerminationMode::ScaleIn
+                },
             },
         });
         self.observations
@@ -957,6 +1043,7 @@ mod tests {
                 cache: None,
                 paused: false,
                 draining,
+                current_build: true,
                 last_seen: Timestamp::default(),
             }],
             ..gang_spi::SchedulerSnapshot::default()
@@ -965,6 +1052,7 @@ mod tests {
             snapshot.cordons.push(gang_spi::InstanceCordon {
                 fleet: 0,
                 instance: Arc::new(instance),
+                replacing: false,
             });
         }
         let mut hosted = HostedSnapshot::default();
@@ -1287,6 +1375,7 @@ mod tests {
                 cache: None,
                 paused: false,
                 draining: false,
+                current_build: true,
                 last_seen: Timestamp::default(),
             },
             WorkerState {
@@ -1300,6 +1389,7 @@ mod tests {
                 cache: None,
                 paused: false,
                 draining: true,
+                current_build: true,
                 last_seen: Timestamp::default(),
             },
         ];

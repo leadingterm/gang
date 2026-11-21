@@ -171,7 +171,7 @@ fn cold_start(tuning: &ColdStartTuning) -> Option<Value> {
 /// The platform properties the scheduler declares. CPU count is admitted by the catalog but
 /// ignored here because its reservation is represented by millicores.
 fn supported_platform_properties(fleets: &FleetCatalog) -> Map<String, Value> {
-    fleets
+    let mut properties: Map<String, Value> = fleets
         .declared()
         .iter()
         .map(|&(key, kind)| {
@@ -182,7 +182,9 @@ fn supported_platform_properties(fleets: &FleetCatalog) -> Map<String, Value> {
             };
             (key.to_owned(), json!(property_type(kind)))
         })
-        .collect()
+        .collect();
+    properties.insert(property::GANG_VERSION.to_owned(), json!("ignore"));
+    properties
 }
 
 /// The `NativeLink` property type that matches a key of `kind`.
@@ -373,7 +375,7 @@ fn local_worker(
         "tcp_keepalive_s": keepalive,
         "http2_keepalive_interval_s": keepalive,
     });
-    let platform_properties: Map<String, Value> = spec
+    let mut platform_properties: Map<String, Value> = spec
         .properties
         .worker_properties()
         .map(|(key, value)| {
@@ -386,6 +388,10 @@ fn local_worker(
             (key.to_owned(), json!({ "values": [value] }))
         })
         .collect();
+    platform_properties.insert(
+        property::GANG_VERSION.to_owned(),
+        json!({ "values": [env!("CARGO_PKG_VERSION")] }),
+    );
     let action_ceilings = action_ceilings(&spec.properties);
     let worker = json!({
         "name": spec.instance.worker_name(),
@@ -676,6 +682,10 @@ mod tests {
             supported_platform_properties(&fleets).get(property::CPU_COUNT),
             Some(&json!("ignore"))
         );
+        assert_eq!(
+            supported_platform_properties(&fleets).get(property::GANG_VERSION),
+            Some(&json!("ignore"))
+        );
         let escalation = resource_escalation(&ActionsConfig::default(), &fleets);
         let minimum = escalation["capacities"][0]["minimum"]
             .as_object()
@@ -934,6 +944,10 @@ mod tests {
             StoreAccess::Direct,
         );
         let rendered = local_worker(&config(), &spec, "grpc://127.0.0.1:9100").expect("worker");
+        assert_eq!(
+            rendered["platform_properties"][property::GANG_VERSION]["values"],
+            json!([env!("CARGO_PKG_VERSION")])
+        );
         let native: LocalWorkerConfig =
             serde_json::from_value(rendered.clone()).expect("native worker");
         let native = serde_json::to_value(native).expect("serialize native worker");

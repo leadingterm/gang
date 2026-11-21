@@ -96,6 +96,7 @@ const DENIED_STATUS: u16 = 403;
 const GRANTED_ACTIONS: &[&str] = &[
     "DescribeAutoScalingGroups",
     "SetDesiredCapacity",
+    "UpdateAutoScalingGroup",
     "TerminateInstanceInAutoScalingGroup",
     "DescribeInstances",
     "GetWebIdentityToken",
@@ -640,18 +641,11 @@ fn query_operation(
     params: &Parameters,
 ) -> Result<String, FakeFailure> {
     match action {
-        "DescribeLifecycleHooks" => {
-            let group = required(params, "AutoScalingGroupName")?;
-            let mut hooks = String::new();
-            for (name, transition) in state.lifecycle_hooks.get(group).into_iter().flatten() {
-                write!(hooks, "<member><LifecycleHookName>{name}</LifecycleHookName><AutoScalingGroupName>{group}</AutoScalingGroupName><LifecycleTransition>{transition}</LifecycleTransition></member>").expect("writing to a String cannot fail");
-            }
-            Ok(query_ok(
-                QueryService::AutoScaling,
-                action,
-                Some(&format!("<LifecycleHooks>{hooks}</LifecycleHooks>")),
-            ))
-        }
+        "DescribeLifecycleHooks" => Ok(query_ok(
+            QueryService::AutoScaling,
+            action,
+            Some(&describe_lifecycle_hooks(state, params)?),
+        )),
         "CompleteLifecycleAction" => {
             let no_action = || invalid("no active lifecycle action");
             let group_name = params.get("AutoScalingGroupName").ok_or_else(no_action)?;
@@ -708,6 +702,10 @@ fn query_operation(
             set_desired_capacity(state, params)?;
             Ok(query_ok(QueryService::AutoScaling, action, None))
         }
+        "UpdateAutoScalingGroup" => {
+            update_auto_scaling_group(state, params)?;
+            Ok(query_ok(QueryService::AutoScaling, action, None))
+        }
         "TerminateInstanceInAutoScalingGroup" => {
             let activity = terminate(state, params)?;
             Ok(query_ok(QueryService::AutoScaling, action, Some(&activity)))
@@ -737,6 +735,15 @@ fn query_operation(
             message: UNKNOWN_OPERATION,
         }),
     }
+}
+
+fn describe_lifecycle_hooks(state: &FakeState, params: &Parameters) -> Result<String, FakeFailure> {
+    let group = required(params, "AutoScalingGroupName")?;
+    let mut hooks = String::new();
+    for (name, transition) in state.lifecycle_hooks.get(group).into_iter().flatten() {
+        write!(hooks, "<member><LifecycleHookName>{name}</LifecycleHookName><AutoScalingGroupName>{group}</AutoScalingGroupName><LifecycleTransition>{transition}</LifecycleTransition></member>").expect("writing to a String cannot fail");
+    }
+    Ok(format!("<LifecycleHooks>{hooks}</LifecycleHooks>"))
 }
 
 fn describe_groups(state: &FakeState, params: &Parameters) -> String {
@@ -789,6 +796,27 @@ fn group_xml(group: &FakeGroup) -> String {
         max_size = group.max_size,
         protected = group.new_instances_protected,
     )
+}
+
+/// Updates only the group's maximum, preserving its minimum and desired capacity.
+fn update_auto_scaling_group(
+    state: &mut FakeState,
+    params: &Parameters,
+) -> Result<(), FakeFailure> {
+    let name = required(params, "AutoScalingGroupName")?;
+    let maximum: i32 = required(params, "MaxSize")?
+        .parse()
+        .map_err(|_| invalid(MALFORMED_NUMBER))?;
+    let group = state
+        .groups
+        .iter_mut()
+        .find(|group| group.name == name)
+        .ok_or_else(|| invalid(UNKNOWN_GROUP))?;
+    if maximum < group.min_size || maximum < group.desired {
+        return Err(invalid(OUT_OF_BOUNDS));
+    }
+    group.max_size = maximum;
+    Ok(())
 }
 
 /// Answers `SetDesiredCapacity`: the desired capacity must lie within the group's bounds, and `HonorCooldown` is refused while a scaling activity is in progress. An accepted write stores the capacity and, for a simulated group, scales its members.

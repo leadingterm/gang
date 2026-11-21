@@ -44,6 +44,26 @@ impl HostedSnapshot {
             .is_ok()
     }
 
+    /// Whether any connection or the physical cordon marks an instance for replacement.
+    pub(crate) fn is_replacing(&self, fleet: usize, name: &FleetName, instance: &str) -> bool {
+        let cordon = self.snapshot.cordons.binary_search_by(|cordon| {
+            (cordon.fleet, cordon.instance.as_str()).cmp(&(fleet, instance))
+        });
+        if cordon.is_ok_and(|index| self.snapshot.cordons[index].replacing) {
+            return true;
+        }
+        let probe = (Some(instance), name);
+        let workers = &self.snapshot.workers;
+        let start = self
+            .by_instance
+            .partition_point(|&i| key(&workers[i]) < probe);
+        self.by_instance[start..]
+            .iter()
+            .copied()
+            .take_while(|&i| key(&workers[i]) == probe)
+            .any(|i| !workers[i].current_build)
+    }
+
     /// The indices into `snapshot().workers` of the workers of `fleet` that run on the instance
     /// `id`, in worker id order. A worker registered in another fleet does not host the
     /// instance. Allocates nothing.
@@ -101,6 +121,7 @@ mod tests {
             reserved: None,
             cache: None,
             draining: false,
+            current_build: true,
             paused: false,
             last_seen: Timestamp::default(),
         })
@@ -229,6 +250,7 @@ mod tests {
             cordons: vec![gang_spi::InstanceCordon {
                 fleet: 0,
                 instance: std::sync::Arc::new(InstanceId::try_new("local-1")?),
+                replacing: false,
             }],
             ..SchedulerSnapshot::default()
         };

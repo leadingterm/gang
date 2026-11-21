@@ -8,7 +8,7 @@ use std::time::Duration;
 use gang_clock::{Clock, Timestamp};
 use gang_config::{InstanceBounds, Weekday};
 use gang_reconciler::{Action, DrainReason, NeedCause, PlanStep, TerminationCause};
-use gang_spi::{ScalingEventKind, WorkerState};
+use gang_spi::{ScalingEventKind, TerminationMode, WorkerState};
 use gang_testkit::{TestResult, scheduled_minimum, worker_id};
 use gang_types::health::CLIENT_REROUTE_BOUND;
 use gang_types::{FleetSet, InstanceId, InstanceLifecycle, Isa, ScalingCause, WorkerId};
@@ -35,6 +35,269 @@ fn mismatched_and_unknown_workers_supply_capacity_without_early_draining() -> Te
             assert_eq!(h.outlook(X86)?.expected_wait, Some(Duration::ZERO));
         }
     }
+    Ok(())
+}
+
+#[test]
+fn stale_busy_instance_is_replaced_at_max_without_duplicate_purchase() -> TestResult {
+    let mut policy = policy()?;
+    policy.instances = InstanceBounds::try_new(2, NonZeroU32::new(2).unwrap())?;
+    let max_wait = policy.max_drain_wait;
+    let mut h = Harness::with_policy(policy);
+    h.settle_term()?;
+    serve(&mut h, "local-old", secs(60))?;
+    serve(&mut h, "local-current", secs(60))?;
+    h.set_running("local-old", 1)?;
+    h.snapshot
+        .workers
+        .iter_mut()
+        .find(|w| w.id.instance_name() == Some("local-old"))
+        .unwrap()
+        .current_build = false;
+
+    let first = changes(&h.run());
+    assert!(first.contains(&Change::Reinforce(X86, "local-old".into())));
+    assert_eq!(
+        first
+            .iter()
+            .filter(|change| matches!(change, Change::Reinforce(..)))
+            .count(),
+        1
+    );
+    assert!(first.contains(&Change::Scale(X86, 2, 3, NeedCause::Minimum)));
+    assert_eq!(h.outlook(X86)?.workers.running, 1);
+    assert!(h.snapshot.cordons[0].replacing);
+    assert!(
+        !changes(&h.run())
+            .iter()
+            .any(|change| matches!(change, Change::Scale(..) | Change::Cancel(..)))
+    );
+
+    h.launch(X86, "local-new", InstanceLifecycle::InService, secs(0))?;
+    h.connect(X86, "local-new")?;
+    h.advance(max_wait + secs(1));
+    assert!(!changes(&h.run()).iter().any(|change| matches!(
+        change,
+        Change::Terminate(..) | Change::Scale(..) | Change::Cancel(..)
+    )));
+    h.set_running("local-old", 0)?;
+    let finished_steps = h.run();
+    assert_termination_mode(&finished_steps, "local-old", TerminationMode::Replace);
+    let finished = changes(&finished_steps);
+    assert!(finished.contains(&Change::Terminate(
+        X86,
+        "local-old".into(),
+        TerminationCause::DrainFinished
+    )));
+    assert!(
+        !finished
+            .iter()
+            .any(|change| matches!(change, Change::Scale(..)))
+    );
+    assert_eq!(h.supply(X86)?.desired, 2);
+    assert!(h.snapshot.workers.iter().all(|worker| worker.current_build));
+    assert!(
+        !changes(&h.run())
+            .iter()
+            .any(|change| matches!(change, Change::Scale(..)))
+    );
+    Ok(())
+}
+
+#[test]
+fn busy_stale_work_creates_replacement_demand_without_a_minimum() -> TestResult {
+    let mut policy = policy()?;
+    policy.instances = InstanceBounds::try_new(0, NonZeroU32::MIN)?;
+    let mut h = Harness::with_policy(policy);
+    h.settle_term()?;
+    serve(&mut h, "local-old", secs(60))?;
+    h.set_running("local-old", 1)?;
+    h.snapshot.workers[0].current_build = false;
+
+    let first = changes(&h.run());
+    assert!(first.contains(&Change::Reinforce(X86, "local-old".into())));
+    assert!(first.contains(&Change::Scale(X86, 1, 2, NeedCause::Demand)));
+    assert_eq!(h.outlook(X86)?.needed, 1);
+    assert!(
+        !changes(&h.run())
+            .iter()
+            .any(|change| matches!(change, Change::Scale(..)))
+    );
+
+    h.launch(X86, "local-new", InstanceLifecycle::InService, secs(0))?;
+    h.connect(X86, "local-new")?;
+    assert!(
+        !changes(&h.run())
+            .iter()
+            .any(|change| matches!(change, Change::Scale(..)))
+    );
+    assert_eq!(h.outlook(X86)?.needed, 1);
+    h.set_running("local-old", 0)?;
+    let finished_steps = h.run();
+    assert_termination_mode(&finished_steps, "local-old", TerminationMode::Replace);
+    let finished = changes(&finished_steps);
+    assert!(finished.contains(&Change::Terminate(
+        X86,
+        "local-old".into(),
+        TerminationCause::DrainFinished
+    )));
+    assert!(
+        !finished
+            .iter()
+            .any(|change| matches!(change, Change::Scale(..)))
+    );
+    assert_eq!(h.outlook(X86)?.needed, 0);
+    assert_eq!(h.supply(X86)?.desired, 1);
+    Ok(())
+}
+
+#[test]
+fn replacement_intent_survives_current_reconnect_and_model_restart() -> TestResult {
+    let mut policy = policy()?;
+    policy.instances = InstanceBounds::try_new(1, NonZeroU32::MIN)?;
+    let mut h = Harness::with_policy(policy);
+    h.settle_term()?;
+    serve(&mut h, "local-old", secs(60))?;
+    h.set_running("local-old", 1)?;
+    h.snapshot.workers[0].current_build = false;
+    h.run();
+    h.disconnect("local-old")?;
+    h.connect(X86, "local-old")?;
+    h.snapshot.workers[0].draining = false;
+    h.set_running("local-old", 1)?;
+    h.restart();
+    let steps = changes(&h.run());
+    assert!(
+        !steps
+            .iter()
+            .any(|change| matches!(change, Change::Cancel(..) | Change::Scale(..)))
+    );
+    assert!(steps.contains(&Change::Reinforce(X86, "local-old".into())));
+    assert!(h.snapshot.workers[0].current_build);
+    h.advance(CLIENT_REROUTE_BOUND);
+    h.launch(X86, "local-new", InstanceLifecycle::InService, secs(0))?;
+    h.connect(X86, "local-new")?;
+    h.set_running("local-old", 0)?;
+    let finished = h.run();
+    assert_termination_mode(&finished, "local-old", TerminationMode::Replace);
+    Ok(())
+}
+
+#[test]
+fn disconnected_replacement_terminates_after_connection_grace_without_rebuying() -> TestResult {
+    let mut policy = policy()?;
+    policy.instances = InstanceBounds::try_new(1, NonZeroU32::MIN)?;
+    let grace = policy.boot_grace;
+    let mut h = Harness::with_policy(policy);
+    h.settle_term()?;
+    serve(&mut h, "local-old", grace + secs(1))?;
+    h.set_running("local-old", 1)?;
+    h.snapshot.workers[0].current_build = false;
+    h.run();
+    h.disconnect("local-old")?;
+    h.launch(X86, "local-new", InstanceLifecycle::InService, secs(0))?;
+    h.connect(X86, "local-new")?;
+    assert!(
+        !changes(&h.run())
+            .iter()
+            .any(|change| matches!(change, Change::Terminate(..)))
+    );
+    h.advance(grace);
+    let retirement = h.run();
+    assert_termination_mode(&retirement, "local-old", TerminationMode::Replace);
+    let steps = changes(&retirement);
+    assert!(steps.contains(&Change::Terminate(
+        X86,
+        "local-old".into(),
+        TerminationCause::Orphan
+    )));
+    assert!(
+        !steps
+            .iter()
+            .any(|change| matches!(change, Change::Scale(..)))
+    );
+    assert_eq!(h.supply(X86)?.desired, 1);
+    Ok(())
+}
+
+#[test]
+fn one_stale_connection_replaces_the_entire_physical_instance() -> TestResult {
+    for (stale_running, current_running) in [(1, 0), (0, 1), (1, 1)] {
+        let mut policy = policy()?;
+        policy.instances = InstanceBounds::try_new(1, NonZeroU32::MIN)?;
+        let mut h = Harness::with_policy(policy);
+        h.settle_term()?;
+        serve(&mut h, "local-old", secs(60))?;
+        h.set_running("local-old", stale_running)?;
+        let mut current = renewed(&h.snapshot.workers[0], 1)?;
+        current.running_actions = current_running;
+        h.snapshot.workers[0].current_build = false;
+        h.snapshot.workers.push(current);
+        let plan = h.run();
+        let steps = changes(&plan);
+        assert!(steps.contains(&Change::Reinforce(X86, "local-old".into())));
+        assert!(
+            steps.contains(&Change::Scale(X86, 1, 2, NeedCause::Demand)),
+            "expected one replacement for the physical instance: {plan:?}"
+        );
+        assert!(h.snapshot.workers.iter().all(|worker| worker.draining));
+        assert!(h.snapshot.cordons[0].replacing);
+        let outlook = h.outlook(X86)?;
+        assert_eq!(outlook.workers.running, stale_running + current_running);
+        assert_eq!(
+            outlook.demand.actions(),
+            u64::from(stale_running + current_running)
+        );
+        assert_eq!(outlook.needed, 1);
+        assert!(
+            !steps
+                .iter()
+                .any(|change| matches!(change, Change::Cancel(..) | Change::Terminate(..))),
+            "busy replacement must keep draining: {plan:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn idle_stale_draining_instance_is_destroyed() -> TestResult {
+    let mut policy = policy()?;
+    policy.instances = InstanceBounds::try_new(1, NonZeroU32::MIN)?;
+    let mut h = Harness::with_policy(policy);
+    h.settle_term()?;
+    serve(&mut h, "local-old", secs(60))?;
+    h.snapshot.workers[0].current_build = false;
+    h.snapshot.workers[0].draining = true;
+
+    let retirement = h.run();
+    assert_termination_mode(&retirement, "local-old", TerminationMode::Replace);
+    Ok(())
+}
+
+#[test]
+fn already_draining_stale_instance_gets_replacement_intent() -> TestResult {
+    let mut policy = policy()?;
+    policy.instances = InstanceBounds::try_new(1, NonZeroU32::MIN)?;
+    let mut h = Harness::with_policy(policy);
+    h.settle_term()?;
+    serve(&mut h, "local-old", secs(60))?;
+    h.set_running("local-old", 1)?;
+    h.snapshot.workers[0].current_build = false;
+    h.snapshot.workers[0].draining = true;
+
+    let plan = h.run();
+    let steps = changes(&plan);
+    assert!(steps.contains(&Change::Reinforce(X86, "local-old".into())));
+    assert!(
+        steps.contains(&Change::Scale(X86, 1, 2, NeedCause::Demand)),
+        "expected replacement demand from the busy stale drain: {plan:?}"
+    );
+    assert!(h.snapshot.cordons[0].replacing);
+    assert!(
+        !steps
+            .iter()
+            .any(|change| matches!(change, Change::Cancel(..) | Change::Terminate(..)))
+    );
     Ok(())
 }
 
@@ -73,15 +336,26 @@ fn changes(steps: &[PlanStep]) -> Vec<Change> {
                 worker.instance_name().unwrap_or(worker.as_str()).to_owned(),
                 *need,
             ),
-            Action::Terminate { instance, cause } => {
-                Change::Terminate(step.fleet, instance.as_str().to_owned(), *cause)
-            }
+            Action::Terminate {
+                instance, cause, ..
+            } => Change::Terminate(step.fleet, instance.as_str().to_owned(), *cause),
             Action::ReinforceDrain(worker) => Change::Reinforce(
                 step.fleet,
                 worker.instance_name().unwrap_or(worker.as_str()).to_owned(),
             ),
         })
         .collect()
+}
+
+fn assert_termination_mode(steps: &[PlanStep], name: &str, expected: TerminationMode) {
+    assert!(
+        steps.iter().any(|step| matches!(
+            &step.action,
+            Action::Terminate { instance, mode, .. }
+                if instance.as_str() == name && *mode == expected
+        )),
+        "missing {expected:?} termination for {name}: {steps:?}"
+    );
 }
 
 fn idle_world(minimum: u32, timeout: u64) -> TestResult<Workload> {
@@ -208,8 +482,10 @@ fn idle_timeout_drain_terminates_once_and_records_original_causes() -> TestResul
         w.h.audit_events()?[0].cause,
         Some(ScalingCause::IdleTimeout)
     );
+    let retirement = w.run();
+    assert_termination_mode(&retirement, "local-1", TerminationMode::ScaleIn);
     assert_eq!(
-        changes(&w.run()),
+        changes(&retirement),
         vec![Change::Terminate(
             X86,
             "local-1".into(),
@@ -1110,6 +1386,7 @@ fn absent_and_ordered_cordon_registry_entries_do_not_consume_live_budget() -> Te
     w.h.snapshot.cordons.push(gang_spi::InstanceCordon {
         fleet: X86,
         instance: std::sync::Arc::new(InstanceId::try_new("local-absent")?),
+        replacing: false,
     });
     settle_low(&mut w);
     w.h.advance(secs(300));
@@ -1159,6 +1436,7 @@ fn removing_workers_remaps_executing_without_losing_sources_or_resources() -> Te
         action: Action::Terminate {
             instance: InstanceId::try_new("local-2")?,
             cause: TerminationCause::DrainFinished,
+            mode: TerminationMode::ScaleIn,
         },
     }];
     w.h.apply();

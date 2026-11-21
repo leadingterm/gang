@@ -863,6 +863,7 @@ fn worker_phase_and_phase_time_copy_or_reset_across_frames() -> TestResult {
     let first = fill(&mut builder, &blank(), 1, &world, 1_000, ok(0))?;
     let first_row = find_worker(&first, &worker).ok_or("worker missing")?;
     assert_eq!(first_row.phase, gang_wire::Phase::Busy);
+    assert!(!first_row.stale);
     assert_eq!(first_row.phase_time, ts(1_000));
     assert_eq!(first_row.launch_time, ts(0));
     assert_eq!(first_row.instance, instance_name(&instance));
@@ -889,10 +890,20 @@ fn worker_phase_and_phase_time_copy_or_reset_across_frames() -> TestResult {
     );
 
     world.snapshot.workers[0].draining = true;
+    world.snapshot.workers[0].current_build = false;
+    world.snapshot.workers[0].running_actions = 2;
     let fourth = fill(&mut builder, &third, 4, &world, 4_000, ok(0))?;
     let fourth_row = find_worker(&fourth, &worker).ok_or("worker missing")?;
     assert_eq!(fourth_row.phase, gang_wire::Phase::Draining);
+    assert!(fourth_row.stale);
+    assert_eq!(fourth_row.running, 2);
     assert_eq!(fourth_row.phase_time, ts(4_000));
+
+    world.snapshot.workers[0].current_build = true;
+    let fifth = fill(&mut builder, &fourth, 5, &world, 5_000, ok(0))?;
+    let fifth_row = find_worker(&fifth, &worker).ok_or("worker missing")?;
+    assert!(!fifth_row.stale);
+    assert_eq!(fifth_row.phase, gang_wire::Phase::Draining);
     Ok(())
 }
 
@@ -1729,6 +1740,7 @@ fn a_worker_of_another_fleet_does_not_host_the_instance() -> TestResult {
             action: Action::Terminate {
                 instance: instance.clone(),
                 cause: TerminationCause::Orphan,
+                mode: gang_spi::TerminationMode::ScaleIn,
             },
         }]
     );

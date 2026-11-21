@@ -956,6 +956,7 @@ mod tests {
             reserved: None,
             cache: None,
             draining: false,
+            current_build: true,
             paused: false,
             last_seen: Timestamp::from_unix_millis(1_000_000),
         }

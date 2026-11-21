@@ -22,9 +22,11 @@ pub const NETWORK: &str = "network";
 pub const SUPPORTS_WORKERS: &str = "supports-workers";
 /// An old client's cache label, ignored by the scheduler.
 pub const ACTION_ENVIRONMENT: &str = "gang_action_environment";
+/// The worker's Gang package version, used only by the scheduler.
+pub const GANG_VERSION: &str = "gang_version";
 
 /// Every reserved property key.
-pub const RESERVED: [&str; 10] = [
+pub const RESERVED: [&str; 11] = [
     FLEET,
     ISA,
     SANDBOX,
@@ -35,6 +37,7 @@ pub const RESERVED: [&str; 10] = [
     NETWORK,
     SUPPORTS_WORKERS,
     ACTION_ENVIRONMENT,
+    GANG_VERSION,
 ];
 
 /// Explicitly harmless properties that impose nothing on matching.
@@ -81,6 +84,7 @@ mod tests {
             "network",
             "supports-workers",
             "gang_action_environment",
+            "gang_version",
         ] {
             assert!(is_reserved(key), "{key}");
         }

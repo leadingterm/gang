@@ -346,6 +346,7 @@ mod tests {
             cache: None,
             paused: false,
             draining,
+            current_build: true,
             last_seen: Timestamp::default(),
         })
     }

@@ -2742,9 +2742,14 @@ fn worker_registration(
     instance: &str,
     max: u64,
 ) -> Result<worker_wire::ConnectWorkerRequest, Box<dyn Error>> {
+    // Manual workers need the release metadata normally added by NativeLink's worker config.
     Ok(worker_wire::ConnectWorkerRequest {
         properties: properties
             .worker_properties()
+            .chain([(
+                gang_types::property::GANG_VERSION,
+                env!("CARGO_PKG_VERSION"),
+            )])
             .map(|(name, value)| platform::Property {
                 name: name.into(),
                 value: value.into(),

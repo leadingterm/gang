@@ -13,7 +13,7 @@ use gang_clock::{Clock, Timestamp};
 use gang_spi::{
     ExecutingDemand, Fence, FleetInstance, FleetSupply, Held, InstanceExit, PortError,
     ProvisionerPort, ScalingAuditEvent, ScalingEventKind, ScalingEventSeq, SchedulerPort,
-    SchedulerSnapshot, WorkerState,
+    SchedulerSnapshot, TerminationMode, WorkerState,
 };
 use gang_state::BuilderConfig;
 use gang_types::{
@@ -74,8 +74,9 @@ impl ProvisionerPort for PartialFailureProvisioner {
         held: &Held,
         fleet: Fleet<'_, Opaque>,
         instance: &InstanceId,
+        mode: TerminationMode,
     ) -> Result<(), PortError> {
-        self.inner.terminate(held, fleet, instance).await
+        self.inner.terminate(held, fleet, instance, mode).await
     }
 
     fn worker_lifetime(&self) -> gang_types::WorkerLifetime {
@@ -123,8 +124,9 @@ impl ProvisionerPort for LapsingProvisioner {
         held: &Held,
         fleet: Fleet<'_, Opaque>,
         instance: &InstanceId,
+        mode: TerminationMode,
     ) -> Result<(), PortError> {
-        self.inner.terminate(held, fleet, instance).await?;
+        self.inner.terminate(held, fleet, instance, mode).await?;
         if self.lapse.swap(false, Ordering::SeqCst) {
             self.clock.advance(Duration::from_secs(8));
         }
@@ -185,8 +187,9 @@ impl ProvisionerPort for CommittedTerminationProvisioner {
         held: &Held,
         fleet: Fleet<'_, Opaque>,
         instance: &InstanceId,
+        mode: TerminationMode,
     ) -> Result<(), PortError> {
-        self.inner.terminate(held, fleet, instance).await?;
+        self.inner.terminate(held, fleet, instance, mode).await?;
         if self.fail_after_commit.swap(false, Ordering::SeqCst) {
             self.block_converge.store(true, Ordering::SeqCst);
             return Err(PortError::unavailable("termination deadline elapsed"));
@@ -317,6 +320,7 @@ fn owned_cordon(instance: &InstanceId) -> gang_spi::InstanceCordon {
     gang_spi::InstanceCordon {
         fleet: 0,
         instance: Arc::new(instance.clone()),
+        replacing: false,
     }
 }
 
@@ -358,6 +362,7 @@ fn idle_worker(instance: &InstanceId, last_seen: Timestamp) -> TestResult<Worker
         capacity: None,
         reserved: None,
         cache: None,
+        current_build: true,
         draining: false,
         last_seen,
         paused: false,
@@ -1540,6 +1545,72 @@ async fn drain_of_a_worker_that_left_is_neither_applied_nor_audited() -> TestRes
 }
 
 #[tokio::test]
+async fn replacement_cordon_forwards_destroy_mode_for_current_worker() -> TestResult {
+    let clock = clock_at(1_000_000);
+    let fleets = fleets();
+    let fleet = FakeProvisioner::default();
+    let scheduler = FakeScheduler::new()?;
+    let repository = FakeRepository::default();
+    let name = instance_id("local-1");
+    fleet.set_supply(
+        &fleet_name(),
+        supply_with("local-1", Timestamp::from_unix_millis(0), 1),
+    );
+    scheduler.set_snapshot(SchedulerSnapshot {
+        workers: vec![idle_worker(&name, clock.wall())?],
+        ..SchedulerSnapshot::default()
+    });
+    let mut control = ControlLoop::new(
+        &fleets,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        gang_types::nonzero_u32(2),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
+        gang_testkit::fence::valid_fence(),
+    );
+    assert_eq!(
+        control.pass().await,
+        PassOutcome::Completed {
+            applied: 0,
+            failed: 0
+        }
+    );
+    clock.advance(gang_types::health::CLIENT_REROUTE_BOUND);
+    scheduler.set_snapshot(SchedulerSnapshot {
+        cordons: vec![gang_spi::InstanceCordon {
+            replacing: true,
+            ..owned_cordon(&name)
+        }],
+        workers: vec![WorkerState {
+            draining: true,
+            ..idle_worker(&name, clock.wall())?
+        }],
+        ..SchedulerSnapshot::default()
+    });
+    assert_eq!(
+        control.pass().await,
+        PassOutcome::Completed {
+            applied: 1,
+            failed: 0
+        }
+    );
+    assert_eq!(
+        fleet.termination_calls(),
+        vec![(name, TerminationMode::Replace)]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn idle_worker_is_drained_then_terminated_once_empty() -> TestResult {
     let clock = clock_at(1_000_000);
     let fleets = fleets();
@@ -1605,6 +1676,10 @@ async fn idle_worker_is_drained_then_terminated_once_empty() -> TestResult {
         }
     );
     assert!(fleet.terminations().contains(&name));
+    assert_eq!(
+        fleet.termination_calls(),
+        vec![(name.clone(), TerminationMode::ScaleIn)]
+    );
 
     let kinds: Vec<ScalingEventKind> = repository
         .scaling_events()
@@ -3434,8 +3509,9 @@ impl ProvisionerPort for EventProvisioner {
         held: &Held,
         fleet: Fleet<'_, Opaque>,
         instance: &InstanceId,
+        mode: TerminationMode,
     ) -> Result<(), PortError> {
-        self.inner.terminate(held, fleet, instance).await
+        self.inner.terminate(held, fleet, instance, mode).await
     }
 
     fn worker_lifetime(&self) -> gang_types::WorkerLifetime {

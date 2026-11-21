@@ -10,10 +10,10 @@ import { AsOf, ReservationAmounts } from "./actions.tsx";
 import { fleetCounts, fleetTotals, STATE_NAME, StaticCell, Tally, unhostedInstances, type Counted, type FleetCensus } from "./fleet.tsx";
 
 /** The instances without a worker are listed under their fleet. */
-const GHOSTED: Record<Counted, boolean> = { busy: false, idle: false, draining: false, unconnected: true, pending: true, terminating: true, replacing: false, replacement: false, unknown: true, warm: false };
+const GHOSTED: Record<Counted, boolean> = { busy: false, idle: false, draining: false, stale: false, unconnected: true, pending: true, terminating: true, replacing: false, replacement: false, unknown: true, warm: false };
 
 /** The toolbar tallies workers by phase, and the instances that have none yet. */
-const TALLIED: Record<Counted, boolean> = { busy: true, idle: true, draining: true, unconnected: true, pending: true, terminating: false, replacing: true, replacement: true, unknown: true, warm: false };
+const TALLIED: Record<Counted, boolean> = { busy: true, idle: true, draining: true, stale: true, unconnected: true, pending: true, terminating: false, replacing: true, replacement: true, unknown: true, warm: false };
 
 /** Lanes move at this resolution, so rows do not re-render every second. */
 const LANE_STEP_MS = 10 * 1000;
@@ -124,6 +124,7 @@ export const WorkerDetail = ({ w, state }: { w: Worker; state: State }) => {
         </dd>
         <dt>reservation</dt>
         <dd class="mono">{schedulerCurrent(state) ? ledger(w) : "unknown"}</dd>
+        {w.stale && <><dt>release</dt><dd>stale or unknown worker version</dd></>}
         {w.infrastructure && <><dt>infrastructure</dt><dd><Infrastructure status={w.infrastructure} /></dd></>}
       </dl>
       <h3>Worker cache</h3>
@@ -198,6 +199,7 @@ const WorkerRow = ({ w, state, now }: { w: Worker; state: State; now: UnixMs }) 
                 <Since t={ms(w.phaseTime)} />
               </span>}
               {w.infrastructure && <> · <Infrastructure status={w.infrastructure} /></>}
+              {w.stale && <span class="paused">stale</span>}
               {w.paused && <span class="paused">paused</span>}
             </span>
             <span>{known ? `${w.running} running` : "unknown"}</span>

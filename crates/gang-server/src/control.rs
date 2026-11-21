@@ -791,10 +791,10 @@ where
             Action::CancelDrain(worker, _) => {
                 Self::set_draining(scheduler, configs, step.fleet, worker, false).await
             }
-            Action::Terminate { instance, .. } => {
+            Action::Terminate { instance, mode, .. } => {
                 let fleet = configs[step.fleet].fleet();
                 fence
-                    .run(async |held| provisioner.terminate(held, fleet, instance).await)
+                    .run(async |held| provisioner.terminate(held, fleet, instance, *mode).await)
                     .await
                     .map_err(PortError::from)
             }
@@ -1076,6 +1076,7 @@ mod tests {
             cordons: vec![InstanceCordon {
                 fleet: 0,
                 instance: Arc::new(instance.clone()),
+                replacing: false,
             }],
             workers: vec![WorkerState {
                 id: worker.clone(),
@@ -1086,6 +1087,7 @@ mod tests {
                 capacity: None,
                 reserved: None,
                 cache: None,
+                current_build: true,
                 draining: true,
                 paused: false,
                 last_seen: clock.wall(),
@@ -1101,24 +1103,23 @@ mod tests {
                 .iter()
                 .any(|step| matches!(step.action, Action::Terminate { .. }))
         );
-        control.plan.steps.insert(
-            0,
-            PlanStep {
-                fleet: 0,
-                action: Action::ReinforceDrain(worker),
-            },
-        );
-        control.plan.steps.insert(
-            0,
-            PlanStep {
-                fleet: 0,
-                action: Action::ScaleOut {
-                    from: 1,
-                    to: 2,
-                    need: NeedCause::Demand,
-                    summary: ScaleDecision::default(),
+        control.plan.steps.splice(
+            0..0,
+            [
+                PlanStep {
+                    fleet: 0,
+                    action: Action::ScaleOut {
+                        from: 1,
+                        to: 2,
+                        need: NeedCause::Demand,
+                        summary: ScaleDecision::default(),
+                    },
                 },
-            },
+                PlanStep {
+                    fleet: 0,
+                    action: Action::ReinforceDrain(worker),
+                },
+            ],
         );
         let guard = scheduler.hold_control_acquisition().await?;
         {
@@ -1141,10 +1142,8 @@ mod tests {
                 .any(|event| matches!(event.kind, ScalingEventKind::ScaledOut { .. }))
         );
         drop(guard);
-        assert!(matches!(
-            control.pass().await,
-            PassOutcome::Completed { failed: 0, .. }
-        ));
+        let outcome = control.pass().await;
+        assert!(matches!(outcome, PassOutcome::Completed { failed: 0, .. }));
         assert_eq!(provisioner.terminations().len(), 1);
         Ok(())
     }
@@ -1427,6 +1426,7 @@ mod tests {
                 capacity: None,
                 reserved: None,
                 cache: None,
+                current_build: true,
                 draining: false,
                 paused: false,
                 last_seen: clock.wall(),
@@ -1479,6 +1479,7 @@ mod tests {
             capacity: None,
             reserved: None,
             cache: None,
+            current_build: true,
             draining: false,
             paused: false,
             last_seen: at(),
